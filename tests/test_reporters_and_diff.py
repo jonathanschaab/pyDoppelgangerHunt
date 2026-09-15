@@ -751,7 +751,8 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
 
     helper = synthesize_shared_helper_code(u1, u2)
     assert "def _shared_compute_coords" in helper
-    assert "x: Any, y: Any" in helper
+    assert "x: float, y: float" in helper
+    assert "-> float:" in helper
     assert "*args" not in helper
 
     patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path))
@@ -762,6 +763,7 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
     # Test single-unit scope analysis
     scope_single = analyze_unit_variable_scope(u1)
     assert scope_single["inputs"] == ["x", "y"]
+    assert scope_single["return_type"] == "float"
 
     # Test async function with *args and **kwargs
     file_async = tmp_path / "async_service.py"
@@ -776,6 +778,153 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
     assert "extra_args" in scope_async["inputs"]
     assert "options" in scope_async["inputs"]
     assert "record_id" in scope_async["outputs"]
+    assert scope_async["return_type"] == "int"
+
+    # Test closure-captured variables from outer lexical scopes
+    file_closure = tmp_path / "closure_service.py"
+    file_closure.write_text(
+        "def make_multiplier(factor: int):\n"
+        "    def inner_mult(x: int) -> int:\n"
+        "        return x * factor\n"
+        "    return inner_mult\n",
+        encoding="utf-8",
+    )
+    u_closure = {"file": str(file_closure), "start": 2, "end": 3, "name": "inner_mult"}
+    scope_closure = analyze_unit_variable_scope(u_closure)
+    assert "x" in scope_closure["inputs"]
+    assert "factor" in scope_closure["inputs"]
+    assert "factor" in scope_closure["free_vars"]
+    assert scope_closure["return_type"] == "int"
+
+    # Test nonlocal and global variable declarations
+    file_scope_vars = tmp_path / "scope_vars.py"
+    file_scope_vars.write_text(
+        "def stateful_step():\n"
+        "    global global_cache\n"
+        "    nonlocal outer_counter\n"
+        "    outer_counter += 1\n"
+        "    global_cache = outer_counter\n"
+        "    return outer_counter\n",
+        encoding="utf-8",
+    )
+    u_state = {"file": str(file_scope_vars), "start": 1, "end": 6, "name": "stateful_step"}
+    scope_state = analyze_unit_variable_scope(u_state)
+    assert "outer_counter" in scope_state["nonlocals"]
+    assert "global_cache" in scope_state["globals"]
+    assert "outer_counter" in scope_state["inputs"]
+    assert "outer_counter" in scope_state["outputs"]
+
+    # Test class instance attributes (self.x, self.y)
+    file_cls = tmp_path / "point_cls.py"
+    file_cls.write_text(
+        "class Point:\n"
+        "    def translate(self, dx: float, dy: float = 0.0) -> None:\n"
+        "        self.x += dx\n"
+        "        self.y += dy\n",
+        encoding="utf-8",
+    )
+    u_cls = {"file": str(file_cls), "start": 2, "end": 4, "name": "translate"}
+    scope_cls = analyze_unit_variable_scope(u_cls)
+    assert scope_cls["inputs"][0] == "self"
+    assert "self.x" in scope_cls["attrs_read"]
+    assert "self.x" in scope_cls["attrs_written"]
+    assert "self.y" in scope_cls["attrs_read"]
+    assert "self.y" in scope_cls["attrs_written"]
+    assert scope_cls["return_type"] == "None"
+
+    # Test keyword-only parameters and defaults preservation
+    file_kw = tmp_path / "kw_service.py"
+    file_kw.write_text(
+        "def fetch_api(url: str, timeout: float = 5.0, *, retries: int = 3) -> dict:\n"
+        "    return {'url': url}\n",
+        encoding="utf-8",
+    )
+    u_kw = {"file": str(file_kw), "start": 1, "end": 2, "name": "fetch_api"}
+    scope_kw = analyze_unit_variable_scope(u_kw)
+    assert "url" in scope_kw["inputs"]
+    assert "timeout" in scope_kw["inputs"]
+    assert "retries" in scope_kw["inputs"]
+    assert scope_kw["return_type"] == "dict"
+
+    helper_kw = synthesize_shared_helper_code(u_kw, u_kw)
+    assert "url: str" in helper_kw
+    assert "timeout: float = 5.0" in helper_kw
+    assert "*, retries: int = 3" in helper_kw
+    assert "-> dict:" in helper_kw
+
+    # Test conflicting defaults and conflicting types between clone units
+    file_conf1 = tmp_path / "conf1.py"
+    file_conf2 = tmp_path / "conf2.py"
+    file_conf1.write_text(
+        "def process_data(val: int, timeout: float = 10.0) -> int:\n"
+        "    return val + int(timeout)\n",
+        encoding="utf-8",
+    )
+    file_conf2.write_text(
+        "def process_data_v2(val: float, timeout: float = 20.0) -> str:\n"
+        "    return str(val + timeout)\n",
+        encoding="utf-8",
+    )
+    u_c1 = {"file": str(file_conf1), "start": 1, "end": 2, "name": "process_data"}
+    u_c2 = {"file": str(file_conf2), "start": 1, "end": 2, "name": "process_data_v2"}
+    helper_conf = synthesize_shared_helper_code(u_c1, u_c2)
+    sig_conf = helper_conf.split("\n")[0]
+    # Conflicting types val: int vs float fallback to Any
+    assert "val: Any" in sig_conf
+    # Conflicting defaults 10.0 vs 20.0 are safely omitted from signature
+    assert "timeout: float," in sig_conf or "timeout: float)" in sig_conf
+    assert "= 10.0" not in sig_conf
+    assert "= 20.0" not in sig_conf
+    # Test nested function handling (top-level function guard)
+    file_nested = tmp_path / "nested_func.py"
+    file_nested.write_text(
+        "def outer_calc(base: int) -> int:\n"
+        "    def inner_step(step: int) -> int:\n"
+        "        return base + step\n"
+        "    return inner_step(5)\n",
+        encoding="utf-8",
+    )
+    u_nested = {"file": str(file_nested), "start": 1, "end": 4, "name": "outer_calc"}
+    scope_nested = analyze_unit_variable_scope(u_nested)
+    assert scope_nested["inputs"] == ["base"]
+    assert scope_nested["return_type"] == "int"
+
+    # Test classmethod with cls parameter ordering
+    file_cm = tmp_path / "cm_service.py"
+    file_cm.write_text(
+        "class Builder:\n"
+        "    @classmethod\n"
+        "    def build(cls, tag: str = 'item') -> str:\n"
+        "        return f'{tag}'\n",
+        encoding="utf-8",
+    )
+    u_cm = {"file": str(file_cm), "start": 2, "end": 4, "name": "build"}
+    scope_cm = analyze_unit_variable_scope(u_cm)
+    assert scope_cm["inputs"][0] == "cls"
+    helper_cm = synthesize_shared_helper_code(u_cm, u_cm)
+    assert "def _shared_build(cls: Any, tag: str = 'item') -> str:" in helper_cm
+
+    # Test positional default order invalidation (clearing preceding defaults)
+    file_ord1 = tmp_path / "ord1.py"
+    file_ord2 = tmp_path / "ord2.py"
+    file_ord1.write_text(
+        "def order_func(a: int = 1, b: int = 2) -> int:\n"
+        "    return a + b\n",
+        encoding="utf-8",
+    )
+    file_ord2.write_text(
+        "def order_func_v2(a: int = 1, b: int = 3) -> int:\n"
+        "    return a + b\n",
+        encoding="utf-8",
+    )
+    u_o1 = {"file": str(file_ord1), "start": 1, "end": 2, "name": "order_func"}
+    u_o2 = {"file": str(file_ord2), "start": 1, "end": 2, "name": "order_func_v2"}
+    helper_ord = synthesize_shared_helper_code(u_o1, u_o2)
+    # Since b defaults differ (2 vs 3), b has no default, invalidating positional default on a
+    sig_ord = helper_ord.split("\n")[0]
+    assert "a: int, b: int" in sig_ord
+    assert "= 1" not in sig_ord
+
 
     # Test empty / invalid source unit
     scope_empty = analyze_unit_variable_scope({"file": "non_existent.py", "start": 1, "end": 1, "name": "bad"})

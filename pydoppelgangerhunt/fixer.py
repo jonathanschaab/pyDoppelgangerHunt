@@ -16,41 +16,161 @@ BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
 
 class _ScopeVisitor(ast.NodeVisitor):
-    """Inspects AST loads, stores, function parameters, and returns for scope analysis."""
+    """Inspects AST loads, stores, function parameters, returns, nonlocals, globals, and attributes."""
 
     def __init__(self) -> None:
         self.loads: List[str] = []
         self.stores: List[str] = []
         self.params: List[str] = []
+        self.param_details: List[Dict[str, Any]] = []
         self.returns: List[str] = []
+        self.return_type: Optional[str] = None
+        self.nonlocals: List[str] = []
+        self.globals: List[str] = []
+        self.attrs_read: List[str] = []
+        self.attrs_written: List[str] = []
+        self._scope_stack: List[Set[str]] = []
+
+    def _record_arg(
+        self,
+        arg_node: Optional[ast.arg],
+        default_node: Optional[ast.expr],
+        kind: str,
+    ) -> None:
+        if arg_node is None or arg_node.arg in BUILTIN_NAMES:
+            return
+        arg_name = arg_node.arg
+        if arg_name not in self.params:
+            self.params.append(arg_name)
+
+        type_val = None
+        if arg_node.annotation is not None:
+            try:
+                type_val = ast.unparse(arg_node.annotation)
+            except Exception:
+                type_val = None
+
+        default_val = None
+        if default_node is not None:
+            try:
+                default_val = ast.unparse(default_node)
+            except Exception:
+                default_val = None
+
+        prefix = "*" if kind == "vararg" else ("**" if kind == "kwarg" else "")
+        self.param_details.append({
+            "name": f"{prefix}{arg_name}",
+            "type": type_val,
+            "default": default_val,
+            "kind": kind,
+        })
 
     def _process_args(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
-        for a in (
-            node.args.posonlyargs
-            + node.args.args
-            + node.args.kwonlyargs
-        ):
-            if a.arg not in BUILTIN_NAMES and a.arg not in self.params:
-                self.params.append(a.arg)
-        if node.args.vararg and node.args.vararg.arg not in BUILTIN_NAMES:
-            self.params.append(node.args.vararg.arg)
-        if node.args.kwarg and node.args.kwarg.arg not in BUILTIN_NAMES:
-            self.params.append(node.args.kwarg.arg)
+        if node.returns is not None:
+            try:
+                self.return_type = ast.unparse(node.returns)
+            except Exception:
+                self.return_type = None
+
+        pos_and_plain = node.args.posonlyargs + node.args.args
+        num_pos = len(pos_and_plain)
+        num_defaults = len(node.args.defaults)
+        first_default_idx = num_pos - num_defaults
+
+        for i, a in enumerate(pos_and_plain):
+            def_node = node.args.defaults[i - first_default_idx] if i >= first_default_idx else None
+            self._record_arg(a, def_node, "pos")
+
+        self._record_arg(node.args.vararg, None, "vararg")
+
+        for k, kw_def in zip(node.args.kwonlyargs, node.args.kw_defaults):
+            self._record_arg(k, kw_def, "kwonly")
+
+        self._record_arg(node.args.kwarg, None, "kwarg")
+
+    def _process_func(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
+        is_top = len(self._scope_stack) == 0
+        if is_top:
+            self._process_args(node)
+            self._scope_stack.append(set(self.params))
+        else:
+            if node.name not in self.stores:
+                self.stores.append(node.name)
+            inner_args = {
+                a.arg for a in (node.args.posonlyargs + node.args.args + node.args.kwonlyargs)
+            }
+            if node.args.vararg:
+                inner_args.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                inner_args.add(node.args.kwarg.arg)
+            self._scope_stack.append(inner_args)
+
         self.generic_visit(node)
+        self._scope_stack.pop()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._process_args(node)
+        self._process_func(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self._process_args(node)
+        self._process_func(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        if node.name not in self.stores:
+            self.stores.append(node.name)
+        self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Load):
-            if node.id not in BUILTIN_NAMES and node.id not in self.loads:
+            is_inner = any(node.id in s for s in self._scope_stack[1:])
+            if not is_inner and node.id not in BUILTIN_NAMES and node.id not in self.loads:
                 self.loads.append(node.id)
         elif isinstance(node.ctx, ast.Store):
-            if node.id not in BUILTIN_NAMES and node.id not in self.stores:
+            if len(self._scope_stack) > 1:
+                self._scope_stack[-1].add(node.id)
+            elif node.id not in BUILTIN_NAMES and node.id not in self.stores:
                 self.stores.append(node.id)
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if isinstance(node.value, ast.Name) and node.value.id in ("self", "cls"):
+            attr_name = f"{node.value.id}.{node.attr}"
+            if isinstance(node.ctx, ast.Load):
+                if attr_name not in self.attrs_read:
+                    self.attrs_read.append(attr_name)
+            elif isinstance(node.ctx, ast.Store):
+                if attr_name not in self.attrs_written:
+                    self.attrs_written.append(attr_name)
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        # AugAssign both loads and stores the target
+        if isinstance(node.target, ast.Name):
+            is_inner = any(node.target.id in s for s in self._scope_stack[1:])
+            if not is_inner and node.target.id not in BUILTIN_NAMES and node.target.id not in self.loads:
+                self.loads.append(node.target.id)
+            if len(self._scope_stack) > 1:
+                self._scope_stack[-1].add(node.target.id)
+            elif node.target.id not in BUILTIN_NAMES and node.target.id not in self.stores:
+                self.stores.append(node.target.id)
+        elif isinstance(node.target, ast.Attribute):
+            if isinstance(node.target.value, ast.Name) and node.target.value.id in ("self", "cls"):
+                attr_name = f"{node.target.value.id}.{node.target.attr}"
+                if attr_name not in self.attrs_read:
+                    self.attrs_read.append(attr_name)
+                if attr_name not in self.attrs_written:
+                    self.attrs_written.append(attr_name)
+        self.generic_visit(node)
+
+    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+        for name in node.names:
+            if name not in self.nonlocals:
+                self.nonlocals.append(name)
+        self.generic_visit(node)
+
+    def visit_Global(self, node: ast.Global) -> None:
+        for name in node.names:
+            if name not in self.globals:
+                self.globals.append(name)
         self.generic_visit(node)
 
     def visit_Return(self, node: ast.Return) -> None:
@@ -60,12 +180,24 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def _inspect_unit_scope(unit: Dict[str, Any]) -> Tuple[List[str], List[str], List[str]]:
-    """Extracts (inputs, outputs, stores) for a single AST unit by parsing its source."""
+def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
+    """Extracts scope analysis metadata for a single AST unit by parsing its source."""
     raw_lines = extract_unit_source_code(unit)
     dedented = textwrap.dedent("".join(raw_lines))
+    empty_res: Dict[str, Any] = {
+        "inputs": [],
+        "outputs": [],
+        "stores": [],
+        "free_vars": [],
+        "nonlocals": [],
+        "globals": [],
+        "attrs_read": [],
+        "attrs_written": [],
+        "param_details": [],
+        "return_type": None,
+    }
     if not dedented.strip():
-        return [], [], []
+        return empty_res
 
     tree: Optional[ast.AST] = None
     try:
@@ -77,40 +209,92 @@ def _inspect_unit_scope(unit: Dict[str, Any]) -> Tuple[List[str], List[str], Lis
             tree = None
 
     if tree is None:
-        return [], [], []
+        return empty_res
 
     visitor = _ScopeVisitor()
     visitor.visit(tree)
 
-    if visitor.params:
-        inputs = list(visitor.params)
-    else:
-        inputs = [name for name in visitor.loads if name not in visitor.stores]
+    free_vars = [
+        name for name in visitor.loads
+        if name not in visitor.params
+        and name not in visitor.stores
+        and name not in visitor.globals
+        and name not in BUILTIN_NAMES
+    ]
+
+    inputs: List[str] = list(visitor.params)
+    for fv in free_vars:
+        if fv not in inputs:
+            inputs.append(fv)
+    for nl in visitor.nonlocals:
+        if nl not in inputs:
+            inputs.append(nl)
 
     outputs = list(visitor.returns)
-    return inputs, outputs, visitor.stores
+    for nl in visitor.nonlocals:
+        if nl in visitor.stores and nl not in outputs:
+            outputs.append(nl)
+
+    return {
+        "inputs": inputs,
+        "outputs": outputs,
+        "stores": visitor.stores,
+        "free_vars": free_vars,
+        "nonlocals": visitor.nonlocals,
+        "globals": visitor.globals,
+        "attrs_read": visitor.attrs_read,
+        "attrs_written": visitor.attrs_written,
+        "param_details": visitor.param_details,
+        "return_type": visitor.return_type,
+    }
 
 
 def analyze_unit_variable_scope(
     u1: Dict[str, Any],
     u2: Optional[Dict[str, Any]] = None,
-) -> Dict[str, List[str]]:
-    """Analyzes AST variable scoping to determine input parameters, outputs, and local variables."""
-    inputs1, outputs1, stores1 = _inspect_unit_scope(u1)
+) -> Dict[str, Any]:
+    """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
+    info1 = _inspect_unit_scope(u1)
     if u2 is not None:
-        inputs2, outputs2, _ = _inspect_unit_scope(u2)
-        common_inputs = [var for var in inputs1 if var in inputs2]
-        inputs = common_inputs if common_inputs else inputs1
-        outputs = list(dict.fromkeys(outputs1 + outputs2))
+        info2 = _inspect_unit_scope(u2)
+        common_inputs = [var for var in info1["inputs"] if var in info2["inputs"]]
+        inputs = common_inputs if common_inputs else info1["inputs"]
+        outputs = list(dict.fromkeys(info1["outputs"] + info2["outputs"]))
+        free_vars = list(dict.fromkeys(info1["free_vars"] + info2["free_vars"]))
+        nonlocals = list(dict.fromkeys(info1["nonlocals"] + info2["nonlocals"]))
+        globals_ = list(dict.fromkeys(info1["globals"] + info2["globals"]))
+        attrs_read = list(dict.fromkeys(info1["attrs_read"] + info2["attrs_read"]))
+        attrs_written = list(dict.fromkeys(info1["attrs_written"] + info2["attrs_written"]))
+        if info1["return_type"] == info2["return_type"]:
+            return_type = info1["return_type"]
+        elif info1["return_type"] is None:
+            return_type = info2["return_type"]
+        elif info2["return_type"] is None:
+            return_type = info1["return_type"]
+        else:
+            return_type = None
     else:
-        inputs = inputs1
-        outputs = outputs1
+        inputs = info1["inputs"]
+        outputs = info1["outputs"]
+        free_vars = info1["free_vars"]
+        nonlocals = info1["nonlocals"]
+        globals_ = info1["globals"]
+        attrs_read = info1["attrs_read"]
+        attrs_written = info1["attrs_written"]
+        return_type = info1["return_type"]
 
-    locals_ = [var for var in stores1 if var not in inputs]
+    locals_ = [var for var in info1["stores"] if var not in inputs]
     return {
         "inputs": inputs,
         "outputs": outputs,
         "locals": locals_,
+        "free_vars": free_vars,
+        "nonlocals": nonlocals,
+        "globals": globals_,
+        "attrs_read": attrs_read,
+        "attrs_written": attrs_written,
+        "param_details": info1["param_details"],
+        "return_type": return_type,
     }
 
 
@@ -134,15 +318,94 @@ def synthesize_shared_helper_code(u1: Dict[str, Any], u2: Dict[str, Any]) -> str
         common_lines = lines1
 
     # Variable scope analysis for concrete parameter signatures
+    scope1 = analyze_unit_variable_scope(u1)
+    scope2 = analyze_unit_variable_scope(u2)
     scope = analyze_unit_variable_scope(u1, u2)
-    if scope["inputs"]:
-        params_str = ", ".join(f"{arg}: Any" for arg in scope["inputs"])
-    else:
-        params_str = "*args: Any, **kwargs: Any"
+
+    meta1 = {p["name"].lstrip("*"): p for p in scope1.get("param_details", [])}
+    meta2 = {p["name"].lstrip("*"): p for p in scope2.get("param_details", [])}
+
+    inputs = list(scope["inputs"])
+    for special in ("cls", "self"):
+        if special in inputs:
+            inputs.remove(special)
+            inputs.insert(0, special)
+
+    params: List[str] = []
+    seen_kwonly = False
+
+    # Extract parameter descriptors
+    descriptors: List[Dict[str, Any]] = []
+    for var in inputs:
+        m1 = meta1.get(var, {})
+        m2 = meta2.get(var, {})
+
+        t1 = m1.get("type")
+        t2 = m2.get("type")
+        if t1 and t2:
+            resolved_type = t1 if t1 == t2 else "Any"
+        elif t1:
+            resolved_type = t1
+        elif t2:
+            resolved_type = t2
+        else:
+            resolved_type = "Any"
+
+        d1 = m1.get("default")
+        d2 = m2.get("default")
+        resolved_default = d1 if (d1 and d2 and d1 == d2) else None
+
+        kind = m1.get("kind") or m2.get("kind") or "pos"
+        descriptors.append({
+            "var": var,
+            "type": resolved_type,
+            "default": resolved_default,
+            "kind": kind,
+        })
+
+    # Validate positional argument default order (non-default cannot follow default)
+    has_pos_default = False
+    invalid_pos_defaults = False
+    for desc in descriptors:
+        if desc["kind"] == "pos":
+            if desc["default"] is not None:
+                has_pos_default = True
+            elif has_pos_default:
+                invalid_pos_defaults = True
+                break
+    if invalid_pos_defaults:
+        for desc in descriptors:
+            if desc["kind"] == "pos":
+                desc["default"] = None
+
+    # Render formatted parameters
+    for desc in descriptors:
+        var = desc["var"]
+        resolved_type = desc["type"]
+        resolved_default = desc["default"]
+        kind = desc["kind"]
+        prefix = "*" if kind == "vararg" else ("**" if kind == "kwarg" else "")
+        var_name = f"{prefix}{var}"
+
+        if kind == "kwonly" and not seen_kwonly and not any("*" in p for p in params):
+            params.append("*")
+            seen_kwonly = True
+
+        if resolved_default is not None:
+            params.append(f"{var_name}: {resolved_type} = {resolved_default}")
+        else:
+            params.append(f"{var_name}: {resolved_type}")
+
+    return_type = scope.get("return_type") or "Any"
+    params_str = ", ".join(params) if params else "*args: Any, **kwargs: Any"
 
     # Indent body
     indented_body = "\n".join(f"    {ln}" if ln.strip() else "" for ln in common_lines)
-    return f"def {helper_name}({params_str}) -> Any:\n    \"\"\"Auto-extracted shared helper for duplicate logic.\"\"\"\n{indented_body}\n"
+    return (
+        f"def {helper_name}({params_str}) -> {return_type}:\n"
+        f"    \"\"\"Auto-extracted shared helper for duplicate logic.\"\"\"\n"
+        f"{indented_body}\n"
+    )
 
 
 def generate_refactoring_patch(
