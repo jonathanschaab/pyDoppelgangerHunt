@@ -92,7 +92,7 @@ try {
 # --- GATE 6: PYTEST TEST SUITE & COVERAGE ---
 Write-GateHeader "6" "Test Suite & Code Coverage Verification (Pytest >= 85%)"
 try {
-    python -m pytest -q
+    python -m pytest -q --cov=pydoppelgangerhunt --cov-report=term-missing --cov-report=xml
     if ($LASTEXITCODE -ne 0) { throw "Pytest reported test failures or coverage fell below threshold." }
     Write-GateSuccess "6" "Test Suite & Code Coverage Verification (Pytest)"
 } catch {

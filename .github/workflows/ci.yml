@@ -48,7 +48,7 @@ jobs:
 
       - name: Gate 3 — Unit Tests & Code Coverage (Pytest >= 85%)
         run: |
-          python -m pytest -v
+          python -m pytest -v --cov=pydoppelgangerhunt --cov-report=term-missing --cov-report=xml
 
       - name: Gate 4 — Static Application Security Testing (Bandit)
         run: |
@@ -57,7 +57,7 @@ jobs:
       - name: Gate 5 — Supply Chain CVE Auditing (pip-audit)
         if: matrix.python-version != '3.9'
         run: |
-          python -m pip_audit .
+          python -m pip_audit . --local
 
       - name: Gate 6 — Dependency Packaging Hygiene (deptry)
         if: matrix.python-version != '3.9'

@@ -84,7 +84,7 @@ exclude = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "--cov=pydoppelgangerhunt --cov-report=term-missing --cov-report=xml"
+addopts = "-ra -q"
 
 [tool.coverage.run]
 source = ["pydoppelgangerhunt"]
