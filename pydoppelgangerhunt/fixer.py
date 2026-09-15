@@ -5,12 +5,15 @@ from __future__ import annotations
 import ast
 import builtins
 import difflib
+import logging
 import os
 from pathlib import Path
 import textwrap
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from pydoppelgangerhunt.reporters import extract_unit_source_code
+
+logger = logging.getLogger(__name__)
 
 BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
@@ -47,14 +50,16 @@ class _ScopeVisitor(ast.NodeVisitor):
         if arg_node.annotation is not None:
             try:
                 type_val = ast.unparse(arg_node.annotation)
-            except Exception:
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                logger.debug("Failed to unparse argument annotation %r: %s", arg_node.annotation, exc)
                 type_val = None
 
         default_val = None
         if default_node is not None:
             try:
                 default_val = ast.unparse(default_node)
-            except Exception:
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                logger.debug("Failed to unparse default value %r: %s", default_node, exc)
                 default_val = None
 
         prefix = "*" if kind == "vararg" else ("**" if kind == "kwarg" else "")
@@ -69,7 +74,8 @@ class _ScopeVisitor(ast.NodeVisitor):
         if node.returns is not None:
             try:
                 self.return_type = ast.unparse(node.returns)
-            except Exception:
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                logger.debug("Failed to unparse return annotation %r: %s", node.returns, exc)
                 self.return_type = None
 
         pos_and_plain = node.args.posonlyargs + node.args.args
@@ -105,7 +111,8 @@ class _ScopeVisitor(ast.NodeVisitor):
                 inner_args.add(node.args.kwarg.arg)
             self._scope_stack.append(inner_args)
 
-        self.generic_visit(node)
+        for stmt in node.body:
+            self.visit(stmt)
         self._scope_stack.pop()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -230,6 +237,9 @@ def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
         if nl not in inputs:
             inputs.append(nl)
 
+    # Nonlocal variables are marked as outputs only when stored (mutated) within this unit.
+    # Read-only nonlocals act as outer closure inputs; if they are modified by an outer scope
+    # rather than within this function, that mutation is external to this unit's write scope.
     outputs = list(visitor.returns)
     for nl in visitor.nonlocals:
         if nl in visitor.stores and nl not in outputs:
@@ -298,8 +308,31 @@ def analyze_unit_variable_scope(
     }
 
 
-def synthesize_shared_helper_code(u1: Dict[str, Any], u2: Dict[str, Any]) -> str:
-    """Synthesizes a proposed shared helper function stub from two clone units."""
+def _merge_types(t1: Optional[str], t2: Optional[str], strategy: str) -> str:
+    """Merges two type annotations according to the specified merge strategy."""
+    if t1 and t2:
+        if t1 == t2:
+            return t1
+        if strategy == "union":
+            return f"Union[{t1}, {t2}]"
+        return "Any"
+    return t1 or t2 or "Any"
+
+
+def synthesize_shared_helper_code(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    type_merge_strategy: str = "fallback_any",
+) -> str:
+    """Synthesizes a proposed shared helper function stub from two clone units.
+
+    Args:
+        u1: First clone unit dictionary.
+        u2: Second clone unit dictionary.
+        type_merge_strategy: Strategy for merging conflicting types.
+            Options: "fallback_any" (default, falls back to Any)
+            or "union" (suggests typing.Union[T1, T2]).
+    """
     lines1 = [ln.rstrip("\r\n") for ln in extract_unit_source_code(u1)]
     lines2 = [ln.rstrip("\r\n") for ln in extract_unit_source_code(u2)]
 
@@ -326,10 +359,6 @@ def synthesize_shared_helper_code(u1: Dict[str, Any], u2: Dict[str, Any]) -> str
     meta2 = {p["name"].lstrip("*"): p for p in scope2.get("param_details", [])}
 
     inputs = list(scope["inputs"])
-    for special in ("cls", "self"):
-        if special in inputs:
-            inputs.remove(special)
-            inputs.insert(0, special)
 
     params: List[str] = []
     seen_kwonly = False
@@ -342,14 +371,7 @@ def synthesize_shared_helper_code(u1: Dict[str, Any], u2: Dict[str, Any]) -> str
 
         t1 = m1.get("type")
         t2 = m2.get("type")
-        if t1 and t2:
-            resolved_type = t1 if t1 == t2 else "Any"
-        elif t1:
-            resolved_type = t1
-        elif t2:
-            resolved_type = t2
-        else:
-            resolved_type = "Any"
+        resolved_type = _merge_types(t1, t2, type_merge_strategy)
 
         d1 = m1.get("default")
         d2 = m2.get("default")
@@ -362,6 +384,17 @@ def synthesize_shared_helper_code(u1: Dict[str, Any], u2: Dict[str, Any]) -> str
             "default": resolved_default,
             "kind": kind,
         })
+
+    # Validate and ensure canonical argument kind ordering (self/cls -> pos -> vararg -> kwonly -> kwarg)
+    def _kind_rank(desc: Dict[str, Any]) -> Tuple[int, int]:
+        var = desc["var"]
+        kind = desc["kind"]
+        if var in ("self", "cls"):
+            return (0, 0)
+        rank_map = {"pos": 1, "vararg": 2, "kwonly": 3, "kwarg": 4}
+        return (rank_map.get(kind, 1), 1)
+
+    descriptors.sort(key=_kind_rank)
 
     # Validate positional argument default order (non-default cannot follow default)
     has_pos_default = False
@@ -396,7 +429,10 @@ def synthesize_shared_helper_code(u1: Dict[str, Any], u2: Dict[str, Any]) -> str
         else:
             params.append(f"{var_name}: {resolved_type}")
 
-    return_type = scope.get("return_type") or "Any"
+    r1 = scope1.get("return_type")
+    r2 = scope2.get("return_type")
+    return_type = _merge_types(r1, r2, type_merge_strategy)
+
     params_str = ", ".join(params) if params else "*args: Any, **kwargs: Any"
 
     # Indent body
@@ -411,6 +447,7 @@ def synthesize_shared_helper_code(u1: Dict[str, Any], u2: Dict[str, Any]) -> str
 def generate_refactoring_patch(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     repo_root: Optional[str] = None,
+    type_merge_strategy: str = "fallback_any",
 ) -> str:
     """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
     if not clones:
@@ -432,7 +469,9 @@ def generate_refactoring_patch(
             continue
 
         orig_lines = orig_text.splitlines(keepends=True)
-        helper_code = synthesize_shared_helper_code(u1, u2)
+        helper_code = synthesize_shared_helper_code(
+            u1, u2, type_merge_strategy=type_merge_strategy
+        )
 
         # Prepend helper to file as candidate patch
         modified_lines = [helper_code + "\n\n"] + orig_lines

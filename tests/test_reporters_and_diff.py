@@ -920,10 +920,43 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
     u_o1 = {"file": str(file_ord1), "start": 1, "end": 2, "name": "order_func"}
     u_o2 = {"file": str(file_ord2), "start": 1, "end": 2, "name": "order_func_v2"}
     helper_ord = synthesize_shared_helper_code(u_o1, u_o2)
-    # Since b defaults differ (2 vs 3), b has no default, invalidating positional default on a
     sig_ord = helper_ord.split("\n")[0]
     assert "a: int, b: int" in sig_ord
     assert "= 1" not in sig_ord
+
+    # Test type_merge_strategy="union"
+    helper_union = synthesize_shared_helper_code(u_c1, u_c2, type_merge_strategy="union")
+    sig_union = helper_union.split("\n")[0]
+    assert "Union[int, float]" in sig_union
+    assert "Union[int, str]" in sig_union
+
+    # Test read-only nonlocal variable (in inputs, but NOT in outputs)
+    file_ro_nl = tmp_path / "ro_nonlocal.py"
+    file_ro_nl.write_text(
+        "def read_only_step(x: int) -> int:\n"
+        "    nonlocal scale_factor\n"
+        "    return x * scale_factor\n",
+        encoding="utf-8",
+    )
+    u_ro_nl = {"file": str(file_ro_nl), "start": 1, "end": 3, "name": "read_only_step"}
+    scope_ro_nl = analyze_unit_variable_scope(u_ro_nl)
+    assert "scale_factor" in scope_ro_nl["inputs"]
+    assert "scale_factor" in scope_ro_nl["nonlocals"]
+    # Conservative check: scale_factor was only read, never stored, so NOT in outputs
+    assert "scale_factor" not in scope_ro_nl["outputs"]
+
+    # Test canonical argument kind ordering (pos -> vararg -> kwonly -> kwarg)
+    file_full_args = tmp_path / "full_args.py"
+    file_full_args.write_text(
+        "def complex_sig(self, a: int, *args: Any, b: int = 1, **kwargs: Any) -> bool:\n"
+        "    return True\n",
+        encoding="utf-8",
+    )
+    u_fa = {"file": str(file_full_args), "start": 1, "end": 2, "name": "complex_sig"}
+    helper_fa = synthesize_shared_helper_code(u_fa, u_fa)
+    sig_fa = helper_fa.split("\n")[0]
+    assert "self: Any, a: int, *args: Any, b: int = 1, **kwargs: Any" in sig_fa
+    assert "-> bool:" in sig_fa
 
 
     # Test empty / invalid source unit
