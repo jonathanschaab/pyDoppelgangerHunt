@@ -1,4 +1,4 @@
-name: CI
+name: CI & Security Quality Gates
 
 on:
   push:
@@ -6,8 +6,17 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
-  test:
+  quality-gates:
+    name: Quality Gates (${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -15,34 +24,62 @@ jobs:
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout repository
+        uses: actions/checkout@v7
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
+          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install .[dev]
 
-      - name: Run unit tests
+      - name: Gate 1 — Type Safety (Mypy)
+        run: |
+          python -m mypy pydoppelgangerhunt tests
+
+      - name: Gate 2 — Code Quality & Linting (Pylint)
+        run: |
+          python -m pylint pydoppelgangerhunt tests
+
+      - name: Gate 3 — Unit Tests & Code Coverage (Pytest >= 85%)
         run: |
           python -m pytest -v
 
-      - name: Run static type checking (Mypy)
+      - name: Gate 4 — Static Application Security Testing (Bandit)
         run: |
-          python -m mypy pydoppelgangerhunt
+          python -m bandit -r pydoppelgangerhunt -ll -q
 
-      - name: Run linter (Pylint)
+      - name: Gate 5 — Supply Chain CVE Auditing (pip-audit)
+        if: matrix.python-version != '3.9'
         run: |
-          pylint pydoppelgangerhunt
+          python -m pip_audit .
 
-      - name: Run security scan (Bandit)
+      - name: Gate 6 — Dependency Packaging Hygiene (deptry)
+        if: matrix.python-version != '3.9'
         run: |
-          bandit -r pydoppelgangerhunt -ll -q
+          python -m deptry .
 
-      - name: Self-scan clone audit
+      - name: Gate 7 — Dogfooding Code Clone Barrier (Dual-Tier)
         run: |
-          python -m pydoppelgangerhunt.cli pydoppelgangerhunt --threshold 0.85 --min-lines 6
+          python -m pydoppelgangerhunt.cli pydoppelgangerhunt --threshold 0.70 --min-lines 8 --sliding-window --idioms
+          python -m pydoppelgangerhunt.cli pydoppelgangerhunt --threshold 0.80 --min-lines 6 --idioms
+
+  cloud-secret-scan:
+    name: Cloud Secret Scanning (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code (Full History)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks Secret Detection
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

@@ -52,9 +52,12 @@ pydoppelgangerhunt = "pydoppelgangerhunt.cli:main"
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
     "mypy>=1.0.0",
     "pylint>=3.0.0",
     "bandit>=1.7.0",
+    "deptry>=0.12.0; python_version >= '3.10'",
+    "pip-audit>=2.7.0; python_version >= '3.10'",
     "build>=1.0.0",
     "tomli>=2.0.0; python_version < '3.11'",
 ]
@@ -66,6 +69,7 @@ include = ["pydoppelgangerhunt*"]
 threshold = 0.90
 min_lines = 8
 min_tokens = 15
+idioms = true
 exclude = [
     "tests",
     ".git",
@@ -80,6 +84,38 @@ exclude = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+addopts = "--cov=pydoppelgangerhunt --cov-report=term-missing --cov-report=xml"
+
+[tool.coverage.run]
+source = ["pydoppelgangerhunt"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+show_missing = true
+skip_covered = true
+fail_under = 85.0
+
+[tool.deptry]
+known_first_party = ["pydoppelgangerhunt"]
+extend_exclude = [
+    "tests"
+]
+optional_dependencies_dev_groups = ["dev"]
+
+[tool.deptry.package_module_name_map]
+build = "build"
+
+[tool.deptry.per_rule_ignores]
+DEP004 = [
+    "tomli"
+]
 
 [tool.mypy]
 python_version = "3.10"
