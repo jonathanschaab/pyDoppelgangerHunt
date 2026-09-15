@@ -14,6 +14,10 @@ def compute_unit_structural_hash(unit: Dict[str, Any]) -> str:
     if "structural_hash" in unit and unit["structural_hash"]:
         return str(unit["structural_hash"])
     tokens = unit.get("tokens", [])
+    # Truncating SHA-256 to 16 hex characters provides 64 bits of entropy (keyspace: 2^64 ≈ 1.84e19).
+    # Per the Birthday Paradox, the collision probability P for N items is approximately P ≈ N^2 / (2 * 2^64).
+    # For a large repository with N = 100,000 units, P ≈ 2.7e-10 (< 1 in 3.7 billion).
+    # Even for N = 1,000,000 units, P ≈ 2.7e-8 (< 1 in 37 million). A 50% collision threshold requires ~5.06 billion units.
     if tokens:
         return hashlib.sha256(" ".join(tokens).encode("utf-8")).hexdigest()[:16]
     vec = unit.get("vector", {})

@@ -658,6 +658,8 @@ def _record_unit(
                 abstract_expressions=abstract_expressions,
                 strip_docstrings=strip_docstrings,
             )
+            # 16 hex chars = 64 bits of entropy (2^64 keyspace). Collision probability for N=100k
+            # units is P ≈ N^2 / (2 * 2^64) ≈ 2.7e-10 (< 1 in 3.7B), rendering collisions negligible.
             structural_hash = hashlib.sha256(" ".join(tokens).encode("utf-8")).hexdigest()[:16]
             units.append({
                 "name": name,
