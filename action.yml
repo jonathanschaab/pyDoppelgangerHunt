@@ -1,0 +1,44 @@
+name: "pyDoppelgangerHunt"
+description: "AST structural code clone detector, redundancy gate, and refactoring patch synthesizer"
+inputs:
+  target:
+    description: "Directory or package to scan"
+    required: false
+    default: "."
+  threshold:
+    description: "Minimum similarity threshold (0.0 - 1.0)"
+    required: false
+    default: "0.90"
+  min_lines:
+    description: "Minimum lines of code per code block"
+    required: false
+    default: "8"
+  summary:
+    description: "Write GitHub Step Summary Markdown report"
+    required: false
+    default: "true"
+  github_annotations:
+    description: "Emit GitHub Actions PR diff annotations"
+    required: false
+    default: "true"
+  sarif_output:
+    description: "Output path for SARIF 2.1.0 report"
+    required: false
+    default: ""
+runs:
+  using: "composite"
+  steps:
+    - name: Run pyDoppelgangerHunt
+      shell: bash
+      run: |
+        ARGS="${{ inputs.target }} --threshold ${{ inputs.threshold }} --min-lines ${{ inputs.min_lines }}"
+        if [ "${{ inputs.summary }}" = "true" ]; then
+          ARGS="$ARGS --summary $GITHUB_STEP_SUMMARY"
+        fi
+        if [ "${{ inputs.github_annotations }}" = "true" ]; then
+          ARGS="$ARGS --github-annotations"
+        fi
+        if [ -n "${{ inputs.sarif_output }}" ]; then
+          ARGS="$ARGS --format sarif --output ${{ inputs.sarif_output }}"
+        fi
+        python -m pydoppelgangerhunt.cli $ARGS

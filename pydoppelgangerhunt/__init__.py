@@ -1,0 +1,136 @@
+"""pyDoppelgangerHunt: High-Performance AST Structural Code Clone & Redundancy Gate."""
+
+from __future__ import annotations
+
+from pydoppelgangerhunt.baseline import (
+    clone_pair_fingerprint,
+    filter_clones_by_baseline,
+    load_baseline,
+    record_baseline,
+)
+from pydoppelgangerhunt.cli import build_arg_parser, main
+from pydoppelgangerhunt.clustering import UnionFind, cluster_clone_families, unit_key
+from pydoppelgangerhunt.config import (
+    DEFAULT_EXCLUDES,
+    DEFAULT_TOOL_TOML_CONTENT,
+    init_tool_configuration,
+    load_toml_section,
+    load_tool_config,
+)
+from pydoppelgangerhunt.coverage import (
+    check_asymmetric_coverage,
+    compute_unit_coverage,
+    read_coverage_data,
+)
+from pydoppelgangerhunt.fixer import (
+    generate_refactoring_patch,
+    synthesize_shared_helper_code,
+)
+from pydoppelgangerhunt.git_diff import (
+    check_temporal_divergence,
+    filter_clones_by_git_diff,
+    get_git_blame_info,
+    get_git_modified_line_ranges,
+    is_unit_in_modified_ranges,
+    parse_git_diff_hunks,
+)
+from pydoppelgangerhunt.matcher import (
+    call_sequence_similarity,
+    compute_pair_similarity,
+    compute_priority_score,
+    jaccard_similarity,
+    lcs_alignment_similarity,
+    merge_adjacent_clones,
+    multiset_jaccard_similarity,
+    scan_target,
+    suppress_subclones,
+    tfidf_jaccard_similarity,
+    tfidf_multiset_jaccard_similarity,
+)
+from pydoppelgangerhunt.metrics import compute_repository_dry_stats
+from pydoppelgangerhunt.parser import (
+    BUILTIN_NAMES,
+    compute_cyclomatic_complexity,
+    extract_call_sequence,
+    get_ast_characteristic_vector,
+    get_ast_shingles,
+    get_ast_tokens,
+    harvest_file_units,
+    harvest_notebook_units,
+    is_boilerplate_node,
+)
+from pydoppelgangerhunt.reporters import (
+    colorize,
+    emit_structured_report,
+    extract_unit_source_code,
+    format_github_annotations,
+    format_json_report,
+    format_markdown_summary,
+    format_sarif_report,
+    generate_clone_diff,
+    generate_html_report,
+    supports_color,
+    synthesize_refactoring_suggestion,
+)
+
+__version__ = "1.0.0"
+__all__ = [
+    "__version__",
+    "main",
+    "build_arg_parser",
+    "scan_target",
+    "harvest_file_units",
+    "harvest_notebook_units",
+    "compute_cyclomatic_complexity",
+    "compute_priority_score",
+    "UnionFind",
+    "cluster_clone_families",
+    "unit_key",
+    "get_ast_tokens",
+    "get_ast_shingles",
+    "get_ast_characteristic_vector",
+    "extract_call_sequence",
+    "is_boilerplate_node",
+    "compute_pair_similarity",
+    "jaccard_similarity",
+    "multiset_jaccard_similarity",
+    "lcs_alignment_similarity",
+    "call_sequence_similarity",
+    "tfidf_jaccard_similarity",
+    "tfidf_multiset_jaccard_similarity",
+    "merge_adjacent_clones",
+    "suppress_subclones",
+    "compute_repository_dry_stats",
+    "format_sarif_report",
+    "format_json_report",
+    "format_markdown_summary",
+    "format_github_annotations",
+    "generate_html_report",
+    "emit_structured_report",
+    "generate_clone_diff",
+    "synthesize_refactoring_suggestion",
+    "extract_unit_source_code",
+    "supports_color",
+    "colorize",
+    "parse_git_diff_hunks",
+    "get_git_modified_line_ranges",
+    "is_unit_in_modified_ranges",
+    "filter_clones_by_git_diff",
+    "get_git_blame_info",
+    "check_temporal_divergence",
+    "read_coverage_data",
+    "compute_unit_coverage",
+    "check_asymmetric_coverage",
+    "synthesize_shared_helper_code",
+    "generate_refactoring_patch",
+    "record_baseline",
+    "load_baseline",
+    "filter_clones_by_baseline",
+    "clone_pair_fingerprint",
+    "load_toml_section",
+    "load_tool_config",
+    "init_tool_configuration",
+    "DEFAULT_EXCLUDES",
+    "DEFAULT_TOOL_TOML_CONTENT",
+    "BUILTIN_NAMES",
+]

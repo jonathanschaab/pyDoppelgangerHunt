@@ -1,0 +1,548 @@
+"""Clone matching algorithms, SourcererCC bound pruning, and target scanner."""
+
+from __future__ import annotations
+
+import concurrent.futures
+import math
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+
+from pydoppelgangerhunt.config import find_python_files
+from pydoppelgangerhunt.parser import harvest_file_units
+
+
+def lcs_alignment_similarity(
+    tokens_a: Sequence[str],
+    tokens_b: Sequence[str],
+    threshold: Optional[float] = None,
+) -> float:
+    """Computes CCAligner-style Longest Common Subsequence alignment similarity between two token sequences."""
+    if not tokens_a or not tokens_b:
+        return 0.0
+    len_a = len(tokens_a)
+    len_b = len(tokens_b)
+    # SourcererCC theoretical upper-bound check: max possible similarity
+    max_possible = (2.0 * min(len_a, len_b)) / (len_a + len_b)
+    if threshold is not None and max_possible < threshold:
+        return 0.0
+
+    if len_a < len_b:
+        tokens_a, tokens_b = tokens_b, tokens_a
+        len_a, len_b = len_b, len_a
+    m = len_b
+    dp = [0] * (m + 1)
+    for tok_a in tokens_a:
+        prev = 0
+        for j in range(1, m + 1):
+            temp = dp[j]
+            if tok_a == tokens_b[j - 1]:
+                dp[j] = prev + 1
+            elif dp[j - 1] > dp[j]:
+                dp[j] = dp[j - 1]
+            prev = temp
+    return (2.0 * dp[m]) / (len_a + len_b)
+
+
+def call_sequence_similarity(seq1: Sequence[str], seq2: Sequence[str]) -> float:
+    """Computes sequence alignment similarity between two function/method call traces."""
+    if not seq1 or not seq2:
+        return 0.0
+    return lcs_alignment_similarity(seq1, seq2)
+
+
+def jaccard_similarity(set_a: Set[Any], set_b: Set[Any]) -> float:
+    """Computes Jaccard similarity score between two shingle sets."""
+    if not set_a or not set_b:
+        return 0.0
+    intersection = len(set_a.intersection(set_b))
+    union = len(set_a.union(set_b))
+    return intersection / union if union > 0 else 0.0
+
+
+def tfidf_multiset_jaccard_similarity(
+    vec_a: Dict[Any, int], vec_b: Dict[Any, int], idf_weights: Dict[Any, float]
+) -> float:
+    """Computes TF-IDF weighted multiset Jaccard similarity between two token frequency vectors."""
+    if not vec_a or not vec_b:
+        return 0.0
+    all_keys = set(vec_a.keys()).union(vec_b.keys())
+    intersection_sum = sum(
+        min(vec_a.get(k, 0), vec_b.get(k, 0)) * idf_weights.get(k, 1.0) for k in all_keys
+    )
+    union_sum = sum(
+        max(vec_a.get(k, 0), vec_b.get(k, 0)) * idf_weights.get(k, 1.0) for k in all_keys
+    )
+    return intersection_sum / union_sum if union_sum > 0 else 0.0
+
+
+def multiset_jaccard_similarity(vec_a: Dict[str, int], vec_b: Dict[str, int]) -> float:
+    """Computes multiset Jaccard (Ruzicka) similarity between two token frequency vectors."""
+    return tfidf_multiset_jaccard_similarity(vec_a, vec_b, idf_weights={})
+
+
+def tfidf_jaccard_similarity(
+    set_a: Set[Any], set_b: Set[Any], idf_weights: Dict[Any, float]
+) -> float:
+    """Computes TF-IDF weighted Jaccard similarity between two shingle sets."""
+    if not idf_weights:
+        return jaccard_similarity(set_a, set_b)
+    return tfidf_multiset_jaccard_similarity(
+        dict.fromkeys(set_a, 1), dict.fromkeys(set_b, 1), idf_weights
+    )
+
+
+def compute_pair_similarity(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    *,
+    bag_of_tokens: bool = False,
+    tfidf: bool = False,
+    gapped_tolerance: bool = False,
+    call_sequences: bool = False,
+    idf_weights: Optional[Dict[Any, float]] = None,
+    threshold: Optional[float] = None,
+) -> float:
+    """Computes similarity between two code units under configured metric."""
+    if call_sequences:
+        c1 = u1.get("calls", [])
+        c2 = u2.get("calls", [])
+        if len(c1) >= 3 and len(c2) >= 3:
+            return call_sequence_similarity(c1, c2)
+        return 0.0
+
+    len1 = u1.get("token_count", len(u1.get("tokens", [])))
+    len2 = u2.get("token_count", len(u2.get("tokens", [])))
+    if threshold is not None and len1 > 0 and len2 > 0:
+        max_possible = (2.0 * min(len1, len2)) / (len1 + len2)
+        if max_possible < threshold:
+            return 0.0
+
+    if tfidf and idf_weights is not None:
+        if bag_of_tokens:
+            return tfidf_multiset_jaccard_similarity(
+                u1.get("vector", {}), u2.get("vector", {}), idf_weights
+            )
+        return tfidf_jaccard_similarity(
+            u1.get("shingles", set()), u2.get("shingles", set()), idf_weights
+        )
+    if gapped_tolerance:
+        # SourcererCC Theorem: LCS similarity >= T requires Multiset Jaccard >= T / (2 - T)
+        if threshold is not None and threshold > 0:
+            min_m_jaccard = threshold / (2.0 - threshold)
+            m_jaccard = multiset_jaccard_similarity(u1.get("vector", {}), u2.get("vector", {}))
+            if m_jaccard < min_m_jaccard:
+                return 0.0
+        return lcs_alignment_similarity(
+            u1.get("tokens", []), u2.get("tokens", []), threshold=threshold
+        )
+    if bag_of_tokens:
+        return multiset_jaccard_similarity(u1.get("vector", {}), u2.get("vector", {}))
+    return jaccard_similarity(u1.get("shingles", set()), u2.get("shingles", set()))
+
+
+def merge_adjacent_clones(
+    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
+    line_tolerance: int = 2,
+    threshold: Optional[float] = None,
+    bag_of_tokens: bool = False,
+    tfidf: bool = False,
+    idf_weights: Optional[Dict[Any, float]] = None,
+    gapped_tolerance: bool = False,
+) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]:
+    """Merges adjacent and overlapping clone pairs into maximal continuous clone regions."""
+    if not clones:
+        return []
+
+    canonical: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
+    for sim, u1, u2 in clones:
+        k1 = (u1["file"], u1["start"], u1["name"])
+        k2 = (u2["file"], u2["start"], u2["name"])
+        if k1 <= k2:
+            canonical.append((sim, dict(u1), dict(u2)))
+        else:
+            canonical.append((sim, dict(u2), dict(u1)))
+
+    merged_clones = canonical
+    changed = True
+
+    while changed:
+        changed = False
+        new_clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
+        skip: Set[int] = set()
+
+        for i, (sim_a, u1_a, u2_a) in enumerate(merged_clones):
+            if i in skip:
+                continue
+
+            current_u1 = dict(u1_a)
+            current_u2 = dict(u2_a)
+            merged_with_any = False
+
+            for j in range(i + 1, len(merged_clones)):
+                if j in skip:
+                    continue
+                _sim_b, u1_b, u2_b = merged_clones[j]
+
+                if current_u1["file"] != u1_b["file"] or current_u2["file"] != u2_b["file"]:
+                    continue
+
+                fn1_a = current_u1["name"].split(":")[0]
+                fn1_b = u1_b["name"].split(":")[0]
+                fn2_a = current_u2["name"].split(":")[0]
+                fn2_b = u2_b["name"].split(":")[0]
+                if fn1_a != fn1_b or fn2_a != fn2_b:
+                    continue
+
+                adj1 = (u1_b["start"] <= current_u1["end"] + line_tolerance) and (
+                    u1_b["end"] >= current_u1["start"] - line_tolerance
+                )
+                adj2 = (u2_b["start"] <= current_u2["end"] + line_tolerance) and (
+                    u2_b["end"] >= current_u2["start"] - line_tolerance
+                )
+
+                if not (adj1 and adj2):
+                    continue
+
+                current_u1["start"] = min(current_u1["start"], u1_b["start"])
+                current_u1["end"] = max(current_u1["end"], u1_b["end"])
+                current_u1["lines"] = current_u1["end"] - current_u1["start"] + 1
+                current_u1["shingles"] = set(current_u1["shingles"]).union(u1_b["shingles"])
+                current_u1["token_count"] = max(current_u1["token_count"], u1_b["token_count"])
+                current_u1["tokens"] = current_u1.get("tokens", []) + u1_b.get("tokens", [])
+                current_u1["name"] = f"{fn1_a}:merged_{current_u1['start']}-{current_u1['end']}"
+                v1_a = current_u1.get("vector", {})
+                v1_b = u1_b.get("vector", {})
+                current_u1["vector"] = {k: v1_a.get(k, 0) + v1_b.get(k, 0) for k in set(v1_a).union(v1_b)}
+
+                current_u2["start"] = min(current_u2["start"], u2_b["start"])
+                current_u2["end"] = max(current_u2["end"], u2_b["end"])
+                current_u2["lines"] = current_u2["end"] - current_u2["start"] + 1
+                current_u2["shingles"] = set(current_u2["shingles"]).union(u2_b["shingles"])
+                current_u2["token_count"] = max(current_u2["token_count"], u2_b["token_count"])
+                current_u2["tokens"] = current_u2.get("tokens", []) + u2_b.get("tokens", [])
+                current_u2["name"] = f"{fn2_a}:merged_{current_u2['start']}-{current_u2['end']}"
+                v2_a = current_u2.get("vector", {})
+                v2_b = u2_b.get("vector", {})
+                current_u2["vector"] = {k: v2_a.get(k, 0) + v2_b.get(k, 0) for k in set(v2_a).union(v2_b)}
+
+                skip.add(j)
+                changed = True
+                merged_with_any = True
+
+            combined_sim = compute_pair_similarity(
+                current_u1,
+                current_u2,
+                bag_of_tokens=bag_of_tokens,
+                tfidf=tfidf,
+                gapped_tolerance=gapped_tolerance,
+                idf_weights=idf_weights,
+            )
+            if not merged_with_any:
+                combined_sim = sim_a
+            new_clones.append((combined_sim, current_u1, current_u2))
+
+        merged_clones = new_clones
+
+    if threshold is not None:
+        merged_clones = [c for c in merged_clones if c[0] >= threshold]
+
+    merged_clones.sort(key=lambda x: x[0], reverse=True)
+    return merged_clones
+
+
+def suppress_subclones(
+    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
+    sim_tolerance: float = 0.05,
+) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]:
+    """Eliminates redundant sub-clones geometrically contained within an enclosing parent clone."""
+    if len(clones) <= 1:
+        return clones
+
+    suppressed_indices: Set[int] = set()
+
+    for i, (sim_parent, p1, p2) in enumerate(clones):
+        if i in suppressed_indices:
+            continue
+        f1_p = p1["file"].replace("\\", "/")
+        f2_p = p2["file"].replace("\\", "/")
+
+        for j, (sim_child, c1, c2) in enumerate(clones):
+            if i == j or j in suppressed_indices:
+                continue
+            f1_c = c1["file"].replace("\\", "/")
+            f2_c = c2["file"].replace("\\", "/")
+
+            direct_match = (f1_p == f1_c and f2_p == f2_c)
+            reverse_match = (f1_p == f2_c and f2_p == f1_c)
+
+            if not (direct_match or reverse_match):
+                continue
+
+            c1_corr = c1 if direct_match else c2
+            c2_corr = c2 if direct_match else c1
+
+            c1_enclosed = p1["start"] <= c1_corr["start"] and c1_corr["end"] <= p1["end"]
+            c2_enclosed = p2["start"] <= c2_corr["start"] and c2_corr["end"] <= p2["end"]
+
+            if not (c1_enclosed and c2_enclosed):
+                continue
+
+            is_strictly_smaller = (
+                (c1_corr["start"] > p1["start"] or c1_corr["end"] < p1["end"])
+                or (c2_corr["start"] > p2["start"] or c2_corr["end"] < p2["end"])
+            )
+            if not is_strictly_smaller:
+                continue
+
+            if sim_parent >= sim_child - sim_tolerance:
+                suppressed_indices.add(j)
+
+    return [c for idx, c in enumerate(clones) if idx not in suppressed_indices]
+
+
+def _worker_harvest_file(task_kwargs: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Worker task wrapper for process pool executor."""
+    return harvest_file_units(**task_kwargs)
+
+
+def scan_target(
+    target_dir: str,
+    *,
+    min_lines: int = 8,
+    min_tokens: int = 15,
+    threshold: float = 0.90,
+    excludes: Optional[List[str]] = None,
+    functions_only: bool = False,
+    sliding_window: bool = False,
+    window_size: int = 5,
+    blind_indexing: bool = False,
+    merge_subtrees: bool = False,
+    complex_expressions: bool = False,
+    min_expr_complexity: int = 4,
+    clause_level: bool = False,
+    data_tables: bool = False,
+    strip_annotations: bool = False,
+    nms: bool = False,
+    class_level: bool = False,
+    blind_literals: bool = False,
+    bag_of_tokens: bool = False,
+    filter_boilerplate: bool = False,
+    consistent_renaming: bool = False,
+    tfidf: bool = False,
+    harvest_closures: bool = False,
+    commutative: bool = False,
+    comprehensions: bool = False,
+    idioms: bool = False,
+    abstract_expressions: bool = False,
+    gapped_tolerance: bool = False,
+    call_sequences: bool = False,
+    audit_tests: bool = False,
+    exemptions: Optional[List[Tuple[str, str]]] = None,
+    workers: Optional[int] = None,
+    sort_by: str = "similarity",
+    top_n: Optional[int] = None,
+    include_notebooks: bool = False,
+) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]:
+    units: List[Dict[str, Any]] = []
+    repo_root = Path.cwd()
+    file_list = find_python_files(
+        target_dir,
+        excludes=excludes,
+        audit_tests=audit_tests,
+        include_notebooks=include_notebooks,
+    )
+
+    effective_workers = workers if workers is not None else 1
+    # Multi-core process pool when requested or on large repos
+    if effective_workers > 1 and len(file_list) >= 10:
+        task_list = [
+            {
+                "file_path": str(p),
+                "repo_root": str(repo_root),
+                "min_lines": min_lines,
+                "min_tokens": min_tokens,
+                "functions_only": functions_only,
+                "sliding_window": sliding_window,
+                "window_size": window_size,
+                "blind_indexing": blind_indexing,
+                "complex_expressions": complex_expressions,
+                "min_expr_complexity": min_expr_complexity,
+                "clause_level": clause_level,
+                "data_tables": data_tables,
+                "strip_annotations": strip_annotations,
+                "class_level": class_level,
+                "blind_literals": blind_literals,
+                "filter_boilerplate": filter_boilerplate,
+                "consistent_renaming": consistent_renaming,
+                "harvest_closures": harvest_closures,
+                "commutative": commutative,
+                "comprehensions": comprehensions,
+                "idioms": idioms,
+                "abstract_expressions": abstract_expressions,
+            }
+            for p in file_list
+        ]
+        with concurrent.futures.ProcessPoolExecutor(max_workers=effective_workers) as executor:
+            for file_units in executor.map(_worker_harvest_file, task_list):
+                units.extend(file_units)
+    else:
+        for p in file_list:
+            units.extend(
+                harvest_file_units(
+                    str(p),
+                    str(repo_root),
+                    min_lines=min_lines,
+                    min_tokens=min_tokens,
+                    functions_only=functions_only,
+                    sliding_window=sliding_window,
+                    window_size=window_size,
+                    blind_indexing=blind_indexing,
+                    complex_expressions=complex_expressions,
+                    min_expr_complexity=min_expr_complexity,
+                    clause_level=clause_level,
+                    data_tables=data_tables,
+                    strip_annotations=strip_annotations,
+                    class_level=class_level,
+                    blind_literals=blind_literals,
+                    filter_boilerplate=filter_boilerplate,
+                    consistent_renaming=consistent_renaming,
+                    harvest_closures=harvest_closures,
+                    commutative=commutative,
+                    comprehensions=comprehensions,
+                    idioms=idioms,
+                    abstract_expressions=abstract_expressions,
+                )
+            )
+
+    idf_weights: Dict[Any, float] = {}
+    if tfidf and units:
+        corpus_size = len(units)
+        df_counts: Dict[Any, int] = {}
+        for u in units:
+            keys = u.get("vector", {}).keys() if bag_of_tokens else u["shingles"]
+            for k in keys:
+                df_counts[k] = df_counts.get(k, 0) + 1
+        for k, df in df_counts.items():
+            idf_weights[k] = math.log((1.0 + corpus_size) / (1.0 + df)) + 1.0
+
+    shingle_index: Dict[Any, List[int]] = {}
+    for idx, u in enumerate(units):
+        if call_sequences:
+            index_keys = list(set(u.get("calls", [])))
+        elif bag_of_tokens:
+            index_keys = list(u.get("vector", {}).keys())
+        else:
+            index_keys = list(u["shingles"])
+        for sh in index_keys:
+            shingle_index.setdefault(sh, []).append(idx)
+
+    candidate_pairs: Set[Tuple[int, int]] = set()
+    for u_indices in shingle_index.values():
+        if len(u_indices) > 1:
+            for i, idx1 in enumerate(u_indices):
+                for idx2 in u_indices[i + 1:]:
+                    candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))
+
+    raw_exemptions = exemptions if exemptions is not None else []
+    normalized_exemptions = {
+        tuple(sorted([k1.replace("\\", "/"), k2.replace("\\", "/")]))
+        for k1, k2 in raw_exemptions
+    }
+
+    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
+    for i, j in candidate_pairs:
+        u1, u2 = units[i], units[j]
+
+        if audit_tests and not (u1["name"].startswith("test_") and u2["name"].startswith("test_")):
+            continue
+
+        f1 = u1["file"].replace("\\", "/")
+        f2 = u2["file"].replace("\\", "/")
+
+        if f1 == f2:
+            fn1 = u1["name"].split(":")[0]
+            fn2 = u2["name"].split(":")[0]
+            if fn1 == fn2:
+                if max(u1["start"], u2["start"]) <= min(u1["end"], u2["end"]):
+                    continue
+            elif (u1["start"] <= u2["start"] and u1["end"] >= u2["end"]) or (u2["start"] <= u1["start"] and u2["end"] >= u1["end"]):
+                continue
+
+        # Skip if size differs significantly
+        if u1["token_count"] > 2.5 * u2["token_count"] or u2["token_count"] > 2.5 * u1["token_count"]:
+            continue
+
+        t_count1 = u1["token_count"]
+        t_count2 = u2["token_count"]
+        if not call_sequences and t_count1 > 0 and t_count2 > 0:
+            max_bound = (2.0 * min(t_count1, t_count2)) / (t_count1 + t_count2)
+            if max_bound < threshold:
+                continue
+
+        f1_pkg = f1
+        f2_pkg = f2
+        for pfx in ("pyfloorplanner/", "src/", "pydoppelgangerhunt/"):
+            if f1_pkg.startswith(pfx):
+                f1_pkg = f1_pkg[len(pfx):]
+            if f2_pkg.startswith(pfx):
+                f2_pkg = f2_pkg[len(pfx):]
+
+        pair_id_rel = tuple(sorted([f"{f1}:{u1['name']}", f"{f2}:{u2['name']}"]))
+        pair_id_pkg = tuple(sorted([f"{f1_pkg}:{u1['name']}", f"{f2_pkg}:{u2['name']}"]))
+        pair_id_base = tuple(sorted([f"{os.path.basename(f1)}:{u1['name']}", f"{os.path.basename(f2)}:{u2['name']}"]))
+        if (
+            pair_id_rel in normalized_exemptions
+            or pair_id_pkg in normalized_exemptions
+            or pair_id_base in normalized_exemptions
+        ):
+            continue
+
+        sim = compute_pair_similarity(
+            u1,
+            u2,
+            bag_of_tokens=bag_of_tokens,
+            tfidf=tfidf,
+            gapped_tolerance=gapped_tolerance,
+            call_sequences=call_sequences,
+            idf_weights=idf_weights if tfidf else None,
+            threshold=threshold,
+        )
+        if sim >= threshold:
+            clones.append((sim, u1, u2))
+
+    if merge_subtrees:
+        clones = merge_adjacent_clones(
+            clones,
+            threshold=threshold,
+            bag_of_tokens=bag_of_tokens,
+            tfidf=tfidf,
+            idf_weights=idf_weights if tfidf else None,
+            gapped_tolerance=gapped_tolerance,
+        )
+
+    if nms:
+        clones = suppress_subclones(clones)
+
+    if sort_by == "priority":
+        clones.sort(key=lambda x: compute_priority_score(x[0], x[1], x[2]), reverse=True)
+    elif sort_by == "sloc":
+        clones.sort(key=lambda x: (x[1]["end"] - x[1]["start"] + 1) + (x[2]["end"] - x[2]["start"] + 1), reverse=True)
+    else:
+        clones.sort(key=lambda x: x[0], reverse=True)
+
+    if top_n is not None and top_n > 0:
+        clones = clones[:top_n]
+
+    return clones
+
+
+def compute_priority_score(
+    sim: float,
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+) -> float:
+    """Calculates refactoring priority based on similarity, line length, and cyclomatic complexity."""
+    avg_sloc = ((u1["end"] - u1["start"] + 1) + (u2["end"] - u2["start"] + 1)) / 2.0
+    max_comp = max(u1.get("complexity", 1), u2.get("complexity", 1))
+    return float(round(sim * avg_sloc * max_comp, 1))

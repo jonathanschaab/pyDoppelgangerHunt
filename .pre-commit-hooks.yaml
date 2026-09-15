@@ -1,0 +1,7 @@
+- id: pydoppelgangerhunt
+  name: pyDoppelgangerHunt
+  description: AST structural code clone and redundancy gate
+  entry: pydoppelgangerhunt
+  language: python
+  types: [python]
+  args: ["--diff-only"]

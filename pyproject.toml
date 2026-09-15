@@ -1,0 +1,146 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pydoppelgangerhunt"
+version = "1.0.0"
+description = "AST structural code clone detector, redundancy gate, and refactoring patch synthesizer for Python."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Jonathan Schaab" }
+]
+requires-python = ">=3.9"
+dependencies = []
+keywords = [
+    "ast",
+    "code-clones",
+    "refactoring",
+    "static-analysis",
+    "dry",
+    "duplication",
+    "quality-gate",
+    "sarif",
+    "coverage",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.urls]
+Homepage = "https://github.com/jonathanschaab/pyDoppelgangerHunt"
+Repository = "https://github.com/jonathanschaab/pyDoppelgangerHunt.git"
+Issues = "https://github.com/jonathanschaab/pyDoppelgangerHunt/issues"
+
+[project.scripts]
+pydoppelgangerhunt = "pydoppelgangerhunt.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "mypy>=1.0.0",
+    "pylint>=3.0.0",
+    "bandit>=1.7.0",
+    "build>=1.0.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["pydoppelgangerhunt*"]
+
+[tool.pydoppelgangerhunt]
+threshold = 0.90
+min_lines = 8
+min_tokens = 15
+exclude = [
+    "tests",
+    ".git",
+    "venv",
+    ".venv",
+    "dist",
+    "build",
+    "tools",
+    "submodules",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[tool.pylint.main]
+py-version = "3.10"
+ignore = ["tests"]
+
+[tool.pylint.messages_control]
+disable = [
+    "raw-checker-failed",
+    "bad-inline-option",
+    "locally-disabled",
+    "file-ignored",
+    "suppressed-message",
+    "useless-suppression",
+    "deprecated-pragma",
+    "use-symbolic-message-instead",
+    "missing-module-docstring",
+    "missing-class-docstring",
+    "missing-function-docstring",
+    "invalid-name",
+    "too-many-arguments",
+    "too-many-locals",
+    "too-many-branches",
+    "too-many-statements",
+    "too-many-lines",
+    "too-many-instance-attributes",
+    "too-many-positional-arguments",
+    "too-many-return-statements",
+    "too-many-nested-blocks",
+    "too-many-boolean-expressions",
+    "too-few-public-methods",
+    "too-many-public-methods",
+    "line-too-long",
+    "broad-exception-caught",
+    "unused-argument",
+    "import-outside-toplevel",
+    "cyclic-import",
+    "duplicate-code",
+]
+enable = [
+    "E",
+    "F",
+    "W0102",
+    "W0101",
+    "W0611",
+    "W0612",
+    "W0702",
+    "W0631",
+    "W0404",
+    "W1514",
+    "R1710",
+]
+
+[tool.pylint.reports]
+fail-under = 10.0
