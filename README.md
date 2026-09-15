@@ -170,6 +170,9 @@ pydoppelgangerhunt --init
 | `--idioms` | Flag | Canonicalize Python idioms (loops, comprehensions, search loops) |
 | `--abstract-expressions`| Flag | Abstract arithmetic expressions and condition tests (NiCad Type-3-2) |
 | `--gapped-tolerance` | Flag | Compute LCS alignment with length-bound pruning |
+| `--preserve-docstrings` | Flag | Preserve docstrings during AST token extraction (docstrings stripped by default) |
+| `--preserve-annotations`| Flag | Preserve PEP 484/526 type annotations (annotations stripped by default) |
+| `--max-index-frequency` | `FLOAT` | Inverted index frequency threshold to prune ubiquitous shingles (default: `0.25`) |
 | `--workers` | `INT` | Number of worker processes for parallel AST harvesting |
 
 ---
@@ -185,7 +188,7 @@ All pull requests and releases are validated against 7 automated quality gates d
 | **Gate 3** | Packaging Hygiene | `deptry` | 0 unused, missing, or transitive dependencies |
 | **Gate 4** | AST Security | `bandit` | 0 security issues (`-ll`) |
 | **Gate 5** | Supply Chain | `pip-audit` | 0 known CVEs in virtual environment |
-| **Gate 6** | Unit Tests & Coverage | `pytest` + `pytest-cov` | 74 passed, **$\ge 85.0\%$ branch coverage** (85.22%) |
+| **Gate 6** | Unit Tests & Coverage | `pytest` + `pytest-cov` | 80 passed, **$\ge 85.0\%$ branch coverage** (85.92%) |
 | **Gate 7** | Clone Barrier | `pydoppelgangerhunt` | 0 clones across Tier 1 ($\ge 70\%$, 8 lines) and Tier 2 ($\ge 80\%$, 6 lines) |
 
 ### Executing Quality Gates Locally
@@ -208,6 +211,18 @@ pwsh -File .\scripts\check_quality_gates.ps1
 ```
 
 For full quality gate metrics and verification logs, see [Pull Request #1](https://github.com/jonathanschaab/pyDoppelgangerHunt/pull/1).
+
+---
+
+## References & Acknowledgements
+
+The design and detection pipeline of `pyDoppelgangerHunt` draw inspiration from foundational research in software clone detection and static code analysis:
+
+- **SourcererCC** (Sajnani, H., Saini, V., Ossher, J., & Lopes, C. V., *SourcererCC: Scaling Code Clone Detection to Big-Code*, ICSE 2016): Inverted index candidate filtering, token frequency weighting, and length/prefix-bound pruning theorems that enable near-linear clone detection across large codebases.
+- **NiCad** (Roy, C. K., & Cordy, J. R., *NICAD: Accurate Detection of Near-Miss Intentional Clones Using Flexible Pretty-Printing and Code Normalization*, ICPC 2008): AST structural normalization, blind identifier renaming, commutative operator canonicalization, and boilerplate statement filtering for Type-2 and Type-3 near-miss clones.
+- **CCAligner** (Wang, P., Svajlenko, J., Wu, Y., Xu, Y., & Roy, C. K., *CCAligner: A Code Clone Detector for Finding Clones with Large Language Gaps*, ICSE 2018): Token-based sequence alignment algorithms using Longest Common Subsequence (LCS) with dynamic bound pruning for gapped clone tolerance.
+- **McCabe Cyclomatic Complexity** (McCabe, T. J., *A Complexity Measure*, IEEE Transactions on Software Engineering, 1976): Complexity-weighted priority scoring ($\text{Similarity} \times \text{SLOC} \times \text{Cyclomatic Complexity}$) to elevate high-risk, cognitively complex clone pairs in refactoring workflows.
+- **Non-Maximum Suppression (NMS)**: Geometric containment suppression of redundant sub-clones within larger compound clone blocks, adapted from spatial object detection.
 
 ---
 

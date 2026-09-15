@@ -322,7 +322,7 @@ def scan_target(
     min_expr_complexity: int = 4,
     clause_level: bool = False,
     data_tables: bool = False,
-    strip_annotations: bool = False,
+    strip_annotations: bool = True,
     nms: bool = False,
     class_level: bool = False,
     blind_literals: bool = False,
@@ -343,6 +343,8 @@ def scan_target(
     sort_by: str = "similarity",
     top_n: Optional[int] = None,
     include_notebooks: bool = False,
+    strip_docstrings: bool = True,
+    max_index_frequency: float = 0.25,
 ) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]:
     units: List[Dict[str, Any]] = []
     repo_root = Path.cwd()
@@ -380,6 +382,7 @@ def scan_target(
                 "comprehensions": comprehensions,
                 "idioms": idioms,
                 "abstract_expressions": abstract_expressions,
+                "strip_docstrings": strip_docstrings,
             }
             for p in file_list
         ]
@@ -412,6 +415,7 @@ def scan_target(
                     comprehensions=comprehensions,
                     idioms=idioms,
                     abstract_expressions=abstract_expressions,
+                    strip_docstrings=strip_docstrings,
                 )
             )
 
@@ -437,9 +441,16 @@ def scan_target(
         for sh in index_keys:
             shingle_index.setdefault(sh, []).append(idx)
 
+    max_posting_len = (
+        int(len(units) * max_index_frequency)
+        if (max_index_frequency is not None and len(units) > 30)
+        else len(units) + 1
+    )
+    max_posting_len = max(2, max_posting_len)
+
     candidate_pairs: Set[Tuple[int, int]] = set()
     for u_indices in shingle_index.values():
-        if len(u_indices) > 1:
+        if 1 < len(u_indices) <= max_posting_len:
             for i, idx1 in enumerate(u_indices):
                 for idx2 in u_indices[i + 1:]:
                     candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))

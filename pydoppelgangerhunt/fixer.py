@@ -2,12 +2,116 @@
 
 from __future__ import annotations
 
+import ast
+import builtins
 import difflib
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import textwrap
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from pydoppelgangerhunt.reporters import extract_unit_source_code
+
+BUILTIN_NAMES: Set[str] = set(dir(builtins))
+
+
+class _ScopeVisitor(ast.NodeVisitor):
+    """Inspects AST loads, stores, function parameters, and returns for scope analysis."""
+
+    def __init__(self) -> None:
+        self.loads: List[str] = []
+        self.stores: List[str] = []
+        self.params: List[str] = []
+        self.returns: List[str] = []
+
+    def _process_args(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
+        for a in (
+            node.args.posonlyargs
+            + node.args.args
+            + node.args.kwonlyargs
+        ):
+            if a.arg not in BUILTIN_NAMES and a.arg not in self.params:
+                self.params.append(a.arg)
+        if node.args.vararg and node.args.vararg.arg not in BUILTIN_NAMES:
+            self.params.append(node.args.vararg.arg)
+        if node.args.kwarg and node.args.kwarg.arg not in BUILTIN_NAMES:
+            self.params.append(node.args.kwarg.arg)
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._process_args(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._process_args(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Load):
+            if node.id not in BUILTIN_NAMES and node.id not in self.loads:
+                self.loads.append(node.id)
+        elif isinstance(node.ctx, ast.Store):
+            if node.id not in BUILTIN_NAMES and node.id not in self.stores:
+                self.stores.append(node.id)
+        self.generic_visit(node)
+
+    def visit_Return(self, node: ast.Return) -> None:
+        if node.value is not None:
+            if isinstance(node.value, ast.Name) and node.value.id not in self.returns:
+                self.returns.append(node.value.id)
+        self.generic_visit(node)
+
+
+def _inspect_unit_scope(unit: Dict[str, Any]) -> Tuple[List[str], List[str], List[str]]:
+    """Extracts (inputs, outputs, stores) for a single AST unit by parsing its source."""
+    raw_lines = extract_unit_source_code(unit)
+    dedented = textwrap.dedent("".join(raw_lines))
+    if not dedented.strip():
+        return [], [], []
+
+    tree: Optional[ast.AST] = None
+    try:
+        tree = ast.parse(dedented)
+    except SyntaxError:
+        try:
+            tree = ast.parse(f"def _wrapper():\n{textwrap.indent(dedented, '    ')}")
+        except SyntaxError:
+            tree = None
+
+    if tree is None:
+        return [], [], []
+
+    visitor = _ScopeVisitor()
+    visitor.visit(tree)
+
+    if visitor.params:
+        inputs = list(visitor.params)
+    else:
+        inputs = [name for name in visitor.loads if name not in visitor.stores]
+
+    outputs = list(visitor.returns)
+    return inputs, outputs, visitor.stores
+
+
+def analyze_unit_variable_scope(
+    u1: Dict[str, Any],
+    u2: Optional[Dict[str, Any]] = None,
+) -> Dict[str, List[str]]:
+    """Analyzes AST variable scoping to determine input parameters, outputs, and local variables."""
+    inputs1, outputs1, stores1 = _inspect_unit_scope(u1)
+    if u2 is not None:
+        inputs2, outputs2, _ = _inspect_unit_scope(u2)
+        common_inputs = [var for var in inputs1 if var in inputs2]
+        inputs = common_inputs if common_inputs else inputs1
+        outputs = list(dict.fromkeys(outputs1 + outputs2))
+    else:
+        inputs = inputs1
+        outputs = outputs1
+
+    locals_ = [var for var in stores1 if var not in inputs]
+    return {
+        "inputs": inputs,
+        "outputs": outputs,
+        "locals": locals_,
+    }
 
 
 def synthesize_shared_helper_code(u1: Dict[str, Any], u2: Dict[str, Any]) -> str:
@@ -29,9 +133,16 @@ def synthesize_shared_helper_code(u1: Dict[str, Any], u2: Dict[str, Any]) -> str
     if not common_lines:
         common_lines = lines1
 
+    # Variable scope analysis for concrete parameter signatures
+    scope = analyze_unit_variable_scope(u1, u2)
+    if scope["inputs"]:
+        params_str = ", ".join(f"{arg}: Any" for arg in scope["inputs"])
+    else:
+        params_str = "*args: Any, **kwargs: Any"
+
     # Indent body
     indented_body = "\n".join(f"    {ln}" if ln.strip() else "" for ln in common_lines)
-    return f"def {helper_name}(*args: Any, **kwargs: Any) -> Any:\n    \"\"\"Auto-extracted shared helper for duplicate logic.\"\"\"\n{indented_body}\n"
+    return f"def {helper_name}({params_str}) -> Any:\n    \"\"\"Auto-extracted shared helper for duplicate logic.\"\"\"\n{indented_body}\n"
 
 
 def generate_refactoring_patch(

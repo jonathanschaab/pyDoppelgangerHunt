@@ -687,3 +687,48 @@ def test_multi_core_parallel_scan(tmp_path: Path) -> None:
     )
     assert len(clones_parallel) == len(clones_seq)
 
+
+def test_inverted_index_frequency_threshold_pruning(tmp_path: Path) -> None:
+    """Test inverted index frequency thresholding prunes ubiquitous shingles in large codebases."""
+    scan_dir = tmp_path / "large_corpus"
+    scan_dir.mkdir()
+
+    # Create 35 files (corpus size > 30 triggers frequency thresholding)
+    for i in range(35):
+        fp = scan_dir / f"unit_{i:02d}.py"
+        if i < 2:
+            fp.write_text(
+                f"def calculate_discriminative_{i}(val_x, val_y):\n"
+                f"    common_counter = 0\n"
+                f"    while common_counter < 10:\n"
+                f"        common_counter += 1\n"
+                f"    discriminative_calc = (val_x * 98765) ^ (val_y * 43210)\n"
+                f"    return discriminative_calc\n",
+                encoding="utf-8",
+            )
+        else:
+            fp.write_text(
+                f"def calculate_filler_{i}(val_x, val_y):\n"
+                f"    common_counter = 0\n"
+                f"    while common_counter < 10:\n"
+                f"        common_counter += 1\n"
+                f"    filler_unique_{i} = val_x + val_y + {i * 1000}\n"
+                f"    return filler_unique_{i}\n",
+                encoding="utf-8",
+            )
+
+    # Scan with max_index_frequency=0.20
+    clones = scan_target(
+        str(scan_dir),
+        min_lines=4,
+        min_tokens=12,
+        threshold=0.85,
+        max_index_frequency=0.20,
+    )
+    assert len(clones) == 1
+    sim, u1, u2 = clones[0]
+    assert sim >= 0.85
+    assert "calculate_discriminative" in u1["name"]
+    assert "calculate_discriminative" in u2["name"]
+
+
