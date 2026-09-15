@@ -1,4 +1,4 @@
-name: CI
+name: CI & Security Quality Gates
 
 on:
   push:
@@ -6,8 +6,17 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
-  test:
+  quality-gates:
+    name: Quality Gates (${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -15,34 +24,68 @@ jobs:
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout repository
+        uses: actions/checkout@v7
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
+          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install .[dev]
 
-      - name: Run unit tests
+      - name: Gate 1 — Type Safety (Mypy)
         run: |
-          python -m pytest -v
+          python scripts/run_quality_gates.py --gate type-safety
 
-      - name: Run static type checking (Mypy)
+      - name: Gate 2 — Code Quality & Linting (Pylint)
         run: |
-          python -m mypy pydoppelgangerhunt
+          python scripts/run_quality_gates.py --gate linting
 
-      - name: Run linter (Pylint)
+      # Threshold rationale: 85.0% branch coverage floor enforces comprehensive execution
+      # across all AST visitors, canonicalizers, shingle hashers, and cluster graphs,
+      # while accounting for unreachable defensive exceptions and Python version fallbacks.
+      - name: Gate 3 — Unit Tests & Code Coverage (Pytest >= 85%)
         run: |
-          pylint pydoppelgangerhunt
+          python scripts/run_quality_gates.py --gate tests-coverage
 
-      - name: Run security scan (Bandit)
+      - name: Gate 4 — Static Application Security Testing (Bandit)
         run: |
-          bandit -r pydoppelgangerhunt -ll -q
+          python scripts/run_quality_gates.py --gate ast-security
 
-      - name: Self-scan clone audit
+      - name: Gate 5 — Supply Chain CVE Auditing (pip-audit)
         run: |
-          python -m pydoppelgangerhunt.cli pydoppelgangerhunt --threshold 0.85 --min-lines 6
+          python scripts/run_quality_gates.py --gate supply-chain
+
+      - name: Gate 6 — Dependency Packaging Hygiene (deptry)
+        run: |
+          python scripts/run_quality_gates.py --gate packaging
+
+      # Threshold rationale: Dual-tier clone barrier provides layered redundancy prevention:
+      # - Tier 1 (70% threshold, min 8 lines, sliding window, idioms): Detects structural and macro
+      #   architectural duplication. Empirically, Python functions/blocks sharing >=70% AST shingles
+      #   represent extractable common abstractions.
+      # - Tier 2 (80% threshold, min 6 lines, idioms): Catches micro sub-block duplications (such as
+      #   repeated error-handling or validation sequences) that fall below the 8-line sliding window.
+      #   The higher 80% threshold avoids false positives on short idiom snippets.
+      - name: Gate 7 — Dogfooding Code Clone Barrier (Dual-Tier)
+        run: |
+          python scripts/run_quality_gates.py --gate clone-barrier
+
+  cloud-secret-scan:
+    name: Cloud Secret Scanning (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code (Full History)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks Secret Detection
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -2,6 +2,10 @@
 
 AST structural code clone detector, redundancy gate, and refactoring patch synthesizer for Python.
 
+[![CI](https://github.com/jonathanschaab/pyDoppelgangerHunt/actions/workflows/ci.yml/badge.svg)](https://github.com/jonathanschaab/pyDoppelgangerHunt/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/badge/coverage-85.2%25-brightgreen.svg)](https://github.com/jonathanschaab/pyDoppelgangerHunt/pull/1)
+[![Code Quality](https://img.shields.io/badge/pylint-10.00%2F10-brightgreen.svg)](https://github.com/jonathanschaab/pyDoppelgangerHunt/pull/1)
+[![Clones](https://img.shields.io/badge/clones-0%20(dual--tier)-brightgreen.svg)](https://github.com/jonathanschaab/pyDoppelgangerHunt/pull/1)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python: 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
 [![Dependencies: None](https://img.shields.io/badge/dependencies-0%20(stdlib%20only)-brightgreen.svg)](https://docs.python.org/3/)
@@ -167,6 +171,43 @@ pydoppelgangerhunt --init
 | `--abstract-expressions`| Flag | Abstract arithmetic expressions and condition tests (NiCad Type-3-2) |
 | `--gapped-tolerance` | Flag | Compute LCS alignment with length-bound pruning |
 | `--workers` | `INT` | Number of worker processes for parallel AST harvesting |
+
+---
+
+## Quality Gates & Invariant Standards
+
+All pull requests and releases are validated against 7 automated quality gates defined centrally in `gates.toml`:
+
+| Gate | Target | Tool / Command | Invariant Threshold |
+| :--- | :--- | :--- | :--- |
+| **Gate 1** | Type Safety | `mypy` | 0 errors across 18 source files |
+| **Gate 2** | Code Quality | `pylint` | Strict **10.00 / 10.00** rating |
+| **Gate 3** | Packaging Hygiene | `deptry` | 0 unused, missing, or transitive dependencies |
+| **Gate 4** | AST Security | `bandit` | 0 security issues (`-ll`) |
+| **Gate 5** | Supply Chain | `pip-audit` | 0 known CVEs in virtual environment |
+| **Gate 6** | Unit Tests & Coverage | `pytest` + `pytest-cov` | 74 passed, **$\ge 85.0\%$ branch coverage** (85.22%) |
+| **Gate 7** | Clone Barrier | `pydoppelgangerhunt` | 0 clones across Tier 1 ($\ge 70\%$, 8 lines) and Tier 2 ($\ge 80\%$, 6 lines) |
+
+### Executing Quality Gates Locally
+
+All gates can be executed locally in under 25 seconds via the shared runner or cross-platform wrappers:
+
+```bash
+# Python runner (driven by gates.toml)
+python scripts/run_quality_gates.py
+
+# Run a specific gate by ID or number
+python scripts/run_quality_gates.py --gate type-safety
+python scripts/run_quality_gates.py --gate tests-coverage
+
+# POSIX shell wrapper (Linux / macOS)
+./scripts/check_quality_gates.sh
+
+# PowerShell wrapper (Windows)
+pwsh -File .\scripts\check_quality_gates.ps1
+```
+
+For full quality gate metrics and verification logs, see [Pull Request #1](https://github.com/jonathanschaab/pyDoppelgangerHunt/pull/1).
 
 ---
 
