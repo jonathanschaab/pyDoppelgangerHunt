@@ -40,34 +40,41 @@ jobs:
 
       - name: Gate 1 — Type Safety (Mypy)
         run: |
-          python -m mypy pydoppelgangerhunt tests
+          python scripts/run_quality_gates.py --gate type-safety
 
       - name: Gate 2 — Code Quality & Linting (Pylint)
         run: |
-          python -m pylint pydoppelgangerhunt tests
+          python scripts/run_quality_gates.py --gate linting
 
+      # Threshold rationale: 85.0% branch coverage floor enforces comprehensive execution
+      # across all AST visitors, canonicalizers, shingle hashers, and cluster graphs,
+      # while accounting for unreachable defensive exceptions and Python version fallbacks.
       - name: Gate 3 — Unit Tests & Code Coverage (Pytest >= 85%)
         run: |
-          python -m pytest -v --cov=pydoppelgangerhunt --cov-report=term-missing --cov-report=xml
+          python scripts/run_quality_gates.py --gate tests-coverage
 
       - name: Gate 4 — Static Application Security Testing (Bandit)
         run: |
-          python -m bandit -r pydoppelgangerhunt -ll -q
+          python scripts/run_quality_gates.py --gate ast-security
 
       - name: Gate 5 — Supply Chain CVE Auditing (pip-audit)
-        if: matrix.python-version != '3.9'
         run: |
-          python -m pip_audit . --local
+          python scripts/run_quality_gates.py --gate supply-chain
 
       - name: Gate 6 — Dependency Packaging Hygiene (deptry)
-        if: matrix.python-version != '3.9'
         run: |
-          python -m deptry .
+          python scripts/run_quality_gates.py --gate packaging
 
+      # Threshold rationale: Dual-tier clone barrier provides layered redundancy prevention:
+      # - Tier 1 (70% threshold, min 8 lines, sliding window, idioms): Detects structural and macro
+      #   architectural duplication. Empirically, Python functions/blocks sharing >=70% AST shingles
+      #   represent extractable common abstractions.
+      # - Tier 2 (80% threshold, min 6 lines, idioms): Catches micro sub-block duplications (such as
+      #   repeated error-handling or validation sequences) that fall below the 8-line sliding window.
+      #   The higher 80% threshold avoids false positives on short idiom snippets.
       - name: Gate 7 — Dogfooding Code Clone Barrier (Dual-Tier)
         run: |
-          python -m pydoppelgangerhunt.cli pydoppelgangerhunt --threshold 0.70 --min-lines 8 --sliding-window --idioms
-          python -m pydoppelgangerhunt.cli pydoppelgangerhunt --threshold 0.80 --min-lines 6 --idioms
+          python scripts/run_quality_gates.py --gate clone-barrier
 
   cloud-secret-scan:
     name: Cloud Secret Scanning (Gitleaks)
@@ -82,4 +89,3 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-

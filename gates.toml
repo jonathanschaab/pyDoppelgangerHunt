@@ -1,0 +1,51 @@
+# ==============================================================================
+# pyDoppelgangerHunt Quality Gates Specification
+# Shared single source of truth across CI workflows and local runner scripts.
+# ==============================================================================
+
+[gates.1]
+id = "type-safety"
+name = "Static Type Safety (Mypy)"
+command = "python -m mypy pydoppelgangerhunt tests"
+description = "Verify static type correctness across package and tests."
+
+[gates.2]
+id = "linting"
+name = "Code Quality & Strict Linting (Pylint)"
+command = "python -m pylint pydoppelgangerhunt tests"
+description = "Enforce 10.00 / 10.00 code quality rating."
+
+[gates.3]
+id = "packaging"
+name = "Dependency Packaging & Import Hygiene (Deptry)"
+command = "python -m deptry ."
+description = "Detect missing, unused, or transitive dependencies."
+min_python = "3.10"
+
+[gates.4]
+id = "ast-security"
+name = "Static Application Security Testing (Bandit)"
+command = "python -m bandit -r pydoppelgangerhunt -ll -q"
+description = "Scan AST for security vulnerabilities."
+
+[gates.5]
+id = "supply-chain"
+name = "Dependency CVE Vulnerability Audit (pip-audit)"
+command = "python -m pip_audit . --local"
+description = "Audit installed virtualenv packages against known CVEs."
+min_python = "3.10"
+
+[gates.6]
+id = "tests-coverage"
+name = "Test Suite & Code Coverage Verification (Pytest >= 85%)"
+command = "python -m pytest -q --cov=pydoppelgangerhunt --cov-report=term-missing --cov-report=xml"
+description = "Execute unit test suite and enforce minimum 85.0% branch coverage."
+
+[gates.7]
+id = "clone-barrier"
+name = "Dogfooding Code Clone Barrier (Dual-Tier Macro + Micro)"
+commands = [
+    "python -m pydoppelgangerhunt.cli pydoppelgangerhunt --threshold 0.70 --min-lines 8 --sliding-window --idioms",
+    "python -m pydoppelgangerhunt.cli pydoppelgangerhunt --threshold 0.80 --min-lines 6 --idioms",
+]
+description = "Enforce zero structural clones using dogfooded engine."
