@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
@@ -252,11 +253,12 @@ def _get_docstring_node(root_node: ast.AST) -> Optional[ast.AST]:
 def get_ast_tokens(
     node_or_nodes: Any,
     blind_indexing: bool = False,
-    strip_annotations: bool = False,
+    strip_annotations: bool = True,
     blind_literals: bool = False,
     filter_boilerplate: bool = False,
     consistent_renaming: bool = False,
     abstract_expressions: bool = False,
+    strip_docstrings: bool = True,
 ) -> List[str]:
     """Normalizes an AST node or list of statements into a structural token sequence."""
     nodes = node_or_nodes if isinstance(node_or_nodes, (list, tuple)) else [node_or_nodes]
@@ -267,7 +269,17 @@ def get_ast_tokens(
     lvar_map: Dict[str, int] = {}
 
     for root_node in nodes:
-        doc_node = _get_docstring_node(root_node) if blind_literals else None
+        doc_nodes: Set[int] = set()
+        if strip_docstrings or blind_literals:
+            sub_roots = [root_node] if isinstance(root_node, ast.AST) else [x for x in root_node if isinstance(x, ast.AST)]
+            for r in sub_roots:
+                for container in ast.walk(r):
+                    if isinstance(container, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+                        dn = _get_docstring_node(container)
+                        if dn is not None:
+                            doc_nodes.add(id(dn))
+                            if hasattr(dn, "value"):
+                                doc_nodes.add(id(dn.value))
 
         if consistent_renaming and isinstance(root_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             for a in (
@@ -288,7 +300,7 @@ def get_ast_tokens(
             filter_boilerplate=filter_boilerplate,
             abstract_expressions=abstract_expressions,
         ):
-            if doc_node is not None and (child is doc_node or child is getattr(doc_node, "value", None)):
+            if id(child) in doc_nodes:
                 continue
             node_type = type(child).__name__
             if isinstance(child, ast.Constant):
@@ -343,11 +355,12 @@ def get_ast_shingles(
     node_or_nodes: Any,
     k: int = 3,
     blind_indexing: bool = False,
-    strip_annotations: bool = False,
+    strip_annotations: bool = True,
     blind_literals: bool = False,
     filter_boilerplate: bool = False,
     consistent_renaming: bool = False,
     abstract_expressions: bool = False,
+    strip_docstrings: bool = True,
 ) -> Tuple[Set[Tuple[str, ...]], int]:
     """Normalizes an AST node or list of statements into structural tokens and produces overlapping k-shingles."""
     tokens = get_ast_tokens(
@@ -358,6 +371,7 @@ def get_ast_shingles(
         filter_boilerplate=filter_boilerplate,
         consistent_renaming=consistent_renaming,
         abstract_expressions=abstract_expressions,
+        strip_docstrings=strip_docstrings,
     )
     if len(tokens) < k:
         return {tuple(tokens)} if tokens else set(), len(tokens)
@@ -372,11 +386,12 @@ def get_ast_shingles(
 def get_ast_characteristic_vector(
     node_or_nodes: Any,
     blind_indexing: bool = False,
-    strip_annotations: bool = False,
+    strip_annotations: bool = True,
     blind_literals: bool = False,
     filter_boilerplate: bool = False,
     consistent_renaming: bool = False,
     abstract_expressions: bool = False,
+    strip_docstrings: bool = True,
 ) -> Dict[str, int]:
     """Computes a Deckard-style multiset frequency vector of AST tokens for permutation-invariant comparison."""
     tokens = get_ast_tokens(
@@ -387,6 +402,7 @@ def get_ast_characteristic_vector(
         filter_boilerplate=filter_boilerplate,
         consistent_renaming=consistent_renaming,
         abstract_expressions=abstract_expressions,
+        strip_docstrings=strip_docstrings,
     )
     counts: Dict[str, int] = {}
     for tok in tokens:
@@ -575,11 +591,12 @@ def _record_unit(
     kind: str,
     file_lines: Optional[List[str]] = None,
     blind_indexing: bool = False,
-    strip_annotations: bool = False,
+    strip_annotations: bool = True,
     blind_literals: bool = False,
     filter_boilerplate: bool = False,
     consistent_renaming: bool = False,
     abstract_expressions: bool = False,
+    strip_docstrings: bool = True,
 ) -> None:
     """Records an AST unit if it satisfies thresholds and is not suppressed by inline comments."""
     if file_lines and check_inline_suppression(file_lines, start, end):
@@ -617,6 +634,7 @@ def _record_unit(
             filter_boilerplate=filter_boilerplate,
             consistent_renaming=consistent_renaming,
             abstract_expressions=abstract_expressions,
+            strip_docstrings=strip_docstrings,
         )
         token_count = len(tokens)
         if token_count >= effective_min_tokens:
@@ -628,6 +646,7 @@ def _record_unit(
                 filter_boilerplate=filter_boilerplate,
                 consistent_renaming=consistent_renaming,
                 abstract_expressions=abstract_expressions,
+                strip_docstrings=strip_docstrings,
             )
             char_vector = get_ast_characteristic_vector(
                 ast_target,
@@ -637,7 +656,9 @@ def _record_unit(
                 filter_boilerplate=filter_boilerplate,
                 consistent_renaming=consistent_renaming,
                 abstract_expressions=abstract_expressions,
+                strip_docstrings=strip_docstrings,
             )
+            structural_hash = hashlib.sha256(" ".join(tokens).encode("utf-8")).hexdigest()[:16]
             units.append({
                 "name": name,
                 "file": rel_file,
@@ -651,6 +672,7 @@ def _record_unit(
                 "kind": kind,
                 "calls": extract_call_sequence(ast_target),
                 "complexity": compute_cyclomatic_complexity(ast_target),
+                "structural_hash": structural_hash,
             })
 
 
@@ -665,11 +687,12 @@ def _record_clause_branch(
     min_tokens: int,
     file_lines: Optional[List[str]] = None,
     blind_indexing: bool = False,
-    strip_annotations: bool = False,
+    strip_annotations: bool = True,
     blind_literals: bool = False,
     filter_boilerplate: bool = False,
     consistent_renaming: bool = False,
     abstract_expressions: bool = False,
+    strip_docstrings: bool = True,
 ) -> None:
     """Records an if-branch or except-handler clause if it contains at least 3 statements."""
     if len(body) < 3:
@@ -693,6 +716,7 @@ def _record_clause_branch(
         filter_boilerplate=filter_boilerplate,
         consistent_renaming=consistent_renaming,
         abstract_expressions=abstract_expressions,
+        strip_docstrings=strip_docstrings,
     )
 
 
@@ -706,11 +730,12 @@ def _record_node_unit(
     kind: str,
     file_lines: Optional[List[str]] = None,
     blind_indexing: bool = False,
-    strip_annotations: bool = False,
+    strip_annotations: bool = True,
     blind_literals: bool = False,
     filter_boilerplate: bool = False,
     consistent_renaming: bool = False,
     abstract_expressions: bool = False,
+    strip_docstrings: bool = True,
 ) -> None:
     """Records an AST node unit by extracting its start and end line bounds."""
     start = getattr(node, "lineno", 0)
@@ -732,6 +757,7 @@ def _record_node_unit(
         filter_boilerplate=filter_boilerplate,
         consistent_renaming=consistent_renaming,
         abstract_expressions=abstract_expressions,
+        strip_docstrings=strip_docstrings,
     )
 
 
@@ -741,13 +767,14 @@ def harvest_notebook_units(
     min_lines: int = 8,
     min_tokens: int = 15,
     blind_indexing: bool = False,
-    strip_annotations: bool = False,
+    strip_annotations: bool = True,
     blind_literals: bool = False,
     filter_boilerplate: bool = False,
     consistent_renaming: bool = False,
     commutative: bool = False,
     idioms: bool = False,
     abstract_expressions: bool = False,
+    strip_docstrings: bool = True,
 ) -> List[Dict[str, Any]]:
     """Extracts code cells from Jupyter Notebook (.ipynb) files and harvests AST units."""
     units: List[Dict[str, Any]] = []
@@ -803,6 +830,7 @@ def harvest_notebook_units(
             filter_boilerplate=filter_boilerplate,
             consistent_renaming=consistent_renaming,
             abstract_expressions=abstract_expressions,
+            strip_docstrings=strip_docstrings,
         )
 
         for node in ast.walk(tree):
@@ -826,6 +854,7 @@ def harvest_notebook_units(
                     filter_boilerplate=filter_boilerplate,
                     consistent_renaming=consistent_renaming,
                     abstract_expressions=abstract_expressions,
+                    strip_docstrings=strip_docstrings,
                 )
 
     return units
@@ -844,7 +873,7 @@ def harvest_file_units(
     min_expr_complexity: int = 4,
     clause_level: bool = False,
     data_tables: bool = False,
-    strip_annotations: bool = False,
+    strip_annotations: bool = True,
     class_level: bool = False,
     blind_literals: bool = False,
     filter_boilerplate: bool = False,
@@ -854,6 +883,7 @@ def harvest_file_units(
     comprehensions: bool = False,
     idioms: bool = False,
     abstract_expressions: bool = False,
+    strip_docstrings: bool = True,
 ) -> List[Dict[str, Any]]:
     """Harvests AST code units from a single Python source file. Picklable for multi-core worker pools."""
     if file_path.endswith(".ipynb"):
@@ -870,6 +900,7 @@ def harvest_file_units(
             commutative=commutative,
             idioms=idioms,
             abstract_expressions=abstract_expressions,
+            strip_docstrings=strip_docstrings,
         )
 
     units: List[Dict[str, Any]] = []
@@ -939,6 +970,7 @@ def harvest_file_units(
                     filter_boilerplate=filter_boilerplate,
                     consistent_renaming=consistent_renaming,
                     abstract_expressions=abstract_expressions,
+                    strip_docstrings=strip_docstrings,
                 )
 
             if not functions_only:
@@ -976,6 +1008,7 @@ def harvest_file_units(
                                 filter_boilerplate=filter_boilerplate,
                                 consistent_renaming=consistent_renaming,
                                 abstract_expressions=abstract_expressions,
+                                strip_docstrings=strip_docstrings,
                             )
 
             if sliding_window and hasattr(node, "body"):
@@ -1002,6 +1035,7 @@ def harvest_file_units(
                             filter_boilerplate=filter_boilerplate,
                             consistent_renaming=consistent_renaming,
                             abstract_expressions=abstract_expressions,
+                            strip_docstrings=strip_docstrings,
                         )
 
             if clause_level and hasattr(node, "body"):
@@ -1024,6 +1058,7 @@ def harvest_file_units(
                             filter_boilerplate=filter_boilerplate,
                             consistent_renaming=consistent_renaming,
                             abstract_expressions=abstract_expressions,
+                            strip_docstrings=strip_docstrings,
                         )
                         if stmt.orelse:
                             _record_clause_branch(
@@ -1042,6 +1077,7 @@ def harvest_file_units(
                                 filter_boilerplate=filter_boilerplate,
                                 consistent_renaming=consistent_renaming,
                                 abstract_expressions=abstract_expressions,
+                                strip_docstrings=strip_docstrings,
                             )
                     elif isinstance(stmt, ast.Try):
                         t_line = getattr(stmt, "lineno", 0)
@@ -1067,6 +1103,7 @@ def harvest_file_units(
                                 filter_boilerplate=filter_boilerplate,
                                 consistent_renaming=consistent_renaming,
                                 abstract_expressions=abstract_expressions,
+                                strip_docstrings=strip_docstrings,
                             )
 
         elif class_level and isinstance(node, ast.ClassDef):
@@ -1085,6 +1122,7 @@ def harvest_file_units(
                 filter_boilerplate=filter_boilerplate,
                 consistent_renaming=consistent_renaming,
                 abstract_expressions=abstract_expressions,
+                strip_docstrings=strip_docstrings,
             )
 
     if complex_expressions:  # pydoppelgangerhunt: ignore
@@ -1108,6 +1146,7 @@ def harvest_file_units(
                 filter_boilerplate=filter_boilerplate,
                 consistent_renaming=consistent_renaming,
                 abstract_expressions=abstract_expressions,
+                strip_docstrings=strip_docstrings,
             )
 
     if data_tables:  # pydoppelgangerhunt: ignore
@@ -1131,6 +1170,7 @@ def harvest_file_units(
                 filter_boilerplate=filter_boilerplate,
                 consistent_renaming=consistent_renaming,
                 abstract_expressions=abstract_expressions,
+                strip_docstrings=strip_docstrings,
             )
 
     if comprehensions:
@@ -1172,6 +1212,7 @@ def harvest_file_units(
                     filter_boilerplate=filter_boilerplate,
                     consistent_renaming=consistent_renaming,
                     abstract_expressions=abstract_expressions,
+                    strip_docstrings=strip_docstrings,
                 )
 
     return units

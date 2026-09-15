@@ -11,6 +11,8 @@ from pydoppelgangerhunt import (
     compute_priority_score,
     extract_call_sequence,
     get_ast_shingles,
+    get_ast_tokens,
+    harvest_file_units,
     harvest_notebook_units,
     is_boilerplate_node,
     jaccard_similarity,
@@ -694,4 +696,60 @@ def test_coverage_missing_files_and_boilerplate_nodes() -> None:
     assert is_boilerplate_node(ast.Assert(test=ast.Constant(value=True))) is True
     assert is_boilerplate_node(ast.Expr(value=ast.Call(func=ast.Name(id="print", ctx=ast.Load()), args=[], keywords=[]))) is True
     assert is_boilerplate_node(ast.Assign(targets=[ast.Name(id="x", ctx=ast.Store())], value=ast.Constant(value=1))) is False
+
+
+def test_docstring_and_annotation_normalization() -> None:
+    """Test decoupled docstring stripping and default annotation normalization."""
+    code_a = (
+        'def process_items(items: list[str]) -> int:\n'
+        '    """Documentation for process items version A."""\n'
+        '    total: int = len(items)\n'
+        '    return total * 2\n'
+    )
+    code_b = (
+        'def process_items(items):\n'
+        '    total = len(items)\n'
+        '    return total * 2\n'
+    )
+    tree_a = ast.parse(code_a)
+    tree_b = ast.parse(code_b)
+
+    tokens_a_default = get_ast_tokens(tree_a)
+    tokens_b_default = get_ast_tokens(tree_b)
+    # Default: both docstrings and annotations are stripped, yielding identical tokens
+    assert tokens_a_default == tokens_b_default
+
+    # With docstrings preserved, code_a has docstring tokens whereas code_b does not
+    tokens_a_doc = get_ast_tokens(tree_a, strip_docstrings=False)
+    tokens_b_doc = get_ast_tokens(tree_b, strip_docstrings=False)
+    assert tokens_a_doc != tokens_a_default
+    assert tokens_a_doc != tokens_b_doc
+
+    # With annotations preserved, they differ due to annotations
+    tokens_a_ann = get_ast_tokens(tree_a, strip_annotations=False)
+    tokens_b_ann = get_ast_tokens(tree_b, strip_annotations=False)
+    assert tokens_a_ann != tokens_b_ann
+
+
+def test_harvest_units_structural_hash(tmp_path: Path) -> None:
+    """Test deterministic structural content hash generation during AST harvesting."""
+    src_file = tmp_path / "sample.py"
+    src_file.write_text(
+        "def compute_score(val: int) -> float:\n"
+        "    scaled = val * 1.5\n"
+        "    offset = scaled + 10.0\n"
+        "    return offset / 2.0\n",
+        encoding="utf-8",
+    )
+    units = harvest_file_units(str(src_file), str(tmp_path), min_lines=2, min_tokens=5)
+    assert len(units) >= 1
+    u = units[0]
+    assert "structural_hash" in u
+    assert isinstance(u["structural_hash"], str)
+    assert len(u["structural_hash"]) == 16
+
+    # Re-harvest to confirm hash determinism
+    units2 = harvest_file_units(str(src_file), str(tmp_path), min_lines=2, min_tokens=5)
+    assert units2[0]["structural_hash"] == u["structural_hash"]
+
 

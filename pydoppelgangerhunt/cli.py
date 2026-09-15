@@ -76,6 +76,7 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
     parser.add_argument("--baseline", type=str, default=None, help="Path to grandfathered clone baseline JSON file")
     parser.add_argument("--record-baseline", type=str, default=None, help="Path to record detected clones into baseline JSON file")
     parser.add_argument("--workers", type=int, default=None, help="Number of worker processes for parallel AST harvesting (default: 1)")
+    parser.add_argument("--max-index-frequency", type=float, default=None, help="Inverted index frequency threshold to prune ubiquitous shingles (default: 0.25)")
 
     color_group = parser.add_mutually_exclusive_group()
     color_group.add_argument("--color", dest="color", action="store_true", default=None, help="Force colorized terminal output")
@@ -89,7 +90,9 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         ("--complex-expressions", "Audit inline complex expressions with high operator density"),
         ("--clause-level", "Audit branch- and handler-level logic (if/else bodies and try/except handlers)"),
         ("--data-tables", "Audit module-level dictionary, list, set, and tuple configuration tables"),
-        ("--strip-annotations", "Strip PEP 484/526 type annotations during AST shingling"),
+        ("--strip-annotations", "Strip PEP 484/526 type annotations during AST shingling (deprecated: enabled by default)"),
+        ("--preserve-annotations", "Preserve PEP 484/526 type annotations during AST shingling"),
+        ("--preserve-docstrings", "Preserve docstrings during AST token extraction (docstrings stripped by default)"),
         ("--nms", "Apply Non-Maximum Suppression to eliminate redundant sub-clones"),
         ("--class-level", "Audit classes (ast.ClassDef) for structural duplicates (PyChase-style)"),
         ("--blind-literals", "Normalize constants to LITERAL and strip docstrings (PyChase/NiCad-style)"),
@@ -178,6 +181,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     audit_tests_enabled = args.audit_tests or bool(tool_cfg.get("audit_tests", False))
     idioms_enabled = args.idioms or bool(tool_cfg.get("idioms", False))
 
+    max_index_frequency = (
+        args.max_index_frequency
+        if args.max_index_frequency is not None
+        else float(tool_cfg.get("max_index_frequency", 0.25))
+    )
+    strip_docstrings = not args.preserve_docstrings
+    strip_annotations = True if args.strip_annotations else (not args.preserve_annotations)
+
     if args.type4:
         try:
             import importlib  # pylint: disable=import-outside-toplevel
@@ -204,7 +215,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         (args.class_level, "classes"),
         (args.merge_subtrees, "merged subtrees"),
         (args.blind_indexing, "blind indexed"),
-        (args.strip_annotations, "untyped"),
+        (strip_annotations, "untyped"),
+        (strip_docstrings, "docstrings stripped"),
         (args.blind_literals, "blind literals"),
         (args.bag_of_tokens, "bag of tokens"),
         (args.filter_boilerplate, "filtered boilerplate"),
@@ -245,7 +257,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         min_expr_complexity=args.min_expr_complexity,
         clause_level=args.clause_level,
         data_tables=args.data_tables,
-        strip_annotations=args.strip_annotations,
+        strip_annotations=strip_annotations,
         nms=args.nms,
         class_level=args.class_level,
         blind_literals=args.blind_literals,
@@ -266,6 +278,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         sort_by=sort_by,
         top_n=args.top,
         include_notebooks=args.notebooks,
+        strip_docstrings=strip_docstrings,
+        max_index_frequency=max_index_frequency,
     )
 
     if args.record_baseline:

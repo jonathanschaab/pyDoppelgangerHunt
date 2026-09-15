@@ -8,6 +8,7 @@ import pydoppelgangerhunt
 
 from pydoppelgangerhunt import (
     clone_pair_fingerprint,
+    clone_pair_structural_fingerprint,
     filter_clones_by_baseline,
     init_tool_configuration,
     load_baseline,
@@ -91,9 +92,10 @@ def test_baseline_record_load_and_filter(tmp_path: Path) -> None:
     assert Path(saved_path).exists()
 
     loaded_fps = load_baseline(str(baseline_file))
-    assert len(loaded_fps) == 2
+    assert len(loaded_fps) == 4
     fp1 = clone_pair_fingerprint(u1, u2)
     assert fp1 in loaded_fps
+    assert clone_pair_structural_fingerprint(u1, u2) in loaded_fps
 
     new_clones, suppressed = filter_clones_by_baseline(mock_clones, loaded_fps)
     assert len(new_clones) == 0
@@ -250,4 +252,24 @@ def test_toml_fallback_line_parser(tmp_path: Path, monkeypatch: Any) -> None:
     assert res.get("idioms") is True
     assert res.get("flag") is False
     assert res.get("name") == "test"
+
+
+def test_cli_normalization_and_frequency_flags(tmp_path: Path) -> None:
+    """Test CLI flags --preserve-docstrings, --preserve-annotations, and --max-index-frequency."""
+    f = tmp_path / "sample.py"
+    f.write_text(
+        'def compute(x: int) -> int:\n'
+        '    """Sample docstring."""\n'
+        '    return x * 2\n',
+        encoding="utf-8",
+    )
+    code = pydoppelgangerhunt.main([
+        str(tmp_path),
+        "--preserve-docstrings",
+        "--preserve-annotations",
+        "--max-index-frequency", "0.20",
+        "--threshold", "0.90",
+    ])
+    assert code == 0
+
 

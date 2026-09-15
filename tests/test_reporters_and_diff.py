@@ -8,13 +8,16 @@ import pydoppelgangerhunt
 
 from pydoppelgangerhunt import (
     UnionFind,
+    analyze_unit_variable_scope,
     check_asymmetric_coverage,
     check_temporal_divergence,
+    clone_pair_structural_fingerprint,
     cluster_clone_families,
     colorize,
     compute_repository_dry_stats,
     compute_unit_coverage,
     extract_unit_source_code,
+    filter_clones_by_baseline,
     filter_clones_by_git_diff,
     format_github_annotations,
     format_json_report,
@@ -24,8 +27,10 @@ from pydoppelgangerhunt import (
     generate_html_report,
     generate_refactoring_patch,
     is_unit_in_modified_ranges,
+    load_baseline,
     parse_git_diff_hunks,
     read_coverage_data,
+    record_baseline,
     scan_target,
     supports_color,
     synthesize_refactoring_suggestion,
@@ -676,4 +681,144 @@ def test_dry_score_grade_tiers(tmp_path: Path) -> None:
     u_f2 = {"file": str(f), "start": 14, "end": 26, "name": "u2"}
     s_f = compute_repository_dry_stats(str(tmp_path), [(0.95, u_f1, u_f2)])
     assert s_f["grade"] == "F"
+
+
+def test_baseline_drift_immunity_across_line_shifts(tmp_path: Path) -> None:
+    """Test that grandfathered baseline matches via structural hash despite line position shifts."""
+    pkg = tmp_path / "baseline_pkg"
+    pkg.mkdir()
+
+    file_a = pkg / "worker_a.py"
+    file_b = pkg / "worker_b.py"
+
+    code_body = (
+        "def run_computation(x, y):\n"
+        "    acc = 0\n"
+        "    for val in range(x):\n"
+        "        acc += val * y\n"
+        "    return acc\n"
+    )
+    file_a.write_text(code_body, encoding="utf-8")
+    file_b.write_text(code_body, encoding="utf-8")
+
+    initial_clones = scan_target(str(pkg), min_lines=3, min_tokens=10, threshold=0.90)
+    assert len(initial_clones) >= 1
+    baseline_path = tmp_path / "baseline.json"
+    record_baseline(initial_clones, str(baseline_path), target=str(pkg), threshold=0.90)
+    fps = load_baseline(str(baseline_path))
+
+    # Shift lines in file_a by inserting 15 comment lines at top
+    shifted_code = ("# Upstream edit shifting lines down\n" * 15) + code_body
+    file_a.write_text(shifted_code, encoding="utf-8")
+
+    shifted_clones = scan_target(str(pkg), min_lines=3, min_tokens=10, threshold=0.90)
+    assert len(shifted_clones) >= 1
+    _, u1, u2 = shifted_clones[0]
+    # Verify line numbers indeed shifted
+    assert u1["start"] >= 16 or u2["start"] >= 16
+
+    # Verify structural fingerprint suppresses the clone despite the line shift
+    remaining, suppressed = filter_clones_by_baseline(shifted_clones, fps)
+    assert suppressed >= 1
+    assert len(remaining) == 0
+
+
+def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
+    """Test AST variable scope analysis and concrete parameter signature synthesis."""
+    file_a = tmp_path / "math_a.py"
+    file_b = tmp_path / "math_b.py"
+
+    file_a.write_text(
+        "def compute_coords(x: float, y: float) -> float:\n"
+        "    scaled = (x * 2.0) + (y * 3.0)\n"
+        "    return scaled\n",
+        encoding="utf-8",
+    )
+    file_b.write_text(
+        "def compute_coords_v2(x: float, y: float) -> float:\n"
+        "    scaled = (x * 2.0) + (y * 3.0)\n"
+        "    return scaled\n",
+        encoding="utf-8",
+    )
+
+    u1 = {"file": str(file_a), "start": 1, "end": 3, "name": "compute_coords"}
+    u2 = {"file": str(file_b), "start": 1, "end": 3, "name": "compute_coords_v2"}
+
+    scope = analyze_unit_variable_scope(u1, u2)
+    assert scope["inputs"] == ["x", "y"]
+    assert "scaled" in scope["outputs"]
+    assert "scaled" in scope["locals"]
+
+    helper = synthesize_shared_helper_code(u1, u2)
+    assert "def _shared_compute_coords" in helper
+    assert "x: Any, y: Any" in helper
+    assert "*args" not in helper
+
+    patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path))
+    assert "--- a/" in patch
+    assert "+++ b/" in patch
+    assert "def _shared_compute_coords" in patch
+
+    # Test single-unit scope analysis
+    scope_single = analyze_unit_variable_scope(u1)
+    assert scope_single["inputs"] == ["x", "y"]
+
+    # Test async function with *args and **kwargs
+    file_async = tmp_path / "async_service.py"
+    file_async.write_text(
+        "async def fetch_record(record_id: int, *extra_args: Any, **options: Any) -> int:\n"
+        "    return record_id\n",
+        encoding="utf-8",
+    )
+    u_async = {"file": str(file_async), "start": 1, "end": 2, "name": "fetch_record"}
+    scope_async = analyze_unit_variable_scope(u_async)
+    assert "record_id" in scope_async["inputs"]
+    assert "extra_args" in scope_async["inputs"]
+    assert "options" in scope_async["inputs"]
+    assert "record_id" in scope_async["outputs"]
+
+    # Test empty / invalid source unit
+    scope_empty = analyze_unit_variable_scope({"file": "non_existent.py", "start": 1, "end": 1, "name": "bad"})
+    assert scope_empty["inputs"] == []
+
+    # Test vector fallback and invalid baseline JSON
+    from pydoppelgangerhunt.baseline import compute_unit_structural_hash  # pylint: disable=import-outside-toplevel
+    assert compute_unit_structural_hash({"structural_hash": "existing12345678"}) == "existing12345678"
+    assert len(compute_unit_structural_hash({"tokens": ["alpha", "beta"]})) == 16
+    h_vec = compute_unit_structural_hash({"vector": {"token_x": 3, "token_y": 1}})
+    assert len(h_vec) == 16
+
+    corrupt_json = tmp_path / "corrupt.json"
+    corrupt_json.write_text("NOT_JSON_DATA", encoding="utf-8")
+    assert load_baseline(str(corrupt_json)) == set()
+    assert load_baseline(str(tmp_path / "absent.json")) == set()
+
+    # Test fixer with no common lines fallback and non-existent patch targets
+    file_diff1 = tmp_path / "diff1.py"
+    file_diff2 = tmp_path / "diff2.py"
+    file_diff1.write_text("def unique_one():\n    return 1\n", encoding="utf-8")
+    file_diff2.write_text("def unique_two():\n    return 2\n", encoding="utf-8")
+    u_d1 = {"file": str(file_diff1), "start": 1, "end": 2, "name": "unique_one"}
+    u_d2 = {"file": str(file_diff2), "start": 1, "end": 2, "name": "unique_two"}
+    helper_uncommon = synthesize_shared_helper_code(u_d1, u_d2)
+    assert "_shared_unique_one_unique_two" in helper_uncommon
+
+    u_missing = {"file": "no_such_file_on_disk.py", "start": 1, "end": 2, "name": "miss"}
+    assert generate_refactoring_patch([(0.9, u_missing, u_d2)]) == ""
+
+    # Test cli risk warnings helper
+    from pydoppelgangerhunt import cli  # pylint: disable=import-outside-toplevel
+    warn_u1 = {"file": "mod1.py", "start": 1, "end": 10, "name": "f1"}
+    warn_u2 = {"file": "mod2.py", "start": 1, "end": 10, "name": "f2"}
+    risk_lines = cli._audit_clone_risk_warnings(  # pylint: disable=protected-access
+        warn_u1,
+        warn_u2,
+        audit_blame=True,
+        cov_data={"mod1.py": {1, 2}, "mod2.py": set(range(1, 10))},
+        use_color=False,
+    )
+    assert isinstance(risk_lines, list)
+
+
+
 

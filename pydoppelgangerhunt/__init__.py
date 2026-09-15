@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pydoppelgangerhunt.baseline import (
     clone_pair_fingerprint,
+    clone_pair_structural_fingerprint,
+    compute_unit_structural_hash,
     filter_clones_by_baseline,
     load_baseline,
     record_baseline,
@@ -23,6 +25,7 @@ from pydoppelgangerhunt.coverage import (
     read_coverage_data,
 )
 from pydoppelgangerhunt.fixer import (
+    analyze_unit_variable_scope,
     generate_refactoring_patch,
     synthesize_shared_helper_code,
 )
@@ -121,8 +124,11 @@ __all__ = [
     "read_coverage_data",
     "compute_unit_coverage",
     "check_asymmetric_coverage",
+    "analyze_unit_variable_scope",
     "synthesize_shared_helper_code",
     "generate_refactoring_patch",
+    "compute_unit_structural_hash",
+    "clone_pair_structural_fingerprint",
     "record_baseline",
     "load_baseline",
     "filter_clones_by_baseline",
