@@ -113,6 +113,9 @@ optional_dependencies_dev_groups = ["dev"]
 build = "build"
 
 [tool.deptry.per_rule_ignores]
+DEP001 = [
+    "tomllib"
+]
 DEP004 = [
     "tomli"
 ]
