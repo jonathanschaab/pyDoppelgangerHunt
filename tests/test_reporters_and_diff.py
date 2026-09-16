@@ -5,8 +5,12 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
+import sys
 from typing import Any, Dict, List, Tuple
 from unittest import mock
+
+import pytest
+
 import pydoppelgangerhunt
 
 from pydoppelgangerhunt import (
@@ -3907,6 +3911,7 @@ def test_direct_method_verification_distinguishes_closures(tmp_path: Path) -> No
     assert _is_method_of_class(fn_inner, cls_meta) is False
 
 
+@pytest.mark.skipif(sys.version_info < (3, 10), reason="Pattern matching requires Python 3.10+")
 def test_match_pattern_bound_variables_not_treated_as_inputs(tmp_path: Path) -> None:
     """Verifies that pattern-bound variables in match statements are recognized as stores, not inputs."""
     code = (
@@ -3929,6 +3934,7 @@ def test_match_pattern_bound_variables_not_treated_as_inputs(tmp_path: Path) -> 
     assert "total" in scope["outputs"]
 
 
+@pytest.mark.skipif(sys.version_info < (3, 10), reason="Pattern matching requires Python 3.10+")
 def test_match_definite_assignment_requires_irrefutable_default() -> None:
     """Verifies that match block assignments require an irrefutable pattern to be definite."""
     code_no_default = (
