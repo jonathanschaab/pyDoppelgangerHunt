@@ -349,9 +349,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not os.path.exists(baseline_path):
             print(f"[ERROR] Baseline file '{baseline_path}' not found")
             return 1
-        pruned_count, retained_count = prune_baseline(baseline_path, clones)
+        prune_res = prune_baseline(baseline_path, clones)
+        pruned_count = prune_res[0]
+        retained_count = prune_res[1]
+        skipped_dirty = getattr(prune_res, "skipped_dirty_count", 0)
         if args.format == "text":
-            print(f"[BASELINE] Pruned {pruned_count} orphaned fingerprint(s) from {baseline_path} ({retained_count} retained).")
+            if skipped_dirty > 0:
+                print(
+                    f"[BASELINE] Pruned {pruned_count} orphaned fingerprint(s) from {baseline_path} "
+                    f"({skipped_dirty} skipped due to unstaged git changes, {retained_count} retained)."
+                )
+            else:
+                print(
+                    f"[BASELINE] Pruned {pruned_count} orphaned fingerprint(s) from {baseline_path} "
+                    f"({retained_count} retained)."
+                )
 
     if baseline_path:
         base_fps = load_baseline(baseline_path)
