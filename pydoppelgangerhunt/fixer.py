@@ -5,11 +5,13 @@ from __future__ import annotations
 import ast
 import builtins
 import difflib
+import io
 import logging
 import os
 from pathlib import Path
 import re
 import textwrap
+import tokenize
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.reporters import extract_unit_source_code
@@ -22,7 +24,11 @@ BUILTIN_NAMES: Set[str] = set(dir(builtins))
 class _ScopeVisitor(ast.NodeVisitor):
     """Inspects AST loads, stores, function parameters, returns, nonlocals, globals, and attributes."""
 
-    def __init__(self, loop_offset: int = 0) -> None:
+    def __init__(
+        self,
+        loop_offset: int = 0,
+        source_lines: Optional[Sequence[str]] = None,
+    ) -> None:
         self.loads: List[str] = []
         self.stores: List[str] = []
         self.params: List[str] = []
@@ -44,6 +50,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.imported_names: Dict[str, str] = {}
         self.yield_expr_names: List[Tuple[str, str]] = []
         self.is_async: bool = False
+        self.source_lines: Optional[List[str]] = list(source_lines) if source_lines is not None else None
 
     def _record_arg(
         self,
@@ -256,15 +263,29 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _record_import_node(self, node: Union[ast.Import, ast.ImportFrom]) -> None:
-        try:
-            stmt = ast.unparse(node)
-            if stmt not in self.local_imports:
-                self.local_imports.append(stmt)
-            for alias in node.names:
-                name = alias.asname or alias.name
-                self.imported_names[name] = stmt
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            logger.debug("Failed to unparse import node %r: %s", node, exc)
+        stmt: Optional[str] = None
+        if self.source_lines is not None:
+            lineno = getattr(node, "lineno", None)
+            end_lineno = getattr(node, "end_lineno", lineno)
+            if lineno is not None and end_lineno is not None:
+                if 1 <= lineno <= len(self.source_lines) and 1 <= end_lineno <= len(self.source_lines):
+                    raw_slice = self.source_lines[lineno - 1 : end_lineno]
+                    raw_str = "".join(raw_slice).strip()
+                    if raw_str:
+                        stmt = raw_str
+
+        if stmt is None:
+            try:
+                stmt = ast.unparse(node)
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                logger.debug("Failed to unparse import node %r: %s", node, exc)
+                return
+
+        if stmt not in self.local_imports:
+            self.local_imports.append(stmt)
+        for alias in node.names:
+            name = alias.asname or alias.name
+            self.imported_names[name] = stmt
 
     def visit_Import(self, node: ast.Import) -> None:
         self._record_import_node(node)
@@ -402,7 +423,8 @@ def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
     if tree is None:
         return empty_res
 
-    visitor = _ScopeVisitor(loop_offset=loop_offset)
+    cand_lines = cand_text.splitlines(keepends=True)
+    visitor = _ScopeVisitor(loop_offset=loop_offset, source_lines=cand_lines)
     visitor.visit(tree)
 
     unit_name = unit.get("name", "")
@@ -723,11 +745,141 @@ def _insert_imports_into_module(
     return orig_lines[:insert_idx] + formatted + ["\n"] + orig_lines[insert_idx:]
 
 
+def slice_source_by_token_range(
+    source_text: str,
+    start_line: int,
+    start_col: int,
+    end_line: int,
+    end_col: Optional[int] = None,
+) -> str:
+    """Extracts a precise slice of source code spanning 1-indexed lines and 0-indexed columns.
+
+    Args:
+        source_text: The complete original Python source code.
+        start_line: 1-indexed start line number.
+        start_col: 0-indexed start column offset.
+        end_line: 1-indexed end line number.
+        end_col: 0-indexed end column offset (exclusive). If None, includes through the end of end_line.
+
+    Returns:
+        The exact string slice of source code between the specified coordinates.
+    """
+    if not source_text:
+        return ""
+    lines = source_text.splitlines(keepends=True)
+    if not lines or start_line < 1 or start_line > len(lines) or start_line > end_line:
+        return ""
+
+    effective_end_line = min(len(lines), end_line)
+    if start_line == effective_end_line:
+        line_str = lines[start_line - 1]
+        start_c = max(0, min(len(line_str), start_col))
+        end_c = len(line_str) if end_col is None else max(start_c, min(len(line_str), end_col))
+        return line_str[start_c:end_c]
+
+    first_line = lines[start_line - 1]
+    start_c = max(0, min(len(first_line), start_col))
+    part_first = first_line[start_c:]
+    middle_parts = lines[start_line : effective_end_line - 1]
+    last_line = lines[effective_end_line - 1]
+    end_c = len(last_line) if end_col is None else max(0, min(len(last_line), end_col))
+    part_last = last_line[:end_c]
+    return part_first + "".join(middle_parts) + part_last
+
+
+def extract_unit_comments_and_pragmas(
+    source_text: str,
+    start_line: int,
+    end_line: int,
+    start_col: int = 0,
+    end_col: Optional[int] = None,
+    include_leading: bool = False,
+) -> List[Dict[str, Any]]:
+    """Extracts comments and pragmas within or attached to a unit's coordinate bounds.
+
+    Uses Python's standard library `tokenize` module to harvest exact token positions
+    for comments, identifying `# type: ignore`, `# noqa`, and `# pylint:` annotations.
+
+    Args:
+        source_text: The complete original Python source code.
+        start_line: 1-indexed start line number of the unit.
+        end_line: 1-indexed end line number of the unit.
+        start_col: 0-indexed start column offset.
+        end_col: 0-indexed end column offset.
+        include_leading: If True, also harvests consecutive comment lines immediately
+            preceding start_line.
+
+    Returns:
+        A list of dictionaries representing discovered comments:
+        [{
+            "line": int,
+            "col": int,
+            "end_col": int,
+            "text": str,
+            "is_pragma": bool,
+            "pragma_kind": Optional[str],
+        }]
+    """
+    if not source_text:
+        return []
+
+    lines = source_text.splitlines(keepends=True)
+    min_check_line = start_line
+    if include_leading and start_line > 1:
+        curr = start_line - 1
+        while curr >= 1:
+            stripped = lines[curr - 1].strip()
+            if stripped.startswith("#"):
+                min_check_line = curr
+                curr -= 1
+            else:
+                break
+
+    results: List[Dict[str, Any]] = []
+    try:
+        token_gen = tokenize.generate_tokens(io.StringIO(source_text).readline)
+        for tok in token_gen:
+            if tok.type == tokenize.COMMENT:
+                tok_line, tok_col = tok.start
+                _, tok_end_col = tok.end
+
+                if min_check_line <= tok_line <= end_line:
+                    if tok_line == start_line and tok_line == min_check_line and tok_col < start_col:
+                        continue
+                    comment_text = tok.string
+                    lower = comment_text.lower()
+                    is_pragma = False
+                    pragma_kind = None
+                    if "type: ignore" in lower:
+                        is_pragma = True
+                        pragma_kind = "type_ignore"
+                    elif "noqa" in lower:
+                        is_pragma = True
+                        pragma_kind = "noqa"
+                    elif "pylint:" in lower:
+                        is_pragma = True
+                        pragma_kind = "pylint"
+
+                    results.append({
+                        "line": tok_line,
+                        "col": tok_col,
+                        "end_col": tok_end_col,
+                        "text": comment_text,
+                        "is_pragma": is_pragma,
+                        "pragma_kind": pragma_kind,
+                    })
+    except (tokenize.TokenError, IndentationError) as exc:
+        logger.debug("Failed to tokenize source for comments: %s", exc)
+
+    return results
+
+
 def synthesize_shared_helper_code(
     u1: Dict[str, Any],
     u2: Dict[str, Any],
     type_merge_strategy: str = "fallback_any",
     include_imports: bool = False,
+    preserve_pragmas: bool = True,
 ) -> str:
     """Synthesizes a proposed shared helper function stub from two clone units.
 
@@ -738,6 +890,8 @@ def synthesize_shared_helper_code(
             Options: "fallback_any" (default, falls back to Any)
             or "union" (suggests typing.Union[T1, T2]).
         include_imports: Whether to prepend required typing and local imports.
+        preserve_pragmas: Whether to preserve comments and pragmas (# type: ignore / # noqa)
+            from the original clone units in the extracted helper function.
     """
     lines1 = [ln.rstrip("\r\n") for ln in extract_unit_source_code(u1)]
     lines2 = [ln.rstrip("\r\n") for ln in extract_unit_source_code(u2)]
@@ -753,8 +907,22 @@ def synthesize_shared_helper_code(
         if tag == "equal":
             common_lines.extend(lines1[i1:i2])
 
-    if not common_lines:
+    if not common_lines or (preserve_pragmas and len(common_lines) < max(len(lines1), len(lines2)) * 0.5):
         common_lines = lines1
+
+    if preserve_pragmas:
+        raw1 = "\n".join(lines1)
+        raw2 = "\n".join(lines2)
+        pragmas1 = extract_unit_comments_and_pragmas(raw1, 1, len(lines1))
+        pragmas2 = extract_unit_comments_and_pragmas(raw2, 1, len(lines2))
+        for p in pragmas1 + pragmas2:
+            if p["is_pragma"]:
+                p_text = p["text"].strip()
+                if not any(p_text in ln for ln in common_lines):
+                    for idx, ln in enumerate(common_lines):
+                        if ln.strip() and not ln.strip().startswith("#"):
+                            common_lines[idx] = ln.rstrip() + f"  {p_text}"
+                            break
 
     # Variable scope analysis for concrete parameter signatures
     scope1 = analyze_unit_variable_scope(u1)
@@ -986,13 +1154,21 @@ def replace_unit_in_source(
     source_text: str,
     unit: Dict[str, Any],
     replacement_text: str,
+    preserve_boundary_pragmas: bool = True,
 ) -> str:
     """Replaces an AST code unit in source text with replacement text, preserving comments and formatting.
 
+    Supports sub-line and token-range precision slicing when 'start_col' and 'end_col'
+    are present in the unit dictionary. Preserves surrounding indentation, preceding code
+    on the start line, trailing pragmas/comments on the end line, and attached pragmas.
+
     Args:
         source_text: The complete original Python source code.
-        unit: The AST unit mapping containing 1-indexed 'start' and 'end' line numbers.
+        unit: The AST unit mapping containing 1-indexed 'start' and 'end' line numbers,
+            and optional 0-indexed 'start_col' and 'end_col' column offsets.
         replacement_text: The text to substitute in place of the unit lines.
+        preserve_boundary_pragmas: If True, retains boundary pragmas (# type: ignore / # noqa)
+            attached to the original code unit and appends them to the replacement statement.
 
     Returns:
         The modified source code with comments, type ignores, and whitespace outside the unit preserved.
@@ -1003,7 +1179,64 @@ def replace_unit_in_source(
     if start > len(lines) or start > end:
         return source_text
 
+    start_col = unit.get("start_col")
+    end_col = unit.get("end_col")
+
     rep = replacement_text
+
+    # Extract boundary pragmas if requested
+    attached_pragmas: List[str] = []
+    if preserve_boundary_pragmas:
+        boundary_comments = extract_unit_comments_and_pragmas(
+            source_text, start_line=start, end_line=end, start_col=start_col or 0, end_col=end_col
+        )
+        for c in boundary_comments:
+            if c["is_pragma"] and c["line"] in (start, end):
+                p_text = c["text"].strip()
+                if p_text not in rep and p_text not in attached_pragmas:
+                    attached_pragmas.append(p_text)
+
+    first_line = lines[start - 1]
+    start_c = max(0, min(len(first_line), int(start_col or 0)))
+    last_line = lines[end - 1]
+    end_c = len(last_line) if end_col is None else max(0, min(len(last_line), int(end_col)))
+
+    prefix_is_whitespace = not first_line[:start_c].strip()
+    suffix_stripped = last_line[end_c:].strip()
+    suffix_is_boundary_only = not suffix_stripped or suffix_stripped.startswith("#")
+    is_column_bounded = (start_col is not None or end_col is not None) and not (
+        prefix_is_whitespace and suffix_is_boundary_only
+    )
+
+    if is_column_bounded:
+        prefix_line = first_line[:start_c]
+        suffix_line = last_line[end_c:]
+
+        prefix_all = "".join(lines[: start - 1]) + prefix_line
+        suffix_all = suffix_line + "".join(lines[end:])
+
+        final_rep = rep
+        if attached_pragmas and not any(p in suffix_line for p in attached_pragmas):
+            pragma_suffix = "  " + "  ".join(attached_pragmas)
+            if final_rep.endswith("\n"):
+                final_rep = final_rep[:-1] + pragma_suffix + "\n"
+            else:
+                final_rep += pragma_suffix
+
+        return prefix_all + final_rep + suffix_all
+
+    # Whole-line replacement
+    if attached_pragmas and rep:
+        pragma_suffix = "  " + "  ".join(attached_pragmas)
+        rep_lines = rep.splitlines(keepends=True)
+        if rep_lines:
+            last_rep = rep_lines[-1]
+            if last_rep.endswith("\n"):
+                rep_lines[-1] = last_rep[:-1] + pragma_suffix + "\n"
+            else:
+                rep_lines[-1] = last_rep + pragma_suffix
+            rep = "".join(rep_lines)
+
     if rep and not rep.endswith("\n"):
         rep += "\n"
 

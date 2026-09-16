@@ -2114,6 +2114,198 @@ def test_cli_prune_baseline_with_unstaged_diff(tmp_path: Path, monkeypatch: Any,
     assert "skipped due to unstaged git changes" in captured
 
 
+def test_slice_source_by_token_range() -> None:
+    """Tests precise character/token-range slicing across lines and columns."""
+    from pydoppelgangerhunt import slice_source_by_token_range  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def example(alpha: int, beta: str) -> None:\n"
+        "    first_val = 10; second_val = 20  # inline\n"
+        "    return None\n"
+    )
+
+    # 1. Single-line slice: "first_val = 10" is columns 4 to 18 on line 2
+    sl1 = slice_source_by_token_range(code, 2, 4, 2, 18)
+    assert sl1 == "first_val = 10"
+
+    # 2. Multi-line slice
+    sl2 = slice_source_by_token_range(code, 1, 4, 2, 18)
+    assert sl2.startswith("example(alpha: int, beta: str) -> None:\n    first_val = 10")
+
+    # 3. None end_col includes through end of line
+    sl3 = slice_source_by_token_range(code, 3, 4, 3, None)
+    assert sl3 == "return None\n"
+
+    # 4. Out of bounds and edge cases
+    assert slice_source_by_token_range("", 1, 0, 1, 5) == ""
+    assert slice_source_by_token_range(code, 0, 0, 1, 5) == ""
+    assert slice_source_by_token_range(code, 5, 0, 10, 5) == ""
+    assert slice_source_by_token_range(code, 3, 0, 2, 5) == ""
+
+
+def test_extract_unit_comments_and_pragmas() -> None:
+    """Tests extraction and classification of comments, # type: ignore, and # noqa pragmas."""
+    from pydoppelgangerhunt import extract_unit_comments_and_pragmas  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "# Top comment\n"
+        "# Another header\n"
+        "def compute():\n"
+        "    x = 1  # inline note\n"
+        "    y = 2  # type: ignore[assignment]\n"
+        "    z = 3  # noqa: E501\n"
+        "    w = 4  # pylint: disable=unused-variable\n"
+    )
+
+    # Harvest lines 3 through 7
+    comments = extract_unit_comments_and_pragmas(code, 3, 7)
+    assert len(comments) == 4
+    texts = [c["text"] for c in comments]
+    assert "# inline note" in texts
+    assert "# type: ignore[assignment]" in texts
+    assert "# noqa: E501" in texts
+    assert "# pylint: disable=unused-variable" in texts
+
+    # Verify classification
+    pragmas = [c for c in comments if c["is_pragma"]]
+    assert len(pragmas) == 3
+    kinds = {c["pragma_kind"] for c in pragmas}
+    assert kinds == {"type_ignore", "noqa", "pylint"}
+
+    # Leading comments harvesting
+    leading = extract_unit_comments_and_pragmas(code, 3, 4, include_leading=True)
+    leading_texts = [c["text"] for c in leading]
+    assert "# Top comment" in leading_texts
+    assert "# Another header" in leading_texts
+
+    # Empty code
+    assert extract_unit_comments_and_pragmas("", 1, 5) == []
+
+
+def test_replace_unit_in_source_subline_and_token_slicing() -> None:
+    """Verifies sub-line and token-range replacement preserving surrounding code and pragmas."""
+    from pydoppelgangerhunt import replace_unit_in_source  # pylint: disable=import-outside-toplevel
+
+    # 1. Statement sharing a line with prefix code and trailing pragma
+    code1 = "x = 1; y = (a + b)  # type: ignore[operator]\n"
+    unit_subline = {
+        "file": "sub.py",
+        "start": 1,
+        "end": 1,
+        "start_col": 7,
+        "end_col": 18,
+        "name": "y_assign",
+    }
+    replaced1 = replace_unit_in_source(code1, unit_subline, "y = helper(a, b)")
+    assert replaced1 == "x = 1; y = helper(a, b)  # type: ignore[operator]\n"
+
+    # 2. Multi-line unit with boundary pragma preservation
+    code2 = (
+        "def run_job():\n"
+        "    val = compute_step()\n"
+        "    return val  # type: ignore[no-any-return]\n"
+    )
+    unit_whole = {"file": "job.py", "start": 2, "end": 3, "name": "run_job_body"}
+    replaced2 = replace_unit_in_source(code2, unit_whole, "    return _shared_compute_step()")
+    assert "return _shared_compute_step()  # type: ignore[no-any-return]\n" in replaced2
+
+    # 3. Whole-line with preserve_boundary_pragmas=False
+    replaced3 = replace_unit_in_source(
+        code2, unit_whole, "    return _shared_compute_step()", preserve_boundary_pragmas=False
+    )
+    assert "return _shared_compute_step()\n" in replaced3
+    assert "# type: ignore" not in replaced3
+
+
+def test_replace_unit_in_source_harvested_block_keeps_indentation(tmp_path: Path) -> None:
+    """Verifies harvested indented multiline blocks are replaced as whole lines."""
+    from pydoppelgangerhunt import replace_unit_in_source  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.parser import harvest_file_units  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def run(value: int) -> int:\n"
+        "    if value > 0:\n"
+        "        result = value + 1\n"
+        "        return result\n"
+        "    fallback = 0\n"
+        "    return fallback\n"
+    )
+    src = tmp_path / "sample.py"
+    src.write_text(code, encoding="utf-8")
+
+    units = harvest_file_units(str(src), str(tmp_path), min_lines=2, min_tokens=3)
+    block_unit = next(unit for unit in units if unit.get("kind") == "compound_block")
+
+    replaced = replace_unit_in_source(code, block_unit, "    helper_result = shared(value)\n    return helper_result\n")
+
+    assert replaced == (
+        "def run(value: int) -> int:\n"
+        "    helper_result = shared(value)\n"
+        "    return helper_result\n"
+        "    fallback = 0\n"
+        "    return fallback\n"
+    )
+
+
+def test_synthesize_helper_with_pragma_and_import_preservation(tmp_path: Path) -> None:
+    """Verifies that synthesize_shared_helper_code and local import capture preserve pragmas."""
+    from pydoppelgangerhunt.fixer import (  # pylint: disable=import-outside-toplevel
+        analyze_unit_variable_scope,
+        synthesize_shared_helper_code,
+    )
+
+    f1 = tmp_path / "mod_a.py"
+    f2 = tmp_path / "mod_b.py"
+
+    code_a = (
+        "def process_a(val):\n"
+        "    from typing_extensions import Buffer  # type: ignore\n"
+        "    # Step 1: calculate\n"
+        "    result = val * 10  # type: ignore[operator]\n"
+        "    return result\n"
+    )
+    code_b = (
+        "def process_b(val):\n"
+        "    # Step 1: calculate\n"
+        "    result = val * 10  # type: ignore[operator]\n"
+        "    return result\n"
+    )
+    f1.write_text(code_a, encoding="utf-8")
+    f2.write_text(code_b, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 1, "end": 5, "name": "process_a", "kind": "function"}
+    u2 = {"file": str(f2), "start": 1, "end": 5, "name": "process_b", "kind": "function"}
+
+    # Scope analysis captures local import with # type: ignore intact
+    scope = analyze_unit_variable_scope(u1)
+    assert any("# type: ignore" in imp for imp in scope.get("local_imports", []))
+
+    # Shared helper synthesis preserves comments and # type: ignore pragma
+    helper = synthesize_shared_helper_code(u1, u2, preserve_pragmas=True)
+    assert "# type: ignore[operator]" in helper
+
+
+def test_parser_harvests_token_columns(tmp_path: Path) -> None:
+    """Verifies that parser._record_unit stores start_col and end_col on harvested units."""
+    from pydoppelgangerhunt.parser import harvest_file_units  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def add(x: int, y: int) -> int:\n"
+        "    # Some logic\n"
+        "    total = x + y\n"
+        "    return total\n"
+    )
+    f = tmp_path / "sample.py"
+    f.write_text(code, encoding="utf-8")
+
+    units = harvest_file_units(str(f), str(tmp_path), min_lines=2, min_tokens=3)
+    assert units
+    for u in units:
+        assert "start_col" in u
+        assert "end_col" in u
+        assert isinstance(u["start_col"], int)
+
+
 
 
 

@@ -36,10 +36,12 @@ from pydoppelgangerhunt.coverage import (
 from pydoppelgangerhunt.fixer import (
     analyze_unit_variable_scope,
     check_units_overlap,
+    extract_unit_comments_and_pragmas,
     filter_overlapping_clone_units,
     generate_refactoring_patch,
     refactor_module_units,
     replace_unit_in_source,
+    slice_source_by_token_range,
     synthesize_shared_helper_code,
 )
 from pydoppelgangerhunt.git_diff import (
@@ -151,6 +153,8 @@ __all__ = [
     "analyze_unit_variable_scope",
     "synthesize_shared_helper_code",
     "replace_unit_in_source",
+    "slice_source_by_token_range",
+    "extract_unit_comments_and_pragmas",
     "check_units_overlap",
     "filter_overlapping_clone_units",
     "refactor_module_units",
