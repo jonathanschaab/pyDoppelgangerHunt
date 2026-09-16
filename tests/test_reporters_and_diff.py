@@ -54,6 +54,7 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _detect_indent_step,
     _extract_required_typing_imports,
     _find_module_helper_insertion_index,
+    _format_call_arguments,
     _insert_imports_into_module,
     _inspect_unit_scope,
     _is_method_of_class,
@@ -4736,6 +4737,113 @@ def test_generate_refactoring_patch_mixed_static_instance_does_not_mark_static(t
     assert "@staticmethod\n    def _shared" not in patch
     assert "@staticmethod\ndef _shared" not in patch
     assert "def _shared_static_calc_inst_calc(a: int, b: int) -> int:" in patch
+
+
+def test_format_call_arguments_vararg_kwarg_ordering() -> None:
+    """Verifies that _format_call_arguments orders positional arguments and free variables before varargs/kwargs."""
+    inputs = ["self", "*args", "**kwargs", "extra_pos"]
+    param_details = [
+        {"name": "self", "kind": "pos"},
+        {"name": "*args", "kind": "vararg"},
+        {"name": "**kwargs", "kind": "kwarg"},
+        {"name": "extra_pos", "kind": "pos"},
+    ]
+    args_str = _format_call_arguments(inputs, param_details, receiver_to_omit="self")
+    assert args_str == "extra_pos, *args, **kwargs"
+    # Ensure it parses cleanly without SyntaxError: positional argument follows keyword argument unpacking
+    ast.parse(f"call({args_str})")
+
+
+def test_analyze_block_assignment_short_circuit_walrus() -> None:
+    """Verifies that short-circuit walrus expressions are correctly identified as conditional."""
+    code_and = "if cond and (x := 1):\n    pass\n"
+    d1, c1 = _analyze_block_assignment(ast.parse(code_and).body)
+    assert "x" in c1
+    assert "x" not in d1
+
+    code_or = "if cond or (x := 1):\n    pass\n"
+    d2, c2 = _analyze_block_assignment(ast.parse(code_or).body)
+    assert "x" in c2
+    assert "x" not in d2
+
+    code_ifexp = "val = (x := 1) if cond else 0\n"
+    d3, c3 = _analyze_block_assignment(ast.parse(code_ifexp).body)
+    assert "val" in d3
+    assert "x" in c3
+    assert "x" not in d3
+
+
+def test_analyze_block_assignment_unconditional_walrus() -> None:
+    """Verifies that unconditionally evaluated walrus expressions are identified as definite."""
+    code_assign = "val = (x := 1)\n"
+    d1, c1 = _analyze_block_assignment(ast.parse(code_assign).body)
+    assert "val" in d1
+    assert "x" in d1
+    assert "x" not in c1
+
+    code_head = "if (x := 1) and cond:\n    pass\n"
+    d2, c2 = _analyze_block_assignment(ast.parse(code_head).body)
+    assert "x" in d2
+    assert "x" not in c2
+
+
+def test_analyze_block_assignment_with_target_variables() -> None:
+    """Verifies that with/async with optional_vars targets are captured as definite assignments."""
+    code_with = "with open('file') as fh:\n    data = fh.read()\n"
+    d, _ = _analyze_block_assignment(ast.parse(code_with).body)
+    assert "fh" in d
+
+
+def test_analyze_block_assignment_try_finally_definite() -> None:
+    """Verifies that statements in finally: blocks are recognized as definite assignments."""
+    code_try = "try:\n    risky()\nfinally:\n    cleaned = True\n"
+    d, _ = _analyze_block_assignment(ast.parse(code_try).body)
+    assert "cleaned" in d
+
+
+def test_extracted_helper_short_circuit_walrus_initialization(tmp_path: Path) -> None:
+    """Verifies that short-circuit walrus inside extracted clone initializes output = None."""
+    code = (
+        "def worker_a(cond: bool, data: int) -> int:\n"
+        "    if cond and (res := data * 2):\n"
+        "        pass\n"
+        "    return res\n"
+        "\n"
+        "def worker_b(cond: bool, data: int) -> int:\n"
+        "    if cond and (res := data * 2):\n"
+        "        pass\n"
+        "    return res\n"
+    )
+    f = tmp_path / "walrus_sub.py"
+    f.write_text(code, encoding="utf-8")
+    u1 = {"file": str(f), "start": 2, "end": 3, "name": "worker_a:block_L2", "kind": "compound_block"}
+    u2 = {"file": str(f), "start": 7, "end": 8, "name": "worker_b:block_L7", "kind": "compound_block"}
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch
+    assert "res = None" in patch
+
+
+def test_extracted_helper_unconditional_walrus_no_redundant_init(tmp_path: Path) -> None:
+    """Verifies that unconditionally evaluated walrus inside extracted clone does not initialize with None."""
+    code = (
+        "def worker_a(data: int) -> int:\n"
+        "    total = (res := data * 2)\n"
+        "    return total + res\n"
+        "\n"
+        "def worker_b(data: int) -> int:\n"
+        "    total = (res := data * 2)\n"
+        "    return total + res\n"
+    )
+    f = tmp_path / "walrus_uncond.py"
+    f.write_text(code, encoding="utf-8")
+    u1 = {"file": str(f), "start": 2, "end": 2, "name": "worker_a:block_L2", "kind": "compound_block"}
+    u2 = {"file": str(f), "start": 6, "end": 6, "name": "worker_b:block_L6", "kind": "compound_block"}
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch
+    assert "res = None" not in patch
+
 
 
 

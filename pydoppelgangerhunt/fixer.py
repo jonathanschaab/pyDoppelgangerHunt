@@ -474,6 +474,76 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+def _walrus_assignment_in_expr(
+    expr: Optional[ast.AST],
+    is_conditional: bool = False,
+) -> Tuple[Set[str], Set[str]]:
+    """Analyzes walrus assignments in an expression to distinguish definite from conditional stores."""
+    definite: Set[str] = set()
+    conditional: Set[str] = set()
+    if expr is None:
+        return definite, conditional
+
+    if isinstance(expr, ast.NamedExpr) and isinstance(expr.target, ast.Name):
+        if is_conditional:
+            conditional.add(expr.target.id)
+        else:
+            definite.add(expr.target.id)
+
+    if isinstance(expr, ast.BoolOp):
+        if expr.values:
+            d_head, c_head = _walrus_assignment_in_expr(expr.values[0], is_conditional)
+            definite.update(d_head)
+            conditional.update(c_head)
+            for val in expr.values[1:]:
+                d_tail, c_tail = _walrus_assignment_in_expr(val, True)
+                definite.update(d_tail)
+                conditional.update(c_tail)
+        return definite, conditional - definite
+
+    if isinstance(expr, ast.IfExp):
+        d_t, c_t = _walrus_assignment_in_expr(expr.test, is_conditional)
+        d_b, c_b = _walrus_assignment_in_expr(expr.body, True)
+        d_o, c_o = _walrus_assignment_in_expr(expr.orelse, True)
+        definite.update(d_t)
+        conditional.update(c_t | d_b | c_b | d_o | c_o)
+        return definite, conditional - definite
+
+    if isinstance(expr, ast.Lambda):
+        d_l, c_l = _walrus_assignment_in_expr(expr.body, True)
+        conditional.update(d_l | c_l)
+        return definite, conditional - definite
+
+    if isinstance(expr, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+        if expr.generators:
+            d_i, c_i = _walrus_assignment_in_expr(expr.generators[0].iter, is_conditional)
+            definite.update(d_i)
+            conditional.update(c_i)
+            for gen in expr.generators[1:]:
+                d_g, c_g = _walrus_assignment_in_expr(gen.iter, True)
+                conditional.update(d_g | c_g)
+        for child in ast.iter_child_nodes(expr):
+            if isinstance(expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp)) and child is expr.elt:
+                d_c, c_c = _walrus_assignment_in_expr(child, True)
+                conditional.update(d_c | c_c)
+            elif isinstance(expr, ast.DictComp) and child in (expr.key, expr.value):
+                d_c, c_c = _walrus_assignment_in_expr(child, True)
+                conditional.update(d_c | c_c)
+            elif isinstance(child, ast.comprehension):
+                for if_expr in child.ifs:
+                    d_c, c_c = _walrus_assignment_in_expr(if_expr, True)
+                    conditional.update(d_c | c_c)
+        return definite, conditional - definite
+
+    for child in ast.iter_child_nodes(expr):
+        if isinstance(child, ast.expr):
+            d_ch, c_ch = _walrus_assignment_in_expr(child, is_conditional)
+            definite.update(d_ch)
+            conditional.update(c_ch)
+
+    return definite, conditional - definite
+
+
 def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str], Set[str]]:
     """Analyzes a sequence of statements to determine unconditionally and conditionally assigned variables.
 
@@ -489,13 +559,35 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                 for node in ast.walk(target):
                     if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
                         definite.add(node.id)
+            d_val, c_val = _walrus_assignment_in_expr(stmt.value)
+            definite.update(d_val)
+            conditional.update(c_val)
         elif isinstance(stmt, ast.AnnAssign):
-            if stmt.value is not None and isinstance(stmt.target, ast.Name):
-                definite.add(stmt.target.id)
+            if stmt.value is not None:
+                if isinstance(stmt.target, ast.Name):
+                    definite.add(stmt.target.id)
+                d_val, c_val = _walrus_assignment_in_expr(stmt.value)
+                definite.update(d_val)
+                conditional.update(c_val)
         elif isinstance(stmt, ast.AugAssign):
             if isinstance(stmt.target, ast.Name):
                 definite.add(stmt.target.id)
+            d_val, c_val = _walrus_assignment_in_expr(stmt.value)
+            definite.update(d_val)
+            conditional.update(c_val)
+        elif isinstance(stmt, ast.Expr):
+            d_val, c_val = _walrus_assignment_in_expr(stmt.value)
+            definite.update(d_val)
+            conditional.update(c_val)
+        elif isinstance(stmt, ast.Return):
+            if stmt.value is not None:
+                d_val, c_val = _walrus_assignment_in_expr(stmt.value)
+                definite.update(d_val)
+                conditional.update(c_val)
         elif isinstance(stmt, ast.If):
+            d_test, c_test = _walrus_assignment_in_expr(stmt.test)
+            definite.update(d_test)
+            conditional.update(c_test)
             b_def, b_cond = _analyze_block_assignment(stmt.body)
             o_def, o_cond = _analyze_block_assignment(stmt.orelse) if stmt.orelse else (set(), set())
             if stmt.orelse:
@@ -504,7 +596,19 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                 conditional.update((b_def | b_cond | o_def | o_cond) - definite)
             else:
                 conditional.update((b_def | b_cond) - definite)
+        elif isinstance(stmt, ast.While):
+            d_test, c_test = _walrus_assignment_in_expr(stmt.test)
+            definite.update(d_test)
+            conditional.update(c_test)
+            sub_stmts = list(stmt.body)
+            if hasattr(stmt, "orelse") and stmt.orelse:
+                sub_stmts.extend(stmt.orelse)
+            sub_def, sub_cond = _analyze_block_assignment(sub_stmts)
+            conditional.update((sub_def | sub_cond) - definite)
         elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+            d_iter, c_iter = _walrus_assignment_in_expr(stmt.iter)
+            definite.update(d_iter)
+            conditional.update(c_iter)
             for p_node in ast.walk(stmt.target):
                 if isinstance(p_node, ast.Name):
                     conditional.add(p_node.id)
@@ -513,27 +617,46 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                 sub_stmts.extend(stmt.orelse)
             sub_def, sub_cond = _analyze_block_assignment(sub_stmts)
             conditional.update((sub_def | sub_cond) - definite)
-        elif isinstance(stmt, (ast.While, ast.Try, ast.With, ast.AsyncWith)):
+        elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+            for item in stmt.items:
+                d_ctx, c_ctx = _walrus_assignment_in_expr(item.context_expr)
+                definite.update(d_ctx)
+                conditional.update(c_ctx)
+                if item.optional_vars is not None:
+                    for p_node in ast.walk(item.optional_vars):
+                        if isinstance(p_node, ast.Name) and isinstance(p_node.ctx, ast.Store):
+                            definite.add(p_node.id)
+            sub_stmts = list(stmt.body)
+            sub_def, sub_cond = _analyze_block_assignment(sub_stmts)
+            conditional.update((sub_def | sub_cond) - definite)
+        elif isinstance(stmt, ast.Try):
             sub_stmts = list(stmt.body)
             if hasattr(stmt, "orelse") and stmt.orelse:
                 sub_stmts.extend(stmt.orelse)
             if hasattr(stmt, "handlers") and stmt.handlers:
                 for h in stmt.handlers:
                     sub_stmts.extend(h.body)
-            if hasattr(stmt, "finalbody") and stmt.finalbody:
-                sub_stmts.extend(stmt.finalbody)
             sub_def, sub_cond = _analyze_block_assignment(sub_stmts)
             conditional.update((sub_def | sub_cond) - definite)
+            if hasattr(stmt, "finalbody") and stmt.finalbody:
+                f_def, f_cond = _analyze_block_assignment(stmt.finalbody)
+                definite.update(f_def)
+                conditional.update((f_def | f_cond) - definite)
         elif hasattr(ast, "TryStar") and isinstance(stmt, getattr(ast, "TryStar")):
             sub_stmts_star: List[ast.stmt] = list(getattr(stmt, "body", []))
             if hasattr(stmt, "handlers") and getattr(stmt, "handlers", None):
                 for h in getattr(stmt, "handlers", []):
                     sub_stmts_star.extend(getattr(h, "body", []))
-            if hasattr(stmt, "finalbody") and getattr(stmt, "finalbody", None):
-                sub_stmts_star.extend(getattr(stmt, "finalbody", []))
             sub_def, sub_cond = _analyze_block_assignment(sub_stmts_star)
             conditional.update((sub_def | sub_cond) - definite)
+            if hasattr(stmt, "finalbody") and getattr(stmt, "finalbody", None):
+                f_def, f_cond = _analyze_block_assignment(getattr(stmt, "finalbody", []))
+                definite.update(f_def)
+                conditional.update((f_def | f_cond) - definite)
         elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):
+            d_sub, c_sub = _walrus_assignment_in_expr(getattr(stmt, "subject", None))
+            definite.update(d_sub)
+            conditional.update(c_sub)
             case_defs: List[Set[str]] = []
             case_conds: Set[str] = set()
             has_irrefutable_default = False
@@ -576,15 +699,13 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                 if alias.name != "*":
                     bound_name = alias.asname or alias.name
                     definite.add(bound_name)
-
-        for p_node in ast.walk(stmt):
-            if isinstance(p_node, ast.NamedExpr) and isinstance(p_node.target, ast.Name):
-                if isinstance(stmt, ast.Expr):
-                    definite.add(p_node.target.id)
-                elif isinstance(stmt, (ast.If, ast.While)) and any(p_node is n for n in ast.walk(stmt.test)):
-                    definite.add(p_node.target.id)
-                else:
-                    conditional.add(p_node.target.id)
+        elif isinstance(stmt, ast.Assert):
+            d_ast, c_ast = _walrus_assignment_in_expr(stmt.test)
+            definite.update(d_ast)
+            conditional.update(c_ast)
+            if stmt.msg is not None:
+                d_m, c_m = _walrus_assignment_in_expr(stmt.msg, is_conditional=True)
+                conditional.update(d_m | c_m)
 
     return definite, conditional - definite
 
@@ -626,6 +747,21 @@ def _normalize_receiver_order(
             inputs.insert(0, "cls")
 
 
+def _rank_param_kind(var_name: str, param_map: Dict[str, str]) -> int:
+    """Returns canonical parameter sorting rank: self/cls=0, pos=1, vararg=2, kwonly=3, kwarg=4."""
+    clean = var_name.lstrip("*")
+    if clean in ("self", "cls"):
+        return 0
+    kind = param_map.get(clean, "pos")
+    if var_name.startswith("**") or kind == "kwarg":
+        return 4
+    if kind == "kwonly":
+        return 3
+    if var_name.startswith("*") or kind == "vararg":
+        return 2
+    return 1
+
+
 def _format_call_arguments(
     inputs: List[str],
     param_details: List[Dict[str, Any]],
@@ -635,8 +771,9 @@ def _format_call_arguments(
     param_map: Dict[str, str] = {
         p["name"].lstrip("*"): p.get("kind", "pos") for p in param_details
     }
+    sorted_inputs = sorted(inputs, key=lambda v: _rank_param_kind(v, param_map))
     formatted_args: List[str] = []
-    for raw_var in inputs:
+    for raw_var in sorted_inputs:
         clean_var = raw_var.lstrip("*")
         if receiver_to_omit and (
             clean_var == receiver_to_omit
@@ -882,6 +1019,9 @@ def _inspect_unit_scope(
     for nl in visitor.nonlocals:
         if nl not in inputs:
             inputs.append(nl)
+
+    param_map = {p["name"].lstrip("*"): p.get("kind", "pos") for p in visitor.param_details}
+    inputs.sort(key=lambda v: _rank_param_kind(v, param_map))
 
     has_instance_binding = (
         "self" in visitor.loads
