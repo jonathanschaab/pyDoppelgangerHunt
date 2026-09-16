@@ -339,6 +339,8 @@ def test_modular_pydoppelgangerhunt_exports() -> None:
     assert isinstance(pydoppelgangerhunt.DEFAULT_STOP_SHINGLES, set)
     assert callable(pydoppelgangerhunt.get_boilerplate_stop_shingles)
     assert callable(pydoppelgangerhunt.compute_unit_diff_overlap)
+    assert pydoppelgangerhunt.MAJOR_POLICY_THRESHOLD == 0.50
+    assert pydoppelgangerhunt.NEW_POLICY_THRESHOLD == 0.80
 
 
 

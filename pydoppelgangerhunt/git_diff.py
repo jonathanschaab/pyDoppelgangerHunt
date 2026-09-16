@@ -6,6 +6,9 @@ import os
 import subprocess
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+MAJOR_POLICY_THRESHOLD: float = 0.50
+NEW_POLICY_THRESHOLD: float = 0.80
+
 
 def _run_git_command(args: Sequence[str], cwd: Optional[str] = None) -> Optional[str]:
     """Executes a git command safely and returns standard output, or None on failure."""
@@ -73,6 +76,24 @@ def compute_unit_diff_overlap(
 
     Returns:
         A tuple of (overlapping_modified_line_count, overlap_ratio) where ratio is in [0.0, 1.0].
+
+    Example:
+        >>> from pydoppelgangerhunt.git_diff import (
+        ...     compute_unit_diff_overlap,
+        ...     parse_git_diff_hunks,
+        ... )
+        >>> diff_text = (
+        ...     "--- a/service.py\\n"
+        ...     "+++ b/service.py\\n"
+        ...     "@@ -10,0 +10,5 @@\\n"
+        ... )
+        >>> modified_ranges = parse_git_diff_hunks(diff_text)
+        >>> unit = {"file": "service.py", "start": 8, "end": 15}
+        >>> overlap_count, overlap_ratio = compute_unit_diff_overlap(unit, modified_ranges)
+        >>> overlap_count
+        5
+        >>> overlap_ratio
+        0.625
     """
     norm_file = unit["file"].replace("\\", "/")
     target_ranges = modified_ranges.get(norm_file)
@@ -120,9 +141,9 @@ def is_unit_in_modified_ranges(
     effective_ratio_floor = min_overlap_ratio
     if effective_ratio_floor <= 0.0:
         if policy == "major":
-            effective_ratio_floor = 0.50
+            effective_ratio_floor = MAJOR_POLICY_THRESHOLD
         elif policy == "new":
-            effective_ratio_floor = 0.80
+            effective_ratio_floor = NEW_POLICY_THRESHOLD
 
     return ratio >= effective_ratio_floor
 

@@ -141,7 +141,7 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         ("--call-sequences", "Audit function and method call traces for procedural pipeline duplicates"),
         ("--audit-tests", "Audit test suites for clone patterns and @pytest.mark.parametrize opportunities"),
         ("--strict-type4", "Fail with non-zero exit code if Type-4 semantic issues are found"),
-        ("--stop-shingles", "Filter ubiquitous boilerplate stop-shingles from inverted index (SourcererCC-style)"),
+        ("--stop-shingles", "Filter canonical boilerplate shingles (logging, main guards) to reduce spurious candidate pairs"),
     ]
     for flag_name, help_text in bool_flags:
         parser.add_argument(flag_name, action="store_true", help=help_text)

@@ -37,6 +37,8 @@ from pydoppelgangerhunt.fixer import (
     synthesize_shared_helper_code,
 )
 from pydoppelgangerhunt.git_diff import (
+    MAJOR_POLICY_THRESHOLD,
+    NEW_POLICY_THRESHOLD,
     check_temporal_divergence,
     compute_unit_diff_overlap,
     filter_clones_by_git_diff,
@@ -131,6 +133,8 @@ __all__ = [
     "compute_unit_diff_overlap",
     "is_unit_in_modified_ranges",
     "filter_clones_by_git_diff",
+    "MAJOR_POLICY_THRESHOLD",
+    "NEW_POLICY_THRESHOLD",
     "DEFAULT_STOP_SHINGLES",
     "get_boilerplate_stop_shingles",
     "get_git_blame_info",
