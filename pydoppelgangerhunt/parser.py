@@ -508,7 +508,10 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
         if self.class_stack:
             self.enclosing_classes[id(node)] = self.class_stack[-1]
         self.class_stack.append(node.name)
+        saved_func_stack = self.func_stack
+        self.func_stack = []
         self.generic_visit(node)
+        self.func_stack = saved_func_stack
         self.class_stack.pop()
 
     def _scope_function(self, fn: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:

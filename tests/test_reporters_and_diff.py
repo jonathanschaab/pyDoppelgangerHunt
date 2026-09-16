@@ -42,6 +42,7 @@ from pydoppelgangerhunt import (
 )
 from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _build_whole_method_delegation,
+    _detect_indent_step,
     _extract_required_typing_imports,
     _find_module_helper_insertion_index,
     _insert_imports_into_module,
@@ -3610,6 +3611,109 @@ def test_parentheses_on_staticmethod_and_classmethod_decorators(tmp_path: Path) 
     enc_c = find_enclosing_function(code, by_name["c_fn"])
     assert enc_c is not None
     assert enc_c["is_class_method"] is True
+
+
+def test_nested_closure_control_flow_and_returns_do_not_leak_to_outer(tmp_path: Path) -> None:
+    """Verifies that returns, yields, and awaits in nested closures do not leak into outer function scope."""
+    code = (
+        "def outer_factory(base: int):\n"
+        "    multiplier = 2\n"
+        "    async def inner_worker(val: int) -> int:\n"
+        "        await do_async_op()\n"
+        "        if val < 0:\n"
+        "            return 0\n"
+        "        return val * multiplier\n"
+        "    return inner_worker\n"
+    )
+    f = tmp_path / "factory.py"
+    f.write_text(code, encoding="utf-8")
+    units = harvest_file_units(str(f), str(tmp_path), min_lines=2, min_tokens=1, harvest_closures=True)
+    outer_u = next(u for u in units if u["name"] == "outer_factory")
+    scope = analyze_unit_variable_scope(outer_u, repo_root=str(tmp_path))
+
+    # Outer factory must be synchronous, non-generator, and only return inner_worker
+    assert scope["is_async"] is False
+    assert scope["has_yield"] is False
+    assert scope["outputs"] == ["inner_worker"]
+
+
+def test_local_class_methods_not_scoped_as_closures_of_factory_function(tmp_path: Path) -> None:
+    """Verifies that methods of classes defined in functions are scoped to the class rather than as closures."""
+    code = (
+        "def make_handler():\n"
+        "    class LocalHandler:\n"
+        "        def handle(self, item: str) -> str:\n"
+        "            def nested_sub():\n"
+        "                item_clean = item.strip()\n"
+        "                temp = item_clean.lower()\n"
+        "                return temp\n"
+        "            return nested_sub()\n"
+        "    return LocalHandler\n"
+    )
+    f = tmp_path / "local_cls.py"
+    f.write_text(code, encoding="utf-8")
+    units = harvest_file_units(str(f), str(tmp_path), min_lines=2, min_tokens=1, harvest_closures=True)
+    by_name = {u["name"]: u for u in units}
+
+    # handle is a method of LocalHandler, not a closure of make_handler
+    assert "handle" in by_name
+    handle_u = by_name["handle"]
+    assert handle_u["kind"] == "function"
+    assert handle_u["enclosing_class"] == "LocalHandler"
+    assert handle_u["receiver_kind"] == "instance"
+
+    # nested_sub is a closure of handle
+    assert "handle:nested_sub" in by_name
+    sub_u = by_name["handle:nested_sub"]
+    assert sub_u["kind"] == "closure"
+    assert sub_u["enclosing_class"] == "LocalHandler"
+
+
+def test_instance_method_paired_with_module_function_declines_replacement_when_receiver_accessed(tmp_path: Path) -> None:
+    """Verifies that pairing an instance method accessing self.val with a module function declines replacement."""
+    code1 = (
+        "class Service:\n"
+        "    def compute(self, x: int) -> int:\n"
+        "        val = self.offset\n"
+        "        return val + x * 2\n"
+    )
+    code2 = (
+        "def compute(x: int) -> int:\n"
+        "    val = 10\n"
+        "    return val + x * 2\n"
+    )
+    f1 = tmp_path / "srv.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2 = tmp_path / "util.py"
+    f2.write_text(code2, encoding="utf-8")
+
+    u1 = {
+        "file": "srv.py", "start": 2, "end": 4, "name": "Service:compute",
+        "kind": "function", "enclosing_class": "Service", "receiver_kind": "instance"
+    }
+    u2 = {
+        "file": "util.py", "start": 1, "end": 3, "name": "compute",
+        "kind": "function", "enclosing_class": None, "receiver_kind": None
+    }
+
+    # Synthesis must return "" because receiver kinds differ and u1 accesses self
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper == ""
+
+    # Patch generation must skip this clone pair
+    patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch == ""
+
+
+def test_detect_indent_step_multi_level_two_spaces() -> None:
+    """Verifies that _detect_indent_step correctly handles 2-space indentation at various nesting levels."""
+    assert _detect_indent_step("  ") == "  "
+    assert _detect_indent_step("    ") == "    "
+    assert _detect_indent_step("      ") == "  "
+    assert _detect_indent_step("        ") == "    "
+    assert _detect_indent_step("          ") == "  "
+    assert _detect_indent_step("\t\t") == "\t"
+
 
 
 

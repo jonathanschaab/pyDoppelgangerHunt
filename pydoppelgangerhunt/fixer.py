@@ -138,11 +138,13 @@ class _ScopeVisitor(ast.NodeVisitor):
         self._process_func(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self.is_async = True
+        if len(self._scope_stack) == 0:
+            self.is_async = True
         self._process_func(node)
 
     def visit_Await(self, node: ast.Await) -> None:
-        self.is_async = True
+        if len(self._scope_stack) <= 1:
+            self.is_async = True
         self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
@@ -213,11 +215,13 @@ class _ScopeVisitor(ast.NodeVisitor):
         self._visit_loop(node)
 
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
-        self.is_async = True
+        if len(self._scope_stack) <= 1:
+            self.is_async = True
         self._visit_loop(node)
 
     def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
-        self.is_async = True
+        if len(self._scope_stack) <= 1:
+            self.is_async = True
         self.generic_visit(node)
 
     def visit_While(self, node: ast.While) -> None:
@@ -239,9 +243,10 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _record_yield_expr(self, kind: str, node: Union[ast.Yield, ast.YieldFrom]) -> None:
-        self.has_yield = True
-        if node.value is not None and isinstance(node.value, ast.Name):
-            self.yield_expr_names.append((kind, node.value.id))
+        if len(self._scope_stack) <= 1:
+            self.has_yield = True
+            if node.value is not None and isinstance(node.value, ast.Name):
+                self.yield_expr_names.append((kind, node.value.id))
 
     def visit_Yield(self, node: ast.Yield) -> None:
         self._record_yield_expr("yield", node)
@@ -252,15 +257,16 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Return(self, node: ast.Return) -> None:
-        self.has_return = True
-        if node.value is not None:
-            if isinstance(node.value, ast.Name):
-                if node.value.id not in self.returns:
-                    self.returns.append(node.value.id)
-            elif isinstance(node.value, ast.Tuple):
-                for elt in node.value.elts:
-                    if isinstance(elt, ast.Name) and elt.id not in self.returns:
-                        self.returns.append(elt.id)
+        if len(self._scope_stack) <= 1:
+            self.has_return = True
+            if node.value is not None:
+                if isinstance(node.value, ast.Name):
+                    if node.value.id not in self.returns:
+                        self.returns.append(node.value.id)
+                elif isinstance(node.value, ast.Tuple):
+                    for elt in node.value.elts:
+                        if isinstance(elt, ast.Name) and elt.id not in self.returns:
+                            self.returns.append(elt.id)
         self.generic_visit(node)
 
     def _record_import_node(self, node: Union[ast.Import, ast.ImportFrom]) -> None:
@@ -455,8 +461,14 @@ def _detect_indent_step(indent_str: str) -> str:
     """Detects indentation step (tab, 2 spaces, or 4 spaces) from an indentation prefix."""
     if "\t" in indent_str:
         return "\t"
-    if indent_str and len(indent_str) <= 4 and len(indent_str) % 2 == 0:
-        return indent_str
+    if indent_str:
+        num_spaces = len(indent_str)
+        if num_spaces % 4 != 0 and num_spaces % 2 == 0:
+            return "  "
+        if num_spaces % 4 == 0:
+            return "    "
+        if num_spaces % 2 == 0:
+            return "  "
     return "    "
 
 
@@ -1418,7 +1430,9 @@ def synthesize_shared_helper_code(
             return receiver_kind
         if is_static:
             return "static"
-        return "instance"
+        if u.get("enclosing_class"):
+            return "instance"
+        return "none"
 
     k1 = _unit_receiver_kind(u1, scope1)
     k2 = _unit_receiver_kind(u2, scope2)
@@ -2085,8 +2099,8 @@ def generate_refactoring_patch(
         if not _is_method_of_class(fn2, enc2):
             fn2 = None
 
-        fn1_kind = _get_enclosing_receiver_kind(fn1) if fn1 else (u1.get("receiver_kind") or "instance")
-        fn2_kind = _get_enclosing_receiver_kind(fn2) if fn2 else (u2.get("receiver_kind") or fn1_kind)
+        fn1_kind = _get_enclosing_receiver_kind(fn1) if fn1 else (u1.get("receiver_kind") or ("instance" if enc1 else "none"))
+        fn2_kind = _get_enclosing_receiver_kind(fn2) if fn2 else (u2.get("receiver_kind") or ("instance" if enc2 else "none"))
         receiver_kinds_differ = bool(fn1_kind != fn2_kind)
         is_in_method = bool(
             fn1
