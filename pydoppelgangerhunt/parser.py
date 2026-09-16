@@ -577,6 +577,16 @@ def check_inline_suppression(file_lines: List[str], start: int, end: int) -> boo
     return False
 
 
+def is_decorator_named(d: ast.AST, name: str) -> bool:
+    """Checks if an AST decorator node matches a given name, supporting call expressions."""
+    target = d.func if isinstance(d, ast.Call) else d
+    if isinstance(target, ast.Name):
+        return bool(target.id == name)
+    if isinstance(target, ast.Attribute):
+        return bool(target.attr == name)
+    return False
+
+
 def compute_cyclomatic_complexity(target: Any) -> int:
     """Calculates McCabe Cyclomatic Complexity for an AST node or statement sequence."""
     if not target:
@@ -1011,16 +1021,8 @@ def harvest_file_units(
 
             enc_class = enclosing_classes.get(id(node))
             decs = getattr(node, "decorator_list", [])
-            fn_is_static = any(
-                (isinstance(d, ast.Name) and d.id == "staticmethod")
-                or (isinstance(d, ast.Attribute) and d.attr == "staticmethod")
-                for d in decs
-            )
-            fn_is_class_method = any(
-                (isinstance(d, ast.Name) and d.id == "classmethod")
-                or (isinstance(d, ast.Attribute) and d.attr == "classmethod")
-                for d in decs
-            )
+            fn_is_static = any(is_decorator_named(d, "staticmethod") for d in decs)
+            fn_is_class_method = any(is_decorator_named(d, "classmethod") for d in decs)
             if fn_is_static:
                 fn_receiver_kind: Optional[str] = "static"
             elif fn_is_class_method:

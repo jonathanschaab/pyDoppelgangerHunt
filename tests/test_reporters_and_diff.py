@@ -45,6 +45,7 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _extract_required_typing_imports,
     _find_module_helper_insertion_index,
     _insert_imports_into_module,
+    _inspect_unit_scope,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
 
@@ -3465,6 +3466,151 @@ def test_generate_refactoring_patch_does_not_mutate_unit_is_static(tmp_path: Pat
         replace_clones=True,
     )
     assert "is_static" not in u_inst
+
+
+def test_closure_returns_not_classified_as_control_flow_hazards(tmp_path: Path) -> None:
+    """Verifies that whole closure units with return statements are not flagged as embedded_return hazards."""
+    code = (
+        "def factory_calc(multiplier: int):\n"
+        "    def step_fn(val: int) -> int:\n"
+        "        offset = 10\n"
+        "        return val * multiplier + offset\n"
+        "    return step_fn\n"
+    )
+    f = tmp_path / "factory.py"
+    f.write_text(code, encoding="utf-8")
+    u = {
+        "file": str(f),
+        "start": 2,
+        "end": 4,
+        "name": "factory_calc:step_fn",
+        "kind": "closure",
+    }
+    info = _inspect_unit_scope(u, repo_root=str(tmp_path))
+    assert info["is_control_flow_safe"] is True
+    assert "embedded_return" not in info["control_flow_hazards"]
+
+    helper = synthesize_shared_helper_code(u, u, repo_root=str(tmp_path))
+    assert "WARNING: Non-local control flow hazard" not in helper
+
+
+def test_synthesize_shared_helper_independent_receiver_kinds(tmp_path: Path) -> None:
+    """Verifies that units with differing is_static flags are not cross-contaminated into identical receiver kinds."""
+    code_stat = (
+        "def stat_fn(x: int) -> int:\n"
+        "    return x + 1\n"
+    )
+    code_inst = (
+        "class Worker:\n"
+        "    def inst_fn(self, x: int) -> int:\n"
+        "        return self.value + x\n"
+    )
+    f1 = tmp_path / "mod_stat.py"
+    f2 = tmp_path / "mod_inst.py"
+    f1.write_text(code_stat, encoding="utf-8")
+    f2.write_text(code_inst, encoding="utf-8")
+    u1 = {"file": str(f1), "start": 1, "end": 2, "name": "stat_fn", "kind": "function", "is_static": True}
+    u2 = {"file": str(f2), "start": 2, "end": 3, "name": "inst_fn", "kind": "function", "is_static": False}
+
+    # Should detect differing receiver kinds and decline helper replacement due to self.value reference
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper == ""
+
+
+def test_generate_refactoring_patch_cross_file_receiver_difference(tmp_path: Path) -> None:
+    """Verifies that cross-file pairs with differing receiver kinds decline replacement if receiver is referenced."""
+    code1 = (
+        "class ServiceA:\n"
+        "    def run(self, x: int) -> int:\n"
+        "        y = x\n"
+        "        return self.factor + y\n"
+    )
+    code2 = (
+        "class ServiceB:\n"
+        "    @classmethod\n"
+        "    def run(cls, x: int) -> int:\n"
+        "        y = x\n"
+        "        return cls.factor + y\n"
+    )
+    f1 = tmp_path / "srv_a.py"
+    f2 = tmp_path / "srv_b.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+    u1 = {"file": str(f1), "start": 2, "end": 4, "name": "run", "kind": "function", "enclosing_class": "ServiceA", "receiver_kind": "instance"}
+    u2 = {"file": str(f2), "start": 3, "end": 5, "name": "run", "kind": "function", "enclosing_class": "ServiceB", "receiver_kind": "class"}
+
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert patch == ""
+
+
+def test_generate_refactoring_patch_slash_normalization(tmp_path: Path) -> None:
+    """Verifies that differing path slash formats normalize to the same file during patch generation."""
+    code = (
+        "class Normalizer:\n"
+        "    def worker_one(self, x: int) -> int:\n"
+        "        y = x * 2\n"
+        "        return y + 1\n"
+        "\n"
+        "    def worker_two(self, x: int) -> int:\n"
+        "        y = x * 2\n"
+        "        return y + 1\n"
+    )
+    sub = tmp_path / "pkg"
+    sub.mkdir()
+    f = sub / "norm.py"
+    f.write_text(code, encoding="utf-8")
+
+    # One unit with POSIX slash, one with Windows backslash
+    u1 = {"file": "pkg/norm.py", "start": 2, "end": 4, "name": "worker_one", "kind": "function", "enclosing_class": "Normalizer"}
+    u2 = {"file": "pkg\\norm.py", "start": 6, "end": 8, "name": "worker_two", "kind": "function", "enclosing_class": "Normalizer"}
+
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert patch
+    # Both units must be replaced in the single file and delegate to the helper
+    assert patch.count("+        return self._shared_worker_one_worker_two(x)") == 2
+
+
+def test_parentheses_on_staticmethod_and_classmethod_decorators(tmp_path: Path) -> None:
+    """Verifies that @staticmethod() and @classmethod() call decorators are recognized properly."""
+    code = (
+        "class CallDec:\n"
+        "    @staticmethod()\n"
+        "    def s_fn(x: int) -> int:\n"
+        "        y = x\n"
+        "        return y + 1\n"
+        "\n"
+        "    @classmethod()\n"
+        "    def c_fn(cls, x: int) -> int:\n"
+        "        y = x\n"
+        "        return y + 1\n"
+    )
+    f = tmp_path / "calldec.py"
+    f.write_text(code, encoding="utf-8")
+    units = harvest_file_units(str(f), str(tmp_path), min_lines=2, min_tokens=1)
+    by_name = {u["name"]: u for u in units}
+
+    assert by_name["s_fn"]["is_static"] is True
+    assert by_name["s_fn"]["receiver_kind"] == "static"
+
+    assert by_name["c_fn"]["is_static"] is False
+    assert by_name["c_fn"]["receiver_kind"] == "class"
+
+    enc_s = find_enclosing_function(code, by_name["s_fn"])
+    assert enc_s is not None
+    assert enc_s["is_static"] is True
+
+    enc_c = find_enclosing_function(code, by_name["c_fn"])
+    assert enc_c is not None
+    assert enc_c["is_class_method"] is True
+
 
 
 

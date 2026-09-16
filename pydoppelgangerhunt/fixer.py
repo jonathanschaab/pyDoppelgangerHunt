@@ -14,6 +14,7 @@ import textwrap
 import tokenize
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
+from pydoppelgangerhunt.parser import is_decorator_named
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 
 logger = logging.getLogger(__name__)
@@ -585,10 +586,10 @@ def _inspect_unit_scope(
     visitor = _ScopeVisitor(loop_offset=loop_offset, source_lines=cand_lines)
     visitor.visit(tree)
 
-    unit_name = unit.get("name", "")
-    unit_kind = unit.get("kind", "")
+    unit_name = str(unit.get("name") or "")
+    unit_kind = str(unit.get("kind") or "")
     is_subroutine = unit_kind in ("compound_block", "sliding_window", "clause_branch") or (
-        ":" in unit_name and not unit_name.startswith("closure:")
+        unit_kind not in ("function", "closure") and ":" in unit_name
     )
 
     hazards: List[str] = []
@@ -1220,16 +1221,8 @@ def find_enclosing_function(
 
     decs = meta.pop("decorators")
     meta.pop("node")
-    meta["is_static"] = any(
-        (isinstance(d, ast.Name) and d.id == "staticmethod")
-        or (isinstance(d, ast.Attribute) and d.attr == "staticmethod")
-        for d in decs
-    )
-    meta["is_class_method"] = any(
-        (isinstance(d, ast.Name) and d.id == "classmethod")
-        or (isinstance(d, ast.Attribute) and d.attr == "classmethod")
-        for d in decs
-    )
+    meta["is_static"] = any(is_decorator_named(d, "staticmethod") for d in decs)
+    meta["is_class_method"] = any(is_decorator_named(d, "classmethod") for d in decs)
     return meta
 
 
@@ -1412,32 +1405,39 @@ def synthesize_shared_helper_code(
     is_same_class = bool(enc1 and enc2 and enc1 == enc2 and f1 == f2)
 
     inputs = list(scope["inputs"])
-    is_static_clone = bool(
-        is_static
-        or receiver_kind == "static"
-        or scope.get("binding_kind") == "static"
-        or u1.get("is_static")
-        or u2.get("is_static")
-    )
-    is_class_receiver = bool(
-        receiver_kind == "class"
-        or scope.get("binding_kind") == "class"
-        or u1.get("receiver_kind") == "class"
-        or u2.get("receiver_kind") == "class"
-    )
 
-    k1 = u1.get("receiver_kind") or (
-        "class" if is_class_receiver else ("static" if is_static_clone else "instance")
-    )
-    k2 = u2.get("receiver_kind") or (
-        "class" if is_class_receiver else ("static" if is_static_clone else "instance")
-    )
+    def _unit_receiver_kind(u: Dict[str, Any], u_scope: Dict[str, Any]) -> str:
+        if u.get("receiver_kind"):
+            return str(u["receiver_kind"])
+        if u.get("is_static"):
+            return "static"
+        bk = u_scope.get("binding_kind")
+        if bk in ("static", "class", "instance"):
+            return str(bk)
+        if receiver_kind:
+            return receiver_kind
+        if is_static:
+            return "static"
+        return "instance"
+
+    k1 = _unit_receiver_kind(u1, scope1)
+    k2 = _unit_receiver_kind(u2, scope2)
     receiver_kinds_differ = bool(k1 != k2)
     if receiver_kinds_differ and (
         _has_receiver_reference(u1, scope1, repo_root=repo_root)
         or _has_receiver_reference(u2, scope2, repo_root=repo_root)
     ):
         return ""
+
+    is_static_clone = bool(
+        is_static
+        or receiver_kind == "static"
+        or (k1 == "static" and k2 == "static")
+    )
+    is_class_receiver = bool(
+        receiver_kind == "class"
+        or (k1 == "class" and k2 == "class")
+    )
 
     is_in_method = bool(
         u1.get("kind") not in ("comprehension", "complex_expr")
@@ -1944,31 +1944,35 @@ def _build_whole_method_delegation(
 
     try:
         tree = ast.parse(source_text)
+        cand_nodes: List[Tuple[int, Union[ast.FunctionDef, ast.AsyncFunctionDef]]] = []
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 n_start = getattr(node, "lineno", 0)
                 n_end = getattr(node, "end_lineno", n_start)
-                if n_start == u_start or (
-                    node.name in (raw_u_name, base_u_name) and n_start <= u_start <= n_end
+                if n_start == u_start:
+                    cand_nodes.append((0, node))
+                elif node.name in (raw_u_name, base_u_name) and n_start <= u_start <= n_end:
+                    cand_nodes.append((n_end - n_start + 1, node))
+        if cand_nodes:
+            cand_nodes.sort(key=lambda item: item[0])
+            matched_node = cand_nodes[0][1]
+            if matched_node.body:
+                b_cand_lines = [
+                    int(getattr(b_stmt, "lineno", 0))
+                    for b_stmt in matched_node.body
+                    if getattr(b_stmt, "lineno", 0) > 0
+                ]
+                found_indent = _extract_child_indentation(lines, b_cand_lines, indent)
+                if found_indent is not None:
+                    body_indent = found_indent
+                first_body = matched_node.body[0]
+                sig_end_line = first_body.lineno - 1
+                if (
+                    isinstance(first_body, ast.Expr)
+                    and isinstance(first_body.value, ast.Constant)
+                    and isinstance(first_body.value.value, str)
                 ):
-                    if node.body:
-                        b_cand_lines = [
-                            int(getattr(b_stmt, "lineno", 0))
-                            for b_stmt in node.body
-                            if getattr(b_stmt, "lineno", 0) > 0
-                        ]
-                        found_indent = _extract_child_indentation(lines, b_cand_lines, indent)
-                        if found_indent is not None:
-                            body_indent = found_indent
-                        first_body = node.body[0]
-                        sig_end_line = first_body.lineno - 1
-                        if (
-                            isinstance(first_body, ast.Expr)
-                            and isinstance(first_body.value, ast.Constant)
-                            and isinstance(first_body.value.value, str)
-                        ):
-                            docstring_end_line = getattr(first_body, "end_lineno", first_body.lineno)
-                    break
+                    docstring_end_line = getattr(first_body, "end_lineno", first_body.lineno)
     except SyntaxError:
         pass
 
@@ -2044,25 +2048,46 @@ def generate_refactoring_patch(
 
         orig_lines = orig_text.splitlines(keepends=True)
 
-        enc1 = find_enclosing_class(orig_text, u1)
+        f1_norm = f1_raw.replace("\\", "/")
         f2_raw = u2.get("file", "").split("#")[0]
-        enc2 = find_enclosing_class(orig_text, u2) if (f2_raw == f1_raw) else None
+        f2_norm = f2_raw.replace("\\", "/")
+        is_same_file = bool(f2_norm and f2_norm == f1_norm)
+
+        enc1 = find_enclosing_class(orig_text, u1)
+        fn1 = find_enclosing_function(orig_text, u1)
+
+        enc2 = None
+        fn2 = None
+        if is_same_file:
+            enc2 = find_enclosing_class(orig_text, u2)
+            fn2 = find_enclosing_function(orig_text, u2)
+        elif f2_raw:
+            p2 = Path(f2_raw)
+            f2_path = p2 if p2.is_absolute() else (root / f2_raw)
+            if f2_path.is_file():
+                try:
+                    f2_text = f2_path.read_text(encoding="utf-8")
+                    enc2 = find_enclosing_class(f2_text, u2)
+                    fn2 = find_enclosing_function(f2_text, u2)
+                except OSError:
+                    pass
 
         is_same_class = bool(
-            enc1 and enc2 and enc1["name"] == enc2["name"] and enc1["start"] == enc2["start"]
+            is_same_file
+            and enc1
+            and enc2
+            and enc1["name"] == enc2["name"]
+            and enc1["start"] == enc2["start"]
         )
-
-        fn1 = find_enclosing_function(orig_text, u1)
-        fn2 = find_enclosing_function(orig_text, u2) if (f2_raw == f1_raw) else None
 
         if not _is_method_of_class(fn1, enc1):
             fn1 = None
         if not _is_method_of_class(fn2, enc2):
             fn2 = None
 
-        fn1_kind = _get_enclosing_receiver_kind(fn1) if fn1 else "instance"
-        fn2_kind = _get_enclosing_receiver_kind(fn2) if fn2 else fn1_kind
-        receiver_kinds_differ = bool(fn2 and fn1_kind != fn2_kind)
+        fn1_kind = _get_enclosing_receiver_kind(fn1) if fn1 else (u1.get("receiver_kind") or "instance")
+        fn2_kind = _get_enclosing_receiver_kind(fn2) if fn2 else (u2.get("receiver_kind") or fn1_kind)
+        receiver_kinds_differ = bool(fn1_kind != fn2_kind)
         is_in_method = bool(
             fn1
             and fn2
@@ -2142,7 +2167,7 @@ def generate_refactoring_patch(
         outputs = list(scope.get("outputs", []))
 
         candidate_units = [u1]
-        if f2_raw and f2_raw == f1_raw and not check_units_overlap(u1, u2):
+        if is_same_file and not check_units_overlap(u1, u2):
             candidate_units.append(u2)
 
         earliest_unit = min(candidate_units, key=lambda u: int(u.get("start", 1)))
