@@ -4411,6 +4411,111 @@ def test_base_unit_name_fallback_for_underscore_or_empty_name() -> None:
     assert _base_unit_name({"name": "calculate", "kind": "function"}) == "calculate"
 
 
+def test_for_loop_iter_evaluated_before_target_binding(tmp_path: Path) -> None:
+    """Verifies that variables referenced in loop iterators are evaluated before target assignment."""
+    code = (
+        "def process(items):\n"
+        "    for item in transform(items, item):\n"
+        "        print(item)\n"
+    )
+    f = tmp_path / "for_order.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {
+        "file": "for_order.py",
+        "start": 2,
+        "end": 3,
+        "name": "process:for_loop",
+        "kind": "compound_block",
+    }
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert "item" in scope["inputs"]
+    assert "transform" in scope["inputs"]
+    assert "items" in scope["inputs"]
+
+
+def test_annassign_type_annotation_does_not_leak_into_inputs(tmp_path: Path) -> None:
+    """Verifies that type annotations on local variables are not treated as runtime inputs."""
+    code = (
+        "def run():\n"
+        "    data: CustomType = fetch_data()\n"
+        "    entries: List[str] = parse(data)\n"
+        "    return entries\n"
+    )
+    f = tmp_path / "ann_leak.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {
+        "file": "ann_leak.py",
+        "start": 1,
+        "end": 4,
+        "name": "run",
+        "kind": "function",
+    }
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert "CustomType" not in scope["inputs"]
+    assert "List" not in scope["inputs"]
+    assert "fetch_data" in scope["inputs"]
+    assert "parse" in scope["inputs"]
+    assert "entries" in scope["outputs"]
+
+
+def test_while_test_walrus_treated_as_definite_assignment(tmp_path: Path) -> None:
+    """Verifies that walrus expressions in while loop tests are marked as definite assignments."""
+    code = (
+        "def drain_stream(stream):\n"
+        "    while (chunk := stream.read(1024)):\n"
+        "        process(chunk)\n"
+        "    return chunk\n"
+    )
+    f = tmp_path / "while_walrus.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {
+        "file": "while_walrus.py",
+        "start": 2,
+        "end": 3,
+        "name": "drain_stream:while_loop",
+        "kind": "compound_block",
+    }
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert "chunk" in scope["definite_stores"]
+
+
+def test_nested_function_walrus_does_not_leak_to_outer_scope(tmp_path: Path) -> None:
+    """Verifies that walrus expressions inside nested functions do not register in outer unit stores."""
+    code = (
+        "def outer(data):\n"
+        "    def inner():\n"
+        "        if (inner_val := process(data)):\n"
+        "            return inner_val\n"
+        "    return inner()\n"
+    )
+    f = tmp_path / "nested_walrus.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {
+        "file": "nested_walrus.py",
+        "start": 1,
+        "end": 5,
+        "name": "outer",
+        "kind": "function",
+    }
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert "inner_val" not in scope["locals"]
+    assert "inner_val" not in scope["outputs"]
+
+
+def test_extract_unit_source_code_empty_and_directory_path(tmp_path: Path) -> None:
+    """Verifies that extract_unit_source_code safely handles empty paths and directory paths."""
+    u_empty = {"file": "", "name": "dummy", "start": 1, "end": 5}
+    assert extract_unit_source_code(u_empty) == ["# Source for dummy lines 1-5\n"]
+
+    u_dir = {"file": str(tmp_path), "name": "dir_unit", "start": 1, "end": 3}
+    assert extract_unit_source_code(u_dir) == ["# Source for dir_unit lines 1-3\n"]
+
+
+
 
 
 

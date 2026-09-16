@@ -42,19 +42,21 @@ def colorize(text: str, color_code: str, enabled: bool) -> str:
 def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:
     """Reads raw source code lines for a given unit from disk."""
     f_raw = unit.get("file", "").split("#")[0].replace("\\", "/")
+    if not f_raw:
+        return [f"# Source for {unit.get('name', 'unit')} lines {unit.get('start', 1)}-{unit.get('end', 1)}\n"]
     file_path = Path(f_raw)
     if repo_root and not file_path.is_absolute():
         file_path = Path(repo_root) / file_path
-    if not file_path.exists():
-        return [f"# Source for {unit['name']} lines {unit['start']}-{unit['end']}\n"]
+    if not file_path.is_file():
+        return [f"# Source for {unit.get('name', 'unit')} lines {unit.get('start', 1)}-{unit.get('end', 1)}\n"]
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
             all_lines = fh.readlines()
-        start = max(1, unit["start"])
-        end = min(len(all_lines), unit["end"])
+        start = max(1, unit.get("start", 1))
+        end = min(len(all_lines), unit.get("end", len(all_lines)))
         return all_lines[start - 1 : end]
     except OSError:
-        return [f"# Unable to read {unit['file']}\n"]
+        return [f"# Unable to read {unit.get('file', '')}\n"]
 
 
 def generate_clone_diff(

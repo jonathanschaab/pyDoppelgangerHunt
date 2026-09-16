@@ -45,6 +45,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.except_vars: Set[str] = set()
         self.deleted_names: Set[str] = set()
         self._scope_stack: List[Set[str]] = []
+        self._comprehension_depth: int = 0
         self.loop_offset: int = loop_offset
         self.loop_depth: int = 0
         self.has_return: bool = False
@@ -277,10 +278,10 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        self.visit(node.annotation)
         if node.value is not None:
             self.visit(node.value)
             if isinstance(node.target, ast.Name):
+                self.deleted_names.discard(node.target.id)
                 self._record_store_name(node.target.id)
             else:
                 self.visit(node.target)
@@ -289,15 +290,24 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.visit(node.value)
         if isinstance(node.target, ast.Name):
             target_id = node.target.id
-            if self._scope_stack:
-                self._scope_stack[0].add(target_id)
-            if target_id not in BUILTIN_NAMES and target_id not in self.stores:
-                self.stores.append(target_id)
+            self.deleted_names.discard(target_id)
+            if self._comprehension_depth > 0:
+                target_idx = -1 - self._comprehension_depth
+                if len(self._scope_stack) >= abs(target_idx):
+                    self._scope_stack[target_idx].add(target_id)
+                    if abs(target_idx) == len(self._scope_stack):
+                        if target_id not in BUILTIN_NAMES and target_id not in self.stores:
+                            self.stores.append(target_id)
+                elif target_id not in BUILTIN_NAMES and target_id not in self.stores:
+                    self.stores.append(target_id)
+            else:
+                self._record_store_name(target_id)
 
     def _visit_comprehension(
         self,
         node: Union[ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp],
     ) -> None:
+        self._comprehension_depth += 1
         created_outer = False
         if not self._scope_stack:
             self._scope_stack.append(set())
@@ -322,6 +332,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self._scope_stack.pop()
         if created_outer:
             self._scope_stack.pop()
+        self._comprehension_depth -= 1
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
         self._visit_comprehension(node)
@@ -349,7 +360,15 @@ class _ScopeVisitor(ast.NodeVisitor):
 
     def _visit_loop(self, node: Union[ast.For, ast.AsyncFor, ast.While]) -> None:
         self.loop_depth += 1
-        self.generic_visit(node)
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            self.visit(node.iter)
+            self.visit(node.target)
+            for stmt in node.body:
+                self.visit(stmt)
+            for stmt in node.orelse:
+                self.visit(stmt)
+        else:
+            self.generic_visit(node)
         self.loop_depth -= 1
 
     def visit_For(self, node: ast.For) -> None:
@@ -479,8 +498,17 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                 conditional.update((b_def | b_cond | o_def | o_cond) - definite)
             else:
                 conditional.update((b_def | b_cond) - definite)
-        elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While, ast.Try, ast.With, ast.AsyncWith)):
-            sub_stmts: List[ast.stmt] = list(stmt.body)
+        elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+            for p_node in ast.walk(stmt.target):
+                if isinstance(p_node, ast.Name):
+                    conditional.add(p_node.id)
+            sub_stmts = list(stmt.body)
+            if hasattr(stmt, "orelse") and stmt.orelse:
+                sub_stmts.extend(stmt.orelse)
+            sub_def, sub_cond = _analyze_block_assignment(sub_stmts)
+            conditional.update((sub_def | sub_cond) - definite)
+        elif isinstance(stmt, (ast.While, ast.Try, ast.With, ast.AsyncWith)):
+            sub_stmts = list(stmt.body)
             if hasattr(stmt, "orelse") and stmt.orelse:
                 sub_stmts.extend(stmt.orelse)
             if hasattr(stmt, "handlers") and stmt.handlers:
@@ -547,7 +575,7 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
             if isinstance(p_node, ast.NamedExpr) and isinstance(p_node.target, ast.Name):
                 if isinstance(stmt, ast.Expr):
                     definite.add(p_node.target.id)
-                elif isinstance(stmt, ast.If) and any(p_node is n for n in ast.walk(stmt.test)):
+                elif isinstance(stmt, (ast.If, ast.While)) and any(p_node is n for n in ast.walk(stmt.test)):
                     definite.add(p_node.target.id)
                 else:
                     conditional.add(p_node.target.id)
