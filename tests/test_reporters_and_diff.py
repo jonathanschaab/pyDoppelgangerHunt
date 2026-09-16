@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Tuple
 from unittest import mock
 import pydoppelgangerhunt
 
@@ -1320,6 +1320,14 @@ def test_clustering_transitivity_and_medoid_coherence(tmp_path: Path) -> None:
     m_key, m_score = compute_medoid(["k1", "k2", "k3"], sim_map)
     assert m_key == "k2"
     assert m_score > 0.8
+
+    # Memoization validation
+    memo: Dict[Tuple[str, ...], Tuple[str, float]] = {}
+    m_key_c, m_score_c = compute_medoid(["k1", "k2", "k3"], sim_map, cache=memo)
+    assert m_key_c == "k2"
+    assert len(memo) == 1
+    m_key_hit, m_score_hit = compute_medoid(["k3", "k2", "k1"], sim_map, cache=memo)
+    assert (m_key_hit, m_score_hit) == (m_key_c, m_score_c)
 
     # Edge cases in compute_medoid
     single_key, single_score = compute_medoid(["only_one"], {})

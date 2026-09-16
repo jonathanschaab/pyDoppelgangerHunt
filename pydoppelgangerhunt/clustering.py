@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 
 class UnionFind:
@@ -46,10 +46,18 @@ def unit_key(unit: Dict[str, Any]) -> str:
 
 
 def compute_medoid(
-    member_keys: List[str],
+    member_keys: Sequence[str],
     sim_matrix: Dict[Tuple[str, str], float],
+    cache: Optional[Dict[Tuple[str, ...], Tuple[str, float]]] = None,
 ) -> Tuple[str, float]:
     """Finds the representative medoid unit maximizing total similarity to other members.
+
+    Args:
+        member_keys: Collection of unique unit string keys in the cluster.
+        sim_matrix: Pairwise similarity lookup mapping (key1, key2) to similarity score.
+        cache: Optional memoization dictionary mapping sorted member key tuples to
+            (medoid_key, coherence_score). Memoization avoids redundant O(N^2)
+            recalculations across iterative agglomerative clustering passes on large clusters.
 
     Returns:
         A tuple of (medoid_key, coherence_score), where coherence_score is the
@@ -59,6 +67,12 @@ def compute_medoid(
         raise ValueError("Cannot compute medoid of an empty member set.")
     if len(member_keys) == 1:
         return member_keys[0], 1.0
+
+    cache_key: Optional[Tuple[str, ...]] = None
+    if cache is not None:
+        cache_key = tuple(sorted(member_keys))
+        if cache_key in cache:
+            return cache[cache_key]
 
     best_key = member_keys[0]
     best_score = -1.0
@@ -75,7 +89,10 @@ def compute_medoid(
             best_score = mean_sim
             best_key = u
 
-    return best_key, best_score
+    res = (best_key, best_score)
+    if cache is not None and cache_key is not None:
+        cache[cache_key] = res
+    return res
 
 
 def cluster_clone_families(
@@ -88,8 +105,13 @@ def cluster_clone_families(
     Supported linkage strategies:
     - 'single': Connected components via Union-Find (transitive chaining).
     - 'complete': Clique partitioning where all pairwise edges must exist and satisfy min_similarity_floor.
-    - 'average': Hierarchical agglomerative clustering requiring mean cross-cluster similarity >= min_similarity_floor.
-    - 'medoid': Centroid-based agglomerative clustering tracking a dynamic medoid and requiring similarity to medoid >= min_similarity_floor.
+    - 'average': Hierarchical agglomerative clustering requiring mean cross-cluster pairwise
+      similarity >= min_similarity_floor. Note that this enforces "average threshold" semantics
+      over all cross-cluster candidate pairs, unlike complete-linkage's strict "all pairs"
+      requirement. Pairs between clusters that do not share an edge in 'clones' contribute 0.0
+      similarity to the mean cross-cluster evaluation.
+    - 'medoid': Centroid-based agglomerative clustering tracking a dynamic medoid and requiring
+      similarity to medoid >= min_similarity_floor.
     """
     if not clones:
         return []
@@ -116,6 +138,7 @@ def cluster_clone_families(
     )
 
     raw_clusters: List[List[str]] = []
+    medoid_cache: Dict[Tuple[str, ...], Tuple[str, float]] = {}
 
     if linkage == "single":
         uf = UnionFind()
@@ -199,7 +222,9 @@ def cluster_clone_families(
                 continue
 
             candidate_merged = sorted(c1 | c2)
-            cand_medoid, _ = compute_medoid(candidate_merged, sim_matrix)
+            cand_medoid, _ = compute_medoid(
+                candidate_merged, sim_matrix, cache=medoid_cache
+            )
 
             can_merge = all(
                 (node == cand_medoid or sim_matrix.get((node, cand_medoid), 0.0) >= floor)
@@ -242,7 +267,9 @@ def cluster_clone_families(
         max_sim = max(family_sims) if family_sims else 1.0
         min_sim = min(family_sims) if family_sims else 1.0
 
-        medoid_key, coherence = compute_medoid(member_keys, sim_matrix)
+        medoid_key, coherence = compute_medoid(
+            member_keys, sim_matrix, cache=medoid_cache
+        )
         medoid_unit = unit_map[medoid_key]
 
         families.append({
