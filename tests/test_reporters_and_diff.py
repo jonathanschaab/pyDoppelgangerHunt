@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from unittest import mock
 import pydoppelgangerhunt
 
 from pydoppelgangerhunt import (
@@ -11,7 +12,6 @@ from pydoppelgangerhunt import (
     analyze_unit_variable_scope,
     check_asymmetric_coverage,
     check_temporal_divergence,
-    clone_pair_structural_fingerprint,
     cluster_clone_families,
     colorize,
     compute_repository_dry_stats,
@@ -35,6 +35,10 @@ from pydoppelgangerhunt import (
     supports_color,
     synthesize_refactoring_suggestion,
     synthesize_shared_helper_code,
+)
+from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
+    _extract_required_typing_imports,
+    _insert_imports_into_module,
 )
 
 
@@ -411,8 +415,6 @@ def test_temporal_divergence_detection() -> None:
     now = 1700000000
     b1 = {"timestamp": now, "author": "Alice", "commit": "abc1234"}
     b2 = {"timestamp": now - (120 * 86400), "author": "Bob", "commit": "def5678"}
-
-    import unittest.mock as mock
 
     with mock.patch("pydoppelgangerhunt.git_diff.get_git_blame_info", side_effect=[b1, b2]):
         res = check_temporal_divergence(u1, u2, max_divergence_days=90)
@@ -1002,5 +1004,260 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
     assert isinstance(risk_lines, list)
 
 
+def test_fixer_control_flow_and_side_effect_safety(tmp_path: Path) -> None:
+    """Verifies control flow hazard detection, multi-value returns, and import propagation."""
+    # 1. Test naked break and continue detection in compound block
+    file_ctrl = tmp_path / "ctrl_hazards.py"
+    file_ctrl.write_text(
+        "def outer_loop(items):\n"
+        "    for x in items:\n"
+        "        if x < 0:\n"
+        "            break\n"
+        "        if x == 0:\n"
+        "            continue\n",
+        encoding="utf-8",
+    )
+    # Unit representing the if block with break
+    u_break = {
+        "file": str(file_ctrl),
+        "start": 3,
+        "end": 4,
+        "name": "outer_loop:If",
+        "kind": "compound_block",
+    }
+    scope_break = analyze_unit_variable_scope(u_break)
+    assert "naked_break" in scope_break["control_flow_hazards"]
+    assert scope_break["is_control_flow_safe"] is False
+
+    helper_break = synthesize_shared_helper_code(u_break, u_break)
+    assert "WARNING: Non-local control flow hazard detected" in helper_break
+    assert "naked_break" in helper_break
+
+    # Unit representing the for loop with internal break
+    u_loop = {
+        "file": str(file_ctrl),
+        "start": 2,
+        "end": 6,
+        "name": "outer_loop:For",
+        "kind": "compound_block",
+    }
+    scope_loop = analyze_unit_variable_scope(u_loop)
+    # Inside loop, break and continue are enclosed, so not naked
+    assert "naked_break" not in scope_loop["control_flow_hazards"]
+    assert "naked_continue" not in scope_loop["control_flow_hazards"]
+
+    # 2. Test embedded return in compound block
+    file_ret = tmp_path / "embedded_ret.py"
+    file_ret.write_text(
+        "def compute(val: int) -> int:\n"
+        "    if val < 0:\n"
+        "        return -1\n"
+        "    return val * 2\n",
+        encoding="utf-8",
+    )
+    u_emb_ret = {
+        "file": str(file_ret),
+        "start": 2,
+        "end": 3,
+        "name": "compute:If",
+        "kind": "compound_block",
+    }
+    scope_emb_ret = analyze_unit_variable_scope(u_emb_ret)
+    assert "embedded_return" in scope_emb_ret["control_flow_hazards"]
+    assert scope_emb_ret["is_control_flow_safe"] is False
+
+    helper_emb_ret = synthesize_shared_helper_code(u_emb_ret, u_emb_ret)
+    assert "embedded_return" in helper_emb_ret
+
+    # 3. Test generator yield detection
+    file_gen = tmp_path / "gen_func.py"
+    file_gen.write_text(
+        "def number_stream(n: int):\n"
+        "    for i in range(n):\n"
+        "        yield i\n",
+        encoding="utf-8",
+    )
+    u_gen = {"file": str(file_gen), "start": 1, "end": 3, "name": "number_stream", "kind": "function"}
+    scope_gen = analyze_unit_variable_scope(u_gen)
+    assert scope_gen["has_yield"] is True
+    assert "generator_yield" in scope_gen["control_flow_hazards"]
+    helper_gen = synthesize_shared_helper_code(u_gen, u_gen)
+    assert "-> Iterator[Any]:" in helper_gen
+
+    # 4. Test multiple local reassignments and tuple return synthesis
+    file_mut = tmp_path / "mut_locals.py"
+    file_mut.write_text(
+        "def process_batch(items, delta: int):\n"
+        "    total = 0\n"
+        "    count = 0\n"
+        "    total += delta\n"
+        "    count += 1\n"
+        "    return total, count\n",
+        encoding="utf-8",
+    )
+    # Unit representing the two reassignments in lines 4-5
+    u_mut = {
+        "file": str(file_mut),
+        "start": 4,
+        "end": 5,
+        "name": "process_batch:stmts_4-5",
+        "kind": "sliding_window",
+    }
+    scope_mut = analyze_unit_variable_scope(u_mut)
+    assert "total" in scope_mut["outputs"]
+    assert "count" in scope_mut["outputs"]
+    assert len(scope_mut["outputs"]) >= 2
+
+    helper_mut = synthesize_shared_helper_code(u_mut, u_mut)
+    assert "Tuple[" in helper_mut
+    assert "return total, count" in helper_mut
+    assert "Call site:" in helper_mut
+    assert "total, count = _shared_process_batch(...)" in helper_mut
+
+    # 5. Test multi-value return in whole function (return a, b)
+    u_fn_ret = {
+        "file": str(file_mut),
+        "start": 1,
+        "end": 6,
+        "name": "process_batch",
+        "kind": "function",
+    }
+    scope_fn_ret = analyze_unit_variable_scope(u_fn_ret)
+    assert "total" in scope_fn_ret["outputs"]
+    assert "count" in scope_fn_ret["outputs"]
+
+    # 6. Test local import tracking and include_imports
+    file_imp = tmp_path / "local_imports.py"
+    file_imp.write_text(
+        "def parse_config(path: str) -> dict:\n"
+        "    import json\n"
+        "    from collections import deque\n"
+        "    with open(path) as fh:\n"
+        "        return json.load(fh)\n",
+        encoding="utf-8",
+    )
+    u_imp = {"file": str(file_imp), "start": 1, "end": 5, "name": "parse_config", "kind": "function"}
+    scope_imp = analyze_unit_variable_scope(u_imp)
+    assert "import json" in scope_imp["local_imports"]
+    assert "from collections import deque" in scope_imp["local_imports"]
+
+    helper_with_imports = synthesize_shared_helper_code(u_mut, u_mut, include_imports=True)
+    assert "from typing import" in helper_with_imports
+    assert "Tuple" in helper_with_imports
+
+    # 7. Test missing import propagation in generate_refactoring_patch
+    file_target = tmp_path / "patch_target.py"
+    file_target.write_text(
+        '"""Target module docstring."""\n\n'
+        'from __future__ import annotations\n\n'
+        'def run_step(a: int, b: int) -> int:\n'
+        '    return a + b\n',
+        encoding="utf-8",
+    )
+    u_patch1 = {"file": str(file_target), "start": 5, "end": 6, "name": "run_step"}
+    patch = generate_refactoring_patch([(0.95, u_mut, u_patch1)], repo_root=str(tmp_path))
+    assert "+from typing import" in patch
+    assert "Tuple" in patch
 
 
+def test_fixer_feedback_and_advanced_robustness(tmp_path: Path) -> None:
+    """Verifies nested nonlocals, typed generator inference, import dedup, and AST typing extraction."""
+    # 1. Nested function scoping with nonlocals (mutated vs read-only)
+    file_nested = tmp_path / "nested_nonlocal.py"
+    file_nested.write_text(
+        "def outer():\n"
+        "    count = 0\n"
+        "    def inner():\n"
+        "        nonlocal count\n"
+        "        count += 1\n"
+        "    return inner\n",
+        encoding="utf-8",
+    )
+    u_inner = {
+        "file": str(file_nested),
+        "start": 3,
+        "end": 5,
+        "name": "outer:inner",
+        "kind": "function",
+    }
+    scope_inner = analyze_unit_variable_scope(u_inner)
+    assert "count" in scope_inner["outputs"]
+
+    file_ro = tmp_path / "nested_nonlocal_ro.py"
+    file_ro.write_text(
+        "def outer():\n"
+        "    base = 10\n"
+        "    def inner(x):\n"
+        "        nonlocal base\n"
+        "        return x + base\n"
+        "    return inner\n",
+        encoding="utf-8",
+    )
+    u_ro = {
+        "file": str(file_ro),
+        "start": 3,
+        "end": 5,
+        "name": "outer:inner",
+        "kind": "function",
+    }
+    scope_ro = analyze_unit_variable_scope(u_ro)
+    assert "base" in scope_ro["inputs"]
+    assert "base" not in scope_ro["outputs"]
+
+    # 2. Generator return type inference for yield from and typed yield
+    file_gen_from = tmp_path / "gen_yield_from.py"
+    file_gen_from.write_text(
+        "def stream_items(src: List[str]):\n"
+        "    yield from src\n",
+        encoding="utf-8",
+    )
+    u_gen_from = {
+        "file": str(file_gen_from),
+        "start": 1,
+        "end": 2,
+        "name": "stream_items",
+        "kind": "function",
+    }
+    helper_gen_from = synthesize_shared_helper_code(u_gen_from, u_gen_from, include_imports=True)
+    assert "-> Iterator[str]:" in helper_gen_from
+    assert "from typing import Iterator, List" in helper_gen_from
+
+    file_gen_val = tmp_path / "gen_yield_val.py"
+    file_gen_val.write_text(
+        "def yield_single(val: int):\n"
+        "    yield val\n",
+        encoding="utf-8",
+    )
+    u_gen_val = {
+        "file": str(file_gen_val),
+        "start": 1,
+        "end": 2,
+        "name": "yield_single",
+        "kind": "function",
+    }
+    helper_gen_val = synthesize_shared_helper_code(u_gen_val, u_gen_val)
+    assert "-> Iterator[int]:" in helper_gen_val
+
+    # 3. Import deduplication in _insert_imports_into_module
+    orig_lines = ["from typing import Tuple\n", "import os\n"]
+    res_dedup = _insert_imports_into_module(orig_lines, ["from typing import Tuple"])
+    assert res_dedup == orig_lines
+
+    new_lines = _insert_imports_into_module(orig_lines, ["from typing import List"])
+    assert "from typing import List\n" in new_lines
+
+    # 4. AST-based typing symbol extraction with shadowing parameter immunity
+    shadow_func = "def helper(Tuple: int, List: str) -> None:\n    pass\n"
+    extracted_shadow = _extract_required_typing_imports(shadow_func)
+    assert "Tuple" not in extracted_shadow
+    assert "List" not in extracted_shadow
+
+    real_func = "def helper(items: List[str]) -> Tuple[int, Optional[str]]:\n    pass\n"
+    extracted_real = _extract_required_typing_imports(real_func)
+    assert extracted_real == ["List", "Optional", "Tuple"]
+
+    # Raw signature without wrapper
+    sig_raw = "x: Dict[str, Any]"
+    extracted_sig = _extract_required_typing_imports(sig_raw)
+    assert "Dict" in extracted_sig
+    assert "Any" in extracted_sig
