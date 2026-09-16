@@ -5,8 +5,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 def compute_unit_structural_hash(unit: Dict[str, Any]) -> str:
@@ -188,22 +191,23 @@ def _match_clone_record(
     c_namespaces = c_keys["namespaces"]
     c_names = c_keys["names"]
 
-    # Pass 1: exact symbol-path fingerprint
+    # Pass 1: exact symbol-path fingerprint (file:name <===> file:name) for untouched code units
     for rec in unconsumed:
         if rec.get("fingerprint") == c_fp:
             return rec
 
-    # Pass 2: exact path-structural fingerprint
+    # Pass 2: exact path-structural fingerprint (file#hash <===> file#hash) resilient to function renames
     for rec in unconsumed:
         if rec.get("structural_fingerprint") == c_sfp:
             return rec
 
-    # Pass 3: namespaced structural fingerprint (file renamed within package)
+    # Pass 3: namespaced structural fingerprint (namespace#hash <===> namespace#hash) resilient to file renames within package
     for rec in unconsumed:
         if rec.get("namespaced_structural_fingerprint") == c_ns_sfp:
             return rec
 
-    # Pass 4: pure structural fingerprint with matching namespaces
+    # Pass 4: pure structural fingerprint (hash <===> hash) strictly requiring matching module namespaces,
+    # preventing identical boilerplate functions across different modules from colliding
     for rec in unconsumed:
         if rec.get("pure_structural_fingerprint") == c_pure_sfp:
             rec_ns = sorted([
@@ -213,7 +217,8 @@ def _match_clone_record(
             if rec_ns == c_namespaces:
                 return rec
 
-    # Pass 5: pure structural fingerprint fallback for cross-namespace moved files with matching symbols
+    # Pass 5: pure structural fallback for cross-namespace moved files; requires distinct structural hashes
+    # (h_a != h_b) and matching symbols, preventing a grandfathered entry from being hijacked by unrelated cross-namespace code
     for rec in unconsumed:
         if rec.get("pure_structural_fingerprint") == c_pure_sfp:
             h_a = str(rec.get("hash_a", ""))
@@ -336,7 +341,12 @@ def prune_baseline(
             # pylint: disable=import-outside-toplevel
             from pydoppelgangerhunt.git_diff import get_git_modified_line_ranges
             unstaged_modified_ranges = get_git_modified_line_ranges(since_ref=None)
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            # Pragmatic fallback when git is unavailable, outside a repo, or query fails
+            logger.debug(
+                "Failed to query unstaged git modified line ranges during baseline pruning: %s",
+                err,
+            )
             unstaged_modified_ranges = {}
 
     active_fps: Set[str] = set()
@@ -428,6 +438,9 @@ def prune_baseline(
         else:
             f_a = item.get("file_a", "").replace("\\", "/")
             f_b = item.get("file_b", "").replace("\\", "/")
+            # Path matching checks exact equality or bidirectional suffix containment
+            # (f_a.endswith(k) or k.endswith(f_a)) to reliably reconcile absolute paths,
+            # repository-relative paths, and normalized forward-slash variants.
             is_dirty = bool(
                 unstaged_modified_ranges
                 and (
