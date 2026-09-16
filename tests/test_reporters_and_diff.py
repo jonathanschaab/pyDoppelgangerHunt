@@ -4389,6 +4389,29 @@ def test_local_import_not_treated_as_free_var_input_or_subroutine_output(tmp_pat
     assert "path" in scope["outputs"]
 
 
+def test_compute_unit_diff_overlap_with_notebook_cell_fragment() -> None:
+    """Verifies that notebook cell fragments (#cell_1) are stripped when matching diff ranges."""
+    from pydoppelgangerhunt.git_diff import compute_unit_diff_overlap  # pylint: disable=import-outside-toplevel
+
+    unit = {"file": "notebooks/analysis.ipynb#cell_3", "start": 10, "end": 20}
+    modified_ranges = {"notebooks/analysis.ipynb": [(12, 16)]}
+    count, ratio = compute_unit_diff_overlap(unit, modified_ranges)
+    assert count == 5
+    assert ratio == round(5 / 11, 4)
+
+
+def test_base_unit_name_fallback_for_underscore_or_empty_name() -> None:
+    """Verifies that _base_unit_name falls back to 'helper' when unit name has only underscores."""
+    from pydoppelgangerhunt.fixer import _base_unit_name  # pylint: disable=protected-access
+
+    assert _base_unit_name({"name": "_", "kind": "function"}) == "helper"
+    assert _base_unit_name({"name": "___", "kind": "function"}) == "helper"
+    assert _base_unit_name({"name": "", "kind": "function"}) == "helper"
+    assert _base_unit_name({"name": "outer:_", "kind": "closure"}) == "helper"
+    assert _base_unit_name({"name": "calculate", "kind": "function"}) == "calculate"
+
+
+
 
 
 

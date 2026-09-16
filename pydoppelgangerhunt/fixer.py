@@ -1596,8 +1596,10 @@ def _base_unit_name(u: Dict[str, Any]) -> str:
     """Extracts base function or method name from unit dictionary for helper synthesis."""
     name = str(u.get("name") or "")
     if u.get("kind") == "closure" and ":" in name:
-        return str(name.rsplit(":", maxsplit=1)[-1].lstrip("_"))
-    return str(name.split(":", maxsplit=1)[0].lstrip("_"))
+        base = name.rsplit(":", maxsplit=1)[-1].lstrip("_")
+    else:
+        base = name.split(":", maxsplit=1)[0].lstrip("_")
+    return base or "helper"
 
 
 def _resolve_effective_binding(
