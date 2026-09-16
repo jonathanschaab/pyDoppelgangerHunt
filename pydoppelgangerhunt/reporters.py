@@ -41,7 +41,8 @@ def colorize(text: str, color_code: str, enabled: bool) -> str:
 
 def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:
     """Reads raw source code lines for a given unit from disk."""
-    file_path = Path(unit["file"])
+    f_raw = unit.get("file", "").split("#")[0].replace("\\", "/")
+    file_path = Path(f_raw)
     if repo_root and not file_path.is_absolute():
         file_path = Path(repo_root) / file_path
     if not file_path.exists():

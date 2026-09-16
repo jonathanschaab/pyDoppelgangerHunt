@@ -4052,6 +4052,124 @@ def test_closures_in_classes_synthesize_module_helper_auto_mode(tmp_path: Path) 
     assert "self" not in helper
 
 
+def test_aug_assign_compound_block_inputs_and_outputs(tmp_path: Path) -> None:
+    """Verifies that AugAssign targets without prior assignment in the block are tracked as both inputs and outputs."""
+    code = (
+        "def compute_a(items: list) -> int:\n"
+        "    total = 0\n"
+        "    total += len(items)\n"
+        "    return total\n\n"
+        "def compute_b(items: list) -> int:\n"
+        "    total = 0\n"
+        "    total += len(items)\n"
+        "    return total\n"
+    )
+    f = tmp_path / "calc.py"
+    f.write_text(code, encoding="utf-8")
+
+    u1 = {"file": str(f), "start": 3, "end": 3, "name": "aug_a", "kind": "compound_block"}
+    u2 = {"file": str(f), "start": 8, "end": 8, "name": "aug_b", "kind": "compound_block"}
+
+    scope = analyze_unit_variable_scope(u1, repo_root=str(tmp_path))
+    assert "total" in scope["inputs"]
+    assert "total" in scope["outputs"]
+    assert "items" in scope["inputs"]
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "total: Any" in helper
+    assert "return total" in helper
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert "total = _shared_aug_a" in patch
+    assert "total," in patch or "(total," in patch or "(items, total)" in patch or "(total)" in patch
+
+
+def test_module_helper_insertion_index_stops_at_first_non_import() -> None:
+    """Verifies that module helper insertion index terminates at the initial import block boundary."""
+    code = (
+        '"""Module docstring."""\n'
+        "import sys\n"
+        "import os\n\n"
+        "class Config:\n"
+        "    val = 42\n\n"
+        "import math\n"
+    )
+    lines = code.splitlines(keepends=True)
+    idx = _find_module_helper_insertion_index(lines)
+    # Must be after import os (line 3), before class Config (line 5), not after import math (line 8)
+    assert idx == 3
+
+
+def test_comprehension_token_span_and_bare_call_replacement(tmp_path: Path) -> None:
+    """Verifies that comprehension units return the evaluated expression and replace exact token spans."""
+    code = (
+        "def make_lists(items: list):\n"
+        "    a_list = [k * 2 for k in items if k > 0]\n"
+        "    b_list = [k * 2 for k in items if k > 0]\n"
+        "    return a_list, b_list\n"
+    )
+    f = tmp_path / "comps.py"
+    f.write_text(code, encoding="utf-8")
+
+    units = harvest_file_units(str(f), repo_root=str(tmp_path), min_lines=1, min_tokens=5, comprehensions=True)
+    comps = [u for u in units if u["kind"] == "comprehension"]
+    assert len(comps) == 2
+    c1, c2 = comps[0], comps[1]
+
+    scope = analyze_unit_variable_scope(c1, repo_root=str(tmp_path))
+    assert "items" in scope["inputs"]
+    assert "k" not in scope["inputs"]
+    assert "k" not in scope["outputs"]
+
+    helper = synthesize_shared_helper_code(c1, c2, repo_root=str(tmp_path))
+    assert "return [k * 2 for k in items if k > 0]" in helper
+    assert "return k" not in helper
+
+    patch = generate_refactoring_patch([(1.0, c1, c2)], repo_root=str(tmp_path), replace_clones=True)
+    assert "a_list = _shared_" in patch
+    assert "b_list = _shared_" in patch
+
+
+def test_receiver_isolation_in_factory_function(tmp_path: Path) -> None:
+    """Verifies that nested class/method receiver accesses do not pollute the outer function's scope."""
+    code = (
+        "def build_service(mult: int):\n"
+        "    class Inner:\n"
+        "        def calc(self, v: int) -> int:\n"
+        "            return self.mult * v\n"
+        "    return Inner()\n"
+    )
+    f = tmp_path / "factory.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {"file": str(f), "start": 1, "end": 5, "name": "build_service", "kind": "function"}
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert scope["has_instance_binding"] is False
+    assert scope["has_class_binding"] is False
+    assert "self" not in scope["inputs"]
+    assert "mult" in scope["inputs"]
+
+
+def test_backslash_relative_path_normalization_on_unit(tmp_path: Path) -> None:
+    """Verifies that units carrying Windows-style backslashes resolve correctly across platforms."""
+    pkg_dir = tmp_path / "pkg"
+    pkg_dir.mkdir()
+    f = pkg_dir / "service.py"
+    f.write_text("def run_a(x: int) -> int:\n    return x + 10\n\ndef run_b(x: int) -> int:\n    return x + 10\n", encoding="utf-8")
+
+    u1 = {"file": "pkg\\service.py", "start": 1, "end": 2, "name": "run_a", "kind": "function"}
+    u2 = {"file": "pkg/service.py", "start": 4, "end": 5, "name": "run_b", "kind": "function"}
+
+    extracted = extract_unit_source_code(u1, repo_root=str(tmp_path))
+    assert len(extracted) == 2
+    assert "def run_a" in extracted[0]
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert "--- a/pkg/service.py" in patch
+    assert "+++ b/pkg/service.py" in patch
+
+
+
 
 
 

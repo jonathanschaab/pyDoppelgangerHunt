@@ -33,6 +33,7 @@ class _ScopeVisitor(ast.NodeVisitor):
     ) -> None:
         self.loads: List[str] = []
         self.stores: List[str] = []
+        self.read_before_write: List[str] = []
         self.params: List[str] = []
         self.param_details: List[Dict[str, Any]] = []
         self.returns: List[str] = []
@@ -155,9 +156,15 @@ class _ScopeVisitor(ast.NodeVisitor):
         for kw_default in node.args.kw_defaults:
             if kw_default is not None:
                 self.visit(kw_default)
+        created_outer = False
+        if not self._scope_stack:
+            self._scope_stack.append(set())
+            created_outer = True
         self._scope_stack.append(self._extract_arg_names(node.args))
         self.visit(node.body)
         self._scope_stack.pop()
+        if created_outer:
+            self._scope_stack.pop()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._process_func(node)
@@ -174,7 +181,22 @@ class _ScopeVisitor(ast.NodeVisitor):
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self._record_store_name(node.name)
-        self.generic_visit(node)
+        for dec in node.decorator_list:
+            self.visit(dec)
+        for base in node.bases:
+            self.visit(base)
+        for keyword in node.keywords:
+            self.visit(keyword)
+        created_outer = False
+        if not self._scope_stack:
+            self._scope_stack.append(set())
+            created_outer = True
+        self._scope_stack.append(set())
+        for stmt in node.body:
+            self.visit(stmt)
+        self._scope_stack.pop()
+        if created_outer:
+            self._scope_stack.pop()
 
     def visit_MatchAs(self, node: ast.AST) -> None:
         name = getattr(node, "name", None)
@@ -194,41 +216,91 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._record_store_name(rest)
         self.generic_visit(node)
 
+    def _record_load_name(self, name: str) -> None:
+        is_inner = any(name in s for s in self._scope_stack[1:])
+        if not is_inner and name not in BUILTIN_NAMES:
+            if name not in self.loads:
+                self.loads.append(name)
+            if (
+                len(self._scope_stack) <= 1
+                and name not in self.params
+                and name not in self.stores
+                and name not in self.read_before_write
+            ):
+                self.read_before_write.append(name)
+
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Load):
-            is_inner = any(node.id in s for s in self._scope_stack[1:])
-            if not is_inner and node.id not in BUILTIN_NAMES and node.id not in self.loads:
-                self.loads.append(node.id)
+            self._record_load_name(node.id)
         elif isinstance(node.ctx, ast.Store):
             self._record_store_name(node.id)
-        self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        if isinstance(node.value, ast.Name) and node.value.id in ("self", "cls"):
-            attr_name = f"{node.value.id}.{node.attr}"
-            if isinstance(node.ctx, ast.Load):
-                if attr_name not in self.attrs_read:
-                    self.attrs_read.append(attr_name)
-            elif isinstance(node.ctx, ast.Store):
-                if attr_name not in self.attrs_written:
-                    self.attrs_written.append(attr_name)
+        if len(self._scope_stack) <= 1:
+            if isinstance(node.value, ast.Name) and node.value.id in ("self", "cls"):
+                attr_name = f"{node.value.id}.{node.attr}"
+                if isinstance(node.ctx, ast.Load):
+                    if attr_name not in self.attrs_read:
+                        self.attrs_read.append(attr_name)
+                elif isinstance(node.ctx, ast.Store):
+                    if attr_name not in self.attrs_written:
+                        self.attrs_written.append(attr_name)
         self.generic_visit(node)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         # AugAssign both loads and stores the target
         if isinstance(node.target, ast.Name):
-            is_inner = any(node.target.id in s for s in self._scope_stack[1:])
-            if not is_inner and node.target.id not in BUILTIN_NAMES and node.target.id not in self.loads:
-                self.loads.append(node.target.id)
+            self._record_load_name(node.target.id)
             self._record_store_name(node.target.id)
         elif isinstance(node.target, ast.Attribute):
-            if isinstance(node.target.value, ast.Name) and node.target.value.id in ("self", "cls"):
-                attr_name = f"{node.target.value.id}.{node.target.attr}"
-                if attr_name not in self.attrs_read:
-                    self.attrs_read.append(attr_name)
-                if attr_name not in self.attrs_written:
-                    self.attrs_written.append(attr_name)
+            if len(self._scope_stack) <= 1:
+                if isinstance(node.target.value, ast.Name) and node.target.value.id in ("self", "cls"):
+                    attr_name = f"{node.target.value.id}.{node.target.attr}"
+                    if attr_name not in self.attrs_read:
+                        self.attrs_read.append(attr_name)
+                    if attr_name not in self.attrs_written:
+                        self.attrs_written.append(attr_name)
         self.generic_visit(node)
+
+    def _visit_comprehension(
+        self,
+        node: Union[ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp],
+    ) -> None:
+        for gen in node.generators:
+            self.visit(gen.iter)
+        inner_vars: Set[str] = set()
+        for gen in node.generators:
+            for n in ast.walk(gen.target):
+                if isinstance(n, ast.Name):
+                    inner_vars.add(n.id)
+        created_outer = False
+        if not self._scope_stack:
+            self._scope_stack.append(set())
+            created_outer = True
+        self._scope_stack.append(inner_vars)
+        for gen in node.generators:
+            for if_expr in gen.ifs:
+                self.visit(if_expr)
+        if isinstance(node, ast.DictComp):
+            self.visit(node.key)
+            self.visit(node.value)
+        else:
+            self.visit(node.elt)
+        self._scope_stack.pop()
+        if created_outer:
+            self._scope_stack.pop()
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node)
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node)
 
     def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
         for name in node.names:
@@ -572,9 +644,27 @@ def _find_module_helper_insertion_index(lines: List[str]) -> int:
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             end_l = getattr(node, "end_lineno", node.lineno)
             last_import_line = max(last_import_line, end_l)
+        else:
+            break
 
     target_line = max(last_import_line, docstring_line, min_insert_idx)
     return min(target_line, len(lines))
+
+
+def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]:
+    """Slices source lines to the exact start_col and end_col offsets of the unit."""
+    if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
+        return lines
+    s_col = unit.get("start_col", 0) or 0
+    e_col = unit.get("end_col")
+    res = list(lines)
+    if len(res) == 1:
+        res[0] = res[0][s_col:e_col]
+    else:
+        res[0] = res[0][s_col:]
+        if e_col is not None:
+            res[-1] = res[-1][:e_col]
+    return res
 
 
 def _inspect_unit_scope(
@@ -582,7 +672,7 @@ def _inspect_unit_scope(
     repo_root: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Extracts lexical and AST scope metadata for a single unit."""
-    raw_lines = extract_unit_source_code(unit, repo_root=repo_root)
+    raw_lines = _slice_unit_token_lines(unit, extract_unit_source_code(unit, repo_root=repo_root))
     dedented = textwrap.dedent("".join(raw_lines))
     empty_res: Dict[str, Any] = {
         "inputs": [],
@@ -661,7 +751,7 @@ def _inspect_unit_scope(
     unit_name = str(unit.get("name") or "")
     unit_kind = str(unit.get("kind") or "")
     is_subroutine = unit_kind in ("compound_block", "sliding_window", "clause_branch") or (
-        unit_kind not in ("function", "closure") and ":" in unit_name
+        unit_kind not in ("function", "closure", "comprehension", "complex_expr") and ":" in unit_name
     )
 
     hazards: List[str] = []
@@ -681,7 +771,7 @@ def _inspect_unit_scope(
     free_vars = [
         name for name in visitor.loads
         if name not in visitor.params
-        and name not in visitor.stores
+        and (name not in visitor.stores or name in visitor.read_before_write)
         and name not in visitor.globals
         and name not in BUILTIN_NAMES
     ]
@@ -1405,8 +1495,9 @@ def _populate_unit_receiver_metadata(
     f_raw = unit.get("file", "").split("#")[0]
     if not f_raw:
         return
-    p = Path(f_raw)
-    f_path = p if p.is_absolute() else Path(repo_root or os.getcwd()) / f_raw
+    f_norm = f_raw.replace("\\", "/")
+    p = Path(f_norm)
+    f_path = p if p.is_absolute() else Path(repo_root or os.getcwd()) / p
     if not f_path.is_file():
         return
     try:
@@ -1494,8 +1585,14 @@ def synthesize_shared_helper_code(
         step: Indentation step per indentation level (defaults to "\t" for tabs, 4 spaces otherwise).
         repo_root: Optional root directory of the repository for relative path resolution.
     """
-    lines1 = _extract_unit_body_lines(u1, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u1, repo_root=repo_root)])
-    lines2 = _extract_unit_body_lines(u2, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u2, repo_root=repo_root)])
+    lines1 = _slice_unit_token_lines(
+        u1,
+        _extract_unit_body_lines(u1, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u1, repo_root=repo_root)]),
+    )
+    lines2 = _slice_unit_token_lines(
+        u2,
+        _extract_unit_body_lines(u2, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u2, repo_root=repo_root)]),
+    )
 
     base_name1 = _base_unit_name(u1)
     base_name2 = _base_unit_name(u2)
@@ -1769,7 +1866,7 @@ def synthesize_shared_helper_code(
             if not return_type.startswith("Optional[") and "None" not in return_type and return_type != "None":
                 return_type = f"Optional[{return_type}]"
     elif not helper_outputs and not scope.get("has_return") and resolved_ret == "Any":
-        return_type = "None"
+        return_type = "Any" if u1.get("kind") in ("comprehension", "complex_expr") else "None"
     else:
         return_type = resolved_ret
 
@@ -1798,7 +1895,11 @@ def synthesize_shared_helper_code(
         ln.strip().startswith("return ") or ln.strip() == "return"
         for ln in common_lines[-3:]
     )
-    if not has_trailing_return and helper_outputs and not scope.get("has_yield"):
+    if u1.get("kind") in ("comprehension", "complex_expr"):
+        expr_text = "".join(common_lines).strip()
+        common_lines = [f"return {expr_text}"]
+        helper_outputs = []
+    elif not has_trailing_return and helper_outputs and not scope.get("has_yield"):
         if len(helper_outputs) >= 2:
             common_lines = common_lines + [f"return {', '.join(helper_outputs)}"]
         else:
@@ -2196,8 +2297,9 @@ def generate_refactoring_patch(
 
     for sim, u1, u2 in clones:
         f1_raw = u1["file"].split("#")[0]
-        p = Path(f1_raw)
-        f1_path = p if p.is_absolute() else (root / f1_raw)
+        f1_norm = f1_raw.replace("\\", "/")
+        p = Path(f1_norm)
+        f1_path = p if p.is_absolute() else (root / p)
         if not f1_path.is_file():
             continue
 
@@ -2208,7 +2310,6 @@ def generate_refactoring_patch(
 
         orig_lines = orig_text.splitlines(keepends=True)
 
-        f1_norm = f1_raw.replace("\\", "/")
         f2_raw = u2.get("file", "").split("#")[0]
         f2_norm = f2_raw.replace("\\", "/")
         is_same_file = bool(f2_norm and f2_norm == f1_norm)
@@ -2222,8 +2323,8 @@ def generate_refactoring_patch(
             enc2 = find_enclosing_class(orig_text, u2)
             fn2 = find_enclosing_function(orig_text, u2)
         elif f2_raw:
-            p2 = Path(f2_raw)
-            f2_path = p2 if p2.is_absolute() else (root / f2_raw)
+            p2 = Path(f2_norm)
+            f2_path = p2 if p2.is_absolute() else (root / p2)
             if f2_path.is_file():
                 try:
                     f2_text = f2_path.read_text(encoding="utf-8")
@@ -2398,6 +2499,9 @@ def generate_refactoring_patch(
                             is_async=bool(scope.get("is_async")),
                             has_yield=bool(scope.get("has_yield")),
                         )
+                    elif target_unit.get("kind") in ("comprehension", "complex_expr"):
+                        call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
+                        rep_stmt = f"{await_prefix}{call_expr}"
                     else:
                         call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
                         rep_step = step or ("\t" if "\t" in indent else "    ")
