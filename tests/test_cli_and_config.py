@@ -14,6 +14,7 @@ from pydoppelgangerhunt import (
     load_baseline,
     load_toml_section,
     load_tool_config,
+    namespaced_structural_fingerprint,
     pure_structural_fingerprint,
     record_baseline,
 )
@@ -93,10 +94,11 @@ def test_baseline_record_load_and_filter(tmp_path: Path) -> None:
     assert Path(saved_path).exists()
 
     loaded_fps = load_baseline(str(baseline_file))
-    assert len(loaded_fps) == 6
+    assert len(loaded_fps) == 8
     fp1 = clone_pair_fingerprint(u1, u2)
     assert fp1 in loaded_fps
     assert clone_pair_structural_fingerprint(u1, u2) in loaded_fps
+    assert namespaced_structural_fingerprint(u1, u2) in loaded_fps
     assert pure_structural_fingerprint(u1, u2) in loaded_fps
 
     new_clones, suppressed = filter_clones_by_baseline(mock_clones, loaded_fps)

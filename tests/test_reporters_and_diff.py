@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 from unittest import mock
 import pydoppelgangerhunt
 
@@ -335,6 +335,8 @@ def test_modular_pydoppelgangerhunt_exports() -> None:
     assert callable(pydoppelgangerhunt.record_baseline)
     assert callable(pydoppelgangerhunt.load_baseline)
     assert callable(pydoppelgangerhunt.pure_structural_fingerprint)
+    assert callable(pydoppelgangerhunt.extract_unit_namespace)
+    assert callable(pydoppelgangerhunt.namespaced_structural_fingerprint)
     assert callable(pydoppelgangerhunt.prune_baseline)
     assert isinstance(pydoppelgangerhunt.DEFAULT_STOP_SHINGLES, set)
     assert callable(pydoppelgangerhunt.get_boilerplate_stop_shingles)
@@ -1950,6 +1952,167 @@ def test_inter_block_overlap_collision_detection_and_reverse_offset_refactoring(
     patch = generate_refactoring_patch([(0.95, u_t1, u_t2)], repo_root=str(tmp_path), replace_clones=True)
     assert "def _shared_first_task_second_task" in patch
     assert "_shared_first_task_second_task(x)" in patch
+
+
+def test_cross_namespace_collision_prevention_and_granular_tracking(tmp_path: Path) -> None:
+    """Test that identical boilerplate across different modules is disambiguated and tracked granularly."""
+    bp_hash = "hash_boilerplate_common"
+    u_auth1 = {"file": "auth/views.py", "name": "to_dict", "structural_hash": bp_hash}
+    u_auth2 = {"file": "auth/helpers.py", "name": "to_dict", "structural_hash": bp_hash}
+
+    u_bill1 = {"file": "billing/views.py", "name": "to_dict", "structural_hash": bp_hash}
+    u_bill2 = {"file": "billing/helpers.py", "name": "to_dict", "structural_hash": bp_hash}
+
+    # Verify extract_unit_namespace
+    assert pydoppelgangerhunt.extract_unit_namespace("auth/views.py") == "auth"
+    assert pydoppelgangerhunt.extract_unit_namespace("billing/helpers.py") == "billing"
+    assert pydoppelgangerhunt.extract_unit_namespace("standalone.py") == "."
+    assert pydoppelgangerhunt.extract_unit_namespace("./nested/dir/mod.py") == "nested/dir"
+
+    # Verify namespaced structural fingerprints
+    ns_auth = pydoppelgangerhunt.namespaced_structural_fingerprint(u_auth1, u_auth2)
+    ns_bill = pydoppelgangerhunt.namespaced_structural_fingerprint(u_bill1, u_bill2)
+    assert ns_auth != ns_bill
+    assert "auth#hash_boilerplate_common" in ns_auth
+    assert "billing#hash_boilerplate_common" in ns_bill
+
+    # Pure structural fingerprint is identical
+    pure_auth = pydoppelgangerhunt.pure_structural_fingerprint(u_auth1, u_auth2)
+    pure_bill = pydoppelgangerhunt.pure_structural_fingerprint(u_bill1, u_bill2)
+    assert pure_auth == pure_bill
+
+    # Record baseline grandfathering ONLY the auth/ boilerplate pair
+    base_file = tmp_path / "baseline_disambig.json"
+    pydoppelgangerhunt.record_baseline([(0.98, u_auth1, u_auth2)], str(base_file), "test_ns", 0.90)
+
+    loaded_base = pydoppelgangerhunt.load_baseline(str(base_file))
+
+    # Test 1: Scan both clone pairs -> auth is suppressed, billing is NOT (detected as new)
+    active_clones = [
+        (0.98, u_auth1, u_auth2),
+        (0.98, u_bill1, u_bill2),
+    ]
+    new_clones, suppressed = pydoppelgangerhunt.filter_clones_by_baseline(active_clones, loaded_base)
+    assert suppressed == 1
+    assert len(new_clones) == 1
+    assert new_clones[0][1]["file"] == "billing/views.py"
+
+    # Test 2: Even if auth/ pair is absent, billing/ cannot hijack auth's grandfathered record
+    active_bill_only = [(0.98, u_bill1, u_bill2)]
+    new_clones_bill, suppressed_bill = pydoppelgangerhunt.filter_clones_by_baseline(active_bill_only, loaded_base)
+    assert suppressed_bill == 0
+    assert len(new_clones_bill) == 1
+
+    # Test 3: Granular 1-to-1 matching within the same namespace
+    u_auth3 = {"file": "auth/extra.py", "name": "to_dict", "structural_hash": bp_hash}
+    u_auth4 = {"file": "auth/other.py", "name": "to_dict", "structural_hash": bp_hash}
+    two_auth_pairs = [
+        (0.98, u_auth1, u_auth2),
+        (0.98, u_auth3, u_auth4),
+    ]
+    new_two, supp_two = pydoppelgangerhunt.filter_clones_by_baseline(two_auth_pairs, loaded_base)
+    assert supp_two == 1
+    assert len(new_two) == 1
+    assert new_two[0][1]["file"] == "auth/extra.py"
+
+    # Test 4: File rename resilience within the same namespace
+    u_auth1_renamed = {"file": "auth/auth_views.py", "name": "to_dict", "structural_hash": bp_hash}
+    renamed_active = [(0.98, u_auth1_renamed, u_auth2)]
+    new_renamed, supp_renamed = pydoppelgangerhunt.filter_clones_by_baseline(renamed_active, loaded_base)
+    assert supp_renamed == 1
+    assert len(new_renamed) == 0
+
+
+def test_stale_unstaged_diff_protection_during_baseline_pruning(tmp_path: Path) -> None:
+    """Test that prune_baseline protects inactive entries touching unstaged git changes."""
+    u_auth1 = {"file": "src/auth/views.py", "name": "login", "structural_hash": "hash_auth_login"}
+    u_auth2 = {"file": "src/auth/helpers.py", "name": "login", "structural_hash": "hash_auth_login"}
+    u_clean1 = {"file": "src/calc/math.py", "name": "add", "structural_hash": "hash_clean_add"}
+    u_clean2 = {"file": "src/calc/utils.py", "name": "add", "structural_hash": "hash_clean_add"}
+
+    base_file = tmp_path / "prune_dirty_baseline.json"
+    pydoppelgangerhunt.record_baseline(
+        [(0.95, u_auth1, u_auth2), (0.95, u_clean1, u_clean2)],
+        str(base_file),
+        "test_prune",
+        0.90,
+    )
+
+    active_clones: List[Any] = []
+    dirty_unstaged = {"src/auth/views.py": [(10, 20)]}
+
+    prune_res = pydoppelgangerhunt.prune_baseline(
+        str(base_file),
+        active_clones,
+        unstaged_modified_ranges=dirty_unstaged,
+    )
+    assert isinstance(prune_res, tuple)
+    pruned, retained = prune_res
+    assert pruned == 1
+    assert retained == 1
+    assert prune_res.skipped_dirty_count == 1
+    assert prune_res.pruned_count == 1
+    assert prune_res.retained_count == 1
+
+    data = json.loads(base_file.read_text(encoding="utf-8"))
+    assert data["clone_count"] == 1
+    assert data["fingerprints"][0]["file_a"] == "src/auth/views.py"
+
+    # Clean worktree prunes the remaining entry
+    prune_res_clean = pydoppelgangerhunt.prune_baseline(
+        str(base_file),
+        active_clones,
+        unstaged_modified_ranges={},
+    )
+    assert prune_res_clean.pruned_count == 1
+    assert prune_res_clean.retained_count == 0
+    assert prune_res_clean.skipped_dirty_count == 0
+
+    data_clean = json.loads(base_file.read_text(encoding="utf-8"))
+    assert data_clean["clone_count"] == 0
+    assert len(data_clean["fingerprints"]) == 0
+
+
+def test_cli_prune_baseline_with_unstaged_diff(tmp_path: Path, monkeypatch: Any, capsys: Any) -> None:
+    """Test CLI output for --prune-baseline when unstaged git changes protect entries."""
+    src_dir = tmp_path / "cli_dirty"
+    src_dir.mkdir()
+    f1 = src_dir / "mod1.py"
+    f2 = src_dir / "mod2.py"
+    code = "def compute_val(x, y):\n    res = x * y\n    print(res)\n    return res + 1\n"
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+
+    cli_base = tmp_path / "cli_prune_test.json"
+    pydoppelgangerhunt.main([
+        str(src_dir),
+        "--threshold", "0.70",
+        "--min-lines", "3",
+        "--min-tokens", "5",
+        "--record-baseline", str(cli_base),
+    ])
+    assert cli_base.exists()
+
+    # Now mod2 has different function, mod1 has unstaged changes
+    f2.write_text("def different_function():\n    return 42\n", encoding="utf-8")
+    norm_f1 = str(f1.resolve()).replace("\\", "/")
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff.get_git_modified_line_ranges",
+        lambda since_ref=None, repo_root=None: {norm_f1: [(1, 5)]},
+    )
+
+    exit_code = pydoppelgangerhunt.main([
+        str(src_dir),
+        "--threshold", "0.70",
+        "--min-lines", "3",
+        "--min-tokens", "5",
+        "--baseline", str(cli_base),
+        "--prune-baseline",
+    ])
+    assert exit_code == 0
+    captured = capsys.readouterr().out
+    assert "skipped due to unstaged git changes" in captured
+
 
 
 

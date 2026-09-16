@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 def compute_unit_structural_hash(unit: Dict[str, Any]) -> str:
@@ -29,6 +29,26 @@ def _format_paired_endpoints(ep1: str, ep2: str) -> str:
     """Formats two endpoints into an order-invariant clone pair representation."""
     ordered = sorted([ep1, ep2])
     return f"{ordered[0]} <===> {ordered[1]}"
+
+
+def extract_unit_namespace(file_path: str) -> str:
+    """Extracts canonical module/package directory namespace from a file path."""
+    norm_path = file_path.replace("\\", "/").strip()
+    if norm_path.startswith("./"):
+        norm_path = norm_path[2:]
+    if "/" not in norm_path:
+        return "."
+    parent = norm_path.rsplit("/", 1)[0]
+    return parent if parent else "."
+
+
+def namespaced_structural_fingerprint(u1: Dict[str, Any], u2: Dict[str, Any]) -> str:
+    """Computes order-invariant structural content fingerprint bound to module/package namespaces."""
+    ns1 = extract_unit_namespace(u1.get("file", ""))
+    ns2 = extract_unit_namespace(u2.get("file", ""))
+    h1 = compute_unit_structural_hash(u1)
+    h2 = compute_unit_structural_hash(u2)
+    return _format_paired_endpoints(f"{ns1}#{h1}", f"{ns2}#{h2}")
 
 
 def pure_structural_fingerprint(u1: Dict[str, Any], u2: Dict[str, Any]) -> str:
@@ -62,7 +82,7 @@ def record_baseline(
 ) -> str:
     """Records detected clones into a JSON baseline file for grandfathering."""
     data: Dict[str, Any] = {
-        "version": "1.2.0",
+        "version": "1.3.0",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "target": target,
         "threshold": threshold,
@@ -71,14 +91,17 @@ def record_baseline(
             {
                 "fingerprint": clone_pair_fingerprint(u1, u2),
                 "structural_fingerprint": clone_pair_structural_fingerprint(u1, u2),
+                "namespaced_structural_fingerprint": namespaced_structural_fingerprint(u1, u2),
                 "pure_structural_fingerprint": pure_structural_fingerprint(u1, u2),
                 "similarity": round(sim, 4),
                 "file_a": u1["file"].replace("\\", "/"),
                 "name_a": u1["name"],
                 "hash_a": compute_unit_structural_hash(u1),
+                "namespace_a": extract_unit_namespace(u1["file"]),
                 "file_b": u2["file"].replace("\\", "/"),
                 "name_b": u2["name"],
                 "hash_b": compute_unit_structural_hash(u2),
+                "namespace_b": extract_unit_namespace(u2["file"]),
             }
             for sim, u1, u2 in clones
         ],
@@ -89,27 +112,118 @@ def record_baseline(
     return str(target_p)
 
 
+class BaselineFingerprints(set):  # type: ignore[type-arg]
+    """Set of baseline fingerprints with structured record metadata for granular disambiguation."""
+
+    def __init__(
+        self,
+        fps: Optional[Set[str]] = None,
+        records: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        super().__init__(fps or set())
+        self.records: List[Dict[str, Any]] = records or []
+
+
 def load_baseline(baseline_path: str) -> Set[str]:
     """Loads grandfathered clone fingerprints and structural hashes from a JSON baseline file."""
     path = Path(baseline_path)
     if not path.exists():
-        return set()
+        return BaselineFingerprints()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         fingerprints = data.get("fingerprints", [])
         fps: Set[str] = set()
+        records: List[Dict[str, Any]] = []
         for item in fingerprints:
-            if "fingerprint" in item and item["fingerprint"]:
-                fps.add(item["fingerprint"])
+            if not isinstance(item, dict):
+                continue
+            rec = dict(item)
+            if "fingerprint" in item:
+                fp_str = str(item["fingerprint"])
+                if fp_str:
+                    fps.add(fp_str)
+                parts = fp_str.split(" <===> ")
+                if len(parts) == 2:
+                    for idx, suffix in enumerate(["a", "b"]):
+                        if ":" in parts[idx]:
+                            f_val, n_val = parts[idx].rsplit(":", 1)
+                            rec.setdefault(f"file_{suffix}", f_val)
+                            rec.setdefault(f"name_{suffix}", n_val)
+
             if "structural_fingerprint" in item and item["structural_fingerprint"]:
                 fps.add(item["structural_fingerprint"])
+            if "namespaced_structural_fingerprint" in item and item["namespaced_structural_fingerprint"]:
+                fps.add(item["namespaced_structural_fingerprint"])
+            elif "hash_a" in item and "hash_b" in item and item["hash_a"] and item["hash_b"]:
+                ns_a = item.get("namespace_a") or extract_unit_namespace(rec.get("file_a", ""))
+                ns_b = item.get("namespace_b") or extract_unit_namespace(rec.get("file_b", ""))
+                rec["namespace_a"] = ns_a
+                rec["namespace_b"] = ns_b
+                ns_sfp = _format_paired_endpoints(f"{ns_a}#{item['hash_a']}", f"{ns_b}#{item['hash_b']}")
+                rec["namespaced_structural_fingerprint"] = ns_sfp
+                fps.add(ns_sfp)
+
             if "pure_structural_fingerprint" in item and item["pure_structural_fingerprint"]:
                 fps.add(item["pure_structural_fingerprint"])
             elif "hash_a" in item and "hash_b" in item and item["hash_a"] and item["hash_b"]:
-                fps.add(_format_paired_endpoints(str(item["hash_a"]), str(item["hash_b"])))
-        return fps
+                pure_sfp = _format_paired_endpoints(str(item["hash_a"]), str(item["hash_b"]))
+                rec["pure_structural_fingerprint"] = pure_sfp
+                fps.add(pure_sfp)
+
+            records.append(rec)
+        return BaselineFingerprints(fps, records=records)
     except (json.JSONDecodeError, OSError):
-        return set()
+        return BaselineFingerprints()
+
+
+def _match_clone_record(
+    c_keys: Dict[str, Any],
+    unconsumed: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Finds matching unconsumed baseline record prioritizing exact and namespaced fingerprints."""
+    c_fp = c_keys["fp"]
+    c_sfp = c_keys["sfp"]
+    c_ns_sfp = c_keys["ns_sfp"]
+    c_pure_sfp = c_keys["pure_sfp"]
+    c_namespaces = c_keys["namespaces"]
+    c_names = c_keys["names"]
+
+    # Pass 1: exact symbol-path fingerprint
+    for rec in unconsumed:
+        if rec.get("fingerprint") == c_fp:
+            return rec
+
+    # Pass 2: exact path-structural fingerprint
+    for rec in unconsumed:
+        if rec.get("structural_fingerprint") == c_sfp:
+            return rec
+
+    # Pass 3: namespaced structural fingerprint (file renamed within package)
+    for rec in unconsumed:
+        if rec.get("namespaced_structural_fingerprint") == c_ns_sfp:
+            return rec
+
+    # Pass 4: pure structural fingerprint with matching namespaces
+    for rec in unconsumed:
+        if rec.get("pure_structural_fingerprint") == c_pure_sfp:
+            rec_ns = sorted([
+                rec.get("namespace_a") or extract_unit_namespace(rec.get("file_a", "")),
+                rec.get("namespace_b") or extract_unit_namespace(rec.get("file_b", "")),
+            ])
+            if rec_ns == c_namespaces:
+                return rec
+
+    # Pass 5: pure structural fingerprint fallback for cross-namespace moved files with matching symbols
+    for rec in unconsumed:
+        if rec.get("pure_structural_fingerprint") == c_pure_sfp:
+            h_a = str(rec.get("hash_a", ""))
+            h_b = str(rec.get("hash_b", ""))
+            if h_a and h_b and h_a != h_b:
+                rec_names = sorted([rec.get("name_a", ""), rec.get("name_b", "")])
+                if not rec_names[0] or rec_names == c_names:
+                    return rec
+
+    return None
 
 
 def filter_clones_by_baseline(
@@ -120,97 +234,215 @@ def filter_clones_by_baseline(
     if not baseline_fingerprints:
         return clones, 0
 
-    new_clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
-    suppressed_count = 0
+    records = getattr(baseline_fingerprints, "records", None)
+    if records:
+        unconsumed = list(records)
+        new_clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
+        suppressed_count = 0
+        for sim, u1, u2 in clones:
+            c_keys = {
+                "fp": clone_pair_fingerprint(u1, u2),
+                "sfp": clone_pair_structural_fingerprint(u1, u2),
+                "ns_sfp": namespaced_structural_fingerprint(u1, u2),
+                "pure_sfp": pure_structural_fingerprint(u1, u2),
+                "namespaces": sorted([
+                    extract_unit_namespace(u1.get("file", "")),
+                    extract_unit_namespace(u2.get("file", "")),
+                ]),
+                "names": sorted([u1.get("name", ""), u2.get("name", "")]),
+            }
+            matched_rec = _match_clone_record(c_keys, unconsumed)
+            if matched_rec is not None:
+                suppressed_count += 1
+                unconsumed.remove(matched_rec)
+            else:
+                new_clones.append((sim, u1, u2))
+        return new_clones, suppressed_count
+
+    # Consumable set-based matching if a plain set was provided
+    new_clones_plain: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
+    suppressed_count_plain = 0
+    avail_fps = set(baseline_fingerprints)
     for sim, u1, u2 in clones:
         fp = clone_pair_fingerprint(u1, u2)
         sfp = clone_pair_structural_fingerprint(u1, u2)
+        ns_sfp = namespaced_structural_fingerprint(u1, u2)
         pure_sfp = pure_structural_fingerprint(u1, u2)
-        if (
-            fp in baseline_fingerprints
-            or sfp in baseline_fingerprints
-            or pure_sfp in baseline_fingerprints
-        ):
-            suppressed_count += 1
+        matched_key: Optional[str] = None
+        if fp in avail_fps:
+            matched_key = fp
+        elif sfp in avail_fps:
+            matched_key = sfp
+        elif ns_sfp in avail_fps:
+            matched_key = ns_sfp
+        elif pure_sfp in avail_fps:
+            matched_key = pure_sfp
+
+        if matched_key is not None:
+            suppressed_count_plain += 1
+            avail_fps.remove(matched_key)
         else:
-            new_clones.append((sim, u1, u2))
-    return new_clones, suppressed_count
+            new_clones_plain.append((sim, u1, u2))
+    return new_clones_plain, suppressed_count_plain
+
+
+class PruneResult(tuple):  # type: ignore[type-arg]
+    """Result of prune_baseline with backward-compatible 2-tuple unpacking."""
+
+    def __new__(
+        cls,
+        pruned_count: int,
+        retained_count: int,
+        skipped_dirty_count: int = 0,
+    ) -> PruneResult:
+        return super().__new__(cls, (pruned_count, retained_count))
+
+    def __init__(
+        self,
+        pruned_count: int,
+        retained_count: int,
+        skipped_dirty_count: int = 0,
+    ) -> None:
+        super().__init__()
+        self.pruned_count = pruned_count
+        self.retained_count = retained_count
+        self.skipped_dirty_count = skipped_dirty_count
 
 
 def prune_baseline(
     baseline_path: str,
     active_clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
-) -> Tuple[int, int]:
+    unstaged_modified_ranges: Optional[Dict[str, List[Tuple[int, int]]]] = None,
+) -> PruneResult:
     """Prunes dead or refactored clone fingerprints from an existing baseline file.
 
     Returns:
-        A tuple of (pruned_count, retained_count).
+        A PruneResult tuple of (pruned_count, retained_count).
     """
     path = Path(baseline_path)
     if not path.exists():
-        return 0, 0
+        return PruneResult(0, 0, 0)
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return 0, 0
+        return PruneResult(0, 0, 0)
 
     if not isinstance(data, dict) or "fingerprints" not in data:
-        return 0, 0
+        return PruneResult(0, 0, 0)
+
+    if unstaged_modified_ranges is None:
+        try:
+            # pylint: disable=import-outside-toplevel
+            from pydoppelgangerhunt.git_diff import get_git_modified_line_ranges
+            unstaged_modified_ranges = get_git_modified_line_ranges(since_ref=None)
+        except Exception:  # pylint: disable=broad-exception-caught
+            unstaged_modified_ranges = {}
 
     active_fps: Set[str] = set()
     active_sfps: Set[str] = set()
+    active_ns_sfps: Set[str] = set()
     active_pure_sfps: Set[str] = set()
-    pure_sfp_to_clone: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+    ns_sfp_to_clone: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+    pure_sfp_to_clones: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
 
     for _sim, u1, u2 in active_clones:
         fp = clone_pair_fingerprint(u1, u2)
         sfp = clone_pair_structural_fingerprint(u1, u2)
+        ns_sfp = namespaced_structural_fingerprint(u1, u2)
         pure_sfp = pure_structural_fingerprint(u1, u2)
         active_fps.add(fp)
         active_sfps.add(sfp)
+        active_ns_sfps.add(ns_sfp)
         active_pure_sfps.add(pure_sfp)
-        pure_sfp_to_clone[pure_sfp] = (u1, u2)
+        ns_sfp_to_clone[ns_sfp] = (u1, u2)
+        pure_sfp_to_clones.setdefault(pure_sfp, []).append((u1, u2))
 
     retained: List[Dict[str, Any]] = []
     pruned_count = 0
+    skipped_dirty_count = 0
 
     for item in data.get("fingerprints", []):
+        if not isinstance(item, dict):
+            continue
         item_fp = item.get("fingerprint")
         item_sfp = item.get("structural_fingerprint")
+        item_ns_sfp = item.get("namespaced_structural_fingerprint")
         item_pure_sfp = item.get("pure_structural_fingerprint")
-        if not item_pure_sfp and "hash_a" in item and "hash_b" in item:
-            item_pure_sfp = _format_paired_endpoints(str(item["hash_a"]), str(item["hash_b"]))
+        h_a = str(item.get("hash_a", ""))
+        h_b = str(item.get("hash_b", ""))
+
+        if not item_ns_sfp and h_a and h_b:
+            ns_a = item.get("namespace_a") or extract_unit_namespace(item.get("file_a", ""))
+            ns_b = item.get("namespace_b") or extract_unit_namespace(item.get("file_b", ""))
+            item_ns_sfp = _format_paired_endpoints(f"{ns_a}#{h_a}", f"{ns_b}#{h_b}")
+            item["namespaced_structural_fingerprint"] = item_ns_sfp
+            item["namespace_a"] = ns_a
+            item["namespace_b"] = ns_b
+
+        if not item_pure_sfp and h_a and h_b:
+            item_pure_sfp = _format_paired_endpoints(h_a, h_b)
+            item["pure_structural_fingerprint"] = item_pure_sfp
 
         is_active = bool(
             (item_fp and item_fp in active_fps)
             or (item_sfp and item_sfp in active_sfps)
-            or (item_pure_sfp and item_pure_sfp in active_pure_sfps)
+            or (item_ns_sfp and item_ns_sfp in active_ns_sfps)
         )
 
+        matched_clone: Optional[Tuple[Dict[str, Any], Dict[str, Any]]] = None
+
+        if not is_active and item_pure_sfp and item_pure_sfp in active_pure_sfps:
+            item_ns = sorted([
+                item.get("namespace_a") or extract_unit_namespace(item.get("file_a", "")),
+                item.get("namespace_b") or extract_unit_namespace(item.get("file_b", "")),
+            ])
+            item_names = sorted([item.get("name_a", ""), item.get("name_b", "")])
+            for u1, u2 in pure_sfp_to_clones.get(item_pure_sfp, []):
+                u_ns = sorted([extract_unit_namespace(u1["file"]), extract_unit_namespace(u2["file"])])
+                u_names = sorted([u1.get("name", ""), u2.get("name", "")])
+                if u_ns == item_ns or (h_a != h_b and u_names == item_names):
+                    is_active = True
+                    matched_clone = (u1, u2)
+                    break
+
         if is_active:
-            if item_pure_sfp:
-                item["pure_structural_fingerprint"] = item_pure_sfp
-            # If the entry matched solely via pure_sfp (e.g. file was moved or renamed),
-            # synchronize the file paths and path-bound fingerprints to the new location.
+            if not matched_clone and item_ns_sfp and item_ns_sfp in ns_sfp_to_clone:
+                matched_clone = ns_sfp_to_clone[item_ns_sfp]
+
             if (
-                item_fp not in active_fps
-                and item_sfp not in active_sfps
-                and item_pure_sfp in pure_sfp_to_clone
+                matched_clone
+                and (item_fp not in active_fps or item_sfp not in active_sfps)
             ):
-                u1, u2 = pure_sfp_to_clone[item_pure_sfp]
+                u1, u2 = matched_clone
                 item["file_a"] = u1["file"].replace("\\", "/")
                 item["file_b"] = u2["file"].replace("\\", "/")
                 item["name_a"] = u1["name"]
                 item["name_b"] = u2["name"]
+                item["namespace_a"] = extract_unit_namespace(u1["file"])
+                item["namespace_b"] = extract_unit_namespace(u2["file"])
                 item["fingerprint"] = clone_pair_fingerprint(u1, u2)
                 item["structural_fingerprint"] = clone_pair_structural_fingerprint(u1, u2)
+                item["namespaced_structural_fingerprint"] = namespaced_structural_fingerprint(u1, u2)
             retained.append(item)
         else:
-            pruned_count += 1
+            f_a = item.get("file_a", "").replace("\\", "/")
+            f_b = item.get("file_b", "").replace("\\", "/")
+            is_dirty = bool(
+                unstaged_modified_ranges
+                and (
+                    any(f_a == k or f_a.endswith(k) or k.endswith(f_a) for k in unstaged_modified_ranges)
+                    or any(f_b == k or f_b.endswith(k) or k.endswith(f_b) for k in unstaged_modified_ranges)
+                )
+            )
+            if is_dirty:
+                skipped_dirty_count += 1
+                retained.append(item)
+            else:
+                pruned_count += 1
 
-    data["version"] = "1.2.0"
+    data["version"] = "1.3.0"
     data["clone_count"] = len(retained)
     data["fingerprints"] = retained
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    return pruned_count, len(retained)
+    return PruneResult(pruned_count, len(retained), skipped_dirty_count)
