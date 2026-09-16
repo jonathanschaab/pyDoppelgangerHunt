@@ -42,6 +42,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.naked_continues: int = 0
         self.local_imports: List[str] = []
         self.imported_names: Dict[str, str] = {}
+        self.yield_expr_names: List[Tuple[str, str]] = []
 
     def _record_arg(
         self,
@@ -218,12 +219,17 @@ class _ScopeVisitor(ast.NodeVisitor):
         self._record_loop_control(is_break=False)
         self.generic_visit(node)
 
-    def visit_Yield(self, node: ast.Yield) -> None:
+    def _record_yield_expr(self, kind: str, node: Union[ast.Yield, ast.YieldFrom]) -> None:
         self.has_yield = True
+        if node.value is not None and isinstance(node.value, ast.Name):
+            self.yield_expr_names.append((kind, node.value.id))
+
+    def visit_Yield(self, node: ast.Yield) -> None:
+        self._record_yield_expr("yield", node)
         self.generic_visit(node)
 
     def visit_YieldFrom(self, node: ast.YieldFrom) -> None:
-        self.has_yield = True
+        self._record_yield_expr("yield_from", node)
         self.generic_visit(node)
 
     def visit_Return(self, node: ast.Return) -> None:
@@ -278,6 +284,7 @@ def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
         "has_yield": False,
         "has_return": False,
         "local_imports": [],
+        "yield_expr_names": [],
     }
     if not dedented.strip():
         return empty_res
@@ -350,6 +357,11 @@ def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
         outputs = []
 
     # Nonlocal variables are marked as outputs only when stored (mutated) within this unit.
+    # When a nested function modifies an enclosing variable via 'nonlocal', that mutation
+    # is an external side effect from the perspective of the nested function, so the mutated
+    # variable must be included in the nested function's outputs to allow callers or parent
+    # scopes to receive the updated value. Conversely, read-only nonlocals act strictly as
+    # inputs and are omitted from outputs.
     for nl in visitor.nonlocals:
         if nl in visitor.stores and nl not in outputs:
             outputs.append(nl)
@@ -370,6 +382,7 @@ def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
         "has_yield": visitor.has_yield,
         "has_return": visitor.has_return,
         "local_imports": visitor.local_imports,
+        "yield_expr_names": visitor.yield_expr_names,
     }
 
 
@@ -403,6 +416,7 @@ def analyze_unit_variable_scope(
         has_yield = info1["has_yield"] or info2["has_yield"]
         has_return = info1["has_return"] or info2["has_return"]
         local_imports = list(dict.fromkeys(info1["local_imports"] + info2["local_imports"]))
+        yield_expr_names = info1["yield_expr_names"] + info2["yield_expr_names"]
     else:
         inputs = info1["inputs"]
         outputs = info1["outputs"]
@@ -417,6 +431,7 @@ def analyze_unit_variable_scope(
         has_yield = info1["has_yield"]
         has_return = info1["has_return"]
         local_imports = info1["local_imports"]
+        yield_expr_names = info1["yield_expr_names"]
 
     locals_ = [var for var in info1["stores"] if var not in inputs]
     return {
@@ -435,6 +450,7 @@ def analyze_unit_variable_scope(
         "has_yield": has_yield,
         "has_return": has_return,
         "local_imports": local_imports,
+        "yield_expr_names": yield_expr_names,
     }
 
 
@@ -449,11 +465,71 @@ def _merge_types(t1: Optional[str], t2: Optional[str], strategy: str) -> str:
     return t1 or t2 or "Any"
 
 
-def _extract_required_typing_imports(text: str) -> List[str]:
-    """Identifies typing symbols referenced in generated signatures or annotations."""
-    candidates = ("Any", "Dict", "Iterator", "List", "Optional", "Set", "Tuple", "Union")
-    tokens = set(re.findall(r"\b[A-Za-z_]\w*\b", text))
-    return [c for c in candidates if c in tokens]
+TYPING_SYMBOLS: Set[str] = {
+    "Any", "Callable", "Dict", "Generator", "Iterable",
+    "Iterator", "List", "Optional", "Sequence", "Set", "Tuple", "Union",
+}
+
+
+def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
+    """Identifies typing symbols referenced in type annotations via AST inspection."""
+    text = signature_or_func_text.strip()
+    tree: Optional[ast.AST] = None
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        pass
+
+    if tree is None and "->" in text:
+        parts = text.split("->", 1)
+        params_part = parts[0].strip()
+        if params_part.startswith("(") and params_part.endswith(")"):
+            params_part = params_part[1:-1].strip()
+        ret_part = parts[1].strip()
+        try:
+            tree = ast.parse(f"def _sig_wrapper({params_part}) -> {ret_part}: pass")
+        except SyntaxError:
+            pass
+
+    if tree is None:
+        try:
+            tree = ast.parse(f"def _sig_wrapper({text}): pass")
+        except SyntaxError:
+            pass
+
+    if tree is None:
+        tokens = set(re.findall(r"\b[A-Za-z_]\w*\b", text))
+        return sorted(s for s in TYPING_SYMBOLS if s in tokens)
+
+    has_defs = any(
+        isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.AnnAssign))
+        for n in ast.walk(tree)
+    )
+    needed: Set[str] = set()
+    for node in ast.walk(tree):
+        annotations: List[ast.AST] = []
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.returns is not None:
+                annotations.append(node.returns)
+            all_args = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+            if node.args.vararg:
+                all_args.append(node.args.vararg)
+            if node.args.kwarg:
+                all_args.append(node.args.kwarg)
+            for a in all_args:
+                if a.annotation is not None:
+                    annotations.append(a.annotation)
+        elif isinstance(node, ast.AnnAssign):
+            if node.annotation is not None:
+                annotations.append(node.annotation)
+        elif not has_defs and isinstance(node, ast.Expr):
+            annotations.append(node.value)
+
+        for ann in annotations:
+            for sub in ast.walk(ann):
+                if isinstance(sub, ast.Name) and sub.id in TYPING_SYMBOLS:
+                    needed.add(sub.id)
+    return sorted(needed)
 
 
 def _get_module_imported_names(source: str) -> Set[str]:
@@ -477,8 +553,13 @@ def _insert_imports_into_module(
     orig_lines: List[str],
     import_lines: List[str],
 ) -> List[str]:
-    """Inserts import statements after module docstring and future imports."""
+    """Inserts import statements after module docstring and future imports, deduplicating existing statements."""
     if not import_lines:
+        return orig_lines
+
+    existing_stripped = {ln.strip() for ln in orig_lines}
+    deduped_imports = [imp for imp in import_lines if imp.strip() not in existing_stripped]
+    if not deduped_imports:
         return orig_lines
 
     insert_idx = 0
@@ -520,7 +601,7 @@ def _insert_imports_into_module(
         while insert_idx < len(orig_lines) and not orig_lines[insert_idx].strip():
             insert_idx += 1
 
-    formatted = [imp.rstrip("\r\n") + "\n" for imp in import_lines]
+    formatted = [imp.rstrip("\r\n") + "\n" for imp in deduped_imports]
     return orig_lines[:insert_idx] + formatted + ["\n"] + orig_lines[insert_idx:]
 
 
@@ -642,7 +723,27 @@ def synthesize_shared_helper_code(
 
     outputs = list(scope.get("outputs", []))
     if scope.get("has_yield"):
-        return_type = "Iterator[Any]"
+        inferred_yield_type = None
+        for kind, name in scope.get("yield_expr_names", []):
+            m_t = meta1.get(name, {}).get("type") or meta2.get(name, {}).get("type")
+            if not m_t:
+                continue
+            if kind == "yield":
+                inferred_yield_type = m_t
+                break
+            if kind == "yield_from":
+                for prefix in ("Iterator[", "Iterable[", "List[", "Sequence[", "Set["):
+                    if m_t.startswith(prefix) and m_t.endswith("]"):
+                        inferred_yield_type = m_t[len(prefix) : -1].strip()
+                        break
+                if inferred_yield_type:
+                    break
+        if resolved_ret != "Any":
+            return_type = resolved_ret
+        elif inferred_yield_type:
+            return_type = f"Iterator[{inferred_yield_type}]"
+        else:
+            return_type = "Iterator[Any]"
     elif len(outputs) >= 2:
         out_types = []
         for out_var in outputs:

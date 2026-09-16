@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from unittest import mock
 import pydoppelgangerhunt
 
 from pydoppelgangerhunt import (
@@ -11,7 +12,6 @@ from pydoppelgangerhunt import (
     analyze_unit_variable_scope,
     check_asymmetric_coverage,
     check_temporal_divergence,
-    clone_pair_structural_fingerprint,
     cluster_clone_families,
     colorize,
     compute_repository_dry_stats,
@@ -35,6 +35,10 @@ from pydoppelgangerhunt import (
     supports_color,
     synthesize_refactoring_suggestion,
     synthesize_shared_helper_code,
+)
+from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
+    _extract_required_typing_imports,
+    _insert_imports_into_module,
 )
 
 
@@ -411,8 +415,6 @@ def test_temporal_divergence_detection() -> None:
     now = 1700000000
     b1 = {"timestamp": now, "author": "Alice", "commit": "abc1234"}
     b2 = {"timestamp": now - (120 * 86400), "author": "Bob", "commit": "def5678"}
-
-    import unittest.mock as mock
 
     with mock.patch("pydoppelgangerhunt.git_diff.get_git_blame_info", side_effect=[b1, b2]):
         res = check_temporal_divergence(u1, u2, max_divergence_days=90)
@@ -1158,6 +1160,104 @@ def test_fixer_control_flow_and_side_effect_safety(tmp_path: Path) -> None:
     assert "Tuple" in patch
 
 
+def test_fixer_feedback_and_advanced_robustness(tmp_path: Path) -> None:
+    """Verifies nested nonlocals, typed generator inference, import dedup, and AST typing extraction."""
+    # 1. Nested function scoping with nonlocals (mutated vs read-only)
+    file_nested = tmp_path / "nested_nonlocal.py"
+    file_nested.write_text(
+        "def outer():\n"
+        "    count = 0\n"
+        "    def inner():\n"
+        "        nonlocal count\n"
+        "        count += 1\n"
+        "    return inner\n",
+        encoding="utf-8",
+    )
+    u_inner = {
+        "file": str(file_nested),
+        "start": 3,
+        "end": 5,
+        "name": "outer:inner",
+        "kind": "function",
+    }
+    scope_inner = analyze_unit_variable_scope(u_inner)
+    assert "count" in scope_inner["outputs"]
 
+    file_ro = tmp_path / "nested_nonlocal_ro.py"
+    file_ro.write_text(
+        "def outer():\n"
+        "    base = 10\n"
+        "    def inner(x):\n"
+        "        nonlocal base\n"
+        "        return x + base\n"
+        "    return inner\n",
+        encoding="utf-8",
+    )
+    u_ro = {
+        "file": str(file_ro),
+        "start": 3,
+        "end": 5,
+        "name": "outer:inner",
+        "kind": "function",
+    }
+    scope_ro = analyze_unit_variable_scope(u_ro)
+    assert "base" in scope_ro["inputs"]
+    assert "base" not in scope_ro["outputs"]
 
+    # 2. Generator return type inference for yield from and typed yield
+    file_gen_from = tmp_path / "gen_yield_from.py"
+    file_gen_from.write_text(
+        "def stream_items(src: List[str]):\n"
+        "    yield from src\n",
+        encoding="utf-8",
+    )
+    u_gen_from = {
+        "file": str(file_gen_from),
+        "start": 1,
+        "end": 2,
+        "name": "stream_items",
+        "kind": "function",
+    }
+    helper_gen_from = synthesize_shared_helper_code(u_gen_from, u_gen_from, include_imports=True)
+    assert "-> Iterator[str]:" in helper_gen_from
+    assert "from typing import Iterator, List" in helper_gen_from
 
+    file_gen_val = tmp_path / "gen_yield_val.py"
+    file_gen_val.write_text(
+        "def yield_single(val: int):\n"
+        "    yield val\n",
+        encoding="utf-8",
+    )
+    u_gen_val = {
+        "file": str(file_gen_val),
+        "start": 1,
+        "end": 2,
+        "name": "yield_single",
+        "kind": "function",
+    }
+    helper_gen_val = synthesize_shared_helper_code(u_gen_val, u_gen_val)
+    assert "-> Iterator[int]:" in helper_gen_val
+
+    # 3. Import deduplication in _insert_imports_into_module
+    orig_lines = ["from typing import Tuple\n", "import os\n"]
+    res_dedup = _insert_imports_into_module(orig_lines, ["from typing import Tuple"])
+    assert res_dedup == orig_lines
+
+    new_lines = _insert_imports_into_module(orig_lines, ["from typing import List"])
+    assert "from typing import List\n" in new_lines
+
+    # 4. AST-based typing symbol extraction with shadowing parameter immunity
+    shadow_func = "def helper(Tuple: int, List: str) -> None:\n    pass\n"
+    extracted_shadow = _extract_required_typing_imports(shadow_func)
+    assert "Tuple" not in extracted_shadow
+    assert "List" not in extracted_shadow
+
+    real_func = "def helper(items: List[str]) -> Tuple[int, Optional[str]]:\n    pass\n"
+    extracted_real = _extract_required_typing_imports(real_func)
+    assert extracted_real == ["List", "Optional", "Tuple"]
+
+    # Raw signature without wrapper
+    sig_raw = "x: Dict[str, Any]"
+    extracted_sig = _extract_required_typing_imports(sig_raw)
+    assert "Dict" in extracted_sig
+    assert "Any" in extracted_sig
