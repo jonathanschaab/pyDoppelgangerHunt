@@ -4169,6 +4169,103 @@ def test_backslash_relative_path_normalization_on_unit(tmp_path: Path) -> None:
     assert "+++ b/pkg/service.py" in patch
 
 
+def test_cross_class_clone_call_site_receiver_arguments(tmp_path: Path) -> None:
+    """Verifies that cross-class method clones preserve receiver arguments at both call sites."""
+    code = (
+        "class WorkerA:\n"
+        "    def execute(self, payload: str) -> str:\n"
+        "        return payload.strip().lower()\n"
+        "\n"
+        "class WorkerB:\n"
+        "    def run_task(self, payload: str) -> str:\n"
+        "        return payload.strip().lower()\n"
+    )
+    f = tmp_path / "workers.py"
+    f.write_text(code, encoding="utf-8")
+
+    u1 = {"file": "workers.py", "start": 2, "end": 3, "name": "execute", "kind": "function"}
+    u2 = {"file": "workers.py", "start": 6, "end": 7, "name": "run_task", "kind": "function"}
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert "def _shared_execute_run_task(self: Any, payload: str)" in patch
+    assert "+        return _shared_execute_run_task(self, payload)" in patch
+    # Verify WorkerB also passes self, not just WorkerA
+    count_self_call = patch.count("_shared_execute_run_task(self, payload)")
+    assert count_self_call == 2
+
+
+def test_annassign_without_value_not_treated_as_definite_assignment(tmp_path: Path) -> None:
+    """Verifies that type annotations without values do not prevent conditional output initialization."""
+    from pydoppelgangerhunt.fixer import _analyze_block_assignment, synthesize_shared_helper_code  # pylint: disable=import-outside-toplevel
+
+    tree = ast.parse("res: int\nif flag:\n    res = 42\n")
+    definite, conditional = _analyze_block_assignment(tree.body)
+    assert "res" not in definite
+    assert "res" in conditional
+
+    code = "res: int\nif flag:\n    res = 42\n"
+    f = tmp_path / "ann.py"
+    f.write_text(code, encoding="utf-8")
+    u1 = {"file": "ann.py", "start": 1, "end": 3, "name": "block", "kind": "compound_block"}
+    helper = synthesize_shared_helper_code(u1, u1, repo_root=str(tmp_path))
+    assert "res = None" in helper
+
+
+def test_comprehension_multi_generator_scoping(tmp_path: Path) -> None:
+    """Verifies that multi-generator comprehensions do not leak inner loop variables into inputs."""
+    code = "matrix = [[1, 2], [3, 4]]\nflat = [x for row in matrix for x in row]\n"
+    f = tmp_path / "comp_matrix.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {
+        "file": "comp_matrix.py",
+        "start": 2,
+        "end": 2,
+        "start_col": 7,
+        "end_col": 42,
+        "name": "flat_comp",
+        "kind": "comprehension",
+    }
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert "matrix" in scope["inputs"]
+    assert "row" not in scope["inputs"]
+    assert "x" not in scope["inputs"]
+
+
+def test_walrus_operator_comprehension_enclosing_scope(tmp_path: Path) -> None:
+    """Verifies that walrus expressions in comprehensions register as stores in the enclosing scope."""
+    code = "def process_data(items):\n    squared = [val := x * 2 for x in items]\n    return squared, val\n"
+    f = tmp_path / "walrus.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {"file": "walrus.py", "start": 1, "end": 3, "name": "process_data", "kind": "function"}
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert "val" in scope["locals"]
+    assert "val" in scope["outputs"]
+    assert "items" in scope["inputs"]
+    assert "val" not in scope["inputs"]
+
+
+def test_async_comprehension_detected_as_async(tmp_path: Path) -> None:
+    """Verifies that an async comprehension correctly tags its unit scope as async."""
+    code = "async def fetch():\n    results = [x async for x in aiter]\n    return results\n"
+    f = tmp_path / "async_comp.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {
+        "file": "async_comp.py",
+        "start": 2,
+        "end": 2,
+        "start_col": 14,
+        "end_col": 38,
+        "name": "async_listcomp",
+        "kind": "comprehension",
+    }
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert scope["is_async"] is True
+
+
+
 
 
 

@@ -262,23 +262,42 @@ class _ScopeVisitor(ast.NodeVisitor):
                         self.attrs_written.append(attr_name)
         self.generic_visit(node)
 
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.visit(node.annotation)
+        if node.value is not None:
+            self.visit(node.value)
+            if isinstance(node.target, ast.Name):
+                self._record_store_name(node.target.id)
+            else:
+                self.visit(node.target)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.visit(node.value)
+        if isinstance(node.target, ast.Name):
+            target_id = node.target.id
+            if self._scope_stack:
+                self._scope_stack[0].add(target_id)
+            if target_id not in BUILTIN_NAMES and target_id not in self.stores:
+                self.stores.append(target_id)
+
     def _visit_comprehension(
         self,
         node: Union[ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp],
     ) -> None:
-        for gen in node.generators:
-            self.visit(gen.iter)
-        inner_vars: Set[str] = set()
-        for gen in node.generators:
-            for n in ast.walk(gen.target):
-                if isinstance(n, ast.Name):
-                    inner_vars.add(n.id)
         created_outer = False
         if not self._scope_stack:
             self._scope_stack.append(set())
             created_outer = True
+        inner_vars: Set[str] = set()
         self._scope_stack.append(inner_vars)
+        if any(getattr(g, "is_async", False) for g in node.generators):
+            if len(self._scope_stack) <= 2:
+                self.is_async = True
         for gen in node.generators:
+            self.visit(gen.iter)
+            for n in ast.walk(gen.target):
+                if isinstance(n, ast.Name):
+                    inner_vars.add(n.id)
             for if_expr in gen.ifs:
                 self.visit(if_expr)
         if isinstance(node, ast.DictComp):
@@ -427,7 +446,7 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                     if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
                         definite.add(node.id)
         elif isinstance(stmt, ast.AnnAssign):
-            if isinstance(stmt.target, ast.Name):
+            if stmt.value is not None and isinstance(stmt.target, ast.Name):
                 definite.add(stmt.target.id)
         elif isinstance(stmt, ast.AugAssign):
             if isinstance(stmt.target, ast.Name):
@@ -487,7 +506,16 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
         elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             definite.add(stmt.name)
 
-    return definite, conditional
+        for p_node in ast.walk(stmt):
+            if isinstance(p_node, ast.NamedExpr) and isinstance(p_node.target, ast.Name):
+                if isinstance(stmt, ast.Expr):
+                    definite.add(p_node.target.id)
+                elif isinstance(stmt, ast.If) and any(p_node is n for n in ast.walk(stmt.test)):
+                    definite.add(p_node.target.id)
+                else:
+                    conditional.add(p_node.target.id)
+
+    return definite, conditional - definite
 
 
 def _determine_binding_kind(
@@ -2458,11 +2486,13 @@ def generate_refactoring_patch(
                     lead = orig_lines[u_start - 1]
                     indent = lead[: len(lead) - len(lead.lstrip())]
 
+                    t_fn = find_enclosing_function(orig_text, target_unit)
+                    t_enc = find_enclosing_class(orig_text, target_unit)
+                    if not _is_method_of_class(t_fn, t_enc):
+                        t_fn = None
+                    t_kind = _get_enclosing_receiver_kind(t_fn) if t_fn else "none"
+
                     if effective_binding == "method":
-                        t_fn = find_enclosing_function(orig_text, target_unit)
-                        if not _is_method_of_class(t_fn, enc1):
-                            t_fn = None
-                        t_kind = _get_enclosing_receiver_kind(t_fn) if t_fn else "instance"
                         if t_kind == "static":
                             unit_call_prefix = "__class__."
                             unit_receiver_omit = None
@@ -2474,11 +2504,11 @@ def generate_refactoring_patch(
                             unit_receiver_omit = "self"
                     else:
                         unit_call_prefix = ""
-                        t_fn = find_enclosing_function(orig_text, target_unit)
-                        if not _is_method_of_class(t_fn, enc1):
-                            t_fn = None
-                        t_kind = _get_enclosing_receiver_kind(t_fn) if t_fn else "none"
-                        unit_receiver_omit = "receivers" if t_kind in ("static", "none") else None
+                        unit_receiver_omit = (
+                            "receivers"
+                            if t_kind in ("static", "none")
+                            else ("self" if t_kind == "class" else "cls")
+                        )
 
                     unit_args_str = _format_call_arguments(
                         inputs,
