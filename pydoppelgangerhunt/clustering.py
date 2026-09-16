@@ -99,12 +99,19 @@ def cluster_clone_families(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     linkage: str = "single",
     min_similarity_floor: Optional[float] = None,
+    linkage_tolerance: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """Groups pairwise clone detections into Clone Families with configurable linkage.
 
     Supported linkage strategies:
     - 'single': Connected components via Union-Find (transitive chaining).
     - 'complete': Clique partitioning where all pairwise edges must exist and satisfy min_similarity_floor.
+      When linkage_tolerance > 0.0, allows edges >= (min_similarity_floor - linkage_tolerance)
+      provided mean cross-cluster similarity >= min_similarity_floor.
+    - 'quasi_complete': Tolerance-bounded complete linkage designed for Type-3 clone families,
+      defaulting to linkage_tolerance=0.05 if unspecified. Requires all cross-cluster edges
+      to meet >= (min_similarity_floor - linkage_tolerance) and mean cross-cluster similarity
+      >= min_similarity_floor.
     - 'average': Hierarchical agglomerative clustering requiring mean cross-cluster pairwise
       similarity >= min_similarity_floor. Note that this enforces "average threshold" semantics
       over all cross-cluster candidate pairs, unlike complete-linkage's strict "all pairs"
@@ -118,18 +125,32 @@ def cluster_clone_families(
 
     unit_map: Dict[str, Dict[str, Any]] = {}
     sim_matrix: Dict[Tuple[str, str], float] = {}
-    pair_records: List[Tuple[float, str, str]] = []
+    deduped_pairs: Dict[Tuple[str, str], float] = {}
 
     for sim, u1, u2 in clones:
         k1 = unit_key(u1)
         k2 = unit_key(u2)
         unit_map[k1] = u1
         unit_map[k2] = u2
-        sim_matrix[(k1, k2)] = sim
-        sim_matrix[(k2, k1)] = sim
-        pair_records.append((sim, k1, k2))
+        sim_matrix[(k1, k2)] = max(sim_matrix.get((k1, k2), 0.0), sim)
+        sim_matrix[(k2, k1)] = max(sim_matrix.get((k2, k1), 0.0), sim)
+
+        edge_key = (k1, k2) if k1 <= k2 else (k2, k1)
+        deduped_pairs[edge_key] = max(deduped_pairs.get(edge_key, 0.0), sim)
 
     all_keys = sorted(unit_map.keys())
+
+    # Sorted candidate pairs:
+    # 1. Higher similarity first (-round(sim, 9))
+    # 2. Ascending tie-breaking by source key (k1)
+    # 3. Ascending tie-breaking by target key (k2)
+    sorted_pairs: List[Tuple[float, str, str]] = [
+        (sim, edge[0], edge[1])
+        for edge, sim in sorted(
+            deduped_pairs.items(),
+            key=lambda item: (-round(item[1], 9), item[0][0], item[0][1]),
+        )
+    ]
 
     floor = (
         min_similarity_floor
@@ -137,23 +158,28 @@ def cluster_clone_families(
         else (min(sim for sim, _, _ in clones) if clones else 0.0)
     )
 
+    effective_tolerance = linkage_tolerance
+    if linkage == "quasi_complete" and effective_tolerance == 0.0:
+        effective_tolerance = 0.05
+
     raw_clusters: List[List[str]] = []
     medoid_cache: Dict[Tuple[str, ...], Tuple[str, float]] = {}
 
     if linkage == "single":
         uf = UnionFind()
-        for _, k1, k2 in pair_records:
+        for _, k1, k2 in sorted_pairs:
             uf.union(k1, k2)
 
         groups: Dict[str, List[str]] = {}
         for k in all_keys:
             root = uf.find(k)
             groups.setdefault(root, []).append(k)
-        raw_clusters = list(groups.values())
+        unique_groups = [sorted(members) for members in groups.values()]
+        raw_clusters = sorted(unique_groups, key=lambda g: (g[0], len(g)))
 
-    elif linkage == "complete":
-        sorted_pairs = sorted(pair_records, key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    elif linkage in ("complete", "quasi_complete"):
         cluster_map: Dict[str, Set[str]] = {k: {k} for k in all_keys}
+        min_allowed_edge = max(0.0, floor - effective_tolerance)
 
         for _, k1, k2 in sorted_pairs:
             c1 = cluster_map[k1]
@@ -162,30 +188,36 @@ def cluster_clone_families(
                 continue
 
             can_merge = True
+            total_cross_sim = 0.0
             for u in c1:
                 for v in c2:
-                    if sim_matrix.get((u, v), 0.0) < floor:
+                    edge_sim = sim_matrix.get((u, v), 0.0)
+                    if edge_sim < min_allowed_edge:
                         can_merge = False
                         break
+                    total_cross_sim += edge_sim
                 if not can_merge:
                     break
+
+            if can_merge and effective_tolerance > 0.0:
+                avg_cross_sim = total_cross_sim / (len(c1) * len(c2))
+                if avg_cross_sim < floor:
+                    can_merge = False
 
             if can_merge:
                 merged = c1 | c2
                 for node in merged:
                     cluster_map[node] = merged
 
-        unique_clusters: List[Set[str]] = []
-        seen_ids: Set[int] = set()
-        for c in cluster_map.values():
-            cid = id(c)
-            if cid not in seen_ids:
-                seen_ids.add(cid)
-                unique_clusters.append(c)
-        raw_clusters = [sorted(c) for c in unique_clusters]
+        unique_clusters_dict: Dict[Tuple[str, ...], List[str]] = {}
+        for k in all_keys:
+            c = cluster_map[k]
+            rep = tuple(sorted(c))
+            if rep not in unique_clusters_dict:
+                unique_clusters_dict[rep] = list(rep)
+        raw_clusters = [unique_clusters_dict[rep] for rep in sorted(unique_clusters_dict.keys())]
 
     elif linkage == "average":
-        sorted_pairs = sorted(pair_records, key=lambda x: (x[0], x[1], x[2]), reverse=True)
         cluster_map = {k: {k} for k in all_keys}
 
         for _, k1, k2 in sorted_pairs:
@@ -202,17 +234,15 @@ def cluster_clone_families(
                 for node in merged:
                     cluster_map[node] = merged
 
-        unique_clusters = []
-        seen_ids = set()
-        for c in cluster_map.values():
-            cid = id(c)
-            if cid not in seen_ids:
-                seen_ids.add(cid)
-                unique_clusters.append(c)
-        raw_clusters = [sorted(c) for c in unique_clusters]
+        unique_clusters_dict = {}
+        for k in all_keys:
+            c = cluster_map[k]
+            rep = tuple(sorted(c))
+            if rep not in unique_clusters_dict:
+                unique_clusters_dict[rep] = list(rep)
+        raw_clusters = [unique_clusters_dict[rep] for rep in sorted(unique_clusters_dict.keys())]
 
     elif linkage in ("medoid", "centroid"):
-        sorted_pairs = sorted(pair_records, key=lambda x: (x[0], x[1], x[2]), reverse=True)
         cluster_map = {k: {k} for k in all_keys}
 
         for _, k1, k2 in sorted_pairs:
@@ -236,18 +266,17 @@ def cluster_clone_families(
                 for node in merged:
                     cluster_map[node] = merged
 
-        unique_clusters = []
-        seen_ids = set()
-        for c in cluster_map.values():
-            cid = id(c)
-            if cid not in seen_ids:
-                seen_ids.add(cid)
-                unique_clusters.append(c)
-        raw_clusters = [sorted(c) for c in unique_clusters]
+        unique_clusters_dict = {}
+        for k in all_keys:
+            c = cluster_map[k]
+            rep = tuple(sorted(c))
+            if rep not in unique_clusters_dict:
+                unique_clusters_dict[rep] = list(rep)
+        raw_clusters = [unique_clusters_dict[rep] for rep in sorted(unique_clusters_dict.keys())]
 
     else:
         raise ValueError(
-            f"Unsupported linkage strategy '{linkage}'. Expected 'single', 'complete', 'average', or 'medoid'."
+            f"Unsupported linkage strategy '{linkage}'. Expected 'single', 'complete', 'quasi_complete', 'average', or 'medoid'."
         )
 
     clusters = [m for m in raw_clusters if len(m) >= 2]
@@ -259,7 +288,7 @@ def cluster_clone_families(
         member_set = set(member_keys)
 
         family_sims = [
-            sim for sim, k1, k2 in pair_records if k1 in member_set and k2 in member_set
+            sim for sim, k1, k2 in sorted_pairs if k1 in member_set and k2 in member_set
         ]
         unique_files = sorted(list({u["file"].replace("\\", "/") for u in members}))
         total_lines = sum(u["end"] - u["start"] + 1 for u in members)
@@ -285,7 +314,15 @@ def cluster_clone_families(
             "total_lines": total_lines,
         })
 
-    families.sort(key=lambda f: (f["member_count"], f["avg_similarity"]), reverse=True)
+    families.sort(
+        key=lambda f: (
+            -f["member_count"],
+            -round(f["avg_similarity"], 9),
+            f["members"][0]["file"].replace("\\", "/"),
+            f["members"][0]["start"],
+            f["medoid"]["name"],
+        )
+    )
     for idx, fam in enumerate(families):
         fam["family_id"] = f"CF-{idx + 1:03d}"
 

@@ -76,15 +76,21 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
     parser.add_argument(
         "--linkage",
         type=str,
-        choices=["single", "complete", "average", "medoid"],
+        choices=["single", "complete", "quasi_complete", "average", "medoid"],
         default=None,
-        help="Clustering linkage strategy for clone families ('single', 'complete', 'average', 'medoid'; default: 'single')",
+        help="Clustering linkage strategy for clone families ('single', 'complete', 'quasi_complete', 'average', 'medoid'; default: 'single')",
     )
     parser.add_argument(
         "--min-cluster-similarity",
         type=float,
         default=None,
         help="Minimum intra-cluster similarity floor for cluster admission/merging (default: match threshold)",
+    )
+    parser.add_argument(
+        "--linkage-tolerance",
+        type=float,
+        default=None,
+        help="Permissible similarity fluctuation margin below floor for complete/quasi-complete linkage (default: 0.0, or 0.05 for quasi_complete)",
     )
     parser.add_argument("--diff-only", action="store_true", help="Only audit lines modified in git (PR diff gating)")
     parser.add_argument("--since", type=str, default=None, help="Git reference / commit / branch to compare against for --diff-only (default: HEAD)")
@@ -367,10 +373,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.min_cluster_similarity is not None
             else float(tool_cfg.get("min_cluster_similarity", threshold))
         )
+        linkage_tol = (
+            args.linkage_tolerance
+            if args.linkage_tolerance is not None
+            else float(tool_cfg.get("linkage_tolerance", 0.0))
+        )
         families = cluster_clone_families(
             clones,
             linkage=linkage_strategy,
             min_similarity_floor=cluster_floor,
+            linkage_tolerance=linkage_tol,
         )
 
     stats: Optional[Dict[str, Any]] = None
