@@ -115,6 +115,7 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
     parser.add_argument("--prune-baseline", action="store_true", help="Prune orphaned fingerprints from baseline JSON file")
     parser.add_argument("--workers", type=int, default=None, help="Number of worker processes for parallel AST harvesting (default: 1)")
     parser.add_argument("--max-index-frequency", type=float, default=None, help="Inverted index frequency threshold to prune ubiquitous shingles (default: 0.25)")
+    parser.add_argument("--min-corpus-units", type=int, default=None, help="Minimum corpus unit count before activating dynamic frequency stop-shingle pruning (default: 4)")
 
     color_group = parser.add_mutually_exclusive_group()
     color_group.add_argument("--color", dest="color", action="store_true", default=None, help="Force colorized terminal output")
@@ -219,12 +220,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     call_seq_enabled = args.call_sequences or bool(tool_cfg.get("call_sequences", False))
     audit_tests_enabled = args.audit_tests or bool(tool_cfg.get("audit_tests", False))
     idioms_enabled = args.idioms or bool(tool_cfg.get("idioms", False))
-    stop_shingles_enabled = args.stop_shingles or bool(tool_cfg.get("stop_shingles", False))
+    stop_shingles_enabled = (
+        args.stop_shingles
+        or args.diff_only
+        or bool(tool_cfg.get("stop_shingles", False))
+    )
 
     max_index_frequency = (
         args.max_index_frequency
         if args.max_index_frequency is not None
         else float(tool_cfg.get("max_index_frequency", 0.25))
+    )
+    min_corpus_size = (
+        args.min_corpus_units
+        if args.min_corpus_units is not None
+        else (int(tool_cfg["min_corpus_units"]) if "min_corpus_units" in tool_cfg else None)
     )
     strip_docstrings = not args.preserve_docstrings
     strip_annotations = True if args.strip_annotations else (not args.preserve_annotations)
@@ -322,6 +332,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         strip_docstrings=strip_docstrings,
         max_index_frequency=max_index_frequency,
         filter_stop_shingles=stop_shingles_enabled,
+        min_corpus_size=min_corpus_size,
     )
 
     if args.record_baseline:

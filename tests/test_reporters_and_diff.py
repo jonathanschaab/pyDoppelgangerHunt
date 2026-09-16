@@ -342,6 +342,9 @@ def test_modular_pydoppelgangerhunt_exports() -> None:
     assert pydoppelgangerhunt.MAJOR_POLICY_THRESHOLD == 0.50
     assert pydoppelgangerhunt.NEW_POLICY_THRESHOLD == 0.80
     assert callable(pydoppelgangerhunt.replace_unit_in_source)
+    assert callable(pydoppelgangerhunt.check_units_overlap)
+    assert callable(pydoppelgangerhunt.filter_overlapping_clone_units)
+    assert callable(pydoppelgangerhunt.refactor_module_units)
 
 
 
@@ -1827,6 +1830,127 @@ def test_complete_linkage_sensitivity_and_quasi_complete(tmp_path: Path) -> None
         "--linkage-tolerance", "0.05",
     ])
     assert exit_code == 1
+
+
+def test_corpus_sensitivity_stop_shingle_pruning_on_differential_runs(tmp_path: Path) -> None:
+    """Verifies that dynamic stop-shingle pruning activates on small corpora (differential PR runs)."""
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    # Create a small module with 6 distinct utility functions sharing common boilerplate logging/guards
+    code_lines = []
+    for i in range(6):
+        code_lines.append(
+            f"def compute_metric_{i}(data: int) -> int:\n"
+            f"    # Standard boilerplate logger invocation\n"
+            f"    if __name__ == '__main__':\n"
+            f"        pass\n"
+            f"    # Distinct algorithmic computation\n"
+            f"    return data ** {i + 2} + {i * 100}\n"
+        )
+    src_file = tmp_path / "pr_diff_sample.py"
+    src_file.write_text("\n".join(code_lines), encoding="utf-8")
+
+    # With min_corpus_size=4 and max_index_frequency=0.25 on a 6-unit corpus:
+    # max_posting_len = max(2, ceil(6 * 0.25)) = 2.
+    # The boilerplate guard appearing in all 6 functions has posting len 6 > 2, so it is pruned!
+    # Because each function's algorithm is distinct, no spurious clones are reported:
+    clones_pruned = scan_target(
+        str(tmp_path),
+        threshold=0.85,
+        min_lines=3,
+        min_tokens=5,
+        max_index_frequency=0.25,
+        min_corpus_size=4,
+    )
+    assert len(clones_pruned) == 0
+
+
+def test_inter_block_overlap_collision_detection_and_reverse_offset_refactoring(tmp_path: Path) -> None:
+    """Verifies overlap collision detection, maximal subset filtering, and reverse-order refactoring."""
+    import pytest  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer import (  # pylint: disable=import-outside-toplevel
+        check_units_overlap,
+        filter_overlapping_clone_units,
+        refactor_module_units,
+    )
+
+    u_outer = {"file": "mod.py", "start": 10, "end": 30, "name": "outer_block"}
+    u_inner = {"file": "mod.py", "start": 15, "end": 25, "name": "inner_block"}
+    u_disjoint = {"file": "mod.py", "start": 40, "end": 50, "name": "disjoint_block"}
+    u_other_file = {"file": "other.py", "start": 10, "end": 30, "name": "other_outer"}
+
+    # 1. Test check_units_overlap
+    assert check_units_overlap(u_outer, u_inner) is True
+    assert check_units_overlap(u_inner, u_outer) is True
+    assert check_units_overlap(u_outer, u_disjoint) is False
+    assert check_units_overlap(u_outer, u_other_file) is False
+
+    # 2. Test filter_overlapping_clone_units
+    # Should prioritize u_outer (21 lines) over u_inner (11 lines), while keeping u_disjoint
+    filtered = filter_overlapping_clone_units([u_inner, u_outer, u_disjoint])
+    assert len(filtered) == 2
+    names = [u["name"] for u in filtered]
+    assert "outer_block" in names
+    assert "disjoint_block" in names
+    assert "inner_block" not in names
+
+    # Empty list edge case
+    assert filter_overlapping_clone_units([]) == []
+
+    # 3. Test refactor_module_units overlap collision exception
+    source_sample = (
+        "line 1\nline 2\nline 3\nline 4\nline 5\n"
+        "line 6\nline 7\nline 8\nline 9\nline 10\n"
+    )
+    rep_col1 = ({"file": "test.py", "start": 2, "end": 5, "name": "c1"}, "NEW_C1\n")
+    rep_col2 = ({"file": "test.py", "start": 4, "end": 7, "name": "c2"}, "NEW_C2\n")
+
+    with pytest.raises(ValueError, match="Overlapping unit collision detected"):
+        refactor_module_units(source_sample, [rep_col1, rep_col2])
+
+    # 4. Test refactor_module_units reverse line order application (no offset drift)
+    # Block A: lines 2-4 (replaced with 1 line)
+    # Block B: lines 7-9 (replaced with 1 line)
+    rep_a = ({"file": "test.py", "start": 2, "end": 4, "name": "block_a"}, "REPLACED_A\n")
+    rep_b = ({"file": "test.py", "start": 7, "end": 9, "name": "block_b"}, "REPLACED_B\n")
+
+    # Pass in forward order: refactor_module_units should internally sort reverse
+    refactored = refactor_module_units(source_sample, [rep_a, rep_b])
+    expected_lines = [
+        "line 1\n",
+        "REPLACED_A\n",
+        "line 5\n",
+        "line 6\n",
+        "REPLACED_B\n",
+        "line 10\n",
+    ]
+    assert refactored == "".join(expected_lines)
+
+    # Empty replacements edge case
+    assert refactor_module_units(source_sample, []) == source_sample
+
+    # 5. Test generate_refactoring_patch with overlapping clone units in the same file
+    f_multi = tmp_path / "multi_clone.py"
+    f_multi.write_text(
+        "def first_task(x: int) -> int:\n"
+        "    a = x * 10\n"
+        "    b = a + 5\n"
+        "    return b\n"
+        "\n"
+        "def second_task(x: int) -> int:\n"
+        "    a = x * 10\n"
+        "    b = a + 5\n"
+        "    return b\n",
+        encoding="utf-8",
+    )
+    u_t1 = {"file": str(f_multi), "start": 1, "end": 4, "name": "first_task"}
+    u_t2 = {"file": str(f_multi), "start": 6, "end": 9, "name": "second_task"}
+
+    # Non-overlapping clones in the same file are both safely refactored in reverse order
+    patch = generate_refactoring_patch([(0.95, u_t1, u_t2)], repo_root=str(tmp_path), replace_clones=True)
+    assert "def _shared_first_task_second_task" in patch
+    assert "_shared_first_task_second_task(x)" in patch
+
 
 
 
