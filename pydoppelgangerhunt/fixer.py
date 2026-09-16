@@ -1910,6 +1910,14 @@ def generate_refactoring_patch(
             candidate_units.append(u2)
 
         earliest_unit = min(candidate_units, key=lambda u: int(u.get("start", 1)))
+        enc_fn_earliest = (
+            find_enclosing_function(orig_text, earliest_unit)
+            if effective_binding == "method"
+            else None
+        )
+        insert_line = (
+            enc_fn_earliest["start"] if enc_fn_earliest else int(earliest_unit.get("start", 1))
+        )
         current_text = orig_text
 
         if replace_clones:
@@ -1991,8 +1999,6 @@ def generate_refactoring_patch(
             current_text = refactor_module_units(orig_text, units_to_replace)
 
         if effective_binding == "method":
-            enc_fn = find_enclosing_function(current_text, earliest_unit)
-            insert_line = enc_fn["start"] if enc_fn else int(earliest_unit.get("start", 1))
             current_lines = current_text.splitlines(keepends=True)
             insert_idx = max(0, insert_line - 1)
             current_lines = current_lines[:insert_idx] + [helper_code + "\n"] + current_lines[insert_idx:]
