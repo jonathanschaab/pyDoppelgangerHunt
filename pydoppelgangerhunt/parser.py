@@ -635,6 +635,8 @@ def _record_unit(
     start_col: Optional[int] = None,
     end_col: Optional[int] = None,
     enclosing_class: Optional[str] = None,
+    receiver_kind: Optional[str] = None,
+    is_static: bool = False,
 ) -> None:
     """Records an AST unit if it satisfies thresholds and is not suppressed by inline comments."""
     if file_lines and check_inline_suppression(file_lines, start, end):
@@ -731,6 +733,8 @@ def _record_unit(
                 "complexity": compute_cyclomatic_complexity(ast_target),
                 "structural_hash": structural_hash,
                 "enclosing_class": enclosing_class,
+                "receiver_kind": receiver_kind,
+                "is_static": is_static,
             })
 
 
@@ -752,6 +756,8 @@ def _record_clause_branch(
     abstract_expressions: bool = False,
     strip_docstrings: bool = True,
     enclosing_class: Optional[str] = None,
+    receiver_kind: Optional[str] = None,
+    is_static: bool = False,
 ) -> None:
     """Records an if-branch or except-handler clause if it contains at least 3 statements."""
     if len(body) < 3:
@@ -777,6 +783,8 @@ def _record_clause_branch(
         abstract_expressions=abstract_expressions,
         strip_docstrings=strip_docstrings,
         enclosing_class=enclosing_class,
+        receiver_kind=receiver_kind,
+        is_static=is_static,
     )
 
 
@@ -797,6 +805,8 @@ def _record_node_unit(
     abstract_expressions: bool = False,
     strip_docstrings: bool = True,
     enclosing_class: Optional[str] = None,
+    receiver_kind: Optional[str] = None,
+    is_static: bool = False,
 ) -> None:
     """Records an AST node unit by extracting its start and end line bounds."""
     start = getattr(node, "lineno", 0)
@@ -820,6 +830,8 @@ def _record_node_unit(
         abstract_expressions=abstract_expressions,
         strip_docstrings=strip_docstrings,
         enclosing_class=enclosing_class,
+        receiver_kind=receiver_kind,
+        is_static=is_static,
     )
 
 
@@ -998,6 +1010,26 @@ def harvest_file_units(
                 continue
 
             enc_class = enclosing_classes.get(id(node))
+            decs = getattr(node, "decorator_list", [])
+            fn_is_static = any(
+                (isinstance(d, ast.Name) and d.id == "staticmethod")
+                or (isinstance(d, ast.Attribute) and d.attr == "staticmethod")
+                for d in decs
+            )
+            fn_is_class_method = any(
+                (isinstance(d, ast.Name) and d.id == "classmethod")
+                or (isinstance(d, ast.Attribute) and d.attr == "classmethod")
+                for d in decs
+            )
+            if fn_is_static:
+                fn_receiver_kind: Optional[str] = "static"
+            elif fn_is_class_method:
+                fn_receiver_kind = "class"
+            elif enc_class:
+                fn_receiver_kind = "instance"
+            else:
+                fn_receiver_kind = None
+
             is_closure = harvest_closures and id(node) in closure_parents
             if is_closure:
                 unit_kind = "closure"
@@ -1035,6 +1067,8 @@ def harvest_file_units(
                     abstract_expressions=abstract_expressions,
                     strip_docstrings=strip_docstrings,
                     enclosing_class=enc_class,
+                    receiver_kind=fn_receiver_kind,
+                    is_static=fn_is_static,
                 )
 
             if not functions_only:
@@ -1074,6 +1108,8 @@ def harvest_file_units(
                                 abstract_expressions=abstract_expressions,
                                 strip_docstrings=strip_docstrings,
                                 enclosing_class=enc_class,
+                                receiver_kind=fn_receiver_kind,
+                                is_static=fn_is_static,
                             )
 
             if sliding_window and hasattr(node, "body"):
@@ -1102,6 +1138,8 @@ def harvest_file_units(
                             abstract_expressions=abstract_expressions,
                             strip_docstrings=strip_docstrings,
                             enclosing_class=enc_class,
+                            receiver_kind=fn_receiver_kind,
+                            is_static=fn_is_static,
                         )
 
             if clause_level and hasattr(node, "body"):
@@ -1126,6 +1164,8 @@ def harvest_file_units(
                             abstract_expressions=abstract_expressions,
                             strip_docstrings=strip_docstrings,
                             enclosing_class=enc_class,
+                            receiver_kind=fn_receiver_kind,
+                            is_static=fn_is_static,
                         )
                         if stmt.orelse:
                             _record_clause_branch(
@@ -1146,6 +1186,8 @@ def harvest_file_units(
                                 abstract_expressions=abstract_expressions,
                                 strip_docstrings=strip_docstrings,
                                 enclosing_class=enc_class,
+                                receiver_kind=fn_receiver_kind,
+                                is_static=fn_is_static,
                             )
                     elif isinstance(stmt, ast.Try):
                         t_line = getattr(stmt, "lineno", 0)
@@ -1173,6 +1215,8 @@ def harvest_file_units(
                                 abstract_expressions=abstract_expressions,
                                 strip_docstrings=strip_docstrings,
                                 enclosing_class=enc_class,
+                                receiver_kind=fn_receiver_kind,
+                                is_static=fn_is_static,
                             )
 
         elif class_level and isinstance(node, ast.ClassDef):

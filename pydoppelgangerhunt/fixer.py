@@ -419,10 +419,7 @@ def _format_call_arguments(
 
 def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List[str]:
     """Extracts executable body lines for a unit, stripping function headers and docstrings for whole functions."""
-    if not (
-        unit.get("kind") in ("function", "closure")
-        and ":" not in unit.get("name", "")
-    ):
+    if unit.get("kind") not in ("function", "closure"):
         return raw_lines
 
     code_block = "\n".join(raw_lines)
@@ -451,6 +448,15 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
     except Exception:  # pylint: disable=broad-exception-caught
         pass
     return raw_lines
+
+
+def _detect_indent_step(indent_str: str) -> str:
+    """Detects indentation step (tab, 2 spaces, or 4 spaces) from an indentation prefix."""
+    if "\t" in indent_str:
+        return "\t"
+    if indent_str and len(indent_str) <= 4 and len(indent_str) % 2 == 0:
+        return indent_str
+    return "    "
 
 
 def _find_header_cookie_boundary(lines: List[str]) -> int:
@@ -498,9 +504,12 @@ def _find_module_helper_insertion_index(lines: List[str]) -> int:
     return min(target_line, len(lines))
 
 
-def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
+def _inspect_unit_scope(
+    unit: Dict[str, Any],
+    repo_root: Optional[str] = None,
+) -> Dict[str, Any]:
     """Extracts lexical and AST scope metadata for a single unit."""
-    raw_lines = extract_unit_source_code(unit)
+    raw_lines = extract_unit_source_code(unit, repo_root=repo_root)
     dedented = textwrap.dedent("".join(raw_lines))
     empty_res: Dict[str, Any] = {
         "inputs": [],
@@ -691,11 +700,12 @@ def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
 def analyze_unit_variable_scope(
     u1: Dict[str, Any],
     u2: Optional[Dict[str, Any]] = None,
+    repo_root: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
-    info1 = _inspect_unit_scope(u1)
+    info1 = _inspect_unit_scope(u1, repo_root=repo_root)
     if u2 is not None:
-        info2 = _inspect_unit_scope(u2)
+        info2 = _inspect_unit_scope(u2, repo_root=repo_root)
         common_inputs = [var for var in info1["inputs"] if var in info2["inputs"]]
         inputs = common_inputs if common_inputs else info1["inputs"]
         common_outputs = [var for var in info1["outputs"] if var in info2["outputs"]]
@@ -1239,9 +1249,12 @@ def _is_method_of_class(
 def _has_receiver_reference(
     unit: Dict[str, Any],
     scope: Optional[Dict[str, Any]] = None,
+    repo_root: Optional[str] = None,
 ) -> bool:
     """Checks if a unit actually references an instance or class receiver in its executable body."""
-    target_scope = scope if scope is not None else analyze_unit_variable_scope(unit)
+    target_scope = (
+        scope if scope is not None else analyze_unit_variable_scope(unit, repo_root=repo_root)
+    )
     return bool(
         target_scope.get("has_receiver_access")
         or target_scope.get("instance_attrs")
@@ -1258,6 +1271,41 @@ def _get_enclosing_receiver_kind(fn_info: Optional[Dict[str, Any]]) -> str:
     if fn_info.get("is_class_method"):
         return "class"
     return "instance"
+
+
+def _populate_unit_receiver_metadata(
+    unit: Dict[str, Any],
+    repo_root: Optional[str] = None,
+) -> None:
+    """Populates receiver_kind and is_static on a unit from enclosing AST nodes if absent."""
+    if "receiver_kind" in unit:
+        return
+    f_raw = unit.get("file", "").split("#")[0]
+    if not f_raw:
+        return
+    p = Path(f_raw)
+    f_path = p if p.is_absolute() else Path(repo_root or os.getcwd()) / f_raw
+    if not f_path.is_file():
+        return
+    try:
+        source = f_path.read_text(encoding="utf-8")
+        fn_meta = find_enclosing_function(source, unit)
+        cls_meta = find_enclosing_class(source, unit)
+        if _is_method_of_class(fn_meta, cls_meta):
+            rec_k = _get_enclosing_receiver_kind(fn_meta)
+            unit["receiver_kind"] = rec_k
+            if rec_k == "static":
+                unit["is_static"] = True
+    except OSError:
+        pass
+
+
+def _base_unit_name(u: Dict[str, Any]) -> str:
+    """Extracts base function or method name from unit dictionary for helper synthesis."""
+    name = str(u.get("name") or "")
+    if u.get("kind") == "closure" and ":" in name:
+        return str(name.rsplit(":", maxsplit=1)[-1].lstrip("_"))
+    return str(name.split(":", maxsplit=1)[0].lstrip("_"))
 
 
 def _resolve_effective_binding(
@@ -1296,6 +1344,7 @@ def synthesize_shared_helper_code(
     is_static: bool = False,
     receiver_kind: Optional[str] = None,
     step: Optional[str] = None,
+    repo_root: Optional[str] = None,
 ) -> str:
     """Synthesizes a proposed shared helper function stub from two clone units.
 
@@ -1315,12 +1364,13 @@ def synthesize_shared_helper_code(
         is_static: Whether the cloned methods are static methods.
         receiver_kind: Receiver kind of enclosing method ('class', 'instance', 'static').
         step: Indentation step per indentation level (defaults to "\t" for tabs, 4 spaces otherwise).
+        repo_root: Optional root directory of the repository for relative path resolution.
     """
-    lines1 = _extract_unit_body_lines(u1, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u1)])
-    lines2 = _extract_unit_body_lines(u2, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u2)])
+    lines1 = _extract_unit_body_lines(u1, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u1, repo_root=repo_root)])
+    lines2 = _extract_unit_body_lines(u2, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u2, repo_root=repo_root)])
 
-    base_name1 = u1["name"].split(":")[0].lstrip("_")
-    base_name2 = u2["name"].split(":")[0].lstrip("_")
+    base_name1 = _base_unit_name(u1)
+    base_name2 = _base_unit_name(u2)
     helper_name = f"_shared_{base_name1}" if base_name1 == base_name2 else f"_shared_{base_name1}_{base_name2}"
 
     # Find common lines using difflib matching
@@ -1347,10 +1397,13 @@ def synthesize_shared_helper_code(
                             common_lines[idx] = ln.rstrip() + f"  {p_text}"
                             break
 
+    _populate_unit_receiver_metadata(u1, repo_root=repo_root)
+    _populate_unit_receiver_metadata(u2, repo_root=repo_root)
+
     # Variable scope analysis for concrete parameter signatures
-    scope1 = analyze_unit_variable_scope(u1)
-    scope2 = analyze_unit_variable_scope(u2)
-    scope = analyze_unit_variable_scope(u1, u2)
+    scope1 = analyze_unit_variable_scope(u1, repo_root=repo_root)
+    scope2 = analyze_unit_variable_scope(u2, repo_root=repo_root)
+    scope = analyze_unit_variable_scope(u1, u2, repo_root=repo_root)
 
     enc1 = u1.get("enclosing_class")
     enc2 = u2.get("enclosing_class")
@@ -1381,7 +1434,8 @@ def synthesize_shared_helper_code(
     )
     receiver_kinds_differ = bool(k1 != k2)
     if receiver_kinds_differ and (
-        _has_receiver_reference(u1, scope1) or _has_receiver_reference(u2, scope2)
+        _has_receiver_reference(u1, scope1, repo_root=repo_root)
+        or _has_receiver_reference(u2, scope2, repo_root=repo_root)
     ):
         return ""
 
@@ -1591,12 +1645,7 @@ def synthesize_shared_helper_code(
             common_lines = common_lines + [f"return {helper_outputs[0]}"]
 
     if step is None:
-        if "\t" in indent:
-            step = "\t"
-        elif indent and len(indent) <= 4 and len(indent) % 2 == 0:
-            step = indent
-        else:
-            step = "    "
+        step = _detect_indent_step(indent)
 
     body_indent = indent + step
     doc_indent = indent + step
@@ -1885,10 +1934,13 @@ def _build_whole_method_delegation(
 
     lead = lines[u_start - 1] if 1 <= u_start <= len(lines) else ""
     indent = lead[: len(lead) - len(lead.lstrip())]
-    body_indent = indent + "    "
+    default_step = _detect_indent_step(indent)
+    body_indent = indent + default_step
 
     sig_end_line = u_start
     docstring_end_line: Optional[int] = None
+    raw_u_name = unit.get("name", "")
+    base_u_name = raw_u_name.rsplit(":", maxsplit=1)[-1]
 
     try:
         tree = ast.parse(source_text)
@@ -1896,7 +1948,9 @@ def _build_whole_method_delegation(
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 n_start = getattr(node, "lineno", 0)
                 n_end = getattr(node, "end_lineno", n_start)
-                if n_start == u_start or (node.name == unit.get("name") and n_start <= u_start <= n_end):
+                if n_start == u_start or (
+                    node.name in (raw_u_name, base_u_name) and n_start <= u_start <= n_end
+                ):
                     if node.body:
                         b_cand_lines = [
                             int(getattr(b_stmt, "lineno", 0))
@@ -2009,16 +2063,21 @@ def generate_refactoring_patch(
         fn1_kind = _get_enclosing_receiver_kind(fn1) if fn1 else "instance"
         fn2_kind = _get_enclosing_receiver_kind(fn2) if fn2 else fn1_kind
         receiver_kinds_differ = bool(fn2 and fn1_kind != fn2_kind)
-        is_in_method = bool(fn1 and fn2)
+        is_in_method = bool(
+            fn1
+            and fn2
+            and u1.get("kind") not in ("comprehension", "complex_expr")
+            and u2.get("kind") not in ("comprehension", "complex_expr")
+        )
         is_static = bool((fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static")))
         if is_static:
             u1["is_static"] = True
             u2["is_static"] = True
 
         if receiver_kinds_differ:
-            s1 = analyze_unit_variable_scope(u1)
-            s2 = analyze_unit_variable_scope(u2)
-            if _has_receiver_reference(u1, s1) or _has_receiver_reference(u2, s2):
+            s1 = analyze_unit_variable_scope(u1, repo_root=str(root))
+            s2 = analyze_unit_variable_scope(u2, repo_root=str(root))
+            if _has_receiver_reference(u1, s1, repo_root=str(root)) or _has_receiver_reference(u2, s2, repo_root=str(root)):
                 continue
 
         effective_binding = _resolve_effective_binding(
@@ -2044,6 +2103,11 @@ def generate_refactoring_patch(
             )
             else None
         )
+        if step is None:
+            u1_s = int(u1.get("start", 1))
+            u1_lead = orig_lines[u1_s - 1] if 1 <= u1_s <= len(orig_lines) else ""
+            u1_ind = u1_lead[: len(u1_lead) - len(u1_lead.lstrip())]
+            step = _detect_indent_step(u1_ind)
 
         helper_code = synthesize_shared_helper_code(
             u1,
@@ -2054,6 +2118,7 @@ def generate_refactoring_patch(
             is_static=is_static,
             receiver_kind=fn1_kind if effective_binding == "method" else None,
             step=step,
+            repo_root=str(root),
         )
         if not helper_code:
             continue
@@ -2065,13 +2130,13 @@ def generate_refactoring_patch(
         missing_import_lines: List[str] = []
         if missing_typing:
             missing_import_lines.append(f"from typing import {', '.join(sorted(missing_typing))}")
-        scope = analyze_unit_variable_scope(u1, u2)
+        scope = analyze_unit_variable_scope(u1, u2, repo_root=str(root))
         for loc_imp in scope.get("local_imports", []):
             if loc_imp not in orig_text and loc_imp not in missing_import_lines:
                 missing_import_lines.append(loc_imp)
 
-        base_name1 = u1["name"].split(":")[0].lstrip("_")
-        base_name2 = u2["name"].split(":")[0].lstrip("_")
+        base_name1 = _base_unit_name(u1)
+        base_name2 = _base_unit_name(u2)
         helper_name = (
             f"_shared_{base_name1}" if base_name1 == base_name2 else f"_shared_{base_name1}_{base_name2}"
         )
@@ -2126,10 +2191,7 @@ def generate_refactoring_patch(
                         receiver_to_omit=unit_receiver_omit,
                     )
 
-                    is_whole_method = (
-                        target_unit.get("kind") in ("function", "closure")
-                        and ":" not in target_unit.get("name", "")
-                    )
+                    is_whole_method = target_unit.get("kind") in ("function", "closure")
                     if is_whole_method:
                         rep_stmt = _build_whole_method_delegation(
                             orig_text,
@@ -2144,7 +2206,7 @@ def generate_refactoring_patch(
                         )
                     else:
                         call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
-                        rep_step = "\t" if "\t" in indent else "    "
+                        rep_step = step or ("\t" if "\t" in indent else "    ")
                         if scope.get("has_yield") and scope.get("is_async"):
                             rep_stmt = (
                                 f"{indent}async for _item in {call_expr}:\n"

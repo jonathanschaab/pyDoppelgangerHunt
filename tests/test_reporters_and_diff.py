@@ -3269,6 +3269,179 @@ def test_nested_class_static_method_uses_dunder_class(tmp_path: Path) -> None:
     assert "Inner._shared" not in patch
 
 
+def test_comprehension_inside_method_uses_module_binding(tmp_path: Path) -> None:
+    """Verifies that duplicate comprehensions inside methods use module binding without self._shared."""
+    code = (
+        "class Worker:\n"
+        "    def run_a(self, data: list) -> list:\n"
+        "        return [x * 2 for x in data]\n"
+        "\n"
+        "    def run_b(self, data: list) -> list:\n"
+        "        return [x * 2 for x in data]\n"
+    )
+    f = tmp_path / "worker_comp.py"
+    f.write_text(code, encoding="utf-8")
+    u1 = {
+        "file": str(f),
+        "start": 3,
+        "end": 3,
+        "name": "run_a:listcomp_L3",
+        "kind": "comprehension",
+        "enclosing_class": "Worker",
+    }
+    u2 = {
+        "file": str(f),
+        "start": 6,
+        "end": 6,
+        "name": "run_b:listcomp_L6",
+        "kind": "comprehension",
+        "enclosing_class": "Worker",
+    }
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        method_binding="auto",
+        replace_clones=True,
+    )
+    assert patch
+    # Must synthesize module helper, not method helper inside Worker
+    assert "+def _shared_run_a_run_b(" in patch
+    # Must not invoke self._shared inside run_a or run_b
+    assert "self._shared_run_a_run_b" not in patch
+    assert "_shared_run_a_run_b(" in patch
+
+
+def test_harvest_file_units_records_receiver_kind_and_is_static(tmp_path: Path) -> None:
+    """Verifies that harvest_file_units records receiver_kind and is_static."""
+    code = (
+        "class Service:\n"
+        "    def inst_m(self, x: int) -> int:\n"
+        "        y = x\n"
+        "        return y + 1\n"
+        "\n"
+        "    @classmethod\n"
+        "    def cls_m(cls, x: int) -> int:\n"
+        "        y = x\n"
+        "        return y + 1\n"
+        "\n"
+        "    @staticmethod\n"
+        "    def stat_m(x: int) -> int:\n"
+        "        y = x\n"
+        "        return y + 1\n"
+    )
+    f = tmp_path / "svc.py"
+    f.write_text(code, encoding="utf-8")
+    units = harvest_file_units(str(f), str(tmp_path), min_lines=2, min_tokens=1)
+    by_name = {u["name"]: u for u in units}
+
+    assert by_name["inst_m"]["receiver_kind"] == "instance"
+    assert by_name["inst_m"]["is_static"] is False
+
+    assert by_name["cls_m"]["receiver_kind"] == "class"
+    assert by_name["cls_m"]["is_static"] is False
+
+    assert by_name["stat_m"]["receiver_kind"] == "static"
+    assert by_name["stat_m"]["is_static"] is True
+
+
+def test_synthesize_shared_helper_harvested_units_declines_mixed_receiver(tmp_path: Path) -> None:
+    """Verifies that synthesize_shared_helper_code on real harvested units declines receiver-bound mixed-kind pairs."""
+    code = (
+        "class Handler:\n"
+        "    def inst_worker(self, x: int) -> int:\n"
+        "        y = x\n"
+        "        return self.value + y\n"
+        "\n"
+        "    @classmethod\n"
+        "    def cls_worker(cls, x: int) -> int:\n"
+        "        y = x\n"
+        "        return cls.value + y\n"
+    )
+    f = tmp_path / "mixed_harvest.py"
+    f.write_text(code, encoding="utf-8")
+    units = harvest_file_units(str(f), str(tmp_path), min_lines=2, min_tokens=1)
+    by_name = {u["name"]: u for u in units}
+
+    # Direct call to synthesize_shared_helper_code without pre-configured receiver_kind
+    helper = synthesize_shared_helper_code(
+        by_name["inst_worker"], by_name["cls_worker"], repo_root=str(tmp_path)
+    )
+    assert helper == ""
+
+
+def test_closure_whole_function_refactoring_and_body_extraction(tmp_path: Path) -> None:
+    """Verifies that whole closure units strip their header in synthesis and delegate properly in patches."""
+    code = (
+        "def factory_a():\n"
+        "    def inner_a(x: int) -> int:\n"
+        "        step_val = 1\n"
+        "        return x + step_val\n"
+        "    return inner_a\n"
+        "\n"
+        "def factory_b():\n"
+        "    def inner_b(x: int) -> int:\n"
+        "        step_val = 1\n"
+        "        return x + step_val\n"
+        "    return inner_b\n"
+    )
+    f = tmp_path / "factories.py"
+    f.write_text(code, encoding="utf-8")
+    u1 = {
+        "file": str(f),
+        "start": 2,
+        "end": 4,
+        "name": "factory_a:inner_a",
+        "kind": "closure",
+    }
+    u2 = {
+        "file": str(f),
+        "start": 8,
+        "end": 10,
+        "name": "factory_b:inner_b",
+        "kind": "closure",
+    }
+    helper = synthesize_shared_helper_code(u1, u2)
+    assert helper
+    # def inner_a must NOT be nested inside the helper body
+    assert "def inner_a" not in helper
+    assert "def inner_b" not in helper
+
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert patch
+    # Closure definitions must be preserved and delegate to helper
+    assert "def inner_a(x: int) -> int:" in patch
+    assert "return _shared_inner_a_inner_b(x)" in patch
+
+
+def test_two_space_async_generator_delegation(tmp_path: Path) -> None:
+    """Verifies that 2-space indented files use 2-space step for async generator delegation."""
+    code = (
+        "async def gen1(src):\n"
+        "  async for item in src:\n"
+        "    yield item\n"
+        "\n"
+        "async def gen2(src):\n"
+        "  async for item in src:\n"
+        "    yield item\n"
+    )
+    f = tmp_path / "two_gen.py"
+    f.write_text(code, encoding="utf-8")
+    u1 = {"file": str(f), "start": 2, "end": 3, "name": "gen1:asyncfor", "kind": "compound_block"}
+    u2 = {"file": str(f), "start": 6, "end": 7, "name": "gen2:asyncfor", "kind": "compound_block"}
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert patch
+    assert "+  async for _item in _shared_gen1_gen2(src):\n+    yield _item\n" in patch
+
+
+
 
 
 
