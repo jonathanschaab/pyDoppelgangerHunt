@@ -389,6 +389,7 @@ def scan_target(
     max_index_frequency: float = 0.25,
     filter_stop_shingles: bool = False,
     stop_shingles: Optional[Set[Any]] = None,
+    min_corpus_size: Optional[int] = None,
 ) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]:
     units: List[Dict[str, Any]] = []
     repo_root = Path.cwd()
@@ -495,12 +496,17 @@ def scan_target(
                 continue
             shingle_index.setdefault(sh, []).append(idx)
 
+    effective_min_corpus = (
+        min_corpus_size
+        if min_corpus_size is not None
+        else (4 if filter_stop_shingles else 30)
+    )
+
     max_posting_len = (
-        int(len(units) * max_index_frequency)
-        if (max_index_frequency is not None and len(units) > 30)
+        max(2, int(math.ceil(len(units) * max_index_frequency)))
+        if (max_index_frequency is not None and len(units) >= effective_min_corpus)
         else len(units) + 1
     )
-    max_posting_len = max(2, max_posting_len)
 
     candidate_pairs: Set[Tuple[int, int]] = set()
     for u_indices in shingle_index.values():

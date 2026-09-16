@@ -33,7 +33,10 @@ from pydoppelgangerhunt.coverage import (
 )
 from pydoppelgangerhunt.fixer import (
     analyze_unit_variable_scope,
+    check_units_overlap,
+    filter_overlapping_clone_units,
     generate_refactoring_patch,
+    refactor_module_units,
     replace_unit_in_source,
     synthesize_shared_helper_code,
 )
@@ -146,6 +149,9 @@ __all__ = [
     "analyze_unit_variable_scope",
     "synthesize_shared_helper_code",
     "replace_unit_in_source",
+    "check_units_overlap",
+    "filter_overlapping_clone_units",
+    "refactor_module_units",
     "generate_refactoring_patch",
     "compute_unit_structural_hash",
     "clone_pair_structural_fingerprint",

@@ -1012,6 +1012,111 @@ def replace_unit_in_source(
     return "".join(prefix_lines) + rep + "".join(suffix_lines)
 
 
+def check_units_overlap(u1: Dict[str, Any], u2: Dict[str, Any]) -> bool:
+    """Determines whether two AST code units in the same file share overlapping line ranges.
+
+    Args:
+        u1: First AST unit dictionary with 'file', 'start', and 'end'.
+        u2: Second AST unit dictionary with 'file', 'start', and 'end'.
+
+    Returns:
+        True if both units reside in the same normalized file path and their [start, end]
+        intervals overlap; False otherwise.
+    """
+    f1 = u1.get("file", "").split("#")[0].replace("\\", "/")
+    f2 = u2.get("file", "").split("#")[0].replace("\\", "/")
+    if not f1 or not f2 or f1 != f2:
+        return False
+    start1, end1 = int(u1.get("start", 1)), int(u1.get("end", 1))
+    start2, end2 = int(u2.get("start", 1)), int(u2.get("end", 1))
+    return max(start1, start2) <= min(end1, end2)
+
+
+def filter_overlapping_clone_units(units: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Filters a sequence of candidate code units to retain a maximal non-overlapping subset.
+
+    When candidates share overlapping lines/tokens within the same module, candidates
+    spanning a larger line range are prioritized, with ties broken by earlier start line.
+
+    Args:
+        units: Sequence of AST unit dictionaries proposed for refactoring.
+
+    Returns:
+        List of non-overlapping units safe for concurrent refactoring within the same pass.
+    """
+    if not units:
+        return []
+
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for u in units:
+        norm_file = u.get("file", "").split("#")[0].replace("\\", "/")
+        grouped.setdefault(norm_file, []).append(u)
+
+    retained: List[Dict[str, Any]] = []
+    for file_units in grouped.values():
+        sorted_candidates = sorted(
+            file_units,
+            key=lambda u: (
+                -(int(u.get("end", 0)) - int(u.get("start", 0))),
+                int(u.get("start", 0)),
+                str(u.get("name", "")),
+            ),
+        )
+        file_retained: List[Dict[str, Any]] = []
+        for cand in sorted_candidates:
+            if not any(check_units_overlap(cand, prev) for prev in file_retained):
+                file_retained.append(cand)
+        retained.extend(file_retained)
+
+    return retained
+
+
+def refactor_module_units(
+    source_text: str,
+    replacements: Sequence[Tuple[Dict[str, Any], str]],
+) -> str:
+    """Applies multiple non-overlapping unit replacements in reverse source order.
+
+    Applying substitutions bottom-to-top (descending by unit 'start' line) guarantees
+    that line count changes downstream never invalidate the 1-indexed source line
+    coordinates of earlier units in the same file.
+
+    Args:
+        source_text: The complete original Python source code.
+        replacements: Sequence of (unit, replacement_text) tuples.
+
+    Returns:
+        The refactored module source text.
+
+    Raises:
+        ValueError: If any pair of units in replacements shares overlapping line ranges.
+    """
+    if not replacements:
+        return source_text
+
+    rep_list = list(replacements)
+    for i, (u1, _) in enumerate(rep_list):
+        for u2, _ in rep_list[i + 1:]:
+            if check_units_overlap(u1, u2):
+                raise ValueError(
+                    f"Overlapping unit collision detected between "
+                    f"'{u1.get('name')}' ({u1.get('start')}-{u1.get('end')}) and "
+                    f"'{u2.get('name')}' ({u2.get('start')}-{u2.get('end')}) in {u1.get('file')}."
+                )
+
+    sorted_replacements = sorted(
+        rep_list,
+        key=lambda item: int(item[0].get("start", 0)),
+        reverse=True,
+    )
+
+    current_text = source_text
+    for unit, replacement in sorted_replacements:
+        current_text = replace_unit_in_source(current_text, unit, replacement)
+
+    return current_text
+
+
 def generate_refactoring_patch(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     repo_root: Optional[str] = None,
@@ -1065,18 +1170,26 @@ def generate_refactoring_patch(
             inputs = scope.get("inputs", [])
             outputs = scope.get("outputs", [])
             args_str = ", ".join(inputs)
-            u1_start = int(u1.get("start", 1))
-            if 1 <= u1_start <= len(orig_lines):
-                lead = orig_lines[u1_start - 1]
-                indent = lead[: len(lead) - len(lead.lstrip())]
-                if outputs:
-                    if len(outputs) >= 2:
-                        call_stmt = f"{indent}{', '.join(outputs)} = {await_prefix}{helper_name}({args_str})\n"
+
+            candidate_units = [u1]
+            f2_raw = u2.get("file", "").split("#")[0]
+            if f2_raw and f2_raw == f1_raw and not check_units_overlap(u1, u2):
+                candidate_units.append(u2)
+
+            units_to_replace: List[Tuple[Dict[str, Any], str]] = []
+            for target_unit in candidate_units:
+                u_start = int(target_unit.get("start", 1))
+                if 1 <= u_start <= len(orig_lines):
+                    lead = orig_lines[u_start - 1]
+                    indent = lead[: len(lead) - len(lead.lstrip())]
+                    if outputs:
+                        assign_target = ", ".join(outputs) if len(outputs) >= 2 else outputs[0]
+                        call_stmt = f"{indent}{assign_target} = {await_prefix}{helper_name}({args_str})\n"
                     else:
-                        call_stmt = f"{indent}{outputs[0]} = {await_prefix}{helper_name}({args_str})\n"
-                else:
-                    call_stmt = f"{indent}{await_prefix}{helper_name}({args_str})\n"
-                current_text = replace_unit_in_source(current_text, u1, call_stmt)
+                        call_stmt = f"{indent}{await_prefix}{helper_name}({args_str})\n"
+                    units_to_replace.append((target_unit, call_stmt))
+
+            current_text = refactor_module_units(orig_text, units_to_replace)
 
         current_lines = current_text.splitlines(keepends=True)
         lines_with_imports = _insert_imports_into_module(current_lines, missing_import_lines)
