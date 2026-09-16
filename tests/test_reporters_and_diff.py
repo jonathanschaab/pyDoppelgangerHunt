@@ -341,6 +341,7 @@ def test_modular_pydoppelgangerhunt_exports() -> None:
     assert callable(pydoppelgangerhunt.compute_unit_diff_overlap)
     assert pydoppelgangerhunt.MAJOR_POLICY_THRESHOLD == 0.50
     assert pydoppelgangerhunt.NEW_POLICY_THRESHOLD == 0.80
+    assert callable(pydoppelgangerhunt.replace_unit_in_source)
 
 
 
@@ -1589,5 +1590,127 @@ def test_partial_hunk_policy_and_diff_overlap(tmp_path: Path) -> None:
     ])
     # No git repo initialized in cli_src so modified_ranges is empty -> exits 0 (clean)
     assert cli_exit == 0
+
+
+def test_conditional_variable_escape_prevention(tmp_path: Path) -> None:
+    """Test that conditionally assigned variables are safely initialized to avoid runtime UnboundLocalError."""
+    from pydoppelgangerhunt.fixer import analyze_unit_variable_scope, synthesize_shared_helper_code  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def compute_summary(flag: bool):\n"
+        "    if flag:\n"
+        "        metric = 42\n"
+        "    return flag\n"
+    )
+    src_file = tmp_path / "cond_src.py"
+    src_file.write_text(code, encoding="utf-8")
+
+    u_block = {"file": str(src_file), "start": 2, "end": 3, "name": "compute_summary:If", "kind": "compound_block"}
+    scope = analyze_unit_variable_scope(u_block)
+    assert "metric" in scope["conditional_outputs"]
+    assert "flag" in scope["inputs"]
+
+    helper_code = synthesize_shared_helper_code(u_block, u_block)
+    assert "metric = None" in helper_code
+    assert "Optional" in helper_code
+
+    # Execute synthesized helper dynamically in namespace to verify no UnboundLocalError occurs when flag=False
+    namespace: Dict[str, Any] = {}
+    exec(helper_code, namespace)  # nosec
+    helper_fn = namespace["_shared_compute_summary"]
+    assert helper_fn(False) is None
+    assert helper_fn(True) == 42
+
+
+def test_async_coroutine_context_synthesis(tmp_path: Path) -> None:
+    """Test that extracted blocks with await or async context synthesize async def and await call sites."""
+    from pydoppelgangerhunt.fixer import analyze_unit_variable_scope, synthesize_shared_helper_code  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "async def process_item(item_id: int):\n"
+        "    async with acquire_lock(item_id):\n"
+        "        data = await fetch_remote(item_id)\n"
+        "        return data\n"
+    )
+    src_file = tmp_path / "async_src.py"
+    src_file.write_text(code, encoding="utf-8")
+
+    u_async = {"file": str(src_file), "start": 2, "end": 3, "name": "process_item:AsyncWith", "kind": "compound_block"}
+    scope = analyze_unit_variable_scope(u_async)
+    assert scope["is_async"] is True
+    assert "item_id" in scope["inputs"]
+
+    helper_code = synthesize_shared_helper_code(u_async, u_async)
+    assert helper_code.startswith("async def _shared_process_item")
+    assert "await _shared_process_item" in helper_code
+    # Must compile cleanly as an async function without SyntaxError
+    compiled = compile(helper_code, "<test_async_helper>", "exec")
+    assert compiled is not None
+
+
+def test_global_and_nonlocal_scope_preservation(tmp_path: Path) -> None:
+    """Test that variables altered via global/nonlocal preserve scope modifiers and avoid return-tuple leakage."""
+    from pydoppelgangerhunt.fixer import analyze_unit_variable_scope, synthesize_shared_helper_code  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def outer():\n"
+        "    global global_metric\n"
+        "    nonlocal captured_scale\n"
+        "    global_metric += 1\n"
+        "    captured_scale *= 2\n"
+    )
+    src_file = tmp_path / "scope_mod_src.py"
+    src_file.write_text(code, encoding="utf-8")
+
+    u_scope = {"file": str(src_file), "start": 2, "end": 5, "name": "outer:compound", "kind": "compound_block"}
+    scope = analyze_unit_variable_scope(u_scope)
+    assert "global_metric" in scope["globals"]
+    assert "captured_scale" in scope["nonlocals"]
+
+    helper_code = synthesize_shared_helper_code(u_scope, u_scope)
+    # The return-tuple generator must not return globals or nonlocals; scope modifiers must be preserved
+    assert "global global_metric" in helper_code
+    assert "nonlocal captured_scale" in helper_code
+    assert "return" not in helper_code
+
+
+def test_comment_and_formatting_preservation(tmp_path: Path) -> None:
+    """Test that replace_unit_in_source and generate_refactoring_patch preserve comments and formatting."""
+    from pydoppelgangerhunt.fixer import generate_refactoring_patch, replace_unit_in_source  # pylint: disable=import-outside-toplevel
+
+    source_code = (
+        "# Top header license comment\n"
+        "# type: ignore[module-attr]\n"
+        "\n"
+        "def calculate_tax(income: float) -> float:  # inline comment\n"
+        "    # Step 1: Base deduction\n"
+        "    rate = 0.20\n"
+        "    return income * rate\n"
+        "\n"
+        "# Section divider comment\n"
+        "def other_worker():\n"
+        "    # worker notes\n"
+        "    pass  # noqa: E501\n"
+    )
+    src_file = tmp_path / "tax_calc.py"
+    src_file.write_text(source_code, encoding="utf-8")
+
+    u_calc = {"file": str(src_file), "start": 4, "end": 7, "name": "calculate_tax", "kind": "function"}
+
+    # 1. Test replace_unit_in_source
+    call_stmt = "def calculate_tax(income: float) -> float:\n    return _shared_calculate_tax(income)\n"
+    replaced = replace_unit_in_source(source_code, u_calc, call_stmt)
+
+    assert "# Top header license comment\n" in replaced
+    assert "# type: ignore[module-attr]\n" in replaced
+    assert "# Section divider comment\n" in replaced
+    assert "# worker notes\n" in replaced
+    assert "pass  # noqa: E501\n" in replaced
+    assert "return _shared_calculate_tax(income)" in replaced
+
+    # 2. Test generate_refactoring_patch with replace_clones=True
+    patch = generate_refactoring_patch([(0.95, u_calc, u_calc)], repo_root=str(tmp_path), replace_clones=True)
+    assert "def _shared_calculate_tax" in patch
+    assert "# Clone Pair" in patch
 
 

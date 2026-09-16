@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import re
 import textwrap
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 
@@ -43,6 +43,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.local_imports: List[str] = []
         self.imported_names: Dict[str, str] = {}
         self.yield_expr_names: List[Tuple[str, str]] = []
+        self.is_async: bool = False
 
     def _record_arg(
         self,
@@ -129,7 +130,12 @@ class _ScopeVisitor(ast.NodeVisitor):
         self._process_func(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.is_async = True
         self._process_func(node)
+
+    def visit_Await(self, node: ast.Await) -> None:
+        self.is_async = True
+        self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         if node.name not in self.stores:
@@ -199,7 +205,12 @@ class _ScopeVisitor(ast.NodeVisitor):
         self._visit_loop(node)
 
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self.is_async = True
         self._visit_loop(node)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+        self.is_async = True
+        self.generic_visit(node)
 
     def visit_While(self, node: ast.While) -> None:
         self._visit_loop(node)
@@ -264,6 +275,64 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str], Set[str]]:
+    """Analyzes a sequence of statements to determine unconditionally and conditionally assigned variables.
+
+    Returns:
+        A tuple of (definitely_assigned, conditionally_assigned) variable name sets.
+    """
+    definite: Set[str] = set()
+    conditional: Set[str] = set()
+
+    for stmt in statements:
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                for node in ast.walk(target):
+                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                        definite.add(node.id)
+        elif isinstance(stmt, ast.AnnAssign):
+            if isinstance(stmt.target, ast.Name):
+                definite.add(stmt.target.id)
+        elif isinstance(stmt, ast.AugAssign):
+            if isinstance(stmt.target, ast.Name):
+                definite.add(stmt.target.id)
+        elif isinstance(stmt, ast.If):
+            b_def, b_cond = _analyze_block_assignment(stmt.body)
+            o_def, o_cond = _analyze_block_assignment(stmt.orelse) if stmt.orelse else (set(), set())
+            if stmt.orelse:
+                both = b_def & o_def
+                definite.update(both)
+                conditional.update((b_def | b_cond | o_def | o_cond) - definite)
+            else:
+                conditional.update((b_def | b_cond) - definite)
+        elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While, ast.Try, ast.With, ast.AsyncWith)):
+            sub_stmts: List[ast.stmt] = list(stmt.body)
+            if hasattr(stmt, "orelse") and stmt.orelse:
+                sub_stmts.extend(stmt.orelse)
+            if hasattr(stmt, "handlers") and stmt.handlers:
+                for h in stmt.handlers:
+                    sub_stmts.extend(h.body)
+            if hasattr(stmt, "finalbody") and stmt.finalbody:
+                sub_stmts.extend(stmt.finalbody)
+            sub_def, sub_cond = _analyze_block_assignment(sub_stmts)
+            conditional.update((sub_def | sub_cond) - definite)
+        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):
+            case_defs: List[Set[str]] = []
+            case_conds: Set[str] = set()
+            for case in getattr(stmt, "cases", []):
+                c_def, c_cond = _analyze_block_assignment(case.body)
+                case_defs.append(c_def)
+                case_conds.update(c_def | c_cond)
+            if case_defs:
+                common = set.intersection(*case_defs)
+                definite.update(common)
+                conditional.update(case_conds - definite)
+        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            definite.add(stmt.name)
+
+    return definite, conditional
+
+
 def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
     """Extracts scope analysis metadata for a single AST unit by parsing its source."""
     raw_lines = extract_unit_source_code(unit)
@@ -285,25 +354,50 @@ def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
         "has_return": False,
         "local_imports": [],
         "yield_expr_names": [],
+        "is_async": False,
+        "conditional_outputs": [],
+        "definite_stores": [],
     }
     if not dedented.strip():
         return empty_res
 
     tree: Optional[ast.AST] = None
     loop_offset = 0
-    try:
-        tree = ast.parse(dedented)
-    except SyntaxError:
+    candidate_stmts: List[ast.stmt] = []
+
+    parse_candidates = [
+        (dedented, 0),
+        (f"async def _wrapper():\n{textwrap.indent(dedented, '    ')}", 0),
+        (f"def _wrapper():\n{textwrap.indent(dedented, '    ')}", 0),
+        (f"async def _wrapper():\n    for _ in (0,):\n{textwrap.indent(dedented, '        ')}", 1),
+        (f"def _wrapper():\n    for _ in (0,):\n{textwrap.indent(dedented, '        ')}", 1),
+    ]
+
+    for cand_text, offset in parse_candidates:
         try:
-            tree = ast.parse(f"def _wrapper():\n{textwrap.indent(dedented, '    ')}")
+            tree = ast.parse(cand_text)
+            loop_offset = offset
+            if cand_text == dedented:
+                if isinstance(tree, ast.Module):
+                    if len(tree.body) == 1 and isinstance(
+                        tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)
+                    ):
+                        candidate_stmts = tree.body[0].body
+                    else:
+                        candidate_stmts = tree.body
+            elif offset == 1:
+                wrapper_fn = tree.body[0]  # type: ignore[attr-defined]
+                if isinstance(wrapper_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for_loop = wrapper_fn.body[0]
+                    if isinstance(for_loop, (ast.For, ast.AsyncFor, ast.While)):
+                        candidate_stmts = for_loop.body
+            else:
+                wrapper_fn = tree.body[0]  # type: ignore[attr-defined]
+                if isinstance(wrapper_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    candidate_stmts = wrapper_fn.body
+            break
         except SyntaxError:
-            try:
-                tree = ast.parse(
-                    f"def _wrapper():\n    for _ in (0,):\n{textwrap.indent(dedented, '        ')}"
-                )
-                loop_offset = 1
-            except SyntaxError:
-                tree = None
+            continue
 
     if tree is None:
         return empty_res
@@ -347,24 +441,32 @@ def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
         if nl not in inputs:
             inputs.append(nl)
 
-    # If explicit returns exist, prioritize them. For subroutines without explicit
+    # Definite and conditional assignment analysis across candidate statements
+    def_assigned, _ = _analyze_block_assignment(candidate_stmts)
+
+    # Unit outputs: explicit returns if present; for subroutines without explicit
     # returns, all local variable stores act as unit outputs to preserve caller mutations.
     if visitor.returns:
         outputs = list(visitor.returns)
     elif is_subroutine:
-        outputs = [v for v in visitor.stores if v not in visitor.globals and v not in BUILTIN_NAMES]
+        outputs = [
+            v for v in visitor.stores
+            if v not in visitor.globals
+            and v not in BUILTIN_NAMES
+        ]
     else:
         outputs = []
 
-    # Nonlocal variables are marked as outputs only when stored (mutated) within this unit.
-    # When a nested function modifies an enclosing variable via 'nonlocal', that mutation
-    # is an external side effect from the perspective of the nested function, so the mutated
-    # variable must be included in the nested function's outputs to allow callers or parent
-    # scopes to receive the updated value. Conversely, read-only nonlocals act strictly as
-    # inputs and are omitted from outputs.
     for nl in visitor.nonlocals:
         if nl in visitor.stores and nl not in outputs:
             outputs.append(nl)
+
+    # Detect conditional variable escapes (outputs assigned conditionally without prior
+    # unconditional assignment in this block, and not provided as input arguments).
+    conditional_outputs = [
+        v for v in outputs
+        if v not in inputs and v not in def_assigned
+    ]
 
     return {
         "inputs": inputs,
@@ -383,6 +485,9 @@ def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
         "has_return": visitor.has_return,
         "local_imports": visitor.local_imports,
         "yield_expr_names": visitor.yield_expr_names,
+        "is_async": visitor.is_async,
+        "conditional_outputs": conditional_outputs,
+        "definite_stores": sorted(def_assigned),
     }
 
 
@@ -417,6 +522,13 @@ def analyze_unit_variable_scope(
         has_return = info1["has_return"] or info2["has_return"]
         local_imports = list(dict.fromkeys(info1["local_imports"] + info2["local_imports"]))
         yield_expr_names = info1["yield_expr_names"] + info2["yield_expr_names"]
+        is_async = info1.get("is_async", False) or info2.get("is_async", False)
+        conditional_outputs = list(dict.fromkeys(
+            info1.get("conditional_outputs", []) + info2.get("conditional_outputs", [])
+        ))
+        definite_stores = sorted(
+            set(info1.get("definite_stores", [])) & set(info2.get("definite_stores", []))
+        )
     else:
         inputs = info1["inputs"]
         outputs = info1["outputs"]
@@ -432,6 +544,9 @@ def analyze_unit_variable_scope(
         has_return = info1["has_return"]
         local_imports = info1["local_imports"]
         yield_expr_names = info1["yield_expr_names"]
+        is_async = info1.get("is_async", False)
+        conditional_outputs = info1.get("conditional_outputs", [])
+        definite_stores = info1.get("definite_stores", [])
 
     locals_ = [var for var in info1["stores"] if var not in inputs]
     return {
@@ -451,6 +566,9 @@ def analyze_unit_variable_scope(
         "has_return": has_return,
         "local_imports": local_imports,
         "yield_expr_names": yield_expr_names,
+        "is_async": is_async,
+        "conditional_outputs": conditional_outputs,
+        "definite_stores": definite_stores,
     }
 
 
@@ -466,7 +584,7 @@ def _merge_types(t1: Optional[str], t2: Optional[str], strategy: str) -> str:
 
 
 TYPING_SYMBOLS: Set[str] = {
-    "Any", "Callable", "Dict", "Generator", "Iterable",
+    "Any", "AsyncGenerator", "AsyncIterator", "Callable", "Dict", "Generator", "Iterable",
     "Iterator", "List", "Optional", "Sequence", "Set", "Tuple", "Union",
 }
 
@@ -722,71 +840,115 @@ def synthesize_shared_helper_code(
     resolved_ret = _merge_types(r1, r2, type_merge_strategy)
 
     outputs = list(scope.get("outputs", []))
+    conditional_outs = set(scope.get("conditional_outputs", []))
+    is_async = scope.get("is_async", False)
+    func_keyword = "async def" if is_async else "def"
+    await_prefix = "await " if is_async else ""
+
+    # Variables altered via global or nonlocal statements must not be captured in the helper's return tuple
+    helper_outputs = [
+        v for v in outputs
+        if v not in scope.get("globals", [])
+        and v not in scope.get("nonlocals", [])
+    ]
+
     if scope.get("has_yield"):
-        inferred_yield_type = None
-        for kind, name in scope.get("yield_expr_names", []):
-            m_t = meta1.get(name, {}).get("type") or meta2.get(name, {}).get("type")
-            if not m_t:
-                continue
-            if kind == "yield":
-                inferred_yield_type = m_t
-                break
-            if kind == "yield_from":
-                for prefix in ("Iterator[", "Iterable[", "List[", "Sequence[", "Set["):
-                    if m_t.startswith(prefix) and m_t.endswith("]"):
-                        inferred_yield_type = m_t[len(prefix) : -1].strip()
-                        break
-                if inferred_yield_type:
-                    break
-        if resolved_ret != "Any":
-            return_type = resolved_ret
-        elif inferred_yield_type:
-            return_type = f"Iterator[{inferred_yield_type}]"
+        if is_async:
+            return_type = "AsyncIterator[Any]"
         else:
-            return_type = "Iterator[Any]"
-    elif len(outputs) >= 2:
+            inferred_yield_type = None
+            for kind, name in scope.get("yield_expr_names", []):
+                m_t = meta1.get(name, {}).get("type") or meta2.get(name, {}).get("type")
+                if not m_t:
+                    continue
+                if kind == "yield":
+                    inferred_yield_type = m_t
+                    break
+                if kind == "yield_from":
+                    for prefix in ("Iterator[", "Iterable[", "List[", "Sequence[", "Set["):
+                        if m_t.startswith(prefix) and m_t.endswith("]"):
+                            inferred_yield_type = m_t[len(prefix) : -1].strip()
+                            break
+                    if inferred_yield_type:
+                        break
+            if resolved_ret != "Any":
+                return_type = resolved_ret
+            elif inferred_yield_type:
+                return_type = f"Iterator[{inferred_yield_type}]"
+            else:
+                return_type = "Iterator[Any]"
+    elif len(helper_outputs) >= 2:
         out_types = []
-        for out_var in outputs:
+        for out_var in helper_outputs:
             t1 = meta1.get(out_var, {}).get("type")
             t2 = meta2.get(out_var, {}).get("type")
-            out_types.append(_merge_types(t1, t2, type_merge_strategy))
+            t_merged = _merge_types(t1, t2, type_merge_strategy)
+            if out_var in conditional_outs:
+                if not t_merged.startswith("Optional[") and "None" not in t_merged:
+                    t_merged = f"Optional[{t_merged}]"
+            out_types.append(t_merged)
         return_type = f"Tuple[{', '.join(out_types)}]"
-    elif len(outputs) == 1:
-        out_var = outputs[0]
+    elif len(helper_outputs) == 1:
+        out_var = helper_outputs[0]
         t1 = meta1.get(out_var, {}).get("type")
         t2 = meta2.get(out_var, {}).get("type")
         out_t = _merge_types(t1, t2, type_merge_strategy)
+        if out_var in conditional_outs:
+            if not out_t.startswith("Optional[") and "None" not in out_t:
+                out_t = f"Optional[{out_t}]"
         return_type = resolved_ret if resolved_ret != "Any" else out_t
-    elif not outputs and not scope.get("has_return") and resolved_ret == "Any":
+        if out_var in conditional_outs:
+            if not return_type.startswith("Optional[") and "None" not in return_type and return_type != "None":
+                return_type = f"Optional[{return_type}]"
+    elif not helper_outputs and not scope.get("has_return") and resolved_ret == "Any":
         return_type = "None"
     else:
         return_type = resolved_ret
 
     params_str = ", ".join(params) if params else "*args: Any, **kwargs: Any"
 
+    # Dedent common_lines first so relative block indentation is normalized
+    common_lines = textwrap.dedent("\n".join(common_lines)).splitlines()
+
+    # Prepend scope modifiers and conditional variable initializations to preserve runtime safety
+    prefix_stmts: List[str] = []
+    if scope.get("globals"):
+        g_vars = sorted(set(scope["globals"]))
+        if not any(ln.strip().startswith("global ") for ln in common_lines):
+            prefix_stmts.append(f"global {', '.join(g_vars)}")
+    if scope.get("nonlocals"):
+        nl_vars = sorted(set(scope["nonlocals"]))
+        if not any(ln.strip().startswith("nonlocal ") for ln in common_lines):
+            prefix_stmts.append(f"nonlocal {', '.join(nl_vars)}")
+    for out_var in scope.get("conditional_outputs", []):
+        prefix_stmts.append(f"{out_var} = None")
+
+    if prefix_stmts:
+        common_lines = prefix_stmts + common_lines
+
     has_trailing_return = any(
         ln.strip().startswith("return ") or ln.strip() == "return"
         for ln in common_lines[-3:]
     )
-    if not has_trailing_return and outputs and not scope.get("has_yield"):
-        if len(outputs) >= 2:
-            common_lines = common_lines + [f"return {', '.join(outputs)}"]
+    if not has_trailing_return and helper_outputs and not scope.get("has_yield"):
+        if len(helper_outputs) >= 2:
+            common_lines = common_lines + [f"return {', '.join(helper_outputs)}"]
         else:
-            common_lines = common_lines + [f"return {outputs[0]}"]
+            common_lines = common_lines + [f"return {helper_outputs[0]}"]
 
     docstring_lines = ["    \"\"\"Auto-extracted shared helper for duplicate logic."]
-    if outputs:
-        if len(outputs) >= 2:
-            call_site = f"{', '.join(outputs)} = {helper_name}(...)"
+    if helper_outputs:
+        if len(helper_outputs) >= 2:
+            call_site = f"{', '.join(helper_outputs)} = {await_prefix}{helper_name}(...)"
         else:
-            call_site = f"{outputs[0]} = {helper_name}(...)"
+            call_site = f"{helper_outputs[0]} = {await_prefix}{helper_name}(...)"
         docstring_lines.append("")
         docstring_lines.append("    Call site:")
         docstring_lines.append(f"        {call_site}")
     else:
         docstring_lines.append("")
         docstring_lines.append("    Call site:")
-        docstring_lines.append(f"        {helper_name}(...)")
+        docstring_lines.append(f"        {await_prefix}{helper_name}(...)")
 
     hazards = scope.get("control_flow_hazards", [])
     if hazards:
@@ -801,7 +963,7 @@ def synthesize_shared_helper_code(
 
     indented_body = "\n".join(f"    {ln}" if ln.strip() else "" for ln in common_lines)
     helper_def = (
-        f"def {helper_name}({params_str}) -> {return_type}:\n"
+        f"{func_keyword} {helper_name}({params_str}) -> {return_type}:\n"
         f"{docstring_str}\n"
         f"{indented_body}\n"
     )
@@ -820,10 +982,41 @@ def synthesize_shared_helper_code(
     return helper_def
 
 
+def replace_unit_in_source(
+    source_text: str,
+    unit: Dict[str, Any],
+    replacement_text: str,
+) -> str:
+    """Replaces an AST code unit in source text with replacement text, preserving comments and formatting.
+
+    Args:
+        source_text: The complete original Python source code.
+        unit: The AST unit mapping containing 1-indexed 'start' and 'end' line numbers.
+        replacement_text: The text to substitute in place of the unit lines.
+
+    Returns:
+        The modified source code with comments, type ignores, and whitespace outside the unit preserved.
+    """
+    lines = source_text.splitlines(keepends=True)
+    start = max(1, int(unit.get("start", 1)))
+    end = min(len(lines), int(unit.get("end", len(lines))))
+    if start > len(lines) or start > end:
+        return source_text
+
+    rep = replacement_text
+    if rep and not rep.endswith("\n"):
+        rep += "\n"
+
+    prefix_lines = lines[: start - 1]
+    suffix_lines = lines[end:]
+    return "".join(prefix_lines) + rep + "".join(suffix_lines)
+
+
 def generate_refactoring_patch(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     repo_root: Optional[str] = None,
     type_merge_strategy: str = "fallback_any",
+    replace_clones: bool = False,
 ) -> str:
     """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
     if not clones:
@@ -861,7 +1054,32 @@ def generate_refactoring_patch(
             if loc_imp not in orig_text and loc_imp not in missing_import_lines:
                 missing_import_lines.append(loc_imp)
 
-        lines_with_imports = _insert_imports_into_module(orig_lines, missing_import_lines)
+        current_text = orig_text
+        if replace_clones:
+            base_name1 = u1["name"].split(":")[0].lstrip("_")
+            base_name2 = u2["name"].split(":")[0].lstrip("_")
+            helper_name = (
+                f"_shared_{base_name1}" if base_name1 == base_name2 else f"_shared_{base_name1}_{base_name2}"
+            )
+            await_prefix = "await " if scope.get("is_async") else ""
+            inputs = scope.get("inputs", [])
+            outputs = scope.get("outputs", [])
+            args_str = ", ".join(inputs)
+            u1_start = int(u1.get("start", 1))
+            if 1 <= u1_start <= len(orig_lines):
+                lead = orig_lines[u1_start - 1]
+                indent = lead[: len(lead) - len(lead.lstrip())]
+                if outputs:
+                    if len(outputs) >= 2:
+                        call_stmt = f"{indent}{', '.join(outputs)} = {await_prefix}{helper_name}({args_str})\n"
+                    else:
+                        call_stmt = f"{indent}{outputs[0]} = {await_prefix}{helper_name}({args_str})\n"
+                else:
+                    call_stmt = f"{indent}{await_prefix}{helper_name}({args_str})\n"
+                current_text = replace_unit_in_source(current_text, u1, call_stmt)
+
+        current_lines = current_text.splitlines(keepends=True)
+        lines_with_imports = _insert_imports_into_module(current_lines, missing_import_lines)
         modified_lines = [helper_code + "\n\n"] + lines_with_imports
 
         try:

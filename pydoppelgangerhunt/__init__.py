@@ -34,6 +34,7 @@ from pydoppelgangerhunt.coverage import (
 from pydoppelgangerhunt.fixer import (
     analyze_unit_variable_scope,
     generate_refactoring_patch,
+    replace_unit_in_source,
     synthesize_shared_helper_code,
 )
 from pydoppelgangerhunt.git_diff import (
@@ -144,6 +145,7 @@ __all__ = [
     "check_asymmetric_coverage",
     "analyze_unit_variable_scope",
     "synthesize_shared_helper_code",
+    "replace_unit_in_source",
     "generate_refactoring_patch",
     "compute_unit_structural_hash",
     "clone_pair_structural_fingerprint",
