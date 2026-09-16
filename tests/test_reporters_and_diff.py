@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Dict, Tuple
 from unittest import mock
@@ -333,6 +334,8 @@ def test_modular_pydoppelgangerhunt_exports() -> None:
     assert callable(pydoppelgangerhunt.cluster_clone_families)
     assert callable(pydoppelgangerhunt.record_baseline)
     assert callable(pydoppelgangerhunt.load_baseline)
+    assert callable(pydoppelgangerhunt.pure_structural_fingerprint)
+    assert callable(pydoppelgangerhunt.prune_baseline)
 
 
 
@@ -1374,3 +1377,133 @@ def test_clustering_transitivity_and_medoid_coherence(tmp_path: Path) -> None:
         "--min-cluster-similarity", "0.75",
     ])
     assert exit_code == 1
+
+
+def test_path_independent_structural_fingerprint_rename_and_fallback(tmp_path: Path) -> None:
+    """Test pure structural fingerprinting across file renames and legacy baseline fallback."""
+    u1 = {"file": "dir_a/worker.py", "name": "do_work", "structural_hash": "hash_worker_01"}
+    u2 = {"file": "dir_b/worker.py", "name": "do_work", "structural_hash": "hash_worker_02"}
+
+    # Pure structural fingerprint is independent of file paths and order-invariant
+    pure_fp = pydoppelgangerhunt.pure_structural_fingerprint(u1, u2)
+    pure_fp_rev = pydoppelgangerhunt.pure_structural_fingerprint(u2, u1)
+    assert pure_fp == pure_fp_rev
+    assert "hash_worker_01" in pure_fp and "hash_worker_02" in pure_fp
+    assert "dir_a" not in pure_fp and "dir_b" not in pure_fp
+
+    # Simulate baseline recording
+    baseline_path = tmp_path / "baseline_v120.json"
+    pydoppelgangerhunt.record_baseline([(0.95, u1, u2)], str(baseline_path), "test_target", 0.90)
+
+    # Move/rename dir_a/worker.py to dir_renamed/worker.py
+    u1_renamed = {"file": "dir_renamed/worker.py", "name": "do_work", "structural_hash": "hash_worker_01"}
+    active_clones = [(0.95, u1_renamed, u2)]
+
+    # Old fingerprints (fp, sfp) won't match because path changed, but pure_sfp will match!
+    loaded_fps = pydoppelgangerhunt.load_baseline(str(baseline_path))
+    remaining, suppressed = pydoppelgangerhunt.filter_clones_by_baseline(active_clones, loaded_fps)
+    assert suppressed == 1
+    assert len(remaining) == 0
+
+    # Test backward-compatibility with v1.0/v1.1 legacy baseline JSON lacking pure_structural_fingerprint
+    legacy_baseline = tmp_path / "baseline_legacy.json"
+    legacy_data = {
+        "version": "1.1.0",
+        "fingerprints": [
+            {
+                "fingerprint": "old_dir/a.py:calc <===> old_dir/b.py:calc",
+                "structural_fingerprint": "old_dir/a.py#hash_c1 <===> old_dir/b.py#hash_c2",
+                "hash_a": "hash_c1",
+                "hash_b": "hash_c2",
+            }
+        ]
+    }
+    legacy_baseline.write_text(json.dumps(legacy_data), encoding="utf-8")
+    loaded_legacy_fps = pydoppelgangerhunt.load_baseline(str(legacy_baseline))
+    # Check that synthesized pure structural fingerprint is present
+    expected_pure = "hash_c1 <===> hash_c2"
+    assert expected_pure in loaded_legacy_fps
+
+    # Verify a renamed clone matching hash_c1 and hash_c2 is suppressed using legacy baseline
+    u_renamed_a = {"file": "new_dir/a.py", "name": "calc", "structural_hash": "hash_c1"}
+    u_renamed_b = {"file": "new_dir/b.py", "name": "calc", "structural_hash": "hash_c2"}
+    rem_legacy, supp_legacy = pydoppelgangerhunt.filter_clones_by_baseline(
+        [(0.92, u_renamed_a, u_renamed_b)], loaded_legacy_fps
+    )
+    assert supp_legacy == 1
+    assert len(rem_legacy) == 0
+
+
+def test_baseline_pruning_and_cli(tmp_path: Path) -> None:
+    """Test prune_baseline removing orphaned entries, synchronizing renames, and CLI integration."""
+    u1 = {"file": "src/active_a.py", "name": "active_a", "structural_hash": "hash_act_a"}
+    u2 = {"file": "src/active_b.py", "name": "active_b", "structural_hash": "hash_act_b"}
+    u_dead1 = {"file": "src/dead_a.py", "name": "dead_a", "structural_hash": "hash_dead_a"}
+    u_dead2 = {"file": "src/dead_b.py", "name": "dead_b", "structural_hash": "hash_dead_b"}
+    u_moved1 = {"file": "src/old_loc.py", "name": "calc", "structural_hash": "hash_moved"}
+    u_moved2 = {"file": "src/fixed_loc.py", "name": "calc", "structural_hash": "hash_fixed"}
+
+    baseline_file = tmp_path / "prune_test_baseline.json"
+    initial_clones = [
+        (0.95, u1, u2),
+        (0.92, u_dead1, u_dead2),
+        (0.90, u_moved1, u_moved2),
+    ]
+    pydoppelgangerhunt.record_baseline(initial_clones, str(baseline_file), "test_pkg", 0.90)
+
+    # Now simulate u_dead1/u_dead2 being deleted/refactored (not active)
+    # and u_moved1 being moved to src/new_loc.py
+    u_moved1_new = {"file": "src/new_loc.py", "name": "calc", "structural_hash": "hash_moved"}
+    current_active = [
+        (0.95, u1, u2),
+        (0.90, u_moved1_new, u_moved2),
+    ]
+
+    pruned_count, retained_count = pydoppelgangerhunt.prune_baseline(str(baseline_file), current_active)
+    assert pruned_count == 1
+    assert retained_count == 2
+
+    # Verify pruned baseline content
+    content = json.loads(baseline_file.read_text(encoding="utf-8"))
+    assert content["clone_count"] == 2
+    assert len(content["fingerprints"]) == 2
+    # Verify moved clone was retained and synchronized to new file path
+    fps_files = [(item["file_a"], item["file_b"]) for item in content["fingerprints"]]
+    assert any("src/new_loc.py" in (f1, f2) for f1, f2 in fps_files)
+
+    # Test edge cases: non-existent file, corrupt file, invalid JSON structure
+    assert pydoppelgangerhunt.prune_baseline(str(tmp_path / "missing.json"), current_active) == (0, 0)
+    corrupt_f = tmp_path / "corrupt_baseline.json"
+    corrupt_f.write_text("invalid json content", encoding="utf-8")
+    assert pydoppelgangerhunt.prune_baseline(str(corrupt_f), current_active) == (0, 0)
+    not_dict_f = tmp_path / "not_dict.json"
+    not_dict_f.write_text("[1, 2, 3]", encoding="utf-8")
+    assert pydoppelgangerhunt.prune_baseline(str(not_dict_f), current_active) == (0, 0)
+
+    # CLI test: --prune-baseline without baseline specified
+    code_missing_base = pydoppelgangerhunt.main([str(tmp_path), "--prune-baseline"])
+    assert code_missing_base == 1
+
+    # CLI test: --prune-baseline with non-existent baseline file
+    code_not_found = pydoppelgangerhunt.main([str(tmp_path), "--baseline", str(tmp_path / "no_such_file.json"), "--prune-baseline"])
+    assert code_not_found == 1
+
+    # CLI test: valid execution with --prune-baseline
+    src_dir = tmp_path / "cli_src"
+    src_dir.mkdir()
+    f1 = src_dir / "mod1.py"
+    f2 = src_dir / "mod2.py"
+    shared_code = "def compute_val(x, y):\n    res = x * y\n    print(res)\n    return res + 1\n"
+    f1.write_text(shared_code, encoding="utf-8")
+    f2.write_text(shared_code, encoding="utf-8")
+
+    cli_base = tmp_path / "cli_baseline.json"
+    # First record baseline
+    record_ret = pydoppelgangerhunt.main([str(src_dir), "--threshold", "0.70", "--min-lines", "3", "--min-tokens", "5", "--record-baseline", str(cli_base)])
+    assert record_ret == 0
+    assert cli_base.exists()
+
+    # Now prune baseline (nothing pruned, 1 retained, clone suppressed)
+    prune_ret = pydoppelgangerhunt.main([str(src_dir), "--threshold", "0.70", "--min-lines", "3", "--min-tokens", "5", "--baseline", str(cli_base), "--prune-baseline"])
+    assert prune_ret == 0
+

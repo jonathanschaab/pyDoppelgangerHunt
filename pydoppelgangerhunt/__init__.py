@@ -8,6 +8,8 @@ from pydoppelgangerhunt.baseline import (
     compute_unit_structural_hash,
     filter_clones_by_baseline,
     load_baseline,
+    prune_baseline,
+    pure_structural_fingerprint,
     record_baseline,
 )
 from pydoppelgangerhunt.cli import build_arg_parser, main
@@ -135,9 +137,11 @@ __all__ = [
     "generate_refactoring_patch",
     "compute_unit_structural_hash",
     "clone_pair_structural_fingerprint",
+    "pure_structural_fingerprint",
     "record_baseline",
     "load_baseline",
     "filter_clones_by_baseline",
+    "prune_baseline",
     "clone_pair_fingerprint",
     "load_toml_section",
     "load_tool_config",

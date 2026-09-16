@@ -14,6 +14,7 @@ from pydoppelgangerhunt import (
     load_baseline,
     load_toml_section,
     load_tool_config,
+    pure_structural_fingerprint,
     record_baseline,
 )
 
@@ -78,10 +79,10 @@ def test_init_configuration_generation(tmp_path: Path) -> None:
 def test_baseline_record_load_and_filter(tmp_path: Path) -> None:
     """Test recording clone pairs to a baseline JSON file and filtering grandfathered hits."""
     baseline_file = tmp_path / "clones_baseline.json"
-    u1 = {"file": "service/alpha.py", "start": 10, "end": 20, "name": "handler_a"}
-    u2 = {"file": "service/beta.py", "start": 15, "end": 25, "name": "handler_b"}
-    u3 = {"file": "service/gamma.py", "start": 30, "end": 40, "name": "handler_c"}
-    u4 = {"file": "service/delta.py", "start": 35, "end": 45, "name": "handler_d"}
+    u1 = {"file": "service/alpha.py", "start": 10, "end": 20, "name": "handler_a", "structural_hash": "hash_a1"}
+    u2 = {"file": "service/beta.py", "start": 15, "end": 25, "name": "handler_b", "structural_hash": "hash_b1"}
+    u3 = {"file": "service/gamma.py", "start": 30, "end": 40, "name": "handler_c", "structural_hash": "hash_c1"}
+    u4 = {"file": "service/delta.py", "start": 35, "end": 45, "name": "handler_d", "structural_hash": "hash_d1"}
 
     mock_clones = [
         (0.95, u1, u2),
@@ -92,10 +93,11 @@ def test_baseline_record_load_and_filter(tmp_path: Path) -> None:
     assert Path(saved_path).exists()
 
     loaded_fps = load_baseline(str(baseline_file))
-    assert len(loaded_fps) == 4
+    assert len(loaded_fps) == 6
     fp1 = clone_pair_fingerprint(u1, u2)
     assert fp1 in loaded_fps
     assert clone_pair_structural_fingerprint(u1, u2) in loaded_fps
+    assert pure_structural_fingerprint(u1, u2) in loaded_fps
 
     new_clones, suppressed = filter_clones_by_baseline(mock_clones, loaded_fps)
     assert len(new_clones) == 0
