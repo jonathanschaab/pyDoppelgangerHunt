@@ -2785,6 +2785,13 @@ def test_find_module_helper_insertion_index_shebang_and_encoding() -> None:
     ]
     assert _find_module_helper_insertion_index(lines_encoding) == 1
 
+    lines_comment_then_encoding = [
+        "# Ordinary comment\n",
+        "# -*- coding: utf-8 -*-\n",
+        "x = 1\n",
+    ]
+    assert _find_module_helper_insertion_index(lines_comment_then_encoding) == 2
+
     lines_syntax_error = [
         "#!/usr/bin/env python3\n",
         "# coding=utf-8\n",
@@ -2811,8 +2818,21 @@ def test_build_whole_method_delegation_sync_and_async_generators() -> None:
         args_str="count",
         has_yield=True,
         is_async=False,
+        has_return=False,
     )
     assert "yield from self._shared_gen(count)" in sync_del
+
+    sync_del_ret = _build_whole_method_delegation(
+        src,
+        unit,
+        call_prefix="self.",
+        helper_name="_shared_gen",
+        args_str="count",
+        has_yield=True,
+        is_async=False,
+        has_return=True,
+    )
+    assert "return (yield from self._shared_gen(count))" in sync_del_ret
 
     async_src = (
         "class AsyncStreamer:\n"
@@ -2888,10 +2908,7 @@ def test_static_methods_propagation_in_synthesis_and_patch(tmp_path: Path) -> No
 
 
 def test_differing_receiver_kinds_in_same_class(tmp_path: Path) -> None:
-    """Verifies that clones with different receiver kinds fall back to module helper in auto mode,
-
-    and resolve per-unit receivers when method_binding='method' is forced.
-    """
+    """Verifies that clones with different receiver kinds fall back to module helper."""
     f = tmp_path / "mixed_receivers.py"
     code = (
         "class Handler:\n"
@@ -2933,7 +2950,7 @@ def test_differing_receiver_kinds_in_same_class(tmp_path: Path) -> None:
     assert "+def _shared_inst_worker_cls_worker(key: str) -> str:" in patch_auto
     assert "self." not in patch_auto.split("def cls_worker")[1]
 
-    # When method binding is forced, receiver must be resolved per unit
+    # Explicit method binding must also fall back to module helper because differing receivers cannot share one descriptor
     patch_method = generate_refactoring_patch(
         [(0.95, u1, u2)],
         repo_root=str(tmp_path),
@@ -2941,8 +2958,119 @@ def test_differing_receiver_kinds_in_same_class(tmp_path: Path) -> None:
         replace_clones=True,
     )
     assert patch_method
-    assert "self._shared_inst_worker_cls_worker" in patch_method
-    assert "cls._shared_inst_worker_cls_worker" in patch_method
+    assert "+def _shared_inst_worker_cls_worker(key: str) -> str:" in patch_method
+    assert "return _shared_inst_worker_cls_worker(key)" in patch_method
+
+
+def test_same_file_cross_class_method_binding_fallback(tmp_path: Path) -> None:
+    """Verifies that clones across different classes fall back to module helper even with method_binding='method'."""
+    f = tmp_path / "cross_class.py"
+    code = (
+        "class Alpha:\n"
+        "    def work(self, v: int) -> int:\n"
+        "        return v * 10\n"
+        "\n"
+        "class Beta:\n"
+        "    def work(self, v: int) -> int:\n"
+        "        return v * 10\n"
+    )
+    f.write_text(code, encoding="utf-8")
+    u1 = {"file": str(f), "start": 2, "end": 3, "name": "work", "kind": "function", "enclosing_class": "Alpha"}
+    u2 = {"file": str(f), "start": 6, "end": 7, "name": "work", "kind": "function", "enclosing_class": "Beta"}
+
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        method_binding="method",
+        replace_clones=True,
+    )
+    assert patch
+    assert "+def _shared_work(" in patch
+    # Helper must be at module level, not inside Beta
+    assert "class Beta" in patch
+
+
+def test_classmethod_compound_block_injects_cls(tmp_path: Path) -> None:
+    """Verifies that compound blocks inside @classmethod that don't reference cls still inject cls and @classmethod."""
+    f = tmp_path / "factory.py"
+    code = (
+        "class Factory:\n"
+        "    @classmethod\n"
+        "    def make_a(cls, x: int, y: int) -> int:\n"
+        "        val = (x + y) * 2\n"
+        "        return val\n"
+        "\n"
+        "    @classmethod\n"
+        "    def make_b(cls, x: int, y: int) -> int:\n"
+        "        val = (x + y) * 2\n"
+        "        return val\n"
+    )
+    f.write_text(code, encoding="utf-8")
+    u1 = {
+        "file": str(f),
+        "start": 4,
+        "end": 5,
+        "name": "make_a:block",
+        "kind": "compound_block",
+        "enclosing_class": "Factory",
+    }
+    u2 = {
+        "file": str(f),
+        "start": 9,
+        "end": 10,
+        "name": "make_b:block",
+        "kind": "compound_block",
+        "enclosing_class": "Factory",
+    }
+
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        method_binding="method",
+        replace_clones=True,
+    )
+    assert patch
+    assert "@classmethod" in patch
+    assert "_shared_make_a_make_b(cls, " in patch
+    assert "cls._shared_make_a_make_b" in patch
+    assert "self." not in patch
+
+
+def test_class_body_comprehension_clones_use_module_binding(tmp_path: Path) -> None:
+    """Verifies that clones directly in class body fall back to module helper and avoid self._shared in class body."""
+    f = tmp_path / "table.py"
+    code = (
+        "class ConfigTable:\n"
+        "    A = [k.upper() for k in ('x', 'y')]\n"
+        "    B = [k.upper() for k in ('x', 'y')]\n"
+    )
+    f.write_text(code, encoding="utf-8")
+    u1 = {
+        "file": str(f),
+        "start": 2,
+        "end": 2,
+        "name": "ConfigTable:listcomp_L2",
+        "kind": "comprehension",
+        "enclosing_class": "ConfigTable",
+    }
+    u2 = {
+        "file": str(f),
+        "start": 3,
+        "end": 3,
+        "name": "ConfigTable:listcomp_L3",
+        "kind": "comprehension",
+        "enclosing_class": "ConfigTable",
+    }
+
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        method_binding="method",
+        replace_clones=True,
+    )
+    assert patch
+    assert "self." not in patch
+    assert "+def _shared" in patch
 
 
 def test_class_level_comprehensions_harvest_enclosing_class(tmp_path: Path) -> None:
