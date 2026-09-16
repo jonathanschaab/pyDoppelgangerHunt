@@ -47,6 +47,7 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _find_module_helper_insertion_index,
     _insert_imports_into_module,
     _inspect_unit_scope,
+    _is_method_of_class,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
 
@@ -3870,6 +3871,38 @@ def test_instance_method_paired_with_module_function_omits_receiver_parameter(tm
     patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
     assert "return _shared_foo_bar(x)" in patch
     assert "_shared_foo_bar(self" not in patch
+
+
+def test_direct_method_verification_distinguishes_closures(tmp_path: Path) -> None:
+    """Verifies that direct method verification distinguishes class methods from nested closures."""
+    code = (
+        "class Worker:\n"
+        "    def outer_method(self, a: int) -> int:\n"
+        "        def inner_closure(b: int) -> int:\n"
+        "            y = b * 2\n"
+        "            z = y + 1\n"
+        "            w = z * 3\n"
+        "            return w\n"
+        "        return inner_closure(a)\n"
+    )
+    f = tmp_path / "worker.py"
+    f.write_text(code, encoding="utf-8")
+
+    # Harvest units to check parser hierarchy scoping
+    units = harvest_file_units(str(f), repo_root=str(tmp_path), min_lines=2, min_tokens=5, harvest_closures=True)
+    by_name = {u["name"]: u for u in units}
+    assert by_name["outer_method"]["enclosing_class"] == "Worker"
+    assert by_name["outer_method"]["receiver_kind"] == "instance"
+    assert by_name["outer_method:inner_closure"]["enclosing_class"] == "Worker"
+    assert by_name["outer_method:inner_closure"]["receiver_kind"] is None
+
+    # Verify find_enclosing_class and _is_method_of_class
+    cls_meta = find_enclosing_class(code, by_name["outer_method"])
+    fn_outer = find_enclosing_function(code, by_name["outer_method"])
+    fn_inner = find_enclosing_function(code, by_name["outer_method:inner_closure"])
+
+    assert _is_method_of_class(fn_outer, cls_meta) is True
+    assert _is_method_of_class(fn_inner, cls_meta) is False
 
 
 

@@ -1240,6 +1240,7 @@ def find_enclosing_class(
     node = meta.get("node")
     suite_indent = None
     def_start = meta.get("def_start", c_start)
+    direct_methods: Set[Tuple[int, int]] = set()
     if isinstance(node, ast.ClassDef) and node.body:
         cand_lines: List[int] = []
         for stmt in node.body:
@@ -1253,8 +1254,13 @@ def find_enclosing_class(
                     earliest_line = min(dec_start, earliest_line) if earliest_line > 0 else dec_start
             if earliest_line > def_start:
                 cand_lines.append(earliest_line)
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                end_l = int(getattr(stmt, "end_lineno", stmt_lineno))
+                direct_methods.add((earliest_line, end_l))
+                direct_methods.add((stmt_lineno, end_l))
         suite_indent = _extract_child_indentation(lines, cand_lines, indent)
 
+    meta["methods"] = direct_methods
     meta["method_indent"] = suite_indent if suite_indent is not None else (indent + "    ")
     meta.pop("node", None)
     meta.pop("decorators", None)
@@ -1284,9 +1290,14 @@ def _is_method_of_class(
     fn_meta: Optional[Dict[str, Any]],
     cls_meta: Optional[Dict[str, Any]],
 ) -> bool:
-    """Returns True if the function is a method defined inside the enclosing class."""
+    """Returns True if the function is a direct method defined inside the enclosing class."""
     if not fn_meta or not cls_meta:
         return False
+    methods = cls_meta.get("methods")
+    if methods is not None:
+        fn_span = (fn_meta["start"], fn_meta["end"])
+        fn_def_span = (fn_meta.get("def_start", fn_meta["start"]), fn_meta["end"])
+        return fn_span in methods or fn_def_span in methods
     return bool(
         cls_meta["start"] < fn_meta["start"]
         and fn_meta["end"] <= cls_meta["end"]

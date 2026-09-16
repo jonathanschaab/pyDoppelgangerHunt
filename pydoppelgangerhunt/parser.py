@@ -1026,16 +1026,15 @@ def harvest_file_units(
             decs = getattr(node, "decorator_list", [])
             fn_is_static = any(is_decorator_named(d, "staticmethod") for d in decs)
             fn_is_class_method = any(is_decorator_named(d, "classmethod") for d in decs)
+            is_closure = harvest_closures and id(node) in closure_parents
             if fn_is_static:
                 fn_receiver_kind: Optional[str] = "static"
             elif fn_is_class_method:
                 fn_receiver_kind = "class"
-            elif enc_class:
+            elif enc_class and not is_closure:
                 fn_receiver_kind = "instance"
             else:
                 fn_receiver_kind = None
-
-            is_closure = harvest_closures and id(node) in closure_parents
             if is_closure:
                 unit_kind = "closure"
                 unit_name = f"{closure_parents[id(node)]}:{node.name}"
