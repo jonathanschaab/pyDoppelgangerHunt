@@ -123,14 +123,26 @@ class _ScopeVisitor(ast.NodeVisitor):
             arg_set.add(args.kwarg.arg)
         return arg_set
 
+    def _record_store_name(self, name: str) -> None:
+        if len(self._scope_stack) > 1:
+            self._scope_stack[-1].add(name)
+        elif name not in BUILTIN_NAMES and name not in self.stores:
+            self.stores.append(name)
+
     def _process_func(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
         is_top = len(self._scope_stack) == 0
         if is_top:
             self._process_args(node)
             self._scope_stack.append(set(self.params))
         else:
-            if node.name not in self.stores:
-                self.stores.append(node.name)
+            for dec in node.decorator_list:
+                self.visit(dec)
+            for default in node.args.defaults:
+                self.visit(default)
+            for kw_default in node.args.kw_defaults:
+                if kw_default is not None:
+                    self.visit(kw_default)
+            self._record_store_name(node.name)
             self._scope_stack.append(self._extract_arg_names(node.args))
 
         for stmt in node.body:
@@ -161,8 +173,25 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        if node.name not in self.stores:
-            self.stores.append(node.name)
+        self._record_store_name(node.name)
+        self.generic_visit(node)
+
+    def visit_MatchAs(self, node: ast.AST) -> None:
+        name = getattr(node, "name", None)
+        if name and isinstance(name, str):
+            self._record_store_name(name)
+        self.generic_visit(node)
+
+    def visit_MatchStar(self, node: ast.AST) -> None:
+        name = getattr(node, "name", None)
+        if name and isinstance(name, str):
+            self._record_store_name(name)
+        self.generic_visit(node)
+
+    def visit_MatchMapping(self, node: ast.AST) -> None:
+        rest = getattr(node, "rest", None)
+        if rest and isinstance(rest, str):
+            self._record_store_name(rest)
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
@@ -171,10 +200,7 @@ class _ScopeVisitor(ast.NodeVisitor):
             if not is_inner and node.id not in BUILTIN_NAMES and node.id not in self.loads:
                 self.loads.append(node.id)
         elif isinstance(node.ctx, ast.Store):
-            if len(self._scope_stack) > 1:
-                self._scope_stack[-1].add(node.id)
-            elif node.id not in BUILTIN_NAMES and node.id not in self.stores:
-                self.stores.append(node.id)
+            self._record_store_name(node.id)
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
@@ -194,10 +220,7 @@ class _ScopeVisitor(ast.NodeVisitor):
             is_inner = any(node.target.id in s for s in self._scope_stack[1:])
             if not is_inner and node.target.id not in BUILTIN_NAMES and node.target.id not in self.loads:
                 self.loads.append(node.target.id)
-            if len(self._scope_stack) > 1:
-                self._scope_stack[-1].add(node.target.id)
-            elif node.target.id not in BUILTIN_NAMES and node.target.id not in self.stores:
-                self.stores.append(node.target.id)
+            self._record_store_name(node.target.id)
         elif isinstance(node.target, ast.Attribute):
             if isinstance(node.target.value, ast.Name) and node.target.value.id in ("self", "cls"):
                 attr_name = f"{node.target.value.id}.{node.target.attr}"
@@ -360,13 +383,34 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
         elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):
             case_defs: List[Set[str]] = []
             case_conds: Set[str] = set()
+            has_irrefutable_default = False
             for case in getattr(stmt, "cases", []):
+                pattern_stores: Set[str] = set()
+                pattern = getattr(case, "pattern", None)
+                if pattern is not None:
+                    for p_node in ast.walk(pattern):
+                        p_name = getattr(p_node, "name", None)
+                        if p_name and isinstance(p_name, str):
+                            pattern_stores.add(p_name)
+                        p_rest = getattr(p_node, "rest", None)
+                        if p_rest and isinstance(p_rest, str):
+                            pattern_stores.add(p_rest)
                 c_def, c_cond = _analyze_block_assignment(case.body)
+                c_def.update(pattern_stores)
                 case_defs.append(c_def)
                 case_conds.update(c_def | c_cond)
-            if case_defs:
+                guard = getattr(case, "guard", None)
+                if guard is None and pattern is not None:
+                    pat_type = type(pattern).__name__
+                    if pat_type == "MatchWildcard" or (
+                        pat_type == "MatchAs" and getattr(pattern, "pattern", None) is None
+                    ):
+                        has_irrefutable_default = True
+            if case_defs and has_irrefutable_default:
                 common = set.intersection(*case_defs)
                 definite.update(common)
+                conditional.update(case_conds - definite)
+            else:
                 conditional.update(case_conds - definite)
         elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             definite.add(stmt.name)
@@ -1356,7 +1400,7 @@ def _populate_unit_receiver_metadata(
     repo_root: Optional[str] = None,
 ) -> None:
     """Populates receiver_kind and is_static on a unit from enclosing AST nodes if absent."""
-    if "receiver_kind" in unit:
+    if "receiver_kind" in unit and "enclosing_class_start" in unit:
         return
     f_raw = unit.get("file", "").split("#")[0]
     if not f_raw:
@@ -1369,15 +1413,16 @@ def _populate_unit_receiver_metadata(
         source = f_path.read_text(encoding="utf-8")
         fn_meta = find_enclosing_function(source, unit)
         cls_meta = find_enclosing_class(source, unit)
-        if _is_method_of_class(fn_meta, cls_meta):
-            rec_k = _get_enclosing_receiver_kind(fn_meta)
-            unit["receiver_kind"] = rec_k
-            if rec_k == "static":
-                unit["is_static"] = True
-            if cls_meta:
-                unit["enclosing_class_start"] = cls_meta["start"]
-        else:
-            unit["receiver_kind"] = "none"
+        if cls_meta and "enclosing_class_start" not in unit:
+            unit["enclosing_class_start"] = cls_meta["start"]
+        if "receiver_kind" not in unit:
+            if _is_method_of_class(fn_meta, cls_meta):
+                rec_k = _get_enclosing_receiver_kind(fn_meta)
+                unit["receiver_kind"] = rec_k
+                if rec_k == "static":
+                    unit["is_static"] = True
+            else:
+                unit["receiver_kind"] = None
     except OSError:
         pass
 
@@ -1396,6 +1441,7 @@ def _resolve_effective_binding(
     is_static: bool = False,
     receiver_kinds_differ: bool = False,
     is_in_method: bool = True,
+    receiver_kind: Optional[str] = None,
 ) -> str:
     """Resolve the effective helper binding mode ('method' vs 'module')."""
     if method_binding == "module":
@@ -1410,7 +1456,7 @@ def _resolve_effective_binding(
         return "method"
 
     # auto mode
-    if is_static:
+    if is_static or receiver_kind in ("none", None):
         return "module"
     return "method"
 
@@ -1506,6 +1552,10 @@ def synthesize_shared_helper_code(
     def _unit_receiver_kind(u: Dict[str, Any], u_scope: Dict[str, Any]) -> str:
         if u.get("receiver_kind"):
             return str(u["receiver_kind"])
+        if "receiver_kind" in u and u.get("receiver_kind") is None:
+            return "none"
+        if u.get("kind") in ("closure", "class"):
+            return "none"
         if u.get("is_static"):
             return "static"
         bk = u_scope.get("binding_kind")
@@ -1544,8 +1594,10 @@ def synthesize_shared_helper_code(
     )
 
     is_in_method = bool(
-        u1.get("kind") not in ("comprehension", "complex_expr")
-        and u2.get("kind") not in ("comprehension", "complex_expr")
+        u1.get("kind") not in ("comprehension", "complex_expr", "closure", "class")
+        and u2.get("kind") not in ("comprehension", "complex_expr", "closure", "class")
+        and k1 != "none"
+        and k2 != "none"
     )
 
     effective_binding = _resolve_effective_binding(
@@ -1554,6 +1606,7 @@ def synthesize_shared_helper_code(
         is_static=is_static_clone,
         receiver_kinds_differ=receiver_kinds_differ,
         is_in_method=is_in_method,
+        receiver_kind=k1,
     )
 
     if effective_binding == "module":
@@ -2220,6 +2273,7 @@ def generate_refactoring_patch(
             is_static=is_static,
             receiver_kinds_differ=receiver_kinds_differ,
             is_in_method=is_in_method,
+            receiver_kind=fn1_kind,
         )
 
         helper_indent = (
@@ -2320,6 +2374,8 @@ def generate_refactoring_patch(
                     else:
                         unit_call_prefix = ""
                         t_fn = find_enclosing_function(orig_text, target_unit)
+                        if not _is_method_of_class(t_fn, enc1):
+                            t_fn = None
                         t_kind = _get_enclosing_receiver_kind(t_fn) if t_fn else "none"
                         unit_receiver_omit = "receivers" if t_kind in ("static", "none") else None
 

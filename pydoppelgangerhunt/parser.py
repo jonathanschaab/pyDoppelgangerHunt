@@ -498,16 +498,22 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
         self,
         closure_parents: Optional[Dict[int, str]] = None,
         enclosing_classes: Optional[Dict[int, str]] = None,
+        enclosing_class_starts: Optional[Dict[int, int]] = None,
     ) -> None:
         self.closure_parents: Dict[int, str] = closure_parents if closure_parents is not None else {}
         self.enclosing_classes: Dict[int, str] = enclosing_classes if enclosing_classes is not None else {}
+        self.enclosing_class_starts: Dict[int, int] = (
+            enclosing_class_starts if enclosing_class_starts is not None else {}
+        )
         self.func_stack: List[str] = []
-        self.class_stack: List[str] = []
+        self.class_stack: List[Tuple[str, int]] = []
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         if self.class_stack:
-            self.enclosing_classes[id(node)] = self.class_stack[-1]
-        self.class_stack.append(node.name)
+            self.enclosing_classes[id(node)] = self.class_stack[-1][0]
+            self.enclosing_class_starts[id(node)] = self.class_stack[-1][1]
+        c_start = int(getattr(node, "lineno", 0))
+        self.class_stack.append((node.name, c_start))
         saved_func_stack = self.func_stack
         self.func_stack = []
         self.generic_visit(node)
@@ -516,7 +522,8 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
 
     def _scope_function(self, fn: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
         if self.class_stack:
-            self.enclosing_classes[id(fn)] = self.class_stack[-1]
+            self.enclosing_classes[id(fn)] = self.class_stack[-1][0]
+            self.enclosing_class_starts[id(fn)] = self.class_stack[-1][1]
         if self.func_stack:
             self.closure_parents[id(fn)] = ":".join(self.func_stack)
         self.func_stack.append(fn.name)
@@ -531,7 +538,8 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
 
     def _scope_comprehension(self, comp: ast.AST) -> None:
         if self.class_stack:
-            self.enclosing_classes[id(comp)] = self.class_stack[-1]
+            self.enclosing_classes[id(comp)] = self.class_stack[-1][0]
+            self.enclosing_class_starts[id(comp)] = self.class_stack[-1][1]
         self.generic_visit(comp)
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
@@ -648,6 +656,7 @@ def _record_unit(
     start_col: Optional[int] = None,
     end_col: Optional[int] = None,
     enclosing_class: Optional[str] = None,
+    enclosing_class_start: Optional[int] = None,
     receiver_kind: Optional[str] = None,
     is_static: bool = False,
 ) -> None:
@@ -746,6 +755,7 @@ def _record_unit(
                 "complexity": compute_cyclomatic_complexity(ast_target),
                 "structural_hash": structural_hash,
                 "enclosing_class": enclosing_class,
+                "enclosing_class_start": enclosing_class_start,
                 "receiver_kind": receiver_kind,
                 "is_static": is_static,
             })
@@ -769,6 +779,7 @@ def _record_clause_branch(
     abstract_expressions: bool = False,
     strip_docstrings: bool = True,
     enclosing_class: Optional[str] = None,
+    enclosing_class_start: Optional[int] = None,
     receiver_kind: Optional[str] = None,
     is_static: bool = False,
 ) -> None:
@@ -796,6 +807,7 @@ def _record_clause_branch(
         abstract_expressions=abstract_expressions,
         strip_docstrings=strip_docstrings,
         enclosing_class=enclosing_class,
+        enclosing_class_start=enclosing_class_start,
         receiver_kind=receiver_kind,
         is_static=is_static,
     )
@@ -818,6 +830,7 @@ def _record_node_unit(
     abstract_expressions: bool = False,
     strip_docstrings: bool = True,
     enclosing_class: Optional[str] = None,
+    enclosing_class_start: Optional[int] = None,
     receiver_kind: Optional[str] = None,
     is_static: bool = False,
 ) -> None:
@@ -843,6 +856,7 @@ def _record_node_unit(
         abstract_expressions=abstract_expressions,
         strip_docstrings=strip_docstrings,
         enclosing_class=enclosing_class,
+        enclosing_class_start=enclosing_class_start,
         receiver_kind=receiver_kind,
         is_static=is_static,
     )
@@ -1013,7 +1027,8 @@ def harvest_file_units(
 
     closure_parents: Dict[int, str] = {}
     enclosing_classes: Dict[int, str] = {}
-    _ScopeHierarchyVisitor(closure_parents, enclosing_classes).visit(tree)
+    enclosing_class_starts: Dict[int, int] = {}
+    _ScopeHierarchyVisitor(closure_parents, enclosing_classes, enclosing_class_starts).visit(tree)
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1023,6 +1038,7 @@ def harvest_file_units(
                 continue
 
             enc_class = enclosing_classes.get(id(node))
+            enc_class_start = enclosing_class_starts.get(id(node))
             decs = getattr(node, "decorator_list", [])
             fn_is_static = any(is_decorator_named(d, "staticmethod") for d in decs)
             fn_is_class_method = any(is_decorator_named(d, "classmethod") for d in decs)
@@ -1071,6 +1087,7 @@ def harvest_file_units(
                     abstract_expressions=abstract_expressions,
                     strip_docstrings=strip_docstrings,
                     enclosing_class=enc_class,
+                    enclosing_class_start=enc_class_start,
                     receiver_kind=fn_receiver_kind,
                     is_static=fn_is_static,
                 )
@@ -1112,6 +1129,7 @@ def harvest_file_units(
                                 abstract_expressions=abstract_expressions,
                                 strip_docstrings=strip_docstrings,
                                 enclosing_class=enc_class,
+                                enclosing_class_start=enc_class_start,
                                 receiver_kind=fn_receiver_kind,
                                 is_static=fn_is_static,
                             )
@@ -1142,6 +1160,7 @@ def harvest_file_units(
                             abstract_expressions=abstract_expressions,
                             strip_docstrings=strip_docstrings,
                             enclosing_class=enc_class,
+                            enclosing_class_start=enc_class_start,
                             receiver_kind=fn_receiver_kind,
                             is_static=fn_is_static,
                         )
@@ -1168,6 +1187,7 @@ def harvest_file_units(
                             abstract_expressions=abstract_expressions,
                             strip_docstrings=strip_docstrings,
                             enclosing_class=enc_class,
+                            enclosing_class_start=enc_class_start,
                             receiver_kind=fn_receiver_kind,
                             is_static=fn_is_static,
                         )
@@ -1190,6 +1210,7 @@ def harvest_file_units(
                                 abstract_expressions=abstract_expressions,
                                 strip_docstrings=strip_docstrings,
                                 enclosing_class=enc_class,
+                                enclosing_class_start=enc_class_start,
                                 receiver_kind=fn_receiver_kind,
                                 is_static=fn_is_static,
                             )
@@ -1219,6 +1240,7 @@ def harvest_file_units(
                                 abstract_expressions=abstract_expressions,
                                 strip_docstrings=strip_docstrings,
                                 enclosing_class=enc_class,
+                                enclosing_class_start=enc_class_start,
                                 receiver_kind=fn_receiver_kind,
                                 is_static=fn_is_static,
                             )
@@ -1241,6 +1263,7 @@ def harvest_file_units(
                 abstract_expressions=abstract_expressions,
                 strip_docstrings=strip_docstrings,
                 enclosing_class=enclosing_classes.get(id(node)),
+                enclosing_class_start=enclosing_class_starts.get(id(node)),
             )
 
     if complex_expressions:  # pydoppelgangerhunt: ignore
@@ -1333,6 +1356,7 @@ def harvest_file_units(
                     abstract_expressions=abstract_expressions,
                     strip_docstrings=strip_docstrings,
                     enclosing_class=enc_cls,
+                    enclosing_class_start=enclosing_class_starts.get(id(comp)),
                 )
 
     return units

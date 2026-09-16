@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -41,6 +42,7 @@ from pydoppelgangerhunt import (
     synthesize_shared_helper_code,
 )
 from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
+    _analyze_block_assignment,
     _build_whole_method_delegation,
     _detect_indent_step,
     _extract_required_typing_imports,
@@ -3903,6 +3905,146 @@ def test_direct_method_verification_distinguishes_closures(tmp_path: Path) -> No
 
     assert _is_method_of_class(fn_outer, cls_meta) is True
     assert _is_method_of_class(fn_inner, cls_meta) is False
+
+
+def test_match_pattern_bound_variables_not_treated_as_inputs(tmp_path: Path) -> None:
+    """Verifies that pattern-bound variables in match statements are recognized as stores, not inputs."""
+    code = (
+        "def process_data(data: list) -> int:\n"
+        "    match data:\n"
+        "        case [head, *tail]:\n"
+        "            total = head + len(tail)\n"
+        "            return total\n"
+        "        case _:\n"
+        "            return 0\n"
+    )
+    f = tmp_path / "matcher_unit.py"
+    f.write_text(code, encoding="utf-8")
+    u = {"file": str(f), "start": 1, "end": 7, "name": "process_data", "kind": "function"}
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+
+    assert "data" in scope["inputs"]
+    assert "head" not in scope["inputs"]
+    assert "tail" not in scope["inputs"]
+    assert "total" in scope["outputs"]
+
+
+def test_match_definite_assignment_requires_irrefutable_default() -> None:
+    """Verifies that match block assignments require an irrefutable pattern to be definite."""
+    code_no_default = (
+        "match x:\n"
+        "    case 1:\n"
+        "        val = 10\n"
+        "    case 2:\n"
+        "        val = 20\n"
+    )
+    tree1 = ast.parse(code_no_default)
+    def1, cond1 = _analyze_block_assignment(tree1.body)
+    assert "val" not in def1
+    assert "val" in cond1
+
+    code_with_default = (
+        "match x:\n"
+        "    case 1:\n"
+        "        val = 10\n"
+        "    case _:\n"
+        "        val = 20\n"
+    )
+    tree2 = ast.parse(code_with_default)
+    def2, cond2 = _analyze_block_assignment(tree2.body)
+    assert "val" in def2
+    assert "val" not in cond2
+
+
+def test_inner_function_decorators_and_defaults_lexical_scoping(tmp_path: Path) -> None:
+    """Verifies that variables in inner function decorators and defaults are captured into outer inputs."""
+    code = (
+        "def make_pipeline(outer_mult: int, threshold: int) -> object:\n"
+        "    @transform_decorator\n"
+        "    def step(x: int = threshold) -> int:\n"
+        "        return x * outer_mult\n"
+        "    return step\n"
+    )
+    f = tmp_path / "pipeline.py"
+    f.write_text(code, encoding="utf-8")
+    u = {"file": str(f), "start": 1, "end": 5, "name": "make_pipeline", "kind": "function"}
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+
+    assert "outer_mult" in scope["inputs"]
+    assert "threshold" in scope["inputs"]
+    assert "transform_decorator" in scope["inputs"]
+    assert "x" not in scope["inputs"]
+
+
+def test_separate_scopes_identical_class_name_enclosing_class_start(tmp_path: Path) -> None:
+    """Verifies that identically named classes in different scopes have distinct enclosing_class_start."""
+    code = (
+        "def factory_one():\n"
+        "    class Config:\n"
+        "        def process(self, a: int, b: int) -> int:\n"
+        "            x = a * 10\n"
+        "            y = b * 20\n"
+        "            z = x + y\n"
+        "            return z\n"
+        "    return Config\n\n"
+        "def factory_two():\n"
+        "    class Config:\n"
+        "        def process(self, a: int, b: int) -> int:\n"
+        "            x = a * 10\n"
+        "            y = b * 20\n"
+        "            z = x + y\n"
+        "            return z\n"
+        "    return Config\n"
+    )
+    f = tmp_path / "factories.py"
+    f.write_text(code, encoding="utf-8")
+
+    units = harvest_file_units(str(f), repo_root=str(tmp_path), min_lines=3, min_tokens=5)
+    processes = [u for u in units if u["name"] == "process"]
+    assert len(processes) == 2
+    u1, u2 = processes[0], processes[1]
+    assert u1["enclosing_class"] == "Config"
+    assert u2["enclosing_class"] == "Config"
+    assert u1["enclosing_class_start"] is not None
+    assert u2["enclosing_class_start"] is not None
+    assert u1["enclosing_class_start"] != u2["enclosing_class_start"]
+
+    # In auto mode, separate classes must NOT synthesize a private instance method
+    helper = synthesize_shared_helper_code(u1, u2, method_binding="auto", repo_root=str(tmp_path))
+    assert not helper.startswith("    def _shared_process(self")
+    assert "def _shared_process(self" in helper or "def _shared_process(" in helper
+
+
+def test_closures_in_classes_synthesize_module_helper_auto_mode(tmp_path: Path) -> None:
+    """Verifies that closures inside classes synthesize module-level helpers in auto mode."""
+    code = (
+        "class Service:\n"
+        "    def run_a(self, items: list) -> list:\n"
+        "        def transform(val: int) -> int:\n"
+        "            x = val * 2\n"
+        "            y = x + 3\n"
+        "            return y\n"
+        "        return [transform(i) for i in items]\n"
+        "    def run_b(self, items: list) -> list:\n"
+        "        def transform(val: int) -> int:\n"
+        "            x = val * 2\n"
+        "            y = x + 3\n"
+        "            return y\n"
+        "        return [transform(i) for i in items]\n"
+    )
+    f = tmp_path / "service.py"
+    f.write_text(code, encoding="utf-8")
+
+    units = harvest_file_units(str(f), repo_root=str(tmp_path), min_lines=2, min_tokens=5, harvest_closures=True)
+    closures = [u for u in units if u["kind"] == "closure"]
+    assert len(closures) == 2
+    c1, c2 = closures[0], closures[1]
+
+    helper = synthesize_shared_helper_code(c1, c2, method_binding="auto", repo_root=str(tmp_path))
+    # Helper must be module-level (no indentation, no self receiver)
+    assert helper.startswith("def _shared_transform(")
+    assert "self" not in helper
+
 
 
 
