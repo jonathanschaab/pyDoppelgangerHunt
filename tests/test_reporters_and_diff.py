@@ -2880,7 +2880,7 @@ def test_static_methods_propagation_in_synthesis_and_patch(tmp_path: Path) -> No
     assert "@staticmethod" in code
     assert "(self" not in code
     assert "(cls" not in code
-    assert "Calculator._shared_calc_a_calc_b" in code
+    assert "__class__._shared_calc_a_calc_b" in code
 
     f = tmp_path / "calc.py"
     calc_code = (
@@ -2904,7 +2904,7 @@ def test_static_methods_propagation_in_synthesis_and_patch(tmp_path: Path) -> No
     )
     assert patch
     assert "@staticmethod" in patch
-    assert "Calculator._shared" in patch
+    assert "__class__._shared" in patch
 
 
 def test_differing_receiver_kinds_in_same_class(tmp_path: Path) -> None:
@@ -3088,6 +3088,185 @@ def test_class_level_comprehensions_harvest_enclosing_class(tmp_path: Path) -> N
     for comp in comps:
         assert comp.get("enclosing_class") == "Settings"
         assert comp.get("name", "").startswith("Settings:")
+
+
+def test_class_suite_tab_and_two_space_indentation(tmp_path: Path) -> None:
+    """Verifies that suite indentation is dynamically derived for tab and 2-space classes."""
+    tab_code = (
+        "class TabbedClass:\n"
+        "\tdef m1(self, x: int) -> int:\n"
+        "\t\treturn x + 1\n"
+        "\n"
+        "\tdef m2(self, x: int) -> int:\n"
+        "\t\treturn x + 1\n"
+    )
+    f_tab = tmp_path / "tabbed.py"
+    f_tab.write_text(tab_code, encoding="utf-8")
+    u_tab = {"file": str(f_tab), "start": 2, "end": 3, "name": "m1", "kind": "function"}
+    meta_tab = find_enclosing_class(tab_code, u_tab)
+    assert meta_tab is not None
+    assert meta_tab["method_indent"] == "\t"
+
+    u_tab2 = {"file": str(f_tab), "start": 5, "end": 6, "name": "m2", "kind": "function"}
+    patch_tab = generate_refactoring_patch(
+        [(0.95, u_tab, u_tab2)],
+        repo_root=str(tmp_path),
+        method_binding="method",
+        replace_clones=True,
+    )
+    assert patch_tab
+    assert "+\tdef _shared_m1_m2(self" in patch_tab
+    assert "+\t\treturn " in patch_tab
+
+    two_space_code = (
+        "class TwoSpaceClass:\n"
+        "  def m1(self, x: int) -> int:\n"
+        "    return x + 1\n"
+        "\n"
+        "  def m2(self, x: int) -> int:\n"
+        "    return x + 1\n"
+    )
+    f_two = tmp_path / "two.py"
+    f_two.write_text(two_space_code, encoding="utf-8")
+    u_two = {"file": str(f_two), "start": 2, "end": 3, "name": "m1", "kind": "function"}
+    meta_two = find_enclosing_class(two_space_code, u_two)
+    assert meta_two is not None
+    assert meta_two["method_indent"] == "  "
+
+
+def test_receiver_bound_mixed_kind_declines_replacement(tmp_path: Path) -> None:
+    """Verifies that differing receiver kinds with referenced receivers decline replacement."""
+    code = (
+        "class Handler:\n"
+        "    def inst_worker(self, x: int) -> int:\n"
+        "        return self.value + x\n"
+        "\n"
+        "    @classmethod\n"
+        "    def cls_worker(cls, x: int) -> int:\n"
+        "        return cls.value + x\n"
+    )
+    f = tmp_path / "mixed_referenced.py"
+    f.write_text(code, encoding="utf-8")
+    u1 = {
+        "file": str(f),
+        "start": 2,
+        "end": 3,
+        "name": "inst_worker",
+        "kind": "function",
+        "enclosing_class": "Handler",
+        "receiver_kind": "instance",
+    }
+    u2 = {
+        "file": str(f),
+        "start": 6,
+        "end": 7,
+        "name": "cls_worker",
+        "kind": "function",
+        "enclosing_class": "Handler",
+        "receiver_kind": "class",
+    }
+
+    # Synthesis must return empty string
+    helper = synthesize_shared_helper_code(u1, u2)
+    assert helper == ""
+
+    # Patch generation must skip / return empty patch
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        method_binding="auto",
+        replace_clones=True,
+    )
+    assert patch == ""
+
+
+def test_class_body_in_factory_function_uses_module_binding(tmp_path: Path) -> None:
+    """Verifies that class body units in a local class defined inside a factory function use module binding."""
+    code = (
+        "def make_class():\n"
+        "    class LocalClass:\n"
+        "        vals1 = [x * 2 for x in range(10)]\n"
+        "        vals2 = [x * 2 for x in range(10)]\n"
+        "    return LocalClass\n"
+    )
+    f = tmp_path / "factory.py"
+    f.write_text(code, encoding="utf-8")
+    u1 = {
+        "file": str(f),
+        "start": 3,
+        "end": 3,
+        "name": "vals1",
+        "kind": "comprehension",
+        "enclosing_class": "LocalClass",
+    }
+    u2 = {
+        "file": str(f),
+        "start": 4,
+        "end": 4,
+        "name": "vals2",
+        "kind": "comprehension",
+        "enclosing_class": "LocalClass",
+    }
+
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        method_binding="auto",
+        replace_clones=True,
+    )
+    assert patch
+    # Must NOT emit self. inside class creation body
+    assert "self._shared" not in patch
+    # Must synthesize module helper
+    assert "+def _shared" in patch
+
+
+def test_nested_class_static_method_uses_dunder_class(tmp_path: Path) -> None:
+    """Verifies that nested static methods in Outer.Inner delegate via __class__._shared."""
+    code = (
+        "class Outer:\n"
+        "    class Inner:\n"
+        "        @staticmethod\n"
+        "        def add1(a: int, b: int) -> int:\n"
+        "            return a + b\n"
+        "\n"
+        "        @staticmethod\n"
+        "        def add2(a: int, b: int) -> int:\n"
+        "            return a + b\n"
+    )
+    f = tmp_path / "nested_static.py"
+    f.write_text(code, encoding="utf-8")
+    u1 = {
+        "file": str(f),
+        "start": 4,
+        "end": 5,
+        "name": "add1",
+        "kind": "function",
+        "enclosing_class": "Inner",
+        "receiver_kind": "static",
+        "is_static": True,
+    }
+    u2 = {
+        "file": str(f),
+        "start": 8,
+        "end": 9,
+        "name": "add2",
+        "kind": "function",
+        "enclosing_class": "Inner",
+        "receiver_kind": "static",
+        "is_static": True,
+    }
+
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        method_binding="method",
+        replace_clones=True,
+    )
+    assert patch
+    assert "@staticmethod" in patch
+    assert "__class__._shared" in patch
+    assert "Inner._shared" not in patch
 
 
 

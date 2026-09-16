@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import textwrap
 import tokenize
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 
@@ -653,6 +653,12 @@ def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
         if v not in inputs and v not in def_assigned
     ]
 
+    has_receiver_access = bool(
+        "self" in visitor.loads
+        or "cls" in visitor.loads
+        or any(a.startswith("self.") or a.startswith("cls.") for a in visitor.attrs_read + visitor.attrs_written)
+    )
+
     return {
         "inputs": inputs,
         "outputs": outputs,
@@ -676,6 +682,7 @@ def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
         "has_instance_binding": has_instance_binding,
         "has_class_binding": has_class_binding,
         "binding_kind": binding_kind,
+        "has_receiver_access": has_receiver_access,
         "instance_attrs": [a for a in visitor.attrs_read + visitor.attrs_written if a.startswith("self.")],
         "class_attrs": [a for a in visitor.attrs_read + visitor.attrs_written if a.startswith("cls.")],
     }
@@ -744,6 +751,9 @@ def analyze_unit_variable_scope(
     has_class_binding = info1.get("has_class_binding", False) or (
         info2.get("has_class_binding", False) if u2 is not None else False
     )
+    has_receiver_access = info1.get("has_receiver_access", False) or (
+        info2.get("has_receiver_access", False) if u2 is not None else False
+    )
     binding_kind = _determine_binding_kind(has_instance_binding, has_class_binding)
 
     _normalize_receiver_order(inputs, has_instance_binding, has_class_binding)
@@ -772,6 +782,7 @@ def analyze_unit_variable_scope(
         "has_instance_binding": has_instance_binding,
         "has_class_binding": has_class_binding,
         "binding_kind": binding_kind,
+        "has_receiver_access": has_receiver_access,
         "instance_attrs": list(dict.fromkeys(
             info1.get("instance_attrs", []) + (info2.get("instance_attrs", []) if u2 is not None else [])
         )),
@@ -1122,11 +1133,26 @@ def _inspect_enclosing_node(
     }
 
 
+def _extract_child_indentation(
+    lines: Sequence[str],
+    line_numbers: Iterable[int],
+    parent_indent: str,
+) -> Optional[str]:
+    """Finds the indentation of the first line from line_numbers that is more indented than parent_indent."""
+    for line_num in line_numbers:
+        if 1 <= line_num <= len(lines):
+            line_str: str = str(lines[line_num - 1])
+            ind: str = line_str[: len(line_str) - len(line_str.lstrip())]
+            if ind.startswith(parent_indent) and len(ind) > len(parent_indent):
+                return str(ind)
+    return None
+
+
 def find_enclosing_class(
     source_text: str,
     unit: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    """Locates the enclosing class definition for an AST code unit within the source text.
+    """Locates the innermost enclosing ClassDef for an AST code unit.
 
     Args:
         source_text: The complete original Python source code.
@@ -1145,10 +1171,29 @@ def find_enclosing_class(
     cls_line = lines[c_start - 1] if 1 <= c_start <= len(lines) else ""
     indent = cls_line[: len(cls_line) - len(cls_line.lstrip())]
     meta["indent"] = indent
-    meta["method_indent"] = indent + "    "
-    del meta["node"]
-    del meta["decorators"]
-    del meta["def_start"]
+
+    node = meta.get("node")
+    suite_indent = None
+    def_start = meta.get("def_start", c_start)
+    if isinstance(node, ast.ClassDef) and node.body:
+        cand_lines: List[int] = []
+        for stmt in node.body:
+            stmt_lineno = int(getattr(stmt, "lineno", 0))
+            earliest_line = stmt_lineno
+            decorators = getattr(stmt, "decorator_list", [])
+            if decorators:
+                dec_lines = [int(getattr(d, "lineno", stmt_lineno)) for d in decorators]
+                if dec_lines:
+                    dec_start = min(dec_lines)
+                    earliest_line = min(dec_start, earliest_line) if earliest_line > 0 else dec_start
+            if earliest_line > def_start:
+                cand_lines.append(earliest_line)
+        suite_indent = _extract_child_indentation(lines, cand_lines, indent)
+
+    meta["method_indent"] = suite_indent if suite_indent is not None else (indent + "    ")
+    meta.pop("node", None)
+    meta.pop("decorators", None)
+    meta.pop("def_start", None)
     return meta
 
 
@@ -1176,6 +1221,32 @@ def find_enclosing_function(
         for d in decs
     )
     return meta
+
+
+def _is_method_of_class(
+    fn_meta: Optional[Dict[str, Any]],
+    cls_meta: Optional[Dict[str, Any]],
+) -> bool:
+    """Returns True if the function is a method defined inside the enclosing class."""
+    if not fn_meta or not cls_meta:
+        return False
+    return bool(
+        cls_meta["start"] < fn_meta["start"]
+        and fn_meta["end"] <= cls_meta["end"]
+    )
+
+
+def _has_receiver_reference(
+    unit: Dict[str, Any],
+    scope: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Checks if a unit actually references an instance or class receiver in its executable body."""
+    target_scope = scope if scope is not None else analyze_unit_variable_scope(unit)
+    return bool(
+        target_scope.get("has_receiver_access")
+        or target_scope.get("instance_attrs")
+        or target_scope.get("class_attrs")
+    )
 
 
 def _get_enclosing_receiver_kind(fn_info: Optional[Dict[str, Any]]) -> str:
@@ -1224,6 +1295,7 @@ def synthesize_shared_helper_code(
     indent: str = "",
     is_static: bool = False,
     receiver_kind: Optional[str] = None,
+    step: Optional[str] = None,
 ) -> str:
     """Synthesizes a proposed shared helper function stub from two clone units.
 
@@ -1242,6 +1314,7 @@ def synthesize_shared_helper_code(
         indent: Base indentation prefix for helper definition lines (defaults to 4 spaces for methods).
         is_static: Whether the cloned methods are static methods.
         receiver_kind: Receiver kind of enclosing method ('class', 'instance', 'static').
+        step: Indentation step per indentation level (defaults to "\t" for tabs, 4 spaces otherwise).
     """
     lines1 = _extract_unit_body_lines(u1, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u1)])
     lines2 = _extract_unit_body_lines(u2, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u2)])
@@ -1307,6 +1380,11 @@ def synthesize_shared_helper_code(
         "class" if is_class_receiver else ("static" if is_static_clone else "instance")
     )
     receiver_kinds_differ = bool(k1 != k2)
+    if receiver_kinds_differ and (
+        _has_receiver_reference(u1, scope1) or _has_receiver_reference(u2, scope2)
+    ):
+        return ""
+
     is_in_method = bool(
         u1.get("kind") not in ("comprehension", "complex_expr")
         and u2.get("kind") not in ("comprehension", "complex_expr")
@@ -1512,14 +1590,22 @@ def synthesize_shared_helper_code(
         else:
             common_lines = common_lines + [f"return {helper_outputs[0]}"]
 
-    body_indent = indent + "    "
-    doc_indent = indent + "    "
-    sub_indent = indent + "        "
+    if step is None:
+        if "\t" in indent:
+            step = "\t"
+        elif indent and len(indent) <= 4 and len(indent) % 2 == 0:
+            step = indent
+        else:
+            step = "    "
+
+    body_indent = indent + step
+    doc_indent = indent + step
+    sub_indent = indent + step + step
     if effective_binding == "method":
         if is_class_receiver:
             call_target = f"cls.{helper_name}"
         elif is_static_clone:
-            call_target = f"{enc1 or 'ClassName'}.{helper_name}"
+            call_target = f"__class__.{helper_name}"
         else:
             call_target = f"self.{helper_name}"
     else:
@@ -1812,6 +1898,14 @@ def _build_whole_method_delegation(
                 n_end = getattr(node, "end_lineno", n_start)
                 if n_start == u_start or (node.name == unit.get("name") and n_start <= u_start <= n_end):
                     if node.body:
+                        b_cand_lines = [
+                            int(getattr(b_stmt, "lineno", 0))
+                            for b_stmt in node.body
+                            if getattr(b_stmt, "lineno", 0) > 0
+                        ]
+                        found_indent = _extract_child_indentation(lines, b_cand_lines, indent)
+                        if found_indent is not None:
+                            body_indent = found_indent
                         first_body = node.body[0]
                         sig_end_line = first_body.lineno - 1
                         if (
@@ -1840,11 +1934,17 @@ def _build_whole_method_delegation(
     if not header.endswith("\n"):
         header += "\n"
 
+    body_step = (
+        body_indent[len(indent):]
+        if body_indent.startswith(indent) and len(body_indent) > len(indent)
+        else ("\t" if "\t" in body_indent else "    ")
+    )
+
     effective_async = is_async or bool(await_prefix.strip())
     if effective_async and has_yield:
         delegation_stmt = (
             f"{body_indent}async for _item in {call_prefix}{helper_name}({args_str}):\n"
-            f"{body_indent}    yield _item\n"
+            f"{body_indent}{body_step}yield _item\n"
         )
     elif has_yield:
         if has_return:
@@ -1900,7 +2000,13 @@ def generate_refactoring_patch(
 
         fn1 = find_enclosing_function(orig_text, u1)
         fn2 = find_enclosing_function(orig_text, u2) if (f2_raw == f1_raw) else None
-        fn1_kind = _get_enclosing_receiver_kind(fn1)
+
+        if not _is_method_of_class(fn1, enc1):
+            fn1 = None
+        if not _is_method_of_class(fn2, enc2):
+            fn2 = None
+
+        fn1_kind = _get_enclosing_receiver_kind(fn1) if fn1 else "instance"
         fn2_kind = _get_enclosing_receiver_kind(fn2) if fn2 else fn1_kind
         receiver_kinds_differ = bool(fn2 and fn1_kind != fn2_kind)
         is_in_method = bool(fn1 and fn2)
@@ -1908,6 +2014,12 @@ def generate_refactoring_patch(
         if is_static:
             u1["is_static"] = True
             u2["is_static"] = True
+
+        if receiver_kinds_differ:
+            s1 = analyze_unit_variable_scope(u1)
+            s2 = analyze_unit_variable_scope(u2)
+            if _has_receiver_reference(u1, s1) or _has_receiver_reference(u2, s2):
+                continue
 
         effective_binding = _resolve_effective_binding(
             method_binding,
@@ -1922,6 +2034,16 @@ def generate_refactoring_patch(
             if (effective_binding == "method" and enc1)
             else ("    " if effective_binding == "method" else "")
         )
+        step = (
+            enc1["method_indent"][len(enc1["indent"]):]
+            if (
+                enc1
+                and enc1.get("indent") is not None
+                and enc1["method_indent"].startswith(enc1["indent"])
+                and len(enc1["method_indent"]) > len(enc1["indent"])
+            )
+            else None
+        )
 
         helper_code = synthesize_shared_helper_code(
             u1,
@@ -1931,7 +2053,10 @@ def generate_refactoring_patch(
             indent=helper_indent,
             is_static=is_static,
             receiver_kind=fn1_kind if effective_binding == "method" else None,
+            step=step,
         )
+        if not helper_code:
+            continue
 
         needed_typing = _extract_required_typing_imports(helper_code)
         existing_imports = _get_module_imported_names(orig_text)
@@ -1979,10 +2104,11 @@ def generate_refactoring_patch(
 
                     if effective_binding == "method":
                         t_fn = find_enclosing_function(orig_text, target_unit)
-                        t_kind = _get_enclosing_receiver_kind(t_fn)
+                        if not _is_method_of_class(t_fn, enc1):
+                            t_fn = None
+                        t_kind = _get_enclosing_receiver_kind(t_fn) if t_fn else "instance"
                         if t_kind == "static":
-                            cls_name = enc1["name"] if enc1 else ""
-                            unit_call_prefix = f"{cls_name}." if cls_name else ""
+                            unit_call_prefix = "__class__."
                             unit_receiver_omit = None
                         elif t_kind == "class":
                             unit_call_prefix = "cls."
@@ -2018,10 +2144,11 @@ def generate_refactoring_patch(
                         )
                     else:
                         call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
+                        rep_step = "\t" if "\t" in indent else "    "
                         if scope.get("has_yield") and scope.get("is_async"):
                             rep_stmt = (
                                 f"{indent}async for _item in {call_expr}:\n"
-                                f"{indent}    yield _item\n"
+                                f"{indent}{rep_step}yield _item\n"
                             )
                         else:
                             is_sync_gen = bool(scope.get("has_yield"))
@@ -2046,15 +2173,17 @@ def generate_refactoring_patch(
         if effective_binding == "method":
             current_lines = current_text.splitlines(keepends=True)
             insert_idx = max(0, insert_line - 1)
-            current_lines = current_lines[:insert_idx] + [helper_code + "\n"] + current_lines[insert_idx:]
+            helper_lines = [ln + "\n" for ln in helper_code.splitlines()] + ["\n"]
+            current_lines = current_lines[:insert_idx] + helper_lines + current_lines[insert_idx:]
             modified_lines = _insert_imports_into_module(current_lines, missing_import_lines)
         else:
             current_lines = current_text.splitlines(keepends=True)
             lines_with_imports = _insert_imports_into_module(current_lines, missing_import_lines)
             ins_idx = _find_module_helper_insertion_index(lines_with_imports)
+            helper_lines = ["\n"] + [ln + "\n" for ln in helper_code.splitlines()] + ["\n"]
             modified_lines = (
                 lines_with_imports[:ins_idx]
-                + ["\n", helper_code + "\n\n"]
+                + helper_lines
                 + lines_with_imports[ins_idx:]
             )
 
