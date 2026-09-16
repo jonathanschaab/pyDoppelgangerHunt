@@ -354,17 +354,129 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
     return definite, conditional
 
 
+def _determine_binding_kind(
+    has_instance_binding: bool,
+    has_class_binding: bool,
+) -> Optional[str]:
+    """Determines the scope binding category from instance and class binding flags."""
+    if has_instance_binding and has_class_binding:
+        return "mixed"
+    if has_instance_binding:
+        return "instance"
+    if has_class_binding:
+        return "class"
+    return None
+
+
 def _normalize_receiver_order(
     inputs: List[str],
     has_instance_binding: bool,
     has_class_binding: bool,
 ) -> None:
-    """Ensures self or cls is positioned as the first parameter in inputs."""
-    target_var = "self" if has_instance_binding else ("cls" if has_class_binding else None)
-    if target_var:
-        if target_var in inputs:
-            inputs.remove(target_var)
-        inputs.insert(0, target_var)
+    """Ensures self or cls is positioned as the primary receiver parameter in inputs."""
+    if has_instance_binding and has_class_binding:
+        if "cls" in inputs:
+            inputs.remove("cls")
+            inputs.insert(0, "cls")
+        if "self" in inputs:
+            inputs.remove("self")
+            inputs.insert(0, "self")
+    elif has_instance_binding:
+        if "self" in inputs:
+            inputs.remove("self")
+            inputs.insert(0, "self")
+    elif has_class_binding:
+        if "cls" in inputs:
+            inputs.remove("cls")
+            inputs.insert(0, "cls")
+
+
+def _format_call_arguments(
+    inputs: List[str],
+    param_details: List[Dict[str, Any]],
+    receiver_to_omit: Optional[str] = None,
+) -> str:
+    """Formats argument strings for helper call sites, preserving keyword-only, vararg, and kwarg syntax."""
+    param_map: Dict[str, str] = {
+        p["name"].lstrip("*"): p.get("kind", "pos") for p in param_details
+    }
+    formatted_args: List[str] = []
+    for raw_var in inputs:
+        clean_var = raw_var.lstrip("*")
+        if receiver_to_omit and clean_var == receiver_to_omit:
+            continue
+        kind = param_map.get(clean_var, "")
+        if kind == "kwonly":
+            formatted_args.append(f"{clean_var}={clean_var}")
+        elif kind == "vararg" or (raw_var.startswith("*") and not raw_var.startswith("**")):
+            formatted_args.append(f"*{clean_var}")
+        elif kind == "kwarg" or raw_var.startswith("**"):
+            formatted_args.append(f"**{clean_var}")
+        else:
+            formatted_args.append(clean_var)
+    return ", ".join(formatted_args)
+
+
+def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List[str]:
+    """Extracts executable body lines for a unit, stripping function headers and docstrings for whole functions."""
+    if not (
+        unit.get("kind") in ("function", "closure")
+        and ":" not in unit.get("name", "")
+    ):
+        return raw_lines
+
+    code_block = "\n".join(raw_lines)
+    dedented = textwrap.dedent(code_block)
+    try:
+        tree = ast.parse(dedented)
+        if len(tree.body) == 1 and isinstance(
+            tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            fn_node = tree.body[0]
+            body_nodes = list(fn_node.body)
+            if (
+                body_nodes
+                and isinstance(body_nodes[0], ast.Expr)
+                and isinstance(body_nodes[0].value, ast.Constant)
+                and isinstance(body_nodes[0].value.value, str)
+            ):
+                body_nodes = body_nodes[1:]
+            if body_nodes:
+                d_lines = dedented.splitlines()
+                start_l = body_nodes[0].lineno
+                end_l = getattr(body_nodes[-1], "end_lineno", len(d_lines))
+                extracted = d_lines[start_l - 1 : end_l]
+                if extracted:
+                    return textwrap.dedent("\n".join(extracted)).splitlines()
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+    return raw_lines
+
+
+def _find_module_helper_insertion_index(lines: List[str]) -> int:
+    """Finds the line index after module docstring, future imports, and all module imports."""
+    try:
+        tree = ast.parse("".join(lines))
+    except SyntaxError:
+        return 0
+
+    last_import_line = 0
+    docstring_line = 0
+
+    for idx, node in enumerate(tree.body):
+        if (
+            idx == 0
+            and isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            docstring_line = getattr(node, "end_lineno", node.lineno)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            end_l = getattr(node, "end_lineno", node.lineno)
+            last_import_line = max(last_import_line, end_l)
+
+    target_line = max(last_import_line, docstring_line)
+    return min(target_line, len(lines))
 
 
 def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
@@ -491,9 +603,7 @@ def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
         or "cls" in visitor.params
         or any(a.startswith("cls.") for a in visitor.attrs_read + visitor.attrs_written)
     )
-    binding_kind: Optional[str] = (
-        "instance" if has_instance_binding else ("class" if has_class_binding else None)
-    )
+    binding_kind = _determine_binding_kind(has_instance_binding, has_class_binding)
 
     _normalize_receiver_order(inputs, has_instance_binding, has_class_binding)
 
@@ -615,7 +725,7 @@ def analyze_unit_variable_scope(
     has_class_binding = info1.get("has_class_binding", False) or (
         info2.get("has_class_binding", False) if u2 is not None else False
     )
-    binding_kind = "instance" if has_instance_binding else ("class" if has_class_binding else None)
+    binding_kind = _determine_binding_kind(has_instance_binding, has_class_binding)
 
     _normalize_receiver_order(inputs, has_instance_binding, has_class_binding)
 
@@ -956,8 +1066,15 @@ def _find_innermost_enclosing_node(
         if isinstance(node, node_types):
             n_start = getattr(node, "lineno", 0)
             n_end = getattr(node, "end_lineno", n_start)
-            if n_start <= u_start <= u_end <= n_end:
-                candidates.append((n_end - n_start, node, n_start, n_end))
+            decorators = getattr(node, "decorator_list", [])
+            dec_start = (
+                min(getattr(d, "lineno", n_start) for d in decorators)
+                if decorators
+                else n_start
+            )
+            earliest_start = min(dec_start, n_start)
+            if earliest_start <= u_start <= u_end <= n_end:
+                candidates.append((n_end - earliest_start, node, earliest_start, n_end))
 
     if not candidates:
         return None
@@ -965,6 +1082,27 @@ def _find_innermost_enclosing_node(
     candidates.sort(key=lambda item: item[0])
     _, matched_node, n_start, n_end = candidates[0]
     return matched_node, n_start, n_end
+
+
+def _inspect_enclosing_node(
+    source_text: str,
+    unit: Dict[str, Any],
+    node_types: Tuple[type, ...],
+) -> Optional[Dict[str, Any]]:
+    """Locates and extracts metadata for the innermost enclosing AST node of matching types."""
+    res = _find_innermost_enclosing_node(source_text, unit, node_types)
+    if not res:
+        return None
+    matched_node, start, end = res
+    decorators = list(getattr(matched_node, "decorator_list", []))
+    return {
+        "node": matched_node,
+        "name": getattr(matched_node, "name", ""),
+        "start": start,
+        "def_start": getattr(matched_node, "lineno", start),
+        "end": end,
+        "decorators": decorators,
+    }
 
 
 def find_enclosing_class(
@@ -981,23 +1119,20 @@ def find_enclosing_class(
         A dictionary with class metadata ('name', 'start', 'end', 'indent', 'method_indent')
         if the unit is enclosed within a ClassDef; None otherwise.
     """
-    res = _find_innermost_enclosing_node(source_text, unit, (ast.ClassDef,))
-    if not res:
+    meta = _inspect_enclosing_node(source_text, unit, (ast.ClassDef,))
+    if not meta:
         return None
 
-    matched_node, c_start, c_end = res
     lines = source_text.splitlines(keepends=True)
+    c_start = meta["start"]
     cls_line = lines[c_start - 1] if 1 <= c_start <= len(lines) else ""
     indent = cls_line[: len(cls_line) - len(cls_line.lstrip())]
-    method_indent = indent + "    "
-
-    return {
-        "name": getattr(matched_node, "name", ""),
-        "start": c_start,
-        "end": c_end,
-        "indent": indent,
-        "method_indent": method_indent,
-    }
+    meta["indent"] = indent
+    meta["method_indent"] = indent + "    "
+    del meta["node"]
+    del meta["decorators"]
+    del meta["def_start"]
+    return meta
 
 
 def find_enclosing_function(
@@ -1005,24 +1140,37 @@ def find_enclosing_function(
     unit: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
     """Locates the innermost enclosing FunctionDef/AsyncFunctionDef for an AST code unit."""
-    res = _find_innermost_enclosing_node(
+    meta = _inspect_enclosing_node(
         source_text, unit, (ast.FunctionDef, ast.AsyncFunctionDef)
     )
-    if not res:
+    if not meta:
         return None
 
-    matched_node, f_start, f_end = res
-    return {
-        "name": getattr(matched_node, "name", ""),
-        "start": f_start,
-        "end": f_end,
-    }
+    decs = meta.pop("decorators")
+    meta.pop("node")
+    meta["is_static"] = any(
+        (isinstance(d, ast.Name) and d.id == "staticmethod")
+        or (isinstance(d, ast.Attribute) and d.attr == "staticmethod")
+        for d in decs
+    )
+    meta["is_class_method"] = any(
+        (isinstance(d, ast.Name) and d.id == "classmethod")
+        or (isinstance(d, ast.Attribute) and d.attr == "classmethod")
+        for d in decs
+    )
+    return meta
 
 
-def _resolve_effective_binding(method_binding: str, is_same_class: bool) -> str:
+def _resolve_effective_binding(
+    method_binding: str,
+    is_same_class: bool,
+    is_static: bool = False,
+) -> str:
     """Resolve the effective helper binding mode ('method' vs 'module')."""
     if method_binding in ("method", "module"):
         return method_binding
+    if is_static:
+        return "module"
     return "method" if is_same_class else "module"
 
 
@@ -1051,8 +1199,8 @@ def synthesize_shared_helper_code(
             or a module-level helper with explicit receiver injection otherwise.
         indent: Base indentation prefix for helper definition lines (defaults to 4 spaces for methods).
     """
-    lines1 = [ln.rstrip("\r\n") for ln in extract_unit_source_code(u1)]
-    lines2 = [ln.rstrip("\r\n") for ln in extract_unit_source_code(u2)]
+    lines1 = _extract_unit_body_lines(u1, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u1)])
+    lines2 = _extract_unit_body_lines(u2, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u2)])
 
     base_name1 = u1["name"].split(":")[0].lstrip("_")
     base_name2 = u2["name"].split(":")[0].lstrip("_")
@@ -1093,15 +1241,22 @@ def synthesize_shared_helper_code(
     f2 = u2.get("file", "").split("#")[0].replace("\\", "/")
     is_same_class = bool(enc1 and enc2 and enc1 == enc2 and f1 == f2)
 
-    effective_binding = _resolve_effective_binding(method_binding, is_same_class)
+    inputs = list(scope["inputs"])
+    is_static_clone = bool(
+        scope.get("binding_kind") == "static"
+        or u1.get("is_static")
+        or u2.get("is_static")
+    )
+
+    effective_binding = _resolve_effective_binding(
+        method_binding, is_same_class, is_static=is_static_clone
+    )
 
     if effective_binding == "method" and not indent:
         indent = "    "
 
     meta1 = {p["name"].lstrip("*"): p for p in scope1.get("param_details", [])}
     meta2 = {p["name"].lstrip("*"): p for p in scope2.get("param_details", [])}
-
-    inputs = list(scope["inputs"])
 
     params: List[str] = []
     seen_kwonly = False
@@ -1139,8 +1294,12 @@ def synthesize_shared_helper_code(
 
     descriptors.sort(key=_kind_rank)
 
-    # In method binding mode, ensure receiver parameter exists
-    if effective_binding == "method" and not any(desc["var"] in ("self", "cls") for desc in descriptors):
+    # In method binding mode, ensure receiver parameter exists (unless static)
+    if (
+        effective_binding == "method"
+        and not is_static_clone
+        and not any(desc["var"] in ("self", "cls") for desc in descriptors)
+    ):
         rec_var = "cls" if scope.get("binding_kind") == "class" else "self"
         descriptors.insert(0, {
             "var": rec_var,
@@ -1320,11 +1479,15 @@ def synthesize_shared_helper_code(
     docstring_str = "\n".join(docstring_lines)
 
     indented_body = "\n".join(f"{body_indent}{ln}" if ln.strip() else "" for ln in common_lines)
-    dec_prefix = (
-        f"{indent}@classmethod\n"
-        if (effective_binding == "method" and scope.get("binding_kind") == "class")
-        else ""
-    )
+    if effective_binding == "method":
+        if scope.get("binding_kind") == "class":
+            dec_prefix = f"{indent}@classmethod\n"
+        elif is_static_clone:
+            dec_prefix = f"{indent}@staticmethod\n"
+        else:
+            dec_prefix = ""
+    else:
+        dec_prefix = ""
     helper_def = (
         f"{dec_prefix}"
         f"{indent}{func_keyword} {helper_name}({params_str}) -> {return_type}:\n"
@@ -1553,6 +1716,7 @@ def _build_whole_method_delegation(
     helper_name: str,
     args_str: str,
     await_prefix: str,
+    has_return: bool = True,
 ) -> str:
     """Builds a delegated method replacement body preserving method signature and docstring."""
     lines = source_text.splitlines(keepends=True)
@@ -1570,7 +1734,9 @@ def _build_whole_method_delegation(
         tree = ast.parse(source_text)
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if getattr(node, "lineno", 0) == u_start or node.name == unit.get("name"):
+                n_start = getattr(node, "lineno", 0)
+                n_end = getattr(node, "end_lineno", n_start)
+                if n_start == u_start or (node.name == unit.get("name") and n_start <= u_start <= n_end):
                     if node.body:
                         first_body = node.body[0]
                         sig_end_line = first_body.lineno - 1
@@ -1600,7 +1766,8 @@ def _build_whole_method_delegation(
     if not header.endswith("\n"):
         header += "\n"
 
-    delegation_stmt = f"{body_indent}return {await_prefix}{call_prefix}{helper_name}({args_str})\n"
+    ret_prefix = "return " if has_return else ""
+    delegation_stmt = f"{body_indent}{ret_prefix}{await_prefix}{call_prefix}{helper_name}({args_str})\n"
     return header + delegation_stmt
 
 
@@ -1640,7 +1807,13 @@ def generate_refactoring_patch(
             enc1 and enc2 and enc1["name"] == enc2["name"] and enc1["start"] == enc2["start"]
         )
 
-        effective_binding = _resolve_effective_binding(method_binding, is_same_class)
+        fn1 = find_enclosing_function(orig_text, u1)
+        fn2 = find_enclosing_function(orig_text, u2) if (f2_raw == f1_raw) else None
+        is_static = bool((fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static")))
+
+        effective_binding = _resolve_effective_binding(
+            method_binding, is_same_class, is_static=is_static
+        )
 
         helper_indent = (
             enc1["method_indent"]
@@ -1678,12 +1851,25 @@ def generate_refactoring_patch(
         outputs = list(scope.get("outputs", []))
 
         if effective_binding == "method":
-            call_prefix = "cls." if scope.get("binding_kind") == "class" else "self."
-            call_args = [arg for arg in inputs if arg not in ("self", "cls")]
-            args_str = ", ".join(call_args)
+            if is_static or scope.get("binding_kind") == "static":
+                cls_name = enc1["name"] if enc1 else ""
+                call_prefix = f"{cls_name}." if cls_name else ""
+                receiver_to_omit = None
+            elif scope.get("binding_kind") == "class":
+                call_prefix = "cls."
+                receiver_to_omit = "cls"
+            else:  # "instance" or "mixed"
+                call_prefix = "self."
+                receiver_to_omit = "self"
         else:
             call_prefix = ""
-            args_str = ", ".join(inputs)
+            receiver_to_omit = None
+
+        args_str = _format_call_arguments(
+            inputs,
+            scope.get("param_details", []),
+            receiver_to_omit=receiver_to_omit,
+        )
 
         candidate_units = [u1]
         if f2_raw and f2_raw == f1_raw and not check_units_overlap(u1, u2):
@@ -1711,6 +1897,7 @@ def generate_refactoring_patch(
                             helper_name=helper_name,
                             args_str=args_str,
                             await_prefix=await_prefix,
+                            has_return=bool(outputs or scope.get("has_return", True)),
                         )
                     else:
                         if outputs:
@@ -1733,7 +1920,12 @@ def generate_refactoring_patch(
         else:
             current_lines = current_text.splitlines(keepends=True)
             lines_with_imports = _insert_imports_into_module(current_lines, missing_import_lines)
-            modified_lines = [helper_code + "\n\n"] + lines_with_imports
+            ins_idx = _find_module_helper_insertion_index(lines_with_imports)
+            modified_lines = (
+                lines_with_imports[:ins_idx]
+                + ["\n", helper_code + "\n\n"]
+                + lines_with_imports[ins_idx:]
+            )
 
         try:
             rel_f1 = str(f1_path.relative_to(root)).replace("\\", "/")

@@ -2635,6 +2635,132 @@ def test_parser_harvests_enclosing_class(tmp_path: Path) -> None:
     assert top_unit.get("enclosing_class") is None
 
 
+def test_same_named_whole_method_helper_synthesis(tmp_path: Path) -> None:
+    """Verifies that whole-method clones with identical names do not nest def inside helper."""
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    c1 = "class ServiceA:\n    def compute(self, n: int) -> int:\n        \"\"\"Docs.\"\"\"\n        ans = n * 10\n        return ans\n"
+    c2 = "class ServiceB:\n    def compute(self, n: int) -> int:\n        \"\"\"Docs.\"\"\"\n        ans = n * 10\n        return ans\n"
+    f1.write_text(c1, encoding="utf-8")
+    f2.write_text(c2, encoding="utf-8")
+    u1 = {"file": str(f1), "start": 2, "end": 5, "name": "compute", "kind": "function", "enclosing_class": "ServiceA"}
+    u2 = {"file": str(f2), "start": 2, "end": 5, "name": "compute", "kind": "function", "enclosing_class": "ServiceB"}
+    code = synthesize_shared_helper_code(u1, u2)
+    assert "def compute(" not in code
+    assert "ans = n * 10" in code
+    assert "return ans" in code
+
+
+def test_module_helper_placed_after_docstring_and_future_imports(tmp_path: Path) -> None:
+    """Verifies that cross-class module helpers are inserted after docstrings and future imports."""
+    f = tmp_path / "order_proc.py"
+    content = (
+        '"""Module docstring."""\n'
+        'from __future__ import annotations\n'
+        '\n'
+        'class Handler1:\n'
+        '    def handle(self, num: int) -> int:\n'
+        '        return num + 42\n'
+        '\n'
+        'class Handler2:\n'
+        '    def handle(self, num: int) -> int:\n'
+        '        return num + 42\n'
+    )
+    f.write_text(content, encoding="utf-8")
+    u1 = {"file": str(f), "start": 5, "end": 6, "name": "handle", "kind": "function", "enclosing_class": "Handler1"}
+    u2 = {"file": str(f), "start": 9, "end": 10, "name": "handle", "kind": "function", "enclosing_class": "Handler2"}
+    patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch
+    assert '"""Module docstring."""' in patch
+    assert 'from __future__ import annotations' in patch
+    assert "+def _shared_handle(self: Any, num: int) -> int:" in patch
+
+
+def test_mixed_binding_preserves_cls_argument(tmp_path: Path) -> None:
+    """Verifies that mixed instance and class binding retains cls in helper call arguments."""
+    f = tmp_path / "factory.py"
+    code = (
+        "class WidgetFactory:\n"
+        "    def build_item(self, cls: type, item_id: int) -> object:\n"
+        "        self.count += 1\n"
+        "        return cls(self.prefix, item_id)\n"
+    )
+    f.write_text(code, encoding="utf-8")
+    u = {"file": str(f), "start": 2, "end": 4, "name": "build_item", "kind": "function", "enclosing_class": "WidgetFactory"}
+    scope = analyze_unit_variable_scope(u)
+    assert scope.get("binding_kind") == "mixed"
+    assert scope.get("has_instance_binding") is True
+    assert scope.get("has_class_binding") is True
+
+
+def test_static_methods_avoid_self_injection(tmp_path: Path) -> None:
+    """Verifies static method clones don't inject self and delegate cleanly."""
+    f = tmp_path / "math_util.py"
+    code = (
+        "class MathUtils:\n"
+        "    @staticmethod\n"
+        "    def add_sq1(x: int, y: int) -> int:\n"
+        "        return (x + y) ** 2\n"
+        "\n"
+        "    @staticmethod\n"
+        "    def add_sq2(x: int, y: int) -> int:\n"
+        "        return (x + y) ** 2\n"
+    )
+    f.write_text(code, encoding="utf-8")
+    u1 = {"file": str(f), "start": 3, "end": 4, "name": "add_sq1", "kind": "function", "enclosing_class": "MathUtils"}
+    u2 = {"file": str(f), "start": 7, "end": 8, "name": "add_sq2", "kind": "function", "enclosing_class": "MathUtils"}
+    patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch
+    assert "+def _shared_add_sq1_add_sq2(x: int, y: int) -> int:" in patch
+    assert "+        return _shared_add_sq1_add_sq2(x, y)" in patch
+    assert "self." not in patch
+
+
+def test_parameter_kinds_forwarding_in_calls(tmp_path: Path) -> None:
+    """Verifies that keyword-only, vararg, and kwarg parameters are forwarded with correct syntax."""
+    f = tmp_path / "dispatcher.py"
+    code = (
+        "class EventDispatcher:\n"
+        "    def dispatch_a(self, event: str, *args: object, retries: int = 3, **kwargs: object) -> bool:\n"
+        "        self.sent.append(event)\n"
+        "        return len(self.sent) > 0\n"
+        "\n"
+        "    def dispatch_b(self, event: str, *args: object, retries: int = 3, **kwargs: object) -> bool:\n"
+        "        self.sent.append(event)\n"
+        "        return len(self.sent) > 0\n"
+    )
+    f.write_text(code, encoding="utf-8")
+    u1 = {"file": str(f), "start": 2, "end": 4, "name": "dispatch_a", "kind": "function", "enclosing_class": "EventDispatcher"}
+    u2 = {"file": str(f), "start": 6, "end": 8, "name": "dispatch_b", "kind": "function", "enclosing_class": "EventDispatcher"}
+    patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch
+    assert "retries=retries" in patch
+    assert "*args" in patch
+    assert "**kwargs" in patch
+
+
+def test_helper_inserted_before_decorators(tmp_path: Path) -> None:
+    """Verifies helper is inserted before decorators on earliest method."""
+    f = tmp_path / "repo.py"
+    code = (
+        "class Repository:\n"
+        "    @classmethod\n"
+        "    def get_first(cls, name: str) -> str:\n"
+        "        return f'item:{name}'\n"
+        "\n"
+        "    @classmethod\n"
+        "    def get_second(cls, name: str) -> str:\n"
+        "        return f'item:{name}'\n"
+    )
+    f.write_text(code, encoding="utf-8")
+    u1 = {"file": str(f), "start": 3, "end": 4, "name": "get_first", "kind": "function", "enclosing_class": "Repository"}
+    u2 = {"file": str(f), "start": 7, "end": 8, "name": "get_second", "kind": "function", "enclosing_class": "Repository"}
+    patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch
+    assert "_shared_get_first_get_second(cls, name: str) -> str:" in patch
+    assert "return cls._shared_get_first_get_second(name)" in patch
+
+
 
 
 
