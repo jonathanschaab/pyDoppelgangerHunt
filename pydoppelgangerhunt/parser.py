@@ -512,26 +512,50 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
         self.func_stack: List[str] = []
         self.class_stack: List[Tuple[str, int]] = []
 
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+    def _record_class_enclosure(self, node: ast.AST) -> None:
         if self.class_stack:
             self.enclosing_classes[id(node)] = self.class_stack[-1][0]
             self.enclosing_class_starts[id(node)] = self.class_stack[-1][1]
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        for dec in node.decorator_list:
+            self.visit(dec)
+        for base in node.bases:
+            self.visit(base)
+        for keyword in node.keywords:
+            self.visit(keyword)
+        for tp in getattr(node, "type_params", ()):
+            self.visit(tp)
+
+        self._record_class_enclosure(node)
         c_start = int(getattr(node, "lineno", 0))
         self.class_stack.append((node.name, c_start))
         saved_func_stack = self.func_stack
         self.func_stack = []
-        self.generic_visit(node)
+        for stmt in node.body:
+            self.visit(stmt)
         self.func_stack = saved_func_stack
         self.class_stack.pop()
 
     def _scope_function(self, fn: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
-        if self.class_stack:
-            self.enclosing_classes[id(fn)] = self.class_stack[-1][0]
-            self.enclosing_class_starts[id(fn)] = self.class_stack[-1][1]
+        for dec in fn.decorator_list:
+            self.visit(dec)
+        for default in fn.args.defaults:
+            self.visit(default)
+        for kw_default in fn.args.kw_defaults:
+            if kw_default is not None:
+                self.visit(kw_default)
+        if fn.returns is not None:
+            self.visit(fn.returns)
+        for tp in getattr(fn, "type_params", ()):
+            self.visit(tp)
+
+        self._record_class_enclosure(fn)
         if self.func_stack:
             self.closure_parents[id(fn)] = ":".join(self.func_stack)
         self.func_stack.append(fn.name)
-        self.generic_visit(fn)
+        for stmt in fn.body:
+            self.visit(stmt)
         self.func_stack.pop()
 
     def visit_FunctionDef(self, fn: ast.FunctionDef) -> None:
@@ -541,9 +565,7 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
         self._scope_function(fn)
 
     def _scope_comprehension(self, comp: ast.AST) -> None:
-        if self.class_stack:
-            self.enclosing_classes[id(comp)] = self.class_stack[-1][0]
-            self.enclosing_class_starts[id(comp)] = self.class_stack[-1][1]
+        self._record_class_enclosure(comp)
         if self.func_stack:
             if self.harvest_closures or len(self.func_stack) == 1:
                 self.func_owners[id(comp)] = ":".join(self.func_stack)
@@ -1058,12 +1080,17 @@ def harvest_file_units(
             decs = getattr(node, "decorator_list", [])
             fn_is_static = any(is_decorator_named(d, "staticmethod") for d in decs)
             fn_is_class_method = any(is_decorator_named(d, "classmethod") for d in decs)
-            is_closure = harvest_closures and id(node) in closure_parents
-            if fn_is_static:
-                fn_receiver_kind: Optional[str] = "static"
+            is_nested = id(node) in closure_parents
+            is_closure = harvest_closures and is_nested
+            if is_nested:
+                fn_receiver_kind: Optional[str] = None
+                fn_is_static = False
+                fn_is_class_method = False
+            elif fn_is_static:
+                fn_receiver_kind = "static"
             elif fn_is_class_method:
                 fn_receiver_kind = "class"
-            elif enc_class and not is_closure:
+            elif enc_class:
                 fn_receiver_kind = "instance"
             else:
                 fn_receiver_kind = None

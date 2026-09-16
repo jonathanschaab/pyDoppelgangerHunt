@@ -128,6 +128,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         return arg_set
 
     def _record_store_name(self, name: str) -> None:
+        self.deleted_names.discard(name)
         if len(self._scope_stack) > 1:
             self._scope_stack[-1].add(name)
         elif name not in BUILTIN_NAMES and name not in self.stores:
@@ -261,6 +262,11 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._record_store_name(node.name)
         for stmt in node.body:
             self.visit(stmt)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        for target in node.targets:
+            self.visit(target)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         # AugAssign both loads and stores the target
@@ -1591,8 +1597,12 @@ def _populate_unit_receiver_metadata(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
 ) -> None:
-    """Populates receiver_kind and is_static on a unit from enclosing AST nodes if absent."""
-    if "receiver_kind" in unit and "enclosing_class_start" in unit:
+    """Populates receiver_kind, enclosing_class, and is_static on a unit from enclosing AST nodes if absent."""
+    if (
+        "receiver_kind" in unit
+        and "enclosing_class" in unit
+        and "enclosing_class_start" in unit
+    ):
         return
     f_raw = unit.get("file", "").split("#")[0]
     if not f_raw:
@@ -1606,8 +1616,11 @@ def _populate_unit_receiver_metadata(
         source = f_path.read_text(encoding="utf-8")
         fn_meta = find_enclosing_function(source, unit)
         cls_meta = find_enclosing_class(source, unit)
-        if cls_meta and "enclosing_class_start" not in unit:
-            unit["enclosing_class_start"] = cls_meta["start"]
+        if cls_meta:
+            if "enclosing_class" not in unit:
+                unit["enclosing_class"] = cls_meta["name"]
+            if "enclosing_class_start" not in unit:
+                unit["enclosing_class_start"] = cls_meta["start"]
         if "receiver_kind" not in unit:
             if _is_method_of_class(fn_meta, cls_meta):
                 rec_k = _get_enclosing_receiver_kind(fn_meta)
@@ -2135,8 +2148,9 @@ def replace_unit_in_source(
     prefix_is_whitespace = not first_line[:start_c].strip()
     suffix_stripped = last_line[end_c:].strip()
     suffix_is_boundary_only = not suffix_stripped or suffix_stripped.startswith("#")
-    is_column_bounded = (start_col is not None or end_col is not None) and not (
-        prefix_is_whitespace and suffix_is_boundary_only
+    is_expr_kind = unit.get("kind") in ("comprehension", "complex_expr")
+    is_column_bounded = (start_col is not None or end_col is not None) and (
+        is_expr_kind or not (prefix_is_whitespace and suffix_is_boundary_only)
     )
 
     if is_column_bounded:
@@ -2149,10 +2163,20 @@ def replace_unit_in_source(
         final_rep = rep
         if attached_pragmas and not any(p in suffix_line for p in attached_pragmas):
             pragma_suffix = "  " + "  ".join(attached_pragmas)
-            if final_rep.endswith("\n"):
-                final_rep = final_rep[:-1] + pragma_suffix + "\n"
+            if not suffix_stripped or suffix_stripped.startswith("#"):
+                if final_rep.endswith("\n"):
+                    final_rep = final_rep[:-1] + pragma_suffix + "\n"
+                else:
+                    final_rep += pragma_suffix
             else:
-                final_rep += pragma_suffix
+                s_lines = suffix_all.splitlines(keepends=True)
+                if s_lines:
+                    first_s = s_lines[0]
+                    if first_s.endswith("\n"):
+                        s_lines[0] = first_s[:-1].rstrip() + pragma_suffix + "\n"
+                    else:
+                        s_lines[0] = first_s.rstrip() + pragma_suffix
+                    suffix_all = "".join(s_lines)
 
         return prefix_all + final_rep + suffix_all
 
@@ -2193,6 +2217,27 @@ def check_units_overlap(u1: Dict[str, Any], u2: Dict[str, Any]) -> bool:
         return False
     start1, end1 = int(u1.get("start", 1)), int(u1.get("end", 1))
     start2, end2 = int(u2.get("start", 1)), int(u2.get("end", 1))
+
+    if end1 < start2 or end2 < start1:
+        return False
+
+    s_col1 = u1.get("start_col")
+    e_col1 = u1.get("end_col")
+    s_col2 = u2.get("start_col")
+    e_col2 = u2.get("end_col")
+
+    if start1 == end1 == start2 == end2:
+        if s_col1 is not None and e_col1 is not None and s_col2 is not None and e_col2 is not None:
+            return max(int(s_col1), int(s_col2)) < min(int(e_col1), int(e_col2))
+
+    if start1 < start2 and end1 == start2:
+        if e_col1 is not None and s_col2 is not None:
+            return int(s_col2) < int(e_col1)
+
+    if start2 < start1 and end2 == start1:
+        if e_col2 is not None and s_col1 is not None:
+            return int(s_col1) < int(e_col2)
+
     return max(start1, start2) <= min(end1, end2)
 
 
@@ -2223,6 +2268,7 @@ def filter_overlapping_clone_units(units: Sequence[Dict[str, Any]]) -> List[Dict
             key=lambda u: (
                 -(int(u.get("end", 0)) - int(u.get("start", 0))),
                 int(u.get("start", 0)),
+                int(u.get("start_col", 0) or 0),
                 str(u.get("name", "")),
             ),
         )
@@ -2270,7 +2316,10 @@ def refactor_module_units(
 
     sorted_replacements = sorted(
         rep_list,
-        key=lambda item: int(item[0].get("start", 0)),
+        key=lambda item: (
+            int(item[0].get("start", 0)),
+            int(item[0].get("start_col", 0) or 0),
+        ),
         reverse=True,
     )
 
@@ -2459,7 +2508,10 @@ def generate_refactoring_patch(
             and u1.get("kind") not in ("comprehension", "complex_expr")
             and u2.get("kind") not in ("comprehension", "complex_expr")
         )
-        is_static = bool((fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static")))
+        if fn1 and fn2:
+            is_static = bool(fn1.get("is_static") and fn2.get("is_static"))
+        else:
+            is_static = bool((fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static")))
 
         s1 = analyze_unit_variable_scope(u1, repo_root=str(root))
         s2 = analyze_unit_variable_scope(u2, repo_root=str(root))
