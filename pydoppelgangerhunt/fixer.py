@@ -2070,9 +2070,6 @@ def generate_refactoring_patch(
             and u2.get("kind") not in ("comprehension", "complex_expr")
         )
         is_static = bool((fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static")))
-        if is_static:
-            u1["is_static"] = True
-            u2["is_static"] = True
 
         if receiver_kinds_differ:
             s1 = analyze_unit_variable_scope(u1, repo_root=str(root))

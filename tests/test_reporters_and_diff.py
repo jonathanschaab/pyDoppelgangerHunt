@@ -3441,6 +3441,32 @@ def test_two_space_async_generator_delegation(tmp_path: Path) -> None:
     assert "+  async for _item in _shared_gen1_gen2(src):\n+    yield _item\n" in patch
 
 
+def test_generate_refactoring_patch_does_not_mutate_unit_is_static(tmp_path: Path) -> None:
+    """Verifies that generate_refactoring_patch does not mutate caller unit dicts with is_static."""
+    code = (
+        "class Handler:\n"
+        "    @staticmethod\n"
+        "    def s_work(x: int) -> int:\n"
+        "        y = x\n"
+        "        return y + 1\n"
+        "\n"
+        "    def i_work(self, x: int) -> int:\n"
+        "        y = x\n"
+        "        return y + 1\n"
+    )
+    f = tmp_path / "mutate_check.py"
+    f.write_text(code, encoding="utf-8")
+    u_inst = {"file": str(f), "start": 8, "end": 9, "name": "i_work", "kind": "function"}
+    u_stat = {"file": str(f), "start": 3, "end": 4, "name": "s_work", "kind": "function"}
+
+    _ = generate_refactoring_patch(
+        [(0.95, u_inst, u_stat)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "is_static" not in u_inst
+
+
 
 
 
