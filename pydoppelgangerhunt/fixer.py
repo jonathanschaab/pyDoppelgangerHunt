@@ -42,6 +42,8 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.globals: List[str] = []
         self.attrs_read: List[str] = []
         self.attrs_written: List[str] = []
+        self.except_vars: Set[str] = set()
+        self.deleted_names: Set[str] = set()
         self._scope_stack: List[Set[str]] = []
         self.loop_offset: int = loop_offset
         self.loop_depth: int = 0
@@ -233,7 +235,10 @@ class _ScopeVisitor(ast.NodeVisitor):
         if isinstance(node.ctx, ast.Load):
             self._record_load_name(node.id)
         elif isinstance(node.ctx, ast.Store):
+            self.deleted_names.discard(node.id)
             self._record_store_name(node.id)
+        elif isinstance(node.ctx, ast.Del):
+            self.deleted_names.add(node.id)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if len(self._scope_stack) <= 1:
@@ -242,10 +247,19 @@ class _ScopeVisitor(ast.NodeVisitor):
                 if isinstance(node.ctx, ast.Load):
                     if attr_name not in self.attrs_read:
                         self.attrs_read.append(attr_name)
-                elif isinstance(node.ctx, ast.Store):
+                elif isinstance(node.ctx, (ast.Store, ast.Del)):
                     if attr_name not in self.attrs_written:
                         self.attrs_written.append(attr_name)
         self.generic_visit(node)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.type is not None:
+            self.visit(node.type)
+        if node.name and isinstance(node.name, str):
+            self.except_vars.add(node.name)
+            self._record_store_name(node.name)
+        for stmt in node.body:
+            self.visit(stmt)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         # AugAssign both loads and stores the target
@@ -418,8 +432,13 @@ class _ScopeVisitor(ast.NodeVisitor):
         if stmt not in self.local_imports:
             self.local_imports.append(stmt)
         for alias in node.names:
-            name = alias.asname or alias.name
-            self.imported_names[name] = stmt
+            if isinstance(node, ast.Import):
+                bound_name = alias.asname or alias.name.split(".")[0]
+            else:
+                bound_name = alias.asname or alias.name
+            if bound_name != "*":
+                self.imported_names[bound_name] = stmt
+                self._record_store_name(bound_name)
 
     def visit_Import(self, node: ast.Import) -> None:
         self._record_import_node(node)
@@ -471,6 +490,15 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                 sub_stmts.extend(stmt.finalbody)
             sub_def, sub_cond = _analyze_block_assignment(sub_stmts)
             conditional.update((sub_def | sub_cond) - definite)
+        elif hasattr(ast, "TryStar") and isinstance(stmt, getattr(ast, "TryStar")):
+            sub_stmts_star: List[ast.stmt] = list(getattr(stmt, "body", []))
+            if hasattr(stmt, "handlers") and getattr(stmt, "handlers", None):
+                for h in getattr(stmt, "handlers", []):
+                    sub_stmts_star.extend(getattr(h, "body", []))
+            if hasattr(stmt, "finalbody") and getattr(stmt, "finalbody", None):
+                sub_stmts_star.extend(getattr(stmt, "finalbody", []))
+            sub_def, sub_cond = _analyze_block_assignment(sub_stmts_star)
+            conditional.update((sub_def | sub_cond) - definite)
         elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):
             case_defs: List[Set[str]] = []
             case_conds: Set[str] = set()
@@ -505,6 +533,15 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                 conditional.update(case_conds - definite)
         elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             definite.add(stmt.name)
+        elif isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                bound_name = alias.asname or alias.name.split(".")[0]
+                definite.add(bound_name)
+        elif isinstance(stmt, ast.ImportFrom):
+            for alias in stmt.names:
+                if alias.name != "*":
+                    bound_name = alias.asname or alias.name
+                    definite.add(bound_name)
 
         for p_node in ast.walk(stmt):
             if isinstance(p_node, ast.NamedExpr) and isinstance(p_node.target, ast.Name):
@@ -838,12 +875,21 @@ def _inspect_unit_scope(
             v for v in visitor.stores
             if v not in visitor.globals
             and v not in BUILTIN_NAMES
+            and v not in visitor.except_vars
+            and v not in visitor.deleted_names
+            and v not in visitor.imported_names
         ]
     else:
         outputs = []
 
     for nl in visitor.nonlocals:
-        if nl in visitor.stores and nl not in outputs:
+        if (
+            nl in visitor.stores
+            and nl not in outputs
+            and nl not in visitor.except_vars
+            and nl not in visitor.deleted_names
+            and nl not in visitor.imported_names
+        ):
             outputs.append(nl)
 
     # Detect conditional variable escapes (outputs assigned conditionally without prior

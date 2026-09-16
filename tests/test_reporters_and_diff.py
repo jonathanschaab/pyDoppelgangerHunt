@@ -4265,6 +4265,131 @@ def test_async_comprehension_detected_as_async(tmp_path: Path) -> None:
     assert scope["is_async"] is True
 
 
+def test_except_handler_as_err_variable_not_treated_as_input_or_output(tmp_path: Path) -> None:
+    """Verifies that 'except Exception as err:' does not leak 'err' into inputs or subroutine outputs."""
+    code = (
+        "def run_task():\n"
+        "    try:\n"
+        "        action()\n"
+        "    except Exception as err:\n"
+        "        logger.error(err)\n"
+    )
+    f = tmp_path / "except_scope.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {
+        "file": "except_scope.py",
+        "start": 2,
+        "end": 5,
+        "name": "run_task:try_block",
+        "kind": "compound_block",
+    }
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert "err" not in scope["inputs"]
+    assert "err" not in scope["outputs"]
+    assert "logger" in scope["inputs"]
+
+
+def test_nested_closure_comprehension_owner_attribution(tmp_path: Path) -> None:
+    """Verifies that comprehensions inside nested closures are accurately attributed to their lexical parent path."""
+    code = (
+        "def outer():\n"
+        "    def inner():\n"
+        "        return [x for x in [1, 2, 3]]\n"
+        "    return inner\n"
+    )
+    f = tmp_path / "nested_comp.py"
+    f.write_text(code, encoding="utf-8")
+
+    units = harvest_file_units(
+        str(f),
+        repo_root=str(tmp_path),
+        min_lines=1,
+        min_tokens=1,
+        harvest_closures=True,
+        comprehensions=True,
+    )
+    comp_units = [u for u in units if u.get("kind") == "comprehension"]
+    assert len(comp_units) == 1
+    assert comp_units[0]["name"].startswith("outer:inner:listcomp_L")
+
+
+def test_attribute_del_tracked_as_attribute_written(tmp_path: Path) -> None:
+    """Verifies that 'del self.attr' is tracked in attrs_written and triggers instance binding."""
+    code = (
+        "class CacheManager:\n"
+        "    def clear_cache(self):\n"
+        "        del self._cache\n"
+    )
+    f = tmp_path / "del_attr.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {
+        "file": "del_attr.py",
+        "start": 2,
+        "end": 3,
+        "name": "CacheManager:clear_cache",
+        "kind": "function",
+    }
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert "self._cache" in scope["attrs_written"]
+    assert scope["has_instance_binding"] is True
+    assert scope["binding_kind"] == "instance"
+
+
+def test_deleted_variable_not_treated_as_subroutine_output(tmp_path: Path) -> None:
+    """Verifies that a locally deleted variable ('del x') is not returned in subroutine outputs."""
+    code = (
+        "def do_calc():\n"
+        "    x = 10\n"
+        "    del x\n"
+        "    y = 20\n"
+    )
+    f = tmp_path / "del_var.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {
+        "file": "del_var.py",
+        "start": 2,
+        "end": 4,
+        "name": "do_calc:stmts",
+        "kind": "sliding_window",
+    }
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert "x" not in scope["outputs"]
+    assert "y" in scope["outputs"]
+
+
+def test_local_import_not_treated_as_free_var_input_or_subroutine_output(tmp_path: Path) -> None:
+    """Verifies that locally imported modules and functions are not treated as inputs or subroutine outputs."""
+    code = (
+        "def compute(val):\n"
+        "    import math\n"
+        "    from os.path import join\n"
+        "    res = math.sqrt(val)\n"
+        "    path = join('dir', str(res))\n"
+    )
+    f = tmp_path / "local_import.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {
+        "file": "local_import.py",
+        "start": 2,
+        "end": 5,
+        "name": "compute:stmts",
+        "kind": "sliding_window",
+    }
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert "math" not in scope["inputs"]
+    assert "join" not in scope["inputs"]
+    assert "val" in scope["inputs"]
+    assert "math" not in scope["outputs"]
+    assert "join" not in scope["outputs"]
+    assert "res" in scope["outputs"]
+    assert "path" in scope["outputs"]
+
+
+
 
 
 

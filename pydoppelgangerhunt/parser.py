@@ -499,12 +499,16 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
         closure_parents: Optional[Dict[int, str]] = None,
         enclosing_classes: Optional[Dict[int, str]] = None,
         enclosing_class_starts: Optional[Dict[int, int]] = None,
+        func_owners: Optional[Dict[int, str]] = None,
+        harvest_closures: bool = True,
     ) -> None:
         self.closure_parents: Dict[int, str] = closure_parents if closure_parents is not None else {}
         self.enclosing_classes: Dict[int, str] = enclosing_classes if enclosing_classes is not None else {}
         self.enclosing_class_starts: Dict[int, int] = (
             enclosing_class_starts if enclosing_class_starts is not None else {}
         )
+        self.func_owners: Dict[int, str] = func_owners if func_owners is not None else {}
+        self.harvest_closures: bool = harvest_closures
         self.func_stack: List[str] = []
         self.class_stack: List[Tuple[str, int]] = []
 
@@ -540,6 +544,11 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
         if self.class_stack:
             self.enclosing_classes[id(comp)] = self.class_stack[-1][0]
             self.enclosing_class_starts[id(comp)] = self.class_stack[-1][1]
+        if self.func_stack:
+            if self.harvest_closures or len(self.func_stack) == 1:
+                self.func_owners[id(comp)] = ":".join(self.func_stack)
+            else:
+                self.func_owners[id(comp)] = self.func_stack[-1]
         self.generic_visit(comp)
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
@@ -1028,7 +1037,14 @@ def harvest_file_units(
     closure_parents: Dict[int, str] = {}
     enclosing_classes: Dict[int, str] = {}
     enclosing_class_starts: Dict[int, int] = {}
-    _ScopeHierarchyVisitor(closure_parents, enclosing_classes, enclosing_class_starts).visit(tree)
+    func_owners: Dict[int, str] = {}
+    _ScopeHierarchyVisitor(
+        closure_parents,
+        enclosing_classes,
+        enclosing_class_starts,
+        func_owners=func_owners,
+        harvest_closures=harvest_closures,
+    ).visit(tree)
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1315,21 +1331,6 @@ def harvest_file_units(
             )
 
     if comprehensions:
-        func_owner_map: Dict[int, str] = {}
-        for fn in ast.walk(tree):
-            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                qname = (
-                    f"{closure_parents[id(fn)]}:{fn.name}"
-                    if (harvest_closures and id(fn) in closure_parents)
-                    else fn.name
-                )
-                for child in ast.walk(fn):
-                    if child is not fn and isinstance(
-                        child,
-                        (ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp),
-                    ):
-                        func_owner_map.setdefault(id(child), qname)
-
         for comp in ast.walk(tree):
             if isinstance(
                 comp,
@@ -1337,7 +1338,7 @@ def harvest_file_units(
             ):
                 comp_name = type(comp).__name__.lower()
                 enc_cls = enclosing_classes.get(id(comp))
-                owner = func_owner_map.get(id(comp)) or enc_cls or "module"
+                owner = func_owners.get(id(comp)) or enc_cls or "module"
                 start_l = getattr(comp, "lineno", 0)
                 _record_node_unit(
                     units,
