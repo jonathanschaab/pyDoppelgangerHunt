@@ -129,7 +129,12 @@ class _ScopeVisitor(ast.NodeVisitor):
 
     def _record_store_name(self, name: str) -> None:
         self.deleted_names.discard(name)
-        if len(self._scope_stack) > 1:
+        if name in self.nonlocals:
+            if name not in BUILTIN_NAMES and name not in self.stores:
+                self.stores.append(name)
+        elif name in self.globals:
+            pass
+        elif len(self._scope_stack) > 1:
             self._scope_stack[-1].add(name)
         elif name not in BUILTIN_NAMES and name not in self.stores:
             self.stores.append(name)
@@ -243,8 +248,9 @@ class _ScopeVisitor(ast.NodeVisitor):
             self.deleted_names.add(node.id)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        if len(self._scope_stack) <= 1:
-            if isinstance(node.value, ast.Name) and node.value.id in ("self", "cls"):
+        if isinstance(node.value, ast.Name) and node.value.id in ("self", "cls"):
+            is_inner = any(node.value.id in s for s in self._scope_stack[1:])
+            if not is_inner:
                 attr_name = f"{node.value.id}.{node.attr}"
                 if isinstance(node.ctx, ast.Load):
                     if attr_name not in self.attrs_read:
@@ -274,8 +280,9 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._record_load_name(node.target.id)
             self._record_store_name(node.target.id)
         elif isinstance(node.target, ast.Attribute):
-            if len(self._scope_stack) <= 1:
-                if isinstance(node.target.value, ast.Name) and node.target.value.id in ("self", "cls"):
+            if isinstance(node.target.value, ast.Name) and node.target.value.id in ("self", "cls"):
+                is_inner = any(node.target.value.id in s for s in self._scope_stack[1:])
+                if not is_inner:
                     attr_name = f"{node.target.value.id}.{node.target.attr}"
                     if attr_name not in self.attrs_read:
                         self.attrs_read.append(attr_name)
@@ -2221,7 +2228,7 @@ def synthesize_shared_helper_code(
     )
 
     if include_imports:
-        needed_typing = _extract_required_typing_imports(f"{params_str} -> {return_type}")
+        needed_typing = _extract_required_typing_imports(helper_def)
         import_header_parts: List[str] = []
         if needed_typing:
             import_header_parts.append(f"from typing import {', '.join(sorted(needed_typing))}")

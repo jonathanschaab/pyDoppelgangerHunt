@@ -4845,6 +4845,119 @@ def test_extracted_helper_unconditional_walrus_no_redundant_init(tmp_path: Path)
     assert "res = None" not in patch
 
 
+def test_nested_closure_receiver_attribute_tracking(tmp_path: Path) -> None:
+    """Verifies that attributes accessed or mutated inside nested closures are attributed to the outer receiver."""
+    code = (
+        "class Pipeline:\n"
+        "    def run(self, items: list) -> list:\n"
+        "        def transform(x: int) -> int:\n"
+        "            self.count += 1\n"
+        "            return x + self.offset\n"
+        "        return [transform(i) for i in items]\n"
+    )
+    f = tmp_path / "closure_receiver.py"
+    f.write_text(code, encoding="utf-8")
+    u = {"file": str(f), "start": 2, "end": 6, "name": "run", "kind": "function"}
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+
+    assert "self.count" in scope["attrs_read"]
+    assert "self.count" in scope["attrs_written"]
+    assert "self.offset" in scope["attrs_read"]
+    assert "self.count" in scope["instance_attrs"]
+    assert "self.offset" in scope["instance_attrs"]
+    assert scope["has_receiver_access"] is True
+
+
+def test_nested_class_receiver_attribute_isolation(tmp_path: Path) -> None:
+    """Verifies that nested class methods do not leak their own self attributes to the enclosing method."""
+    code = (
+        "class Outer:\n"
+        "    def execute(self, val: int) -> int:\n"
+        "        class Inner:\n"
+        "            def helper(self, x: int) -> int:\n"
+        "                self.inner_data = x * 2\n"
+        "                return self.inner_data\n"
+        "        return Inner().helper(val)\n"
+    )
+    f = tmp_path / "nested_class_receiver.py"
+    f.write_text(code, encoding="utf-8")
+    u = {"file": str(f), "start": 2, "end": 7, "name": "execute", "kind": "function"}
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+
+    assert "self.inner_data" not in scope["attrs_read"]
+    assert "self.inner_data" not in scope["attrs_written"]
+    assert "self.inner_data" not in scope["instance_attrs"]
+
+
+def test_nested_closure_shadowed_self_param_isolation(tmp_path: Path) -> None:
+    """Verifies that local functions taking a parameter named 'self' do not leak receiver attributes."""
+    code = (
+        "class Service:\n"
+        "    def process(self, data: int) -> int:\n"
+        "        def inner(self, v: int) -> int:\n"
+        "            return self.shadowed + v\n"
+        "        return inner(self, data)\n"
+    )
+    f = tmp_path / "shadowed_self.py"
+    f.write_text(code, encoding="utf-8")
+    u = {"file": str(f), "start": 2, "end": 5, "name": "process", "kind": "function"}
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+
+    assert "self.shadowed" not in scope["attrs_read"]
+    assert "self.shadowed" not in scope["instance_attrs"]
+
+
+def test_synthesize_shared_helper_code_body_typing_imports(tmp_path: Path) -> None:
+    """Verifies that synthesize_shared_helper_code captures typing constructs inside the helper body."""
+    code = (
+        "def transform(data: list) -> list:\n"
+        "    res: List[Dict[str, Any]] = []\n"
+        "    for x in data:\n"
+        "        res.append({'val': x})\n"
+        "    return res\n"
+    )
+    f = tmp_path / "typing_body.py"
+    f.write_text(code, encoding="utf-8")
+    u1 = {"file": str(f), "start": 1, "end": 5, "name": "transform", "kind": "function"}
+
+    helper = synthesize_shared_helper_code(u1, u1, include_imports=True, repo_root=str(tmp_path))
+    assert "from typing import" in helper
+    assert "Dict" in helper
+    assert "List" in helper
+    assert "Any" in helper
+
+
+def test_nonlocal_variable_mutation_recorded_in_stores(tmp_path: Path) -> None:
+    """Verifies that nonlocal mutations within inner closures are recorded in unit stores and outputs."""
+    from pydoppelgangerhunt.fixer import _inspect_unit_scope  # pylint: disable=import-outside-toplevel
+    code = (
+        "def outer(limit: int) -> int:\n"
+        "    total = 0\n"
+        "    def increment(step: int) -> None:\n"
+        "        nonlocal total\n"
+        "        total += step\n"
+        "    increment(limit)\n"
+        "    return total\n"
+    )
+    f = tmp_path / "nonlocal_stores.py"
+    f.write_text(code, encoding="utf-8")
+    u_block = {
+        "file": str(f),
+        "start": 3,
+        "end": 6,
+        "name": "outer:sub",
+        "kind": "compound_block",
+    }
+    raw_info = _inspect_unit_scope(u_block, repo_root=str(tmp_path))
+    assert "total" in raw_info["stores"]
+    assert "total" in raw_info["outputs"]
+
+    scope = analyze_unit_variable_scope(u_block, repo_root=str(tmp_path))
+    assert "total" in scope["outputs"]
+    assert "total" in scope["nonlocals"]
+
+
+
 
 
 
