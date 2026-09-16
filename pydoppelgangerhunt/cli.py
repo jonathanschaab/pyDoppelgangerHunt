@@ -7,7 +7,12 @@ import os
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Set
 
-from pydoppelgangerhunt.baseline import filter_clones_by_baseline, load_baseline, record_baseline
+from pydoppelgangerhunt.baseline import (
+    filter_clones_by_baseline,
+    load_baseline,
+    prune_baseline,
+    record_baseline,
+)
 from pydoppelgangerhunt.clustering import cluster_clone_families
 from pydoppelgangerhunt.config import DEFAULT_EXCLUDES, init_tool_configuration, load_tool_config
 from pydoppelgangerhunt.coverage import check_asymmetric_coverage, read_coverage_data
@@ -88,6 +93,7 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
     parser.add_argument("--init", action="store_true", help="Initialize pyDoppelgangerHunt configuration file")
     parser.add_argument("--baseline", type=str, default=None, help="Path to grandfathered clone baseline JSON file")
     parser.add_argument("--record-baseline", type=str, default=None, help="Path to record detected clones into baseline JSON file")
+    parser.add_argument("--prune-baseline", action="store_true", help="Prune orphaned fingerprints from baseline JSON file")
     parser.add_argument("--workers", type=int, default=None, help="Number of worker processes for parallel AST harvesting (default: 1)")
     parser.add_argument("--max-index-frequency", type=float, default=None, help="Inverted index frequency threshold to prune ubiquitous shingles (default: 0.25)")
 
@@ -300,8 +306,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"[OK] Recorded {len(clones)} clone baseline pair(s) to {bp}")
         return 0
 
-    if args.baseline:
-        base_fps = load_baseline(args.baseline)
+    baseline_path = args.baseline or tool_cfg.get("baseline")
+
+    if args.prune_baseline:
+        if not baseline_path:
+            print("[ERROR] --prune-baseline requires a baseline path (specify via --baseline or config)")
+            return 1
+        if not os.path.exists(baseline_path):
+            print(f"[ERROR] Baseline file '{baseline_path}' not found")
+            return 1
+        pruned_count, retained_count = prune_baseline(baseline_path, clones)
+        if args.format == "text":
+            print(f"[BASELINE] Pruned {pruned_count} orphaned fingerprint(s) from {baseline_path} ({retained_count} retained).")
+
+    if baseline_path:
+        base_fps = load_baseline(baseline_path)
         clones, suppressed_count = filter_clones_by_baseline(clones, base_fps)
         if args.format == "text":
             print(f"[BASELINE] Suppressed {suppressed_count} grandfathered clone(s). {len(clones)} un-grandfathered clone(s) remaining.")
