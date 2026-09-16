@@ -2217,6 +2217,36 @@ def test_replace_unit_in_source_subline_and_token_slicing() -> None:
     assert "# type: ignore" not in replaced3
 
 
+def test_replace_unit_in_source_harvested_block_keeps_indentation(tmp_path: Path) -> None:
+    """Verifies harvested indented multiline blocks are replaced as whole lines."""
+    from pydoppelgangerhunt import replace_unit_in_source  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.parser import harvest_file_units  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def run(value: int) -> int:\n"
+        "    if value > 0:\n"
+        "        result = value + 1\n"
+        "        return result\n"
+        "    fallback = 0\n"
+        "    return fallback\n"
+    )
+    src = tmp_path / "sample.py"
+    src.write_text(code, encoding="utf-8")
+
+    units = harvest_file_units(str(src), str(tmp_path), min_lines=2, min_tokens=3)
+    block_unit = next(unit for unit in units if unit.get("kind") == "compound_block")
+
+    replaced = replace_unit_in_source(code, block_unit, "    helper_result = shared(value)\n    return helper_result\n")
+
+    assert replaced == (
+        "def run(value: int) -> int:\n"
+        "    helper_result = shared(value)\n"
+        "    return helper_result\n"
+        "    fallback = 0\n"
+        "    return fallback\n"
+    )
+
+
 def test_synthesize_helper_with_pragma_and_import_preservation(tmp_path: Path) -> None:
     """Verifies that synthesize_shared_helper_code and local import capture preserve pragmas."""
     from pydoppelgangerhunt.fixer import (  # pylint: disable=import-outside-toplevel
@@ -2274,7 +2304,6 @@ def test_parser_harvests_token_columns(tmp_path: Path) -> None:
         assert "start_col" in u
         assert "end_col" in u
         assert isinstance(u["start_col"], int)
-
 
 
 

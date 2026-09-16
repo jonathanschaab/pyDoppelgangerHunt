@@ -1182,9 +1182,6 @@ def replace_unit_in_source(
     start_col = unit.get("start_col")
     end_col = unit.get("end_col")
 
-    # Check if this is a sub-line or column-bounded unit
-    is_column_bounded = (start_col is not None and start_col > 0) or end_col is not None
-
     rep = replacement_text
 
     # Extract boundary pragmas if requested
@@ -1199,13 +1196,20 @@ def replace_unit_in_source(
                 if p_text not in rep and p_text not in attached_pragmas:
                     attached_pragmas.append(p_text)
 
-    if is_column_bounded:
-        first_line = lines[start - 1]
-        start_c = max(0, min(len(first_line), int(start_col or 0)))
-        prefix_line = first_line[:start_c]
+    first_line = lines[start - 1]
+    start_c = max(0, min(len(first_line), int(start_col or 0)))
+    last_line = lines[end - 1]
+    end_c = len(last_line) if end_col is None else max(0, min(len(last_line), int(end_col)))
 
-        last_line = lines[end - 1]
-        end_c = len(last_line) if end_col is None else max(0, min(len(last_line), int(end_col)))
+    prefix_is_whitespace = not first_line[:start_c].strip()
+    suffix_stripped = last_line[end_c:].strip()
+    suffix_is_boundary_only = not suffix_stripped or suffix_stripped.startswith("#")
+    is_column_bounded = (start_col is not None or end_col is not None) and not (
+        prefix_is_whitespace and suffix_is_boundary_only
+    )
+
+    if is_column_bounded:
+        prefix_line = first_line[:start_c]
         suffix_line = last_line[end_c:]
 
         prefix_all = "".join(lines[: start - 1]) + prefix_line
