@@ -11,7 +11,12 @@ from pydoppelgangerhunt.baseline import (
     record_baseline,
 )
 from pydoppelgangerhunt.cli import build_arg_parser, main
-from pydoppelgangerhunt.clustering import UnionFind, cluster_clone_families, unit_key
+from pydoppelgangerhunt.clustering import (
+    UnionFind,
+    cluster_clone_families,
+    compute_medoid,
+    unit_key,
+)
 from pydoppelgangerhunt.config import (
     DEFAULT_EXCLUDES,
     DEFAULT_TOOL_TOML_CONTENT,
@@ -88,6 +93,7 @@ __all__ = [
     "compute_priority_score",
     "UnionFind",
     "cluster_clone_families",
+    "compute_medoid",
     "unit_key",
     "get_ast_tokens",
     "get_ast_shingles",
