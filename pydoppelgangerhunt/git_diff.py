@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import os
 import subprocess
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+
+MAJOR_POLICY_THRESHOLD: float = 0.50
+NEW_POLICY_THRESHOLD: float = 0.80
 
 
 def _run_git_command(args: Sequence[str], cwd: Optional[str] = None) -> Optional[str]:
@@ -65,10 +68,33 @@ def get_git_modified_line_ranges(
     return parse_git_diff_hunks(diff_output)
 
 
-def is_unit_in_modified_ranges(
-    unit: Dict[str, Any], modified_ranges: Dict[str, List[Tuple[int, int]]]
-) -> bool:
-    """Checks if AST unit overlaps with any git-modified line ranges."""
+def compute_unit_diff_overlap(
+    unit: Dict[str, Any],
+    modified_ranges: Dict[str, List[Tuple[int, int]]],
+) -> Tuple[int, float]:
+    """Computes the number of modified lines and the fractional overlap ratio for an AST unit.
+
+    Returns:
+        A tuple of (overlapping_modified_line_count, overlap_ratio) where ratio is in [0.0, 1.0].
+
+    Example:
+        >>> from pydoppelgangerhunt.git_diff import (
+        ...     compute_unit_diff_overlap,
+        ...     parse_git_diff_hunks,
+        ... )
+        >>> diff_text = (
+        ...     "--- a/service.py\\n"
+        ...     "+++ b/service.py\\n"
+        ...     "@@ -10,0 +10,5 @@\\n"
+        ... )
+        >>> modified_ranges = parse_git_diff_hunks(diff_text)
+        >>> unit = {"file": "service.py", "start": 8, "end": 15}
+        >>> overlap_count, overlap_ratio = compute_unit_diff_overlap(unit, modified_ranges)
+        >>> overlap_count
+        5
+        >>> overlap_ratio
+        0.625
+    """
     norm_file = unit["file"].replace("\\", "/")
     target_ranges = modified_ranges.get(norm_file)
     if not target_ranges:
@@ -77,27 +103,75 @@ def is_unit_in_modified_ranges(
                 target_ranges = ranges
                 break
     if not target_ranges:
+        return 0, 0.0
+
+    u_start = int(unit.get("start", 1))
+    u_end = int(unit.get("end", u_start))
+    total_unit_lines = max(1, u_end - u_start + 1)
+
+    overlapping_lines: Set[int] = set()
+    for m_start, m_end in target_ranges:
+        overlap_start = max(u_start, m_start)
+        overlap_end = min(u_end, m_end)
+        if overlap_start <= overlap_end:
+            overlapping_lines.update(range(overlap_start, overlap_end + 1))
+
+    overlap_count = len(overlapping_lines)
+    overlap_ratio = overlap_count / total_unit_lines
+    return overlap_count, round(overlap_ratio, 4)
+
+
+def is_unit_in_modified_ranges(
+    unit: Dict[str, Any],
+    modified_ranges: Dict[str, List[Tuple[int, int]]],
+    min_overlap_ratio: float = 0.0,
+    policy: str = "any",
+) -> bool:
+    """Checks if AST unit overlaps with git-modified line ranges according to the partial hunk policy.
+
+    Policies:
+        - "any": Overlaps if at least 1 line is modified (and overlap_ratio >= min_overlap_ratio).
+        - "major": Overlaps if at least 50% of the unit lines are modified (or min_overlap_ratio if > 0).
+        - "new": Overlaps if at least 80% of the unit lines are modified (or min_overlap_ratio if > 0).
+    """
+    overlap_count, ratio = compute_unit_diff_overlap(unit, modified_ranges)
+    if overlap_count == 0:
         return False
 
-    u_start = unit["start"]
-    u_end = unit["end"]
-    for m_start, m_end in target_ranges:
-        if max(u_start, m_start) <= min(u_end, m_end):
-            return True
-    return False
+    effective_ratio_floor = min_overlap_ratio
+    if effective_ratio_floor <= 0.0:
+        if policy == "major":
+            effective_ratio_floor = MAJOR_POLICY_THRESHOLD
+        elif policy == "new":
+            effective_ratio_floor = NEW_POLICY_THRESHOLD
+
+    return ratio >= effective_ratio_floor
 
 
 def filter_clones_by_git_diff(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     modified_ranges: Dict[str, List[Tuple[int, int]]],
+    policy: str = "any",
+    min_overlap_ratio: float = 0.0,
+    both_units: bool = False,
 ) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]:
-    """Filters clones to only retain pairs where at least one unit intersects git-modified lines."""
+    """Filters clones based on git-modified line ranges and partial hunk policy."""
     if not modified_ranges:
         return []
     filtered: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
     for sim, u1, u2 in clones:
-        if is_unit_in_modified_ranges(u1, modified_ranges) or is_unit_in_modified_ranges(u2, modified_ranges):
-            filtered.append((sim, u1, u2))
+        u1_mod = is_unit_in_modified_ranges(
+            u1, modified_ranges, min_overlap_ratio=min_overlap_ratio, policy=policy
+        )
+        u2_mod = is_unit_in_modified_ranges(
+            u2, modified_ranges, min_overlap_ratio=min_overlap_ratio, policy=policy
+        )
+        if both_units:
+            if u1_mod and u2_mod:
+                filtered.append((sim, u1, u2))
+        else:
+            if u1_mod or u2_mod:
+                filtered.append((sim, u1, u2))
     return filtered
 
 

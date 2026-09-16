@@ -37,7 +37,10 @@ from pydoppelgangerhunt.fixer import (
     synthesize_shared_helper_code,
 )
 from pydoppelgangerhunt.git_diff import (
+    MAJOR_POLICY_THRESHOLD,
+    NEW_POLICY_THRESHOLD,
     check_temporal_divergence,
+    compute_unit_diff_overlap,
     filter_clones_by_git_diff,
     get_git_blame_info,
     get_git_modified_line_ranges,
@@ -45,9 +48,11 @@ from pydoppelgangerhunt.git_diff import (
     parse_git_diff_hunks,
 )
 from pydoppelgangerhunt.matcher import (
+    DEFAULT_STOP_SHINGLES,
     call_sequence_similarity,
     compute_pair_similarity,
     compute_priority_score,
+    get_boilerplate_stop_shingles,
     jaccard_similarity,
     lcs_alignment_similarity,
     merge_adjacent_clones,
@@ -125,8 +130,13 @@ __all__ = [
     "colorize",
     "parse_git_diff_hunks",
     "get_git_modified_line_ranges",
+    "compute_unit_diff_overlap",
     "is_unit_in_modified_ranges",
     "filter_clones_by_git_diff",
+    "MAJOR_POLICY_THRESHOLD",
+    "NEW_POLICY_THRESHOLD",
+    "DEFAULT_STOP_SHINGLES",
+    "get_boilerplate_stop_shingles",
     "get_git_blame_info",
     "check_temporal_divergence",
     "read_coverage_data",
