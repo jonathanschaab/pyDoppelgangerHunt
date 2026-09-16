@@ -597,10 +597,27 @@ def _record_unit(
     consistent_renaming: bool = False,
     abstract_expressions: bool = False,
     strip_docstrings: bool = True,
+    start_col: Optional[int] = None,
+    end_col: Optional[int] = None,
 ) -> None:
     """Records an AST unit if it satisfies thresholds and is not suppressed by inline comments."""
     if file_lines and check_inline_suppression(file_lines, start, end):
         return
+
+    if start_col is None:
+        if isinstance(ast_target, ast.AST):
+            start_col = getattr(ast_target, "col_offset", 0)
+        elif isinstance(ast_target, (list, tuple)) and ast_target:
+            start_col = getattr(ast_target[0], "col_offset", 0)
+        else:
+            start_col = 0
+    if end_col is None:
+        if isinstance(ast_target, ast.AST):
+            end_col = getattr(ast_target, "end_col_offset", None)
+        elif isinstance(ast_target, (list, tuple)) and ast_target:
+            end_col = getattr(ast_target[-1], "end_col_offset", None)
+        else:
+            end_col = None
 
     lines = end - start + 1
     if kind == "complex_expr":
@@ -666,6 +683,8 @@ def _record_unit(
                 "file": rel_file,
                 "start": start,
                 "end": end,
+                "start_col": start_col,
+                "end_col": end_col,
                 "lines": lines,
                 "tokens": tokens,
                 "shingles": shingles,
