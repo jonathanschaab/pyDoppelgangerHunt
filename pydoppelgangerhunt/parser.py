@@ -526,6 +526,23 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
     def visit_AsyncFunctionDef(self, fn: ast.AsyncFunctionDef) -> None:
         self._scope_function(fn)
 
+    def _scope_comprehension(self, comp: ast.AST) -> None:
+        if self.class_stack:
+            self.enclosing_classes[id(comp)] = self.class_stack[-1]
+        self.generic_visit(comp)
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._scope_comprehension(node)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._scope_comprehension(node)
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._scope_comprehension(node)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._scope_comprehension(node)
+
 
 _ClosureScoper = _ScopeHierarchyVisitor
 
@@ -1228,7 +1245,6 @@ def harvest_file_units(
 
     if comprehensions:
         func_owner_map: Dict[int, str] = {}
-        func_class_map: Dict[int, Optional[str]] = {}
         for fn in ast.walk(tree):
             if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 qname = (
@@ -1242,7 +1258,6 @@ def harvest_file_units(
                         (ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp),
                     ):
                         func_owner_map.setdefault(id(child), qname)
-                        func_class_map.setdefault(id(child), enclosing_classes.get(id(fn)))
 
         for comp in ast.walk(tree):
             if isinstance(
@@ -1250,7 +1265,8 @@ def harvest_file_units(
                 (ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp),
             ):
                 comp_name = type(comp).__name__.lower()
-                owner = func_owner_map.get(id(comp), "module")
+                enc_cls = enclosing_classes.get(id(comp))
+                owner = func_owner_map.get(id(comp)) or enc_cls or "module"
                 start_l = getattr(comp, "lineno", 0)
                 _record_node_unit(
                     units,
@@ -1268,7 +1284,7 @@ def harvest_file_units(
                     consistent_renaming=consistent_renaming,
                     abstract_expressions=abstract_expressions,
                     strip_docstrings=strip_docstrings,
-                    enclosing_class=func_class_map.get(id(comp)),
+                    enclosing_class=enc_cls,
                 )
 
     return units

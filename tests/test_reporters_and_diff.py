@@ -41,9 +41,12 @@ from pydoppelgangerhunt import (
     synthesize_shared_helper_code,
 )
 from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
+    _build_whole_method_delegation,
     _extract_required_typing_imports,
+    _find_module_helper_insertion_index,
     _insert_imports_into_module,
 )
+from pydoppelgangerhunt.parser import harvest_file_units
 
 
 def test_sarif_210_report_generation() -> None:
@@ -2759,6 +2762,205 @@ def test_helper_inserted_before_decorators(tmp_path: Path) -> None:
     assert patch
     assert "_shared_get_first_get_second(cls, name: str) -> str:" in patch
     assert "return cls._shared_get_first_get_second(name)" in patch
+
+
+def test_find_module_helper_insertion_index_shebang_and_encoding() -> None:
+    """Verifies that module helper insertion respects shebang and encoding cookies."""
+    lines_both = [
+        "#!/usr/bin/env python3\n",
+        "# -*- coding: utf-8 -*-\n",
+        "x = 1\n",
+    ]
+    assert _find_module_helper_insertion_index(lines_both) == 2
+
+    lines_shebang = [
+        "#!/usr/bin/env python3\n",
+        "x = 1\n",
+    ]
+    assert _find_module_helper_insertion_index(lines_shebang) == 1
+
+    lines_encoding = [
+        "# coding=utf-8\n",
+        "x = 1\n",
+    ]
+    assert _find_module_helper_insertion_index(lines_encoding) == 1
+
+    lines_syntax_error = [
+        "#!/usr/bin/env python3\n",
+        "# coding=utf-8\n",
+        "invalid ? ? ?\n",
+    ]
+    assert _find_module_helper_insertion_index(lines_syntax_error) == 2
+
+
+def test_build_whole_method_delegation_sync_and_async_generators() -> None:
+    """Verifies whole-method delegation syntax for sync and async generators."""
+    src = (
+        "class Streamer:\n"
+        "    def gen(self, count: int):\n"
+        "        \"\"\"Docstring.\"\"\"\n"
+        "        for i in range(count):\n"
+        "            yield i\n"
+    )
+    unit = {"name": "gen", "start": 2, "end": 5}
+    sync_del = _build_whole_method_delegation(
+        src,
+        unit,
+        call_prefix="self.",
+        helper_name="_shared_gen",
+        args_str="count",
+        has_yield=True,
+        is_async=False,
+    )
+    assert "yield from self._shared_gen(count)" in sync_del
+
+    async_src = (
+        "class AsyncStreamer:\n"
+        "    async def stream(self, count: int):\n"
+        "        for i in range(count):\n"
+        "            yield i\n"
+    )
+    async_unit = {"name": "stream", "start": 2, "end": 4}
+    async_del = _build_whole_method_delegation(
+        async_src,
+        async_unit,
+        call_prefix="self.",
+        helper_name="_shared_stream",
+        args_str="count",
+        has_yield=True,
+        is_async=True,
+    )
+    assert "async for _item in self._shared_stream(count):\n            yield _item" in async_del
+
+
+def test_static_methods_propagation_in_synthesis_and_patch(tmp_path: Path) -> None:
+    """Verifies is_static propagates into synthesize_shared_helper_code and method_binding='method'."""
+    u1: Dict[str, Any] = {
+        "file": "calc.py",
+        "start": 3,
+        "end": 4,
+        "name": "calc_a",
+        "kind": "function",
+        "enclosing_class": "Calculator",
+    }
+    u2: Dict[str, Any] = {
+        "file": "calc.py",
+        "start": 7,
+        "end": 8,
+        "name": "calc_b",
+        "kind": "function",
+        "enclosing_class": "Calculator",
+    }
+    code = synthesize_shared_helper_code(
+        u1,
+        u2,
+        method_binding="method",
+        is_static=True,
+    )
+    assert "@staticmethod" in code
+    assert "(self" not in code
+    assert "(cls" not in code
+    assert "Calculator._shared_calc_a_calc_b" in code
+
+    f = tmp_path / "calc.py"
+    calc_code = (
+        "class Calculator:\n"
+        "    @staticmethod\n"
+        "    def add_a(x: int, y: int) -> int:\n"
+        "        return x + y\n"
+        "\n"
+        "    @staticmethod\n"
+        "    def add_b(x: int, y: int) -> int:\n"
+        "        return x + y\n"
+    )
+    f.write_text(calc_code, encoding="utf-8")
+    u1["file"] = str(f)
+    u2["file"] = str(f)
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        method_binding="method",
+        replace_clones=True,
+    )
+    assert patch
+    assert "@staticmethod" in patch
+    assert "Calculator._shared" in patch
+
+
+def test_differing_receiver_kinds_in_same_class(tmp_path: Path) -> None:
+    """Verifies that clones with different receiver kinds fall back to module helper in auto mode,
+
+    and resolve per-unit receivers when method_binding='method' is forced.
+    """
+    f = tmp_path / "mixed_receivers.py"
+    code = (
+        "class Handler:\n"
+        "    def inst_worker(self, key: str) -> str:\n"
+        "        res = f'key:{key}'\n"
+        "        return res\n"
+        "\n"
+        "    @classmethod\n"
+        "    def cls_worker(cls, key: str) -> str:\n"
+        "        res = f'key:{key}'\n"
+        "        return res\n"
+    )
+    f.write_text(code, encoding="utf-8")
+    u1 = {
+        "file": str(f),
+        "start": 2,
+        "end": 4,
+        "name": "inst_worker",
+        "kind": "function",
+        "enclosing_class": "Handler",
+    }
+    u2 = {
+        "file": str(f),
+        "start": 7,
+        "end": 9,
+        "name": "cls_worker",
+        "kind": "function",
+        "enclosing_class": "Handler",
+    }
+
+    # In auto mode, differing receivers must fall back to module helper
+    patch_auto = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        method_binding="auto",
+        replace_clones=True,
+    )
+    assert patch_auto
+    assert "+def _shared_inst_worker_cls_worker(key: str) -> str:" in patch_auto
+    assert "self." not in patch_auto.split("def cls_worker")[1]
+
+    # When method binding is forced, receiver must be resolved per unit
+    patch_method = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        method_binding="method",
+        replace_clones=True,
+    )
+    assert patch_method
+    assert "self._shared_inst_worker_cls_worker" in patch_method
+    assert "cls._shared_inst_worker_cls_worker" in patch_method
+
+
+def test_class_level_comprehensions_harvest_enclosing_class(tmp_path: Path) -> None:
+    """Verifies that comprehensions defined directly in class body have enclosing_class set."""
+    f = tmp_path / "settings.py"
+    code = (
+        "class Settings:\n"
+        "    KEYS = [k.upper() for k in ('a', 'b', 'c')]\n"
+        "    MAP = {k: k * 2 for k in range(5)}\n"
+    )
+    f.write_text(code, encoding="utf-8")
+    units = harvest_file_units(str(f), str(tmp_path), comprehensions=True)
+    comps = [u for u in units if u.get("kind") == "comprehension"]
+    assert len(comps) >= 2
+    for comp in comps:
+        assert comp.get("enclosing_class") == "Settings"
+        assert comp.get("name", "").startswith("Settings:")
+
 
 
 

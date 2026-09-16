@@ -455,10 +455,18 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
 
 def _find_module_helper_insertion_index(lines: List[str]) -> int:
     """Finds the line index after module docstring, future imports, and all module imports."""
+    min_insert_idx = 0
+    if min_insert_idx < len(lines) and lines[min_insert_idx].startswith("#!"):
+        min_insert_idx += 1
+    if min_insert_idx < len(lines) and (
+        "coding:" in lines[min_insert_idx] or "coding=" in lines[min_insert_idx]
+    ):
+        min_insert_idx += 1
+
     try:
         tree = ast.parse("".join(lines))
     except SyntaxError:
-        return 0
+        return min_insert_idx
 
     last_import_line = 0
     docstring_line = 0
@@ -475,7 +483,7 @@ def _find_module_helper_insertion_index(lines: List[str]) -> int:
             end_l = getattr(node, "end_lineno", node.lineno)
             last_import_line = max(last_import_line, end_l)
 
-    target_line = max(last_import_line, docstring_line)
+    target_line = max(last_import_line, docstring_line, min_insert_idx)
     return min(target_line, len(lines))
 
 
@@ -873,6 +881,10 @@ def _insert_imports_into_module(
     insert_idx = 0
     if insert_idx < len(orig_lines) and orig_lines[insert_idx].startswith("#!"):
         insert_idx += 1
+    if insert_idx < len(orig_lines) and (
+        "coding:" in orig_lines[insert_idx] or "coding=" in orig_lines[insert_idx]
+    ):
+        insert_idx += 1
 
     in_docstring = False
     doc_quote = ""
@@ -1161,15 +1173,27 @@ def find_enclosing_function(
     return meta
 
 
+def _get_enclosing_receiver_kind(fn_info: Optional[Dict[str, Any]]) -> str:
+    """Returns the receiver kind for an enclosing function: static, class, instance, or none."""
+    if not fn_info:
+        return "none"
+    if fn_info.get("is_static"):
+        return "static"
+    if fn_info.get("is_class_method"):
+        return "class"
+    return "instance"
+
+
 def _resolve_effective_binding(
     method_binding: str,
     is_same_class: bool,
     is_static: bool = False,
+    receiver_kinds_differ: bool = False,
 ) -> str:
     """Resolve the effective helper binding mode ('method' vs 'module')."""
     if method_binding in ("method", "module"):
         return method_binding
-    if is_static:
+    if is_static or receiver_kinds_differ:
         return "module"
     return "method" if is_same_class else "module"
 
@@ -1182,6 +1206,7 @@ def synthesize_shared_helper_code(
     preserve_pragmas: bool = True,
     method_binding: str = "auto",
     indent: str = "",
+    is_static: bool = False,
 ) -> str:
     """Synthesizes a proposed shared helper function stub from two clone units.
 
@@ -1198,6 +1223,7 @@ def synthesize_shared_helper_code(
             "auto" emits a private class method if both clones reside in the same class,
             or a module-level helper with explicit receiver injection otherwise.
         indent: Base indentation prefix for helper definition lines (defaults to 4 spaces for methods).
+        is_static: Whether the cloned methods are static methods.
     """
     lines1 = _extract_unit_body_lines(u1, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u1)])
     lines2 = _extract_unit_body_lines(u2, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u2)])
@@ -1243,7 +1269,8 @@ def synthesize_shared_helper_code(
 
     inputs = list(scope["inputs"])
     is_static_clone = bool(
-        scope.get("binding_kind") == "static"
+        is_static
+        or scope.get("binding_kind") == "static"
         or u1.get("is_static")
         or u2.get("is_static")
     )
@@ -1447,11 +1474,15 @@ def synthesize_shared_helper_code(
     body_indent = indent + "    "
     doc_indent = indent + "    "
     sub_indent = indent + "        "
-    call_target = (
-        f"{'cls' if scope.get('binding_kind') == 'class' else 'self'}.{helper_name}"
-        if effective_binding == "method"
-        else helper_name
-    )
+    if effective_binding == "method":
+        if scope.get("binding_kind") == "class":
+            call_target = f"cls.{helper_name}"
+        elif is_static_clone:
+            call_target = f"{enc1 or 'ClassName'}.{helper_name}"
+        else:
+            call_target = f"self.{helper_name}"
+    else:
+        call_target = helper_name
 
     docstring_lines = [f"{doc_indent}\"\"\"Auto-extracted shared helper for duplicate logic."]
     if helper_outputs:
@@ -1715,8 +1746,10 @@ def _build_whole_method_delegation(
     call_prefix: str,
     helper_name: str,
     args_str: str,
-    await_prefix: str,
+    await_prefix: str = "",
     has_return: bool = True,
+    is_async: bool = False,
+    has_yield: bool = False,
 ) -> str:
     """Builds a delegated method replacement body preserving method signature and docstring."""
     lines = source_text.splitlines(keepends=True)
@@ -1766,8 +1799,20 @@ def _build_whole_method_delegation(
     if not header.endswith("\n"):
         header += "\n"
 
-    ret_prefix = "return " if has_return else ""
-    delegation_stmt = f"{body_indent}{ret_prefix}{await_prefix}{call_prefix}{helper_name}({args_str})\n"
+    effective_async = is_async or bool(await_prefix.strip())
+    if effective_async and has_yield:
+        delegation_stmt = (
+            f"{body_indent}async for _item in {call_prefix}{helper_name}({args_str}):\n"
+            f"{body_indent}    yield _item\n"
+        )
+    elif has_yield:
+        delegation_stmt = f"{body_indent}yield from {call_prefix}{helper_name}({args_str})\n"
+    elif effective_async:
+        ret_prefix = "return " if has_return else ""
+        delegation_stmt = f"{body_indent}{ret_prefix}await {call_prefix}{helper_name}({args_str})\n"
+    else:
+        ret_prefix = "return " if has_return else ""
+        delegation_stmt = f"{body_indent}{ret_prefix}{call_prefix}{helper_name}({args_str})\n"
     return header + delegation_stmt
 
 
@@ -1809,10 +1854,19 @@ def generate_refactoring_patch(
 
         fn1 = find_enclosing_function(orig_text, u1)
         fn2 = find_enclosing_function(orig_text, u2) if (f2_raw == f1_raw) else None
+        fn1_kind = _get_enclosing_receiver_kind(fn1)
+        fn2_kind = _get_enclosing_receiver_kind(fn2) if fn2 else fn1_kind
+        receiver_kinds_differ = bool(fn2 and fn1_kind != fn2_kind)
         is_static = bool((fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static")))
+        if is_static:
+            u1["is_static"] = True
+            u2["is_static"] = True
 
         effective_binding = _resolve_effective_binding(
-            method_binding, is_same_class, is_static=is_static
+            method_binding,
+            is_same_class,
+            is_static=is_static,
+            receiver_kinds_differ=receiver_kinds_differ,
         )
 
         helper_indent = (
@@ -1827,6 +1881,7 @@ def generate_refactoring_patch(
             type_merge_strategy=type_merge_strategy,
             method_binding=effective_binding,
             indent=helper_indent,
+            is_static=is_static,
         )
 
         needed_typing = _extract_required_typing_imports(helper_code)
@@ -1850,27 +1905,6 @@ def generate_refactoring_patch(
         inputs = list(scope.get("inputs", []))
         outputs = list(scope.get("outputs", []))
 
-        if effective_binding == "method":
-            if is_static or scope.get("binding_kind") == "static":
-                cls_name = enc1["name"] if enc1 else ""
-                call_prefix = f"{cls_name}." if cls_name else ""
-                receiver_to_omit = None
-            elif scope.get("binding_kind") == "class":
-                call_prefix = "cls."
-                receiver_to_omit = "cls"
-            else:  # "instance" or "mixed"
-                call_prefix = "self."
-                receiver_to_omit = "self"
-        else:
-            call_prefix = ""
-            receiver_to_omit = None
-
-        args_str = _format_call_arguments(
-            inputs,
-            scope.get("param_details", []),
-            receiver_to_omit=receiver_to_omit,
-        )
-
         candidate_units = [u1]
         if f2_raw and f2_raw == f1_raw and not check_units_overlap(u1, u2):
             candidate_units.append(u2)
@@ -1885,6 +1919,30 @@ def generate_refactoring_patch(
                 if 1 <= u_start <= len(orig_lines):
                     lead = orig_lines[u_start - 1]
                     indent = lead[: len(lead) - len(lead.lstrip())]
+
+                    if effective_binding == "method":
+                        t_fn = find_enclosing_function(orig_text, target_unit)
+                        t_kind = _get_enclosing_receiver_kind(t_fn)
+                        if t_kind == "static":
+                            cls_name = enc1["name"] if enc1 else ""
+                            unit_call_prefix = f"{cls_name}." if cls_name else ""
+                            unit_receiver_omit = None
+                        elif t_kind == "class":
+                            unit_call_prefix = "cls."
+                            unit_receiver_omit = "cls"
+                        else:
+                            unit_call_prefix = "self."
+                            unit_receiver_omit = "self"
+                    else:
+                        unit_call_prefix = ""
+                        unit_receiver_omit = None
+
+                    unit_args_str = _format_call_arguments(
+                        inputs,
+                        scope.get("param_details", []),
+                        receiver_to_omit=unit_receiver_omit,
+                    )
+
                     is_whole_method = (
                         target_unit.get("kind") in ("function", "closure")
                         and ":" not in target_unit.get("name", "")
@@ -1893,18 +1951,40 @@ def generate_refactoring_patch(
                         rep_stmt = _build_whole_method_delegation(
                             orig_text,
                             target_unit,
-                            call_prefix=call_prefix,
+                            call_prefix=unit_call_prefix,
                             helper_name=helper_name,
-                            args_str=args_str,
+                            args_str=unit_args_str,
                             await_prefix=await_prefix,
                             has_return=bool(outputs or scope.get("has_return", True)),
+                            is_async=bool(scope.get("is_async")),
+                            has_yield=bool(scope.get("has_yield")),
                         )
                     else:
-                        if outputs:
-                            assign_target = ", ".join(outputs) if len(outputs) >= 2 else outputs[0]
-                            rep_stmt = f"{indent}{assign_target} = {await_prefix}{call_prefix}{helper_name}({args_str})\n"
+                        if bool(scope.get("has_yield")):
+                            if scope.get("is_async"):
+                                rep_stmt = (
+                                    f"{indent}async for _item in "
+                                    f"{unit_call_prefix}{helper_name}({unit_args_str}):\n"
+                                    f"{indent}    yield _item\n"
+                                )
+                            else:
+                                rep_stmt = (
+                                    f"{indent}yield from "
+                                    f"{unit_call_prefix}{helper_name}({unit_args_str})\n"
+                                )
+                        elif outputs:
+                            assign_target = (
+                                ", ".join(outputs) if len(outputs) >= 2 else outputs[0]
+                            )
+                            rep_stmt = (
+                                f"{indent}{assign_target} = "
+                                f"{await_prefix}{unit_call_prefix}{helper_name}({unit_args_str})\n"
+                            )
                         else:
-                            rep_stmt = f"{indent}{await_prefix}{call_prefix}{helper_name}({args_str})\n"
+                            rep_stmt = (
+                                f"{indent}{await_prefix}{unit_call_prefix}"
+                                f"{helper_name}({unit_args_str})\n"
+                            )
 
                     units_to_replace.append((target_unit, rep_stmt))
 
