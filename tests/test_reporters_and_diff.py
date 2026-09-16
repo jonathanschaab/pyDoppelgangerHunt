@@ -3715,6 +3715,64 @@ def test_detect_indent_step_multi_level_two_spaces() -> None:
     assert _detect_indent_step("\t\t") == "\t"
 
 
+def test_insert_imports_raw_and_unicode_docstrings() -> None:
+    """Verifies that raw (r\"\"\") and unicode (u\"\"\") docstrings are preserved ahead of inserted imports."""
+    raw_lines = [
+        'r"""Raw module docstring with \\s+ escapes."""\n',
+        "x = 1\n",
+    ]
+    res_raw = _insert_imports_into_module(raw_lines, ["from typing import Any"])
+    assert res_raw[0].startswith('r"""')
+    assert "from typing import Any\n" in res_raw
+    assert res_raw.index("from typing import Any\n") > 0
+
+    uni_lines = [
+        'u"""Unicode module docstring with unicode text."""\n',
+        "x = 1\n",
+    ]
+    res_uni = _insert_imports_into_module(uni_lines, ["from typing import Any"])
+    assert res_uni[0].startswith('u"""')
+    assert res_uni.index("from typing import Any\n") > 0
+
+
+def test_extract_required_typing_imports_comprehensive() -> None:
+    """Verifies that standard library typing symbols such as Mapping and Literal are extracted."""
+    sig = "(config: Mapping[str, Any], mode: Literal['fast', 'slow']) -> Optional[Tuple[int, ...]]"
+    needed = _extract_required_typing_imports(sig)
+    for expected in ["Any", "Literal", "Mapping", "Optional", "Tuple"]:
+        assert expected in needed
+
+
+def test_same_name_classes_in_different_factories_not_same_class(tmp_path: Path) -> None:
+    """Verifies that two identically named local classes in different factory functions are not treated as same class."""
+    code = (
+        "def factory_one():\n"
+        "    class Config:\n"
+        "        def process(self, x: int) -> int:\n"
+        "            y = x * 2\n"
+        "            return y + 1\n"
+        "    return Config\n"
+        "\n"
+        "def factory_two():\n"
+        "    class Config:\n"
+        "        def process(self, x: int) -> int:\n"
+        "            y = x * 2\n"
+        "            return y + 1\n"
+        "    return Config\n"
+    )
+    f = tmp_path / "factories.py"
+    f.write_text(code, encoding="utf-8")
+
+    u1 = {"file": "factories.py", "start": 3, "end": 5, "name": "process", "kind": "function"}
+    u2 = {"file": "factories.py", "start": 10, "end": 12, "name": "process", "kind": "function"}
+
+    # In auto mode, because start lines differ (line 2 vs line 9), they cannot share a private class method
+    helper = synthesize_shared_helper_code(u1, u2, method_binding="auto", repo_root=str(tmp_path))
+    # Helper should fall back to module-level helper (no self parameter omission or @classmethod/method indent)
+    assert helper.startswith("def _shared_process(self: Any, x: int) -> int:")
+
+
+
 
 
 

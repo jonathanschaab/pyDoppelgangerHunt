@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import textwrap
 import tokenize
+import typing
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.parser import is_decorator_named
@@ -826,10 +827,7 @@ def _merge_types(t1: Optional[str], t2: Optional[str], strategy: str) -> str:
     return t1 or t2 or "Any"
 
 
-TYPING_SYMBOLS: Set[str] = {
-    "Any", "AsyncGenerator", "AsyncIterator", "Callable", "Dict", "Generator", "Iterable",
-    "Iterator", "List", "Optional", "Sequence", "Set", "Tuple", "Union",
-}
+TYPING_SYMBOLS: Set[str] = set(typing.__all__)
 
 
 def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
@@ -925,40 +923,69 @@ def _insert_imports_into_module(
 
     insert_idx = _find_header_cookie_boundary(orig_lines)
 
-    in_docstring = False
-    doc_quote = ""
-    for idx in range(insert_idx, len(orig_lines)):
-        line = orig_lines[idx].strip()
-        if not in_docstring:
-            if line.startswith(('"""', "'''")):
-                doc_quote = line[:3]
-                if line.endswith(doc_quote) and len(line) > 3:
+    parsed_with_ast = False
+    try:
+        tree = ast.parse("".join(orig_lines))
+        doc_end = 0
+        if (
+            tree.body
+            and isinstance(tree.body[0], ast.Expr)
+            and isinstance(tree.body[0].value, ast.Constant)
+            and isinstance(tree.body[0].value.value, str)
+        ):
+            doc_end = getattr(tree.body[0], "end_lineno", tree.body[0].lineno)
+        future_end = max(
+            (
+                getattr(node, "end_lineno", node.lineno)
+                for node in tree.body
+                if isinstance(node, ast.ImportFrom) and node.module == "__future__"
+            ),
+            default=0,
+        )
+        insert_idx = max(insert_idx, doc_end, future_end)
+        while insert_idx < len(orig_lines) and not orig_lines[insert_idx].strip():
+            insert_idx += 1
+        parsed_with_ast = True
+    except SyntaxError:
+        pass
+
+    if not parsed_with_ast:
+        in_docstring = False
+        doc_quote = ""
+        doc_prefixes = ('"""', "'''", 'r"""', "r'''", 'R"""', "R'''", 'u"""', "u'''", 'U"""', "U'''")
+        for idx in range(insert_idx, len(orig_lines)):
+            line = orig_lines[idx].strip()
+            if not in_docstring:
+                matching_pfx = next((p for p in doc_prefixes if line.startswith(p)), None)
+                if matching_pfx:
+                    doc_quote = matching_pfx[-3:]
+                    if line.endswith(doc_quote) and len(line) > len(matching_pfx):
+                        insert_idx = idx + 1
+                        break
+                    in_docstring = True
+                elif line.startswith("#") or not line:
+                    continue
+                else:
+                    break
+            else:
+                if line.endswith(doc_quote):
                     insert_idx = idx + 1
                     break
-                in_docstring = True
+
+        last_future_idx = -1
+        for idx in range(insert_idx, len(orig_lines)):
+            line = orig_lines[idx].strip()
+            if line.startswith("from __future__"):
+                last_future_idx = idx
             elif line.startswith("#") or not line:
                 continue
             else:
                 break
-        else:
-            if line.endswith(doc_quote):
-                insert_idx = idx + 1
-                break
 
-    last_future_idx = -1
-    for idx in range(insert_idx, len(orig_lines)):
-        line = orig_lines[idx].strip()
-        if line.startswith("from __future__"):
-            last_future_idx = idx
-        elif line.startswith("#") or not line:
-            continue
-        else:
-            break
-
-    if last_future_idx != -1:
-        insert_idx = last_future_idx + 1
-        while insert_idx < len(orig_lines) and not orig_lines[insert_idx].strip():
-            insert_idx += 1
+        if last_future_idx != -1:
+            insert_idx = last_future_idx + 1
+            while insert_idx < len(orig_lines) and not orig_lines[insert_idx].strip():
+                insert_idx += 1
 
     formatted = [imp.rstrip("\r\n") + "\n" for imp in deduped_imports]
     return orig_lines[:insert_idx] + formatted + ["\n"] + orig_lines[insert_idx:]
@@ -1130,7 +1157,7 @@ def _find_innermost_enclosing_node(
     if not candidates:
         return None
 
-    candidates.sort(key=lambda item: item[0])
+    candidates.sort(key=lambda item: (item[0], -item[2]))
     _, matched_node, n_start, n_end = candidates[0]
     return matched_node, n_start, n_end
 
@@ -1301,6 +1328,10 @@ def _populate_unit_receiver_metadata(
             unit["receiver_kind"] = rec_k
             if rec_k == "static":
                 unit["is_static"] = True
+            if cls_meta:
+                unit["enclosing_class_start"] = cls_meta["start"]
+        else:
+            unit["receiver_kind"] = "none"
     except OSError:
         pass
 
@@ -1414,7 +1445,15 @@ def synthesize_shared_helper_code(
     enc2 = u2.get("enclosing_class")
     f1 = u1.get("file", "").split("#")[0].replace("\\", "/")
     f2 = u2.get("file", "").split("#")[0].replace("\\", "/")
-    is_same_class = bool(enc1 and enc2 and enc1 == enc2 and f1 == f2)
+    enc1_start = u1.get("enclosing_class_start")
+    enc2_start = u2.get("enclosing_class_start")
+    is_same_class = bool(
+        enc1
+        and enc2
+        and enc1 == enc2
+        and f1 == f2
+        and (enc1_start is None or enc2_start is None or enc1_start == enc2_start)
+    )
 
     inputs = list(scope["inputs"])
 
