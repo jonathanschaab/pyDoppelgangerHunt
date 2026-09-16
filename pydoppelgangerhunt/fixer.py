@@ -354,8 +354,21 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
     return definite, conditional
 
 
+def _normalize_receiver_order(
+    inputs: List[str],
+    has_instance_binding: bool,
+    has_class_binding: bool,
+) -> None:
+    """Ensures self or cls is positioned as the first parameter in inputs."""
+    target_var = "self" if has_instance_binding else ("cls" if has_class_binding else None)
+    if target_var:
+        if target_var in inputs:
+            inputs.remove(target_var)
+        inputs.insert(0, target_var)
+
+
 def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
-    """Extracts scope analysis metadata for a single AST unit by parsing its source."""
+    """Extracts lexical and AST scope metadata for a single unit."""
     raw_lines = extract_unit_source_code(unit)
     dedented = textwrap.dedent("".join(raw_lines))
     empty_res: Dict[str, Any] = {
@@ -378,6 +391,11 @@ def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
         "is_async": False,
         "conditional_outputs": [],
         "definite_stores": [],
+        "has_instance_binding": False,
+        "has_class_binding": False,
+        "binding_kind": None,
+        "instance_attrs": [],
+        "class_attrs": [],
     }
     if not dedented.strip():
         return empty_res
@@ -463,6 +481,22 @@ def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
         if nl not in inputs:
             inputs.append(nl)
 
+    has_instance_binding = (
+        "self" in visitor.loads
+        or "self" in visitor.params
+        or any(a.startswith("self.") for a in visitor.attrs_read + visitor.attrs_written)
+    )
+    has_class_binding = (
+        "cls" in visitor.loads
+        or "cls" in visitor.params
+        or any(a.startswith("cls.") for a in visitor.attrs_read + visitor.attrs_written)
+    )
+    binding_kind: Optional[str] = (
+        "instance" if has_instance_binding else ("class" if has_class_binding else None)
+    )
+
+    _normalize_receiver_order(inputs, has_instance_binding, has_class_binding)
+
     # Definite and conditional assignment analysis across candidate statements
     def_assigned, _ = _analyze_block_assignment(candidate_stmts)
 
@@ -510,6 +544,11 @@ def _inspect_unit_scope(unit: Dict[str, Any]) -> Dict[str, Any]:
         "is_async": visitor.is_async,
         "conditional_outputs": conditional_outputs,
         "definite_stores": sorted(def_assigned),
+        "has_instance_binding": has_instance_binding,
+        "has_class_binding": has_class_binding,
+        "binding_kind": binding_kind,
+        "instance_attrs": [a for a in visitor.attrs_read + visitor.attrs_written if a.startswith("self.")],
+        "class_attrs": [a for a in visitor.attrs_read + visitor.attrs_written if a.startswith("cls.")],
     }
 
 
@@ -570,6 +609,16 @@ def analyze_unit_variable_scope(
         conditional_outputs = info1.get("conditional_outputs", [])
         definite_stores = info1.get("definite_stores", [])
 
+    has_instance_binding = info1.get("has_instance_binding", False) or (
+        info2.get("has_instance_binding", False) if u2 is not None else False
+    )
+    has_class_binding = info1.get("has_class_binding", False) or (
+        info2.get("has_class_binding", False) if u2 is not None else False
+    )
+    binding_kind = "instance" if has_instance_binding else ("class" if has_class_binding else None)
+
+    _normalize_receiver_order(inputs, has_instance_binding, has_class_binding)
+
     locals_ = [var for var in info1["stores"] if var not in inputs]
     return {
         "inputs": inputs,
@@ -591,6 +640,15 @@ def analyze_unit_variable_scope(
         "is_async": is_async,
         "conditional_outputs": conditional_outputs,
         "definite_stores": definite_stores,
+        "has_instance_binding": has_instance_binding,
+        "has_class_binding": has_class_binding,
+        "binding_kind": binding_kind,
+        "instance_attrs": list(dict.fromkeys(
+            info1.get("instance_attrs", []) + (info2.get("instance_attrs", []) if u2 is not None else [])
+        )),
+        "class_attrs": list(dict.fromkeys(
+            info1.get("class_attrs", []) + (info2.get("class_attrs", []) if u2 is not None else [])
+        )),
     }
 
 
@@ -874,12 +932,108 @@ def extract_unit_comments_and_pragmas(
     return results
 
 
+def _find_innermost_enclosing_node(
+    source_text: str,
+    unit: Dict[str, Any],
+    node_types: Tuple[type, ...],
+) -> Optional[Tuple[ast.AST, int, int]]:
+    """Locates the innermost AST node of matching types enclosing the given unit."""
+    if not source_text.strip():
+        return None
+
+    try:
+        tree = ast.parse(source_text)
+    except SyntaxError:
+        return None
+
+    u_start = int(unit.get("start", 0))
+    u_end = int(unit.get("end", u_start))
+    if u_start <= 0:
+        return None
+
+    candidates: List[Tuple[int, ast.AST, int, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, node_types):
+            n_start = getattr(node, "lineno", 0)
+            n_end = getattr(node, "end_lineno", n_start)
+            if n_start <= u_start <= u_end <= n_end:
+                candidates.append((n_end - n_start, node, n_start, n_end))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0])
+    _, matched_node, n_start, n_end = candidates[0]
+    return matched_node, n_start, n_end
+
+
+def find_enclosing_class(
+    source_text: str,
+    unit: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Locates the enclosing class definition for an AST code unit within the source text.
+
+    Args:
+        source_text: The complete original Python source code.
+        unit: AST unit dictionary with 1-indexed 'start' and 'end' line bounds.
+
+    Returns:
+        A dictionary with class metadata ('name', 'start', 'end', 'indent', 'method_indent')
+        if the unit is enclosed within a ClassDef; None otherwise.
+    """
+    res = _find_innermost_enclosing_node(source_text, unit, (ast.ClassDef,))
+    if not res:
+        return None
+
+    matched_node, c_start, c_end = res
+    lines = source_text.splitlines(keepends=True)
+    cls_line = lines[c_start - 1] if 1 <= c_start <= len(lines) else ""
+    indent = cls_line[: len(cls_line) - len(cls_line.lstrip())]
+    method_indent = indent + "    "
+
+    return {
+        "name": getattr(matched_node, "name", ""),
+        "start": c_start,
+        "end": c_end,
+        "indent": indent,
+        "method_indent": method_indent,
+    }
+
+
+def find_enclosing_function(
+    source_text: str,
+    unit: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Locates the innermost enclosing FunctionDef/AsyncFunctionDef for an AST code unit."""
+    res = _find_innermost_enclosing_node(
+        source_text, unit, (ast.FunctionDef, ast.AsyncFunctionDef)
+    )
+    if not res:
+        return None
+
+    matched_node, f_start, f_end = res
+    return {
+        "name": getattr(matched_node, "name", ""),
+        "start": f_start,
+        "end": f_end,
+    }
+
+
+def _resolve_effective_binding(method_binding: str, is_same_class: bool) -> str:
+    """Resolve the effective helper binding mode ('method' vs 'module')."""
+    if method_binding in ("method", "module"):
+        return method_binding
+    return "method" if is_same_class else "module"
+
+
 def synthesize_shared_helper_code(
     u1: Dict[str, Any],
     u2: Dict[str, Any],
     type_merge_strategy: str = "fallback_any",
     include_imports: bool = False,
     preserve_pragmas: bool = True,
+    method_binding: str = "auto",
+    indent: str = "",
 ) -> str:
     """Synthesizes a proposed shared helper function stub from two clone units.
 
@@ -892,6 +1046,10 @@ def synthesize_shared_helper_code(
         include_imports: Whether to prepend required typing and local imports.
         preserve_pragmas: Whether to preserve comments and pragmas (# type: ignore / # noqa)
             from the original clone units in the extracted helper function.
+        method_binding: Scope binding strategy ("auto", "method", "module").
+            "auto" emits a private class method if both clones reside in the same class,
+            or a module-level helper with explicit receiver injection otherwise.
+        indent: Base indentation prefix for helper definition lines (defaults to 4 spaces for methods).
     """
     lines1 = [ln.rstrip("\r\n") for ln in extract_unit_source_code(u1)]
     lines2 = [ln.rstrip("\r\n") for ln in extract_unit_source_code(u2)]
@@ -928,6 +1086,17 @@ def synthesize_shared_helper_code(
     scope1 = analyze_unit_variable_scope(u1)
     scope2 = analyze_unit_variable_scope(u2)
     scope = analyze_unit_variable_scope(u1, u2)
+
+    enc1 = u1.get("enclosing_class")
+    enc2 = u2.get("enclosing_class")
+    f1 = u1.get("file", "").split("#")[0].replace("\\", "/")
+    f2 = u2.get("file", "").split("#")[0].replace("\\", "/")
+    is_same_class = bool(enc1 and enc2 and enc1 == enc2 and f1 == f2)
+
+    effective_binding = _resolve_effective_binding(method_binding, is_same_class)
+
+    if effective_binding == "method" and not indent:
+        indent = "    "
 
     meta1 = {p["name"].lstrip("*"): p for p in scope1.get("param_details", [])}
     meta2 = {p["name"].lstrip("*"): p for p in scope2.get("param_details", [])}
@@ -970,6 +1139,16 @@ def synthesize_shared_helper_code(
 
     descriptors.sort(key=_kind_rank)
 
+    # In method binding mode, ensure receiver parameter exists
+    if effective_binding == "method" and not any(desc["var"] in ("self", "cls") for desc in descriptors):
+        rec_var = "cls" if scope.get("binding_kind") == "class" else "self"
+        descriptors.insert(0, {
+            "var": rec_var,
+            "type": "Any",
+            "default": None,
+            "kind": "pos",
+        })
+
     # Validate positional argument default order (non-default cannot follow default)
     has_pos_default = False
     invalid_pos_defaults = False
@@ -998,7 +1177,9 @@ def synthesize_shared_helper_code(
             params.append("*")
             seen_kwonly = True
 
-        if resolved_default is not None:
+        if var in ("self", "cls") and effective_binding == "method":
+            params.append(var)
+        elif resolved_default is not None:
             params.append(f"{var_name}: {resolved_type} = {resolved_default}")
         else:
             params.append(f"{var_name}: {resolved_type}")
@@ -1104,34 +1285,49 @@ def synthesize_shared_helper_code(
         else:
             common_lines = common_lines + [f"return {helper_outputs[0]}"]
 
-    docstring_lines = ["    \"\"\"Auto-extracted shared helper for duplicate logic."]
+    body_indent = indent + "    "
+    doc_indent = indent + "    "
+    sub_indent = indent + "        "
+    call_target = (
+        f"{'cls' if scope.get('binding_kind') == 'class' else 'self'}.{helper_name}"
+        if effective_binding == "method"
+        else helper_name
+    )
+
+    docstring_lines = [f"{doc_indent}\"\"\"Auto-extracted shared helper for duplicate logic."]
     if helper_outputs:
         if len(helper_outputs) >= 2:
-            call_site = f"{', '.join(helper_outputs)} = {await_prefix}{helper_name}(...)"
+            call_site = f"{', '.join(helper_outputs)} = {await_prefix}{call_target}(...)"
         else:
-            call_site = f"{helper_outputs[0]} = {await_prefix}{helper_name}(...)"
+            call_site = f"{helper_outputs[0]} = {await_prefix}{call_target}(...)"
         docstring_lines.append("")
-        docstring_lines.append("    Call site:")
-        docstring_lines.append(f"        {call_site}")
+        docstring_lines.append(f"{doc_indent}Call site:")
+        docstring_lines.append(f"{sub_indent}{call_site}")
     else:
         docstring_lines.append("")
-        docstring_lines.append("    Call site:")
-        docstring_lines.append(f"        {await_prefix}{helper_name}(...)")
+        docstring_lines.append(f"{doc_indent}Call site:")
+        docstring_lines.append(f"{sub_indent}{await_prefix}{call_target}(...)")
 
     hazards = scope.get("control_flow_hazards", [])
     if hazards:
         hazard_str = ", ".join(hazards)
         docstring_lines.append("")
         docstring_lines.append(
-            f"    WARNING: Non-local control flow hazard detected ({hazard_str}). "
+            f"{doc_indent}WARNING: Non-local control flow hazard detected ({hazard_str}). "
             "Direct extraction alters caller control flow semantics."
         )
-    docstring_lines.append("    \"\"\"")
+    docstring_lines.append(f"{doc_indent}\"\"\"")
     docstring_str = "\n".join(docstring_lines)
 
-    indented_body = "\n".join(f"    {ln}" if ln.strip() else "" for ln in common_lines)
+    indented_body = "\n".join(f"{body_indent}{ln}" if ln.strip() else "" for ln in common_lines)
+    dec_prefix = (
+        f"{indent}@classmethod\n"
+        if (effective_binding == "method" and scope.get("binding_kind") == "class")
+        else ""
+    )
     helper_def = (
-        f"{func_keyword} {helper_name}({params_str}) -> {return_type}:\n"
+        f"{dec_prefix}"
+        f"{indent}{func_keyword} {helper_name}({params_str}) -> {return_type}:\n"
         f"{docstring_str}\n"
         f"{indented_body}\n"
     )
@@ -1350,11 +1546,70 @@ def refactor_module_units(
     return current_text
 
 
+def _build_whole_method_delegation(
+    source_text: str,
+    unit: Dict[str, Any],
+    call_prefix: str,
+    helper_name: str,
+    args_str: str,
+    await_prefix: str,
+) -> str:
+    """Builds a delegated method replacement body preserving method signature and docstring."""
+    lines = source_text.splitlines(keepends=True)
+    u_start = int(unit.get("start", 1))
+    u_end = int(unit.get("end", len(lines)))
+
+    lead = lines[u_start - 1] if 1 <= u_start <= len(lines) else ""
+    indent = lead[: len(lead) - len(lead.lstrip())]
+    body_indent = indent + "    "
+
+    sig_end_line = u_start
+    docstring_end_line: Optional[int] = None
+
+    try:
+        tree = ast.parse(source_text)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if getattr(node, "lineno", 0) == u_start or node.name == unit.get("name"):
+                    if node.body:
+                        first_body = node.body[0]
+                        sig_end_line = first_body.lineno - 1
+                        if (
+                            isinstance(first_body, ast.Expr)
+                            and isinstance(first_body.value, ast.Constant)
+                            and isinstance(first_body.value.value, str)
+                        ):
+                            docstring_end_line = getattr(first_body, "end_lineno", first_body.lineno)
+                    break
+    except SyntaxError:
+        pass
+
+    if docstring_end_line is not None and docstring_end_line >= u_start:
+        header = "".join(lines[u_start - 1 : docstring_end_line])
+    elif sig_end_line >= u_start:
+        header = "".join(lines[u_start - 1 : sig_end_line])
+    else:
+        hdr_lines = []
+        for l_num in range(u_start, min(u_end + 1, len(lines) + 1)):
+            ln = lines[l_num - 1]
+            hdr_lines.append(ln)
+            if ln.rstrip().endswith(":"):
+                break
+        header = "".join(hdr_lines)
+
+    if not header.endswith("\n"):
+        header += "\n"
+
+    delegation_stmt = f"{body_indent}return {await_prefix}{call_prefix}{helper_name}({args_str})\n"
+    return header + delegation_stmt
+
+
 def generate_refactoring_patch(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     repo_root: Optional[str] = None,
     type_merge_strategy: str = "fallback_any",
     replace_clones: bool = False,
+    method_binding: str = "auto",
 ) -> str:
     """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
     if not clones:
@@ -1376,8 +1631,29 @@ def generate_refactoring_patch(
             continue
 
         orig_lines = orig_text.splitlines(keepends=True)
+
+        enc1 = find_enclosing_class(orig_text, u1)
+        f2_raw = u2.get("file", "").split("#")[0]
+        enc2 = find_enclosing_class(orig_text, u2) if (f2_raw == f1_raw) else None
+
+        is_same_class = bool(
+            enc1 and enc2 and enc1["name"] == enc2["name"] and enc1["start"] == enc2["start"]
+        )
+
+        effective_binding = _resolve_effective_binding(method_binding, is_same_class)
+
+        helper_indent = (
+            enc1["method_indent"]
+            if (effective_binding == "method" and enc1)
+            else ("    " if effective_binding == "method" else "")
+        )
+
         helper_code = synthesize_shared_helper_code(
-            u1, u2, type_merge_strategy=type_merge_strategy
+            u1,
+            u2,
+            type_merge_strategy=type_merge_strategy,
+            method_binding=effective_binding,
+            indent=helper_indent,
         )
 
         needed_typing = _extract_required_typing_imports(helper_code)
@@ -1392,41 +1668,72 @@ def generate_refactoring_patch(
             if loc_imp not in orig_text and loc_imp not in missing_import_lines:
                 missing_import_lines.append(loc_imp)
 
-        current_text = orig_text
-        if replace_clones:
-            base_name1 = u1["name"].split(":")[0].lstrip("_")
-            base_name2 = u2["name"].split(":")[0].lstrip("_")
-            helper_name = (
-                f"_shared_{base_name1}" if base_name1 == base_name2 else f"_shared_{base_name1}_{base_name2}"
-            )
-            await_prefix = "await " if scope.get("is_async") else ""
-            inputs = scope.get("inputs", [])
-            outputs = scope.get("outputs", [])
+        base_name1 = u1["name"].split(":")[0].lstrip("_")
+        base_name2 = u2["name"].split(":")[0].lstrip("_")
+        helper_name = (
+            f"_shared_{base_name1}" if base_name1 == base_name2 else f"_shared_{base_name1}_{base_name2}"
+        )
+        await_prefix = "await " if scope.get("is_async") else ""
+        inputs = list(scope.get("inputs", []))
+        outputs = list(scope.get("outputs", []))
+
+        if effective_binding == "method":
+            call_prefix = "cls." if scope.get("binding_kind") == "class" else "self."
+            call_args = [arg for arg in inputs if arg not in ("self", "cls")]
+            args_str = ", ".join(call_args)
+        else:
+            call_prefix = ""
             args_str = ", ".join(inputs)
 
-            candidate_units = [u1]
-            f2_raw = u2.get("file", "").split("#")[0]
-            if f2_raw and f2_raw == f1_raw and not check_units_overlap(u1, u2):
-                candidate_units.append(u2)
+        candidate_units = [u1]
+        if f2_raw and f2_raw == f1_raw and not check_units_overlap(u1, u2):
+            candidate_units.append(u2)
 
+        earliest_unit = min(candidate_units, key=lambda u: int(u.get("start", 1)))
+        current_text = orig_text
+
+        if replace_clones:
             units_to_replace: List[Tuple[Dict[str, Any], str]] = []
             for target_unit in candidate_units:
                 u_start = int(target_unit.get("start", 1))
                 if 1 <= u_start <= len(orig_lines):
                     lead = orig_lines[u_start - 1]
                     indent = lead[: len(lead) - len(lead.lstrip())]
-                    if outputs:
-                        assign_target = ", ".join(outputs) if len(outputs) >= 2 else outputs[0]
-                        call_stmt = f"{indent}{assign_target} = {await_prefix}{helper_name}({args_str})\n"
+                    is_whole_method = (
+                        target_unit.get("kind") in ("function", "closure")
+                        and ":" not in target_unit.get("name", "")
+                    )
+                    if is_whole_method:
+                        rep_stmt = _build_whole_method_delegation(
+                            orig_text,
+                            target_unit,
+                            call_prefix=call_prefix,
+                            helper_name=helper_name,
+                            args_str=args_str,
+                            await_prefix=await_prefix,
+                        )
                     else:
-                        call_stmt = f"{indent}{await_prefix}{helper_name}({args_str})\n"
-                    units_to_replace.append((target_unit, call_stmt))
+                        if outputs:
+                            assign_target = ", ".join(outputs) if len(outputs) >= 2 else outputs[0]
+                            rep_stmt = f"{indent}{assign_target} = {await_prefix}{call_prefix}{helper_name}({args_str})\n"
+                        else:
+                            rep_stmt = f"{indent}{await_prefix}{call_prefix}{helper_name}({args_str})\n"
+
+                    units_to_replace.append((target_unit, rep_stmt))
 
             current_text = refactor_module_units(orig_text, units_to_replace)
 
-        current_lines = current_text.splitlines(keepends=True)
-        lines_with_imports = _insert_imports_into_module(current_lines, missing_import_lines)
-        modified_lines = [helper_code + "\n\n"] + lines_with_imports
+        if effective_binding == "method":
+            enc_fn = find_enclosing_function(current_text, earliest_unit)
+            insert_line = enc_fn["start"] if enc_fn else int(earliest_unit.get("start", 1))
+            current_lines = current_text.splitlines(keepends=True)
+            insert_idx = max(0, insert_line - 1)
+            current_lines = current_lines[:insert_idx] + [helper_code + "\n"] + current_lines[insert_idx:]
+            modified_lines = _insert_imports_into_module(current_lines, missing_import_lines)
+        else:
+            current_lines = current_text.splitlines(keepends=True)
+            lines_with_imports = _insert_imports_into_module(current_lines, missing_import_lines)
+            modified_lines = [helper_code + "\n\n"] + lines_with_imports
 
         try:
             rel_f1 = str(f1_path.relative_to(root)).replace("\\", "/")

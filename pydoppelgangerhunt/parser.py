@@ -491,14 +491,29 @@ def _harvest_complex_expressions(
     return results
 
 
-class _ClosureScoper(ast.NodeVisitor):
-    """Tracks lexical parent scopes for nested functions and closures."""
+class _ScopeHierarchyVisitor(ast.NodeVisitor):
+    """Tracks lexical parent scopes for nested functions, closures, and enclosing classes."""
 
-    def __init__(self, closure_parents: Dict[int, str]) -> None:
-        self.closure_parents = closure_parents
+    def __init__(
+        self,
+        closure_parents: Optional[Dict[int, str]] = None,
+        enclosing_classes: Optional[Dict[int, str]] = None,
+    ) -> None:
+        self.closure_parents: Dict[int, str] = closure_parents if closure_parents is not None else {}
+        self.enclosing_classes: Dict[int, str] = enclosing_classes if enclosing_classes is not None else {}
         self.func_stack: List[str] = []
+        self.class_stack: List[str] = []
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        if self.class_stack:
+            self.enclosing_classes[id(node)] = self.class_stack[-1]
+        self.class_stack.append(node.name)
+        self.generic_visit(node)
+        self.class_stack.pop()
 
     def _scope_function(self, fn: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
+        if self.class_stack:
+            self.enclosing_classes[id(fn)] = self.class_stack[-1]
         if self.func_stack:
             self.closure_parents[id(fn)] = ":".join(self.func_stack)
         self.func_stack.append(fn.name)
@@ -510,6 +525,9 @@ class _ClosureScoper(ast.NodeVisitor):
 
     def visit_AsyncFunctionDef(self, fn: ast.AsyncFunctionDef) -> None:
         self._scope_function(fn)
+
+
+_ClosureScoper = _ScopeHierarchyVisitor
 
 
 class _DataTableVisitor(ast.NodeVisitor):
@@ -599,6 +617,7 @@ def _record_unit(
     strip_docstrings: bool = True,
     start_col: Optional[int] = None,
     end_col: Optional[int] = None,
+    enclosing_class: Optional[str] = None,
 ) -> None:
     """Records an AST unit if it satisfies thresholds and is not suppressed by inline comments."""
     if file_lines and check_inline_suppression(file_lines, start, end):
@@ -694,6 +713,7 @@ def _record_unit(
                 "calls": extract_call_sequence(ast_target),
                 "complexity": compute_cyclomatic_complexity(ast_target),
                 "structural_hash": structural_hash,
+                "enclosing_class": enclosing_class,
             })
 
 
@@ -714,6 +734,7 @@ def _record_clause_branch(
     consistent_renaming: bool = False,
     abstract_expressions: bool = False,
     strip_docstrings: bool = True,
+    enclosing_class: Optional[str] = None,
 ) -> None:
     """Records an if-branch or except-handler clause if it contains at least 3 statements."""
     if len(body) < 3:
@@ -738,6 +759,7 @@ def _record_clause_branch(
         consistent_renaming=consistent_renaming,
         abstract_expressions=abstract_expressions,
         strip_docstrings=strip_docstrings,
+        enclosing_class=enclosing_class,
     )
 
 
@@ -757,6 +779,7 @@ def _record_node_unit(
     consistent_renaming: bool = False,
     abstract_expressions: bool = False,
     strip_docstrings: bool = True,
+    enclosing_class: Optional[str] = None,
 ) -> None:
     """Records an AST node unit by extracting its start and end line bounds."""
     start = getattr(node, "lineno", 0)
@@ -779,6 +802,7 @@ def _record_node_unit(
         consistent_renaming=consistent_renaming,
         abstract_expressions=abstract_expressions,
         strip_docstrings=strip_docstrings,
+        enclosing_class=enclosing_class,
     )
 
 
@@ -946,8 +970,8 @@ def harvest_file_units(
         rel_file = str(p).replace("\\", "/")
 
     closure_parents: Dict[int, str] = {}
-    if harvest_closures:
-        _ClosureScoper(closure_parents).visit(tree)
+    enclosing_classes: Dict[int, str] = {}
+    _ScopeHierarchyVisitor(closure_parents, enclosing_classes).visit(tree)
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -956,6 +980,7 @@ def harvest_file_units(
             if file_lines and check_inline_suppression(file_lines, fn_start, fn_end):
                 continue
 
+            enc_class = enclosing_classes.get(id(node))
             is_closure = harvest_closures and id(node) in closure_parents
             if is_closure:
                 unit_kind = "closure"
@@ -992,6 +1017,7 @@ def harvest_file_units(
                     consistent_renaming=consistent_renaming,
                     abstract_expressions=abstract_expressions,
                     strip_docstrings=strip_docstrings,
+                    enclosing_class=enc_class,
                 )
 
             if not functions_only:
@@ -1030,6 +1056,7 @@ def harvest_file_units(
                                 consistent_renaming=consistent_renaming,
                                 abstract_expressions=abstract_expressions,
                                 strip_docstrings=strip_docstrings,
+                                enclosing_class=enc_class,
                             )
 
             if sliding_window and hasattr(node, "body"):
@@ -1057,6 +1084,7 @@ def harvest_file_units(
                             consistent_renaming=consistent_renaming,
                             abstract_expressions=abstract_expressions,
                             strip_docstrings=strip_docstrings,
+                            enclosing_class=enc_class,
                         )
 
             if clause_level and hasattr(node, "body"):
@@ -1080,6 +1108,7 @@ def harvest_file_units(
                             consistent_renaming=consistent_renaming,
                             abstract_expressions=abstract_expressions,
                             strip_docstrings=strip_docstrings,
+                            enclosing_class=enc_class,
                         )
                         if stmt.orelse:
                             _record_clause_branch(
@@ -1099,6 +1128,7 @@ def harvest_file_units(
                                 consistent_renaming=consistent_renaming,
                                 abstract_expressions=abstract_expressions,
                                 strip_docstrings=strip_docstrings,
+                                enclosing_class=enc_class,
                             )
                     elif isinstance(stmt, ast.Try):
                         t_line = getattr(stmt, "lineno", 0)
@@ -1125,6 +1155,7 @@ def harvest_file_units(
                                 consistent_renaming=consistent_renaming,
                                 abstract_expressions=abstract_expressions,
                                 strip_docstrings=strip_docstrings,
+                                enclosing_class=enc_class,
                             )
 
         elif class_level and isinstance(node, ast.ClassDef):
@@ -1144,6 +1175,7 @@ def harvest_file_units(
                 consistent_renaming=consistent_renaming,
                 abstract_expressions=abstract_expressions,
                 strip_docstrings=strip_docstrings,
+                enclosing_class=enclosing_classes.get(id(node)),
             )
 
     if complex_expressions:  # pydoppelgangerhunt: ignore
@@ -1196,6 +1228,7 @@ def harvest_file_units(
 
     if comprehensions:
         func_owner_map: Dict[int, str] = {}
+        func_class_map: Dict[int, Optional[str]] = {}
         for fn in ast.walk(tree):
             if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 qname = (
@@ -1209,6 +1242,7 @@ def harvest_file_units(
                         (ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp),
                     ):
                         func_owner_map.setdefault(id(child), qname)
+                        func_class_map.setdefault(id(child), enclosing_classes.get(id(fn)))
 
         for comp in ast.walk(tree):
             if isinstance(
@@ -1234,6 +1268,7 @@ def harvest_file_units(
                     consistent_renaming=consistent_renaming,
                     abstract_expressions=abstract_expressions,
                     strip_docstrings=strip_docstrings,
+                    enclosing_class=func_class_map.get(id(comp)),
                 )
 
     return units

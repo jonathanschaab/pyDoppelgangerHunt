@@ -21,6 +21,8 @@ from pydoppelgangerhunt import (
     extract_unit_source_code,
     filter_clones_by_baseline,
     filter_clones_by_git_diff,
+    find_enclosing_class,
+    find_enclosing_function,
     format_github_annotations,
     format_json_report,
     format_markdown_summary,
@@ -2304,6 +2306,333 @@ def test_parser_harvests_token_columns(tmp_path: Path) -> None:
         assert "start_col" in u
         assert "end_col" in u
         assert isinstance(u["start_col"], int)
+
+
+def test_scope_binding_instance_and_class_detection(tmp_path: Path) -> None:
+    """Verifies that scope analysis identifies instance and class method bindings."""
+    code = (
+        "class Service:\n"
+        "    def run_instance(self, delta: int) -> int:\n"
+        "        self.total = self.base_value + delta\n"
+        "        return self.total\n"
+        "\n"
+        "    @classmethod\n"
+        "    def run_class(cls, factor: int) -> int:\n"
+        "        cls.count += factor\n"
+        "        return cls.count\n"
+        "\n"
+        "    def run_plain(x: int) -> int:\n"
+        "        return x * 2\n"
+    )
+    src = tmp_path / "service.py"
+    src.write_text(code, encoding="utf-8")
+
+    u_inst = {"file": str(src), "start": 2, "end": 4, "name": "run_instance", "kind": "function"}
+    scope_inst = analyze_unit_variable_scope(u_inst)
+    assert scope_inst["has_instance_binding"] is True
+    assert scope_inst["has_class_binding"] is False
+    assert scope_inst["binding_kind"] == "instance"
+    assert scope_inst["inputs"][0] == "self"
+    assert "self.base_value" in scope_inst["instance_attrs"] or "self.total" in scope_inst["instance_attrs"]
+
+    u_cls = {"file": str(src), "start": 6, "end": 9, "name": "run_class", "kind": "function"}
+    scope_cls = analyze_unit_variable_scope(u_cls)
+    assert scope_cls["has_class_binding"] is True
+    assert scope_cls["has_instance_binding"] is False
+    assert scope_cls["binding_kind"] == "class"
+    assert scope_cls["inputs"][0] == "cls"
+    assert "cls.count" in scope_cls["class_attrs"]
+
+    u_plain = {"file": str(src), "start": 11, "end": 12, "name": "run_plain", "kind": "function"}
+    scope_plain = analyze_unit_variable_scope(u_plain)
+    assert scope_plain["has_instance_binding"] is False
+    assert scope_plain["has_class_binding"] is False
+    assert scope_plain["binding_kind"] is None
+
+
+def test_find_enclosing_class_and_function(tmp_path: Path) -> None:
+    """Verifies locating enclosing class definitions and functions including nested scopes."""
+    code = (
+        "class Outer:\n"
+        "    class Inner:\n"
+        "        def compute(self, x: int) -> int:\n"
+        "            total = x + 1\n"
+        "            return total\n"
+        "\n"
+        "def standalone(a: int) -> int:\n"
+        "    return a * 2\n"
+    )
+    src = tmp_path / "nested.py"
+    src.write_text(code, encoding="utf-8")
+
+    # Inside Inner method
+    u_inner = {"file": str(src), "start": 3, "end": 5, "name": "compute", "kind": "function"}
+    enc_class = find_enclosing_class(code, u_inner)
+    assert enc_class is not None
+    assert enc_class["name"] == "Inner"
+    assert enc_class["start"] == 2
+    assert enc_class["indent"] == "    "
+    assert enc_class["method_indent"] == "        "
+
+    enc_fn = find_enclosing_function(code, u_inner)
+    assert enc_fn is not None
+    assert enc_fn["name"] == "compute"
+    assert enc_fn["start"] == 3
+
+    # Compound block inside compute
+    u_block = {"file": str(src), "start": 4, "end": 4, "name": "compute:Assign", "kind": "compound_block"}
+    enc_block_cls = find_enclosing_class(code, u_block)
+    assert enc_block_cls is not None
+    assert enc_block_cls["name"] == "Inner"
+    enc_block_fn = find_enclosing_function(code, u_block)
+    assert enc_block_fn is not None
+    assert enc_block_fn["name"] == "compute"
+
+    # Top-level standalone function has no enclosing class
+    u_standalone = {"file": str(src), "start": 7, "end": 8, "name": "standalone", "kind": "function"}
+    assert find_enclosing_class(code, u_standalone) is None
+    standalone_fn = find_enclosing_function(code, u_standalone)
+    assert standalone_fn is not None
+    assert standalone_fn["name"] == "standalone"
+
+    # Edge cases: empty text, syntax error, zero start line
+    assert find_enclosing_class("", u_inner) is None
+    assert find_enclosing_class("def broken(: pass", u_inner) is None
+    assert find_enclosing_class(code, {"start": 0, "end": 0}) is None
+    assert find_enclosing_function("", u_inner) is None
+    assert find_enclosing_function("def broken(: pass", u_inner) is None
+    assert find_enclosing_function(code, {"start": 0, "end": 0}) is None
+
+
+def test_synthesize_shared_helper_code_same_class_and_class_binding(tmp_path: Path) -> None:
+    """Verifies synthesizing private instance and class methods with appropriate indentation."""
+    f = tmp_path / "calc.py"
+    code = (
+        "class Calculator:\n"
+        "    def add_tax_a(self, amount: float) -> float:\n"
+        "        rate = 0.05\n"
+        "        return amount * (1.0 + rate)\n"
+        "\n"
+        "    def add_tax_b(self, amount: float) -> float:\n"
+        "        rate = 0.05\n"
+        "        return amount * (1.0 + rate)\n"
+        "\n"
+        "    @classmethod\n"
+        "    def create_a(cls, val: int) -> int:\n"
+        "        cls.total += val\n"
+        "        return cls.total\n"
+        "\n"
+        "    @classmethod\n"
+        "    def create_b(cls, val: int) -> int:\n"
+        "        cls.total += val\n"
+        "        return cls.total\n"
+    )
+    f.write_text(code, encoding="utf-8")
+
+    u1 = {
+        "file": str(f),
+        "start": 2,
+        "end": 4,
+        "name": "add_tax_a",
+        "kind": "function",
+        "enclosing_class": "Calculator",
+    }
+    u2 = {
+        "file": str(f),
+        "start": 6,
+        "end": 8,
+        "name": "add_tax_b",
+        "kind": "function",
+        "enclosing_class": "Calculator",
+    }
+
+    # Auto mode detects same class in same file -> method mode
+    helper = synthesize_shared_helper_code(u1, u2, method_binding="auto")
+    assert "    def _shared_add_tax_a_add_tax_b(self, amount: float) -> float:" in helper
+    assert "self: Any" not in helper  # self must not have : Any annotation
+    assert "Call site:\n            self._shared_add_tax_a_add_tax_b(...)" in helper
+
+    # Class method binding
+    u_c1 = {
+        "file": str(f),
+        "start": 10,
+        "end": 13,
+        "name": "create_a",
+        "kind": "function",
+        "enclosing_class": "Calculator",
+    }
+    u_c2 = {
+        "file": str(f),
+        "start": 15,
+        "end": 18,
+        "name": "create_b",
+        "kind": "function",
+        "enclosing_class": "Calculator",
+    }
+    cls_helper = synthesize_shared_helper_code(u_c1, u_c2, method_binding="method")
+    assert "    @classmethod\n    def _shared_create_a_create_b(cls, val: int) -> int:" in cls_helper
+    assert "Call site:\n            cls._shared_create_a_create_b(...)" in cls_helper
+
+    # Explicit module mode falls back to module-level helper with self: Any
+    mod_helper = synthesize_shared_helper_code(u1, u2, method_binding="module")
+    assert "def _shared_add_tax_a_add_tax_b(self: Any, amount: float) -> float:" in mod_helper
+
+
+def test_generate_refactoring_patch_same_class_whole_methods(tmp_path: Path) -> None:
+    """Verifies that refactoring whole methods in the same class preserves headers and delegates."""
+    f = tmp_path / "bank.py"
+    code = (
+        "class BankAccount:\n"
+        "    def calc_interest_a(self, principal: float) -> float:\n"
+        "        rate = 0.05\n"
+        "        return principal * rate\n"
+        "\n"
+        "    def calc_interest_b(self, principal: float) -> float:\n"
+        "        rate = 0.05\n"
+        "        return principal * rate\n"
+    )
+    f.write_text(code, encoding="utf-8")
+
+    u1 = {
+        "file": str(f),
+        "start": 2,
+        "end": 4,
+        "name": "calc_interest_a",
+        "kind": "function",
+        "enclosing_class": "BankAccount",
+    }
+    u2 = {
+        "file": str(f),
+        "start": 6,
+        "end": 8,
+        "name": "calc_interest_b",
+        "kind": "function",
+        "enclosing_class": "BankAccount",
+    }
+
+    patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch
+    # Private helper should be inserted inside BankAccount
+    assert "+    def _shared_calc_interest_a_calc_interest_b(self, principal: float) -> float:" in patch
+    # Signatures preserved and bodies delegate via self._shared_helper
+    assert "+        return self._shared_calc_interest_a_calc_interest_b(principal)" in patch
+    assert "-        rate = 0.05" in patch
+
+    # Check replace_clones=False inserting helper inside class
+    patch_preview = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=False)
+    assert patch_preview
+    assert "+    def _shared_calc_interest_a_calc_interest_b(self, principal: float) -> float:" in patch_preview
+    assert "-        rate = 0.05" not in patch_preview
+
+
+def test_generate_refactoring_patch_same_class_compound_blocks(tmp_path: Path) -> None:
+    """Verifies refactoring compound blocks within class methods invokes self._shared_helper."""
+    f = tmp_path / "processor.py"
+    code = (
+        "class DataProcessor:\n"
+        "    def process_one(self, items: list) -> int:\n"
+        "        total = 0\n"
+        "        for x in items:\n"
+        "            total += x\n"
+        "        return total\n"
+        "\n"
+        "    def process_two(self, items: list) -> int:\n"
+        "        total = 0\n"
+        "        for x in items:\n"
+        "            total += x\n"
+        "        return total * 2\n"
+    )
+    f.write_text(code, encoding="utf-8")
+
+    u1 = {
+        "file": str(f),
+        "start": 4,
+        "end": 5,
+        "name": "process_one:For",
+        "kind": "compound_block",
+        "enclosing_class": "DataProcessor",
+    }
+    u2 = {
+        "file": str(f),
+        "start": 10,
+        "end": 11,
+        "name": "process_two:For",
+        "kind": "compound_block",
+        "enclosing_class": "DataProcessor",
+    }
+
+    patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch
+    # Private method in class body
+    assert "+    def _shared_process_one_process_two(" in patch
+    # Invocation via self._shared_helper omitting self from args
+    assert "self._shared_process_one_process_two(" in patch
+
+
+def test_generate_refactoring_patch_cross_class_receiver_injection(tmp_path: Path) -> None:
+    """Verifies cross-class clones extract to module-level helper with explicit receiver injection."""
+    f = tmp_path / "workers.py"
+    code = (
+        "class WorkerA:\n"
+        "    def work(self, speed: int) -> int:\n"
+        "        return speed * 10\n"
+        "\n"
+        "class WorkerB:\n"
+        "    def work(self, speed: int) -> int:\n"
+        "        return speed * 10\n"
+    )
+    f.write_text(code, encoding="utf-8")
+
+    u1 = {
+        "file": str(f),
+        "start": 2,
+        "end": 3,
+        "name": "work",
+        "kind": "function",
+        "enclosing_class": "WorkerA",
+    }
+    u2 = {
+        "file": str(f),
+        "start": 6,
+        "end": 7,
+        "name": "work",
+        "kind": "function",
+        "enclosing_class": "WorkerB",
+    }
+
+    patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch
+    # Module-level helper with self: Any
+    assert "+def _shared_work(self: Any, speed: int) -> int:" in patch
+    # Call site delegates with self passed explicitly
+    assert "+        return _shared_work(self, speed)" in patch
+
+
+def test_parser_harvests_enclosing_class(tmp_path: Path) -> None:
+    """Verifies that parser sets enclosing_class across methods, blocks, and sliding windows."""
+    from pydoppelgangerhunt.parser import harvest_file_units  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "class OrderService:\n"
+        "    def process_order(self, order_id: int) -> bool:\n"
+        "        if order_id > 0:\n"
+        "            status = True\n"
+        "            return status\n"
+        "        return False\n"
+        "\n"
+        "def top_level(x: int) -> int:\n"
+        "    y = x + 1\n"
+        "    return y\n"
+    )
+    f = tmp_path / "order.py"
+    f.write_text(code, encoding="utf-8")
+
+    units = harvest_file_units(str(f), str(tmp_path), min_lines=2, min_tokens=3)
+    method_unit = next(u for u in units if u["name"] == "process_order")
+    assert method_unit.get("enclosing_class") == "OrderService"
+
+    top_unit = next(u for u in units if u["name"] == "top_level")
+    assert top_unit.get("enclosing_class") is None
 
 
 
