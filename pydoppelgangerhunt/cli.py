@@ -68,6 +68,19 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
     parser.add_argument("--suggest", action="store_true", help="Synthesize refactoring recommendations and helper function signatures")
     parser.add_argument("--diff", action="store_true", help="Display unified diff between cloned code blocks")
     parser.add_argument("--cluster", action="store_true", help="Group pairwise clones into connected component Clone Families using Union-Find")
+    parser.add_argument(
+        "--linkage",
+        type=str,
+        choices=["single", "complete", "average", "medoid"],
+        default=None,
+        help="Clustering linkage strategy for clone families ('single', 'complete', 'average', 'medoid'; default: 'single')",
+    )
+    parser.add_argument(
+        "--min-cluster-similarity",
+        type=float,
+        default=None,
+        help="Minimum intra-cluster similarity floor for cluster admission/merging (default: match threshold)",
+    )
     parser.add_argument("--diff-only", action="store_true", help="Only audit lines modified in git (PR diff gating)")
     parser.add_argument("--since", type=str, default=None, help="Git reference / commit / branch to compare against for --diff-only (default: HEAD)")
     parser.add_argument("--stats", action="store_true", help="Compute repository DRY score, DLOC, and duplication metrics")
@@ -301,7 +314,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     families: Optional[List[Dict[str, Any]]] = None
     if args.cluster:
-        families = cluster_clone_families(clones)
+        linkage_strategy = args.linkage or str(tool_cfg.get("linkage", "single"))
+        cluster_floor = (
+            args.min_cluster_similarity
+            if args.min_cluster_similarity is not None
+            else float(tool_cfg.get("min_cluster_similarity", threshold))
+        )
+        families = cluster_clone_families(
+            clones,
+            linkage=linkage_strategy,
+            min_similarity_floor=cluster_floor,
+        )
 
     stats: Optional[Dict[str, Any]] = None
     if args.stats or args.summary or args.html:
@@ -368,15 +391,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         report_lines.append(title)
         for fam in families:
             fam_badge = colorize(f"[{fam['family_id']}]", COLOR_BOLD + COLOR_MAGENTA, use_color)
+            coherence_str = f", {fam['coherence']:.1%} coherence" if "coherence" in fam else ""
             f_head = (
                 f"  * {fam_badge} {fam['member_count']} members "
-                f"(avg sim {fam['avg_similarity']:.1%}, max {fam['max_similarity']:.1%}, "
+                f"(avg sim {fam['avg_similarity']:.1%}{coherence_str}, max {fam['max_similarity']:.1%}, "
                 f"{fam['total_lines']} lines across {len(fam['unique_files'])} file(s)):"
             )
             print(f_head)
             report_lines.append(f_head)
+            medoid_name = fam.get("medoid", {}).get("name") if fam.get("medoid") else None
             for m in fam["members"]:
-                m_line = f"      - {m['file']}:{m['start']}-{m['end']} ({m['name']})"
+                m_tag = " [medoid]" if medoid_name and m["name"] == medoid_name else ""
+                m_line = f"      - {m['file']}:{m['start']}-{m['end']} ({m['name']}){m_tag}"
                 print(m_line)
                 report_lines.append(m_line)
             if len(fam["members"]) >= 2:

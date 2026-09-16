@@ -273,7 +273,20 @@ def format_json_report(
                 "unique_files": f["unique_files"],
                 "avg_similarity": round(f["avg_similarity"], 4),
                 "max_similarity": round(f["max_similarity"], 4),
+                "min_similarity": round(f.get("min_similarity", f["avg_similarity"]), 4),
+                "coherence": round(f.get("coherence", 1.0), 4),
                 "total_lines": f["total_lines"],
+                "medoid": (
+                    {
+                        "name": f["medoid"]["name"],
+                        "file": f["medoid"]["file"].replace("\\", "/"),
+                        "start": f["medoid"]["start"],
+                        "end": f["medoid"]["end"],
+                        "kind": f["medoid"].get("kind"),
+                    }
+                    if "medoid" in f and f["medoid"]
+                    else None
+                ),
                 "members": [
                     {
                         "name": m["name"],
@@ -414,13 +427,17 @@ def generate_html_report(
     families_html: List[str] = []
     if families:
         for fam in families:
+            medoid_name = fam.get("medoid", {}).get("name") if fam.get("medoid") else None
+            coherence_val = fam.get("coherence")
+            coherence_str = f" &bull; {coherence_val:.1%} coherence" if coherence_val is not None else ""
             members_li = "".join(
-                f"<li><code>{m['file']}:{m['start']}-{m['end']}</code> ({m['name']})</li>"
+                f"<li><code>{m['file']}:{m['start']}-{m['end']}</code> ({m['name']})"
+                f"{' <strong>[medoid]</strong>' if medoid_name and m.get('name') == medoid_name else ''}</li>"
                 for m in fam["members"]
             )
             f_card = f"""
             <div class="family-card">
-                <h3>{fam['family_id']} &mdash; {fam['member_count']} Members ({fam['avg_similarity']:.1%} avg sim)</h3>
+                <h3>{fam['family_id']} &mdash; {fam['member_count']} Members ({fam['avg_similarity']:.1%} avg sim{coherence_str})</h3>
                 <ul>{members_li}</ul>
             </div>
             """

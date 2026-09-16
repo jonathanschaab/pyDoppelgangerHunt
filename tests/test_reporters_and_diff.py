@@ -13,6 +13,7 @@ from pydoppelgangerhunt import (
     check_asymmetric_coverage,
     check_temporal_divergence,
     cluster_clone_families,
+    compute_medoid,
     colorize,
     compute_repository_dry_stats,
     compute_unit_coverage,
@@ -1261,3 +1262,107 @@ def test_fixer_feedback_and_advanced_robustness(tmp_path: Path) -> None:
     extracted_sig = _extract_required_typing_imports(sig_raw)
     assert "Dict" in extracted_sig
     assert "Any" in extracted_sig
+
+
+def test_clustering_transitivity_and_medoid_coherence(tmp_path: Path) -> None:
+    """Verifies complete/average/medoid linkage strategies, chaining prevention, and medoid coherence."""
+    import pytest  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    u_a = {"file": "mod_a.py", "start": 1, "end": 10, "name": "fn_a"}
+    u_b = {"file": "mod_b.py", "start": 1, "end": 10, "name": "fn_b"}
+    u_c = {"file": "mod_c.py", "start": 1, "end": 10, "name": "fn_c"}
+
+    # 1. Transitive chaining test: A ~ B (0.95), B ~ C (0.90), no edge A ~ C
+    clones_chain = [
+        (0.95, u_a, u_b),
+        (0.90, u_b, u_c),
+    ]
+
+    # Single linkage chains transitively into 1 family with 3 members
+    f_single = cluster_clone_families(clones_chain, linkage="single")
+    assert len(f_single) == 1
+    assert f_single[0]["member_count"] == 3
+
+    # Complete linkage (clique partitioning) isolates the strongest clique and drops chaining
+    f_complete = cluster_clone_families(clones_chain, linkage="complete", min_similarity_floor=0.80)
+    assert len(f_complete) == 1
+    assert f_complete[0]["member_count"] == 2
+    assert [m["name"] for m in f_complete[0]["members"]] == ["fn_a", "fn_b"]
+
+    # Average linkage with floor 0.80 prevents merge because cross-cluster similarity is (0.0 + 0.90)/2 = 0.45 < 0.80
+    f_average = cluster_clone_families(clones_chain, linkage="average", min_similarity_floor=0.80)
+    assert len(f_average) == 1
+    assert f_average[0]["member_count"] == 2
+
+    # 2. Triangle clique: all edges present
+    clones_triangle = [
+        (0.95, u_a, u_b),
+        (0.90, u_b, u_c),
+        (0.85, u_a, u_c),
+    ]
+    for strategy in ("single", "complete", "average", "medoid"):
+        f_tri = cluster_clone_families(clones_triangle, linkage=strategy, min_similarity_floor=0.80)
+        assert len(f_tri) == 1
+        assert f_tri[0]["member_count"] == 3
+        assert f_tri[0]["medoid"]["name"] == "fn_b"
+        assert f_tri[0]["min_similarity"] == 0.85
+        assert f_tri[0]["max_similarity"] == 0.95
+        assert round(f_tri[0]["coherence"], 4) == round((1.0 + 0.95 + 0.90) / 3, 4)
+
+    # 3. compute_medoid standalone validation
+    sim_map = {
+        ("k1", "k2"): 0.9,
+        ("k2", "k1"): 0.9,
+        ("k2", "k3"): 0.8,
+        ("k3", "k2"): 0.8,
+    }
+    m_key, m_score = compute_medoid(["k1", "k2", "k3"], sim_map)
+    assert m_key == "k2"
+    assert m_score > 0.8
+
+    # Edge cases in compute_medoid
+    single_key, single_score = compute_medoid(["only_one"], {})
+    assert single_key == "only_one"
+    assert single_score == 1.0
+
+    with pytest.raises(ValueError, match="empty member set"):
+        compute_medoid([], {})
+
+    # Invalid linkage strategy raises ValueError
+    with pytest.raises(ValueError, match="Unsupported linkage"):
+        cluster_clone_families(clones_triangle, linkage="invalid_strategy")
+
+    # Empty clones list returns empty families
+    assert not cluster_clone_families([])
+
+    # 4. JSON report serialization with medoid and coherence
+    tri_fams = cluster_clone_families(clones_triangle, linkage="complete", min_similarity_floor=0.80)
+    json_rep = format_json_report(clones_triangle, "target_pkg", 0.80, families=tri_fams)
+    assert "families" in json_rep
+    fam_entry = json_rep["families"][0]
+    assert fam_entry["medoid"]["name"] == "fn_b"
+    assert fam_entry["min_similarity"] == 0.85
+    assert "coherence" in fam_entry
+
+    # 5. HTML report serialization with medoid badge and coherence
+    html_rep = generate_html_report(clones_triangle, "target_pkg", 0.80, families=tri_fams)
+    assert "[medoid]" in html_rep
+    assert "coherence" in html_rep
+
+    # 6. CLI execution with --linkage complete and --min-cluster-similarity
+    f1 = tmp_path / "cli_mod1.py"
+    f1.write_text("def run_task(a, b):\n    print(a)\n    print(b)\n    return a + b\n", encoding="utf-8")
+    f2 = tmp_path / "cli_mod2.py"
+    f2.write_text("def run_task(a, b):\n    print(a)\n    print(b)\n    return a + b\n", encoding="utf-8")
+
+    exit_code = main([
+        str(tmp_path),
+        "--threshold", "0.70",
+        "--min-lines", "3",
+        "--min-tokens", "5",
+        "--cluster",
+        "--linkage", "complete",
+        "--min-cluster-similarity", "0.75",
+    ])
+    assert exit_code == 1
