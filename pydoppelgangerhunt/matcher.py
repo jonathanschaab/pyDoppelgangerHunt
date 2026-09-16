@@ -11,6 +11,48 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from pydoppelgangerhunt.config import find_python_files
 from pydoppelgangerhunt.parser import harvest_file_units
 
+DEFAULT_STOP_SHINGLES: Set[Tuple[str, ...]] = {
+    # Main guard boilerplate: if __name__ == "__main__":
+    ("Module", "If", "Compare"),
+    ("If", "Compare", "Pass"),
+    ("If", "Compare", "Expr"),
+    ("Compare", "Pass", "VAR"),
+    ("Compare", "Expr", "VAR"),
+    ("Pass", "VAR", "Eq"),
+    ("VAR", "Eq", "CONST_str"),
+    ("Eq", "CONST_str", "Load"),
+    ("Eq", "CONST_str", "Call"),
+    # Standard logger & logging calls:
+    ("Module", "Expr", "Call"),
+    ("Expr", "Call", "ATTR"),
+    ("Call", "ATTR", "CONST_str"),
+    ("Call", "ATTR", "VAR"),
+    ("ATTR", "CONST_str", "VAR"),
+    ("ATTR", "VAR", "VAR"),
+    ("ATTR", "VAR", "Load"),
+    ("Call", "Load", "ATTR"),
+    ("Load", "Call", "ATTR"),
+    ("Load", "ATTR", "VAR"),
+    # Standard try/except error handling & logging / pass:
+    ("Module", "Try", "Pass"),
+    ("Module", "Try", "Expr"),
+    ("Try", "Pass", "ExceptHandler"),
+    ("Try", "Expr", "ExceptHandler"),
+    ("Pass", "ExceptHandler", "VAR"),
+    ("ExceptHandler", "VAR", "Pass"),
+    ("ExceptHandler", "VAR", "Expr"),
+    ("ExceptHandler", "Call", "VAR"),
+    ("Expr", "ExceptHandler", "Call"),
+    # Exception raising boilerplate:
+    ("Module", "Raise", "Call"),
+    ("Raise", "Call", "VAR"),
+}
+
+
+def get_boilerplate_stop_shingles() -> Set[Tuple[str, ...]]:
+    """Returns a copy of the default set of boilerplate stop-shingles."""
+    return set(DEFAULT_STOP_SHINGLES)
+
 
 def lcs_alignment_similarity(
     tokens_a: Sequence[str],
@@ -345,6 +387,8 @@ def scan_target(
     include_notebooks: bool = False,
     strip_docstrings: bool = True,
     max_index_frequency: float = 0.25,
+    filter_stop_shingles: bool = False,
+    stop_shingles: Optional[Set[Any]] = None,
 ) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]:
     units: List[Dict[str, Any]] = []
     repo_root = Path.cwd()
@@ -419,6 +463,12 @@ def scan_target(
                 )
             )
 
+    effective_stop_shingles: Set[Any] = set()
+    if filter_stop_shingles:
+        effective_stop_shingles.update(DEFAULT_STOP_SHINGLES)
+    if stop_shingles is not None:
+        effective_stop_shingles.update(stop_shingles)
+
     idf_weights: Dict[Any, float] = {}
     if tfidf and units:
         corpus_size = len(units)
@@ -426,6 +476,8 @@ def scan_target(
         for u in units:
             keys = u.get("vector", {}).keys() if bag_of_tokens else u["shingles"]
             for k in keys:
+                if effective_stop_shingles and k in effective_stop_shingles:
+                    continue
                 df_counts[k] = df_counts.get(k, 0) + 1
         for k, df in df_counts.items():
             idf_weights[k] = math.log((1.0 + corpus_size) / (1.0 + df)) + 1.0
@@ -439,6 +491,8 @@ def scan_target(
         else:
             index_keys = list(u["shingles"])
         for sh in index_keys:
+            if effective_stop_shingles and sh in effective_stop_shingles:
+                continue
             shingle_index.setdefault(sh, []).append(idx)
 
     max_posting_len = (

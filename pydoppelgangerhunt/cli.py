@@ -88,6 +88,19 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
     )
     parser.add_argument("--diff-only", action="store_true", help="Only audit lines modified in git (PR diff gating)")
     parser.add_argument("--since", type=str, default=None, help="Git reference / commit / branch to compare against for --diff-only (default: HEAD)")
+    parser.add_argument(
+        "--partial-hunk-policy",
+        type=str,
+        choices=["any", "major", "new"],
+        default=None,
+        help="Diff overlap policy for PR gating ('any': >=1 line, 'major': >=50%% lines, 'new': >=80%% lines; default: 'any')",
+    )
+    parser.add_argument(
+        "--min-diff-overlap",
+        type=float,
+        default=None,
+        help="Minimum fractional line overlap [0.0 - 1.0] for a clone block to be considered modified in git diff",
+    )
     parser.add_argument("--stats", action="store_true", help="Compute repository DRY score, DLOC, and duplication metrics")
     parser.add_argument("--summary", type=str, default=None, help="Path to write GitHub Step Summary Markdown report")
     parser.add_argument("--init", action="store_true", help="Initialize pyDoppelgangerHunt configuration file")
@@ -128,6 +141,7 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         ("--call-sequences", "Audit function and method call traces for procedural pipeline duplicates"),
         ("--audit-tests", "Audit test suites for clone patterns and @pytest.mark.parametrize opportunities"),
         ("--strict-type4", "Fail with non-zero exit code if Type-4 semantic issues are found"),
+        ("--stop-shingles", "Filter ubiquitous boilerplate stop-shingles from inverted index (SourcererCC-style)"),
     ]
     for flag_name, help_text in bool_flags:
         parser.add_argument(flag_name, action="store_true", help=help_text)
@@ -199,6 +213,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     call_seq_enabled = args.call_sequences or bool(tool_cfg.get("call_sequences", False))
     audit_tests_enabled = args.audit_tests or bool(tool_cfg.get("audit_tests", False))
     idioms_enabled = args.idioms or bool(tool_cfg.get("idioms", False))
+    stop_shingles_enabled = args.stop_shingles or bool(tool_cfg.get("stop_shingles", False))
 
     max_index_frequency = (
         args.max_index_frequency
@@ -249,6 +264,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         (args.gapped_tolerance, "gapped tolerance"),
         (call_seq_enabled, "call sequences"),
         (audit_tests_enabled, "audit tests"),
+        (stop_shingles_enabled, "stop-shingles filtered"),
         (args.nms, "nms suppressed"),
     ]
     for is_enabled, label in flag_modes:
@@ -299,6 +315,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         include_notebooks=args.notebooks,
         strip_docstrings=strip_docstrings,
         max_index_frequency=max_index_frequency,
+        filter_stop_shingles=stop_shingles_enabled,
     )
 
     if args.record_baseline:
@@ -326,10 +343,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"[BASELINE] Suppressed {suppressed_count} grandfathered clone(s). {len(clones)} un-grandfathered clone(s) remaining.")
 
     if args.diff_only:
+        diff_policy = args.partial_hunk_policy or str(tool_cfg.get("partial_hunk_policy", "any"))
+        min_overlap = (
+            args.min_diff_overlap
+            if args.min_diff_overlap is not None
+            else float(tool_cfg.get("min_diff_overlap", 0.0))
+        )
         modified_ranges = get_git_modified_line_ranges(since_ref=args.since)
-        clones = filter_clones_by_git_diff(clones, modified_ranges)
+        clones = filter_clones_by_git_diff(
+            clones,
+            modified_ranges,
+            policy=diff_policy,
+            min_overlap_ratio=min_overlap,
+        )
         if args.format == "text":
-            print(f"[INFO] Filtered by git diff: {len(clones)} clone pair(s) touch modified lines.")
+            print(f"[INFO] Filtered by git diff (policy={diff_policy}): {len(clones)} clone pair(s) touch modified lines.")
 
     families: Optional[List[Dict[str, Any]]] = None
     if args.cluster:

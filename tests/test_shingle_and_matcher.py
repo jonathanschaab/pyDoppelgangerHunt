@@ -732,3 +732,68 @@ def test_inverted_index_frequency_threshold_pruning(tmp_path: Path) -> None:
     assert "calculate_discriminative" in u2["name"]
 
 
+def test_stop_shingle_filtering_and_candidate_pruning(tmp_path: Path) -> None:
+    """Test DEFAULT_STOP_SHINGLES and candidate inverted index pruning with stop-shingles."""
+    from pydoppelgangerhunt.matcher import DEFAULT_STOP_SHINGLES, get_boilerplate_stop_shingles  # pylint: disable=import-outside-toplevel
+
+    stop_shingles = get_boilerplate_stop_shingles()
+    assert isinstance(stop_shingles, set)
+    assert len(stop_shingles) >= 20
+    assert ("Module", "If", "Compare") in stop_shingles
+    assert ("Expr", "Call", "ATTR") in stop_shingles
+
+    # Create two modules that only share boilerplate logging and main guards,
+    # but have completely distinct algorithmic code
+    pkg = tmp_path / "stop_pkg"
+    pkg.mkdir()
+    f1 = pkg / "worker_a.py"
+    f2 = pkg / "worker_b.py"
+
+    code_a = (
+        "import logging\n"
+        "logger = logging.getLogger(__name__)\n"
+        "def run_a(alpha, beta):\n"
+        "    logger.info('running worker a')\n"
+        "    result = [alpha * x for x in range(beta)]\n"
+        "    logger.debug('finished')\n"
+        "    return result\n"
+        "if __name__ == '__main__':\n"
+        "    pass\n"
+    )
+    code_b = (
+        "import logging\n"
+        "logger = logging.getLogger(__name__)\n"
+        "def run_b(delta, gamma):\n"
+        "    logger.info('running worker b')\n"
+        "    mapping = {k: chr(k + 65) for k in range(delta, gamma)}\n"
+        "    logger.debug('finished')\n"
+        "    return mapping\n"
+        "if __name__ == '__main__':\n"
+        "    pass\n"
+    )
+    f1.write_text(code_a, encoding="utf-8")
+    f2.write_text(code_b, encoding="utf-8")
+
+    # Scan with stop-shingles filtered
+    clones_filtered = scan_target(
+        str(pkg),
+        min_lines=3,
+        min_tokens=10,
+        threshold=0.80,
+        filter_stop_shingles=True,
+    )
+    assert len(clones_filtered) == 0
+
+    # Test with custom stop-shingles
+    custom_stop = {("Custom", "Token", "Shingle")}
+    clones_custom = scan_target(
+        str(pkg),
+        min_lines=3,
+        min_tokens=10,
+        threshold=0.80,
+        stop_shingles=custom_stop,
+    )
+    assert isinstance(clones_custom, list)
+
+
+

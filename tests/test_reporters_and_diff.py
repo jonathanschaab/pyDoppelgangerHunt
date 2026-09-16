@@ -336,6 +336,9 @@ def test_modular_pydoppelgangerhunt_exports() -> None:
     assert callable(pydoppelgangerhunt.load_baseline)
     assert callable(pydoppelgangerhunt.pure_structural_fingerprint)
     assert callable(pydoppelgangerhunt.prune_baseline)
+    assert isinstance(pydoppelgangerhunt.DEFAULT_STOP_SHINGLES, set)
+    assert callable(pydoppelgangerhunt.get_boilerplate_stop_shingles)
+    assert callable(pydoppelgangerhunt.compute_unit_diff_overlap)
 
 
 
@@ -1506,4 +1509,83 @@ def test_baseline_pruning_and_cli(tmp_path: Path) -> None:
     # Now prune baseline (nothing pruned, 1 retained, clone suppressed)
     prune_ret = pydoppelgangerhunt.main([str(src_dir), "--threshold", "0.70", "--min-lines", "3", "--min-tokens", "5", "--baseline", str(cli_base), "--prune-baseline"])
     assert prune_ret == 0
+
+
+def test_partial_hunk_policy_and_diff_overlap(tmp_path: Path) -> None:
+    """Test compute_unit_diff_overlap, partial hunk policies ('any', 'major', 'new'), and CLI flags."""
+    from pydoppelgangerhunt.git_diff import compute_unit_diff_overlap, is_unit_in_modified_ranges, filter_clones_by_git_diff  # pylint: disable=import-outside-toplevel
+
+    u_target = {"file": "pkg/service.py", "start": 10, "end": 29, "name": "process_records"}
+    # 20 lines total: [10 .. 29]
+
+    # 1. Incidental 1-line edit (line 15)
+    ranges_incidental = {"pkg/service.py": [(15, 15)]}
+    count_1, ratio_1 = compute_unit_diff_overlap(u_target, ranges_incidental)
+    assert count_1 == 1
+    assert ratio_1 == 0.05
+
+    # 2. Major 12-line edit (lines 10..21)
+    ranges_major = {"pkg/service.py": [(10, 21)]}
+    count_12, ratio_12 = compute_unit_diff_overlap(u_target, ranges_major)
+    assert count_12 == 12
+    assert ratio_12 == 0.60
+
+    # 3. Disjoint / non-matching file
+    ranges_other = {"pkg/other.py": [(10, 20)]}
+    assert compute_unit_diff_overlap(u_target, ranges_other) == (0, 0.0)
+
+    # 4. Evaluate policy thresholds on incidental 1-line edit
+    assert is_unit_in_modified_ranges(u_target, ranges_incidental, policy="any") is True
+    assert is_unit_in_modified_ranges(u_target, ranges_incidental, policy="major") is False
+    assert is_unit_in_modified_ranges(u_target, ranges_incidental, policy="new") is False
+    assert is_unit_in_modified_ranges(u_target, ranges_incidental, min_overlap_ratio=0.10) is False
+
+    # 5. Evaluate policy thresholds on major 60% edit
+    assert is_unit_in_modified_ranges(u_target, ranges_major, policy="any") is True
+    assert is_unit_in_modified_ranges(u_target, ranges_major, policy="major") is True
+    assert is_unit_in_modified_ranges(u_target, ranges_major, policy="new") is False
+
+    # 6. Evaluate policy thresholds on 90% rewrite
+    ranges_new = {"pkg/service.py": [(10, 27)]}
+    assert is_unit_in_modified_ranges(u_target, ranges_new, policy="new") is True
+
+    # 7. Test filter_clones_by_git_diff with clone pair
+    u_other = {"file": "pkg/other.py", "start": 1, "end": 20, "name": "legacy_helper"}
+    mock_clones = [(0.95, u_target, u_other)]
+
+    # Under "any", incidental edit triggers violation
+    clones_any = filter_clones_by_git_diff(mock_clones, ranges_incidental, policy="any")
+    assert len(clones_any) == 1
+
+    # Under "major" or "new", incidental edit is ignored
+    clones_major = filter_clones_by_git_diff(mock_clones, ranges_incidental, policy="major")
+    assert len(clones_major) == 0
+    clones_new = filter_clones_by_git_diff(mock_clones, ranges_incidental, policy="new")
+    assert len(clones_new) == 0
+
+    # Test both_units requirement
+    clones_both = filter_clones_by_git_diff(mock_clones, ranges_major, policy="major", both_units=True)
+    assert len(clones_both) == 0  # u_other is untouched
+
+    # 8. CLI integration test with --diff-only, --partial-hunk-policy, --min-diff-overlap, and --stop-shingles
+    cli_src = tmp_path / "diff_src"
+    cli_src.mkdir()
+    f_a = cli_src / "task_a.py"
+    f_b = cli_src / "task_b.py"
+    f_a.write_text("def run():\n    x = 1\n    y = 2\n    return x + y\n", encoding="utf-8")
+    f_b.write_text("def run():\n    x = 1\n    y = 2\n    return x + y\n", encoding="utf-8")
+
+    cli_exit = pydoppelgangerhunt.main([
+        str(cli_src),
+        "--threshold", "0.70",
+        "--min-lines", "3",
+        "--min-tokens", "5",
+        "--diff-only",
+        "--partial-hunk-policy", "major",
+        "--min-diff-overlap", "0.5",
+        "--stop-shingles",
+    ])
+    # No git repo initialized in cli_src so modified_ranges is empty -> exits 0 (clean)
+    assert cli_exit == 0
+
 
