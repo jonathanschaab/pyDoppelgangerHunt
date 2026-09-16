@@ -114,6 +114,15 @@ class _ScopeVisitor(ast.NodeVisitor):
 
         self._record_arg(node.args.kwarg, None, "kwarg")
 
+    @staticmethod
+    def _extract_arg_names(args: ast.arguments) -> Set[str]:
+        arg_set = {a.arg for a in (args.posonlyargs + args.args + args.kwonlyargs)}
+        if args.vararg:
+            arg_set.add(args.vararg.arg)
+        if args.kwarg:
+            arg_set.add(args.kwarg.arg)
+        return arg_set
+
     def _process_func(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
         is_top = len(self._scope_stack) == 0
         if is_top:
@@ -122,17 +131,20 @@ class _ScopeVisitor(ast.NodeVisitor):
         else:
             if node.name not in self.stores:
                 self.stores.append(node.name)
-            inner_args = {
-                a.arg for a in (node.args.posonlyargs + node.args.args + node.args.kwonlyargs)
-            }
-            if node.args.vararg:
-                inner_args.add(node.args.vararg.arg)
-            if node.args.kwarg:
-                inner_args.add(node.args.kwarg.arg)
-            self._scope_stack.append(inner_args)
+            self._scope_stack.append(self._extract_arg_names(node.args))
 
         for stmt in node.body:
             self.visit(stmt)
+        self._scope_stack.pop()
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        for default in node.args.defaults:
+            self.visit(default)
+        for kw_default in node.args.kw_defaults:
+            if kw_default is not None:
+                self.visit(kw_default)
+        self._scope_stack.append(self._extract_arg_names(node.args))
+        self.visit(node.body)
         self._scope_stack.pop()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -411,7 +423,10 @@ def _format_call_arguments(
     formatted_args: List[str] = []
     for raw_var in inputs:
         clean_var = raw_var.lstrip("*")
-        if receiver_to_omit and clean_var == receiver_to_omit:
+        if receiver_to_omit and (
+            clean_var == receiver_to_omit
+            or (receiver_to_omit == "receivers" and clean_var in ("self", "cls"))
+        ):
             continue
         kind = param_map.get(clean_var, "")
         if kind == "kwonly":
@@ -1294,6 +1309,26 @@ def _has_receiver_reference(
     )
 
 
+def _prune_unshared_receivers(
+    inputs: List[str],
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    scope1: Dict[str, Any],
+    scope2: Dict[str, Any],
+    repo_root: Optional[str] = None,
+) -> List[str]:
+    """Removes 'self' and 'cls' from inputs when only one unit receives them and neither references them."""
+    res = list(inputs)
+    for rec in ("self", "cls"):
+        if (rec in scope1.get("inputs", [])) != (rec in scope2.get("inputs", [])):
+            if not (
+                _has_receiver_reference(u1, scope1, repo_root=repo_root)
+                or _has_receiver_reference(u2, scope2, repo_root=repo_root)
+            ):
+                res = [v for v in res if v != rec]
+    return res
+
+
 def _get_enclosing_receiver_kind(fn_info: Optional[Dict[str, Any]]) -> str:
     """Returns the receiver kind for an enclosing function: static, class, instance, or none."""
     if not fn_info:
@@ -1482,6 +1517,11 @@ def synthesize_shared_helper_code(
     ):
         return ""
 
+    if bool(scope1.get("is_async")) != bool(scope2.get("is_async")):
+        return ""
+    if bool(scope1.get("has_yield")) != bool(scope2.get("has_yield")):
+        return ""
+
     is_static_clone = bool(
         is_static
         or receiver_kind == "static"
@@ -1504,6 +1544,9 @@ def synthesize_shared_helper_code(
         receiver_kinds_differ=receiver_kinds_differ,
         is_in_method=is_in_method,
     )
+
+    if effective_binding == "module":
+        inputs = _prune_unshared_receivers(inputs, u1, u2, scope1, scope2, repo_root=repo_root)
 
     if effective_binding == "method" and not indent:
         indent = "    "
@@ -2149,9 +2192,14 @@ def generate_refactoring_patch(
         )
         is_static = bool((fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static")))
 
+        s1 = analyze_unit_variable_scope(u1, repo_root=str(root))
+        s2 = analyze_unit_variable_scope(u2, repo_root=str(root))
+        if bool(s1.get("is_async")) != bool(s2.get("is_async")):
+            continue
+        if bool(s1.get("has_yield")) != bool(s2.get("has_yield")):
+            continue
+
         if receiver_kinds_differ:
-            s1 = analyze_unit_variable_scope(u1, repo_root=str(root))
-            s2 = analyze_unit_variable_scope(u2, repo_root=str(root))
             if _has_receiver_reference(u1, s1, repo_root=str(root)) or _has_receiver_reference(u2, s2, repo_root=str(root)):
                 continue
 
@@ -2217,6 +2265,8 @@ def generate_refactoring_patch(
         )
         await_prefix = "await " if scope.get("is_async") else ""
         inputs = list(scope.get("inputs", []))
+        if effective_binding == "module":
+            inputs = _prune_unshared_receivers(inputs, u1, u2, s1, s2, repo_root=str(root))
         outputs = list(scope.get("outputs", []))
 
         candidate_units = [u1]
@@ -2258,7 +2308,9 @@ def generate_refactoring_patch(
                             unit_receiver_omit = "self"
                     else:
                         unit_call_prefix = ""
-                        unit_receiver_omit = None
+                        t_fn = find_enclosing_function(orig_text, target_unit)
+                        t_kind = _get_enclosing_receiver_kind(t_fn) if t_fn else "none"
+                        unit_receiver_omit = "receivers" if t_kind in ("static", "none") else None
 
                     unit_args_str = _format_call_arguments(
                         inputs,

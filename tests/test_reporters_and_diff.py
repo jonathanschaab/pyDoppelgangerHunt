@@ -3772,6 +3772,106 @@ def test_same_name_classes_in_different_factories_not_same_class(tmp_path: Path)
     assert helper.startswith("def _shared_process(self: Any, x: int) -> int:")
 
 
+def test_lambda_parameter_scoping_no_leakage(tmp_path: Path) -> None:
+    """Verifies that parameters of lambda expressions do not leak into outer inputs."""
+    code = (
+        "def transform_items(items: list[int]) -> list[int]:\n"
+        "    return sorted(items, key=lambda x: x.val)\n"
+    )
+    f = tmp_path / "lambda_mod.py"
+    f.write_text(code, encoding="utf-8")
+    u = {"file": str(f), "start": 1, "end": 2, "name": "transform_items"}
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert "items" in scope["inputs"]
+    assert "x" not in scope["inputs"]
+
+
+def test_mixed_async_and_sync_pair_declined(tmp_path: Path) -> None:
+    """Verifies that clone pairs with mixed async and sync execution models are declined."""
+    code = (
+        "async def async_worker(x: int) -> int:\n"
+        "    y = x * 2\n"
+        "    return y + 1\n"
+        "\n"
+        "def sync_worker(x: int) -> int:\n"
+        "    y = x * 2\n"
+        "    return y + 1\n"
+    )
+    f = tmp_path / "mixed_async.py"
+    f.write_text(code, encoding="utf-8")
+    u1 = {"file": str(f), "start": 1, "end": 3, "name": "async_worker", "kind": "function"}
+    u2 = {"file": str(f), "start": 5, "end": 7, "name": "sync_worker", "kind": "function"}
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper == ""
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch == ""
+
+
+def test_mixed_generator_and_function_pair_declined(tmp_path: Path) -> None:
+    """Verifies that clone pairs with mixed generator (yield) and normal function models are declined."""
+    code = (
+        "def gen_worker(x: int):\n"
+        "    y = x * 2\n"
+        "    yield y + 1\n"
+        "\n"
+        "def fn_worker(x: int) -> int:\n"
+        "    y = x * 2\n"
+        "    return y + 1\n"
+    )
+    f = tmp_path / "mixed_gen.py"
+    f.write_text(code, encoding="utf-8")
+    u1 = {"file": str(f), "start": 1, "end": 3, "name": "gen_worker", "kind": "function"}
+    u2 = {"file": str(f), "start": 5, "end": 7, "name": "fn_worker", "kind": "function"}
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper == ""
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch == ""
+
+
+def test_instance_method_paired_with_module_function_omits_receiver_parameter(tmp_path: Path) -> None:
+    """Verifies that an instance method paired with a module function without receiver references omits self."""
+    code = (
+        "class Service:\n"
+        "    def foo(self, x: int) -> int:\n"
+        "        y = x * 2\n"
+        "        return y + 1\n"
+        "\n"
+        "def bar(x: int) -> int:\n"
+        "        y = x * 2\n"
+        "        return y + 1\n"
+    )
+    f = tmp_path / "service_mod.py"
+    f.write_text(code, encoding="utf-8")
+    u1 = {
+        "file": str(f),
+        "start": 2,
+        "end": 4,
+        "name": "foo",
+        "kind": "function",
+        "enclosing_class": "Service",
+        "receiver_kind": "instance",
+    }
+    u2 = {
+        "file": str(f),
+        "start": 6,
+        "end": 8,
+        "name": "bar",
+        "kind": "function",
+    }
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper.startswith("def _shared_foo_bar(x: int) -> int:")
+    assert "self" not in helper.splitlines()[0]
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert "return _shared_foo_bar(x)" in patch
+    assert "_shared_foo_bar(self" not in patch
+
+
 
 
 
