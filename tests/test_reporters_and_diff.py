@@ -1714,3 +1714,119 @@ def test_comment_and_formatting_preservation(tmp_path: Path) -> None:
     assert "# Clone Pair" in patch
 
 
+def test_clustering_tie_breaking_determinism() -> None:
+    """Verifies that clone family aggregation and tie-breaking are deterministic across edge orderings."""
+    u1 = {"file": "pkg/a.py", "start": 10, "end": 20, "name": "fn_1"}
+    u2 = {"file": "pkg/b.py", "start": 10, "end": 20, "name": "fn_2"}
+    u3 = {"file": "pkg/c.py", "start": 10, "end": 20, "name": "fn_3"}
+    u4 = {"file": "pkg/d.py", "start": 10, "end": 20, "name": "fn_4"}
+    u5 = {"file": "pkg/e.py", "start": 10, "end": 20, "name": "fn_5"}
+    u6 = {"file": "pkg/f.py", "start": 10, "end": 20, "name": "fn_6"}
+
+    # Two independent triangles with identical similarity scores across all edges
+    # (testing strict tie-breaking across multiple components)
+    clones_forward = [
+        (0.85, u1, u2),
+        (0.85, u2, u3),
+        (0.85, u1, u3),
+        (0.85, u4, u5),
+        (0.85, u5, u6),
+        (0.85, u4, u6),
+    ]
+
+    # Reversed edge list
+    clones_reversed = list(reversed(clones_forward))
+
+    # Inverted unit pairs (u2, u1) instead of (u1, u2)
+    clones_inverted = [(sim, u_b, u_a) for sim, u_a, u_b in clones_forward]
+
+    for strategy in ("single", "complete", "quasi_complete", "average", "medoid"):
+        fams_fwd = cluster_clone_families(clones_forward, linkage=strategy, min_similarity_floor=0.80)
+        fams_rev = cluster_clone_families(clones_reversed, linkage=strategy, min_similarity_floor=0.80)
+        fams_inv = cluster_clone_families(clones_inverted, linkage=strategy, min_similarity_floor=0.80)
+
+        assert len(fams_fwd) == 2
+        assert len(fams_rev) == 2
+        assert len(fams_inv) == 2
+
+        for f1, f2, f3 in zip(fams_fwd, fams_rev, fams_inv):
+            assert f1["family_id"] == f2["family_id"] == f3["family_id"]
+            assert f1["member_count"] == f2["member_count"] == f3["member_count"] == 3
+            assert [m["name"] for m in f1["members"]] == [m["name"] for m in f2["members"]] == [m["name"] for m in f3["members"]]
+            assert f1["medoid"]["name"] == f2["medoid"]["name"] == f3["medoid"]["name"]
+            assert round(f1["avg_similarity"], 6) == round(f2["avg_similarity"], 6) == round(f3["avg_similarity"], 6)
+
+
+def test_complete_linkage_sensitivity_and_quasi_complete(tmp_path: Path) -> None:
+    """Verifies complete-linkage sensitivity tolerance and quasi_complete clustering on Type-3 clones."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    u_a = {"file": "mod_a.py", "start": 1, "end": 15, "name": "fn_a"}
+    u_b = {"file": "mod_b.py", "start": 1, "end": 15, "name": "fn_b"}
+    u_c = {"file": "mod_c.py", "start": 1, "end": 15, "name": "fn_c"}
+    u_d = {"file": "mod_d.py", "start": 1, "end": 15, "name": "fn_d"}
+    u_e = {"file": "mod_e.py", "start": 1, "end": 15, "name": "fn_e"}
+    u_f = {"file": "mod_f.py", "start": 1, "end": 15, "name": "fn_f"}
+
+    # Type-3 clone family {A, B, C, D} where A~D fluctuates slightly below 0.80 (0.77)
+    # Nodes E and F form a separate cluster {E, F} with D~E being 0.80 (potential chaining candidate)
+    clones = [
+        (0.90, u_a, u_b),
+        (0.88, u_b, u_c),
+        (0.86, u_c, u_d),
+        (0.85, u_e, u_f),
+        (0.85, u_b, u_d),
+        (0.82, u_a, u_c),
+        (0.77, u_a, u_d),
+        (0.80, u_d, u_e),
+    ]
+
+    # 1. Strict complete linkage (tolerance=0.0): over-partitions {A, B, C, D}
+    # Because A~D is 0.77 < 0.80, D cannot merge into {A, B, C}. Nor can D merge into {E, F} (D~F is 0.0).
+    f_strict = cluster_clone_families(clones, linkage="complete", min_similarity_floor=0.80, linkage_tolerance=0.0)
+    # Result: {fn_a, fn_b, fn_c} of size 3, {fn_e, fn_f} of size 2. D remains an unclustered singleton.
+    assert len(f_strict) == 2
+    assert f_strict[0]["member_count"] == 3
+    assert [m["name"] for m in f_strict[0]["members"]] == ["fn_a", "fn_b", "fn_c"]
+    assert f_strict[1]["member_count"] == 2
+    assert [m["name"] for m in f_strict[1]["members"]] == ["fn_e", "fn_f"]
+
+    # 2. Complete linkage with tolerance 0.05:
+    # 0.80 - 0.05 = 0.75. All cross-cluster edges between {A, B, C} and {D} are >= 0.75 (0.77, 0.85, 0.86)
+    # and average cross-similarity is (0.77 + 0.85 + 0.86) / 3 = 0.8267 >= 0.80.
+    # Therefore, {A, B, C, D} merges successfully!
+    # {E, F} does NOT merge into {A, B, C, D} because edges E~A, E~B, E~C, F~A, etc. are 0.0 < 0.75.
+    f_tolerant = cluster_clone_families(clones, linkage="complete", min_similarity_floor=0.80, linkage_tolerance=0.05)
+    assert len(f_tolerant) == 2
+    assert f_tolerant[0]["member_count"] == 4
+    assert [m["name"] for m in f_tolerant[0]["members"]] == ["fn_a", "fn_b", "fn_c", "fn_d"]
+    assert f_tolerant[1]["member_count"] == 2
+    assert [m["name"] for m in f_tolerant[1]["members"]] == ["fn_e", "fn_f"]
+
+    # 3. quasi_complete linkage: defaults to tolerance 0.05
+    f_quasi = cluster_clone_families(clones, linkage="quasi_complete", min_similarity_floor=0.80)
+    assert len(f_quasi) == 2
+    assert f_quasi[0]["member_count"] == 4
+    assert [m["name"] for m in f_quasi[0]["members"]] == ["fn_a", "fn_b", "fn_c", "fn_d"]
+    assert f_quasi[1]["member_count"] == 2
+    assert [m["name"] for m in f_quasi[1]["members"]] == ["fn_e", "fn_f"]
+
+    # 4. CLI invocation with --linkage quasi_complete and --linkage-tolerance
+    f1 = tmp_path / "mod1.py"
+    f1.write_text("def worker(x, y):\n    v1 = x * 2\n    v2 = y * 2\n    return v1 + v2\n", encoding="utf-8")
+    f2 = tmp_path / "mod2.py"
+    f2.write_text("def worker(x, y):\n    v1 = x * 2\n    v2 = y * 2\n    return v1 + v2\n", encoding="utf-8")
+
+    exit_code = main([
+        str(tmp_path),
+        "--threshold", "0.70",
+        "--min-lines", "3",
+        "--min-tokens", "5",
+        "--cluster",
+        "--linkage", "quasi_complete",
+        "--linkage-tolerance", "0.05",
+    ])
+    assert exit_code == 1
+
+
+
