@@ -172,7 +172,7 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
             return dict(tool_sec[section_name])
         if any(k in data for k in ("threshold", "min_lines", "exemptions", "exclude")):
             return dict(data)
-    except (ImportError, OSError):
+    except (ImportError, OSError, ValueError):
         pass
 
     # Built-in zero-dependency line parser fallback

@@ -313,4 +313,133 @@ def test_cli_dynamic_target_resolution(tmp_path: Path, monkeypatch: Any) -> None
     assert (init_dir / ".pydoppelgangerhunt.toml").exists()
 
 
+def test_batch_48_cli_and_config_edge_cases(tmp_path: Path) -> None:
+    """Batch 48: Test CLI diff/suggest output, warnings, Type-4 execution, and config fallbacks."""
+    # pylint: disable=protected-access,import-outside-toplevel
+    import os
+    import sys
+    from unittest import mock
+    from pydoppelgangerhunt.cli import _audit_clone_risk_warnings, _write_artifact_file
+    from pydoppelgangerhunt.config import (
+        canonical_path_key,
+        find_python_files,
+        paths_match_boundary,
+    )
+
+    # 1. cli: _write_artifact_file with verbose=False
+    dest_file = tmp_path / "silent_artifact.txt"
+    _write_artifact_file(str(dest_file), "content", "TEST", verbose=False)
+    assert dest_file.read_text(encoding="utf-8") == "content"
+
+    # 2. cli: _audit_clone_risk_warnings divergence and coverage warnings
+    u_mock1 = {"file": "svc/a.py", "start": 1, "end": 10}
+    u_mock2 = {"file": "svc/b.py", "start": 1, "end": 10}
+    mock_div = {"divergence_days": 120.5}
+    with mock.patch("pydoppelgangerhunt.cli.check_temporal_divergence", return_value=mock_div):
+        warns = _audit_clone_risk_warnings(u_mock1, u_mock2, audit_blame=True)
+        assert any("Divergent clone risk" in w for w in warns)
+
+    mock_cov_data = {"svc/a.py": {1, 2, 3}}
+    with mock.patch("pydoppelgangerhunt.cli.check_asymmetric_coverage", return_value=(0.9, 0.1)):
+        warns_cov = _audit_clone_risk_warnings(u_mock1, u_mock2, cov_data=mock_cov_data)
+        assert any("Asymmetric test coverage" in w for w in warns_cov)
+
+    # 3. cli: --diff, --suggest, --output, and @pytest.mark.parametrize tip
+    test_repo = tmp_path / "test_repo"
+    test_repo.mkdir()
+    code_content = (
+        "def test_foo(x):\n"
+        "    a = x * 2\n"
+        "    b = a + 1\n"
+        "    c = b * 3\n"
+        "    return c\n\n"
+        "def test_bar(x):\n"
+        "    a = x * 2\n"
+        "    b = a + 1\n"
+        "    c = b * 3\n"
+        "    return c\n"
+    )
+    (test_repo / "test_sample.py").write_text(code_content, encoding="utf-8")
+    out_file = tmp_path / "cli_report.txt"
+
+    code_res = pydoppelgangerhunt.main([
+        str(test_repo),
+        "--threshold", "0.80",
+        "--min-lines", "4",
+        "--diff",
+        "--suggest",
+        "--audit-tests",
+        "--output", str(out_file),
+    ])
+    assert code_res == 1
+    assert out_file.exists()
+    out_text = out_file.read_text(encoding="utf-8")
+    assert "pytest.mark.parametrize" in out_text
+    assert "Diff" in out_text
+
+    # 4. cli: --type4 fallback when module missing and strict-type4 failure
+    code_type4_missing = pydoppelgangerhunt.main([str(test_repo), "--type4"])
+    assert code_type4_missing == 0
+
+    fake_mod = mock.MagicMock()
+    fake_mod.find_semantic_clones.return_value = [{"dummy": 1}]
+    fake_mod.report_semantic_results.return_value = True
+    with mock.patch.dict("sys.modules", {"check_semantic_clones": fake_mod}):
+        clean_dir = tmp_path / "clean_empty"
+        clean_dir.mkdir()
+        code_strict = pydoppelgangerhunt.main([
+            str(clean_dir),
+            "--type4",
+            "--strict-type4",
+        ])
+        assert code_strict == 1
+
+    # 5. config: canonical_path_key non-Windows & paths_match_boundary edge cases
+    with mock.patch.object(os, "name", "posix"):
+        with mock.patch.object(sys, "platform", "linux"):
+            assert canonical_path_key("Some/Path/File.py") == "Some/Path/File.py"
+
+    assert not paths_match_boundary(None, "mod.py")
+    assert not paths_match_boundary("mod.py", None)
+    assert not paths_match_boundary("foo/a.py", "bar/b.py")
+
+    # 6. config: find_python_files edge cases
+    assert find_python_files(tmp_path / "non_existent_folder") == []
+    txt_file = tmp_path / "doc.txt"
+    txt_file.write_text("hello", encoding="utf-8")
+    assert find_python_files(txt_file) == []
+    py_single = test_repo / "test_sample.py"
+    assert len(find_python_files(py_single)) == 1
+
+    # 7. config: load_toml_section edge cases (flat toml, section transitions, unquoted values)
+    assert load_toml_section(tmp_path / "missing.toml", "tool") == {}
+
+    flat_toml = tmp_path / "flat.toml"
+    flat_toml.write_text("threshold = 0.77\nmin_lines = 8\nunquoted = some_value\n", encoding="utf-8")
+    flat_cfg = load_toml_section(flat_toml, "pydoppelgangerhunt")
+    assert flat_cfg.get("threshold") == 0.77
+
+    multi_section = tmp_path / "multi.toml"
+    multi_section.write_text(
+        "[tool.pydoppelgangerhunt]\n"
+        "threshold = 0.88\n"
+        "[tool.other]\n"
+        "threshold = 0.11\n",
+        encoding="utf-8",
+    )
+    multi_cfg = load_toml_section(multi_section, "pydoppelgangerhunt")
+    assert multi_cfg.get("threshold") == 0.88
+
+    # 8. config: load_tool_config fallback between candidates
+    fallback_dir = tmp_path / "fallback_dir"
+    fallback_dir.mkdir()
+    (fallback_dir / "pyproject.toml").write_text("[project]\nname = 'demo'\n", encoding="utf-8")
+    (fallback_dir / ".pydoppelgangerhunt.toml").write_text(
+        "[tool.pydoppelgangerhunt]\nthreshold = 0.93\n", encoding="utf-8"
+    )
+    fallback_cfg = load_tool_config(repo_root=str(fallback_dir))
+    assert fallback_cfg.get("threshold") == 0.93
+
+
+
 
