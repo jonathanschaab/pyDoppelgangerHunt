@@ -3230,7 +3230,10 @@ def _build_unit_delegation_call(
 
     is_whole_method = target_unit.get("kind") in ("function", "closure", "method")
     if is_whole_method:
-        is_init = target_unit.get("name") == "__init__" or str(target_unit.get("name", "")).endswith(".__init__")
+        is_init = bool(
+            target_unit.get("name") == "__init__"
+            or str(target_unit.get("name", "")).endswith((".__init__", ":__init__"))
+        )
         has_return = False if is_init else bool(effective_outputs or scope.get("has_return", True))
         return _build_whole_method_delegation(
             orig_text,

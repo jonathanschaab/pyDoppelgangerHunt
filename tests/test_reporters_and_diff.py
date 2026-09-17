@@ -8527,3 +8527,47 @@ def test_mangled_private_attribute_same_class_method_binding_accepted_and_execut
     assert run_proc.returncode == 0, f"run failed: {run_proc.stderr}"
     assert run_proc.stdout.strip() == "token:super_secret_xyz token:super_secret_xyz"
 
+
+def test_init_colon_notation_no_return_delegation(tmp_path: Path) -> None:
+    """Verifies that __init__ methods with colon-prefixed names delegate without return statements."""
+    src = (
+        "class ConfigRecord:\n"
+        "    def __init__(self, key: str) -> None:\n"
+        "        self.key = key\n"
+        "        self.active = True\n"
+        "\n"
+        "class DataRecord:\n"
+        "    def __init__(self, key: str) -> None:\n"
+        "        self.key = key\n"
+        "        self.active = True\n"
+    )
+    f = tmp_path / "records.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {
+        "name": "ConfigRecord:__init__",
+        "file": "records.py",
+        "start": 2,
+        "end": 4,
+        "kind": "function",
+        "enclosing_class": "ConfigRecord",
+    }
+    u2 = {
+        "name": "DataRecord:__init__",
+        "file": "records.py",
+        "start": 7,
+        "end": 9,
+        "kind": "function",
+        "enclosing_class": "DataRecord",
+    }
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert patch != ""
+    assert "return _shared" not in patch
+    assert "_shared_ConfigRecord_DataRecord(self, key)" in patch
+
+
