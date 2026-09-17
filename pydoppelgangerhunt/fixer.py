@@ -1940,7 +1940,7 @@ def _normalize_file_path(
     root = Path(repo_root or os.getcwd())
     try:
         p = Path(norm)
-        p_full = p if p.is_absolute() else (root / p)
+        p_full = p if p.is_file() or p.is_absolute() else (root / p)
         return str(p_full.resolve()).replace("\\", "/")
     except OSError:
         return norm
@@ -2051,7 +2051,7 @@ def _populate_unit_receiver_metadata(
     if not f_raw:
         return
     p = Path(f_raw)
-    f_path = p if p.is_absolute() else Path(repo_root or os.getcwd()) / p
+    f_path = p if p.is_file() or p.is_absolute() else (Path(repo_root or os.getcwd()) / p)
     if not f_path.is_file():
         return
     try:

@@ -6605,5 +6605,41 @@ def test_batch_47_git_diff_metrics_matcher_clustering(tmp_path: Path) -> None:
     assert _read_xml_coverage(str(xml_cov)) == {}
 
 
+def test_batch_54_fixer_path_resolution_and_receiver_metadata(tmp_path: Path) -> None:
+    """Batch 54: Test _normalize_file_path and _populate_unit_receiver_metadata edge cases."""
+    # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer import (
+        _normalize_file_path,
+        _populate_unit_receiver_metadata,
+        find_enclosing_class,
+        find_enclosing_function,
+    )
+
+    # 1. Test _normalize_file_path with existing cwd-relative file and repo_root
+    pyproject = "pyproject.toml"
+    assert _normalize_file_path(pyproject, repo_root=str(tmp_path)).endswith("pyproject.toml")
+    assert _normalize_file_path("") == ""
+
+    # 2. Test _populate_unit_receiver_metadata with file existing relative to tmp_path
+    mod_code = (
+        "class Service:\n"
+        "    @classmethod\n"
+        "    def create(cls, data):\n"
+        "        return cls(data)\n"
+    )
+    mod_file = tmp_path / "service.py"
+    mod_file.write_text(mod_code, encoding="utf-8")
+
+    unit_cls = {"file": "service.py", "start": 3, "end": 4, "name": "create"}
+    _populate_unit_receiver_metadata(unit_cls, repo_root=str(tmp_path))
+    assert unit_cls.get("enclosing_class") == "Service"
+    assert unit_cls.get("receiver_kind") == "class"
+
+    # 3. Test find_enclosing_class and find_enclosing_function edge cases
+    assert find_enclosing_class("", unit_cls) is None
+    assert find_enclosing_function("", unit_cls) is None
+
+
+
 
 
