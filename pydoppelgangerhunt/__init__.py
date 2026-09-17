@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pydoppelgangerhunt.baseline import (
     BaselineFingerprints,
+    PruneResult,
     clone_pair_fingerprint,
     clone_pair_structural_fingerprint,
     compute_unit_structural_hash,
@@ -176,6 +177,7 @@ __all__ = [
     "record_baseline",
     "load_baseline",
     "BaselineFingerprints",
+    "PruneResult",
     "filter_clones_by_baseline",
     "prune_baseline",
     "clone_pair_fingerprint",

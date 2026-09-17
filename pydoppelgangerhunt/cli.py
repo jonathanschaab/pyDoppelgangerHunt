@@ -227,7 +227,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     use_color = supports_color(args.color)
 
     # Load configuration from pyproject.toml / config file
-    tool_cfg = load_tool_config(args.config)
+    tool_cfg: Dict[str, Any] = {}
+    if args.config:
+        tool_cfg = load_tool_config(args.config)
+    else:
+        if target_arg:
+            target_dir = (
+                target_arg
+                if os.path.isdir(target_arg)
+                else (os.path.dirname(target_arg) or ".")
+            )
+            if target_dir != ".":
+                try:
+                    tool_cfg = load_tool_config(repo_root=target_dir)
+                except TypeError:
+                    pass
+        if not tool_cfg:
+            tool_cfg = load_tool_config()
     cfg_target = str(tool_cfg.get("target") or "")
     default_dir = (
         cfg_target

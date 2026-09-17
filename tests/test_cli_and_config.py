@@ -692,3 +692,47 @@ def test_batch_55_baseline_prune_repo_root_and_html_reporter(tmp_path: Path) -> 
             "--prune-baseline",
         ])
         assert cli_prune_code == 0
+
+
+def test_batch_56_target_dir_config_and_pruneresult_export(tmp_path: Path) -> None:
+    """Batch 56: Test PruneResult public export and target directory config discovery."""
+    # pylint: disable=import-outside-toplevel
+    from unittest import mock
+    from pydoppelgangerhunt import PruneResult
+    from pydoppelgangerhunt.baseline import PruneResult as BasePruneResult
+
+    # 1. Test PruneResult export and attribute behavior
+    assert PruneResult is BasePruneResult
+    res = PruneResult(pruned_count=3, retained_count=7, skipped_dirty_count=2)
+    assert res.pruned_count == 3
+    assert res.retained_count == 7
+    assert res.skipped_dirty_count == 2
+    # 2-tuple unpacking backward compatibility
+    pruned, retained = res
+    assert pruned == 3
+    assert retained == 7
+
+    # 2. Test CLI automatic config discovery from target directory
+    sub_proj = tmp_path / "sub_project_cfg"
+    sub_proj.mkdir()
+    (sub_proj / "pyproject.toml").write_text(
+        """
+[tool.pydoppelgangerhunt]
+threshold = 0.77
+min_lines = 11
+""",
+        encoding="utf-8",
+    )
+    (sub_proj / "dummy.py").write_text("x = 1\n", encoding="utf-8")
+
+    # Run CLI without --config pointing to sub_proj
+    # Should automatically discover pyproject.toml in sub_proj
+    with mock.patch("pydoppelgangerhunt.cli.scan_target") as mock_scan:
+        mock_scan.return_value = []
+        exit_code = pydoppelgangerhunt.main([str(sub_proj)])
+        assert exit_code == 0
+        mock_scan.assert_called_once()
+        _, kwargs = mock_scan.call_args
+        assert kwargs.get("threshold") == 0.77
+        assert kwargs.get("min_lines") == 11
+
