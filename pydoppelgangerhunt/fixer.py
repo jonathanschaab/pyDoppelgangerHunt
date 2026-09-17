@@ -482,6 +482,21 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+def _walrus_in_sequence(
+    items: Sequence[Optional[ast.AST]],
+    is_conditional: bool = False,
+) -> Tuple[Set[str], Set[str]]:
+    """Evaluates walrus assignments sequentially across expressions with short-circuiting tail conditions."""
+    definite: Set[str] = set()
+    conditional: Set[str] = set()
+    for idx, item in enumerate(items):
+        if item is not None:
+            d, c = _walrus_assignment_in_expr(item, is_conditional if idx == 0 else True)
+            definite.update(d)
+            conditional.update(c)
+    return definite, conditional
+
+
 def _walrus_assignment_in_expr(
     expr: Optional[ast.AST],
     is_conditional: bool = False,
@@ -499,14 +514,9 @@ def _walrus_assignment_in_expr(
             definite.add(expr.target.id)
 
     if isinstance(expr, ast.BoolOp):
-        if expr.values:
-            d_head, c_head = _walrus_assignment_in_expr(expr.values[0], is_conditional)
-            definite.update(d_head)
-            conditional.update(c_head)
-            for val in expr.values[1:]:
-                d_tail, c_tail = _walrus_assignment_in_expr(val, True)
-                definite.update(d_tail)
-                conditional.update(c_tail)
+        d_seq, c_seq = _walrus_in_sequence(expr.values, is_conditional)
+        definite.update(d_seq)
+        conditional.update(c_seq)
         return definite, conditional - definite
 
     if isinstance(expr, ast.IfExp):
@@ -517,19 +527,24 @@ def _walrus_assignment_in_expr(
         conditional.update(c_t | d_b | c_b | d_o | c_o)
         return definite, conditional - definite
 
+    if isinstance(expr, ast.Compare):
+        d_l, c_l = _walrus_assignment_in_expr(expr.left, is_conditional)
+        definite.update(d_l)
+        conditional.update(c_l)
+        d_seq, c_seq = _walrus_in_sequence(expr.comparators, is_conditional)
+        definite.update(d_seq)
+        conditional.update(c_seq)
+        return definite, conditional - definite
+
     if isinstance(expr, ast.Lambda):
         d_l, c_l = _walrus_assignment_in_expr(expr.body, True)
         conditional.update(d_l | c_l)
         return definite, conditional - definite
 
     if isinstance(expr, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
-        if expr.generators:
-            d_i, c_i = _walrus_assignment_in_expr(expr.generators[0].iter, is_conditional)
-            definite.update(d_i)
-            conditional.update(c_i)
-            for gen in expr.generators[1:]:
-                d_g, c_g = _walrus_assignment_in_expr(gen.iter, True)
-                conditional.update(d_g | c_g)
+        d_seq, c_seq = _walrus_in_sequence([g.iter for g in expr.generators], is_conditional)
+        definite.update(d_seq)
+        conditional.update(c_seq)
         for child in ast.iter_child_nodes(expr):
             if isinstance(expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp)) and child is expr.elt:
                 d_c, c_c = _walrus_assignment_in_expr(child, True)
@@ -595,7 +610,7 @@ def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
     return False
 
 
-def _extract_deleted_names(statements: Sequence[ast.stmt]) -> Set[str]:
+def _extract_deleted_names(statements: Sequence[ast.AST]) -> Set[str]:
     """Finds all variable names deleted within a statement sequence without recursing into nested functions."""
     deleted: Set[str] = set()
     for stmt in statements:
@@ -604,17 +619,17 @@ def _extract_deleted_names(statements: Sequence[ast.stmt]) -> Set[str]:
                 for node in ast.walk(target):
                     if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del):
                         deleted.add(node.id)
-        elif isinstance(stmt, (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try, getattr(ast, "TryStar", ast.Try))):
-            for child in ast.iter_child_nodes(stmt):
-                if isinstance(child, list):
-                    child_stmts = [c for c in child if isinstance(c, ast.stmt)]
-                    if child_stmts:
-                        deleted.update(_extract_deleted_names(child_stmts))
-                elif isinstance(child, ast.stmt):
-                    deleted.update(_extract_deleted_names([child]))
+        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        elif isinstance(stmt, ast.ExceptHandler):
+            deleted.update(_extract_deleted_names(stmt.body))
         elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
             for case in getattr(stmt, "cases", []):
                 deleted.update(_extract_deleted_names(getattr(case, "body", [])))
+        else:
+            for child in ast.iter_child_nodes(stmt):
+                if isinstance(child, (ast.stmt, ast.ExceptHandler)):
+                    deleted.update(_extract_deleted_names([child]))
     return deleted
 
 
@@ -798,6 +813,14 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                 f_def, f_cond = _analyze_block_assignment(f_body)
                 definite.update(f_def)
                 conditional.update((f_def | f_cond) - definite)
+                for v_del in _extract_deleted_names(f_body):
+                    definite.discard(v_del)
+                    conditional.discard(v_del)
+            for v_del in _extract_deleted_names(t_body):
+                definite.discard(v_del)
+            for h in handlers:
+                for v_del in _extract_deleted_names(getattr(h, "body", [])):
+                    definite.discard(v_del)
         elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
             d_sub, c_sub = _walrus_assignment_in_expr(getattr(stmt, "subject", None))
             definite.update(d_sub)
@@ -1808,8 +1831,8 @@ def find_enclosing_function(
     if not meta:
         return None
 
-    decs = meta.pop("decorators")
-    meta.pop("node")
+    decs = meta.pop("decorators", [])
+    meta.pop("node", None)
     meta["is_static"] = any(is_decorator_named(d, "staticmethod") for d in decs)
     meta["is_class_method"] = any(is_decorator_named(d, "classmethod") for d in decs)
     return meta

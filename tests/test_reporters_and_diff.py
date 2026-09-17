@@ -52,6 +52,7 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _analyze_block_assignment,
     _build_whole_method_delegation,
     _detect_indent_step,
+    _extract_deleted_names,
     _extract_required_typing_imports,
     _find_module_helper_insertion_index,
     _format_call_arguments,
@@ -59,6 +60,7 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _inspect_unit_scope,
     _is_method_of_class,
     _populate_unit_receiver_metadata,
+    _walrus_assignment_in_expr,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
 
@@ -5098,3 +5100,59 @@ def test_match_terminating_case_definite_assignment() -> None:
     tree = ast.parse(code)
     def_assigned, _ = _analyze_block_assignment(tree.body)
     assert "res" in def_assigned
+
+
+def test_extract_deleted_names_inside_except_handler() -> None:
+    """Verifies that _extract_deleted_names extracts deletions inside except handlers and preserves inner closures."""
+    code = (
+        "try:\n"
+        "    val = 10\n"
+        "except ValueError:\n"
+        "    del err_val\n"
+        "    def inner():\n"
+        "        del inner_scoped\n"
+    )
+    tree = ast.parse(code)
+    dels = _extract_deleted_names(tree.body)
+    assert "err_val" in dels
+    assert "inner_scoped" not in dels
+
+
+def test_try_finally_deletion_discards_from_definite() -> None:
+    """Verifies that _analyze_block_assignment discards variables deleted in finally blocks."""
+    code = (
+        "x = 10\n"
+        "y = 20\n"
+        "try:\n"
+        "    z = 30\n"
+        "finally:\n"
+        "    del x\n"
+    )
+    tree = ast.parse(code)
+    definite, _ = _analyze_block_assignment(tree.body)
+    assert "x" not in definite
+    assert "y" in definite
+
+
+def test_chained_comparison_walrus_short_circuit() -> None:
+    """Verifies that _walrus_assignment_in_expr treats chained comparison tails as conditional."""
+    code = "res = (a < (b := 1) < (c := 2))"
+    tree = ast.parse(code)
+    assign_stmt = tree.body[0]
+    assert isinstance(assign_stmt, ast.Assign)
+    definite, conditional = _walrus_assignment_in_expr(assign_stmt.value)
+    assert "b" in definite
+    assert "c" in conditional
+
+
+def test_find_enclosing_function_defensive(tmp_path: Path) -> None:
+    """Verifies that find_enclosing_function handles functions without decorators or metadata safely."""
+    code = "def sample():\n    pass\n"
+    f = tmp_path / "sample_mod.py"
+    f.write_text(code, encoding="utf-8")
+    u = {"file": str(f), "start": 1, "end": 2, "name": "sample", "kind": "function"}
+    meta = find_enclosing_function(code, u)
+    assert meta is not None
+    assert meta["name"] == "sample"
+    assert not meta["is_static"]
+    assert not meta["is_class_method"]
