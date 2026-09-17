@@ -702,9 +702,9 @@ def scan_target(
     target_norm = target_dir.replace("\\", "/").strip("./").rstrip("/")
     target_pfx = f"{target_norm}/" if target_norm and target_norm != "." else ""
     target_prefixes = (
-        (target_pfx, "pyfloorplanner/", "src/", "pydoppelgangerhunt/")
+        (target_pfx, "src/", "pydoppelgangerhunt/")
         if target_pfx
-        else ("pyfloorplanner/", "src/", "pydoppelgangerhunt/")
+        else ("src/", "pydoppelgangerhunt/")
     )
 
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []

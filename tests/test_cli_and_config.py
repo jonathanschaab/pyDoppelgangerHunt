@@ -1276,4 +1276,36 @@ def test_cli_replace_clones_without_patch_warning(tmp_path: Path, capsys: Any) -
     assert "Warning: --replace-clones specified without --patch; no patch will be generated." in captured.out
 
 
+def test_load_toml_section_multiline_nested_arrays_fallback(tmp_path: Path) -> None:
+    """Verifies that the zero-dependency TOML fallback parser tracks bracket depth across multiline 2D arrays."""
+    import builtins  # pylint: disable=import-outside-toplevel
+    from unittest import mock  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.config import load_toml_section  # pylint: disable=import-outside-toplevel
+
+    cfg = tmp_path / "pyproject.toml"
+    cfg.write_text(
+        "[tool.pydoppelgangerhunt]\n"
+        "exemptions = [\n"
+        '    ["pkg/a.py:func1", "pkg/b.py:func2"],\n'
+        '    ["pkg/c.py:func3", "pkg/d.py:func4"]\n'
+        "]\n",
+        encoding="utf-8",
+    )
+
+    real_import = builtins.__import__
+
+    def fake_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name in ("tomllib", "tomli"):
+            raise ImportError("Simulated missing toml library")
+        return real_import(name, *args, **kwargs)
+
+    with mock.patch("builtins.__import__", side_effect=fake_import):
+        data = load_toml_section(cfg, "pydoppelgangerhunt")
+        assert data["exemptions"] == [
+            ["pkg/a.py:func1", "pkg/b.py:func2"],
+            ["pkg/c.py:func3", "pkg/d.py:func4"],
+        ]
+
+
+
 

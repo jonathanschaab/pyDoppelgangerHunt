@@ -559,9 +559,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cfg_target
         if cfg_target and os.path.isdir(cfg_target)
         else (
-            "pyfloorplanner"
-            if os.path.isdir("pyfloorplanner")
-            else ("pydoppelgangerhunt" if os.path.isdir("pydoppelgangerhunt") else ".")
+            "pydoppelgangerhunt"
+            if os.path.isdir("pydoppelgangerhunt")
+            else ("src" if os.path.isdir("src") else ".")
         )
     )
     target = target_arg or default_dir

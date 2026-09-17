@@ -7507,6 +7507,197 @@ def test_batch_71_type2_clone_parameter_renaming_and_body_retention(tmp_path: Pa
     assert "v, out2 = _shared_b1_b2(q)" in patch_block
 
 
+def test_generate_refactoring_patch_multi_clone_same_file_git_apply(tmp_path: Path) -> None:
+    """Verifies that multiple clone pairs in the same file generate a single unified diff that applies cleanly via git apply."""
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    src = (
+        "def alpha(x: int) -> int:\n"
+        "    a = x * 2\n"
+        "    b = a + 1\n"
+        "    return b\n\n"
+        "def beta(y: int) -> int:\n"
+        "    a = y * 2\n"
+        "    b = a + 1\n"
+        "    return b\n\n"
+        "def gamma(z: int) -> int:\n"
+        "    c = z * 3\n"
+        "    d = c + 5\n"
+        "    return d\n\n"
+        "def delta(w: int) -> int:\n"
+        "    c = w * 3\n"
+        "    d = c + 5\n"
+        "    return d\n"
+    )
+    mod_file = tmp_path / "multi_mod.py"
+    mod_file.write_text(src, encoding="utf-8")
+
+    u_alpha = {"name": "alpha", "file": "multi_mod.py", "start": 1, "end": 4, "kind": "function", "receiver_kind": "none"}
+    u_beta = {"name": "beta", "file": "multi_mod.py", "start": 6, "end": 9, "kind": "function", "receiver_kind": "none"}
+    u_gamma = {"name": "gamma", "file": "multi_mod.py", "start": 11, "end": 14, "kind": "function", "receiver_kind": "none"}
+    u_delta = {"name": "delta", "file": "multi_mod.py", "start": 16, "end": 19, "kind": "function", "receiver_kind": "none"}
+
+    patch = generate_refactoring_patch(
+        [(0.95, u_alpha, u_beta), (0.95, u_gamma, u_delta)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+
+    # 1. Exactly one unified diff header for multi_mod.py
+    assert patch.count("--- a/multi_mod.py") == 1
+    assert patch.count("+++ b/multi_mod.py") == 1
+    # 2. Both clone pairs reflected and helpers synthesized
+    assert "# Clone Pair (95.0%): multi_mod.py <===> multi_mod.py" in patch
+    assert "def _shared_alpha_beta(x: int) -> int:" in patch
+    assert "def _shared_gamma_delta(z: int) -> int:" in patch
+    assert "return _shared_alpha_beta(x)" in patch
+    assert "return _shared_gamma_delta(z)" in patch
+
+    # 3. Verify clean git apply and execution
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    # Verify execution
+    run_proc = subprocess.run(
+        ["python", "-c", "from multi_mod import alpha, beta, gamma, delta; print(alpha(3), beta(3), gamma(2), delta(2))"],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+    )
+    assert run_proc.returncode == 0
+    assert run_proc.stdout.strip() == "7 7 11 11"
+
+
+def test_generate_refactoring_patch_cross_module_with_import_and_execution(tmp_path: Path) -> None:
+    """Verifies that cross-module clone refactoring injects the import into file 2 and both run."""
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    pkg_dir = tmp_path / "service_pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    src_a = (
+        "def compute_alpha(x: int) -> int:\n"
+        "    step1 = x * 10\n"
+        "    step2 = step1 + 7\n"
+        "    return step2\n"
+    )
+    src_b = (
+        "def compute_beta(v: int) -> int:\n"
+        "    step1 = v * 10\n"
+        "    step2 = step1 + 7\n"
+        "    return step2\n"
+    )
+    f_a = pkg_dir / "srv_a.py"
+    f_b = pkg_dir / "srv_b.py"
+    f_a.write_text(src_a, encoding="utf-8")
+    f_b.write_text(src_b, encoding="utf-8")
+
+    u_a = {"name": "compute_alpha", "file": "service_pkg/srv_a.py", "start": 1, "end": 4, "kind": "function"}
+    u_b = {"name": "compute_beta", "file": "service_pkg/srv_b.py", "start": 1, "end": 4, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u_a, u_b)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+
+    # 1. Diff includes both files
+    assert "--- a/service_pkg/srv_a.py" in patch
+    assert "--- a/service_pkg/srv_b.py" in patch
+    # 2. File 2 imports helper from file 1
+    assert "from service_pkg.srv_a import _shared_compute_alpha_compute_beta" in patch
+
+    # 3. Verify git apply and execution
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    run_proc = subprocess.run(
+        ["python", "-c", "from service_pkg.srv_a import compute_alpha; from service_pkg.srv_b import compute_beta; print(compute_alpha(5), compute_beta(5))"],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+    )
+    assert run_proc.returncode == 0
+    assert run_proc.stdout.strip() == "57 57"
+
+
+def test_generate_refactoring_patch_cross_module_circular_import_safety(tmp_path: Path) -> None:
+    """Verifies that circular module imports are detected and prevented during cross-module patch generation."""
+    pkg_dir = tmp_path / "cyclic_pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    src_a = (
+        "import cyclic_pkg.mod_b\n\n"
+        "def work_a(x: int) -> int:\n"
+        "    y = x + 1\n"
+        "    return y * 2\n"
+    )
+    src_b = (
+        "def work_b(x: int) -> int:\n"
+        "    y = x + 1\n"
+        "    return y * 2\n"
+    )
+    f_a = pkg_dir / "mod_a.py"
+    f_b = pkg_dir / "mod_b.py"
+    f_a.write_text(src_a, encoding="utf-8")
+    f_b.write_text(src_b, encoding="utf-8")
+
+    u_a = {"name": "work_a", "file": "cyclic_pkg/mod_a.py", "start": 3, "end": 5, "kind": "function"}
+    u_b = {"name": "work_b", "file": "cyclic_pkg/mod_b.py", "start": 1, "end": 3, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u_a, u_b)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+
+    # File 2 is NOT refactored with an unsafe circular import
+    assert "--- a/cyclic_pkg/mod_b.py" not in patch
+    assert "Circular import or unresolvable module path" in patch
+
+
+def test_generate_refactoring_patch_overlapping_units_filtered(tmp_path: Path) -> None:
+    """Verifies that overlapping candidate units are filtered without crashing ValueError."""
+    src = (
+        "def outer(x: int) -> int:\n"
+        "    y = x * 2\n"
+        "    z = y + 1\n"
+        "    return z\n"
+    )
+    f = tmp_path / "overlap.py"
+    f.write_text(src, encoding="utf-8")
+
+    u_outer = {"name": "outer", "file": "overlap.py", "start": 1, "end": 4, "kind": "function"}
+    u_inner = {"name": "outer:inner", "file": "overlap.py", "start": 2, "end": 3, "kind": "compound_block"}
+
+    # Pair proposing outer and inner concurrently
+    patch = generate_refactoring_patch(
+        [(0.90, u_outer, u_outer), (0.85, u_inner, u_inner)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "def outer(x: int) -> int:" in patch
+
+
+
 
 
 

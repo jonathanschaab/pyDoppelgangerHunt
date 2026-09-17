@@ -167,6 +167,31 @@ def _strip_toml_inline_comment(line: str) -> str:
     return line.strip()
 
 
+def _count_bracket_depth(text: str, initial_depth: int = 0) -> int:
+    """Computes net bracket nesting depth for [ and ] ignoring brackets inside quotes."""
+    depth = initial_depth
+    in_quote: Optional[str] = None
+    escaped = False
+    for ch in text:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and in_quote is not None:
+            escaped = True
+            continue
+        if ch in ('"', "'"):
+            if in_quote is None:
+                in_quote = ch
+            elif in_quote == ch:
+                in_quote = None
+        elif in_quote is None:
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth = max(0, depth - 1)
+    return depth
+
+
 def _parse_toml_array_value(val_str: str) -> List[Any]:
     """Parses a TOML array string representation into a list of Python typed values."""
     elems: List[Any] = []
@@ -222,19 +247,19 @@ def _parse_toml_array_value(val_str: str) -> List[Any]:
 def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[str, Any]:
     """Loads a specific tool configuration section from a TOML file with fallbacks."""
     target_path = Path(target_file)
-    if not target_path.exists():
+    if not target_path.is_file():
         return {}
 
-    # Standard library / tomli parser
+    # Prefer standard library tomllib (Python 3.11+) or third-party tomli if installed
     try:
         if sys.version_info >= (3, 11):
             import tomllib  # pylint: disable=import-outside-toplevel
         else:
-            import tomli as tomllib  # type: ignore[import-not-found,unused-ignore] # pylint: disable=import-outside-toplevel
+            import tomli as tomllib  # type: ignore # pylint: disable=import-outside-toplevel
         with open(target_path, "rb") as fh:
             data = tomllib.load(fh)
         tool_sec = data.get("tool", {})
-        if section_name in tool_sec and isinstance(tool_sec[section_name], dict):
+        if section_name in tool_sec:
             return dict(tool_sec[section_name])
         if any(k in data for k in ("threshold", "min_lines", "exemptions", "exclude")):
             return dict(data)
@@ -247,6 +272,7 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
         in_section = False
         in_multiline_key: Optional[str] = None
         multiline_tokens: List[str] = []
+        multiline_depth = 0
         target_section = f"[tool.{section_name}]"
         with open(target_path, "r", encoding="utf-8", errors="replace") as fh:
             lines = fh.readlines()
@@ -260,7 +286,8 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
                 continue
             if in_multiline_key is not None:
                 multiline_tokens.append(stripped)
-                if stripped.endswith("]"):
+                multiline_depth = _count_bracket_depth(stripped, multiline_depth)
+                if multiline_depth == 0:
                     config[in_multiline_key] = _parse_toml_array_value(" ".join(multiline_tokens))
                     in_multiline_key = None
                     multiline_tokens = []
@@ -280,11 +307,13 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
                 ):
                     config[k] = v[1:-1]
                 elif v.startswith("["):
-                    if v.endswith("]"):
+                    v_depth = _count_bracket_depth(v, 0)
+                    if v_depth == 0:
                         config[k] = _parse_toml_array_value(v)
                     else:
                         in_multiline_key = k
                         multiline_tokens = [v]
+                        multiline_depth = v_depth
                 elif v.lower() == "true":
                     config[k] = True
                 elif v.lower() == "false":
