@@ -21,8 +21,13 @@ from pydoppelgangerhunt import (
 )
 
 from pydoppelgangerhunt.parser import (
+    BRANCH_NODE_TYPES,
+    COMPOUND_BLOCK_TYPES,
+    _CommutativeCanonicalizer,
+    _IdiomCanonicalizer,
     _compute_expression_complexity,
     _harvest_complex_expressions,
+    _walk_ast_nodes,
     check_inline_suppression,
 )
 
@@ -751,5 +756,161 @@ def test_harvest_units_structural_hash(tmp_path: Path) -> None:
     # Re-harvest to confirm hash determinism
     units2 = harvest_file_units(str(src_file), str(tmp_path), min_lines=2, min_tokens=5)
     assert units2[0]["structural_hash"] == u["structural_hash"]
+
+
+def test_batch_43_ast_constructs_canonicalizers_and_branch_harvesting(tmp_path: Path) -> None:
+    """Test AST node types, commutative canonicalization, idiom reduction, and branch harvesting."""
+    # 1. Expanded boilerplate recognition (exception, warn, info, custom)
+    tree_ex = ast.parse("logger.exception('failed')").body[0]
+    assert is_boilerplate_node(tree_ex) is True
+    tree_warn = ast.parse("logger.warn('deprecated')").body[0]
+    assert is_boilerplate_node(tree_warn) is True
+    tree_cust = ast.parse("custom_obj.calculate_result()").body[0]
+    assert is_boilerplate_node(tree_cust) is False
+
+    # 2. _CommutativeCanonicalizer with symmetric identity comparisons (is, is not)
+    t_is1 = ast.parse("res = x is None")
+    t_is2 = ast.parse("res = None is x")
+    c_is1 = _CommutativeCanonicalizer().visit(t_is1)
+    c_is2 = _CommutativeCanonicalizer().visit(t_is2)
+    assert ast.dump(c_is1) == ast.dump(c_is2)
+
+    t_isnot1 = ast.parse("res = x is not None")
+    t_isnot2 = ast.parse("res = None is not x")
+    c_isnot1 = _CommutativeCanonicalizer().visit(t_isnot1)
+    c_isnot2 = _CommutativeCanonicalizer().visit(t_isnot2)
+    assert ast.dump(c_isnot1) == ast.dump(c_isnot2)
+
+    # 3. _CommutativeCanonicalizer with MatchOr (Python 3.10+)
+    if hasattr(ast, "MatchOr"):
+        t_mor1 = ast.parse("match val:\n    case int() | float():\n        pass")
+        t_mor2 = ast.parse("match val:\n    case float() | int():\n        pass")
+        c_mor1 = _CommutativeCanonicalizer().visit(t_mor1)
+        c_mor2 = _CommutativeCanonicalizer().visit(t_mor2)
+        assert ast.dump(c_mor1) == ast.dump(c_mor2)
+
+    # 4. _IdiomCanonicalizer with Attribute append target (self.items.append(x))
+    t_attr_loop = ast.parse("for x in data:\n    self.items.append(x)")
+    c_attr_loop = _IdiomCanonicalizer().visit(t_attr_loop)
+    assert isinstance(c_attr_loop.body[0], ast.Assign)
+    assert isinstance(c_attr_loop.body[0].targets[0], ast.Attribute)
+    assert c_attr_loop.body[0].targets[0].attr == "items"
+    assert isinstance(c_attr_loop.body[0].value, ast.ListComp)
+
+    # 5. compute_cyclomatic_complexity with Match cases and TryStar
+    if hasattr(ast, "Match"):
+        t_match = ast.parse(
+            "def handle(val):\n"
+            "    match val:\n"
+            "        case 1:\n"
+            "            return 10\n"
+            "        case 2:\n"
+            "            return 20\n"
+            "        case _:\n"
+            "            return 30\n"
+        ).body[0]
+        assert compute_cyclomatic_complexity(t_match) == 4
+
+    if hasattr(ast, "TryStar"):
+        t_trystar = ast.parse(
+            "def handle_tg():\n"
+            "    try:\n"
+            "        pass\n"
+            "    except* ValueError:\n"
+            "        pass\n"
+            "    except* TypeError:\n"
+            "        pass\n"
+        ).body[0]
+        assert compute_cyclomatic_complexity(t_trystar) == 4
+
+    # 6. COMPOUND_BLOCK_TYPES and BRANCH_NODE_TYPES invariants
+    assert ast.If in COMPOUND_BLOCK_TYPES
+    assert ast.For in COMPOUND_BLOCK_TYPES
+    assert ast.Try in COMPOUND_BLOCK_TYPES
+    assert ast.If in BRANCH_NODE_TYPES
+    assert ast.ExceptHandler in BRANCH_NODE_TYPES
+    if hasattr(ast, "Match"):
+        assert getattr(ast, "Match") in COMPOUND_BLOCK_TYPES
+        assert getattr(ast, "match_case") in BRANCH_NODE_TYPES
+    if hasattr(ast, "TryStar"):
+        assert getattr(ast, "TryStar") in COMPOUND_BLOCK_TYPES
+        assert getattr(ast, "TryStar") in BRANCH_NODE_TYPES
+
+    # 7. _walk_ast_nodes with type_params (PEP 695) and match_case guard
+    if hasattr(ast, "TypeVar"):
+        try:
+            t_tp = ast.parse("def generic_fn[T](x: int) -> int: pass")
+            nodes_untyped = _walk_ast_nodes(t_tp, strip_annotations=True)
+            assert not any(type(n).__name__ == "TypeVar" for n in nodes_untyped)
+            nodes_typed = _walk_ast_nodes(t_tp, strip_annotations=False)
+            assert any(type(n).__name__ == "TypeVar" for n in nodes_typed)
+        except SyntaxError:
+            pass
+
+    if hasattr(ast, "match_case"):
+        t_guard = ast.parse("match x:\n    case 1 if a > 0:\n        pass")
+        nodes_guard = _walk_ast_nodes(t_guard, abstract_expressions=True)
+        assert any(isinstance(n, ast.Name) and n.id == "__ABSTRACT_COND__" for n in nodes_guard)
+
+    # 8. Clause-level branch harvesting across Try (else, finally) and Match (cases)
+    src_try = tmp_path / "clause_try.py"
+    src_try.write_text(
+        "def try_proc():\n"
+        "    try:\n"
+        "        a = 1\n"
+        "        b = 2\n"
+        "        c = 3\n"
+        "    except ValueError:\n"
+        "        d = 4\n"
+        "        e = 5\n"
+        "        f = 6\n"
+        "    else:\n"
+        "        g = 7\n"
+        "        h = 8\n"
+        "        i = 9\n"
+        "    finally:\n"
+        "        j = 10\n"
+        "        k = 11\n"
+        "        l = 12\n",
+        encoding="utf-8",
+    )
+    units_try = harvest_file_units(str(src_try), str(tmp_path), min_lines=2, min_tokens=5, clause_level=True)
+    c_names = {u["name"] for u in units_try if u.get("kind") == "clause_branch"}
+    assert "try_proc:except_ValueError" in c_names
+    assert "try_proc:try_else" in c_names
+    assert "try_proc:try_finally" in c_names
+
+    if hasattr(ast, "Match"):
+        src_match = tmp_path / "clause_match.py"
+        src_match.write_text(
+            "def match_proc(val):\n"
+            "    init_val = 0\n"
+            "    match val:\n"
+            "        case 1:\n"
+            "            a = 1\n"
+            "            b = 2\n"
+            "            c = 3\n"
+            "        case 2:\n"
+            "            d = 4\n"
+            "            e = 5\n"
+            "            f = 6\n",
+            encoding="utf-8",
+        )
+        # Without clause_level: harvested as compound block
+        units_m_block = harvest_file_units(
+            str(src_match), str(tmp_path), min_lines=4, min_tokens=8, clause_level=False
+        )
+        m_block_kinds = {u["name"]: u["kind"] for u in units_m_block}
+        assert "match_proc:Match" in m_block_kinds
+        assert m_block_kinds["match_proc:Match"] == "compound_block"
+
+        # With clause_level: case branches harvested
+        units_m_clause = harvest_file_units(
+            str(src_match), str(tmp_path), min_lines=2, min_tokens=5, clause_level=True
+        )
+        m_clause_names = {u["name"] for u in units_m_clause if u.get("kind") == "clause_branch"}
+        assert "match_proc:case_1" in m_clause_names
+        assert "match_proc:case_2" in m_clause_names
+
 
 

@@ -12,6 +12,40 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Un
 
 BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
+COMPOUND_BLOCK_TYPES: Tuple[type, ...] = tuple(
+    cls
+    for cls in (
+        ast.If,
+        ast.For,
+        ast.AsyncFor,
+        ast.While,
+        ast.Try,
+        getattr(ast, "TryStar", None),
+        ast.With,
+        ast.AsyncWith,
+        getattr(ast, "Match", None),
+    )
+    if cls is not None
+)
+
+BRANCH_NODE_TYPES: Tuple[type, ...] = tuple(
+    cls
+    for cls in (
+        ast.If,
+        ast.IfExp,
+        ast.For,
+        ast.AsyncFor,
+        ast.While,
+        ast.Try,
+        getattr(ast, "TryStar", None),
+        ast.ExceptHandler,
+        getattr(ast, "match_case", None),
+        ast.With,
+        ast.AsyncWith,
+    )
+    if cls is not None
+)
+
 
 def is_boilerplate_node(node: ast.AST) -> bool:
     """Checks if an AST statement node is logging, print, or assertion boilerplate."""
@@ -22,7 +56,17 @@ def is_boilerplate_node(node: ast.AST) -> bool:
         if isinstance(call.func, ast.Name) and call.func.id in ("print", "log"):
             return True
         if isinstance(call.func, ast.Attribute):
-            if call.func.attr in ("debug", "info", "warning", "error", "critical", "log", "_log"):
+            if call.func.attr in (
+                "debug",
+                "info",
+                "warning",
+                "warn",
+                "error",
+                "critical",
+                "exception",
+                "log",
+                "_log",
+            ):
                 return True
             if isinstance(call.func.value, ast.Name) and call.func.value.id in ("logger", "logging"):
                 return True
@@ -56,13 +100,21 @@ class _CommutativeCanonicalizer(ast.NodeTransformer):
         return node
 
     def visit_Compare(self, node: ast.Compare) -> ast.Compare:
-        """Canonicalizes symmetric comparisons (==, !=) by sorting operands."""
+        """Canonicalizes symmetric comparisons (==, !=, is, is not) by sorting operands."""
         self.generic_visit(node)
-        if len(node.ops) == 1 and isinstance(node.ops[0], (ast.Eq, ast.NotEq)):
+        if len(node.ops) == 1 and isinstance(node.ops[0], (ast.Eq, ast.NotEq, ast.Is, ast.IsNot)):
             k_left = self._sort_key(node.left)
             k_right = self._sort_key(node.comparators[0])
             if k_left > k_right:
                 node.left, node.comparators[0] = node.comparators[0], node.left
+        return node
+
+    def visit_MatchOr(self, node: ast.AST) -> ast.AST:  # pragma: no cover (py310+)
+        """Canonicalizes pattern matching alternatives (case A | B) by sorting patterns."""
+        self.generic_visit(node)
+        patterns = getattr(node, "patterns", None)
+        if isinstance(patterns, list):
+            setattr(node, "patterns", sorted(patterns, key=self._sort_key))
         return node
 
 
@@ -76,23 +128,32 @@ class _IdiomCanonicalizer(ast.NodeTransformer):
         if (
             isinstance(call.func, ast.Attribute)
             and call.func.attr == "append"
-            and isinstance(call.func.value, ast.Name)
             and len(call.args) == 1
         ):
-            return ast.Assign(
-                targets=[ast.Name(id=call.func.value.id, ctx=ast.Store())],
-                value=ast.ListComp(
-                    elt=call.args[0],
-                    generators=[
-                        ast.comprehension(
-                            target=node.target,
-                            iter=node.iter,
-                            ifs=list(ifs),
-                            is_async=0,
-                        )
-                    ],
-                ),
-            )
+            target_expr: Optional[ast.expr] = None
+            if isinstance(call.func.value, ast.Name):
+                target_expr = ast.Name(id=call.func.value.id, ctx=ast.Store())
+            elif isinstance(call.func.value, ast.Attribute):
+                target_expr = ast.Attribute(
+                    value=call.func.value.value,
+                    attr=call.func.value.attr,
+                    ctx=ast.Store(),
+                )
+            if target_expr is not None:
+                return ast.Assign(
+                    targets=[target_expr],
+                    value=ast.ListComp(
+                        elt=call.args[0],
+                        generators=[
+                            ast.comprehension(
+                                target=node.target,
+                                iter=node.iter,
+                                ifs=list(ifs),
+                                is_async=0,
+                            )
+                        ],
+                    ),
+                )
         return None
 
     @staticmethod
@@ -191,9 +252,18 @@ def _walk_ast_nodes(
             continue
         nodes.append(node)
         for name, value in ast.iter_fields(node):
-            if strip_annotations and name in ("annotation", "returns", "type_comment"):
+            if strip_annotations and name in ("annotation", "returns", "type_comment", "type_params"):
                 continue
             if abstract_expressions and name == "test" and isinstance(node, (ast.If, ast.While, ast.IfExp)):
+                if isinstance(value, (ast.Compare, ast.BoolOp, ast.UnaryOp)):
+                    nodes.append(ast.Name(id="__ABSTRACT_COND__", ctx=ast.Load()))
+                    continue
+            if (
+                abstract_expressions
+                and name == "guard"
+                and hasattr(ast, "match_case")
+                and isinstance(node, getattr(ast, "match_case"))  # pragma: no cover (py310+)
+            ):
                 if isinstance(value, (ast.Compare, ast.BoolOp, ast.UnaryOp)):
                     nodes.append(ast.Name(id="__ABSTRACT_COND__", ctx=ast.Load()))
                     continue
@@ -645,20 +715,7 @@ def compute_cyclomatic_complexity(target: Any) -> int:
     complexity = 1
     for root in nodes:
         for node in ast.walk(root):
-            if isinstance(
-                node,
-                (
-                    ast.If,
-                    ast.IfExp,
-                    ast.For,
-                    ast.AsyncFor,
-                    ast.While,
-                    ast.Try,
-                    ast.ExceptHandler,
-                    ast.With,
-                    ast.AsyncWith,
-                ),
-            ):
+            if isinstance(node, BRANCH_NODE_TYPES):
                 complexity += 1
             elif isinstance(node, ast.BoolOp):
                 complexity += max(0, len(node.values) - 1)
@@ -1083,6 +1140,7 @@ def harvest_file_units(
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             fn_start = getattr(node, "lineno", 0)
             fn_end = getattr(node, "end_lineno", fn_start)
+            fn_len = (fn_end or fn_start) - fn_start + 1
             if file_lines and check_inline_suppression(file_lines, fn_start, fn_end):
                 continue
 
@@ -1148,22 +1206,11 @@ def harvest_file_units(
 
             if not functions_only:
                 for item in _iter_local_nodes(node):
-                    if item is not node and isinstance(
-                        item,
-                        (
-                            ast.If,
-                            ast.For,
-                            ast.AsyncFor,
-                            ast.While,
-                            ast.Try,
-                            ast.With,
-                            ast.AsyncWith,
-                        ),
-                    ):
+                    if item is not node and isinstance(item, COMPOUND_BLOCK_TYPES):
                         item_start = getattr(item, "lineno", 0)
-                        item_end = getattr(item, "end_lineno", item_start)
+                        item_end = getattr(item, "end_lineno", item_start) or item_start
                         block_lines = item_end - item_start + 1
-                        if block_lines < (node.end_lineno - node.lineno + 1):  # type: ignore[operator]
+                        if block_lines < fn_len:
                             _record_unit(
                                 units,
                                 f"{unit_name}:{type(item).__name__}",
@@ -1220,84 +1267,64 @@ def harvest_file_units(
                         )
 
             if clause_level and hasattr(node, "body"):
+                def _record_branch(
+                    label: str,
+                    body: List[ast.stmt],
+                    default_line: int,
+                    u_name: str = unit_name,
+                    e_class: Optional[str] = enc_class,
+                    e_start: Optional[int] = enc_class_start,
+                    r_kind: Optional[str] = fn_receiver_kind,
+                    static_fn: bool = fn_is_static,
+                ) -> None:
+                    _record_clause_branch(
+                        units,
+                        u_name,
+                        label,
+                        rel_file,
+                        body,
+                        default_line,
+                        min_lines,
+                        min_tokens,
+                        file_lines=file_lines,
+                        blind_indexing=blind_indexing,
+                        strip_annotations=strip_annotations,
+                        blind_literals=blind_literals,
+                        filter_boilerplate=filter_boilerplate,
+                        consistent_renaming=consistent_renaming,
+                        abstract_expressions=abstract_expressions,
+                        strip_docstrings=strip_docstrings,
+                        enclosing_class=e_class,
+                        enclosing_class_start=e_start,
+                        receiver_kind=r_kind,
+                        is_static=static_fn,
+                    )
+
                 for stmt in _iter_local_nodes(node):
                     if isinstance(stmt, ast.If):
                         s_line = getattr(stmt, "lineno", 0)
-                        _record_clause_branch(
-                            units,
-                            unit_name,
-                            "if_branch",
-                            rel_file,
-                            stmt.body,
-                            s_line,
-                            min_lines,
-                            min_tokens,
-                            file_lines=file_lines,
-                            blind_indexing=blind_indexing,
-                            strip_annotations=strip_annotations,
-                            blind_literals=blind_literals,
-                            filter_boilerplate=filter_boilerplate,
-                            consistent_renaming=consistent_renaming,
-                            abstract_expressions=abstract_expressions,
-                            strip_docstrings=strip_docstrings,
-                            enclosing_class=enc_class,
-                            enclosing_class_start=enc_class_start,
-                            receiver_kind=fn_receiver_kind,
-                            is_static=fn_is_static,
-                        )
+                        _record_branch("if_branch", stmt.body, s_line)
                         if stmt.orelse:
-                            _record_clause_branch(
-                                units,
-                                unit_name,
-                                "else_branch",
-                                rel_file,
-                                stmt.orelse,
-                                s_line,
-                                min_lines,
-                                min_tokens,
-                                file_lines=file_lines,
-                                blind_indexing=blind_indexing,
-                                strip_annotations=strip_annotations,
-                                blind_literals=blind_literals,
-                                filter_boilerplate=filter_boilerplate,
-                                consistent_renaming=consistent_renaming,
-                                abstract_expressions=abstract_expressions,
-                                strip_docstrings=strip_docstrings,
-                                enclosing_class=enc_class,
-                                enclosing_class_start=enc_class_start,
-                                receiver_kind=fn_receiver_kind,
-                                is_static=fn_is_static,
-                            )
-                    elif isinstance(stmt, ast.Try):
+                            _record_branch("else_branch", stmt.orelse, s_line)
+                    elif isinstance(stmt, (ast.Try, getattr(ast, "TryStar", ()))):
                         t_line = getattr(stmt, "lineno", 0)
-                        for h_idx, handler in enumerate(stmt.handlers):
+                        for h_idx, handler in enumerate(getattr(stmt, "handlers", [])):
                             h_name = (
                                 handler.type.id
                                 if isinstance(handler.type, ast.Name)
                                 else f"handler_{h_idx}"
                             )
-                            _record_clause_branch(
-                                units,
-                                unit_name,
-                                f"except_{h_name}",
-                                rel_file,
-                                handler.body,
-                                t_line,
-                                min_lines,
-                                min_tokens,
-                                file_lines=file_lines,
-                                blind_indexing=blind_indexing,
-                                strip_annotations=strip_annotations,
-                                blind_literals=blind_literals,
-                                filter_boilerplate=filter_boilerplate,
-                                consistent_renaming=consistent_renaming,
-                                abstract_expressions=abstract_expressions,
-                                strip_docstrings=strip_docstrings,
-                                enclosing_class=enc_class,
-                                enclosing_class_start=enc_class_start,
-                                receiver_kind=fn_receiver_kind,
-                                is_static=fn_is_static,
-                            )
+                            _record_branch(f"except_{h_name}", handler.body, t_line)
+                        try_else = getattr(stmt, "orelse", None)
+                        if try_else:
+                            _record_branch("try_else", try_else, t_line)
+                        try_finally = getattr(stmt, "finalbody", None)
+                        if try_finally:
+                            _record_branch("try_finally", try_finally, t_line)
+                    elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
+                        m_line = getattr(stmt, "lineno", 0)
+                        for c_idx, case in enumerate(getattr(stmt, "cases", [])):
+                            _record_branch(f"case_{c_idx + 1}", getattr(case, "body", []), m_line)
 
         elif class_level and isinstance(node, ast.ClassDef):
             _record_node_unit(
