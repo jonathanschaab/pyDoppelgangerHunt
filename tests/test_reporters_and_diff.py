@@ -5156,3 +5156,23 @@ def test_find_enclosing_function_defensive(tmp_path: Path) -> None:
     assert meta["name"] == "sample"
     assert not meta["is_static"]
     assert not meta["is_class_method"]
+
+
+def test_build_whole_method_delegation_single_line_function() -> None:
+    """Verifies that _build_whole_method_delegation cleanly handles single-line functions without IndentationError."""
+    code = "def add(x: int, y: int) -> int: return x + y\n"
+    unit = {"file": "t.py", "start": 1, "end": 1, "name": "add", "kind": "function"}
+    res = _build_whole_method_delegation(code, unit, "", "_shared_add", "x, y")
+    assert "def add(x: int, y: int) -> int:\n" in res
+    assert "return _shared_add(x, y)" in res
+    parsed = ast.parse(res)
+    assert len(parsed.body) == 1
+    assert isinstance(parsed.body[0], ast.FunctionDef)
+
+
+def test_compute_unit_diff_overlap_missing_file() -> None:
+    """Verifies that compute_unit_diff_overlap safely returns (0, 0.0) when file key is missing or empty."""
+    from pydoppelgangerhunt.git_diff import compute_unit_diff_overlap  # pylint: disable=import-outside-toplevel
+
+    assert compute_unit_diff_overlap({}, {"foo.py": [(1, 10)]}) == (0, 0.0)
+    assert compute_unit_diff_overlap({"file": ""}, {"foo.py": [(1, 10)]}) == (0, 0.0)

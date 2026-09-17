@@ -2663,6 +2663,7 @@ def _build_whole_method_delegation(
 
     sig_end_line = u_start
     docstring_end_line: Optional[int] = None
+    header = ""
     raw_u_name = unit.get("name", "")
     base_u_name = raw_u_name.rsplit(":", maxsplit=1)[-1]
 
@@ -2690,28 +2691,41 @@ def _build_whole_method_delegation(
                 if found_indent is not None:
                     body_indent = found_indent
                 first_body = matched_node.body[0]
-                sig_end_line = first_body.lineno - 1
-                if (
-                    isinstance(first_body, ast.Expr)
-                    and isinstance(first_body.value, ast.Constant)
-                    and isinstance(first_body.value.value, str)
-                ):
-                    docstring_end_line = getattr(first_body, "end_lineno", first_body.lineno)
+                if first_body.lineno == u_start:
+                    b_col = getattr(first_body, "col_offset", len(lines[u_start - 1]))
+                    same_line = lines[u_start - 1][:b_col].rstrip()
+                    if not same_line.endswith(":"):
+                        colon_pos = lines[u_start - 1].find(":")
+                        if colon_pos != -1:
+                            same_line = lines[u_start - 1][: colon_pos + 1]
+                    header = same_line + "\n"
+                else:
+                    sig_end_line = first_body.lineno - 1
+                    if (
+                        isinstance(first_body, ast.Expr)
+                        and isinstance(first_body.value, ast.Constant)
+                        and isinstance(first_body.value.value, str)
+                    ):
+                        docstring_end_line = getattr(first_body, "end_lineno", first_body.lineno)
     except SyntaxError:
         pass
 
-    if docstring_end_line is not None and docstring_end_line >= u_start:
-        header = "".join(lines[u_start - 1 : docstring_end_line])
-    elif sig_end_line >= u_start:
-        header = "".join(lines[u_start - 1 : sig_end_line])
-    else:
-        hdr_lines = []
-        for l_num in range(u_start, min(u_end + 1, len(lines) + 1)):
-            ln = lines[l_num - 1]
-            hdr_lines.append(ln)
-            if ln.rstrip().endswith(":"):
-                break
-        header = "".join(hdr_lines)
+    if not header:
+        if docstring_end_line is not None and docstring_end_line >= u_start:
+            header = "".join(lines[u_start - 1 : docstring_end_line])
+        elif sig_end_line >= u_start:
+            header = "".join(lines[u_start - 1 : sig_end_line])
+        else:
+            hdr_lines = []
+            for l_num in range(u_start, min(u_end + 1, len(lines) + 1)):
+                ln = lines[l_num - 1]
+                if ":" in ln and not ln.rstrip().endswith(":"):
+                    hdr_lines.append(ln[: ln.find(":") + 1] + "\n")
+                    break
+                hdr_lines.append(ln)
+                if ln.rstrip().endswith(":"):
+                    break
+            header = "".join(hdr_lines)
 
     if not header.endswith("\n"):
         header += "\n"
@@ -2759,7 +2773,9 @@ def generate_refactoring_patch(
     patch_chunks: List[str] = []
 
     for sim, u1, u2 in clones:
-        f1_raw = u1["file"].split("#")[0]
+        f1_raw = str(u1.get("file", "")).split("#", maxsplit=1)[0]
+        if not f1_raw:
+            continue
         f1_norm = f1_raw.replace("\\", "/")
         p = Path(f1_norm)
         f1_path = p if p.is_absolute() else (root / p)
@@ -2773,7 +2789,7 @@ def generate_refactoring_patch(
 
         orig_lines = orig_text.splitlines(keepends=True)
 
-        f2_raw = u2.get("file", "").split("#")[0]
+        f2_raw = str(u2.get("file", "")).split("#", maxsplit=1)[0]
         f2_norm = f2_raw.replace("\\", "/")
         is_same_file = bool(f2_norm and f2_norm == f1_norm)
 

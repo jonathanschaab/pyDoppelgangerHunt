@@ -95,7 +95,9 @@ def compute_unit_diff_overlap(
         >>> overlap_ratio
         0.625
     """
-    norm_file = unit["file"].split("#")[0].replace("\\", "/")
+    norm_file = unit.get("file", "").split("#")[0].replace("\\", "/")
+    if not norm_file:
+        return 0, 0.0
     target_ranges = modified_ranges.get(norm_file)
     if not target_ranges:
         for f, ranges in modified_ranges.items():
