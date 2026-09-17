@@ -95,7 +95,7 @@ def compute_unit_diff_overlap(
         >>> overlap_ratio
         0.625
     """
-    norm_file = unit.get("file", "").split("#")[0].replace("\\", "/")
+    norm_file = str(unit.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
     if not norm_file:
         return 0, 0.0
     target_ranges = modified_ranges.get(norm_file)
@@ -184,7 +184,9 @@ def get_git_blame_info(
     repo_root: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Extracts git commit and author metadata for a line range using git blame --porcelain."""
-    norm_file = file_path.split("#")[0]  # strip notebook cell suffixes if present
+    norm_file = str(file_path or "").split("#", maxsplit=1)[0]
+    if not norm_file:
+        return {"author": "Unknown", "commit": "unknown", "timestamp": 0, "summary": ""}
     start_l = max(1, start_line)
     end_l = max(start_l, end_line)
     args = ["blame", "-L", f"{start_l},{end_l}", "--porcelain", norm_file]
@@ -232,8 +234,12 @@ def check_temporal_divergence(
     max_divergence_days: int = 90,
 ) -> Optional[Dict[str, Any]]:
     """Detects whether two clone instances exhibit temporal divergence (asymmetric commit ages)."""
-    b1 = get_git_blame_info(u1["file"], u1["start"], u1["end"], repo_root=repo_root)
-    b2 = get_git_blame_info(u2["file"], u2["start"], u2["end"], repo_root=repo_root)
+    f1 = str(u1.get("file") or "")
+    f2 = str(u2.get("file") or "")
+    if not f1 or not f2:
+        return None
+    b1 = get_git_blame_info(f1, u1.get("start", 1), u1.get("end", 1), repo_root=repo_root)
+    b2 = get_git_blame_info(f2, u2.get("start", 1), u2.get("end", 1), repo_root=repo_root)
 
     t1 = b1.get("timestamp", 0)
     t2 = b2.get("timestamp", 0)

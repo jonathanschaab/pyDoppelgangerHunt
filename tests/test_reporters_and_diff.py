@@ -5346,3 +5346,87 @@ def test_conditional_output_which_is_also_input_not_overwritten_with_none(tmp_pa
     helper = synthesize_shared_helper_code(u1, u1, repo_root=str(tmp_path))
     assert "total = None" not in helper
     assert "total: Any" in helper or "total" in helper
+
+
+def test_refactoring_patch_global_and_nonlocal_not_assigned_at_call_site(tmp_path: Path) -> None:
+    """Verifies that generate_refactoring_patch does not generate call-site assignments for globals or nonlocals."""
+    code = (
+        "total = 0\n"
+        "def outer():\n"
+        "    acc = 10\n"
+        "    def inner1():\n"
+        "        global total\n"
+        "        nonlocal acc\n"
+        "        total += 1\n"
+        "        acc += 2\n"
+        "    def inner2():\n"
+        "        global total\n"
+        "        nonlocal acc\n"
+        "        total += 1\n"
+        "        acc += 2\n"
+    )
+    f = tmp_path / "mod_glob.py"
+    f.write_text(code, encoding="utf-8")
+    u1 = {"file": str(f), "start": 5, "end": 8, "name": "outer:inner1", "kind": "compound_block"}
+    u2 = {"file": str(f), "start": 10, "end": 13, "name": "outer:inner2", "kind": "compound_block"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "total, acc = _shared" not in patch
+    assert "total = _shared" not in patch
+    assert "acc = _shared" not in patch
+    assert "_shared" in patch
+
+
+def test_class_level_comprehension_receiver_kind_is_none(tmp_path: Path) -> None:
+    """Verifies that a comprehension in a class scope has receiver kind 'none'."""
+    code = (
+        "class Container:\n"
+        "    items = [x * 2 for x in range(5)]\n"
+    )
+    f = tmp_path / "cls_comp.py"
+    f.write_text(code, encoding="utf-8")
+    u_comp = {
+        "file": str(f),
+        "start": 2,
+        "end": 2,
+        "name": "Container:listcomp_L2",
+        "kind": "comprehension",
+        "enclosing_class": "Container",
+        "enclosing_class_start": 1,
+    }
+    helper = synthesize_shared_helper_code(u_comp, u_comp, repo_root=str(tmp_path))
+    assert "self: Any" not in helper
+    assert "def _shared" in helper
+
+
+def test_defensive_unit_file_handling_in_diff_and_reporters(tmp_path: Path) -> None:
+    """Verifies that diff, reporter, and coverage tools gracefully handle units with None or empty file."""
+    from pydoppelgangerhunt.coverage import compute_unit_coverage
+    from pydoppelgangerhunt.git_diff import check_temporal_divergence, compute_unit_diff_overlap
+    from pydoppelgangerhunt.reporters import format_github_annotations
+
+    u_none: Dict[str, Any] = {"file": None, "start": 1, "end": 2, "name": "dummy"}
+    u_empty: Dict[str, Any] = {"file": "", "start": 1, "end": 2, "name": "dummy"}
+    u_missing: Dict[str, Any] = {"start": 1, "end": 2}
+
+    # Should not raise AttributeError or KeyError
+    assert compute_unit_diff_overlap(u_none, {}) == (0, 0.0)
+    assert compute_unit_diff_overlap(u_empty, {}) == (0, 0.0)
+    assert compute_unit_diff_overlap(u_missing, {}) == (0, 0.0)
+
+    lines = extract_unit_source_code(u_none, repo_root=str(tmp_path))
+    assert len(lines) >= 1
+
+    annots = format_github_annotations([(1.0, u_none, u_missing)])
+    assert len(annots) == 2
+
+    cov = compute_unit_coverage(u_none, {})
+    assert cov == 0.0
+
+    divergence = check_temporal_divergence(u_none, u_missing, repo_root=str(tmp_path))
+    assert divergence is None
+

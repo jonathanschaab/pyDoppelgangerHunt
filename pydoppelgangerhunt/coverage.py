@@ -98,7 +98,9 @@ def compute_unit_coverage(
     if not coverage_data:
         return 0.0
 
-    target = unit["file"].replace("\\", "/").split("#")[0]
+    target = str(unit.get("file") or "").replace("\\", "/").split("#", maxsplit=1)[0]
+    if not target:
+        return 0.0
     covered_lines = coverage_data.get(target)
     if covered_lines is None:
         covered_lines = next(
@@ -106,11 +108,13 @@ def compute_unit_coverage(
             set(),
         )
 
-    lines_total = unit["end"] - unit["start"] + 1
+    s = unit.get("start", 1)
+    e = unit.get("end", s)
+    lines_total = e - s + 1
     if lines_total <= 0 or not covered_lines:
         return 0.0
 
-    hits = sum(1 for ln in range(unit["start"], unit["end"] + 1) if ln in covered_lines)
+    hits = sum(1 for ln in range(s, e + 1) if ln in covered_lines)
     return min(1.0, hits / float(lines_total))
 
 

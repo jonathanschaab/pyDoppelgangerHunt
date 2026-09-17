@@ -483,7 +483,7 @@ class _ScopeVisitor(ast.NodeVisitor):
             self.local_imports.append(stmt)
         for alias in node.names:
             if isinstance(node, ast.Import):
-                bound_name = alias.asname or alias.name.split(".")[0]
+                bound_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
             else:
                 bound_name = alias.asname or alias.name
             if bound_name != "*":
@@ -917,7 +917,7 @@ def _analyze_block_assignment(
             definite.add(stmt.name)
         elif isinstance(stmt, ast.Import):
             for alias in stmt.names:
-                bound_name = alias.asname or alias.name.split(".")[0]
+                bound_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
                 definite.add(bound_name)
         elif isinstance(stmt, ast.ImportFrom):
             for alias in stmt.names:
@@ -2147,7 +2147,7 @@ def synthesize_shared_helper_code(
             return str(u["receiver_kind"])
         if "receiver_kind" in u and u.get("receiver_kind") is None:
             return "none"
-        if u.get("kind") in ("closure", "class"):
+        if u.get("kind") in ("closure", "class", "comprehension", "data_table", "complex_expr"):
             return "none"
         if u.get("is_static"):
             return "static"
@@ -2849,7 +2849,7 @@ def generate_refactoring_patch(
     patch_chunks: List[str] = []
 
     for sim, u1, u2 in clones:
-        f1_raw = str(u1.get("file", "")).split("#", maxsplit=1)[0]
+        f1_raw = str(u1.get("file") or "").split("#", maxsplit=1)[0]
         if not f1_raw:
             continue
         f1_norm = f1_raw.replace("\\", "/")
@@ -2865,7 +2865,7 @@ def generate_refactoring_patch(
 
         orig_lines = orig_text.splitlines(keepends=True)
 
-        f2_raw = str(u2.get("file", "")).split("#", maxsplit=1)[0]
+        f2_raw = str(u2.get("file") or "").split("#", maxsplit=1)[0]
         f2_norm = f2_raw.replace("\\", "/")
         is_same_file = bool(f2_norm and f2_norm == f1_norm)
 
@@ -2901,8 +2901,9 @@ def generate_refactoring_patch(
         if not _is_method_of_class(fn2, enc2):
             fn2 = None
 
-        fn1_kind = _get_enclosing_receiver_kind(fn1) if fn1 else (u1.get("receiver_kind") or ("instance" if enc1 else "none"))
-        fn2_kind = _get_enclosing_receiver_kind(fn2) if fn2 else (u2.get("receiver_kind") or ("instance" if enc2 else "none"))
+        non_method_kinds = ("closure", "class", "comprehension", "data_table", "complex_expr")
+        fn1_kind = _get_enclosing_receiver_kind(fn1) if fn1 else (u1.get("receiver_kind") or ("instance" if enc1 and u1.get("kind") not in non_method_kinds else "none"))
+        fn2_kind = _get_enclosing_receiver_kind(fn2) if fn2 else (u2.get("receiver_kind") or ("instance" if enc2 and u2.get("kind") not in non_method_kinds else "none"))
         receiver_kinds_differ = bool(fn1_kind != fn2_kind)
         is_in_method = bool(
             fn1
@@ -2991,7 +2992,11 @@ def generate_refactoring_patch(
         inputs = list(scope.get("inputs", []))
         if effective_binding == "module":
             inputs = _prune_unshared_receivers(inputs, u1, u2, s1, s2, repo_root=str(root))
-        outputs = list(scope.get("outputs", []))
+        outputs = [
+            v for v in scope.get("outputs", [])
+            if v not in scope.get("globals", [])
+            and v not in scope.get("nonlocals", [])
+        ]
 
         candidate_units = [u1]
         if is_same_file and not check_units_overlap(u1, u2):
@@ -3120,6 +3125,8 @@ def generate_refactoring_patch(
         )
         diff_str = "".join(diff)
         if diff_str:
-            patch_chunks.append(f"# Clone Pair ({sim:.1%}): {u1['file']} <===> {u2['file']}\n" + diff_str)
+            f1_disp = str(u1.get("file") or "file1")
+            f2_disp = str(u2.get("file") or "file2")
+            patch_chunks.append(f"# Clone Pair ({sim:.1%}): {f1_disp} <===> {f2_disp}\n" + diff_str)
 
     return "\n".join(patch_chunks)

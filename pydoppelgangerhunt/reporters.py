@@ -41,7 +41,7 @@ def colorize(text: str, color_code: str, enabled: bool) -> str:
 
 def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:
     """Reads raw source code lines for a given unit from disk."""
-    f_raw = unit.get("file", "").split("#")[0].replace("\\", "/")
+    f_raw = str(unit.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
     if not f_raw:
         return [f"# Source for {unit.get('name', 'unit')} lines {unit.get('start', 1)}-{unit.get('end', 1)}\n"]
     file_path = Path(f_raw)
@@ -56,7 +56,7 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
         end = min(len(all_lines), unit.get("end", len(all_lines)))
         return all_lines[start - 1 : end]
     except OSError:
-        return [f"# Unable to read {unit.get('file', '')}\n"]
+        return [f"# Unable to read {unit.get('file') or ''}\n"]
 
 
 def generate_clone_diff(
@@ -355,17 +355,19 @@ def format_github_annotations(
     """Generates GitHub Actions workflow commands to annotate PR line diffs."""
     annotations: List[str] = []
     for sim, u1, u2 in clones:
-        f1 = u1["file"].replace("\\", "/").split("#")[0]
-        s1 = u1["start"]
-        e1 = u1["end"]
-        f2 = u2["file"].replace("\\", "/").split("#")[0]
-        s2 = u2["start"]
-        e2 = u2["end"]
-        msg1 = f"Structural clone ({sim:.1%}) matching {f2}:{s2}-{e2} ({u2['name']})"
+        f1 = str(u1.get("file") or "").replace("\\", "/").split("#", maxsplit=1)[0]
+        s1 = u1.get("start", 1)
+        e1 = u1.get("end", 1)
+        f2 = str(u2.get("file") or "").replace("\\", "/").split("#", maxsplit=1)[0]
+        s2 = u2.get("start", 1)
+        e2 = u2.get("end", 1)
+        n1 = str(u1.get("name") or "unit1")
+        n2 = str(u2.get("name") or "unit2")
+        msg1 = f"Structural clone ({sim:.1%}) matching {f2}:{s2}-{e2} ({n2})"
         annotations.append(
             f"::warning file={f1},line={s1},endLine={e1},title=pyDoppelgangerHunt Duplicate Code::{msg1}"
         )
-        msg2 = f"Structural clone ({sim:.1%}) matching {f1}:{s1}-{e1} ({u1['name']})"
+        msg2 = f"Structural clone ({sim:.1%}) matching {f1}:{s1}-{e1} ({n1})"
         annotations.append(
             f"::warning file={f2},line={s2},endLine={e2},title=pyDoppelgangerHunt Duplicate Code::{msg2}"
         )
