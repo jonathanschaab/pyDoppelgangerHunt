@@ -30,6 +30,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self,
         loop_offset: int = 0,
         source_lines: Optional[Sequence[str]] = None,
+        is_subroutine: bool = False,
     ) -> None:
         self.loads: List[str] = []
         self.stores: List[str] = []
@@ -56,6 +57,8 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.imported_names: Dict[str, str] = {}
         self.yield_expr_names: List[Tuple[str, str]] = []
         self.is_async: bool = False
+        self.is_subroutine: bool = is_subroutine
+        self._has_processed_top_func: bool = False
         self.source_lines: Optional[List[str]] = list(source_lines) if source_lines is not None else None
 
     def _record_arg(
@@ -141,8 +144,14 @@ class _ScopeVisitor(ast.NodeVisitor):
             self.stores.append(name)
 
     def _process_func(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
-        is_top = len(self._scope_stack) == 0
+        is_top = (
+            len(self._scope_stack) == 0
+            and not self.is_subroutine
+            and not self._has_processed_top_func
+        )
+        created_outer = False
         if is_top:
+            self._has_processed_top_func = True
             self._process_args(node)
             self._scope_stack.append(set(self.params))
         else:
@@ -154,11 +163,16 @@ class _ScopeVisitor(ast.NodeVisitor):
                 if kw_default is not None:
                     self.visit(kw_default)
             self._record_store_name(node.name)
+            if not self._scope_stack:
+                self._scope_stack.append(set())
+                created_outer = True
             self._scope_stack.append(self._extract_arg_names(node.args))
 
         for stmt in node.body:
             self.visit(stmt)
         self._scope_stack.pop()
+        if created_outer:
+            self._scope_stack.pop()
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         for default in node.args.defaults:
@@ -180,7 +194,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self._process_func(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        if len(self._scope_stack) == 0:
+        if len(self._scope_stack) == 0 and not self.is_subroutine:
             self.is_async = True
         self._process_func(node)
 
@@ -307,13 +321,16 @@ class _ScopeVisitor(ast.NodeVisitor):
                 self.deleted_names.discard(target_id)
             if self._comprehension_depth > 0:
                 target_idx = -1 - self._comprehension_depth
-                if len(self._scope_stack) >= abs(target_idx):
+                stack_len = len(self._scope_stack)
+                if stack_len >= abs(target_idx):
                     self._scope_stack[target_idx].add(target_id)
-                    if abs(target_idx) == len(self._scope_stack):
-                        if target_id not in BUILTIN_NAMES and target_id not in self.stores:
-                            self.stores.append(target_id)
-                elif target_id not in BUILTIN_NAMES and target_id not in self.stores:
-                    self.stores.append(target_id)
+                if stack_len <= abs(target_idx):
+                    if (
+                        target_id not in BUILTIN_NAMES
+                        and target_id not in self.globals
+                        and target_id not in self.stores
+                    ):
+                        self.stores.append(target_id)
             else:
                 self._record_store_name(target_id)
 
@@ -559,8 +576,9 @@ def _walrus_assignment_in_expr(
         return definite, conditional - definite
 
     for child in ast.iter_child_nodes(expr):
-        if isinstance(child, ast.expr):
-            d_ch, c_ch = _walrus_assignment_in_expr(child, is_conditional)
+        target_child = child.value if isinstance(child, ast.keyword) else child
+        if isinstance(target_child, ast.expr):
+            d_ch, c_ch = _walrus_assignment_in_expr(target_child, is_conditional)
             definite.update(d_ch)
             conditional.update(c_ch)
 
@@ -590,6 +608,9 @@ def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
                 and _block_terminates(stmt.body)
                 and _block_terminates(stmt.orelse)
             ):
+                return True
+        elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+            if _block_terminates(stmt.body):
                 return True
         elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
             cases = getattr(stmt, "cases", [])
@@ -633,14 +654,32 @@ def _extract_deleted_names(statements: Sequence[ast.AST]) -> Set[str]:
     return deleted
 
 
-def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str], Set[str]]:
+def _demote_deletions_to_conditional(
+    deleted_names: Iterable[str],
+    definite: Set[str],
+    conditional: Set[str],
+) -> None:
+    """Discards deleted variables from definite and promotes previously definite variables to conditional."""
+    for v_del in deleted_names:
+        if v_del in definite:
+            definite.discard(v_del)
+            conditional.add(v_del)
+
+
+def _analyze_block_assignment(
+    statements: Sequence[ast.stmt],
+    definite: Optional[Set[str]] = None,
+    conditional: Optional[Set[str]] = None,
+) -> Tuple[Set[str], Set[str]]:
     """Analyzes a sequence of statements to determine unconditionally and conditionally assigned variables.
 
     Returns:
         A tuple of (definitely_assigned, conditionally_assigned) variable name sets.
     """
-    definite: Set[str] = set()
-    conditional: Set[str] = set()
+    if definite is None:
+        definite = set()
+    if conditional is None:
+        conditional = set()
 
     for stmt in statements:
         if isinstance(stmt, ast.Assign):
@@ -648,6 +687,9 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                 for node in ast.walk(target):
                     if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
                         definite.add(node.id)
+                d_t, c_t = _walrus_assignment_in_expr(target)
+                definite.update(d_t)
+                conditional.update(c_t)
             d_val, c_val = _walrus_assignment_in_expr(stmt.value)
             definite.update(d_val)
             conditional.update(c_val)
@@ -661,6 +703,9 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
         elif isinstance(stmt, ast.AugAssign):
             if isinstance(stmt.target, ast.Name):
                 definite.add(stmt.target.id)
+            d_t, c_t = _walrus_assignment_in_expr(stmt.target)
+            definite.update(d_t)
+            conditional.update(c_t)
             d_val, c_val = _walrus_assignment_in_expr(stmt.value)
             definite.update(d_val)
             conditional.update(c_val)
@@ -712,17 +757,15 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                     conditional.update((b_def | b_cond | o_def | o_cond) - definite)
                 eff_b_del = _extract_deleted_names(stmt.body) - b_def
                 eff_o_del = _extract_deleted_names(stmt.orelse) - o_def
-                for v_del in eff_b_del | eff_o_del:
-                    definite.discard(v_del)
                 for v_del in eff_b_del & eff_o_del:
+                    definite.discard(v_del)
                     conditional.discard(v_del)
+                _demote_deletions_to_conditional(eff_b_del ^ eff_o_del, definite, conditional)
             else:
                 if not b_term:
                     conditional.update((b_def | b_cond) - definite)
                     eff_b_del = _extract_deleted_names(stmt.body) - b_def
-                    for v_del in eff_b_del:
-                        definite.discard(v_del)
-                        conditional.add(v_del)
+                    _demote_deletions_to_conditional(eff_b_del, definite, conditional)
         elif isinstance(stmt, ast.While):
             d_test, c_test = _walrus_assignment_in_expr(stmt.test)
             definite.update(d_test)
@@ -732,6 +775,7 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                 sub_stmts.extend(stmt.orelse)
             sub_def, sub_cond = _analyze_block_assignment(sub_stmts)
             conditional.update((sub_def | sub_cond) - definite)
+            _demote_deletions_to_conditional(_extract_deleted_names(sub_stmts), definite, conditional)
         elif isinstance(stmt, (ast.For, ast.AsyncFor)):
             d_iter, c_iter = _walrus_assignment_in_expr(stmt.iter)
             definite.update(d_iter)
@@ -744,6 +788,7 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                 sub_stmts.extend(stmt.orelse)
             sub_def, sub_cond = _analyze_block_assignment(sub_stmts)
             conditional.update((sub_def | sub_cond) - definite)
+            _demote_deletions_to_conditional(_extract_deleted_names(sub_stmts), definite, conditional)
         elif isinstance(stmt, (ast.With, ast.AsyncWith)):
             for item in stmt.items:
                 d_ctx, c_ctx = _walrus_assignment_in_expr(item.context_expr)
@@ -753,10 +798,7 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                     for p_node in ast.walk(item.optional_vars):
                         if isinstance(p_node, ast.Name) and isinstance(p_node.ctx, ast.Store):
                             definite.add(p_node.id)
-            sub_stmts = list(stmt.body)
-            sub_def, sub_cond = _analyze_block_assignment(sub_stmts)
-            definite.update(sub_def)
-            conditional.update((sub_def | sub_cond) - definite)
+            _analyze_block_assignment(stmt.body, definite, conditional)
         elif isinstance(stmt, (ast.Try, getattr(ast, "TryStar", ast.Try))):
             t_body = list(getattr(stmt, "body", []))
             t_def, t_cond = _analyze_block_assignment(t_body)
@@ -808,19 +850,17 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                 definite.update(common)
                 conditional.update(try_cond - definite)
 
+            _demote_deletions_to_conditional(_extract_deleted_names(t_body), definite, conditional)
+            for h in handlers:
+                _demote_deletions_to_conditional(
+                    _extract_deleted_names(getattr(h, "body", [])),
+                    definite,
+                    conditional,
+                )
+
             f_body = list(getattr(stmt, "finalbody", []))
             if f_body:
-                f_def, f_cond = _analyze_block_assignment(f_body)
-                definite.update(f_def)
-                conditional.update((f_def | f_cond) - definite)
-                for v_del in _extract_deleted_names(f_body):
-                    definite.discard(v_del)
-                    conditional.discard(v_del)
-            for v_del in _extract_deleted_names(t_body):
-                definite.discard(v_del)
-            for h in handlers:
-                for v_del in _extract_deleted_names(getattr(h, "body", [])):
-                    definite.discard(v_del)
+                _analyze_block_assignment(f_body, definite, conditional)
         elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
             d_sub, c_sub = _walrus_assignment_in_expr(getattr(stmt, "subject", None))
             definite.update(d_sub)
@@ -828,6 +868,8 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
             case_defs: List[Set[str]] = []
             non_term_case_defs: List[Set[str]] = []
             case_conds: Set[str] = set()
+            case_dels: Set[str] = set()
+            non_term_case_dels: List[Set[str]] = []
             has_irrefutable_default = False
             for case in getattr(stmt, "cases", []):
                 pattern_stores: Set[str] = set()
@@ -840,12 +882,19 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                         p_rest = getattr(p_node, "rest", None)
                         if p_rest and isinstance(p_rest, str):
                             pattern_stores.add(p_rest)
+                guard = getattr(case, "guard", None)
+                if guard is not None:
+                    d_g, c_g = _walrus_assignment_in_expr(guard, is_conditional=True)
+                    case_conds.update(d_g | c_g)
                 c_def, c_cond = _analyze_block_assignment(case.body)
                 c_def.update(pattern_stores)
                 case_defs.append(c_def)
                 case_conds.update(c_def | c_cond)
+                c_del = _extract_deleted_names(case.body) - c_def
+                case_dels.update(c_del)
                 if not _block_terminates(case.body):
                     non_term_case_defs.append(c_def)
+                    non_term_case_dels.append(c_del)
                 if _is_irrefutable_case(case):
                     has_irrefutable_default = True
             if case_defs and has_irrefutable_default:
@@ -855,6 +904,15 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                 conditional.update(case_conds - definite)
             else:
                 conditional.update(case_conds - definite)
+            all_del = (
+                {v for v in case_dels if all(v in d for d in non_term_case_dels)}
+                if (has_irrefutable_default and non_term_case_dels)
+                else set()
+            )
+            for v_del in all_del:
+                definite.discard(v_del)
+                conditional.discard(v_del)
+            _demote_deletions_to_conditional(case_dels - all_del, definite, conditional)
         elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             definite.add(stmt.name)
         elif isinstance(stmt, ast.Import):
@@ -985,10 +1043,14 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
                 body_nodes = body_nodes[1:]
             if body_nodes:
                 d_lines = dedented.splitlines()
-                start_l = body_nodes[0].lineno
+                first_body = body_nodes[0]
+                start_l = first_body.lineno
                 end_l = getattr(body_nodes[-1], "end_lineno", len(d_lines))
                 extracted = d_lines[start_l - 1 : end_l]
                 if extracted:
+                    if start_l == fn_node.lineno:
+                        b_col = getattr(first_body, "col_offset", 0)
+                        extracted[0] = extracted[0][b_col:]
                     return textwrap.dedent("\n".join(extracted)).splitlines()
     except Exception:  # pylint: disable=broad-exception-caught
         pass
@@ -1150,15 +1212,22 @@ def _inspect_unit_scope(
     if tree is None:
         return empty_res
 
-    cand_lines = cand_text.splitlines(keepends=True)
-    visitor = _ScopeVisitor(loop_offset=loop_offset, source_lines=cand_lines)
-    visitor.visit(tree)
-
     unit_name = str(unit.get("name") or "")
     unit_kind = str(unit.get("kind") or "")
     is_subroutine = unit_kind in ("compound_block", "sliding_window", "clause_branch") or (
         unit_kind not in ("function", "closure", "comprehension", "complex_expr") and ":" in unit_name
     )
+
+    cand_lines = cand_text.splitlines(keepends=True)
+    is_sub = is_subroutine or (
+        cand_text == dedented and isinstance(tree, ast.Module) and len(tree.body) > 1
+    )
+    visitor = _ScopeVisitor(
+        loop_offset=loop_offset,
+        source_lines=cand_lines,
+        is_subroutine=is_sub,
+    )
+    visitor.visit(tree)
 
     hazards: List[str] = []
     if visitor.naked_breaks > 0:
@@ -1914,7 +1983,7 @@ def _populate_unit_receiver_metadata(
         and "enclosing_class_start" in unit
     ):
         return
-    f_raw = unit.get("file", "").split("#")[0]
+    f_raw = str(unit.get("file") or "").split("#", maxsplit=1)[0]
     if not f_raw:
         return
     f_norm = f_raw.replace("\\", "/")
@@ -2059,8 +2128,8 @@ def synthesize_shared_helper_code(
 
     enc1 = u1.get("enclosing_class")
     enc2 = u2.get("enclosing_class")
-    f1 = u1.get("file", "").split("#")[0].replace("\\", "/")
-    f2 = u2.get("file", "").split("#")[0].replace("\\", "/")
+    f1 = str(u1.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
+    f2 = str(u2.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
     enc1_start = u1.get("enclosing_class_start")
     enc2_start = u2.get("enclosing_class_start")
     is_same_class = bool(
@@ -2454,6 +2523,8 @@ def replace_unit_in_source(
     start_c = max(0, min(len(first_line), int(start_col or 0)))
     last_line = lines[end - 1]
     end_c = len(last_line) if end_col is None else max(0, min(len(last_line), int(end_col)))
+    if start == end:
+        end_c = max(start_c, end_c)
 
     prefix_is_whitespace = not first_line[:start_c].strip()
     suffix_stripped = last_line[end_c:].strip()
@@ -2521,8 +2592,8 @@ def check_units_overlap(u1: Dict[str, Any], u2: Dict[str, Any]) -> bool:
         True if both units reside in the same normalized file path and their [start, end]
         intervals overlap; False otherwise.
     """
-    f1 = u1.get("file", "").split("#")[0].replace("\\", "/")
-    f2 = u2.get("file", "").split("#")[0].replace("\\", "/")
+    f1 = str(u1.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
+    f2 = str(u2.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
     if not f1 or not f2 or f1 != f2:
         return False
     start1, end1 = int(u1.get("start", 1)), int(u1.get("end", 1))
@@ -2568,7 +2639,7 @@ def filter_overlapping_clone_units(units: Sequence[Dict[str, Any]]) -> List[Dict
 
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for u in units:
-        norm_file = u.get("file", "").split("#")[0].replace("\\", "/")
+        norm_file = str(u.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
         grouped.setdefault(norm_file, []).append(u)
 
     retained: List[Dict[str, Any]] = []
@@ -2674,10 +2745,13 @@ def _build_whole_method_delegation(
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 n_start = getattr(node, "lineno", 0)
                 n_end = getattr(node, "end_lineno", n_start)
-                if n_start == u_start:
+                decs = getattr(node, "decorator_list", [])
+                dec_start = min(getattr(d, "lineno", n_start) for d in decs) if decs else n_start
+                earliest_start = min(dec_start, n_start)
+                if u_start in (n_start, earliest_start):
                     cand_nodes.append((0, node))
-                elif node.name in (raw_u_name, base_u_name) and n_start <= u_start <= n_end:
-                    cand_nodes.append((n_end - n_start + 1, node))
+                elif node.name in (raw_u_name, base_u_name) and earliest_start <= u_start <= n_end:
+                    cand_nodes.append((n_end - earliest_start + 1, node))
         if cand_nodes:
             cand_nodes.sort(key=lambda item: item[0])
             matched_node = cand_nodes[0][1]
@@ -2691,14 +2765,15 @@ def _build_whole_method_delegation(
                 if found_indent is not None:
                     body_indent = found_indent
                 first_body = matched_node.body[0]
-                if first_body.lineno == u_start:
-                    b_col = getattr(first_body, "col_offset", len(lines[u_start - 1]))
-                    same_line = lines[u_start - 1][:b_col].rstrip()
+                fn_def_line = getattr(matched_node, "lineno", u_start)
+                if first_body.lineno == fn_def_line:
+                    b_col = getattr(first_body, "col_offset", len(lines[fn_def_line - 1]))
+                    same_line = lines[fn_def_line - 1][:b_col].rstrip()
                     if not same_line.endswith(":"):
-                        colon_pos = lines[u_start - 1].find(":")
+                        colon_pos = lines[fn_def_line - 1].find(":")
                         if colon_pos != -1:
-                            same_line = lines[u_start - 1][: colon_pos + 1]
-                    header = same_line + "\n"
+                            same_line = lines[fn_def_line - 1][: colon_pos + 1]
+                    header = "".join(lines[u_start - 1 : fn_def_line - 1]) + same_line + "\n"
                 else:
                     sig_end_line = first_body.lineno - 1
                     if (

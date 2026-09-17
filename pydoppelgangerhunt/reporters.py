@@ -98,8 +98,8 @@ def synthesize_refactoring_suggestion(
     """Synthesizes actionable refactoring recommendation and shared helper template."""
     lines1 = extract_unit_source_code(u1, repo_root)
     lines2 = extract_unit_source_code(u2, repo_root)
-    n1 = u1["name"].split(":")[-1]
-    n2 = u2["name"].split(":")[-1]
+    n1 = str(u1.get("name") or "unit1").rsplit(":", maxsplit=1)[-1]
+    n2 = str(u2.get("name") or "unit2").rsplit(":", maxsplit=1)[-1]
 
     if n1.startswith("test_") and n2.startswith("test_"):
         return (

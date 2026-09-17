@@ -50,10 +50,12 @@ from pydoppelgangerhunt import (
 )
 from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _analyze_block_assignment,
+    _block_terminates,
     _build_whole_method_delegation,
     _detect_indent_step,
     _extract_deleted_names,
     _extract_required_typing_imports,
+    _extract_unit_body_lines,
     _find_module_helper_insertion_index,
     _format_call_arguments,
     _insert_imports_into_module,
@@ -5176,3 +5178,155 @@ def test_compute_unit_diff_overlap_missing_file() -> None:
 
     assert compute_unit_diff_overlap({}, {"foo.py": [(1, 10)]}) == (0, 0.0)
     assert compute_unit_diff_overlap({"file": ""}, {"foo.py": [(1, 10)]}) == (0, 0.0)
+
+
+def test_subroutine_with_local_function_scope_isolation(tmp_path: Path) -> None:
+    """Verifies that compound blocks with local helper functions isolate arguments and returns."""
+    code = (
+        "def outer(val):\n"
+        "    def helper(a):\n"
+        "        return a * 2\n"
+        "    result = helper(val)\n"
+        "    return result\n"
+    )
+    f = tmp_path / "sub_fn.py"
+    f.write_text(code, encoding="utf-8")
+    u_block = {
+        "file": str(f),
+        "start": 2,
+        "end": 4,
+        "name": "outer:2-4",
+        "kind": "compound_block",
+    }
+    scope = analyze_unit_variable_scope(u_block, repo_root=str(tmp_path))
+    assert "val" in scope["inputs"]
+    assert "a" not in scope["inputs"]
+    assert "helper" not in scope["inputs"]
+    assert "result" in scope["outputs"]
+    assert "helper" in scope["outputs"]
+    assert scope["is_control_flow_safe"] is True
+    assert "embedded_return" not in scope["control_flow_hazards"]
+
+
+def test_with_block_unconditional_termination_and_deletion() -> None:
+    """Verifies that terminating with blocks are recognized and deleted names in with blocks are discarded."""
+    term_code = "with lock:\n    return val\nx = 1\n"
+    tree_term = ast.parse(term_code)
+    assert _block_terminates(tree_term.body) is True
+
+    del_code = "x = 1\nwith lock:\n    del x\n"
+    tree_del = ast.parse(del_code)
+    definite, conditional = _analyze_block_assignment(tree_del.body)
+    assert "x" not in definite
+    assert "x" not in conditional
+
+
+def test_loop_block_deletion_promoted_to_conditional() -> None:
+    """Verifies that variable deletions inside for and while loops are discarded from definite."""
+    for_code = "x = 1\nfor i in items:\n    del x\n"
+    tree_for = ast.parse(for_code)
+    def_for, cond_for = _analyze_block_assignment(tree_for.body)
+    assert "x" not in def_for
+    assert "x" in cond_for
+
+    while_code = "x = 1\nwhile cond:\n    del x\n"
+    tree_while = ast.parse(while_code)
+    def_while, cond_while = _analyze_block_assignment(tree_while.body)
+    assert "x" not in def_while
+    assert "x" in cond_while
+
+
+def test_walrus_assignment_in_call_keywords_and_targets() -> None:
+    """Verifies walrus expressions inside function call keywords and assignment/augassign targets."""
+    call_stmt = ast.parse("fn(x=(y := 1), **(z := {}))").body[0]
+    assert isinstance(call_stmt, ast.Expr)
+    expr_call = call_stmt.value
+    def_call, _ = _walrus_assignment_in_expr(expr_call)
+    assert "y" in def_call
+    assert "z" in def_call
+
+    assign_code = "data[(k := 1)] = val\n"
+    tree_assign = ast.parse(assign_code)
+    def_assign, _ = _analyze_block_assignment(tree_assign.body)
+    assert "k" in def_assign
+
+    augassign_code = "data[(m := 2)] += val\n"
+    tree_augassign = ast.parse(augassign_code)
+    def_augassign, _ = _analyze_block_assignment(tree_augassign.body)
+    assert "m" in def_augassign
+
+
+def test_extract_unit_body_lines_single_line_function() -> None:
+    """Verifies that _extract_unit_body_lines strips single-line function headers."""
+    unit = {"kind": "function", "start": 1, "end": 1, "name": "foo"}
+    raw_lines = ["def foo(x: int) -> int: return x * 2\n"]
+    extracted = _extract_unit_body_lines(unit, raw_lines)
+    assert extracted == ["return x * 2"]
+
+
+def test_build_whole_method_delegation_decorated_single_line() -> None:
+    """Verifies that _build_whole_method_delegation retains decorators on single-line functions."""
+    code = "@decorator\ndef compute(x: int) -> int: return x * 2\n"
+    unit = {"file": "t.py", "start": 1, "end": 2, "name": "compute", "kind": "function"}
+    res = _build_whole_method_delegation(code, unit, "", "_shared_compute", "x")
+    assert "@decorator\n" in res
+    assert "def compute(x: int) -> int:\n" in res
+    assert "return _shared_compute(x)" in res
+    parsed = ast.parse(res)
+    assert len(parsed.body) == 1
+    fn_def = parsed.body[0]
+    assert isinstance(fn_def, ast.FunctionDef)
+    assert len(fn_def.decorator_list) == 1
+
+
+def test_defensive_unit_file_and_name_none_handling() -> None:
+    """Verifies that units with None or missing file/name attributes are handled without exceptions."""
+    from pydoppelgangerhunt.fixer import filter_overlapping_clone_units  # pylint: disable=import-outside-toplevel
+
+    u_none_file: Dict[str, Any] = {"file": None, "start": 1, "end": 5, "name": "test"}
+    assert filter_overlapping_clone_units([u_none_file]) == [u_none_file]
+    assert not check_units_overlap(u_none_file, {"file": "a.py", "start": 1, "end": 5})
+
+    u_none_name: Dict[str, Any] = {"file": "a.py", "start": 1, "end": 5, "name": None}
+    suggestion = synthesize_refactoring_suggestion(u_none_name, u_none_name)
+    assert "[REFACTOR SUGGESTION]" in suggestion
+
+
+def test_if_else_single_and_dual_branch_deletion() -> None:
+    """Verifies that if/else deletions in only one branch demote to conditional, while both branches discard."""
+    code_single = "x = 1\nif cond:\n    del x\nelse:\n    y = 2\n"
+    d_single, c_single = _analyze_block_assignment(ast.parse(code_single).body)
+    assert "x" not in d_single
+    assert "x" in c_single
+    assert "y" in c_single
+
+    code_both = "x = 1\nif cond:\n    del x\nelse:\n    del x\n"
+    d_both, c_both = _analyze_block_assignment(ast.parse(code_both).body)
+    assert "x" not in d_both
+    assert "x" not in c_both
+
+
+def test_with_and_finally_conditional_deletion_demotion() -> None:
+    """Verifies that deletions under conditional sub-blocks within with and finally demote to conditional."""
+    code_with = "x = 1\nwith lock:\n    if cond:\n        del x\n"
+    d_with, c_with = _analyze_block_assignment(ast.parse(code_with).body)
+    assert "x" not in d_with
+    assert "x" in c_with
+
+    code_fin_cond = "x = 1\ntry:\n    pass\nfinally:\n    if cond:\n        del x\n"
+    d_fin, c_fin = _analyze_block_assignment(ast.parse(code_fin_cond).body)
+    assert "x" not in d_fin
+    assert "x" in c_fin
+
+    code_fin_uncond = "x = 1\ntry:\n    pass\nfinally:\n    del x\n"
+    d_fin_u, c_fin_u = _analyze_block_assignment(ast.parse(code_fin_uncond).body)
+    assert "x" not in d_fin_u
+    assert "x" not in c_fin_u
+
+
+def test_undefined_variable_deletion_does_not_create_conditional() -> None:
+    """Verifies that deleting a variable that was never defined does not add it to conditional stores."""
+    code = "if cond:\n    del z\n"
+    d, c = _analyze_block_assignment(ast.parse(code).body)
+    assert "z" not in d
+    assert "z" not in c
