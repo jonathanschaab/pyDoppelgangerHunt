@@ -9,7 +9,11 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from pydoppelgangerhunt.config import find_matching_path_value, normalize_path_string
+from pydoppelgangerhunt.config import (
+    canonical_path_key,
+    find_matching_path_value,
+    normalize_path_string,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +42,7 @@ def _format_paired_endpoints(ep1: str, ep2: str) -> str:
 
 def extract_unit_namespace(file_path: str) -> str:
     """Extracts canonical module/package directory namespace from a file path."""
-    norm_path = normalize_path_string(file_path, strip_anchor=False)
+    norm_path = canonical_path_key(file_path, strip_anchor=False)
     if "/" not in norm_path:
         return "."
     parent = norm_path.rsplit("/", 1)[0]
@@ -67,15 +71,15 @@ def pure_structural_fingerprint(u1: Dict[str, Any], u2: Dict[str, Any]) -> str:
 
 def clone_pair_structural_fingerprint(u1: Dict[str, Any], u2: Dict[str, Any]) -> str:
     """Computes order-invariant structural content fingerprint for a clone pair."""
-    f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
-    f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
+    f1 = canonical_path_key(str(u1.get("file") or ""), strip_anchor=False)
+    f2 = canonical_path_key(str(u2.get("file") or ""), strip_anchor=False)
     return _paired_hashed_fingerprint(u1, u2, f1, f2)
 
 
 def clone_pair_fingerprint(u1: Dict[str, Any], u2: Dict[str, Any]) -> str:
     """Computes stable, order-invariant fingerprint for a clone pair."""
-    f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
-    f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
+    f1 = canonical_path_key(str(u1.get("file") or ""), strip_anchor=False)
+    f2 = canonical_path_key(str(u2.get("file") or ""), strip_anchor=False)
     n1 = str(u1.get("name") or "unit1")
     n2 = str(u2.get("name") or "unit2")
     return _format_paired_endpoints(f"{f1}:{n1}", f"{f2}:{n2}")

@@ -6,10 +6,9 @@ import concurrent.futures
 import math
 import os
 from pathlib import Path
-import sys
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-from pydoppelgangerhunt.config import find_python_files, normalize_path_string
+from pydoppelgangerhunt.config import canonical_path_key, find_python_files
 from pydoppelgangerhunt.parser import harvest_file_units
 
 DEFAULT_STOP_SHINGLES: Set[Tuple[str, ...]] = {
@@ -57,10 +56,33 @@ def get_boilerplate_stop_shingles() -> Set[Tuple[str, ...]]:
 
 def _normalize_matcher_file(file_str: Optional[str]) -> str:
     """Normalizes unit file path string for robust matching, preserving cell anchors."""
-    norm = normalize_path_string(file_str, strip_anchor=False)
-    if os.name == "nt" or sys.platform == "win32":
-        return norm.lower()
-    return norm
+    return canonical_path_key(file_str, strip_anchor=False)
+
+
+def _split_exemption_endpoint(ep: str) -> Tuple[str, Optional[str]]:
+    """Splits an exemption endpoint into (file_path, symbol_name), accounting for Windows drive letters."""
+    if ":" not in ep:
+        return ep, None
+    f_part, sym_part = ep.rsplit(":", 1)
+    if "/" in sym_part or "\\" in sym_part or (len(f_part) == 1 and f_part.isalpha()):
+        return ep, None
+    return f_part, sym_part
+
+
+def _normalize_exemption_endpoint(ep: str) -> str:
+    """Normalizes an exemption endpoint by normalizing only the file portion, preserving symbol casing."""
+    f_part, sym_part = _split_exemption_endpoint(ep)
+    norm_file = _normalize_matcher_file(f_part)
+    if sym_part is not None:
+        return f"{norm_file}:{sym_part}"
+    return norm_file
+
+
+def _sorted_pair(a: str, b: str) -> Tuple[str, str]:
+    """Returns an order-invariant sorted 2-tuple of two string keys."""
+    return (a, b) if a <= b else (b, a)
+
+
 
 
 def lcs_alignment_similarity(
@@ -531,10 +553,20 @@ def scan_target(
                     candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))
 
     raw_exemptions = exemptions if exemptions is not None else []
-    normalized_exemptions = {
-        tuple(sorted([_normalize_matcher_file(k1), _normalize_matcher_file(k2)]))
-        for k1, k2 in raw_exemptions
-    }
+    normalized_exemptions: Set[Tuple[str, str]] = set()
+    for pair in raw_exemptions:
+        if len(pair) == 2:
+            k1, k2 = pair
+            ep1 = _normalize_exemption_endpoint(k1)
+            ep2 = _normalize_exemption_endpoint(k2)
+            normalized_exemptions.add(_sorted_pair(ep1, ep2))
+            f1_part, sym1 = _split_exemption_endpoint(ep1)
+            f2_part, sym2 = _split_exemption_endpoint(ep2)
+            base_f1 = os.path.basename(f1_part)
+            base_f2 = os.path.basename(f2_part)
+            b1 = f"{base_f1}:{sym1}" if sym1 is not None else base_f1
+            b2 = f"{base_f2}:{sym2}" if sym2 is not None else base_f2
+            normalized_exemptions.add(_sorted_pair(b1, b2))
 
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
     for i, j in candidate_pairs:
@@ -574,13 +606,17 @@ def scan_target(
             if f2_pkg.startswith(pfx):
                 f2_pkg = f2_pkg[len(pfx):]
 
-        pair_id_rel = tuple(sorted([f"{f1}:{u1['name']}", f"{f2}:{u2['name']}"]))
-        pair_id_pkg = tuple(sorted([f"{f1_pkg}:{u1['name']}", f"{f2_pkg}:{u2['name']}"]))
-        pair_id_base = tuple(sorted([f"{os.path.basename(f1)}:{u1['name']}", f"{os.path.basename(f2)}:{u2['name']}"]))
+        pair_id_rel = _sorted_pair(f"{f1}:{u1['name']}", f"{f2}:{u2['name']}")
+        pair_id_pkg = _sorted_pair(f"{f1_pkg}:{u1['name']}", f"{f2_pkg}:{u2['name']}")
+        pair_id_base = _sorted_pair(f"{os.path.basename(f1)}:{u1['name']}", f"{os.path.basename(f2)}:{u2['name']}")
+        pair_id_file = _sorted_pair(f1, f2)
+        pair_id_file_base = _sorted_pair(os.path.basename(f1), os.path.basename(f2))
         if (
             pair_id_rel in normalized_exemptions
             or pair_id_pkg in normalized_exemptions
             or pair_id_base in normalized_exemptions
+            or pair_id_file in normalized_exemptions
+            or pair_id_file_base in normalized_exemptions
         ):
             continue
 

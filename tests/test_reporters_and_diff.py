@@ -6348,5 +6348,51 @@ def test_batch_41_unified_path_normalization_and_html_escaping(tmp_path: Path) -
     cov_xml = _read_xml_coverage(str(xml_file))
     assert "sub/module.py" in cov_xml
 
+    # 10. canonical_path_key and _normalize_exemption_endpoint
+    import os
+    from pydoppelgangerhunt.config import canonical_path_key
+    from pydoppelgangerhunt.matcher import _normalize_exemption_endpoint, scan_target
+    from pydoppelgangerhunt.clustering import unit_key, _normalize_unit_file  # pylint: disable=protected-access
+    from pydoppelgangerhunt.metrics import compute_repository_dry_stats
+
+    ep = _normalize_exemption_endpoint("./pkg/Engine.py:ComputeData")
+    assert ep.endswith(":ComputeData")
+    if os.name == "nt" or sys.platform == "win32":
+        assert ep.startswith("pkg/engine.py:")
+    else:
+        assert ep.startswith("pkg/Engine.py:")
+
+    # 11. scan_target with symbol-level and whole-file exemptions
+    ex_dir = tmp_path / "ex_dir"
+    ex_dir.mkdir()
+    mod_file = ex_dir / "service.py"
+    mod_file.write_text(
+        "def ProcessTask(x):\n    a = x * 2\n    b = a + 1\n    c = b * 3\n    return c\n\n"
+        "def HandleTask(x):\n    a = x * 2\n    b = a + 1\n    c = b * 3\n    return c\n",
+        encoding="utf-8",
+    )
+    exemptions_sym = [(f"{mod_file}:ProcessTask", f"{mod_file}:HandleTask")]
+    clones_sym = scan_target(str(ex_dir), min_lines=4, threshold=0.8, exemptions=exemptions_sym)
+    assert len(clones_sym) == 0
+
+    exemptions_file = [(str(mod_file), str(mod_file))]
+    clones_file = scan_target(str(ex_dir), min_lines=4, threshold=0.8, exemptions=exemptions_file)
+    assert len(clones_file) == 0
+
+    # 12. clustering unit_key and _normalize_unit_file with case variants
+    u_lower = {"file": "c:/repo/mod.py", "name": "fn", "start": 1, "end": 5}
+    u_upper = {"file": "C:/REPO/MOD.PY", "name": "fn", "start": 1, "end": 5}
+    if os.name == "nt" or sys.platform == "win32":
+        assert unit_key(u_lower) == unit_key(u_upper)
+        assert _normalize_unit_file(u_lower) == _normalize_unit_file(u_upper)
+
+    # 13. metrics compute_repository_dry_stats DLOC deduplication
+    stats_case = compute_repository_dry_stats(
+        str(tmp_path),
+        [(1.0, u_lower, u_upper)],
+    )
+    if os.name == "nt" or sys.platform == "win32":
+        assert stats_case["dloc"] == 5
+
 
 

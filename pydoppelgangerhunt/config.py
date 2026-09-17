@@ -56,6 +56,15 @@ def normalize_path_string(path_str: Optional[str], strip_anchor: bool = True) ->
     return norm
 
 
+def canonical_path_key(path_str: Optional[str], strip_anchor: bool = False) -> str:
+    """Returns canonical normalized path key, folding case on Windows for equivalence."""
+    norm = normalize_path_string(path_str, strip_anchor=strip_anchor)
+    if os.name == "nt" or sys.platform == "win32":
+        return norm.lower()
+    return norm
+
+
+
 
 def paths_match_boundary(p1: Optional[str], p2: Optional[str]) -> bool:
     """Checks whether two normalized paths refer to the same file respecting directory boundaries."""
