@@ -5083,6 +5083,7 @@ def test_try_terminating_handlers_definite_assignment(tmp_path: Path) -> None:
     assert "val" not in scope2["conditional_outputs"]
 
 
+@pytest.mark.skipif(sys.version_info < (3, 10), reason="Pattern matching requires Python 3.10+")
 def test_match_terminating_case_definite_assignment() -> None:
     """Verifies that Match with a terminating case preserves definite assignment across non-terminating branches."""
     code = (

@@ -208,19 +208,19 @@ class _ScopeVisitor(ast.NodeVisitor):
         if created_outer:
             self._scope_stack.pop()
 
-    def visit_MatchAs(self, node: ast.AST) -> None:
+    def visit_MatchAs(self, node: ast.AST) -> None:  # pragma: no cover (py310+)
         name = getattr(node, "name", None)
         if name and isinstance(name, str):
             self._record_store_name(name)
         self.generic_visit(node)
 
-    def visit_MatchStar(self, node: ast.AST) -> None:
+    def visit_MatchStar(self, node: ast.AST) -> None:  # pragma: no cover (py310+)
         name = getattr(node, "name", None)
         if name and isinstance(name, str):
             self._record_store_name(name)
         self.generic_visit(node)
 
-    def visit_MatchMapping(self, node: ast.AST) -> None:
+    def visit_MatchMapping(self, node: ast.AST) -> None:  # pragma: no cover (py310+)
         rest = getattr(node, "rest", None)
         if rest and isinstance(rest, str):
             self._record_store_name(rest)
@@ -552,7 +552,7 @@ def _walrus_assignment_in_expr(
     return definite, conditional - definite
 
 
-def _is_irrefutable_case(case: ast.AST) -> bool:
+def _is_irrefutable_case(case: ast.AST) -> bool:  # pragma: no cover (py310+)
     """Returns True if the match case has no guard and an irrefutable wildcard or as-pattern."""
     guard = getattr(case, "guard", None)
     pattern = getattr(case, "pattern", None)
@@ -576,7 +576,7 @@ def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
                 and _block_terminates(stmt.orelse)
             ):
                 return True
-        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):
+        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
             cases = getattr(stmt, "cases", [])
             has_irrefutable = any(_is_irrefutable_case(c) for c in cases)
             if has_irrefutable and cases and all(_block_terminates(c.body) for c in cases):
@@ -612,7 +612,7 @@ def _extract_deleted_names(statements: Sequence[ast.stmt]) -> Set[str]:
                         deleted.update(_extract_deleted_names(child_stmts))
                 elif isinstance(child, ast.stmt):
                     deleted.update(_extract_deleted_names([child]))
-        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):
+        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
             for case in getattr(stmt, "cases", []):
                 deleted.update(_extract_deleted_names(getattr(case, "body", [])))
     return deleted
@@ -798,7 +798,7 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                 f_def, f_cond = _analyze_block_assignment(f_body)
                 definite.update(f_def)
                 conditional.update((f_def | f_cond) - definite)
-        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):
+        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
             d_sub, c_sub = _walrus_assignment_in_expr(getattr(stmt, "subject", None))
             definite.update(d_sub)
             conditional.update(c_sub)
