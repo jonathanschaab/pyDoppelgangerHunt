@@ -64,6 +64,8 @@ def is_boilerplate_node(node: ast.AST) -> bool:
                 "error",
                 "critical",
                 "exception",
+                "fatal",
+                "trace",
                 "log",
                 "_log",
             ):
@@ -121,43 +123,71 @@ class _CommutativeCanonicalizer(ast.NodeTransformer):
 class _IdiomCanonicalizer(ast.NodeTransformer):
     """Canonicalizes Python idioms (loops to comprehensions, search loops to any/all) (PyChase-style)."""
 
+    def _build_comp_assign(
+        self,
+        node: Union[ast.For, ast.AsyncFor],
+        call_or_assign: Union[ast.Call, ast.Assign],
+        ifs: Sequence[ast.expr],
+    ) -> Optional[ast.Assign]:
+        """Constructs an accumulator ListComp, SetComp, or DictComp assignment node."""
+        is_async = 1 if isinstance(node, ast.AsyncFor) else 0
+        gens = [
+            ast.comprehension(
+                target=node.target,
+                iter=node.iter,
+                ifs=list(ifs),
+                is_async=is_async,
+            )
+        ]
+        if isinstance(call_or_assign, ast.Call):
+            call = call_or_assign
+            if (
+                isinstance(call.func, ast.Attribute)
+                and len(call.args) == 1
+                and call.func.attr in ("append", "add")
+            ):
+                target_expr: Optional[ast.expr] = None
+                if isinstance(call.func.value, ast.Name):
+                    target_expr = ast.Name(id=call.func.value.id, ctx=ast.Store())
+                elif isinstance(call.func.value, ast.Attribute):
+                    target_expr = ast.Attribute(
+                        value=call.func.value.value,
+                        attr=call.func.value.attr,
+                        ctx=ast.Store(),
+                    )
+                if target_expr is not None:
+                    comp_val: ast.expr = (
+                        ast.ListComp(elt=call.args[0], generators=gens)
+                        if call.func.attr == "append"
+                        else ast.SetComp(elt=call.args[0], generators=gens)
+                    )
+                    return ast.Assign(targets=[target_expr], value=comp_val)
+        elif isinstance(call_or_assign, ast.Assign):
+            assign = call_or_assign
+            if len(assign.targets) == 1 and isinstance(assign.targets[0], ast.Subscript):
+                sub = assign.targets[0]
+                target_expr = None
+                if isinstance(sub.value, ast.Name):
+                    target_expr = ast.Name(id=sub.value.id, ctx=ast.Store())
+                elif isinstance(sub.value, ast.Attribute):
+                    target_expr = ast.Attribute(
+                        value=sub.value.value,
+                        attr=sub.value.attr,
+                        ctx=ast.Store(),
+                    )
+                if target_expr is not None:
+                    dict_comp = ast.DictComp(key=sub.slice, value=assign.value, generators=gens)
+                    return ast.Assign(targets=[target_expr], value=dict_comp)
+        return None
+
     def _build_listcomp_assign(
         self, node: ast.For, call: ast.Call, ifs: Sequence[ast.expr]
     ) -> Optional[ast.Assign]:
-        """Constructs an accumulator list comprehension assignment node."""
-        if (
-            isinstance(call.func, ast.Attribute)
-            and call.func.attr == "append"
-            and len(call.args) == 1
-        ):
-            target_expr: Optional[ast.expr] = None
-            if isinstance(call.func.value, ast.Name):
-                target_expr = ast.Name(id=call.func.value.id, ctx=ast.Store())
-            elif isinstance(call.func.value, ast.Attribute):
-                target_expr = ast.Attribute(
-                    value=call.func.value.value,
-                    attr=call.func.value.attr,
-                    ctx=ast.Store(),
-                )
-            if target_expr is not None:
-                return ast.Assign(
-                    targets=[target_expr],
-                    value=ast.ListComp(
-                        elt=call.args[0],
-                        generators=[
-                            ast.comprehension(
-                                target=node.target,
-                                iter=node.iter,
-                                ifs=list(ifs),
-                                is_async=0,
-                            )
-                        ],
-                    ),
-                )
-        return None
+        """Backward-compatible wrapper for listcomp assignment."""
+        return self._build_comp_assign(node, call, ifs)
 
     @staticmethod
-    def _get_single_stmt(node: ast.For) -> Optional[ast.stmt]:
+    def _get_single_stmt(node: Union[ast.For, ast.AsyncFor]) -> Optional[ast.stmt]:
         if len(node.body) == 1 and not node.orelse:
             return node.body[0]
         return None
@@ -168,20 +198,26 @@ class _IdiomCanonicalizer(ast.NodeTransformer):
             return stmt.test, stmt.body[0]
         return None
 
-    def _transform_accumulator_loop(self, node: ast.For) -> Optional[ast.Assign]:
-        """Transforms a single-statement accumulator for-loop into an equivalent ListComp assignment."""
+    def _transform_accumulator_loop(
+        self, node: Union[ast.For, ast.AsyncFor]
+    ) -> Optional[ast.Assign]:
+        """Transforms a single-statement accumulator for-loop into an equivalent comprehension assignment."""
         stmt = self._get_single_stmt(node)
         if stmt is None:
             return None
 
         if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
-            return self._build_listcomp_assign(node, stmt.value, [])
+            return self._build_comp_assign(node, stmt.value, [])
+        if isinstance(stmt, ast.Assign):
+            return self._build_comp_assign(node, stmt, [])
 
         if_info = self._get_single_if_child(stmt)
         if if_info is not None:
             test, inner = if_info
             if isinstance(inner, ast.Expr) and isinstance(inner.value, ast.Call):
-                return self._build_listcomp_assign(node, inner.value, [test])
+                return self._build_comp_assign(node, inner.value, [test])
+            if isinstance(inner, ast.Assign):
+                return self._build_comp_assign(node, inner, [test])
         return None
 
     def _build_reduction_return(
@@ -234,6 +270,14 @@ class _IdiomCanonicalizer(ast.NodeTransformer):
         red_ret = self._transform_reduction_loop(node)
         if red_ret is not None:
             return ast.fix_missing_locations(ast.copy_location(red_ret, node))
+        return node
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> ast.AST:
+        """Visits and canonicalizes async accumulator for-loops."""
+        self.generic_visit(node)
+        acc_assign = self._transform_accumulator_loop(node)
+        if acc_assign is not None:
+            return ast.fix_missing_locations(ast.copy_location(acc_assign, node))
         return node
 
 
@@ -1241,7 +1285,7 @@ def harvest_file_units(
                     for w_idx in range(len(body_stmts) - window_size + 1):
                         window_slice = body_stmts[w_idx : w_idx + window_size]
                         w_start = getattr(window_slice[0], "lineno", 0)
-                        w_end = getattr(window_slice[-1], "end_lineno", w_start)
+                        w_end = getattr(window_slice[-1], "end_lineno", w_start) or w_start
                         _record_unit(
                             units,
                             f"{unit_name}:stmts_{w_idx+1}-{w_idx+window_size}",

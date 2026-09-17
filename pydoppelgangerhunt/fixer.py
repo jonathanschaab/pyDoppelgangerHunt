@@ -2345,10 +2345,16 @@ def synthesize_shared_helper_code(
         resolved_type = desc["type"]
         resolved_default = desc["default"]
         kind = desc["kind"]
+        if kind in ("vararg", "kwarg"):
+            resolved_default = None
         prefix = "*" if kind == "vararg" else ("**" if kind == "kwarg" else "")
         var_name = f"{prefix}{var}"
 
-        if kind == "kwonly" and not seen_kwonly and not any("*" in p for p in params):
+        if (
+            kind == "kwonly"
+            and not seen_kwonly
+            and not any(p.startswith("*") and not p.startswith("**") for p in params)
+        ):
             params.append("*")
             seen_kwonly = True
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pydoppelgangerhunt.baseline import (
+    BaselineFingerprints,
     clone_pair_fingerprint,
     clone_pair_structural_fingerprint,
     compute_unit_structural_hash,
@@ -174,6 +175,7 @@ __all__ = [
     "pure_structural_fingerprint",
     "record_baseline",
     "load_baseline",
+    "BaselineFingerprints",
     "filter_clones_by_baseline",
     "prune_baseline",
     "clone_pair_fingerprint",

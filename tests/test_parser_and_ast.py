@@ -913,4 +913,107 @@ def test_batch_43_ast_constructs_canonicalizers_and_branch_harvesting(tmp_path: 
         assert "match_proc:case_2" in m_clause_names
 
 
+def test_batch_45_idiom_canonicalizer_and_baseline_legacy(tmp_path: Path) -> None:
+    """Test Batch 45 enhancements: SetComp/DictComp/AsyncFor canonicalization, fatal/trace boilerplate, legacy baselines."""
+    # 1. Boilerplate node checks for fatal and trace
+    fatal_tree = ast.parse("logger.fatal('severe error')\nlogger.trace('tracing step')")
+    for stmt in fatal_tree.body:
+        assert is_boilerplate_node(stmt)
+
+    # 2. _IdiomCanonicalizer SetComp and DictComp and AsyncFor transformations
+    canon = _IdiomCanonicalizer()
+
+    # Sync SetComp
+    set_loop = ast.parse("for x in data:\n    s.add(x)").body[0]
+    set_comp = canon.visit(set_loop)
+    assert isinstance(set_comp, ast.Assign)
+    assert isinstance(set_comp.value, ast.SetComp)
+
+    # Sync SetComp with if
+    set_if_loop = ast.parse("for x in data:\n    if x > 0:\n        s.add(x)").body[0]
+    set_if_comp = canon.visit(set_if_loop)
+    assert isinstance(set_if_comp, ast.Assign)
+    assert isinstance(set_if_comp.value, ast.SetComp)
+    assert len(set_if_comp.value.generators[0].ifs) == 1
+
+    # Sync DictComp
+    dict_loop = ast.parse("for k, v in items:\n    d[k] = v").body[0]
+    dict_comp = canon.visit(dict_loop)
+    assert isinstance(dict_comp, ast.Assign)
+    assert isinstance(dict_comp.value, ast.DictComp)
+
+    # Sync DictComp with if
+    dict_if_loop = ast.parse("for k, v in items:\n    if v:\n        d[k] = v").body[0]
+    dict_if_comp = canon.visit(dict_if_loop)
+    assert isinstance(dict_if_comp, ast.Assign)
+    assert isinstance(dict_if_comp.value, ast.DictComp)
+
+    # Attribute target DictComp: self.map[k] = v
+    attr_dict_loop = ast.parse("for k, v in items:\n    self.map[k] = v").body[0]
+    attr_dict_comp = canon.visit(attr_dict_loop)
+    assert isinstance(attr_dict_comp, ast.Assign)
+    assert isinstance(attr_dict_comp.targets[0], ast.Attribute)
+    assert isinstance(attr_dict_comp.value, ast.DictComp)
+
+    # Async ListComp and SetComp
+    async_list_loop = ast.parse("async def f():\n    async for x in stream:\n        items.append(x)").body[0].body[0]  # type: ignore[attr-defined]
+    async_list_comp = canon.visit(async_list_loop)
+    assert isinstance(async_list_comp, ast.Assign)
+    assert isinstance(async_list_comp.value, ast.ListComp)
+    assert async_list_comp.value.generators[0].is_async == 1
+
+    async_set_loop = ast.parse("async def f():\n    async for x in stream:\n        s.add(x)").body[0].body[0]  # type: ignore[attr-defined]
+    async_set_comp = canon.visit(async_set_loop)
+    assert isinstance(async_set_comp, ast.Assign)
+    assert isinstance(async_set_comp.value, ast.SetComp)
+    assert async_set_comp.value.generators[0].is_async == 1
+
+    async_dict_loop = ast.parse("async def f():\n    async for k, v in stream:\n        d[k] = v").body[0].body[0]  # type: ignore[attr-defined]
+    async_dict_comp = canon.visit(async_dict_loop)
+    assert isinstance(async_dict_comp, ast.Assign)
+    assert isinstance(async_dict_comp.value, ast.DictComp)
+    assert async_dict_comp.value.generators[0].is_async == 1
+
+    # 3. Sliding window harvesting with safe end_lineno fallback
+    src_sw = tmp_path / "sw.py"
+    src_sw.write_text(
+        "def run_sliding():\n"
+        "    a = 1\n"
+        "    b = 2\n"
+        "    c = 3\n"
+        "    d = 4\n"
+        "    e = 5\n"
+        "    f = 6\n",
+        encoding="utf-8",
+    )
+    sw_units = harvest_file_units(str(src_sw), str(tmp_path), min_lines=2, min_tokens=5, sliding_window=True, window_size=3)
+    sw_kinds = [u["kind"] for u in sw_units if u.get("kind") == "sliding_window"]
+    assert len(sw_kinds) >= 1
+
+    # 4. Legacy string-list baseline support in load_baseline and prune_baseline
+    import json
+    from pydoppelgangerhunt.baseline import load_baseline, prune_baseline
+    legacy_file = tmp_path / "legacy_baseline.json"
+    legacy_file.write_text(
+        json.dumps({
+            "version": "1.0.0",
+            "fingerprints": [
+                "mod_a.py:fn1 <===> mod_b.py:fn2",
+                "mod_c.py:calc <===> mod_d.py:calc",
+            ],
+        }),
+        encoding="utf-8",
+    )
+    loaded_bl = load_baseline(str(legacy_file))
+    assert "mod_a.py:fn1 <===> mod_b.py:fn2" in loaded_bl
+    assert len(loaded_bl.records) == 2
+    assert loaded_bl.records[0]["file_a"] == "mod_a.py"
+    assert loaded_bl.records[0]["name_a"] == "fn1"
+
+    prune_res = prune_baseline(str(legacy_file), active_clones=[], unstaged_modified_ranges={})
+    assert prune_res.pruned_count == 2
+    assert prune_res.retained_count == 0
+
+
+
 

@@ -135,7 +135,20 @@ class BaselineFingerprints(set):  # type: ignore[type-arg]
         self.records: List[Dict[str, Any]] = records or []
 
 
-def load_baseline(baseline_path: str) -> Set[str]:
+def _parse_legacy_fingerprint_record(raw_fp: str) -> Dict[str, Any]:
+    """Parses a legacy string fingerprint into a baseline record dictionary."""
+    rec: Dict[str, Any] = {"fingerprint": raw_fp}
+    parts = raw_fp.split(" <===> ")
+    if len(parts) == 2:
+        for idx, suffix in enumerate(["a", "b"]):
+            if ":" in parts[idx]:
+                f_val, n_val = parts[idx].rsplit(":", 1)
+                rec[f"file_{suffix}"] = f_val
+                rec[f"name_{suffix}"] = n_val
+    return rec
+
+
+def load_baseline(baseline_path: str) -> BaselineFingerprints:
     """Loads grandfathered clone fingerprints and structural hashes from a JSON baseline file."""
     path = Path(baseline_path)
     if not path.exists():
@@ -145,9 +158,16 @@ def load_baseline(baseline_path: str) -> Set[str]:
         fingerprints = data.get("fingerprints", [])
         fps: Set[str] = set()
         records: List[Dict[str, Any]] = []
-        for item in fingerprints:
-            if not isinstance(item, dict):
+        for raw_item in fingerprints:
+            if isinstance(raw_item, str):
+                item_str = str(raw_item).strip()
+                if item_str:
+                    fps.add(item_str)
+                    records.append(_parse_legacy_fingerprint_record(item_str))
                 continue
+            if not isinstance(raw_item, dict):
+                continue
+            item = raw_item
             rec = dict(item)
             if "fingerprint" in item:
                 fp_str = str(item["fingerprint"])
@@ -383,8 +403,12 @@ def prune_baseline(
     pruned_count = 0
     skipped_dirty_count = 0
 
-    for item in data.get("fingerprints", []):
-        if not isinstance(item, dict):
+    for raw_item in data.get("fingerprints", []):
+        if isinstance(raw_item, str):
+            item = _parse_legacy_fingerprint_record(raw_item)
+        elif isinstance(raw_item, dict):
+            item = dict(raw_item)
+        else:
             continue
         item_fp = item.get("fingerprint")
         item_sfp = item.get("structural_fingerprint")
