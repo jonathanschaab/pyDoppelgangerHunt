@@ -736,6 +736,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             else ""
         )
         _write_artifact_file(args.patch, patch_text, "PATCH", args.format == "text")
+    elif args.replace_clones and args.format == "text":
+        print(
+            colorize(
+                "Warning: --replace-clones specified without --patch; no patch will be generated.",
+                COLOR_BOLD + COLOR_YELLOW,
+                use_color,
+            )
+        )
 
     if args.github_annotations and clones:
         annotations = format_github_annotations(clones)

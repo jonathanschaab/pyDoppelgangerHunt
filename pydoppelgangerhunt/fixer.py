@@ -1018,29 +1018,37 @@ def _format_call_arguments(
     inputs: List[str],
     param_details: List[Dict[str, Any]],
     receiver_to_omit: Optional[str] = None,
+    target_inputs: Optional[List[str]] = None,
 ) -> str:
     """Formats argument strings for helper call sites, preserving keyword-only, vararg, and kwarg syntax."""
     param_map: Dict[str, str] = {
         p["name"].lstrip("*"): p.get("kind", "pos") for p in param_details
     }
     sorted_inputs = sorted(inputs, key=lambda v: _rank_param_kind(v, param_map))
+    if target_inputs is not None and len(target_inputs) == len(inputs):
+        inp_to_target = dict(zip(inputs, target_inputs))
+        sorted_targets = [inp_to_target.get(k, k) for k in sorted_inputs]
+    else:
+        sorted_targets = sorted_inputs
+
     formatted_args: List[str] = []
-    for raw_var in sorted_inputs:
-        clean_var = raw_var.lstrip("*")
+    for h_var, t_var in zip(sorted_inputs, sorted_targets):
+        clean_h = h_var.lstrip("*")
+        clean_t = t_var.lstrip("*")
         if receiver_to_omit and (
-            clean_var == receiver_to_omit
-            or (receiver_to_omit == "receivers" and clean_var in ("self", "cls"))
+            clean_t == receiver_to_omit
+            or (receiver_to_omit == "receivers" and clean_t in ("self", "cls"))
         ):
             continue
-        kind = param_map.get(clean_var, "")
+        kind = param_map.get(clean_h, "")
         if kind == "kwonly":
-            formatted_args.append(f"{clean_var}={clean_var}")
-        elif kind == "vararg" or (raw_var.startswith("*") and not raw_var.startswith("**")):
-            formatted_args.append(f"*{clean_var}")
-        elif kind == "kwarg" or raw_var.startswith("**"):
-            formatted_args.append(f"**{clean_var}")
+            formatted_args.append(f"{clean_h}={clean_t}")
+        elif kind == "vararg" or (h_var.startswith("*") and not h_var.startswith("**")):
+            formatted_args.append(f"*{clean_t}")
+        elif kind == "kwarg" or h_var.startswith("**"):
+            formatted_args.append(f"**{clean_t}")
         else:
-            formatted_args.append(clean_var)
+            formatted_args.append(clean_t)
     return ", ".join(formatted_args)
 
 
@@ -1382,7 +1390,10 @@ def analyze_unit_variable_scope(
         common_inputs = [var for var in info1["inputs"] if var in info2["inputs"]]
         inputs = common_inputs if common_inputs else info1["inputs"]
         common_outputs = [var for var in info1["outputs"] if var in info2["outputs"]]
-        outputs = common_outputs if common_outputs else list(dict.fromkeys(info1["outputs"] + info2["outputs"]))
+        if len(info1["outputs"]) == len(info2["outputs"]):
+            outputs = common_outputs if len(common_outputs) == len(info1["outputs"]) else info1["outputs"]
+        else:
+            outputs = common_outputs if common_outputs else info1["outputs"]
         free_vars = list(dict.fromkeys(info1["free_vars"] + info2["free_vars"]))
         nonlocals = list(dict.fromkeys(info1["nonlocals"] + info2["nonlocals"]))
         globals_ = list(dict.fromkeys(info1["globals"] + info2["globals"]))
@@ -2381,7 +2392,7 @@ def synthesize_shared_helper_code(
         if tag == "equal":
             common_lines.extend(lines1[i1:i2])
 
-    if not common_lines or (preserve_pragmas and len(common_lines) < max(len(lines1), len(lines2)) * 0.5):
+    if not common_lines or len(common_lines) < len(lines1):
         common_lines = lines1
 
     if preserve_pragmas:
@@ -3067,6 +3078,8 @@ def _build_unit_delegation_call(
     inputs: List[str],
     outputs: List[str],
     scope: Dict[str, Any],
+    target_inputs: Optional[List[str]] = None,
+    target_outputs: Optional[List[str]] = None,
     await_prefix: str = "",
     step: Optional[str] = None,
 ) -> str:
@@ -3099,10 +3112,14 @@ def _build_unit_delegation_call(
             else ("self" if t_kind == "class" else "cls")
         )
 
+    effective_targets = target_inputs if target_inputs is not None else inputs
+    effective_outputs = target_outputs if target_outputs is not None else outputs
+
     unit_args_str = _format_call_arguments(
         inputs,
         scope.get("param_details", []),
         receiver_to_omit=unit_receiver_omit,
+        target_inputs=effective_targets,
     )
 
     is_whole_method = target_unit.get("kind") in ("function", "closure")
@@ -3114,7 +3131,7 @@ def _build_unit_delegation_call(
             helper_name=helper_name,
             args_str=unit_args_str,
             await_prefix=await_prefix,
-            has_return=bool(outputs or scope.get("has_return", True)),
+            has_return=bool(effective_outputs or scope.get("has_return", True)),
             is_async=bool(scope.get("is_async")),
             has_yield=bool(scope.get("has_yield")),
         )
@@ -3132,8 +3149,8 @@ def _build_unit_delegation_call(
         )
 
     is_sync_gen = bool(scope.get("has_yield"))
-    if outputs:
-        assign_target = ", ".join(outputs) if len(outputs) >= 2 else outputs[0]
+    if effective_outputs:
+        assign_target = ", ".join(effective_outputs) if len(effective_outputs) >= 2 else effective_outputs[0]
         rhs = (
             f"(yield from {call_expr})"
             if is_sync_gen
@@ -3331,7 +3348,28 @@ def generate_refactoring_patch(
 
         if replace_clones:
             units_to_replace: List[Tuple[Dict[str, Any], str]] = []
+            u1_outs = [
+                v for v in s1.get("outputs", [])
+                if v not in s1.get("globals", [])
+                and v not in s1.get("nonlocals", [])
+            ]
+            u2_outs = [
+                v for v in s2.get("outputs", [])
+                if v not in s2.get("globals", [])
+                and v not in s2.get("nonlocals", [])
+            ]
             for target_unit in candidate_units:
+                if target_unit is u2 or target_unit == u2:
+                    t_inputs = list(s2.get("inputs", []))
+                    if effective_binding == "module":
+                        t_inputs = _prune_unshared_receivers(
+                            t_inputs, u2, u1, s2, s1, repo_root=str(root)
+                        )
+                    t_outputs = u2_outs if len(u2_outs) == len(outputs) else outputs
+                else:
+                    t_inputs = inputs
+                    t_outputs = u1_outs if len(u1_outs) == len(outputs) else outputs
+
                 rep_stmt = _build_unit_delegation_call(
                     target_unit,
                     orig_text,
@@ -3341,6 +3379,8 @@ def generate_refactoring_patch(
                     inputs=inputs,
                     outputs=outputs,
                     scope=scope,
+                    target_inputs=t_inputs,
+                    target_outputs=t_outputs,
                     await_prefix=await_prefix,
                     step=step,
                 )

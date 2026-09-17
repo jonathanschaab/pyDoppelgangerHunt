@@ -7446,6 +7446,68 @@ def test_batch_66_artifact_dirs_clustering_helper_and_defensive_scoring(tmp_path
     assert "Repository DRY Score" in md_summary
 
 
+def test_batch_71_type2_clone_parameter_renaming_and_body_retention(tmp_path: Path) -> None:
+    """Verifies that Type-2 clones with renamed parameters preserve full helper body and map arguments at call sites."""
+    f = tmp_path / "calc.py"
+    code = (
+        "def calc_alpha(x: int) -> int:\n"
+        "    a = x * 2\n"
+        "    b = a + 1\n"
+        "    c = b * 3\n"
+        "    d = c + 4\n"
+        "    return d\n"
+        "\n"
+        "def calc_beta(y: int) -> int:\n"
+        "    a = y * 2\n"
+        "    b = a + 1\n"
+        "    c = b * 3\n"
+        "    d = c + 4\n"
+        "    return d\n"
+    )
+    f.write_text(code, encoding="utf-8")
+
+    u1 = {"file": str(f), "start": 1, "end": 6, "name": "calc_alpha", "kind": "function"}
+    u2 = {"file": str(f), "start": 8, "end": 13, "name": "calc_beta", "kind": "function"}
+
+    # 1. Helper synthesis must retain all statements despite variable renaming on line 1
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "a = x * 2" in helper
+    assert "b = a + 1" in helper
+    assert "c = b * 3" in helper
+    assert "d = c + 4" in helper
+    assert "return d" in helper
+
+    # 2. Refactoring patch must delegate with x in calc_alpha and y in calc_beta
+    patch = generate_refactoring_patch([(0.90, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert "return _shared_calc_alpha_calc_beta(x)" in patch
+    assert "return _shared_calc_alpha_calc_beta(y)" in patch
+    # Ensure calc_beta does not reference x
+    beta_section = patch.split("def calc_beta(y: int) -> int:")[1]
+    assert "(x)" not in beta_section
+    assert "(y)" in beta_section
+
+    # 3. Compound blocks with renamed outputs
+    f_block = tmp_path / "block.py"
+    b_code = (
+        "def proc1(p: int) -> int:\n"
+        "    v = p * 2\n"
+        "    out1 = v + 10\n"
+        "    return out1\n"
+        "\n"
+        "def proc2(q: int) -> int:\n"
+        "    v = q * 2\n"
+        "    out2 = v + 10\n"
+        "    return out2\n"
+    )
+    f_block.write_text(b_code, encoding="utf-8")
+    u_b1 = {"file": str(f_block), "start": 2, "end": 3, "name": "b1:1", "kind": "compound_block"}
+    u_b2 = {"file": str(f_block), "start": 7, "end": 8, "name": "b2:1", "kind": "compound_block"}
+    patch_block = generate_refactoring_patch([(0.90, u_b1, u_b2)], repo_root=str(tmp_path), replace_clones=True)
+    assert "v, out1 = _shared_b1_b2(p)" in patch_block
+    assert "v, out2 = _shared_b1_b2(q)" in patch_block
+
+
+
 
 
 

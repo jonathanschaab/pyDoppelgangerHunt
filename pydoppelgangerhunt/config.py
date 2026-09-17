@@ -176,6 +176,7 @@ def _parse_toml_array_value(val_str: str) -> List[Any]:
     raw_tokens: List[str] = []
     curr: List[str] = []
     in_quote: Optional[str] = None
+    bracket_depth = 0
     for ch in inner:
         if ch in ('"', "'"):
             if in_quote is None:
@@ -183,7 +184,13 @@ def _parse_toml_array_value(val_str: str) -> List[Any]:
             elif in_quote == ch:
                 in_quote = None
             curr.append(ch)
-        elif ch == "," and in_quote is None:
+        elif in_quote is None and ch == "[":
+            bracket_depth += 1
+            curr.append(ch)
+        elif in_quote is None and ch == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+            curr.append(ch)
+        elif ch == "," and in_quote is None and bracket_depth == 0:
             raw_tokens.append("".join(curr).strip())
             curr = []
         else:
@@ -194,7 +201,9 @@ def _parse_toml_array_value(val_str: str) -> List[Any]:
     for e_str in raw_tokens:
         if not e_str:
             continue
-        if (e_str.startswith('"') and e_str.endswith('"')) or (
+        if e_str.startswith("[") and e_str.endswith("]"):
+            elems.append(_parse_toml_array_value(e_str))
+        elif (e_str.startswith('"') and e_str.endswith('"')) or (
             e_str.startswith("'") and e_str.endswith("'")
         ):
             elems.append(e_str[1:-1])

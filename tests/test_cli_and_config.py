@@ -1237,3 +1237,43 @@ def test_batch_69_modular_decomposition(tmp_path: Path) -> None:
     assert call_comp == "_shared_comp(a)"
 
 
+def test_toml_array_value_nested_2d_arrays(tmp_path: Path) -> None:
+    """Verifies that _parse_toml_array_value correctly parses nested 2D TOML arrays and exemptions."""
+    from pydoppelgangerhunt.config import _parse_toml_array_value, load_toml_section  # pylint: disable=import-outside-toplevel
+
+    # 1. 2D array of strings
+    raw_2d = '[["pkg/a.py:f", "pkg/b.py:g"], ["pkg/c.py:h", "pkg/d.py:k"]]'
+    parsed_2d = _parse_toml_array_value(raw_2d)
+    assert parsed_2d == [["pkg/a.py:f", "pkg/b.py:g"], ["pkg/c.py:h", "pkg/d.py:k"]]
+
+    # 2. Mixed types in nested arrays
+    raw_mixed = '[["a", 1, True], ["b", 2.5, False]]'
+    parsed_mixed = _parse_toml_array_value(raw_mixed)
+    assert parsed_mixed == [["a", 1, True], ["b", 2.5, False]]
+
+    # 3. Via load_toml_section fallback parser
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        '[tool.pydoppelgangerhunt]\n'
+        'exemptions = [["pkg/a.py:func1", "pkg/b.py:func2"]]\n',
+        encoding="utf-8",
+    )
+    data = load_toml_section(cfg_file, "pydoppelgangerhunt")
+    assert "exemptions" in data
+    assert data["exemptions"] == [["pkg/a.py:func1", "pkg/b.py:func2"]]
+
+
+def test_cli_replace_clones_without_patch_warning(tmp_path: Path, capsys: Any) -> None:
+    """Verifies that CLI emits a friendly warning when --replace-clones is passed without --patch."""
+    f = tmp_path / "target.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    code = main([str(f), "--replace-clones"])
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "Warning: --replace-clones specified without --patch; no patch will be generated." in captured.out
+
+
+
