@@ -1930,6 +1930,62 @@ def find_enclosing_function(
     return meta
 
 
+def _normalize_file_path(
+    f_str: str,
+    repo_root: Optional[str] = None,
+) -> str:
+    """Normalizes a file path string to a canonical resolved POSIX path."""
+    if not f_str:
+        return ""
+    norm = str(f_str).split("#", maxsplit=1)[0].replace("\\", "/")
+    if norm.startswith("./"):
+        norm = norm[2:]
+    root = Path(repo_root or os.getcwd())
+    try:
+        p = Path(norm)
+        p_full = p if p.is_absolute() else (root / p)
+        return str(p_full.resolve()).replace("\\", "/")
+    except OSError:
+        return norm
+
+
+def _is_same_file_path(
+    f1_str: str,
+    f2_str: str,
+    repo_root: Optional[str] = None,
+) -> bool:
+    """Checks whether two file path strings refer to the identical file on disk."""
+    if not f1_str or not f2_str:
+        return False
+    norm1 = str(f1_str).split("#", maxsplit=1)[0].replace("\\", "/")
+    norm2 = str(f2_str).split("#", maxsplit=1)[0].replace("\\", "/")
+    if norm1 == norm2:
+        return True
+    if norm1.startswith("./"):
+        norm1 = norm1[2:]
+    if norm2.startswith("./"):
+        norm2 = norm2[2:]
+    if norm1 == norm2:
+        return True
+    root = Path(repo_root or os.getcwd())
+    try:
+        p1 = Path(norm1)
+        p2 = Path(norm2)
+        p1_full = p1 if p1.is_absolute() else (root / p1)
+        p2_full = p2 if p2.is_absolute() else (root / p2)
+        if p1_full.resolve() == p2_full.resolve():
+            return True
+        if p1.is_absolute() and not p2.is_absolute():
+            if norm1.lower().endswith("/" + norm2.lower()):
+                return True
+        elif p2.is_absolute() and not p1.is_absolute():
+            if norm2.lower().endswith("/" + norm1.lower()):
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def _is_method_of_class(
     fn_meta: Optional[Dict[str, Any]],
     cls_meta: Optional[Dict[str, Any]],
@@ -2159,7 +2215,7 @@ def synthesize_shared_helper_code(
         enc1
         and enc2
         and enc1 == enc2
-        and f1 == f2
+        and _is_same_file_path(f1, f2, repo_root=repo_root)
         and (enc1_start is None or enc2_start is None or enc1_start == enc2_start)
     )
 
@@ -2605,12 +2661,17 @@ def replace_unit_in_source(
     return "".join(prefix_lines) + rep + "".join(suffix_lines)
 
 
-def check_units_overlap(u1: Dict[str, Any], u2: Dict[str, Any]) -> bool:
+def check_units_overlap(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    repo_root: Optional[str] = None,
+) -> bool:
     """Determines whether two AST code units in the same file share overlapping line ranges.
 
     Args:
         u1: First AST unit dictionary with 'file', 'start', and 'end'.
         u2: Second AST unit dictionary with 'file', 'start', and 'end'.
+        repo_root: Optional repository root path for resolving relative file paths.
 
     Returns:
         True if both units reside in the same normalized file path and their [start, end]
@@ -2618,7 +2679,7 @@ def check_units_overlap(u1: Dict[str, Any], u2: Dict[str, Any]) -> bool:
     """
     f1 = str(u1.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
     f2 = str(u2.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
-    if not f1 or not f2 or f1 != f2:
+    if not f1 or not f2 or not _is_same_file_path(f1, f2, repo_root=repo_root):
         return False
     start1 = int(u1.get("start") or 1)
     end1 = int(u1.get("end") or start1)
@@ -2648,7 +2709,10 @@ def check_units_overlap(u1: Dict[str, Any], u2: Dict[str, Any]) -> bool:
     return max(start1, start2) <= min(end1, end2)
 
 
-def filter_overlapping_clone_units(units: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def filter_overlapping_clone_units(
+    units: Sequence[Dict[str, Any]],
+    repo_root: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Filters a sequence of candidate code units to retain a maximal non-overlapping subset.
 
     When candidates share overlapping lines/tokens within the same module, candidates
@@ -2656,6 +2720,7 @@ def filter_overlapping_clone_units(units: Sequence[Dict[str, Any]]) -> List[Dict
 
     Args:
         units: Sequence of AST unit dictionaries proposed for refactoring.
+        repo_root: Optional repository root path for resolving relative file paths.
 
     Returns:
         List of non-overlapping units safe for concurrent refactoring within the same pass.
@@ -2663,13 +2728,22 @@ def filter_overlapping_clone_units(units: Sequence[Dict[str, Any]]) -> List[Dict
     if not units:
         return []
 
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    file_groups: List[Tuple[str, List[Dict[str, Any]]]] = []
     for u in units:
-        norm_file = str(u.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
-        grouped.setdefault(norm_file, []).append(u)
+        f_raw = str(u.get("file") or "")
+        matched = False
+        for rep_f, group in file_groups:
+            if (not f_raw and not rep_f) or (
+                f_raw and rep_f and _is_same_file_path(f_raw, rep_f, repo_root=repo_root)
+            ):
+                group.append(u)
+                matched = True
+                break
+        if not matched:
+            file_groups.append((f_raw, [u]))
 
     retained: List[Dict[str, Any]] = []
-    for file_units in grouped.values():
+    for _, file_units in file_groups:
         sorted_candidates = sorted(
             file_units,
             key=lambda u: (
@@ -2681,7 +2755,7 @@ def filter_overlapping_clone_units(units: Sequence[Dict[str, Any]]) -> List[Dict
         )
         file_retained: List[Dict[str, Any]] = []
         for cand in sorted_candidates:
-            if not any(check_units_overlap(cand, prev) for prev in file_retained):
+            if not any(check_units_overlap(cand, prev, repo_root=repo_root) for prev in file_retained):
                 file_retained.append(cand)
         retained.extend(file_retained)
 
@@ -2939,7 +3013,7 @@ def generate_refactoring_patch(
 
         f2_raw = str(u2.get("file") or "").split("#", maxsplit=1)[0]
         f2_norm = f2_raw.replace("\\", "/")
-        is_same_file = bool(f2_norm and f2_norm == f1_norm)
+        is_same_file = _is_same_file_path(f1_raw, f2_raw, repo_root=str(root))
 
         enc1 = find_enclosing_class(orig_text, u1)
         fn1 = find_enclosing_function(orig_text, u1)
@@ -3071,7 +3145,7 @@ def generate_refactoring_patch(
         ]
 
         candidate_units = [u1]
-        if is_same_file and not check_units_overlap(u1, u2):
+        if is_same_file and not check_units_overlap(u1, u2, repo_root=str(root)):
             candidate_units.append(u2)
 
         earliest_unit = min(candidate_units, key=lambda u: int(u.get("start") or 1))

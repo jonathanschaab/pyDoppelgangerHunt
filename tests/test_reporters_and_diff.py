@@ -5892,3 +5892,90 @@ def test_batch_35_git_blame_dictionary_porcelain_parsing() -> None:
         assert blame_2["timestamp"] == 1720000000
         assert blame_2["summary"] == "Bob commit"
 
+
+def test_batch_36_path_resolution_and_same_file_matching(tmp_path: Any) -> None:
+    """Tests Batch 36: robust path normalization and resolution across duplicate units."""
+    from pydoppelgangerhunt.fixer import (
+        _is_same_file_path,
+        _normalize_file_path,
+        check_units_overlap,
+        filter_overlapping_clone_units,
+        generate_refactoring_patch,
+        synthesize_shared_helper_code,
+    )
+
+    # 1. Base string equivalence and anchor handling
+    assert not _is_same_file_path("", "foo.py")
+    assert not _is_same_file_path("foo.py", "")
+    assert _is_same_file_path("foo/bar.py", "foo/bar.py")
+    assert _is_same_file_path("foo/bar.py#hash1", "foo/bar.py#hash2")
+    assert _is_same_file_path("./foo/bar.py", "foo/bar.py")
+    assert _is_same_file_path("foo\\bar.py", "foo/bar.py")
+    assert _normalize_file_path("") == ""
+    assert _normalize_file_path("./mod.py#h").endswith("mod.py")
+
+    # 2. Filesystem-based relative vs absolute path equivalence
+    target_file = tmp_path / "sample.py"
+    target_file.write_text(
+        "class Worker:\n"
+        "    def task_a(self, x):\n"
+        "        val = x * 2 + 1\n"
+        "        return val\n"
+        "    def task_b(self, x):\n"
+        "        val = x * 2 + 1\n"
+        "        return val\n",
+        encoding="utf-8",
+    )
+
+    abs_path_str = str(target_file)
+    rel_path_dot = "./sample.py"
+    rel_path_plain = "sample.py"
+
+    assert _is_same_file_path(abs_path_str, rel_path_dot, repo_root=str(tmp_path))
+    assert _is_same_file_path(rel_path_plain, rel_path_dot, repo_root=str(tmp_path))
+
+    # 3. check_units_overlap with differing path formats
+    u_base = {"file": abs_path_str, "start": 2, "end": 4}
+    u_overlap = {"file": rel_path_dot, "start": 3, "end": 5}
+    u_disjoint = {"file": rel_path_dot, "start": 5, "end": 7}
+    assert check_units_overlap(u_base, u_overlap)
+    assert not check_units_overlap(u_base, u_disjoint)
+
+    # 4. filter_overlapping_clone_units groups identical files despite leading dot-slash
+    filtered = filter_overlapping_clone_units([u_base, u_overlap])
+    assert len(filtered) == 1
+
+    # 5. synthesize_shared_helper_code recognizes same-class across relative and absolute paths
+    u1 = {
+        "file": abs_path_str,
+        "name": "task_a",
+        "type": "function",
+        "kind": "function",
+        "start": 2,
+        "end": 4,
+        "params": ["self", "x"],
+        "enclosing_class": "Worker",
+        "enclosing_class_start": 1,
+        "receiver_kind": "method",
+    }
+    u2 = {
+        "file": rel_path_dot,
+        "name": "task_b",
+        "type": "function",
+        "kind": "function",
+        "start": 5,
+        "end": 7,
+        "params": ["self", "x"],
+        "enclosing_class": "Worker",
+        "enclosing_class_start": 1,
+        "receiver_kind": "method",
+    }
+    helper_code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "def _shared_task_a_task_b(self, x: Any) -> Any:" in helper_code
+
+    # 6. generate_refactoring_patch succeeds with mixed path formats
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert "def _shared_task_a_task_b(self, x: Any) -> Any:" in patch
+    assert "self._shared_task_a_task_b(x)" in patch
+
+
