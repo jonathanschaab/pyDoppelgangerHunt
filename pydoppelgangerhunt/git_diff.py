@@ -107,8 +107,8 @@ def compute_unit_diff_overlap(
     if not target_ranges:
         return 0, 0.0
 
-    u_start = int(unit.get("start", 1))
-    u_end = int(unit.get("end", u_start))
+    u_start = int(unit.get("start") or 1)
+    u_end = int(unit.get("end") or u_start)
     total_unit_lines = max(1, u_end - u_start + 1)
 
     overlapping_lines: Set[int] = set()
@@ -238,8 +238,8 @@ def check_temporal_divergence(
     f2 = str(u2.get("file") or "")
     if not f1 or not f2:
         return None
-    b1 = get_git_blame_info(f1, u1.get("start", 1), u1.get("end", 1), repo_root=repo_root)
-    b2 = get_git_blame_info(f2, u2.get("start", 1), u2.get("end", 1), repo_root=repo_root)
+    b1 = get_git_blame_info(f1, int(u1.get("start") or 1), int(u1.get("end") or 1), repo_root=repo_root)
+    b2 = get_git_blame_info(f2, int(u2.get("start") or 1), int(u2.get("end") or 1), repo_root=repo_root)
 
     t1 = b1.get("timestamp", 0)
     t2 = b2.get("timestamp", 0)

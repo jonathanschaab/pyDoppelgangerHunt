@@ -5430,3 +5430,42 @@ def test_defensive_unit_file_handling_in_diff_and_reporters(tmp_path: Path) -> N
     divergence = check_temporal_divergence(u_none, u_missing, repo_root=str(tmp_path))
     assert divergence is None
 
+
+def test_defensive_unit_start_end_none_handling(tmp_path: Path) -> None:
+    """Verifies that units with None start or end lines do not crash with TypeError."""
+    from pydoppelgangerhunt.baseline import clone_pair_fingerprint, record_baseline
+    from pydoppelgangerhunt.clustering import unit_key
+    from pydoppelgangerhunt.fixer import check_units_overlap, filter_overlapping_clone_units, refactor_module_units
+
+    u_null_bounds: Dict[str, Any] = {
+        "file": str(tmp_path / "mod.py"),
+        "start": None,
+        "end": None,
+        "name": None,
+    }
+    u_null_bounds2: Dict[str, Any] = {
+        "file": str(tmp_path / "mod.py"),
+        "start": None,
+        "end": None,
+        "name": None,
+    }
+
+    # Should not raise TypeError: int() argument must be ... not 'NoneType'
+    key = unit_key(u_null_bounds)
+    assert ":1-1:unit" in key
+
+    assert check_units_overlap(u_null_bounds, u_null_bounds2) is True
+
+    retained = filter_overlapping_clone_units([u_null_bounds, u_null_bounds2])
+    assert len(retained) == 1
+
+    fp = clone_pair_fingerprint(u_null_bounds, u_null_bounds2)
+    assert "unit" in fp
+
+    base_file = str(tmp_path / "base.json")
+    saved = record_baseline([(1.0, u_null_bounds, u_null_bounds2)], base_file, "target", 0.8)
+    assert Path(saved).is_file()
+
+    out = refactor_module_units("x = 1\n", [])
+    assert out == "x = 1\n"
+

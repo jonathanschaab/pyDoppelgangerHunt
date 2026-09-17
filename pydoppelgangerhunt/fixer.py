@@ -1770,8 +1770,8 @@ def _find_innermost_enclosing_node(
     except SyntaxError:
         return None
 
-    u_start = int(unit.get("start", 0))
-    u_end = int(unit.get("end", u_start))
+    u_start = int(unit.get("start") or 0)
+    u_end = int(unit.get("end") or u_start)
     if u_start <= 0:
         return None
 
@@ -2498,8 +2498,8 @@ def replace_unit_in_source(
         The modified source code with comments, type ignores, and whitespace outside the unit preserved.
     """
     lines = source_text.splitlines(keepends=True)
-    start = max(1, int(unit.get("start", 1)))
-    end = min(len(lines), int(unit.get("end", len(lines))))
+    start = max(1, int(unit.get("start") or 1))
+    end = min(len(lines), int(unit.get("end") or len(lines)))
     if start > len(lines) or start > end:
         return source_text
 
@@ -2597,8 +2597,10 @@ def check_units_overlap(u1: Dict[str, Any], u2: Dict[str, Any]) -> bool:
     f2 = str(u2.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
     if not f1 or not f2 or f1 != f2:
         return False
-    start1, end1 = int(u1.get("start", 1)), int(u1.get("end", 1))
-    start2, end2 = int(u2.get("start", 1)), int(u2.get("end", 1))
+    start1 = int(u1.get("start") or 1)
+    end1 = int(u1.get("end") or start1)
+    start2 = int(u2.get("start") or 1)
+    end2 = int(u2.get("end") or start2)
 
     if end1 < start2 or end2 < start1:
         return False
@@ -2648,10 +2650,10 @@ def filter_overlapping_clone_units(units: Sequence[Dict[str, Any]]) -> List[Dict
         sorted_candidates = sorted(
             file_units,
             key=lambda u: (
-                -(int(u.get("end", 0)) - int(u.get("start", 0))),
-                int(u.get("start", 0)),
-                int(u.get("start_col", 0) or 0),
-                str(u.get("name", "")),
+                -(int(u.get("end") or 0) - int(u.get("start") or 0)),
+                int(u.get("start") or 0),
+                int(u.get("start_col") or 0),
+                str(u.get("name") or ""),
             ),
         )
         file_retained: List[Dict[str, Any]] = []
@@ -2699,8 +2701,8 @@ def refactor_module_units(
     sorted_replacements = sorted(
         rep_list,
         key=lambda item: (
-            int(item[0].get("start", 0)),
-            int(item[0].get("start_col", 0) or 0),
+            int(item[0].get("start") or 0),
+            int(item[0].get("start_col") or 0),
         ),
         reverse=True,
     )
@@ -2725,8 +2727,8 @@ def _build_whole_method_delegation(
 ) -> str:
     """Builds a delegated method replacement body preserving method signature and docstring."""
     lines = source_text.splitlines(keepends=True)
-    u_start = int(unit.get("start", 1))
-    u_end = int(unit.get("end", len(lines)))
+    u_start = int(unit.get("start") or 1)
+    u_end = int(unit.get("end") or len(lines))
 
     lead = lines[u_start - 1] if 1 <= u_start <= len(lines) else ""
     indent = lead[: len(lead) - len(lead.lstrip())]
@@ -2952,7 +2954,7 @@ def generate_refactoring_patch(
             else None
         )
         if step is None:
-            u1_s = int(u1.get("start", 1))
+            u1_s = int(u1.get("start") or 1)
             u1_lead = orig_lines[u1_s - 1] if 1 <= u1_s <= len(orig_lines) else ""
             u1_ind = u1_lead[: len(u1_lead) - len(u1_lead.lstrip())]
             step = _detect_indent_step(u1_ind)
@@ -3002,21 +3004,21 @@ def generate_refactoring_patch(
         if is_same_file and not check_units_overlap(u1, u2):
             candidate_units.append(u2)
 
-        earliest_unit = min(candidate_units, key=lambda u: int(u.get("start", 1)))
+        earliest_unit = min(candidate_units, key=lambda u: int(u.get("start") or 1))
         enc_fn_earliest = (
             find_enclosing_function(orig_text, earliest_unit)
             if effective_binding == "method"
             else None
         )
         insert_line = (
-            enc_fn_earliest["start"] if enc_fn_earliest else int(earliest_unit.get("start", 1))
+            enc_fn_earliest["start"] if enc_fn_earliest else int(earliest_unit.get("start") or 1)
         )
         current_text = orig_text
 
         if replace_clones:
             units_to_replace: List[Tuple[Dict[str, Any], str]] = []
             for target_unit in candidate_units:
-                u_start = int(target_unit.get("start", 1))
+                u_start = int(target_unit.get("start") or 1)
                 if 1 <= u_start <= len(orig_lines):
                     lead = orig_lines[u_start - 1]
                     indent = lead[: len(lead) - len(lead.lstrip())]

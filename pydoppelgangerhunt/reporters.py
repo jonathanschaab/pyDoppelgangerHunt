@@ -43,17 +43,21 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
     """Reads raw source code lines for a given unit from disk."""
     f_raw = str(unit.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
     if not f_raw:
-        return [f"# Source for {unit.get('name', 'unit')} lines {unit.get('start', 1)}-{unit.get('end', 1)}\n"]
+        s_d = int(unit.get('start') or 1)
+        e_d = int(unit.get('end') or 1)
+        return [f"# Source for {unit.get('name', 'unit')} lines {s_d}-{e_d}\n"]
     file_path = Path(f_raw)
     if repo_root and not file_path.is_absolute():
         file_path = Path(repo_root) / file_path
     if not file_path.is_file():
-        return [f"# Source for {unit.get('name', 'unit')} lines {unit.get('start', 1)}-{unit.get('end', 1)}\n"]
+        s_d = int(unit.get('start') or 1)
+        e_d = int(unit.get('end') or 1)
+        return [f"# Source for {unit.get('name', 'unit')} lines {s_d}-{e_d}\n"]
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
             all_lines = fh.readlines()
-        start = max(1, unit.get("start", 1))
-        end = min(len(all_lines), unit.get("end", len(all_lines)))
+        start = max(1, int(unit.get("start") or 1))
+        end = min(len(all_lines), int(unit.get("end") or len(all_lines)))
         return all_lines[start - 1 : end]
     except OSError:
         return [f"# Unable to read {unit.get('file') or ''}\n"]
@@ -356,11 +360,11 @@ def format_github_annotations(
     annotations: List[str] = []
     for sim, u1, u2 in clones:
         f1 = str(u1.get("file") or "").replace("\\", "/").split("#", maxsplit=1)[0]
-        s1 = u1.get("start", 1)
-        e1 = u1.get("end", 1)
+        s1 = int(u1.get("start") or 1)
+        e1 = int(u1.get("end") or 1)
         f2 = str(u2.get("file") or "").replace("\\", "/").split("#", maxsplit=1)[0]
-        s2 = u2.get("start", 1)
-        e2 = u2.get("end", 1)
+        s2 = int(u2.get("start") or 1)
+        e2 = int(u2.get("end") or 1)
         n1 = str(u1.get("name") or "unit1")
         n2 = str(u2.get("name") or "unit2")
         msg1 = f"Structural clone ({sim:.1%}) matching {f2}:{s2}-{e2} ({n2})"

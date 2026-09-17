@@ -47,8 +47,8 @@ def extract_unit_namespace(file_path: str) -> str:
 
 def namespaced_structural_fingerprint(u1: Dict[str, Any], u2: Dict[str, Any]) -> str:
     """Computes order-invariant structural content fingerprint bound to module/package namespaces."""
-    ns1 = extract_unit_namespace(u1.get("file", ""))
-    ns2 = extract_unit_namespace(u2.get("file", ""))
+    ns1 = extract_unit_namespace(str(u1.get("file") or ""))
+    ns2 = extract_unit_namespace(str(u2.get("file") or ""))
     h1 = compute_unit_structural_hash(u1)
     h2 = compute_unit_structural_hash(u2)
     return _format_paired_endpoints(f"{ns1}#{h1}", f"{ns2}#{h2}")
@@ -63,8 +63,8 @@ def pure_structural_fingerprint(u1: Dict[str, Any], u2: Dict[str, Any]) -> str:
 
 def clone_pair_structural_fingerprint(u1: Dict[str, Any], u2: Dict[str, Any]) -> str:
     """Computes order-invariant structural content fingerprint for a clone pair."""
-    f1 = u1["file"].replace("\\", "/")
-    f2 = u2["file"].replace("\\", "/")
+    f1 = str(u1.get("file") or "").replace("\\", "/")
+    f2 = str(u2.get("file") or "").replace("\\", "/")
     h1 = compute_unit_structural_hash(u1)
     h2 = compute_unit_structural_hash(u2)
     return _format_paired_endpoints(f"{f1}#{h1}", f"{f2}#{h2}")
@@ -72,9 +72,11 @@ def clone_pair_structural_fingerprint(u1: Dict[str, Any], u2: Dict[str, Any]) ->
 
 def clone_pair_fingerprint(u1: Dict[str, Any], u2: Dict[str, Any]) -> str:
     """Computes stable, order-invariant fingerprint for a clone pair."""
-    f1 = u1["file"].replace("\\", "/")
-    f2 = u2["file"].replace("\\", "/")
-    return _format_paired_endpoints(f"{f1}:{u1['name']}", f"{f2}:{u2['name']}")
+    f1 = str(u1.get("file") or "").replace("\\", "/")
+    f2 = str(u2.get("file") or "").replace("\\", "/")
+    n1 = str(u1.get("name") or "unit1")
+    n2 = str(u2.get("name") or "unit2")
+    return _format_paired_endpoints(f"{f1}:{n1}", f"{f2}:{n2}")
 
 
 def record_baseline(
@@ -97,14 +99,14 @@ def record_baseline(
                 "namespaced_structural_fingerprint": namespaced_structural_fingerprint(u1, u2),
                 "pure_structural_fingerprint": pure_structural_fingerprint(u1, u2),
                 "similarity": round(sim, 4),
-                "file_a": u1["file"].replace("\\", "/"),
-                "name_a": u1["name"],
+                "file_a": str(u1.get("file") or "").replace("\\", "/"),
+                "name_a": str(u1.get("name") or "unit1"),
                 "hash_a": compute_unit_structural_hash(u1),
-                "namespace_a": extract_unit_namespace(u1["file"]),
-                "file_b": u2["file"].replace("\\", "/"),
-                "name_b": u2["name"],
+                "namespace_a": extract_unit_namespace(str(u1.get("file") or "")),
+                "file_b": str(u2.get("file") or "").replace("\\", "/"),
+                "name_b": str(u2.get("name") or "unit2"),
                 "hash_b": compute_unit_structural_hash(u2),
-                "namespace_b": extract_unit_namespace(u2["file"]),
+                "namespace_b": extract_unit_namespace(str(u2.get("file") or "")),
             }
             for sim, u1, u2 in clones
         ],
@@ -251,10 +253,10 @@ def filter_clones_by_baseline(
                 "ns_sfp": namespaced_structural_fingerprint(u1, u2),
                 "pure_sfp": pure_structural_fingerprint(u1, u2),
                 "namespaces": sorted([
-                    extract_unit_namespace(u1.get("file", "")),
-                    extract_unit_namespace(u2.get("file", "")),
+                    extract_unit_namespace(str(u1.get("file") or "")),
+                    extract_unit_namespace(str(u2.get("file") or "")),
                 ]),
-                "names": sorted([u1.get("name", ""), u2.get("name", "")]),
+                "names": sorted([str(u1.get("name") or ""), str(u2.get("name") or "")]),
             }
             matched_rec = _match_clone_record(c_keys, unconsumed)
             if matched_rec is not None:
@@ -409,8 +411,11 @@ def prune_baseline(
             ])
             item_names = sorted([item.get("name_a", ""), item.get("name_b", "")])
             for u1, u2 in pure_sfp_to_clones.get(item_pure_sfp, []):
-                u_ns = sorted([extract_unit_namespace(u1["file"]), extract_unit_namespace(u2["file"])])
-                u_names = sorted([u1.get("name", ""), u2.get("name", "")])
+                u_ns = sorted([
+                    extract_unit_namespace(str(u1.get("file") or "")),
+                    extract_unit_namespace(str(u2.get("file") or "")),
+                ])
+                u_names = sorted([str(u1.get("name") or ""), str(u2.get("name") or "")])
                 if u_ns == item_ns or (h_a != h_b and u_names == item_names):
                     is_active = True
                     matched_clone = (u1, u2)
@@ -425,12 +430,12 @@ def prune_baseline(
                 and (item_fp not in active_fps or item_sfp not in active_sfps)
             ):
                 u1, u2 = matched_clone
-                item["file_a"] = u1["file"].replace("\\", "/")
-                item["file_b"] = u2["file"].replace("\\", "/")
-                item["name_a"] = u1["name"]
-                item["name_b"] = u2["name"]
-                item["namespace_a"] = extract_unit_namespace(u1["file"])
-                item["namespace_b"] = extract_unit_namespace(u2["file"])
+                item["file_a"] = str(u1.get("file") or "").replace("\\", "/")
+                item["file_b"] = str(u2.get("file") or "").replace("\\", "/")
+                item["name_a"] = str(u1.get("name") or "unit1")
+                item["name_b"] = str(u2.get("name") or "unit2")
+                item["namespace_a"] = extract_unit_namespace(str(u1.get("file") or ""))
+                item["namespace_b"] = extract_unit_namespace(str(u2.get("file") or ""))
                 item["fingerprint"] = clone_pair_fingerprint(u1, u2)
                 item["structural_fingerprint"] = clone_pair_structural_fingerprint(u1, u2)
                 item["namespaced_structural_fingerprint"] = namespaced_structural_fingerprint(u1, u2)

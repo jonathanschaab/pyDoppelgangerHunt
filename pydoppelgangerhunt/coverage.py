@@ -108,8 +108,8 @@ def compute_unit_coverage(
             set(),
         )
 
-    s = unit.get("start", 1)
-    e = unit.get("end", s)
+    s = int(unit.get("start") or 1)
+    e = int(unit.get("end") or s)
     lines_total = e - s + 1
     if lines_total <= 0 or not covered_lines:
         return 0.0

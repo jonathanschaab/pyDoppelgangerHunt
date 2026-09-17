@@ -41,8 +41,11 @@ class UnionFind:
 
 def unit_key(unit: Dict[str, Any]) -> str:
     """Generates unique deterministic string key for an AST unit."""
-    norm_file = unit["file"].replace("\\", "/")
-    return f"{norm_file}:{unit['start']}-{unit['end']}:{unit['name']}"
+    norm_file = str(unit.get("file") or "").replace("\\", "/")
+    s = int(unit.get("start") or 1)
+    e = int(unit.get("end") or s)
+    name = str(unit.get("name") or "unit")
+    return f"{norm_file}:{s}-{e}:{name}"
 
 
 def compute_medoid(
