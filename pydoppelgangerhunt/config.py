@@ -198,8 +198,30 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
                 k, v = stripped.split("=", 1)
                 k = k.strip()
                 v = v.strip()
-                if v.startswith('"') and v.endswith('"'):
+                if (v.startswith('"') and v.endswith('"')) or (
+                    v.startswith("'") and v.endswith("'")
+                ):
                     config[k] = v[1:-1]
+                elif v.startswith("[") and v.endswith("]"):
+                    elems: List[Any] = []
+                    for e in v[1:-1].split(","):
+                        e_str = e.strip()
+                        if not e_str:
+                            continue
+                        if (e_str.startswith('"') and e_str.endswith('"')) or (
+                            e_str.startswith("'") and e_str.endswith("'")
+                        ):
+                            elems.append(e_str[1:-1])
+                        elif e_str.lower() == "true":
+                            elems.append(True)
+                        elif e_str.lower() == "false":
+                            elems.append(False)
+                        else:
+                            try:
+                                elems.append(float(e_str) if "." in e_str else int(e_str))
+                            except ValueError:
+                                elems.append(e_str)
+                    config[k] = elems
                 elif v.lower() == "true":
                     config[k] = True
                 elif v.lower() == "false":

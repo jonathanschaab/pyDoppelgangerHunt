@@ -441,5 +441,59 @@ def test_batch_48_cli_and_config_edge_cases(tmp_path: Path) -> None:
     assert fallback_cfg.get("threshold") == 0.93
 
 
+def test_batch_52_toml_lists_and_quotes(tmp_path: Path, monkeypatch: Any) -> None:
+    """Batch 52: Test zero-dependency TOML parser with single quotes, lists, and typed elements."""
+    # pylint: disable=import-outside-toplevel
+    import builtins
+    from pydoppelgangerhunt import config
+    from pydoppelgangerhunt.coverage import check_asymmetric_coverage, compute_unit_coverage
 
+    toml_file = tmp_path / "extended.toml"
+    toml_content = (
+        "[tool.pydoppelgangerhunt]\n"
+        "single_quoted = 'literal_value'\n"
+        'double_quoted = "standard_value"\n'
+        'exclude = ["dist", \'build\', "venv"]\n'
+        'mixed_list = [1, 2.5, true, false, "alpha", \'beta\']\n'
+        "flag_true = true\n"
+        "flag_false = false\n"
+        "int_val = 42\n"
+        "float_val = 3.14\n"
+    )
+    toml_file.write_text(toml_content, encoding="utf-8")
 
+    # 1. Test via standard parser
+    std_cfg = config.load_toml_section(toml_file, "pydoppelgangerhunt")
+    assert std_cfg.get("single_quoted") == "literal_value"
+    assert std_cfg.get("double_quoted") == "standard_value"
+    assert "dist" in std_cfg.get("exclude", [])
+
+    # 2. Test via zero-dependency line parser fallback
+    orig_import = builtins.__import__
+
+    def mock_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name in ("tomli", "tomllib"):
+            raise ImportError("mocked no toml parser")
+        return orig_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import)
+
+    line_cfg = config.load_toml_section(toml_file, "pydoppelgangerhunt")
+    assert line_cfg.get("single_quoted") == "literal_value"
+    assert line_cfg.get("double_quoted") == "standard_value"
+    assert line_cfg.get("exclude") == ["dist", "build", "venv"]
+    assert line_cfg.get("mixed_list") == [1, 2.5, True, False, "alpha", "beta"]
+    assert line_cfg.get("flag_true") is True
+    assert line_cfg.get("flag_false") is False
+    assert line_cfg.get("int_val") == 42
+    assert line_cfg.get("float_val") == 3.14
+
+    # 3. Coverage helper edge cases
+    assert compute_unit_coverage({}, {"mod.py": {1, 2}}) == 0.0
+    assert compute_unit_coverage({"file": "mod.py", "start": 1, "end": 5}, {}) == 0.0
+    assert compute_unit_coverage({"file": "mod.py", "start": 1, "end": 5}, {"other.py": {1}}) == 0.0
+
+    u_a = {"file": "mod.py", "start": 1, "end": 10}
+    u_b = {"file": "mod.py", "start": 1, "end": 10}
+    cov_data = {"mod.py": {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}}
+    assert check_asymmetric_coverage(u_a, u_b, cov_data, min_diff=0.40) is None
