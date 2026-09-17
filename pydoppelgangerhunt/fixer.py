@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
 
+def _is_mangled_name(name: str) -> bool:
+    """Checks if an identifier is subject to Python private name mangling (__foo, not __foo__)."""
+    return name.startswith("__") and not name.endswith("__") and len(name) > 2
+
+
 def _unfold_receiver_attribute(node: ast.AST) -> Optional[str]:
     """Unfolds chained attribute access on 'self' or 'cls' (e.g. self.config.timeout -> 'self.config.timeout')."""
     parts: List[str] = []
@@ -67,6 +72,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.has_return: bool = False
         self.has_yield: bool = False
         self.has_super: bool = False
+        self.has_mangled_names: bool = False
         self.naked_breaks: int = 0
         self.naked_continues: int = 0
         self.local_imports: List[str] = []
@@ -288,6 +294,8 @@ class _ScopeVisitor(ast.NodeVisitor):
                 self.read_before_write.append(name)
 
     def visit_Name(self, node: ast.Name) -> None:
+        if self.class_depth == 0 and _is_mangled_name(node.id):
+            self.has_mangled_names = True
         if isinstance(node.ctx, ast.Load):
             self._record_load_name(node.id)
         elif isinstance(node.ctx, ast.Store):
@@ -297,6 +305,8 @@ class _ScopeVisitor(ast.NodeVisitor):
                 self.deleted_names.add(node.id)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
+        if self.class_depth == 0 and _is_mangled_name(node.attr):
+            self.has_mangled_names = True
         attr_name = _unfold_receiver_attribute(node)
         if attr_name is not None:
             receiver_id = attr_name.split(".", 1)[0]
@@ -1223,6 +1233,7 @@ def _inspect_unit_scope(
         "has_yield": False,
         "has_return": False,
         "has_super": False,
+        "has_mangled_names": False,
         "local_imports": [],
         "yield_expr_names": [],
         "is_async": False,
@@ -1401,6 +1412,7 @@ def _inspect_unit_scope(
         "has_yield": visitor.has_yield,
         "has_return": visitor.has_return,
         "has_super": visitor.has_super,
+        "has_mangled_names": visitor.has_mangled_names,
         "local_imports": visitor.local_imports,
         "yield_expr_names": visitor.yield_expr_names,
         "is_async": visitor.is_async,
@@ -1449,6 +1461,7 @@ def analyze_unit_variable_scope(
         has_yield = info1["has_yield"] or info2["has_yield"]
         has_return = info1["has_return"] or info2["has_return"]
         has_super = bool(info1.get("has_super", False) or info2.get("has_super", False))
+        has_mangled = bool(info1.get("has_mangled_names", False) or info2.get("has_mangled_names", False))
         local_imports = list(dict.fromkeys(info1["local_imports"] + info2["local_imports"]))
         yield_expr_names = info1["yield_expr_names"] + info2["yield_expr_names"]
         is_async = info1.get("is_async", False) or info2.get("is_async", False)
@@ -1472,6 +1485,7 @@ def analyze_unit_variable_scope(
         has_yield = info1["has_yield"]
         has_return = info1["has_return"]
         has_super = bool(info1.get("has_super", False))
+        has_mangled = bool(info1.get("has_mangled_names", False))
         local_imports = info1["local_imports"]
         yield_expr_names = info1["yield_expr_names"]
         is_async = info1.get("is_async", False)
@@ -1508,6 +1522,7 @@ def analyze_unit_variable_scope(
         "has_yield": has_yield,
         "has_return": has_return,
         "has_super": has_super,
+        "has_mangled_names": has_mangled,
         "local_imports": local_imports,
         "yield_expr_names": yield_expr_names,
         "is_async": is_async,
@@ -2557,6 +2572,10 @@ def synthesize_shared_helper_code(
     if has_super and (effective_binding == "module" or is_static_clone):
         return ""
 
+    has_mangled = bool(scope1.get("has_mangled_names") or scope2.get("has_mangled_names"))
+    if has_mangled and (effective_binding != "method" or not is_same_class or is_static_clone):
+        return ""
+
     if effective_binding == "module":
         inputs = _prune_unshared_receivers(inputs, u1, u2, scope1, scope2, repo_root=repo_root)
 
@@ -3586,6 +3605,10 @@ def generate_refactoring_patch(
 
         has_super = bool(s1.get("has_super") or s2.get("has_super"))
         if has_super and (effective_binding == "module" or is_static):
+            continue
+
+        has_mangled = bool(s1.get("has_mangled_names") or s2.get("has_mangled_names"))
+        if has_mangled and (effective_binding != "method" or not is_same_class or is_static):
             continue
 
         helper_indent = (

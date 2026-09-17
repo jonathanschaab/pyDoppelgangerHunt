@@ -8351,3 +8351,179 @@ def test_receiver_identical_attributes_accepted_and_executed(tmp_path: Path) -> 
     )
     assert run_proc.returncode == 0, f"run failed: {run_proc.stderr}"
     assert run_proc.stdout.strip() == "150 175 175"
+
+
+def test_mangled_private_attribute_module_binding_rejected(tmp_path: Path) -> None:
+    """Verifies that methods accessing mangled private attributes reject module-level binding."""
+    src = (
+        "class Vault:\n"
+        "    def __init__(self, key: str) -> None:\n"
+        "        self.__key = key\n"
+        "\n"
+        "    def access_alpha(self) -> str:\n"
+        "        tag = 'v1_'\n"
+        "        return tag + self.__key\n"
+        "\n"
+        "    def access_beta(self) -> str:\n"
+        "        tag = 'v1_'\n"
+        "        return tag + self.__key\n"
+    )
+    f = tmp_path / "vault_mod.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {
+        "name": "access_alpha",
+        "file": "vault_mod.py",
+        "start": 5,
+        "end": 7,
+        "kind": "function",
+        "enclosing_class": "Vault",
+    }
+    u2 = {
+        "name": "access_beta",
+        "file": "vault_mod.py",
+        "start": 9,
+        "end": 11,
+        "kind": "function",
+        "enclosing_class": "Vault",
+    }
+
+    helper = synthesize_shared_helper_code(u1, u2, method_binding="module", repo_root=str(tmp_path))
+    assert helper == ""
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        method_binding="module",
+        replace_clones=True,
+    )
+    assert patch == ""
+
+
+def test_mangled_private_attribute_cross_class_rejected(tmp_path: Path) -> None:
+    """Verifies that cross-class clones accessing mangled private attributes are rejected."""
+    src = (
+        "class NodeAlpha:\n"
+        "    def __init__(self, val: int) -> None:\n"
+        "        self.__val = val\n"
+        "    def get_metric(self) -> int:\n"
+        "        scale = 10\n"
+        "        return self.__val * scale\n"
+        "\n"
+        "class NodeBeta:\n"
+        "    def __init__(self, val: int) -> None:\n"
+        "        self.__val = val\n"
+        "    def get_metric(self) -> int:\n"
+        "        scale = 10\n"
+        "        return self.__val * scale\n"
+    )
+    f = tmp_path / "cross_vault.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {
+        "name": "get_metric",
+        "file": "cross_vault.py",
+        "start": 4,
+        "end": 6,
+        "kind": "function",
+        "enclosing_class": "NodeAlpha",
+    }
+    u2 = {
+        "name": "get_metric",
+        "file": "cross_vault.py",
+        "start": 11,
+        "end": 13,
+        "kind": "function",
+        "enclosing_class": "NodeBeta",
+    }
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper == ""
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert patch == ""
+
+
+def test_mangled_private_attribute_same_class_method_binding_accepted_and_executed(
+    tmp_path: Path,
+) -> None:
+    """Verifies that methods accessing mangled attributes within the same class refactor and execute cleanly."""
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    src = (
+        "class SecretHolder:\n"
+        "    def __init__(self, token: str) -> None:\n"
+        "        self.__token = token\n"
+        "\n"
+        "    def reveal_first(self) -> str:\n"
+        "        prefix = 'token:'\n"
+        "        return prefix + self.__token\n"
+        "\n"
+        "    def reveal_second(self) -> str:\n"
+        "        prefix = 'token:'\n"
+        "        return prefix + self.__token\n"
+    )
+    f = tmp_path / "secret_holder.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {
+        "name": "reveal_first",
+        "file": "secret_holder.py",
+        "start": 5,
+        "end": 7,
+        "kind": "function",
+        "enclosing_class": "SecretHolder",
+    }
+    u2 = {
+        "name": "reveal_second",
+        "file": "secret_holder.py",
+        "start": 9,
+        "end": 11,
+        "kind": "function",
+        "enclosing_class": "SecretHolder",
+    }
+
+    helper = synthesize_shared_helper_code(u1, u2, method_binding="method", repo_root=str(tmp_path))
+    assert "def _shared_reveal_first_reveal_second(self) -> str:" in helper
+    assert "return prefix + self.__token" in helper
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        method_binding="method",
+        replace_clones=True,
+    )
+    assert patch != ""
+    assert "return self._shared_reveal_first_reveal_second()" in patch
+
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    run_proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from secret_holder import SecretHolder; "
+            "h = SecretHolder('super_secret_xyz'); "
+            "print(h.reveal_first(), h.reveal_second())",
+        ],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run_proc.returncode == 0, f"run failed: {run_proc.stderr}"
+    assert run_proc.stdout.strip() == "token:super_secret_xyz token:super_secret_xyz"
+
