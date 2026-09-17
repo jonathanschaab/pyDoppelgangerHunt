@@ -6813,6 +6813,148 @@ def test_batch_60_generator_docstring_call_site_and_overlap(tmp_path: Path) -> N
     ) is False
 
 
+def test_batch_61_column_precision_and_diff_robustness() -> None:
+    """Verifies SARIF/annotation column precision, matcher column handling, and diff parser robustness."""
+    from pydoppelgangerhunt.git_diff import parse_git_diff_hunks
+    from pydoppelgangerhunt.matcher import merge_adjacent_clones, suppress_subclones
+    from pydoppelgangerhunt.reporters import format_github_annotations, format_sarif_report
+
+    # 1. format_sarif_report with column bounds
+    u1 = {
+        "file": "src/calc.py",
+        "name": "calc_a",
+        "start": 10,
+        "end": 12,
+        "start_col": 4,
+        "end_col": 28,
+    }
+    u2 = {
+        "file": "src/calc.py",
+        "name": "calc_b",
+        "start": 20,
+        "end": 22,
+        "start_col": 8,
+        "end_col": 32,
+    }
+    sarif = format_sarif_report([(0.95, u1, u2)], target="src", threshold=0.90)
+    loc_region = sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"]
+    rel_region = sarif["runs"][0]["results"][0]["relatedLocations"][0]["physicalLocation"]["region"]
+    assert loc_region["startLine"] == 10
+    assert loc_region["endLine"] == 12
+    assert loc_region["startColumn"] == 5
+    assert loc_region["endColumn"] == 29
+    assert rel_region["startLine"] == 20
+    assert rel_region["endLine"] == 22
+    assert rel_region["startColumn"] == 9
+    assert rel_region["endColumn"] == 33
+
+    # Omitted columns
+    u_no_col = {"file": "src/calc.py", "name": "c", "start": 5, "end": 6}
+    sarif_no_col = format_sarif_report([(0.90, u_no_col, u_no_col)], target="src", threshold=0.90)
+    region_plain = sarif_no_col["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"]
+    assert "startColumn" not in region_plain
+    assert "endColumn" not in region_plain
+
+    # 2. format_github_annotations with column bounds
+    annots = format_github_annotations([(0.95, u1, u2)])
+    assert len(annots) == 2
+    assert "col=5,endColumn=29" in annots[0]
+    assert "col=9,endColumn=33" in annots[1]
+
+    annots_no_col = format_github_annotations([(0.90, u_no_col, u_no_col)])
+    assert "col=" not in annots_no_col[0]
+
+    # 3. merge_adjacent_clones column propagation
+    unit_a1 = {
+        "file": "pkg/mod.py",
+        "name": "foo:block1",
+        "start": 10,
+        "end": 15,
+        "start_col": 4,
+        "end_col": 20,
+        "shingles": {"s1"},
+        "tokens": ["a", "b"],
+        "token_count": 2,
+    }
+    unit_a2 = {
+        "file": "pkg/mod.py",
+        "name": "foo:block2",
+        "start": 16,
+        "end": 20,
+        "start_col": 0,
+        "end_col": 35,
+        "shingles": {"s2"},
+        "tokens": ["c", "d"],
+        "token_count": 2,
+    }
+    unit_b1 = {
+        "file": "pkg/other.py",
+        "name": "bar:block1",
+        "start": 30,
+        "end": 35,
+        "start_col": 8,
+        "end_col": 25,
+        "shingles": {"s1"},
+        "tokens": ["a", "b"],
+        "token_count": 2,
+    }
+    unit_b2 = {
+        "file": "pkg/other.py",
+        "name": "bar:block2",
+        "start": 36,
+        "end": 40,
+        "start_col": 2,
+        "end_col": 40,
+        "shingles": {"s2"},
+        "tokens": ["c", "d"],
+        "token_count": 2,
+    }
+    merged = merge_adjacent_clones([(0.9, unit_a1, unit_b1), (0.9, unit_a2, unit_b2)])
+    assert len(merged) == 1
+    m_sim, m_u1, m_u2 = merged[0]
+    assert m_sim >= 0.0
+    assert m_u1["start"] == 10 and m_u1["end"] == 20
+    assert m_u1["start_col"] == 4 and m_u1["end_col"] == 35
+    assert m_u2["start"] == 30 and m_u2["end"] == 40
+    assert m_u2["start_col"] == 8 and m_u2["end_col"] == 40
+
+    # 4. suppress_subclones column awareness
+    p1 = {"file": "mod.py", "name": "stmt1", "start": 10, "end": 10, "start_col": 0, "end_col": 80}
+    p2 = {"file": "mod.py", "name": "stmt2", "start": 20, "end": 20, "start_col": 0, "end_col": 80}
+    c1 = {"file": "mod.py", "name": "expr1", "start": 10, "end": 10, "start_col": 15, "end_col": 40}
+    c2 = {"file": "mod.py", "name": "expr2", "start": 20, "end": 20, "start_col": 15, "end_col": 40}
+
+    # Child is strictly inside column bounds of parent -> suppressed
+    surviving = suppress_subclones([(0.95, p1, p2), (0.92, c1, c2)])
+    assert len(surviving) == 1
+    assert surviving[0][1]["name"] == "stmt1"
+
+    # Child with wider column bounds than parent -> NOT suppressed
+    c_wide = {"file": "mod.py", "name": "wide1", "start": 10, "end": 10, "start_col": 0, "end_col": 90}
+    not_suppressed = suppress_subclones([(0.95, p1, p2), (0.92, c_wide, c2)])
+    assert len(not_suppressed) == 2
+
+    # 5. parse_git_diff_hunks robustness
+    diff_sample = (
+        "--- a/src/util.py\t2026-09-17 10:00:00\n"
+        "+++ b/src/util.py\t2026-09-17 11:00:00\n"
+        "@@ -10,2 +10,5 @@ def f():\n"
+        "--- /dev/null\n"
+        '+++ "b/path with space/module.py"\n'
+        "@@ -0,0 +1,10 @@\n"
+        "--- a/corrupt.py\n"
+        "+++ b/corrupt.py\n"
+        "@@ -bad +corrupt,spec @@\n"
+    )
+    hunks = parse_git_diff_hunks(diff_sample)
+    assert "src/util.py" in hunks
+    assert hunks["src/util.py"] == [(10, 14)]
+    assert "path with space/module.py" in hunks
+    assert hunks["path with space/module.py"] == [(1, 10)]
+    assert "corrupt.py" not in hunks
+
+
+
 
 
 

@@ -192,6 +192,24 @@ def format_sarif_report(
             f"is {sim:.1%} structurally identical to '{n2}' in {f2_norm}:{s2}-{e2} "
             f"(threshold >= {threshold:.0%})."
         )
+        r1: Dict[str, Any] = {
+            "startLine": s1,
+            "endLine": e1,
+        }
+        if u1.get("start_col") is not None:
+            r1["startColumn"] = max(1, int(u1["start_col"]) + 1)
+        if u1.get("end_col") is not None:
+            r1["endColumn"] = max(1, int(u1["end_col"]) + 1)
+
+        r2: Dict[str, Any] = {
+            "startLine": s2,
+            "endLine": e2,
+        }
+        if u2.get("start_col") is not None:
+            r2["startColumn"] = max(1, int(u2["start_col"]) + 1)
+        if u2.get("end_col") is not None:
+            r2["endColumn"] = max(1, int(u2["end_col"]) + 1)
+
         result_item: Dict[str, Any] = {
             "ruleId": rule_id,
             "ruleIndex": 0,
@@ -204,10 +222,7 @@ def format_sarif_report(
                             "uri": f1_norm,
                             "uriBaseId": "%SRCROOT%",
                         },
-                        "region": {
-                            "startLine": s1,
-                            "endLine": e1,
-                        },
+                        "region": r1,
                     }
                 }
             ],
@@ -220,10 +235,7 @@ def format_sarif_report(
                             "uri": f2_norm,
                             "uriBaseId": "%SRCROOT%",
                         },
-                        "region": {
-                            "startLine": s2,
-                            "endLine": e2,
-                        },
+                        "region": r2,
                     },
                 }
             ],
@@ -405,12 +417,22 @@ def format_github_annotations(
         n1 = str(u1.get("name") or "unit1")
         n2 = str(u2.get("name") or "unit2")
         msg1 = f"Structural clone ({sim:.1%}) matching {f2}:{s2}-{e2} ({n2})"
+        col_part1 = ""
+        if u1.get("start_col") is not None:
+            col_part1 += f",col={max(1, int(u1['start_col']) + 1)}"
+            if u1.get("end_col") is not None:
+                col_part1 += f",endColumn={max(1, int(u1['end_col']) + 1)}"
         annotations.append(
-            f"::warning file={f1},line={s1},endLine={e1},title=pyDoppelgangerHunt Duplicate Code::{msg1}"
+            f"::warning file={f1},line={s1},endLine={e1}{col_part1},title=pyDoppelgangerHunt Duplicate Code::{msg1}"
         )
         msg2 = f"Structural clone ({sim:.1%}) matching {f1}:{s1}-{e1} ({n1})"
+        col_part2 = ""
+        if u2.get("start_col") is not None:
+            col_part2 += f",col={max(1, int(u2['start_col']) + 1)}"
+            if u2.get("end_col") is not None:
+                col_part2 += f",endColumn={max(1, int(u2['end_col']) + 1)}"
         annotations.append(
-            f"::warning file={f2},line={s2},endLine={e2},title=pyDoppelgangerHunt Duplicate Code::{msg2}"
+            f"::warning file={f2},line={s2},endLine={e2}{col_part2},title=pyDoppelgangerHunt Duplicate Code::{msg2}"
         )
     return annotations
 

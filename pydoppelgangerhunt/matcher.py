@@ -214,6 +214,58 @@ def compute_pair_similarity(
     return jaccard_similarity(u1.get("shingles", set()), u2.get("shingles", set()))
 
 
+def _update_merged_unit_columns(
+    target_unit: Dict[str, Any],
+    donor_unit: Dict[str, Any],
+    target_start: int,
+    target_end: int,
+    donor_start: int,
+    donor_end: int,
+) -> None:
+    """Propagates outer column boundaries when merging two adjacent or overlapping units."""
+    for key, d_pos, t_pos, is_expanded, agg in (
+        ("start_col", donor_start, target_start, donor_start < target_start, min),
+        ("end_col", donor_end, target_end, donor_end > target_end, max),
+    ):
+        if is_expanded:
+            target_unit[key] = donor_unit.get(key)
+        elif d_pos == t_pos and donor_unit.get(key) is not None:
+            curr_val = target_unit.get(key)
+            donor_val = donor_unit[key]
+            target_unit[key] = agg(curr_val, donor_val) if curr_val is not None else donor_val
+
+
+def _check_column_bounds_relationship(
+    p_start: int,
+    p_end: int,
+    c_start: int,
+    c_end: int,
+    p_unit: Dict[str, Any],
+    c_unit: Dict[str, Any],
+) -> Tuple[bool, bool]:
+    """Evaluates whether child unit columns are enclosed within and/or strictly smaller than parent.
+
+    Returns:
+        A tuple of (is_enclosed, is_strictly_smaller).
+    """
+    p_sc, c_sc = p_unit.get("start_col"), c_unit.get("start_col")
+    p_ec, c_ec = p_unit.get("end_col"), c_unit.get("end_col")
+
+    if c_start == p_start and p_sc is not None and c_sc is not None:
+        if int(c_sc) < int(p_sc):
+            return False, False
+
+    if c_end == p_end and p_ec is not None and c_ec is not None:
+        if int(c_ec) > int(p_ec):
+            return False, False
+
+    strictly_smaller = (
+        (c_start == p_start and p_sc is not None and c_sc is not None and int(c_sc) > int(p_sc))
+        or (c_end == p_end and p_ec is not None and c_ec is not None and int(c_ec) < int(p_ec))
+    )
+    return True, strictly_smaller
+
+
 def merge_adjacent_clones(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     line_tolerance: int = 2,
@@ -293,6 +345,9 @@ def merge_adjacent_clones(
                 if not (adj1 and adj2):
                     continue
 
+                _update_merged_unit_columns(
+                    current_u1, u1_b, curr_u1_start, curr_u1_end, u1_b_start, u1_b_end
+                )
                 current_u1["start"] = min(curr_u1_start, u1_b_start)
                 current_u1["end"] = max(curr_u1_end, u1_b_end)
                 current_u1["lines"] = current_u1["end"] - current_u1["start"] + 1
@@ -311,6 +366,9 @@ def merge_adjacent_clones(
                 v1_b = u1_b.get("vector", {})
                 current_u1["vector"] = {k: v1_a.get(k, 0) + v1_b.get(k, 0) for k in set(v1_a).union(v1_b)}
 
+                _update_merged_unit_columns(
+                    current_u2, u2_b, curr_u2_start, curr_u2_end, u2_b_start, u2_b_end
+                )
                 current_u2["start"] = min(curr_u2_start, u2_b_start)
                 current_u2["end"] = max(curr_u2_end, u2_b_end)
                 current_u2["lines"] = current_u2["end"] - current_u2["start"] + 1
@@ -400,9 +458,21 @@ def suppress_subclones(
             if not (c1_enclosed and c2_enclosed):
                 continue
 
+            enc1, small1 = _check_column_bounds_relationship(
+                p1_start, p1_end, c1_start, c1_end, p1, c1_corr
+            )
+            if not enc1:
+                continue
+
+            enc2, small2 = _check_column_bounds_relationship(
+                p2_start, p2_end, c2_start, c2_end, p2, c2_corr
+            )
+            if not enc2:
+                continue
+
             is_strictly_smaller = (
-                (c1_start > p1_start or c1_end < p1_end)
-                or (c2_start > p2_start or c2_end < p2_end)
+                (c1_start > p1_start or c1_end < p1_end or small1)
+                or (c2_start > p2_start or c2_end < p2_end or small2)
             )
             if not is_strictly_smaller:
                 continue

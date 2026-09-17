@@ -39,26 +39,33 @@ def parse_git_diff_hunks(diff_text: str) -> Dict[str, List[Tuple[int, int]]]:
             current_file = None
         elif line.startswith("+++ "):
             rest = line[4:].strip()
+            if "\t" in rest:
+                rest = rest.split("\t", 1)[0].strip()
+            if rest.startswith('"') and rest.endswith('"') and len(rest) >= 2:
+                rest = rest[1:-1]
             if rest in ("/dev/null", ""):
                 current_file = None
             else:
                 if len(rest) > 2 and rest[1] == "/" and rest[0] in "biwc":
                     rest = rest[2:]
-                current_file = normalize_path_string(rest, strip_anchor=False)
+                current_file = normalize_path_string(rest.strip('"'), strip_anchor=False)
         elif line.startswith("@@ ") and current_file:
             parts = line.split(" ")
             plus_parts = [p for p in parts if p.startswith("+")]
             if plus_parts:
                 hunk_spec = plus_parts[0][1:]
-                if "," in hunk_spec:
-                    start_str, count_str = hunk_spec.split(",", 1)
-                    start = int(start_str)
-                    count = int(count_str)
-                else:
-                    start = int(hunk_spec)
-                    count = 1
-                if count > 0:
-                    modified_ranges.setdefault(current_file, []).append((start, start + count - 1))
+                try:
+                    if "," in hunk_spec:
+                        start_str, count_str = hunk_spec.split(",", 1)
+                        start = int(start_str)
+                        count = int(count_str)
+                    else:
+                        start = int(hunk_spec)
+                        count = 1
+                    if count > 0:
+                        modified_ranges.setdefault(current_file, []).append((start, start + count - 1))
+                except ValueError:
+                    pass
 
     return modified_ranges
 
