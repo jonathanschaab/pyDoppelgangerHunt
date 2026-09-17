@@ -46,6 +46,10 @@ BRANCH_NODE_TYPES: Tuple[type, ...] = tuple(
     if cls is not None
 )
 
+TRY_NODE_TYPES: Tuple[type, ...] = tuple(
+    cls for cls in (ast.Try, getattr(ast, "TryStar", None)) if cls is not None
+)
+
 
 def is_boilerplate_node(node: ast.AST) -> bool:
     """Checks if an AST statement node is logging, print, or assertion boilerplate."""
@@ -1350,7 +1354,7 @@ def harvest_file_units(
                         _record_branch("if_branch", stmt.body, s_line)
                         if stmt.orelse:
                             _record_branch("else_branch", stmt.orelse, s_line)
-                    elif isinstance(stmt, (ast.Try, getattr(ast, "TryStar", ()))):
+                    elif isinstance(stmt, TRY_NODE_TYPES):
                         t_line = getattr(stmt, "lineno", 0)
                         for h_idx, handler in enumerate(getattr(stmt, "handlers", [])):
                             h_name = (

@@ -1716,10 +1716,21 @@ def test_global_and_nonlocal_scope_preservation(tmp_path: Path) -> None:
     assert "captured_scale" in scope["nonlocals"]
 
     helper_code = synthesize_shared_helper_code(u_scope, u_scope)
-    # The return-tuple generator must not return globals or nonlocals; scope modifiers must be preserved
-    assert "global global_metric" in helper_code
-    assert "nonlocal captured_scale" in helper_code
-    assert "return" not in helper_code
+    # Synthesis must be declined for nonlocal-dependent units to avoid compile-time SyntaxError
+    assert helper_code == ""
+
+    # Global-only units must preserve global modifiers and avoid return-tuple leakage
+    code_glob = (
+        "def outer():\n"
+        "    global global_metric\n"
+        "    global_metric += 1\n"
+    )
+    src_glob = tmp_path / "scope_glob_src.py"
+    src_glob.write_text(code_glob, encoding="utf-8")
+    u_glob = {"file": str(src_glob), "start": 2, "end": 3, "name": "outer:compound", "kind": "compound_block"}
+    helper_glob = synthesize_shared_helper_code(u_glob, u_glob)
+    assert "global global_metric" in helper_glob
+    assert "return" not in helper_glob
 
 
 def test_comment_and_formatting_preservation(tmp_path: Path) -> None:
@@ -5366,36 +5377,51 @@ def test_conditional_output_which_is_also_input_not_overwritten_with_none(tmp_pa
 
 
 def test_refactoring_patch_global_and_nonlocal_not_assigned_at_call_site(tmp_path: Path) -> None:
-    """Verifies that generate_refactoring_patch does not generate call-site assignments for globals or nonlocals."""
-    code = (
+    """Verifies that generate_refactoring_patch does not generate call-site assignments for globals and declines nonlocals."""
+    code_glob = (
         "total = 0\n"
         "def outer():\n"
-        "    acc = 10\n"
         "    def inner1():\n"
         "        global total\n"
-        "        nonlocal acc\n"
         "        total += 1\n"
-        "        acc += 2\n"
         "    def inner2():\n"
         "        global total\n"
-        "        nonlocal acc\n"
         "        total += 1\n"
-        "        acc += 2\n"
     )
     f = tmp_path / "mod_glob.py"
-    f.write_text(code, encoding="utf-8")
-    u1 = {"file": str(f), "start": 5, "end": 8, "name": "outer:inner1", "kind": "compound_block"}
-    u2 = {"file": str(f), "start": 10, "end": 13, "name": "outer:inner2", "kind": "compound_block"}
+    f.write_text(code_glob, encoding="utf-8")
+    u1 = {"file": str(f), "start": 4, "end": 5, "name": "outer:inner1", "kind": "compound_block"}
+    u2 = {"file": str(f), "start": 7, "end": 8, "name": "outer:inner2", "kind": "compound_block"}
 
     patch = generate_refactoring_patch(
         [(1.0, u1, u2)],
         repo_root=str(tmp_path),
         replace_clones=True,
     )
-    assert "total, acc = _shared" not in patch
     assert "total = _shared" not in patch
-    assert "acc = _shared" not in patch
     assert "_shared" in patch
+
+    # Nonlocal-dependent units must decline patch generation to avoid compile-time SyntaxError
+    code_nl = (
+        "def outer():\n"
+        "    acc = 10\n"
+        "    def inner1():\n"
+        "        nonlocal acc\n"
+        "        acc += 2\n"
+        "    def inner2():\n"
+        "        nonlocal acc\n"
+        "        acc += 2\n"
+    )
+    f_nl = tmp_path / "mod_nl.py"
+    f_nl.write_text(code_nl, encoding="utf-8")
+    u1_nl = {"file": str(f_nl), "start": 4, "end": 5, "name": "outer:inner1", "kind": "compound_block"}
+    u2_nl = {"file": str(f_nl), "start": 7, "end": 8, "name": "outer:inner2", "kind": "compound_block"}
+    patch_nl = generate_refactoring_patch(
+        [(1.0, u1_nl, u2_nl)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert patch_nl == ""
 
 
 def test_class_level_comprehension_receiver_kind_is_none(tmp_path: Path) -> None:
@@ -6108,11 +6134,13 @@ def test_batch_38_windows_path_case_insensitivity_and_unicode_resilience(tmp_pat
     pruned = prune_baseline(str(bad_baseline), [])
     assert pruned.pruned_count == 0
 
-    # init_tool_configuration with non-UTF8 pyproject.toml
+    # init_tool_configuration with non-UTF8 pyproject.toml leaves file untouched and uses standalone config
     bad_pyproject = tmp_path / "pyproject.toml"
-    bad_pyproject.write_bytes(b"\x80\xff[project]\nname='bad'\n")
+    bad_bytes = b"\x80\xff[project]\nname='bad'\n"
+    bad_pyproject.write_bytes(bad_bytes)
     res_cfg = init_tool_configuration(str(tmp_path))
-    assert str(bad_pyproject) in res_cfg
+    assert bad_pyproject.read_bytes() == bad_bytes
+    assert ".pydoppelgangerhunt.toml" in res_cfg
 
     # 5. Markdown table escaping for pipe characters in package names
     stats_with_pipe = {

@@ -878,10 +878,11 @@ def test_batch_49_matcher_similarity_and_subclones(tmp_path: Path) -> None:
     # 8. scan_target with workers=2 exercising _worker_harvest_file
     pkg = tmp_path / "parallel_pkg"
     pkg.mkdir()
-    (pkg / "f1.py").write_text("def run_a():\n    x = 10\n    return x\n", encoding="utf-8")
-    (pkg / "f2.py").write_text("def run_b():\n    x = 10\n    return x\n", encoding="utf-8")
+    for idx in range(12):
+        (pkg / f"f{idx}.py").write_text(f"def run_{idx}():\n    x = 10\n    return x\n", encoding="utf-8")
     par_clones = scan_target(str(pkg), threshold=0.8, min_lines=2, min_tokens=3, workers=2)
     assert isinstance(par_clones, list)
+    assert len(par_clones) > 0
 
     task = {
         "file_path": str(pkg / "f1.py"),
@@ -1059,4 +1060,82 @@ def test_batch_59_scan_target_repo_root_and_diff_hunk_prefixes(tmp_path: Path) -
     assert hunks.get("file_i.py") == [(40, 40)]
     assert "deleted.py" not in hunks
     assert "/dev/null" not in hunks
+
+
+def test_batch_70_review_fixes(tmp_path: Path) -> None:
+    """Batch 70: Test TRY_NODE_TYPES compatibility, path-specific exemption isolation, and absolute path normalization."""
+    # pylint: disable=import-outside-toplevel
+    import ast
+    from pydoppelgangerhunt.matcher import (
+        _normalize_exemption_endpoint,
+        scan_target,
+    )
+    from pydoppelgangerhunt.parser import TRY_NODE_TYPES, harvest_file_units
+
+    # 1. TRY_NODE_TYPES verification
+    assert ast.Try in TRY_NODE_TYPES
+    assert () not in TRY_NODE_TYPES
+    assert all(isinstance(t, type) for t in TRY_NODE_TYPES)
+
+    # 2. Path-specific exemption isolation
+    pkg_a = tmp_path / "pkg_a"
+    pkg_b = tmp_path / "pkg_b"
+    pkg_a.mkdir(parents=True, exist_ok=True)
+    pkg_b.mkdir(parents=True, exist_ok=True)
+
+    code_body = "def compute(x: int) -> int:\n    a = x * 10\n    b = a + 5\n    c = b * 2\n    return c\n"
+    (pkg_a / "service.py").write_text(code_body, encoding="utf-8")
+    (pkg_b / "service.py").write_text(code_body, encoding="utf-8")
+    (tmp_path / "other.py").write_text(code_body, encoding="utf-8")
+
+    # Path-specific exemption for pkg_a should not suppress pkg_b
+    exempt_pair = ("pkg_a/service.py:compute", "other.py:compute")
+    clones = scan_target(str(tmp_path), exemptions=[exempt_pair], threshold=0.8, min_lines=3)
+    has_pkg_b_other = any(
+        ("pkg_b" in str(u1.get("file")) and "other.py" in str(u2.get("file")))
+        or ("other.py" in str(u1.get("file")) and "pkg_b" in str(u2.get("file")))
+        for _, u1, u2 in clones
+    )
+    assert has_pkg_b_other, "pkg_b/service.py should not be suppressed by pkg_a/service.py exemption"
+
+    has_pkg_a_other = any(
+        ("pkg_a" in str(u1.get("file")) and "other.py" in str(u2.get("file")))
+        or ("other.py" in str(u1.get("file")) and "pkg_a" in str(u2.get("file")))
+        for _, u1, u2 in clones
+    )
+    assert not has_pkg_a_other, "pkg_a/service.py should be suppressed by pkg_a exemption"
+
+    # 3. Basename-only exemption suppresses across all packages
+    base_exempt_pair = ("service.py:compute", "other.py:compute")
+    clones_base = scan_target(str(tmp_path), exemptions=[base_exempt_pair], threshold=0.8, min_lines=3)
+    has_any_service_other = any(
+        ("service.py" in str(u1.get("file")) and "other.py" in str(u2.get("file")))
+        or ("other.py" in str(u1.get("file")) and "service.py" in str(u2.get("file")))
+        for _, u1, u2 in clones_base
+    )
+    assert not has_any_service_other, "service.py basename exemption should suppress across all packages"
+
+    # 4. Absolute path exemption normalization
+    abs_f = str((pkg_a / "service.py").resolve())
+    norm_ep = _normalize_exemption_endpoint(f"{abs_f}:compute", repo_root=tmp_path)
+    assert not norm_ep.startswith("/")
+    assert "pkg_a/service.py:compute" in norm_ep or "pkg_a" in norm_ep
+
+    # 5. harvest_file_units with clause_level=True parses Try statements safely
+    try_code = (
+        "def try_flow(x):\n"
+        "    try:\n"
+        "        return 1 / x\n"
+        "    except ZeroDivisionError:\n"
+        "        return 0\n"
+        "    else:\n"
+        "        pass\n"
+        "    finally:\n"
+        "        pass\n"
+    )
+    try_file = tmp_path / "try_test.py"
+    try_file.write_text(try_code, encoding="utf-8")
+    try_units = harvest_file_units(str(try_file), str(tmp_path), clause_level=True, min_lines=1, min_tokens=1)
+    assert len(try_units) > 0
+
 

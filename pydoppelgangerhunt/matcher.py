@@ -69,9 +69,18 @@ def _split_exemption_endpoint(ep: str) -> Tuple[str, Optional[str]]:
     return f_part, sym_part
 
 
-def _normalize_exemption_endpoint(ep: str) -> str:
-    """Normalizes an exemption endpoint by normalizing only the file portion, preserving symbol casing."""
+def _normalize_exemption_endpoint(
+    ep: str, repo_root: Optional[Union[str, Path]] = None
+) -> str:
+    """Normalizes an exemption endpoint by normalizing the file portion relative to repo root."""
     f_part, sym_part = _split_exemption_endpoint(ep)
+    if repo_root is not None:
+        try:
+            p = Path(f_part)
+            if p.is_absolute():
+                f_part = str(p.resolve().relative_to(Path(repo_root).resolve()))
+        except (ValueError, OSError):
+            pass
     norm_file = _normalize_matcher_file(f_part)
     if sym_part is not None:
         return f"{norm_file}:{sym_part}"
@@ -670,19 +679,25 @@ def scan_target(
 
     raw_exemptions = exemptions if exemptions is not None else []
     normalized_exemptions: Set[Tuple[str, str]] = set()
+    basename_exemptions: Set[Tuple[str, str]] = set()
     for pair in raw_exemptions:
         if len(pair) == 2:
             k1, k2 = pair
-            ep1 = _normalize_exemption_endpoint(k1)
-            ep2 = _normalize_exemption_endpoint(k2)
+            ep1 = _normalize_exemption_endpoint(k1, repo_root=effective_repo_root)
+            ep2 = _normalize_exemption_endpoint(k2, repo_root=effective_repo_root)
             normalized_exemptions.add(_sorted_pair(ep1, ep2))
             f1_part, sym1 = _split_exemption_endpoint(ep1)
             f2_part, sym2 = _split_exemption_endpoint(ep2)
-            base_f1 = os.path.basename(f1_part)
-            base_f2 = os.path.basename(f2_part)
-            b1 = f"{base_f1}:{sym1}" if sym1 is not None else base_f1
-            b2 = f"{base_f2}:{sym2}" if sym2 is not None else base_f2
-            normalized_exemptions.add(_sorted_pair(b1, b2))
+            k1_file, _ = _split_exemption_endpoint(k1)
+            k2_file, _ = _split_exemption_endpoint(k2)
+            has_dir1 = ("/" in k1_file or "\\" in k1_file) and not (len(k1_file) == 1 and k1_file.isalpha())
+            has_dir2 = ("/" in k2_file or "\\" in k2_file) and not (len(k2_file) == 1 and k2_file.isalpha())
+            if not has_dir1 and not has_dir2:
+                base_f1 = os.path.basename(f1_part)
+                base_f2 = os.path.basename(f2_part)
+                b1 = f"{base_f1}:{sym1}" if sym1 is not None else base_f1
+                b2 = f"{base_f2}:{sym2}" if sym2 is not None else base_f2
+                basename_exemptions.add(_sorted_pair(b1, b2))
 
     target_norm = target_dir.replace("\\", "/").strip("./").rstrip("/")
     target_pfx = f"{target_norm}/" if target_norm and target_norm != "." else ""
@@ -732,17 +747,24 @@ def scan_target(
 
         pair_id_rel = _sorted_pair(f"{f1}:{u1['name']}", f"{f2}:{u2['name']}")
         pair_id_pkg = _sorted_pair(f"{f1_pkg}:{u1['name']}", f"{f2_pkg}:{u2['name']}")
-        pair_id_base = _sorted_pair(f"{os.path.basename(f1)}:{u1['name']}", f"{os.path.basename(f2)}:{u2['name']}")
         pair_id_file = _sorted_pair(f1, f2)
-        pair_id_file_base = _sorted_pair(os.path.basename(f1), os.path.basename(f2))
+        pair_id_file_pkg = _sorted_pair(f1_pkg, f2_pkg)
         if (
             pair_id_rel in normalized_exemptions
             or pair_id_pkg in normalized_exemptions
-            or pair_id_base in normalized_exemptions
             or pair_id_file in normalized_exemptions
-            or pair_id_file_base in normalized_exemptions
+            or pair_id_file_pkg in normalized_exemptions
         ):
             continue
+
+        if basename_exemptions:
+            pair_id_base = _sorted_pair(
+                f"{os.path.basename(f1)}:{u1['name']}",
+                f"{os.path.basename(f2)}:{u2['name']}",
+            )
+            pair_id_file_base = _sorted_pair(os.path.basename(f1), os.path.basename(f2))
+            if pair_id_base in basename_exemptions or pair_id_file_base in basename_exemptions:
+                continue
 
         sim = compute_pair_similarity(
             u1,

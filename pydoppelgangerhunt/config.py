@@ -318,14 +318,15 @@ def init_tool_configuration(target_dir: str = ".") -> str:
     pyproject_path = Path(target_dir) / "pyproject.toml"
     if pyproject_path.exists():
         try:
-            content = pyproject_path.read_text(encoding="utf-8")
+            content: Optional[str] = pyproject_path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
-            content = ""
-        if "[tool.pydoppelgangerhunt]" in content:
-            return f"{pyproject_path} (already configured)"
-        with open(pyproject_path, "a", encoding="utf-8") as fh:
-            fh.write("\n" + DEFAULT_TOOL_TOML_CONTENT)
-        return str(pyproject_path)
+            content = None
+        if content is not None:
+            if "[tool.pydoppelgangerhunt]" in content:
+                return f"{pyproject_path} (already configured)"
+            with open(pyproject_path, "a", encoding="utf-8") as fh:
+                fh.write("\n" + DEFAULT_TOOL_TOML_CONTENT)
+            return str(pyproject_path)
 
     standalone_path = Path(target_dir) / ".pydoppelgangerhunt.toml"
     standalone_path.write_text(DEFAULT_TOOL_TOML_CONTENT, encoding="utf-8")

@@ -2455,6 +2455,8 @@ def synthesize_shared_helper_code(
         return ""
     if bool(scope1.get("has_yield")) != bool(scope2.get("has_yield")):
         return ""
+    if scope1.get("nonlocals") or scope2.get("nonlocals") or scope.get("nonlocals"):
+        return ""
 
     is_static_clone = bool(
         is_static
@@ -2541,10 +2543,6 @@ def synthesize_shared_helper_code(
         g_vars = sorted(set(scope["globals"]))
         if not any(ln.strip().startswith("global ") for ln in common_lines):
             prefix_stmts.append(f"global {', '.join(g_vars)}")
-    if scope.get("nonlocals"):
-        nl_vars = sorted(set(scope["nonlocals"]))
-        if not any(ln.strip().startswith("nonlocal ") for ln in common_lines):
-            prefix_stmts.append(f"nonlocal {', '.join(nl_vars)}")
     for out_var in helper_outputs:
         if out_var in conditional_outs and out_var not in inputs:
             prefix_stmts.append(f"{out_var} = None")
@@ -3232,6 +3230,8 @@ def generate_refactoring_patch(
         if bool(s1.get("is_async")) != bool(s2.get("is_async")):
             continue
         if bool(s1.get("has_yield")) != bool(s2.get("has_yield")):
+            continue
+        if s1.get("nonlocals") or s2.get("nonlocals"):
             continue
 
         hazards1 = set(s1.get("control_flow_hazards", []))
