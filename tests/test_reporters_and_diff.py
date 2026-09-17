@@ -5330,3 +5330,19 @@ def test_undefined_variable_deletion_does_not_create_conditional() -> None:
     d, c = _analyze_block_assignment(ast.parse(code).body)
     assert "z" not in d
     assert "z" not in c
+
+
+def test_conditional_output_which_is_also_input_not_overwritten_with_none(tmp_path: Path) -> None:
+    """Verifies that when a conditional output is also an input parameter, it is not initialized to None."""
+    code1 = (
+        "def compute(flag, total):\n"
+        "    if flag:\n"
+        "        total = total + 10\n"
+        "    return total\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f1.write_text(code1, encoding="utf-8")
+    u1 = {"file": str(f1), "start": 2, "end": 3, "name": "compute:If", "kind": "compound_block"}
+    helper = synthesize_shared_helper_code(u1, u1, repo_root=str(tmp_path))
+    assert "total = None" not in helper
+    assert "total: Any" in helper or "total" in helper

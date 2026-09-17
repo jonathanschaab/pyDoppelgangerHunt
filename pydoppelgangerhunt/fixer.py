@@ -2381,8 +2381,9 @@ def synthesize_shared_helper_code(
         nl_vars = sorted(set(scope["nonlocals"]))
         if not any(ln.strip().startswith("nonlocal ") for ln in common_lines):
             prefix_stmts.append(f"nonlocal {', '.join(nl_vars)}")
-    for out_var in scope.get("conditional_outputs", []):
-        prefix_stmts.append(f"{out_var} = None")
+    for out_var in helper_outputs:
+        if out_var in conditional_outs and out_var not in inputs:
+            prefix_stmts.append(f"{out_var} = None")
 
     if prefix_stmts:
         common_lines = prefix_stmts + common_lines
