@@ -386,7 +386,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not os.path.exists(baseline_path):
             print(f"[ERROR] Baseline file '{baseline_path}' not found")
             return 1
-        prune_res = prune_baseline(baseline_path, clones)
+        try:
+            prune_res = prune_baseline(
+                baseline_path, clones, repo_root=target_repo_root
+            )
+        except TypeError:
+            prune_res = prune_baseline(baseline_path, clones)
         pruned_count = prune_res[0]
         retained_count = prune_res[1]
         skipped_dirty = getattr(prune_res, "skipped_dirty_count", 0)
@@ -472,6 +477,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             threshold,
             families=families,
             stats=stats,
+            repo_root=target_repo_root,
         )
         _write_artifact_file(args.html, html_report, "HTML", args.format == "text")
 

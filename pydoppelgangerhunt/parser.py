@@ -289,9 +289,9 @@ def _walk_ast_nodes(
 ) -> List[ast.AST]:
     """Traverses AST nodes in BFS order, optionally omitting annotations, boilerplate, or abstracting expressions."""
     nodes: List[ast.AST] = []
-    todo: List[ast.AST] = [root]
+    todo: deque[ast.AST] = deque([root])
     while todo:
-        node = todo.pop(0)
+        node = todo.popleft()
         if filter_boilerplate and is_boilerplate_node(node):
             continue
         nodes.append(node)

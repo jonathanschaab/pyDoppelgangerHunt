@@ -421,8 +421,14 @@ def generate_html_report(
     threshold: float,
     families: Optional[List[Dict[str, Any]]] = None,
     stats: Optional[Dict[str, Any]] = None,
+    repo_root: Optional[str] = None,
 ) -> str:
     """Generates a standalone, self-contained interactive HTML audit report."""
+    effective_repo_root = (
+        repo_root
+        if repo_root is not None
+        else (target if os.path.isdir(target) else (os.path.dirname(target) or None))
+    )
     dry_score = stats["dry_score"] if stats else 100.0
     grade = stats["grade"] if stats else "A+"
     sloc = stats["sloc"] if stats else 0
@@ -435,8 +441,8 @@ def generate_html_report(
 
     cards_html: List[str] = []
     for idx, (sim, u1, u2) in enumerate(clones, 1):
-        diff_txt = generate_clone_diff(u1, u2)
-        sug_txt = synthesize_refactoring_suggestion(u1, u2)
+        diff_txt = generate_clone_diff(u1, u2, repo_root=effective_repo_root)
+        sug_txt = synthesize_refactoring_suggestion(u1, u2, repo_root=effective_repo_root)
         diff_block = (
             f"<pre class='diff'><code>{html.escape(diff_txt)}</code></pre>" if diff_txt else "<em>No textual diff</em>"
         )

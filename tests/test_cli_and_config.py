@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Optional
 import pydoppelgangerhunt
 
 from pydoppelgangerhunt import (
@@ -592,3 +592,103 @@ def test_batch_53_cli_method_binding_and_repo_root(tmp_path: Path) -> None:
     assert dry_stats["duplication_pct"] == 100.0
     assert dry_stats["dry_score"] == 0.0
     assert dry_stats["grade"] == "F"
+
+
+def test_batch_55_baseline_prune_repo_root_and_html_reporter(tmp_path: Path) -> None:
+    """Batch 55: Test prune_baseline repo_root, generate_html_report repo_root, and deque AST walk."""
+    # pylint: disable=import-outside-toplevel
+    import ast
+    from unittest import mock
+    from pydoppelgangerhunt.baseline import prune_baseline, record_baseline
+    from pydoppelgangerhunt.parser import _walk_ast_nodes
+    from pydoppelgangerhunt.reporters import generate_html_report
+
+    # 1. Test _walk_ast_nodes with deque BFS traversal
+    sample_ast = ast.parse("def sample(a):\n    if a > 0:\n        return a * 2\n    return 0\n")
+    walked_nodes = _walk_ast_nodes(sample_ast)
+    assert len(walked_nodes) > 5
+    assert isinstance(walked_nodes[0], ast.Module)
+    assert isinstance(walked_nodes[1], ast.FunctionDef)
+
+    # 2. Test prune_baseline forwarding repo_root to get_git_modified_line_ranges
+    sub_repo = tmp_path / "batch55_sub"
+    sub_repo.mkdir()
+    f1 = sub_repo / "src_a.py"
+    f2 = sub_repo / "src_b.py"
+    code1 = (
+        "def calc_one(x, y):\n"
+        "    res = x * 10 + y * 20\n"
+        "    val = res ** 2\n"
+        "    return val + 1\n"
+    )
+    code2 = (
+        "def calc_two(x, y):\n"
+        "    res = x * 10 + y * 20\n"
+        "    val = res ** 2\n"
+        "    return val + 1\n"
+    )
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+
+    u1 = {"file": "src_a.py", "start": 1, "end": 4, "name": "calc_one", "tokens": ["def", "calc_one"]}
+    u2 = {"file": "src_b.py", "start": 1, "end": 4, "name": "calc_two", "tokens": ["def", "calc_two"]}
+    clones = [(1.0, u1, u2)]
+
+    base_file = sub_repo / "baseline.json"
+    record_baseline(clones, str(base_file), str(sub_repo), 0.90)
+    assert base_file.exists()
+
+    with mock.patch("pydoppelgangerhunt.git_diff.get_git_modified_line_ranges") as mock_git:
+        mock_git.return_value = {"src_a.py": [(1, 4)]}
+        res = prune_baseline(str(base_file), active_clones=[], repo_root=str(sub_repo))
+        assert res.skipped_dirty_count == 1
+        assert res.retained_count == 1
+        mock_git.assert_called_once_with(since_ref=None, repo_root=str(sub_repo))
+
+    # Test prune_baseline fallback when git function raises TypeError
+    with mock.patch("pydoppelgangerhunt.git_diff.get_git_modified_line_ranges") as mock_git_err:
+        def _err_call(since_ref: Optional[str] = None, **kwargs: Any) -> Dict[str, Any]:
+            if "repo_root" in kwargs:
+                raise TypeError("unexpected keyword argument 'repo_root'")
+            return {}
+        mock_git_err.side_effect = _err_call
+        res_fallback = prune_baseline(str(base_file), active_clones=[], repo_root=str(sub_repo))
+        assert res_fallback.pruned_count == 1
+        assert res_fallback.retained_count == 0
+
+    # 3. Test generate_html_report with explicit repo_root and target subfolder
+    record_baseline(clones, str(base_file), str(sub_repo), 0.90)
+    html_out = generate_html_report(clones, target=str(sub_repo), threshold=0.90, repo_root=str(sub_repo))
+    assert "calc_one" in html_out
+    assert "calc_two" in html_out
+    assert "res ** 2" in html_out
+
+    # 4. Test CLI integration with --prune-baseline and --html forwarding target_repo_root
+    html_file = sub_repo / "report.html"
+    cli_code = pydoppelgangerhunt.main([
+        str(sub_repo),
+        "--threshold", "0.80",
+        "--min-lines", "3",
+        "--min-tokens", "5",
+        "--html", str(html_file),
+    ])
+    assert cli_code == 1
+    assert html_file.exists()
+    html_content = html_file.read_text(encoding="utf-8")
+    assert "calc_one" in html_content
+    assert "calc_two" in html_content
+
+    # 5. Test CLI prune-baseline with dirty unstaged check
+    f2.write_text("def different_function():\n    return 42\n", encoding="utf-8")
+    norm_f1 = str(f1.resolve()).replace("\\", "/")
+    with mock.patch("pydoppelgangerhunt.git_diff.get_git_modified_line_ranges") as mock_git_cli:
+        mock_git_cli.return_value = {norm_f1: [(1, 4)]}
+        cli_prune_code = pydoppelgangerhunt.main([
+            str(sub_repo),
+            "--threshold", "0.80",
+            "--min-lines", "3",
+            "--min-tokens", "5",
+            "--baseline", str(base_file),
+            "--prune-baseline",
+        ])
+        assert cli_prune_code == 0

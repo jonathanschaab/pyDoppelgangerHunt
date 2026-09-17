@@ -349,6 +349,7 @@ def prune_baseline(
     baseline_path: str,
     active_clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     unstaged_modified_ranges: Optional[Dict[str, List[Tuple[int, int]]]] = None,
+    repo_root: Optional[str] = None,
 ) -> PruneResult:
     """Prunes dead or refactored clone fingerprints from an existing baseline file.
 
@@ -371,7 +372,12 @@ def prune_baseline(
         try:
             # pylint: disable=import-outside-toplevel
             from pydoppelgangerhunt.git_diff import get_git_modified_line_ranges
-            unstaged_modified_ranges = get_git_modified_line_ranges(since_ref=None)
+            try:
+                unstaged_modified_ranges = get_git_modified_line_ranges(
+                    since_ref=None, repo_root=repo_root
+                )
+            except TypeError:
+                unstaged_modified_ranges = get_git_modified_line_ranges(since_ref=None)
         except Exception as err:  # pylint: disable=broad-exception-caught
             # Pragmatic fallback when git is unavailable, outside a repo, or query fails
             logger.debug(
