@@ -7285,6 +7285,75 @@ def test_batch_64_control_flow_hazards_and_baseline_pruning(tmp_path: Path) -> N
     assert m2_rec["file_b"] == "pkg/mod2.py"
 
 
+def test_batch_65_git_sha256_diff_prefixes_and_quoted_toml_arrays(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies SHA-256 git blame parsing, git diff prefix determinism, and quote-aware TOML arrays."""
+    from typing import Optional, Sequence  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.config import _parse_toml_array_value  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.coverage import compute_unit_coverage  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.git_diff import (  # pylint: disable=import-outside-toplevel
+        get_git_blame_info,
+        get_git_modified_line_ranges,
+    )
+
+    # 1. Quotation-aware TOML array tokenization with internal commas
+    arr_with_commas = '["path,with,comma", "simple", \'single,quote,comma\', true, false, 42, 3.14]'
+    parsed = _parse_toml_array_value(arr_with_commas)
+    assert parsed == [
+        "path,with,comma",
+        "simple",
+        "single,quote,comma",
+        True,
+        False,
+        42,
+        3.14,
+    ]
+
+    # 2. Git blame parsing on modern SHA-256 (64 hex characters) repositories
+    sha256_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    mock_blame = (
+        f"{sha256_hash} 1 1 1\n"
+        f"author Jane Doe\n"
+        f"author-time 1700000000\n"
+        f"summary Feature implementation\n"
+        f"filename test.py\n"
+        f"\tprint('hello')\n"
+    )
+
+    def mock_run_blame(args: Sequence[str], cwd: Optional[str] = None) -> Optional[str]:
+        assert "blame" in args
+        return mock_blame
+
+    monkeypatch.setattr("pydoppelgangerhunt.git_diff._run_git_command", mock_run_blame)
+    blame = get_git_blame_info("test.py", 1, 1)
+    assert blame["author"] == "Jane Doe"
+    assert blame["commit"] == sha256_hash[:8]
+    assert blame["timestamp"] == 1700000000
+    assert blame["summary"] == "Feature implementation"
+
+    # 3. Deterministic diff prefixes passed to git diff
+    captured_args: List[Sequence[str]] = []
+
+    def mock_run_diff(args: Sequence[str], cwd: Optional[str] = None) -> Optional[str]:
+        captured_args.append(args)
+        return "--- a/test.py\n+++ b/test.py\n@@ -1,0 +1,5 @@\n"
+
+    monkeypatch.setattr("pydoppelgangerhunt.git_diff._run_git_command", mock_run_diff)
+    diff_ranges = get_git_modified_line_ranges(since_ref="HEAD~1")
+    assert len(captured_args) == 1
+    assert "--src-prefix=a/" in captured_args[0]
+    assert "--dst-prefix=b/" in captured_args[0]
+    assert "test.py" in diff_ranges
+
+    # 4. Zero-allocation compute_unit_coverage calculation
+    u_cov = {"file": "mod.py", "start": 10, "end": 14}  # 5 lines total
+    cov_data = {"mod.py": {10, 11, 12}}  # 3 of 5 lines covered
+    ratio = compute_unit_coverage(u_cov, cov_data)
+    assert ratio == 0.6
+
+
+
 
 
 

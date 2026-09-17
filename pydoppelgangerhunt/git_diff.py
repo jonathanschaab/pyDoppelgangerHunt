@@ -76,7 +76,7 @@ def get_git_modified_line_ranges(
     cwd: Optional[str] = None,
 ) -> Dict[str, List[Tuple[int, int]]]:
     """Extracts modified line ranges for files using git diff --unified=0."""
-    args = ["diff", "--unified=0"]
+    args = ["diff", "--unified=0", "--src-prefix=a/", "--dst-prefix=b/"]
     if since_ref:
         args.append(since_ref)
 
@@ -216,7 +216,7 @@ def get_git_blame_info(
 
     for line in blame_text.splitlines():
         parts = line.split(" ", 1)
-        if len(parts[0]) == 40 and all(c in "0123456789abcdefABCDEF" for c in parts[0]):
+        if len(parts[0]) in (40, 64) and all(c in "0123456789abcdefABCDEF" for c in parts[0]):
             current_commit = parts[0][:8]
             if latest_commit == "unknown":
                 latest_commit = current_commit

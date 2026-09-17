@@ -173,8 +173,25 @@ def _parse_toml_array_value(val_str: str) -> List[Any]:
     inner = val_str.strip()
     if inner.startswith("[") and inner.endswith("]"):
         inner = inner[1:-1]
-    for e in inner.split(","):
-        e_str = e.strip()
+    raw_tokens: List[str] = []
+    curr: List[str] = []
+    in_quote: Optional[str] = None
+    for ch in inner:
+        if ch in ('"', "'"):
+            if in_quote is None:
+                in_quote = ch
+            elif in_quote == ch:
+                in_quote = None
+            curr.append(ch)
+        elif ch == "," and in_quote is None:
+            raw_tokens.append("".join(curr).strip())
+            curr = []
+        else:
+            curr.append(ch)
+    if curr:
+        raw_tokens.append("".join(curr).strip())
+
+    for e_str in raw_tokens:
         if not e_str:
             continue
         if (e_str.startswith('"') and e_str.endswith('"')) or (

@@ -115,8 +115,11 @@ def compute_unit_coverage(
     if not covered_lines:
         return 0.0
 
-    target_lines = list(range(int(unit.get("start") or 1), int(unit.get("end") or int(unit.get("start") or 1)) + 1))
-    return min(1.0, len(covered_lines.intersection(target_lines)) / float(len(target_lines))) if target_lines else 0.0
+    start = int(unit.get("start") or 1)
+    end = int(unit.get("end") or start)
+    total_lines = max(1, end - start + 1)
+    covered_count = sum(1 for ln in range(start, end + 1) if ln in covered_lines)
+    return min(1.0, covered_count / float(total_lines))
 
 
 def check_asymmetric_coverage(
