@@ -943,3 +943,84 @@ def test_batch_67_cli_and_fixer_decomposition(tmp_path: Path) -> None:
     )
     assert params_kwonly == ["*", "k1: int = 1"]
 
+
+def test_batch_68_cli_patch_replace_and_type_merge_strategy(tmp_path: Path) -> None:
+    """Batch 68: Test CLI --replace-clones and --type-merge-strategy flags and config propagation."""
+    # pylint: disable=import-outside-toplevel
+    from unittest import mock
+    from pydoppelgangerhunt.cli import build_arg_parser
+
+    # 1. Test argument parser
+    parser = build_arg_parser()
+    args_def = parser.parse_args(["target_dir"])
+    assert args_def.replace_clones is False
+    assert args_def.type_merge_strategy is None
+
+    args_custom = parser.parse_args([
+        "target_dir",
+        "--replace-clones",
+        "--type-merge-strategy",
+        "union",
+    ])
+    assert args_custom.replace_clones is True
+    assert args_custom.type_merge_strategy == "union"
+
+    # 2. Test CLI forwarding to generate_refactoring_patch
+    sub_repo = tmp_path / "sub_repo_68"
+    sub_repo.mkdir()
+    code_a = (
+        "def compute_1(x: int, y: int) -> int:\n"
+        "    res = x * 10 + y * 20\n"
+        "    val = res ** 2\n"
+        "    return val + 1\n"
+    )
+    code_b = (
+        "def compute_2(x: float, y: float) -> float:\n"
+        "    res = x * 10 + y * 20\n"
+        "    val = res ** 2\n"
+        "    return val + 1\n"
+    )
+    (sub_repo / "mod_a.py").write_text(code_a, encoding="utf-8")
+    (sub_repo / "mod_b.py").write_text(code_b, encoding="utf-8")
+
+    patch_file = tmp_path / "replace.patch"
+    with mock.patch("pydoppelgangerhunt.cli.generate_refactoring_patch") as mock_patch:
+        mock_patch.return_value = "patch content"
+        exit_code = pydoppelgangerhunt.main([
+            str(sub_repo),
+            "--threshold", "0.80",
+            "--min-lines", "4",
+            "--patch", str(patch_file),
+            "--replace-clones",
+            "--type-merge-strategy", "union",
+        ])
+        assert exit_code == 1
+        mock_patch.assert_called_once()
+        _, kwargs = mock_patch.call_args
+        assert kwargs.get("replace_clones") is True
+        assert kwargs.get("type_merge_strategy") == "union"
+        assert kwargs.get("method_binding") == "auto"
+
+    # 3. Test config file defaults when flags omitted
+    (sub_repo / "pyproject.toml").write_text(
+        """
+[tool.pydoppelgangerhunt]
+threshold = 0.80
+min_lines = 4
+replace_clones = true
+type_merge_strategy = "union"
+""",
+        encoding="utf-8",
+    )
+    with mock.patch("pydoppelgangerhunt.cli.generate_refactoring_patch") as mock_patch_cfg:
+        mock_patch_cfg.return_value = "patch cfg content"
+        exit_code = pydoppelgangerhunt.main([
+            str(sub_repo),
+            "--patch", str(patch_file),
+        ])
+        assert exit_code == 1
+        mock_patch_cfg.assert_called_once()
+        _, kwargs_cfg = mock_patch_cfg.call_args
+        assert kwargs_cfg.get("replace_clones") is True
+        assert kwargs_cfg.get("type_merge_strategy") == "union"
+

@@ -73,6 +73,14 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
     parser.add_argument("--output", "-o", type=str, default=None, help="Output file path to save report")
     parser.add_argument("--html", type=str, default=None, help="Path to write standalone interactive HTML report")
     parser.add_argument("--patch", type=str, default=None, help="Path to write git-apply compatible refactoring patch file")
+    parser.add_argument("--replace-clones", action="store_true", help="Replace clone bodies with calls to the synthesized helper in generated patches")
+    parser.add_argument(
+        "--type-merge-strategy",
+        type=str,
+        choices=["fallback_any", "union"],
+        default=None,
+        help="Type annotation merging strategy for shared helper parameter synthesis ('fallback_any' or 'union'; default: 'fallback_any')",
+    )
     parser.add_argument("--sort-by", choices=["similarity", "priority", "sloc"], default="similarity", help="Sort clones by similarity, priority, or sloc (default: similarity)")
     parser.add_argument("--priority", action="store_true", help="Shortcut to sort clones by Priority score (Similarity * SLOC * Complexity)")
     parser.add_argument("--top", type=int, default=None, help="Truncate report to top N clone pairs")
@@ -402,6 +410,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     raw_binding = args.method_binding or str(tool_cfg.get("method_binding", "auto"))
     method_binding = raw_binding if raw_binding in ("auto", "method", "module") else "auto"
+    replace_clones = args.replace_clones or bool(tool_cfg.get("replace_clones", False))
+    raw_strategy = args.type_merge_strategy or str(tool_cfg.get("type_merge_strategy", "fallback_any"))
+    type_merge_strategy = raw_strategy if raw_strategy in ("fallback_any", "union") else "fallback_any"
 
     if args.type4 and _run_type4_semantic_audit(target, excludes, args.strict_type4, use_color):
         return 1
@@ -578,6 +589,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             generate_refactoring_patch(
                 clones,
                 repo_root=target_repo_root,
+                type_merge_strategy=type_merge_strategy,
+                replace_clones=replace_clones,
                 method_binding=method_binding,
             )
             if clones
