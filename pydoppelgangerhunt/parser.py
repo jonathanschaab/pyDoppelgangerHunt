@@ -6,8 +6,9 @@ import ast
 import builtins
 import hashlib
 import json
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
@@ -992,6 +993,16 @@ def harvest_notebook_units(
     return units
 
 
+def _iter_local_nodes(root: ast.AST) -> Iterator[ast.AST]:
+    """Iterates through descendant AST nodes without crossing nested function or class definitions."""
+    todo = deque(ast.iter_child_nodes(root))
+    while todo:
+        current = todo.popleft()
+        yield current
+        if not isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            todo.extend(ast.iter_child_nodes(current))
+
+
 def harvest_file_units(
     file_path: str,
     repo_root: str,
@@ -1136,7 +1147,7 @@ def harvest_file_units(
                 )
 
             if not functions_only:
-                for item in ast.walk(node):
+                for item in _iter_local_nodes(node):
                     if item is not node and isinstance(
                         item,
                         (
@@ -1209,7 +1220,7 @@ def harvest_file_units(
                         )
 
             if clause_level and hasattr(node, "body"):
-                for stmt in ast.walk(node):
+                for stmt in _iter_local_nodes(node):
                     if isinstance(stmt, ast.If):
                         s_line = getattr(stmt, "lineno", 0)
                         _record_clause_branch(

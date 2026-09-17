@@ -2824,7 +2824,7 @@ def _build_whole_method_delegation(
                 elif node.name in (raw_u_name, base_u_name) and earliest_start <= u_start <= n_end:
                     cand_nodes.append((n_end - earliest_start + 1, node))
         if cand_nodes:
-            cand_nodes.sort(key=lambda item: item[0])
+            cand_nodes.sort(key=lambda item: (item[0], -getattr(item[1], "lineno", 0)))
             matched_node = cand_nodes[0][1]
             if matched_node.body:
                 b_cand_lines = [

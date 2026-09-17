@@ -5784,6 +5784,73 @@ def test_batch_32_exhaustive_review_hardening(tmp_path: Path) -> None:
     assert "My &lt;Package&gt;" in html_out
 
 
+def test_batch_34_local_node_traversal_and_delegation_hardening(tmp_path: Path) -> None:
+    """Tests Batch 34: _iter_local_nodes isolation and delegation tie-breaking."""
+    from pydoppelgangerhunt.parser import harvest_file_units
+    from pydoppelgangerhunt.fixer import _build_whole_method_delegation
 
+    code = (
+        "class Handler:\n"
+        "    def handle(self, req):\n"
+        "        def validate(data):\n"
+        "            if not data:\n"
+        "                a = 1\n"
+        "                b = 2\n"
+        "                c = 3\n"
+        "                d = 4\n"
+        "                e = 5\n"
+        "                return False\n"
+        "            return True\n"
+        "        return validate(req)\n"
+    )
+    src_file = tmp_path / "handler.py"
+    src_file.write_text(code, encoding="utf-8")
 
+    units_with_closures = harvest_file_units(
+        str(src_file),
+        repo_root=str(tmp_path),
+        min_lines=4,
+        min_tokens=5,
+        harvest_closures=True,
+    )
+    names = [u["name"] for u in units_with_closures]
+    assert "handle:If" not in names
+    assert "Handler.handle:If" not in names
+    assert any("validate:If" in name for name in names)
 
+    validate_if = next(u for u in units_with_closures if "validate:If" in u["name"])
+    assert validate_if.get("receiver_kind") is None
+    assert validate_if.get("is_static") is False
+
+    clause_units = harvest_file_units(
+        str(src_file),
+        repo_root=str(tmp_path),
+        min_lines=4,
+        min_tokens=5,
+        clause_level=True,
+        harvest_closures=True,
+    )
+    c_names = [u["name"] for u in clause_units]
+    assert "handle:if_branch" not in c_names
+
+    delegation_code = (
+        "class A:\n"
+        "    def method(self):\n"
+        "        return 42\n"
+    )
+    u_delegation = {
+        "file": str(src_file),
+        "start": 2,
+        "end": 3,
+        "name": "method",
+        "kind": "function",
+    }
+    del_res = _build_whole_method_delegation(
+        delegation_code,
+        u_delegation,
+        call_prefix="self.",
+        helper_name="_shared_method",
+        args_str="",
+    )
+    assert "def method(self):" in del_res
+    assert "return self._shared_method()" in del_res
