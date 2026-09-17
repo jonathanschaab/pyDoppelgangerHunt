@@ -892,5 +892,90 @@ def test_batch_49_matcher_similarity_and_subclones(tmp_path: Path) -> None:
     assert len(_worker_harvest_file(task)) >= 1
 
 
+def test_batch_51_matcher_defensive_bounds_and_raw_set_baseline(tmp_path: Path) -> None:
+    """Batch 51: Test defensive bounds in matcher merging/subclones, and raw set baseline filtering."""
+    # pylint: disable=import-outside-toplevel
+    import json
+    from pydoppelgangerhunt.baseline import (
+        clone_pair_structural_fingerprint,
+        filter_clones_by_baseline,
+        namespaced_structural_fingerprint,
+        prune_baseline,
+        pure_structural_fingerprint,
+    )
+    from pydoppelgangerhunt.matcher import merge_adjacent_clones, suppress_subclones
 
+    # 1. merge_adjacent_clones with minimal dicts missing shingles/token_count (bag_of_tokens mode)
+    u1_a = {"file": "mod.py", "name": "fn1:1-5", "start": 1, "end": 5, "vector": {"a": 1}}
+    u2_a = {"file": "mod.py", "name": "fn2:1-5", "start": 1, "end": 5, "vector": {"a": 1}}
+    u1_b = {"file": "mod.py", "name": "fn1:6-10", "start": 6, "end": 10, "vector": {"b": 1}}
+    u2_b = {"file": "mod.py", "name": "fn2:6-10", "start": 6, "end": 10, "vector": {"b": 1}}
+    merged = merge_adjacent_clones([(1.0, u1_a, u2_a), (1.0, u1_b, u2_b)], bag_of_tokens=True)
+    assert len(merged) == 1
+    assert merged[0][1]["start"] == 1
+    assert merged[0][1]["end"] == 10
+    assert merged[0][1]["vector"] == {"a": 1, "b": 1}
 
+    # 2. suppress_subclones with missing start/end or None values
+    p1 = {"file": "mod.py", "start": 1, "end": 20}
+    p2 = {"file": "mod.py", "start": 30, "end": 50}
+    c1 = {"file": "mod.py", "start": None, "end": 10}
+    c2 = {"file": "mod.py", "start": 35, "end": 45}
+    suppressed = suppress_subclones([(0.95, p1, p2), (0.90, c1, c2)])
+    assert len(suppressed) == 1
+    assert suppressed[0][0] == 0.95
+
+    # 3. filter_clones_by_baseline with a raw set of strings (sfp, ns_sfp, pure_sfp)
+    u_x = {"file": "x.py", "name": "calc", "start": 1, "end": 5, "structural_hash": "hash_x"}
+    u_y = {"file": "y.py", "name": "calc", "start": 1, "end": 5, "structural_hash": "hash_y"}
+    sfp = clone_pair_structural_fingerprint(u_x, u_y)
+    ns_sfp = namespaced_structural_fingerprint(u_x, u_y)
+    pure_sfp = pure_structural_fingerprint(u_x, u_y)
+
+    # sfp match via raw set
+    filtered_sfp, supp_sfp = filter_clones_by_baseline([(0.9, u_x, u_y)], {sfp})
+    assert len(filtered_sfp) == 0
+    assert supp_sfp == 1
+
+    # ns_sfp match via raw set
+    filtered_ns, supp_ns = filter_clones_by_baseline([(0.9, u_x, u_y)], {ns_sfp})
+    assert len(filtered_ns) == 0
+    assert supp_ns == 1
+
+    # pure_sfp match via raw set
+    filtered_pure, supp_pure = filter_clones_by_baseline([(0.9, u_x, u_y)], {pure_sfp})
+    assert len(filtered_pure) == 0
+    assert supp_pure == 1
+
+    # unmatched clone retains
+    u_z = {"file": "z.py", "name": "calc", "start": 1, "end": 5, "structural_hash": "hash_z"}
+    unmatched_res, supp_unmatched = filter_clones_by_baseline([(0.85, u_x, u_z)], {pure_sfp})
+    assert len(unmatched_res) == 1
+    assert supp_unmatched == 0
+
+    # 4. prune_baseline when item_pure_sfp is absent in baseline file
+    bl_json = tmp_path / "baseline_no_pure.json"
+    bl_json.write_text(
+        json.dumps({
+            "version": "1.3.0",
+            "fingerprints": [
+                {
+                    "fingerprint": "x.py:calc <===> y.py:calc",
+                    "hash_a": "hash_x",
+                    "hash_b": "hash_y",
+                    "file_a": "x.py",
+                    "file_b": "y.py",
+                    "name_a": "calc",
+                    "name_b": "calc",
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+    res_prune = prune_baseline(
+        str(bl_json),
+        active_clones=[(0.9, u_x, u_y)],
+        unstaged_modified_ranges={},
+    )
+    assert res_prune.retained_count == 1
+    assert res_prune.pruned_count == 0

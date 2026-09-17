@@ -293,23 +293,37 @@ def merge_adjacent_clones(
                 if not (adj1 and adj2):
                     continue
 
-                current_u1["start"] = min(current_u1["start"], u1_b["start"])
-                current_u1["end"] = max(current_u1["end"], u1_b["end"])
+                current_u1["start"] = min(curr_u1_start, u1_b_start)
+                current_u1["end"] = max(curr_u1_end, u1_b_end)
                 current_u1["lines"] = current_u1["end"] - current_u1["start"] + 1
-                current_u1["shingles"] = set(current_u1["shingles"]).union(u1_b["shingles"])
-                current_u1["token_count"] = max(current_u1["token_count"], u1_b["token_count"])
-                current_u1["tokens"] = current_u1.get("tokens", []) + u1_b.get("tokens", [])
+                current_u1["shingles"] = set(current_u1.get("shingles") or set()).union(
+                    u1_b.get("shingles") or set()
+                )
+                current_u1["token_count"] = max(
+                    int(current_u1.get("token_count") or 0),
+                    int(u1_b.get("token_count") or 0),
+                )
+                current_u1["tokens"] = list(current_u1.get("tokens") or []) + list(
+                    u1_b.get("tokens") or []
+                )
                 current_u1["name"] = f"{fn1_a}:merged_{current_u1['start']}-{current_u1['end']}"
                 v1_a = current_u1.get("vector", {})
                 v1_b = u1_b.get("vector", {})
                 current_u1["vector"] = {k: v1_a.get(k, 0) + v1_b.get(k, 0) for k in set(v1_a).union(v1_b)}
 
-                current_u2["start"] = min(current_u2["start"], u2_b["start"])
-                current_u2["end"] = max(current_u2["end"], u2_b["end"])
+                current_u2["start"] = min(curr_u2_start, u2_b_start)
+                current_u2["end"] = max(curr_u2_end, u2_b_end)
                 current_u2["lines"] = current_u2["end"] - current_u2["start"] + 1
-                current_u2["shingles"] = set(current_u2["shingles"]).union(u2_b["shingles"])
-                current_u2["token_count"] = max(current_u2["token_count"], u2_b["token_count"])
-                current_u2["tokens"] = current_u2.get("tokens", []) + u2_b.get("tokens", [])
+                current_u2["shingles"] = set(current_u2.get("shingles") or set()).union(
+                    u2_b.get("shingles") or set()
+                )
+                current_u2["token_count"] = max(
+                    int(current_u2.get("token_count") or 0),
+                    int(u2_b.get("token_count") or 0),
+                )
+                current_u2["tokens"] = list(current_u2.get("tokens") or []) + list(
+                    u2_b.get("tokens") or []
+                )
                 current_u2["name"] = f"{fn2_a}:merged_{current_u2['start']}-{current_u2['end']}"
                 v2_a = current_u2.get("vector", {})
                 v2_b = u2_b.get("vector", {})
@@ -371,15 +385,24 @@ def suppress_subclones(
             c1_corr = c1 if direct_match else c2
             c2_corr = c2 if direct_match else c1
 
-            c1_enclosed = p1["start"] <= c1_corr["start"] and c1_corr["end"] <= p1["end"]
-            c2_enclosed = p2["start"] <= c2_corr["start"] and c2_corr["end"] <= p2["end"]
+            p1_start = int(p1.get("start") or 1)
+            p1_end = int(p1.get("end") or p1_start)
+            p2_start = int(p2.get("start") or 1)
+            p2_end = int(p2.get("end") or p2_start)
+            c1_start = int(c1_corr.get("start") or 1)
+            c1_end = int(c1_corr.get("end") or c1_start)
+            c2_start = int(c2_corr.get("start") or 1)
+            c2_end = int(c2_corr.get("end") or c2_start)
+
+            c1_enclosed = p1_start <= c1_start and c1_end <= p1_end
+            c2_enclosed = p2_start <= c2_start and c2_end <= p2_end
 
             if not (c1_enclosed and c2_enclosed):
                 continue
 
             is_strictly_smaller = (
-                (c1_corr["start"] > p1["start"] or c1_corr["end"] < p1["end"])
-                or (c2_corr["start"] > p2["start"] or c2_corr["end"] < p2["end"])
+                (c1_start > p1_start or c1_end < p1_end)
+                or (c2_start > p2_start or c2_end < p2_end)
             )
             if not is_strictly_smaller:
                 continue
