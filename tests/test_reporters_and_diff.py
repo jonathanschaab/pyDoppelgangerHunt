@@ -525,6 +525,23 @@ def test_coverage_readers_and_asymmetry(tmp_path: Path) -> None:
     assert len(matched_key) == 1
     assert 1 in sql_data[matched_key[0]]
 
+    # 4. SQLite .coverage reader with arc branch table
+    db_arc = tmp_path / ".coverage_arc"
+    conn_arc = sqlite3.connect(str(db_arc))
+    cur_arc = conn_arc.cursor()
+    cur_arc.execute("CREATE TABLE file (id INTEGER PRIMARY KEY, path TEXT)")
+    cur_arc.execute("CREATE TABLE arc (file_id INTEGER, fromno INTEGER, tono INTEGER)")
+    cur_arc.execute("INSERT INTO file VALUES (1, ?)", (str(tmp_path / "mod_arc.py"),))
+    cur_arc.execute("INSERT INTO arc VALUES (1, 10, 12)")
+    cur_arc.execute("INSERT INTO arc VALUES (1, -1, 10)")
+    conn_arc.commit()
+    conn_arc.close()
+
+    sql_arc_data = read_coverage_data(str(db_arc))
+    arc_key = [k for k in sql_arc_data if "mod_arc.py" in k]
+    assert len(arc_key) == 1
+    assert 10 in sql_arc_data[arc_key[0]]
+
 
 
 def test_fixer_synthesis_and_patch(tmp_path: Path) -> None:

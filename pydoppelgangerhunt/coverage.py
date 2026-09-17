@@ -15,9 +15,11 @@ def _read_sqlite_coverage(coverage_path: str) -> Dict[str, Set[int]]:
     coverage_map: Dict[str, Set[int]] = {}
     if not os.path.isfile(coverage_path):
         return coverage_map
-
     try:
-        conn = sqlite3.connect(f"file:{os.path.abspath(coverage_path)}?mode=ro", uri=True)
+        try:
+            conn = sqlite3.connect(f"file:{os.path.abspath(coverage_path)}?mode=ro", uri=True)
+        except (sqlite3.Error, OSError):
+            conn = sqlite3.connect(coverage_path)
         cursor = conn.cursor()
 
         cursor.execute("SELECT id, path FROM file")
