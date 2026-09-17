@@ -4929,7 +4929,6 @@ def test_synthesize_shared_helper_code_body_typing_imports(tmp_path: Path) -> No
 
 def test_nonlocal_variable_mutation_recorded_in_stores(tmp_path: Path) -> None:
     """Verifies that nonlocal mutations within inner closures are recorded in unit stores and outputs."""
-    from pydoppelgangerhunt.fixer import _inspect_unit_scope  # pylint: disable=import-outside-toplevel
     code = (
         "def outer(limit: int) -> int:\n"
         "    total = 0\n"
@@ -4956,20 +4955,145 @@ def test_nonlocal_variable_mutation_recorded_in_stores(tmp_path: Path) -> None:
     assert "total" in scope["outputs"]
     assert "total" in scope["nonlocals"]
 
+def test_ast_delete_in_block_assignment() -> None:
+    """Verifies that ast.Delete discards variables from definite stores unless reassigned."""
+    tree1 = ast.parse("x = 1\ny = 2\ndel x\n")
+    d1, _ = _analyze_block_assignment(tree1.body)
+    assert "x" not in d1
+    assert "y" in d1
+
+    tree2 = ast.parse("x = 1\ndel x\nx = 3\n")
+    d2, _ = _analyze_block_assignment(tree2.body)
+    assert "x" in d2
+
+    tree_del_tuple = ast.parse("a = 1\nb = 2\ndel a, b\n")
+    d3, _ = _analyze_block_assignment(tree_del_tuple.body)
+    assert "a" not in d3
+    assert "b" not in d3
 
 
+def test_inner_closure_delete_isolation(tmp_path: Path) -> None:
+    """Verifies that del on an inner closure local variable does not delete outer variables of the same name."""
+    code = (
+        "def compute() -> int:\n"
+        "    x = 10\n"
+        "    def inner_cleanup() -> None:\n"
+        "        x = 20\n"
+        "        del x\n"
+        "    inner_cleanup()\n"
+        "    return x\n"
+    )
+    f = tmp_path / "inner_del.py"
+    f.write_text(code, encoding="utf-8")
+    u = {"file": str(f), "start": 1, "end": 7, "name": "compute", "kind": "function"}
+    raw_info = _inspect_unit_scope(u, repo_root=str(tmp_path))
+    assert "x" not in raw_info.get("deleted_names", set())
+
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert "x" in scope["outputs"]
 
 
+def test_if_else_terminating_branch_definite_assignment(tmp_path: Path) -> None:
+    """Verifies that if-else with a terminating branch correctly tracks definite assignment."""
+    code = (
+        "def parse_or_raise(flag: bool, num: int) -> int:\n"
+        "    if flag:\n"
+        "        val = num * 2\n"
+        "    else:\n"
+        "        raise ValueError('invalid flag')\n"
+        "    return val\n"
+    )
+    f = tmp_path / "terminating_else.py"
+    f.write_text(code, encoding="utf-8")
+    u = {"file": str(f), "start": 1, "end": 6, "name": "parse_or_raise", "kind": "function"}
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert "val" in scope["definite_stores"]
+    assert "val" not in scope["conditional_outputs"]
+
+    helper = synthesize_shared_helper_code(u, u, repo_root=str(tmp_path))
+    assert "Optional[" not in helper
+    assert "val = None" not in helper
 
 
+def test_if_terminating_no_else_conditional_isolation(tmp_path: Path) -> None:
+    """Verifies that if-body assignments in a terminating if block do not leak into conditional outputs."""
+    code = (
+        "def guard_step(error: bool, data: str) -> str:\n"
+        "    if error:\n"
+        "        err_msg = f'Failed on {data}'\n"
+        "        raise RuntimeError(err_msg)\n"
+        "    res = data.upper()\n"
+        "    return res\n"
+    )
+    f = tmp_path / "terminating_guard.py"
+    f.write_text(code, encoding="utf-8")
+    u = {"file": str(f), "start": 1, "end": 6, "name": "guard_step", "kind": "function"}
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert "err_msg" not in scope["conditional_outputs"]
+    assert "res" in scope["definite_stores"]
+    assert "res" not in scope["conditional_outputs"]
 
 
+def test_with_block_definite_assignment(tmp_path: Path) -> None:
+    """Verifies that sequential assignments inside with blocks are recorded as definite stores."""
+    code = (
+        "def read_record(path: str) -> str:\n"
+        "    with open(path, 'r', encoding='utf-8') as fh:\n"
+        "        content = fh.read()\n"
+        "    return content\n"
+    )
+    f = tmp_path / "with_block.py"
+    f.write_text(code, encoding="utf-8")
+    u = {"file": str(f), "start": 1, "end": 4, "name": "read_record", "kind": "function"}
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert "content" in scope["definite_stores"]
+    assert "content" not in scope["conditional_outputs"]
 
 
+def test_try_terminating_handlers_definite_assignment(tmp_path: Path) -> None:
+    """Verifies that try-except with terminating handlers or dual assignments tracks definite assignment."""
+    code1 = (
+        "def safe_convert(s: str) -> int:\n"
+        "    try:\n"
+        "        val = int(s)\n"
+        "    except ValueError:\n"
+        "        return 0\n"
+        "    return val\n"
+    )
+    f1 = tmp_path / "try_term.py"
+    f1.write_text(code1, encoding="utf-8")
+    u1 = {"file": str(f1), "start": 1, "end": 6, "name": "safe_convert", "kind": "function"}
+    scope1 = analyze_unit_variable_scope(u1, repo_root=str(tmp_path))
+    assert "val" in scope1["definite_stores"]
+    assert "val" not in scope1["conditional_outputs"]
+
+    code2 = (
+        "def fallback_convert(s: str) -> int:\n"
+        "    try:\n"
+        "        val = int(s)\n"
+        "    except ValueError:\n"
+        "        val = -1\n"
+        "    return val\n"
+    )
+    f2 = tmp_path / "try_fallback.py"
+    f2.write_text(code2, encoding="utf-8")
+    u2 = {"file": str(f2), "start": 1, "end": 6, "name": "fallback_convert", "kind": "function"}
+    scope2 = analyze_unit_variable_scope(u2, repo_root=str(tmp_path))
+    assert "val" in scope2["definite_stores"]
+    assert "val" not in scope2["conditional_outputs"]
 
 
-
-
-
-
-
+def test_match_terminating_case_definite_assignment() -> None:
+    """Verifies that Match with a terminating case preserves definite assignment across non-terminating branches."""
+    code = (
+        "match cmd:\n"
+        "    case 'start':\n"
+        "        res = 1\n"
+        "    case 'stop':\n"
+        "        res = 2\n"
+        "    case _:\n"
+        "        raise ValueError('unknown')\n"
+    )
+    tree = ast.parse(code)
+    def_assigned, _ = _analyze_block_assignment(tree.body)
+    assert "res" in def_assigned

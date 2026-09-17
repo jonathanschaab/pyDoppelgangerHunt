@@ -128,7 +128,8 @@ class _ScopeVisitor(ast.NodeVisitor):
         return arg_set
 
     def _record_store_name(self, name: str) -> None:
-        self.deleted_names.discard(name)
+        if len(self._scope_stack) <= 1 or name in self.nonlocals:
+            self.deleted_names.discard(name)
         if name in self.nonlocals:
             if name not in BUILTIN_NAMES and name not in self.stores:
                 self.stores.append(name)
@@ -242,10 +243,10 @@ class _ScopeVisitor(ast.NodeVisitor):
         if isinstance(node.ctx, ast.Load):
             self._record_load_name(node.id)
         elif isinstance(node.ctx, ast.Store):
-            self.deleted_names.discard(node.id)
             self._record_store_name(node.id)
         elif isinstance(node.ctx, ast.Del):
-            self.deleted_names.add(node.id)
+            if len(self._scope_stack) <= 1 or node.id in self.nonlocals:
+                self.deleted_names.add(node.id)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if isinstance(node.value, ast.Name) and node.value.id in ("self", "cls"):
@@ -294,7 +295,6 @@ class _ScopeVisitor(ast.NodeVisitor):
         if node.value is not None:
             self.visit(node.value)
             if isinstance(node.target, ast.Name):
-                self.deleted_names.discard(node.target.id)
                 self._record_store_name(node.target.id)
             else:
                 self.visit(node.target)
@@ -303,7 +303,8 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.visit(node.value)
         if isinstance(node.target, ast.Name):
             target_id = node.target.id
-            self.deleted_names.discard(target_id)
+            if len(self._scope_stack) <= 1 + self._comprehension_depth or target_id in self.nonlocals:
+                self.deleted_names.discard(target_id)
             if self._comprehension_depth > 0:
                 target_idx = -1 - self._comprehension_depth
                 if len(self._scope_stack) >= abs(target_idx):
@@ -551,6 +552,72 @@ def _walrus_assignment_in_expr(
     return definite, conditional - definite
 
 
+def _is_irrefutable_case(case: ast.AST) -> bool:
+    """Returns True if the match case has no guard and an irrefutable wildcard or as-pattern."""
+    guard = getattr(case, "guard", None)
+    pattern = getattr(case, "pattern", None)
+    if guard is not None or pattern is None:
+        return False
+    pat_type = type(pattern).__name__
+    return pat_type == "MatchWildcard" or (
+        pat_type == "MatchAs" and getattr(pattern, "pattern", None) is None
+    )
+
+
+def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
+    """Returns True if the statement sequence unconditionally terminates via return or raise."""
+    for stmt in statements:
+        if isinstance(stmt, (ast.Return, ast.Raise)):
+            return True
+        if isinstance(stmt, ast.If):
+            if (
+                stmt.orelse
+                and _block_terminates(stmt.body)
+                and _block_terminates(stmt.orelse)
+            ):
+                return True
+        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):
+            cases = getattr(stmt, "cases", [])
+            has_irrefutable = any(_is_irrefutable_case(c) for c in cases)
+            if has_irrefutable and cases and all(_block_terminates(c.body) for c in cases):
+                return True
+        elif isinstance(stmt, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+            f_body = getattr(stmt, "finalbody", [])
+            if f_body and _block_terminates(f_body):
+                return True
+            handlers = getattr(stmt, "handlers", [])
+            if (
+                handlers
+                and _block_terminates(getattr(stmt, "body", []))
+                and all(_block_terminates(getattr(h, "body", [])) for h in handlers)
+            ):
+                return True
+    return False
+
+
+def _extract_deleted_names(statements: Sequence[ast.stmt]) -> Set[str]:
+    """Finds all variable names deleted within a statement sequence without recursing into nested functions."""
+    deleted: Set[str] = set()
+    for stmt in statements:
+        if isinstance(stmt, ast.Delete):
+            for target in stmt.targets:
+                for node in ast.walk(target):
+                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del):
+                        deleted.add(node.id)
+        elif isinstance(stmt, (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try, getattr(ast, "TryStar", ast.Try))):
+            for child in ast.iter_child_nodes(stmt):
+                if isinstance(child, list):
+                    child_stmts = [c for c in child if isinstance(c, ast.stmt)]
+                    if child_stmts:
+                        deleted.update(_extract_deleted_names(child_stmts))
+                elif isinstance(child, ast.stmt):
+                    deleted.update(_extract_deleted_names([child]))
+        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):
+            for case in getattr(stmt, "cases", []):
+                deleted.update(_extract_deleted_names(getattr(case, "body", [])))
+    return deleted
+
+
 def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str], Set[str]]:
     """Analyzes a sequence of statements to determine unconditionally and conditionally assigned variables.
 
@@ -586,6 +653,24 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
             d_val, c_val = _walrus_assignment_in_expr(stmt.value)
             definite.update(d_val)
             conditional.update(c_val)
+        elif isinstance(stmt, ast.Delete):
+            for target in stmt.targets:
+                d_del, c_del = _walrus_assignment_in_expr(target)
+                definite.update(d_del)
+                conditional.update(c_del)
+                for node in ast.walk(target):
+                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del):
+                        definite.discard(node.id)
+                        conditional.discard(node.id)
+        elif isinstance(stmt, ast.Raise):
+            if stmt.exc is not None:
+                d_exc, c_exc = _walrus_assignment_in_expr(stmt.exc)
+                definite.update(d_exc)
+                conditional.update(c_exc)
+            if stmt.cause is not None:
+                d_cause, c_cause = _walrus_assignment_in_expr(stmt.cause)
+                definite.update(d_cause)
+                conditional.update(c_cause)
         elif isinstance(stmt, ast.Return):
             if stmt.value is not None:
                 d_val, c_val = _walrus_assignment_in_expr(stmt.value)
@@ -597,12 +682,32 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
             conditional.update(c_test)
             b_def, b_cond = _analyze_block_assignment(stmt.body)
             o_def, o_cond = _analyze_block_assignment(stmt.orelse) if stmt.orelse else (set(), set())
+            b_term = _block_terminates(stmt.body)
+            o_term = _block_terminates(stmt.orelse) if stmt.orelse else False
             if stmt.orelse:
-                both = b_def & o_def
-                definite.update(both)
-                conditional.update((b_def | b_cond | o_def | o_cond) - definite)
+                if o_term and not b_term:
+                    definite.update(b_def)
+                    conditional.update((b_def | b_cond) - definite)
+                elif b_term and not o_term:
+                    definite.update(o_def)
+                    conditional.update((o_def | o_cond) - definite)
+                elif not b_term and not o_term:
+                    both = b_def & o_def
+                    definite.update(both)
+                    conditional.update((b_def | b_cond | o_def | o_cond) - definite)
+                eff_b_del = _extract_deleted_names(stmt.body) - b_def
+                eff_o_del = _extract_deleted_names(stmt.orelse) - o_def
+                for v_del in eff_b_del | eff_o_del:
+                    definite.discard(v_del)
+                for v_del in eff_b_del & eff_o_del:
+                    conditional.discard(v_del)
             else:
-                conditional.update((b_def | b_cond) - definite)
+                if not b_term:
+                    conditional.update((b_def | b_cond) - definite)
+                    eff_b_del = _extract_deleted_names(stmt.body) - b_def
+                    for v_del in eff_b_del:
+                        definite.discard(v_del)
+                        conditional.add(v_del)
         elif isinstance(stmt, ast.While):
             d_test, c_test = _walrus_assignment_in_expr(stmt.test)
             definite.update(d_test)
@@ -635,29 +740,62 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                             definite.add(p_node.id)
             sub_stmts = list(stmt.body)
             sub_def, sub_cond = _analyze_block_assignment(sub_stmts)
+            definite.update(sub_def)
             conditional.update((sub_def | sub_cond) - definite)
-        elif isinstance(stmt, ast.Try):
-            sub_stmts = list(stmt.body)
-            if hasattr(stmt, "orelse") and stmt.orelse:
-                sub_stmts.extend(stmt.orelse)
-            if hasattr(stmt, "handlers") and stmt.handlers:
-                for h in stmt.handlers:
-                    sub_stmts.extend(h.body)
-            sub_def, sub_cond = _analyze_block_assignment(sub_stmts)
-            conditional.update((sub_def | sub_cond) - definite)
-            if hasattr(stmt, "finalbody") and stmt.finalbody:
-                f_def, f_cond = _analyze_block_assignment(stmt.finalbody)
-                definite.update(f_def)
-                conditional.update((f_def | f_cond) - definite)
-        elif hasattr(ast, "TryStar") and isinstance(stmt, getattr(ast, "TryStar")):
-            sub_stmts_star: List[ast.stmt] = list(getattr(stmt, "body", []))
-            if hasattr(stmt, "handlers") and getattr(stmt, "handlers", None):
-                for h in getattr(stmt, "handlers", []):
-                    sub_stmts_star.extend(getattr(h, "body", []))
-            sub_def, sub_cond = _analyze_block_assignment(sub_stmts_star)
-            conditional.update((sub_def | sub_cond) - definite)
-            if hasattr(stmt, "finalbody") and getattr(stmt, "finalbody", None):
-                f_def, f_cond = _analyze_block_assignment(getattr(stmt, "finalbody", []))
+        elif isinstance(stmt, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+            t_body = list(getattr(stmt, "body", []))
+            t_def, t_cond = _analyze_block_assignment(t_body)
+            t_term = _block_terminates(t_body)
+            o_stmts = list(getattr(stmt, "orelse", []))
+            if o_stmts:
+                o_def, o_cond = _analyze_block_assignment(o_stmts)
+                o_term = _block_terminates(o_stmts)
+                if not o_term:
+                    try_def = t_def | o_def
+                    try_cond = (t_cond | o_cond) - try_def
+                else:
+                    try_def = set()
+                    try_cond = set()
+                    t_term = True
+            else:
+                try_def = t_def
+                try_cond = t_cond
+
+            handlers = list(getattr(stmt, "handlers", []))
+            h_defs: List[Set[str]] = []
+            all_handlers_terminate = bool(
+                handlers and all(_block_terminates(getattr(h, "body", [])) for h in handlers)
+            )
+
+            for h in handlers:
+                h_body = list(getattr(h, "body", []))
+                if getattr(h, "type", None) is not None:
+                    d_ht, c_ht = _walrus_assignment_in_expr(h.type, is_conditional=True)
+                    conditional.update(d_ht | c_ht)
+                h_d, h_c = _analyze_block_assignment(h_body)
+                if not _block_terminates(h_body):
+                    h_defs.append(h_d)
+                conditional.update((h_d | h_c) - definite)
+
+            if not t_term:
+                if all_handlers_terminate:
+                    definite.update(try_def)
+                    conditional.update(try_cond - definite)
+                elif handlers and h_defs:
+                    common = try_def.intersection(*h_defs)
+                    definite.update(common)
+                    conditional.update((try_def | try_cond) - definite)
+                elif not handlers:
+                    definite.update(try_def)
+                    conditional.update(try_cond - definite)
+            elif h_defs:
+                common = set.intersection(*h_defs)
+                definite.update(common)
+                conditional.update(try_cond - definite)
+
+            f_body = list(getattr(stmt, "finalbody", []))
+            if f_body:
+                f_def, f_cond = _analyze_block_assignment(f_body)
                 definite.update(f_def)
                 conditional.update((f_def | f_cond) - definite)
         elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):
@@ -665,6 +803,7 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
             definite.update(d_sub)
             conditional.update(c_sub)
             case_defs: List[Set[str]] = []
+            non_term_case_defs: List[Set[str]] = []
             case_conds: Set[str] = set()
             has_irrefutable_default = False
             for case in getattr(stmt, "cases", []):
@@ -682,16 +821,14 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
                 c_def.update(pattern_stores)
                 case_defs.append(c_def)
                 case_conds.update(c_def | c_cond)
-                guard = getattr(case, "guard", None)
-                if guard is None and pattern is not None:
-                    pat_type = type(pattern).__name__
-                    if pat_type == "MatchWildcard" or (
-                        pat_type == "MatchAs" and getattr(pattern, "pattern", None) is None
-                    ):
-                        has_irrefutable_default = True
+                if not _block_terminates(case.body):
+                    non_term_case_defs.append(c_def)
+                if _is_irrefutable_case(case):
+                    has_irrefutable_default = True
             if case_defs and has_irrefutable_default:
-                common = set.intersection(*case_defs)
-                definite.update(common)
+                if non_term_case_defs:
+                    common = set.intersection(*non_term_case_defs)
+                    definite.update(common)
                 conditional.update(case_conds - definite)
             else:
                 conditional.update(case_conds - definite)
@@ -713,6 +850,9 @@ def _analyze_block_assignment(statements: Sequence[ast.stmt]) -> Tuple[Set[str],
             if stmt.msg is not None:
                 d_m, c_m = _walrus_assignment_in_expr(stmt.msg, is_conditional=True)
                 conditional.update(d_m | c_m)
+
+        if _block_terminates([stmt]):
+            break
 
     return definite, conditional - definite
 
