@@ -6750,6 +6750,70 @@ def test_batch_58_parenthesized_return_and_relative_path_resolution(tmp_path: Pa
     assert units[0]["file"] == "nested_subpkg/logic.py"
 
 
+def test_batch_60_generator_docstring_call_site_and_overlap(tmp_path: Path) -> None:
+    """Test generator call site docstring synthesis and check_units_overlap column boundary validation."""
+    from pydoppelgangerhunt.fixer import check_units_overlap, synthesize_shared_helper_code
+
+    # 1. Sync generator without return value
+    gen_file = tmp_path / "gen_logic.py"
+    gen_file.write_text(
+        "def produce_stream(limit: int):\n"
+        "    for val in range(limit):\n"
+        "        yield val * 2\n",
+        encoding="utf-8",
+    )
+    u_gen = {"file": str(gen_file), "start": 1, "end": 3, "name": "produce_stream", "kind": "function"}
+    helper_gen = synthesize_shared_helper_code(u_gen, u_gen, repo_root=str(tmp_path))
+    assert "yield from _shared_produce_stream(...)" in helper_gen
+
+    # 2. Sync generator with return value (StopIteration.value)
+    gen_ret_file = tmp_path / "gen_ret.py"
+    gen_ret_file.write_text(
+        "def accumulate_stream(limit: int):\n"
+        "    accum = 0\n"
+        "    for val in range(limit):\n"
+        "        accum += val\n"
+        "        yield val\n"
+        "    return accum\n",
+        encoding="utf-8",
+    )
+    u_gen_ret = {"file": str(gen_ret_file), "start": 1, "end": 6, "name": "accumulate_stream", "kind": "function"}
+    helper_gen_ret = synthesize_shared_helper_code(u_gen_ret, u_gen_ret, repo_root=str(tmp_path))
+    assert "(yield from _shared_accumulate_stream(...))" in helper_gen_ret
+
+    # 3. Async generator
+    agen_file = tmp_path / "agen_logic.py"
+    agen_file.write_text(
+        "async def produce_async(limit: int):\n"
+        "    for val in range(limit):\n"
+        "        yield val * 3\n",
+        encoding="utf-8",
+    )
+    u_agen = {"file": str(agen_file), "start": 1, "end": 3, "name": "produce_async", "kind": "function"}
+    helper_agen = synthesize_shared_helper_code(u_agen, u_agen, repo_root=str(tmp_path))
+    assert "async for _item in _shared_produce_async(...):" in helper_agen
+    assert "yield _item" in helper_agen
+
+    # 4. check_units_overlap column boundary validation
+    u_base = {"file": "core.py", "start": 10, "end": 10}
+    # Overlapping columns (0..20 and 15..30)
+    assert check_units_overlap(
+        dict(u_base, start_col=0, end_col=20),
+        dict(u_base, start_col=15, end_col=30),
+    ) is True
+    # Disjoint columns (0..10 and 15..30)
+    assert check_units_overlap(
+        dict(u_base, start_col=0, end_col=10),
+        dict(u_base, start_col=15, end_col=30),
+    ) is False
+    # Malformed / inverted column bounds (e.g. start_col > end_col)
+    assert check_units_overlap(
+        dict(u_base, start_col=25, end_col=10),
+        dict(u_base, start_col=15, end_col=30),
+    ) is False
+
+
+
 
 
 

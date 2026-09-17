@@ -2494,18 +2494,24 @@ def synthesize_shared_helper_code(
         call_target = helper_name
 
     docstring_lines = [f"{doc_indent}\"\"\"Auto-extracted shared helper for duplicate logic."]
-    if helper_outputs:
-        if len(helper_outputs) >= 2:
-            call_site = f"{', '.join(helper_outputs)} = {await_prefix}{call_target}(...)"
+    is_async_gen = bool(scope.get("has_yield") and is_async)
+    is_sync_gen = bool(scope.get("has_yield") and not is_async)
+    if is_async_gen:
+        call_site = f"async for _item in {call_target}(...):\n{sub_indent}yield _item"
+    elif is_sync_gen:
+        if helper_outputs:
+            assign = ", ".join(helper_outputs) if len(helper_outputs) >= 2 else helper_outputs[0]
+            call_site = f"{assign} = (yield from {call_target}(...))"
         else:
-            call_site = f"{helper_outputs[0]} = {await_prefix}{call_target}(...)"
-        docstring_lines.append("")
-        docstring_lines.append(f"{doc_indent}Call site:")
-        docstring_lines.append(f"{sub_indent}{call_site}")
+            call_site = f"yield from {call_target}(...)"
+    elif helper_outputs:
+        assign = ", ".join(helper_outputs) if len(helper_outputs) >= 2 else helper_outputs[0]
+        call_site = f"{assign} = {await_prefix}{call_target}(...)"
     else:
-        docstring_lines.append("")
-        docstring_lines.append(f"{doc_indent}Call site:")
-        docstring_lines.append(f"{sub_indent}{await_prefix}{call_target}(...)")
+        call_site = f"{await_prefix}{call_target}(...)"
+    docstring_lines.append("")
+    docstring_lines.append(f"{doc_indent}Call site:")
+    docstring_lines.append(f"{sub_indent}{call_site}")
 
     hazards = scope.get("control_flow_hazards", [])
     if hazards:
@@ -2692,7 +2698,11 @@ def check_units_overlap(
 
     if start1 == end1 == start2 == end2:
         if s_col1 is not None and e_col1 is not None and s_col2 is not None and e_col2 is not None:
-            return max(int(s_col1), int(s_col2)) < min(int(e_col1), int(e_col2))
+            sc1, ec1 = int(s_col1), int(e_col1)
+            sc2, ec2 = int(s_col2), int(e_col2)
+            if sc1 <= ec1 and sc2 <= ec2:
+                return max(sc1, sc2) < min(ec1, ec2)
+            return False
 
     if start1 < start2 and end1 == start2:
         if e_col1 is not None and s_col2 is not None:
