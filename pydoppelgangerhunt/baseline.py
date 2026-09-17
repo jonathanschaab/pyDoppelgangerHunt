@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from pydoppelgangerhunt.config import find_matching_path_value
+from pydoppelgangerhunt.config import find_matching_path_value, normalize_path_string
 
 logger = logging.getLogger(__name__)
 
@@ -38,44 +38,44 @@ def _format_paired_endpoints(ep1: str, ep2: str) -> str:
 
 def extract_unit_namespace(file_path: str) -> str:
     """Extracts canonical module/package directory namespace from a file path."""
-    norm_path = str(file_path or "").replace("\\", "/").strip()
-    if norm_path.startswith("./"):
-        norm_path = norm_path[2:]
+    norm_path = normalize_path_string(file_path, strip_anchor=False)
     if "/" not in norm_path:
         return "."
     parent = norm_path.rsplit("/", 1)[0]
     return parent if parent else "."
 
 
+def _paired_hashed_fingerprint(
+    u1: Dict[str, Any], u2: Dict[str, Any], prefix1: str, prefix2: str
+) -> str:
+    h1 = compute_unit_structural_hash(u1)
+    h2 = compute_unit_structural_hash(u2)
+    return _format_paired_endpoints(f"{prefix1}#{h1}", f"{prefix2}#{h2}")
+
+
 def namespaced_structural_fingerprint(u1: Dict[str, Any], u2: Dict[str, Any]) -> str:
     """Computes order-invariant structural content fingerprint bound to module/package namespaces."""
     ns1 = extract_unit_namespace(str(u1.get("file") or ""))
     ns2 = extract_unit_namespace(str(u2.get("file") or ""))
-    h1 = compute_unit_structural_hash(u1)
-    h2 = compute_unit_structural_hash(u2)
-    return _format_paired_endpoints(f"{ns1}#{h1}", f"{ns2}#{h2}")
+    return _paired_hashed_fingerprint(u1, u2, ns1, ns2)
 
 
 def pure_structural_fingerprint(u1: Dict[str, Any], u2: Dict[str, Any]) -> str:
     """Computes path-independent, order-invariant structural content fingerprint for a clone pair."""
-    h1 = compute_unit_structural_hash(u1)
-    h2 = compute_unit_structural_hash(u2)
-    return _format_paired_endpoints(h1, h2)
+    return _format_paired_endpoints(compute_unit_structural_hash(u1), compute_unit_structural_hash(u2))
 
 
 def clone_pair_structural_fingerprint(u1: Dict[str, Any], u2: Dict[str, Any]) -> str:
     """Computes order-invariant structural content fingerprint for a clone pair."""
-    f1 = str(u1.get("file") or "").replace("\\", "/")
-    f2 = str(u2.get("file") or "").replace("\\", "/")
-    h1 = compute_unit_structural_hash(u1)
-    h2 = compute_unit_structural_hash(u2)
-    return _format_paired_endpoints(f"{f1}#{h1}", f"{f2}#{h2}")
+    f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+    f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
+    return _paired_hashed_fingerprint(u1, u2, f1, f2)
 
 
 def clone_pair_fingerprint(u1: Dict[str, Any], u2: Dict[str, Any]) -> str:
     """Computes stable, order-invariant fingerprint for a clone pair."""
-    f1 = str(u1.get("file") or "").replace("\\", "/")
-    f2 = str(u2.get("file") or "").replace("\\", "/")
+    f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+    f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
     n1 = str(u1.get("name") or "unit1")
     n2 = str(u2.get("name") or "unit2")
     return _format_paired_endpoints(f"{f1}:{n1}", f"{f2}:{n2}")
@@ -101,11 +101,11 @@ def record_baseline(
                 "namespaced_structural_fingerprint": namespaced_structural_fingerprint(u1, u2),
                 "pure_structural_fingerprint": pure_structural_fingerprint(u1, u2),
                 "similarity": round(sim, 4),
-                "file_a": str(u1.get("file") or "").replace("\\", "/"),
+                "file_a": normalize_path_string(str(u1.get("file") or ""), strip_anchor=False),
                 "name_a": str(u1.get("name") or "unit1"),
                 "hash_a": compute_unit_structural_hash(u1),
                 "namespace_a": extract_unit_namespace(str(u1.get("file") or "")),
-                "file_b": str(u2.get("file") or "").replace("\\", "/"),
+                "file_b": normalize_path_string(str(u2.get("file") or ""), strip_anchor=False),
                 "name_b": str(u2.get("name") or "unit2"),
                 "hash_b": compute_unit_structural_hash(u2),
                 "namespace_b": extract_unit_namespace(str(u2.get("file") or "")),
@@ -438,8 +438,8 @@ def prune_baseline(
                 and (item_fp not in active_fps or item_sfp not in active_sfps)
             ):
                 u1, u2 = matched_clone
-                item["file_a"] = str(u1.get("file") or "").replace("\\", "/")
-                item["file_b"] = str(u2.get("file") or "").replace("\\", "/")
+                item["file_a"] = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+                item["file_b"] = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
                 item["name_a"] = str(u1.get("name") or "unit1")
                 item["name_b"] = str(u2.get("name") or "unit2")
                 item["namespace_a"] = extract_unit_namespace(str(u1.get("file") or ""))

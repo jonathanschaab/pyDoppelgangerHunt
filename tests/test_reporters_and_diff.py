@@ -6173,3 +6173,92 @@ def test_batch_39_notebook_cell_clustering_and_metrics_isolation(tmp_path: Any) 
     assert _detect_indent_step("   ") == "    "
     assert _detect_indent_step("") == "    "
 
+
+def test_batch_40_notebook_source_code_and_matcher_path_robustness(tmp_path: Any) -> None:
+    """Tests Batch 40: notebook cell source extraction, clone diffing, and matcher/baseline path equivalence."""
+    import json
+    from pydoppelgangerhunt.baseline import (
+        clone_pair_fingerprint,
+        clone_pair_structural_fingerprint,
+        extract_unit_namespace,
+        record_baseline,
+    )
+    from pydoppelgangerhunt.matcher import merge_adjacent_clones, suppress_subclones
+    from pydoppelgangerhunt.reporters import (
+        extract_unit_source_code,
+        format_sarif_report,
+        generate_clone_diff,
+    )
+
+    # 1. extract_unit_source_code and generate_clone_diff from Jupyter Notebook code cells
+    nb_content = {
+        "cells": [
+            {
+                "cell_type": "code",
+                "source": ["def calc(x):\n", "    y = x * 2\n", "    return y\n"],
+            },
+            {
+                "cell_type": "code",
+                "source": ["def calc(x):\n", "    y = x * 3\n", "    return y\n"],
+            },
+        ]
+    }
+    nb_path = tmp_path / "notebook.ipynb"
+    nb_path.write_text(json.dumps(nb_content), encoding="utf-8")
+
+    u1 = {"file": f"{nb_path}#cell_1", "start": 1, "end": 3, "name": "calc"}
+    u2 = {"file": f"{nb_path}#cell_2", "start": 1, "end": 3, "name": "calc"}
+
+    lines1 = extract_unit_source_code(u1)
+    assert lines1 == ["def calc(x):\n", "    y = x * 2\n", "    return y\n"]
+
+    diff_text = generate_clone_diff(u1, u2)
+    assert "-    y = x * 2" in diff_text
+    assert "+    y = x * 3" in diff_text
+
+    # Out-of-bounds cell index fallback
+    u_oob = {"file": f"{nb_path}#cell_99", "start": 1, "end": 3, "name": "oob"}
+    lines_oob = extract_unit_source_code(u_oob)
+    assert lines_oob == []
+
+    # 2. format_sarif_report normalizes leading dot-slash while retaining cell anchors
+    u_dot_cell = {"file": "./notebook.ipynb#cell_1", "start": 1, "end": 3, "name": "calc"}
+    sarif = format_sarif_report([(1.0, u_dot_cell, u_dot_cell)], "repo", 0.9)
+    uri = sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+    assert uri == "notebook.ipynb#cell_1"
+
+    # 3. merge_adjacent_clones consolidates hits across dot-slash file representations
+    u1_w1 = {"file": "./mod.py", "name": "f:w1", "start": 10, "end": 15, "lines": 6, "shingles": {"s1"}, "token_count": 20, "kind": "sliding_window"}
+    u2_w1 = {"file": "mod.py", "name": "g:w1", "start": 30, "end": 35, "lines": 6, "shingles": {"s1"}, "token_count": 20, "kind": "sliding_window"}
+    u1_w2 = {"file": "mod.py", "name": "f:w2", "start": 11, "end": 16, "lines": 6, "shingles": {"s2"}, "token_count": 20, "kind": "sliding_window"}
+    u2_w2 = {"file": "./mod.py", "name": "g:w2", "start": 31, "end": 36, "lines": 6, "shingles": {"s2"}, "token_count": 20, "kind": "sliding_window"}
+
+    merged = merge_adjacent_clones([(1.0, u1_w1, u2_w1), (1.0, u1_w2, u2_w2)], line_tolerance=2)
+    assert len(merged) == 1
+    assert merged[0][1]["start"] == 10
+    assert merged[0][1]["end"] == 16
+
+    # 4. suppress_subclones eliminates redundant sub-clones across dot-slash file representations
+    u_parent1 = {"file": "./worker.py", "name": "worker", "start": 1, "end": 50, "token_count": 100}
+    u_parent2 = {"file": "worker.py", "name": "worker2", "start": 1, "end": 50, "token_count": 100}
+    u_child1 = {"file": "worker.py", "name": "worker:w1", "start": 10, "end": 25, "token_count": 30}
+    u_child2 = {"file": "./worker.py", "name": "worker2:w1", "start": 10, "end": 25, "token_count": 30}
+
+    suppressed = suppress_subclones([(1.0, u_parent1, u_parent2), (0.98, u_child1, u_child2)])
+    assert len(suppressed) == 1
+    assert suppressed[0][1]["name"] == "worker"
+
+    # 5. baseline fingerprint and recording path normalization
+    u_b1 = {"file": "./core/engine.py", "start": 5, "end": 15, "name": "run", "tokens": ["a", "b"]}
+    u_b2 = {"file": "core/engine.py", "start": 5, "end": 15, "name": "run", "tokens": ["a", "b"]}
+    assert clone_pair_fingerprint(u_b1, u_b1) == clone_pair_fingerprint(u_b2, u_b2)
+    assert clone_pair_structural_fingerprint(u_b1, u_b1) == clone_pair_structural_fingerprint(u_b2, u_b2)
+    assert extract_unit_namespace("./core/engine.py") == "core"
+
+    base_json = tmp_path / "baseline.json"
+    record_baseline([(1.0, u_b1, u_b2)], str(base_json), "repo", 0.9)
+    base_data = json.loads(base_json.read_text(encoding="utf-8"))
+    assert base_data["fingerprints"][0]["file_a"] == "core/engine.py"
+    assert base_data["fingerprints"][0]["file_b"] == "core/engine.py"
+
+

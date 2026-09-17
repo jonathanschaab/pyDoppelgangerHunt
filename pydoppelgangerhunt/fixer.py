@@ -2192,8 +2192,8 @@ def synthesize_shared_helper_code(
 
     enc1 = u1.get("enclosing_class")
     enc2 = u2.get("enclosing_class")
-    f1 = str(u1.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
-    f2 = str(u2.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
+    f1 = normalize_path_string(str(u1.get("file") or ""))
+    f2 = normalize_path_string(str(u2.get("file") or ""))
     enc1_start = u1.get("enclosing_class_start")
     enc2_start = u2.get("enclosing_class_start")
     is_same_class = bool(
@@ -2662,8 +2662,8 @@ def check_units_overlap(
         True if both units reside in the same normalized file path and their [start, end]
         intervals overlap; False otherwise.
     """
-    f1 = str(u1.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
-    f2 = str(u2.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
+    f1 = normalize_path_string(str(u1.get("file") or ""))
+    f2 = normalize_path_string(str(u2.get("file") or ""))
     if not f1 or not f2 or not _is_same_file_path(f1, f2, repo_root=repo_root):
         return False
     start1 = int(u1.get("start") or 1)

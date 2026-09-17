@@ -6,9 +6,10 @@ import concurrent.futures
 import math
 import os
 from pathlib import Path
+import sys
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-from pydoppelgangerhunt.config import find_python_files
+from pydoppelgangerhunt.config import find_python_files, normalize_path_string
 from pydoppelgangerhunt.parser import harvest_file_units
 
 DEFAULT_STOP_SHINGLES: Set[Tuple[str, ...]] = {
@@ -52,6 +53,14 @@ DEFAULT_STOP_SHINGLES: Set[Tuple[str, ...]] = {
 def get_boilerplate_stop_shingles() -> Set[Tuple[str, ...]]:
     """Returns a copy of the default set of boilerplate stop-shingles."""
     return set(DEFAULT_STOP_SHINGLES)
+
+
+def _normalize_matcher_file(file_str: Optional[str]) -> str:
+    """Normalizes unit file path string for robust matching, preserving cell anchors."""
+    norm = normalize_path_string(file_str, strip_anchor=False)
+    if os.name == "nt" or sys.platform == "win32":
+        return norm.lower()
+    return norm
 
 
 def lcs_alignment_similarity(
@@ -198,8 +207,10 @@ def merge_adjacent_clones(
 
     canonical: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
     for sim, u1, u2 in clones:
-        k1 = (u1["file"], u1["start"], u1["name"])
-        k2 = (u2["file"], u2["start"], u2["name"])
+        f1 = _normalize_matcher_file(u1.get("file"))
+        f2 = _normalize_matcher_file(u2.get("file"))
+        k1 = (f1, int(u1.get("start") or 1), str(u1.get("name") or ""))
+        k2 = (f2, int(u2.get("start") or 1), str(u2.get("name") or ""))
         if k1 <= k2:
             canonical.append((sim, dict(u1), dict(u2)))
         else:
@@ -226,7 +237,11 @@ def merge_adjacent_clones(
                     continue
                 _sim_b, u1_b, u2_b = merged_clones[j]
 
-                if current_u1["file"] != u1_b["file"] or current_u2["file"] != u2_b["file"]:
+                f1_curr = _normalize_matcher_file(current_u1.get("file"))
+                f1_b = _normalize_matcher_file(u1_b.get("file"))
+                f2_curr = _normalize_matcher_file(current_u2.get("file"))
+                f2_b = _normalize_matcher_file(u2_b.get("file"))
+                if f1_curr != f1_b or f2_curr != f2_b:
                     continue
 
                 fn1_a = current_u1["name"].split(":")[0]
@@ -306,14 +321,14 @@ def suppress_subclones(
     for i, (sim_parent, p1, p2) in enumerate(clones):
         if i in suppressed_indices:
             continue
-        f1_p = p1["file"].replace("\\", "/")
-        f2_p = p2["file"].replace("\\", "/")
+        f1_p = _normalize_matcher_file(p1.get("file"))
+        f2_p = _normalize_matcher_file(p2.get("file"))
 
         for j, (sim_child, c1, c2) in enumerate(clones):
             if i == j or j in suppressed_indices:
                 continue
-            f1_c = c1["file"].replace("\\", "/")
-            f2_c = c2["file"].replace("\\", "/")
+            f1_c = _normalize_matcher_file(c1.get("file"))
+            f2_c = _normalize_matcher_file(c2.get("file"))
 
             direct_match = (f1_p == f1_c and f2_p == f2_c)
             reverse_match = (f1_p == f2_c and f2_p == f1_c)
@@ -517,7 +532,7 @@ def scan_target(
 
     raw_exemptions = exemptions if exemptions is not None else []
     normalized_exemptions = {
-        tuple(sorted([k1.replace("\\", "/"), k2.replace("\\", "/")]))
+        tuple(sorted([_normalize_matcher_file(k1), _normalize_matcher_file(k2)]))
         for k1, k2 in raw_exemptions
     }
 
@@ -528,8 +543,8 @@ def scan_target(
         if audit_tests and not (u1["name"].startswith("test_") and u2["name"].startswith("test_")):
             continue
 
-        f1 = u1["file"].replace("\\", "/")
-        f2 = u2["file"].replace("\\", "/")
+        f1 = _normalize_matcher_file(u1.get("file"))
+        f2 = _normalize_matcher_file(u2.get("file"))
 
         if f1 == f2:
             fn1 = u1["name"].split(":")[0]

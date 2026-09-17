@@ -10,6 +10,8 @@ from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
+from pydoppelgangerhunt.config import normalize_path_string
+
 
 # ANSI Color Codes
 COLOR_RESET = "\033[0m"
@@ -42,7 +44,8 @@ def colorize(text: str, color_code: str, enabled: bool) -> str:
 
 def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:
     """Reads raw source code lines for a given unit from disk."""
-    f_raw = str(unit.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
+    raw_file = str(unit.get("file") or "")
+    f_raw = normalize_path_string(raw_file, strip_anchor=True)
     if not f_raw:
         s_d = int(unit.get("start") or 1)
         e_d = int(unit.get("end") or s_d)
@@ -57,8 +60,24 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
         n_d = str(unit.get("name") or "unit")
         return [f"# Source for {n_d} lines {s_d}-{e_d}\n"]
     try:
-        with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
-            all_lines = fh.readlines()
+        if file_path.suffix == ".ipynb" and "#cell_" in raw_file:
+            try:
+                cell_idx_str = raw_file.split("#cell_", 1)[-1]
+                cell_idx = int(cell_idx_str) - 1
+                nb_data = json.loads(file_path.read_text(encoding="utf-8", errors="replace"))
+                cells = nb_data.get("cells", [])
+                if 0 <= cell_idx < len(cells):
+                    cell = cells[cell_idx]
+                    src = cell.get("source", [])
+                    raw_lines = src if isinstance(src, list) else str(src).splitlines(keepends=True)
+                    all_lines = [l if l.endswith("\n") else l + "\n" for l in raw_lines]
+                else:
+                    all_lines = []
+            except (json.JSONDecodeError, ValueError):
+                all_lines = []
+        else:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
+                all_lines = fh.readlines()
         start = max(1, int(unit.get("start") or 1))
         end = min(len(all_lines), int(unit.get("end") or len(all_lines)))
         return all_lines[start - 1 : end]
@@ -75,8 +94,8 @@ def generate_clone_diff(
     """Produces unified line diff between two cloned code blocks, with optional syntax coloring."""
     lines1 = extract_unit_source_code(u1, repo_root)
     lines2 = extract_unit_source_code(u2, repo_root)
-    f1_norm = str(u1.get("file") or "").replace("\\", "/")
-    f2_norm = str(u2.get("file") or "").replace("\\", "/")
+    f1_norm = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+    f2_norm = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
     s1 = int(u1.get("start") or 1)
     e1 = int(u1.get("end") or s1)
     s2 = int(u2.get("start") or 1)
@@ -159,8 +178,8 @@ def format_sarif_report(
     """Formats detected clones into OASIS SARIF 2.1.0 standard schema for GitHub Code Scanning."""
     results: List[Dict[str, Any]] = []
     for idx, (sim, u1, u2) in enumerate(clones):
-        f1_norm = str(u1.get("file") or "").replace("\\", "/")
-        f2_norm = str(u2.get("file") or "").replace("\\", "/")
+        f1_norm = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+        f2_norm = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
         s1 = int(u1.get("start") or 1)
         e1 = int(u1.get("end") or s1)
         s2 = int(u2.get("start") or 1)
