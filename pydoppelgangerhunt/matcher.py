@@ -568,6 +568,14 @@ def scan_target(
             b2 = f"{base_f2}:{sym2}" if sym2 is not None else base_f2
             normalized_exemptions.add(_sorted_pair(b1, b2))
 
+    target_norm = target_dir.replace("\\", "/").strip("./").rstrip("/")
+    target_pfx = f"{target_norm}/" if target_norm and target_norm != "." else ""
+    target_prefixes = (
+        (target_pfx, "pyfloorplanner/", "src/", "pydoppelgangerhunt/")
+        if target_pfx
+        else ("pyfloorplanner/", "src/", "pydoppelgangerhunt/")
+    )
+
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
     for i, j in candidate_pairs:
         u1, u2 = units[i], units[j]
@@ -600,10 +608,10 @@ def scan_target(
 
         f1_pkg = f1
         f2_pkg = f2
-        for pfx in ("pyfloorplanner/", "src/", "pydoppelgangerhunt/"):
-            if f1_pkg.startswith(pfx):
+        for pfx in target_prefixes:
+            if pfx and f1_pkg.startswith(pfx):
                 f1_pkg = f1_pkg[len(pfx):]
-            if f2_pkg.startswith(pfx):
+            if pfx and f2_pkg.startswith(pfx):
                 f2_pkg = f2_pkg[len(pfx):]
 
         pair_id_rel = _sorted_pair(f"{f1}:{u1['name']}", f"{f2}:{u2['name']}")

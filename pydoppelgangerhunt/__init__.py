@@ -24,9 +24,11 @@ from pydoppelgangerhunt.clustering import (
 from pydoppelgangerhunt.config import (
     DEFAULT_EXCLUDES,
     DEFAULT_TOOL_TOML_CONTENT,
+    canonical_path_key,
     init_tool_configuration,
     load_toml_section,
     load_tool_config,
+    normalize_path_string,
 )
 from pydoppelgangerhunt.coverage import (
     check_asymmetric_coverage,
@@ -74,7 +76,9 @@ from pydoppelgangerhunt.matcher import (
 )
 from pydoppelgangerhunt.metrics import compute_repository_dry_stats
 from pydoppelgangerhunt.parser import (
+    BRANCH_NODE_TYPES,
     BUILTIN_NAMES,
+    COMPOUND_BLOCK_TYPES,
     compute_cyclomatic_complexity,
     extract_call_sequence,
     get_ast_characteristic_vector,
@@ -179,4 +183,8 @@ __all__ = [
     "DEFAULT_EXCLUDES",
     "DEFAULT_TOOL_TOML_CONTENT",
     "BUILTIN_NAMES",
+    "canonical_path_key",
+    "normalize_path_string",
+    "COMPOUND_BLOCK_TYPES",
+    "BRANCH_NODE_TYPES",
 ]

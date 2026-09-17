@@ -277,3 +277,40 @@ def test_cli_normalization_and_frequency_flags(tmp_path: Path) -> None:
     assert code == 0
 
 
+def test_public_api_exports() -> None:
+    """Verify that all declared exports in __all__ exist on pydoppelgangerhunt."""
+    for name in pydoppelgangerhunt.__all__:
+        assert hasattr(pydoppelgangerhunt, name), f"Missing export: {name}"
+    assert "canonical_path_key" in pydoppelgangerhunt.__all__
+    assert "normalize_path_string" in pydoppelgangerhunt.__all__
+    assert "COMPOUND_BLOCK_TYPES" in pydoppelgangerhunt.__all__
+    assert "BRANCH_NODE_TYPES" in pydoppelgangerhunt.__all__
+
+
+def test_cli_dynamic_target_resolution(tmp_path: Path, monkeypatch: Any) -> None:
+    """Verify CLI target fallback resolution from tool config and directory detection."""
+    monkeypatch.chdir(tmp_path)
+
+    # 1. No target, no pyproject.toml -> defaults to '.'
+    code_empty = pydoppelgangerhunt.main([])
+    assert code_empty == 0
+
+    # 2. Configured target in pyproject.toml
+    sub_dir = tmp_path / "custom_module"
+    sub_dir.mkdir()
+    (sub_dir / "code.py").write_text("def f() -> int:\n    return 10\n", encoding="utf-8")
+    pyproj = tmp_path / "pyproject.toml"
+    pyproj.write_text('[tool.pydoppelgangerhunt]\ntarget = "custom_module"\n', encoding="utf-8")
+    code_cfg = pydoppelgangerhunt.main([])
+    assert code_cfg == 0
+
+    # 3. CLI --init without target defaults to '.'
+    init_dir = tmp_path / "new_repo"
+    init_dir.mkdir()
+    monkeypatch.chdir(init_dir)
+    code_init = pydoppelgangerhunt.main(["--init"])
+    assert code_init == 0
+    assert (init_dir / ".pydoppelgangerhunt.toml").exists()
+
+
+

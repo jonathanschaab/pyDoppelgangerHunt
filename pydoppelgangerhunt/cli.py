@@ -55,7 +55,12 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         prog="pydoppelgangerhunt",
         description="pyDoppelgangerHunt: AST Structural Code Clone & Redundancy Gate",
     )
-    parser.add_argument("target", nargs="?", default="pyfloorplanner", help="Directory or package to scan")
+    parser.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="Directory or package to scan (default: configured target or current directory)",
+    )
     parser.add_argument("--threshold", type=float, default=None, help="Minimum similarity threshold (0.0 - 1.0)")
     parser.add_argument("--min-lines", type=int, default=None, help="Minimum lines of code per function/block")
     parser.add_argument("--min-tokens", type=int, default=None, help="Minimum normalized AST tokens")
@@ -204,8 +209,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
+    target_arg = args.target
     if args.init:
-        cfg_target = init_tool_configuration(args.target if os.path.isdir(args.target) else ".")
+        init_dir = target_arg if (target_arg and os.path.isdir(target_arg)) else "."
+        cfg_target = init_tool_configuration(init_dir)
         print(f"[OK] Initialized pyDoppelgangerHunt configuration at {cfg_target}")
         return 0
 
@@ -213,6 +220,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # Load configuration from pyproject.toml / config file
     tool_cfg = load_tool_config(args.config)
+    cfg_target = str(tool_cfg.get("target") or "")
+    default_dir = (
+        cfg_target
+        if cfg_target and os.path.isdir(cfg_target)
+        else (
+            "pyfloorplanner"
+            if os.path.isdir("pyfloorplanner")
+            else ("pydoppelgangerhunt" if os.path.isdir("pydoppelgangerhunt") else ".")
+        )
+    )
+    target = target_arg or default_dir
     threshold = args.threshold if args.threshold is not None else float(tool_cfg.get("threshold", 0.90))
     min_lines = args.min_lines if args.min_lines is not None else int(tool_cfg.get("min_lines", 8))
     min_tokens = args.min_tokens if args.min_tokens is not None else int(tool_cfg.get("min_tokens", 15))
@@ -252,8 +270,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             mod = importlib.import_module("check_semantic_clones")
             find_semantic_clones = getattr(mod, "find_semantic_clones")
             report_semantic_results = getattr(mod, "report_semantic_results")
-            print(f"Scanning '{args.target}' for Type-4 Semantic Clones & Consistency Violations...")
-            results = find_semantic_clones(args.target, excludes=excludes)
+            print(f"Scanning '{target}' for Type-4 Semantic Clones & Consistency Violations...")
+            results = find_semantic_clones(target, excludes=excludes)
             has_violations = report_semantic_results(results)
             if has_violations and args.strict_type4:
                 print(colorize("[FAIL] Type-4 semantic clone violations detected!", COLOR_BOLD + COLOR_RED, use_color))
@@ -296,12 +314,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     mode_desc = " + ".join(modes)
 
     if args.format == "text":
-        print(f"\nScanning '{args.target}' for AST structural clones (threshold >= {threshold:.0%}, min_lines={min_lines}, mode: {mode_desc})...")
+        print(f"\nScanning '{target}' for AST structural clones (threshold >= {threshold:.0%}, min_lines={min_lines}, mode: {mode_desc})...")
 
     sort_by = "priority" if args.priority else args.sort_by
 
     clones = scan_target(
-        args.target,
+        target,
         min_lines=min_lines,
         min_tokens=min_tokens,
         threshold=threshold,
@@ -343,7 +361,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     if args.record_baseline:
-        bp = record_baseline(clones, args.record_baseline, args.target, threshold)
+        bp = record_baseline(clones, args.record_baseline, target, threshold)
         print(f"[OK] Recorded {len(clones)} clone baseline pair(s) to {bp}")
         return 0
 
@@ -418,13 +436,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stats: Optional[Dict[str, Any]] = None
     if args.stats or args.summary or args.html:
         stats = compute_repository_dry_stats(
-            args.target,
+            target,
             clones,
             excludes=excludes,
             include_notebooks=getattr(args, "notebooks", False),
         )
         if args.summary:
-            _write_artifact_file(args.summary, format_markdown_summary(stats, args.target), "SUMMARY", args.format == "text")
+            _write_artifact_file(args.summary, format_markdown_summary(stats, target), "SUMMARY", args.format == "text")
 
     cov_data: Dict[str, Set[int]] = {}
     if args.coverage:
@@ -433,7 +451,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.html:
         html_report = generate_html_report(
             clones,
-            args.target,
+            target,
             threshold,
             families=families,
             stats=stats,
@@ -451,9 +469,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.format in ("sarif", "json"):
         report_data = (
-            format_sarif_report(clones, args.target, threshold)
+            format_sarif_report(clones, target, threshold)
             if args.format == "sarif"
-            else format_json_report(clones, args.target, threshold, families=families, stats=stats)
+            else format_json_report(clones, target, threshold, families=families, stats=stats)
         )
         emit_structured_report(
             report_data, "SARIF 2.1.0" if args.format == "sarif" else "JSON", args.output
