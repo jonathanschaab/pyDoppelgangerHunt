@@ -8003,4 +8003,145 @@ def test_cross_module_helper_name_collision_deduplication(tmp_path: Path) -> Non
     assert "from coll_pkg.f1 import _shared_handle_data_process_data_2" in patch
 
 
+def test_super_call_rejected_for_module_binding(tmp_path: Path) -> None:
+    """Verifies that methods containing super() are rejected when effective binding is module."""
+    src = (
+        "class Base:\n"
+        "    def run(self) -> str:\n"
+        "        return 'base'\n"
+        "\n"
+        "class ChildA(Base):\n"
+        "    def execute(self) -> str:\n"
+        "        val = super().run() + '_a'\n"
+        "        return val\n"
+        "\n"
+        "class ChildB(Base):\n"
+        "    def execute(self) -> str:\n"
+        "        val = super().run() + '_b'\n"
+        "        return val\n"
+    )
+    f = tmp_path / "super_mod.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {"name": "execute", "file": "super_mod.py", "start": 6, "end": 8, "kind": "function", "enclosing_class": "ChildA"}
+    u2 = {"name": "execute", "file": "super_mod.py", "start": 11, "end": 13, "kind": "function", "enclosing_class": "ChildB"}
+
+    # Cross-class clones resolve to module binding -> should reject
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert patch == ""
+
+    # Explicit module binding on same class -> should also reject
+    u3 = {"name": "execute", "file": "super_mod.py", "start": 6, "end": 8, "kind": "function", "enclosing_class": "ChildA"}
+    patch_module = generate_refactoring_patch(
+        [(1.0, u1, u3)],
+        repo_root=str(tmp_path),
+        method_binding="module",
+        replace_clones=True,
+    )
+    assert patch_module == ""
+
+
+def test_super_call_accepted_for_same_class_method_binding(tmp_path: Path) -> None:
+    """Verifies that methods containing super() within the same class generate a valid class helper method."""
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    src = (
+        "class BaseHandler:\n"
+        "    def perform(self, x: int) -> int:\n"
+        "        return x * 10\n"
+        "\n"
+        "class CustomHandler(BaseHandler):\n"
+        "    def handle_primary(self, x: int) -> int:\n"
+        "        base_val = super().perform(x)\n"
+        "        return base_val + 5\n"
+        "\n"
+        "    def handle_secondary(self, x: int) -> int:\n"
+        "        base_val = super().perform(x)\n"
+        "        return base_val + 5\n"
+    )
+    f = tmp_path / "handlers.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {"name": "handle_primary", "file": "handlers.py", "start": 6, "end": 8, "kind": "function", "enclosing_class": "CustomHandler"}
+    u2 = {"name": "handle_secondary", "file": "handlers.py", "start": 10, "end": 12, "kind": "function", "enclosing_class": "CustomHandler"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        method_binding="method",
+        replace_clones=True,
+    )
+    assert patch != ""
+    assert "def _shared_handle_primary" in patch
+    assert "super().perform(x)" in patch
+
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    run_proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from handlers import CustomHandler; "
+            "h = CustomHandler(); "
+            "print(h.handle_primary(3), h.handle_secondary(7))",
+        ],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run_proc.returncode == 0, f"run failed: {run_proc.stderr}"
+    assert run_proc.stdout.strip() == "35 75"
+
+
+def test_cross_module_global_rejected(tmp_path: Path) -> None:
+    """Verifies that clone pairs using global variables across different files are rejected."""
+    pkg = tmp_path / "state_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = (
+        "COUNTER = 0\n"
+        "\n"
+        "def increment_counter() -> int:\n"
+        "    global COUNTER\n"
+        "    COUNTER += 1\n"
+        "    return COUNTER\n"
+    )
+    src2 = (
+        "COUNTER = 100\n"
+        "\n"
+        "def advance_counter() -> int:\n"
+        "    global COUNTER\n"
+        "    COUNTER += 1\n"
+        "    return COUNTER\n"
+    )
+    (pkg / "mod_a.py").write_text(src1, encoding="utf-8")
+    (pkg / "mod_b.py").write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "increment_counter", "file": "state_pkg/mod_a.py", "start": 3, "end": 6, "kind": "function"}
+    u2 = {"name": "advance_counter", "file": "state_pkg/mod_b.py", "start": 3, "end": 6, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert patch == ""
+
+
+
 

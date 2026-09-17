@@ -48,10 +48,12 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.deleted_names: Set[str] = set()
         self._scope_stack: List[Set[str]] = []
         self._comprehension_depth: int = 0
+        self.class_depth: int = 0
         self.loop_offset: int = loop_offset
         self.loop_depth: int = 0
         self.has_return: bool = False
         self.has_yield: bool = False
+        self.has_super: bool = False
         self.naked_breaks: int = 0
         self.naked_continues: int = 0
         self.local_imports: List[str] = []
@@ -217,11 +219,29 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._scope_stack.append(set())
             created_outer = True
         self._scope_stack.append(set())
+        self.class_depth += 1
         for stmt in node.body:
             self.visit(stmt)
+        self.class_depth -= 1
         self._scope_stack.pop()
         if created_outer:
             self._scope_stack.pop()
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if self.class_depth == 0:
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "super"
+                and "super" not in self.stores
+                and "super" not in self.params
+            ) or (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "super"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "builtins"
+            ):
+                self.has_super = True
+        self.generic_visit(node)
 
     def visit_MatchAs(self, node: ast.AST) -> None:  # pragma: no cover (py310+)
         name = getattr(node, "name", None)
@@ -1187,6 +1207,7 @@ def _inspect_unit_scope(
         "is_control_flow_safe": True,
         "has_yield": False,
         "has_return": False,
+        "has_super": False,
         "local_imports": [],
         "yield_expr_names": [],
         "is_async": False,
@@ -1364,6 +1385,7 @@ def _inspect_unit_scope(
         "is_control_flow_safe": is_control_flow_safe,
         "has_yield": visitor.has_yield,
         "has_return": visitor.has_return,
+        "has_super": visitor.has_super,
         "local_imports": visitor.local_imports,
         "yield_expr_names": visitor.yield_expr_names,
         "is_async": visitor.is_async,
@@ -1411,6 +1433,7 @@ def analyze_unit_variable_scope(
         is_safe = info1["is_control_flow_safe"] and info2["is_control_flow_safe"]
         has_yield = info1["has_yield"] or info2["has_yield"]
         has_return = info1["has_return"] or info2["has_return"]
+        has_super = bool(info1.get("has_super", False) or info2.get("has_super", False))
         local_imports = list(dict.fromkeys(info1["local_imports"] + info2["local_imports"]))
         yield_expr_names = info1["yield_expr_names"] + info2["yield_expr_names"]
         is_async = info1.get("is_async", False) or info2.get("is_async", False)
@@ -1433,6 +1456,7 @@ def analyze_unit_variable_scope(
         is_safe = info1["is_control_flow_safe"]
         has_yield = info1["has_yield"]
         has_return = info1["has_return"]
+        has_super = bool(info1.get("has_super", False))
         local_imports = info1["local_imports"]
         yield_expr_names = info1["yield_expr_names"]
         is_async = info1.get("is_async", False)
@@ -1468,6 +1492,7 @@ def analyze_unit_variable_scope(
         "is_control_flow_safe": is_safe,
         "has_yield": has_yield,
         "has_return": has_return,
+        "has_super": has_super,
         "local_imports": local_imports,
         "yield_expr_names": yield_expr_names,
         "is_async": is_async,
@@ -2477,6 +2502,10 @@ def synthesize_shared_helper_code(
         return ""
     if scope1.get("nonlocals") or scope2.get("nonlocals") or scope.get("nonlocals"):
         return ""
+    if not is_same_class and not _is_same_file_path(f1, f2, repo_root=repo_root) and (
+        scope1.get("globals") or scope2.get("globals") or scope.get("globals")
+    ):
+        return ""
 
     is_static_clone = bool(
         is_static
@@ -2503,6 +2532,10 @@ def synthesize_shared_helper_code(
         is_in_method=is_in_method,
         receiver_kind=k1,
     )
+
+    has_super = bool(scope1.get("has_super") or scope2.get("has_super"))
+    if has_super and (effective_binding == "module" or is_static_clone):
+        return ""
 
     if effective_binding == "module":
         inputs = _prune_unshared_receivers(inputs, u1, u2, scope1, scope2, repo_root=repo_root)
@@ -3497,6 +3530,8 @@ def generate_refactoring_patch(
             continue
         if s1.get("nonlocals") or s2.get("nonlocals"):
             continue
+        if not is_same_file and (s1.get("globals") or s2.get("globals")):
+            continue
 
         hazards1 = set(s1.get("control_flow_hazards", []))
         hazards2 = set(s2.get("control_flow_hazards", []))
@@ -3523,6 +3558,10 @@ def generate_refactoring_patch(
             is_in_method=is_in_method,
             receiver_kind=fn1_kind,
         )
+
+        has_super = bool(s1.get("has_super") or s2.get("has_super"))
+        if has_super and (effective_binding == "module" or is_static):
+            continue
 
         helper_indent = (
             enc1["method_indent"]
@@ -3662,7 +3701,7 @@ def generate_refactoring_patch(
             inputs=inputs,
             outputs=outputs,
             scope=scope,
-            target_inputs=inputs,
+            target_inputs=t_inputs1,
             target_outputs=u1_outs if len(u1_outs) == len(outputs) else outputs,
             await_prefix=await_prefix,
             step=step,
