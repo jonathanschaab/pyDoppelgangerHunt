@@ -2217,6 +2217,117 @@ def _format_helper_parameters(
     return params
 
 
+def _infer_helper_return_type(
+    resolved_ret: str,
+    helper_outputs: List[str],
+    conditional_outs: Set[str],
+    scope: Dict[str, Any],
+    meta1: Dict[str, Any],
+    meta2: Dict[str, Any],
+    type_merge_strategy: str = "fallback_any",
+    is_async: bool = False,
+    unit_kind: Optional[str] = None,
+) -> str:
+    """Infers the return type annotation for a synthesized shared helper function."""
+    if scope.get("has_yield"):
+        if is_async:
+            return "AsyncIterator[Any]"
+        inferred_yield_type = None
+        for kind, name in scope.get("yield_expr_names", []):
+            m_t = meta1.get(name, {}).get("type") or meta2.get(name, {}).get("type")
+            if not m_t:
+                continue
+            if kind == "yield":
+                inferred_yield_type = m_t
+                break
+            if kind == "yield_from":
+                for prefix in ("Iterator[", "Iterable[", "List[", "Sequence[", "Set["):
+                    if m_t.startswith(prefix) and m_t.endswith("]"):
+                        inferred_yield_type = m_t[len(prefix) : -1].strip()
+                        break
+                if inferred_yield_type:
+                    break
+        if resolved_ret != "Any":
+            return resolved_ret
+        if inferred_yield_type:
+            return f"Iterator[{inferred_yield_type}]"
+        return "Iterator[Any]"
+
+    if len(helper_outputs) >= 2:
+        out_types: List[str] = []
+        for out_var in helper_outputs:
+            t1 = meta1.get(out_var, {}).get("type")
+            t2 = meta2.get(out_var, {}).get("type")
+            t_merged = _merge_types(t1, t2, type_merge_strategy)
+            if out_var in conditional_outs:
+                if not t_merged.startswith("Optional[") and "None" not in t_merged:
+                    t_merged = f"Optional[{t_merged}]"
+            out_types.append(t_merged)
+        return f"Tuple[{', '.join(out_types)}]"
+
+    if len(helper_outputs) == 1:
+        out_var = helper_outputs[0]
+        t1 = meta1.get(out_var, {}).get("type")
+        t2 = meta2.get(out_var, {}).get("type")
+        out_t = _merge_types(t1, t2, type_merge_strategy)
+        if out_var in conditional_outs:
+            if not out_t.startswith("Optional[") and "None" not in out_t:
+                out_t = f"Optional[{out_t}]"
+        return_type = resolved_ret if resolved_ret != "Any" else out_t
+        if out_var in conditional_outs:
+            if not return_type.startswith("Optional[") and "None" not in return_type and return_type != "None":
+                return_type = f"Optional[{return_type}]"
+        return return_type
+
+    if not helper_outputs and not scope.get("has_return") and resolved_ret == "Any":
+        return "Any" if unit_kind in ("comprehension", "complex_expr") else "None"
+
+    return resolved_ret
+
+
+def _format_helper_docstring(
+    call_target: str,
+    helper_outputs: List[str],
+    scope: Dict[str, Any],
+    *,
+    is_async: bool = False,
+    doc_indent: str = "    ",
+    sub_indent: str = "        ",
+    await_prefix: str = "",
+) -> str:
+    """Formats docstring with call-site example and control flow hazard warnings."""
+    docstring_lines = [f"{doc_indent}\"\"\"Auto-extracted shared helper for duplicate logic."]
+    is_async_gen = bool(scope.get("has_yield") and is_async)
+    is_sync_gen = bool(scope.get("has_yield") and not is_async)
+    if is_async_gen:
+        call_site = f"async for _item in {call_target}(...):\n{sub_indent}yield _item"
+    elif is_sync_gen:
+        if helper_outputs:
+            assign = ", ".join(helper_outputs) if len(helper_outputs) >= 2 else helper_outputs[0]
+            call_site = f"{assign} = (yield from {call_target}(...))"
+        else:
+            call_site = f"yield from {call_target}(...)"
+    elif helper_outputs:
+        assign = ", ".join(helper_outputs) if len(helper_outputs) >= 2 else helper_outputs[0]
+        call_site = f"{assign} = {await_prefix}{call_target}(...)"
+    else:
+        call_site = f"{await_prefix}{call_target}(...)"
+    docstring_lines.append("")
+    docstring_lines.append(f"{doc_indent}Call site:")
+    docstring_lines.append(f"{sub_indent}{call_site}")
+
+    hazards = scope.get("control_flow_hazards", [])
+    if hazards:
+        hazard_str = ", ".join(hazards)
+        docstring_lines.append("")
+        docstring_lines.append(
+            f"{doc_indent}WARNING: Non-local control flow hazard detected ({hazard_str}). "
+            "Direct extraction alters caller control flow semantics."
+        )
+    docstring_lines.append(f"{doc_indent}\"\"\"")
+    return "\n".join(docstring_lines)
+
+
 def synthesize_shared_helper_code(
     u1: Dict[str, Any],
     u2: Dict[str, Any],
@@ -2407,58 +2518,17 @@ def synthesize_shared_helper_code(
         and v not in scope.get("nonlocals", [])
     ]
 
-    if scope.get("has_yield"):
-        if is_async:
-            return_type = "AsyncIterator[Any]"
-        else:
-            inferred_yield_type = None
-            for kind, name in scope.get("yield_expr_names", []):
-                m_t = meta1.get(name, {}).get("type") or meta2.get(name, {}).get("type")
-                if not m_t:
-                    continue
-                if kind == "yield":
-                    inferred_yield_type = m_t
-                    break
-                if kind == "yield_from":
-                    for prefix in ("Iterator[", "Iterable[", "List[", "Sequence[", "Set["):
-                        if m_t.startswith(prefix) and m_t.endswith("]"):
-                            inferred_yield_type = m_t[len(prefix) : -1].strip()
-                            break
-                    if inferred_yield_type:
-                        break
-            if resolved_ret != "Any":
-                return_type = resolved_ret
-            elif inferred_yield_type:
-                return_type = f"Iterator[{inferred_yield_type}]"
-            else:
-                return_type = "Iterator[Any]"
-    elif len(helper_outputs) >= 2:
-        out_types = []
-        for out_var in helper_outputs:
-            t1 = meta1.get(out_var, {}).get("type")
-            t2 = meta2.get(out_var, {}).get("type")
-            t_merged = _merge_types(t1, t2, type_merge_strategy)
-            if out_var in conditional_outs:
-                if not t_merged.startswith("Optional[") and "None" not in t_merged:
-                    t_merged = f"Optional[{t_merged}]"
-            out_types.append(t_merged)
-        return_type = f"Tuple[{', '.join(out_types)}]"
-    elif len(helper_outputs) == 1:
-        out_var = helper_outputs[0]
-        t1 = meta1.get(out_var, {}).get("type")
-        t2 = meta2.get(out_var, {}).get("type")
-        out_t = _merge_types(t1, t2, type_merge_strategy)
-        if out_var in conditional_outs:
-            if not out_t.startswith("Optional[") and "None" not in out_t:
-                out_t = f"Optional[{out_t}]"
-        return_type = resolved_ret if resolved_ret != "Any" else out_t
-        if out_var in conditional_outs:
-            if not return_type.startswith("Optional[") and "None" not in return_type and return_type != "None":
-                return_type = f"Optional[{return_type}]"
-    elif not helper_outputs and not scope.get("has_return") and resolved_ret == "Any":
-        return_type = "Any" if u1.get("kind") in ("comprehension", "complex_expr") else "None"
-    else:
-        return_type = resolved_ret
+    return_type = _infer_helper_return_type(
+        resolved_ret,
+        helper_outputs,
+        conditional_outs,
+        scope,
+        meta1,
+        meta2,
+        type_merge_strategy=type_merge_strategy,
+        is_async=is_async,
+        unit_kind=u1.get("kind"),
+    )
 
     params_str = ", ".join(params) if params else "*args: Any, **kwargs: Any"
 
@@ -2517,36 +2587,15 @@ def synthesize_shared_helper_code(
     else:
         call_target = helper_name
 
-    docstring_lines = [f"{doc_indent}\"\"\"Auto-extracted shared helper for duplicate logic."]
-    is_async_gen = bool(scope.get("has_yield") and is_async)
-    is_sync_gen = bool(scope.get("has_yield") and not is_async)
-    if is_async_gen:
-        call_site = f"async for _item in {call_target}(...):\n{sub_indent}yield _item"
-    elif is_sync_gen:
-        if helper_outputs:
-            assign = ", ".join(helper_outputs) if len(helper_outputs) >= 2 else helper_outputs[0]
-            call_site = f"{assign} = (yield from {call_target}(...))"
-        else:
-            call_site = f"yield from {call_target}(...)"
-    elif helper_outputs:
-        assign = ", ".join(helper_outputs) if len(helper_outputs) >= 2 else helper_outputs[0]
-        call_site = f"{assign} = {await_prefix}{call_target}(...)"
-    else:
-        call_site = f"{await_prefix}{call_target}(...)"
-    docstring_lines.append("")
-    docstring_lines.append(f"{doc_indent}Call site:")
-    docstring_lines.append(f"{sub_indent}{call_site}")
-
-    hazards = scope.get("control_flow_hazards", [])
-    if hazards:
-        hazard_str = ", ".join(hazards)
-        docstring_lines.append("")
-        docstring_lines.append(
-            f"{doc_indent}WARNING: Non-local control flow hazard detected ({hazard_str}). "
-            "Direct extraction alters caller control flow semantics."
-        )
-    docstring_lines.append(f"{doc_indent}\"\"\"")
-    docstring_str = "\n".join(docstring_lines)
+    docstring_str = _format_helper_docstring(
+        call_target,
+        helper_outputs,
+        scope,
+        is_async=is_async,
+        doc_indent=doc_indent,
+        sub_indent=sub_indent,
+        await_prefix=await_prefix,
+    )
 
     indented_body = "\n".join(f"{body_indent}{ln}" if ln.strip() else "" for ln in common_lines)
     if effective_binding == "method":
@@ -3010,6 +3059,94 @@ def _build_whole_method_delegation(
     return header + delegation_stmt
 
 
+def _build_unit_delegation_call(
+    target_unit: Dict[str, Any],
+    orig_text: str,
+    orig_lines: List[str],
+    *,
+    effective_binding: str,
+    helper_name: str,
+    inputs: List[str],
+    outputs: List[str],
+    scope: Dict[str, Any],
+    await_prefix: str = "",
+    step: Optional[str] = None,
+) -> str:
+    """Constructs replacement delegation call statement for a clone unit in refactoring patches."""
+    u_start = int(target_unit.get("start") or 1)
+    lead = orig_lines[u_start - 1] if 1 <= u_start <= len(orig_lines) else ""
+    indent = lead[: len(lead) - len(lead.lstrip())]
+
+    t_fn = find_enclosing_function(orig_text, target_unit)
+    t_enc = find_enclosing_class(orig_text, target_unit)
+    if not _is_method_of_class(t_fn, t_enc):
+        t_fn = None
+    t_kind = _get_enclosing_receiver_kind(t_fn) if t_fn else "none"
+
+    if effective_binding == "method":
+        if t_kind == "static":
+            unit_call_prefix = "__class__."
+            unit_receiver_omit: Optional[str] = None
+        elif t_kind == "class":
+            unit_call_prefix = "cls."
+            unit_receiver_omit = "cls"
+        else:
+            unit_call_prefix = "self."
+            unit_receiver_omit = "self"
+    else:
+        unit_call_prefix = ""
+        unit_receiver_omit = (
+            "receivers"
+            if t_kind in ("static", "none")
+            else ("self" if t_kind == "class" else "cls")
+        )
+
+    unit_args_str = _format_call_arguments(
+        inputs,
+        scope.get("param_details", []),
+        receiver_to_omit=unit_receiver_omit,
+    )
+
+    is_whole_method = target_unit.get("kind") in ("function", "closure")
+    if is_whole_method:
+        return _build_whole_method_delegation(
+            orig_text,
+            target_unit,
+            call_prefix=unit_call_prefix,
+            helper_name=helper_name,
+            args_str=unit_args_str,
+            await_prefix=await_prefix,
+            has_return=bool(outputs or scope.get("has_return", True)),
+            is_async=bool(scope.get("is_async")),
+            has_yield=bool(scope.get("has_yield")),
+        )
+
+    if target_unit.get("kind") in ("comprehension", "complex_expr"):
+        call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
+        return f"{await_prefix}{call_expr}"
+
+    call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
+    rep_step = step or ("\t" if "\t" in indent else "    ")
+    if scope.get("has_yield") and scope.get("is_async"):
+        return (
+            f"{indent}async for _item in {call_expr}:\n"
+            f"{indent}{rep_step}yield _item\n"
+        )
+
+    is_sync_gen = bool(scope.get("has_yield"))
+    if outputs:
+        assign_target = ", ".join(outputs) if len(outputs) >= 2 else outputs[0]
+        rhs = (
+            f"(yield from {call_expr})"
+            if is_sync_gen
+            else f"{await_prefix}{call_expr}"
+        )
+        return f"{indent}{assign_target} = {rhs}\n"
+
+    prefix = "yield from " if is_sync_gen else await_prefix
+    return f"{indent}{prefix}{call_expr}\n"
+
+
 def generate_refactoring_patch(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     repo_root: Optional[str] = None,
@@ -3195,82 +3332,19 @@ def generate_refactoring_patch(
         if replace_clones:
             units_to_replace: List[Tuple[Dict[str, Any], str]] = []
             for target_unit in candidate_units:
-                u_start = int(target_unit.get("start") or 1)
-                if 1 <= u_start <= len(orig_lines):
-                    lead = orig_lines[u_start - 1]
-                    indent = lead[: len(lead) - len(lead.lstrip())]
-
-                    t_fn = find_enclosing_function(orig_text, target_unit)
-                    t_enc = find_enclosing_class(orig_text, target_unit)
-                    if not _is_method_of_class(t_fn, t_enc):
-                        t_fn = None
-                    t_kind = _get_enclosing_receiver_kind(t_fn) if t_fn else "none"
-
-                    if effective_binding == "method":
-                        if t_kind == "static":
-                            unit_call_prefix = "__class__."
-                            unit_receiver_omit = None
-                        elif t_kind == "class":
-                            unit_call_prefix = "cls."
-                            unit_receiver_omit = "cls"
-                        else:
-                            unit_call_prefix = "self."
-                            unit_receiver_omit = "self"
-                    else:
-                        unit_call_prefix = ""
-                        unit_receiver_omit = (
-                            "receivers"
-                            if t_kind in ("static", "none")
-                            else ("self" if t_kind == "class" else "cls")
-                        )
-
-                    unit_args_str = _format_call_arguments(
-                        inputs,
-                        scope.get("param_details", []),
-                        receiver_to_omit=unit_receiver_omit,
-                    )
-
-                    is_whole_method = target_unit.get("kind") in ("function", "closure")
-                    if is_whole_method:
-                        rep_stmt = _build_whole_method_delegation(
-                            orig_text,
-                            target_unit,
-                            call_prefix=unit_call_prefix,
-                            helper_name=helper_name,
-                            args_str=unit_args_str,
-                            await_prefix=await_prefix,
-                            has_return=bool(outputs or scope.get("has_return", True)),
-                            is_async=bool(scope.get("is_async")),
-                            has_yield=bool(scope.get("has_yield")),
-                        )
-                    elif target_unit.get("kind") in ("comprehension", "complex_expr"):
-                        call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
-                        rep_stmt = f"{await_prefix}{call_expr}"
-                    else:
-                        call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
-                        rep_step = step or ("\t" if "\t" in indent else "    ")
-                        if scope.get("has_yield") and scope.get("is_async"):
-                            rep_stmt = (
-                                f"{indent}async for _item in {call_expr}:\n"
-                                f"{indent}{rep_step}yield _item\n"
-                            )
-                        else:
-                            is_sync_gen = bool(scope.get("has_yield"))
-                            if outputs:
-                                assign_target = (
-                                    ", ".join(outputs) if len(outputs) >= 2 else outputs[0]
-                                )
-                                rhs = (
-                                    f"(yield from {call_expr})"
-                                    if is_sync_gen
-                                    else f"{await_prefix}{call_expr}"
-                                )
-                                rep_stmt = f"{indent}{assign_target} = {rhs}\n"
-                            else:
-                                prefix = "yield from " if is_sync_gen else await_prefix
-                                rep_stmt = f"{indent}{prefix}{call_expr}\n"
-
-                    units_to_replace.append((target_unit, rep_stmt))
+                rep_stmt = _build_unit_delegation_call(
+                    target_unit,
+                    orig_text,
+                    orig_lines,
+                    effective_binding=effective_binding,
+                    helper_name=helper_name,
+                    inputs=inputs,
+                    outputs=outputs,
+                    scope=scope,
+                    await_prefix=await_prefix,
+                    step=step,
+                )
+                units_to_replace.append((target_unit, rep_stmt))
 
             current_text = refactor_module_units(orig_text, units_to_replace)
 

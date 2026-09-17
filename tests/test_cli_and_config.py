@@ -1024,3 +1024,216 @@ type_merge_strategy = "union"
         assert kwargs_cfg.get("replace_clones") is True
         assert kwargs_cfg.get("type_merge_strategy") == "union"
 
+
+def test_batch_69_modular_decomposition(tmp_path: Path) -> None:
+    """Batch 69: Validate extracted single-responsibility helpers in cli.py and fixer.py."""
+    # pylint: disable=import-outside-toplevel
+    import argparse
+    from unittest import mock
+    from pydoppelgangerhunt.cli import (
+        _apply_baseline_and_diff_filters,
+        _render_text_violations,
+    )
+    from pydoppelgangerhunt.fixer import (
+        _infer_helper_return_type,
+        _format_helper_docstring,
+        _build_unit_delegation_call,
+    )
+
+    # 1. Test _apply_baseline_and_diff_filters
+    sample_clones = [
+        (0.95, {"file": "mod1.py", "start": 1, "end": 10, "name": "fn1"}, {"file": "mod2.py", "start": 1, "end": 10, "name": "fn2"})
+    ]
+    # Prune without baseline path -> exit code 1
+    args_err1 = argparse.Namespace(
+        prune_baseline=True, baseline=None, diff_only=False, format="text"
+    )
+    clones_res, exit_code = _apply_baseline_and_diff_filters(
+        sample_clones, args_err1, {}, "."
+    )
+    assert exit_code == 1
+
+    # Prune with missing file -> exit code 1
+    args_err2 = argparse.Namespace(
+        prune_baseline=True, baseline=str(tmp_path / "nonexistent.json"), diff_only=False, format="text"
+    )
+    _, exit_code = _apply_baseline_and_diff_filters(
+        sample_clones, args_err2, {}, "."
+    )
+    assert exit_code == 1
+
+    # Normal baseline loading & suppression
+    base_file = tmp_path / "base.json"
+    base_file.write_text("{}", encoding="utf-8")
+    args_normal = argparse.Namespace(
+        prune_baseline=False,
+        baseline=str(base_file),
+        diff_only=False,
+        format="text",
+    )
+    with mock.patch("pydoppelgangerhunt.cli.load_baseline", return_value=set()):
+        with mock.patch("pydoppelgangerhunt.cli.filter_clones_by_baseline", return_value=(sample_clones, 0)):
+            res_clones, early_exit = _apply_baseline_and_diff_filters(
+                sample_clones, args_normal, {}, "."
+            )
+            assert early_exit is None
+            assert len(res_clones) == 1
+
+    # 2. Test _render_text_violations (families and pairwise)
+    u1 = {"file": "test_foo.py", "start": 1, "end": 5, "name": "test_one"}
+    u2 = {"file": "test_bar.py", "start": 1, "end": 5, "name": "test_two"}
+    clones = [(0.90, u1, u2)]
+
+    # Flat clone report
+    args_flat = argparse.Namespace(cluster=False, blame=False, suggest=False, diff=False)
+    lines_flat = _render_text_violations(
+        clones, 0.85, "priority", args=args_flat, audit_tests_enabled=True
+    )
+    assert any("[Priority" in ln for ln in lines_flat)
+    assert any("@pytest.mark.parametrize" in ln for ln in lines_flat)
+    assert any("Please refactor structural duplicates" in ln for ln in lines_flat)
+
+    # Clustered family report
+    fam = {
+        "family_id": "fam_1",
+        "member_count": 2,
+        "avg_similarity": 0.90,
+        "max_similarity": 0.90,
+        "coherence": 1.0,
+        "total_lines": 10,
+        "unique_files": ["test_foo.py", "test_bar.py"],
+        "medoid": u1,
+        "members": [u1, u2],
+    }
+    args_cluster = argparse.Namespace(cluster=True, blame=False, suggest=False, diff=False)
+    lines_fam = _render_text_violations(
+        clones, 0.85, "similarity", args=args_cluster, families=[fam]
+    )
+    assert any("[fam_1]" in ln for ln in lines_fam)
+    assert any("[medoid]" in ln for ln in lines_fam)
+
+    # 3. Test _infer_helper_return_type
+    # Async generator
+    ret_async_gen = _infer_helper_return_type(
+        "Any", [], set(), {"has_yield": True}, {}, {}, is_async=True
+    )
+    assert ret_async_gen == "AsyncIterator[Any]"
+
+    # Sync generator with inferred item type
+    ret_sync_gen = _infer_helper_return_type(
+        "Any",
+        [],
+        set(),
+        {"has_yield": True, "yield_expr_names": [("yield", "item")]},
+        {"item": {"type": "int"}},
+        {},
+        is_async=False,
+    )
+    assert ret_sync_gen == "Iterator[int]"
+
+    # Sync generator with yield from List[str]
+    ret_sync_yf = _infer_helper_return_type(
+        "Any",
+        [],
+        set(),
+        {"has_yield": True, "yield_expr_names": [("yield_from", "items")]},
+        {"items": {"type": "List[str]"}},
+        {},
+        is_async=False,
+    )
+    assert ret_sync_yf == "Iterator[str]"
+
+    # Multi-output tuple with conditional output
+    ret_tuple = _infer_helper_return_type(
+        "Any",
+        ["a", "b"],
+        {"b"},
+        {},
+        {"a": {"type": "int"}, "b": {"type": "str"}},
+        {},
+    )
+    assert ret_tuple == "Tuple[int, Optional[str]]"
+
+    # Single output
+    ret_single = _infer_helper_return_type(
+        "Any",
+        ["res"],
+        set(),
+        {},
+        {"res": {"type": "float"}},
+        {},
+    )
+    assert ret_single == "float"
+
+    # Comprehension fallback
+    ret_comp = _infer_helper_return_type(
+        "Any", [], set(), {"has_return": False}, {}, {}, unit_kind="comprehension"
+    )
+    assert ret_comp == "Any"
+
+    # Void fallback
+    ret_void = _infer_helper_return_type(
+        "Any", [], set(), {"has_return": False}, {}, {}, unit_kind="block"
+    )
+    assert ret_void == "None"
+
+    # 4. Test _format_helper_docstring
+    # Async generator call site
+    doc_async = _format_helper_docstring(
+        "helper", [], {"has_yield": True}, is_async=True
+    )
+    assert "async for _item in helper(...):" in doc_async
+
+    # Sync generator call site with assignment
+    doc_sync = _format_helper_docstring(
+        "helper", ["res1", "res2"], {"has_yield": True}, is_async=False
+    )
+    assert "res1, res2 = (yield from helper(...))" in doc_sync
+
+    # Hazard warning
+    doc_hazard = _format_helper_docstring(
+        "helper", [], {"control_flow_hazards": ["naked_break"]}
+    )
+    assert "WARNING: Non-local control flow hazard detected" in doc_hazard
+
+    # 5. Test _build_unit_delegation_call
+    orig_code = (
+        "class MyService:\n"
+        "    def do_work(self, a: int) -> int:\n"
+        "        x = a * 2\n"
+        "        return x\n"
+    )
+    orig_lines = orig_code.splitlines(keepends=True)
+    target_unit = {"kind": "block", "start": 3, "end": 3}
+    scope_inst = {
+        "inputs": ["self", "a"],
+        "outputs": ["x"],
+        "param_details": [{"name": "self"}, {"name": "a"}],
+    }
+    call_inst = _build_unit_delegation_call(
+        target_unit,
+        orig_code,
+        orig_lines,
+        effective_binding="method",
+        helper_name="_shared_calc",
+        inputs=["self", "a"],
+        outputs=["x"],
+        scope=scope_inst,
+    )
+    assert "x = self._shared_calc(a)" in call_inst
+
+    # Comprehension call
+    target_comp = {"kind": "comprehension", "start": 3, "end": 3}
+    call_comp = _build_unit_delegation_call(
+        target_comp,
+        orig_code,
+        orig_lines,
+        effective_binding="module",
+        helper_name="_shared_comp",
+        inputs=["a"],
+        outputs=[],
+        scope=scope_inst,
+    )
+    assert call_comp == "_shared_comp(a)"
+
+
