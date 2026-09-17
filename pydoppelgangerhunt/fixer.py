@@ -3073,6 +3073,11 @@ def generate_refactoring_patch(
         if bool(s1.get("has_yield")) != bool(s2.get("has_yield")):
             continue
 
+        hazards1 = set(s1.get("control_flow_hazards", []))
+        hazards2 = set(s2.get("control_flow_hazards", []))
+        if any(h in ("naked_break", "naked_continue") for h in hazards1 | hazards2):
+            continue
+
         if receiver_kinds_differ:
             if _has_receiver_reference(u1, s1, repo_root=str(root)) or _has_receiver_reference(u2, s2, repo_root=str(root)):
                 continue

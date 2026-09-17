@@ -417,7 +417,8 @@ def prune_baseline(
     active_sfps: Set[str] = set()
     active_ns_sfps: Set[str] = set()
     active_pure_sfps: Set[str] = set()
-    ns_sfp_to_clone: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+    sfp_to_clone: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+    ns_sfp_to_clones: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
     pure_sfp_to_clones: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
 
     for _sim, u1, u2 in active_clones:
@@ -429,7 +430,8 @@ def prune_baseline(
         active_sfps.add(sfp)
         active_ns_sfps.add(ns_sfp)
         active_pure_sfps.add(pure_sfp)
-        ns_sfp_to_clone[ns_sfp] = (u1, u2)
+        sfp_to_clone[sfp] = (u1, u2)
+        ns_sfp_to_clones.setdefault(ns_sfp, []).append((u1, u2))
         pure_sfp_to_clones.setdefault(pure_sfp, []).append((u1, u2))
 
     retained: List[Dict[str, Any]] = []
@@ -495,10 +497,21 @@ def prune_baseline(
                     is_active = True
                     matched_clone = (u1, u2)
                     break
-
         if is_active:
-            if not matched_clone and item_ns_sfp and item_ns_sfp in ns_sfp_to_clone:
-                matched_clone = ns_sfp_to_clone[item_ns_sfp]
+            if not matched_clone and item_sfp and item_sfp in sfp_to_clone:
+                matched_clone = sfp_to_clone[item_sfp]
+            if not matched_clone and item_ns_sfp and item_ns_sfp in ns_sfp_to_clones:
+                item_names = sorted([
+                    str(item.get("name_a") or ""),
+                    str(item.get("name_b") or ""),
+                ])
+                for u1, u2 in ns_sfp_to_clones[item_ns_sfp]:
+                    u_names = sorted([str(u1.get("name") or ""), str(u2.get("name") or "")])
+                    if u_names == item_names:
+                        matched_clone = (u1, u2)
+                        break
+                if not matched_clone:
+                    matched_clone = ns_sfp_to_clones[item_ns_sfp][0]
 
             if (
                 matched_clone

@@ -7188,6 +7188,104 @@ values = [ 10, 20, 30 ]
     assert matched_ns is rec_same_names
 
 
+def test_batch_64_control_flow_hazards_and_baseline_pruning(tmp_path: Path) -> None:
+    """Verifies that generate_refactoring_patch declines units with naked loop controls,
+
+    and prune_baseline correctly uses sfp_to_clone and name disambiguation across identical hashes.
+    """
+    from pydoppelgangerhunt.baseline import prune_baseline  # pylint: disable=import-outside-toplevel
+
+    # 1. Test generate_refactoring_patch with naked break and naked continue
+    loop_code = (
+        "def process_items(items: list) -> None:\n"
+        "    for x in items:\n"
+        "        if x < 0:\n"
+        "            break\n"
+        "        if x == 0:\n"
+        "            continue\n"
+        "        print(x)\n"
+    )
+    src_file = tmp_path / "proc.py"
+    src_file.write_text(loop_code, encoding="utf-8")
+
+    u_break = {
+        "file": str(src_file),
+        "start": 3,
+        "end": 4,
+        "name": "process_items:If_break",
+        "kind": "compound_block",
+    }
+    u_continue = {
+        "file": str(src_file),
+        "start": 5,
+        "end": 6,
+        "name": "process_items:If_continue",
+        "kind": "compound_block",
+    }
+
+    # Patch generation should decline (return empty string) for naked_break and naked_continue
+    patch_break = generate_refactoring_patch([(0.95, u_break, u_break)], repo_root=str(tmp_path))
+    assert patch_break == ""
+
+    patch_continue = generate_refactoring_patch([(0.95, u_continue, u_continue)], repo_root=str(tmp_path))
+    assert patch_continue == ""
+
+    # 2. Test prune_baseline sfp_to_clone and name-disambiguated ns_sfp_to_clones
+    base_json = tmp_path / "baseline_multi.json"
+    data = {
+        "version": "1.3.0",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "target": ".",
+        "threshold": 0.8,
+        "clone_count": 2,
+        "fingerprints": [
+            {
+                "file_a": "pkg/mod1.py",
+                "name_a": "alpha",
+                "hash_a": "1111222233334444",
+                "file_b": "pkg/mod1.py",
+                "name_b": "beta",
+                "hash_b": "1111222233334444",
+            },
+            {
+                "file_a": "pkg/mod2.py",
+                "name_a": "gamma",
+                "hash_a": "1111222233334444",
+                "file_b": "pkg/mod2.py",
+                "name_b": "delta",
+                "hash_b": "1111222233334444",
+            },
+        ],
+    }
+    base_json.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    # Active clones: pair in mod1 was renamed from beta -> beta_renamed, while mod2 pair is active as-is
+    u_m1_a = {"file": "pkg/mod1.py", "name": "alpha", "structural_hash": "1111222233334444"}
+    u_m1_b = {"file": "pkg/mod1.py", "name": "beta_renamed", "structural_hash": "1111222233334444"}
+    u_m2_a = {"file": "pkg/mod2.py", "name": "gamma", "structural_hash": "1111222233334444"}
+    u_m2_b = {"file": "pkg/mod2.py", "name": "delta", "structural_hash": "1111222233334444"}
+
+    active = [
+        (0.95, u_m1_a, u_m1_b),
+        (0.95, u_m2_a, u_m2_b),
+    ]
+    res = prune_baseline(str(base_json), active, unstaged_modified_ranges={})
+    assert res.retained_count == 2
+    assert res.pruned_count == 0
+
+    saved_data = json.loads(base_json.read_text(encoding="utf-8"))
+    recs = saved_data["fingerprints"]
+    # mod1 record should be updated to beta_renamed, without adopting mod2's file path
+    m1_rec = next(r for r in recs if r["file_a"] == "pkg/mod1.py")
+    assert m1_rec["name_b"] == "beta_renamed"
+    assert m1_rec["file_b"] == "pkg/mod1.py"
+
+    m2_rec = next(r for r in recs if r["file_a"] == "pkg/mod2.py")
+    assert m2_rec["name_b"] == "delta"
+    assert m2_rec["file_b"] == "pkg/mod2.py"
+
+
+
 
 
 
