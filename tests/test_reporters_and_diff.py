@@ -5593,4 +5593,75 @@ def test_single_line_delegation_with_type_annotations_and_none_bounds() -> None:
     assert res is None or isinstance(res, dict)
 
 
+def test_syntax_error_fallback_delegation_and_defensive_extract_source_code() -> None:
+    """Verifies scanner fallback delegation on SyntaxError and defensive source code / HTML report bounds."""
+    from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
+        _build_whole_method_delegation,
+        _scan_sig_line,
+    )
+    from pydoppelgangerhunt.reporters import extract_unit_source_code, generate_html_report
+
+    # 1. _scan_sig_line paren and colon detection
+    pos, depth = _scan_sig_line("def f(x: int = 1) -> int: return x", 0)
+    assert pos == 24
+    assert depth == 0
+
+    pos_m1, depth_m1 = _scan_sig_line("def f(", 0)
+    assert pos_m1 == -1
+    assert depth_m1 == 1
+
+    pos_m2, depth_m2 = _scan_sig_line("    x: int = 1,", 1)
+    assert pos_m2 == -1
+    assert depth_m2 == 1
+
+    pos_m3, depth_m3 = _scan_sig_line(") -> int: return x", 1)
+    assert pos_m3 == 8
+    assert depth_m3 == 0
+
+    pos_c, depth_c = _scan_sig_line("def g():  # note: colon", 0)
+    assert pos_c == 7
+    assert depth_c == 0
+
+    pos_bs, depth_bs = _scan_sig_line('def h(s: str = "\\\\"): pass', 0)
+    assert pos_bs == 20
+    assert depth_bs == 0
+
+    # 2. _build_whole_method_delegation fallback on SyntaxError
+    bad_src = "def add(x: int, y: int = 1) -> int: return x + y\nif {\n"
+    unit = {"file": "mod.py", "name": "add", "start": 1, "end": 1}
+    del_res = _build_whole_method_delegation(bad_src, unit, "", "_shared_add", "x, y=y")
+    assert "def add(x: int, y: int = 1) -> int:\n" in del_res
+    assert "return _shared_add(x, y=y)\n" in del_res
+    assert "return x + y" not in del_res
+
+    bad_multi = "def multi(\n    x: int,\n) -> int: return x + 1\nif {\n"
+    unit_m = {"file": "mod.py", "name": "multi", "start": 1, "end": 3}
+    del_m = _build_whole_method_delegation(bad_multi, unit_m, "", "_shared_multi", "x")
+    assert ") -> int:\n" in del_m
+    assert "return _shared_multi(x)\n" in del_m
+    assert "return x + 1" not in del_m
+
+    # 3. extract_unit_source_code with empty or missing files and None bounds/names
+    u_none: Dict[str, Any] = {"file": "", "name": None, "start": 40, "end": None}
+    lines_none = extract_unit_source_code(u_none)
+    assert lines_none == ["# Source for unit lines 40-40\n"]
+
+    u_missing: Dict[str, Any] = {"file": "nonexistent_file_xyz.py", "name": None, "start": 55, "end": None}
+    lines_missing = extract_unit_source_code(u_missing)
+    assert lines_missing == ["# Source for unit lines 55-55\n"]
+
+    # 4. generate_html_report with family member None values
+    fam: Dict[str, Any] = {
+        "family_id": "CF-001",
+        "member_count": 1,
+        "avg_similarity": 0.9,
+        "members": [{"file": None, "start": 10, "end": None, "name": None}],
+        "medoid": None,
+    }
+    html = generate_html_report([], "target", 0.9, families=[fam])
+    assert "CF-001" in html
+    assert ":10-10</code> (member)" in html
+
+
+
 

@@ -43,16 +43,18 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
     """Reads raw source code lines for a given unit from disk."""
     f_raw = str(unit.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
     if not f_raw:
-        s_d = int(unit.get('start') or 1)
-        e_d = int(unit.get('end') or 1)
-        return [f"# Source for {unit.get('name', 'unit')} lines {s_d}-{e_d}\n"]
+        s_d = int(unit.get("start") or 1)
+        e_d = int(unit.get("end") or s_d)
+        n_d = str(unit.get("name") or "unit")
+        return [f"# Source for {n_d} lines {s_d}-{e_d}\n"]
     file_path = Path(f_raw)
     if repo_root and not file_path.is_absolute():
         file_path = Path(repo_root) / file_path
     if not file_path.is_file():
-        s_d = int(unit.get('start') or 1)
-        e_d = int(unit.get('end') or 1)
-        return [f"# Source for {unit.get('name', 'unit')} lines {s_d}-{e_d}\n"]
+        s_d = int(unit.get("start") or 1)
+        e_d = int(unit.get("end") or s_d)
+        n_d = str(unit.get("name") or "unit")
+        return [f"# Source for {n_d} lines {s_d}-{e_d}\n"]
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
             all_lines = fh.readlines()
@@ -60,7 +62,7 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
         end = min(len(all_lines), int(unit.get("end") or len(all_lines)))
         return all_lines[start - 1 : end]
     except OSError:
-        return [f"# Unable to read {unit.get('file') or ''}\n"]
+        return [f"# Unable to read {str(unit.get('file') or '')}\n"]
 
 
 def generate_clone_diff(
@@ -459,13 +461,17 @@ def generate_html_report(
     families_html: List[str] = []
     if families:
         for fam in families:
-            medoid_name = fam.get("medoid", {}).get("name") if fam.get("medoid") else None
+            medoid_name = (
+                str(fam["medoid"].get("name") or "")
+                if isinstance(fam.get("medoid"), dict)
+                else None
+            )
             coherence_val = fam.get("coherence")
             coherence_str = f" &bull; {coherence_val:.1%} coherence" if coherence_val is not None else ""
             members_li = "".join(
-                f"<li><code>{m['file']}:{m['start']}-{m['end']}</code> ({m['name']})"
-                f"{' <strong>[medoid]</strong>' if medoid_name and m.get('name') == medoid_name else ''}</li>"
-                for m in fam["members"]
+                f"<li><code>{str(m.get('file') or '').replace('\\\\', '/')}:{int(m.get('start') or 1)}-{int(m.get('end') or int(m.get('start') or 1))}</code> ({str(m.get('name') or 'member')})"
+                f"{' <strong>[medoid]</strong>' if medoid_name and str(m.get('name') or '') == medoid_name else ''}</li>"
+                for m in fam.get("members", [])
             )
             f_card = f"""
             <div class="family-card">

@@ -2721,27 +2721,42 @@ def refactor_module_units(
     return current_text
 
 
-def _find_sig_colon(line: str) -> int:
-    """Finds the colon terminating a function definition header on a single line."""
-    paren_depth = 0
+def _scan_sig_line(line: str, initial_paren_depth: int = 0) -> Tuple[int, int]:
+    """Scans a line for the function header terminating colon and computes resulting paren depth."""
+    paren_depth = initial_paren_depth
     in_quote: Optional[str] = None
     for i, ch in enumerate(line):
         if in_quote:
-            if ch == in_quote and (i == 0 or line[i - 1] != "\\"):
-                in_quote = None
+            if ch == in_quote:
+                num_bs = 0
+                k = i - 1
+                while k >= 0 and line[k] == "\\":
+                    num_bs += 1
+                    k -= 1
+                if num_bs % 2 == 0:
+                    in_quote = None
             continue
         if ch in ('"', "'"):
             in_quote = ch
             continue
+        if ch == "#":
+            break
         if ch in "([{":
             paren_depth += 1
         elif ch in ")]}":
             paren_depth = max(0, paren_depth - 1)
         elif ch == ":" and paren_depth == 0:
-            after = line[i + 1 :].strip()
-            if not after.startswith("->"):
-                return i
+            return i, paren_depth
+    return -1, paren_depth
+
+
+def _find_sig_colon(line: str) -> int:
+    """Finds the colon terminating a function definition header on a single line."""
+    colon_idx, _ = _scan_sig_line(line, 0)
+    if colon_idx != -1:
+        return colon_idx
     return line.rfind(":")
+
 
 
 def _build_whole_method_delegation(
@@ -2765,7 +2780,7 @@ def _build_whole_method_delegation(
     default_step = _detect_indent_step(indent)
     body_indent = indent + default_step
 
-    sig_end_line = u_start
+    sig_end_line: Optional[int] = None
     docstring_end_line: Optional[int] = None
     header = ""
     raw_u_name = str(unit.get("name") or "")
@@ -2803,7 +2818,7 @@ def _build_whole_method_delegation(
                     b_col = getattr(first_body, "col_offset", len(lines[fn_def_line - 1]))
                     same_line = lines[fn_def_line - 1][:b_col].rstrip()
                     if not same_line.endswith(":"):
-                        colon_pos = lines[fn_def_line - 1][:b_col].rfind(":")
+                        colon_pos = _find_sig_colon(lines[fn_def_line - 1][:b_col])
                         if colon_pos != -1:
                             same_line = lines[fn_def_line - 1][: colon_pos + 1]
                     header = "".join(lines[u_start - 1 : fn_def_line - 1]) + same_line + "\n"
@@ -2821,18 +2836,19 @@ def _build_whole_method_delegation(
     if not header:
         if docstring_end_line is not None and docstring_end_line >= u_start:
             header = "".join(lines[u_start - 1 : docstring_end_line])
-        elif sig_end_line >= u_start:
+        elif sig_end_line is not None and sig_end_line >= u_start:
             header = "".join(lines[u_start - 1 : sig_end_line])
         else:
             hdr_lines = []
+            curr_depth = 0
             for l_num in range(u_start, min(u_end + 1, len(lines) + 1)):
                 ln = lines[l_num - 1]
-                if ":" in ln and not ln.rstrip().endswith(":"):
-                    colon_pos = _find_sig_colon(ln)
+                colon_pos, curr_depth = _scan_sig_line(ln, initial_paren_depth=curr_depth)
+                if colon_pos != -1:
                     hdr_lines.append(ln[: colon_pos + 1] + "\n")
                     break
                 hdr_lines.append(ln)
-                if ln.rstrip().endswith(":"):
+                if ln.rstrip().endswith(":") and curr_depth == 0:
                     break
             header = "".join(hdr_lines)
 
