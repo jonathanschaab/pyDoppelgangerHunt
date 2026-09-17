@@ -1015,5 +1015,147 @@ def test_batch_45_idiom_canonicalizer_and_baseline_legacy(tmp_path: Path) -> Non
     assert prune_res.retained_count == 0
 
 
+def test_batch_50_parser_and_baseline_deep_hardening(tmp_path: Path) -> None:
+    """Batch 50: Test AST canonicalization, scope visitor, decorator inspection, and baseline pruning."""
+    # pylint: disable=import-outside-toplevel,protected-access
+    import json
+    from typing import Any
+    from pydoppelgangerhunt.baseline import prune_baseline
+    from pydoppelgangerhunt.parser import (
+        _CommutativeCanonicalizer,
+        _IdiomCanonicalizer,
+        _ScopeHierarchyVisitor,
+        is_boilerplate_node,
+        is_decorator_named,
+    )
 
+    # 1. is_boilerplate_node on custom logger names and methods
+    log_call = ast.parse("custom_logger.critical('fatal issue')").body[0]
+    assert is_boilerplate_node(log_call) is True
+    logger_call = ast.parse("logger.anything('logged')").body[0]
+    assert is_boilerplate_node(logger_call) is True
+    non_log_call = ast.parse("math_helper.sqrt(100)").body[0]
+    assert is_boilerplate_node(non_log_call) is False
 
+    # 2. _CommutativeCanonicalizer sort key fallback and bitwise operations
+    canon = _CommutativeCanonicalizer()
+
+    class _BrokenNode(ast.AST):
+        def __getattribute__(self, name: str) -> Any:
+            if name == "_fields":
+                raise TypeError("ast dump failure")
+            return super().__getattribute__(name)
+
+    assert canon._sort_key(_BrokenNode()) == "_BrokenNode"
+
+    t_and1 = ast.parse("res = b & a")
+    t_and2 = ast.parse("res = a & b")
+    assert ast.dump(canon.visit(t_and1)) == ast.dump(canon.visit(t_and2))
+
+    t_xor1 = ast.parse("res = b ^ a")
+    t_xor2 = ast.parse("res = a ^ b")
+    assert ast.dump(canon.visit(t_xor1)) == ast.dump(canon.visit(t_xor2))
+
+    # 3. _IdiomCanonicalizer reduction loop with all()
+    t_all = ast.parse("for item in items:\n    if not item:\n        return False").body[0]
+    c_all = _IdiomCanonicalizer().visit(t_all)
+    assert isinstance(c_all, ast.Return)
+    assert isinstance(c_all.value, ast.Call)
+    assert isinstance(c_all.value.func, ast.Name)
+    assert c_all.value.func.id == "all"
+
+    # Multi-statement loop should not be transformed
+    t_multi = ast.parse("for x in data:\n    step1()\n    step2()").body[0]
+    assert _IdiomCanonicalizer().visit(t_multi) is t_multi
+
+    # 4. _ScopeHierarchyVisitor with nested classes, functions, and closures
+    src = (
+        "class Outer(Base, meta=1):\n"
+        "    def method(self, def_arg=5):\n"
+        "        def inner():\n"
+        "            return def_arg\n"
+        "        return inner()\n"
+        "    class InnerClass:\n"
+        "        def nested_m(self):\n"
+        "            pass\n"
+    )
+    visitor = _ScopeHierarchyVisitor()
+    visitor.visit(ast.parse(src))
+    assert len(visitor.enclosing_classes) >= 2
+    assert len(visitor.closure_parents) >= 1
+
+    # 5. is_decorator_named across Name, Call, and Attribute nodes
+    assert is_decorator_named(ast.Name(id="staticmethod"), "staticmethod") is True
+    assert is_decorator_named(ast.Name(id="staticmethod"), "classmethod") is False
+    assert (
+        is_decorator_named(
+            ast.Call(func=ast.Name(id="pytest_fixture"), args=[], keywords=[]),
+            "pytest_fixture",
+        )
+        is True
+    )
+    assert (
+        is_decorator_named(
+            ast.Attribute(value=ast.Name(id="pytest"), attr="mark"),
+            "mark",
+        )
+        is True
+    )
+    assert is_decorator_named(ast.Constant(value="literal"), "literal") is False
+
+    # 6. prune_baseline self-healing when unit name/location moves
+    bl_file = tmp_path / "baseline_healing.json"
+    u1 = {
+        "file": "foo.py",
+        "name": "func_old",
+        "start": 1,
+        "end": 10,
+        "token_count": 20,
+        "tokens": ["x"] * 20,
+        "structural_hash": "hash_1111",
+    }
+    u2 = {
+        "file": "bar.py",
+        "name": "func_target",
+        "start": 1,
+        "end": 10,
+        "token_count": 20,
+        "tokens": ["x"] * 20,
+        "structural_hash": "hash_2222",
+    }
+    bl_data = {
+        "version": "1.3.0",
+        "clone_count": 1,
+        "fingerprints": [
+            {
+                "fingerprint": "foo.py:func_old <===> bar.py:func_target",
+                "structural_fingerprint": "foo.py:func_old#hash_1111 <===> bar.py:func_target#hash_2222",
+                "namespaced_structural_fingerprint": "foo#hash_1111 <===> bar#hash_2222",
+                "pure_structural_fingerprint": "hash_1111 <===> hash_2222",
+                "hash_a": "hash_1111",
+                "hash_b": "hash_2222",
+                "file_a": "foo.py",
+                "name_a": "func_old",
+                "file_b": "bar.py",
+                "name_b": "func_target",
+            }
+        ],
+    }
+    bl_file.write_text(json.dumps(bl_data), encoding="utf-8")
+
+    # Rename u1 from func_old to func_new: pure structural match heals fingerprint
+    u1_renamed = dict(u1)
+    u1_renamed["name"] = "func_new"
+    active_clones = [(0.95, u1_renamed, u2)]
+    res = prune_baseline(str(bl_file), active_clones=active_clones, unstaged_modified_ranges={})
+    assert res.pruned_count == 0
+    assert res.retained_count == 1
+    healed_data = json.loads(bl_file.read_text(encoding="utf-8"))
+    assert healed_data["fingerprints"][0]["name_a"] == "func_new"
+
+    # 7. prune_baseline dirty skip when inactive clone file is in unstaged_modified_ranges
+    dirty_ranges = {"foo.py": [(1, 20)]}
+    res_dirty = prune_baseline(str(bl_file), active_clones=[], unstaged_modified_ranges=dirty_ranges)
+    assert res_dirty.pruned_count == 0
+    assert res_dirty.retained_count == 1
+    assert res_dirty.skipped_dirty_count == 1

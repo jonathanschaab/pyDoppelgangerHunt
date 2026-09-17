@@ -796,4 +796,101 @@ def test_stop_shingle_filtering_and_candidate_pruning(tmp_path: Path) -> None:
     assert isinstance(clones_custom, list)
 
 
+def test_batch_49_matcher_similarity_and_subclones(tmp_path: Path) -> None:
+    """Batch 49: Test matcher similarity bounds, tfidf fallbacks, subclones, and multiprocessing."""
+    # pylint: disable=protected-access,import-outside-toplevel
+    from pydoppelgangerhunt.matcher import (
+        _worker_harvest_file,
+        compute_pair_similarity,
+        suppress_subclones,
+        tfidf_jaccard_similarity,
+    )
+
+    # 1. tfidf_jaccard_similarity fallback when idf_weights is empty
+    set_x = {"a", "b", "c"}
+    set_y = {"b", "c", "d"}
+    assert tfidf_jaccard_similarity(set_x, set_y, {}) == 0.5
+
+    # 2. compute_pair_similarity: call sequences under 3 calls and size bounding
+    u_short_call1 = {"calls": ["step1", "step2"]}
+    u_short_call2 = {"calls": ["step1", "step2"]}
+    assert compute_pair_similarity(u_short_call1, u_short_call2, call_sequences=True) == 0.0
+
+    u_huge = {"token_count": 100, "tokens": ["t"] * 100}
+    u_tiny = {"token_count": 10, "tokens": ["t"] * 10}
+    assert compute_pair_similarity(u_huge, u_tiny, threshold=0.8) == 0.0
+
+    # 3. compute_pair_similarity: tfidf with shingles (not bag_of_tokens)
+    u_shing1 = {"shingles": {"s1", "s2"}}
+    u_shing2 = {"shingles": {"s1", "s2"}}
+    assert compute_pair_similarity(u_shing1, u_shing2, tfidf=True, idf_weights={"s1": 1.5, "s2": 1.5}) == 1.0
+
+    # 4. compute_pair_similarity: gapped_tolerance SourcererCC min multiset pruning
+    u_gap1 = {"tokens": ["a", "b", "c"], "vector": {"a": 1, "b": 1, "c": 1}}
+    u_gap2 = {"tokens": ["x", "y", "z"], "vector": {"x": 1, "y": 1, "z": 1}}
+    assert compute_pair_similarity(u_gap1, u_gap2, gapped_tolerance=True, threshold=0.8) == 0.0
+
+    # 5. compute_pair_similarity: plain bag_of_tokens without tfidf
+    u_bag1 = {"vector": {"alpha": 2, "beta": 1}}
+    u_bag2 = {"vector": {"alpha": 2, "beta": 1}}
+    assert compute_pair_similarity(u_bag1, u_bag2, bag_of_tokens=True) == 1.0
+
+    # 6. suppress_subclones: <= 1 clone, non-matching files, non-strictly smaller
+    single_clone = [(0.9, {"file": "a.py"}, {"file": "b.py"})]
+    assert suppress_subclones(single_clone) == single_clone
+
+    c_parent = (0.95, {"file": "p.py", "start": 1, "end": 20}, {"file": "p.py", "start": 30, "end": 50})
+    c_other = (0.90, {"file": "other1.py", "start": 5, "end": 10}, {"file": "other2.py", "start": 5, "end": 10})
+    assert len(suppress_subclones([c_parent, c_other])) == 2
+
+    c_equal = (0.95, {"file": "p.py", "start": 1, "end": 20}, {"file": "p.py", "start": 30, "end": 50})
+    assert len(suppress_subclones([c_parent, c_equal])) == 2
+
+    # 7. scan_target with tfidf, call_sequences, bag_of_tokens, sort_by="priority", and top_n
+    pkg_scan = tmp_path / "scan_modes"
+    pkg_scan.mkdir()
+    (pkg_scan / "a.py").write_text(
+        "def compute_1():\n    step_a()\n    step_b()\n    step_c()\n    return 42\n",
+        encoding="utf-8",
+    )
+    (pkg_scan / "b.py").write_text(
+        "def compute_2():\n    step_a()\n    step_b()\n    step_c()\n    return 42\n",
+        encoding="utf-8",
+    )
+
+    clones_tfidf = scan_target(str(pkg_scan), threshold=0.8, min_lines=2, min_tokens=3, tfidf=True)
+    assert len(clones_tfidf) == 1
+
+    clones_calls = scan_target(str(pkg_scan), threshold=0.8, min_lines=2, min_tokens=3, call_sequences=True)
+    assert len(clones_calls) == 1
+
+    clones_bag = scan_target(
+        str(pkg_scan),
+        threshold=0.8,
+        min_lines=2,
+        min_tokens=3,
+        bag_of_tokens=True,
+        sort_by="priority",
+        top_n=1,
+    )
+    assert len(clones_bag) == 1
+
+    # 8. scan_target with workers=2 exercising _worker_harvest_file
+    pkg = tmp_path / "parallel_pkg"
+    pkg.mkdir()
+    (pkg / "f1.py").write_text("def run_a():\n    x = 10\n    return x\n", encoding="utf-8")
+    (pkg / "f2.py").write_text("def run_b():\n    x = 10\n    return x\n", encoding="utf-8")
+    par_clones = scan_target(str(pkg), threshold=0.8, min_lines=2, min_tokens=3, workers=2)
+    assert isinstance(par_clones, list)
+
+    task = {
+        "file_path": str(pkg / "f1.py"),
+        "repo_root": str(pkg),
+        "min_lines": 2,
+        "min_tokens": 3,
+    }
+    assert len(_worker_harvest_file(task)) >= 1
+
+
+
 
