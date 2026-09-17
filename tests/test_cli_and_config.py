@@ -736,3 +736,210 @@ min_lines = 11
         assert kwargs.get("threshold") == 0.77
         assert kwargs.get("min_lines") == 11
 
+
+def test_batch_67_cli_and_fixer_decomposition(tmp_path: Path) -> None:
+    """Batch 67: Test extracted helper functions in cli.py and fixer.py."""
+    # pylint: disable=import-outside-toplevel
+    import argparse
+    from unittest import mock
+    from pydoppelgangerhunt.cli import (
+        _format_scan_mode_description,
+        _render_dry_scorecard,
+        _render_pair_diff_and_suggestions,
+        _run_type4_semantic_audit,
+    )
+    from pydoppelgangerhunt.fixer import _format_helper_parameters
+
+    # 1. Test _format_scan_mode_description
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--functions-only", action="store_true")
+    parser.add_argument("--sliding-window", action="store_true")
+    parser.add_argument("--complex-expressions", action="store_true")
+    parser.add_argument("--clause-level", action="store_true")
+    parser.add_argument("--data-tables", action="store_true")
+    parser.add_argument("--class-level", action="store_true")
+    parser.add_argument("--merge-subtrees", action="store_true")
+    parser.add_argument("--blind-indexing", action="store_true")
+    parser.add_argument("--blind-literals", action="store_true")
+    parser.add_argument("--bag-of-tokens", action="store_true")
+    parser.add_argument("--filter-boilerplate", action="store_true")
+    parser.add_argument("--consistent-renaming", action="store_true")
+    parser.add_argument("--tfidf", action="store_true")
+    parser.add_argument("--harvest-closures", action="store_true")
+    parser.add_argument("--commutative", action="store_true")
+    parser.add_argument("--comprehensions", action="store_true")
+    parser.add_argument("--abstract-expressions", action="store_true")
+    parser.add_argument("--gapped-tolerance", action="store_true")
+    parser.add_argument("--nms", action="store_true")
+    args = parser.parse_args([
+        "--sliding-window",
+        "--comprehensions",
+        "--nms",
+    ])
+    desc = _format_scan_mode_description(
+        args,
+        strip_annotations=True,
+        strip_docstrings=False,
+        idioms_enabled=True,
+        call_seq_enabled=False,
+        audit_tests_enabled=True,
+        stop_shingles_enabled=False,
+    )
+    assert "functions + compound blocks" in desc
+    assert "sliding windows" in desc
+    assert "comprehensions" in desc
+    assert "untyped" in desc
+    assert "idioms canonicalized" in desc
+    assert "audit tests" in desc
+    assert "nms suppressed" in desc
+
+    # 2. Test _render_dry_scorecard
+    stats_good = {
+        "grade": "A+",
+        "dry_score": 98.5,
+        "sloc": 1200,
+        "dloc": 10,
+        "duplication_pct": 0.83,
+        "clone_pairs": 1,
+        "clone_families": 1,
+    }
+    _render_dry_scorecard(stats_good, use_color=True)
+    _render_dry_scorecard(stats_good, use_color=False)
+
+    stats_poor = {
+        "grade": "D",
+        "dry_score": 55.0,
+        "sloc": 1000,
+        "dloc": 450,
+        "duplication_pct": 45.0,
+        "clone_pairs": 10,
+        "clone_families": 4,
+    }
+    _render_dry_scorecard(stats_poor, use_color=False)
+
+    # Empty stats defensive defaults
+    _render_dry_scorecard({}, use_color=False)
+
+    # 3. Test _render_pair_diff_and_suggestions
+    dummy_u1 = {"file": "mod1.py", "start": 1, "end": 4, "name": "fn1", "source": "def fn1(): pass\n"}
+    dummy_u2 = {"file": "mod2.py", "start": 1, "end": 4, "name": "fn2", "source": "def fn2(): pass\n"}
+    pair_parser = argparse.ArgumentParser()
+    pair_parser.add_argument("--suggest", action="store_true")
+    pair_parser.add_argument("--diff", action="store_true")
+    pair_args = pair_parser.parse_args(["--suggest", "--diff"])
+
+    with mock.patch("pydoppelgangerhunt.cli.synthesize_refactoring_suggestion", return_value="suggestion block"), \
+         mock.patch("pydoppelgangerhunt.cli.generate_clone_diff", return_value="--- diff block"):
+        rendered_lines = _render_pair_diff_and_suggestions(
+            dummy_u1,
+            dummy_u2,
+            args=pair_args,
+            target_repo_root=str(tmp_path),
+            use_color=False,
+            indent="  ",
+        )
+        assert len(rendered_lines) == 2
+        assert "suggestion block" in rendered_lines[0]
+        assert "diff block" in rendered_lines[1]
+
+    # When both suggest and diff are disabled
+    no_args = pair_parser.parse_args([])
+    assert _render_pair_diff_and_suggestions(
+        dummy_u1,
+        dummy_u2,
+        args=no_args,
+        target_repo_root=str(tmp_path),
+        use_color=False,
+    ) == []
+
+    # 4. Test _run_type4_semantic_audit
+    # Missing module
+    assert not _run_type4_semantic_audit("target", [], strict_type4=True, use_color=False)
+
+    # Mock module present with violations
+    mock_mod = mock.MagicMock()
+    mock_mod.find_semantic_clones.return_value = ["violation"]
+    mock_mod.report_semantic_results.return_value = True
+    with mock.patch.dict("sys.modules", {"check_semantic_clones": mock_mod}):
+        # strict_type4=True returns True on violations
+        assert _run_type4_semantic_audit("target", [], strict_type4=True, use_color=False)
+        # strict_type4=False returns False even with violations
+        assert not _run_type4_semantic_audit("target", [], strict_type4=False, use_color=False)
+
+    # 5. Test _format_helper_parameters from fixer.py
+    # Ordering: self/cls -> pos -> vararg -> kwonly -> kwarg
+    inputs = ["kw", "args", "kwargs", "x", "self"]
+    meta1 = {
+        "self": {"name": "self", "type": "Any", "default": None, "kind": "pos"},
+        "x": {"name": "x", "type": "int", "default": "0", "kind": "pos"},
+        "args": {"name": "*args", "type": "Any", "default": None, "kind": "vararg"},
+        "kw": {"name": "kw", "type": "str", "default": None, "kind": "kwonly"},
+        "kwargs": {"name": "**kwargs", "type": "Any", "default": None, "kind": "kwarg"},
+    }
+    meta2 = dict(meta1)
+    params = _format_helper_parameters(
+        inputs,
+        meta1,
+        meta2,
+        effective_binding="method",
+        is_static_clone=False,
+        is_class_receiver=False,
+        type_merge_strategy="fallback_any",
+    )
+    assert params[0] == "self"
+    assert params[1] == "x: int = 0"
+    assert params[2] == "*args: Any"
+    assert params[3] == "kw: str"
+    assert params[4] == "**kwargs: Any"
+
+    # Test receiver parameter injection when absent in method binding
+    inputs_no_receiver = ["a", "b"]
+    meta_no_rec = {
+        "a": {"name": "a", "type": "int", "default": None, "kind": "pos"},
+        "b": {"name": "b", "type": "int", "default": None, "kind": "pos"},
+    }
+    params_injected_cls = _format_helper_parameters(
+        inputs_no_receiver,
+        meta_no_rec,
+        meta_no_rec,
+        effective_binding="method",
+        is_static_clone=False,
+        is_class_receiver=True,
+        type_merge_strategy="fallback_any",
+    )
+    assert params_injected_cls[0] == "cls"
+    assert params_injected_cls[1] == "a: int"
+    assert params_injected_cls[2] == "b: int"
+
+    # Test positional argument default invalidation (non-default follows default)
+    meta_invalid_order = {
+        "p1": {"name": "p1", "type": "int", "default": "10", "kind": "pos"},
+        "p2": {"name": "p2", "type": "int", "default": None, "kind": "pos"},
+    }
+    params_reset_defaults = _format_helper_parameters(
+        ["p1", "p2"],
+        meta_invalid_order,
+        meta_invalid_order,
+        effective_binding="module",
+        is_static_clone=False,
+        is_class_receiver=False,
+        type_merge_strategy="fallback_any",
+    )
+    assert params_reset_defaults[0] == "p1: int"
+    assert params_reset_defaults[1] == "p2: int"
+
+    # Test kwonly marker '*' insertion when no *args is present
+    meta_kwonly = {
+        "k1": {"name": "k1", "type": "int", "default": "1", "kind": "kwonly"},
+    }
+    params_kwonly = _format_helper_parameters(
+        ["k1"],
+        meta_kwonly,
+        meta_kwonly,
+        effective_binding="module",
+        is_static_clone=False,
+        is_class_receiver=False,
+        type_merge_strategy="fallback_any",
+    )
+    assert params_kwonly == ["*", "k1: int = 1"]
+

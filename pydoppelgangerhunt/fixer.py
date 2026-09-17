@@ -2112,6 +2112,111 @@ def _resolve_effective_binding(
     return "method"
 
 
+def _format_helper_parameters(
+    inputs: Sequence[str],
+    meta1: Dict[str, Any],
+    meta2: Dict[str, Any],
+    *,
+    effective_binding: str,
+    is_static_clone: bool,
+    is_class_receiver: bool,
+    type_merge_strategy: str,
+) -> List[str]:
+    """Formats helper function parameters with type annotations and default values."""
+    params: List[str] = []
+    seen_kwonly = False
+
+    # Extract parameter descriptors
+    descriptors: List[Dict[str, Any]] = []
+    for var in inputs:
+        m1 = meta1.get(var, {})
+        m2 = meta2.get(var, {})
+
+        t1 = m1.get("type")
+        t2 = m2.get("type")
+        resolved_type = _merge_types(t1, t2, type_merge_strategy)
+
+        d1 = m1.get("default")
+        d2 = m2.get("default")
+        resolved_default = d1 if (d1 and d2 and d1 == d2) else None
+
+        kind = m1.get("kind") or m2.get("kind") or "pos"
+        descriptors.append({
+            "var": var,
+            "type": resolved_type,
+            "default": resolved_default,
+            "kind": kind,
+        })
+
+    # Validate and ensure canonical argument kind ordering (self/cls -> pos -> vararg -> kwonly -> kwarg)
+    def _kind_rank(desc: Dict[str, Any]) -> Tuple[int, int]:
+        var = desc["var"]
+        kind = desc["kind"]
+        if var in ("self", "cls"):
+            return (0, 0)
+        rank_map = {"pos": 1, "vararg": 2, "kwonly": 3, "kwarg": 4}
+        return (rank_map.get(kind, 1), 1)
+
+    descriptors.sort(key=_kind_rank)
+
+    # In method binding mode, ensure receiver parameter exists (unless static)
+    if (
+        effective_binding == "method"
+        and not is_static_clone
+        and not any(desc["var"] in ("self", "cls") for desc in descriptors)
+    ):
+        rec_var = "cls" if is_class_receiver else "self"
+        descriptors.insert(0, {
+            "var": rec_var,
+            "type": "Any",
+            "default": None,
+            "kind": "pos",
+        })
+
+    # Validate positional argument default order (non-default cannot follow default)
+    has_pos_default = False
+    invalid_pos_defaults = False
+    for desc in descriptors:
+        if desc["kind"] == "pos":
+            if desc["default"] is not None:
+                has_pos_default = True
+            elif has_pos_default:
+                invalid_pos_defaults = True
+                break
+    if invalid_pos_defaults:
+        for desc in descriptors:
+            if desc["kind"] == "pos":
+                desc["default"] = None
+
+    # Render formatted parameters
+    for desc in descriptors:
+        var = desc["var"]
+        resolved_type = desc["type"]
+        resolved_default = desc["default"]
+        kind = desc["kind"]
+        if kind in ("vararg", "kwarg"):
+            resolved_default = None
+        prefix = "*" if kind == "vararg" else ("**" if kind == "kwarg" else "")
+        var_name = f"{prefix}{var}"
+
+        if (
+            kind == "kwonly"
+            and not seen_kwonly
+            and not any(p.startswith("*") and not p.startswith("**") for p in params)
+        ):
+            params.append("*")
+            seen_kwonly = True
+
+        if var in ("self", "cls") and effective_binding == "method":
+            params.append(var)
+        elif resolved_default is not None:
+            params.append(f"{var_name}: {resolved_type} = {resolved_default}")
+        else:
+            params.append(f"{var_name}: {resolved_type}")
+
+    return params
+
+
 def synthesize_shared_helper_code(
     u1: Dict[str, Any],
     u2: Dict[str, Any],
@@ -2275,96 +2380,15 @@ def synthesize_shared_helper_code(
     meta1 = {p["name"].lstrip("*"): p for p in scope1.get("param_details", [])}
     meta2 = {p["name"].lstrip("*"): p for p in scope2.get("param_details", [])}
 
-    params: List[str] = []
-    seen_kwonly = False
-
-    # Extract parameter descriptors
-    descriptors: List[Dict[str, Any]] = []
-    for var in inputs:
-        m1 = meta1.get(var, {})
-        m2 = meta2.get(var, {})
-
-        t1 = m1.get("type")
-        t2 = m2.get("type")
-        resolved_type = _merge_types(t1, t2, type_merge_strategy)
-
-        d1 = m1.get("default")
-        d2 = m2.get("default")
-        resolved_default = d1 if (d1 and d2 and d1 == d2) else None
-
-        kind = m1.get("kind") or m2.get("kind") or "pos"
-        descriptors.append({
-            "var": var,
-            "type": resolved_type,
-            "default": resolved_default,
-            "kind": kind,
-        })
-
-    # Validate and ensure canonical argument kind ordering (self/cls -> pos -> vararg -> kwonly -> kwarg)
-    def _kind_rank(desc: Dict[str, Any]) -> Tuple[int, int]:
-        var = desc["var"]
-        kind = desc["kind"]
-        if var in ("self", "cls"):
-            return (0, 0)
-        rank_map = {"pos": 1, "vararg": 2, "kwonly": 3, "kwarg": 4}
-        return (rank_map.get(kind, 1), 1)
-
-    descriptors.sort(key=_kind_rank)
-
-    # In method binding mode, ensure receiver parameter exists (unless static)
-    if (
-        effective_binding == "method"
-        and not is_static_clone
-        and not any(desc["var"] in ("self", "cls") for desc in descriptors)
-    ):
-        rec_var = "cls" if is_class_receiver else "self"
-        descriptors.insert(0, {
-            "var": rec_var,
-            "type": "Any",
-            "default": None,
-            "kind": "pos",
-        })
-
-    # Validate positional argument default order (non-default cannot follow default)
-    has_pos_default = False
-    invalid_pos_defaults = False
-    for desc in descriptors:
-        if desc["kind"] == "pos":
-            if desc["default"] is not None:
-                has_pos_default = True
-            elif has_pos_default:
-                invalid_pos_defaults = True
-                break
-    if invalid_pos_defaults:
-        for desc in descriptors:
-            if desc["kind"] == "pos":
-                desc["default"] = None
-
-    # Render formatted parameters
-    for desc in descriptors:
-        var = desc["var"]
-        resolved_type = desc["type"]
-        resolved_default = desc["default"]
-        kind = desc["kind"]
-        if kind in ("vararg", "kwarg"):
-            resolved_default = None
-        prefix = "*" if kind == "vararg" else ("**" if kind == "kwarg" else "")
-        var_name = f"{prefix}{var}"
-
-        if (
-            kind == "kwonly"
-            and not seen_kwonly
-            and not any(p.startswith("*") and not p.startswith("**") for p in params)
-        ):
-            params.append("*")
-            seen_kwonly = True
-
-        if var in ("self", "cls") and effective_binding == "method":
-            params.append(var)
-        elif resolved_default is not None:
-            params.append(f"{var_name}: {resolved_type} = {resolved_default}")
-        else:
-            params.append(f"{var_name}: {resolved_type}")
+    params = _format_helper_parameters(
+        inputs,
+        meta1,
+        meta2,
+        effective_binding=effective_binding,
+        is_static_clone=is_static_clone,
+        is_class_receiver=is_class_receiver,
+        type_merge_strategy=type_merge_strategy,
+    )
 
     r1 = scope1.get("return_type")
     r2 = scope2.get("return_type")

@@ -215,6 +215,114 @@ def _audit_clone_risk_warnings(
     return lines
 
 
+def _run_type4_semantic_audit(
+    target: str,
+    excludes: List[str],
+    strict_type4: bool,
+    use_color: bool,
+) -> bool:
+    """Runs optional Type-4 semantic clone checks, returning True if strict check failed."""
+    try:
+        import importlib  # pylint: disable=import-outside-toplevel
+        mod = importlib.import_module("check_semantic_clones")
+        find_semantic_clones = getattr(mod, "find_semantic_clones")
+        report_semantic_results = getattr(mod, "report_semantic_results")
+        print(f"Scanning '{target}' for Type-4 Semantic Clones & Consistency Violations...")
+        results = find_semantic_clones(target, excludes=excludes)
+        has_violations = report_semantic_results(results)
+        if has_violations and strict_type4:
+            print(colorize("[FAIL] Type-4 semantic clone violations detected!", COLOR_BOLD + COLOR_RED, use_color))
+            return True
+    except (ImportError, AttributeError):
+        print("[INFO] check_semantic_clones not found; skipping Type-4 scan.")
+    return False
+
+
+def _format_scan_mode_description(
+    args: argparse.Namespace,
+    *,
+    strip_annotations: bool,
+    strip_docstrings: bool,
+    idioms_enabled: bool,
+    call_seq_enabled: bool,
+    audit_tests_enabled: bool,
+    stop_shingles_enabled: bool,
+) -> str:
+    """Builds human-readable description string of active AST scanning modes."""
+    modes: List[str] = ["functions"]
+    if not args.functions_only:
+        modes.append("compound blocks")
+    flag_modes = [
+        (args.sliding_window, "sliding windows"),
+        (args.complex_expressions, "complex expressions"),
+        (args.clause_level, "clause branches"),
+        (args.data_tables, "data tables"),
+        (args.class_level, "classes"),
+        (args.merge_subtrees, "merged subtrees"),
+        (args.blind_indexing, "blind indexed"),
+        (strip_annotations, "untyped"),
+        (strip_docstrings, "docstrings stripped"),
+        (args.blind_literals, "blind literals"),
+        (args.bag_of_tokens, "bag of tokens"),
+        (args.filter_boilerplate, "filtered boilerplate"),
+        (args.consistent_renaming, "consistent renaming"),
+        (args.tfidf, "tfidf weighted"),
+        (args.harvest_closures, "closure harvesting"),
+        (args.commutative, "commutative"),
+        (args.comprehensions, "comprehensions"),
+        (idioms_enabled, "idioms canonicalized"),
+        (args.abstract_expressions, "abstract expressions"),
+        (args.gapped_tolerance, "gapped tolerance"),
+        (call_seq_enabled, "call sequences"),
+        (audit_tests_enabled, "audit tests"),
+        (stop_shingles_enabled, "stop-shingles filtered"),
+        (args.nms, "nms suppressed"),
+    ]
+    for is_enabled, label in flag_modes:
+        if is_enabled:
+            modes.append(label)
+    return " + ".join(modes)
+
+
+def _render_dry_scorecard(stats: Dict[str, Any], use_color: bool) -> None:
+    """Emits ASCII scorecard and duplication summary to console."""
+    print("\n" + "=" * 55)
+    grade = str(stats.get("grade", "A+"))
+    grade_color = COLOR_GREEN if grade in ("A+", "A") else (COLOR_YELLOW if grade in ("B", "C") else COLOR_RED)
+    score_str = colorize(f"{float(stats.get('dry_score', 100.0)):.1f}% (Grade: {grade})", COLOR_BOLD + grade_color, use_color)
+    print(f"pyDoppelgangerHunt DRY Scorecard: {score_str}")
+    print(f"SLOC: {int(stats.get('sloc', 0)):,} | DLOC: {int(stats.get('dloc', 0)):,} | Duplication: {float(stats.get('duplication_pct', 0.0)):.2f}%")
+    print(f"Clone Pairs: {int(stats.get('clone_pairs', 0))} | Clone Families: {int(stats.get('clone_families', 0))}")
+    print("=" * 55)
+
+
+def _render_pair_diff_and_suggestions(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    *,
+    args: argparse.Namespace,
+    target_repo_root: str,
+    use_color: bool,
+    indent: str = "    ",
+) -> List[str]:
+    """Renders optional refactoring suggestion and unified diff for a pair of clone units."""
+    lines: List[str] = []
+    if args.suggest:
+        sug = synthesize_refactoring_suggestion(u1, u2, repo_root=target_repo_root)
+        sug_colored = colorize(sug, COLOR_YELLOW, use_color)
+        print(indent + sug_colored.replace("\n", "\n" + indent))
+        lines.append(indent + sug.replace("\n", "\n" + indent))
+    if args.diff:
+        diff_out = generate_clone_diff(
+            u1, u2, repo_root=target_repo_root, color=use_color
+        )
+        if diff_out:
+            print(f"{indent}--- Diff ---")
+            print(indent + diff_out.replace("\n", "\n" + indent))
+            lines.append(f"{indent}--- Diff ---\n{indent}" + diff_out.replace("\n", "\n" + indent))
+    return lines
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Main execution CLI entrypoint."""
     parser = build_arg_parser()
@@ -295,54 +403,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     raw_binding = args.method_binding or str(tool_cfg.get("method_binding", "auto"))
     method_binding = raw_binding if raw_binding in ("auto", "method", "module") else "auto"
 
-    if args.type4:
-        try:
-            import importlib  # pylint: disable=import-outside-toplevel
-            mod = importlib.import_module("check_semantic_clones")
-            find_semantic_clones = getattr(mod, "find_semantic_clones")
-            report_semantic_results = getattr(mod, "report_semantic_results")
-            print(f"Scanning '{target}' for Type-4 Semantic Clones & Consistency Violations...")
-            results = find_semantic_clones(target, excludes=excludes)
-            has_violations = report_semantic_results(results)
-            if has_violations and args.strict_type4:
-                print(colorize("[FAIL] Type-4 semantic clone violations detected!", COLOR_BOLD + COLOR_RED, use_color))
-                return 1
-        except (ImportError, AttributeError):
-            print("[INFO] check_semantic_clones not found; skipping Type-4 scan.")
+    if args.type4 and _run_type4_semantic_audit(target, excludes, args.strict_type4, use_color):
+        return 1
 
-    modes: List[str] = ["functions"]
-    if not args.functions_only:
-        modes.append("compound blocks")
-    flag_modes = [
-        (args.sliding_window, "sliding windows"),
-        (args.complex_expressions, "complex expressions"),
-        (args.clause_level, "clause branches"),
-        (args.data_tables, "data tables"),
-        (args.class_level, "classes"),
-        (args.merge_subtrees, "merged subtrees"),
-        (args.blind_indexing, "blind indexed"),
-        (strip_annotations, "untyped"),
-        (strip_docstrings, "docstrings stripped"),
-        (args.blind_literals, "blind literals"),
-        (args.bag_of_tokens, "bag of tokens"),
-        (args.filter_boilerplate, "filtered boilerplate"),
-        (args.consistent_renaming, "consistent renaming"),
-        (args.tfidf, "tfidf weighted"),
-        (args.harvest_closures, "closure harvesting"),
-        (args.commutative, "commutative"),
-        (args.comprehensions, "comprehensions"),
-        (idioms_enabled, "idioms canonicalized"),
-        (args.abstract_expressions, "abstract expressions"),
-        (args.gapped_tolerance, "gapped tolerance"),
-        (call_seq_enabled, "call sequences"),
-        (audit_tests_enabled, "audit tests"),
-        (stop_shingles_enabled, "stop-shingles filtered"),
-        (args.nms, "nms suppressed"),
-    ]
-    for is_enabled, label in flag_modes:
-        if is_enabled:
-            modes.append(label)
-    mode_desc = " + ".join(modes)
+    mode_desc = _format_scan_mode_description(
+        args,
+        strip_annotations=strip_annotations,
+        strip_docstrings=strip_docstrings,
+        idioms_enabled=idioms_enabled,
+        call_seq_enabled=call_seq_enabled,
+        audit_tests_enabled=audit_tests_enabled,
+        stop_shingles_enabled=stop_shingles_enabled,
+    )
 
     if args.format == "text":
         print(f"\nScanning '{target}' for AST structural clones (threshold >= {threshold:.0%}, min_lines={min_lines}, mode: {mode_desc})...")
@@ -531,13 +603,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # Text format
     if stats and args.stats:
-        print("\n" + "=" * 55)
-        grade_color = COLOR_GREEN if stats["grade"] in ("A+", "A") else (COLOR_YELLOW if stats["grade"] in ("B", "C") else COLOR_RED)
-        score_str = colorize(f"{stats['dry_score']:.1f}% (Grade: {stats['grade']})", COLOR_BOLD + grade_color, use_color)
-        print(f"pyDoppelgangerHunt DRY Scorecard: {score_str}")
-        print(f"SLOC: {stats['sloc']:,} | DLOC: {stats['dloc']:,} | Duplication: {stats['duplication_pct']:.2f}%")
-        print(f"Clone Pairs: {stats['clone_pairs']} | Clone Families: {stats['clone_families']}")
-        print("=" * 55)
+        _render_dry_scorecard(stats, use_color)
 
     if not clones:
         ok_msg = colorize(f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!", COLOR_BOLD + COLOR_GREEN, use_color)
@@ -590,26 +656,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         repo_root=target_repo_root,
                     )
                 )
-            if args.suggest and len(fam["members"]) >= 2:
-                sug = synthesize_refactoring_suggestion(
-                    fam["members"][0],
-                    fam["members"][1],
-                    repo_root=target_repo_root,
+                report_lines.extend(
+                    _render_pair_diff_and_suggestions(
+                        fam["members"][0],
+                        fam["members"][1],
+                        args=args,
+                        target_repo_root=target_repo_root,
+                        use_color=use_color,
+                        indent="      ",
+                    )
                 )
-                sug_colored = colorize(sug, COLOR_YELLOW, use_color)
-                print("      " + sug_colored.replace("\n", "\n      "))
-                report_lines.append("      " + sug.replace("\n", "\n      "))
-            if args.diff and len(fam["members"]) >= 2:
-                diff_out = generate_clone_diff(
-                    fam["members"][0],
-                    fam["members"][1],
-                    repo_root=target_repo_root,
-                    color=use_color,
-                )
-                if diff_out:
-                    print("      --- Diff ---")
-                    print("      " + diff_out.replace("\n", "\n      "))
-                    report_lines.append("      --- Diff ---\n      " + diff_out.replace("\n", "\n      "))
     else:
         title = f"\n[VIOLATION] Found {len(clones)} AST structural clone pair(s) >= {threshold:.0%}:\n"
         print(colorize(title, COLOR_BOLD + COLOR_RED, use_color))
@@ -647,21 +703,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 tip = colorize("    [TIP] Consider refactoring with @pytest.mark.parametrize", COLOR_YELLOW, use_color)
                 print(tip)
                 report_lines.append("    [TIP] Consider refactoring with @pytest.mark.parametrize")
-            if args.suggest:
-                sug = synthesize_refactoring_suggestion(
-                    u1, u2, repo_root=target_repo_root
+            report_lines.extend(
+                _render_pair_diff_and_suggestions(
+                    u1,
+                    u2,
+                    args=args,
+                    target_repo_root=target_repo_root,
+                    use_color=use_color,
+                    indent="    ",
                 )
-                sug_colored = colorize(sug, COLOR_YELLOW, use_color)
-                print("    " + sug_colored.replace("\n", "\n    "))
-                report_lines.append("    " + sug.replace("\n", "\n    "))
-            if args.diff:
-                diff_out = generate_clone_diff(
-                    u1, u2, repo_root=target_repo_root, color=use_color
-                )
-                if diff_out:
-                    print("    --- Diff ---")
-                    print("    " + diff_out.replace("\n", "\n    "))
-                    report_lines.append("    --- Diff ---\n    " + diff_out.replace("\n", "\n    "))
+            )
 
     footer = "\nPlease refactor structural duplicates into shared helpers, base models, or declarative specifications."
     print(footer)
