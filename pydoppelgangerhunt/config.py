@@ -153,6 +153,20 @@ def find_python_files(
     return found_files
 
 
+def _strip_toml_inline_comment(line: str) -> str:
+    """Strips trailing TOML comments starting with # outside quotes."""
+    in_quote: Optional[str] = None
+    for idx, ch in enumerate(line):
+        if ch in ('"', "'"):
+            if in_quote is None:
+                in_quote = ch
+            elif in_quote == ch:
+                in_quote = None
+        elif ch == "#" and in_quote is None:
+            return line[:idx].strip()
+    return line.strip()
+
+
 def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[str, Any]:
     """Loads a specific tool configuration section from a TOML file with fallbacks."""
     target_path = Path(target_file)
@@ -187,7 +201,9 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
             in_section = True
 
         for line in lines:
-            stripped = line.strip()
+            stripped = _strip_toml_inline_comment(line)
+            if not stripped:
+                continue
             if stripped == target_section:
                 in_section = True
                 continue

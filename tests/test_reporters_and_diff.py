@@ -6954,6 +6954,95 @@ def test_batch_61_column_precision_and_diff_robustness() -> None:
     assert "corrupt.py" not in hunks
 
 
+def test_batch_62_toml_inline_comments_and_coverage_cleanup(tmp_path: Path) -> None:
+    """Verifies TOML inline comment parsing, coverage SQLite cleanup, and metrics single-file resolution."""
+    import sqlite3
+    from pydoppelgangerhunt.config import _strip_toml_inline_comment, load_toml_section
+    from pydoppelgangerhunt.coverage import _read_sqlite_coverage, _read_xml_coverage
+    from pydoppelgangerhunt.metrics import compute_repository_dry_stats
+
+    # 1. _strip_toml_inline_comment and load_toml_section
+    assert _strip_toml_inline_comment('threshold = 0.85 # comment') == "threshold = 0.85"
+    assert _strip_toml_inline_comment('key = "value # not comment"') == 'key = "value # not comment"'
+    assert _strip_toml_inline_comment("key = 'single # quote'") == "key = 'single # quote'"
+    assert _strip_toml_inline_comment("# full line comment") == ""
+
+    toml_file = tmp_path / "pyproject.toml"
+    toml_file.write_text(
+        """
+[tool.pydoppelgangerhunt]
+threshold = 0.85 # Minimum similarity threshold
+min_lines = 10 # Minimal lines
+call_sequences = true # Call sequence analysis
+exclude = ["venv", "build#dir", ".git"] # Exclude patterns
+""",
+        encoding="utf-8",
+    )
+    cfg = load_toml_section(toml_file, "pydoppelgangerhunt")
+    assert cfg.get("threshold") == 0.85
+    assert cfg.get("min_lines") == 10
+    assert cfg.get("call_sequences") is True
+    assert cfg.get("exclude") == ["venv", "build#dir", ".git"]
+
+    # 2. _read_sqlite_coverage connection cleanup and file unlink
+    db_file = tmp_path / "test.coverage"
+    conn = sqlite3.connect(str(db_file))
+    conn.execute("CREATE TABLE file (id INTEGER PRIMARY KEY, path TEXT)")
+    conn.execute("CREATE TABLE line_bits (file_id INTEGER, num_bits INTEGER, bits BLOB)")
+    conn.execute("INSERT INTO file VALUES (1, 'src/main.py')")
+    # Bit 0 of byte 0 set -> line 1 covered
+    conn.execute("INSERT INTO line_bits VALUES (1, 8, ?)", (b"\x01",))
+    conn.commit()
+    conn.close()
+
+    cov_map = _read_sqlite_coverage(str(db_file))
+    assert "src/main.py" in cov_map
+    assert 1 in cov_map["src/main.py"]
+    # File should be completely closed and un-lockable on Windows
+    db_file.unlink()
+    assert not db_file.exists()
+
+    # 3. _read_xml_coverage positive line check
+    xml_file = tmp_path / "coverage.xml"
+    xml_file.write_text(
+        """<?xml version="1.0" ?>
+<coverage version="7.0">
+  <packages>
+    <package name="pkg">
+      <classes>
+        <class name="mod" filename="pkg/mod.py">
+          <lines>
+            <line number="0" hits="1" />
+            <line number="-5" hits="1" />
+            <line number="12" hits="0" />
+            <line number="42" hits="3" />
+          </lines>
+        </class>
+      </classes>
+    </package>
+  </packages>
+</coverage>
+""",
+        encoding="utf-8",
+    )
+    xml_cov = _read_xml_coverage(str(xml_file))
+    assert "pkg/mod.py" in xml_cov
+    assert 42 in xml_cov["pkg/mod.py"]
+    assert 12 not in xml_cov["pkg/mod.py"]
+    assert 0 not in xml_cov["pkg/mod.py"]
+    assert -5 not in xml_cov["pkg/mod.py"]
+
+    # 4. compute_repository_dry_stats on a single file target
+    single_script = tmp_path / "script.py"
+    single_script.write_text("x = 1\ny = 2\n# comment\nz = x + y\n", encoding="utf-8")
+    stats = compute_repository_dry_stats(str(single_script), clones=[])
+    assert stats["sloc"] == 3
+    assert stats["dloc"] == 0
+    assert stats["dry_score"] == 100.0
+    assert "script.py" in stats["package_sloc"]
+
+
+
 
 
 

@@ -15,6 +15,7 @@ def _read_sqlite_coverage(coverage_path: str) -> Dict[str, Set[int]]:
     coverage_map: Dict[str, Set[int]] = {}
     if not os.path.isfile(coverage_path):
         return coverage_map
+    conn = None
     try:
         try:
             conn = sqlite3.connect(f"file:{os.path.abspath(coverage_path)}?mode=ro", uri=True)
@@ -55,10 +56,14 @@ def _read_sqlite_coverage(coverage_path: str) -> Dict[str, Set[int]]:
                         coverage_map.setdefault(fpath, set()).add(line_num)
             except sqlite3.OperationalError:
                 pass
-
-        conn.close()
     except (sqlite3.Error, OSError):
         pass
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except (sqlite3.Error, OSError):
+                pass
 
     return coverage_map
 
@@ -81,8 +86,9 @@ def _read_xml_coverage(xml_path: str) -> Dict[str, Set[int]]:
             for line_node in class_node.findall("./lines/line"):
                 hits = line_node.get("hits", "0")
                 try:
-                    if int(hits) > 0:
-                        covered_lines.add(int(line_node.get("number", 0)))
+                    line_num = int(line_node.get("number", 0))
+                    if int(hits) > 0 and line_num > 0:
+                        covered_lines.add(line_num)
                 except ValueError:
                     pass
     except (ET.ParseError, OSError):

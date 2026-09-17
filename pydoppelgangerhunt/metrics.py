@@ -19,6 +19,8 @@ def compute_repository_dry_stats(
     """Calculates repository-wide DRY metrics: SLOC, DLOC, Duplication %, and DRY Grade."""
     total_sloc = 0
     package_sloc: Dict[str, int] = {}
+    target_path = Path(target_dir).resolve()
+    base_dir = target_path if target_path.is_dir() else target_path.parent
     file_list = find_python_files(
         target_dir, excludes=excludes, include_notebooks=include_notebooks
     )
@@ -47,7 +49,7 @@ def compute_repository_dry_stats(
                     count = sum(1 for line in fh if line.strip() and not line.strip().startswith("#"))
             total_sloc += count
             try:
-                rel = p.resolve().relative_to(Path(target_dir).resolve())
+                rel = p.resolve().relative_to(base_dir)
                 top_pkg = rel.parts[0] if len(rel.parts) > 1 else rel.name
             except ValueError:
                 top_pkg = p.parts[0] if len(p.parts) > 1 else str(p)
@@ -59,8 +61,8 @@ def compute_repository_dry_stats(
     for _sim, u1, u2 in clones:
         for u in (u1, u2):
             f_norm = canonical_path_key(str(u.get("file") or ""), strip_anchor=False)
-            s = int(u.get("start") or 1)
-            e = int(u.get("end") or s)
+            s = max(1, int(u.get("start") or 1))
+            e = max(s, int(u.get("end") or s))
             duplicated_lines_by_file.setdefault(f_norm, set()).update(
                 range(s, e + 1)
             )
