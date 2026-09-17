@@ -126,6 +126,13 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
     parser.add_argument("--workers", type=int, default=None, help="Number of worker processes for parallel AST harvesting (default: 1)")
     parser.add_argument("--max-index-frequency", type=float, default=None, help="Inverted index frequency threshold to prune ubiquitous shingles (default: 0.25)")
     parser.add_argument("--min-corpus-units", type=int, default=None, help="Minimum corpus unit count before activating dynamic frequency stop-shingle pruning (default: 4)")
+    parser.add_argument(
+        "--method-binding",
+        type=str,
+        choices=["auto", "method", "module"],
+        default=None,
+        help="Target method binding strategy for patch refactoring ('auto', 'method', or 'module'; default: 'auto')",
+    )
 
     color_group = parser.add_mutually_exclusive_group()
     color_group.add_argument("--color", dest="color", action="store_true", default=None, help="Force colorized terminal output")
@@ -183,11 +190,12 @@ def _audit_clone_risk_warnings(
     cov_data: Optional[Dict[str, Set[int]]] = None,
     use_color: bool = False,
     indent: str = "    ",
+    repo_root: Optional[str] = None,
 ) -> List[str]:
     """Audits temporal divergence and asymmetric test coverage risks for a clone pair."""
     lines: List[str] = []
     if audit_blame:
-        div = check_temporal_divergence(u1, u2)
+        div = check_temporal_divergence(u1, u2, repo_root=repo_root)
         if div:
             msg = f"{indent}[WARN] Divergent clone risk: {div['divergence_days']} days difference between edits!"
             print(colorize(msg, COLOR_YELLOW, use_color))
@@ -231,6 +239,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     )
     target = target_arg or default_dir
+    target_repo_root = target if os.path.isdir(target) else (os.path.dirname(target) or ".")
     threshold = args.threshold if args.threshold is not None else float(tool_cfg.get("threshold", 0.90))
     min_lines = args.min_lines if args.min_lines is not None else int(tool_cfg.get("min_lines", 8))
     min_tokens = args.min_tokens if args.min_tokens is not None else int(tool_cfg.get("min_tokens", 15))
@@ -263,6 +272,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     strip_docstrings = not args.preserve_docstrings
     strip_annotations = True if args.strip_annotations else (not args.preserve_annotations)
+
+    raw_binding = args.method_binding or str(tool_cfg.get("method_binding", "auto"))
+    method_binding = raw_binding if raw_binding in ("auto", "method", "module") else "auto"
 
     if args.type4:
         try:
@@ -403,7 +415,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.min_diff_overlap is not None
             else float(tool_cfg.get("min_diff_overlap", 0.0))
         )
-        modified_ranges = get_git_modified_line_ranges(since_ref=args.since)
+        try:
+            modified_ranges = get_git_modified_line_ranges(
+                since_ref=args.since, repo_root=target_repo_root
+            )
+        except TypeError:
+            modified_ranges = get_git_modified_line_ranges(since_ref=args.since)
         clones = filter_clones_by_git_diff(
             clones,
             modified_ranges,
@@ -459,7 +476,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _write_artifact_file(args.html, html_report, "HTML", args.format == "text")
 
     if args.patch:
-        patch_text = generate_refactoring_patch(clones) if clones else ""
+        patch_text = (
+            generate_refactoring_patch(
+                clones,
+                repo_root=target_repo_root,
+                method_binding=method_binding,
+            )
+            if clones
+            else ""
+        )
         _write_artifact_file(args.patch, patch_text, "PATCH", args.format == "text")
 
     if args.github_annotations and clones:
@@ -534,15 +559,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         cov_data=cov_data,
                         use_color=use_color,
                         indent="      ",
+                        repo_root=target_repo_root,
                     )
                 )
             if args.suggest and len(fam["members"]) >= 2:
-                sug = synthesize_refactoring_suggestion(fam["members"][0], fam["members"][1])
+                sug = synthesize_refactoring_suggestion(
+                    fam["members"][0],
+                    fam["members"][1],
+                    repo_root=target_repo_root,
+                )
                 sug_colored = colorize(sug, COLOR_YELLOW, use_color)
                 print("      " + sug_colored.replace("\n", "\n      "))
                 report_lines.append("      " + sug.replace("\n", "\n      "))
             if args.diff and len(fam["members"]) >= 2:
-                diff_out = generate_clone_diff(fam["members"][0], fam["members"][1], color=use_color)
+                diff_out = generate_clone_diff(
+                    fam["members"][0],
+                    fam["members"][1],
+                    repo_root=target_repo_root,
+                    color=use_color,
+                )
                 if diff_out:
                     print("      --- Diff ---")
                     print("      " + diff_out.replace("\n", "\n      "))
@@ -577,6 +612,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     cov_data=cov_data,
                     use_color=use_color,
                     indent="    ",
+                    repo_root=target_repo_root,
                 )
             )
             if audit_tests_enabled and n1.startswith("test_") and n2.startswith("test_"):
@@ -584,12 +620,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(tip)
                 report_lines.append("    [TIP] Consider refactoring with @pytest.mark.parametrize")
             if args.suggest:
-                sug = synthesize_refactoring_suggestion(u1, u2)
+                sug = synthesize_refactoring_suggestion(
+                    u1, u2, repo_root=target_repo_root
+                )
                 sug_colored = colorize(sug, COLOR_YELLOW, use_color)
                 print("    " + sug_colored.replace("\n", "\n    "))
                 report_lines.append("    " + sug.replace("\n", "\n    "))
             if args.diff:
-                diff_out = generate_clone_diff(u1, u2, color=use_color)
+                diff_out = generate_clone_diff(
+                    u1, u2, repo_root=target_repo_root, color=use_color
+                )
                 if diff_out:
                     print("    --- Diff ---")
                     print("    " + diff_out.replace("\n", "\n    "))

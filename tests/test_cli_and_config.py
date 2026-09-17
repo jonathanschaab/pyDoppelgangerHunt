@@ -227,7 +227,11 @@ def test_cli_init_and_diff_only(tmp_path: Path, monkeypatch: Any) -> None:
     from pydoppelgangerhunt import cli
     f = init_dir / "target.py"
     f.write_text("def a(): pass\n", encoding="utf-8")
-    monkeypatch.setattr(cli, "get_git_modified_line_ranges", lambda since_ref=None, cwd=None: {str(f.resolve()): [(1, 1)]})
+    monkeypatch.setattr(
+        cli,
+        "get_git_modified_line_ranges",
+        lambda since_ref=None, repo_root=None, cwd=None, **kwargs: {str(f.resolve()): [(1, 1)]},
+    )
     code_diff = pydoppelgangerhunt.main([str(init_dir), "--diff-only", "--threshold", "0.90", "--min-lines", "1"])
     assert code_diff == 0
 
@@ -497,3 +501,94 @@ def test_batch_52_toml_lists_and_quotes(tmp_path: Path, monkeypatch: Any) -> Non
     u_b = {"file": "mod.py", "start": 1, "end": 10}
     cov_data = {"mod.py": {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}}
     assert check_asymmetric_coverage(u_a, u_b, cov_data, min_diff=0.40) is None
+
+
+def test_batch_53_cli_method_binding_and_repo_root(tmp_path: Path) -> None:
+    """Batch 53: Test CLI --method-binding, repo_root forwarding, and metrics clamping."""
+    # pylint: disable=import-outside-toplevel
+    from unittest import mock
+    import pytest
+    from pydoppelgangerhunt.cli import _audit_clone_risk_warnings, build_arg_parser
+    from pydoppelgangerhunt.fixer import _is_same_file_path
+    from pydoppelgangerhunt.metrics import compute_repository_dry_stats
+    from pydoppelgangerhunt.reporters import extract_unit_source_code
+
+    # 1. Test CLI argument parser for --method-binding
+    parser = build_arg_parser()
+    args_auto = parser.parse_args(["target_dir", "--method-binding", "auto"])
+    assert args_auto.method_binding == "auto"
+    args_method = parser.parse_args(["target_dir", "--method-binding", "method"])
+    assert args_method.method_binding == "method"
+    args_module = parser.parse_args(["target_dir", "--method-binding", "module"])
+    assert args_module.method_binding == "module"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["target_dir", "--method-binding", "invalid_mode"])
+
+    # 2. Test CLI execution with --method-binding and repo_root forwarding
+    sub_repo = tmp_path / "sub_repo"
+    sub_repo.mkdir()
+    code_a = (
+        "def compute_alpha(x, y):\n"
+        "    res = x * 2 + y * 3\n"
+        "    val = res ** 2\n"
+        "    return val + 1\n"
+    )
+    code_b = (
+        "def compute_beta(x, y):\n"
+        "    res = x * 2 + y * 3\n"
+        "    val = res ** 2\n"
+        "    return val + 1\n"
+    )
+    (sub_repo / "mod_a.py").write_text(code_a, encoding="utf-8")
+    (sub_repo / "mod_b.py").write_text(code_b, encoding="utf-8")
+
+    patch_file = tmp_path / "refactor.patch"
+    cli_code = pydoppelgangerhunt.main([
+        str(sub_repo),
+        "--threshold", "0.80",
+        "--min-lines", "4",
+        "--method-binding", "module",
+        "--patch", str(patch_file),
+        "--suggest",
+        "--diff",
+    ])
+    assert cli_code == 1
+    assert patch_file.exists()
+
+    # 3. Test extract_unit_source_code with relative paths and repo_root
+    unit_rel = {"file": "mod_a.py", "start": 1, "end": 4, "name": "compute_alpha"}
+    src_lines = extract_unit_source_code(unit_rel, repo_root=str(sub_repo))
+    assert len(src_lines) == 4
+    assert "compute_alpha" in src_lines[0]
+
+    # Test that existing file in CWD is not mangled by repo_root
+    pyproject_file = Path("pyproject.toml")
+    if pyproject_file.exists():
+        unit_cwd = {"file": "pyproject.toml", "start": 1, "end": 2, "name": "root"}
+        cwd_lines = extract_unit_source_code(unit_cwd, repo_root=str(sub_repo))
+        assert len(cwd_lines) == 2
+
+    # 4. Test _is_same_file_path with repo_root
+    assert _is_same_file_path("mod_a.py", "mod_a.py", repo_root=str(sub_repo))
+    assert not _is_same_file_path("mod_a.py", "mod_b.py", repo_root=str(sub_repo))
+
+    # 5. Test _audit_clone_risk_warnings forwarding repo_root
+    with mock.patch("pydoppelgangerhunt.cli.check_temporal_divergence") as mock_div:
+        mock_div.return_value = {"divergence_days": 120.0}
+        warns = _audit_clone_risk_warnings(
+            unit_rel, unit_rel, audit_blame=True, repo_root=str(sub_repo)
+        )
+        assert len(warns) == 1
+        assert "Divergent clone risk" in warns[0]
+        mock_div.assert_called_once_with(unit_rel, unit_rel, repo_root=str(sub_repo))
+
+    # 6. Test defensive clamping in compute_repository_dry_stats (dloc > sloc)
+    huge_clone = (
+        0.95,
+        {"file": str(sub_repo / "mod_a.py"), "start": 1, "end": 500},
+        {"file": str(sub_repo / "mod_b.py"), "start": 1, "end": 500},
+    )
+    dry_stats = compute_repository_dry_stats(str(sub_repo), [huge_clone])
+    assert dry_stats["duplication_pct"] == 100.0
+    assert dry_stats["dry_score"] == 0.0
+    assert dry_stats["grade"] == "F"

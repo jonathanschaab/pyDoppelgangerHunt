@@ -60,14 +60,17 @@ def parse_git_diff_hunks(diff_text: str) -> Dict[str, List[Tuple[int, int]]]:
 
 
 def get_git_modified_line_ranges(
-    since_ref: Optional[str] = None, repo_root: Optional[str] = None
+    since_ref: Optional[str] = None,
+    repo_root: Optional[str] = None,
+    cwd: Optional[str] = None,
 ) -> Dict[str, List[Tuple[int, int]]]:
     """Extracts modified line ranges for files using git diff --unified=0."""
     args = ["diff", "--unified=0"]
     if since_ref:
         args.append(since_ref)
 
-    diff_output = _run_git_command(args, cwd=repo_root)
+    effective_cwd = repo_root or cwd
+    diff_output = _run_git_command(args, cwd=effective_cwd)
     if not diff_output:
         return {}
 

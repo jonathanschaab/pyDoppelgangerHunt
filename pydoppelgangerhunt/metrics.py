@@ -65,7 +65,7 @@ def compute_repository_dry_stats(
             )
 
     total_dloc = sum(len(line_set) for line_set in duplicated_lines_by_file.values())
-    dup_pct = (total_dloc / total_sloc * 100.0) if total_sloc > 0 else 0.0
+    dup_pct = min(100.0, (total_dloc / total_sloc * 100.0)) if total_sloc > 0 else 0.0
     dry_score = max(0.0, 100.0 - dup_pct)
 
     if dry_score >= 98.0:

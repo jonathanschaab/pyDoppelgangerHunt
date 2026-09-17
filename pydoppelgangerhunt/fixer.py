@@ -1962,8 +1962,8 @@ def _is_same_file_path(
     try:
         p1 = Path(norm1)
         p2 = Path(norm2)
-        p1_full = p1 if p1.is_absolute() else (root / p1)
-        p2_full = p2 if p2.is_absolute() else (root / p2)
+        p1_full = p1 if p1.is_file() or p1.is_absolute() else (root / p1)
+        p2_full = p2 if p2.is_file() or p2.is_absolute() else (root / p2)
         if p1_full.resolve() == p2_full.resolve():
             return True
     except OSError:
@@ -2989,7 +2989,7 @@ def generate_refactoring_patch(
         if not f1_raw:
             continue
         p = Path(f1_raw)
-        f1_path = p if p.is_absolute() else (root / p)
+        f1_path = p if p.is_file() or p.is_absolute() else (root / p)
         if not f1_path.is_file():
             continue
 
@@ -3013,7 +3013,7 @@ def generate_refactoring_patch(
             fn2 = find_enclosing_function(orig_text, u2)
         elif f2_raw:
             p2 = Path(f2_raw)
-            f2_path = p2 if p2.is_absolute() else (root / p2)
+            f2_path = p2 if p2.is_file() or p2.is_absolute() else (root / p2)
             if f2_path.is_file():
                 try:
                     f2_text = f2_path.read_text(encoding="utf-8")

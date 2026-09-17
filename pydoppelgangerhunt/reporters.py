@@ -52,7 +52,7 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
         n_d = str(unit.get("name") or "unit")
         return [f"# Source for {n_d} lines {s_d}-{e_d}\n"]
     file_path = Path(f_raw)
-    if repo_root and not file_path.is_absolute():
+    if not file_path.is_file() and repo_root and not file_path.is_absolute():
         file_path = Path(repo_root) / file_path
     if not file_path.is_file():
         s_d = int(unit.get("start") or 1)
