@@ -37,10 +37,14 @@ def parse_git_diff_hunks(diff_text: str) -> Dict[str, List[Tuple[int, int]]]:
     for line in diff_text.splitlines():
         if line.startswith("--- "):
             current_file = None
-        elif line.startswith("+++ b/"):
-            current_file = normalize_path_string(line[6:].strip(), strip_anchor=False)
         elif line.startswith("+++ "):
-            current_file = None
+            rest = line[4:].strip()
+            if rest in ("/dev/null", ""):
+                current_file = None
+            else:
+                if len(rest) > 2 and rest[1] == "/" and rest[0] in "biwc":
+                    rest = rest[2:]
+                current_file = normalize_path_string(rest, strip_anchor=False)
         elif line.startswith("@@ ") and current_file:
             parts = line.split(" ")
             plus_parts = [p for p in parts if p.startswith("+")]

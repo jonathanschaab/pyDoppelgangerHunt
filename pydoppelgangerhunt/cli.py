@@ -348,6 +348,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     clones = scan_target(
         target,
+        repo_root=target_repo_root,
         min_lines=min_lines,
         min_tokens=min_tokens,
         threshold=threshold,

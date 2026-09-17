@@ -6,7 +6,7 @@ import concurrent.futures
 import math
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.config import canonical_path_key, find_python_files
 from pydoppelgangerhunt.parser import harvest_file_units
@@ -424,6 +424,7 @@ def scan_target(
     min_lines: int = 8,
     min_tokens: int = 15,
     threshold: float = 0.90,
+    repo_root: Optional[Union[str, Path]] = None,
     excludes: Optional[List[str]] = None,
     functions_only: bool = False,
     sliding_window: bool = False,
@@ -462,7 +463,19 @@ def scan_target(
     min_corpus_size: Optional[int] = None,
 ) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]:
     units: List[Dict[str, Any]] = []
-    repo_root = Path.cwd()
+    if repo_root is not None:
+        effective_repo_root = Path(repo_root)
+    else:
+        try:
+            target_path = Path(target_dir).resolve()
+            cwd = Path.cwd().resolve()
+            try:
+                target_path.relative_to(cwd)
+                effective_repo_root = cwd
+            except ValueError:
+                effective_repo_root = target_path if target_path.is_dir() else target_path.parent
+        except (ValueError, OSError):
+            effective_repo_root = Path.cwd()
     file_list = find_python_files(
         target_dir,
         excludes=excludes,
@@ -476,7 +489,7 @@ def scan_target(
         task_list = [
             {
                 "file_path": str(p),
-                "repo_root": str(repo_root),
+                "repo_root": str(effective_repo_root),
                 "min_lines": min_lines,
                 "min_tokens": min_tokens,
                 "functions_only": functions_only,
@@ -509,7 +522,7 @@ def scan_target(
             units.extend(
                 harvest_file_units(
                     str(p),
-                    str(repo_root),
+                    str(effective_repo_root),
                     min_lines=min_lines,
                     min_tokens=min_tokens,
                     functions_only=functions_only,

@@ -979,3 +979,84 @@ def test_batch_51_matcher_defensive_bounds_and_raw_set_baseline(tmp_path: Path) 
     )
     assert res_prune.retained_count == 1
     assert res_prune.pruned_count == 0
+
+
+def test_batch_59_scan_target_repo_root_and_diff_hunk_prefixes(tmp_path: Path) -> None:
+    """Test scan_target repo_root propagation, auto-derivation, and parse_git_diff_hunks multi-prefix parsing."""
+    from pydoppelgangerhunt.git_diff import parse_git_diff_hunks
+
+    # 1. scan_target with explicit repo_root on external directory
+    ext_repo = tmp_path / "ext_repo"
+    sub_pkg = ext_repo / "sub_pkg"
+    sub_pkg.mkdir(parents=True)
+
+    f1 = sub_pkg / "worker_a.py"
+    f2 = sub_pkg / "worker_b.py"
+    code = (
+        "def process_payload(x: int, y: int) -> int:\n"
+        "    r1 = x * 10 + y * 20\n"
+        "    r2 = r1 ** 2 + 100\n"
+        "    return r2 // 3\n"
+    )
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+
+    clones_with_root = scan_target(
+        str(sub_pkg),
+        repo_root=str(ext_repo),
+        min_lines=2,
+        min_tokens=5,
+        threshold=0.90,
+    )
+    assert len(clones_with_root) >= 1
+    file_a = clones_with_root[0][1]["file"]
+    file_b = clones_with_root[0][2]["file"]
+    assert file_a in ("sub_pkg/worker_a.py", "sub_pkg/worker_b.py")
+    assert file_b in ("sub_pkg/worker_a.py", "sub_pkg/worker_b.py")
+    assert not Path(file_a).is_absolute()
+
+    # 2. scan_target auto-deriving effective_repo_root when external target_dir is scanned without repo_root
+    clones_auto_root = scan_target(
+        str(sub_pkg),
+        min_lines=2,
+        min_tokens=5,
+        threshold=0.90,
+    )
+    assert len(clones_auto_root) >= 1
+    auto_file_a = clones_auto_root[0][1]["file"]
+    auto_file_b = clones_auto_root[0][2]["file"]
+    assert auto_file_a in ("worker_a.py", "worker_b.py")
+    assert auto_file_b in ("worker_a.py", "worker_b.py")
+    assert not Path(auto_file_a).is_absolute()
+
+    # 3. parse_git_diff_hunks supporting no-prefix, b/, w/, i/, c/, and /dev/null
+    diff_multi = (
+        "--- file_np.py\n"
+        "+++ file_np.py\n"
+        "@@ -10,3 +10,3 @@\n"
+        "+np_line\n"
+        "--- a/file_b.py\n"
+        "+++ b/file_b.py\n"
+        "@@ -20,2 +20,2 @@\n"
+        "+b_line\n"
+        "--- old/file_w.py\n"
+        "+++ w/file_w.py\n"
+        "@@ -30,1 +30,1 @@\n"
+        "+w_line\n"
+        "--- old/file_i.py\n"
+        "+++ i/file_i.py\n"
+        "@@ -40,1 +40,1 @@\n"
+        "+i_line\n"
+        "--- a/deleted.py\n"
+        "+++ /dev/null\n"
+        "@@ -1,5 +0,0 @@\n"
+        "-deleted\n"
+    )
+    hunks = parse_git_diff_hunks(diff_multi)
+    assert hunks.get("file_np.py") == [(10, 12)]
+    assert hunks.get("file_b.py") == [(20, 21)]
+    assert hunks.get("file_w.py") == [(30, 30)]
+    assert hunks.get("file_i.py") == [(40, 40)]
+    assert "deleted.py" not in hunks
+    assert "/dev/null" not in hunks
+
