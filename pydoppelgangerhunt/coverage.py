@@ -7,6 +7,8 @@ import sqlite3
 from typing import Any, Dict, Optional, Set, Tuple
 import xml.etree.ElementTree as ET
 
+from pydoppelgangerhunt.config import find_matching_path_value
+
 
 def _read_sqlite_coverage(coverage_path: str) -> Dict[str, Set[int]]:
     """Reads covered line sets per file from SQLite-based .coverage file."""
@@ -95,27 +97,15 @@ def compute_unit_coverage(
     unit: Dict[str, Any], coverage_data: Dict[str, Set[int]]
 ) -> float:
     """Computes statement coverage percentage for an AST unit's line range."""
-    if not coverage_data:
+    if not coverage_data or not unit:
         return 0.0
 
-    target = str(unit.get("file") or "").replace("\\", "/").split("#", maxsplit=1)[0]
-    if not target:
-        return 0.0
-    covered_lines = coverage_data.get(target)
-    if covered_lines is None:
-        covered_lines = next(
-            (lines for f, lines in coverage_data.items() if f and (f.endswith(target) or target.endswith(f))),
-            set(),
-        )
-
-    s = int(unit.get("start") or 1)
-    e = int(unit.get("end") or s)
-    lines_total = e - s + 1
-    if lines_total <= 0 or not covered_lines:
+    covered_lines = find_matching_path_value(str(unit.get("file") or ""), coverage_data)
+    if not covered_lines:
         return 0.0
 
-    hits = sum(1 for ln in range(s, e + 1) if ln in covered_lines)
-    return min(1.0, hits / float(lines_total))
+    target_lines = list(range(int(unit.get("start") or 1), int(unit.get("end") or int(unit.get("start") or 1)) + 1))
+    return min(1.0, len(covered_lines.intersection(target_lines)) / float(len(target_lines))) if target_lines else 0.0
 
 
 def check_asymmetric_coverage(

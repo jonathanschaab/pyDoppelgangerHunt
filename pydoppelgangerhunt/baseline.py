@@ -9,6 +9,8 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from pydoppelgangerhunt.config import find_matching_path_value
+
 logger = logging.getLogger(__name__)
 
 
@@ -447,16 +449,13 @@ def prune_baseline(
                 item["namespaced_structural_fingerprint"] = namespaced_structural_fingerprint(u1, u2)
             retained.append(item)
         else:
-            f_a = str(item.get("file_a") or "").replace("\\", "/")
-            f_b = str(item.get("file_b") or "").replace("\\", "/")
-            # Path matching checks exact equality or bidirectional suffix containment
-            # (f_a.endswith(k) or k.endswith(f_a)) to reliably reconcile absolute paths,
-            # repository-relative paths, and normalized forward-slash variants.
+            f_a = str(item.get("file_a") or "")
+            f_b = str(item.get("file_b") or "")
             is_dirty = bool(
                 unstaged_modified_ranges
                 and (
-                    (bool(f_a) and any(bool(k) and (f_a == k or f_a.endswith(k) or k.endswith(f_a)) for k in unstaged_modified_ranges))
-                    or (bool(f_b) and any(bool(k) and (f_b == k or f_b.endswith(k) or k.endswith(f_b)) for k in unstaged_modified_ranges))
+                    find_matching_path_value(f_a, unstaged_modified_ranges) is not None
+                    or find_matching_path_value(f_b, unstaged_modified_ranges) is not None
                 )
             )
             if is_dirty:

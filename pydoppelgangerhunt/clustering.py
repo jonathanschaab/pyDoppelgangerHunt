@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+from pydoppelgangerhunt.config import normalize_path_string
+
 
 class UnionFind:
     """Disjoint-Set Union (DSU) data structure with path compression and union by rank."""
@@ -39,9 +41,13 @@ class UnionFind:
         return root1
 
 
+def _normalize_unit_file(unit: Dict[str, Any]) -> str:
+    return normalize_path_string(str(unit.get("file") or ""))
+
+
 def unit_key(unit: Dict[str, Any]) -> str:
     """Generates unique deterministic string key for an AST unit."""
-    norm_file = str(unit.get("file") or "").replace("\\", "/")
+    norm_file = _normalize_unit_file(unit)
     s = int(unit.get("start") or 1)
     e = int(unit.get("end") or s)
     name = str(unit.get("name") or "unit")
@@ -289,7 +295,7 @@ def cluster_clone_families(
         members = [unit_map[k] for k in member_keys]
         members.sort(
             key=lambda u: (
-                str(u.get("file") or "").replace("\\", "/"),
+                _normalize_unit_file(u),
                 int(u.get("start") or 1),
             )
         )
@@ -298,7 +304,7 @@ def cluster_clone_families(
         family_sims = [
             sim for sim, k1, k2 in sorted_pairs if k1 in member_set and k2 in member_set
         ]
-        unique_files = sorted(list({str(u.get("file") or "").replace("\\", "/") for u in members}))
+        unique_files = sorted(list({_normalize_unit_file(u) for u in members}))
         total_lines = sum(
             int(u.get("end") or int(u.get("start") or 1)) - int(u.get("start") or 1) + 1
             for u in members
@@ -329,7 +335,7 @@ def cluster_clone_families(
         key=lambda f: (
             -f["member_count"],
             -round(f["avg_similarity"], 9),
-            str(f["members"][0].get("file") or "").replace("\\", "/"),
+            _normalize_unit_file(f["members"][0]),
             int(f["members"][0].get("start") or 1),
             str(f["medoid"].get("name") or "") if isinstance(f.get("medoid"), dict) else "",
         )

@@ -43,6 +43,44 @@ idioms = true
 """
 
 
+def normalize_path_string(path_str: Optional[str]) -> str:
+    """Normalizes a file path string by stripping anchors, converting backslashes, and stripping leading './'."""
+    if not path_str:
+        return ""
+    norm = str(path_str).split("#", maxsplit=1)[0].replace("\\", "/")
+    if norm.startswith("./"):
+        return norm[2:]
+    return norm
+
+
+def paths_match_boundary(p1: Optional[str], p2: Optional[str]) -> bool:
+    """Checks whether two normalized paths refer to the same file respecting directory boundaries."""
+    n1 = normalize_path_string(p1)
+    n2 = normalize_path_string(p2)
+    if not n1 or not n2:
+        return False
+    if n1 == n2:
+        return True
+    return n1.endswith("/" + n2) or n2.endswith("/" + n1)
+
+
+def find_matching_path_value(
+    target_path: Optional[str],
+    path_map: Dict[str, Any],
+) -> Any:
+    """Finds a value in a path-keyed mapping where keys match target_path respecting directory boundaries."""
+    target_norm = normalize_path_string(target_path)
+    if not target_norm or not path_map:
+        return None
+    direct = path_map.get(target_norm)
+    if direct is not None:
+        return direct
+    for k, val in path_map.items():
+        if paths_match_boundary(target_norm, k):
+            return val
+    return None
+
+
 def find_python_files(
     target: Union[str, Path],
     excludes: Optional[List[str]] = None,
@@ -61,17 +99,17 @@ def find_python_files(
     target_clean = str(target_path).replace("\\", "/").strip("./")
     active_excludes = [
         ex for ex in exclude_patterns
-        if ex.replace("\\", "/").strip("./") not in target_clean
+        if ex.strip("./\\") and ex.replace("\\", "/").strip("./") not in target_clean
     ]
     if audit_tests:
         active_excludes = [ex for ex in active_excludes if "test" not in ex]
 
     def _is_excluded(full_p: str, rel_p: str) -> bool:
-        return any(
-            ex.replace("\\", "/").strip("/") in full_p
-            or ex.replace("\\", "/").strip("/") in rel_p
-            for ex in active_excludes
-        )
+        for ex in active_excludes:
+            clean_ex = ex.replace("\\", "/").strip("/")
+            if clean_ex and (clean_ex in full_p or clean_ex in rel_p):
+                return True
+        return False
 
     found_files: List[Path] = []
     target_str = str(target_path)

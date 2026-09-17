@@ -6,6 +6,8 @@ import os
 import subprocess
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+from pydoppelgangerhunt.config import find_matching_path_value
+
 MAJOR_POLICY_THRESHOLD: float = 0.50
 NEW_POLICY_THRESHOLD: float = 0.80
 
@@ -95,15 +97,7 @@ def compute_unit_diff_overlap(
         >>> overlap_ratio
         0.625
     """
-    norm_file = str(unit.get("file") or "").split("#", maxsplit=1)[0].replace("\\", "/")
-    if not norm_file:
-        return 0, 0.0
-    target_ranges = modified_ranges.get(norm_file)
-    if not target_ranges:
-        for f, ranges in modified_ranges.items():
-            if f and (norm_file.endswith(f) or f.endswith(norm_file)):
-                target_ranges = ranges
-                break
+    target_ranges = find_matching_path_value(str(unit.get("file") or ""), modified_ranges)
     if not target_ranges:
         return 0, 0.0
 

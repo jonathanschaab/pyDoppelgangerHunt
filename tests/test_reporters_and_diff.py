@@ -5979,3 +5979,56 @@ def test_batch_36_path_resolution_and_same_file_matching(tmp_path: Any) -> None:
     assert "self._shared_task_a_task_b(x)" in patch
 
 
+def test_batch_37_directory_boundary_path_matching_and_exclude_filtering(tmp_path: Any) -> None:
+    """Tests Batch 37: directory-boundary path matching and exclude filter safety."""
+    from pydoppelgangerhunt.clustering import unit_key
+    from pydoppelgangerhunt.config import find_python_files
+    from pydoppelgangerhunt.coverage import compute_unit_coverage
+    from pydoppelgangerhunt.git_diff import compute_unit_diff_overlap
+    from pydoppelgangerhunt.metrics import compute_repository_dry_stats
+
+    # 1. compute_unit_diff_overlap avoids suffix false positives without directory boundary
+    u_engine = {"file": "engine.py", "start": 10, "end": 20}
+    # computation_engine.py shares suffix 'engine.py' but lacks '/' boundary
+    overlap_false, ratio_false = compute_unit_diff_overlap(
+        u_engine, {"computation_engine.py": [(10, 20)]}
+    )
+    assert overlap_false == 0
+    assert ratio_false == 0.0
+
+    # True matches with directory boundary and dot-slash
+    overlap_true_sub, _ = compute_unit_diff_overlap(u_engine, {"sub/engine.py": [(10, 20)]})
+    assert overlap_true_sub == 11
+    overlap_true_dot, _ = compute_unit_diff_overlap(u_engine, {"./engine.py": [(10, 20)]})
+    assert overlap_true_dot == 11
+
+    # 2. compute_unit_coverage respects directory boundary
+    cov_false = compute_unit_coverage(u_engine, {"computation_engine.py": {10, 11, 12}})
+    assert cov_false == 0.0
+    cov_sub = compute_unit_coverage(u_engine, {"sub/engine.py": set(range(10, 21))})
+    assert cov_sub == 1.0
+    cov_dot = compute_unit_coverage(u_engine, {"./engine.py": {10, 11}})
+    assert round(cov_dot, 2) == 0.18
+
+    # 3. find_python_files handles empty and slash-only exclude patterns safely
+    py_file = tmp_path / "app.py"
+    py_file.write_text("x = 1\n", encoding="utf-8")
+    found = find_python_files(tmp_path, excludes=["", "   ", "/", "./"])
+    assert len(found) == 1
+    assert found[0].name == "app.py"
+
+    # 4. unit_key normalizes leading dot-slash and anchors
+    u_dot_hash = {"file": "./sub/app.py#abc", "start": 1, "end": 5, "name": "f"}
+    u_plain = {"file": "sub/app.py", "start": 1, "end": 5, "name": "f"}
+    assert unit_key(u_dot_hash) == unit_key(u_plain)
+
+    # 5. compute_repository_dry_stats de-duplicates lines across dot-slash file representations
+    u_mod1 = {"file": "./mod.py", "start": 1, "end": 10, "name": "f1"}
+    u_mod2 = {"file": "mod.py", "start": 1, "end": 10, "name": "f2"}
+    mod_file = tmp_path / "mod.py"
+    mod_file.write_text("x = 1\n" * 10, encoding="utf-8")
+    stats = compute_repository_dry_stats(str(tmp_path), [(1.0, u_mod1, u_mod2)])
+    assert stats["dloc"] == 10
+
+
+
