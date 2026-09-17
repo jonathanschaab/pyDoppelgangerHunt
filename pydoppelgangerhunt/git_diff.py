@@ -199,6 +199,7 @@ def get_git_blame_info(
     latest_author = "Unknown"
     latest_commit = "unknown"
     latest_summary = ""
+    author = "Unknown"
 
     current_commit = ""
     for line in blame_text.splitlines():

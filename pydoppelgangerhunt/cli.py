@@ -483,10 +483,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             print(f_head)
             report_lines.append(f_head)
-            medoid_name = fam.get("medoid", {}).get("name") if fam.get("medoid") else None
-            for m in fam["members"]:
-                m_tag = " [medoid]" if medoid_name and m["name"] == medoid_name else ""
-                m_line = f"      - {m['file']}:{m['start']}-{m['end']} ({m['name']}){m_tag}"
+            medoid_name = (
+                str(fam["medoid"].get("name") or "")
+                if isinstance(fam.get("medoid"), dict)
+                else None
+            )
+            for m in fam.get("members", []):
+                m_file = str(m.get("file") or "").replace("\\", "/")
+                m_start = int(m.get("start") or 1)
+                m_end = int(m.get("end") or m_start)
+                m_name = str(m.get("name") or "member")
+                m_tag = " [medoid]" if medoid_name and m_name == medoid_name else ""
+                m_line = f"      - {m_file}:{m_start}-{m_end} ({m_name}){m_tag}"
                 print(m_line)
                 report_lines.append(m_line)
             if len(fam["members"]) >= 2:

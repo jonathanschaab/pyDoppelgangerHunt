@@ -5663,5 +5663,127 @@ def test_syntax_error_fallback_delegation_and_defensive_extract_source_code() ->
     assert ":10-10</code> (member)" in html
 
 
+def test_batch_32_exhaustive_review_hardening(tmp_path: Path) -> None:
+    """Tests Batch 32 edge case fixes across fixer, diff, baseline, and reporters."""
+    from pydoppelgangerhunt.fixer import (
+        _block_terminates,
+        _analyze_block_assignment,
+        _walrus_assignment_in_expr,
+    )
+    from pydoppelgangerhunt.git_diff import get_git_blame_info
+    from pydoppelgangerhunt.baseline import _match_clone_record, prune_baseline
+    from pydoppelgangerhunt.reporters import generate_html_report
+    import unittest.mock as mock
+
+    # 1. _block_terminates on try-except-else terminating branches
+    tree_term = ast.parse(
+        "try:\n    x = 1\nexcept Exception:\n    return 2\nelse:\n    return 3\n"
+    )
+    assert _block_terminates(tree_term.body) is True
+
+    tree_nonterm1 = ast.parse(
+        "try:\n    return 1\nexcept Exception:\n    pass\n"
+    )
+    assert _block_terminates(tree_nonterm1.body) is False
+
+    tree_nonterm2 = ast.parse(
+        "try:\n    x = 1\nexcept Exception:\n    return 2\nelse:\n    pass\n"
+    )
+    assert _block_terminates(tree_nonterm2.body) is False
+
+    # 2. _analyze_block_assignment with orelse deletions and unconditional deletion discarding
+    # 2a. Deletion in else clause demoted to conditional
+    tree_del_else = ast.parse(
+        "x = 10\ntry:\n    pass\nexcept Exception:\n    pass\nelse:\n    del x\n"
+    )
+    d_else, c_else = _analyze_block_assignment(tree_del_else.body)
+    assert "x" not in d_else
+    assert "x" in c_else
+
+    # 2b. Unconditional deletion in both try and except discarded from definite and conditional
+    tree_del_both = ast.parse(
+        "x = 10\ntry:\n    del x\nexcept Exception:\n    del x\n"
+    )
+    d_both, c_both = _analyze_block_assignment(tree_del_both.body)
+    assert "x" not in d_both
+    assert "x" not in c_both
+
+    # 2c. Unconditional deletion in try with terminating except handler
+    tree_del_term = ast.parse(
+        "x = 10\ntry:\n    del x\nexcept Exception:\n    return 1\n"
+    )
+    d_term, c_term = _analyze_block_assignment(tree_del_term.body)
+    assert "x" not in d_term
+    assert "x" not in c_term
+
+    # 3. _walrus_assignment_in_expr in AST slice bounds
+    tree_slice = ast.parse("y = a[(b := 1) : (c := 2)]")
+    assert isinstance(tree_slice.body[0], ast.Assign)
+    d_sl, c_sl = _walrus_assignment_in_expr(tree_slice.body[0].value)
+    assert "b" in (d_sl | c_sl)
+    assert "c" in (d_sl | c_sl)
+
+    # 4. get_git_blame_info with out-of-order headers without author line
+    with mock.patch("pydoppelgangerhunt.git_diff._run_git_command") as mock_git:
+        mock_git.return_value = (
+            "0000000000000000000000000000000000000001 1 1 1\n"
+            "author-time 1700000000\n"
+            "summary Initial commit\n"
+        )
+        blame = get_git_blame_info("test.py", 1, 5)
+        assert blame["author"] == "Unknown"
+        assert blame["timestamp"] == 1700000000
+
+    # 5. _match_clone_record and prune_baseline with None name_a and name_b values
+    c_keys = {
+        "fp": "fp",
+        "sfp": "sfp",
+        "ns_sfp": "ns_sfp",
+        "pure_sfp": "pure_sfp",
+        "namespaces": ["ns_a", "ns_b"],
+        "names": ["name_a", "name_b"],
+    }
+    unconsumed = [
+        {
+            "pure_structural_fingerprint": "pure_sfp",
+            "hash_a": "h1",
+            "hash_b": "h2",
+            "name_a": None,
+            "name_b": None,
+        }
+    ]
+    # Verify no TypeError '<' not supported between instances of 'NoneType'
+    matched = _match_clone_record(c_keys, unconsumed)
+    assert matched is not None
+
+    b_file = tmp_path / "baseline.json"
+    b_file.write_text(
+        '{"fingerprints": [{"pure_structural_fingerprint": "pure_sfp", "hash_a": "h1", "hash_b": "h2", "name_a": null, "name_b": null}]}',
+        encoding="utf-8",
+    )
+    retained_cnt, pruned_cnt = prune_baseline(str(b_file), [])
+    assert pruned_cnt == 1
+    assert retained_cnt == 0
+
+    # 6. HTML entity escaping in generate_html_report
+    u_special_1 = {
+        "file": "pkg/foo.py",
+        "start": 1,
+        "end": 2,
+        "name": "<lambda>",
+    }
+    u_special_2 = {
+        "file": "pkg/bar.py",
+        "start": 1,
+        "end": 2,
+        "name": "<listcomp>",
+    }
+    html_out = generate_html_report([(0.9, u_special_1, u_special_2)], "My <Package>", 0.8)
+    assert "&lt;lambda&gt;" in html_out
+    assert "&lt;listcomp&gt;" in html_out
+    assert "My &lt;Package&gt;" in html_out
+
+
+
 
 

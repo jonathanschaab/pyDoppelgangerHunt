@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import html
 import json
 import os
 from pathlib import Path
@@ -417,10 +418,10 @@ def generate_html_report(
         diff_txt = generate_clone_diff(u1, u2)
         sug_txt = synthesize_refactoring_suggestion(u1, u2)
         diff_block = (
-            f"<pre class='diff'><code>{diff_txt}</code></pre>" if diff_txt else "<em>No textual diff</em>"
+            f"<pre class='diff'><code>{html.escape(diff_txt)}</code></pre>" if diff_txt else "<em>No textual diff</em>"
         )
         sug_block = (
-            f"<div class='sug'><strong>Refactoring Suggestion:</strong><pre><code>{sug_txt}</code></pre></div>"
+            f"<div class='sug'><strong>Refactoring Suggestion:</strong><pre><code>{html.escape(sug_txt)}</code></pre></div>"
             if sug_txt
             else ""
         )
@@ -434,19 +435,25 @@ def generate_html_report(
         n1 = str(u1.get("name") or "unit1")
         n2 = str(u2.get("name") or "unit2")
 
+        f1_esc = html.escape(f1_norm)
+        f2_esc = html.escape(f2_norm)
+        n1_esc = html.escape(n1)
+        n2_esc = html.escape(n2)
+        search_attr = html.escape(f"{f1_norm} {n1} {f2_norm} {n2}", quote=True)
+
         card = f"""
-        <div class="clone-card" data-search="{f1_norm} {n1} {f2_norm} {n2}">
+        <div class="clone-card" data-search="{search_attr}">
             <div class="card-header">
                 <span class="sim-badge" style="background: {'#ef4444' if sim >= 0.85 else '#f59e0b'};">
                     {sim:.1%} Match
                 </span>
-                <span class="card-title">#{idx}: {n1} &harr; {n2}</span>
+                <span class="card-title">#{idx}: {n1_esc} &harr; {n2_esc}</span>
             </div>
             <div class="card-body">
                 <div class="loc-row">
-                    <span class="file-tag">&#128196; {f1_norm}:{s1}-{e1}</span>
+                    <span class="file-tag">&#128196; {f1_esc}:{s1}-{e1}</span>
                     <span class="arrow">&harr;</span>
-                    <span class="file-tag">&#128196; {f2_norm}:{s2}-{e2}</span>
+                    <span class="file-tag">&#128196; {f2_esc}:{s2}-{e2}</span>
                 </div>
                 {sug_block}
                 <details>
@@ -470,30 +477,33 @@ def generate_html_report(
             coherence_str = f" &bull; {coherence_val:.1%} coherence" if coherence_val is not None else ""
             members_li_parts: List[str] = []
             for m in fam.get("members", []):
-                m_file = str(m.get("file") or "").replace("\\", "/")
+                m_file = html.escape(str(m.get("file") or "").replace("\\", "/"))
                 m_start = int(m.get("start") or 1)
                 m_end = int(m.get("end") or m_start)
-                m_name = str(m.get("name") or "member")
-                is_medoid = bool(medoid_name and m_name == medoid_name)
+                raw_m_name = str(m.get("name") or "member")
+                m_name = html.escape(raw_m_name)
+                is_medoid = bool(medoid_name and raw_m_name == medoid_name)
                 medoid_tag = " <strong>[medoid]</strong>" if is_medoid else ""
                 members_li_parts.append(
                     f"<li><code>{m_file}:{m_start}-{m_end}</code> ({m_name}){medoid_tag}</li>"
                 )
             members_li = "".join(members_li_parts)
+            fam_id = html.escape(str(fam.get("family_id", "")))
             f_card = f"""
             <div class="family-card">
-                <h3>{fam['family_id']} &mdash; {fam['member_count']} Members ({fam['avg_similarity']:.1%} avg sim{coherence_str})</h3>
+                <h3>{fam_id} &mdash; {fam['member_count']} Members ({fam['avg_similarity']:.1%} avg sim{coherence_str})</h3>
                 <ul>{members_li}</ul>
             </div>
             """
             families_html.append(f_card)
 
+    target_esc = html.escape(str(target))
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>pyDoppelgangerHunt Audit Report - {target}</title>
+    <title>pyDoppelgangerHunt Audit Report - {target_esc}</title>
     <style>
         :root {{
             --bg: #0f172a;

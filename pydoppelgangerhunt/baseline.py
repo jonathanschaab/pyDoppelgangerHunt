@@ -226,7 +226,10 @@ def _match_clone_record(
             h_a = str(rec.get("hash_a", ""))
             h_b = str(rec.get("hash_b", ""))
             if h_a and h_b and h_a != h_b:
-                rec_names = sorted([rec.get("name_a", ""), rec.get("name_b", "")])
+                rec_names = sorted([
+                    str(rec.get("name_a") or ""),
+                    str(rec.get("name_b") or ""),
+                ])
                 if not rec_names[0] or rec_names == c_names:
                     return rec
 
@@ -409,7 +412,10 @@ def prune_baseline(
                 item.get("namespace_a") or extract_unit_namespace(str(item.get("file_a") or "")),
                 item.get("namespace_b") or extract_unit_namespace(str(item.get("file_b") or "")),
             ])
-            item_names = sorted([item.get("name_a", ""), item.get("name_b", "")])
+            item_names = sorted([
+                str(item.get("name_a") or ""),
+                str(item.get("name_b") or ""),
+            ])
             for u1, u2 in pure_sfp_to_clones.get(item_pure_sfp, []):
                 u_ns = sorted([
                     extract_unit_namespace(str(u1.get("file") or "")),

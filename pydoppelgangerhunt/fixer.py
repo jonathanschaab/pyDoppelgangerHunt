@@ -577,7 +577,7 @@ def _walrus_assignment_in_expr(
 
     for child in ast.iter_child_nodes(expr):
         target_child = child.value if isinstance(child, ast.keyword) else child
-        if isinstance(target_child, ast.expr):
+        if isinstance(target_child, ast.AST):
             d_ch, c_ch = _walrus_assignment_in_expr(target_child, is_conditional)
             definite.update(d_ch)
             conditional.update(c_ch)
@@ -622,9 +622,13 @@ def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
             if f_body and _block_terminates(f_body):
                 return True
             handlers = getattr(stmt, "handlers", [])
+            o_stmts = getattr(stmt, "orelse", [])
+            body_terminates = _block_terminates(getattr(stmt, "body", [])) or (
+                bool(o_stmts) and _block_terminates(o_stmts)
+            )
             if (
                 handlers
-                and _block_terminates(getattr(stmt, "body", []))
+                and body_terminates
                 and all(_block_terminates(getattr(h, "body", [])) for h in handlers)
             ):
                 return True
@@ -820,6 +824,7 @@ def _analyze_block_assignment(
 
             handlers = list(getattr(stmt, "handlers", []))
             h_defs: List[Set[str]] = []
+            h_dels: List[Tuple[Set[str], bool]] = []
             all_handlers_terminate = bool(
                 handlers and all(_block_terminates(getattr(h, "body", [])) for h in handlers)
             )
@@ -830,7 +835,10 @@ def _analyze_block_assignment(
                     d_ht, c_ht = _walrus_assignment_in_expr(h.type, is_conditional=True)
                     conditional.update(d_ht | c_ht)
                 h_d, h_c = _analyze_block_assignment(h_body)
-                if not _block_terminates(h_body):
+                h_term = _block_terminates(h_body)
+                eff_h_del = _extract_deleted_names(h_body) - h_d
+                h_dels.append((eff_h_del, h_term))
+                if not h_term:
                     h_defs.append(h_d)
                 conditional.update((h_d | h_c) - definite)
 
@@ -850,13 +858,28 @@ def _analyze_block_assignment(
                 definite.update(common)
                 conditional.update(try_cond - definite)
 
-            _demote_deletions_to_conditional(_extract_deleted_names(t_body), definite, conditional)
-            for h in handlers:
-                _demote_deletions_to_conditional(
-                    _extract_deleted_names(getattr(h, "body", [])),
-                    definite,
-                    conditional,
-                )
+            eff_try_del = _extract_deleted_names(t_body) - t_def
+            eff_o_del = _extract_deleted_names(o_stmts) - o_def if o_stmts else set()
+            succ_del = eff_try_del | eff_o_del
+
+            surviving_dels: List[Set[str]] = []
+            all_try_dels = succ_del.copy()
+            if not t_term:
+                surviving_dels.append(succ_del)
+
+            for eff_h_del, h_term in h_dels:
+                all_try_dels.update(eff_h_del)
+                if not h_term:
+                    surviving_dels.append(eff_h_del)
+
+            if surviving_dels:
+                uncond_dels = set.intersection(*surviving_dels)
+                for v_del in uncond_dels:
+                    definite.discard(v_del)
+                    conditional.discard(v_del)
+                _demote_deletions_to_conditional(all_try_dels - uncond_dels, definite, conditional)
+            else:
+                _demote_deletions_to_conditional(all_try_dels, definite, conditional)
 
             f_body = list(getattr(stmt, "finalbody", []))
             if f_body:
