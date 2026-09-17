@@ -1023,7 +1023,7 @@ def harvest_notebook_units(
         return units
 
     try:
-        rel_file = str(p.relative_to(repo_root)).replace("\\", "/")
+        rel_file = str(p.resolve().relative_to(Path(repo_root).resolve())).replace("\\", "/")
     except ValueError:
         rel_file = str(p).replace("\\", "/")
 
@@ -1164,7 +1164,7 @@ def harvest_file_units(
         ast.fix_missing_locations(tree)
 
     try:
-        rel_file = str(p.relative_to(repo_root)).replace("\\", "/")
+        rel_file = str(p.resolve().relative_to(Path(repo_root).resolve())).replace("\\", "/")
     except ValueError:
         rel_file = str(p).replace("\\", "/")
 

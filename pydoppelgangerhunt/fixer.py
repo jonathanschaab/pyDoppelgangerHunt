@@ -2459,7 +2459,12 @@ def synthesize_shared_helper_code(
         common_lines = prefix_stmts + common_lines
 
     has_trailing_return = any(
-        ln.strip().startswith("return ") or ln.strip() == "return"
+        ln.strip() == "return"
+        or (
+            ln.strip().startswith("return")
+            and len(ln.strip()) > 6
+            and ln.strip()[6] in (" ", "\t", "(", "#")
+        )
         for ln in common_lines[-3:]
     )
     if u1.get("kind") in ("comprehension", "complex_expr"):
@@ -3248,7 +3253,7 @@ def generate_refactoring_patch(
             )
 
         try:
-            rel_f1 = str(f1_path.relative_to(root)).replace("\\", "/")
+            rel_f1 = str(f1_path.resolve().relative_to(root.resolve())).replace("\\", "/")
         except ValueError:
             rel_f1 = str(f1_path.name)
         diff = difflib.unified_diff(

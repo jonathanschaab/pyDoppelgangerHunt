@@ -6683,6 +6683,74 @@ def test_batch_57_empty_res_has_receiver_access_and_metrics_package_sloc(tmp_pat
     assert stats["package_sloc"]["core_pkg"] == 2
 
 
+def test_batch_58_parenthesized_return_and_relative_path_resolution(tmp_path: Path) -> None:
+    """Batch 58: Test parenthesized/tabbed return detection and relative path resolution in patch/harvest."""
+    # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer import generate_refactoring_patch, synthesize_shared_helper_code
+    from pydoppelgangerhunt.parser import harvest_file_units
+
+    # 1. Test parenthesized return 'return(res)' in synthesize_shared_helper_code
+    code_paren = (
+        "def compute_paren(val: int) -> int:\n"
+        "    res = val * 2\n"
+        "    return(res)\n"
+    )
+    f1 = tmp_path / "mod_paren.py"
+    f1.write_text(code_paren, encoding="utf-8")
+    u1 = {"file": str(f1), "start": 1, "end": 3, "name": "compute_paren", "kind": "function"}
+
+    helper_paren = synthesize_shared_helper_code(u1, u1, repo_root=str(tmp_path))
+    # Must contain return(res) and not append a duplicate 'return res'
+    assert "return(res)" in helper_paren
+    assert "return res" not in helper_paren
+
+    # Test tabbed return 'return\tres'
+    code_tab = (
+        "def compute_tab(val: int) -> int:\n"
+        "    res = val * 2\n"
+        "    return\tres\n"
+    )
+    f2 = tmp_path / "mod_tab.py"
+    f2.write_text(code_tab, encoding="utf-8")
+    u2 = {"file": str(f2), "start": 1, "end": 3, "name": "compute_tab", "kind": "function"}
+
+    helper_tab = synthesize_shared_helper_code(u2, u2, repo_root=str(tmp_path))
+    assert "return\tres" in helper_tab
+    assert "return res" not in helper_tab
+
+    # 2. Test generate_refactoring_patch with subpackage path and relative repo_root
+    subpkg = tmp_path / "nested_subpkg"
+    subpkg.mkdir(parents=True, exist_ok=True)
+    sub_file = subpkg / "logic.py"
+    sub_code = (
+        "def process(a: int, b: int) -> int:\n"
+        "    c = a + b\n"
+        "    return c\n"
+    )
+    sub_file.write_text(sub_code, encoding="utf-8")
+    u_sub = {
+        "file": str(sub_file),
+        "start": 1,
+        "end": 3,
+        "name": "process",
+        "kind": "function",
+    }
+    patch = generate_refactoring_patch([(1.0, u_sub, u_sub)], repo_root=str(tmp_path))
+    assert "--- a/nested_subpkg/logic.py" in patch
+    assert "+++ b/nested_subpkg/logic.py" in patch
+
+    # 3. Test harvest_file_units with absolute file_path and relative repo_root
+    units = harvest_file_units(
+        str(sub_file.resolve()),
+        repo_root=str(tmp_path.resolve()),
+        min_lines=1,
+        min_tokens=1,
+    )
+    assert len(units) >= 1
+    assert units[0]["file"] == "nested_subpkg/logic.py"
+
+
+
 
 
 
