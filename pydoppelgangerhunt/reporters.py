@@ -468,11 +468,18 @@ def generate_html_report(
             )
             coherence_val = fam.get("coherence")
             coherence_str = f" &bull; {coherence_val:.1%} coherence" if coherence_val is not None else ""
-            members_li = "".join(
-                f"<li><code>{str(m.get('file') or '').replace('\\\\', '/')}:{int(m.get('start') or 1)}-{int(m.get('end') or int(m.get('start') or 1))}</code> ({str(m.get('name') or 'member')})"
-                f"{' <strong>[medoid]</strong>' if medoid_name and str(m.get('name') or '') == medoid_name else ''}</li>"
-                for m in fam.get("members", [])
-            )
+            members_li_parts: List[str] = []
+            for m in fam.get("members", []):
+                m_file = str(m.get("file") or "").replace("\\", "/")
+                m_start = int(m.get("start") or 1)
+                m_end = int(m.get("end") or m_start)
+                m_name = str(m.get("name") or "member")
+                is_medoid = bool(medoid_name and m_name == medoid_name)
+                medoid_tag = " <strong>[medoid]</strong>" if is_medoid else ""
+                members_li_parts.append(
+                    f"<li><code>{m_file}:{m_start}-{m_end}</code> ({m_name}){medoid_tag}</li>"
+                )
+            members_li = "".join(members_li_parts)
             f_card = f"""
             <div class="family-card">
                 <h3>{fam['family_id']} &mdash; {fam['member_count']} Members ({fam['avg_similarity']:.1%} avg sim{coherence_str})</h3>
