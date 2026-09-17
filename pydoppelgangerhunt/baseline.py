@@ -183,6 +183,13 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
 
             if "structural_fingerprint" in item and item["structural_fingerprint"]:
                 fps.add(item["structural_fingerprint"])
+            elif "hash_a" in item and "hash_b" in item and item["hash_a"] and item["hash_b"]:
+                f_a = canonical_path_key(str(rec.get("file_a") or ""), strip_anchor=False)
+                f_b = canonical_path_key(str(rec.get("file_b") or ""), strip_anchor=False)
+                sfp = _format_paired_endpoints(f"{f_a}#{item['hash_a']}", f"{f_b}#{item['hash_b']}")
+                rec["structural_fingerprint"] = sfp
+                fps.add(sfp)
+
             if "namespaced_structural_fingerprint" in item and item["namespaced_structural_fingerprint"]:
                 fps.add(item["namespaced_structural_fingerprint"])
             elif "hash_a" in item and "hash_b" in item and item["hash_a"] and item["hash_b"]:
@@ -207,6 +214,12 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
         return BaselineFingerprints()
 
 
+def _record_matches_names(rec: Dict[str, Any], target_names: List[str]) -> bool:
+    """Checks if a baseline record's paired symbol names match target clone names."""
+    rec_names = sorted([str(rec.get("name_a") or ""), str(rec.get("name_b") or "")])
+    return rec_names == target_names
+
+
 def _match_clone_record(
     c_keys: Dict[str, Any],
     unconsumed: List[Dict[str, Any]],
@@ -219,10 +232,16 @@ def _match_clone_record(
     c_namespaces = c_keys["namespaces"]
     c_names = c_keys["names"]
 
-    # Pass 1: exact symbol-path fingerprint (file:name <===> file:name) for untouched code units
+    # Pass 1: exact symbol-path fingerprint (file:name <===> file:name) prioritizing matching structural hash
+    cand_pass1: Optional[Dict[str, Any]] = None
     for rec in unconsumed:
         if rec.get("fingerprint") == c_fp:
-            return rec
+            if rec.get("structural_fingerprint") == c_sfp:
+                return rec
+            if cand_pass1 is None:
+                cand_pass1 = rec
+    if cand_pass1 is not None:
+        return cand_pass1
 
     # Pass 2: exact path-structural fingerprint (file#hash <===> file#hash) resilient to function renames
     for rec in unconsumed:
@@ -230,12 +249,19 @@ def _match_clone_record(
             return rec
 
     # Pass 3: namespaced structural fingerprint (namespace#hash <===> namespace#hash) resilient to file renames within package
+    cand_pass3: Optional[Dict[str, Any]] = None
     for rec in unconsumed:
         if rec.get("namespaced_structural_fingerprint") == c_ns_sfp:
-            return rec
+            if _record_matches_names(rec, c_names):
+                return rec
+            if cand_pass3 is None:
+                cand_pass3 = rec
+    if cand_pass3 is not None:
+        return cand_pass3
 
     # Pass 4: pure structural fingerprint (hash <===> hash) strictly requiring matching module namespaces,
     # preventing identical boilerplate functions across different modules from colliding
+    cand_pass4: Optional[Dict[str, Any]] = None
     for rec in unconsumed:
         if rec.get("pure_structural_fingerprint") == c_pure_sfp:
             rec_ns = sorted([
@@ -243,7 +269,12 @@ def _match_clone_record(
                 rec.get("namespace_b") or extract_unit_namespace(str(rec.get("file_b") or "")),
             ])
             if rec_ns == c_namespaces:
-                return rec
+                if _record_matches_names(rec, c_names):
+                    return rec
+                if cand_pass4 is None:
+                    cand_pass4 = rec
+    if cand_pass4 is not None:
+        return cand_pass4
 
     # Pass 5: pure structural fallback for cross-namespace moved files; requires distinct structural hashes
     # (h_a != h_b) and matching symbols, preventing a grandfathered entry from being hijacked by unrelated cross-namespace code
@@ -252,11 +283,7 @@ def _match_clone_record(
             h_a = str(rec.get("hash_a", ""))
             h_b = str(rec.get("hash_b", ""))
             if h_a and h_b and h_a != h_b:
-                rec_names = sorted([
-                    str(rec.get("name_a") or ""),
-                    str(rec.get("name_b") or ""),
-                ])
-                if not rec_names[0] or rec_names == c_names:
+                if not rec.get("name_a") or _record_matches_names(rec, c_names):
                     return rec
 
     return None
@@ -422,6 +449,12 @@ def prune_baseline(
         item_pure_sfp = item.get("pure_structural_fingerprint")
         h_a = str(item.get("hash_a", ""))
         h_b = str(item.get("hash_b", ""))
+
+        if not item_sfp and h_a and h_b:
+            f_a = canonical_path_key(str(item.get("file_a") or ""), strip_anchor=False)
+            f_b = canonical_path_key(str(item.get("file_b") or ""), strip_anchor=False)
+            item_sfp = _format_paired_endpoints(f"{f_a}#{h_a}", f"{f_b}#{h_b}")
+            item["structural_fingerprint"] = item_sfp
 
         if not item_ns_sfp and h_a and h_b:
             ns_a = item.get("namespace_a") or extract_unit_namespace(str(item.get("file_a") or ""))

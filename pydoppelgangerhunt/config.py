@@ -167,6 +167,32 @@ def _strip_toml_inline_comment(line: str) -> str:
     return line.strip()
 
 
+def _parse_toml_array_value(val_str: str) -> List[Any]:
+    """Parses a TOML array string representation into a list of Python typed values."""
+    elems: List[Any] = []
+    inner = val_str.strip()
+    if inner.startswith("[") and inner.endswith("]"):
+        inner = inner[1:-1]
+    for e in inner.split(","):
+        e_str = e.strip()
+        if not e_str:
+            continue
+        if (e_str.startswith('"') and e_str.endswith('"')) or (
+            e_str.startswith("'") and e_str.endswith("'")
+        ):
+            elems.append(e_str[1:-1])
+        elif e_str.lower() == "true":
+            elems.append(True)
+        elif e_str.lower() == "false":
+            elems.append(False)
+        else:
+            try:
+                elems.append(float(e_str) if "." in e_str else int(e_str))
+            except ValueError:
+                elems.append(e_str)
+    return elems
+
+
 def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[str, Any]:
     """Loads a specific tool configuration section from a TOML file with fallbacks."""
     target_path = Path(target_file)
@@ -193,6 +219,8 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
     try:
         config: Dict[str, Any] = {}
         in_section = False
+        in_multiline_key: Optional[str] = None
+        multiline_tokens: List[str] = []
         target_section = f"[tool.{section_name}]"
         with open(target_path, "r", encoding="utf-8", errors="replace") as fh:
             lines = fh.readlines()
@@ -203,6 +231,13 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
         for line in lines:
             stripped = _strip_toml_inline_comment(line)
             if not stripped:
+                continue
+            if in_multiline_key is not None:
+                multiline_tokens.append(stripped)
+                if stripped.endswith("]"):
+                    config[in_multiline_key] = _parse_toml_array_value(" ".join(multiline_tokens))
+                    in_multiline_key = None
+                    multiline_tokens = []
                 continue
             if stripped == target_section:
                 in_section = True
@@ -218,26 +253,12 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
                     v.startswith("'") and v.endswith("'")
                 ):
                     config[k] = v[1:-1]
-                elif v.startswith("[") and v.endswith("]"):
-                    elems: List[Any] = []
-                    for e in v[1:-1].split(","):
-                        e_str = e.strip()
-                        if not e_str:
-                            continue
-                        if (e_str.startswith('"') and e_str.endswith('"')) or (
-                            e_str.startswith("'") and e_str.endswith("'")
-                        ):
-                            elems.append(e_str[1:-1])
-                        elif e_str.lower() == "true":
-                            elems.append(True)
-                        elif e_str.lower() == "false":
-                            elems.append(False)
-                        else:
-                            try:
-                                elems.append(float(e_str) if "." in e_str else int(e_str))
-                            except ValueError:
-                                elems.append(e_str)
-                    config[k] = elems
+                elif v.startswith("["):
+                    if v.endswith("]"):
+                        config[k] = _parse_toml_array_value(v)
+                    else:
+                        in_multiline_key = k
+                        multiline_tokens = [v]
                 elif v.lower() == "true":
                     config[k] = True
                 elif v.lower() == "false":

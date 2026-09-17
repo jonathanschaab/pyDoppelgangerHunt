@@ -7042,6 +7042,153 @@ exclude = ["venv", "build#dir", ".git"] # Exclude patterns
     assert "script.py" in stats["package_sloc"]
 
 
+def test_batch_63_multiline_toml_and_baseline_disambiguation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tests multi-line TOML array parsing in zero-dep fallback, baseline structural reconstruction, and record disambiguation."""
+    # pylint: disable=import-outside-toplevel
+    import builtins
+    from pydoppelgangerhunt.baseline import (
+        _match_clone_record,
+        _record_matches_names,
+        load_baseline,
+        prune_baseline,
+    )
+    from pydoppelgangerhunt.config import _parse_toml_array_value, load_toml_section
+
+    # 1. Direct _parse_toml_array_value validation
+    assert _parse_toml_array_value("['alpha', 'beta']") == ["alpha", "beta"]
+    assert _parse_toml_array_value("[ 10, 2.5, true, false, 'text' ]") == [
+        10,
+        2.5,
+        True,
+        False,
+        "text",
+    ]
+    assert not _parse_toml_array_value("")
+
+    # 2. Multi-line TOML array parsing via zero-dependency line fallback
+    multiline_toml = tmp_path / "multiline.toml"
+    multiline_toml.write_text(
+        """[tool.pydoppelgangerhunt]
+threshold = 0.88 # inline comment
+exclude = [
+    "venv", # comment 1
+    ".venv",
+    "build",
+    "dist",
+]
+flags = [
+    true,
+    false,
+]
+values = [ 10, 20, 30 ]
+""",
+        encoding="utf-8",
+    )
+    orig_import = builtins.__import__
+
+    def mock_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name in ("tomli", "tomllib"):
+            raise ImportError("mocked no toml parser")
+        return orig_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import)
+    cfg = load_toml_section(multiline_toml, "pydoppelgangerhunt")
+    assert cfg.get("threshold") == 0.88
+    assert cfg.get("exclude") == ["venv", ".venv", "build", "dist"]
+    assert cfg.get("flags") == [True, False]
+    assert cfg.get("values") == [10, 20, 30]
+    monkeypatch.undo()
+
+    # 3. Baseline structural fingerprint reconstruction in load_baseline and prune_baseline
+    base_json = tmp_path / "legacy_base.json"
+    base_json.write_text(
+        json.dumps({
+            "version": "1.3.0",
+            "fingerprints": [
+                {
+                    "file_a": "pkg/mod_a.py",
+                    "name_a": "compute",
+                    "hash_a": "aaaa111122223333",
+                    "file_b": "pkg/mod_b.py",
+                    "name_b": "calculate",
+                    "hash_b": "bbbb111122223333",
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+    loaded_base = load_baseline(str(base_json))
+    assert len(loaded_base.records) == 1
+    rec = loaded_base.records[0]
+    expected_sfp = "pkg/mod_a.py#aaaa111122223333 <===> pkg/mod_b.py#bbbb111122223333"
+    assert rec.get("structural_fingerprint") == expected_sfp
+    assert expected_sfp in loaded_base
+
+    u1 = {"file": "pkg/mod_a.py", "name": "new_compute", "structural_hash": "aaaa111122223333"}
+    u2 = {"file": "pkg/mod_b.py", "name": "new_calc", "structural_hash": "bbbb111122223333"}
+    prune_res = prune_baseline(str(base_json), [(0.95, u1, u2)], unstaged_modified_ranges={})
+    assert prune_res.retained_count == 1
+    assert prune_res.pruned_count == 0
+
+    # 4. _match_clone_record Pass 1 disambiguation prioritizing matching structural hash
+    rec_stale = {
+        "fingerprint": "service.py:worker <===> client.py:worker",
+        "structural_fingerprint": "service.py#old1 <===> client.py#old2",
+        "name_a": "worker",
+        "name_b": "worker",
+    }
+    rec_fresh = {
+        "fingerprint": "service.py:worker <===> client.py:worker",
+        "structural_fingerprint": "service.py#new1 <===> client.py#new2",
+        "name_a": "worker",
+        "name_b": "worker",
+    }
+    keys_p1 = {
+        "fp": "service.py:worker <===> client.py:worker",
+        "sfp": "service.py#new1 <===> client.py#new2",
+        "ns_sfp": "dummy",
+        "pure_sfp": "dummy",
+        "namespaces": [".", "."],
+        "names": ["worker", "worker"],
+    }
+    matched_p1 = _match_clone_record(keys_p1, [rec_stale, rec_fresh])
+    assert matched_p1 is rec_fresh
+
+    # 5. _match_clone_record Pass 3/4 disambiguation prioritizing symbol names
+    rec_diff_names = {
+        "namespaced_structural_fingerprint": "pkg#h1 <===> pkg#h2",
+        "pure_structural_fingerprint": "h1 <===> h2",
+        "namespace_a": "pkg",
+        "namespace_b": "pkg",
+        "name_a": "alpha",
+        "name_b": "beta",
+    }
+    rec_same_names = {
+        "namespaced_structural_fingerprint": "pkg#h1 <===> pkg#h2",
+        "pure_structural_fingerprint": "h1 <===> h2",
+        "namespace_a": "pkg",
+        "namespace_b": "pkg",
+        "name_a": "worker",
+        "name_b": "worker",
+    }
+    assert _record_matches_names(rec_same_names, ["worker", "worker"]) is True
+    assert _record_matches_names(rec_diff_names, ["worker", "worker"]) is False
+
+    keys_ns = {
+        "fp": "nomatch",
+        "sfp": "nomatch",
+        "ns_sfp": "pkg#h1 <===> pkg#h2",
+        "pure_sfp": "h1 <===> h2",
+        "namespaces": ["pkg", "pkg"],
+        "names": ["worker", "worker"],
+    }
+    matched_ns = _match_clone_record(keys_ns, [rec_diff_names, rec_same_names])
+    assert matched_ns is rec_same_names
+
+
+
 
 
 
