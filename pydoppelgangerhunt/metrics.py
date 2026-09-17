@@ -45,7 +45,11 @@ def compute_repository_dry_stats(
                 with open(p, "r", encoding="utf-8", errors="replace") as fh:
                     count = sum(1 for line in fh if line.strip() and not line.strip().startswith("#"))
             total_sloc += count
-            top_pkg = p.parts[0] if len(p.parts) > 1 else str(p)
+            try:
+                rel = p.relative_to(target_dir)
+                top_pkg = rel.parts[0] if len(rel.parts) > 1 else rel.name
+            except ValueError:
+                top_pkg = p.parts[0] if len(p.parts) > 1 else str(p)
             package_sloc[top_pkg] = package_sloc.get(top_pkg, 0) + count
         except OSError:
             continue

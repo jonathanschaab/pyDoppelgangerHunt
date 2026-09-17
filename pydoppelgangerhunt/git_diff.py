@@ -35,8 +35,12 @@ def parse_git_diff_hunks(diff_text: str) -> Dict[str, List[Tuple[int, int]]]:
     current_file: Optional[str] = None
 
     for line in diff_text.splitlines():
-        if line.startswith("+++ b/"):
+        if line.startswith("--- "):
+            current_file = None
+        elif line.startswith("+++ b/"):
             current_file = normalize_path_string(line[6:].strip(), strip_anchor=False)
+        elif line.startswith("+++ "):
+            current_file = None
         elif line.startswith("@@ ") and current_file:
             parts = line.split(" ")
             plus_parts = [p for p in parts if p.startswith("+")]
@@ -200,9 +204,7 @@ def get_git_blame_info(
         parts = line.split(" ", 1)
         if len(parts[0]) == 40 and all(c in "0123456789abcdefABCDEF" for c in parts[0]):
             current_commit = parts[0][:8]
-            c_time = commit_times.get(current_commit, 0)
-            if c_time > latest_time:
-                latest_time = c_time
+            if latest_commit == "unknown":
                 latest_commit = current_commit
         elif line.startswith("author "):
             commit_authors[current_commit] = line[7:].strip()

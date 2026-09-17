@@ -266,18 +266,28 @@ def merge_adjacent_clones(
                 if f1_curr != f1_b or f2_curr != f2_b:
                     continue
 
-                fn1_a = current_u1["name"].split(":")[0]
-                fn1_b = u1_b["name"].split(":")[0]
-                fn2_a = current_u2["name"].split(":")[0]
-                fn2_b = u2_b["name"].split(":")[0]
+                fn1_a = str(current_u1.get("name") or "").split(":", maxsplit=1)[0]
+                fn1_b = str(u1_b.get("name") or "").split(":", maxsplit=1)[0]
+                fn2_a = str(current_u2.get("name") or "").split(":", maxsplit=1)[0]
+                fn2_b = str(u2_b.get("name") or "").split(":", maxsplit=1)[0]
                 if fn1_a != fn1_b or fn2_a != fn2_b:
                     continue
 
-                adj1 = (u1_b["start"] <= current_u1["end"] + line_tolerance) and (
-                    u1_b["end"] >= current_u1["start"] - line_tolerance
+                u1_b_start = int(u1_b.get("start") or 1)
+                u1_b_end = int(u1_b.get("end") or u1_b_start)
+                curr_u1_start = int(current_u1.get("start") or 1)
+                curr_u1_end = int(current_u1.get("end") or curr_u1_start)
+
+                u2_b_start = int(u2_b.get("start") or 1)
+                u2_b_end = int(u2_b.get("end") or u2_b_start)
+                curr_u2_start = int(current_u2.get("start") or 1)
+                curr_u2_end = int(current_u2.get("end") or curr_u2_start)
+
+                adj1 = (u1_b_start <= curr_u1_end + line_tolerance) and (
+                    u1_b_end >= curr_u1_start - line_tolerance
                 )
-                adj2 = (u2_b["start"] <= current_u2["end"] + line_tolerance) and (
-                    u2_b["end"] >= current_u2["start"] - line_tolerance
+                adj2 = (u2_b_start <= curr_u2_end + line_tolerance) and (
+                    u2_b_end >= curr_u2_start - line_tolerance
                 )
 
                 if not (adj1 and adj2):

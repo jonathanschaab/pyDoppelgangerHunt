@@ -6412,4 +6412,198 @@ def test_batch_41_unified_path_normalization_and_html_escaping(tmp_path: Path) -
         assert stats_case["dloc"] == 5
 
 
+def test_batch_47_git_diff_metrics_matcher_clustering(tmp_path: Path) -> None:
+    """Batch 47: Test git diff hunk parsing, blame parsing, UnionFind rank orders,
+
+    metrics relative package path resolution, matcher edge cases, and coverage readers.
+    """
+    # pylint: disable=protected-access,import-outside-toplevel
+    import sqlite3
+    from pydoppelgangerhunt.baseline import clone_pair_fingerprint, prune_baseline
+    from pydoppelgangerhunt.coverage import _read_sqlite_coverage, _read_xml_coverage
+    from pydoppelgangerhunt.git_diff import (
+        _run_git_command,
+        get_git_blame_info,
+        get_git_modified_line_ranges,
+    )
+    from pydoppelgangerhunt.matcher import (
+        _split_exemption_endpoint,
+        call_sequence_similarity,
+        compute_pair_similarity,
+        jaccard_similarity,
+        merge_adjacent_clones,
+        tfidf_multiset_jaccard_similarity,
+    )
+
+    # 1. git_diff: parse_git_diff_hunks single-line hunks and deleted-file bleed prevention
+    diff_data = (
+        "--- a/file_one.py\n"
+        "+++ b/file_one.py\n"
+        "@@ -10 +10 @@\n"
+        "+added_single_line\n"
+        "--- a/file_deleted.py\n"
+        "+++ /dev/null\n"
+        "@@ -1,5 +0,0 @@\n"
+        "-deleted_line\n"
+        "--- a/file_two.py\n"
+        "+++ b/file_two.py\n"
+        "@@ -20,2 +20,2 @@\n"
+        "+line20\n+line21\n"
+    )
+    parsed_hunks = parse_git_diff_hunks(diff_data)
+    assert parsed_hunks.get("file_one.py") == [(10, 10)]
+    assert "file_deleted.py" not in parsed_hunks
+    assert parsed_hunks.get("file_two.py") == [(20, 21)]
+
+    # 2. git_diff: _run_git_command exception safety and range queries
+    with mock.patch("subprocess.run", side_effect=OSError("binary failure")):
+        assert _run_git_command(["status"]) is None
+
+    mock_diff = "+++ b/target_mod.py\n@@ -5,3 +5,3 @@\n"
+    with mock.patch("pydoppelgangerhunt.git_diff._run_git_command", return_value=mock_diff):
+        ranges = get_git_modified_line_ranges(since_ref="HEAD~1")
+        assert "target_mod.py" in ranges
+
+    with mock.patch("pydoppelgangerhunt.git_diff._run_git_command", return_value=None):
+        assert get_git_modified_line_ranges() == {}
+
+    # 3. git_diff: filter_clones_by_git_diff empty ranges & both_units flag
+    unit_alpha = {"file": "mod_a.py", "start": 5, "end": 15}
+    unit_beta = {"file": "mod_b.py", "start": 5, "end": 15}
+    clone_candidate = [(0.92, unit_alpha, unit_beta)]
+    assert filter_clones_by_git_diff(clone_candidate, {}) == []
+
+    matched_ranges = {"mod_a.py": [(5, 10)], "mod_b.py": [(5, 10)]}
+    both_filtered = filter_clones_by_git_diff(
+        clone_candidate, matched_ranges, both_units=True
+    )
+    assert len(both_filtered) == 1
+
+    # 4. git_diff: get_git_blame_info empty file and invalid timestamp handling
+    blame_empty = get_git_blame_info("", 1, 5)
+    assert blame_empty["author"] == "Unknown"
+
+    porcelain_sample = (
+        "fedcba9876543210fedcba9876543210fedcba98 1 1 1\n"
+        "author Dev Master\n"
+        "author-time not_a_valid_integer\n"
+        "summary Patch update\n"
+        "\tval = 42\n"
+    )
+    with mock.patch("pydoppelgangerhunt.git_diff._run_git_command", return_value=porcelain_sample):
+        blame_res = get_git_blame_info("mod_a.py", 1, 1)
+        assert blame_res["commit"] == "fedcba98"
+        assert blame_res["author"] == "Dev Master"
+        assert blame_res["timestamp"] == 0
+
+    # 5. UnionFind: rank orders and self-union branch coverage
+    uf = UnionFind()
+    assert uf.find("item_solo") == "item_solo"
+    root_1 = uf.union("elem_a", "elem_b")
+    root_2 = uf.union("elem_c", "elem_d")
+    assert uf.union("elem_e", "elem_c") == root_2
+    assert uf.union("elem_c", "elem_f") == root_2
+    assert uf.union("elem_a", "elem_a") == root_1
+
+    # 6. clustering: tolerance-floor rejection and medoid sub-threshold rejection
+    cand_1 = {"file": "c1.py", "name": "f1", "start": 1, "end": 10}
+    cand_2 = {"file": "c2.py", "name": "f2", "start": 1, "end": 10}
+    fams_tol = cluster_clone_families(
+        [(0.77, cand_1, cand_2)],
+        linkage="complete",
+        min_similarity_floor=0.80,
+        linkage_tolerance=0.05,
+    )
+    assert len(fams_tol) == 0
+
+    cand_3 = {"file": "c3.py", "name": "f3", "start": 1, "end": 10}
+    # In medoid linkage, cand_3 cannot merge with {cand_1, cand_2} because sim(cand_2, cand_3) < floor
+    fams_med = cluster_clone_families(
+        [(0.95, cand_1, cand_2), (0.75, cand_2, cand_3)],
+        linkage="medoid",
+        min_similarity_floor=0.80,
+    )
+    assert len(fams_med) == 1
+    assert fams_med[0]["member_count"] == 2
+
+    # 7. metrics: package_sloc relative to target_dir and OSError handling
+    stat_root = tmp_path / "repo_metrics"
+    svc_sub = stat_root / "services_pkg"
+    svc_sub.mkdir(parents=True)
+    (svc_sub / "handler.py").write_text("def run_job():\n    return 100\n", encoding="utf-8")
+    (stat_root / "entrypoint.py").write_text("import sys\n", encoding="utf-8")
+
+    stats = compute_repository_dry_stats(str(stat_root), [])
+    assert "services_pkg" in stats["package_sloc"]
+
+    with mock.patch("builtins.open", side_effect=OSError("Disk read failure")):
+        stats_error = compute_repository_dry_stats(str(stat_root), [])
+        assert stats_error["sloc"] == 0
+
+    # 8. matcher: empty fallbacks, exemptions, and alternative similarity modes
+    assert jaccard_similarity(set(), set()) == 0.0
+    assert call_sequence_similarity([], []) == 0.0
+    assert tfidf_multiset_jaccard_similarity({}, {}, {}) == 0.0
+    assert merge_adjacent_clones([]) == []
+
+    assert _split_exemption_endpoint("no_colon_path") == ("no_colon_path", None)
+    assert _split_exemption_endpoint("file.py:sym") == ("file.py", "sym")
+
+    unit_trace_1 = {"calls": ["step_a", "step_b", "step_c"]}
+    unit_trace_2 = {"calls": ["step_a", "step_b", "step_c"]}
+    assert compute_pair_similarity(unit_trace_1, unit_trace_2, call_sequences=True) == 1.0
+
+    unit_vec_1 = {"vector": {"tok_x": 3, "tok_y": 1}, "shingles": set()}
+    unit_vec_2 = {"vector": {"tok_x": 3, "tok_y": 1}, "shingles": set()}
+    idf_map = {"tok_x": 1.2, "tok_y": 1.8}
+    assert compute_pair_similarity(
+        unit_vec_1, unit_vec_2, tfidf=True, bag_of_tokens=True, idf_weights=idf_map
+    ) == 1.0
+
+    # 9. baseline: plain set consumable suppression and prune error recovery
+    u_base_1 = {"file": "b1.py", "name": "fn1", "tokens": ["tok_a", "tok_b"], "start": 1, "end": 10}
+    u_base_2 = {"file": "b2.py", "name": "fn2", "tokens": ["tok_a", "tok_b"], "start": 1, "end": 10}
+    fp_base = clone_pair_fingerprint(u_base_1, u_base_2)
+    plain_fp_set = {fp_base}
+    rem, supp = filter_clones_by_baseline([(0.95, u_base_1, u_base_2)], plain_fp_set)
+    assert supp == 1
+    assert len(rem) == 0
+
+    with mock.patch(
+        "pydoppelgangerhunt.git_diff.get_git_modified_line_ranges",
+        side_effect=RuntimeError("git failure"),
+    ):
+        base_doc = {"fingerprints": [99999, "legacy_raw_str", {"fingerprint": "dict_raw"}]}
+        base_file = tmp_path / "mock_baseline.json"
+        base_file.write_text(json.dumps(base_doc), encoding="utf-8")
+        prune_res = prune_baseline(str(base_file), active_clones=[])
+        assert isinstance(prune_res, tuple)
+
+    # 10. coverage: SQLite bit bounds & unmapped IDs, and XML parse exceptions
+    db_cov = tmp_path / ".coverage_bit_bounds"
+    db_conn = sqlite3.connect(str(db_cov))
+    db_c = db_conn.cursor()
+    db_c.execute("CREATE TABLE file (id INTEGER PRIMARY KEY, path TEXT)")
+    db_c.execute("CREATE TABLE line_bits (file_id INTEGER, num_bits INTEGER, bits BLOB)")
+    db_c.execute("INSERT INTO file VALUES (1, 'recorded.py')")
+    db_c.execute("INSERT INTO line_bits VALUES (1, 2, ?)", (b"\xff",))
+    db_c.execute("INSERT INTO line_bits VALUES (888, 5, ?)", (b"\xff",))
+    db_conn.commit()
+    db_conn.close()
+
+    cov_result = _read_sqlite_coverage(str(db_cov))
+    assert cov_result.get("recorded.py") == {1, 2}
+
+    xml_cov = tmp_path / "cov_malformed.xml"
+    xml_cov.write_text(
+        "<coverage><project><package><classes><class filename='m.py'>"
+        "<lines><line number='not_a_num' hits='1'/></lines></class></classes></package></project></coverage>",
+        encoding="utf-8",
+    )
+    assert _read_xml_coverage(str(xml_cov)) == {"m.py": set()}
+    xml_cov.write_text("<<<NOT_XML>>>", encoding="utf-8")
+    assert _read_xml_coverage(str(xml_cov)) == {}
+
+
+
 
