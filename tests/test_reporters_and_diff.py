@@ -5761,7 +5761,7 @@ def test_batch_32_exhaustive_review_hardening(tmp_path: Path) -> None:
         '{"fingerprints": [{"pure_structural_fingerprint": "pure_sfp", "hash_a": "h1", "hash_b": "h2", "name_a": null, "name_b": null}]}',
         encoding="utf-8",
     )
-    retained_cnt, pruned_cnt = prune_baseline(str(b_file), [])
+    pruned_cnt, retained_cnt = prune_baseline(str(b_file), [])
     assert pruned_cnt == 1
     assert retained_cnt == 0
 

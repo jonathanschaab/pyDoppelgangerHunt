@@ -101,7 +101,7 @@ def compute_unit_diff_overlap(
     target_ranges = modified_ranges.get(norm_file)
     if not target_ranges:
         for f, ranges in modified_ranges.items():
-            if norm_file.endswith(f) or f.endswith(norm_file):
+            if f and (norm_file.endswith(f) or f.endswith(norm_file)):
                 target_ranges = ranges
                 break
     if not target_ranges:

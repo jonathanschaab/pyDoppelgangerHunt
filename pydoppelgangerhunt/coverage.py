@@ -104,7 +104,7 @@ def compute_unit_coverage(
     covered_lines = coverage_data.get(target)
     if covered_lines is None:
         covered_lines = next(
-            (lines for f, lines in coverage_data.items() if f.endswith(target) or target.endswith(f)),
+            (lines for f, lines in coverage_data.items() if f and (f.endswith(target) or target.endswith(f))),
             set(),
         )
 

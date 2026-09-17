@@ -455,8 +455,8 @@ def prune_baseline(
             is_dirty = bool(
                 unstaged_modified_ranges
                 and (
-                    any(f_a == k or f_a.endswith(k) or k.endswith(f_a) for k in unstaged_modified_ranges)
-                    or any(f_b == k or f_b.endswith(k) or k.endswith(f_b) for k in unstaged_modified_ranges)
+                    (bool(f_a) and any(bool(k) and (f_a == k or f_a.endswith(k) or k.endswith(f_a)) for k in unstaged_modified_ranges))
+                    or (bool(f_b) and any(bool(k) and (f_b == k or f_b.endswith(k) or k.endswith(f_b)) for k in unstaged_modified_ranges))
                 )
             )
             if is_dirty:
