@@ -6640,6 +6640,50 @@ def test_batch_54_fixer_path_resolution_and_receiver_metadata(tmp_path: Path) ->
     assert find_enclosing_function("", unit_cls) is None
 
 
+def test_batch_57_empty_res_has_receiver_access_and_metrics_package_sloc(tmp_path: Path) -> None:
+    """Batch 57: Test empty_res has_receiver_access key parity and cross-platform package SLOC."""
+    # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer import _inspect_unit_scope, analyze_unit_variable_scope
+    from pydoppelgangerhunt.metrics import compute_repository_dry_stats
+
+    # 1. Test _inspect_unit_scope on empty / whitespace units
+    empty_file = tmp_path / "empty.py"
+    empty_file.write_text("   \n\n\t  \n", encoding="utf-8")
+    u_empty = {"file": str(empty_file), "start": 1, "end": 3, "name": "empty_unit"}
+    info_empty = _inspect_unit_scope(u_empty, repo_root=str(tmp_path))
+
+    # Verify has_receiver_access is present and is False
+    assert "has_receiver_access" in info_empty
+    assert info_empty["has_receiver_access"] is False
+    assert info_empty["has_instance_binding"] is False
+    assert info_empty["has_class_binding"] is False
+    assert info_empty["binding_kind"] is None
+
+    # Verify key schema parity with populated unit
+    valid_file = tmp_path / "valid.py"
+    valid_file.write_text("def hello(self, x: int) -> int:\n    return self.val + x\n", encoding="utf-8")
+    u_valid = {"file": str(valid_file), "start": 1, "end": 2, "name": "hello"}
+    info_valid = _inspect_unit_scope(u_valid, repo_root=str(tmp_path))
+    assert set(info_empty.keys()) == set(info_valid.keys())
+    assert info_valid["has_receiver_access"] is True
+
+    # 2. Test analyze_unit_variable_scope on empty unit
+    scope_empty = analyze_unit_variable_scope(u_empty, repo_root=str(tmp_path))
+    assert "has_receiver_access" in scope_empty
+    assert scope_empty["has_receiver_access"] is False
+
+    # 3. Test compute_repository_dry_stats package SLOC resolution with subpackages
+    pkg_dir = tmp_path / "core_pkg"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    mod_file = pkg_dir / "worker.py"
+    mod_file.write_text("def work():\n    return 42\n", encoding="utf-8")
+
+    stats = compute_repository_dry_stats(str(tmp_path), [])
+    assert "core_pkg" in stats["package_sloc"]
+    assert stats["package_sloc"]["core_pkg"] == 2
+
+
+
 
 
 

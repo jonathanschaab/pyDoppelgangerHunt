@@ -1187,6 +1187,7 @@ def _inspect_unit_scope(
         "has_instance_binding": False,
         "has_class_binding": False,
         "binding_kind": None,
+        "has_receiver_access": False,
         "instance_attrs": [],
         "class_attrs": [],
     }

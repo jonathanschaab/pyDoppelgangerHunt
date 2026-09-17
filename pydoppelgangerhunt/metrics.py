@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pydoppelgangerhunt.clustering import cluster_clone_families
@@ -46,7 +47,7 @@ def compute_repository_dry_stats(
                     count = sum(1 for line in fh if line.strip() and not line.strip().startswith("#"))
             total_sloc += count
             try:
-                rel = p.relative_to(target_dir)
+                rel = p.resolve().relative_to(Path(target_dir).resolve())
                 top_pkg = rel.parts[0] if len(rel.parts) > 1 else rel.name
             except ValueError:
                 top_pkg = p.parts[0] if len(p.parts) > 1 else str(p)
