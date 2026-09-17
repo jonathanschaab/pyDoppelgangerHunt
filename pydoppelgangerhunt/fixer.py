@@ -24,6 +24,19 @@ logger = logging.getLogger(__name__)
 BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
 
+def _unfold_receiver_attribute(node: ast.AST) -> Optional[str]:
+    """Unfolds chained attribute access on 'self' or 'cls' (e.g. self.config.timeout -> 'self.config.timeout')."""
+    parts: List[str] = []
+    curr: ast.AST = node
+    while isinstance(curr, ast.Attribute):
+        parts.append(curr.attr)
+        curr = curr.value
+    if isinstance(curr, ast.Name) and curr.id in ("self", "cls"):
+        parts.append(curr.id)
+        return ".".join(reversed(parts))
+    return None
+
+
 class _ScopeVisitor(ast.NodeVisitor):
     """Inspects AST loads, stores, function parameters, returns, nonlocals, globals, and attributes."""
 
@@ -284,10 +297,11 @@ class _ScopeVisitor(ast.NodeVisitor):
                 self.deleted_names.add(node.id)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        if isinstance(node.value, ast.Name) and node.value.id in ("self", "cls"):
-            is_inner = any(node.value.id in s for s in self._scope_stack[1:])
-            if not is_inner:
-                attr_name = f"{node.value.id}.{node.attr}"
+        attr_name = _unfold_receiver_attribute(node)
+        if attr_name is not None:
+            receiver_id = attr_name.split(".", 1)[0]
+            is_inner = any(receiver_id in s for s in self._scope_stack[1:])
+            if not is_inner and self.class_depth == 0:
                 if isinstance(node.ctx, ast.Load):
                     if attr_name not in self.attrs_read:
                         self.attrs_read.append(attr_name)
@@ -316,10 +330,11 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._record_load_name(node.target.id)
             self._record_store_name(node.target.id)
         elif isinstance(node.target, ast.Attribute):
-            if isinstance(node.target.value, ast.Name) and node.target.value.id in ("self", "cls"):
-                is_inner = any(node.target.value.id in s for s in self._scope_stack[1:])
-                if not is_inner:
-                    attr_name = f"{node.target.value.id}.{node.target.attr}"
+            attr_name = _unfold_receiver_attribute(node.target)
+            if attr_name is not None:
+                receiver_id = attr_name.split(".", 1)[0]
+                is_inner = any(receiver_id in s for s in self._scope_stack[1:])
+                if not is_inner and self.class_depth == 0:
                     if attr_name not in self.attrs_read:
                         self.attrs_read.append(attr_name)
                     if attr_name not in self.attrs_written:
@@ -2506,6 +2521,11 @@ def synthesize_shared_helper_code(
         scope1.get("globals") or scope2.get("globals") or scope.get("globals")
     ):
         return ""
+    if (
+        set(scope1.get("attrs_read", [])) != set(scope2.get("attrs_read", []))
+        or set(scope1.get("attrs_written", [])) != set(scope2.get("attrs_written", []))
+    ):
+        return ""
 
     is_static_clone = bool(
         is_static
@@ -3531,6 +3551,11 @@ def generate_refactoring_patch(
         if s1.get("nonlocals") or s2.get("nonlocals"):
             continue
         if not is_same_file and (s1.get("globals") or s2.get("globals")):
+            continue
+        if (
+            set(s1.get("attrs_read", [])) != set(s2.get("attrs_read", []))
+            or set(s1.get("attrs_written", [])) != set(s2.get("attrs_written", []))
+        ):
             continue
 
         hazards1 = set(s1.get("control_flow_hazards", []))

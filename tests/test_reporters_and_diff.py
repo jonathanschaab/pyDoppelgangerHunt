@@ -8143,5 +8143,211 @@ def test_cross_module_global_rejected(tmp_path: Path) -> None:
     assert patch == ""
 
 
+def test_receiver_attribute_mismatch_rejected(tmp_path: Path) -> None:
+    """Verifies that methods accessing different receiver attributes are rejected."""
+    src = (
+        "class StateManager:\n"
+        "    def update_alpha(self, val: int) -> int:\n"
+        "        self.alpha = val * 2\n"
+        "        return self.alpha\n"
+        "\n"
+        "    def update_beta(self, val: int) -> int:\n"
+        "        self.beta = val * 2\n"
+        "        return self.beta\n"
+    )
+    f = tmp_path / "state_mismatch.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {
+        "name": "update_alpha",
+        "file": "state_mismatch.py",
+        "start": 2,
+        "end": 4,
+        "kind": "function",
+        "enclosing_class": "StateManager",
+    }
+    u2 = {
+        "name": "update_beta",
+        "file": "state_mismatch.py",
+        "start": 6,
+        "end": 8,
+        "kind": "function",
+        "enclosing_class": "StateManager",
+    }
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper == ""
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert patch == ""
 
 
+def test_receiver_chained_attribute_mismatch_rejected(tmp_path: Path) -> None:
+    """Verifies that methods accessing different chained receiver attributes are rejected."""
+    src = (
+        "class ServiceDriver:\n"
+        "    def configure_timeout(self, setting: int) -> int:\n"
+        "        self.config.timeout = setting\n"
+        "        return self.config.timeout\n"
+        "\n"
+        "    def configure_retries(self, setting: int) -> int:\n"
+        "        self.config.retries = setting\n"
+        "        return self.config.retries\n"
+    )
+    f = tmp_path / "service_mismatch.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {
+        "name": "configure_timeout",
+        "file": "service_mismatch.py",
+        "start": 2,
+        "end": 4,
+        "kind": "function",
+        "enclosing_class": "ServiceDriver",
+    }
+    u2 = {
+        "name": "configure_retries",
+        "file": "service_mismatch.py",
+        "start": 6,
+        "end": 8,
+        "kind": "function",
+        "enclosing_class": "ServiceDriver",
+    }
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper == ""
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert patch == ""
+
+
+def test_receiver_cross_class_attribute_mismatch_rejected(tmp_path: Path) -> None:
+    """Verifies that cross-class method clones accessing different attributes are rejected."""
+    src = (
+        "class ModelA:\n"
+        "    def fetch(self) -> int:\n"
+        "        res = self.primary_data + 1\n"
+        "        return res\n"
+        "\n"
+        "class ModelB:\n"
+        "    def fetch(self) -> int:\n"
+        "        res = self.secondary_data + 1\n"
+        "        return res\n"
+    )
+    f = tmp_path / "models_mismatch.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {
+        "name": "fetch",
+        "file": "models_mismatch.py",
+        "start": 2,
+        "end": 4,
+        "kind": "function",
+        "enclosing_class": "ModelA",
+    }
+    u2 = {
+        "name": "fetch",
+        "file": "models_mismatch.py",
+        "start": 7,
+        "end": 9,
+        "kind": "function",
+        "enclosing_class": "ModelB",
+    }
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper == ""
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert patch == ""
+
+
+def test_receiver_identical_attributes_accepted_and_executed(tmp_path: Path) -> None:
+    """Verifies that methods accessing identical receiver attributes are refactored cleanly."""
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    src = (
+        "class Ledger:\n"
+        "    def __init__(self, initial: int) -> None:\n"
+        "        self.balance: int = initial\n"
+        "\n"
+        "    def credit_direct(self, amount: int) -> int:\n"
+        "        self.balance += amount\n"
+        "        return self.balance\n"
+        "\n"
+        "    def credit_wire(self, amount: int) -> int:\n"
+        "        self.balance += amount\n"
+        "        return self.balance\n"
+    )
+    f = tmp_path / "ledger.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {
+        "name": "credit_direct",
+        "file": "ledger.py",
+        "start": 5,
+        "end": 7,
+        "kind": "function",
+        "enclosing_class": "Ledger",
+    }
+    u2 = {
+        "name": "credit_wire",
+        "file": "ledger.py",
+        "start": 9,
+        "end": 11,
+        "kind": "function",
+        "enclosing_class": "Ledger",
+    }
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "_shared_credit_direct_credit_wire(self, amount: int) -> int:" in helper
+    assert "self.balance += amount" in helper
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        method_binding="method",
+        replace_clones=True,
+    )
+    assert patch != ""
+    assert "return self._shared_credit_direct_credit_wire(amount)" in patch
+
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    run_proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from ledger import Ledger; "
+            "led = Ledger(100); "
+            "r1 = led.credit_direct(50); "
+            "r2 = led.credit_wire(25); "
+            "print(r1, r2, led.balance)",
+        ],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run_proc.returncode == 0, f"run failed: {run_proc.stderr}"
+    assert run_proc.stdout.strip() == "150 175 175"
