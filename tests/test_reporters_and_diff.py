@@ -7353,6 +7353,72 @@ def test_batch_65_git_sha256_diff_prefixes_and_quoted_toml_arrays(
     assert ratio == 0.6
 
 
+def test_batch_66_artifact_dirs_clustering_helper_and_defensive_scoring(tmp_path: Path) -> None:
+    """Batch 66: Verify artifact directory creation, clustering deduplication helper, and defensive scoring."""
+    from pydoppelgangerhunt.cli import (  # pylint: disable=import-outside-toplevel
+        _write_artifact_file,
+        main as cli_main,
+    )
+    from pydoppelgangerhunt.clustering import (  # pylint: disable=import-outside-toplevel,protected-access
+        _extract_unique_clusters,
+    )
+    from pydoppelgangerhunt.matcher import compute_priority_score  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.reporters import (  # pylint: disable=import-outside-toplevel
+        emit_structured_report,
+        format_markdown_summary,
+    )
+
+    # 1. _write_artifact_file creates nested missing parent directories
+    nested_art = tmp_path / "nested" / "deep" / "summary.md"
+    _write_artifact_file(str(nested_art), "# Title\n", "SUMMARY", verbose=False)
+    assert nested_art.is_file()
+    assert nested_art.read_text(encoding="utf-8") == "# Title\n"
+
+    # 2. emit_structured_report creates nested missing parent directories
+    nested_json = tmp_path / "build" / "reports" / "report.json"
+    emit_structured_report({"test": True}, "JSON", str(nested_json))
+    assert nested_json.is_file()
+    assert '"test": true' in nested_json.read_text(encoding="utf-8")
+
+    # 3. cli_main creates nested missing parent directories for --output
+    py_file = tmp_path / "sample.py"
+    py_file.write_text("def unique_one():\n    return 1\n", encoding="utf-8")
+    nested_out = tmp_path / "out" / "cli" / "result.txt"
+    code = cli_main([str(tmp_path), "--output", str(nested_out)])
+    assert code == 0
+    assert nested_out.is_file()
+    assert "No structural code clones found" in nested_out.read_text(encoding="utf-8")
+
+    # 4. _extract_unique_clusters dedupes and deterministically sorts clusters
+    shared_c1 = {"node_b", "node_a"}
+    shared_c2 = {"node_c"}
+    c_map = {
+        "node_a": shared_c1,
+        "node_b": shared_c1,
+        "node_c": shared_c2,
+    }
+    extracted = _extract_unique_clusters(c_map, ["node_a", "node_b", "node_c"])
+    assert extracted == [["node_a", "node_b"], ["node_c"]]
+
+    # 5. compute_priority_score defensive bounds on partial/missing unit keys
+    u_partial1 = {"name": "partial1"}
+    u_partial2 = {"name": "partial2"}
+    score = compute_priority_score(0.95, u_partial1, u_partial2)
+    assert score > 0.0
+    assert isinstance(score, float)
+
+    # 6. format_markdown_summary with empty stats and backticks / pipes in names
+    empty_stats: Dict[str, Any] = {
+        "package_sloc": {"pkg|sub`dir": 120},
+    }
+    md_summary = format_markdown_summary(empty_stats, target="target`pkg")
+    assert "target'pkg" in md_summary
+    assert "`target`pkg`" not in md_summary
+    assert "pkg\\|sub'dir" in md_summary
+    assert "Repository DRY Score" in md_summary
+
+
+
 
 
 

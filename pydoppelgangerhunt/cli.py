@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Set
 
@@ -176,7 +177,9 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
 
 def _write_artifact_file(dest_path: str, content: str, label: str, verbose: bool = True) -> None:
     """Writes report content to disk and emits console confirmation."""
-    with open(dest_path, "w", encoding="utf-8") as fh:
+    out_p = Path(dest_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_p, "w", encoding="utf-8") as fh:
         fh.write(content)
     if verbose:
         print(f"[{label}] Saved to {dest_path}")
@@ -540,7 +543,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ok_msg = colorize(f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!", COLOR_BOLD + COLOR_GREEN, use_color)
         print(ok_msg)
         if args.output:
-            with open(args.output, "w", encoding="utf-8") as fh:
+            out_p = Path(args.output)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_p, "w", encoding="utf-8") as fh:
                 fh.write(f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!\n")
         return 0
 
@@ -663,7 +668,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report_lines.append(footer)
 
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as fh:
+        out_p = Path(args.output)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_p, "w", encoding="utf-8") as fh:
             fh.write("\n".join(report_lines) + "\n")
 
     return 1

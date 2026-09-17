@@ -362,19 +362,28 @@ def format_json_report(
 
 def format_markdown_summary(stats: Dict[str, Any], target: str) -> str:
     """Formats GitHub Step Summary Markdown report."""
+    clean_target = str(target).replace("`", "'")
+    dry_score = float(stats.get("dry_score", 100.0))
+    grade = str(stats.get("grade", "A+"))
+    sloc = int(stats.get("sloc", 0))
+    dloc = int(stats.get("dloc", 0))
+    dup_pct = float(stats.get("duplication_pct", 0.0))
+    clone_pairs = int(stats.get("clone_pairs", 0))
+    clone_fams = int(stats.get("clone_families", 0))
+
     md_lines: List[str] = [
         "## pyDoppelgangerHunt DRY Quality Audit Summary",
         "",
-        f"**Audit Target:** `{target}`",
+        f"**Audit Target:** `{clean_target}`",
         "",
         "| Metric | Value |",
         "| :--- | :--- |",
-        f"| **Repository DRY Score** | **{stats['dry_score']:.1f}% (Grade: {stats['grade']})** |",
-        f"| **Total Source Lines (SLOC)** | {stats['sloc']:,} |",
-        f"| **Duplicated Lines (DLOC)** | {stats['dloc']:,} |",
-        f"| **Duplication Rate** | {stats['duplication_pct']:.2f}% |",
-        f"| **Total Clone Pairs** | {stats['clone_pairs']} |",
-        f"| **Clone Families** | {stats['clone_families']} |",
+        f"| **Repository DRY Score** | **{dry_score:.1f}% (Grade: {grade})** |",
+        f"| **Total Source Lines (SLOC)** | {sloc:,} |",
+        f"| **Duplicated Lines (DLOC)** | {dloc:,} |",
+        f"| **Duplication Rate** | {dup_pct:.2f}% |",
+        f"| **Total Clone Pairs** | {clone_pairs} |",
+        f"| **Clone Families** | {clone_fams} |",
         "",
     ]
     if stats.get("package_sloc"):
@@ -382,7 +391,7 @@ def format_markdown_summary(stats: Dict[str, Any], target: str) -> str:
         md_lines.append("| Package / Directory | SLOC |")
         md_lines.append("| :--- | :--- |")
         for pkg, lines in sorted(stats["package_sloc"].items(), key=lambda x: x[1], reverse=True):
-            clean_pkg = str(pkg).replace("|", "\\|")
+            clean_pkg = str(pkg).replace("|", "\\|").replace("`", "'")
             md_lines.append(f"| `{clean_pkg}` | {lines:,} |")
         md_lines.append("")
 
@@ -395,7 +404,9 @@ def emit_structured_report(
     """Emits formatted JSON or SARIF report to stdout or output file."""
     text = json.dumps(data, indent=2)
     if output_path:
-        with open(output_path, "w", encoding="utf-8") as fh:
+        out_p = Path(output_path)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_p, "w", encoding="utf-8") as fh:
             fh.write(text)
         print(f"Report saved in {fmt_label} format to {output_path}")
     else:

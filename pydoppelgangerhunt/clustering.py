@@ -104,6 +104,19 @@ def compute_medoid(
     return res
 
 
+def _extract_unique_clusters(
+    cluster_map: Dict[str, Set[str]], all_keys: Sequence[str]
+) -> List[List[str]]:
+    """Extracts deterministically sorted unique clusters from a node-to-cluster mapping."""
+    unique_clusters_dict: Dict[Tuple[str, ...], List[str]] = {}
+    for k in all_keys:
+        c = cluster_map[k]
+        rep = tuple(sorted(c))
+        if rep not in unique_clusters_dict:
+            unique_clusters_dict[rep] = list(rep)
+    return [unique_clusters_dict[rep] for rep in sorted(unique_clusters_dict.keys())]
+
+
 def cluster_clone_families(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     linkage: str = "single",
@@ -218,13 +231,7 @@ def cluster_clone_families(
                 for node in merged:
                     cluster_map[node] = merged
 
-        unique_clusters_dict: Dict[Tuple[str, ...], List[str]] = {}
-        for k in all_keys:
-            c = cluster_map[k]
-            rep = tuple(sorted(c))
-            if rep not in unique_clusters_dict:
-                unique_clusters_dict[rep] = list(rep)
-        raw_clusters = [unique_clusters_dict[rep] for rep in sorted(unique_clusters_dict.keys())]
+        raw_clusters = _extract_unique_clusters(cluster_map, all_keys)
 
     elif linkage == "average":
         cluster_map = {k: {k} for k in all_keys}
@@ -243,13 +250,7 @@ def cluster_clone_families(
                 for node in merged:
                     cluster_map[node] = merged
 
-        unique_clusters_dict = {}
-        for k in all_keys:
-            c = cluster_map[k]
-            rep = tuple(sorted(c))
-            if rep not in unique_clusters_dict:
-                unique_clusters_dict[rep] = list(rep)
-        raw_clusters = [unique_clusters_dict[rep] for rep in sorted(unique_clusters_dict.keys())]
+        raw_clusters = _extract_unique_clusters(cluster_map, all_keys)
 
     elif linkage in ("medoid", "centroid"):
         cluster_map = {k: {k} for k in all_keys}
@@ -275,13 +276,7 @@ def cluster_clone_families(
                 for node in merged:
                     cluster_map[node] = merged
 
-        unique_clusters_dict = {}
-        for k in all_keys:
-            c = cluster_map[k]
-            rep = tuple(sorted(c))
-            if rep not in unique_clusters_dict:
-                unique_clusters_dict[rep] = list(rep)
-        raw_clusters = [unique_clusters_dict[rep] for rep in sorted(unique_clusters_dict.keys())]
+        raw_clusters = _extract_unique_clusters(cluster_map, all_keys)
 
     else:
         raise ValueError(

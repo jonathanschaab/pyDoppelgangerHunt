@@ -773,7 +773,13 @@ def scan_target(
     if sort_by == "priority":
         clones.sort(key=lambda x: compute_priority_score(x[0], x[1], x[2]), reverse=True)
     elif sort_by == "sloc":
-        clones.sort(key=lambda x: (x[1]["end"] - x[1]["start"] + 1) + (x[2]["end"] - x[2]["start"] + 1), reverse=True)
+        clones.sort(
+            key=lambda x: (
+                (int(x[1].get("end") or int(x[1].get("start") or 1)) - int(x[1].get("start") or 1) + 1)
+                + (int(x[2].get("end") or int(x[2].get("start") or 1)) - int(x[2].get("start") or 1) + 1)
+            ),
+            reverse=True,
+        )
     else:
         clones.sort(key=lambda x: x[0], reverse=True)
 
@@ -789,6 +795,10 @@ def compute_priority_score(
     u2: Dict[str, Any],
 ) -> float:
     """Calculates refactoring priority based on similarity, line length, and cyclomatic complexity."""
-    avg_sloc = ((u1["end"] - u1["start"] + 1) + (u2["end"] - u2["start"] + 1)) / 2.0
-    max_comp = max(u1.get("complexity", 1), u2.get("complexity", 1))
+    s1 = int(u1.get("start") or 1)
+    e1 = int(u1.get("end") or s1)
+    s2 = int(u2.get("start") or 1)
+    e2 = int(u2.get("end") or s2)
+    avg_sloc = ((e1 - s1 + 1) + (e2 - s2 + 1)) / 2.0
+    max_comp = max(int(u1.get("complexity") or 1), int(u2.get("complexity") or 1))
     return float(round(sim * avg_sloc * max_comp, 1))
