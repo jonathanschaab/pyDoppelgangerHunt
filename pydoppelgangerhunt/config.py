@@ -61,7 +61,16 @@ def paths_match_boundary(p1: Optional[str], p2: Optional[str]) -> bool:
         return False
     if n1 == n2:
         return True
-    return n1.endswith("/" + n2) or n2.endswith("/" + n1)
+    if n1.endswith("/" + n2) or n2.endswith("/" + n1):
+        return True
+    if os.name == "nt" or sys.platform == "win32":
+        n1_lower = n1.lower()
+        n2_lower = n2.lower()
+        if n1_lower == n2_lower:
+            return True
+        if n1_lower.endswith("/" + n2_lower) or n2_lower.endswith("/" + n1_lower):
+            return True
+    return False
 
 
 def find_matching_path_value(
@@ -219,7 +228,10 @@ def init_tool_configuration(target_dir: str = ".") -> str:
     """Initializes configuration for pyDoppelgangerHunt in pyproject.toml or standalone file."""
     pyproject_path = Path(target_dir) / "pyproject.toml"
     if pyproject_path.exists():
-        content = pyproject_path.read_text(encoding="utf-8")
+        try:
+            content = pyproject_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            content = ""
         if "[tool.pydoppelgangerhunt]" in content:
             return f"{pyproject_path} (already configured)"
         with open(pyproject_path, "a", encoding="utf-8") as fh:

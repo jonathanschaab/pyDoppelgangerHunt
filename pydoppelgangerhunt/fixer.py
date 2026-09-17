@@ -15,6 +15,7 @@ import tokenize
 import typing
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
+from pydoppelgangerhunt.config import normalize_path_string, paths_match_boundary
 from pydoppelgangerhunt.parser import is_decorator_named
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 
@@ -1935,11 +1936,9 @@ def _normalize_file_path(
     repo_root: Optional[str] = None,
 ) -> str:
     """Normalizes a file path string to a canonical resolved POSIX path."""
-    if not f_str:
+    norm = normalize_path_string(f_str)
+    if not norm:
         return ""
-    norm = str(f_str).split("#", maxsplit=1)[0].replace("\\", "/")
-    if norm.startswith("./"):
-        norm = norm[2:]
     root = Path(repo_root or os.getcwd())
     try:
         p = Path(norm)
@@ -1957,15 +1956,9 @@ def _is_same_file_path(
     """Checks whether two file path strings refer to the identical file on disk."""
     if not f1_str or not f2_str:
         return False
-    norm1 = str(f1_str).split("#", maxsplit=1)[0].replace("\\", "/")
-    norm2 = str(f2_str).split("#", maxsplit=1)[0].replace("\\", "/")
-    if norm1 == norm2:
-        return True
-    if norm1.startswith("./"):
-        norm1 = norm1[2:]
-    if norm2.startswith("./"):
-        norm2 = norm2[2:]
-    if norm1 == norm2:
+    norm1 = normalize_path_string(f1_str)
+    norm2 = normalize_path_string(f2_str)
+    if paths_match_boundary(norm1, norm2):
         return True
     root = Path(repo_root or os.getcwd())
     try:
@@ -1975,12 +1968,6 @@ def _is_same_file_path(
         p2_full = p2 if p2.is_absolute() else (root / p2)
         if p1_full.resolve() == p2_full.resolve():
             return True
-        if p1.is_absolute() and not p2.is_absolute():
-            if norm1.lower().endswith("/" + norm2.lower()):
-                return True
-        elif p2.is_absolute() and not p1.is_absolute():
-            if norm2.lower().endswith("/" + norm1.lower()):
-                return True
     except OSError:
         return False
     return False
@@ -2087,7 +2074,7 @@ def _populate_unit_receiver_metadata(
                     unit["is_static"] = True
             else:
                 unit["receiver_kind"] = None
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         pass
 
 
@@ -3006,7 +2993,7 @@ def generate_refactoring_patch(
 
         try:
             orig_text = f1_path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             continue
 
         orig_lines = orig_text.splitlines(keepends=True)
@@ -3031,7 +3018,7 @@ def generate_refactoring_patch(
                     f2_text = f2_path.read_text(encoding="utf-8")
                     enc2 = find_enclosing_class(f2_text, u2)
                     fn2 = find_enclosing_function(f2_text, u2)
-                except OSError:
+                except (OSError, UnicodeDecodeError):
                     pass
 
         is_same_class = bool(

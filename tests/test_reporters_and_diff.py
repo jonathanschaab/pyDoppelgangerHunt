@@ -6031,4 +6031,79 @@ def test_batch_37_directory_boundary_path_matching_and_exclude_filtering(tmp_pat
     assert stats["dloc"] == 10
 
 
+def test_batch_38_windows_path_case_insensitivity_and_unicode_resilience(tmp_path: Any, monkeypatch: Any) -> None:
+    """Tests Batch 38: Windows case-insensitive path matching, UnicodeDecodeError resilience, and markdown table escaping."""
+    import sys
+    from pydoppelgangerhunt.baseline import load_baseline, prune_baseline
+    from pydoppelgangerhunt.config import (
+        find_matching_path_value,
+        init_tool_configuration,
+        paths_match_boundary,
+    )
+    from pydoppelgangerhunt.fixer import (
+        _is_same_file_path,
+        _populate_unit_receiver_metadata,
+        generate_refactoring_patch,
+    )
+    from pydoppelgangerhunt.reporters import format_markdown_summary
 
+    # 1. Windows case-insensitive boundary path matching
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert paths_match_boundary("C:/Project/Sub/Engine.py", "c:/project/sub/engine.py")
+    assert paths_match_boundary("C:/Project/Sub/Engine.py", "sub/engine.py")
+    assert paths_match_boundary("sub/engine.py", "C:/Project/Sub/Engine.py")
+    assert not paths_match_boundary("C:/Project/Sub/Other.py", "sub/engine.py")
+
+    # 2. find_matching_path_value with Windows case insensitivity
+    data_map = {"c:/repo/sub/module.py": 42}
+    val = find_matching_path_value("C:/Repo/Sub/Module.py", data_map)
+    assert val == 42
+    val_rel = find_matching_path_value("sub/module.py", data_map)
+    assert val_rel == 42
+
+    # 3. _is_same_file_path using boundary matching
+    assert _is_same_file_path("./Sub/Module.py#cell1", "sub/module.py")
+    assert _is_same_file_path("C:/Repo/Sub/Module.py", "sub/module.py")
+
+    # 4. UnicodeDecodeError resilience across file reading
+    bad_file = tmp_path / "corrupted.py"
+    bad_file.write_bytes(b"\x80\xff\xfe\x00\x01not-utf8")
+    u_corrupt = {"file": str(bad_file), "start": 1, "end": 2, "name": "bad"}
+
+    # _populate_unit_receiver_metadata does not raise
+    _populate_unit_receiver_metadata(u_corrupt, repo_root=str(tmp_path))
+    assert u_corrupt.get("receiver_kind") is None
+
+    # generate_refactoring_patch skips corrupted files gracefully
+    patch = generate_refactoring_patch([(1.0, u_corrupt, u_corrupt)], repo_root=str(tmp_path))
+    assert patch == ""
+
+    # load_baseline and prune_baseline with non-UTF8 baseline file
+    bad_baseline = tmp_path / "bad_baseline.json"
+    bad_baseline.write_bytes(b"\xff\xfe\x00corrupt")
+    base_fps = load_baseline(str(bad_baseline))
+    assert len(base_fps) == 0
+
+    pruned = prune_baseline(str(bad_baseline), [])
+    assert pruned.pruned_count == 0
+
+    # init_tool_configuration with non-UTF8 pyproject.toml
+    bad_pyproject = tmp_path / "pyproject.toml"
+    bad_pyproject.write_bytes(b"\x80\xff[project]\nname='bad'\n")
+    res_cfg = init_tool_configuration(str(tmp_path))
+    assert str(bad_pyproject) in res_cfg
+
+    # 5. Markdown table escaping for pipe characters in package names
+    stats_with_pipe = {
+        "dry_score": 95.0,
+        "grade": "A",
+        "sloc": 1000,
+        "dloc": 50,
+        "duplication_pct": 5.0,
+        "clone_pairs": 1,
+        "clone_families": 1,
+        "package_sloc": {"pkg|with|pipes": 500, "normal_pkg": 500},
+    }
+    summary = format_markdown_summary(stats_with_pipe, "test_repo")
+    assert "| `pkg\\|with\\|pipes` | 500 |" in summary
+    assert "| `normal_pkg` | 500 |" in summary

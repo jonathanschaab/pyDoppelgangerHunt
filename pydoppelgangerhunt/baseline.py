@@ -179,7 +179,7 @@ def load_baseline(baseline_path: str) -> Set[str]:
 
             records.append(rec)
         return BaselineFingerprints(fps, records=records)
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return BaselineFingerprints()
 
 
@@ -337,7 +337,7 @@ def prune_baseline(
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return PruneResult(0, 0, 0)
 
     if not isinstance(data, dict) or "fingerprints" not in data:

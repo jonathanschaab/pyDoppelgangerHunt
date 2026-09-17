@@ -351,7 +351,8 @@ def format_markdown_summary(stats: Dict[str, Any], target: str) -> str:
         md_lines.append("| Package / Directory | SLOC |")
         md_lines.append("| :--- | :--- |")
         for pkg, lines in sorted(stats["package_sloc"].items(), key=lambda x: x[1], reverse=True):
-            md_lines.append(f"| `{pkg}` | {lines:,} |")
+            clean_pkg = str(pkg).replace("|", "\\|")
+            md_lines.append(f"| `{clean_pkg}` | {lines:,} |")
         md_lines.append("")
 
     return "\n".join(md_lines)
