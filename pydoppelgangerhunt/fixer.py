@@ -2091,10 +2091,14 @@ def _base_unit_name(u: Dict[str, Any]) -> str:
     """Extracts base function or method name from unit dictionary for helper synthesis."""
     name = str(u.get("name") or "")
     if u.get("kind") == "closure" and ":" in name:
-        base = name.rsplit(":", maxsplit=1)[-1].lstrip("_")
+        base = name.rsplit(":", maxsplit=1)[-1].strip("_")
     else:
-        base = name.split(":", maxsplit=1)[0].lstrip("_")
+        base = name.split(":", maxsplit=1)[0].strip("_")
+    if "." in base:
+        base = base.rsplit(".", maxsplit=1)[-1].strip("_")
+    base = re.sub(r"[^a-zA-Z0-9_]", "_", base).strip("_")
     return base or "helper"
+
 
 
 def _resolve_effective_binding(
@@ -2576,8 +2580,12 @@ def synthesize_shared_helper_code(
         for ln in common_lines[-3:]
     )
     if u1.get("kind") in ("comprehension", "complex_expr"):
-        expr_text = "".join(common_lines).strip()
-        common_lines = [f"return {expr_text}"]
+        if len(common_lines) == 1:
+            common_lines = [f"return {common_lines[0].strip()}"]
+        else:
+            eff_step = step or _detect_indent_step(indent)
+            expr_inner = [f"{eff_step}{ln}" for ln in common_lines]
+            common_lines = ["return ("] + expr_inner + [")"]
         helper_outputs = []
     elif not has_trailing_return and helper_outputs and not scope.get("has_yield"):
         if len(helper_outputs) >= 2:
@@ -3073,6 +3081,27 @@ def _build_whole_method_delegation(
     return header + delegation_stmt
 
 
+def _has_unconditional_terminal_return(
+    unit: Dict[str, Any], orig_lines: Sequence[str]
+) -> bool:
+    """Checks whether an AST code unit terminates with an unconditional return at its base indentation."""
+    u_start = max(1, int(unit.get("start") or 1))
+    u_end = min(len(orig_lines), int(unit.get("end") or u_start))
+    if u_start > len(orig_lines) or u_start > u_end:
+        return False
+    cand_lines = orig_lines[u_start - 1 : u_end]
+    non_empty = [ln for ln in cand_lines if ln.strip() and not ln.strip().startswith("#")]
+    if not non_empty:
+        return False
+    base_ind = len(non_empty[0]) - len(non_empty[0].lstrip())
+    last_ln = non_empty[-1]
+    last_ind = len(last_ln) - len(last_ln.lstrip())
+    if last_ind != base_ind:
+        return False
+    s = last_ln.strip()
+    return s == "return" or s.startswith("return ") or s.startswith("return(") or s.startswith("return\t")
+
+
 def _build_unit_delegation_call(
     target_unit: Dict[str, Any],
     orig_text: str,
@@ -3127,8 +3156,10 @@ def _build_unit_delegation_call(
         target_inputs=effective_targets,
     )
 
-    is_whole_method = target_unit.get("kind") in ("function", "closure")
+    is_whole_method = target_unit.get("kind") in ("function", "closure", "method")
     if is_whole_method:
+        is_init = target_unit.get("name") == "__init__" or str(target_unit.get("name", "")).endswith(".__init__")
+        has_return = False if is_init else bool(effective_outputs or scope.get("has_return", True))
         return _build_whole_method_delegation(
             orig_text,
             target_unit,
@@ -3136,7 +3167,7 @@ def _build_unit_delegation_call(
             helper_name=helper_name,
             args_str=unit_args_str,
             await_prefix=await_prefix,
-            has_return=bool(effective_outputs or scope.get("has_return", True)),
+            has_return=has_return,
             is_async=bool(scope.get("is_async")),
             has_yield=bool(scope.get("has_yield")),
         )
@@ -3154,6 +3185,10 @@ def _build_unit_delegation_call(
         )
 
     is_sync_gen = bool(scope.get("has_yield"))
+    if _has_unconditional_terminal_return(target_unit, orig_lines):
+        prefix = "yield from " if is_sync_gen else await_prefix
+        return f"{indent}return {prefix}{call_expr}\n"
+
     if effective_outputs:
         assign_target = ", ".join(effective_outputs) if len(effective_outputs) >= 2 else effective_outputs[0]
         rhs = (
@@ -3227,6 +3262,29 @@ class _FilePatchPlan:
         self.missing_imports: List[str] = []
         self.comments: List[str] = []
         self.used_helper_names: Set[str] = set()
+        self.claimed_units: List[Dict[str, Any]] = []
+
+
+def _adjust_line_for_replacements(
+    target_line: int,
+    reps: Sequence[Tuple[Dict[str, Any], str]],
+    orig_text: str,
+) -> int:
+    """Adjusts a target source line number to account for upstream line expansions or contractions."""
+    orig_lines = orig_text.splitlines(keepends=True)
+    offset = 0
+    for u, rep in reps:
+        u_start = int(u.get("start") or 1)
+        u_end = int(u.get("end") or u_start)
+        if u_end < target_line:
+            orig_count = u_end - u_start + 1
+            unit_orig_text = "".join(orig_lines[u_start - 1 : u_end])
+            replaced_text = replace_unit_in_source(
+                unit_orig_text, {**u, "start": 1, "end": orig_count}, rep
+            )
+            new_count = len(replaced_text.splitlines(keepends=True))
+            offset += (new_count - orig_count)
+    return max(1, target_line + offset)
 
 
 def _render_file_patch_plan(
@@ -3261,7 +3319,16 @@ def _render_file_patch_plan(
         current_text = plan.orig_text
 
     if plan.method_helpers:
-        sorted_methods = sorted(plan.method_helpers, key=lambda m: m[0], reverse=True)
+        adjusted_methods = [
+            (
+                _adjust_line_for_replacements(ins_line, filtered_reps, plan.orig_text)
+                if replace_clones and filtered_reps
+                else ins_line,
+                h_code,
+            )
+            for ins_line, h_code in plan.method_helpers
+        ]
+        sorted_methods = sorted(adjusted_methods, key=lambda m: m[0], reverse=True)
         for ins_line, h_code in sorted_methods:
             c_lines = current_text.splitlines(keepends=True)
             idx = max(0, ins_line - 1)
@@ -3372,6 +3439,28 @@ def generate_refactoring_patch(
                     enc2 = find_enclosing_class(f2_plan.orig_text, u2)
                     fn2 = find_enclosing_function(f2_plan.orig_text, u2)
 
+        if replace_clones:
+            u1_claimed = any(
+                check_units_overlap(u1, prev_u, repo_root=str(root))
+                for prev_u in f1_plan.claimed_units
+            )
+            if is_same_file:
+                u2_claimed = any(
+                    check_units_overlap(u2, prev_u, repo_root=str(root))
+                    for prev_u in f1_plan.claimed_units
+                )
+            else:
+                u2_claimed = (
+                    any(
+                        check_units_overlap(u2, prev_u, repo_root=str(root))
+                        for prev_u in f2_plan.claimed_units
+                    )
+                    if f2_plan is not None
+                    else False
+                )
+            if u1_claimed or u2_claimed:
+                continue
+
         is_same_class = bool(
             is_same_file
             and enc1
@@ -3413,6 +3502,14 @@ def generate_refactoring_patch(
         hazards2 = set(s2.get("control_flow_hazards", []))
         if any(h in ("naked_break", "naked_continue") for h in hazards1 | hazards2):
             continue
+        if "embedded_return" in hazards1 | hazards2:
+            lines1 = orig_lines
+            lines2 = orig_lines if is_same_file else (f2_plan.orig_lines if f2_plan else [])
+            if not (
+                _has_unconditional_terminal_return(u1, lines1)
+                and _has_unconditional_terminal_return(u2, lines2)
+            ):
+                continue
 
         if receiver_kinds_differ:
             if _has_receiver_reference(u1, s1, repo_root=str(root)) or _has_receiver_reference(u2, s2, repo_root=str(root)):
@@ -3448,6 +3545,43 @@ def generate_refactoring_patch(
             u1_ind = u1_lead[: len(u1_lead) - len(u1_lead.lstrip())]
             step = _detect_indent_step(u1_ind)
 
+        scope = analyze_unit_variable_scope(u1, u2, repo_root=str(root))
+        inputs = list(scope.get("inputs", []))
+        if effective_binding == "module":
+            inputs = _prune_unshared_receivers(inputs, u1, u2, s1, s2, repo_root=str(root))
+        outputs = [
+            v for v in scope.get("outputs", [])
+            if v not in scope.get("globals", [])
+            and v not in scope.get("nonlocals", [])
+        ]
+        u1_outs = [
+            v for v in s1.get("outputs", [])
+            if v not in s1.get("globals", [])
+            and v not in s1.get("nonlocals", [])
+        ]
+        u2_outs = [
+            v for v in s2.get("outputs", [])
+            if v not in s2.get("globals", [])
+            and v not in s2.get("nonlocals", [])
+        ]
+        t_inputs1 = list(s1.get("inputs", []))
+        t_inputs2 = list(s2.get("inputs", []))
+        if effective_binding == "module":
+            t_inputs1 = _prune_unshared_receivers(
+                t_inputs1, u1, u2, s1, s2, repo_root=str(root)
+            )
+            t_inputs2 = _prune_unshared_receivers(
+                t_inputs2, u2, u1, s2, s1, repo_root=str(root)
+            )
+
+        if replace_clones and (
+            len(t_inputs1) != len(inputs)
+            or len(t_inputs2) != len(inputs)
+            or len(u1_outs) != len(outputs)
+            or len(u2_outs) != len(outputs)
+        ):
+            continue
+
         base_name1 = _base_unit_name(u1)
         base_name2 = _base_unit_name(u2)
         base_helper = (
@@ -3455,12 +3589,22 @@ def generate_refactoring_patch(
         )
         helper_name = base_helper
         h_idx = 2
-        while helper_name in f1_plan.used_helper_names or (
-            f"def {helper_name}" in orig_text
+        while (
+            helper_name in f1_plan.used_helper_names
+            or bool(re.search(rf"\b{re.escape(helper_name)}\b", orig_text))
+            or (
+                f2_plan is not None
+                and (
+                    helper_name in f2_plan.used_helper_names
+                    or bool(re.search(rf"\b{re.escape(helper_name)}\b", f2_plan.orig_text))
+                )
+            )
         ):
             helper_name = f"{base_helper}_{h_idx}"
             h_idx += 1
         f1_plan.used_helper_names.add(helper_name)
+        if f2_plan is not None:
+            f2_plan.used_helper_names.add(helper_name)
 
         helper_code = synthesize_shared_helper_code(
             u1,
@@ -3484,20 +3628,11 @@ def generate_refactoring_patch(
         missing_import_lines: List[str] = []
         if missing_typing:
             missing_import_lines.append(f"from typing import {', '.join(sorted(missing_typing))}")
-        scope = analyze_unit_variable_scope(u1, u2, repo_root=str(root))
         for loc_imp in scope.get("local_imports", []):
             if loc_imp not in orig_text and loc_imp not in missing_import_lines:
                 missing_import_lines.append(loc_imp)
 
         await_prefix = "await " if scope.get("is_async") else ""
-        inputs = list(scope.get("inputs", []))
-        if effective_binding == "module":
-            inputs = _prune_unshared_receivers(inputs, u1, u2, s1, s2, repo_root=str(root))
-        outputs = [
-            v for v in scope.get("outputs", [])
-            if v not in scope.get("globals", [])
-            and v not in scope.get("nonlocals", [])
-        ]
 
         f1_disp = normalize_path_string(str(u1.get("file") or "file1"), strip_anchor=False)
         f2_disp = normalize_path_string(str(u2.get("file") or "file2"), strip_anchor=False)
@@ -3518,17 +3653,6 @@ def generate_refactoring_patch(
             enc_fn_earliest["start"] if enc_fn_earliest else int(earliest_unit.get("start") or 1)
         )
 
-        u1_outs = [
-            v for v in s1.get("outputs", [])
-            if v not in s1.get("globals", [])
-            and v not in s1.get("nonlocals", [])
-        ]
-        u2_outs = [
-            v for v in s2.get("outputs", [])
-            if v not in s2.get("globals", [])
-            and v not in s2.get("nonlocals", [])
-        ]
-
         rep_stmt1 = _build_unit_delegation_call(
             u1,
             orig_text,
@@ -3544,13 +3668,9 @@ def generate_refactoring_patch(
             step=step,
         )
         f1_plan.replacements.append((u1, rep_stmt1))
+        f1_plan.claimed_units.append(u1)
 
         if is_same_file and len(candidate_units) > 1:
-            t_inputs2 = list(s2.get("inputs", []))
-            if effective_binding == "module":
-                t_inputs2 = _prune_unshared_receivers(
-                    t_inputs2, u2, u1, s2, s1, repo_root=str(root)
-                )
             rep_stmt2 = _build_unit_delegation_call(
                 u2,
                 orig_text,
@@ -3566,6 +3686,7 @@ def generate_refactoring_patch(
                 step=step,
             )
             f1_plan.replacements.append((u2, rep_stmt2))
+            f1_plan.claimed_units.append(u2)
         elif not is_same_file and f2_plan is not None:
             mod1 = _derive_module_import_path(f1_path, root)
             mod2 = _derive_module_import_path(f2_plan.path, root)
@@ -3578,10 +3699,6 @@ def generate_refactoring_patch(
             elif replace_clones:
                 f2_plan.comments.append(pair_comment)
                 f2_plan.missing_imports.append(f"from {mod1} import {helper_name}")
-                t_inputs2 = list(s2.get("inputs", []))
-                t_inputs2 = _prune_unshared_receivers(
-                    t_inputs2, u2, u1, s2, s1, repo_root=str(root)
-                )
                 u2_s = int(u2.get("start") or 1)
                 u2_lead = (
                     f2_plan.orig_lines[u2_s - 1]
@@ -3606,6 +3723,7 @@ def generate_refactoring_patch(
                     step=step2,
                 )
                 f2_plan.replacements.append((u2, rep_stmt2))
+                f2_plan.claimed_units.append(u2)
             else:
                 f1_plan.comments.append(
                     f"# Note: Cross-module clone pair; helper generated in {f1_disp}. "

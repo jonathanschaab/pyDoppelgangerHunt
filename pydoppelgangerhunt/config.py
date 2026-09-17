@@ -156,7 +156,14 @@ def find_python_files(
 def _strip_toml_inline_comment(line: str) -> str:
     """Strips trailing TOML comments starting with # outside quotes."""
     in_quote: Optional[str] = None
+    escaped = False
     for idx, ch in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and in_quote is not None:
+            escaped = True
+            continue
         if ch in ('"', "'"):
             if in_quote is None:
                 in_quote = ch

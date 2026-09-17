@@ -7697,17 +7697,310 @@ def test_generate_refactoring_patch_overlapping_units_filtered(tmp_path: Path) -
     assert "def outer(x: int) -> int:" in patch
 
 
+def test_multiline_comprehension_helper_synthesis_and_apply(tmp_path: Path) -> None:
+    """Verifies that multiline comprehensions with comments are wrapped in return (...) and run cleanly."""
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    src = (
+        "def parse_items(items: list) -> list:\n"
+        "    return [\n"
+        "        # double item value\n"
+        "        x * 2\n"
+        "        for x in items\n"
+        "        if x > 0\n"
+        "    ]\n"
+        "\n"
+        "def process_items(elements: list) -> list:\n"
+        "    return [\n"
+        "        # double item value\n"
+        "        e * 2\n"
+        "        for e in elements\n"
+        "        if e > 0\n"
+        "    ]\n"
+    )
+    f = tmp_path / "comp.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {
+        "name": "parse_items:listcomp",
+        "file": "comp.py",
+        "start": 2,
+        "end": 7,
+        "start_col": 11,
+        "end_col": 5,
+        "kind": "comprehension",
+    }
+    u2 = {
+        "name": "process_items:listcomp",
+        "file": "comp.py",
+        "start": 10,
+        "end": 15,
+        "start_col": 11,
+        "end_col": 5,
+        "kind": "comprehension",
+    }
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "return (" in patch
+
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    run_proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from comp import parse_items, process_items; "
+            "print(parse_items([1, -1, 3]), process_items([2, -5, 4]))",
+        ],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run_proc.returncode == 0
+    assert run_proc.stdout.strip() == "[2, 6] [4, 8]"
 
 
+def test_subroutine_nonterminal_embedded_return_hazard_rejected(tmp_path: Path) -> None:
+    """Verifies that subroutine compound blocks with non-terminal returns are rejected as hazards."""
+    src = (
+        "def func_a(x: int) -> int:\n"
+        "    if x < 0:\n"
+        "        return 0\n"
+        "    y = x * 2\n"
+        "    return y\n"
+        "\n"
+        "def func_b(x: int) -> int:\n"
+        "    if x < 0:\n"
+        "        return 0\n"
+        "    y = x * 2\n"
+        "    return y\n"
+    )
+    f = tmp_path / "hazard.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {"name": "func_a:blk", "file": "hazard.py", "start": 2, "end": 4, "kind": "compound_block"}
+    u2 = {"name": "func_b:blk", "file": "hazard.py", "start": 8, "end": 10, "kind": "compound_block"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert patch == ""
 
 
+def test_init_method_delegation_suppresses_return(tmp_path: Path) -> None:
+    """Verifies that __init__ method refactoring never emits return in delegation calls."""
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    src = (
+        "class ModelA:\n"
+        "    def __init__(self, val: int) -> None:\n"
+        "        self.val = val * 10\n"
+        "        self.active = True\n"
+        "\n"
+        "class ModelB:\n"
+        "    def __init__(self, val: int) -> None:\n"
+        "        self.val = val * 10\n"
+        "        self.active = True\n"
+    )
+    f = tmp_path / "models.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {"name": "__init__", "file": "models.py", "start": 2, "end": 4, "kind": "function", "enclosing_class": "ModelA"}
+    u2 = {"name": "__init__", "file": "models.py", "start": 7, "end": 9, "kind": "function", "enclosing_class": "ModelB"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    lines = [
+        line for line in patch.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+    init_delegations = [line for line in lines if "_shared_init" in line]
+    assert len(init_delegations) >= 2
+    for line in init_delegations:
+        assert "return " not in line
+
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    run_proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from models import ModelA, ModelB; "
+            "a = ModelA(5); b = ModelB(7); "
+            "print(a.val, a.active, b.val, b.active)",
+        ],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run_proc.returncode == 0
+    assert run_proc.stdout.strip() == "50 True 70 True"
 
 
+def test_multi_class_method_helper_line_adjustment(tmp_path: Path) -> None:
+    """Verifies that line shifts from earlier method refactorings do not corrupt helper insertion in later classes."""
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    src = (
+        "class ServiceFirst:\n"
+        "    def action_one(self, x: int) -> int:\n"
+        "        a = x * 2\n"
+        "        b = a + 3\n"
+        "        return b\n"
+        "\n"
+        "    def action_two(self, x: int) -> int:\n"
+        "        a = x * 2\n"
+        "        b = a + 3\n"
+        "        return b\n"
+        "\n"
+        "class ServiceSecond:\n"
+        "    def execute_one(self, y: int) -> int:\n"
+        "        m = y * 5\n"
+        "        n = m + 7\n"
+        "        return n\n"
+        "\n"
+        "    def execute_two(self, y: int) -> int:\n"
+        "        m = y * 5\n"
+        "        n = m + 7\n"
+        "        return n\n"
+    )
+    f = tmp_path / "services.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {"name": "action_one", "file": "services.py", "start": 2, "end": 5, "kind": "function", "enclosing_class": "ServiceFirst"}
+    u2 = {"name": "action_two", "file": "services.py", "start": 7, "end": 10, "kind": "function", "enclosing_class": "ServiceFirst"}
+    u3 = {"name": "execute_one", "file": "services.py", "start": 13, "end": 16, "kind": "function", "enclosing_class": "ServiceSecond"}
+    u4 = {"name": "execute_two", "file": "services.py", "start": 18, "end": 21, "kind": "function", "enclosing_class": "ServiceSecond"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2), (1.0, u3, u4)],
+        repo_root=str(tmp_path),
+        method_binding="method",
+        replace_clones=True,
+    )
+
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    run_proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from services import ServiceFirst, ServiceSecond; "
+            "s1 = ServiceFirst(); s2 = ServiceSecond(); "
+            "print(s1.action_one(4), s2.execute_one(3))",
+        ],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run_proc.returncode == 0
+    assert run_proc.stdout.strip() == "11 22"
 
 
+def test_type2_arity_mismatch_skips_delegation(tmp_path: Path) -> None:
+    """Verifies that clone pairs with differing input or output variable arities skip replacement."""
+    src = (
+        "def compute_first(a: int, b: int) -> int:\n"
+        "    res = a * b + 1\n"
+        "    return res\n"
+        "\n"
+        "def compute_second(a: int) -> int:\n"
+        "    res = a * 10 + 1\n"
+        "    return res\n"
+    )
+    f = tmp_path / "arity.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {"name": "compute_first", "file": "arity.py", "start": 1, "end": 3, "kind": "function"}
+    u2 = {"name": "compute_second", "file": "arity.py", "start": 5, "end": 7, "kind": "function"}
+
+    real_scope = analyze_unit_variable_scope
+
+    def fake_scope(unit: Dict[str, Any], *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        res = real_scope(unit, *args, **kwargs)
+        if unit.get("name") == "compute_second":
+            res["inputs"] = ["a"]
+        return res
+
+    with mock.patch("pydoppelgangerhunt.fixer.analyze_unit_variable_scope", side_effect=fake_scope):
+        patch = generate_refactoring_patch(
+            [(0.90, u1, u2)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+        )
+        assert patch == ""
 
 
+def test_cross_module_helper_name_collision_deduplication(tmp_path: Path) -> None:
+    """Verifies that if File 2 already defines the candidate helper name, an indexed suffix is generated."""
+    pkg = tmp_path / "coll_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
 
+    src1 = (
+        "def handle_data(x: int) -> int:\n"
+        "    res = x * 2 + 5\n"
+        "    return res\n"
+    )
+    src2 = (
+        "_shared_handle_data_process_data = 'existing_symbol'\n"
+        "\n"
+        "def process_data(x: int) -> int:\n"
+        "    res = x * 2 + 5\n"
+        "    return res\n"
+    )
+    (pkg / "f1.py").write_text(src1, encoding="utf-8")
+    (pkg / "f2.py").write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "handle_data", "file": "coll_pkg/f1.py", "start": 1, "end": 3, "kind": "function"}
+    u2 = {"name": "process_data", "file": "coll_pkg/f2.py", "start": 3, "end": 5, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "_shared_handle_data_process_data_2" in patch
+    assert "from coll_pkg.f1 import _shared_handle_data_process_data_2" in patch
 
 
 

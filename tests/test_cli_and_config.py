@@ -1307,5 +1307,27 @@ def test_load_toml_section_multiline_nested_arrays_fallback(tmp_path: Path) -> N
         ]
 
 
+def test_toml_line_parser_escaped_quote_inline_comment(tmp_path: Path) -> None:
+    """Verifies that escaped quotes in strings don't cause trailing text to be misidentified as inline comments."""
+    import builtins  # pylint: disable=import-outside-toplevel
+    from unittest import mock  # pylint: disable=import-outside-toplevel
 
+    cfg = tmp_path / "pyproject.toml"
+    cfg.write_text(
+        '[tool.pydoppelgangerhunt]\n'
+        'pattern = "hello \\" # not a comment"\n'
+        'threshold = 0.85 # this is a comment\n',
+        encoding="utf-8",
+    )
 
+    real_import = builtins.__import__
+
+    def fake_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name in ("tomllib", "tomli"):
+            raise ImportError("Simulated missing toml library")
+        return real_import(name, *args, **kwargs)
+
+    with mock.patch("builtins.__import__", side_effect=fake_import):
+        data = load_toml_section(cfg, "pydoppelgangerhunt")
+        assert data["pattern"] == 'hello \\" # not a comment'
+        assert data["threshold"] == 0.85
