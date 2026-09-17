@@ -14,7 +14,12 @@ from pydoppelgangerhunt.baseline import (
     record_baseline,
 )
 from pydoppelgangerhunt.clustering import cluster_clone_families
-from pydoppelgangerhunt.config import DEFAULT_EXCLUDES, init_tool_configuration, load_tool_config
+from pydoppelgangerhunt.config import (
+    DEFAULT_EXCLUDES,
+    init_tool_configuration,
+    load_tool_config,
+    normalize_path_string,
+)
 from pydoppelgangerhunt.coverage import check_asymmetric_coverage, read_coverage_data
 from pydoppelgangerhunt.fixer import generate_refactoring_patch
 from pydoppelgangerhunt.git_diff import (
@@ -169,9 +174,9 @@ def _audit_clone_risk_warnings(
     u1: Dict[str, Any],
     u2: Dict[str, Any],
     *,
-    audit_blame: bool,
-    cov_data: Dict[str, Set[int]],
-    use_color: bool,
+    audit_blame: bool = False,
+    cov_data: Optional[Dict[str, Set[int]]] = None,
+    use_color: bool = False,
     indent: str = "    ",
 ) -> List[str]:
     """Audits temporal divergence and asymmetric test coverage risks for a clone pair."""
@@ -186,8 +191,8 @@ def _audit_clone_risk_warnings(
         asym = check_asymmetric_coverage(u1, u2, cov_data)
         if asym:
             c1, c2 = asym
-            f1 = str(u1.get("file") or "")
-            f2 = str(u2.get("file") or "")
+            f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+            f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
             msg = f"{indent}[WARN] Asymmetric test coverage: {f1} ({c1:.0%}) vs {f2} ({c2:.0%})"
             print(colorize(msg, COLOR_YELLOW, use_color))
             lines.append(msg)
@@ -494,7 +499,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 else None
             )
             for m in fam.get("members", []):
-                m_file = str(m.get("file") or "").replace("\\", "/")
+                m_file = normalize_path_string(str(m.get("file") or ""), strip_anchor=False)
                 m_start = int(m.get("start") or 1)
                 m_end = int(m.get("end") or m_start)
                 m_name = str(m.get("name") or "member")
@@ -535,8 +540,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 p_val = compute_priority_score(sim, u1, u2)
                 p_badge = colorize(f"[Priority {p_val:.1f}]", COLOR_BOLD + COLOR_MAGENTA, use_color)
                 prefix = f"  * {sim_badge} {p_badge}"
-            f1 = str(u1.get("file") or "")
-            f2 = str(u2.get("file") or "")
+            f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+            f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
             s1 = int(u1.get("start") or 1)
             e1 = int(u1.get("end") or s1)
             s2 = int(u2.get("start") or 1)

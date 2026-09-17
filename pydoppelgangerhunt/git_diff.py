@@ -6,7 +6,7 @@ import os
 import subprocess
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-from pydoppelgangerhunt.config import find_matching_path_value
+from pydoppelgangerhunt.config import find_matching_path_value, normalize_path_string
 
 MAJOR_POLICY_THRESHOLD: float = 0.50
 NEW_POLICY_THRESHOLD: float = 0.80
@@ -36,7 +36,7 @@ def parse_git_diff_hunks(diff_text: str) -> Dict[str, List[Tuple[int, int]]]:
 
     for line in diff_text.splitlines():
         if line.startswith("+++ b/"):
-            current_file = line[6:].strip().replace("\\", "/")
+            current_file = normalize_path_string(line[6:].strip(), strip_anchor=False)
         elif line.startswith("@@ ") and current_file:
             parts = line.split(" ")
             plus_parts = [p for p in parts if p.startswith("+")]
@@ -178,7 +178,7 @@ def get_git_blame_info(
     repo_root: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Extracts git commit and author metadata for a line range using git blame --porcelain."""
-    norm_file = str(file_path or "").split("#", maxsplit=1)[0]
+    norm_file = normalize_path_string(file_path, strip_anchor=True)
     if not norm_file:
         return {"author": "Unknown", "commit": "unknown", "timestamp": 0, "summary": ""}
     start_l = max(1, start_line)
@@ -233,8 +233,8 @@ def check_temporal_divergence(
     max_divergence_days: int = 90,
 ) -> Optional[Dict[str, Any]]:
     """Detects whether two clone instances exhibit temporal divergence (asymmetric commit ages)."""
-    f1 = str(u1.get("file") or "")
-    f2 = str(u2.get("file") or "")
+    f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+    f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
     if not f1 or not f2:
         return None
     s1 = int(u1.get("start") or 1)

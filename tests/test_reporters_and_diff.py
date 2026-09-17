@@ -6262,3 +6262,91 @@ def test_batch_40_notebook_source_code_and_matcher_path_robustness(tmp_path: Any
     assert base_data["fingerprints"][0]["file_b"] == "core/engine.py"
 
 
+def test_batch_41_unified_path_normalization_and_html_escaping(tmp_path: Path) -> None:
+    """Verifies Batch 41 unified path normalization across reporters, diff, coverage, and HTML escaping."""
+    from pydoppelgangerhunt.cli import _audit_clone_risk_warnings  # pylint: disable=protected-access
+    from pydoppelgangerhunt.config import normalize_path_string
+    from pydoppelgangerhunt.coverage import _read_xml_coverage  # pylint: disable=protected-access
+    from pydoppelgangerhunt.fixer import generate_refactoring_patch
+    from pydoppelgangerhunt.git_diff import check_temporal_divergence, parse_git_diff_hunks
+    from pydoppelgangerhunt.reporters import (
+        format_github_annotations,
+        format_json_report,
+        generate_html_report,
+    )
+
+    # 1. normalize_path_string handles repetitive dot-slash and backslashes
+    assert normalize_path_string("././foo/bar.py") == "foo/bar.py"
+    assert normalize_path_string(".\\.\\foo\\bar.py") == "foo/bar.py"
+    assert normalize_path_string("./foo/bar.py#cell_1", strip_anchor=False) == "foo/bar.py#cell_1"
+    assert normalize_path_string("./foo/bar.py#cell_1", strip_anchor=True) == "foo/bar.py"
+
+    # 2. format_json_report normalizes paths while preserving anchors
+    u1 = {"file": "./pkg/mod.py#cell_1", "start": 5, "end": 10, "name": "fn1", "token_count": 25}
+    u2 = {"file": ".\\pkg\\mod.py#cell_2", "start": 15, "end": 20, "name": "fn2", "token_count": 25}
+    mock_fam = {
+        "family_id": "CF-100",
+        "member_count": 2,
+        "unique_files": ["pkg/mod.py"],
+        "avg_similarity": 0.95,
+        "max_similarity": 0.95,
+        "min_similarity": 0.95,
+        "coherence": 1.0,
+        "total_lines": 10,
+        "medoid": {"file": "./pkg/mod.py#cell_1", "name": "fn1", "start": 5, "end": 10},
+        "members": [u1, u2],
+    }
+    json_out = format_json_report([(0.95, u1, u2)], "repo", 0.9, families=[mock_fam])
+    assert json_out["clones"][0]["unit_a"]["file"] == "pkg/mod.py#cell_1"
+    assert json_out["clones"][0]["unit_b"]["file"] == "pkg/mod.py#cell_2"
+    assert json_out["families"][0]["medoid"]["file"] == "pkg/mod.py#cell_1"
+    assert json_out["families"][0]["members"][1]["file"] == "pkg/mod.py#cell_2"
+
+    # 3. format_github_annotations strips anchors and leading dot-slash
+    annots = format_github_annotations([(0.95, u1, u2)])
+    assert len(annots) == 2
+    assert "file=pkg/mod.py," in annots[0]
+    assert "#cell_" not in annots[0]
+
+    # 4. generate_html_report escapes target and renders normalized paths
+    dangerous_target = "<script>alert('pwned')</script>&foo"
+    html_report = generate_html_report([(0.95, u1, u2)], dangerous_target, 0.9, families=[mock_fam])
+    assert "<script>alert('pwned')</script>" not in html_report
+    assert "&lt;script&gt;alert(&#x27;pwned&#x27;)&lt;/script&gt;&amp;foo" in html_report
+    assert "pkg/mod.py#cell_1" in html_report
+    assert "pkg/mod.py#cell_2" in html_report
+
+    # 5. _audit_clone_risk_warnings path normalization
+    cov_data = {"pkg/mod.py#cell_1": {5, 6, 7, 8, 9, 10}, "pkg/mod.py#cell_2": set()}
+    warn_lines = _audit_clone_risk_warnings(u1, u2, cov_data=cov_data, use_color=False)
+    assert any("Asymmetric test coverage: pkg/mod.py#cell_1 (100%) vs pkg/mod.py#cell_2 (0%)" in w for w in warn_lines)
+
+    # 6. parse_git_diff_hunks path normalization
+    diff_raw = "--- a/pkg/mod.py\n+++ b/./pkg/mod.py\n@@ -1,5 +1,5 @@\n+line\n"
+    hunks = parse_git_diff_hunks(diff_raw)
+    assert "pkg/mod.py" in hunks
+
+    # 7. check_temporal_divergence path normalization
+    assert check_temporal_divergence(u1, u2, repo_root=str(tmp_path)) is None
+
+    # 8. generate_refactoring_patch patch header comment path normalization
+    src_file = tmp_path / "calc.py"
+    src_file.write_text("def a():\n    return 42\ndef b():\n    return 42\n", encoding="utf-8")
+    u_c1 = {"file": f"./{src_file.name}", "start": 1, "end": 2, "name": "a"}
+    u_c2 = {"file": str(src_file), "start": 3, "end": 4, "name": "b"}
+    patch = generate_refactoring_patch([(1.0, u_c1, u_c2)], repo_root=str(tmp_path))
+    assert f"# Clone Pair (100.0%): {src_file.name} <===>" in patch
+
+    # 9. _read_xml_coverage path normalization
+    xml_file = tmp_path / "coverage.xml"
+    xml_file.write_text(
+        '<coverage><packages><package><classes>'
+        f'<class filename="./sub/module.py"><lines><line number="10" hits="1"/></lines></class>'
+        '</classes></package></packages></coverage>',
+        encoding="utf-8",
+    )
+    cov_xml = _read_xml_coverage(str(xml_file))
+    assert "sub/module.py" in cov_xml
+
+
+

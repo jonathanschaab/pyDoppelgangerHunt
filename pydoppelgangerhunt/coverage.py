@@ -7,7 +7,7 @@ import sqlite3
 from typing import Any, Dict, Optional, Set, Tuple
 import xml.etree.ElementTree as ET
 
-from pydoppelgangerhunt.config import find_matching_path_value
+from pydoppelgangerhunt.config import find_matching_path_value, normalize_path_string
 
 
 def _read_sqlite_coverage(coverage_path: str) -> Dict[str, Set[int]]:
@@ -21,7 +21,10 @@ def _read_sqlite_coverage(coverage_path: str) -> Dict[str, Set[int]]:
         cursor = conn.cursor()
 
         cursor.execute("SELECT id, path FROM file")
-        file_map = {row[0]: row[1].replace("\\", "/") for row in cursor.fetchall()}
+        file_map = {
+            row[0]: normalize_path_string(row[1], strip_anchor=False)
+            for row in cursor.fetchall()
+        }
 
         try:
             cursor.execute("SELECT file_id, num_bits, bits FROM line_bits")
@@ -71,7 +74,7 @@ def _read_xml_coverage(xml_path: str) -> Dict[str, Set[int]]:
             filename = class_node.get("filename")
             if not filename:
                 continue
-            norm_file = filename.replace("\\", "/")
+            norm_file = normalize_path_string(filename, strip_anchor=False)
             covered_lines = coverage_map.setdefault(norm_file, set())
             for line_node in class_node.findall("./lines/line"):
                 hits = line_node.get("hits", "0")

@@ -2047,11 +2047,10 @@ def _populate_unit_receiver_metadata(
         and "enclosing_class_start" in unit
     ):
         return
-    f_raw = str(unit.get("file") or "").split("#", maxsplit=1)[0]
+    f_raw = normalize_path_string(str(unit.get("file") or ""), strip_anchor=True)
     if not f_raw:
         return
-    f_norm = f_raw.replace("\\", "/")
-    p = Path(f_norm)
+    p = Path(f_raw)
     f_path = p if p.is_absolute() else Path(repo_root or os.getcwd()) / p
     if not f_path.is_file():
         return
@@ -2780,7 +2779,7 @@ def refactor_module_units(
                 n2 = str(u2.get("name") or "unit")
                 s2 = int(u2.get("start") or 1)
                 e2 = int(u2.get("end") or s2)
-                f1 = str(u1.get("file") or "")
+                f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
                 raise ValueError(
                     f"Overlapping unit collision detected between "
                     f"'{n1}' ({s1}-{e1}) and "
@@ -2980,11 +2979,10 @@ def generate_refactoring_patch(
     patch_chunks: List[str] = []
 
     for sim, u1, u2 in clones:
-        f1_raw = str(u1.get("file") or "").split("#", maxsplit=1)[0]
+        f1_raw = normalize_path_string(str(u1.get("file") or ""), strip_anchor=True)
         if not f1_raw:
             continue
-        f1_norm = f1_raw.replace("\\", "/")
-        p = Path(f1_norm)
+        p = Path(f1_raw)
         f1_path = p if p.is_absolute() else (root / p)
         if not f1_path.is_file():
             continue
@@ -2996,8 +2994,7 @@ def generate_refactoring_patch(
 
         orig_lines = orig_text.splitlines(keepends=True)
 
-        f2_raw = str(u2.get("file") or "").split("#", maxsplit=1)[0]
-        f2_norm = f2_raw.replace("\\", "/")
+        f2_raw = normalize_path_string(str(u2.get("file") or ""), strip_anchor=True)
         is_same_file = _is_same_file_path(f1_raw, f2_raw, repo_root=str(root))
 
         enc1 = find_enclosing_class(orig_text, u1)
@@ -3009,7 +3006,7 @@ def generate_refactoring_patch(
             enc2 = find_enclosing_class(orig_text, u2)
             fn2 = find_enclosing_function(orig_text, u2)
         elif f2_raw:
-            p2 = Path(f2_norm)
+            p2 = Path(f2_raw)
             f2_path = p2 if p2.is_absolute() else (root / p2)
             if f2_path.is_file():
                 try:
@@ -3256,8 +3253,8 @@ def generate_refactoring_patch(
         )
         diff_str = "".join(diff)
         if diff_str:
-            f1_disp = str(u1.get("file") or "file1")
-            f2_disp = str(u2.get("file") or "file2")
+            f1_disp = normalize_path_string(str(u1.get("file") or "file1"), strip_anchor=False)
+            f2_disp = normalize_path_string(str(u2.get("file") or "file2"), strip_anchor=False)
             patch_chunks.append(f"# Clone Pair ({sim:.1%}): {f1_disp} <===> {f2_disp}\n" + diff_str)
 
     return "\n".join(patch_chunks)

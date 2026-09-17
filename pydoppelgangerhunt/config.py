@@ -51,9 +51,10 @@ def normalize_path_string(path_str: Optional[str], strip_anchor: bool = True) ->
     if strip_anchor and "#" in raw:
         raw = raw.split("#", maxsplit=1)[0]
     norm = raw.replace("\\", "/")
-    if norm.startswith("./"):
-        return norm[2:]
+    while norm.startswith("./"):
+        norm = norm[2:]
     return norm
+
 
 
 def paths_match_boundary(p1: Optional[str], p2: Optional[str]) -> bool:
