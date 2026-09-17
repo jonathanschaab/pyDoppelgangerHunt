@@ -43,11 +43,14 @@ idioms = true
 """
 
 
-def normalize_path_string(path_str: Optional[str]) -> str:
-    """Normalizes a file path string by stripping anchors, converting backslashes, and stripping leading './'."""
+def normalize_path_string(path_str: Optional[str], strip_anchor: bool = True) -> str:
+    """Normalizes a file path string by optionally stripping anchors, converting backslashes, and stripping leading './'."""
     if not path_str:
         return ""
-    norm = str(path_str).split("#", maxsplit=1)[0].replace("\\", "/")
+    raw = str(path_str)
+    if strip_anchor and "#" in raw:
+        raw = raw.split("#", maxsplit=1)[0]
+    norm = raw.replace("\\", "/")
     if norm.startswith("./"):
         return norm[2:]
     return norm

@@ -47,7 +47,7 @@ def _normalize_unit_file(unit: Dict[str, Any]) -> str:
 
 def unit_key(unit: Dict[str, Any]) -> str:
     """Generates unique deterministic string key for an AST unit."""
-    norm_file = _normalize_unit_file(unit)
+    norm_file = normalize_path_string(str(unit.get("file") or ""), strip_anchor=False)
     s = int(unit.get("start") or 1)
     e = int(unit.get("end") or s)
     name = str(unit.get("name") or "unit")
@@ -295,7 +295,7 @@ def cluster_clone_families(
         members = [unit_map[k] for k in member_keys]
         members.sort(
             key=lambda u: (
-                _normalize_unit_file(u),
+                normalize_path_string(str(u.get("file") or ""), strip_anchor=False),
                 int(u.get("start") or 1),
             )
         )

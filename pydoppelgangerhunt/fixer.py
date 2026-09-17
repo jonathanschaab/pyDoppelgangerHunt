@@ -1087,11 +1087,9 @@ def _detect_indent_step(indent_str: str) -> str:
         return "\t"
     if indent_str:
         num_spaces = len(indent_str)
-        if num_spaces % 4 != 0 and num_spaces % 2 == 0:
-            return "  "
-        if num_spaces % 4 == 0:
+        if num_spaces > 0 and num_spaces % 4 == 0:
             return "    "
-        if num_spaces % 2 == 0:
+        if num_spaces > 0 and num_spaces % 2 == 0:
             return "  "
     return "    "
 

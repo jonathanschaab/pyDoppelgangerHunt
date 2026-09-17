@@ -6017,10 +6017,14 @@ def test_batch_37_directory_boundary_path_matching_and_exclude_filtering(tmp_pat
     assert len(found) == 1
     assert found[0].name == "app.py"
 
-    # 4. unit_key normalizes leading dot-slash and anchors
-    u_dot_hash = {"file": "./sub/app.py#abc", "start": 1, "end": 5, "name": "f"}
+    # 4. unit_key normalizes leading dot-slash while preserving sub-document cell anchors
+    u_dot = {"file": "./sub/app.py", "start": 1, "end": 5, "name": "f"}
     u_plain = {"file": "sub/app.py", "start": 1, "end": 5, "name": "f"}
-    assert unit_key(u_dot_hash) == unit_key(u_plain)
+    assert unit_key(u_dot) == unit_key(u_plain)
+    u_cell1 = {"file": "./sub/app.py#cell_1", "start": 1, "end": 5, "name": "f"}
+    u_cell2 = {"file": "sub/app.py#cell_2", "start": 1, "end": 5, "name": "f"}
+    assert unit_key(u_cell1) != unit_key(u_cell2)
+    assert unit_key(u_cell1) == "sub/app.py#cell_1:1-5:f"
 
     # 5. compute_repository_dry_stats de-duplicates lines across dot-slash file representations
     u_mod1 = {"file": "./mod.py", "start": 1, "end": 10, "name": "f1"}
@@ -6107,3 +6111,65 @@ def test_batch_38_windows_path_case_insensitivity_and_unicode_resilience(tmp_pat
     summary = format_markdown_summary(stats_with_pipe, "test_repo")
     assert "| `pkg\\|with\\|pipes` | 500 |" in summary
     assert "| `normal_pkg` | 500 |" in summary
+
+
+def test_batch_39_notebook_cell_clustering_and_metrics_isolation(tmp_path: Any) -> None:
+    """Tests Batch 39: notebook cell clustering isolation, notebook SLOC/DLOC metrics, and indent step detection."""
+    import json
+    from pydoppelgangerhunt.clustering import cluster_clone_families
+    from pydoppelgangerhunt.fixer import _detect_indent_step
+    from pydoppelgangerhunt.metrics import compute_repository_dry_stats
+
+    # 1. Notebook clone pairs across different cells form distinct members and families
+    u_nb1 = {"file": "analysis.ipynb#cell_1", "start": 1, "end": 5, "name": "process_data"}
+    u_nb2 = {"file": "analysis.ipynb#cell_2", "start": 1, "end": 5, "name": "process_data"}
+    clones = [(0.95, u_nb1, u_nb2)]
+    families = cluster_clone_families(clones)
+    assert len(families) == 1
+    fam = families[0]
+    assert fam["member_count"] == 2
+    assert fam["unique_files"] == ["analysis.ipynb"]
+    assert fam["total_lines"] == 10
+    assert fam["members"][0]["file"] == "analysis.ipynb#cell_1"
+    assert fam["members"][1]["file"] == "analysis.ipynb#cell_2"
+
+    # 2. compute_repository_dry_stats isolates DLOC lines across distinct notebook cells
+    nb_content = {
+        "cells": [
+            {
+                "cell_type": "code",
+                "source": ["def process_data():\n", "    # comment\n", "    return 42\n"],
+            },
+            {
+                "cell_type": "code",
+                "source": "def helper():\n    return 10\n",
+            },
+            {
+                "cell_type": "markdown",
+                "source": ["# Documentation\n"],
+            },
+        ]
+    }
+    nb_file = tmp_path / "analysis.ipynb"
+    nb_file.write_text(json.dumps(nb_content), encoding="utf-8")
+
+    stats = compute_repository_dry_stats(str(tmp_path), clones, include_notebooks=True)
+    assert stats["dloc"] == 10
+    assert stats["sloc"] == 4
+    assert stats["clone_families"] == 1
+
+    # 3. Corrupted notebook JSON handling
+    corrupt_nb = tmp_path / "corrupt.ipynb"
+    corrupt_nb.write_text("{broken json", encoding="utf-8")
+    stats_corrupt = compute_repository_dry_stats(str(tmp_path), [], include_notebooks=True)
+    assert stats_corrupt["sloc"] == 4
+
+    # 4. _detect_indent_step coverage across tab, 2-space, 4-space, 6-space, and non-standard indents
+    assert _detect_indent_step("\t") == "\t"
+    assert _detect_indent_step("  ") == "  "
+    assert _detect_indent_step("    ") == "    "
+    assert _detect_indent_step("      ") == "  "
+    assert _detect_indent_step("        ") == "    "
+    assert _detect_indent_step("   ") == "    "
+    assert _detect_indent_step("") == "    "
+

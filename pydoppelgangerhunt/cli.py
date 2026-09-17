@@ -412,7 +412,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     stats: Optional[Dict[str, Any]] = None
     if args.stats or args.summary or args.html:
-        stats = compute_repository_dry_stats(args.target, clones, excludes=excludes)
+        stats = compute_repository_dry_stats(
+            args.target,
+            clones,
+            excludes=excludes,
+            include_notebooks=getattr(args, "notebooks", False),
+        )
         if args.summary:
             _write_artifact_file(args.summary, format_markdown_summary(stats, args.target), "SUMMARY", args.format == "text")
 
