@@ -72,8 +72,16 @@ def generate_clone_diff(
     """Produces unified line diff between two cloned code blocks, with optional syntax coloring."""
     lines1 = extract_unit_source_code(u1, repo_root)
     lines2 = extract_unit_source_code(u2, repo_root)
-    from_label = f"{u1['file']}:{u1['start']}-{u1['end']} ({u1['name']})"
-    to_label = f"{u2['file']}:{u2['start']}-{u2['end']} ({u2['name']})"
+    f1_norm = str(u1.get("file") or "").replace("\\", "/")
+    f2_norm = str(u2.get("file") or "").replace("\\", "/")
+    s1 = int(u1.get("start") or 1)
+    e1 = int(u1.get("end") or s1)
+    s2 = int(u2.get("start") or 1)
+    e2 = int(u2.get("end") or s2)
+    n1 = str(u1.get("name") or "unit1")
+    n2 = str(u2.get("name") or "unit2")
+    from_label = f"{f1_norm}:{s1}-{e1} ({n1})"
+    to_label = f"{f2_norm}:{s2}-{e2} ({n2})"
     diff = list(difflib.unified_diff(
         lines1, lines2, fromfile=from_label, tofile=to_label, lineterm=""
     ))
@@ -148,14 +156,20 @@ def format_sarif_report(
     """Formats detected clones into OASIS SARIF 2.1.0 standard schema for GitHub Code Scanning."""
     results: List[Dict[str, Any]] = []
     for idx, (sim, u1, u2) in enumerate(clones):
+        f1_norm = str(u1.get("file") or "").replace("\\", "/")
+        f2_norm = str(u2.get("file") or "").replace("\\", "/")
+        s1 = int(u1.get("start") or 1)
+        e1 = int(u1.get("end") or s1)
+        s2 = int(u2.get("start") or 1)
+        e2 = int(u2.get("end") or s2)
+        n1 = str(u1.get("name") or "unit1")
+        n2 = str(u2.get("name") or "unit2")
         rule_id = "PYDOPPEL001"
         message = (
-            f"Code duplication: AST block '{u1['name']}' in {u1['file']}:{u1['start']}-{u1['end']} "
-            f"is {sim:.1%} structurally identical to '{u2['name']}' in {u2['file']}:{u2['start']}-{u2['end']} "
+            f"Code duplication: AST block '{n1}' in {f1_norm}:{s1}-{e1} "
+            f"is {sim:.1%} structurally identical to '{n2}' in {f2_norm}:{s2}-{e2} "
             f"(threshold >= {threshold:.0%})."
         )
-        f1_norm = u1["file"].replace("\\", "/")
-        f2_norm = u2["file"].replace("\\", "/")
         result_item: Dict[str, Any] = {
             "ruleId": rule_id,
             "ruleIndex": 0,
@@ -169,8 +183,8 @@ def format_sarif_report(
                             "uriBaseId": "%SRCROOT%",
                         },
                         "region": {
-                            "startLine": u1["start"],
-                            "endLine": u1["end"],
+                            "startLine": s1,
+                            "endLine": e1,
                         },
                     }
                 }
@@ -178,15 +192,15 @@ def format_sarif_report(
             "relatedLocations": [
                 {
                     "id": idx + 1,
-                    "message": {"text": f"Clone twin: '{u2['name']}' in {f2_norm}:{u2['start']}-{u2['end']}"},
+                    "message": {"text": f"Clone twin: '{n2}' in {f2_norm}:{s2}-{e2}"},
                     "physicalLocation": {
                         "artifactLocation": {
                             "uri": f2_norm,
                             "uriBaseId": "%SRCROOT%",
                         },
                         "region": {
-                            "startLine": u2["start"],
-                            "endLine": u2["end"],
+                            "startLine": s2,
+                            "endLine": e2,
                         },
                     },
                 }
@@ -253,18 +267,18 @@ def format_json_report(
             {
                 "similarity": round(sim, 4),
                 "unit_a": {
-                    "name": u1["name"],
-                    "file": u1["file"].replace("\\", "/"),
-                    "start": u1["start"],
-                    "end": u1["end"],
+                    "name": str(u1.get("name") or "unit1"),
+                    "file": str(u1.get("file") or "").replace("\\", "/"),
+                    "start": int(u1.get("start") or 1),
+                    "end": int(u1.get("end") or int(u1.get("start") or 1)),
                     "kind": u1.get("kind"),
                     "tokens": u1.get("token_count", 0),
                 },
                 "unit_b": {
-                    "name": u2["name"],
-                    "file": u2["file"].replace("\\", "/"),
-                    "start": u2["start"],
-                    "end": u2["end"],
+                    "name": str(u2.get("name") or "unit2"),
+                    "file": str(u2.get("file") or "").replace("\\", "/"),
+                    "start": int(u2.get("start") or 1),
+                    "end": int(u2.get("end") or int(u2.get("start") or 1)),
                     "kind": u2.get("kind"),
                     "tokens": u2.get("token_count", 0),
                 },
@@ -285,10 +299,10 @@ def format_json_report(
                 "total_lines": f["total_lines"],
                 "medoid": (
                     {
-                        "name": f["medoid"]["name"],
-                        "file": f["medoid"]["file"].replace("\\", "/"),
-                        "start": f["medoid"]["start"],
-                        "end": f["medoid"]["end"],
+                        "name": str(f["medoid"].get("name") or "medoid"),
+                        "file": str(f["medoid"].get("file") or "").replace("\\", "/"),
+                        "start": int(f["medoid"].get("start") or 1),
+                        "end": int(f["medoid"].get("end") or int(f["medoid"].get("start") or 1)),
                         "kind": f["medoid"].get("kind"),
                     }
                     if "medoid" in f and f["medoid"]
@@ -296,10 +310,10 @@ def format_json_report(
                 ),
                 "members": [
                     {
-                        "name": m["name"],
-                        "file": m["file"].replace("\\", "/"),
-                        "start": m["start"],
-                        "end": m["end"],
+                        "name": str(m.get("name") or "member"),
+                        "file": str(m.get("file") or "").replace("\\", "/"),
+                        "start": int(m.get("start") or 1),
+                        "end": int(m.get("end") or int(m.get("start") or 1)),
                         "kind": m.get("kind"),
                     }
                     for m in f["members"]
@@ -409,19 +423,28 @@ def generate_html_report(
             else ""
         )
 
+        f1_norm = str(u1.get("file") or "").replace("\\", "/")
+        f2_norm = str(u2.get("file") or "").replace("\\", "/")
+        s1 = int(u1.get("start") or 1)
+        e1 = int(u1.get("end") or s1)
+        s2 = int(u2.get("start") or 1)
+        e2 = int(u2.get("end") or s2)
+        n1 = str(u1.get("name") or "unit1")
+        n2 = str(u2.get("name") or "unit2")
+
         card = f"""
-        <div class="clone-card" data-search="{u1['file']} {u1['name']} {u2['file']} {u2['name']}">
+        <div class="clone-card" data-search="{f1_norm} {n1} {f2_norm} {n2}">
             <div class="card-header">
                 <span class="sim-badge" style="background: {'#ef4444' if sim >= 0.85 else '#f59e0b'};">
                     {sim:.1%} Match
                 </span>
-                <span class="card-title">#{idx}: {u1['name']} &harr; {u2['name']}</span>
+                <span class="card-title">#{idx}: {n1} &harr; {n2}</span>
             </div>
             <div class="card-body">
                 <div class="loc-row">
-                    <span class="file-tag">&#128196; {u1['file']}:{u1['start']}-{u1['end']}</span>
+                    <span class="file-tag">&#128196; {f1_norm}:{s1}-{e1}</span>
                     <span class="arrow">&harr;</span>
-                    <span class="file-tag">&#128196; {u2['file']}:{u2['start']}-{u2['end']}</span>
+                    <span class="file-tag">&#128196; {f2_norm}:{s2}-{e2}</span>
                 </div>
                 {sug_block}
                 <details>

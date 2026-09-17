@@ -31,9 +31,11 @@ def compute_repository_dry_stats(
     duplicated_lines_by_file: Dict[str, Set[int]] = {}
     for _sim, u1, u2 in clones:
         for u in (u1, u2):
-            f_norm = u["file"].replace("\\", "/")
+            f_norm = str(u.get("file") or "").replace("\\", "/")
+            s = int(u.get("start") or 1)
+            e = int(u.get("end") or s)
             duplicated_lines_by_file.setdefault(f_norm, set()).update(
-                range(u["start"], u["end"] + 1)
+                range(s, e + 1)
             )
 
     total_dloc = sum(len(line_set) for line_set in duplicated_lines_by_file.values())

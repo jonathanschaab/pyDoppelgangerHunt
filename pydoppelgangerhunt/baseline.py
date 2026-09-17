@@ -36,7 +36,7 @@ def _format_paired_endpoints(ep1: str, ep2: str) -> str:
 
 def extract_unit_namespace(file_path: str) -> str:
     """Extracts canonical module/package directory namespace from a file path."""
-    norm_path = file_path.replace("\\", "/").strip()
+    norm_path = str(file_path or "").replace("\\", "/").strip()
     if norm_path.startswith("./"):
         norm_path = norm_path[2:]
     if "/" not in norm_path:
@@ -160,8 +160,8 @@ def load_baseline(baseline_path: str) -> Set[str]:
             if "namespaced_structural_fingerprint" in item and item["namespaced_structural_fingerprint"]:
                 fps.add(item["namespaced_structural_fingerprint"])
             elif "hash_a" in item and "hash_b" in item and item["hash_a"] and item["hash_b"]:
-                ns_a = item.get("namespace_a") or extract_unit_namespace(rec.get("file_a", ""))
-                ns_b = item.get("namespace_b") or extract_unit_namespace(rec.get("file_b", ""))
+                ns_a = item.get("namespace_a") or extract_unit_namespace(str(rec.get("file_a") or ""))
+                ns_b = item.get("namespace_b") or extract_unit_namespace(str(rec.get("file_b") or ""))
                 rec["namespace_a"] = ns_a
                 rec["namespace_b"] = ns_b
                 ns_sfp = _format_paired_endpoints(f"{ns_a}#{item['hash_a']}", f"{ns_b}#{item['hash_b']}")
@@ -213,8 +213,8 @@ def _match_clone_record(
     for rec in unconsumed:
         if rec.get("pure_structural_fingerprint") == c_pure_sfp:
             rec_ns = sorted([
-                rec.get("namespace_a") or extract_unit_namespace(rec.get("file_a", "")),
-                rec.get("namespace_b") or extract_unit_namespace(rec.get("file_b", "")),
+                rec.get("namespace_a") or extract_unit_namespace(str(rec.get("file_a") or "")),
+                rec.get("namespace_b") or extract_unit_namespace(str(rec.get("file_b") or "")),
             ])
             if rec_ns == c_namespaces:
                 return rec
@@ -385,8 +385,8 @@ def prune_baseline(
         h_b = str(item.get("hash_b", ""))
 
         if not item_ns_sfp and h_a and h_b:
-            ns_a = item.get("namespace_a") or extract_unit_namespace(item.get("file_a", ""))
-            ns_b = item.get("namespace_b") or extract_unit_namespace(item.get("file_b", ""))
+            ns_a = item.get("namespace_a") or extract_unit_namespace(str(item.get("file_a") or ""))
+            ns_b = item.get("namespace_b") or extract_unit_namespace(str(item.get("file_b") or ""))
             item_ns_sfp = _format_paired_endpoints(f"{ns_a}#{h_a}", f"{ns_b}#{h_b}")
             item["namespaced_structural_fingerprint"] = item_ns_sfp
             item["namespace_a"] = ns_a
@@ -406,8 +406,8 @@ def prune_baseline(
 
         if not is_active and item_pure_sfp and item_pure_sfp in active_pure_sfps:
             item_ns = sorted([
-                item.get("namespace_a") or extract_unit_namespace(item.get("file_a", "")),
-                item.get("namespace_b") or extract_unit_namespace(item.get("file_b", "")),
+                item.get("namespace_a") or extract_unit_namespace(str(item.get("file_a") or "")),
+                item.get("namespace_b") or extract_unit_namespace(str(item.get("file_b") or "")),
             ])
             item_names = sorted([item.get("name_a", ""), item.get("name_b", "")])
             for u1, u2 in pure_sfp_to_clones.get(item_pure_sfp, []):
@@ -441,8 +441,8 @@ def prune_baseline(
                 item["namespaced_structural_fingerprint"] = namespaced_structural_fingerprint(u1, u2)
             retained.append(item)
         else:
-            f_a = item.get("file_a", "").replace("\\", "/")
-            f_b = item.get("file_b", "").replace("\\", "/")
+            f_a = str(item.get("file_a") or "").replace("\\", "/")
+            f_b = str(item.get("file_b") or "").replace("\\", "/")
             # Path matching checks exact equality or bidirectional suffix containment
             # (f_a.endswith(k) or k.endswith(f_a)) to reliably reconcile absolute paths,
             # repository-relative paths, and normalized forward-slash variants.

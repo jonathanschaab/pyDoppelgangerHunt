@@ -186,7 +186,9 @@ def _audit_clone_risk_warnings(
         asym = check_asymmetric_coverage(u1, u2, cov_data)
         if asym:
             c1, c2 = asym
-            msg = f"{indent}[WARN] Asymmetric test coverage: {u1['file']} ({c1:.0%}) vs {u2['file']} ({c2:.0%})"
+            f1 = str(u1.get("file") or "")
+            f2 = str(u2.get("file") or "")
+            msg = f"{indent}[WARN] Asymmetric test coverage: {f1} ({c1:.0%}) vs {f2} ({c2:.0%})"
             print(colorize(msg, COLOR_YELLOW, use_color))
             lines.append(msg)
     return lines
@@ -520,7 +522,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 p_val = compute_priority_score(sim, u1, u2)
                 p_badge = colorize(f"[Priority {p_val:.1f}]", COLOR_BOLD + COLOR_MAGENTA, use_color)
                 prefix = f"  * {sim_badge} {p_badge}"
-            line = f"{prefix} {u1['file']}:{u1['start']}-{u1['end']} ({u1['name']}) <===> {u2['file']}:{u2['start']}-{u2['end']} ({u2['name']})"
+            f1 = str(u1.get("file") or "")
+            f2 = str(u2.get("file") or "")
+            s1 = int(u1.get("start") or 1)
+            e1 = int(u1.get("end") or s1)
+            s2 = int(u2.get("start") or 1)
+            e2 = int(u2.get("end") or s2)
+            n1 = str(u1.get("name") or "unit1")
+            n2 = str(u2.get("name") or "unit2")
+            line = f"{prefix} {f1}:{s1}-{e1} ({n1}) <===> {f2}:{s2}-{e2} ({n2})"
             print(line)
             report_lines.append(line)
             report_lines.extend(
@@ -533,7 +543,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     indent="    ",
                 )
             )
-            if audit_tests_enabled and u1["name"].startswith("test_") and u2["name"].startswith("test_"):
+            if audit_tests_enabled and n1.startswith("test_") and n2.startswith("test_"):
                 tip = colorize("    [TIP] Consider refactoring with @pytest.mark.parametrize", COLOR_YELLOW, use_color)
                 print(tip)
                 report_lines.append("    [TIP] Consider refactoring with @pytest.mark.parametrize")

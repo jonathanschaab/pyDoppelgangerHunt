@@ -5469,3 +5469,79 @@ def test_defensive_unit_start_end_none_handling(tmp_path: Path) -> None:
     out = refactor_module_units("x = 1\n", [])
     assert out == "x = 1\n"
 
+
+def test_defensive_reporting_and_metrics_with_none_fields(tmp_path: Path) -> None:
+    """Verifies that reporters, clustering, and metrics do not crash with NoneType/KeyError on synthetic units."""
+    from pydoppelgangerhunt.baseline import extract_unit_namespace
+    from pydoppelgangerhunt.clustering import cluster_clone_families
+    from pydoppelgangerhunt.metrics import compute_repository_dry_stats
+    from pydoppelgangerhunt.reporters import (
+        format_json_report,
+        format_sarif_report,
+        generate_clone_diff,
+        generate_html_report,
+    )
+
+    # 1. extract_unit_namespace handles None or empty string gracefully
+    assert extract_unit_namespace(None) == "."  # type: ignore[arg-type]
+    assert extract_unit_namespace("") == "."
+
+    u1: Dict[str, Any] = {
+        "file": None,
+        "name": None,
+        "start": None,
+        "end": None,
+    }
+    u2: Dict[str, Any] = {
+        "file": None,
+        "name": None,
+        "start": None,
+        "end": None,
+    }
+
+    # 2. generate_clone_diff
+    diff = generate_clone_diff(u1, u2)
+    assert isinstance(diff, str)
+
+    # 3. format_sarif_report
+    sarif = format_sarif_report([(0.9, u1, u2)], "target", 0.8)
+    assert len(sarif["runs"][0]["results"]) == 1
+
+    # 4. format_json_report with mock families
+    mock_family = {
+        "family_id": "CF-001",
+        "member_count": 2,
+        "unique_files": ["."],
+        "avg_similarity": 0.9,
+        "max_similarity": 0.9,
+        "min_similarity": 0.9,
+        "coherence": 1.0,
+        "total_lines": 1,
+        "medoid": {"name": None, "file": None, "start": None, "end": None},
+        "members": [u1, u2],
+    }
+    json_rep = format_json_report([(0.9, u1, u2)], "target", 0.8, families=[mock_family])
+    assert json_rep["clone_count"] == 1
+    assert json_rep["clones"][0]["unit_a"]["name"] == "unit1"
+    assert json_rep["families"][0]["medoid"]["name"] == "medoid"
+    assert json_rep["families"][0]["members"][0]["name"] == "member"
+
+    # 5. generate_html_report
+    html = generate_html_report([(0.9, u1, u2)], "target", 0.8, families=[mock_family])
+    assert "unit1" in html
+    assert "unit2" in html
+
+    # 6. compute_repository_dry_stats
+    f = tmp_path / "sample.py"
+    f.write_text("x = 1\ny = 2\n", encoding="utf-8")
+    stats = compute_repository_dry_stats(str(tmp_path), [(0.9, u1, u2)])
+    assert stats["sloc"] == 2
+    assert stats["clone_pairs"] == 1
+
+    # 7. cluster_clone_families
+    u_a: Dict[str, Any] = {"file": None, "name": "a", "start": None, "end": None}
+    u_b: Dict[str, Any] = {"file": None, "name": "b", "start": None, "end": None}
+    families = cluster_clone_families([(0.95, u_a, u_b)], min_similarity_floor=0.8)
+    assert len(families) == 1
+
+

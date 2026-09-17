@@ -287,14 +287,22 @@ def cluster_clone_families(
     families: List[Dict[str, Any]] = []
     for idx, member_keys in enumerate(clusters):
         members = [unit_map[k] for k in member_keys]
-        members.sort(key=lambda u: (u["file"].replace("\\", "/"), u["start"]))
+        members.sort(
+            key=lambda u: (
+                str(u.get("file") or "").replace("\\", "/"),
+                int(u.get("start") or 1),
+            )
+        )
         member_set = set(member_keys)
 
         family_sims = [
             sim for sim, k1, k2 in sorted_pairs if k1 in member_set and k2 in member_set
         ]
-        unique_files = sorted(list({u["file"].replace("\\", "/") for u in members}))
-        total_lines = sum(u["end"] - u["start"] + 1 for u in members)
+        unique_files = sorted(list({str(u.get("file") or "").replace("\\", "/") for u in members}))
+        total_lines = sum(
+            int(u.get("end") or int(u.get("start") or 1)) - int(u.get("start") or 1) + 1
+            for u in members
+        )
         avg_sim = (sum(family_sims) / len(family_sims)) if family_sims else 1.0
         max_sim = max(family_sims) if family_sims else 1.0
         min_sim = min(family_sims) if family_sims else 1.0
@@ -321,9 +329,9 @@ def cluster_clone_families(
         key=lambda f: (
             -f["member_count"],
             -round(f["avg_similarity"], 9),
-            f["members"][0]["file"].replace("\\", "/"),
-            f["members"][0]["start"],
-            f["medoid"]["name"],
+            str(f["members"][0].get("file") or "").replace("\\", "/"),
+            int(f["members"][0].get("start") or 1),
+            str(f["medoid"].get("name") or "") if isinstance(f.get("medoid"), dict) else "",
         )
     )
     for idx, fam in enumerate(families):
