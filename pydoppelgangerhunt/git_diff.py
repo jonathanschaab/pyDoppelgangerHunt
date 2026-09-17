@@ -196,35 +196,39 @@ def get_git_blame_info(
         return {"author": "Unknown", "commit": "unknown", "timestamp": 0, "summary": ""}
 
     latest_time = 0
-    latest_author = "Unknown"
     latest_commit = "unknown"
-    latest_summary = ""
-    author = "Unknown"
-
+    commit_authors: Dict[str, str] = {}
+    commit_summaries: Dict[str, str] = {}
+    commit_times: Dict[str, int] = {}
     current_commit = ""
+
     for line in blame_text.splitlines():
         parts = line.split(" ", 1)
         if len(parts[0]) == 40 and all(c in "0123456789abcdefABCDEF" for c in parts[0]):
             current_commit = parts[0][:8]
+            c_time = commit_times.get(current_commit, 0)
+            if c_time > latest_time:
+                latest_time = c_time
+                latest_commit = current_commit
         elif line.startswith("author "):
-            author = line[7:].strip()
+            commit_authors[current_commit] = line[7:].strip()
         elif line.startswith("author-time "):
             try:
                 t_val = int(line[12:].strip())
+                commit_times[current_commit] = t_val
                 if t_val > latest_time:
                     latest_time = t_val
-                    latest_author = author
                     latest_commit = current_commit
             except ValueError:
                 pass
-        elif line.startswith("summary ") and current_commit == latest_commit:
-            latest_summary = line[8:].strip()
+        elif line.startswith("summary "):
+            commit_summaries[current_commit] = line[8:].strip()
 
     return {
-        "author": latest_author,
+        "author": commit_authors.get(latest_commit, "Unknown"),
         "commit": latest_commit,
         "timestamp": latest_time,
-        "summary": latest_summary,
+        "summary": commit_summaries.get(latest_commit, ""),
     }
 
 

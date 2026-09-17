@@ -5854,3 +5854,41 @@ def test_batch_34_local_node_traversal_and_delegation_hardening(tmp_path: Path) 
     )
     assert "def method(self):" in del_res
     assert "return self._shared_method()" in del_res
+
+
+def test_batch_35_git_blame_dictionary_porcelain_parsing() -> None:
+    """Tests Batch 35: git blame porcelain parsing with out-of-order and repeated commit headers."""
+    import unittest.mock as mock
+    from pydoppelgangerhunt.git_diff import get_git_blame_info
+
+    mock_out_1 = (
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\n"
+        "summary Add new feature\n"
+        "author Alice\n"
+        "author-time 1710000000\n"
+    )
+    with mock.patch("pydoppelgangerhunt.git_diff._run_git_command", return_value=mock_out_1):
+        blame_1 = get_git_blame_info("mod.py", 1, 1)
+        assert blame_1["author"] == "Alice"
+        assert blame_1["commit"] == "aaaaaaaa"
+        assert blame_1["timestamp"] == 1710000000
+        assert blame_1["summary"] == "Add new feature"
+
+    mock_out_2 = (
+        "1111111111111111111111111111111111111111 1 1 1\n"
+        "author-time 1720000000\n"
+        "author Bob\n"
+        "summary Bob commit\n"
+        "2222222222222222222222222222222222222222 2 2 1\n"
+        "author-time 1710000000\n"
+        "author Charlie\n"
+        "summary Charlie commit\n"
+        "1111111111111111111111111111111111111111 3 3 1\n"
+    )
+    with mock.patch("pydoppelgangerhunt.git_diff._run_git_command", return_value=mock_out_2):
+        blame_2 = get_git_blame_info("mod.py", 1, 3)
+        assert blame_2["author"] == "Bob"
+        assert blame_2["commit"] == "11111111"
+        assert blame_2["timestamp"] == 1720000000
+        assert blame_2["summary"] == "Bob commit"
+
