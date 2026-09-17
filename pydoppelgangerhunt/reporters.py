@@ -375,10 +375,10 @@ def format_github_annotations(
     for sim, u1, u2 in clones:
         f1 = str(u1.get("file") or "").replace("\\", "/").split("#", maxsplit=1)[0]
         s1 = int(u1.get("start") or 1)
-        e1 = int(u1.get("end") or 1)
+        e1 = int(u1.get("end") or s1)
         f2 = str(u2.get("file") or "").replace("\\", "/").split("#", maxsplit=1)[0]
         s2 = int(u2.get("start") or 1)
-        e2 = int(u2.get("end") or 1)
+        e2 = int(u2.get("end") or s2)
         n1 = str(u1.get("name") or "unit1")
         n2 = str(u2.get("name") or "unit2")
         msg1 = f"Structural clone ({sim:.1%}) matching {f2}:{s2}-{e2} ({n2})"

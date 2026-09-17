@@ -2650,7 +2650,7 @@ def filter_overlapping_clone_units(units: Sequence[Dict[str, Any]]) -> List[Dict
         sorted_candidates = sorted(
             file_units,
             key=lambda u: (
-                -(int(u.get("end") or 0) - int(u.get("start") or 0)),
+                -(int(u.get("end") or int(u.get("start") or 0)) - int(u.get("start") or 0)),
                 int(u.get("start") or 0),
                 int(u.get("start_col") or 0),
                 str(u.get("name") or ""),
@@ -2692,10 +2692,17 @@ def refactor_module_units(
     for i, (u1, _) in enumerate(rep_list):
         for u2, _ in rep_list[i + 1:]:
             if check_units_overlap(u1, u2):
+                n1 = str(u1.get("name") or "unit")
+                s1 = int(u1.get("start") or 1)
+                e1 = int(u1.get("end") or s1)
+                n2 = str(u2.get("name") or "unit")
+                s2 = int(u2.get("start") or 1)
+                e2 = int(u2.get("end") or s2)
+                f1 = str(u1.get("file") or "")
                 raise ValueError(
                     f"Overlapping unit collision detected between "
-                    f"'{u1.get('name')}' ({u1.get('start')}-{u1.get('end')}) and "
-                    f"'{u2.get('name')}' ({u2.get('start')}-{u2.get('end')}) in {u1.get('file')}."
+                    f"'{n1}' ({s1}-{e1}) and "
+                    f"'{n2}' ({s2}-{e2}) in {f1}."
                 )
 
     sorted_replacements = sorted(
@@ -2714,6 +2721,29 @@ def refactor_module_units(
     return current_text
 
 
+def _find_sig_colon(line: str) -> int:
+    """Finds the colon terminating a function definition header on a single line."""
+    paren_depth = 0
+    in_quote: Optional[str] = None
+    for i, ch in enumerate(line):
+        if in_quote:
+            if ch == in_quote and (i == 0 or line[i - 1] != "\\"):
+                in_quote = None
+            continue
+        if ch in ('"', "'"):
+            in_quote = ch
+            continue
+        if ch in "([{":
+            paren_depth += 1
+        elif ch in ")]}":
+            paren_depth = max(0, paren_depth - 1)
+        elif ch == ":" and paren_depth == 0:
+            after = line[i + 1 :].strip()
+            if not after.startswith("->"):
+                return i
+    return line.rfind(":")
+
+
 def _build_whole_method_delegation(
     source_text: str,
     unit: Dict[str, Any],
@@ -2728,7 +2758,7 @@ def _build_whole_method_delegation(
     """Builds a delegated method replacement body preserving method signature and docstring."""
     lines = source_text.splitlines(keepends=True)
     u_start = int(unit.get("start") or 1)
-    u_end = int(unit.get("end") or len(lines))
+    u_end = int(unit.get("end") or max(u_start, len(lines)))
 
     lead = lines[u_start - 1] if 1 <= u_start <= len(lines) else ""
     indent = lead[: len(lead) - len(lead.lstrip())]
@@ -2738,8 +2768,8 @@ def _build_whole_method_delegation(
     sig_end_line = u_start
     docstring_end_line: Optional[int] = None
     header = ""
-    raw_u_name = unit.get("name", "")
-    base_u_name = raw_u_name.rsplit(":", maxsplit=1)[-1]
+    raw_u_name = str(unit.get("name") or "")
+    base_u_name = raw_u_name.rsplit(":", maxsplit=1)[-1] if raw_u_name else ""
 
     try:
         tree = ast.parse(source_text)
@@ -2773,7 +2803,7 @@ def _build_whole_method_delegation(
                     b_col = getattr(first_body, "col_offset", len(lines[fn_def_line - 1]))
                     same_line = lines[fn_def_line - 1][:b_col].rstrip()
                     if not same_line.endswith(":"):
-                        colon_pos = lines[fn_def_line - 1].find(":")
+                        colon_pos = lines[fn_def_line - 1][:b_col].rfind(":")
                         if colon_pos != -1:
                             same_line = lines[fn_def_line - 1][: colon_pos + 1]
                     header = "".join(lines[u_start - 1 : fn_def_line - 1]) + same_line + "\n"
@@ -2798,7 +2828,8 @@ def _build_whole_method_delegation(
             for l_num in range(u_start, min(u_end + 1, len(lines) + 1)):
                 ln = lines[l_num - 1]
                 if ":" in ln and not ln.rstrip().endswith(":"):
-                    hdr_lines.append(ln[: ln.find(":") + 1] + "\n")
+                    colon_pos = _find_sig_colon(ln)
+                    hdr_lines.append(ln[: colon_pos + 1] + "\n")
                     break
                 hdr_lines.append(ln)
                 if ln.rstrip().endswith(":"):

@@ -238,8 +238,12 @@ def check_temporal_divergence(
     f2 = str(u2.get("file") or "")
     if not f1 or not f2:
         return None
-    b1 = get_git_blame_info(f1, int(u1.get("start") or 1), int(u1.get("end") or 1), repo_root=repo_root)
-    b2 = get_git_blame_info(f2, int(u2.get("start") or 1), int(u2.get("end") or 1), repo_root=repo_root)
+    s1 = int(u1.get("start") or 1)
+    e1 = int(u1.get("end") or s1)
+    s2 = int(u2.get("start") or 1)
+    e2 = int(u2.get("end") or s2)
+    b1 = get_git_blame_info(f1, s1, e1, repo_root=repo_root)
+    b2 = get_git_blame_info(f2, s2, e2, repo_root=repo_root)
 
     t1 = b1.get("timestamp", 0)
     t2 = b2.get("timestamp", 0)

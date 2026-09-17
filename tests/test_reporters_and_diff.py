@@ -5545,3 +5545,52 @@ def test_defensive_reporting_and_metrics_with_none_fields(tmp_path: Path) -> Non
     assert len(families) == 1
 
 
+def test_single_line_delegation_with_type_annotations_and_none_bounds() -> None:
+    """Verifies that single-line functions with type annotations preserve their signatures during delegation."""
+    from pydoppelgangerhunt.fixer import _build_whole_method_delegation, _find_sig_colon  # pylint: disable=protected-access
+    from pydoppelgangerhunt.git_diff import check_temporal_divergence
+    from pydoppelgangerhunt.reporters import format_github_annotations
+
+    # 1. Single-line function with argument annotations and return annotation
+    src = "def add(x: int, y: int = 1) -> int: return x + y\n"
+    unit = {"file": "calc.py", "name": "add", "start": 1, "end": 1, "kind": "function"}
+    delegation = _build_whole_method_delegation(
+        src,
+        unit,
+        call_prefix="",
+        helper_name="_shared_add",
+        args_str="x, y=y",
+        has_return=True,
+    )
+    assert "def add(x: int, y: int = 1) -> int:\n" in delegation
+    assert "    return _shared_add(x, y=y)\n" in delegation
+
+    # 2. _find_sig_colon unit tests
+    assert _find_sig_colon("def f(x: int, y: int = 1) -> int: return x + y") == 32
+    assert _find_sig_colon('def g(msg: str = "val:1") -> str: return msg') == 32
+    assert _find_sig_colon("def h(): return {'a': 1, 'b': 2}") == 7
+
+    # 3. _build_whole_method_delegation with all-None synthetic unit
+    null_unit = {"file": None, "name": None, "start": None, "end": None}
+    delegation_null = _build_whole_method_delegation(
+        "def fallback(): pass\n",
+        null_unit,
+        call_prefix="",
+        helper_name="_shared_fallback",
+        args_str="",
+    )
+    assert isinstance(delegation_null, str)
+    assert "_shared_fallback()" in delegation_null
+
+    # 4. format_github_annotations defensive end bounds
+    u_open = {"file": "target.py", "name": "open_unit", "start": 42, "end": None}
+    u_other = {"file": "target.py", "name": "other_unit", "start": 100, "end": 105}
+    ann = format_github_annotations([(0.9, u_open, u_other)])
+    assert "line=42,endLine=42" in ann[0]
+
+    # 5. check_temporal_divergence defensive None end handling
+    res = check_temporal_divergence(u_open, u_other)
+    assert res is None or isinstance(res, dict)
+
+
+
