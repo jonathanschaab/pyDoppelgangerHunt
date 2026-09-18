@@ -1533,3 +1533,76 @@ def test_batch_83_generator_subunit_terminal_return_syntax() -> None:
     assert "return (yield from _shared_gen(items))" in call_code
     parsed = ast.parse(f"def wrapper():\n    {call_code}\n")
     assert isinstance(parsed, ast.Module)
+
+
+def test_generate_refactoring_patch_custom_receiver_paired_with_standalone(tmp_path: Path) -> None:
+    """Verifies that generate_refactoring_patch supports replacing clones between a custom receiver method and a function."""
+    src1 = (
+        "class Runner:\n"
+        "    def execute(this, val: int) -> int:\n"
+        "        return val * 2\n"
+    )
+    src2 = (
+        "def execute_standalone(val: int) -> int:\n"
+        "    return val * 2\n"
+    )
+    f1 = tmp_path / "a.py"
+    f2 = tmp_path / "b.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": "a.py", "start": 2, "end": 3, "name": "execute"}
+    u2 = {"file": "b.py", "start": 1, "end": 2, "name": "execute_standalone"}
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert "--- a/a.py" in patch
+    assert "--- a/b.py" in patch
+    assert "_shared_execute_execute_standalone" in patch
+
+
+def test_generate_refactoring_patch_custom_receiver_different_attrs_rejected(tmp_path: Path) -> None:
+    """Verifies that methods accessing different attributes on custom receivers are not falsely merged."""
+    src1 = (
+        "class A:\n"
+        "    def get_val(this) -> int:\n"
+        "        return this.alpha\n"
+    )
+    src2 = (
+        "class B:\n"
+        "    def get_val(this) -> int:\n"
+        "        return this.beta\n"
+    )
+    f1 = tmp_path / "a.py"
+    f2 = tmp_path / "b.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": "a.py", "start": 2, "end": 3, "name": "get_val"}
+    u2 = {"file": "b.py", "start": 2, "end": 3, "name": "get_val"}
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch == ""
+
+
+def test_generate_refactoring_patch_cross_receiver_attrs_matching(tmp_path: Path) -> None:
+    """Verifies that methods accessing the same attribute under different receiver names (self vs this) are merged."""
+    src1 = (
+        "class A:\n"
+        "    def get_val(self) -> int:\n"
+        "        return self.total\n"
+    )
+    src2 = (
+        "class B:\n"
+        "    def get_val(this) -> int:\n"
+        "        return this.total\n"
+    )
+    f1 = tmp_path / "a.py"
+    f2 = tmp_path / "b.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": "a.py", "start": 2, "end": 3, "name": "get_val"}
+    u2 = {"file": "b.py", "start": 2, "end": 3, "name": "get_val"}
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert "--- a/a.py" in patch
+    assert "--- a/b.py" in patch
+    assert "_shared_get_val" in patch
+

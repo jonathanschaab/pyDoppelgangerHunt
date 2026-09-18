@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, Dict
 
 import pytest
 
@@ -18,6 +19,7 @@ from pydoppelgangerhunt import (
 from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _is_method_of_class,
     _populate_unit_receiver_metadata,
+    _prune_unshared_receivers,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
 
@@ -1354,3 +1356,21 @@ def test_batch_83_normalize_receiver_order_custom_receiver() -> None:
     inputs_cls = ["a", "b", "klass"]
     _normalize_receiver_order(inputs_cls, has_instance_binding=False, has_class_binding=True, primary_receiver="klass")
     assert inputs_cls == ["klass", "a", "b"]
+
+
+def test_prune_unshared_receivers_custom_receiver() -> None:
+    """Verifies that _prune_unshared_receivers prunes custom receivers (this, klass) when unreferenced."""
+    u1: Dict[str, Any] = {"name": "method_a", "receiver_param": "this"}
+    u2: Dict[str, Any] = {"name": "func_b"}
+    scope1: Dict[str, Any] = {"inputs": ["this", "val"], "has_receiver_access": False, "instance_attrs": [], "class_attrs": []}
+    scope2: Dict[str, Any] = {"inputs": ["val"], "has_receiver_access": False, "instance_attrs": [], "class_attrs": []}
+
+    inputs = ["this", "val"]
+    pruned = _prune_unshared_receivers(inputs, u1, u2, scope1, scope2)
+    assert pruned == ["val"]
+
+    # When receiver is referenced, it must not be pruned
+    scope1_ref: Dict[str, Any] = {"inputs": ["this", "val"], "has_receiver_access": True, "instance_attrs": ["this.x"], "class_attrs": []}
+    unpruned = _prune_unshared_receivers(inputs, u1, u2, scope1_ref, scope2)
+    assert unpruned == ["this", "val"]
+

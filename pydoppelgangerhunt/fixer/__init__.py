@@ -48,6 +48,8 @@ from pydoppelgangerhunt.fixer.scope import (
     _is_irrefutable_case,
     _is_irrefutable_pattern,
     _is_mangled_name,
+    _normalize_receiver_attr_name,
+    _normalize_receiver_attrs,
     _normalize_receiver_order,
     _rank_param_kind,
     _unfold_receiver_attribute,

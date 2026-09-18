@@ -255,9 +255,14 @@ def _prune_unshared_receivers(
     scope2: Dict[str, Any],
     repo_root: Optional[str] = None,
 ) -> List[str]:
-    """Removes 'self' and 'cls' from inputs when only one unit receives them and neither references them."""
+    """Removes receiver parameters from inputs when only one unit receives them and neither references them."""
     res = list(inputs)
-    for rec in ("self", "cls"):
+    rec_candidates: Set[str] = {"self", "cls"}
+    for u in (u1, u2):
+        rec_p = u.get("receiver_param")
+        if rec_p:
+            rec_candidates.add(rec_p)
+    for rec in sorted(rec_candidates):
         if (rec in scope1.get("inputs", [])) != (rec in scope2.get("inputs", [])):
             if not (
                 _has_receiver_reference(u1, scope1, repo_root=repo_root)

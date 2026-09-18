@@ -22,17 +22,43 @@ def _is_mangled_name(name: str) -> bool:
     return name.startswith("__") and not name.endswith("__") and len(name) > 2
 
 
-def _unfold_receiver_attribute(node: ast.AST) -> Optional[str]:
-    """Unfolds chained attribute access on 'self' or 'cls' (e.g. self.config.timeout -> 'self.config.timeout')."""
+def _unfold_receiver_attribute(
+    node: ast.AST,
+    receiver_names: Optional[Sequence[str]] = None,
+) -> Optional[str]:
+    """Unfolds chained attribute access on receiver parameters (e.g. self.config.timeout -> 'self.config.timeout')."""
     parts: List[str] = []
     curr: ast.AST = node
     while isinstance(curr, ast.Attribute):
         parts.append(curr.attr)
         curr = curr.value
-    if isinstance(curr, ast.Name) and curr.id in ("self", "cls"):
+    valid_receivers = tuple(receiver_names) if receiver_names is not None else ("self", "cls")
+    if isinstance(curr, ast.Name) and curr.id in valid_receivers:
         parts.append(curr.id)
         return ".".join(reversed(parts))
     return None
+
+
+def _normalize_receiver_attr_name(
+    attr: str,
+    receiver_param: Optional[str] = None,
+) -> str:
+    """Normalizes receiver attribute prefix (e.g. 'self.x', 'this.x', 'cls.x') to canonical '<rec>.x'."""
+    pfxs = ["self.", "cls."]
+    if receiver_param:
+        pfxs.append(f"{receiver_param}.")
+    for pfx in pfxs:
+        if attr.startswith(pfx):
+            return "<rec>." + attr[len(pfx):]
+    return attr
+
+
+def _normalize_receiver_attrs(
+    attrs: Sequence[str],
+    receiver_param: Optional[str] = None,
+) -> Set[str]:
+    """Normalizes a collection of receiver attribute strings to canonical '<rec>.*' form."""
+    return {_normalize_receiver_attr_name(a, receiver_param) for a in attrs}
 
 
 class _ScopeVisitor(ast.NodeVisitor):
@@ -43,6 +69,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         loop_offset: int = 0,
         source_lines: Optional[Sequence[str]] = None,
         is_subroutine: bool = False,
+        receiver_names: Optional[Sequence[str]] = None,
     ) -> None:
         self.loads: List[str] = []
         self.stores: List[str] = []
@@ -75,6 +102,11 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.is_subroutine: bool = is_subroutine
         self._has_processed_top_func: bool = False
         self.source_lines: Optional[List[str]] = list(source_lines) if source_lines is not None else None
+        self.receiver_names: Tuple[str, ...] = (
+            tuple(dict.fromkeys(list(receiver_names) + ["self", "cls"]))
+            if receiver_names is not None
+            else ("self", "cls")
+        )
 
     def _record_arg(
         self,
@@ -300,7 +332,7 @@ class _ScopeVisitor(ast.NodeVisitor):
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if self.class_depth == 0 and _is_mangled_name(node.attr):
             self.has_mangled_names = True
-        attr_name = _unfold_receiver_attribute(node)
+        attr_name = _unfold_receiver_attribute(node, receiver_names=self.receiver_names)
         if attr_name is not None:
             receiver_id = attr_name.split(".", 1)[0]
             is_inner = any(receiver_id in s for s in self._scope_stack[1:])
@@ -333,7 +365,7 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._record_load_name(node.target.id)
             self._record_store_name(node.target.id)
         elif isinstance(node.target, ast.Attribute):
-            attr_name = _unfold_receiver_attribute(node.target)
+            attr_name = _unfold_receiver_attribute(node.target, receiver_names=self.receiver_names)
             if attr_name is not None:
                 receiver_id = attr_name.split(".", 1)[0]
                 is_inner = any(receiver_id in s for s in self._scope_stack[1:])
@@ -1073,10 +1105,15 @@ def _normalize_receiver_order(
 
 
 
-def _rank_param_kind(var_name: str, param_map: Dict[str, str]) -> int:
-    """Returns canonical parameter sorting rank: self/cls=0, pos=1, vararg=2, kwonly=3, kwarg=4."""
+def _rank_param_kind(
+    var_name: str,
+    param_map: Dict[str, str],
+    receiver_names: Optional[Sequence[str]] = None,
+) -> int:
+    """Returns canonical parameter sorting rank: receiver=0, pos=1, vararg=2, kwonly=3, kwarg=4."""
     clean = var_name.lstrip("*")
-    if clean in ("self", "cls"):
+    valid_receivers = tuple(receiver_names) if receiver_names is not None else ("self", "cls")
+    if clean in valid_receivers:
         return 0
     kind = param_map.get(clean, "pos")
     if var_name.startswith("**") or kind == "kwarg":
@@ -1173,6 +1210,20 @@ def _inspect_unit_scope(
         unit_kind not in ("function", "closure", "method", "comprehension", "complex_expr") and ":" in unit_name
     )
 
+    rec_param = unit.get("receiver_param")
+    rec_kind = unit.get("receiver_kind")
+    is_class_rec = rec_kind == "class"
+
+    inst_receivers: Set[str] = {"self", "this"}
+    class_receivers: Set[str] = {"cls", "klass"}
+    if rec_param:
+        if is_class_rec:
+            class_receivers.add(rec_param)
+        else:
+            inst_receivers.add(rec_param)
+
+    all_receivers = inst_receivers | class_receivers
+
     cand_lines = cand_text.splitlines(keepends=True)
     is_sub = is_subroutine or (
         cand_text == dedented and isinstance(tree, ast.Module) and len(tree.body) > 1
@@ -1181,6 +1232,7 @@ def _inspect_unit_scope(
         loop_offset=loop_offset,
         source_lines=cand_lines,
         is_subroutine=is_sub,
+        receiver_names=tuple(all_receivers),
     )
     visitor.visit(tree)
 
@@ -1215,21 +1267,29 @@ def _inspect_unit_scope(
             inputs.append(nl)
 
     param_map = {p["name"].lstrip("*"): p.get("kind", "pos") for p in visitor.param_details}
-    inputs.sort(key=lambda v: _rank_param_kind(v, param_map))
+    inputs.sort(key=lambda v: _rank_param_kind(v, param_map, receiver_names=tuple(all_receivers)))
 
-    has_instance_binding = (
-        "self" in visitor.loads
-        or "self" in visitor.params
-        or any(a.startswith("self.") for a in visitor.attrs_read + visitor.attrs_written)
+    has_instance_binding = any(
+        r in visitor.loads
+        or r in visitor.params
+        or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
+        for r in inst_receivers
+        if r in ("self", "this")
+        or (rec_param and r == rec_param and rec_kind == "instance")
+        or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
     )
-    has_class_binding = (
-        "cls" in visitor.loads
-        or "cls" in visitor.params
-        or any(a.startswith("cls.") for a in visitor.attrs_read + visitor.attrs_written)
+    has_class_binding = any(
+        r in visitor.loads
+        or r in visitor.params
+        or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
+        for r in class_receivers
+        if r in ("cls", "klass")
+        or (rec_param and r == rec_param and is_class_rec)
+        or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
     )
     binding_kind = _determine_binding_kind(has_instance_binding, has_class_binding)
 
-    primary_rec = unit.get("receiver_param") or ("cls" if unit.get("receiver_kind") == "class" else None)
+    primary_rec = rec_param or ("cls" if is_class_rec else None)
     _normalize_receiver_order(inputs, has_instance_binding, has_class_binding, primary_receiver=primary_rec)
 
     # Definite and conditional assignment analysis across candidate statements
@@ -1269,9 +1329,13 @@ def _inspect_unit_scope(
     ]
 
     has_receiver_access = bool(
-        "self" in visitor.loads
-        or "cls" in visitor.loads
-        or any(a.startswith("self.") or a.startswith("cls.") for a in visitor.attrs_read + visitor.attrs_written)
+        any(
+            r in visitor.loads
+            or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
+            for r in all_receivers
+            if r in ("self", "cls", "this", "klass")
+            or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
+        )
     )
 
     return {
@@ -1300,9 +1364,16 @@ def _inspect_unit_scope(
         "has_class_binding": has_class_binding,
         "binding_kind": binding_kind,
         "has_receiver_access": has_receiver_access,
-        "instance_attrs": [a for a in visitor.attrs_read + visitor.attrs_written if a.startswith("self.")],
-        "class_attrs": [a for a in visitor.attrs_read + visitor.attrs_written if a.startswith("cls.")],
+        "instance_attrs": [
+            a for a in visitor.attrs_read + visitor.attrs_written
+            if any(a.startswith(f"{r}.") for r in inst_receivers)
+        ],
+        "class_attrs": [
+            a for a in visitor.attrs_read + visitor.attrs_written
+            if any(a.startswith(f"{r}.") for r in class_receivers)
+        ],
     }
+
 
 
 def analyze_unit_variable_scope(

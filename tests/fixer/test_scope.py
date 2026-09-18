@@ -20,6 +20,9 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _block_terminates,
     _extract_deleted_names,
     _inspect_unit_scope,
+    _normalize_receiver_attr_name,
+    _normalize_receiver_attrs,
+    _unfold_receiver_attribute,
     _walrus_assignment_in_expr,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
@@ -1417,3 +1420,83 @@ def test_match_guard_walrus_definite_in_case_body() -> None:
     # n was walrus-assigned in the guard and deleted inside the case body, so it should not be definite or conditional
     assert "n" not in definite
     assert "n" not in conditional
+
+
+def test_unfold_receiver_attribute_custom_receivers() -> None:
+    """Verifies that _unfold_receiver_attribute supports custom receiver names."""
+    tree_this = ast.parse("this.config.timeout")
+    expr_this = getattr(tree_this.body[0], "value")
+    assert _unfold_receiver_attribute(expr_this, receiver_names=("this",)) == "this.config.timeout"
+    assert _unfold_receiver_attribute(expr_this) is None  # Defaults to self/cls
+
+    tree_klass = ast.parse("klass.cache.enabled")
+    expr_klass = getattr(tree_klass.body[0], "value")
+    assert _unfold_receiver_attribute(expr_klass, receiver_names=("klass",)) == "klass.cache.enabled"
+    assert _unfold_receiver_attribute(expr_klass) is None
+
+
+def test_normalize_receiver_attr_name_and_set() -> None:
+    """Verifies that receiver attribute normalization maps different prefixes to canonical <rec>."""
+    assert _normalize_receiver_attr_name("self.total") == "<rec>.total"
+    assert _normalize_receiver_attr_name("cls.count") == "<rec>.count"
+    assert _normalize_receiver_attr_name("this.total", receiver_param="this") == "<rec>.total"
+    assert _normalize_receiver_attr_name("klass.count", receiver_param="klass") == "<rec>.count"
+    assert _normalize_receiver_attr_name("other.total", receiver_param="this") == "other.total"
+
+    attrs1 = ["self.x", "self.y.z"]
+    attrs2 = ["this.x", "this.y.z"]
+    assert _normalize_receiver_attrs(attrs1) == {"<rec>.x", "<rec>.y.z"}
+    assert _normalize_receiver_attrs(attrs2, receiver_param="this") == {"<rec>.x", "<rec>.y.z"}
+
+
+def test_scope_inspection_custom_receiver_attributes(tmp_path: Path) -> None:
+    """Verifies that scope inspection populates attrs_read, instance_attrs, and class_attrs for custom receivers."""
+    code = (
+        "class Worker:\n"
+        "    def run(this, val: int) -> int:\n"
+        "        this.total = this.multiplier * val\n"
+        "        return this.total\n"
+        "\n"
+        "    @classmethod\n"
+        "    def tally(klass, delta: int) -> int:\n"
+        "        klass.count += delta\n"
+        "        return klass.count\n"
+    )
+    f = tmp_path / "worker.py"
+    f.write_text(code, encoding="utf-8")
+
+    u_inst = {
+        "file": str(f),
+        "start": 2,
+        "end": 4,
+        "name": "run",
+        "kind": "function",
+        "receiver_param": "this",
+        "receiver_kind": "instance",
+    }
+    s_inst = analyze_unit_variable_scope(u_inst, repo_root=str(tmp_path))
+    assert s_inst["has_instance_binding"] is True
+    assert s_inst["has_class_binding"] is False
+    assert s_inst["has_receiver_access"] is True
+    assert "this.multiplier" in s_inst["attrs_read"]
+    assert "this.total" in s_inst["attrs_written"]
+    assert "this.multiplier" in s_inst["instance_attrs"]
+    assert s_inst["inputs"][0] == "this"
+
+    u_cls = {
+        "file": str(f),
+        "start": 7,
+        "end": 9,
+        "name": "tally",
+        "kind": "function",
+        "receiver_param": "klass",
+        "receiver_kind": "class",
+    }
+    s_cls = analyze_unit_variable_scope(u_cls, repo_root=str(tmp_path))
+    assert s_cls["has_class_binding"] is True
+    assert s_cls["has_instance_binding"] is False
+    assert s_cls["has_receiver_access"] is True
+    assert "klass.count" in s_cls["attrs_read"]
+    assert "klass.count" in s_cls["class_attrs"]
+    assert s_cls["inputs"][0] == "klass"
+

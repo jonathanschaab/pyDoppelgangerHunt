@@ -24,6 +24,7 @@ from pydoppelgangerhunt.fixer.binding import (
     find_enclosing_function,
 )
 from pydoppelgangerhunt.fixer.scope import (
+    _normalize_receiver_attrs,
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
 )
 from pydoppelgangerhunt.fixer.source import (
@@ -757,9 +758,13 @@ def generate_refactoring_patch(
             continue
         if not is_same_file and (s1.get("globals") or s2.get("globals")):
             continue
+        rec1 = u1.get("receiver_param") or ("cls" if fn1_kind == "class" else "self")
+        rec2 = u2.get("receiver_param") or ("cls" if fn2_kind == "class" else "self")
         if (
-            set(s1.get("attrs_read", [])) != set(s2.get("attrs_read", []))
-            or set(s1.get("attrs_written", [])) != set(s2.get("attrs_written", []))
+            _normalize_receiver_attrs(s1.get("attrs_read", []), rec1)
+            != _normalize_receiver_attrs(s2.get("attrs_read", []), rec2)
+            or _normalize_receiver_attrs(s1.get("attrs_written", []), rec1)
+            != _normalize_receiver_attrs(s2.get("attrs_written", []), rec2)
         ):
             continue
 

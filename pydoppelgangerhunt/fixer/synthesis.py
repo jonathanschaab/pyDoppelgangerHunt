@@ -20,6 +20,7 @@ from pydoppelgangerhunt.fixer.binding import (
     _resolve_effective_binding,
 )
 from pydoppelgangerhunt.fixer.scope import (
+    _normalize_receiver_attrs,
     _rank_param_kind,
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
 )
@@ -522,9 +523,13 @@ def synthesize_shared_helper_code(
         scope1.get("globals") or scope2.get("globals") or scope.get("globals")
     ):
         return ""
+    rec1 = u1.get("receiver_param") or ("cls" if k1 == "class" else "self")
+    rec2 = u2.get("receiver_param") or ("cls" if k2 == "class" else "self")
     if (
-        set(scope1.get("attrs_read", [])) != set(scope2.get("attrs_read", []))
-        or set(scope1.get("attrs_written", [])) != set(scope2.get("attrs_written", []))
+        _normalize_receiver_attrs(scope1.get("attrs_read", []), rec1)
+        != _normalize_receiver_attrs(scope2.get("attrs_read", []), rec2)
+        or _normalize_receiver_attrs(scope1.get("attrs_written", []), rec1)
+        != _normalize_receiver_attrs(scope2.get("attrs_written", []), rec2)
     ):
         return ""
 
@@ -672,12 +677,13 @@ def synthesize_shared_helper_code(
     doc_indent = indent + step
     sub_indent = indent + step + step
     if effective_binding == "method":
+        rec_call = u1.get("receiver_param") or u2.get("receiver_param")
         if is_class_receiver:
-            call_target = f"cls.{helper_name}"
+            call_target = f"{rec_call or 'cls'}.{helper_name}"
         elif is_static_clone:
             call_target = f"__class__.{helper_name}"
         else:
-            call_target = f"self.{helper_name}"
+            call_target = f"{rec_call or 'self'}.{helper_name}"
     else:
         call_target = helper_name
 
