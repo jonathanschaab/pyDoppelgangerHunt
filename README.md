@@ -77,6 +77,9 @@ pydoppelgangerhunt src/ --coverage .coverage
 # Generate git-apply compatible refactoring patch file
 pydoppelgangerhunt src/ --patch refactor.patch
 
+# Synthesize cross-file shared utility modules and replace duplicates
+pydoppelgangerhunt src/ --patch refactor.patch --replace-clones --cross-file-strategy auto
+
 # Emit OASIS SARIF 2.1.0 output for GitHub Code Scanning
 pydoppelgangerhunt src/ --format sarif --output results.sarif
 ```
@@ -149,6 +152,11 @@ pydoppelgangerhunt --init
 | `--output`, `-o` | `PATH` | Output file path to save report |
 | `--html` | `PATH` | Write standalone interactive HTML dashboard report |
 | `--patch` | `PATH` | Write git-apply compatible unified patch file |
+| `--replace-clones` | Flag | Replace duplicate clone bodies with calls delegating to extracted helpers |
+| `--type-merge-strategy` | `fallback_any\|union` | Parameter typing strategy for helper synthesis (`fallback_any` or `union`) |
+| `--method-binding` | `auto\|method\|module` | Target helper binding strategy (`auto`, `method`, or `module`) |
+| `--cross-file-strategy` | `auto\|shared_module\|host_module` | Cross-module deduplication strategy (`auto`, `shared_module`, or `host_module`) |
+| `--shared-module-name` | `FILENAME` | Target filename for shared utility extractions (default: `_common.py`) |
 | `--sort-by` | `similarity\|priority\|sloc` | Sort clone hits (default: `similarity`) |
 | `--priority` | Flag | Sort clones by Priority score: $\text{Sim} \times \text{SLOC} \times \text{Complexity}$ |
 | `--top` | `INT` | Truncate report to top $N$ clone pairs |
