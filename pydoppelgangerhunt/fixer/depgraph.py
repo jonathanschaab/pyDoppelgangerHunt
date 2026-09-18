@@ -40,10 +40,13 @@ def derive_module_import_path(
     Returns:
         Dot-separated module import path, or an empty string if unresolvable.
     """
-    p_file = Path(file_path)
-    p_root = Path(repo_root)
+    norm_path = str(file_path).replace("\\", "/")
+    p_root = Path(repo_root).resolve()
+    p_file = Path(norm_path)
+    if not p_file.is_absolute():
+        p_file = p_root / p_file
     try:
-        rel = p_file.resolve().relative_to(p_root.resolve())
+        rel = p_file.resolve().relative_to(p_root)
     except ValueError:
         rel = Path(p_file.name)
     parts = list(rel.parts)

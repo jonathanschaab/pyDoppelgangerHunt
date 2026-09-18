@@ -6,6 +6,7 @@ import ast
 import subprocess
 import sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -19,6 +20,7 @@ from pydoppelgangerhunt import (
 )
 from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _build_whole_method_delegation,
+    patch as patch_mod,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
 
@@ -2055,3 +2057,124 @@ def test_generate_refactoring_patch_cross_module_missing_caller_file(tmp_path: P
 
     assert "--- a/single_pkg/file1.py" in patch
     assert "Complete refactoring by importing the helper into single_pkg/nonexistent.py" in patch
+
+
+def test_generate_refactoring_patch_shared_module_helper_name_collision_avoidance(
+    tmp_path: Path,
+) -> None:
+    """Verifies that two distinct clone pairs sharing the same base name do not collide in _common.py."""
+    pkg_dir = tmp_path / "collision_pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    src_a = (
+        "def compute_val(x: int) -> int:\n"
+        "    return x * 10\n"
+        "\n"
+        "def calculate_val(x: int) -> int:\n"
+        "    return x + 99\n"
+    )
+    src_b = (
+        "def compute_val(y: int) -> int:\n"
+        "    return y * 10\n"
+        "\n"
+        "def calculate_val(y: int) -> int:\n"
+        "    return y + 99\n"
+    )
+    (pkg_dir / "mod_a.py").write_text(src_a, encoding="utf-8")
+    (pkg_dir / "mod_b.py").write_text(src_b, encoding="utf-8")
+
+    u_a1 = {"name": "compute_val", "file": "collision_pkg/mod_a.py", "start": 1, "end": 2, "kind": "function"}
+    u_b1 = {"name": "compute_val", "file": "collision_pkg/mod_b.py", "start": 1, "end": 2, "kind": "function"}
+
+    u_a2 = {"name": "calculate_val", "file": "collision_pkg/mod_a.py", "start": 4, "end": 5, "kind": "function"}
+    u_b2 = {"name": "calculate_val", "file": "collision_pkg/mod_b.py", "start": 4, "end": 5, "kind": "function"}
+
+    # Pre-existing _common.py that already contains _shared_compute_val
+    src_existing_common = (
+        "def _shared_compute_val(x: int) -> int:\n"
+        "    return x * 999\n"
+    )
+    (pkg_dir / "_common.py").write_text(src_existing_common, encoding="utf-8")
+
+    patch = generate_refactoring_patch(
+        [(1.0, u_a1, u_b1), (1.0, u_a2, u_b2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="auto",
+    )
+
+    # Pre-existing _shared_compute_val was in _common.py, so helper for u_a1/u_b1 gets _shared_compute_val_2
+    assert "def _shared_compute_val_2" in patch
+    assert "def _shared_calculate_val" in patch
+    assert "from collision_pkg._common import _shared_compute_val_2" in patch
+
+
+def test_generate_refactoring_patch_auto_detects_existing_shared_module_cycle(
+    tmp_path: Path,
+) -> None:
+    """Verifies that auto strategy detects when existing _common.py already imports caller and avoids cycle."""
+    pkg_dir = tmp_path / "precycle_pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    # _common.py already imports mod_a
+    src_common = (
+        "import precycle_pkg.mod_a\n\n"
+        "def existing_seed() -> int:\n"
+        "    return 1\n"
+    )
+    src_a = (
+        "def run_task(x: int) -> int:\n"
+        "    return x * 5\n"
+    )
+    src_b = (
+        "def run_other(x: int) -> int:\n"
+        "    return x * 5\n"
+    )
+    (pkg_dir / "_common.py").write_text(src_common, encoding="utf-8")
+    (pkg_dir / "mod_a.py").write_text(src_a, encoding="utf-8")
+    (pkg_dir / "mod_b.py").write_text(src_b, encoding="utf-8")
+
+    u_a = {"name": "run_task", "file": "precycle_pkg/mod_a.py", "start": 1, "end": 2, "kind": "function"}
+    u_b = {"name": "run_other", "file": "precycle_pkg/mod_b.py", "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u_a, u_b)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="auto",
+    )
+
+    # Circular import detected for mod_a -> _common -> mod_a
+    assert (
+        "Circular import detected "
+        "(cycle: precycle_pkg.mod_a -> precycle_pkg._common -> precycle_pkg.mod_a)"
+    ) in patch
+    # mod_a must NOT be patched with a circular import
+    assert "--- a/precycle_pkg/mod_a.py" not in patch
+    # mod_b (which has no cycle) safely imports from _common
+    assert "--- a/precycle_pkg/mod_b.py" in patch
+    assert "from precycle_pkg._common import _shared_run_task_run_other" in patch
+
+
+def test_generate_refactoring_patch_lazy_depgraph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that build_module_graph is evaluated lazily only when needed."""
+    mock_build = mock.MagicMock()
+    monkeypatch.setattr(patch_mod, "build_module_graph", mock_build)
+
+    f = tmp_path / "single.py"
+    f.write_text("def a(): return 1\ndef b(): return 1\n", encoding="utf-8")
+    u1 = {"name": "a", "file": str(f), "start": 1, "end": 1, "kind": "function"}
+    u2 = {"name": "b", "file": str(f), "start": 2, "end": 2, "kind": "function"}
+
+    # Intra-file patch generation does not consult or build the graph
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=False,
+    )
+    assert "def _shared_a_b" in patch
+    mock_build.assert_not_called()

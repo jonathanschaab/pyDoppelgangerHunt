@@ -46,6 +46,10 @@ def test_derive_module_import_path_layouts(tmp_path: Path) -> None:
     other = tmp_path / "outside.py"
     assert derive_module_import_path(other, root) == "outside"
 
+    # Relative path inputs resolved against repo root (regardless of process CWD)
+    assert derive_module_import_path("pkg/sub/worker.py", root) == "pkg.sub.worker"
+    assert derive_module_import_path("pkg\\sub\\worker.py", root) == "pkg.sub.worker"
+
 
 def test_find_nearest_common_package(tmp_path: Path) -> None:
     """Verifies nearest common package directory resolution between files."""
