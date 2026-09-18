@@ -192,6 +192,11 @@ def derive_shared_module_import(
     if src_dir in (p_root, p_root / "src"):
         return derive_module_import_path(p_shared, p_root)
 
+    # When shared file is at repo root (or src/ root), any relative import from a subpackage
+    # would climb above top-level package and raise ImportError; fall back to absolute path.
+    if shared_dir in (p_root, p_root / "src"):
+        return derive_module_import_path(p_shared, p_root)
+
     try:
         rel_dir = os.path.relpath(str(shared_dir), str(src_dir))
     except ValueError:
@@ -203,6 +208,18 @@ def derive_shared_module_import(
     rel_parts = Path(rel_dir).parts
     up_count = sum(1 for part in rel_parts if part == "..")
     down_parts = [part for part in rel_parts if part != ".."]
+
+    # Check if up_count climbs above the top-level package enclosing src_dir
+    src_base = p_root / "src"
+    try:
+        pkg_depth = len(src_dir.relative_to(src_base).parts)
+    except ValueError:
+        try:
+            pkg_depth = len(src_dir.relative_to(p_root).parts)
+        except ValueError:
+            pkg_depth = 0
+    if up_count >= pkg_depth:
+        return derive_module_import_path(p_shared, p_root)
 
     dots = "." * (up_count + 1)
     if down_parts:
@@ -402,7 +419,11 @@ class ModuleDependencyGraph:
         graph = cls(root)
 
         if file_paths is not None:
-            python_files = [p.resolve() for p in file_paths if p.suffix == ".py"]
+            python_files = [
+                _resolve_repo_relative_path(p, root)
+                for p in file_paths
+                if p.suffix == ".py"
+            ]
         else:
             python_files = []
             for dirpath, dirnames, filenames in os.walk(root):

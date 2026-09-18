@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import difflib
 import logging
 import os
@@ -54,6 +55,8 @@ from pydoppelgangerhunt.fixer.synthesis import (
 )
 
 logger = logging.getLogger(__name__)
+_BUILTIN_NAMES: Set[str] = set(dir(builtins))
+
 
 def check_units_overlap(
     u1: Dict[str, Any],
@@ -834,17 +837,18 @@ def _extract_module_import_statements(
     source_text: str,
     source_mod: Optional[str] = None,
     is_package: bool = False,
-) -> Dict[str, str]:
+) -> Tuple[Dict[str, str], List[str]]:
     """Maps imported symbol/module names to clean import statements from source text."""
     stmts: Dict[str, str] = {}
+    wildcards: List[str] = []
     if not source_text.strip():
-        return stmts
+        return stmts, wildcards
     try:
         tree = ast.parse(source_text)
     except (SyntaxError, UnicodeDecodeError):
-        return stmts
+        return stmts, wildcards
 
-    for node in ast.walk(tree):
+    for node in tree.body:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 name = alias.asname or alias.name.split(".", maxsplit=1)[0]
@@ -869,15 +873,17 @@ def _extract_module_import_statements(
 
             if target_module:
                 for alias in node.names:
-                    name = alias.asname or alias.name
-                    if name != "*":
+                    if alias.name == "*":
+                        wildcards.append(f"from {target_module} import *")
+                    else:
+                        name = alias.asname or alias.name
                         if alias.asname:
                             stmts[name] = (
                                 f"from {target_module} import {alias.name} as {alias.asname}"
                             )
                         else:
                             stmts[name] = f"from {target_module} import {alias.name}"
-    return stmts
+    return stmts, wildcards
 
 
 def _canonicalize_helper_relative_imports(
@@ -1076,29 +1082,105 @@ def _collect_host_missing_imports(
                 elif isinstance(node.ctx, ast.Load):
                     loaded_in_helper.add(node.id)
 
+        is_same_file_host = (
+            not host_plan.is_new_file
+            and len(source_texts) == 1
+            and _unpack_source_item(source_texts[0])[0] == host_plan.orig_text
+        )
+
+        source_import_maps: List[Tuple[Dict[str, str], List[str]]] = []
         for item in source_texts:
             src_text, src_mod, src_ispkg = _unpack_source_item(item)
             if not src_text:
                 continue
-            src_imports = _extract_module_import_statements(
+            s_map, s_wild = _extract_module_import_statements(
                 src_text, source_mod=src_mod, is_package=src_ispkg
             )
-            for loaded_name in sorted(loaded_in_helper):
-                if (
-                    loaded_name not in defined_in_helper
-                    and loaded_name not in host_imported
-                    and loaded_name not in needed_typing
-                    and loaded_name in src_imports
-                ):
-                    stmt = src_imports[loaded_name]
-                    if (
-                        stmt not in missing
-                        and stmt not in host_content
-                        and stmt not in host_plan.missing_imports
-                    ):
-                        missing.append(stmt)
+            source_import_maps.append((s_map, s_wild))
+
+        ignored_names = _BUILTIN_NAMES | defined_in_helper | set(needed_typing)
+        symbol_to_stmt: Dict[str, str] = {}
+        for loaded_name in sorted(loaded_in_helper):
+            if loaded_name in ignored_names:
+                continue
+
+            found_in_any = False
+            for s_map, _ in source_import_maps:
+                if loaded_name in s_map:
+                    found_in_any = True
+                    stmt = s_map[loaded_name]
+                    if loaded_name in symbol_to_stmt and symbol_to_stmt[loaded_name] != stmt:
+                        raise ValueError(
+                            f"conflicting imported symbol '{loaded_name}' across clone sources"
+                        )
+                    symbol_to_stmt[loaded_name] = stmt
+
+            if not is_same_file_host:
+                if not found_in_any and any(s_wild for _, s_wild in source_import_maps):
+                    raise ValueError(
+                        f"symbol '{loaded_name}' potentially relies on wildcard import"
+                    )
+
+            if loaded_name in host_imported:
+                symbol_to_stmt.pop(loaded_name, None)
+
+        for host_stmt in host_plan.missing_imports:
+            try:
+                htree = ast.parse(host_stmt)
+                for node in htree.body:
+                    if isinstance(node, ast.Import):
+                        for alias in node.names:
+                            hname = alias.asname or alias.name.split(".", 1)[0]
+                            if hname in symbol_to_stmt and symbol_to_stmt[hname] != host_stmt:
+                                raise ValueError(
+                                    f"conflicting imported symbol '{hname}' across clone sources"
+                                )
+                    elif isinstance(node, ast.ImportFrom):
+                        for alias in node.names:
+                            if alias.name != "*":
+                                hname = alias.asname or alias.name
+                                if hname in symbol_to_stmt and symbol_to_stmt[hname] != host_stmt:
+                                    raise ValueError(
+                                        f"conflicting imported symbol '{hname}' across clone sources"
+                                    )
+            except (SyntaxError, UnicodeDecodeError):
+                pass
+
+        for stmt in symbol_to_stmt.values():
+            if (
+                stmt not in missing
+                and stmt not in host_content
+                and stmt not in host_plan.missing_imports
+            ):
+                missing.append(stmt)
 
     return missing
+
+
+def _safely_collect_host_missing_imports(
+    host_plan: _FilePatchPlan,
+    helper_code: str,
+    scope: Dict[str, Any],
+    source_texts: Sequence[Union[str, Tuple[Any, ...]]],
+    f1_plan: _FilePatchPlan,
+    f2_plan: Optional[_FilePatchPlan],
+) -> Optional[List[str]]:
+    """Collects host imports or records skip comments on both plans if a conflict is detected."""
+    try:
+        return _collect_host_missing_imports(
+            host_plan=host_plan,
+            helper_code=helper_code,
+            scope=scope,
+            source_texts=source_texts,
+        )
+    except ValueError as err:
+        conflict_msg = (
+            f"# Note: Cross-module clone pair; {err}; skipping extraction.\n"
+        )
+        f1_plan.comments.append(conflict_msg)
+        if f2_plan is not None:
+            f2_plan.comments.append(conflict_msg)
+        return None
 
 
 def _register_plan_dependencies_in_graph(
@@ -1596,13 +1678,19 @@ def generate_refactoring_patch(
                 helper_code = _canonicalize_helper_relative_imports(
                     helper_code, [(mod1, is_pkg1), (mod2, is_pkg2)]
                 )
-                host_plan.module_helpers.append(helper_code)
-                host_imports = _collect_host_missing_imports(
+                maybe_imports = _safely_collect_host_missing_imports(
                     host_plan=host_plan,
                     helper_code=helper_code,
                     scope=scope,
                     source_texts=[(orig_text, mod1, is_pkg1), (f2_plan.orig_text, mod2, is_pkg2)],
+                    f1_plan=f1_plan,
+                    f2_plan=f2_plan,
                 )
+                if maybe_imports is None:
+                    continue
+                host_imports = maybe_imports
+
+                host_plan.module_helpers.append(helper_code)
                 host_plan.missing_imports.extend(host_imports)
                 host_plan.used_helper_names.add(helper_name)
                 host_plan.comments.append(pair_comment)
@@ -1698,12 +1786,18 @@ def generate_refactoring_patch(
                 )
                 dg = _get_depgraph()
 
-                host_imports = _collect_host_missing_imports(
+                maybe_imports = _safely_collect_host_missing_imports(
                     host_plan=f1_plan,
                     helper_code=helper_code,
                     scope=scope,
                     source_texts=[(orig_text, mod1, is_pkg1), (f2_plan.orig_text, mod2, is_pkg2)],
+                    f1_plan=f1_plan,
+                    f2_plan=f2_plan,
                 )
+                if maybe_imports is None:
+                    continue
+                host_imports = maybe_imports
+
                 if mod1 and host_imports:
                     _register_plan_dependencies_in_graph(
                         dg, mod1, f1_plan.path, host_imports
@@ -1765,16 +1859,22 @@ def generate_refactoring_patch(
                     replace_clones=replace_clones,
                 )
         else:
-            f1_plan.comments.append(
-                f"# Note: Cross-module clone pair; helper generated in {f1_disp}. "
-                f"Complete refactoring by importing the helper into {f2_disp}.\n"
-            )
             mod1 = _derive_module_import_path(f1_path, root)
-            host_imports = _collect_host_missing_imports(
+            maybe_imports = _safely_collect_host_missing_imports(
                 host_plan=f1_plan,
                 helper_code=helper_code,
                 scope=scope,
                 source_texts=[(orig_text, mod1, f1_path.name == "__init__.py")],
+                f1_plan=f1_plan,
+                f2_plan=f2_plan,
+            )
+            if maybe_imports is None:
+                continue
+            host_imports = maybe_imports
+
+            f1_plan.comments.append(
+                f"# Note: Cross-module clone pair; helper generated in {f1_disp}. "
+                f"Complete refactoring by importing the helper into {f2_disp}.\n"
             )
             _finalize_host_unit_and_helper(
                 plan=f1_plan,

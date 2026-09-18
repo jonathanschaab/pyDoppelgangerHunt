@@ -363,3 +363,34 @@ def test_depgraph_edge_cases(tmp_path: Path) -> None:
     f_not_py.write_text("hello", encoding="utf-8")
     g_explicit = build_module_graph(root, file_paths=[f_ok, f_not_py, root_init])
     assert "ok" in g_explicit.mod_to_file
+
+
+def test_derive_shared_module_import_climbs_above_package(tmp_path: Path) -> None:
+    """Verifies that relative imports climbing above top-level package fall back to absolute path."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    shared_at_root = root / "_common.py"
+    pkg_sub = root / "pkg" / "sub"
+    pkg_sub.mkdir(parents=True)
+    src_mod = pkg_sub / "worker.py"
+    src_mod.write_text("x = 1\n", encoding="utf-8")
+
+    # Shared module at repo root
+    assert (
+        derive_shared_module_import(src_mod, shared_at_root, root, prefer_relative=True)
+        == "_common"
+    )
+
+    # Source in top-level package and shared module in another top-level package
+    other_pkg = root / "other"
+    other_pkg.mkdir()
+    shared_in_other = other_pkg / "_common.py"
+    assert (
+        derive_shared_module_import(src_mod, shared_in_other, root, prefer_relative=True)
+        == "other._common"
+    )
+
+    # Relative file_paths in build_from_repository resolved against repo root
+    g_rel = build_module_graph(root, file_paths=[Path("pkg/sub/worker.py")])
+    assert "pkg.sub.worker" in g_rel.mod_to_file
+

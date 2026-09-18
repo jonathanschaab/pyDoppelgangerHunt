@@ -2789,9 +2789,12 @@ def test_collect_host_missing_imports_preserves_aliased_typing(tmp_path: Path) -
     assert "from typing import List as MyList" in patch
 
 
-def test_generate_patch_relative_repo_root_no_path_doubling(tmp_path: Path) -> None:
+def test_generate_patch_relative_repo_root_no_path_doubling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Verifies that passing a relative repo_root does not duplicate path components."""
-    rel_root = tmp_path / "sub_proj"
+    monkeypatch.chdir(tmp_path)
+    rel_root = Path("sub_proj")
     pkg = rel_root / "my_pkg"
     pkg.mkdir(parents=True)
     (pkg / "__init__.py").write_text("", encoding="utf-8")
@@ -2803,8 +2806,8 @@ def test_generate_patch_relative_repo_root_no_path_doubling(tmp_path: Path) -> N
     u1 = {"name": "util", "file": str(pkg / "a.py"), "start": 1, "end": 2, "kind": "function"}
     u2 = {"name": "util", "file": str(pkg / "b.py"), "start": 1, "end": 2, "kind": "function"}
 
-    # Pass relative repo_root
-    rel_repo_root = str(rel_root)
+    # Pass genuinely relative repo_root
+    rel_repo_root = "sub_proj"
     patch = generate_refactoring_patch(
         [(1.0, u1, u2)],
         repo_root=rel_repo_root,
@@ -2814,6 +2817,131 @@ def test_generate_patch_relative_repo_root_no_path_doubling(tmp_path: Path) -> N
 
     assert "sub_proj/sub_proj" not in patch.replace("\\", "/")
     assert "my_pkg/_common.py" in patch.replace("\\", "/")
+
+
+def test_generate_patch_conflicting_import_symbols_skips_extraction(tmp_path: Path) -> None:
+    """Verifies that clones binding the same symbol to different modules skip extraction."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    sub1 = pkg / "sub1"
+    sub1.mkdir()
+    (sub1 / "__init__.py").write_text("", encoding="utf-8")
+    (sub1 / "helpers.py").write_text("class CustomType:\n    pass\n", encoding="utf-8")
+
+    sub2 = pkg / "sub2"
+    sub2.mkdir()
+    (sub2 / "__init__.py").write_text("", encoding="utf-8")
+    (sub2 / "helpers.py").write_text("class CustomType:\n    pass\n", encoding="utf-8")
+
+    src1 = (
+        "from .helpers import CustomType\n\n"
+        "def compute(item: CustomType) -> int:\n"
+        "    return len(item)\n"
+    )
+    src2 = (
+        "from .helpers import CustomType\n\n"
+        "def compute(item: CustomType) -> int:\n"
+        "    return len(item)\n"
+    )
+    f1 = sub1 / "worker.py"
+    f2 = sub2 / "worker.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "compute", "file": str(f1), "start": 3, "end": 4, "kind": "function"}
+    u2 = {"name": "compute", "file": str(f2), "start": 3, "end": 4, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "conflicting imported symbol 'CustomType'" in patch
+    assert "skipping extraction" in patch
+    assert "_common.py" not in patch
+
+
+def test_generate_patch_skips_guarded_imports_in_shared_module(tmp_path: Path) -> None:
+    """Verifies that imports inside conditional or guarded blocks are not emitted into shared modules."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = (
+        "from typing import List\n"
+        "if True:\n"
+        "    from typing_extensions import Buffer\n\n"
+        "def run_job(x: List[int]) -> int:\n"
+        "    return len(x)\n"
+    )
+    src2 = (
+        "from typing import List\n"
+        "try:\n"
+        "    import optional_dep\n"
+        "except ImportError:\n"
+        "    pass\n\n"
+        "def run_job(x: List[int]) -> int:\n"
+        "    return len(x)\n"
+    )
+    f1 = pkg / "a.py"
+    f2 = pkg / "b.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "run_job", "file": str(f1), "start": 5, "end": 6, "kind": "function"}
+    u2 = {"name": "run_job", "file": str(f2), "start": 7, "end": 8, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    common_section = patch.split("diff --git a/pkg/_common.py")[-1]
+    assert "from typing import List" in common_section
+    assert "Buffer" not in common_section
+    assert "optional_dep" not in common_section
+
+
+def test_generate_patch_wildcard_import_unresolved_symbol(tmp_path: Path) -> None:
+    """Verifies that an unresolved symbol in a helper where source used wildcard import skips extraction."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = (
+        "from math import *\n\n"
+        "def calc(x: CustomType) -> float:\n"
+        "    return float(len(str(x)))\n"
+    )
+    src2 = (
+        "from math import *\n\n"
+        "def calc(x: CustomType) -> float:\n"
+        "    return float(len(str(x)))\n"
+    )
+    f1 = pkg / "m1.py"
+    f2 = pkg / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "calc", "file": str(f1), "start": 3, "end": 4, "kind": "function"}
+    u2 = {"name": "calc", "file": str(f2), "start": 3, "end": 4, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "potentially relies on wildcard import" in patch
+    assert "skipping extraction" in patch
+
 
 
 
