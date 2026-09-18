@@ -2055,6 +2055,3 @@ def test_generate_refactoring_patch_cross_module_missing_caller_file(tmp_path: P
 
     assert "--- a/single_pkg/file1.py" in patch
     assert "Complete refactoring by importing the helper into single_pkg/nonexistent.py" in patch
-
-
-
