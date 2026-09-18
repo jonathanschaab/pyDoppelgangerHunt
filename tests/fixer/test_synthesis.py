@@ -1096,3 +1096,40 @@ def test_batch_82_generator_container_literal_and_pep585_return_type_inference(t
 
     helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert "-> Iterator[str]:" in helper
+
+
+def test_format_call_arguments_order_preservation_and_custom_receivers() -> None:
+    """Verifies that call argument formatting preserves name identity across load permutations and omits custom receivers."""
+    from pydoppelgangerhunt.fixer.synthesis import _format_call_arguments  # pylint: disable=import-outside-toplevel
+
+    # 1. Identical input names in permuted target_inputs must not be swapped
+    inputs = ["alpha", "beta", "gamma"]
+    target_inputs = ["gamma", "alpha", "beta"]
+    param_details = [{"name": "alpha"}, {"name": "beta"}, {"name": "gamma"}]
+    args = _format_call_arguments(inputs, param_details, target_inputs=target_inputs)
+    assert args == "alpha, beta, gamma"
+
+    # 2. Custom instance receiver "this" omitted when receiver_to_omit="self"
+    args_inst = _format_call_arguments(
+        ["this", "value"],
+        [{"name": "this"}, {"name": "value"}],
+        receiver_to_omit="self",
+    )
+    assert args_inst == "value"
+
+    # 3. Custom class receiver "klass" omitted when receiver_to_omit="cls"
+    args_cls = _format_call_arguments(
+        ["klass", "param"],
+        [{"name": "klass"}, {"name": "param"}],
+        receiver_to_omit="cls",
+    )
+    assert args_cls == "param"
+
+    # 4. Custom receivers omitted when receiver_to_omit="receivers"
+    args_rec = _format_call_arguments(
+        ["this", "klass", "data"],
+        [{"name": "this"}, {"name": "klass"}, {"name": "data"}],
+        receiver_to_omit="receivers",
+    )
+    assert args_rec == "data"
+

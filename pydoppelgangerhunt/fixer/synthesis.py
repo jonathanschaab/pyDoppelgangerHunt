@@ -43,7 +43,15 @@ def _format_call_arguments(
     }
     sorted_inputs = sorted(inputs, key=lambda v: _rank_param_kind(v, param_map))
     if target_inputs is not None and len(target_inputs) == len(inputs):
-        inp_to_target = dict(zip(inputs, target_inputs))
+        if set(inputs) == set(target_inputs):
+            inp_to_target = {k: k for k in inputs}
+        else:
+            common_names = set(inputs) & set(target_inputs)
+            inp_to_target = {k: k for k in common_names}
+            rem_inputs = [k for k in inputs if k not in common_names]
+            rem_targets = [k for k in target_inputs if k not in common_names]
+            for h_var, t_var in zip(rem_inputs, rem_targets):
+                inp_to_target[h_var] = t_var
         sorted_targets = [inp_to_target.get(k, k) for k in sorted_inputs]
     else:
         sorted_targets = sorted_inputs
@@ -55,7 +63,9 @@ def _format_call_arguments(
         if receiver_to_omit and (
             clean_t == receiver_to_omit
             or clean_h == receiver_to_omit
-            or (receiver_to_omit == "receivers" and clean_t in ("self", "cls"))
+            or (receiver_to_omit == "self" and clean_t in ("self", "this"))
+            or (receiver_to_omit == "cls" and clean_t in ("cls", "klass"))
+            or (receiver_to_omit == "receivers" and clean_t in ("self", "cls", "this", "klass"))
         ):
             continue
         kind = param_map.get(clean_h, "")
@@ -185,7 +195,7 @@ def _format_helper_parameters(
     # Validate and ensure canonical argument kind ordering (primary receiver -> secondary receiver -> pos -> vararg -> kwonly -> kwarg)
     primary_receiver = receiver_param or ("cls" if is_class_receiver else "self")
     secondary_receiver = "self" if is_class_receiver else "cls"
-    all_receivers = {primary_receiver, "self", "cls"}
+    all_receivers = {primary_receiver, "self", "cls", "this", "klass"}
 
     def _kind_rank(desc: Dict[str, Any]) -> Tuple[int, int]:
         var = desc["var"]

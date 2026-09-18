@@ -1112,7 +1112,11 @@ def _rank_param_kind(
 ) -> int:
     """Returns canonical parameter sorting rank: receiver=0, pos=1, vararg=2, kwonly=3, kwarg=4."""
     clean = var_name.lstrip("*")
-    valid_receivers = tuple(receiver_names) if receiver_names is not None else ("self", "cls")
+    valid_receivers = (
+        tuple(receiver_names)
+        if receiver_names is not None
+        else ("self", "cls", "this", "klass")
+    )
     if clean in valid_receivers:
         return 0
     kind = param_map.get(clean, "pos")

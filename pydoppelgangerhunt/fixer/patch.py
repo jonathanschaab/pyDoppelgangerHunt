@@ -842,6 +842,17 @@ def generate_refactoring_patch(
             if v not in s2.get("globals", [])
             and v not in s2.get("nonlocals", [])
         ]
+        if set(u2_outs) == set(outputs):
+            target_outs2 = outputs
+        elif len(u2_outs) == len(outputs):
+            out_map = {o: o for o in set(outputs) & set(u2_outs)}
+            rem_o = [o for o in outputs if o not in out_map]
+            rem_u2 = [o for o in u2_outs if o not in out_map]
+            for o1, o2 in zip(rem_o, rem_u2):
+                out_map[o1] = o2
+            target_outs2 = [out_map.get(o, o) for o in outputs]
+        else:
+            target_outs2 = outputs
         t_inputs1 = list(s1.get("inputs", []))
         t_inputs2 = list(s2.get("inputs", []))
         if effective_binding == "module":
@@ -941,7 +952,7 @@ def generate_refactoring_patch(
             outputs=outputs,
             scope=scope,
             target_inputs=t_inputs1,
-            target_outputs=u1_outs if len(u1_outs) == len(outputs) else outputs,
+            target_outputs=outputs,
             await_prefix=await_prefix,
             step=step,
         )
@@ -959,7 +970,7 @@ def generate_refactoring_patch(
                 outputs=outputs,
                 scope=scope,
                 target_inputs=t_inputs2,
-                target_outputs=u2_outs if len(u2_outs) == len(outputs) else outputs,
+                target_outputs=target_outs2,
                 await_prefix=await_prefix,
                 step=step,
             )
@@ -996,7 +1007,7 @@ def generate_refactoring_patch(
                     outputs=outputs,
                     scope=scope,
                     target_inputs=t_inputs2,
-                    target_outputs=u2_outs if len(u2_outs) == len(outputs) else outputs,
+                    target_outputs=target_outs2,
                     await_prefix=await_prefix,
                     step=step2,
                 )
