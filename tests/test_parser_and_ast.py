@@ -1159,3 +1159,140 @@ def test_batch_50_parser_and_baseline_deep_hardening(tmp_path: Path) -> None:
     assert res_dirty.pruned_count == 0
     assert res_dirty.retained_count == 1
     assert res_dirty.skipped_dirty_count == 1
+
+
+def test_parser_harvests_token_columns(tmp_path: Path) -> None:
+    """Verifies that parser._record_unit stores start_col and end_col on harvested units."""
+    from pydoppelgangerhunt.parser import harvest_file_units  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def add(x: int, y: int) -> int:\n"
+        "    # Some logic\n"
+        "    total = x + y\n"
+        "    return total\n"
+    )
+    f = tmp_path / "sample.py"
+    f.write_text(code, encoding="utf-8")
+
+    units = harvest_file_units(str(f), str(tmp_path), min_lines=2, min_tokens=3)
+    assert units
+    for u in units:
+        assert "start_col" in u
+        assert "end_col" in u
+        assert isinstance(u["start_col"], int)
+
+def test_parser_harvests_enclosing_class(tmp_path: Path) -> None:
+    """Verifies that parser sets enclosing_class across methods, blocks, and sliding windows."""
+    from pydoppelgangerhunt.parser import harvest_file_units  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "class OrderService:\n"
+        "    def process_order(self, order_id: int) -> bool:\n"
+        "        if order_id > 0:\n"
+        "            status = True\n"
+        "            return status\n"
+        "        return False\n"
+        "\n"
+        "def top_level(x: int) -> int:\n"
+        "    y = x + 1\n"
+        "    return y\n"
+    )
+    f = tmp_path / "order.py"
+    f.write_text(code, encoding="utf-8")
+
+    units = harvest_file_units(str(f), str(tmp_path), min_lines=2, min_tokens=3)
+    method_unit = next(u for u in units if u["name"] == "process_order")
+    assert method_unit.get("enclosing_class") == "OrderService"
+
+    top_unit = next(u for u in units if u["name"] == "top_level")
+    assert top_unit.get("enclosing_class") is None
+
+def test_class_level_comprehensions_harvest_enclosing_class(tmp_path: Path) -> None:
+    """Verifies that comprehensions defined directly in class body have enclosing_class set."""
+    f = tmp_path / "settings.py"
+    code = (
+        "class Settings:\n"
+        "    KEYS = [k.upper() for k in ('a', 'b', 'c')]\n"
+        "    MAP = {k: k * 2 for k in range(5)}\n"
+    )
+    f.write_text(code, encoding="utf-8")
+    units = harvest_file_units(str(f), str(tmp_path), comprehensions=True)
+    comps = [u for u in units if u.get("kind") == "comprehension"]
+    assert len(comps) >= 2
+    for comp in comps:
+        assert comp.get("enclosing_class") == "Settings"
+        assert comp.get("name", "").startswith("Settings:")
+
+def test_harvest_file_units_records_receiver_kind_and_is_static(tmp_path: Path) -> None:
+    """Verifies that harvest_file_units records receiver_kind and is_static."""
+    code = (
+        "class Service:\n"
+        "    def inst_m(self, x: int) -> int:\n"
+        "        y = x\n"
+        "        return y + 1\n"
+        "\n"
+        "    @classmethod\n"
+        "    def cls_m(cls, x: int) -> int:\n"
+        "        y = x\n"
+        "        return y + 1\n"
+        "\n"
+        "    @staticmethod\n"
+        "    def stat_m(x: int) -> int:\n"
+        "        y = x\n"
+        "        return y + 1\n"
+    )
+    f = tmp_path / "svc.py"
+    f.write_text(code, encoding="utf-8")
+    units = harvest_file_units(str(f), str(tmp_path), min_lines=2, min_tokens=1)
+    by_name = {u["name"]: u for u in units}
+
+    assert by_name["inst_m"]["receiver_kind"] == "instance"
+    assert by_name["inst_m"]["is_static"] is False
+
+    assert by_name["cls_m"]["receiver_kind"] == "class"
+    assert by_name["cls_m"]["is_static"] is False
+
+    assert by_name["stat_m"]["receiver_kind"] == "static"
+    assert by_name["stat_m"]["is_static"] is True
+
+def test_harvest_file_units_nested_function_receiver_kind_isolation(tmp_path: Path) -> None:
+    """Verifies that nested functions inside methods do not acquire receiver_kind='instance' when closures are disabled."""
+    code = (
+        "class Worker:\n"
+        "    def run(self, data: list):\n"
+        "        def inner(x: int) -> int:\n"
+        "            y = x * 2\n"
+        "            return y\n"
+        "        return [inner(v) for v in data]\n"
+    )
+    f = tmp_path / "nested_worker.py"
+    f.write_text(code, encoding="utf-8")
+
+    units = harvest_file_units(str(f), repo_root=str(tmp_path), min_lines=1, min_tokens=1, harvest_closures=False)
+    inner_u = next((u for u in units if u["name"] == "inner"), None)
+    assert inner_u is not None
+    assert inner_u.get("receiver_kind") is None
+    assert inner_u.get("is_static") is False
+
+def test_batch_83_comprehension_in_method_argument_annotation(tmp_path: Path) -> None:
+    """Verifies that comprehensions embedded inside method argument annotations record enclosing_class correctly."""
+    from pydoppelgangerhunt.parser import harvest_file_units  # pylint: disable=import-outside-toplevel
+
+    f = tmp_path / "handler.py"
+    code = (
+        "class Handler:\n"
+        "    def process(\n"
+        "        self,\n"
+        "        flags: list = [x for x in (1, 2)],\n"
+        "        *, \n"
+        "        options: dict = {k: v for k, v in [('a', 1)]}\n"
+        "    ) -> None:\n"
+        "        pass\n"
+    )
+    f.write_text(code, encoding="utf-8")
+
+    units = harvest_file_units(str(f), repo_root=str(tmp_path), min_lines=1, min_tokens=1, comprehensions=True)
+    comp_units = [u for u in units if u.get("kind") == "comprehension"]
+    assert len(comp_units) == 2
+    for comp in comp_units:
+        assert comp.get("enclosing_class") == "Handler"

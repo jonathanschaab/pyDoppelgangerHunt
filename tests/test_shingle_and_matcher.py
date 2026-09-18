@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
 from pydoppelgangerhunt import (
     get_ast_characteristic_vector,
@@ -1139,3 +1140,56 @@ def test_batch_70_review_fixes(tmp_path: Path) -> None:
     assert len(try_units) > 0
 
 
+def test_corpus_sensitivity_stop_shingle_pruning_on_differential_runs(tmp_path: Path) -> None:
+    """Verifies that dynamic stop-shingle pruning activates on small corpora (differential PR runs)."""
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    # Create a small module with 6 distinct utility functions sharing common boilerplate logging/guards
+    code_lines = []
+    for i in range(6):
+        code_lines.append(
+            f"def compute_metric_{i}(data: int) -> int:\n"
+            f"    # Standard boilerplate logger invocation\n"
+            f"    if __name__ == '__main__':\n"
+            f"        pass\n"
+            f"    # Distinct algorithmic computation\n"
+            f"    return data ** {i + 2} + {i * 100}\n"
+        )
+    src_file = tmp_path / "pr_diff_sample.py"
+    src_file.write_text("\n".join(code_lines), encoding="utf-8")
+
+    # With min_corpus_size=4 and max_index_frequency=0.25 on a 6-unit corpus:
+    # max_posting_len = max(2, ceil(6 * 0.25)) = 2.
+    # The boilerplate guard appearing in all 6 functions has posting len 6 > 2, so it is pruned!
+    # Because each function's algorithm is distinct, no spurious clones are reported:
+    clones_pruned = scan_target(
+        str(tmp_path),
+        threshold=0.85,
+        min_lines=3,
+        min_tokens=5,
+        max_index_frequency=0.25,
+        min_corpus_size=4,
+    )
+    assert len(clones_pruned) == 0
+
+def test_batch_82_matcher_sloc_and_priority_score_bounds() -> None:
+    """Verifies that compute_priority_score and SLOC sorting handle inverted or synthetic line bounds defensively."""
+    from pydoppelgangerhunt.matcher import compute_priority_score  # pylint: disable=import-outside-toplevel
+
+    u1 = {"start": 20, "end": 10, "complexity": -5, "token_count": 50, "name": "bad1", "file": "f1.py"}
+    u2 = {"start": 30, "end": 15, "complexity": 0, "token_count": 50, "name": "bad2", "file": "f2.py"}
+    score = compute_priority_score(0.9, u1, u2)
+    assert score == 0.0
+
+    clone_pairs: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = [
+        (0.9, u1, u2),
+        (0.8, {"start": 1, "end": 5}, {"start": 1, "end": 5}),
+    ]
+    clone_pairs.sort(
+        key=lambda x: (
+            max(0, int(x[1].get("end") or int(x[1].get("start") or 1)) - int(x[1].get("start") or 1) + 1)
+            + max(0, int(x[2].get("end") or int(x[2].get("start") or 1)) - int(x[2].get("start") or 1) + 1)
+        ),
+        reverse=True,
+    )
+    assert len(clone_pairs) == 2
