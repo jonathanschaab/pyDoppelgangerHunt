@@ -1846,8 +1846,11 @@ def test_generate_refactoring_patch_cross_module_auto_prevents_circular_import(t
     assert run_proc.stdout.strip() == "12 12"
 
 
-def test_generate_refactoring_patch_cross_module_when_f2_is_already_shared_module(tmp_path: Path) -> None:
-    """Verifies consolidating when the second duplicate is already located in the shared module."""
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_generate_refactoring_patch_cross_module_when_one_file_is_already_shared_module(
+    tmp_path: Path, reverse_order: bool
+) -> None:
+    """Verifies consolidating when either duplicate unit is already located in the shared module."""
     pkg_dir = tmp_path / "shared_pkg"
     pkg_dir.mkdir()
     (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
@@ -1871,19 +1874,22 @@ def test_generate_refactoring_patch_cross_module_when_f2_is_already_shared_modul
     u_worker = {"name": "compute_task", "file": "shared_pkg/worker.py", "start": 1, "end": 3, "kind": "function"}
     u_common = {"name": "compute_common", "file": "shared_pkg/_common.py", "start": 4, "end": 6, "kind": "function"}
 
+    pair = (1.0, u_common, u_worker) if reverse_order else (1.0, u_worker, u_common)
+
     patch = generate_refactoring_patch(
-        [(1.0, u_worker, u_common)],
+        [pair],
         repo_root=str(tmp_path),
         replace_clones=True,
         cross_file_strategy="auto",
     )
 
+    helper_name = "_shared_compute_common_compute_task" if reverse_order else "_shared_compute_task_compute_common"
     # worker.py imports from shared_pkg._common
     assert "--- a/shared_pkg/worker.py" in patch
-    assert "from shared_pkg._common import _shared_compute_task_compute_common" in patch
+    assert f"from shared_pkg._common import {helper_name}" in patch
     # _common.py defines the helper
     assert "--- a/shared_pkg/_common.py" in patch
-    assert "def _shared_compute_task_compute_common" in patch
+    assert f"def {helper_name}" in patch
 
     subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
