@@ -283,6 +283,27 @@ class ModuleDependencyGraph:
             self.adjacency[from_mod] = set()
         self.adjacency[from_mod].add(to_mod)
 
+    def add_import_dependency(
+        self,
+        from_mod: str,
+        raw_import: str,
+        known_modules: Optional[Set[str]] = None,
+    ) -> None:
+        """Adds a dependency edge from from_mod to raw_import, matching package prefixes."""
+        if not from_mod or not raw_import:
+            return
+        if known_modules is None:
+            known_modules = set(self.mod_to_file.keys())
+        if raw_import in known_modules:
+            self.add_dependency(from_mod, raw_import)
+            return
+        parts = raw_import.split(".")
+        for i in range(len(parts), 0, -1):
+            prefix = ".".join(parts[:i])
+            if prefix in known_modules:
+                self.add_dependency(from_mod, prefix)
+                break
+
     def get_dependencies(self, mod_name: str) -> Set[str]:
         """Returns direct dependency module names for a given module."""
         return self.adjacency.get(mod_name, set()).copy()
@@ -401,16 +422,7 @@ class ModuleDependencyGraph:
                 content, mod_name, is_package=(p_file.name == "__init__.py")
             )
             for imp in raw_imports:
-                if imp in known_modules:
-                    graph.add_dependency(mod_name, imp)
-                else:
-                    # Check prefix matching against known packages
-                    parts = imp.split(".")
-                    for i in range(len(parts), 0, -1):
-                        prefix = ".".join(parts[:i])
-                        if prefix in known_modules:
-                            graph.add_dependency(mod_name, prefix)
-                            break
+                graph.add_import_dependency(mod_name, imp, known_modules=known_modules)
         return graph
 
 

@@ -25,6 +25,8 @@ from pydoppelgangerhunt.fixer.binding import (
 )
 from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
+    _parse_source_imports,
+    _resolve_relative_import_path,
     build_module_graph,
     derive_module_import_path as _derive_module_import_path,
     resolve_shared_module_file,
@@ -673,7 +675,14 @@ def _render_file_patch_plan(
     """Renders a single cumulative unified diff for all modifications in a file plan."""
     if plan.is_new_file:
         deduped_imports = list(dict.fromkeys(plan.missing_imports))
-        formatted_imports = [imp.rstrip("\r\n") + "\n" for imp in deduped_imports]
+        future_imports = [
+            imp for imp in deduped_imports if imp.strip().startswith("from __future__")
+        ]
+        other_imports = [
+            imp for imp in deduped_imports if not imp.strip().startswith("from __future__")
+        ]
+        ordered_imports = future_imports + other_imports
+        formatted_imports = [imp.rstrip("\r\n") + "\n" for imp in ordered_imports]
         new_h_lines: List[str] = []
         for h_code in plan.module_helpers:
             new_h_lines.extend(["\n"] + [ln + "\n" for ln in h_code.splitlines()] + ["\n"])
@@ -760,13 +769,68 @@ def _render_file_patch_plan(
     )
     diff_str = "".join(diff)
     if not diff_str:
+        advisory_comments = [
+            c for c in plan.comments if not c.startswith("# Clone Pair (")
+        ]
+        if advisory_comments:
+            deduped_comments = list(dict.fromkeys(advisory_comments))
+            return "".join(deduped_comments)
         return ""
 
     deduped_comments = list(dict.fromkeys(plan.comments))
     return "".join(deduped_comments) + diff_str
 
 
-def _extract_module_import_statements(source_text: str) -> Dict[str, str]:
+def _is_or_contains_bitor(node: ast.AST) -> bool:
+    """Checks if an AST expression node contains a bitwise OR (|) operator."""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.BitOr):
+            return True
+    return False
+
+
+def _has_future_annotations(source_text: str) -> bool:
+    """Checks whether source_text enables postponed evaluation of annotations via __future__."""
+    if not source_text or "__future__" not in source_text:
+        return False
+    try:
+        tree = ast.parse(source_text)
+    except (SyntaxError, UnicodeDecodeError):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            for alias in node.names:
+                if alias.name == "annotations":
+                    return True
+    return False
+
+
+def _helper_requires_future_annotations(helper_code: str) -> bool:
+    """Detects whether helper annotations use PEP 604 union syntax (|)."""
+    if not helper_code or "|" not in helper_code:
+        return False
+    try:
+        tree = ast.parse(helper_code)
+    except (SyntaxError, UnicodeDecodeError):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            all_args = (
+                getattr(node.args, "posonlyargs", [])
+                + node.args.args
+                + getattr(node.args, "kwonlyargs", [])
+            )
+            for arg in all_args:
+                if arg.annotation and _is_or_contains_bitor(arg.annotation):
+                    return True
+            if node.returns and _is_or_contains_bitor(node.returns):
+                return True
+    return False
+
+
+def _extract_module_import_statements(
+    source_text: str, source_mod: Optional[str] = None
+) -> Dict[str, str]:
     """Maps imported symbol/module names to clean import statements from source text."""
     stmts: Dict[str, str] = {}
     if not source_text.strip():
@@ -787,16 +851,26 @@ def _extract_module_import_statements(source_text: str) -> Dict[str, str]:
                         stmts[name] = f"import {alias.name}"
         elif isinstance(node, ast.ImportFrom):
             level = getattr(node, "level", 0) or 0
+            target_module = ""
             if level == 0 and node.module:
+                target_module = node.module
+            elif level > 0:
+                if source_mod:
+                    target_module = _resolve_relative_import_path(source_mod, level, node.module)
+                else:
+                    dots = "." * level
+                    target_module = f"{dots}{node.module}" if node.module else dots
+
+            if target_module:
                 for alias in node.names:
                     name = alias.asname or alias.name
                     if name != "*":
                         if alias.asname:
                             stmts[name] = (
-                                f"from {node.module} import {alias.name} as {alias.asname}"
+                                f"from {target_module} import {alias.name} as {alias.asname}"
                             )
                         else:
-                            stmts[name] = f"from {node.module} import {alias.name}"
+                            stmts[name] = f"from {target_module} import {alias.name}"
     return stmts
 
 
@@ -804,7 +878,7 @@ def _collect_host_missing_imports(
     host_plan: _FilePatchPlan,
     helper_code: str,
     scope: Dict[str, Any],
-    source_texts: Sequence[str] = (),
+    source_texts: Sequence[Union[str, Tuple[str, Optional[str]]]] = (),
 ) -> List[str]:
     """Computes all required imports for a host plan receiving extracted helper_code.
 
@@ -815,6 +889,25 @@ def _collect_host_missing_imports(
     host_imported = _get_module_imported_names(host_content)
 
     missing: List[str] = []
+
+    # 0. Future annotations for newly synthesized modules or PEP 604 annotations
+    raw_sources = [
+        item[0] if isinstance(item, tuple) else item
+        for item in source_texts
+        if (item[0] if isinstance(item, tuple) else item)
+    ]
+    needs_future = False
+    if host_plan.is_new_file:
+        needs_future = any(_has_future_annotations(s) for s in raw_sources) or (
+            _helper_requires_future_annotations(helper_code)
+        )
+    elif _helper_requires_future_annotations(helper_code) and not _has_future_annotations(
+        host_content
+    ):
+        needs_future = True
+
+    if needs_future and "from __future__ import annotations" not in host_content:
+        missing.append("from __future__ import annotations")
 
     # 1. Typing annotations
     needed_typing = _extract_required_typing_imports(helper_code)
@@ -857,10 +950,14 @@ def _collect_host_missing_imports(
                 elif isinstance(node.ctx, ast.Load):
                     loaded_in_helper.add(node.id)
 
-        for src_text in source_texts:
+        for item in source_texts:
+            if isinstance(item, tuple):
+                src_text, src_mod = item
+            else:
+                src_text, src_mod = item, None
             if not src_text:
                 continue
-            src_imports = _extract_module_import_statements(src_text)
+            src_imports = _extract_module_import_statements(src_text, source_mod=src_mod)
             for loaded_name in sorted(loaded_in_helper):
                 if (
                     loaded_name not in defined_in_helper
@@ -878,6 +975,22 @@ def _collect_host_missing_imports(
                         missing.append(stmt)
 
     return missing
+
+
+def _register_plan_dependencies_in_graph(
+    dg: ModuleDependencyGraph,
+    mod_name: str,
+    file_path: Path,
+    import_stmts: Sequence[str],
+) -> None:
+    """Registers a module and its synthesized import statements into the dependency graph."""
+    if not mod_name or not import_stmts:
+        return
+    dg.add_module(mod_name, file_path)
+    known_modules = set(dg.mod_to_file.keys())
+    raw_imports = _parse_source_imports("\n".join(import_stmts), mod_name)
+    for imp in raw_imports:
+        dg.add_import_dependency(mod_name, imp, known_modules=known_modules)
 
 
 def generate_refactoring_patch(
@@ -1275,11 +1388,12 @@ def generate_refactoring_patch(
                         binding=effective_binding,
                         step=step,
                     )
+            mod1 = _derive_module_import_path(f1_path, root)
             host_imports = _collect_host_missing_imports(
                 host_plan=f1_plan,
                 helper_code=helper_code,
                 scope=scope,
-                source_texts=[orig_text],
+                source_texts=[(orig_text, mod1)],
             )
             _attach_helper_to_plan(
                 f1_plan,
@@ -1316,9 +1430,13 @@ def generate_refactoring_patch(
                                     shared_p, rel_shared, shared_text, is_new_file=False
                                 )
                             except (OSError, UnicodeDecodeError):
-                                shared_plan = _get_plan(
-                                    shared_p, rel_shared, "", is_new_file=True
+                                read_err_msg = (
+                                    f"# Note: Cross-module clone pair; shared module file {rel_shared} "
+                                    f"exists but could not be read; skipping extraction.\n"
                                 )
+                                f1_plan.comments.append(read_err_msg)
+                                f2_plan.comments.append(read_err_msg)
+                                continue
                         else:
                             shared_plan = _get_plan(
                                 shared_p, rel_shared, "", is_new_file=True
@@ -1330,11 +1448,13 @@ def generate_refactoring_patch(
                     ]
 
                 host_plan.module_helpers.append(helper_code)
+                mod1 = _derive_module_import_path(f1_path, root)
+                mod2 = _derive_module_import_path(f2_plan.path, root)
                 host_imports = _collect_host_missing_imports(
                     host_plan=host_plan,
                     helper_code=helper_code,
                     scope=scope,
-                    source_texts=[orig_text, f2_plan.orig_text],
+                    source_texts=[(orig_text, mod1), (f2_plan.orig_text, mod2)],
                 )
                 host_plan.missing_imports.extend(host_imports)
                 host_plan.used_helper_names.add(helper_name)
@@ -1342,6 +1462,12 @@ def generate_refactoring_patch(
 
                 mod_host = _derive_module_import_path(host_plan.path, root)
                 host_disp = normalize_path_string(str(host_plan.rel_path), strip_anchor=False)
+
+                dg = _get_depgraph()
+                if mod_host and host_plan.missing_imports:
+                    _register_plan_dependencies_in_graph(
+                        dg, mod_host, host_plan.path, host_plan.missing_imports
+                    )
 
                 if replace_clones:
                     if host_plan is f1_plan:
@@ -1375,7 +1501,6 @@ def generate_refactoring_patch(
                 for c_plan, c_unit, c_tin, c_tout in callers:
                     c_plan.comments.append(pair_comment)
                     mod_caller = _derive_module_import_path(c_plan.path, root)
-                    dg = _get_depgraph()
                     cycle = (
                         dg.check_cycle_if_added(mod_caller, mod_host)
                         if (mod_caller and mod_host)
@@ -1451,14 +1576,14 @@ def generate_refactoring_patch(
                         target_outs2=target_outs2,
                         await_prefix=await_prefix,
                     )
-                    if mod1 and mod2:
+                    if replace_clones and mod1 and mod2:
                         dg.add_dependency(mod2, mod1)
 
                 host_imports = _collect_host_missing_imports(
                     host_plan=f1_plan,
                     helper_code=helper_code,
                     scope=scope,
-                    source_texts=[orig_text, f2_plan.orig_text],
+                    source_texts=[(orig_text, mod1), (f2_plan.orig_text, mod2)],
                 )
                 _finalize_host_unit_and_helper(
                     plan=f1_plan,
@@ -1481,11 +1606,12 @@ def generate_refactoring_patch(
                 f"# Note: Cross-module clone pair; helper generated in {f1_disp}. "
                 f"Complete refactoring by importing the helper into {f2_disp}.\n"
             )
+            mod1 = _derive_module_import_path(f1_path, root)
             host_imports = _collect_host_missing_imports(
                 host_plan=f1_plan,
                 helper_code=helper_code,
                 scope=scope,
-                source_texts=[orig_text],
+                source_texts=[(orig_text, mod1)],
             )
             _finalize_host_unit_and_helper(
                 plan=f1_plan,

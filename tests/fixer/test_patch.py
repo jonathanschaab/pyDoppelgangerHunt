@@ -6,6 +6,7 @@ import ast
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -2269,3 +2270,188 @@ def test_shared_module_computes_required_imports_for_host(tmp_path: Path) -> Non
     assert "diff --git a/imports_pkg/_common.py b/imports_pkg/_common.py" in patch
     assert "+from typing import List" in patch
     assert "+import math" in patch
+
+
+def test_unreadable_existing_shared_module_skips_gracefully(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that an existing shared module that fails to read does not emit new-file patch."""
+    pkg = tmp_path / "unread_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "f1.py").write_text("def run_a(x):\n    return x * 2\n", encoding="utf-8")
+    (pkg / "f2.py").write_text("def run_b(x):\n    return x * 2\n", encoding="utf-8")
+    shared_file = pkg / "_common.py"
+    shared_file.write_text("# existing unreadable\n", encoding="utf-8")
+
+    orig_read_text = Path.read_text
+
+    def mock_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self.resolve() == shared_file.resolve():
+            raise OSError("Permission denied: unreadable")
+        return orig_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", mock_read_text)
+
+    u1 = {"name": "run_a", "file": "unread_pkg/f1.py", "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "run_b", "file": "unread_pkg/f2.py", "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    # Must NOT emit a new-file patch for _common.py
+    assert "new file mode 100644" not in patch
+    assert "--- /dev/null" not in patch
+    # Must emit advisory notice about existing unreadable file
+    expected_note = (
+        "shared module file unread_pkg/_common.py exists but could not be read; skipping extraction."
+    )
+    assert expected_note in patch
+
+
+def test_relative_imports_preserved_and_translated_in_shared_module(tmp_path: Path) -> None:
+    """Verifies that relative imports in clone files are translated to canonical imports in _common.py."""
+    pkg = tmp_path / "rel_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "helpers.py").write_text("class CustomType:\n    pass\n", encoding="utf-8")
+
+    src_f1 = (
+        "from .helpers import CustomType\n"
+        "\n"
+        "def compute_val(v: CustomType) -> int:\n"
+        "    return 42\n"
+    )
+    src_f2 = (
+        "from .helpers import CustomType\n"
+        "\n"
+        "def compute_other(v: CustomType) -> int:\n"
+        "    return 42\n"
+    )
+    (pkg / "f1.py").write_text(src_f1, encoding="utf-8")
+    (pkg / "f2.py").write_text(src_f2, encoding="utf-8")
+
+    u1 = {"name": "compute_val", "file": "rel_pkg/f1.py", "start": 3, "end": 4, "kind": "function"}
+    u2 = {"name": "compute_other", "file": "rel_pkg/f2.py", "start": 3, "end": 4, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    # _common.py should receive translated canonical import: from rel_pkg.helpers import CustomType
+    assert "diff --git a/rel_pkg/_common.py b/rel_pkg/_common.py" in patch
+    assert "+from rel_pkg.helpers import CustomType" in patch
+
+
+def test_shared_module_host_imports_cycle_detection(tmp_path: Path) -> None:
+    """Verifies that when _common.py gains dependencies on a caller module, cycle is detected and prevented."""
+    pkg = tmp_path / "host_cycle_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src_f1 = (
+        "class HelperDep:\n"
+        "    pass\n"
+        "\n"
+        "def clone_a(x: HelperDep) -> int:\n"
+        "    return 42\n"
+    )
+    src_f2 = (
+        "from host_cycle_pkg.f1 import HelperDep\n"
+        "\n"
+        "def clone_b(x: HelperDep) -> int:\n"
+        "    return 42\n"
+    )
+    (pkg / "f1.py").write_text(src_f1, encoding="utf-8")
+    (pkg / "f2.py").write_text(src_f2, encoding="utf-8")
+
+    u1 = {"name": "clone_a", "file": "host_cycle_pkg/f1.py", "start": 4, "end": 5, "kind": "function"}
+    u2 = {"name": "clone_b", "file": "host_cycle_pkg/f2.py", "start": 3, "end": 4, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    # Because helper uses HelperDep from host_cycle_pkg.f1, _common.py imports host_cycle_pkg.f1.
+    # Therefore, f1 importing _common.py would form f1 -> _common -> f1 cycle!
+    assert "Circular import detected" in patch
+    assert "host_cycle_pkg.f1 -> host_cycle_pkg._common -> host_cycle_pkg.f1" in patch
+
+
+def test_host_module_no_ghost_edge_when_replace_clones_is_false(tmp_path: Path) -> None:
+    """Verifies that replace_clones=False does not insert phantom edges into the dependency graph."""
+    pkg = tmp_path / "ghost_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src_a = "def run_a(x: int) -> int:\n    return x + 1\n"
+    src_b = "def run_b(x: int) -> int:\n    return x + 1\n"
+    (pkg / "mod_a.py").write_text(src_a, encoding="utf-8")
+    (pkg / "mod_b.py").write_text(src_b, encoding="utf-8")
+
+    u_a = {"name": "run_a", "file": "ghost_pkg/mod_a.py", "start": 1, "end": 2, "kind": "function"}
+    u_b = {"name": "run_b", "file": "ghost_pkg/mod_b.py", "start": 1, "end": 2, "kind": "function"}
+
+    # With replace_clones=False, mod_b is NOT wired to import mod_a
+    patch_dry = generate_refactoring_patch(
+        [(1.0, u_a, u_b)],
+        repo_root=str(tmp_path),
+        replace_clones=False,
+        cross_file_strategy="host_module",
+    )
+    assert "from ghost_pkg.mod_a import" not in patch_dry
+    assert "Complete refactoring by importing the helper into ghost_pkg/mod_b.py" in patch_dry
+
+
+def test_future_annotations_propagation_in_shared_module(tmp_path: Path) -> None:
+    """Verifies that from __future__ import annotations is carried over to synthesized shared module."""
+    pkg = tmp_path / "future_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src_f1 = (
+        "from __future__ import annotations\n"
+        "from typing import List\n"
+        "\n"
+        "def process_models(items: List[str] | None) -> int:\n"
+        "    return len(items) if items else 0\n"
+    )
+    src_f2 = (
+        "from __future__ import annotations\n"
+        "from typing import List\n"
+        "\n"
+        "def handle_models(items: List[str] | None) -> int:\n"
+        "    return len(items) if items else 0\n"
+    )
+    (pkg / "f1.py").write_text(src_f1, encoding="utf-8")
+    (pkg / "f2.py").write_text(src_f2, encoding="utf-8")
+
+    u1 = {"name": "process_models", "file": "future_pkg/f1.py", "start": 4, "end": 5, "kind": "function"}
+    u2 = {"name": "handle_models", "file": "future_pkg/f2.py", "start": 4, "end": 5, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "diff --git a/future_pkg/_common.py b/future_pkg/_common.py" in patch
+    assert "+from __future__ import annotations" in patch
+    # Verify from __future__ import annotations comes before other imports in the diff
+    future_idx = patch.find("+from __future__ import annotations")
+    typing_idx = patch.find("+from typing import List")
+    assert future_idx != -1
+    assert typing_idx != -1
+    assert future_idx < typing_idx
+
