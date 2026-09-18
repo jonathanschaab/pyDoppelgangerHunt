@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import keyword
 import os
 from collections import deque
 from pathlib import Path
@@ -130,11 +131,13 @@ def resolve_shared_module_file(
         Path to the shared module file within the nearest common directory.
     """
     common_dir = find_nearest_common_package(file1, file2, repo_root)
-    # Sanitize shared_module_name to a safe filename to prevent path traversal or repository escaping
+    # Sanitize shared_module_name to a safe, valid Python module filename
     raw_name = Path(str(shared_module_name)).name.strip()
-    if not raw_name or raw_name in (".", "..", ".py"):
-        raw_name = "_common.py"
-    clean_name = raw_name if raw_name.endswith(".py") else f"{raw_name}.py"
+    stem = raw_name[:-3] if raw_name.endswith(".py") else raw_name
+    if not stem or not stem.isidentifier() or keyword.iskeyword(stem):
+        clean_name = "_common.py"
+    else:
+        clean_name = f"{stem}.py"
     target = common_dir / clean_name
     try:
         target.resolve().relative_to(common_dir.resolve())
@@ -319,7 +322,7 @@ class ModuleDependencyGraph:
 
         while queue:
             curr = queue.popleft()
-            for neighbor in self.adjacency.get(curr, ()):
+            for neighbor in sorted(self.adjacency.get(curr, ())):
                 # If neighbor is exact target or a prefix of target module
                 if neighbor == to_mod:
                     return True
@@ -345,7 +348,7 @@ class ModuleDependencyGraph:
             if curr == to_mod:
                 found = True
                 break
-            for neighbor in self.adjacency.get(curr, ()):
+            for neighbor in sorted(self.adjacency.get(curr, ())):
                 if neighbor not in visited:
                     visited.add(neighbor)
                     parent[neighbor] = curr

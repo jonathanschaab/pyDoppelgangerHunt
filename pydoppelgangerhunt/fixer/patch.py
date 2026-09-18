@@ -29,6 +29,7 @@ from pydoppelgangerhunt.fixer.depgraph import (
     _resolve_relative_import_path,
     build_module_graph,
     derive_module_import_path as _derive_module_import_path,
+    find_nearest_common_package,
     resolve_shared_module_file,
 )
 from pydoppelgangerhunt.fixer.scope import (
@@ -1271,10 +1272,18 @@ def generate_refactoring_patch(
         )
         target_host_plan: Optional[_FilePatchPlan] = None
         target_host_text: Optional[str] = None
+        cross_file_action = cross_file_strategy
+        if cross_file_action == "auto" and not is_same_file and f2_plan is not None:
+            common_dir = find_nearest_common_package(f1_path, f2_plan.path, root)
+            if common_dir.resolve() in (root.resolve(), (root / "src").resolve()):
+                cross_file_action = "host_module"
+            else:
+                cross_file_action = "shared_module"
+
         if (
             not is_same_file
             and f2_plan is not None
-            and cross_file_strategy in ("auto", "shared_module", "shared")
+            and cross_file_action in ("shared_module", "shared")
         ):
             shared_p = resolve_shared_module_file(
                 f1_path, f2_plan.path, root, shared_module_name=shared_module_name
@@ -1403,7 +1412,7 @@ def generate_refactoring_patch(
                 missing_imports=host_imports,
             )
         elif f2_plan is not None:
-            if cross_file_strategy in ("auto", "shared_module", "shared"):
+            if cross_file_action in ("shared_module", "shared"):
                 shared_p = resolve_shared_module_file(
                     f1_path, f2_plan.path, root, shared_module_name=shared_module_name
                 )
@@ -1547,12 +1556,24 @@ def generate_refactoring_patch(
                         else:
                             c_plan.comments.append(
                                 f"# Note: Cross-module clone pair; helper extracted to {host_disp}. "
-                                f"Complete refactoring by importing the helper into {c_disp}.\n"
+                                f"Complete refactoring by replacing the clone with a call in {c_disp}.\n"
                             )
             else:
                 mod1 = _derive_module_import_path(f1_path, root)
                 mod2 = _derive_module_import_path(f2_plan.path, root)
                 dg = _get_depgraph()
+
+                host_imports = _collect_host_missing_imports(
+                    host_plan=f1_plan,
+                    helper_code=helper_code,
+                    scope=scope,
+                    source_texts=[(orig_text, mod1), (f2_plan.orig_text, mod2)],
+                )
+                if mod1 and host_imports:
+                    _register_plan_dependencies_in_graph(
+                        dg, mod1, f1_plan.path, host_imports
+                    )
+
                 cycle = (
                     dg.check_cycle_if_added(mod2, mod1)
                     if (mod1 and mod2)
@@ -1592,12 +1613,6 @@ def generate_refactoring_patch(
                     if replace_clones and mod1 and mod2:
                         dg.add_dependency(mod2, mod1)
 
-                host_imports = _collect_host_missing_imports(
-                    host_plan=f1_plan,
-                    helper_code=helper_code,
-                    scope=scope,
-                    source_texts=[(orig_text, mod1), (f2_plan.orig_text, mod2)],
-                )
                 _finalize_host_unit_and_helper(
                     plan=f1_plan,
                     unit=u1,

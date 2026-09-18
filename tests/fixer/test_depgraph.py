@@ -157,6 +157,13 @@ def test_resolve_shared_module_file_safe_sanitization(tmp_path: Path) -> None:
     assert resolve_shared_module_file(f1, f2, root, shared_module_name=".") == root / "services" / "_common.py"
     assert resolve_shared_module_file(f1, f2, root, shared_module_name=".py") == root / "services" / "_common.py"
 
+    # Invalid Python identifiers and reserved keywords fall back safely to _common.py
+    assert resolve_shared_module_file(f1, f2, root, shared_module_name="shared-module.py") == root / "services" / "_common.py"
+    assert resolve_shared_module_file(f1, f2, root, shared_module_name="helpers.py.py") == root / "services" / "_common.py"
+    assert resolve_shared_module_file(f1, f2, root, shared_module_name="123helper.py") == root / "services" / "_common.py"
+    assert resolve_shared_module_file(f1, f2, root, shared_module_name="class.py") == root / "services" / "_common.py"
+    assert resolve_shared_module_file(f1, f2, root, shared_module_name="def") == root / "services" / "_common.py"
+
 
 def test_derive_shared_module_import_top_level_fallback(tmp_path: Path) -> None:
     """Verifies that top-level modules without package context fall back to absolute imports."""

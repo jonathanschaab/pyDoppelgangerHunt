@@ -2486,8 +2486,8 @@ def test_shared_module_dry_run_no_ghost_edge_or_caller_import(tmp_path: Path) ->
     # Function bodies are NOT replaced because replace_clones=False
     assert "return _shared_compute_a_compute_b" not in patch
     # Callers receive advisory comments explaining where helper was extracted
-    assert "Complete refactoring by importing the helper into dry_shared_pkg/mod_a.py" in patch
-    assert "Complete refactoring by importing the helper into dry_shared_pkg/mod_b.py" in patch
+    assert "Complete refactoring by replacing the clone with a call in dry_shared_pkg/mod_a.py" in patch
+    assert "Complete refactoring by replacing the clone with a call in dry_shared_pkg/mod_b.py" in patch
 
 
 def test_shared_module_existing_directory_skipped(tmp_path: Path) -> None:
@@ -2517,5 +2517,90 @@ def test_shared_module_existing_directory_skipped(tmp_path: Path) -> None:
 
     assert "is an existing directory; skipping extraction" in patch
     assert "new file mode 100644" not in patch
+
+
+def test_auto_strategy_falls_back_to_host_when_separate_packages(tmp_path: Path) -> None:
+    """Verifies that auto strategy uses host_module instead of polluting repo root when files share no common package."""
+    pkg_a = tmp_path / "pkg_a"
+    pkg_b = tmp_path / "pkg_b"
+    pkg_a.mkdir()
+    pkg_b.mkdir()
+    (pkg_a / "__init__.py").write_text("", encoding="utf-8")
+    (pkg_b / "__init__.py").write_text("", encoding="utf-8")
+
+    src_a = "def process(x: int) -> int:\n    return x * 2 + 10\n"
+    src_b = "def handle(x: int) -> int:\n    return x * 2 + 10\n"
+    (pkg_a / "srv.py").write_text(src_a, encoding="utf-8")
+    (pkg_b / "srv.py").write_text(src_b, encoding="utf-8")
+
+    u_a = {"name": "process", "file": "pkg_a/srv.py", "start": 1, "end": 2, "kind": "function"}
+    u_b = {"name": "handle", "file": "pkg_b/srv.py", "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u_a, u_b)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="auto",
+    )
+
+    # In auto mode, separate packages fall back to host_module rather than repo root _common.py
+    assert "_common.py" not in patch
+    assert "--- a/pkg_a/srv.py" in patch
+    assert "--- a/pkg_b/srv.py" in patch
+    assert "from pkg_a.srv import _shared_process_handle" in patch
+
+
+def test_host_module_detects_cycle_from_synthesized_host_imports(tmp_path: Path) -> None:
+    """Verifies that host_module detects cycle when host gains an import pointing back to caller."""
+    pkg = tmp_path / "host_cycle_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    # mod_b has a helper function used by the clone in mod_b
+    src_b = (
+        "def helper_b(x: int) -> int:\n"
+        "    return x + 1\n"
+        "\n"
+        "def compute_b(x: int) -> int:\n"
+        "    y = helper_b(x)\n"
+        "    return y * 2\n"
+    )
+    src_a = (
+        "def helper_b(x: int) -> int:\n"
+        "    return x + 1\n"
+        "\n"
+        "def compute_a(x: int) -> int:\n"
+        "    y = helper_b(x)\n"
+        "    return y * 2\n"
+    )
+    (pkg / "mod_a.py").write_text(src_a, encoding="utf-8")
+    (pkg / "mod_b.py").write_text(src_b, encoding="utf-8")
+
+    u_a = {"name": "compute_a", "file": "host_cycle_pkg/mod_a.py", "start": 4, "end": 6, "kind": "function"}
+    u_b = {"name": "compute_b", "file": "host_cycle_pkg/mod_b.py", "start": 4, "end": 6, "kind": "function"}
+
+    # Pre-wire mod_a to import mod_b so mod_a -> mod_b
+    src_a_with_import = (
+        "from host_cycle_pkg.mod_b import helper_b\n"
+        "\n"
+        "def compute_a(x: int) -> int:\n"
+        "    y = helper_b(x)\n"
+        "    return y * 2\n"
+    )
+    (pkg / "mod_a.py").write_text(src_a_with_import, encoding="utf-8")
+    u_a["start"] = 3
+    u_a["end"] = 5
+
+    # If mod_b were to import mod_a, cycle mod_b -> mod_a -> mod_b would form
+    patch = generate_refactoring_patch(
+        [(1.0, u_a, u_b)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="host_module",
+    )
+
+    assert "Circular import detected" in patch or "Circular import or unresolvable module path" in patch
+    assert "from host_cycle_pkg.mod_a import _shared_compute_a_compute_b" not in patch
+
 
 
