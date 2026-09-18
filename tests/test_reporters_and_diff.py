@@ -8977,3 +8977,34 @@ def test_generator_helper_synthesis_literal_yields(tmp_path: Path) -> None:
 
     helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert "-> Iterator[int]:" in helper
+
+
+def test_is_docstring_node_and_extract_docstring_end_line() -> None:
+    """Verifies that _is_docstring_node and _extract_docstring_end_line accurately detect docstrings."""
+    from pydoppelgangerhunt.fixer import (  # pylint: disable=import-outside-toplevel
+        _extract_docstring_end_line,
+        _is_docstring_node,
+    )
+
+    # 1. Non-docstrings: None, Call, Constant int
+    assert not _is_docstring_node(None)
+    assert not _is_docstring_node(ast.parse("pass").body[0])
+    assert not _is_docstring_node(ast.parse("42").body[0])
+    assert not _is_docstring_node(ast.parse("print('hi')").body[0])
+
+    # 2. String constant docstring node
+    doc_node = ast.parse("'''docstring'''").body[0]
+    assert _is_docstring_node(doc_node)
+
+    # 3. _extract_docstring_end_line on module and function with multiline docstring
+    tree_multiline = ast.parse('"""Line 1\nLine 2\nLine 3"""\nx = 1\n')
+    assert _extract_docstring_end_line(tree_multiline) == 3
+
+    # 4. _extract_docstring_end_line with no docstring
+    tree_no_doc = ast.parse("x = 1\ny = 2\n")
+    assert _extract_docstring_end_line(tree_no_doc) == 0
+
+    # 5. _extract_docstring_end_line on a function node
+    fn_tree = ast.parse("def f():\n    '''Function docstring.'''\n    return 10\n")
+    assert _extract_docstring_end_line(fn_tree.body[0]) == 2
+

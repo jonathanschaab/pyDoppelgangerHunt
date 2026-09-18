@@ -1117,6 +1117,27 @@ def _format_call_arguments(
     return ", ".join(formatted_args)
 
 
+def _is_docstring_node(node: Optional[ast.AST]) -> bool:
+    """Returns True if the AST node is a string literal docstring expression."""
+    return bool(
+        node is not None
+        and isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    )
+
+
+def _extract_docstring_end_line(tree: ast.AST) -> int:
+    """Extracts the end line number of a module- or function-level docstring if present."""
+    body = getattr(tree, "body", [])
+    if body and _is_docstring_node(body[0]):
+        return int(getattr(body[0], "end_lineno", getattr(body[0], "lineno", 0)))
+    return 0
+
+
+_extract_module_docstring_end_line = _extract_docstring_end_line
+
+
 def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List[str]:
     """Extracts executable body lines for a unit, stripping function headers and docstrings for whole functions."""
     if unit.get("kind") not in ("function", "closure", "method"):
@@ -1131,12 +1152,7 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
         ):
             fn_node = tree.body[0]
             body_nodes = list(fn_node.body)
-            if (
-                body_nodes
-                and isinstance(body_nodes[0], ast.Expr)
-                and isinstance(body_nodes[0].value, ast.Constant)
-                and isinstance(body_nodes[0].value.value, str)
-            ):
+            if body_nodes and _is_docstring_node(body_nodes[0]):
                 body_nodes = body_nodes[1:]
             if body_nodes:
                 d_lines = dedented.splitlines()
@@ -1182,19 +1198,6 @@ def _find_header_cookie_boundary(lines: List[str]) -> int:
             boundary = max(boundary, idx + 1)
 
     return boundary
-
-
-def _extract_module_docstring_end_line(tree: ast.AST) -> int:
-    """Extracts the end line number of a module-level docstring if present."""
-    body = getattr(tree, "body", [])
-    if (
-        body
-        and isinstance(body[0], ast.Expr)
-        and isinstance(body[0].value, ast.Constant)
-        and isinstance(body[0].value.value, str)
-    ):
-        return int(getattr(body[0], "end_lineno", getattr(body[0], "lineno", 0)))
-    return 0
 
 
 def _find_module_helper_insertion_index(lines: List[str]) -> int:
@@ -3160,11 +3163,7 @@ def _build_whole_method_delegation(
                     header = "".join(lines[u_start - 1 : fn_def_line - 1]) + same_line + "\n"
                 else:
                     sig_end_line = first_body.lineno - 1
-                    if (
-                        isinstance(first_body, ast.Expr)
-                        and isinstance(first_body.value, ast.Constant)
-                        and isinstance(first_body.value.value, str)
-                    ):
+                    if _is_docstring_node(first_body):
                         docstring_end_line = getattr(first_body, "end_lineno", first_body.lineno)
     except SyntaxError:
         pass

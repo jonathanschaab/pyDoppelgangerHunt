@@ -1219,16 +1219,7 @@ def harvest_file_units(
                 unit_name = node.name
 
             # 1. Whole function / closure unit: omit thin 1-statement delegate wrappers
-            doc_offset = (
-                1
-                if (
-                    node.body
-                    and isinstance(node.body[0], ast.Expr)
-                    and isinstance(node.body[0].value, ast.Constant)
-                    and isinstance(node.body[0].value.value, str)
-                )
-                else 0
-            )
+            doc_offset = 1 if _get_docstring_node(node) is not None else 0
             if len(node.body) - doc_offset > 1 or is_closure:
                 _record_node_unit(
                     units,
