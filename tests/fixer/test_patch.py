@@ -952,6 +952,7 @@ def test_generate_refactoring_patch_cross_module_with_import_and_execution(tmp_p
         [(1.0, u_a, u_b)],
         repo_root=str(tmp_path),
         replace_clones=True,
+        cross_file_strategy="host",
     )
 
     # 1. Diff includes both files
@@ -1010,6 +1011,7 @@ def test_generate_refactoring_patch_cross_module_circular_import_safety(tmp_path
         [(1.0, u_a, u_b)],
         repo_root=str(tmp_path),
         replace_clones=True,
+        cross_file_strategy="host",
     )
 
     # File 2 is NOT refactored with an unsafe circular import
@@ -1197,6 +1199,7 @@ def test_cross_module_helper_name_collision_deduplication(tmp_path: Path) -> Non
         [(1.0, u1, u2)],
         repo_root=str(tmp_path),
         replace_clones=True,
+        cross_file_strategy="host",
     )
     assert "_shared_handle_data_process_data_2" in patch
     assert "from coll_pkg.f1 import _shared_handle_data_process_data_2" in patch
@@ -1636,4 +1639,209 @@ def test_generate_refactoring_patch_permuted_outputs_alignment(tmp_path: Path) -
     assert "+    x, y = _shared_compute_1" in patch
     assert "y, x = _shared_compute_1" not in patch
 
+
+def test_generate_refactoring_patch_cross_module_auto_creates_common_module(tmp_path: Path) -> None:
+    """Verifies that auto cross-module strategy synthesizes _common.py and decouples siblings."""
+    pkg_dir = tmp_path / "service_pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    src_a = (
+        "def compute_alpha(x: int) -> int:\n"
+        "    step1 = x * 10\n"
+        "    step2 = step1 + 7\n"
+        "    return step2\n"
+    )
+    src_b = (
+        "def compute_beta(v: int) -> int:\n"
+        "    step1 = v * 10\n"
+        "    step2 = step1 + 7\n"
+        "    return step2\n"
+    )
+    f_a = pkg_dir / "srv_a.py"
+    f_b = pkg_dir / "srv_b.py"
+    f_a.write_text(src_a, encoding="utf-8")
+    f_b.write_text(src_b, encoding="utf-8")
+
+    u_a = {"name": "compute_alpha", "file": "service_pkg/srv_a.py", "start": 1, "end": 4, "kind": "function"}
+    u_b = {"name": "compute_beta", "file": "service_pkg/srv_b.py", "start": 1, "end": 4, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u_a, u_b)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="auto",
+    )
+
+    # 1. Diff includes both files plus the new shared utility module
+    assert "--- a/service_pkg/srv_a.py" in patch
+    assert "--- a/service_pkg/srv_b.py" in patch
+    assert "diff --git a/service_pkg/_common.py b/service_pkg/_common.py" in patch
+    assert "new file mode 100644" in patch
+    assert "--- /dev/null" in patch
+    assert "+++ b/service_pkg/_common.py" in patch
+
+    # 2. Both files import from service_pkg._common
+    assert "from service_pkg._common import _shared_compute_alpha_compute_beta" in patch
+    # Sibling modules do not import each other
+    assert "from service_pkg.srv_a import" not in patch
+    assert "from service_pkg.srv_b import" not in patch
+
+    # 3. Verify git apply and execution
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+    assert (pkg_dir / "_common.py").is_file()
+
+    run_proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from service_pkg.srv_a import compute_alpha; from service_pkg.srv_b import compute_beta; print(compute_alpha(5), compute_beta(5))",
+        ],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run_proc.returncode == 0
+    assert run_proc.stdout.strip() == "57 57"
+
+
+def test_generate_refactoring_patch_cross_module_auto_preserves_existing_common_module(tmp_path: Path) -> None:
+    """Verifies that auto strategy cleanly appends to an already-existing _common.py without overwriting."""
+    pkg_dir = tmp_path / "service_pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+    existing_common = (
+        "def existing_utility() -> str:\n"
+        "    return 'preserved'\n"
+    )
+    (pkg_dir / "_common.py").write_text(existing_common, encoding="utf-8")
+
+    src_a = (
+        "def do_calc_a(x: int) -> int:\n"
+        "    res = x * 3 + 1\n"
+        "    return res\n"
+    )
+    src_b = (
+        "def do_calc_b(x: int) -> int:\n"
+        "    res = x * 3 + 1\n"
+        "    return res\n"
+    )
+    (pkg_dir / "calc_a.py").write_text(src_a, encoding="utf-8")
+    (pkg_dir / "calc_b.py").write_text(src_b, encoding="utf-8")
+
+    u_a = {"name": "do_calc_a", "file": "service_pkg/calc_a.py", "start": 1, "end": 3, "kind": "function"}
+    u_b = {"name": "do_calc_b", "file": "service_pkg/calc_b.py", "start": 1, "end": 3, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u_a, u_b)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="auto",
+    )
+
+    # Modified existing _common.py (not new file mode)
+    assert "new file mode 100644" not in patch
+    assert "--- a/service_pkg/_common.py" in patch
+    assert "+++ b/service_pkg/_common.py" in patch
+
+    # Apply git diff
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    run_proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from service_pkg._common import existing_utility; "
+            "from service_pkg.calc_a import do_calc_a; "
+            "from service_pkg.calc_b import do_calc_b; "
+            "print(existing_utility(), do_calc_a(10), do_calc_b(10))",
+        ],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run_proc.returncode == 0
+    assert run_proc.stdout.strip() == "preserved 31 31"
+
+
+def test_generate_refactoring_patch_cross_module_auto_prevents_circular_import(tmp_path: Path) -> None:
+    """Verifies that synthesizing _common.py eliminates sibling circular dependencies even when imports exist."""
+    pkg_dir = tmp_path / "cyclic_pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    src_a = (
+        "import cyclic_pkg.mod_b\n\n"
+        "def work_a(x: int) -> int:\n"
+        "    y = x + 1\n"
+        "    return y * 2\n"
+    )
+    src_b = (
+        "def work_b(x: int) -> int:\n"
+        "    y = x + 1\n"
+        "    return y * 2\n"
+    )
+    (pkg_dir / "mod_a.py").write_text(src_a, encoding="utf-8")
+    (pkg_dir / "mod_b.py").write_text(src_b, encoding="utf-8")
+
+    u_a = {"name": "work_a", "file": "cyclic_pkg/mod_a.py", "start": 3, "end": 5, "kind": "function"}
+    u_b = {"name": "work_b", "file": "cyclic_pkg/mod_b.py", "start": 1, "end": 3, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u_a, u_b)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="auto",
+    )
+
+    # In auto mode, _common.py is synthesized and neither sibling imports the other for the helper
+    assert "--- a/cyclic_pkg/mod_a.py" in patch
+    assert "--- a/cyclic_pkg/mod_b.py" in patch
+    assert "from cyclic_pkg._common import _shared_work_a_work_b" in patch
+
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    run_proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import cyclic_pkg.mod_a; import cyclic_pkg.mod_b; "
+            "print(cyclic_pkg.mod_a.work_a(5), cyclic_pkg.mod_b.work_b(5))",
+        ],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run_proc.returncode == 0
+    assert run_proc.stdout.strip() == "12 12"
 

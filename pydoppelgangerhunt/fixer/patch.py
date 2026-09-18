@@ -23,6 +23,12 @@ from pydoppelgangerhunt.fixer.binding import (
     find_enclosing_class,
     find_enclosing_function,
 )
+from pydoppelgangerhunt.fixer.depgraph import (
+    ModuleDependencyGraph,
+    build_module_graph,
+    derive_module_import_path as _derive_module_import_path,
+    resolve_shared_module_file,
+)
 from pydoppelgangerhunt.fixer.scope import (
     _normalize_receiver_attrs,
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
@@ -453,28 +459,7 @@ def _build_unit_delegation_call(
     return f"{indent}{prefix}{call_expr}\n"
 
 
-def _derive_module_import_path(file_path: Union[Path, str], repo_root: Union[Path, str]) -> str:
-    """Derives the importable Python module dot-path for a file relative to repository root.
 
-    Handles flat layouts (foo.py -> foo), package layouts (pkg/mod.py -> pkg.mod),
-    PEP 517/518 src layouts (src/pkg/mod.py -> pkg.mod), and __init__.py files (pkg/__init__.py -> pkg).
-    """
-    p_file = Path(file_path)
-    p_root = Path(repo_root)
-    try:
-        rel = p_file.resolve().relative_to(p_root.resolve())
-    except ValueError:
-        rel = p_file
-    parts = list(rel.parts)
-    if parts and parts[0] == "src":
-        parts = parts[1:]
-    if not parts:
-        return ""
-    if parts[-1].endswith(".py"):
-        parts[-1] = parts[-1][:-3]
-    if parts[-1] == "__init__":
-        parts = parts[:-1]
-    return ".".join(parts)
 
 
 def _module_imports_target(source_text: str, target_module: str) -> bool:
@@ -504,11 +489,18 @@ def _module_imports_target(source_text: str, target_module: str) -> bool:
 class _FilePatchPlan:
     """Internal accumulator of proposed transformations for a single file."""
 
-    def __init__(self, file_path: Path, orig_text: str, rel_path: str) -> None:
+    def __init__(
+        self,
+        file_path: Path,
+        orig_text: str,
+        rel_path: str,
+        is_new_file: bool = False,
+    ) -> None:
         self.path = file_path
         self.orig_text = orig_text
-        self.orig_lines = orig_text.splitlines(keepends=True)
+        self.orig_lines = [] if is_new_file else orig_text.splitlines(keepends=True)
         self.rel_path = rel_path
+        self.is_new_file = is_new_file
         self.replacements: List[Tuple[Dict[str, Any], str]] = []
         self.method_helpers: List[Tuple[int, str]] = []
         self.module_helpers: List[str] = []
@@ -540,12 +532,130 @@ def _adjust_line_for_replacements(
     return max(1, target_line + offset)
 
 
+def _delegate_unit_in_plan(
+    unit: Dict[str, Any],
+    plan: _FilePatchPlan,
+    helper_name: str,
+    inputs: List[str],
+    outputs: List[str],
+    scope: Dict[str, Any],
+    target_inputs: Optional[List[str]],
+    target_outputs: Optional[List[str]],
+    await_prefix: str,
+    binding: str = "module",
+    step: Optional[str] = None,
+) -> None:
+    """Builds and records a delegation call replacement for a unit inside a file plan."""
+    if step is None:
+        u_s = int(unit.get("start") or 1)
+        u_lead = plan.orig_lines[u_s - 1] if 1 <= u_s <= len(plan.orig_lines) else ""
+        u_ind = u_lead[: len(u_lead) - len(u_lead.lstrip())]
+        step = _detect_indent_step(u_ind)
+
+    rep_stmt = _build_unit_delegation_call(
+        unit,
+        plan.orig_text,
+        plan.orig_lines,
+        effective_binding=binding,
+        helper_name=helper_name,
+        inputs=inputs,
+        outputs=outputs,
+        scope=scope,
+        target_inputs=target_inputs,
+        target_outputs=target_outputs,
+        await_prefix=await_prefix,
+        step=step,
+    )
+    plan.replacements.append((unit, rep_stmt))
+    plan.claimed_units.append(unit)
+
+
+def _wire_cross_module_host_delegation(
+    f1_plan: _FilePatchPlan,
+    f2_plan: _FilePatchPlan,
+    u2: Dict[str, Any],
+    mod1: str,
+    helper_name: str,
+    pair_comment: str,
+    f1_disp: str,
+    f2_disp: str,
+    replace_clones: bool,
+    inputs: List[str],
+    outputs: List[str],
+    scope: Dict[str, Any],
+    t_inputs2: Optional[List[str]],
+    target_outs2: Optional[List[str]],
+    await_prefix: str,
+) -> None:
+    """Wires cross-module import and delegation from target module to host module."""
+    if replace_clones:
+        f2_plan.comments.append(pair_comment)
+        f2_plan.missing_imports.append(f"from {mod1} import {helper_name}")
+        _delegate_unit_in_plan(
+            u2,
+            f2_plan,
+            helper_name=helper_name,
+            inputs=inputs,
+            outputs=outputs,
+            scope=scope,
+            target_inputs=t_inputs2,
+            target_outputs=target_outs2,
+            await_prefix=await_prefix,
+            binding="module",
+        )
+    else:
+        f1_plan.comments.append(
+            f"# Note: Cross-module clone pair; helper generated in {f1_disp}. "
+            f"Complete refactoring by importing the helper into {f2_disp}.\n"
+        )
+
+
+def _attach_helper_to_plan(
+    plan: _FilePatchPlan,
+    binding: str,
+    insert_line: int,
+    helper_code: str,
+    missing_imports: Sequence[str],
+) -> None:
+    """Attaches a synthesized helper and its missing imports to the designated file plan."""
+    if binding == "method":
+        plan.method_helpers.append((insert_line, helper_code))
+    else:
+        plan.module_helpers.append(helper_code)
+    plan.missing_imports.extend(missing_imports)
+
+
 def _render_file_patch_plan(
     plan: _FilePatchPlan,
     replace_clones: bool,
     repo_root: Optional[str] = None,
 ) -> str:
     """Renders a single cumulative unified diff for all modifications in a file plan."""
+    if plan.is_new_file:
+        deduped_imports = list(dict.fromkeys(plan.missing_imports))
+        formatted_imports = [imp.rstrip("\r\n") + "\n" for imp in deduped_imports]
+        new_h_lines: List[str] = []
+        for h_code in plan.module_helpers:
+            new_h_lines.extend(["\n"] + [ln + "\n" for ln in h_code.splitlines()] + ["\n"])
+        new_lines: List[str] = []
+        if formatted_imports:
+            new_lines.extend(formatted_imports + ["\n"])
+        new_lines.extend(new_h_lines)
+        while new_lines and not new_lines[0].strip():
+            new_lines.pop(0)
+        diff = difflib.unified_diff(
+            [],
+            new_lines,
+            fromfile="/dev/null",
+            tofile=f"b/{plan.rel_path}",
+            n=3,
+        )
+        diff_str = "".join(diff)
+        if not diff_str:
+            return ""
+        git_header = f"diff --git a/{plan.rel_path} b/{plan.rel_path}\nnew file mode 100644\n"
+        deduped_comments = list(dict.fromkeys(plan.comments))
+        return "".join(deduped_comments) + git_header + diff_str
     retained_cands = filter_overlapping_clone_units(
         [u for u, _ in plan.replacements], repo_root=repo_root
     )
@@ -622,17 +732,26 @@ def generate_refactoring_patch(
     type_merge_strategy: str = "fallback_any",
     replace_clones: bool = False,
     method_binding: str = "auto",
+    cross_file_strategy: str = "auto",
+    shared_module_name: str = "_common.py",
+    depgraph: Optional[ModuleDependencyGraph] = None,
 ) -> str:
     """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
     if not clones:
         return ""
 
     root = Path(repo_root or os.getcwd())
+    if depgraph is None:
+        depgraph = build_module_graph(root)
     file_plans: Dict[Path, _FilePatchPlan] = {}
 
-    def _get_plan(file_p: Path, rel_f: str, text: str) -> _FilePatchPlan:
+    def _get_plan(
+        file_p: Path, rel_f: str, text: str, is_new_file: bool = False
+    ) -> _FilePatchPlan:
         if file_p not in file_plans:
-            file_plans[file_p] = _FilePatchPlan(file_p, text, rel_f)
+            file_plans[file_p] = _FilePatchPlan(
+                file_p, text, rel_f, is_new_file=is_new_file
+            )
         return file_plans[file_p]
 
     for sim, u1, u2 in clones:
@@ -942,11 +1061,9 @@ def generate_refactoring_patch(
             enc_fn_earliest["start"] if enc_fn_earliest else int(earliest_unit.get("start") or 1)
         )
 
-        rep_stmt1 = _build_unit_delegation_call(
+        _delegate_unit_in_plan(
             u1,
-            orig_text,
-            orig_lines,
-            effective_binding=effective_binding,
+            f1_plan,
             helper_name=helper_name,
             inputs=inputs,
             outputs=outputs,
@@ -954,54 +1071,15 @@ def generate_refactoring_patch(
             target_inputs=t_inputs1,
             target_outputs=outputs,
             await_prefix=await_prefix,
+            binding=effective_binding,
             step=step,
         )
-        f1_plan.replacements.append((u1, rep_stmt1))
-        f1_plan.claimed_units.append(u1)
 
-        if is_same_file and len(candidate_units) > 1:
-            rep_stmt2 = _build_unit_delegation_call(
-                u2,
-                orig_text,
-                orig_lines,
-                effective_binding=effective_binding,
-                helper_name=helper_name,
-                inputs=inputs,
-                outputs=outputs,
-                scope=scope,
-                target_inputs=t_inputs2,
-                target_outputs=target_outs2,
-                await_prefix=await_prefix,
-                step=step,
-            )
-            f1_plan.replacements.append((u2, rep_stmt2))
-            f1_plan.claimed_units.append(u2)
-        elif not is_same_file and f2_plan is not None:
-            mod1 = _derive_module_import_path(f1_path, root)
-            mod2 = _derive_module_import_path(f2_plan.path, root)
-            is_circular = bool(mod2 and _module_imports_target(orig_text, mod2))
-            if is_circular or not mod1:
-                f1_plan.comments.append(
-                    f"# Note: Cross-module clone pair; helper generated in {f1_disp}. "
-                    f"Circular import or unresolvable module path; import manually into {f2_disp}.\n"
-                )
-            elif replace_clones:
-                f2_plan.comments.append(pair_comment)
-                f2_plan.missing_imports.append(f"from {mod1} import {helper_name}")
-                u2_s = int(u2.get("start") or 1)
-                u2_lead = (
-                    f2_plan.orig_lines[u2_s - 1]
-                    if 1 <= u2_s <= len(f2_plan.orig_lines)
-                    else ""
-                )
-                u2_ind = u2_lead[: len(u2_lead) - len(u2_lead.lstrip())]
-                step2 = _detect_indent_step(u2_ind)
-
-                rep_stmt2 = _build_unit_delegation_call(
+        if is_same_file:
+            if len(candidate_units) > 1:
+                _delegate_unit_in_plan(
                     u2,
-                    f2_plan.orig_text,
-                    f2_plan.orig_lines,
-                    effective_binding="module",
+                    f1_plan,
                     helper_name=helper_name,
                     inputs=inputs,
                     outputs=outputs,
@@ -1009,27 +1087,164 @@ def generate_refactoring_patch(
                     target_inputs=t_inputs2,
                     target_outputs=target_outs2,
                     await_prefix=await_prefix,
-                    step=step2,
+                    binding=effective_binding,
+                    step=step,
                 )
-                f2_plan.replacements.append((u2, rep_stmt2))
-                f2_plan.claimed_units.append(u2)
+            _attach_helper_to_plan(
+                f1_plan,
+                binding=effective_binding,
+                insert_line=insert_line,
+                helper_code=helper_code,
+                missing_imports=missing_import_lines,
+            )
+        elif f2_plan is not None:
+            if cross_file_strategy in ("auto", "shared_module", "shared"):
+                shared_p = resolve_shared_module_file(
+                    f1_path, f2_plan.path, root, shared_module_name=shared_module_name
+                )
+                try:
+                    rel_shared = str(
+                        shared_p.resolve().relative_to(root.resolve())
+                    ).replace("\\", "/")
+                except ValueError:
+                    rel_shared = str(shared_p.name)
+
+                if shared_p.resolve() == f1_path.resolve():
+                    f1_plan.module_helpers.append(helper_code)
+                    f1_plan.missing_imports.extend(missing_import_lines)
+                    f1_plan.comments.append(pair_comment)
+                    mod1 = _derive_module_import_path(f1_path, root)
+                    _wire_cross_module_host_delegation(
+                        f1_plan=f1_plan,
+                        f2_plan=f2_plan,
+                        u2=u2,
+                        mod1=mod1,
+                        helper_name=helper_name,
+                        pair_comment=pair_comment,
+                        f1_disp=f1_disp,
+                        f2_disp=f2_disp,
+                        replace_clones=replace_clones,
+                        inputs=inputs,
+                        outputs=outputs,
+                        scope=scope,
+                        t_inputs2=t_inputs2,
+                        target_outs2=target_outs2,
+                        await_prefix=await_prefix,
+                    )
+                elif shared_p.resolve() == f2_plan.path.resolve():
+                    f2_plan.module_helpers.append(helper_code)
+                    f2_plan.missing_imports.extend(missing_import_lines)
+                    f2_plan.comments.append(pair_comment)
+                    mod2 = _derive_module_import_path(f2_plan.path, root)
+                    f1_plan.comments.append(pair_comment)
+                    f1_plan.missing_imports.append(f"from {mod2} import {helper_name}")
+                else:
+                    shared_plan = file_plans.get(shared_p)
+                    if shared_plan is None:
+                        if shared_p.is_file():
+                            try:
+                                shared_text = shared_p.read_text(encoding="utf-8")
+                                shared_plan = _get_plan(
+                                    shared_p, rel_shared, shared_text, is_new_file=False
+                                )
+                            except (OSError, UnicodeDecodeError):
+                                shared_plan = _get_plan(
+                                    shared_p, rel_shared, "", is_new_file=True
+                                )
+                        else:
+                            shared_plan = _get_plan(
+                                shared_p, rel_shared, "", is_new_file=True
+                            )
+
+                    shared_plan.module_helpers.append(helper_code)
+                    shared_plan.missing_imports.extend(missing_import_lines)
+                    shared_plan.used_helper_names.add(helper_name)
+
+                    mod_shared = _derive_module_import_path(shared_p, root)
+                    shared_imp = f"from {mod_shared} import {helper_name}"
+
+                    f1_plan.missing_imports.append(shared_imp)
+                    f1_plan.comments.append(pair_comment)
+
+                    f2_plan.missing_imports.append(shared_imp)
+                    f2_plan.comments.append(pair_comment)
+
+                    if replace_clones:
+                        _delegate_unit_in_plan(
+                            u2,
+                            f2_plan,
+                            helper_name=helper_name,
+                            inputs=inputs,
+                            outputs=outputs,
+                            scope=scope,
+                            target_inputs=t_inputs2,
+                            target_outputs=target_outs2,
+                            await_prefix=await_prefix,
+                            binding="module",
+                        )
+                    else:
+                        f1_plan.comments.append(
+                            f"# Note: Cross-module clone pair; helper extracted to {rel_shared}. "
+                            f"Complete refactoring by importing the helper into {f1_disp}.\n"
+                        )
+                        f2_plan.comments.append(
+                            f"# Note: Cross-module clone pair; helper extracted to {rel_shared}. "
+                            f"Complete refactoring by importing the helper into {f2_disp}.\n"
+                        )
             else:
-                f1_plan.comments.append(
-                    f"# Note: Cross-module clone pair; helper generated in {f1_disp}. "
-                    f"Complete refactoring by importing the helper into {f2_disp}.\n"
+                mod1 = _derive_module_import_path(f1_path, root)
+                mod2 = _derive_module_import_path(f2_plan.path, root)
+                is_circular = bool(
+                    (mod1 and mod2 and depgraph.has_transitive_path(mod1, mod2))
+                    or (mod2 and _module_imports_target(orig_text, mod2))
                 )
-        elif not is_same_file:
+                if is_circular or not mod1:
+                    cycle_desc = ""
+                    if mod1 and mod2 and depgraph.has_transitive_path(mod1, mod2):
+                        cycle_path = depgraph.find_cycle_path(mod1, mod2)
+                        if cycle_path:
+                            cycle_desc = f" (cycle: {' -> '.join([mod2] + cycle_path)})"
+                    f1_plan.comments.append(
+                        f"# Note: Cross-module clone pair; helper generated in {f1_disp}. "
+                        f"Circular import or unresolvable module path{cycle_desc}; import manually into {f2_disp}.\n"
+                    )
+                else:
+                    _wire_cross_module_host_delegation(
+                        f1_plan=f1_plan,
+                        f2_plan=f2_plan,
+                        u2=u2,
+                        mod1=mod1,
+                        helper_name=helper_name,
+                        pair_comment=pair_comment,
+                        f1_disp=f1_disp,
+                        f2_disp=f2_disp,
+                        replace_clones=replace_clones,
+                        inputs=inputs,
+                        outputs=outputs,
+                        scope=scope,
+                        t_inputs2=t_inputs2,
+                        target_outs2=target_outs2,
+                        await_prefix=await_prefix,
+                    )
+                _attach_helper_to_plan(
+                    f1_plan,
+                    binding=effective_binding,
+                    insert_line=insert_line,
+                    helper_code=helper_code,
+                    missing_imports=missing_import_lines,
+                )
+        else:
             f1_plan.comments.append(
                 f"# Note: Cross-module clone pair; helper generated in {f1_disp}. "
                 f"Complete refactoring by importing the helper into {f2_disp}.\n"
             )
-
-        if effective_binding == "method":
-            f1_plan.method_helpers.append((insert_line, helper_code))
-            f1_plan.missing_imports.extend(missing_import_lines)
-        else:
-            f1_plan.module_helpers.append(helper_code)
-            f1_plan.missing_imports.extend(missing_import_lines)
+            _attach_helper_to_plan(
+                f1_plan,
+                binding=effective_binding,
+                insert_line=insert_line,
+                helper_code=helper_code,
+                missing_imports=missing_import_lines,
+            )
 
     patch_chunks: List[str] = []
     for plan in file_plans.values():

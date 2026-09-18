@@ -22,6 +22,13 @@ from pydoppelgangerhunt.fixer.binding import (
     find_enclosing_class,
     find_enclosing_function,
 )
+from pydoppelgangerhunt.fixer.depgraph import (
+    ModuleDependencyGraph,
+    build_module_graph,
+    derive_shared_module_import,
+    find_nearest_common_package,
+    resolve_shared_module_file,
+)
 from pydoppelgangerhunt.fixer.patch import (
     _FilePatchPlan,
     _adjust_line_for_replacements,
@@ -86,15 +93,20 @@ from pydoppelgangerhunt.fixer.synthesis import (
 )
 
 __all__ = [
+    "ModuleDependencyGraph",
     "analyze_unit_variable_scope",
+    "build_module_graph",
     "check_units_overlap",
+    "derive_shared_module_import",
     "extract_unit_comments_and_pragmas",
     "filter_overlapping_clone_units",
     "find_enclosing_class",
     "find_enclosing_function",
+    "find_nearest_common_package",
     "generate_refactoring_patch",
     "refactor_module_units",
     "replace_unit_in_source",
+    "resolve_shared_module_file",
     "slice_source_by_token_range",
     "synthesize_shared_helper_code",
 ]
