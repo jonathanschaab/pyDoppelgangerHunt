@@ -6,10 +6,49 @@ import ast
 import builtins
 import hashlib
 import json
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 BUILTIN_NAMES: Set[str] = set(dir(builtins))
+
+COMPOUND_BLOCK_TYPES: Tuple[type, ...] = tuple(
+    cls
+    for cls in (
+        ast.If,
+        ast.For,
+        ast.AsyncFor,
+        ast.While,
+        ast.Try,
+        getattr(ast, "TryStar", None),
+        ast.With,
+        ast.AsyncWith,
+        getattr(ast, "Match", None),
+    )
+    if cls is not None
+)
+
+BRANCH_NODE_TYPES: Tuple[type, ...] = tuple(
+    cls
+    for cls in (
+        ast.If,
+        ast.IfExp,
+        ast.For,
+        ast.AsyncFor,
+        ast.While,
+        ast.Try,
+        getattr(ast, "TryStar", None),
+        ast.ExceptHandler,
+        getattr(ast, "match_case", None),
+        ast.With,
+        ast.AsyncWith,
+    )
+    if cls is not None
+)
+
+TRY_NODE_TYPES: Tuple[type, ...] = tuple(
+    cls for cls in (ast.Try, getattr(ast, "TryStar", None)) if cls is not None
+)
 
 
 def is_boilerplate_node(node: ast.AST) -> bool:
@@ -21,7 +60,19 @@ def is_boilerplate_node(node: ast.AST) -> bool:
         if isinstance(call.func, ast.Name) and call.func.id in ("print", "log"):
             return True
         if isinstance(call.func, ast.Attribute):
-            if call.func.attr in ("debug", "info", "warning", "error", "critical", "log", "_log"):
+            if call.func.attr in (
+                "debug",
+                "info",
+                "warning",
+                "warn",
+                "error",
+                "critical",
+                "exception",
+                "fatal",
+                "trace",
+                "log",
+                "_log",
+            ):
                 return True
             if isinstance(call.func.value, ast.Name) and call.func.value.id in ("logger", "logging"):
                 return True
@@ -55,47 +106,92 @@ class _CommutativeCanonicalizer(ast.NodeTransformer):
         return node
 
     def visit_Compare(self, node: ast.Compare) -> ast.Compare:
-        """Canonicalizes symmetric comparisons (==, !=) by sorting operands."""
+        """Canonicalizes symmetric comparisons (==, !=, is, is not) by sorting operands."""
         self.generic_visit(node)
-        if len(node.ops) == 1 and isinstance(node.ops[0], (ast.Eq, ast.NotEq)):
+        if len(node.ops) == 1 and isinstance(node.ops[0], (ast.Eq, ast.NotEq, ast.Is, ast.IsNot)):
             k_left = self._sort_key(node.left)
             k_right = self._sort_key(node.comparators[0])
             if k_left > k_right:
                 node.left, node.comparators[0] = node.comparators[0], node.left
         return node
 
+    def visit_MatchOr(self, node: ast.AST) -> ast.AST:  # pragma: no cover (py310+)
+        """Canonicalizes pattern matching alternatives (case A | B) by sorting patterns."""
+        self.generic_visit(node)
+        patterns = getattr(node, "patterns", None)
+        if isinstance(patterns, list):
+            setattr(node, "patterns", sorted(patterns, key=self._sort_key))
+        return node
+
 
 class _IdiomCanonicalizer(ast.NodeTransformer):
     """Canonicalizes Python idioms (loops to comprehensions, search loops to any/all) (PyChase-style)."""
 
+    def _build_comp_assign(
+        self,
+        node: Union[ast.For, ast.AsyncFor],
+        call_or_assign: Union[ast.Call, ast.Assign],
+        ifs: Sequence[ast.expr],
+    ) -> Optional[ast.Assign]:
+        """Constructs an accumulator ListComp, SetComp, or DictComp assignment node."""
+        is_async = 1 if isinstance(node, ast.AsyncFor) else 0
+        gens = [
+            ast.comprehension(
+                target=node.target,
+                iter=node.iter,
+                ifs=list(ifs),
+                is_async=is_async,
+            )
+        ]
+        if isinstance(call_or_assign, ast.Call):
+            call = call_or_assign
+            if (
+                isinstance(call.func, ast.Attribute)
+                and len(call.args) == 1
+                and call.func.attr in ("append", "add")
+            ):
+                target_expr: Optional[ast.expr] = None
+                if isinstance(call.func.value, ast.Name):
+                    target_expr = ast.Name(id=call.func.value.id, ctx=ast.Store())
+                elif isinstance(call.func.value, ast.Attribute):
+                    target_expr = ast.Attribute(
+                        value=call.func.value.value,
+                        attr=call.func.value.attr,
+                        ctx=ast.Store(),
+                    )
+                if target_expr is not None:
+                    comp_val: ast.expr = (
+                        ast.ListComp(elt=call.args[0], generators=gens)
+                        if call.func.attr == "append"
+                        else ast.SetComp(elt=call.args[0], generators=gens)
+                    )
+                    return ast.Assign(targets=[target_expr], value=comp_val)
+        elif isinstance(call_or_assign, ast.Assign):
+            assign = call_or_assign
+            if len(assign.targets) == 1 and isinstance(assign.targets[0], ast.Subscript):
+                sub = assign.targets[0]
+                target_expr = None
+                if isinstance(sub.value, ast.Name):
+                    target_expr = ast.Name(id=sub.value.id, ctx=ast.Store())
+                elif isinstance(sub.value, ast.Attribute):
+                    target_expr = ast.Attribute(
+                        value=sub.value.value,
+                        attr=sub.value.attr,
+                        ctx=ast.Store(),
+                    )
+                if target_expr is not None:
+                    dict_comp = ast.DictComp(key=sub.slice, value=assign.value, generators=gens)
+                    return ast.Assign(targets=[target_expr], value=dict_comp)
+        return None
+
     def _build_listcomp_assign(
         self, node: ast.For, call: ast.Call, ifs: Sequence[ast.expr]
     ) -> Optional[ast.Assign]:
-        """Constructs an accumulator list comprehension assignment node."""
-        if (
-            isinstance(call.func, ast.Attribute)
-            and call.func.attr == "append"
-            and isinstance(call.func.value, ast.Name)
-            and len(call.args) == 1
-        ):
-            return ast.Assign(
-                targets=[ast.Name(id=call.func.value.id, ctx=ast.Store())],
-                value=ast.ListComp(
-                    elt=call.args[0],
-                    generators=[
-                        ast.comprehension(
-                            target=node.target,
-                            iter=node.iter,
-                            ifs=list(ifs),
-                            is_async=0,
-                        )
-                    ],
-                ),
-            )
-        return None
+        """Backward-compatible wrapper for listcomp assignment."""
+        return self._build_comp_assign(node, call, ifs)
 
     @staticmethod
-    def _get_single_stmt(node: ast.For) -> Optional[ast.stmt]:
+    def _get_single_stmt(node: Union[ast.For, ast.AsyncFor]) -> Optional[ast.stmt]:
         if len(node.body) == 1 and not node.orelse:
             return node.body[0]
         return None
@@ -106,20 +202,26 @@ class _IdiomCanonicalizer(ast.NodeTransformer):
             return stmt.test, stmt.body[0]
         return None
 
-    def _transform_accumulator_loop(self, node: ast.For) -> Optional[ast.Assign]:
-        """Transforms a single-statement accumulator for-loop into an equivalent ListComp assignment."""
+    def _transform_accumulator_loop(
+        self, node: Union[ast.For, ast.AsyncFor]
+    ) -> Optional[ast.Assign]:
+        """Transforms a single-statement accumulator for-loop into an equivalent comprehension assignment."""
         stmt = self._get_single_stmt(node)
         if stmt is None:
             return None
 
         if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
-            return self._build_listcomp_assign(node, stmt.value, [])
+            return self._build_comp_assign(node, stmt.value, [])
+        if isinstance(stmt, ast.Assign):
+            return self._build_comp_assign(node, stmt, [])
 
         if_info = self._get_single_if_child(stmt)
         if if_info is not None:
             test, inner = if_info
             if isinstance(inner, ast.Expr) and isinstance(inner.value, ast.Call):
-                return self._build_listcomp_assign(node, inner.value, [test])
+                return self._build_comp_assign(node, inner.value, [test])
+            if isinstance(inner, ast.Assign):
+                return self._build_comp_assign(node, inner, [test])
         return None
 
     def _build_reduction_return(
@@ -174,6 +276,14 @@ class _IdiomCanonicalizer(ast.NodeTransformer):
             return ast.fix_missing_locations(ast.copy_location(red_ret, node))
         return node
 
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> ast.AST:
+        """Visits and canonicalizes async accumulator for-loops."""
+        self.generic_visit(node)
+        acc_assign = self._transform_accumulator_loop(node)
+        if acc_assign is not None:
+            return ast.fix_missing_locations(ast.copy_location(acc_assign, node))
+        return node
+
 
 def _walk_ast_nodes(
     root: ast.AST,
@@ -183,16 +293,25 @@ def _walk_ast_nodes(
 ) -> List[ast.AST]:
     """Traverses AST nodes in BFS order, optionally omitting annotations, boilerplate, or abstracting expressions."""
     nodes: List[ast.AST] = []
-    todo: List[ast.AST] = [root]
+    todo: deque[ast.AST] = deque([root])
     while todo:
-        node = todo.pop(0)
+        node = todo.popleft()
         if filter_boilerplate and is_boilerplate_node(node):
             continue
         nodes.append(node)
         for name, value in ast.iter_fields(node):
-            if strip_annotations and name in ("annotation", "returns", "type_comment"):
+            if strip_annotations and name in ("annotation", "returns", "type_comment", "type_params"):
                 continue
             if abstract_expressions and name == "test" and isinstance(node, (ast.If, ast.While, ast.IfExp)):
+                if isinstance(value, (ast.Compare, ast.BoolOp, ast.UnaryOp)):
+                    nodes.append(ast.Name(id="__ABSTRACT_COND__", ctx=ast.Load()))
+                    continue
+            if (
+                abstract_expressions
+                and name == "guard"
+                and hasattr(ast, "match_case")
+                and isinstance(node, getattr(ast, "match_case"))  # pragma: no cover (py310+)
+            ):
                 if isinstance(value, (ast.Compare, ast.BoolOp, ast.UnaryOp)):
                     nodes.append(ast.Name(id="__ABSTRACT_COND__", ctx=ast.Load()))
                     continue
@@ -491,18 +610,83 @@ def _harvest_complex_expressions(
     return results
 
 
-class _ClosureScoper(ast.NodeVisitor):
-    """Tracks lexical parent scopes for nested functions and closures."""
+class _ScopeHierarchyVisitor(ast.NodeVisitor):
+    """Tracks lexical parent scopes for nested functions, closures, and enclosing classes."""
 
-    def __init__(self, closure_parents: Dict[int, str]) -> None:
-        self.closure_parents = closure_parents
+    def __init__(
+        self,
+        closure_parents: Optional[Dict[int, str]] = None,
+        enclosing_classes: Optional[Dict[int, str]] = None,
+        enclosing_class_starts: Optional[Dict[int, int]] = None,
+        func_owners: Optional[Dict[int, str]] = None,
+        harvest_closures: bool = True,
+    ) -> None:
+        self.closure_parents: Dict[int, str] = closure_parents if closure_parents is not None else {}
+        self.enclosing_classes: Dict[int, str] = enclosing_classes if enclosing_classes is not None else {}
+        self.enclosing_class_starts: Dict[int, int] = (
+            enclosing_class_starts if enclosing_class_starts is not None else {}
+        )
+        self.func_owners: Dict[int, str] = func_owners if func_owners is not None else {}
+        self.harvest_closures: bool = harvest_closures
         self.func_stack: List[str] = []
+        self.class_stack: List[Tuple[str, int]] = []
+
+    def _record_class_enclosure(self, node: ast.AST) -> None:
+        if self.class_stack:
+            self.enclosing_classes[id(node)] = self.class_stack[-1][0]
+            self.enclosing_class_starts[id(node)] = self.class_stack[-1][1]
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        for dec in node.decorator_list:
+            self.visit(dec)
+        for base in node.bases:
+            self.visit(base)
+        for keyword in node.keywords:
+            self.visit(keyword)
+        for tp in getattr(node, "type_params", ()):
+            self.visit(tp)
+
+        self._record_class_enclosure(node)
+        c_start = int(getattr(node, "lineno", 0))
+        self.class_stack.append((node.name, c_start))
+        saved_func_stack = self.func_stack
+        self.func_stack = []
+        for stmt in node.body:
+            self.visit(stmt)
+        self.func_stack = saved_func_stack
+        self.class_stack.pop()
 
     def _scope_function(self, fn: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
+        for dec in fn.decorator_list:
+            self.visit(dec)
+        for default in fn.args.defaults:
+            self.visit(default)
+        for kw_default in fn.args.kw_defaults:
+            if kw_default is not None:
+                self.visit(kw_default)
+        all_args = (
+            list(getattr(fn.args, "posonlyargs", []))
+            + list(fn.args.args)
+            + list(fn.args.kwonlyargs)
+        )
+        if fn.args.vararg is not None:
+            all_args.append(fn.args.vararg)
+        if fn.args.kwarg is not None:
+            all_args.append(fn.args.kwarg)
+        for arg in all_args:
+            if arg.annotation is not None:
+                self.visit(arg.annotation)
+        if fn.returns is not None:
+            self.visit(fn.returns)
+        for tp in getattr(fn, "type_params", ()):
+            self.visit(tp)
+
+        self._record_class_enclosure(fn)
         if self.func_stack:
             self.closure_parents[id(fn)] = ":".join(self.func_stack)
         self.func_stack.append(fn.name)
-        self.generic_visit(fn)
+        for stmt in fn.body:
+            self.visit(stmt)
         self.func_stack.pop()
 
     def visit_FunctionDef(self, fn: ast.FunctionDef) -> None:
@@ -510,6 +694,30 @@ class _ClosureScoper(ast.NodeVisitor):
 
     def visit_AsyncFunctionDef(self, fn: ast.AsyncFunctionDef) -> None:
         self._scope_function(fn)
+
+    def _scope_comprehension(self, comp: ast.AST) -> None:
+        self._record_class_enclosure(comp)
+        if self.func_stack:
+            if self.harvest_closures or len(self.func_stack) == 1:
+                self.func_owners[id(comp)] = ":".join(self.func_stack)
+            else:
+                self.func_owners[id(comp)] = self.func_stack[-1]
+        self.generic_visit(comp)
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._scope_comprehension(node)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._scope_comprehension(node)
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._scope_comprehension(node)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._scope_comprehension(node)
+
+
+_ClosureScoper = _ScopeHierarchyVisitor
 
 
 class _DataTableVisitor(ast.NodeVisitor):
@@ -542,6 +750,16 @@ def check_inline_suppression(file_lines: List[str], start: int, end: int) -> boo
     return False
 
 
+def is_decorator_named(d: ast.AST, name: str) -> bool:
+    """Checks if an AST decorator node matches a given name, supporting call expressions."""
+    target = d.func if isinstance(d, ast.Call) else d
+    if isinstance(target, ast.Name):
+        return bool(target.id == name)
+    if isinstance(target, ast.Attribute):
+        return bool(target.attr == name)
+    return False
+
+
 def compute_cyclomatic_complexity(target: Any) -> int:
     """Calculates McCabe Cyclomatic Complexity for an AST node or statement sequence."""
     if not target:
@@ -557,20 +775,7 @@ def compute_cyclomatic_complexity(target: Any) -> int:
     complexity = 1
     for root in nodes:
         for node in ast.walk(root):
-            if isinstance(
-                node,
-                (
-                    ast.If,
-                    ast.IfExp,
-                    ast.For,
-                    ast.AsyncFor,
-                    ast.While,
-                    ast.Try,
-                    ast.ExceptHandler,
-                    ast.With,
-                    ast.AsyncWith,
-                ),
-            ):
+            if isinstance(node, BRANCH_NODE_TYPES):
                 complexity += 1
             elif isinstance(node, ast.BoolOp):
                 complexity += max(0, len(node.values) - 1)
@@ -599,6 +804,10 @@ def _record_unit(
     strip_docstrings: bool = True,
     start_col: Optional[int] = None,
     end_col: Optional[int] = None,
+    enclosing_class: Optional[str] = None,
+    enclosing_class_start: Optional[int] = None,
+    receiver_kind: Optional[str] = None,
+    is_static: bool = False,
 ) -> None:
     """Records an AST unit if it satisfies thresholds and is not suppressed by inline comments."""
     if file_lines and check_inline_suppression(file_lines, start, end):
@@ -694,6 +903,10 @@ def _record_unit(
                 "calls": extract_call_sequence(ast_target),
                 "complexity": compute_cyclomatic_complexity(ast_target),
                 "structural_hash": structural_hash,
+                "enclosing_class": enclosing_class,
+                "enclosing_class_start": enclosing_class_start,
+                "receiver_kind": receiver_kind,
+                "is_static": is_static,
             })
 
 
@@ -714,6 +927,10 @@ def _record_clause_branch(
     consistent_renaming: bool = False,
     abstract_expressions: bool = False,
     strip_docstrings: bool = True,
+    enclosing_class: Optional[str] = None,
+    enclosing_class_start: Optional[int] = None,
+    receiver_kind: Optional[str] = None,
+    is_static: bool = False,
 ) -> None:
     """Records an if-branch or except-handler clause if it contains at least 3 statements."""
     if len(body) < 3:
@@ -738,6 +955,10 @@ def _record_clause_branch(
         consistent_renaming=consistent_renaming,
         abstract_expressions=abstract_expressions,
         strip_docstrings=strip_docstrings,
+        enclosing_class=enclosing_class,
+        enclosing_class_start=enclosing_class_start,
+        receiver_kind=receiver_kind,
+        is_static=is_static,
     )
 
 
@@ -757,6 +978,10 @@ def _record_node_unit(
     consistent_renaming: bool = False,
     abstract_expressions: bool = False,
     strip_docstrings: bool = True,
+    enclosing_class: Optional[str] = None,
+    enclosing_class_start: Optional[int] = None,
+    receiver_kind: Optional[str] = None,
+    is_static: bool = False,
 ) -> None:
     """Records an AST node unit by extracting its start and end line bounds."""
     start = getattr(node, "lineno", 0)
@@ -779,6 +1004,10 @@ def _record_node_unit(
         consistent_renaming=consistent_renaming,
         abstract_expressions=abstract_expressions,
         strip_docstrings=strip_docstrings,
+        enclosing_class=enclosing_class,
+        enclosing_class_start=enclosing_class_start,
+        receiver_kind=receiver_kind,
+        is_static=is_static,
     )
 
 
@@ -810,7 +1039,7 @@ def harvest_notebook_units(
         return units
 
     try:
-        rel_file = str(p.relative_to(repo_root)).replace("\\", "/")
+        rel_file = str(p.resolve().relative_to(Path(repo_root).resolve())).replace("\\", "/")
     except ValueError:
         rel_file = str(p).replace("\\", "/")
 
@@ -881,6 +1110,16 @@ def harvest_notebook_units(
     return units
 
 
+def _iter_local_nodes(root: ast.AST) -> Iterator[ast.AST]:
+    """Iterates through descendant AST nodes without crossing nested function or class definitions."""
+    todo = deque(ast.iter_child_nodes(root))
+    while todo:
+        current = todo.popleft()
+        yield current
+        if not isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            todo.extend(ast.iter_child_nodes(current))
+
+
 def harvest_file_units(
     file_path: str,
     repo_root: str,
@@ -941,22 +1180,49 @@ def harvest_file_units(
         ast.fix_missing_locations(tree)
 
     try:
-        rel_file = str(p.relative_to(repo_root)).replace("\\", "/")
+        rel_file = str(p.resolve().relative_to(Path(repo_root).resolve())).replace("\\", "/")
     except ValueError:
         rel_file = str(p).replace("\\", "/")
 
     closure_parents: Dict[int, str] = {}
-    if harvest_closures:
-        _ClosureScoper(closure_parents).visit(tree)
+    enclosing_classes: Dict[int, str] = {}
+    enclosing_class_starts: Dict[int, int] = {}
+    func_owners: Dict[int, str] = {}
+    _ScopeHierarchyVisitor(
+        closure_parents,
+        enclosing_classes,
+        enclosing_class_starts,
+        func_owners=func_owners,
+        harvest_closures=harvest_closures,
+    ).visit(tree)
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             fn_start = getattr(node, "lineno", 0)
             fn_end = getattr(node, "end_lineno", fn_start)
+            fn_len = (fn_end or fn_start) - fn_start + 1
             if file_lines and check_inline_suppression(file_lines, fn_start, fn_end):
                 continue
 
-            is_closure = harvest_closures and id(node) in closure_parents
+            enc_class = enclosing_classes.get(id(node))
+            enc_class_start = enclosing_class_starts.get(id(node))
+            decs = getattr(node, "decorator_list", [])
+            fn_is_static = any(is_decorator_named(d, "staticmethod") for d in decs)
+            fn_is_class_method = any(is_decorator_named(d, "classmethod") for d in decs)
+            is_nested = id(node) in closure_parents
+            is_closure = harvest_closures and is_nested
+            if is_nested:
+                fn_receiver_kind: Optional[str] = None
+                fn_is_static = False
+                fn_is_class_method = False
+            elif fn_is_static:
+                fn_receiver_kind = "static"
+            elif fn_is_class_method:
+                fn_receiver_kind = "class"
+            elif enc_class:
+                fn_receiver_kind = "instance"
+            else:
+                fn_receiver_kind = None
             if is_closure:
                 unit_kind = "closure"
                 unit_name = f"{closure_parents[id(node)]}:{node.name}"
@@ -965,16 +1231,7 @@ def harvest_file_units(
                 unit_name = node.name
 
             # 1. Whole function / closure unit: omit thin 1-statement delegate wrappers
-            doc_offset = (
-                1
-                if (
-                    node.body
-                    and isinstance(node.body[0], ast.Expr)
-                    and isinstance(node.body[0].value, ast.Constant)
-                    and isinstance(node.body[0].value.value, str)
-                )
-                else 0
-            )
+            doc_offset = 1 if _get_docstring_node(node) is not None else 0
             if len(node.body) - doc_offset > 1 or is_closure:
                 _record_node_unit(
                     units,
@@ -992,26 +1249,19 @@ def harvest_file_units(
                     consistent_renaming=consistent_renaming,
                     abstract_expressions=abstract_expressions,
                     strip_docstrings=strip_docstrings,
+                    enclosing_class=enc_class,
+                    enclosing_class_start=enc_class_start,
+                    receiver_kind=fn_receiver_kind,
+                    is_static=fn_is_static,
                 )
 
             if not functions_only:
-                for item in ast.walk(node):
-                    if item is not node and isinstance(
-                        item,
-                        (
-                            ast.If,
-                            ast.For,
-                            ast.AsyncFor,
-                            ast.While,
-                            ast.Try,
-                            ast.With,
-                            ast.AsyncWith,
-                        ),
-                    ):
+                for item in _iter_local_nodes(node):
+                    if item is not node and isinstance(item, COMPOUND_BLOCK_TYPES):
                         item_start = getattr(item, "lineno", 0)
-                        item_end = getattr(item, "end_lineno", item_start)
+                        item_end = getattr(item, "end_lineno", item_start) or item_start
                         block_lines = item_end - item_start + 1
-                        if block_lines < (node.end_lineno - node.lineno + 1):  # type: ignore[operator]
+                        if block_lines < fn_len:
                             _record_unit(
                                 units,
                                 f"{unit_name}:{type(item).__name__}",
@@ -1030,6 +1280,10 @@ def harvest_file_units(
                                 consistent_renaming=consistent_renaming,
                                 abstract_expressions=abstract_expressions,
                                 strip_docstrings=strip_docstrings,
+                                enclosing_class=enc_class,
+                                enclosing_class_start=enc_class_start,
+                                receiver_kind=fn_receiver_kind,
+                                is_static=fn_is_static,
                             )
 
             if sliding_window and hasattr(node, "body"):
@@ -1038,7 +1292,7 @@ def harvest_file_units(
                     for w_idx in range(len(body_stmts) - window_size + 1):
                         window_slice = body_stmts[w_idx : w_idx + window_size]
                         w_start = getattr(window_slice[0], "lineno", 0)
-                        w_end = getattr(window_slice[-1], "end_lineno", w_start)
+                        w_end = getattr(window_slice[-1], "end_lineno", w_start) or w_start
                         _record_unit(
                             units,
                             f"{unit_name}:stmts_{w_idx+1}-{w_idx+window_size}",
@@ -1057,75 +1311,71 @@ def harvest_file_units(
                             consistent_renaming=consistent_renaming,
                             abstract_expressions=abstract_expressions,
                             strip_docstrings=strip_docstrings,
+                            enclosing_class=enc_class,
+                            enclosing_class_start=enc_class_start,
+                            receiver_kind=fn_receiver_kind,
+                            is_static=fn_is_static,
                         )
 
             if clause_level and hasattr(node, "body"):
-                for stmt in ast.walk(node):
+                def _record_branch(
+                    label: str,
+                    body: List[ast.stmt],
+                    default_line: int,
+                    u_name: str = unit_name,
+                    e_class: Optional[str] = enc_class,
+                    e_start: Optional[int] = enc_class_start,
+                    r_kind: Optional[str] = fn_receiver_kind,
+                    static_fn: bool = fn_is_static,
+                ) -> None:
+                    _record_clause_branch(
+                        units,
+                        u_name,
+                        label,
+                        rel_file,
+                        body,
+                        default_line,
+                        min_lines,
+                        min_tokens,
+                        file_lines=file_lines,
+                        blind_indexing=blind_indexing,
+                        strip_annotations=strip_annotations,
+                        blind_literals=blind_literals,
+                        filter_boilerplate=filter_boilerplate,
+                        consistent_renaming=consistent_renaming,
+                        abstract_expressions=abstract_expressions,
+                        strip_docstrings=strip_docstrings,
+                        enclosing_class=e_class,
+                        enclosing_class_start=e_start,
+                        receiver_kind=r_kind,
+                        is_static=static_fn,
+                    )
+
+                for stmt in _iter_local_nodes(node):
                     if isinstance(stmt, ast.If):
                         s_line = getattr(stmt, "lineno", 0)
-                        _record_clause_branch(
-                            units,
-                            unit_name,
-                            "if_branch",
-                            rel_file,
-                            stmt.body,
-                            s_line,
-                            min_lines,
-                            min_tokens,
-                            file_lines=file_lines,
-                            blind_indexing=blind_indexing,
-                            strip_annotations=strip_annotations,
-                            blind_literals=blind_literals,
-                            filter_boilerplate=filter_boilerplate,
-                            consistent_renaming=consistent_renaming,
-                            abstract_expressions=abstract_expressions,
-                            strip_docstrings=strip_docstrings,
-                        )
+                        _record_branch("if_branch", stmt.body, s_line)
                         if stmt.orelse:
-                            _record_clause_branch(
-                                units,
-                                unit_name,
-                                "else_branch",
-                                rel_file,
-                                stmt.orelse,
-                                s_line,
-                                min_lines,
-                                min_tokens,
-                                file_lines=file_lines,
-                                blind_indexing=blind_indexing,
-                                strip_annotations=strip_annotations,
-                                blind_literals=blind_literals,
-                                filter_boilerplate=filter_boilerplate,
-                                consistent_renaming=consistent_renaming,
-                                abstract_expressions=abstract_expressions,
-                                strip_docstrings=strip_docstrings,
-                            )
-                    elif isinstance(stmt, ast.Try):
+                            _record_branch("else_branch", stmt.orelse, s_line)
+                    elif isinstance(stmt, TRY_NODE_TYPES):
                         t_line = getattr(stmt, "lineno", 0)
-                        for h_idx, handler in enumerate(stmt.handlers):
+                        for h_idx, handler in enumerate(getattr(stmt, "handlers", [])):
                             h_name = (
                                 handler.type.id
                                 if isinstance(handler.type, ast.Name)
                                 else f"handler_{h_idx}"
                             )
-                            _record_clause_branch(
-                                units,
-                                unit_name,
-                                f"except_{h_name}",
-                                rel_file,
-                                handler.body,
-                                t_line,
-                                min_lines,
-                                min_tokens,
-                                file_lines=file_lines,
-                                blind_indexing=blind_indexing,
-                                strip_annotations=strip_annotations,
-                                blind_literals=blind_literals,
-                                filter_boilerplate=filter_boilerplate,
-                                consistent_renaming=consistent_renaming,
-                                abstract_expressions=abstract_expressions,
-                                strip_docstrings=strip_docstrings,
-                            )
+                            _record_branch(f"except_{h_name}", handler.body, t_line)
+                        try_else = getattr(stmt, "orelse", None)
+                        if try_else:
+                            _record_branch("try_else", try_else, t_line)
+                        try_finally = getattr(stmt, "finalbody", None)
+                        if try_finally:
+                            _record_branch("try_finally", try_finally, t_line)
+                    elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
+                        m_line = getattr(stmt, "lineno", 0)
+                        for c_idx, case in enumerate(getattr(stmt, "cases", [])):
+                            _record_branch(f"case_{c_idx + 1}", getattr(case, "body", []), m_line)
 
         elif class_level and isinstance(node, ast.ClassDef):
             _record_node_unit(
@@ -1144,6 +1394,8 @@ def harvest_file_units(
                 consistent_renaming=consistent_renaming,
                 abstract_expressions=abstract_expressions,
                 strip_docstrings=strip_docstrings,
+                enclosing_class=enclosing_classes.get(id(node)),
+                enclosing_class_start=enclosing_class_starts.get(id(node)),
             )
 
     if complex_expressions:  # pydoppelgangerhunt: ignore
@@ -1195,28 +1447,14 @@ def harvest_file_units(
             )
 
     if comprehensions:
-        func_owner_map: Dict[int, str] = {}
-        for fn in ast.walk(tree):
-            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                qname = (
-                    f"{closure_parents[id(fn)]}:{fn.name}"
-                    if (harvest_closures and id(fn) in closure_parents)
-                    else fn.name
-                )
-                for child in ast.walk(fn):
-                    if child is not fn and isinstance(
-                        child,
-                        (ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp),
-                    ):
-                        func_owner_map.setdefault(id(child), qname)
-
         for comp in ast.walk(tree):
             if isinstance(
                 comp,
                 (ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp),
             ):
                 comp_name = type(comp).__name__.lower()
-                owner = func_owner_map.get(id(comp), "module")
+                enc_cls = enclosing_classes.get(id(comp))
+                owner = func_owners.get(id(comp)) or enc_cls or "module"
                 start_l = getattr(comp, "lineno", 0)
                 _record_node_unit(
                     units,
@@ -1234,6 +1472,8 @@ def harvest_file_units(
                     consistent_renaming=consistent_renaming,
                     abstract_expressions=abstract_expressions,
                     strip_docstrings=strip_docstrings,
+                    enclosing_class=enc_cls,
+                    enclosing_class_start=enclosing_class_starts.get(id(comp)),
                 )
 
     return units

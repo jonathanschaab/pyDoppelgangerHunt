@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pydoppelgangerhunt.baseline import (
+    BaselineFingerprints,
+    PruneResult,
     clone_pair_fingerprint,
     clone_pair_structural_fingerprint,
     compute_unit_structural_hash,
@@ -24,9 +26,11 @@ from pydoppelgangerhunt.clustering import (
 from pydoppelgangerhunt.config import (
     DEFAULT_EXCLUDES,
     DEFAULT_TOOL_TOML_CONTENT,
+    canonical_path_key,
     init_tool_configuration,
     load_toml_section,
     load_tool_config,
+    normalize_path_string,
 )
 from pydoppelgangerhunt.coverage import (
     check_asymmetric_coverage,
@@ -38,6 +42,8 @@ from pydoppelgangerhunt.fixer import (
     check_units_overlap,
     extract_unit_comments_and_pragmas,
     filter_overlapping_clone_units,
+    find_enclosing_class,
+    find_enclosing_function,
     generate_refactoring_patch,
     refactor_module_units,
     replace_unit_in_source,
@@ -72,7 +78,9 @@ from pydoppelgangerhunt.matcher import (
 )
 from pydoppelgangerhunt.metrics import compute_repository_dry_stats
 from pydoppelgangerhunt.parser import (
+    BRANCH_NODE_TYPES,
     BUILTIN_NAMES,
+    COMPOUND_BLOCK_TYPES,
     compute_cyclomatic_complexity,
     extract_call_sequence,
     get_ast_characteristic_vector,
@@ -157,6 +165,8 @@ __all__ = [
     "extract_unit_comments_and_pragmas",
     "check_units_overlap",
     "filter_overlapping_clone_units",
+    "find_enclosing_class",
+    "find_enclosing_function",
     "refactor_module_units",
     "generate_refactoring_patch",
     "compute_unit_structural_hash",
@@ -166,6 +176,8 @@ __all__ = [
     "pure_structural_fingerprint",
     "record_baseline",
     "load_baseline",
+    "BaselineFingerprints",
+    "PruneResult",
     "filter_clones_by_baseline",
     "prune_baseline",
     "clone_pair_fingerprint",
@@ -175,4 +187,8 @@ __all__ = [
     "DEFAULT_EXCLUDES",
     "DEFAULT_TOOL_TOML_CONTENT",
     "BUILTIN_NAMES",
+    "canonical_path_key",
+    "normalize_path_string",
+    "COMPOUND_BLOCK_TYPES",
+    "BRANCH_NODE_TYPES",
 ]

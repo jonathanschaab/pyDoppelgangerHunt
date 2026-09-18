@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.baseline import (
     filter_clones_by_baseline,
@@ -14,7 +15,12 @@ from pydoppelgangerhunt.baseline import (
     record_baseline,
 )
 from pydoppelgangerhunt.clustering import cluster_clone_families
-from pydoppelgangerhunt.config import DEFAULT_EXCLUDES, init_tool_configuration, load_tool_config
+from pydoppelgangerhunt.config import (
+    DEFAULT_EXCLUDES,
+    init_tool_configuration,
+    load_tool_config,
+    normalize_path_string,
+)
 from pydoppelgangerhunt.coverage import check_asymmetric_coverage, read_coverage_data
 from pydoppelgangerhunt.fixer import generate_refactoring_patch
 from pydoppelgangerhunt.git_diff import (
@@ -50,7 +56,12 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         prog="pydoppelgangerhunt",
         description="pyDoppelgangerHunt: AST Structural Code Clone & Redundancy Gate",
     )
-    parser.add_argument("target", nargs="?", default="pyfloorplanner", help="Directory or package to scan")
+    parser.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="Directory or package to scan (default: configured target or current directory)",
+    )
     parser.add_argument("--threshold", type=float, default=None, help="Minimum similarity threshold (0.0 - 1.0)")
     parser.add_argument("--min-lines", type=int, default=None, help="Minimum lines of code per function/block")
     parser.add_argument("--min-tokens", type=int, default=None, help="Minimum normalized AST tokens")
@@ -62,6 +73,14 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
     parser.add_argument("--output", "-o", type=str, default=None, help="Output file path to save report")
     parser.add_argument("--html", type=str, default=None, help="Path to write standalone interactive HTML report")
     parser.add_argument("--patch", type=str, default=None, help="Path to write git-apply compatible refactoring patch file")
+    parser.add_argument("--replace-clones", action="store_true", help="Replace clone bodies with calls to the synthesized helper in generated patches")
+    parser.add_argument(
+        "--type-merge-strategy",
+        type=str,
+        choices=["fallback_any", "union"],
+        default=None,
+        help="Type annotation merging strategy for shared helper parameter synthesis ('fallback_any' or 'union'; default: 'fallback_any')",
+    )
     parser.add_argument("--sort-by", choices=["similarity", "priority", "sloc"], default="similarity", help="Sort clones by similarity, priority, or sloc (default: similarity)")
     parser.add_argument("--priority", action="store_true", help="Shortcut to sort clones by Priority score (Similarity * SLOC * Complexity)")
     parser.add_argument("--top", type=int, default=None, help="Truncate report to top N clone pairs")
@@ -116,6 +135,13 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
     parser.add_argument("--workers", type=int, default=None, help="Number of worker processes for parallel AST harvesting (default: 1)")
     parser.add_argument("--max-index-frequency", type=float, default=None, help="Inverted index frequency threshold to prune ubiquitous shingles (default: 0.25)")
     parser.add_argument("--min-corpus-units", type=int, default=None, help="Minimum corpus unit count before activating dynamic frequency stop-shingle pruning (default: 4)")
+    parser.add_argument(
+        "--method-binding",
+        type=str,
+        choices=["auto", "method", "module"],
+        default=None,
+        help="Target method binding strategy for patch refactoring ('auto', 'method', or 'module'; default: 'auto')",
+    )
 
     color_group = parser.add_mutually_exclusive_group()
     color_group.add_argument("--color", dest="color", action="store_true", default=None, help="Force colorized terminal output")
@@ -159,7 +185,9 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
 
 def _write_artifact_file(dest_path: str, content: str, label: str, verbose: bool = True) -> None:
     """Writes report content to disk and emits console confirmation."""
-    with open(dest_path, "w", encoding="utf-8") as fh:
+    out_p = Path(dest_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_p, "w", encoding="utf-8") as fh:
         fh.write(content)
     if verbose:
         print(f"[{label}] Saved to {dest_path}")
@@ -169,15 +197,16 @@ def _audit_clone_risk_warnings(
     u1: Dict[str, Any],
     u2: Dict[str, Any],
     *,
-    audit_blame: bool,
-    cov_data: Dict[str, Set[int]],
-    use_color: bool,
+    audit_blame: bool = False,
+    cov_data: Optional[Dict[str, Set[int]]] = None,
+    use_color: bool = False,
     indent: str = "    ",
+    repo_root: Optional[str] = None,
 ) -> List[str]:
     """Audits temporal divergence and asymmetric test coverage risks for a clone pair."""
     lines: List[str] = []
     if audit_blame:
-        div = check_temporal_divergence(u1, u2)
+        div = check_temporal_divergence(u1, u2, repo_root=repo_root)
         if div:
             msg = f"{indent}[WARN] Divergent clone risk: {div['divergence_days']} days difference between edits!"
             print(colorize(msg, COLOR_YELLOW, use_color))
@@ -186,10 +215,311 @@ def _audit_clone_risk_warnings(
         asym = check_asymmetric_coverage(u1, u2, cov_data)
         if asym:
             c1, c2 = asym
-            msg = f"{indent}[WARN] Asymmetric test coverage: {u1['file']} ({c1:.0%}) vs {u2['file']} ({c2:.0%})"
+            f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+            f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
+            msg = f"{indent}[WARN] Asymmetric test coverage: {f1} ({c1:.0%}) vs {f2} ({c2:.0%})"
             print(colorize(msg, COLOR_YELLOW, use_color))
             lines.append(msg)
     return lines
+
+
+def _run_type4_semantic_audit(
+    target: str,
+    excludes: List[str],
+    strict_type4: bool,
+    use_color: bool,
+) -> bool:
+    """Runs optional Type-4 semantic clone checks, returning True if strict check failed."""
+    try:
+        import importlib  # pylint: disable=import-outside-toplevel
+        mod = importlib.import_module("check_semantic_clones")
+        find_semantic_clones = getattr(mod, "find_semantic_clones")
+        report_semantic_results = getattr(mod, "report_semantic_results")
+        print(f"Scanning '{target}' for Type-4 Semantic Clones & Consistency Violations...")
+        results = find_semantic_clones(target, excludes=excludes)
+        has_violations = report_semantic_results(results)
+        if has_violations and strict_type4:
+            print(colorize("[FAIL] Type-4 semantic clone violations detected!", COLOR_BOLD + COLOR_RED, use_color))
+            return True
+    except (ImportError, AttributeError):
+        print("[INFO] check_semantic_clones not found; skipping Type-4 scan.")
+    return False
+
+
+def _format_scan_mode_description(
+    args: argparse.Namespace,
+    *,
+    strip_annotations: bool,
+    strip_docstrings: bool,
+    idioms_enabled: bool,
+    call_seq_enabled: bool,
+    audit_tests_enabled: bool,
+    stop_shingles_enabled: bool,
+) -> str:
+    """Builds human-readable description string of active AST scanning modes."""
+    modes: List[str] = ["functions"]
+    if not args.functions_only:
+        modes.append("compound blocks")
+    flag_modes = [
+        (args.sliding_window, "sliding windows"),
+        (args.complex_expressions, "complex expressions"),
+        (args.clause_level, "clause branches"),
+        (args.data_tables, "data tables"),
+        (args.class_level, "classes"),
+        (args.merge_subtrees, "merged subtrees"),
+        (args.blind_indexing, "blind indexed"),
+        (strip_annotations, "untyped"),
+        (strip_docstrings, "docstrings stripped"),
+        (args.blind_literals, "blind literals"),
+        (args.bag_of_tokens, "bag of tokens"),
+        (args.filter_boilerplate, "filtered boilerplate"),
+        (args.consistent_renaming, "consistent renaming"),
+        (args.tfidf, "tfidf weighted"),
+        (args.harvest_closures, "closure harvesting"),
+        (args.commutative, "commutative"),
+        (args.comprehensions, "comprehensions"),
+        (idioms_enabled, "idioms canonicalized"),
+        (args.abstract_expressions, "abstract expressions"),
+        (args.gapped_tolerance, "gapped tolerance"),
+        (call_seq_enabled, "call sequences"),
+        (audit_tests_enabled, "audit tests"),
+        (stop_shingles_enabled, "stop-shingles filtered"),
+        (args.nms, "nms suppressed"),
+    ]
+    for is_enabled, label in flag_modes:
+        if is_enabled:
+            modes.append(label)
+    return " + ".join(modes)
+
+
+def _render_dry_scorecard(stats: Dict[str, Any], use_color: bool) -> None:
+    """Emits ASCII scorecard and duplication summary to console."""
+    print("\n" + "=" * 55)
+    grade = str(stats.get("grade", "A+"))
+    grade_color = COLOR_GREEN if grade in ("A+", "A") else (COLOR_YELLOW if grade in ("B", "C") else COLOR_RED)
+    score_str = colorize(f"{float(stats.get('dry_score', 100.0)):.1f}% (Grade: {grade})", COLOR_BOLD + grade_color, use_color)
+    print(f"pyDoppelgangerHunt DRY Scorecard: {score_str}")
+    print(f"SLOC: {int(stats.get('sloc', 0)):,} | DLOC: {int(stats.get('dloc', 0)):,} | Duplication: {float(stats.get('duplication_pct', 0.0)):.2f}%")
+    print(f"Clone Pairs: {int(stats.get('clone_pairs', 0))} | Clone Families: {int(stats.get('clone_families', 0))}")
+    print("=" * 55)
+
+
+def _render_pair_diff_and_suggestions(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    *,
+    args: argparse.Namespace,
+    target_repo_root: str,
+    use_color: bool,
+    indent: str = "    ",
+) -> List[str]:
+    """Renders optional refactoring suggestion and unified diff for a pair of clone units."""
+    lines: List[str] = []
+    if args.suggest:
+        sug = synthesize_refactoring_suggestion(u1, u2, repo_root=target_repo_root)
+        sug_colored = colorize(sug, COLOR_YELLOW, use_color)
+        print(indent + sug_colored.replace("\n", "\n" + indent))
+        lines.append(indent + sug.replace("\n", "\n" + indent))
+    if args.diff:
+        diff_out = generate_clone_diff(
+            u1, u2, repo_root=target_repo_root, color=use_color
+        )
+        if diff_out:
+            print(f"{indent}--- Diff ---")
+            print(indent + diff_out.replace("\n", "\n" + indent))
+            lines.append(f"{indent}--- Diff ---\n{indent}" + diff_out.replace("\n", "\n" + indent))
+    return lines
+
+
+def _apply_baseline_and_diff_filters(
+    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
+    args: argparse.Namespace,
+    tool_cfg: Dict[str, Any],
+    target_repo_root: str,
+) -> Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Optional[int]]:
+    """Applies baseline pruning, baseline suppression, and git diff line filtering.
+
+    Returns:
+        Tuple of (filtered_clones, early_exit_code). If early_exit_code is not None, execution should terminate.
+    """
+    baseline_path = args.baseline or tool_cfg.get("baseline")
+
+    if args.prune_baseline:
+        if not baseline_path:
+            print("[ERROR] --prune-baseline requires a baseline path (specify via --baseline or config)")
+            return clones, 1
+        if not os.path.exists(baseline_path):
+            print(f"[ERROR] Baseline file '{baseline_path}' not found")
+            return clones, 1
+        try:
+            prune_res = prune_baseline(
+                baseline_path, clones, repo_root=target_repo_root
+            )
+        except TypeError:
+            prune_res = prune_baseline(baseline_path, clones)
+        pruned_count = prune_res[0]
+        retained_count = prune_res[1]
+        skipped_dirty = getattr(prune_res, "skipped_dirty_count", 0)
+        if args.format == "text":
+            if skipped_dirty > 0:
+                print(
+                    f"[BASELINE] Pruned {pruned_count} orphaned fingerprint(s) from {baseline_path} "
+                    f"({skipped_dirty} skipped due to unstaged git changes, {retained_count} retained)."
+                )
+            else:
+                print(
+                    f"[BASELINE] Pruned {pruned_count} orphaned fingerprint(s) from {baseline_path} "
+                    f"({retained_count} retained)."
+                )
+
+    if baseline_path:
+        base_fps = load_baseline(baseline_path)
+        clones, suppressed_count = filter_clones_by_baseline(clones, base_fps)
+        if args.format == "text":
+            print(f"[BASELINE] Suppressed {suppressed_count} grandfathered clone(s). {len(clones)} un-grandfathered clone(s) remaining.")
+
+    if args.diff_only:
+        diff_policy = args.partial_hunk_policy or str(tool_cfg.get("partial_hunk_policy", "any"))
+        min_overlap = (
+            args.min_diff_overlap
+            if args.min_diff_overlap is not None
+            else float(tool_cfg.get("min_diff_overlap", 0.0))
+        )
+        try:
+            modified_ranges = get_git_modified_line_ranges(
+                since_ref=args.since, repo_root=target_repo_root
+            )
+        except TypeError:
+            modified_ranges = get_git_modified_line_ranges(since_ref=args.since)
+        clones = filter_clones_by_git_diff(
+            clones,
+            modified_ranges,
+            policy=diff_policy,
+            min_overlap_ratio=min_overlap,
+        )
+        if args.format == "text":
+            print(f"[INFO] Filtered by git diff (policy={diff_policy}): {len(clones)} clone pair(s) touch modified lines.")
+
+    return clones, None
+
+
+def _render_text_violations(
+    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
+    threshold: float,
+    sort_by: str,
+    *,
+    args: argparse.Namespace,
+    families: Optional[List[Dict[str, Any]]] = None,
+    cov_data: Optional[Dict[str, Set[int]]] = None,
+    use_color: bool = False,
+    target_repo_root: str = ".",
+    audit_tests_enabled: bool = False,
+) -> List[str]:
+    """Renders human-readable text output for clone violations (either clustered families or pairwise)."""
+    report_lines: List[str] = []
+    active_cov = cov_data or {}
+    if args.cluster and families is not None:
+        title = f"\n[VIOLATION] Clustered into {len(families)} Clone Family/Families (from {len(clones)} pairwise hits) >= {threshold:.0%}:\n"
+        print(colorize(title, COLOR_BOLD + COLOR_RED, use_color))
+        report_lines.append(title)
+        for fam in families:
+            fam_badge = colorize(f"[{fam['family_id']}]", COLOR_BOLD + COLOR_MAGENTA, use_color)
+            coherence_str = f", {fam['coherence']:.1%} coherence" if "coherence" in fam else ""
+            f_head = (
+                f"  * {fam_badge} {fam['member_count']} members "
+                f"(avg sim {fam['avg_similarity']:.1%}{coherence_str}, max {fam['max_similarity']:.1%}, "
+                f"{fam['total_lines']} lines across {len(fam['unique_files'])} file(s)):"
+            )
+            print(f_head)
+            report_lines.append(f_head)
+            medoid_name = (
+                str(fam["medoid"].get("name") or "")
+                if isinstance(fam.get("medoid"), dict)
+                else None
+            )
+            for m in fam.get("members", []):
+                m_file = normalize_path_string(str(m.get("file") or ""), strip_anchor=False)
+                m_start = int(m.get("start") or 1)
+                m_end = int(m.get("end") or m_start)
+                m_name = str(m.get("name") or "member")
+                m_tag = " [medoid]" if medoid_name and m_name == medoid_name else ""
+                m_line = f"      - {m_file}:{m_start}-{m_end} ({m_name}){m_tag}"
+                print(m_line)
+                report_lines.append(m_line)
+            if len(fam["members"]) >= 2:
+                report_lines.extend(
+                    _audit_clone_risk_warnings(
+                        fam["members"][0],
+                        fam["members"][1],
+                        audit_blame=args.blame,
+                        cov_data=active_cov,
+                        use_color=use_color,
+                        indent="      ",
+                        repo_root=target_repo_root,
+                    )
+                )
+                report_lines.extend(
+                    _render_pair_diff_and_suggestions(
+                        fam["members"][0],
+                        fam["members"][1],
+                        args=args,
+                        target_repo_root=target_repo_root,
+                        use_color=use_color,
+                        indent="      ",
+                    )
+                )
+    else:
+        title = f"\n[VIOLATION] Found {len(clones)} AST structural clone pair(s) >= {threshold:.0%}:\n"
+        print(colorize(title, COLOR_BOLD + COLOR_RED, use_color))
+        report_lines.append(title)
+        for sim, u1, u2 in clones:
+            sim_badge = colorize(f"[{sim:.1%}]", COLOR_BOLD + COLOR_CYAN, use_color)
+            prefix = f"  * {sim_badge}"
+            if sort_by == "priority":
+                p_val = compute_priority_score(sim, u1, u2)
+                p_badge = colorize(f"[Priority {p_val:.1f}]", COLOR_BOLD + COLOR_MAGENTA, use_color)
+                prefix = f"  * {sim_badge} {p_badge}"
+            f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+            f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
+            s1 = int(u1.get("start") or 1)
+            e1 = int(u1.get("end") or s1)
+            s2 = int(u2.get("start") or 1)
+            e2 = int(u2.get("end") or s2)
+            n1 = str(u1.get("name") or "unit1")
+            n2 = str(u2.get("name") or "unit2")
+            line = f"{prefix} {f1}:{s1}-{e1} ({n1}) <===> {f2}:{s2}-{e2} ({n2})"
+            print(line)
+            report_lines.append(line)
+            report_lines.extend(
+                _audit_clone_risk_warnings(
+                    u1,
+                    u2,
+                    audit_blame=args.blame,
+                    cov_data=active_cov,
+                    use_color=use_color,
+                    indent="    ",
+                    repo_root=target_repo_root,
+                )
+            )
+            if audit_tests_enabled and n1.startswith("test_") and n2.startswith("test_"):
+                tip = colorize("    [TIP] Consider refactoring with @pytest.mark.parametrize", COLOR_YELLOW, use_color)
+                print(tip)
+                report_lines.append("    [TIP] Consider refactoring with @pytest.mark.parametrize")
+            report_lines.extend(
+                _render_pair_diff_and_suggestions(
+                    u1,
+                    u2,
+                    args=args,
+                    target_repo_root=target_repo_root,
+                    use_color=use_color,
+                    indent="    ",
+                )
+            )
+
+    footer = "\nPlease refactor structural duplicates into shared helpers, base models, or declarative specifications."
+    print(footer)
+    report_lines.append(footer)
+    return report_lines
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -197,15 +527,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
+    target_arg = args.target
     if args.init:
-        cfg_target = init_tool_configuration(args.target if os.path.isdir(args.target) else ".")
+        init_dir = target_arg if (target_arg and os.path.isdir(target_arg)) else "."
+        cfg_target = init_tool_configuration(init_dir)
         print(f"[OK] Initialized pyDoppelgangerHunt configuration at {cfg_target}")
         return 0
 
     use_color = supports_color(args.color)
 
     # Load configuration from pyproject.toml / config file
-    tool_cfg = load_tool_config(args.config)
+    tool_cfg: Dict[str, Any] = {}
+    if args.config:
+        tool_cfg = load_tool_config(args.config)
+    else:
+        if target_arg:
+            target_dir = (
+                target_arg
+                if os.path.isdir(target_arg)
+                else (os.path.dirname(target_arg) or ".")
+            )
+            if target_dir != ".":
+                try:
+                    tool_cfg = load_tool_config(repo_root=target_dir)
+                except TypeError:
+                    pass
+        if not tool_cfg:
+            tool_cfg = load_tool_config()
+    cfg_target = str(tool_cfg.get("target") or "")
+    default_dir = (
+        cfg_target
+        if cfg_target and os.path.isdir(cfg_target)
+        else (
+            "pydoppelgangerhunt"
+            if os.path.isdir("pydoppelgangerhunt")
+            else ("src" if os.path.isdir("src") else ".")
+        )
+    )
+    target = target_arg or default_dir
+    target_repo_root = target if os.path.isdir(target) else (os.path.dirname(target) or ".")
     threshold = args.threshold if args.threshold is not None else float(tool_cfg.get("threshold", 0.90))
     min_lines = args.min_lines if args.min_lines is not None else int(tool_cfg.get("min_lines", 8))
     min_tokens = args.min_tokens if args.min_tokens is not None else int(tool_cfg.get("min_tokens", 15))
@@ -239,62 +599,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     strip_docstrings = not args.preserve_docstrings
     strip_annotations = True if args.strip_annotations else (not args.preserve_annotations)
 
-    if args.type4:
-        try:
-            import importlib  # pylint: disable=import-outside-toplevel
-            mod = importlib.import_module("check_semantic_clones")
-            find_semantic_clones = getattr(mod, "find_semantic_clones")
-            report_semantic_results = getattr(mod, "report_semantic_results")
-            print(f"Scanning '{args.target}' for Type-4 Semantic Clones & Consistency Violations...")
-            results = find_semantic_clones(args.target, excludes=excludes)
-            has_violations = report_semantic_results(results)
-            if has_violations and args.strict_type4:
-                print(colorize("[FAIL] Type-4 semantic clone violations detected!", COLOR_BOLD + COLOR_RED, use_color))
-                return 1
-        except (ImportError, AttributeError):
-            print("[INFO] check_semantic_clones not found; skipping Type-4 scan.")
+    raw_binding = args.method_binding or str(tool_cfg.get("method_binding", "auto"))
+    method_binding = raw_binding if raw_binding in ("auto", "method", "module") else "auto"
+    replace_clones = args.replace_clones or bool(tool_cfg.get("replace_clones", False))
+    raw_strategy = args.type_merge_strategy or str(tool_cfg.get("type_merge_strategy", "fallback_any"))
+    type_merge_strategy = raw_strategy if raw_strategy in ("fallback_any", "union") else "fallback_any"
 
-    modes: List[str] = ["functions"]
-    if not args.functions_only:
-        modes.append("compound blocks")
-    flag_modes = [
-        (args.sliding_window, "sliding windows"),
-        (args.complex_expressions, "complex expressions"),
-        (args.clause_level, "clause branches"),
-        (args.data_tables, "data tables"),
-        (args.class_level, "classes"),
-        (args.merge_subtrees, "merged subtrees"),
-        (args.blind_indexing, "blind indexed"),
-        (strip_annotations, "untyped"),
-        (strip_docstrings, "docstrings stripped"),
-        (args.blind_literals, "blind literals"),
-        (args.bag_of_tokens, "bag of tokens"),
-        (args.filter_boilerplate, "filtered boilerplate"),
-        (args.consistent_renaming, "consistent renaming"),
-        (args.tfidf, "tfidf weighted"),
-        (args.harvest_closures, "closure harvesting"),
-        (args.commutative, "commutative"),
-        (args.comprehensions, "comprehensions"),
-        (idioms_enabled, "idioms canonicalized"),
-        (args.abstract_expressions, "abstract expressions"),
-        (args.gapped_tolerance, "gapped tolerance"),
-        (call_seq_enabled, "call sequences"),
-        (audit_tests_enabled, "audit tests"),
-        (stop_shingles_enabled, "stop-shingles filtered"),
-        (args.nms, "nms suppressed"),
-    ]
-    for is_enabled, label in flag_modes:
-        if is_enabled:
-            modes.append(label)
-    mode_desc = " + ".join(modes)
+    if args.type4 and _run_type4_semantic_audit(target, excludes, args.strict_type4, use_color):
+        return 1
+
+    mode_desc = _format_scan_mode_description(
+        args,
+        strip_annotations=strip_annotations,
+        strip_docstrings=strip_docstrings,
+        idioms_enabled=idioms_enabled,
+        call_seq_enabled=call_seq_enabled,
+        audit_tests_enabled=audit_tests_enabled,
+        stop_shingles_enabled=stop_shingles_enabled,
+    )
 
     if args.format == "text":
-        print(f"\nScanning '{args.target}' for AST structural clones (threshold >= {threshold:.0%}, min_lines={min_lines}, mode: {mode_desc})...")
+        print(f"\nScanning '{target}' for AST structural clones (threshold >= {threshold:.0%}, min_lines={min_lines}, mode: {mode_desc})...")
 
     sort_by = "priority" if args.priority else args.sort_by
 
     clones = scan_target(
-        args.target,
+        target,
+        repo_root=target_repo_root,
         min_lines=min_lines,
         min_tokens=min_tokens,
         threshold=threshold,
@@ -336,57 +667,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     if args.record_baseline:
-        bp = record_baseline(clones, args.record_baseline, args.target, threshold)
+        bp = record_baseline(clones, args.record_baseline, target, threshold)
         print(f"[OK] Recorded {len(clones)} clone baseline pair(s) to {bp}")
         return 0
 
-    baseline_path = args.baseline or tool_cfg.get("baseline")
-
-    if args.prune_baseline:
-        if not baseline_path:
-            print("[ERROR] --prune-baseline requires a baseline path (specify via --baseline or config)")
-            return 1
-        if not os.path.exists(baseline_path):
-            print(f"[ERROR] Baseline file '{baseline_path}' not found")
-            return 1
-        prune_res = prune_baseline(baseline_path, clones)
-        pruned_count = prune_res[0]
-        retained_count = prune_res[1]
-        skipped_dirty = getattr(prune_res, "skipped_dirty_count", 0)
-        if args.format == "text":
-            if skipped_dirty > 0:
-                print(
-                    f"[BASELINE] Pruned {pruned_count} orphaned fingerprint(s) from {baseline_path} "
-                    f"({skipped_dirty} skipped due to unstaged git changes, {retained_count} retained)."
-                )
-            else:
-                print(
-                    f"[BASELINE] Pruned {pruned_count} orphaned fingerprint(s) from {baseline_path} "
-                    f"({retained_count} retained)."
-                )
-
-    if baseline_path:
-        base_fps = load_baseline(baseline_path)
-        clones, suppressed_count = filter_clones_by_baseline(clones, base_fps)
-        if args.format == "text":
-            print(f"[BASELINE] Suppressed {suppressed_count} grandfathered clone(s). {len(clones)} un-grandfathered clone(s) remaining.")
-
-    if args.diff_only:
-        diff_policy = args.partial_hunk_policy or str(tool_cfg.get("partial_hunk_policy", "any"))
-        min_overlap = (
-            args.min_diff_overlap
-            if args.min_diff_overlap is not None
-            else float(tool_cfg.get("min_diff_overlap", 0.0))
-        )
-        modified_ranges = get_git_modified_line_ranges(since_ref=args.since)
-        clones = filter_clones_by_git_diff(
-            clones,
-            modified_ranges,
-            policy=diff_policy,
-            min_overlap_ratio=min_overlap,
-        )
-        if args.format == "text":
-            print(f"[INFO] Filtered by git diff (policy={diff_policy}): {len(clones)} clone pair(s) touch modified lines.")
+    clones, early_exit = _apply_baseline_and_diff_filters(
+        clones, args, tool_cfg, target_repo_root=target_repo_root
+    )
+    if early_exit is not None:
+        return early_exit
 
     families: Optional[List[Dict[str, Any]]] = None
     if args.cluster:
@@ -410,9 +699,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     stats: Optional[Dict[str, Any]] = None
     if args.stats or args.summary or args.html:
-        stats = compute_repository_dry_stats(args.target, clones, excludes=excludes)
+        stats = compute_repository_dry_stats(
+            target,
+            clones,
+            excludes=excludes,
+            include_notebooks=getattr(args, "notebooks", False),
+        )
         if args.summary:
-            _write_artifact_file(args.summary, format_markdown_summary(stats, args.target), "SUMMARY", args.format == "text")
+            _write_artifact_file(args.summary, format_markdown_summary(stats, target), "SUMMARY", args.format == "text")
 
     cov_data: Dict[str, Set[int]] = {}
     if args.coverage:
@@ -421,16 +715,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.html:
         html_report = generate_html_report(
             clones,
-            args.target,
+            target,
             threshold,
             families=families,
             stats=stats,
+            repo_root=target_repo_root,
         )
         _write_artifact_file(args.html, html_report, "HTML", args.format == "text")
 
     if args.patch:
-        patch_text = generate_refactoring_patch(clones) if clones else ""
+        patch_text = (
+            generate_refactoring_patch(
+                clones,
+                repo_root=target_repo_root,
+                type_merge_strategy=type_merge_strategy,
+                replace_clones=replace_clones,
+                method_binding=method_binding,
+            )
+            if clones
+            else ""
+        )
         _write_artifact_file(args.patch, patch_text, "PATCH", args.format == "text")
+    elif args.replace_clones and args.format == "text":
+        print(
+            colorize(
+                "Warning: --replace-clones specified without --patch; no patch will be generated.",
+                COLOR_BOLD + COLOR_YELLOW,
+                use_color,
+            )
+        )
 
     if args.github_annotations and clones:
         annotations = format_github_annotations(clones)
@@ -439,9 +752,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.format in ("sarif", "json"):
         report_data = (
-            format_sarif_report(clones, args.target, threshold)
+            format_sarif_report(clones, target, threshold)
             if args.format == "sarif"
-            else format_json_report(clones, args.target, threshold, families=families, stats=stats)
+            else format_json_report(clones, target, threshold, families=families, stats=stats)
         )
         emit_structured_report(
             report_data, "SARIF 2.1.0" if args.format == "sarif" else "JSON", args.output
@@ -450,111 +763,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # Text format
     if stats and args.stats:
-        print("\n" + "=" * 55)
-        grade_color = COLOR_GREEN if stats["grade"] in ("A+", "A") else (COLOR_YELLOW if stats["grade"] in ("B", "C") else COLOR_RED)
-        score_str = colorize(f"{stats['dry_score']:.1f}% (Grade: {stats['grade']})", COLOR_BOLD + grade_color, use_color)
-        print(f"pyDoppelgangerHunt DRY Scorecard: {score_str}")
-        print(f"SLOC: {stats['sloc']:,} | DLOC: {stats['dloc']:,} | Duplication: {stats['duplication_pct']:.2f}%")
-        print(f"Clone Pairs: {stats['clone_pairs']} | Clone Families: {stats['clone_families']}")
-        print("=" * 55)
+        _render_dry_scorecard(stats, use_color)
 
     if not clones:
         ok_msg = colorize(f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!", COLOR_BOLD + COLOR_GREEN, use_color)
         print(ok_msg)
         if args.output:
-            with open(args.output, "w", encoding="utf-8") as fh:
+            out_p = Path(args.output)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_p, "w", encoding="utf-8") as fh:
                 fh.write(f"[OK] No structural code clones found with similarity >= {threshold:.0%}. Codebase is DRY!\n")
         return 0
 
-    report_lines: List[str] = []
-    if args.cluster and families is not None:
-        title = f"\n[VIOLATION] Clustered into {len(families)} Clone Family/Families (from {len(clones)} pairwise hits) >= {threshold:.0%}:\n"
-        print(colorize(title, COLOR_BOLD + COLOR_RED, use_color))
-        report_lines.append(title)
-        for fam in families:
-            fam_badge = colorize(f"[{fam['family_id']}]", COLOR_BOLD + COLOR_MAGENTA, use_color)
-            coherence_str = f", {fam['coherence']:.1%} coherence" if "coherence" in fam else ""
-            f_head = (
-                f"  * {fam_badge} {fam['member_count']} members "
-                f"(avg sim {fam['avg_similarity']:.1%}{coherence_str}, max {fam['max_similarity']:.1%}, "
-                f"{fam['total_lines']} lines across {len(fam['unique_files'])} file(s)):"
-            )
-            print(f_head)
-            report_lines.append(f_head)
-            medoid_name = fam.get("medoid", {}).get("name") if fam.get("medoid") else None
-            for m in fam["members"]:
-                m_tag = " [medoid]" if medoid_name and m["name"] == medoid_name else ""
-                m_line = f"      - {m['file']}:{m['start']}-{m['end']} ({m['name']}){m_tag}"
-                print(m_line)
-                report_lines.append(m_line)
-            if len(fam["members"]) >= 2:
-                report_lines.extend(
-                    _audit_clone_risk_warnings(
-                        fam["members"][0],
-                        fam["members"][1],
-                        audit_blame=args.blame,
-                        cov_data=cov_data,
-                        use_color=use_color,
-                        indent="      ",
-                    )
-                )
-            if args.suggest and len(fam["members"]) >= 2:
-                sug = synthesize_refactoring_suggestion(fam["members"][0], fam["members"][1])
-                sug_colored = colorize(sug, COLOR_YELLOW, use_color)
-                print("      " + sug_colored.replace("\n", "\n      "))
-                report_lines.append("      " + sug.replace("\n", "\n      "))
-            if args.diff and len(fam["members"]) >= 2:
-                diff_out = generate_clone_diff(fam["members"][0], fam["members"][1], color=use_color)
-                if diff_out:
-                    print("      --- Diff ---")
-                    print("      " + diff_out.replace("\n", "\n      "))
-                    report_lines.append("      --- Diff ---\n      " + diff_out.replace("\n", "\n      "))
-    else:
-        title = f"\n[VIOLATION] Found {len(clones)} AST structural clone pair(s) >= {threshold:.0%}:\n"
-        print(colorize(title, COLOR_BOLD + COLOR_RED, use_color))
-        report_lines.append(title)
-        for sim, u1, u2 in clones:
-            sim_badge = colorize(f"[{sim:.1%}]", COLOR_BOLD + COLOR_CYAN, use_color)
-            prefix = f"  * {sim_badge}"
-            if sort_by == "priority":
-                p_val = compute_priority_score(sim, u1, u2)
-                p_badge = colorize(f"[Priority {p_val:.1f}]", COLOR_BOLD + COLOR_MAGENTA, use_color)
-                prefix = f"  * {sim_badge} {p_badge}"
-            line = f"{prefix} {u1['file']}:{u1['start']}-{u1['end']} ({u1['name']}) <===> {u2['file']}:{u2['start']}-{u2['end']} ({u2['name']})"
-            print(line)
-            report_lines.append(line)
-            report_lines.extend(
-                _audit_clone_risk_warnings(
-                    u1,
-                    u2,
-                    audit_blame=args.blame,
-                    cov_data=cov_data,
-                    use_color=use_color,
-                    indent="    ",
-                )
-            )
-            if audit_tests_enabled and u1["name"].startswith("test_") and u2["name"].startswith("test_"):
-                tip = colorize("    [TIP] Consider refactoring with @pytest.mark.parametrize", COLOR_YELLOW, use_color)
-                print(tip)
-                report_lines.append("    [TIP] Consider refactoring with @pytest.mark.parametrize")
-            if args.suggest:
-                sug = synthesize_refactoring_suggestion(u1, u2)
-                sug_colored = colorize(sug, COLOR_YELLOW, use_color)
-                print("    " + sug_colored.replace("\n", "\n    "))
-                report_lines.append("    " + sug.replace("\n", "\n    "))
-            if args.diff:
-                diff_out = generate_clone_diff(u1, u2, color=use_color)
-                if diff_out:
-                    print("    --- Diff ---")
-                    print("    " + diff_out.replace("\n", "\n    "))
-                    report_lines.append("    --- Diff ---\n    " + diff_out.replace("\n", "\n    "))
-
-    footer = "\nPlease refactor structural duplicates into shared helpers, base models, or declarative specifications."
-    print(footer)
-    report_lines.append(footer)
+    report_lines = _render_text_violations(
+        clones,
+        threshold,
+        sort_by,
+        args=args,
+        families=families,
+        cov_data=cov_data,
+        use_color=use_color,
+        target_repo_root=target_repo_root,
+        audit_tests_enabled=audit_tests_enabled,
+    )
 
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as fh:
+        out_p = Path(args.output)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_p, "w", encoding="utf-8") as fh:
             fh.write("\n".join(report_lines) + "\n")
 
     return 1

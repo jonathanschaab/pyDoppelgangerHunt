@@ -6,6 +6,8 @@ import os
 import subprocess
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+from pydoppelgangerhunt.config import find_matching_path_value, normalize_path_string
+
 MAJOR_POLICY_THRESHOLD: float = 0.50
 NEW_POLICY_THRESHOLD: float = 0.80
 
@@ -33,35 +35,53 @@ def parse_git_diff_hunks(diff_text: str) -> Dict[str, List[Tuple[int, int]]]:
     current_file: Optional[str] = None
 
     for line in diff_text.splitlines():
-        if line.startswith("+++ b/"):
-            current_file = line[6:].strip().replace("\\", "/")
+        if line.startswith("--- "):
+            current_file = None
+        elif line.startswith("+++ "):
+            rest = line[4:].strip()
+            if "\t" in rest:
+                rest = rest.split("\t", 1)[0].strip()
+            if rest.startswith('"') and rest.endswith('"') and len(rest) >= 2:
+                rest = rest[1:-1]
+            if rest in ("/dev/null", ""):
+                current_file = None
+            else:
+                if len(rest) > 2 and rest[1] == "/" and rest[0] in "biwc":
+                    rest = rest[2:]
+                current_file = normalize_path_string(rest.strip('"'), strip_anchor=False)
         elif line.startswith("@@ ") and current_file:
             parts = line.split(" ")
             plus_parts = [p for p in parts if p.startswith("+")]
             if plus_parts:
                 hunk_spec = plus_parts[0][1:]
-                if "," in hunk_spec:
-                    start_str, count_str = hunk_spec.split(",", 1)
-                    start = int(start_str)
-                    count = int(count_str)
-                else:
-                    start = int(hunk_spec)
-                    count = 1
-                if count > 0:
-                    modified_ranges.setdefault(current_file, []).append((start, start + count - 1))
+                try:
+                    if "," in hunk_spec:
+                        start_str, count_str = hunk_spec.split(",", 1)
+                        start = int(start_str)
+                        count = int(count_str)
+                    else:
+                        start = int(hunk_spec)
+                        count = 1
+                    if count > 0:
+                        modified_ranges.setdefault(current_file, []).append((start, start + count - 1))
+                except ValueError:
+                    pass
 
     return modified_ranges
 
 
 def get_git_modified_line_ranges(
-    since_ref: Optional[str] = None, repo_root: Optional[str] = None
+    since_ref: Optional[str] = None,
+    repo_root: Optional[str] = None,
+    cwd: Optional[str] = None,
 ) -> Dict[str, List[Tuple[int, int]]]:
     """Extracts modified line ranges for files using git diff --unified=0."""
-    args = ["diff", "--unified=0"]
+    args = ["diff", "--unified=0", "--src-prefix=a/", "--dst-prefix=b/"]
     if since_ref:
         args.append(since_ref)
 
-    diff_output = _run_git_command(args, cwd=repo_root)
+    effective_cwd = repo_root or cwd
+    diff_output = _run_git_command(args, cwd=effective_cwd)
     if not diff_output:
         return {}
 
@@ -95,18 +115,12 @@ def compute_unit_diff_overlap(
         >>> overlap_ratio
         0.625
     """
-    norm_file = unit["file"].replace("\\", "/")
-    target_ranges = modified_ranges.get(norm_file)
-    if not target_ranges:
-        for f, ranges in modified_ranges.items():
-            if norm_file.endswith(f) or f.endswith(norm_file):
-                target_ranges = ranges
-                break
+    target_ranges = find_matching_path_value(str(unit.get("file") or ""), modified_ranges)
     if not target_ranges:
         return 0, 0.0
 
-    u_start = int(unit.get("start", 1))
-    u_end = int(unit.get("end", u_start))
+    u_start = int(unit.get("start") or 1)
+    u_end = int(unit.get("end") or u_start)
     total_unit_lines = max(1, u_end - u_start + 1)
 
     overlapping_lines: Set[int] = set()
@@ -182,7 +196,9 @@ def get_git_blame_info(
     repo_root: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Extracts git commit and author metadata for a line range using git blame --porcelain."""
-    norm_file = file_path.split("#")[0]  # strip notebook cell suffixes if present
+    norm_file = normalize_path_string(file_path, strip_anchor=True)
+    if not norm_file:
+        return {"author": "Unknown", "commit": "unknown", "timestamp": 0, "summary": ""}
     start_l = max(1, start_line)
     end_l = max(start_l, end_line)
     args = ["blame", "-L", f"{start_l},{end_l}", "--porcelain", norm_file]
@@ -192,34 +208,37 @@ def get_git_blame_info(
         return {"author": "Unknown", "commit": "unknown", "timestamp": 0, "summary": ""}
 
     latest_time = 0
-    latest_author = "Unknown"
     latest_commit = "unknown"
-    latest_summary = ""
-
+    commit_authors: Dict[str, str] = {}
+    commit_summaries: Dict[str, str] = {}
+    commit_times: Dict[str, int] = {}
     current_commit = ""
+
     for line in blame_text.splitlines():
         parts = line.split(" ", 1)
-        if len(parts[0]) == 40 and all(c in "0123456789abcdefABCDEF" for c in parts[0]):
+        if len(parts[0]) in (40, 64) and all(c in "0123456789abcdefABCDEF" for c in parts[0]):
             current_commit = parts[0][:8]
+            if latest_commit == "unknown":
+                latest_commit = current_commit
         elif line.startswith("author "):
-            author = line[7:].strip()
+            commit_authors[current_commit] = line[7:].strip()
         elif line.startswith("author-time "):
             try:
                 t_val = int(line[12:].strip())
+                commit_times[current_commit] = t_val
                 if t_val > latest_time:
                     latest_time = t_val
-                    latest_author = author
                     latest_commit = current_commit
             except ValueError:
                 pass
-        elif line.startswith("summary ") and current_commit == latest_commit:
-            latest_summary = line[8:].strip()
+        elif line.startswith("summary "):
+            commit_summaries[current_commit] = line[8:].strip()
 
     return {
-        "author": latest_author,
+        "author": commit_authors.get(latest_commit, "Unknown"),
         "commit": latest_commit,
         "timestamp": latest_time,
-        "summary": latest_summary,
+        "summary": commit_summaries.get(latest_commit, ""),
     }
 
 
@@ -230,8 +249,16 @@ def check_temporal_divergence(
     max_divergence_days: int = 90,
 ) -> Optional[Dict[str, Any]]:
     """Detects whether two clone instances exhibit temporal divergence (asymmetric commit ages)."""
-    b1 = get_git_blame_info(u1["file"], u1["start"], u1["end"], repo_root=repo_root)
-    b2 = get_git_blame_info(u2["file"], u2["start"], u2["end"], repo_root=repo_root)
+    f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+    f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
+    if not f1 or not f2:
+        return None
+    s1 = int(u1.get("start") or 1)
+    e1 = int(u1.get("end") or s1)
+    s2 = int(u2.get("start") or 1)
+    e2 = int(u2.get("end") or s2)
+    b1 = get_git_blame_info(f1, s1, e1, repo_root=repo_root)
+    b2 = get_git_blame_info(f2, s2, e2, repo_root=repo_root)
 
     t1 = b1.get("timestamp", 0)
     t2 = b2.get("timestamp", 0)

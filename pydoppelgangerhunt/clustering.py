@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+from pydoppelgangerhunt.config import canonical_path_key
+
 
 class UnionFind:
     """Disjoint-Set Union (DSU) data structure with path compression and union by rank."""
@@ -39,10 +41,17 @@ class UnionFind:
         return root1
 
 
+def _normalize_unit_file(unit: Dict[str, Any]) -> str:
+    return canonical_path_key(str(unit.get("file") or ""), strip_anchor=True)
+
+
 def unit_key(unit: Dict[str, Any]) -> str:
     """Generates unique deterministic string key for an AST unit."""
-    norm_file = unit["file"].replace("\\", "/")
-    return f"{norm_file}:{unit['start']}-{unit['end']}:{unit['name']}"
+    norm_file = canonical_path_key(str(unit.get("file") or ""), strip_anchor=False)
+    s = int(unit.get("start") or 1)
+    e = int(unit.get("end") or s)
+    name = str(unit.get("name") or "unit")
+    return f"{norm_file}:{s}-{e}:{name}"
 
 
 def compute_medoid(
@@ -93,6 +102,19 @@ def compute_medoid(
     if cache is not None and cache_key is not None:
         cache[cache_key] = res
     return res
+
+
+def _extract_unique_clusters(
+    cluster_map: Dict[str, Set[str]], all_keys: Sequence[str]
+) -> List[List[str]]:
+    """Extracts deterministically sorted unique clusters from a node-to-cluster mapping."""
+    unique_clusters_dict: Dict[Tuple[str, ...], List[str]] = {}
+    for k in all_keys:
+        c = cluster_map[k]
+        rep = tuple(sorted(c))
+        if rep not in unique_clusters_dict:
+            unique_clusters_dict[rep] = list(rep)
+    return [unique_clusters_dict[rep] for rep in sorted(unique_clusters_dict.keys())]
 
 
 def cluster_clone_families(
@@ -209,13 +231,7 @@ def cluster_clone_families(
                 for node in merged:
                     cluster_map[node] = merged
 
-        unique_clusters_dict: Dict[Tuple[str, ...], List[str]] = {}
-        for k in all_keys:
-            c = cluster_map[k]
-            rep = tuple(sorted(c))
-            if rep not in unique_clusters_dict:
-                unique_clusters_dict[rep] = list(rep)
-        raw_clusters = [unique_clusters_dict[rep] for rep in sorted(unique_clusters_dict.keys())]
+        raw_clusters = _extract_unique_clusters(cluster_map, all_keys)
 
     elif linkage == "average":
         cluster_map = {k: {k} for k in all_keys}
@@ -234,13 +250,7 @@ def cluster_clone_families(
                 for node in merged:
                     cluster_map[node] = merged
 
-        unique_clusters_dict = {}
-        for k in all_keys:
-            c = cluster_map[k]
-            rep = tuple(sorted(c))
-            if rep not in unique_clusters_dict:
-                unique_clusters_dict[rep] = list(rep)
-        raw_clusters = [unique_clusters_dict[rep] for rep in sorted(unique_clusters_dict.keys())]
+        raw_clusters = _extract_unique_clusters(cluster_map, all_keys)
 
     elif linkage in ("medoid", "centroid"):
         cluster_map = {k: {k} for k in all_keys}
@@ -266,13 +276,7 @@ def cluster_clone_families(
                 for node in merged:
                     cluster_map[node] = merged
 
-        unique_clusters_dict = {}
-        for k in all_keys:
-            c = cluster_map[k]
-            rep = tuple(sorted(c))
-            if rep not in unique_clusters_dict:
-                unique_clusters_dict[rep] = list(rep)
-        raw_clusters = [unique_clusters_dict[rep] for rep in sorted(unique_clusters_dict.keys())]
+        raw_clusters = _extract_unique_clusters(cluster_map, all_keys)
 
     else:
         raise ValueError(
@@ -284,14 +288,22 @@ def cluster_clone_families(
     families: List[Dict[str, Any]] = []
     for idx, member_keys in enumerate(clusters):
         members = [unit_map[k] for k in member_keys]
-        members.sort(key=lambda u: (u["file"].replace("\\", "/"), u["start"]))
+        members.sort(
+            key=lambda u: (
+                canonical_path_key(str(u.get("file") or ""), strip_anchor=False),
+                int(u.get("start") or 1),
+            )
+        )
         member_set = set(member_keys)
 
         family_sims = [
             sim for sim, k1, k2 in sorted_pairs if k1 in member_set and k2 in member_set
         ]
-        unique_files = sorted(list({u["file"].replace("\\", "/") for u in members}))
-        total_lines = sum(u["end"] - u["start"] + 1 for u in members)
+        unique_files = sorted(list({_normalize_unit_file(u) for u in members}))
+        total_lines = sum(
+            int(u.get("end") or int(u.get("start") or 1)) - int(u.get("start") or 1) + 1
+            for u in members
+        )
         avg_sim = (sum(family_sims) / len(family_sims)) if family_sims else 1.0
         max_sim = max(family_sims) if family_sims else 1.0
         min_sim = min(family_sims) if family_sims else 1.0
@@ -318,9 +330,9 @@ def cluster_clone_families(
         key=lambda f: (
             -f["member_count"],
             -round(f["avg_similarity"], 9),
-            f["members"][0]["file"].replace("\\", "/"),
-            f["members"][0]["start"],
-            f["medoid"]["name"],
+            _normalize_unit_file(f["members"][0]),
+            int(f["members"][0].get("start") or 1),
+            str(f["medoid"].get("name") or "") if isinstance(f.get("medoid"), dict) else "",
         )
     )
     for idx, fam in enumerate(families):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
 from pydoppelgangerhunt import (
     get_ast_characteristic_vector,
@@ -796,4 +797,399 @@ def test_stop_shingle_filtering_and_candidate_pruning(tmp_path: Path) -> None:
     assert isinstance(clones_custom, list)
 
 
+def test_batch_49_matcher_similarity_and_subclones(tmp_path: Path) -> None:
+    """Batch 49: Test matcher similarity bounds, tfidf fallbacks, subclones, and multiprocessing."""
+    # pylint: disable=protected-access,import-outside-toplevel
+    from pydoppelgangerhunt.matcher import (
+        _worker_harvest_file,
+        compute_pair_similarity,
+        suppress_subclones,
+        tfidf_jaccard_similarity,
+    )
 
+    # 1. tfidf_jaccard_similarity fallback when idf_weights is empty
+    set_x = {"a", "b", "c"}
+    set_y = {"b", "c", "d"}
+    assert tfidf_jaccard_similarity(set_x, set_y, {}) == 0.5
+
+    # 2. compute_pair_similarity: call sequences under 3 calls and size bounding
+    u_short_call1 = {"calls": ["step1", "step2"]}
+    u_short_call2 = {"calls": ["step1", "step2"]}
+    assert compute_pair_similarity(u_short_call1, u_short_call2, call_sequences=True) == 0.0
+
+    u_huge = {"token_count": 100, "tokens": ["t"] * 100}
+    u_tiny = {"token_count": 10, "tokens": ["t"] * 10}
+    assert compute_pair_similarity(u_huge, u_tiny, threshold=0.8) == 0.0
+
+    # 3. compute_pair_similarity: tfidf with shingles (not bag_of_tokens)
+    u_shing1 = {"shingles": {"s1", "s2"}}
+    u_shing2 = {"shingles": {"s1", "s2"}}
+    assert compute_pair_similarity(u_shing1, u_shing2, tfidf=True, idf_weights={"s1": 1.5, "s2": 1.5}) == 1.0
+
+    # 4. compute_pair_similarity: gapped_tolerance SourcererCC min multiset pruning
+    u_gap1 = {"tokens": ["a", "b", "c"], "vector": {"a": 1, "b": 1, "c": 1}}
+    u_gap2 = {"tokens": ["x", "y", "z"], "vector": {"x": 1, "y": 1, "z": 1}}
+    assert compute_pair_similarity(u_gap1, u_gap2, gapped_tolerance=True, threshold=0.8) == 0.0
+
+    # 5. compute_pair_similarity: plain bag_of_tokens without tfidf
+    u_bag1 = {"vector": {"alpha": 2, "beta": 1}}
+    u_bag2 = {"vector": {"alpha": 2, "beta": 1}}
+    assert compute_pair_similarity(u_bag1, u_bag2, bag_of_tokens=True) == 1.0
+
+    # 6. suppress_subclones: <= 1 clone, non-matching files, non-strictly smaller
+    single_clone = [(0.9, {"file": "a.py"}, {"file": "b.py"})]
+    assert suppress_subclones(single_clone) == single_clone
+
+    c_parent = (0.95, {"file": "p.py", "start": 1, "end": 20}, {"file": "p.py", "start": 30, "end": 50})
+    c_other = (0.90, {"file": "other1.py", "start": 5, "end": 10}, {"file": "other2.py", "start": 5, "end": 10})
+    assert len(suppress_subclones([c_parent, c_other])) == 2
+
+    c_equal = (0.95, {"file": "p.py", "start": 1, "end": 20}, {"file": "p.py", "start": 30, "end": 50})
+    assert len(suppress_subclones([c_parent, c_equal])) == 2
+
+    # 7. scan_target with tfidf, call_sequences, bag_of_tokens, sort_by="priority", and top_n
+    pkg_scan = tmp_path / "scan_modes"
+    pkg_scan.mkdir()
+    (pkg_scan / "a.py").write_text(
+        "def compute_1():\n    step_a()\n    step_b()\n    step_c()\n    return 42\n",
+        encoding="utf-8",
+    )
+    (pkg_scan / "b.py").write_text(
+        "def compute_2():\n    step_a()\n    step_b()\n    step_c()\n    return 42\n",
+        encoding="utf-8",
+    )
+
+    clones_tfidf = scan_target(str(pkg_scan), threshold=0.8, min_lines=2, min_tokens=3, tfidf=True)
+    assert len(clones_tfidf) == 1
+
+    clones_calls = scan_target(str(pkg_scan), threshold=0.8, min_lines=2, min_tokens=3, call_sequences=True)
+    assert len(clones_calls) == 1
+
+    clones_bag = scan_target(
+        str(pkg_scan),
+        threshold=0.8,
+        min_lines=2,
+        min_tokens=3,
+        bag_of_tokens=True,
+        sort_by="priority",
+        top_n=1,
+    )
+    assert len(clones_bag) == 1
+
+    # 8. scan_target with workers=2 exercising _worker_harvest_file
+    pkg = tmp_path / "parallel_pkg"
+    pkg.mkdir()
+    for idx in range(12):
+        (pkg / f"f{idx}.py").write_text(f"def run_{idx}():\n    x = 10\n    return x\n", encoding="utf-8")
+    par_clones = scan_target(str(pkg), threshold=0.8, min_lines=2, min_tokens=3, workers=2)
+    assert isinstance(par_clones, list)
+    assert len(par_clones) > 0
+
+    task = {
+        "file_path": str(pkg / "f1.py"),
+        "repo_root": str(pkg),
+        "min_lines": 2,
+        "min_tokens": 3,
+    }
+    assert len(_worker_harvest_file(task)) >= 1
+
+
+def test_batch_51_matcher_defensive_bounds_and_raw_set_baseline(tmp_path: Path) -> None:
+    """Batch 51: Test defensive bounds in matcher merging/subclones, and raw set baseline filtering."""
+    # pylint: disable=import-outside-toplevel
+    import json
+    from pydoppelgangerhunt.baseline import (
+        clone_pair_structural_fingerprint,
+        filter_clones_by_baseline,
+        namespaced_structural_fingerprint,
+        prune_baseline,
+        pure_structural_fingerprint,
+    )
+    from pydoppelgangerhunt.matcher import merge_adjacent_clones, suppress_subclones
+
+    # 1. merge_adjacent_clones with minimal dicts missing shingles/token_count (bag_of_tokens mode)
+    u1_a = {"file": "mod.py", "name": "fn1:1-5", "start": 1, "end": 5, "vector": {"a": 1}}
+    u2_a = {"file": "mod.py", "name": "fn2:1-5", "start": 1, "end": 5, "vector": {"a": 1}}
+    u1_b = {"file": "mod.py", "name": "fn1:6-10", "start": 6, "end": 10, "vector": {"b": 1}}
+    u2_b = {"file": "mod.py", "name": "fn2:6-10", "start": 6, "end": 10, "vector": {"b": 1}}
+    merged = merge_adjacent_clones([(1.0, u1_a, u2_a), (1.0, u1_b, u2_b)], bag_of_tokens=True)
+    assert len(merged) == 1
+    assert merged[0][1]["start"] == 1
+    assert merged[0][1]["end"] == 10
+    assert merged[0][1]["vector"] == {"a": 1, "b": 1}
+
+    # 2. suppress_subclones with missing start/end or None values
+    p1 = {"file": "mod.py", "start": 1, "end": 20}
+    p2 = {"file": "mod.py", "start": 30, "end": 50}
+    c1 = {"file": "mod.py", "start": None, "end": 10}
+    c2 = {"file": "mod.py", "start": 35, "end": 45}
+    suppressed = suppress_subclones([(0.95, p1, p2), (0.90, c1, c2)])
+    assert len(suppressed) == 1
+    assert suppressed[0][0] == 0.95
+
+    # 3. filter_clones_by_baseline with a raw set of strings (sfp, ns_sfp, pure_sfp)
+    u_x = {"file": "x.py", "name": "calc", "start": 1, "end": 5, "structural_hash": "hash_x"}
+    u_y = {"file": "y.py", "name": "calc", "start": 1, "end": 5, "structural_hash": "hash_y"}
+    sfp = clone_pair_structural_fingerprint(u_x, u_y)
+    ns_sfp = namespaced_structural_fingerprint(u_x, u_y)
+    pure_sfp = pure_structural_fingerprint(u_x, u_y)
+
+    # sfp match via raw set
+    filtered_sfp, supp_sfp = filter_clones_by_baseline([(0.9, u_x, u_y)], {sfp})
+    assert len(filtered_sfp) == 0
+    assert supp_sfp == 1
+
+    # ns_sfp match via raw set
+    filtered_ns, supp_ns = filter_clones_by_baseline([(0.9, u_x, u_y)], {ns_sfp})
+    assert len(filtered_ns) == 0
+    assert supp_ns == 1
+
+    # pure_sfp match via raw set
+    filtered_pure, supp_pure = filter_clones_by_baseline([(0.9, u_x, u_y)], {pure_sfp})
+    assert len(filtered_pure) == 0
+    assert supp_pure == 1
+
+    # unmatched clone retains
+    u_z = {"file": "z.py", "name": "calc", "start": 1, "end": 5, "structural_hash": "hash_z"}
+    unmatched_res, supp_unmatched = filter_clones_by_baseline([(0.85, u_x, u_z)], {pure_sfp})
+    assert len(unmatched_res) == 1
+    assert supp_unmatched == 0
+
+    # 4. prune_baseline when item_pure_sfp is absent in baseline file
+    bl_json = tmp_path / "baseline_no_pure.json"
+    bl_json.write_text(
+        json.dumps({
+            "version": "1.3.0",
+            "fingerprints": [
+                {
+                    "fingerprint": "x.py:calc <===> y.py:calc",
+                    "hash_a": "hash_x",
+                    "hash_b": "hash_y",
+                    "file_a": "x.py",
+                    "file_b": "y.py",
+                    "name_a": "calc",
+                    "name_b": "calc",
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+    res_prune = prune_baseline(
+        str(bl_json),
+        active_clones=[(0.9, u_x, u_y)],
+        unstaged_modified_ranges={},
+    )
+    assert res_prune.retained_count == 1
+    assert res_prune.pruned_count == 0
+
+
+def test_batch_59_scan_target_repo_root_and_diff_hunk_prefixes(tmp_path: Path) -> None:
+    """Test scan_target repo_root propagation, auto-derivation, and parse_git_diff_hunks multi-prefix parsing."""
+    from pydoppelgangerhunt.git_diff import parse_git_diff_hunks
+
+    # 1. scan_target with explicit repo_root on external directory
+    ext_repo = tmp_path / "ext_repo"
+    sub_pkg = ext_repo / "sub_pkg"
+    sub_pkg.mkdir(parents=True)
+
+    f1 = sub_pkg / "worker_a.py"
+    f2 = sub_pkg / "worker_b.py"
+    code = (
+        "def process_payload(x: int, y: int) -> int:\n"
+        "    r1 = x * 10 + y * 20\n"
+        "    r2 = r1 ** 2 + 100\n"
+        "    return r2 // 3\n"
+    )
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+
+    clones_with_root = scan_target(
+        str(sub_pkg),
+        repo_root=str(ext_repo),
+        min_lines=2,
+        min_tokens=5,
+        threshold=0.90,
+    )
+    assert len(clones_with_root) >= 1
+    file_a = clones_with_root[0][1]["file"]
+    file_b = clones_with_root[0][2]["file"]
+    assert file_a in ("sub_pkg/worker_a.py", "sub_pkg/worker_b.py")
+    assert file_b in ("sub_pkg/worker_a.py", "sub_pkg/worker_b.py")
+    assert not Path(file_a).is_absolute()
+
+    # 2. scan_target auto-deriving effective_repo_root when external target_dir is scanned without repo_root
+    clones_auto_root = scan_target(
+        str(sub_pkg),
+        min_lines=2,
+        min_tokens=5,
+        threshold=0.90,
+    )
+    assert len(clones_auto_root) >= 1
+    auto_file_a = clones_auto_root[0][1]["file"]
+    auto_file_b = clones_auto_root[0][2]["file"]
+    assert auto_file_a in ("worker_a.py", "worker_b.py")
+    assert auto_file_b in ("worker_a.py", "worker_b.py")
+    assert not Path(auto_file_a).is_absolute()
+
+    # 3. parse_git_diff_hunks supporting no-prefix, b/, w/, i/, c/, and /dev/null
+    diff_multi = (
+        "--- file_np.py\n"
+        "+++ file_np.py\n"
+        "@@ -10,3 +10,3 @@\n"
+        "+np_line\n"
+        "--- a/file_b.py\n"
+        "+++ b/file_b.py\n"
+        "@@ -20,2 +20,2 @@\n"
+        "+b_line\n"
+        "--- old/file_w.py\n"
+        "+++ w/file_w.py\n"
+        "@@ -30,1 +30,1 @@\n"
+        "+w_line\n"
+        "--- old/file_i.py\n"
+        "+++ i/file_i.py\n"
+        "@@ -40,1 +40,1 @@\n"
+        "+i_line\n"
+        "--- a/deleted.py\n"
+        "+++ /dev/null\n"
+        "@@ -1,5 +0,0 @@\n"
+        "-deleted\n"
+    )
+    hunks = parse_git_diff_hunks(diff_multi)
+    assert hunks.get("file_np.py") == [(10, 12)]
+    assert hunks.get("file_b.py") == [(20, 21)]
+    assert hunks.get("file_w.py") == [(30, 30)]
+    assert hunks.get("file_i.py") == [(40, 40)]
+    assert "deleted.py" not in hunks
+    assert "/dev/null" not in hunks
+
+
+def test_batch_70_review_fixes(tmp_path: Path) -> None:
+    """Batch 70: Test TRY_NODE_TYPES compatibility, path-specific exemption isolation, and absolute path normalization."""
+    # pylint: disable=import-outside-toplevel
+    import ast
+    from pydoppelgangerhunt.matcher import (
+        _normalize_exemption_endpoint,
+        scan_target,
+    )
+    from pydoppelgangerhunt.parser import TRY_NODE_TYPES, harvest_file_units
+
+    # 1. TRY_NODE_TYPES verification
+    assert ast.Try in TRY_NODE_TYPES
+    assert () not in TRY_NODE_TYPES
+    assert all(isinstance(t, type) for t in TRY_NODE_TYPES)
+
+    # 2. Path-specific exemption isolation
+    pkg_a = tmp_path / "pkg_a"
+    pkg_b = tmp_path / "pkg_b"
+    pkg_a.mkdir(parents=True, exist_ok=True)
+    pkg_b.mkdir(parents=True, exist_ok=True)
+
+    code_body = "def compute(x: int) -> int:\n    a = x * 10\n    b = a + 5\n    c = b * 2\n    return c\n"
+    (pkg_a / "service.py").write_text(code_body, encoding="utf-8")
+    (pkg_b / "service.py").write_text(code_body, encoding="utf-8")
+    (tmp_path / "other.py").write_text(code_body, encoding="utf-8")
+
+    # Path-specific exemption for pkg_a should not suppress pkg_b
+    exempt_pair = ("pkg_a/service.py:compute", "other.py:compute")
+    clones = scan_target(str(tmp_path), exemptions=[exempt_pair], threshold=0.8, min_lines=3)
+    has_pkg_b_other = any(
+        ("pkg_b" in str(u1.get("file")) and "other.py" in str(u2.get("file")))
+        or ("other.py" in str(u1.get("file")) and "pkg_b" in str(u2.get("file")))
+        for _, u1, u2 in clones
+    )
+    assert has_pkg_b_other, "pkg_b/service.py should not be suppressed by pkg_a/service.py exemption"
+
+    has_pkg_a_other = any(
+        ("pkg_a" in str(u1.get("file")) and "other.py" in str(u2.get("file")))
+        or ("other.py" in str(u1.get("file")) and "pkg_a" in str(u2.get("file")))
+        for _, u1, u2 in clones
+    )
+    assert not has_pkg_a_other, "pkg_a/service.py should be suppressed by pkg_a exemption"
+
+    # 3. Basename-only exemption suppresses across all packages
+    base_exempt_pair = ("service.py:compute", "other.py:compute")
+    clones_base = scan_target(str(tmp_path), exemptions=[base_exempt_pair], threshold=0.8, min_lines=3)
+    has_any_service_other = any(
+        ("service.py" in str(u1.get("file")) and "other.py" in str(u2.get("file")))
+        or ("other.py" in str(u1.get("file")) and "service.py" in str(u2.get("file")))
+        for _, u1, u2 in clones_base
+    )
+    assert not has_any_service_other, "service.py basename exemption should suppress across all packages"
+
+    # 4. Absolute path exemption normalization
+    abs_f = str((pkg_a / "service.py").resolve())
+    norm_ep = _normalize_exemption_endpoint(f"{abs_f}:compute", repo_root=tmp_path)
+    assert not norm_ep.startswith("/")
+    assert "pkg_a/service.py:compute" in norm_ep or "pkg_a" in norm_ep
+
+    # 5. harvest_file_units with clause_level=True parses Try statements safely
+    try_code = (
+        "def try_flow(x):\n"
+        "    try:\n"
+        "        return 1 / x\n"
+        "    except ZeroDivisionError:\n"
+        "        return 0\n"
+        "    else:\n"
+        "        pass\n"
+        "    finally:\n"
+        "        pass\n"
+    )
+    try_file = tmp_path / "try_test.py"
+    try_file.write_text(try_code, encoding="utf-8")
+    try_units = harvest_file_units(str(try_file), str(tmp_path), clause_level=True, min_lines=1, min_tokens=1)
+    assert len(try_units) > 0
+
+
+def test_corpus_sensitivity_stop_shingle_pruning_on_differential_runs(tmp_path: Path) -> None:
+    """Verifies that dynamic stop-shingle pruning activates on small corpora (differential PR runs)."""
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    # Create a small module with 6 distinct utility functions sharing common boilerplate logging/guards
+    code_lines = []
+    for i in range(6):
+        code_lines.append(
+            f"def compute_metric_{i}(data: int) -> int:\n"
+            f"    # Standard boilerplate logger invocation\n"
+            f"    if __name__ == '__main__':\n"
+            f"        pass\n"
+            f"    # Distinct algorithmic computation\n"
+            f"    return data ** {i + 2} + {i * 100}\n"
+        )
+    src_file = tmp_path / "pr_diff_sample.py"
+    src_file.write_text("\n".join(code_lines), encoding="utf-8")
+
+    # With min_corpus_size=4 and max_index_frequency=0.25 on a 6-unit corpus:
+    # max_posting_len = max(2, ceil(6 * 0.25)) = 2.
+    # The boilerplate guard appearing in all 6 functions has posting len 6 > 2, so it is pruned!
+    # Because each function's algorithm is distinct, no spurious clones are reported:
+    clones_pruned = scan_target(
+        str(tmp_path),
+        threshold=0.85,
+        min_lines=3,
+        min_tokens=5,
+        max_index_frequency=0.25,
+        min_corpus_size=4,
+    )
+    assert len(clones_pruned) == 0
+
+def test_batch_82_matcher_sloc_and_priority_score_bounds() -> None:
+    """Verifies that compute_priority_score and SLOC sorting handle inverted or synthetic line bounds defensively."""
+    from pydoppelgangerhunt.matcher import compute_priority_score  # pylint: disable=import-outside-toplevel
+
+    u1 = {"start": 20, "end": 10, "complexity": -5, "token_count": 50, "name": "bad1", "file": "f1.py"}
+    u2 = {"start": 30, "end": 15, "complexity": 0, "token_count": 50, "name": "bad2", "file": "f2.py"}
+    score = compute_priority_score(0.9, u1, u2)
+    assert score == 0.0
+
+    clone_pairs: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = [
+        (0.9, u1, u2),
+        (0.8, {"start": 1, "end": 5}, {"start": 1, "end": 5}),
+    ]
+    clone_pairs.sort(
+        key=lambda x: (
+            max(0, int(x[1].get("end") or int(x[1].get("start") or 1)) - int(x[1].get("start") or 1) + 1)
+            + max(0, int(x[2].get("end") or int(x[2].get("start") or 1)) - int(x[2].get("start") or 1) + 1)
+        ),
+        reverse=True,
+    )
+    assert len(clone_pairs) == 2

@@ -7,19 +7,27 @@ import sqlite3
 from typing import Any, Dict, Optional, Set, Tuple
 import xml.etree.ElementTree as ET
 
+from pydoppelgangerhunt.config import find_matching_path_value, normalize_path_string
+
 
 def _read_sqlite_coverage(coverage_path: str) -> Dict[str, Set[int]]:
     """Reads covered line sets per file from SQLite-based .coverage file."""
     coverage_map: Dict[str, Set[int]] = {}
     if not os.path.isfile(coverage_path):
         return coverage_map
-
+    conn = None
     try:
-        conn = sqlite3.connect(f"file:{os.path.abspath(coverage_path)}?mode=ro", uri=True)
+        try:
+            conn = sqlite3.connect(f"file:{os.path.abspath(coverage_path)}?mode=ro", uri=True)
+        except (sqlite3.Error, OSError):
+            conn = sqlite3.connect(coverage_path)
         cursor = conn.cursor()
 
         cursor.execute("SELECT id, path FROM file")
-        file_map = {row[0]: row[1].replace("\\", "/") for row in cursor.fetchall()}
+        file_map = {
+            row[0]: normalize_path_string(row[1], strip_anchor=False)
+            for row in cursor.fetchall()
+        }
 
         try:
             cursor.execute("SELECT file_id, num_bits, bits FROM line_bits")
@@ -48,10 +56,14 @@ def _read_sqlite_coverage(coverage_path: str) -> Dict[str, Set[int]]:
                         coverage_map.setdefault(fpath, set()).add(line_num)
             except sqlite3.OperationalError:
                 pass
-
-        conn.close()
     except (sqlite3.Error, OSError):
         pass
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except (sqlite3.Error, OSError):
+                pass
 
     return coverage_map
 
@@ -69,13 +81,14 @@ def _read_xml_coverage(xml_path: str) -> Dict[str, Set[int]]:
             filename = class_node.get("filename")
             if not filename:
                 continue
-            norm_file = filename.replace("\\", "/")
+            norm_file = normalize_path_string(filename, strip_anchor=False)
             covered_lines = coverage_map.setdefault(norm_file, set())
             for line_node in class_node.findall("./lines/line"):
                 hits = line_node.get("hits", "0")
                 try:
-                    if int(hits) > 0:
-                        covered_lines.add(int(line_node.get("number", 0)))
+                    line_num = int(line_node.get("number", 0))
+                    if int(hits) > 0 and line_num > 0:
+                        covered_lines.add(line_num)
                 except ValueError:
                     pass
     except (ET.ParseError, OSError):
@@ -95,23 +108,18 @@ def compute_unit_coverage(
     unit: Dict[str, Any], coverage_data: Dict[str, Set[int]]
 ) -> float:
     """Computes statement coverage percentage for an AST unit's line range."""
-    if not coverage_data:
+    if not coverage_data or not unit:
         return 0.0
 
-    target = unit["file"].replace("\\", "/").split("#")[0]
-    covered_lines = coverage_data.get(target)
-    if covered_lines is None:
-        covered_lines = next(
-            (lines for f, lines in coverage_data.items() if f.endswith(target) or target.endswith(f)),
-            set(),
-        )
-
-    lines_total = unit["end"] - unit["start"] + 1
-    if lines_total <= 0 or not covered_lines:
+    covered_lines = find_matching_path_value(str(unit.get("file") or ""), coverage_data)
+    if not covered_lines:
         return 0.0
 
-    hits = sum(1 for ln in range(unit["start"], unit["end"] + 1) if ln in covered_lines)
-    return min(1.0, hits / float(lines_total))
+    start = int(unit.get("start") or 1)
+    end = int(unit.get("end") or start)
+    total_lines = max(1, end - start + 1)
+    covered_count = sum(1 for ln in range(start, end + 1) if ln in covered_lines)
+    return min(1.0, covered_count / float(total_lines))
 
 
 def check_asymmetric_coverage(

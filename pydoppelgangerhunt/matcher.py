@@ -6,9 +6,9 @@ import concurrent.futures
 import math
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
-from pydoppelgangerhunt.config import find_python_files
+from pydoppelgangerhunt.config import canonical_path_key, find_python_files
 from pydoppelgangerhunt.parser import harvest_file_units
 
 DEFAULT_STOP_SHINGLES: Set[Tuple[str, ...]] = {
@@ -52,6 +52,46 @@ DEFAULT_STOP_SHINGLES: Set[Tuple[str, ...]] = {
 def get_boilerplate_stop_shingles() -> Set[Tuple[str, ...]]:
     """Returns a copy of the default set of boilerplate stop-shingles."""
     return set(DEFAULT_STOP_SHINGLES)
+
+
+def _normalize_matcher_file(file_str: Optional[str]) -> str:
+    """Normalizes unit file path string for robust matching, preserving cell anchors."""
+    return canonical_path_key(file_str, strip_anchor=False)
+
+
+def _split_exemption_endpoint(ep: str) -> Tuple[str, Optional[str]]:
+    """Splits an exemption endpoint into (file_path, symbol_name), accounting for Windows drive letters."""
+    if ":" not in ep:
+        return ep, None
+    f_part, sym_part = ep.rsplit(":", 1)
+    if "/" in sym_part or "\\" in sym_part or (len(f_part) == 1 and f_part.isalpha()):
+        return ep, None
+    return f_part, sym_part
+
+
+def _normalize_exemption_endpoint(
+    ep: str, repo_root: Optional[Union[str, Path]] = None
+) -> str:
+    """Normalizes an exemption endpoint by normalizing the file portion relative to repo root."""
+    f_part, sym_part = _split_exemption_endpoint(ep)
+    if repo_root is not None:
+        try:
+            p = Path(f_part)
+            if p.is_absolute():
+                f_part = str(p.resolve().relative_to(Path(repo_root).resolve()))
+        except (ValueError, OSError):
+            pass
+    norm_file = _normalize_matcher_file(f_part)
+    if sym_part is not None:
+        return f"{norm_file}:{sym_part}"
+    return norm_file
+
+
+def _sorted_pair(a: str, b: str) -> Tuple[str, str]:
+    """Returns an order-invariant sorted 2-tuple of two string keys."""
+    return (a, b) if a <= b else (b, a)
+
+
 
 
 def lcs_alignment_similarity(
@@ -183,6 +223,58 @@ def compute_pair_similarity(
     return jaccard_similarity(u1.get("shingles", set()), u2.get("shingles", set()))
 
 
+def _update_merged_unit_columns(
+    target_unit: Dict[str, Any],
+    donor_unit: Dict[str, Any],
+    target_start: int,
+    target_end: int,
+    donor_start: int,
+    donor_end: int,
+) -> None:
+    """Propagates outer column boundaries when merging two adjacent or overlapping units."""
+    for key, d_pos, t_pos, is_expanded, agg in (
+        ("start_col", donor_start, target_start, donor_start < target_start, min),
+        ("end_col", donor_end, target_end, donor_end > target_end, max),
+    ):
+        if is_expanded:
+            target_unit[key] = donor_unit.get(key)
+        elif d_pos == t_pos and donor_unit.get(key) is not None:
+            curr_val = target_unit.get(key)
+            donor_val = donor_unit[key]
+            target_unit[key] = agg(curr_val, donor_val) if curr_val is not None else donor_val
+
+
+def _check_column_bounds_relationship(
+    p_start: int,
+    p_end: int,
+    c_start: int,
+    c_end: int,
+    p_unit: Dict[str, Any],
+    c_unit: Dict[str, Any],
+) -> Tuple[bool, bool]:
+    """Evaluates whether child unit columns are enclosed within and/or strictly smaller than parent.
+
+    Returns:
+        A tuple of (is_enclosed, is_strictly_smaller).
+    """
+    p_sc, c_sc = p_unit.get("start_col"), c_unit.get("start_col")
+    p_ec, c_ec = p_unit.get("end_col"), c_unit.get("end_col")
+
+    if c_start == p_start and p_sc is not None and c_sc is not None:
+        if int(c_sc) < int(p_sc):
+            return False, False
+
+    if c_end == p_end and p_ec is not None and c_ec is not None:
+        if int(c_ec) > int(p_ec):
+            return False, False
+
+    strictly_smaller = (
+        (c_start == p_start and p_sc is not None and c_sc is not None and int(c_sc) > int(p_sc))
+        or (c_end == p_end and p_ec is not None and c_ec is not None and int(c_ec) < int(p_ec))
+    )
+    return True, strictly_smaller
+
+
 def merge_adjacent_clones(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     line_tolerance: int = 2,
@@ -198,8 +290,10 @@ def merge_adjacent_clones(
 
     canonical: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
     for sim, u1, u2 in clones:
-        k1 = (u1["file"], u1["start"], u1["name"])
-        k2 = (u2["file"], u2["start"], u2["name"])
+        f1 = _normalize_matcher_file(u1.get("file"))
+        f2 = _normalize_matcher_file(u2.get("file"))
+        k1 = (f1, int(u1.get("start") or 1), str(u1.get("name") or ""))
+        k2 = (f2, int(u2.get("start") or 1), str(u2.get("name") or ""))
         if k1 <= k2:
             canonical.append((sim, dict(u1), dict(u2)))
         else:
@@ -226,43 +320,77 @@ def merge_adjacent_clones(
                     continue
                 _sim_b, u1_b, u2_b = merged_clones[j]
 
-                if current_u1["file"] != u1_b["file"] or current_u2["file"] != u2_b["file"]:
+                f1_curr = _normalize_matcher_file(current_u1.get("file"))
+                f1_b = _normalize_matcher_file(u1_b.get("file"))
+                f2_curr = _normalize_matcher_file(current_u2.get("file"))
+                f2_b = _normalize_matcher_file(u2_b.get("file"))
+                if f1_curr != f1_b or f2_curr != f2_b:
                     continue
 
-                fn1_a = current_u1["name"].split(":")[0]
-                fn1_b = u1_b["name"].split(":")[0]
-                fn2_a = current_u2["name"].split(":")[0]
-                fn2_b = u2_b["name"].split(":")[0]
+                fn1_a = str(current_u1.get("name") or "").split(":", maxsplit=1)[0]
+                fn1_b = str(u1_b.get("name") or "").split(":", maxsplit=1)[0]
+                fn2_a = str(current_u2.get("name") or "").split(":", maxsplit=1)[0]
+                fn2_b = str(u2_b.get("name") or "").split(":", maxsplit=1)[0]
                 if fn1_a != fn1_b or fn2_a != fn2_b:
                     continue
 
-                adj1 = (u1_b["start"] <= current_u1["end"] + line_tolerance) and (
-                    u1_b["end"] >= current_u1["start"] - line_tolerance
+                u1_b_start = int(u1_b.get("start") or 1)
+                u1_b_end = int(u1_b.get("end") or u1_b_start)
+                curr_u1_start = int(current_u1.get("start") or 1)
+                curr_u1_end = int(current_u1.get("end") or curr_u1_start)
+
+                u2_b_start = int(u2_b.get("start") or 1)
+                u2_b_end = int(u2_b.get("end") or u2_b_start)
+                curr_u2_start = int(current_u2.get("start") or 1)
+                curr_u2_end = int(current_u2.get("end") or curr_u2_start)
+
+                adj1 = (u1_b_start <= curr_u1_end + line_tolerance) and (
+                    u1_b_end >= curr_u1_start - line_tolerance
                 )
-                adj2 = (u2_b["start"] <= current_u2["end"] + line_tolerance) and (
-                    u2_b["end"] >= current_u2["start"] - line_tolerance
+                adj2 = (u2_b_start <= curr_u2_end + line_tolerance) and (
+                    u2_b_end >= curr_u2_start - line_tolerance
                 )
 
                 if not (adj1 and adj2):
                     continue
 
-                current_u1["start"] = min(current_u1["start"], u1_b["start"])
-                current_u1["end"] = max(current_u1["end"], u1_b["end"])
+                _update_merged_unit_columns(
+                    current_u1, u1_b, curr_u1_start, curr_u1_end, u1_b_start, u1_b_end
+                )
+                current_u1["start"] = min(curr_u1_start, u1_b_start)
+                current_u1["end"] = max(curr_u1_end, u1_b_end)
                 current_u1["lines"] = current_u1["end"] - current_u1["start"] + 1
-                current_u1["shingles"] = set(current_u1["shingles"]).union(u1_b["shingles"])
-                current_u1["token_count"] = max(current_u1["token_count"], u1_b["token_count"])
-                current_u1["tokens"] = current_u1.get("tokens", []) + u1_b.get("tokens", [])
+                current_u1["shingles"] = set(current_u1.get("shingles") or set()).union(
+                    u1_b.get("shingles") or set()
+                )
+                current_u1["token_count"] = max(
+                    int(current_u1.get("token_count") or 0),
+                    int(u1_b.get("token_count") or 0),
+                )
+                current_u1["tokens"] = list(current_u1.get("tokens") or []) + list(
+                    u1_b.get("tokens") or []
+                )
                 current_u1["name"] = f"{fn1_a}:merged_{current_u1['start']}-{current_u1['end']}"
                 v1_a = current_u1.get("vector", {})
                 v1_b = u1_b.get("vector", {})
                 current_u1["vector"] = {k: v1_a.get(k, 0) + v1_b.get(k, 0) for k in set(v1_a).union(v1_b)}
 
-                current_u2["start"] = min(current_u2["start"], u2_b["start"])
-                current_u2["end"] = max(current_u2["end"], u2_b["end"])
+                _update_merged_unit_columns(
+                    current_u2, u2_b, curr_u2_start, curr_u2_end, u2_b_start, u2_b_end
+                )
+                current_u2["start"] = min(curr_u2_start, u2_b_start)
+                current_u2["end"] = max(curr_u2_end, u2_b_end)
                 current_u2["lines"] = current_u2["end"] - current_u2["start"] + 1
-                current_u2["shingles"] = set(current_u2["shingles"]).union(u2_b["shingles"])
-                current_u2["token_count"] = max(current_u2["token_count"], u2_b["token_count"])
-                current_u2["tokens"] = current_u2.get("tokens", []) + u2_b.get("tokens", [])
+                current_u2["shingles"] = set(current_u2.get("shingles") or set()).union(
+                    u2_b.get("shingles") or set()
+                )
+                current_u2["token_count"] = max(
+                    int(current_u2.get("token_count") or 0),
+                    int(u2_b.get("token_count") or 0),
+                )
+                current_u2["tokens"] = list(current_u2.get("tokens") or []) + list(
+                    u2_b.get("tokens") or []
+                )
                 current_u2["name"] = f"{fn2_a}:merged_{current_u2['start']}-{current_u2['end']}"
                 v2_a = current_u2.get("vector", {})
                 v2_b = u2_b.get("vector", {})
@@ -306,14 +434,14 @@ def suppress_subclones(
     for i, (sim_parent, p1, p2) in enumerate(clones):
         if i in suppressed_indices:
             continue
-        f1_p = p1["file"].replace("\\", "/")
-        f2_p = p2["file"].replace("\\", "/")
+        f1_p = _normalize_matcher_file(p1.get("file"))
+        f2_p = _normalize_matcher_file(p2.get("file"))
 
         for j, (sim_child, c1, c2) in enumerate(clones):
             if i == j or j in suppressed_indices:
                 continue
-            f1_c = c1["file"].replace("\\", "/")
-            f2_c = c2["file"].replace("\\", "/")
+            f1_c = _normalize_matcher_file(c1.get("file"))
+            f2_c = _normalize_matcher_file(c2.get("file"))
 
             direct_match = (f1_p == f1_c and f2_p == f2_c)
             reverse_match = (f1_p == f2_c and f2_p == f1_c)
@@ -324,15 +452,36 @@ def suppress_subclones(
             c1_corr = c1 if direct_match else c2
             c2_corr = c2 if direct_match else c1
 
-            c1_enclosed = p1["start"] <= c1_corr["start"] and c1_corr["end"] <= p1["end"]
-            c2_enclosed = p2["start"] <= c2_corr["start"] and c2_corr["end"] <= p2["end"]
+            p1_start = int(p1.get("start") or 1)
+            p1_end = int(p1.get("end") or p1_start)
+            p2_start = int(p2.get("start") or 1)
+            p2_end = int(p2.get("end") or p2_start)
+            c1_start = int(c1_corr.get("start") or 1)
+            c1_end = int(c1_corr.get("end") or c1_start)
+            c2_start = int(c2_corr.get("start") or 1)
+            c2_end = int(c2_corr.get("end") or c2_start)
+
+            c1_enclosed = p1_start <= c1_start and c1_end <= p1_end
+            c2_enclosed = p2_start <= c2_start and c2_end <= p2_end
 
             if not (c1_enclosed and c2_enclosed):
                 continue
 
+            enc1, small1 = _check_column_bounds_relationship(
+                p1_start, p1_end, c1_start, c1_end, p1, c1_corr
+            )
+            if not enc1:
+                continue
+
+            enc2, small2 = _check_column_bounds_relationship(
+                p2_start, p2_end, c2_start, c2_end, p2, c2_corr
+            )
+            if not enc2:
+                continue
+
             is_strictly_smaller = (
-                (c1_corr["start"] > p1["start"] or c1_corr["end"] < p1["end"])
-                or (c2_corr["start"] > p2["start"] or c2_corr["end"] < p2["end"])
+                (c1_start > p1_start or c1_end < p1_end or small1)
+                or (c2_start > p2_start or c2_end < p2_end or small2)
             )
             if not is_strictly_smaller:
                 continue
@@ -354,6 +503,7 @@ def scan_target(
     min_lines: int = 8,
     min_tokens: int = 15,
     threshold: float = 0.90,
+    repo_root: Optional[Union[str, Path]] = None,
     excludes: Optional[List[str]] = None,
     functions_only: bool = False,
     sliding_window: bool = False,
@@ -392,7 +542,19 @@ def scan_target(
     min_corpus_size: Optional[int] = None,
 ) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]:
     units: List[Dict[str, Any]] = []
-    repo_root = Path.cwd()
+    if repo_root is not None:
+        effective_repo_root = Path(repo_root)
+    else:
+        try:
+            target_path = Path(target_dir).resolve()
+            cwd = Path.cwd().resolve()
+            try:
+                target_path.relative_to(cwd)
+                effective_repo_root = cwd
+            except ValueError:
+                effective_repo_root = target_path if target_path.is_dir() else target_path.parent
+        except (ValueError, OSError):
+            effective_repo_root = Path.cwd()
     file_list = find_python_files(
         target_dir,
         excludes=excludes,
@@ -406,7 +568,7 @@ def scan_target(
         task_list = [
             {
                 "file_path": str(p),
-                "repo_root": str(repo_root),
+                "repo_root": str(effective_repo_root),
                 "min_lines": min_lines,
                 "min_tokens": min_tokens,
                 "functions_only": functions_only,
@@ -439,7 +601,7 @@ def scan_target(
             units.extend(
                 harvest_file_units(
                     str(p),
-                    str(repo_root),
+                    str(effective_repo_root),
                     min_lines=min_lines,
                     min_tokens=min_tokens,
                     functions_only=functions_only,
@@ -516,10 +678,34 @@ def scan_target(
                     candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))
 
     raw_exemptions = exemptions if exemptions is not None else []
-    normalized_exemptions = {
-        tuple(sorted([k1.replace("\\", "/"), k2.replace("\\", "/")]))
-        for k1, k2 in raw_exemptions
-    }
+    normalized_exemptions: Set[Tuple[str, str]] = set()
+    basename_exemptions: Set[Tuple[str, str]] = set()
+    for pair in raw_exemptions:
+        if len(pair) == 2:
+            k1, k2 = pair
+            ep1 = _normalize_exemption_endpoint(k1, repo_root=effective_repo_root)
+            ep2 = _normalize_exemption_endpoint(k2, repo_root=effective_repo_root)
+            normalized_exemptions.add(_sorted_pair(ep1, ep2))
+            f1_part, sym1 = _split_exemption_endpoint(ep1)
+            f2_part, sym2 = _split_exemption_endpoint(ep2)
+            k1_file, _ = _split_exemption_endpoint(k1)
+            k2_file, _ = _split_exemption_endpoint(k2)
+            has_dir1 = ("/" in k1_file or "\\" in k1_file) and not (len(k1_file) == 1 and k1_file.isalpha())
+            has_dir2 = ("/" in k2_file or "\\" in k2_file) and not (len(k2_file) == 1 and k2_file.isalpha())
+            if not has_dir1 and not has_dir2:
+                base_f1 = os.path.basename(f1_part)
+                base_f2 = os.path.basename(f2_part)
+                b1 = f"{base_f1}:{sym1}" if sym1 is not None else base_f1
+                b2 = f"{base_f2}:{sym2}" if sym2 is not None else base_f2
+                basename_exemptions.add(_sorted_pair(b1, b2))
+
+    target_norm = target_dir.replace("\\", "/").strip("./").rstrip("/")
+    target_pfx = f"{target_norm}/" if target_norm and target_norm != "." else ""
+    target_prefixes = (
+        (target_pfx, "src/", "pydoppelgangerhunt/")
+        if target_pfx
+        else ("src/", "pydoppelgangerhunt/")
+    )
 
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
     for i, j in candidate_pairs:
@@ -528,8 +714,8 @@ def scan_target(
         if audit_tests and not (u1["name"].startswith("test_") and u2["name"].startswith("test_")):
             continue
 
-        f1 = u1["file"].replace("\\", "/")
-        f2 = u2["file"].replace("\\", "/")
+        f1 = _normalize_matcher_file(u1.get("file"))
+        f2 = _normalize_matcher_file(u2.get("file"))
 
         if f1 == f2:
             fn1 = u1["name"].split(":")[0]
@@ -553,21 +739,32 @@ def scan_target(
 
         f1_pkg = f1
         f2_pkg = f2
-        for pfx in ("pyfloorplanner/", "src/", "pydoppelgangerhunt/"):
-            if f1_pkg.startswith(pfx):
+        for pfx in target_prefixes:
+            if pfx and f1_pkg.startswith(pfx):
                 f1_pkg = f1_pkg[len(pfx):]
-            if f2_pkg.startswith(pfx):
+            if pfx and f2_pkg.startswith(pfx):
                 f2_pkg = f2_pkg[len(pfx):]
 
-        pair_id_rel = tuple(sorted([f"{f1}:{u1['name']}", f"{f2}:{u2['name']}"]))
-        pair_id_pkg = tuple(sorted([f"{f1_pkg}:{u1['name']}", f"{f2_pkg}:{u2['name']}"]))
-        pair_id_base = tuple(sorted([f"{os.path.basename(f1)}:{u1['name']}", f"{os.path.basename(f2)}:{u2['name']}"]))
+        pair_id_rel = _sorted_pair(f"{f1}:{u1['name']}", f"{f2}:{u2['name']}")
+        pair_id_pkg = _sorted_pair(f"{f1_pkg}:{u1['name']}", f"{f2_pkg}:{u2['name']}")
+        pair_id_file = _sorted_pair(f1, f2)
+        pair_id_file_pkg = _sorted_pair(f1_pkg, f2_pkg)
         if (
             pair_id_rel in normalized_exemptions
             or pair_id_pkg in normalized_exemptions
-            or pair_id_base in normalized_exemptions
+            or pair_id_file in normalized_exemptions
+            or pair_id_file_pkg in normalized_exemptions
         ):
             continue
+
+        if basename_exemptions:
+            pair_id_base = _sorted_pair(
+                f"{os.path.basename(f1)}:{u1['name']}",
+                f"{os.path.basename(f2)}:{u2['name']}",
+            )
+            pair_id_file_base = _sorted_pair(os.path.basename(f1), os.path.basename(f2))
+            if pair_id_base in basename_exemptions or pair_id_file_base in basename_exemptions:
+                continue
 
         sim = compute_pair_similarity(
             u1,
@@ -598,7 +795,13 @@ def scan_target(
     if sort_by == "priority":
         clones.sort(key=lambda x: compute_priority_score(x[0], x[1], x[2]), reverse=True)
     elif sort_by == "sloc":
-        clones.sort(key=lambda x: (x[1]["end"] - x[1]["start"] + 1) + (x[2]["end"] - x[2]["start"] + 1), reverse=True)
+        clones.sort(
+            key=lambda x: (
+                max(0, int(x[1].get("end") or int(x[1].get("start") or 1)) - int(x[1].get("start") or 1) + 1)
+                + max(0, int(x[2].get("end") or int(x[2].get("start") or 1)) - int(x[2].get("start") or 1) + 1)
+            ),
+            reverse=True,
+        )
     else:
         clones.sort(key=lambda x: x[0], reverse=True)
 
@@ -614,6 +817,10 @@ def compute_priority_score(
     u2: Dict[str, Any],
 ) -> float:
     """Calculates refactoring priority based on similarity, line length, and cyclomatic complexity."""
-    avg_sloc = ((u1["end"] - u1["start"] + 1) + (u2["end"] - u2["start"] + 1)) / 2.0
-    max_comp = max(u1.get("complexity", 1), u2.get("complexity", 1))
+    s1 = int(u1.get("start") or 1)
+    e1 = int(u1.get("end") or s1)
+    s2 = int(u2.get("start") or 1)
+    e2 = int(u2.get("end") or s2)
+    avg_sloc = (max(0, e1 - s1 + 1) + max(0, e2 - s2 + 1)) / 2.0
+    max_comp = max(1, int(u1.get("complexity") or 1), int(u2.get("complexity") or 1))
     return float(round(sim * avg_sloc * max_comp, 1))

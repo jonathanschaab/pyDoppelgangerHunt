@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import difflib
+import html
 import json
 import os
 from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Tuple
+
+from pydoppelgangerhunt.config import normalize_path_string
 
 
 # ANSI Color Codes
@@ -41,19 +44,45 @@ def colorize(text: str, color_code: str, enabled: bool) -> str:
 
 def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:
     """Reads raw source code lines for a given unit from disk."""
-    file_path = Path(unit["file"])
-    if repo_root and not file_path.is_absolute():
+    raw_file = str(unit.get("file") or "")
+    f_raw = normalize_path_string(raw_file, strip_anchor=True)
+    if not f_raw:
+        s_d = int(unit.get("start") or 1)
+        e_d = int(unit.get("end") or s_d)
+        n_d = str(unit.get("name") or "unit")
+        return [f"# Source for {n_d} lines {s_d}-{e_d}\n"]
+    file_path = Path(f_raw)
+    if not file_path.is_file() and repo_root and not file_path.is_absolute():
         file_path = Path(repo_root) / file_path
-    if not file_path.exists():
-        return [f"# Source for {unit['name']} lines {unit['start']}-{unit['end']}\n"]
+    if not file_path.is_file():
+        s_d = int(unit.get("start") or 1)
+        e_d = int(unit.get("end") or s_d)
+        n_d = str(unit.get("name") or "unit")
+        return [f"# Source for {n_d} lines {s_d}-{e_d}\n"]
     try:
-        with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
-            all_lines = fh.readlines()
-        start = max(1, unit["start"])
-        end = min(len(all_lines), unit["end"])
+        if file_path.suffix == ".ipynb" and "#cell_" in raw_file:
+            try:
+                cell_idx_str = raw_file.split("#cell_", 1)[-1]
+                cell_idx = int(cell_idx_str) - 1
+                nb_data = json.loads(file_path.read_text(encoding="utf-8", errors="replace"))
+                cells = nb_data.get("cells", [])
+                if 0 <= cell_idx < len(cells):
+                    cell = cells[cell_idx]
+                    src = cell.get("source", [])
+                    raw_lines = src if isinstance(src, list) else str(src).splitlines(keepends=True)
+                    all_lines = [l if l.endswith("\n") else l + "\n" for l in raw_lines]
+                else:
+                    all_lines = []
+            except (json.JSONDecodeError, ValueError):
+                all_lines = []
+        else:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
+                all_lines = fh.readlines()
+        start = max(1, int(unit.get("start") or 1))
+        end = min(len(all_lines), int(unit.get("end") or len(all_lines)))
         return all_lines[start - 1 : end]
     except OSError:
-        return [f"# Unable to read {unit['file']}\n"]
+        return [f"# Unable to read {str(unit.get('file') or '')}\n"]
 
 
 def generate_clone_diff(
@@ -65,8 +94,16 @@ def generate_clone_diff(
     """Produces unified line diff between two cloned code blocks, with optional syntax coloring."""
     lines1 = extract_unit_source_code(u1, repo_root)
     lines2 = extract_unit_source_code(u2, repo_root)
-    from_label = f"{u1['file']}:{u1['start']}-{u1['end']} ({u1['name']})"
-    to_label = f"{u2['file']}:{u2['start']}-{u2['end']} ({u2['name']})"
+    f1_norm = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+    f2_norm = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
+    s1 = int(u1.get("start") or 1)
+    e1 = int(u1.get("end") or s1)
+    s2 = int(u2.get("start") or 1)
+    e2 = int(u2.get("end") or s2)
+    n1 = str(u1.get("name") or "unit1")
+    n2 = str(u2.get("name") or "unit2")
+    from_label = f"{f1_norm}:{s1}-{e1} ({n1})"
+    to_label = f"{f2_norm}:{s2}-{e2} ({n2})"
     diff = list(difflib.unified_diff(
         lines1, lines2, fromfile=from_label, tofile=to_label, lineterm=""
     ))
@@ -95,8 +132,8 @@ def synthesize_refactoring_suggestion(
     """Synthesizes actionable refactoring recommendation and shared helper template."""
     lines1 = extract_unit_source_code(u1, repo_root)
     lines2 = extract_unit_source_code(u2, repo_root)
-    n1 = u1["name"].split(":")[-1]
-    n2 = u2["name"].split(":")[-1]
+    n1 = str(u1.get("name") or "unit1").rsplit(":", maxsplit=1)[-1]
+    n2 = str(u2.get("name") or "unit2").rsplit(":", maxsplit=1)[-1]
 
     if n1.startswith("test_") and n2.startswith("test_"):
         return (
@@ -141,14 +178,38 @@ def format_sarif_report(
     """Formats detected clones into OASIS SARIF 2.1.0 standard schema for GitHub Code Scanning."""
     results: List[Dict[str, Any]] = []
     for idx, (sim, u1, u2) in enumerate(clones):
+        f1_norm = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+        f2_norm = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
+        s1 = int(u1.get("start") or 1)
+        e1 = int(u1.get("end") or s1)
+        s2 = int(u2.get("start") or 1)
+        e2 = int(u2.get("end") or s2)
+        n1 = str(u1.get("name") or "unit1")
+        n2 = str(u2.get("name") or "unit2")
         rule_id = "PYDOPPEL001"
         message = (
-            f"Code duplication: AST block '{u1['name']}' in {u1['file']}:{u1['start']}-{u1['end']} "
-            f"is {sim:.1%} structurally identical to '{u2['name']}' in {u2['file']}:{u2['start']}-{u2['end']} "
+            f"Code duplication: AST block '{n1}' in {f1_norm}:{s1}-{e1} "
+            f"is {sim:.1%} structurally identical to '{n2}' in {f2_norm}:{s2}-{e2} "
             f"(threshold >= {threshold:.0%})."
         )
-        f1_norm = u1["file"].replace("\\", "/")
-        f2_norm = u2["file"].replace("\\", "/")
+        r1: Dict[str, Any] = {
+            "startLine": s1,
+            "endLine": e1,
+        }
+        if u1.get("start_col") is not None:
+            r1["startColumn"] = max(1, int(u1["start_col"]) + 1)
+        if u1.get("end_col") is not None:
+            r1["endColumn"] = max(1, int(u1["end_col"]) + 1)
+
+        r2: Dict[str, Any] = {
+            "startLine": s2,
+            "endLine": e2,
+        }
+        if u2.get("start_col") is not None:
+            r2["startColumn"] = max(1, int(u2["start_col"]) + 1)
+        if u2.get("end_col") is not None:
+            r2["endColumn"] = max(1, int(u2["end_col"]) + 1)
+
         result_item: Dict[str, Any] = {
             "ruleId": rule_id,
             "ruleIndex": 0,
@@ -161,26 +222,20 @@ def format_sarif_report(
                             "uri": f1_norm,
                             "uriBaseId": "%SRCROOT%",
                         },
-                        "region": {
-                            "startLine": u1["start"],
-                            "endLine": u1["end"],
-                        },
+                        "region": r1,
                     }
                 }
             ],
             "relatedLocations": [
                 {
                     "id": idx + 1,
-                    "message": {"text": f"Clone twin: '{u2['name']}' in {f2_norm}:{u2['start']}-{u2['end']}"},
+                    "message": {"text": f"Clone twin: '{n2}' in {f2_norm}:{s2}-{e2}"},
                     "physicalLocation": {
                         "artifactLocation": {
                             "uri": f2_norm,
                             "uriBaseId": "%SRCROOT%",
                         },
-                        "region": {
-                            "startLine": u2["start"],
-                            "endLine": u2["end"],
-                        },
+                        "region": r2,
                     },
                 }
             ],
@@ -246,18 +301,18 @@ def format_json_report(
             {
                 "similarity": round(sim, 4),
                 "unit_a": {
-                    "name": u1["name"],
-                    "file": u1["file"].replace("\\", "/"),
-                    "start": u1["start"],
-                    "end": u1["end"],
+                    "name": str(u1.get("name") or "unit1"),
+                    "file": normalize_path_string(str(u1.get("file") or ""), strip_anchor=False),
+                    "start": int(u1.get("start") or 1),
+                    "end": int(u1.get("end") or int(u1.get("start") or 1)),
                     "kind": u1.get("kind"),
                     "tokens": u1.get("token_count", 0),
                 },
                 "unit_b": {
-                    "name": u2["name"],
-                    "file": u2["file"].replace("\\", "/"),
-                    "start": u2["start"],
-                    "end": u2["end"],
+                    "name": str(u2.get("name") or "unit2"),
+                    "file": normalize_path_string(str(u2.get("file") or ""), strip_anchor=False),
+                    "start": int(u2.get("start") or 1),
+                    "end": int(u2.get("end") or int(u2.get("start") or 1)),
                     "kind": u2.get("kind"),
                     "tokens": u2.get("token_count", 0),
                 },
@@ -278,10 +333,10 @@ def format_json_report(
                 "total_lines": f["total_lines"],
                 "medoid": (
                     {
-                        "name": f["medoid"]["name"],
-                        "file": f["medoid"]["file"].replace("\\", "/"),
-                        "start": f["medoid"]["start"],
-                        "end": f["medoid"]["end"],
+                        "name": str(f["medoid"].get("name") or "medoid"),
+                        "file": normalize_path_string(str(f["medoid"].get("file") or ""), strip_anchor=False),
+                        "start": int(f["medoid"].get("start") or 1),
+                        "end": int(f["medoid"].get("end") or int(f["medoid"].get("start") or 1)),
                         "kind": f["medoid"].get("kind"),
                     }
                     if "medoid" in f and f["medoid"]
@@ -289,10 +344,10 @@ def format_json_report(
                 ),
                 "members": [
                     {
-                        "name": m["name"],
-                        "file": m["file"].replace("\\", "/"),
-                        "start": m["start"],
-                        "end": m["end"],
+                        "name": str(m.get("name") or "member"),
+                        "file": normalize_path_string(str(m.get("file") or ""), strip_anchor=False),
+                        "start": int(m.get("start") or 1),
+                        "end": int(m.get("end") or int(m.get("start") or 1)),
                         "kind": m.get("kind"),
                     }
                     for m in f["members"]
@@ -307,19 +362,28 @@ def format_json_report(
 
 def format_markdown_summary(stats: Dict[str, Any], target: str) -> str:
     """Formats GitHub Step Summary Markdown report."""
+    clean_target = str(target).replace("`", "'")
+    dry_score = float(stats.get("dry_score", 100.0))
+    grade = str(stats.get("grade", "A+"))
+    sloc = int(stats.get("sloc", 0))
+    dloc = int(stats.get("dloc", 0))
+    dup_pct = float(stats.get("duplication_pct", 0.0))
+    clone_pairs = int(stats.get("clone_pairs", 0))
+    clone_fams = int(stats.get("clone_families", 0))
+
     md_lines: List[str] = [
         "## pyDoppelgangerHunt DRY Quality Audit Summary",
         "",
-        f"**Audit Target:** `{target}`",
+        f"**Audit Target:** `{clean_target}`",
         "",
         "| Metric | Value |",
         "| :--- | :--- |",
-        f"| **Repository DRY Score** | **{stats['dry_score']:.1f}% (Grade: {stats['grade']})** |",
-        f"| **Total Source Lines (SLOC)** | {stats['sloc']:,} |",
-        f"| **Duplicated Lines (DLOC)** | {stats['dloc']:,} |",
-        f"| **Duplication Rate** | {stats['duplication_pct']:.2f}% |",
-        f"| **Total Clone Pairs** | {stats['clone_pairs']} |",
-        f"| **Clone Families** | {stats['clone_families']} |",
+        f"| **Repository DRY Score** | **{dry_score:.1f}% (Grade: {grade})** |",
+        f"| **Total Source Lines (SLOC)** | {sloc:,} |",
+        f"| **Duplicated Lines (DLOC)** | {dloc:,} |",
+        f"| **Duplication Rate** | {dup_pct:.2f}% |",
+        f"| **Total Clone Pairs** | {clone_pairs} |",
+        f"| **Clone Families** | {clone_fams} |",
         "",
     ]
     if stats.get("package_sloc"):
@@ -327,7 +391,8 @@ def format_markdown_summary(stats: Dict[str, Any], target: str) -> str:
         md_lines.append("| Package / Directory | SLOC |")
         md_lines.append("| :--- | :--- |")
         for pkg, lines in sorted(stats["package_sloc"].items(), key=lambda x: x[1], reverse=True):
-            md_lines.append(f"| `{pkg}` | {lines:,} |")
+            clean_pkg = str(pkg).replace("|", "\\|").replace("`", "'")
+            md_lines.append(f"| `{clean_pkg}` | {lines:,} |")
         md_lines.append("")
 
     return "\n".join(md_lines)
@@ -339,7 +404,9 @@ def emit_structured_report(
     """Emits formatted JSON or SARIF report to stdout or output file."""
     text = json.dumps(data, indent=2)
     if output_path:
-        with open(output_path, "w", encoding="utf-8") as fh:
+        out_p = Path(output_path)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_p, "w", encoding="utf-8") as fh:
             fh.write(text)
         print(f"Report saved in {fmt_label} format to {output_path}")
     else:
@@ -352,19 +419,31 @@ def format_github_annotations(
     """Generates GitHub Actions workflow commands to annotate PR line diffs."""
     annotations: List[str] = []
     for sim, u1, u2 in clones:
-        f1 = u1["file"].replace("\\", "/").split("#")[0]
-        s1 = u1["start"]
-        e1 = u1["end"]
-        f2 = u2["file"].replace("\\", "/").split("#")[0]
-        s2 = u2["start"]
-        e2 = u2["end"]
-        msg1 = f"Structural clone ({sim:.1%}) matching {f2}:{s2}-{e2} ({u2['name']})"
+        f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=True)
+        s1 = int(u1.get("start") or 1)
+        e1 = int(u1.get("end") or s1)
+        f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=True)
+        s2 = int(u2.get("start") or 1)
+        e2 = int(u2.get("end") or s2)
+        n1 = str(u1.get("name") or "unit1")
+        n2 = str(u2.get("name") or "unit2")
+        msg1 = f"Structural clone ({sim:.1%}) matching {f2}:{s2}-{e2} ({n2})"
+        col_part1 = ""
+        if u1.get("start_col") is not None:
+            col_part1 += f",col={max(1, int(u1['start_col']) + 1)}"
+            if u1.get("end_col") is not None:
+                col_part1 += f",endColumn={max(1, int(u1['end_col']) + 1)}"
         annotations.append(
-            f"::warning file={f1},line={s1},endLine={e1},title=pyDoppelgangerHunt Duplicate Code::{msg1}"
+            f"::warning file={f1},line={s1},endLine={e1}{col_part1},title=pyDoppelgangerHunt Duplicate Code::{msg1}"
         )
-        msg2 = f"Structural clone ({sim:.1%}) matching {f1}:{s1}-{e1} ({u1['name']})"
+        msg2 = f"Structural clone ({sim:.1%}) matching {f1}:{s1}-{e1} ({n1})"
+        col_part2 = ""
+        if u2.get("start_col") is not None:
+            col_part2 += f",col={max(1, int(u2['start_col']) + 1)}"
+            if u2.get("end_col") is not None:
+                col_part2 += f",endColumn={max(1, int(u2['end_col']) + 1)}"
         annotations.append(
-            f"::warning file={f2},line={s2},endLine={e2},title=pyDoppelgangerHunt Duplicate Code::{msg2}"
+            f"::warning file={f2},line={s2},endLine={e2}{col_part2},title=pyDoppelgangerHunt Duplicate Code::{msg2}"
         )
     return annotations
 
@@ -375,8 +454,14 @@ def generate_html_report(
     threshold: float,
     families: Optional[List[Dict[str, Any]]] = None,
     stats: Optional[Dict[str, Any]] = None,
+    repo_root: Optional[str] = None,
 ) -> str:
     """Generates a standalone, self-contained interactive HTML audit report."""
+    effective_repo_root = (
+        repo_root
+        if repo_root is not None
+        else (target if os.path.isdir(target) else (os.path.dirname(target) or None))
+    )
     dry_score = stats["dry_score"] if stats else 100.0
     grade = stats["grade"] if stats else "A+"
     sloc = stats["sloc"] if stats else 0
@@ -389,30 +474,45 @@ def generate_html_report(
 
     cards_html: List[str] = []
     for idx, (sim, u1, u2) in enumerate(clones, 1):
-        diff_txt = generate_clone_diff(u1, u2)
-        sug_txt = synthesize_refactoring_suggestion(u1, u2)
+        diff_txt = generate_clone_diff(u1, u2, repo_root=effective_repo_root)
+        sug_txt = synthesize_refactoring_suggestion(u1, u2, repo_root=effective_repo_root)
         diff_block = (
-            f"<pre class='diff'><code>{diff_txt}</code></pre>" if diff_txt else "<em>No textual diff</em>"
+            f"<pre class='diff'><code>{html.escape(diff_txt)}</code></pre>" if diff_txt else "<em>No textual diff</em>"
         )
         sug_block = (
-            f"<div class='sug'><strong>Refactoring Suggestion:</strong><pre><code>{sug_txt}</code></pre></div>"
+            f"<div class='sug'><strong>Refactoring Suggestion:</strong><pre><code>{html.escape(sug_txt)}</code></pre></div>"
             if sug_txt
             else ""
         )
 
+        f1_norm = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+        f2_norm = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
+        s1 = int(u1.get("start") or 1)
+        e1 = int(u1.get("end") or s1)
+        s2 = int(u2.get("start") or 1)
+        e2 = int(u2.get("end") or s2)
+        n1 = str(u1.get("name") or "unit1")
+        n2 = str(u2.get("name") or "unit2")
+
+        f1_esc = html.escape(f1_norm)
+        f2_esc = html.escape(f2_norm)
+        n1_esc = html.escape(n1)
+        n2_esc = html.escape(n2)
+        search_attr = html.escape(f"{f1_norm} {n1} {f2_norm} {n2}", quote=True)
+
         card = f"""
-        <div class="clone-card" data-search="{u1['file']} {u1['name']} {u2['file']} {u2['name']}">
+        <div class="clone-card" data-search="{search_attr}">
             <div class="card-header">
                 <span class="sim-badge" style="background: {'#ef4444' if sim >= 0.85 else '#f59e0b'};">
                     {sim:.1%} Match
                 </span>
-                <span class="card-title">#{idx}: {u1['name']} &harr; {u2['name']}</span>
+                <span class="card-title">#{idx}: {n1_esc} &harr; {n2_esc}</span>
             </div>
             <div class="card-body">
                 <div class="loc-row">
-                    <span class="file-tag">&#128196; {u1['file']}:{u1['start']}-{u1['end']}</span>
+                    <span class="file-tag">&#128196; {f1_esc}:{s1}-{e1}</span>
                     <span class="arrow">&harr;</span>
-                    <span class="file-tag">&#128196; {u2['file']}:{u2['start']}-{u2['end']}</span>
+                    <span class="file-tag">&#128196; {f2_esc}:{s2}-{e2}</span>
                 </div>
                 {sug_block}
                 <details>
@@ -427,28 +527,44 @@ def generate_html_report(
     families_html: List[str] = []
     if families:
         for fam in families:
-            medoid_name = fam.get("medoid", {}).get("name") if fam.get("medoid") else None
+            medoid_name = (
+                str(fam["medoid"].get("name") or "")
+                if isinstance(fam.get("medoid"), dict)
+                else None
+            )
             coherence_val = fam.get("coherence")
             coherence_str = f" &bull; {coherence_val:.1%} coherence" if coherence_val is not None else ""
-            members_li = "".join(
-                f"<li><code>{m['file']}:{m['start']}-{m['end']}</code> ({m['name']})"
-                f"{' <strong>[medoid]</strong>' if medoid_name and m.get('name') == medoid_name else ''}</li>"
-                for m in fam["members"]
-            )
+            members_li_parts: List[str] = []
+            for m in fam.get("members", []):
+                m_file = html.escape(
+                    normalize_path_string(str(m.get("file") or ""), strip_anchor=False)
+                )
+                m_start = int(m.get("start") or 1)
+                m_end = int(m.get("end") or m_start)
+                raw_m_name = str(m.get("name") or "member")
+                m_name = html.escape(raw_m_name)
+                is_medoid = bool(medoid_name and raw_m_name == medoid_name)
+                medoid_tag = " <strong>[medoid]</strong>" if is_medoid else ""
+                members_li_parts.append(
+                    f"<li><code>{m_file}:{m_start}-{m_end}</code> ({m_name}){medoid_tag}</li>"
+                )
+            members_li = "".join(members_li_parts)
+            fam_id = html.escape(str(fam.get("family_id", "")))
             f_card = f"""
             <div class="family-card">
-                <h3>{fam['family_id']} &mdash; {fam['member_count']} Members ({fam['avg_similarity']:.1%} avg sim{coherence_str})</h3>
+                <h3>{fam_id} &mdash; {fam['member_count']} Members ({fam['avg_similarity']:.1%} avg sim{coherence_str})</h3>
                 <ul>{members_li}</ul>
             </div>
             """
             families_html.append(f_card)
 
+    target_esc = html.escape(str(target))
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>pyDoppelgangerHunt Audit Report - {target}</title>
+    <title>pyDoppelgangerHunt Audit Report - {target_esc}</title>
     <style>
         :root {{
             --bg: #0f172a;
@@ -574,7 +690,7 @@ def generate_html_report(
     <div class="container">
         <header>
             <h1>pyDoppelgangerHunt Audit Report</h1>
-            <div class="meta">Target: <code>{target}</code> | Similarity Threshold: {threshold:.0%} | Generated by pyDoppelgangerHunt v1.0.0</div>
+            <div class="meta">Target: <code>{target_esc}</code> | Similarity Threshold: {threshold:.0%} | Generated by pyDoppelgangerHunt v1.0.0</div>
         </header>
 
         <div class="grid-stats">

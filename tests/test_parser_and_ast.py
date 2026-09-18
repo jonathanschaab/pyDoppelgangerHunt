@@ -21,8 +21,13 @@ from pydoppelgangerhunt import (
 )
 
 from pydoppelgangerhunt.parser import (
+    BRANCH_NODE_TYPES,
+    COMPOUND_BLOCK_TYPES,
+    _CommutativeCanonicalizer,
+    _IdiomCanonicalizer,
     _compute_expression_complexity,
     _harvest_complex_expressions,
+    _walk_ast_nodes,
     check_inline_suppression,
 )
 
@@ -753,3 +758,541 @@ def test_harvest_units_structural_hash(tmp_path: Path) -> None:
     assert units2[0]["structural_hash"] == u["structural_hash"]
 
 
+def test_batch_43_ast_constructs_canonicalizers_and_branch_harvesting(tmp_path: Path) -> None:
+    """Test AST node types, commutative canonicalization, idiom reduction, and branch harvesting."""
+    # 1. Expanded boilerplate recognition (exception, warn, info, custom)
+    tree_ex = ast.parse("logger.exception('failed')").body[0]
+    assert is_boilerplate_node(tree_ex) is True
+    tree_warn = ast.parse("logger.warn('deprecated')").body[0]
+    assert is_boilerplate_node(tree_warn) is True
+    tree_cust = ast.parse("custom_obj.calculate_result()").body[0]
+    assert is_boilerplate_node(tree_cust) is False
+
+    # 2. _CommutativeCanonicalizer with symmetric identity comparisons (is, is not)
+    t_is1 = ast.parse("res = x is None")
+    t_is2 = ast.parse("res = None is x")
+    c_is1 = _CommutativeCanonicalizer().visit(t_is1)
+    c_is2 = _CommutativeCanonicalizer().visit(t_is2)
+    assert ast.dump(c_is1) == ast.dump(c_is2)
+
+    t_isnot1 = ast.parse("res = x is not None")
+    t_isnot2 = ast.parse("res = None is not x")
+    c_isnot1 = _CommutativeCanonicalizer().visit(t_isnot1)
+    c_isnot2 = _CommutativeCanonicalizer().visit(t_isnot2)
+    assert ast.dump(c_isnot1) == ast.dump(c_isnot2)
+
+    # 3. _CommutativeCanonicalizer with MatchOr (Python 3.10+)
+    if hasattr(ast, "MatchOr"):
+        t_mor1 = ast.parse("match val:\n    case int() | float():\n        pass")
+        t_mor2 = ast.parse("match val:\n    case float() | int():\n        pass")
+        c_mor1 = _CommutativeCanonicalizer().visit(t_mor1)
+        c_mor2 = _CommutativeCanonicalizer().visit(t_mor2)
+        assert ast.dump(c_mor1) == ast.dump(c_mor2)
+
+    # 4. _IdiomCanonicalizer with Attribute append target (self.items.append(x))
+    t_attr_loop = ast.parse("for x in data:\n    self.items.append(x)")
+    c_attr_loop = _IdiomCanonicalizer().visit(t_attr_loop)
+    assert isinstance(c_attr_loop.body[0], ast.Assign)
+    assert isinstance(c_attr_loop.body[0].targets[0], ast.Attribute)
+    assert c_attr_loop.body[0].targets[0].attr == "items"
+    assert isinstance(c_attr_loop.body[0].value, ast.ListComp)
+
+    # 5. compute_cyclomatic_complexity with Match cases and TryStar
+    if hasattr(ast, "Match"):
+        t_match = ast.parse(
+            "def handle(val):\n"
+            "    match val:\n"
+            "        case 1:\n"
+            "            return 10\n"
+            "        case 2:\n"
+            "            return 20\n"
+            "        case _:\n"
+            "            return 30\n"
+        ).body[0]
+        assert compute_cyclomatic_complexity(t_match) == 4
+
+    if hasattr(ast, "TryStar"):
+        t_trystar = ast.parse(
+            "def handle_tg():\n"
+            "    try:\n"
+            "        pass\n"
+            "    except* ValueError:\n"
+            "        pass\n"
+            "    except* TypeError:\n"
+            "        pass\n"
+        ).body[0]
+        assert compute_cyclomatic_complexity(t_trystar) == 4
+
+    # 6. COMPOUND_BLOCK_TYPES and BRANCH_NODE_TYPES invariants
+    assert ast.If in COMPOUND_BLOCK_TYPES
+    assert ast.For in COMPOUND_BLOCK_TYPES
+    assert ast.Try in COMPOUND_BLOCK_TYPES
+    assert ast.If in BRANCH_NODE_TYPES
+    assert ast.ExceptHandler in BRANCH_NODE_TYPES
+    if hasattr(ast, "Match"):
+        assert getattr(ast, "Match") in COMPOUND_BLOCK_TYPES
+        assert getattr(ast, "match_case") in BRANCH_NODE_TYPES
+    if hasattr(ast, "TryStar"):
+        assert getattr(ast, "TryStar") in COMPOUND_BLOCK_TYPES
+        assert getattr(ast, "TryStar") in BRANCH_NODE_TYPES
+
+    # 7. _walk_ast_nodes with type_params (PEP 695) and match_case guard
+    if hasattr(ast, "TypeVar"):
+        try:
+            t_tp = ast.parse("def generic_fn[T](x: int) -> int: pass")
+            nodes_untyped = _walk_ast_nodes(t_tp, strip_annotations=True)
+            assert not any(type(n).__name__ == "TypeVar" for n in nodes_untyped)
+            nodes_typed = _walk_ast_nodes(t_tp, strip_annotations=False)
+            assert any(type(n).__name__ == "TypeVar" for n in nodes_typed)
+        except SyntaxError:
+            pass
+
+    if hasattr(ast, "match_case"):
+        t_guard = ast.parse("match x:\n    case 1 if a > 0:\n        pass")
+        nodes_guard = _walk_ast_nodes(t_guard, abstract_expressions=True)
+        assert any(isinstance(n, ast.Name) and n.id == "__ABSTRACT_COND__" for n in nodes_guard)
+
+    # 8. Clause-level branch harvesting across Try (else, finally) and Match (cases)
+    src_try = tmp_path / "clause_try.py"
+    src_try.write_text(
+        "def try_proc():\n"
+        "    try:\n"
+        "        a = 1\n"
+        "        b = 2\n"
+        "        c = 3\n"
+        "    except ValueError:\n"
+        "        d = 4\n"
+        "        e = 5\n"
+        "        f = 6\n"
+        "    else:\n"
+        "        g = 7\n"
+        "        h = 8\n"
+        "        i = 9\n"
+        "    finally:\n"
+        "        j = 10\n"
+        "        k = 11\n"
+        "        l = 12\n",
+        encoding="utf-8",
+    )
+    units_try = harvest_file_units(str(src_try), str(tmp_path), min_lines=2, min_tokens=5, clause_level=True)
+    c_names = {u["name"] for u in units_try if u.get("kind") == "clause_branch"}
+    assert "try_proc:except_ValueError" in c_names
+    assert "try_proc:try_else" in c_names
+    assert "try_proc:try_finally" in c_names
+
+    if hasattr(ast, "Match"):
+        src_match = tmp_path / "clause_match.py"
+        src_match.write_text(
+            "def match_proc(val):\n"
+            "    init_val = 0\n"
+            "    match val:\n"
+            "        case 1:\n"
+            "            a = 1\n"
+            "            b = 2\n"
+            "            c = 3\n"
+            "        case 2:\n"
+            "            d = 4\n"
+            "            e = 5\n"
+            "            f = 6\n",
+            encoding="utf-8",
+        )
+        # Without clause_level: harvested as compound block
+        units_m_block = harvest_file_units(
+            str(src_match), str(tmp_path), min_lines=4, min_tokens=8, clause_level=False
+        )
+        m_block_kinds = {u["name"]: u["kind"] for u in units_m_block}
+        assert "match_proc:Match" in m_block_kinds
+        assert m_block_kinds["match_proc:Match"] == "compound_block"
+
+        # With clause_level: case branches harvested
+        units_m_clause = harvest_file_units(
+            str(src_match), str(tmp_path), min_lines=2, min_tokens=5, clause_level=True
+        )
+        m_clause_names = {u["name"] for u in units_m_clause if u.get("kind") == "clause_branch"}
+        assert "match_proc:case_1" in m_clause_names
+        assert "match_proc:case_2" in m_clause_names
+
+
+def test_batch_45_idiom_canonicalizer_and_baseline_legacy(tmp_path: Path) -> None:
+    """Test Batch 45 enhancements: SetComp/DictComp/AsyncFor canonicalization, fatal/trace boilerplate, legacy baselines."""
+    # 1. Boilerplate node checks for fatal and trace
+    fatal_tree = ast.parse("logger.fatal('severe error')\nlogger.trace('tracing step')")
+    for stmt in fatal_tree.body:
+        assert is_boilerplate_node(stmt)
+
+    # 2. _IdiomCanonicalizer SetComp and DictComp and AsyncFor transformations
+    canon = _IdiomCanonicalizer()
+
+    # Sync SetComp
+    set_loop = ast.parse("for x in data:\n    s.add(x)").body[0]
+    set_comp = canon.visit(set_loop)
+    assert isinstance(set_comp, ast.Assign)
+    assert isinstance(set_comp.value, ast.SetComp)
+
+    # Sync SetComp with if
+    set_if_loop = ast.parse("for x in data:\n    if x > 0:\n        s.add(x)").body[0]
+    set_if_comp = canon.visit(set_if_loop)
+    assert isinstance(set_if_comp, ast.Assign)
+    assert isinstance(set_if_comp.value, ast.SetComp)
+    assert len(set_if_comp.value.generators[0].ifs) == 1
+
+    # Sync DictComp
+    dict_loop = ast.parse("for k, v in items:\n    d[k] = v").body[0]
+    dict_comp = canon.visit(dict_loop)
+    assert isinstance(dict_comp, ast.Assign)
+    assert isinstance(dict_comp.value, ast.DictComp)
+
+    # Sync DictComp with if
+    dict_if_loop = ast.parse("for k, v in items:\n    if v:\n        d[k] = v").body[0]
+    dict_if_comp = canon.visit(dict_if_loop)
+    assert isinstance(dict_if_comp, ast.Assign)
+    assert isinstance(dict_if_comp.value, ast.DictComp)
+
+    # Attribute target DictComp: self.map[k] = v
+    attr_dict_loop = ast.parse("for k, v in items:\n    self.map[k] = v").body[0]
+    attr_dict_comp = canon.visit(attr_dict_loop)
+    assert isinstance(attr_dict_comp, ast.Assign)
+    assert isinstance(attr_dict_comp.targets[0], ast.Attribute)
+    assert isinstance(attr_dict_comp.value, ast.DictComp)
+
+    # Async ListComp and SetComp
+    async_list_loop = ast.parse("async def f():\n    async for x in stream:\n        items.append(x)").body[0].body[0]  # type: ignore[attr-defined]
+    async_list_comp = canon.visit(async_list_loop)
+    assert isinstance(async_list_comp, ast.Assign)
+    assert isinstance(async_list_comp.value, ast.ListComp)
+    assert async_list_comp.value.generators[0].is_async == 1
+
+    async_set_loop = ast.parse("async def f():\n    async for x in stream:\n        s.add(x)").body[0].body[0]  # type: ignore[attr-defined]
+    async_set_comp = canon.visit(async_set_loop)
+    assert isinstance(async_set_comp, ast.Assign)
+    assert isinstance(async_set_comp.value, ast.SetComp)
+    assert async_set_comp.value.generators[0].is_async == 1
+
+    async_dict_loop = ast.parse("async def f():\n    async for k, v in stream:\n        d[k] = v").body[0].body[0]  # type: ignore[attr-defined]
+    async_dict_comp = canon.visit(async_dict_loop)
+    assert isinstance(async_dict_comp, ast.Assign)
+    assert isinstance(async_dict_comp.value, ast.DictComp)
+    assert async_dict_comp.value.generators[0].is_async == 1
+
+    # 3. Sliding window harvesting with safe end_lineno fallback
+    src_sw = tmp_path / "sw.py"
+    src_sw.write_text(
+        "def run_sliding():\n"
+        "    a = 1\n"
+        "    b = 2\n"
+        "    c = 3\n"
+        "    d = 4\n"
+        "    e = 5\n"
+        "    f = 6\n",
+        encoding="utf-8",
+    )
+    sw_units = harvest_file_units(str(src_sw), str(tmp_path), min_lines=2, min_tokens=5, sliding_window=True, window_size=3)
+    sw_kinds = [u["kind"] for u in sw_units if u.get("kind") == "sliding_window"]
+    assert len(sw_kinds) >= 1
+
+    # 4. Legacy string-list baseline support in load_baseline and prune_baseline
+    import json
+    from pydoppelgangerhunt.baseline import load_baseline, prune_baseline
+    legacy_file = tmp_path / "legacy_baseline.json"
+    legacy_file.write_text(
+        json.dumps({
+            "version": "1.0.0",
+            "fingerprints": [
+                "mod_a.py:fn1 <===> mod_b.py:fn2",
+                "mod_c.py:calc <===> mod_d.py:calc",
+            ],
+        }),
+        encoding="utf-8",
+    )
+    loaded_bl = load_baseline(str(legacy_file))
+    assert "mod_a.py:fn1 <===> mod_b.py:fn2" in loaded_bl
+    assert len(loaded_bl.records) == 2
+    assert loaded_bl.records[0]["file_a"] == "mod_a.py"
+    assert loaded_bl.records[0]["name_a"] == "fn1"
+
+    prune_res = prune_baseline(str(legacy_file), active_clones=[], unstaged_modified_ranges={})
+    assert prune_res.pruned_count == 2
+    assert prune_res.retained_count == 0
+
+
+def test_batch_50_parser_and_baseline_deep_hardening(tmp_path: Path) -> None:
+    """Batch 50: Test AST canonicalization, scope visitor, decorator inspection, and baseline pruning."""
+    # pylint: disable=import-outside-toplevel,protected-access
+    import json
+    from typing import Any
+    from pydoppelgangerhunt.baseline import prune_baseline
+    from pydoppelgangerhunt.parser import (
+        _CommutativeCanonicalizer,
+        _IdiomCanonicalizer,
+        _ScopeHierarchyVisitor,
+        is_boilerplate_node,
+        is_decorator_named,
+    )
+
+    # 1. is_boilerplate_node on custom logger names and methods
+    log_call = ast.parse("custom_logger.critical('fatal issue')").body[0]
+    assert is_boilerplate_node(log_call) is True
+    logger_call = ast.parse("logger.anything('logged')").body[0]
+    assert is_boilerplate_node(logger_call) is True
+    non_log_call = ast.parse("math_helper.sqrt(100)").body[0]
+    assert is_boilerplate_node(non_log_call) is False
+
+    # 2. _CommutativeCanonicalizer sort key fallback and bitwise operations
+    canon = _CommutativeCanonicalizer()
+
+    class _BrokenNode(ast.AST):
+        def __getattribute__(self, name: str) -> Any:
+            if name == "_fields":
+                raise TypeError("ast dump failure")
+            return super().__getattribute__(name)
+
+    assert canon._sort_key(_BrokenNode()) == "_BrokenNode"
+
+    t_and1 = ast.parse("res = b & a")
+    t_and2 = ast.parse("res = a & b")
+    assert ast.dump(canon.visit(t_and1)) == ast.dump(canon.visit(t_and2))
+
+    t_xor1 = ast.parse("res = b ^ a")
+    t_xor2 = ast.parse("res = a ^ b")
+    assert ast.dump(canon.visit(t_xor1)) == ast.dump(canon.visit(t_xor2))
+
+    # 3. _IdiomCanonicalizer reduction loop with all()
+    t_all = ast.parse("for item in items:\n    if not item:\n        return False").body[0]
+    c_all = _IdiomCanonicalizer().visit(t_all)
+    assert isinstance(c_all, ast.Return)
+    assert isinstance(c_all.value, ast.Call)
+    assert isinstance(c_all.value.func, ast.Name)
+    assert c_all.value.func.id == "all"
+
+    # Multi-statement loop should not be transformed
+    t_multi = ast.parse("for x in data:\n    step1()\n    step2()").body[0]
+    assert _IdiomCanonicalizer().visit(t_multi) is t_multi
+
+    # 4. _ScopeHierarchyVisitor with nested classes, functions, and closures
+    src = (
+        "class Outer(Base, meta=1):\n"
+        "    def method(self, def_arg=5):\n"
+        "        def inner():\n"
+        "            return def_arg\n"
+        "        return inner()\n"
+        "    class InnerClass:\n"
+        "        def nested_m(self):\n"
+        "            pass\n"
+    )
+    visitor = _ScopeHierarchyVisitor()
+    visitor.visit(ast.parse(src))
+    assert len(visitor.enclosing_classes) >= 2
+    assert len(visitor.closure_parents) >= 1
+
+    # 5. is_decorator_named across Name, Call, and Attribute nodes
+    assert is_decorator_named(ast.Name(id="staticmethod"), "staticmethod") is True
+    assert is_decorator_named(ast.Name(id="staticmethod"), "classmethod") is False
+    assert (
+        is_decorator_named(
+            ast.Call(func=ast.Name(id="pytest_fixture"), args=[], keywords=[]),
+            "pytest_fixture",
+        )
+        is True
+    )
+    assert (
+        is_decorator_named(
+            ast.Attribute(value=ast.Name(id="pytest"), attr="mark"),
+            "mark",
+        )
+        is True
+    )
+    assert is_decorator_named(ast.Constant(value="literal"), "literal") is False
+
+    # 6. prune_baseline self-healing when unit name/location moves
+    bl_file = tmp_path / "baseline_healing.json"
+    u1 = {
+        "file": "foo.py",
+        "name": "func_old",
+        "start": 1,
+        "end": 10,
+        "token_count": 20,
+        "tokens": ["x"] * 20,
+        "structural_hash": "hash_1111",
+    }
+    u2 = {
+        "file": "bar.py",
+        "name": "func_target",
+        "start": 1,
+        "end": 10,
+        "token_count": 20,
+        "tokens": ["x"] * 20,
+        "structural_hash": "hash_2222",
+    }
+    bl_data = {
+        "version": "1.3.0",
+        "clone_count": 1,
+        "fingerprints": [
+            {
+                "fingerprint": "foo.py:func_old <===> bar.py:func_target",
+                "structural_fingerprint": "foo.py:func_old#hash_1111 <===> bar.py:func_target#hash_2222",
+                "namespaced_structural_fingerprint": "foo#hash_1111 <===> bar#hash_2222",
+                "pure_structural_fingerprint": "hash_1111 <===> hash_2222",
+                "hash_a": "hash_1111",
+                "hash_b": "hash_2222",
+                "file_a": "foo.py",
+                "name_a": "func_old",
+                "file_b": "bar.py",
+                "name_b": "func_target",
+            }
+        ],
+    }
+    bl_file.write_text(json.dumps(bl_data), encoding="utf-8")
+
+    # Rename u1 from func_old to func_new: pure structural match heals fingerprint
+    u1_renamed = dict(u1)
+    u1_renamed["name"] = "func_new"
+    active_clones = [(0.95, u1_renamed, u2)]
+    res = prune_baseline(str(bl_file), active_clones=active_clones, unstaged_modified_ranges={})
+    assert res.pruned_count == 0
+    assert res.retained_count == 1
+    healed_data = json.loads(bl_file.read_text(encoding="utf-8"))
+    assert healed_data["fingerprints"][0]["name_a"] == "func_new"
+
+    # 7. prune_baseline dirty skip when inactive clone file is in unstaged_modified_ranges
+    dirty_ranges = {"foo.py": [(1, 20)]}
+    res_dirty = prune_baseline(str(bl_file), active_clones=[], unstaged_modified_ranges=dirty_ranges)
+    assert res_dirty.pruned_count == 0
+    assert res_dirty.retained_count == 1
+    assert res_dirty.skipped_dirty_count == 1
+
+
+def test_parser_harvests_token_columns(tmp_path: Path) -> None:
+    """Verifies that parser._record_unit stores start_col and end_col on harvested units."""
+    from pydoppelgangerhunt.parser import harvest_file_units  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def add(x: int, y: int) -> int:\n"
+        "    # Some logic\n"
+        "    total = x + y\n"
+        "    return total\n"
+    )
+    f = tmp_path / "sample.py"
+    f.write_text(code, encoding="utf-8")
+
+    units = harvest_file_units(str(f), str(tmp_path), min_lines=2, min_tokens=3)
+    assert units
+    for u in units:
+        assert "start_col" in u
+        assert "end_col" in u
+        assert isinstance(u["start_col"], int)
+
+def test_parser_harvests_enclosing_class(tmp_path: Path) -> None:
+    """Verifies that parser sets enclosing_class across methods, blocks, and sliding windows."""
+    from pydoppelgangerhunt.parser import harvest_file_units  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "class OrderService:\n"
+        "    def process_order(self, order_id: int) -> bool:\n"
+        "        if order_id > 0:\n"
+        "            status = True\n"
+        "            return status\n"
+        "        return False\n"
+        "\n"
+        "def top_level(x: int) -> int:\n"
+        "    y = x + 1\n"
+        "    return y\n"
+    )
+    f = tmp_path / "order.py"
+    f.write_text(code, encoding="utf-8")
+
+    units = harvest_file_units(str(f), str(tmp_path), min_lines=2, min_tokens=3)
+    method_unit = next(u for u in units if u["name"] == "process_order")
+    assert method_unit.get("enclosing_class") == "OrderService"
+
+    top_unit = next(u for u in units if u["name"] == "top_level")
+    assert top_unit.get("enclosing_class") is None
+
+def test_class_level_comprehensions_harvest_enclosing_class(tmp_path: Path) -> None:
+    """Verifies that comprehensions defined directly in class body have enclosing_class set."""
+    f = tmp_path / "settings.py"
+    code = (
+        "class Settings:\n"
+        "    KEYS = [k.upper() for k in ('a', 'b', 'c')]\n"
+        "    MAP = {k: k * 2 for k in range(5)}\n"
+    )
+    f.write_text(code, encoding="utf-8")
+    units = harvest_file_units(str(f), str(tmp_path), comprehensions=True)
+    comps = [u for u in units if u.get("kind") == "comprehension"]
+    assert len(comps) >= 2
+    for comp in comps:
+        assert comp.get("enclosing_class") == "Settings"
+        assert comp.get("name", "").startswith("Settings:")
+
+def test_harvest_file_units_records_receiver_kind_and_is_static(tmp_path: Path) -> None:
+    """Verifies that harvest_file_units records receiver_kind and is_static."""
+    code = (
+        "class Service:\n"
+        "    def inst_m(self, x: int) -> int:\n"
+        "        y = x\n"
+        "        return y + 1\n"
+        "\n"
+        "    @classmethod\n"
+        "    def cls_m(cls, x: int) -> int:\n"
+        "        y = x\n"
+        "        return y + 1\n"
+        "\n"
+        "    @staticmethod\n"
+        "    def stat_m(x: int) -> int:\n"
+        "        y = x\n"
+        "        return y + 1\n"
+    )
+    f = tmp_path / "svc.py"
+    f.write_text(code, encoding="utf-8")
+    units = harvest_file_units(str(f), str(tmp_path), min_lines=2, min_tokens=1)
+    by_name = {u["name"]: u for u in units}
+
+    assert by_name["inst_m"]["receiver_kind"] == "instance"
+    assert by_name["inst_m"]["is_static"] is False
+
+    assert by_name["cls_m"]["receiver_kind"] == "class"
+    assert by_name["cls_m"]["is_static"] is False
+
+    assert by_name["stat_m"]["receiver_kind"] == "static"
+    assert by_name["stat_m"]["is_static"] is True
+
+def test_harvest_file_units_nested_function_receiver_kind_isolation(tmp_path: Path) -> None:
+    """Verifies that nested functions inside methods do not acquire receiver_kind='instance' when closures are disabled."""
+    code = (
+        "class Worker:\n"
+        "    def run(self, data: list):\n"
+        "        def inner(x: int) -> int:\n"
+        "            y = x * 2\n"
+        "            return y\n"
+        "        return [inner(v) for v in data]\n"
+    )
+    f = tmp_path / "nested_worker.py"
+    f.write_text(code, encoding="utf-8")
+
+    units = harvest_file_units(str(f), repo_root=str(tmp_path), min_lines=1, min_tokens=1, harvest_closures=False)
+    inner_u = next((u for u in units if u["name"] == "inner"), None)
+    assert inner_u is not None
+    assert inner_u.get("receiver_kind") is None
+    assert inner_u.get("is_static") is False
+
+def test_batch_83_comprehension_in_method_argument_annotation(tmp_path: Path) -> None:
+    """Verifies that comprehensions embedded inside method argument annotations record enclosing_class correctly."""
+    from pydoppelgangerhunt.parser import harvest_file_units  # pylint: disable=import-outside-toplevel
+
+    f = tmp_path / "handler.py"
+    code = (
+        "class Handler:\n"
+        "    def process(\n"
+        "        self,\n"
+        "        flags: list = [x for x in (1, 2)],\n"
+        "        *, \n"
+        "        options: dict = {k: v for k, v in [('a', 1)]}\n"
+        "    ) -> None:\n"
+        "        pass\n"
+    )
+    f.write_text(code, encoding="utf-8")
+
+    units = harvest_file_units(str(f), repo_root=str(tmp_path), min_lines=1, min_tokens=1, comprehensions=True)
+    comp_units = [u for u in units if u.get("kind") == "comprehension"]
+    assert len(comp_units) == 2
+    for comp in comp_units:
+        assert comp.get("enclosing_class") == "Handler"
