@@ -84,6 +84,11 @@ def test_find_nearest_common_package(tmp_path: Path) -> None:
     common_root = find_nearest_common_package(f_root1, f_root2, root)
     assert common_root == root
 
+    # Relative path inputs resolved against repo root (regardless of process CWD)
+    assert find_nearest_common_package("pkg/mod_a.py", "pkg/mod_b.py", root) == root / "pkg"
+    assert find_nearest_common_package("pkg\\mod_a.py", "pkg\\mod_b.py", root) == root / "pkg"
+    assert resolve_shared_module_file("pkg/mod_a.py", "pkg/mod_b.py", root) == root / "pkg" / "_common.py"
+
 
 def test_resolve_shared_module_file(tmp_path: Path) -> None:
     """Verifies target shared utility module file path resolution."""
@@ -122,6 +127,12 @@ def test_derive_shared_module_import_modes(tmp_path: Path) -> None:
     sibling_file = root / "pkg" / "helper.py"
     sibling_rel = derive_shared_module_import(sibling_file, shared_file, root, prefer_relative=True)
     assert sibling_rel == "._common"
+
+    # Relative string path inputs resolved against repo root (regardless of process CWD)
+    assert derive_shared_module_import("pkg/services/worker.py", "pkg/_common.py", root) == "pkg._common"
+    assert derive_shared_module_import("pkg\\services\\worker.py", "pkg\\_common.py", root) == "pkg._common"
+    assert derive_shared_module_import("pkg/services/worker.py", "pkg/_common.py", root, prefer_relative=True) == ".._common"
+    assert derive_shared_module_import("pkg\\services\\worker.py", "pkg\\_common.py", root, prefer_relative=True) == ".._common"
 
 
 def test_module_dependency_graph_reachability_and_cycles(tmp_path: Path) -> None:

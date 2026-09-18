@@ -25,6 +25,7 @@ from pydoppelgangerhunt.fixer.binding import (
 from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
     build_module_graph,
+    derive_module_import_path,
     derive_shared_module_import,
     find_nearest_common_package,
     resolve_shared_module_file,
@@ -34,7 +35,6 @@ from pydoppelgangerhunt.fixer.patch import (
     _adjust_line_for_replacements,
     _build_unit_delegation_call,
     _build_whole_method_delegation,
-    _derive_module_import_path,
     _has_unconditional_terminal_return,
     _module_imports_target,
     _render_file_patch_plan,
@@ -97,6 +97,7 @@ __all__ = [
     "analyze_unit_variable_scope",
     "build_module_graph",
     "check_units_overlap",
+    "derive_module_import_path",
     "derive_shared_module_import",
     "extract_unit_comments_and_pragmas",
     "filter_overlapping_clone_units",

@@ -24,6 +24,17 @@ EXCLUDED_GRAPH_DIRS: Set[str] = {
 }
 
 
+def _resolve_repo_relative_path(
+    file_path: Union[Path, str], p_root: Path
+) -> Path:
+    """Normalizes path separators and resolves relative paths against the repository root."""
+    norm = str(file_path).replace("\\", "/")
+    p = Path(norm)
+    if not p.is_absolute():
+        p = p_root / p
+    return p.resolve()
+
+
 def derive_module_import_path(
     file_path: Union[Path, str], repo_root: Union[Path, str]
 ) -> str:
@@ -40,13 +51,10 @@ def derive_module_import_path(
     Returns:
         Dot-separated module import path, or an empty string if unresolvable.
     """
-    norm_path = str(file_path).replace("\\", "/")
     p_root = Path(repo_root).resolve()
-    p_file = Path(norm_path)
-    if not p_file.is_absolute():
-        p_file = p_root / p_file
+    p_file = _resolve_repo_relative_path(file_path, p_root)
     try:
-        rel = p_file.resolve().relative_to(p_root)
+        rel = p_file.relative_to(p_root)
     except ValueError:
         rel = Path(p_file.name)
     parts = list(rel.parts)
@@ -83,8 +91,8 @@ def find_nearest_common_package(
         Path to the nearest common directory.
     """
     p_root = Path(repo_root).resolve()
-    dir1 = _parent_dir_of_path(Path(file1).resolve())
-    dir2 = _parent_dir_of_path(Path(file2).resolve())
+    dir1 = _parent_dir_of_path(_resolve_repo_relative_path(file1, p_root))
+    dir2 = _parent_dir_of_path(_resolve_repo_relative_path(file2, p_root))
 
     try:
         rel1 = dir1.relative_to(p_root)
@@ -148,8 +156,8 @@ def derive_shared_module_import(
         Module path suitable for 'from <module> import <helper>'.
     """
     p_root = Path(repo_root).resolve()
-    p_src = Path(source_file).resolve()
-    p_shared = Path(shared_file).resolve()
+    p_src = _resolve_repo_relative_path(source_file, p_root)
+    p_shared = _resolve_repo_relative_path(shared_file, p_root)
 
     try:
         p_src.relative_to(p_root)
