@@ -265,12 +265,12 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
             import tomli as tomllib  # type: ignore # pylint: disable=import-outside-toplevel
         with open(target_path, "rb") as fh:
             data = tomllib.load(fh)
-        tool_sec = data.get("tool", {})
-        if section_name in tool_sec:
+        tool_sec = data.get("tool", {}) if isinstance(data, dict) else {}
+        if isinstance(tool_sec, dict) and isinstance(tool_sec.get(section_name), dict):
             return dict(tool_sec[section_name])
-        if any(k in data for k in ("threshold", "min_lines", "exemptions", "exclude")):
+        if isinstance(data, dict) and any(k in data for k in ("threshold", "min_lines", "exemptions", "exclude")):
             return dict(data)
-    except (ImportError, OSError, ValueError):
+    except (ImportError, OSError, ValueError, TypeError):
         pass
 
     # Built-in zero-dependency line parser fallback
@@ -330,6 +330,10 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
                         config[k] = float(v) if "." in v else int(v)
                     except ValueError:
                         pass
+        if not any(line.strip().startswith("[") for line in lines):
+            if any(k in config for k in ("threshold", "min_lines", "exemptions", "exclude")):
+                return config
+            return {}
         return config
     except OSError:
         return {}

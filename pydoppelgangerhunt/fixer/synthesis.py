@@ -53,6 +53,7 @@ def _format_call_arguments(
         clean_t = t_var.lstrip("*")
         if receiver_to_omit and (
             clean_t == receiver_to_omit
+            or clean_h == receiver_to_omit
             or (receiver_to_omit == "receivers" and clean_t in ("self", "cls"))
         ):
             continue
@@ -150,6 +151,7 @@ def _format_helper_parameters(
     is_class_receiver: bool,
     type_merge_strategy: str,
     inputs2: Optional[Sequence[str]] = None,
+    receiver_param: Optional[str] = None,
 ) -> List[str]:
     """Formats helper function parameters with type annotations and default values."""
     params: List[str] = []
@@ -179,14 +181,22 @@ def _format_helper_parameters(
             "kind": kind,
         })
 
-    # Validate and ensure canonical argument kind ordering (self/cls -> pos -> vararg -> kwonly -> kwarg)
+    # Validate and ensure canonical argument kind ordering (primary receiver -> secondary receiver -> pos -> vararg -> kwonly -> kwarg)
+    primary_receiver = receiver_param or ("cls" if is_class_receiver else "self")
+    secondary_receiver = "self" if is_class_receiver else "cls"
+    all_receivers = {primary_receiver, "self", "cls"}
+
     def _kind_rank(desc: Dict[str, Any]) -> Tuple[int, int]:
         var = desc["var"]
         kind = desc["kind"]
-        if var in ("self", "cls"):
+        if var == primary_receiver:
+            return (0, 0)
+        if var == secondary_receiver:
+            return (0, 1)
+        if var in all_receivers:
             return (0, 0)
         rank_map = {"pos": 1, "vararg": 2, "kwonly": 3, "kwarg": 4}
-        return (rank_map.get(kind, 1), 1)
+        return (rank_map.get(kind, 1), 2)
 
     descriptors.sort(key=_kind_rank)
 
@@ -194,9 +204,9 @@ def _format_helper_parameters(
     if (
         effective_binding == "method"
         and not is_static_clone
-        and not any(desc["var"] in ("self", "cls") for desc in descriptors)
+        and not any(desc["var"] in all_receivers for desc in descriptors)
     ):
-        rec_var = "cls" if is_class_receiver else "self"
+        rec_var = primary_receiver
         descriptors.insert(0, {
             "var": rec_var,
             "type": "Any",
@@ -238,7 +248,7 @@ def _format_helper_parameters(
             params.append("*")
             seen_kwonly = True
 
-        if var in ("self", "cls") and effective_binding == "method":
+        if var == primary_receiver and effective_binding == "method":
             params.append(var)
         elif resolved_default is not None:
             params.append(f"{var_name}: {resolved_type} = {resolved_default}")
@@ -565,6 +575,7 @@ def synthesize_shared_helper_code(
     meta1 = {p["name"].lstrip("*"): p for p in scope1.get("param_details", [])}
     meta2 = {p["name"].lstrip("*"): p for p in scope2.get("param_details", [])}
 
+    rec_param = u1.get("receiver_param") or u2.get("receiver_param")
     params = _format_helper_parameters(
         inputs,
         meta1,
@@ -574,6 +585,7 @@ def synthesize_shared_helper_code(
         is_class_receiver=is_class_receiver,
         type_merge_strategy=type_merge_strategy,
         inputs2=inputs2 if len(inputs2) == len(inputs) else None,
+        receiver_param=rec_param,
     )
 
     r1 = scope1.get("return_type")

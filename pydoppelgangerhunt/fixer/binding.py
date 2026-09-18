@@ -159,9 +159,15 @@ def find_enclosing_function(
         return None
 
     decs = meta.pop("decorators", [])
-    meta.pop("node", None)
+    node = meta.pop("node", None)
     meta["is_static"] = any(is_decorator_named(d, "staticmethod") for d in decs)
     meta["is_class_method"] = any(is_decorator_named(d, "classmethod") for d in decs)
+    receiver_param = None
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        all_pos = list(getattr(node.args, "posonlyargs", [])) + list(node.args.args)
+        if all_pos:
+            receiver_param = all_pos[0].arg
+    meta["receiver_param"] = receiver_param
     return meta
 
 
@@ -307,6 +313,8 @@ def _populate_unit_receiver_metadata(
                     unit["is_static"] = True
             else:
                 unit["receiver_kind"] = None
+        if fn_meta and "receiver_param" in fn_meta and "receiver_param" not in unit:
+            unit["receiver_param"] = fn_meta["receiver_param"]
     except (OSError, UnicodeDecodeError):
         pass
 

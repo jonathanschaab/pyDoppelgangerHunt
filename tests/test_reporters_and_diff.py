@@ -9181,4 +9181,172 @@ def test_batch_82_matcher_sloc_and_priority_score_bounds() -> None:
     assert len(clone_pairs) == 2
 
 
+def test_batch_83_custom_receiver_name_delegation(tmp_path: Path) -> None:
+    """Verifies that custom receiver parameter names (e.g. this, klass) are respected during delegation and helper generation."""
+    f = tmp_path / "custom_rec.py"
+    code = (
+        "class Worker:\n"
+        "    def task_a(this, amount: int) -> int:\n"
+        "        val = amount * 2\n"
+        "        return val\n"
+        "\n"
+        "    def task_b(this, amount: int) -> int:\n"
+        "        val = amount * 2\n"
+        "        return val\n"
+    )
+    f.write_text(code, encoding="utf-8")
 
+    u1 = {
+        "file": str(f),
+        "start": 2,
+        "end": 4,
+        "name": "task_a",
+        "kind": "function",
+        "enclosing_class": "Worker",
+    }
+    u2 = {
+        "file": str(f),
+        "start": 6,
+        "end": 8,
+        "name": "task_b",
+        "kind": "function",
+        "enclosing_class": "Worker",
+    }
+
+    patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch
+    assert "+    def _shared_task_a_task_b(this, amount: int) -> int:" in patch
+    assert "+        return this._shared_task_a_task_b(amount)" in patch
+
+
+def test_batch_83_method_without_positional_params_falls_back_to_module(tmp_path: Path) -> None:
+    """Verifies that methods without positional receiver parameters fall back defensively to module binding."""
+    f = tmp_path / "no_receiver.py"
+    code = (
+        "class Utility:\n"
+        "    def no_rec_a():\n"
+        "        base = 10\n"
+        "        return base + 1\n"
+        "\n"
+        "    def no_rec_b():\n"
+        "        base = 10\n"
+        "        return base + 1\n"
+    )
+    f.write_text(code, encoding="utf-8")
+
+    u1 = {
+        "file": str(f),
+        "start": 2,
+        "end": 4,
+        "name": "no_rec_a",
+        "kind": "function",
+        "enclosing_class": "Utility",
+    }
+    u2 = {
+        "file": str(f),
+        "start": 6,
+        "end": 8,
+        "name": "no_rec_b",
+        "kind": "function",
+        "enclosing_class": "Utility",
+    }
+
+    patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch
+    assert "+def _shared_no_rec_a_no_rec_b(" in patch
+    assert "+        return _shared_no_rec_a_no_rec_b()" in patch
+
+
+def test_batch_83_generator_subunit_terminal_return_syntax() -> None:
+    """Verifies that _build_unit_delegation_call generates valid Python syntax 'return (yield from ...)' for generator subunits."""
+    from pydoppelgangerhunt.fixer.patch import _build_unit_delegation_call  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def gen(items):\n"
+        "    for item in items:\n"
+        "        yield item\n"
+        "    return 42\n"
+    )
+    lines = code.splitlines(keepends=True)
+    target_unit = {"kind": "block", "start": 2, "end": 4}
+    scope = {
+        "inputs": ["items"],
+        "outputs": [],
+        "param_details": [{"name": "items"}],
+        "has_yield": True,
+    }
+
+    call_code = _build_unit_delegation_call(
+        target_unit,
+        code,
+        lines,
+        effective_binding="module",
+        helper_name="_shared_gen",
+        inputs=["items"],
+        outputs=[],
+        scope=scope,
+    )
+
+    assert "return (yield from _shared_gen(items))" in call_code
+    parsed = ast.parse(f"def wrapper():\n    {call_code}\n")
+    assert isinstance(parsed, ast.Module)
+
+
+def test_batch_83_classmethod_receiver_ordering_cls_before_self() -> None:
+    """Verifies that _format_helper_parameters sorts 'cls' before 'self' when primary_receiver is 'cls'."""
+    from pydoppelgangerhunt.fixer.synthesis import _format_helper_parameters  # pylint: disable=import-outside-toplevel
+
+    inputs = ["self", "cls", "data"]
+    meta = {
+        "self": {"type": "Any", "kind": "pos"},
+        "cls": {"type": "Any", "kind": "pos"},
+        "data": {"type": "dict", "kind": "pos"},
+    }
+
+    params_cls = _format_helper_parameters(
+        inputs,
+        meta,
+        meta,
+        effective_binding="method",
+        is_static_clone=False,
+        is_class_receiver=True,
+        type_merge_strategy="union",
+        receiver_param="cls",
+    )
+    assert params_cls == ["cls", "self: Any", "data: dict"]
+
+    params_self = _format_helper_parameters(
+        inputs,
+        meta,
+        meta,
+        effective_binding="method",
+        is_static_clone=False,
+        is_class_receiver=False,
+        type_merge_strategy="union",
+        receiver_param="self",
+    )
+    assert params_self == ["self", "cls: Any", "data: dict"]
+
+
+def test_batch_83_comprehension_in_method_argument_annotation(tmp_path: Path) -> None:
+    """Verifies that comprehensions embedded inside method argument annotations record enclosing_class correctly."""
+    from pydoppelgangerhunt.parser import harvest_file_units  # pylint: disable=import-outside-toplevel
+
+    f = tmp_path / "handler.py"
+    code = (
+        "class Handler:\n"
+        "    def process(\n"
+        "        self,\n"
+        "        flags: list = [x for x in (1, 2)],\n"
+        "        *, \n"
+        "        options: dict = {k: v for k, v in [('a', 1)]}\n"
+        "    ) -> None:\n"
+        "        pass\n"
+    )
+    f.write_text(code, encoding="utf-8")
+
+    units = harvest_file_units(str(f), repo_root=str(tmp_path), min_lines=1, min_tokens=1, comprehensions=True)
+    comp_units = [u for u in units if u.get("kind") == "comprehension"]
+    assert len(comp_units) == 2
+    for comp in comp_units:
+        assert comp.get("enclosing_class") == "Handler"

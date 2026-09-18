@@ -664,6 +664,18 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
         for kw_default in fn.args.kw_defaults:
             if kw_default is not None:
                 self.visit(kw_default)
+        all_args = (
+            list(getattr(fn.args, "posonlyargs", []))
+            + list(fn.args.args)
+            + list(fn.args.kwonlyargs)
+        )
+        if fn.args.vararg is not None:
+            all_args.append(fn.args.vararg)
+        if fn.args.kwarg is not None:
+            all_args.append(fn.args.kwarg)
+        for arg in all_args:
+            if arg.annotation is not None:
+                self.visit(arg.annotation)
         if fn.returns is not None:
             self.visit(fn.returns)
         for tp in getattr(fn, "type_params", ()):

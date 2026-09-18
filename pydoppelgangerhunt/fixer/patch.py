@@ -371,16 +371,19 @@ def _build_unit_delegation_call(
         t_fn = None
     t_kind = _get_enclosing_receiver_kind(t_fn) if t_fn else "none"
 
+    rec_param = t_fn.get("receiver_param") if t_fn else None
+    rec_name = rec_param or ("cls" if t_kind == "class" else "self")
+
     if effective_binding == "method":
         if t_kind == "static":
             unit_call_prefix = "__class__."
             unit_receiver_omit: Optional[str] = None
         elif t_kind == "class":
-            unit_call_prefix = "cls."
-            unit_receiver_omit = "cls"
+            unit_call_prefix = f"{rec_name}."
+            unit_receiver_omit = rec_name
         else:
-            unit_call_prefix = "self."
-            unit_receiver_omit = "self"
+            unit_call_prefix = f"{rec_name}."
+            unit_receiver_omit = rec_name
     else:
         unit_call_prefix = ""
         unit_receiver_omit = (
@@ -432,8 +435,9 @@ def _build_unit_delegation_call(
 
     is_sync_gen = bool(scope.get("has_yield"))
     if _has_unconditional_terminal_return(target_unit, orig_lines):
-        prefix = "yield from " if is_sync_gen else await_prefix
-        return f"{indent}return {prefix}{call_expr}\n"
+        if is_sync_gen:
+            return f"{indent}return (yield from {call_expr})\n"
+        return f"{indent}return {await_prefix}{call_expr}\n"
 
     if effective_outputs:
         assign_target = ", ".join(effective_outputs) if len(effective_outputs) >= 2 else effective_outputs[0]
@@ -731,6 +735,8 @@ def generate_refactoring_patch(
             and fn2
             and u1.get("kind") not in ("comprehension", "complex_expr")
             and u2.get("kind") not in ("comprehension", "complex_expr")
+            and (fn1.get("receiver_param") or fn1.get("is_static"))
+            and (fn2.get("receiver_param") or fn2.get("is_static"))
         )
         if fn1 and fn2:
             is_static = bool(fn1.get("is_static") and fn2.get("is_static"))

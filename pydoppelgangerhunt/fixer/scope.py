@@ -1053,15 +1053,18 @@ def _normalize_receiver_order(
     inputs: List[str],
     has_instance_binding: bool,
     has_class_binding: bool,
+    primary_receiver: Optional[str] = None,
 ) -> None:
     """Ensures self or cls is positioned as the primary receiver parameter in inputs."""
     if has_instance_binding and has_class_binding:
-        if "cls" in inputs:
-            inputs.remove("cls")
-            inputs.insert(0, "cls")
-        if "self" in inputs:
-            inputs.remove("self")
-            inputs.insert(0, "self")
+        first = primary_receiver or "self"
+        second = "cls" if first == "self" else "self"
+        if second in inputs:
+            inputs.remove(second)
+            inputs.insert(0, second)
+        if first in inputs:
+            inputs.remove(first)
+            inputs.insert(0, first)
     elif has_instance_binding:
         if "self" in inputs:
             inputs.remove("self")
@@ -1228,7 +1231,8 @@ def _inspect_unit_scope(
     )
     binding_kind = _determine_binding_kind(has_instance_binding, has_class_binding)
 
-    _normalize_receiver_order(inputs, has_instance_binding, has_class_binding)
+    primary_rec = "cls" if unit.get("receiver_kind") == "class" else None
+    _normalize_receiver_order(inputs, has_instance_binding, has_class_binding, primary_receiver=primary_rec)
 
     # Definite and conditional assignment analysis across candidate statements
     def_assigned, _ = _analyze_block_assignment(candidate_stmts)
@@ -1382,7 +1386,8 @@ def analyze_unit_variable_scope(
     )
     binding_kind = _determine_binding_kind(has_instance_binding, has_class_binding)
 
-    _normalize_receiver_order(inputs, has_instance_binding, has_class_binding)
+    primary_rec = "cls" if (u1.get("receiver_kind") == "class" or (u2 and u2.get("receiver_kind") == "class")) else None
+    _normalize_receiver_order(inputs, has_instance_binding, has_class_binding, primary_receiver=primary_rec)
 
     locals_ = [var for var in info1["stores"] if var not in inputs]
     return {

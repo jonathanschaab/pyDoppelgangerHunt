@@ -1331,3 +1331,27 @@ def test_toml_line_parser_escaped_quote_inline_comment(tmp_path: Path) -> None:
         data = load_toml_section(cfg, "pydoppelgangerhunt")
         assert data["pattern"] == 'hello \\" # not a comment'
         assert data["threshold"] == 0.85
+
+
+def test_load_toml_section_non_mapping_resilience(tmp_path: Path) -> None:
+    """Verifies that non-dict or malformed TOML sections do not raise TypeError and return empty dict."""
+    cfg = tmp_path / "pyproject.toml"
+    cfg.write_text(
+        '[tool]\n'
+        'pydoppelgangerhunt = 1\n',
+        encoding="utf-8",
+    )
+    assert not load_toml_section(cfg, "pydoppelgangerhunt")
+
+    cfg.write_text(
+        '[tool]\n'
+        'pydoppelgangerhunt = "scalar_value"\n',
+        encoding="utf-8",
+    )
+    assert not load_toml_section(cfg, "pydoppelgangerhunt")
+
+    cfg.write_text(
+        'tool = 42\n',
+        encoding="utf-8",
+    )
+    assert not load_toml_section(cfg, "pydoppelgangerhunt")
