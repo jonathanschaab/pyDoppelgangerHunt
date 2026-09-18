@@ -8889,3 +8889,91 @@ def test_match_refactoring_subprocess_execution(tmp_path: Path) -> None:
         check=True,
     )
     assert "ALL_EVAL_TESTS_PASSED" in proc.stdout
+
+
+def test_find_module_helper_insertion_index_with_try_except_and_conditional_imports() -> None:
+    """Verifies that _find_module_helper_insertion_index places helpers after try/except and conditional imports."""
+    from pydoppelgangerhunt.fixer import _find_module_helper_insertion_index  # pylint: disable=import-outside-toplevel
+
+    lines = [
+        '"""Module docstring."""\n',
+        "import os\n",
+        "try:\n",
+        "    import tomllib\n",
+        "except ImportError:\n",
+        "    import tomli as tomllib\n",
+        "import sys\n",
+        "\n",
+        "def existing_fn():\n",
+        "    pass\n",
+    ]
+    idx = _find_module_helper_insertion_index(lines)
+    # The last import is 'import sys' at line 7 (1-indexed). The helper should be inserted at index 7 (line 7), before line 9.
+    assert idx == 7
+
+
+def test_infer_helper_return_type_generator_literal_and_explicit_types() -> None:
+    """Verifies that _infer_helper_return_type infers literal yield types and preserves explicit annotations."""
+    from pydoppelgangerhunt.fixer import _infer_helper_return_type  # pylint: disable=import-outside-toplevel
+
+    # 1. Sync generator with literal integer yield
+    scope_int = {"has_yield": True, "yield_expr_names": [("yield", ":literal:int")]}
+    res_int = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope=scope_int,
+        meta1={},
+        meta2={},
+        is_async=False,
+    )
+    assert res_int == "Iterator[int]"
+
+    # 2. Async generator with literal string yield
+    scope_str = {"has_yield": True, "yield_expr_names": [("yield", ":literal:str")]}
+    res_str = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope=scope_str,
+        meta1={},
+        meta2={},
+        is_async=True,
+    )
+    assert res_str == "AsyncIterator[str]"
+
+    # 3. Explicit return type preserved for async generator
+    res_explicit = _infer_helper_return_type(
+        resolved_ret="AsyncIterator[float]",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={"has_yield": True, "yield_expr_names": []},
+        meta1={},
+        meta2={},
+        is_async=True,
+    )
+    assert res_explicit == "AsyncIterator[float]"
+
+
+def test_generator_helper_synthesis_literal_yields(tmp_path: Path) -> None:
+    """Verifies that synthesizing helpers from generator units infers Iterator types and executes cleanly."""
+    code1 = (
+        "def num_gen1(limit: int):\n"
+        "    for i in range(limit):\n"
+        "        yield 42\n"
+    )
+    code2 = (
+        "def num_gen2(limit: int):\n"
+        "    for i in range(limit):\n"
+        "        yield 42\n"
+    )
+    f1 = tmp_path / "g1.py"
+    f2 = tmp_path / "g2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+
+    u1 = {"file": "g1.py", "start": 1, "end": 3, "name": "num_gen1", "kind": "function"}
+    u2 = {"file": "g2.py", "start": 1, "end": 3, "name": "num_gen2", "kind": "function"}
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "-> Iterator[int]:" in helper

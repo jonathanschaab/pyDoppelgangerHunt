@@ -482,8 +482,11 @@ class _ScopeVisitor(ast.NodeVisitor):
     def _record_yield_expr(self, kind: str, node: Union[ast.Yield, ast.YieldFrom]) -> None:
         if len(self._scope_stack) <= 1:
             self.has_yield = True
-            if node.value is not None and isinstance(node.value, ast.Name):
-                self.yield_expr_names.append((kind, node.value.id))
+            if node.value is not None:
+                if isinstance(node.value, ast.Name):
+                    self.yield_expr_names.append((kind, node.value.id))
+                elif isinstance(node.value, ast.Constant) and node.value.value is not None:
+                    self.yield_expr_names.append((kind, f":literal:{type(node.value.value).__name__}"))
 
     def visit_Yield(self, node: ast.Yield) -> None:
         self._record_yield_expr("yield", node)
@@ -1181,6 +1184,19 @@ def _find_header_cookie_boundary(lines: List[str]) -> int:
     return boundary
 
 
+def _extract_module_docstring_end_line(tree: ast.AST) -> int:
+    """Extracts the end line number of a module-level docstring if present."""
+    body = getattr(tree, "body", [])
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        return int(getattr(body[0], "end_lineno", getattr(body[0], "lineno", 0)))
+    return 0
+
+
 def _find_module_helper_insertion_index(lines: List[str]) -> int:
     """Finds the line index after module docstring, future imports, and all module imports."""
     min_insert_idx = _find_header_cookie_boundary(lines)
@@ -1191,24 +1207,31 @@ def _find_module_helper_insertion_index(lines: List[str]) -> int:
         return min_insert_idx
 
     last_import_line = 0
-    docstring_line = 0
+    docstring_line = _extract_module_docstring_end_line(tree)
 
-    for idx, node in enumerate(tree.body):
-        if (
-            idx == 0
-            and isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, str)
-        ):
-            docstring_line = getattr(node, "end_lineno", node.lineno)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            end_l = getattr(node, "end_lineno", node.lineno)
-            last_import_line = max(last_import_line, end_l)
-        else:
+    first_def_line: Optional[int] = None
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            first_def_line = getattr(node, "lineno", None)
             break
 
+    for node in tree.body:
+        if first_def_line is not None and getattr(node, "lineno", 0) >= first_def_line:
+            break
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            end_l = getattr(node, "end_lineno", node.lineno)
+            last_import_line = max(last_import_line, end_l)
+        elif isinstance(node, (ast.Try, getattr(ast, "TryStar", ast.Try), ast.If)):
+            for sub in ast.walk(node):
+                if isinstance(sub, (ast.Import, ast.ImportFrom)):
+                    end_l = getattr(node, "end_lineno", node.lineno)
+                    last_import_line = max(last_import_line, end_l)
+                    break
+
     target_line = max(last_import_line, docstring_line, min_insert_idx)
-    return min(target_line, len(lines))
+    if first_def_line is not None:
+        target_line = min(target_line, first_def_line - 1)
+    return min(max(target_line, min_insert_idx), len(lines))
 
 
 def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]:
@@ -1677,14 +1700,7 @@ def _insert_imports_into_module(
     parsed_with_ast = False
     try:
         tree = ast.parse("".join(orig_lines))
-        doc_end = 0
-        if (
-            tree.body
-            and isinstance(tree.body[0], ast.Expr)
-            and isinstance(tree.body[0].value, ast.Constant)
-            and isinstance(tree.body[0].value.value, str)
-        ):
-            doc_end = getattr(tree.body[0], "end_lineno", tree.body[0].lineno)
+        doc_end = _extract_module_docstring_end_line(tree)
         future_end = max(
             (
                 getattr(node, "end_lineno", node.lineno)
@@ -2330,10 +2346,13 @@ def _infer_helper_return_type(
 ) -> str:
     """Infers the return type annotation for a synthesized shared helper function."""
     if scope.get("has_yield"):
-        if is_async:
-            return "AsyncIterator[Any]"
+        if resolved_ret != "Any":
+            return resolved_ret
         inferred_yield_type = None
         for kind, name in scope.get("yield_expr_names", []):
+            if name.startswith(":literal:"):
+                inferred_yield_type = name[len(":literal:") :]
+                break
             m_t = meta1.get(name, {}).get("type") or meta2.get(name, {}).get("type")
             if not m_t:
                 continue
@@ -2347,11 +2366,10 @@ def _infer_helper_return_type(
                         break
                 if inferred_yield_type:
                     break
-        if resolved_ret != "Any":
-            return resolved_ret
+        iter_name = "AsyncIterator" if is_async else "Iterator"
         if inferred_yield_type:
-            return f"Iterator[{inferred_yield_type}]"
-        return "Iterator[Any]"
+            return f"{iter_name}[{inferred_yield_type}]"
+        return f"{iter_name}[Any]"
 
     if len(helper_outputs) >= 2:
         out_types: List[str] = []
