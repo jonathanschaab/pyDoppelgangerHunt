@@ -2614,16 +2614,16 @@ def test_shared_module_translates_local_relative_imports(tmp_path: Path) -> None
     (sub1 / "__init__.py").write_text("", encoding="utf-8")
     (sub2 / "__init__.py").write_text("", encoding="utf-8")
 
-    (sub1 / "helpers.py").write_text("def transform(x: int) -> int:\n    return x + 42\n", encoding="utf-8")
+    (pkg / "helpers.py").write_text("def transform(x: int) -> int:\n    return x + 42\n", encoding="utf-8")
 
     src_1 = (
         "def compute_1(x: int) -> int:\n"
-        "    from .helpers import transform\n"
+        "    from ..helpers import transform\n"
         "    return transform(x)\n"
     )
     src_2 = (
         "def compute_2(x: int) -> int:\n"
-        "    from .helpers import transform\n"
+        "    from ..helpers import transform\n"
         "    return transform(x)\n"
     )
     (sub1 / "mod1.py").write_text(src_1, encoding="utf-8")
@@ -2639,11 +2639,11 @@ def test_shared_module_translates_local_relative_imports(tmp_path: Path) -> None
         cross_file_strategy="shared_module",
     )
 
-    # In local_rel_pkg/_common.py, the import should be canonicalized to from local_rel_pkg.sub1.helpers import transform
-    assert "from local_rel_pkg.sub1.helpers import transform" in patch
-    # Should NOT have verbatim 'from .helpers import transform' added in the shared module
-    assert "+from .helpers import transform" not in patch
-    assert "+    from .helpers import transform" not in patch
+    # In local_rel_pkg/_common.py, the import should be canonicalized to from local_rel_pkg.helpers import transform
+    assert "from local_rel_pkg.helpers import transform" in patch
+    # Should NOT have verbatim 'from ..helpers import transform' added in the shared module
+    assert "+from ..helpers import transform" not in patch
+    assert "+    from ..helpers import transform" not in patch
 
 
 def test_register_plan_dependencies_init_package_context(tmp_path: Path) -> None:
@@ -2712,20 +2712,22 @@ def test_existing_shared_module_gains_future_annotations_from_source(tmp_path: P
     (pkg / "_common.py").write_text("def existing_helper() -> None:\n    pass\n", encoding="utf-8")
 
     src1 = (
-        "from __future__ import annotations\n\n"
+        "from __future__ import annotations\n"
+        "from dep_pkg import Later\n\n"
         "def run_calc(x: Later) -> Later:\n"
         "    return x\n"
     )
     src2 = (
-        "from __future__ import annotations\n\n"
+        "from __future__ import annotations\n"
+        "from dep_pkg import Later\n\n"
         "def run_calc2(x: Later) -> Later:\n"
         "    return x\n"
     )
     (pkg / "mod1.py").write_text(src1, encoding="utf-8")
     (pkg / "mod2.py").write_text(src2, encoding="utf-8")
 
-    u1 = {"name": "run_calc", "file": "future_pkg/mod1.py", "start": 3, "end": 4, "kind": "function"}
-    u2 = {"name": "run_calc2", "file": "future_pkg/mod2.py", "start": 3, "end": 4, "kind": "function"}
+    u1 = {"name": "run_calc", "file": "future_pkg/mod1.py", "start": 4, "end": 5, "kind": "function"}
+    u2 = {"name": "run_calc2", "file": "future_pkg/mod2.py", "start": 4, "end": 5, "kind": "function"}
 
     patch = generate_refactoring_patch(
         [(1.0, u1, u2)],
@@ -2941,6 +2943,208 @@ def test_generate_patch_wildcard_import_unresolved_symbol(tmp_path: Path) -> Non
 
     assert "potentially relies on wildcard import" in patch
     assert "skipping extraction" in patch
+
+
+def test_shared_module_rejects_unresolved_nonbuiltin_dependency(tmp_path: Path) -> None:
+    """Verifies that a helper referencing an unimported module-local type rejects shared module extraction."""
+    pkg = tmp_path / "pkg_unresolved"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = (
+        "class LocalDep:\n"
+        "    pass\n\n"
+        "def compute_1(x: LocalDep) -> int:\n"
+        "    return 42\n"
+    )
+    src2 = (
+        "class LocalDep:\n"
+        "    pass\n\n"
+        "def compute_2(x: LocalDep) -> int:\n"
+        "    return 42\n"
+    )
+    f1 = pkg / "m1.py"
+    f2 = pkg / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "compute_1", "file": str(f1), "start": 4, "end": 5, "kind": "function"}
+    u2 = {"name": "compute_2", "file": str(f2), "start": 4, "end": 5, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "unresolved symbol 'LocalDep' in shared module" in patch
+    assert "skipping extraction" in patch
+
+
+def test_host_module_rejects_unresolved_nonbuiltin_dependency(tmp_path: Path) -> None:
+    """Verifies that a helper referencing a type only defined in clone 2 file rejects host module extraction."""
+    pkg = tmp_path / "pkg_host_unresolved"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = (
+        "def compute_1(x: DepOnlyInTwo) -> int:\n"
+        "    return 42\n"
+    )
+    src2 = (
+        "class DepOnlyInTwo:\n"
+        "    pass\n\n"
+        "def compute_2(x: DepOnlyInTwo) -> int:\n"
+        "    return 42\n"
+    )
+    f1 = pkg / "m1.py"
+    f2 = pkg / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "compute_1", "file": str(f1), "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "compute_2", "file": str(f2), "start": 4, "end": 5, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="host",
+    )
+
+    assert "unresolved symbol 'DepOnlyInTwo' in host module" in patch
+    assert "skipping extraction" in patch
+
+
+def test_shared_module_rejects_conflicting_local_imports(tmp_path: Path) -> None:
+    """Verifies that clones with conflicting local imports for the same symbol are rejected."""
+    pkg = tmp_path / "pkg_conflicting_locals"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = (
+        "def calc_1(x: float) -> float:\n"
+        "    from math import sin as f\n"
+        "    return f(x)\n"
+    )
+    src2 = (
+        "def calc_2(x: float) -> float:\n"
+        "    from cmath import sin as f\n"
+        "    return f(x).real\n"
+    )
+    f1 = pkg / "m1.py"
+    f2 = pkg / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "calc_1", "file": str(f1), "start": 1, "end": 3, "kind": "function"}
+    u2 = {"name": "calc_2", "file": str(f2), "start": 1, "end": 3, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "conflicting local import symbol 'f' across clone sources" in patch
+    assert "skipping extraction" in patch
+
+
+def test_host_module_detects_conflicting_imported_symbol_with_host(tmp_path: Path) -> None:
+    """Verifies that extraction is skipped if host module already imports the symbol from another package."""
+    pkg = tmp_path / "pkg_host_conflict"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = (
+        "from pkg_a import transform\n\n"
+        "def run_1(x: int) -> int:\n"
+        "    from pkg_b import transform\n"
+        "    return transform(x)\n"
+    )
+    src2 = (
+        "def run_2(x: int) -> int:\n"
+        "    from pkg_b import transform\n"
+        "    return transform(x)\n"
+    )
+    f1 = pkg / "m1.py"
+    f2 = pkg / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "run_1", "file": str(f1), "start": 3, "end": 5, "kind": "function"}
+    u2 = {"name": "run_2", "file": str(f2), "start": 1, "end": 3, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="host",
+    )
+
+    assert "conflicting imported symbol 'transform' across clone sources" in patch
+    assert "skipping extraction" in patch
+
+
+def test_canonicalize_helper_relative_imports_with_nonstandard_whitespace() -> None:
+    """Verifies that relative imports with irregular whitespace are parsed and canonicalized."""
+    from pydoppelgangerhunt.fixer.patch import _canonicalize_helper_relative_imports  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def helper(x: int) -> int:\n"
+        "    from   .helpers   import   transform\n"
+        "    return transform(x)\n"
+    )
+    res = _canonicalize_helper_relative_imports(code, [("my_pkg.mod", False)])
+    assert "from my_pkg.helpers import transform" in res
+    assert "from   ." not in res
+
+
+def test_shared_module_rejects_conflicting_local_relative_imports(tmp_path: Path) -> None:
+    """Verifies that clones in different subpackages using conflicting relative imports are rejected."""
+    pkg = tmp_path / "conflict_rel_pkg"
+    sub1 = pkg / "sub1"
+    sub2 = pkg / "sub2"
+    sub1.mkdir(parents=True)
+    sub2.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (sub1 / "__init__.py").write_text("", encoding="utf-8")
+    (sub2 / "__init__.py").write_text("", encoding="utf-8")
+
+    (sub1 / "helpers.py").write_text("def transform(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+    (sub2 / "helpers.py").write_text("def transform(x: int) -> int:\n    return x + 2\n", encoding="utf-8")
+
+    src_1 = (
+        "def compute_1(x: int) -> int:\n"
+        "    from .helpers import transform\n"
+        "    return transform(x)\n"
+    )
+    src_2 = (
+        "def compute_2(x: int) -> int:\n"
+        "    from .helpers import transform\n"
+        "    return transform(x)\n"
+    )
+    (sub1 / "mod1.py").write_text(src_1, encoding="utf-8")
+    (sub2 / "mod2.py").write_text(src_2, encoding="utf-8")
+
+    u1 = {"name": "compute_1", "file": "conflict_rel_pkg/sub1/mod1.py", "start": 1, "end": 3, "kind": "function"}
+    u2 = {"name": "compute_2", "file": "conflict_rel_pkg/sub2/mod2.py", "start": 1, "end": 3, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert (
+        "conflicting relative import in helper across clone sources" in patch
+        or "conflicting local import symbol 'transform' across clone sources" in patch
+    )
+    assert "from conflict_rel_pkg.sub1.helpers import transform" not in patch
+
 
 
 
