@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import pytest
 
 from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
@@ -393,4 +394,32 @@ def test_derive_shared_module_import_climbs_above_package(tmp_path: Path) -> Non
     # Relative file_paths in build_from_repository resolved against repo root
     g_rel = build_module_graph(root, file_paths=[Path("pkg/sub/worker.py")])
     assert "pkg.sub.worker" in g_rel.mod_to_file
+
+
+def test_resolve_shared_module_file_unsafe_fallback_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that if fallback _common.py resolves outside common_dir, ValueError is raised."""
+    root = tmp_path / "app"
+    root.mkdir()
+    f1 = root / "services" / "srv1.py"
+    f2 = root / "services" / "srv2.py"
+    f1.parent.mkdir(parents=True)
+
+    outside = tmp_path / "outside.py"
+    outside.write_text("", encoding="utf-8")
+
+    orig_resolve = Path.resolve
+
+    def mock_resolve(self: Path, strict: bool = False) -> Path:
+        if self.name == "_common.py":
+            return outside
+        return orig_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", mock_resolve)
+    with pytest.raises(
+        ValueError, match="Shared module path resolves outside common package directory"
+    ):
+        resolve_shared_module_file(f1, f2, root, shared_module_name="_common.py")
+
 

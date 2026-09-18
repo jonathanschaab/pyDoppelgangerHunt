@@ -1005,6 +1005,8 @@ def _collect_host_missing_imports(
     helper_code: str,
     scope: Dict[str, Any],
     source_texts: Sequence[Union[str, Tuple[Any, ...]]] = (),
+    host_mod: Optional[str] = None,
+    is_host_pkg: bool = False,
 ) -> List[str]:
     """Computes all required imports for a host plan receiving extracted helper_code.
 
@@ -1166,6 +1168,7 @@ def _collect_host_missing_imports(
 
         ignored_names = _BUILTIN_NAMES | defined_in_helper | set(needed_typing)
         symbol_to_stmt: Dict[str, str] = dict(local_import_stmts)
+        source_hoisted_symbols: Set[str] = set()
         host_defs: Optional[Set[str]] = None
         for loaded_name in sorted(loaded_in_helper):
             if loaded_name in ignored_names:
@@ -1181,6 +1184,8 @@ def _collect_host_missing_imports(
                             f"conflicting imported symbol '{loaded_name}' across clone sources"
                         )
                     symbol_to_stmt[loaded_name] = stmt
+                    if loaded_name not in local_import_stmts:
+                        source_hoisted_symbols.add(loaded_name)
 
             if not is_same_file_host:
                 if not found_in_any:
@@ -1200,8 +1205,12 @@ def _collect_host_missing_imports(
                         )
 
         # Cross-check symbol_to_stmt against host module's existing and queued imports
-        host_existing_stmts, _ = _extract_module_import_statements(host_plan.orig_text or "")
-        host_queued_stmts, _ = _extract_module_import_statements("\n".join(host_plan.missing_imports))
+        host_existing_stmts, _ = _extract_module_import_statements(
+            host_plan.orig_text or "", source_mod=host_mod, is_package=is_host_pkg
+        )
+        host_queued_stmts, _ = _extract_module_import_statements(
+            "\n".join(host_plan.missing_imports), source_mod=host_mod, is_package=is_host_pkg
+        )
         all_host_stmts: Dict[str, str] = {**host_existing_stmts, **host_queued_stmts}
 
         for hname, hstmt in all_host_stmts.items():
@@ -1218,21 +1227,14 @@ def _collect_host_missing_imports(
                     f"conflicting imported symbol '{sname}' with host module"
                 )
 
-        for stmt in symbol_to_stmt.values():
-            if (
-                stmt not in missing
-                and stmt not in host_content
-                and stmt not in host_plan.missing_imports
-            ):
-                missing.append(stmt)
-    else:
-        for stmt in local_import_stmts.values():
-            if (
-                stmt not in missing
-                and stmt not in host_content
-                and stmt not in host_plan.missing_imports
-            ):
-                missing.append(stmt)
+        for sname, stmt in symbol_to_stmt.items():
+            if sname in source_hoisted_symbols:
+                if (
+                    stmt not in missing
+                    and stmt not in host_content
+                    and stmt not in host_plan.missing_imports
+                ):
+                    missing.append(stmt)
 
     return missing
 
@@ -1244,6 +1246,8 @@ def _safely_prepare_helper_and_imports(
     source_texts: Sequence[Union[str, Tuple[Any, ...]]],
     f1_plan: _FilePatchPlan,
     f2_plan: Optional[_FilePatchPlan],
+    host_mod: Optional[str] = None,
+    is_host_pkg: bool = False,
 ) -> Tuple[str, Optional[List[str]]]:
     """Canonicalizes helper relative imports and collects host imports, handling conflicts."""
     try:
@@ -1257,11 +1261,14 @@ def _safely_prepare_helper_and_imports(
             helper_code=canon_code,
             scope=scope,
             source_texts=source_texts,
+            host_mod=host_mod,
+            is_host_pkg=is_host_pkg,
         )
         return canon_code, imports
     except ValueError as err:
+        prefix = "Cross-module clone pair" if f2_plan is not None else "Clone pair"
         conflict_msg = (
-            f"# Note: Cross-module clone pair; {err}; skipping extraction.\n"
+            f"# Note: {prefix}; {err}; skipping extraction.\n"
         )
         f1_plan.comments.append(conflict_msg)
         if f2_plan is not None:
@@ -1276,6 +1283,8 @@ def _safely_collect_host_missing_imports(
     source_texts: Sequence[Union[str, Tuple[Any, ...]]],
     f1_plan: _FilePatchPlan,
     f2_plan: Optional[_FilePatchPlan],
+    host_mod: Optional[str] = None,
+    is_host_pkg: bool = False,
 ) -> Optional[List[str]]:
     """Legacy helper: collects host imports or records skip comments on plans if a conflict is detected."""
     _, maybe_imports = _safely_prepare_helper_and_imports(
@@ -1285,8 +1294,31 @@ def _safely_collect_host_missing_imports(
         source_texts=source_texts,
         f1_plan=f1_plan,
         f2_plan=f2_plan,
+        host_mod=host_mod,
+        is_host_pkg=is_host_pkg,
     )
     return maybe_imports
+
+
+def _safely_resolve_shared_module_file(
+    f1_path: Path,
+    f2_path: Path,
+    root: Path,
+    shared_module_name: str,
+    f1_plan: _FilePatchPlan,
+    f2_plan: Optional[_FilePatchPlan] = None,
+) -> Optional[Path]:
+    """Resolves the shared module file path, appending skip advisory comments on containment error."""
+    try:
+        return resolve_shared_module_file(
+            f1_path, f2_path, root, shared_module_name=shared_module_name
+        )
+    except ValueError as exc:
+        err_msg = f"# Note: Cross-module clone pair; {exc}; skipping extraction.\n"
+        f1_plan.comments.append(err_msg)
+        if f2_plan is not None:
+            f2_plan.comments.append(err_msg)
+        return None
 
 
 def _register_plan_dependencies_in_graph(
@@ -1598,9 +1630,13 @@ def generate_refactoring_patch(
             and f2_plan is not None
             and cross_file_action in ("shared_module", "shared")
         ):
-            shared_p = resolve_shared_module_file(
-                f1_path, f2_plan.path, root, shared_module_name=shared_module_name
+            maybe_shared_p = _safely_resolve_shared_module_file(
+                f1_path, f2_plan.path, root, shared_module_name, f1_plan, f2_plan
             )
+            if maybe_shared_p is None:
+                continue
+            shared_p = maybe_shared_p
+
             if shared_p.resolve() == f1_path.resolve():
                 target_host_plan = f1_plan
             elif shared_p.resolve() == f2_plan.path.resolve():
@@ -1609,8 +1645,9 @@ def generate_refactoring_patch(
                 target_host_plan = file_plans.get(shared_p)
                 if target_host_plan is None and shared_p.is_file():
                     try:
+                        shared_p.resolve().relative_to(root.resolve())
                         target_host_text = shared_p.read_text(encoding="utf-8")
-                    except (OSError, UnicodeDecodeError):
+                    except (OSError, UnicodeDecodeError, ValueError):
                         pass
 
         helper_name = base_helper
@@ -1682,6 +1719,22 @@ def generate_refactoring_patch(
         )
 
         if is_same_file:
+            mod1 = _derive_module_import_path(f1_path, root)
+            is_pkg1 = f1_path.name == "__init__.py"
+            helper_code, maybe_imports = _safely_prepare_helper_and_imports(
+                host_plan=f1_plan,
+                helper_code=helper_code,
+                scope=scope,
+                source_texts=[(orig_text, mod1, is_pkg1)],
+                f1_plan=f1_plan,
+                f2_plan=f2_plan,
+                host_mod=mod1,
+                is_host_pkg=is_pkg1,
+            )
+            if maybe_imports is None:
+                continue
+            host_imports = maybe_imports
+
             if replace_clones:
                 _delegate_unit_in_plan(
                     u1,
@@ -1710,13 +1763,6 @@ def generate_refactoring_patch(
                         binding=effective_binding,
                         step=step,
                     )
-            mod1 = _derive_module_import_path(f1_path, root)
-            host_imports = _collect_host_missing_imports(
-                host_plan=f1_plan,
-                helper_code=helper_code,
-                scope=scope,
-                source_texts=[(orig_text, mod1, f1_path.name == "__init__.py")],
-            )
             _attach_helper_to_plan(
                 f1_plan,
                 binding=effective_binding,
@@ -1726,9 +1772,13 @@ def generate_refactoring_patch(
             )
         elif f2_plan is not None:
             if cross_file_action in ("shared_module", "shared"):
-                shared_p = resolve_shared_module_file(
-                    f1_path, f2_plan.path, root, shared_module_name=shared_module_name
+                maybe_shared_p = _safely_resolve_shared_module_file(
+                    f1_path, f2_plan.path, root, shared_module_name, f1_plan, f2_plan
                 )
+                if maybe_shared_p is None:
+                    continue
+                shared_p = maybe_shared_p
+
                 try:
                     rel_shared = str(
                         shared_p.resolve().relative_to(root.resolve())
@@ -1755,11 +1805,12 @@ def generate_refactoring_patch(
                             continue
                         if shared_p.is_file():
                             try:
+                                shared_p.resolve().relative_to(root.resolve())
                                 shared_text = shared_p.read_text(encoding="utf-8")
                                 shared_plan = _get_plan(
                                     shared_p, rel_shared, shared_text, is_new_file=False
                                 )
-                            except (OSError, UnicodeDecodeError):
+                            except (OSError, UnicodeDecodeError, ValueError):
                                 read_err_msg = (
                                     f"# Note: Cross-module clone pair; shared module file {rel_shared} "
                                     f"exists but could not be read; skipping extraction.\n"
@@ -1781,6 +1832,8 @@ def generate_refactoring_patch(
                 mod2 = _derive_module_import_path(f2_plan.path, root)
                 is_pkg1 = f1_path.name == "__init__.py"
                 is_pkg2 = f2_plan.path.name == "__init__.py"
+                mod_host = _derive_module_import_path(host_plan.path, root)
+                is_host_pkg = host_plan.path.name == "__init__.py"
                 helper_code, maybe_imports = _safely_prepare_helper_and_imports(
                     host_plan=host_plan,
                     helper_code=helper_code,
@@ -1788,6 +1841,8 @@ def generate_refactoring_patch(
                     source_texts=[(orig_text, mod1, is_pkg1), (f2_plan.orig_text, mod2, is_pkg2)],
                     f1_plan=f1_plan,
                     f2_plan=f2_plan,
+                    host_mod=mod_host,
+                    is_host_pkg=is_host_pkg,
                 )
                 if maybe_imports is None:
                     continue
@@ -1798,7 +1853,6 @@ def generate_refactoring_patch(
                 host_plan.used_helper_names.add(helper_name)
                 host_plan.comments.append(pair_comment)
 
-                mod_host = _derive_module_import_path(host_plan.path, root)
                 host_disp = normalize_path_string(str(host_plan.rel_path), strip_anchor=False)
 
                 dg = _get_depgraph()
@@ -1893,6 +1947,8 @@ def generate_refactoring_patch(
                     source_texts=[(orig_text, mod1, is_pkg1), (f2_plan.orig_text, mod2, is_pkg2)],
                     f1_plan=f1_plan,
                     f2_plan=f2_plan,
+                    host_mod=mod1,
+                    is_host_pkg=is_pkg1,
                 )
                 if maybe_imports is None:
                     continue
@@ -1960,13 +2016,16 @@ def generate_refactoring_patch(
                 )
         else:
             mod1 = _derive_module_import_path(f1_path, root)
+            is_pkg1 = f1_path.name == "__init__.py"
             helper_code, maybe_imports = _safely_prepare_helper_and_imports(
                 host_plan=f1_plan,
                 helper_code=helper_code,
                 scope=scope,
-                source_texts=[(orig_text, mod1, f1_path.name == "__init__.py")],
+                source_texts=[(orig_text, mod1, is_pkg1)],
                 f1_plan=f1_plan,
                 f2_plan=f2_plan,
+                host_mod=mod1,
+                is_host_pkg=is_pkg1,
             )
             if maybe_imports is None:
                 continue

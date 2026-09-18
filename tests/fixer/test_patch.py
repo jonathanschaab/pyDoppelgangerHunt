@@ -2266,10 +2266,11 @@ def test_shared_module_computes_required_imports_for_host(tmp_path: Path) -> Non
         cross_file_strategy="shared_module",
     )
 
-    # Verify that the synthesized _common.py patch contains both typing and math imports
+    # Verify that the synthesized _common.py patch contains typing imports and preserves local math import
     assert "diff --git a/imports_pkg/_common.py b/imports_pkg/_common.py" in patch
     assert "+from typing import List" in patch
-    assert "+import math" in patch
+    assert "+    import math" in patch
+    assert "\n+import math\n" not in patch
 
 
 def test_unreadable_existing_shared_module_skips_gracefully(
@@ -3144,6 +3145,144 @@ def test_shared_module_rejects_conflicting_local_relative_imports(tmp_path: Path
         or "conflicting local import symbol 'transform' across clone sources" in patch
     )
     assert "from conflict_rel_pkg.sub1.helpers import transform" not in patch
+
+
+def test_same_file_conflicting_local_imports_skips_without_corrupting_plan(tmp_path: Path) -> None:
+    """Verifies same-file clones with conflicting local imports skip extraction cleanly without dirtying plan."""
+    f = tmp_path / "same_file_mod.py"
+    f.write_text(
+        "def foo(x: int) -> int:\n"
+        "    from math import sqrt as f\n"
+        "    return f(x)\n\n"
+        "def bar(x: int) -> int:\n"
+        "    from cmath import sqrt as f\n"
+        "    return f(x).real\n",
+        encoding="utf-8",
+    )
+    u1 = {"name": "foo", "file": str(f), "start": 1, "end": 3, "kind": "function"}
+    u2 = {"name": "bar", "file": str(f), "start": 5, "end": 7, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+
+    assert "conflicting local import symbol 'f' across clone sources" in patch
+    assert "skipping extraction" in patch
+    assert "_shared_foo_bar" not in patch
+
+
+def test_local_imports_not_hoisted_to_module_scope(tmp_path: Path) -> None:
+    """Verifies that lazy/guarded local imports stay inside the helper body and are not hoisted to module scope."""
+    pkg = tmp_path / "lazy_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = (
+        "def do_calc1(x: int) -> int:\n"
+        "    import math\n"
+        "    return math.isqrt(x)\n"
+    )
+    src2 = (
+        "def do_calc2(x: int) -> int:\n"
+        "    import math\n"
+        "    return math.isqrt(x)\n"
+    )
+    f1 = pkg / "m1.py"
+    f2 = pkg / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "do_calc1", "file": str(f1), "start": 1, "end": 3, "kind": "function"}
+    u2 = {"name": "do_calc2", "file": str(f2), "start": 1, "end": 3, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "diff --git a/lazy_pkg/_common.py b/lazy_pkg/_common.py" in patch
+    assert "+    import math" in patch
+    assert "\n+import math\n" not in patch
+
+
+def test_host_existing_relative_imports_canonicalized_without_false_conflict(tmp_path: Path) -> None:
+    """Verifies that existing relative imports in host module match canonicalized clone imports without conflict."""
+    pkg = tmp_path / "rel_host_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "helpers.py").write_text("class CustomType:\n    pass\n", encoding="utf-8")
+
+    host_src = (
+        "from .helpers import CustomType\n\n"
+        "def run_host(val: CustomType) -> CustomType:\n"
+        "    return val\n"
+    )
+    caller_src = (
+        "from rel_host_pkg.helpers import CustomType\n\n"
+        "def run_caller(val: CustomType) -> CustomType:\n"
+        "    return val\n"
+    )
+
+    f_host = pkg / "host_mod.py"
+    f_caller = pkg / "caller_mod.py"
+    f_host.write_text(host_src, encoding="utf-8")
+    f_caller.write_text(caller_src, encoding="utf-8")
+
+    u1 = {"name": "run_host", "file": str(f_host), "start": 3, "end": 4, "kind": "function"}
+    u2 = {"name": "run_caller", "file": str(f_caller), "start": 3, "end": 4, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="host",
+    )
+
+    assert "conflicting imported symbol" not in patch
+    assert "skipping extraction" not in patch
+    assert "from rel_host_pkg.host_mod import _shared_run_host_run_caller" in patch
+
+
+def test_shared_module_resolution_failure_adds_advisory_comment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that if resolve_shared_module_file raises ValueError, patch adds skip advisory comment."""
+    pkg = tmp_path / "unsafe_shared_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = "def fn1(x: int) -> int:\n    return x + 1\n"
+    src2 = "def fn2(x: int) -> int:\n    return x + 1\n"
+    f1 = pkg / "m1.py"
+    f2 = pkg / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "fn1", "file": str(f1), "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "fn2", "file": str(f2), "start": 1, "end": 2, "kind": "function"}
+
+    from pydoppelgangerhunt.fixer import patch as patch_mod  # pylint: disable=import-outside-toplevel
+
+    def mock_resolve_shared(*args: Any, **kwargs: Any) -> Path:
+        raise ValueError("Shared module path resolves outside common package directory")
+
+    monkeypatch.setattr(patch_mod, "resolve_shared_module_file", mock_resolve_shared)
+
+    patch = patch_mod.generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "Shared module path resolves outside common package directory" in patch
+    assert "skipping extraction" in patch
+    assert "_common.py" not in patch
+
 
 
 

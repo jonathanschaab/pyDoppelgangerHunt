@@ -145,12 +145,22 @@ def resolve_shared_module_file(
         clean_name = "_common.py"
     else:
         clean_name = f"{stem}.py"
+    resolved_common = common_dir.resolve()
     target = common_dir / clean_name
     try:
-        target.resolve().relative_to(common_dir.resolve())
+        target.resolve().relative_to(resolved_common)
+        return target
     except ValueError:
-        return common_dir / "_common.py"
-    return target
+        pass
+
+    fallback = common_dir / "_common.py"
+    try:
+        fallback.resolve().relative_to(resolved_common)
+        return fallback
+    except ValueError as exc:
+        raise ValueError(
+            f"Shared module path resolves outside common package directory {common_dir}"
+        ) from exc
 
 
 def derive_shared_module_import(
