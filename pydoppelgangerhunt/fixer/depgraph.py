@@ -147,6 +147,10 @@ def resolve_shared_module_file(
         clean_name = f"{stem}.py"
     resolved_common = common_dir.resolve()
     target = common_dir / clean_name
+    if target.is_symlink():
+        raise ValueError(
+            f"Shared module target path is an existing symlink: {target}"
+        )
     try:
         target.resolve().relative_to(resolved_common)
         return target
@@ -154,6 +158,10 @@ def resolve_shared_module_file(
         pass
 
     fallback = common_dir / "_common.py"
+    if fallback.is_symlink():
+        raise ValueError(
+            f"Shared module fallback path is an existing symlink: {fallback}"
+        )
     try:
         fallback.resolve().relative_to(resolved_common)
         return fallback
@@ -301,6 +309,7 @@ class ModuleDependencyGraph:
         self.adjacency: Dict[str, Set[str]] = {}
         self.mod_to_file: Dict[str, Path] = {}
         self.file_to_mod: Dict[str, str] = {}
+        self._sorted_adjacency: Dict[str, List[str]] = {}
 
     def add_module(self, mod_name: str, file_path: Path) -> None:
         """Registers a module and its backing file path in the graph."""
@@ -312,13 +321,35 @@ class ModuleDependencyGraph:
         self.mod_to_file[mod_name] = resolved
         self.file_to_mod[str(resolved).replace("\\", "/").lower()] = mod_name
 
+        # In Python, importing a submodule first executes its ancestor package initializers
+        parts = mod_name.split(".")
+        for i in range(1, len(parts)):
+            parent_pkg = ".".join(parts[:i])
+            if parent_pkg in self.mod_to_file:
+                self.add_dependency(mod_name, parent_pkg)
+
+        for existing_mod in list(self.mod_to_file.keys()):
+            if existing_mod != mod_name and existing_mod.startswith(f"{mod_name}."):
+                self.add_dependency(existing_mod, mod_name)
+
     def add_dependency(self, from_mod: str, to_mod: str) -> None:
         """Adds a directed import edge from from_mod to to_mod."""
         if not from_mod or not to_mod or from_mod == to_mod:
             return
         if from_mod not in self.adjacency:
             self.adjacency[from_mod] = set()
-        self.adjacency[from_mod].add(to_mod)
+        if to_mod not in self.adjacency[from_mod]:
+            self.adjacency[from_mod].add(to_mod)
+            self._sorted_adjacency.pop(from_mod, None)
+
+    def _get_sorted_neighbors(self, mod_name: str) -> List[str]:
+        """Returns deterministic sorted neighbors of mod_name, using a cached list."""
+        cached = self._sorted_adjacency.get(mod_name)
+        if cached is None:
+            neighbors = self.adjacency.get(mod_name)
+            cached = sorted(neighbors) if neighbors else []
+            self._sorted_adjacency[mod_name] = cached
+        return cached
 
     def add_import_dependency(
         self,
@@ -356,7 +387,7 @@ class ModuleDependencyGraph:
 
         while queue:
             curr = queue.popleft()
-            for neighbor in sorted(self.adjacency.get(curr, ())):
+            for neighbor in self._get_sorted_neighbors(curr):
                 # If neighbor is exact target or a prefix of target module
                 if neighbor == to_mod:
                     return True
@@ -382,7 +413,7 @@ class ModuleDependencyGraph:
             if curr == to_mod:
                 found = True
                 break
-            for neighbor in sorted(self.adjacency.get(curr, ())):
+            for neighbor in self._get_sorted_neighbors(curr):
                 if neighbor not in visited:
                     visited.add(neighbor)
                     parent[neighbor] = curr
@@ -416,6 +447,16 @@ class ModuleDependencyGraph:
         existing_path = self.find_cycle_path(from_mod=to_mod, to_mod=from_mod)
         if existing_path is not None:
             return [from_mod] + existing_path
+
+        # Submodule import executes ancestor package initializers:
+        # e.g., importing `pkg.worker` first executes `pkg/__init__.py`.
+        # If `pkg` already depends on `from_mod`, caller -> pkg.worker -> pkg -> caller forms a cycle.
+        parts = to_mod.split(".")
+        for i in range(1, len(parts)):
+            prefix = ".".join(parts[:i])
+            prefix_path = self.find_cycle_path(from_mod=prefix, to_mod=from_mod)
+            if prefix_path is not None:
+                return [from_mod, to_mod] + prefix_path
         return None
 
     @classmethod
@@ -449,6 +490,14 @@ class ModuleDependencyGraph:
                 graph.add_module(mod_name, p_file)
 
         known_modules = set(graph.mod_to_file.keys())
+
+        # Wire submodule execution dependencies to ancestor package initializers
+        for mod_name in known_modules:
+            parts = mod_name.split(".")
+            for i in range(1, len(parts)):
+                parent_pkg = ".".join(parts[:i])
+                if parent_pkg in known_modules:
+                    graph.add_dependency(mod_name, parent_pkg)
 
         # Second pass: parse imports and wire edges
         for p_file in python_files:

@@ -1000,6 +1000,201 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
     return names
 
 
+def _extract_helper_symbols(
+    helper_tree: ast.AST,
+) -> Tuple[Set[str], Set[str], Set[str]]:
+    """Extracts (free_names, defined_names, helper_local_imported_names) with lexical scope awareness.
+
+    Parameters and local stores from nested functions/classes/comprehensions do not bleed
+    into the outer helper scope, preventing false shadowing of module-level dependencies.
+    """
+    free_names: Set[str] = set()
+    defined_names: Set[str] = set()
+    local_imported_names: Set[str] = set()
+    scope_stack: List[Set[str]] = [set()]
+
+    def _collect_direct_bindings(stmts: Sequence[ast.stmt]) -> Set[str]:
+        bound: Set[str] = set()
+        for stmt in stmts:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                bound.add(stmt.name)
+            elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                for alias in stmt.names:
+                    bound.add(alias.asname or alias.name.split(".", 1)[0])
+            elif isinstance(stmt, ast.Assign):
+                for t in stmt.targets:
+                    bound.update(
+                        n.id
+                        for n in ast.walk(t)
+                        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+                    )
+            elif isinstance(stmt, (ast.AugAssign, ast.AnnAssign)):
+                target = stmt.target
+                bound.update(
+                    n.id
+                    for n in ast.walk(target)
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+                )
+            elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+                bound.update(
+                    n.id
+                    for n in ast.walk(stmt.target)
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+                )
+                bound.update(_collect_direct_bindings(stmt.body))
+                bound.update(_collect_direct_bindings(stmt.orelse))
+            elif isinstance(stmt, (ast.While, ast.If)):
+                bound.update(_collect_direct_bindings(stmt.body))
+                bound.update(_collect_direct_bindings(stmt.orelse))
+            elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+                for item in stmt.items:
+                    if item.optional_vars:
+                        bound.update(
+                            n.id
+                            for n in ast.walk(item.optional_vars)
+                            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+                        )
+                bound.update(_collect_direct_bindings(stmt.body))
+            elif isinstance(stmt, ast.Try):
+                bound.update(_collect_direct_bindings(stmt.body))
+                for handler in stmt.handlers:
+                    if isinstance(handler.name, str):
+                        bound.add(handler.name)
+                    bound.update(_collect_direct_bindings(handler.body))
+                bound.update(_collect_direct_bindings(stmt.orelse))
+                bound.update(_collect_direct_bindings(stmt.finalbody))
+            elif type(stmt).__name__ == "Match":
+                for case in getattr(stmt, "cases", []):
+                    pattern = getattr(case, "pattern", None)
+                    if pattern is not None:
+                        for n in ast.walk(pattern):
+                            m_name = getattr(n, "name", None) or getattr(n, "rest", None)
+                            if isinstance(m_name, str):
+                                bound.add(m_name)
+                    bound.update(_collect_direct_bindings(case.body))
+
+            for n in ast.walk(stmt):
+                if (
+                    isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                    and n is not stmt
+                ):
+                    continue
+                if type(n).__name__ == "NamedExpr":
+                    target_node = getattr(n, "target", None)
+                    if isinstance(target_node, ast.Name):
+                        bound.add(target_node.id)
+        return bound
+
+    class _ScopeVisitor(ast.NodeVisitor):
+        def _handle_function_def(
+            self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
+        ) -> None:
+            scope_stack[-1].add(node.name)
+            if len(scope_stack) == 1:
+                defined_names.add(node.name)
+            for d in node.decorator_list:
+                self.visit(d)
+            for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+                if a.annotation:
+                    self.visit(a.annotation)
+            if node.args.vararg and node.args.vararg.annotation:
+                self.visit(node.args.vararg.annotation)
+            if node.args.kwarg and node.args.kwarg.annotation:
+                self.visit(node.args.kwarg.annotation)
+            for d in node.args.defaults + [df for df in node.args.kw_defaults if df]:
+                self.visit(d)
+            if node.returns:
+                self.visit(node.returns)
+
+            fn_scope: Set[str] = set()
+            for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+                fn_scope.add(a.arg)
+            if node.args.vararg:
+                fn_scope.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                fn_scope.add(node.args.kwarg.arg)
+            fn_scope.update(_collect_direct_bindings(node.body))
+            self._enter_block_scope(fn_scope, node.body)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._handle_function_def(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._handle_function_def(node)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            scope_stack[-1].add(node.name)
+            if len(scope_stack) == 1:
+                defined_names.add(node.name)
+            for d in node.decorator_list:
+                self.visit(d)
+            for base_expr in node.bases:
+                self.visit(base_expr)
+            for k in node.keywords:
+                self.visit(k)
+
+            cls_scope = _collect_direct_bindings(node.body)
+            self._enter_block_scope(cls_scope, node.body)
+
+        def _enter_block_scope(
+            self, child_scope: Set[str], body: Sequence[ast.stmt]
+        ) -> None:
+            if len(scope_stack) == 1:
+                defined_names.update(child_scope)
+            scope_stack.append(child_scope)
+            for body_stmt in body:
+                self.visit(body_stmt)
+            scope_stack.pop()
+
+        def _handle_comprehension(
+            self, elts: Sequence[ast.expr], generators: Sequence[ast.comprehension]
+        ) -> None:
+            comp_scope: Set[str] = set()
+            for gen in generators:
+                self.visit(gen.iter)
+                for t in ast.walk(gen.target):
+                    if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store):
+                        comp_scope.add(t.id)
+                for if_clause in gen.ifs:
+                    scope_stack.append(comp_scope)
+                    self.visit(if_clause)
+                    scope_stack.pop()
+            scope_stack.append(comp_scope)
+            for e in elts:
+                self.visit(e)
+            scope_stack.pop()
+
+        def visit_ListComp(self, node: ast.ListComp) -> None:
+            self._handle_comprehension([node.elt], node.generators)
+
+        def visit_SetComp(self, node: ast.SetComp) -> None:
+            self._handle_comprehension([node.elt], node.generators)
+
+        def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+            self._handle_comprehension([node.elt], node.generators)
+
+        def visit_DictComp(self, node: ast.DictComp) -> None:
+            self._handle_comprehension([node.key, node.value], node.generators)
+
+        def visit_Import(self, node: ast.Import) -> None:
+            for alias in node.names:
+                name = alias.asname or alias.name.split(".", 1)[0]
+                local_imported_names.add(name)
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            for alias in node.names:
+                name = alias.asname or alias.name
+                local_imported_names.add(name)
+
+        def visit_Name(self, node: ast.Name) -> None:
+            if isinstance(node.ctx, ast.Load):
+                if not any(node.id in s for s in reversed(scope_stack)):
+                    free_names.add(node.id)
+
+    _ScopeVisitor().visit(helper_tree)
+    return free_names, defined_names, local_imported_names
+
+
 def _collect_host_missing_imports(
     host_plan: _FilePatchPlan,
     helper_code: str,
@@ -1118,37 +1313,9 @@ def _collect_host_missing_imports(
         helper_tree = None
 
     if helper_tree is not None and source_texts:
-        defined_in_helper: Set[str] = set()
-        loaded_in_helper: Set[str] = set()
-        for node in ast.walk(helper_tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                defined_in_helper.add(node.name)
-                for arg in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
-                    defined_in_helper.add(arg.arg)
-                if node.args.vararg:
-                    defined_in_helper.add(node.args.vararg.arg)
-                if node.args.kwarg:
-                    defined_in_helper.add(node.args.kwarg.arg)
-            elif isinstance(node, ast.ClassDef):
-                defined_in_helper.add(node.name)
-            elif isinstance(node, ast.ExceptHandler) and isinstance(node.name, str):
-                defined_in_helper.add(node.name)
-            elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                for alias in node.names:
-                    defined_in_helper.add(alias.asname or alias.name.split(".", 1)[0])
-            elif isinstance(node, ast.Name):
-                if isinstance(node.ctx, ast.Store):
-                    defined_in_helper.add(node.id)
-                elif isinstance(node.ctx, ast.Load):
-                    loaded_in_helper.add(node.id)
-            elif type(node).__name__ in ("MatchAs", "MatchStar"):
-                match_name = getattr(node, "name", None)
-                if isinstance(match_name, str):
-                    defined_in_helper.add(match_name)
-            elif type(node).__name__ == "MatchMapping":
-                match_rest = getattr(node, "rest", None)
-                if isinstance(match_rest, str):
-                    defined_in_helper.add(match_rest)
+        free_names, defined_in_helper, helper_local_imported_names = _extract_helper_symbols(
+            helper_tree
+        )
 
         is_same_file_host = (
             not host_plan.is_new_file
@@ -1156,7 +1323,7 @@ def _collect_host_missing_imports(
             and _unpack_source_item(source_texts[0])[0] == host_plan.orig_text
         )
 
-        source_import_maps: List[Tuple[Dict[str, str], List[str]]] = []
+        source_info: List[Tuple[Dict[str, str], List[str], Set[str]]] = []
         for item in source_texts:
             src_text, src_mod, src_ispkg = _unpack_source_item(item)
             if not src_text:
@@ -1164,18 +1331,23 @@ def _collect_host_missing_imports(
             s_map, s_wild = _extract_module_import_statements(
                 src_text, source_mod=src_mod, is_package=src_ispkg
             )
-            source_import_maps.append((s_map, s_wild))
+            s_defs = _extract_module_defined_names(src_text)
+            source_info.append((s_map, s_wild, s_defs))
 
         ignored_names = _BUILTIN_NAMES | defined_in_helper | set(needed_typing)
         symbol_to_stmt: Dict[str, str] = dict(local_import_stmts)
         source_hoisted_symbols: Set[str] = set()
         host_defs: Optional[Set[str]] = None
-        for loaded_name in sorted(loaded_in_helper):
+
+        for loaded_name in sorted(free_names):
             if loaded_name in ignored_names:
                 continue
 
-            found_in_any = loaded_name in symbol_to_stmt
-            for s_map, _ in source_import_maps:
+            found_in_any = (
+                loaded_name in symbol_to_stmt
+                or loaded_name in helper_local_imported_names
+            )
+            for s_map, _, s_defs in source_info:
                 if loaded_name in s_map:
                     found_in_any = True
                     stmt = s_map[loaded_name]
@@ -1184,12 +1356,30 @@ def _collect_host_missing_imports(
                             f"conflicting imported symbol '{loaded_name}' across clone sources"
                         )
                     symbol_to_stmt[loaded_name] = stmt
-                    if loaded_name not in local_import_stmts:
+                    if loaded_name not in helper_local_imported_names:
                         source_hoisted_symbols.add(loaded_name)
+
+            # Check for conflicting module definitions vs imports across clone sources
+            for item, (s_map, _, s_defs) in zip(source_texts, source_info):
+                if loaded_name in s_defs:
+                    _, s_mod, _ = _unpack_source_item(item)
+                    if loaded_name in symbol_to_stmt:
+                        imp_stmt = symbol_to_stmt[loaded_name]
+                        is_import_from_self = False
+                        if s_mod:
+                            expected_prefix = f"from {s_mod} import "
+                            if imp_stmt.startswith(expected_prefix):
+                                is_import_from_self = True
+                        if not is_import_from_self:
+                            raise ValueError(
+                                f"conflicting imported symbol '{loaded_name}' across clone sources"
+                            )
+                    elif host_plan.is_new_file and not found_in_any:
+                        pass
 
             if not is_same_file_host:
                 if not found_in_any:
-                    if any(s_wild for _, s_wild in source_import_maps):
+                    if any(s_wild for _, s_wild, _ in source_info):
                         raise ValueError(
                             f"symbol '{loaded_name}' potentially relies on wildcard import"
                         )
@@ -1203,6 +1393,26 @@ def _collect_host_missing_imports(
                         raise ValueError(
                             f"unresolved symbol '{loaded_name}' in host module"
                         )
+                else:
+                    for item, (s_map, s_wild, s_defs) in zip(source_texts, source_info):
+                        _, s_mod, _ = _unpack_source_item(item)
+                        has_binding = (
+                            loaded_name in s_map
+                            or (
+                                loaded_name in s_defs
+                                and bool(s_mod)
+                                and symbol_to_stmt.get(loaded_name, "").startswith(
+                                    f"from {s_mod} import "
+                                )
+                            )
+                            or loaded_name in helper_local_imported_names
+                            or loaded_name in local_import_stmts
+                            or bool(s_wild)
+                        )
+                        if not has_binding:
+                            raise ValueError(
+                                f"conflicting imported symbol '{loaded_name}' across clone sources"
+                            )
 
         # Cross-check symbol_to_stmt against host module's existing and queued imports
         host_existing_stmts, _ = _extract_module_import_statements(
@@ -1310,9 +1520,14 @@ def _safely_resolve_shared_module_file(
 ) -> Optional[Path]:
     """Resolves the shared module file path, appending skip advisory comments on containment error."""
     try:
-        return resolve_shared_module_file(
+        resolved = resolve_shared_module_file(
             f1_path, f2_path, root, shared_module_name=shared_module_name
         )
+        if resolved.is_symlink():
+            raise ValueError(
+                f"shared module path {resolved.name} is an existing symlink"
+            )
+        return resolved
     except ValueError as exc:
         err_msg = f"# Note: Cross-module clone pair; {exc}; skipping extraction.\n"
         f1_plan.comments.append(err_msg)
@@ -1643,7 +1858,7 @@ def generate_refactoring_patch(
                 target_host_plan = f2_plan
             else:
                 target_host_plan = file_plans.get(shared_p)
-                if target_host_plan is None and shared_p.is_file():
+                if target_host_plan is None and shared_p.is_file() and not shared_p.is_symlink():
                     try:
                         shared_p.resolve().relative_to(root.resolve())
                         target_host_text = shared_p.read_text(encoding="utf-8")
@@ -1795,13 +2010,18 @@ def generate_refactoring_patch(
                 else:
                     shared_plan = file_plans.get(shared_p)
                     if shared_plan is None:
-                        if shared_p.is_dir():
-                            dir_err_msg = (
-                                f"# Note: Cross-module clone pair; shared module path {rel_shared} "
-                                f"is an existing directory; skipping extraction.\n"
+                        if shared_p.is_symlink() or shared_p.is_dir():
+                            kind_desc = (
+                                "an existing symlink"
+                                if shared_p.is_symlink()
+                                else "an existing directory"
                             )
-                            f1_plan.comments.append(dir_err_msg)
-                            f2_plan.comments.append(dir_err_msg)
+                            skip_msg = (
+                                f"# Note: Cross-module clone pair; shared module path {rel_shared} "
+                                f"is {kind_desc}; skipping extraction.\n"
+                            )
+                            f1_plan.comments.append(skip_msg)
+                            f2_plan.comments.append(skip_msg)
                             continue
                         if shared_p.is_file():
                             try:

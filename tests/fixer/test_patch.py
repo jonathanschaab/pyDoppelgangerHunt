@@ -3284,6 +3284,194 @@ def test_shared_module_resolution_failure_adds_advisory_comment(
     assert "_common.py" not in patch
 
 
+def test_clone_sources_conflicting_definition_and_import_rejected(tmp_path: Path) -> None:
+    """Verifies that if one clone imports a symbol while another defines it locally, extraction is rejected."""
+    pkg = tmp_path / "conflict_def_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = (
+        "from dep import CustomType\n\n"
+        "def calc1(x: CustomType) -> int:\n"
+        "    return 42\n"
+    )
+    src2 = (
+        "class CustomType:\n"
+        "    pass\n\n"
+        "def calc2(x: CustomType) -> int:\n"
+        "    return 42\n"
+    )
+    f1 = pkg / "m1.py"
+    f2 = pkg / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "calc1", "file": str(f1), "start": 3, "end": 4, "kind": "function"}
+    u2 = {"name": "calc2", "file": str(f2), "start": 4, "end": 5, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "conflicting imported symbol 'CustomType' across clone sources" in patch
+    assert "skipping extraction" in patch
+
+
+def test_clone_sources_inconsistent_binding_missing_import_rejected(tmp_path: Path) -> None:
+    """Verifies that if one clone imports a symbol while another has no binding for it, extraction is rejected."""
+    pkg = tmp_path / "inconsistent_bind_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = (
+        "from dep import CustomType\n\n"
+        "def calc1(x: CustomType) -> int:\n"
+        "    return 42\n"
+    )
+    src2 = (
+        "def calc2(x: CustomType) -> int:\n"
+        "    return 42\n"
+    )
+    f1 = pkg / "m1.py"
+    f2 = pkg / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "calc1", "file": str(f1), "start": 3, "end": 4, "kind": "function"}
+    u2 = {"name": "calc2", "file": str(f2), "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "conflicting imported symbol 'CustomType' across clone sources" in patch
+    assert "skipping extraction" in patch
+
+
+def test_helper_retains_module_import_when_local_import_not_selected(tmp_path: Path) -> None:
+    """Verifies that module-level import is hoisted when clone 2 had local import not present in clone 1 helper."""
+    pkg = tmp_path / "retained_local_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = (
+        "from math import sqrt\n\n"
+        "def calc1(x: int) -> float:\n"
+        "    return sqrt(x)\n"
+    )
+    src2 = (
+        "def calc2(x: int) -> float:\n"
+        "    from math import sqrt\n"
+        "    return sqrt(x)\n"
+    )
+    f1 = pkg / "m1.py"
+    f2 = pkg / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "calc1", "file": str(f1), "start": 3, "end": 4, "kind": "function"}
+    u2 = {"name": "calc2", "file": str(f2), "start": 1, "end": 3, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=False,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "from math import sqrt" in patch
+    assert "skipping extraction" not in patch
+    assert "diff --git a/retained_local_pkg/_common.py b/retained_local_pkg/_common.py" in patch
+
+
+def test_nested_function_parameters_do_not_shadow_outer_helper_imports(tmp_path: Path) -> None:
+    """Verifies that nested function parameters in helper do not prevent module-level imports from hoisting."""
+    pkg = tmp_path / "nested_shadow_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = (
+        "from math import sqrt as transform\n\n"
+        "def runner1(x: int) -> float:\n"
+        "    res = transform(x)\n"
+        "    def inner(transform: int) -> int:\n"
+        "        return transform + 1\n"
+        "    return res + inner(1)\n"
+    )
+    src2 = (
+        "from math import sqrt as transform\n\n"
+        "def runner2(x: int) -> float:\n"
+        "    res = transform(x)\n"
+        "    def inner(transform: int) -> int:\n"
+        "        return transform + 1\n"
+        "    return res + inner(1)\n"
+    )
+    f1 = pkg / "m1.py"
+    f2 = pkg / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "runner1", "file": str(f1), "start": 3, "end": 7, "kind": "function"}
+    u2 = {"name": "runner2", "file": str(f2), "start": 3, "end": 7, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "from math import sqrt as transform" in patch
+    assert "skipping extraction" not in patch
+
+
+def test_symlink_shared_module_target_rejected_with_advisory_comment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that if target shared module is a symlink, extraction is skipped with advisory comment."""
+    pkg = tmp_path / "sym_target_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = "def f1(x: int) -> int:\n    return x + 1\n"
+    src2 = "def f2(x: int) -> int:\n    return x + 1\n"
+    f1 = pkg / "m1.py"
+    f2 = pkg / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "f1", "file": str(f1), "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "f2", "file": str(f2), "start": 1, "end": 2, "kind": "function"}
+
+    orig_is_symlink = Path.is_symlink
+
+    def mock_is_symlink(self: Path) -> bool:
+        if self.name == "_common.py":
+            return True
+        return orig_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", mock_is_symlink)
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "is an existing symlink" in patch
+    assert "skipping extraction" in patch
+    assert "diff --git" not in patch
+
+
+
+
 
 
 

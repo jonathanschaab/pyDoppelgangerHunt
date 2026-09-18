@@ -423,3 +423,84 @@ def test_resolve_shared_module_file_unsafe_fallback_rejected(
         resolve_shared_module_file(f1, f2, root, shared_module_name="_common.py")
 
 
+def test_package_ancestor_initializer_cycle_detected(tmp_path: Path) -> None:
+    """Verifies that submodule imports account for package initializer execution cycles."""
+    root = tmp_path / "pkg_cycle_repo"
+    pkg = root / "pkg"
+    pkg.mkdir(parents=True)
+
+    # pkg/__init__.py imports caller module
+    (pkg / "__init__.py").write_text("import caller\n", encoding="utf-8")
+    (pkg / "worker.py").write_text("def do_work(): pass\n", encoding="utf-8")
+    (root / "caller.py").write_text("def run(): pass\n", encoding="utf-8")
+
+    graph = build_module_graph(root)
+
+    # Submodule should model dependency on its parent package initializer
+    assert "pkg" in graph.get_dependencies("pkg.worker")
+
+    # caller -> pkg.worker would execute pkg/__init__.py, which imports caller -> CYCLE!
+    cycle = graph.check_cycle_if_added("caller", "pkg.worker")
+    assert cycle is not None
+    assert cycle[0] == "caller"
+    assert "pkg.worker" in cycle
+    assert "pkg" in cycle
+    assert cycle[-1] == "caller"
+
+
+def test_depgraph_bfs_neighbor_caching_deterministic(tmp_path: Path) -> None:
+    """Verifies that _get_sorted_neighbors caches sorted neighbors and invalidates on mutation."""
+    # pylint: disable=protected-access
+    graph = ModuleDependencyGraph(tmp_path)
+    graph.add_module("a", tmp_path / "a.py")
+    graph.add_module("b", tmp_path / "b.py")
+    graph.add_module("c", tmp_path / "c.py")
+
+    graph.add_dependency("a", "c")
+    graph.add_dependency("a", "b")
+
+    # First call caches sorted neighbors
+    neighbors = graph._get_sorted_neighbors("a")
+    assert neighbors == ["b", "c"]
+    assert "a" in graph._sorted_adjacency
+
+    # Adding a redundant edge does not invalidate cache
+    graph.add_dependency("a", "b")
+    assert "a" in graph._sorted_adjacency
+
+    # Adding a new edge invalidates cache
+    graph.add_dependency("a", "a0")
+    assert "a" not in graph._sorted_adjacency
+    assert graph._get_sorted_neighbors("a") == ["a0", "b", "c"]
+
+
+def test_resolve_shared_module_file_rejects_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that if target or fallback is an existing symlink, ValueError is raised."""
+    root = tmp_path / "sym_repo"
+    pkg = root / "pkg"
+    pkg.mkdir(parents=True)
+    f1 = pkg / "f1.py"
+    f2 = pkg / "f2.py"
+    f1.write_text("x = 1\n", encoding="utf-8")
+    f2.write_text("x = 2\n", encoding="utf-8")
+
+    # Mock Path.is_symlink to simulate existing symlink
+    orig_is_symlink = Path.is_symlink
+
+    def mock_is_symlink(self: Path) -> bool:
+        if self.name in ("_common.py", "custom.py"):
+            return True
+        return orig_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", mock_is_symlink)
+
+    with pytest.raises(ValueError, match="existing symlink"):
+        resolve_shared_module_file(f1, f2, root, shared_module_name="custom.py")
+
+    with pytest.raises(ValueError, match="existing symlink"):
+        resolve_shared_module_file(f1, f2, root, shared_module_name="_common.py")
+
+
+
