@@ -631,16 +631,24 @@ def _walrus_assignment_in_expr(
     return definite, conditional - definite
 
 
+def _is_irrefutable_pattern(pattern: Optional[ast.AST]) -> bool:
+    """Recursively determines if a pattern matching AST node unconditionally matches any subject."""
+    if pattern is None:
+        return True
+    if hasattr(ast, "MatchAs") and isinstance(pattern, ast.MatchAs):
+        return pattern.pattern is None or _is_irrefutable_pattern(pattern.pattern)
+    if hasattr(ast, "MatchOr") and isinstance(pattern, ast.MatchOr):
+        return any(_is_irrefutable_pattern(p) for p in pattern.patterns)
+    return False
+
+
 def _is_irrefutable_case(case: ast.AST) -> bool:  # pragma: no cover (py310+)
-    """Returns True if the match case has no guard and an irrefutable wildcard or as-pattern."""
+    """Returns True if the match case has no guard and an irrefutable pattern."""
     guard = getattr(case, "guard", None)
     pattern = getattr(case, "pattern", None)
     if guard is not None or pattern is None:
         return False
-    pat_type = type(pattern).__name__
-    return pat_type == "MatchWildcard" or (
-        pat_type == "MatchAs" and getattr(pattern, "pattern", None) is None
-    )
+    return _is_irrefutable_pattern(pattern)
 
 
 def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
@@ -952,11 +960,16 @@ def _analyze_block_assignment(
                         if p_rest and isinstance(p_rest, str):
                             pattern_stores.add(p_rest)
                 guard = getattr(case, "guard", None)
+                d_g: Set[str] = set()
+                c_g: Set[str] = set()
                 if guard is not None:
-                    d_g, c_g = _walrus_assignment_in_expr(guard, is_conditional=True)
-                    case_conds.update(d_g | c_g)
-                c_def, c_cond = _analyze_block_assignment(case.body)
-                c_def.update(pattern_stores)
+                    d_g, c_g = _walrus_assignment_in_expr(guard, is_conditional=False)
+                case_init_def = pattern_stores | d_g
+                c_def, c_cond = _analyze_block_assignment(
+                    case.body,
+                    definite=case_init_def.copy(),
+                    conditional=c_g.copy() if c_g else None,
+                )
                 case_defs.append(c_def)
                 case_conds.update(c_def | c_cond)
                 c_del = _extract_deleted_names(case.body) - c_def
@@ -1099,7 +1112,7 @@ def _format_call_arguments(
 
 def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List[str]:
     """Extracts executable body lines for a unit, stripping function headers and docstrings for whole functions."""
-    if unit.get("kind") not in ("function", "closure"):
+    if unit.get("kind") not in ("function", "closure", "method"):
         return raw_lines
 
     code_block = "\n".join(raw_lines)
@@ -1293,7 +1306,7 @@ def _inspect_unit_scope(
     unit_name = str(unit.get("name") or "")
     unit_kind = str(unit.get("kind") or "")
     is_subroutine = unit_kind in ("compound_block", "sliding_window", "clause_branch") or (
-        unit_kind not in ("function", "closure", "comprehension", "complex_expr") and ":" in unit_name
+        unit_kind not in ("function", "closure", "method", "comprehension", "complex_expr") and ":" in unit_name
     )
 
     cand_lines = cand_text.splitlines(keepends=True)

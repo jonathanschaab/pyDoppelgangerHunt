@@ -8690,4 +8690,202 @@ def test_insert_imports_into_module_deduplicates_within_import_lines() -> None:
     assert res.count("from typing import Tuple\n") == 1
 
 
+@pytest.mark.skipif(sys.version_info < (3, 10), reason="Pattern matching requires Python 3.10+")
+def test_is_irrefutable_pattern_and_case() -> None:
+    """Verifies that _is_irrefutable_case identifies wildcard, as, and alternative irrefutable patterns."""
+    from pydoppelgangerhunt.fixer import _is_irrefutable_case  # pylint: disable=import-outside-toplevel
 
+    code = (
+        "match x:\n"
+        "    case _:\n"
+        "        pass\n"
+        "    case val:\n"
+        "        pass\n"
+        "    case _ as y:\n"
+        "        pass\n"
+        "    case 1 | _:\n"
+        "        pass\n"
+        "    case (1 | _) as y:\n"
+        "        pass\n"
+        "    case 1 as y:\n"
+        "        pass\n"
+        "    case 1 | 2:\n"
+        "        pass\n"
+        "    case _ if False:\n"
+        "        pass\n"
+        "    case [a, b]:\n"
+        "        pass\n"
+    )
+    tree = ast.parse(code)
+    cases = tree.body[0].cases  # type: ignore[attr-defined]
+
+    # case _:
+    assert _is_irrefutable_case(cases[0]) is True
+    # case val:
+    assert _is_irrefutable_case(cases[1]) is True
+    # case _ as y:
+    assert _is_irrefutable_case(cases[2]) is True
+    # case 1 | _:
+    assert _is_irrefutable_case(cases[3]) is True
+    # case (1 | _) as y:
+    assert _is_irrefutable_case(cases[4]) is True
+    # case 1 as y:
+    assert _is_irrefutable_case(cases[5]) is False
+    # case 1 | 2:
+    assert _is_irrefutable_case(cases[6]) is False
+    # case _ if False:
+    assert _is_irrefutable_case(cases[7]) is False
+    # case [a, b]:
+    assert _is_irrefutable_case(cases[8]) is False
+
+
+@pytest.mark.skipif(sys.version_info < (3, 10), reason="Pattern matching requires Python 3.10+")
+def test_match_pattern_stores_deletion_and_as_pattern_definite_assignment() -> None:
+    """Verifies that variable deletions inside match bodies discard pattern-bound stores, and as-patterns are definite."""
+    code = (
+        "match x:\n"
+        "    case (a, b):\n"
+        "        del a\n"
+        "        res = 1\n"
+        "    case _ as fallback:\n"
+        "        res = 2\n"
+    )
+    tree = ast.parse(code)
+    definite, conditional = _analyze_block_assignment(tree.body)
+
+    # res is assigned in all non-terminating branches of an irrefutable match
+    assert "res" in definite
+    assert "res" not in conditional
+
+    # a was bound by pattern but deleted in case 1 body
+    assert "a" not in definite
+    assert "a" not in conditional
+
+    # b and fallback were conditionally bound in respective branches
+    assert "b" in conditional
+    assert "b" not in definite
+    assert "fallback" in conditional
+    assert "fallback" not in definite
+
+
+@pytest.mark.skipif(sys.version_info < (3, 10), reason="Pattern matching requires Python 3.10+")
+def test_match_guard_walrus_definite_in_case_body() -> None:
+    """Verifies that walrus variables defined in match guards are recognized as definite within the case body."""
+    code = (
+        "match x:\n"
+        "    case items if (n := len(items)) > 0:\n"
+        "        del n\n"
+        "        res = 1\n"
+        "    case _:\n"
+        "        res = 2\n"
+    )
+    tree = ast.parse(code)
+    definite, conditional = _analyze_block_assignment(tree.body)
+
+    # res is definitely assigned across the whole match
+    assert "res" in definite
+    # n was walrus-assigned in the guard and deleted inside the case body, so it should not be definite or conditional
+    assert "n" not in definite
+    assert "n" not in conditional
+
+
+def test_extract_unit_body_lines_and_scope_method_kind(tmp_path: Path) -> None:
+    """Verifies that units with kind='method' strip headers/docstrings and preserve method parameters."""
+    from pydoppelgangerhunt.fixer import _extract_unit_body_lines  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "class Calculator:\n"
+        "    def compute(self, a: int, b: int) -> int:\n"
+        "        '''Compute sum.'''\n"
+        "        total = a + b\n"
+        "        return total\n"
+    )
+    f = tmp_path / "calc.py"
+    f.write_text(code, encoding="utf-8")
+
+    unit = {
+        "file": str(f),
+        "start": 2,
+        "end": 5,
+        "name": "Calculator:compute",
+        "kind": "method",
+    }
+    raw_lines = code.splitlines()[1:]
+    body_lines = _extract_unit_body_lines(unit, raw_lines)
+    assert body_lines == ["total = a + b", "return total"]
+
+    scope = analyze_unit_variable_scope(unit, repo_root=str(tmp_path))
+    assert "self" in scope["inputs"]
+    assert "a" in scope["inputs"]
+    assert "b" in scope["inputs"]
+    assert "total" in scope["outputs"]
+    assert scope["return_type"] == "int"
+
+
+@pytest.mark.skipif(sys.version_info < (3, 10), reason="Pattern matching requires Python 3.10+")
+def test_match_refactoring_subprocess_execution(tmp_path: Path) -> None:
+    """End-to-end integration test verifying that refactored pattern matching methods execute cleanly via subprocess."""
+    code1 = (
+        "def evaluate_code_v1(payload: dict) -> str:\n"
+        "    match payload:\n"
+        "        case {'status': 'success', 'code': c}:\n"
+        "            res = f'OK:{c}'\n"
+        "        case _ as fallback:\n"
+        "            res = f'FAIL:{fallback.get(\"status\")}'\n"
+        "    return res\n"
+    )
+    code2 = (
+        "def evaluate_code_v2(payload: dict) -> str:\n"
+        "    match payload:\n"
+        "        case {'status': 'success', 'code': c}:\n"
+        "            res = f'OK:{c}'\n"
+        "        case _ as fallback:\n"
+        "            res = f'FAIL:{fallback.get(\"status\")}'\n"
+        "    return res\n"
+    )
+    entry_script = (
+        "from mod1 import evaluate_code_v1\n"
+        "from mod2 import evaluate_code_v2\n"
+        "assert evaluate_code_v1({'status': 'success', 'code': 200}) == 'OK:200'\n"
+        "assert evaluate_code_v1({'status': 'error'}) == 'FAIL:error'\n"
+        "assert evaluate_code_v2({'status': 'success', 'code': 200}) == 'OK:200'\n"
+        "assert evaluate_code_v2({'status': 'error'}) == 'FAIL:error'\n"
+        "print('ALL_EVAL_TESTS_PASSED')\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    main_py = tmp_path / "run_eval.py"
+
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+    main_py.write_text(entry_script, encoding="utf-8")
+
+    u1 = {"file": "mod1.py", "start": 1, "end": 7, "name": "evaluate_code_v1", "kind": "function"}
+    u2 = {"file": "mod2.py", "start": 1, "end": 7, "name": "evaluate_code_v2", "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert patch != ""
+
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    proc = subprocess.run(
+        [sys.executable, str(main_py)],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "ALL_EVAL_TESTS_PASSED" in proc.stdout
