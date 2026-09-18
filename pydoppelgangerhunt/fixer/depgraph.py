@@ -32,6 +32,13 @@ def _resolve_repo_relative_path(
     norm = str(file_path).replace("\\", "/")
     p = Path(norm)
     if not p.is_absolute():
+        if p.is_file() or p.is_dir():
+            cand = p.resolve()
+            try:
+                cand.relative_to(p_root)
+                return cand
+            except ValueError:
+                pass
         p = p_root / p
     return p.resolve()
 

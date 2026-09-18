@@ -2667,5 +2667,154 @@ def test_register_plan_dependencies_init_package_context(tmp_path: Path) -> None
     assert "my_package.deps" in dg.get_dependencies("my_package")
 
 
+def test_shared_module_translates_local_relative_imports_package_init(tmp_path: Path) -> None:
+    """Verifies that relative function-local imports in pkg/__init__.py are translated with package context."""
+    pkg = tmp_path / "pkg_init_test"
+    pkg.mkdir()
+    (pkg / "deps.py").write_text("def helper(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+
+    src_init = (
+        "def compute_init(x: int) -> int:\n"
+        "    from .deps import helper\n"
+        "    return helper(x)\n"
+    )
+    src_mod = (
+        "def compute_mod(x: int) -> int:\n"
+        "    from .deps import helper\n"
+        "    return helper(x)\n"
+    )
+    (pkg / "__init__.py").write_text(src_init, encoding="utf-8")
+    (pkg / "mod.py").write_text(src_mod, encoding="utf-8")
+
+    u1 = {"name": "compute_init", "file": "pkg_init_test/__init__.py", "start": 1, "end": 3, "kind": "function"}
+    u2 = {"name": "compute_mod", "file": "pkg_init_test/mod.py", "start": 1, "end": 3, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    # In pkg_init_test/_common.py, the import should be translated to from pkg_init_test.deps import helper
+    assert "from pkg_init_test.deps import helper" in patch
+    # Should NOT have resolved to from deps import helper (which would be missing pkg_init_test.)
+    assert "+from deps import helper" not in patch
+    assert "+    from deps import helper" not in patch
+
+
+def test_existing_shared_module_gains_future_annotations_from_source(tmp_path: Path) -> None:
+    """Verifies that an existing shared module gains future annotations when clone source has them."""
+    pkg = tmp_path / "future_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    # Pre-existing _common.py without future annotations
+    (pkg / "_common.py").write_text("def existing_helper() -> None:\n    pass\n", encoding="utf-8")
+
+    src1 = (
+        "from __future__ import annotations\n\n"
+        "def run_calc(x: Later) -> Later:\n"
+        "    return x\n"
+    )
+    src2 = (
+        "from __future__ import annotations\n\n"
+        "def run_calc2(x: Later) -> Later:\n"
+        "    return x\n"
+    )
+    (pkg / "mod1.py").write_text(src1, encoding="utf-8")
+    (pkg / "mod2.py").write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "run_calc", "file": "future_pkg/mod1.py", "start": 3, "end": 4, "kind": "function"}
+    u2 = {"name": "run_calc2", "file": "future_pkg/mod2.py", "start": 3, "end": 4, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    # _common.py should receive from __future__ import annotations
+    assert "+from __future__ import annotations" in patch
+
+
+def test_canonicalize_helper_preserves_comments_and_pragmas() -> None:
+    """Verifies that canonicalizing relative imports preserves inline comments, pragmas, and formatting."""
+    from pydoppelgangerhunt.fixer.patch import _canonicalize_helper_relative_imports  # pylint: disable=import-outside-toplevel
+
+    helper = (
+        "def helper_func(x: int) -> int:\n"
+        "    # Important internal logic comment\n"
+        "    from .utils import convert  # type: ignore[import-untyped]\n"
+        "    # Another inline remark\n"
+        "    return convert(x)  # noqa: E501\n"
+    )
+    canonicalized = _canonicalize_helper_relative_imports(helper, [("my_pkg.sub.mod", False)])
+    assert "from my_pkg.sub.utils import convert  # type: ignore[import-untyped]" in canonicalized
+    assert "# Important internal logic comment" in canonicalized
+    assert "# Another inline remark" in canonicalized
+    assert "# noqa: E501" in canonicalized
+
+
+def test_collect_host_missing_imports_preserves_aliased_typing(tmp_path: Path) -> None:
+    """Verifies that aliased typing imports (e.g. from typing import List as MyList) are preserved."""
+    pkg = tmp_path / "alias_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = (
+        "from typing import List as MyList\n\n"
+        "def process(items: MyList[int]) -> int:\n"
+        "    return len(items)\n"
+    )
+    src2 = (
+        "from typing import List as MyList\n\n"
+        "def process2(items: MyList[int]) -> int:\n"
+        "    return len(items)\n"
+    )
+    (pkg / "mod1.py").write_text(src1, encoding="utf-8")
+    (pkg / "mod2.py").write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "process", "file": "alias_pkg/mod1.py", "start": 3, "end": 4, "kind": "function"}
+    u2 = {"name": "process2", "file": "alias_pkg/mod2.py", "start": 3, "end": 4, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    # In _common.py, the aliased typing import should be present
+    assert "from typing import List as MyList" in patch
+
+
+def test_generate_patch_relative_repo_root_no_path_doubling(tmp_path: Path) -> None:
+    """Verifies that passing a relative repo_root does not duplicate path components."""
+    rel_root = tmp_path / "sub_proj"
+    pkg = rel_root / "my_pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src = "def util(a: int) -> int:\n    return a * 2\n"
+    (pkg / "a.py").write_text(src, encoding="utf-8")
+    (pkg / "b.py").write_text(src, encoding="utf-8")
+
+    u1 = {"name": "util", "file": str(pkg / "a.py"), "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "util", "file": str(pkg / "b.py"), "start": 1, "end": 2, "kind": "function"}
+
+    # Pass relative repo_root
+    rel_repo_root = str(rel_root)
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=rel_repo_root,
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "sub_proj/sub_proj" not in patch.replace("\\", "/")
+    assert "my_pkg/_common.py" in patch.replace("\\", "/")
+
+
 
 

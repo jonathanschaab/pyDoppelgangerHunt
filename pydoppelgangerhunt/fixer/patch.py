@@ -27,6 +27,7 @@ from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
     _parse_source_imports,
     _resolve_relative_import_path,
+    _resolve_repo_relative_path,
     build_module_graph,
     derive_module_import_path as _derive_module_import_path,
     find_nearest_common_package,
@@ -830,7 +831,9 @@ def _helper_requires_future_annotations(helper_code: str) -> bool:
 
 
 def _extract_module_import_statements(
-    source_text: str, source_mod: Optional[str] = None
+    source_text: str,
+    source_mod: Optional[str] = None,
+    is_package: bool = False,
 ) -> Dict[str, str]:
     """Maps imported symbol/module names to clean import statements from source text."""
     stmts: Dict[str, str] = {}
@@ -857,7 +860,9 @@ def _extract_module_import_statements(
                 target_module = node.module
             elif level > 0:
                 if source_mod:
-                    target_module = _resolve_relative_import_path(source_mod, level, node.module)
+                    target_module = _resolve_relative_import_path(
+                        source_mod, level, node.module, is_package=is_package
+                    )
                 else:
                     dots = "." * level
                     target_module = f"{dots}{node.module}" if node.module else dots
@@ -877,12 +882,20 @@ def _extract_module_import_statements(
 
 def _canonicalize_helper_relative_imports(
     helper_code: str,
-    source_mods: Sequence[Optional[str]] = (),
+    source_mods: Sequence[Union[str, Tuple[Optional[str], bool], None]] = (),
 ) -> str:
     """Translates relative imports inside a helper body to canonical absolute imports."""
     if not helper_code or "from ." not in helper_code:
         return helper_code
-    valid_mods = [m for m in source_mods if m]
+    valid_mods: List[Tuple[str, bool]] = []
+    for item in source_mods:
+        if not item:
+            continue
+        if isinstance(item, tuple):
+            if item[0]:
+                valid_mods.append((item[0], bool(item[1])))
+        else:
+            valid_mods.append((item, False))
     if not valid_mods:
         return helper_code
     try:
@@ -890,30 +903,74 @@ def _canonicalize_helper_relative_imports(
     except (SyntaxError, UnicodeDecodeError):
         return helper_code
 
-    modified = False
+    import_nodes: List[ast.ImportFrom] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and (getattr(node, "level", 0) or 0) > 0:
-            for s_mod in valid_mods:
-                resolved = _resolve_relative_import_path(s_mod, node.level, node.module)
-                if resolved:
-                    node.level = 0
-                    node.module = resolved
-                    modified = True
-                    break
+            if hasattr(node, "lineno") and hasattr(node, "end_lineno"):
+                import_nodes.append(node)
 
-    if modified:
-        try:
-            return ast.unparse(tree)
-        except Exception:
-            return helper_code
-    return helper_code
+    if not import_nodes:
+        return helper_code
+
+    import_nodes.sort(key=lambda n: n.lineno, reverse=True)
+    lines = helper_code.splitlines()
+
+    for node in import_nodes:
+        resolved = None
+        for s_mod, s_ispkg in valid_mods:
+            resolved = _resolve_relative_import_path(
+                s_mod, node.level, node.module, is_package=s_ispkg
+            )
+            if resolved:
+                break
+        if not resolved:
+            continue
+
+        if node.lineno is None:
+            continue
+        start_idx = node.lineno - 1
+        end_idx = node.end_lineno if node.end_lineno is not None else node.lineno
+        if start_idx < 0 or start_idx >= len(lines) or end_idx < start_idx:
+            continue
+
+        first_line = lines[start_idx]
+        indent = first_line[: len(first_line) - len(first_line.lstrip())]
+
+        trailing_comment = ""
+        last_line = lines[end_idx - 1] if 0 <= end_idx - 1 < len(lines) else first_line
+        hash_pos = last_line.find("#")
+        if hash_pos != -1:
+            trailing_comment = f"  {last_line[hash_pos:].strip()}"
+
+        names_str = ", ".join(
+            f"{a.name} as {a.asname}" if a.asname else a.name
+            for a in node.names
+        )
+        new_stmt = f"{indent}from {resolved} import {names_str}{trailing_comment}"
+        lines[start_idx:end_idx] = [new_stmt]
+
+    result = "\n".join(lines)
+    if helper_code.endswith("\n") and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _unpack_source_item(
+    item: Union[str, Tuple[Any, ...], List[Any]]
+) -> Tuple[str, Optional[str], bool]:
+    if isinstance(item, (tuple, list)):
+        text = str(item[0]) if len(item) > 0 else ""
+        mod = str(item[1]) if len(item) > 1 and item[1] is not None else None
+        ispkg = bool(item[2]) if len(item) > 2 else False
+        return text, mod, ispkg
+    return str(item), None, False
 
 
 def _collect_host_missing_imports(
     host_plan: _FilePatchPlan,
     helper_code: str,
     scope: Dict[str, Any],
-    source_texts: Sequence[Union[str, Tuple[str, Optional[str]]]] = (),
+    source_texts: Sequence[Union[str, Tuple[Any, ...]]] = (),
 ) -> List[str]:
     """Computes all required imports for a host plan receiving extracted helper_code.
 
@@ -927,19 +984,13 @@ def _collect_host_missing_imports(
 
     # 0. Future annotations for newly synthesized modules or PEP 604 annotations
     raw_sources = [
-        item[0] if isinstance(item, tuple) else item
-        for item in source_texts
-        if (item[0] if isinstance(item, tuple) else item)
+        _unpack_source_item(s)[0]
+        for s in source_texts
+        if _unpack_source_item(s)[0]
     ]
-    needs_future = False
-    if host_plan.is_new_file:
-        needs_future = any(_has_future_annotations(s) for s in raw_sources) or (
-            _helper_requires_future_annotations(helper_code)
-        )
-    elif _helper_requires_future_annotations(helper_code) and not _has_future_annotations(
-        host_content
-    ):
-        needs_future = True
+    needs_future = any(_has_future_annotations(s) for s in raw_sources) or (
+        _helper_requires_future_annotations(helper_code)
+    )
 
     if needs_future and "from __future__ import annotations" not in host_content:
         missing.append("from __future__ import annotations")
@@ -962,17 +1013,23 @@ def _collect_host_missing_imports(
                 imp_node = loc_tree.body[0]
                 if (getattr(imp_node, "level", 0) or 0) > 0:
                     origin_mod = None
+                    origin_ispkg = False
                     for item in source_texts:
-                        s_text, s_mod = item if isinstance(item, tuple) else (item, None)
+                        s_text, s_mod, s_ispkg = _unpack_source_item(item)
                         if s_text and s_loc in s_text and s_mod:
                             origin_mod = s_mod
+                            origin_ispkg = s_ispkg
                             break
                     if not origin_mod and source_texts:
-                        first = source_texts[0]
-                        origin_mod = first[1] if isinstance(first, tuple) else None
+                        _, first_mod, first_ispkg = _unpack_source_item(source_texts[0])
+                        origin_mod = first_mod
+                        origin_ispkg = first_ispkg
                     if origin_mod:
                         target_mod = _resolve_relative_import_path(
-                            origin_mod, imp_node.level, imp_node.module
+                            origin_mod,
+                            imp_node.level,
+                            imp_node.module,
+                            is_package=origin_ispkg,
                         )
                         if target_mod:
                             names_str = ", ".join(
@@ -1020,13 +1077,12 @@ def _collect_host_missing_imports(
                     loaded_in_helper.add(node.id)
 
         for item in source_texts:
-            if isinstance(item, tuple):
-                src_text, src_mod = item
-            else:
-                src_text, src_mod = item, None
+            src_text, src_mod, src_ispkg = _unpack_source_item(item)
             if not src_text:
                 continue
-            src_imports = _extract_module_import_statements(src_text, source_mod=src_mod)
+            src_imports = _extract_module_import_statements(
+                src_text, source_mod=src_mod, is_package=src_ispkg
+            )
             for loaded_name in sorted(loaded_in_helper):
                 if (
                     loaded_name not in defined_in_helper
@@ -1036,8 +1092,7 @@ def _collect_host_missing_imports(
                 ):
                     stmt = src_imports[loaded_name]
                     if (
-                        not stmt.startswith("from typing ")
-                        and stmt not in missing
+                        stmt not in missing
                         and stmt not in host_content
                         and stmt not in host_plan.missing_imports
                     ):
@@ -1080,7 +1135,7 @@ def generate_refactoring_patch(
     if not clones:
         return ""
 
-    root = Path(repo_root or os.getcwd())
+    root = Path(repo_root or os.getcwd()).resolve()
     graph_holder: List[Optional[ModuleDependencyGraph]] = [depgraph]
 
     def _get_depgraph() -> ModuleDependencyGraph:
@@ -1105,13 +1160,12 @@ def generate_refactoring_patch(
         f1_raw = normalize_path_string(str(u1.get("file") or ""), strip_anchor=True)
         if not f1_raw:
             continue
-        p = Path(f1_raw)
-        f1_path = p if p.is_file() or p.is_absolute() else (root / p)
+        f1_path = _resolve_repo_relative_path(f1_raw, root)
         if not f1_path.is_file():
             continue
 
         try:
-            rel_f1 = str(f1_path.resolve().relative_to(root.resolve())).replace("\\", "/")
+            rel_f1 = str(f1_path.relative_to(root)).replace("\\", "/")
         except ValueError:
             rel_f1 = str(f1_path.name)
 
@@ -1140,11 +1194,10 @@ def generate_refactoring_patch(
             enc2 = find_enclosing_class(orig_text, u2)
             fn2 = find_enclosing_function(orig_text, u2)
         elif f2_raw:
-            p2 = Path(f2_raw)
-            f2_path = p2 if p2.is_file() or p2.is_absolute() else (root / p2)
+            f2_path = _resolve_repo_relative_path(f2_raw, root)
             if f2_path.is_file():
                 try:
-                    rel_f2 = str(f2_path.resolve().relative_to(root.resolve())).replace("\\", "/")
+                    rel_f2 = str(f2_path.relative_to(root)).replace("\\", "/")
                 except ValueError:
                     rel_f2 = str(f2_path.name)
                 f2_plan = file_plans.get(f2_path)
@@ -1474,7 +1527,7 @@ def generate_refactoring_patch(
                 host_plan=f1_plan,
                 helper_code=helper_code,
                 scope=scope,
-                source_texts=[(orig_text, mod1)],
+                source_texts=[(orig_text, mod1, f1_path.name == "__init__.py")],
             )
             _attach_helper_to_plan(
                 f1_plan,
@@ -1538,15 +1591,17 @@ def generate_refactoring_patch(
 
                 mod1 = _derive_module_import_path(f1_path, root)
                 mod2 = _derive_module_import_path(f2_plan.path, root)
+                is_pkg1 = f1_path.name == "__init__.py"
+                is_pkg2 = f2_plan.path.name == "__init__.py"
                 helper_code = _canonicalize_helper_relative_imports(
-                    helper_code, [mod1, mod2]
+                    helper_code, [(mod1, is_pkg1), (mod2, is_pkg2)]
                 )
                 host_plan.module_helpers.append(helper_code)
                 host_imports = _collect_host_missing_imports(
                     host_plan=host_plan,
                     helper_code=helper_code,
                     scope=scope,
-                    source_texts=[(orig_text, mod1), (f2_plan.orig_text, mod2)],
+                    source_texts=[(orig_text, mod1, is_pkg1), (f2_plan.orig_text, mod2, is_pkg2)],
                 )
                 host_plan.missing_imports.extend(host_imports)
                 host_plan.used_helper_names.add(helper_name)
@@ -1636,8 +1691,10 @@ def generate_refactoring_patch(
             else:
                 mod1 = _derive_module_import_path(f1_path, root)
                 mod2 = _derive_module_import_path(f2_plan.path, root)
+                is_pkg1 = f1_path.name == "__init__.py"
+                is_pkg2 = f2_plan.path.name == "__init__.py"
                 helper_code = _canonicalize_helper_relative_imports(
-                    helper_code, [mod1, mod2]
+                    helper_code, [(mod1, is_pkg1), (mod2, is_pkg2)]
                 )
                 dg = _get_depgraph()
 
@@ -1645,7 +1702,7 @@ def generate_refactoring_patch(
                     host_plan=f1_plan,
                     helper_code=helper_code,
                     scope=scope,
-                    source_texts=[(orig_text, mod1), (f2_plan.orig_text, mod2)],
+                    source_texts=[(orig_text, mod1, is_pkg1), (f2_plan.orig_text, mod2, is_pkg2)],
                 )
                 if mod1 and host_imports:
                     _register_plan_dependencies_in_graph(
@@ -1717,7 +1774,7 @@ def generate_refactoring_patch(
                 host_plan=f1_plan,
                 helper_code=helper_code,
                 scope=scope,
-                source_texts=[(orig_text, mod1)],
+                source_texts=[(orig_text, mod1, f1_path.name == "__init__.py")],
             )
             _finalize_host_unit_and_helper(
                 plan=f1_plan,
