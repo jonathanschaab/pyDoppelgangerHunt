@@ -202,7 +202,13 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
                 fps.add(ns_sfp)
 
             if "pure_structural_fingerprint" in item and item["pure_structural_fingerprint"]:
-                fps.add(item["pure_structural_fingerprint"])
+                pure_sfp = str(item["pure_structural_fingerprint"])
+                fps.add(pure_sfp)
+                if ("hash_a" not in rec or "hash_b" not in rec) and " <===> " in pure_sfp:
+                    h_parts = pure_sfp.split(" <===> ")
+                    if len(h_parts) == 2:
+                        rec.setdefault("hash_a", h_parts[0])
+                        rec.setdefault("hash_b", h_parts[1])
             elif "hash_a" in item and "hash_b" in item and item["hash_a"] and item["hash_b"]:
                 pure_sfp = _format_paired_endpoints(str(item["hash_a"]), str(item["hash_b"]))
                 rec["pure_structural_fingerprint"] = pure_sfp
@@ -527,6 +533,9 @@ def prune_baseline(
                 item["fingerprint"] = clone_pair_fingerprint(u1, u2)
                 item["structural_fingerprint"] = clone_pair_structural_fingerprint(u1, u2)
                 item["namespaced_structural_fingerprint"] = namespaced_structural_fingerprint(u1, u2)
+                item["pure_structural_fingerprint"] = pure_structural_fingerprint(u1, u2)
+                item["hash_a"] = compute_unit_structural_hash(u1)
+                item["hash_b"] = compute_unit_structural_hash(u2)
             retained.append(item)
         else:
             f_a = str(item.get("file_a") or "")

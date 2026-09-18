@@ -797,8 +797,8 @@ def scan_target(
     elif sort_by == "sloc":
         clones.sort(
             key=lambda x: (
-                (int(x[1].get("end") or int(x[1].get("start") or 1)) - int(x[1].get("start") or 1) + 1)
-                + (int(x[2].get("end") or int(x[2].get("start") or 1)) - int(x[2].get("start") or 1) + 1)
+                max(0, int(x[1].get("end") or int(x[1].get("start") or 1)) - int(x[1].get("start") or 1) + 1)
+                + max(0, int(x[2].get("end") or int(x[2].get("start") or 1)) - int(x[2].get("start") or 1) + 1)
             ),
             reverse=True,
         )
@@ -821,6 +821,6 @@ def compute_priority_score(
     e1 = int(u1.get("end") or s1)
     s2 = int(u2.get("start") or 1)
     e2 = int(u2.get("end") or s2)
-    avg_sloc = ((e1 - s1 + 1) + (e2 - s2 + 1)) / 2.0
-    max_comp = max(int(u1.get("complexity") or 1), int(u2.get("complexity") or 1))
+    avg_sloc = (max(0, e1 - s1 + 1) + max(0, e2 - s2 + 1)) / 2.0
+    max_comp = max(1, int(u1.get("complexity") or 1), int(u2.get("complexity") or 1))
     return float(round(sim * avg_sloc * max_comp, 1))

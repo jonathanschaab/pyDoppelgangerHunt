@@ -487,6 +487,21 @@ class _ScopeVisitor(ast.NodeVisitor):
                     self.yield_expr_names.append((kind, node.value.id))
                 elif isinstance(node.value, ast.Constant) and node.value.value is not None:
                     self.yield_expr_names.append((kind, f":literal:{type(node.value.value).__name__}"))
+                elif (
+                    kind == "yield_from"
+                    and isinstance(node.value, (ast.List, ast.Tuple, ast.Set))
+                    and node.value.elts
+                ):
+                    first_elt = node.value.elts[0]
+                    if isinstance(first_elt, ast.Constant) and first_elt.value is not None:
+                        t_name = type(first_elt.value).__name__
+                        if all(
+                            isinstance(e, ast.Constant)
+                            and e.value is not None
+                            and type(e.value).__name__ == t_name
+                            for e in node.value.elts
+                        ):
+                            self.yield_expr_names.append((kind, f":literal:{t_name}"))
 
     def visit_Yield(self, node: ast.Yield) -> None:
         self._record_yield_expr("yield", node)
@@ -1245,7 +1260,7 @@ def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]
     e_col = unit.get("end_col")
     res = list(lines)
     if len(res) == 1:
-        res[0] = res[0][s_col:e_col]
+        res[0] = res[0][s_col:e_col] if (e_col is None or e_col > s_col) else res[0][s_col:]
     else:
         res[0] = res[0][s_col:]
         if e_col is not None:
@@ -1676,6 +1691,11 @@ def _get_module_imported_names(source: str) -> Set[str]:
         elif isinstance(stmt, ast.ImportFrom):
             for alias in stmt.names:
                 imported.add(alias.asname or alias.name)
+        elif isinstance(stmt, (ast.If, ast.Try, getattr(ast, "TryStar", ast.Try))):
+            for sub in ast.walk(stmt):
+                if isinstance(sub, (ast.Import, ast.ImportFrom)):
+                    for alias in sub.names:
+                        imported.add(alias.asname or alias.name)
     return imported
 
 
@@ -2363,9 +2383,15 @@ def _infer_helper_return_type(
                 inferred_yield_type = m_t
                 break
             if kind == "yield_from":
-                for prefix in ("Iterator[", "Iterable[", "List[", "Sequence[", "Set["):
+                for prefix in (
+                    "Iterator[", "Iterable[", "List[", "Sequence[", "Set[", "Tuple[", "Collection[",
+                    "list[", "set[", "tuple[", "sequence[", "iterable[", "iterator[",
+                ):
                     if m_t.startswith(prefix) and m_t.endswith("]"):
-                        inferred_yield_type = m_t[len(prefix) : -1].strip()
+                        inner = m_t[len(prefix) : -1].strip()
+                        if "," in inner:
+                            inner = inner.split(",")[0].strip()
+                        inferred_yield_type = inner
                         break
                 if inferred_yield_type:
                     break

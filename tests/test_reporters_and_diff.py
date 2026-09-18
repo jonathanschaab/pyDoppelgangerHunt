@@ -9008,3 +9008,177 @@ def test_is_docstring_node_and_extract_docstring_end_line() -> None:
     fn_tree = ast.parse("def f():\n    '''Function docstring.'''\n    return 10\n")
     assert _extract_docstring_end_line(fn_tree.body[0]) == 2
 
+
+def test_batch_82_generator_container_literal_and_pep585_return_type_inference(tmp_path: Path) -> None:
+    """Verifies that container literals and PEP 585 lowercase types in yield from are properly inferred."""
+    from pydoppelgangerhunt.fixer import (  # pylint: disable=import-outside-toplevel
+        _infer_helper_return_type,
+        synthesize_shared_helper_code,
+    )
+
+    # 1. PEP 585 lowercase list[int] and tuple[str, ...]
+    assert _infer_helper_return_type(
+        "Any", [], set(),
+        scope={"has_yield": True, "yield_expr_names": [("yield_from", "items")]},
+        meta1={"items": {"type": "list[int]"}},
+        meta2={},
+    ) == "Iterator[int]"
+
+    assert _infer_helper_return_type(
+        "Any", [], set(),
+        scope={"has_yield": True, "yield_expr_names": [("yield_from", "items")]},
+        meta1={"items": {"type": "tuple[str, ...]"}},
+        meta2={},
+    ) == "Iterator[str]"
+
+    assert _infer_helper_return_type(
+        "Any", [], set(),
+        scope={"has_yield": True, "yield_expr_names": [("yield_from", "items")]},
+        meta1={"items": {"type": "set[float]"}},
+        meta2={},
+        is_async=True,
+    ) == "AsyncIterator[float]"
+
+    # 2. Container literal in code unit: yield from ["hello", "world"]
+    c1 = (
+        "def str_producer():\n"
+        "    yield from ['apple', 'banana', 'cherry']\n"
+    )
+    c2 = (
+        "def str_producer2():\n"
+        "    yield from ['apple', 'banana', 'cherry']\n"
+    )
+    f1 = tmp_path / "str1.py"
+    f2 = tmp_path / "str2.py"
+    f1.write_text(c1, encoding="utf-8")
+    f2.write_text(c2, encoding="utf-8")
+    u1 = {"file": "str1.py", "start": 1, "end": 2, "name": "str_producer", "kind": "function"}
+    u2 = {"file": "str2.py", "start": 1, "end": 2, "name": "str_producer2", "kind": "function"}
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "-> Iterator[str]:" in helper
+
+
+def test_batch_82_get_module_imported_names_guarded_imports() -> None:
+    """Verifies that _get_module_imported_names inspects top-level If and Try import blocks."""
+    from pydoppelgangerhunt.fixer import _get_module_imported_names  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "import sys\n"
+        "from os import path\n"
+        "if TYPE_CHECKING:\n"
+        "    from typing import Optional, List\n"
+        "try:\n"
+        "    from collections.abc import Sequence\n"
+        "except ImportError:\n"
+        "    from typing import Sequence\n"
+    )
+    imported = _get_module_imported_names(code)
+    assert "sys" in imported
+    assert "path" in imported
+    assert "Optional" in imported
+    assert "List" in imported
+    assert "Sequence" in imported
+
+
+def test_batch_82_slice_unit_token_lines_single_line_bounds() -> None:
+    """Verifies defensive single-line column bounds check in _slice_unit_token_lines."""
+    from pydoppelgangerhunt.fixer import _slice_unit_token_lines  # pylint: disable=import-outside-toplevel
+
+    line = ["    total = sum(x for x in data)"]
+    # Normal column slice
+    res_normal = _slice_unit_token_lines(
+        {"kind": "comprehension", "start_col": 12, "end_col": 32},
+        list(line),
+    )
+    assert res_normal == ["sum(x for x in data)"]
+
+    # Inverted column bounds (e_col <= s_col) must not collapse the line to empty
+    res_inverted = _slice_unit_token_lines(
+        {"kind": "comprehension", "start_col": 12, "end_col": 5},
+        list(line),
+    )
+    assert res_inverted == ["sum(x for x in data)"]
+
+
+def test_batch_82_baseline_hash_unpacking_and_prune_synchronization(tmp_path: Path) -> None:
+    """Verifies that load_baseline unpacks pure structural hashes and prune_baseline synchronizes self-healed records."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        load_baseline,
+        prune_baseline,
+    )
+
+    # 1. Baseline file with pure_structural_fingerprint but missing explicit hash_a and hash_b
+    b_file = tmp_path / "baseline_legacy.json"
+    b_file.write_text(
+        json.dumps({
+            "version": "1.2.0",
+            "fingerprints": [
+                {
+                    "fingerprint": "a.py:f1 <===> b.py:f2",
+                    "pure_structural_fingerprint": "1111222233334444 <===> 5555666677778888",
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+    loaded = load_baseline(str(b_file))
+    rec = loaded.records[0]
+    assert rec["hash_a"] == "1111222233334444"
+    assert rec["hash_b"] == "5555666677778888"
+
+    # 2. Self-healing in prune_baseline synchronizes pure_structural_fingerprint, hash_a, and hash_b
+    from pydoppelgangerhunt.baseline import clone_pair_structural_fingerprint  # pylint: disable=import-outside-toplevel
+
+    u1 = {"file": "mod1.py", "name": "f1_renamed", "tokens": ["x", "+", "1"]}
+    u2 = {"file": "mod2.py", "name": "f2_renamed", "tokens": ["y", "+", "2"]}
+    sfp_orig = clone_pair_structural_fingerprint(u1, u2)
+    b_file2 = tmp_path / "baseline_healing.json"
+    b_file2.write_text(
+        json.dumps({
+            "version": "1.2.0",
+            "fingerprints": [
+                {
+                    "fingerprint": "old1.py:f1 <===> old2.py:f2",
+                    "structural_fingerprint": sfp_orig,
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+    active_clones = [(1.0, u1, u2)]
+
+    res = prune_baseline(str(b_file2), active_clones, unstaged_modified_ranges={})
+    assert res.retained_count == 1
+    updated_data = json.loads(b_file2.read_text(encoding="utf-8"))
+    updated_rec = updated_data["fingerprints"][0]
+    assert updated_rec["file_a"] == "mod1.py"
+    assert "pure_structural_fingerprint" in updated_rec
+    assert "hash_a" in updated_rec
+    assert "hash_b" in updated_rec
+
+
+def test_batch_82_matcher_sloc_and_priority_score_bounds() -> None:
+    """Verifies that compute_priority_score and SLOC sorting handle inverted or synthetic line bounds defensively."""
+    from pydoppelgangerhunt.matcher import compute_priority_score  # pylint: disable=import-outside-toplevel
+
+    u1 = {"start": 20, "end": 10, "complexity": -5, "token_count": 50, "name": "bad1", "file": "f1.py"}
+    u2 = {"start": 30, "end": 15, "complexity": 0, "token_count": 50, "name": "bad2", "file": "f2.py"}
+    score = compute_priority_score(0.9, u1, u2)
+    assert score == 0.0
+
+    clone_pairs: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = [
+        (0.9, u1, u2),
+        (0.8, {"start": 1, "end": 5}, {"start": 1, "end": 5}),
+    ]
+    clone_pairs.sort(
+        key=lambda x: (
+            max(0, int(x[1].get("end") or int(x[1].get("start") or 1)) - int(x[1].get("start") or 1) + 1)
+            + max(0, int(x[2].get("end") or int(x[2].get("start") or 1)) - int(x[2].get("start") or 1) + 1)
+        ),
+        reverse=True,
+    )
+    assert len(clone_pairs) == 2
+
+
+
