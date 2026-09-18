@@ -1437,7 +1437,10 @@ def analyze_unit_variable_scope(
     if u2 is not None:
         info2 = _inspect_unit_scope(u2, repo_root=repo_root)
         common_inputs = [var for var in info1["inputs"] if var in info2["inputs"]]
-        inputs = common_inputs if common_inputs else info1["inputs"]
+        if len(info1["inputs"]) == len(info2["inputs"]):
+            inputs = common_inputs if len(common_inputs) == len(info1["inputs"]) else info1["inputs"]
+        else:
+            inputs = common_inputs if common_inputs else info1["inputs"]
         common_outputs = [var for var in info1["outputs"] if var in info2["outputs"]]
         if len(info1["outputs"]) == len(info2["outputs"]):
             outputs = common_outputs if len(common_outputs) == len(info1["outputs"]) else info1["outputs"]
@@ -1642,7 +1645,13 @@ def _insert_imports_into_module(
         return orig_lines
 
     existing_stripped = {ln.strip() for ln in orig_lines}
-    deduped_imports = [imp for imp in import_lines if imp.strip() not in existing_stripped]
+    seen: Set[str] = set()
+    deduped_imports: List[str] = []
+    for imp in import_lines:
+        s = imp.strip()
+        if s not in existing_stripped and s not in seen:
+            seen.add(s)
+            deduped_imports.append(imp)
     if not deduped_imports:
         return orig_lines
 
@@ -2191,6 +2200,7 @@ def _format_helper_parameters(
     is_static_clone: bool,
     is_class_receiver: bool,
     type_merge_strategy: str,
+    inputs2: Optional[Sequence[str]] = None,
 ) -> List[str]:
     """Formats helper function parameters with type annotations and default values."""
     params: List[str] = []
@@ -2198,9 +2208,11 @@ def _format_helper_parameters(
 
     # Extract parameter descriptors
     descriptors: List[Dict[str, Any]] = []
-    for var in inputs:
+    for idx, var in enumerate(inputs):
         m1 = meta1.get(var, {})
         m2 = meta2.get(var, {})
+        if not m2 and inputs2 and idx < len(inputs2):
+            m2 = meta2.get(inputs2[idx], {})
 
         t1 = m1.get("type")
         t2 = m2.get("type")
@@ -2297,6 +2309,7 @@ def _infer_helper_return_type(
     type_merge_strategy: str = "fallback_any",
     is_async: bool = False,
     unit_kind: Optional[str] = None,
+    outputs2: Optional[List[str]] = None,
 ) -> str:
     """Infers the return type annotation for a synthesized shared helper function."""
     if scope.get("has_yield"):
@@ -2325,9 +2338,12 @@ def _infer_helper_return_type(
 
     if len(helper_outputs) >= 2:
         out_types: List[str] = []
-        for out_var in helper_outputs:
+        for idx, out_var in enumerate(helper_outputs):
             t1 = meta1.get(out_var, {}).get("type")
-            t2 = meta2.get(out_var, {}).get("type")
+            m2 = meta2.get(out_var, {})
+            if not m2 and outputs2 and idx < len(outputs2):
+                m2 = meta2.get(outputs2[idx], {})
+            t2 = m2.get("type")
             t_merged = _merge_types(t1, t2, type_merge_strategy)
             if out_var in conditional_outs:
                 if not t_merged.startswith("Optional[") and "None" not in t_merged:
@@ -2338,7 +2354,10 @@ def _infer_helper_return_type(
     if len(helper_outputs) == 1:
         out_var = helper_outputs[0]
         t1 = meta1.get(out_var, {}).get("type")
-        t2 = meta2.get(out_var, {}).get("type")
+        m2 = meta2.get(out_var, {})
+        if not m2 and outputs2 and len(outputs2) >= 1:
+            m2 = meta2.get(outputs2[0], {})
+        t2 = m2.get("type")
         out_t = _merge_types(t1, t2, type_merge_strategy)
         if out_var in conditional_outs:
             if not out_t.startswith("Optional[") and "None" not in out_t:
@@ -2582,6 +2601,10 @@ def synthesize_shared_helper_code(
     if effective_binding == "method" and not indent:
         indent = "    "
 
+    inputs2 = list(scope2.get("inputs", []))
+    if effective_binding == "module":
+        inputs2 = _prune_unshared_receivers(inputs2, u2, u1, scope2, scope1, repo_root=repo_root)
+
     meta1 = {p["name"].lstrip("*"): p for p in scope1.get("param_details", [])}
     meta2 = {p["name"].lstrip("*"): p for p in scope2.get("param_details", [])}
 
@@ -2593,6 +2616,7 @@ def synthesize_shared_helper_code(
         is_static_clone=is_static_clone,
         is_class_receiver=is_class_receiver,
         type_merge_strategy=type_merge_strategy,
+        inputs2=inputs2 if len(inputs2) == len(inputs) else None,
     )
 
     r1 = scope1.get("return_type")
@@ -2612,6 +2636,12 @@ def synthesize_shared_helper_code(
         and v not in scope.get("nonlocals", [])
     ]
 
+    u2_outs = [
+        v for v in scope2.get("outputs", [])
+        if v not in scope2.get("globals", [])
+        and v not in scope2.get("nonlocals", [])
+    ]
+
     return_type = _infer_helper_return_type(
         resolved_ret,
         helper_outputs,
@@ -2622,6 +2652,7 @@ def synthesize_shared_helper_code(
         type_merge_strategy=type_merge_strategy,
         is_async=is_async,
         unit_kind=u1.get("kind"),
+        outputs2=u2_outs if len(u2_outs) == len(helper_outputs) else None,
     )
 
     params_str = ", ".join(params) if params else "*args: Any, **kwargs: Any"
@@ -3277,16 +3308,18 @@ def _build_unit_delegation_call(
     return f"{indent}{prefix}{call_expr}\n"
 
 
-def _derive_module_import_path(file_path: Path, repo_root: Path) -> str:
+def _derive_module_import_path(file_path: Union[Path, str], repo_root: Union[Path, str]) -> str:
     """Derives the importable Python module dot-path for a file relative to repository root.
 
     Handles flat layouts (foo.py -> foo), package layouts (pkg/mod.py -> pkg.mod),
     PEP 517/518 src layouts (src/pkg/mod.py -> pkg.mod), and __init__.py files (pkg/__init__.py -> pkg).
     """
+    p_file = Path(file_path)
+    p_root = Path(repo_root)
     try:
-        rel = file_path.resolve().relative_to(repo_root.resolve())
+        rel = p_file.resolve().relative_to(p_root.resolve())
     except ValueError:
-        rel = file_path
+        rel = p_file
     parts = list(rel.parts)
     if parts and parts[0] == "src":
         parts = parts[1:]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
+import subprocess
 import sys
 from typing import Any, Dict, List, Tuple
 from unittest import mock
@@ -8569,5 +8570,124 @@ def test_init_colon_notation_no_return_delegation(tmp_path: Path) -> None:
     assert patch != ""
     assert "return _shared" not in patch
     assert "_shared_ConfigRecord_DataRecord(self, key)" in patch
+
+
+def test_partially_overlapping_inputs_preserves_full_signature(tmp_path: Path) -> None:
+    """Verifies that Type-2 clone pairs with partially overlapping parameter names preserve all inputs."""
+    code1 = (
+        "def compute_delta(x: int, y: int, timeout: float = 1.0) -> int:\n"
+        "    return x * 2 + y\n"
+    )
+    code2 = (
+        "def compute_delta_v2(a: int, b: int, timeout: float = 1.0) -> int:\n"
+        "    return a * 2 + b\n"
+    )
+    f1 = tmp_path / "calc1.py"
+    f2 = tmp_path / "calc2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+
+    u1 = {"file": "calc1.py", "start": 1, "end": 2, "name": "compute_delta", "kind": "function"}
+    u2 = {"file": "calc2.py", "start": 1, "end": 2, "name": "compute_delta_v2", "kind": "function"}
+
+    scope = analyze_unit_variable_scope(u1, u2, repo_root=str(tmp_path))
+    assert scope["inputs"] == ["x", "y", "timeout"]
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "def _shared_compute_delta_compute_delta_v2(x: int, y: int, timeout: float = 1.0) -> int:" in helper
+    assert "return x * 2 + y" in helper
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert "return _shared_compute_delta_compute_delta_v2(x, y, timeout)" in patch
+    assert "return _shared_compute_delta_compute_delta_v2(a, b, timeout)" in patch
+
+
+def test_partially_overlapping_inputs_subprocess_execution(tmp_path: Path) -> None:
+    """Verifies runtime correctness of refactored Type-2 clones with partially overlapping parameters."""
+    code1 = (
+        "def eval_math(x: int, y: int, timeout: float = 1.0) -> int:\n"
+        "    return x * 2 + y\n"
+    )
+    code2 = (
+        "def eval_math_alt(a: int, b: int, timeout: float = 1.0) -> int:\n"
+        "    return a * 2 + b\n"
+    )
+    f1 = tmp_path / "math1.py"
+    f2 = tmp_path / "math2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+
+    u1 = {"file": "math1.py", "start": 1, "end": 2, "name": "eval_math", "kind": "function"}
+    u2 = {"file": "math2.py", "start": 1, "end": 2, "name": "eval_math_alt", "kind": "function"}
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch != ""
+
+    patch_file = tmp_path / "refactor.patch"
+    patch_file.write_text(patch, encoding="utf-8")
+
+    subprocess.run(
+        ["git", "apply", "--whitespace=nowarn", str(patch_file)],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    runner_code = (
+        "from math1 import eval_math\n"
+        "from math2 import eval_math_alt\n"
+        "r1 = eval_math(3, 4)\n"
+        "r2 = eval_math_alt(5, 6)\n"
+        "assert r1 == 10, f'Expected 10, got {r1}'\n"
+        "assert r2 == 16, f'Expected 16, got {r2}'\n"
+        "print('PARTIAL_INPUTS_SUCCESS')\n"
+    )
+    runner_file = tmp_path / "run_test.py"
+    runner_file.write_text(runner_code, encoding="utf-8")
+
+    res = subprocess.run(
+        [sys.executable, str(runner_file)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 0, f"Execution failed:\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}"
+    assert "PARTIAL_INPUTS_SUCCESS" in res.stdout
+
+
+def test_type_merge_positional_alignment_renamed_parameters(tmp_path: Path) -> None:
+    """Verifies that type annotations merge positionally across renamed parameter names in Type-2 clones."""
+    code1 = (
+        "def process_val(x: int, y: int, timeout: float = 1.0) -> int:\n"
+        "    return x * 2 + y\n"
+    )
+    code2 = (
+        "def process_val_v2(a: str, b: int, timeout: float = 1.0) -> int:\n"
+        "    return a * 2 + b\n"
+    )
+    f1 = tmp_path / "proc1.py"
+    f2 = tmp_path / "proc2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+
+    u1 = {"file": "proc1.py", "start": 1, "end": 2, "name": "process_val", "kind": "function"}
+    u2 = {"file": "proc2.py", "start": 1, "end": 2, "name": "process_val_v2", "kind": "function"}
+
+    helper = synthesize_shared_helper_code(
+        u1, u2, repo_root=str(tmp_path), type_merge_strategy="union"
+    )
+    assert "def _shared_process_val_process_val_v2(x: Union[int, str], y: int, timeout: float = 1.0) -> int:" in helper
+
+
+def test_insert_imports_into_module_deduplicates_within_import_lines() -> None:
+    """Verifies that _insert_imports_into_module eliminates duplicate imports present in import_lines."""
+    from pydoppelgangerhunt.fixer import _insert_imports_into_module  # pylint: disable=import-outside-toplevel
+
+    orig = ["def foo(): pass\n"]
+    imports = ["from typing import Any", "from typing import Any", "from typing import Tuple"]
+    res = _insert_imports_into_module(orig, imports)
+    assert res.count("from typing import Any\n") == 1
+    assert res.count("from typing import Tuple\n") == 1
+
 
 
