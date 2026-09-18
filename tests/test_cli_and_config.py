@@ -1355,3 +1355,12 @@ def test_load_toml_section_non_mapping_resilience(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert not load_toml_section(cfg, "pydoppelgangerhunt")
+
+
+def test_parse_toml_array_value_escaped_quotes_and_commas() -> None:
+    """Verifies that _parse_toml_array_value handles escaped quotes containing commas inside string elements."""
+    from pydoppelgangerhunt.config import _parse_toml_array_value  # pylint: disable=import-outside-toplevel
+
+    raw = '["hello \\"world\\", here", "item2", \'another \\\'escaped\\\', comma\']'
+    parsed = _parse_toml_array_value(raw)
+    assert parsed == ['hello "world", here', 'item2', "another 'escaped', comma"]

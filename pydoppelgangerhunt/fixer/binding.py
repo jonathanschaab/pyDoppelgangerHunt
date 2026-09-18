@@ -287,6 +287,7 @@ def _populate_unit_receiver_metadata(
         "receiver_kind" in unit
         and "enclosing_class" in unit
         and "enclosing_class_start" in unit
+        and "receiver_param" in unit
     ):
         return
     f_raw = normalize_path_string(str(unit.get("file") or ""), strip_anchor=True)
@@ -305,16 +306,20 @@ def _populate_unit_receiver_metadata(
                 unit["enclosing_class"] = cls_meta["name"]
             if "enclosing_class_start" not in unit:
                 unit["enclosing_class_start"] = cls_meta["start"]
+        is_method = _is_method_of_class(fn_meta, cls_meta)
         if "receiver_kind" not in unit:
-            if _is_method_of_class(fn_meta, cls_meta):
+            if is_method:
                 rec_k = _get_enclosing_receiver_kind(fn_meta)
                 unit["receiver_kind"] = rec_k
                 if rec_k == "static":
                     unit["is_static"] = True
             else:
                 unit["receiver_kind"] = None
-        if fn_meta and "receiver_param" in fn_meta and "receiver_param" not in unit:
-            unit["receiver_param"] = fn_meta["receiver_param"]
+        if "receiver_param" not in unit:
+            if is_method and unit.get("receiver_kind") in ("instance", "class"):
+                unit["receiver_param"] = fn_meta.get("receiver_param") if fn_meta else None
+            else:
+                unit["receiver_param"] = None
     except (OSError, UnicodeDecodeError):
         pass
 

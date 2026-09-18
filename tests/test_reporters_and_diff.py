@@ -9350,3 +9350,40 @@ def test_batch_83_comprehension_in_method_argument_annotation(tmp_path: Path) ->
     assert len(comp_units) == 2
     for comp in comp_units:
         assert comp.get("enclosing_class") == "Handler"
+
+
+def test_batch_83_populate_receiver_param_when_kind_present(tmp_path: Path) -> None:
+    """Verifies that _populate_unit_receiver_metadata populates receiver_param even if receiver_kind was already present."""
+    from pydoppelgangerhunt.fixer.binding import _populate_unit_receiver_metadata  # pylint: disable=import-outside-toplevel
+
+    f = tmp_path / "mod.py"
+    f.write_text(
+        "class Worker:\n"
+        "    def run(this, val: int) -> int:\n"
+        "        return val * 2\n",
+        encoding="utf-8",
+    )
+    unit = {
+        "file": str(f),
+        "start": 2,
+        "end": 3,
+        "enclosing_class": "Worker",
+        "enclosing_class_start": 1,
+        "receiver_kind": "instance",
+    }
+    _populate_unit_receiver_metadata(unit, repo_root=str(tmp_path))
+    assert unit.get("receiver_param") == "this"
+
+
+def test_batch_83_normalize_receiver_order_custom_receiver() -> None:
+    """Verifies that _normalize_receiver_order properly orders custom receiver names (e.g. this, klass)."""
+    from pydoppelgangerhunt.fixer.scope import _normalize_receiver_order  # pylint: disable=import-outside-toplevel
+
+    inputs_inst = ["x", "y", "this"]
+    _normalize_receiver_order(inputs_inst, has_instance_binding=True, has_class_binding=False, primary_receiver="this")
+    assert inputs_inst == ["this", "x", "y"]
+
+    inputs_cls = ["a", "b", "klass"]
+    _normalize_receiver_order(inputs_cls, has_instance_binding=False, has_class_binding=True, primary_receiver="klass")
+    assert inputs_cls == ["klass", "a", "b"]
+

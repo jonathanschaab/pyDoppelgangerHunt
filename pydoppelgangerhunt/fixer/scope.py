@@ -1056,23 +1056,21 @@ def _normalize_receiver_order(
     primary_receiver: Optional[str] = None,
 ) -> None:
     """Ensures self or cls is positioned as the primary receiver parameter in inputs."""
+    def _bring_to_front(name: str) -> None:
+        if name in inputs:
+            inputs.remove(name)
+            inputs.insert(0, name)
+
     if has_instance_binding and has_class_binding:
         first = primary_receiver or "self"
         second = "cls" if first == "self" else "self"
-        if second in inputs:
-            inputs.remove(second)
-            inputs.insert(0, second)
-        if first in inputs:
-            inputs.remove(first)
-            inputs.insert(0, first)
-    elif has_instance_binding:
-        if "self" in inputs:
-            inputs.remove("self")
-            inputs.insert(0, "self")
-    elif has_class_binding:
-        if "cls" in inputs:
-            inputs.remove("cls")
-            inputs.insert(0, "cls")
+        _bring_to_front(second)
+        _bring_to_front(first)
+    elif has_instance_binding or has_class_binding:
+        default_rec = "self" if has_instance_binding else "cls"
+        target = primary_receiver if (primary_receiver and primary_receiver in inputs) else default_rec
+        _bring_to_front(target)
+
 
 
 def _rank_param_kind(var_name: str, param_map: Dict[str, str]) -> int:
@@ -1231,7 +1229,7 @@ def _inspect_unit_scope(
     )
     binding_kind = _determine_binding_kind(has_instance_binding, has_class_binding)
 
-    primary_rec = "cls" if unit.get("receiver_kind") == "class" else None
+    primary_rec = unit.get("receiver_param") or ("cls" if unit.get("receiver_kind") == "class" else None)
     _normalize_receiver_order(inputs, has_instance_binding, has_class_binding, primary_receiver=primary_rec)
 
     # Definite and conditional assignment analysis across candidate statements
@@ -1386,7 +1384,9 @@ def analyze_unit_variable_scope(
     )
     binding_kind = _determine_binding_kind(has_instance_binding, has_class_binding)
 
-    primary_rec = "cls" if (u1.get("receiver_kind") == "class" or (u2 and u2.get("receiver_kind") == "class")) else None
+    primary_rec = u1.get("receiver_param") or (u2.get("receiver_param") if u2 else None) or (
+        "cls" if (u1.get("receiver_kind") == "class" or (u2 and u2.get("receiver_kind") == "class")) else None
+    )
     _normalize_receiver_order(inputs, has_instance_binding, has_class_binding, primary_receiver=primary_rec)
 
     locals_ = [var for var in info1["stores"] if var not in inputs]

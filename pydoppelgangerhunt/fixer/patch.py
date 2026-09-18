@@ -738,6 +738,10 @@ def generate_refactoring_patch(
             and (fn1.get("receiver_param") or fn1.get("is_static"))
             and (fn2.get("receiver_param") or fn2.get("is_static"))
         )
+        if fn1 and "receiver_param" not in u1:
+            u1["receiver_param"] = fn1.get("receiver_param")
+        if fn2 and "receiver_param" not in u2:
+            u2["receiver_param"] = fn2.get("receiver_param")
         if fn1 and fn2:
             is_static = bool(fn1.get("is_static") and fn2.get("is_static"))
         else:
