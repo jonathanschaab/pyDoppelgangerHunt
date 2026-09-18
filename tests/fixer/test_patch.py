@@ -1845,3 +1845,70 @@ def test_generate_refactoring_patch_cross_module_auto_prevents_circular_import(t
     assert run_proc.returncode == 0
     assert run_proc.stdout.strip() == "12 12"
 
+
+def test_generate_refactoring_patch_cross_module_when_f2_is_already_shared_module(tmp_path: Path) -> None:
+    """Verifies consolidating when the second duplicate is already located in the shared module."""
+    pkg_dir = tmp_path / "shared_pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    src_worker = (
+        "def compute_task(x: int) -> int:\n"
+        "    r = x * 4 + 3\n"
+        "    return r\n"
+    )
+    src_common = (
+        "def helper_seed() -> int:\n"
+        "    return 1\n"
+        "\n"
+        "def compute_common(x: int) -> int:\n"
+        "    r = x * 4 + 3\n"
+        "    return r\n"
+    )
+    (pkg_dir / "worker.py").write_text(src_worker, encoding="utf-8")
+    (pkg_dir / "_common.py").write_text(src_common, encoding="utf-8")
+
+    u_worker = {"name": "compute_task", "file": "shared_pkg/worker.py", "start": 1, "end": 3, "kind": "function"}
+    u_common = {"name": "compute_common", "file": "shared_pkg/_common.py", "start": 4, "end": 6, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u_worker, u_common)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="auto",
+    )
+
+    # worker.py imports from shared_pkg._common
+    assert "--- a/shared_pkg/worker.py" in patch
+    assert "from shared_pkg._common import _shared_compute_task_compute_common" in patch
+    # _common.py defines the helper
+    assert "--- a/shared_pkg/_common.py" in patch
+    assert "def _shared_compute_task_compute_common" in patch
+
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    run_proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import shared_pkg.worker; import shared_pkg._common; "
+            "print(shared_pkg.worker.compute_task(7), shared_pkg._common.compute_common(7))",
+        ],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run_proc.returncode == 0
+    assert run_proc.stdout.strip() == "31 31"
+
+

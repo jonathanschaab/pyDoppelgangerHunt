@@ -181,22 +181,24 @@ def derive_shared_module_import(
 
 
 def _resolve_relative_import_path(
-    current_mod: str, level: int, module_name: Optional[str]
+    current_mod: str, level: int, module_name: Optional[str], is_package: bool = False
 ) -> str:
     """Resolves a relative import (level > 0) to a canonical module dot-path."""
     parts = current_mod.split(".") if current_mod else []
-    # If current_mod is empty, relative resolution is impossible
     if not parts:
         return module_name or ""
-    # In Python, from . import x inside pkg.mod means x is inside pkg (up 1 level).
-    # from .. import x means up 2 levels.
-    # So we strip 'level' elements from the end of parts if parts represent a module.
-    # Note: caller passes current_pkg or current_mod.
-    if level > len(parts):
+    pkg_parts = parts if is_package else parts[:-1]
+    if (level - 1) > len(pkg_parts):
         return module_name or ""
-    base_parts = parts[: len(parts) - level]
-    suffix = f".{module_name}" if module_name else ""
-    return ".".join(base_parts) + suffix if base_parts else (module_name or "")
+    target_base = (
+        pkg_parts[: len(pkg_parts) - (level - 1)]
+        if len(pkg_parts) >= (level - 1)
+        else []
+    )
+    base_str = ".".join(target_base)
+    if base_str and module_name:
+        return f"{base_str}.{module_name}"
+    return base_str or module_name or ""
 
 
 def _parse_source_imports(
@@ -217,18 +219,8 @@ def _parse_source_imports(
             level = getattr(node, "level", 0) or 0
             raw_mod = getattr(node, "module", None)
             if level > 0:
-                mod_parts = current_mod.split(".") if current_mod else []
-                pkg_parts = mod_parts if is_package else mod_parts[:-1]
-                target_base = (
-                    pkg_parts[: len(pkg_parts) - (level - 1)]
-                    if len(pkg_parts) >= (level - 1)
-                    else []
-                )
-                base_str = ".".join(target_base)
-                resolved = (
-                    f"{base_str}.{raw_mod}"
-                    if (base_str and raw_mod)
-                    else (base_str or raw_mod or "")
+                resolved = _resolve_relative_import_path(
+                    current_mod, level, raw_mod, is_package=is_package
                 )
                 if resolved:
                     imports.add(resolved)

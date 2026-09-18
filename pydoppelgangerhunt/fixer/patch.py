@@ -1110,34 +1110,11 @@ def generate_refactoring_patch(
                     rel_shared = str(shared_p.name)
 
                 if shared_p.resolve() == f1_path.resolve():
-                    f1_plan.module_helpers.append(helper_code)
-                    f1_plan.missing_imports.extend(missing_import_lines)
-                    f1_plan.comments.append(pair_comment)
-                    mod1 = _derive_module_import_path(f1_path, root)
-                    _wire_cross_module_host_delegation(
-                        f1_plan=f1_plan,
-                        f2_plan=f2_plan,
-                        u2=u2,
-                        mod1=mod1,
-                        helper_name=helper_name,
-                        pair_comment=pair_comment,
-                        f1_disp=f1_disp,
-                        f2_disp=f2_disp,
-                        replace_clones=replace_clones,
-                        inputs=inputs,
-                        outputs=outputs,
-                        scope=scope,
-                        t_inputs2=t_inputs2,
-                        target_outs2=target_outs2,
-                        await_prefix=await_prefix,
-                    )
+                    host_plan = f1_plan
+                    calling_plans = [f2_plan]
                 elif shared_p.resolve() == f2_plan.path.resolve():
-                    f2_plan.module_helpers.append(helper_code)
-                    f2_plan.missing_imports.extend(missing_import_lines)
-                    f2_plan.comments.append(pair_comment)
-                    mod2 = _derive_module_import_path(f2_plan.path, root)
-                    f1_plan.comments.append(pair_comment)
-                    f1_plan.missing_imports.append(f"from {mod2} import {helper_name}")
+                    host_plan = f2_plan
+                    calling_plans = [f1_plan]
                 else:
                     shared_plan = file_plans.get(shared_p)
                     if shared_plan is None:
@@ -1155,42 +1132,40 @@ def generate_refactoring_patch(
                             shared_plan = _get_plan(
                                 shared_p, rel_shared, "", is_new_file=True
                             )
+                    host_plan = shared_plan
+                    calling_plans = [f1_plan, f2_plan]
 
-                    shared_plan.module_helpers.append(helper_code)
-                    shared_plan.missing_imports.extend(missing_import_lines)
-                    shared_plan.used_helper_names.add(helper_name)
+                host_plan.module_helpers.append(helper_code)
+                host_plan.missing_imports.extend(missing_import_lines)
+                host_plan.used_helper_names.add(helper_name)
 
-                    mod_shared = _derive_module_import_path(shared_p, root)
-                    shared_imp = f"from {mod_shared} import {helper_name}"
+                mod_host = _derive_module_import_path(host_plan.path, root)
+                host_disp = normalize_path_string(str(host_plan.rel_path), strip_anchor=False)
 
-                    f1_plan.missing_imports.append(shared_imp)
-                    f1_plan.comments.append(pair_comment)
-
-                    f2_plan.missing_imports.append(shared_imp)
-                    f2_plan.comments.append(pair_comment)
-
-                    if replace_clones:
-                        _delegate_unit_in_plan(
-                            u2,
-                            f2_plan,
-                            helper_name=helper_name,
-                            inputs=inputs,
-                            outputs=outputs,
-                            scope=scope,
-                            target_inputs=t_inputs2,
-                            target_outputs=target_outs2,
-                            await_prefix=await_prefix,
-                            binding="module",
+                f2_plan.comments.append(pair_comment)
+                for c_plan in calling_plans:
+                    c_plan.comments.append(pair_comment)
+                    c_plan.missing_imports.append(f"from {mod_host} import {helper_name}")
+                    if not replace_clones:
+                        c_disp = normalize_path_string(str(c_plan.rel_path), strip_anchor=False)
+                        c_plan.comments.append(
+                            f"# Note: Cross-module clone pair; helper extracted to {host_disp}. "
+                            f"Complete refactoring by importing the helper into {c_disp}.\n"
                         )
-                    else:
-                        f1_plan.comments.append(
-                            f"# Note: Cross-module clone pair; helper extracted to {rel_shared}. "
-                            f"Complete refactoring by importing the helper into {f1_disp}.\n"
-                        )
-                        f2_plan.comments.append(
-                            f"# Note: Cross-module clone pair; helper extracted to {rel_shared}. "
-                            f"Complete refactoring by importing the helper into {f2_disp}.\n"
-                        )
+
+                if replace_clones:
+                    _delegate_unit_in_plan(
+                        u2,
+                        f2_plan,
+                        helper_name=helper_name,
+                        inputs=inputs,
+                        outputs=outputs,
+                        scope=scope,
+                        target_inputs=t_inputs2,
+                        target_outputs=target_outs2,
+                        await_prefix=await_prefix,
+                        binding="module",
+                    )
             else:
                 mod1 = _derive_module_import_path(f1_path, root)
                 mod2 = _derive_module_import_path(f2_plan.path, root)
