@@ -1625,11 +1625,13 @@ def generate_refactoring_patch(
         if not f1_raw:
             continue
         f1_path = _resolve_repo_relative_path(f1_raw, root)
+        if not f1_path.is_file() and effective_repo_root != root:
+            f1_path = _resolve_repo_relative_path(f1_raw, effective_repo_root)
         if not f1_path.is_file():
             continue
 
         try:
-            rel_f1 = str(f1_path.relative_to(root)).replace("\\", "/")
+            rel_f1 = str(f1_path.relative_to(effective_repo_root)).replace("\\", "/")
         except ValueError:
             rel_f1 = str(f1_path.name)
 
@@ -1659,9 +1661,11 @@ def generate_refactoring_patch(
             fn2 = find_enclosing_function(orig_text, u2)
         elif f2_raw:
             f2_path = _resolve_repo_relative_path(f2_raw, root)
+            if not f2_path.is_file() and effective_repo_root != root:
+                f2_path = _resolve_repo_relative_path(f2_raw, effective_repo_root)
             if f2_path.is_file():
                 try:
-                    rel_f2 = str(f2_path.relative_to(root)).replace("\\", "/")
+                    rel_f2 = str(f2_path.relative_to(effective_repo_root)).replace("\\", "/")
                 except ValueError:
                     rel_f2 = str(f2_path.name)
                 f2_plan = file_plans.get(f2_path)
@@ -2020,7 +2024,7 @@ def generate_refactoring_patch(
         elif f2_plan is not None:
             if cross_file_action in ("shared_module", "shared"):
                 maybe_shared_p = _safely_resolve_shared_module_file(
-                    f1_path, f2_plan.path, root, shared_module_name, f1_plan, f2_plan
+                    f1_path, f2_plan.path, effective_repo_root, shared_module_name, f1_plan, f2_plan
                 )
                 if maybe_shared_p is None:
                     continue
@@ -2028,7 +2032,7 @@ def generate_refactoring_patch(
 
                 try:
                     rel_shared = str(
-                        shared_p.resolve().relative_to(root.resolve())
+                        shared_p.resolve().relative_to(effective_repo_root.resolve())
                     ).replace("\\", "/")
                 except ValueError:
                     rel_shared = str(shared_p.name)
@@ -2057,7 +2061,7 @@ def generate_refactoring_patch(
                             continue
                         if shared_p.is_file():
                             try:
-                                shared_p.resolve().relative_to(root.resolve())
+                                shared_p.resolve().relative_to(effective_repo_root.resolve())
                                 shared_text = shared_p.read_text(encoding="utf-8")
                                 shared_plan = _get_plan(
                                     shared_p, rel_shared, shared_text, is_new_file=False
@@ -2307,7 +2311,7 @@ def generate_refactoring_patch(
     patch_chunks: List[str] = []
     for plan in file_plans.values():
         chunk = _render_file_patch_plan(
-            plan, replace_clones=replace_clones, repo_root=str(root)
+            plan, replace_clones=replace_clones, repo_root=str(effective_repo_root)
         )
         if chunk:
             patch_chunks.append(chunk)

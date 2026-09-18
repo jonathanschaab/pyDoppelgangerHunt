@@ -3501,7 +3501,26 @@ def test_generate_refactoring_patch_when_target_is_package_directory(tmp_path: P
 
     assert "from my_package.sub._common import _shared_calc_one_calc_two" in patch
     assert "from sub._common import" not in patch
-    assert "diff --git" in patch
+    assert "diff --git a/my_package/sub/_common.py b/my_package/sub/_common.py" in patch
+    assert "--- a/my_package/sub/mod1.py" in patch
+    assert "+++ b/my_package/sub/mod1.py" in patch
+    assert "--- a/my_package/sub/mod2.py" in patch
+    assert "+++ b/my_package/sub/mod2.py" in patch
+
+    # Initialize a git repository at project_root and verify that the generated patch
+    # applies cleanly from the project root.
+    subprocess.run(["git", "init"], cwd=project_root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=project_root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=project_root, check=True, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=project_root, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=project_root, check=True, capture_output=True)
+
+    patch_file = project_root / "refactor.patch"
+    patch_file.write_text(patch, encoding="utf-8")
+    apply_res = subprocess.run(["git", "apply", "refactor.patch"], cwd=project_root, capture_output=True, text=True)
+    assert apply_res.returncode == 0
+    assert (sub_pkg / "_common.py").is_file()
+    assert "_shared_calc_one_calc_two" in (sub_pkg / "_common.py").read_text(encoding="utf-8")
 
 
 def test_collect_host_missing_imports_handles_shadowed_builtins(tmp_path: Path) -> None:
