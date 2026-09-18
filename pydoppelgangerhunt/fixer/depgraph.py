@@ -148,6 +148,12 @@ def derive_shared_module_import(
     p_src = Path(source_file).resolve()
     p_shared = Path(shared_file).resolve()
 
+    try:
+        p_src.relative_to(p_root)
+        p_shared.relative_to(p_root)
+    except ValueError:
+        return derive_module_import_path(p_shared, p_root)
+
     if not prefer_relative:
         return derive_module_import_path(p_shared, p_root)
 

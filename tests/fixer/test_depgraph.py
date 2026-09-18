@@ -226,7 +226,7 @@ def test_depgraph_edge_cases(tmp_path: Path) -> None:
     assert find_nearest_common_package(d1, d2, root) == root
 
     # 2. Path outside root for find_nearest_common_package
-    outside = Path("Z:/outside/path.py")
+    outside = tmp_path.parent / "outside" / "path.py"
     assert find_nearest_common_package(outside, d1, root) == root
 
     # 3. derive_shared_module_import with down_parts and error fallback
