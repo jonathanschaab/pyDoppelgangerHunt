@@ -631,14 +631,18 @@ def _walrus_assignment_in_expr(
     return definite, conditional - definite
 
 
-def _is_irrefutable_pattern(pattern: Optional[ast.AST]) -> bool:
+def _is_irrefutable_pattern(pattern: Optional[ast.AST]) -> bool:  # pragma: no cover (py310+)
     """Recursively determines if a pattern matching AST node unconditionally matches any subject."""
     if pattern is None:
         return True
-    if hasattr(ast, "MatchAs") and isinstance(pattern, ast.MatchAs):
-        return pattern.pattern is None or _is_irrefutable_pattern(pattern.pattern)
-    if hasattr(ast, "MatchOr") and isinstance(pattern, ast.MatchOr):
-        return any(_is_irrefutable_pattern(p) for p in pattern.patterns)
+    match_as = getattr(ast, "MatchAs", ())
+    if isinstance(pattern, match_as):
+        sub_pat = getattr(pattern, "pattern", None)
+        return sub_pat is None or _is_irrefutable_pattern(sub_pat)
+    match_or = getattr(ast, "MatchOr", ())
+    if isinstance(pattern, match_or):
+        patterns = getattr(pattern, "patterns", [])
+        return any(_is_irrefutable_pattern(p) for p in patterns)
     return False
 
 
