@@ -875,6 +875,40 @@ def _extract_module_import_statements(
     return stmts
 
 
+def _canonicalize_helper_relative_imports(
+    helper_code: str,
+    source_mods: Sequence[Optional[str]] = (),
+) -> str:
+    """Translates relative imports inside a helper body to canonical absolute imports."""
+    if not helper_code or "from ." not in helper_code:
+        return helper_code
+    valid_mods = [m for m in source_mods if m]
+    if not valid_mods:
+        return helper_code
+    try:
+        tree = ast.parse(helper_code)
+    except (SyntaxError, UnicodeDecodeError):
+        return helper_code
+
+    modified = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (getattr(node, "level", 0) or 0) > 0:
+            for s_mod in valid_mods:
+                resolved = _resolve_relative_import_path(s_mod, node.level, node.module)
+                if resolved:
+                    node.level = 0
+                    node.module = resolved
+                    modified = True
+                    break
+
+    if modified:
+        try:
+            return ast.unparse(tree)
+        except Exception:
+            return helper_code
+    return helper_code
+
+
 def _collect_host_missing_imports(
     host_plan: _FilePatchPlan,
     helper_code: str,
@@ -919,13 +953,47 @@ def _collect_host_missing_imports(
     # 2. Local imports discovered during scope analysis
     for loc_imp in scope.get("local_imports", []):
         s_loc = loc_imp.strip()
+        if not s_loc:
+            continue
+        resolved_stmt = s_loc
+        try:
+            loc_tree = ast.parse(s_loc)
+            if loc_tree.body and isinstance(loc_tree.body[0], ast.ImportFrom):
+                imp_node = loc_tree.body[0]
+                if (getattr(imp_node, "level", 0) or 0) > 0:
+                    origin_mod = None
+                    for item in source_texts:
+                        s_text, s_mod = item if isinstance(item, tuple) else (item, None)
+                        if s_text and s_loc in s_text and s_mod:
+                            origin_mod = s_mod
+                            break
+                    if not origin_mod and source_texts:
+                        first = source_texts[0]
+                        origin_mod = first[1] if isinstance(first, tuple) else None
+                    if origin_mod:
+                        target_mod = _resolve_relative_import_path(
+                            origin_mod, imp_node.level, imp_node.module
+                        )
+                        if target_mod:
+                            names_str = ", ".join(
+                                f"{a.name} as {a.asname}" if a.asname else a.name
+                                for a in imp_node.names
+                            )
+                            resolved_stmt = f"from {target_mod} import {names_str}"
+                        else:
+                            continue
+                    else:
+                        continue
+        except (SyntaxError, UnicodeDecodeError):
+            pass
+
         if (
-            s_loc
-            and s_loc not in host_content
-            and s_loc not in missing
-            and s_loc not in host_plan.missing_imports
+            resolved_stmt
+            and resolved_stmt not in host_content
+            and resolved_stmt not in missing
+            and resolved_stmt not in host_plan.missing_imports
         ):
-            missing.append(loc_imp)
+            missing.append(resolved_stmt)
 
     # 3. Source dependencies referenced in helper_code
     try:
@@ -989,7 +1057,11 @@ def _register_plan_dependencies_in_graph(
         return
     dg.add_module(mod_name, file_path)
     known_modules = set(dg.mod_to_file.keys())
-    raw_imports = _parse_source_imports("\n".join(import_stmts), mod_name)
+    raw_imports = _parse_source_imports(
+        "\n".join(import_stmts),
+        mod_name,
+        is_package=(file_path.name == "__init__.py"),
+    )
     for imp in raw_imports:
         dg.add_import_dependency(mod_name, imp, known_modules=known_modules)
 
@@ -1464,9 +1536,12 @@ def generate_refactoring_patch(
                         (f2_plan, u2, t_inputs2, target_outs2),
                     ]
 
-                host_plan.module_helpers.append(helper_code)
                 mod1 = _derive_module_import_path(f1_path, root)
                 mod2 = _derive_module_import_path(f2_plan.path, root)
+                helper_code = _canonicalize_helper_relative_imports(
+                    helper_code, [mod1, mod2]
+                )
+                host_plan.module_helpers.append(helper_code)
                 host_imports = _collect_host_missing_imports(
                     host_plan=host_plan,
                     helper_code=helper_code,
@@ -1561,6 +1636,9 @@ def generate_refactoring_patch(
             else:
                 mod1 = _derive_module_import_path(f1_path, root)
                 mod2 = _derive_module_import_path(f2_plan.path, root)
+                helper_code = _canonicalize_helper_relative_imports(
+                    helper_code, [mod1, mod2]
+                )
                 dg = _get_depgraph()
 
                 host_imports = _collect_host_missing_imports(

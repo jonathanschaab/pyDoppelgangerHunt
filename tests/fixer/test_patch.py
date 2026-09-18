@@ -2603,4 +2603,69 @@ def test_host_module_detects_cycle_from_synthesized_host_imports(tmp_path: Path)
     assert "from host_cycle_pkg.mod_a import _shared_compute_a_compute_b" not in patch
 
 
+def test_shared_module_translates_local_relative_imports(tmp_path: Path) -> None:
+    """Verifies that relative function-local imports in clones are translated to canonical absolute paths."""
+    pkg = tmp_path / "local_rel_pkg"
+    sub1 = pkg / "sub1"
+    sub2 = pkg / "sub2"
+    sub1.mkdir(parents=True)
+    sub2.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (sub1 / "__init__.py").write_text("", encoding="utf-8")
+    (sub2 / "__init__.py").write_text("", encoding="utf-8")
+
+    (sub1 / "helpers.py").write_text("def transform(x: int) -> int:\n    return x + 42\n", encoding="utf-8")
+
+    src_1 = (
+        "def compute_1(x: int) -> int:\n"
+        "    from .helpers import transform\n"
+        "    return transform(x)\n"
+    )
+    src_2 = (
+        "def compute_2(x: int) -> int:\n"
+        "    from .helpers import transform\n"
+        "    return transform(x)\n"
+    )
+    (sub1 / "mod1.py").write_text(src_1, encoding="utf-8")
+    (sub2 / "mod2.py").write_text(src_2, encoding="utf-8")
+
+    u1 = {"name": "compute_1", "file": "local_rel_pkg/sub1/mod1.py", "start": 1, "end": 3, "kind": "function"}
+    u2 = {"name": "compute_2", "file": "local_rel_pkg/sub2/mod2.py", "start": 1, "end": 3, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    # In local_rel_pkg/_common.py, the import should be canonicalized to from local_rel_pkg.sub1.helpers import transform
+    assert "from local_rel_pkg.sub1.helpers import transform" in patch
+    # Should NOT have verbatim 'from .helpers import transform' added in the shared module
+    assert "+from .helpers import transform" not in patch
+    assert "+    from .helpers import transform" not in patch
+
+
+def test_register_plan_dependencies_init_package_context(tmp_path: Path) -> None:
+    """Verifies that _register_plan_dependencies_in_graph correctly identifies __init__.py as package context."""
+    from pydoppelgangerhunt.fixer.patch import _register_plan_dependencies_in_graph  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.depgraph import ModuleDependencyGraph  # pylint: disable=import-outside-toplevel
+
+    dg = ModuleDependencyGraph(tmp_path)
+    pkg_init = tmp_path / "my_package" / "__init__.py"
+    pkg_init.parent.mkdir()
+    pkg_init.write_text("", encoding="utf-8")
+
+    deps_file = tmp_path / "my_package" / "deps.py"
+    deps_file.write_text("", encoding="utf-8")
+    dg.add_module("my_package.deps", deps_file)
+
+    # When registered for __init__.py with 'from .deps import X', it should resolve to my_package.deps
+    _register_plan_dependencies_in_graph(dg, "my_package", pkg_init, ["from .deps import X"])
+
+    # dg should have edge my_package -> my_package.deps
+    assert "my_package.deps" in dg.get_dependencies("my_package")
+
+
+
 
