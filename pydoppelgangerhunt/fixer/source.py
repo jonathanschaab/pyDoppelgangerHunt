@@ -186,6 +186,13 @@ def _insert_imports_into_module(
         if s not in existing_stripped and s not in seen:
             seen.add(s)
             deduped_imports.append(imp)
+    future_imps = [
+        imp for imp in deduped_imports if imp.strip().startswith("from __future__")
+    ]
+    other_imps = [
+        imp for imp in deduped_imports if not imp.strip().startswith("from __future__")
+    ]
+    deduped_imports = future_imps + other_imps
     if not deduped_imports:
         return orig_lines
 

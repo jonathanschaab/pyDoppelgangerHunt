@@ -2455,3 +2455,67 @@ def test_future_annotations_propagation_in_shared_module(tmp_path: Path) -> None
     assert typing_idx != -1
     assert future_idx < typing_idx
 
+
+def test_shared_module_dry_run_no_ghost_edge_or_caller_import(tmp_path: Path) -> None:
+    """Verifies that replace_clones=False with shared_module does not emit caller imports or ghost edges."""
+    pkg = tmp_path / "dry_shared_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src_a = "def compute_a(x: int) -> int:\n    return x * 10 + 1\n"
+    src_b = "def compute_b(x: int) -> int:\n    return x * 10 + 1\n"
+    (pkg / "mod_a.py").write_text(src_a, encoding="utf-8")
+    (pkg / "mod_b.py").write_text(src_b, encoding="utf-8")
+
+    u_a = {"name": "compute_a", "file": "dry_shared_pkg/mod_a.py", "start": 1, "end": 2, "kind": "function"}
+    u_b = {"name": "compute_b", "file": "dry_shared_pkg/mod_b.py", "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u_a, u_b)],
+        repo_root=str(tmp_path),
+        replace_clones=False,
+        cross_file_strategy="shared_module",
+    )
+
+    # _common.py is synthesized with the helper
+    assert "diff --git a/dry_shared_pkg/_common.py b/dry_shared_pkg/_common.py" in patch
+    assert "+def _shared_compute_a_compute_b(x: int) -> int:" in patch
+
+    # Callers receive the proposed import from _common
+    assert "+from dry_shared_pkg._common import _shared_compute_a_compute_b" in patch
+    # Function bodies are NOT replaced because replace_clones=False
+    assert "return _shared_compute_a_compute_b" not in patch
+    # Callers receive advisory comments explaining where helper was extracted
+    assert "Complete refactoring by importing the helper into dry_shared_pkg/mod_a.py" in patch
+    assert "Complete refactoring by importing the helper into dry_shared_pkg/mod_b.py" in patch
+
+
+def test_shared_module_existing_directory_skipped(tmp_path: Path) -> None:
+    """Verifies that when the target shared module path is an existing directory, extraction skips gracefully."""
+    pkg = tmp_path / "dir_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    # Create a directory named _common.py
+    dir_conflict = pkg / "_common.py"
+    dir_conflict.mkdir()
+
+    src_a = "def run_a(x: int) -> int:\n    return x + 5\n"
+    src_b = "def run_b(x: int) -> int:\n    return x + 5\n"
+    (pkg / "mod_a.py").write_text(src_a, encoding="utf-8")
+    (pkg / "mod_b.py").write_text(src_b, encoding="utf-8")
+
+    u_a = {"name": "run_a", "file": "dir_pkg/mod_a.py", "start": 1, "end": 2, "kind": "function"}
+    u_b = {"name": "run_b", "file": "dir_pkg/mod_b.py", "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u_a, u_b)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "is an existing directory; skipping extraction" in patch
+    assert "new file mode 100644" not in patch
+
+

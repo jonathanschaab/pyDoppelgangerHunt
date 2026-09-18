@@ -1423,6 +1423,14 @@ def generate_refactoring_patch(
                 else:
                     shared_plan = file_plans.get(shared_p)
                     if shared_plan is None:
+                        if shared_p.is_dir():
+                            dir_err_msg = (
+                                f"# Note: Cross-module clone pair; shared module path {rel_shared} "
+                                f"is an existing directory; skipping extraction.\n"
+                            )
+                            f1_plan.comments.append(dir_err_msg)
+                            f2_plan.comments.append(dir_err_msg)
+                            continue
                         if shared_p.is_file():
                             try:
                                 shared_text = shared_p.read_text(encoding="utf-8")
@@ -1507,10 +1515,15 @@ def generate_refactoring_patch(
                         else None
                     )
                     c_disp = normalize_path_string(str(c_plan.rel_path), strip_anchor=False)
-                    if cycle:
+                    if cycle or not mod_host or not mod_caller:
+                        cycle_desc = ""
+                        if cycle:
+                            cycle_desc = f"Circular import detected (cycle: {' -> '.join(cycle)})"
+                        else:
+                            cycle_desc = "Unresolvable module import path"
                         cycle_msg = (
                             f"# Note: Cross-module clone pair; helper extracted to {host_disp}. "
-                            f"Circular import detected (cycle: {' -> '.join(cycle)}); import manually into {c_disp}.\n"
+                            f"{cycle_desc}; import manually into {c_disp}.\n"
                         )
                         c_plan.comments.append(cycle_msg)
                         host_plan.comments.append(cycle_msg)
@@ -1548,7 +1561,7 @@ def generate_refactoring_patch(
                 direct_import = bool(mod2 and _module_imports_target(orig_text, mod2))
                 is_circular = bool(cycle or direct_import)
 
-                if is_circular or not mod1:
+                if is_circular or not mod1 or not mod2:
                     cycle_desc = ""
                     if cycle:
                         cycle_desc = f" (cycle: {' -> '.join(cycle)})"
