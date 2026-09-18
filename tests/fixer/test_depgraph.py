@@ -503,4 +503,40 @@ def test_resolve_shared_module_file_rejects_symlink(
         resolve_shared_module_file(f1, f2, root, shared_module_name="_common.py")
 
 
+def test_depgraph_pending_descendants_wiring(tmp_path: Path) -> None:
+    """Verifies that pending package descendants are wired without quadratic scans."""
+    # pylint: disable=protected-access
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    # Case 1: Submodule registered BEFORE ancestor packages
+    g1 = ModuleDependencyGraph(repo)
+    g1.add_module("pkg.sub.worker", repo / "pkg" / "sub" / "worker.py")
+    assert "pkg" in g1._pending_descendants
+    assert "pkg.sub" in g1._pending_descendants
+    assert g1._pending_descendants["pkg"] == {"pkg.sub.worker"}
+    assert g1._pending_descendants["pkg.sub"] == {"pkg.sub.worker"}
+
+    g1.add_module("pkg.sub", repo / "pkg" / "sub" / "__init__.py")
+    assert "pkg.sub" not in g1._pending_descendants
+    assert "pkg.sub" in g1.adjacency["pkg.sub.worker"]
+
+    g1.add_module("pkg", repo / "pkg" / "__init__.py")
+    assert "pkg" not in g1._pending_descendants
+    assert "pkg" in g1.adjacency["pkg.sub.worker"]
+    assert "pkg" in g1.adjacency["pkg.sub"]
+    assert not g1._pending_descendants
+
+    # Case 2: Ancestor packages registered BEFORE submodule
+    g2 = ModuleDependencyGraph(repo)
+    g2.add_module("pkg", repo / "pkg" / "__init__.py")
+    g2.add_module("pkg.sub", repo / "pkg" / "sub" / "__init__.py")
+    g2.add_module("pkg.sub.worker", repo / "pkg" / "sub" / "worker.py")
+    assert "pkg" in g2.adjacency["pkg.sub"]
+    assert "pkg.sub" in g2.adjacency["pkg.sub.worker"]
+    assert "pkg" in g2.adjacency["pkg.sub.worker"]
+    assert not g2._pending_descendants
+
+
+
 

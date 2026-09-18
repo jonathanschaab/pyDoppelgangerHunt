@@ -336,6 +336,7 @@ class ModuleDependencyGraph:
         self.mod_to_file: Dict[str, Path] = {}
         self.file_to_mod: Dict[str, str] = {}
         self._sorted_adjacency: Dict[str, List[str]] = {}
+        self._pending_descendants: Dict[str, Set[str]] = {}
 
     def add_module(self, mod_name: str, file_path: Path) -> None:
         """Registers a module and its backing file path in the graph."""
@@ -353,10 +354,12 @@ class ModuleDependencyGraph:
             parent_pkg = ".".join(parts[:i])
             if parent_pkg in self.mod_to_file:
                 self.add_dependency(mod_name, parent_pkg)
+            else:
+                self._pending_descendants.setdefault(parent_pkg, set()).add(mod_name)
 
-        for existing_mod in list(self.mod_to_file.keys()):
-            if existing_mod != mod_name and existing_mod.startswith(f"{mod_name}."):
-                self.add_dependency(existing_mod, mod_name)
+        if mod_name in self._pending_descendants:
+            for desc_mod in self._pending_descendants.pop(mod_name):
+                self.add_dependency(desc_mod, mod_name)
 
     def add_dependency(self, from_mod: str, to_mod: str) -> None:
         """Adds a directed import edge from from_mod to to_mod."""
@@ -516,14 +519,6 @@ class ModuleDependencyGraph:
                 graph.add_module(mod_name, p_file)
 
         known_modules = set(graph.mod_to_file.keys())
-
-        # Wire submodule execution dependencies to ancestor package initializers
-        for mod_name in known_modules:
-            parts = mod_name.split(".")
-            for i in range(1, len(parts)):
-                parent_pkg = ".".join(parts[:i])
-                if parent_pkg in known_modules:
-                    graph.add_dependency(mod_name, parent_pkg)
 
         # Second pass: parse imports and wire edges
         for p_file in python_files:

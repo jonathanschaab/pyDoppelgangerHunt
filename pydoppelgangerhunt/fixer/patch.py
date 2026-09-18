@@ -1009,6 +1009,16 @@ def _extract_helper_symbols(
     Parameters and local stores from nested functions/classes/comprehensions do not bleed
     into the outer helper scope, preventing false shadowing of module-level dependencies.
     """
+    has_top_level_fn = isinstance(
+        helper_tree, (ast.FunctionDef, ast.AsyncFunctionDef)
+    ) or (
+        isinstance(helper_tree, ast.Module)
+        and any(
+            isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for stmt in getattr(helper_tree, "body", [])
+        )
+    )
+    max_helper_scope_depth = 2 if has_top_level_fn else 1
     free_names: Set[str] = set()
     defined_names: Set[str] = set()
     local_imported_names: Set[str] = set()
@@ -1178,14 +1188,16 @@ def _extract_helper_symbols(
             self._handle_comprehension([node.key, node.value], node.generators)
 
         def visit_Import(self, node: ast.Import) -> None:
-            for alias in node.names:
-                name = alias.asname or alias.name.split(".", 1)[0]
-                local_imported_names.add(name)
+            if len(scope_stack) <= max_helper_scope_depth:
+                for alias in node.names:
+                    name = alias.asname or alias.name.split(".", 1)[0]
+                    local_imported_names.add(name)
 
         def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-            for alias in node.names:
-                name = alias.asname or alias.name
-                local_imported_names.add(name)
+            if len(scope_stack) <= max_helper_scope_depth:
+                for alias in node.names:
+                    name = alias.asname or alias.name
+                    local_imported_names.add(name)
 
         def visit_Name(self, node: ast.Name) -> None:
             if isinstance(node.ctx, ast.Load):

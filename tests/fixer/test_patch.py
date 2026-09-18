@@ -3558,6 +3558,70 @@ def test_collect_host_missing_imports_handles_shadowed_builtins(tmp_path: Path) 
     assert "skipping extraction" in patch_inconsistent
 
 
+def test_nested_imports_do_not_suppress_outer_helper_imports(tmp_path: Path) -> None:
+    """Verifies that imports in nested functions/classes do not suppress outer helper imports."""
+    # pylint: disable=protected-access
+    code = (
+        "def helper(x: int) -> int:\n"
+        "    res = transform(x)\n"
+        "    def inner(y: int) -> int:\n"
+        "        from inner_pkg import transform\n"
+        "        return transform(y)\n"
+        "    return res + inner(x)\n"
+    )
+    tree = ast.parse(code)
+    free_names, defined_names, local_imports = patch_mod._extract_helper_symbols(tree)
+    assert "transform" in free_names
+    assert "transform" not in local_imports
+    assert "helper" in defined_names
+    assert "x" in defined_names
+    assert "inner" in defined_names
+    assert "y" not in defined_names
+
+    # End-to-end patch generation test:
+    # Outer helper uses `transform`, while inner function locally imports a different `transform`.
+    # Ensure `from mymod import transform` is hoisted to the shared module header.
+    pkg = tmp_path / "nested_import_pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = (
+        "from mymod import transform\n\n"
+        "def run_step1(x: int) -> int:\n"
+        "    res = transform(x)\n"
+        "    def inner(y: int) -> int:\n"
+        "        from inner_pkg import transform\n"
+        "        return transform(y)\n"
+        "    return res + inner(x)\n"
+    )
+    src2 = (
+        "from mymod import transform\n\n"
+        "def run_step2(x: int) -> int:\n"
+        "    res = transform(x)\n"
+        "    def inner(y: int) -> int:\n"
+        "        from inner_pkg import transform\n"
+        "        return transform(y)\n"
+        "    return res + inner(x)\n"
+    )
+    f1 = pkg / "s1.py"
+    f2 = pkg / "s2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "run_step1", "file": str(f1), "start": 3, "end": 8, "kind": "function"}
+    u2 = {"name": "run_step2", "file": str(f2), "start": 3, "end": 8, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "from mymod import transform" in patch
+    assert "from nested_import_pkg._common import _shared_run_step1_run_step2" in patch
+
+
 
 
 
