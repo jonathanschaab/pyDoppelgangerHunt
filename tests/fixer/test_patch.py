@@ -3470,6 +3470,95 @@ def test_symlink_shared_module_target_rejected_with_advisory_comment(
     assert "diff --git" not in patch
 
 
+def test_generate_refactoring_patch_when_target_is_package_directory(tmp_path: Path) -> None:
+    """Verifies that when repo_root is a package directory, imports retain enclosing package context."""
+    project_root = tmp_path / "my_project"
+    project_root.mkdir()
+    top_pkg = project_root / "my_package"
+    top_pkg.mkdir()
+    (top_pkg / "__init__.py").write_text("", encoding="utf-8")
+    sub_pkg = top_pkg / "sub"
+    sub_pkg.mkdir()
+    (sub_pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = "def calc_one(x: int) -> int:\n    return x * 2 + 1\n"
+    src2 = "def calc_two(x: int) -> int:\n    return x * 2 + 1\n"
+    f1 = sub_pkg / "mod1.py"
+    f2 = sub_pkg / "mod2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "calc_one", "file": "sub/mod1.py", "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "calc_two", "file": "sub/mod2.py", "start": 1, "end": 2, "kind": "function"}
+
+    # Target scan is passed as the package directory itself (top_pkg)
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(top_pkg),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "from my_package.sub._common import _shared_calc_one_calc_two" in patch
+    assert "from sub._common import" not in patch
+    assert "diff --git" in patch
+
+
+def test_collect_host_missing_imports_handles_shadowed_builtins(tmp_path: Path) -> None:
+    """Verifies that shadowed builtins are hoisted when consistent or rejected when conflicting."""
+    pkg = tmp_path / "shadow_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    # Consistent shadowing: both modules import a custom `len`
+    src1_consistent = (
+        "from custom_utils import len\n\n"
+        "def count_items1(items: list) -> int:\n"
+        "    return len(items) + 1\n"
+    )
+    src2_consistent = (
+        "from custom_utils import len\n\n"
+        "def count_items2(items: list) -> int:\n"
+        "    return len(items) + 1\n"
+    )
+    f1 = pkg / "c1.py"
+    f2 = pkg / "c2.py"
+    f1.write_text(src1_consistent, encoding="utf-8")
+    f2.write_text(src2_consistent, encoding="utf-8")
+
+    u1 = {"name": "count_items1", "file": str(f1), "start": 3, "end": 4, "kind": "function"}
+    u2 = {"name": "count_items2", "file": str(f2), "start": 3, "end": 4, "kind": "function"}
+
+    patch_consistent = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "from custom_utils import len" in patch_consistent
+    assert "from shadow_pkg._common import _shared_count_items1_count_items2" in patch_consistent
+
+    # Inconsistent shadowing: one clone imports custom `len`, the other uses builtin `len`
+    src2_inconsistent = (
+        "def count_items2(items: list) -> int:\n"
+        "    return len(items) + 1\n"
+    )
+    f2.write_text(src2_inconsistent, encoding="utf-8")
+    u2_inconsistent = {"name": "count_items2", "file": str(f2), "start": 1, "end": 2, "kind": "function"}
+
+    patch_inconsistent = generate_refactoring_patch(
+        [(1.0, u1, u2_inconsistent)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "conflicting imported symbol 'len'" in patch_inconsistent
+    assert "skipping extraction" in patch_inconsistent
+
+
+
 
 
 

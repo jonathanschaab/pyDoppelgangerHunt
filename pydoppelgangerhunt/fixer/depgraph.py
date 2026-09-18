@@ -39,8 +39,33 @@ def _resolve_repo_relative_path(
                 return cand
             except ValueError:
                 pass
+        cand = (p_root / p).resolve()
+        if cand.is_file() or cand.is_dir():
+            return cand
+        pkg_root = _find_enclosing_package_root(p_root)
+        if pkg_root != p_root:
+            cand_pkg = (pkg_root / p).resolve()
+            if cand_pkg.is_file() or cand_pkg.is_dir():
+                return cand_pkg
         p = p_root / p
     return p.resolve()
+
+
+def _find_enclosing_package_root(path: Path) -> Path:
+    """Finds the enclosing non-package directory if path is inside a Python package."""
+    curr = path.resolve()
+    if curr.is_file():
+        curr = curr.parent
+    if not (curr / "__init__.py").is_file():
+        return curr
+    while (curr / "__init__.py").is_file():
+        parent = curr.parent
+        if parent == curr:
+            break
+        if not (parent / "__init__.py").is_file():
+            return parent
+        curr = parent
+    return curr.parent
 
 
 def derive_module_import_path(
@@ -189,12 +214,13 @@ def derive_shared_module_import(
         Module path suitable for 'from <module> import <helper>'.
     """
     p_root = Path(repo_root).resolve()
+    effective_root = _find_enclosing_package_root(p_root)
     p_src = _resolve_repo_relative_path(source_file, p_root)
     p_shared = _resolve_repo_relative_path(shared_file, p_root)
 
     try:
-        p_src.relative_to(p_root)
-        p_shared.relative_to(p_root)
+        p_src.relative_to(effective_root)
+        p_shared.relative_to(effective_root)
     except ValueError:
         return derive_module_import_path(p_shared, p_root)
 
@@ -207,12 +233,12 @@ def derive_shared_module_import(
 
     # Top-level source modules (at repo root or src/ root) have no enclosing package context;
     # relative imports with leading dots raise ImportError, so fall back to absolute module paths.
-    if src_dir in (p_root, p_root / "src"):
+    if src_dir in (effective_root, effective_root / "src"):
         return derive_module_import_path(p_shared, p_root)
 
     # When shared file is at repo root (or src/ root), any relative import from a subpackage
     # would climb above top-level package and raise ImportError; fall back to absolute path.
-    if shared_dir in (p_root, p_root / "src"):
+    if shared_dir in (effective_root, effective_root / "src"):
         return derive_module_import_path(p_shared, p_root)
 
     try:
@@ -228,12 +254,12 @@ def derive_shared_module_import(
     down_parts = [part for part in rel_parts if part != ".."]
 
     # Check if up_count climbs above the top-level package enclosing src_dir
-    src_base = p_root / "src"
+    src_base = effective_root / "src"
     try:
         pkg_depth = len(src_dir.relative_to(src_base).parts)
     except ValueError:
         try:
-            pkg_depth = len(src_dir.relative_to(p_root).parts)
+            pkg_depth = len(src_dir.relative_to(effective_root).parts)
         except ValueError:
             pkg_depth = 0
     if up_count >= pkg_depth:

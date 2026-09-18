@@ -26,6 +26,7 @@ from pydoppelgangerhunt.fixer.binding import (
 )
 from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
+    _find_enclosing_package_root,
     _parse_source_imports,
     _resolve_relative_import_path,
     _resolve_repo_relative_path,
@@ -1334,7 +1335,16 @@ def _collect_host_missing_imports(
             s_defs = _extract_module_defined_names(src_text)
             source_info.append((s_map, s_wild, s_defs))
 
-        ignored_names = _BUILTIN_NAMES | defined_in_helper | set(needed_typing)
+        source_bound_names: Set[str] = (
+            set(local_import_stmts.keys()) | helper_local_imported_names
+        )
+        for s_map, _, s_defs in source_info:
+            source_bound_names.update(s_map.keys())
+            source_bound_names.update(s_defs)
+
+        effective_builtins = _BUILTIN_NAMES - source_bound_names
+        effective_typing = set(needed_typing) - source_bound_names
+        ignored_names = effective_builtins | defined_in_helper | effective_typing
         symbol_to_stmt: Dict[str, str] = dict(local_import_stmts)
         source_hoisted_symbols: Set[str] = set()
         host_defs: Optional[Set[str]] = None
@@ -1571,12 +1581,19 @@ def generate_refactoring_patch(
         return ""
 
     root = Path(repo_root or os.getcwd()).resolve()
+    if root.is_file():
+        root = root.parent
+    effective_repo_root = (
+        _find_enclosing_package_root(root)
+        if (root / "__init__.py").is_file()
+        else root
+    )
     graph_holder: List[Optional[ModuleDependencyGraph]] = [depgraph]
 
     def _get_depgraph() -> ModuleDependencyGraph:
         g = graph_holder[0]
         if g is None:
-            g = build_module_graph(root)
+            g = build_module_graph(effective_repo_root)
             graph_holder[0] = g
         return g
 
@@ -1835,7 +1852,10 @@ def generate_refactoring_patch(
         cross_file_action = cross_file_strategy
         if cross_file_action == "auto" and not is_same_file and f2_plan is not None:
             common_dir = find_nearest_common_package(f1_path, f2_plan.path, root)
-            if common_dir.resolve() in (root.resolve(), (root / "src").resolve()):
+            if common_dir.resolve() in (
+                effective_repo_root.resolve(),
+                (effective_repo_root / "src").resolve(),
+            ):
                 cross_file_action = "host_module"
             else:
                 cross_file_action = "shared_module"
@@ -1934,7 +1954,7 @@ def generate_refactoring_patch(
         )
 
         if is_same_file:
-            mod1 = _derive_module_import_path(f1_path, root)
+            mod1 = _derive_module_import_path(f1_path, effective_repo_root)
             is_pkg1 = f1_path.name == "__init__.py"
             helper_code, maybe_imports = _safely_prepare_helper_and_imports(
                 host_plan=f1_plan,
@@ -2048,11 +2068,11 @@ def generate_refactoring_patch(
                         (f2_plan, u2, t_inputs2, target_outs2),
                     ]
 
-                mod1 = _derive_module_import_path(f1_path, root)
-                mod2 = _derive_module_import_path(f2_plan.path, root)
+                mod1 = _derive_module_import_path(f1_path, effective_repo_root)
+                mod2 = _derive_module_import_path(f2_plan.path, effective_repo_root)
                 is_pkg1 = f1_path.name == "__init__.py"
                 is_pkg2 = f2_plan.path.name == "__init__.py"
-                mod_host = _derive_module_import_path(host_plan.path, root)
+                mod_host = _derive_module_import_path(host_plan.path, effective_repo_root)
                 is_host_pkg = host_plan.path.name == "__init__.py"
                 helper_code, maybe_imports = _safely_prepare_helper_and_imports(
                     host_plan=host_plan,
@@ -2112,7 +2132,7 @@ def generate_refactoring_patch(
 
                 for c_plan, c_unit, c_tin, c_tout in callers:
                     c_plan.comments.append(pair_comment)
-                    mod_caller = _derive_module_import_path(c_plan.path, root)
+                    mod_caller = _derive_module_import_path(c_plan.path, effective_repo_root)
                     cycle = (
                         dg.check_cycle_if_added(mod_caller, mod_host)
                         if (mod_caller and mod_host)
@@ -2154,8 +2174,8 @@ def generate_refactoring_patch(
                                 f"Complete refactoring by replacing the clone with a call in {c_disp}.\n"
                             )
             else:
-                mod1 = _derive_module_import_path(f1_path, root)
-                mod2 = _derive_module_import_path(f2_plan.path, root)
+                mod1 = _derive_module_import_path(f1_path, effective_repo_root)
+                mod2 = _derive_module_import_path(f2_plan.path, effective_repo_root)
                 is_pkg1 = f1_path.name == "__init__.py"
                 is_pkg2 = f2_plan.path.name == "__init__.py"
                 dg = _get_depgraph()
@@ -2235,7 +2255,7 @@ def generate_refactoring_patch(
                     replace_clones=replace_clones,
                 )
         else:
-            mod1 = _derive_module_import_path(f1_path, root)
+            mod1 = _derive_module_import_path(f1_path, effective_repo_root)
             is_pkg1 = f1_path.name == "__init__.py"
             helper_code, maybe_imports = _safely_prepare_helper_and_imports(
                 host_plan=f1_plan,
