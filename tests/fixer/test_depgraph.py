@@ -135,6 +135,50 @@ def test_derive_shared_module_import_modes(tmp_path: Path) -> None:
     assert derive_shared_module_import("pkg\\services\\worker.py", "pkg\\_common.py", root, prefer_relative=True) == ".._common"
 
 
+def test_resolve_shared_module_file_safe_sanitization(tmp_path: Path) -> None:
+    """Verifies that malicious or tricky shared_module_name inputs cannot escape the common directory."""
+    root = tmp_path / "app"
+    root.mkdir()
+    f1 = root / "services" / "srv1.py"
+    f2 = root / "services" / "srv2.py"
+    f1.parent.mkdir(parents=True)
+
+    # Absolute path input does not escape common directory
+    res_abs = resolve_shared_module_file(f1, f2, root, shared_module_name="/tmp/secret.py")
+    assert res_abs == root / "services" / "secret.py"
+
+    # Directory traversal input does not escape common directory
+    res_trav = resolve_shared_module_file(f1, f2, root, shared_module_name="../../evil.py")
+    assert res_trav == root / "services" / "evil.py"
+
+    # Empty string, dots, and bare extension fall back safely to _common.py
+    assert resolve_shared_module_file(f1, f2, root, shared_module_name="") == root / "services" / "_common.py"
+    assert resolve_shared_module_file(f1, f2, root, shared_module_name="..") == root / "services" / "_common.py"
+    assert resolve_shared_module_file(f1, f2, root, shared_module_name=".") == root / "services" / "_common.py"
+    assert resolve_shared_module_file(f1, f2, root, shared_module_name=".py") == root / "services" / "_common.py"
+
+
+def test_derive_shared_module_import_top_level_fallback(tmp_path: Path) -> None:
+    """Verifies that top-level modules without package context fall back to absolute imports."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    top_file = root / "main.py"
+    shared_file = root / "pkg" / "sub" / "_common.py"
+    shared_file.parent.mkdir(parents=True)
+
+    # Even with prefer_relative=True, a top-level file at repo root must not use leading dots
+    rel_imp = derive_shared_module_import(top_file, shared_file, root, prefer_relative=True)
+    assert rel_imp == "pkg.sub._common"
+
+    # Top-level file under src/ root also falls back to absolute import
+    src_top = root / "src" / "cli.py"
+    src_top.parent.mkdir(parents=True)
+    src_shared = root / "src" / "app" / "_common.py"
+    src_shared.parent.mkdir(parents=True)
+    src_rel_imp = derive_shared_module_import(src_top, src_shared, root, prefer_relative=True)
+    assert src_rel_imp == "app._common"
+
+
 def test_module_dependency_graph_reachability_and_cycles(tmp_path: Path) -> None:
     """Verifies BFS reachability, cycle path extraction, and safety checks on directed graph."""
     graph = ModuleDependencyGraph(tmp_path)

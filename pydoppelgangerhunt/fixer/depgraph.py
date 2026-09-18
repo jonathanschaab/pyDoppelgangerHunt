@@ -130,12 +130,17 @@ def resolve_shared_module_file(
         Path to the shared module file within the nearest common directory.
     """
     common_dir = find_nearest_common_package(file1, file2, repo_root)
-    clean_name = (
-        shared_module_name
-        if shared_module_name.endswith(".py")
-        else f"{shared_module_name}.py"
-    )
-    return common_dir / clean_name
+    # Sanitize shared_module_name to a safe filename to prevent path traversal or repository escaping
+    raw_name = Path(str(shared_module_name)).name.strip()
+    if not raw_name or raw_name in (".", "..", ".py"):
+        raw_name = "_common.py"
+    clean_name = raw_name if raw_name.endswith(".py") else f"{raw_name}.py"
+    target = common_dir / clean_name
+    try:
+        target.resolve().relative_to(common_dir.resolve())
+    except ValueError:
+        return common_dir / "_common.py"
+    return target
 
 
 def derive_shared_module_import(
@@ -171,6 +176,11 @@ def derive_shared_module_import(
     src_dir = _parent_dir_of_path(p_src)
     shared_dir = _parent_dir_of_path(p_shared)
     shared_stem = p_shared.stem if p_shared.stem != "__init__" else ""
+
+    # Top-level source modules (at repo root or src/ root) have no enclosing package context;
+    # relative imports with leading dots raise ImportError, so fall back to absolute module paths.
+    if src_dir in (p_root, p_root / "src"):
+        return derive_module_import_path(p_shared, p_root)
 
     try:
         rel_dir = os.path.relpath(str(shared_dir), str(src_dir))

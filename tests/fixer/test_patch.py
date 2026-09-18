@@ -2178,3 +2178,94 @@ def test_generate_refactoring_patch_lazy_depgraph(
     )
     assert "def _shared_a_b" in patch
     mock_build.assert_not_called()
+
+
+def test_evolving_depgraph_detects_multi_pair_cycles(tmp_path: Path) -> None:
+    """Verifies that accepted cross-module dependencies update the evolving graph, catching multi-pair cycles."""
+    pkg = tmp_path / "cycle_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "mod_a.py").write_text(
+        "def a1(x: int) -> int:\n    return x + 1\ndef a2(y: int) -> int:\n    return y * 2\n",
+        encoding="utf-8",
+    )
+    (pkg / "mod_b.py").write_text(
+        "def b1(x: int) -> int:\n    return x + 1\ndef b2(z: int) -> int:\n    return z * 3\n",
+        encoding="utf-8",
+    )
+    (pkg / "mod_c.py").write_text(
+        "def c1(z: int) -> int:\n    return z * 3\ndef c2(y: int) -> int:\n    return y * 2\n",
+        encoding="utf-8",
+    )
+
+    u_a1 = {"name": "a1", "file": "cycle_pkg/mod_a.py", "start": 1, "end": 2, "kind": "function"}
+    u_b1 = {"name": "b1", "file": "cycle_pkg/mod_b.py", "start": 1, "end": 2, "kind": "function"}
+    u_b2 = {"name": "b2", "file": "cycle_pkg/mod_b.py", "start": 3, "end": 4, "kind": "function"}
+    u_c1 = {"name": "c1", "file": "cycle_pkg/mod_c.py", "start": 1, "end": 2, "kind": "function"}
+    u_c2 = {"name": "c2", "file": "cycle_pkg/mod_c.py", "start": 3, "end": 4, "kind": "function"}
+    u_a2 = {"name": "a2", "file": "cycle_pkg/mod_a.py", "start": 3, "end": 4, "kind": "function"}
+
+    # Pair 1: a1(host) <-> b1(caller) -> b imports a (b -> a)
+    # Pair 2: b2(host) <-> c1(caller) -> c imports b (c -> b)
+    # Pair 3: c2(host) <-> a2(caller) -> a imports c (a -> c), which closes a -> c -> b -> a cycle!
+    clones = [
+        (1.0, u_a1, u_b1),
+        (1.0, u_b2, u_c1),
+        (1.0, u_c2, u_a2),
+    ]
+
+    patch = generate_refactoring_patch(
+        clones,
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="host_module",
+    )
+
+    # Pair 1 & Pair 2 succeed and are wired
+    assert "from cycle_pkg.mod_a import _shared_a1_b1" in patch
+    assert "from cycle_pkg.mod_b import _shared_b2_c1" in patch
+
+    # Pair 3 is detected as closing a cycle: cycle_pkg.mod_a -> cycle_pkg.mod_c -> cycle_pkg.mod_b -> cycle_pkg.mod_a
+    assert "Circular import or unresolvable module path" in patch
+    assert "cycle_pkg.mod_a -> cycle_pkg.mod_c -> cycle_pkg.mod_b -> cycle_pkg.mod_a" in patch
+    # mod_a must NOT import from mod_c
+    assert "from cycle_pkg.mod_c import" not in patch
+
+
+def test_shared_module_computes_required_imports_for_host(tmp_path: Path) -> None:
+    """Verifies that shared modules receive typing and source dependencies even if already imported in f1."""
+    pkg = tmp_path / "imports_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src_f1 = (
+        "from typing import List\n"
+        "\n"
+        "def calc_roots(vals: List[float]) -> float:\n"
+        "    import math\n"
+        "    return math.sqrt(sum(vals))\n"
+    )
+    src_f2 = (
+        "from typing import List\n"
+        "\n"
+        "def compute_roots(items: List[float]) -> float:\n"
+        "    import math\n"
+        "    return math.sqrt(sum(items))\n"
+    )
+    (pkg / "f1.py").write_text(src_f1, encoding="utf-8")
+    (pkg / "f2.py").write_text(src_f2, encoding="utf-8")
+
+    u1 = {"name": "calc_roots", "file": "imports_pkg/f1.py", "start": 3, "end": 5, "kind": "function"}
+    u2 = {"name": "compute_roots", "file": "imports_pkg/f2.py", "start": 3, "end": 5, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    # Verify that the synthesized _common.py patch contains both typing and math imports
+    assert "diff --git a/imports_pkg/_common.py b/imports_pkg/_common.py" in patch
+    assert "+from typing import List" in patch
+    assert "+import math" in patch
