@@ -1918,3 +1918,143 @@ def test_generate_refactoring_patch_cross_module_when_one_file_is_already_shared
     assert run_proc.stdout.strip() == "31 31"
 
 
+def test_generate_refactoring_patch_cross_module_host_strategy_success(tmp_path: Path) -> None:
+    """Verifies cross-module clone consolidation when cross_file_strategy='host_module' with no cycle."""
+    pkg_dir = tmp_path / "host_pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    src_host = (
+        "def compute_data(x: int) -> int:\n"
+        "    res = x * 2 + 5\n"
+        "    return res\n"
+    )
+    src_caller = (
+        "def compute_other(x: int) -> int:\n"
+        "    res = x * 2 + 5\n"
+        "    return res\n"
+    )
+    (pkg_dir / "host.py").write_text(src_host, encoding="utf-8")
+    (pkg_dir / "caller.py").write_text(src_caller, encoding="utf-8")
+
+    u1 = {"name": "compute_data", "file": "host_pkg/host.py", "start": 1, "end": 3, "kind": "function"}
+    u2 = {"name": "compute_other", "file": "host_pkg/caller.py", "start": 1, "end": 3, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="host_module",
+    )
+
+    # host.py defines the helper
+    assert "--- a/host_pkg/host.py" in patch
+    assert "def _shared_compute_data_compute_other" in patch
+
+    # caller.py imports helper from host_pkg.host
+    assert "--- a/host_pkg/caller.py" in patch
+    assert "from host_pkg.host import _shared_compute_data_compute_other" in patch
+
+    # Apply diff and verify runtime
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    run_proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import host_pkg.host; import host_pkg.caller; "
+            "print(host_pkg.host.compute_data(4), host_pkg.caller.compute_other(4))",
+        ],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run_proc.returncode == 0
+    assert run_proc.stdout.strip() == "13 13"
+
+
+def test_generate_refactoring_patch_cross_module_host_strategy_circular_detection(
+    tmp_path: Path,
+) -> None:
+    """Verifies that host_module strategy detects transitive circular import and logs cycle diagnostic."""
+    pkg_dir = tmp_path / "cycle_pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    # Cycle chain: host -> mid -> caller
+    # If caller imports host, it closes caller -> host -> mid -> caller
+    src_caller = (
+        "def compute_c(x: int) -> int:\n"
+        "    return x + 10\n"
+    )
+    src_mid = (
+        "import cycle_pkg.caller\n\n"
+        "def compute_m(x: int) -> int:\n"
+        "    return cycle_pkg.caller.compute_c(x)\n"
+    )
+    src_host = (
+        "import cycle_pkg.mid\n\n"
+        "def compute_h(x: int) -> int:\n"
+        "    return x + 10\n"
+    )
+    (pkg_dir / "caller.py").write_text(src_caller, encoding="utf-8")
+    (pkg_dir / "mid.py").write_text(src_mid, encoding="utf-8")
+    (pkg_dir / "host.py").write_text(src_host, encoding="utf-8")
+
+    u_host = {"name": "compute_h", "file": "cycle_pkg/host.py", "start": 3, "end": 4, "kind": "function"}
+    u_caller = {"name": "compute_c", "file": "cycle_pkg/caller.py", "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u_host, u_caller)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="host_module",
+    )
+
+    # Cycle detected: cycle: cycle_pkg.caller -> cycle_pkg.host -> cycle_pkg.mid -> cycle_pkg.caller
+    assert (
+        "Circular import or unresolvable module path "
+        "(cycle: cycle_pkg.caller -> cycle_pkg.host -> cycle_pkg.mid -> cycle_pkg.caller)"
+    ) in patch
+    # caller.py must NOT be edited with a circular import
+    assert "--- a/cycle_pkg/caller.py" not in patch
+    assert "from cycle_pkg.host import" not in patch
+
+
+def test_generate_refactoring_patch_cross_module_missing_caller_file(tmp_path: Path) -> None:
+    """Verifies that missing caller file gracefully records refactoring commentary without crash."""
+    pkg_dir = tmp_path / "single_pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    src_f1 = (
+        "def compute_alone(x: int) -> int:\n"
+        "    return x * 3\n"
+    )
+    (pkg_dir / "file1.py").write_text(src_f1, encoding="utf-8")
+
+    u1 = {"name": "compute_alone", "file": "single_pkg/file1.py", "start": 1, "end": 2, "kind": "function"}
+    u2_missing = {"name": "compute_alone", "file": "single_pkg/nonexistent.py", "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2_missing)],
+        repo_root=str(tmp_path),
+        replace_clones=False,
+        cross_file_strategy="host_module",
+    )
+
+    assert "--- a/single_pkg/file1.py" in patch
+    assert "Complete refactoring by importing the helper into single_pkg/nonexistent.py" in patch
+
+
+

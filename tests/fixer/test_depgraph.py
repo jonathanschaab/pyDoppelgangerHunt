@@ -242,10 +242,26 @@ def test_depgraph_edge_cases(tmp_path: Path) -> None:
     assert _resolve_relative_import_path("pkg.mod", 5, "foo") == "foo"
     assert _resolve_relative_import_path("pkg.sub.mod", 1, "util") == "pkg.sub.util"
 
-    # 5. _parse_source_imports with syntax error
+    # 5. _parse_source_imports with syntax error and relative imports with no module name
     assert not _parse_source_imports("def broken(:\n", "mod")
+    assert "pkg.helper" in _parse_source_imports("from . import helper\n", "pkg.mod")
+    assert "pkg.sub.helper" in _parse_source_imports("from .sub import helper\n", "pkg.mod")
 
-    # 6. ModuleDependencyGraph edge cases
+    # 6. derive_module_import_path for top-level or src __init__.py
+    root_init = root / "__init__.py"
+    root_init.write_text("", encoding="utf-8")
+    assert derive_module_import_path(root_init, root) == ""
+
+    src_init = root / "src" / "__init__.py"
+    src_init.parent.mkdir(parents=True, exist_ok=True)
+    src_init.write_text("", encoding="utf-8")
+    assert derive_module_import_path(src_init, root) == ""
+
+    # 7. _resolve_relative_import_path empty base/module
+    assert _resolve_relative_import_path("pkg.mod", 1, "") == "pkg"
+    assert _resolve_relative_import_path("", 1, "") == ""
+
+    # 8. ModuleDependencyGraph edge cases
     graph = ModuleDependencyGraph(root)
     graph.add_module("", root / "empty.py")
     assert "" not in graph.adjacency
@@ -257,16 +273,27 @@ def test_depgraph_edge_cases(tmp_path: Path) -> None:
 
     assert not graph.has_transitive_path("", "b")
     assert not graph.has_transitive_path("a", "")
+    assert not graph.has_transitive_path("a", "nonexistent")
     assert graph.has_transitive_path("same", "same")
 
     assert graph.find_cycle_path("", "b") is None
     assert graph.find_cycle_path("a", "") is None
+    assert graph.find_cycle_path("a", "nonexistent") is None
     assert graph.find_cycle_path("same", "same") == ["same"]
 
-    # 7. build_from_repository with explicit file_paths and unreadable file
+    # Multi-path BFS exploration where neighbor is visited before target
+    graph.add_module("x1", root / "x1.py")
+    graph.add_module("x2", root / "x2.py")
+    graph.add_module("x3", root / "x3.py")
+    graph.add_dependency("x1", "x2")
+    graph.add_dependency("x1", "x3")
+    graph.add_dependency("x2", "x3")
+    assert graph.find_cycle_path("x1", "x3") == ["x1", "x3"]
+
+    # 9. build_from_repository with explicit file_paths and unreadable file
     f_ok = root / "ok.py"
     f_ok.write_text("x = 1\n", encoding="utf-8")
     f_not_py = root / "data.txt"
     f_not_py.write_text("hello", encoding="utf-8")
-    g_explicit = build_module_graph(root, file_paths=[f_ok, f_not_py])
+    g_explicit = build_module_graph(root, file_paths=[f_ok, f_not_py, root_init])
     assert "ok" in g_explicit.mod_to_file
