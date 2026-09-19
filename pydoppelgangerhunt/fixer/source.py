@@ -60,7 +60,7 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
                         b_col = getattr(first_body, "col_offset", 0)
                         extracted[0] = extracted[0][b_col:]
                     return textwrap.dedent("\n".join(extracted)).splitlines()
-    except Exception:  # pylint: disable=broad-exception-caught
+    except Exception:
         pass
     return raw_lines
 

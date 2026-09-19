@@ -1086,10 +1086,11 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
                 for sub in ast.walk(node.target):
                     if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
                         names.add(sub.id)
-            elif isinstance(node, (ast.For, ast.AsyncFor)):
-                for sub in ast.walk(node.target):
-                    if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
-                        names.add(sub.id)
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+                if hasattr(node, "target"):
+                    for sub in ast.walk(node.target):
+                        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                            names.add(sub.id)
                 _collect_top_defs(node.body)
                 _collect_top_defs(node.orelse)
             elif isinstance(node, (ast.With, ast.AsyncWith)):
@@ -1127,7 +1128,19 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
                             and getattr(sub, "name", None)
                         ):
                             names.add(sub.name)
+                        elif (
+                            hasattr(ast, "MatchMapping")
+                            and isinstance(sub, getattr(ast, "MatchMapping"))
+                            and getattr(sub, "rest", None)
+                        ):
+                            names.add(sub.rest)
                     _collect_top_defs(case.body)
+            elif hasattr(ast, "TypeAlias") and isinstance(node, getattr(ast, "TypeAlias")):
+                tgt_name = getattr(node, "name", None)
+                if isinstance(tgt_name, ast.Name):
+                    names.add(tgt_name.id)
+                elif isinstance(tgt_name, str):
+                    names.add(tgt_name)
 
     def _collect_top_named_exprs(node: ast.AST) -> None:
         for child in ast.iter_child_nodes(node):
@@ -1169,6 +1182,19 @@ def _extract_helper_symbols(
 
     def _collect_direct_bindings(stmts: Sequence[ast.stmt]) -> Set[str]:
         bound: Set[str] = set()
+
+        def _collect_helper_named_exprs(curr: ast.AST) -> None:
+            if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                return
+            for child in ast.iter_child_nodes(curr):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                if type(child).__name__ == "NamedExpr":
+                    target_node = getattr(child, "target", None)
+                    if isinstance(target_node, ast.Name):
+                        bound.add(target_node.id)
+                _collect_helper_named_exprs(child)
+
         for stmt in stmts:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 bound.add(stmt.name)
@@ -1227,16 +1253,8 @@ def _extract_helper_symbols(
                                 bound.add(m_name)
                     bound.update(_collect_direct_bindings(case.body))
 
-            for n in ast.walk(stmt):
-                if (
-                    isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                    and n is not stmt
-                ):
-                    continue
-                if type(n).__name__ == "NamedExpr":
-                    target_node = getattr(n, "target", None)
-                    if isinstance(target_node, ast.Name):
-                        bound.add(target_node.id)
+            if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                _collect_helper_named_exprs(stmt)
         return bound
 
     class _ScopeVisitor(ast.NodeVisitor):
@@ -2007,7 +2025,9 @@ def generate_refactoring_patch(
     method_binding = (method_binding or "auto").strip().lower()
     if method_binding not in ("auto", "method", "module"):
         method_binding = "auto"
-    graph_holder: List[Optional[ModuleDependencyGraph]] = [depgraph]
+    graph_holder: List[Optional[ModuleDependencyGraph]] = [
+        depgraph.copy() if depgraph is not None else None
+    ]
 
     def _get_depgraph() -> ModuleDependencyGraph:
         g = graph_holder[0]
@@ -2594,8 +2614,8 @@ def generate_refactoring_patch(
                         c_disp = normalize_path_string(str(c_plan.rel_path), strip_anchor=False)
                         c_desc = f" (cycle: {' -> '.join(c_cycle)})" if c_cycle else ""
                         c_msg = (
-                            f"# Note: Cross-module clone pair; helper generated in {host_disp}. "
-                            f"Circular import or unresolvable module path{c_desc}; import manually into {c_disp}.\n"
+                            f"# Note: Cross-module clone pair; helper extraction to {host_disp} rejected. "
+                            f"Circular import or unresolvable module path{c_desc}.\n"
                         )
                         f1_plan.comments.append(c_msg)
                         f2_plan.comments.append(c_msg)
@@ -2727,7 +2747,7 @@ def generate_refactoring_patch(
                         cycle_desc = f" (cycle: {' -> '.join(host_cycle)})"
                         cycle_msg = (
                             f"# Note: Cross-module clone pair; helper extraction to {f1_disp} "
-                            f"rejected due to circular dependency{cycle_desc}; import manually into {f2_disp}.\n"
+                            f"rejected due to circular dependency{cycle_desc}.\n"
                         )
                         for plan in (f1_plan, f2_plan):
                             plan.comments.append(cycle_msg)
@@ -2759,8 +2779,8 @@ def generate_refactoring_patch(
                     elif direct_import:
                         cycle_desc = f" (cycle: {mod2} -> {mod1} -> {mod2})"
                     cycle_msg = (
-                        f"# Note: Cross-module clone pair; helper generated in {f1_disp}. "
-                        f"Circular import or unresolvable module path{cycle_desc}; import manually into {f2_disp}.\n"
+                        f"# Note: Cross-module clone pair; helper extraction to {f1_disp} rejected. "
+                        f"Circular import or unresolvable module path{cycle_desc}.\n"
                     )
                     for plan in (f1_plan, f2_plan):
                         plan.comments.append(cycle_msg)
@@ -2846,11 +2866,16 @@ def generate_refactoring_patch(
             )
 
     patch_chunks: List[str] = []
+    seen_comments: Set[str] = set()
     for plan in file_plans.values():
         chunk = _render_file_patch_plan(
             plan, replace_clones=replace_clones, repo_root=str(patch_root)
         )
         if chunk:
+            if not plan.replacements and not plan.module_helpers and not plan.method_helpers:
+                if chunk in seen_comments:
+                    continue
+                seen_comments.add(chunk)
             patch_chunks.append(chunk)
 
     return "\n".join(patch_chunks)

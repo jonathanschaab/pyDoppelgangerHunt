@@ -23,6 +23,7 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _build_whole_method_delegation,
     patch as patch_mod,
 )
+from pydoppelgangerhunt.fixer.depgraph import build_module_graph
 from pydoppelgangerhunt.parser import harvest_file_units
 
 
@@ -5095,5 +5096,102 @@ def test_generate_refactoring_patch_subdirectory_scan_detects_project_cycle(tmp_
     # script_b must not have an emitted replacement or import
     assert "from script_a import" not in patch
     assert "from tools.script_a import" not in patch
+
+
+def test_extract_defined_symbols_comprehensive_constructs() -> None:
+    """Verifies symbol extraction correctly discovers while loops, match mapping rest, and type aliases."""
+    code = (
+        "while active:\n"
+        "    x = 10\n"
+        "match payload:\n"
+        "    case {'key': val, **rest_kwargs}:\n"
+        "        pass\n"
+    )
+    names = patch_mod._extract_module_defined_names(code)
+    assert "x" in names
+    assert "val" in names
+    assert "rest_kwargs" in names
+
+    if sys.version_info >= (3, 12):
+        alias_code = "type CustomInt = int\n"
+        alias_names = patch_mod._extract_module_defined_names(alias_code)
+        assert "CustomInt" in alias_names
+
+
+def test_extract_helper_symbols_nested_walrus_isolation() -> None:
+    """Verifies walrus assignments inside nested functions do not leak into helper defined names."""
+    code = (
+        "def outer(val: int) -> int:\n"
+        "    def inner() -> int:\n"
+        "        if (inner_walrus := val > 0):\n"
+        "            return 1\n"
+        "        return 0\n"
+        "    return inner()\n"
+    )
+    tree = ast.parse(code)
+    _, defined, _ = patch_mod._extract_helper_symbols(tree.body[0])
+    assert "outer" in defined or "inner" in defined
+    assert "inner_walrus" not in defined
+
+
+def test_generate_refactoring_patch_does_not_mutate_caller_depgraph(
+    tmp_path: Path,
+) -> None:
+    """Verifies generate_refactoring_patch works on a copy of depgraph and does not mutate caller's graph."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    mod_a = pkg / "mod_a.py"
+    mod_b = pkg / "mod_b.py"
+
+    mod_a.write_text("import pkg.mod_b\ndef func_a(): return 123\n", encoding="utf-8")
+    mod_b.write_text("def func_b(): return 123\n", encoding="utf-8")
+
+    u1 = {"name": "func_a", "file": str(mod_a), "start": 2, "end": 2, "kind": "function"}
+    u2 = {"name": "func_b", "file": str(mod_b), "start": 1, "end": 1, "kind": "function"}
+
+    depgraph = build_module_graph(tmp_path)
+    snapshot_adj = {k: set(v) for k, v in depgraph.adjacency.items()}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="host_module",
+        depgraph=depgraph,
+    )
+
+    assert "Circular import or unresolvable module path" in patch
+    # Verify caller's depgraph adjacency remains identical
+    assert depgraph.adjacency == snapshot_adj
+
+
+def test_generate_refactoring_patch_deduplicates_standalone_advisory_comments(
+    tmp_path: Path,
+) -> None:
+    """Verifies duplicate standalone advisory comments are deduplicated across file plans without diffs."""
+    pkg = tmp_path / "dedup_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f1 = pkg / "file1.py"
+    f2 = pkg / "file2.py"
+
+    # Both files already import each other causing cycle
+    f1.write_text("import dedup_pkg.file2\ndef helper(): return 999\n", encoding="utf-8")
+    f2.write_text("import dedup_pkg.file1\ndef helper(): return 999\n", encoding="utf-8")
+
+    u1 = {"name": "helper", "file": str(f1), "start": 2, "end": 2, "kind": "function"}
+    u2 = {"name": "helper", "file": str(f2), "start": 2, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="host_module",
+    )
+
+    # Standalone comment should only appear once in patch output
+    assert patch.count("# Note: Cross-module clone pair; helper extraction") == 1
+
 
 

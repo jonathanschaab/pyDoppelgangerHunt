@@ -403,7 +403,6 @@ def prune_baseline(
 
     if unstaged_modified_ranges is None:
         try:
-            # pylint: disable=import-outside-toplevel
             from pydoppelgangerhunt.git_diff import get_git_modified_line_ranges
             try:
                 unstaged_modified_ranges = get_git_modified_line_ranges(
@@ -411,7 +410,7 @@ def prune_baseline(
                 )
             except TypeError:
                 unstaged_modified_ranges = get_git_modified_line_ranges(since_ref=None)
-        except Exception as err:  # pylint: disable=broad-exception-caught
+        except Exception as err:
             # Pragmatic fallback when git is unavailable, outside a repo, or query fails
             logger.debug(
                 "Failed to query unstaged git modified line ranges during baseline pruning: %s",

@@ -86,7 +86,7 @@ class _CommutativeCanonicalizer(ast.NodeTransformer):
         """Generates a stable string key for sorting commutative AST operands."""
         try:
             return ast.dump(node)
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception:
             return type(node).__name__
 
     def visit_BoolOp(self, node: ast.BoolOp) -> ast.BoolOp:

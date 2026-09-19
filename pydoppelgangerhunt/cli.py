@@ -244,7 +244,7 @@ def _run_type4_semantic_audit(
 ) -> bool:
     """Runs optional Type-4 semantic clone checks, returning True if strict check failed."""
     try:
-        import importlib  # pylint: disable=import-outside-toplevel
+        import importlib
         mod = importlib.import_module("check_semantic_clones")
         find_semantic_clones = getattr(mod, "find_semantic_clones")
         report_semantic_results = getattr(mod, "report_semantic_results")

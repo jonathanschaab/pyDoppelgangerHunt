@@ -124,7 +124,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         if arg_node.annotation is not None:
             try:
                 type_val = ast.unparse(arg_node.annotation)
-            except Exception as exc:  # pylint: disable=broad-exception-caught
+            except Exception as exc:
                 logger.debug("Failed to unparse argument annotation %r: %s", arg_node.annotation, exc)
                 type_val = None
 
@@ -132,7 +132,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         if default_node is not None:
             try:
                 default_val = ast.unparse(default_node)
-            except Exception as exc:  # pylint: disable=broad-exception-caught
+            except Exception as exc:
                 logger.debug("Failed to unparse default value %r: %s", default_node, exc)
                 default_val = None
 
@@ -148,7 +148,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         if node.returns is not None:
             try:
                 self.return_type = ast.unparse(node.returns)
-            except Exception as exc:  # pylint: disable=broad-exception-caught
+            except Exception as exc:
                 logger.debug("Failed to unparse return annotation %r: %s", node.returns, exc)
                 self.return_type = None
 
@@ -564,7 +564,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         if stmt is None:
             try:
                 stmt = ast.unparse(node)
-            except Exception as exc:  # pylint: disable=broad-exception-caught
+            except Exception as exc:
                 logger.debug("Failed to unparse import node %r: %s", node, exc)
                 return
 

@@ -139,7 +139,7 @@ exemptions = [
 When refactoring clones across different files with `--patch` and `--replace-clones`, `pyDoppelgangerHunt` uses directed dependency graph analysis to prevent circular imports:
 
 - **`auto`** *(default)*: Uses `shared_module` when clones share an enclosing Python package directory; falls back to `host_module` when clones only share the repository or `src/` root.
-- **`shared_module`**: Synthesizes a shared helper into a common utility module (e.g. `_common.py`) and wires relative or absolute imports for each caller.
+- **`shared_module`**: Synthesizes a shared helper into a common utility module (e.g. `_common.py`) and wires module imports for each caller.
 - **`host_module`**: Extracts the helper into the primary clone file and wires callers to import from it.
 - **`skip`**: Skips cross-module clone pairs and focuses exclusively on intra-file deduplication.
 
