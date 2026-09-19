@@ -3744,3 +3744,66 @@ def test_cross_file_host_local_definition_conflict_rejected(
             host_mod="host_mod",
         )
 
+
+def test_host_local_definition_omits_self_import_when_caller_imports_from_host(
+    tmp_path: Path,
+) -> None:
+    """Verifies that when a caller imports a dependency from host, host omits self-imports of its own local definition."""
+    # pylint: disable=protected-access
+    pkg = tmp_path / "self_import_pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    host_src = (
+        "class LocalDep:\n"
+        "    pass\n\n"
+        "def process_item1(item: LocalDep) -> int:\n"
+        "    return 42\n"
+    )
+    caller_src = (
+        "from self_import_pkg.host_mod import LocalDep\n\n"
+        "def process_item2(item: LocalDep) -> int:\n"
+        "    return 42\n"
+    )
+    f_host = pkg / "host_mod.py"
+    f_caller = pkg / "caller_mod.py"
+    f_host.write_text(host_src, encoding="utf-8")
+    f_caller.write_text(caller_src, encoding="utf-8")
+
+    # 1. Direct collector check
+    host_plan = patch_mod._FilePatchPlan(f_host, host_src, "self_import_pkg/host_mod.py")
+    helper_code = "def _shared_process_item1_process_item2(item: LocalDep) -> int:\n    return 42\n"
+    imports = patch_mod._collect_host_missing_imports(
+        host_plan=host_plan,
+        helper_code=helper_code,
+        scope={},
+        source_texts=[
+            (host_src, "self_import_pkg.host_mod", False),
+            (caller_src, "self_import_pkg.caller_mod", False),
+        ],
+        host_mod="self_import_pkg.host_mod",
+    )
+    # Must NOT contain self-import from self_import_pkg.host_mod
+    assert not any("self_import_pkg.host_mod" in imp for imp in imports)
+    assert not any("LocalDep" in imp for imp in imports)
+
+    # 2. End-to-end patch generation check
+    u1 = {"name": "process_item1", "file": str(f_host), "start": 4, "end": 5, "kind": "function"}
+    u2 = {"name": "process_item2", "file": str(f_caller), "start": 3, "end": 4, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="host",
+    )
+
+    # Host module diff must NOT contain a self-import
+    assert "+from self_import_pkg.host_mod import LocalDep" not in patch
+    assert "+import self_import_pkg.host_mod" not in patch
+    # Host module must receive the extracted helper
+    assert "def _shared_process_item1_process_item2(item: LocalDep) -> int:" in patch
+    # Caller module must import the extracted helper from host
+    assert "from self_import_pkg.host_mod import _shared_process_item1_process_item2" in patch
+
+

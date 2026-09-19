@@ -1454,6 +1454,36 @@ def _collect_host_missing_imports(
                                 f"conflicting imported symbol '{loaded_name}' across clone sources"
                             )
 
+        # Treat bindings imported from host_mod as satisfied by host's local definition
+        if not host_plan.is_new_file:
+            if host_defs is None:
+                host_defs = _extract_module_defined_names(host_plan.orig_text or "")
+            effective_host_mod = host_mod
+            if effective_host_mod is None:
+                for item in source_texts:
+                    src_text, s_mod, _ = _unpack_source_item(item)
+                    if src_text == host_plan.orig_text and s_mod:
+                        effective_host_mod = s_mod
+                        break
+            self_imported = [
+                sname
+                for sname, stmt in symbol_to_stmt.items()
+                if sname in host_defs
+                and (
+                    (
+                        bool(effective_host_mod)
+                        and (
+                            stmt.startswith(f"from {effective_host_mod} import ")
+                            or stmt == f"import {effective_host_mod}"
+                            or stmt.startswith(f"import {effective_host_mod} as ")
+                        )
+                    )
+                    or not effective_host_mod
+                )
+            ]
+            for sname in self_imported:
+                symbol_to_stmt.pop(sname, None)
+
         # Cross-check symbol_to_stmt against host module's existing and queued imports
         host_existing_stmts, _ = _extract_module_import_statements(
             host_plan.orig_text or "", source_mod=host_mod, is_package=is_host_pkg
