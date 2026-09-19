@@ -1419,6 +1419,7 @@ def analyze_unit_variable_scope(
         has_super = bool(info1.get("has_super", False) or info2.get("has_super", False))
         has_mangled = bool(info1.get("has_mangled_names", False) or info2.get("has_mangled_names", False))
         local_imports = list(dict.fromkeys(info1["local_imports"] + info2["local_imports"]))
+        local_imports_by_unit = [info1["local_imports"], info2["local_imports"]]
         yield_expr_names = info1["yield_expr_names"] + info2["yield_expr_names"]
         is_async = info1.get("is_async", False) or info2.get("is_async", False)
         conditional_outputs = list(dict.fromkeys(
@@ -1443,6 +1444,7 @@ def analyze_unit_variable_scope(
         has_super = bool(info1.get("has_super", False))
         has_mangled = bool(info1.get("has_mangled_names", False))
         local_imports = info1["local_imports"]
+        local_imports_by_unit = [info1["local_imports"]]
         yield_expr_names = info1["yield_expr_names"]
         is_async = info1.get("is_async", False)
         conditional_outputs = info1.get("conditional_outputs", [])
@@ -1483,6 +1485,7 @@ def analyze_unit_variable_scope(
         "has_super": has_super,
         "has_mangled_names": has_mangled,
         "local_imports": local_imports,
+        "local_imports_by_unit": local_imports_by_unit,
         "yield_expr_names": yield_expr_names,
         "is_async": is_async,
         "conditional_outputs": conditional_outputs,

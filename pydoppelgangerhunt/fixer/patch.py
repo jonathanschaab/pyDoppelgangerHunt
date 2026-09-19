@@ -1201,6 +1201,105 @@ def _extract_helper_symbols(
     return free_names, defined_names, local_imported_names
 
 
+def _parse_local_import_statements(
+    loc_imports: Sequence[str],
+    source_texts: Sequence[Union[str, Tuple[Any, ...]]],
+    source_idx: Optional[int] = None,
+) -> Dict[str, str]:
+    stmts: Dict[str, str] = {}
+
+    def _add_target(
+        s_item: Any,
+        lvl: int,
+        mod: Optional[str],
+        targets: Set[str],
+    ) -> None:
+        _, sm, s_pkg = _unpack_source_item(s_item)
+        if sm:
+            tm = _resolve_relative_import_path(sm, lvl, mod, is_package=s_pkg)
+            if tm:
+                targets.add(tm)
+
+    for loc_imp in loc_imports:
+        s_loc = loc_imp.strip()
+        if not s_loc:
+            continue
+        try:
+            loc_tree = ast.parse(s_loc)
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+
+        for node in loc_tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    name = alias.asname or alias.name.split(".", 1)[0]
+                    stmt = (
+                        f"import {alias.name} as {alias.asname}"
+                        if alias.asname
+                        else f"import {alias.name}"
+                    )
+                    if name in stmts and stmts[name] != stmt:
+                        raise ValueError(
+                            f"conflicting local import symbol '{name}' across clone sources"
+                        )
+                    stmts[name] = stmt
+            elif isinstance(node, ast.ImportFrom):
+                level = getattr(node, "level", 0) or 0
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    name = alias.asname or alias.name
+                    if level == 0 and node.module:
+                        stmt = (
+                            f"from {node.module} import {alias.name} as {alias.asname}"
+                            if alias.asname
+                            else f"from {node.module} import {alias.name}"
+                        )
+                    elif level > 0:
+                        resolved_targets: Set[str] = set()
+                        if source_idx is not None and 0 <= source_idx < len(source_texts):
+                            _add_target(
+                                source_texts[source_idx],
+                                level,
+                                node.module,
+                                resolved_targets,
+                            )
+                        if not resolved_targets and source_texts:
+                            matching_items = [
+                                item for item in source_texts
+                                if bool(_unpack_source_item(item)[0] and s_loc in (_unpack_source_item(item)[0] or ""))
+                            ]
+                            for item in matching_items or source_texts:
+                                _add_target(
+                                    item,
+                                    level,
+                                    node.module,
+                                    resolved_targets,
+                                )
+
+                        if len(resolved_targets) > 1:
+                            raise ValueError(
+                                f"conflicting local import symbol '{name}' across clone sources"
+                            )
+                        if not resolved_targets:
+                            continue
+                        target_mod = next(iter(resolved_targets))
+                        stmt = (
+                            f"from {target_mod} import {alias.name} as {alias.asname}"
+                            if alias.asname
+                            else f"from {target_mod} import {alias.name}"
+                        )
+                    else:
+                        continue
+
+                    if name in stmts and stmts[name] != stmt:
+                        raise ValueError(
+                            f"conflicting local import symbol '{name}' across clone sources"
+                        )
+                    stmts[name] = stmt
+    return stmts
+
+
 def _collect_host_missing_imports(
     host_plan: _FilePatchPlan,
     helper_code: str,
@@ -1239,78 +1338,38 @@ def _collect_host_missing_imports(
         missing.append(f"from typing import {', '.join(sorted(missing_typing))}")
 
     # 2. Local imports discovered during scope analysis
+    raw_units_local = scope.get("local_imports_by_unit")
+    unit_local_maps: List[Dict[str, str]] = []
+    if raw_units_local is not None:
+        for u_idx, raw_list in enumerate(raw_units_local):
+            s_idx = u_idx if u_idx < len(source_texts) else 0
+            u_map = _parse_local_import_statements(raw_list, source_texts, source_idx=s_idx)
+            unit_local_maps.append(u_map)
+    else:
+        flat_loc = scope.get("local_imports", [])
+        if len(source_texts) <= 1:
+            u_map = _parse_local_import_statements(flat_loc, source_texts, source_idx=0)
+            unit_local_maps = [u_map]
+        else:
+            for s_idx, item in enumerate(source_texts):
+                s_text = _unpack_source_item(item)[0] or ""
+                attributed = [
+                    stmt_str for stmt_str in flat_loc
+                    if stmt_str.strip() in s_text
+                ]
+                if not attributed and flat_loc:
+                    attributed = list(flat_loc)
+                u_map = _parse_local_import_statements(attributed, source_texts, source_idx=s_idx)
+                unit_local_maps.append(u_map)
+
     local_import_stmts: Dict[str, str] = {}
-    for loc_imp in scope.get("local_imports", []):
-        s_loc = loc_imp.strip()
-        if not s_loc:
-            continue
-        try:
-            loc_tree = ast.parse(s_loc)
-        except (SyntaxError, UnicodeDecodeError):
-            continue
-
-        for node in loc_tree.body:
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    name = alias.asname or alias.name.split(".", 1)[0]
-                    stmt = f"import {alias.name} as {alias.asname}" if alias.asname else f"import {alias.name}"
-                    if name in local_import_stmts and local_import_stmts[name] != stmt:
-                        raise ValueError(
-                            f"conflicting local import symbol '{name}' across clone sources"
-                        )
-                    local_import_stmts[name] = stmt
-            elif isinstance(node, ast.ImportFrom):
-                level = getattr(node, "level", 0) or 0
-                for alias in node.names:
-                    if alias.name == "*":
-                        continue
-                    name = alias.asname or alias.name
-                    if level == 0 and node.module:
-                        stmt = (
-                            f"from {node.module} import {alias.name} as {alias.asname}"
-                            if alias.asname
-                            else f"from {node.module} import {alias.name}"
-                        )
-                    elif level > 0:
-                        resolved_targets: Set[str] = set()
-                        for item in source_texts:
-                            s_text, s_mod, s_ispkg = _unpack_source_item(item)
-                            if s_text and s_loc in s_text and s_mod:
-                                t_mod = _resolve_relative_import_path(
-                                    s_mod, level, node.module, is_package=s_ispkg
-                                )
-                                if t_mod:
-                                    resolved_targets.add(t_mod)
-                        if not resolved_targets and source_texts:
-                            for item in source_texts:
-                                _, s_mod, s_ispkg = _unpack_source_item(item)
-                                if s_mod:
-                                    t_mod = _resolve_relative_import_path(
-                                        s_mod, level, node.module, is_package=s_ispkg
-                                    )
-                                    if t_mod:
-                                        resolved_targets.add(t_mod)
-
-                        if len(resolved_targets) > 1:
-                            raise ValueError(
-                                f"conflicting local import symbol '{name}' across clone sources"
-                            )
-                        if not resolved_targets:
-                            continue
-                        target_mod = next(iter(resolved_targets))
-                        stmt = (
-                            f"from {target_mod} import {alias.name} as {alias.asname}"
-                            if alias.asname
-                            else f"from {target_mod} import {alias.name}"
-                        )
-                    else:
-                        continue
-
-                    if name in local_import_stmts and local_import_stmts[name] != stmt:
-                        raise ValueError(
-                            f"conflicting local import symbol '{name}' across clone sources"
-                        )
-                    local_import_stmts[name] = stmt
+    for u_map in unit_local_maps:
+        for name, stmt in u_map.items():
+            if name in local_import_stmts and local_import_stmts[name] != stmt:
+                raise ValueError(
+                    f"conflicting local import symbol '{name}' across clone sources"
+                )
+            local_import_stmts[name] = stmt
 
     # 3. Source dependencies referenced in helper_code
     try:
@@ -1354,50 +1413,103 @@ def _collect_host_missing_imports(
         source_hoisted_symbols: Set[str] = set()
         host_defs: Optional[Set[str]] = None
 
-        for loaded_name in sorted(free_names):
+        symbols_to_check = set(free_names) | (helper_local_imported_names & source_bound_names)
+        for loaded_name in sorted(symbols_to_check):
             if loaded_name in ignored_names:
                 continue
 
-            found_in_any = (
-                loaded_name in symbol_to_stmt
-                or loaded_name in helper_local_imported_names
-            )
-            for s_map, _, s_defs in source_info:
-                if loaded_name in s_map:
-                    found_in_any = True
-                    stmt = s_map[loaded_name]
-                    if loaded_name in symbol_to_stmt and symbol_to_stmt[loaded_name] != stmt:
-                        raise ValueError(
-                            f"conflicting imported symbol '{loaded_name}' across clone sources"
-                        )
-                    symbol_to_stmt[loaded_name] = stmt
-                    if loaded_name not in helper_local_imported_names:
-                        source_hoisted_symbols.add(loaded_name)
+            num_units = max(len(unit_local_maps), len(source_texts))
+            unit_bindings: List[Tuple[str, Optional[str], Optional[str], int, int]] = []
+            for u_idx in range(num_units):
+                u_loc = unit_local_maps[u_idx] if u_idx < len(unit_local_maps) else {}
+                s_idx = u_idx if u_idx < len(source_texts) else 0
+                s_map, s_wild, s_defs = source_info[s_idx]
+                _, s_mod, _ = _unpack_source_item(source_texts[s_idx])
 
-            # Check for conflicting module definitions vs imports across clone sources
-            for item, (s_map, _, s_defs) in zip(source_texts, source_info):
-                if loaded_name in s_defs:
-                    _, s_mod, _ = _unpack_source_item(item)
-                    if loaded_name in symbol_to_stmt:
-                        imp_stmt = symbol_to_stmt[loaded_name]
-                        is_import_from_self = False
-                        if s_mod:
-                            expected_prefix = f"from {s_mod} import "
-                            if imp_stmt.startswith(expected_prefix):
-                                is_import_from_self = True
-                        if not is_import_from_self:
+                if loaded_name in u_loc:
+                    b_type = "import"
+                    b_val = u_loc[loaded_name]
+                elif loaded_name in s_map:
+                    b_type = "import"
+                    b_val = s_map[loaded_name]
+                elif loaded_name in s_defs:
+                    b_type = "def"
+                    b_val = s_mod or f"source_{s_idx}"
+                elif bool(s_wild):
+                    b_type = "wildcard"
+                    b_val = "*"
+                elif loaded_name in _BUILTIN_NAMES:
+                    b_type = "builtin"
+                    b_val = loaded_name
+                else:
+                    b_type = "unresolved"
+                    b_val = None
+
+                unit_bindings.append((b_type, b_val, s_mod, s_idx, u_idx))
+
+            # 1. Wildcard check: if any unit relies on wildcard and symbol is not explicitly imported or defined
+            has_wildcard = any(b[0] == "wildcard" for b in unit_bindings)
+            has_explicit = any(b[0] in ("import", "def") for b in unit_bindings)
+            if has_wildcard and not has_explicit and not is_same_file_host:
+                raise ValueError(
+                    f"symbol '{loaded_name}' potentially relies on wildcard import"
+                )
+
+            # 2. Builtin shadowed by local import or def while another unit uses builtin
+            has_builtin = any(b[0] == "builtin" for b in unit_bindings)
+            has_shadowed = any(b[0] in ("import", "def") for b in unit_bindings)
+            if has_builtin and has_shadowed:
+                raise ValueError(
+                    f"conflicting imported symbol '{loaded_name}' across clone sources"
+                )
+
+            # 3. If targeting a new shared module, any symbol without an agreed import cannot be resolved
+            has_import = any(b[0] == "import" for b in unit_bindings)
+            if host_plan.is_new_file and not has_import:
+                raise ValueError(
+                    f"unresolved symbol '{loaded_name}' in shared module"
+                )
+
+            # 4. Conflicting local definitions across different clone modules
+            def_mods = {b[1] for b in unit_bindings if b[0] == "def"}
+            if len(def_mods) > 1:
+                raise ValueError(
+                    f"conflicting local definition '{loaded_name}' across clone sources"
+                )
+
+            # 5. Check imports across units
+            has_unresolved = any(b[0] == "unresolved" for b in unit_bindings)
+            if has_import and (has_builtin or has_unresolved):
+                raise ValueError(
+                    f"conflicting imported symbol '{loaded_name}' across clone sources"
+                )
+
+            agreed_stmt: Optional[str] = None
+            for b_type, b_val, _, _, _ in unit_bindings:
+                if b_type == "import":
+                    imp_stmt = b_val
+                    assert imp_stmt is not None
+                    if def_mods:
+                        def_mod = next(iter(def_mods))
+                        is_from_def = bool(def_mod) and imp_stmt.startswith(f"from {def_mod} import ")
+                        if not is_from_def:
                             raise ValueError(
                                 f"conflicting imported symbol '{loaded_name}' across clone sources"
                             )
-                    elif host_plan.is_new_file and not found_in_any:
-                        pass
-
-            if not is_same_file_host:
-                if not found_in_any:
-                    if any(s_wild for _, s_wild, _ in source_info):
+                    if agreed_stmt is None:
+                        agreed_stmt = imp_stmt
+                    elif agreed_stmt != imp_stmt:
                         raise ValueError(
-                            f"symbol '{loaded_name}' potentially relies on wildcard import"
+                            f"conflicting imported symbol '{loaded_name}' across clone sources"
                         )
+
+            if agreed_stmt is not None:
+                symbol_to_stmt[loaded_name] = agreed_stmt
+                if loaded_name not in helper_local_imported_names:
+                    source_hoisted_symbols.add(loaded_name)
+            else:
+                # No agreed import exists: verify symbol resolution in host/caller modules
+                if not is_same_file_host:
                     if host_plan.is_new_file:
                         raise ValueError(
                             f"unresolved symbol '{loaded_name}' in shared module"
@@ -1422,30 +1534,19 @@ def _collect_host_missing_imports(
                             raise ValueError(
                                 f"conflicting local definition '{loaded_name}' across clone sources"
                             )
-                        if loaded_name not in s_map:
+                        if loaded_name not in s_map and not any(
+                            loaded_name in u for u in unit_local_maps
+                        ):
                             raise ValueError(
                                 f"unresolved symbol '{loaded_name}' in caller module"
                             )
                 else:
-                    for item, (s_map, s_wild, s_defs) in zip(source_texts, source_info):
-                        _, s_mod, _ = _unpack_source_item(item)
-                        has_binding = (
-                            loaded_name in s_map
-                            or (
-                                loaded_name in s_defs
-                                and bool(s_mod)
-                                and symbol_to_stmt.get(loaded_name, "").startswith(
-                                    f"from {s_mod} import "
-                                )
-                            )
-                            or loaded_name in helper_local_imported_names
-                            or loaded_name in local_import_stmts
-                            or bool(s_wild)
+                    if host_defs is None:
+                        host_defs = _extract_module_defined_names(host_plan.orig_text or "")
+                    if loaded_name not in host_imported and loaded_name not in host_defs:
+                        raise ValueError(
+                            f"unresolved symbol '{loaded_name}' in host module"
                         )
-                        if not has_binding:
-                            raise ValueError(
-                                f"conflicting imported symbol '{loaded_name}' across clone sources"
-                            )
 
         # Treat bindings imported from host_mod as satisfied by host's local definition
         if not host_plan.is_new_file:

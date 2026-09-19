@@ -3888,3 +3888,100 @@ def test_host_local_definition_omits_self_import_when_caller_imports_from_host(
     # Caller module must import the extracted helper from host
     assert "from self_import_pkg.host_mod import _shared_process_item1_process_item2" in patch
 
+
+def test_clone_differing_local_builtin_binding_rejected(tmp_path: Path) -> None:
+    """Verifies that extraction is rejected when one clone uses a builtin while another binds the name locally."""
+    pkg = tmp_path / "builtin_shadow_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "custom_utils.py").write_text("def len(x): return 999\n", encoding="utf-8")
+
+    src1 = (
+        "def count_items_1(items: list) -> int:\n"
+        "    return len(items)\n"
+    )
+    src2 = (
+        "def count_items_2(items: list) -> int:\n"
+        "    from builtin_shadow_pkg.custom_utils import len\n"
+        "    return len(items)\n"
+    )
+    f1 = pkg / "m1.py"
+    f2 = pkg / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "count_items_1", "file": str(f1), "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "count_items_2", "file": str(f2), "start": 1, "end": 3, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "conflicting imported symbol 'len' across clone sources" in patch
+    assert "skipping extraction" in patch
+
+
+def test_clone_differing_local_builtin_binding_rejected_same_file(tmp_path: Path) -> None:
+    """Verifies that same-file clones where one uses a builtin and another shadows it locally are rejected."""
+    f = tmp_path / "same_file_shadow.py"
+    src = (
+        "def count_items_1(items: list) -> int:\n"
+        "    return len(items)\n\n"
+        "def count_items_2(items: list) -> int:\n"
+        "    from math import isqrt as len\n"
+        "    return len(items)\n"
+    )
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {"name": "count_items_1", "file": str(f), "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "count_items_2", "file": str(f), "start": 4, "end": 6, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+
+    assert "conflicting imported symbol 'len' across clone sources" in patch
+    assert "skipping extraction" in patch
+
+
+def test_clones_with_matching_local_imports_hoisted_to_shared_module(tmp_path: Path) -> None:
+    """Verifies that when helper lacks a local import, an agreed local import from clones is safely hoisted."""
+    pkg = tmp_path / "shared_local_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = (
+        "from math import isqrt\n\n"
+        "def compute_1(x: int) -> int:\n"
+        "    return isqrt(x)\n"
+    )
+    src2 = (
+        "def compute_2(x: int) -> int:\n"
+        "    from math import isqrt\n"
+        "    return isqrt(x)\n"
+    )
+    f1 = pkg / "m1.py"
+    f2 = pkg / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "compute_1", "file": str(f1), "start": 3, "end": 4, "kind": "function"}
+    u2 = {"name": "compute_2", "file": str(f2), "start": 1, "end": 3, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=False,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "diff --git a/shared_local_pkg/_common.py b/shared_local_pkg/_common.py" in patch
+    assert "+from math import isqrt" in patch
+    assert "def _shared_compute_1_compute_2(x: int) -> int:" in patch
+
+
