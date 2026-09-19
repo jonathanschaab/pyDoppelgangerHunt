@@ -1384,7 +1384,3 @@ def test_ancestor_package_importing_nested_submodule_with_explicit_import_flagge
     graph = build_module_graph(root)
     cycle = graph.check_cycle_if_added("mypkg", "mypkg.sub.worker")
     assert cycle == ["mypkg", "mypkg.sub.worker", "mypkg.sub", "mypkg"]
-
-
-
-

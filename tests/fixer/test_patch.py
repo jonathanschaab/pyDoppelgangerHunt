@@ -4870,8 +4870,3 @@ def test_collect_host_missing_imports_substring_safety() -> None:
 def test_has_future_annotations_value_error_handling() -> None:
     """Verifies that _has_future_annotations gracefully handles source strings triggering ValueError."""
     assert patch_mod._has_future_annotations("def foo():\n    pass\x00") is False
-
-
-
-
-

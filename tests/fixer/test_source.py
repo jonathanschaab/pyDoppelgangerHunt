@@ -518,6 +518,3 @@ def test_find_enclosing_ast_node_corrupt_source_fallback() -> None:
     u = {"file": "test.py", "start": 1, "end": 2, "name": "foo", "kind": "function"}
     res = _find_innermost_enclosing_node("def foo():\n    pass\x00", u, (ast.FunctionDef,))
     assert res is None
-
-
-
