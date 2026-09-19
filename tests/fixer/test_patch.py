@@ -3641,11 +3641,106 @@ def test_nested_imports_do_not_suppress_outer_helper_imports(tmp_path: Path) -> 
     assert "from nested_import_pkg._common import _shared_run_step1_run_step2" in patch
 
 
+def test_type_checking_guarded_import_does_not_suppress_runtime_helper_typing(
+    tmp_path: Path,
+) -> None:
+    """Verifies that imports under 'if TYPE_CHECKING:' do not suppress runtime helper typing imports."""
+    pkg = tmp_path / "type_check_pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    # Existing _common.py contains guarded TYPE_CHECKING import
+    common_file = pkg / "_common.py"
+    common_file.write_text(
+        "from typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    from typing import List\n",
+        encoding="utf-8",
+    )
+
+    src1 = (
+        "def compute_items1(vals: List[int]) -> int:\n"
+        "    return sum(vals)\n"
+    )
+    src2 = (
+        "def compute_items2(vals: List[int]) -> int:\n"
+        "    return sum(vals)\n"
+    )
+    f1 = pkg / "c1.py"
+    f2 = pkg / "c2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "compute_items1", "file": str(f1), "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "compute_items2", "file": str(f2), "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    # _common.py patch MUST contain unconditional 'from typing import List'
+    assert "+from typing import List" in patch
 
 
+def test_cross_file_host_local_definition_conflict_rejected(
+    tmp_path: Path,
+) -> None:
+    """Verifies that cross-file extraction into host module is rejected when callers define conflicting local dependencies."""
+    # pylint: disable=protected-access
+    pkg = tmp_path / "host_conflict_pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
 
+    src_host = (
+        "class LocalService:\n"
+        "    pass\n\n"
+        "def process_service1(svc: LocalService) -> int:\n"
+        "    return 42\n"
+    )
+    src_caller = (
+        "class LocalService:\n"
+        "    pass\n\n"
+        "def process_service2(svc: LocalService) -> int:\n"
+        "    return 42\n"
+    )
+    f_host = pkg / "host_mod.py"
+    f_caller = pkg / "caller_mod.py"
+    f_host.write_text(src_host, encoding="utf-8")
+    f_caller.write_text(src_caller, encoding="utf-8")
 
+    u_host = {"name": "process_service1", "file": str(f_host), "start": 4, "end": 5, "kind": "function"}
+    u_caller = {"name": "process_service2", "file": str(f_caller), "start": 4, "end": 5, "kind": "function"}
 
+    patch = generate_refactoring_patch(
+        [(1.0, u_host, u_caller)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="host",
+    )
 
+    assert "conflicting local definition 'LocalService' across clone sources" in patch
+    # Extraction must be safely skipped, no helper inserted
+    assert "_shared_process_service1_process_service2" not in patch
 
+    # Direct collector verification for conflicting and unresolved symbols
+    host_plan = patch_mod._FilePatchPlan(f_host, src_host, "host_mod.py")
+    helper_code = "def _shared(svc: LocalService) -> int:\n    return 42\n"
+    with pytest.raises(ValueError, match="conflicting local definition 'LocalService'"):
+        patch_mod._collect_host_missing_imports(
+            host_plan=host_plan,
+            helper_code=helper_code,
+            scope={},
+            source_texts=[(src_host, "host_mod", False), (src_caller, "caller_mod", False)],
+            host_mod="host_mod",
+        )
+
+    with pytest.raises(ValueError, match="unresolved symbol 'LocalService' in caller module"):
+        patch_mod._collect_host_missing_imports(
+            host_plan=host_plan,
+            helper_code=helper_code,
+            scope={},
+            source_texts=[(src_host, "host_mod", False), ("# no defs\n", "caller_mod", False)],
+            host_mod="host_mod",
+        )
 

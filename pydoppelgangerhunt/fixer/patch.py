@@ -1222,7 +1222,7 @@ def _collect_host_missing_imports(
     against the destination host plan's actual content and existing missing_imports.
     """
     host_content = (host_plan.orig_text or "") + "\n" + "\n".join(host_plan.missing_imports)
-    host_imported = _get_module_imported_names(host_content)
+    host_imported = _get_module_imported_names(host_content, include_conditional=False)
 
     missing: List[str] = []
 
@@ -1415,6 +1415,24 @@ def _collect_host_missing_imports(
                         raise ValueError(
                             f"unresolved symbol '{loaded_name}' in host module"
                         )
+                    for item, (s_map, _, s_defs) in zip(source_texts, source_info):
+                        src_text, s_mod, _ = _unpack_source_item(item)
+                        if (
+                            (s_mod is not None and host_mod is not None and s_mod == host_mod)
+                            or (
+                                (s_mod is None or host_mod is None)
+                                and src_text == host_plan.orig_text
+                            )
+                        ):
+                            continue
+                        if loaded_name in s_defs:
+                            raise ValueError(
+                                f"conflicting local definition '{loaded_name}' across clone sources"
+                            )
+                        if loaded_name not in s_map:
+                            raise ValueError(
+                                f"unresolved symbol '{loaded_name}' in caller module"
+                            )
                 else:
                     for item, (s_map, s_wild, s_defs) in zip(source_texts, source_info):
                         _, s_mod, _ = _unpack_source_item(item)

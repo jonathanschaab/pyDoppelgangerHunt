@@ -418,6 +418,13 @@ def test_batch_82_get_module_imported_names_guarded_imports() -> None:
     assert "List" in imported
     assert "Sequence" in imported
 
+    unconditional = _get_module_imported_names(code, include_conditional=False)
+    assert "sys" in unconditional
+    assert "path" in unconditional
+    assert "Optional" not in unconditional
+    assert "List" not in unconditional
+    assert "Sequence" not in unconditional
+
 def test_batch_82_slice_unit_token_lines_single_line_bounds() -> None:
     """Verifies defensive single-line column bounds check in _slice_unit_token_lines."""
     from pydoppelgangerhunt.fixer import _slice_unit_token_lines  # pylint: disable=import-outside-toplevel

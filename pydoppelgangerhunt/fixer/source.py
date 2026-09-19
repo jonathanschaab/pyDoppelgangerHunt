@@ -148,7 +148,9 @@ def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]
     return res
 
 
-def _get_module_imported_names(source: str) -> Set[str]:
+def _get_module_imported_names(
+    source: str, include_conditional: bool = True
+) -> Set[str]:
     """Extracts top-level imported module and symbol names from source code."""
     try:
         tree = ast.parse(source)
@@ -162,7 +164,9 @@ def _get_module_imported_names(source: str) -> Set[str]:
         elif isinstance(stmt, ast.ImportFrom):
             for alias in stmt.names:
                 imported.add(alias.asname or alias.name)
-        elif isinstance(stmt, (ast.If, ast.Try, getattr(ast, "TryStar", ast.Try))):
+        elif include_conditional and isinstance(
+            stmt, (ast.If, ast.Try, getattr(ast, "TryStar", ast.Try))
+        ):
             for sub in ast.walk(stmt):
                 if isinstance(sub, (ast.Import, ast.ImportFrom)):
                     for alias in sub.names:
@@ -178,7 +182,9 @@ def _insert_imports_into_module(
     if not import_lines:
         return orig_lines
 
-    existing_stripped = {ln.strip() for ln in orig_lines}
+    existing_stripped = {
+        ln.strip() for ln in orig_lines if ln and not ln[0].isspace()
+    }
     seen: Set[str] = set()
     deduped_imports: List[str] = []
     for imp in import_lines:

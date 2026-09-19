@@ -538,5 +538,21 @@ def test_depgraph_pending_descendants_wiring(tmp_path: Path) -> None:
     assert not g2._pending_descendants
 
 
+def test_derive_shared_module_import_preserves_package_prefix_for_package_root(tmp_path: Path) -> None:
+    """Verifies derive_shared_module_import retains top-level package prefix when repo_root is a package."""
+    proj = tmp_path / "project"
+    pkg = proj / "mypkg"
+    sub = pkg / "sub"
+    sub.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (sub / "__init__.py").write_text("", encoding="utf-8")
+    mod = sub / "worker.py"
+    mod.write_text("x = 1\n", encoding="utf-8")
+    shared_sub = sub / "_common.py"
+    shared_pkg = pkg / "_common.py"
 
+    imp1 = derive_shared_module_import(mod, shared_sub, repo_root=pkg, prefer_relative=False)
+    assert imp1 == "mypkg.sub._common"
 
+    imp2 = derive_shared_module_import(mod, shared_pkg, repo_root=pkg, prefer_relative=False)
+    assert imp2 == "mypkg._common"

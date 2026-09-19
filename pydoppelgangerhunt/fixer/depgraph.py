@@ -222,10 +222,10 @@ def derive_shared_module_import(
         p_src.relative_to(effective_root)
         p_shared.relative_to(effective_root)
     except ValueError:
-        return derive_module_import_path(p_shared, p_root)
+        return derive_module_import_path(p_shared, effective_root)
 
     if not prefer_relative:
-        return derive_module_import_path(p_shared, p_root)
+        return derive_module_import_path(p_shared, effective_root)
 
     src_dir = _parent_dir_of_path(p_src)
     shared_dir = _parent_dir_of_path(p_shared)
@@ -234,17 +234,17 @@ def derive_shared_module_import(
     # Top-level source modules (at repo root or src/ root) have no enclosing package context;
     # relative imports with leading dots raise ImportError, so fall back to absolute module paths.
     if src_dir in (effective_root, effective_root / "src"):
-        return derive_module_import_path(p_shared, p_root)
+        return derive_module_import_path(p_shared, effective_root)
 
     # When shared file is at repo root (or src/ root), any relative import from a subpackage
     # would climb above top-level package and raise ImportError; fall back to absolute path.
     if shared_dir in (effective_root, effective_root / "src"):
-        return derive_module_import_path(p_shared, p_root)
+        return derive_module_import_path(p_shared, effective_root)
 
     try:
         rel_dir = os.path.relpath(str(shared_dir), str(src_dir))
     except ValueError:
-        return derive_module_import_path(p_shared, p_root)
+        return derive_module_import_path(p_shared, effective_root)
 
     if rel_dir == ".":
         return f".{shared_stem}" if shared_stem else "."
@@ -263,7 +263,7 @@ def derive_shared_module_import(
         except ValueError:
             pkg_depth = 0
     if up_count >= pkg_depth:
-        return derive_module_import_path(p_shared, p_root)
+        return derive_module_import_path(p_shared, effective_root)
 
     dots = "." * (up_count + 1)
     if down_parts:
