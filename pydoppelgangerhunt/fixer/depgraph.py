@@ -46,11 +46,11 @@ def _resolve_repo_relative_path(
     norm = str(file_path).replace("\\", "/")
     p = Path(norm)
     resolved_root = p_root.resolve()
+    pkg_root = _find_enclosing_package_root(resolved_root)
     if not p.is_absolute():
         cand = (resolved_root / p).resolve()
         if _is_within_root(cand, resolved_root) and (cand.is_file() or cand.is_dir()):
             return cand
-        pkg_root = _find_enclosing_package_root(resolved_root)
         if pkg_root != resolved_root:
             cand_pkg = (pkg_root / p).resolve()
             if _is_within_root(cand_pkg, resolved_root) and (
@@ -64,9 +64,12 @@ def _resolve_repo_relative_path(
         if not _is_within_root(cand, resolved_root):
             return _rejected_outside_root_path(resolved_root)
         return cand
-    if not _is_within_root(p, resolved_root):
-        return _rejected_outside_root_path(resolved_root)
-    return p.resolve()
+    resolved_path = p.resolve()
+    if _is_within_root(resolved_path, resolved_root):
+        return resolved_path
+    if pkg_root != resolved_root and _is_within_root(resolved_path, pkg_root):
+        return resolved_path
+    return _rejected_outside_root_path(resolved_root)
 
 
 def _find_enclosing_package_root(path: Path) -> Path:
