@@ -26,6 +26,7 @@ from pydoppelgangerhunt.fixer.binding import (
 )
 from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
+    _TRY_TYPES,
     _collect_top_level_import_nodes,
     _find_enclosing_package_root,
     _find_project_filesystem_root,
@@ -830,58 +831,146 @@ def _helper_requires_future_annotations(helper_code: str) -> bool:
     return False
 
 
+class _ModuleImportsResult(Tuple[Dict[str, str], List[str]]):
+    """Encapsulates extracted module imports with binding classification.
+
+    Inherits from Tuple[Dict[str, str], List[str]] so callers unpacking
+    (stmts, wildcards) maintain 100% backwards compatibility.
+    """
+
+    stmts: Dict[str, str]
+    wildcards: List[str]
+    unconditional_names: Set[str]
+    guarded_names: Set[str]
+    rebound_conflicts: Set[str]
+
+    def __new__(
+        cls,
+        stmts: Dict[str, str],
+        wildcards: List[str],
+        unconditional_names: Optional[Set[str]] = None,
+        guarded_names: Optional[Set[str]] = None,
+        rebound_conflicts: Optional[Set[str]] = None,
+    ) -> "_ModuleImportsResult":
+        instance = super().__new__(cls, (stmts, wildcards))
+        instance.stmts = stmts
+        instance.wildcards = wildcards
+        instance.unconditional_names = (
+            set() if unconditional_names is None else unconditional_names
+        )
+        instance.guarded_names = (
+            set() if guarded_names is None else guarded_names
+        )
+        instance.rebound_conflicts = (
+            set() if rebound_conflicts is None else rebound_conflicts
+        )
+        return instance
+
+
+def _parse_import_node_statements(
+    node: Union[ast.Import, ast.ImportFrom],
+    source_mod: Optional[str] = None,
+    is_package: bool = False,
+) -> Tuple[List[Tuple[str, str]], List[str]]:
+    """Extracts (bound_name, import_stmt) pairs and wildcard strings from an AST import node."""
+    name_stmts: List[Tuple[str, str]] = []
+    wildcards: List[str] = []
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+            if name != "*":
+                if alias.asname:
+                    stmt = f"import {alias.name} as {alias.asname}"
+                else:
+                    stmt = f"import {alias.name}"
+                name_stmts.append((name, stmt))
+    elif isinstance(node, ast.ImportFrom):
+        level = getattr(node, "level", 0) or 0
+        target_module = ""
+        if level == 0 and node.module:
+            target_module = node.module
+        elif level > 0:
+            if source_mod:
+                target_module = _resolve_relative_import_path(
+                    source_mod, level, node.module, is_package=is_package
+                )
+            else:
+                dots = "." * level
+                target_module = f"{dots}{node.module}" if node.module else dots
+
+        if target_module:
+            for alias in node.names:
+                if alias.name == "*":
+                    wildcards.append(f"from {target_module} import *")
+                else:
+                    name = alias.asname or alias.name
+                    if alias.asname:
+                        stmt = (
+                            f"from {target_module} import {alias.name} as {alias.asname}"
+                        )
+                    else:
+                        stmt = f"from {target_module} import {alias.name}"
+                    name_stmts.append((name, stmt))
+    return name_stmts, wildcards
+
+
 def _extract_module_import_statements(
     source_text: str,
     source_mod: Optional[str] = None,
     is_package: bool = False,
-) -> Tuple[Dict[str, str], List[str]]:
-    """Maps imported symbol/module names to clean import statements from source text."""
+) -> _ModuleImportsResult:
+    """Maps imported symbol/module names to clean import statements from source text.
+
+    Tracks final top-level bindings for rebound symbols, distinguishes unconditional
+    top-level imports from runtime-guarded imports, and detects conflicting rebindings.
+    """
     stmts: Dict[str, str] = {}
     wildcards: List[str] = []
+    unconditional_names: Set[str] = set()
+    guarded_names: Set[str] = set()
+    rebound_conflicts: Set[str] = set()
+
     if not source_text.strip():
-        return stmts, wildcards
+        return _ModuleImportsResult(stmts, wildcards)
     try:
         tree = ast.parse(source_text)
     except (SyntaxError, UnicodeDecodeError, ValueError):
-        return stmts, wildcards
+        return _ModuleImportsResult(stmts, wildcards)
 
-    for node in _collect_top_level_import_nodes(tree.body):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                name = alias.asname or alias.name.split(".", maxsplit=1)[0]
-                if name != "*" and name not in stmts:
-                    if alias.asname:
-                        stmts[name] = f"import {alias.name} as {alias.asname}"
-                    else:
-                        stmts[name] = f"import {alias.name}"
-        elif isinstance(node, ast.ImportFrom):
-            level = getattr(node, "level", 0) or 0
-            target_module = ""
-            if level == 0 and node.module:
-                target_module = node.module
-            elif level > 0:
-                if source_mod:
-                    target_module = _resolve_relative_import_path(
-                        source_mod, level, node.module, is_package=is_package
-                    )
-                else:
-                    dots = "." * level
-                    target_module = f"{dots}{node.module}" if node.module else dots
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            name_stmts, wilds = _parse_import_node_statements(
+                stmt, source_mod=source_mod, is_package=is_package
+            )
+            wildcards.extend(wilds)
+            for name, stmt_str in name_stmts:
+                if name in unconditional_names and stmts.get(name) != stmt_str:
+                    rebound_conflicts.add(name)
+                stmts[name] = stmt_str
+                unconditional_names.add(name)
+        else:
+            guarded_nodes = _collect_top_level_import_nodes(
+                [stmt], include_classes=False
+            )
+            for g_node in guarded_nodes:
+                name_stmts, wilds = _parse_import_node_statements(
+                    g_node, source_mod=source_mod, is_package=is_package
+                )
+                wildcards.extend(wilds)
+                for name, stmt_str in name_stmts:
+                    guarded_names.add(name)
+                    if name in unconditional_names and stmts.get(name) != stmt_str:
+                        rebound_conflicts.add(name)
+                    elif name not in stmts:
+                        stmts[name] = stmt_str
 
-            if target_module:
-                for alias in node.names:
-                    if alias.name == "*":
-                        wildcards.append(f"from {target_module} import *")
-                    else:
-                        name = alias.asname or alias.name
-                        if name not in stmts:
-                            if alias.asname:
-                                stmts[name] = (
-                                    f"from {target_module} import {alias.name} as {alias.asname}"
-                                )
-                            else:
-                                stmts[name] = f"from {target_module} import {alias.name}"
-    return stmts, wildcards
+    return _ModuleImportsResult(
+        stmts=stmts,
+        wildcards=wildcards,
+        unconditional_names=unconditional_names,
+        guarded_names=guarded_names,
+        rebound_conflicts=rebound_conflicts,
+    )
 
 
 def _canonicalize_helper_relative_imports(
@@ -992,28 +1081,51 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
             elif isinstance(node, ast.Assign):
                 for target in node.targets:
                     for sub in ast.walk(target):
-                        if isinstance(sub, ast.Name):
+                        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
                             names.add(sub.id)
             elif isinstance(node, ast.AnnAssign):
-                if isinstance(node.target, ast.Name):
+                if isinstance(node.target, ast.Name) and isinstance(node.target.ctx, ast.Store):
                     names.add(node.target.id)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                for sub in ast.walk(node.target):
+                    if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                        names.add(sub.id)
+                _collect_top_defs(node.body)
+                _collect_top_defs(node.orelse)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars:
+                        for sub in ast.walk(item.optional_vars):
+                            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                                names.add(sub.id)
+                _collect_top_defs(node.body)
             elif isinstance(node, ast.If):
                 _collect_top_defs(node.body)
                 _collect_top_defs(node.orelse)
-            elif isinstance(node, ast.Try):
+            elif isinstance(node, _TRY_TYPES):
                 _collect_top_defs(node.body)
                 for handler in node.handlers:
                     _collect_top_defs(handler.body)
                 _collect_top_defs(node.orelse)
                 _collect_top_defs(node.finalbody)
-            elif hasattr(ast, "TryStar") and isinstance(node, getattr(ast, "TryStar")):
-                _collect_top_defs(node.body)
-                for handler in node.handlers:
-                    _collect_top_defs(handler.body)
-                _collect_top_defs(node.orelse)
-                _collect_top_defs(node.finalbody)
-            elif isinstance(node, (ast.With, ast.AsyncWith)):
-                _collect_top_defs(node.body)
+            elif hasattr(ast, "Match") and isinstance(node, getattr(ast, "Match")):
+                for case in getattr(node, "cases", []):
+                    for sub in ast.walk(case.pattern):
+                        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                            names.add(sub.id)
+                        elif (
+                            hasattr(ast, "MatchAs")
+                            and isinstance(sub, getattr(ast, "MatchAs"))
+                            and getattr(sub, "name", None)
+                        ):
+                            names.add(sub.name)
+                        elif (
+                            hasattr(ast, "MatchStar")
+                            and isinstance(sub, getattr(ast, "MatchStar"))
+                            and getattr(sub, "name", None)
+                        ):
+                            names.add(sub.name)
+                    _collect_top_defs(case.body)
 
     _collect_top_defs(tree.body)
     return names
@@ -1417,22 +1529,22 @@ def _collect_host_missing_imports(
             and _unpack_source_item(source_texts[0])[0] == host_plan.orig_text
         )
 
-        source_info: List[Tuple[Dict[str, str], List[str], Set[str]]] = []
+        source_info: List[Tuple[_ModuleImportsResult, List[str], Set[str]]] = []
         for item in source_texts:
             src_text, src_mod, src_ispkg = _unpack_source_item(item)
             if not src_text:
                 continue
-            s_map, s_wild = _extract_module_import_statements(
+            s_res = _extract_module_import_statements(
                 src_text, source_mod=src_mod, is_package=src_ispkg
             )
             s_defs = _extract_module_defined_names(src_text)
-            source_info.append((s_map, s_wild, s_defs))
+            source_info.append((s_res, s_res.wildcards, s_defs))
 
         source_bound_names: Set[str] = (
             set(local_import_stmts.keys()) | helper_local_imported_names
         )
-        for s_map, _, s_defs in source_info:
-            source_bound_names.update(s_map.keys())
+        for s_res, _, s_defs in source_info:
+            source_bound_names.update(s_res.stmts.keys())
             source_bound_names.update(s_defs)
 
         effective_builtins = _BUILTIN_NAMES - source_bound_names
@@ -1452,15 +1564,26 @@ def _collect_host_missing_imports(
             for u_idx in range(num_units):
                 u_loc = unit_local_maps[u_idx] if u_idx < len(unit_local_maps) else {}
                 s_idx = u_idx if u_idx < len(source_texts) else 0
-                s_map, s_wild, s_defs = source_info[s_idx]
+                s_res, s_wild, s_defs = source_info[s_idx]
                 _, s_mod, _ = _unpack_source_item(source_texts[s_idx])
 
                 if loaded_name in u_loc:
                     b_type = "import"
                     b_val = u_loc[loaded_name]
-                elif loaded_name in s_map:
+                elif loaded_name in s_res.stmts:
+                    if loaded_name in s_res.rebound_conflicts:
+                        raise ValueError(
+                            f"conflicting imported symbol '{loaded_name}' rebound within source module"
+                        )
+                    if not is_same_file_host and (
+                        loaded_name in s_res.guarded_names
+                        and loaded_name not in s_res.unconditional_names
+                    ):
+                        raise ValueError(
+                            f"symbol '{loaded_name}' relies on runtime-guarded import in source module"
+                        )
                     b_type = "import"
-                    b_val = s_map[loaded_name]
+                    b_val = s_res.stmts[loaded_name]
                 elif loaded_name in s_defs:
                     b_type = "def"
                     b_val = s_mod or f"source_{s_idx}"
@@ -1536,7 +1659,17 @@ def _collect_host_missing_imports(
 
             if agreed_stmt is not None:
                 symbol_to_stmt[loaded_name] = agreed_stmt
-                if loaded_name not in helper_local_imported_names:
+                if (
+                    loaded_name not in helper_local_imported_names
+                    and not (
+                        is_same_file_host
+                        and any(
+                            loaded_name in s_info[0].guarded_names
+                            and loaded_name not in s_info[0].unconditional_names
+                            for s_info in source_info
+                        )
+                    )
+                ):
                     source_hoisted_symbols.add(loaded_name)
             else:
                 # No agreed import exists: verify symbol resolution in host/caller modules
@@ -1551,7 +1684,7 @@ def _collect_host_missing_imports(
                         raise ValueError(
                             f"unresolved symbol '{loaded_name}' in host module"
                         )
-                    for item, (s_map, _, s_defs) in zip(source_texts, source_info):
+                    for item, (s_res, _, s_defs) in zip(source_texts, source_info):
                         src_text, s_mod, _ = _unpack_source_item(item)
                         if (
                             (s_mod is not None and host_mod is not None and s_mod == host_mod)
@@ -1565,7 +1698,7 @@ def _collect_host_missing_imports(
                             raise ValueError(
                                 f"conflicting local definition '{loaded_name}' across clone sources"
                             )
-                        if loaded_name not in s_map and not any(
+                        if loaded_name not in s_res.stmts and not any(
                             loaded_name in u for u in unit_local_maps
                         ):
                             raise ValueError(
@@ -1610,16 +1743,22 @@ def _collect_host_missing_imports(
                 symbol_to_stmt.pop(sname, None)
 
         # Cross-check symbol_to_stmt against host module's existing and queued imports
-        host_existing_stmts, _ = _extract_module_import_statements(
+        host_existing_res = _extract_module_import_statements(
             host_plan.orig_text or "", source_mod=host_mod, is_package=is_host_pkg
         )
-        host_queued_stmts, _ = _extract_module_import_statements(
+        host_existing_stmts = host_existing_res.stmts
+        host_queued_res = _extract_module_import_statements(
             "\n".join(host_plan.missing_imports), source_mod=host_mod, is_package=is_host_pkg
         )
+        host_queued_stmts = host_queued_res.stmts
         all_host_stmts: Dict[str, str] = {**host_existing_stmts, **host_queued_stmts}
 
         for hname, hstmt in all_host_stmts.items():
             if hname in symbol_to_stmt:
+                if hname in host_existing_res.rebound_conflicts:
+                    raise ValueError(
+                        f"conflicting imported symbol '{hname}' rebound within host module"
+                    )
                 if symbol_to_stmt.pop(hname) != hstmt:
                     raise ValueError(
                         f"conflicting imported symbol '{hname}' across clone sources"

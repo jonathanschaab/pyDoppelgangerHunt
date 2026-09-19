@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import keyword
 import os
+import sys
 from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
@@ -23,6 +24,11 @@ EXCLUDED_GRAPH_DIRS: Set[str] = {
     ".gemini",
     "scratch",
 }
+
+if sys.version_info >= (3, 11):
+    _TRY_TYPES = (ast.Try, ast.TryStar)
+else:
+    _TRY_TYPES = (ast.Try,)
 
 
 def _is_within_root(path: Path, root: Path) -> bool:
@@ -556,6 +562,7 @@ def _is_inverted_type_checking_guard(test_node: ast.expr) -> bool:
 
 def _collect_top_level_import_nodes(
     stmts: Sequence[ast.stmt],
+    include_classes: bool = True,
 ) -> List[Union[ast.Import, ast.ImportFrom]]:
     """Recursively collects module-level runtime import nodes, skipping type-checking and functions."""
     result: List[Union[ast.Import, ast.ImportFrom]] = []
@@ -564,34 +571,81 @@ def _collect_top_level_import_nodes(
             result.append(stmt)
         elif isinstance(stmt, ast.If):
             if _is_type_checking_guard(stmt.test):
-                result.extend(_collect_top_level_import_nodes(stmt.orelse))
+                result.extend(
+                    _collect_top_level_import_nodes(
+                        stmt.orelse, include_classes=include_classes
+                    )
+                )
             elif _is_inverted_type_checking_guard(stmt.test):
-                result.extend(_collect_top_level_import_nodes(stmt.body))
+                result.extend(
+                    _collect_top_level_import_nodes(
+                        stmt.body, include_classes=include_classes
+                    )
+                )
             else:
-                result.extend(_collect_top_level_import_nodes(stmt.body))
-                result.extend(_collect_top_level_import_nodes(stmt.orelse))
-        elif isinstance(stmt, ast.Try):
-            result.extend(_collect_top_level_import_nodes(stmt.body))
+                result.extend(
+                    _collect_top_level_import_nodes(
+                        stmt.body, include_classes=include_classes
+                    )
+                )
+                result.extend(
+                    _collect_top_level_import_nodes(
+                        stmt.orelse, include_classes=include_classes
+                    )
+                )
+        elif isinstance(stmt, _TRY_TYPES):
+            result.extend(
+                _collect_top_level_import_nodes(
+                    stmt.body, include_classes=include_classes
+                )
+            )
             for handler in stmt.handlers:
-                result.extend(_collect_top_level_import_nodes(handler.body))
-            result.extend(_collect_top_level_import_nodes(stmt.orelse))
-            result.extend(_collect_top_level_import_nodes(stmt.finalbody))
-        elif hasattr(ast, "TryStar") and isinstance(stmt, getattr(ast, "TryStar")):
-            result.extend(_collect_top_level_import_nodes(stmt.body))
-            for handler in stmt.handlers:
-                result.extend(_collect_top_level_import_nodes(handler.body))
-            result.extend(_collect_top_level_import_nodes(stmt.orelse))
-            result.extend(_collect_top_level_import_nodes(stmt.finalbody))
+                result.extend(
+                    _collect_top_level_import_nodes(
+                        handler.body, include_classes=include_classes
+                    )
+                )
+            result.extend(
+                _collect_top_level_import_nodes(
+                    stmt.orelse, include_classes=include_classes
+                )
+            )
+            result.extend(
+                _collect_top_level_import_nodes(
+                    stmt.finalbody, include_classes=include_classes
+                )
+            )
         elif isinstance(stmt, ast.ClassDef):
-            result.extend(_collect_top_level_import_nodes(stmt.body))
+            if include_classes:
+                result.extend(
+                    _collect_top_level_import_nodes(
+                        stmt.body, include_classes=include_classes
+                    )
+                )
         elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-            result.extend(_collect_top_level_import_nodes(stmt.body))
+            result.extend(
+                _collect_top_level_import_nodes(
+                    stmt.body, include_classes=include_classes
+                )
+            )
         elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
-            result.extend(_collect_top_level_import_nodes(stmt.body))
-            result.extend(_collect_top_level_import_nodes(stmt.orelse))
+            result.extend(
+                _collect_top_level_import_nodes(
+                    stmt.body, include_classes=include_classes
+                )
+            )
+            result.extend(
+                _collect_top_level_import_nodes(
+                    stmt.orelse, include_classes=include_classes
+                )
+            )
         elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):
             for case in getattr(stmt, "cases", []):
-                result.extend(_collect_top_level_import_nodes(case.body))
+                result.extend(
+                    _collect_top_level_import_nodes(
+                        case.body, include_classes=include_classes
+                    )
+                )
     return result
 
 

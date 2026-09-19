@@ -4870,3 +4870,132 @@ def test_collect_host_missing_imports_substring_safety() -> None:
 def test_has_future_annotations_value_error_handling() -> None:
     """Verifies that _has_future_annotations gracefully handles source strings triggering ValueError."""
     assert patch_mod._has_future_annotations("def foo():\n    pass\x00") is False
+
+
+def test_extract_module_import_statements_final_binding_and_rebound_conflicts() -> None:
+    """Verifies that later top-level imports override earlier bindings and flag conflicts."""
+    src = (
+        "from dep_a import transform\n"
+        "from dep_b import transform\n"
+        "import os\n"
+        "import os\n"
+    )
+    res = patch_mod._extract_module_import_statements(src)
+    assert res.stmts["transform"] == "from dep_b import transform"
+    assert "transform" in res.rebound_conflicts
+    assert "transform" in res.unconditional_names
+    assert res.stmts["os"] == "import os"
+    assert "os" not in res.rebound_conflicts
+    assert "os" in res.unconditional_names
+
+
+def test_collect_host_missing_imports_rejects_rebound_conflicts() -> None:
+    """Verifies that clone extraction fails when referencing a rebound conflicting symbol."""
+    source_code = (
+        "from dep_a import transform\n"
+        "from dep_b import transform\n\n"
+        "def compute(x: int) -> int:\n"
+        "    return transform(x)\n"
+    )
+    host_plan = patch_mod._FilePatchPlan(
+        Path("common.py"),
+        "",
+        "common.py",
+        is_new_file=True,
+    )
+    helper_code = "def helper_fn(x: int) -> int:\n    return transform(x)\n"
+    scope = {"module": "source_mod"}
+
+    with pytest.raises(
+        ValueError,
+        match="conflicting imported symbol 'transform' rebound within source module",
+    ):
+        patch_mod._collect_host_missing_imports(
+            host_plan=host_plan,
+            helper_code=helper_code,
+            scope=scope,
+            source_texts=[(source_code, "source_mod", False)],
+        )
+
+
+def test_collect_host_missing_imports_rejects_cross_file_guarded_imports() -> None:
+    """Verifies that cross-file extraction rejects symbols relying on runtime fallback imports."""
+    source_code = (
+        "try:\n"
+        "    from fast_dep import transform\n"
+        "except ImportError:\n"
+        "    from fallback_dep import transform\n\n"
+        "def compute(x: int) -> int:\n"
+        "    return transform(x)\n"
+    )
+    host_plan = patch_mod._FilePatchPlan(
+        Path("pkg/_common.py"),
+        "",
+        "pkg/_common.py",
+        is_new_file=True,
+    )
+    helper_code = "def helper_fn(x: int) -> int:\n    return transform(x)\n"
+    scope = {"module": "pkg.worker"}
+
+    with pytest.raises(
+        ValueError,
+        match="symbol 'transform' relies on runtime-guarded import in source module",
+    ):
+        patch_mod._collect_host_missing_imports(
+            host_plan=host_plan,
+            helper_code=helper_code,
+            scope=scope,
+            source_texts=[(source_code, "pkg.worker", False)],
+        )
+
+
+def test_collect_host_missing_imports_same_file_preserves_guarded_imports() -> None:
+    """Verifies that same-file host refactoring does not hoist guarded imports unconditionally."""
+    source_code = (
+        "try:\n"
+        "    import ujson as json\n"
+        "except ImportError:\n"
+        "    import json\n\n"
+        "def f1(d):\n"
+        "    return json.dumps(d)\n"
+    )
+    host_plan = patch_mod._FilePatchPlan(
+        Path("pkg/worker.py"),
+        source_code,
+        "pkg/worker.py",
+        is_new_file=False,
+    )
+    helper_code = "def helper_fn(d):\n    return json.dumps(d)\n"
+    scope = {"module": "pkg.worker"}
+
+    missing = patch_mod._collect_host_missing_imports(
+        host_plan=host_plan,
+        helper_code=helper_code,
+        scope=scope,
+        source_texts=[(source_code, "pkg.worker", False)],
+    )
+    assert not any("json" in s for s in missing)
+
+
+def test_extract_module_defined_names_ignores_non_store_contexts() -> None:
+    """Verifies that attribute and subscript assignment targets do not register load-context names as defined."""
+    src = (
+        "config.value = 1\n"
+        "data[key] = 2\n"
+        "registry.items['id'] = 3\n"
+        "a, (b, c) = (10, (20, 30))\n"
+        "for item in data:\n"
+        "    pass\n"
+        "with open('foo') as f:\n"
+        "    pass\n"
+    )
+    defined = patch_mod._extract_module_defined_names(src)
+    assert "config" not in defined
+    assert "data" not in defined
+    assert "key" not in defined
+    assert "registry" not in defined
+    assert "a" in defined
+    assert "b" in defined
+    assert "c" in defined
+    assert "item" in defined
+    assert "f" in defined
