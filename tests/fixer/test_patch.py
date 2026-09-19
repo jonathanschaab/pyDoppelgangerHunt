@@ -4999,3 +4999,43 @@ def test_extract_module_defined_names_ignores_non_store_contexts() -> None:
     assert "c" in defined
     assert "item" in defined
     assert "f" in defined
+
+
+def test_extract_module_defined_names_augassign_and_walrus() -> None:
+    """Verifies that AugAssign store targets and module-level walrus expressions are extracted as defined."""
+    src = (
+        "total = 0\n"
+        "total += 10\n"
+        "state.count += 5\n"
+        "if (module_val := get_config()):\n"
+        "    pass\n"
+        "def helper_fn():\n"
+        "    if (nested_val := 99):\n"
+        "        pass\n"
+    )
+    defined = patch_mod._extract_module_defined_names(src)
+    assert "total" in defined
+    assert "module_val" in defined
+    assert "state" not in defined
+    assert "count" not in defined
+    assert "nested_val" not in defined
+
+
+def test_collect_host_missing_imports_rejects_import_rebound_by_definition(tmp_path: Path) -> None:
+    """Verifies that attempting cross-file extraction of a symbol rebound by local definition is rejected."""
+    plan = patch_mod._FilePatchPlan(tmp_path / "mod_target.py", "", "mod_target.py", is_new_file=True)
+    source_code = (
+        "from dep_lib import process\n"
+        "def process(x: int) -> int:\n"
+        "    return x + 10\n"
+    )
+    helper_code = "def _shared(x: int) -> int:\n    return process(x)\n"
+
+    with pytest.raises(ValueError, match="conflicting imported symbol 'process' rebound by local definition"):
+        patch_mod._collect_host_missing_imports(
+            host_plan=plan,
+            helper_code=helper_code,
+            scope={"local_imports": []},
+            source_texts=[(source_code, "pkg.worker", False)],
+        )
+

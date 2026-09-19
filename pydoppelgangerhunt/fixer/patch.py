@@ -1082,9 +1082,10 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
                     for sub in ast.walk(target):
                         if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
                             names.add(sub.id)
-            elif isinstance(node, ast.AnnAssign):
-                if isinstance(node.target, ast.Name) and isinstance(node.target.ctx, ast.Store):
-                    names.add(node.target.id)
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                for sub in ast.walk(node.target):
+                    if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                        names.add(sub.id)
             elif isinstance(node, (ast.For, ast.AsyncFor)):
                 for sub in ast.walk(node.target):
                     if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
@@ -1101,13 +1102,9 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
             elif isinstance(node, ast.If):
                 _collect_top_defs(node.body)
                 _collect_top_defs(node.orelse)
-            elif isinstance(node, ast.Try):
-                _collect_top_defs(node.body)
-                for handler in node.handlers:
-                    _collect_top_defs(handler.body)
-                _collect_top_defs(node.orelse)
-                _collect_top_defs(node.finalbody)
-            elif hasattr(ast, "TryStar") and isinstance(node, getattr(ast, "TryStar")):
+            elif isinstance(node, ast.Try) or (
+                hasattr(ast, "TryStar") and isinstance(node, getattr(ast, "TryStar"))
+            ):
                 _collect_top_defs(getattr(node, "body", []))
                 for handler in getattr(node, "handlers", []):
                     _collect_top_defs(getattr(handler, "body", []))
@@ -1132,7 +1129,18 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
                             names.add(sub.name)
                     _collect_top_defs(case.body)
 
+    def _collect_top_named_exprs(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if type(child).__name__ == "NamedExpr":
+                tgt = getattr(child, "target", None)
+                if isinstance(tgt, ast.Name) and isinstance(tgt.ctx, ast.Store):
+                    names.add(tgt.id)
+            _collect_top_named_exprs(child)
+
     _collect_top_defs(tree.body)
+    _collect_top_named_exprs(tree)
     return names
 
 
@@ -1576,6 +1584,10 @@ def _collect_host_missing_imports(
                     b_type = "import"
                     b_val = u_loc[loaded_name]
                 elif loaded_name in s_res.stmts:
+                    if loaded_name in s_defs:
+                        raise ValueError(
+                            f"conflicting imported symbol '{loaded_name}' rebound by local definition within source module"
+                        )
                     if loaded_name in s_res.rebound_conflicts:
                         raise ValueError(
                             f"conflicting imported symbol '{loaded_name}' rebound within source module"
@@ -1760,6 +1772,10 @@ def _collect_host_missing_imports(
 
         for hname, hstmt in all_host_stmts.items():
             if hname in symbol_to_stmt:
+                if host_defs is not None and hname in host_defs:
+                    raise ValueError(
+                        f"conflicting imported symbol '{hname}' rebound by local definition within host module"
+                    )
                 if hname in host_existing_res.rebound_conflicts:
                     raise ValueError(
                         f"conflicting imported symbol '{hname}' rebound within host module"
