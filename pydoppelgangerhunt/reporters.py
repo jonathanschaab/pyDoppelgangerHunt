@@ -79,6 +79,8 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
             return placeholder
         if resolved_against_repo_root and repo_root:
             resolved_root = Path(repo_root).resolve()
+            if resolved_root.is_file():
+                resolved_root = resolved_root.parent
             try:
                 resolved_file.relative_to(resolved_root)
             except ValueError:
@@ -91,14 +93,12 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
                 return placeholder
         elif repo_root:
             resolved_root = Path(repo_root).resolve()
+            if resolved_root.is_file():
+                resolved_root = resolved_root.parent
             try:
                 resolved_file.relative_to(resolved_root)
             except ValueError:
-                resolved_cwd = Path.cwd().resolve()
-                try:
-                    resolved_file.relative_to(resolved_cwd)
-                except ValueError:
-                    return placeholder
+                return placeholder
     except (OSError, RuntimeError, ValueError):
         return placeholder
 

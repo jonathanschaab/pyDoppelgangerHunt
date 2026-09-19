@@ -652,6 +652,15 @@ def test_batch_36_path_resolution_and_same_file_matching(tmp_path: Any) -> None:
     assert _is_same_file_path(abs_path_str, rel_path_dot, repo_root=str(tmp_path))
     assert _is_same_file_path(rel_path_plain, rel_path_dot, repo_root=str(tmp_path))
 
+    symlink_file = tmp_path / "sym_sample.py"
+    try:
+        symlink_file.symlink_to(target_file)
+    except (OSError, NotImplementedError):
+        pass
+    if symlink_file.is_symlink():
+        assert not _is_same_file_path(abs_path_str, str(symlink_file), repo_root=str(tmp_path))
+        assert not _is_same_file_path(str(symlink_file), abs_path_str, repo_root=str(tmp_path))
+
     # 3. check_units_overlap with differing path formats
     u_base = {"file": abs_path_str, "start": 2, "end": 4}
     u_overlap = {"file": rel_path_dot, "start": 3, "end": 5}

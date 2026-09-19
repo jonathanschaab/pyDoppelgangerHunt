@@ -2064,12 +2064,16 @@ def generate_refactoring_patch(
             )
         return file_plans[file_p]
 
+    candidate_roots = (
+        (fs_root,) if repo_root is not None else (fs_root, patch_root, import_root)
+    )
+
     for sim, u1, u2 in clones:
         f1_raw = normalize_path_string(str(u1.get("file") or ""), strip_anchor=True)
         if not f1_raw:
             continue
         f1_path, is_f1_rejected = _validate_clone_file_path(
-            f1_raw, (fs_root, patch_root, import_root)
+            f1_raw, candidate_roots
         )
         if is_f1_rejected or f1_path is None:
             continue
@@ -2089,7 +2093,19 @@ def generate_refactoring_patch(
         orig_lines = f1_plan.orig_lines
 
         f2_raw = normalize_path_string(str(u2.get("file") or ""), strip_anchor=True)
-        is_same_file = _is_same_file_path(f1_raw, f2_raw, repo_root=str(root))
+        f2_path: Optional[Path] = None
+        if f2_raw:
+            f2_path, is_f2_rejected = _validate_clone_file_path(
+                f2_raw, candidate_roots
+            )
+            if is_f2_rejected:
+                continue
+
+        is_same_file = False
+        if f2_path is not None and f1_path is not None and f2_path == f1_path:
+            is_same_file = True
+        elif not f2_raw or _is_same_file_path(f1_raw, f2_raw, repo_root=str(root)):
+            is_same_file = True
 
         enc1 = find_enclosing_class(orig_text, u1)
         fn1 = find_enclosing_function(orig_text, u1)
@@ -2101,11 +2117,6 @@ def generate_refactoring_patch(
             enc2 = find_enclosing_class(orig_text, u2)
             fn2 = find_enclosing_function(orig_text, u2)
         elif f2_raw:
-            f2_path, is_f2_rejected = _validate_clone_file_path(
-                f2_raw, (fs_root, patch_root, import_root)
-            )
-            if is_f2_rejected:
-                continue
             if f2_path is not None:
                 rel_f2 = _format_patch_relative_path(f2_path, patch_root, fs_root)
                 f2_plan = file_plans.get(f2_path)

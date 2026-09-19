@@ -4658,6 +4658,45 @@ def test_generate_refactoring_patch_rejects_internal_symlink_clone(
     assert "real.py" not in patch
     assert patch == ""
 
+    # Inverted pair: u2 is real.py (valid) and u1 is link.py (symlink to real.py).
+    # Must be rejected before same-file detection and must NOT modify real.py.
+    patch_inverted = generate_refactoring_patch(
+        [(1.0, u2, u1)],
+        repo_root=str(repo),
+        replace_clones=True,
+    )
+    assert "real.py" not in patch_inverted
+    assert patch_inverted == ""
+
+
+def test_generate_refactoring_patch_rejects_absolute_path_outside_repo_root(
+    tmp_path: Path,
+) -> None:
+    """Verifies that an absolute path outside repo_root is rejected even if inside cwd or parent."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    sub_repo = project / "sub_repo"
+    sub_repo.mkdir()
+    (sub_repo / "__init__.py").write_text("", encoding="utf-8")
+
+    outside_file = project / "outside.py"
+    outside_file.write_text("def helper(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+
+    inside_file = sub_repo / "inside.py"
+    inside_file.write_text("def helper(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+
+    u_inside = {"name": "helper", "file": "inside.py", "start": 1, "end": 2, "kind": "function"}
+    u_outside = {"name": "helper", "file": str(outside_file), "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u_inside, u_outside)],
+        repo_root=str(sub_repo),
+        replace_clones=True,
+    )
+    assert patch == ""
+    assert "outside.py" not in patch
+    assert "inside.py" not in patch
+
 
 def test_resolve_safe_clone_file_path_filesystem_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

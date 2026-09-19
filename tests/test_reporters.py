@@ -501,6 +501,36 @@ def test_syntax_error_fallback_delegation_and_defensive_extract_source_code() ->
     lines_missing = extract_unit_source_code(u_missing)
     assert lines_missing == ["# Source for unit lines 55-55\n"]
 
+
+def test_extract_unit_source_code_rejects_out_of_root_absolute_path(tmp_path: Path) -> None:
+    """Verifies that extract_unit_source_code rejects absolute paths outside repo_root without falling back to CWD."""
+    sub_root = tmp_path / "sub_repo"
+    sub_root.mkdir()
+    outside_file = tmp_path / "outside.py"
+    outside_file.write_text("secret = 42\n", encoding="utf-8")
+
+    inside_file = sub_root / "inside.py"
+    inside_file.write_text("public = 1\n", encoding="utf-8")
+
+    u_outside: Dict[str, Any] = {
+        "file": str(outside_file),
+        "name": "secret_var",
+        "start": 1,
+        "end": 1,
+    }
+    lines = extract_unit_source_code(u_outside, repo_root=str(sub_root))
+    assert lines == ["# Source for secret_var lines 1-1\n"]
+    assert "secret = 42" not in "".join(lines)
+
+    u_inside: Dict[str, Any] = {
+        "file": str(inside_file),
+        "name": "public_var",
+        "start": 1,
+        "end": 1,
+    }
+    lines_in = extract_unit_source_code(u_inside, repo_root=str(sub_root))
+    assert lines_in == ["public = 1\n"]
+
     # 4. generate_html_report with family member None values
     fam: Dict[str, Any] = {
         "family_id": "CF-001",
