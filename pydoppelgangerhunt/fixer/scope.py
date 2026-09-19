@@ -568,7 +568,12 @@ class _ScopeVisitor(ast.NodeVisitor):
                 logger.debug("Failed to unparse import node %r: %s", node, exc)
                 return
 
-        if stmt not in self.local_imports:
+        is_nested = (
+            len(self._scope_stack) > 0
+            if self.is_subroutine
+            else len(self._scope_stack) > 1
+        )
+        if not is_nested and stmt not in self.local_imports:
             self.local_imports.append(stmt)
         for alias in node.names:
             if isinstance(node, ast.Import):
@@ -576,7 +581,8 @@ class _ScopeVisitor(ast.NodeVisitor):
             else:
                 bound_name = alias.asname or alias.name
             if bound_name != "*":
-                self.imported_names[bound_name] = stmt
+                if not is_nested:
+                    self.imported_names[bound_name] = stmt
                 self._record_store_name(bound_name)
 
     def visit_Import(self, node: ast.Import) -> None:
@@ -1419,6 +1425,7 @@ def analyze_unit_variable_scope(
         has_super = bool(info1.get("has_super", False) or info2.get("has_super", False))
         has_mangled = bool(info1.get("has_mangled_names", False) or info2.get("has_mangled_names", False))
         local_imports = list(dict.fromkeys(info1["local_imports"] + info2["local_imports"]))
+        local_imports_by_unit = [info1["local_imports"], info2["local_imports"]]
         yield_expr_names = info1["yield_expr_names"] + info2["yield_expr_names"]
         is_async = info1.get("is_async", False) or info2.get("is_async", False)
         conditional_outputs = list(dict.fromkeys(
@@ -1443,6 +1450,7 @@ def analyze_unit_variable_scope(
         has_super = bool(info1.get("has_super", False))
         has_mangled = bool(info1.get("has_mangled_names", False))
         local_imports = info1["local_imports"]
+        local_imports_by_unit = [info1["local_imports"]]
         yield_expr_names = info1["yield_expr_names"]
         is_async = info1.get("is_async", False)
         conditional_outputs = info1.get("conditional_outputs", [])
@@ -1483,6 +1491,7 @@ def analyze_unit_variable_scope(
         "has_super": has_super,
         "has_mangled_names": has_mangled,
         "local_imports": local_imports,
+        "local_imports_by_unit": local_imports_by_unit,
         "yield_expr_names": yield_expr_names,
         "is_async": is_async,
         "conditional_outputs": conditional_outputs,

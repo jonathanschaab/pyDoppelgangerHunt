@@ -142,6 +142,19 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         default=None,
         help="Target method binding strategy for patch refactoring ('auto', 'method', or 'module'; default: 'auto')",
     )
+    parser.add_argument(
+        "--cross-file-strategy",
+        type=str,
+        choices=["auto", "shared_module", "host_module", "skip"],
+        default=None,
+        help="Strategy for cross-module clone refactoring ('auto', 'shared_module', 'host_module', or 'skip'; default: 'auto')",
+    )
+    parser.add_argument(
+        "--shared-module-name",
+        type=str,
+        default=None,
+        help="Module filename for shared utility extractions (default: '_common.py')",
+    )
 
     color_group = parser.add_mutually_exclusive_group()
     color_group.add_argument("--color", dest="color", action="store_true", default=None, help="Force colorized terminal output")
@@ -604,6 +617,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     replace_clones = args.replace_clones or bool(tool_cfg.get("replace_clones", False))
     raw_strategy = args.type_merge_strategy or str(tool_cfg.get("type_merge_strategy", "fallback_any"))
     type_merge_strategy = raw_strategy if raw_strategy in ("fallback_any", "union") else "fallback_any"
+    raw_cross_file = args.cross_file_strategy or str(tool_cfg.get("cross_file_strategy", "auto"))
+    cross_file_strategy = (
+        raw_cross_file
+        if raw_cross_file in ("auto", "shared_module", "host_module", "host", "shared", "skip")
+        else "auto"
+    )
+    shared_module_name = str(args.shared_module_name or tool_cfg.get("shared_module_name", "_common.py"))
 
     if args.type4 and _run_type4_semantic_audit(target, excludes, args.strict_type4, use_color):
         return 1
@@ -731,6 +751,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 type_merge_strategy=type_merge_strategy,
                 replace_clones=replace_clones,
                 method_binding=method_binding,
+                cross_file_strategy=cross_file_strategy,
+                shared_module_name=shared_module_name,
             )
             if clones
             else ""

@@ -418,6 +418,13 @@ def test_batch_82_get_module_imported_names_guarded_imports() -> None:
     assert "List" in imported
     assert "Sequence" in imported
 
+    unconditional = _get_module_imported_names(code, include_conditional=False)
+    assert "sys" in unconditional
+    assert "path" in unconditional
+    assert "Optional" not in unconditional
+    assert "List" not in unconditional
+    assert "Sequence" not in unconditional
+
 def test_batch_82_slice_unit_token_lines_single_line_bounds() -> None:
     """Verifies defensive single-line column bounds check in _slice_unit_token_lines."""
     from pydoppelgangerhunt.fixer import _slice_unit_token_lines  # pylint: disable=import-outside-toplevel
@@ -436,3 +443,28 @@ def test_batch_82_slice_unit_token_lines_single_line_bounds() -> None:
         list(line),
     )
     assert res_inverted == ["sum(x for x in data)"]
+
+
+def test_insert_imports_orders_future_annotations_first() -> None:
+    """Verifies _insert_imports_into_module ensures from __future__ is placed before other imports."""
+    orig_lines = [
+        "\"\"\"Docstring.\"\"\"\n",
+        "\n",
+        "import os\n",
+    ]
+    imports_to_add = [
+        "import sys",
+        "from __future__ import annotations",
+        "from typing import List",
+    ]
+    result = _insert_imports_into_module(orig_lines, imports_to_add)
+    result_text = "".join(result)
+    fut_pos = result_text.find("from __future__ import annotations")
+    sys_pos = result_text.find("import sys")
+    typing_pos = result_text.find("from typing import List")
+    assert fut_pos != -1
+    assert sys_pos != -1
+    assert typing_pos != -1
+    assert fut_pos < sys_pos
+    assert fut_pos < typing_pos
+

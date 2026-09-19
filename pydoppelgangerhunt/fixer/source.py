@@ -101,7 +101,7 @@ def _find_module_helper_insertion_index(lines: List[str]) -> int:
 
     try:
         tree = ast.parse("".join(lines))
-    except SyntaxError:
+    except (SyntaxError, ValueError, UnicodeDecodeError):
         return min_insert_idx
 
     last_import_line = 0
@@ -148,11 +148,13 @@ def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]
     return res
 
 
-def _get_module_imported_names(source: str) -> Set[str]:
+def _get_module_imported_names(
+    source: str, include_conditional: bool = True
+) -> Set[str]:
     """Extracts top-level imported module and symbol names from source code."""
     try:
         tree = ast.parse(source)
-    except SyntaxError:
+    except (SyntaxError, ValueError, UnicodeDecodeError):
         return set()
     imported: Set[str] = set()
     for stmt in tree.body:
@@ -162,7 +164,9 @@ def _get_module_imported_names(source: str) -> Set[str]:
         elif isinstance(stmt, ast.ImportFrom):
             for alias in stmt.names:
                 imported.add(alias.asname or alias.name)
-        elif isinstance(stmt, (ast.If, ast.Try, getattr(ast, "TryStar", ast.Try))):
+        elif include_conditional and isinstance(
+            stmt, (ast.If, ast.Try, getattr(ast, "TryStar", ast.Try))
+        ):
             for sub in ast.walk(stmt):
                 if isinstance(sub, (ast.Import, ast.ImportFrom)):
                     for alias in sub.names:
@@ -178,7 +182,9 @@ def _insert_imports_into_module(
     if not import_lines:
         return orig_lines
 
-    existing_stripped = {ln.strip() for ln in orig_lines}
+    existing_stripped = {
+        ln.strip() for ln in orig_lines if ln and not ln[0].isspace()
+    }
     seen: Set[str] = set()
     deduped_imports: List[str] = []
     for imp in import_lines:
@@ -186,6 +192,13 @@ def _insert_imports_into_module(
         if s not in existing_stripped and s not in seen:
             seen.add(s)
             deduped_imports.append(imp)
+    future_imps = [
+        imp for imp in deduped_imports if imp.strip().startswith("from __future__")
+    ]
+    other_imps = [
+        imp for imp in deduped_imports if not imp.strip().startswith("from __future__")
+    ]
+    deduped_imports = future_imps + other_imps
     if not deduped_imports:
         return orig_lines
 
