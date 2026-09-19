@@ -1758,11 +1758,7 @@ def generate_refactoring_patch(
         fs_root = fs_root.parent
     patch_root = _find_project_filesystem_root(fs_root)
     root = fs_root
-    import_root = (
-        _find_enclosing_package_root(fs_root)
-        if (fs_root / "__init__.py").is_file()
-        else fs_root
-    )
+    import_root = _find_enclosing_package_root(fs_root)
     cross_file_strategy = (cross_file_strategy or "auto").strip().lower()
     if cross_file_strategy not in (
         "auto",
@@ -1784,7 +1780,7 @@ def generate_refactoring_patch(
     def _get_depgraph() -> ModuleDependencyGraph:
         g = graph_holder[0]
         if g is None:
-            g = build_module_graph(patch_root)
+            g = build_module_graph(import_root)
             graph_holder[0] = g
         return g
 
@@ -2044,6 +2040,8 @@ def generate_refactoring_patch(
         target_host_plan: Optional[_FilePatchPlan] = None
         target_host_text: Optional[str] = None
         cross_file_action = cross_file_strategy
+        if not is_same_file and cross_file_action in ("skip", "none"):
+            continue
         if cross_file_action == "auto" and not is_same_file and f2_plan is not None:
             common_dir = find_nearest_common_package(f1_path, f2_plan.path, patch_root)
             if common_dir.resolve() in (
@@ -2201,6 +2199,8 @@ def generate_refactoring_patch(
                 missing_imports=host_imports,
             )
         elif f2_plan is not None:
+            if cross_file_action in ("skip", "none"):
+                continue
             if cross_file_action in ("shared_module", "shared"):
                 if shared_p is None:
                     maybe_shared_p = _safely_resolve_shared_module_file(

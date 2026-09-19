@@ -32,13 +32,6 @@ def _resolve_repo_relative_path(
     norm = str(file_path).replace("\\", "/")
     p = Path(norm)
     if not p.is_absolute():
-        if p.is_file() or p.is_dir():
-            cand = p.resolve()
-            try:
-                cand.relative_to(p_root)
-                return cand
-            except ValueError:
-                pass
         cand = (p_root / p).resolve()
         if cand.is_file() or cand.is_dir():
             return cand
@@ -47,25 +40,50 @@ def _resolve_repo_relative_path(
             cand_pkg = (pkg_root / p).resolve()
             if cand_pkg.is_file() or cand_pkg.is_dir():
                 return cand_pkg
-        p = p_root / p
+        if p.is_file() or p.is_dir():
+            cand_cwd = p.resolve()
+            try:
+                cand_cwd.relative_to(p_root)
+                return cand_cwd
+            except ValueError:
+                pass
+        p = cand
     return p.resolve()
 
 
 def _find_enclosing_package_root(path: Path) -> Path:
-    """Finds the enclosing non-package directory if path is inside a Python package."""
+    """Finds the enclosing non-package directory (import root) for a module or directory.
+
+    Walks ancestor directories to find the outermost ancestor containing an '__init__.py'.
+    Returns that outermost package's parent directory. If no ancestor contains '__init__.py',
+    checks if the path or any parent is named 'src', or contains a 'src' directory,
+    falling back to the directory itself.
+    """
     curr = path.resolve()
     if curr.is_file():
         curr = curr.parent
-    if not (curr / "__init__.py").is_file():
-        return curr
-    while (curr / "__init__.py").is_file():
-        parent = curr.parent
-        if parent == curr:
-            break
-        if not (parent / "__init__.py").is_file():
+
+    # 1. Find highest ancestor that is still a Python package (contains __init__.py)
+    highest_pkg: Optional[Path] = None
+    node: Optional[Path] = curr
+    while node is not None and node.parent != node:
+        if (node / "__init__.py").is_file():
+            highest_pkg = node
+        node = node.parent
+
+    if highest_pkg is not None:
+        return highest_pkg.parent
+
+    # 2. If no ancestor contains __init__.py, check if curr is inside a 'src' container
+    for parent in (curr, *curr.parents):
+        if parent.name == "src" and parent.parent != parent:
             return parent
-        curr = parent
-    return curr.parent
+
+    # 3. If curr contains a 'src' directory, the import root is 'src'
+    if (curr / "src").is_dir():
+        return curr / "src"
+
+    return curr
 
 
 def _find_project_filesystem_root(path: Path) -> Path:

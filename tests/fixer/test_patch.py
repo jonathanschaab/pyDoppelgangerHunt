@@ -3830,6 +3830,60 @@ def test_collect_host_missing_imports_handles_shadowed_builtins(tmp_path: Path) 
     assert "skipping extraction" in patch_inconsistent
 
 
+def test_generate_refactoring_patch_cross_file_strategy_skip(tmp_path: Path) -> None:
+    """Verifies that cross_file_strategy='skip' bypasses cross-file clones while allowing same-file clones."""
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text("def a():\n    return 1\ndef b():\n    return 1\n", encoding="utf-8")
+    f2.write_text("def c():\n    return 1\n", encoding="utf-8")
+
+    u_a = {"name": "a", "file": "mod1.py", "start": 1, "end": 2, "kind": "function"}
+    u_b = {"name": "b", "file": "mod1.py", "start": 3, "end": 4, "kind": "function"}
+    u_c = {"name": "c", "file": "mod2.py", "start": 1, "end": 2, "kind": "function"}
+
+    # Pure cross-file pair with skip should produce no patch
+    patch_cross = generate_refactoring_patch(
+        [(1.0, u_a, u_c)],
+        repo_root=str(tmp_path),
+        cross_file_strategy="skip",
+    )
+    assert patch_cross == ""
+
+    # Same-file pair should still be extracted even when cross_file_strategy='skip'
+    patch_same = generate_refactoring_patch(
+        [(1.0, u_a, u_b)],
+        repo_root=str(tmp_path),
+        cross_file_strategy="skip",
+    )
+    assert "def _shared_a_b" in patch_same
+
+
+def test_generate_refactoring_patch_nested_subdirectory_without_init(tmp_path: Path) -> None:
+    """Verifies scanning a nested directory inside a package produces fully-qualified import paths."""
+    repo_root = tmp_path / "project"
+    pkg = repo_root / "my_pkg"
+    tools = pkg / "tools"
+    tools.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f1 = tools / "a.py"
+    f2 = tools / "b.py"
+    f1.write_text("def run(v: int) -> int:\n    return v * 3\n", encoding="utf-8")
+    f2.write_text("def run2(v: int) -> int:\n    return v * 3\n", encoding="utf-8")
+
+    u1 = {"name": "run", "file": "a.py", "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "run2", "file": "b.py", "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tools),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+    # Import must be fully qualified under my_pkg, not bare from _common
+    assert "from my_pkg.tools._common import _shared_run_run2" in patch
+    assert "from _common" not in patch
+
+
 def test_nested_imports_do_not_suppress_outer_helper_imports(tmp_path: Path) -> None:
     """Verifies that imports in nested functions/classes do not suppress outer helper imports."""
     # pylint: disable=protected-access

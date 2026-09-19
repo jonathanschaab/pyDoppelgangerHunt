@@ -932,5 +932,69 @@ def test_find_project_filesystem_root(tmp_path: Path) -> None:
     src_repo.mkdir()
     src_pkg = src_repo / "src" / "pkg"
     src_pkg.mkdir(parents=True)
-    (src_pkg / "__init__.py").write_text("", encoding="utf-8")
     assert _find_project_filesystem_root(src_pkg) == src_repo
+
+
+def test_resolve_repo_relative_path_prioritizes_repo_root_over_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that _resolve_repo_relative_path prioritizes repo_root over process CWD."""
+    from pydoppelgangerhunt.fixer.depgraph import (  # pylint: disable=import-outside-toplevel
+        _resolve_repo_relative_path,
+    )
+
+    cwd_dir = tmp_path / "cwd"
+    cwd_dir.mkdir()
+    (cwd_dir / "target.py").write_text("# cwd version\n", encoding="utf-8")
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    repo_target = repo_dir / "target.py"
+    repo_target.write_text("# repo version\n", encoding="utf-8")
+
+    monkeypatch.chdir(cwd_dir)
+    resolved = _resolve_repo_relative_path("target.py", repo_dir)
+    assert resolved == repo_target
+    assert resolved.read_text(encoding="utf-8") == "# repo version\n"
+
+
+def test_find_enclosing_package_root_nested_subdirectory_without_init(tmp_path: Path) -> None:
+    """Verifies that nested package directories without __init__.py discover the enclosing import root."""
+    from pydoppelgangerhunt.fixer.depgraph import (  # pylint: disable=import-outside-toplevel
+        _find_enclosing_package_root,
+        derive_module_import_path,
+    )
+
+    repo_root = tmp_path / "project"
+    pkg = repo_root / "my_pkg"
+    tools = pkg / "tools"
+    tools.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    mod_file = tools / "runner.py"
+    mod_file.write_text("x = 1\n", encoding="utf-8")
+
+    # tools has no __init__.py, but enclosing package is my_pkg with import root repo_root
+    import_root = _find_enclosing_package_root(tools)
+    assert import_root == repo_root
+    assert derive_module_import_path(mod_file, import_root) == "my_pkg.tools.runner"
+
+
+def test_find_enclosing_package_root_non_src_container(tmp_path: Path) -> None:
+    """Verifies that custom non-src containers like lib/ derive the correct import root."""
+    from pydoppelgangerhunt.fixer.depgraph import (  # pylint: disable=import-outside-toplevel
+        _find_enclosing_package_root,
+        derive_module_import_path,
+    )
+
+    project_root = tmp_path / "project"
+    lib_dir = project_root / "lib"
+    pkg = lib_dir / "custom_lib"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    mod_file = pkg / "core.py"
+    mod_file.write_text("y = 2\n", encoding="utf-8")
+
+    import_root = _find_enclosing_package_root(pkg)
+    assert import_root == lib_dir
+    assert derive_module_import_path(mod_file, import_root) == "custom_lib.core"
+
