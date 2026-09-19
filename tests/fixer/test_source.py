@@ -18,6 +18,7 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _extract_required_typing_imports,
     _extract_unit_body_lines,
     _find_module_helper_insertion_index,
+    _get_module_imported_names,
     _insert_imports_into_module,
 )
 
@@ -467,4 +468,36 @@ def test_insert_imports_orders_future_annotations_first() -> None:
     assert typing_pos != -1
     assert fut_pos < sys_pos
     assert fut_pos < typing_pos
+
+
+def test_get_module_imported_names_dotted_imports() -> None:
+    """Verifies that dotted imports record both the root bound identifier and full module name."""
+    src = (
+        "import os.path\n"
+        "import xml.etree.ElementTree as ET\n"
+        "from urllib.parse import urlparse\n"
+        "if True:\n"
+        "    import posixpath.constants\n"
+    )
+    names = _get_module_imported_names(src, include_conditional=True)
+    assert "os" in names
+    assert "os.path" in names
+    assert "ET" in names
+    assert "urlparse" in names
+    assert "posixpath" in names
+    assert "posixpath.constants" in names
+
+
+def test_insert_imports_into_module_corrupt_source_fallback() -> None:
+    """Verifies that if source code causes ast.parse to raise ValueError, manual parser falls back gracefully."""
+    corrupt_lines = [
+        "\"\"\"Docstring with null\x00byte.\"\"\"\n",
+        "def compute():\n",
+        "    return 42\n",
+    ]
+    imports = ["import math"]
+    res = _insert_imports_into_module(corrupt_lines, imports)
+    res_text = "".join(res)
+    assert "import math" in res_text
+
 

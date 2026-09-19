@@ -122,6 +122,8 @@ repos:
 threshold = 0.85
 min_lines = 8
 min_tokens = 15
+cross_file_strategy = "auto"
+shared_module_name = "_common.py"
 exclude = [
     "tests",
     "vendor",
@@ -131,6 +133,17 @@ exemptions = [
     ["module_a.py:func_1", "module_b.py:func_2"],
 ]
 ```
+
+### Cross-Module Deduplication Strategies
+
+When refactoring clones across different files with `--patch` and `--replace-clones`, `pyDoppelgangerHunt` uses directed dependency graph analysis to prevent circular imports:
+
+- **`auto`** *(default)*: Uses `shared_module` when clones share an enclosing Python package directory; falls back to `host_module` when clones only share the repository or `src/` root.
+- **`shared_module`**: Synthesizes a shared helper into a common utility module (e.g. `_common.py`) and wires relative or absolute imports for each caller.
+- **`host_module`**: Extracts the helper into the primary clone file and wires callers to import from it.
+- **`skip`**: Skips cross-module clone pairs and focuses exclusively on intra-file deduplication.
+
+If any proposed cross-module extraction would introduce a circular import or unresolvable path, `pyDoppelgangerHunt` records a descriptive advisory comment and keeps the refactoring transactional without emitting broken imports.
 
 To generate a starter configuration file in your project root:
 

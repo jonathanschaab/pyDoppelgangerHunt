@@ -26,6 +26,7 @@ from pydoppelgangerhunt.fixer.binding import (
 )
 from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
+    _collect_top_level_import_nodes,
     _find_enclosing_package_root,
     _find_project_filesystem_root,
     _is_safe_repo_python_file,
@@ -811,15 +812,16 @@ def _helper_requires_future_annotations(helper_code: str) -> bool:
         return False
     try:
         tree = ast.parse(helper_code)
-    except (SyntaxError, UnicodeDecodeError):
+    except (SyntaxError, UnicodeDecodeError, ValueError):
         return False
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            all_args = (
-                getattr(node.args, "posonlyargs", [])
-                + node.args.args
-                + getattr(node.args, "kwonlyargs", [])
-            )
+            all_args = [
+                *getattr(node.args, "posonlyargs", []),
+                *node.args.args,
+                *getattr(node.args, "kwonlyargs", []),
+                *(arg for arg in (node.args.vararg, node.args.kwarg) if arg is not None),
+            ]
             for arg in all_args:
                 if arg.annotation and _is_or_contains_bitor(arg.annotation):
                     return True
@@ -840,14 +842,14 @@ def _extract_module_import_statements(
         return stmts, wildcards
     try:
         tree = ast.parse(source_text)
-    except (SyntaxError, UnicodeDecodeError):
+    except (SyntaxError, UnicodeDecodeError, ValueError):
         return stmts, wildcards
 
-    for node in tree.body:
+    for node in _collect_top_level_import_nodes(tree.body):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 name = alias.asname or alias.name.split(".", maxsplit=1)[0]
-                if name != "*":
+                if name != "*" and name not in stmts:
                     if alias.asname:
                         stmts[name] = f"import {alias.name} as {alias.asname}"
                     else:
@@ -872,12 +874,13 @@ def _extract_module_import_statements(
                         wildcards.append(f"from {target_module} import *")
                     else:
                         name = alias.asname or alias.name
-                        if alias.asname:
-                            stmts[name] = (
-                                f"from {target_module} import {alias.name} as {alias.asname}"
-                            )
-                        else:
-                            stmts[name] = f"from {target_module} import {alias.name}"
+                        if name not in stmts:
+                            if alias.asname:
+                                stmts[name] = (
+                                    f"from {target_module} import {alias.name} as {alias.asname}"
+                                )
+                            else:
+                                stmts[name] = f"from {target_module} import {alias.name}"
     return stmts, wildcards
 
 
@@ -978,20 +981,41 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
         return set()
     try:
         tree = ast.parse(source_text)
-    except (SyntaxError, UnicodeDecodeError):
+    except (SyntaxError, UnicodeDecodeError, ValueError):
         return set()
     names: Set[str] = set()
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(node.name)
-        elif isinstance(node, ast.Assign):
-            for target in node.targets:
-                for sub in ast.walk(target):
-                    if isinstance(sub, ast.Name):
-                        names.add(sub.id)
-        elif isinstance(node, ast.AnnAssign):
-            if isinstance(node.target, ast.Name):
-                names.add(node.target.id)
+
+    def _collect_top_defs(stmts: Sequence[ast.stmt]) -> None:
+        for node in stmts:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    for sub in ast.walk(target):
+                        if isinstance(sub, ast.Name):
+                            names.add(sub.id)
+            elif isinstance(node, ast.AnnAssign):
+                if isinstance(node.target, ast.Name):
+                    names.add(node.target.id)
+            elif isinstance(node, ast.If):
+                _collect_top_defs(node.body)
+                _collect_top_defs(node.orelse)
+            elif isinstance(node, ast.Try):
+                _collect_top_defs(node.body)
+                for handler in node.handlers:
+                    _collect_top_defs(handler.body)
+                _collect_top_defs(node.orelse)
+                _collect_top_defs(node.finalbody)
+            elif hasattr(ast, "TryStar") and isinstance(node, getattr(ast, "TryStar")):
+                _collect_top_defs(node.body)
+                for handler in node.handlers:
+                    _collect_top_defs(handler.body)
+                _collect_top_defs(node.orelse)
+                _collect_top_defs(node.finalbody)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                _collect_top_defs(node.body)
+
+    _collect_top_defs(tree.body)
     return names
 
 
@@ -1490,7 +1514,8 @@ def _collect_host_missing_imports(
             for b_type, b_val, _, _, _ in unit_bindings:
                 if b_type == "import":
                     imp_stmt = b_val
-                    assert imp_stmt is not None
+                    if imp_stmt is None:
+                        continue
                     if def_mods:
                         def_mod = next(iter(def_mods))
                         is_from_def = bool(def_mod) and imp_stmt.startswith(f"from {def_mod} import ")
@@ -2372,6 +2397,64 @@ def generate_refactoring_patch(
                         f2_plan.comments.append(cycle_msg)
                         continue
 
+                tentative_dg = dg.copy()
+                if mod_host:
+                    _register_plan_dependencies_in_graph(
+                        tentative_dg, mod_host, host_plan.path, host_imports
+                    )
+
+                caller_evaluations: List[
+                    Tuple[
+                        _FilePatchPlan,
+                        Dict[str, Any],
+                        List[str],
+                        List[str],
+                        str,
+                        Optional[List[str]],
+                    ]
+                ] = []
+                for c_plan, c_unit, c_tin, c_tout in callers:
+                    c_mod = _derive_module_import_path(c_plan.path, import_root)
+                    c_cycle = (
+                        tentative_dg.check_cycle_if_added(c_mod, mod_host)
+                        if (c_mod and mod_host)
+                        else None
+                    )
+                    caller_evaluations.append(
+                        (c_plan, c_unit, c_tin, c_tout, c_mod, c_cycle)
+                    )
+
+                if host_plan in (f1_plan, f2_plan) and caller_evaluations:
+                    c_plan, _, _, _, c_mod, c_cycle = caller_evaluations[0]
+                    if c_cycle or not mod_host or not c_mod:
+                        c_disp = normalize_path_string(str(c_plan.rel_path), strip_anchor=False)
+                        c_desc = f" (cycle: {' -> '.join(c_cycle)})" if c_cycle else ""
+                        c_msg = (
+                            f"# Note: Cross-module clone pair; helper generated in {host_disp}. "
+                            f"Circular import or unresolvable module path{c_desc}; import manually into {c_disp}.\n"
+                        )
+                        f1_plan.comments.append(c_msg)
+                        f2_plan.comments.append(c_msg)
+                        continue
+
+                if host_plan not in (f1_plan, f2_plan) and all(
+                    bool(cycle or not mod_host or not m_call)
+                    for _, _, _, _, m_call, cycle in caller_evaluations
+                ):
+                    c_descs = [
+                        f"{m_call}: {' -> '.join(cycle)}"
+                        for _, _, _, _, m_call, cycle in caller_evaluations
+                        if cycle
+                    ]
+                    c_txt = f" ({'; '.join(c_descs)})" if c_descs else ""
+                    skip_msg = (
+                        f"# Note: Cross-module clone pair; helper extraction to {host_disp} "
+                        f"rejected due to circular dependency{c_txt}.\n"
+                    )
+                    f1_plan.comments.append(skip_msg)
+                    f2_plan.comments.append(skip_msg)
+                    continue
+
                 host_plan.module_helpers.append(helper_code)
                 host_plan.missing_imports.extend(host_imports)
                 host_plan.used_helper_names.add(helper_name)
@@ -2411,14 +2494,8 @@ def generate_refactoring_patch(
                             binding="module",
                         )
 
-                for c_plan, c_unit, c_tin, c_tout in callers:
+                for c_plan, c_unit, c_tin, c_tout, mod_caller, cycle in caller_evaluations:
                     c_plan.comments.append(pair_comment)
-                    mod_caller = _derive_module_import_path(c_plan.path, import_root)
-                    cycle = (
-                        dg.check_cycle_if_added(mod_caller, mod_host)
-                        if (mod_caller and mod_host)
-                        else None
-                    )
                     c_disp = normalize_path_string(str(c_plan.rel_path), strip_anchor=False)
                     if cycle or not mod_host or not mod_caller:
                         cycle_desc = ""
@@ -2475,8 +2552,31 @@ def generate_refactoring_patch(
                     continue
                 host_imports = maybe_imports
 
+                if mod1 and host_imports:
+                    host_cycle = dg.check_cycle_if_imports_added(
+                        mod1,
+                        host_imports,
+                        file_path=f1_plan.path,
+                        is_package=is_pkg1,
+                    )
+                    if host_cycle:
+                        cycle_desc = f" (cycle: {' -> '.join(host_cycle)})"
+                        cycle_msg = (
+                            f"# Note: Cross-module clone pair; helper extraction to {f1_disp} "
+                            f"rejected due to circular dependency{cycle_desc}; import manually into {f2_disp}.\n"
+                        )
+                        for plan in (f1_plan, f2_plan):
+                            plan.comments.append(cycle_msg)
+                        continue
+
+                tentative_dg = dg.copy()
+                if mod1:
+                    _register_plan_dependencies_in_graph(
+                        tentative_dg, mod1, f1_plan.path, host_imports
+                    )
+
                 cycle = (
-                    dg.check_cycle_if_added(mod2, mod1)
+                    tentative_dg.check_cycle_if_added(mod2, mod1)
                     if (mod1 and mod2)
                     else None
                 )
@@ -2502,28 +2602,9 @@ def generate_refactoring_patch(
                         plan.comments.append(cycle_msg)
                     continue
 
-                if mod1 and host_imports:
-                    host_cycle = dg.check_cycle_if_imports_added(
-                        mod1,
-                        host_imports,
-                        file_path=f1_plan.path,
-                        is_package=is_pkg1,
-                    )
-                    if host_cycle:
-                        cycle_desc = f" (cycle: {' -> '.join(host_cycle)})"
-                        cycle_msg = (
-                            f"# Note: Cross-module clone pair; helper extraction to {f1_disp} "
-                            f"rejected due to circular dependency{cycle_desc}; import manually into {f2_disp}.\n"
-                        )
-                        for plan in (f1_plan, f2_plan):
-                            plan.comments.append(cycle_msg)
-                        continue
+                if mod1:
                     _register_plan_dependencies_in_graph(
                         dg, mod1, f1_plan.path, host_imports
-                    )
-                elif mod1:
-                    _register_plan_dependencies_in_graph(
-                        dg, mod1, f1_plan.path, []
                     )
 
                 _wire_cross_module_host_delegation(

@@ -4672,4 +4672,127 @@ def test_host_module_cycle_detection_skips_finalization_transactionally(
     assert "Circular import or unresolvable module path" in patch
 
 
+def test_helper_requires_future_annotations_vararg_and_kwarg() -> None:
+    """Verifies that *args and **kwargs annotations with PEP 604 unions trigger future annotations."""
+    code_var = "def helper(*items: int | str) -> None:\n    pass\n"
+    assert patch_mod._helper_requires_future_annotations(code_var) is True
+
+    code_kw = "def helper(**kwargs: int | float) -> None:\n    pass\n"
+    assert patch_mod._helper_requires_future_annotations(code_kw) is True
+
+    code_none = "def helper(*items: int, **kwargs: str) -> None:\n    pass\n"
+    assert patch_mod._helper_requires_future_annotations(code_none) is False
+
+
+def test_extract_module_defined_names_compound_blocks() -> None:
+    """Verifies that classes, functions, and variables in top-level if/try/with are discovered."""
+    src = (
+        "try:\n"
+        "    class FastWorker:\n"
+        "        pass\n"
+        "except ImportError:\n"
+        "    def fallback_worker():\n"
+        "        pass\n"
+        "if True:\n"
+        "    CONFIG_VAL: int = 10\n"
+        "    def inner_fn():\n"
+        "        nested_var = 1\n"
+        "        class NestedClass:\n"
+        "            pass\n"
+    )
+    defs = patch_mod._extract_module_defined_names(src)
+    assert "FastWorker" in defs
+    assert "fallback_worker" in defs
+    assert "CONFIG_VAL" in defs
+    assert "inner_fn" in defs
+    assert "nested_var" not in defs
+    assert "NestedClass" not in defs
+
+
+def test_extract_module_import_statements_compound_blocks() -> None:
+    """Verifies that runtime imports inside top-level try/except and if blocks are extracted."""
+    src = (
+        "try:\n"
+        "    import ujson as json\n"
+        "except ImportError:\n"
+        "    import json\n"
+        "if True:\n"
+        "    from math import sqrt\n"
+    )
+    stmts, wildcards = patch_mod._extract_module_import_statements(src)
+    assert "json" in stmts
+    assert "sqrt" in stmts
+    assert not wildcards
+
+
+def test_shared_module_strategy_skips_when_host_is_clone_and_cycle_detected(
+    tmp_path: Path,
+) -> None:
+    """Verifies that shared_module strategy targeting a clone file skips transactionally on cycle."""
+    pkg = tmp_path / "shared_host_cycle"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src_f1 = (
+        "import shared_host_cycle.f2\n\n"
+        "def compute_1(x: int) -> int:\n"
+        "    return x * 10\n"
+    )
+    src_f2 = (
+        "def compute_2(x: int) -> int:\n"
+        "    return x * 10\n"
+    )
+    (pkg / "f1.py").write_text(src_f1, encoding="utf-8")
+    (pkg / "f2.py").write_text(src_f2, encoding="utf-8")
+
+    u1 = {"name": "compute_1", "file": "shared_host_cycle/f1.py", "start": 3, "end": 4, "kind": "function"}
+    u2 = {"name": "compute_2", "file": "shared_host_cycle/f2.py", "start": 1, "end": 2, "kind": "function"}
+
+    # Set shared_module_name to f1.py so host_plan is f1_plan
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+        shared_module_name="f1.py",
+    )
+
+    assert "--- a/shared_host_cycle/f1.py" not in patch
+    assert "--- a/shared_host_cycle/f2.py" not in patch
+    assert "Circular import or unresolvable module path" in patch
+
+
+def test_shared_module_strategy_skips_when_all_callers_form_cycles(
+    tmp_path: Path,
+) -> None:
+    """Verifies that if all callers form cycles with _common.py, extraction is transactionally skipped."""
+    pkg = tmp_path / "all_cycle_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    # Create existing _common.py that already imports both mod_a and mod_b
+    (pkg / "_common.py").write_text(
+        "import all_cycle_pkg.mod_a\nimport all_cycle_pkg.mod_b\n", encoding="utf-8"
+    )
+    src_a = "def process_a(x: int) -> int:\n    return x + 5\n"
+    src_b = "def process_b(x: int) -> int:\n    return x + 5\n"
+    (pkg / "mod_a.py").write_text(src_a, encoding="utf-8")
+    (pkg / "mod_b.py").write_text(src_b, encoding="utf-8")
+
+    u_a = {"name": "process_a", "file": "all_cycle_pkg/mod_a.py", "start": 1, "end": 2, "kind": "function"}
+    u_b = {"name": "process_b", "file": "all_cycle_pkg/mod_b.py", "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u_a, u_b)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "--- a/all_cycle_pkg/mod_a.py" not in patch
+    assert "--- a/all_cycle_pkg/mod_b.py" not in patch
+    assert "rejected due to circular dependency" in patch
+
+
+
 

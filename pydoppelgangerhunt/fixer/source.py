@@ -160,7 +160,9 @@ def _get_module_imported_names(
     for stmt in tree.body:
         if isinstance(stmt, ast.Import):
             for alias in stmt.names:
-                imported.add(alias.asname or alias.name)
+                imported.add(alias.asname or alias.name.split(".", maxsplit=1)[0])
+                if not alias.asname and "." in alias.name:
+                    imported.add(alias.name)
         elif isinstance(stmt, ast.ImportFrom):
             for alias in stmt.names:
                 imported.add(alias.asname or alias.name)
@@ -168,7 +170,14 @@ def _get_module_imported_names(
             stmt, (ast.If, ast.Try, getattr(ast, "TryStar", ast.Try))
         ):
             for sub in ast.walk(stmt):
-                if isinstance(sub, (ast.Import, ast.ImportFrom)):
+                if isinstance(sub, ast.Import):
+                    for alias in sub.names:
+                        imported.add(
+                            alias.asname or alias.name.split(".", maxsplit=1)[0]
+                        )
+                        if not alias.asname and "." in alias.name:
+                            imported.add(alias.name)
+                elif isinstance(sub, ast.ImportFrom):
                     for alias in sub.names:
                         imported.add(alias.asname or alias.name)
     return imported
@@ -220,7 +229,7 @@ def _insert_imports_into_module(
         while insert_idx < len(orig_lines) and not orig_lines[insert_idx].strip():
             insert_idx += 1
         parsed_with_ast = True
-    except SyntaxError:
+    except (SyntaxError, ValueError, UnicodeDecodeError):
         pass
 
     if not parsed_with_ast:
