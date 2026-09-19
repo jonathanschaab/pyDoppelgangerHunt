@@ -38,9 +38,11 @@ from pydoppelgangerhunt.fixer.depgraph import (
     resolve_shared_module_file,
 )
 from pydoppelgangerhunt.fixer.scope import (
+    _extract_arg_names,
     _normalize_receiver_attrs,
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
 )
+
 from pydoppelgangerhunt.fixer.source import (
     _detect_indent_step,
     _find_module_helper_insertion_index,
@@ -1004,7 +1006,13 @@ def _canonicalize_helper_relative_imports(
     if not import_nodes:
         return helper_code
 
-    import_nodes.sort(key=lambda n: n.lineno, reverse=True)
+    import_nodes.sort(
+        key=lambda n: (
+            n.lineno if n.lineno is not None else 0,
+            getattr(n, "col_offset", 0) or 0,
+        ),
+        reverse=True,
+    )
     lines = helper_code.splitlines()
 
     for node in import_nodes:
@@ -1030,21 +1038,32 @@ def _canonicalize_helper_relative_imports(
         if start_idx < 0 or start_idx >= len(lines) or end_idx < start_idx:
             continue
 
-        first_line = lines[start_idx]
-        indent = first_line[: len(first_line) - len(first_line.lstrip())]
-
-        trailing_comment = ""
-        last_line = lines[end_idx - 1] if 0 <= end_idx - 1 < len(lines) else first_line
-        hash_pos = last_line.find("#")
-        if hash_pos != -1:
-            trailing_comment = f"  {last_line[hash_pos:].strip()}"
-
         names_str = ", ".join(
             f"{a.name} as {a.asname}" if a.asname else a.name
             for a in node.names
         )
-        new_stmt = f"{indent}from {resolved} import {names_str}{trailing_comment}"
-        lines[start_idx:end_idx] = [new_stmt]
+
+        col_start = getattr(node, "col_offset", None)
+        col_end = getattr(node, "end_col_offset", None)
+        if (
+            start_idx == end_idx - 1
+            and col_start is not None
+            and col_end is not None
+            and 0 <= col_start <= col_end <= len(lines[start_idx])
+        ):
+            line = lines[start_idx]
+            new_slice = f"from {resolved} import {names_str}"
+            lines[start_idx] = line[:col_start] + new_slice + line[col_end:]
+        else:
+            first_line = lines[start_idx]
+            indent = first_line[: len(first_line) - len(first_line.lstrip())]
+            trailing_comment = ""
+            last_line = lines[end_idx - 1] if 0 <= end_idx - 1 < len(lines) else first_line
+            hash_pos = last_line.find("#")
+            if hash_pos != -1:
+                trailing_comment = f"  {last_line[hash_pos:].strip()}"
+            new_stmt = f"{indent}from {resolved} import {names_str}{trailing_comment}"
+            lines[start_idx:end_idx] = [new_stmt]
 
     result = "\n".join(lines)
     if helper_code.endswith("\n") and not result.endswith("\n"):
@@ -1144,7 +1163,7 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
 
     def _collect_top_named_exprs(node: ast.AST) -> None:
         for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
                 continue
             if type(child).__name__ == "NamedExpr":
                 tgt = getattr(child, "target", None)
@@ -1184,10 +1203,10 @@ def _extract_helper_symbols(
         bound: Set[str] = set()
 
         def _collect_helper_named_exprs(curr: ast.AST) -> None:
-            if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
                 return
             for child in ast.iter_child_nodes(curr):
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
                     continue
                 if type(child).__name__ == "NamedExpr":
                     target_node = getattr(child, "target", None)
@@ -1258,6 +1277,11 @@ def _extract_helper_symbols(
         return bound
 
     class _ScopeVisitor(ast.NodeVisitor):
+
+        def _visit_arg_defaults(self, args: ast.arguments) -> None:
+            for d in args.defaults + [df for df in args.kw_defaults if df]:
+                self.visit(d)
+
         def _handle_function_def(
             self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
         ) -> None:
@@ -1273,20 +1297,14 @@ def _extract_helper_symbols(
                 self.visit(node.args.vararg.annotation)
             if node.args.kwarg and node.args.kwarg.annotation:
                 self.visit(node.args.kwarg.annotation)
-            for d in node.args.defaults + [df for df in node.args.kw_defaults if df]:
-                self.visit(d)
+            self._visit_arg_defaults(node.args)
             if node.returns:
                 self.visit(node.returns)
 
-            fn_scope: Set[str] = set()
-            for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
-                fn_scope.add(a.arg)
-            if node.args.vararg:
-                fn_scope.add(node.args.vararg.arg)
-            if node.args.kwarg:
-                fn_scope.add(node.args.kwarg.arg)
+            fn_scope: Set[str] = _extract_arg_names(node.args)
             fn_scope.update(_collect_direct_bindings(node.body))
             self._enter_block_scope(fn_scope, node.body)
+
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
             self._handle_function_def(node)
@@ -1347,6 +1365,13 @@ def _extract_helper_symbols(
 
         def visit_DictComp(self, node: ast.DictComp) -> None:
             self._handle_comprehension([node.key, node.value], node.generators)
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            self._visit_arg_defaults(node.args)
+            scope_stack.append(_extract_arg_names(node.args))
+            self.visit(node.body)
+            scope_stack.pop()
+
 
         def visit_Import(self, node: ast.Import) -> None:
             if len(scope_stack) <= max_helper_scope_depth:
@@ -1943,7 +1968,9 @@ def _format_patch_relative_path(
     """Formats target_path relative to primary_root, falling back to fallback_root or filename."""
     try:
         resolved_target = (
-            target_path.resolve() if target_path.is_absolute() else target_path
+            target_path.resolve()
+            if target_path.is_absolute()
+            else (primary_root / target_path).resolve()
         )
     except (OSError, RuntimeError, ValueError):
         resolved_target = target_path
@@ -1954,7 +1981,8 @@ def _format_patch_relative_path(
                 return str(resolved_target.relative_to(cand_res)).replace("\\", "/")
             except (ValueError, OSError, RuntimeError):
                 pass
-    return str(target_path.name)
+    norm = normalize_path_string(str(target_path), strip_anchor=True)
+    return norm if norm else str(target_path.name)
 
 
 def _is_same_file_or_resolved(p1: Path, p2: Path) -> bool:
@@ -2102,9 +2130,11 @@ def generate_refactoring_patch(
                 continue
 
         is_same_file = False
-        if f2_path is not None and f1_path is not None and f2_path == f1_path:
+        if f2_path is not None and f1_path is not None:
+            is_same_file = (f1_path == f2_path or f1_path.resolve() == f2_path.resolve())
+        elif not f2_raw:
             is_same_file = True
-        elif not f2_raw or _is_same_file_path(f1_raw, f2_raw, repo_root=str(root)):
+        elif _is_same_file_path(f1_raw, f2_raw, repo_root=str(root)):
             is_same_file = True
 
         enc1 = find_enclosing_class(orig_text, u1)

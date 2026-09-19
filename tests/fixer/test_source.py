@@ -518,3 +518,22 @@ def test_find_enclosing_ast_node_corrupt_source_fallback() -> None:
     u = {"file": "test.py", "start": 1, "end": 2, "name": "foo", "kind": "function"}
     res = _find_innermost_enclosing_node("def foo():\n    pass\x00", u, (ast.FunctionDef,))
     assert res is None
+
+
+def test_find_module_helper_insertion_index_with_suppress() -> None:
+    """Verifies that helpers are placed after 'with suppress(ImportError): import ...' blocks."""
+    lines = [
+        "from contextlib import suppress\n",
+        "with suppress(ImportError):\n",
+        "    import optional_dep\n",
+        "\n",
+        "def first_func():\n",
+        "    pass\n",
+    ]
+    idx = _find_module_helper_insertion_index(lines)
+    assert idx >= 3
+
+    src = "".join(lines)
+    names = _get_module_imported_names(src, include_conditional=True)
+    assert "optional_dep" in names
+

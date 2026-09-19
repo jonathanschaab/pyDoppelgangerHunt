@@ -206,13 +206,9 @@ def _is_same_file_path(
         p2_full = p2 if p2.is_file() or p2.is_absolute() else (root / p2)
         if p1_full.is_symlink() or p2_full.is_symlink():
             return False
+        if p1_full.is_file() and p2_full.is_file():
+            return p1_full.resolve() == p2_full.resolve()
         if paths_match_boundary(norm1, norm2):
-            return True
-        if (
-            p1_full.is_file()
-            and p2_full.is_file()
-            and p1_full.resolve() == p2_full.resolve()
-        ):
             return True
     except OSError:
         return False

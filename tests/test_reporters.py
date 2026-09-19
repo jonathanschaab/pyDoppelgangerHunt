@@ -531,6 +531,30 @@ def test_extract_unit_source_code_rejects_out_of_root_absolute_path(tmp_path: Pa
     lines_in = extract_unit_source_code(u_inside, repo_root=str(sub_root))
     assert lines_in == ["public = 1\n"]
 
+
+def test_extract_unit_source_code_relative_path_containment_in_repo_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that relative paths are strictly resolved against repo_root and cannot escape to CWD."""
+    repo = tmp_path / "target_repo"
+    repo.mkdir()
+    outside_file = tmp_path / "outside_secret.py"
+    outside_file.write_text("SUPER_SECRET = 999\n", encoding="utf-8")
+
+    monkeypatch.chdir(tmp_path)
+
+    # Traversal attempting to escape repo
+    u_traverse = {"file": "../outside_secret.py", "name": "secret", "start": 1, "end": 1}
+    lines = extract_unit_source_code(u_traverse, repo_root=str(repo))
+    assert lines == ["# Source for secret lines 1-1\n"]
+    assert "SUPER_SECRET" not in "".join(lines)
+
+    # Non-python extension rejection
+    u_non_py = {"file": "config.ini", "name": "cfg", "start": 1, "end": 1}
+    (repo / "config.ini").write_text("[section]\nkey=val\n", encoding="utf-8")
+    lines_non_py = extract_unit_source_code(u_non_py, repo_root=str(repo))
+    assert lines_non_py == ["# Source for cfg lines 1-1\n"]
+
     # 4. generate_html_report with family member None values
     fam: Dict[str, Any] = {
         "family_id": "CF-001",

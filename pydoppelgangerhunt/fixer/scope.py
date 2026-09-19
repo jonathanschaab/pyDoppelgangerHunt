@@ -60,8 +60,18 @@ def _normalize_receiver_attrs(
     """Normalizes a collection of receiver attribute strings to canonical '<rec>.*' form."""
     return {_normalize_receiver_attr_name(a, receiver_param) for a in attrs}
 
+def _extract_arg_names(args: ast.arguments) -> Set[str]:
+    """Extracts all parameter names from an ast.arguments node."""
+    arg_set = {a.arg for a in (args.posonlyargs + args.args + args.kwonlyargs)}
+    if args.vararg:
+        arg_set.add(args.vararg.arg)
+    if args.kwarg:
+        arg_set.add(args.kwarg.arg)
+    return arg_set
+
 
 class _ScopeVisitor(ast.NodeVisitor):
+
     """Inspects AST loads, stores, function parameters, returns, nonlocals, globals, and attributes."""
 
     def __init__(
@@ -168,14 +178,8 @@ class _ScopeVisitor(ast.NodeVisitor):
 
         self._record_arg(node.args.kwarg, None, "kwarg")
 
-    @staticmethod
-    def _extract_arg_names(args: ast.arguments) -> Set[str]:
-        arg_set = {a.arg for a in (args.posonlyargs + args.args + args.kwonlyargs)}
-        if args.vararg:
-            arg_set.add(args.vararg.arg)
-        if args.kwarg:
-            arg_set.add(args.kwarg.arg)
-        return arg_set
+    _extract_arg_names = staticmethod(_extract_arg_names)
+
 
     def _record_store_name(self, name: str) -> None:
         if len(self._scope_stack) <= 1 or name in self.nonlocals:

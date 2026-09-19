@@ -561,12 +561,12 @@ def test_batch_53_cli_method_binding_and_repo_root(tmp_path: Path) -> None:
     assert len(src_lines) == 4
     assert "compute_alpha" in src_lines[0]
 
-    # Test that existing file in CWD is not mangled by repo_root
+    # Test that existing file in CWD is contained and does not escape repo_root
     pyproject_file = Path("pyproject.toml")
     if pyproject_file.exists():
         unit_cwd = {"file": "pyproject.toml", "start": 1, "end": 2, "name": "root"}
         cwd_lines = extract_unit_source_code(unit_cwd, repo_root=str(sub_repo))
-        assert len(cwd_lines) == 2
+        assert cwd_lines == ["# Source for root lines 1-2\n"]
 
     # 4. Test _is_same_file_path with repo_root
     assert _is_same_file_path("mod_a.py", "mod_a.py", repo_root=str(sub_repo))

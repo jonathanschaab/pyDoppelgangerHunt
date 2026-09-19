@@ -5338,4 +5338,52 @@ def test_generate_refactoring_patch_deduplicates_standalone_advisory_comments(
     assert patch.count("# Note: Cross-module clone pair; helper extraction") == 1
 
 
+def test_helper_lambda_parameter_scoping_does_not_abort_extraction(tmp_path: Path) -> None:
+    """Verifies that lambda parameters are properly scoped and not treated as unresolved symbols."""
+    pkg = tmp_path / "lambda_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f1 = pkg / "mod1.py"
+    f2 = pkg / "mod2.py"
+    c1 = "def sort_first(items):\n    return sorted(items, key=lambda x: x.val)\n"
+    c2 = "def sort_second(items):\n    return sorted(items, key=lambda x: x.val)\n"
+    f1.write_text(c1, encoding="utf-8")
+    f2.write_text(c2, encoding="utf-8")
+    u1 = {"name": "sort_first", "file": str(f1), "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "sort_second", "file": str(f2), "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        cross_file_strategy="shared_module",
+    )
+    assert "unresolved symbol 'x'" not in patch
+    assert "_common.py" in patch
+
+
+def test_canonicalize_helper_relative_imports_semicolon_separated() -> None:
+    """Verifies that multiple relative imports on the same line are both canonicalized."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _canonicalize_helper_relative_imports,
+    )
+
+    code = "from .a import x; from .b import y\n"
+    canon = _canonicalize_helper_relative_imports(code, [("pkg.mod", False)])
+    assert "from pkg.a import x" in canon
+    assert "from pkg.b import y" in canon
+
+
+def test_format_patch_relative_path_nested_directories(tmp_path: Path) -> None:
+    """Verifies that _format_patch_relative_path does not strip nested directory components."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _format_patch_relative_path,
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    rel_target = Path("sub/nested/file.py")
+    res = _format_patch_relative_path(rel_target, repo)
+    assert res == "sub/nested/file.py"
+
+
 

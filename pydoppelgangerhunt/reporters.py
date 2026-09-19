@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 from pydoppelgangerhunt.config import normalize_path_string
@@ -66,10 +67,20 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
         return placeholder
 
     file_path = Path(f_raw)
-    resolved_against_repo_root = False
-    if not file_path.is_file() and repo_root and not file_path.is_absolute():
-        file_path = Path(repo_root) / file_path
-        resolved_against_repo_root = True
+    if file_path.suffix not in (".py", ".ipynb"):
+        return placeholder
+
+    if repo_root:
+        effective_root = Path(repo_root).resolve()
+        if effective_root.is_file():
+            effective_root = effective_root.parent
+        if not file_path.is_absolute():
+            file_path = effective_root / file_path
+        allowed_roots = [effective_root]
+    else:
+        if not file_path.is_absolute():
+            file_path = Path.cwd().resolve() / file_path
+        allowed_roots = [Path.cwd().resolve(), Path(tempfile.gettempdir()).resolve()]
 
     try:
         if not file_path.is_file() or file_path.is_symlink():
@@ -77,28 +88,16 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
         resolved_file = file_path.resolve()
         if resolved_file.is_symlink():
             return placeholder
-        if resolved_against_repo_root and repo_root:
-            resolved_root = Path(repo_root).resolve()
-            if resolved_root.is_file():
-                resolved_root = resolved_root.parent
+        within_allowed = False
+        for root_dir in allowed_roots:
             try:
-                resolved_file.relative_to(resolved_root)
+                resolved_file.relative_to(root_dir)
+                within_allowed = True
+                break
             except ValueError:
-                return placeholder
-        elif not file_path.is_absolute():
-            resolved_cwd = Path.cwd().resolve()
-            try:
-                resolved_file.relative_to(resolved_cwd)
-            except ValueError:
-                return placeholder
-        elif repo_root:
-            resolved_root = Path(repo_root).resolve()
-            if resolved_root.is_file():
-                resolved_root = resolved_root.parent
-            try:
-                resolved_file.relative_to(resolved_root)
-            except ValueError:
-                return placeholder
+                pass
+        if not within_allowed:
+            return placeholder
     except (OSError, RuntimeError, ValueError):
         return placeholder
 
