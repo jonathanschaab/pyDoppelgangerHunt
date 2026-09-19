@@ -25,28 +25,39 @@ EXCLUDED_GRAPH_DIRS: Set[str] = {
 }
 
 
+def _is_within_root(path: Path, root: Path) -> bool:
+    """Checks whether a resolved path is contained within the given root."""
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
 def _resolve_repo_relative_path(
     file_path: Union[Path, str], p_root: Path
 ) -> Path:
     """Normalizes path separators and resolves relative paths against the repository root."""
     norm = str(file_path).replace("\\", "/")
     p = Path(norm)
+    resolved_root = p_root.resolve()
     if not p.is_absolute():
-        cand = (p_root / p).resolve()
-        if cand.is_file() or cand.is_dir():
+        cand = (resolved_root / p).resolve()
+        if _is_within_root(cand, resolved_root) and (cand.is_file() or cand.is_dir()):
             return cand
-        pkg_root = _find_enclosing_package_root(p_root)
-        if pkg_root != p_root:
+        pkg_root = _find_enclosing_package_root(resolved_root)
+        if pkg_root != resolved_root:
             cand_pkg = (pkg_root / p).resolve()
-            if cand_pkg.is_file() or cand_pkg.is_dir():
+            if _is_within_root(cand_pkg, resolved_root) and (
+                cand_pkg.is_file() or cand_pkg.is_dir()
+            ):
                 return cand_pkg
         if p.is_file() or p.is_dir():
             cand_cwd = p.resolve()
-            try:
-                cand_cwd.relative_to(p_root)
+            if _is_within_root(cand_cwd, resolved_root):
                 return cand_cwd
-            except ValueError:
-                pass
+        if not _is_within_root(cand, resolved_root):
+            return resolved_root / ".pydoppelgangerhunt-invalid-path" / "__outside_root__"
         p = cand
     return p.resolve()
 

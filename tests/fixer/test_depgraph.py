@@ -973,6 +973,30 @@ def test_resolve_repo_relative_path_prioritizes_repo_root_over_cwd(
     assert resolved.read_text(encoding="utf-8") == "# repo version\n"
 
 
+def test_resolve_repo_relative_path_rejects_parent_escape(tmp_path: Path) -> None:
+    """Verifies that parent-relative paths cannot escape the provided repo root."""
+    from pydoppelgangerhunt.fixer.depgraph import (  # pylint: disable=import-outside-toplevel
+        _resolve_repo_relative_path,
+    )
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    safe_target = repo_dir / "safe.py"
+    safe_target.write_text("# safe\n", encoding="utf-8")
+
+    outside = tmp_path / "outside.py"
+    outside.write_text("# outside\n", encoding="utf-8")
+
+    resolved_safe = _resolve_repo_relative_path("pkg/../safe.py", repo_dir)
+    assert resolved_safe == safe_target
+
+    escaped = _resolve_repo_relative_path("../outside.py", repo_dir)
+    assert escaped != outside
+    assert not escaped.exists()
+    assert escaped.is_absolute()
+    assert escaped.is_relative_to(repo_dir)
+
+
 def test_find_enclosing_package_root_nested_subdirectory_without_init(tmp_path: Path) -> None:
     """Verifies that nested package directories without __init__.py discover the enclosing import root."""
     from pydoppelgangerhunt.fixer.depgraph import (  # pylint: disable=import-outside-toplevel
@@ -1012,4 +1036,3 @@ def test_find_enclosing_package_root_non_src_container(tmp_path: Path) -> None:
     import_root = _find_enclosing_package_root(pkg)
     assert import_root == lib_dir
     assert derive_module_import_path(mod_file, import_root) == "custom_lib.core"
-
