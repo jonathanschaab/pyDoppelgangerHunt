@@ -467,9 +467,6 @@ def _build_unit_delegation_call(
     return f"{indent}{prefix}{call_expr}\n"
 
 
-
-
-
 def _module_imports_target(
     source_text: str,
     target_module: str,
