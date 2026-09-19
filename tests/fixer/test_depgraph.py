@@ -1384,3 +1384,53 @@ def test_ancestor_package_importing_nested_submodule_with_explicit_import_flagge
     graph = build_module_graph(root)
     cycle = graph.check_cycle_if_added("mypkg", "mypkg.sub.worker")
     assert cycle == ["mypkg", "mypkg.sub.worker", "mypkg.sub", "mypkg"]
+
+
+def test_build_module_graph_subdirectory_and_project_boundary(tmp_path: Path) -> None:
+    """Verifies graph builds from project boundary while preserving separate import namespace and aliases."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = workspace / "outside.py"
+    outside.write_text("import sys\n", encoding="utf-8")
+
+    project = workspace / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text("[project]\nname = 'test'\n", encoding="utf-8")
+
+    tools = project / "tools"
+    tools.mkdir()
+    script = tools / "script.py"
+    script.write_text("import pkg.service\n", encoding="utf-8")
+
+    pkg = project / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    service = pkg / "service.py"
+    service.write_text("import tools.script\n", encoding="utf-8")
+
+    # Build graph with repo_root=project (project boundary) and import_root=tools (subdirectory namespace)
+    graph = build_module_graph(project, import_root=tools)
+
+    # 1. External workspace file is NOT included
+    assert "outside" not in graph.mod_to_file
+
+    # 2. Both tools.script (alias) and script (local namespace) resolve to script.py
+    assert graph.canonicalize_module_name("tools.script") == "script"
+    assert "script" in graph.mod_to_file
+    assert "tools.script" in graph.mod_to_file
+    assert graph.mod_to_file["script"] == script.resolve()
+
+    # 3. Project-level package is discovered and included
+    assert "pkg.service" in graph.mod_to_file
+    assert graph.mod_to_file["pkg.service"] == service.resolve()
+
+    # 4. Dependency edges are established across the project boundary
+    assert "pkg.service" in graph.get_dependencies("script")
+    assert "script" in graph.get_dependencies("pkg.service")
+
+    # 5. Cycle between script and pkg.service is detected in both directions
+    cycle_forward = graph.check_cycle_if_added("script", "pkg.service")
+    assert cycle_forward == ["script", "pkg.service", "script"]
+
+    cycle_backward = graph.check_cycle_if_added("pkg.service", "script")
+    assert cycle_backward == ["pkg.service", "script", "pkg.service"]

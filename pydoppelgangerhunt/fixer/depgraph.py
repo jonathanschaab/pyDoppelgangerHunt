@@ -709,6 +709,7 @@ class ModuleDependencyGraph:
         file_to_mod: Optional[Dict[str, str]] = None,
         pending_descendants: Optional[Dict[str, Set[str]]] = None,
         ancestor_edges: Optional[Set[Tuple[str, str]]] = None,
+        aliases: Optional[Dict[str, str]] = None,
     ) -> None:
         """Initializes a module dependency graph scoped to a repository root."""
         self.repo_root = _resolve_root_path(repo_root)
@@ -717,6 +718,7 @@ class ModuleDependencyGraph:
         )
         self.mod_to_file: Dict[str, Path] = mod_to_file.copy() if mod_to_file else {}
         self.file_to_mod: Dict[str, str] = file_to_mod.copy() if file_to_mod else {}
+        self.aliases: Dict[str, str] = aliases.copy() if aliases else {}
         self._sorted_adjacency: Dict[str, List[str]] = {}
         self._pending_descendants: Dict[str, Set[str]] = (
             {k: v.copy() for k, v in pending_descendants.items()}
@@ -727,44 +729,62 @@ class ModuleDependencyGraph:
             ancestor_edges.copy() if ancestor_edges else set()
         )
 
+    def canonicalize_module_name(self, mod_name: str) -> str:
+        """Returns the canonical module name resolving any registered module aliases."""
+        return self.aliases.get(mod_name, mod_name)
+
+    def add_alias(self, alias_name: str, canonical_name: str) -> None:
+        """Registers an alias name mapping to an existing canonical module name."""
+        if not alias_name or not canonical_name or alias_name == canonical_name:
+            return
+        canon = self.canonicalize_module_name(canonical_name)
+        self.aliases[alias_name] = canon
+        if canon in self.mod_to_file:
+            self.mod_to_file[alias_name] = self.mod_to_file[canon]
+
     def add_module(self, mod_name: str, file_path: Path) -> None:
         """Registers a module and its backing file path in the graph."""
         if not mod_name:
             return
-        if mod_name not in self.adjacency:
-            self.adjacency[mod_name] = set()
+        canon = self.canonicalize_module_name(mod_name)
+        if canon not in self.adjacency:
+            self.adjacency[canon] = set()
         try:
             resolved = file_path.resolve()
         except (OSError, RuntimeError, ValueError):
             resolved = file_path
+        self.mod_to_file[canon] = resolved
         self.mod_to_file[mod_name] = resolved
-        self.file_to_mod[str(resolved).replace("\\", "/").lower()] = mod_name
+        self.file_to_mod[str(resolved).replace("\\", "/").lower()] = canon
 
         # In Python, importing a submodule first executes its ancestor package initializers
-        parts = mod_name.split(".")
+        parts = canon.split(".")
         for i in range(1, len(parts)):
             parent_pkg = ".".join(parts[:i])
-            if parent_pkg in self.mod_to_file:
-                self.add_dependency(mod_name, parent_pkg)
-                self._ancestor_edges.add((mod_name, parent_pkg))
+            parent_canon = self.canonicalize_module_name(parent_pkg)
+            if parent_canon in self.mod_to_file:
+                self.add_dependency(canon, parent_canon)
+                self._ancestor_edges.add((canon, parent_canon))
             else:
-                self._pending_descendants.setdefault(parent_pkg, set()).add(mod_name)
+                self._pending_descendants.setdefault(parent_canon, set()).add(canon)
 
-        if mod_name in self._pending_descendants:
-            for desc_mod in self._pending_descendants.pop(mod_name):
-                self.add_dependency(desc_mod, mod_name)
-                self._ancestor_edges.add((desc_mod, mod_name))
+        if canon in self._pending_descendants:
+            for desc_mod in self._pending_descendants.pop(canon):
+                self.add_dependency(desc_mod, canon)
+                self._ancestor_edges.add((desc_mod, canon))
 
     def add_dependency(self, from_mod: str, to_mod: str) -> None:
         """Adds a directed import edge from from_mod to to_mod."""
-        if not from_mod or not to_mod or from_mod == to_mod:
+        from_canon = self.canonicalize_module_name(from_mod)
+        to_canon = self.canonicalize_module_name(to_mod)
+        if not from_canon or not to_canon or from_canon == to_canon:
             return
-        if from_mod not in self.adjacency:
-            self.adjacency[from_mod] = set()
-        if to_mod not in self.adjacency[from_mod]:
-            self.adjacency[from_mod].add(to_mod)
-            self._sorted_adjacency.pop(from_mod, None)
-        self._ancestor_edges.discard((from_mod, to_mod))
+        if from_canon not in self.adjacency:
+            self.adjacency[from_canon] = set()
+        if to_canon not in self.adjacency[from_canon]:
+            self.adjacency[from_canon].add(to_canon)
+            self._sorted_adjacency.pop(from_canon, None)
+        self._ancestor_edges.discard((from_canon, to_canon))
 
     def _get_sorted_neighbors(self, mod_name: str) -> List[str]:
         """Returns deterministic sorted neighbors of mod_name, using a cached list."""
@@ -784,6 +804,7 @@ class ModuleDependencyGraph:
             file_to_mod=self.file_to_mod,
             pending_descendants=self._pending_descendants,
             ancestor_edges=self._ancestor_edges,
+            aliases=self.aliases,
         )
 
     def resolve_import_target(
@@ -797,12 +818,12 @@ class ModuleDependencyGraph:
         if known_modules is None:
             known_modules = set(self.mod_to_file.keys())
         if raw_import in known_modules:
-            return raw_import
+            return self.canonicalize_module_name(raw_import)
         parts = raw_import.split(".")
         for i in range(len(parts), 0, -1):
             prefix = ".".join(parts[:i])
             if prefix in known_modules:
-                return prefix
+                return self.canonicalize_module_name(prefix)
         return None
 
     def add_import_dependency(
@@ -821,7 +842,8 @@ class ModuleDependencyGraph:
 
     def get_dependencies(self, mod_name: str) -> Set[str]:
         """Returns direct dependency module names for a given module."""
-        return self.adjacency.get(mod_name, set()).copy()
+        canon = self.canonicalize_module_name(mod_name)
+        return self.adjacency.get(canon, set()).copy()
 
     def has_transitive_path(
         self,
@@ -830,12 +852,14 @@ class ModuleDependencyGraph:
         ignored_edges: Optional[Set[Tuple[str, str]]] = None,
     ) -> bool:
         """Determines reachability from from_mod to to_mod via BFS search in O(V + E) time."""
-        if not from_mod or not to_mod:
+        from_canon = self.canonicalize_module_name(from_mod)
+        to_canon = self.canonicalize_module_name(to_mod)
+        if not from_canon or not to_canon:
             return False
-        if from_mod == to_mod:
+        if from_canon == to_canon:
             return True
-        visited: Set[str] = {from_mod}
-        queue: deque[str] = deque([from_mod])
+        visited: Set[str] = {from_canon}
+        queue: deque[str] = deque([from_canon])
 
         while queue:
             curr = queue.popleft()
@@ -843,7 +867,7 @@ class ModuleDependencyGraph:
                 if ignored_edges and (curr, neighbor) in ignored_edges:
                     continue
                 # If neighbor is the target module
-                if neighbor == to_mod:
+                if neighbor == to_canon:
                     return True
                 if neighbor not in visited:
                     visited.add(neighbor)
@@ -857,19 +881,21 @@ class ModuleDependencyGraph:
         ignored_edges: Optional[Set[Tuple[str, str]]] = None,
     ) -> Optional[List[str]]:
         """Finds a directed path from from_mod to to_mod if one exists, returning module names."""
-        if not from_mod or not to_mod:
+        from_canon = self.canonicalize_module_name(from_mod)
+        to_canon = self.canonicalize_module_name(to_mod)
+        if not from_canon or not to_canon:
             return None
-        if from_mod == to_mod:
-            return [from_mod]
+        if from_canon == to_canon:
+            return [from_canon]
 
         parent: Dict[str, str] = {}
-        visited: Set[str] = {from_mod}
-        queue: deque[str] = deque([from_mod])
+        visited: Set[str] = {from_canon}
+        queue: deque[str] = deque([from_canon])
         found = False
 
         while queue:
             curr = queue.popleft()
-            if curr == to_mod:
+            if curr == to_canon:
                 found = True
                 break
             for neighbor in self._get_sorted_neighbors(curr):
@@ -880,16 +906,16 @@ class ModuleDependencyGraph:
                     parent[neighbor] = curr
                     queue.append(neighbor)
 
-        if not found and to_mod not in parent:
+        if not found and to_canon not in parent:
             return None
 
         # Reconstruct path
-        path: List[str] = [to_mod]
-        curr_node = to_mod
+        path: List[str] = [to_canon]
+        curr_node = to_canon
         while curr_node in parent:
             curr_node = parent[curr_node]
             path.append(curr_node)
-            if curr_node == from_mod:
+            if curr_node == from_canon:
                 break
         path.reverse()
         return path
@@ -903,38 +929,45 @@ class ModuleDependencyGraph:
             The cycle path (e.g. ['mod_a', 'mod_b', 'mod_a']) if a cycle would form;
             None if the edge is safe and acyclic.
         """
-        if from_mod == to_mod:
+        from_canon = self.canonicalize_module_name(from_mod)
+        to_canon = self.canonicalize_module_name(to_mod)
+        if from_canon == to_canon:
             return [from_mod, to_mod]
 
         ignored: Optional[Set[Tuple[str, str]]] = None
-        if to_mod.startswith(f"{from_mod}."):
-            # from_mod is an ancestor package of to_mod and is already executing.
-            # Implicit ancestor initialization edges back to from_mod (or ancestors of from_mod)
+        if to_canon.startswith(f"{from_canon}."):
+            # from_canon is an ancestor package of to_canon and is already executing.
+            # Implicit ancestor initialization edges back to from_canon (or ancestors of from_canon)
             # do not trigger circular imports unless explicitly imported in code.
             ignored = {
                 (u, v)
                 for (u, v) in self._ancestor_edges
-                if v == from_mod or from_mod.startswith(f"{v}.")
+                if v == from_canon or from_canon.startswith(f"{v}.")
             }
 
         existing_path = self.find_cycle_path(
-            from_mod=to_mod, to_mod=from_mod, ignored_edges=ignored
+            from_mod=to_canon, to_mod=from_canon, ignored_edges=ignored
         )
         if existing_path is not None:
             return [from_mod] + existing_path
 
         # Submodule import executes ancestor package initializers:
         # e.g., importing `pkg.worker` first executes `pkg/__init__.py`.
-        # If `pkg` already depends on `from_mod`, caller -> pkg.worker -> pkg -> caller forms a cycle.
-        parts = to_mod.split(".")
-        for i in range(1, len(parts)):
-            prefix = ".".join(parts[:i])
-            if prefix != from_mod and not from_mod.startswith(f"{prefix}."):
-                prefix_path = self.find_cycle_path(
-                    from_mod=prefix, to_mod=from_mod, ignored_edges=ignored
-                )
-                if prefix_path is not None:
-                    return [from_mod, to_mod] + prefix_path
+        # If `pkg` already depends on `from_canon`, caller -> pkg.worker -> pkg -> caller forms a cycle.
+        target_names = [to_canon]
+        if to_mod != to_canon:
+            target_names.append(to_mod)
+        for target in target_names:
+            parts = target.split(".")
+            for i in range(1, len(parts)):
+                prefix = ".".join(parts[:i])
+                prefix_canon = self.canonicalize_module_name(prefix)
+                if prefix_canon != from_canon and not from_canon.startswith(f"{prefix_canon}."):
+                    prefix_path = self.find_cycle_path(
+                        from_mod=prefix_canon, to_mod=from_canon, ignored_edges=ignored
+                    )
+                    if prefix_path is not None:
+                        return [from_mod, to_mod] + prefix_path
         return None
 
     def check_cycle_if_imports_added(
@@ -948,14 +981,15 @@ class ModuleDependencyGraph:
         if not from_mod or not import_stmts:
             return None
 
+        from_canon = self.canonicalize_module_name(from_mod)
         tentative = self.copy()
         if file_path is not None:
-            tentative.add_module(from_mod, file_path)
-        elif from_mod not in tentative.adjacency:
-            tentative.adjacency[from_mod] = set()
+            tentative.add_module(from_canon, file_path)
+        elif from_canon not in tentative.adjacency:
+            tentative.adjacency[from_canon] = set()
 
         raw_imports = _parse_source_imports(
-            "\n".join(import_stmts), from_mod, is_package=is_package
+            "\n".join(import_stmts), from_canon, is_package=is_package
         )
         known = set(tentative.mod_to_file.keys())
 
@@ -963,12 +997,13 @@ class ModuleDependencyGraph:
             target = tentative.resolve_import_target(raw_imp, known_modules=known)
             if not target:
                 continue
-            if target == from_mod:
+            target_canon = tentative.canonicalize_module_name(target)
+            if target_canon == from_canon:
                 return [from_mod, target]
-            cycle = tentative.check_cycle_if_added(from_mod, target)
+            cycle = tentative.check_cycle_if_added(from_canon, target_canon)
             if cycle is not None:
                 return cycle
-            tentative.add_dependency(from_mod, target)
+            tentative.add_dependency(from_canon, target_canon)
         return None
 
     @classmethod
@@ -976,10 +1011,25 @@ class ModuleDependencyGraph:
         cls,
         repo_root: Union[Path, str],
         file_paths: Optional[Sequence[Path]] = None,
+        import_root: Optional[Union[Path, str]] = None,
     ) -> ModuleDependencyGraph:
-        """Builds a populated dependency graph across the repository's Python source files."""
+        """Builds a populated dependency graph across the repository's Python source files.
+
+        Args:
+            repo_root: Project scan boundary where Python source files are discovered.
+            file_paths: Optional explicit sequence of source file paths to include.
+            import_root: Optional module import namespace root for deriving module dot-paths.
+                Defaults to enclosing package root of repo_root if not specified.
+
+        Returns:
+            Populated ModuleDependencyGraph containing discovered modules and dependency edges.
+        """
         root = _resolve_root_path(repo_root)
-        effective_root = _find_enclosing_package_root(root)
+        effective_root = (
+            _resolve_root_path(import_root)
+            if import_root is not None
+            else _find_enclosing_package_root(root)
+        )
         graph = cls(effective_root)
 
         python_files: List[Path] = []
@@ -1007,19 +1057,30 @@ class ModuleDependencyGraph:
                         seen_files.add(safe_file)
                         python_files.append(safe_file)
 
-        # First pass: map all modules
+        # First pass: map all modules and register aliases
+        file_to_names: List[Tuple[Path, str, str]] = []
         for p_file in python_files:
-            mod_name = derive_module_import_path(p_file, effective_root)
+            if _is_within_root(p_file, effective_root):
+                mod_name = derive_module_import_path(p_file, effective_root)
+                alias_name = (
+                    derive_module_import_path(p_file, root)
+                    if effective_root != root and _is_within_root(p_file, root)
+                    else ""
+                )
+            else:
+                mod_name = derive_module_import_path(p_file, root)
+                alias_name = ""
+
             if mod_name:
                 graph.add_module(mod_name, p_file)
+                if alias_name and alias_name != mod_name:
+                    graph.add_alias(alias_name, mod_name)
+                file_to_names.append((p_file, mod_name, alias_name))
 
         known_modules = set(graph.mod_to_file.keys())
 
         # Second pass: parse imports and wire edges
-        for p_file in python_files:
-            mod_name = derive_module_import_path(p_file, effective_root)
-            if not mod_name:
-                continue
+        for p_file, mod_name, alias_name in file_to_names:
             try:
                 content = p_file.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
@@ -1027,6 +1088,12 @@ class ModuleDependencyGraph:
             raw_imports = _parse_source_imports(
                 content, mod_name, is_package=(p_file.name == "__init__.py")
             )
+            if alias_name and alias_name != mod_name:
+                raw_imports.update(
+                    _parse_source_imports(
+                        content, alias_name, is_package=(p_file.name == "__init__.py")
+                    )
+                )
             for imp in raw_imports:
                 graph.add_import_dependency(mod_name, imp, known_modules=known_modules)
         return graph
@@ -1035,6 +1102,18 @@ class ModuleDependencyGraph:
 def build_module_graph(
     repo_root: Union[Path, str],
     file_paths: Optional[Sequence[Path]] = None,
+    import_root: Optional[Union[Path, str]] = None,
 ) -> ModuleDependencyGraph:
-    """Convenience helper to construct a ModuleDependencyGraph for a repository."""
-    return ModuleDependencyGraph.build_from_repository(repo_root, file_paths=file_paths)
+    """Convenience helper to construct a ModuleDependencyGraph for a repository.
+
+    Args:
+        repo_root: Project scan boundary where Python source files are discovered.
+        file_paths: Optional explicit sequence of source file paths to include.
+        import_root: Optional module import namespace root for deriving module dot-paths.
+
+    Returns:
+        Populated ModuleDependencyGraph containing discovered modules and dependency edges.
+    """
+    return ModuleDependencyGraph.build_from_repository(
+        repo_root, file_paths=file_paths, import_root=import_root
+    )

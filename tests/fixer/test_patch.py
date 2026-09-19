@@ -5039,3 +5039,61 @@ def test_collect_host_missing_imports_rejects_import_rebound_by_definition(tmp_p
             source_texts=[(source_code, "pkg.worker", False)],
         )
 
+
+def test_generate_refactoring_patch_subdirectory_scan_detects_project_cycle(tmp_path: Path) -> None:
+    """Verifies that scanning a non-package subdirectory detects circular imports through project-level modules."""
+    project = tmp_path / "my_project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text("[project]\nname = 'test'\n", encoding="utf-8")
+
+    tools = project / "tools"
+    tools.mkdir()
+    script_a = tools / "script_a.py"
+    script_b = tools / "script_b.py"
+
+    pkg = project / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    service = pkg / "service.py"
+
+    # script_a defines compute_a and imports pkg.service
+    script_a.write_text(
+        "import pkg.service\n\n"
+        "def compute_a(x: int) -> int:\n"
+        "    return x + 42\n",
+        encoding="utf-8",
+    )
+    # script_b defines compute_b (clone of compute_a)
+    script_b.write_text(
+        "def compute_b(x: int) -> int:\n"
+        "    return x + 42\n",
+        encoding="utf-8",
+    )
+    # service imports tools.script_b
+    service.write_text(
+        "import tools.script_b\n\n"
+        "def run_svc() -> None:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    u1 = {"name": "compute_a", "file": str(script_a), "start": 3, "end": 4, "kind": "function"}
+    u2 = {"name": "compute_b", "file": str(script_b), "start": 1, "end": 2, "kind": "function"}
+
+    # Scanning from the subdirectory 'tools'
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tools),
+        replace_clones=True,
+        cross_file_strategy="host_module",
+    )
+
+    # A circular import is detected through pkg.service, so host extraction is rejected with advisory comment
+    assert "Circular import or unresolvable module path" in patch
+    # Verify the cycle path was detected through pkg.service
+    assert "pkg.service" in patch
+    # script_b must not have an emitted replacement or import
+    assert "from script_a import" not in patch
+    assert "from tools.script_a import" not in patch
+
+

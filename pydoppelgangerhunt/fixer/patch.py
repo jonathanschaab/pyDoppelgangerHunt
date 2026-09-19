@@ -2012,7 +2012,7 @@ def generate_refactoring_patch(
     def _get_depgraph() -> ModuleDependencyGraph:
         g = graph_holder[0]
         if g is None:
-            g = build_module_graph(import_root)
+            g = build_module_graph(patch_root, import_root=import_root)
             graph_holder[0] = g
         return g
 
