@@ -3882,6 +3882,12 @@ def test_generate_refactoring_patch_nested_subdirectory_without_init(tmp_path: P
     # Import must be fully qualified under my_pkg, not bare from _common
     assert "from my_pkg.tools._common import _shared_run_run2" in patch
     assert "from _common" not in patch
+    # Diff paths must be relative to the enclosing project root (my_pkg/tools/...)
+    assert "--- a/my_pkg/tools/a.py" in patch
+    assert "+++ b/my_pkg/tools/a.py" in patch
+    assert "--- a/my_pkg/tools/b.py" in patch
+    assert "+++ b/my_pkg/tools/b.py" in patch
+    assert "+++ b/my_pkg/tools/_common.py" in patch
 
 
 def test_nested_imports_do_not_suppress_outer_helper_imports(tmp_path: Path) -> None:

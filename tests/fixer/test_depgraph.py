@@ -934,6 +934,21 @@ def test_find_project_filesystem_root(tmp_path: Path) -> None:
     src_pkg.mkdir(parents=True)
     assert _find_project_filesystem_root(src_pkg) == src_repo
 
+    # 4. Nested package directory without __init__.py inside an ancestor package
+    pkg_repo = tmp_path / "pkg_repo"
+    pkg_repo.mkdir()
+    top_pkg = pkg_repo / "my_pkg"
+    top_pkg.mkdir()
+    (top_pkg / "__init__.py").write_text("", encoding="utf-8")
+    nested_dir = top_pkg / "tools" / "utils"
+    nested_dir.mkdir(parents=True)
+    assert _find_project_filesystem_root(nested_dir) == pkg_repo
+
+    # 5. Standalone directory without VCS or package context falls back to itself
+    plain_dir = tmp_path / "plain_dir"
+    plain_dir.mkdir()
+    assert _find_project_filesystem_root(plain_dir) == plain_dir
+
 
 def test_resolve_repo_relative_path_prioritizes_repo_root_over_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

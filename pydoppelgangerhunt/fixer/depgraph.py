@@ -121,11 +121,8 @@ def _find_project_filesystem_root(path: Path) -> Path:
     if enclosing_pkg.name == "src" and enclosing_pkg.parent != enclosing_pkg:
         return enclosing_pkg.parent
 
-    # 3. Fallback to enclosing package root if path is inside a package
-    if (curr / "__init__.py").is_file():
-        return enclosing_pkg
-
-    return curr
+    # 3. Fallback to enclosing package root (or curr if no package context)
+    return enclosing_pkg
 
 
 def derive_module_import_path(
