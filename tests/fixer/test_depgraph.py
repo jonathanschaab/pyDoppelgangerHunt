@@ -996,6 +996,12 @@ def test_resolve_repo_relative_path_rejects_parent_escape(tmp_path: Path) -> Non
     assert escaped.is_absolute()
     assert escaped.is_relative_to(repo_dir)
 
+    escaped_abs = _resolve_repo_relative_path(outside, repo_dir)
+    assert escaped_abs != outside
+    assert not escaped_abs.exists()
+    assert escaped_abs.is_absolute()
+    assert escaped_abs.is_relative_to(repo_dir)
+
 
 def test_find_enclosing_package_root_nested_subdirectory_without_init(tmp_path: Path) -> None:
     """Verifies that nested package directories without __init__.py discover the enclosing import root."""
