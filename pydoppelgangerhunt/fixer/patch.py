@@ -29,7 +29,7 @@ from pydoppelgangerhunt.fixer.depgraph import (
     _collect_top_level_import_nodes,
     _find_enclosing_package_root,
     _find_project_filesystem_root,
-    _is_safe_repo_python_file,
+    _is_safe_repo_python_path,
     _parse_source_imports,
     _resolve_relative_import_path,
     build_module_graph,
@@ -1967,26 +1967,43 @@ def _is_same_file_or_resolved(p1: Path, p2: Path) -> bool:
         return False
 
 
-def _resolve_safe_clone_file_path(
+def _validate_clone_file_path(
     raw_path: str, candidate_roots: Sequence[Path]
-) -> Optional[Path]:
-    """Resolves raw_path across candidate roots, rejecting symlinks and resolution errors.
+) -> Tuple[Optional[Path], bool]:
+    """Validates raw_path across candidate roots, returning (resolved_path, is_rejected).
 
-    Relative paths are resolved strictly against the primary scan root (candidate_roots[0]).
-    Absolute paths are validated against candidate_roots.
+    Returns:
+        (resolved_path, False) if path is safe, within root, non-symlinked, and exists on disk.
+        (None, False) if path is safe, within root, non-symlinked, but does not exist on disk.
+        (None, True) if path violates boundaries (outside root, symlink, non-Python, or unresolvable).
     """
     if not raw_path or not candidate_roots:
-        return None
+        return None, True
     try:
         p = Path(raw_path)
         roots_to_check = candidate_roots if p.is_absolute() else (candidate_roots[0],)
+        found_nonexistent_safe = False
         for root_dir in roots_to_check:
-            safe = _is_safe_repo_python_file(raw_path, root_dir)
-            if safe is not None:
-                return safe
+            resolved, is_rejected = _is_safe_repo_python_path(raw_path, root_dir)
+            if not is_rejected:
+                if resolved is not None:
+                    return resolved, False
+                found_nonexistent_safe = True
+        if found_nonexistent_safe:
+            return None, False
+        return None, True
     except (OSError, RuntimeError, ValueError):
+        return None, True
+
+
+def _resolve_safe_clone_file_path(
+    raw_path: str, candidate_roots: Sequence[Path]
+) -> Optional[Path]:
+    """Resolves raw_path across candidate roots, rejecting symlinks and resolution errors."""
+    resolved, is_rejected = _validate_clone_file_path(raw_path, candidate_roots)
+    if is_rejected or resolved is None:
         return None
-    return None
+    return resolved
 
 
 def generate_refactoring_patch(
@@ -2051,15 +2068,10 @@ def generate_refactoring_patch(
         f1_raw = normalize_path_string(str(u1.get("file") or ""), strip_anchor=True)
         if not f1_raw:
             continue
-        f1_path = _resolve_safe_clone_file_path(
+        f1_path, is_f1_rejected = _validate_clone_file_path(
             f1_raw, (fs_root, patch_root, import_root)
         )
-        if f1_path is None:
-            continue
-        try:
-            if not f1_path.is_file() or f1_path.is_symlink():
-                continue
-        except (OSError, RuntimeError, ValueError):
+        if is_f1_rejected or f1_path is None:
             continue
 
         rel_f1 = _format_patch_relative_path(f1_path, patch_root, fs_root)
@@ -2089,18 +2101,12 @@ def generate_refactoring_patch(
             enc2 = find_enclosing_class(orig_text, u2)
             fn2 = find_enclosing_function(orig_text, u2)
         elif f2_raw:
-            f2_path = _resolve_safe_clone_file_path(
+            f2_path, is_f2_rejected = _validate_clone_file_path(
                 f2_raw, (fs_root, patch_root, import_root)
             )
-            try:
-                is_f2_safe = bool(
-                    f2_path is not None
-                    and f2_path.is_file()
-                    and not f2_path.is_symlink()
-                )
-            except (OSError, RuntimeError, ValueError):
-                is_f2_safe = False
-            if is_f2_safe and f2_path is not None:
+            if is_f2_rejected:
+                continue
+            if f2_path is not None:
                 rel_f2 = _format_patch_relative_path(f2_path, patch_root, fs_root)
                 f2_plan = file_plans.get(f2_path)
                 if f2_plan is None:
@@ -2112,6 +2118,13 @@ def generate_refactoring_patch(
                 if f2_plan is not None:
                     enc2 = find_enclosing_class(f2_plan.orig_text, u2)
                     fn2 = find_enclosing_function(f2_plan.orig_text, u2)
+        else:
+            continue
+
+        u1_lines = orig_lines
+        u2_lines = orig_lines if is_same_file else (f2_plan.orig_lines if f2_plan is not None else [])
+        u1_eff = dict(u1, source_lines=u1_lines)
+        u2_eff = dict(u2, source_lines=u2_lines)
 
         if replace_clones:
             u1_claimed = any(
@@ -2162,15 +2175,17 @@ def generate_refactoring_patch(
         )
         if fn1 and "receiver_param" not in u1:
             u1["receiver_param"] = fn1.get("receiver_param")
+            u1_eff["receiver_param"] = fn1.get("receiver_param")
         if fn2 and "receiver_param" not in u2:
             u2["receiver_param"] = fn2.get("receiver_param")
+            u2_eff["receiver_param"] = fn2.get("receiver_param")
         if fn1 and fn2:
             is_static = bool(fn1.get("is_static") and fn2.get("is_static"))
         else:
             is_static = bool((fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static")))
 
-        s1 = analyze_unit_variable_scope(u1, repo_root=str(root))
-        s2 = analyze_unit_variable_scope(u2, repo_root=str(root))
+        s1 = analyze_unit_variable_scope(u1_eff, repo_root=str(root))
+        s2 = analyze_unit_variable_scope(u2_eff, repo_root=str(root))
         if bool(s1.get("is_async")) != bool(s2.get("is_async")):
             continue
         if bool(s1.get("has_yield")) != bool(s2.get("has_yield")):
@@ -2194,8 +2209,8 @@ def generate_refactoring_patch(
         if any(h in ("naked_break", "naked_continue") for h in hazards1 | hazards2):
             continue
         if "embedded_return" in hazards1 | hazards2:
-            lines1 = orig_lines
-            lines2 = orig_lines if is_same_file else (f2_plan.orig_lines if f2_plan else [])
+            lines1 = u1_lines
+            lines2 = u2_lines
             if not (
                 _has_unconditional_terminal_return(u1, lines1)
                 and _has_unconditional_terminal_return(u2, lines2)
@@ -2203,7 +2218,7 @@ def generate_refactoring_patch(
                 continue
 
         if receiver_kinds_differ:
-            if _has_receiver_reference(u1, s1, repo_root=str(root)) or _has_receiver_reference(u2, s2, repo_root=str(root)):
+            if _has_receiver_reference(u1_eff, s1, repo_root=str(root)) or _has_receiver_reference(u2_eff, s2, repo_root=str(root)):
                 continue
 
         effective_binding = _resolve_effective_binding(
@@ -2244,10 +2259,10 @@ def generate_refactoring_patch(
             u1_ind = u1_lead[: len(u1_lead) - len(u1_lead.lstrip())]
             step = _detect_indent_step(u1_ind)
 
-        scope = analyze_unit_variable_scope(u1, u2, repo_root=str(root))
+        scope = analyze_unit_variable_scope(u1_eff, u2_eff, repo_root=str(root))
         inputs = list(scope.get("inputs", []))
         if effective_binding == "module":
-            inputs = _prune_unshared_receivers(inputs, u1, u2, s1, s2, repo_root=str(root))
+            inputs = _prune_unshared_receivers(inputs, u1_eff, u2_eff, s1, s2, repo_root=str(root))
         outputs = [
             v for v in scope.get("outputs", [])
             if v not in scope.get("globals", [])
@@ -2278,10 +2293,10 @@ def generate_refactoring_patch(
         t_inputs2 = list(s2.get("inputs", []))
         if effective_binding == "module":
             t_inputs1 = _prune_unshared_receivers(
-                t_inputs1, u1, u2, s1, s2, repo_root=str(root)
+                t_inputs1, u1_eff, u2_eff, s1, s2, repo_root=str(root)
             )
             t_inputs2 = _prune_unshared_receivers(
-                t_inputs2, u2, u1, s2, s1, repo_root=str(root)
+                t_inputs2, u2_eff, u1_eff, s2, s1, repo_root=str(root)
             )
 
         if replace_clones and (
@@ -2379,8 +2394,8 @@ def generate_refactoring_patch(
             target_host_plan.used_helper_names.add(helper_name)
 
         helper_code = synthesize_shared_helper_code(
-            u1,
-            u2,
+            u1_eff,
+            u2_eff,
             type_merge_strategy=type_merge_strategy,
             method_binding=effective_binding,
             indent=helper_indent,

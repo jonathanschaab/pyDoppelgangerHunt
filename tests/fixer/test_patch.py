@@ -2061,6 +2061,109 @@ def test_generate_refactoring_patch_cross_module_missing_caller_file(tmp_path: P
     assert "Complete refactoring by importing the helper into single_pkg/nonexistent.py" in patch
 
 
+def test_generate_refactoring_patch_rejects_out_of_root_caller_path(
+    tmp_path: Path,
+) -> None:
+    """Verifies that an out-of-root caller path is rejected without reading outside files."""
+    repo_dir = tmp_path / "safe_repo"
+    pkg_dir = repo_dir / "target_pkg"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    secret_file = tmp_path / "outside_confidential.py"
+    secret_file.write_text("CONFIDENTIAL_TOKEN = 12345\n", encoding="utf-8")
+
+    src_f1 = (
+        "def safe_worker(x: int) -> int:\n"
+        "    return x + 10\n"
+    )
+    (pkg_dir / "worker.py").write_text(src_f1, encoding="utf-8")
+
+    u1 = {
+        "name": "safe_worker",
+        "file": "target_pkg/worker.py",
+        "start": 1,
+        "end": 2,
+        "kind": "function",
+    }
+    u2_outside = {
+        "name": "safe_worker",
+        "file": "../outside_confidential.py",
+        "start": 1,
+        "end": 2,
+        "kind": "function",
+    }
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2_outside)],
+        repo_root=str(repo_dir),
+        replace_clones=False,
+        cross_file_strategy="host_module",
+    )
+
+    assert patch == ""
+    assert "outside_confidential" not in patch
+    assert "CONFIDENTIAL_TOKEN" not in patch
+
+    extracted = extract_unit_source_code(u2_outside, repo_root=str(repo_dir))
+    assert not any("CONFIDENTIAL_TOKEN" in line for line in extracted)
+    assert extracted == ["# Source for safe_worker lines 1-2\n"]
+
+
+def test_generate_refactoring_patch_rejects_symlink_caller_path(
+    tmp_path: Path,
+) -> None:
+    """Verifies that a symlinked caller path within root is rejected and skipped."""
+    repo_dir = tmp_path / "sym_repo"
+    pkg_dir = repo_dir / "inner_pkg"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    outside_file = tmp_path / "external_target.py"
+    outside_file.write_text("OUTSIDE_SYM_DATA = 999\n", encoding="utf-8")
+
+    symlink_file = pkg_dir / "sym_link.py"
+    try:
+        symlink_file.symlink_to(outside_file)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks not supported on this platform/privilege level")
+
+    src_f1 = (
+        "def process_item(item: int) -> int:\n"
+        "    return item * 2\n"
+    )
+    (pkg_dir / "host.py").write_text(src_f1, encoding="utf-8")
+
+    u1 = {
+        "name": "process_item",
+        "file": "inner_pkg/host.py",
+        "start": 1,
+        "end": 2,
+        "kind": "function",
+    }
+    u2_sym = {
+        "name": "process_item",
+        "file": "inner_pkg/sym_link.py",
+        "start": 1,
+        "end": 2,
+        "kind": "function",
+    }
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2_sym)],
+        repo_root=str(repo_dir),
+        replace_clones=False,
+        cross_file_strategy="host_module",
+    )
+
+    assert patch == ""
+    assert "OUTSIDE_SYM_DATA" not in patch
+
+    extracted = extract_unit_source_code(u2_sym, repo_root=str(repo_dir))
+    assert not any("OUTSIDE_SYM_DATA" in line for line in extracted)
+    assert extracted == ["# Source for process_item lines 1-2\n"]
+
+
 def test_generate_refactoring_patch_shared_module_helper_name_collision_avoidance(
     tmp_path: Path,
 ) -> None:

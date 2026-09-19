@@ -67,36 +67,55 @@ def _has_symlink_component(path: Path, root: Optional[Path] = None) -> bool:
         return True
 
 
+def _is_safe_repo_python_path(
+    path: Union[Path, str], root: Path
+) -> Tuple[Optional[Path], bool]:
+    """Validates whether a path is safely contained within root and free of symlinks.
+
+    Returns:
+        (resolved_path, is_rejected):
+        - (resolved_path, False) if safe, non-symlinked, and exists as a regular file.
+        - (None, False) if safe and non-symlinked within root, but does not exist on disk.
+        - (None, True) if the path violates security boundaries (outside root, symlink,
+          non-Python, or unresolvable).
+    """
+    try:
+        p = Path(path)
+        if p.suffix != ".py":
+            return None, True
+        if _has_symlink_component(p, root):
+            return None, True
+        resolved_root = root.resolve()
+        if not p.is_absolute() and _has_symlink_component(resolved_root / p, resolved_root):
+            return None, True
+        cand = _resolve_repo_relative_path(p, resolved_root)
+        sentinel = _rejected_outside_root_path(resolved_root)
+        if cand == sentinel or _has_symlink_component(cand, resolved_root):
+            return None, True
+        resolved = cand.resolve()
+        if (
+            _has_symlink_component(resolved, resolved_root)
+            or not _is_within_root(resolved, resolved_root)
+            or resolved == sentinel
+        ):
+            return None, True
+        if resolved.is_file():
+            return resolved, False
+        if not resolved.exists():
+            return None, False
+        return None, True
+    except (OSError, RuntimeError, ValueError):
+        return None, True
+
+
 def _is_safe_repo_python_file(path: Union[Path, str], root: Path) -> Optional[Path]:
     """Validates that a path is a regular, non-symlinked Python file strictly within root.
 
     Returns the canonical resolved Path if safe, or None if the path is a symlink,
     resolves outside the root boundary, or is invalid.
     """
-    try:
-        p = Path(path)
-        if p.suffix != ".py":
-            return None
-        if _has_symlink_component(p, root):
-            return None
-        resolved_root = root.resolve()
-        if not p.is_absolute() and _has_symlink_component(resolved_root / p, resolved_root):
-            return None
-        cand = _resolve_repo_relative_path(p, resolved_root)
-        sentinel = _rejected_outside_root_path(resolved_root)
-        if cand == sentinel or _has_symlink_component(cand, resolved_root):
-            return None
-        resolved = cand.resolve()
-        if (
-            _has_symlink_component(resolved, resolved_root)
-            or not resolved.is_file()
-            or not _is_within_root(resolved, resolved_root)
-            or resolved == sentinel
-        ):
-            return None
-        return resolved
-    except (OSError, RuntimeError, ValueError):
-        return None
+    resolved, is_rejected = _is_safe_repo_python_path(path, root)
+    return resolved if not is_rejected else None
 
 
 def _resolve_repo_relative_path(
