@@ -162,10 +162,13 @@ def derive_module_import_path(
     """
     p_root = Path(repo_root).resolve()
     p_file = _resolve_repo_relative_path(file_path, p_root)
-    try:
-        rel = p_file.relative_to(p_root)
-    except ValueError:
-        rel = Path(p_file.name)
+    if p_file == _rejected_outside_root_path(p_root):
+        rel = Path(Path(str(file_path)).name)
+    else:
+        try:
+            rel = p_file.relative_to(p_root)
+        except ValueError:
+            rel = Path(p_file.name)
     parts = list(rel.parts)
     if parts and parts[0] == "src":
         parts = parts[1:]
@@ -293,12 +296,16 @@ def derive_shared_module_import(
     effective_root = _find_enclosing_package_root(p_root)
     p_src = _resolve_repo_relative_path(source_file, p_root)
     p_shared = _resolve_repo_relative_path(shared_file, p_root)
+    rejected_sentinel = _rejected_outside_root_path(p_root)
+
+    if rejected_sentinel in (p_src, p_shared):
+        return derive_module_import_path(shared_file, effective_root)
 
     try:
         p_src.relative_to(effective_root)
         p_shared.relative_to(effective_root)
     except ValueError:
-        return derive_module_import_path(p_shared, effective_root)
+        return derive_module_import_path(shared_file, effective_root)
 
     if not prefer_relative:
         return derive_module_import_path(p_shared, effective_root)
