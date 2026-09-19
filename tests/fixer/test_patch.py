@@ -5100,17 +5100,19 @@ def test_generate_refactoring_patch_subdirectory_scan_detects_project_cycle(tmp_
 
 def test_extract_defined_symbols_comprehensive_constructs() -> None:
     """Verifies symbol extraction correctly discovers while loops, match mapping rest, and type aliases."""
-    code = (
-        "while active:\n"
-        "    x = 10\n"
-        "match payload:\n"
-        "    case {'key': val, **rest_kwargs}:\n"
-        "        pass\n"
-    )
-    names = patch_mod._extract_module_defined_names(code)
+    while_code = "while active:\n    x = 10\n"
+    names = patch_mod._extract_module_defined_names(while_code)
     assert "x" in names
-    assert "val" in names
-    assert "rest_kwargs" in names
+
+    if sys.version_info >= (3, 10):
+        match_code = (
+            "match payload:\n"
+            "    case {'key': val, **rest_kwargs}:\n"
+            "        pass\n"
+        )
+        match_names = patch_mod._extract_module_defined_names(match_code)
+        assert "val" in match_names
+        assert "rest_kwargs" in match_names
 
     if sys.version_info >= (3, 12):
         alias_code = "type CustomInt = int\n"
