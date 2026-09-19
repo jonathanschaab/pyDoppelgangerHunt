@@ -26,7 +26,6 @@ from pydoppelgangerhunt.fixer.binding import (
 )
 from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
-    _TRY_TYPES,
     _collect_top_level_import_nodes,
     _find_enclosing_package_root,
     _find_project_filesystem_root,
@@ -1102,12 +1101,18 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
             elif isinstance(node, ast.If):
                 _collect_top_defs(node.body)
                 _collect_top_defs(node.orelse)
-            elif isinstance(node, _TRY_TYPES):
+            elif isinstance(node, ast.Try):
                 _collect_top_defs(node.body)
                 for handler in node.handlers:
                     _collect_top_defs(handler.body)
                 _collect_top_defs(node.orelse)
                 _collect_top_defs(node.finalbody)
+            elif hasattr(ast, "TryStar") and isinstance(node, getattr(ast, "TryStar")):
+                _collect_top_defs(getattr(node, "body", []))
+                for handler in getattr(node, "handlers", []):
+                    _collect_top_defs(getattr(handler, "body", []))
+                _collect_top_defs(getattr(node, "orelse", []))
+                _collect_top_defs(getattr(node, "finalbody", []))
             elif hasattr(ast, "Match") and isinstance(node, getattr(ast, "Match")):
                 for case in getattr(node, "cases", []):
                     for sub in ast.walk(case.pattern):
