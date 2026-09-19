@@ -28,6 +28,7 @@ from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
     _find_enclosing_package_root,
     _find_project_filesystem_root,
+    _has_symlink_component,
     _parse_source_imports,
     _resolve_relative_import_path,
     _resolve_repo_relative_path,
@@ -1744,6 +1745,26 @@ def _format_patch_relative_path(
     return str(target_path.name)
 
 
+def _resolve_safe_clone_file_path(
+    raw_path: str, candidate_roots: Sequence[Path]
+) -> Optional[Path]:
+    """Resolves raw_path across candidate roots, rejecting symlinks and resolution errors."""
+    if not raw_path:
+        return None
+    for root_dir in candidate_roots:
+        unresolved = (
+            Path(raw_path)
+            if Path(raw_path).is_absolute()
+            else root_dir / Path(raw_path)
+        )
+        if _has_symlink_component(unresolved, root_dir):
+            return None
+        cand = _resolve_repo_relative_path(raw_path, root_dir)
+        if cand.is_file() and not _has_symlink_component(cand, root_dir):
+            return cand
+    return None
+
+
 def generate_refactoring_patch(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     repo_root: Optional[str] = None,
@@ -1804,12 +1825,10 @@ def generate_refactoring_patch(
         f1_raw = normalize_path_string(str(u1.get("file") or ""), strip_anchor=True)
         if not f1_raw:
             continue
-        f1_path = _resolve_repo_relative_path(f1_raw, fs_root)
-        if not f1_path.is_file() and patch_root != fs_root:
-            f1_path = _resolve_repo_relative_path(f1_raw, patch_root)
-        if not f1_path.is_file() and import_root != fs_root and import_root != patch_root:
-            f1_path = _resolve_repo_relative_path(f1_raw, import_root)
-        if not f1_path.is_file() or f1_path.is_symlink():
+        f1_path = _resolve_safe_clone_file_path(
+            f1_raw, (fs_root, patch_root, import_root)
+        )
+        if f1_path is None or not f1_path.is_file() or f1_path.is_symlink():
             continue
 
         rel_f1 = _format_patch_relative_path(f1_path, patch_root, fs_root)
@@ -1839,12 +1858,10 @@ def generate_refactoring_patch(
             enc2 = find_enclosing_class(orig_text, u2)
             fn2 = find_enclosing_function(orig_text, u2)
         elif f2_raw:
-            f2_path = _resolve_repo_relative_path(f2_raw, fs_root)
-            if not f2_path.is_file() and patch_root != fs_root:
-                f2_path = _resolve_repo_relative_path(f2_raw, patch_root)
-            if not f2_path.is_file() and import_root != fs_root and import_root != patch_root:
-                f2_path = _resolve_repo_relative_path(f2_raw, import_root)
-            if f2_path.is_file() and not f2_path.is_symlink():
+            f2_path = _resolve_safe_clone_file_path(
+                f2_raw, (fs_root, patch_root, import_root)
+            )
+            if f2_path is not None and f2_path.is_file() and not f2_path.is_symlink():
                 rel_f2 = _format_patch_relative_path(f2_path, patch_root, fs_root)
                 f2_plan = file_plans.get(f2_path)
                 if f2_plan is None:

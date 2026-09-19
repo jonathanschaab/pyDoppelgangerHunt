@@ -4461,3 +4461,44 @@ def test_cross_module_shared_module_directory_collision_rejected(tmp_path: Path)
     assert "existing directory" in patch
     assert "skipping extraction" in patch
 
+
+def test_generate_refactoring_patch_rejects_internal_symlink_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that a clone referencing an internal symlink is rejected rather than modifying the target file."""
+    repo = tmp_path / "symlink_repo"
+    repo.mkdir()
+    (repo / "__init__.py").write_text("", encoding="utf-8")
+
+    real_file = repo / "real.py"
+    real_file.write_text("def helper(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+
+    link_file = repo / "link.py"
+
+    try:
+        link_file.symlink_to(real_file)
+    except (OSError, NotImplementedError):
+        link_file.write_text("def helper(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+        orig_is_symlink = Path.is_symlink
+
+        def mock_is_symlink(self: Path) -> bool:
+            if self.name == "link.py":
+                return True
+            return orig_is_symlink(self)
+
+        monkeypatch.setattr(Path, "is_symlink", mock_is_symlink)
+
+    u1 = {"name": "helper", "file": "link.py", "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "helper", "file": "real.py", "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(repo),
+        replace_clones=True,
+    )
+
+    # Because u1 is link.py, it must be rejected and must NOT generate modifications against real.py
+    assert "real.py" not in patch
+    assert patch == ""
+
+

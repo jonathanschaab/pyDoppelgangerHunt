@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 import pytest
 
 from pydoppelgangerhunt.fixer.depgraph import (
@@ -1149,4 +1150,53 @@ def test_resolve_shared_module_file_directory_collision(tmp_path: Path) -> None:
     # 3. Target _common.py requested directly when it is a directory -> raises ValueError
     with pytest.raises(ValueError, match="existing directory"):
         resolve_shared_module_file(f1, f2, root, shared_module_name="_common.py")
+
+
+def test_resolve_repo_relative_path_catches_resolution_errors_and_symlink_loops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that symlink loops and resolution errors return the rejected sentinel."""
+    from pydoppelgangerhunt.fixer.depgraph import (  # pylint: disable=import-outside-toplevel
+        _rejected_outside_root_path,
+        _resolve_repo_relative_path,
+    )
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    sentinel = _rejected_outside_root_path(repo_dir)
+
+    # 1. Mock Path.resolve to raise RuntimeError ("Symlink loop")
+    orig_resolve = Path.resolve
+
+    def mock_resolve_loop(self: Path, *args: Any, **kwargs: Any) -> Path:
+        if "loop" in self.name:
+            raise RuntimeError("Symlink loop detected")
+        return orig_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", mock_resolve_loop)
+    res_loop = _resolve_repo_relative_path("loop.py", repo_dir)
+    assert res_loop == sentinel
+
+    # 2. Mock Path.resolve to raise OSError (Filesystem error)
+    def mock_resolve_oserror(self: Path, *args: Any, **kwargs: Any) -> Path:
+        if "bad_fs" in self.name:
+            raise OSError("Filesystem I/O error")
+        return orig_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", mock_resolve_oserror)
+    res_err = _resolve_repo_relative_path("bad_fs.py", repo_dir)
+    assert res_err == sentinel
+
+    # 3. Direct symlink in candidate path returns sentinel
+    orig_is_symlink = Path.is_symlink
+
+    def mock_is_symlink(self: Path) -> bool:
+        if self.name == "link.py":
+            return True
+        return orig_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", mock_is_symlink)
+    res_sym = _resolve_repo_relative_path("link.py", repo_dir)
+    assert res_sym == sentinel
+
 

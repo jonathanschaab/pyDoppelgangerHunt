@@ -36,7 +36,30 @@ def _is_within_root(path: Path, root: Path) -> bool:
 
 def _rejected_outside_root_path(root: Path) -> Path:
     """Returns a non-colliding sentinel path for rejected candidates outside the root."""
-    return root.resolve() / ".git" / ".pydoppelgangerhunt-invalid-path" / "__outside_root__"
+    try:
+        resolved = root.resolve()
+    except (OSError, RuntimeError, ValueError):
+        resolved = root
+    return resolved / ".git" / ".pydoppelgangerhunt-invalid-path" / "__outside_root__"
+
+
+def _has_symlink_component(path: Path, root: Optional[Path] = None) -> bool:
+    """Checks whether a path or any ancestor component below root is a symbolic link."""
+    try:
+        if path.is_symlink():
+            return True
+        if root is not None:
+            try:
+                resolved_root = root.resolve()
+            except (OSError, RuntimeError, ValueError):
+                resolved_root = root
+            for parent in path.parents:
+                if parent != resolved_root and resolved_root in parent.parents:
+                    if parent.is_symlink():
+                        return True
+        return False
+    except (OSError, RuntimeError, ValueError):
+        return True
 
 
 def _is_safe_repo_python_file(path: Union[Path, str], root: Path) -> Optional[Path]:
@@ -49,18 +72,18 @@ def _is_safe_repo_python_file(path: Union[Path, str], root: Path) -> Optional[Pa
         p = Path(path)
         if p.suffix != ".py":
             return None
-        if p.is_symlink():
+        if _has_symlink_component(p, root):
             return None
         resolved_root = root.resolve()
-        if not p.is_absolute() and (resolved_root / p).is_symlink():
+        if not p.is_absolute() and _has_symlink_component(resolved_root / p, resolved_root):
             return None
         cand = _resolve_repo_relative_path(p, resolved_root)
         sentinel = _rejected_outside_root_path(resolved_root)
-        if cand == sentinel or cand.is_symlink():
+        if cand == sentinel or _has_symlink_component(cand, resolved_root):
             return None
         resolved = cand.resolve()
         if (
-            resolved.is_symlink()
+            _has_symlink_component(resolved, resolved_root)
             or not resolved.is_file()
             or not _is_within_root(resolved, resolved_root)
             or resolved == sentinel
@@ -75,31 +98,53 @@ def _resolve_repo_relative_path(
     file_path: Union[Path, str], p_root: Path
 ) -> Path:
     """Normalizes path separators and resolves relative paths against the repository root."""
-    norm = str(file_path).replace("\\", "/")
-    p = Path(norm)
-    resolved_root = p_root.resolve()
-    pkg_root = _find_enclosing_package_root(resolved_root)
-    if not p.is_absolute():
-        cand = (resolved_root / p).resolve()
-        if _is_within_root(cand, resolved_root) and (cand.is_file() or cand.is_dir()):
+    try:
+        norm = str(file_path).replace("\\", "/")
+        p = Path(norm)
+        resolved_root = p_root.resolve()
+        sentinel = _rejected_outside_root_path(resolved_root)
+        if _has_symlink_component(p, resolved_root):
+            return sentinel
+        pkg_root = _find_enclosing_package_root(resolved_root)
+        if not p.is_absolute():
+            unresolved = resolved_root / p
+            if _has_symlink_component(unresolved, resolved_root):
+                return sentinel
+            cand = unresolved.resolve()
+            if _has_symlink_component(cand, resolved_root):
+                return sentinel
+            if _is_within_root(cand, resolved_root) and (cand.is_file() or cand.is_dir()):
+                return cand
+            if pkg_root != resolved_root:
+                unresolved_pkg = pkg_root / p
+                if _has_symlink_component(unresolved_pkg, resolved_root):
+                    return sentinel
+                cand_pkg = unresolved_pkg.resolve()
+                if _has_symlink_component(cand_pkg, resolved_root):
+                    return sentinel
+                if _is_within_root(cand_pkg, resolved_root) and (
+                    cand_pkg.is_file() or cand_pkg.is_dir()
+                ):
+                    return cand_pkg
+            if p.is_file() or p.is_dir():
+                if _has_symlink_component(p, resolved_root):
+                    return sentinel
+                cand_cwd = p.resolve()
+                if _has_symlink_component(cand_cwd, resolved_root):
+                    return sentinel
+                if _is_within_root(cand_cwd, resolved_root):
+                    return cand_cwd
+            if not _is_within_root(cand, resolved_root):
+                return sentinel
             return cand
-        if pkg_root != resolved_root:
-            cand_pkg = (pkg_root / p).resolve()
-            if _is_within_root(cand_pkg, resolved_root) and (
-                cand_pkg.is_file() or cand_pkg.is_dir()
-            ):
-                return cand_pkg
-        if p.is_file() or p.is_dir():
-            cand_cwd = p.resolve()
-            if _is_within_root(cand_cwd, resolved_root):
-                return cand_cwd
-        if not _is_within_root(cand, resolved_root):
-            return _rejected_outside_root_path(resolved_root)
-        return cand
-    resolved_path = p.resolve()
-    if _is_within_root(resolved_path, resolved_root):
-        return resolved_path
-    return _rejected_outside_root_path(resolved_root)
+        resolved_path = p.resolve()
+        if _has_symlink_component(resolved_path, resolved_root):
+            return sentinel
+        if _is_within_root(resolved_path, resolved_root):
+            return resolved_path
+        return sentinel
+    except (OSError, RuntimeError, ValueError):
+        return _rejected_outside_root_path(p_root)
 
 
 def _find_enclosing_package_root(path: Path) -> Path:
