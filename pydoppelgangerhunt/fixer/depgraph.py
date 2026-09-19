@@ -7,7 +7,7 @@ import keyword
 import os
 from collections import deque
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Union
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 EXCLUDED_GRAPH_DIRS: Set[str] = {
     ".git",
@@ -66,6 +66,48 @@ def _find_enclosing_package_root(path: Path) -> Path:
             return parent
         curr = parent
     return curr.parent
+
+
+def _find_project_filesystem_root(path: Path) -> Path:
+    """Finds the project or repository filesystem root enclosing the given path.
+
+    Walks ancestor directories checking for VCS metadata (.git, .hg, .svn)
+    or build configurations (pyproject.toml, setup.py, setup.cfg).
+    If nested inside a 'src' layout, returns the directory enclosing 'src'.
+    Falls back to enclosing package root or the path itself.
+    """
+    curr = path.resolve()
+    if curr.is_file():
+        curr = curr.parent
+
+    # 1. Search upwards for VCS metadata or build configurations
+    scan_dir = curr
+    while True:
+        if (
+            (scan_dir / ".git").exists()
+            or (scan_dir / ".hg").is_dir()
+            or (scan_dir / ".svn").is_dir()
+            or (scan_dir / "pyproject.toml").is_file()
+            or (scan_dir / "setup.py").is_file()
+            or (scan_dir / "setup.cfg").is_file()
+            or (scan_dir / "tox.ini").is_file()
+        ):
+            return scan_dir
+        parent = scan_dir.parent
+        if parent == scan_dir:
+            break
+        scan_dir = parent
+
+    # 2. Check for standard 'src' container layout
+    enclosing_pkg = _find_enclosing_package_root(curr)
+    if enclosing_pkg.name == "src" and enclosing_pkg.parent != enclosing_pkg:
+        return enclosing_pkg.parent
+
+    # 3. Fallback to enclosing package root if path is inside a package
+    if (curr / "__init__.py").is_file():
+        return enclosing_pkg
+
+    return curr
 
 
 def derive_module_import_path(
@@ -306,16 +348,42 @@ def _is_type_checking_guard(test_node: ast.expr) -> bool:
         return True
     if isinstance(test_node, ast.Constant) and test_node.value in (False, 0):
         return True
+    cmp_info = _extract_guarded_compare_target(test_node)
+    if cmp_info is not None:
+        target, expected = cmp_info
+        return expected and _is_type_checking_guard(target)
     return False
+
+
+def _extract_guarded_compare_target(
+    test_node: ast.expr,
+) -> Optional[Tuple[ast.expr, bool]]:
+    """Extracts comparison target and resolved boolean truth value for single-comparison guards."""
+    if (
+        isinstance(test_node, ast.Compare)
+        and len(test_node.ops) == 1
+        and len(test_node.comparators) == 1
+        and isinstance(test_node.comparators[0], ast.Constant)
+        and isinstance(test_node.comparators[0].value, bool)
+    ):
+        op = test_node.ops[0]
+        val = bool(test_node.comparators[0].value)
+        if isinstance(op, (ast.Is, ast.Eq)):
+            return test_node.left, val
+        if isinstance(op, (ast.IsNot, ast.NotEq)):
+            return test_node.left, not val
+    return None
 
 
 def _is_inverted_type_checking_guard(test_node: ast.expr) -> bool:
     """Detects whether an AST expression inverts a static type-checking guard."""
-    return (
-        isinstance(test_node, ast.UnaryOp)
-        and isinstance(test_node.op, ast.Not)
-        and _is_type_checking_guard(test_node.operand)
-    )
+    if isinstance(test_node, ast.UnaryOp) and isinstance(test_node.op, ast.Not):
+        return _is_type_checking_guard(test_node.operand)
+    cmp_info = _extract_guarded_compare_target(test_node)
+    if cmp_info is not None:
+        target, expected = cmp_info
+        return (not expected) and _is_type_checking_guard(target)
+    return False
 
 
 def _collect_top_level_import_nodes(
@@ -350,6 +418,14 @@ def _collect_top_level_import_nodes(
             result.extend(_collect_top_level_import_nodes(stmt.body))
         elif isinstance(stmt, (ast.With, ast.AsyncWith)):
             result.extend(_collect_top_level_import_nodes(stmt.body))
+        elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+            result.extend(_collect_top_level_import_nodes(stmt.body))
+            result.extend(_collect_top_level_import_nodes(stmt.orelse))
+        elif isinstance(stmt, ast.ClassDef):
+            result.extend(_collect_top_level_import_nodes(stmt.body))
+        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):
+            for case in getattr(stmt, "cases", []):
+                result.extend(_collect_top_level_import_nodes(case.body))
     return result
 
 
@@ -360,7 +436,7 @@ def _parse_source_imports(
     imports: Set[str] = set()
     try:
         tree = ast.parse(source_text)
-    except (SyntaxError, UnicodeDecodeError):
+    except (SyntaxError, UnicodeDecodeError, ValueError):
         return imports
 
     for node in _collect_top_level_import_nodes(tree.body):

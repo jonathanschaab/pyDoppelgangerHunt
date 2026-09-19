@@ -3752,6 +3752,26 @@ def test_generate_refactoring_patch_file_repo_root_uses_project_root_patch_paths
     assert (top_pkg / "_common.py").is_file()
 
 
+def test_generate_refactoring_patch_strategy_normalization(tmp_path: Path) -> None:
+    """Verifies that strategy arguments handle whitespace, casing, and unknown fallback gracefully."""
+    f1 = tmp_path / "a.py"
+    f2 = tmp_path / "b.py"
+    f1.write_text("def fn():\n    return 42\n", encoding="utf-8")
+    f2.write_text("def fn2():\n    return 42\n", encoding="utf-8")
+    u1 = {"name": "fn", "file": "a.py", "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "fn2", "file": "b.py", "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        cross_file_strategy="  UNKNOWN_STRATEGY  ",
+        type_merge_strategy=" STRICT ",
+        method_binding=" MODULE ",
+    )
+    assert "--- a/a.py" in patch
+    assert "+++ b/a.py" in patch
+
+
 def test_collect_host_missing_imports_handles_shadowed_builtins(tmp_path: Path) -> None:
     """Verifies that shadowed builtins are hoisted when consistent or rejected when conflicting."""
     pkg = tmp_path / "shadow_pkg"

@@ -834,3 +834,103 @@ def test_check_cycle_if_imports_added_reports_self_import_cycle(tmp_path: Path) 
         file_path=host_file,
     )
     assert cycle == ["pkg.host", "pkg.host"]
+
+
+def test_check_cycle_if_imports_added_detects_self_import(tmp_path: Path) -> None:
+    """Verifies that check_cycle_if_imports_added identifies self-imports as cycles."""
+    root = tmp_path / "repo"
+    pkg = root / "pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "service.py").write_text("def run() -> None: pass\n", encoding="utf-8")
+
+    graph = build_module_graph(root)
+
+    # Propose self-import: pkg.service importing pkg.service
+    self_cycle = graph.check_cycle_if_imports_added(
+        "pkg.service", ["from pkg.service import run"]
+    )
+    assert self_cycle == ["pkg.service", "pkg.service"]
+
+
+def test_depgraph_collect_top_level_import_nodes_in_class_def(tmp_path: Path) -> None:
+    """Verifies that top-level class body imports are collected, while methods are skipped."""
+    root = tmp_path / "repo"
+    pkg = root / "pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    (pkg / "caller.py").write_text("x = 10\n", encoding="utf-8")
+    (pkg / "host.py").write_text(
+        "class Registry:\n"
+        "    from pkg.caller import x\n"
+        "    def method(self) -> None:\n"
+        "        import pkg.lazy_ignored\n",
+        encoding="utf-8",
+    )
+
+    graph = build_module_graph(root)
+    assert "pkg.caller" in graph.get_dependencies("pkg.host")
+    assert "pkg.lazy_ignored" not in graph.get_dependencies("pkg.host")
+
+    # Propose caller -> host: should detect cycle host -> caller -> host
+    cycle = graph.check_cycle_if_added("pkg.caller", "pkg.host")
+    assert cycle == ["pkg.caller", "pkg.host", "pkg.caller"]
+
+
+def test_depgraph_conditional_comparisons_and_loops() -> None:
+    """Verifies ast comparison expressions for TYPE_CHECKING and loop traversal."""
+    from pydoppelgangerhunt.fixer.depgraph import (  # pylint: disable=import-outside-toplevel
+        _parse_source_imports,
+    )
+
+    src = (
+        "import typing\n"
+        "if typing.TYPE_CHECKING is True:\n"
+        "    import tc_cmp_skipped\n"
+        "else:\n"
+        "    import tc_cmp_active\n"
+        "if typing.TYPE_CHECKING is False:\n"
+        "    import tc_false_active\n"
+        "for _ in range(2):\n"
+        "    import loop_dep\n"
+    )
+    imports = _parse_source_imports(src, "pkg.mod")
+    assert "tc_cmp_skipped" not in imports
+    assert "tc_cmp_active" in imports
+    assert "tc_false_active" in imports
+    assert "loop_dep" in imports
+
+    # Null bytes do not raise ValueError and return empty set
+    assert _parse_source_imports("x = 1\x00\nimport bad", "pkg.mod") == set()
+
+
+def test_find_project_filesystem_root(tmp_path: Path) -> None:
+    """Verifies that _find_project_filesystem_root accurately discovers project boundaries."""
+    from pydoppelgangerhunt.fixer.depgraph import (  # pylint: disable=import-outside-toplevel
+        _find_project_filesystem_root,
+    )
+
+    # 1. Project with .git directory
+    git_repo = tmp_path / "git_project"
+    git_repo.mkdir()
+    (git_repo / ".git").mkdir()
+    sub_dir = git_repo / "sub" / "deep"
+    sub_dir.mkdir(parents=True)
+    assert _find_project_filesystem_root(sub_dir) == git_repo
+
+    # 2. Project with pyproject.toml
+    pyproject_repo = tmp_path / "pyproject_project"
+    pyproject_repo.mkdir()
+    (pyproject_repo / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    pkg_dir = pyproject_repo / "src" / "pkg"
+    pkg_dir.mkdir(parents=True)
+    assert _find_project_filesystem_root(pkg_dir) == pyproject_repo
+
+    # 3. src layout without markers
+    src_repo = tmp_path / "src_layout_project"
+    src_repo.mkdir()
+    src_pkg = src_repo / "src" / "pkg"
+    src_pkg.mkdir(parents=True)
+    (src_pkg / "__init__.py").write_text("", encoding="utf-8")
+    assert _find_project_filesystem_root(src_pkg) == src_repo

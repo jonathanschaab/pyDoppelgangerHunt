@@ -27,6 +27,7 @@ from pydoppelgangerhunt.fixer.binding import (
 from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
     _find_enclosing_package_root,
+    _find_project_filesystem_root,
     _parse_source_imports,
     _resolve_relative_import_path,
     _resolve_repo_relative_path,
@@ -57,25 +58,6 @@ from pydoppelgangerhunt.fixer.synthesis import (
 
 logger = logging.getLogger(__name__)
 _BUILTIN_NAMES: Set[str] = set(dir(builtins))
-_PROJECT_ROOT_MARKERS: Set[str] = {
-    ".git",
-    "pyproject.toml",
-    "setup.py",
-    "setup.cfg",
-    "tox.ini",
-}
-
-
-def _find_patch_repo_root(root: Path, import_repo_root: Path) -> Path:
-    """Finds the filesystem root to use for patch paths independently of import derivation."""
-    resolved_root = root.resolve()
-    for candidate in (resolved_root, *resolved_root.parents):
-        has_marker = any((candidate / marker).exists() for marker in _PROJECT_ROOT_MARKERS)
-        if has_marker:
-            return candidate
-    if (resolved_root / "__init__.py").is_file():
-        return import_repo_root
-    return resolved_root
 
 
 def check_units_overlap(
@@ -1741,6 +1723,22 @@ def _register_plan_dependencies_in_graph(
         dg.add_import_dependency(mod_name, imp, known_modules=known_modules)
 
 
+def _format_patch_relative_path(
+    target_path: Path,
+    primary_root: Path,
+    fallback_root: Optional[Path] = None,
+) -> str:
+    """Formats target_path relative to primary_root, falling back to fallback_root or filename."""
+    resolved_target = target_path.resolve() if target_path.is_absolute() else target_path
+    for candidate in (primary_root, fallback_root):
+        if candidate is not None:
+            try:
+                return str(resolved_target.relative_to(candidate.resolve())).replace("\\", "/")
+            except ValueError:
+                pass
+    return str(target_path.name)
+
+
 def generate_refactoring_patch(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     repo_root: Optional[str] = None,
@@ -1755,22 +1753,38 @@ def generate_refactoring_patch(
     if not clones:
         return ""
 
-    root = Path(repo_root or os.getcwd()).resolve()
-    if root.is_file():
-        root = root.parent
-    patch_repo_root = root
-    effective_repo_root = (
-        _find_enclosing_package_root(root)
-        if (root / "__init__.py").is_file()
-        else root
+    fs_root = Path(repo_root or os.getcwd()).resolve()
+    if fs_root.is_file():
+        fs_root = fs_root.parent
+    patch_root = _find_project_filesystem_root(fs_root)
+    root = patch_root
+    import_root = (
+        _find_enclosing_package_root(fs_root)
+        if (fs_root / "__init__.py").is_file()
+        else fs_root
     )
-    patch_repo_root = _find_patch_repo_root(root, effective_repo_root)
+    cross_file_strategy = (cross_file_strategy or "auto").strip().lower()
+    if cross_file_strategy not in (
+        "auto",
+        "host_module",
+        "host",
+        "shared_module",
+        "shared",
+        "skip",
+    ):
+        cross_file_strategy = "auto"
+    type_merge_strategy = (type_merge_strategy or "fallback_any").strip().lower()
+    if type_merge_strategy not in ("fallback_any", "union", "intersect", "strict"):
+        type_merge_strategy = "fallback_any"
+    method_binding = (method_binding or "auto").strip().lower()
+    if method_binding not in ("auto", "method", "module"):
+        method_binding = "auto"
     graph_holder: List[Optional[ModuleDependencyGraph]] = [depgraph]
 
     def _get_depgraph() -> ModuleDependencyGraph:
         g = graph_holder[0]
         if g is None:
-            g = build_module_graph(effective_repo_root)
+            g = build_module_graph(patch_root)
             graph_holder[0] = g
         return g
 
@@ -1789,16 +1803,15 @@ def generate_refactoring_patch(
         f1_raw = normalize_path_string(str(u1.get("file") or ""), strip_anchor=True)
         if not f1_raw:
             continue
-        f1_path = _resolve_repo_relative_path(f1_raw, root)
-        if not f1_path.is_file() and effective_repo_root != root:
-            f1_path = _resolve_repo_relative_path(f1_raw, effective_repo_root)
+        f1_path = _resolve_repo_relative_path(f1_raw, patch_root)
+        if not f1_path.is_file() and fs_root != patch_root:
+            f1_path = _resolve_repo_relative_path(f1_raw, fs_root)
+        if not f1_path.is_file() and import_root != patch_root:
+            f1_path = _resolve_repo_relative_path(f1_raw, import_root)
         if not f1_path.is_file():
             continue
 
-        try:
-            rel_f1 = str(f1_path.relative_to(patch_repo_root)).replace("\\", "/")
-        except ValueError:
-            rel_f1 = str(f1_path.name)
+        rel_f1 = _format_patch_relative_path(f1_path, patch_root, fs_root)
 
         f1_plan = file_plans.get(f1_path)
         if f1_plan is None:
@@ -1813,7 +1826,7 @@ def generate_refactoring_patch(
         orig_lines = f1_plan.orig_lines
 
         f2_raw = normalize_path_string(str(u2.get("file") or ""), strip_anchor=True)
-        is_same_file = _is_same_file_path(f1_raw, f2_raw, repo_root=str(root))
+        is_same_file = _is_same_file_path(f1_raw, f2_raw, repo_root=str(patch_root))
 
         enc1 = find_enclosing_class(orig_text, u1)
         fn1 = find_enclosing_function(orig_text, u1)
@@ -1825,14 +1838,13 @@ def generate_refactoring_patch(
             enc2 = find_enclosing_class(orig_text, u2)
             fn2 = find_enclosing_function(orig_text, u2)
         elif f2_raw:
-            f2_path = _resolve_repo_relative_path(f2_raw, root)
-            if not f2_path.is_file() and effective_repo_root != root:
-                f2_path = _resolve_repo_relative_path(f2_raw, effective_repo_root)
+            f2_path = _resolve_repo_relative_path(f2_raw, patch_root)
+            if not f2_path.is_file() and fs_root != patch_root:
+                f2_path = _resolve_repo_relative_path(f2_raw, fs_root)
+            if not f2_path.is_file() and import_root != patch_root:
+                f2_path = _resolve_repo_relative_path(f2_raw, import_root)
             if f2_path.is_file():
-                try:
-                    rel_f2 = str(f2_path.relative_to(patch_repo_root)).replace("\\", "/")
-                except ValueError:
-                    rel_f2 = str(f2_path.name)
+                rel_f2 = _format_patch_relative_path(f2_path, patch_root, fs_root)
                 f2_plan = file_plans.get(f2_path)
                 if f2_plan is None:
                     try:
@@ -1846,18 +1858,18 @@ def generate_refactoring_patch(
 
         if replace_clones:
             u1_claimed = any(
-                check_units_overlap(u1, prev_u, repo_root=str(root))
+                check_units_overlap(u1, prev_u, repo_root=str(patch_root))
                 for prev_u in f1_plan.claimed_units
             )
             if is_same_file:
                 u2_claimed = any(
-                    check_units_overlap(u2, prev_u, repo_root=str(root))
+                    check_units_overlap(u2, prev_u, repo_root=str(patch_root))
                     for prev_u in f1_plan.claimed_units
                 )
             else:
                 u2_claimed = (
                     any(
-                        check_units_overlap(u2, prev_u, repo_root=str(root))
+                        check_units_overlap(u2, prev_u, repo_root=str(patch_root))
                         for prev_u in f2_plan.claimed_units
                     )
                     if f2_plan is not None
@@ -2028,14 +2040,16 @@ def generate_refactoring_patch(
         base_helper = (
             f"_shared_{base_name1}" if base_name1 == base_name2 else f"_shared_{base_name1}_{base_name2}"
         )
+        shared_p: Optional[Path] = None
         target_host_plan: Optional[_FilePatchPlan] = None
         target_host_text: Optional[str] = None
         cross_file_action = cross_file_strategy
         if cross_file_action == "auto" and not is_same_file and f2_plan is not None:
-            common_dir = find_nearest_common_package(f1_path, f2_plan.path, root)
+            common_dir = find_nearest_common_package(f1_path, f2_plan.path, patch_root)
             if common_dir.resolve() in (
-                effective_repo_root.resolve(),
-                (effective_repo_root / "src").resolve(),
+                patch_root.resolve(),
+                (patch_root / "src").resolve(),
+                import_root.resolve(),
             ):
                 cross_file_action = "host_module"
             else:
@@ -2047,7 +2061,7 @@ def generate_refactoring_patch(
             and cross_file_action in ("shared_module", "shared")
         ):
             maybe_shared_p = _safely_resolve_shared_module_file(
-                f1_path, f2_plan.path, root, shared_module_name, f1_plan, f2_plan
+                f1_path, f2_plan.path, patch_root, shared_module_name, f1_plan, f2_plan
             )
             if maybe_shared_p is None:
                 continue
@@ -2061,7 +2075,7 @@ def generate_refactoring_patch(
                 target_host_plan = file_plans.get(shared_p)
                 if target_host_plan is None and shared_p.is_file() and not shared_p.is_symlink():
                     try:
-                        shared_p.resolve().relative_to(root.resolve())
+                        shared_p.resolve().relative_to(patch_root.resolve())
                         target_host_text = shared_p.read_text(encoding="utf-8")
                     except (OSError, UnicodeDecodeError, ValueError):
                         pass
@@ -2135,7 +2149,7 @@ def generate_refactoring_patch(
         )
 
         if is_same_file:
-            mod1 = _derive_module_import_path(f1_path, effective_repo_root)
+            mod1 = _derive_module_import_path(f1_path, import_root)
             is_pkg1 = f1_path.name == "__init__.py"
             helper_code, maybe_imports = _safely_prepare_helper_and_imports(
                 host_plan=f1_plan,
@@ -2188,19 +2202,15 @@ def generate_refactoring_patch(
             )
         elif f2_plan is not None:
             if cross_file_action in ("shared_module", "shared"):
-                maybe_shared_p = _safely_resolve_shared_module_file(
-                    f1_path, f2_plan.path, effective_repo_root, shared_module_name, f1_plan, f2_plan
-                )
-                if maybe_shared_p is None:
-                    continue
-                shared_p = maybe_shared_p
+                if shared_p is None:
+                    maybe_shared_p = _safely_resolve_shared_module_file(
+                        f1_path, f2_plan.path, patch_root, shared_module_name, f1_plan, f2_plan
+                    )
+                    if maybe_shared_p is None:
+                        continue
+                    shared_p = maybe_shared_p
 
-                try:
-                    rel_shared = str(
-                        shared_p.resolve().relative_to(patch_repo_root.resolve())
-                    ).replace("\\", "/")
-                except ValueError:
-                    rel_shared = str(shared_p.name)
+                rel_shared = _format_patch_relative_path(shared_p, patch_root, fs_root)
 
                 if shared_p.resolve() == f1_path.resolve():
                     host_plan = f1_plan
@@ -2226,7 +2236,7 @@ def generate_refactoring_patch(
                             continue
                         if shared_p.is_file():
                             try:
-                                shared_p.resolve().relative_to(patch_repo_root.resolve())
+                                shared_p.resolve().relative_to(patch_root.resolve())
                                 shared_text = shared_p.read_text(encoding="utf-8")
                                 shared_plan = _get_plan(
                                     shared_p, rel_shared, shared_text, is_new_file=False
@@ -2249,11 +2259,11 @@ def generate_refactoring_patch(
                         (f2_plan, u2, t_inputs2, target_outs2),
                     ]
 
-                mod1 = _derive_module_import_path(f1_path, effective_repo_root)
-                mod2 = _derive_module_import_path(f2_plan.path, effective_repo_root)
+                mod1 = _derive_module_import_path(f1_path, import_root)
+                mod2 = _derive_module_import_path(f2_plan.path, import_root)
                 is_pkg1 = f1_path.name == "__init__.py"
                 is_pkg2 = f2_plan.path.name == "__init__.py"
-                mod_host = _derive_module_import_path(host_plan.path, effective_repo_root)
+                mod_host = _derive_module_import_path(host_plan.path, import_root)
                 is_host_pkg = host_plan.path.name == "__init__.py"
                 helper_code, maybe_imports = _safely_prepare_helper_and_imports(
                     host_plan=host_plan,
@@ -2329,7 +2339,7 @@ def generate_refactoring_patch(
 
                 for c_plan, c_unit, c_tin, c_tout in callers:
                     c_plan.comments.append(pair_comment)
-                    mod_caller = _derive_module_import_path(c_plan.path, effective_repo_root)
+                    mod_caller = _derive_module_import_path(c_plan.path, import_root)
                     cycle = (
                         dg.check_cycle_if_added(mod_caller, mod_host)
                         if (mod_caller and mod_host)
@@ -2371,8 +2381,8 @@ def generate_refactoring_patch(
                                 f"Complete refactoring by replacing the clone with a call in {c_disp}.\n"
                             )
             else:
-                mod1 = _derive_module_import_path(f1_path, effective_repo_root)
-                mod2 = _derive_module_import_path(f2_plan.path, effective_repo_root)
+                mod1 = _derive_module_import_path(f1_path, import_root)
+                mod2 = _derive_module_import_path(f2_plan.path, import_root)
                 is_pkg1 = f1_path.name == "__init__.py"
                 is_pkg2 = f2_plan.path.name == "__init__.py"
                 dg = _get_depgraph()
@@ -2478,7 +2488,7 @@ def generate_refactoring_patch(
                     replace_clones=replace_clones,
                 )
         else:
-            mod1 = _derive_module_import_path(f1_path, effective_repo_root)
+            mod1 = _derive_module_import_path(f1_path, import_root)
             is_pkg1 = f1_path.name == "__init__.py"
             helper_code, maybe_imports = _safely_prepare_helper_and_imports(
                 host_plan=f1_plan,
@@ -2518,7 +2528,7 @@ def generate_refactoring_patch(
     patch_chunks: List[str] = []
     for plan in file_plans.values():
         chunk = _render_file_patch_plan(
-            plan, replace_clones=replace_clones, repo_root=str(patch_repo_root)
+            plan, replace_clones=replace_clones, repo_root=str(patch_root)
         )
         if chunk:
             patch_chunks.append(chunk)
