@@ -69,15 +69,9 @@ _PROJECT_ROOT_MARKERS: Set[str] = {
 def _find_patch_repo_root(root: Path, import_repo_root: Path) -> Path:
     """Finds the filesystem root to use for patch paths independently of import derivation."""
     resolved_root = root.resolve()
-    src_root = import_repo_root if import_repo_root.name == "src" else None
-    if resolved_root.name == "src":
-        src_root = resolved_root
-    if src_root is not None:
-        candidate = src_root.parent
-        has_marker = any(
-            (candidate / marker).exists() for marker in _PROJECT_ROOT_MARKERS
-        )
-        if candidate != src_root and has_marker:
+    for candidate in (resolved_root, *resolved_root.parents):
+        has_marker = any((candidate / marker).exists() for marker in _PROJECT_ROOT_MARKERS)
+        if has_marker:
             return candidate
     if (resolved_root / "__init__.py").is_file():
         return import_repo_root

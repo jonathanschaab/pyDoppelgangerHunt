@@ -3680,6 +3680,78 @@ def test_generate_refactoring_patch_src_layout_uses_project_root_patch_paths(
     assert (sub_pkg / "_common.py").is_file()
 
 
+def test_generate_refactoring_patch_file_repo_root_uses_project_root_patch_paths(
+    tmp_path: Path,
+) -> None:
+    """Verifies file-path repo roots walk up to the project root for patch paths."""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / "pyproject.toml").write_text(
+        "[project]\nname = 'demo'\n",
+        encoding="utf-8",
+    )
+
+    lib_root = project_root / "lib"
+    top_pkg = lib_root / "my_package"
+    top_pkg.mkdir(parents=True)
+    (top_pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src = "def util(a: int) -> int:\n    return a * 2\n"
+    module_a = top_pkg / "a.py"
+    module_b = top_pkg / "b.py"
+    module_a.write_text(src, encoding="utf-8")
+    module_b.write_text(src, encoding="utf-8")
+
+    u1 = {"name": "util", "file": "a.py", "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "util", "file": "b.py", "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(module_a),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "from my_package._common import _shared_util" in patch
+    assert "diff --git a/lib/my_package/_common.py b/lib/my_package/_common.py" in patch
+    assert "--- a/lib/my_package/a.py" in patch
+    assert "+++ b/lib/my_package/a.py" in patch
+    assert "--- a/lib/my_package/b.py" in patch
+    assert "+++ b/lib/my_package/b.py" in patch
+
+    subprocess.run(["git", "init"], cwd=project_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=project_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+    )
+
+    patch_file = project_root / "refactor.patch"
+    patch_file.write_text(patch, encoding="utf-8")
+    apply_res = subprocess.run(
+        ["git", "apply", "refactor.patch"],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+    )
+    assert apply_res.returncode == 0
+    assert (top_pkg / "_common.py").is_file()
+
+
 def test_collect_host_missing_imports_handles_shadowed_builtins(tmp_path: Path) -> None:
     """Verifies that shadowed builtins are hoisted when consistent or rejected when conflicting."""
     pkg = tmp_path / "shadow_pkg"
