@@ -67,8 +67,6 @@ def _resolve_repo_relative_path(
     resolved_path = p.resolve()
     if _is_within_root(resolved_path, resolved_root):
         return resolved_path
-    if pkg_root != resolved_root and _is_within_root(resolved_path, pkg_root):
-        return resolved_path
     return _rejected_outside_root_path(resolved_root)
 
 

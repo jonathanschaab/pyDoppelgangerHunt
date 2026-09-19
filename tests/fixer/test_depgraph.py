@@ -1006,14 +1006,6 @@ def test_resolve_repo_relative_path_rejects_parent_escape(tmp_path: Path) -> Non
     assert escaped_abs.is_absolute()
     assert escaped_abs.is_relative_to(repo_dir)
 
-    nested_pkg = repo_dir / "pkg"
-    nested_root = nested_pkg / "tools"
-    nested_root.mkdir(parents=True)
-    (nested_pkg / "__init__.py").write_text("", encoding="utf-8")
-    pkg_abs = nested_pkg / "shared.py"
-    pkg_abs.write_text("# shared\n", encoding="utf-8")
-    assert _resolve_repo_relative_path(pkg_abs, nested_root) == pkg_abs
-
 
 def test_find_enclosing_package_root_nested_subdirectory_without_init(tmp_path: Path) -> None:
     """Verifies that nested package directories without __init__.py discover the enclosing import root."""
