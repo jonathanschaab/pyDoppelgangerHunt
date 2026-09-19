@@ -274,6 +274,57 @@ def test_build_module_graph_from_repository_ast(tmp_path: Path) -> None:
     assert not graph.has_transitive_path("my_pkg.beta", "my_pkg.alpha")
 
 
+def test_build_module_graph_ignores_type_checking_import_cycles(tmp_path: Path) -> None:
+    """Verifies that TYPE_CHECKING-only imports do not create runtime dependency edges."""
+    root = tmp_path / "repo"
+    pkg = root / "pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "a.py").write_text(
+        "from typing import TYPE_CHECKING\n\n"
+        "if TYPE_CHECKING:\n"
+        "    import pkg.b\n",
+        encoding="utf-8",
+    )
+    (pkg / "b.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    graph = build_module_graph(root)
+
+    assert "pkg.b" not in graph.get_dependencies("pkg.a")
+    assert graph.check_cycle_if_added("pkg.b", "pkg.a") is None
+
+
+def test_build_module_graph_package_root_preserves_package_prefix(tmp_path: Path) -> None:
+    """Verifies graphs built from a package directory keep fully qualified module names."""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    pkg = project_root / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "caller.py").write_text("def compute_c(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+    (pkg / "mid.py").write_text(
+        "import mypkg.caller\n\n"
+        "def compute_m(x: int) -> int:\n"
+        "    return mypkg.caller.compute_c(x)\n",
+        encoding="utf-8",
+    )
+    (pkg / "host.py").write_text(
+        "import mypkg.mid\n\n"
+        "def compute_h(x: int) -> int:\n"
+        "    return x + 1\n",
+        encoding="utf-8",
+    )
+
+    graph = build_module_graph(pkg)
+
+    assert "mypkg.host" in graph.mod_to_file
+    assert "mypkg.mid" in graph.get_dependencies("mypkg.host")
+    assert (
+        graph.check_cycle_if_added("mypkg.caller", "mypkg.host")
+        == ["mypkg.caller", "mypkg.host", "mypkg.mid", "mypkg.caller"]
+    )
+
+
 def test_depgraph_edge_cases(tmp_path: Path) -> None:
     """Verifies edge cases in depgraph for branch coverage."""
     # pylint: disable=protected-access
@@ -363,7 +414,7 @@ def test_depgraph_edge_cases(tmp_path: Path) -> None:
     f_not_py = root / "data.txt"
     f_not_py.write_text("hello", encoding="utf-8")
     g_explicit = build_module_graph(root, file_paths=[f_ok, f_not_py, root_init])
-    assert "ok" in g_explicit.mod_to_file
+    assert "edge_repo.ok" in g_explicit.mod_to_file
 
 
 def test_derive_shared_module_import_climbs_above_package(tmp_path: Path) -> None:

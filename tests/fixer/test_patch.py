@@ -2604,6 +2604,40 @@ def test_host_module_detects_cycle_from_synthesized_host_imports(tmp_path: Path)
     assert "from host_cycle_pkg.mod_a import _shared_compute_a_compute_b" not in patch
 
 
+def test_host_module_ignores_type_checking_guarded_direct_import(tmp_path: Path) -> None:
+    """Verifies that TYPE_CHECKING-only imports do not block safe host-module extraction."""
+    pkg_dir = tmp_path / "guard_pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    src_host = (
+        "from typing import TYPE_CHECKING\n\n"
+        "if TYPE_CHECKING:\n"
+        "    import guard_pkg.caller\n\n"
+        "def compute_host(x: int) -> int:\n"
+        "    return x * 2 + 5\n"
+    )
+    src_caller = (
+        "def compute_caller(x: int) -> int:\n"
+        "    return x * 2 + 5\n"
+    )
+    (pkg_dir / "host.py").write_text(src_host, encoding="utf-8")
+    (pkg_dir / "caller.py").write_text(src_caller, encoding="utf-8")
+
+    u_host = {"name": "compute_host", "file": "guard_pkg/host.py", "start": 6, "end": 7, "kind": "function"}
+    u_caller = {"name": "compute_caller", "file": "guard_pkg/caller.py", "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u_host, u_caller)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="host_module",
+    )
+
+    assert "Circular import or unresolvable module path" not in patch
+    assert "from guard_pkg.host import _shared_compute_host_compute_caller" in patch
+
+
 def test_shared_module_translates_local_relative_imports(tmp_path: Path) -> None:
     """Verifies that relative function-local imports in clones are translated to canonical absolute paths."""
     pkg = tmp_path / "local_rel_pkg"
@@ -3523,6 +3557,54 @@ def test_generate_refactoring_patch_when_target_is_package_directory(tmp_path: P
     assert "_shared_calc_one_calc_two" in (sub_pkg / "_common.py").read_text(encoding="utf-8")
 
 
+def test_generate_refactoring_patch_with_package_root_depgraph_preserves_cycle_detection(
+    tmp_path: Path,
+) -> None:
+    """Verifies externally built depgraphs from package roots use the same module namespace."""
+    from pydoppelgangerhunt.fixer.depgraph import build_module_graph  # pylint: disable=import-outside-toplevel
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    top_pkg = project_root / "my_package"
+    top_pkg.mkdir()
+    (top_pkg / "__init__.py").write_text("", encoding="utf-8")
+    (top_pkg / "caller.py").write_text(
+        "def compute_c(x: int) -> int:\n"
+        "    return x + 10\n",
+        encoding="utf-8",
+    )
+    (top_pkg / "mid.py").write_text(
+        "import my_package.caller\n\n"
+        "def compute_m(x: int) -> int:\n"
+        "    return my_package.caller.compute_c(x)\n",
+        encoding="utf-8",
+    )
+    (top_pkg / "host.py").write_text(
+        "import my_package.mid\n\n"
+        "def compute_h(x: int) -> int:\n"
+        "    return x + 10\n",
+        encoding="utf-8",
+    )
+
+    depgraph = build_module_graph(top_pkg)
+    u_host = {"name": "compute_h", "file": "host.py", "start": 3, "end": 4, "kind": "function"}
+    u_caller = {"name": "compute_c", "file": "caller.py", "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u_host, u_caller)],
+        repo_root=str(top_pkg),
+        replace_clones=True,
+        cross_file_strategy="host_module",
+        depgraph=depgraph,
+    )
+
+    assert (
+        "Circular import or unresolvable module path "
+        "(cycle: my_package.caller -> my_package.host -> my_package.mid -> my_package.caller)"
+    ) in patch
+    assert "from my_package.host import _shared_compute_h_compute_c" not in patch
+
+
 def test_collect_host_missing_imports_handles_shadowed_builtins(tmp_path: Path) -> None:
     """Verifies that shadowed builtins are hoisted when consistent or rejected when conflicting."""
     pkg = tmp_path / "shadow_pkg"
@@ -3805,5 +3887,4 @@ def test_host_local_definition_omits_self_import_when_caller_imports_from_host(
     assert "def _shared_process_item1_process_item2(item: LocalDep) -> int:" in patch
     # Caller module must import the extracted helper from host
     assert "from self_import_pkg.host_mod import _shared_process_item1_process_item2" in patch
-
 

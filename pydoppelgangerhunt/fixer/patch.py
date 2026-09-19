@@ -470,27 +470,23 @@ def _build_unit_delegation_call(
 
 
 
-def _module_imports_target(source_text: str, target_module: str) -> bool:
-    """Checks whether a module's source imports a specific target module."""
+def _module_imports_target(
+    source_text: str,
+    target_module: str,
+    current_mod: str = "",
+    is_package: bool = False,
+) -> bool:
+    """Checks whether a module's source unconditionally imports a specific target module."""
     if not target_module:
         return False
-    try:
-        tree = ast.parse(source_text)
-    except SyntaxError:
-        return target_module in source_text
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name == target_module or alias.name.startswith(f"{target_module}."):
-                    return True
-        elif isinstance(node, ast.ImportFrom):
-            mod = getattr(node, "module", None) or ""
-            if mod == target_module or mod.startswith(f"{target_module}."):
-                return True
-            for alias in node.names:
-                full = f"{mod}.{alias.name}" if mod else alias.name
-                if full == target_module or full.startswith(f"{target_module}."):
-                    return True
+    raw_imports = _parse_source_imports(
+        source_text, current_mod, is_package=is_package
+    )
+    for imported_mod in raw_imports:
+        if imported_mod == target_module or imported_mod.startswith(
+            f"{target_module}."
+        ):
+            return True
     return False
 
 
@@ -2268,7 +2264,12 @@ def generate_refactoring_patch(
                     if (mod1 and mod2)
                     else None
                 )
-                direct_import = bool(mod2 and _module_imports_target(orig_text, mod2))
+                direct_import = bool(
+                    mod2
+                    and _module_imports_target(
+                        orig_text, mod2, current_mod=mod1, is_package=is_pkg1
+                    )
+                )
                 is_circular = bool(cycle or direct_import)
 
                 if is_circular or not mod1 or not mod2:

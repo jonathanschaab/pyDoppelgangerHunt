@@ -296,14 +296,14 @@ def _resolve_relative_import_path(
 def _parse_source_imports(
     source_text: str, current_mod: str, is_package: bool = False
 ) -> Set[str]:
-    """Extracts imported module dot-paths from Python source text via AST traversal."""
+    """Extracts unconditionally executed top-level imported module dot-paths."""
     imports: Set[str] = set()
     try:
         tree = ast.parse(source_text)
     except (SyntaxError, UnicodeDecodeError):
         return imports
 
-    for node in ast.walk(tree):
+    for node in tree.body:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 imports.add(alias.name)
@@ -496,7 +496,8 @@ class ModuleDependencyGraph:
     ) -> ModuleDependencyGraph:
         """Builds a populated dependency graph across the repository's Python source files."""
         root = Path(repo_root).resolve()
-        graph = cls(root)
+        effective_root = _find_enclosing_package_root(root)
+        graph = cls(effective_root)
 
         if file_paths is not None:
             python_files = [
@@ -514,7 +515,7 @@ class ModuleDependencyGraph:
 
         # First pass: map all modules
         for p_file in python_files:
-            mod_name = derive_module_import_path(p_file, root)
+            mod_name = derive_module_import_path(p_file, effective_root)
             if mod_name:
                 graph.add_module(mod_name, p_file)
 
@@ -522,7 +523,7 @@ class ModuleDependencyGraph:
 
         # Second pass: parse imports and wire edges
         for p_file in python_files:
-            mod_name = derive_module_import_path(p_file, root)
+            mod_name = derive_module_import_path(p_file, effective_root)
             if not mod_name:
                 continue
             try:
