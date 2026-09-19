@@ -287,16 +287,26 @@ def resolve_shared_module_file(
         raise ValueError(
             f"Shared module target path is an existing symlink: {target}"
         )
-    try:
-        target.resolve().relative_to(resolved_common)
-        return target
-    except ValueError:
-        pass
+    if target.is_dir():
+        if clean_name == "_common.py":
+            raise ValueError(
+                f"shared module path {clean_name} is an existing directory"
+            )
+    else:
+        try:
+            target.resolve().relative_to(resolved_common)
+            return target
+        except ValueError:
+            pass
 
     fallback = common_dir / "_common.py"
     if fallback.is_symlink():
         raise ValueError(
             f"Shared module fallback path is an existing symlink: {fallback}"
+        )
+    if fallback.is_dir():
+        raise ValueError(
+            "shared module path _common.py is an existing directory"
         )
     try:
         fallback.resolve().relative_to(resolved_common)
@@ -494,8 +504,6 @@ def _collect_top_level_import_nodes(
         elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
             result.extend(_collect_top_level_import_nodes(stmt.body))
             result.extend(_collect_top_level_import_nodes(stmt.orelse))
-        elif isinstance(stmt, ast.ClassDef):
-            result.extend(_collect_top_level_import_nodes(stmt.body))
         elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):
             for case in getattr(stmt, "cases", []):
                 result.extend(_collect_top_level_import_nodes(case.body))

@@ -1122,3 +1122,31 @@ def test_build_from_repository_rejects_symlinked_files_mocked(
     g_exp = build_module_graph(repo, file_paths=[internal, fake_symlink])
     assert "worker" in g_exp.mod_to_file
     assert "fake_symlink" not in g_exp.mod_to_file
+
+
+def test_resolve_shared_module_file_directory_collision(tmp_path: Path) -> None:
+    """Verifies handling when shared module targets or fallbacks collide with directories."""
+    root = tmp_path / "dir_repo"
+    pkg = root / "pkg"
+    pkg.mkdir(parents=True)
+    f1 = pkg / "f1.py"
+    f2 = pkg / "f2.py"
+    f1.write_text("x = 1\n", encoding="utf-8")
+    f2.write_text("x = 2\n", encoding="utf-8")
+
+    # 1. Target directory custom.py exists, fallback _common.py does not -> falls back to _common.py
+    custom_dir = pkg / "custom.py"
+    custom_dir.mkdir()
+    res = resolve_shared_module_file(f1, f2, root, shared_module_name="custom.py")
+    assert res == pkg / "_common.py"
+
+    # 2. Both target custom.py and fallback _common.py exist as directories -> raises ValueError
+    common_dir = pkg / "_common.py"
+    common_dir.mkdir()
+    with pytest.raises(ValueError, match="existing directory"):
+        resolve_shared_module_file(f1, f2, root, shared_module_name="custom.py")
+
+    # 3. Target _common.py requested directly when it is a directory -> raises ValueError
+    with pytest.raises(ValueError, match="existing directory"):
+        resolve_shared_module_file(f1, f2, root, shared_module_name="_common.py")
+

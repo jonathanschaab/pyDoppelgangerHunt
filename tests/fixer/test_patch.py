@@ -4430,3 +4430,34 @@ def test_shared_module_rejects_subsequent_pair_creating_cycle_with_earlier_calle
 
     # Pair 2 was rejected due to circular dependency
     assert "rejected due to circular dependency" in patch
+
+
+def test_cross_module_shared_module_directory_collision_rejected(tmp_path: Path) -> None:
+    """Verifies that if the shared module path is an existing directory, extraction is safely skipped."""
+    pkg = tmp_path / "pkg_dir_collision"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = "def fn1(x: int) -> int:\n    return x + 10\n"
+    src2 = "def fn2(x: int) -> int:\n    return x + 10\n"
+    f1 = pkg / "m1.py"
+    f2 = pkg / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    # Create directory at _common.py
+    (pkg / "_common.py").mkdir()
+
+    u1 = {"name": "fn1", "file": str(f1), "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "fn2", "file": str(f2), "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        cross_file_strategy="shared_module",
+        replace_clones=True,
+    )
+
+    assert "existing directory" in patch
+    assert "skipping extraction" in patch
+

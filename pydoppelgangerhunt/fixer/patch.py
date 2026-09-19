@@ -1693,6 +1693,10 @@ def _safely_resolve_shared_module_file(
             raise ValueError(
                 f"shared module path {resolved.name} is an existing symlink"
             )
+        if resolved.is_dir():
+            raise ValueError(
+                f"shared module path {resolved.name} is an existing directory"
+            )
         return resolved
     except ValueError as exc:
         err_msg = f"# Note: Cross-module clone pair; {exc}; skipping extraction.\n"
