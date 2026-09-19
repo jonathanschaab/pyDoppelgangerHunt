@@ -1707,9 +1707,11 @@ def _register_plan_dependencies_in_graph(
     import_stmts: Sequence[str],
 ) -> None:
     """Registers a module and its synthesized import statements into the dependency graph."""
-    if not mod_name or not import_stmts:
+    if not mod_name:
         return
     dg.add_module(mod_name, file_path)
+    if not import_stmts:
+        return
     known_modules = set(dg.mod_to_file.keys())
     raw_imports = _parse_source_imports(
         "\n".join(import_stmts),
@@ -2246,17 +2248,33 @@ def generate_refactoring_patch(
                     continue
                 host_imports = maybe_imports
 
+                host_disp = normalize_path_string(str(host_plan.rel_path), strip_anchor=False)
+                dg = _get_depgraph()
+                if mod_host and host_imports:
+                    host_cycle = dg.check_cycle_if_imports_added(
+                        mod_host,
+                        host_imports,
+                        file_path=host_plan.path,
+                        is_package=is_host_pkg,
+                    )
+                    if host_cycle:
+                        cycle_desc = f"Circular import detected (cycle: {' -> '.join(host_cycle)})"
+                        cycle_msg = (
+                            f"# Note: Cross-module clone pair; helper extraction to {host_disp} "
+                            f"rejected due to circular dependency ({cycle_desc}).\n"
+                        )
+                        f1_plan.comments.append(cycle_msg)
+                        f2_plan.comments.append(cycle_msg)
+                        continue
+
                 host_plan.module_helpers.append(helper_code)
                 host_plan.missing_imports.extend(host_imports)
                 host_plan.used_helper_names.add(helper_name)
                 host_plan.comments.append(pair_comment)
 
-                host_disp = normalize_path_string(str(host_plan.rel_path), strip_anchor=False)
-
-                dg = _get_depgraph()
-                if mod_host and host_plan.missing_imports:
+                if mod_host:
                     _register_plan_dependencies_in_graph(
-                        dg, mod_host, host_plan.path, host_plan.missing_imports
+                        dg, mod_host, host_plan.path, host_imports
                     )
 
                 if replace_clones:
@@ -2353,8 +2371,29 @@ def generate_refactoring_patch(
                 host_imports = maybe_imports
 
                 if mod1 and host_imports:
+                    host_cycle = dg.check_cycle_if_imports_added(
+                        mod1,
+                        host_imports,
+                        file_path=f1_plan.path,
+                        is_package=is_pkg1,
+                    )
+                    if host_cycle:
+                        cycle_desc = f" (cycle: {' -> '.join(host_cycle)})"
+                        f1_plan.comments.append(
+                            f"# Note: Cross-module clone pair; helper extraction to {f1_disp} "
+                            f"rejected due to circular dependency{cycle_desc}; import manually into {f2_disp}.\n"
+                        )
+                        f2_plan.comments.append(
+                            f"# Note: Cross-module clone pair; helper extraction to {f1_disp} "
+                            f"rejected due to circular dependency{cycle_desc}; import manually into {f2_disp}.\n"
+                        )
+                        continue
                     _register_plan_dependencies_in_graph(
                         dg, mod1, f1_plan.path, host_imports
+                    )
+                elif mod1:
+                    _register_plan_dependencies_in_graph(
+                        dg, mod1, f1_plan.path, []
                     )
 
                 cycle = (

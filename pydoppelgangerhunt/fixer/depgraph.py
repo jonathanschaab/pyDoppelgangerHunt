@@ -293,17 +293,75 @@ def _resolve_relative_import_path(
     return base_str or module_name or ""
 
 
+def _is_type_checking_guard(test_node: ast.expr) -> bool:
+    """Detects whether an AST expression represents a static type-checking guard."""
+    if isinstance(test_node, ast.Name) and test_node.id == "TYPE_CHECKING":
+        return True
+    if (
+        isinstance(test_node, ast.Attribute)
+        and test_node.attr == "TYPE_CHECKING"
+        and isinstance(test_node.value, ast.Name)
+        and test_node.value.id in ("typing", "typing_extensions")
+    ):
+        return True
+    if isinstance(test_node, ast.Constant) and test_node.value in (False, 0):
+        return True
+    return False
+
+
+def _is_inverted_type_checking_guard(test_node: ast.expr) -> bool:
+    """Detects whether an AST expression inverts a static type-checking guard."""
+    return (
+        isinstance(test_node, ast.UnaryOp)
+        and isinstance(test_node.op, ast.Not)
+        and _is_type_checking_guard(test_node.operand)
+    )
+
+
+def _collect_top_level_import_nodes(
+    stmts: Sequence[ast.stmt],
+) -> List[Union[ast.Import, ast.ImportFrom]]:
+    """Recursively collects module-level runtime import nodes, skipping type-checking and functions."""
+    result: List[Union[ast.Import, ast.ImportFrom]] = []
+    for stmt in stmts:
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            result.append(stmt)
+        elif isinstance(stmt, ast.If):
+            if _is_type_checking_guard(stmt.test):
+                result.extend(_collect_top_level_import_nodes(stmt.orelse))
+            elif _is_inverted_type_checking_guard(stmt.test):
+                result.extend(_collect_top_level_import_nodes(stmt.body))
+            else:
+                result.extend(_collect_top_level_import_nodes(stmt.body))
+                result.extend(_collect_top_level_import_nodes(stmt.orelse))
+        elif isinstance(stmt, ast.Try):
+            result.extend(_collect_top_level_import_nodes(stmt.body))
+            for handler in stmt.handlers:
+                result.extend(_collect_top_level_import_nodes(handler.body))
+            result.extend(_collect_top_level_import_nodes(stmt.orelse))
+            result.extend(_collect_top_level_import_nodes(stmt.finalbody))
+        elif hasattr(ast, "TryStar") and isinstance(stmt, getattr(ast, "TryStar")):
+            result.extend(_collect_top_level_import_nodes(stmt.body))
+            for handler in stmt.handlers:
+                result.extend(_collect_top_level_import_nodes(handler.body))
+            result.extend(_collect_top_level_import_nodes(stmt.orelse))
+            result.extend(_collect_top_level_import_nodes(stmt.finalbody))
+        elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+            result.extend(_collect_top_level_import_nodes(stmt.body))
+    return result
+
+
 def _parse_source_imports(
     source_text: str, current_mod: str, is_package: bool = False
 ) -> Set[str]:
-    """Extracts unconditionally executed top-level imported module dot-paths."""
+    """Extracts module-level imported module dot-paths executed at runtime."""
     imports: Set[str] = set()
     try:
         tree = ast.parse(source_text)
     except (SyntaxError, UnicodeDecodeError):
         return imports
 
-    for node in tree.body:
+    for node in _collect_top_level_import_nodes(tree.body):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 imports.add(alias.name)
@@ -329,14 +387,28 @@ def _parse_source_imports(
 class ModuleDependencyGraph:
     """Project-wide module import dependency graph for reachability and cycle detection."""
 
-    def __init__(self, repo_root: Union[Path, str]) -> None:
-        """Initializes an empty module dependency graph scoped to a repository root."""
+    def __init__(
+        self,
+        repo_root: Union[Path, str],
+        *,
+        adjacency: Optional[Dict[str, Set[str]]] = None,
+        mod_to_file: Optional[Dict[str, Path]] = None,
+        file_to_mod: Optional[Dict[str, str]] = None,
+        pending_descendants: Optional[Dict[str, Set[str]]] = None,
+    ) -> None:
+        """Initializes a module dependency graph scoped to a repository root."""
         self.repo_root = Path(repo_root).resolve()
-        self.adjacency: Dict[str, Set[str]] = {}
-        self.mod_to_file: Dict[str, Path] = {}
-        self.file_to_mod: Dict[str, str] = {}
+        self.adjacency: Dict[str, Set[str]] = (
+            {k: v.copy() for k, v in adjacency.items()} if adjacency else {}
+        )
+        self.mod_to_file: Dict[str, Path] = mod_to_file.copy() if mod_to_file else {}
+        self.file_to_mod: Dict[str, str] = file_to_mod.copy() if file_to_mod else {}
         self._sorted_adjacency: Dict[str, List[str]] = {}
-        self._pending_descendants: Dict[str, Set[str]] = {}
+        self._pending_descendants: Dict[str, Set[str]] = (
+            {k: v.copy() for k, v in pending_descendants.items()}
+            if pending_descendants
+            else {}
+        )
 
     def add_module(self, mod_name: str, file_path: Path) -> None:
         """Registers a module and its backing file path in the graph."""
@@ -380,6 +452,35 @@ class ModuleDependencyGraph:
             self._sorted_adjacency[mod_name] = cached
         return cached
 
+    def copy(self) -> "ModuleDependencyGraph":
+        """Returns an isolated shallow copy of the dependency graph with copied adjacency collections."""
+        return ModuleDependencyGraph(
+            self.repo_root,
+            adjacency=self.adjacency,
+            mod_to_file=self.mod_to_file,
+            file_to_mod=self.file_to_mod,
+            pending_descendants=self._pending_descendants,
+        )
+
+    def resolve_import_target(
+        self,
+        raw_import: str,
+        known_modules: Optional[Set[str]] = None,
+    ) -> Optional[str]:
+        """Resolves a raw import string to the matching known internal module or package name."""
+        if not raw_import:
+            return None
+        if known_modules is None:
+            known_modules = set(self.mod_to_file.keys())
+        if raw_import in known_modules:
+            return raw_import
+        parts = raw_import.split(".")
+        for i in range(len(parts), 0, -1):
+            prefix = ".".join(parts[:i])
+            if prefix in known_modules:
+                return prefix
+        return None
+
     def add_import_dependency(
         self,
         from_mod: str,
@@ -389,17 +490,9 @@ class ModuleDependencyGraph:
         """Adds a dependency edge from from_mod to raw_import, matching package prefixes."""
         if not from_mod or not raw_import:
             return
-        if known_modules is None:
-            known_modules = set(self.mod_to_file.keys())
-        if raw_import in known_modules:
-            self.add_dependency(from_mod, raw_import)
-            return
-        parts = raw_import.split(".")
-        for i in range(len(parts), 0, -1):
-            prefix = ".".join(parts[:i])
-            if prefix in known_modules:
-                self.add_dependency(from_mod, prefix)
-                break
+        target = self.resolve_import_target(raw_import, known_modules=known_modules)
+        if target:
+            self.add_dependency(from_mod, target)
 
     def get_dependencies(self, mod_name: str) -> Set[str]:
         """Returns direct dependency module names for a given module."""
@@ -486,6 +579,38 @@ class ModuleDependencyGraph:
             prefix_path = self.find_cycle_path(from_mod=prefix, to_mod=from_mod)
             if prefix_path is not None:
                 return [from_mod, to_mod] + prefix_path
+        return None
+
+    def check_cycle_if_imports_added(
+        self,
+        from_mod: str,
+        import_stmts: Sequence[str],
+        file_path: Optional[Path] = None,
+        is_package: bool = False,
+    ) -> Optional[List[str]]:
+        """Checks whether introducing a set of imports to from_mod would create any cycle in the graph."""
+        if not from_mod or not import_stmts:
+            return None
+
+        tentative = self.copy()
+        if file_path is not None:
+            tentative.add_module(from_mod, file_path)
+        elif from_mod not in tentative.adjacency:
+            tentative.adjacency[from_mod] = set()
+
+        raw_imports = _parse_source_imports(
+            "\n".join(import_stmts), from_mod, is_package=is_package
+        )
+        known = set(tentative.mod_to_file.keys())
+
+        for raw_imp in sorted(raw_imports):
+            target = tentative.resolve_import_target(raw_imp, known_modules=known)
+            if not target or target == from_mod:
+                continue
+            cycle = tentative.check_cycle_if_added(from_mod, target)
+            if cycle is not None:
+                return cycle
+            tentative.add_dependency(from_mod, target)
         return None
 
     @classmethod

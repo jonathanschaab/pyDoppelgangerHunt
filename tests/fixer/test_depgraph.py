@@ -700,3 +700,98 @@ def test_derive_shared_module_import_relative_and_fallback(tmp_path: Path, monke
     monkeypatch.setattr(os.path, "relpath", mock_relpath)
     imp_fallback = derive_shared_module_import(f1, shared_same, root, prefer_relative=True)
     assert imp_fallback == "mypkg.sub1._common"
+
+
+def test_depgraph_detects_cycle_from_try_guarded_import(tmp_path: Path) -> None:
+    """Verifies that imports inside top-level try blocks are captured and detect cycles."""
+    root = tmp_path / "repo"
+    pkg = root / "pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "host.py").write_text(
+        "try:\n"
+        "    import pkg.caller\n"
+        "except ImportError:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    (pkg / "caller.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    graph = build_module_graph(root)
+
+    assert "pkg.caller" in graph.get_dependencies("pkg.host")
+    cycle = graph.check_cycle_if_added("pkg.caller", "pkg.host")
+    assert cycle == ["pkg.caller", "pkg.host", "pkg.caller"]
+
+
+def test_depgraph_conditional_and_type_checking_matrix() -> None:
+    """Verifies that _parse_source_imports correctly handles TYPE_CHECKING and runtime conditionals."""
+    from pydoppelgangerhunt.fixer.depgraph import (  # pylint: disable=import-outside-toplevel
+        _parse_source_imports,
+    )
+
+    # 1. TYPE_CHECKING body skipped, orelse included
+    src_tc = (
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    import type_only\n"
+        "else:\n"
+        "    import runtime_fallback\n"
+    )
+    imports_tc = _parse_source_imports(src_tc, "pkg.mod")
+    assert "type_only" not in imports_tc
+    assert "runtime_fallback" in imports_tc
+
+    # 2. not TYPE_CHECKING body included, orelse skipped
+    src_not_tc = (
+        "import typing\n"
+        "if not typing.TYPE_CHECKING:\n"
+        "    import runtime_active\n"
+        "else:\n"
+        "    import type_ignored\n"
+    )
+    imports_not_tc = _parse_source_imports(src_not_tc, "pkg.mod")
+    assert "runtime_active" in imports_not_tc
+    assert "type_ignored" not in imports_not_tc
+
+    # 3. Runtime conditional: both branches conservatively included
+    src_cond = (
+        "import sys\n"
+        "if sys.platform == 'win32':\n"
+        "    import win32_backend\n"
+        "else:\n"
+        "    import unix_backend\n"
+    )
+    imports_cond = _parse_source_imports(src_cond, "pkg.mod")
+    assert "win32_backend" in imports_cond
+    assert "unix_backend" in imports_cond
+
+    # 4. Context manager with block
+    src_with = (
+        "import contextlib\n"
+        "with contextlib.suppress(ImportError):\n"
+        "    import optional_dep\n"
+    )
+    imports_with = _parse_source_imports(src_with, "pkg.mod")
+    assert "optional_dep" in imports_with
+
+
+def test_check_cycle_if_imports_added_transactional_isolation(tmp_path: Path) -> None:
+    """Verifies that check_cycle_if_imports_added does not mutate the graph."""
+    root = tmp_path / "repo"
+    pkg = root / "pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "a.py").write_text("import pkg.b\n", encoding="utf-8")
+    (pkg / "b.py").write_text("x = 1\n", encoding="utf-8")
+
+    graph = build_module_graph(root)
+    assert graph.get_dependencies("pkg.b") == {"pkg"}
+
+    # Propose adding import of pkg.a to pkg.b (would create cycle: b -> a -> b)
+    cycle = graph.check_cycle_if_imports_added("pkg.b", ["import pkg.a"])
+    assert cycle == ["pkg.b", "pkg.a", "pkg.b"]
+
+    # Verify graph is NOT mutated by the check
+    assert graph.get_dependencies("pkg.b") == {"pkg"}
+    assert graph.check_cycle_if_added("pkg.b", "pkg.a") == ["pkg.b", "pkg.a", "pkg.b"]

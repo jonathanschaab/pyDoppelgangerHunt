@@ -4054,3 +4054,83 @@ def match_helper(external_val: Any) -> Any:
     assert "head" not in free
     assert "tail" not in free
     assert "match_helper" in defined
+
+
+def test_shared_module_rejects_subsequent_pair_creating_cycle_with_earlier_caller(
+    tmp_path: Path,
+) -> None:
+    """Verifies that a subsequent clone pair cannot inject dependencies into a shared module
+
+    that create a circular dependency with an earlier pair's caller.
+    """
+    root = tmp_path / "repo"
+    pkg = root / "pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    # caller_a defines CustomType and has clone 1
+    src_a = (
+        "class CustomType:\n"
+        "    pass\n\n"
+        "def clone_one_a(x: int) -> int:\n"
+        "    a = x + 1\n"
+        "    b = a + 2\n"
+        "    return b\n"
+    )
+    # caller_b has clone 1
+    src_b = (
+        "def clone_one_b(x: int) -> int:\n"
+        "    a = x + 1\n"
+        "    b = a + 2\n"
+        "    return b\n"
+    )
+    # caller_c imports CustomType from caller_a and has clone 2
+    src_c = (
+        "from pkg.caller_a import CustomType\n\n"
+        "def clone_two_c(item: CustomType) -> int:\n"
+        "    a = 10\n"
+        "    b = a + 20\n"
+        "    return b\n"
+    )
+    # caller_d imports CustomType from caller_a and has clone 2
+    src_d = (
+        "from pkg.caller_a import CustomType\n\n"
+        "def clone_two_d(item: CustomType) -> int:\n"
+        "    a = 10\n"
+        "    b = a + 20\n"
+        "    return b\n"
+    )
+
+    fa = pkg / "caller_a.py"
+    fb = pkg / "caller_b.py"
+    fc = pkg / "caller_c.py"
+    fd = pkg / "caller_d.py"
+    fa.write_text(src_a, encoding="utf-8")
+    fb.write_text(src_b, encoding="utf-8")
+    fc.write_text(src_c, encoding="utf-8")
+    fd.write_text(src_d, encoding="utf-8")
+
+    u1a = {"name": "clone_one_a", "file": str(fa), "start": 4, "end": 7, "kind": "function"}
+    u1b = {"name": "clone_one_b", "file": str(fb), "start": 1, "end": 4, "kind": "function"}
+    u2c = {"name": "clone_two_c", "file": str(fc), "start": 3, "end": 6, "kind": "function"}
+    u2d = {"name": "clone_two_d", "file": str(fd), "start": 3, "end": 6, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1a, u1b), (1.0, u2c, u2d)],
+        repo_root=str(root),
+        cross_file_strategy="shared_module",
+        replace_clones=True,
+    )
+
+    assert patch is not None
+    # Pair 1 succeeded in creating _common.py
+    assert "pkg/_common.py" in patch
+    # Pair 1 callers were patched
+    assert "pkg/caller_a.py" in patch
+    assert "pkg/caller_b.py" in patch
+
+    # _common.py must NOT import caller_a (which would cause a cycle)
+    assert "+from pkg.caller_a import" not in patch
+
+    # Pair 2 was rejected due to circular dependency
+    assert "rejected due to circular dependency" in patch
