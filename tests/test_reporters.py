@@ -630,3 +630,49 @@ def test_batch_66_artifact_dirs_clustering_helper_and_defensive_scoring(tmp_path
     assert "`target`pkg`" not in md_summary
     assert "pkg\\|sub'dir" in md_summary
     assert "Repository DRY Score" in md_summary
+
+
+def test_extract_unit_source_code_symlink_parents_and_root_containment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that symlinked parent components and out-of-root files are rejected."""
+    # 1. Symlinked parent directory when repo_root is provided
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sub_dir = repo / "sym_parent"
+    sub_dir.mkdir()
+    target_file = sub_dir / "target.py"
+    target_file.write_text("def foo():\n    pass\n", encoding="utf-8")
+
+    orig_is_symlink = Path.is_symlink
+
+    def mock_symlink(self: Path) -> bool:
+        if self == sub_dir or self.resolve() == sub_dir.resolve():
+            return True
+        return orig_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", mock_symlink)
+    u_sym_parent = {"file": "sym_parent/target.py", "start": 1, "end": 2, "name": "foo"}
+    res_sym = extract_unit_source_code(u_sym_parent, repo_root=str(repo))
+    assert res_sym == ["# Source for foo lines 1-2\n"]
+
+    # 2. Symlinked parent directory when repo_root is omitted (None)
+    monkeypatch.setattr(Path, "is_symlink", orig_is_symlink)
+    cwd_sym = Path.cwd().resolve() / "mock_link_dir"
+
+    def mock_cwd_sym(self: Path) -> bool:
+        if self == cwd_sym or self.resolve() == cwd_sym.resolve():
+            return True
+        return orig_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", mock_cwd_sym)
+    u_cwd_sym = {"file": "mock_link_dir/secret.py", "start": 1, "end": 1, "name": "secret"}
+    res_cwd_sym = extract_unit_source_code(u_cwd_sym, repo_root=None)
+    assert res_cwd_sym == ["# Source for secret lines 1-1\n"]
+
+    # 3. Clean execution without symlinks works normally
+    monkeypatch.setattr(Path, "is_symlink", orig_is_symlink)
+    u_clean = {"file": "sym_parent/target.py", "start": 1, "end": 2, "name": "foo"}
+    res_clean = extract_unit_source_code(u_clean, repo_root=str(repo))
+    assert res_clean == ["def foo():\n", "    pass\n"]
+

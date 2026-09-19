@@ -74,39 +74,50 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
         effective_root = Path(repo_root).resolve()
         if effective_root.is_file():
             effective_root = effective_root.parent
+        target_root = effective_root
         if not file_path.is_absolute():
             file_path = effective_root / file_path
-        allowed_roots = [effective_root]
     else:
+        cwd_root = Path.cwd().resolve()
         if not file_path.is_absolute():
-            file_path = Path.cwd().resolve() / file_path
-        allowed_roots = [Path.cwd().resolve(), Path(tempfile.gettempdir()).resolve()]
+            target_root = cwd_root
+            file_path = cwd_root / file_path
+        else:
+            temp_root = Path(tempfile.gettempdir()).resolve()
+            try:
+                file_path.resolve().relative_to(cwd_root)
+                target_root = cwd_root
+            except ValueError:
+                try:
+                    file_path.resolve().relative_to(temp_root)
+                    target_root = temp_root
+                except ValueError:
+                    return placeholder
 
     try:
         if not file_path.is_file() or file_path.is_symlink():
             return placeholder
-        resolved_file = file_path.resolve()
-        if resolved_file.is_symlink():
-            return placeholder
-        within_allowed = False
-        for root_dir in allowed_roots:
+        for parent in file_path.parents:
             try:
-                resolved_file.relative_to(root_dir)
-                within_allowed = True
-                break
-            except ValueError:
-                pass
-        if not within_allowed:
+                if parent == target_root or parent.resolve() == target_root:
+                    break
+            except (OSError, RuntimeError, ValueError):
+                return placeholder
+            if parent.is_symlink():
+                return placeholder
+        resolved_file = file_path.resolve()
+        if resolved_file.is_symlink() or not resolved_file.is_file():
             return placeholder
+        resolved_file.relative_to(target_root)
     except (OSError, RuntimeError, ValueError):
         return placeholder
 
     try:
-        if file_path.suffix == ".ipynb" and "#cell_" in raw_file:
+        if resolved_file.suffix == ".ipynb" and "#cell_" in raw_file:
             try:
                 cell_idx_str = raw_file.split("#cell_", 1)[-1]
                 cell_idx = int(cell_idx_str) - 1
-                nb_data = json.loads(file_path.read_text(encoding="utf-8", errors="replace"))
+                nb_data = json.loads(resolved_file.read_text(encoding="utf-8", errors="replace"))
                 cells = nb_data.get("cells", [])
                 if 0 <= cell_idx < len(cells):
                     cell = cells[cell_idx]
@@ -118,7 +129,7 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
             except (json.JSONDecodeError, ValueError):
                 all_lines = []
         else:
-            with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
+            with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
                 all_lines = fh.readlines()
         start = max(1, s_d)
         end = min(len(all_lines), int(unit.get("end") or len(all_lines)))
