@@ -57,6 +57,31 @@ from pydoppelgangerhunt.fixer.synthesis import (
 
 logger = logging.getLogger(__name__)
 _BUILTIN_NAMES: Set[str] = set(dir(builtins))
+_PROJECT_ROOT_MARKERS: Set[str] = {
+    ".git",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "tox.ini",
+}
+
+
+def _find_patch_repo_root(root: Path, import_repo_root: Path) -> Path:
+    """Finds the filesystem root to use for patch paths independently of import derivation."""
+    resolved_root = root.resolve()
+    src_root = import_repo_root if import_repo_root.name == "src" else None
+    if resolved_root.name == "src":
+        src_root = resolved_root
+    if src_root is not None:
+        candidate = src_root.parent
+        has_marker = any(
+            (candidate / marker).exists() for marker in _PROJECT_ROOT_MARKERS
+        )
+        if candidate != src_root and has_marker:
+            return candidate
+    if (resolved_root / "__init__.py").is_file():
+        return import_repo_root
+    return resolved_root
 
 
 def check_units_overlap(
@@ -1739,11 +1764,13 @@ def generate_refactoring_patch(
     root = Path(repo_root or os.getcwd()).resolve()
     if root.is_file():
         root = root.parent
+    patch_repo_root = root
     effective_repo_root = (
         _find_enclosing_package_root(root)
         if (root / "__init__.py").is_file()
         else root
     )
+    patch_repo_root = _find_patch_repo_root(root, effective_repo_root)
     graph_holder: List[Optional[ModuleDependencyGraph]] = [depgraph]
 
     def _get_depgraph() -> ModuleDependencyGraph:
@@ -1775,7 +1802,7 @@ def generate_refactoring_patch(
             continue
 
         try:
-            rel_f1 = str(f1_path.relative_to(effective_repo_root)).replace("\\", "/")
+            rel_f1 = str(f1_path.relative_to(patch_repo_root)).replace("\\", "/")
         except ValueError:
             rel_f1 = str(f1_path.name)
 
@@ -1809,7 +1836,7 @@ def generate_refactoring_patch(
                 f2_path = _resolve_repo_relative_path(f2_raw, effective_repo_root)
             if f2_path.is_file():
                 try:
-                    rel_f2 = str(f2_path.relative_to(effective_repo_root)).replace("\\", "/")
+                    rel_f2 = str(f2_path.relative_to(patch_repo_root)).replace("\\", "/")
                 except ValueError:
                     rel_f2 = str(f2_path.name)
                 f2_plan = file_plans.get(f2_path)
@@ -2176,7 +2203,7 @@ def generate_refactoring_patch(
 
                 try:
                     rel_shared = str(
-                        shared_p.resolve().relative_to(effective_repo_root.resolve())
+                        shared_p.resolve().relative_to(patch_repo_root.resolve())
                     ).replace("\\", "/")
                 except ValueError:
                     rel_shared = str(shared_p.name)
@@ -2205,7 +2232,7 @@ def generate_refactoring_patch(
                             continue
                         if shared_p.is_file():
                             try:
-                                shared_p.resolve().relative_to(effective_repo_root.resolve())
+                                shared_p.resolve().relative_to(patch_repo_root.resolve())
                                 shared_text = shared_p.read_text(encoding="utf-8")
                                 shared_plan = _get_plan(
                                     shared_p, rel_shared, shared_text, is_new_file=False
@@ -2497,7 +2524,7 @@ def generate_refactoring_patch(
     patch_chunks: List[str] = []
     for plan in file_plans.values():
         chunk = _render_file_patch_plan(
-            plan, replace_clones=replace_clones, repo_root=str(effective_repo_root)
+            plan, replace_clones=replace_clones, repo_root=str(patch_repo_root)
         )
         if chunk:
             patch_chunks.append(chunk)

@@ -346,6 +346,8 @@ def _collect_top_level_import_nodes(
                 result.extend(_collect_top_level_import_nodes(handler.body))
             result.extend(_collect_top_level_import_nodes(stmt.orelse))
             result.extend(_collect_top_level_import_nodes(stmt.finalbody))
+        elif isinstance(stmt, ast.ClassDef):
+            result.extend(_collect_top_level_import_nodes(stmt.body))
         elif isinstance(stmt, (ast.With, ast.AsyncWith)):
             result.extend(_collect_top_level_import_nodes(stmt.body))
     return result
@@ -605,8 +607,10 @@ class ModuleDependencyGraph:
 
         for raw_imp in sorted(raw_imports):
             target = tentative.resolve_import_target(raw_imp, known_modules=known)
-            if not target or target == from_mod:
+            if not target:
                 continue
+            if target == from_mod:
+                return [from_mod, target]
             cycle = tentative.check_cycle_if_added(from_mod, target)
             if cycle is not None:
                 return cycle

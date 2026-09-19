@@ -724,6 +724,26 @@ def test_depgraph_detects_cycle_from_try_guarded_import(tmp_path: Path) -> None:
     assert cycle == ["pkg.caller", "pkg.host", "pkg.caller"]
 
 
+def test_depgraph_detects_cycle_from_class_body_import(tmp_path: Path) -> None:
+    """Verifies that imports inside top-level class bodies are captured as runtime edges."""
+    root = tmp_path / "repo"
+    pkg = root / "pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "host.py").write_text(
+        "class Registry:\n"
+        "    import pkg.caller\n",
+        encoding="utf-8",
+    )
+    (pkg / "caller.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    graph = build_module_graph(root)
+
+    assert "pkg.caller" in graph.get_dependencies("pkg.host")
+    cycle = graph.check_cycle_if_added("pkg.caller", "pkg.host")
+    assert cycle == ["pkg.caller", "pkg.host", "pkg.caller"]
+
+
 def test_depgraph_conditional_and_type_checking_matrix() -> None:
     """Verifies that _parse_source_imports correctly handles TYPE_CHECKING and runtime conditionals."""
     from pydoppelgangerhunt.fixer.depgraph import (  # pylint: disable=import-outside-toplevel
@@ -795,3 +815,22 @@ def test_check_cycle_if_imports_added_transactional_isolation(tmp_path: Path) ->
     # Verify graph is NOT mutated by the check
     assert graph.get_dependencies("pkg.b") == {"pkg"}
     assert graph.check_cycle_if_added("pkg.b", "pkg.a") == ["pkg.b", "pkg.a", "pkg.b"]
+
+
+def test_check_cycle_if_imports_added_reports_self_import_cycle(tmp_path: Path) -> None:
+    """Verifies that transactional import checks reject synthesized self-imports."""
+    root = tmp_path / "repo"
+    pkg = root / "pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    host_file = pkg / "host.py"
+    host_file.write_text("class LocalDep:\n    pass\n", encoding="utf-8")
+
+    graph = build_module_graph(root)
+
+    cycle = graph.check_cycle_if_imports_added(
+        "pkg.host",
+        ["from pkg.host import LocalDep"],
+        file_path=host_file,
+    )
+    assert cycle == ["pkg.host", "pkg.host"]
