@@ -4794,5 +4794,84 @@ def test_shared_module_strategy_skips_when_all_callers_form_cycles(
     assert "rejected due to circular dependency" in patch
 
 
+def test_generate_refactoring_patch_init_and_submodule_shared_module(
+    tmp_path: Path,
+) -> None:
+    """Verifies that clones between __init__.py and a submodule can share a module without false cycle."""
+    pkg = tmp_path / "init_sub_pkg"
+    pkg.mkdir()
+    src_init = (
+        "def common_calc(val: int) -> int:\n"
+        "    res = val * 2 + 1\n"
+        "    return res\n"
+    )
+    src_worker = (
+        "def run_worker_calc(val: int) -> int:\n"
+        "    res = val * 2 + 1\n"
+        "    return res\n"
+    )
+    (pkg / "__init__.py").write_text(src_init, encoding="utf-8")
+    (pkg / "worker.py").write_text(src_worker, encoding="utf-8")
+
+    u1 = {
+        "name": "common_calc",
+        "file": "init_sub_pkg/__init__.py",
+        "start": 1,
+        "end": 3,
+        "kind": "function",
+    }
+    u2 = {
+        "name": "run_worker_calc",
+        "file": "init_sub_pkg/worker.py",
+        "start": 1,
+        "end": 3,
+        "kind": "function",
+    }
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "diff --git a/init_sub_pkg/_common.py b/init_sub_pkg/_common.py" in patch
+    assert "--- a/init_sub_pkg/__init__.py" in patch
+    assert "--- a/init_sub_pkg/worker.py" in patch
+    assert "Circular import" not in patch
+
+
+def test_collect_host_missing_imports_substring_safety() -> None:
+    """Verifies that substring matches in comments or longer import names do not suppress required imports."""
+    host_code = (
+        "# Note: do not import os directly\n"
+        "import os_helper\n\n"
+        "def existing_fn():\n"
+        "    return os_helper.run()\n"
+    )
+    host_plan = patch_mod._FilePatchPlan(
+        Path("app/main.py"),
+        host_code,
+        "app/main.py",
+    )
+    helper_code = "def helper_fn():\n    return os.path.exists('foo')\n"
+    scope = {"module": "app.main"}
+    source_code = "import os\ndef orig_fn():\n    return os.path.exists('foo')\n"
+
+    missing = patch_mod._collect_host_missing_imports(
+        host_plan=host_plan,
+        helper_code=helper_code,
+        scope=scope,
+        source_texts=[source_code],
+    )
+    assert "import os" in missing
+
+
+def test_has_future_annotations_value_error_handling() -> None:
+    """Verifies that _has_future_annotations gracefully handles source strings triggering ValueError."""
+    assert patch_mod._has_future_annotations("def foo():\n    pass\x00") is False
+
+
+
 
 

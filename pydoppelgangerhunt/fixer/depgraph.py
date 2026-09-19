@@ -640,6 +640,7 @@ class ModuleDependencyGraph:
         mod_to_file: Optional[Dict[str, Path]] = None,
         file_to_mod: Optional[Dict[str, str]] = None,
         pending_descendants: Optional[Dict[str, Set[str]]] = None,
+        ancestor_edges: Optional[Set[Tuple[str, str]]] = None,
     ) -> None:
         """Initializes a module dependency graph scoped to a repository root."""
         self.repo_root = _resolve_root_path(repo_root)
@@ -653,6 +654,9 @@ class ModuleDependencyGraph:
             {k: v.copy() for k, v in pending_descendants.items()}
             if pending_descendants
             else {}
+        )
+        self._ancestor_edges: Set[Tuple[str, str]] = (
+            ancestor_edges.copy() if ancestor_edges else set()
         )
 
     def add_module(self, mod_name: str, file_path: Path) -> None:
@@ -674,12 +678,14 @@ class ModuleDependencyGraph:
             parent_pkg = ".".join(parts[:i])
             if parent_pkg in self.mod_to_file:
                 self.add_dependency(mod_name, parent_pkg)
+                self._ancestor_edges.add((mod_name, parent_pkg))
             else:
                 self._pending_descendants.setdefault(parent_pkg, set()).add(mod_name)
 
         if mod_name in self._pending_descendants:
             for desc_mod in self._pending_descendants.pop(mod_name):
                 self.add_dependency(desc_mod, mod_name)
+                self._ancestor_edges.add((desc_mod, mod_name))
 
     def add_dependency(self, from_mod: str, to_mod: str) -> None:
         """Adds a directed import edge from from_mod to to_mod."""
@@ -690,6 +696,7 @@ class ModuleDependencyGraph:
         if to_mod not in self.adjacency[from_mod]:
             self.adjacency[from_mod].add(to_mod)
             self._sorted_adjacency.pop(from_mod, None)
+        self._ancestor_edges.discard((from_mod, to_mod))
 
     def _get_sorted_neighbors(self, mod_name: str) -> List[str]:
         """Returns deterministic sorted neighbors of mod_name, using a cached list."""
@@ -708,6 +715,7 @@ class ModuleDependencyGraph:
             mod_to_file=self.mod_to_file,
             file_to_mod=self.file_to_mod,
             pending_descendants=self._pending_descendants,
+            ancestor_edges=self._ancestor_edges,
         )
 
     def resolve_import_target(
@@ -741,12 +749,18 @@ class ModuleDependencyGraph:
         target = self.resolve_import_target(raw_import, known_modules=known_modules)
         if target:
             self.add_dependency(from_mod, target)
+            self._ancestor_edges.discard((from_mod, target))
 
     def get_dependencies(self, mod_name: str) -> Set[str]:
         """Returns direct dependency module names for a given module."""
         return self.adjacency.get(mod_name, set()).copy()
 
-    def has_transitive_path(self, from_mod: str, to_mod: str) -> bool:
+    def has_transitive_path(
+        self,
+        from_mod: str,
+        to_mod: str,
+        ignored_edges: Optional[Set[Tuple[str, str]]] = None,
+    ) -> bool:
         """Determines reachability from from_mod to to_mod via BFS search in O(V + E) time."""
         if not from_mod or not to_mod:
             return False
@@ -758,7 +772,9 @@ class ModuleDependencyGraph:
         while queue:
             curr = queue.popleft()
             for neighbor in self._get_sorted_neighbors(curr):
-                # If neighbor is exact target or a prefix of target module
+                if ignored_edges and (curr, neighbor) in ignored_edges:
+                    continue
+                # If neighbor is the target module
                 if neighbor == to_mod:
                     return True
                 if neighbor not in visited:
@@ -766,7 +782,12 @@ class ModuleDependencyGraph:
                     queue.append(neighbor)
         return False
 
-    def find_cycle_path(self, from_mod: str, to_mod: str) -> Optional[List[str]]:
+    def find_cycle_path(
+        self,
+        from_mod: str,
+        to_mod: str,
+        ignored_edges: Optional[Set[Tuple[str, str]]] = None,
+    ) -> Optional[List[str]]:
         """Finds a directed path from from_mod to to_mod if one exists, returning module names."""
         if not from_mod or not to_mod:
             return None
@@ -784,6 +805,8 @@ class ModuleDependencyGraph:
                 found = True
                 break
             for neighbor in self._get_sorted_neighbors(curr):
+                if ignored_edges and (curr, neighbor) in ignored_edges:
+                    continue
                 if neighbor not in visited:
                     visited.add(neighbor)
                     parent[neighbor] = curr
@@ -814,7 +837,21 @@ class ModuleDependencyGraph:
         """
         if from_mod == to_mod:
             return [from_mod, to_mod]
-        existing_path = self.find_cycle_path(from_mod=to_mod, to_mod=from_mod)
+
+        ignored: Optional[Set[Tuple[str, str]]] = None
+        if to_mod.startswith(f"{from_mod}."):
+            # from_mod is an ancestor package of to_mod and is already executing.
+            # Implicit ancestor initialization edges back to from_mod (or ancestors of from_mod)
+            # do not trigger circular imports unless explicitly imported in code.
+            ignored = {
+                (u, v)
+                for (u, v) in self._ancestor_edges
+                if v == from_mod or from_mod.startswith(f"{v}.")
+            }
+
+        existing_path = self.find_cycle_path(
+            from_mod=to_mod, to_mod=from_mod, ignored_edges=ignored
+        )
         if existing_path is not None:
             return [from_mod] + existing_path
 
@@ -824,9 +861,12 @@ class ModuleDependencyGraph:
         parts = to_mod.split(".")
         for i in range(1, len(parts)):
             prefix = ".".join(parts[:i])
-            prefix_path = self.find_cycle_path(from_mod=prefix, to_mod=from_mod)
-            if prefix_path is not None:
-                return [from_mod, to_mod] + prefix_path
+            if prefix != from_mod and not from_mod.startswith(f"{prefix}."):
+                prefix_path = self.find_cycle_path(
+                    from_mod=prefix, to_mod=from_mod, ignored_edges=ignored
+                )
+                if prefix_path is not None:
+                    return [from_mod, to_mod] + prefix_path
         return None
 
     def check_cycle_if_imports_added(

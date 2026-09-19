@@ -98,7 +98,7 @@ def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
     tree: Optional[ast.AST] = None
     try:
         tree = ast.parse(text)
-    except SyntaxError:
+    except (SyntaxError, ValueError, UnicodeDecodeError):
         pass
 
     if tree is None and "->" in text:
@@ -109,13 +109,13 @@ def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
         ret_part = parts[1].strip()
         try:
             tree = ast.parse(f"def _sig_wrapper({params_part}) -> {ret_part}: pass")
-        except SyntaxError:
+        except (SyntaxError, ValueError, UnicodeDecodeError):
             pass
 
     if tree is None:
         try:
             tree = ast.parse(f"def _sig_wrapper({text}): pass")
-        except SyntaxError:
+        except (SyntaxError, ValueError, UnicodeDecodeError):
             pass
 
     if tree is None:

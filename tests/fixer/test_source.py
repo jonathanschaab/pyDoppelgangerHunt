@@ -501,3 +501,23 @@ def test_insert_imports_into_module_corrupt_source_fallback() -> None:
     assert "import math" in res_text
 
 
+def test_extract_required_typing_imports_corrupt_source_fallback() -> None:
+    """Verifies that _extract_required_typing_imports handles ValueError from null bytes gracefully."""
+    corrupt_sig = "x: List[str]\x00 -> None"
+    # Should fall back to regex token matching and find List
+    res = _extract_required_typing_imports(corrupt_sig)
+    assert "List" in res
+
+
+def test_find_enclosing_ast_node_corrupt_source_fallback() -> None:
+    """Verifies that _find_innermost_enclosing_node handles ValueError from null bytes gracefully."""
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
+        _find_innermost_enclosing_node,
+    )
+
+    u = {"file": "test.py", "start": 1, "end": 2, "name": "foo", "kind": "function"}
+    res = _find_innermost_enclosing_node("def foo():\n    pass\x00", u, (ast.FunctionDef,))
+    assert res is None
+
+
+

@@ -1208,7 +1208,7 @@ def _inspect_unit_scope(
                 if isinstance(wrapper_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     candidate_stmts = wrapper_fn.body
             break
-        except SyntaxError:
+        except (SyntaxError, ValueError, UnicodeDecodeError):
             continue
 
     if tree is None:

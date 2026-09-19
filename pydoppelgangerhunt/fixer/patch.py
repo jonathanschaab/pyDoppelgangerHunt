@@ -288,7 +288,7 @@ def _build_whole_method_delegation(
                     sig_end_line = first_body.lineno - 1
                     if _is_docstring_node(first_body):
                         docstring_end_line = getattr(first_body, "end_lineno", first_body.lineno)
-    except SyntaxError:
+    except (SyntaxError, ValueError, UnicodeDecodeError):
         pass
 
     if not header:
@@ -796,7 +796,7 @@ def _has_future_annotations(source_text: str) -> bool:
         return False
     try:
         tree = ast.parse(source_text)
-    except (SyntaxError, UnicodeDecodeError):
+    except (SyntaxError, UnicodeDecodeError, ValueError):
         return False
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "__future__":
@@ -904,7 +904,7 @@ def _canonicalize_helper_relative_imports(
         return helper_code
     try:
         tree = ast.parse(helper_code)
-    except (SyntaxError, UnicodeDecodeError):
+    except (SyntaxError, UnicodeDecodeError, ValueError):
         return helper_code
 
     import_nodes: List[ast.ImportFrom] = []
@@ -1251,7 +1251,7 @@ def _parse_local_import_statements(
             continue
         try:
             loc_tree = ast.parse(s_loc)
-        except (SyntaxError, UnicodeDecodeError):
+        except (SyntaxError, UnicodeDecodeError, ValueError):
             continue
 
         for node in loc_tree.body:
@@ -1353,7 +1353,11 @@ def _collect_host_missing_imports(
         _helper_requires_future_annotations(helper_code)
     )
 
-    if needs_future and "from __future__ import annotations" not in host_content:
+    if (
+        needs_future
+        and not _has_future_annotations(host_plan.orig_text or "")
+        and "from __future__ import annotations" not in host_plan.missing_imports
+    ):
         missing.append("from __future__ import annotations")
 
     # 1. Typing annotations
@@ -1399,7 +1403,7 @@ def _collect_host_missing_imports(
     # 3. Source dependencies referenced in helper_code
     try:
         helper_tree = ast.parse(helper_code)
-    except (SyntaxError, UnicodeDecodeError):
+    except (SyntaxError, UnicodeDecodeError, ValueError):
         helper_tree = None
 
     if helper_tree is not None and source_texts:
@@ -1621,20 +1625,20 @@ def _collect_host_missing_imports(
                         f"conflicting imported symbol '{hname}' across clone sources"
                     )
 
+        existing_and_queued = (
+            set(all_host_stmts.values()) | set(host_plan.missing_imports)
+        )
         unmatched_host = set(symbol_to_stmt.keys()) & host_imported
         for sname in unmatched_host:
-            if symbol_to_stmt.pop(sname) not in host_content:
+            cand_stmt = symbol_to_stmt.pop(sname)
+            if cand_stmt not in existing_and_queued:
                 raise ValueError(
                     f"conflicting imported symbol '{sname}' with host module"
                 )
 
         for sname, stmt in symbol_to_stmt.items():
             if sname in source_hoisted_symbols:
-                if (
-                    stmt not in missing
-                    and stmt not in host_content
-                    and stmt not in host_plan.missing_imports
-                ):
+                if stmt not in missing and stmt not in existing_and_queued:
                     missing.append(stmt)
 
     return missing

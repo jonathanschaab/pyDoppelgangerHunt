@@ -1328,3 +1328,63 @@ def test_extract_guarded_compare_target_yoda_comparison() -> None:
     assert _is_type_checking_guard(expr3) is True
 
 
+def test_ancestor_package_importing_submodule_not_flagged_as_cycle(tmp_path: Path) -> None:
+    """Verifies that an ancestor package importing its submodule is not flagged as a cycle due to implicit ancestor edge."""
+    root = tmp_path / "repo"
+    pkg = root / "mypkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "worker.py").write_text("", encoding="utf-8")
+    (pkg / "_common.py").write_text("", encoding="utf-8")
+
+    graph = build_module_graph(root)
+    # Check that mypkg importing mypkg._common or mypkg.worker is permitted
+    assert graph.check_cycle_if_added("mypkg", "mypkg._common") is None
+    assert graph.check_cycle_if_added("mypkg", "mypkg.worker") is None
+
+
+def test_ancestor_package_importing_submodule_with_explicit_import_flagged_as_cycle(tmp_path: Path) -> None:
+    """Verifies that if a submodule explicitly imports its ancestor package, adding an ancestor import creates a cycle."""
+    root = tmp_path / "repo"
+    pkg = root / "mypkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "worker.py").write_text("import mypkg\n", encoding="utf-8")
+
+    graph = build_module_graph(root)
+    # worker explicitly imports mypkg
+    cycle = graph.check_cycle_if_added("mypkg", "mypkg.worker")
+    assert cycle == ["mypkg", "mypkg.worker", "mypkg"]
+
+
+def test_ancestor_package_importing_nested_submodule_not_flagged_as_cycle(tmp_path: Path) -> None:
+    """Verifies that an ancestor package importing a nested submodule is not flagged as a cycle."""
+    root = tmp_path / "repo"
+    pkg = root / "mypkg"
+    sub = pkg / "sub"
+    sub.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (sub / "__init__.py").write_text("", encoding="utf-8")
+    (sub / "worker.py").write_text("", encoding="utf-8")
+
+    graph = build_module_graph(root)
+    assert graph.check_cycle_if_added("mypkg", "mypkg.sub.worker") is None
+
+
+def test_ancestor_package_importing_nested_submodule_with_explicit_import_flagged_as_cycle(tmp_path: Path) -> None:
+    """Verifies that if an intermediate subpackage explicitly imports the ancestor package, a cycle is detected."""
+    root = tmp_path / "repo"
+    pkg = root / "mypkg"
+    sub = pkg / "sub"
+    sub.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (sub / "__init__.py").write_text("import mypkg\n", encoding="utf-8")
+    (sub / "worker.py").write_text("", encoding="utf-8")
+
+    graph = build_module_graph(root)
+    cycle = graph.check_cycle_if_added("mypkg", "mypkg.sub.worker")
+    assert cycle == ["mypkg", "mypkg.sub.worker", "mypkg.sub", "mypkg"]
+
+
+
+

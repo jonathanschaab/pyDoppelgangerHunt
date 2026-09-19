@@ -25,7 +25,7 @@ def _find_innermost_enclosing_node(
 
     try:
         tree = ast.parse(source_text)
-    except SyntaxError:
+    except (SyntaxError, ValueError, UnicodeDecodeError):
         return None
 
     u_start = int(unit.get("start") or 0)
