@@ -1699,7 +1699,7 @@ def _safely_resolve_shared_module_file(
                 f"shared module path {resolved.name} is an existing directory"
             )
         return resolved
-    except ValueError as exc:
+    except (ValueError, OSError, RuntimeError) as exc:
         err_msg = f"# Note: Cross-module clone pair; {exc}; skipping extraction.\n"
         f1_plan.comments.append(err_msg)
         if f2_plan is not None:
@@ -1735,14 +1735,30 @@ def _format_patch_relative_path(
     fallback_root: Optional[Path] = None,
 ) -> str:
     """Formats target_path relative to primary_root, falling back to fallback_root or filename."""
-    resolved_target = target_path.resolve() if target_path.is_absolute() else target_path
+    try:
+        resolved_target = (
+            target_path.resolve() if target_path.is_absolute() else target_path
+        )
+    except (OSError, RuntimeError, ValueError):
+        resolved_target = target_path
     for candidate in (primary_root, fallback_root):
         if candidate is not None:
             try:
-                return str(resolved_target.relative_to(candidate.resolve())).replace("\\", "/")
-            except ValueError:
+                cand_res = candidate.resolve()
+                return str(resolved_target.relative_to(cand_res)).replace("\\", "/")
+            except (ValueError, OSError, RuntimeError):
                 pass
     return str(target_path.name)
+
+
+def _is_same_file_or_resolved(p1: Path, p2: Path) -> bool:
+    """Checks whether two paths refer to the same file or resolved target."""
+    if p1 == p2:
+        return True
+    try:
+        return p1.resolve() == p2.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def _resolve_safe_clone_file_path(
@@ -2066,11 +2082,15 @@ def generate_refactoring_patch(
             continue
         if cross_file_action == "auto" and not is_same_file and f2_plan is not None:
             common_dir = find_nearest_common_package(f1_path, f2_plan.path, patch_root)
-            if common_dir.resolve() in (
-                patch_root.resolve(),
-                (patch_root / "src").resolve(),
-                import_root.resolve(),
-            ):
+            try:
+                res_common = common_dir.resolve()
+                res_patch_root = patch_root.resolve()
+                res_src = (patch_root / "src").resolve()
+                res_import_root = import_root.resolve()
+                is_top_level = res_common in (res_patch_root, res_src, res_import_root)
+            except (OSError, RuntimeError, ValueError):
+                is_top_level = False
+            if is_top_level:
                 cross_file_action = "host_module"
             else:
                 cross_file_action = "shared_module"
@@ -2087,18 +2107,21 @@ def generate_refactoring_patch(
                 continue
             shared_p = maybe_shared_p
 
-            if shared_p.resolve() == f1_path.resolve():
+            if _is_same_file_or_resolved(shared_p, f1_path):
                 target_host_plan = f1_plan
-            elif shared_p.resolve() == f2_plan.path.resolve():
+            elif _is_same_file_or_resolved(shared_p, f2_plan.path):
                 target_host_plan = f2_plan
             else:
                 target_host_plan = file_plans.get(shared_p)
-                if target_host_plan is None and shared_p.is_file() and not shared_p.is_symlink():
-                    try:
-                        shared_p.resolve().relative_to(patch_root.resolve())
-                        target_host_text = shared_p.read_text(encoding="utf-8")
-                    except (OSError, UnicodeDecodeError, ValueError):
-                        pass
+                try:
+                    if target_host_plan is None and shared_p.is_file() and not shared_p.is_symlink():
+                        try:
+                            shared_p.resolve().relative_to(patch_root.resolve())
+                            target_host_text = shared_p.read_text(encoding="utf-8")
+                        except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
+                            pass
+                except (OSError, RuntimeError, ValueError):
+                    pass
 
         helper_name = base_helper
         h_idx = 2
@@ -2234,21 +2257,30 @@ def generate_refactoring_patch(
 
                 rel_shared = _format_patch_relative_path(shared_p, patch_root, fs_root)
 
-                if shared_p.resolve() == f1_path.resolve():
+                if _is_same_file_or_resolved(shared_p, f1_path):
                     host_plan = f1_plan
                     callers = [(f2_plan, u2, t_inputs2, target_outs2)]
-                elif shared_p.resolve() == f2_plan.path.resolve():
+                elif _is_same_file_or_resolved(shared_p, f2_plan.path):
                     host_plan = f2_plan
                     callers = [(f1_plan, u1, t_inputs1, outputs)]
                 else:
                     shared_plan = file_plans.get(shared_p)
                     if shared_plan is None:
-                        if shared_p.is_symlink() or shared_p.is_dir():
-                            kind_desc = (
-                                "an existing symlink"
-                                if shared_p.is_symlink()
-                                else "an existing directory"
-                            )
+                        is_bad_target = False
+                        kind_desc = ""
+                        try:
+                            if shared_p.is_symlink() or shared_p.is_dir():
+                                is_bad_target = True
+                                kind_desc = (
+                                    "an existing symlink"
+                                    if shared_p.is_symlink()
+                                    else "an existing directory"
+                                )
+                        except (OSError, RuntimeError, ValueError) as exc:
+                            is_bad_target = True
+                            kind_desc = f"unresolvable ({exc})"
+
+                        if is_bad_target:
                             skip_msg = (
                                 f"# Note: Cross-module clone pair; shared module path {rel_shared} "
                                 f"is {kind_desc}; skipping extraction.\n"
@@ -2256,14 +2288,20 @@ def generate_refactoring_patch(
                             f1_plan.comments.append(skip_msg)
                             f2_plan.comments.append(skip_msg)
                             continue
-                        if shared_p.is_file():
+
+                        try:
+                            is_existing_file = shared_p.is_file()
+                        except (OSError, RuntimeError, ValueError):
+                            is_existing_file = False
+
+                        if is_existing_file:
                             try:
                                 shared_p.resolve().relative_to(patch_root.resolve())
                                 shared_text = shared_p.read_text(encoding="utf-8")
                                 shared_plan = _get_plan(
                                     shared_p, rel_shared, shared_text, is_new_file=False
                                 )
-                            except (OSError, UnicodeDecodeError, ValueError):
+                            except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
                                 read_err_msg = (
                                     f"# Note: Cross-module clone pair; shared module file {rel_shared} "
                                     f"exists but could not be read; skipping extraction.\n"

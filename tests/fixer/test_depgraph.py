@@ -660,6 +660,41 @@ def test_resolve_shared_module_file_symlink_fallback_raises(tmp_path: Path, monk
         resolve_shared_module_file(f1, f2, repo, shared_module_name="outside.py")
 
 
+def test_resolve_shared_module_file_resolution_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that symlink loops or filesystem errors in resolve_shared_module_file raise ValueError."""
+    repo = tmp_path / "repo_err"
+    repo.mkdir()
+    f1 = repo / "pkg" / "mod1.py"
+    f2 = repo / "pkg" / "mod2.py"
+    f1.parent.mkdir()
+    f1.write_text("", encoding="utf-8")
+    f2.write_text("", encoding="utf-8")
+
+    orig_resolve = Path.resolve
+
+    def mock_common_loop(self: Path, strict: bool = False) -> Path:
+        if self.name == "pkg":
+            raise RuntimeError("Symlink loop detected")
+        return orig_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", mock_common_loop)
+    with pytest.raises(ValueError, match="Common package directory resolution failed"):
+        resolve_shared_module_file(f1, f2, repo)
+
+    def mock_fallback_err(self: Path, strict: bool = False) -> Path:
+        if self.name == "_common.py":
+            raise OSError("Permission denied")
+        if self.name == "custom.py":
+            raise OSError("I/O error")
+        return orig_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", mock_fallback_err)
+    with pytest.raises(ValueError, match="Shared module path resolves outside common package directory"):
+        resolve_shared_module_file(f1, f2, repo, shared_module_name="custom.py")
+
+
 def test_derive_shared_module_import_relative_and_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Verifies prefer_relative behavior within subpackages and graceful fallback."""
     root = tmp_path / "repo"

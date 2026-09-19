@@ -34,12 +34,17 @@ def _is_within_root(path: Path, root: Path) -> bool:
         return False
 
 
+def _resolve_root_path(repo_root: Union[Path, str]) -> Path:
+    """Safely resolves a repository or root path, falling back on filesystem error."""
+    try:
+        return Path(repo_root).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return Path(repo_root)
+
+
 def _rejected_outside_root_path(root: Path) -> Path:
     """Returns a non-colliding sentinel path for rejected candidates outside the root."""
-    try:
-        resolved = root.resolve()
-    except (OSError, RuntimeError, ValueError):
-        resolved = root
+    resolved = _resolve_root_path(root)
     return resolved / ".git" / ".pydoppelgangerhunt-invalid-path" / "__outside_root__"
 
 
@@ -155,7 +160,7 @@ def _find_enclosing_package_root(path: Path) -> Path:
     checks if the path or any parent is named 'src', or contains a 'src' directory,
     falling back to the directory itself.
     """
-    curr = path.resolve()
+    curr = _resolve_root_path(path)
     if curr.is_file():
         curr = curr.parent
 
@@ -190,7 +195,7 @@ def _find_project_filesystem_root(path: Path) -> Path:
     If nested inside a 'src' layout, returns the directory enclosing 'src'.
     Falls back to enclosing package root or the path itself.
     """
-    curr = path.resolve()
+    curr = _resolve_root_path(path)
     if curr.is_file():
         curr = curr.parent
 
@@ -237,7 +242,7 @@ def derive_module_import_path(
     Returns:
         Dot-separated module import path, or an empty string if unresolvable.
     """
-    p_root = Path(repo_root).resolve()
+    p_root = _resolve_root_path(repo_root)
     p_file = _resolve_repo_relative_path(file_path, p_root)
     if p_file == _rejected_outside_root_path(p_root):
         rel = Path(Path(str(file_path)).name)
@@ -279,7 +284,7 @@ def find_nearest_common_package(
     Returns:
         Path to the nearest common directory.
     """
-    p_root = Path(repo_root).resolve()
+    p_root = _resolve_root_path(repo_root)
     dir1 = _parent_dir_of_path(_resolve_repo_relative_path(file1, p_root))
     dir2 = _parent_dir_of_path(_resolve_repo_relative_path(file2, p_root))
 
@@ -326,37 +331,53 @@ def resolve_shared_module_file(
         clean_name = "_common.py"
     else:
         clean_name = f"{stem}.py"
-    resolved_common = common_dir.resolve()
-    target = common_dir / clean_name
-    if target.is_symlink():
+    try:
+        resolved_common = common_dir.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
         raise ValueError(
-            f"Shared module target path is an existing symlink: {target}"
-        )
-    if target.is_dir():
+            f"Common package directory resolution failed for {common_dir}: {exc}"
+        ) from exc
+    target = common_dir / clean_name
+    try:
+        if target.is_symlink():
+            raise ValueError(
+                f"Shared module target path is an existing symlink: {target}"
+            )
+        if target.is_dir():
+            if clean_name == "_common.py":
+                raise ValueError(
+                    f"shared module path {clean_name} is an existing directory"
+                )
+        else:
+            try:
+                target.resolve().relative_to(resolved_common)
+                return target
+            except (ValueError, OSError, RuntimeError):
+                pass
+    except (OSError, RuntimeError) as exc:
         if clean_name == "_common.py":
             raise ValueError(
-                f"shared module path {clean_name} is an existing directory"
-            )
-    else:
-        try:
-            target.resolve().relative_to(resolved_common)
-            return target
-        except ValueError:
-            pass
+                f"Shared module target path error: {exc}"
+            ) from exc
 
     fallback = common_dir / "_common.py"
-    if fallback.is_symlink():
+    try:
+        if fallback.is_symlink():
+            raise ValueError(
+                f"Shared module fallback path is an existing symlink: {fallback}"
+            )
+        if fallback.is_dir():
+            raise ValueError(
+                "shared module path _common.py is an existing directory"
+            )
+    except (OSError, RuntimeError) as exc:
         raise ValueError(
-            f"Shared module fallback path is an existing symlink: {fallback}"
-        )
-    if fallback.is_dir():
-        raise ValueError(
-            "shared module path _common.py is an existing directory"
-        )
+            f"Shared module fallback path error: {exc}"
+        ) from exc
     try:
         fallback.resolve().relative_to(resolved_common)
         return fallback
-    except ValueError as exc:
+    except (ValueError, OSError, RuntimeError) as exc:
         raise ValueError(
             f"Shared module path resolves outside common package directory {common_dir}"
         ) from exc
@@ -379,7 +400,7 @@ def derive_shared_module_import(
     Returns:
         Module path suitable for 'from <module> import <helper>'.
     """
-    p_root = Path(repo_root).resolve()
+    p_root = _resolve_root_path(repo_root)
     effective_root = _find_enclosing_package_root(p_root)
     p_src = _resolve_repo_relative_path(source_file, p_root)
     p_shared = _resolve_repo_relative_path(shared_file, p_root)
@@ -601,7 +622,7 @@ class ModuleDependencyGraph:
         pending_descendants: Optional[Dict[str, Set[str]]] = None,
     ) -> None:
         """Initializes a module dependency graph scoped to a repository root."""
-        self.repo_root = Path(repo_root).resolve()
+        self.repo_root = _resolve_root_path(repo_root)
         self.adjacency: Dict[str, Set[str]] = (
             {k: v.copy() for k, v in adjacency.items()} if adjacency else {}
         )
@@ -620,7 +641,10 @@ class ModuleDependencyGraph:
             return
         if mod_name not in self.adjacency:
             self.adjacency[mod_name] = set()
-        resolved = file_path.resolve()
+        try:
+            resolved = file_path.resolve()
+        except (OSError, RuntimeError, ValueError):
+            resolved = file_path
         self.mod_to_file[mod_name] = resolved
         self.file_to_mod[str(resolved).replace("\\", "/").lower()] = mod_name
 
@@ -826,7 +850,7 @@ class ModuleDependencyGraph:
         file_paths: Optional[Sequence[Path]] = None,
     ) -> ModuleDependencyGraph:
         """Builds a populated dependency graph across the repository's Python source files."""
-        root = Path(repo_root).resolve()
+        root = _resolve_root_path(repo_root)
         effective_root = _find_enclosing_package_root(root)
         graph = cls(effective_root)
 

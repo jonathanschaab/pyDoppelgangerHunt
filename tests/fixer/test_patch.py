@@ -3383,6 +3383,59 @@ def test_shared_module_resolution_failure_adds_advisory_comment(
     assert "_common.py" not in patch
 
 
+def test_shared_module_resolution_filesystem_error_adds_advisory_comment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that if resolve_shared_module_file raises OSError or RuntimeError, patch adds skip advisory comment."""
+    pkg = tmp_path / "oserr_shared_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = "def fn1(x: int) -> int:\n    return x + 1\n"
+    src2 = "def fn2(x: int) -> int:\n    return x + 1\n"
+    f1 = pkg / "m1.py"
+    f2 = pkg / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "fn1", "file": str(f1), "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "fn2", "file": str(f2), "start": 1, "end": 2, "kind": "function"}
+
+    from pydoppelgangerhunt.fixer import patch as patch_mod  # pylint: disable=import-outside-toplevel
+
+    def mock_resolve_oserror(*args: Any, **kwargs: Any) -> Path:
+        raise OSError("Permission denied: cannot access directory")
+
+    monkeypatch.setattr(patch_mod, "resolve_shared_module_file", mock_resolve_oserror)
+
+    patch_os = patch_mod.generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "Permission denied: cannot access directory" in patch_os
+    assert "skipping extraction" in patch_os
+    assert "_common.py" not in patch_os
+
+    def mock_resolve_runtime_err(*args: Any, **kwargs: Any) -> Path:
+        raise RuntimeError("Symlink loop detected")
+
+    monkeypatch.setattr(patch_mod, "resolve_shared_module_file", mock_resolve_runtime_err)
+
+    patch_rt = patch_mod.generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "Symlink loop detected" in patch_rt
+    assert "skipping extraction" in patch_rt
+    assert "_common.py" not in patch_rt
+
+
 def test_clone_sources_conflicting_definition_and_import_rejected(tmp_path: Path) -> None:
     """Verifies that if one clone imports a symbol while another defines it locally, extraction is rejected."""
     pkg = tmp_path / "conflict_def_pkg"
