@@ -4555,3 +4555,28 @@ def test_generate_refactoring_patch_rejects_internal_symlink_clone(
     assert patch == ""
 
 
+def test_resolve_safe_clone_file_path_filesystem_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that _resolve_safe_clone_file_path gracefully catches filesystem errors."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _resolve_safe_clone_file_path,
+    )
+
+    repo = tmp_path / "err_repo"
+    repo.mkdir()
+    f = repo / "target.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+
+    orig_is_file = Path.is_file
+
+    def mock_is_file_oserror(self: Path) -> bool:
+        if self.name == "target.py":
+            raise OSError("Access denied")
+        return orig_is_file(self)
+
+    monkeypatch.setattr(Path, "is_file", mock_is_file_oserror)
+    res = _resolve_safe_clone_file_path("target.py", [repo])
+    assert res is None
+
+

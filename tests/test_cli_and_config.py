@@ -1020,7 +1020,22 @@ def test_batch_68_cli_patch_replace_and_type_merge_strategy(tmp_path: Path) -> N
         assert kwargs_custom.get("cross_file_strategy") == "host_module"
         assert kwargs_custom.get("shared_module_name") == "_shared_helpers.py"
 
-    # 4. Test config file defaults when flags omitted
+    # 4. Test CLI explicit cross-file skip flag
+    with mock.patch("pydoppelgangerhunt.cli.generate_refactoring_patch") as mock_patch_skip:
+        mock_patch_skip.return_value = "skip patch"
+        exit_code = pydoppelgangerhunt.main([
+            str(sub_repo),
+            "--threshold", "0.80",
+            "--min-lines", "4",
+            "--patch", str(patch_file),
+            "--cross-file-strategy", "skip",
+        ])
+        assert exit_code == 1
+        mock_patch_skip.assert_called_once()
+        _, kwargs_skip = mock_patch_skip.call_args
+        assert kwargs_skip.get("cross_file_strategy") == "skip"
+
+    # 5. Test config file defaults when flags omitted
     (sub_repo / "pyproject.toml").write_text(
         """
 [tool.pydoppelgangerhunt]

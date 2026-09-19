@@ -1767,17 +1767,24 @@ def _resolve_safe_clone_file_path(
     """Resolves raw_path across candidate roots, rejecting symlinks and resolution errors."""
     if not raw_path:
         return None
-    for root_dir in candidate_roots:
-        unresolved = (
-            Path(raw_path)
-            if Path(raw_path).is_absolute()
-            else root_dir / Path(raw_path)
-        )
-        if _has_symlink_component(unresolved, root_dir):
-            return None
-        cand = _resolve_repo_relative_path(raw_path, root_dir)
-        if cand.is_file() and not _has_symlink_component(cand, root_dir):
-            return cand
+    try:
+        for root_dir in candidate_roots:
+            unresolved = (
+                Path(raw_path)
+                if Path(raw_path).is_absolute()
+                else root_dir / Path(raw_path)
+            )
+            if _has_symlink_component(unresolved, root_dir):
+                return None
+            cand = _resolve_repo_relative_path(raw_path, root_dir)
+            try:
+                is_f = cand.is_file()
+            except (OSError, RuntimeError, ValueError):
+                is_f = False
+            if is_f and not _has_symlink_component(cand, root_dir):
+                return cand
+    except (OSError, RuntimeError, ValueError):
+        return None
     return None
 
 
@@ -1844,7 +1851,12 @@ def generate_refactoring_patch(
         f1_path = _resolve_safe_clone_file_path(
             f1_raw, (fs_root, patch_root, import_root)
         )
-        if f1_path is None or not f1_path.is_file() or f1_path.is_symlink():
+        if f1_path is None:
+            continue
+        try:
+            if not f1_path.is_file() or f1_path.is_symlink():
+                continue
+        except (OSError, RuntimeError, ValueError):
             continue
 
         rel_f1 = _format_patch_relative_path(f1_path, patch_root, fs_root)
@@ -1877,7 +1889,15 @@ def generate_refactoring_patch(
             f2_path = _resolve_safe_clone_file_path(
                 f2_raw, (fs_root, patch_root, import_root)
             )
-            if f2_path is not None and f2_path.is_file() and not f2_path.is_symlink():
+            try:
+                is_f2_safe = bool(
+                    f2_path is not None
+                    and f2_path.is_file()
+                    and not f2_path.is_symlink()
+                )
+            except (OSError, RuntimeError, ValueError):
+                is_f2_safe = False
+            if is_f2_safe and f2_path is not None:
                 rel_f2 = _format_patch_relative_path(f2_path, patch_root, fs_root)
                 f2_plan = file_plans.get(f2_path)
                 if f2_plan is None:

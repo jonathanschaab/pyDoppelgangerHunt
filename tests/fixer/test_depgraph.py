@@ -1235,3 +1235,96 @@ def test_resolve_repo_relative_path_catches_resolution_errors_and_symlink_loops(
     assert res_sym == sentinel
 
 
+def test_has_symlink_component_relative_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that _has_symlink_component detects symlinks in relative directory components."""
+    from pydoppelgangerhunt.fixer.depgraph import (  # pylint: disable=import-outside-toplevel
+        _has_symlink_component,
+    )
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+
+    orig_is_symlink = Path.is_symlink
+
+    def mock_is_symlink(self: Path) -> bool:
+        if self.name == "sym_dir":
+            return True
+        return orig_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", mock_is_symlink)
+    rel_path = Path("sym_dir") / "worker.py"
+    assert _has_symlink_component(rel_path, repo_dir) is True
+
+
+def test_is_within_root_catches_resolution_exceptions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that _is_within_root catches OSError and RuntimeError without raising."""
+    from pydoppelgangerhunt.fixer.depgraph import (  # pylint: disable=import-outside-toplevel
+        _is_within_root,
+    )
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    f = repo_dir / "test.py"
+
+    orig_resolve = Path.resolve
+
+    def mock_resolve_runtime(self: Path, *args: Any, **kwargs: Any) -> Path:
+        if self.name == "test.py":
+            raise RuntimeError("Symlink loop detected")
+        return orig_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", mock_resolve_runtime)
+    assert _is_within_root(f, repo_dir) is False
+
+    def mock_resolve_oserror(self: Path, *args: Any, **kwargs: Any) -> Path:
+        if self.name == "test.py":
+            raise OSError("Permission denied")
+        return orig_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", mock_resolve_oserror)
+    assert _is_within_root(f, repo_dir) is False
+
+
+def test_find_nearest_common_package_sentinel_fallback(tmp_path: Path) -> None:
+    """Verifies that find_nearest_common_package returns repo_root when candidates resolve to sentinel."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    res = find_nearest_common_package("../outside1.py", "../outside2.py", repo_dir)
+    assert res == repo_dir.resolve()
+
+
+def test_resolve_relative_import_path_boundary() -> None:
+    """Verifies that _resolve_relative_import_path falls back safely when climbing beyond package root."""
+    from pydoppelgangerhunt.fixer.depgraph import (  # pylint: disable=import-outside-toplevel
+        _resolve_relative_import_path,
+    )
+
+    # In pkg.mod (pkg_parts = ['pkg'], length 1), level 2 (from .. import foo) falls back to module_name
+    assert _resolve_relative_import_path("pkg.mod", 2, "foo", is_package=False) == "foo"
+    # When module_name is None, returns empty string
+    assert _resolve_relative_import_path("pkg.mod", 2, None, is_package=False) == ""
+
+    # In pkg.sub.mod (pkg_parts = ['pkg', 'sub'], length 2):
+    # level 2 climbs to pkg -> 'pkg.foo'
+    assert _resolve_relative_import_path("pkg.sub.mod", 2, "foo", is_package=False) == "pkg.foo"
+    # level 3 climbs beyond pkg -> falls back to module_name
+    assert _resolve_relative_import_path("pkg.sub.mod", 3, "foo", is_package=False) == "foo"
+
+
+def test_extract_guarded_compare_target_yoda_comparison() -> None:
+    """Verifies that _is_type_checking_guard detects Yoda boolean comparisons."""
+    import ast  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.depgraph import (  # pylint: disable=import-outside-toplevel
+        _is_type_checking_guard,
+    )
+
+    expr1 = ast.parse("True is TYPE_CHECKING").body[0].value  # type: ignore[attr-defined]
+    assert _is_type_checking_guard(expr1) is True
+
+    expr2 = ast.parse("False == TYPE_CHECKING").body[0].value  # type: ignore[attr-defined]
+    assert _is_type_checking_guard(expr2) is False
+
+    expr3 = ast.parse("False != TYPE_CHECKING").body[0].value  # type: ignore[attr-defined]
+    assert _is_type_checking_guard(expr3) is True
+
+

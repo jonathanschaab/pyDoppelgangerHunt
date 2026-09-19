@@ -145,9 +145,9 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
     parser.add_argument(
         "--cross-file-strategy",
         type=str,
-        choices=["auto", "shared_module", "host_module"],
+        choices=["auto", "shared_module", "host_module", "skip"],
         default=None,
-        help="Strategy for cross-module clone refactoring ('auto', 'shared_module', or 'host_module'; default: 'auto')",
+        help="Strategy for cross-module clone refactoring ('auto', 'shared_module', 'host_module', or 'skip'; default: 'auto')",
     )
     parser.add_argument(
         "--shared-module-name",
@@ -620,7 +620,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     raw_cross_file = args.cross_file_strategy or str(tool_cfg.get("cross_file_strategy", "auto"))
     cross_file_strategy = (
         raw_cross_file
-        if raw_cross_file in ("auto", "shared_module", "host_module", "host", "shared")
+        if raw_cross_file in ("auto", "shared_module", "host_module", "host", "shared", "skip")
         else "auto"
     )
     shared_module_name = str(args.shared_module_name or tool_cfg.get("shared_module_name", "_common.py"))

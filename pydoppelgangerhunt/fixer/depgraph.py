@@ -30,7 +30,7 @@ def _is_within_root(path: Path, root: Path) -> bool:
     try:
         path.resolve().relative_to(root.resolve())
         return True
-    except ValueError:
+    except (ValueError, OSError, RuntimeError):
         return False
 
 
@@ -54,11 +54,11 @@ def _has_symlink_component(path: Path, root: Optional[Path] = None) -> bool:
         if path.is_symlink():
             return True
         if root is not None:
-            try:
-                resolved_root = root.resolve()
-            except (OSError, RuntimeError, ValueError):
-                resolved_root = root
-            for parent in path.parents:
+            resolved_root = _resolve_root_path(root)
+            check_path = path if path.is_absolute() else (resolved_root / path)
+            if check_path.is_symlink():
+                return True
+            for parent in check_path.parents:
                 if parent != resolved_root and resolved_root in parent.parents:
                     if parent.is_symlink():
                         return True
@@ -152,6 +152,15 @@ def _resolve_repo_relative_path(
         return _rejected_outside_root_path(p_root)
 
 
+def _safe_parent_dir(path: Path) -> Path:
+    """Safely returns the parent directory if path is a file, or path itself."""
+    curr = _resolve_root_path(path)
+    try:
+        return curr.parent if curr.is_file() else curr
+    except (OSError, RuntimeError, ValueError):
+        return curr
+
+
 def _find_enclosing_package_root(path: Path) -> Path:
     """Finds the enclosing non-package directory (import root) for a module or directory.
 
@@ -160,16 +169,17 @@ def _find_enclosing_package_root(path: Path) -> Path:
     checks if the path or any parent is named 'src', or contains a 'src' directory,
     falling back to the directory itself.
     """
-    curr = _resolve_root_path(path)
-    if curr.is_file():
-        curr = curr.parent
+    curr = _safe_parent_dir(path)
 
     # 1. Find highest ancestor that is still a Python package (contains __init__.py)
     highest_pkg: Optional[Path] = None
     node: Optional[Path] = curr
     while node is not None and node.parent != node:
-        if (node / "__init__.py").is_file():
-            highest_pkg = node
+        try:
+            if (node / "__init__.py").is_file():
+                highest_pkg = node
+        except (OSError, RuntimeError, ValueError):
+            break
         node = node.parent
 
     if highest_pkg is not None:
@@ -181,8 +191,11 @@ def _find_enclosing_package_root(path: Path) -> Path:
             return parent
 
     # 3. If curr contains a 'src' directory, the import root is 'src'
-    if (curr / "src").is_dir():
-        return curr / "src"
+    try:
+        if (curr / "src").is_dir():
+            return curr / "src"
+    except (OSError, RuntimeError, ValueError):
+        pass
 
     return curr
 
@@ -195,23 +208,24 @@ def _find_project_filesystem_root(path: Path) -> Path:
     If nested inside a 'src' layout, returns the directory enclosing 'src'.
     Falls back to enclosing package root or the path itself.
     """
-    curr = _resolve_root_path(path)
-    if curr.is_file():
-        curr = curr.parent
+    curr = _safe_parent_dir(path)
 
     # 1. Search upwards for VCS metadata or build configurations
     scan_dir = curr
     while True:
-        if (
-            (scan_dir / ".git").exists()
-            or (scan_dir / ".hg").is_dir()
-            or (scan_dir / ".svn").is_dir()
-            or (scan_dir / "pyproject.toml").is_file()
-            or (scan_dir / "setup.py").is_file()
-            or (scan_dir / "setup.cfg").is_file()
-            or (scan_dir / "tox.ini").is_file()
-        ):
-            return scan_dir
+        try:
+            if (
+                (scan_dir / ".git").exists()
+                or (scan_dir / ".hg").is_dir()
+                or (scan_dir / ".svn").is_dir()
+                or (scan_dir / "pyproject.toml").is_file()
+                or (scan_dir / "setup.py").is_file()
+                or (scan_dir / "setup.cfg").is_file()
+                or (scan_dir / "tox.ini").is_file()
+            ):
+                return scan_dir
+        except (OSError, RuntimeError, ValueError):
+            break
         parent = scan_dir.parent
         if parent == scan_dir:
             break
@@ -265,7 +279,19 @@ def derive_module_import_path(
 
 def _parent_dir_of_path(path: Path) -> Path:
     """Returns the enclosing directory for a file path or directory."""
-    return path.parent if path.is_file() or path.suffix == ".py" else path
+    if path.suffix == ".py":
+        return path.parent
+    return _safe_parent_dir(path)
+
+
+def _resolve_candidate_pair(
+    p_root: Path, file1: Union[Path, str], file2: Union[Path, str]
+) -> Tuple[Path, Path, bool]:
+    """Resolves a pair of candidate paths against root, returning paths and rejection status."""
+    sentinel = _rejected_outside_root_path(p_root)
+    p1 = _resolve_repo_relative_path(file1, p_root)
+    p2 = _resolve_repo_relative_path(file2, p_root)
+    return p1, p2, sentinel in (p1, p2)
 
 
 def find_nearest_common_package(
@@ -285,25 +311,23 @@ def find_nearest_common_package(
         Path to the nearest common directory.
     """
     p_root = _resolve_root_path(repo_root)
-    dir1 = _parent_dir_of_path(_resolve_repo_relative_path(file1, p_root))
-    dir2 = _parent_dir_of_path(_resolve_repo_relative_path(file2, p_root))
+    p_file1, p_file2, has_rejected = _resolve_candidate_pair(p_root, file1, file2)
+    if has_rejected:
+        return p_root
 
+    dirs = (_parent_dir_of_path(p_file1), _parent_dir_of_path(p_file2))
     try:
-        rel1 = dir1.relative_to(p_root)
-        rel2 = dir2.relative_to(p_root)
+        rel_dirs = [d.relative_to(p_root) for d in dirs]
     except ValueError:
         return p_root
 
     common_parts: List[str] = []
-    for part1, part2 in zip(rel1.parts, rel2.parts):
-        if part1 == part2:
-            common_parts.append(part1)
-        else:
+    for part1, part2 in zip(rel_dirs[0].parts, rel_dirs[1].parts):
+        if part1 != part2:
             break
+        common_parts.append(part1)
 
-    if common_parts:
-        return p_root.joinpath(*common_parts)
-    return p_root
+    return p_root.joinpath(*common_parts) if common_parts else p_root
 
 
 def resolve_shared_module_file(
@@ -402,17 +426,14 @@ def derive_shared_module_import(
     """
     p_root = _resolve_root_path(repo_root)
     effective_root = _find_enclosing_package_root(p_root)
-    p_src = _resolve_repo_relative_path(source_file, p_root)
-    p_shared = _resolve_repo_relative_path(shared_file, p_root)
-    rejected_sentinel = _rejected_outside_root_path(p_root)
+    p_src, p_shared, has_rejected = _resolve_candidate_pair(
+        p_root, source_file, shared_file
+    )
 
-    if rejected_sentinel in (p_src, p_shared):
-        return derive_module_import_path(shared_file, effective_root)
-
-    try:
-        p_src.relative_to(effective_root)
-        p_shared.relative_to(effective_root)
-    except ValueError:
+    if has_rejected or not (
+        _is_within_root(p_src, effective_root)
+        and _is_within_root(p_shared, effective_root)
+    ):
         return derive_module_import_path(shared_file, effective_root)
 
     if not prefer_relative:
@@ -471,13 +492,9 @@ def _resolve_relative_import_path(
     if not parts:
         return module_name or ""
     pkg_parts = parts if is_package else parts[:-1]
-    if (level - 1) > len(pkg_parts):
+    if (level - 1) >= len(pkg_parts):
         return module_name or ""
-    target_base = (
-        pkg_parts[: len(pkg_parts) - (level - 1)]
-        if len(pkg_parts) >= (level - 1)
-        else []
-    )
+    target_base = pkg_parts[: len(pkg_parts) - (level - 1)]
     base_str = ".".join(target_base)
     if base_str and module_name:
         return f"{base_str}.{module_name}"
@@ -512,15 +529,17 @@ def _extract_guarded_compare_target(
         isinstance(test_node, ast.Compare)
         and len(test_node.ops) == 1
         and len(test_node.comparators) == 1
-        and isinstance(test_node.comparators[0], ast.Constant)
-        and isinstance(test_node.comparators[0].value, bool)
     ):
+        left = test_node.left
+        right = test_node.comparators[0]
         op = test_node.ops[0]
-        val = bool(test_node.comparators[0].value)
-        if isinstance(op, (ast.Is, ast.Eq)):
-            return test_node.left, val
-        if isinstance(op, (ast.IsNot, ast.NotEq)):
-            return test_node.left, not val
+        for const_side, target_side in ((right, left), (left, right)):
+            if isinstance(const_side, ast.Constant) and isinstance(const_side.value, bool):
+                val = bool(const_side.value)
+                if isinstance(op, (ast.Is, ast.Eq)):
+                    return target_side, val
+                if isinstance(op, (ast.IsNot, ast.NotEq)):
+                    return target_side, not val
     return None
 
 
@@ -599,13 +618,14 @@ def _parse_source_imports(
                 )
                 if resolved:
                     imports.add(resolved)
-                for alias in node.names:
-                    full_cand = f"{resolved}.{alias.name}" if resolved else alias.name
-                    imports.add(full_cand)
+                    for alias in node.names:
+                        if alias.name != "*":
+                            imports.add(f"{resolved}.{alias.name}")
             elif raw_mod:
                 imports.add(raw_mod)
                 for alias in node.names:
-                    imports.add(f"{raw_mod}.{alias.name}")
+                    if alias.name != "*":
+                        imports.add(f"{raw_mod}.{alias.name}")
     return imports
 
 

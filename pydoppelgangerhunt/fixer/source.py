@@ -101,7 +101,7 @@ def _find_module_helper_insertion_index(lines: List[str]) -> int:
 
     try:
         tree = ast.parse("".join(lines))
-    except SyntaxError:
+    except (SyntaxError, ValueError, UnicodeDecodeError):
         return min_insert_idx
 
     last_import_line = 0
@@ -154,7 +154,7 @@ def _get_module_imported_names(
     """Extracts top-level imported module and symbol names from source code."""
     try:
         tree = ast.parse(source)
-    except SyntaxError:
+    except (SyntaxError, ValueError, UnicodeDecodeError):
         return set()
     imported: Set[str] = set()
     for stmt in tree.body:
