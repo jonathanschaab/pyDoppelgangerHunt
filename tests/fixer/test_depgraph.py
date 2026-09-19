@@ -990,6 +990,10 @@ def test_resolve_repo_relative_path_rejects_parent_escape(tmp_path: Path) -> Non
     resolved_safe = _resolve_repo_relative_path("pkg/../safe.py", repo_dir)
     assert resolved_safe == safe_target
 
+    missing = _resolve_repo_relative_path("missing.py", repo_dir)
+    assert missing == repo_dir / "missing.py"
+    assert not missing.exists()
+
     escaped = _resolve_repo_relative_path("../outside.py", repo_dir)
     assert escaped != outside
     assert not escaped.exists()

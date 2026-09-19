@@ -63,8 +63,8 @@ def _resolve_repo_relative_path(
                 return cand_cwd
         if not _is_within_root(cand, resolved_root):
             return _rejected_outside_root_path(resolved_root)
-        p = cand
-    elif not _is_within_root(p, resolved_root):
+        return cand
+    if not _is_within_root(p, resolved_root):
         return _rejected_outside_root_path(resolved_root)
     return p.resolve()
 
