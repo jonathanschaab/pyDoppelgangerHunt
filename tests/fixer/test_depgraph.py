@@ -1046,3 +1046,79 @@ def test_find_enclosing_package_root_non_src_container(tmp_path: Path) -> None:
     import_root = _find_enclosing_package_root(pkg)
     assert import_root == lib_dir
     assert derive_module_import_path(mod_file, import_root) == "custom_lib.core"
+
+
+def test_build_from_repository_rejects_symlinked_files(tmp_path: Path) -> None:
+    """Verifies that build_from_repository skips symlinks pointing inside or outside the root."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    internal_file = repo / "internal.py"
+    internal_file.write_text("import sys\n", encoding="utf-8")
+
+    outside_file = outside / "external.py"
+    outside_file.write_text("import os\n", encoding="utf-8")
+
+    link_to_outside = repo / "sym_outside.py"
+    link_to_inside = repo / "sym_inside.py"
+    dir_link = repo / "sym_dir"
+
+    try:
+        link_to_outside.symlink_to(outside_file)
+        link_to_inside.symlink_to(internal_file)
+        dir_link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("Filesystem symlinks not supported in this environment")
+
+    # 1. Walk-based graph construction
+    graph_walk = build_module_graph(repo)
+    assert "internal" in graph_walk.mod_to_file
+    assert "sym_outside" not in graph_walk.mod_to_file
+    assert "sym_inside" not in graph_walk.mod_to_file
+    assert "sym_dir.external" not in graph_walk.mod_to_file
+    assert "external" not in graph_walk.mod_to_file
+
+    # 2. Explicit file_paths graph construction
+    graph_explicit = build_module_graph(
+        repo,
+        file_paths=[internal_file, link_to_outside, link_to_inside, outside_file],
+    )
+    assert "internal" in graph_explicit.mod_to_file
+    assert "sym_outside" not in graph_explicit.mod_to_file
+    assert "sym_inside" not in graph_explicit.mod_to_file
+    assert "external" not in graph_explicit.mod_to_file
+
+
+def test_build_from_repository_rejects_symlinked_files_mocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies symlink rejection in build_from_repository via mocked is_symlink."""
+    repo = tmp_path / "mock_repo"
+    repo.mkdir()
+
+    internal = repo / "worker.py"
+    internal.write_text("import math\n", encoding="utf-8")
+
+    fake_symlink = repo / "fake_symlink.py"
+    fake_symlink.write_text("import evil\n", encoding="utf-8")
+
+    orig_is_symlink = Path.is_symlink
+
+    def mock_is_symlink(self: Path) -> bool:
+        if self.name == "fake_symlink.py":
+            return True
+        return orig_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", mock_is_symlink)
+
+    # 1. Walk rejects fake_symlink.py
+    g_walk = build_module_graph(repo)
+    assert "worker" in g_walk.mod_to_file
+    assert "fake_symlink" not in g_walk.mod_to_file
+
+    # 2. Explicit list rejects fake_symlink.py
+    g_exp = build_module_graph(repo, file_paths=[internal, fake_symlink])
+    assert "worker" in g_exp.mod_to_file
+    assert "fake_symlink" not in g_exp.mod_to_file

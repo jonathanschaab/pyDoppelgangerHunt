@@ -2980,6 +2980,71 @@ def test_generate_patch_wildcard_import_unresolved_symbol(tmp_path: Path) -> Non
     assert "skipping extraction" in patch
 
 
+def test_cross_file_wildcard_with_explicit_import_rejected(tmp_path: Path) -> None:
+    """Verifies that cross-file extraction is rejected when one clone uses wildcard and another has explicit import."""
+    pkg = tmp_path / "pkg_wildcard_mixed"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src1 = (
+        "from dep_a import *\n\n"
+        "def process(x: TransformType) -> int:\n"
+        "    return 42\n"
+    )
+    src2 = (
+        "from dep_b import TransformType\n\n"
+        "def process(x: TransformType) -> int:\n"
+        "    return 42\n"
+    )
+    f1 = pkg / "m1.py"
+    f2 = pkg / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"name": "process", "file": str(f1), "start": 3, "end": 4, "kind": "function"}
+    u2 = {"name": "process", "file": str(f2), "start": 3, "end": 4, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="shared_module",
+    )
+
+    assert "potentially relies on wildcard import" in patch
+    assert "skipping extraction" in patch
+    assert "from dep_b import TransformType" not in patch
+
+
+def test_same_file_wildcard_import_allowed(tmp_path: Path) -> None:
+    """Verifies that same-file clones sharing a module-level wildcard import are extracted."""
+    pkg = tmp_path / "pkg_same_file_wildcard"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src = (
+        "from math import *\n\n"
+        "def run_a(x: int) -> float:\n"
+        "    return float(x) * 2.0\n\n"
+        "def run_b(x: int) -> float:\n"
+        "    return float(x) * 2.0\n"
+    )
+    f = pkg / "mod.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {"name": "run_a", "file": str(f), "start": 3, "end": 4, "kind": "function"}
+    u2 = {"name": "run_b", "file": str(f), "start": 6, "end": 7, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+
+    assert "potentially relies on wildcard import" not in patch
+    assert "def _shared_run_a" in patch
+
+
 def test_shared_module_rejects_unresolved_nonbuiltin_dependency(tmp_path: Path) -> None:
     """Verifies that a helper referencing an unimported module-local type rejects shared module extraction."""
     pkg = tmp_path / "pkg_unresolved"

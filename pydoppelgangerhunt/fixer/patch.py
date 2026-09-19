@@ -1448,10 +1448,11 @@ def _collect_host_missing_imports(
 
                 unit_bindings.append((b_type, b_val, s_mod, s_idx, u_idx))
 
-            # 1. Wildcard check: if any unit relies on wildcard and symbol is not explicitly imported or defined
+            # 1. Wildcard check: reject wildcard-dependent cross-file extraction,
+            # or mixed wildcard/explicit bindings within the same file.
             has_wildcard = any(b[0] == "wildcard" for b in unit_bindings)
             has_explicit = any(b[0] in ("import", "def") for b in unit_bindings)
-            if has_wildcard and not has_explicit and not is_same_file_host:
+            if has_wildcard and (not is_same_file_host or has_explicit):
                 raise ValueError(
                     f"symbol '{loaded_name}' potentially relies on wildcard import"
                 )
@@ -1804,7 +1805,7 @@ def generate_refactoring_patch(
             f1_path = _resolve_repo_relative_path(f1_raw, patch_root)
         if not f1_path.is_file() and import_root != fs_root and import_root != patch_root:
             f1_path = _resolve_repo_relative_path(f1_raw, import_root)
-        if not f1_path.is_file():
+        if not f1_path.is_file() or f1_path.is_symlink():
             continue
 
         rel_f1 = _format_patch_relative_path(f1_path, patch_root, fs_root)
@@ -1839,7 +1840,7 @@ def generate_refactoring_patch(
                 f2_path = _resolve_repo_relative_path(f2_raw, patch_root)
             if not f2_path.is_file() and import_root != fs_root and import_root != patch_root:
                 f2_path = _resolve_repo_relative_path(f2_raw, import_root)
-            if f2_path.is_file():
+            if f2_path.is_file() and not f2_path.is_symlink():
                 rel_f2 = _format_patch_relative_path(f2_path, patch_root, fs_root)
                 f2_plan = file_plans.get(f2_path)
                 if f2_plan is None:

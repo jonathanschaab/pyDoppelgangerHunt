@@ -39,6 +39,38 @@ def _rejected_outside_root_path(root: Path) -> Path:
     return root.resolve() / ".git" / ".pydoppelgangerhunt-invalid-path" / "__outside_root__"
 
 
+def _is_safe_repo_python_file(path: Union[Path, str], root: Path) -> Optional[Path]:
+    """Validates that a path is a regular, non-symlinked Python file strictly within root.
+
+    Returns the canonical resolved Path if safe, or None if the path is a symlink,
+    resolves outside the root boundary, or is invalid.
+    """
+    try:
+        p = Path(path)
+        if p.suffix != ".py":
+            return None
+        if p.is_symlink():
+            return None
+        resolved_root = root.resolve()
+        if not p.is_absolute() and (resolved_root / p).is_symlink():
+            return None
+        cand = _resolve_repo_relative_path(p, resolved_root)
+        sentinel = _rejected_outside_root_path(resolved_root)
+        if cand == sentinel or cand.is_symlink():
+            return None
+        resolved = cand.resolve()
+        if (
+            resolved.is_symlink()
+            or not resolved.is_file()
+            or not _is_within_root(resolved, resolved_root)
+            or resolved == sentinel
+        ):
+            return None
+        return resolved
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
 def _resolve_repo_relative_path(
     file_path: Union[Path, str], p_root: Path
 ) -> Path:
@@ -745,19 +777,30 @@ class ModuleDependencyGraph:
         effective_root = _find_enclosing_package_root(root)
         graph = cls(effective_root)
 
+        python_files: List[Path] = []
+        seen_files: Set[Path] = set()
+
         if file_paths is not None:
-            python_files = [
-                _resolve_repo_relative_path(p, root)
-                for p in file_paths
-                if p.suffix == ".py"
-            ]
+            for p in file_paths:
+                safe_file = _is_safe_repo_python_file(p, root)
+                if safe_file is not None and safe_file not in seen_files:
+                    seen_files.add(safe_file)
+                    python_files.append(safe_file)
         else:
-            python_files = []
             for dirpath, dirnames, filenames in os.walk(root):
-                dirnames[:] = [d for d in dirnames if d not in EXCLUDED_GRAPH_DIRS]
+                dir_p = Path(dirpath)
+                dirnames[:] = [
+                    d
+                    for d in dirnames
+                    if d not in EXCLUDED_GRAPH_DIRS
+                    and not (dir_p / d).is_symlink()
+                ]
                 for filename in filenames:
-                    if filename.endswith(".py"):
-                        python_files.append(Path(dirpath) / filename)
+                    file_p = dir_p / filename
+                    safe_file = _is_safe_repo_python_file(file_p, root)
+                    if safe_file is not None and safe_file not in seen_files:
+                        seen_files.add(safe_file)
+                        python_files.append(safe_file)
 
         # First pass: map all modules
         for p_file in python_files:
