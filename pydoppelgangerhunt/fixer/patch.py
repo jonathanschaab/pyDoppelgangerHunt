@@ -28,10 +28,9 @@ from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
     _find_enclosing_package_root,
     _find_project_filesystem_root,
-    _has_symlink_component,
+    _is_safe_repo_python_file,
     _parse_source_imports,
     _resolve_relative_import_path,
-    _resolve_repo_relative_path,
     build_module_graph,
     derive_module_import_path as _derive_module_import_path,
     find_nearest_common_package,
@@ -1764,25 +1763,20 @@ def _is_same_file_or_resolved(p1: Path, p2: Path) -> bool:
 def _resolve_safe_clone_file_path(
     raw_path: str, candidate_roots: Sequence[Path]
 ) -> Optional[Path]:
-    """Resolves raw_path across candidate roots, rejecting symlinks and resolution errors."""
-    if not raw_path:
+    """Resolves raw_path across candidate roots, rejecting symlinks and resolution errors.
+
+    Relative paths are resolved strictly against the primary scan root (candidate_roots[0]).
+    Absolute paths are validated against candidate_roots.
+    """
+    if not raw_path or not candidate_roots:
         return None
     try:
-        for root_dir in candidate_roots:
-            unresolved = (
-                Path(raw_path)
-                if Path(raw_path).is_absolute()
-                else root_dir / Path(raw_path)
-            )
-            if _has_symlink_component(unresolved, root_dir):
-                return None
-            cand = _resolve_repo_relative_path(raw_path, root_dir)
-            try:
-                is_f = cand.is_file()
-            except (OSError, RuntimeError, ValueError):
-                is_f = False
-            if is_f and not _has_symlink_component(cand, root_dir):
-                return cand
+        p = Path(raw_path)
+        roots_to_check = candidate_roots if p.is_absolute() else (candidate_roots[0],)
+        for root_dir in roots_to_check:
+            safe = _is_safe_repo_python_file(raw_path, root_dir)
+            if safe is not None:
+                return safe
     except (OSError, RuntimeError, ValueError):
         return None
     return None
@@ -2481,32 +2475,6 @@ def generate_refactoring_patch(
                     continue
                 host_imports = maybe_imports
 
-                if mod1 and host_imports:
-                    host_cycle = dg.check_cycle_if_imports_added(
-                        mod1,
-                        host_imports,
-                        file_path=f1_plan.path,
-                        is_package=is_pkg1,
-                    )
-                    if host_cycle:
-                        cycle_desc = f" (cycle: {' -> '.join(host_cycle)})"
-                        f1_plan.comments.append(
-                            f"# Note: Cross-module clone pair; helper extraction to {f1_disp} "
-                            f"rejected due to circular dependency{cycle_desc}; import manually into {f2_disp}.\n"
-                        )
-                        f2_plan.comments.append(
-                            f"# Note: Cross-module clone pair; helper extraction to {f1_disp} "
-                            f"rejected due to circular dependency{cycle_desc}; import manually into {f2_disp}.\n"
-                        )
-                        continue
-                    _register_plan_dependencies_in_graph(
-                        dg, mod1, f1_plan.path, host_imports
-                    )
-                elif mod1:
-                    _register_plan_dependencies_in_graph(
-                        dg, mod1, f1_plan.path, []
-                    )
-
                 cycle = (
                     dg.check_cycle_if_added(mod2, mod1)
                     if (mod1 and mod2)
@@ -2526,30 +2494,57 @@ def generate_refactoring_patch(
                         cycle_desc = f" (cycle: {' -> '.join(cycle)})"
                     elif direct_import:
                         cycle_desc = f" (cycle: {mod2} -> {mod1} -> {mod2})"
-                    f1_plan.comments.append(
+                    cycle_msg = (
                         f"# Note: Cross-module clone pair; helper generated in {f1_disp}. "
                         f"Circular import or unresolvable module path{cycle_desc}; import manually into {f2_disp}.\n"
                     )
-                else:
-                    _wire_cross_module_host_delegation(
-                        f1_plan=f1_plan,
-                        f2_plan=f2_plan,
-                        u2=u2,
-                        mod1=mod1,
-                        helper_name=helper_name,
-                        pair_comment=pair_comment,
-                        f1_disp=f1_disp,
-                        f2_disp=f2_disp,
-                        replace_clones=replace_clones,
-                        inputs=inputs,
-                        outputs=outputs,
-                        scope=scope,
-                        t_inputs2=t_inputs2,
-                        target_outs2=target_outs2,
-                        await_prefix=await_prefix,
+                    for plan in (f1_plan, f2_plan):
+                        plan.comments.append(cycle_msg)
+                    continue
+
+                if mod1 and host_imports:
+                    host_cycle = dg.check_cycle_if_imports_added(
+                        mod1,
+                        host_imports,
+                        file_path=f1_plan.path,
+                        is_package=is_pkg1,
                     )
-                    if replace_clones and mod1 and mod2:
-                        dg.add_dependency(mod2, mod1)
+                    if host_cycle:
+                        cycle_desc = f" (cycle: {' -> '.join(host_cycle)})"
+                        cycle_msg = (
+                            f"# Note: Cross-module clone pair; helper extraction to {f1_disp} "
+                            f"rejected due to circular dependency{cycle_desc}; import manually into {f2_disp}.\n"
+                        )
+                        for plan in (f1_plan, f2_plan):
+                            plan.comments.append(cycle_msg)
+                        continue
+                    _register_plan_dependencies_in_graph(
+                        dg, mod1, f1_plan.path, host_imports
+                    )
+                elif mod1:
+                    _register_plan_dependencies_in_graph(
+                        dg, mod1, f1_plan.path, []
+                    )
+
+                _wire_cross_module_host_delegation(
+                    f1_plan=f1_plan,
+                    f2_plan=f2_plan,
+                    u2=u2,
+                    mod1=mod1,
+                    helper_name=helper_name,
+                    pair_comment=pair_comment,
+                    f1_disp=f1_disp,
+                    f2_disp=f2_disp,
+                    replace_clones=replace_clones,
+                    inputs=inputs,
+                    outputs=outputs,
+                    scope=scope,
+                    t_inputs2=t_inputs2,
+                    target_outs2=target_outs2,
+                    await_prefix=await_prefix,
+                )
+                if replace_clones and mod1 and mod2:
+                    dg.add_dependency(mod2, mod1)
 
                 _finalize_host_unit_and_helper(
                     plan=f1_plan,

@@ -568,7 +568,12 @@ class _ScopeVisitor(ast.NodeVisitor):
                 logger.debug("Failed to unparse import node %r: %s", node, exc)
                 return
 
-        if stmt not in self.local_imports:
+        is_nested = (
+            len(self._scope_stack) > 0
+            if self.is_subroutine
+            else len(self._scope_stack) > 1
+        )
+        if not is_nested and stmt not in self.local_imports:
             self.local_imports.append(stmt)
         for alias in node.names:
             if isinstance(node, ast.Import):
@@ -576,7 +581,8 @@ class _ScopeVisitor(ast.NodeVisitor):
             else:
                 bound_name = alias.asname or alias.name
             if bound_name != "*":
-                self.imported_names[bound_name] = stmt
+                if not is_nested:
+                    self.imported_names[bound_name] = stmt
                 self._record_store_name(bound_name)
 
     def visit_Import(self, node: ast.Import) -> None:

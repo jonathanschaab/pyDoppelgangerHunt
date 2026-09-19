@@ -4580,3 +4580,96 @@ def test_resolve_safe_clone_file_path_filesystem_error(
     assert res is None
 
 
+def test_scope_nested_import_not_recorded_in_local_imports(tmp_path: Path) -> None:
+    """Verifies that imports within nested functions are not recorded in unit local_imports."""
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        analyze_unit_variable_scope,
+    )
+
+    code = (
+        "def outer(x: int) -> int:\n"
+        "    def inner(y: int) -> int:\n"
+        "        from inner_pkg import helper\n"
+        "        return helper(y)\n"
+        "    return inner(x)\n"
+    )
+    f = tmp_path / "test_nested.py"
+    f.write_text(code, encoding="utf-8")
+    unit = {"file": "test_nested.py", "start": 1, "end": 5, "kind": "function", "name": "outer"}
+    scope_info = analyze_unit_variable_scope(unit, repo_root=str(tmp_path))
+    assert "from inner_pkg import helper" not in scope_info["local_imports"]
+
+
+def test_resolve_safe_clone_file_path_does_not_fallback_relative_path_to_patch_root(
+    tmp_path: Path,
+) -> None:
+    """Verifies that relative clone paths are only resolved against the scan root, not patch_root."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _resolve_safe_clone_file_path,
+    )
+
+    project = tmp_path / "project"
+    tools = project / "pkg" / "tools"
+    tools.mkdir(parents=True)
+    other = project / "pkg" / "other.py"
+    other.write_text("x = 1\n", encoding="utf-8")
+
+    res = _resolve_safe_clone_file_path("pkg/other.py", (tools, project))
+    assert res is None
+
+
+def test_resolve_safe_clone_file_path_rejects_sentinel_file_on_disk(
+    tmp_path: Path,
+) -> None:
+    """Verifies that out-of-root paths are rejected even if the sentinel file exists on disk."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _resolve_safe_clone_file_path,
+    )
+
+    repo = tmp_path / "sentinel_repo"
+    repo.mkdir()
+    sentinel_dir = repo / ".git" / ".pydoppelgangerhunt-invalid-path"
+    sentinel_dir.mkdir(parents=True)
+    sentinel_file = sentinel_dir / "__outside_root__"
+    sentinel_file.write_text("# fake sentinel on disk\n", encoding="utf-8")
+
+    res = _resolve_safe_clone_file_path("../outside.py", [repo])
+    assert res is None
+
+
+def test_host_module_cycle_detection_skips_finalization_transactionally(
+    tmp_path: Path,
+) -> None:
+    """Verifies that when a caller-to-host cycle is detected, no code hunks are emitted in patch."""
+    pkg = tmp_path / "cyc_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    src_host = (
+        "import cyc_pkg.caller\n\n"
+        "def work_host(x: int) -> int:\n"
+        "    return x * 2 + 1\n"
+    )
+    src_caller = (
+        "def work_caller(x: int) -> int:\n"
+        "    return x * 2 + 1\n"
+    )
+    (pkg / "host.py").write_text(src_host, encoding="utf-8")
+    (pkg / "caller.py").write_text(src_caller, encoding="utf-8")
+
+    u_host = {"name": "work_host", "file": "cyc_pkg/host.py", "start": 3, "end": 4, "kind": "function"}
+    u_caller = {"name": "work_caller", "file": "cyc_pkg/caller.py", "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u_host, u_caller)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        cross_file_strategy="host_module",
+    )
+
+    assert "--- a/cyc_pkg/caller.py" not in patch
+    assert "--- a/cyc_pkg/host.py" not in patch
+    assert "Circular import or unresolvable module path" in patch
+
+
+
