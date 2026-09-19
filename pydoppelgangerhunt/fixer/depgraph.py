@@ -35,8 +35,8 @@ def _is_within_root(path: Path, root: Path) -> bool:
 
 
 def _rejected_outside_root_path(root: Path) -> Path:
-    """Returns a non-existent sentinel path for rejected candidates outside the root."""
-    return root.resolve() / ".pydoppelgangerhunt-invalid-path" / "__outside_root__"
+    """Returns a non-colliding sentinel path for rejected candidates outside the root."""
+    return root.resolve() / ".git" / ".pydoppelgangerhunt-invalid-path" / "__outside_root__"
 
 
 def _resolve_repo_relative_path(
