@@ -1757,7 +1757,7 @@ def generate_refactoring_patch(
     if fs_root.is_file():
         fs_root = fs_root.parent
     patch_root = _find_project_filesystem_root(fs_root)
-    root = patch_root
+    root = fs_root
     import_root = (
         _find_enclosing_package_root(fs_root)
         if (fs_root / "__init__.py").is_file()
@@ -1803,10 +1803,10 @@ def generate_refactoring_patch(
         f1_raw = normalize_path_string(str(u1.get("file") or ""), strip_anchor=True)
         if not f1_raw:
             continue
-        f1_path = _resolve_repo_relative_path(f1_raw, patch_root)
-        if not f1_path.is_file() and fs_root != patch_root:
-            f1_path = _resolve_repo_relative_path(f1_raw, fs_root)
-        if not f1_path.is_file() and import_root != patch_root:
+        f1_path = _resolve_repo_relative_path(f1_raw, fs_root)
+        if not f1_path.is_file() and patch_root != fs_root:
+            f1_path = _resolve_repo_relative_path(f1_raw, patch_root)
+        if not f1_path.is_file() and import_root != fs_root and import_root != patch_root:
             f1_path = _resolve_repo_relative_path(f1_raw, import_root)
         if not f1_path.is_file():
             continue
@@ -1826,7 +1826,7 @@ def generate_refactoring_patch(
         orig_lines = f1_plan.orig_lines
 
         f2_raw = normalize_path_string(str(u2.get("file") or ""), strip_anchor=True)
-        is_same_file = _is_same_file_path(f1_raw, f2_raw, repo_root=str(patch_root))
+        is_same_file = _is_same_file_path(f1_raw, f2_raw, repo_root=str(root))
 
         enc1 = find_enclosing_class(orig_text, u1)
         fn1 = find_enclosing_function(orig_text, u1)
@@ -1838,10 +1838,10 @@ def generate_refactoring_patch(
             enc2 = find_enclosing_class(orig_text, u2)
             fn2 = find_enclosing_function(orig_text, u2)
         elif f2_raw:
-            f2_path = _resolve_repo_relative_path(f2_raw, patch_root)
-            if not f2_path.is_file() and fs_root != patch_root:
-                f2_path = _resolve_repo_relative_path(f2_raw, fs_root)
-            if not f2_path.is_file() and import_root != patch_root:
+            f2_path = _resolve_repo_relative_path(f2_raw, fs_root)
+            if not f2_path.is_file() and patch_root != fs_root:
+                f2_path = _resolve_repo_relative_path(f2_raw, patch_root)
+            if not f2_path.is_file() and import_root != fs_root and import_root != patch_root:
                 f2_path = _resolve_repo_relative_path(f2_raw, import_root)
             if f2_path.is_file():
                 rel_f2 = _format_patch_relative_path(f2_path, patch_root, fs_root)
@@ -1858,18 +1858,18 @@ def generate_refactoring_patch(
 
         if replace_clones:
             u1_claimed = any(
-                check_units_overlap(u1, prev_u, repo_root=str(patch_root))
+                check_units_overlap(u1, prev_u, repo_root=str(root))
                 for prev_u in f1_plan.claimed_units
             )
             if is_same_file:
                 u2_claimed = any(
-                    check_units_overlap(u2, prev_u, repo_root=str(patch_root))
+                    check_units_overlap(u2, prev_u, repo_root=str(root))
                     for prev_u in f1_plan.claimed_units
                 )
             else:
                 u2_claimed = (
                     any(
-                        check_units_overlap(u2, prev_u, repo_root=str(patch_root))
+                        check_units_overlap(u2, prev_u, repo_root=str(root))
                         for prev_u in f2_plan.claimed_units
                     )
                     if f2_plan is not None

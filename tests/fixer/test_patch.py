@@ -3638,6 +3638,8 @@ def test_generate_refactoring_patch_src_layout_uses_project_root_patch_paths(
     )
 
     assert "from my_package.sub._common import _shared_util" in patch
+    assert "def _shared_util(a: int) -> int:" in patch
+    assert "return a * 2" in patch
     assert (
         "diff --git a/src/my_package/sub/_common.py "
         "b/src/my_package/sub/_common.py"
@@ -3713,6 +3715,8 @@ def test_generate_refactoring_patch_file_repo_root_uses_project_root_patch_paths
     )
 
     assert "from my_package._common import _shared_util" in patch
+    assert "def _shared_util(a: int) -> int:" in patch
+    assert "return a * 2" in patch
     assert "diff --git a/lib/my_package/_common.py b/lib/my_package/_common.py" in patch
     assert "--- a/lib/my_package/a.py" in patch
     assert "+++ b/lib/my_package/a.py" in patch
