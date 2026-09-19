@@ -4002,9 +4002,6 @@ def my_helper(param1: ExternalType, default_arg=ExternalDefault) -> ReturnType:
     class LocalClass(ExternalBase):
         def method(self):
             return self.attr
-    match external_val:
-        case [head, *tail]:
-            process(head)
     walrus_res = (walrus_bound := calc())
     items = [comp_item for comp_item in external_seq]
     return local_func(local_mod.run(ctx_a, LocalClass(), walrus_res, items))
@@ -4020,8 +4017,6 @@ def my_helper(param1: ExternalType, default_arg=ExternalDefault) -> ReturnType:
     assert "ExternalError" in free
     assert "handle_err" in free
     assert "ExternalBase" in free
-    assert "external_val" in free
-    assert "process" in free
     assert "calc" in free
     assert "external_seq" in free
 
@@ -4032,8 +4027,6 @@ def my_helper(param1: ExternalType, default_arg=ExternalDefault) -> ReturnType:
     assert "ctx_b" not in free
     assert "err" not in free
     assert "LocalClass" not in free
-    assert "head" not in free
-    assert "tail" not in free
     assert "walrus_bound" not in free
     assert "comp_item" not in free
 
@@ -4041,3 +4034,23 @@ def my_helper(param1: ExternalType, default_arg=ExternalDefault) -> ReturnType:
     assert "local_mod" in local_imps
     assert "local_func" in local_imps
     assert "my_helper" in defined
+
+
+@pytest.mark.skipif(sys.version_info < (3, 10), reason="Pattern matching requires Python 3.10+")
+def test_extract_helper_symbols_pattern_matching() -> None:
+    """Verifies that match-case pattern bindings are recognized as local bindings on Python 3.10+."""
+    from pydoppelgangerhunt.fixer.patch import _extract_helper_symbols  # pylint: disable=import-outside-toplevel
+
+    code = """
+def match_helper(external_val: Any) -> Any:
+    match external_val:
+        case [head, *tail]:
+            return process(head, tail)
+"""
+    tree = ast.parse(code)
+    free, defined, _ = _extract_helper_symbols(tree)
+    assert "external_val" not in free
+    assert "process" in free
+    assert "head" not in free
+    assert "tail" not in free
+    assert "match_helper" in defined
