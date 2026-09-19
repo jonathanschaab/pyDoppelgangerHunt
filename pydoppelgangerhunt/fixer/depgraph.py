@@ -782,15 +782,17 @@ class ModuleDependencyGraph:
             parent_pkg = ".".join(parts[:i])
             parent_canon = self.canonicalize_module_name(parent_pkg)
             if parent_canon in self.mod_to_file:
-                self.add_dependency(canon, parent_canon)
-                self._ancestor_edges.add((canon, parent_canon))
+                if parent_canon not in self.adjacency.get(canon, ()):
+                    self.add_dependency(canon, parent_canon)
+                    self._ancestor_edges.add((canon, parent_canon))
             else:
                 self._pending_descendants.setdefault(parent_canon, set()).add(canon)
 
         if canon in self._pending_descendants:
             for desc_mod in self._pending_descendants.pop(canon):
-                self.add_dependency(desc_mod, canon)
-                self._ancestor_edges.add((desc_mod, canon))
+                if canon not in self.adjacency.get(desc_mod, ()):
+                    self.add_dependency(desc_mod, canon)
+                    self._ancestor_edges.add((desc_mod, canon))
 
     def add_dependency(self, from_mod: str, to_mod: str) -> None:
         """Adds a directed import edge from from_mod to to_mod."""

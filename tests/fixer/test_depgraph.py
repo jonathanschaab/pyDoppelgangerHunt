@@ -1386,6 +1386,38 @@ def test_ancestor_package_importing_nested_submodule_with_explicit_import_flagge
     assert cycle == ["mypkg", "mypkg.sub.worker", "mypkg.sub", "mypkg"]
 
 
+def test_explicit_dependency_before_parent_module_not_reclassified_as_ancestor(
+    tmp_path: Path,
+) -> None:
+    """Verifies that an explicit edge added before the submodule or parent module is not reclassified."""
+    # pylint: disable=protected-access
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    # Case 1: Parent registered, explicit dependency added, then submodule registered
+    g1 = ModuleDependencyGraph(root)
+    g1.add_module("core_pkg", root / "core_pkg" / "__init__.py")
+    g1.add_dependency("core_pkg.helper", "core_pkg")
+    assert ("core_pkg.helper", "core_pkg") not in g1._ancestor_edges
+
+    g1.add_module("core_pkg.helper", root / "core_pkg" / "helper.py")
+    assert ("core_pkg.helper", "core_pkg") not in g1._ancestor_edges
+    cycle1 = g1.check_cycle_if_added("core_pkg", "core_pkg.helper")
+    assert cycle1 == ["core_pkg", "core_pkg.helper", "core_pkg"]
+
+    # Case 2: Submodule registered first (pending descendant), explicit dependency added, then parent registered
+    g2 = ModuleDependencyGraph(root)
+    g2.add_module("core_pkg.helper", root / "core_pkg" / "helper.py")
+    assert "core_pkg" in g2._pending_descendants
+    g2.add_dependency("core_pkg.helper", "core_pkg")
+    assert ("core_pkg.helper", "core_pkg") not in g2._ancestor_edges
+
+    g2.add_module("core_pkg", root / "core_pkg" / "__init__.py")
+    assert ("core_pkg.helper", "core_pkg") not in g2._ancestor_edges
+    cycle2 = g2.check_cycle_if_added("core_pkg", "core_pkg.helper")
+    assert cycle2 == ["core_pkg", "core_pkg.helper", "core_pkg"]
+
+
 def test_build_module_graph_subdirectory_and_project_boundary(tmp_path: Path) -> None:
     """Verifies graph builds from project boundary while preserving separate import namespace and aliases."""
     workspace = tmp_path / "workspace"
