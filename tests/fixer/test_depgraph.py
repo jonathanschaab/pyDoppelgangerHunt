@@ -607,3 +607,96 @@ def test_derive_shared_module_import_preserves_package_prefix_for_package_root(t
 
     imp2 = derive_shared_module_import(mod, shared_pkg, repo_root=pkg, prefer_relative=False)
     assert imp2 == "mypkg._common"
+
+
+def test_resolve_shared_module_file_symlink_fallback_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that existing symlinks at target or fallback shared module path raise ValueError."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    f1 = repo / "pkg" / "mod1.py"
+    f2 = repo / "pkg" / "mod2.py"
+    f1.parent.mkdir()
+    f1.write_text("", encoding="utf-8")
+    f2.write_text("", encoding="utf-8")
+
+    orig_is_symlink = Path.is_symlink
+
+    # 1. Target itself is a symlink
+    def mock_target_symlink(self: Path) -> bool:
+        if self.name == "custom.py":
+            return True
+        return orig_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", mock_target_symlink)
+    with pytest.raises(ValueError, match="Shared module target path is an existing symlink"):
+        resolve_shared_module_file(f1, f2, repo, shared_module_name="custom.py")
+
+    # 2. Target fails containment and fallback _common.py is a symlink
+    orig_resolve = Path.resolve
+
+    def mock_resolve(self: Path, strict: bool = False) -> Path:
+        if self.name == "outside.py":
+            return tmp_path / "other_dir" / "outside.py"
+        return orig_resolve(self, strict=strict)
+
+    def mock_fallback_symlink(self: Path) -> bool:
+        if self.name == "_common.py":
+            return True
+        return orig_is_symlink(self)
+
+    monkeypatch.setattr(Path, "resolve", mock_resolve)
+    monkeypatch.setattr(Path, "is_symlink", mock_fallback_symlink)
+    with pytest.raises(ValueError, match="Shared module fallback path is an existing symlink"):
+        resolve_shared_module_file(f1, f2, repo, shared_module_name="outside.py")
+
+    # 3. Target fails containment and fallback also resolves outside common package directory
+    def mock_resolve_all_outside(self: Path, strict: bool = False) -> Path:
+        return tmp_path / "other_dir" / self.name
+
+    monkeypatch.setattr(Path, "resolve", mock_resolve_all_outside)
+    monkeypatch.setattr(Path, "is_symlink", lambda self: False)
+    with pytest.raises(ValueError, match="Shared module path resolves outside common package directory"):
+        resolve_shared_module_file(f1, f2, repo, shared_module_name="outside.py")
+
+
+def test_derive_shared_module_import_relative_and_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies prefer_relative behavior within subpackages and graceful fallback."""
+    root = tmp_path / "repo"
+    pkg = root / "mypkg"
+    sub1 = pkg / "sub1"
+    sub2 = pkg / "sub2"
+    sub1.mkdir(parents=True)
+    sub2.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (sub1 / "__init__.py").write_text("", encoding="utf-8")
+    (sub2 / "__init__.py").write_text("", encoding="utf-8")
+
+    f1 = sub1 / "caller.py"
+    shared_same = sub1 / "_common.py"
+    shared_sibling = sub2 / "_common.py"
+    shared_parent = pkg / "_common.py"
+    f1.write_text("", encoding="utf-8")
+    shared_same.write_text("", encoding="utf-8")
+    shared_sibling.write_text("", encoding="utf-8")
+    shared_parent.write_text("", encoding="utf-8")
+
+    # Same directory relative import
+    imp_same = derive_shared_module_import(f1, shared_same, root, prefer_relative=True)
+    assert imp_same == "._common"
+
+    # Parent directory relative import
+    imp_parent = derive_shared_module_import(f1, shared_parent, root, prefer_relative=True)
+    assert imp_parent == ".._common"
+
+    # Sibling directory relative import
+    imp_sibling = derive_shared_module_import(f1, shared_sibling, root, prefer_relative=True)
+    assert imp_sibling == "..sub2._common"
+
+    # Cross-drive / relpath ValueError fallback to absolute
+    import os  # pylint: disable=import-outside-toplevel
+    def mock_relpath(path: str, start: str = ".") -> str:
+        raise ValueError("Cannot compute relative path across drives")
+
+    monkeypatch.setattr(os.path, "relpath", mock_relpath)
+    imp_fallback = derive_shared_module_import(f1, shared_same, root, prefer_relative=True)
+    assert imp_fallback == "mypkg.sub1._common"

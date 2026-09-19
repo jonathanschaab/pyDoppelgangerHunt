@@ -3985,3 +3985,59 @@ def test_clones_with_matching_local_imports_hoisted_to_shared_module(tmp_path: P
     assert "def _shared_compute_1_compute_2(x: int) -> int:" in patch
 
 
+def test_extract_helper_symbols_scope_resolution() -> None:
+    """Verifies that _extract_helper_symbols accurately identifies free, defined, and local names."""
+    from pydoppelgangerhunt.fixer.patch import _extract_helper_symbols  # pylint: disable=import-outside-toplevel
+
+    code = """
+def my_helper(param1: ExternalType, default_arg=ExternalDefault) -> ReturnType:
+    import local_mod
+    from local_pkg import local_func
+    with external_ctx() as (ctx_a, ctx_b):
+        pass
+    try:
+        risky_op()
+    except ExternalError as err:
+        handle_err(err)
+    class LocalClass(ExternalBase):
+        def method(self):
+            return self.attr
+    match external_val:
+        case [head, *tail]:
+            process(head)
+    walrus_res = (walrus_bound := calc())
+    items = [comp_item for comp_item in external_seq]
+    return local_func(local_mod.run(ctx_a, LocalClass(), walrus_res, items))
+"""
+    tree = ast.parse(code)
+    free, defined, local_imps = _extract_helper_symbols(tree)
+    # Free names should include external dependencies
+    assert "ExternalType" in free
+    assert "ExternalDefault" in free
+    assert "ReturnType" in free
+    assert "external_ctx" in free
+    assert "risky_op" in free
+    assert "ExternalError" in free
+    assert "handle_err" in free
+    assert "ExternalBase" in free
+    assert "external_val" in free
+    assert "process" in free
+    assert "calc" in free
+    assert "external_seq" in free
+
+    # Locally bound names should NOT be in free names
+    assert "param1" not in free
+    assert "default_arg" not in free
+    assert "ctx_a" not in free
+    assert "ctx_b" not in free
+    assert "err" not in free
+    assert "LocalClass" not in free
+    assert "head" not in free
+    assert "tail" not in free
+    assert "walrus_bound" not in free
+    assert "comp_item" not in free
+
+    # Local imports
+    assert "local_mod" in local_imps
+    assert "local_func" in local_imps
+    assert "my_helper" in defined
