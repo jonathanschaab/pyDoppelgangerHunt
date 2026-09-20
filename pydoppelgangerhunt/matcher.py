@@ -15,7 +15,12 @@ from pydoppelgangerhunt.config import (
     normalize_path_string,
     paths_match_boundary,
 )
-from pydoppelgangerhunt.baseline import _safe_index_frequency, _safe_min_corpus, _safe_total_units
+from pydoppelgangerhunt.baseline import (
+    _safe_bool,
+    _safe_index_frequency,
+    _safe_min_corpus,
+    _safe_total_units,
+)
 from pydoppelgangerhunt.parser import harvest_file_units
 
 DEFAULT_STOP_SHINGLES: Set[Tuple[str, ...]] = {
@@ -617,7 +622,9 @@ def _is_calibration_mode_compatible(
     call_sequences: bool,
 ) -> bool:
     """Validates that corpus calibration was generated with compatible representation features."""
-    return bool(calib.get("bag_of_tokens", False)) == bool(bag_of_tokens) and bool(
+    if not isinstance(calib, dict):
+        return False
+    return _safe_bool(calib.get("bag_of_tokens", False)) == bool(bag_of_tokens) and _safe_bool(
         calib.get("call_sequences", False)
     ) == bool(call_sequences)
 

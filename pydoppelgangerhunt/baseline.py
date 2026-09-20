@@ -49,15 +49,36 @@ def _safe_min_corpus(raw_min_corpus: Any, filter_stop_shingles: bool = False) ->
     return 4 if filter_stop_shingles else 30
 
 
+def _safe_bool(val: Any) -> bool:
+    """Safely coerces arbitrary input to bool, handling common string encodings and rejecting malformed types."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val != 0)
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "1", "yes")
+    return False
+
+
 def _attach_calibration_flags(
     target: Dict[str, Any],
     source: Dict[str, Any],
 ) -> None:
     """Attaches feature mode flags and bounds from source dictionary to target calibration dict."""
+    if not isinstance(source, dict) or not isinstance(target, dict):
+        return
     for flag in ("bag_of_tokens", "call_sequences", "filter_stop_shingles"):
-        target[flag] = bool(source.get(flag, False))
+        target[flag] = _safe_bool(source.get(flag, False))
     if "min_corpus_size" in source:
-        target["min_corpus_size"] = source.get("min_corpus_size")
+        raw_mcs = source.get("min_corpus_size")
+        if raw_mcs is None:
+            target["min_corpus_size"] = None
+        else:
+            try:
+                val = int(raw_mcs)
+                target["min_corpus_size"] = val if val >= 0 else None
+            except (ValueError, TypeError, OverflowError):
+                target["min_corpus_size"] = None
 
 
 def _serialize_shingle_key(sh: Any) -> str:

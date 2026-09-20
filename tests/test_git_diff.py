@@ -863,5 +863,29 @@ def test_parse_git_diff_hunks_preserves_literal_quotes_in_filename() -> None:
     assert any('"pkg.py"' in k or '"pkg.py' in k for k in hunks)
 
 
+def test_parse_git_diff_hunks_quoted_paths_with_timestamps_and_escapes() -> None:
+    """Verifies that parse_git_diff_hunks strips trailing timestamps outside quoted filenames without breaking path content."""
+    from pydoppelgangerhunt.git_diff import parse_git_diff_hunks  # pylint: disable=import-outside-toplevel
 
+    diff_timestamp = (
+        'diff --git "a/path with space.py" "b/path with space.py"\n'
+        '--- "a/path with space.py"\t2026-09-20 12:00:00.000000000 +0000\n'
+        '+++ "b/path with space.py"\t2026-09-20 12:00:00.000000000 +0000\n'
+        "@@ -5,2 +5,2 @@\n"
+        "+# change\n"
+    )
+    hunks = parse_git_diff_hunks(diff_timestamp)
+    assert any("path with space.py" in k for k in hunks)
+    assert not any("2026-09-20" in k for k in hunks)
 
+    # Unquoted with timestamp
+    diff_unquoted = (
+        "diff --git a/simple.py b/simple.py\n"
+        "--- a/simple.py\t2026-09-20 12:00:00.000000000 +0000\n"
+        "+++ b/simple.py\t2026-09-20 12:00:00.000000000 +0000\n"
+        "@@ -1,1 +1,1 @@\n"
+        "+# change\n"
+    )
+    hunks_unquoted = parse_git_diff_hunks(diff_unquoted)
+    assert any("simple.py" in k for k in hunks_unquoted)
+    assert not any("2026-09-20" in k for k in hunks_unquoted)

@@ -93,7 +93,11 @@ def parse_git_diff_hunks(diff_text: str) -> Dict[str, List[Tuple[int, int]]]:
             current_file = None
         elif line.startswith("+++ "):
             rest = line[4:].strip()
-            if "\t" in rest:
+            if rest.startswith('"'):
+                closing_idx = rest.rfind('"')
+                if 0 < closing_idx < len(rest) - 1:
+                    rest = rest[: closing_idx + 1]
+            elif "\t" in rest:
                 rest = rest.split("\t", 1)[0].strip()
             rest = _decode_git_cstyle_path(rest)
             if rest in ("/dev/null", ""):

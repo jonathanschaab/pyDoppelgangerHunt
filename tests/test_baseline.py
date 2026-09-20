@@ -2715,11 +2715,99 @@ def test_corpus_calibration_feature_mode_validation_and_rejection(tmp_path: Path
     assert len(clones) >= 1
 
 
+def test_malformed_crafted_calibration_metadata(tmp_path: Path) -> None:
+    """Verifies that non-boolean and crafted strings in calibration metadata are safely coerced and sanitized."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        _attach_calibration_flags,
+        _safe_bool,
+        load_baseline,
+        record_baseline,
+    )
+    from pydoppelgangerhunt.matcher import _is_calibration_mode_compatible  # pylint: disable=import-outside-toplevel
+
+    # 1. _safe_bool coercion checks
+    assert _safe_bool(True) is True
+    assert _safe_bool(False) is False
+    assert _safe_bool(1) is True
+    assert _safe_bool(0) is False
+    assert _safe_bool("true") is True
+    assert _safe_bool("True") is True
+    assert _safe_bool("1") is True
+    assert _safe_bool("yes") is True
+    assert _safe_bool("false") is False
+    assert _safe_bool("False") is False
+    assert _safe_bool("0") is False
+    assert _safe_bool("no") is False
+    assert _safe_bool(["invalid"]) is False
+    assert _safe_bool({"key": "val"}) is False
+    assert _safe_bool(None) is False
+
+    # 2. _attach_calibration_flags with malformed types
+    target_dict: Dict[str, Any] = {}
+    _attach_calibration_flags(target_dict, "not_a_dict")  # type: ignore[arg-type]
+    assert not target_dict
+
+    crafted_source = {
+        "bag_of_tokens": "false",
+        "call_sequences": "0",
+        "filter_stop_shingles": ["invalid"],
+        "min_corpus_size": "crafted_string",
+    }
+    _attach_calibration_flags(target_dict, crafted_source)
+    assert target_dict["bag_of_tokens"] is False
+    assert target_dict["call_sequences"] is False
+    assert target_dict["filter_stop_shingles"] is False
+    assert target_dict["min_corpus_size"] is None
+
+    # Negative min_corpus_size sanitized to None
+    _attach_calibration_flags(target_dict, {"min_corpus_size": -42})
+    assert target_dict["min_corpus_size"] is None
+
+    # 3. Compatibility checking on malformed calib objects
+    assert _is_calibration_mode_compatible("not_a_dict", bag_of_tokens=False, call_sequences=False) is False  # type: ignore[arg-type]
+    assert _is_calibration_mode_compatible({"bag_of_tokens": "false"}, bag_of_tokens=False, call_sequences=False) is True
+    assert _is_calibration_mode_compatible({"bag_of_tokens": "true"}, bag_of_tokens=True, call_sequences=False) is True
+
+    # 4. JSON loading with spoofed fields
+    base_file = tmp_path / "spoofed_baseline.json"
+    spoofed_json = {
+        "version": "1.4.0",
+        "target": "repo",
+        "threshold": 0.85,
+        "clone_count": 0,
+        "fingerprints": [],
+        "corpus_calibration": {
+            "total_units": 50,
+            "max_index_frequency": 0.25,
+            "bag_of_tokens": "false",
+            "call_sequences": ["crafted"],
+            "min_corpus_size": "invalid_size",
+        },
+    }
+    base_file.write_text(json.dumps(spoofed_json), encoding="utf-8")
+    loaded = load_baseline(str(base_file))
+    assert loaded.corpus_calibration is not None
+    assert loaded.corpus_calibration["bag_of_tokens"] is False
+    assert loaded.corpus_calibration["call_sequences"] is False
+    assert loaded.corpus_calibration["min_corpus_size"] is None
 
 
+def test_subnormal_and_extreme_floats_index_frequency() -> None:
+    """Verifies that subnormal and extreme float frequencies are handled safely without exceptions."""
+    from pydoppelgangerhunt.baseline import _safe_index_frequency  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.matcher import _compute_max_posting_len  # pylint: disable=import-outside-toplevel
 
+    # Subnormal and very small positive floats
+    assert _safe_index_frequency(1e-300) == 1e-300
+    assert _safe_index_frequency(1e-320) == 1e-320
 
+    # Underflow to 0.0 or negative/inf/nan rejected
+    assert _safe_index_frequency(0.0) is None
+    assert _safe_index_frequency(-1e-5) is None
+    assert _safe_index_frequency(1.00001) is None
+    assert _safe_index_frequency(float("nan")) is None
+    assert _safe_index_frequency(float("inf")) is None
 
-
-
-
+    # Extremely small positive float in posting calculation floors to max(2, ...)
+    posting_len = _compute_max_posting_len(500, 1e-300, 10)
+    assert posting_len == 2
