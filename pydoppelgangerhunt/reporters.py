@@ -98,13 +98,12 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
         if not file_path.is_file() or file_path.is_symlink():
             return placeholder
         for parent in file_path.parents:
-            try:
-                if parent == target_root or parent.resolve() == target_root:
-                    break
-            except (OSError, RuntimeError, ValueError):
-                return placeholder
             if parent.is_symlink():
                 return placeholder
+            if parent == target_root:
+                break
+
+
         resolved_file = file_path.resolve()
         if resolved_file.is_symlink() or not resolved_file.is_file():
             return placeholder

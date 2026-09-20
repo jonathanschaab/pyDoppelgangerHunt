@@ -676,3 +676,18 @@ def test_extract_unit_source_code_symlink_parents_and_root_containment(
     res_clean = extract_unit_source_code(u_clean, repo_root=str(repo))
     assert res_clean == ["def foo():\n", "    pass\n"]
 
+    # 4. Absolute path through a symlink alias resolving to root is rejected
+    repo_alias = tmp_path / "repo_alias"
+    file_via_alias = repo_alias / "sym_parent" / "target.py"
+
+    def mock_alias_symlink(self: Path) -> bool:
+        if self == repo_alias or self.resolve() == repo_alias.resolve():
+            return True
+        return orig_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", mock_alias_symlink)
+    u_alias = {"file": str(file_via_alias), "start": 1, "end": 2, "name": "foo"}
+    res_alias = extract_unit_source_code(u_alias, repo_root=str(repo))
+    assert res_alias == ["# Source for foo lines 1-2\n"]
+
+

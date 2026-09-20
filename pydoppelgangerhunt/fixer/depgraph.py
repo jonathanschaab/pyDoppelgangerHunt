@@ -59,9 +59,10 @@ def _has_symlink_component(path: Path, root: Optional[Path] = None) -> bool:
             if check_path.is_symlink():
                 return True
             for parent in check_path.parents:
-                if parent != resolved_root and resolved_root in parent.parents:
-                    if parent.is_symlink():
-                        return True
+                if parent.is_symlink():
+                    return True
+                if parent == resolved_root:
+                    break
         return False
     except (OSError, RuntimeError, ValueError):
         return True

@@ -1466,3 +1466,39 @@ def test_build_module_graph_subdirectory_and_project_boundary(tmp_path: Path) ->
 
     cycle_backward = graph.check_cycle_if_added("pkg.service", "script")
     assert cycle_backward == ["pkg.service", "script", "pkg.service"]
+
+
+def test_has_symlink_component_rejects_symlink_root_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that an absolute path whose parent is a symlink alias to root is rejected."""
+    from pydoppelgangerhunt.fixer.depgraph import (  # pylint: disable=import-outside-toplevel
+        _has_symlink_component,
+        _is_safe_repo_python_path,
+    )
+
+    repo = tmp_path / "target_repo"
+    repo.mkdir()
+    real_file = repo / "mod.py"
+    real_file.write_text("x = 1\n", encoding="utf-8")
+
+    alias = tmp_path / "repo_alias"
+    file_via_alias = alias / "mod.py"
+
+    orig_is_symlink = Path.is_symlink
+
+    def mock_alias_symlink(self: Path) -> bool:
+        if self == alias or self.resolve() == alias.resolve():
+            return True
+        return orig_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", mock_alias_symlink)
+
+    # _has_symlink_component must detect that alias is a symlink
+    assert _has_symlink_component(file_via_alias, root=repo)
+
+    # _is_safe_repo_python_path must reject the path
+    res_path, is_rejected = _is_safe_repo_python_path(file_via_alias, root=repo)
+    assert is_rejected
+    assert res_path is None
+
