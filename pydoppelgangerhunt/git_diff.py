@@ -88,6 +88,30 @@ def get_git_modified_line_ranges(
     return parse_git_diff_hunks(diff_output)
 
 
+def get_git_modified_files(
+    since_ref: Optional[str] = None,
+    repo_root: Optional[str] = None,
+    cwd: Optional[str] = None,
+) -> List[str]:
+    """Extracts normalized file paths of modified files from git diff."""
+    args = ["diff", "--name-only"]
+    if since_ref:
+        args.append(since_ref)
+    effective_cwd = repo_root or cwd
+    diff_output = _run_git_command(args, cwd=effective_cwd)
+    if not diff_output:
+        return []
+    modified_files: List[str] = []
+    for line in diff_output.splitlines():
+        trimmed = line.strip()
+        if trimmed:
+            norm = normalize_path_string(trimmed, strip_anchor=False)
+            if norm and norm not in modified_files:
+                modified_files.append(norm)
+    return modified_files
+
+
+
 def compute_unit_diff_overlap(
     unit: Dict[str, Any],
     modified_ranges: Dict[str, List[Tuple[int, int]]],

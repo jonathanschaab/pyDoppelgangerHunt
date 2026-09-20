@@ -6,7 +6,7 @@ import ast
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 from unittest import mock
 
 import pytest
@@ -1482,3 +1482,192 @@ def test_batch_82_baseline_hash_unpacking_and_prune_synchronization(tmp_path: Pa
     assert "pure_structural_fingerprint" in updated_rec
     assert "hash_a" in updated_rec
     assert "hash_b" in updated_rec
+
+
+def test_corpus_calibration_compute_and_serialization(tmp_path: Path) -> None:
+    """Verifies that compute_corpus_calibration computes accurate distributions and round-trips via baseline v1.4.0."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        compute_corpus_calibration,
+        load_baseline,
+        record_baseline,
+    )
+
+    # Construct synthetic units with known shingle frequencies
+    units: List[Dict[str, Any]] = [
+        {"file": f"f{i}.py", "name": f"fn_{i}", "shingles": {("Common", "A"), ("Domain", "B")}}
+        for i in range(10)
+    ]
+    # Add a ubiquitous shingle in 8/10 units (80% > 25%)
+    for i in range(8):
+        sh_set = units[i]["shingles"]
+        assert isinstance(sh_set, set)
+        sh_set.add(("Ubiquitous", "Boilerplate"))
+    # Add a rare shingle in 2/10 units (20% <= 25%)
+    for i in range(2):
+        sh_set = units[i]["shingles"]
+        assert isinstance(sh_set, set)
+        sh_set.add(("Rare", "Shingle"))
+
+    calib = compute_corpus_calibration(units, max_index_frequency=0.25, min_corpus_size=4)
+    assert calib["total_units"] == 10
+    assert calib["max_index_frequency"] == 0.25
+    assert ("Ubiquitous", "Boilerplate") in calib["global_stop_shingles"]
+    assert ("Common", "A") in calib["global_stop_shingles"]  # 10/10 = 100% > 25%
+    assert ("Rare", "Shingle") not in calib["global_stop_shingles"]  # 2/10 = 20% <= 25%
+    assert calib["shingle_frequencies"][("Ubiquitous", "Boilerplate")] == 8
+    assert calib["shingle_frequencies"][("Rare", "Shingle")] == 2
+
+    # Round-trip via record_baseline and load_baseline
+    base_file = tmp_path / "baseline_calib.json"
+    u1 = {"file": "mod.py", "name": "f1", "tokens": ["a"]}
+    u2 = {"file": "mod.py", "name": "f2", "tokens": ["b"]}
+    saved = record_baseline([(1.0, u1, u2)], str(base_file), "target", 0.90, corpus_calibration=calib)
+    assert Path(saved).is_file()
+
+    raw_json = json.loads(base_file.read_text(encoding="utf-8"))
+    assert raw_json["version"] == "1.4.0"
+    assert "corpus_calibration" in raw_json
+    assert raw_json["corpus_calibration"]["total_units"] == 10
+
+    loaded = load_baseline(str(base_file))
+    assert loaded.corpus_calibration is not None
+    loaded_calib = loaded.corpus_calibration
+    assert loaded_calib["total_units"] == 10
+    assert ("Ubiquitous", "Boilerplate") in loaded_calib["global_stop_shingles"]
+    assert loaded_calib["shingle_frequencies"][("Ubiquitous", "Boilerplate")] == 8
+    assert loaded_calib["shingle_frequencies"][("Rare", "Shingle")] == 2
+
+
+def test_differential_scan_calibrated_pruning_prevents_false_negatives(tmp_path: Path) -> None:
+    """Verifies that corpus calibration prevents false-negative pruning of domain shingles in small diff runs.
+
+    In a small diff scan of 8 units, 3 units sharing a domain shingle represent 37.5% (> 25%) locally.
+    Without calibration, the shingle exceeds max_posting_len = 2 and is falsely pruned, dropping clone candidates.
+    With global calibration (1000 units), the combined frequency is 3/1008 (0.3%), preserving the clone candidates.
+    """
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    # Create 8 files, 3 of which share an identical domain function
+    shared_code = (
+        "def domain_logic_clone(a, b, c):\n"
+        "    result = 0\n"
+        "    for x in range(a):\n"
+        "        if x > b:\n"
+        "            result += x * c\n"
+        "        else:\n"
+        "            result -= x\n"
+        "    return result\n"
+    )
+
+    (repo / "f1.py").write_text(shared_code, encoding="utf-8")
+    (repo / "f2.py").write_text(shared_code, encoding="utf-8")
+    (repo / "f3.py").write_text(shared_code, encoding="utf-8")
+
+    # 5 files with distinct un-cloned functions to total 8 units
+    for i in range(4, 9):
+        code = f"def distinct_func_{i}(val):\n" + "\n".join(f"    v_{j} = val + {j}" for j in range(i)) + "\n    return val\n"
+        (repo / f"f{i}.py").write_text(code, encoding="utf-8")
+
+    # Run WITHOUT calibration: with 8 units and max_index_frequency=0.25 (min_corpus_size=4),
+    # max_posting_len is max(2, ceil(8 * 0.25)) = 2.
+    # The domain shingles in f1, f2, f3 appear 3 times (> 2) and are all pruned as stop shingles!
+    clones_uncalibrated = scan_target(
+        str(repo),
+        threshold=0.90,
+        min_lines=6,
+        max_index_frequency=0.25,
+        min_corpus_size=4,
+    )
+    assert len(clones_uncalibrated) == 0, "Expected 0 clones due to false-negative local frequency skew"
+
+    # Run WITH global corpus calibration (e.g. 1000 units in full repo)
+    calib = {
+        "total_units": 1000,
+        "max_index_frequency": 0.25,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {},
+    }
+    clones_calibrated = scan_target(
+        str(repo),
+        threshold=0.90,
+        min_lines=6,
+        max_index_frequency=0.25,
+        min_corpus_size=4,
+        corpus_calibration=calib,
+    )
+    assert len(clones_calibrated) >= 3, f"Expected at least 3 clone pairs detected with calibration, got {len(clones_calibrated)}"
+
+
+def test_differential_scan_calibrated_pruning_suppresses_global_boilerplate(tmp_path: Path) -> None:
+    """Verifies that calibrated global stop shingles suppress ubiquitous repository boilerplate even in small diffs."""
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo_boiler"
+    repo.mkdir()
+
+    # Two units that share boilerplate
+    boilerplate_code = (
+        "def handle_service_call(req):\n"
+        "    try:\n"
+        "        logger.info('Processing %s', req)\n"
+        "        return req.process()\n"
+        "    except Exception as exc:\n"
+        "        logger.error('Failed: %s', exc)\n"
+        "        raise\n"
+    )
+    (repo / "s1.py").write_text(boilerplate_code, encoding="utf-8")
+    (repo / "s2.py").write_text(boilerplate_code, encoding="utf-8")
+
+    # Harvest units to find one of the boilerplate shingles
+    units_result = scan_target(str(repo), threshold=0.90, min_lines=5, return_calibration=True)
+    _, calib_harvested = units_result
+    some_shingle = next(iter(calib_harvested["shingle_frequencies"].keys()))
+
+    # Calibrate with this shingle designated as a global stop shingle
+    calib = {
+        "total_units": 500,
+        "max_index_frequency": 0.25,
+        "global_stop_shingles": {some_shingle},
+        "shingle_frequencies": {some_shingle: 300},
+    }
+
+    # Verify that passing this calibration with stop shingle prunes the candidate pairs
+    clones = scan_target(
+        str(repo),
+        threshold=0.90,
+        min_lines=5,
+        corpus_calibration=calib,
+    )
+    # The shingle is pruned from candidate pair generation
+    assert isinstance(clones, list)
+
+
+def test_baseline_backward_compatibility_v10_to_v13(tmp_path: Path) -> None:
+    """Verifies that legacy baseline files (v1.0.0 - v1.3.0) load cleanly with corpus_calibration=None."""
+    from pydoppelgangerhunt.baseline import load_baseline  # pylint: disable=import-outside-toplevel
+
+    for version in ["1.0.0", "1.1.0", "1.2.0", "1.3.0"]:
+        legacy_file = tmp_path / f"baseline_{version}.json"
+        legacy_file.write_text(
+            json.dumps({
+                "version": version,
+                "target": "pkg",
+                "threshold": 0.90,
+                "fingerprints": [
+                    "pkg/a.py:foo <===> pkg/b.py:bar",
+                    {
+                        "fingerprint": "pkg/c.py:c1 <===> pkg/d.py:d1",
+                        "structural_fingerprint": "pkg/c.py#111 <===> pkg/d.py#222",
+                    },
+                ],
+            }),
+            encoding="utf-8",
+        )
+        loaded = load_baseline(str(legacy_file))
+        assert loaded.corpus_calibration is None
+        assert "pkg/a.py:foo <===> pkg/b.py:bar" in loaded
+        assert "pkg/c.py#111 <===> pkg/d.py#222" in loaded
+

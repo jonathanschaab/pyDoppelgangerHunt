@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, Optional
+import pytest
+
 import pydoppelgangerhunt
 
 from pydoppelgangerhunt import (
@@ -1402,3 +1404,65 @@ def test_parse_toml_array_value_escaped_quotes_and_commas() -> None:
     raw = '["hello \\"world\\", here", "item2", \'another \\\'escaped\\\', comma\']'
     parsed = _parse_toml_array_value(raw)
     assert parsed == ['hello "world", here', 'item2', "another 'escaped', comma"]
+
+
+def test_cli_record_baseline_and_differential_scan_calibration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that main() records baseline with corpus_calibration and passes it during --baseline runs."""
+    from pydoppelgangerhunt.baseline import load_baseline  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "cli_repo"
+    repo.mkdir()
+
+    # Create dummy python files
+    shared = (
+        "def compute_total(a, b, c):\n"
+        "    res = 0\n"
+        "    for val in [a, b, c]:\n"
+        "        if val > 0:\n"
+        "            res += val * 2\n"
+        "        else:\n"
+        "            res -= val\n"
+        "    return res\n"
+    )
+    (repo / "m1.py").write_text(shared, encoding="utf-8")
+    (repo / "m2.py").write_text(shared, encoding="utf-8")
+
+    baseline_json = tmp_path / "baseline.json"
+
+    # Step 1: Record baseline via CLI
+    test_args_record = [
+        "pydoppelgangerhunt",
+        str(repo),
+        "--record-baseline",
+        str(baseline_json),
+        "--threshold",
+        "0.90",
+        "--min-lines",
+        "6",
+    ]
+    monkeypatch.setattr("sys.argv", test_args_record)
+    exit_code_record = main()
+    assert exit_code_record == 0
+    assert baseline_json.is_file()
+
+    # Verify baseline contents
+    loaded = load_baseline(str(baseline_json))
+    assert loaded.corpus_calibration is not None
+    assert loaded.corpus_calibration["total_units"] >= 2
+
+    # Step 2: Run scan with --baseline to ensure grandfathered suppression
+    test_args_scan = [
+        "pydoppelgangerhunt",
+        str(repo),
+        "--baseline",
+        str(baseline_json),
+        "--threshold",
+        "0.90",
+        "--min-lines",
+        "6",
+    ]
+    monkeypatch.setattr("sys.argv", test_args_scan)
+    exit_code_scan = main()
+    assert exit_code_scan == 0
+

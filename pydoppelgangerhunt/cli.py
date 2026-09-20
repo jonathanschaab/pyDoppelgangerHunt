@@ -9,6 +9,7 @@ import sys
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.baseline import (
+    BaselineFingerprints,
     filter_clones_by_baseline,
     load_baseline,
     prune_baseline,
@@ -349,6 +350,7 @@ def _apply_baseline_and_diff_filters(
     args: argparse.Namespace,
     tool_cfg: Dict[str, Any],
     target_repo_root: str,
+    preloaded_baseline: Optional[BaselineFingerprints] = None,
 ) -> Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Optional[int]]:
     """Applies baseline pruning, baseline suppression, and git diff line filtering.
 
@@ -386,7 +388,10 @@ def _apply_baseline_and_diff_filters(
                 )
 
     if baseline_path:
-        base_fps = load_baseline(baseline_path)
+        if preloaded_baseline is not None and not args.prune_baseline:
+            base_fps = preloaded_baseline
+        else:
+            base_fps = load_baseline(baseline_path)
         clones, suppressed_count = filter_clones_by_baseline(clones, base_fps)
         if args.format == "text":
             print(f"[BASELINE] Suppressed {suppressed_count} grandfathered clone(s). {len(clones)} un-grandfathered clone(s) remaining.")
@@ -643,7 +648,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     sort_by = "priority" if args.priority else args.sort_by
 
-    clones = scan_target(
+    baseline_path = args.baseline or tool_cfg.get("baseline")
+    preloaded_baseline: Optional[BaselineFingerprints] = None
+    calib_dict: Optional[Dict[str, Any]] = None
+    if baseline_path and not args.record_baseline and os.path.exists(baseline_path):
+        preloaded_baseline = load_baseline(baseline_path)
+        calib_dict = getattr(preloaded_baseline, "corpus_calibration", None)
+
+    scan_res = scan_target(
         target,
         repo_root=target_repo_root,
         min_lines=min_lines,
@@ -684,15 +696,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_index_frequency=max_index_frequency,
         filter_stop_shingles=stop_shingles_enabled,
         min_corpus_size=min_corpus_size,
+        corpus_calibration=calib_dict,
+        return_calibration=bool(args.record_baseline),
     )
 
+    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]]
+    recorded_calib: Optional[Dict[str, Any]] = None
+    if isinstance(scan_res, tuple) and len(scan_res) == 2 and isinstance(scan_res[1], dict):
+        clones, recorded_calib = scan_res
+    elif isinstance(scan_res, list):
+        clones = scan_res
+    else:
+        clones = []
+
     if args.record_baseline:
-        bp = record_baseline(clones, args.record_baseline, target, threshold)
+        bp = record_baseline(
+            clones,
+            args.record_baseline,
+            target,
+            threshold,
+            corpus_calibration=recorded_calib,
+        )
         print(f"[OK] Recorded {len(clones)} clone baseline pair(s) to {bp}")
         return 0
 
     clones, early_exit = _apply_baseline_and_diff_filters(
-        clones, args, tool_cfg, target_repo_root=target_repo_root
+        clones,
+        args,
+        tool_cfg,
+        target_repo_root=target_repo_root,
+        preloaded_baseline=preloaded_baseline,
     )
     if early_exit is not None:
         return early_exit

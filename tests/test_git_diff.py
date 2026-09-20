@@ -672,3 +672,26 @@ def test_batch_65_git_sha256_diff_prefixes_and_quoted_toml_arrays(
     cov_data = {"mod.py": {10, 11, 12}}  # 3 of 5 lines covered
     ratio = compute_unit_coverage(u_cov, cov_data)
     assert ratio == 0.6
+
+
+def test_get_git_modified_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test extracting normalized modified files list from git diff --name-only."""
+    from typing import Sequence  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.git_diff import get_git_modified_files  # pylint: disable=import-outside-toplevel
+
+    captured_args: List[Sequence[str]] = []
+
+    def mock_run_diff(args: Sequence[str], cwd: Optional[str] = None) -> Optional[str]:
+        captured_args.append(args)
+        return "pkg/mod1.py\npkg/sub/mod2.py\n\npkg/mod1.py\n"
+
+    monkeypatch.setattr("pydoppelgangerhunt.git_diff._run_git_command", mock_run_diff)
+    files = get_git_modified_files(since_ref="main", repo_root="/repo")
+    assert "--name-only" in captured_args[0]
+    assert "main" in captured_args[0]
+    assert files == ["pkg/mod1.py", "pkg/sub/mod2.py"]
+
+    # When git returns None
+    monkeypatch.setattr("pydoppelgangerhunt.git_diff._run_git_command", lambda args, cwd=None: None)
+    assert get_git_modified_files() == []
+

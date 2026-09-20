@@ -6,8 +6,9 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
+import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.config import (
     canonical_path_key,
@@ -16,6 +17,74 @@ from pydoppelgangerhunt.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _serialize_shingle_key(sh: Any) -> str:
+    """Serializes a shingle key (tuple, list, or scalar) into a string representation for JSON."""
+    if isinstance(sh, (tuple, list)):
+        return json.dumps(list(sh))
+    return str(sh)
+
+
+def _deserialize_shingle_key(key: str) -> Any:
+    """Deserializes a JSON-compatible string key back into a shingle tuple or scalar."""
+    if key.startswith("[") and key.endswith("]"):
+        try:
+            parsed = json.loads(key)
+            if isinstance(parsed, list):
+                return tuple(parsed)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return key
+
+
+def compute_corpus_calibration(
+    units: Sequence[Dict[str, Any]],
+    max_index_frequency: float = 0.25,
+    min_corpus_size: Optional[int] = None,
+    filter_stop_shingles: bool = False,
+    stop_shingles: Optional[Set[Any]] = None,
+) -> Dict[str, Any]:
+    """Computes global shingle document frequencies and calibrated stop-shingles for a repository corpus."""
+    total_units = len(units)
+    shingle_frequencies: Dict[Any, int] = {}
+    for u in units:
+        if "shingles" in u and u["shingles"]:
+            keys = set(u["shingles"])
+        elif "vector" in u and u["vector"]:
+            keys = set(u["vector"].keys())
+        elif "calls" in u and u["calls"]:
+            keys = set(u["calls"])
+        else:
+            keys = set()
+        for sh in keys:
+            shingle_frequencies[sh] = shingle_frequencies.get(sh, 0) + 1
+
+    effective_min_corpus = (
+        min_corpus_size
+        if min_corpus_size is not None
+        else (4 if filter_stop_shingles else 30)
+    )
+    global_stop_shingles: Set[Any] = set()
+    if filter_stop_shingles:
+        from pydoppelgangerhunt.matcher import DEFAULT_STOP_SHINGLES
+        global_stop_shingles.update(DEFAULT_STOP_SHINGLES)
+    if stop_shingles is not None:
+        global_stop_shingles.update(stop_shingles)
+
+    if max_index_frequency is not None and total_units >= effective_min_corpus:
+        max_posting_len = max(2, int(math.ceil(total_units * max_index_frequency)))
+        for sh, count in shingle_frequencies.items():
+            if count > max_posting_len:
+                global_stop_shingles.add(sh)
+
+    return {
+        "total_units": total_units,
+        "max_index_frequency": max_index_frequency,
+        "global_stop_shingles": global_stop_shingles,
+        "shingle_frequencies": shingle_frequencies,
+    }
+
 
 
 def compute_unit_structural_hash(unit: Dict[str, Any]) -> str:
@@ -90,10 +159,12 @@ def record_baseline(
     baseline_path: str,
     target: str,
     threshold: float,
+    *,
+    corpus_calibration: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Records detected clones into a JSON baseline file for grandfathering."""
     data: Dict[str, Any] = {
-        "version": "1.3.0",
+        "version": "1.4.0",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "target": target,
         "threshold": threshold,
@@ -117,6 +188,19 @@ def record_baseline(
             for sim, u1, u2 in clones
         ],
     }
+    if corpus_calibration is not None:
+        data["corpus_calibration"] = {
+            "total_units": int(corpus_calibration.get("total_units", 0)),
+            "max_index_frequency": float(corpus_calibration.get("max_index_frequency", 0.25)),
+            "global_stop_shingles": [
+                list(sh) if isinstance(sh, (tuple, list)) else sh
+                for sh in corpus_calibration.get("global_stop_shingles", [])
+            ],
+            "shingle_frequencies": {
+                _serialize_shingle_key(sh): int(cnt)
+                for sh, cnt in corpus_calibration.get("shingle_frequencies", {}).items()
+            },
+        }
     target_p = Path(baseline_path)
     target_p.parent.mkdir(parents=True, exist_ok=True)
     target_p.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -130,9 +214,11 @@ class BaselineFingerprints(set):  # type: ignore[type-arg]
         self,
         fps: Optional[Set[str]] = None,
         records: Optional[List[Dict[str, Any]]] = None,
+        corpus_calibration: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(fps or set())
         self.records: List[Dict[str, Any]] = records or []
+        self.corpus_calibration: Optional[Dict[str, Any]] = corpus_calibration
 
 
 def _parse_legacy_fingerprint_record(raw_fp: str) -> Dict[str, Any]:
@@ -215,9 +301,33 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
                 fps.add(pure_sfp)
 
             records.append(rec)
-        return BaselineFingerprints(fps, records=records)
+
+        raw_calib = data.get("corpus_calibration")
+        corpus_calibration: Optional[Dict[str, Any]] = None
+        if isinstance(raw_calib, dict):
+            raw_stops = raw_calib.get("global_stop_shingles", [])
+            decoded_stops = {
+                tuple(sh) if isinstance(sh, list) else sh
+                for sh in raw_stops
+            }
+            raw_freqs = raw_calib.get("shingle_frequencies", {})
+            decoded_freqs = {
+                _deserialize_shingle_key(k): int(v)
+                for k, v in raw_freqs.items()
+            }
+            corpus_calibration = {
+                "total_units": int(raw_calib.get("total_units", 0)),
+                "max_index_frequency": float(raw_calib.get("max_index_frequency", 0.25)),
+                "global_stop_shingles": decoded_stops,
+                "shingle_frequencies": decoded_freqs,
+            }
+
+        return BaselineFingerprints(
+            fps, records=records, corpus_calibration=corpus_calibration
+        )
     except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return BaselineFingerprints()
+
 
 
 def _record_matches_names(rec: Dict[str, Any], target_names: List[str]) -> bool:
@@ -552,7 +662,7 @@ def prune_baseline(
             else:
                 pruned_count += 1
 
-    data["version"] = "1.3.0"
+    data["version"] = "1.4.0"
     data["clone_count"] = len(retained)
     data["fingerprints"] = retained
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")

@@ -6,7 +6,7 @@ import concurrent.futures
 import math
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Set, Tuple, Union, overload
 
 from pydoppelgangerhunt.config import canonical_path_key, find_python_files
 from pydoppelgangerhunt.parser import harvest_file_units
@@ -497,6 +497,36 @@ def _worker_harvest_file(task_kwargs: Dict[str, Any]) -> List[Dict[str, Any]]:
     return harvest_file_units(**task_kwargs)
 
 
+@overload
+def scan_target(
+    target_dir: str,
+    *,
+    return_calibration: Literal[False] = False,
+    **kwargs: Any,
+) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]: ...
+
+
+@overload
+def scan_target(
+    target_dir: str,
+    *,
+    return_calibration: Literal[True],
+    **kwargs: Any,
+) -> Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Dict[str, Any]]: ...
+
+
+@overload
+def scan_target(
+    target_dir: str,
+    *,
+    return_calibration: bool = False,
+    **kwargs: Any,
+) -> Union[
+    List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
+    Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Dict[str, Any]],
+]: ...
+
+
 def scan_target(
     target_dir: str,
     *,
@@ -540,7 +570,10 @@ def scan_target(
     filter_stop_shingles: bool = False,
     stop_shingles: Optional[Set[Any]] = None,
     min_corpus_size: Optional[int] = None,
-) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]:
+    corpus_calibration: Optional[Dict[str, Any]] = None,
+    return_calibration: bool = False,
+    **kwargs: Any,
+) -> Union[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Dict[str, Any]]]:
     units: List[Dict[str, Any]] = []
     if repo_root is not None:
         effective_repo_root = Path(repo_root)
@@ -631,10 +664,16 @@ def scan_target(
         effective_stop_shingles.update(DEFAULT_STOP_SHINGLES)
     if stop_shingles is not None:
         effective_stop_shingles.update(stop_shingles)
+    if corpus_calibration is not None:
+        calib_stops = corpus_calibration.get("global_stop_shingles")
+        if calib_stops:
+            effective_stop_shingles.update(calib_stops)
 
     idf_weights: Dict[Any, float] = {}
     if tfidf and units:
         corpus_size = len(units)
+        if corpus_calibration is not None:
+            corpus_size += int(corpus_calibration.get("total_units", 0))
         df_counts: Dict[Any, int] = {}
         for u in units:
             keys = u.get("vector", {}).keys() if bag_of_tokens else u["shingles"]
@@ -642,8 +681,14 @@ def scan_target(
                 if effective_stop_shingles and k in effective_stop_shingles:
                     continue
                 df_counts[k] = df_counts.get(k, 0) + 1
+        calib_freqs = (
+            corpus_calibration.get("shingle_frequencies", {})
+            if corpus_calibration is not None
+            else {}
+        )
         for k, df in df_counts.items():
-            idf_weights[k] = math.log((1.0 + corpus_size) / (1.0 + df)) + 1.0
+            combined_df = df + int(calib_freqs.get(k, 0))
+            idf_weights[k] = math.log((1.0 + corpus_size) / (1.0 + combined_df)) + 1.0
 
     shingle_index: Dict[Any, List[int]] = {}
     for idx, u in enumerate(units):
@@ -658,24 +703,39 @@ def scan_target(
                 continue
             shingle_index.setdefault(sh, []).append(idx)
 
-    effective_min_corpus = (
-        min_corpus_size
-        if min_corpus_size is not None
-        else (4 if filter_stop_shingles else 30)
-    )
-
-    max_posting_len = (
-        max(2, int(math.ceil(len(units) * max_index_frequency)))
-        if (max_index_frequency is not None and len(units) >= effective_min_corpus)
-        else len(units) + 1
-    )
-
     candidate_pairs: Set[Tuple[int, int]] = set()
-    for u_indices in shingle_index.values():
-        if 1 < len(u_indices) <= max_posting_len:
+    if corpus_calibration is not None:
+        total_corpus_units = len(units) + int(corpus_calibration.get("total_units", 0))
+        calib_freqs_map = corpus_calibration.get("shingle_frequencies", {})
+        calib_max_freq = float(corpus_calibration.get("max_index_frequency", max_index_frequency))
+        for sh, u_indices in shingle_index.items():
+            if len(u_indices) <= 1:
+                continue
+            df_global = int(calib_freqs_map.get(sh, 0))
+            combined_df = df_global + len(u_indices)
+            if total_corpus_units > 0 and (combined_df / total_corpus_units) > calib_max_freq:
+                continue
             for i, idx1 in enumerate(u_indices):
                 for idx2 in u_indices[i + 1:]:
                     candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))
+    else:
+        effective_min_corpus = (
+            min_corpus_size
+            if min_corpus_size is not None
+            else (4 if filter_stop_shingles else 30)
+        )
+
+        max_posting_len = (
+            max(2, int(math.ceil(len(units) * max_index_frequency)))
+            if (max_index_frequency is not None and len(units) >= effective_min_corpus)
+            else len(units) + 1
+        )
+
+        for u_indices in shingle_index.values():
+            if 1 < len(u_indices) <= max_posting_len:
+                for i, idx1 in enumerate(u_indices):
+                    for idx2 in u_indices[i + 1:]:
+                        candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))
 
     raw_exemptions = exemptions if exemptions is not None else []
     normalized_exemptions: Set[Tuple[str, str]] = set()
@@ -807,6 +867,17 @@ def scan_target(
 
     if top_n is not None and top_n > 0:
         clones = clones[:top_n]
+
+    if return_calibration:
+        from pydoppelgangerhunt.baseline import compute_corpus_calibration
+        calib_dict = compute_corpus_calibration(
+            units,
+            max_index_frequency=max_index_frequency,
+            min_corpus_size=min_corpus_size,
+            filter_stop_shingles=filter_stop_shingles,
+            stop_shingles=stop_shingles,
+        )
+        return clones, calib_dict
 
     return clones
 
