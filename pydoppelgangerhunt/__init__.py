@@ -60,6 +60,7 @@ from pydoppelgangerhunt.git_diff import (
     get_git_blame_info,
     get_git_modified_files,
     get_git_modified_line_ranges,
+    get_git_repo_root,
     is_unit_in_modified_ranges,
     parse_git_diff_hunks,
 )
@@ -149,6 +150,7 @@ __all__ = [
     "parse_git_diff_hunks",
     "get_git_modified_line_ranges",
     "get_git_modified_files",
+    "get_git_repo_root",
     "compute_unit_diff_overlap",
     "is_unit_in_modified_ranges",
     "filter_clones_by_git_diff",

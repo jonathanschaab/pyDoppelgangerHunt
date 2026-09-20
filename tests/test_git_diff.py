@@ -889,3 +889,89 @@ def test_parse_git_diff_hunks_quoted_paths_with_timestamps_and_escapes() -> None
     hunks_unquoted = parse_git_diff_hunks(diff_unquoted)
     assert any("simple.py" in k for k in hunks_unquoted)
     assert not any("2026-09-20" in k for k in hunks_unquoted)
+
+
+def test_get_git_repo_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies get_git_repo_root resolves normalized worktree top-level path and handles non-git fallbacks."""
+    from pydoppelgangerhunt.git_diff import get_git_repo_root  # pylint: disable=import-outside-toplevel
+
+    sub_dir = tmp_path / "src" / "pkg"
+    sub_dir.mkdir(parents=True)
+    expected_root = str(tmp_path).replace("\\", "/")
+
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: expected_root + "\n" if args == ["rev-parse", "--show-toplevel"] else None,
+    )
+    resolved = get_git_repo_root(repo_root=sub_dir)
+    assert resolved == expected_root
+
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: None,
+    )
+    assert get_git_repo_root(repo_root=sub_dir) is None
+
+
+def test_subdirectory_scan_in_git_worktree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies CLI differential scan targeting a subdirectory inside a Git worktree resolves worktree root."""
+    repo = tmp_path / "worktree_repo"
+    repo.mkdir()
+    subpkg = repo / "src" / "subpkg"
+    subpkg.mkdir(parents=True)
+
+    foo_code = (
+        "def execute_pipeline(data_batch, multiplier):\n"
+        "    res = 0\n"
+        "    for val in data_batch:\n"
+        "        res += val * multiplier + 10\n"
+        "    return res\n"
+    )
+    clone_code = (
+        "def execute_pipeline(data_batch, multiplier):\n"
+        "    res = 0\n"
+        "    for val in data_batch:\n"
+        "        res += val * multiplier + 10\n"
+        "    return res\n"
+    )
+
+    (subpkg / "worker.py").write_text(foo_code, encoding="utf-8")
+    (subpkg / "worker_clone.py").write_text(clone_code, encoding="utf-8")
+
+    norm_repo = str(repo).replace("\\", "/")
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: (
+            norm_repo + "\n"
+            if args == ["rev-parse", "--show-toplevel"]
+            else (
+                "src/subpkg/worker.py\n"
+                if args == ["diff", "--name-only", "--"]
+                else (
+                    "diff --git a/src/subpkg/worker.py b/src/subpkg/worker.py\n"
+                    "--- a/src/subpkg/worker.py\n"
+                    "+++ b/src/subpkg/worker.py\n"
+                    "@@ -1,5 +1,5 @@\n"
+                    "+# change\n"
+                    if "--unified=0" in args
+                    else None
+                )
+            )
+        ),
+    )
+
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    test_args = [
+        "pydoppelgangerhunt",
+        str(subpkg),
+        "--diff-only",
+        "--threshold",
+        "0.90",
+        "--min-lines",
+        "5",
+    ]
+    monkeypatch.setattr("sys.argv", test_args)
+    exit_code = main()
+    assert exit_code == 1
+

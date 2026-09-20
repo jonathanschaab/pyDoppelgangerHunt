@@ -29,6 +29,7 @@ from pydoppelgangerhunt.git_diff import (
     filter_clones_by_git_diff,
     get_git_modified_files,
     get_git_modified_line_ranges,
+    get_git_repo_root,
 )
 from pydoppelgangerhunt.matcher import compute_priority_score, scan_target
 from pydoppelgangerhunt.metrics import compute_repository_dry_stats
@@ -593,7 +594,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     )
     target = target_arg or default_dir
-    target_repo_root = target if os.path.isdir(target) else (os.path.dirname(target) or ".")
+    target_dir = target if os.path.isdir(target) else (os.path.dirname(target) or ".")
+    git_root = _safe_call_git_diff_helper(get_git_repo_root, None, target_dir)
+    target_repo_root = git_root if git_root and os.path.exists(git_root) else target_dir
     threshold = args.threshold if args.threshold is not None else float(tool_cfg.get("threshold", 0.90))
     min_lines = args.min_lines if args.min_lines is not None else int(tool_cfg.get("min_lines", 8))
     min_tokens = args.min_tokens if args.min_tokens is not None else int(tool_cfg.get("min_tokens", 15))

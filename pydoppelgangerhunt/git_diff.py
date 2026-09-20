@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 import subprocess
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.config import find_matching_path_value, normalize_path_string
 
@@ -181,6 +182,24 @@ def get_git_modified_files(
             if norm and norm not in modified_files:
                 modified_files.append(norm)
     return modified_files
+
+
+def get_git_repo_root(
+    since_ref: Optional[str] = None,
+    repo_root: Optional[Union[str, Path]] = None,
+    cwd: Optional[Union[str, Path]] = None,
+) -> Optional[str]:
+    """Resolves the top-level root directory of the current Git worktree, or None if not in a repository."""
+    _ = since_ref
+    target_cwd = str(repo_root or cwd) if (repo_root or cwd) else None
+    raw = _run_git_command(["rev-parse", "--show-toplevel"], cwd=target_cwd)
+    if not raw:
+        return None
+    top = raw.strip()
+    if top:
+        return normalize_path_string(top, strip_anchor=True)
+    return None
+
 
 
 

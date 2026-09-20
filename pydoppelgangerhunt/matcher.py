@@ -14,6 +14,7 @@ from pydoppelgangerhunt.config import (
     find_python_files,
     normalize_path_string,
 )
+from pydoppelgangerhunt.git_diff import get_git_repo_root
 from pydoppelgangerhunt.baseline import (
     HARVEST_BOOLEAN_MODES,
     _safe_bool,
@@ -565,6 +566,7 @@ def _resolve_candidate_file_paths(
     repo_root: Path,
     target_dir: Path,
     cwd_resolved: Optional[Path] = None,
+    git_root_resolved: Optional[Path] = None,
 ) -> List[Path]:
     """Generates candidate absolute paths for a normalized file path against repo and target roots."""
     p = Path(clean_path)
@@ -575,21 +577,19 @@ def _resolve_candidate_file_paths(
             return [p]
 
     candidates: List[Path] = []
-    for root in (repo_root, target_dir):
+    roots_to_check: List[Path] = [repo_root, target_dir]
+    if cwd_resolved is not None and cwd_resolved not in (repo_root, target_dir):
+        roots_to_check.append(cwd_resolved)
+    if git_root_resolved is not None and git_root_resolved not in roots_to_check:
+        roots_to_check.append(git_root_resolved)
+
+    for root in roots_to_check:
         try:
             resolved = (root / p).resolve()
         except (ValueError, OSError):
             resolved = root / p
         if resolved not in candidates:
             candidates.append(resolved)
-
-    if cwd_resolved is not None and cwd_resolved not in (repo_root, target_dir):
-        try:
-            resolved_cwd = (cwd_resolved / p).resolve()
-        except (ValueError, OSError):
-            resolved_cwd = cwd_resolved / p
-        if resolved_cwd not in candidates:
-            candidates.append(resolved_cwd)
 
     return candidates
 
@@ -607,6 +607,14 @@ def _build_diff_path_keys(
     except (ValueError, OSError):
         pass
 
+    git_root_resolved: Optional[Path] = None
+    raw_git_root = get_git_repo_root(repo_root=target_dir)
+    if raw_git_root:
+        try:
+            git_root_resolved = Path(raw_git_root).resolve()
+        except (ValueError, OSError):
+            pass
+
     for d_file in diff_files:
         if not d_file:
             continue
@@ -615,16 +623,16 @@ def _build_diff_path_keys(
             continue
 
         keys.add(canonical_path_key(d_clean, strip_anchor=True))
-        for p in _resolve_candidate_file_paths(d_clean, repo_root, target_dir, cwd_resolved):
+        for p in _resolve_candidate_file_paths(
+            d_clean, repo_root, target_dir, cwd_resolved, git_root_resolved
+        ):
             keys.add(canonical_path_key(p.as_posix(), strip_anchor=True))
-            try:
-                keys.add(canonical_path_key(p.relative_to(repo_root).as_posix(), strip_anchor=True))
-            except ValueError:
-                pass
-            try:
-                keys.add(canonical_path_key(p.relative_to(target_dir).as_posix(), strip_anchor=True))
-            except ValueError:
-                pass
+            for base_root in (repo_root, target_dir, git_root_resolved):
+                if base_root is not None:
+                    try:
+                        keys.add(canonical_path_key(p.relative_to(base_root).as_posix(), strip_anchor=True))
+                    except ValueError:
+                        pass
 
     return keys
 
@@ -645,19 +653,26 @@ def _unit_matches_diff_keys(
     if canonical_path_key(u_clean, strip_anchor=True) in diff_keys:
         return True
 
-    for p in _resolve_candidate_file_paths(u_clean, repo_root, target_dir):
+    git_root_resolved: Optional[Path] = None
+    raw_git_root = get_git_repo_root(repo_root=target_dir)
+    if raw_git_root:
+        try:
+            git_root_resolved = Path(raw_git_root).resolve()
+        except (ValueError, OSError):
+            pass
+
+    for p in _resolve_candidate_file_paths(
+        u_clean, repo_root, target_dir, git_root_resolved=git_root_resolved
+    ):
         if canonical_path_key(p.as_posix(), strip_anchor=True) in diff_keys:
             return True
-        try:
-            if canonical_path_key(p.relative_to(repo_root).as_posix(), strip_anchor=True) in diff_keys:
-                return True
-        except ValueError:
-            pass
-        try:
-            if canonical_path_key(p.relative_to(target_dir).as_posix(), strip_anchor=True) in diff_keys:
-                return True
-        except ValueError:
-            pass
+        for base_root in (repo_root, target_dir, git_root_resolved):
+            if base_root is not None:
+                try:
+                    if canonical_path_key(p.relative_to(base_root).as_posix(), strip_anchor=True) in diff_keys:
+                        return True
+                except ValueError:
+                    pass
 
     return False
 
@@ -876,7 +891,11 @@ def scan_target(
                 target_path.relative_to(cwd)
                 effective_repo_root = cwd
             except ValueError:
-                effective_repo_root = target_path if target_path.is_dir() else target_path.parent
+                git_root_str = get_git_repo_root(repo_root=target_path)
+                if git_root_str and os.path.exists(git_root_str):
+                    effective_repo_root = Path(git_root_str).resolve()
+                else:
+                    effective_repo_root = target_path if target_path.is_dir() else target_path.parent
         except (ValueError, OSError):
             effective_repo_root = Path.cwd()
     file_list = find_python_files(
