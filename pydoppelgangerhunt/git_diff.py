@@ -110,7 +110,12 @@ def get_git_modified_files(
         trimmed = line.strip()
         if trimmed:
             if trimmed.startswith('"') and trimmed.endswith('"') and len(trimmed) >= 2:
-                trimmed = trimmed[1:-1]
+                inner = trimmed[1:-1]
+                try:
+                    raw_bytes = inner.encode("latin1").decode("unicode_escape").encode("latin1")
+                    trimmed = raw_bytes.decode("utf-8", errors="replace")
+                except (UnicodeError, ValueError):
+                    trimmed = inner
             norm = normalize_path_string(trimmed, strip_anchor=False)
             if norm and norm not in modified_files:
                 modified_files.append(norm)

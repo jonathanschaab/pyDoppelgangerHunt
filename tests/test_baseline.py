@@ -1621,28 +1621,31 @@ def test_differential_scan_calibrated_pruning_suppresses_global_boilerplate(tmp_
     (repo / "s1.py").write_text(boilerplate_code, encoding="utf-8")
     (repo / "s2.py").write_text(boilerplate_code, encoding="utf-8")
 
-    # Harvest units to find one of the boilerplate shingles
-    units_result = scan_target(str(repo), threshold=0.90, min_lines=5, return_calibration=True)
-    _, calib_harvested = units_result
-    some_shingle = next(iter(calib_harvested["shingle_frequencies"].keys()))
+    # 1. Uncalibrated scan on s1.py and s2.py finds 1 clone pair
+    clones_uncalib = scan_target(str(repo), threshold=0.90, min_lines=5)
+    assert len(clones_uncalib) == 1
 
-    # Calibrate with this shingle designated as a global stop shingle
+    # Harvest units to collect the boilerplate shingles
+    _, calib_harvested = scan_target(str(repo), threshold=0.90, min_lines=5, return_calibration=True)
+    all_boilerplate_shingles = set(calib_harvested["shingle_frequencies"].keys())
+    assert len(all_boilerplate_shingles) > 0
+
+    # Calibrate with all boilerplate shingles designated as global stop shingles
     calib = {
         "total_units": 500,
         "max_index_frequency": 0.25,
-        "global_stop_shingles": {some_shingle},
-        "shingle_frequencies": {some_shingle: 300},
+        "global_stop_shingles": all_boilerplate_shingles,
+        "shingle_frequencies": {sh: 300 for sh in all_boilerplate_shingles},
     }
 
-    # Verify that passing this calibration with stop shingle prunes the candidate pairs
-    clones = scan_target(
+    # Verify that passing this calibration suppresses candidate pair generation and yields 0 clones
+    clones_calibrated = scan_target(
         str(repo),
         threshold=0.90,
         min_lines=5,
         corpus_calibration=calib,
     )
-    # The shingle is pruned from candidate pair generation
-    assert isinstance(clones, list)
+    assert len(clones_calibrated) == 0, "Expected boilerplate clone pair to be completely suppressed by calibrated stop shingles"
 
 
 def test_baseline_backward_compatibility_v10_to_v13(tmp_path: Path) -> None:
@@ -1909,5 +1912,42 @@ def test_red_team_baseline_and_matcher_hardening(tmp_path: Path) -> None:
         },
     )
     assert len(clones) == 1
+
+    # 4. Non-finite values (NaN / inf / -inf / <= 0) and overflow in matcher do not crash
+    for invalid_freq in [float("nan"), float("inf"), float("-inf"), 0.0, -0.5, 1e308]:
+        nan_calib = {
+            "total_units": 50,
+            "max_index_frequency": invalid_freq,
+            "global_stop_shingles": set(),
+            "shingle_frequencies": {},
+        }
+        res_calib = scan_target(str(repo), min_lines=5, threshold=0.90, corpus_calibration=nan_calib)
+        assert len(res_calib) == 1
+        res_uncalib = scan_target(str(repo), min_lines=5, threshold=0.90, max_index_frequency=invalid_freq)
+        assert len(res_uncalib) == 1
+
+    # 5. Non-finite values and negative frequencies in baseline JSON
+    non_finite_file = tmp_path / "non_finite_calib.json"
+    non_finite_file.write_text(
+        json.dumps({
+            "version": "1.4.0",
+            "corpus_calibration": {
+                "total_units": 100,
+                "max_index_frequency": "NaN",
+                "global_stop_shingles": ["stop1"],
+                "shingle_frequencies": {
+                    "stop1": -5,  # Negative frequency filtered out
+                    "stop2": 10,
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    loaded_nf = load_baseline(str(non_finite_file))
+    assert loaded_nf.corpus_calibration is not None
+    assert loaded_nf.corpus_calibration["max_index_frequency"] == 0.25  # Fallback on NaN
+    assert "stop1" not in loaded_nf.corpus_calibration["shingle_frequencies"]
+    assert loaded_nf.corpus_calibration["shingle_frequencies"]["stop2"] == 10
+
 
 

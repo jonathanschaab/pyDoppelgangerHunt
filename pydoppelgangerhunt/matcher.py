@@ -493,6 +493,36 @@ def suppress_subclones(
     return [c for idx, c in enumerate(clones) if idx not in suppressed_indices]
 
 
+def _safe_index_frequency(raw_freq: Any) -> Optional[float]:
+    """Validates and clamps an index frequency to a finite float in (0.0, 1.0], or None."""
+    if raw_freq is None:
+        return None
+    try:
+        val = float(raw_freq)
+        if math.isfinite(val) and 0.0 < val <= 1.0:
+            return val
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return None
+
+
+def _compute_max_posting_len(
+    total_units: int,
+    freq: Optional[float],
+    min_corpus: int,
+    fallback: Optional[int] = None,
+) -> Optional[int]:
+    """Calculates max posting length for frequency-based pruning, handling overflow safely."""
+    if freq is not None and total_units >= min_corpus:
+        try:
+            posting_float = total_units * freq
+            if math.isfinite(posting_float):
+                return max(2, int(math.ceil(posting_float)))
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return fallback
+
+
 def _worker_harvest_file(task_kwargs: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Worker task wrapper for process pool executor."""
     return harvest_file_units(**task_kwargs)
@@ -681,7 +711,7 @@ def scan_target(
         if corpus_calibration is not None:
             try:
                 corpus_size += max(0, int(corpus_calibration.get("total_units", 0) or 0))
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, OverflowError):
                 pass
         df_counts: Dict[Any, int] = {}
         for u in units:
@@ -728,7 +758,7 @@ def scan_target(
     if corpus_calibration is not None:
         try:
             calib_units = max(0, int(corpus_calibration.get("total_units", 0) or 0))
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
             calib_units = 0
         total_corpus_units = len(units) + calib_units
         calib_freqs_map = corpus_calibration.get("shingle_frequencies", {})
@@ -737,19 +767,9 @@ def scan_target(
             if "max_index_frequency" in corpus_calibration
             else max_index_frequency
         )
-        try:
-            calib_max_freq = float(raw_calib_max_freq) if raw_calib_max_freq is not None else None
-        except (ValueError, TypeError):
-            calib_max_freq = None
-
-        filter_freq = (
-            calib_max_freq is not None
-            and total_corpus_units >= effective_min_corpus
-        )
-        max_posting_len = (
-            max(2, int(math.ceil(total_corpus_units * calib_max_freq)))
-            if filter_freq and calib_max_freq is not None
-            else None
+        calib_max_freq = _safe_index_frequency(raw_calib_max_freq)
+        max_posting_len = _compute_max_posting_len(
+            total_corpus_units, calib_max_freq, effective_min_corpus, fallback=None
         )
 
         for sh, u_indices in shingle_index.items():
@@ -760,7 +780,7 @@ def scan_target(
                 df_global = calib_freqs_map.get(json.dumps(list(sh)), 0)
             try:
                 combined_df = int(df_global or 0) + len(u_indices)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, OverflowError):
                 combined_df = len(u_indices)
 
             if max_posting_len is not None and combined_df > max_posting_len:
@@ -769,14 +789,13 @@ def scan_target(
                 for idx2 in u_indices[i + 1:]:
                     candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))
     else:
-        max_posting_len = (
-            max(2, int(math.ceil(len(units) * max_index_frequency)))
-            if (max_index_frequency is not None and len(units) >= effective_min_corpus)
-            else len(units) + 1
-        )
+        safe_max_freq = _safe_index_frequency(max_index_frequency)
+        max_posting_len_uncalib = _compute_max_posting_len(
+            len(units), safe_max_freq, effective_min_corpus, fallback=len(units) + 1
+        ) or (len(units) + 1)
 
         for u_indices in shingle_index.values():
-            if 1 < len(u_indices) <= max_posting_len:
+            if 1 < len(u_indices) <= max_posting_len_uncalib:
                 for i, idx1 in enumerate(u_indices):
                     for idx2 in u_indices[i + 1:]:
                         candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))

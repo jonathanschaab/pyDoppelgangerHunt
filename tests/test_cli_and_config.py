@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import pytest
 
 import pydoppelgangerhunt
@@ -1451,7 +1451,17 @@ def test_cli_record_baseline_and_differential_scan_calibration(tmp_path: Path, m
     assert loaded.corpus_calibration is not None
     assert loaded.corpus_calibration["total_units"] >= 2
 
-    # Step 2: Run scan with --baseline to ensure grandfathered suppression
+    # Step 2: Run scan with --baseline to ensure calibration forwarding to scan_target
+    import pydoppelgangerhunt.cli as cli_mod  # pylint: disable=import-outside-toplevel
+    captured_kwargs: List[Dict[str, Any]] = []
+    orig_scan = cli_mod.scan_target
+
+    def spy_scan_target(*args: Any, **kwargs: Any) -> Any:
+        captured_kwargs.append(dict(kwargs))
+        return orig_scan(*args, **kwargs)
+
+    monkeypatch.setattr(cli_mod, "scan_target", spy_scan_target)
+
     test_args_scan = [
         "pydoppelgangerhunt",
         str(repo),
@@ -1465,4 +1475,31 @@ def test_cli_record_baseline_and_differential_scan_calibration(tmp_path: Path, m
     monkeypatch.setattr("sys.argv", test_args_scan)
     exit_code_scan = main()
     assert exit_code_scan == 0
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0].get("corpus_calibration") is not None
+    assert captured_kwargs[0]["corpus_calibration"]["total_units"] >= 2
+
+    # Step 3: Run differential scan with --baseline and --diff-only to verify differential forwarding
+    captured_kwargs.clear()
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.cli.get_git_modified_line_ranges",
+        lambda since_ref=None, repo_root=None: {str(repo / "m1.py"): [(1, 10)]},
+    )
+    test_args_diff = [
+        "pydoppelgangerhunt",
+        str(repo),
+        "--baseline",
+        str(baseline_json),
+        "--diff-only",
+        "--threshold",
+        "0.90",
+        "--min-lines",
+        "6",
+    ]
+    monkeypatch.setattr("sys.argv", test_args_diff)
+    exit_code_diff = main()
+    assert exit_code_diff == 0
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0].get("corpus_calibration") is not None
+    assert captured_kwargs[0]["corpus_calibration"]["total_units"] >= 2
 

@@ -88,15 +88,29 @@ def compute_corpus_calibration(
     if stop_shingles is not None:
         global_stop_shingles.update(stop_shingles)
 
-    if max_index_frequency is not None and total_units >= effective_min_corpus:
-        max_posting_len = max(2, int(math.ceil(total_units * max_index_frequency)))
-        for sh, count in shingle_frequencies.items():
-            if count > max_posting_len:
-                global_stop_shingles.add(sh)
+    valid_max_freq: Optional[float] = None
+    if max_index_frequency is not None:
+        try:
+            parsed_max_freq = float(max_index_frequency)
+            if math.isfinite(parsed_max_freq) and 0.0 < parsed_max_freq <= 1.0:
+                valid_max_freq = parsed_max_freq
+        except (ValueError, TypeError, OverflowError):
+            valid_max_freq = None
+
+    if valid_max_freq is not None and total_units >= effective_min_corpus:
+        try:
+            posting_float = total_units * valid_max_freq
+            if math.isfinite(posting_float):
+                max_posting_len = max(2, int(math.ceil(posting_float)))
+                for sh, count in shingle_frequencies.items():
+                    if count > max_posting_len:
+                        global_stop_shingles.add(sh)
+        except (ValueError, TypeError, OverflowError):
+            pass
 
     return {
         "total_units": total_units,
-        "max_index_frequency": max_index_frequency,
+        "max_index_frequency": valid_max_freq,
         "global_stop_shingles": global_stop_shingles,
         "shingle_frequencies": shingle_frequencies,
     }
@@ -343,8 +357,10 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
             if isinstance(raw_freqs, dict):
                 for k, v in raw_freqs.items():
                     try:
-                        decoded_freqs[_deserialize_shingle_key(k)] = int(v)
-                    except (ValueError, TypeError, RecursionError):
+                        freq_val = int(v)
+                        if freq_val > 0:
+                            decoded_freqs[_deserialize_shingle_key(k)] = freq_val
+                    except (ValueError, TypeError, OverflowError, RecursionError):
                         continue
             raw_max_freq = raw_calib.get("max_index_frequency")
             max_idx_freq: Optional[float]
@@ -353,11 +369,13 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
             else:
                 try:
                     max_idx_freq = float(raw_max_freq)
-                except (ValueError, TypeError):
+                    if not math.isfinite(max_idx_freq) or max_idx_freq <= 0.0 or max_idx_freq > 1.0:
+                        max_idx_freq = 0.25
+                except (ValueError, TypeError, OverflowError):
                     max_idx_freq = 0.25
             try:
                 calib_total_units = max(0, int(raw_calib.get("total_units", 0) or 0))
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, OverflowError):
                 calib_total_units = 0
 
             corpus_calibration = {
