@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Union
-
-import os
+import unicodedata
 
 DEFAULT_EXCLUDES: List[str] = [
     "checks/encapsulated",
@@ -53,7 +53,7 @@ def normalize_path_string(path_str: Optional[str], strip_anchor: bool = True) ->
     norm = raw.replace("\\", "/")
     while norm.startswith("./"):
         norm = norm[2:]
-    return norm
+    return unicodedata.normalize("NFC", norm)
 
 
 def canonical_path_key(path_str: Optional[str], strip_anchor: bool = False) -> str:

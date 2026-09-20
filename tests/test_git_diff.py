@@ -747,3 +747,63 @@ def test_parse_git_diff_hunks_cstyle_and_blame_dash_dash(monkeypatch: pytest.Mon
     assert blame_args[0][blame_args[0].index("--") + 1] == "pkg/café.py"
 
 
+def test_git_diff_args_contain_double_dash_delimiter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that get_git_modified_files and get_git_modified_line_ranges isolate revisions with '--'."""
+    from typing import Sequence  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.git_diff import (  # pylint: disable=import-outside-toplevel
+        get_git_modified_files,
+        get_git_modified_line_ranges,
+    )
+
+    captured_cmds: List[Sequence[str]] = []
+
+    def mock_run(args: Sequence[str], cwd: Optional[str] = None) -> Optional[str]:
+        captured_cmds.append(args)
+        return ""
+
+    monkeypatch.setattr("pydoppelgangerhunt.git_diff._run_git_command", mock_run)
+
+    # 1. With since_ref
+    get_git_modified_files(since_ref="release_branch")
+    assert len(captured_cmds) == 1
+    assert captured_cmds[0] == ["diff", "--name-only", "release_branch", "--"]
+
+    get_git_modified_line_ranges(since_ref="release_branch")
+    assert len(captured_cmds) == 2
+    assert captured_cmds[1] == ["diff", "--unified=0", "--src-prefix=a/", "--dst-prefix=b/", "release_branch", "--"]
+
+    # 2. Without since_ref (unstaged working tree diff)
+    get_git_modified_files()
+    assert len(captured_cmds) == 3
+    assert captured_cmds[2] == ["diff", "--name-only", "--"]
+
+    get_git_modified_line_ranges()
+    assert len(captured_cmds) == 4
+    assert captured_cmds[3] == ["diff", "--unified=0", "--src-prefix=a/", "--dst-prefix=b/", "--"]
+
+
+def test_run_git_command_utf8_decoding_and_replace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that _run_git_command enforces utf-8 encoding and replace error handling."""
+    from unittest import mock  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.git_diff import _run_git_command  # pylint: disable=import-outside-toplevel
+
+    captured_kwargs: Dict[str, Any] = {}
+
+    def mock_subprocess_run(*args: Any, **kwargs: Any) -> Any:
+        captured_kwargs.update(kwargs)
+        mock_proc = mock.MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = "pkg/café.py\npkg/🚀_launch.py\n"
+        return mock_proc
+
+    monkeypatch.setattr("subprocess.run", mock_subprocess_run)
+    out = _run_git_command(["diff", "--name-only"])
+    assert captured_kwargs.get("encoding") == "utf-8"
+    assert captured_kwargs.get("errors") == "replace"
+    assert captured_kwargs.get("text") is True
+    assert out is not None
+    assert "pkg/café.py" in out
+    assert "pkg/🚀_launch.py" in out
+
+
+

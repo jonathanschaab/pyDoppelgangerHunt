@@ -20,6 +20,8 @@ def _run_git_command(args: Sequence[str], cwd: Optional[str] = None) -> Optional
             cwd=cwd or os.getcwd(),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
         if proc.returncode == 0:
@@ -82,20 +84,33 @@ def parse_git_diff_hunks(diff_text: str) -> Dict[str, List[Tuple[int, int]]]:
     return modified_ranges
 
 
+def _run_git_diff(
+    diff_flags: Sequence[str],
+    since_ref: Optional[str] = None,
+    cwd: Optional[str] = None,
+) -> Optional[str]:
+    """Builds and executes a safe git diff command isolating revisions from pathspecs."""
+    if since_ref and since_ref.strip().startswith("-"):
+        return None
+    args = ["diff", *diff_flags]
+    if since_ref:
+        args.extend([since_ref, "--"])
+    else:
+        args.append("--")
+    return _run_git_command(args, cwd=cwd)
+
+
 def get_git_modified_line_ranges(
     since_ref: Optional[str] = None,
     repo_root: Optional[str] = None,
     cwd: Optional[str] = None,
 ) -> Dict[str, List[Tuple[int, int]]]:
     """Extracts modified line ranges for files using git diff --unified=0."""
-    if since_ref and since_ref.strip().startswith("-"):
-        return {}
-    args = ["diff", "--unified=0", "--src-prefix=a/", "--dst-prefix=b/"]
-    if since_ref:
-        args.append(since_ref)
-
-    effective_cwd = repo_root or cwd
-    diff_output = _run_git_command(args, cwd=effective_cwd)
+    diff_output = _run_git_diff(
+        ["--unified=0", "--src-prefix=a/", "--dst-prefix=b/"],
+        since_ref=since_ref,
+        cwd=repo_root or cwd,
+    )
     if not diff_output:
         return {}
 
@@ -108,13 +123,11 @@ def get_git_modified_files(
     cwd: Optional[str] = None,
 ) -> List[str]:
     """Extracts normalized file paths of modified files from git diff."""
-    if since_ref and since_ref.strip().startswith("-"):
-        return []
-    args = ["diff", "--name-only"]
-    if since_ref:
-        args.append(since_ref)
-    effective_cwd = repo_root or cwd
-    diff_output = _run_git_command(args, cwd=effective_cwd)
+    diff_output = _run_git_diff(
+        ["--name-only"],
+        since_ref=since_ref,
+        cwd=repo_root or cwd,
+    )
     if not diff_output:
         return []
     modified_files: List[str] = []

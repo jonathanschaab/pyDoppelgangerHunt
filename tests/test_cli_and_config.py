@@ -1509,3 +1509,19 @@ def test_cli_record_baseline_and_differential_scan_calibration(tmp_path: Path, m
     assert captured_kwargs[0].get("diff_files") is not None
     assert str(repo / "m1.py") in captured_kwargs[0]["diff_files"]
 
+
+def test_normalize_path_string_nfc_normalization() -> None:
+    """Verifies that normalize_path_string converts macOS NFD decomposed Unicode into canonical NFC."""
+    import unicodedata
+    from pydoppelgangerhunt.config import normalize_path_string, paths_match_boundary
+
+    nfc_path = "src/café_module.py"
+    nfd_path = unicodedata.normalize("NFD", nfc_path)
+    assert nfc_path != nfd_path
+    norm_nfd = normalize_path_string(nfd_path)
+    norm_nfc = normalize_path_string(nfc_path)
+    assert norm_nfd == norm_nfc == "src/café_module.py"
+    assert paths_match_boundary(nfd_path, nfc_path)
+    assert paths_match_boundary(nfc_path, nfd_path)
+
+
