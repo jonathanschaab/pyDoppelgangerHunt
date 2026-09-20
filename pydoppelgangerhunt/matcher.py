@@ -887,18 +887,29 @@ def scan_target(
         else:
             df_local = len(u_indices)
 
+        is_global_shingle = False
         if calib_freqs_map is not None:
-            df_global = calib_freqs_map.get(sh)
-            if df_global is None and isinstance(sh, (tuple, list)):
-                df_global = calib_freqs_map.get(json.dumps(list(sh)), 0)
-            try:
-                combined_df = int(df_global or 0) + df_local
-            except (ValueError, TypeError, OverflowError):
-                combined_df = df_local
+            raw_global = calib_freqs_map.get(sh)
+            if raw_global is None and isinstance(sh, (tuple, list)):
+                raw_global = calib_freqs_map.get(json.dumps(list(sh)))
+            if raw_global is not None:
+                is_global_shingle = True
+                try:
+                    df_global = int(raw_global)
+                except (ValueError, TypeError, OverflowError):
+                    df_global = 0
+            else:
+                df_global = 0
+            combined_df = df_global + df_local
         else:
             combined_df = len(u_indices)
 
-        if max_posting_len is not None and combined_df > max_posting_len:
+        if effective_stop_shingles and sh in effective_stop_shingles:
+            continue
+
+        if diff_unit_indices is not None and calib_freqs_map is not None and not is_global_shingle:
+            pass
+        elif max_posting_len is not None and combined_df > max_posting_len:
             continue
 
         _add_candidate_pairs(candidate_pairs, u_indices, diff_unit_indices)

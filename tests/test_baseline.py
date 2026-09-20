@@ -2167,5 +2167,84 @@ def test_diff_scan_uncalibrated_pruning(tmp_path: Path) -> None:
     assert pair[1]["name"] in ("calculate_tax_for_eu_region", "calculate_tax_for_eu_region_duplicate")
 
 
+def test_diff_scan_avoids_pruning_novel_shingles_missing_from_calibration(tmp_path: Path) -> None:
+    """Verifies that shingles missing from calibration frequencies in differential mode are not falsely pruned."""
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.parser import harvest_file_units  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo_stale_baseline"
+    repo.mkdir()
+
+    def generate_fn(num: int) -> str:
+        return (
+            f"def custom_domain_service_action_{num}(payload, context, options):\n"
+            "    transformed = [item.strip() for item in payload if item]\n"
+            "    result_map = {idx: val.upper() for idx, val in enumerate(transformed)}\n"
+            f"    audit_tag = 'ACTION_{num}'\n"
+            "    status_flag = len(result_map) > 0\n"
+            "    return {'status': status_flag, 'tag': audit_tag, 'data': result_map}\n"
+        )
+
+    diff_code_1 = "\n\n".join(generate_fn(i) for i in range(4))
+    diff_code_2 = "\n\n".join(generate_fn(i) for i in range(4))
+    (repo / "new_service_a.py").write_text(diff_code_1, encoding="utf-8")
+    (repo / "new_service_b.py").write_text(diff_code_2, encoding="utf-8")
+
+    # Stale/small baseline calibration with total_units=1 and empty shingle_frequencies:
+    # total_corpus_units = 1 + 8 = 9.
+    # With max_index_frequency=0.25 and effective_min_corpus=4, max_posting_len = max(2, ceil(9 * 0.25)) = 3.
+    # The novel domain shingles occur in 8 units (or 4 per file).
+    # If uncalibrated df_local=8 (or 4) were compared with max_posting_len=3, it would be falsely pruned!
+    # Because it is missing from calibration frequencies, the posting-length check is bypassed.
+    calib = {
+        "total_units": 1,
+        "max_index_frequency": 0.25,
+        "min_corpus_size": 4,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {},
+    }
+
+    clones = scan_target(
+        str(repo),
+        min_lines=6,
+        threshold=0.90,
+        diff_files=["new_service_a.py", "new_service_b.py"],
+        corpus_calibration=calib,
+    )
+
+    cross_file_clones = [
+        (sim, u1, u2)
+        for sim, u1, u2 in clones
+        if Path(u1["file"]).name != Path(u2["file"]).name
+    ]
+    assert len(cross_file_clones) >= 4
+    for _, u1, u2 in cross_file_clones:
+        f1 = Path(u1["file"]).name
+        f2 = Path(u2["file"]).name
+        assert {f1, f2} == {"new_service_a.py", "new_service_b.py"}
+
+    # Verify that global_stop_shingles is STILL honored for novel shingles if present in global_stop_shingles
+    units = harvest_file_units(str(repo / "new_service_a.py"), str(repo), min_lines=6)
+    assert len(units) >= 1
+
+    calib_all_stopped = {
+        "total_units": 1,
+        "max_index_frequency": 0.25,
+        "min_corpus_size": 4,
+        "global_stop_shingles": set(units[0]["shingles"]),
+        "shingle_frequencies": {},
+    }
+    clones_all_stopped = scan_target(
+        str(repo),
+        min_lines=6,
+        threshold=0.90,
+        diff_files=["new_service_a.py", "new_service_b.py"],
+        corpus_calibration=calib_all_stopped,
+    )
+    names = {u1["name"] for _, u1, _ in clones_all_stopped}
+    assert "custom_domain_service_action_0" not in names
+
+
+
 
 
