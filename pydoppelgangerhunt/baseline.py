@@ -60,6 +60,27 @@ def _safe_bool(val: Any) -> bool:
     return False
 
 
+HARVEST_BOOLEAN_MODES: Tuple[Tuple[str, bool], ...] = (
+    ("blind_literals", False),
+    ("strip_annotations", True),
+    ("strip_docstrings", True),
+    ("idioms", False),
+    ("commutative", False),
+    ("filter_boilerplate", False),
+    ("consistent_renaming", False),
+    ("abstract_expressions", False),
+    ("blind_indexing", False),
+    ("functions_only", False),
+    ("class_level", False),
+    ("sliding_window", False),
+    ("clause_level", False),
+    ("data_tables", False),
+    ("harvest_closures", False),
+    ("comprehensions", False),
+    ("complex_expressions", False),
+)
+
+
 def _attach_calibration_flags(
     target: Dict[str, Any],
     source: Dict[str, Any],
@@ -69,6 +90,15 @@ def _attach_calibration_flags(
         return
     for flag in ("bag_of_tokens", "call_sequences", "filter_stop_shingles"):
         target[flag] = _safe_bool(source.get(flag, False))
+    for flag, default_val in HARVEST_BOOLEAN_MODES:
+        target[flag] = _safe_bool(source.get(flag, default_val))
+    for int_flag, default_int in (("window_size", 5), ("min_expr_complexity", 4)):
+        raw_val = source.get(int_flag, default_int)
+        try:
+            val = int(raw_val)
+            target[int_flag] = val if val > 0 else default_int
+        except (ValueError, TypeError, OverflowError):
+            target[int_flag] = default_int
     if "min_corpus_size" in source:
         raw_mcs = source.get("min_corpus_size")
         if raw_mcs is None:
@@ -213,6 +243,7 @@ def compute_corpus_calibration(
     *,
     bag_of_tokens: bool = False,
     call_sequences: bool = False,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """Computes global shingle document frequencies and calibrated stop-shingles for a repository corpus."""
     total_units = len(units)
@@ -255,15 +286,14 @@ def compute_corpus_calibration(
         "global_stop_shingles": global_stop_shingles,
         "shingle_frequencies": shingle_frequencies,
     }
-    _attach_calibration_flags(
-        calib,
-        {
-            "bag_of_tokens": bag_of_tokens,
-            "call_sequences": call_sequences,
-            "filter_stop_shingles": filter_stop_shingles,
-            "min_corpus_size": min_corpus_size,
-        },
-    )
+    flags_dict: Dict[str, Any] = {
+        "bag_of_tokens": bag_of_tokens,
+        "call_sequences": call_sequences,
+        "filter_stop_shingles": filter_stop_shingles,
+        "min_corpus_size": min_corpus_size,
+    }
+    flags_dict.update(kwargs)
+    _attach_calibration_flags(calib, flags_dict)
     return calib
 
 

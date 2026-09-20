@@ -2856,3 +2856,149 @@ def test_stop_shingles_calibration_compatibility_and_isolation(tmp_path: Path) -
     )
     assert len(clones) >= 1
 
+
+def test_harvesting_modes_calibration_persistence_and_compatibility(tmp_path: Path) -> None:
+    """Verifies that AST unit-shaping and harvesting modes are persisted in calibration and validated for compatibility."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        HARVEST_BOOLEAN_MODES,
+        compute_corpus_calibration,
+        load_baseline,
+        record_baseline,
+    )
+    from pydoppelgangerhunt.matcher import (  # pylint: disable=import-outside-toplevel
+        _is_calibration_mode_compatible,
+        scan_target,
+    )
+
+    # 1. compute_corpus_calibration attaches all default harvesting boolean modes and int bounds
+    calib_default = compute_corpus_calibration([])
+    for flag, default_val in HARVEST_BOOLEAN_MODES:
+        assert flag in calib_default
+        assert calib_default[flag] is default_val
+    assert calib_default["window_size"] == 5
+    assert calib_default["min_expr_complexity"] == 4
+
+    # 2. compute_corpus_calibration overrides harvesting flags when explicitly provided
+    calib_custom = compute_corpus_calibration(
+        [],
+        blind_literals=True,
+        strip_annotations=False,
+        idioms=True,
+        commutative=True,
+        filter_boilerplate=True,
+        sliding_window=True,
+        window_size=10,
+        complex_expressions=True,
+        min_expr_complexity=8,
+    )
+    assert calib_custom["blind_literals"] is True
+    assert calib_custom["strip_annotations"] is False
+    assert calib_custom["idioms"] is True
+    assert calib_custom["commutative"] is True
+    assert calib_custom["filter_boilerplate"] is True
+    assert calib_custom["sliding_window"] is True
+    assert calib_custom["window_size"] == 10
+    assert calib_custom["complex_expressions"] is True
+    assert calib_custom["min_expr_complexity"] == 8
+
+    # 3. Round-trip baseline persistence through record_baseline and load_baseline
+    base_file = tmp_path / "harvest_baseline.json"
+    record_baseline([], str(base_file), "target", 0.90, corpus_calibration=calib_custom)
+    loaded = load_baseline(str(base_file))
+    assert loaded.corpus_calibration is not None
+    loaded_calib = loaded.corpus_calibration
+    assert loaded_calib["blind_literals"] is True
+    assert loaded_calib["strip_annotations"] is False
+    assert loaded_calib["idioms"] is True
+    assert loaded_calib["commutative"] is True
+    assert loaded_calib["filter_boilerplate"] is True
+    assert loaded_calib["sliding_window"] is True
+    assert loaded_calib["window_size"] == 10
+    assert loaded_calib["complex_expressions"] is True
+    assert loaded_calib["min_expr_complexity"] == 8
+
+    # 4. _is_calibration_mode_compatible rejects mismatched harvesting configurations
+    assert _is_calibration_mode_compatible(
+        calib_custom,
+        blind_literals=True,
+        strip_annotations=False,
+        idioms=True,
+        commutative=True,
+        filter_boilerplate=True,
+        sliding_window=True,
+        window_size=10,
+        complex_expressions=True,
+        min_expr_complexity=8,
+    ) is True
+
+    # Mismatched blind_literals
+    assert _is_calibration_mode_compatible(calib_custom, blind_literals=False) is False
+    assert _is_calibration_mode_compatible(calib_default, blind_literals=True) is False
+
+    # Mismatched strip_annotations
+    assert _is_calibration_mode_compatible(calib_custom, strip_annotations=True) is False
+    assert _is_calibration_mode_compatible(calib_default, strip_annotations=False) is False
+
+    # Mismatched idioms
+    assert _is_calibration_mode_compatible(calib_custom, idioms=False) is False
+    assert _is_calibration_mode_compatible(calib_default, idioms=True) is False
+
+    # Mismatched commutative
+    assert _is_calibration_mode_compatible(calib_custom, commutative=False) is False
+    assert _is_calibration_mode_compatible(calib_default, commutative=True) is False
+
+    # Mismatched filter_boilerplate
+    assert _is_calibration_mode_compatible(calib_custom, filter_boilerplate=False) is False
+    assert _is_calibration_mode_compatible(calib_default, filter_boilerplate=True) is False
+
+    # Mismatched window_size when sliding_window is active
+    assert _is_calibration_mode_compatible(
+        calib_custom,
+        blind_literals=True,
+        strip_annotations=False,
+        idioms=True,
+        commutative=True,
+        filter_boilerplate=True,
+        sliding_window=True,
+        window_size=5,
+        complex_expressions=True,
+        min_expr_complexity=8,
+    ) is False
+
+    # Mismatched min_expr_complexity when complex_expressions is active
+    assert _is_calibration_mode_compatible(
+        calib_custom,
+        blind_literals=True,
+        strip_annotations=False,
+        idioms=True,
+        commutative=True,
+        filter_boilerplate=True,
+        sliding_window=True,
+        window_size=10,
+        complex_expressions=True,
+        min_expr_complexity=4,
+    ) is False
+
+    # 5. Integration: scan_target skips incompatible calibration
+    code_file = tmp_path / "diff_test.py"
+    code_file.write_text(
+        "def service_one(a, b):\n"
+        "    v1 = a * 10\n"
+        "    v2 = b + 20\n"
+        "    return v1 + v2\n\n"
+        "def service_two(a, b):\n"
+        "    v1 = a * 10\n"
+        "    v2 = b + 20\n"
+        "    return v1 + v2\n",
+        encoding="utf-8",
+    )
+    clones = scan_target(
+        str(tmp_path),
+        min_lines=2,
+        min_tokens=3,
+        corpus_calibration=calib_custom,
+        blind_literals=False,
+    )
+    assert len(clones) >= 1
+
+

@@ -16,6 +16,7 @@ from pydoppelgangerhunt.config import (
     paths_match_boundary,
 )
 from pydoppelgangerhunt.baseline import (
+    HARVEST_BOOLEAN_MODES,
     _safe_bool,
     _safe_index_frequency,
     _safe_min_corpus,
@@ -601,6 +602,7 @@ def _build_calibration_metadata(
     stop_shingles: Optional[Set[Any]],
     bag_of_tokens: bool,
     call_sequences: bool,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """Helper to compute baseline corpus calibration dictionary."""
     from pydoppelgangerhunt.baseline import compute_corpus_calibration
@@ -612,17 +614,19 @@ def _build_calibration_metadata(
         stop_shingles=stop_shingles,
         bag_of_tokens=bag_of_tokens,
         call_sequences=call_sequences,
+        **kwargs,
     )
 
 
 def _is_calibration_mode_compatible(
     calib: Dict[str, Any],
     *,
-    bag_of_tokens: bool,
-    call_sequences: bool,
+    bag_of_tokens: bool = False,
+    call_sequences: bool = False,
     filter_stop_shingles: bool = False,
+    **kwargs: Any,
 ) -> bool:
-    """Validates that corpus calibration was generated with compatible representation and filtering features."""
+    """Validates that corpus calibration was generated with compatible representation, filtering, and AST shaping features."""
     if not isinstance(calib, dict):
         return False
     if _safe_bool(calib.get("bag_of_tokens", False)) != bool(bag_of_tokens):
@@ -631,6 +635,24 @@ def _is_calibration_mode_compatible(
         return False
     if _safe_bool(calib.get("filter_stop_shingles", False)) and not filter_stop_shingles:
         return False
+
+    for flag, default_val in HARVEST_BOOLEAN_MODES:
+        scan_val = kwargs.get(flag, default_val)
+        if _safe_bool(calib.get(flag, default_val)) != bool(scan_val):
+            return False
+
+    for flag_active, int_key, default_int in (
+        ("sliding_window", "window_size", 5),
+        ("complex_expressions", "min_expr_complexity", 4),
+    ):
+        if kwargs.get(flag_active, False):
+            curr_val = kwargs.get(int_key, default_int)
+            try:
+                if int(calib.get(int_key, default_int)) != int(curr_val):
+                    return False
+            except (ValueError, TypeError, OverflowError):
+                return False
+
     return True
 
 
@@ -742,6 +764,27 @@ def scan_target(
     )
 
     effective_workers = workers if workers is not None else 1
+    harvest_mode_opts: Dict[str, Any] = {
+        "functions_only": functions_only,
+        "sliding_window": sliding_window,
+        "window_size": window_size,
+        "blind_indexing": blind_indexing,
+        "complex_expressions": complex_expressions,
+        "min_expr_complexity": min_expr_complexity,
+        "clause_level": clause_level,
+        "data_tables": data_tables,
+        "strip_annotations": strip_annotations,
+        "class_level": class_level,
+        "blind_literals": blind_literals,
+        "filter_boilerplate": filter_boilerplate,
+        "consistent_renaming": consistent_renaming,
+        "harvest_closures": harvest_closures,
+        "commutative": commutative,
+        "comprehensions": comprehensions,
+        "idioms": idioms,
+        "abstract_expressions": abstract_expressions,
+        "strip_docstrings": strip_docstrings,
+    }
     # Multi-core process pool when requested or on large repos
     if effective_workers > 1 and len(file_list) >= 10:
         task_list = [
@@ -750,25 +793,7 @@ def scan_target(
                 "repo_root": str(effective_repo_root),
                 "min_lines": min_lines,
                 "min_tokens": min_tokens,
-                "functions_only": functions_only,
-                "sliding_window": sliding_window,
-                "window_size": window_size,
-                "blind_indexing": blind_indexing,
-                "complex_expressions": complex_expressions,
-                "min_expr_complexity": min_expr_complexity,
-                "clause_level": clause_level,
-                "data_tables": data_tables,
-                "strip_annotations": strip_annotations,
-                "class_level": class_level,
-                "blind_literals": blind_literals,
-                "filter_boilerplate": filter_boilerplate,
-                "consistent_renaming": consistent_renaming,
-                "harvest_closures": harvest_closures,
-                "commutative": commutative,
-                "comprehensions": comprehensions,
-                "idioms": idioms,
-                "abstract_expressions": abstract_expressions,
-                "strip_docstrings": strip_docstrings,
+                **harvest_mode_opts,
             }
             for p in file_list
         ]
@@ -783,25 +808,7 @@ def scan_target(
                     str(effective_repo_root),
                     min_lines=min_lines,
                     min_tokens=min_tokens,
-                    functions_only=functions_only,
-                    sliding_window=sliding_window,
-                    window_size=window_size,
-                    blind_indexing=blind_indexing,
-                    complex_expressions=complex_expressions,
-                    min_expr_complexity=min_expr_complexity,
-                    clause_level=clause_level,
-                    data_tables=data_tables,
-                    strip_annotations=strip_annotations,
-                    class_level=class_level,
-                    blind_literals=blind_literals,
-                    filter_boilerplate=filter_boilerplate,
-                    consistent_renaming=consistent_renaming,
-                    harvest_closures=harvest_closures,
-                    commutative=commutative,
-                    comprehensions=comprehensions,
-                    idioms=idioms,
-                    abstract_expressions=abstract_expressions,
-                    strip_docstrings=strip_docstrings,
+                    **harvest_mode_opts,
                 )
             )
 
@@ -835,6 +842,7 @@ def scan_target(
                     stop_shingles=stop_shingles,
                     bag_of_tokens=bag_of_tokens,
                     call_sequences=call_sequences,
+                    **harvest_mode_opts,
                 )
             return []
 
@@ -850,6 +858,7 @@ def scan_target(
         bag_of_tokens=bag_of_tokens,
         call_sequences=call_sequences,
         filter_stop_shingles=filter_stop_shingles,
+        **harvest_mode_opts,
     ):
         corpus_calibration = None
     if corpus_calibration is not None:
@@ -1150,6 +1159,7 @@ def scan_target(
             stop_shingles=stop_shingles,
             bag_of_tokens=bag_of_tokens,
             call_sequences=call_sequences,
+            **harvest_mode_opts,
         )
         return clones, calib_dict
 
