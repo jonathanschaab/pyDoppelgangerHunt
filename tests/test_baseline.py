@@ -125,12 +125,12 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
     u1 = {"file": str(file_a), "start": 1, "end": 3, "name": "compute_coords"}
     u2 = {"file": str(file_b), "start": 1, "end": 3, "name": "compute_coords_v2"}
 
-    scope = analyze_unit_variable_scope(u1, u2)
+    scope = analyze_unit_variable_scope(u1, u2, repo_root=str(tmp_path))
     assert scope["inputs"] == ["x", "y"]
     assert "scaled" in scope["outputs"]
     assert "scaled" in scope["locals"]
 
-    helper = synthesize_shared_helper_code(u1, u2)
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert "def _shared_compute_coords" in helper
     assert "x: float, y: float" in helper
     assert "-> float:" in helper
@@ -142,7 +142,7 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
     assert "def _shared_compute_coords" in patch
 
     # Test single-unit scope analysis
-    scope_single = analyze_unit_variable_scope(u1)
+    scope_single = analyze_unit_variable_scope(u1, repo_root=str(tmp_path))
     assert scope_single["inputs"] == ["x", "y"]
     assert scope_single["return_type"] == "float"
 
@@ -154,7 +154,7 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     u_async = {"file": str(file_async), "start": 1, "end": 2, "name": "fetch_record"}
-    scope_async = analyze_unit_variable_scope(u_async)
+    scope_async = analyze_unit_variable_scope(u_async, repo_root=str(tmp_path))
     assert "record_id" in scope_async["inputs"]
     assert "extra_args" in scope_async["inputs"]
     assert "options" in scope_async["inputs"]
@@ -171,7 +171,7 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     u_closure = {"file": str(file_closure), "start": 2, "end": 3, "name": "inner_mult"}
-    scope_closure = analyze_unit_variable_scope(u_closure)
+    scope_closure = analyze_unit_variable_scope(u_closure, repo_root=str(tmp_path))
     assert "x" in scope_closure["inputs"]
     assert "factor" in scope_closure["inputs"]
     assert "factor" in scope_closure["free_vars"]
@@ -189,7 +189,7 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     u_state = {"file": str(file_scope_vars), "start": 1, "end": 6, "name": "stateful_step"}
-    scope_state = analyze_unit_variable_scope(u_state)
+    scope_state = analyze_unit_variable_scope(u_state, repo_root=str(tmp_path))
     assert "outer_counter" in scope_state["nonlocals"]
     assert "global_cache" in scope_state["globals"]
     assert "outer_counter" in scope_state["inputs"]
@@ -205,7 +205,7 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     u_cls = {"file": str(file_cls), "start": 2, "end": 4, "name": "translate"}
-    scope_cls = analyze_unit_variable_scope(u_cls)
+    scope_cls = analyze_unit_variable_scope(u_cls, repo_root=str(tmp_path))
     assert scope_cls["inputs"][0] == "self"
     assert "self.x" in scope_cls["attrs_read"]
     assert "self.x" in scope_cls["attrs_written"]
@@ -221,13 +221,13 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     u_kw = {"file": str(file_kw), "start": 1, "end": 2, "name": "fetch_api"}
-    scope_kw = analyze_unit_variable_scope(u_kw)
+    scope_kw = analyze_unit_variable_scope(u_kw, repo_root=str(tmp_path))
     assert "url" in scope_kw["inputs"]
     assert "timeout" in scope_kw["inputs"]
     assert "retries" in scope_kw["inputs"]
     assert scope_kw["return_type"] == "dict"
 
-    helper_kw = synthesize_shared_helper_code(u_kw, u_kw)
+    helper_kw = synthesize_shared_helper_code(u_kw, u_kw, repo_root=str(tmp_path))
     assert "url: str" in helper_kw
     assert "timeout: float = 5.0" in helper_kw
     assert "*, retries: int = 3" in helper_kw
@@ -248,7 +248,7 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
     )
     u_c1 = {"file": str(file_conf1), "start": 1, "end": 2, "name": "process_data"}
     u_c2 = {"file": str(file_conf2), "start": 1, "end": 2, "name": "process_data_v2"}
-    helper_conf = synthesize_shared_helper_code(u_c1, u_c2)
+    helper_conf = synthesize_shared_helper_code(u_c1, u_c2, repo_root=str(tmp_path))
     sig_conf = helper_conf.split("\n")[0]
     # Conflicting types val: int vs float fallback to Any
     assert "val: Any" in sig_conf
@@ -266,7 +266,7 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     u_nested = {"file": str(file_nested), "start": 1, "end": 4, "name": "outer_calc"}
-    scope_nested = analyze_unit_variable_scope(u_nested)
+    scope_nested = analyze_unit_variable_scope(u_nested, repo_root=str(tmp_path))
     assert scope_nested["inputs"] == ["base"]
     assert scope_nested["return_type"] == "int"
 
@@ -280,9 +280,9 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     u_cm = {"file": str(file_cm), "start": 2, "end": 4, "name": "build"}
-    scope_cm = analyze_unit_variable_scope(u_cm)
+    scope_cm = analyze_unit_variable_scope(u_cm, repo_root=str(tmp_path))
     assert scope_cm["inputs"][0] == "cls"
-    helper_cm = synthesize_shared_helper_code(u_cm, u_cm)
+    helper_cm = synthesize_shared_helper_code(u_cm, u_cm, repo_root=str(tmp_path))
     assert (
         "def _shared_build(cls, tag: str = 'item') -> str:" in helper_cm
         or "def _shared_build(cls: Any, tag: str = 'item') -> str:" in helper_cm
@@ -303,13 +303,13 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
     )
     u_o1 = {"file": str(file_ord1), "start": 1, "end": 2, "name": "order_func"}
     u_o2 = {"file": str(file_ord2), "start": 1, "end": 2, "name": "order_func_v2"}
-    helper_ord = synthesize_shared_helper_code(u_o1, u_o2)
+    helper_ord = synthesize_shared_helper_code(u_o1, u_o2, repo_root=str(tmp_path))
     sig_ord = helper_ord.split("\n")[0]
     assert "a: int, b: int" in sig_ord
     assert "= 1" not in sig_ord
 
     # Test type_merge_strategy="union"
-    helper_union = synthesize_shared_helper_code(u_c1, u_c2, type_merge_strategy="union")
+    helper_union = synthesize_shared_helper_code(u_c1, u_c2, type_merge_strategy="union", repo_root=str(tmp_path))
     sig_union = helper_union.split("\n")[0]
     assert "Union[int, float]" in sig_union
     assert "Union[int, str]" in sig_union
@@ -323,7 +323,7 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     u_ro_nl = {"file": str(file_ro_nl), "start": 1, "end": 3, "name": "read_only_step"}
-    scope_ro_nl = analyze_unit_variable_scope(u_ro_nl)
+    scope_ro_nl = analyze_unit_variable_scope(u_ro_nl, repo_root=str(tmp_path))
     assert "scale_factor" in scope_ro_nl["inputs"]
     assert "scale_factor" in scope_ro_nl["nonlocals"]
     # Conservative check: scale_factor was only read, never stored, so NOT in outputs
@@ -337,7 +337,7 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     u_fa = {"file": str(file_full_args), "start": 1, "end": 2, "name": "complex_sig"}
-    helper_fa = synthesize_shared_helper_code(u_fa, u_fa)
+    helper_fa = synthesize_shared_helper_code(u_fa, u_fa, repo_root=str(tmp_path))
     sig_fa = helper_fa.split("\n")[0]
     assert "self: Any, a: int, *args: Any, b: int = 1, **kwargs: Any" in sig_fa
     assert "-> bool:" in sig_fa
@@ -366,7 +366,7 @@ def test_fixer_scope_analysis_and_signature_synthesis(tmp_path: Path) -> None:
     file_diff2.write_text("def unique_two():\n    return 2\n", encoding="utf-8")
     u_d1 = {"file": str(file_diff1), "start": 1, "end": 2, "name": "unique_one"}
     u_d2 = {"file": str(file_diff2), "start": 1, "end": 2, "name": "unique_two"}
-    helper_uncommon = synthesize_shared_helper_code(u_d1, u_d2)
+    helper_uncommon = synthesize_shared_helper_code(u_d1, u_d2, repo_root=str(tmp_path))
     assert "_shared_unique_one_unique_two" in helper_uncommon
 
     u_missing = {"file": "no_such_file_on_disk.py", "start": 1, "end": 2, "name": "miss"}
@@ -941,17 +941,18 @@ def test_batch_40_notebook_source_code_and_matcher_path_robustness(tmp_path: Any
     u1 = {"file": f"{nb_path}#cell_1", "start": 1, "end": 3, "name": "calc"}
     u2 = {"file": f"{nb_path}#cell_2", "start": 1, "end": 3, "name": "calc"}
 
-    lines1 = extract_unit_source_code(u1)
+    lines1 = extract_unit_source_code(u1, repo_root=str(tmp_path))
     assert lines1 == ["def calc(x):\n", "    y = x * 2\n", "    return y\n"]
 
-    diff_text = generate_clone_diff(u1, u2)
+    diff_text = generate_clone_diff(u1, u2, repo_root=str(tmp_path))
     assert "-    y = x * 2" in diff_text
     assert "+    y = x * 3" in diff_text
 
     # Out-of-bounds cell index fallback
     u_oob = {"file": f"{nb_path}#cell_99", "start": 1, "end": 3, "name": "oob"}
-    lines_oob = extract_unit_source_code(u_oob)
+    lines_oob = extract_unit_source_code(u_oob, repo_root=str(tmp_path))
     assert lines_oob == []
+
 
     # 2. format_sarif_report normalizes leading dot-slash while retaining cell anchors
     u_dot_cell = {"file": "./notebook.ipynb#cell_1", "start": 1, "end": 3, "name": "calc"}

@@ -48,14 +48,18 @@ def test_generate_clone_diff_and_refactoring_suggestions(tmp_path: Path) -> None
     u1 = {"file": str(file_a), "start": 1, "end": 4, "name": "process_order_v1"}
     u2 = {"file": str(file_b), "start": 1, "end": 4, "name": "process_order_v2"}
 
-    lines1 = extract_unit_source_code(u1)
+    lines1 = extract_unit_source_code(u1, repo_root=str(tmp_path))
     assert len(lines1) == 4
     assert "process_order_v1" in lines1[0]
 
-    missing_lines = extract_unit_source_code({"file": "non_existent.py", "start": 1, "end": 5, "name": "mock"})
+    missing_lines = extract_unit_source_code(
+        {"file": "non_existent.py", "start": 1, "end": 5, "name": "mock"},
+        repo_root=str(tmp_path),
+    )
     assert "Source for mock" in missing_lines[0]
 
-    diff = generate_clone_diff(u1, u2)
+    diff = generate_clone_diff(u1, u2, repo_root=str(tmp_path))
+
     assert "---" in diff and "+++" in diff
     assert "-    tax = 0.05" in diff
     assert "+    tax = 0.08" in diff
@@ -105,7 +109,7 @@ def test_fixer_synthesis_and_patch(tmp_path: Path) -> None:
         "lines": 3,
     }
 
-    helper = synthesize_shared_helper_code(u1, u2)
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert "def _shared_process_alpha" in helper
     assert "v = x + y" in helper
 
@@ -157,7 +161,7 @@ def test_synthesize_shared_helper_code_same_class_and_class_binding(tmp_path: Pa
     }
 
     # Auto mode detects same class in same file -> method mode
-    helper = synthesize_shared_helper_code(u1, u2, method_binding="auto")
+    helper = synthesize_shared_helper_code(u1, u2, method_binding="auto", repo_root=str(tmp_path))
     assert "    def _shared_add_tax_a_add_tax_b(self, amount: float) -> float:" in helper
     assert "self: Any" not in helper  # self must not have : Any annotation
     assert "Call site:\n            self._shared_add_tax_a_add_tax_b(...)" in helper
@@ -179,12 +183,12 @@ def test_synthesize_shared_helper_code_same_class_and_class_binding(tmp_path: Pa
         "kind": "function",
         "enclosing_class": "Calculator",
     }
-    cls_helper = synthesize_shared_helper_code(u_c1, u_c2, method_binding="method")
+    cls_helper = synthesize_shared_helper_code(u_c1, u_c2, method_binding="method", repo_root=str(tmp_path))
     assert "    @classmethod\n    def _shared_create_a_create_b(cls, val: int) -> int:" in cls_helper
     assert "Call site:\n            cls._shared_create_a_create_b(...)" in cls_helper
 
     # Explicit module mode falls back to module-level helper with self: Any
-    mod_helper = synthesize_shared_helper_code(u1, u2, method_binding="module")
+    mod_helper = synthesize_shared_helper_code(u1, u2, method_binding="module", repo_root=str(tmp_path))
     assert "def _shared_add_tax_a_add_tax_b(self: Any, amount: float) -> float:" in mod_helper
 
 def test_same_named_whole_method_helper_synthesis(tmp_path: Path) -> None:
@@ -197,7 +201,7 @@ def test_same_named_whole_method_helper_synthesis(tmp_path: Path) -> None:
     f2.write_text(c2, encoding="utf-8")
     u1 = {"file": str(f1), "start": 2, "end": 5, "name": "compute", "kind": "function", "enclosing_class": "ServiceA"}
     u2 = {"file": str(f2), "start": 2, "end": 5, "name": "compute", "kind": "function", "enclosing_class": "ServiceB"}
-    code = synthesize_shared_helper_code(u1, u2)
+    code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert "def compute(" not in code
     assert "ans = n * 10" in code
     assert "return ans" in code
@@ -444,7 +448,7 @@ def test_closure_whole_function_refactoring_and_body_extraction(tmp_path: Path) 
         "name": "factory_b:inner_b",
         "kind": "closure",
     }
-    helper = synthesize_shared_helper_code(u1, u2)
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert helper
     # def inner_a must NOT be nested inside the helper body
     assert "def inner_a" not in helper
@@ -651,6 +655,15 @@ def test_batch_36_path_resolution_and_same_file_matching(tmp_path: Any) -> None:
 
     assert _is_same_file_path(abs_path_str, rel_path_dot, repo_root=str(tmp_path))
     assert _is_same_file_path(rel_path_plain, rel_path_dot, repo_root=str(tmp_path))
+
+    symlink_file = tmp_path / "sym_sample.py"
+    try:
+        symlink_file.symlink_to(target_file)
+    except (OSError, NotImplementedError):
+        pass
+    if symlink_file.is_symlink():
+        assert not _is_same_file_path(abs_path_str, str(symlink_file), repo_root=str(tmp_path))
+        assert not _is_same_file_path(str(symlink_file), abs_path_str, repo_root=str(tmp_path))
 
     # 3. check_units_overlap with differing path formats
     u_base = {"file": abs_path_str, "start": 2, "end": 4}

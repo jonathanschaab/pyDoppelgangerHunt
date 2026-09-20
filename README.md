@@ -77,6 +77,9 @@ pydoppelgangerhunt src/ --coverage .coverage
 # Generate git-apply compatible refactoring patch file
 pydoppelgangerhunt src/ --patch refactor.patch
 
+# Synthesize cross-file shared utility modules and replace duplicates
+pydoppelgangerhunt src/ --patch refactor.patch --replace-clones --cross-file-strategy auto
+
 # Emit OASIS SARIF 2.1.0 output for GitHub Code Scanning
 pydoppelgangerhunt src/ --format sarif --output results.sarif
 ```
@@ -119,6 +122,8 @@ repos:
 threshold = 0.85
 min_lines = 8
 min_tokens = 15
+cross_file_strategy = "auto"
+shared_module_name = "_common.py"
 exclude = [
     "tests",
     "vendor",
@@ -128,6 +133,17 @@ exemptions = [
     ["module_a.py:func_1", "module_b.py:func_2"],
 ]
 ```
+
+### Cross-Module Deduplication Strategies
+
+When refactoring clones across different files with `--patch` and `--replace-clones`, `pyDoppelgangerHunt` uses directed dependency graph analysis to prevent circular imports:
+
+- **`auto`** *(default)*: Uses `shared_module` when clones share an enclosing Python package directory; falls back to `host_module` when clones only share the repository or `src/` root.
+- **`shared_module`**: Synthesizes a shared helper into a common utility module (e.g. `_common.py`) and wires module imports for each caller.
+- **`host_module`**: Extracts the helper into the primary clone file and wires callers to import from it.
+- **`skip`**: Skips cross-module clone pairs and focuses exclusively on intra-file deduplication.
+
+If any proposed cross-module extraction would introduce a circular import or unresolvable path, `pyDoppelgangerHunt` records a descriptive advisory comment and keeps the refactoring transactional without emitting broken imports.
 
 To generate a starter configuration file in your project root:
 
@@ -149,6 +165,11 @@ pydoppelgangerhunt --init
 | `--output`, `-o` | `PATH` | Output file path to save report |
 | `--html` | `PATH` | Write standalone interactive HTML dashboard report |
 | `--patch` | `PATH` | Write git-apply compatible unified patch file |
+| `--replace-clones` | Flag | Replace duplicate clone bodies with calls delegating to extracted helpers |
+| `--type-merge-strategy` | `fallback_any\|union` | Parameter typing strategy for helper synthesis (`fallback_any` or `union`) |
+| `--method-binding` | `auto\|method\|module` | Target helper binding strategy (`auto`, `method`, or `module`) |
+| `--cross-file-strategy` | `auto\|shared_module\|host_module\|skip` | Cross-module deduplication strategy (`auto`, `shared_module`, `host_module`, or `skip`; default: `auto`) |
+| `--shared-module-name` | `FILENAME` | Target filename for shared utility extractions (default: `_common.py`) |
 | `--sort-by` | `similarity\|priority\|sloc` | Sort clone hits (default: `similarity`) |
 | `--priority` | Flag | Sort clones by Priority score: $\text{Sim} \times \text{SLOC} \times \text{Complexity}$ |
 | `--top` | `INT` | Truncate report to top $N$ clone pairs |

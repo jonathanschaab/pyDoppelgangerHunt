@@ -501,6 +501,60 @@ def test_syntax_error_fallback_delegation_and_defensive_extract_source_code() ->
     lines_missing = extract_unit_source_code(u_missing)
     assert lines_missing == ["# Source for unit lines 55-55\n"]
 
+
+def test_extract_unit_source_code_rejects_out_of_root_absolute_path(tmp_path: Path) -> None:
+    """Verifies that extract_unit_source_code rejects absolute paths outside repo_root without falling back to CWD."""
+    sub_root = tmp_path / "sub_repo"
+    sub_root.mkdir()
+    outside_file = tmp_path / "outside.py"
+    outside_file.write_text("secret = 42\n", encoding="utf-8")
+
+    inside_file = sub_root / "inside.py"
+    inside_file.write_text("public = 1\n", encoding="utf-8")
+
+    u_outside: Dict[str, Any] = {
+        "file": str(outside_file),
+        "name": "secret_var",
+        "start": 1,
+        "end": 1,
+    }
+    lines = extract_unit_source_code(u_outside, repo_root=str(sub_root))
+    assert lines == ["# Source for secret_var lines 1-1\n"]
+    assert "secret = 42" not in "".join(lines)
+
+    u_inside: Dict[str, Any] = {
+        "file": str(inside_file),
+        "name": "public_var",
+        "start": 1,
+        "end": 1,
+    }
+    lines_in = extract_unit_source_code(u_inside, repo_root=str(sub_root))
+    assert lines_in == ["public = 1\n"]
+
+
+def test_extract_unit_source_code_relative_path_containment_in_repo_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that relative paths are strictly resolved against repo_root and cannot escape to CWD."""
+    repo = tmp_path / "target_repo"
+    repo.mkdir()
+    outside_file = tmp_path / "outside_secret.py"
+    outside_file.write_text("SUPER_SECRET = 999\n", encoding="utf-8")
+
+    monkeypatch.chdir(tmp_path)
+
+    # Traversal attempting to escape repo
+    u_traverse = {"file": "../outside_secret.py", "name": "secret", "start": 1, "end": 1}
+    lines = extract_unit_source_code(u_traverse, repo_root=str(repo))
+    assert lines == ["# Source for secret lines 1-1\n"]
+    assert "SUPER_SECRET" not in "".join(lines)
+
+    # Non-python extension rejection
+    u_non_py = {"file": "config.ini", "name": "cfg", "start": 1, "end": 1}
+    (repo / "config.ini").write_text("[section]\nkey=val\n", encoding="utf-8")
+    lines_non_py = extract_unit_source_code(u_non_py, repo_root=str(repo))
+    assert lines_non_py == ["# Source for cfg lines 1-1\n"]
+
     # 4. generate_html_report with family member None values
     fam: Dict[str, Any] = {
         "family_id": "CF-001",
@@ -576,3 +630,75 @@ def test_batch_66_artifact_dirs_clustering_helper_and_defensive_scoring(tmp_path
     assert "`target`pkg`" not in md_summary
     assert "pkg\\|sub'dir" in md_summary
     assert "Repository DRY Score" in md_summary
+
+
+def test_extract_unit_source_code_symlink_parents_and_root_containment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that symlinked parent components and out-of-root files are rejected."""
+    # 1. Symlinked parent directory when repo_root is provided
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sub_dir = repo / "sym_parent"
+    sub_dir.mkdir()
+    target_file = sub_dir / "target.py"
+    target_file.write_text("def foo():\n    pass\n", encoding="utf-8")
+
+    orig_is_symlink = Path.is_symlink
+
+    def mock_symlink(self: Path) -> bool:
+        if self == sub_dir or self.resolve() == sub_dir.resolve():
+            return True
+        return orig_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", mock_symlink)
+    u_sym_parent = {"file": "sym_parent/target.py", "start": 1, "end": 2, "name": "foo"}
+    res_sym = extract_unit_source_code(u_sym_parent, repo_root=str(repo))
+    assert res_sym == ["# Source for foo lines 1-2\n"]
+
+    # 2. Symlinked parent directory when repo_root is omitted (None)
+    monkeypatch.setattr(Path, "is_symlink", orig_is_symlink)
+    cwd_sym = Path.cwd().resolve() / "mock_link_dir"
+
+    def mock_cwd_sym(self: Path) -> bool:
+        if self == cwd_sym or self.resolve() == cwd_sym.resolve():
+            return True
+        return orig_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", mock_cwd_sym)
+    u_cwd_sym = {"file": "mock_link_dir/secret.py", "start": 1, "end": 1, "name": "secret"}
+    res_cwd_sym = extract_unit_source_code(u_cwd_sym, repo_root=None)
+    assert res_cwd_sym == ["# Source for secret lines 1-1\n"]
+
+    # 3. Clean execution without symlinks works normally
+    monkeypatch.setattr(Path, "is_symlink", orig_is_symlink)
+    u_clean = {"file": "sym_parent/target.py", "start": 1, "end": 2, "name": "foo"}
+    res_clean = extract_unit_source_code(u_clean, repo_root=str(repo))
+    assert res_clean == ["def foo():\n", "    pass\n"]
+
+    # 4. Absolute path through a symlink alias resolving to root is rejected
+    repo_alias = tmp_path / "repo_alias"
+    file_via_alias = repo_alias / "sym_parent" / "target.py"
+
+    def mock_alias_symlink(self: Path) -> bool:
+        if self == repo_alias or self.resolve() == repo_alias.resolve():
+            return True
+        return orig_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", mock_alias_symlink)
+    u_alias = {"file": str(file_via_alias), "start": 1, "end": 2, "name": "foo"}
+    res_alias = extract_unit_source_code(u_alias, repo_root=str(repo))
+    assert res_alias == ["# Source for foo lines 1-2\n"]
+
+
+def test_extract_unit_source_code_rejects_global_tempdir_when_repo_root_omitted(tmp_path: Path) -> None:
+    """Verifies that when repo_root is None, files in the system tempdir are rejected."""
+    secret_file = tmp_path / "secret.py"
+    secret_file.write_text("SECRET_KEY = 'secret'\n", encoding="utf-8")
+    u_secret = {"file": str(secret_file), "start": 1, "end": 1, "name": "secret"}
+    # When repo_root is omitted, tmp_path (outside CWD) must be rejected
+    res = extract_unit_source_code(u_secret, repo_root=None)
+    assert res == ["# Source for secret lines 1-1\n"]
+
+
+

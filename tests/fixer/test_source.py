@@ -18,6 +18,7 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _extract_required_typing_imports,
     _extract_unit_body_lines,
     _find_module_helper_insertion_index,
+    _get_module_imported_names,
     _insert_imports_into_module,
 )
 
@@ -42,7 +43,7 @@ def test_fixer_feedback_and_advanced_robustness(tmp_path: Path) -> None:
         "name": "outer:inner",
         "kind": "function",
     }
-    scope_inner = analyze_unit_variable_scope(u_inner)
+    scope_inner = analyze_unit_variable_scope(u_inner, repo_root=str(tmp_path))
     assert "count" in scope_inner["outputs"]
 
     file_ro = tmp_path / "nested_nonlocal_ro.py"
@@ -62,7 +63,7 @@ def test_fixer_feedback_and_advanced_robustness(tmp_path: Path) -> None:
         "name": "outer:inner",
         "kind": "function",
     }
-    scope_ro = analyze_unit_variable_scope(u_ro)
+    scope_ro = analyze_unit_variable_scope(u_ro, repo_root=str(tmp_path))
     assert "base" in scope_ro["inputs"]
     assert "base" not in scope_ro["outputs"]
 
@@ -80,7 +81,9 @@ def test_fixer_feedback_and_advanced_robustness(tmp_path: Path) -> None:
         "name": "stream_items",
         "kind": "function",
     }
-    helper_gen_from = synthesize_shared_helper_code(u_gen_from, u_gen_from, include_imports=True)
+    helper_gen_from = synthesize_shared_helper_code(
+        u_gen_from, u_gen_from, include_imports=True, repo_root=str(tmp_path)
+    )
     assert "-> Iterator[str]:" in helper_gen_from
     assert "from typing import Iterator, List" in helper_gen_from
 
@@ -97,7 +100,7 @@ def test_fixer_feedback_and_advanced_robustness(tmp_path: Path) -> None:
         "name": "yield_single",
         "kind": "function",
     }
-    helper_gen_val = synthesize_shared_helper_code(u_gen_val, u_gen_val)
+    helper_gen_val = synthesize_shared_helper_code(u_gen_val, u_gen_val, repo_root=str(tmp_path))
     assert "-> Iterator[int]:" in helper_gen_val
 
     # 3. Import deduplication in _insert_imports_into_module
@@ -418,6 +421,13 @@ def test_batch_82_get_module_imported_names_guarded_imports() -> None:
     assert "List" in imported
     assert "Sequence" in imported
 
+    unconditional = _get_module_imported_names(code, include_conditional=False)
+    assert "sys" in unconditional
+    assert "path" in unconditional
+    assert "Optional" not in unconditional
+    assert "List" not in unconditional
+    assert "Sequence" not in unconditional
+
 def test_batch_82_slice_unit_token_lines_single_line_bounds() -> None:
     """Verifies defensive single-line column bounds check in _slice_unit_token_lines."""
     from pydoppelgangerhunt.fixer import _slice_unit_token_lines  # pylint: disable=import-outside-toplevel
@@ -436,3 +446,96 @@ def test_batch_82_slice_unit_token_lines_single_line_bounds() -> None:
         list(line),
     )
     assert res_inverted == ["sum(x for x in data)"]
+
+
+def test_insert_imports_orders_future_annotations_first() -> None:
+    """Verifies _insert_imports_into_module ensures from __future__ is placed before other imports."""
+    orig_lines = [
+        "\"\"\"Docstring.\"\"\"\n",
+        "\n",
+        "import os\n",
+    ]
+    imports_to_add = [
+        "import sys",
+        "from __future__ import annotations",
+        "from typing import List",
+    ]
+    result = _insert_imports_into_module(orig_lines, imports_to_add)
+    result_text = "".join(result)
+    fut_pos = result_text.find("from __future__ import annotations")
+    sys_pos = result_text.find("import sys")
+    typing_pos = result_text.find("from typing import List")
+    assert fut_pos != -1
+    assert sys_pos != -1
+    assert typing_pos != -1
+    assert fut_pos < sys_pos
+    assert fut_pos < typing_pos
+
+
+def test_get_module_imported_names_dotted_imports() -> None:
+    """Verifies that dotted imports record both the root bound identifier and full module name."""
+    src = (
+        "import os.path\n"
+        "import xml.etree.ElementTree as ET\n"
+        "from urllib.parse import urlparse\n"
+        "if True:\n"
+        "    import posixpath.constants\n"
+    )
+    names = _get_module_imported_names(src, include_conditional=True)
+    assert "os" in names
+    assert "os.path" in names
+    assert "ET" in names
+    assert "urlparse" in names
+    assert "posixpath" in names
+    assert "posixpath.constants" in names
+
+
+def test_insert_imports_into_module_corrupt_source_fallback() -> None:
+    """Verifies that if source code causes ast.parse to raise ValueError, manual parser falls back gracefully."""
+    corrupt_lines = [
+        "\"\"\"Docstring with null\x00byte.\"\"\"\n",
+        "def compute():\n",
+        "    return 42\n",
+    ]
+    imports = ["import math"]
+    res = _insert_imports_into_module(corrupt_lines, imports)
+    res_text = "".join(res)
+    assert "import math" in res_text
+
+
+def test_extract_required_typing_imports_corrupt_source_fallback() -> None:
+    """Verifies that _extract_required_typing_imports handles ValueError from null bytes gracefully."""
+    corrupt_sig = "x: List[str]\x00 -> None"
+    # Should fall back to regex token matching and find List
+    res = _extract_required_typing_imports(corrupt_sig)
+    assert "List" in res
+
+
+def test_find_enclosing_ast_node_corrupt_source_fallback() -> None:
+    """Verifies that _find_innermost_enclosing_node handles ValueError from null bytes gracefully."""
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
+        _find_innermost_enclosing_node,
+    )
+
+    u = {"file": "test.py", "start": 1, "end": 2, "name": "foo", "kind": "function"}
+    res = _find_innermost_enclosing_node("def foo():\n    pass\x00", u, (ast.FunctionDef,))
+    assert res is None
+
+
+def test_find_module_helper_insertion_index_with_suppress() -> None:
+    """Verifies that helpers are placed after 'with suppress(ImportError): import ...' blocks."""
+    lines = [
+        "from contextlib import suppress\n",
+        "with suppress(ImportError):\n",
+        "    import optional_dep\n",
+        "\n",
+        "def first_func():\n",
+        "    pass\n",
+    ]
+    idx = _find_module_helper_insertion_index(lines)
+    assert idx >= 3
+
+    src = "".join(lines)
+    names = _get_module_imported_names(src, include_conditional=True)
+    assert "optional_dep" in names
+

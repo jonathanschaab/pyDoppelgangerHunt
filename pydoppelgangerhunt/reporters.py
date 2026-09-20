@@ -43,28 +43,68 @@ def colorize(text: str, color_code: str, enabled: bool) -> str:
 
 
 def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:
-    """Reads raw source code lines for a given unit from disk."""
+    """Reads raw source code lines for a given unit from provided lines or disk."""
+    s_d = int(unit.get("start") or 1)
+    e_d = int(unit.get("end") or s_d)
+    n_d = str(unit.get("name") or "unit")
+    placeholder = [f"# Source for {n_d} lines {s_d}-{e_d}\n"]
+
+    source_lines = unit.get("source_lines")
+    if source_lines is not None and isinstance(source_lines, (list, tuple)):
+        if not source_lines:
+            return placeholder
+        start = max(1, s_d)
+        end = min(len(source_lines), int(unit.get("end") or len(source_lines)))
+        return [
+            ln if ln.endswith("\n") else ln + "\n"
+            for ln in source_lines[start - 1 : end]
+        ]
+
     raw_file = str(unit.get("file") or "")
     f_raw = normalize_path_string(raw_file, strip_anchor=True)
     if not f_raw:
-        s_d = int(unit.get("start") or 1)
-        e_d = int(unit.get("end") or s_d)
-        n_d = str(unit.get("name") or "unit")
-        return [f"# Source for {n_d} lines {s_d}-{e_d}\n"]
+        return placeholder
+
     file_path = Path(f_raw)
-    if not file_path.is_file() and repo_root and not file_path.is_absolute():
-        file_path = Path(repo_root) / file_path
-    if not file_path.is_file():
-        s_d = int(unit.get("start") or 1)
-        e_d = int(unit.get("end") or s_d)
-        n_d = str(unit.get("name") or "unit")
-        return [f"# Source for {n_d} lines {s_d}-{e_d}\n"]
+    if file_path.suffix not in (".py", ".ipynb"):
+        return placeholder
+
+    if repo_root:
+        effective_root = Path(repo_root).resolve()
+        if effective_root.is_file():
+            effective_root = effective_root.parent
+        target_root = effective_root
+        if not file_path.is_absolute():
+            file_path = effective_root / file_path
+    else:
+        target_root = Path.cwd().resolve()
+        if not file_path.is_absolute():
+            file_path = target_root / file_path
+
+
     try:
-        if file_path.suffix == ".ipynb" and "#cell_" in raw_file:
+        if not file_path.is_file() or file_path.is_symlink():
+            return placeholder
+        for parent in file_path.parents:
+            if parent.is_symlink():
+                return placeholder
+            if parent == target_root:
+                break
+
+
+        resolved_file = file_path.resolve()
+        if resolved_file.is_symlink() or not resolved_file.is_file():
+            return placeholder
+        resolved_file.relative_to(target_root)
+    except (OSError, RuntimeError, ValueError):
+        return placeholder
+
+    try:
+        if resolved_file.suffix == ".ipynb" and "#cell_" in raw_file:
             try:
                 cell_idx_str = raw_file.split("#cell_", 1)[-1]
                 cell_idx = int(cell_idx_str) - 1
-                nb_data = json.loads(file_path.read_text(encoding="utf-8", errors="replace"))
+                nb_data = json.loads(resolved_file.read_text(encoding="utf-8", errors="replace"))
                 cells = nb_data.get("cells", [])
                 if 0 <= cell_idx < len(cells):
                     cell = cells[cell_idx]
@@ -76,9 +116,9 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
             except (json.JSONDecodeError, ValueError):
                 all_lines = []
         else:
-            with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
+            with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
                 all_lines = fh.readlines()
-        start = max(1, int(unit.get("start") or 1))
+        start = max(1, s_d)
         end = min(len(all_lines), int(unit.get("end") or len(all_lines)))
         return all_lines[start - 1 : end]
     except OSError:

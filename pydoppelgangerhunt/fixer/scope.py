@@ -60,8 +60,18 @@ def _normalize_receiver_attrs(
     """Normalizes a collection of receiver attribute strings to canonical '<rec>.*' form."""
     return {_normalize_receiver_attr_name(a, receiver_param) for a in attrs}
 
+def _extract_arg_names(args: ast.arguments) -> Set[str]:
+    """Extracts all parameter names from an ast.arguments node."""
+    arg_set = {a.arg for a in (args.posonlyargs + args.args + args.kwonlyargs)}
+    if args.vararg:
+        arg_set.add(args.vararg.arg)
+    if args.kwarg:
+        arg_set.add(args.kwarg.arg)
+    return arg_set
+
 
 class _ScopeVisitor(ast.NodeVisitor):
+
     """Inspects AST loads, stores, function parameters, returns, nonlocals, globals, and attributes."""
 
     def __init__(
@@ -124,7 +134,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         if arg_node.annotation is not None:
             try:
                 type_val = ast.unparse(arg_node.annotation)
-            except Exception as exc:  # pylint: disable=broad-exception-caught
+            except Exception as exc:
                 logger.debug("Failed to unparse argument annotation %r: %s", arg_node.annotation, exc)
                 type_val = None
 
@@ -132,7 +142,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         if default_node is not None:
             try:
                 default_val = ast.unparse(default_node)
-            except Exception as exc:  # pylint: disable=broad-exception-caught
+            except Exception as exc:
                 logger.debug("Failed to unparse default value %r: %s", default_node, exc)
                 default_val = None
 
@@ -148,7 +158,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         if node.returns is not None:
             try:
                 self.return_type = ast.unparse(node.returns)
-            except Exception as exc:  # pylint: disable=broad-exception-caught
+            except Exception as exc:
                 logger.debug("Failed to unparse return annotation %r: %s", node.returns, exc)
                 self.return_type = None
 
@@ -168,14 +178,8 @@ class _ScopeVisitor(ast.NodeVisitor):
 
         self._record_arg(node.args.kwarg, None, "kwarg")
 
-    @staticmethod
-    def _extract_arg_names(args: ast.arguments) -> Set[str]:
-        arg_set = {a.arg for a in (args.posonlyargs + args.args + args.kwonlyargs)}
-        if args.vararg:
-            arg_set.add(args.vararg.arg)
-        if args.kwarg:
-            arg_set.add(args.kwarg.arg)
-        return arg_set
+    _extract_arg_names = staticmethod(_extract_arg_names)
+
 
     def _record_store_name(self, name: str) -> None:
         if len(self._scope_stack) <= 1 or name in self.nonlocals:
@@ -564,11 +568,16 @@ class _ScopeVisitor(ast.NodeVisitor):
         if stmt is None:
             try:
                 stmt = ast.unparse(node)
-            except Exception as exc:  # pylint: disable=broad-exception-caught
+            except Exception as exc:
                 logger.debug("Failed to unparse import node %r: %s", node, exc)
                 return
 
-        if stmt not in self.local_imports:
+        is_nested = (
+            len(self._scope_stack) > 0
+            if self.is_subroutine
+            else len(self._scope_stack) > 1
+        )
+        if not is_nested and stmt not in self.local_imports:
             self.local_imports.append(stmt)
         for alias in node.names:
             if isinstance(node, ast.Import):
@@ -576,7 +585,8 @@ class _ScopeVisitor(ast.NodeVisitor):
             else:
                 bound_name = alias.asname or alias.name
             if bound_name != "*":
-                self.imported_names[bound_name] = stmt
+                if not is_nested:
+                    self.imported_names[bound_name] = stmt
                 self._record_store_name(bound_name)
 
     def visit_Import(self, node: ast.Import) -> None:
@@ -1202,7 +1212,7 @@ def _inspect_unit_scope(
                 if isinstance(wrapper_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     candidate_stmts = wrapper_fn.body
             break
-        except SyntaxError:
+        except (SyntaxError, ValueError, UnicodeDecodeError):
             continue
 
     if tree is None:
@@ -1419,6 +1429,7 @@ def analyze_unit_variable_scope(
         has_super = bool(info1.get("has_super", False) or info2.get("has_super", False))
         has_mangled = bool(info1.get("has_mangled_names", False) or info2.get("has_mangled_names", False))
         local_imports = list(dict.fromkeys(info1["local_imports"] + info2["local_imports"]))
+        local_imports_by_unit = [info1["local_imports"], info2["local_imports"]]
         yield_expr_names = info1["yield_expr_names"] + info2["yield_expr_names"]
         is_async = info1.get("is_async", False) or info2.get("is_async", False)
         conditional_outputs = list(dict.fromkeys(
@@ -1443,6 +1454,7 @@ def analyze_unit_variable_scope(
         has_super = bool(info1.get("has_super", False))
         has_mangled = bool(info1.get("has_mangled_names", False))
         local_imports = info1["local_imports"]
+        local_imports_by_unit = [info1["local_imports"]]
         yield_expr_names = info1["yield_expr_names"]
         is_async = info1.get("is_async", False)
         conditional_outputs = info1.get("conditional_outputs", [])
@@ -1483,6 +1495,7 @@ def analyze_unit_variable_scope(
         "has_super": has_super,
         "has_mangled_names": has_mangled,
         "local_imports": local_imports,
+        "local_imports_by_unit": local_imports_by_unit,
         "yield_expr_names": yield_expr_names,
         "is_async": is_async,
         "conditional_outputs": conditional_outputs,

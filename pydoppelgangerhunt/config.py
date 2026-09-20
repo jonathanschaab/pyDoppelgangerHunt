@@ -272,9 +272,9 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
     # Prefer standard library tomllib (Python 3.11+) or third-party tomli if installed
     try:
         if sys.version_info >= (3, 11):
-            import tomllib  # pylint: disable=import-outside-toplevel
+            import tomllib
         else:
-            import tomli as tomllib  # type: ignore # pylint: disable=import-outside-toplevel
+            import tomli as tomllib  # type: ignore
         with open(target_path, "rb") as fh:
             data = tomllib.load(fh)
         tool_sec = data.get("tool", {}) if isinstance(data, dict) else {}

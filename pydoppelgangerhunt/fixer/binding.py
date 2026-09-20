@@ -25,7 +25,7 @@ def _find_innermost_enclosing_node(
 
     try:
         tree = ast.parse(source_text)
-    except SyntaxError:
+    except (SyntaxError, ValueError, UnicodeDecodeError):
         return None
 
     u_start = int(unit.get("start") or 0)
@@ -198,15 +198,17 @@ def _is_same_file_path(
         return False
     norm1 = normalize_path_string(f1_str)
     norm2 = normalize_path_string(f2_str)
-    if paths_match_boundary(norm1, norm2):
-        return True
     root = Path(repo_root or os.getcwd())
     try:
         p1 = Path(norm1)
         p2 = Path(norm2)
         p1_full = p1 if p1.is_file() or p1.is_absolute() else (root / p1)
         p2_full = p2 if p2.is_file() or p2.is_absolute() else (root / p2)
-        if p1_full.resolve() == p2_full.resolve():
+        if p1_full.is_symlink() or p2_full.is_symlink():
+            return False
+        if p1_full.is_file() and p2_full.is_file():
+            return p1_full.resolve() == p2_full.resolve()
+        if paths_match_boundary(norm1, norm2):
             return True
     except OSError:
         return False

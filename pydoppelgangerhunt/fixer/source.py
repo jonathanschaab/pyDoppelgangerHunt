@@ -60,7 +60,7 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
                         b_col = getattr(first_body, "col_offset", 0)
                         extracted[0] = extracted[0][b_col:]
                     return textwrap.dedent("\n".join(extracted)).splitlines()
-    except Exception:  # pylint: disable=broad-exception-caught
+    except Exception:
         pass
     return raw_lines
 
@@ -101,7 +101,7 @@ def _find_module_helper_insertion_index(lines: List[str]) -> int:
 
     try:
         tree = ast.parse("".join(lines))
-    except SyntaxError:
+    except (SyntaxError, ValueError, UnicodeDecodeError):
         return min_insert_idx
 
     last_import_line = 0
@@ -119,7 +119,10 @@ def _find_module_helper_insertion_index(lines: List[str]) -> int:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             end_l = getattr(node, "end_lineno", node.lineno)
             last_import_line = max(last_import_line, end_l)
-        elif isinstance(node, (ast.Try, getattr(ast, "TryStar", ast.Try), ast.If)):
+        elif isinstance(
+            node,
+            (ast.Try, getattr(ast, "TryStar", ast.Try), ast.If, ast.With, ast.AsyncWith),
+        ):
             for sub in ast.walk(node):
                 if isinstance(sub, (ast.Import, ast.ImportFrom)):
                     end_l = getattr(node, "end_lineno", node.lineno)
@@ -148,23 +151,37 @@ def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]
     return res
 
 
-def _get_module_imported_names(source: str) -> Set[str]:
+def _get_module_imported_names(
+    source: str, include_conditional: bool = True
+) -> Set[str]:
     """Extracts top-level imported module and symbol names from source code."""
     try:
         tree = ast.parse(source)
-    except SyntaxError:
+    except (SyntaxError, ValueError, UnicodeDecodeError):
         return set()
     imported: Set[str] = set()
     for stmt in tree.body:
         if isinstance(stmt, ast.Import):
             for alias in stmt.names:
-                imported.add(alias.asname or alias.name)
+                imported.add(alias.asname or alias.name.split(".", maxsplit=1)[0])
+                if not alias.asname and "." in alias.name:
+                    imported.add(alias.name)
         elif isinstance(stmt, ast.ImportFrom):
             for alias in stmt.names:
                 imported.add(alias.asname or alias.name)
-        elif isinstance(stmt, (ast.If, ast.Try, getattr(ast, "TryStar", ast.Try))):
+        elif include_conditional and isinstance(
+            stmt,
+            (ast.If, ast.Try, getattr(ast, "TryStar", ast.Try), ast.With, ast.AsyncWith),
+        ):
             for sub in ast.walk(stmt):
-                if isinstance(sub, (ast.Import, ast.ImportFrom)):
+                if isinstance(sub, ast.Import):
+                    for alias in sub.names:
+                        imported.add(
+                            alias.asname or alias.name.split(".", maxsplit=1)[0]
+                        )
+                        if not alias.asname and "." in alias.name:
+                            imported.add(alias.name)
+                elif isinstance(sub, ast.ImportFrom):
                     for alias in sub.names:
                         imported.add(alias.asname or alias.name)
     return imported
@@ -178,7 +195,9 @@ def _insert_imports_into_module(
     if not import_lines:
         return orig_lines
 
-    existing_stripped = {ln.strip() for ln in orig_lines}
+    existing_stripped = {
+        ln.strip() for ln in orig_lines if ln and not ln[0].isspace()
+    }
     seen: Set[str] = set()
     deduped_imports: List[str] = []
     for imp in import_lines:
@@ -186,6 +205,13 @@ def _insert_imports_into_module(
         if s not in existing_stripped and s not in seen:
             seen.add(s)
             deduped_imports.append(imp)
+    future_imps = [
+        imp for imp in deduped_imports if imp.strip().startswith("from __future__")
+    ]
+    other_imps = [
+        imp for imp in deduped_imports if not imp.strip().startswith("from __future__")
+    ]
+    deduped_imports = future_imps + other_imps
     if not deduped_imports:
         return orig_lines
 
@@ -207,7 +233,7 @@ def _insert_imports_into_module(
         while insert_idx < len(orig_lines) and not orig_lines[insert_idx].strip():
             insert_idx += 1
         parsed_with_ast = True
-    except SyntaxError:
+    except (SyntaxError, ValueError, UnicodeDecodeError):
         pass
 
     if not parsed_with_ast:
