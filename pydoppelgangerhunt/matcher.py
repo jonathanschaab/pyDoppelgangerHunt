@@ -15,7 +15,7 @@ from pydoppelgangerhunt.config import (
     normalize_path_string,
     paths_match_boundary,
 )
-from pydoppelgangerhunt.baseline import _safe_index_frequency, _safe_total_units
+from pydoppelgangerhunt.baseline import _safe_index_frequency, _safe_min_corpus, _safe_total_units
 from pydoppelgangerhunt.parser import harvest_file_units
 
 DEFAULT_STOP_SHINGLES: Set[Tuple[str, ...]] = {
@@ -898,19 +898,7 @@ def scan_target(
         if corpus_calibration is not None and "min_corpus_size" in corpus_calibration
         else min_corpus_size
     )
-    parsed_min_corpus: Optional[int] = None
-    if raw_calib_min_corpus is not None:
-        try:
-            val = int(raw_calib_min_corpus)
-            if val >= 0:
-                parsed_min_corpus = val
-        except (ValueError, TypeError, OverflowError):
-            pass
-    effective_min_corpus = (
-        parsed_min_corpus
-        if parsed_min_corpus is not None
-        else (4 if filter_stop_shingles else 30)
-    )
+    effective_min_corpus = _safe_min_corpus(raw_calib_min_corpus, filter_stop_shingles)
 
     candidate_pairs: Set[Tuple[int, int]] = set()
     calib_freqs_map: Optional[Dict[Any, Any]] = None

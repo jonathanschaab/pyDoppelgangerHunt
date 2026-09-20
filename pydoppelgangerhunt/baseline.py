@@ -37,6 +37,18 @@ def _safe_total_units(raw_units: Any) -> int:
     return 0
 
 
+def _safe_min_corpus(raw_min_corpus: Any, filter_stop_shingles: bool = False) -> int:
+    """Sanitizes min_corpus_size to a non-negative int, or default based on filter_stop_shingles."""
+    if raw_min_corpus is not None:
+        try:
+            val = int(raw_min_corpus)
+            if val >= 0:
+                return val
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return 4 if filter_stop_shingles else 30
+
+
 def _serialize_shingle_key(sh: Any) -> str:
     """Serializes a shingle key into a type-tagged string representation for JSON."""
     if isinstance(sh, (tuple, list)):
@@ -189,19 +201,7 @@ def compute_corpus_calibration(
         for sh in keys:
             shingle_frequencies[sh] = shingle_frequencies.get(sh, 0) + 1
 
-    parsed_min_corpus: Optional[int] = None
-    if min_corpus_size is not None:
-        try:
-            val = int(min_corpus_size)
-            if val >= 0:
-                parsed_min_corpus = val
-        except (ValueError, TypeError, OverflowError):
-            pass
-    effective_min_corpus = (
-        parsed_min_corpus
-        if parsed_min_corpus is not None
-        else (4 if filter_stop_shingles else 30)
-    )
+    effective_min_corpus = _safe_min_corpus(min_corpus_size, filter_stop_shingles)
     global_stop_shingles: Set[Any] = set()
     if filter_stop_shingles:
         from pydoppelgangerhunt.matcher import DEFAULT_STOP_SHINGLES
