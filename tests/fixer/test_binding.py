@@ -44,7 +44,7 @@ def test_scope_binding_instance_and_class_detection(tmp_path: Path) -> None:
     src.write_text(code, encoding="utf-8")
 
     u_inst = {"file": str(src), "start": 2, "end": 4, "name": "run_instance", "kind": "function"}
-    scope_inst = analyze_unit_variable_scope(u_inst)
+    scope_inst = analyze_unit_variable_scope(u_inst, repo_root=str(tmp_path))
     assert scope_inst["has_instance_binding"] is True
     assert scope_inst["has_class_binding"] is False
     assert scope_inst["binding_kind"] == "instance"
@@ -52,7 +52,7 @@ def test_scope_binding_instance_and_class_detection(tmp_path: Path) -> None:
     assert "self.base_value" in scope_inst["instance_attrs"] or "self.total" in scope_inst["instance_attrs"]
 
     u_cls = {"file": str(src), "start": 6, "end": 9, "name": "run_class", "kind": "function"}
-    scope_cls = analyze_unit_variable_scope(u_cls)
+    scope_cls = analyze_unit_variable_scope(u_cls, repo_root=str(tmp_path))
     assert scope_cls["has_class_binding"] is True
     assert scope_cls["has_instance_binding"] is False
     assert scope_cls["binding_kind"] == "class"
@@ -60,7 +60,7 @@ def test_scope_binding_instance_and_class_detection(tmp_path: Path) -> None:
     assert "cls.count" in scope_cls["class_attrs"]
 
     u_plain = {"file": str(src), "start": 11, "end": 12, "name": "run_plain", "kind": "function"}
-    scope_plain = analyze_unit_variable_scope(u_plain)
+    scope_plain = analyze_unit_variable_scope(u_plain, repo_root=str(tmp_path))
     assert scope_plain["has_instance_binding"] is False
     assert scope_plain["has_class_binding"] is False
     assert scope_plain["binding_kind"] is None
@@ -311,7 +311,7 @@ def test_receiver_bound_mixed_kind_declines_replacement(tmp_path: Path) -> None:
     }
 
     # Synthesis must return empty string
-    helper = synthesize_shared_helper_code(u1, u2)
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert helper == ""
 
     # Patch generation must skip / return empty patch

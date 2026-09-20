@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 import sys
-import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 from pydoppelgangerhunt.config import normalize_path_string
@@ -78,21 +77,10 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
         if not file_path.is_absolute():
             file_path = effective_root / file_path
     else:
-        cwd_root = Path.cwd().resolve()
+        target_root = Path.cwd().resolve()
         if not file_path.is_absolute():
-            target_root = cwd_root
-            file_path = cwd_root / file_path
-        else:
-            temp_root = Path(tempfile.gettempdir()).resolve()
-            try:
-                file_path.resolve().relative_to(cwd_root)
-                target_root = cwd_root
-            except ValueError:
-                try:
-                    file_path.resolve().relative_to(temp_root)
-                    target_root = temp_root
-                except ValueError:
-                    return placeholder
+            file_path = target_root / file_path
+
 
     try:
         if not file_path.is_file() or file_path.is_symlink():

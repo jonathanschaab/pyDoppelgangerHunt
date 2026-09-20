@@ -691,3 +691,14 @@ def test_extract_unit_source_code_symlink_parents_and_root_containment(
     assert res_alias == ["# Source for foo lines 1-2\n"]
 
 
+def test_extract_unit_source_code_rejects_global_tempdir_when_repo_root_omitted(tmp_path: Path) -> None:
+    """Verifies that when repo_root is None, files in the system tempdir are rejected."""
+    secret_file = tmp_path / "secret.py"
+    secret_file.write_text("SECRET_KEY = 'secret'\n", encoding="utf-8")
+    u_secret = {"file": str(secret_file), "start": 1, "end": 1, "name": "secret"}
+    # When repo_root is omitted, tmp_path (outside CWD) must be rejected
+    res = extract_unit_source_code(u_secret, repo_root=None)
+    assert res == ["# Source for secret lines 1-1\n"]
+
+
+

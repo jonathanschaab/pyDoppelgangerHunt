@@ -43,7 +43,7 @@ def test_fixer_feedback_and_advanced_robustness(tmp_path: Path) -> None:
         "name": "outer:inner",
         "kind": "function",
     }
-    scope_inner = analyze_unit_variable_scope(u_inner)
+    scope_inner = analyze_unit_variable_scope(u_inner, repo_root=str(tmp_path))
     assert "count" in scope_inner["outputs"]
 
     file_ro = tmp_path / "nested_nonlocal_ro.py"
@@ -63,7 +63,7 @@ def test_fixer_feedback_and_advanced_robustness(tmp_path: Path) -> None:
         "name": "outer:inner",
         "kind": "function",
     }
-    scope_ro = analyze_unit_variable_scope(u_ro)
+    scope_ro = analyze_unit_variable_scope(u_ro, repo_root=str(tmp_path))
     assert "base" in scope_ro["inputs"]
     assert "base" not in scope_ro["outputs"]
 
@@ -81,7 +81,9 @@ def test_fixer_feedback_and_advanced_robustness(tmp_path: Path) -> None:
         "name": "stream_items",
         "kind": "function",
     }
-    helper_gen_from = synthesize_shared_helper_code(u_gen_from, u_gen_from, include_imports=True)
+    helper_gen_from = synthesize_shared_helper_code(
+        u_gen_from, u_gen_from, include_imports=True, repo_root=str(tmp_path)
+    )
     assert "-> Iterator[str]:" in helper_gen_from
     assert "from typing import Iterator, List" in helper_gen_from
 
@@ -98,7 +100,7 @@ def test_fixer_feedback_and_advanced_robustness(tmp_path: Path) -> None:
         "name": "yield_single",
         "kind": "function",
     }
-    helper_gen_val = synthesize_shared_helper_code(u_gen_val, u_gen_val)
+    helper_gen_val = synthesize_shared_helper_code(u_gen_val, u_gen_val, repo_root=str(tmp_path))
     assert "-> Iterator[int]:" in helper_gen_val
 
     # 3. Import deduplication in _insert_imports_into_module

@@ -49,11 +49,11 @@ def test_fixer_control_flow_and_side_effect_safety(tmp_path: Path) -> None:
         "name": "outer_loop:If",
         "kind": "compound_block",
     }
-    scope_break = analyze_unit_variable_scope(u_break)
+    scope_break = analyze_unit_variable_scope(u_break, repo_root=str(tmp_path))
     assert "naked_break" in scope_break["control_flow_hazards"]
     assert scope_break["is_control_flow_safe"] is False
 
-    helper_break = synthesize_shared_helper_code(u_break, u_break)
+    helper_break = synthesize_shared_helper_code(u_break, u_break, repo_root=str(tmp_path))
     assert "WARNING: Non-local control flow hazard detected" in helper_break
     assert "naked_break" in helper_break
 
@@ -65,7 +65,7 @@ def test_fixer_control_flow_and_side_effect_safety(tmp_path: Path) -> None:
         "name": "outer_loop:For",
         "kind": "compound_block",
     }
-    scope_loop = analyze_unit_variable_scope(u_loop)
+    scope_loop = analyze_unit_variable_scope(u_loop, repo_root=str(tmp_path))
     # Inside loop, break and continue are enclosed, so not naked
     assert "naked_break" not in scope_loop["control_flow_hazards"]
     assert "naked_continue" not in scope_loop["control_flow_hazards"]
@@ -86,11 +86,11 @@ def test_fixer_control_flow_and_side_effect_safety(tmp_path: Path) -> None:
         "name": "compute:If",
         "kind": "compound_block",
     }
-    scope_emb_ret = analyze_unit_variable_scope(u_emb_ret)
+    scope_emb_ret = analyze_unit_variable_scope(u_emb_ret, repo_root=str(tmp_path))
     assert "embedded_return" in scope_emb_ret["control_flow_hazards"]
     assert scope_emb_ret["is_control_flow_safe"] is False
 
-    helper_emb_ret = synthesize_shared_helper_code(u_emb_ret, u_emb_ret)
+    helper_emb_ret = synthesize_shared_helper_code(u_emb_ret, u_emb_ret, repo_root=str(tmp_path))
     assert "embedded_return" in helper_emb_ret
 
     # 3. Test generator yield detection
@@ -102,10 +102,10 @@ def test_fixer_control_flow_and_side_effect_safety(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     u_gen = {"file": str(file_gen), "start": 1, "end": 3, "name": "number_stream", "kind": "function"}
-    scope_gen = analyze_unit_variable_scope(u_gen)
+    scope_gen = analyze_unit_variable_scope(u_gen, repo_root=str(tmp_path))
     assert scope_gen["has_yield"] is True
     assert "generator_yield" in scope_gen["control_flow_hazards"]
-    helper_gen = synthesize_shared_helper_code(u_gen, u_gen)
+    helper_gen = synthesize_shared_helper_code(u_gen, u_gen, repo_root=str(tmp_path))
     assert "-> Iterator[Any]:" in helper_gen
 
     # 4. Test multiple local reassignments and tuple return synthesis
@@ -127,12 +127,12 @@ def test_fixer_control_flow_and_side_effect_safety(tmp_path: Path) -> None:
         "name": "process_batch:stmts_4-5",
         "kind": "sliding_window",
     }
-    scope_mut = analyze_unit_variable_scope(u_mut)
+    scope_mut = analyze_unit_variable_scope(u_mut, repo_root=str(tmp_path))
     assert "total" in scope_mut["outputs"]
     assert "count" in scope_mut["outputs"]
     assert len(scope_mut["outputs"]) >= 2
 
-    helper_mut = synthesize_shared_helper_code(u_mut, u_mut)
+    helper_mut = synthesize_shared_helper_code(u_mut, u_mut, repo_root=str(tmp_path))
     assert "Tuple[" in helper_mut
     assert "return total, count" in helper_mut
     assert "Call site:" in helper_mut
@@ -146,7 +146,7 @@ def test_fixer_control_flow_and_side_effect_safety(tmp_path: Path) -> None:
         "name": "process_batch",
         "kind": "function",
     }
-    scope_fn_ret = analyze_unit_variable_scope(u_fn_ret)
+    scope_fn_ret = analyze_unit_variable_scope(u_fn_ret, repo_root=str(tmp_path))
     assert "total" in scope_fn_ret["outputs"]
     assert "count" in scope_fn_ret["outputs"]
 
@@ -161,11 +161,13 @@ def test_fixer_control_flow_and_side_effect_safety(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     u_imp = {"file": str(file_imp), "start": 1, "end": 5, "name": "parse_config", "kind": "function"}
-    scope_imp = analyze_unit_variable_scope(u_imp)
+    scope_imp = analyze_unit_variable_scope(u_imp, repo_root=str(tmp_path))
     assert "import json" in scope_imp["local_imports"]
     assert "from collections import deque" in scope_imp["local_imports"]
 
-    helper_with_imports = synthesize_shared_helper_code(u_mut, u_mut, include_imports=True)
+    helper_with_imports = synthesize_shared_helper_code(
+        u_mut, u_mut, include_imports=True, repo_root=str(tmp_path)
+    )
     assert "from typing import" in helper_with_imports
     assert "Tuple" in helper_with_imports
 
@@ -197,11 +199,11 @@ def test_conditional_variable_escape_prevention(tmp_path: Path) -> None:
     src_file.write_text(code, encoding="utf-8")
 
     u_block = {"file": str(src_file), "start": 2, "end": 3, "name": "compute_summary:If", "kind": "compound_block"}
-    scope = analyze_unit_variable_scope(u_block)
+    scope = analyze_unit_variable_scope(u_block, repo_root=str(tmp_path))
     assert "metric" in scope["conditional_outputs"]
     assert "flag" in scope["inputs"]
 
-    helper_code = synthesize_shared_helper_code(u_block, u_block)
+    helper_code = synthesize_shared_helper_code(u_block, u_block, repo_root=str(tmp_path))
     assert "metric = None" in helper_code
     assert "Optional" in helper_code
 
@@ -226,11 +228,11 @@ def test_async_coroutine_context_synthesis(tmp_path: Path) -> None:
     src_file.write_text(code, encoding="utf-8")
 
     u_async = {"file": str(src_file), "start": 2, "end": 3, "name": "process_item:AsyncWith", "kind": "compound_block"}
-    scope = analyze_unit_variable_scope(u_async)
+    scope = analyze_unit_variable_scope(u_async, repo_root=str(tmp_path))
     assert scope["is_async"] is True
     assert "item_id" in scope["inputs"]
 
-    helper_code = synthesize_shared_helper_code(u_async, u_async)
+    helper_code = synthesize_shared_helper_code(u_async, u_async, repo_root=str(tmp_path))
     assert helper_code.startswith("async def _shared_process_item")
     assert "await _shared_process_item" in helper_code
     # Must compile cleanly as an async function without SyntaxError
@@ -252,11 +254,11 @@ def test_global_and_nonlocal_scope_preservation(tmp_path: Path) -> None:
     src_file.write_text(code, encoding="utf-8")
 
     u_scope = {"file": str(src_file), "start": 2, "end": 5, "name": "outer:compound", "kind": "compound_block"}
-    scope = analyze_unit_variable_scope(u_scope)
+    scope = analyze_unit_variable_scope(u_scope, repo_root=str(tmp_path))
     assert "global_metric" in scope["globals"]
     assert "captured_scale" in scope["nonlocals"]
 
-    helper_code = synthesize_shared_helper_code(u_scope, u_scope)
+    helper_code = synthesize_shared_helper_code(u_scope, u_scope, repo_root=str(tmp_path))
     # Synthesis must be declined for nonlocal-dependent units to avoid compile-time SyntaxError
     assert helper_code == ""
 
@@ -269,7 +271,7 @@ def test_global_and_nonlocal_scope_preservation(tmp_path: Path) -> None:
     src_glob = tmp_path / "scope_glob_src.py"
     src_glob.write_text(code_glob, encoding="utf-8")
     u_glob = {"file": str(src_glob), "start": 2, "end": 3, "name": "outer:compound", "kind": "compound_block"}
-    helper_glob = synthesize_shared_helper_code(u_glob, u_glob)
+    helper_glob = synthesize_shared_helper_code(u_glob, u_glob, repo_root=str(tmp_path))
     assert "global global_metric" in helper_glob
     assert "return" not in helper_glob
 
@@ -303,11 +305,11 @@ def test_synthesize_helper_with_pragma_and_import_preservation(tmp_path: Path) -
     u2 = {"file": str(f2), "start": 1, "end": 5, "name": "process_b", "kind": "function"}
 
     # Scope analysis captures local import with # type: ignore intact
-    scope = analyze_unit_variable_scope(u1)
+    scope = analyze_unit_variable_scope(u1, repo_root=str(tmp_path))
     assert any("# type: ignore" in imp for imp in scope.get("local_imports", []))
 
     # Shared helper synthesis preserves comments and # type: ignore pragma
-    helper = synthesize_shared_helper_code(u1, u2, preserve_pragmas=True)
+    helper = synthesize_shared_helper_code(u1, u2, preserve_pragmas=True, repo_root=str(tmp_path))
     assert "# type: ignore[operator]" in helper
 
 def test_mixed_binding_preserves_cls_argument(tmp_path: Path) -> None:
@@ -321,7 +323,7 @@ def test_mixed_binding_preserves_cls_argument(tmp_path: Path) -> None:
     )
     f.write_text(code, encoding="utf-8")
     u = {"file": str(f), "start": 2, "end": 4, "name": "build_item", "kind": "function", "enclosing_class": "WidgetFactory"}
-    scope = analyze_unit_variable_scope(u)
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
     assert scope.get("binding_kind") == "mixed"
     assert scope.get("has_instance_binding") is True
     assert scope.get("has_class_binding") is True
