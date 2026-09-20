@@ -1588,6 +1588,7 @@ def test_differential_scan_calibrated_pruning_prevents_false_negatives(tmp_path:
         "total_units": 1000,
         "max_index_frequency": 0.25,
         "min_lines": 6,
+        "min_corpus_size": 4,
         "global_stop_shingles": set(),
         "shingle_frequencies": {},
     }
@@ -3095,6 +3096,22 @@ def test_calibration_bounds_and_frequency_cutoff_compatibility(tmp_path: Path) -
         corpus_calibration=calib_base_8,
     )
     assert len(clones_strict) == 0
+
+    # 6. min_corpus_size compatibility and scan-argument authoritativeness
+    c_mcs_4 = compute_corpus_calibration([], min_corpus_size=4)
+    assert _is_calibration_mode_compatible(c_mcs_4, min_corpus_size=100) is False
+    assert _is_calibration_mode_compatible(c_mcs_4, min_corpus_size=4) is True
+    assert _is_calibration_mode_compatible(c_mcs_4, min_corpus_size=None) is True
+
+    clones_mcs_override = scan_target(
+        str(repo_dir),
+        min_lines=6,
+        min_tokens=5,
+        min_corpus_size=100,
+        corpus_calibration=c_mcs_4,
+    )
+    assert len(clones_mcs_override) == 1
+
 
 
 

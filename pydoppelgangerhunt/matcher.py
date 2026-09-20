@@ -625,6 +625,7 @@ def _is_calibration_mode_compatible(
     call_sequences: bool = False,
     filter_stop_shingles: bool = False,
     max_index_frequency: Optional[float] = 0.25,
+    min_corpus_size: Optional[int] = None,
     **kwargs: Any,
 ) -> bool:
     """Validates that corpus calibration was generated with compatible representation, filtering, and AST shaping features."""
@@ -636,6 +637,12 @@ def _is_calibration_mode_compatible(
         return False
     if _safe_bool(calib.get("filter_stop_shingles", False)) and not filter_stop_shingles:
         return False
+
+    if min_corpus_size is not None:
+        scan_mcs = _safe_min_corpus(min_corpus_size, filter_stop_shingles)
+        calib_mcs = _safe_min_corpus(calib.get("min_corpus_size"), filter_stop_shingles)
+        if scan_mcs != calib_mcs:
+            return False
 
     calib_freq = (
         _safe_index_frequency(calib["max_index_frequency"])
@@ -872,6 +879,7 @@ def scan_target(
         call_sequences=call_sequences,
         filter_stop_shingles=filter_stop_shingles,
         max_index_frequency=max_index_frequency,
+        min_corpus_size=min_corpus_size,
         **harvest_mode_opts,
     ):
         corpus_calibration = None
@@ -947,12 +955,16 @@ def scan_target(
                 continue
             shingle_index.setdefault(sh, []).append(idx)
 
-    raw_calib_min_corpus = (
-        corpus_calibration.get("min_corpus_size")
-        if corpus_calibration is not None and "min_corpus_size" in corpus_calibration
-        else min_corpus_size
+    raw_min_corpus = (
+        min_corpus_size
+        if min_corpus_size is not None
+        else (
+            corpus_calibration.get("min_corpus_size")
+            if corpus_calibration is not None and "min_corpus_size" in corpus_calibration
+            else None
+        )
     )
-    effective_min_corpus = _safe_min_corpus(raw_calib_min_corpus, filter_stop_shingles)
+    effective_min_corpus = _safe_min_corpus(raw_min_corpus, filter_stop_shingles)
 
     candidate_pairs: Set[Tuple[int, int]] = set()
     calib_freqs_map: Optional[Dict[Any, Any]] = None
