@@ -189,9 +189,17 @@ def compute_corpus_calibration(
         for sh in keys:
             shingle_frequencies[sh] = shingle_frequencies.get(sh, 0) + 1
 
+    parsed_min_corpus: Optional[int] = None
+    if min_corpus_size is not None:
+        try:
+            val = int(min_corpus_size)
+            if val >= 0:
+                parsed_min_corpus = val
+        except (ValueError, TypeError, OverflowError):
+            pass
     effective_min_corpus = (
-        min_corpus_size
-        if min_corpus_size is not None
+        parsed_min_corpus
+        if parsed_min_corpus is not None
         else (4 if filter_stop_shingles else 30)
     )
     global_stop_shingles: Set[Any] = set()

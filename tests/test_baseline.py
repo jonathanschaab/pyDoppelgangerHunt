@@ -2598,6 +2598,54 @@ def test_diff_scan_prunes_uncalibrated_shingles_matching_many_unmodified_units(t
     assert len(cross_diff_clones) >= 1
 
 
+def test_min_corpus_size_malformed_fallback(tmp_path: Path) -> None:
+    """Verifies that non-integer, negative, or invalid min_corpus_size safely falls back without raising errors."""
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.baseline import compute_corpus_calibration  # pylint: disable=import-outside-toplevel
+
+    code_file = tmp_path / "min_corpus_sample.py"
+    code_file.write_text(
+        "def helper_sample_one(a, b, c, d):\n"
+        "    x = (a * 2) + (b * 3)\n"
+        "    y = (c * 4) + (d * 5)\n"
+        "    return x + y if x > y else y - x\n\n"
+        "def helper_sample_two(a, b, c, d):\n"
+        "    x = (a * 2) + (b * 3)\n"
+        "    y = (c * 4) + (d * 5)\n"
+        "    return x + y if x > y else y - x\n",
+        encoding="utf-8",
+    )
+
+    # 1. Invalid min_corpus_size in corpus_calibration
+    clones = scan_target(
+        str(tmp_path),
+        min_lines=2,
+        corpus_calibration={"min_corpus_size": "invalid", "total_units": 10},  # type: ignore[dict-item]
+    )
+    assert len(clones) >= 1
+
+    # 2. Negative min_corpus_size in corpus_calibration
+    clones_neg = scan_target(
+        str(tmp_path),
+        min_lines=2,
+        corpus_calibration={"min_corpus_size": -50, "total_units": 10},
+    )
+    assert len(clones_neg) >= 1
+
+    # 3. Direct invalid min_corpus_size parameter in scan_target
+    clones_arg = scan_target(
+        str(tmp_path),
+        min_lines=2,
+        min_corpus_size="invalid",  # type: ignore[arg-type]
+    )
+    assert len(clones_arg) >= 1
+
+    # 4. compute_corpus_calibration with invalid min_corpus_size
+    calib = compute_corpus_calibration([], min_corpus_size="invalid")  # type: ignore[arg-type]
+    assert isinstance(calib, dict)
+
+
+
 
 
 

@@ -545,13 +545,13 @@ def _compute_max_posting_len(
     fallback: Optional[int] = None,
 ) -> Optional[int]:
     """Calculates max posting length for frequency-based pruning, handling overflow safely."""
-    if freq is not None and total_units >= min_corpus:
-        try:
+    try:
+        if freq is not None and int(total_units) >= int(min_corpus):
             posting_float = total_units * freq
             if math.isfinite(posting_float):
                 return max(2, int(math.ceil(posting_float)))
-        except (ValueError, TypeError, OverflowError):
-            pass
+    except (ValueError, TypeError, OverflowError):
+        pass
     return fallback
 
 
@@ -898,9 +898,17 @@ def scan_target(
         if corpus_calibration is not None and "min_corpus_size" in corpus_calibration
         else min_corpus_size
     )
+    parsed_min_corpus: Optional[int] = None
+    if raw_calib_min_corpus is not None:
+        try:
+            val = int(raw_calib_min_corpus)
+            if val >= 0:
+                parsed_min_corpus = val
+        except (ValueError, TypeError, OverflowError):
+            pass
     effective_min_corpus = (
-        raw_calib_min_corpus
-        if raw_calib_min_corpus is not None
+        parsed_min_corpus
+        if parsed_min_corpus is not None
         else (4 if filter_stop_shingles else 30)
     )
 
