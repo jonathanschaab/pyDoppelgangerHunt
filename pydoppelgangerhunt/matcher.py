@@ -561,6 +561,19 @@ def _compute_max_posting_len(
     return fallback
 
 
+def _resolve_git_root_path(target: Union[str, Path]) -> Optional[Path]:
+    """Resolves Git worktree root as an absolute Path, or None if not in a git repository."""
+    raw_root = get_git_repo_root(repo_root=target)
+    if raw_root:
+        try:
+            p = Path(raw_root).resolve()
+            if p.exists():
+                return p
+        except (ValueError, OSError, RuntimeError):
+            pass
+    return None
+
+
 def _resolve_candidate_file_paths(
     clean_path: str,
     repo_root: Path,
@@ -573,7 +586,7 @@ def _resolve_candidate_file_paths(
     if p.is_absolute():
         try:
             return [p.resolve()]
-        except (ValueError, OSError):
+        except (ValueError, OSError, RuntimeError):
             return [p]
 
     candidates: List[Path] = []
@@ -586,7 +599,7 @@ def _resolve_candidate_file_paths(
     for root in roots_to_check:
         try:
             resolved = (root / p).resolve()
-        except (ValueError, OSError):
+        except (ValueError, OSError, RuntimeError):
             resolved = root / p
         if resolved not in candidates:
             candidates.append(resolved)
@@ -598,22 +611,17 @@ def _build_diff_path_keys(
     diff_files: Sequence[str],
     repo_root: Path,
     target_dir: Path,
+    git_root_resolved: Optional[Path] = None,
 ) -> Set[str]:
     """Builds canonical lookup keys for diff files resolved against repo and target roots."""
     keys: Set[str] = set()
     cwd_resolved: Optional[Path] = None
     try:
         cwd_resolved = Path.cwd().resolve()
-    except (ValueError, OSError):
+    except (ValueError, OSError, RuntimeError):
         pass
 
-    git_root_resolved: Optional[Path] = None
-    raw_git_root = get_git_repo_root(repo_root=target_dir)
-    if raw_git_root:
-        try:
-            git_root_resolved = Path(raw_git_root).resolve()
-        except (ValueError, OSError):
-            pass
+    effective_git_root = git_root_resolved or _resolve_git_root_path(target_dir)
 
     for d_file in diff_files:
         if not d_file:
@@ -624,10 +632,10 @@ def _build_diff_path_keys(
 
         keys.add(canonical_path_key(d_clean, strip_anchor=True))
         for p in _resolve_candidate_file_paths(
-            d_clean, repo_root, target_dir, cwd_resolved, git_root_resolved
+            d_clean, repo_root, target_dir, cwd_resolved, effective_git_root
         ):
             keys.add(canonical_path_key(p.as_posix(), strip_anchor=True))
-            for base_root in (repo_root, target_dir, git_root_resolved):
+            for base_root in (repo_root, target_dir, effective_git_root):
                 if base_root is not None:
                     try:
                         keys.add(canonical_path_key(p.relative_to(base_root).as_posix(), strip_anchor=True))
@@ -642,6 +650,7 @@ def _unit_matches_diff_keys(
     diff_keys: Set[str],
     repo_root: Path,
     target_dir: Path,
+    git_root_resolved: Optional[Path] = None,
 ) -> bool:
     """Checks if a unit file matches any canonical diff key without ambiguous suffix matching."""
     if not u_file_raw or not diff_keys:
@@ -653,20 +662,14 @@ def _unit_matches_diff_keys(
     if canonical_path_key(u_clean, strip_anchor=True) in diff_keys:
         return True
 
-    git_root_resolved: Optional[Path] = None
-    raw_git_root = get_git_repo_root(repo_root=target_dir)
-    if raw_git_root:
-        try:
-            git_root_resolved = Path(raw_git_root).resolve()
-        except (ValueError, OSError):
-            pass
+    effective_git_root = git_root_resolved or _resolve_git_root_path(target_dir)
 
     for p in _resolve_candidate_file_paths(
-        u_clean, repo_root, target_dir, git_root_resolved=git_root_resolved
+        u_clean, repo_root, target_dir, git_root_resolved=effective_git_root
     ):
         if canonical_path_key(p.as_posix(), strip_anchor=True) in diff_keys:
             return True
-        for base_root in (repo_root, target_dir, git_root_resolved):
+        for base_root in (repo_root, target_dir, effective_git_root):
             if base_root is not None:
                 try:
                     if canonical_path_key(p.relative_to(base_root).as_posix(), strip_anchor=True) in diff_keys:
@@ -891,9 +894,9 @@ def scan_target(
                 target_path.relative_to(cwd)
                 effective_repo_root = cwd
             except ValueError:
-                git_root_str = get_git_repo_root(repo_root=target_path)
-                if git_root_str and os.path.exists(git_root_str):
-                    effective_repo_root = Path(git_root_str).resolve()
+                git_root_path = _resolve_git_root_path(target_path)
+                if git_root_path is not None:
+                    effective_repo_root = git_root_path
                 else:
                     effective_repo_root = target_path if target_path.is_dir() else target_path.parent
         except (ValueError, OSError):
@@ -956,18 +959,28 @@ def scan_target(
     if diff_files is not None:
         try:
             res_repo_root = Path(effective_repo_root).resolve()
-        except (ValueError, OSError):
+        except (ValueError, OSError, RuntimeError):
             res_repo_root = Path(effective_repo_root)
         try:
             res_target_dir = Path(target_dir).resolve()
-        except (ValueError, OSError):
+        except (ValueError, OSError, RuntimeError):
             res_target_dir = Path(target_dir)
 
-        diff_keys = _build_diff_path_keys(diff_files, res_repo_root, res_target_dir)
+        git_root_resolved = _resolve_git_root_path(res_target_dir)
+
+        diff_keys = _build_diff_path_keys(
+            diff_files, res_repo_root, res_target_dir, git_root_resolved=git_root_resolved
+        )
         diff_unit_indices = {
             idx
             for idx, u in enumerate(units)
-            if _unit_matches_diff_keys(u.get("file"), diff_keys, res_repo_root, res_target_dir)
+            if _unit_matches_diff_keys(
+                u.get("file"),
+                diff_keys,
+                res_repo_root,
+                res_target_dir,
+                git_root_resolved=git_root_resolved,
+            )
         }
         if not diff_unit_indices:
             if return_calibration:

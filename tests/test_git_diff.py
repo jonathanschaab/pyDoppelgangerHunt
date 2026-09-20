@@ -975,3 +975,67 @@ def test_subdirectory_scan_in_git_worktree(tmp_path: Path, monkeypatch: pytest.M
     exit_code = main()
     assert exit_code == 1
 
+
+def test_get_git_repo_root_security_and_edge_cases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies get_git_repo_root handles non-existent paths, null bytes, and corrupted git metadata safely."""
+    from pydoppelgangerhunt.git_diff import get_git_repo_root  # pylint: disable=import-outside-toplevel
+
+    # 1. Non-existent path returns None without raising exceptions
+    non_existent = tmp_path / "definitely_does_not_exist_12345"
+    assert get_git_repo_root(repo_root=non_existent) is None
+
+    # 2. Path with null byte is safely handled
+    null_byte_path = str(tmp_path) + "\x00invalid"
+    assert get_git_repo_root(repo_root=null_byte_path) is None
+
+    # 3. Empty or whitespace-only git output returns None
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: "   \n\t\n  ",
+    )
+    assert get_git_repo_root(repo_root=tmp_path) is None
+
+    # 4. Git error / non-zero exit returns None
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: None,
+    )
+    assert get_git_repo_root(repo_root=tmp_path) is None
+
+
+def test_diff_unit_matching_subprocess_efficiency(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies scan_target resolves git root once rather than executing git subprocess for every unit."""
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    code_file = tmp_path / "sample.py"
+    # Generate multiple functions
+    functions_code = "\n\n".join(
+        f"def fn_{i}(a, b):\n    val = a * 2 + b * {i}\n    return val + 10\n"
+        for i in range(20)
+    )
+    code_file.write_text(functions_code, encoding="utf-8")
+
+    git_call_count = 0
+
+    def counting_git_command(args: Any, cwd: Any = None) -> Optional[str]:  # pylint: disable=unused-argument
+        nonlocal git_call_count
+        if args == ["rev-parse", "--show-toplevel"]:
+            git_call_count += 1
+            return str(tmp_path).replace("\\", "/") + "\n"
+        return None
+
+    monkeypatch.setattr("pydoppelgangerhunt.git_diff._run_git_command", counting_git_command)
+
+    # Run scan_target with diff_files specifying a non-matching file
+    scan_target(
+        str(tmp_path),
+        min_lines=2,
+        min_tokens=3,
+        threshold=0.90,
+        diff_files=["other_unrelated_file.py"],
+    )
+
+    # Crucial assertion: get_git_repo_root must not be invoked per unit
+    assert git_call_count <= 2
+
+
