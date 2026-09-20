@@ -893,14 +893,20 @@ def scan_target(
                 continue
             shingle_index.setdefault(sh, []).append(idx)
 
+    raw_calib_min_corpus = (
+        corpus_calibration.get("min_corpus_size")
+        if corpus_calibration is not None and "min_corpus_size" in corpus_calibration
+        else min_corpus_size
+    )
     effective_min_corpus = (
-        min_corpus_size
-        if min_corpus_size is not None
+        raw_calib_min_corpus
+        if raw_calib_min_corpus is not None
         else (4 if filter_stop_shingles else 30)
     )
 
     candidate_pairs: Set[Tuple[int, int]] = set()
     calib_freqs_map: Optional[Dict[Any, Any]] = None
+    calib_units = 0
     if corpus_calibration is not None:
         calib_units = _safe_total_units(corpus_calibration.get("total_units"))
         local_units_count = len(diff_unit_indices) if diff_unit_indices is not None else len(units)
@@ -914,15 +920,25 @@ def scan_target(
             if "max_index_frequency" in corpus_calibration
             else max_index_frequency
         )
-        calib_max_freq = _safe_index_frequency(raw_calib_max_freq)
+        active_max_freq = _safe_index_frequency(raw_calib_max_freq)
         max_posting_len = _compute_max_posting_len(
-            total_corpus_units, calib_max_freq, effective_min_corpus, fallback=None
+            total_corpus_units, active_max_freq, effective_min_corpus, fallback=None
         )
     else:
-        safe_max_freq = _safe_index_frequency(max_index_frequency)
+        active_max_freq = _safe_index_frequency(max_index_frequency)
         max_posting_len = _compute_max_posting_len(
-            len(units), safe_max_freq, effective_min_corpus, fallback=len(units) + 1
+            len(units), active_max_freq, effective_min_corpus, fallback=len(units) + 1
         ) or (len(units) + 1)
+
+    effective_max_posting = max_posting_len
+    if (
+        effective_max_posting is None
+        and active_max_freq is not None
+        and len(units) >= effective_min_corpus
+    ):
+        effective_max_posting = _compute_max_posting_len(
+            len(units), active_max_freq, effective_min_corpus, fallback=None
+        )
 
     for sh, u_indices in shingle_index.items():
         if len(u_indices) <= 1:
@@ -957,8 +973,12 @@ def scan_target(
             continue
 
         if diff_unit_indices is not None and calib_freqs_map is not None and not is_global_shingle:
-            pass
-        elif max_posting_len is not None and combined_df > max_posting_len:
+            df_unmodified = len(u_indices) - df_local
+            if df_unmodified > 0 and effective_max_posting is not None and (
+                df_unmodified > effective_max_posting or len(u_indices) > effective_max_posting
+            ):
+                continue
+        elif effective_max_posting is not None and combined_df > effective_max_posting:
             continue
 
         _add_candidate_pairs(candidate_pairs, u_indices, diff_unit_indices)

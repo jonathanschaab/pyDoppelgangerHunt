@@ -11,6 +11,18 @@ from pydoppelgangerhunt.config import find_matching_path_value, normalize_path_s
 MAJOR_POLICY_THRESHOLD: float = 0.50
 NEW_POLICY_THRESHOLD: float = 0.80
 
+_GIT_C_ESCAPES: Dict[int, int] = {
+    ord(b"a"): 0x07,
+    ord(b"b"): 0x08,
+    ord(b"t"): 0x09,
+    ord(b"n"): 0x0A,
+    ord(b"v"): 0x0B,
+    ord(b"f"): 0x0C,
+    ord(b"r"): 0x0D,
+    ord(b'"'): 0x22,
+    ord(b"\\"): 0x5C,
+}
+
 
 def _run_git_command(args: Sequence[str], cwd: Optional[str] = None) -> Optional[str]:
     """Executes a git command safely and returns standard output, or None on failure."""
@@ -32,12 +44,39 @@ def _run_git_command(args: Sequence[str], cwd: Optional[str] = None) -> Optional
 
 
 def _decode_git_cstyle_path(raw_path: str) -> str:
-    """Decodes C-style octal and unicode escape sequences in git quotepath strings."""
+    """Decodes C-style octal and escape sequences in git quotepath strings while preserving literal UTF-8."""
     trimmed = raw_path.strip()
     if trimmed.startswith('"') and trimmed.endswith('"') and len(trimmed) >= 2:
         inner = trimmed[1:-1]
         try:
-            raw_bytes = inner.encode("latin1").decode("unicode_escape").encode("latin1")
+            raw_bytes = bytearray()
+            inner_bytes = inner.encode("utf-8", errors="replace")
+            i = 0
+            n = len(inner_bytes)
+            while i < n:
+                b = inner_bytes[i]
+                if b == 0x5C and i + 1 < n:
+                    nxt = inner_bytes[i + 1]
+                    if 0x30 <= nxt <= 0x37:
+                        octal_val = nxt - 0x30
+                        i += 2
+                        for _ in range(2):
+                            if i < n and 0x30 <= inner_bytes[i] <= 0x37:
+                                octal_val = (octal_val << 3) + (inner_bytes[i] - 0x30)
+                                i += 1
+                            else:
+                                break
+                        raw_bytes.append(octal_val & 0xFF)
+                        continue
+                    if nxt in _GIT_C_ESCAPES:
+                        raw_bytes.append(_GIT_C_ESCAPES[nxt])
+                        i += 2
+                        continue
+                    raw_bytes.append(nxt)
+                    i += 2
+                    continue
+                raw_bytes.append(b)
+                i += 1
             return raw_bytes.decode("utf-8", errors="replace")
         except (UnicodeError, ValueError):
             return inner

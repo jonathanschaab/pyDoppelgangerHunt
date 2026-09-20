@@ -2512,6 +2512,92 @@ def test_type_tagged_shingle_keys_and_oversized_unit_bounds(tmp_path: Path) -> N
     assert loaded_calib["shingle_frequencies"][123] == 15
 
 
+def test_diff_scan_prunes_uncalibrated_shingles_matching_many_unmodified_units(tmp_path: Path) -> None:
+    """Verifies that uncalibrated shingles matching many unmodified units are bounded/pruned to prevent pair explosion."""
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo_explosion_defense"
+    repo.mkdir()
+
+    # Create 10 unmodified files, each containing a common helper with identical ubiquitous structure
+    common_code = (
+        "def common_repository_helper(context, data):\n"
+        "    if not context:\n"
+        "        return None\n"
+        "    res = {}\n"
+        "    for k, v in data.items():\n"
+        "        res[k] = str(v).strip()\n"
+        "    return res\n"
+    )
+    for i in range(10):
+        (repo / f"unmodified_{i}.py").write_text(
+            f"# File unmodified {i}\n" + common_code,
+            encoding="utf-8",
+        )
+
+    # Create 1 changed file in the diff containing the same common helper plus a unique function
+    changed_code = (
+        common_code
+        + "\n\ndef unique_changed_feature():\n"
+        + "    return 'UNIQUE_DIFF_FEATURE_ALPHA_BETA'\n"
+    )
+    (repo / "changed.py").write_text(changed_code, encoding="utf-8")
+
+    # Stale/partial calibration missing common_repository_helper shingles entirely:
+    # 11 total units in repo (10 unmodified + 1 changed).
+    # calib specifies total_units=10, max_index_frequency=0.25, min_corpus_size=4.
+    # Because common_repository_helper occurs in 10 unmodified units, df_unmodified = 10 > max_posting_len (which is ceil(11 * 0.25) = 3).
+    # The common shingle MUST be pruned from pairing against the 10 unmodified units!
+    calib = {
+        "total_units": 10,
+        "max_index_frequency": 0.25,
+        "min_corpus_size": 4,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {},
+    }
+
+    clones = scan_target(
+        str(repo),
+        min_lines=6,
+        threshold=0.85,
+        diff_files=["changed.py"],
+        corpus_calibration=calib,
+    )
+
+    # The changed file should NOT be paired with all 10 unmodified files across the common helper
+    changed_clones = [
+        (sim, u1, u2)
+        for sim, u1, u2 in clones
+        if "changed.py" in (Path(u1["file"]).name, Path(u2["file"]).name)
+    ]
+    assert len(changed_clones) == 0
+
+    # Also verify that if two diff files share a novel domain clone (df_unmodified == 0), it IS detected
+    novel_clone_code = (
+        "def novel_domain_handler(request, response):\n"
+        "    data_items = [x for x in request if x]\n"
+        "    mapped = {i: str(v).lower() for i, v in enumerate(data_items)}\n"
+        "    audit = 'DOMAIN_HANDLER_SECURE_TAG'\n"
+        "    return {'audit': audit, 'mapped': mapped}\n"
+    )
+    (repo / "changed_a.py").write_text(novel_clone_code, encoding="utf-8")
+    (repo / "changed_b.py").write_text(novel_clone_code, encoding="utf-8")
+
+    novel_clones = scan_target(
+        str(repo),
+        min_lines=5,
+        threshold=0.90,
+        diff_files=["changed_a.py", "changed_b.py"],
+        corpus_calibration=calib,
+    )
+    cross_diff_clones = [
+        (sim, u1, u2)
+        for sim, u1, u2 in novel_clones
+        if {Path(u1["file"]).name, Path(u2["file"]).name} == {"changed_a.py", "changed_b.py"}
+    ]
+    assert len(cross_diff_clones) >= 1
+
+
 
 
 

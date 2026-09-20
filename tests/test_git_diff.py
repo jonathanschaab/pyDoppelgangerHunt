@@ -806,4 +806,43 @@ def test_run_git_command_utf8_decoding_and_replace(monkeypatch: pytest.MonkeyPat
     assert "pkg/🚀_launch.py" in out
 
 
+def test_decode_git_cstyle_path_quoted_literal_unicode() -> None:
+    """Verifies that _decode_git_cstyle_path preserves literal Unicode and parses C-style octal escapes."""
+    from pydoppelgangerhunt.git_diff import (  # pylint: disable=import-outside-toplevel
+        _decode_git_cstyle_path,
+        parse_git_diff_hunks,
+    )
+
+    # 1. Literal Unicode in quoted path (core.quotepath = false or non-ASCII characters quoted due to space)
+    p1 = '"pkg/café file.py"'
+    assert _decode_git_cstyle_path(p1) == "pkg/café file.py"
+
+    # 2. Octal escaped Unicode (core.quotepath = true default)
+    p2 = '"pkg/caf\\303\\251 file.py"'
+    assert _decode_git_cstyle_path(p2) == "pkg/café file.py"
+
+    # 3. Mixed quotes, backslashes, tabs, and octal escapes
+    p3 = '"pkg/\\"quoted\\"\\\\file\\t\\303\\251.py"'
+    assert _decode_git_cstyle_path(p3) == 'pkg/"quoted"\\file\té.py'
+
+    # 4. Standard C escapes
+    p4 = '"pkg/line\\nbreak\\rreturn.py"'
+    assert _decode_git_cstyle_path(p4) == "pkg/line\nbreak\rreturn.py"
+
+    # 5. Unquoted plain path
+    p5 = "pkg/plain_path.py"
+    assert _decode_git_cstyle_path(p5) == "pkg/plain_path.py"
+
+    # 6. Integration with parse_git_diff_hunks
+    diff_sample = (
+        'diff --git "a/pkg/café file.py" "b/pkg/café file.py"\n'
+        '--- "a/pkg/café file.py"\n'
+        '+++ "b/pkg/café file.py"\n'
+        "@@ -1,5 +1,5 @@\n"
+        "+# modified line\n"
+    )
+    hunks = parse_git_diff_hunks(diff_sample)
+    assert any("café file.py" in k for k in hunks)
+
+
 
