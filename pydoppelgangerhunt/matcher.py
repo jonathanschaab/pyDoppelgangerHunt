@@ -9,7 +9,12 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Set, Tuple, Union, overload
 
-from pydoppelgangerhunt.config import canonical_path_key, find_python_files
+from pydoppelgangerhunt.config import (
+    canonical_path_key,
+    find_python_files,
+    normalize_path_string,
+    paths_match_boundary,
+)
 from pydoppelgangerhunt.parser import harvest_file_units
 
 DEFAULT_STOP_SHINGLES: Set[Tuple[str, ...]] = {
@@ -523,6 +528,46 @@ def _compute_max_posting_len(
     return fallback
 
 
+def _add_candidate_pairs(
+    candidate_pairs: Set[Tuple[int, int]],
+    indices: Sequence[int],
+    diff_unit_indices: Optional[Set[int]] = None,
+) -> None:
+    """Populates candidate pairs from posting list, filtering by diff units if active."""
+    for i, idx1 in enumerate(indices):
+        for idx2 in indices[i + 1:]:
+            if (
+                diff_unit_indices is not None
+                and idx1 not in diff_unit_indices
+                and idx2 not in diff_unit_indices
+            ):
+                continue
+            candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))
+
+
+def _build_calibration_metadata(
+    units: Sequence[Dict[str, Any]],
+    *,
+    max_index_frequency: Optional[float],
+    min_corpus_size: Optional[int],
+    filter_stop_shingles: bool,
+    stop_shingles: Optional[Set[Any]],
+    bag_of_tokens: bool,
+    call_sequences: bool,
+) -> Dict[str, Any]:
+    """Helper to compute baseline corpus calibration dictionary."""
+    from pydoppelgangerhunt.baseline import compute_corpus_calibration
+    return compute_corpus_calibration(
+        units,
+        max_index_frequency=max_index_frequency,
+        min_corpus_size=min_corpus_size,
+        filter_stop_shingles=filter_stop_shingles,
+        stop_shingles=stop_shingles,
+        bag_of_tokens=bag_of_tokens,
+        call_sequences=call_sequences,
+    )
+
+
 def _worker_harvest_file(task_kwargs: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Worker task wrapper for process pool executor."""
     return harvest_file_units(**task_kwargs)
@@ -533,6 +578,7 @@ def scan_target(
     target_dir: str,
     *,
     return_calibration: Literal[False] = False,
+    diff_files: Optional[Sequence[str]] = None,
     **kwargs: Any,
 ) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]: ...
 
@@ -542,6 +588,7 @@ def scan_target(
     target_dir: str,
     *,
     return_calibration: Literal[True],
+    diff_files: Optional[Sequence[str]] = None,
     **kwargs: Any,
 ) -> Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Dict[str, Any]]: ...
 
@@ -551,6 +598,7 @@ def scan_target(
     target_dir: str,
     *,
     return_calibration: bool = False,
+    diff_files: Optional[Sequence[str]] = None,
     **kwargs: Any,
 ) -> Union[
     List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
@@ -565,6 +613,7 @@ def scan_target(
     min_tokens: int = 15,
     threshold: float = 0.90,
     repo_root: Optional[Union[str, Path]] = None,
+    diff_files: Optional[Sequence[str]] = None,
     excludes: Optional[List[str]] = None,
     functions_only: bool = False,
     sliding_window: bool = False,
@@ -690,6 +739,41 @@ def scan_target(
                 )
             )
 
+    diff_unit_indices: Optional[Set[int]] = None
+    if diff_files is not None:
+        norm_diff_files_list = [
+            normalize_path_string(d_file, strip_anchor=False)
+            for d_file in diff_files
+            if d_file
+        ]
+        norm_diff_files_set = set(norm_diff_files_list)
+        diff_unit_indices = set()
+        for idx, u in enumerate(units):
+            u_file = normalize_path_string(str(u.get("file") or ""), strip_anchor=False)
+            if not u_file:
+                continue
+            if u_file in norm_diff_files_set:
+                diff_unit_indices.add(idx)
+                continue
+            for d_file in norm_diff_files_list:
+                if paths_match_boundary(u_file, d_file):
+                    diff_unit_indices.add(idx)
+                    break
+        if not diff_unit_indices:
+            if return_calibration:
+                return [], _build_calibration_metadata(
+                    units,
+                    max_index_frequency=max_index_frequency,
+                    min_corpus_size=min_corpus_size,
+                    filter_stop_shingles=filter_stop_shingles,
+                    stop_shingles=stop_shingles,
+                    bag_of_tokens=bag_of_tokens,
+                    call_sequences=call_sequences,
+                )
+            return []
+
+    local_corpus_units = len(diff_unit_indices) if diff_unit_indices is not None else len(units)
+
     effective_stop_shingles: Set[Any] = set()
     if filter_stop_shingles:
         effective_stop_shingles.update(DEFAULT_STOP_SHINGLES)
@@ -707,14 +791,20 @@ def scan_target(
 
     idf_weights: Dict[Any, float] = {}
     if tfidf and units:
-        corpus_size = len(units)
+        corpus_size = local_corpus_units
         if corpus_calibration is not None:
             try:
                 corpus_size += max(0, int(corpus_calibration.get("total_units", 0) or 0))
             except (ValueError, TypeError, OverflowError):
                 pass
         df_counts: Dict[Any, int] = {}
-        for u in units:
+        active_indices: Union[Set[int], range] = (
+            diff_unit_indices
+            if diff_unit_indices is not None
+            else range(len(units))
+        )
+        for idx in active_indices:
+            u = units[idx]
             keys = u.get("vector", {}).keys() if bag_of_tokens else u["shingles"]
             for k in keys:
                 if effective_stop_shingles and k in effective_stop_shingles:
@@ -755,12 +845,13 @@ def scan_target(
     )
 
     candidate_pairs: Set[Tuple[int, int]] = set()
+    calib_freqs_map: Optional[Dict[Any, Any]] = None
     if corpus_calibration is not None:
         try:
             calib_units = max(0, int(corpus_calibration.get("total_units", 0) or 0))
         except (ValueError, TypeError, OverflowError):
             calib_units = 0
-        total_corpus_units = len(units) + calib_units
+        total_corpus_units = local_corpus_units + calib_units
         calib_freqs_map = corpus_calibration.get("shingle_frequencies", {})
         raw_calib_max_freq = (
             corpus_calibration["max_index_frequency"]
@@ -771,34 +862,37 @@ def scan_target(
         max_posting_len = _compute_max_posting_len(
             total_corpus_units, calib_max_freq, effective_min_corpus, fallback=None
         )
+    else:
+        safe_max_freq = _safe_index_frequency(max_index_frequency)
+        max_posting_len = _compute_max_posting_len(
+            local_corpus_units, safe_max_freq, effective_min_corpus, fallback=local_corpus_units + 1
+        ) or (local_corpus_units + 1)
 
-        for sh, u_indices in shingle_index.items():
-            if len(u_indices) <= 1:
+    for sh, u_indices in shingle_index.items():
+        if len(u_indices) <= 1:
+            continue
+        if diff_unit_indices is not None:
+            df_local = sum(1 for idx in u_indices if idx in diff_unit_indices)
+            if df_local == 0:
                 continue
+        else:
+            df_local = len(u_indices)
+
+        if calib_freqs_map is not None:
             df_global = calib_freqs_map.get(sh)
             if df_global is None and isinstance(sh, (tuple, list)):
                 df_global = calib_freqs_map.get(json.dumps(list(sh)), 0)
             try:
-                combined_df = int(df_global or 0) + len(u_indices)
+                combined_df = int(df_global or 0) + df_local
             except (ValueError, TypeError, OverflowError):
-                combined_df = len(u_indices)
+                combined_df = df_local
+        else:
+            combined_df = df_local
 
-            if max_posting_len is not None and combined_df > max_posting_len:
-                continue
-            for i, idx1 in enumerate(u_indices):
-                for idx2 in u_indices[i + 1:]:
-                    candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))
-    else:
-        safe_max_freq = _safe_index_frequency(max_index_frequency)
-        max_posting_len_uncalib = _compute_max_posting_len(
-            len(units), safe_max_freq, effective_min_corpus, fallback=len(units) + 1
-        ) or (len(units) + 1)
+        if max_posting_len is not None and combined_df > max_posting_len:
+            continue
 
-        for u_indices in shingle_index.values():
-            if 1 < len(u_indices) <= max_posting_len_uncalib:
-                for i, idx1 in enumerate(u_indices):
-                    for idx2 in u_indices[i + 1:]:
-                        candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))
+        _add_candidate_pairs(candidate_pairs, u_indices, diff_unit_indices)
 
     raw_exemptions = exemptions if exemptions is not None else []
     normalized_exemptions: Set[Tuple[str, str]] = set()
@@ -932,8 +1026,7 @@ def scan_target(
         clones = clones[:top_n]
 
     if return_calibration:
-        from pydoppelgangerhunt.baseline import compute_corpus_calibration
-        calib_dict = compute_corpus_calibration(
+        calib_dict = _build_calibration_metadata(
             units,
             max_index_frequency=max_index_frequency,
             min_corpus_size=min_corpus_size,

@@ -1482,6 +1482,10 @@ def test_cli_record_baseline_and_differential_scan_calibration(tmp_path: Path, m
     # Step 3: Run differential scan with --baseline and --diff-only to verify differential forwarding
     captured_kwargs.clear()
     monkeypatch.setattr(
+        "pydoppelgangerhunt.cli.get_git_modified_files",
+        lambda since_ref=None, repo_root=None: [str(repo / "m1.py")],
+    )
+    monkeypatch.setattr(
         "pydoppelgangerhunt.cli.get_git_modified_line_ranges",
         lambda since_ref=None, repo_root=None: {str(repo / "m1.py"): [(1, 10)]},
     )
@@ -1502,4 +1506,6 @@ def test_cli_record_baseline_and_differential_scan_calibration(tmp_path: Path, m
     assert len(captured_kwargs) == 1
     assert captured_kwargs[0].get("corpus_calibration") is not None
     assert captured_kwargs[0]["corpus_calibration"]["total_units"] >= 2
+    assert captured_kwargs[0].get("diff_files") is not None
+    assert str(repo / "m1.py") in captured_kwargs[0]["diff_files"]
 

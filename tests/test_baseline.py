@@ -1950,4 +1950,102 @@ def test_red_team_baseline_and_matcher_hardening(tmp_path: Path) -> None:
     assert loaded_nf.corpus_calibration["shingle_frequencies"]["stop2"] == 10
 
 
+def test_diff_aware_candidate_pruning_and_stats(tmp_path: Path) -> None:
+    """Verifies that diff_files feeds diff-aware unit statistics into candidate pruning."""
+    repo = tmp_path / "diff_repo"
+    repo.mkdir()
+
+    code_clone_1 = """
+def process_data_alpha(items):
+    res = []
+    for x in items:
+        if x > 10:
+            res.append(x * 2)
+        else:
+            res.append(x + 1)
+    return res
+"""
+
+    code_clone_2 = """
+def process_data_beta(items):
+    out = []
+    for val in items:
+        if val > 10:
+            out.append(val * 2)
+        else:
+            out.append(val + 1)
+    return out
+"""
+
+    code_unmod_pair = """
+def internal_worker_gamma(elements):
+    acc = []
+    for e in elements:
+        if e % 2 == 0:
+            acc.append(e // 2)
+        else:
+            acc.append(e * 3)
+    return acc
+"""
+
+    (repo / "mod.py").write_text(code_clone_1, encoding="utf-8")
+    (repo / "unmod_a.py").write_text(code_clone_2, encoding="utf-8")
+    (repo / "unmod_b.py").write_text(code_unmod_pair, encoding="utf-8")
+    (repo / "unmod_c.py").write_text(code_unmod_pair, encoding="utf-8")
+
+    # 1. Full scan without diff_files finds both clone pairs
+    full_clones = scan_target(str(repo), min_lines=6, threshold=0.90)
+    assert len(full_clones) == 2
+
+    # 2. Diff scan with diff_files=["mod.py"]: only pairs touching mod.py are returned
+    diff_clones = scan_target(
+        str(repo),
+        min_lines=6,
+        threshold=0.90,
+        diff_files=["mod.py"],
+    )
+    assert len(diff_clones) == 1
+    pair = diff_clones[0]
+    files_in_clone = {Path(pair[1]["file"]).name, Path(pair[2]["file"]).name}
+    assert files_in_clone == {"mod.py", "unmod_a.py"}
+
+    # 3. Diff scan where diff_files has no modified files in target: returns [] immediately
+    empty_diff_clones = scan_target(
+        str(repo),
+        min_lines=6,
+        threshold=0.90,
+        diff_files=["non_existent_file.py"],
+    )
+    assert empty_diff_clones == []
+
+    # 4. Diff-aware statistics prevent small-diff false pruning with corpus_calibration
+    from pydoppelgangerhunt.parser import harvest_file_units  # pylint: disable=import-outside-toplevel
+    mod_units = harvest_file_units(str(repo / "mod.py"), str(repo), min_lines=6)
+    assert len(mod_units) >= 1
+    shared_shingle = list(mod_units[0]["shingles"])[0]
+
+    # Baseline total_units = 100, max_index_frequency = 0.25 (pruning cutoff is ceil(101 * 0.25) = 26).
+    # If df_global = 25 and df_local in diff = 1 -> combined_df = 26 <= 26 (retained).
+    # If df_local counted all local units (>= 2) -> combined_df >= 27 > 26 (would be falsely pruned).
+    calib = {
+        "total_units": 100,
+        "max_index_frequency": 0.25,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {
+            shared_shingle if isinstance(shared_shingle, str) else json.dumps(list(shared_shingle)): 25,
+        },
+    }
+
+    calib_clones = scan_target(
+        str(repo),
+        min_lines=6,
+        threshold=0.90,
+        diff_files=["mod.py"],
+        corpus_calibration=calib,
+    )
+    assert len(calib_clones) == 1
+    pair_calib = calib_clones[0]
+    assert {Path(pair_calib[1]["file"]).name, Path(pair_calib[2]["file"]).name} == {"mod.py", "unmod_a.py"}
+
+
 

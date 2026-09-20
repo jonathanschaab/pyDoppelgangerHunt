@@ -27,6 +27,7 @@ from pydoppelgangerhunt.fixer import generate_refactoring_patch
 from pydoppelgangerhunt.git_diff import (
     check_temporal_divergence,
     filter_clones_by_git_diff,
+    get_git_modified_files,
     get_git_modified_line_ranges,
 )
 from pydoppelgangerhunt.matcher import compute_priority_score, scan_target
@@ -345,6 +346,18 @@ def _render_pair_diff_and_suggestions(
     return lines
 
 
+def _safe_call_git_diff_helper(
+    fn: Any,
+    since_ref: Optional[str],
+    repo_root: Optional[str],
+) -> Any:
+    """Invokes git diff helper function supporting optional repo_root parameter."""
+    try:
+        return fn(since_ref=since_ref, repo_root=repo_root)
+    except TypeError:
+        return fn(since_ref=since_ref)
+
+
 def _apply_baseline_and_diff_filters(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     args: argparse.Namespace,
@@ -403,12 +416,9 @@ def _apply_baseline_and_diff_filters(
             if args.min_diff_overlap is not None
             else float(tool_cfg.get("min_diff_overlap", 0.0))
         )
-        try:
-            modified_ranges = get_git_modified_line_ranges(
-                since_ref=args.since, repo_root=target_repo_root
-            )
-        except TypeError:
-            modified_ranges = get_git_modified_line_ranges(since_ref=args.since)
+        modified_ranges = _safe_call_git_diff_helper(
+            get_git_modified_line_ranges, args.since, target_repo_root
+        )
         clones = filter_clones_by_git_diff(
             clones,
             modified_ranges,
@@ -655,9 +665,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         preloaded_baseline = load_baseline(baseline_path)
         calib_dict = getattr(preloaded_baseline, "corpus_calibration", None)
 
+    diff_files: Optional[Sequence[str]] = None
+    if args.diff_only:
+        diff_files = _safe_call_git_diff_helper(
+            get_git_modified_files, args.since, target_repo_root
+        )
+        if not diff_files:
+            mod_ranges = _safe_call_git_diff_helper(
+                get_git_modified_line_ranges, args.since, target_repo_root
+            )
+            if mod_ranges:
+                diff_files = list(mod_ranges.keys())
+
     scan_res = scan_target(
         target,
         repo_root=target_repo_root,
+        diff_files=diff_files,
         min_lines=min_lines,
         min_tokens=min_tokens,
         threshold=threshold,
