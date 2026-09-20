@@ -92,7 +92,12 @@ def _attach_calibration_flags(
         target[flag] = _safe_bool(source.get(flag, False))
     for flag, default_val in HARVEST_BOOLEAN_MODES:
         target[flag] = _safe_bool(source.get(flag, default_val))
-    for int_flag, default_int in (("window_size", 5), ("min_expr_complexity", 4)):
+    for int_flag, default_int in (
+        ("window_size", 5),
+        ("min_expr_complexity", 4),
+        ("min_lines", 8),
+        ("min_tokens", 15),
+    ):
         raw_val = source.get(int_flag, default_int)
         try:
             val = int(raw_val)

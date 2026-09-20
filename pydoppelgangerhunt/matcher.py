@@ -624,6 +624,7 @@ def _is_calibration_mode_compatible(
     bag_of_tokens: bool = False,
     call_sequences: bool = False,
     filter_stop_shingles: bool = False,
+    max_index_frequency: Optional[float] = 0.25,
     **kwargs: Any,
 ) -> bool:
     """Validates that corpus calibration was generated with compatible representation, filtering, and AST shaping features."""
@@ -636,19 +637,33 @@ def _is_calibration_mode_compatible(
     if _safe_bool(calib.get("filter_stop_shingles", False)) and not filter_stop_shingles:
         return False
 
+    calib_freq = (
+        _safe_index_frequency(calib["max_index_frequency"])
+        if "max_index_frequency" in calib
+        else 0.25
+    )
+    active_freq = _safe_index_frequency(max_index_frequency)
+    if (calib_freq is None) != (active_freq is None):
+        return False
+    if calib_freq is not None and active_freq is not None:
+        if not math.isclose(calib_freq, active_freq, rel_tol=1e-9, abs_tol=1e-12):
+            return False
+
     for flag, default_val in HARVEST_BOOLEAN_MODES:
         scan_val = kwargs.get(flag, default_val)
         if _safe_bool(calib.get(flag, default_val)) != bool(scan_val):
             return False
 
-    for flag_active, int_key, default_int in (
+    int_bounds = (
+        (None, "min_lines", 8),
+        (None, "min_tokens", 15),
         ("sliding_window", "window_size", 5),
         ("complex_expressions", "min_expr_complexity", 4),
-    ):
-        if kwargs.get(flag_active, False):
-            curr_val = kwargs.get(int_key, default_int)
+    )
+    for flag_active, int_key, default_int in int_bounds:
+        if flag_active is None or kwargs.get(flag_active, False):
             try:
-                if int(calib.get(int_key, default_int)) != int(curr_val):
+                if int(calib.get(int_key, default_int)) != int(kwargs.get(int_key, default_int)):
                     return False
             except (ValueError, TypeError, OverflowError):
                 return False
@@ -765,6 +780,8 @@ def scan_target(
 
     effective_workers = workers if workers is not None else 1
     harvest_mode_opts: Dict[str, Any] = {
+        "min_lines": min_lines,
+        "min_tokens": min_tokens,
         "functions_only": functions_only,
         "sliding_window": sliding_window,
         "window_size": window_size,
@@ -791,8 +808,6 @@ def scan_target(
             {
                 "file_path": str(p),
                 "repo_root": str(effective_repo_root),
-                "min_lines": min_lines,
-                "min_tokens": min_tokens,
                 **harvest_mode_opts,
             }
             for p in file_list
@@ -806,8 +821,6 @@ def scan_target(
                 harvest_file_units(
                     str(p),
                     str(effective_repo_root),
-                    min_lines=min_lines,
-                    min_tokens=min_tokens,
                     **harvest_mode_opts,
                 )
             )
@@ -858,6 +871,7 @@ def scan_target(
         bag_of_tokens=bag_of_tokens,
         call_sequences=call_sequences,
         filter_stop_shingles=filter_stop_shingles,
+        max_index_frequency=max_index_frequency,
         **harvest_mode_opts,
     ):
         corpus_calibration = None
@@ -943,6 +957,7 @@ def scan_target(
     candidate_pairs: Set[Tuple[int, int]] = set()
     calib_freqs_map: Optional[Dict[Any, Any]] = None
     calib_units = 0
+    active_max_freq = _safe_index_frequency(max_index_frequency)
     if corpus_calibration is not None:
         calib_units = _safe_total_units(corpus_calibration.get("total_units"))
         local_units_count = len(diff_unit_indices) if diff_unit_indices is not None else len(units)
@@ -951,17 +966,10 @@ def scan_target(
         calib_freqs_map = (
             calib_freqs_raw if isinstance(calib_freqs_raw, dict) else None
         )
-        raw_calib_max_freq = (
-            corpus_calibration.get("max_index_frequency")
-            if "max_index_frequency" in corpus_calibration
-            else max_index_frequency
-        )
-        active_max_freq = _safe_index_frequency(raw_calib_max_freq)
         max_posting_len = _compute_max_posting_len(
             total_corpus_units, active_max_freq, effective_min_corpus, fallback=None
         )
     else:
-        active_max_freq = _safe_index_frequency(max_index_frequency)
         max_posting_len = _compute_max_posting_len(
             len(units), active_max_freq, effective_min_corpus, fallback=len(units) + 1
         ) or (len(units) + 1)

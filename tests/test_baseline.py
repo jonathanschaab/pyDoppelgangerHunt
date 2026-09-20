@@ -1587,6 +1587,7 @@ def test_differential_scan_calibrated_pruning_prevents_false_negatives(tmp_path:
     calib = {
         "total_units": 1000,
         "max_index_frequency": 0.25,
+        "min_lines": 6,
         "global_stop_shingles": set(),
         "shingle_frequencies": {},
     }
@@ -1634,6 +1635,7 @@ def test_differential_scan_calibrated_pruning_suppresses_global_boilerplate(tmp_
     calib = {
         "total_units": 500,
         "max_index_frequency": 0.25,
+        "min_lines": 5,
         "global_stop_shingles": all_boilerplate_shingles,
         "shingle_frequencies": {sh: 300 for sh in all_boilerplate_shingles},
     }
@@ -2211,6 +2213,7 @@ def test_diff_scan_avoids_pruning_novel_shingles_missing_from_calibration(tmp_pa
     calib = {
         "total_units": 1,
         "max_index_frequency": 0.25,
+        "min_lines": 6,
         "min_corpus_size": 4,
         "global_stop_shingles": set(),
         "shingle_frequencies": {},
@@ -2242,6 +2245,7 @@ def test_diff_scan_avoids_pruning_novel_shingles_missing_from_calibration(tmp_pa
     calib_all_stopped = {
         "total_units": 1,
         "max_index_frequency": 0.25,
+        "min_lines": 6,
         "min_corpus_size": 4,
         "global_stop_shingles": set(units[0]["shingles"]),
         "shingle_frequencies": {},
@@ -2551,6 +2555,7 @@ def test_diff_scan_prunes_uncalibrated_shingles_matching_many_unmodified_units(t
     calib = {
         "total_units": 10,
         "max_index_frequency": 0.25,
+        "min_lines": 6,
         "min_corpus_size": 4,
         "global_stop_shingles": set(),
         "shingle_frequencies": {},
@@ -2588,7 +2593,7 @@ def test_diff_scan_prunes_uncalibrated_shingles_matching_many_unmodified_units(t
         min_lines=5,
         threshold=0.90,
         diff_files=["changed_a.py", "changed_b.py"],
-        corpus_calibration=calib,
+        corpus_calibration=dict(calib, min_lines=5),
     )
     cross_diff_clones = [
         (sim, u1, u2)
@@ -3000,5 +3005,96 @@ def test_harvesting_modes_calibration_persistence_and_compatibility(tmp_path: Pa
         blind_literals=False,
     )
     assert len(clones) >= 1
+
+
+def test_calibration_bounds_and_frequency_cutoff_compatibility(tmp_path: Path) -> None:
+    """Verifies that min_lines, min_tokens, and max_index_frequency are persisted and validated for compatibility."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        compute_corpus_calibration,
+        load_baseline,
+        record_baseline,
+    )
+    from pydoppelgangerhunt.matcher import (  # pylint: disable=import-outside-toplevel
+        _is_calibration_mode_compatible,
+        scan_target,
+    )
+
+    # 1. Default and custom bounds in compute_corpus_calibration
+    c_default = compute_corpus_calibration([])
+    assert c_default["min_lines"] == 8
+    assert c_default["min_tokens"] == 15
+    assert c_default["max_index_frequency"] == 0.25
+
+    c_custom = compute_corpus_calibration(
+        [],
+        min_lines=6,
+        min_tokens=10,
+        max_index_frequency=0.40,
+    )
+    assert c_custom["min_lines"] == 6
+    assert c_custom["min_tokens"] == 10
+    assert c_custom["max_index_frequency"] == 0.40
+
+    # 2. Round-trip baseline persistence
+    base_file = tmp_path / "bounds_baseline.json"
+    record_baseline([], str(base_file), "target", 0.90, corpus_calibration=c_custom)
+    loaded = load_baseline(str(base_file))
+    assert loaded.corpus_calibration is not None
+    assert loaded.corpus_calibration["min_lines"] == 6
+    assert loaded.corpus_calibration["min_tokens"] == 10
+    assert loaded.corpus_calibration["max_index_frequency"] == 0.40
+
+    # 3. Direct compatibility check for min_lines and min_tokens
+    assert _is_calibration_mode_compatible(c_custom, min_lines=6, min_tokens=10, max_index_frequency=0.40) is True
+    assert _is_calibration_mode_compatible(c_custom, min_lines=8, min_tokens=10, max_index_frequency=0.40) is False
+    assert _is_calibration_mode_compatible(c_custom, min_lines=6, min_tokens=15, max_index_frequency=0.40) is False
+    assert _is_calibration_mode_compatible(c_default, min_lines=6, min_tokens=15, max_index_frequency=0.25) is False
+    assert _is_calibration_mode_compatible(c_default, min_lines=8, min_tokens=10, max_index_frequency=0.25) is False
+
+    # 4. Direct compatibility check for max_index_frequency
+    assert _is_calibration_mode_compatible(c_default, max_index_frequency=0.50) is False
+    assert _is_calibration_mode_compatible(c_default, max_index_frequency=None) is False
+
+    c_none = compute_corpus_calibration([], max_index_frequency=None)
+    assert c_none["max_index_frequency"] is None
+    assert _is_calibration_mode_compatible(c_none, max_index_frequency=None) is True
+    assert _is_calibration_mode_compatible(c_none, max_index_frequency=0.25) is False
+
+    # 5. Integration: Lowered min_lines threshold in diff scan skips calibration
+    repo_dir = tmp_path / "threshold_repo"
+    repo_dir.mkdir()
+    fn_7_lines = (
+        "def micro_service_step(val_x, val_y):\n"
+        "    t1 = val_x * 3\n"
+        "    t2 = val_y * 7\n"
+        "    t3 = t1 + t2\n"
+        "    t4 = t3 * 2\n"
+        "    t5 = t4 - 1\n"
+        "    return t5 if t5 > 0 else 0\n"
+    )
+    (repo_dir / "worker_a.py").write_text(fn_7_lines, encoding="utf-8")
+    (repo_dir / "worker_b.py").write_text(fn_7_lines, encoding="utf-8")
+
+    # Baseline recorded with default min_lines=8
+    calib_base_8 = compute_corpus_calibration([], min_lines=8)
+    # Scanning with min_lines=6 lowers the threshold compared to calib_base_8
+    clones_lowered = scan_target(
+        str(repo_dir),
+        min_lines=6,
+        min_tokens=5,
+        threshold=0.90,
+        corpus_calibration=calib_base_8,
+    )
+    # Incompatible calibration is bypassed and the 7-line clone is detected
+    assert len(clones_lowered) == 1
+    # When scanned with matching min_lines=8, the 7-line function is naturally filtered out
+    clones_strict = scan_target(
+        str(repo_dir),
+        min_lines=8,
+        threshold=0.90,
+        corpus_calibration=calib_base_8,
+    )
+    assert len(clones_strict) == 0
+
 
 
