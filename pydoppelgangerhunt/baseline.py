@@ -49,6 +49,17 @@ def _safe_min_corpus(raw_min_corpus: Any, filter_stop_shingles: bool = False) ->
     return 4 if filter_stop_shingles else 30
 
 
+def _attach_calibration_flags(
+    target: Dict[str, Any],
+    source: Dict[str, Any],
+) -> None:
+    """Attaches feature mode flags and bounds from source dictionary to target calibration dict."""
+    for flag in ("bag_of_tokens", "call_sequences", "filter_stop_shingles"):
+        target[flag] = bool(source.get(flag, False))
+    if "min_corpus_size" in source:
+        target["min_corpus_size"] = source.get("min_corpus_size")
+
+
 def _serialize_shingle_key(sh: Any) -> str:
     """Serializes a shingle key into a type-tagged string representation for JSON."""
     if isinstance(sh, (tuple, list)):
@@ -222,12 +233,22 @@ def compute_corpus_calibration(
         except (ValueError, TypeError, OverflowError):
             pass
 
-    return {
+    calib = {
         "total_units": total_units,
         "max_index_frequency": valid_max_freq,
         "global_stop_shingles": global_stop_shingles,
         "shingle_frequencies": shingle_frequencies,
     }
+    _attach_calibration_flags(
+        calib,
+        {
+            "bag_of_tokens": bag_of_tokens,
+            "call_sequences": call_sequences,
+            "filter_stop_shingles": filter_stop_shingles,
+            "min_corpus_size": min_corpus_size,
+        },
+    )
+    return calib
 
 
 
@@ -336,7 +357,7 @@ def record_baseline(
         total_units_val = _safe_total_units(corpus_calibration.get("total_units"))
 
         parsed_freq = _safe_index_frequency(corpus_calibration.get("max_index_frequency"))
-        safe_max_freq: Optional[float] = round(parsed_freq, 6) if parsed_freq is not None else None
+        safe_max_freq: Optional[float] = parsed_freq
 
         safe_stops: List[Any] = []
         raw_stops = corpus_calibration.get("global_stop_shingles", [])
@@ -359,12 +380,14 @@ def record_baseline(
             max_units=total_units_val,
         )
 
-        data["corpus_calibration"] = {
+        calib_entry = {
             "total_units": total_units_val,
             "max_index_frequency": safe_max_freq,
             "global_stop_shingles": safe_stops,
             "shingle_frequencies": dict(sorted(safe_shingle_freqs.items(), key=lambda item: item[0])),
         }
+        _attach_calibration_flags(calib_entry, corpus_calibration)
+        data["corpus_calibration"] = calib_entry
     target_p = Path(baseline_path)
     target_p.parent.mkdir(parents=True, exist_ok=True)
     target_p.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -490,7 +513,8 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
             if raw_max_freq is None:
                 max_idx_freq = None
             else:
-                max_idx_freq = _safe_index_frequency(raw_max_freq) or 0.25
+                parsed_max = _safe_index_frequency(raw_max_freq)
+                max_idx_freq = parsed_max if parsed_max is not None else 0.25
 
             corpus_calibration = {
                 "total_units": calib_total_units,
@@ -498,6 +522,7 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
                 "global_stop_shingles": decoded_stops,
                 "shingle_frequencies": decoded_freqs,
             }
+            _attach_calibration_flags(corpus_calibration, raw_calib)
 
         return BaselineFingerprints(
             fps, records=records, corpus_calibration=corpus_calibration

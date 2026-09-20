@@ -101,7 +101,7 @@ def parse_git_diff_hunks(diff_text: str) -> Dict[str, List[Tuple[int, int]]]:
             else:
                 if len(rest) > 2 and rest[1] == "/" and rest[0] in "biwc":
                     rest = rest[2:]
-                current_file = normalize_path_string(rest.strip('"'), strip_anchor=False)
+                current_file = normalize_path_string(rest, strip_anchor=False)
         elif line.startswith("@@ ") and current_file:
             parts = line.split(" ")
             plus_parts = [p for p in parts if p.startswith("+")]

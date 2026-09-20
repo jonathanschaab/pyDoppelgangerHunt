@@ -845,4 +845,23 @@ def test_decode_git_cstyle_path_quoted_literal_unicode() -> None:
     assert any("café file.py" in k for k in hunks)
 
 
+def test_parse_git_diff_hunks_preserves_literal_quotes_in_filename() -> None:
+    """Verifies that parse_git_diff_hunks does not strip legitimate quotes from decoded filenames."""
+    from pydoppelgangerhunt.git_diff import parse_git_diff_hunks  # pylint: disable=import-outside-toplevel
+
+    # Git quotes a file containing leading/trailing quotes, escaping internal quotes:
+    # e.g., file `"pkg.py"` is output by git as `"\"pkg.py\""`
+    diff_with_quotes = (
+        'diff --git "a/\\"pkg.py\\"" "b/\\"pkg.py\\""\n'
+        '--- "a/\\"pkg.py\\""\n'
+        '+++ "b/\\"pkg.py\\""\n'
+        "@@ -10,3 +10,3 @@\n"
+        "+# modified line\n"
+    )
+    hunks = parse_git_diff_hunks(diff_with_quotes)
+    # The parsed filename should retain the literal quote character rather than having it stripped
+    assert any('"pkg.py"' in k or '"pkg.py' in k for k in hunks)
+
+
+
 

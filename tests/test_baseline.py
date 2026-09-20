@@ -2645,6 +2645,77 @@ def test_min_corpus_size_malformed_fallback(tmp_path: Path) -> None:
     assert isinstance(calib, dict)
 
 
+def test_small_positive_max_index_frequency_preserved_without_lossy_rounding(tmp_path: Path) -> None:
+    """Verifies that small positive max_index_frequency values (e.g. 4e-7) are not rounded to 0.0 or reset to 0.25."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        compute_corpus_calibration,
+        load_baseline,
+        record_baseline,
+    )
+
+    base_path = tmp_path / "small_freq_baseline.json"
+    calib = compute_corpus_calibration([], max_index_frequency=4e-7)
+    assert calib["max_index_frequency"] == 4e-7
+
+    u1 = {"file": "a.py", "name": "fn1", "tokens": ["a"]}
+    u2 = {"file": "b.py", "name": "fn2", "tokens": ["b"]}
+    record_baseline([(1.0, u1, u2)], str(base_path), "repo", 0.85, corpus_calibration=calib)
+
+    # Raw JSON must retain small positive float
+    raw_data = json.loads(base_path.read_text(encoding="utf-8"))
+    assert raw_data["corpus_calibration"]["max_index_frequency"] == 4e-7
+
+    # Loaded baseline must retain exact 4e-7 and not fall back to 0.25
+    loaded = load_baseline(str(base_path))
+    assert loaded.corpus_calibration is not None
+    assert loaded.corpus_calibration["max_index_frequency"] == 4e-7
+
+
+def test_corpus_calibration_feature_mode_validation_and_rejection(tmp_path: Path) -> None:
+    """Verifies that feature space modes (bag_of_tokens, call_sequences) are tracked and mismatched calibration is skipped."""
+    from pydoppelgangerhunt.baseline import compute_corpus_calibration  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    code_file = tmp_path / "feature_mode_sample.py"
+    code_file.write_text(
+        "def func_alpha(a, b, c, d):\n"
+        "    x = (a * 2) + (b * 3)\n"
+        "    y = (c * 4) + (d * 5)\n"
+        "    return x + y if x > y else y - x\n\n"
+        "def func_beta(a, b, c, d):\n"
+        "    x = (a * 2) + (b * 3)\n"
+        "    y = (c * 4) + (d * 5)\n"
+        "    return x + y if x > y else y - x\n",
+        encoding="utf-8",
+    )
+
+    # 1. Feature flags are properly recorded
+    calib_bot = compute_corpus_calibration([], bag_of_tokens=True)
+    assert calib_bot["bag_of_tokens"] is True
+    assert calib_bot["call_sequences"] is False
+
+    calib_calls = compute_corpus_calibration([], call_sequences=True)
+    assert calib_calls["bag_of_tokens"] is False
+    assert calib_calls["call_sequences"] is True
+
+    calib_default = compute_corpus_calibration([])
+    assert calib_default["bag_of_tokens"] is False
+    assert calib_default["call_sequences"] is False
+
+    # 2. Incompatible calibration mode is skipped in scan_target without corrupting AST clone detection
+    # Passing bag_of_tokens=True calibration to a standard AST shingle scan
+    clones = scan_target(
+        str(tmp_path),
+        min_lines=2,
+        corpus_calibration=calib_bot,
+        bag_of_tokens=False,
+        call_sequences=False,
+    )
+    # The clone must be detected and not falsely pruned by incompatible calibration lookups
+    assert len(clones) >= 1
+
+
+
 
 
 

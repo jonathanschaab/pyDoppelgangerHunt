@@ -610,6 +610,18 @@ def _build_calibration_metadata(
     )
 
 
+def _is_calibration_mode_compatible(
+    calib: Dict[str, Any],
+    *,
+    bag_of_tokens: bool,
+    call_sequences: bool,
+) -> bool:
+    """Validates that corpus calibration was generated with compatible representation features."""
+    return bool(calib.get("bag_of_tokens", False)) == bool(bag_of_tokens) and bool(
+        calib.get("call_sequences", False)
+    ) == bool(call_sequences)
+
+
 def _worker_harvest_file(task_kwargs: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Worker task wrapper for process pool executor."""
     return harvest_file_units(**task_kwargs)
@@ -820,6 +832,12 @@ def scan_target(
     if stop_shingles is not None:
         effective_stop_shingles.update(stop_shingles)
     if not isinstance(corpus_calibration, dict):
+        corpus_calibration = None
+    elif not _is_calibration_mode_compatible(
+        corpus_calibration,
+        bag_of_tokens=bag_of_tokens,
+        call_sequences=call_sequences,
+    ):
         corpus_calibration = None
     if corpus_calibration is not None:
         calib_stops = corpus_calibration.get("global_stop_shingles")
