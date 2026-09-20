@@ -836,9 +836,11 @@ def scan_target(
                 except (TypeError, ValueError):
                     calib_df = 0
             try:
-                combined_df = df + int(calib_df or 0)
-            except (ValueError, TypeError):
-                combined_df = df
+                parsed_calib = int(calib_df or 0)
+                valid_calib_df = max(0, parsed_calib)
+            except (ValueError, TypeError, OverflowError):
+                valid_calib_df = 0
+            combined_df = df + valid_calib_df
             idf_weights[k] = math.log((1.0 + corpus_size) / (1.0 + combined_df)) + 1.0
 
     shingle_index: Dict[Any, List[int]] = {}
@@ -907,9 +909,13 @@ def scan_target(
                 except (TypeError, ValueError):
                     raw_global = None
             if raw_global is not None:
-                is_global_shingle = True
                 try:
-                    df_global = int(raw_global)
+                    val = int(raw_global)
+                    if val > 0:
+                        is_global_shingle = True
+                        df_global = val
+                    else:
+                        df_global = 0
                 except (ValueError, TypeError, OverflowError):
                     df_global = 0
             else:

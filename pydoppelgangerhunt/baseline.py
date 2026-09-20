@@ -29,13 +29,30 @@ def _serialize_shingle_key(sh: Any) -> str:
     return str(sh)
 
 
-def _deep_tuple(val: Any, depth: int = 0, max_depth: int = 20) -> Any:
+def _deep_tuple(
+    val: Any,
+    depth: int = 0,
+    max_depth: int = 20,
+    seen: Optional[Set[int]] = None,
+) -> Any:
     """Recursively converts nested lists and tuples into immutable, hashable tuples."""
     if depth > max_depth:
         raise ValueError(f"Exceeded maximum nesting depth of {max_depth}")
     if isinstance(val, (list, tuple)):
-        return tuple(_deep_tuple(x, depth + 1, max_depth) for x in val)
+        if seen is None:
+            seen = set()
+        val_id = id(val)
+        if val_id in seen:
+            raise ValueError("Cyclic container detected")
+        seen.add(val_id)
+        try:
+            return tuple(_deep_tuple(x, depth + 1, max_depth, seen) for x in val)
+        except RecursionError as err:
+            raise ValueError("Exceeded maximum recursion depth") from err
+        finally:
+            seen.remove(val_id)
     return val
+
 
 
 def _deserialize_shingle_key(key: str) -> Any:

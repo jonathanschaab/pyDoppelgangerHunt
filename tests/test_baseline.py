@@ -1853,8 +1853,20 @@ def test_red_team_baseline_and_matcher_hardening(tmp_path: Path) -> None:
     # Cyclic list raises ValueError in _deep_tuple
     cyclic: List[Any] = []
     cyclic.append(cyclic)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Cyclic container detected"):
         _deep_tuple(cyclic)
+
+    # Mutual/indirect cycle raises ValueError
+    cycle_a: List[Any] = []
+    cycle_b: List[Any] = [cycle_a]
+    cycle_a.append(cycle_b)
+    with pytest.raises(ValueError, match="Cyclic container detected"):
+        _deep_tuple(cycle_a)
+
+    # Non-cyclic DAG (diamond graph) succeeds
+    shared = [1, 2]
+    dag = [shared, shared]
+    assert _deep_tuple(dag) == ((1, 2), (1, 2))
 
     # 2. Unhashable items in stop-shingles do not discard valid stop shingles in load_baseline
     calib_json = tmp_path / "mixed_stops.json"
@@ -2310,6 +2322,41 @@ def test_corpus_calibration_malformed_types_and_unserializable_shingles(tmp_path
         },
     )
     assert base_file_unserializable.exists()
+
+    # 6. tfidf=True with non-finite and negative frequencies in corpus_calibration
+    clones_nonfinite = scan_target(
+        str(tmp_path),
+        min_lines=3,
+        tfidf=True,
+        corpus_calibration={
+            "total_units": 5,
+            "shingle_frequencies": {
+                "compute_something": float("inf"),
+                "var_key": float("-inf"),
+                "other_key": float("nan"),
+                "neg_key": -999,
+                "str_inf": "inf",
+            },
+        },
+    )
+    assert len(clones_nonfinite) >= 1
+
+    # 7. candidate pairing with non-finite and negative frequencies in diff and normal mode
+    clones_diff_nonfinite = scan_target(
+        str(tmp_path),
+        min_lines=3,
+        diff_files=["sample.py"],
+        corpus_calibration={
+            "total_units": 5,
+            "max_index_frequency": 0.25,
+            "shingle_frequencies": {
+                "compute_something": float("inf"),
+                "neg_key": -50,
+            },
+        },
+    )
+    assert len(clones_diff_nonfinite) >= 1
+
 
 
 
