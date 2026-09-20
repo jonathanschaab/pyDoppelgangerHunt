@@ -15,6 +15,7 @@ from pydoppelgangerhunt.config import (
     normalize_path_string,
     paths_match_boundary,
 )
+from pydoppelgangerhunt.baseline import _safe_index_frequency
 from pydoppelgangerhunt.parser import harvest_file_units
 
 DEFAULT_STOP_SHINGLES: Set[Tuple[str, ...]] = {
@@ -498,17 +499,6 @@ def suppress_subclones(
     return [c for idx, c in enumerate(clones) if idx not in suppressed_indices]
 
 
-def _safe_index_frequency(raw_freq: Any) -> Optional[float]:
-    """Validates and clamps an index frequency to a finite float in (0.0, 1.0], or None."""
-    if raw_freq is None:
-        return None
-    try:
-        val = float(raw_freq)
-        if math.isfinite(val) and 0.0 < val <= 1.0:
-            return val
-    except (ValueError, TypeError, OverflowError):
-        pass
-    return None
 
 
 def _compute_max_posting_len(
@@ -534,14 +524,29 @@ def _add_candidate_pairs(
     diff_unit_indices: Optional[Set[int]] = None,
 ) -> None:
     """Populates candidate pairs from posting list, filtering by diff units if active."""
-    for i, idx1 in enumerate(indices):
-        for idx2 in indices[i + 1:]:
-            if (
-                diff_unit_indices is not None
-                and idx1 not in diff_unit_indices
-                and idx2 not in diff_unit_indices
-            ):
-                continue
+    if diff_unit_indices is None:
+        for i, idx1 in enumerate(indices):
+            for idx2 in indices[i + 1:]:
+                candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))
+        return
+
+    diff_in: List[int] = []
+    diff_out: List[int] = []
+    for idx in indices:
+        if idx in diff_unit_indices:
+            diff_in.append(idx)
+        else:
+            diff_out.append(idx)
+
+    if not diff_in:
+        return
+
+    for i, idx1 in enumerate(diff_in):
+        for idx2 in diff_in[i + 1:]:
+            candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))
+
+    for idx1 in diff_in:
+        for idx2 in diff_out:
             candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))
 
 
@@ -772,8 +777,6 @@ def scan_target(
                 )
             return []
 
-    local_corpus_units = len(diff_unit_indices) if diff_unit_indices is not None else len(units)
-
     effective_stop_shingles: Set[Any] = set()
     if filter_stop_shingles:
         effective_stop_shingles.update(DEFAULT_STOP_SHINGLES)
@@ -791,18 +794,23 @@ def scan_target(
 
     idf_weights: Dict[Any, float] = {}
     if tfidf and units:
-        corpus_size = local_corpus_units
         if corpus_calibration is not None:
+            local_units_count = len(diff_unit_indices) if diff_unit_indices is not None else len(units)
             try:
-                corpus_size += max(0, int(corpus_calibration.get("total_units", 0) or 0))
+                calib_units_tfidf = max(0, int(corpus_calibration.get("total_units", 0) or 0))
             except (ValueError, TypeError, OverflowError):
-                pass
+                calib_units_tfidf = 0
+            corpus_size = local_units_count + calib_units_tfidf
+            active_indices: Union[Set[int], range] = (
+                diff_unit_indices
+                if diff_unit_indices is not None
+                else range(len(units))
+            )
+        else:
+            corpus_size = len(units)
+            active_indices = range(len(units))
+
         df_counts: Dict[Any, int] = {}
-        active_indices: Union[Set[int], range] = (
-            diff_unit_indices
-            if diff_unit_indices is not None
-            else range(len(units))
-        )
         for idx in active_indices:
             u = units[idx]
             keys = u.get("vector", {}).keys() if bag_of_tokens else u["shingles"]
@@ -851,7 +859,8 @@ def scan_target(
             calib_units = max(0, int(corpus_calibration.get("total_units", 0) or 0))
         except (ValueError, TypeError, OverflowError):
             calib_units = 0
-        total_corpus_units = local_corpus_units + calib_units
+        local_units_count = len(diff_unit_indices) if diff_unit_indices is not None else len(units)
+        total_corpus_units = local_units_count + calib_units
         calib_freqs_map = corpus_calibration.get("shingle_frequencies", {})
         raw_calib_max_freq = (
             corpus_calibration["max_index_frequency"]
@@ -865,8 +874,8 @@ def scan_target(
     else:
         safe_max_freq = _safe_index_frequency(max_index_frequency)
         max_posting_len = _compute_max_posting_len(
-            local_corpus_units, safe_max_freq, effective_min_corpus, fallback=local_corpus_units + 1
-        ) or (local_corpus_units + 1)
+            len(units), safe_max_freq, effective_min_corpus, fallback=len(units) + 1
+        ) or (len(units) + 1)
 
     for sh, u_indices in shingle_index.items():
         if len(u_indices) <= 1:
@@ -887,7 +896,7 @@ def scan_target(
             except (ValueError, TypeError, OverflowError):
                 combined_df = df_local
         else:
-            combined_df = df_local
+            combined_df = len(u_indices)
 
         if max_posting_len is not None and combined_df > max_posting_len:
             continue

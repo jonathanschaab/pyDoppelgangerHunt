@@ -714,3 +714,36 @@ def test_get_git_modified_files(monkeypatch: pytest.MonkeyPatch) -> None:
     assert get_git_modified_line_ranges(since_ref="--diff-filter=A") == {}
     assert get_git_modified_line_ranges(since_ref="-R") == {}
 
+
+def test_parse_git_diff_hunks_cstyle_and_blame_dash_dash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test parse_git_diff_hunks decodes C-style octal paths and blame porcelain uses '--'."""
+    from typing import Sequence  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.git_diff import get_git_blame_info  # pylint: disable=import-outside-toplevel
+
+    diff_sample = (
+        'diff --git "a/pkg/caf\\303\\251.py" "b/pkg/caf\\303\\251.py"\n'
+        '--- "a/pkg/caf\\303\\251.py"\n'
+        '+++ "b/pkg/caf\\303\\251.py"\n'
+        '@@ -10,3 +10,5 @@\n'
+        '+def cafe():\n'
+    )
+    hunks = parse_git_diff_hunks(diff_sample)
+    assert "pkg/café.py" in hunks
+    assert (10, 14) in hunks["pkg/café.py"]
+
+    blame_args: List[Sequence[str]] = []
+
+    def mock_run_blame(args: Sequence[str], cwd: Optional[str] = None) -> Optional[str]:
+        blame_args.append(args)
+        return (
+            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2 1 1 1\n"
+            "author Ada\nauthor-time 1700000000\nsummary test\n"
+        )
+
+    monkeypatch.setattr("pydoppelgangerhunt.git_diff._run_git_command", mock_run_blame)
+    get_git_blame_info("pkg/café.py", 1, 5, repo_root="/repo")
+    assert blame_args
+    assert "--" in blame_args[0]
+    assert blame_args[0][blame_args[0].index("--") + 1] == "pkg/café.py"
+
+

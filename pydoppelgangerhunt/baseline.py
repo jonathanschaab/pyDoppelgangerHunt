@@ -8,7 +8,7 @@ import json
 import logging
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.config import (
     canonical_path_key,
@@ -45,6 +45,37 @@ def _deserialize_shingle_key(key: str) -> Any:
         except (json.JSONDecodeError, ValueError, TypeError, RecursionError):
             pass
     return key
+
+
+def _sanitize_shingle_frequency_dict(
+    raw_freqs: Any,
+    key_transform: Callable[[Any], Any],
+) -> Dict[Any, int]:
+    """Sanitizes raw shingle frequencies by filtering positive integers and transforming keys."""
+    cleaned: Dict[Any, int] = {}
+    if not isinstance(raw_freqs, dict):
+        return cleaned
+    for k, v in raw_freqs.items():
+        try:
+            freq_val = int(v)
+            if freq_val > 0:
+                cleaned[key_transform(k)] = freq_val
+        except (ValueError, TypeError, OverflowError, RecursionError):
+            continue
+    return cleaned
+
+
+def _safe_index_frequency(raw_freq: Any) -> Optional[float]:
+    """Validates and clamps an index frequency to a finite float in (0.0, 1.0], or None."""
+    if raw_freq is None:
+        return None
+    try:
+        val = float(raw_freq)
+        if math.isfinite(val) and 0.0 < val <= 1.0:
+            return val
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return None
 
 
 def compute_corpus_calibration(
@@ -88,14 +119,7 @@ def compute_corpus_calibration(
     if stop_shingles is not None:
         global_stop_shingles.update(stop_shingles)
 
-    valid_max_freq: Optional[float] = None
-    if max_index_frequency is not None:
-        try:
-            parsed_max_freq = float(max_index_frequency)
-            if math.isfinite(parsed_max_freq) and 0.0 < parsed_max_freq <= 1.0:
-                valid_max_freq = parsed_max_freq
-        except (ValueError, TypeError, OverflowError):
-            valid_max_freq = None
+    valid_max_freq = _safe_index_frequency(max_index_frequency)
 
     if valid_max_freq is not None and total_units >= effective_min_corpus:
         try:
@@ -219,24 +243,34 @@ def record_baseline(
         ],
     }
     if corpus_calibration is not None:
-        raw_max_freq = corpus_calibration.get("max_index_frequency")
+        try:
+            total_units_val = max(0, int(corpus_calibration.get("total_units", 0) or 0))
+        except (ValueError, TypeError, OverflowError):
+            total_units_val = 0
+
+        parsed_freq = _safe_index_frequency(corpus_calibration.get("max_index_frequency"))
+        safe_max_freq: Optional[float] = round(parsed_freq, 6) if parsed_freq is not None else None
+
+        safe_stops: List[Any] = []
+        raw_stops = corpus_calibration.get("global_stop_shingles", [])
+        if isinstance(raw_stops, (list, set, tuple)):
+            for sh in raw_stops:
+                try:
+                    safe_stops.append(list(sh) if isinstance(sh, (tuple, list)) else sh)
+                except (TypeError, ValueError, RecursionError):
+                    continue
+        safe_stops.sort(key=lambda x: json.dumps(x) if isinstance(x, list) else str(x))
+
+        safe_shingle_freqs = _sanitize_shingle_frequency_dict(
+            corpus_calibration.get("shingle_frequencies", {}),
+            _serialize_shingle_key,
+        )
+
         data["corpus_calibration"] = {
-            "total_units": int(corpus_calibration.get("total_units", 0) or 0),
-            "max_index_frequency": float(raw_max_freq) if raw_max_freq is not None else None,
-            "global_stop_shingles": sorted(
-                [
-                    list(sh) if isinstance(sh, (tuple, list)) else sh
-                    for sh in corpus_calibration.get("global_stop_shingles", [])
-                ],
-                key=lambda x: json.dumps(x) if isinstance(x, list) else str(x),
-            ),
-            "shingle_frequencies": {
-                _serialize_shingle_key(sh): int(cnt)
-                for sh, cnt in sorted(
-                    corpus_calibration.get("shingle_frequencies", {}).items(),
-                    key=lambda item: _serialize_shingle_key(item[0]),
-                )
-            },
+            "total_units": total_units_val,
+            "max_index_frequency": safe_max_freq,
+            "global_stop_shingles": safe_stops,
+            "shingle_frequencies": dict(sorted(safe_shingle_freqs.items(), key=lambda item: item[0])),
         }
     target_p = Path(baseline_path)
     target_p.parent.mkdir(parents=True, exist_ok=True)
@@ -352,27 +386,16 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
                         decoded_stops.add(_deep_tuple(sh))
                     except (TypeError, ValueError, RecursionError):
                         continue
-            raw_freqs = raw_calib.get("shingle_frequencies", {})
-            decoded_freqs: Dict[Any, int] = {}
-            if isinstance(raw_freqs, dict):
-                for k, v in raw_freqs.items():
-                    try:
-                        freq_val = int(v)
-                        if freq_val > 0:
-                            decoded_freqs[_deserialize_shingle_key(k)] = freq_val
-                    except (ValueError, TypeError, OverflowError, RecursionError):
-                        continue
+            decoded_freqs = _sanitize_shingle_frequency_dict(
+                raw_calib.get("shingle_frequencies", {}),
+                _deserialize_shingle_key,
+            )
             raw_max_freq = raw_calib.get("max_index_frequency")
             max_idx_freq: Optional[float]
             if raw_max_freq is None:
                 max_idx_freq = None
             else:
-                try:
-                    max_idx_freq = float(raw_max_freq)
-                    if not math.isfinite(max_idx_freq) or max_idx_freq <= 0.0 or max_idx_freq > 1.0:
-                        max_idx_freq = 0.25
-                except (ValueError, TypeError, OverflowError):
-                    max_idx_freq = 0.25
+                max_idx_freq = _safe_index_frequency(raw_max_freq) or 0.25
             try:
                 calib_total_units = max(0, int(raw_calib.get("total_units", 0) or 0))
             except (ValueError, TypeError, OverflowError):

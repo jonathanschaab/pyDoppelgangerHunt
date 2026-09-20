@@ -29,6 +29,19 @@ def _run_git_command(args: Sequence[str], cwd: Optional[str] = None) -> Optional
     return None
 
 
+def _decode_git_cstyle_path(raw_path: str) -> str:
+    """Decodes C-style octal and unicode escape sequences in git quotepath strings."""
+    trimmed = raw_path.strip()
+    if trimmed.startswith('"') and trimmed.endswith('"') and len(trimmed) >= 2:
+        inner = trimmed[1:-1]
+        try:
+            raw_bytes = inner.encode("latin1").decode("unicode_escape").encode("latin1")
+            return raw_bytes.decode("utf-8", errors="replace")
+        except (UnicodeError, ValueError):
+            return inner
+    return trimmed
+
+
 def parse_git_diff_hunks(diff_text: str) -> Dict[str, List[Tuple[int, int]]]:
     """Parses unified diff output into mapping of file paths to changed line ranges."""
     modified_ranges: Dict[str, List[Tuple[int, int]]] = {}
@@ -41,8 +54,7 @@ def parse_git_diff_hunks(diff_text: str) -> Dict[str, List[Tuple[int, int]]]:
             rest = line[4:].strip()
             if "\t" in rest:
                 rest = rest.split("\t", 1)[0].strip()
-            if rest.startswith('"') and rest.endswith('"') and len(rest) >= 2:
-                rest = rest[1:-1]
+            rest = _decode_git_cstyle_path(rest)
             if rest in ("/dev/null", ""):
                 current_file = None
             else:
@@ -107,15 +119,8 @@ def get_git_modified_files(
         return []
     modified_files: List[str] = []
     for line in diff_output.splitlines():
-        trimmed = line.strip()
+        trimmed = _decode_git_cstyle_path(line)
         if trimmed:
-            if trimmed.startswith('"') and trimmed.endswith('"') and len(trimmed) >= 2:
-                inner = trimmed[1:-1]
-                try:
-                    raw_bytes = inner.encode("latin1").decode("unicode_escape").encode("latin1")
-                    trimmed = raw_bytes.decode("utf-8", errors="replace")
-                except (UnicodeError, ValueError):
-                    trimmed = inner
             norm = normalize_path_string(trimmed, strip_anchor=False)
             if norm and norm not in modified_files:
                 modified_files.append(norm)
@@ -236,7 +241,7 @@ def get_git_blame_info(
         return {"author": "Unknown", "commit": "unknown", "timestamp": 0, "summary": ""}
     start_l = max(1, start_line)
     end_l = max(start_l, end_line)
-    args = ["blame", "-L", f"{start_l},{end_l}", "--porcelain", norm_file]
+    args = ["blame", "-L", f"{start_l},{end_l}", "--porcelain", "--", norm_file]
 
     blame_text = _run_git_command(args, cwd=repo_root)
     if not blame_text:

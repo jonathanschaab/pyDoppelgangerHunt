@@ -2048,4 +2048,124 @@ def internal_worker_gamma(elements):
     assert {Path(pair_calib[1]["file"]).name, Path(pair_calib[2]["file"]).name} == {"mod.py", "unmod_a.py"}
 
 
+def test_record_baseline_calibration_hardening(tmp_path: Path) -> None:
+    """Test record_baseline robustly sanitizes non-finite floats, overflow, and invalid counts."""
+    from pydoppelgangerhunt.baseline import load_baseline, record_baseline  # pylint: disable=import-outside-toplevel
+
+    u1 = {"file": "mod1.py", "name": "fn1", "structural_hash": "hash1"}
+    u2 = {"file": "mod2.py", "name": "fn2", "structural_hash": "hash2"}
+    clones = [(0.95, u1, u2)]
+
+    # 1. Non-finite max_index_frequency (NaN, Inf) and negative/invalid counts
+    calib_malformed = {
+        "total_units": "invalid_int",
+        "max_index_frequency": float("nan"),
+        "global_stop_shingles": ["stop_a", ("nested", "shingle"), 12345],
+        "shingle_frequencies": {
+            "valid_key": 42,
+            "zero_key": 0,
+            "negative_key": -5,
+            "invalid_count": "not_an_int",
+        },
+    }
+
+    out_file = tmp_path / "baseline_hardened.json"
+    record_baseline(clones, str(out_file), "target_repo", 0.90, corpus_calibration=calib_malformed)
+
+    raw_json = json.loads(out_file.read_text(encoding="utf-8"))
+    calib_data = raw_json.get("corpus_calibration")
+    assert calib_data is not None
+    assert calib_data["total_units"] == 0
+    assert calib_data["max_index_frequency"] is None
+    assert calib_data["shingle_frequencies"] == {"valid_key": 42}
+    assert "stop_a" in calib_data["global_stop_shingles"]
+
+    # 2. Inf and out-of-range floats
+    calib_inf = {
+        "total_units": 50,
+        "max_index_frequency": float("inf"),
+        "shingle_frequencies": {"k": 10},
+    }
+    out_inf = tmp_path / "baseline_inf.json"
+    record_baseline(clones, str(out_inf), "target_repo", 0.90, corpus_calibration=calib_inf)
+    data_inf = json.loads(out_inf.read_text(encoding="utf-8"))["corpus_calibration"]
+    assert data_inf["max_index_frequency"] is None
+    assert data_inf["total_units"] == 50
+
+    # 3. Valid float should be cleanly preserved
+    calib_valid = {
+        "total_units": 100,
+        "max_index_frequency": 0.25,
+        "shingle_frequencies": {"k": 10},
+    }
+    out_valid = tmp_path / "baseline_valid.json"
+    record_baseline(clones, str(out_valid), "target_repo", 0.90, corpus_calibration=calib_valid)
+    data_valid = json.loads(out_valid.read_text(encoding="utf-8"))["corpus_calibration"]
+    assert data_valid["max_index_frequency"] == 0.25
+    assert data_valid["total_units"] == 100
+
+    loaded = load_baseline(str(out_valid))
+    assert loaded.corpus_calibration is not None
+    assert loaded.corpus_calibration["total_units"] == 100
+    assert loaded.corpus_calibration["max_index_frequency"] == 0.25
+
+
+def test_diff_scan_uncalibrated_pruning(tmp_path: Path) -> None:
+    """Test diff-only scan without calibration prunes ubiquitous boilerplate across repository units."""
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo_pruning"
+    repo.mkdir()
+
+    boilerplate_code = (
+        "def common_logging_handler(event_name, payload, context):\n"
+        "    tag = 'AUDIT'\n"
+        "    msg = f'[{tag}] {event_name}: {payload}'\n"
+        "    print(msg)\n"
+        "    log_line = {'event': event_name, 'ctx': context}\n"
+        "    return log_line\n"
+    )
+
+    for i in range(34):
+        (repo / f"unmod_{i}.py").write_text(boilerplate_code, encoding="utf-8")
+
+    mod_code = (
+        boilerplate_code + "\n\n"
+        "def calculate_tax_for_eu_region(amount, rate, country_code):\n"
+        "    subtotal = amount * rate\n"
+        "    tax = subtotal * 0.20\n"
+        "    total = subtotal + tax\n"
+        "    status = 'EU_OK'\n"
+        "    return {'total': total, 'tax': tax, 'status': status}\n"
+    )
+    (repo / "mod.py").write_text(mod_code, encoding="utf-8")
+
+    target_code = (
+        "def calculate_tax_for_eu_region_duplicate(amount, rate, country_code):\n"
+        "    subtotal = amount * rate\n"
+        "    tax = subtotal * 0.20\n"
+        "    total = subtotal + tax\n"
+        "    status = 'EU_OK'\n"
+        "    return {'total': total, 'tax': tax, 'status': status}\n"
+    )
+    (repo / "clone_target.py").write_text(target_code, encoding="utf-8")
+
+    diff_clones = scan_target(
+        str(repo),
+        min_lines=6,
+        threshold=0.90,
+        diff_files=["mod.py"],
+        max_index_frequency=0.25,
+        min_corpus_size=30,
+        corpus_calibration=None,
+    )
+
+    assert len(diff_clones) == 1
+    pair = diff_clones[0]
+    matched_files = {Path(pair[1]["file"]).name, Path(pair[2]["file"]).name}
+    assert matched_files == {"mod.py", "clone_target.py"}
+    assert pair[1]["name"] in ("calculate_tax_for_eu_region", "calculate_tax_for_eu_region_duplicate")
+
+
+
 
