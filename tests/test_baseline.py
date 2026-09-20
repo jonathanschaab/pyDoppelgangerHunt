@@ -2811,3 +2811,48 @@ def test_subnormal_and_extreme_floats_index_frequency() -> None:
     # Extremely small positive float in posting calculation floors to max(2, ...)
     posting_len = _compute_max_posting_len(500, 1e-300, 10)
     assert posting_len == 2
+
+
+def test_stop_shingles_calibration_compatibility_and_isolation(tmp_path: Path) -> None:
+    """Verifies that configuration-derived stops are kept out of calibration and unconfigured scans reject stop-shingle calibration."""
+    from pydoppelgangerhunt.baseline import compute_corpus_calibration  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.matcher import (  # pylint: disable=import-outside-toplevel
+        DEFAULT_STOP_SHINGLES,
+        _is_calibration_mode_compatible,
+        scan_target,
+    )
+
+    # 1. compute_corpus_calibration does not inject DEFAULT_STOP_SHINGLES into global_stop_shingles
+    calib = compute_corpus_calibration([], filter_stop_shingles=True, stop_shingles={("Custom", "Stop")})
+    assert len(calib["global_stop_shingles"]) == 0
+    for s in DEFAULT_STOP_SHINGLES:
+        assert s not in calib["global_stop_shingles"]
+    assert ("Custom", "Stop") not in calib["global_stop_shingles"]
+    assert calib["filter_stop_shingles"] is True
+
+    # 2. _is_calibration_mode_compatible rejects filter_stop_shingles true-to-false transition
+    assert _is_calibration_mode_compatible(calib, bag_of_tokens=False, call_sequences=False, filter_stop_shingles=True) is True
+    assert _is_calibration_mode_compatible(calib, bag_of_tokens=False, call_sequences=False, filter_stop_shingles=False) is False
+
+    # 3. scan_target skips calibration recorded with filter_stop_shingles=True when current scan has filter_stop_shingles=False
+    code_file = tmp_path / "stop_shingle_test.py"
+    code_file.write_text(
+        "def fn_a(a, b):\n"
+        "    x = a + b\n"
+        "    y = x * 2\n"
+        "    return y\n\n"
+        "def fn_b(a, b):\n"
+        "    x = a + b\n"
+        "    y = x * 2\n"
+        "    return y\n",
+        encoding="utf-8",
+    )
+    clones = scan_target(
+        str(tmp_path),
+        min_lines=2,
+        min_tokens=3,
+        corpus_calibration=calib,
+        filter_stop_shingles=False,
+    )
+    assert len(clones) >= 1
+

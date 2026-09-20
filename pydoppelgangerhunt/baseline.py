@@ -235,11 +235,6 @@ def compute_corpus_calibration(
 
     effective_min_corpus = _safe_min_corpus(min_corpus_size, filter_stop_shingles)
     global_stop_shingles: Set[Any] = set()
-    if filter_stop_shingles:
-        from pydoppelgangerhunt.matcher import DEFAULT_STOP_SHINGLES
-        global_stop_shingles.update(DEFAULT_STOP_SHINGLES)
-    if stop_shingles is not None:
-        global_stop_shingles.update(stop_shingles)
 
     valid_max_freq = _safe_index_frequency(max_index_frequency)
 

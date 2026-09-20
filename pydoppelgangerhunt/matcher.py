@@ -620,13 +620,18 @@ def _is_calibration_mode_compatible(
     *,
     bag_of_tokens: bool,
     call_sequences: bool,
+    filter_stop_shingles: bool = False,
 ) -> bool:
-    """Validates that corpus calibration was generated with compatible representation features."""
+    """Validates that corpus calibration was generated with compatible representation and filtering features."""
     if not isinstance(calib, dict):
         return False
-    return _safe_bool(calib.get("bag_of_tokens", False)) == bool(bag_of_tokens) and _safe_bool(
-        calib.get("call_sequences", False)
-    ) == bool(call_sequences)
+    if _safe_bool(calib.get("bag_of_tokens", False)) != bool(bag_of_tokens):
+        return False
+    if _safe_bool(calib.get("call_sequences", False)) != bool(call_sequences):
+        return False
+    if _safe_bool(calib.get("filter_stop_shingles", False)) and not filter_stop_shingles:
+        return False
+    return True
 
 
 def _worker_harvest_file(task_kwargs: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -844,6 +849,7 @@ def scan_target(
         corpus_calibration,
         bag_of_tokens=bag_of_tokens,
         call_sequences=call_sequences,
+        filter_stop_shingles=filter_stop_shingles,
     ):
         corpus_calibration = None
     if corpus_calibration is not None:
