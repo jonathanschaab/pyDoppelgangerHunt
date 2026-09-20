@@ -22,7 +22,10 @@ logger = logging.getLogger(__name__)
 def _serialize_shingle_key(sh: Any) -> str:
     """Serializes a shingle key (tuple, list, or scalar) into a string representation for JSON."""
     if isinstance(sh, (tuple, list)):
-        return json.dumps(list(sh))
+        try:
+            return json.dumps(list(sh))
+        except (TypeError, ValueError):
+            return str(sh)
     return str(sh)
 
 
@@ -242,7 +245,7 @@ def record_baseline(
             for sim, u1, u2 in clones
         ],
     }
-    if corpus_calibration is not None:
+    if isinstance(corpus_calibration, dict):
         try:
             total_units_val = max(0, int(corpus_calibration.get("total_units", 0) or 0))
         except (ValueError, TypeError, OverflowError):
@@ -256,10 +259,15 @@ def record_baseline(
         if isinstance(raw_stops, (list, set, tuple)):
             for sh in raw_stops:
                 try:
-                    safe_stops.append(list(sh) if isinstance(sh, (tuple, list)) else sh)
+                    elem = list(sh) if isinstance(sh, (tuple, list)) else sh
+                    try:
+                        json.dumps(elem)
+                        safe_stops.append(elem)
+                    except (TypeError, ValueError):
+                        safe_stops.append(str(elem))
                 except (TypeError, ValueError, RecursionError):
                     continue
-        safe_stops.sort(key=lambda x: json.dumps(x) if isinstance(x, list) else str(x))
+        safe_stops.sort(key=_serialize_shingle_key)
 
         safe_shingle_freqs = _sanitize_shingle_frequency_dict(
             corpus_calibration.get("shingle_frequencies", {}),

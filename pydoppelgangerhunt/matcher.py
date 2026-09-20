@@ -782,6 +782,8 @@ def scan_target(
         effective_stop_shingles.update(DEFAULT_STOP_SHINGLES)
     if stop_shingles is not None:
         effective_stop_shingles.update(stop_shingles)
+    if not isinstance(corpus_calibration, dict):
+        corpus_calibration = None
     if corpus_calibration is not None:
         calib_stops = corpus_calibration.get("global_stop_shingles")
         if calib_stops and isinstance(calib_stops, (list, set, tuple)):
@@ -818,15 +820,21 @@ def scan_target(
                 if effective_stop_shingles and k in effective_stop_shingles:
                     continue
                 df_counts[k] = df_counts.get(k, 0) + 1
-        calib_freqs = (
-            corpus_calibration.get("shingle_frequencies", {})
+        calib_freqs_raw = (
+            corpus_calibration.get("shingle_frequencies")
             if corpus_calibration is not None
-            else {}
+            else None
+        )
+        calib_freqs: Dict[Any, Any] = (
+            calib_freqs_raw if isinstance(calib_freqs_raw, dict) else {}
         )
         for k, df in df_counts.items():
             calib_df = calib_freqs.get(k)
             if calib_df is None and isinstance(k, (tuple, list)):
-                calib_df = calib_freqs.get(json.dumps(list(k)), 0)
+                try:
+                    calib_df = calib_freqs.get(json.dumps(list(k)), 0)
+                except (TypeError, ValueError):
+                    calib_df = 0
             try:
                 combined_df = df + int(calib_df or 0)
             except (ValueError, TypeError):
@@ -861,9 +869,12 @@ def scan_target(
             calib_units = 0
         local_units_count = len(diff_unit_indices) if diff_unit_indices is not None else len(units)
         total_corpus_units = local_units_count + calib_units
-        calib_freqs_map = corpus_calibration.get("shingle_frequencies", {})
+        calib_freqs_raw = corpus_calibration.get("shingle_frequencies")
+        calib_freqs_map = (
+            calib_freqs_raw if isinstance(calib_freqs_raw, dict) else None
+        )
         raw_calib_max_freq = (
-            corpus_calibration["max_index_frequency"]
+            corpus_calibration.get("max_index_frequency")
             if "max_index_frequency" in corpus_calibration
             else max_index_frequency
         )
@@ -891,7 +902,10 @@ def scan_target(
         if calib_freqs_map is not None:
             raw_global = calib_freqs_map.get(sh)
             if raw_global is None and isinstance(sh, (tuple, list)):
-                raw_global = calib_freqs_map.get(json.dumps(list(sh)))
+                try:
+                    raw_global = calib_freqs_map.get(json.dumps(list(sh)))
+                except (TypeError, ValueError):
+                    raw_global = None
             if raw_global is not None:
                 is_global_shingle = True
                 try:

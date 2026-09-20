@@ -2245,6 +2245,74 @@ def test_diff_scan_avoids_pruning_novel_shingles_missing_from_calibration(tmp_pa
     assert "custom_domain_service_action_0" not in names
 
 
+def test_corpus_calibration_malformed_types_and_unserializable_shingles(tmp_path: Path) -> None:
+    """Verifies that non-dict calibration, non-dict shingle_frequencies, and un-serializable objects do not crash."""
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.baseline import record_baseline  # pylint: disable=import-outside-toplevel
+
+    code_file = tmp_path / "sample.py"
+    code_file.write_text(
+        "def compute_something(a, b):\n"
+        "    x = a * 2 + b\n"
+        "    y = x ** 2 - 1\n"
+        "    return y if y > 0 else 0\n\n"
+        "def compute_something_dup(a, b):\n"
+        "    x = a * 2 + b\n"
+        "    y = x ** 2 - 1\n"
+        "    return y if y > 0 else 0\n",
+        encoding="utf-8",
+    )
+
+    # 1. Non-dict corpus_calibration passed to scan_target
+    clones = scan_target(str(tmp_path), min_lines=3, corpus_calibration="not_a_dict")  # type: ignore[arg-type]
+    assert len(clones) >= 1
+
+    # 2. corpus_calibration with shingle_frequencies=None under tfidf=True
+    clones_tfidf = scan_target(
+        str(tmp_path),
+        min_lines=3,
+        tfidf=True,
+        corpus_calibration={"shingle_frequencies": None, "total_units": 5},
+    )
+    assert len(clones_tfidf) >= 1
+
+    # 3. corpus_calibration with non-dict shingle_frequencies
+    clones_bad_freqs = scan_target(
+        str(tmp_path),
+        min_lines=3,
+        corpus_calibration={"shingle_frequencies": "not_a_dict", "total_units": 5},
+    )
+    assert len(clones_bad_freqs) >= 1
+
+    # 4. record_baseline with non-dict corpus_calibration
+    base_file = tmp_path / "base1.json"
+    record_baseline(
+        clones,
+        str(base_file),
+        str(tmp_path),
+        0.9,
+        corpus_calibration="not_a_dict",  # type: ignore[arg-type]
+    )
+    assert base_file.exists()
+
+    # 5. record_baseline with un-JSON-serializable objects in global_stop_shingles
+    base_file_unserializable = tmp_path / "base2.json"
+    record_baseline(
+        clones,
+        str(base_file_unserializable),
+        str(tmp_path),
+        0.9,
+        corpus_calibration={
+            "total_units": 10,
+            "max_index_frequency": 0.25,
+            "global_stop_shingles": [({1, 2}, [object()])],
+            "shingle_frequencies": {"shingle_key_1": 5},
+        },
+    )
+    assert base_file_unserializable.exists()
+
+
+
 
 
 
