@@ -19,13 +19,41 @@ from pydoppelgangerhunt.config import (
 logger = logging.getLogger(__name__)
 
 
+MAX_CALIBRATION_UNITS: int = 1_000_000_000
+
+
+def _safe_total_units(raw_units: Any) -> int:
+    """Clamps total_units to [0, MAX_CALIBRATION_UNITS], returning 0 for malformed/overflowing values."""
+    if raw_units is None:
+        return 0
+    try:
+        val = int(raw_units)
+        if 0 <= val <= MAX_CALIBRATION_UNITS:
+            return val
+        if val > MAX_CALIBRATION_UNITS:
+            return MAX_CALIBRATION_UNITS
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return 0
+
+
 def _serialize_shingle_key(sh: Any) -> str:
-    """Serializes a shingle key (tuple, list, or scalar) into a string representation for JSON."""
+    """Serializes a shingle key into a type-tagged string representation for JSON."""
     if isinstance(sh, (tuple, list)):
         try:
-            return json.dumps(list(sh))
+            return "t:" + json.dumps(list(sh))
         except (TypeError, ValueError):
-            return str(sh)
+            return "s:" + str(sh)
+    if isinstance(sh, bool):
+        return "b:" + ("1" if sh else "0")
+    if isinstance(sh, int):
+        return "i:" + str(sh)
+    if isinstance(sh, float):
+        return "f:" + str(sh)
+    if isinstance(sh, str):
+        if sh.startswith(("t:", "s:", "i:", "f:", "b:", "[")):
+            return "s:" + sh
+        return sh
     return str(sh)
 
 
@@ -54,22 +82,54 @@ def _deep_tuple(
     return val
 
 
-
 def _deserialize_shingle_key(key: str) -> Any:
     """Deserializes a JSON-compatible string key back into a shingle tuple or scalar."""
-    if key.startswith("[") and key.endswith("]"):
+    if not isinstance(key, str):
+        return key
+
+    if key.startswith("s:"):
+        return key[2:]
+
+    if key.startswith("i:"):
         try:
-            parsed = json.loads(key)
-            if isinstance(parsed, list):
+            return int(key[2:])
+        except (ValueError, TypeError, OverflowError):
+            return key[2:]
+
+    if key.startswith("f:"):
+        try:
+            val = float(key[2:])
+            if math.isfinite(val):
+                return val
+        except (ValueError, TypeError, OverflowError):
+            pass
+        return key[2:]
+
+    if key.startswith("b:"):
+        return key[2:] in ("1", "True", "true")
+
+    # Tagged tuple "t:[...]" or legacy untagged JSON tuple "[...]"
+    raw_json: Optional[str] = None
+    if key.startswith("t:"):
+        raw_json = key[2:]
+    elif key.startswith("[") and key.endswith("]"):
+        raw_json = key
+
+    if raw_json is not None:
+        try:
+            parsed = json.loads(raw_json)
+            if isinstance(parsed, (list, tuple)):
                 return _deep_tuple(parsed)
         except (json.JSONDecodeError, ValueError, TypeError, RecursionError):
             pass
+
     return key
 
 
 def _sanitize_shingle_frequency_dict(
     raw_freqs: Any,
     key_transform: Callable[[Any], Any],
+    max_units: Optional[int] = None,
 ) -> Dict[Any, int]:
     """Sanitizes raw shingle frequencies by filtering positive integers and transforming keys."""
     cleaned: Dict[Any, int] = {}
@@ -79,6 +139,8 @@ def _sanitize_shingle_frequency_dict(
         try:
             freq_val = int(v)
             if freq_val > 0:
+                if max_units is not None and max_units > 0:
+                    freq_val = min(max_units, freq_val)
                 cleaned[key_transform(k)] = freq_val
         except (ValueError, TypeError, OverflowError, RecursionError):
             continue
@@ -263,10 +325,7 @@ def record_baseline(
         ],
     }
     if isinstance(corpus_calibration, dict):
-        try:
-            total_units_val = max(0, int(corpus_calibration.get("total_units", 0) or 0))
-        except (ValueError, TypeError, OverflowError):
-            total_units_val = 0
+        total_units_val = _safe_total_units(corpus_calibration.get("total_units"))
 
         parsed_freq = _safe_index_frequency(corpus_calibration.get("max_index_frequency"))
         safe_max_freq: Optional[float] = round(parsed_freq, 6) if parsed_freq is not None else None
@@ -289,6 +348,7 @@ def record_baseline(
         safe_shingle_freqs = _sanitize_shingle_frequency_dict(
             corpus_calibration.get("shingle_frequencies", {}),
             _serialize_shingle_key,
+            max_units=total_units_val,
         )
 
         data["corpus_calibration"] = {
@@ -411,9 +471,11 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
                         decoded_stops.add(_deep_tuple(sh))
                     except (TypeError, ValueError, RecursionError):
                         continue
+            calib_total_units = _safe_total_units(raw_calib.get("total_units"))
             decoded_freqs = _sanitize_shingle_frequency_dict(
                 raw_calib.get("shingle_frequencies", {}),
                 _deserialize_shingle_key,
+                max_units=calib_total_units,
             )
             raw_max_freq = raw_calib.get("max_index_frequency")
             max_idx_freq: Optional[float]
@@ -421,10 +483,6 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
                 max_idx_freq = None
             else:
                 max_idx_freq = _safe_index_frequency(raw_max_freq) or 0.25
-            try:
-                calib_total_units = max(0, int(raw_calib.get("total_units", 0) or 0))
-            except (ValueError, TypeError, OverflowError):
-                calib_total_units = 0
 
             corpus_calibration = {
                 "total_units": calib_total_units,

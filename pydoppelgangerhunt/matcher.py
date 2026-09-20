@@ -15,7 +15,7 @@ from pydoppelgangerhunt.config import (
     normalize_path_string,
     paths_match_boundary,
 )
-from pydoppelgangerhunt.baseline import _safe_index_frequency
+from pydoppelgangerhunt.baseline import _safe_index_frequency, _safe_total_units
 from pydoppelgangerhunt.parser import harvest_file_units
 
 DEFAULT_STOP_SHINGLES: Set[Tuple[str, ...]] = {
@@ -501,6 +501,43 @@ def suppress_subclones(
 
 
 
+def _lookup_calib_freq(calib_freqs: Optional[Dict[Any, Any]], key: Any) -> Optional[Any]:
+    """Looks up a shingle key in calibration frequencies supporting tuples, tagged keys, and legacy keys."""
+    if not calib_freqs or not isinstance(calib_freqs, dict):
+        return None
+    val = calib_freqs.get(key)
+    if val is not None:
+        return val
+    if isinstance(key, (tuple, list)):
+        try:
+            dumped = json.dumps(list(key))
+            val = calib_freqs.get("t:" + dumped)
+            if val is not None:
+                return val
+            val = calib_freqs.get(dumped)
+            if val is not None:
+                return val
+        except (TypeError, ValueError):
+            pass
+    elif isinstance(key, str):
+        val = calib_freqs.get("s:" + key)
+        if val is not None:
+            return val
+    elif isinstance(key, bool):
+        val = calib_freqs.get("b:" + ("1" if key else "0"))
+        if val is not None:
+            return val
+    elif isinstance(key, int):
+        val = calib_freqs.get("i:" + str(key))
+        if val is not None:
+            return val
+    elif isinstance(key, float):
+        val = calib_freqs.get("f:" + str(key))
+        if val is not None:
+            return val
+    return None
+
+
 def _compute_max_posting_len(
     total_units: int,
     freq: Optional[float],
@@ -796,12 +833,10 @@ def scan_target(
 
     idf_weights: Dict[Any, float] = {}
     if tfidf and units:
+        calib_units_tfidf = 0
         if corpus_calibration is not None:
             local_units_count = len(diff_unit_indices) if diff_unit_indices is not None else len(units)
-            try:
-                calib_units_tfidf = max(0, int(corpus_calibration.get("total_units", 0) or 0))
-            except (ValueError, TypeError, OverflowError):
-                calib_units_tfidf = 0
+            calib_units_tfidf = _safe_total_units(corpus_calibration.get("total_units"))
             corpus_size = local_units_count + calib_units_tfidf
             active_indices: Union[Set[int], range] = (
                 diff_unit_indices
@@ -829,19 +864,21 @@ def scan_target(
             calib_freqs_raw if isinstance(calib_freqs_raw, dict) else {}
         )
         for k, df in df_counts.items():
-            calib_df = calib_freqs.get(k)
-            if calib_df is None and isinstance(k, (tuple, list)):
-                try:
-                    calib_df = calib_freqs.get(json.dumps(list(k)), 0)
-                except (TypeError, ValueError):
-                    calib_df = 0
+            calib_df = _lookup_calib_freq(calib_freqs, k)
             try:
                 parsed_calib = int(calib_df or 0)
-                valid_calib_df = max(0, parsed_calib)
+                if calib_units_tfidf > 0 and parsed_calib > 0:
+                    valid_calib_df = min(calib_units_tfidf, parsed_calib)
+                else:
+                    valid_calib_df = 0
             except (ValueError, TypeError, OverflowError):
                 valid_calib_df = 0
             combined_df = df + valid_calib_df
-            idf_weights[k] = math.log((1.0 + corpus_size) / (1.0 + combined_df)) + 1.0
+            try:
+                weight = math.log((1.0 + corpus_size) / (1.0 + combined_df)) + 1.0
+                idf_weights[k] = max(0.0, weight)
+            except (ValueError, TypeError, OverflowError):
+                idf_weights[k] = 1.0
 
     shingle_index: Dict[Any, List[int]] = {}
     for idx, u in enumerate(units):
@@ -865,10 +902,7 @@ def scan_target(
     candidate_pairs: Set[Tuple[int, int]] = set()
     calib_freqs_map: Optional[Dict[Any, Any]] = None
     if corpus_calibration is not None:
-        try:
-            calib_units = max(0, int(corpus_calibration.get("total_units", 0) or 0))
-        except (ValueError, TypeError, OverflowError):
-            calib_units = 0
+        calib_units = _safe_total_units(corpus_calibration.get("total_units"))
         local_units_count = len(diff_unit_indices) if diff_unit_indices is not None else len(units)
         total_corpus_units = local_units_count + calib_units
         calib_freqs_raw = corpus_calibration.get("shingle_frequencies")
@@ -902,18 +936,13 @@ def scan_target(
 
         is_global_shingle = False
         if calib_freqs_map is not None:
-            raw_global = calib_freqs_map.get(sh)
-            if raw_global is None and isinstance(sh, (tuple, list)):
-                try:
-                    raw_global = calib_freqs_map.get(json.dumps(list(sh)))
-                except (TypeError, ValueError):
-                    raw_global = None
+            raw_global = _lookup_calib_freq(calib_freqs_map, sh)
             if raw_global is not None:
                 try:
                     val = int(raw_global)
-                    if val > 0:
+                    if calib_units > 0 and val > 0:
                         is_global_shingle = True
-                        df_global = val
+                        df_global = min(calib_units, val)
                     else:
                         df_global = 0
                 except (ValueError, TypeError, OverflowError):

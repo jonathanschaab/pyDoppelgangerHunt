@@ -2358,6 +2358,161 @@ def test_corpus_calibration_malformed_types_and_unserializable_shingles(tmp_path
     assert len(clones_diff_nonfinite) >= 1
 
 
+def test_type_tagged_shingle_keys_and_oversized_unit_bounds(tmp_path: Path) -> None:
+    """Verifies type-tagged shingle keys, legacy key backward compatibility, and oversized unit bounds."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        MAX_CALIBRATION_UNITS,
+        _deserialize_shingle_key,
+        _safe_total_units,
+        _serialize_shingle_key,
+        load_baseline as load_base,
+        record_baseline,
+    )
+    from pydoppelgangerhunt.matcher import _lookup_calib_freq, scan_target  # pylint: disable=import-outside-toplevel
+
+    # 1. Type-tagged key serialization & deserialization fidelity
+    # Tuples
+    tup = ("Module", "If", "Compare")
+    assert _serialize_shingle_key(tup) == 't:["Module", "If", "Compare"]'
+    assert _deserialize_shingle_key('t:["Module", "If", "Compare"]') == tup
+
+    # Scalar strings (including ones that look like JSON lists)
+    s_like_list = '["Module", "If"]'
+    assert _serialize_shingle_key(s_like_list) == 's:["Module", "If"]'
+    assert _deserialize_shingle_key('s:["Module", "If"]') == s_like_list
+    assert isinstance(_deserialize_shingle_key('s:["Module", "If"]'), str)
+
+    # Strings with prefixes
+    s_prefix = "t:custom_tag"
+    assert _serialize_shingle_key(s_prefix) == "s:t:custom_tag"
+    assert _deserialize_shingle_key("s:t:custom_tag") == s_prefix
+
+    # Numbers and booleans
+    assert _serialize_shingle_key(42) == "i:42"
+    assert _deserialize_shingle_key("i:42") == 42
+    assert _serialize_shingle_key(3.14) == "f:3.14"
+    assert _deserialize_shingle_key("f:3.14") == 3.14
+    assert _serialize_shingle_key(True) == "b:1"
+    assert _deserialize_shingle_key("b:1") is True
+
+    # Legacy untagged format compatibility
+    assert _deserialize_shingle_key('["Legacy", "Shingle"]') == ("Legacy", "Shingle")
+    assert _deserialize_shingle_key("plain_legacy_str") == "plain_legacy_str"
+
+    # 2. _safe_total_units bounds
+    assert _safe_total_units(100) == 100
+    assert _safe_total_units(0) == 0
+    assert _safe_total_units(-50) == 0
+    assert _safe_total_units(None) == 0
+    assert _safe_total_units("invalid") == 0
+    assert _safe_total_units(10**400) == MAX_CALIBRATION_UNITS
+    assert _safe_total_units(MAX_CALIBRATION_UNITS + 500) == MAX_CALIBRATION_UNITS
+
+    # 3. _lookup_calib_freq multi-representation lookup
+    freqs = {
+        ("Exact", "Tuple"): 10,
+        't:["Tagged", "Tuple"]': 20,
+        '["Legacy", "Tuple"]': 30,
+        "s:tagged_string": 40,
+        "exact_string": 50,
+        "i:99": 60,
+    }
+    assert _lookup_calib_freq(freqs, ("Exact", "Tuple")) == 10
+    assert _lookup_calib_freq(freqs, ("Tagged", "Tuple")) == 20
+    assert _lookup_calib_freq(freqs, ("Legacy", "Tuple")) == 30
+    assert _lookup_calib_freq(freqs, "tagged_string") == 40
+    assert _lookup_calib_freq(freqs, "exact_string") == 50
+    assert _lookup_calib_freq(freqs, 99) == 60
+    assert _lookup_calib_freq(freqs, "missing") is None
+
+    # 4. TF-IDF and candidate pairing with oversized total_units
+    code_file = tmp_path / "oversized_sample.py"
+    code_file.write_text(
+        "def oversized_test_fn(x, y):\n"
+        "    res = x * 3 + y\n"
+        "    res2 = res ** 2 + 10\n"
+        "    return res2 if res2 > 5 else 0\n\n"
+        "def oversized_test_fn_dup(x, y):\n"
+        "    res = x * 3 + y\n"
+        "    res2 = res ** 2 + 10\n"
+        "    return res2 if res2 > 5 else 0\n",
+        encoding="utf-8",
+    )
+
+    clones_oversized = scan_target(
+        str(tmp_path),
+        min_lines=3,
+        tfidf=True,
+        corpus_calibration={
+            "total_units": 10**400,
+            "shingle_frequencies": {},
+        },
+    )
+    assert len(clones_oversized) >= 1
+
+    # 5. Global frequencies validated and clamped to total_units
+    clones_freq_clamped = scan_target(
+        str(tmp_path),
+        min_lines=3,
+        tfidf=True,
+        corpus_calibration={
+            "total_units": 10,
+            "shingle_frequencies": {
+                "oversized_test_fn": 99999,  # Exceeds total_units=10
+            },
+        },
+    )
+    assert len(clones_freq_clamped) >= 1
+
+    # 6. Candidate pairing with total_units=0 and frequencies > 0 does not prune candidates
+    clones_zero_units = scan_target(
+        str(tmp_path),
+        min_lines=3,
+        corpus_calibration={
+            "total_units": 0,
+            "max_index_frequency": 0.25,
+            "shingle_frequencies": {
+                "oversized_test_fn": 100,
+            },
+        },
+    )
+    assert len(clones_zero_units) >= 1
+
+    # 7. record_baseline and load_baseline round-trip with type-tagged keys and oversized bounds
+    base_file = tmp_path / "tagged_baseline.json"
+    record_baseline(
+        clones_oversized,
+        str(base_file),
+        str(tmp_path),
+        0.90,
+        corpus_calibration={
+            "total_units": 10**400,
+            "max_index_frequency": 0.25,
+            "global_stop_shingles": [("A", "B"), '["string_that_looks_like_tuple"]', 123],
+            "shingle_frequencies": {
+                ("A", "B"): 5,
+                '["string_that_looks_like_tuple"]': 10,
+                123: 15,
+            },
+        },
+    )
+    raw_saved = json.loads(base_file.read_text(encoding="utf-8"))
+    calib_saved = raw_saved["corpus_calibration"]
+    assert calib_saved["total_units"] == MAX_CALIBRATION_UNITS
+    assert 't:["A", "B"]' in calib_saved["shingle_frequencies"]
+    assert 's:["string_that_looks_like_tuple"]' in calib_saved["shingle_frequencies"]
+    assert "i:123" in calib_saved["shingle_frequencies"]
+
+    loaded = load_base(str(base_file))
+    assert loaded.corpus_calibration is not None
+    loaded_calib = loaded.corpus_calibration
+    assert loaded_calib["total_units"] == MAX_CALIBRATION_UNITS
+    assert loaded_calib["shingle_frequencies"][("A", "B")] == 5
+    assert loaded_calib["shingle_frequencies"]['["string_that_looks_like_tuple"]'] == 10
+    assert loaded_calib["shingle_frequencies"][123] == 15
+
+
+
 
 
 
