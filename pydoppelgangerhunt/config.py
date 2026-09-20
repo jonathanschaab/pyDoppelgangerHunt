@@ -53,7 +53,9 @@ def normalize_path_string(path_str: Optional[str], strip_anchor: bool = True) ->
     norm = raw.replace("\\", "/")
     while norm.startswith("./"):
         norm = norm[2:]
-    return unicodedata.normalize("NFC", norm)
+    if sys.platform == "darwin":
+        return unicodedata.normalize("NFC", norm)
+    return norm
 
 
 def canonical_path_key(path_str: Optional[str], strip_anchor: bool = False) -> str:
