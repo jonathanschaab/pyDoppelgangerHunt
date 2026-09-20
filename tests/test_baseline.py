@@ -3113,5 +3113,113 @@ def test_calibration_bounds_and_frequency_cutoff_compatibility(tmp_path: Path) -
     assert len(clones_mcs_override) == 1
 
 
+def test_diff_files_canonical_path_matching_prevents_nested_basename_collisions(tmp_path: Path) -> None:
+    """Verifies that diff_files path resolution prevents nested files with identical basenames from matching."""
+    repo = tmp_path / "repo_nested_diff"
+    repo.mkdir()
+    pkg = repo / "pkg"
+    pkg.mkdir()
+
+    root_code = (
+        "def compute_root_metrics(data_items, factor_val):\n"
+        "    accumulator = 0\n"
+        "    for item in data_items:\n"
+        "        weighted = item * factor_val + 17\n"
+        "        accumulator += weighted\n"
+        "    return accumulator\n"
+    )
+    other1_code = (
+        "def compute_root_metrics(data_items, factor_val):\n"
+        "    accumulator = 0\n"
+        "    for item in data_items:\n"
+        "        weighted = item * factor_val + 17\n"
+        "        accumulator += weighted\n"
+        "    return accumulator\n"
+    )
+
+    nested_code = (
+        "def process_nested_payload(records, scale_num):\n"
+        "    output_sum = 100\n"
+        "    for entry in records:\n"
+        "        temp_res = (entry + scale_num) * 3\n"
+        "        output_sum += temp_res\n"
+        "    return output_sum\n"
+    )
+    other2_code = (
+        "def process_nested_payload(records, scale_num):\n"
+        "    output_sum = 100\n"
+        "    for entry in records:\n"
+        "        temp_res = (entry + scale_num) * 3\n"
+        "        output_sum += temp_res\n"
+        "    return output_sum\n"
+    )
+
+    (repo / "foo.py").write_text(root_code, encoding="utf-8")
+    (repo / "other1.py").write_text(other1_code, encoding="utf-8")
+    (pkg / "foo.py").write_text(nested_code, encoding="utf-8")
+    (repo / "other2.py").write_text(other2_code, encoding="utf-8")
+
+    # 1. Full scan finds both clone pairs
+    all_clones = scan_target(str(repo), min_lines=5, threshold=0.90)
+    assert len(all_clones) == 2
+
+    # 2. Diff scan specifying ONLY root "foo.py" must NOT match "pkg/foo.py"
+    diff_root_only = scan_target(
+        str(repo),
+        min_lines=5,
+        threshold=0.90,
+        diff_files=["foo.py"],
+    )
+    assert len(diff_root_only) == 1
+    files_touched_root = {Path(diff_root_only[0][1]["file"]).name, Path(diff_root_only[0][2]["file"]).name}
+    assert files_touched_root == {"foo.py", "other1.py"}
+    unit_paths_root = {diff_root_only[0][1]["file"].replace("\\", "/"), diff_root_only[0][2]["file"].replace("\\", "/")}
+    assert "pkg/foo.py" not in unit_paths_root
+
+    # 3. Diff scan specifying ONLY nested "pkg/foo.py" must NOT match root "foo.py"
+    diff_nested_only = scan_target(
+        str(repo),
+        min_lines=5,
+        threshold=0.90,
+        diff_files=["pkg/foo.py"],
+    )
+    assert len(diff_nested_only) == 1
+    files_touched_nested = {Path(diff_nested_only[0][1]["file"]).name, Path(diff_nested_only[0][2]["file"]).name}
+    assert files_touched_nested == {"foo.py", "other2.py"}
+    unit_paths_nested = {diff_nested_only[0][1]["file"].replace("\\", "/"), diff_nested_only[0][2]["file"].replace("\\", "/")}
+    assert "pkg/foo.py" in unit_paths_nested
+    assert "foo.py" not in unit_paths_nested
+
+    # 4. Absolute paths also resolve unambiguously
+    diff_abs_root = scan_target(
+        str(repo),
+        min_lines=5,
+        threshold=0.90,
+        diff_files=[str((repo / "foo.py").resolve())],
+    )
+    assert len(diff_abs_root) == 1
+    assert "pkg/foo.py" not in {diff_abs_root[0][1]["file"].replace("\\", "/"), diff_abs_root[0][2]["file"].replace("\\", "/")}
+
+    diff_abs_nested = scan_target(
+        str(repo),
+        min_lines=5,
+        threshold=0.90,
+        diff_files=[str((pkg / "foo.py").resolve())],
+    )
+    assert len(diff_abs_nested) == 1
+    assert "pkg/foo.py" in {diff_abs_nested[0][1]["file"].replace("\\", "/"), diff_abs_nested[0][2]["file"].replace("\\", "/")}
+
+    # 5. Scanning subdirectory with diff_files outside that directory returns empty
+    diff_sub_mismatch = scan_target(
+        str(pkg),
+        repo_root=str(repo),
+        min_lines=5,
+        threshold=0.90,
+        diff_files=["foo.py"],
+    )
+    assert len(diff_sub_mismatch) == 0
+
+
+
 
 
