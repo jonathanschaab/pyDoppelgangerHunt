@@ -1671,3 +1671,157 @@ def test_baseline_backward_compatibility_v10_to_v13(tmp_path: Path) -> None:
         assert "pkg/a.py:foo <===> pkg/b.py:bar" in loaded
         assert "pkg/c.py#111 <===> pkg/d.py#222" in loaded
 
+
+def test_baseline_calibration_edge_cases_and_security(tmp_path: Path) -> None:
+    """Verifies security resilience against malformed baseline JSON and edge-case serialization."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        _deserialize_shingle_key,
+        load_baseline,
+        record_baseline,
+    )
+
+    # 1. Non-dict JSON payloads do not crash load_baseline
+    for malformed_content in [b"[1, 2, 3]", b'"a string"', b"42", b"true"]:
+        malformed_file = tmp_path / "malformed.json"
+        malformed_file.write_bytes(malformed_content)
+        fps = load_baseline(str(malformed_file))
+        assert len(fps) == 0
+        assert fps.corpus_calibration is None
+
+    # 2. Corrupted fields in corpus_calibration do not crash load_baseline
+    corrupted_file = tmp_path / "corrupted_calib.json"
+    corrupted_file.write_text(
+        json.dumps({
+            "version": "1.4.0",
+            "corpus_calibration": {
+                "total_units": "not_an_int",
+                "max_index_frequency": "not_a_float",
+                "global_stop_shingles": "not_a_list",
+                "shingle_frequencies": {"k": "not_an_int"},
+            },
+        }),
+        encoding="utf-8",
+    )
+    loaded_corrupt = load_baseline(str(corrupted_file))
+    assert loaded_corrupt.corpus_calibration is not None
+    assert loaded_corrupt.corpus_calibration["total_units"] == 0
+    assert loaded_corrupt.corpus_calibration["max_index_frequency"] == 0.25
+
+    # 3. max_index_frequency=None round-trip
+    calib_none_max = {
+        "total_units": 100,
+        "max_index_frequency": None,
+        "global_stop_shingles": {("A", "B"), ("C", "D")},
+        "shingle_frequencies": {("A", "B"): 5, ("C", "D"): 10},
+    }
+    none_max_file = tmp_path / "none_max.json"
+    record_baseline([], str(none_max_file), "target", 0.90, corpus_calibration=calib_none_max)
+    loaded_none = load_baseline(str(none_max_file))
+    assert loaded_none.corpus_calibration is not None
+    assert loaded_none.corpus_calibration["max_index_frequency"] is None
+
+    # 4. Nested shingle structure deserialization produces hashable tuples
+    nested_res = _deserialize_shingle_key("[[1, 2], [3, 4]]")
+    assert isinstance(nested_res, tuple)
+    assert isinstance(nested_res[0], tuple)
+    assert hash(nested_res) is not None
+
+    # 5. Deterministic sorting in serialized output
+    raw_text = none_max_file.read_text(encoding="utf-8")
+    loaded_json = json.loads(raw_text)
+    stops = loaded_json["corpus_calibration"]["global_stop_shingles"]
+    freq_keys = list(loaded_json["corpus_calibration"]["shingle_frequencies"].keys())
+    assert stops == sorted(stops, key=str)
+    assert freq_keys == sorted(freq_keys)
+
+
+def test_scan_target_calibration_edge_cases(tmp_path: Path) -> None:
+    """Verifies that scan_target correctly handles raw list stop shingles, string keys, and small corpus bounds."""
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "calib_edge_repo"
+    repo.mkdir()
+
+    sample_func = (
+        "def duplicated_logic(x, y):\n"
+        "    val = x + 1\n"
+        "    acc = val * 2\n"
+        "    diff = acc - y\n"
+        "    total = diff + 4\n"
+        "    return total\n"
+    )
+    (repo / "f1.py").write_text(sample_func, encoding="utf-8")
+    (repo / "f2.py").write_text(sample_func, encoding="utf-8")
+
+    # 1. Uncalibrated scan on 2 files finds 1 clone pair
+    uncalib_clones = scan_target(str(repo), min_lines=5, threshold=0.90)
+    assert len(uncalib_clones) == 1
+
+    # 2. Calibrated scan on small corpus (< effective_min_corpus=30) must NOT falsely prune clones
+    small_calib: Dict[str, Any] = {
+        "total_units": 2,
+        "max_index_frequency": 0.25,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {},
+    }
+    calib_clones = scan_target(str(repo), min_lines=5, threshold=0.90, corpus_calibration=small_calib)
+    assert len(calib_clones) == 1, "Small corpus with calibration must not prune valid clones"
+
+    # 3. Handling max_index_frequency=None in corpus_calibration does not raise TypeError
+    none_freq_calib: Dict[str, Any] = {
+        "total_units": 2,
+        "max_index_frequency": None,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {},
+    }
+    none_clones = scan_target(
+        str(repo),
+        min_lines=5,
+        threshold=0.90,
+        max_index_frequency=None,
+        corpus_calibration=none_freq_calib,
+    )
+    assert len(none_clones) == 1
+
+    # 4. Raw list-of-lists in global_stop_shingles does not raise unhashable type: 'list'
+    list_stops_calib: Dict[str, Any] = {
+        "total_units": 100,
+        "max_index_frequency": 0.25,
+        "global_stop_shingles": [["Name", "Assign"]],
+        "shingle_frequencies": {'["Name", "Assign"]': 50},
+    }
+    list_stop_clones = scan_target(str(repo), min_lines=5, threshold=0.90, corpus_calibration=list_stops_calib)
+    assert isinstance(list_stop_clones, list)
+
+
+def test_prune_baseline_preserves_corpus_calibration(tmp_path: Path) -> None:
+    """Verifies that prune_baseline preserves corpus_calibration metadata in the baseline file."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        load_baseline,
+        prune_baseline,
+        record_baseline,
+    )
+
+    base_file = tmp_path / "baseline_for_prune.json"
+    calib = {
+        "total_units": 42,
+        "max_index_frequency": 0.20,
+        "global_stop_shingles": {("Stop", "A")},
+        "shingle_frequencies": {("Stop", "A"): 15},
+    }
+    u1 = {"file": "mod1.py", "name": "fn1", "tokens": ["x", "1"]}
+    u2 = {"file": "mod2.py", "name": "fn2", "tokens": ["y", "2"]}
+    record_baseline([(1.0, u1, u2)], str(base_file), "target", 0.90, corpus_calibration=calib)
+
+    # Prune with active clones retaining the entry
+    prune_res = prune_baseline(str(base_file), [(1.0, u1, u2)], unstaged_modified_ranges={})
+    assert prune_res.retained_count == 1
+
+    # Load baseline and verify corpus_calibration is intact
+    loaded = load_baseline(str(base_file))
+    assert loaded.corpus_calibration is not None
+    assert loaded.corpus_calibration["total_units"] == 42
+    assert loaded.corpus_calibration["max_index_frequency"] == 0.20
+    assert ("Stop", "A") in loaded.corpus_calibration["global_stop_shingles"]
+    assert loaded.corpus_calibration["shingle_frequencies"][("Stop", "A")] == 15
+

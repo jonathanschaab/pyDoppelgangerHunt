@@ -26,13 +26,20 @@ def _serialize_shingle_key(sh: Any) -> str:
     return str(sh)
 
 
+def _deep_tuple(val: Any) -> Any:
+    """Recursively converts nested lists into tuples to ensure immutability and hashability."""
+    if isinstance(val, list):
+        return tuple(_deep_tuple(x) for x in val)
+    return val
+
+
 def _deserialize_shingle_key(key: str) -> Any:
     """Deserializes a JSON-compatible string key back into a shingle tuple or scalar."""
     if key.startswith("[") and key.endswith("]"):
         try:
             parsed = json.loads(key)
             if isinstance(parsed, list):
-                return tuple(parsed)
+                return _deep_tuple(parsed)
         except (json.JSONDecodeError, ValueError):
             pass
     return key
@@ -40,16 +47,23 @@ def _deserialize_shingle_key(key: str) -> Any:
 
 def compute_corpus_calibration(
     units: Sequence[Dict[str, Any]],
-    max_index_frequency: float = 0.25,
+    max_index_frequency: Optional[float] = 0.25,
     min_corpus_size: Optional[int] = None,
     filter_stop_shingles: bool = False,
     stop_shingles: Optional[Set[Any]] = None,
+    *,
+    bag_of_tokens: bool = False,
+    call_sequences: bool = False,
 ) -> Dict[str, Any]:
     """Computes global shingle document frequencies and calibrated stop-shingles for a repository corpus."""
     total_units = len(units)
     shingle_frequencies: Dict[Any, int] = {}
     for u in units:
-        if "shingles" in u and u["shingles"]:
+        if call_sequences:
+            keys = set(u.get("calls", []))
+        elif bag_of_tokens:
+            keys = set(u.get("vector", {}).keys())
+        elif "shingles" in u and u["shingles"]:
             keys = set(u["shingles"])
         elif "vector" in u and u["vector"]:
             keys = set(u["vector"].keys())
@@ -189,16 +203,23 @@ def record_baseline(
         ],
     }
     if corpus_calibration is not None:
+        raw_max_freq = corpus_calibration.get("max_index_frequency")
         data["corpus_calibration"] = {
-            "total_units": int(corpus_calibration.get("total_units", 0)),
-            "max_index_frequency": float(corpus_calibration.get("max_index_frequency", 0.25)),
-            "global_stop_shingles": [
-                list(sh) if isinstance(sh, (tuple, list)) else sh
-                for sh in corpus_calibration.get("global_stop_shingles", [])
-            ],
+            "total_units": int(corpus_calibration.get("total_units", 0) or 0),
+            "max_index_frequency": float(raw_max_freq) if raw_max_freq is not None else None,
+            "global_stop_shingles": sorted(
+                [
+                    list(sh) if isinstance(sh, (tuple, list)) else sh
+                    for sh in corpus_calibration.get("global_stop_shingles", [])
+                ],
+                key=lambda x: json.dumps(x) if isinstance(x, list) else str(x),
+            ),
             "shingle_frequencies": {
                 _serialize_shingle_key(sh): int(cnt)
-                for sh, cnt in corpus_calibration.get("shingle_frequencies", {}).items()
+                for sh, cnt in sorted(
+                    corpus_calibration.get("shingle_frequencies", {}).items(),
+                    key=lambda item: _serialize_shingle_key(item[0]),
+                )
             },
         }
     target_p = Path(baseline_path)
@@ -241,6 +262,8 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
         return BaselineFingerprints()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return BaselineFingerprints()
         fingerprints = data.get("fingerprints", [])
         fps: Set[str] = set()
         records: List[Dict[str, Any]] = []
@@ -306,18 +329,38 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
         corpus_calibration: Optional[Dict[str, Any]] = None
         if isinstance(raw_calib, dict):
             raw_stops = raw_calib.get("global_stop_shingles", [])
-            decoded_stops = {
-                tuple(sh) if isinstance(sh, list) else sh
-                for sh in raw_stops
-            }
+            decoded_stops: Set[Any] = set()
+            if isinstance(raw_stops, (list, set, tuple)):
+                for sh in raw_stops:
+                    if isinstance(sh, list):
+                        decoded_stops.add(_deep_tuple(sh))
+                    elif isinstance(sh, (str, int, float, tuple)):
+                        decoded_stops.add(sh)
             raw_freqs = raw_calib.get("shingle_frequencies", {})
-            decoded_freqs = {
-                _deserialize_shingle_key(k): int(v)
-                for k, v in raw_freqs.items()
-            }
+            decoded_freqs: Dict[Any, int] = {}
+            if isinstance(raw_freqs, dict):
+                for k, v in raw_freqs.items():
+                    try:
+                        decoded_freqs[_deserialize_shingle_key(k)] = int(v)
+                    except (ValueError, TypeError):
+                        continue
+            raw_max_freq = raw_calib.get("max_index_frequency")
+            max_idx_freq: Optional[float]
+            if raw_max_freq is None:
+                max_idx_freq = None
+            else:
+                try:
+                    max_idx_freq = float(raw_max_freq)
+                except (ValueError, TypeError):
+                    max_idx_freq = 0.25
+            try:
+                calib_total_units = int(raw_calib.get("total_units", 0) or 0)
+            except (ValueError, TypeError):
+                calib_total_units = 0
+
             corpus_calibration = {
-                "total_units": int(raw_calib.get("total_units", 0)),
-                "max_index_frequency": float(raw_calib.get("max_index_frequency", 0.25)),
+                "total_units": calib_total_units,
+                "max_index_frequency": max_idx_freq,
                 "global_stop_shingles": decoded_stops,
                 "shingle_frequencies": decoded_freqs,
             }
@@ -325,7 +368,7 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
         return BaselineFingerprints(
             fps, records=records, corpus_calibration=corpus_calibration
         )
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError, TypeError, AttributeError):
         return BaselineFingerprints()
 
 

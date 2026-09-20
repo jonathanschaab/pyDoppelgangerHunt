@@ -105,6 +105,8 @@ def get_git_modified_files(
     for line in diff_output.splitlines():
         trimmed = line.strip()
         if trimmed:
+            if trimmed.startswith('"') and trimmed.endswith('"') and len(trimmed) >= 2:
+                trimmed = trimmed[1:-1]
             norm = normalize_path_string(trimmed, strip_anchor=False)
             if norm and norm not in modified_files:
                 modified_files.append(norm)

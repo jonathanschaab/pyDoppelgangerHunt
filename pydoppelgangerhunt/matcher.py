@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import math
 import os
 from pathlib import Path
@@ -566,7 +567,7 @@ def scan_target(
     top_n: Optional[int] = None,
     include_notebooks: bool = False,
     strip_docstrings: bool = True,
-    max_index_frequency: float = 0.25,
+    max_index_frequency: Optional[float] = 0.25,
     filter_stop_shingles: bool = False,
     stop_shingles: Optional[Set[Any]] = None,
     min_corpus_size: Optional[int] = None,
@@ -667,13 +668,20 @@ def scan_target(
     if corpus_calibration is not None:
         calib_stops = corpus_calibration.get("global_stop_shingles")
         if calib_stops:
-            effective_stop_shingles.update(calib_stops)
+            for s in calib_stops:
+                if isinstance(s, list):
+                    effective_stop_shingles.add(tuple(s))
+                elif isinstance(s, (str, int, float, tuple)):
+                    effective_stop_shingles.add(s)
 
     idf_weights: Dict[Any, float] = {}
     if tfidf and units:
         corpus_size = len(units)
         if corpus_calibration is not None:
-            corpus_size += int(corpus_calibration.get("total_units", 0))
+            try:
+                corpus_size += int(corpus_calibration.get("total_units", 0) or 0)
+            except (ValueError, TypeError):
+                pass
         df_counts: Dict[Any, int] = {}
         for u in units:
             keys = u.get("vector", {}).keys() if bag_of_tokens else u["shingles"]
@@ -687,7 +695,13 @@ def scan_target(
             else {}
         )
         for k, df in df_counts.items():
-            combined_df = df + int(calib_freqs.get(k, 0))
+            calib_df = calib_freqs.get(k)
+            if calib_df is None and isinstance(k, (tuple, list)):
+                calib_df = calib_freqs.get(json.dumps(list(k)), 0)
+            try:
+                combined_df = df + int(calib_df or 0)
+            except (ValueError, TypeError):
+                combined_df = df
             idf_weights[k] = math.log((1.0 + corpus_size) / (1.0 + combined_df)) + 1.0
 
     shingle_index: Dict[Any, List[int]] = {}
@@ -703,28 +717,57 @@ def scan_target(
                 continue
             shingle_index.setdefault(sh, []).append(idx)
 
+    effective_min_corpus = (
+        min_corpus_size
+        if min_corpus_size is not None
+        else (4 if filter_stop_shingles else 30)
+    )
+
     candidate_pairs: Set[Tuple[int, int]] = set()
     if corpus_calibration is not None:
-        total_corpus_units = len(units) + int(corpus_calibration.get("total_units", 0))
+        try:
+            calib_units = int(corpus_calibration.get("total_units", 0) or 0)
+        except (ValueError, TypeError):
+            calib_units = 0
+        total_corpus_units = len(units) + calib_units
         calib_freqs_map = corpus_calibration.get("shingle_frequencies", {})
-        calib_max_freq = float(corpus_calibration.get("max_index_frequency", max_index_frequency))
+        raw_calib_max_freq = (
+            corpus_calibration.get("max_index_frequency")
+            if corpus_calibration.get("max_index_frequency") is not None
+            else max_index_frequency
+        )
+        try:
+            calib_max_freq = float(raw_calib_max_freq) if raw_calib_max_freq is not None else None
+        except (ValueError, TypeError):
+            calib_max_freq = None
+
+        filter_freq = (
+            calib_max_freq is not None
+            and total_corpus_units >= effective_min_corpus
+        )
+        max_posting_len = (
+            max(2, int(math.ceil(total_corpus_units * calib_max_freq)))
+            if filter_freq and calib_max_freq is not None
+            else None
+        )
+
         for sh, u_indices in shingle_index.items():
             if len(u_indices) <= 1:
                 continue
-            df_global = int(calib_freqs_map.get(sh, 0))
-            combined_df = df_global + len(u_indices)
-            if total_corpus_units > 0 and (combined_df / total_corpus_units) > calib_max_freq:
+            df_global = calib_freqs_map.get(sh)
+            if df_global is None and isinstance(sh, (tuple, list)):
+                df_global = calib_freqs_map.get(json.dumps(list(sh)), 0)
+            try:
+                combined_df = int(df_global or 0) + len(u_indices)
+            except (ValueError, TypeError):
+                combined_df = len(u_indices)
+
+            if max_posting_len is not None and combined_df > max_posting_len:
                 continue
             for i, idx1 in enumerate(u_indices):
                 for idx2 in u_indices[i + 1:]:
                     candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))
     else:
-        effective_min_corpus = (
-            min_corpus_size
-            if min_corpus_size is not None
-            else (4 if filter_stop_shingles else 30)
-        )
-
         max_posting_len = (
             max(2, int(math.ceil(len(units) * max_index_frequency)))
             if (max_index_frequency is not None and len(units) >= effective_min_corpus)
@@ -876,6 +919,8 @@ def scan_target(
             min_corpus_size=min_corpus_size,
             filter_stop_shingles=filter_stop_shingles,
             stop_shingles=stop_shingles,
+            bag_of_tokens=bag_of_tokens,
+            call_sequences=call_sequences,
         )
         return clones, calib_dict
 

@@ -691,6 +691,13 @@ def test_get_git_modified_files(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "main" in captured_args[0]
     assert files == ["pkg/mod1.py", "pkg/sub/mod2.py"]
 
+    # Quoted filenames from git diff (e.g. core.quotepath with spaces)
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: '"pkg/mod with spaces.py"\n"pkg/sub/mod2.py"\n',
+    )
+    assert get_git_modified_files() == ["pkg/mod with spaces.py", "pkg/sub/mod2.py"]
+
     # When git returns None
     monkeypatch.setattr("pydoppelgangerhunt.git_diff._run_git_command", lambda args, cwd=None: None)
     assert get_git_modified_files() == []
