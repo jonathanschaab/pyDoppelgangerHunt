@@ -667,19 +667,20 @@ def scan_target(
         effective_stop_shingles.update(stop_shingles)
     if corpus_calibration is not None:
         calib_stops = corpus_calibration.get("global_stop_shingles")
-        if calib_stops:
+        if calib_stops and isinstance(calib_stops, (list, set, tuple)):
+            from pydoppelgangerhunt.baseline import _deep_tuple
             for s in calib_stops:
-                if isinstance(s, list):
-                    effective_stop_shingles.add(tuple(s))
-                elif isinstance(s, (str, int, float, tuple)):
-                    effective_stop_shingles.add(s)
+                try:
+                    effective_stop_shingles.add(_deep_tuple(s))
+                except (TypeError, ValueError, RecursionError):
+                    continue
 
     idf_weights: Dict[Any, float] = {}
     if tfidf and units:
         corpus_size = len(units)
         if corpus_calibration is not None:
             try:
-                corpus_size += int(corpus_calibration.get("total_units", 0) or 0)
+                corpus_size += max(0, int(corpus_calibration.get("total_units", 0) or 0))
             except (ValueError, TypeError):
                 pass
         df_counts: Dict[Any, int] = {}
@@ -726,14 +727,14 @@ def scan_target(
     candidate_pairs: Set[Tuple[int, int]] = set()
     if corpus_calibration is not None:
         try:
-            calib_units = int(corpus_calibration.get("total_units", 0) or 0)
+            calib_units = max(0, int(corpus_calibration.get("total_units", 0) or 0))
         except (ValueError, TypeError):
             calib_units = 0
         total_corpus_units = len(units) + calib_units
         calib_freqs_map = corpus_calibration.get("shingle_frequencies", {})
         raw_calib_max_freq = (
-            corpus_calibration.get("max_index_frequency")
-            if corpus_calibration.get("max_index_frequency") is not None
+            corpus_calibration["max_index_frequency"]
+            if "max_index_frequency" in corpus_calibration
             else max_index_frequency
         )
         try:

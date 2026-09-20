@@ -26,10 +26,12 @@ def _serialize_shingle_key(sh: Any) -> str:
     return str(sh)
 
 
-def _deep_tuple(val: Any) -> Any:
-    """Recursively converts nested lists into tuples to ensure immutability and hashability."""
-    if isinstance(val, list):
-        return tuple(_deep_tuple(x) for x in val)
+def _deep_tuple(val: Any, depth: int = 0, max_depth: int = 20) -> Any:
+    """Recursively converts nested lists and tuples into immutable, hashable tuples."""
+    if depth > max_depth:
+        raise ValueError(f"Exceeded maximum nesting depth of {max_depth}")
+    if isinstance(val, (list, tuple)):
+        return tuple(_deep_tuple(x, depth + 1, max_depth) for x in val)
     return val
 
 
@@ -40,7 +42,7 @@ def _deserialize_shingle_key(key: str) -> Any:
             parsed = json.loads(key)
             if isinstance(parsed, list):
                 return _deep_tuple(parsed)
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, TypeError, RecursionError):
             pass
     return key
 
@@ -332,17 +334,17 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
             decoded_stops: Set[Any] = set()
             if isinstance(raw_stops, (list, set, tuple)):
                 for sh in raw_stops:
-                    if isinstance(sh, list):
+                    try:
                         decoded_stops.add(_deep_tuple(sh))
-                    elif isinstance(sh, (str, int, float, tuple)):
-                        decoded_stops.add(sh)
+                    except (TypeError, ValueError, RecursionError):
+                        continue
             raw_freqs = raw_calib.get("shingle_frequencies", {})
             decoded_freqs: Dict[Any, int] = {}
             if isinstance(raw_freqs, dict):
                 for k, v in raw_freqs.items():
                     try:
                         decoded_freqs[_deserialize_shingle_key(k)] = int(v)
-                    except (ValueError, TypeError):
+                    except (ValueError, TypeError, RecursionError):
                         continue
             raw_max_freq = raw_calib.get("max_index_frequency")
             max_idx_freq: Optional[float]
@@ -354,7 +356,7 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
                 except (ValueError, TypeError):
                     max_idx_freq = 0.25
             try:
-                calib_total_units = int(raw_calib.get("total_units", 0) or 0)
+                calib_total_units = max(0, int(raw_calib.get("total_units", 0) or 0))
             except (ValueError, TypeError):
                 calib_total_units = 0
 
@@ -368,7 +370,7 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
         return BaselineFingerprints(
             fps, records=records, corpus_calibration=corpus_calibration
         )
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError, TypeError, AttributeError):
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError, TypeError, AttributeError, RecursionError):
         return BaselineFingerprints()
 
 

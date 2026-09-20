@@ -76,6 +76,8 @@ def get_git_modified_line_ranges(
     cwd: Optional[str] = None,
 ) -> Dict[str, List[Tuple[int, int]]]:
     """Extracts modified line ranges for files using git diff --unified=0."""
+    if since_ref and since_ref.strip().startswith("-"):
+        return {}
     args = ["diff", "--unified=0", "--src-prefix=a/", "--dst-prefix=b/"]
     if since_ref:
         args.append(since_ref)
@@ -94,6 +96,8 @@ def get_git_modified_files(
     cwd: Optional[str] = None,
 ) -> List[str]:
     """Extracts normalized file paths of modified files from git diff."""
+    if since_ref and since_ref.strip().startswith("-"):
+        return []
     args = ["diff", "--name-only"]
     if since_ref:
         args.append(since_ref)

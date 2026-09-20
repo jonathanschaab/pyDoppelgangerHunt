@@ -702,3 +702,10 @@ def test_get_git_modified_files(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("pydoppelgangerhunt.git_diff._run_git_command", lambda args, cwd=None: None)
     assert get_git_modified_files() == []
 
+    # Dash-prefixed since_ref must be rejected immediately to prevent option injection
+    from pydoppelgangerhunt.git_diff import get_git_modified_line_ranges  # pylint: disable=import-outside-toplevel
+    assert get_git_modified_files(since_ref="--output=/tmp/pwned") == []
+    assert get_git_modified_files(since_ref="-h") == []
+    assert get_git_modified_line_ranges(since_ref="--diff-filter=A") == {}
+    assert get_git_modified_line_ranges(since_ref="-R") == {}
+

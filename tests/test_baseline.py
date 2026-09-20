@@ -1825,3 +1825,89 @@ def test_prune_baseline_preserves_corpus_calibration(tmp_path: Path) -> None:
     assert ("Stop", "A") in loaded.corpus_calibration["global_stop_shingles"]
     assert loaded.corpus_calibration["shingle_frequencies"][("Stop", "A")] == 15
 
+
+def test_red_team_baseline_and_matcher_hardening(tmp_path: Path) -> None:
+    """Verifies robustness fixes for recursion limits, unhashable stops, and negative bounds."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        _deep_tuple,
+        _deserialize_shingle_key,
+        load_baseline,
+    )
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    # 1. _deep_tuple depth limit and cycle safety
+    deep_val: Any = [1]
+    for _ in range(25):
+        deep_val = [deep_val]
+    with pytest.raises(ValueError, match="Exceeded maximum nesting depth"):
+        _deep_tuple(deep_val)
+
+    # Key deserialization handles exceeded recursion depth without crashing
+    deep_json = json.dumps(deep_val)
+    deserialized = _deserialize_shingle_key(deep_json)
+    assert deserialized == deep_json
+
+    # Cyclic list raises ValueError in _deep_tuple
+    cyclic: List[Any] = []
+    cyclic.append(cyclic)
+    with pytest.raises(ValueError):
+        _deep_tuple(cyclic)
+
+    # 2. Unhashable items in stop-shingles do not discard valid stop shingles in load_baseline
+    calib_json = tmp_path / "mixed_stops.json"
+    calib_json.write_text(
+        json.dumps({
+            "version": "1.4.0",
+            "corpus_calibration": {
+                "total_units": -10,  # Negative units clamped to 0
+                "max_index_frequency": None,  # Explicitly None
+                "global_stop_shingles": [
+                    {"dict": "not_hashable"},
+                    ["valid", "stop"],
+                    "scalar_stop",
+                ],
+                "shingle_frequencies": {
+                    '["valid", "stop"]': 25,
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    loaded = load_baseline(str(calib_json))
+    assert loaded.corpus_calibration is not None
+    assert loaded.corpus_calibration["total_units"] == 0  # Clamped to >= 0
+    assert loaded.corpus_calibration["max_index_frequency"] is None
+    stops = loaded.corpus_calibration["global_stop_shingles"]
+    assert ("valid", "stop") in stops
+    assert "scalar_stop" in stops
+    assert len(stops) == 2
+
+    # 3. Matcher scan_target with tfidf=True and negative total_units does not raise ValueError
+    repo = tmp_path / "red_repo"
+    repo.mkdir()
+    code = (
+        "def compute_score(a, b):\n"
+        "    v1 = a + 1\n"
+        "    v2 = v1 * 2\n"
+        "    v3 = v2 + b\n"
+        "    v4 = v3 - 5\n"
+        "    return v4\n"
+    )
+    (repo / "r1.py").write_text(code, encoding="utf-8")
+    (repo / "r2.py").write_text(code, encoding="utf-8")
+
+    clones = scan_target(
+        str(repo),
+        min_lines=5,
+        threshold=0.90,
+        tfidf=True,
+        corpus_calibration={
+            "total_units": -100,
+            "max_index_frequency": None,
+            "global_stop_shingles": [{"unhashable": "obj"}, ["valid", "token"]],
+            "shingle_frequencies": {},
+        },
+    )
+    assert len(clones) == 1
+
+
