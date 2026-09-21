@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Set, Tuple, Uni
 from pydoppelgangerhunt.canonical_path import (
     CanonicalPathResolver,
     build_diff_path_keys,
+    normalize_lexical_posix,
 )
 from pydoppelgangerhunt.config import (
     canonical_path_key,
@@ -657,6 +658,8 @@ def _build_calibration_metadata(
     audit_tests: bool = False,
     include_notebooks: bool = False,
     excludes: Optional[Sequence[str]] = None,
+    scope: Optional[str] = None,
+    target_repo_relative: Optional[str] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Helper to compute baseline corpus calibration dictionary."""
@@ -672,6 +675,8 @@ def _build_calibration_metadata(
         audit_tests=audit_tests,
         include_notebooks=include_notebooks,
         excludes=excludes,
+        scope=scope,
+        target_repo_relative=target_repo_relative,
         **kwargs,
     )
 
@@ -687,6 +692,7 @@ def _is_calibration_mode_compatible(
     max_index_frequency: Optional[float] = 0.25,
     min_corpus_size: Optional[int] = None,
     excludes: Optional[Sequence[str]] = None,
+    target_scope: Optional[str] = None,
     **kwargs: Any,
 ) -> bool:
     """Validates that corpus calibration was generated with compatible representation, filtering, and AST shaping features."""
@@ -710,6 +716,7 @@ def _is_calibration_mode_compatible(
             "max_index_frequency": max_index_frequency,
             "min_corpus_size": effective_mcs,
             "excludes": clean_active_ex,
+            "scope": target_scope,
         })
         if calib_hash == compute_calibration_config_hash(active_cfg):
             return True
@@ -773,6 +780,20 @@ def _is_calibration_mode_compatible(
                     return False
             except (ValueError, TypeError, OverflowError):
                 return False
+
+    calib_scope = calib.get("scope") or calib.get("target_repo_relative")
+    norm_calib_scope = (
+        normalize_lexical_posix(str(calib_scope)).strip("/")
+        if calib_scope
+        else None
+    )
+    norm_target_scope = (
+        normalize_lexical_posix(str(target_scope)).strip("/")
+        if target_scope
+        else None
+    )
+    if norm_calib_scope != norm_target_scope:
+        return False
 
     return True
 
@@ -942,12 +963,12 @@ def scan_target(
                 )
             )
 
+    target_root_dir = res_target_dir if res_target_dir.is_dir() else res_target_dir.parent
+    effective_repo = git_root_resolved or effective_repo_root
+    resolver = CanonicalPathResolver(target_root=target_root_dir, repo_root=effective_repo)
+
     diff_unit_indices: Optional[Set[int]] = None
     if diff_files is not None:
-        effective_repo = git_root_resolved or effective_repo_root
-        target_root_dir = res_target_dir if res_target_dir.is_dir() else res_target_dir.parent
-        resolver = CanonicalPathResolver(target_root=target_root_dir, repo_root=effective_repo)
-
         diff_keys = build_diff_path_keys(diff_files, resolver)
         unique_unit_files = {u.get("file") for u in units if u.get("file")}
         is_target_relative_harvest = (
@@ -977,6 +998,8 @@ def scan_target(
                     audit_tests=audit_tests,
                     include_notebooks=include_notebooks,
                     excludes=excludes,
+                    scope=resolver.target_in_repo,
+                    target_repo_relative=resolver.target_in_repo,
                     **harvest_mode_opts,
                 )
             return []
@@ -998,6 +1021,7 @@ def scan_target(
         max_index_frequency=max_index_frequency,
         min_corpus_size=min_corpus_size,
         excludes=excludes,
+        target_scope=resolver.target_in_repo,
         **harvest_mode_opts,
     ):
         corpus_calibration = None
@@ -1341,6 +1365,8 @@ def scan_target(
             audit_tests=audit_tests,
             include_notebooks=include_notebooks,
             excludes=excludes,
+            scope=resolver.target_in_repo,
+            target_repo_relative=resolver.target_in_repo,
             **harvest_mode_opts,
         )
         return clones, calib_dict

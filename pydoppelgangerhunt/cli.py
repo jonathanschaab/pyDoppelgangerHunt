@@ -15,6 +15,7 @@ from pydoppelgangerhunt.baseline import (
     load_baseline,
     prune_baseline,
     record_baseline,
+    _derive_target_offsets,
 )
 from pydoppelgangerhunt.clustering import cluster_clone_families
 from pydoppelgangerhunt.config import (
@@ -742,52 +743,73 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if baseline_path and not args.record_baseline and os.path.exists(baseline_path):
         preloaded_baseline = load_baseline(baseline_path)
         calib_dict = getattr(preloaded_baseline, "corpus_calibration", None)
-        if calib_dict and isinstance(calib_dict, dict) and args.format == "text":
-            calib_hash = calib_dict.get("config_hash") or getattr(preloaded_baseline, "config_hash", None)
-            if calib_hash:
-                effective_mcs = min_corpus_size if min_corpus_size is not None else calib_dict.get("min_corpus_size")
-                active_cfg: Dict[str, Any] = {
-                    "bag_of_tokens": args.bag_of_tokens,
-                    "call_sequences": call_seq_enabled,
-                    "filter_stop_shingles": stop_shingles_enabled,
-                    "audit_tests": bool(audit_tests_enabled),
-                    "include_notebooks": bool(args.notebooks),
-                    "max_index_frequency": max_index_frequency,
-                    "min_corpus_size": effective_mcs,
-                    "min_lines": min_lines,
-                    "min_tokens": min_tokens,
-                    "functions_only": args.functions_only,
-                    "sliding_window": args.sliding_window,
-                    "window_size": args.window_size,
-                    "blind_indexing": args.blind_indexing,
-                    "merge_subtrees": args.merge_subtrees,
-                    "complex_expressions": args.complex_expressions,
-                    "min_expr_complexity": args.min_expr_complexity,
-                    "clause_level": args.clause_level,
-                    "data_tables": args.data_tables,
-                    "strip_annotations": strip_annotations,
-                    "nms": args.nms,
-                    "class_level": args.class_level,
-                    "blind_literals": args.blind_literals,
-                    "filter_boilerplate": args.filter_boilerplate,
-                    "consistent_renaming": args.consistent_renaming,
-                    "harvest_closures": args.harvest_closures,
-                    "commutative": args.commutative,
-                    "comprehensions": args.comprehensions,
-                    "idioms": idioms_enabled,
-                    "abstract_expressions": args.abstract_expressions,
-                    "strip_docstrings": strip_docstrings,
-                    "excludes": excludes,
-                }
-                active_hash = compute_calibration_config_hash(active_cfg)
-                if calib_hash != active_hash:
+        base_target = getattr(preloaded_baseline, "target", None)
+        base_target_rel = getattr(preloaded_baseline, "target_repo_relative", None)
+        target_val = target or getattr(args, "target", None) or target_repo_root
+        base_offset, scan_offset = _derive_target_offsets(
+            base_target, base_target_rel, target_repo_root, target_val
+        )
+        if calib_dict and isinstance(calib_dict, dict):
+            if (base_offset or "") != (scan_offset or ""):
+                if args.format == "text":
+                    b_desc = base_offset if base_offset else "repository root"
+                    s_desc = scan_offset if scan_offset else "repository root"
                     print(
                         colorize(
-                            f"Warning: Active scan configuration does not match baseline calibration config (baseline: {calib_hash[:8]}, active: {active_hash[:8]}). Calibration shingle frequencies may not align with active scan settings.",
-                            COLOR_BOLD + COLOR_YELLOW,
+                            f"Info: Active scan scope ({s_desc}) differs from baseline calibration scope ({b_desc}). "
+                            f"Skipping baseline corpus calibration reuse to prevent shingle frequency skew.",
+                            COLOR_YELLOW,
                             use_color,
                         )
                     )
+                calib_dict = None
+            elif args.format == "text":
+                calib_hash = calib_dict.get("config_hash") or getattr(preloaded_baseline, "config_hash", None)
+                if calib_hash:
+                    effective_mcs = min_corpus_size if min_corpus_size is not None else calib_dict.get("min_corpus_size")
+                    active_cfg: Dict[str, Any] = {
+                        "bag_of_tokens": args.bag_of_tokens,
+                        "call_sequences": call_seq_enabled,
+                        "filter_stop_shingles": stop_shingles_enabled,
+                        "audit_tests": bool(audit_tests_enabled),
+                        "include_notebooks": bool(args.notebooks),
+                        "max_index_frequency": max_index_frequency,
+                        "min_corpus_size": effective_mcs,
+                        "min_lines": min_lines,
+                        "min_tokens": min_tokens,
+                        "functions_only": args.functions_only,
+                        "sliding_window": args.sliding_window,
+                        "window_size": args.window_size,
+                        "blind_indexing": args.blind_indexing,
+                        "merge_subtrees": args.merge_subtrees,
+                        "complex_expressions": args.complex_expressions,
+                        "min_expr_complexity": args.min_expr_complexity,
+                        "clause_level": args.clause_level,
+                        "data_tables": args.data_tables,
+                        "strip_annotations": strip_annotations,
+                        "nms": args.nms,
+                        "class_level": args.class_level,
+                        "blind_literals": args.blind_literals,
+                        "filter_boilerplate": args.filter_boilerplate,
+                        "consistent_renaming": args.consistent_renaming,
+                        "harvest_closures": args.harvest_closures,
+                        "commutative": args.commutative,
+                        "comprehensions": args.comprehensions,
+                        "idioms": idioms_enabled,
+                        "abstract_expressions": args.abstract_expressions,
+                        "strip_docstrings": strip_docstrings,
+                        "excludes": excludes,
+                        "scope": scan_offset,
+                    }
+                    active_hash = compute_calibration_config_hash(active_cfg)
+                    if calib_hash != active_hash:
+                        print(
+                            colorize(
+                                f"Warning: Active scan configuration does not match baseline calibration config (baseline: {calib_hash[:8]}, active: {active_hash[:8]}). Calibration shingle frequencies may not align with active scan settings.",
+                                COLOR_BOLD + COLOR_YELLOW,
+                                use_color,
+                            )
+                        )
 
     diff_files: Optional[Sequence[str]] = None
     if args.diff_only:
@@ -895,6 +917,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             target,
             threshold,
             corpus_calibration=recorded_calib,
+            repo_root=target_repo_root,
         )
         print(f"[OK] Recorded {len(clones)} clone baseline pair(s) to {bp}")
         return 0

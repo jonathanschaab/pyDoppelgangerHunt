@@ -3982,6 +3982,110 @@ def test_cli_default_target_baseline_suppression(tmp_path: Path) -> None:
     assert len(filtered) == 0
 
 
+def test_compute_path_offset_single_file_target(tmp_path: Path) -> None:
+    """Verifies that _compute_path_offset and _derive_target_offsets normalize file targets to their parent directory."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        _compute_path_offset,
+        _derive_target_offsets,
+    )
+
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    src = repo / "src"
+    src.mkdir(parents=True)
+    file_a = src / "worker.py"
+    file_a.write_text("def run():\n    pass\n", encoding="utf-8")
+
+    # _compute_path_offset normalizes file target to parent directory
+    offset = _compute_path_offset(file_a, repo)
+    assert offset == "src"
+
+    # _derive_target_offsets derives scan_offset="src" for a single-file target
+    base_off, scan_off = _derive_target_offsets(
+        base_target=src,
+        base_target_rel="src",
+        repo_root=repo,
+        target=file_a,
+    )
+    assert base_off == "src"
+    assert scan_off == "src"
+
+    # Clone recorded with target_repo_relative="src" is suppressed when scanning single file file_a
+    base_file = repo / "baseline.json"
+    u1 = {"file": "worker.py", "name": "run", "structural_hash": "hash_a"}
+    u2 = {"file": "worker.py", "name": "run2", "structural_hash": "hash_a"}
+    clones = [(1.0, u1, u2)]
+
+    pydoppelgangerhunt.record_baseline(
+        clones,
+        str(base_file),
+        str(file_a),
+        0.80,
+        repo_root=repo,
+    )
+    loaded_base = pydoppelgangerhunt.load_baseline(str(base_file))
+    assert loaded_base.target_repo_relative == "src"
+
+    filtered, suppressed = pydoppelgangerhunt.filter_clones_by_baseline(
+        clones,
+        loaded_base,
+        repo_root=str(repo),
+        target=str(file_a),
+    )
+    assert suppressed == 1
+    assert len(filtered) == 0
+
+
+def test_calibration_scope_compatibility_and_rejection() -> None:
+    """Verifies that corpus calibration scope is validated and rejected when target scopes differ."""
+    from pydoppelgangerhunt.baseline import compute_calibration_config_hash  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.matcher import _is_calibration_mode_compatible  # pylint: disable=import-outside-toplevel
+
+    # Base calibration recorded for "src"
+    calib_src = {
+        "total_units": 100,
+        "max_index_frequency": 0.25,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {},
+        "scope": "src",
+        "target_repo_relative": "src",
+    }
+    calib_src["config_hash"] = compute_calibration_config_hash(calib_src)
+
+    # Active scan on root repo (target_scope=None) must be rejected
+    assert not _is_calibration_mode_compatible(calib_src, target_scope=None)
+    assert not _is_calibration_mode_compatible(calib_src, target_scope="")
+
+    # Active scan on "tests" must be rejected
+    assert not _is_calibration_mode_compatible(calib_src, target_scope="tests")
+
+    # Active scan on "src" matches
+    assert _is_calibration_mode_compatible(calib_src, target_scope="src")
+
+    # Base calibration recorded for root repo (scope=None)
+    calib_root = {
+        "total_units": 500,
+        "max_index_frequency": 0.25,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {},
+        "scope": None,
+    }
+    calib_root["config_hash"] = compute_calibration_config_hash(calib_root)
+
+    # Active scan on "src" must be rejected
+    assert not _is_calibration_mode_compatible(calib_root, target_scope="src")
+
+    # Active scan on root repo matches
+    assert _is_calibration_mode_compatible(calib_root, target_scope=None)
+    assert _is_calibration_mode_compatible(calib_root, target_scope="")
+
+    # Config hashes differ between scopes
+    hash_src = compute_calibration_config_hash({"scope": "src"})
+    hash_root = compute_calibration_config_hash({"scope": None})
+    assert hash_src != hash_root
+
+
+
 
 
 

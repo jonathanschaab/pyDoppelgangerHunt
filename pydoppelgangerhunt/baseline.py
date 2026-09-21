@@ -138,6 +138,13 @@ def _extract_calibration_settings(source: Dict[str, Any]) -> Dict[str, Any]:
             settings["excludes"] = []
     else:
         settings["excludes"] = []
+
+    raw_scope = source.get("scope") or source.get("target_repo_relative")
+    if raw_scope:
+        norm_sc = normalize_lexical_posix(str(raw_scope)).strip("/")
+        settings["scope"] = norm_sc if norm_sc else None
+    else:
+        settings["scope"] = None
     return settings
 
 
@@ -312,6 +319,8 @@ def compute_corpus_calibration(
     bag_of_tokens: bool = False,
     call_sequences: bool = False,
     excludes: Optional[Sequence[str]] = None,
+    scope: Optional[str] = None,
+    target_repo_relative: Optional[str] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Computes global shingle document frequencies and calibrated stop-shingles for a repository corpus."""
@@ -361,6 +370,8 @@ def compute_corpus_calibration(
         "filter_stop_shingles": filter_stop_shingles,
         "min_corpus_size": min_corpus_size,
         "excludes": excludes,
+        "scope": scope,
+        "target_repo_relative": target_repo_relative,
     }
     flags_dict.update(kwargs)
     _attach_calibration_flags(calib, flags_dict)
@@ -443,10 +454,11 @@ def record_baseline(
     threshold: float,
     *,
     corpus_calibration: Optional[Dict[str, Any]] = None,
+    repo_root: Optional[Union[str, Path]] = None,
 ) -> str:
     """Records detected clones into a JSON baseline file for grandfathering."""
     target_repo_rel = None
-    res = _build_baseline_path_resolver(target)
+    res = _build_baseline_path_resolver(root=repo_root, target=target)
     if res is not None:
         target_repo_rel = res.target_in_repo
 
@@ -515,6 +527,11 @@ def record_baseline(
             "global_stop_shingles": safe_stops,
             "shingle_frequencies": dict(sorted(safe_shingle_freqs.items(), key=lambda item: item[0])),
         }
+        if target_repo_rel:
+            calib_entry["target_repo_relative"] = target_repo_rel
+            calib_entry["scope"] = target_repo_rel
+        if target:
+            calib_entry["target"] = target
         _attach_calibration_flags(calib_entry, corpus_calibration)
         calib_config_hash = (
             str(corpus_calibration.get("config_hash"))
@@ -690,6 +707,14 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
         path_basis = data.get("path_basis")
         target_repo_rel = data.get("target_repo_relative")
         top_target = _safe_str(data.get("target"))
+
+        if corpus_calibration is not None and isinstance(corpus_calibration, dict):
+            if "target_repo_relative" not in corpus_calibration and target_repo_rel:
+                corpus_calibration["target_repo_relative"] = target_repo_rel
+            if "scope" not in corpus_calibration:
+                corpus_calibration["scope"] = corpus_calibration.get("target_repo_relative") or target_repo_rel
+            if "target" not in corpus_calibration and top_target:
+                corpus_calibration["target"] = top_target
         return BaselineFingerprints(
             fps,
             records=records,
@@ -739,6 +764,16 @@ def _compute_path_offset(
             sub_res = sub_p
             root_res = root_p
 
+        try:
+            if sub_res.is_file() or (not sub_res.is_dir() and sub_p.suffix in (".py", ".ipynb")):
+                sub_res = sub_res.parent
+                sub_p = sub_p.parent
+            if root_res.is_file() or (not root_res.is_dir() and root_p.suffix in (".py", ".ipynb")):
+                root_res = root_res.parent
+                root_p = root_p.parent
+        except (ValueError, OSError, RuntimeError):
+            pass
+
         sub_norm = normalize_lexical_posix(str(sub_res))
         root_norm = normalize_lexical_posix(str(root_res))
         if sub_norm and root_norm and sub_norm != root_norm:
@@ -746,8 +781,8 @@ def _compute_path_offset(
             if rel is not None:
                 return rel.strip("/")
 
-        raw_sub = normalize_lexical_posix(str(sub_path))
-        raw_root = normalize_lexical_posix(str(root_path))
+        raw_sub = normalize_lexical_posix(str(sub_p))
+        raw_root = normalize_lexical_posix(str(root_p))
         if raw_sub and raw_root and raw_sub != raw_root:
             rel = lexical_relative_to(raw_sub, raw_root)
             if rel is not None:
@@ -776,8 +811,19 @@ def _derive_target_offsets(
         pass
 
     if not git_root and base_target is not None and target is not None:
-        t_norm = normalize_lexical_posix(str(target))
-        b_norm = normalize_lexical_posix(str(base_target))
+        try:
+            t_p = Path(target)
+            t_p_parent = t_p.parent if (t_p.is_file() or (not t_p.is_dir() and t_p.suffix in (".py", ".ipynb"))) else t_p
+        except (ValueError, OSError, RuntimeError):
+            t_p_parent = Path(target)
+        try:
+            b_p = Path(base_target)
+            b_p_parent = b_p.parent if (b_p.is_file() or (not b_p.is_dir() and b_p.suffix in (".py", ".ipynb"))) else b_p
+        except (ValueError, OSError, RuntimeError):
+            b_p_parent = Path(base_target)
+
+        t_norm = normalize_lexical_posix(str(t_p_parent))
+        b_norm = normalize_lexical_posix(str(b_p_parent))
         if t_norm and b_norm and t_norm != b_norm:
             if lexical_relative_to(t_norm, b_norm) is not None:
                 effective_repo = base_target
@@ -897,17 +943,17 @@ def _matches_boundary_and_structural_hashes(
 
 
 def _build_baseline_path_resolver(
-    root: Optional[Union[str, Path]],
+    root: Optional[Union[str, Path]] = None,
     baseline_target: Optional[Union[str, Path]] = None,
     target: Optional[Union[str, Path]] = None,
 ) -> Optional[CanonicalPathResolver]:
     """Constructs a CanonicalPathResolver against enclosing Git worktree root or baseline target if available."""
-    anchor = target or root or baseline_target
+    anchor = root or target or baseline_target
     if anchor is None:
         return None
     try:
         git_root = git_diff.get_git_repo_root(repo_root=anchor)
-        effective_repo: Union[str, Path] = git_root or anchor
+        effective_repo: Union[str, Path] = root or git_root or anchor
         effective_target: Union[str, Path] = target or baseline_target or root or anchor
         if baseline_target is not None and target is not None:
             t_norm = normalize_lexical_posix(str(target))

@@ -1535,4 +1535,40 @@ def test_scan_target_diff_files_single_file_target(
     assert len(clones2) >= 1
 
 
+def test_scan_target_calibration_scope_mismatch_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that scan_target discards calibration when target directory scope differs from calibration scope."""
+    repo = tmp_path / "scope_repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+    tests_dir = repo / "tests"
+    tests_dir.mkdir(parents=True)
+
+    norm_repo = str(repo).replace("\\", "/")
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: (
+            norm_repo + "\n"
+            if args == ["rev-parse", "--show-toplevel"]
+            else None
+        ),
+    )
+
+    code = "def sample():\n    x = 10\n    return x * 2\n"
+    (src / "worker.py").write_text(code, encoding="utf-8")
+    (tests_dir / "test_worker.py").write_text(code, encoding="utf-8")
+
+    # Generate calibration for src
+    _, calib_src = scan_target(str(src), return_calibration=True)
+    assert calib_src.get("scope") == "src"
+
+    # Running scan on repo root (scope="") with calib_src:
+    # calib_src should be rejected and NOT used (so calib_src does not record unit_drift)
+    calib_copy = dict(calib_src)
+    scan_target(str(repo), corpus_calibration=calib_copy)
+    assert "unit_drift" not in calib_copy
+
+
+
 

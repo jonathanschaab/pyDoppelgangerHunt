@@ -62,6 +62,24 @@ def normalize_lexical_posix(path_str: Optional[str], strip_anchor: bool = False)
     return norm
 
 
+def _resolve_relative_segments(rel: str) -> Optional[str]:
+    """Resolves '.' and '..' segments in a relative path, returning None on parent escape."""
+    rel_parts = rel.split("/")
+    if ".." not in rel_parts and "." not in rel_parts:
+        return rel
+    resolved_segments: List[str] = []
+    for seg in rel_parts:
+        if not seg or seg == ".":
+            continue
+        if seg == "..":
+            if not resolved_segments:
+                return None
+            resolved_segments.pop()
+        else:
+            resolved_segments.append(seg)
+    return "/".join(resolved_segments)
+
+
 def lexical_relative_to(
     path_posix: str,
     base_posix: str,
@@ -83,8 +101,16 @@ def lexical_relative_to(
     p_clean = path_posix.rstrip("/")
     b_clean = base_posix.rstrip("/")
 
+    # Handle filesystem root base ("/") as a special case
+    if base_posix and set(base_posix) == {"/"}:
+        if not p_clean:
+            return ""
+        if len(p_clean) >= 2 and p_clean[1] == ":":
+            return None
+        return _resolve_relative_segments(p_clean.lstrip("/"))
+
     if not b_clean:
-        return p_clean
+        return p_clean if not p_clean.startswith("/") else None
 
     p_compare = p_clean.lower() if case_fold else p_clean
     b_compare = b_clean.lower() if case_fold else b_clean
@@ -94,23 +120,7 @@ def lexical_relative_to(
 
     prefix = b_compare + "/"
     if p_compare.startswith(prefix):
-        rel = p_clean[len(prefix):]
-        # Guard against path traversal escapes like base/../../escaped
-        rel_parts = rel.split("/")
-        if ".." in rel_parts or "." in rel_parts:
-            resolved_segments: List[str] = []
-            for seg in rel_parts:
-                if not seg or seg == ".":
-                    continue
-                if seg == "..":
-                    if not resolved_segments:
-                        # Escaped above base directory
-                        return None
-                    resolved_segments.pop()
-                else:
-                    resolved_segments.append(seg)
-            return "/".join(resolved_segments)
-        return rel
+        return _resolve_relative_segments(p_clean[len(prefix):])
 
     return None
 
@@ -246,6 +256,14 @@ class CanonicalPathResolver:
 
         if is_abs:
             abs_lex = norm
+            if (
+                os.name == "nt"
+                and abs_lex.startswith("/")
+                and not (len(abs_lex) >= 2 and abs_lex[1] == ":")
+                and len(self.target_lexical) >= 2
+                and self.target_lexical[1] == ":"
+            ):
+                abs_lex = self.target_lexical[:2] + abs_lex
             rel_target = lexical_relative_to(abs_lex, self.target_lexical, case_fold=self.case_fold)
             rel_repo = lexical_relative_to(abs_lex, self.repo_lexical, case_fold=self.case_fold)
             res = CanonicalPath(

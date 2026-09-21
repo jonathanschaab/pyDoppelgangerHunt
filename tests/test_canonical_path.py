@@ -310,6 +310,24 @@ def test_resolver_normalizes_single_file_target_root_to_parent(tmp_path: Path) -
     assert resolver.matches_diff("worker.py", diff_keys, basis="target")
 
 
+def test_lexical_relative_to_filesystem_root() -> None:
+    """Verifies that lexical_relative_to correctly handles root '/' base directory without returning absolute paths."""
+    assert lexical_relative_to("/tmp/x.py", "/") == "tmp/x.py"
+    assert lexical_relative_to("tmp/x.py", "/") == "tmp/x.py"
+    assert lexical_relative_to("/", "/") == ""
+    assert lexical_relative_to("/tmp/../../escaped.py", "/") is None
+    assert lexical_relative_to("/a/b/c.py", "/") == "a/b/c.py"
+
+    resolver = CanonicalPathResolver(target_root="/tmp", repo_root="/")
+    assert resolver.target_in_repo == "tmp"
+    diff_keys = build_diff_path_keys(["/tmp/worker.py"], resolver)
+    assert "target:worker.py" in diff_keys
+    assert "repo:tmp/worker.py" in diff_keys
+    assert resolver.matches_diff("worker.py", diff_keys, basis="target")
+    assert resolver.matches_diff("/tmp/worker.py", diff_keys, basis="repo")
+
+
+
 
 
 
