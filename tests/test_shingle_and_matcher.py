@@ -6,6 +6,8 @@ import ast
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+import pytest
+
 from pydoppelgangerhunt import (
     get_ast_characteristic_vector,
     get_ast_shingles,
@@ -1345,7 +1347,7 @@ def test_unit_drift_computed_when_target_units_drop_to_zero(tmp_path: Path) -> N
     assert calib.get("unit_drift") == 1.0
 
 
-def test_scan_target_diff_files_in_subdirectory(tmp_path: Path) -> None:
+def test_scan_target_diff_files_in_subdirectory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Verifies scan_target correctly resolves diff_files when scanning a subdirectory with repo_root."""
     repo = tmp_path / "diff_repo"
     repo.mkdir()
@@ -1386,6 +1388,26 @@ def test_scan_target_diff_files_in_subdirectory(tmp_path: Path) -> None:
     )
     assert len(clones2) >= 1
 
+    # diff_files passed in Git CLI scenario: target="sub_pkg", repo_root="sub_pkg", diff_files=["sub_pkg/w1.py"]
+    # (Inside Git worktree `repo`, so git_root_resolved is `repo`)
+    norm_repo = str(repo).replace("\\", "/")
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: (
+            norm_repo + "\n"
+            if args == ["rev-parse", "--show-toplevel"]
+            else None
+        ),
+    )
+    clones3 = scan_target(
+        str(sub),
+        repo_root=str(sub),
+        diff_files=["sub_pkg/w1.py"],
+        min_lines=3,
+        threshold=0.80,
+    )
+    assert len(clones3) >= 1
+
 
 def test_unit_matches_diff_keys_with_repo_and_target_basis(tmp_path: Path) -> None:
     """Verifies _unit_matches_diff_keys resolves diff keys correctly for repo-relative units."""
@@ -1397,7 +1419,10 @@ def test_unit_matches_diff_keys_with_repo_and_target_basis(tmp_path: Path) -> No
     target.mkdir()
 
     diff_keys = {"sub_dir/mod.py", "mod.py"}
+    # Repo-relative harvest
     assert _unit_matches_diff_keys("sub_dir/mod.py", diff_keys, repo_root=repo, target_dir=target)
+    # Target-relative harvest (CLI scenario with worktree root)
+    assert _unit_matches_diff_keys("mod.py", diff_keys, repo_root=target, target_dir=target, git_root_resolved=repo)
     assert not _unit_matches_diff_keys("other/mod.py", diff_keys, repo_root=repo, target_dir=target)
     assert not _unit_matches_diff_keys(None, diff_keys, repo_root=repo, target_dir=target)
     assert not _unit_matches_diff_keys("sub_dir/mod.py", set(), repo_root=repo, target_dir=target)

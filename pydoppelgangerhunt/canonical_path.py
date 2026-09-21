@@ -430,6 +430,26 @@ class CanonicalPathResolver:
 
         return False
 
+    def _probe_keys_in_diff(
+        self,
+        t_key: Optional[str],
+        r_key: Optional[str],
+        c_key: Optional[str],
+        diff_keys: Set[str],
+        has_tagged: bool,
+    ) -> bool:
+        """Probes coordinate keys against diff set respecting coordinate tag isolation."""
+        if has_tagged:
+            return bool(
+                (t_key and f"target:{t_key}" in diff_keys)
+                or (r_key and f"repo:{r_key}" in diff_keys)
+            )
+        return bool(
+            (t_key and t_key in diff_keys)
+            or (r_key and r_key in diff_keys)
+            or (c_key and c_key in diff_keys)
+        )
+
     def matches_diff(
         self,
         unit_file: Optional[Union[str, Path, CanonicalPath]],
@@ -441,29 +461,30 @@ class CanonicalPathResolver:
         if not unit_file or not diff_keys:
             return False
 
-        # 1. Exact match with explicit coordinates
-        for k in (
+        has_tagged = any(k.startswith(("repo:", "target:")) for k in diff_keys)
+        if self._probe_keys_in_diff(
             self.target_key(unit_file, basis=basis, strip_anchor=False),
             self.repo_key(unit_file, basis=basis, strip_anchor=False),
             self.canonical_key(unit_file, basis=basis, strip_anchor=False),
+            diff_keys,
+            has_tagged,
         ):
-            if k and k in diff_keys:
-                return True
+            return True
 
-        # 2. Stripped anchor match (for notebook cell anchors like .ipynb#cell_1 or #cell1)
+        # Stripped anchor match (for notebook cell anchors like .ipynb#cell_1 or #cell1)
         if strip_anchor:
             raw_str = str(getattr(unit_file, "raw", unit_file) or "")
             if "#" in raw_str:
                 last_hash = raw_str.rfind("#")
                 fragment = raw_str[last_hash + 1:]
                 if fragment.lower().startswith("cell") or ".ipynb#" in raw_str:
-                    for k in (
+                    return self._probe_keys_in_diff(
                         self.target_key(unit_file, basis=basis, strip_anchor=True),
                         self.repo_key(unit_file, basis=basis, strip_anchor=True),
                         self.canonical_key(unit_file, basis=basis, strip_anchor=True),
-                    ):
-                        if k and k in diff_keys:
-                            return True
+                        diff_keys,
+                        has_tagged,
+                    )
 
         return False
 
@@ -496,9 +517,9 @@ def build_diff_path_keys(
             continue
         r_key = resolver.repo_key(cp, strip_anchor=False)
         if r_key:
-            keys.add(r_key)
+            keys.add(f"repo:{r_key}")
         if cp.target_relative is not None:
             t_key = resolver.target_key(cp, strip_anchor=False)
             if t_key:
-                keys.add(t_key)
+                keys.add(f"target:{t_key}")
     return keys

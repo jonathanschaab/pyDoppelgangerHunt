@@ -604,7 +604,11 @@ def _unit_matches_diff_keys(
         return False
     effective_repo = git_root_resolved or repo_root
     resolver = CanonicalPathResolver(target_root=target_dir, repo_root=effective_repo)
-    unit_basis = "repo" if resolver.target_in_repo else "target"
+    is_target_relative_harvest = (
+        repo_root.resolve() == target_dir.resolve()
+        or (not target_dir.is_dir() and repo_root.resolve() == target_dir.parent.resolve())
+    )
+    unit_basis = "target" if is_target_relative_harvest else "repo"
     return resolver.matches_diff(u_file_raw, diff_keys, basis=unit_basis)
 
 
@@ -944,7 +948,11 @@ def scan_target(
 
         diff_keys = build_diff_path_keys(diff_files, resolver)
         unique_unit_files = {u.get("file") for u in units if u.get("file")}
-        unit_basis = "repo" if resolver.target_in_repo else "target"
+        is_target_relative_harvest = (
+            effective_repo_root.resolve() == res_target_dir.resolve()
+            or (not res_target_dir.is_dir() and effective_repo_root.resolve() == res_target_dir.parent.resolve())
+        )
+        unit_basis = "target" if is_target_relative_harvest else "repo"
         matching_files = {
             f
             for f in unique_unit_files

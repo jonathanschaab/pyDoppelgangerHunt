@@ -1085,8 +1085,8 @@ def test_normalize_git_paths_and_ranges_excludes_out_of_target_files(tmp_path: P
     norm_paths = _normalize_git_paths_for_target(raw_paths, str(repo_dir), str(target_dir))
     assert "foo.py" not in norm_paths
     assert "other/baz.py" not in norm_paths
-    assert "bar.py" in norm_paths
     assert "pkg/bar.py" in norm_paths
+    assert "bar.py" not in norm_paths
 
     ranges = {
         "foo.py": [(1, 10)],
@@ -1098,6 +1098,30 @@ def test_normalize_git_paths_and_ranges_excludes_out_of_target_files(tmp_path: P
     assert "other/baz.py" not in norm_ranges
     assert norm_ranges["bar.py"] == [(20, 30)]
     assert norm_ranges["pkg/bar.py"] == [(20, 30)]
+
+
+def test_normalize_git_paths_prevents_unchanged_same_named_file_collision(tmp_path: Path) -> None:
+    """Verifies that _normalize_git_paths_for_target does not add target-relative alias which collides with unchanged files."""
+    from pydoppelgangerhunt.cli import _normalize_git_paths_for_target  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.canonical_path import CanonicalPathResolver, build_diff_path_keys  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo"
+    src = repo / "src"
+    nested_src = src / "src"
+    nested_src.mkdir(parents=True)
+
+    # Modified file is repo/src/src/foo.py
+    raw_paths = ["src/src/foo.py"]
+    norm_paths = _normalize_git_paths_for_target(raw_paths, str(repo), str(src))
+    assert norm_paths == ["src/src/foo.py"]
+    assert "src/foo.py" not in norm_paths
+
+    resolver = CanonicalPathResolver(target_root=src, repo_root=repo)
+    diff_keys = build_diff_path_keys(norm_paths, resolver)
+    # Unchanged file at repo/src/foo.py (target-relative 'foo.py', repo-relative 'src/foo.py') must NOT match
+    assert not resolver.matches_diff("foo.py", diff_keys, basis="target")
+    # Modified file at repo/src/src/foo.py (target-relative 'src/foo.py', repo-relative 'src/src/foo.py') MUST match
+    assert resolver.matches_diff("src/foo.py", diff_keys, basis="target")
 
 
 def test_decode_git_cstyle_path_preserves_spaces() -> None:
