@@ -124,6 +124,20 @@ def _extract_calibration_settings(source: Dict[str, Any]) -> Dict[str, Any]:
             settings["min_corpus_size"] = val if val >= 0 else None
         except (ValueError, TypeError, OverflowError):
             settings["min_corpus_size"] = None
+
+    raw_excludes = source.get("excludes")
+    if raw_excludes and isinstance(raw_excludes, (list, tuple, set)):
+        try:
+            cleaned_excludes = sorted({
+                str(x).replace("\\", "/").rstrip("\r\n").strip()
+                for x in raw_excludes
+                if str(x).strip()
+            })
+            settings["excludes"] = cleaned_excludes
+        except (TypeError, ValueError):
+            settings["excludes"] = []
+    else:
+        settings["excludes"] = []
     return settings
 
 
@@ -297,6 +311,7 @@ def compute_corpus_calibration(
     *,
     bag_of_tokens: bool = False,
     call_sequences: bool = False,
+    excludes: Optional[Sequence[str]] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Computes global shingle document frequencies and calibrated stop-shingles for a repository corpus."""
@@ -345,6 +360,7 @@ def compute_corpus_calibration(
         "call_sequences": call_sequences,
         "filter_stop_shingles": filter_stop_shingles,
         "min_corpus_size": min_corpus_size,
+        "excludes": excludes,
     }
     flags_dict.update(kwargs)
     _attach_calibration_flags(calib, flags_dict)
@@ -689,6 +705,113 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
 
 
 
+def _canonicalize_endpoint_path(path: str, offset: Optional[str]) -> str:
+    """Canonicalizes an endpoint path relative to a repository root given an optional target offset."""
+    norm = normalize_lexical_posix(path, strip_anchor=False)
+    if not norm:
+        return ""
+    if offset:
+        off_norm = normalize_lexical_posix(offset, strip_anchor=False).strip("/")
+        if off_norm:
+            if norm == off_norm or norm.startswith(off_norm + "/"):
+                return norm
+            return f"{off_norm}/{norm}"
+    return norm
+
+
+def _compute_path_offset(
+    sub_path: Optional[Union[str, Path]], root_path: Optional[Union[str, Path]]
+) -> Optional[str]:
+    """Computes normalized relative offset between a sub path and root path if distinct."""
+    if sub_path is None or root_path is None:
+        return None
+    try:
+        sub_norm = normalize_lexical_posix(str(sub_path))
+        root_norm = normalize_lexical_posix(str(root_path))
+        if sub_norm and root_norm and sub_norm != root_norm:
+            rel = lexical_relative_to(sub_norm, root_norm)
+            if rel is not None:
+                return rel.strip("/")
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def _derive_target_offsets(
+    base_target: Optional[Union[str, Path]],
+    base_target_rel: Optional[str],
+    repo_root: Optional[Union[str, Path]],
+    target: Optional[Union[str, Path]] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Derives normalized baseline and active scan offsets relative to repo root."""
+    base_offset = (
+        normalize_lexical_posix(str(base_target_rel)).strip("/")
+        if base_target_rel
+        else _compute_path_offset(base_target, repo_root)
+    )
+    scan_offset = _compute_path_offset(target, repo_root)
+    return base_offset, scan_offset
+
+
+def _parse_structural_fingerprint(sfp: str) -> Tuple[str, str, str, str]:
+    """Parses a paired structural fingerprint string into (file_a, hash_a, file_b, hash_b)."""
+    parts = sfp.split(" <===> ")
+    if len(parts) == 2 and "#" in parts[0] and "#" in parts[1]:
+        f_a, h_a = parts[0].rsplit("#", 1)
+        f_b, h_b = parts[1].rsplit("#", 1)
+        return f_a, h_a, f_b, h_b
+    return "", "", "", ""
+
+
+def _extract_record_endpoint_data(
+    item: Dict[str, Any],
+) -> Tuple[str, str, str, str, str, str]:
+    """Extracts (file_a, name_a, hash_a, file_b, name_b, hash_b) from a clone or baseline dictionary."""
+    fa = str(item.get("file_a") or "")
+    fb = str(item.get("file_b") or "")
+    na = str(item.get("name_a") or "")
+    nb = str(item.get("name_b") or "")
+    ha = str(item.get("hash_a") or "")
+    hb = str(item.get("hash_b") or "")
+
+    raw_fp = item.get("fingerprint") or item.get("fp")
+    if not fa and not fb and raw_fp:
+        parsed = _parse_legacy_fingerprint_record(str(raw_fp))
+        fa = str(parsed.get("file_a") or "")
+        fb = str(parsed.get("file_b") or "")
+        na = str(parsed.get("name_a") or "")
+        nb = str(parsed.get("name_b") or "")
+
+    raw_sfp = item.get("structural_fingerprint") or item.get("sfp")
+    if not ha and not hb and raw_sfp:
+        p_fa, p_ha, p_fb, p_hb = _parse_structural_fingerprint(str(raw_sfp))
+        if not fa and not fb:
+            fa, fb = p_fa, p_fb
+        if fa == p_fb and fb == p_fa:
+            ha, hb = p_hb, p_ha
+        else:
+            ha, hb = p_ha, p_hb
+
+    return fa, na, ha, fb, nb, hb
+
+
+def _get_rec_repo_data(
+    rec: Dict[str, Any], base_offset: Optional[str]
+) -> Tuple[str, str, str, str, str, List[str]]:
+    """Derives canonical repository-relative path and fingerprint representation for a baseline record."""
+    r_fa, r_na, r_ha, r_fb, r_nb, r_hb = _extract_record_endpoint_data(rec)
+    r_repo_fa = _canonicalize_endpoint_path(r_fa, base_offset)
+    r_repo_fb = _canonicalize_endpoint_path(r_fb, base_offset)
+
+    r_repo_fp = _format_paired_endpoints(f"{r_repo_fa}:{r_na}", f"{r_repo_fb}:{r_nb}")
+    r_repo_sfp = _format_paired_endpoints(f"{r_repo_fa}#{r_ha}", f"{r_repo_fb}#{r_hb}")
+    r_repo_ns_a = extract_unit_namespace(r_repo_fa)
+    r_repo_ns_b = extract_unit_namespace(r_repo_fb)
+    r_repo_ns_sfp = _format_paired_endpoints(f"{r_repo_ns_a}#{r_ha}", f"{r_repo_ns_b}#{r_hb}")
+    r_repo_namespaces = sorted([r_repo_ns_a, r_repo_ns_b])
+    return r_repo_fa, r_repo_fb, r_repo_fp, r_repo_sfp, r_repo_ns_sfp, r_repo_namespaces
+
+
 def _record_matches_names(rec: Dict[str, Any], target_names: List[str]) -> bool:
     """Checks if a baseline record's paired symbol names match target clone names."""
     rec_names = sorted([str(rec.get("name_a") or ""), str(rec.get("name_b") or "")])
@@ -754,20 +877,38 @@ def _match_clone_record(
     c_keys: Dict[str, Any],
     unconsumed: List[Dict[str, Any]],
     resolver: Optional[CanonicalPathResolver] = None,
+    base_offset: Optional[str] = None,
+    scan_offset: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Finds matching unconsumed baseline record prioritizing exact and namespaced fingerprints."""
-    c_fp = c_keys["fp"]
-    c_sfp = c_keys["sfp"]
-    c_ns_sfp = c_keys["ns_sfp"]
-    c_pure_sfp = c_keys["pure_sfp"]
-    c_namespaces = c_keys["namespaces"]
-    c_names = c_keys["names"]
+    c_fa, c_na, c_ha, c_fb, c_nb, c_hb = _extract_record_endpoint_data(c_keys)
+    c_repo_fa = _canonicalize_endpoint_path(c_fa, scan_offset)
+    c_repo_fb = _canonicalize_endpoint_path(c_fb, scan_offset)
+
+    if base_offset:
+        rel_a = lexical_relative_to(c_repo_fa, base_offset)
+        rel_b = lexical_relative_to(c_repo_fb, base_offset)
+        if rel_a is None or rel_b is None:
+            return None
+
+    c_names = c_keys.get("names") or sorted([c_na, c_nb])
+    c_repo_fp = _format_paired_endpoints(f"{c_repo_fa}:{c_na}", f"{c_repo_fb}:{c_nb}")
+    c_repo_sfp = _format_paired_endpoints(f"{c_repo_fa}#{c_ha}", f"{c_repo_fb}#{c_hb}")
+    c_repo_ns_a = extract_unit_namespace(c_repo_fa)
+    c_repo_ns_b = extract_unit_namespace(c_repo_fb)
+    c_repo_ns_sfp = _format_paired_endpoints(f"{c_repo_ns_a}#{c_ha}", f"{c_repo_ns_b}#{c_hb}")
+    c_repo_namespaces = sorted([c_repo_ns_a, c_repo_ns_b])
+    c_pure_sfp = c_keys.get("pure_sfp") or _format_paired_endpoints(c_ha, c_hb)
+    c_sfp = c_repo_sfp if scan_offset else (c_keys.get("sfp") or c_repo_sfp)
+    c_ns_sfp = c_repo_ns_sfp if scan_offset else (c_keys.get("ns_sfp") or c_repo_ns_sfp)
+    c_namespaces = c_repo_namespaces if scan_offset else (c_keys.get("namespaces") or c_repo_namespaces)
 
     # Pass 1: exact symbol-path fingerprint (file:name <===> file:name) prioritizing matching structural hash
     cand_pass1: Optional[Dict[str, Any]] = None
     for rec in unconsumed:
-        if rec.get("fingerprint") == c_fp:
-            if rec.get("structural_fingerprint") == c_sfp:
+        _, _, r_repo_fp, r_repo_sfp, _, _ = _get_rec_repo_data(rec, base_offset)
+        if r_repo_fp == c_repo_fp:
+            if c_ha and c_hb and r_repo_sfp == c_repo_sfp:
                 return rec
             if cand_pass1 is None:
                 cand_pass1 = rec
@@ -776,13 +917,21 @@ def _match_clone_record(
 
     # Pass 2: exact path-structural fingerprint (file#hash <===> file#hash) resilient to function renames
     for rec in unconsumed:
-        if rec.get("structural_fingerprint") == c_sfp:
+        r_sfp = rec.get("structural_fingerprint")
+        if base_offset or not r_sfp:
+            _, _, _, r_repo_sfp, _, _ = _get_rec_repo_data(rec, base_offset)
+            r_sfp = r_repo_sfp
+        if r_sfp == c_sfp:
             return rec
 
     # Pass 3: namespaced structural fingerprint (namespace#hash <===> namespace#hash) resilient to file renames within package
     cand_pass3: Optional[Dict[str, Any]] = None
     for rec in unconsumed:
-        if rec.get("namespaced_structural_fingerprint") == c_ns_sfp:
+        r_ns_sfp = rec.get("namespaced_structural_fingerprint")
+        if base_offset or not r_ns_sfp:
+            _, _, _, _, r_repo_ns_sfp, _ = _get_rec_repo_data(rec, base_offset)
+            r_ns_sfp = r_repo_ns_sfp
+        if r_ns_sfp == c_ns_sfp:
             if _record_matches_names(rec, c_names):
                 return rec
             if cand_pass3 is None:
@@ -795,11 +944,13 @@ def _match_clone_record(
     cand_pass4: Optional[Dict[str, Any]] = None
     for rec in unconsumed:
         if rec.get("pure_structural_fingerprint") == c_pure_sfp:
-            rec_ns = sorted([
-                rec.get("namespace_a") or extract_unit_namespace(str(rec.get("file_a") or "")),
-                rec.get("namespace_b") or extract_unit_namespace(str(rec.get("file_b") or "")),
-            ])
-            if rec_ns == c_namespaces:
+            if base_offset:
+                _, _, _, _, _, r_namespaces = _get_rec_repo_data(rec, base_offset)
+            else:
+                r_namespaces = sorted(filter(None, [rec.get("namespace_a"), rec.get("namespace_b")]))
+                if not r_namespaces:
+                    _, _, _, _, _, r_namespaces = _get_rec_repo_data(rec, base_offset)
+            if r_namespaces == c_namespaces:
                 if _record_matches_names(rec, c_names):
                     return rec
                 if cand_pass4 is None:
@@ -813,22 +964,25 @@ def _match_clone_record(
         if rec.get("pure_structural_fingerprint") == c_pure_sfp:
             h_a = str(rec.get("hash_a", ""))
             h_b = str(rec.get("hash_b", ""))
+            if not h_a and not h_b and rec.get("structural_fingerprint"):
+                _, h_a, _, h_b = _parse_structural_fingerprint(str(rec["structural_fingerprint"]))
+            if not h_a and not h_b and rec.get("pure_structural_fingerprint"):
+                parts = str(rec["pure_structural_fingerprint"]).split(" <===> ")
+                if len(parts) == 2:
+                    h_a, h_b = parts[0], parts[1]
             if h_a and h_b and h_a != h_b:
                 if not rec.get("name_a") or _record_matches_names(rec, c_names):
                     return rec
 
     # Pass 6: cross-root boundary-aware matching (e.g. baseline recorded at repo root vs scan targeting subdirectory)
     for rec in unconsumed:
-        r_fa = str(rec.get("file_a") or "")
-        r_fb = str(rec.get("file_b") or "")
+        r_repo_fa, r_repo_fb, _, _, _, _ = _get_rec_repo_data(rec, base_offset)
         r_ha = str(rec.get("hash_a") or "")
         r_hb = str(rec.get("hash_b") or "")
-        c_fa = str(c_keys.get("file_a") or "")
-        c_fb = str(c_keys.get("file_b") or "")
-        c_ha = str(c_keys.get("hash_a") or "")
-        c_hb = str(c_keys.get("hash_b") or "")
+        if not r_ha and not r_hb and rec.get("structural_fingerprint"):
+            _, r_ha, _, r_hb = _parse_structural_fingerprint(str(rec["structural_fingerprint"]))
         if _matches_boundary_and_structural_hashes(
-            r_fa, r_fb, r_ha, r_hb, c_fa, c_fb, c_ha, c_hb, resolver=resolver
+            r_repo_fa, r_repo_fb, r_ha, r_hb, c_repo_fa, c_repo_fb, c_ha, c_hb, resolver=resolver
         ):
             if not rec.get("name_a") or _record_matches_names(rec, c_names):
                 return rec
@@ -840,6 +994,7 @@ def filter_clones_by_baseline(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     baseline_fingerprints: Set[str],
     repo_root: Optional[str] = None,
+    target: Optional[str] = None,
 ) -> Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], int]:
     """Filters out grandfathered clones, returning newly introduced clones and count of suppressed clones."""
     if not baseline_fingerprints:
@@ -847,6 +1002,12 @@ def filter_clones_by_baseline(
 
     base_target = getattr(baseline_fingerprints, "target", None)
     resolver = _build_baseline_path_resolver(repo_root, baseline_target=base_target)
+    base_offset, scan_offset = _derive_target_offsets(
+        base_target,
+        getattr(baseline_fingerprints, "target_repo_relative", None),
+        repo_root,
+        target=target,
+    )
 
     records = getattr(baseline_fingerprints, "records", None)
     if records:
@@ -865,11 +1026,19 @@ def filter_clones_by_baseline(
                 ]),
                 "names": sorted([str(u1.get("name") or ""), str(u2.get("name") or "")]),
                 "file_a": str(u1.get("file") or ""),
+                "name_a": str(u1.get("name") or ""),
                 "file_b": str(u2.get("file") or ""),
+                "name_b": str(u2.get("name") or ""),
                 "hash_a": str(u1.get("structural_hash") or compute_unit_structural_hash(u1)),
                 "hash_b": str(u2.get("structural_hash") or compute_unit_structural_hash(u2)),
             }
-            matched_rec = _match_clone_record(c_keys, unconsumed, resolver=resolver)
+            matched_rec = _match_clone_record(
+                c_keys,
+                unconsumed,
+                resolver=resolver,
+                base_offset=base_offset,
+                scan_offset=scan_offset,
+            )
             if matched_rec is not None:
                 suppressed_count += 1
                 unconsumed.remove(matched_rec)
@@ -932,6 +1101,7 @@ def prune_baseline(
     active_clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     unstaged_modified_ranges: Optional[Dict[str, List[Tuple[int, int]]]] = None,
     repo_root: Optional[str] = None,
+    target: Optional[str] = None,
 ) -> PruneResult:
     """Prunes dead or refactored clone fingerprints from an existing baseline file.
 
@@ -952,6 +1122,12 @@ def prune_baseline(
 
     base_target = _safe_str(data.get("target")) if isinstance(data, dict) else None
     resolver = _build_baseline_path_resolver(repo_root, baseline_target=base_target)
+    base_offset, scan_offset = _derive_target_offsets(
+        base_target,
+        data.get("target_repo_relative"),
+        repo_root,
+        target=target,
+    )
 
     if unstaged_modified_ranges is None:
         try:
@@ -1007,6 +1183,8 @@ def prune_baseline(
         item_pure_sfp = item.get("pure_structural_fingerprint")
         h_a = str(item.get("hash_a", ""))
         h_b = str(item.get("hash_b", ""))
+        if not h_a and not h_b and item_sfp:
+            _, h_a, _, h_b = _parse_structural_fingerprint(str(item_sfp))
 
         if not item_sfp and h_a and h_b:
             f_a = canonical_path_key(str(item.get("file_a") or ""), strip_anchor=False)
@@ -1055,15 +1233,14 @@ def prune_baseline(
                     break
 
         if not is_active:
-            r_fa = str(item.get("file_a") or "")
-            r_fb = str(item.get("file_b") or "")
+            r_repo_fa, r_repo_fb, _, _, _, _ = _get_rec_repo_data(item, base_offset)
             for _sim, u1, u2 in active_clones:
-                u1_f = str(u1.get("file") or "")
-                u2_f = str(u2.get("file") or "")
+                u1_f = _canonicalize_endpoint_path(str(u1.get("file") or ""), scan_offset)
+                u2_f = _canonicalize_endpoint_path(str(u2.get("file") or ""), scan_offset)
                 u1_h = compute_unit_structural_hash(u1)
                 u2_h = compute_unit_structural_hash(u2)
                 if _matches_boundary_and_structural_hashes(
-                    r_fa, r_fb, h_a, h_b, u1_f, u2_f, u1_h, u2_h, resolver=resolver
+                    r_repo_fa, r_repo_fb, h_a, h_b, u1_f, u2_f, u1_h, u2_h, resolver=resolver
                 ):
                     c_names = sorted([str(u1.get("name") or ""), str(u2.get("name") or "")])
                     if not item.get("name_a") or _record_matches_names(item, c_names):
@@ -1126,8 +1303,10 @@ def prune_baseline(
     data["version"] = "1.5.0"
     if "path_basis" not in data or not data["path_basis"]:
         data["path_basis"] = "target_relative"
-    if "target_repo_relative" not in data and resolver is not None and resolver.target_in_repo:
-        data["target_repo_relative"] = resolver.target_in_repo
+    if "target_repo_relative" not in data and base_target is not None:
+        base_res = _build_baseline_path_resolver(base_target)
+        if base_res is not None and base_res.target_in_repo:
+            data["target_repo_relative"] = base_res.target_in_repo
     data["clone_count"] = len(retained)
     data["fingerprints"] = retained
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")

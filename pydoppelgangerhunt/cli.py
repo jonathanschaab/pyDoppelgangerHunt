@@ -439,6 +439,7 @@ def _apply_baseline_and_diff_filters(
     """
     baseline_path = args.baseline or tool_cfg.get("baseline")
 
+    target_val = getattr(args, "target", None)
     if args.prune_baseline:
         if not baseline_path:
             print("[ERROR] --prune-baseline requires a baseline path (specify via --baseline or config)")
@@ -448,7 +449,7 @@ def _apply_baseline_and_diff_filters(
             return clones, 1
         try:
             prune_res = prune_baseline(
-                baseline_path, clones, repo_root=target_repo_root
+                baseline_path, clones, repo_root=target_repo_root, target=target_val
             )
         except TypeError:
             prune_res = prune_baseline(baseline_path, clones)
@@ -473,7 +474,7 @@ def _apply_baseline_and_diff_filters(
         else:
             base_fps = load_baseline(baseline_path)
         clones, suppressed_count = filter_clones_by_baseline(
-            clones, base_fps, repo_root=target_repo_root
+            clones, base_fps, repo_root=target_repo_root, target=target_val
         )
         if args.format == "text":
             print(f"[BASELINE] Suppressed {suppressed_count} grandfathered clone(s). {len(clones)} un-grandfathered clone(s) remaining.")
@@ -775,6 +776,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "idioms": idioms_enabled,
                     "abstract_expressions": args.abstract_expressions,
                     "strip_docstrings": strip_docstrings,
+                    "excludes": excludes,
                 }
                 active_hash = compute_calibration_config_hash(active_cfg)
                 if calib_hash != active_hash:

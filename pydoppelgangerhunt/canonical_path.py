@@ -441,8 +441,8 @@ class CanonicalPathResolver:
 
         # 1. Exact match (without stripping anchors)
         for k in (
-            self.repo_key(unit_file, basis="target", strip_anchor=False),
-            self.target_key(unit_file, basis="target", strip_anchor=False),
+            self.repo_key(unit_file, basis="auto", strip_anchor=False),
+            self.target_key(unit_file, basis="auto", strip_anchor=False),
             self.canonical_key(unit_file, strip_anchor=False),
         ):
             if k and k in diff_keys:
@@ -456,8 +456,8 @@ class CanonicalPathResolver:
                 fragment = raw_str[last_hash + 1:]
                 if fragment.lower().startswith("cell") or ".ipynb#" in raw_str:
                     for k in (
-                        self.repo_key(unit_file, basis="target", strip_anchor=True),
-                        self.target_key(unit_file, basis="target", strip_anchor=True),
+                        self.repo_key(unit_file, basis="auto", strip_anchor=True),
+                        self.target_key(unit_file, basis="auto", strip_anchor=True),
                         self.canonical_key(unit_file, strip_anchor=True),
                     ):
                         if k and k in diff_keys:

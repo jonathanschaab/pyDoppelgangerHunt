@@ -1100,4 +1100,16 @@ def test_normalize_git_paths_and_ranges_excludes_out_of_target_files(tmp_path: P
     assert norm_ranges["pkg/bar.py"] == [(20, 30)]
 
 
+def test_decode_git_cstyle_path_preserves_spaces() -> None:
+    """Verifies that _decode_git_cstyle_path preserves significant leading/trailing whitespace in unquoted paths."""
+    from pydoppelgangerhunt.git_diff import _decode_git_cstyle_path  # pylint: disable=import-outside-toplevel
+
+    assert _decode_git_cstyle_path(" foo.py\n") == " foo.py"
+    assert _decode_git_cstyle_path("bar.py \r\n") == "bar.py "
+    assert _decode_git_cstyle_path("  pkg/baz.py  \n") == "  pkg/baz.py  "
+    assert _decode_git_cstyle_path('" foo.py"\n') == " foo.py"
+    assert _decode_git_cstyle_path("   \n") == ""
+
+
+
 

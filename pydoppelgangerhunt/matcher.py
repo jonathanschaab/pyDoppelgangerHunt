@@ -650,6 +650,7 @@ def _build_calibration_metadata(
     call_sequences: bool,
     audit_tests: bool = False,
     include_notebooks: bool = False,
+    excludes: Optional[Sequence[str]] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Helper to compute baseline corpus calibration dictionary."""
@@ -664,6 +665,7 @@ def _build_calibration_metadata(
         call_sequences=call_sequences,
         audit_tests=audit_tests,
         include_notebooks=include_notebooks,
+        excludes=excludes,
         **kwargs,
     )
 
@@ -678,12 +680,18 @@ def _is_calibration_mode_compatible(
     include_notebooks: bool = False,
     max_index_frequency: Optional[float] = 0.25,
     min_corpus_size: Optional[int] = None,
+    excludes: Optional[Sequence[str]] = None,
     **kwargs: Any,
 ) -> bool:
     """Validates that corpus calibration was generated with compatible representation, filtering, and AST shaping features."""
     if not isinstance(calib, dict):
         return False
     calib_hash = calib.get("config_hash")
+    clean_active_ex = sorted({
+        str(x).replace("\\", "/").rstrip("\r\n").strip()
+        for x in (excludes or [])
+        if str(x).strip()
+    })
     if calib_hash:
         effective_mcs = min_corpus_size if min_corpus_size is not None else calib.get("min_corpus_size")
         active_cfg = dict(kwargs)
@@ -695,6 +703,7 @@ def _is_calibration_mode_compatible(
             "include_notebooks": include_notebooks,
             "max_index_frequency": max_index_frequency,
             "min_corpus_size": effective_mcs,
+            "excludes": clean_active_ex,
         })
         if calib_hash == compute_calibration_config_hash(active_cfg):
             return True
@@ -707,6 +716,19 @@ def _is_calibration_mode_compatible(
     if _safe_bool(calib.get("audit_tests", False)) != bool(audit_tests):
         return False
     if _safe_bool(calib.get("include_notebooks", False)) != bool(include_notebooks):
+        return False
+
+    raw_calib_ex = calib.get("excludes")
+    calib_ex = (
+        sorted({
+            str(x).replace("\\", "/").rstrip("\r\n").strip()
+            for x in raw_calib_ex
+            if str(x).strip()
+        })
+        if isinstance(raw_calib_ex, (list, tuple, set))
+        else []
+    )
+    if calib_ex != clean_active_ex:
         return False
 
     if min_corpus_size is not None:
@@ -836,21 +858,28 @@ def scan_target(
     **kwargs: Any,
 ) -> Union[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Dict[str, Any]]]:
     units: List[Dict[str, Any]] = []
+    try:
+        res_target_dir = Path(target_dir).resolve()
+    except (ValueError, OSError, RuntimeError):
+        res_target_dir = Path(target_dir)
+
+    git_root_resolved = _resolve_git_root_path(res_target_dir)
+
     if repo_root is not None:
-        effective_repo_root = Path(repo_root)
+        try:
+            effective_repo_root = Path(repo_root).resolve()
+        except (ValueError, OSError, RuntimeError):
+            effective_repo_root = Path(repo_root)
+    elif git_root_resolved is not None:
+        effective_repo_root = git_root_resolved
     else:
         try:
-            target_path = Path(target_dir).resolve()
             cwd = Path.cwd().resolve()
             try:
-                target_path.relative_to(cwd)
+                res_target_dir.relative_to(cwd)
                 effective_repo_root = cwd
             except ValueError:
-                git_root_path = _resolve_git_root_path(target_path)
-                if git_root_path is not None:
-                    effective_repo_root = git_root_path
-                else:
-                    effective_repo_root = target_path if target_path.is_dir() else target_path.parent
+                effective_repo_root = res_target_dir if res_target_dir.is_dir() else res_target_dir.parent
         except (ValueError, OSError):
             effective_repo_root = Path.cwd()
     file_list = find_python_files(
@@ -909,17 +938,7 @@ def scan_target(
 
     diff_unit_indices: Optional[Set[int]] = None
     if diff_files is not None:
-        try:
-            res_repo_root = Path(effective_repo_root).resolve()
-        except (ValueError, OSError, RuntimeError):
-            res_repo_root = Path(effective_repo_root)
-        try:
-            res_target_dir = Path(target_dir).resolve()
-        except (ValueError, OSError, RuntimeError):
-            res_target_dir = Path(target_dir)
-
-        git_root_resolved = _resolve_git_root_path(res_target_dir)
-        effective_repo = git_root_resolved or res_repo_root
+        effective_repo = git_root_resolved or effective_repo_root
         resolver = CanonicalPathResolver(target_root=res_target_dir, repo_root=effective_repo)
 
         diff_keys = build_diff_path_keys(diff_files, resolver)
@@ -946,6 +965,7 @@ def scan_target(
                     call_sequences=call_sequences,
                     audit_tests=audit_tests,
                     include_notebooks=include_notebooks,
+                    excludes=excludes,
                     **harvest_mode_opts,
                 )
             return []
@@ -966,6 +986,7 @@ def scan_target(
         include_notebooks=include_notebooks,
         max_index_frequency=max_index_frequency,
         min_corpus_size=min_corpus_size,
+        excludes=excludes,
         **harvest_mode_opts,
     ):
         corpus_calibration = None
@@ -1056,7 +1077,7 @@ def scan_target(
             total_corpus_units = max(len(units), calib_units)
         calib_freqs_raw = corpus_calibration.get("shingle_frequencies")
         calib_freqs_map = (
-            calib_freqs_raw if isinstance(calib_freqs_raw, dict) else None
+            calib_freqs_raw if isinstance(calib_freqs_raw, dict) else {}
         )
         max_posting_len = _compute_max_posting_len(
             total_corpus_units, active_max_freq, effective_min_corpus, fallback=None
@@ -1300,6 +1321,7 @@ def scan_target(
             call_sequences=call_sequences,
             audit_tests=audit_tests,
             include_notebooks=include_notebooks,
+            excludes=excludes,
             **harvest_mode_opts,
         )
         return clones, calib_dict

@@ -46,7 +46,9 @@ def _run_git_command(args: Sequence[str], cwd: Optional[str] = None) -> Optional
 
 def _decode_git_cstyle_path(raw_path: str) -> str:
     """Decodes C-style octal and escape sequences in git quotepath strings while preserving literal UTF-8."""
-    trimmed = raw_path.strip()
+    trimmed = raw_path.rstrip("\r\n")
+    if not trimmed or not trimmed.strip():
+        return ""
     if trimmed.startswith('"') and trimmed.endswith('"') and len(trimmed) >= 2:
         inner = trimmed[1:-1]
         try:

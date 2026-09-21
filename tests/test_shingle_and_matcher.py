@@ -1254,14 +1254,14 @@ def test_uncalibrated_novel_shingle_pair_budget_bounds_explosion(tmp_path: Path)
 
     assert MAX_NOVEL_SHINGLE_PAIR_BUDGET == 10_000
 
-    # Generate a file with 150 functions sharing an uncalibrated novel shingle:
+    # Generate a file with 150 identical functions sharing an uncalibrated novel shingle:
     # 150 * 149 // 2 = 11,175 potential pairs (> 10,000 budget)
     lines: list[str] = []
     for i in range(150):
         lines.append(
             f"def action_handler_burst_{i}(arg_a, arg_b, arg_c):\n"
             "    novel_token_sequence_xyz = arg_a + arg_b + arg_c\n"
-            f"    return novel_token_sequence_xyz * {i}\n"
+            "    return novel_token_sequence_xyz * 42\n"
         )
     test_file = tmp_path / "burst.py"
     test_file.write_text("\n".join(lines), encoding="utf-8")
@@ -1280,11 +1280,49 @@ def test_uncalibrated_novel_shingle_pair_budget_bounds_explosion(tmp_path: Path)
         str(tmp_path),
         diff_files=["burst.py"],
         min_lines=3,
-        threshold=0.95,
+        threshold=0.90,
         corpus_calibration=calib,
     )
-    # The unbounded candidate explosion was prevented
+    # The unbounded candidate explosion was prevented, suppressing pairs for this shingle
     assert isinstance(clones, list)
+    assert len(clones) == 0
+
+    # Malformed calibration (missing shingle_frequencies) also bounds candidates
+    calib_malformed = {
+        "total_units": 5000,
+        "max_index_frequency": 0.25,
+        "min_lines": 3,
+        "min_corpus_size": 4,
+        "global_stop_shingles": set(),
+    }
+    clones_malformed = scan_target(
+        str(tmp_path),
+        diff_files=["burst.py"],
+        min_lines=3,
+        threshold=0.90,
+        corpus_calibration=calib_malformed,
+    )
+    assert len(clones_malformed) == 0
+
+    # When pairs are within budget (40 functions = 780 pairs <= 10,000), clones are detected
+    small_lines: list[str] = []
+    for i in range(40):
+        small_lines.append(
+            f"def action_handler_small_{i}(arg_a, arg_b, arg_c):\n"
+            "    novel_token_sequence_xyz = arg_a + arg_b + arg_c\n"
+            "    return novel_token_sequence_xyz * 42\n"
+        )
+    small_file = tmp_path / "small.py"
+    small_file.write_text("\n".join(small_lines), encoding="utf-8")
+
+    clones_small = scan_target(
+        str(tmp_path),
+        diff_files=["small.py"],
+        min_lines=3,
+        threshold=0.90,
+        corpus_calibration=calib,
+    )
+    assert len(clones_small) > 0
 
 
 def test_unit_drift_computed_when_target_units_drop_to_zero(tmp_path: Path) -> None:

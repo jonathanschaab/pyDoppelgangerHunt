@@ -3659,6 +3659,86 @@ def test_scan_target_full_scan_with_calibration_avoids_double_counting(tmp_path:
     assert len(clones_uncalib) == 28
 
 
+def test_cross_scope_baseline_matching_prevents_false_suppression(tmp_path: Path) -> None:
+    """Verifies that a baseline recorded under a subdirectory does not falsely suppress same-named root files."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        BaselineFingerprints,
+        filter_clones_by_baseline,
+    )
+
+    repo_dir = tmp_path / "repo"
+    src_dir = repo_dir / "src"
+    src_dir.mkdir(parents=True)
+
+    # Baseline recorded under src/ with target_repo_relative="src"
+    base_record = {
+        "fingerprint": "service.py:run <===> worker.py:work",
+        "structural_fingerprint": "service.py#hash_srv <===> worker.py#hash_wrk",
+        "namespaced_structural_fingerprint": ".#hash_srv <===> .#hash_wrk",
+        "pure_structural_fingerprint": "hash_srv <===> hash_wrk",
+        "file_a": "service.py",
+        "name_a": "run",
+        "hash_a": "hash_srv",
+        "file_b": "worker.py",
+        "name_b": "work",
+        "hash_b": "hash_wrk",
+    }
+    base_fps = BaselineFingerprints(
+        fps={base_record["fingerprint"]},
+        records=[base_record],
+        target=str(src_dir),
+        target_repo_relative="src",
+    )
+
+    # Active scan at repo root produces clones at repo root (outside src)
+    u_root_1 = {"file": "service.py", "name": "run", "structural_hash": "hash_srv"}
+    u_root_2 = {"file": "worker.py", "name": "work", "structural_hash": "hash_wrk"}
+    root_clones = [(1.0, u_root_1, u_root_2)]
+
+    remaining, supp = filter_clones_by_baseline(
+        root_clones, base_fps, repo_root=str(repo_dir), target=str(repo_dir)
+    )
+    # The clone outside src must NOT be suppressed
+    assert supp == 0
+    assert len(remaining) == 1
+
+    # But a clone at src/service.py and src/worker.py in the root scan MUST be suppressed
+    u_in_src_1 = {"file": "src/service.py", "name": "run", "structural_hash": "hash_srv"}
+    u_in_src_2 = {"file": "src/worker.py", "name": "work", "structural_hash": "hash_wrk"}
+    src_clones = [(1.0, u_in_src_1, u_in_src_2)]
+
+    remaining_src, supp_src = filter_clones_by_baseline(
+        src_clones, base_fps, repo_root=str(repo_dir), target=str(repo_dir)
+    )
+    assert supp_src == 1
+    assert len(remaining_src) == 0
+
+
+def test_calibration_compatibility_with_excludes() -> None:
+    """Verifies that excludes are preserved and compared during calibration compatibility checks."""
+    from pydoppelgangerhunt.baseline import compute_corpus_calibration  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.matcher import _is_calibration_mode_compatible  # pylint: disable=import-outside-toplevel
+
+    unit = {
+        "file": "foo.py",
+        "name": "bar",
+        "shingles": ["sh1", "sh2"],
+        "tokens": ["def", "bar"],
+    }
+    calib = compute_corpus_calibration([unit], excludes=["vendor", "tests"])
+    assert calib.get("excludes") == ["tests", "vendor"]
+
+    # Compatible when active excludes match
+    assert _is_calibration_mode_compatible(calib, excludes=["vendor", "tests"])
+    assert _is_calibration_mode_compatible(calib, excludes=["tests", "vendor"])
+
+    # Incompatible when active excludes differ or are empty
+    assert not _is_calibration_mode_compatible(calib, excludes=None)
+    assert not _is_calibration_mode_compatible(calib, excludes=["vendor"])
+    assert not _is_calibration_mode_compatible(calib, excludes=["other"])
+
+
+
 
 
 
