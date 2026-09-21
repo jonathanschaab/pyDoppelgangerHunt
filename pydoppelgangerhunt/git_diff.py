@@ -195,8 +195,8 @@ def get_git_repo_root(
     raw = _run_git_command(["rev-parse", "--show-toplevel"], cwd=target_cwd)
     if not raw:
         return None
-    top = raw.strip()
-    if top:
+    top = raw.rstrip("\r\n")
+    if top and top.strip():
         return normalize_path_string(top, strip_anchor=False)
     return None
 

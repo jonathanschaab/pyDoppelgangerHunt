@@ -1024,6 +1024,14 @@ def test_get_git_repo_root_security_and_edge_cases(tmp_path: Path, monkeypatch: 
     )
     assert get_git_repo_root(repo_root=tmp_path) == hash_repo
 
+    # 6. Repository path containing significant trailing/leading space is preserved
+    spaced_repo = "/tmp/repo "
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: spaced_repo + "\r\n" if args == ["rev-parse", "--show-toplevel"] else None,
+    )
+    assert get_git_repo_root(repo_root=tmp_path) == spaced_repo
+
 
 
 def test_diff_unit_matching_subprocess_efficiency(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1060,5 +1068,36 @@ def test_diff_unit_matching_subprocess_efficiency(tmp_path: Path, monkeypatch: p
 
     # Crucial assertion: get_git_repo_root must not be invoked per unit
     assert git_call_count <= 2
+
+
+def test_normalize_git_paths_and_ranges_excludes_out_of_target_files(tmp_path: Path) -> None:
+    """Verifies that git paths and modified ranges outside target directory are excluded."""
+    from pydoppelgangerhunt.cli import (  # pylint: disable=import-outside-toplevel
+        _normalize_git_paths_for_target,
+        _normalize_modified_ranges_for_target,
+    )
+
+    repo_dir = tmp_path / "repo"
+    target_dir = repo_dir / "pkg"
+    target_dir.mkdir(parents=True)
+
+    raw_paths = ["foo.py", "pkg/bar.py", "other/baz.py"]
+    norm_paths = _normalize_git_paths_for_target(raw_paths, str(repo_dir), str(target_dir))
+    assert "foo.py" not in norm_paths
+    assert "other/baz.py" not in norm_paths
+    assert "bar.py" in norm_paths
+    assert "pkg/bar.py" in norm_paths
+
+    ranges = {
+        "foo.py": [(1, 10)],
+        "pkg/bar.py": [(20, 30)],
+        "other/baz.py": [(5, 15)],
+    }
+    norm_ranges = _normalize_modified_ranges_for_target(ranges, str(repo_dir), str(target_dir))
+    assert "foo.py" not in norm_ranges
+    assert "other/baz.py" not in norm_ranges
+    assert norm_ranges["bar.py"] == [(20, 30)]
+    assert norm_ranges["pkg/bar.py"] == [(20, 30)]
+
 
 

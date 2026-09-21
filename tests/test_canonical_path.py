@@ -269,3 +269,18 @@ def test_build_diff_path_keys_preserves_literal_hashes() -> None:
     assert not resolver.matches_diff("pkg", diff_keys)
 
 
+def test_build_diff_path_keys_repo_relative_does_not_leak_target_key() -> None:
+    """Verifies that repo-relative diff files outside target directory do not emit target keys."""
+    resolver = CanonicalPathResolver(target_root="/repo/pkg", repo_root="/repo")
+    diff_files = ["foo.py"]
+    diff_keys = build_diff_path_keys(diff_files, resolver)
+
+    # "foo.py" is at repo root; it should NOT match a unit in pkg/foo.py (which has target_key "foo.py")
+    assert not resolver.matches_diff("foo.py", diff_keys)
+
+    # However, if pkg/foo.py was changed in repo diff, it matches
+    pkg_diff_keys = build_diff_path_keys(["pkg/foo.py"], resolver)
+    assert resolver.matches_diff("foo.py", pkg_diff_keys)
+
+
+

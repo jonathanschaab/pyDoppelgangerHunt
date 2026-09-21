@@ -391,11 +391,12 @@ def _normalize_git_paths_for_target(
     for p_str in raw_paths:
         if not p_str:
             continue
-        if p_str not in normalized:
-            normalized.append(p_str)
         rel = _resolve_target_relative_path(p_str, res_git, res_target)
-        if rel and rel not in normalized:
-            normalized.append(rel)
+        if rel and rel != ".":
+            if rel not in normalized:
+                normalized.append(rel)
+            if p_str not in normalized:
+                normalized.append(p_str)
     return normalized
 
 
@@ -413,14 +414,15 @@ def _normalize_modified_ranges_for_target(
     if res_git == res_target:
         return modified_ranges
 
-    expanded = dict(modified_ranges)
+    target_ranges: Dict[str, List[Tuple[int, int]]] = {}
     for p_str, ranges in modified_ranges.items():
         if not p_str:
             continue
         rel = _resolve_target_relative_path(p_str, res_git, res_target)
         if rel and rel != ".":
-            expanded[rel] = ranges
-    return expanded
+            target_ranges[rel] = ranges
+            target_ranges[p_str] = ranges
+    return target_ranges
 
 
 def _apply_baseline_and_diff_filters(

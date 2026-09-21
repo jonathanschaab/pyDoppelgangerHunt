@@ -3609,6 +3609,57 @@ def test_prune_baseline_legacy_upgrade_adds_path_basis(tmp_path: Path) -> None:
     assert loaded.path_basis == "target_relative"
 
 
+def test_scan_target_full_scan_with_calibration_avoids_double_counting(tmp_path: Path) -> None:
+    """Verifies that full scan with corpus_calibration does not double-count corpus units or frequencies."""
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    shared_code = (
+        "def common_worker(x):\n"
+        "    a = x + 1\n"
+        "    b = a + 2\n"
+        "    c = b + 3\n"
+        "    d = c + 4\n"
+        "    e = d + 5\n"
+        "    f = e + 6\n"
+        "    g = f + 7\n"
+        "    return g\n"
+    )
+    for i in range(8):
+        (tmp_path / f"shared_{i}.py").write_text(shared_code, encoding="utf-8")
+    for i in range(22):
+        unique_code = (
+            f"def unique_{i}():\n"
+            f"    alpha_{i} = 'hello'\n"
+            f"    beta_{i} = 'world'\n"
+            f"    gamma_{i} = 'foo'\n"
+            f"    delta_{i} = 'bar'\n"
+            f"    epsilon_{i} = 'baz'\n"
+            f"    zeta_{i} = 'qux'\n"
+            f"    eta_{i} = 'test'\n"
+            f"    return alpha_{i} + beta_{i} + gamma_{i} + delta_{i} + epsilon_{i} + zeta_{i} + eta_{i}\n"
+        )
+        (tmp_path / f"unique_{i}.py").write_text(unique_code, encoding="utf-8")
+
+    _, calib = scan_target(str(tmp_path), max_index_frequency=0.28, return_calibration=True)
+    assert calib["total_units"] == 30
+
+    clones_full = scan_target(
+        str(tmp_path),
+        max_index_frequency=0.28,
+        corpus_calibration=calib,
+        diff_files=None,
+    )
+    clones_uncalib = scan_target(
+        str(tmp_path),
+        max_index_frequency=0.28,
+        corpus_calibration=None,
+        diff_files=None,
+    )
+    assert len(clones_full) == 28
+    assert len(clones_uncalib) == 28
+
+
+
 
 
 

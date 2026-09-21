@@ -489,13 +489,14 @@ def build_diff_path_keys(
         if not d:
             continue
         # Git diff outputs paths relative to repo root; preserve literal # and spaces
-        r_key = resolver.repo_key(d, basis="repo", strip_anchor=False)
+        cp = resolver.resolve(d, basis="repo", strip_anchor=False)
+        if resolver.target_in_repo is not None and cp.target_relative is None:
+            continue
+        r_key = resolver.repo_key(cp, strip_anchor=False)
         if r_key:
             keys.add(r_key)
-        t_key = resolver.target_key(d, basis="repo", strip_anchor=False)
-        if t_key:
-            keys.add(t_key)
-        c_key = resolver.canonical_key(d, strip_anchor=False)
-        if c_key:
-            keys.add(c_key)
+        if cp.target_relative is not None:
+            t_key = resolver.target_key(cp, strip_anchor=False)
+            if t_key:
+                keys.add(t_key)
     return keys

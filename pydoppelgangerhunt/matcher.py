@@ -990,17 +990,18 @@ def scan_target(
     calib_freqs: Dict[Any, Any] = {}
     if tfidf and units:
         if corpus_calibration is not None:
-            local_units_count = len(diff_unit_indices) if diff_unit_indices is not None else len(units)
             calib_units_tfidf = _safe_total_units(corpus_calibration.get("total_units"))
-            corpus_size = local_units_count + calib_units_tfidf
-            active_indices: Union[Set[int], range] = (
-                diff_unit_indices
-                if diff_unit_indices is not None
-                else range(len(units))
-            )
+            if diff_unit_indices is not None:
+                local_units_count = len(diff_unit_indices)
+                corpus_size = local_units_count + calib_units_tfidf
+                active_indices: Union[Set[int], range] = diff_unit_indices
+            else:
+                corpus_size = max(len(units), calib_units_tfidf)
+                active_indices = range(len(units))
         else:
             corpus_size = len(units)
             active_indices = range(len(units))
+            calib_units_tfidf = 0
 
         for idx in active_indices:
             u = units[idx]
@@ -1048,8 +1049,11 @@ def scan_target(
     active_max_freq = _safe_index_frequency(max_index_frequency)
     if corpus_calibration is not None:
         calib_units = _safe_total_units(corpus_calibration.get("total_units"))
-        local_units_count = len(diff_unit_indices) if diff_unit_indices is not None else len(units)
-        total_corpus_units = local_units_count + calib_units
+        if diff_unit_indices is not None:
+            local_units_count = len(diff_unit_indices)
+            total_corpus_units = local_units_count + calib_units
+        else:
+            total_corpus_units = max(len(units), calib_units)
         calib_freqs_raw = corpus_calibration.get("shingle_frequencies")
         calib_freqs_map = (
             calib_freqs_raw if isinstance(calib_freqs_raw, dict) else None
@@ -1097,7 +1101,10 @@ def scan_target(
                     df_global = 0
             else:
                 df_global = 0
-            combined_df = df_global + df_local
+            if diff_unit_indices is not None:
+                combined_df = df_global + df_local
+            else:
+                combined_df = max(df_local, df_global)
         else:
             combined_df = len(u_indices)
 
@@ -1132,16 +1139,19 @@ def scan_target(
 
         for k in keys_to_weight:
             df = df_counts.get(k, 0)
-            calib_df = _lookup_calib_freq(calib_freqs, k)
-            try:
-                parsed_calib = int(calib_df or 0)
-                if calib_units_tfidf > 0 and parsed_calib > 0:
-                    valid_calib_df = min(calib_units_tfidf, parsed_calib)
-                else:
+            if calib_units_tfidf > 0 and calib_freqs:
+                calib_df = _lookup_calib_freq(calib_freqs, k)
+                try:
+                    parsed_calib = int(calib_df or 0)
+                    valid_calib_df = min(calib_units_tfidf, parsed_calib) if parsed_calib > 0 else 0
+                except (ValueError, TypeError, OverflowError):
                     valid_calib_df = 0
-            except (ValueError, TypeError, OverflowError):
+            else:
                 valid_calib_df = 0
-            combined_df = df + valid_calib_df
+            if diff_unit_indices is not None:
+                combined_df = df + valid_calib_df
+            else:
+                combined_df = max(df, valid_calib_df)
             try:
                 weight = math.log((1.0 + corpus_size) / (1.0 + combined_df)) + 1.0
                 idf_weights[k] = max(0.0, weight)
