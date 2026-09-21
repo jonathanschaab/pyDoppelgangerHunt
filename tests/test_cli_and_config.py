@@ -1652,6 +1652,61 @@ def test_cli_warns_on_calibration_unit_drift(
     assert "Warning: Calibration drift detected: repository units drifted by" in out
 
 
+def test_cli_inherits_baseline_min_corpus_size_without_mismatch_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that running --baseline without --min-corpus-units inherits min_corpus_size without spurious warnings."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo_inherit_mcs"
+    repo.mkdir()
+    code = (
+        "def compute_delta(x, y):\n"
+        "    diff = x - y\n"
+        "    return diff * 2 if diff > 0 else 0\n"
+    )
+    (repo / "f1.py").write_text(code, encoding="utf-8")
+    baseline_file = tmp_path / "baseline_mcs.json"
+
+    # 1. Record baseline with --min-corpus-units 50
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--record-baseline",
+            str(baseline_file),
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.90",
+            "--min-corpus-units",
+            "50",
+        ],
+    )
+    assert main() == 0
+    capsys.readouterr()
+
+    # 2. Run scan without --min-corpus-units (should inherit from baseline cleanly without config mismatch warning)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(baseline_file),
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.90",
+        ],
+    )
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "Warning: Active scan configuration does not match baseline calibration config" not in out
+
+
+
 
 
 

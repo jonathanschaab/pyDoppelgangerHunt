@@ -679,13 +679,14 @@ def _is_calibration_mode_compatible(
         return False
     calib_hash = calib.get("config_hash")
     if calib_hash:
+        effective_mcs = min_corpus_size if min_corpus_size is not None else calib.get("min_corpus_size")
         active_cfg = dict(kwargs)
         active_cfg.update({
             "bag_of_tokens": bag_of_tokens,
             "call_sequences": call_sequences,
             "filter_stop_shingles": filter_stop_shingles,
             "max_index_frequency": max_index_frequency,
-            "min_corpus_size": min_corpus_size,
+            "min_corpus_size": effective_mcs,
         })
         if calib_hash == compute_calibration_config_hash(active_cfg):
             return True
@@ -954,7 +955,7 @@ def scan_target(
         corpus_calibration = None
     if corpus_calibration is not None:
         calib_total = _safe_total_units(corpus_calibration.get("total_units"))
-        if calib_total > 0 and units:
+        if calib_total > 0:
             corpus_calibration["current_units"] = len(units)
             corpus_calibration["unit_drift"] = round(abs(len(units) - calib_total) / calib_total, 4)
         calib_stops = corpus_calibration.get("global_stop_shingles")
@@ -1089,9 +1090,7 @@ def scan_target(
 
         if diff_unit_indices is not None and calib_freqs_map is not None and not is_global_shingle:
             df_unmodified = len(u_indices) - df_local
-            if df_unmodified > 0 and effective_max_posting is not None and (
-                df_unmodified > effective_max_posting or len(u_indices) > effective_max_posting
-            ):
+            if effective_max_posting is not None and df_unmodified > effective_max_posting:
                 continue
             potential_pairs = (df_local * (df_local - 1)) // 2 + df_local * df_unmodified
             if potential_pairs > MAX_NOVEL_SHINGLE_PAIR_BUDGET:

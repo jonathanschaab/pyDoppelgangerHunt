@@ -741,12 +741,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if calib_dict and isinstance(calib_dict, dict) and args.format == "text":
             calib_hash = calib_dict.get("config_hash") or getattr(preloaded_baseline, "config_hash", None)
             if calib_hash:
+                effective_mcs = min_corpus_size if min_corpus_size is not None else calib_dict.get("min_corpus_size")
                 active_cfg: Dict[str, Any] = {
                     "bag_of_tokens": args.bag_of_tokens,
                     "call_sequences": call_seq_enabled,
                     "filter_stop_shingles": stop_shingles_enabled,
                     "max_index_frequency": max_index_frequency,
-                    "min_corpus_size": min_corpus_size,
+                    "min_corpus_size": effective_mcs,
                     "min_lines": min_lines,
                     "min_tokens": min_tokens,
                     "functions_only": args.functions_only,

@@ -105,16 +105,15 @@ def _extract_calibration_settings(source: Dict[str, Any]) -> Dict[str, Any]:
             settings[int_flag] = val if val > 0 else default_int
         except (ValueError, TypeError, OverflowError):
             settings[int_flag] = default_int
-    if "min_corpus_size" in source:
-        raw_mcs = source.get("min_corpus_size")
-        if raw_mcs is None:
+    raw_mcs = source.get("min_corpus_size") if isinstance(source, dict) else None
+    if raw_mcs is None:
+        settings["min_corpus_size"] = None
+    else:
+        try:
+            val = int(raw_mcs)
+            settings["min_corpus_size"] = val if val >= 0 else None
+        except (ValueError, TypeError, OverflowError):
             settings["min_corpus_size"] = None
-        else:
-            try:
-                val = int(raw_mcs)
-                settings["min_corpus_size"] = val if val >= 0 else None
-            except (ValueError, TypeError, OverflowError):
-                settings["min_corpus_size"] = None
     return settings
 
 

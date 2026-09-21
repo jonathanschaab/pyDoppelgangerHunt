@@ -1286,3 +1286,24 @@ def test_uncalibrated_novel_shingle_pair_budget_bounds_explosion(tmp_path: Path)
     # The unbounded candidate explosion was prevented
     assert isinstance(clones, list)
 
+
+def test_unit_drift_computed_when_target_units_drop_to_zero(tmp_path: Path) -> None:
+    """Verifies that unit_drift is computed as 1.0 (100% drift) when active target units drop to 0."""
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    empty_dir = tmp_path / "empty_dir"
+    empty_dir.mkdir()
+
+    calib = {
+        "total_units": 50,
+        "max_index_frequency": 0.25,
+        "min_lines": 8,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {},
+    }
+
+    scan_target(str(empty_dir), corpus_calibration=calib)
+    assert calib.get("current_units") == 0
+    assert calib.get("unit_drift") == 1.0
+
+

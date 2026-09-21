@@ -3430,6 +3430,10 @@ def test_calibration_config_hash_determinism_and_sensitivity() -> None:
     cfg_none["max_index_frequency"] = None
     assert compute_calibration_config_hash(cfg_none) != hash1
 
+    # Invariant to absent vs explicit None min_corpus_size
+    assert compute_calibration_config_hash({}) == compute_calibration_config_hash({"min_corpus_size": None})
+    assert compute_calibration_config_hash({"min_corpus_size": 100}) != compute_calibration_config_hash({"min_corpus_size": None})
+
 
 def test_baseline_config_hash_and_recorded_commit_roundtrip(tmp_path: Path) -> None:
     """Verifies that record_baseline and load_baseline preserve config_hash and recorded_commit."""
