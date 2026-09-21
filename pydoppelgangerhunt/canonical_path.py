@@ -404,21 +404,22 @@ class CanonicalPathResolver:
         self,
         unit_file: Optional[Union[str, Path, CanonicalPath]],
         diff_keys: Set[str],
+        strip_anchor: bool = True,
     ) -> bool:
         """Checks if a unit file path matches any diff key without ambiguous suffix matching."""
         if not unit_file or not diff_keys:
             return False
 
         # Unit file from scanner is target-relative
-        r_key = self.repo_key(unit_file, basis="target")
+        r_key = self.repo_key(unit_file, basis="target", strip_anchor=strip_anchor)
         if r_key and r_key in diff_keys:
             return True
 
-        t_key = self.target_key(unit_file, basis="target")
+        t_key = self.target_key(unit_file, basis="target", strip_anchor=strip_anchor)
         if t_key and t_key in diff_keys:
             return True
 
-        c_key = self.canonical_key(unit_file)
+        c_key = self.canonical_key(unit_file, strip_anchor=strip_anchor)
         if c_key in diff_keys:
             return True
 

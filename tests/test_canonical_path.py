@@ -223,3 +223,16 @@ def test_canonical_path_security_and_cache_isolation() -> None:
     assert lexical_relative_to("/repo/src/pkg/../pkg/mod.py", "/repo/src") == "pkg/mod.py"
     assert lexical_relative_to("C:/repo/src/../../windows/system32", "C:/repo/src") is None
 
+
+def test_matches_diff_notebook_anchor_support() -> None:
+    """Verifies matches_diff correctly matches notebook units with #cell anchors against diff keys."""
+    resolver = CanonicalPathResolver(target_root="packages/subpkg", repo_root=".")
+    diff_files = ["packages/subpkg/analysis.ipynb"]
+    diff_keys = build_diff_path_keys(diff_files, resolver)
+
+    assert resolver.matches_diff("analysis.ipynb#cell_1", diff_keys)
+    assert resolver.matches_diff("analysis.ipynb#cell_99", diff_keys)
+    assert not resolver.matches_diff("other_notebook.ipynb#cell_1", diff_keys)
+    assert not resolver.matches_diff("packages/other_pkg/analysis.ipynb#cell_1", diff_keys)
+
+
