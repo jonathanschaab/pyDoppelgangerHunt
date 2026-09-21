@@ -431,6 +431,7 @@ def _apply_baseline_and_diff_filters(
     tool_cfg: Dict[str, Any],
     target_repo_root: str,
     preloaded_baseline: Optional[BaselineFingerprints] = None,
+    target: Optional[str] = None,
 ) -> Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Optional[int]]:
     """Applies baseline pruning, baseline suppression, and git diff line filtering.
 
@@ -439,7 +440,7 @@ def _apply_baseline_and_diff_filters(
     """
     baseline_path = args.baseline or tool_cfg.get("baseline")
 
-    target_val = getattr(args, "target", None)
+    target_val = target or getattr(args, "target", None) or target_repo_root
     git_root = _safe_call_git_diff_helper(get_git_repo_root, None, target_repo_root)
     git_worktree_root = git_root if git_root and os.path.exists(git_root) else target_repo_root
 
@@ -906,6 +907,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tool_cfg,
         target_repo_root=target_repo_root,
         preloaded_baseline=preloaded_baseline,
+        target=target,
     )
     if early_exit is not None:
         return early_exit

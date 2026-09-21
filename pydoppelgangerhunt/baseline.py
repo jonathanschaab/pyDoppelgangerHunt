@@ -765,6 +765,7 @@ def _derive_target_offsets(
 ) -> Tuple[Optional[str], Optional[str]]:
     """Derives normalized baseline and active scan offsets relative to repo root."""
     effective_repo = repo_root
+    git_root = None
     try:
         cand = target or repo_root or base_target
         if cand:
@@ -773,6 +774,15 @@ def _derive_target_offsets(
                 effective_repo = git_root
     except (ValueError, OSError, RuntimeError, TypeError):
         pass
+
+    if not git_root and base_target is not None and target is not None:
+        t_norm = normalize_lexical_posix(str(target))
+        b_norm = normalize_lexical_posix(str(base_target))
+        if t_norm and b_norm and t_norm != b_norm:
+            if lexical_relative_to(t_norm, b_norm) is not None:
+                effective_repo = base_target
+            elif lexical_relative_to(b_norm, t_norm) is not None:
+                effective_repo = target
 
     base_offset = (
         normalize_lexical_posix(str(base_target_rel)).strip("/")
@@ -866,15 +876,18 @@ def _matches_boundary_and_structural_hashes(
     if not (r_ha and r_hb and c_ha and c_hb):
         return False
     if resolver is not None:
-        if r_ha == c_ha and r_hb == c_hb:
-            return resolver.equivalent(r_fa, c_fa, allow_suffix_fallback=False) and resolver.equivalent(
-                r_fb, c_fb, allow_suffix_fallback=False
-            )
-        if r_ha == c_hb and r_hb == c_ha:
-            return resolver.equivalent(r_fa, c_fb, allow_suffix_fallback=False) and resolver.equivalent(
-                r_fb, c_fa, allow_suffix_fallback=False
-            )
-        return False
+        rk_r_fa = resolver.repo_key(r_fa, basis="repo")
+        rk_r_fb = resolver.repo_key(r_fb, basis="repo")
+        rk_c_fa = resolver.repo_key(c_fa, basis="repo")
+        rk_c_fb = resolver.repo_key(c_fb, basis="repo")
+        if rk_r_fa and rk_r_fb and rk_c_fa and rk_c_fb:
+            if r_ha == c_ha and r_hb == c_hb:
+                if rk_r_fa == rk_c_fa and rk_r_fb == rk_c_fb:
+                    return True
+            if r_ha == c_hb and r_hb == c_ha:
+                if rk_r_fa == rk_c_fb and rk_r_fb == rk_c_fa:
+                    return True
+            return False
 
     if r_ha == c_ha and r_hb == c_hb:
         return paths_match_boundary(r_fa, c_fa) and paths_match_boundary(r_fb, c_fb)
@@ -1197,25 +1210,54 @@ def prune_baseline(
             )
             unstaged_modified_ranges = {}
 
-    active_fps: Set[str] = set()
-    active_sfps: Set[str] = set()
-    active_ns_sfps: Set[str] = set()
+    active_target_fps: Set[str] = set()
+    active_target_sfps: Set[str] = set()
+    active_repo_fps: Set[str] = set()
+    active_repo_sfps: Set[str] = set()
+    active_repo_ns_sfps: Set[str] = set()
     active_pure_sfps: Set[str] = set()
-    sfp_to_clone: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
-    ns_sfp_to_clones: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+    repo_sfp_to_clone: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+    repo_fp_to_clone: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+    repo_ns_sfp_to_clones: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
     pure_sfp_to_clones: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+    scoped_active_clones: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
 
     for _sim, u1, u2 in active_clones:
-        fp = clone_pair_fingerprint(u1, u2)
-        sfp = clone_pair_structural_fingerprint(u1, u2)
-        ns_sfp = namespaced_structural_fingerprint(u1, u2)
-        pure_sfp = pure_structural_fingerprint(u1, u2)
-        active_fps.add(fp)
-        active_sfps.add(sfp)
-        active_ns_sfps.add(ns_sfp)
+        u1_repo = _canonicalize_endpoint_path(
+            str(u1.get("file") or ""), scan_offset, path_basis="target_relative"
+        )
+        u2_repo = _canonicalize_endpoint_path(
+            str(u2.get("file") or ""), scan_offset, path_basis="target_relative"
+        )
+        if base_offset:
+            rel_1 = lexical_relative_to(u1_repo, base_offset)
+            rel_2 = lexical_relative_to(u2_repo, base_offset)
+            if rel_1 is None or rel_2 is None:
+                continue
+
+        scoped_active_clones.append((u1, u2))
+        active_target_fps.add(clone_pair_fingerprint(u1, u2))
+        active_target_sfps.add(clone_pair_structural_fingerprint(u1, u2))
+
+        u1_name = str(u1.get("name") or "")
+        u2_name = str(u2.get("name") or "")
+        u1_hash = str(u1.get("structural_hash") or compute_unit_structural_hash(u1))
+        u2_hash = str(u2.get("structural_hash") or compute_unit_structural_hash(u2))
+        u1_ns = extract_unit_namespace(u1_repo)
+        u2_ns = extract_unit_namespace(u2_repo)
+
+        repo_fp = _format_paired_endpoints(f"{u1_repo}:{u1_name}", f"{u2_repo}:{u2_name}")
+        repo_sfp = _format_paired_endpoints(f"{u1_repo}#{u1_hash}", f"{u2_repo}#{u2_hash}")
+        repo_ns_sfp = _format_paired_endpoints(f"{u1_ns}#{u1_hash}", f"{u2_ns}#{u2_hash}")
+        pure_sfp = _format_paired_endpoints(u1_hash, u2_hash)
+
+        active_repo_fps.add(repo_fp)
+        active_repo_sfps.add(repo_sfp)
+        active_repo_ns_sfps.add(repo_ns_sfp)
         active_pure_sfps.add(pure_sfp)
-        sfp_to_clone[sfp] = (u1, u2)
-        ns_sfp_to_clones.setdefault(ns_sfp, []).append((u1, u2))
+        repo_sfp_to_clone[repo_sfp] = (u1, u2)
+        repo_fp_to_clone[repo_fp] = (u1, u2)
+        repo_ns_sfp_to_clones.setdefault(repo_ns_sfp, []).append((u1, u2))
         pure_sfp_to_clones.setdefault(pure_sfp, []).append((u1, u2))
 
     retained: List[Dict[str, Any]] = []
@@ -1229,66 +1271,69 @@ def prune_baseline(
             item = dict(raw_item)
         else:
             continue
-        item_fp = item.get("fingerprint")
-        item_sfp = item.get("structural_fingerprint")
-        item_ns_sfp = item.get("namespaced_structural_fingerprint")
-        item_pure_sfp = item.get("pure_structural_fingerprint")
         h_a = str(item.get("hash_a", ""))
         h_b = str(item.get("hash_b", ""))
-        if not h_a and not h_b and item_sfp:
-            _, h_a, _, h_b = _parse_structural_fingerprint(str(item_sfp))
+        if not h_a and not h_b and item.get("structural_fingerprint"):
+            _, h_a, _, h_b = _parse_structural_fingerprint(str(item["structural_fingerprint"]))
 
-        if not item_sfp and h_a and h_b:
-            f_a = canonical_path_key(str(item.get("file_a") or ""), strip_anchor=False)
-            f_b = canonical_path_key(str(item.get("file_b") or ""), strip_anchor=False)
-            item_sfp = _format_paired_endpoints(f"{f_a}#{h_a}", f"{f_b}#{h_b}")
-            item["structural_fingerprint"] = item_sfp
+        r_repo_fa, r_repo_fb, r_repo_fp, r_repo_sfp, r_repo_ns_sfp, r_repo_namespaces = (
+            _get_rec_repo_data(item, base_offset, path_basis=base_basis)
+        )
+        if not h_a and not h_b and r_repo_sfp:
+            _, h_a, _, h_b = _parse_structural_fingerprint(str(r_repo_sfp))
 
-        if not item_ns_sfp and h_a and h_b:
-            ns_a = item.get("namespace_a") or extract_unit_namespace(str(item.get("file_a") or ""))
-            ns_b = item.get("namespace_b") or extract_unit_namespace(str(item.get("file_b") or ""))
-            item_ns_sfp = _format_paired_endpoints(f"{ns_a}#{h_a}", f"{ns_b}#{h_b}")
-            item["namespaced_structural_fingerprint"] = item_ns_sfp
-            item["namespace_a"] = ns_a
-            item["namespace_b"] = ns_b
-
+        item_pure_sfp = item.get("pure_structural_fingerprint")
         if not item_pure_sfp and h_a and h_b:
             item_pure_sfp = _format_paired_endpoints(h_a, h_b)
             item["pure_structural_fingerprint"] = item_pure_sfp
 
-        is_active = bool(
-            (item_fp and item_fp in active_fps)
-            or (item_sfp and item_sfp in active_sfps)
-            or (item_ns_sfp and item_ns_sfp in active_ns_sfps)
-        )
-
+        is_active = False
         matched_clone: Optional[Tuple[Dict[str, Any], Dict[str, Any]]] = None
         is_boundary_matched = False
+
+        if r_repo_sfp and r_repo_sfp in active_repo_sfps:
+            is_active = True
+            matched_clone = repo_sfp_to_clone.get(r_repo_sfp)
+        elif r_repo_fp and r_repo_fp in active_repo_fps:
+            is_active = True
+            matched_clone = repo_fp_to_clone.get(r_repo_fp)
+        elif r_repo_ns_sfp and r_repo_ns_sfp in active_repo_ns_sfps:
+            item_names = sorted([str(item.get("name_a") or ""), str(item.get("name_b") or "")])
+            for u1, u2 in repo_ns_sfp_to_clones.get(r_repo_ns_sfp, []):
+                u_names = sorted([str(u1.get("name") or ""), str(u2.get("name") or "")])
+                if not item.get("name_a") or u_names == item_names:
+                    is_active = True
+                    matched_clone = (u1, u2)
+                    break
+            if not is_active and repo_ns_sfp_to_clones.get(r_repo_ns_sfp):
+                is_active = True
+                matched_clone = repo_ns_sfp_to_clones[r_repo_ns_sfp][0]
+
         if not is_active and item_pure_sfp and item_pure_sfp in active_pure_sfps:
-            item_ns = sorted([
-                item.get("namespace_a") or extract_unit_namespace(str(item.get("file_a") or "")),
-                item.get("namespace_b") or extract_unit_namespace(str(item.get("file_b") or "")),
-            ])
+            item_ns = r_repo_namespaces
             item_names = sorted([
                 str(item.get("name_a") or ""),
                 str(item.get("name_b") or ""),
             ])
             for u1, u2 in pure_sfp_to_clones.get(item_pure_sfp, []):
+                u1_repo = _canonicalize_endpoint_path(
+                    str(u1.get("file") or ""), scan_offset, path_basis="target_relative"
+                )
+                u2_repo = _canonicalize_endpoint_path(
+                    str(u2.get("file") or ""), scan_offset, path_basis="target_relative"
+                )
                 u_ns = sorted([
-                    extract_unit_namespace(str(u1.get("file") or "")),
-                    extract_unit_namespace(str(u2.get("file") or "")),
+                    extract_unit_namespace(u1_repo),
+                    extract_unit_namespace(u2_repo),
                 ])
                 u_names = sorted([str(u1.get("name") or ""), str(u2.get("name") or "")])
-                if u_ns == item_ns or (h_a != h_b and u_names == item_names):
+                if u_ns == item_ns or (h_a and h_b and h_a != h_b and u_names == item_names):
                     is_active = True
                     matched_clone = (u1, u2)
                     break
 
         if not is_active:
-            r_repo_fa, r_repo_fb, _, _, _, _ = _get_rec_repo_data(
-                item, base_offset, path_basis=base_basis
-            )
-            for _sim, u1, u2 in active_clones:
+            for u1, u2 in scoped_active_clones:
                 u1_f = _canonicalize_endpoint_path(
                     str(u1.get("file") or ""), scan_offset, path_basis="target_relative"
                 )
@@ -1308,26 +1353,16 @@ def prune_baseline(
                         break
 
         if is_active:
-            if not matched_clone and item_sfp and item_sfp in sfp_to_clone:
-                matched_clone = sfp_to_clone[item_sfp]
-            if not matched_clone and item_ns_sfp and item_ns_sfp in ns_sfp_to_clones:
-                item_names = sorted([
-                    str(item.get("name_a") or ""),
-                    str(item.get("name_b") or ""),
-                ])
-                for u1, u2 in ns_sfp_to_clones[item_ns_sfp]:
-                    u_names = sorted([str(u1.get("name") or ""), str(u2.get("name") or "")])
-                    if u_names == item_names:
-                        matched_clone = (u1, u2)
-                        break
-                if not matched_clone:
-                    matched_clone = ns_sfp_to_clones[item_ns_sfp][0]
-
-            if (
-                matched_clone
+            can_rewrite = (
+                base_offset == scan_offset
                 and not is_boundary_matched
-                and (item_fp not in active_fps or item_sfp not in active_sfps)
-            ):
+                and matched_clone is not None
+                and (
+                    item.get("fingerprint") not in active_target_fps
+                    or item.get("structural_fingerprint") not in active_target_sfps
+                )
+            )
+            if can_rewrite and matched_clone is not None:
                 u1, u2 = matched_clone
                 item["file_a"] = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
                 item["file_b"] = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
@@ -1350,6 +1385,8 @@ def prune_baseline(
                 and (
                     find_matching_path_value(f_a, unstaged_modified_ranges) is not None
                     or find_matching_path_value(f_b, unstaged_modified_ranges) is not None
+                    or find_matching_path_value(r_repo_fa, unstaged_modified_ranges) is not None
+                    or find_matching_path_value(r_repo_fb, unstaged_modified_ranges) is not None
                 )
             )
             if is_dirty:

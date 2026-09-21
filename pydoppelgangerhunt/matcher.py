@@ -604,7 +604,8 @@ def _unit_matches_diff_keys(
         return False
     effective_repo = git_root_resolved or repo_root
     resolver = CanonicalPathResolver(target_root=target_dir, repo_root=effective_repo)
-    return resolver.matches_diff(u_file_raw, diff_keys)
+    unit_basis = "repo" if resolver.target_in_repo else "target"
+    return resolver.matches_diff(u_file_raw, diff_keys, basis=unit_basis)
 
 
 def _add_candidate_pairs(
@@ -943,10 +944,11 @@ def scan_target(
 
         diff_keys = build_diff_path_keys(diff_files, resolver)
         unique_unit_files = {u.get("file") for u in units if u.get("file")}
+        unit_basis = "repo" if resolver.target_in_repo else "target"
         matching_files = {
             f
             for f in unique_unit_files
-            if resolver.matches_diff(f, diff_keys)
+            if resolver.matches_diff(f, diff_keys, basis=unit_basis)
         }
         diff_unit_indices = {
             idx

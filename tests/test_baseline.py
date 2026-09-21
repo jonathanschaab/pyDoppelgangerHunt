@@ -3804,6 +3804,184 @@ def test_same_target_worktree_baseline_suppression(tmp_path: Path) -> None:
     assert len(filtered) == 0
 
 
+def test_matches_boundary_and_structural_hashes_strict_repo_coordinates() -> None:
+    """Verifies that _matches_boundary_and_structural_hashes does not conflate root and subdirectory files."""
+    from pydoppelgangerhunt.baseline import _matches_boundary_and_structural_hashes  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.canonical_path import CanonicalPathResolver  # pylint: disable=import-outside-toplevel
+
+    resolver = CanonicalPathResolver(target_root="/workspace/src", repo_root="/workspace")
+
+    # False: Root file "foo.py" vs Subdirectory file "src/foo.py" even with identical structural hash
+    assert not _matches_boundary_and_structural_hashes(
+        r_fa="foo.py",
+        r_fb="bar.py",
+        r_ha="hash_123",
+        r_hb="hash_456",
+        c_fa="src/foo.py",
+        c_fb="src/bar.py",
+        c_ha="hash_123",
+        c_hb="hash_456",
+        resolver=resolver,
+    )
+
+    # True: Matching repo-relative coordinates
+    assert _matches_boundary_and_structural_hashes(
+        r_fa="src/foo.py",
+        r_fb="src/bar.py",
+        r_ha="hash_123",
+        r_hb="hash_456",
+        c_fa="src/foo.py",
+        c_fb="src/bar.py",
+        c_ha="hash_123",
+        c_hb="hash_456",
+        resolver=resolver,
+    )
+
+    # True: Symmetric endpoints reversed
+    assert _matches_boundary_and_structural_hashes(
+        r_fa="src/foo.py",
+        r_fb="src/bar.py",
+        r_ha="hash_123",
+        r_hb="hash_456",
+        c_fa="src/bar.py",
+        c_fb="src/foo.py",
+        c_ha="hash_456",
+        c_hb="hash_123",
+        resolver=resolver,
+    )
+
+    # True: Identical hashes reversed
+    assert _matches_boundary_and_structural_hashes(
+        r_fa="src/foo.py",
+        r_fb="src/bar.py",
+        r_ha="hash_same",
+        r_hb="hash_same",
+        c_fa="src/bar.py",
+        c_fb="src/foo.py",
+        c_ha="hash_same",
+        c_hb="hash_same",
+        resolver=resolver,
+    )
+
+
+def test_prune_baseline_cross_scope_isolation(tmp_path: Path) -> None:
+    """Verifies prune_baseline isolates scopes and prunes subdirectory items when only root file matches."""
+    repo_dir = tmp_path / "scope_repo"
+    repo_dir.mkdir()
+    src_dir = repo_dir / "src"
+    src_dir.mkdir()
+
+    # Record baseline for src target with worker.py
+    base_file = repo_dir / "baseline.json"
+    u1 = {"file": "worker.py", "name": "worker_func", "structural_hash": "h_same"}
+    u2 = {"file": "worker_clone.py", "name": "worker_func", "structural_hash": "h_same"}
+    clones = [(1.0, u1, u2)]
+
+    pydoppelgangerhunt.record_baseline(
+        clones,
+        str(base_file),
+        str(src_dir),
+        0.80,
+    )
+
+    # Active scan on repo root has worker.py at ROOT (outside src/), with same name & hash
+    root_u1 = {"file": "worker.py", "name": "worker_func", "structural_hash": "h_same"}
+    root_u2 = {"file": "worker_clone.py", "name": "worker_func", "structural_hash": "h_same"}
+    active_root_clones = [(1.0, root_u1, root_u2)]
+
+    # Pruning baseline against root scan should NOT retain the src/ baseline item
+    res = pydoppelgangerhunt.prune_baseline(
+        str(base_file),
+        active_root_clones,
+        repo_root=str(repo_dir),
+        target=str(repo_dir),
+        unstaged_modified_ranges={},
+    )
+    assert res.pruned_count == 1
+    assert res.retained_count == 0
+
+
+def test_prune_baseline_cross_root_preserves_path_coordinates(tmp_path: Path) -> None:
+    """Verifies prune_baseline does not rewrite target-relative paths to repo paths on cross-root prune."""
+    repo_dir = tmp_path / "cross_repo"
+    repo_dir.mkdir()
+    src_dir = repo_dir / "src"
+    src_dir.mkdir()
+
+    base_file = repo_dir / "baseline.json"
+    u1 = {"file": "worker.py", "name": "worker_func", "structural_hash": "h_orig"}
+    u2 = {"file": "worker_clone.py", "name": "worker_func", "structural_hash": "h_orig"}
+    clones = [(1.0, u1, u2)]
+
+    pydoppelgangerhunt.record_baseline(
+        clones,
+        str(base_file),
+        str(src_dir),
+        0.80,
+    )
+
+    # Active scan at repo root matches src/worker.py via boundary match
+    active_u1 = {"file": "src/worker.py", "name": "worker_func", "structural_hash": "h_orig"}
+    active_u2 = {"file": "src/worker_clone.py", "name": "worker_func", "structural_hash": "h_orig"}
+    active_clones = [(1.0, active_u1, active_u2)]
+
+    res = pydoppelgangerhunt.prune_baseline(
+        str(base_file),
+        active_clones,
+        repo_root=str(repo_dir),
+        target=str(repo_dir),
+        unstaged_modified_ranges={},
+    )
+    assert res.retained_count == 1
+    # Check that file_a remains target-relative ("worker.py") and was not rewritten to "src/worker.py"
+    data = json.loads(base_file.read_text(encoding="utf-8"))
+    assert data["fingerprints"][0]["file_a"] == "worker.py"
+
+
+def test_cli_default_target_baseline_suppression(tmp_path: Path) -> None:
+    """Verifies _apply_baseline_and_diff_filters correctly uses target when args.target is None."""
+    import argparse  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.cli import _apply_baseline_and_diff_filters  # pylint: disable=import-outside-toplevel
+
+    repo_dir = tmp_path / "default_repo"
+    repo_dir.mkdir()
+    src_dir = repo_dir / "src"
+    src_dir.mkdir()
+
+    base_file = repo_dir / "baseline.json"
+    u1 = {"file": "a.py", "name": "func", "structural_hash": "h1"}
+    u2 = {"file": "b.py", "name": "func", "structural_hash": "h1"}
+    clones = [(1.0, u1, u2)]
+
+    pydoppelgangerhunt.record_baseline(
+        clones,
+        str(base_file),
+        str(src_dir),
+        0.80,
+    )
+
+    # Simulated args where args.target is None (omitted on CLI)
+    args = argparse.Namespace(
+        target=None,
+        baseline=str(base_file),
+        prune_baseline=False,
+        diff_only=False,
+        since=None,
+        format="text",
+    )
+
+    # When target=str(src_dir) is passed, baseline suppresses the clone
+    filtered, exit_code = _apply_baseline_and_diff_filters(
+        clones,
+        args,
+        tool_cfg={},
+        target_repo_root=str(src_dir),
+        target=str(src_dir),
+    )
+    assert exit_code is None
+    assert len(filtered) == 0
+
+
 
 
 

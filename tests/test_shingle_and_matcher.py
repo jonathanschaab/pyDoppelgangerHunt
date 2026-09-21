@@ -1345,3 +1345,62 @@ def test_unit_drift_computed_when_target_units_drop_to_zero(tmp_path: Path) -> N
     assert calib.get("unit_drift") == 1.0
 
 
+def test_scan_target_diff_files_in_subdirectory(tmp_path: Path) -> None:
+    """Verifies scan_target correctly resolves diff_files when scanning a subdirectory with repo_root."""
+    repo = tmp_path / "diff_repo"
+    repo.mkdir()
+    sub = repo / "sub_pkg"
+    sub.mkdir()
+
+    code1 = (
+        "def worker_alpha(val_a, val_b):\n"
+        "    res = val_a * 10 + val_b\n"
+        "    res_scaled = res * 2\n"
+        "    return res_scaled\n"
+    )
+    code2 = (
+        "def worker_beta(val_a, val_b):\n"
+        "    res = val_a * 10 + val_b\n"
+        "    res_scaled = res * 2\n"
+        "    return res_scaled\n"
+    )
+    (sub / "w1.py").write_text(code1, encoding="utf-8")
+    (sub / "w2.py").write_text(code2, encoding="utf-8")
+
+    # diff_files passed as repo-relative path 'sub_pkg/w1.py'
+    clones = scan_target(
+        str(sub),
+        repo_root=str(repo),
+        diff_files=["sub_pkg/w1.py"],
+        min_lines=3,
+        threshold=0.80,
+    )
+    assert len(clones) >= 1
+
+    # diff_files passed when target is itself the repo root
+    clones2 = scan_target(
+        str(sub),
+        diff_files=["w1.py"],
+        min_lines=3,
+        threshold=0.80,
+    )
+    assert len(clones2) >= 1
+
+
+def test_unit_matches_diff_keys_with_repo_and_target_basis(tmp_path: Path) -> None:
+    """Verifies _unit_matches_diff_keys resolves diff keys correctly for repo-relative units."""
+    from pydoppelgangerhunt.matcher import _unit_matches_diff_keys  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "diff_keys_repo"
+    repo.mkdir()
+    target = repo / "sub_dir"
+    target.mkdir()
+
+    diff_keys = {"sub_dir/mod.py", "mod.py"}
+    assert _unit_matches_diff_keys("sub_dir/mod.py", diff_keys, repo_root=repo, target_dir=target)
+    assert not _unit_matches_diff_keys("other/mod.py", diff_keys, repo_root=repo, target_dir=target)
+    assert not _unit_matches_diff_keys(None, diff_keys, repo_root=repo, target_dir=target)
+    assert not _unit_matches_diff_keys("sub_dir/mod.py", set(), repo_root=repo, target_dir=target)
+
+
+
