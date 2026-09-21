@@ -383,13 +383,9 @@ def record_baseline(
 ) -> str:
     """Records detected clones into a JSON baseline file for grandfathering."""
     target_repo_rel = None
-    try:
-        git_root = git_diff.get_git_repo_root(target)
-        if git_root:
-            res = CanonicalPathResolver(target_root=target, repo_root=git_root)
-            target_repo_rel = res.target_in_repo
-    except (ValueError, OSError, RuntimeError):
-        pass
+    res = _build_baseline_path_resolver(target)
+    if res is not None:
+        target_repo_rel = res.target_in_repo
 
     data: Dict[str, Any] = {
         "version": "1.5.0",
@@ -642,6 +638,20 @@ def _matches_boundary_and_structural_hashes(
     return False
 
 
+def _build_baseline_path_resolver(
+    root: Optional[Union[str, Path]],
+) -> Optional[CanonicalPathResolver]:
+    """Constructs a CanonicalPathResolver against enclosing Git worktree root if available."""
+    if root is None:
+        return None
+    try:
+        git_root = git_diff.get_git_repo_root(repo_root=root)
+        effective_repo = git_root or root
+        return CanonicalPathResolver(target_root=root, repo_root=effective_repo)
+    except (ValueError, OSError, RuntimeError):
+        return None
+
+
 def _match_clone_record(
     c_keys: Dict[str, Any],
     unconsumed: List[Dict[str, Any]],
@@ -737,12 +747,7 @@ def filter_clones_by_baseline(
     if not baseline_fingerprints:
         return clones, 0
 
-    resolver: Optional[CanonicalPathResolver] = None
-    if repo_root is not None:
-        try:
-            resolver = CanonicalPathResolver(target_root=repo_root, repo_root=repo_root)
-        except (ValueError, OSError, RuntimeError):
-            resolver = None
+    resolver = _build_baseline_path_resolver(repo_root)
 
     records = getattr(baseline_fingerprints, "records", None)
     if records:
@@ -846,12 +851,7 @@ def prune_baseline(
     if not isinstance(data, dict) or "fingerprints" not in data:
         return PruneResult(0, 0, 0)
 
-    resolver: Optional[CanonicalPathResolver] = None
-    if repo_root is not None:
-        try:
-            resolver = CanonicalPathResolver(target_root=repo_root, repo_root=repo_root)
-        except (ValueError, OSError, RuntimeError):
-            resolver = None
+    resolver = _build_baseline_path_resolver(repo_root)
 
     if unstaged_modified_ranges is None:
         try:

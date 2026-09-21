@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import sys
-from typing import Dict, Optional, Sequence, Set, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 import unicodedata
 
 
@@ -29,6 +29,11 @@ def normalize_lexical_posix(path_str: Optional[str], strip_anchor: bool = False)
     if path_str is None:
         return ""
     raw = str(path_str).strip()
+    if not raw:
+        return ""
+
+    if "\x00" in raw:
+        raw = raw.replace("\x00", "")
     if not raw:
         return ""
 
@@ -81,12 +86,28 @@ def lexical_relative_to(
 
     prefix = b_compare + "/"
     if p_compare.startswith(prefix):
-        return p_clean[len(prefix):]
+        rel = p_clean[len(prefix):]
+        # Guard against path traversal escapes like base/../../escaped
+        rel_parts = rel.split("/")
+        if ".." in rel_parts or "." in rel_parts:
+            resolved_segments: List[str] = []
+            for seg in rel_parts:
+                if not seg or seg == ".":
+                    continue
+                if seg == "..":
+                    if not resolved_segments:
+                        # Escaped above base directory
+                        return None
+                    resolved_segments.pop()
+                else:
+                    resolved_segments.append(seg)
+            return "/".join(resolved_segments)
+        return rel
 
     return None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class CanonicalPath:
     """Immutable representation of a path across multiple coordinate systems.
 
@@ -109,6 +130,9 @@ class CanonicalPath:
 
     def __str__(self) -> str:
         return self.display_path
+
+
+MAX_RESOLVER_CACHE_ENTRIES: int = 50_000
 
 
 class CanonicalPathResolver:
@@ -161,7 +185,12 @@ class CanonicalPathResolver:
             self.target_lexical, self.repo_lexical, case_fold=self.case_fold
         )
 
-        self._cache: Dict[Tuple[str, str], CanonicalPath] = {}
+        self._cache: Dict[Tuple[str, str, bool], CanonicalPath] = {}
+
+    def _cache_set(self, key: Tuple[str, str, bool], value: CanonicalPath) -> None:
+        if len(self._cache) >= MAX_RESOLVER_CACHE_ENTRIES:
+            self._cache.clear()
+        self._cache[key] = value
 
     def resolve(
         self,
@@ -186,7 +215,7 @@ class CanonicalPathResolver:
             return path
 
         raw_str = str(path).strip()
-        cache_key = (raw_str, basis)
+        cache_key = (raw_str, basis, bool(strip_anchor))
         cached = self._cache.get(cache_key)
         if cached is not None:
             return cached
@@ -194,11 +223,15 @@ class CanonicalPathResolver:
         norm = normalize_lexical_posix(raw_str, strip_anchor=strip_anchor)
         if not norm:
             res = CanonicalPath(raw=raw_str, repo_relative="", target_relative="", absolute_lexical="")
-            self._cache[cache_key] = res
+            self._cache_set(cache_key, res)
             return res
 
         p = Path(norm)
-        is_abs = p.is_absolute() or (len(norm) >= 2 and norm[1] == ":")
+        is_abs = (
+            p.is_absolute()
+            or norm.startswith("/")
+            or (len(norm) >= 3 and norm[1] == ":" and norm[2] == "/")
+        )
 
         if is_abs:
             abs_lex = norm
@@ -210,7 +243,7 @@ class CanonicalPathResolver:
                 target_relative=rel_target,
                 absolute_lexical=abs_lex,
             )
-            self._cache[cache_key] = res
+            self._cache_set(cache_key, res)
             return res
 
         # Handle relative path
@@ -235,23 +268,28 @@ class CanonicalPathResolver:
             abs_lex = f"{self.target_lexical}/{norm}".rstrip("/")
         else:
             # "auto" basis
-            if self.target_in_repo and (
-                norm == self.target_in_repo
-                or norm.startswith(self.target_in_repo + "/")
-            ):
-                # Path includes target_in_repo prefix; treat as repo-relative
-                repo_rel = norm
-                target_rel = lexical_relative_to(
-                    norm, self.target_in_repo, case_fold=self.case_fold
-                )
-                abs_lex = f"{self.repo_lexical}/{norm}".rstrip("/")
-            else:
-                # Default relative path from scanner/units is target-relative
-                target_rel = norm
-                if self.target_in_repo is not None:
-                    repo_rel = f"{self.target_in_repo}/{norm}" if self.target_in_repo else norm
+            target_in_repo = self.target_in_repo
+            if target_in_repo is not None:
+                norm_cmp = norm.lower() if self.case_fold else norm
+                target_in_repo_cmp = target_in_repo.lower() if self.case_fold else target_in_repo
+                if target_in_repo_cmp and (
+                    norm_cmp == target_in_repo_cmp
+                    or norm_cmp.startswith(target_in_repo_cmp + "/")
+                ):
+                    # Path includes target_in_repo prefix; treat as repo-relative
+                    repo_rel = norm
+                    target_rel = lexical_relative_to(
+                        norm, target_in_repo, case_fold=self.case_fold
+                    )
+                    abs_lex = f"{self.repo_lexical}/{norm}".rstrip("/")
                 else:
-                    repo_rel = None
+                    # Default relative path from scanner/units is target-relative
+                    target_rel = norm
+                    repo_rel = f"{target_in_repo}/{norm}" if target_in_repo else norm
+                    abs_lex = f"{self.target_lexical}/{norm}".rstrip("/")
+            else:
+                target_rel = norm
+                repo_rel = None
                 abs_lex = f"{self.target_lexical}/{norm}".rstrip("/")
 
         res = CanonicalPath(
@@ -260,7 +298,7 @@ class CanonicalPathResolver:
             target_relative=target_rel,
             absolute_lexical=abs_lex,
         )
-        self._cache[cache_key] = res
+        self._cache_set(cache_key, res)
         return res
 
     def _coordinate_key(
@@ -320,6 +358,9 @@ class CanonicalPathResolver:
         4. physical resolution (if both files exist on disk)
         5. optional boundary suffix matching (for legacy unanchored baseline strings)
         """
+        if not str(path_a or "").strip() or not str(path_b or "").strip():
+            return False
+
         ca = self.resolve(path_a)
         cb = self.resolve(path_b)
 

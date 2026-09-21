@@ -203,3 +203,23 @@ def test_baseline_cross_root_equivalence_matching(tmp_path: Path) -> None:
     )
     assert suppressed_count == 1
     assert len(unsuppressed) == 0
+
+
+def test_canonical_path_security_and_cache_isolation() -> None:
+    """Verifies null byte sanitization, cache isolation across strip_anchor, and traversal guards."""
+    # 1. Null byte sanitization
+    assert normalize_lexical_posix("foo\x00bar.py") == "foobar.py"
+    assert normalize_lexical_posix("\x00") == ""
+
+    # 2. Cache isolation across strip_anchor
+    resolver = CanonicalPathResolver(target_root=".")
+    p1 = resolver.resolve("script.ipynb#cell_1", strip_anchor=False)
+    assert p1.target_relative == "script.ipynb#cell_1"
+    p2 = resolver.resolve("script.ipynb#cell_1", strip_anchor=True)
+    assert p2.target_relative == "script.ipynb"
+
+    # 3. Path traversal escape guard in lexical_relative_to
+    assert lexical_relative_to("/repo/src/../../etc/passwd", "/repo/src") is None
+    assert lexical_relative_to("/repo/src/pkg/../pkg/mod.py", "/repo/src") == "pkg/mod.py"
+    assert lexical_relative_to("C:/repo/src/../../windows/system32", "C:/repo/src") is None
+

@@ -468,7 +468,9 @@ def _apply_baseline_and_diff_filters(
             base_fps = preloaded_baseline
         else:
             base_fps = load_baseline(baseline_path)
-        clones, suppressed_count = filter_clones_by_baseline(clones, base_fps)
+        clones, suppressed_count = filter_clones_by_baseline(
+            clones, base_fps, repo_root=target_repo_root
+        )
         if args.format == "text":
             print(f"[BASELINE] Suppressed {suppressed_count} grandfathered clone(s). {len(clones)} un-grandfathered clone(s) remaining.")
 
