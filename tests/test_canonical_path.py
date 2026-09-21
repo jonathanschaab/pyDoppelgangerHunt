@@ -283,4 +283,14 @@ def test_build_diff_path_keys_repo_relative_does_not_leak_target_key() -> None:
     assert resolver.matches_diff("foo.py", pkg_diff_keys)
 
 
+def test_matches_diff_nested_coincident_target_path() -> None:
+    """Verifies matches_diff with basis='target' matches when target_in_repo equals a subdirectory name."""
+    resolver = CanonicalPathResolver(target_root="/repo/src", repo_root="/repo")
+    # Harvested unit from /repo/src/src/foo.py has unit_file = "src/foo.py"
+    diff_keys = {"src/src/foo.py"}
+    assert resolver.matches_diff("src/foo.py", diff_keys, basis="target")
+    assert resolver.matches_diff("src/foo.py", diff_keys)
+
+
+
 

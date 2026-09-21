@@ -3738,6 +3738,73 @@ def test_calibration_compatibility_with_excludes() -> None:
     assert not _is_calibration_mode_compatible(calib, excludes=["other"])
 
 
+def test_canonicalize_endpoint_path_with_path_basis() -> None:
+    """Verifies that _canonicalize_endpoint_path relies on path_basis rather than prefix heuristics."""
+    from pydoppelgangerhunt.baseline import _canonicalize_endpoint_path  # pylint: disable=import-outside-toplevel
+
+    # Target-relative path coincidentally starting with offset name must be prepended
+    res = _canonicalize_endpoint_path("src/module.py", "src", path_basis="target_relative")
+    assert res == "src/src/module.py"
+
+    # Repo-relative path must not be prepended even if offset is provided
+    res_repo = _canonicalize_endpoint_path("src/module.py", "src", path_basis="repo_relative")
+    assert res_repo == "src/module.py"
+
+    res_worktree = _canonicalize_endpoint_path("src/module.py", "src", path_basis="worktree_relative")
+    assert res_worktree == "src/module.py"
+
+    # Normal target-relative path without coincident prefix
+    res_normal = _canonicalize_endpoint_path("module.py", "src", path_basis="target_relative")
+    assert res_normal == "src/module.py"
+
+    # Empty offset
+    res_no_off = _canonicalize_endpoint_path("src/module.py", None, path_basis="target_relative")
+    assert res_no_off == "src/module.py"
+
+
+def test_same_target_worktree_baseline_suppression(tmp_path: Path) -> None:
+    """Verifies that recording and filtering a baseline on the same subdirectory in a git repo suppresses clones."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+    src_dir = repo_dir / "src"
+    src_dir.mkdir()
+
+    f1 = src_dir / "a.py"
+    f2 = src_dir / "b.py"
+    code = "def worker():\n    x = 1\n    y = 2\n    z = x + y\n    print(z)\n    return z\n"
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+
+    # Record baseline targeting src
+    base_file = repo_dir / "baseline.json"
+    u1 = {"file": "a.py", "name": "worker", "structural_hash": "h1"}
+    u2 = {"file": "b.py", "name": "worker", "structural_hash": "h2"}
+    clones = [(1.0, u1, u2)]
+
+    pydoppelgangerhunt.record_baseline(
+        clones,
+        str(base_file),
+        str(src_dir),
+        0.80,
+    )
+
+    base_fps = load_baseline(str(base_file))
+    assert getattr(base_fps, "path_basis", None) == "target_relative"
+
+    # Active scan also targeting src
+    # CLI resolves git_worktree_root as repo_dir and passes target=src_dir
+    filtered, suppressed = filter_clones_by_baseline(
+        clones,
+        base_fps,
+        repo_root=str(repo_dir),
+        target=str(src_dir),
+    )
+    assert suppressed == 1
+    assert len(filtered) == 0
+
+
+
 
 
 

@@ -344,10 +344,11 @@ class CanonicalPathResolver:
     def canonical_key(
         self,
         path: Union[str, Path, CanonicalPath],
+        basis: str = "auto",
         strip_anchor: bool = False,
     ) -> str:
         """Returns standard canonical lookup string for general dictionary indexing."""
-        cp = self.resolve(path, strip_anchor=strip_anchor)
+        cp = self.resolve(path, basis=basis, strip_anchor=strip_anchor)
         key = cp.target_relative or cp.repo_relative or cp.raw
         return key.lower() if self.case_fold else key
 
@@ -433,17 +434,18 @@ class CanonicalPathResolver:
         self,
         unit_file: Optional[Union[str, Path, CanonicalPath]],
         diff_keys: Set[str],
+        basis: str = "target",
         strip_anchor: bool = True,
     ) -> bool:
         """Checks if a unit file path matches any diff key without ambiguous suffix matching."""
         if not unit_file or not diff_keys:
             return False
 
-        # 1. Exact match (without stripping anchors)
+        # 1. Exact match with explicit coordinates
         for k in (
-            self.repo_key(unit_file, basis="auto", strip_anchor=False),
-            self.target_key(unit_file, basis="auto", strip_anchor=False),
-            self.canonical_key(unit_file, strip_anchor=False),
+            self.target_key(unit_file, basis=basis, strip_anchor=False),
+            self.repo_key(unit_file, basis=basis, strip_anchor=False),
+            self.canonical_key(unit_file, basis=basis, strip_anchor=False),
         ):
             if k and k in diff_keys:
                 return True
@@ -456,9 +458,9 @@ class CanonicalPathResolver:
                 fragment = raw_str[last_hash + 1:]
                 if fragment.lower().startswith("cell") or ".ipynb#" in raw_str:
                     for k in (
-                        self.repo_key(unit_file, basis="auto", strip_anchor=True),
-                        self.target_key(unit_file, basis="auto", strip_anchor=True),
-                        self.canonical_key(unit_file, strip_anchor=True),
+                        self.target_key(unit_file, basis=basis, strip_anchor=True),
+                        self.repo_key(unit_file, basis=basis, strip_anchor=True),
+                        self.canonical_key(unit_file, basis=basis, strip_anchor=True),
                     ):
                         if k and k in diff_keys:
                             return True

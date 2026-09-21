@@ -440,6 +440,9 @@ def _apply_baseline_and_diff_filters(
     baseline_path = args.baseline or tool_cfg.get("baseline")
 
     target_val = getattr(args, "target", None)
+    git_root = _safe_call_git_diff_helper(get_git_repo_root, None, target_repo_root)
+    git_worktree_root = git_root if git_root and os.path.exists(git_root) else target_repo_root
+
     if args.prune_baseline:
         if not baseline_path:
             print("[ERROR] --prune-baseline requires a baseline path (specify via --baseline or config)")
@@ -449,7 +452,7 @@ def _apply_baseline_and_diff_filters(
             return clones, 1
         try:
             prune_res = prune_baseline(
-                baseline_path, clones, repo_root=target_repo_root, target=target_val
+                baseline_path, clones, repo_root=git_worktree_root, target=target_val
             )
         except TypeError:
             prune_res = prune_baseline(baseline_path, clones)
@@ -474,7 +477,7 @@ def _apply_baseline_and_diff_filters(
         else:
             base_fps = load_baseline(baseline_path)
         clones, suppressed_count = filter_clones_by_baseline(
-            clones, base_fps, repo_root=target_repo_root, target=target_val
+            clones, base_fps, repo_root=git_worktree_root, target=target_val
         )
         if args.format == "text":
             print(f"[BASELINE] Suppressed {suppressed_count} grandfathered clone(s). {len(clones)} un-grandfathered clone(s) remaining.")
@@ -486,8 +489,7 @@ def _apply_baseline_and_diff_filters(
             if args.min_diff_overlap is not None
             else float(tool_cfg.get("min_diff_overlap", 0.0))
         )
-        git_root = _safe_call_git_diff_helper(get_git_repo_root, None, target_repo_root)
-        git_diff_root = git_root if git_root and os.path.exists(git_root) else target_repo_root
+        git_diff_root = git_worktree_root
         modified_ranges = _safe_call_git_diff_helper(
             get_git_modified_line_ranges, args.since, git_diff_root
         )
