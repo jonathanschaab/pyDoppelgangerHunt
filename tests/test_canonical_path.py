@@ -1,0 +1,205 @@
+"""Exhaustive unit and integration tests for the Unified Canonical Path Model."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import sys
+import unicodedata
+import pytest
+
+from pydoppelgangerhunt.canonical_path import (
+    CanonicalPath,
+    CanonicalPathResolver,
+    build_diff_path_keys,
+    lexical_relative_to,
+    normalize_lexical_posix,
+)
+from pydoppelgangerhunt.baseline import (
+    load_baseline,
+    record_baseline,
+)
+
+
+def test_normalize_lexical_posix_separators_and_anchors() -> None:
+    """Verifies normalize_lexical_posix converts separators, strips ./, and handles anchors."""
+    assert normalize_lexical_posix(None) == ""
+    assert normalize_lexical_posix("") == ""
+    assert normalize_lexical_posix("   ") == ""
+    assert normalize_lexical_posix("././foo/bar.py") == "foo/bar.py"
+    assert normalize_lexical_posix(".\\.\\foo\\bar.py") == "foo/bar.py"
+    assert normalize_lexical_posix("foo/bar.py#cell_1", strip_anchor=True) == "foo/bar.py"
+    assert normalize_lexical_posix("foo/bar.py#cell_1", strip_anchor=False) == "foo/bar.py#cell_1"
+    assert normalize_lexical_posix("repo#1/pkg#2/mod.py", strip_anchor=False) == "repo#1/pkg#2/mod.py"
+
+
+def test_normalize_lexical_posix_windows_drive_letters() -> None:
+    """Verifies Windows drive letters are canonicalized to uppercase."""
+    assert normalize_lexical_posix("c:/users/dev/repo") == "C:/users/dev/repo"
+    assert normalize_lexical_posix("d:\\projects\\repo") == "D:/projects/repo"
+    assert normalize_lexical_posix("E:/already/upper") == "E:/already/upper"
+
+
+def test_normalize_lexical_posix_macos_nfc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies macOS decomposes Unicode (NFD) is normalized to NFC."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    decomposed = unicodedata.normalize("NFD", "café/résumé.py")
+    normalized = normalize_lexical_posix(decomposed)
+    assert normalized == unicodedata.normalize("NFC", "café/résumé.py")
+
+
+def test_lexical_relative_to_computations() -> None:
+    """Verifies pure lexical relative path resolution without touching disk."""
+    assert lexical_relative_to("", "") is None
+    assert lexical_relative_to("foo/bar.py", "") == "foo/bar.py"
+    assert lexical_relative_to("/repo/src/pkg/mod.py", "/repo/src") == "pkg/mod.py"
+    assert lexical_relative_to("/repo/src/pkg/mod.py", "/repo/src/") == "pkg/mod.py"
+    assert lexical_relative_to("/repo/src", "/repo/src") == ""
+    assert lexical_relative_to("/repo/tests/test_mod.py", "/repo/src") is None
+    assert lexical_relative_to("C:/Repo/Src/mod.py", "c:/repo/src", case_fold=True) == "mod.py"
+    assert lexical_relative_to("C:/Repo/Src/mod.py", "c:/repo/src", case_fold=False) is None
+
+
+def test_canonical_path_dataclass_properties() -> None:
+    """Verifies CanonicalPath immutability, display properties, and hashing."""
+    cp = CanonicalPath(
+        raw="./src/mod.py",
+        repo_relative="packages/foo/src/mod.py",
+        target_relative="src/mod.py",
+        absolute_lexical="/app/packages/foo/src/mod.py",
+    )
+    assert cp.display_path == "src/mod.py"
+    assert str(cp) == "src/mod.py"
+
+    cp_no_target = CanonicalPath(
+        raw="other/mod.py",
+        repo_relative="packages/other/mod.py",
+        target_relative=None,
+    )
+    assert cp_no_target.display_path == "packages/other/mod.py"
+
+    # Dataclass is hashable and can be stored in sets
+    s = {cp, cp_no_target}
+    assert len(s) == 2
+
+
+def test_resolver_subdirectory_and_repo_root_coordinates(tmp_path: Path) -> None:
+    """Verifies CanonicalPathResolver correctly translates between repo and target subdirectories."""
+    repo = tmp_path / "my_project"
+    target = repo / "packages" / "sub_pkg"
+    target.mkdir(parents=True)
+
+    resolver = CanonicalPathResolver(target_root=target, repo_root=repo)
+    assert resolver.target_in_repo == "packages/sub_pkg"
+
+    # 1. Target-relative unit file resolution
+    cp_unit = resolver.resolve("src/engine.py", basis="target")
+    assert cp_unit.target_relative == "src/engine.py"
+    assert cp_unit.repo_relative == "packages/sub_pkg/src/engine.py"
+    assert resolver.target_key(cp_unit) == "src/engine.py".lower() if resolver.case_fold else "src/engine.py"
+    assert resolver.repo_key(cp_unit) == "packages/sub_pkg/src/engine.py".lower() if resolver.case_fold else "packages/sub_pkg/src/engine.py"
+
+    # 2. Git diff repo-relative file resolution
+    cp_diff = resolver.resolve("packages/sub_pkg/src/engine.py", basis="repo")
+    assert cp_diff.repo_relative == "packages/sub_pkg/src/engine.py"
+    assert cp_diff.target_relative == "src/engine.py"
+
+    # 3. Equivalence across coordinate systems
+    assert resolver.equivalent("src/engine.py", "packages/sub_pkg/src/engine.py")
+
+    # 4. External file in different subpackage
+    cp_external = resolver.resolve("packages/other_pkg/src/engine.py", basis="repo")
+    assert cp_external.repo_relative == "packages/other_pkg/src/engine.py"
+    assert cp_external.target_relative is None
+    # Crucial: Basename collision avoided! "src/engine.py" != "packages/other_pkg/src/engine.py"
+    assert not resolver.equivalent("src/engine.py", "packages/other_pkg/src/engine.py", allow_suffix_fallback=False)
+
+
+def test_resolver_diff_matching_and_basename_collision_prevention(tmp_path: Path) -> None:
+    """Verifies diff matching matches true modified files and suppresses suffix collisions."""
+    repo = tmp_path / "repo"
+    target = repo / "pkg_a"
+    target.mkdir(parents=True)
+
+    resolver = CanonicalPathResolver(target_root=target, repo_root=repo)
+
+    # Git diff reports pkg_a/worker.py changed
+    diff_files = ["pkg_a/worker.py"]
+    diff_keys = build_diff_path_keys(diff_files, resolver)
+
+    # True unit under pkg_a matches
+    assert resolver.matches_diff("worker.py", diff_keys)
+
+    # Unit in unrelated pkg_b with same basename does NOT match
+    assert not resolver.matches_diff("pkg_b/worker.py", diff_keys)
+
+    # Empty inputs handled safely
+    assert not resolver.matches_diff(None, diff_keys)
+    assert not resolver.matches_diff("", diff_keys)
+    assert not resolver.matches_diff("worker.py", set())
+
+
+def test_resolver_deleted_and_nonexistent_files(tmp_path: Path) -> None:
+    """Verifies resolver does not crash or fail when handling deleted or missing diff files."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    resolver = CanonicalPathResolver(target_root=repo, repo_root=repo)
+
+    # Deleted diff file path
+    deleted_path = "deleted_module.py"
+    cp_del = resolver.resolve(deleted_path, basis="repo")
+    assert cp_del.repo_relative == "deleted_module.py"
+    assert cp_del.target_relative == "deleted_module.py"
+
+    # Diff keys build cleanly
+    diff_keys = build_diff_path_keys([deleted_path, "/dev/null"], resolver)
+    assert len(diff_keys) > 0
+
+
+def test_baseline_schema_v15_metadata_round_trip(tmp_path: Path) -> None:
+    """Verifies record_baseline persists schema 1.5.0 with path_basis and target_repo_relative."""
+    base_file = tmp_path / "baseline_v15.json"
+    u1 = {"file": "core/engine.py", "name": "fn1", "tokens": ["tok1", "tok2"]}
+    u2 = {"file": "core/engine.py", "name": "fn2", "tokens": ["tok1", "tok2"]}
+
+    saved = record_baseline([(1.0, u1, u2)], str(base_file), str(tmp_path), threshold=0.85)
+    assert Path(saved).is_file()
+
+    data = json.loads(base_file.read_text(encoding="utf-8"))
+    assert data["version"] == "1.5.0"
+    assert data["path_basis"] == "target_relative"
+
+    loaded = load_baseline(str(base_file))
+    assert loaded.path_basis == "target_relative"
+    assert len(loaded) > 0
+
+
+def test_baseline_cross_root_equivalence_matching(tmp_path: Path) -> None:
+    """Verifies baseline records match across repo root and subdirectory target scans."""
+    from pydoppelgangerhunt.baseline import filter_clones_by_baseline
+
+    repo = tmp_path / "my_project"
+    sub_pkg = repo / "sub_pkg"
+    sub_pkg.mkdir(parents=True)
+
+    base_file = repo / "baseline.json"
+
+    # Clone recorded with repo-relative paths
+    u1_repo = {"file": "sub_pkg/service.py", "name": "run", "structural_hash": "abcd1234efgh5678"}
+    u2_repo = {"file": "sub_pkg/worker.py", "name": "run", "structural_hash": "1234abcd5678efgh"}
+    record_baseline([(1.0, u1_repo, u2_repo)], str(base_file), str(repo), threshold=0.90)
+
+    loaded_base = load_baseline(str(base_file))
+
+    # Current scan running inside sub_pkg: units have target-relative paths
+    u1_sub = {"file": "service.py", "name": "run", "structural_hash": "abcd1234efgh5678"}
+    u2_sub = {"file": "worker.py", "name": "run", "structural_hash": "1234abcd5678efgh"}
+    current_clones = [(1.0, u1_sub, u2_sub)]
+
+    # Filter with repo_root specified
+    unsuppressed, suppressed_count = filter_clones_by_baseline(
+        current_clones, loaded_base, repo_root=str(repo)
+    )
+    assert suppressed_count == 1
+    assert len(unsuppressed) == 0

@@ -6,7 +6,8 @@ import os
 from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Union
-import unicodedata
+
+from pydoppelgangerhunt.canonical_path import normalize_lexical_posix
 
 DEFAULT_EXCLUDES: List[str] = [
     "checks/encapsulated",
@@ -45,22 +46,12 @@ idioms = true
 
 def normalize_path_string(path_str: Optional[str], strip_anchor: bool = True) -> str:
     """Normalizes a file path string by optionally stripping anchors, converting backslashes, and stripping leading './'."""
-    if not path_str:
-        return ""
-    raw = str(path_str)
-    if strip_anchor and "#" in raw:
-        raw = raw.split("#", maxsplit=1)[0]
-    norm = raw.replace("\\", "/")
-    while norm.startswith("./"):
-        norm = norm[2:]
-    if sys.platform == "darwin":
-        return unicodedata.normalize("NFC", norm)
-    return norm
+    return normalize_lexical_posix(path_str, strip_anchor=strip_anchor)
 
 
 def canonical_path_key(path_str: Optional[str], strip_anchor: bool = False) -> str:
     """Returns canonical normalized path key, folding case on Windows for equivalence."""
-    norm = normalize_path_string(path_str, strip_anchor=strip_anchor)
+    norm = normalize_lexical_posix(path_str, strip_anchor=strip_anchor)
     if os.name == "nt" or sys.platform == "win32":
         return norm.lower()
     return norm
@@ -70,22 +61,16 @@ def canonical_path_key(path_str: Optional[str], strip_anchor: bool = False) -> s
 
 def paths_match_boundary(p1: Optional[str], p2: Optional[str]) -> bool:
     """Checks whether two normalized paths refer to the same file respecting directory boundaries."""
-    n1 = normalize_path_string(p1)
-    n2 = normalize_path_string(p2)
+    n1 = normalize_lexical_posix(p1, strip_anchor=True)
+    n2 = normalize_lexical_posix(p2, strip_anchor=True)
     if not n1 or not n2:
         return False
+    if os.name == "nt" or sys.platform == "win32":
+        n1 = n1.lower()
+        n2 = n2.lower()
     if n1 == n2:
         return True
-    if n1.endswith("/" + n2) or n2.endswith("/" + n1):
-        return True
-    if os.name == "nt" or sys.platform == "win32":
-        n1_lower = n1.lower()
-        n2_lower = n2.lower()
-        if n1_lower == n2_lower:
-            return True
-        if n1_lower.endswith("/" + n2_lower) or n2_lower.endswith("/" + n1_lower):
-            return True
-    return False
+    return n1.endswith("/" + n2) or n2.endswith("/" + n1)
 
 
 def find_matching_path_value(

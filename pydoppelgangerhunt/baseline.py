@@ -10,12 +10,14 @@ import math
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
+from pydoppelgangerhunt.canonical_path import CanonicalPathResolver
 from pydoppelgangerhunt.config import (
     canonical_path_key,
     find_matching_path_value,
     normalize_path_string,
     paths_match_boundary,
 )
+from pydoppelgangerhunt import git_diff
 
 logger = logging.getLogger(__name__)
 
@@ -380,10 +382,20 @@ def record_baseline(
     corpus_calibration: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Records detected clones into a JSON baseline file for grandfathering."""
+    target_repo_rel = None
+    try:
+        git_root = git_diff.get_git_repo_root(target)
+        if git_root:
+            res = CanonicalPathResolver(target_root=target, repo_root=git_root)
+            target_repo_rel = res.target_in_repo
+    except (ValueError, OSError, RuntimeError):
+        pass
+
     data: Dict[str, Any] = {
-        "version": "1.4.0",
+        "version": "1.5.0",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "target": target,
+        "path_basis": "target_relative",
         "threshold": threshold,
         "clone_count": len(clones),
         "fingerprints": [
@@ -405,6 +417,8 @@ def record_baseline(
             for sim, u1, u2 in clones
         ],
     }
+    if target_repo_rel:
+        data["target_repo_relative"] = target_repo_rel
     if isinstance(corpus_calibration, dict):
         total_units_val = _safe_total_units(corpus_calibration.get("total_units"))
 
@@ -454,10 +468,14 @@ class BaselineFingerprints(set):  # type: ignore[type-arg]
         fps: Optional[Set[str]] = None,
         records: Optional[List[Dict[str, Any]]] = None,
         corpus_calibration: Optional[Dict[str, Any]] = None,
+        path_basis: Optional[str] = None,
+        target_repo_relative: Optional[str] = None,
     ) -> None:
         super().__init__(fps or set())
         self.records: List[Dict[str, Any]] = records or []
         self.corpus_calibration: Optional[Dict[str, Any]] = corpus_calibration
+        self.path_basis: Optional[str] = path_basis
+        self.target_repo_relative: Optional[str] = target_repo_relative
 
 
 def _parse_legacy_fingerprint_record(raw_fp: str) -> Dict[str, Any]:
@@ -576,8 +594,14 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
             }
             _attach_calibration_flags(corpus_calibration, raw_calib)
 
+        path_basis = data.get("path_basis")
+        target_repo_rel = data.get("target_repo_relative")
         return BaselineFingerprints(
-            fps, records=records, corpus_calibration=corpus_calibration
+            fps,
+            records=records,
+            corpus_calibration=corpus_calibration,
+            path_basis=path_basis,
+            target_repo_relative=target_repo_rel,
         )
     except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError, TypeError, AttributeError, RecursionError):
         return BaselineFingerprints()
@@ -599,10 +623,18 @@ def _matches_boundary_and_structural_hashes(
     c_fb: str,
     c_ha: str,
     c_hb: str,
+    resolver: Optional[CanonicalPathResolver] = None,
 ) -> bool:
     """Checks if two clone endpoints match directory boundary paths and identical structural hashes."""
     if not (r_ha and r_hb and c_ha and c_hb):
         return False
+    if resolver is not None:
+        if r_ha == c_ha and r_hb == c_hb:
+            return resolver.equivalent(r_fa, c_fa) and resolver.equivalent(r_fb, c_fb)
+        if r_ha == c_hb and r_hb == c_ha:
+            return resolver.equivalent(r_fa, c_fb) and resolver.equivalent(r_fb, c_fa)
+        return False
+
     if r_ha == c_ha and r_hb == c_hb:
         return paths_match_boundary(r_fa, c_fa) and paths_match_boundary(r_fb, c_fb)
     if r_ha == c_hb and r_hb == c_ha:
@@ -613,6 +645,7 @@ def _matches_boundary_and_structural_hashes(
 def _match_clone_record(
     c_keys: Dict[str, Any],
     unconsumed: List[Dict[str, Any]],
+    resolver: Optional[CanonicalPathResolver] = None,
 ) -> Optional[Dict[str, Any]]:
     """Finds matching unconsumed baseline record prioritizing exact and namespaced fingerprints."""
     c_fp = c_keys["fp"]
@@ -687,7 +720,7 @@ def _match_clone_record(
         c_ha = str(c_keys.get("hash_a") or "")
         c_hb = str(c_keys.get("hash_b") or "")
         if _matches_boundary_and_structural_hashes(
-            r_fa, r_fb, r_ha, r_hb, c_fa, c_fb, c_ha, c_hb
+            r_fa, r_fb, r_ha, r_hb, c_fa, c_fb, c_ha, c_hb, resolver=resolver
         ):
             if not rec.get("name_a") or _record_matches_names(rec, c_names):
                 return rec
@@ -698,10 +731,18 @@ def _match_clone_record(
 def filter_clones_by_baseline(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     baseline_fingerprints: Set[str],
+    repo_root: Optional[str] = None,
 ) -> Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], int]:
     """Filters out grandfathered clones, returning newly introduced clones and count of suppressed clones."""
     if not baseline_fingerprints:
         return clones, 0
+
+    resolver: Optional[CanonicalPathResolver] = None
+    if repo_root is not None:
+        try:
+            resolver = CanonicalPathResolver(target_root=repo_root, repo_root=repo_root)
+        except (ValueError, OSError, RuntimeError):
+            resolver = None
 
     records = getattr(baseline_fingerprints, "records", None)
     if records:
@@ -724,7 +765,7 @@ def filter_clones_by_baseline(
                 "hash_a": str(u1.get("structural_hash") or compute_unit_structural_hash(u1)),
                 "hash_b": str(u2.get("structural_hash") or compute_unit_structural_hash(u2)),
             }
-            matched_rec = _match_clone_record(c_keys, unconsumed)
+            matched_rec = _match_clone_record(c_keys, unconsumed, resolver=resolver)
             if matched_rec is not None:
                 suppressed_count += 1
                 unconsumed.remove(matched_rec)
@@ -805,15 +846,21 @@ def prune_baseline(
     if not isinstance(data, dict) or "fingerprints" not in data:
         return PruneResult(0, 0, 0)
 
+    resolver: Optional[CanonicalPathResolver] = None
+    if repo_root is not None:
+        try:
+            resolver = CanonicalPathResolver(target_root=repo_root, repo_root=repo_root)
+        except (ValueError, OSError, RuntimeError):
+            resolver = None
+
     if unstaged_modified_ranges is None:
         try:
-            from pydoppelgangerhunt.git_diff import get_git_modified_line_ranges
             try:
-                unstaged_modified_ranges = get_git_modified_line_ranges(
+                unstaged_modified_ranges = git_diff.get_git_modified_line_ranges(
                     since_ref=None, repo_root=repo_root
                 )
             except TypeError:
-                unstaged_modified_ranges = get_git_modified_line_ranges(since_ref=None)
+                unstaged_modified_ranges = git_diff.get_git_modified_line_ranges(since_ref=None)
         except Exception as err:
             # Pragmatic fallback when git is unavailable, outside a repo, or query fails
             logger.debug(
@@ -916,7 +963,7 @@ def prune_baseline(
                 u1_h = compute_unit_structural_hash(u1)
                 u2_h = compute_unit_structural_hash(u2)
                 if _matches_boundary_and_structural_hashes(
-                    r_fa, r_fb, h_a, h_b, u1_f, u2_f, u1_h, u2_h
+                    r_fa, r_fb, h_a, h_b, u1_f, u2_f, u1_h, u2_h, resolver=resolver
                 ):
                     c_names = sorted([str(u1.get("name") or ""), str(u2.get("name") or "")])
                     if not item.get("name_a") or _record_matches_names(item, c_names):
@@ -976,7 +1023,7 @@ def prune_baseline(
             else:
                 pruned_count += 1
 
-    data["version"] = "1.4.0"
+    data["version"] = "1.5.0"
     data["clone_count"] = len(retained)
     data["fingerprints"] = retained
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")

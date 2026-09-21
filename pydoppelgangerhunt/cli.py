@@ -22,6 +22,7 @@ from pydoppelgangerhunt.config import (
     load_tool_config,
     normalize_path_string,
 )
+from pydoppelgangerhunt.canonical_path import CanonicalPathResolver
 from pydoppelgangerhunt.coverage import check_asymmetric_coverage, read_coverage_data
 from pydoppelgangerhunt.fixer import generate_refactoring_patch
 from pydoppelgangerhunt.git_diff import (
@@ -365,11 +366,9 @@ def _resolve_target_relative_path(
     res_target: Path,
 ) -> Optional[str]:
     """Attempts to resolve a git-worktree-relative path relative to a target directory root."""
-    try:
-        abs_p = (res_git / p_str).resolve()
-        return abs_p.relative_to(res_target).as_posix()
-    except (ValueError, OSError, RuntimeError):
-        return None
+    resolver = CanonicalPathResolver(target_root=res_target, repo_root=res_git)
+    cp = resolver.resolve(p_str, basis="repo")
+    return cp.target_relative
 
 
 def _normalize_git_paths_for_target(

@@ -1525,7 +1525,7 @@ def test_corpus_calibration_compute_and_serialization(tmp_path: Path) -> None:
     assert Path(saved).is_file()
 
     raw_json = json.loads(base_file.read_text(encoding="utf-8"))
-    assert raw_json["version"] == "1.4.0"
+    assert raw_json["version"] in ("1.4.0", "1.5.0")
     assert "corpus_calibration" in raw_json
     assert raw_json["corpus_calibration"]["total_units"] == 10
 

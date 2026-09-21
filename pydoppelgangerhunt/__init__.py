@@ -17,6 +17,13 @@ from pydoppelgangerhunt.baseline import (
     pure_structural_fingerprint,
     record_baseline,
 )
+from pydoppelgangerhunt.canonical_path import (
+    CanonicalPath,
+    CanonicalPathResolver,
+    build_diff_path_keys,
+    lexical_relative_to,
+    normalize_lexical_posix,
+)
 from pydoppelgangerhunt.cli import build_arg_parser, main
 from pydoppelgangerhunt.clustering import (
     UnionFind,
@@ -195,6 +202,11 @@ __all__ = [
     "BUILTIN_NAMES",
     "canonical_path_key",
     "normalize_path_string",
+    "CanonicalPath",
+    "CanonicalPathResolver",
+    "normalize_lexical_posix",
+    "lexical_relative_to",
+    "build_diff_path_keys",
     "COMPOUND_BLOCK_TYPES",
     "BRANCH_NODE_TYPES",
 ]
