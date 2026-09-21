@@ -14,6 +14,7 @@ from pydoppelgangerhunt.config import (
     canonical_path_key,
     find_matching_path_value,
     normalize_path_string,
+    paths_match_boundary,
 )
 
 logger = logging.getLogger(__name__)
@@ -655,6 +656,25 @@ def _match_clone_record(
                 if not rec.get("name_a") or _record_matches_names(rec, c_names):
                     return rec
 
+    # Pass 6: cross-root boundary-aware matching (e.g. baseline recorded at repo root vs scan targeting subdirectory)
+    for rec in unconsumed:
+        r_fa = str(rec.get("file_a") or "")
+        r_fb = str(rec.get("file_b") or "")
+        r_ha = str(rec.get("hash_a") or "")
+        r_hb = str(rec.get("hash_b") or "")
+        c_fa = str(c_keys.get("file_a") or "")
+        c_fb = str(c_keys.get("file_b") or "")
+        c_ha = str(c_keys.get("hash_a") or "")
+        c_hb = str(c_keys.get("hash_b") or "")
+        if (
+            (r_ha and c_ha and r_ha == c_ha and r_hb and c_hb and r_hb == c_hb
+             and paths_match_boundary(r_fa, c_fa) and paths_match_boundary(r_fb, c_fb))
+            or (r_ha and c_hb and r_ha == c_hb and r_hb and c_ha and r_hb == c_ha
+                and paths_match_boundary(r_fa, c_fb) and paths_match_boundary(r_fb, c_fa))
+        ):
+            if _record_matches_names(rec, c_names):
+                return rec
+
     return None
 
 
@@ -682,6 +702,10 @@ def filter_clones_by_baseline(
                     extract_unit_namespace(str(u2.get("file") or "")),
                 ]),
                 "names": sorted([str(u1.get("name") or ""), str(u2.get("name") or "")]),
+                "file_a": str(u1.get("file") or ""),
+                "file_b": str(u2.get("file") or ""),
+                "hash_a": str(u1.get("structural_hash") or ""),
+                "hash_b": str(u2.get("structural_hash") or ""),
             }
             matched_rec = _match_clone_record(c_keys, unconsumed)
             if matched_rec is not None:

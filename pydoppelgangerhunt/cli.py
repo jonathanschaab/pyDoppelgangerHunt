@@ -359,6 +359,66 @@ def _safe_call_git_diff_helper(
         return fn(since_ref=since_ref)
 
 
+def _resolve_target_relative_path(
+    p_str: str,
+    res_git: Path,
+    res_target: Path,
+) -> Optional[str]:
+    """Attempts to resolve a git-worktree-relative path relative to a target directory root."""
+    try:
+        abs_p = (res_git / p_str).resolve()
+        return abs_p.relative_to(res_target).as_posix()
+    except (ValueError, OSError, RuntimeError):
+        return None
+
+
+def _normalize_git_paths_for_target(
+    raw_paths: Sequence[str],
+    git_root: str,
+    target_repo_root: str,
+) -> List[str]:
+    """Normalizes worktree-relative Git paths to target-relative paths when targeting a subdirectory."""
+    try:
+        res_git = Path(git_root).resolve()
+        res_target = Path(target_repo_root).resolve()
+    except (ValueError, OSError, RuntimeError):
+        return list(raw_paths)
+    if res_git == res_target:
+        return [p for p in raw_paths if p]
+
+    normalized: List[str] = []
+    for p_str in raw_paths:
+        if not p_str:
+            continue
+        normalized.append(p_str)
+        rel = _resolve_target_relative_path(p_str, res_git, res_target)
+        if rel and rel not in normalized:
+            normalized.append(rel)
+    return normalized
+
+
+def _normalize_modified_ranges_for_target(
+    modified_ranges: Dict[str, List[Tuple[int, int]]],
+    git_root: str,
+    target_repo_root: str,
+) -> Dict[str, List[Tuple[int, int]]]:
+    """Expands modified ranges to include target-relative paths alongside worktree-relative paths."""
+    try:
+        res_git = Path(git_root).resolve()
+        res_target = Path(target_repo_root).resolve()
+    except (ValueError, OSError, RuntimeError):
+        return modified_ranges
+    if res_git == res_target:
+        return modified_ranges
+
+    expanded = dict(modified_ranges)
+    for p_str, ranges in modified_ranges.items():
+        rel = _resolve_target_relative_path(p_str, res_git, res_target)
+        if rel:
+            expanded[rel] = ranges
+    return expanded
+
+
 def _apply_baseline_and_diff_filters(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     args: argparse.Namespace,
@@ -417,9 +477,15 @@ def _apply_baseline_and_diff_filters(
             if args.min_diff_overlap is not None
             else float(tool_cfg.get("min_diff_overlap", 0.0))
         )
+        git_root = _safe_call_git_diff_helper(get_git_repo_root, None, target_repo_root)
+        git_diff_root = git_root if git_root and os.path.exists(git_root) else target_repo_root
         modified_ranges = _safe_call_git_diff_helper(
-            get_git_modified_line_ranges, args.since, target_repo_root
+            get_git_modified_line_ranges, args.since, git_diff_root
         )
+        if modified_ranges and git_diff_root != target_repo_root:
+            modified_ranges = _normalize_modified_ranges_for_target(
+                modified_ranges, git_diff_root, target_repo_root
+            )
         clones = filter_clones_by_git_diff(
             clones,
             modified_ranges,
@@ -595,8 +661,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     target = target_arg or default_dir
     target_dir = target if os.path.isdir(target) else (os.path.dirname(target) or ".")
-    git_root = _safe_call_git_diff_helper(get_git_repo_root, None, target_dir)
-    target_repo_root = git_root if git_root and os.path.exists(git_root) else target_dir
+    target_repo_root = target_dir
     threshold = args.threshold if args.threshold is not None else float(tool_cfg.get("threshold", 0.90))
     min_lines = args.min_lines if args.min_lines is not None else int(tool_cfg.get("min_lines", 8))
     min_tokens = args.min_tokens if args.min_tokens is not None else int(tool_cfg.get("min_tokens", 15))
@@ -670,15 +735,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     diff_files: Optional[Sequence[str]] = None
     if args.diff_only:
-        diff_files = _safe_call_git_diff_helper(
-            get_git_modified_files, args.since, target_repo_root
+        git_root = _safe_call_git_diff_helper(get_git_repo_root, None, target_repo_root)
+        git_diff_root = git_root if git_root and os.path.exists(git_root) else target_repo_root
+        raw_diff_files = _safe_call_git_diff_helper(
+            get_git_modified_files, args.since, git_diff_root
         )
-        if not diff_files:
+        if not raw_diff_files:
             mod_ranges = _safe_call_git_diff_helper(
-                get_git_modified_line_ranges, args.since, target_repo_root
+                get_git_modified_line_ranges, args.since, git_diff_root
             )
             if mod_ranges:
-                diff_files = list(mod_ranges.keys())
+                raw_diff_files = list(mod_ranges.keys())
+        if raw_diff_files:
+            diff_files = _normalize_git_paths_for_target(
+                raw_diff_files, git_diff_root, target_repo_root
+            )
 
     scan_res = scan_target(
         target,

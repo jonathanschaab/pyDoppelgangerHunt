@@ -3220,6 +3220,167 @@ def test_diff_files_canonical_path_matching_prevents_nested_basename_collisions(
     assert len(diff_sub_mismatch) == 0
 
 
+def test_baseline_matching_preserves_target_relative_subdirectory_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that subdirectory baselines preserve target-relative identity and cross-root baselines match."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.baseline import load_baseline  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    src = repo / "src"
+    pkg = src / "pkg"
+    pkg.mkdir(parents=True)
+
+    foo_code = (
+        "def compute_summary(data_list, factor):\n"
+        "    accum = 0\n"
+        "    for val in data_list:\n"
+        "        accum += val * factor + 5\n"
+        "    return accum\n"
+    )
+    (pkg / "worker.py").write_text(foo_code, encoding="utf-8")
+    (pkg / "worker_clone.py").write_text(foo_code, encoding="utf-8")
+
+    sub_baseline = tmp_path / "sub_baseline.json"
+    root_baseline = tmp_path / "root_baseline.json"
+
+    # 1. Record baseline targeting subdirectory repo/src
+    rec_args = [
+        "pydoppelgangerhunt",
+        str(src),
+        "--record-baseline",
+        str(sub_baseline),
+        "--threshold",
+        "0.90",
+        "--min-lines",
+        "5",
+    ]
+    monkeypatch.setattr("sys.argv", rec_args)
+    assert main() == 0
+    assert sub_baseline.exists()
+
+    # Loaded records must be relative to src (pkg/worker.py), NOT src/pkg/worker.py
+    loaded_sub = load_baseline(str(sub_baseline))
+    assert len(loaded_sub.records) == 1
+    rec = loaded_sub.records[0]
+    assert rec["file_a"].replace("\\", "/").startswith("pkg/")
+    assert not rec["file_a"].replace("\\", "/").startswith("src/")
+
+    # 2. Scanning repo/src with --baseline sub_baseline must suppress the grandfathered clone (Exit 0)
+    check_args = [
+        "pydoppelgangerhunt",
+        str(src),
+        "--baseline",
+        str(sub_baseline),
+        "--threshold",
+        "0.90",
+        "--min-lines",
+        "5",
+    ]
+    monkeypatch.setattr("sys.argv", check_args)
+    assert main() == 0
+
+    # 3. Record baseline targeting full repository repo
+    rec_root_args = [
+        "pydoppelgangerhunt",
+        str(repo),
+        "--record-baseline",
+        str(root_baseline),
+        "--threshold",
+        "0.90",
+        "--min-lines",
+        "5",
+    ]
+    monkeypatch.setattr("sys.argv", rec_root_args)
+    assert main() == 0
+    assert root_baseline.exists()
+
+    loaded_root = load_baseline(str(root_baseline))
+    assert len(loaded_root.records) == 1
+    root_rec = loaded_root.records[0]
+    assert root_rec["file_a"].replace("\\", "/").startswith("src/pkg/")
+
+    # 4. Scanning repo/src with --baseline root_baseline must ALSO suppress the grandfathered clone via Pass 6
+    cross_args = [
+        "pydoppelgangerhunt",
+        str(src),
+        "--baseline",
+        str(root_baseline),
+        "--threshold",
+        "0.90",
+        "--min-lines",
+        "5",
+    ]
+    monkeypatch.setattr("sys.argv", cross_args)
+    assert main() == 0
+
+
+def test_calibrated_differential_tfidf_weights_unchanged_candidate_partner_shingles(
+    tmp_path: Path,
+) -> None:
+    """Verifies calibrated differential TF-IDF weights incorporate global frequencies for unchanged partner shingles."""
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    f_changed = tmp_path / "changed.py"
+    f_unchanged = tmp_path / "unchanged.py"
+
+    code_changed = (
+        "def run_pipeline(x):\n"
+        "    a = 1\n"
+        "    b = 2\n"
+        "    c = 3\n"
+        "    d = 4\n"
+        "    return x + a + b + c + d\n"
+    )
+    # Extra statement in unchanged creates shingles present ONLY in unchanged.py
+    code_unchanged = (
+        "def run_pipeline(x):\n"
+        "    a = 1\n"
+        "    b = 2\n"
+        "    c = 3\n"
+        "    d = 4\n"
+        "    extra_unique_val = 99999 + 88888\n"
+        "    return x + a + b + c + d\n"
+    )
+
+    f_changed.write_text(code_changed, encoding="utf-8")
+    f_unchanged.write_text(code_unchanged, encoding="utf-8")
+
+    # 1. Harvest units to find shingles unique to unchanged
+    units_raw = scan_target(str(tmp_path), min_lines=5, threshold=0.60)
+    assert len(units_raw) == 1
+
+    # 2. Build calibration with high global frequency for all shingles
+    all_units, calib_dict = scan_target(
+        str(tmp_path), min_lines=5, threshold=0.60, return_calibration=True
+    )
+    assert isinstance(calib_dict, dict)
+    assert len(all_units) == 1
+
+    # Modify calibration to simulate a large corpus where shingles have moderate global count (10% < 25%)
+    calib_dict["total_units"] = 500
+    freq_map = calib_dict.get("shingle_frequencies", {})
+    for sh in list(freq_map.keys()):
+        freq_map[sh] = 50
+
+    # 3. Differential scan where only changed.py is in diff_files
+    diff_clones = scan_target(
+        str(tmp_path),
+        min_lines=5,
+        threshold=0.60,
+        tfidf=True,
+        diff_files=["changed.py"],
+        corpus_calibration=calib_dict,
+    )
+    assert len(diff_clones) == 1
+    sim, u1, u2 = diff_clones[0]
+    assert sim >= 0.60
+    assert {u1["file"], u2["file"]} == {"changed.py", "unchanged.py"}
+
+
+
 
 
 

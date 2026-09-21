@@ -1024,8 +1024,11 @@ def scan_target(
                     continue
 
     idf_weights: Dict[Any, float] = {}
+    df_counts: Dict[Any, int] = {}
+    calib_units_tfidf = 0
+    corpus_size = len(units)
+    calib_freqs: Dict[Any, Any] = {}
     if tfidf and units:
-        calib_units_tfidf = 0
         if corpus_calibration is not None:
             local_units_count = len(diff_unit_indices) if diff_unit_indices is not None else len(units)
             calib_units_tfidf = _safe_total_units(corpus_calibration.get("total_units"))
@@ -1039,7 +1042,6 @@ def scan_target(
             corpus_size = len(units)
             active_indices = range(len(units))
 
-        df_counts: Dict[Any, int] = {}
         for idx in active_indices:
             u = units[idx]
             keys = u.get("vector", {}).keys() if bag_of_tokens else u["shingles"]
@@ -1052,25 +1054,9 @@ def scan_target(
             if corpus_calibration is not None
             else None
         )
-        calib_freqs: Dict[Any, Any] = (
+        calib_freqs = (
             calib_freqs_raw if isinstance(calib_freqs_raw, dict) else {}
         )
-        for k, df in df_counts.items():
-            calib_df = _lookup_calib_freq(calib_freqs, k)
-            try:
-                parsed_calib = int(calib_df or 0)
-                if calib_units_tfidf > 0 and parsed_calib > 0:
-                    valid_calib_df = min(calib_units_tfidf, parsed_calib)
-                else:
-                    valid_calib_df = 0
-            except (ValueError, TypeError, OverflowError):
-                valid_calib_df = 0
-            combined_df = df + valid_calib_df
-            try:
-                weight = math.log((1.0 + corpus_size) / (1.0 + combined_df)) + 1.0
-                idf_weights[k] = max(0.0, weight)
-            except (ValueError, TypeError, OverflowError):
-                idf_weights[k] = 1.0
 
     shingle_index: Dict[Any, List[int]] = {}
     for idx, u in enumerate(units):
@@ -1168,6 +1154,34 @@ def scan_target(
             continue
 
         _add_candidate_pairs(candidate_pairs, u_indices, diff_unit_indices)
+
+    if tfidf and units and candidate_pairs:
+        keys_to_weight: Set[Any] = set(df_counts.keys())
+        for i, j in candidate_pairs:
+            for u_idx in (i, j):
+                u = units[u_idx]
+                u_keys = u.get("vector", {}).keys() if bag_of_tokens else u["shingles"]
+                for k in u_keys:
+                    if not (effective_stop_shingles and k in effective_stop_shingles):
+                        keys_to_weight.add(k)
+
+        for k in keys_to_weight:
+            df = df_counts.get(k, 0)
+            calib_df = _lookup_calib_freq(calib_freqs, k)
+            try:
+                parsed_calib = int(calib_df or 0)
+                if calib_units_tfidf > 0 and parsed_calib > 0:
+                    valid_calib_df = min(calib_units_tfidf, parsed_calib)
+                else:
+                    valid_calib_df = 0
+            except (ValueError, TypeError, OverflowError):
+                valid_calib_df = 0
+            combined_df = df + valid_calib_df
+            try:
+                weight = math.log((1.0 + corpus_size) / (1.0 + combined_df)) + 1.0
+                idf_weights[k] = max(0.0, weight)
+            except (ValueError, TypeError, OverflowError):
+                idf_weights[k] = 1.0
 
     raw_exemptions = exemptions if exemptions is not None else []
     normalized_exemptions: Set[Tuple[str, str]] = set()
