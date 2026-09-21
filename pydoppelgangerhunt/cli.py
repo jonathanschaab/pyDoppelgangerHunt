@@ -746,6 +746,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "bag_of_tokens": args.bag_of_tokens,
                     "call_sequences": call_seq_enabled,
                     "filter_stop_shingles": stop_shingles_enabled,
+                    "audit_tests": bool(audit_tests_enabled),
+                    "include_notebooks": bool(args.notebooks),
                     "max_index_frequency": max_index_frequency,
                     "min_corpus_size": effective_mcs,
                     "min_lines": min_lines,

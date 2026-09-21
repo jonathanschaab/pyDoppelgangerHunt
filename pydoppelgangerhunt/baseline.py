@@ -10,7 +10,11 @@ import math
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
-from pydoppelgangerhunt.canonical_path import CanonicalPathResolver
+from pydoppelgangerhunt.canonical_path import (
+    CanonicalPathResolver,
+    lexical_relative_to,
+    normalize_lexical_posix,
+)
 from pydoppelgangerhunt.config import (
     canonical_path_key,
     find_matching_path_value,
@@ -89,7 +93,13 @@ def _extract_calibration_settings(source: Dict[str, Any]) -> Dict[str, Any]:
     settings: Dict[str, Any] = {}
     if not isinstance(source, dict):
         return settings
-    for flag in ("bag_of_tokens", "call_sequences", "filter_stop_shingles"):
+    for flag in (
+        "bag_of_tokens",
+        "call_sequences",
+        "filter_stop_shingles",
+        "audit_tests",
+        "include_notebooks",
+    ):
         settings[flag] = _safe_bool(source.get(flag, False))
     for flag, default_val in HARVEST_BOOLEAN_MODES:
         settings[flag] = _safe_bool(source.get(flag, default_val))
@@ -249,13 +259,29 @@ def _safe_index_frequency(raw_freq: Any) -> Optional[float]:
     return None
 
 
+def _safe_str(val: Any) -> Optional[str]:
+    """Validates that a value is a non-empty string."""
+    if isinstance(val, str):
+        cleaned = val.strip()
+        return cleaned if cleaned else None
+    return None
+
+
+def _safe_hex_hash(val: Any, allowed_lengths: Tuple[int, ...] = (64,)) -> Optional[str]:
+    """Validates that a value is a valid lowercase hexadecimal string of specific length(s)."""
+    s = _safe_str(val)
+    if s and len(s) in allowed_lengths and all(c in "0123456789abcdefABCDEF" for c in s):
+        return s.lower()
+    return None
+
+
 def compute_calibration_config_hash(source: Dict[str, Any]) -> str:
     """Computes a deterministic SHA-256 hash for a set of calibration or scan configuration settings."""
     settings = _extract_calibration_settings(source)
     if "max_index_frequency" in source:
         raw_mif = source.get("max_index_frequency")
         parsed_mif = _safe_index_frequency(raw_mif) if raw_mif is not None else None
-        settings["max_index_frequency"] = round(parsed_mif, 6) if parsed_mif is not None else None
+        settings["max_index_frequency"] = parsed_mif if parsed_mif is not None else None
     else:
         settings["max_index_frequency"] = 0.25
     canonical_json = json.dumps(settings, sort_keys=True, separators=(",", ":"))
@@ -501,6 +527,7 @@ class BaselineFingerprints(set):  # type: ignore[type-arg]
         target_repo_relative: Optional[str] = None,
         config_hash: Optional[str] = None,
         recorded_commit: Optional[str] = None,
+        target: Optional[str] = None,
     ) -> None:
         super().__init__(fps or set())
         self.records: List[Dict[str, Any]] = records or []
@@ -509,6 +536,7 @@ class BaselineFingerprints(set):  # type: ignore[type-arg]
         self.target_repo_relative: Optional[str] = target_repo_relative
         self.config_hash: Optional[str] = config_hash
         self.recorded_commit: Optional[str] = recorded_commit
+        self.target: Optional[str] = target
 
 
 def _parse_legacy_fingerprint_record(raw_fp: str) -> Dict[str, Any]:
@@ -621,11 +649,13 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
                 parsed_max = _safe_index_frequency(raw_max_freq)
                 max_idx_freq = parsed_max if parsed_max is not None else 0.25
 
-            calib_cfg_hash = raw_calib.get("config_hash")
+            raw_hash = raw_calib.get("config_hash")
+            calib_cfg_hash = _safe_hex_hash(raw_hash, (64,))
             if not calib_cfg_hash:
                 calib_cfg_hash = compute_calibration_config_hash(raw_calib)
 
-            calib_commit = raw_calib.get("recorded_commit")
+            raw_commit = raw_calib.get("recorded_commit")
+            calib_commit = _safe_hex_hash(raw_commit, (40, 64))
 
             corpus_calibration = {
                 "total_units": calib_total_units,
@@ -638,11 +668,12 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
                 corpus_calibration["recorded_commit"] = calib_commit
             _attach_calibration_flags(corpus_calibration, raw_calib)
 
-        top_cfg_hash = calib_cfg_hash or data.get("config_hash")
-        top_commit = calib_commit or data.get("recorded_commit")
+        top_cfg_hash = calib_cfg_hash or _safe_hex_hash(data.get("config_hash"), (64,))
+        top_commit = calib_commit or _safe_hex_hash(data.get("recorded_commit"), (40, 64))
 
         path_basis = data.get("path_basis")
         target_repo_rel = data.get("target_repo_relative")
+        top_target = _safe_str(data.get("target"))
         return BaselineFingerprints(
             fps,
             records=records,
@@ -651,6 +682,7 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
             target_repo_relative=target_repo_rel,
             config_hash=top_cfg_hash,
             recorded_commit=top_commit,
+            target=top_target,
         )
     except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError, TypeError, AttributeError, RecursionError):
         return BaselineFingerprints()
@@ -679,9 +711,13 @@ def _matches_boundary_and_structural_hashes(
         return False
     if resolver is not None:
         if r_ha == c_ha and r_hb == c_hb:
-            return resolver.equivalent(r_fa, c_fa) and resolver.equivalent(r_fb, c_fb)
+            return resolver.equivalent(r_fa, c_fa, allow_suffix_fallback=False) and resolver.equivalent(
+                r_fb, c_fb, allow_suffix_fallback=False
+            )
         if r_ha == c_hb and r_hb == c_ha:
-            return resolver.equivalent(r_fa, c_fb) and resolver.equivalent(r_fb, c_fa)
+            return resolver.equivalent(r_fa, c_fb, allow_suffix_fallback=False) and resolver.equivalent(
+                r_fb, c_fa, allow_suffix_fallback=False
+            )
         return False
 
     if r_ha == c_ha and r_hb == c_hb:
@@ -693,13 +729,22 @@ def _matches_boundary_and_structural_hashes(
 
 def _build_baseline_path_resolver(
     root: Optional[Union[str, Path]],
+    baseline_target: Optional[Union[str, Path]] = None,
 ) -> Optional[CanonicalPathResolver]:
-    """Constructs a CanonicalPathResolver against enclosing Git worktree root if available."""
+    """Constructs a CanonicalPathResolver against enclosing Git worktree root or baseline target if available."""
     if root is None:
         return None
     try:
         git_root = git_diff.get_git_repo_root(repo_root=root)
         effective_repo = git_root or root
+        if baseline_target is not None:
+            r_norm = normalize_lexical_posix(str(root))
+            b_norm = normalize_lexical_posix(str(baseline_target))
+            if r_norm and b_norm and r_norm != b_norm:
+                if lexical_relative_to(r_norm, b_norm) is not None:
+                    return CanonicalPathResolver(target_root=root, repo_root=baseline_target)
+                if lexical_relative_to(b_norm, r_norm) is not None:
+                    return CanonicalPathResolver(target_root=baseline_target, repo_root=root)
         return CanonicalPathResolver(target_root=root, repo_root=effective_repo)
     except (ValueError, OSError, RuntimeError):
         return None
@@ -800,7 +845,8 @@ def filter_clones_by_baseline(
     if not baseline_fingerprints:
         return clones, 0
 
-    resolver = _build_baseline_path_resolver(repo_root)
+    base_target = getattr(baseline_fingerprints, "target", None)
+    resolver = _build_baseline_path_resolver(repo_root, baseline_target=base_target)
 
     records = getattr(baseline_fingerprints, "records", None)
     if records:
@@ -904,7 +950,8 @@ def prune_baseline(
     if not isinstance(data, dict) or "fingerprints" not in data:
         return PruneResult(0, 0, 0)
 
-    resolver = _build_baseline_path_resolver(repo_root)
+    base_target = _safe_str(data.get("target")) if isinstance(data, dict) else None
+    resolver = _build_baseline_path_resolver(repo_root, baseline_target=base_target)
 
     if unstaged_modified_ranges is None:
         try:

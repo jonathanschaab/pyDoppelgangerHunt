@@ -28,8 +28,8 @@ def normalize_lexical_posix(path_str: Optional[str], strip_anchor: bool = False)
     """
     if path_str is None:
         return ""
-    raw = str(path_str).strip()
-    if not raw:
+    raw = str(path_str).rstrip("\r\n")
+    if not raw or not raw.strip():
         return ""
 
     if "\x00" in raw:
@@ -38,7 +38,15 @@ def normalize_lexical_posix(path_str: Optional[str], strip_anchor: bool = False)
         return ""
 
     if strip_anchor and "#" in raw:
-        raw = raw.split("#", maxsplit=1)[0]
+        last_seg = raw.replace("\\", "/").rsplit("/", 1)[-1]
+        if "#" in last_seg:
+            fname, fragment = last_seg.split("#", 1)
+            if (
+                ("." in fname and not fname.startswith("."))
+                or fragment.lower().startswith("cell")
+                or ".ipynb#" in raw
+            ):
+                raw = raw[: len(raw) - len(fragment) - 1]
 
     norm = raw.replace("\\", "/")
     while norm.startswith("./"):
@@ -214,7 +222,7 @@ class CanonicalPathResolver:
         if isinstance(path, CanonicalPath):
             return path
 
-        raw_str = str(path).strip()
+        raw_str = str(path).rstrip("\r\n")
         cache_key = (raw_str, basis, bool(strip_anchor))
         cached = self._cache.get(cache_key)
         if cached is not None:
@@ -358,7 +366,9 @@ class CanonicalPathResolver:
         4. physical resolution (if both files exist on disk)
         5. optional boundary suffix matching (for legacy unanchored baseline strings)
         """
-        if not str(path_a or "").strip() or not str(path_b or "").strip():
+        s_a = str(path_a or "").rstrip("\r\n")
+        s_b = str(path_b or "").rstrip("\r\n")
+        if not s_a or not s_b:
             return False
 
         ca = self.resolve(path_a)
@@ -386,11 +396,30 @@ class CanonicalPathResolver:
         try:
             pa = Path(ca.raw)
             pb = Path(cb.raw)
-            if not pa.is_absolute():
-                pa = self.target_path / pa
-            if not pb.is_absolute():
-                pb = self.target_path / pb
-            if pa.is_file() and pb.is_file() and pa.resolve() == pb.resolve():
+
+            def _find_file(p: Path) -> Optional[Path]:
+                if p.is_absolute():
+                    return p if p.is_file() else None
+                t_cand = self.target_path / p
+                if t_cand.is_file():
+                    return t_cand
+                if self.repo_path is not None and self.repo_path != self.target_path:
+                    r_cand = self.repo_path / p
+                    if r_cand.is_file():
+                        return r_cand
+                curr = self.target_path.parent
+                while curr != curr.parent:
+                    cand = curr / p
+                    if cand.is_file():
+                        return cand
+                    if curr == self.repo_path:
+                        break
+                    curr = curr.parent
+                return None
+
+            pa_file = _find_file(pa)
+            pb_file = _find_file(pb)
+            if pa_file and pb_file and pa_file.resolve() == pb_file.resolve():
                 return True
         except (ValueError, OSError, RuntimeError):
             pass
@@ -410,18 +439,29 @@ class CanonicalPathResolver:
         if not unit_file or not diff_keys:
             return False
 
-        # Unit file from scanner is target-relative
-        r_key = self.repo_key(unit_file, basis="target", strip_anchor=strip_anchor)
-        if r_key and r_key in diff_keys:
-            return True
+        # 1. Exact match (without stripping anchors)
+        for k in (
+            self.repo_key(unit_file, basis="target", strip_anchor=False),
+            self.target_key(unit_file, basis="target", strip_anchor=False),
+            self.canonical_key(unit_file, strip_anchor=False),
+        ):
+            if k and k in diff_keys:
+                return True
 
-        t_key = self.target_key(unit_file, basis="target", strip_anchor=strip_anchor)
-        if t_key and t_key in diff_keys:
-            return True
-
-        c_key = self.canonical_key(unit_file, strip_anchor=strip_anchor)
-        if c_key in diff_keys:
-            return True
+        # 2. Stripped anchor match (for notebook cell anchors like .ipynb#cell_1 or #cell1)
+        if strip_anchor:
+            raw_str = str(getattr(unit_file, "raw", unit_file) or "")
+            if "#" in raw_str:
+                last_hash = raw_str.rfind("#")
+                fragment = raw_str[last_hash + 1:]
+                if fragment.lower().startswith("cell") or ".ipynb#" in raw_str:
+                    for k in (
+                        self.repo_key(unit_file, basis="target", strip_anchor=True),
+                        self.target_key(unit_file, basis="target", strip_anchor=True),
+                        self.canonical_key(unit_file, strip_anchor=True),
+                    ):
+                        if k and k in diff_keys:
+                            return True
 
         return False
 
@@ -448,14 +488,14 @@ def build_diff_path_keys(
     for d in diff_files:
         if not d:
             continue
-        # Git diff outputs paths relative to repo root
-        r_key = resolver.repo_key(d, basis="repo", strip_anchor=True)
+        # Git diff outputs paths relative to repo root; preserve literal # and spaces
+        r_key = resolver.repo_key(d, basis="repo", strip_anchor=False)
         if r_key:
             keys.add(r_key)
-        t_key = resolver.target_key(d, basis="repo", strip_anchor=True)
+        t_key = resolver.target_key(d, basis="repo", strip_anchor=False)
         if t_key:
             keys.add(t_key)
-        c_key = resolver.canonical_key(d, strip_anchor=True)
+        c_key = resolver.canonical_key(d, strip_anchor=False)
         if c_key:
             keys.add(c_key)
     return keys

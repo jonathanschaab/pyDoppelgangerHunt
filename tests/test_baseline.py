@@ -3504,6 +3504,76 @@ def test_get_git_head_commit_behavior(tmp_path: Path) -> None:
     assert get_git_head_commit(repo_root=empty_dir) is None
 
 
+def test_baseline_metadata_type_validation_with_crafted_values(tmp_path: Path) -> None:
+    """Verifies that non-string/numeric config_hash and recorded_commit degrade safely without raising in load_baseline."""
+    crafted_path = tmp_path / "crafted_baseline.json"
+    crafted_data = {
+        "version": "1.5.0",
+        "fingerprints": [],
+        "config_hash": 123456789,
+        "recorded_commit": 987654321,
+        "corpus_calibration": {
+            "total_units": 100,
+            "max_index_frequency": 0.25,
+            "global_stop_shingles": [],
+            "shingle_frequencies": {},
+            "config_hash": 123456789,
+            "recorded_commit": 987654321,
+        },
+    }
+    crafted_path.write_text(json.dumps(crafted_data), encoding="utf-8")
+
+    loaded = load_baseline(str(crafted_path))
+    assert isinstance(loaded.config_hash, str)
+    assert len(loaded.config_hash) == 64
+    assert loaded.config_hash[:8]  # Can slice without TypeError
+    assert loaded.recorded_commit is None  # Degraded safely from numeric value
+    assert loaded.corpus_calibration is not None
+    assert isinstance(loaded.corpus_calibration.get("config_hash"), str)
+    assert loaded.corpus_calibration.get("recorded_commit") is None
+
+
+def test_compute_calibration_config_hash_lossless_float() -> None:
+    """Verifies that compute_calibration_config_hash hashes floats without lossy 6-decimal rounding."""
+    from pydoppelgangerhunt.baseline import compute_calibration_config_hash  # pylint: disable=import-outside-toplevel
+
+    hash_a = compute_calibration_config_hash({"max_index_frequency": 0.25})
+    hash_b = compute_calibration_config_hash({"max_index_frequency": 0.2500004})
+    assert hash_a != hash_b
+
+
+def test_matches_boundary_and_structural_hashes_no_suffix_fallback(tmp_path: Path) -> None:
+    """Verifies that _matches_boundary_and_structural_hashes disables suffix fallback when resolver is provided."""
+    from pydoppelgangerhunt.canonical_path import CanonicalPathResolver  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.baseline import _matches_boundary_and_structural_hashes  # pylint: disable=import-outside-toplevel
+
+    resolver = CanonicalPathResolver(target_root=tmp_path / "pkg", repo_root=tmp_path)
+    # Different files: worker.py in target vs pkg/worker.py in repo
+    res = _matches_boundary_and_structural_hashes(
+        "worker.py", "other.py", "hash1", "hash2",
+        "pkg/other_pkg/worker.py", "other.py", "hash1", "hash2",
+        resolver=resolver,
+    )
+    assert not res
+
+
+def test_calibration_compatibility_audit_tests_and_include_notebooks() -> None:
+    """Verifies that audit_tests and include_notebooks are validated in calibration compatibility."""
+    from pydoppelgangerhunt.baseline import compute_calibration_config_hash  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.matcher import _is_calibration_mode_compatible  # pylint: disable=import-outside-toplevel
+
+    calib_std = {
+        "total_units": 100,
+        "max_index_frequency": 0.25,
+        "audit_tests": False,
+        "include_notebooks": False,
+        "config_hash": compute_calibration_config_hash({"audit_tests": False, "include_notebooks": False}),
+    }
+    assert _is_calibration_mode_compatible(calib_std, audit_tests=False, include_notebooks=False)
+    assert not _is_calibration_mode_compatible(calib_std, audit_tests=True, include_notebooks=False)
+    assert not _is_calibration_mode_compatible(calib_std, audit_tests=False, include_notebooks=True)
+
+
 
 
 

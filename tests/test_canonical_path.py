@@ -97,8 +97,14 @@ def test_resolver_subdirectory_and_repo_root_coordinates(tmp_path: Path) -> None
     cp_unit = resolver.resolve("src/engine.py", basis="target")
     assert cp_unit.target_relative == "src/engine.py"
     assert cp_unit.repo_relative == "packages/sub_pkg/src/engine.py"
-    assert resolver.target_key(cp_unit) == "src/engine.py".lower() if resolver.case_fold else "src/engine.py"
-    assert resolver.repo_key(cp_unit) == "packages/sub_pkg/src/engine.py".lower() if resolver.case_fold else "packages/sub_pkg/src/engine.py"
+    assert resolver.target_key(cp_unit) == (
+        "src/engine.py".lower() if resolver.case_fold else "src/engine.py"
+    )
+    assert resolver.repo_key(cp_unit) == (
+        "packages/sub_pkg/src/engine.py".lower()
+        if resolver.case_fold
+        else "packages/sub_pkg/src/engine.py"
+    )
 
     # 2. Git diff repo-relative file resolution
     cp_diff = resolver.resolve("packages/sub_pkg/src/engine.py", basis="repo")
@@ -234,5 +240,32 @@ def test_matches_diff_notebook_anchor_support() -> None:
     assert resolver.matches_diff("analysis.ipynb#cell_99", diff_keys)
     assert not resolver.matches_diff("other_notebook.ipynb#cell_1", diff_keys)
     assert not resolver.matches_diff("packages/other_pkg/analysis.ipynb#cell_1", diff_keys)
+
+
+def test_canonical_path_preserves_significant_spaces() -> None:
+    """Verifies that leading and trailing spaces in filesystem paths are preserved."""
+    assert normalize_lexical_posix(" foo.py") == " foo.py"
+    assert normalize_lexical_posix("dir /bar.py") == "dir /bar.py"
+
+    resolver = CanonicalPathResolver(target_root="/repo")
+    cp = resolver.resolve(" pkg/ foo.py", basis="target")
+    assert cp.target_relative == " pkg/ foo.py"
+
+    assert resolver.equivalent(" pkg/ foo.py", " pkg/ foo.py")
+    assert not resolver.equivalent(" pkg/ foo.py", "pkg/foo.py")
+
+
+def test_build_diff_path_keys_preserves_literal_hashes() -> None:
+    """Verifies that literal # in filenames are preserved in diff keys and do not truncate to prefix."""
+    resolver = CanonicalPathResolver(target_root="/repo/sub", repo_root="/repo")
+    diff_files = ["sub/pkg#2/worker.py"]
+    diff_keys = build_diff_path_keys(diff_files, resolver)
+
+    # Unit matching: exact file with literal hash matches
+    assert resolver.matches_diff("pkg#2/worker.py", diff_keys)
+
+    # Different file without hash does NOT collide or falsely match
+    assert not resolver.matches_diff("pkg/worker.py", diff_keys)
+    assert not resolver.matches_diff("pkg", diff_keys)
 
 

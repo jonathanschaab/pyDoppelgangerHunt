@@ -648,6 +648,8 @@ def _build_calibration_metadata(
     stop_shingles: Optional[Set[Any]],
     bag_of_tokens: bool,
     call_sequences: bool,
+    audit_tests: bool = False,
+    include_notebooks: bool = False,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Helper to compute baseline corpus calibration dictionary."""
@@ -660,6 +662,8 @@ def _build_calibration_metadata(
         stop_shingles=stop_shingles,
         bag_of_tokens=bag_of_tokens,
         call_sequences=call_sequences,
+        audit_tests=audit_tests,
+        include_notebooks=include_notebooks,
         **kwargs,
     )
 
@@ -670,6 +674,8 @@ def _is_calibration_mode_compatible(
     bag_of_tokens: bool = False,
     call_sequences: bool = False,
     filter_stop_shingles: bool = False,
+    audit_tests: bool = False,
+    include_notebooks: bool = False,
     max_index_frequency: Optional[float] = 0.25,
     min_corpus_size: Optional[int] = None,
     **kwargs: Any,
@@ -685,6 +691,8 @@ def _is_calibration_mode_compatible(
             "bag_of_tokens": bag_of_tokens,
             "call_sequences": call_sequences,
             "filter_stop_shingles": filter_stop_shingles,
+            "audit_tests": audit_tests,
+            "include_notebooks": include_notebooks,
             "max_index_frequency": max_index_frequency,
             "min_corpus_size": effective_mcs,
         })
@@ -695,6 +703,10 @@ def _is_calibration_mode_compatible(
     if _safe_bool(calib.get("call_sequences", False)) != bool(call_sequences):
         return False
     if _safe_bool(calib.get("filter_stop_shingles", False)) and not filter_stop_shingles:
+        return False
+    if _safe_bool(calib.get("audit_tests", False)) != bool(audit_tests):
+        return False
+    if _safe_bool(calib.get("include_notebooks", False)) != bool(include_notebooks):
         return False
 
     if min_corpus_size is not None:
@@ -932,6 +944,8 @@ def scan_target(
                     stop_shingles=stop_shingles,
                     bag_of_tokens=bag_of_tokens,
                     call_sequences=call_sequences,
+                    audit_tests=audit_tests,
+                    include_notebooks=include_notebooks,
                     **harvest_mode_opts,
                 )
             return []
@@ -948,6 +962,8 @@ def scan_target(
         bag_of_tokens=bag_of_tokens,
         call_sequences=call_sequences,
         filter_stop_shingles=filter_stop_shingles,
+        audit_tests=audit_tests,
+        include_notebooks=include_notebooks,
         max_index_frequency=max_index_frequency,
         min_corpus_size=min_corpus_size,
         **harvest_mode_opts,
@@ -1272,6 +1288,8 @@ def scan_target(
             stop_shingles=stop_shingles,
             bag_of_tokens=bag_of_tokens,
             call_sequences=call_sequences,
+            audit_tests=audit_tests,
+            include_notebooks=include_notebooks,
             **harvest_mode_opts,
         )
         return clones, calib_dict

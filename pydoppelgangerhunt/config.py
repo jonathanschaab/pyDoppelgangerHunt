@@ -59,10 +59,14 @@ def canonical_path_key(path_str: Optional[str], strip_anchor: bool = False) -> s
 
 
 
-def paths_match_boundary(p1: Optional[str], p2: Optional[str]) -> bool:
+def paths_match_boundary(
+    p1: Optional[str],
+    p2: Optional[str],
+    strip_anchor: bool = False,
+) -> bool:
     """Checks whether two normalized paths refer to the same file respecting directory boundaries."""
-    n1 = normalize_lexical_posix(p1, strip_anchor=True)
-    n2 = normalize_lexical_posix(p2, strip_anchor=True)
+    n1 = normalize_lexical_posix(p1, strip_anchor=strip_anchor)
+    n2 = normalize_lexical_posix(p2, strip_anchor=strip_anchor)
     if not n1 or not n2:
         return False
     if os.name == "nt" or sys.platform == "win32":
@@ -78,15 +82,42 @@ def find_matching_path_value(
     path_map: Dict[str, Any],
 ) -> Any:
     """Finds a value in a path-keyed mapping where keys match target_path respecting directory boundaries."""
-    target_norm = normalize_path_string(target_path)
-    if not target_norm or not path_map:
+    if not target_path or not path_map:
         return None
-    direct = path_map.get(target_norm)
+    direct = path_map.get(target_path)
     if direct is not None:
         return direct
+    # 1. Match exact normalized path (preserving anchors)
+    norm_exact = normalize_path_string(target_path, strip_anchor=False)
+    if norm_exact in path_map:
+        return path_map[norm_exact]
+    key_exact = canonical_path_key(norm_exact, strip_anchor=False)
     for k, val in path_map.items():
-        if paths_match_boundary(target_norm, k):
+        k_clean = normalize_path_string(k, strip_anchor=False)
+        if norm_exact == k_clean or key_exact == canonical_path_key(k_clean, strip_anchor=False):
             return val
+    for k, val in path_map.items():
+        if paths_match_boundary(norm_exact, k, strip_anchor=False):
+            return val
+
+    # 2. If target_path contains a notebook cell anchor, fallback to stripped anchor matching
+    target_raw = str(target_path)
+    if "#" in target_raw:
+        last_hash = target_raw.rfind("#")
+        fragment = target_raw[last_hash + 1:]
+        if fragment.lower().startswith("cell") or ".ipynb#" in target_raw:
+            target_stripped = normalize_path_string(target_raw, strip_anchor=True)
+            if target_stripped:
+                if target_stripped in path_map:
+                    return path_map[target_stripped]
+                key_stripped = canonical_path_key(target_stripped, strip_anchor=False)
+                for k, val in path_map.items():
+                    k_clean = normalize_path_string(k, strip_anchor=False)
+                    if target_stripped == k_clean or key_stripped == canonical_path_key(k_clean, strip_anchor=False):
+                        return val
+                for k, val in path_map.items():
+                    if paths_match_boundary(target_stripped, k, strip_anchor=False):
+                        return val
     return None
 
 

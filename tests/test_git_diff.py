@@ -217,6 +217,20 @@ def test_compute_unit_diff_overlap_with_notebook_cell_fragment() -> None:
     assert count == 5
     assert ratio == round(5 / 11, 4)
 
+
+def test_compute_unit_diff_overlap_with_literal_hash_in_path() -> None:
+    """Verifies that filenames with literal # (e.g. c#_repo or pkg#2) do not truncate and match properly."""
+    from pydoppelgangerhunt.git_diff import compute_unit_diff_overlap  # pylint: disable=import-outside-toplevel
+
+    unit = {"file": "c#_repo/worker.py", "start": 10, "end": 20}
+    modified_ranges = {"c#_repo/worker.py": [(12, 16)]}
+    count, ratio = compute_unit_diff_overlap(unit, modified_ranges)
+    assert count == 5
+    assert ratio == round(5 / 11, 4)
+
+    # Different path without hash does not match
+    assert compute_unit_diff_overlap(unit, {"c/worker.py": [(12, 16)]}) == (0, 0.0)
+
 def test_compute_unit_diff_overlap_missing_file() -> None:
     """Verifies that compute_unit_diff_overlap safely returns (0, 0.0) when file key is missing or empty."""
     from pydoppelgangerhunt.git_diff import compute_unit_diff_overlap  # pylint: disable=import-outside-toplevel
