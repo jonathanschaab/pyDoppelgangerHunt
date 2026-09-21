@@ -1107,6 +1107,8 @@ def scan_target(
             len(units), active_max_freq, effective_min_corpus, fallback=None
         )
 
+    remaining_novel_pair_budget: int = MAX_NOVEL_SHINGLE_PAIR_BUDGET
+
     for sh, u_indices in shingle_index.items():
         if len(u_indices) <= 1:
             continue
@@ -1142,21 +1144,27 @@ def scan_target(
         if effective_stop_shingles and sh in effective_stop_shingles:
             continue
 
-        if diff_unit_indices is not None and calib_freqs_map is not None and not is_global_shingle:
+        is_novel = calib_freqs_map is not None and not is_global_shingle
+
+        if diff_unit_indices is not None and is_novel:
             df_unmodified = len(u_indices) - df_local
             if effective_max_posting is not None and df_unmodified > effective_max_posting:
                 continue
             potential_pairs = (df_local * (df_local - 1)) // 2 + df_local * df_unmodified
-            if potential_pairs > MAX_NOVEL_SHINGLE_PAIR_BUDGET:
+            if potential_pairs > remaining_novel_pair_budget:
                 continue
         elif effective_max_posting is not None and combined_df > effective_max_posting:
             continue
-        elif calib_freqs_map is not None and not is_global_shingle:
+        elif is_novel:
             potential_pairs = (len(u_indices) * (len(u_indices) - 1)) // 2
-            if potential_pairs > MAX_NOVEL_SHINGLE_PAIR_BUDGET:
+            if potential_pairs > remaining_novel_pair_budget:
                 continue
 
+        pairs_before = len(candidate_pairs) if is_novel else 0
         _add_candidate_pairs(candidate_pairs, u_indices, diff_unit_indices)
+        if is_novel:
+            added_pairs = len(candidate_pairs) - pairs_before
+            remaining_novel_pair_budget = max(0, remaining_novel_pair_budget - added_pairs)
 
     if tfidf and units and candidate_pairs:
         keys_to_weight: Set[Any] = set(df_counts.keys())

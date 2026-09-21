@@ -1327,6 +1327,64 @@ def test_uncalibrated_novel_shingle_pair_budget_bounds_explosion(tmp_path: Path)
     assert len(clones_small) > 0
 
 
+def test_cumulative_novel_shingle_pair_budget_bounds_multiple_shingles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that the candidate-pair budget is tracked globally across multiple distinct novel shingles."""
+    import pydoppelgangerhunt.matcher as matcher  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    # Set a tight global novel pair budget: e.g. 5 pairs
+    monkeypatch.setattr(matcher, "MAX_NOVEL_SHINGLE_PAIR_BUDGET", 5)
+
+    # Shingle 1 group: 3 functions = 3 pairs <= 5
+    # Shingle 2 group: 3 functions = 3 pairs (cumulative 6 > 5)
+    lines: list[str] = []
+    for i in range(3):
+        lines.append(
+            f"def group_one_fn_{i}(val_x, val_y):\n"
+            f"    novel_token_group_one = val_x + val_y + {i}\n"
+            "    return novel_token_group_one * 10\n"
+        )
+    for i in range(3):
+        lines.append(
+            f"def group_two_fn_{i}(val_a, val_b):\n"
+            f"    novel_token_group_two = val_a * val_b + {i}\n"
+            "    return novel_token_group_two * 20\n"
+        )
+    test_file = tmp_path / "multi_novel.py"
+    test_file.write_text("\n".join(lines), encoding="utf-8")
+
+    calib = {
+        "total_units": 5000,
+        "max_index_frequency": 0.25,
+        "min_lines": 3,
+        "min_corpus_size": 4,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {},
+    }
+
+    # Group 1 uses 3 pairs (remaining budget = 2).
+    # Group 2 needs 3 pairs, which exceeds the remaining budget 2, so Group 2 is skipped.
+    clones = scan_target(
+        str(tmp_path),
+        diff_files=["multi_novel.py"],
+        min_lines=3,
+        threshold=0.70,
+        corpus_calibration=calib,
+    )
+    group_one_clones = [
+        c for c in clones
+        if "group_one_fn" in (c[1].get("name") or "") or "group_one_fn" in (c[2].get("name") or "")
+    ]
+    group_two_clones = [
+        c for c in clones
+        if "group_two_fn" in (c[1].get("name") or "") or "group_two_fn" in (c[2].get("name") or "")
+    ]
+    assert len(group_one_clones) > 0
+    assert len(group_two_clones) == 0
+
+
 def test_unit_drift_computed_when_target_units_drop_to_zero(tmp_path: Path) -> None:
     """Verifies that unit_drift is computed as 1.0 (100% drift) when active target units drop to 0."""
     from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
