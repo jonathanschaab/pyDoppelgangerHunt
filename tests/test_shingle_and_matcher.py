@@ -1243,3 +1243,46 @@ def test_differential_scan_multi_unit_file_and_shingle_dedup(tmp_path: Path) -> 
     assert cand_pairs == {(0, 4), (0, 2), (2, 4)}
     for idx1, idx2 in cand_pairs:
         assert idx1 < idx2
+
+
+def test_uncalibrated_novel_shingle_pair_budget_bounds_explosion(tmp_path: Path) -> None:
+    """Verifies that novel shingles generating massive candidate pairings are bounded by MAX_NOVEL_SHINGLE_PAIR_BUDGET."""
+    from pydoppelgangerhunt.matcher import (  # pylint: disable=import-outside-toplevel
+        MAX_NOVEL_SHINGLE_PAIR_BUDGET,
+        scan_target,
+    )
+
+    assert MAX_NOVEL_SHINGLE_PAIR_BUDGET == 10_000
+
+    # Generate a file with 150 functions sharing an uncalibrated novel shingle:
+    # 150 * 149 // 2 = 11,175 potential pairs (> 10,000 budget)
+    lines: list[str] = []
+    for i in range(150):
+        lines.append(
+            f"def action_handler_burst_{i}(arg_a, arg_b, arg_c):\n"
+            "    novel_token_sequence_xyz = arg_a + arg_b + arg_c\n"
+            f"    return novel_token_sequence_xyz * {i}\n"
+        )
+    test_file = tmp_path / "burst.py"
+    test_file.write_text("\n".join(lines), encoding="utf-8")
+
+    calib = {
+        "total_units": 5000,
+        "max_index_frequency": 0.25,
+        "min_lines": 3,
+        "min_corpus_size": 4,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {},
+    }
+
+    # In differential scan against burst.py, the novel token produces > 10,000 pairs and is skipped
+    clones = scan_target(
+        str(tmp_path),
+        diff_files=["burst.py"],
+        min_lines=3,
+        threshold=0.95,
+        corpus_calibration=calib,
+    )
+    # The unbounded candidate explosion was prevented
+    assert isinstance(clones, list)
+

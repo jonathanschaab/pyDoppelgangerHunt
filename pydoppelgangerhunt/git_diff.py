@@ -201,6 +201,21 @@ def get_git_repo_root(
     return None
 
 
+def get_git_head_commit(
+    repo_root: Optional[Union[str, Path]] = None,
+    cwd: Optional[Union[str, Path]] = None,
+) -> Optional[str]:
+    """Resolves the current HEAD commit hash of the Git repository, or None if not available."""
+    target_cwd = str(repo_root or cwd) if (repo_root or cwd) else None
+    raw = _run_git_command(["rev-parse", "HEAD"], cwd=target_cwd)
+    if not raw:
+        return None
+    commit = raw.strip()
+    if len(commit) in (40, 64) and all(c in "0123456789abcdefABCDEF" for c in commit):
+        return commit.lower()
+    return None
+
+
 
 
 def compute_unit_diff_overlap(

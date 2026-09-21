@@ -3399,6 +3399,108 @@ def test_calibrated_differential_tfidf_weights_unchanged_candidate_partner_shing
     assert {u1["file"], u2["file"]} == {"changed.py", "unchanged.py"}
 
 
+def test_calibration_config_hash_determinism_and_sensitivity() -> None:
+    """Verifies that compute_calibration_config_hash is deterministic and sensitive to all parameters."""
+    from pydoppelgangerhunt.baseline import compute_calibration_config_hash  # pylint: disable=import-outside-toplevel
+
+    cfg1: Dict[str, Any] = {"bag_of_tokens": False, "min_lines": 8, "max_index_frequency": 0.25, "idioms": True}
+    cfg2: Dict[str, Any] = {"idioms": True, "max_index_frequency": 0.25, "min_lines": 8, "bag_of_tokens": False}
+    hash1 = compute_calibration_config_hash(cfg1)
+    hash2 = compute_calibration_config_hash(cfg2)
+    assert hash1 == hash2
+    assert len(hash1) == 64
+
+    # Sensitive to bag_of_tokens
+    cfg_bot = dict(cfg1)
+    cfg_bot["bag_of_tokens"] = True
+    assert compute_calibration_config_hash(cfg_bot) != hash1
+
+    # Sensitive to min_lines
+    cfg_lines = dict(cfg1)
+    cfg_lines["min_lines"] = 10
+    assert compute_calibration_config_hash(cfg_lines) != hash1
+
+    # Sensitive to max_index_frequency
+    cfg_freq = dict(cfg1)
+    cfg_freq["max_index_frequency"] = 0.50
+    assert compute_calibration_config_hash(cfg_freq) != hash1
+
+    # Sensitive to max_index_frequency=None
+    cfg_none = dict(cfg1)
+    cfg_none["max_index_frequency"] = None
+    assert compute_calibration_config_hash(cfg_none) != hash1
+
+
+def test_baseline_config_hash_and_recorded_commit_roundtrip(tmp_path: Path) -> None:
+    """Verifies that record_baseline and load_baseline preserve config_hash and recorded_commit."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        compute_corpus_calibration,
+        load_baseline,
+        record_baseline,
+    )
+
+    baseline_file = str(tmp_path / "baseline_calib_hash.json")
+    calib = compute_corpus_calibration([], min_lines=8, bag_of_tokens=True)
+    assert "config_hash" in calib
+    assert len(calib["config_hash"]) == 64
+
+    saved_path = record_baseline([], baseline_file, str(tmp_path), 0.90, corpus_calibration=calib)
+    assert Path(saved_path).exists()
+
+    data = json.loads(Path(saved_path).read_text(encoding="utf-8"))
+    assert "config_hash" in data
+    assert data["config_hash"] == calib["config_hash"]
+    assert "corpus_calibration" in data
+    assert data["corpus_calibration"]["config_hash"] == calib["config_hash"]
+
+    loaded = load_baseline(baseline_file)
+    assert loaded.config_hash == calib["config_hash"]
+    assert loaded.corpus_calibration is not None
+    assert loaded.corpus_calibration.get("config_hash") == calib["config_hash"]
+
+
+def test_legacy_baseline_loads_without_config_hash_or_recorded_commit(tmp_path: Path) -> None:
+    """Verifies that legacy baselines lacking config_hash or recorded_commit load safely."""
+    from pydoppelgangerhunt.baseline import load_baseline  # pylint: disable=import-outside-toplevel
+
+    legacy_file = tmp_path / "legacy_v14.json"
+    legacy_data = {
+        "version": "1.4.0",
+        "threshold": 0.85,
+        "clone_count": 0,
+        "fingerprints": [],
+        "corpus_calibration": {
+            "total_units": 100,
+            "max_index_frequency": 0.25,
+            "global_stop_shingles": [],
+            "shingle_frequencies": {},
+        },
+    }
+    legacy_file.write_text(json.dumps(legacy_data), encoding="utf-8")
+
+    loaded = load_baseline(str(legacy_file))
+    assert loaded.corpus_calibration is not None
+    assert "config_hash" in loaded.corpus_calibration
+    assert loaded.recorded_commit is None
+
+
+def test_get_git_head_commit_behavior(tmp_path: Path) -> None:
+    """Verifies get_git_head_commit resolution in git repos and outside git repos."""
+    from pydoppelgangerhunt.git_diff import get_git_head_commit  # pylint: disable=import-outside-toplevel
+
+    # Inside current git repo
+    head_commit = get_git_head_commit()
+    assert head_commit is not None
+    assert len(head_commit) in (40, 64)
+    assert all(c in "0123456789abcdef" for c in head_commit)
+
+    # Outside git repo
+    empty_dir = tmp_path / "not_a_git_repo"
+    empty_dir.mkdir()
+    assert get_git_head_commit(repo_root=empty_dir) is None
+
+
+
 
 
 

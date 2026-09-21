@@ -84,17 +84,15 @@ HARVEST_BOOLEAN_MODES: Tuple[Tuple[str, bool], ...] = (
 )
 
 
-def _attach_calibration_flags(
-    target: Dict[str, Any],
-    source: Dict[str, Any],
-) -> None:
-    """Attaches feature mode flags and bounds from source dictionary to target calibration dict."""
-    if not isinstance(source, dict) or not isinstance(target, dict):
-        return
+def _extract_calibration_settings(source: Dict[str, Any]) -> Dict[str, Any]:
+    """Extracts and normalizes harvesting flags and integer bounds from a source configuration dict."""
+    settings: Dict[str, Any] = {}
+    if not isinstance(source, dict):
+        return settings
     for flag in ("bag_of_tokens", "call_sequences", "filter_stop_shingles"):
-        target[flag] = _safe_bool(source.get(flag, False))
+        settings[flag] = _safe_bool(source.get(flag, False))
     for flag, default_val in HARVEST_BOOLEAN_MODES:
-        target[flag] = _safe_bool(source.get(flag, default_val))
+        settings[flag] = _safe_bool(source.get(flag, default_val))
     for int_flag, default_int in (
         ("window_size", 5),
         ("min_expr_complexity", 4),
@@ -104,19 +102,29 @@ def _attach_calibration_flags(
         raw_val = source.get(int_flag, default_int)
         try:
             val = int(raw_val)
-            target[int_flag] = val if val > 0 else default_int
+            settings[int_flag] = val if val > 0 else default_int
         except (ValueError, TypeError, OverflowError):
-            target[int_flag] = default_int
+            settings[int_flag] = default_int
     if "min_corpus_size" in source:
         raw_mcs = source.get("min_corpus_size")
         if raw_mcs is None:
-            target["min_corpus_size"] = None
+            settings["min_corpus_size"] = None
         else:
             try:
                 val = int(raw_mcs)
-                target["min_corpus_size"] = val if val >= 0 else None
+                settings["min_corpus_size"] = val if val >= 0 else None
             except (ValueError, TypeError, OverflowError):
-                target["min_corpus_size"] = None
+                settings["min_corpus_size"] = None
+    return settings
+
+
+def _attach_calibration_flags(
+    target: Dict[str, Any],
+    source: Dict[str, Any],
+) -> None:
+    """Attaches feature mode flags and bounds from source dictionary to target calibration dict."""
+    if isinstance(target, dict) and isinstance(source, dict):
+        target.update(_extract_calibration_settings(source))
 
 
 def _serialize_shingle_key(sh: Any) -> str:
@@ -242,6 +250,19 @@ def _safe_index_frequency(raw_freq: Any) -> Optional[float]:
     return None
 
 
+def compute_calibration_config_hash(source: Dict[str, Any]) -> str:
+    """Computes a deterministic SHA-256 hash for a set of calibration or scan configuration settings."""
+    settings = _extract_calibration_settings(source)
+    if "max_index_frequency" in source:
+        raw_mif = source.get("max_index_frequency")
+        parsed_mif = _safe_index_frequency(raw_mif) if raw_mif is not None else None
+        settings["max_index_frequency"] = round(parsed_mif, 6) if parsed_mif is not None else None
+    else:
+        settings["max_index_frequency"] = 0.25
+    canonical_json = json.dumps(settings, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+
 def compute_corpus_calibration(
     units: Sequence[Dict[str, Any]],
     max_index_frequency: Optional[float] = 0.25,
@@ -288,7 +309,7 @@ def compute_corpus_calibration(
         except (ValueError, TypeError, OverflowError):
             pass
 
-    calib = {
+    calib: Dict[str, Any] = {
         "total_units": total_units,
         "max_index_frequency": valid_max_freq,
         "global_stop_shingles": global_stop_shingles,
@@ -302,6 +323,7 @@ def compute_corpus_calibration(
     }
     flags_dict.update(kwargs)
     _attach_calibration_flags(calib, flags_dict)
+    calib["config_hash"] = compute_calibration_config_hash(calib)
     return calib
 
 
@@ -413,8 +435,12 @@ def record_baseline(
             for sim, u1, u2 in clones
         ],
     }
+    target_p = Path(baseline_path)
     if target_repo_rel:
         data["target_repo_relative"] = target_repo_rel
+    head_commit = git_diff.get_git_head_commit(repo_root=target)
+    if head_commit:
+        data["recorded_commit"] = head_commit
     if isinstance(corpus_calibration, dict):
         total_units_val = _safe_total_units(corpus_calibration.get("total_units"))
 
@@ -442,15 +468,23 @@ def record_baseline(
             max_units=total_units_val,
         )
 
-        calib_entry = {
+        calib_entry: Dict[str, Any] = {
             "total_units": total_units_val,
             "max_index_frequency": safe_max_freq,
             "global_stop_shingles": safe_stops,
             "shingle_frequencies": dict(sorted(safe_shingle_freqs.items(), key=lambda item: item[0])),
         }
         _attach_calibration_flags(calib_entry, corpus_calibration)
+        calib_config_hash = (
+            str(corpus_calibration.get("config_hash"))
+            if corpus_calibration.get("config_hash")
+            else compute_calibration_config_hash(calib_entry)
+        )
+        calib_entry["config_hash"] = calib_config_hash
+        if head_commit:
+            calib_entry["recorded_commit"] = head_commit
         data["corpus_calibration"] = calib_entry
-    target_p = Path(baseline_path)
+        data["config_hash"] = calib_config_hash
     target_p.parent.mkdir(parents=True, exist_ok=True)
     target_p.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return str(target_p)
@@ -466,12 +500,16 @@ class BaselineFingerprints(set):  # type: ignore[type-arg]
         corpus_calibration: Optional[Dict[str, Any]] = None,
         path_basis: Optional[str] = None,
         target_repo_relative: Optional[str] = None,
+        config_hash: Optional[str] = None,
+        recorded_commit: Optional[str] = None,
     ) -> None:
         super().__init__(fps or set())
         self.records: List[Dict[str, Any]] = records or []
         self.corpus_calibration: Optional[Dict[str, Any]] = corpus_calibration
         self.path_basis: Optional[str] = path_basis
         self.target_repo_relative: Optional[str] = target_repo_relative
+        self.config_hash: Optional[str] = config_hash
+        self.recorded_commit: Optional[str] = recorded_commit
 
 
 def _parse_legacy_fingerprint_record(raw_fp: str) -> Dict[str, Any]:
@@ -559,6 +597,8 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
 
         raw_calib = data.get("corpus_calibration")
         corpus_calibration: Optional[Dict[str, Any]] = None
+        calib_cfg_hash: Optional[str] = None
+        calib_commit: Optional[str] = None
         if isinstance(raw_calib, dict):
             raw_stops = raw_calib.get("global_stop_shingles", [])
             decoded_stops: Set[Any] = set()
@@ -582,13 +622,25 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
                 parsed_max = _safe_index_frequency(raw_max_freq)
                 max_idx_freq = parsed_max if parsed_max is not None else 0.25
 
+            calib_cfg_hash = raw_calib.get("config_hash")
+            if not calib_cfg_hash:
+                calib_cfg_hash = compute_calibration_config_hash(raw_calib)
+
+            calib_commit = raw_calib.get("recorded_commit")
+
             corpus_calibration = {
                 "total_units": calib_total_units,
                 "max_index_frequency": max_idx_freq,
                 "global_stop_shingles": decoded_stops,
                 "shingle_frequencies": decoded_freqs,
+                "config_hash": calib_cfg_hash,
             }
+            if calib_commit:
+                corpus_calibration["recorded_commit"] = calib_commit
             _attach_calibration_flags(corpus_calibration, raw_calib)
+
+        top_cfg_hash = calib_cfg_hash or data.get("config_hash")
+        top_commit = calib_commit or data.get("recorded_commit")
 
         path_basis = data.get("path_basis")
         target_repo_rel = data.get("target_repo_relative")
@@ -598,6 +650,8 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
             corpus_calibration=corpus_calibration,
             path_basis=path_basis,
             target_repo_relative=target_repo_rel,
+            config_hash=top_cfg_hash,
+            recorded_commit=top_commit,
         )
     except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError, TypeError, AttributeError, RecursionError):
         return BaselineFingerprints()

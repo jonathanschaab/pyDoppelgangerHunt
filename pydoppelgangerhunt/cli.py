@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.baseline import (
     BaselineFingerprints,
+    compute_calibration_config_hash,
     filter_clones_by_baseline,
     load_baseline,
     prune_baseline,
@@ -28,6 +29,7 @@ from pydoppelgangerhunt.fixer import generate_refactoring_patch
 from pydoppelgangerhunt.git_diff import (
     check_temporal_divergence,
     filter_clones_by_git_diff,
+    get_git_head_commit,
     get_git_modified_files,
     get_git_modified_line_ranges,
     get_git_repo_root,
@@ -736,6 +738,48 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if baseline_path and not args.record_baseline and os.path.exists(baseline_path):
         preloaded_baseline = load_baseline(baseline_path)
         calib_dict = getattr(preloaded_baseline, "corpus_calibration", None)
+        if calib_dict and isinstance(calib_dict, dict) and args.format == "text":
+            calib_hash = calib_dict.get("config_hash") or getattr(preloaded_baseline, "config_hash", None)
+            if calib_hash:
+                active_cfg: Dict[str, Any] = {
+                    "bag_of_tokens": args.bag_of_tokens,
+                    "call_sequences": call_seq_enabled,
+                    "filter_stop_shingles": stop_shingles_enabled,
+                    "max_index_frequency": max_index_frequency,
+                    "min_corpus_size": min_corpus_size,
+                    "min_lines": min_lines,
+                    "min_tokens": min_tokens,
+                    "functions_only": args.functions_only,
+                    "sliding_window": args.sliding_window,
+                    "window_size": args.window_size,
+                    "blind_indexing": args.blind_indexing,
+                    "merge_subtrees": args.merge_subtrees,
+                    "complex_expressions": args.complex_expressions,
+                    "min_expr_complexity": args.min_expr_complexity,
+                    "clause_level": args.clause_level,
+                    "data_tables": args.data_tables,
+                    "strip_annotations": strip_annotations,
+                    "nms": args.nms,
+                    "class_level": args.class_level,
+                    "blind_literals": args.blind_literals,
+                    "filter_boilerplate": args.filter_boilerplate,
+                    "consistent_renaming": args.consistent_renaming,
+                    "harvest_closures": args.harvest_closures,
+                    "commutative": args.commutative,
+                    "comprehensions": args.comprehensions,
+                    "idioms": idioms_enabled,
+                    "abstract_expressions": args.abstract_expressions,
+                    "strip_docstrings": strip_docstrings,
+                }
+                active_hash = compute_calibration_config_hash(active_cfg)
+                if calib_hash != active_hash:
+                    print(
+                        colorize(
+                            f"Warning: Active scan configuration does not match baseline calibration config (baseline: {calib_hash[:8]}, active: {active_hash[:8]}). Calibration shingle frequencies may not align with active scan settings.",
+                            COLOR_BOLD + COLOR_YELLOW,
+                            use_color,
+                        )
+                    )
 
     diff_files: Optional[Sequence[str]] = None
     if args.diff_only:
@@ -809,6 +853,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         clones = scan_res
     else:
         clones = []
+
+    if calib_dict and isinstance(calib_dict, dict) and args.format == "text":
+        drift = calib_dict.get("unit_drift")
+        if drift is not None and drift >= 0.20:
+            curr_units = calib_dict.get("current_units")
+            base_units = calib_dict.get("total_units")
+            print(
+                colorize(
+                    f"Warning: Calibration drift detected: repository units drifted by {drift:.1%} from baseline calibration "
+                    f"(current: {curr_units}, baseline: {base_units}). "
+                    f"Consider re-running with --record-baseline to refresh calibration.",
+                    COLOR_BOLD + COLOR_YELLOW,
+                    use_color,
+                )
+            )
+        base_commit = calib_dict.get("recorded_commit") or getattr(preloaded_baseline, "recorded_commit", None)
+        if base_commit and args.verbose:
+            curr_commit = get_git_head_commit(repo_root=target_repo_root)
+            if curr_commit and base_commit.lower() != curr_commit.lower():
+                print(
+                    colorize(
+                        f"Info: Repository HEAD commit {curr_commit[:8]} differs from baseline recorded commit {base_commit[:8]}.",
+                        COLOR_YELLOW,
+                        use_color,
+                    )
+                )
 
     if args.record_baseline:
         bp = record_baseline(

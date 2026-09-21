@@ -1537,4 +1537,121 @@ def test_normalize_path_string_nfc_normalization(monkeypatch: pytest.MonkeyPatch
     assert not paths_match_boundary(nfd_path, nfc_path)
 
 
+def test_cli_warns_on_calibration_config_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that main() emits an advisory warning when scan configuration differs from baseline calibration."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo_cfg_mismatch"
+    repo.mkdir()
+    code = (
+        "def sample_func(x):\n"
+        "    a = x + 1\n"
+        "    b = a * 2\n"
+        "    c = b - 3\n"
+        "    return c * 4\n"
+    )
+    (repo / "f1.py").write_text(code, encoding="utf-8")
+    baseline_file = tmp_path / "baseline_mismatch.json"
+
+    # 1. Record baseline with min_lines=4
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--record-baseline",
+            str(baseline_file),
+            "--min-lines",
+            "4",
+            "--threshold",
+            "0.90",
+        ],
+    )
+    assert main() == 0
+    capsys.readouterr()
+
+    # 2. Run scan with min_lines=10 (config mismatch)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(baseline_file),
+            "--min-lines",
+            "10",
+            "--threshold",
+            "0.90",
+        ],
+    )
+    exit_code = main()
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Warning: Active scan configuration does not match baseline calibration config" in out
+
+
+def test_cli_warns_on_calibration_unit_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that main() emits a calibration drift warning when repository units drift >= 20% from baseline."""
+    import json  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo_unit_drift"
+    repo.mkdir()
+    code = (
+        "def helper_action(val):\n"
+        "    res = [x * 2 for x in val if x > 0]\n"
+        "    return sum(res)\n"
+    )
+    (repo / "f1.py").write_text(code, encoding="utf-8")
+    baseline_file = tmp_path / "baseline_drift.json"
+
+    # 1. Record baseline with CLI to guarantee identical configuration settings
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--record-baseline",
+            str(baseline_file),
+            "--threshold",
+            "0.90",
+            "--min-lines",
+            "3",
+        ],
+    )
+    assert main() == 0
+    capsys.readouterr()
+
+    # 2. Artificially simulate repository unit drift in the recorded baseline
+    raw_data = json.loads(baseline_file.read_text(encoding="utf-8"))
+    assert "corpus_calibration" in raw_data
+    raw_data["corpus_calibration"]["total_units"] = 100
+    baseline_file.write_text(json.dumps(raw_data), encoding="utf-8")
+
+    # 3. Run scan with --baseline (same config, but drifted unit count)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(baseline_file),
+            "--threshold",
+            "0.90",
+            "--min-lines",
+            "3",
+        ],
+    )
+    exit_code = main()
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Warning: Calibration drift detected: repository units drifted by" in out
+
+
+
+
 

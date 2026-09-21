@@ -24,8 +24,11 @@ from pydoppelgangerhunt.baseline import (
     _safe_index_frequency,
     _safe_min_corpus,
     _safe_total_units,
+    compute_calibration_config_hash,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
+
+MAX_NOVEL_SHINGLE_PAIR_BUDGET: int = 10_000
 
 DEFAULT_STOP_SHINGLES: Set[Tuple[str, ...]] = {
     # Main guard boilerplate: if __name__ == "__main__":
@@ -674,6 +677,18 @@ def _is_calibration_mode_compatible(
     """Validates that corpus calibration was generated with compatible representation, filtering, and AST shaping features."""
     if not isinstance(calib, dict):
         return False
+    calib_hash = calib.get("config_hash")
+    if calib_hash:
+        active_cfg = dict(kwargs)
+        active_cfg.update({
+            "bag_of_tokens": bag_of_tokens,
+            "call_sequences": call_sequences,
+            "filter_stop_shingles": filter_stop_shingles,
+            "max_index_frequency": max_index_frequency,
+            "min_corpus_size": min_corpus_size,
+        })
+        if calib_hash == compute_calibration_config_hash(active_cfg):
+            return True
     if _safe_bool(calib.get("bag_of_tokens", False)) != bool(bag_of_tokens):
         return False
     if _safe_bool(calib.get("call_sequences", False)) != bool(call_sequences):
@@ -938,6 +953,10 @@ def scan_target(
     ):
         corpus_calibration = None
     if corpus_calibration is not None:
+        calib_total = _safe_total_units(corpus_calibration.get("total_units"))
+        if calib_total > 0 and units:
+            corpus_calibration["current_units"] = len(units)
+            corpus_calibration["unit_drift"] = round(abs(len(units) - calib_total) / calib_total, 4)
         calib_stops = corpus_calibration.get("global_stop_shingles")
         if calib_stops and isinstance(calib_stops, (list, set, tuple)):
             from pydoppelgangerhunt.baseline import _deep_tuple
@@ -1074,8 +1093,15 @@ def scan_target(
                 df_unmodified > effective_max_posting or len(u_indices) > effective_max_posting
             ):
                 continue
+            potential_pairs = (df_local * (df_local - 1)) // 2 + df_local * df_unmodified
+            if potential_pairs > MAX_NOVEL_SHINGLE_PAIR_BUDGET:
+                continue
         elif effective_max_posting is not None and combined_df > effective_max_posting:
             continue
+        elif calib_freqs_map is not None and not is_global_shingle:
+            potential_pairs = (len(u_indices) * (len(u_indices) - 1)) // 2
+            if potential_pairs > MAX_NOVEL_SHINGLE_PAIR_BUDGET:
+                continue
 
         _add_candidate_pairs(candidate_pairs, u_indices, diff_unit_indices)
 
