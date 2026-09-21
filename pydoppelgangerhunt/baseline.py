@@ -1124,6 +1124,10 @@ def prune_baseline(
                 pruned_count += 1
 
     data["version"] = "1.5.0"
+    if "path_basis" not in data or not data["path_basis"]:
+        data["path_basis"] = "target_relative"
+    if "target_repo_relative" not in data and resolver is not None and resolver.target_in_repo:
+        data["target_repo_relative"] = resolver.target_in_repo
     data["clone_count"] = len(retained)
     data["fingerprints"] = retained
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")

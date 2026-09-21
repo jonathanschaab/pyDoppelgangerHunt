@@ -3574,6 +3574,42 @@ def test_calibration_compatibility_audit_tests_and_include_notebooks() -> None:
     assert not _is_calibration_mode_compatible(calib_std, audit_tests=False, include_notebooks=True)
 
 
+def test_prune_baseline_legacy_upgrade_adds_path_basis(tmp_path: Path) -> None:
+    """Verifies that pruning a legacy v1.0–v1.4 baseline adds path_basis: target_relative when upgrading to v1.5.0."""
+    from pydoppelgangerhunt.baseline import load_baseline, prune_baseline  # pylint: disable=import-outside-toplevel
+
+    legacy_file = tmp_path / "legacy_v1_baseline.json"
+    legacy_data = {
+        "version": "1.0.0",
+        "created_at": "2026-01-01T00:00:00Z",
+        "target": "src",
+        "threshold": 0.90,
+        "clone_count": 1,
+        "fingerprints": [
+            {
+                "fingerprint": "src/a.py:f1 <===> src/b.py:f2",
+                "file_a": "src/a.py",
+                "file_b": "src/b.py",
+                "name_a": "f1",
+                "name_b": "f2",
+                "similarity": 0.95,
+            }
+        ],
+    }
+    legacy_file.write_text(json.dumps(legacy_data), encoding="utf-8")
+
+    prune_res = prune_baseline(str(legacy_file), active_clones=[], unstaged_modified_ranges={})
+    assert prune_res.pruned_count == 1
+
+    raw_saved = json.loads(legacy_file.read_text(encoding="utf-8"))
+    assert raw_saved["version"] == "1.5.0"
+    assert raw_saved["path_basis"] == "target_relative"
+
+    loaded = load_baseline(str(legacy_file))
+    assert loaded.path_basis == "target_relative"
+
+
+
 
 
 
