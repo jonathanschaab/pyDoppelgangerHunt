@@ -3316,6 +3316,25 @@ def test_baseline_matching_preserves_target_relative_subdirectory_identity(
     monkeypatch.setattr("sys.argv", cross_args)
     assert main() == 0
 
+    # 5. Pruning root_baseline while targeting repo/src must retain the clone via boundary matching
+    prune_args = [
+        "pydoppelgangerhunt",
+        str(src),
+        "--baseline",
+        str(root_baseline),
+        "--prune-baseline",
+        "--threshold",
+        "0.90",
+        "--min-lines",
+        "5",
+    ]
+    monkeypatch.setattr("sys.argv", prune_args)
+    assert main() == 0
+
+    reloaded_root = load_baseline(str(root_baseline))
+    assert len(reloaded_root.records) == 1
+    assert reloaded_root.records[0]["file_a"].replace("\\", "/").startswith("src/pkg/")
+
 
 def test_calibrated_differential_tfidf_weights_unchanged_candidate_partner_shingles(
     tmp_path: Path,

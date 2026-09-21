@@ -390,7 +390,8 @@ def _normalize_git_paths_for_target(
     for p_str in raw_paths:
         if not p_str:
             continue
-        normalized.append(p_str)
+        if p_str not in normalized:
+            normalized.append(p_str)
         rel = _resolve_target_relative_path(p_str, res_git, res_target)
         if rel and rel not in normalized:
             normalized.append(rel)
@@ -413,8 +414,10 @@ def _normalize_modified_ranges_for_target(
 
     expanded = dict(modified_ranges)
     for p_str, ranges in modified_ranges.items():
+        if not p_str:
+            continue
         rel = _resolve_target_relative_path(p_str, res_git, res_target)
-        if rel:
+        if rel and rel != ".":
             expanded[rel] = ranges
     return expanded
 

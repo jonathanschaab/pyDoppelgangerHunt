@@ -1157,13 +1157,13 @@ def scan_target(
 
     if tfidf and units and candidate_pairs:
         keys_to_weight: Set[Any] = set(df_counts.keys())
-        for i, j in candidate_pairs:
-            for u_idx in (i, j):
-                u = units[u_idx]
-                u_keys = u.get("vector", {}).keys() if bag_of_tokens else u["shingles"]
-                for k in u_keys:
-                    if not (effective_stop_shingles and k in effective_stop_shingles):
-                        keys_to_weight.add(k)
+        active_candidate_units = {idx for pair in candidate_pairs for idx in pair}
+        for u_idx in active_candidate_units:
+            u = units[u_idx]
+            u_keys = u.get("vector", {}).keys() if bag_of_tokens else u["shingles"]
+            for k in u_keys:
+                if not (effective_stop_shingles and k in effective_stop_shingles):
+                    keys_to_weight.add(k)
 
         for k in keys_to_weight:
             df = df_counts.get(k, 0)

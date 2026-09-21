@@ -590,6 +590,26 @@ def _record_matches_names(rec: Dict[str, Any], target_names: List[str]) -> bool:
     return rec_names == target_names
 
 
+def _matches_boundary_and_structural_hashes(
+    r_fa: str,
+    r_fb: str,
+    r_ha: str,
+    r_hb: str,
+    c_fa: str,
+    c_fb: str,
+    c_ha: str,
+    c_hb: str,
+) -> bool:
+    """Checks if two clone endpoints match directory boundary paths and identical structural hashes."""
+    if not (r_ha and r_hb and c_ha and c_hb):
+        return False
+    if r_ha == c_ha and r_hb == c_hb:
+        return paths_match_boundary(r_fa, c_fa) and paths_match_boundary(r_fb, c_fb)
+    if r_ha == c_hb and r_hb == c_ha:
+        return paths_match_boundary(r_fa, c_fb) and paths_match_boundary(r_fb, c_fa)
+    return False
+
+
 def _match_clone_record(
     c_keys: Dict[str, Any],
     unconsumed: List[Dict[str, Any]],
@@ -666,13 +686,10 @@ def _match_clone_record(
         c_fb = str(c_keys.get("file_b") or "")
         c_ha = str(c_keys.get("hash_a") or "")
         c_hb = str(c_keys.get("hash_b") or "")
-        if (
-            (r_ha and c_ha and r_ha == c_ha and r_hb and c_hb and r_hb == c_hb
-             and paths_match_boundary(r_fa, c_fa) and paths_match_boundary(r_fb, c_fb))
-            or (r_ha and c_hb and r_ha == c_hb and r_hb and c_ha and r_hb == c_ha
-                and paths_match_boundary(r_fa, c_fb) and paths_match_boundary(r_fb, c_fa))
+        if _matches_boundary_and_structural_hashes(
+            r_fa, r_fb, r_ha, r_hb, c_fa, c_fb, c_ha, c_hb
         ):
-            if _record_matches_names(rec, c_names):
+            if not rec.get("name_a") or _record_matches_names(rec, c_names):
                 return rec
 
     return None
@@ -704,8 +721,8 @@ def filter_clones_by_baseline(
                 "names": sorted([str(u1.get("name") or ""), str(u2.get("name") or "")]),
                 "file_a": str(u1.get("file") or ""),
                 "file_b": str(u2.get("file") or ""),
-                "hash_a": str(u1.get("structural_hash") or ""),
-                "hash_b": str(u2.get("structural_hash") or ""),
+                "hash_a": str(u1.get("structural_hash") or compute_unit_structural_hash(u1)),
+                "hash_b": str(u2.get("structural_hash") or compute_unit_structural_hash(u2)),
             }
             matched_rec = _match_clone_record(c_keys, unconsumed)
             if matched_rec is not None:
@@ -869,7 +886,7 @@ def prune_baseline(
         )
 
         matched_clone: Optional[Tuple[Dict[str, Any], Dict[str, Any]]] = None
-
+        is_boundary_matched = False
         if not is_active and item_pure_sfp and item_pure_sfp in active_pure_sfps:
             item_ns = sorted([
                 item.get("namespace_a") or extract_unit_namespace(str(item.get("file_a") or "")),
@@ -889,6 +906,25 @@ def prune_baseline(
                     is_active = True
                     matched_clone = (u1, u2)
                     break
+
+        if not is_active:
+            r_fa = str(item.get("file_a") or "")
+            r_fb = str(item.get("file_b") or "")
+            for _sim, u1, u2 in active_clones:
+                u1_f = str(u1.get("file") or "")
+                u2_f = str(u2.get("file") or "")
+                u1_h = compute_unit_structural_hash(u1)
+                u2_h = compute_unit_structural_hash(u2)
+                if _matches_boundary_and_structural_hashes(
+                    r_fa, r_fb, h_a, h_b, u1_f, u2_f, u1_h, u2_h
+                ):
+                    c_names = sorted([str(u1.get("name") or ""), str(u2.get("name") or "")])
+                    if not item.get("name_a") or _record_matches_names(item, c_names):
+                        is_active = True
+                        is_boundary_matched = True
+                        matched_clone = (u1, u2)
+                        break
+
         if is_active:
             if not matched_clone and item_sfp and item_sfp in sfp_to_clone:
                 matched_clone = sfp_to_clone[item_sfp]
@@ -907,6 +943,7 @@ def prune_baseline(
 
             if (
                 matched_clone
+                and not is_boundary_matched
                 and (item_fp not in active_fps or item_sfp not in active_sfps)
             ):
                 u1, u2 = matched_clone
