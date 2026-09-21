@@ -689,7 +689,7 @@ def _add_candidate_pairs(
     if diff_unit_indices is None:
         for i, idx1 in enumerate(indices):
             for idx2 in indices[i + 1:]:
-                candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))
+                candidate_pairs.add((idx1, idx2))
         return
 
     diff_in: List[int] = []
@@ -705,11 +705,11 @@ def _add_candidate_pairs(
 
     for i, idx1 in enumerate(diff_in):
         for idx2 in diff_in[i + 1:]:
-            candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))
+            candidate_pairs.add((idx1, idx2))
 
     for idx1 in diff_in:
         for idx2 in diff_out:
-            candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))
+            candidate_pairs.add((idx1, idx2) if idx1 < idx2 else (idx2, idx1))
 
 
 def _build_calibration_metadata(
@@ -971,16 +971,22 @@ def scan_target(
         diff_keys = _build_diff_path_keys(
             diff_files, res_repo_root, res_target_dir, git_root_resolved=git_root_resolved
         )
-        diff_unit_indices = {
-            idx
-            for idx, u in enumerate(units)
+        unique_unit_files = {u.get("file") for u in units if u.get("file")}
+        matching_files = {
+            f
+            for f in unique_unit_files
             if _unit_matches_diff_keys(
-                u.get("file"),
+                f,
                 diff_keys,
                 res_repo_root,
                 res_target_dir,
                 git_root_resolved=git_root_resolved,
             )
+        }
+        diff_unit_indices = {
+            idx
+            for idx, u in enumerate(units)
+            if u.get("file") in matching_files
         }
         if not diff_unit_indices:
             if return_calibration:
@@ -1061,11 +1067,11 @@ def scan_target(
     shingle_index: Dict[Any, List[int]] = {}
     for idx, u in enumerate(units):
         if call_sequences:
-            index_keys = list(set(u.get("calls", [])))
+            index_keys = set(u.get("calls", []))
         elif bag_of_tokens:
-            index_keys = list(u.get("vector", {}).keys())
+            index_keys = set(u.get("vector", {}))
         else:
-            index_keys = list(u["shingles"])
+            index_keys = set(u.get("shingles") or ())
         for sh in index_keys:
             if effective_stop_shingles and sh in effective_stop_shingles:
                 continue

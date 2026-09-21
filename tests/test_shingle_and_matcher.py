@@ -1193,3 +1193,53 @@ def test_batch_82_matcher_sloc_and_priority_score_bounds() -> None:
         reverse=True,
     )
     assert len(clone_pairs) == 2
+
+
+def test_differential_scan_multi_unit_file_and_shingle_dedup(tmp_path: Path) -> None:
+    """Verifies differential scanning with multi-unit files and candidate pair monotonic ordering."""
+    from pydoppelgangerhunt.matcher import _add_candidate_pairs  # pylint: disable=import-outside-toplevel
+
+    file_a = tmp_path / "file_a.py"
+    file_a.write_text(
+        "def func_one(x: int) -> int:\n"
+        "    a = x + 1\n"
+        "    b = a * 2\n"
+        "    c = b - 3\n"
+        "    return c * 4\n\n"
+        "def func_two(x: int) -> int:\n"
+        "    a = x + 1\n"
+        "    b = a * 2\n"
+        "    c = b - 3\n"
+        "    return c * 4\n\n"
+        "def func_three(x: int) -> int:\n"
+        "    return x ** 2 + 100\n",
+        encoding="utf-8",
+    )
+
+    file_b = tmp_path / "file_b.py"
+    file_b.write_text(
+        "def func_four(x: int) -> int:\n"
+        "    a = x + 1\n"
+        "    b = a * 2\n"
+        "    c = b - 3\n"
+        "    return c * 4\n",
+        encoding="utf-8",
+    )
+
+    clones = scan_target(
+        str(tmp_path),
+        diff_files=["file_a.py"],
+        threshold=0.85,
+        min_lines=3,
+        min_tokens=5,
+    )
+    assert len(clones) >= 1
+    for _, u1, u2 in clones:
+        files = {Path(u1["file"]).name, Path(u2["file"]).name}
+        assert "file_a.py" in files
+
+    cand_pairs: set[Tuple[int, int]] = set()
+    _add_candidate_pairs(cand_pairs, [0, 2, 4], diff_unit_indices={0, 4})
+    assert cand_pairs == {(0, 4), (0, 2), (2, 4)}
+    for idx1, idx2 in cand_pairs:
+        assert idx1 < idx2
