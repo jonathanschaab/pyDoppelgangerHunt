@@ -197,7 +197,7 @@ def get_git_repo_root(
         return None
     top = raw.strip()
     if top:
-        return normalize_path_string(top, strip_anchor=True)
+        return normalize_path_string(top, strip_anchor=False)
     return None
 
 

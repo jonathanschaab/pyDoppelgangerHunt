@@ -1002,6 +1002,15 @@ def test_get_git_repo_root_security_and_edge_cases(tmp_path: Path, monkeypatch: 
     )
     assert get_git_repo_root(repo_root=tmp_path) is None
 
+    # 5. Repository path containing hash characters is preserved (not stripped as an anchor)
+    hash_repo = "/tmp/repo#1/subproject"
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: hash_repo + "\n" if args == ["rev-parse", "--show-toplevel"] else None,
+    )
+    assert get_git_repo_root(repo_root=tmp_path) == hash_repo
+
+
 
 def test_diff_unit_matching_subprocess_efficiency(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Verifies scan_target resolves git root once rather than executing git subprocess for every unit."""
