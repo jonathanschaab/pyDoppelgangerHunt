@@ -588,7 +588,8 @@ def _build_diff_path_keys(
 ) -> Set[str]:
     """Builds canonical lookup keys for diff files resolved against repo and target roots."""
     effective_repo = git_root_resolved or repo_root
-    resolver = CanonicalPathResolver(target_root=target_dir, repo_root=effective_repo)
+    target_root_dir = target_dir if target_dir.is_dir() else target_dir.parent
+    resolver = CanonicalPathResolver(target_root=target_root_dir, repo_root=effective_repo)
     return build_diff_path_keys(diff_files, resolver)
 
 
@@ -603,10 +604,10 @@ def _unit_matches_diff_keys(
     if not u_file_raw or not diff_keys:
         return False
     effective_repo = git_root_resolved or repo_root
-    resolver = CanonicalPathResolver(target_root=target_dir, repo_root=effective_repo)
+    target_root_dir = target_dir if target_dir.is_dir() else target_dir.parent
+    resolver = CanonicalPathResolver(target_root=target_root_dir, repo_root=effective_repo)
     is_target_relative_harvest = (
-        repo_root.resolve() == target_dir.resolve()
-        or (not target_dir.is_dir() and repo_root.resolve() == target_dir.parent.resolve())
+        repo_root.resolve() == target_root_dir.resolve()
     )
     unit_basis = "target" if is_target_relative_harvest else "repo"
     return resolver.matches_diff(u_file_raw, diff_keys, basis=unit_basis)
@@ -944,13 +945,13 @@ def scan_target(
     diff_unit_indices: Optional[Set[int]] = None
     if diff_files is not None:
         effective_repo = git_root_resolved or effective_repo_root
-        resolver = CanonicalPathResolver(target_root=res_target_dir, repo_root=effective_repo)
+        target_root_dir = res_target_dir if res_target_dir.is_dir() else res_target_dir.parent
+        resolver = CanonicalPathResolver(target_root=target_root_dir, repo_root=effective_repo)
 
         diff_keys = build_diff_path_keys(diff_files, resolver)
         unique_unit_files = {u.get("file") for u in units if u.get("file")}
         is_target_relative_harvest = (
-            effective_repo_root.resolve() == res_target_dir.resolve()
-            or (not res_target_dir.is_dir() and effective_repo_root.resolve() == res_target_dir.parent.resolve())
+            effective_repo_root.resolve() == target_root_dir.resolve()
         )
         unit_basis = "target" if is_target_relative_harvest else "repo"
         matching_files = {

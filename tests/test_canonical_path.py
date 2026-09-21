@@ -292,5 +292,24 @@ def test_matches_diff_nested_coincident_target_path() -> None:
     assert resolver.matches_diff("src/foo.py", diff_keys)
 
 
+def test_resolver_normalizes_single_file_target_root_to_parent(tmp_path: Path) -> None:
+    """Verifies that CanonicalPathResolver normalizes a file target to its parent directory."""
+    repo = tmp_path / "repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+    file_path = src / "worker.py"
+    file_path.write_text("print(1)\n", encoding="utf-8")
+
+    resolver = CanonicalPathResolver(target_root=file_path, repo_root=repo)
+    assert resolver.target_resolved == src.resolve()
+    assert resolver.target_in_repo == "src"
+
+    diff_keys = build_diff_path_keys(["src/worker.py"], resolver)
+    assert "target:worker.py" in diff_keys
+    assert "repo:src/worker.py" in diff_keys
+    assert resolver.matches_diff("worker.py", diff_keys, basis="target")
+
+
+
 
 

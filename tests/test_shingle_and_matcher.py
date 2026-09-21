@@ -1486,4 +1486,53 @@ def test_unit_matches_diff_keys_with_repo_and_target_basis(tmp_path: Path) -> No
     assert not _unit_matches_diff_keys("sub_dir/mod.py", set(), repo_root=repo, target_dir=target)
 
 
+def test_scan_target_diff_files_single_file_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies scan_target correctly normalizes single-file targets to containing directory for diff keys."""
+    repo = tmp_path / "single_file_repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+
+    code = (
+        "def compute_alpha(val_a, val_b):\n"
+        "    temp = val_a * 10 + val_b\n"
+        "    return temp * 2\n\n"
+        "def compute_beta(val_a, val_b):\n"
+        "    temp = val_a * 10 + val_b\n"
+        "    return temp * 2\n"
+    )
+    target_file = src / "a.py"
+    target_file.write_text(code, encoding="utf-8")
+
+    norm_repo = str(repo).replace("\\", "/")
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: (
+            norm_repo + "\n"
+            if args == ["rev-parse", "--show-toplevel"]
+            else None
+        ),
+    )
+
+    # 1. Single file scan with repo_root as containing directory (CLI scenario)
+    clones = scan_target(
+        str(target_file),
+        repo_root=str(src),
+        diff_files=["src/a.py"],
+        min_lines=3,
+        threshold=0.80,
+    )
+    assert len(clones) >= 1
+
+    # 2. Single file scan without explicit repo_root (falls back to Git worktree root)
+    clones2 = scan_target(
+        str(target_file),
+        diff_files=["src/a.py"],
+        min_lines=3,
+        threshold=0.80,
+    )
+    assert len(clones2) >= 1
+
+
 

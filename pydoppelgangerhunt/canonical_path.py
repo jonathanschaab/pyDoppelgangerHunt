@@ -169,6 +169,9 @@ class CanonicalPathResolver:
             self.target_resolved = self.target_path.resolve()
         except (ValueError, OSError, RuntimeError):
             self.target_resolved = self.target_path
+        if self.target_resolved.is_file():
+            self.target_resolved = self.target_resolved.parent
+            self.target_path = self.target_path.parent
 
         if repo_root is not None:
             self.repo_path: Optional[Path] = Path(repo_root)
