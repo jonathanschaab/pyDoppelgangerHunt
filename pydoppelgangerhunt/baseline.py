@@ -755,9 +755,28 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
         top_cfg_hash = calib_cfg_hash or _safe_hex_hash(data.get("config_hash"), (64,))
         top_commit = calib_commit or _safe_hex_hash(data.get("recorded_commit"), (40, 64))
 
-        path_basis = data.get("path_basis")
+        raw_path_basis = data.get("path_basis")
         target_repo_rel = data.get("target_repo_relative")
         top_target = _safe_str(data.get("target"))
+
+        if raw_path_basis:
+            path_basis = (
+                "repo_relative"
+                if raw_path_basis in ("repo", "repo_relative", "worktree_relative")
+                else "target_relative"
+            )
+        else:
+            base_offset_inferred = None
+            if target_repo_rel:
+                base_offset_inferred = target_repo_rel
+            elif top_target:
+                base_offset_inferred = normalize_lexical_posix(top_target).strip("./").rstrip("/")
+            path_basis = _detect_clone_path_basis(
+                records or [],
+                base_offset_inferred,
+                repo_root=path.parent,
+                target=top_target,
+            )
 
         if corpus_calibration is not None and isinstance(corpus_calibration, dict):
             if "target_repo_relative" not in corpus_calibration and target_repo_rel:
@@ -808,6 +827,13 @@ def _compute_path_offset(
     try:
         sub_p = Path(sub_path)
         root_p = Path(root_path)
+        if not sub_p.is_absolute():
+            sub_cand = root_p / sub_p
+            try:
+                if sub_cand.exists() or root_p.is_absolute():
+                    sub_p = sub_cand
+            except (ValueError, OSError, RuntimeError):
+                pass
         try:
             sub_res = sub_p.resolve()
             root_res = root_p.resolve()
@@ -1058,7 +1084,10 @@ def _detect_clone_path_basis(
     repo_p: Optional[Path] = None
     try:
         if target is not None:
-            tp = Path(target).resolve()
+            tp = Path(target)
+            if not tp.is_absolute() and repo_root is not None:
+                tp = Path(repo_root) / tp
+            tp = tp.resolve()
             target_p = tp if tp.is_dir() else tp.parent
         if repo_root is not None:
             rp = Path(repo_root).resolve()
@@ -1070,10 +1099,24 @@ def _detect_clone_path_basis(
     candidate_files: List[str] = []
     for item in clones[:50]:
         u1, u2 = None, None
+        if isinstance(item, str):
+            parsed = _parse_legacy_fingerprint_record(item)
+            raw_fa = parsed.get("file_a")
+            raw_fb = parsed.get("file_b")
+            if raw_fa:
+                candidate_files.append(normalize_lexical_posix(str(raw_fa)))
+            if raw_fb:
+                candidate_files.append(normalize_lexical_posix(str(raw_fb)))
+            continue
         if isinstance(item, (tuple, list)) and len(item) >= 3:
             u1, u2 = item[1], item[2]
         elif isinstance(item, dict):
-            u1 = item.get("u1") or item.get("unit_a") or item
+            fa, _, _, fb, _, _ = _extract_record_endpoint_data(item)
+            if fa:
+                candidate_files.append(normalize_lexical_posix(fa))
+            if fb:
+                candidate_files.append(normalize_lexical_posix(fb))
+            u1 = item.get("u1") or item.get("unit_a") or (item if not fa and not fb else None)
             u2 = item.get("u2") or item.get("unit_b")
         if isinstance(u1, dict):
             f1 = normalize_lexical_posix(str(u1.get("file") or ""))
@@ -1084,6 +1127,7 @@ def _detect_clone_path_basis(
             if f2:
                 candidate_files.append(f2)
 
+    candidate_files = [f for f in candidate_files if f]
     if not candidate_files:
         return "target_relative"
 
@@ -1285,7 +1329,24 @@ def filter_clones_by_baseline(
         repo_root,
         target=target,
     )
-    base_basis = getattr(baseline_fingerprints, "path_basis", "target_relative")
+    raw_base_basis = getattr(baseline_fingerprints, "path_basis", None)
+    if not raw_base_basis and isinstance(baseline_fingerprints, BaselineFingerprints):
+        records_obj = getattr(baseline_fingerprints, "records", None)
+        inferred_offset = (
+            base_offset
+            or (normalize_lexical_posix(base_target).strip("./").rstrip("/") if base_target else None)
+        )
+        raw_base_basis = _detect_clone_path_basis(
+            records_obj or [],
+            inferred_offset,
+            repo_root=repo_root,
+            target=base_target or target,
+        )
+    base_basis = (
+        "repo_relative"
+        if raw_base_basis in ("repo", "repo_relative", "worktree_relative")
+        else "target_relative"
+    )
 
     records = getattr(baseline_fingerprints, "records", None)
     if records:
@@ -1416,7 +1477,24 @@ def prune_baseline(
         repo_root,
         target=target,
     )
-    base_basis = data.get("path_basis", "target_relative") if isinstance(data, dict) else "target_relative"
+    raw_base_basis = data.get("path_basis") if isinstance(data, dict) else None
+    if raw_base_basis:
+        base_basis = (
+            "repo_relative"
+            if raw_base_basis in ("repo", "repo_relative", "worktree_relative")
+            else "target_relative"
+        )
+    else:
+        inferred_offset = (
+            base_offset
+            or (normalize_lexical_posix(base_target).strip("./").rstrip("/") if base_target else None)
+        )
+        base_basis = _detect_clone_path_basis(
+            data.get("fingerprints", []),
+            inferred_offset,
+            repo_root=repo_root,
+            target=base_target or target,
+        )
 
     if unstaged_modified_ranges is None:
         try:
@@ -1645,7 +1723,7 @@ def prune_baseline(
 
     data["version"] = "1.5.0"
     if "path_basis" not in data or not data["path_basis"]:
-        data["path_basis"] = "target_relative"
+        data["path_basis"] = base_basis
     if "target_repo_relative" not in data and base_target is not None:
         base_res = _build_baseline_path_resolver(base_target)
         if base_res is not None and base_res.target_in_repo:

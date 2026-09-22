@@ -3575,11 +3575,11 @@ def test_calibration_compatibility_audit_tests_and_include_notebooks() -> None:
 
 
 def test_prune_baseline_legacy_upgrade_adds_path_basis(tmp_path: Path) -> None:
-    """Verifies that pruning a legacy v1.0–v1.4 baseline adds path_basis: target_relative when upgrading to v1.5.0."""
+    """Verifies that pruning a legacy v1.0–v1.4 baseline infers and preserves path_basis when upgrading to v1.5.0."""
     from pydoppelgangerhunt.baseline import load_baseline, prune_baseline  # pylint: disable=import-outside-toplevel
 
-    legacy_file = tmp_path / "legacy_v1_baseline.json"
-    legacy_data = {
+    legacy_file_repo = tmp_path / "legacy_v1_repo_rel.json"
+    legacy_data_repo = {
         "version": "1.0.0",
         "created_at": "2026-01-01T00:00:00Z",
         "target": "src",
@@ -3596,17 +3596,133 @@ def test_prune_baseline_legacy_upgrade_adds_path_basis(tmp_path: Path) -> None:
             }
         ],
     }
+    legacy_file_repo.write_text(json.dumps(legacy_data_repo), encoding="utf-8")
+
+    prune_res = prune_baseline(str(legacy_file_repo), active_clones=[], unstaged_modified_ranges={})
+    assert prune_res.pruned_count == 1
+
+    raw_saved = json.loads(legacy_file_repo.read_text(encoding="utf-8"))
+    assert raw_saved["version"] == "1.5.0"
+    assert raw_saved["path_basis"] == "repo_relative"
+
+    loaded = load_baseline(str(legacy_file_repo))
+    assert loaded.path_basis == "repo_relative"
+
+    legacy_file_target = tmp_path / "legacy_v1_target_rel.json"
+    legacy_data_target = {
+        "version": "1.0.0",
+        "created_at": "2026-01-01T00:00:00Z",
+        "target": "src",
+        "threshold": 0.90,
+        "clone_count": 1,
+        "fingerprints": [
+            {
+                "fingerprint": "a.py:f1 <===> b.py:f2",
+                "file_a": "a.py",
+                "file_b": "b.py",
+                "name_a": "f1",
+                "name_b": "f2",
+                "similarity": 0.95,
+            }
+        ],
+    }
+    legacy_file_target.write_text(json.dumps(legacy_data_target), encoding="utf-8")
+
+    prune_res_target = prune_baseline(str(legacy_file_target), active_clones=[], unstaged_modified_ranges={})
+    assert prune_res_target.pruned_count == 1
+
+    raw_saved_target = json.loads(legacy_file_target.read_text(encoding="utf-8"))
+    assert raw_saved_target["version"] == "1.5.0"
+    assert raw_saved_target["path_basis"] == "target_relative"
+
+    loaded_target = load_baseline(str(legacy_file_target))
+    assert loaded_target.path_basis == "target_relative"
+
+
+def test_prune_baseline_preserves_legacy_repo_relative_records_across_runs(tmp_path: Path) -> None:
+    """Verifies that pruning a legacy repo-relative baseline preserves coordinates without false pruning on future loads."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        compute_unit_structural_hash,
+        filter_clones_by_baseline,
+        load_baseline,
+        prune_baseline,
+    )
+
+    repo_dir = tmp_path / "repo"
+    src_dir = repo_dir / "src"
+    src_dir.mkdir(parents=True)
+    file_a = src_dir / "worker.py"
+    file_b = src_dir / "helper.py"
+    code_a = "def worker(x):\n    return x * 2 + 1\n"
+    code_b = "def helper(y):\n    return y * 2 + 1\n"
+    file_a.write_text(code_a, encoding="utf-8")
+    file_b.write_text(code_b, encoding="utf-8")
+
+    u1 = {"file": "worker.py", "name": "worker", "code": code_a}
+    u2 = {"file": "helper.py", "name": "helper", "code": code_b}
+    u1["structural_hash"] = compute_unit_structural_hash(u1)
+    u2["structural_hash"] = compute_unit_structural_hash(u2)
+    active_clones = [(1.0, u1, u2)]
+
+    # Legacy baseline v1.0.0 with repo-relative paths (src/worker.py, src/helper.py) and no path_basis
+    legacy_file = repo_dir / "baseline.json"
+    legacy_data = {
+        "version": "1.0.0",
+        "created_at": "2026-01-01T00:00:00Z",
+        "target": "src",
+        "threshold": 0.90,
+        "clone_count": 1,
+        "fingerprints": [
+            {
+                "file_a": "src/worker.py",
+                "file_b": "src/helper.py",
+                "name_a": "worker",
+                "name_b": "helper",
+                "hash_a": u1["structural_hash"],
+                "hash_b": u2["structural_hash"],
+                "similarity": 1.0,
+            }
+        ],
+    }
     legacy_file.write_text(json.dumps(legacy_data), encoding="utf-8")
 
-    prune_res = prune_baseline(str(legacy_file), active_clones=[], unstaged_modified_ranges={})
-    assert prune_res.pruned_count == 1
+    # Run 1: prune baseline with active target-relative clones
+    prune_res_1 = prune_baseline(
+        str(legacy_file),
+        active_clones=active_clones,
+        unstaged_modified_ranges={},
+        repo_root=str(repo_dir),
+        target="src",
+    )
+    assert prune_res_1.pruned_count == 0
+    assert prune_res_1.retained_count == 1
 
     raw_saved = json.loads(legacy_file.read_text(encoding="utf-8"))
     assert raw_saved["version"] == "1.5.0"
-    assert raw_saved["path_basis"] == "target_relative"
+    assert raw_saved["path_basis"] == "repo_relative"
 
+    # Verify that future loads interpret coordinates correctly and suppress active clones
     loaded = load_baseline(str(legacy_file))
-    assert loaded.path_basis == "target_relative"
+    assert loaded.path_basis == "repo_relative"
+    new_clones, suppressed_count = filter_clones_by_baseline(
+        active_clones,
+        loaded,
+        repo_root=str(repo_dir),
+        target="src",
+    )
+    assert suppressed_count == 1
+    assert len(new_clones) == 0
+
+    # Run 2: prune baseline again - live record must NOT be pruned
+    prune_res_2 = prune_baseline(
+        str(legacy_file),
+        active_clones=active_clones,
+        unstaged_modified_ranges={},
+        repo_root=str(repo_dir),
+        target="src",
+    )
+    assert prune_res_2.pruned_count == 0
+    assert prune_res_2.retained_count == 1
 
 
 def test_scan_target_full_scan_with_calibration_avoids_double_counting(tmp_path: Path) -> None:
