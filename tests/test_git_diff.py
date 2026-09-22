@@ -1137,5 +1137,30 @@ def test_decode_git_cstyle_path_preserves_spaces() -> None:
     assert _decode_git_cstyle_path("   \n") == ""
 
 
+def test_parse_git_diff_hunks_preserves_trailing_spaces_unquoted() -> None:
+    """Verifies that parse_git_diff_hunks preserves trailing spaces in unquoted diff filenames."""
+    from pydoppelgangerhunt.git_diff import parse_git_diff_hunks  # pylint: disable=import-outside-toplevel
 
+    # 1. Unquoted diff header with trailing space before newline
+    diff_unquoted_trailing_space = (
+        "diff --git a/foo.py  b/foo.py \n"
+        "--- a/foo.py \n"
+        "+++ b/foo.py \n"
+        "@@ -1,3 +1,3 @@\n"
+        "+# modified line\n"
+    )
+    hunks = parse_git_diff_hunks(diff_unquoted_trailing_space)
+    assert "foo.py " in hunks
+    assert hunks["foo.py "] == [(1, 3)]
 
+    # 2. Unquoted diff header with trailing space before timestamp tab
+    diff_unquoted_timestamp = (
+        "diff --git a/bar.py  b/bar.py \n"
+        "--- a/bar.py \t2026-09-22 12:00:00.000000000 +0000\n"
+        "+++ b/bar.py \t2026-09-22 12:00:00.000000000 +0000\n"
+        "@@ -10,2 +10,2 @@\n"
+        "+# modified line\n"
+    )
+    hunks_ts = parse_git_diff_hunks(diff_unquoted_timestamp)
+    assert "bar.py " in hunks_ts
+    assert hunks_ts["bar.py "] == [(10, 11)]
