@@ -4484,6 +4484,52 @@ def test_detect_clone_path_basis_filesystem_disambiguation(tmp_path: Path) -> No
     assert basis_repo_detected == "repo_relative"
 
 
+def test_detect_clone_path_basis_ambiguous_probes_retains_target_relative(tmp_path: Path) -> None:
+    """Verifies that _detect_clone_path_basis retains target-relative convention when both probes succeed."""
+    from pydoppelgangerhunt.baseline import _detect_clone_path_basis  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo_ambig"
+    src = repo / "src"
+    # Create BOTH repo/src/ambig.py AND repo/src/src/ambig.py
+    top_file = src / "ambig.py"
+    top_file.parent.mkdir(parents=True, exist_ok=True)
+    top_file.write_text("a = 1\n", encoding="utf-8")
+
+    nested_file = src / "src" / "ambig.py"
+    nested_file.parent.mkdir(parents=True, exist_ok=True)
+    nested_file.write_text("b = 2\n", encoding="utf-8")
+
+    clones = [
+        (0.95, {"file": "src/ambig.py", "name": "u1"}, {"file": "src/ambig.py", "name": "u2"})
+    ]
+
+    # Without explicit basis: ambiguous filesystem probes retain target-relative harvest convention
+    ambig_basis = _detect_clone_path_basis(
+        clones,
+        scan_offset="src",
+        repo_root=str(repo),
+        target=str(src),
+    )
+    assert ambig_basis == "target_relative"
+
+    # With explicit basis: explicit basis is honored
+    assert _detect_clone_path_basis(
+        clones,
+        scan_offset="src",
+        explicit_basis="repo_relative",
+        repo_root=str(repo),
+        target=str(src),
+    ) == "repo_relative"
+    assert _detect_clone_path_basis(
+        clones,
+        scan_offset="src",
+        explicit_basis="target_relative",
+        repo_root=str(repo),
+        target=str(src),
+    ) == "target_relative"
+
+
+
 
 
 

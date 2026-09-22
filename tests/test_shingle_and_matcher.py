@@ -1289,22 +1289,23 @@ def test_uncalibrated_novel_shingle_pair_budget_bounds_explosion(tmp_path: Path)
     assert isinstance(clones, list)
     assert len(clones) == 0
 
-    # Malformed calibration (missing shingle_frequencies) also bounds candidates
-    calib_malformed = {
+    # Legacy calibration (missing shingle_frequencies) falls back to legacy stop-shingle behavior
+    # and does not drop valid pairs under the novel-pair budget
+    calib_legacy = {
         "total_units": 5000,
         "max_index_frequency": 0.25,
         "min_lines": 3,
         "min_corpus_size": 4,
         "global_stop_shingles": set(),
     }
-    clones_malformed = scan_target(
+    clones_legacy = scan_target(
         str(tmp_path),
         diff_files=["burst.py"],
         min_lines=3,
         threshold=0.90,
-        corpus_calibration=calib_malformed,
+        corpus_calibration=calib_legacy,
     )
-    assert len(clones_malformed) == 0
+    assert len(clones_legacy) > 0
 
     # When pairs are within budget (40 functions = 780 pairs <= 10,000), clones are detected
     small_lines: list[str] = []
@@ -1675,6 +1676,79 @@ def test_shingle_iteration_order_is_deterministic_under_novel_budget(
     # Both runs must discover the exact same clone pairs despite opposite file discovery order
     assert len(names_1) > 0
     assert names_1 == names_2
+
+
+def test_legacy_calibration_missing_frequencies_falls_back_to_stop_shingles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that legacy calibrations without shingle_frequencies fall back to stop shingles without novel budget capping."""
+    import pydoppelgangerhunt.matcher as matcher  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    # Artificially tiny novel budget: 2 pairs max if shingles were marked novel
+    monkeypatch.setattr(matcher, "MAX_NOVEL_SHINGLE_PAIR_BUDGET", 2)
+
+    lines_a = (
+        "def func_a1(x, y):\n"
+        "    alpha_calc = x * 10 + y * 20\n"
+        "    return alpha_calc + 1\n\n"
+        "def func_a2(x, y):\n"
+        "    alpha_calc = x * 10 + y * 20\n"
+        "    return alpha_calc + 1\n"
+    )
+    lines_b = (
+        "def func_b1(x, y):\n"
+        "    beta_calc = x ** 2 + y ** 2\n"
+        "    return beta_calc + 2\n\n"
+        "def func_b2(x, y):\n"
+        "    beta_calc = x ** 2 + y ** 2\n"
+        "    return beta_calc + 2\n"
+    )
+    lines_c = (
+        "def func_c1(x, y):\n"
+        "    gamma_calc = (x + y) * (x - y)\n"
+        "    return gamma_calc + 3\n\n"
+        "def func_c2(x, y):\n"
+        "    gamma_calc = (x + y) * (x - y)\n"
+        "    return gamma_calc + 3\n"
+    )
+    (tmp_path / "mod_a.py").write_text(lines_a, encoding="utf-8")
+    (tmp_path / "mod_b.py").write_text(lines_b, encoding="utf-8")
+    (tmp_path / "mod_c.py").write_text(lines_c, encoding="utf-8")
+
+    # Legacy calibration has total_units and stop shingles, but NO shingle_frequencies key
+    legacy_calib = {
+        "total_units": 100,
+        "max_index_frequency": 0.50,
+        "global_stop_shingles": [],
+    }
+
+    clones = scan_target(
+        str(tmp_path),
+        min_lines=3,
+        threshold=0.80,
+        corpus_calibration=legacy_calib,
+    )
+
+    # All 3 clone pairs must be discovered (not dropped by novel-pair budget of 2)
+    clone_pairs = {(c[1]["name"], c[2]["name"]) for c in clones}
+    assert len(clone_pairs) >= 3
+
+    # Now verify with shingle_frequencies: None
+    legacy_calib_none = {
+        "total_units": 100,
+        "max_index_frequency": 0.50,
+        "global_stop_shingles": [],
+        "shingle_frequencies": None,
+    }
+    clones_none = scan_target(
+        str(tmp_path),
+        min_lines=3,
+        threshold=0.80,
+        corpus_calibration=legacy_calib_none,
+    )
+    assert len(clones_none) >= 3
+
 
 
 

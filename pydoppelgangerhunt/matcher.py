@@ -1122,7 +1122,7 @@ def scan_target(
             total_corpus_units = max(len(units), calib_units)
         calib_freqs_raw = corpus_calibration.get("shingle_frequencies")
         calib_freqs_map = (
-            calib_freqs_raw if isinstance(calib_freqs_raw, dict) else {}
+            calib_freqs_raw if isinstance(calib_freqs_raw, dict) else None
         )
         max_posting_len = _compute_max_posting_len(
             total_corpus_units, active_max_freq, effective_min_corpus, fallback=None

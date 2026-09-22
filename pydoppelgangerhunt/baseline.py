@@ -717,11 +717,14 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
                     except (TypeError, ValueError, RecursionError):
                         continue
             calib_total_units = _safe_total_units(raw_calib.get("total_units"))
-            decoded_freqs = _sanitize_shingle_frequency_dict(
-                raw_calib.get("shingle_frequencies", {}),
-                _deserialize_shingle_key,
-                max_units=calib_total_units,
-            )
+            raw_freqs = raw_calib.get("shingle_frequencies")
+            decoded_freqs: Optional[Dict[Any, int]] = None
+            if isinstance(raw_freqs, dict) and raw_freqs:
+                decoded_freqs = _sanitize_shingle_frequency_dict(
+                    raw_freqs,
+                    _deserialize_shingle_key,
+                    max_units=calib_total_units,
+                )
             raw_max_freq = raw_calib.get("max_index_frequency")
             max_idx_freq: Optional[float]
             if raw_max_freq is None:
@@ -1094,6 +1097,7 @@ def _detect_clone_path_basis(
     if target_p is not None and repo_p is not None and target_p != repo_p:
         found_target_only = False
         found_repo_only = False
+        has_ambiguous_probe = False
         for f in candidate_files:
             try:
                 exists_target = (target_p / f).is_file()
@@ -1110,11 +1114,15 @@ def _detect_clone_path_basis(
             if exists_repo and not exists_target:
                 found_repo_only = True
                 break
+            if exists_target and exists_repo:
+                has_ambiguous_probe = True
 
         if found_target_only:
             return "target_relative"
         if found_repo_only:
             return "repo_relative"
+        if has_ambiguous_probe:
+            return "target_relative"
 
     if all(f == off or f.startswith(prefix) for f in candidate_files):
         return "repo_relative"
