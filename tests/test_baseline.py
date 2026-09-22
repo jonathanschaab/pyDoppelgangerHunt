@@ -4085,6 +4085,40 @@ def test_calibration_scope_compatibility_and_rejection() -> None:
     assert hash_src != hash_root
 
 
+def test_calibration_persisted_fields_validated_against_config_hash() -> None:
+    """Verifies that _is_calibration_mode_compatible does not accept calibrations whose stored fields differ from config_hash."""
+    from typing import Dict, Any  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.baseline import compute_calibration_config_hash  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.matcher import _is_calibration_mode_compatible  # pylint: disable=import-outside-toplevel
+
+    valid_calib: Dict[str, Any] = {
+        "total_units": 50,
+        "max_index_frequency": 0.25,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {},
+        "bag_of_tokens": False,
+        "call_sequences": False,
+        "filter_stop_shingles": False,
+        "scope": "src",
+    }
+    valid_calib["config_hash"] = compute_calibration_config_hash(valid_calib)
+
+    # 1. Matches when persisted fields match config_hash and active scan matches
+    assert _is_calibration_mode_compatible(valid_calib, bag_of_tokens=False, target_scope="src")
+
+    # 2. Desynchronized field: config_hash was for bag_of_tokens=False, but stored field was edited to True
+    desync_calib = dict(valid_calib)
+    desync_calib["bag_of_tokens"] = True
+    # Fast-path must NOT accept desync_calib even if active scan has bag_of_tokens=False (matching config_hash)
+    assert not _is_calibration_mode_compatible(desync_calib, bag_of_tokens=False, target_scope="src")
+
+    # 3. Desynchronized scope: config_hash was for scope="src", but stored field was edited to "tests"
+    desync_scope = dict(valid_calib)
+    desync_scope["scope"] = "tests"
+    assert not _is_calibration_mode_compatible(desync_scope, bag_of_tokens=False, target_scope="src")
+
+
+
 
 
 

@@ -570,7 +570,13 @@ def _compute_max_posting_len(
 
 def _resolve_git_root_path(target: Union[str, Path]) -> Optional[Path]:
     """Resolves Git worktree root as an absolute Path, or None if not in a git repository."""
-    raw_root = get_git_repo_root(repo_root=target)
+    target_dir: Union[str, Path]
+    try:
+        t_p = Path(target)
+        target_dir = t_p.parent if (t_p.is_file() or (not t_p.is_dir() and t_p.suffix in (".py", ".ipynb"))) else t_p
+    except (ValueError, OSError, RuntimeError):
+        target_dir = target
+    raw_root = get_git_repo_root(repo_root=target_dir)
     if raw_root:
         try:
             p = Path(raw_root).resolve()
@@ -705,21 +711,23 @@ def _is_calibration_mode_compatible(
         if str(x).strip()
     })
     if calib_hash:
-        effective_mcs = min_corpus_size if min_corpus_size is not None else calib.get("min_corpus_size")
-        active_cfg = dict(kwargs)
-        active_cfg.update({
-            "bag_of_tokens": bag_of_tokens,
-            "call_sequences": call_sequences,
-            "filter_stop_shingles": filter_stop_shingles,
-            "audit_tests": audit_tests,
-            "include_notebooks": include_notebooks,
-            "max_index_frequency": max_index_frequency,
-            "min_corpus_size": effective_mcs,
-            "excludes": clean_active_ex,
-            "scope": target_scope,
-        })
-        if calib_hash == compute_calibration_config_hash(active_cfg):
-            return True
+        persisted_calib_hash = compute_calibration_config_hash(calib)
+        if calib_hash == persisted_calib_hash:
+            effective_mcs = min_corpus_size if min_corpus_size is not None else calib.get("min_corpus_size")
+            active_cfg = dict(kwargs)
+            active_cfg.update({
+                "bag_of_tokens": bag_of_tokens,
+                "call_sequences": call_sequences,
+                "filter_stop_shingles": filter_stop_shingles,
+                "audit_tests": audit_tests,
+                "include_notebooks": include_notebooks,
+                "max_index_frequency": max_index_frequency,
+                "min_corpus_size": effective_mcs,
+                "excludes": clean_active_ex,
+                "scope": target_scope,
+            })
+            if calib_hash == compute_calibration_config_hash(active_cfg):
+                return True
     if _safe_bool(calib.get("bag_of_tokens", False)) != bool(bag_of_tokens):
         return False
     if _safe_bool(calib.get("call_sequences", False)) != bool(call_sequences):
@@ -890,7 +898,8 @@ def scan_target(
     except (ValueError, OSError, RuntimeError):
         res_target_dir = Path(target_dir)
 
-    git_root_resolved = _resolve_git_root_path(res_target_dir)
+    target_root_dir = res_target_dir if res_target_dir.is_dir() else res_target_dir.parent
+    git_root_resolved = _resolve_git_root_path(target_root_dir)
 
     if repo_root is not None:
         try:
@@ -903,10 +912,10 @@ def scan_target(
         try:
             cwd = Path.cwd().resolve()
             try:
-                res_target_dir.relative_to(cwd)
+                target_root_dir.relative_to(cwd)
                 effective_repo_root = cwd
             except ValueError:
-                effective_repo_root = res_target_dir if res_target_dir.is_dir() else res_target_dir.parent
+                effective_repo_root = target_root_dir
         except (ValueError, OSError):
             effective_repo_root = Path.cwd()
     file_list = find_python_files(

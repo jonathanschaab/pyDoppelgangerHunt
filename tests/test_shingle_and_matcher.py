@@ -1570,5 +1570,52 @@ def test_scan_target_calibration_scope_mismatch_rejected(
     assert "unit_drift" not in calib_copy
 
 
+def test_scan_target_git_root_discovered_for_single_file_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that scan_target correctly probes git root when targeting a single file in a git repo."""
+    repo = tmp_path / "git_single_repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+    f_target = src / "target.py"
+    code = (
+        "def compute_val(a, b):\n"
+        "    res = 0\n"
+        "    for val in a:\n"
+        "        res += val * b + 42\n"
+        "    return res\n"
+    )
+    code_clone = (
+        "def compute_val2(a, b):\n"
+        "    res = 0\n"
+        "    for val in a:\n"
+        "        res += val * b + 42\n"
+        "    return res\n"
+    )
+    f_target.write_text(code + "\n" + code_clone, encoding="utf-8")
+
+    norm_repo = str(repo).replace("\\", "/")
+
+    def mock_run_git(args: Any, cwd: Any = None) -> Any:
+        if args == ["rev-parse", "--show-toplevel"]:
+            if cwd is not None and not Path(cwd).is_dir():
+                raise NotADirectoryError(f"{cwd} is not a directory")
+            return norm_repo + "\n"
+        return None
+
+    monkeypatch.setattr("pydoppelgangerhunt.git_diff._run_git_command", mock_run_git)
+
+    # Differential scan targeting single file f_target with diff_files referencing git-worktree-relative "src/target.py"
+    # without passing repo_root (relying on _resolve_git_root_path to find git root)
+    clones = scan_target(
+        str(f_target),
+        diff_files=["src/target.py"],
+        min_lines=5,
+        threshold=0.80,
+    )
+    assert len(clones) >= 1
+
+
+
 
 
