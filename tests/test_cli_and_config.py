@@ -1851,6 +1851,88 @@ def sample_logic():
     assert "Warning: Active scan configuration does not match baseline calibration config" not in out
 
 
+def test_cli_inherits_representation_and_harvesting_modes_from_calibration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that representation and harvesting modes are inherited from baseline calibration unless overridden."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    pkg_dir = tmp_path / "custom_modes_repo"
+    pkg_dir.mkdir(parents=True)
+    file_content = (
+        "def compute_alpha(vals: list) -> int:\n"
+        "    total = 0\n"
+        "    for v in vals:\n"
+        "        total += v\n"
+        "    return total\n"
+    )
+    (pkg_dir / "mod_a.py").write_text(file_content, encoding="utf-8")
+    (pkg_dir / "mod_b.py").write_text(file_content, encoding="utf-8")
+
+    bl_path = pkg_dir / "baseline.json"
+
+    # Step 1: Record baseline with --idioms, --bag-of-tokens, and --preserve-annotations
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(pkg_dir),
+            "--record-baseline",
+            str(bl_path),
+            "--idioms",
+            "--bag-of-tokens",
+            "--preserve-annotations",
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.80",
+        ],
+    )
+    exit_code_rec = main()
+    assert exit_code_rec == 0
+    capsys.readouterr()
+
+    # Step 2: Scan with --baseline only (unspecified --idioms/--bag-of-tokens/--preserve-annotations)
+    # Options should be inherited from active calibration, matching hash and avoiding warning
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(pkg_dir),
+            "--baseline",
+            str(bl_path),
+            "--threshold",
+            "0.80",
+        ],
+    )
+    exit_code_scan = main()
+    assert exit_code_scan == 0
+    scan_out = capsys.readouterr().out
+    assert "Warning: Active scan configuration does not match baseline calibration config" not in scan_out
+    assert "idioms canonicalized" in scan_out
+    assert "bag of tokens" in scan_out
+    assert "untyped" not in scan_out  # preserve-annotations was active
+
+    # Step 3: Explicit override (--no-idioms) must trigger configuration mismatch warning
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(pkg_dir),
+            "--baseline",
+            str(bl_path),
+            "--no-idioms",
+            "--threshold",
+            "0.80",
+        ],
+    )
+    exit_code_override = main()
+    assert exit_code_override == 0
+    override_out = capsys.readouterr().out
+    assert "Warning: Active scan configuration does not match baseline calibration config" in override_out
+
+
+
 
 
 

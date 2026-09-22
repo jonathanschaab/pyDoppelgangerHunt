@@ -16,6 +16,7 @@ from pydoppelgangerhunt.baseline import (
     prune_baseline,
     record_baseline,
     _derive_target_offsets,
+    _safe_bool,
     _safe_index_frequency,
     _safe_int,
 )
@@ -96,7 +97,12 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
     parser.add_argument("--top", type=int, default=None, help="Truncate report to top N clone pairs")
     parser.add_argument("--blame", action="store_true", help="Audit git commit history and warn on temporally divergent clones (>90 days)")
     parser.add_argument("--coverage", type=str, default=None, help="Path to .coverage (SQLite) or coverage.xml to detect asymmetric test coverage")
-    parser.add_argument("--notebooks", action="store_true", help="Include Jupyter Notebook (.ipynb) code cells in clone scan")
+    parser.add_argument(
+        "--notebooks",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Include Jupyter Notebook (.ipynb) code cells in clone scan",
+    )
     parser.add_argument("--github-annotations", action="store_true", help="Emit GitHub Actions workflow commands (::warning) for PR annotations")
 
     parser.add_argument("--suggest", action="store_true", help="Synthesize refactoring recommendations and helper function signatures")
@@ -179,8 +185,7 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         ("--clause-level", "Audit branch- and handler-level logic (if/else bodies and try/except handlers)"),
         ("--data-tables", "Audit module-level dictionary, list, set, and tuple configuration tables"),
         ("--strip-annotations", "Strip PEP 484/526 type annotations during AST shingling (deprecated: enabled by default)"),
-        ("--preserve-annotations", "Preserve PEP 484/526 type annotations during AST shingling"),
-        ("--preserve-docstrings", "Preserve docstrings during AST token extraction (docstrings stripped by default)"),
+        ("--strip-docstrings", "Strip docstrings during AST token extraction (default: True)"),
         ("--nms", "Apply Non-Maximum Suppression to eliminate redundant sub-clones"),
         ("--class-level", "Audit classes (ast.ClassDef) for structural duplicates (PyChase-style)"),
         ("--blind-literals", "Normalize constants to LITERAL and strip docstrings (PyChase/NiCad-style)"),
@@ -196,11 +201,14 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         ("--gapped-tolerance", "Compute CCAligner-style Longest Common Subsequence alignment for gapped clone tolerance"),
         ("--call-sequences", "Audit function and method call traces for procedural pipeline duplicates"),
         ("--audit-tests", "Audit test suites for clone patterns and @pytest.mark.parametrize opportunities"),
-        ("--strict-type4", "Fail with non-zero exit code if Type-4 semantic issues are found"),
         ("--stop-shingles", "Filter canonical boilerplate shingles (logging, main guards) to reduce spurious candidate pairs"),
     ]
     for flag_name, help_text in bool_flags:
-        parser.add_argument(flag_name, action="store_true", help=help_text)
+        parser.add_argument(flag_name, action=argparse.BooleanOptionalAction, default=None, help=help_text)
+
+    parser.add_argument("--preserve-annotations", action="store_true", default=None, help="Preserve PEP 484/526 type annotations during AST shingling")
+    parser.add_argument("--preserve-docstrings", action="store_true", default=None, help="Preserve docstrings during AST token extraction (docstrings stripped by default)")
+    parser.add_argument("--strict-type4", action="store_true", default=False, help="Fail with non-zero exit code if Type-4 semantic issues are found")
     parser.add_argument("--type4", "--semantic", action="store_true", help="Also run Type-4 semantic clone & consistency audit")
 
     return parser
@@ -649,6 +657,29 @@ def _render_text_violations(
     return report_lines
 
 
+def _resolve_strip_option(
+    args: argparse.Namespace,
+    tool_cfg: Dict[str, Any],
+    active_calib: Dict[str, Any],
+    has_explicit_cfg: bool,
+    strip_name: str,
+    preserve_name: str,
+) -> bool:
+    """Resolves strip/preserve boolean flags with precedence: CLI preserve -> CLI strip -> config -> calibration -> default."""
+    if getattr(args, preserve_name, None):
+        return False
+    cli_strip = getattr(args, strip_name, None)
+    if cli_strip is not None:
+        return bool(cli_strip)
+    if has_explicit_cfg and strip_name in tool_cfg:
+        return bool(tool_cfg[strip_name])
+    if has_explicit_cfg and preserve_name in tool_cfg:
+        return not bool(tool_cfg[preserve_name])
+    if strip_name in active_calib:
+        return _safe_bool(active_calib[strip_name])
+    return bool(tool_cfg.get(strip_name, not tool_cfg.get(preserve_name, False)))
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Main execution CLI entrypoint."""
     parser = build_arg_parser()
@@ -697,47 +728,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     git_root = _safe_call_git_diff_helper(get_git_repo_root, None, target_repo_root)
     git_worktree_root = git_root if git_root and os.path.exists(git_root) else target_repo_root
     threshold = args.threshold if args.threshold is not None else float(tool_cfg.get("threshold", 0.90))
-    min_lines = args.min_lines if args.min_lines is not None else int(tool_cfg.get("min_lines", 8))
-    min_tokens = args.min_tokens if args.min_tokens is not None else int(tool_cfg.get("min_tokens", 15))
-
-    cfg_excludes = list(tool_cfg.get("exclude", DEFAULT_EXCLUDES))
-    excludes = cfg_excludes + args.exclude
-
     cfg_exemptions = (
         [tuple(p) for p in tool_cfg["exemptions"]] if "exemptions" in tool_cfg else None
     )
-
-    call_seq_enabled = args.call_sequences or bool(tool_cfg.get("call_sequences", False))
-    audit_tests_enabled = args.audit_tests or bool(tool_cfg.get("audit_tests", False))
-    idioms_enabled = args.idioms or bool(tool_cfg.get("idioms", False))
-    stop_shingles_enabled = (
-        args.stop_shingles
-        or args.diff_only
-        or bool(tool_cfg.get("stop_shingles", False))
-    )
-
-    max_index_frequency = (
-        args.max_index_frequency
-        if args.max_index_frequency is not None
-        else float(tool_cfg.get("max_index_frequency", 0.25))
-    )
-    min_corpus_size = (
-        args.min_corpus_units
-        if args.min_corpus_units is not None
-        else (int(tool_cfg["min_corpus_units"]) if "min_corpus_units" in tool_cfg else None)
-    )
-    window_size = (
-        args.window_size
-        if args.window_size is not None
-        else (int(tool_cfg["window_size"]) if "window_size" in tool_cfg else None)
-    )
-    min_expr_complexity = (
-        args.min_expr_complexity
-        if args.min_expr_complexity is not None
-        else (int(tool_cfg["min_expr_complexity"]) if "min_expr_complexity" in tool_cfg else None)
-    )
-    strip_docstrings = not args.preserve_docstrings
-    strip_annotations = True if args.strip_annotations else (not args.preserve_annotations)
 
     raw_binding = args.method_binding or str(tool_cfg.get("method_binding", "auto"))
     method_binding = raw_binding if raw_binding in ("auto", "method", "module") else "auto"
@@ -779,45 +772,111 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         )
                     )
                 calib_dict = None
-            else:
-                active_calib: Dict[str, Any] = dict(calib_dict)
-                has_explicit_cfg = bool(args.config)
-                if (
-                    args.max_index_frequency is None
-                    and (not has_explicit_cfg or "max_index_frequency" not in tool_cfg)
-                    and "max_index_frequency" in active_calib
-                ):
-                    inherited_freq = _safe_index_frequency(active_calib.get("max_index_frequency"))
-                    if inherited_freq is not None:
-                        max_index_frequency = inherited_freq
 
-                int_mappings: Sequence[Tuple[str, Optional[int], int]] = (
-                    ("min_lines", args.min_lines, 1),
-                    ("min_tokens", args.min_tokens, 1),
-                    ("min_corpus_size", args.min_corpus_units, 0),
-                    ("window_size", args.window_size, 1),
-                    ("min_expr_complexity", args.min_expr_complexity, 1),
-                )
-                target_vars: Dict[str, int] = {}
-                for key, cli_arg, min_bound in int_mappings:
-                    cfg_key = "min_corpus_units" if key == "min_corpus_size" else key
-                    if (
-                        cli_arg is None
-                        and (not has_explicit_cfg or cfg_key not in tool_cfg)
-                        and key in active_calib
-                    ):
-                        parsed_val = _safe_int(active_calib.get(key), min_val=min_bound)
-                        if parsed_val is not None:
-                            target_vars[key] = parsed_val
+    active_calib: Dict[str, Any] = dict(calib_dict) if (calib_dict and isinstance(calib_dict, dict)) else {}
+    has_explicit_cfg = bool(args.config)
 
-                min_lines = target_vars.get("min_lines", min_lines)
-                min_tokens = target_vars.get("min_tokens", min_tokens)
-                min_corpus_size = target_vars.get("min_corpus_size", min_corpus_size)
-                window_size = target_vars.get("window_size", window_size)
-                min_expr_complexity = target_vars.get("min_expr_complexity", min_expr_complexity)
+    if args.max_index_frequency is not None:
+        max_index_frequency = args.max_index_frequency
+    elif has_explicit_cfg and "max_index_frequency" in tool_cfg:
+        max_index_frequency = float(tool_cfg["max_index_frequency"])
+    elif "max_index_frequency" in active_calib:
+        inherited_freq = _safe_index_frequency(active_calib.get("max_index_frequency"))
+        max_index_frequency = inherited_freq if inherited_freq is not None else 0.25
+    else:
+        max_index_frequency = float(tool_cfg.get("max_index_frequency", 0.25))
 
-    effective_window_size = window_size if window_size is not None else 5
-    effective_min_expr_complexity = min_expr_complexity if min_expr_complexity is not None else 4
+    int_specs: Sequence[Tuple[str, str, Optional[int], int, Optional[int]]] = (
+        ("min_lines", "min_lines", args.min_lines, 1, 8),
+        ("min_tokens", "min_tokens", args.min_tokens, 1, 15),
+        ("min_corpus_size", "min_corpus_units", args.min_corpus_units, 0, None),
+        ("window_size", "window_size", args.window_size, 1, 5),
+        ("min_expr_complexity", "min_expr_complexity", args.min_expr_complexity, 1, 4),
+    )
+    resolved_ints: Dict[str, Optional[int]] = {}
+    for calib_key, cfg_key, cli_arg, min_bound, default_val in int_specs:
+        if cli_arg is not None:
+            resolved_ints[calib_key] = cli_arg
+        elif has_explicit_cfg and cfg_key in tool_cfg:
+            resolved_ints[calib_key] = _safe_int(tool_cfg[cfg_key], min_val=min_bound)
+        elif calib_key in active_calib:
+            resolved_ints[calib_key] = _safe_int(active_calib[calib_key], min_val=min_bound)
+        else:
+            raw_cfg = tool_cfg.get(cfg_key)
+            parsed_cfg = _safe_int(raw_cfg, min_val=min_bound) if raw_cfg is not None else None
+            resolved_ints[calib_key] = parsed_cfg if parsed_cfg is not None else default_val
+
+    min_lines = resolved_ints.get("min_lines", 8) or 8
+    min_tokens = resolved_ints.get("min_tokens", 15) or 15
+    min_corpus_size = resolved_ints.get("min_corpus_size")
+    window_size = resolved_ints.get("window_size", 5) or 5
+    min_expr_complexity = resolved_ints.get("min_expr_complexity", 4) or 4
+    effective_window_size = window_size
+    effective_min_expr_complexity = min_expr_complexity
+
+    if not args.exclude and (not has_explicit_cfg or "exclude" not in tool_cfg) and "excludes" in active_calib:
+        raw_ex = active_calib.get("excludes")
+        if raw_ex and isinstance(raw_ex, (list, tuple, set)):
+            excludes = [str(x) for x in raw_ex]
+        else:
+            excludes = list(tool_cfg.get("exclude", DEFAULT_EXCLUDES))
+    else:
+        excludes = list(tool_cfg.get("exclude", DEFAULT_EXCLUDES)) + args.exclude
+
+    strip_specs = (
+        ("strip_annotations", "preserve_annotations"),
+        ("strip_docstrings", "preserve_docstrings"),
+    )
+    for s_name, p_name in strip_specs:
+        s_val = _resolve_strip_option(args, tool_cfg, active_calib, has_explicit_cfg, s_name, p_name)
+        setattr(args, s_name, s_val)
+    strip_annotations = bool(args.strip_annotations)
+    strip_docstrings = bool(args.strip_docstrings)
+
+    bool_specs: Sequence[Tuple[str, str, str, bool]] = (
+        ("bag_of_tokens", "bag_of_tokens", "bag_of_tokens", False),
+        ("call_sequences", "call_sequences", "call_sequences", False),
+        ("filter_stop_shingles", "stop_shingles", "stop_shingles", False),
+        ("audit_tests", "audit_tests", "audit_tests", False),
+        ("include_notebooks", "notebooks", "notebooks", False),
+        ("blind_literals", "blind_literals", "blind_literals", False),
+        ("idioms", "idioms", "idioms", False),
+        ("commutative", "commutative", "commutative", False),
+        ("filter_boilerplate", "filter_boilerplate", "filter_boilerplate", False),
+        ("consistent_renaming", "consistent_renaming", "consistent_renaming", False),
+        ("abstract_expressions", "abstract_expressions", "abstract_expressions", False),
+        ("blind_indexing", "blind_indexing", "blind_indexing", False),
+        ("functions_only", "functions_only", "functions_only", False),
+        ("class_level", "class_level", "class_level", False),
+        ("sliding_window", "sliding_window", "sliding_window", False),
+        ("clause_level", "clause_level", "clause_level", False),
+        ("data_tables", "data_tables", "data_tables", False),
+        ("harvest_closures", "harvest_closures", "harvest_closures", False),
+        ("comprehensions", "comprehensions", "comprehensions", False),
+        ("complex_expressions", "complex_expressions", "complex_expressions", False),
+    )
+    for calib_key, cli_attr, cfg_key, default_val in bool_specs:
+        cli_val = getattr(args, cli_attr, None)
+        if cli_val is not None:
+            resolved_bool = bool(cli_val)
+        elif has_explicit_cfg and (cfg_key in tool_cfg or calib_key in tool_cfg):
+            resolved_bool = bool(tool_cfg.get(cfg_key, tool_cfg.get(calib_key)))
+        elif calib_key in active_calib:
+            resolved_bool = _safe_bool(active_calib[calib_key])
+        else:
+            resolved_bool = bool(tool_cfg.get(cfg_key, tool_cfg.get(calib_key, default_val)))
+        if calib_key == "filter_stop_shingles" and getattr(args, "diff_only", False) and cli_val is None:
+            resolved_bool = True
+        setattr(args, cli_attr, resolved_bool)
+
+    for extra_flag in ("nms", "merge_subtrees", "tfidf", "gapped_tolerance"):
+        extra_val = getattr(args, extra_flag, None)
+        setattr(args, extra_flag, bool(tool_cfg.get(extra_flag, False)) if extra_val is None else bool(extra_val))
+
+    call_seq_enabled = bool(args.call_sequences)
+    audit_tests_enabled = bool(args.audit_tests)
+    idioms_enabled = bool(args.idioms)
+    stop_shingles_enabled = bool(args.stop_shingles)
 
     if args.type4 and _run_type4_semantic_audit(target, excludes, args.strict_type4, use_color):
         return 1
