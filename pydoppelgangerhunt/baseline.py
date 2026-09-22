@@ -44,15 +44,24 @@ def _safe_total_units(raw_units: Any) -> int:
     return 0
 
 
+def _safe_int(raw_val: Any, min_val: int = 1) -> Optional[int]:
+    """Validates and parses an integer >= min_val, or returns None."""
+    if raw_val is None:
+        return None
+    try:
+        val = int(raw_val)
+        if val >= min_val:
+            return val
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return None
+
+
 def _safe_min_corpus(raw_min_corpus: Any, filter_stop_shingles: bool = False) -> int:
     """Sanitizes min_corpus_size to a non-negative int, or default based on filter_stop_shingles."""
-    if raw_min_corpus is not None:
-        try:
-            val = int(raw_min_corpus)
-            if val >= 0:
-                return val
-        except (ValueError, TypeError, OverflowError):
-            pass
+    val = _safe_int(raw_min_corpus, min_val=0)
+    if val is not None:
+        return val
     return 4 if filter_stop_shingles else 30
 
 
@@ -110,20 +119,10 @@ def _extract_calibration_settings(source: Dict[str, Any]) -> Dict[str, Any]:
         ("min_tokens", 15),
     ):
         raw_val = source.get(int_flag, default_int)
-        try:
-            val = int(raw_val)
-            settings[int_flag] = val if val > 0 else default_int
-        except (ValueError, TypeError, OverflowError):
-            settings[int_flag] = default_int
+        val = _safe_int(raw_val, min_val=1)
+        settings[int_flag] = val if val is not None else default_int
     raw_mcs = source.get("min_corpus_size") if isinstance(source, dict) else None
-    if raw_mcs is None:
-        settings["min_corpus_size"] = None
-    else:
-        try:
-            val = int(raw_mcs)
-            settings["min_corpus_size"] = val if val >= 0 else None
-        except (ValueError, TypeError, OverflowError):
-            settings["min_corpus_size"] = None
+    settings["min_corpus_size"] = _safe_int(raw_mcs, min_val=0)
 
     raw_excludes = source.get("excludes")
     if raw_excludes and isinstance(raw_excludes, (list, tuple, set)):
@@ -455,6 +454,7 @@ def record_baseline(
     *,
     corpus_calibration: Optional[Dict[str, Any]] = None,
     repo_root: Optional[Union[str, Path]] = None,
+    clone_basis: Optional[str] = None,
 ) -> str:
     """Records detected clones into a JSON baseline file for grandfathering."""
     target_repo_rel = None
@@ -462,31 +462,68 @@ def record_baseline(
     if res is not None:
         target_repo_rel = res.target_in_repo
 
+    active_clone_basis = _detect_clone_path_basis(
+        clones,
+        target_repo_rel,
+        explicit_basis=clone_basis,
+        repo_root=repo_root,
+        target=target,
+    )
+
+    fingerprints: List[Dict[str, Any]] = []
+    for item in clones:
+        sim = 1.0
+        u1: Dict[str, Any] = {}
+        u2: Dict[str, Any] = {}
+        if isinstance(item, (tuple, list)) and len(item) >= 3:
+            sim = float(item[0])
+            u1 = item[1] if isinstance(item[1], dict) else {}
+            u2 = item[2] if isinstance(item[2], dict) else {}
+        elif isinstance(item, dict):
+            sim = float(item.get("similarity", 1.0))
+            u1 = item.get("u1") or item.get("unit_a") or item
+            u2 = item.get("u2") or item.get("unit_b") or {}
+
+        fa_raw = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+        fb_raw = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
+
+        fa_target = fa_raw
+        fb_target = fb_raw
+        if target_repo_rel and active_clone_basis == "repo_relative":
+            rel_a = lexical_relative_to(fa_raw, target_repo_rel)
+            if rel_a:
+                fa_target = rel_a
+            rel_b = lexical_relative_to(fb_raw, target_repo_rel)
+            if rel_b:
+                fb_target = rel_b
+
+        u1_rec = dict(u1, file=fa_target)
+        u2_rec = dict(u2, file=fb_target)
+
+        fingerprints.append({
+            "fingerprint": clone_pair_fingerprint(u1_rec, u2_rec),
+            "structural_fingerprint": clone_pair_structural_fingerprint(u1_rec, u2_rec),
+            "namespaced_structural_fingerprint": namespaced_structural_fingerprint(u1_rec, u2_rec),
+            "pure_structural_fingerprint": pure_structural_fingerprint(u1_rec, u2_rec),
+            "similarity": round(sim, 4),
+            "file_a": fa_target,
+            "name_a": str(u1.get("name") or "unit1"),
+            "hash_a": compute_unit_structural_hash(u1),
+            "namespace_a": extract_unit_namespace(fa_target),
+            "file_b": fb_target,
+            "name_b": str(u2.get("name") or "unit2"),
+            "hash_b": compute_unit_structural_hash(u2),
+            "namespace_b": extract_unit_namespace(fb_target),
+        })
+
     data: Dict[str, Any] = {
         "version": "1.5.0",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "target": target,
         "path_basis": "target_relative",
         "threshold": threshold,
-        "clone_count": len(clones),
-        "fingerprints": [
-            {
-                "fingerprint": clone_pair_fingerprint(u1, u2),
-                "structural_fingerprint": clone_pair_structural_fingerprint(u1, u2),
-                "namespaced_structural_fingerprint": namespaced_structural_fingerprint(u1, u2),
-                "pure_structural_fingerprint": pure_structural_fingerprint(u1, u2),
-                "similarity": round(sim, 4),
-                "file_a": normalize_path_string(str(u1.get("file") or ""), strip_anchor=False),
-                "name_a": str(u1.get("name") or "unit1"),
-                "hash_a": compute_unit_structural_hash(u1),
-                "namespace_a": extract_unit_namespace(str(u1.get("file") or "")),
-                "file_b": normalize_path_string(str(u2.get("file") or ""), strip_anchor=False),
-                "name_b": str(u2.get("name") or "unit2"),
-                "hash_b": compute_unit_structural_hash(u2),
-                "namespace_b": extract_unit_namespace(str(u2.get("file") or "")),
-            }
-            for sim, u1, u2 in clones
-        ],
+        "clone_count": len(fingerprints),
+        "fingerprints": fingerprints,
     }
     target_p = Path(baseline_path)
     if target_repo_rel:
@@ -998,6 +1035,8 @@ def _detect_clone_path_basis(
     clones: Sequence[Any],
     scan_offset: Optional[str],
     explicit_basis: Optional[str] = None,
+    repo_root: Optional[Union[str, Path]] = None,
+    target: Optional[Union[str, Path]] = None,
 ) -> str:
     """Detects whether active clone paths are repository-relative or target-relative."""
     if explicit_basis:
@@ -1011,8 +1050,22 @@ def _detect_clone_path_basis(
     off = normalize_lexical_posix(scan_offset).strip("/")
     if not off:
         return "target_relative"
-    prefix = f"{off}/"
-    for item in clones[:20]:
+
+    target_p: Optional[Path] = None
+    repo_p: Optional[Path] = None
+    try:
+        if target is not None:
+            tp = Path(target).resolve()
+            target_p = tp if tp.is_dir() else tp.parent
+        if repo_root is not None:
+            rp = Path(repo_root).resolve()
+            repo_p = rp if rp.is_dir() else rp.parent
+    except (ValueError, OSError, RuntimeError):
+        target_p = None
+        repo_p = None
+
+    candidate_files: List[str] = []
+    for item in clones[:50]:
         u1, u2 = None, None
         if isinstance(item, (tuple, list)) and len(item) >= 3:
             u1, u2 = item[1], item[2]
@@ -1021,12 +1074,51 @@ def _detect_clone_path_basis(
             u2 = item.get("u2") or item.get("unit_b")
         if isinstance(u1, dict):
             f1 = normalize_lexical_posix(str(u1.get("file") or ""))
-            if f1 and (f1 == off or f1.startswith(prefix)):
-                return "repo_relative"
+            if f1:
+                candidate_files.append(f1)
         if isinstance(u2, dict):
             f2 = normalize_lexical_posix(str(u2.get("file") or ""))
-            if f2 and (f2 == off or f2.startswith(prefix)):
-                return "repo_relative"
+            if f2:
+                candidate_files.append(f2)
+
+    if not candidate_files:
+        return "target_relative"
+
+    prefix = f"{off}/"
+
+    # Any candidate that does not start with the scan offset prefix proves target-relative
+    if any(not (f == off or f.startswith(prefix)) for f in candidate_files):
+        return "target_relative"
+
+    # Filesystem disambiguation when target and repo_root directories are provided
+    if target_p is not None and repo_p is not None and target_p != repo_p:
+        found_target_only = False
+        found_repo_only = False
+        for f in candidate_files:
+            try:
+                exists_target = (target_p / f).is_file()
+            except (ValueError, OSError):
+                exists_target = False
+            try:
+                exists_repo = (repo_p / f).is_file()
+            except (ValueError, OSError):
+                exists_repo = False
+
+            if exists_target and not exists_repo:
+                found_target_only = True
+                break
+            if exists_repo and not exists_target:
+                found_repo_only = True
+                break
+
+        if found_target_only:
+            return "target_relative"
+        if found_repo_only:
+            return "repo_relative"
+
+    if all(f == off or f.startswith(prefix) for f in candidate_files):
+        return "repo_relative"
+
     return "target_relative"
 
 
@@ -1190,7 +1282,11 @@ def filter_clones_by_baseline(
     records = getattr(baseline_fingerprints, "records", None)
     if records:
         active_clone_basis = _detect_clone_path_basis(
-            clones, scan_offset, explicit_basis=clone_basis
+            clones,
+            scan_offset,
+            explicit_basis=clone_basis,
+            repo_root=repo_root,
+            target=target,
         )
         unconsumed = list(records)
         new_clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
@@ -1331,7 +1427,11 @@ def prune_baseline(
             unstaged_modified_ranges = {}
 
     active_clone_basis = _detect_clone_path_basis(
-        active_clones, scan_offset, explicit_basis=clone_basis
+        active_clones,
+        scan_offset,
+        explicit_basis=clone_basis,
+        repo_root=repo_root,
+        target=target,
     )
     active_target_fps: Set[str] = set()
     active_target_sfps: Set[str] = set()

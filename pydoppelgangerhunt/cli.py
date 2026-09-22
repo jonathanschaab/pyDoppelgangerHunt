@@ -16,6 +16,8 @@ from pydoppelgangerhunt.baseline import (
     prune_baseline,
     record_baseline,
     _derive_target_offsets,
+    _safe_index_frequency,
+    _safe_int,
 )
 from pydoppelgangerhunt.clustering import cluster_clone_families
 from pydoppelgangerhunt.config import (
@@ -73,10 +75,11 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
     parser.add_argument("--min-lines", type=int, default=None, help="Minimum lines of code per function/block")
     parser.add_argument("--min-tokens", type=int, default=None, help="Minimum normalized AST tokens")
     parser.add_argument("--exclude", action="append", default=[], help="Patterns to exclude")
-    parser.add_argument("--window-size", type=int, default=5, help="Statement window size for sliding window scanner (default: 5)")
-    parser.add_argument("--min-expr-complexity", type=int, default=4, help="Minimum operator complexity for complex expression detection (default: 4)")
+    parser.add_argument("--window-size", type=int, default=None, help="Statement window size for sliding window scanner (default: 5)")
+    parser.add_argument("--min-expr-complexity", type=int, default=None, help="Minimum operator complexity for complex expression detection (default: 4)")
     parser.add_argument("--config", type=str, default=None, help="Path to TOML configuration file (defaults to pyproject.toml)")
     parser.add_argument("--format", choices=["text", "json", "sarif"], default="text", help="Output report format (default: text)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose diagnostic output")
     parser.add_argument("--output", "-o", type=str, default=None, help="Output file path to save report")
     parser.add_argument("--html", type=str, default=None, help="Path to write standalone interactive HTML report")
     parser.add_argument("--patch", type=str, default=None, help="Path to write git-apply compatible refactoring patch file")
@@ -452,10 +455,19 @@ def _apply_baseline_and_diff_filters(
             return clones, 1
         try:
             prune_res = prune_baseline(
-                baseline_path, clones, repo_root=git_worktree_root, target=target_val
+                baseline_path,
+                clones,
+                repo_root=git_worktree_root,
+                target=target_val,
+                clone_basis="target_relative",
             )
         except TypeError:
-            prune_res = prune_baseline(baseline_path, clones)
+            try:
+                prune_res = prune_baseline(
+                    baseline_path, clones, repo_root=git_worktree_root, target=target_val
+                )
+            except TypeError:
+                prune_res = prune_baseline(baseline_path, clones)
         pruned_count = prune_res[0]
         retained_count = prune_res[1]
         skipped_dirty = getattr(prune_res, "skipped_dirty_count", 0)
@@ -476,9 +488,18 @@ def _apply_baseline_and_diff_filters(
             base_fps = preloaded_baseline
         else:
             base_fps = load_baseline(baseline_path)
-        clones, suppressed_count = filter_clones_by_baseline(
-            clones, base_fps, repo_root=git_worktree_root, target=target_val
-        )
+        try:
+            clones, suppressed_count = filter_clones_by_baseline(
+                clones,
+                base_fps,
+                repo_root=git_worktree_root,
+                target=target_val,
+                clone_basis="target_relative",
+            )
+        except TypeError:
+            clones, suppressed_count = filter_clones_by_baseline(
+                clones, base_fps, repo_root=git_worktree_root, target=target_val
+            )
         if args.format == "text":
             print(f"[BASELINE] Suppressed {suppressed_count} grandfathered clone(s). {len(clones)} un-grandfathered clone(s) remaining.")
 
@@ -705,6 +726,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.min_corpus_units is not None
         else (int(tool_cfg["min_corpus_units"]) if "min_corpus_units" in tool_cfg else None)
     )
+    window_size = (
+        args.window_size
+        if args.window_size is not None
+        else (int(tool_cfg["window_size"]) if "window_size" in tool_cfg else None)
+    )
+    min_expr_complexity = (
+        args.min_expr_complexity
+        if args.min_expr_complexity is not None
+        else (int(tool_cfg["min_expr_complexity"]) if "min_expr_complexity" in tool_cfg else None)
+    )
     strip_docstrings = not args.preserve_docstrings
     strip_annotations = True if args.strip_annotations else (not args.preserve_annotations)
 
@@ -721,27 +752,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     shared_module_name = str(args.shared_module_name or tool_cfg.get("shared_module_name", "_common.py"))
 
-    if args.type4 and _run_type4_semantic_audit(target, excludes, args.strict_type4, use_color):
-        return 1
-
-    mode_desc = _format_scan_mode_description(
-        args,
-        strip_annotations=strip_annotations,
-        strip_docstrings=strip_docstrings,
-        idioms_enabled=idioms_enabled,
-        call_seq_enabled=call_seq_enabled,
-        audit_tests_enabled=audit_tests_enabled,
-        stop_shingles_enabled=stop_shingles_enabled,
-    )
-
-    if args.format == "text":
-        print(f"\nScanning '{target}' for AST structural clones (threshold >= {threshold:.0%}, min_lines={min_lines}, mode: {mode_desc})...")
-
-    sort_by = "priority" if args.priority else args.sort_by
-
     baseline_path = args.baseline or tool_cfg.get("baseline")
     preloaded_baseline: Optional[BaselineFingerprints] = None
     calib_dict: Optional[Dict[str, Any]] = None
+    scan_offset: Optional[str] = None
     if baseline_path and not args.record_baseline and os.path.exists(baseline_path):
         preloaded_baseline = load_baseline(baseline_path)
         calib_dict = getattr(preloaded_baseline, "corpus_calibration", None)
@@ -765,53 +779,110 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         )
                     )
                 calib_dict = None
-            elif args.format == "text":
-                calib_hash = calib_dict.get("config_hash") or getattr(preloaded_baseline, "config_hash", None)
-                if calib_hash:
-                    effective_mcs = min_corpus_size if min_corpus_size is not None else calib_dict.get("min_corpus_size")
-                    active_cfg: Dict[str, Any] = {
-                        "bag_of_tokens": args.bag_of_tokens,
-                        "call_sequences": call_seq_enabled,
-                        "filter_stop_shingles": stop_shingles_enabled,
-                        "audit_tests": bool(audit_tests_enabled),
-                        "include_notebooks": bool(args.notebooks),
-                        "max_index_frequency": max_index_frequency,
-                        "min_corpus_size": effective_mcs,
-                        "min_lines": min_lines,
-                        "min_tokens": min_tokens,
-                        "functions_only": args.functions_only,
-                        "sliding_window": args.sliding_window,
-                        "window_size": args.window_size,
-                        "blind_indexing": args.blind_indexing,
-                        "merge_subtrees": args.merge_subtrees,
-                        "complex_expressions": args.complex_expressions,
-                        "min_expr_complexity": args.min_expr_complexity,
-                        "clause_level": args.clause_level,
-                        "data_tables": args.data_tables,
-                        "strip_annotations": strip_annotations,
-                        "nms": args.nms,
-                        "class_level": args.class_level,
-                        "blind_literals": args.blind_literals,
-                        "filter_boilerplate": args.filter_boilerplate,
-                        "consistent_renaming": args.consistent_renaming,
-                        "harvest_closures": args.harvest_closures,
-                        "commutative": args.commutative,
-                        "comprehensions": args.comprehensions,
-                        "idioms": idioms_enabled,
-                        "abstract_expressions": args.abstract_expressions,
-                        "strip_docstrings": strip_docstrings,
-                        "excludes": excludes,
-                        "scope": scan_offset,
-                    }
-                    active_hash = compute_calibration_config_hash(active_cfg)
-                    if calib_hash != active_hash:
-                        print(
-                            colorize(
-                                f"Warning: Active scan configuration does not match baseline calibration config (baseline: {calib_hash[:8]}, active: {active_hash[:8]}). Calibration shingle frequencies may not align with active scan settings.",
-                                COLOR_BOLD + COLOR_YELLOW,
-                                use_color,
-                            )
-                        )
+            else:
+                active_calib: Dict[str, Any] = dict(calib_dict)
+                has_explicit_cfg = bool(args.config)
+                if (
+                    args.max_index_frequency is None
+                    and (not has_explicit_cfg or "max_index_frequency" not in tool_cfg)
+                    and "max_index_frequency" in active_calib
+                ):
+                    inherited_freq = _safe_index_frequency(active_calib.get("max_index_frequency"))
+                    if inherited_freq is not None:
+                        max_index_frequency = inherited_freq
+
+                int_mappings: Sequence[Tuple[str, Optional[int], int]] = (
+                    ("min_lines", args.min_lines, 1),
+                    ("min_tokens", args.min_tokens, 1),
+                    ("min_corpus_size", args.min_corpus_units, 0),
+                    ("window_size", args.window_size, 1),
+                    ("min_expr_complexity", args.min_expr_complexity, 1),
+                )
+                target_vars: Dict[str, int] = {}
+                for key, cli_arg, min_bound in int_mappings:
+                    cfg_key = "min_corpus_units" if key == "min_corpus_size" else key
+                    if (
+                        cli_arg is None
+                        and (not has_explicit_cfg or cfg_key not in tool_cfg)
+                        and key in active_calib
+                    ):
+                        parsed_val = _safe_int(active_calib.get(key), min_val=min_bound)
+                        if parsed_val is not None:
+                            target_vars[key] = parsed_val
+
+                min_lines = target_vars.get("min_lines", min_lines)
+                min_tokens = target_vars.get("min_tokens", min_tokens)
+                min_corpus_size = target_vars.get("min_corpus_size", min_corpus_size)
+                window_size = target_vars.get("window_size", window_size)
+                min_expr_complexity = target_vars.get("min_expr_complexity", min_expr_complexity)
+
+    effective_window_size = window_size if window_size is not None else 5
+    effective_min_expr_complexity = min_expr_complexity if min_expr_complexity is not None else 4
+
+    if args.type4 and _run_type4_semantic_audit(target, excludes, args.strict_type4, use_color):
+        return 1
+
+    mode_desc = _format_scan_mode_description(
+        args,
+        strip_annotations=strip_annotations,
+        strip_docstrings=strip_docstrings,
+        idioms_enabled=idioms_enabled,
+        call_seq_enabled=call_seq_enabled,
+        audit_tests_enabled=audit_tests_enabled,
+        stop_shingles_enabled=stop_shingles_enabled,
+    )
+
+    if args.format == "text":
+        print(f"\nScanning '{target}' for AST structural clones (threshold >= {threshold:.0%}, min_lines={min_lines}, mode: {mode_desc})...")
+
+    sort_by = "priority" if args.priority else args.sort_by
+
+    if calib_dict and isinstance(calib_dict, dict) and args.format == "text":
+        calib_hash = calib_dict.get("config_hash") or getattr(preloaded_baseline, "config_hash", None)
+        if calib_hash:
+            active_cfg: Dict[str, Any] = {
+                "bag_of_tokens": args.bag_of_tokens,
+                "call_sequences": call_seq_enabled,
+                "filter_stop_shingles": stop_shingles_enabled,
+                "audit_tests": bool(audit_tests_enabled),
+                "include_notebooks": bool(args.notebooks),
+                "max_index_frequency": max_index_frequency,
+                "min_corpus_size": min_corpus_size,
+                "min_lines": min_lines,
+                "min_tokens": min_tokens,
+                "functions_only": args.functions_only,
+                "sliding_window": args.sliding_window,
+                "window_size": effective_window_size,
+                "blind_indexing": args.blind_indexing,
+                "merge_subtrees": args.merge_subtrees,
+                "complex_expressions": args.complex_expressions,
+                "min_expr_complexity": effective_min_expr_complexity,
+                "clause_level": args.clause_level,
+                "data_tables": args.data_tables,
+                "strip_annotations": strip_annotations,
+                "nms": args.nms,
+                "class_level": args.class_level,
+                "blind_literals": args.blind_literals,
+                "filter_boilerplate": args.filter_boilerplate,
+                "consistent_renaming": args.consistent_renaming,
+                "harvest_closures": args.harvest_closures,
+                "commutative": args.commutative,
+                "comprehensions": args.comprehensions,
+                "idioms": idioms_enabled,
+                "abstract_expressions": args.abstract_expressions,
+                "strip_docstrings": strip_docstrings,
+                "excludes": excludes,
+                "scope": scan_offset,
+            }
+            active_hash = compute_calibration_config_hash(active_cfg)
+            if calib_hash != active_hash:
+                print(
+                    colorize(
+                        f"Warning: Active scan configuration does not match baseline calibration config (baseline: {calib_hash[:8]}, active: {active_hash[:8]}). Calibration shingle frequencies may not align with active scan settings.",
+                        COLOR_BOLD + COLOR_YELLOW,
+                        use_color,
+                    )
+                )
 
     diff_files: Optional[Sequence[str]] = None
     if args.diff_only:
@@ -840,11 +911,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         excludes=excludes,
         functions_only=args.functions_only,
         sliding_window=args.sliding_window,
-        window_size=args.window_size,
+        window_size=effective_window_size,
         blind_indexing=args.blind_indexing,
         merge_subtrees=args.merge_subtrees,
         complex_expressions=args.complex_expressions,
-        min_expr_complexity=args.min_expr_complexity,
+        min_expr_complexity=effective_min_expr_complexity,
         clause_level=args.clause_level,
         data_tables=args.data_tables,
         strip_annotations=strip_annotations,
@@ -899,8 +970,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     use_color,
                 )
             )
-        base_commit = calib_dict.get("recorded_commit") or getattr(preloaded_baseline, "recorded_commit", None)
-        if base_commit and args.verbose:
+
+    if (calib_dict is not None or preloaded_baseline is not None) and args.format == "text":
+        base_commit_raw = (
+            (calib_dict.get("recorded_commit") if isinstance(calib_dict, dict) else None)
+            or getattr(preloaded_baseline, "recorded_commit", None)
+        )
+        if base_commit_raw and getattr(args, "verbose", False):
+            base_commit = str(base_commit_raw)
             curr_commit = get_git_head_commit(repo_root=git_worktree_root)
             if curr_commit and base_commit.lower() != curr_commit.lower():
                 print(
@@ -912,14 +989,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
 
     if args.record_baseline:
-        bp = record_baseline(
-            clones,
-            args.record_baseline,
-            target,
-            threshold,
-            corpus_calibration=recorded_calib,
-            repo_root=git_worktree_root,
-        )
+        try:
+            bp = record_baseline(
+                clones,
+                args.record_baseline,
+                target,
+                threshold,
+                corpus_calibration=recorded_calib,
+                repo_root=git_worktree_root,
+                clone_basis="target_relative",
+            )
+        except TypeError:
+            bp = record_baseline(
+                clones,
+                args.record_baseline,
+                target,
+                threshold,
+                corpus_calibration=recorded_calib,
+                repo_root=git_worktree_root,
+            )
         print(f"[OK] Recorded {len(clones)} clone baseline pair(s) to {bp}")
         return 0
 

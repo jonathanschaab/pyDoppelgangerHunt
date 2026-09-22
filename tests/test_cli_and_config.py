@@ -1706,6 +1706,152 @@ def test_cli_inherits_baseline_min_corpus_size_without_mismatch_warning(
     assert "Warning: Active scan configuration does not match baseline calibration config" not in out
 
 
+def test_cli_verbose_flag_and_commit_divergence_reporting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that -v/--verbose flag is recognized and reports commit differences without AttributeError."""
+    import json  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.cli import build_arg_parser, main  # pylint: disable=import-outside-toplevel
+    import pydoppelgangerhunt.cli as cli_mod  # pylint: disable=import-outside-toplevel
+
+    parser = build_arg_parser()
+    parsed_v = parser.parse_args(["-v"])
+    assert parsed_v.verbose is True
+    parsed_verbose = parser.parse_args(["--verbose"])
+    assert parsed_verbose.verbose is True
+    parsed_none = parser.parse_args([])
+    assert parsed_none.verbose is False
+
+    repo = tmp_path / "repo_verbose"
+    repo.mkdir(parents=True)
+    (repo / "mod.py").write_text("def fn():\n    return 1\n", encoding="utf-8")
+
+    baseline_file = repo / "baseline.json"
+    recorded_hash = "1111222233334444555566667777888899990000"
+    current_hash = "aaaabbbbccccddddeeeeffff0000111122223333"
+
+    # Record baseline with recorded_commit
+    data = {
+        "version": "1.5.0",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "target": str(repo),
+        "path_basis": "target_relative",
+        "threshold": 0.90,
+        "clone_count": 0,
+        "recorded_commit": recorded_hash,
+        "fingerprints": [],
+    }
+    baseline_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    monkeypatch.setattr(cli_mod, "get_git_head_commit", lambda repo_root=None: current_hash)
+
+    # 1. Run without -v: should not report commit divergence, should not raise AttributeError
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(baseline_file),
+            "--min-lines",
+            "3",
+        ],
+    )
+    assert main() == 0
+    out_default = capsys.readouterr().out
+    assert "differs from baseline recorded commit" not in out_default
+
+    # 2. Run with -v: should report commit divergence
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(baseline_file),
+            "--min-lines",
+            "3",
+            "-v",
+        ],
+    )
+    assert main() == 0
+    out_verbose = capsys.readouterr().out
+    assert f"Repository HEAD commit {current_hash[:8]} differs from baseline recorded commit {recorded_hash[:8]}" in out_verbose
+
+
+def test_cli_inherits_all_unspecified_bounds_from_calibration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that cli.main inherits unspecified pruning/harvesting bounds from loaded calibration."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo_bounds"
+    repo.mkdir(parents=True)
+    code_fn = """
+def sample_logic():
+    a = 10
+    b = 20
+    c = 30
+    d = 40
+    e = 50
+    f = 60
+    g = 70
+    h = 80
+    i = 90
+    j = 100
+    k = 110
+    l = 120
+    return a + b + c + d + e + f + g + h + i + j + k + l
+"""
+    (repo / "sample1.py").write_text(code_fn, encoding="utf-8")
+    (repo / "sample2.py").write_text(code_fn, encoding="utf-8")
+
+    baseline_file = repo / "baseline.json"
+
+    # 1. Record baseline with non-default bounds: min-lines=12, min-tokens=20, max-index-frequency=0.15, min-corpus-units=50
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--record-baseline",
+            str(baseline_file),
+            "--min-lines",
+            "12",
+            "--min-tokens",
+            "20",
+            "--max-index-frequency",
+            "0.15",
+            "--min-corpus-units",
+            "50",
+            "--threshold",
+            "0.90",
+        ],
+    )
+    assert main() == 0
+    capsys.readouterr()
+
+    # 2. Run scan with ONLY --baseline (no --min-lines, no --min-tokens, no --max-index-frequency, no --min-corpus-units)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(baseline_file),
+            "--threshold",
+            "0.90",
+        ],
+    )
+    assert main() == 0
+    out = capsys.readouterr().out
+    # The scan banner must reflect inherited min_lines=12
+    assert "min_lines=12" in out
+    # Calibration must be accepted without mismatch warning
+    assert "Warning: Active scan configuration does not match baseline calibration config" not in out
+
+
+
 
 
 

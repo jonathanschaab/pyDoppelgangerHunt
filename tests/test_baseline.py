@@ -4387,6 +4387,104 @@ def test_run_git_command_normalizes_file_cwd(tmp_path: Path, monkeypatch: pytest
     assert captured_cwds[0] == str(tmp_path)
 
 
+def test_record_baseline_normalizes_repo_relative_clones_to_target_relative(tmp_path: Path) -> None:
+    """Verifies that record_baseline normalizes repo-relative clones to target-relative endpoints."""
+    repo = tmp_path / "repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+    (src / "foo.py").write_text("def f():\n    return 42\n", encoding="utf-8")
+    (src / "bar.py").write_text("def g():\n    return 42\n", encoding="utf-8")
+
+    baseline_file = repo / "baseline.json"
+    u1 = {"file": "src/foo.py", "name": "f", "structural_hash": "a1b2c3d4e5f60718"}
+    u2 = {"file": "src/bar.py", "name": "g", "structural_hash": "a1b2c3d4e5f60718"}
+    clones = [(0.95, u1, u2)]
+
+    bp = record_baseline(
+        clones,
+        str(baseline_file),
+        target=str(src),
+        threshold=0.90,
+        repo_root=str(repo),
+    )
+    assert Path(bp).exists()
+    data = json.loads(Path(bp).read_text(encoding="utf-8"))
+    assert data["path_basis"] == "target_relative"
+    assert data["target_repo_relative"] == "src"
+    rec = data["fingerprints"][0]
+    # Endpoints in baseline must be target-relative
+    assert rec["file_a"] == "foo.py"
+    assert rec["file_b"] == "bar.py"
+    assert rec["namespace_a"] == "."
+    assert rec["namespace_b"] == "."
+
+    # 1. Verify suppression when caller provides repo-relative clones (e.g. from scan_target with git root)
+    base_fps = load_baseline(str(baseline_file))
+    rem_clones, suppressed = filter_clones_by_baseline(
+        clones,
+        base_fps,
+        repo_root=str(repo),
+        target=str(src),
+    )
+    assert suppressed == 1
+    assert len(rem_clones) == 0
+
+    # 2. Verify suppression when caller provides target-relative clones (e.g. from CLI scan)
+    target_clones = [
+        (0.95, {"file": "foo.py", "name": "f", "structural_hash": "a1b2c3d4e5f60718"},
+               {"file": "bar.py", "name": "g", "structural_hash": "a1b2c3d4e5f60718"})
+    ]
+    rem_target, supp_target = filter_clones_by_baseline(
+        target_clones,
+        base_fps,
+        repo_root=str(repo),
+        target=str(src),
+        clone_basis="target_relative",
+    )
+    assert supp_target == 1
+    assert len(rem_target) == 0
+
+
+def test_detect_clone_path_basis_filesystem_disambiguation(tmp_path: Path) -> None:
+    """Verifies that _detect_clone_path_basis disambiguates ambiguous prefixes via filesystem probes."""
+    from pydoppelgangerhunt.baseline import _detect_clone_path_basis  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo"
+    src = repo / "src"
+    nested = src / "src" / "foo.py"
+    nested.parent.mkdir(parents=True)
+    nested.write_text("x = 1\n", encoding="utf-8")
+
+    # Candidate unit file is 'src/foo.py'. Under target repo/src, this refers to repo/src/src/foo.py
+    # Under repo, repo/src/foo.py does NOT exist.
+    clones_target = [
+        (0.90, {"file": "src/foo.py", "name": "u1"}, {"file": "src/foo.py", "name": "u2"})
+    ]
+    basis_detected = _detect_clone_path_basis(
+        clones_target,
+        scan_offset="src",
+        repo_root=str(repo),
+        target=str(src),
+    )
+    assert basis_detected == "target_relative"
+
+    # Now create real repo/src/real.py
+    real_file = src / "real.py"
+    real_file.write_text("y = 2\n", encoding="utf-8")
+    # repo/src/real.py exists under repo, but src/src/real.py does not exist under src
+    clones_repo = [
+        (0.90, {"file": "src/real.py", "name": "v1"}, {"file": "src/real.py", "name": "v2"})
+    ]
+    basis_repo_detected = _detect_clone_path_basis(
+        clones_repo,
+        scan_offset="src",
+        repo_root=str(repo),
+        target=str(src),
+    )
+    assert basis_repo_detected == "repo_relative"
+
+
+
 
 
 
