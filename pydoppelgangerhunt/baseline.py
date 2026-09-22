@@ -489,11 +489,26 @@ def record_baseline(
 
         fa_target = fa_raw
         fb_target = fb_raw
-        if target_repo_rel and active_clone_basis == "repo_relative":
+        if res is not None:
+            resolved_a = res.resolve(fa_raw, basis=active_clone_basis)
+            if resolved_a.target_relative:
+                fa_target = resolved_a.target_relative
+            resolved_b = res.resolve(fb_raw, basis=active_clone_basis)
+            if resolved_b.target_relative:
+                fb_target = resolved_b.target_relative
+        elif target_repo_rel and active_clone_basis == "repo_relative":
             rel_a = lexical_relative_to(fa_raw, target_repo_rel)
             if rel_a:
                 fa_target = rel_a
             rel_b = lexical_relative_to(fb_raw, target_repo_rel)
+            if rel_b:
+                fb_target = rel_b
+        elif target is not None:
+            t_norm = normalize_lexical_posix(str(target))
+            rel_a = lexical_relative_to(fa_raw, t_norm)
+            if rel_a:
+                fa_target = rel_a
+            rel_b = lexical_relative_to(fb_raw, t_norm)
             if rel_b:
                 fb_target = rel_b
 
@@ -800,6 +815,17 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
 
 
 
+def _is_absolute_path_str(path_str: str) -> bool:
+    """Returns True if the path string represents an absolute POSIX or Windows path."""
+    if not path_str:
+        return False
+    return (
+        (len(path_str) >= 2 and path_str[1] == ":" and path_str[0].isalpha())
+        or path_str.startswith("/")
+        or path_str.startswith("\\")
+    )
+
+
 def _canonicalize_endpoint_path(
     path: str,
     offset: Optional[str],
@@ -810,6 +836,8 @@ def _canonicalize_endpoint_path(
     if not norm:
         return ""
     if path_basis in ("repo_relative", "worktree_relative", "repo"):
+        return norm
+    if _is_absolute_path_str(norm):
         return norm
     if offset:
         off_norm = normalize_lexical_posix(offset, strip_anchor=False).strip("/")
@@ -1190,8 +1218,17 @@ def _match_clone_record(
         if clone_basis in ("repo", "repo_relative", "worktree_relative")
         else "target_relative"
     )
-    c_repo_fa = _canonicalize_endpoint_path(c_fa, scan_offset, path_basis=active_basis)
-    c_repo_fb = _canonicalize_endpoint_path(c_fb, scan_offset, path_basis=active_basis)
+    if resolver is not None and _is_absolute_path_str(c_fa):
+        res_a = resolver.resolve(c_fa, basis=active_basis)
+        c_repo_fa = res_a.repo_relative or c_fa
+    else:
+        c_repo_fa = _canonicalize_endpoint_path(c_fa, scan_offset, path_basis=active_basis)
+
+    if resolver is not None and _is_absolute_path_str(c_fb):
+        res_b = resolver.resolve(c_fb, basis=active_basis)
+        c_repo_fb = res_b.repo_relative or c_fb
+    else:
+        c_repo_fb = _canonicalize_endpoint_path(c_fb, scan_offset, path_basis=active_basis)
 
     if base_offset:
         rel_a = lexical_relative_to(c_repo_fa, base_offset)

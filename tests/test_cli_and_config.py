@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from unittest import mock
 import pytest
 
 import pydoppelgangerhunt
@@ -2006,6 +2007,47 @@ def test_cli_inherits_null_max_index_frequency_from_calibration(
     assert res_override == 0
     out_override = capsys.readouterr().out
     assert "Warning: Active scan configuration does not match baseline calibration config" in out_override
+
+
+def test_cli_diff_only_empty_diff_skips_full_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that --diff-only with an empty diff passes diff_files=[] to scan_target and skips scanning."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    f1 = repo / "a.py"
+    f2 = repo / "b.py"
+    code = "def duplicate():\n    x = 1\n    y = 2\n    return x + y\n"
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.cli._safe_call_git_diff_helper",
+        lambda helper, *args, **kwargs: [] if "modified" in helper.__name__ else str(repo),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--diff-only",
+            "--threshold",
+            "0.80",
+            "--min-lines",
+            "3",
+        ],
+    )
+    with mock.patch("pydoppelgangerhunt.cli.scan_target", wraps=pydoppelgangerhunt.cli.scan_target) as mock_scan:
+        res = main()
+        assert res == 0
+        mock_scan.assert_called_once()
+        _, kwargs = mock_scan.call_args
+        assert kwargs.get("diff_files") == []
+    out = capsys.readouterr().out
+    assert "No structural code clones found" in out
+
 
 
 

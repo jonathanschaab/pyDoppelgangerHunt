@@ -103,21 +103,24 @@ def find_matching_path_value(
     # 2. If target_path contains a notebook cell anchor, fallback to stripped anchor matching
     target_raw = str(target_path)
     if "#" in target_raw:
-        last_hash = target_raw.rfind("#")
-        fragment = target_raw[last_hash + 1:]
-        if fragment.lower().startswith("cell") or ".ipynb#" in target_raw:
-            target_stripped = normalize_path_string(target_raw, strip_anchor=True)
-            if target_stripped:
-                if target_stripped in path_map:
-                    return path_map[target_stripped]
-                key_stripped = canonical_path_key(target_stripped, strip_anchor=False)
-                for k, val in path_map.items():
-                    k_clean = normalize_path_string(k, strip_anchor=False)
-                    if target_stripped == k_clean or key_stripped == canonical_path_key(k_clean, strip_anchor=False):
-                        return val
-                for k, val in path_map.items():
-                    if paths_match_boundary(target_stripped, k, strip_anchor=False):
-                        return val
+        last_seg = target_raw.replace("\\", "/").rsplit("/", 1)[-1]
+        if "#" in last_seg:
+            fname, fragment = last_seg.split("#", 1)
+            if fname.lower().endswith(".ipynb") and (
+                fragment.lower().startswith("cell_") or fragment.lower().startswith("cell")
+            ):
+                target_stripped = normalize_path_string(target_raw, strip_anchor=True)
+                if target_stripped:
+                    if target_stripped in path_map:
+                        return path_map[target_stripped]
+                    key_stripped = canonical_path_key(target_stripped, strip_anchor=False)
+                    for k, val in path_map.items():
+                        k_clean = normalize_path_string(k, strip_anchor=False)
+                        if target_stripped == k_clean or key_stripped == canonical_path_key(k_clean, strip_anchor=False):
+                            return val
+                    for k, val in path_map.items():
+                        if paths_match_boundary(target_stripped, k, strip_anchor=False):
+                            return val
     return None
 
 

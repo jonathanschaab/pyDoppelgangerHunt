@@ -630,11 +630,13 @@ def test_batch_36_path_resolution_and_same_file_matching(tmp_path: Any) -> None:
     assert not _is_same_file_path("", "foo.py")
     assert not _is_same_file_path("foo.py", "")
     assert _is_same_file_path("foo/bar.py", "foo/bar.py")
-    assert _is_same_file_path("foo/bar.py#hash1", "foo/bar.py#hash2")
+    assert _is_same_file_path("foo/bar.ipynb#cell_1", "foo/bar.ipynb#cell_2")
+    assert not _is_same_file_path("worker.py#v1", "worker.py#v2")
     assert _is_same_file_path("./foo/bar.py", "foo/bar.py")
     assert _is_same_file_path("foo\\bar.py", "foo/bar.py")
     assert _normalize_file_path("") == ""
-    assert _normalize_file_path("./mod.py#h").endswith("mod.py")
+    assert _normalize_file_path("./mod.ipynb#cell_1").endswith("mod.ipynb")
+    assert _normalize_file_path("worker.py#cell_data.py").endswith("worker.py#cell_data.py")
 
     # 2. Filesystem-based relative vs absolute path equivalence
     target_file = tmp_path / "sample.py"

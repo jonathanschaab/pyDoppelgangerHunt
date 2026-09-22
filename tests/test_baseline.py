@@ -858,7 +858,7 @@ def test_batch_38_windows_path_case_insensitivity_and_unicode_resilience(tmp_pat
     assert val_rel == 42
 
     # 3. _is_same_file_path using boundary matching
-    assert _is_same_file_path("./Sub/Module.py#cell1", "sub/module.py")
+    assert _is_same_file_path("./Sub/Module.ipynb#cell1", "sub/module.ipynb")
     assert _is_same_file_path("C:/Repo/Sub/Module.py", "sub/module.py")
 
     # 4. UnicodeDecodeError resilience across file reading
@@ -4643,6 +4643,49 @@ def test_detect_clone_path_basis_ambiguous_probes_retains_target_relative(tmp_pa
         repo_root=str(repo),
         target=str(src),
     ) == "target_relative"
+
+
+def test_record_baseline_resolves_absolute_endpoints(tmp_path: Path) -> None:
+    """Verifies record_baseline resolves absolute file paths to target-relative paths in baseline."""
+    repo = tmp_path / "repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+    f1 = src / "a.py"
+    f2 = src / "b.py"
+    f1.write_text("def foo():\n    pass\n", encoding="utf-8")
+    f2.write_text("def foo():\n    pass\n", encoding="utf-8")
+
+    u1 = {"file": str(f1.resolve()), "name": "foo", "start": 1, "end": 2, "source": "def foo(): pass"}
+    u2 = {"file": str(f2.resolve()), "name": "foo", "start": 1, "end": 2, "source": "def foo(): pass"}
+    clones = [(1.0, u1, u2)]
+
+    base_file = tmp_path / "baseline.json"
+    record_baseline(
+        clones,
+        str(base_file),
+        target=str(src),
+        repo_root=str(repo),
+        threshold=0.9,
+    )
+
+    with open(base_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    assert data["path_basis"] == "target_relative"
+    rec = data["fingerprints"][0]
+    assert rec["file_a"] == "a.py"
+    assert rec["file_b"] == "b.py"
+
+    loaded = load_baseline(str(base_file))
+    suppressed, count = filter_clones_by_baseline(
+        clones,
+        loaded,
+        target=str(src),
+        repo_root=str(repo),
+    )
+    assert count == 1
+    assert len(suppressed) == 0
+
 
 
 

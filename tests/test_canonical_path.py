@@ -29,8 +29,11 @@ def test_normalize_lexical_posix_separators_and_anchors() -> None:
     assert normalize_lexical_posix("   ") == ""
     assert normalize_lexical_posix("././foo/bar.py") == "foo/bar.py"
     assert normalize_lexical_posix(".\\.\\foo\\bar.py") == "foo/bar.py"
-    assert normalize_lexical_posix("foo/bar.py#cell_1", strip_anchor=True) == "foo/bar.py"
-    assert normalize_lexical_posix("foo/bar.py#cell_1", strip_anchor=False) == "foo/bar.py#cell_1"
+    assert normalize_lexical_posix("foo/bar.ipynb#cell_1", strip_anchor=True) == "foo/bar.ipynb"
+    assert normalize_lexical_posix("foo/bar.ipynb#cell_1", strip_anchor=False) == "foo/bar.ipynb#cell_1"
+    assert normalize_lexical_posix("foo/bar.py#cell_1", strip_anchor=True) == "foo/bar.py#cell_1"
+    assert normalize_lexical_posix("worker.py#cell_data.py", strip_anchor=True) == "worker.py#cell_data.py"
+    assert normalize_lexical_posix("worker.py#v1", strip_anchor=True) == "worker.py#v1"
     assert normalize_lexical_posix("repo#1/pkg#2/mod.py", strip_anchor=False) == "repo#1/pkg#2/mod.py"
 
 

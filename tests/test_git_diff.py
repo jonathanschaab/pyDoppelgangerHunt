@@ -364,34 +364,36 @@ def test_batch_41_unified_path_normalization_and_html_escaping(tmp_path: Path) -
     # 1. normalize_path_string handles repetitive dot-slash and backslashes
     assert normalize_path_string("././foo/bar.py") == "foo/bar.py"
     assert normalize_path_string(".\\.\\foo\\bar.py") == "foo/bar.py"
-    assert normalize_path_string("./foo/bar.py#cell_1", strip_anchor=False) == "foo/bar.py#cell_1"
-    assert normalize_path_string("./foo/bar.py#cell_1", strip_anchor=True) == "foo/bar.py"
+    assert normalize_path_string("./foo/bar.ipynb#cell_1", strip_anchor=False) == "foo/bar.ipynb#cell_1"
+    assert normalize_path_string("./foo/bar.ipynb#cell_1", strip_anchor=True) == "foo/bar.ipynb"
+    assert normalize_path_string("./foo/bar.py#cell_1", strip_anchor=True) == "foo/bar.py#cell_1"
+    assert normalize_path_string("worker.py#cell_data.py", strip_anchor=True) == "worker.py#cell_data.py"
 
     # 2. format_json_report normalizes paths while preserving anchors
-    u1 = {"file": "./pkg/mod.py#cell_1", "start": 5, "end": 10, "name": "fn1", "token_count": 25}
-    u2 = {"file": ".\\pkg\\mod.py#cell_2", "start": 15, "end": 20, "name": "fn2", "token_count": 25}
+    u1 = {"file": "./pkg/mod.ipynb#cell_1", "start": 5, "end": 10, "name": "fn1", "token_count": 25}
+    u2 = {"file": ".\\pkg\\mod.ipynb#cell_2", "start": 15, "end": 20, "name": "fn2", "token_count": 25}
     mock_fam = {
         "family_id": "CF-100",
         "member_count": 2,
-        "unique_files": ["pkg/mod.py"],
+        "unique_files": ["pkg/mod.ipynb"],
         "avg_similarity": 0.95,
         "max_similarity": 0.95,
         "min_similarity": 0.95,
         "coherence": 1.0,
         "total_lines": 10,
-        "medoid": {"file": "./pkg/mod.py#cell_1", "name": "fn1", "start": 5, "end": 10},
+        "medoid": {"file": "./pkg/mod.ipynb#cell_1", "name": "fn1", "start": 5, "end": 10},
         "members": [u1, u2],
     }
     json_out = format_json_report([(0.95, u1, u2)], "repo", 0.9, families=[mock_fam])
-    assert json_out["clones"][0]["unit_a"]["file"] == "pkg/mod.py#cell_1"
-    assert json_out["clones"][0]["unit_b"]["file"] == "pkg/mod.py#cell_2"
-    assert json_out["families"][0]["medoid"]["file"] == "pkg/mod.py#cell_1"
-    assert json_out["families"][0]["members"][1]["file"] == "pkg/mod.py#cell_2"
+    assert json_out["clones"][0]["unit_a"]["file"] == "pkg/mod.ipynb#cell_1"
+    assert json_out["clones"][0]["unit_b"]["file"] == "pkg/mod.ipynb#cell_2"
+    assert json_out["families"][0]["medoid"]["file"] == "pkg/mod.ipynb#cell_1"
+    assert json_out["families"][0]["members"][1]["file"] == "pkg/mod.ipynb#cell_2"
 
     # 3. format_github_annotations strips anchors and leading dot-slash
     annots = format_github_annotations([(0.95, u1, u2)])
     assert len(annots) == 2
-    assert "file=pkg/mod.py," in annots[0]
+    assert "file=pkg/mod.ipynb," in annots[0]
     assert "#cell_" not in annots[0]
 
     # 4. generate_html_report escapes target and renders normalized paths
@@ -399,13 +401,13 @@ def test_batch_41_unified_path_normalization_and_html_escaping(tmp_path: Path) -
     html_report = generate_html_report([(0.95, u1, u2)], dangerous_target, 0.9, families=[mock_fam])
     assert "<script>alert('pwned')</script>" not in html_report
     assert "&lt;script&gt;alert(&#x27;pwned&#x27;)&lt;/script&gt;&amp;foo" in html_report
-    assert "pkg/mod.py#cell_1" in html_report
-    assert "pkg/mod.py#cell_2" in html_report
+    assert "pkg/mod.ipynb#cell_1" in html_report
+    assert "pkg/mod.ipynb#cell_2" in html_report
 
     # 5. _audit_clone_risk_warnings path normalization
-    cov_data = {"pkg/mod.py#cell_1": {5, 6, 7, 8, 9, 10}, "pkg/mod.py#cell_2": set()}
+    cov_data = {"pkg/mod.ipynb#cell_1": {5, 6, 7, 8, 9, 10}, "pkg/mod.ipynb#cell_2": set()}
     warn_lines = _audit_clone_risk_warnings(u1, u2, cov_data=cov_data, use_color=False)
-    assert any("Asymmetric test coverage: pkg/mod.py#cell_1 (100%) vs pkg/mod.py#cell_2 (0%)" in w for w in warn_lines)
+    assert any("Asymmetric test coverage: pkg/mod.ipynb#cell_1 (100%) vs pkg/mod.ipynb#cell_2 (0%)" in w for w in warn_lines)
 
     # 6. parse_git_diff_hunks path normalization
     diff_raw = "--- a/pkg/mod.py\n+++ b/./pkg/mod.py\n@@ -1,5 +1,5 @@\n+line\n"

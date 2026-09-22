@@ -41,10 +41,10 @@ def normalize_lexical_posix(path_str: Optional[str], strip_anchor: bool = False)
         last_seg = raw.replace("\\", "/").rsplit("/", 1)[-1]
         if "#" in last_seg:
             fname, fragment = last_seg.split("#", 1)
-            if (
-                ("." in fname and not fname.startswith("."))
-                or fragment.lower().startswith("cell")
-                or ".ipynb#" in raw
+            fname_lower = fname.lower()
+            frag_lower = fragment.lower()
+            if fname_lower.endswith(".ipynb") and (
+                frag_lower.startswith("cell_") or frag_lower.startswith("cell")
             ):
                 raw = raw[: len(raw) - len(fragment) - 1]
 
@@ -492,27 +492,30 @@ class CanonicalPathResolver:
         ):
             return True
 
-        # Stripped anchor match (for notebook cell anchors like .ipynb#cell_1 or #cell1)
+        # Stripped anchor match (for documented notebook cell anchors like .ipynb#cell_1 or .ipynb#cell1)
         if strip_anchor:
             raw_str = str(getattr(unit_file, "raw", unit_file) or "")
             if "#" in raw_str:
-                last_hash = raw_str.rfind("#")
-                fragment = raw_str[last_hash + 1:]
-                if fragment.lower().startswith("cell") or ".ipynb#" in raw_str:
-                    return self._probe_keys_in_diff(
-                        self.target_key(unit_file, basis=basis, strip_anchor=True),
-                        self.repo_key(unit_file, basis=basis, strip_anchor=True),
-                        self.canonical_key(unit_file, basis=basis, strip_anchor=True),
-                        diff_keys,
-                        has_tagged,
-                    )
+                last_seg = raw_str.replace("\\", "/").rsplit("/", 1)[-1]
+                if "#" in last_seg:
+                    fname, fragment = last_seg.split("#", 1)
+                    if fname.lower().endswith(".ipynb") and (
+                        fragment.lower().startswith("cell_") or fragment.lower().startswith("cell")
+                    ):
+                        return self._probe_keys_in_diff(
+                            self.target_key(unit_file, basis=basis, strip_anchor=True),
+                            self.repo_key(unit_file, basis=basis, strip_anchor=True),
+                            self.canonical_key(unit_file, basis=basis, strip_anchor=True),
+                            diff_keys,
+                            has_tagged,
+                        )
 
         return False
 
     def _suffix_matches_boundary(self, p1_raw: str, p2_raw: str) -> bool:
         """Fallback boundary suffix match for unanchored legacy baseline paths."""
-        n1 = normalize_lexical_posix(p1_raw)
-        n2 = normalize_lexical_posix(p2_raw)
+        n1 = normalize_lexical_posix(p1_raw, strip_anchor=False)
+        n2 = normalize_lexical_posix(p2_raw, strip_anchor=False)
         if not n1 or not n2:
             return False
         if self.case_fold:

@@ -919,6 +919,8 @@ def scan_target(
                 effective_repo_root = target_root_dir
         except (ValueError, OSError):
             effective_repo_root = Path.cwd()
+    if diff_files is not None and not diff_files and not return_calibration:
+        return []
     file_list = find_python_files(
         target_dir,
         excludes=excludes,

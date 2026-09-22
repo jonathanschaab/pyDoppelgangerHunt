@@ -977,6 +977,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             diff_files = _normalize_git_paths_for_target(
                 raw_diff_files, git_diff_root, target_repo_root
             )
+        else:
+            diff_files = []
 
     scan_res = scan_target(
         target,
