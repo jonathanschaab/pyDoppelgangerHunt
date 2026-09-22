@@ -1616,6 +1616,68 @@ def test_scan_target_git_root_discovered_for_single_file_target(
     assert len(clones) >= 1
 
 
+def test_shingle_iteration_order_is_deterministic_under_novel_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that novel shingle admission order is strictly deterministic regardless of file discovery order."""
+    import pydoppelgangerhunt.matcher as matcher  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    # Budget allows only one 3-function group (3 * 2 // 2 = 3 pairs <= 4)
+    monkeypatch.setattr(matcher, "MAX_NOVEL_SHINGLE_PAIR_BUDGET", 4)
+
+    lines_alpha = [
+        f"def alpha_unique_proc_{i}(v1, v2):\n    token_alpha_shingle = v1 + v2 + {i}\n    return token_alpha_shingle\n"
+        for i in range(3)
+    ]
+    lines_omega = [
+        f"def omega_unique_proc_{i}(v1, v2):\n    token_omega_shingle = v1 * v2 + {i}\n    return token_omega_shingle\n"
+        for i in range(3)
+    ]
+
+    dir_1 = tmp_path / "order_1"
+    dir_1.mkdir()
+    # In dir_1: write alpha first, then omega
+    (dir_1 / "1_alpha.py").write_text("\n".join(lines_alpha), encoding="utf-8")
+    (dir_1 / "2_omega.py").write_text("\n".join(lines_omega), encoding="utf-8")
+
+    dir_2 = tmp_path / "order_2"
+    dir_2.mkdir()
+    # In dir_2: write omega first, then alpha
+    (dir_2 / "1_omega.py").write_text("\n".join(lines_omega), encoding="utf-8")
+    (dir_2 / "2_alpha.py").write_text("\n".join(lines_alpha), encoding="utf-8")
+
+    calib = {
+        "total_units": 1000,
+        "max_index_frequency": 0.25,
+        "min_lines": 3,
+        "min_corpus_size": 4,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {},
+    }
+
+    clones_1 = scan_target(
+        str(dir_1),
+        min_lines=3,
+        threshold=0.70,
+        corpus_calibration=calib,
+    )
+    clones_2 = scan_target(
+        str(dir_2),
+        min_lines=3,
+        threshold=0.70,
+        corpus_calibration=calib,
+    )
+
+    names_1 = sorted({(c[1]["name"], c[2]["name"]) for c in clones_1})
+    names_2 = sorted({(c[1]["name"], c[2]["name"]) for c in clones_2})
+
+    # Both runs must discover the exact same clone pairs despite opposite file discovery order
+    assert len(names_1) > 0
+    assert names_1 == names_2
+
+
+
 
 
 

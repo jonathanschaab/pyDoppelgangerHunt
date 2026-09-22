@@ -1932,6 +1932,83 @@ def test_cli_inherits_representation_and_harvesting_modes_from_calibration(
     assert "Warning: Active scan configuration does not match baseline calibration config" in override_out
 
 
+def test_cli_inherits_null_max_index_frequency_from_calibration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that max_index_frequency: null in calibration is preserved as None without reverting to 0.25."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.baseline import compute_corpus_calibration, record_baseline  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def sample_operation_handler():\n"
+        "    val_one = 100\n"
+        "    val_two = 200\n"
+        "    val_three = 300\n"
+        "    return val_one + val_two + val_three\n"
+    )
+    repo = tmp_path / "null_freq_repo"
+    repo.mkdir(parents=True)
+    (repo / "comp_a.py").write_text(code, encoding="utf-8")
+    (repo / "comp_b.py").write_text(code, encoding="utf-8")
+
+    bl_file = repo / "baseline_null_freq.json"
+
+    # 1. Create and record baseline with max_index_frequency=None (disabled frequency pruning)
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+    clones = scan_target(str(repo), min_lines=3, threshold=0.80)
+    calib = compute_corpus_calibration([], max_index_frequency=None, min_lines=3, min_tokens=15, min_corpus_size=4)
+    record_baseline(
+        clones,
+        str(bl_file),
+        str(repo),
+        0.80,
+        repo_root=str(repo),
+        corpus_calibration=calib,
+    )
+
+    # 2. Run CLI scan with ONLY --baseline (unspecified max_index_frequency)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(bl_file),
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.80",
+        ],
+    )
+    res = main()
+    assert res == 0
+    out = capsys.readouterr().out
+    # Calibration should be accepted without configuration mismatch warning
+    assert "Warning: Active scan configuration does not match baseline calibration config" not in out
+
+    # 3. Explicit override (--max-index-frequency 0.20) should trigger configuration mismatch warning
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(bl_file),
+            "--max-index-frequency",
+            "0.20",
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.80",
+        ],
+    )
+    res_override = main()
+    assert res_override == 0
+    out_override = capsys.readouterr().out
+    assert "Warning: Active scan configuration does not match baseline calibration config" in out_override
+
+
+
 
 
 

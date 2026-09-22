@@ -680,6 +680,30 @@ def _resolve_strip_option(
     return bool(tool_cfg.get(strip_name, not tool_cfg.get(preserve_name, False)))
 
 
+def _resolve_frequency_option(
+    cli_arg: Optional[float],
+    tool_cfg: Dict[str, Any],
+    active_calib: Dict[str, Any],
+    has_explicit_cfg: bool,
+) -> Optional[float]:
+    """Resolves index frequency with precedence: CLI -> explicit config -> calibration -> implicit config -> default (0.25)."""
+    if cli_arg is not None:
+        return cli_arg
+    if has_explicit_cfg and "max_index_frequency" in tool_cfg:
+        cfg_val = tool_cfg["max_index_frequency"]
+        return _safe_index_frequency(cfg_val) if cfg_val is not None else None
+    if "max_index_frequency" in active_calib:
+        calib_val = active_calib["max_index_frequency"]
+        if calib_val is None:
+            return None
+        parsed_val = _safe_index_frequency(calib_val)
+        return parsed_val if parsed_val is not None else 0.25
+    if "max_index_frequency" in tool_cfg:
+        implicit_cfg = tool_cfg["max_index_frequency"]
+        return _safe_index_frequency(implicit_cfg) if implicit_cfg is not None else None
+    return 0.25
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Main execution CLI entrypoint."""
     parser = build_arg_parser()
@@ -776,15 +800,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     active_calib: Dict[str, Any] = dict(calib_dict) if (calib_dict and isinstance(calib_dict, dict)) else {}
     has_explicit_cfg = bool(args.config)
 
-    if args.max_index_frequency is not None:
-        max_index_frequency = args.max_index_frequency
-    elif has_explicit_cfg and "max_index_frequency" in tool_cfg:
-        max_index_frequency = float(tool_cfg["max_index_frequency"])
-    elif "max_index_frequency" in active_calib:
-        inherited_freq = _safe_index_frequency(active_calib.get("max_index_frequency"))
-        max_index_frequency = inherited_freq if inherited_freq is not None else 0.25
-    else:
-        max_index_frequency = float(tool_cfg.get("max_index_frequency", 0.25))
+    max_index_frequency = _resolve_frequency_option(
+        args.max_index_frequency, tool_cfg, active_calib, has_explicit_cfg
+    )
 
     int_specs: Sequence[Tuple[str, str, Optional[int], int, Optional[int]]] = (
         ("min_lines", "min_lines", args.min_lines, 1, 8),
@@ -816,7 +834,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if not args.exclude and (not has_explicit_cfg or "exclude" not in tool_cfg) and "excludes" in active_calib:
         raw_ex = active_calib.get("excludes")
-        if raw_ex and isinstance(raw_ex, (list, tuple, set)):
+        if isinstance(raw_ex, (list, tuple, set)):
             excludes = [str(x) for x in raw_ex]
         else:
             excludes = list(tool_cfg.get("exclude", DEFAULT_EXCLUDES))

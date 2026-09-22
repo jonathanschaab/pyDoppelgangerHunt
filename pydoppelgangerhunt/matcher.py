@@ -25,6 +25,7 @@ from pydoppelgangerhunt.baseline import (
     _safe_index_frequency,
     _safe_min_corpus,
     _safe_total_units,
+    _serialize_shingle_key,
     compute_calibration_config_hash,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
@@ -1143,7 +1144,9 @@ def scan_target(
 
     remaining_novel_pair_budget: int = MAX_NOVEL_SHINGLE_PAIR_BUDGET
 
-    for sh, u_indices in shingle_index.items():
+    sorted_shingle_keys = sorted(shingle_index.keys(), key=_serialize_shingle_key)
+    for sh in sorted_shingle_keys:
+        u_indices = shingle_index[sh]
         if len(u_indices) <= 1:
             continue
         if diff_unit_indices is not None:
@@ -1262,7 +1265,7 @@ def scan_target(
     )
 
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
-    for i, j in candidate_pairs:
+    for i, j in sorted(candidate_pairs):
         u1, u2 = units[i], units[j]
 
         if audit_tests and not (u1["name"].startswith("test_") and u2["name"].startswith("test_")):
