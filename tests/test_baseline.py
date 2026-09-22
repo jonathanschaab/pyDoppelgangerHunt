@@ -4687,6 +4687,70 @@ def test_record_baseline_resolves_absolute_endpoints(tmp_path: Path) -> None:
     assert len(suppressed) == 0
 
 
+def test_record_baseline_finalizes_calibration_scope_and_hash(tmp_path: Path) -> None:
+    """Verifies record_baseline applies final target scope before hashing and recomputes config_hash."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        compute_calibration_config_hash,
+        compute_corpus_calibration,
+    )
+    from pydoppelgangerhunt.matcher import _is_calibration_mode_compatible  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+    f1 = src / "a.py"
+    f2 = src / "b.py"
+    f1.write_text("def run():\n    pass\n", encoding="utf-8")
+    f2.write_text("def run():\n    pass\n", encoding="utf-8")
+
+    u1 = {"file": "a.py", "name": "run", "shingles": ["run"]}
+    u2 = {"file": "b.py", "name": "run", "shingles": ["run"]}
+    clones = [(1.0, u1, u2)]
+
+    # 1. Create corpus calibration without explicit scope (scope defaults to None)
+    calib_raw = compute_corpus_calibration([u1, u2])
+    assert calib_raw.get("scope") is None
+    initial_hash = calib_raw.get("config_hash")
+    assert initial_hash is not None
+
+    # 2. Record baseline for subdirectory src/ within repo
+    base_file = tmp_path / "baseline_calib.json"
+    record_baseline(
+        clones,
+        str(base_file),
+        target=str(src),
+        repo_root=str(repo),
+        threshold=0.9,
+        corpus_calibration=calib_raw,
+    )
+
+    with open(base_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # Scope in calibration entry must be finalized to "src" and not overwritten to None
+    persisted_calib = data["corpus_calibration"]
+    assert persisted_calib["scope"] == "src"
+    assert persisted_calib["target_repo_relative"] == "src"
+
+    # config_hash must be recomputed from the finalized entry (different from initial_hash with scope=None)
+    final_expected_hash = compute_calibration_config_hash(persisted_calib)
+    assert persisted_calib["config_hash"] == final_expected_hash
+    assert data["config_hash"] == final_expected_hash
+    assert persisted_calib["config_hash"] != initial_hash
+
+    # 3. Reload baseline and verify compatibility
+    loaded = load_baseline(str(base_file))
+    assert loaded.corpus_calibration is not None
+    assert loaded.corpus_calibration["scope"] == "src"
+    assert loaded.corpus_calibration["config_hash"] == final_expected_hash
+
+    # Must be compatible with active subdirectory scan (target_scope="src")
+    assert _is_calibration_mode_compatible(loaded.corpus_calibration, target_scope="src")
+    # Must reject incompatible target_scope (e.g. root scan target_scope=None)
+    assert not _is_calibration_mode_compatible(loaded.corpus_calibration, target_scope=None)
+
+
+
 
 
 

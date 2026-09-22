@@ -590,17 +590,19 @@ def record_baseline(
             "global_stop_shingles": safe_stops,
             "shingle_frequencies": dict(sorted(safe_shingle_freqs.items(), key=lambda item: item[0])),
         }
+        _attach_calibration_flags(calib_entry, corpus_calibration)
         if target_repo_rel:
             calib_entry["target_repo_relative"] = target_repo_rel
             calib_entry["scope"] = target_repo_rel
+        elif not calib_entry.get("scope"):
+            raw_sc = corpus_calibration.get("scope") or corpus_calibration.get("target_repo_relative")
+            if raw_sc:
+                norm_sc = normalize_lexical_posix(str(raw_sc)).strip("/")
+                calib_entry["scope"] = norm_sc if norm_sc else None
+                calib_entry["target_repo_relative"] = norm_sc if norm_sc else None
         if target:
             calib_entry["target"] = target
-        _attach_calibration_flags(calib_entry, corpus_calibration)
-        calib_config_hash = (
-            str(corpus_calibration.get("config_hash"))
-            if corpus_calibration.get("config_hash")
-            else compute_calibration_config_hash(calib_entry)
-        )
+        calib_config_hash = compute_calibration_config_hash(calib_entry)
         calib_entry["config_hash"] = calib_config_hash
         if head_commit:
             calib_entry["recorded_commit"] = head_commit
@@ -794,12 +796,19 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
             )
 
         if corpus_calibration is not None and isinstance(corpus_calibration, dict):
-            if "target_repo_relative" not in corpus_calibration and target_repo_rel:
+            if target_repo_rel and not corpus_calibration.get("target_repo_relative"):
                 corpus_calibration["target_repo_relative"] = target_repo_rel
-            if "scope" not in corpus_calibration:
-                corpus_calibration["scope"] = corpus_calibration.get("target_repo_relative") or target_repo_rel
+            if target_repo_rel and not corpus_calibration.get("scope"):
+                corpus_calibration["scope"] = target_repo_rel
+            elif not corpus_calibration.get("scope") and corpus_calibration.get("target_repo_relative"):
+                corpus_calibration["scope"] = corpus_calibration.get("target_repo_relative")
             if "target" not in corpus_calibration and top_target:
                 corpus_calibration["target"] = top_target
+            recomputed_hash = compute_calibration_config_hash(corpus_calibration)
+            if not calib_cfg_hash or calib_cfg_hash != recomputed_hash:
+                calib_cfg_hash = recomputed_hash
+                corpus_calibration["config_hash"] = recomputed_hash
+                top_cfg_hash = recomputed_hash
         return BaselineFingerprints(
             fps,
             records=records,
