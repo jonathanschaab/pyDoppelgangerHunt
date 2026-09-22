@@ -491,7 +491,18 @@ def record_baseline(
     target_p = Path(baseline_path)
     if target_repo_rel:
         data["target_repo_relative"] = target_repo_rel
-    head_commit = git_diff.get_git_head_commit(repo_root=target)
+    probe_target = repo_root or target
+    probe_dir: Optional[Union[str, Path]] = None
+    try:
+        t_p = Path(probe_target) if probe_target is not None else None
+        probe_dir = (
+            t_p.parent
+            if (t_p and (t_p.is_file() or (not t_p.is_dir() and t_p.suffix in (".py", ".ipynb"))))
+            else t_p
+        )
+    except (ValueError, OSError, RuntimeError):
+        probe_dir = probe_target
+    head_commit = git_diff.get_git_head_commit(repo_root=probe_dir)
     if head_commit:
         data["recorded_commit"] = head_commit
     if isinstance(corpus_calibration, dict):
@@ -804,7 +815,13 @@ def _derive_target_offsets(
     try:
         cand = target or repo_root or base_target
         if cand:
-            git_root = git_diff.get_git_repo_root(repo_root=cand)
+            c_p = Path(cand)
+            cand_dir: Union[str, Path] = (
+                c_p.parent
+                if (c_p.is_file() or (not c_p.is_dir() and c_p.suffix in (".py", ".ipynb")))
+                else c_p
+            )
+            git_root = git_diff.get_git_repo_root(repo_root=cand_dir)
             if git_root:
                 effective_repo = git_root
     except (ValueError, OSError, RuntimeError, TypeError):
@@ -952,7 +969,16 @@ def _build_baseline_path_resolver(
     if anchor is None:
         return None
     try:
-        git_root = git_diff.get_git_repo_root(repo_root=anchor)
+        a_p = Path(anchor)
+        anchor_dir: Union[str, Path] = (
+            a_p.parent
+            if (a_p.is_file() or (not a_p.is_dir() and a_p.suffix in (".py", ".ipynb")))
+            else a_p
+        )
+    except (ValueError, OSError, RuntimeError):
+        anchor_dir = anchor
+    try:
+        git_root = git_diff.get_git_repo_root(repo_root=anchor_dir)
         effective_repo: Union[str, Path] = root or git_root or anchor
         effective_target: Union[str, Path] = target or baseline_target or root or anchor
         if baseline_target is not None and target is not None:
@@ -968,6 +994,42 @@ def _build_baseline_path_resolver(
         return None
 
 
+def _detect_clone_path_basis(
+    clones: Sequence[Any],
+    scan_offset: Optional[str],
+    explicit_basis: Optional[str] = None,
+) -> str:
+    """Detects whether active clone paths are repository-relative or target-relative."""
+    if explicit_basis:
+        return (
+            "repo_relative"
+            if explicit_basis in ("repo", "repo_relative", "worktree_relative")
+            else "target_relative"
+        )
+    if not scan_offset:
+        return "target_relative"
+    off = normalize_lexical_posix(scan_offset).strip("/")
+    if not off:
+        return "target_relative"
+    prefix = f"{off}/"
+    for item in clones[:20]:
+        u1, u2 = None, None
+        if isinstance(item, (tuple, list)) and len(item) >= 3:
+            u1, u2 = item[1], item[2]
+        elif isinstance(item, dict):
+            u1 = item.get("u1") or item.get("unit_a") or item
+            u2 = item.get("u2") or item.get("unit_b")
+        if isinstance(u1, dict):
+            f1 = normalize_lexical_posix(str(u1.get("file") or ""))
+            if f1 and (f1 == off or f1.startswith(prefix)):
+                return "repo_relative"
+        if isinstance(u2, dict):
+            f2 = normalize_lexical_posix(str(u2.get("file") or ""))
+            if f2 and (f2 == off or f2.startswith(prefix)):
+                return "repo_relative"
+    return "target_relative"
+
+
 def _match_clone_record(
     c_keys: Dict[str, Any],
     unconsumed: List[Dict[str, Any]],
@@ -975,11 +1037,17 @@ def _match_clone_record(
     base_offset: Optional[str] = None,
     scan_offset: Optional[str] = None,
     path_basis: Optional[str] = "target_relative",
+    clone_basis: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Finds matching unconsumed baseline record prioritizing exact and namespaced fingerprints."""
     c_fa, c_na, c_ha, c_fb, c_nb, c_hb = _extract_record_endpoint_data(c_keys)
-    c_repo_fa = _canonicalize_endpoint_path(c_fa, scan_offset, path_basis="target_relative")
-    c_repo_fb = _canonicalize_endpoint_path(c_fb, scan_offset, path_basis="target_relative")
+    active_basis = (
+        "repo_relative"
+        if clone_basis in ("repo", "repo_relative", "worktree_relative")
+        else "target_relative"
+    )
+    c_repo_fa = _canonicalize_endpoint_path(c_fa, scan_offset, path_basis=active_basis)
+    c_repo_fb = _canonicalize_endpoint_path(c_fb, scan_offset, path_basis=active_basis)
 
     if base_offset:
         rel_a = lexical_relative_to(c_repo_fa, base_offset)
@@ -1103,6 +1171,7 @@ def filter_clones_by_baseline(
     baseline_fingerprints: Set[str],
     repo_root: Optional[str] = None,
     target: Optional[str] = None,
+    clone_basis: Optional[str] = None,
 ) -> Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], int]:
     """Filters out grandfathered clones, returning newly introduced clones and count of suppressed clones."""
     if not baseline_fingerprints:
@@ -1120,6 +1189,9 @@ def filter_clones_by_baseline(
 
     records = getattr(baseline_fingerprints, "records", None)
     if records:
+        active_clone_basis = _detect_clone_path_basis(
+            clones, scan_offset, explicit_basis=clone_basis
+        )
         unconsumed = list(records)
         new_clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
         suppressed_count = 0
@@ -1148,6 +1220,7 @@ def filter_clones_by_baseline(
                 base_offset=base_offset,
                 scan_offset=scan_offset,
                 path_basis=base_basis,
+                clone_basis=active_clone_basis,
             )
             if matched_rec is not None:
                 suppressed_count += 1
@@ -1212,6 +1285,7 @@ def prune_baseline(
     unstaged_modified_ranges: Optional[Dict[str, List[Tuple[int, int]]]] = None,
     repo_root: Optional[str] = None,
     target: Optional[str] = None,
+    clone_basis: Optional[str] = None,
 ) -> PruneResult:
     """Prunes dead or refactored clone fingerprints from an existing baseline file.
 
@@ -1256,6 +1330,9 @@ def prune_baseline(
             )
             unstaged_modified_ranges = {}
 
+    active_clone_basis = _detect_clone_path_basis(
+        active_clones, scan_offset, explicit_basis=clone_basis
+    )
     active_target_fps: Set[str] = set()
     active_target_sfps: Set[str] = set()
     active_repo_fps: Set[str] = set()
@@ -1270,10 +1347,10 @@ def prune_baseline(
 
     for _sim, u1, u2 in active_clones:
         u1_repo = _canonicalize_endpoint_path(
-            str(u1.get("file") or ""), scan_offset, path_basis="target_relative"
+            str(u1.get("file") or ""), scan_offset, path_basis=active_clone_basis
         )
         u2_repo = _canonicalize_endpoint_path(
-            str(u2.get("file") or ""), scan_offset, path_basis="target_relative"
+            str(u2.get("file") or ""), scan_offset, path_basis=active_clone_basis
         )
         if base_offset:
             rel_1 = lexical_relative_to(u1_repo, base_offset)
@@ -1363,10 +1440,10 @@ def prune_baseline(
             ])
             for u1, u2 in pure_sfp_to_clones.get(item_pure_sfp, []):
                 u1_repo = _canonicalize_endpoint_path(
-                    str(u1.get("file") or ""), scan_offset, path_basis="target_relative"
+                    str(u1.get("file") or ""), scan_offset, path_basis=active_clone_basis
                 )
                 u2_repo = _canonicalize_endpoint_path(
-                    str(u2.get("file") or ""), scan_offset, path_basis="target_relative"
+                    str(u2.get("file") or ""), scan_offset, path_basis=active_clone_basis
                 )
                 u_ns = sorted([
                     extract_unit_namespace(u1_repo),
@@ -1381,10 +1458,10 @@ def prune_baseline(
         if not is_active:
             for u1, u2 in scoped_active_clones:
                 u1_f = _canonicalize_endpoint_path(
-                    str(u1.get("file") or ""), scan_offset, path_basis="target_relative"
+                    str(u1.get("file") or ""), scan_offset, path_basis=active_clone_basis
                 )
                 u2_f = _canonicalize_endpoint_path(
-                    str(u2.get("file") or ""), scan_offset, path_basis="target_relative"
+                    str(u2.get("file") or ""), scan_offset, path_basis=active_clone_basis
                 )
                 u1_h = compute_unit_structural_hash(u1)
                 u2_h = compute_unit_structural_hash(u2)
@@ -1410,15 +1487,32 @@ def prune_baseline(
             )
             if can_rewrite and matched_clone is not None:
                 u1, u2 = matched_clone
-                item["file_a"] = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
-                item["file_b"] = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
+                f_a = str(u1.get("file") or "")
+                f_b = str(u2.get("file") or "")
+                if base_basis == "target_relative" and active_clone_basis == "repo_relative" and scan_offset:
+                    rel_fa = lexical_relative_to(f_a, scan_offset)
+                    if rel_fa:
+                        f_a = rel_fa
+                    rel_fb = lexical_relative_to(f_b, scan_offset)
+                    if rel_fb:
+                        f_b = rel_fb
+                elif base_basis in ("repo_relative", "worktree_relative") and active_clone_basis == "target_relative" and scan_offset:
+                    off_prefix = normalize_lexical_posix(scan_offset).strip("/")
+                    f_a = f"{off_prefix}/{f_a}"
+                    f_b = f"{off_prefix}/{f_b}"
+                f_a_norm = normalize_path_string(f_a, strip_anchor=False)
+                f_b_norm = normalize_path_string(f_b, strip_anchor=False)
+                u1_rewritten = dict(u1, file=f_a_norm)
+                u2_rewritten = dict(u2, file=f_b_norm)
+                item["file_a"] = f_a_norm
+                item["file_b"] = f_b_norm
                 item["name_a"] = str(u1.get("name") or "unit1")
                 item["name_b"] = str(u2.get("name") or "unit2")
-                item["namespace_a"] = extract_unit_namespace(str(u1.get("file") or ""))
-                item["namespace_b"] = extract_unit_namespace(str(u2.get("file") or ""))
-                item["fingerprint"] = clone_pair_fingerprint(u1, u2)
-                item["structural_fingerprint"] = clone_pair_structural_fingerprint(u1, u2)
-                item["namespaced_structural_fingerprint"] = namespaced_structural_fingerprint(u1, u2)
+                item["namespace_a"] = extract_unit_namespace(f_a_norm)
+                item["namespace_b"] = extract_unit_namespace(f_b_norm)
+                item["fingerprint"] = clone_pair_fingerprint(u1_rewritten, u2_rewritten)
+                item["structural_fingerprint"] = clone_pair_structural_fingerprint(u1_rewritten, u2_rewritten)
+                item["namespaced_structural_fingerprint"] = namespaced_structural_fingerprint(u1_rewritten, u2_rewritten)
                 item["pure_structural_fingerprint"] = pure_structural_fingerprint(u1, u2)
                 item["hash_a"] = compute_unit_structural_hash(u1)
                 item["hash_b"] = compute_unit_structural_hash(u2)

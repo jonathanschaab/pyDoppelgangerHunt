@@ -673,6 +673,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     target = target_arg or default_dir
     target_dir = target if os.path.isdir(target) else (os.path.dirname(target) or ".")
     target_repo_root = target_dir
+    git_root = _safe_call_git_diff_helper(get_git_repo_root, None, target_repo_root)
+    git_worktree_root = git_root if git_root and os.path.exists(git_root) else target_repo_root
     threshold = args.threshold if args.threshold is not None else float(tool_cfg.get("threshold", 0.90))
     min_lines = args.min_lines if args.min_lines is not None else int(tool_cfg.get("min_lines", 8))
     min_tokens = args.min_tokens if args.min_tokens is not None else int(tool_cfg.get("min_tokens", 15))
@@ -747,7 +749,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         base_target_rel = getattr(preloaded_baseline, "target_repo_relative", None)
         target_val = target or getattr(args, "target", None) or target_repo_root
         base_offset, scan_offset = _derive_target_offsets(
-            base_target, base_target_rel, target_repo_root, target_val
+            base_target, base_target_rel, git_worktree_root, target_val
         )
         if calib_dict and isinstance(calib_dict, dict):
             if (base_offset or "") != (scan_offset or ""):
@@ -813,8 +815,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     diff_files: Optional[Sequence[str]] = None
     if args.diff_only:
-        git_root = _safe_call_git_diff_helper(get_git_repo_root, None, target_repo_root)
-        git_diff_root = git_root if git_root and os.path.exists(git_root) else target_repo_root
+        git_diff_root = git_worktree_root
         raw_diff_files = _safe_call_git_diff_helper(
             get_git_modified_files, args.since, git_diff_root
         )
@@ -900,7 +901,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         base_commit = calib_dict.get("recorded_commit") or getattr(preloaded_baseline, "recorded_commit", None)
         if base_commit and args.verbose:
-            curr_commit = get_git_head_commit(repo_root=target_repo_root)
+            curr_commit = get_git_head_commit(repo_root=git_worktree_root)
             if curr_commit and base_commit.lower() != curr_commit.lower():
                 print(
                     colorize(
@@ -917,7 +918,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             target,
             threshold,
             corpus_calibration=recorded_calib,
-            repo_root=target_repo_root,
+            repo_root=git_worktree_root,
         )
         print(f"[OK] Recorded {len(clones)} clone baseline pair(s) to {bp}")
         return 0

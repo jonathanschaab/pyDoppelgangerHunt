@@ -4118,6 +4118,275 @@ def test_calibration_persisted_fields_validated_against_config_hash() -> None:
     assert not _is_calibration_mode_compatible(desync_scope, bag_of_tokens=False, target_scope="src")
 
 
+def test_detect_clone_path_basis() -> None:
+    """Verifies that _detect_clone_path_basis distinguishes repo-relative from target-relative clone endpoints."""
+    from pydoppelgangerhunt.baseline import _detect_clone_path_basis  # pylint: disable=import-outside-toplevel
+
+    # 1. Explicit basis overrides
+    assert _detect_clone_path_basis([], "src", explicit_basis="repo_relative") == "repo_relative"
+    assert _detect_clone_path_basis([], "src", explicit_basis="repo") == "repo_relative"
+    assert _detect_clone_path_basis([], "src", explicit_basis="worktree_relative") == "repo_relative"
+    assert _detect_clone_path_basis([], "src", explicit_basis="target_relative") == "target_relative"
+    assert _detect_clone_path_basis([], "src", explicit_basis="target") == "target_relative"
+
+    # 2. No scan offset -> default target_relative
+    assert _detect_clone_path_basis([], None) == "target_relative"
+    assert _detect_clone_path_basis([], "") == "target_relative"
+
+    # 3. Tuple/list clones
+    c_repo = (
+        0.95,
+        {"file": "src/worker.py", "name": "work"},
+        {"file": "src/helper.py", "name": "help"},
+    )
+    c_target = (
+        0.95,
+        {"file": "worker.py", "name": "work"},
+        {"file": "helper.py", "name": "help"},
+    )
+    assert _detect_clone_path_basis([c_repo], "src") == "repo_relative"
+    assert _detect_clone_path_basis([c_target], "src") == "target_relative"
+
+    # 4. Dict clones
+    d_repo = {
+        "unit_a": {"file": "src/worker.py", "name": "work"},
+        "unit_b": {"file": "src/helper.py", "name": "help"},
+    }
+    d_target = {
+        "unit_a": {"file": "worker.py", "name": "work"},
+        "unit_b": {"file": "helper.py", "name": "help"},
+    }
+    assert _detect_clone_path_basis([d_repo], "src") == "repo_relative"
+    assert _detect_clone_path_basis([d_target], "src") == "target_relative"
+
+
+def test_filter_clones_by_baseline_with_repo_relative_clones(tmp_path: Path) -> None:
+    """Verifies filter_clones_by_baseline suppresses clones whether active endpoints are repo- or target-relative."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        filter_clones_by_baseline,
+        record_baseline,
+        load_baseline,
+    )
+
+    repo_dir = tmp_path / "repo"
+    src_dir = repo_dir / "src"
+    src_dir.mkdir(parents=True)
+
+    u1_t = {"file": "worker.py", "name": "work", "structural_hash": "hash1"}
+    u2_t = {"file": "helper.py", "name": "help", "structural_hash": "hash2"}
+    target_clones = [(0.95, u1_t, u2_t)]
+
+    # Record baseline for src targeting directory
+    bp_path = str(repo_dir / ".baseline.json")
+    record_baseline(
+        target_clones,
+        bp_path,
+        str(src_dir),
+        0.90,
+        repo_root=str(repo_dir),
+    )
+    loaded_base = load_baseline(bp_path)
+
+    # Scenario A: Clones harvested relative to repo_root (src/worker.py)
+    u1_r = {"file": "src/worker.py", "name": "work", "structural_hash": "hash1"}
+    u2_r = {"file": "src/helper.py", "name": "help", "structural_hash": "hash2"}
+    repo_clones = [(0.95, u1_r, u2_r)]
+
+    rem_repo, supp_repo = filter_clones_by_baseline(
+        repo_clones,
+        loaded_base,
+        repo_root=str(repo_dir),
+        target=str(src_dir),
+    )
+    assert supp_repo == 1
+    assert len(rem_repo) == 0
+
+    # Scenario B: Clones harvested relative to target (worker.py)
+    rem_target, supp_target = filter_clones_by_baseline(
+        target_clones,
+        loaded_base,
+        repo_root=str(repo_dir),
+        target=str(src_dir),
+    )
+    assert supp_target == 1
+    assert len(rem_target) == 0
+
+    # Scenario C: Explicit clone_basis override
+    rem_exp, supp_exp = filter_clones_by_baseline(
+        repo_clones,
+        loaded_base,
+        repo_root=str(repo_dir),
+        target=str(src_dir),
+        clone_basis="repo_relative",
+    )
+    assert supp_exp == 1
+    assert len(rem_exp) == 0
+
+
+def test_prune_baseline_with_repo_relative_clones(tmp_path: Path) -> None:
+    """Verifies prune_baseline correctly matches and retains records when active clones are repo-relative."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        prune_baseline,
+        record_baseline,
+        load_baseline,
+    )
+
+    repo_dir = tmp_path / "repo_prune"
+    src_dir = repo_dir / "src"
+    src_dir.mkdir(parents=True)
+
+    u1_t = {"file": "worker.py", "name": "work", "structural_hash": "hash1"}
+    u2_t = {"file": "helper.py", "name": "help", "structural_hash": "hash2"}
+    u3_t = {"file": "dead.py", "name": "old_func", "structural_hash": "hash_dead"}
+    initial_clones = [(0.95, u1_t, u2_t), (0.90, u1_t, u3_t)]
+
+    bp_path = str(repo_dir / ".baseline.json")
+    record_baseline(
+        initial_clones,
+        bp_path,
+        str(src_dir),
+        0.90,
+        repo_root=str(repo_dir),
+    )
+
+    # Active clones only contain the active pair, but formatted as repo-relative: "src/worker.py"
+    u1_r = {"file": "src/worker.py", "name": "work", "structural_hash": "hash1"}
+    u2_r = {"file": "src/helper.py", "name": "help", "structural_hash": "hash2"}
+    active_repo_clones = [(0.95, u1_r, u2_r)]
+
+    prune_res = prune_baseline(
+        bp_path,
+        active_repo_clones,
+        repo_root=str(repo_dir),
+        target=str(src_dir),
+    )
+    # The active clone must be retained, and the orphaned clone (dead.py) must be pruned
+    assert prune_res.retained_count == 1
+    assert prune_res.pruned_count == 1
+
+    reloaded = load_baseline(bp_path)
+    assert len(reloaded.records) == 1
+    # File paths in baseline must remain target_relative if base_basis was target_relative
+    assert reloaded.records[0]["file_a"] in ("worker.py", "helper.py")
+
+
+def test_record_baseline_single_file_in_git_worktree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that record_baseline captures recorded_commit for a single-file target in a Git worktree."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        record_baseline,
+        load_baseline,
+    )
+
+    repo_dir = tmp_path / "git_single_file_repo"
+    src_dir = repo_dir / "src"
+    src_dir.mkdir(parents=True)
+    target_file = src_dir / "worker.py"
+    target_file.write_text("def work(): pass\n", encoding="utf-8")
+
+    norm_repo = str(repo_dir).replace("\\", "/")
+    head_hash = "abcdef0123456789abcdef0123456789abcdef01"
+
+    def mock_run_git(args: Any, cwd: Any = None) -> Any:
+        if cwd is not None and not Path(cwd).is_dir():
+            raise NotADirectoryError(f"Cwd must be a directory, got: {cwd}")
+        if args == ["rev-parse", "--show-toplevel"]:
+            return norm_repo + "\n"
+        if args == ["rev-parse", "HEAD"]:
+            return head_hash + "\n"
+        return None
+
+    monkeypatch.setattr("pydoppelgangerhunt.git_diff._run_git_command", mock_run_git)
+
+    u1 = {"file": "worker.py", "name": "work", "structural_hash": "h1"}
+    u2 = {"file": "worker.py", "name": "work2", "structural_hash": "h2"}
+    clones = [(0.95, u1, u2)]
+
+    bp_path = str(repo_dir / ".single_baseline.json")
+    # Target is the single file path target_file, with repo_root=None (probes from target)
+    record_baseline(
+        clones,
+        bp_path,
+        str(target_file),
+        0.90,
+    )
+
+    loaded = load_baseline(bp_path)
+    assert loaded.recorded_commit == head_hash
+
+
+def test_cli_record_baseline_subdirectory_persists_target_repo_relative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that CLI --record-baseline on a subdirectory records target_repo_relative."""
+    import json  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    repo_dir = tmp_path / "cli_git_repo"
+    src_dir = repo_dir / "src"
+    src_dir.mkdir(parents=True)
+    f1 = src_dir / "a.py"
+    f2 = src_dir / "b.py"
+    code = "def shared():\n    x = 10\n    y = 20\n    return x + y\n"
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code.replace("shared", "shared2"), encoding="utf-8")
+
+    norm_repo = str(repo_dir).replace("\\", "/")
+    head_hash = "1234567890abcdef1234567890abcdef12345678"
+
+    def mock_run_git(args: Any, cwd: Any = None) -> Any:
+        if cwd is not None and not Path(cwd).is_dir():
+            raise NotADirectoryError(f"Cwd must be a directory, got: {cwd}")
+        if args == ["rev-parse", "--show-toplevel"]:
+            return norm_repo + "\n"
+        if args == ["rev-parse", "HEAD"]:
+            return head_hash + "\n"
+        return None
+
+    monkeypatch.setattr("pydoppelgangerhunt.git_diff._run_git_command", mock_run_git)
+
+    baseline_out = repo_dir / "sub_baseline.json"
+    exit_code = main([
+        str(src_dir),
+        "--record-baseline", str(baseline_out),
+        "--min-lines", "3",
+        "--min-tokens", "5",
+        "--threshold", "0.80",
+    ])
+    assert exit_code == 0
+    assert baseline_out.exists()
+
+    raw_data = json.loads(baseline_out.read_text(encoding="utf-8"))
+    assert raw_data.get("target_repo_relative") == "src"
+    assert raw_data.get("recorded_commit") == head_hash
+
+
+def test_run_git_command_normalizes_file_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that _run_git_command normalizes cwd when pointing to an existing file."""
+    import subprocess  # pylint: disable=import-outside-toplevel
+    from unittest import mock  # pylint: disable=import-outside-toplevel
+    from typing import List, Optional  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.git_diff import _run_git_command  # pylint: disable=import-outside-toplevel
+
+    f = tmp_path / "dummy.py"
+    f.write_text("print('hello')", encoding="utf-8")
+
+    captured_cwds: List[Optional[str]] = []
+
+    def mock_subprocess_run(*args: Any, **kwargs: Any) -> Any:
+        captured_cwds.append(kwargs.get("cwd"))
+        proc = mock.MagicMock()
+        proc.returncode = 0
+        proc.stdout = "ok\n"
+        return proc
+
+    monkeypatch.setattr(subprocess, "run", mock_subprocess_run)
+    res = _run_git_command(["status"], cwd=str(f))
+    assert res == "ok\n"
+    assert len(captured_cwds) == 1
+    # Effective cwd must be the directory containing dummy.py, not dummy.py itself
+    assert captured_cwds[0] == str(tmp_path)
+
+
 
 
 

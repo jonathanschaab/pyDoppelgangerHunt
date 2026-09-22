@@ -27,10 +27,16 @@ _GIT_C_ESCAPES: Dict[int, int] = {
 
 def _run_git_command(args: Sequence[str], cwd: Optional[str] = None) -> Optional[str]:
     """Executes a git command safely and returns standard output, or None on failure."""
+    effective_cwd = cwd or os.getcwd()
+    try:
+        if effective_cwd and os.path.isfile(effective_cwd):
+            effective_cwd = os.path.dirname(effective_cwd) or "."
+    except (OSError, ValueError):
+        pass
     try:
         proc = subprocess.run(
             ["git", *args],
-            cwd=cwd or os.getcwd(),
+            cwd=effective_cwd,
             capture_output=True,
             text=True,
             encoding="utf-8",
