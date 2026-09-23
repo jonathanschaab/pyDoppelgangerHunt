@@ -330,10 +330,9 @@ def test_lexical_relative_to_filesystem_root() -> None:
     assert resolver.matches_diff("/tmp/worker.py", diff_keys, basis="repo")
 
 
-def test_canonical_path_preserves_unc_network_paths_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_canonical_path_preserves_unc_network_paths_on_windows() -> None:
     """Verifies that CanonicalPathResolver does not corrupt UNC network paths with drive letters on Windows."""
-    monkeypatch.setattr(os, "name", "nt")
-    resolver = CanonicalPathResolver(target_root="C:/repo/src", repo_root="C:/repo")
+    resolver = CanonicalPathResolver(target_root="C:/repo/src", repo_root="C:/repo", is_windows=True)
 
     unc_path = "//server/share/folder/file.py"
     res = resolver.resolve(unc_path)
@@ -346,6 +345,11 @@ def test_canonical_path_preserves_unc_network_paths_on_windows(monkeypatch: pyte
     res_bs = resolver.resolve(unc_backslash)
     assert res_bs.absolute_lexical == unc_path
     assert not res_bs.absolute_lexical.startswith("C:")
+
+    # Verify regular absolute path with leading slash DOES get drive letter on Windows
+    res_drive_rel = resolver.resolve("/folder/file.py")
+    assert res_drive_rel.absolute_lexical == "C:/folder/file.py"
+
 
 
 def test_lexical_relative_to_empty_base_windows_drive() -> None:

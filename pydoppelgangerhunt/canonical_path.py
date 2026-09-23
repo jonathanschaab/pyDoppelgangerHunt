@@ -166,6 +166,7 @@ class CanonicalPathResolver:
         target_root: Union[str, Path],
         repo_root: Optional[Union[str, Path]] = None,
         case_fold: Optional[bool] = None,
+        is_windows: Optional[bool] = None,
     ) -> None:
         """Initializes resolver with target directory and optional repo root.
 
@@ -174,6 +175,8 @@ class CanonicalPathResolver:
             repo_root: Git worktree root directory. If omitted or None, defaults to target_root.
             case_fold: Whether to fold case during comparisons. If None, defaults to True
                 on Windows and False on other platforms.
+            is_windows: Whether to operate in Windows filesystem mode (drive letters and UNC paths).
+                If None, defaults to True on Windows and False on other platforms.
         """
         self.target_path = Path(target_root)
         try:
@@ -198,6 +201,12 @@ class CanonicalPathResolver:
             self.case_fold = os.name == "nt" or sys.platform == "win32"
         else:
             self.case_fold = bool(case_fold)
+
+        if is_windows is None:
+            self.is_windows = os.name == "nt" or sys.platform == "win32"
+        else:
+            self.is_windows = bool(is_windows)
+
 
         self.target_lexical = normalize_lexical_posix(str(self.target_resolved))
         self.repo_lexical = normalize_lexical_posix(str(self.repo_resolved))
@@ -259,7 +268,7 @@ class CanonicalPathResolver:
         if is_abs:
             abs_lex = norm
             if (
-                os.name == "nt"
+                self.is_windows
                 and abs_lex.startswith("/")
                 and not abs_lex.startswith("//")
                 and not (len(abs_lex) >= 2 and abs_lex[1] == ":")
