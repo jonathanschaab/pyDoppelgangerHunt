@@ -867,6 +867,16 @@ def test_batch_49_matcher_similarity_and_subclones(tmp_path: Path) -> None:
     clones_calls = scan_target(str(pkg_scan), threshold=0.8, min_lines=2, min_tokens=3, call_sequences=True)
     assert len(clones_calls) == 1
 
+    clones_tfidf_calls = scan_target(
+        str(pkg_scan),
+        threshold=0.8,
+        min_lines=2,
+        min_tokens=3,
+        tfidf=True,
+        call_sequences=True,
+    )
+    assert len(clones_tfidf_calls) == 1
+
     clones_bag = scan_target(
         str(pkg_scan),
         threshold=0.8,
@@ -1466,25 +1476,6 @@ def test_scan_target_diff_files_in_subdirectory(tmp_path: Path, monkeypatch: pyt
         threshold=0.80,
     )
     assert len(clones3) >= 1
-
-
-def test_unit_matches_diff_keys_with_repo_and_target_basis(tmp_path: Path) -> None:
-    """Verifies _unit_matches_diff_keys resolves diff keys correctly for repo-relative units."""
-    from pydoppelgangerhunt.matcher import _unit_matches_diff_keys  # pylint: disable=import-outside-toplevel
-
-    repo = tmp_path / "diff_keys_repo"
-    repo.mkdir()
-    target = repo / "sub_dir"
-    target.mkdir()
-
-    diff_keys = {"sub_dir/mod.py", "mod.py"}
-    # Repo-relative harvest
-    assert _unit_matches_diff_keys("sub_dir/mod.py", diff_keys, repo_root=repo, target_dir=target)
-    # Target-relative harvest (CLI scenario with worktree root)
-    assert _unit_matches_diff_keys("mod.py", diff_keys, repo_root=target, target_dir=target, git_root_resolved=repo)
-    assert not _unit_matches_diff_keys("other/mod.py", diff_keys, repo_root=repo, target_dir=target)
-    assert not _unit_matches_diff_keys(None, diff_keys, repo_root=repo, target_dir=target)
-    assert not _unit_matches_diff_keys("sub_dir/mod.py", set(), repo_root=repo, target_dir=target)
 
 
 def test_scan_target_diff_files_single_file_target(

@@ -1164,3 +1164,27 @@ def test_parse_git_diff_hunks_preserves_trailing_spaces_unquoted() -> None:
     hunks_ts = parse_git_diff_hunks(diff_unquoted_timestamp)
     assert "bar.py " in hunks_ts
     assert hunks_ts["bar.py "] == [(10, 11)]
+
+
+def test_run_git_diff_clean_since_ref() -> None:
+    """Verifies that _run_git_diff cleans since_ref, rejects leading hyphens, and ignores whitespace-only refs."""
+    from pydoppelgangerhunt.git_diff import _run_git_diff  # pylint: disable=import-outside-toplevel
+
+    with mock.patch("pydoppelgangerhunt.git_diff._run_git_command") as mock_cmd:
+        mock_cmd.return_value = ""
+        # 1. Whitespace-only ref behaves like unstaged diff without passing whitespace to git
+        _run_git_diff(["--name-only"], since_ref="   ")
+        mock_cmd.assert_called_once_with(["diff", "--name-only", "--"], cwd=None)
+
+    with mock.patch("pydoppelgangerhunt.git_diff._run_git_command") as mock_cmd:
+        # 2. Leading hyphen rejection
+        res = _run_git_diff(["--name-only"], since_ref="  --invalid-flag  ")
+        assert res is None
+        mock_cmd.assert_not_called()
+
+    with mock.patch("pydoppelgangerhunt.git_diff._run_git_command") as mock_cmd:
+        mock_cmd.return_value = ""
+        # 3. Valid ref with surrounding whitespace is stripped
+        _run_git_diff(["--name-only"], since_ref="  HEAD~1  ")
+        mock_cmd.assert_called_once_with(["diff", "--name-only", "HEAD~1", "--"], cwd=None)
+

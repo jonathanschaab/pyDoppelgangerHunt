@@ -142,11 +142,12 @@ def _run_git_diff(
     cwd: Optional[str] = None,
 ) -> Optional[str]:
     """Builds and executes a safe git diff command isolating revisions from pathspecs."""
-    if since_ref and since_ref.strip().startswith("-"):
+    clean_ref = since_ref.strip() if since_ref else None
+    if clean_ref and clean_ref.startswith("-"):
         return None
     args = ["diff", *diff_flags]
-    if since_ref:
-        args.extend([since_ref, "--"])
+    if clean_ref:
+        args.extend([clean_ref, "--"])
     else:
         args.append("--")
     return _run_git_command(args, cwd=cwd)

@@ -121,11 +121,9 @@ def _extract_calibration_settings(source: Dict[str, Any]) -> Dict[str, Any]:
         raw_val = source.get(int_flag, default_int)
         val = _safe_int(raw_val, min_val=1)
         settings[int_flag] = val if val is not None else default_int
-    raw_mcs = None
-    if isinstance(source, dict):
-        raw_mcs = source.get("min_corpus_size")
-        if raw_mcs is None:
-            raw_mcs = source.get("min_corpus_units")
+    raw_mcs = source.get("min_corpus_size")
+    if raw_mcs is None:
+        raw_mcs = source.get("min_corpus_units")
     settings["min_corpus_size"] = _safe_int(raw_mcs, min_val=0)
 
     raw_excludes = source.get("excludes")
@@ -1582,7 +1580,6 @@ def prune_baseline(
     repo_fp_to_clone: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
     repo_ns_sfp_to_clones: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
     pure_sfp_to_clones: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
-    scoped_active_clones: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     scoped_clone_metadata: List[
         Tuple[Dict[str, Any], Dict[str, Any], str, str, str, str, List[str]]
     ] = []
@@ -1600,7 +1597,6 @@ def prune_baseline(
             if rel_1 is None or rel_2 is None:
                 continue
 
-        scoped_active_clones.append((u1, u2))
         active_target_fps.add(clone_pair_fingerprint(u1, u2))
         active_target_sfps.add(clone_pair_structural_fingerprint(u1, u2))
 

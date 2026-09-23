@@ -588,39 +588,6 @@ def _resolve_git_root_path(target: Union[str, Path]) -> Optional[Path]:
     return None
 
 
-def _build_diff_path_keys(
-    diff_files: Sequence[str],
-    repo_root: Path,
-    target_dir: Path,
-    git_root_resolved: Optional[Path] = None,
-) -> Set[str]:
-    """Builds canonical lookup keys for diff files resolved against repo and target roots."""
-    effective_repo = git_root_resolved or repo_root
-    target_root_dir = target_dir if target_dir.is_dir() else target_dir.parent
-    resolver = CanonicalPathResolver(target_root=target_root_dir, repo_root=effective_repo)
-    return build_diff_path_keys(diff_files, resolver)
-
-
-def _unit_matches_diff_keys(
-    u_file_raw: Optional[str],
-    diff_keys: Set[str],
-    repo_root: Path,
-    target_dir: Path,
-    git_root_resolved: Optional[Path] = None,
-) -> bool:
-    """Checks if a unit file matches any canonical diff key without ambiguous suffix matching."""
-    if not u_file_raw or not diff_keys:
-        return False
-    effective_repo = git_root_resolved or repo_root
-    target_root_dir = target_dir if target_dir.is_dir() else target_dir.parent
-    resolver = CanonicalPathResolver(target_root=target_root_dir, repo_root=effective_repo)
-    is_target_relative_harvest = (
-        repo_root.resolve() == target_root_dir.resolve()
-    )
-    unit_basis = "target" if is_target_relative_harvest else "repo"
-    return resolver.matches_diff(u_file_raw, diff_keys, basis=unit_basis)
-
-
 def _add_candidate_pairs(
     candidate_pairs: Set[Tuple[int, int]],
     indices: Sequence[int],
@@ -651,6 +618,20 @@ def _add_candidate_pairs(
     for idx1 in diff_in:
         for idx2 in diff_out:
             candidate_pairs.add((idx1, idx2) if idx1 < idx2 else (idx2, idx1))
+
+
+def _extract_unit_shingle_keys(
+    u: Dict[str, Any],
+    *,
+    call_sequences: bool = False,
+    bag_of_tokens: bool = False,
+) -> Set[Any]:
+    """Extracts shingle keys for indexing, DF counting, or TF-IDF weighting."""
+    if call_sequences:
+        return set(u.get("calls", []))
+    if bag_of_tokens:
+        return set(u.get("vector", {}))
+    return set(u.get("shingles") or ())
 
 
 def _build_calibration_metadata(
@@ -1075,7 +1056,9 @@ def scan_target(
 
         for idx in active_indices:
             u = units[idx]
-            keys = u.get("vector", {}).keys() if bag_of_tokens else (u.get("shingles") or ())
+            keys = _extract_unit_shingle_keys(
+                u, call_sequences=call_sequences, bag_of_tokens=bag_of_tokens
+            )
             for k in keys:
                 if effective_stop_shingles and k in effective_stop_shingles:
                     continue
@@ -1091,12 +1074,9 @@ def scan_target(
 
     shingle_index: Dict[Any, List[int]] = {}
     for idx, u in enumerate(units):
-        if call_sequences:
-            index_keys = set(u.get("calls", []))
-        elif bag_of_tokens:
-            index_keys = set(u.get("vector", {}))
-        else:
-            index_keys = set(u.get("shingles") or ())
+        index_keys = _extract_unit_shingle_keys(
+            u, call_sequences=call_sequences, bag_of_tokens=bag_of_tokens
+        )
         for sh in index_keys:
             if effective_stop_shingles and sh in effective_stop_shingles:
                 continue
@@ -1212,7 +1192,9 @@ def scan_target(
         active_candidate_units = {idx for pair in candidate_pairs for idx in pair}
         for u_idx in active_candidate_units:
             u = units[u_idx]
-            u_keys = u.get("vector", {}).keys() if bag_of_tokens else (u.get("shingles") or ())
+            u_keys = _extract_unit_shingle_keys(
+                u, call_sequences=call_sequences, bag_of_tokens=bag_of_tokens
+            )
             for k in u_keys:
                 if not (effective_stop_shingles and k in effective_stop_shingles):
                     keys_to_weight.add(k)
