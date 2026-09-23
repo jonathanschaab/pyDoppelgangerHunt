@@ -1774,6 +1774,17 @@ def prune_baseline(
         base_res = _build_baseline_path_resolver(base_target)
         if base_res is not None and base_res.target_in_repo:
             data["target_repo_relative"] = base_res.target_in_repo
+    if isinstance(data.get("corpus_calibration"), dict):
+        calib_entry = data["corpus_calibration"]
+        target_rel = data.get("target_repo_relative")
+        if target_rel:
+            if not calib_entry.get("target_repo_relative"):
+                calib_entry["target_repo_relative"] = target_rel
+            if not calib_entry.get("scope"):
+                calib_entry["scope"] = target_rel
+        recomputed_calib_hash = compute_calibration_config_hash(calib_entry)
+        calib_entry["config_hash"] = recomputed_calib_hash
+        data["config_hash"] = recomputed_calib_hash
     data["clone_count"] = len(retained)
     data["fingerprints"] = retained
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")

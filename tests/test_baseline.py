@@ -1832,6 +1832,85 @@ def test_prune_baseline_preserves_corpus_calibration(tmp_path: Path) -> None:
     assert loaded.corpus_calibration["shingle_frequencies"][("Stop", "A")] == 15
 
 
+def test_prune_baseline_synchronizes_calibration_scope_and_hash(tmp_path: Path) -> None:
+    """Verifies that prune_baseline synchronizes corpus_calibration scope and recomputes config_hash."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        compute_calibration_config_hash,
+        load_baseline,
+        prune_baseline,
+    )
+    from pydoppelgangerhunt.matcher import _is_calibration_mode_compatible  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+    f1 = src / "a.py"
+    f2 = src / "b.py"
+    f1.write_text("def run():\n    pass\n", encoding="utf-8")
+    f2.write_text("def run():\n    pass\n", encoding="utf-8")
+
+    u1 = {"file": "a.py", "name": "run"}
+    u2 = {"file": "b.py", "name": "run"}
+    base_file = tmp_path / "pruned_calib.json"
+
+    # Baseline file where corpus_calibration initially lacked scope
+    initial_calib: Dict[str, Any] = {
+        "total_units": 10,
+        "max_index_frequency": 0.25,
+        "scope": None,
+        "target_repo_relative": None,
+    }
+    initial_hash = compute_calibration_config_hash(initial_calib)
+    initial_calib["config_hash"] = initial_hash
+
+    raw_data = {
+        "version": "1.4.0",
+        "target": str(src),
+        "target_repo_relative": "src",
+        "path_basis": "target_relative",
+        "clone_count": 1,
+        "fingerprints": [
+            {
+                "file_a": "a.py",
+                "file_b": "b.py",
+                "name_a": "run",
+                "name_b": "run",
+                "fingerprint": "fp1",
+                "structural_fingerprint": "sfp1",
+            }
+        ],
+        "corpus_calibration": initial_calib,
+        "config_hash": initial_hash,
+    }
+    base_file.write_text(json.dumps(raw_data, indent=2), encoding="utf-8")
+
+    # Prune with active clones
+    prune_res = prune_baseline(
+        str(base_file),
+        [(1.0, u1, u2)],
+        unstaged_modified_ranges={},
+        target=str(src),
+        repo_root=str(repo),
+    )
+    assert prune_res.retained_count == 1
+
+    # Check persisted file on disk directly
+    saved_data = json.loads(base_file.read_text(encoding="utf-8"))
+    saved_calib = saved_data["corpus_calibration"]
+    assert saved_calib["scope"] == "src"
+    assert saved_calib["target_repo_relative"] == "src"
+    expected_hash = compute_calibration_config_hash(saved_calib)
+    assert saved_calib["config_hash"] == expected_hash
+    assert saved_data["config_hash"] == expected_hash
+    assert saved_calib["config_hash"] != initial_hash
+
+    # Check loaded baseline
+    loaded = load_baseline(str(base_file))
+    assert loaded.corpus_calibration is not None
+    assert loaded.corpus_calibration["scope"] == "src"
+    assert _is_calibration_mode_compatible(loaded.corpus_calibration, target_scope="src")
+
+
 def test_red_team_baseline_and_matcher_hardening(tmp_path: Path) -> None:
     """Verifies robustness fixes for recursion limits, unhashable stops, and negative bounds."""
     from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
