@@ -121,7 +121,11 @@ def _extract_calibration_settings(source: Dict[str, Any]) -> Dict[str, Any]:
         raw_val = source.get(int_flag, default_int)
         val = _safe_int(raw_val, min_val=1)
         settings[int_flag] = val if val is not None else default_int
-    raw_mcs = source.get("min_corpus_size") if isinstance(source, dict) else None
+    raw_mcs = None
+    if isinstance(source, dict):
+        raw_mcs = source.get("min_corpus_size")
+        if raw_mcs is None:
+            raw_mcs = source.get("min_corpus_units")
     settings["min_corpus_size"] = _safe_int(raw_mcs, min_val=0)
 
     raw_excludes = source.get("excludes")

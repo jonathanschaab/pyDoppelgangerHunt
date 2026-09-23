@@ -441,3 +441,22 @@ def test_resolver_equivalent_disjoint_repo_bounded_traversal() -> None:
     assert not resolver.equivalent("nonexistent_a.py", "nonexistent_b.py")
 
 
+def test_resolver_native_nonexistent_file_target_normalization(tmp_path: Path) -> None:
+    """Verifies that _normalize_root_directory normalizes non-existent .py and .ipynb files to their parent."""
+    from pydoppelgangerhunt.canonical_path import _normalize_root_directory  # pylint: disable=import-outside-toplevel
+
+    # Non-existent python file in existing parent directory
+    nonexistent_file = tmp_path / "phantom_module.py"
+    assert not nonexistent_file.exists()
+    _, _, lex_path = _normalize_root_directory(str(nonexistent_file), is_windows=(os.name == "nt"))
+    expected_parent = normalize_lexical_posix(str(tmp_path.resolve()))
+    assert lex_path == expected_parent
+
+    # Non-existent notebook file in existing parent directory
+    nonexistent_nb = tmp_path / "phantom_notebook.ipynb"
+    assert not nonexistent_nb.exists()
+    _, _, lex_nb = _normalize_root_directory(str(nonexistent_nb), is_windows=(os.name == "nt"))
+    assert lex_nb == expected_parent
+
+
+

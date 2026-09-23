@@ -3513,6 +3513,19 @@ def test_calibration_config_hash_determinism_and_sensitivity() -> None:
     # Invariant to absent vs explicit None min_corpus_size
     assert compute_calibration_config_hash({}) == compute_calibration_config_hash({"min_corpus_size": None})
     assert compute_calibration_config_hash({"min_corpus_size": 100}) != compute_calibration_config_hash({"min_corpus_size": None})
+    # Fallback to min_corpus_units when min_corpus_size is absent or None
+    assert compute_calibration_config_hash({"min_corpus_units": 100}) == compute_calibration_config_hash({"min_corpus_size": 100})
+    assert compute_calibration_config_hash({"min_corpus_size": None, "min_corpus_units": 100}) == compute_calibration_config_hash({"min_corpus_size": 100})
+    # min_corpus_size takes precedence over min_corpus_units when both present
+    assert compute_calibration_config_hash({"min_corpus_size": 50, "min_corpus_units": 100}) == compute_calibration_config_hash({"min_corpus_size": 50})
+    # Preserves explicit min_corpus_size: 0
+    assert compute_calibration_config_hash({"min_corpus_size": 0, "min_corpus_units": 100}) == compute_calibration_config_hash({"min_corpus_size": 0})
+    assert compute_calibration_config_hash({"min_corpus_size": 0}) != compute_calibration_config_hash({"min_corpus_size": 100})
+
+    from pydoppelgangerhunt.baseline import _extract_calibration_settings  # pylint: disable=import-outside-toplevel
+    assert _extract_calibration_settings({"min_corpus_units": 150})["min_corpus_size"] == 150
+    assert _extract_calibration_settings({"min_corpus_size": 0, "min_corpus_units": 150})["min_corpus_size"] == 0
+
 
 
 def test_baseline_config_hash_and_recorded_commit_roundtrip(tmp_path: Path) -> None:

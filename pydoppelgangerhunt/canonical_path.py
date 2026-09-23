@@ -203,7 +203,9 @@ def _normalize_root_directory(
     except (ValueError, OSError, RuntimeError):
         resolved_obj = path_obj
 
-    if resolved_obj.is_file():
+    if resolved_obj.is_file() or (
+        not resolved_obj.is_dir() and path_obj.suffix.lower() in (".py", ".ipynb")
+    ):
         resolved_obj = resolved_obj.parent
         path_obj = path_obj.parent
 
