@@ -189,6 +189,11 @@ def _normalize_root_directory(
         norm_clean = posixpath.normpath(norm_raw)
         if len(norm_clean) == 2 and norm_clean[1] == ":":
             norm_clean += "/"
+        last_seg = norm_clean.rsplit("/", 1)[-1]
+        if "." in last_seg and last_seg.rsplit(".", 1)[-1].lower() in ("py", "ipynb"):
+            norm_clean = posixpath.dirname(norm_clean)
+            if len(norm_clean) == 2 and norm_clean[1] == ":":
+                norm_clean += "/"
         path_obj = Path(norm_clean)
         return path_obj, path_obj, normalize_lexical_posix(norm_clean)
 
@@ -491,14 +496,15 @@ class CanonicalPathResolver:
                     r_cand = self.repo_path / p
                     if r_cand.is_file():
                         return r_cand
-                curr = self.target_path.parent
-                while curr != curr.parent:
-                    cand = curr / p
-                    if cand.is_file():
-                        return cand
-                    if curr == self.repo_path:
-                        break
-                    curr = curr.parent
+                if self.repo_path is not None and self.target_path != self.repo_path and self.target_in_repo:
+                    curr = self.target_path.parent
+                    while curr != curr.parent:
+                        cand = curr / p
+                        if cand.is_file():
+                            return cand
+                        if curr == self.repo_path:
+                            break
+                        curr = curr.parent
                 return None
 
             pa_file = _find_file(pa)

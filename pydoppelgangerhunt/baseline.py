@@ -31,7 +31,7 @@ MAX_CALIBRATION_UNITS: int = 1_000_000_000
 
 def _safe_total_units(raw_units: Any) -> int:
     """Clamps total_units to [0, MAX_CALIBRATION_UNITS], returning 0 for malformed/overflowing values."""
-    if raw_units is None:
+    if raw_units is None or isinstance(raw_units, bool):
         return 0
     try:
         val = int(raw_units)
@@ -46,7 +46,7 @@ def _safe_total_units(raw_units: Any) -> int:
 
 def _safe_int(raw_val: Any, min_val: int = 1) -> Optional[int]:
     """Validates and parses an integer >= min_val, or returns None."""
-    if raw_val is None:
+    if raw_val is None or isinstance(raw_val, bool):
         return None
     try:
         val = int(raw_val)
@@ -268,7 +268,7 @@ def _sanitize_shingle_frequency_dict(
 
 def _safe_index_frequency(raw_freq: Any) -> Optional[float]:
     """Validates and clamps an index frequency to a finite float in (0.0, 1.0], or None."""
-    if raw_freq is None:
+    if raw_freq is None or isinstance(raw_freq, bool):
         return None
     try:
         val = float(raw_freq)
@@ -819,7 +819,8 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
             recorded_commit=top_commit,
             target=top_target,
         )
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError, TypeError, AttributeError, RecursionError):
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError, TypeError, AttributeError, RecursionError) as err:
+        logger.debug("Failed to load baseline at %s: %s", baseline_path, err, exc_info=True)
         return BaselineFingerprints()
 
 
@@ -1360,7 +1361,7 @@ def _match_clone_record(
 
 def filter_clones_by_baseline(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
-    baseline_fingerprints: Set[str],
+    baseline_fingerprints: Union[Set[str], BaselineFingerprints],
     repo_root: Optional[str] = None,
     target: Optional[str] = None,
     clone_basis: Optional[str] = None,
@@ -1578,6 +1579,9 @@ def prune_baseline(
     repo_ns_sfp_to_clones: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
     pure_sfp_to_clones: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
     scoped_active_clones: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    scoped_clone_metadata: List[
+        Tuple[Dict[str, Any], Dict[str, Any], str, str, str, str, List[str]]
+    ] = []
 
     for _sim, u1, u2 in active_clones:
         u1_repo = _canonicalize_endpoint_path(
@@ -1600,6 +1604,9 @@ def prune_baseline(
         u2_name = str(u2.get("name") or "")
         u1_hash = str(u1.get("structural_hash") or compute_unit_structural_hash(u1))
         u2_hash = str(u2.get("structural_hash") or compute_unit_structural_hash(u2))
+        scoped_clone_metadata.append(
+            (u1, u2, u1_repo, u2_repo, u1_hash, u2_hash, sorted([u1_name, u2_name]))
+        )
         u1_ns = extract_unit_namespace(u1_repo)
         u2_ns = extract_unit_namespace(u2_repo)
 
@@ -1695,19 +1702,10 @@ def prune_baseline(
                     break
 
         if not is_active:
-            for u1, u2 in scoped_active_clones:
-                u1_f = _canonicalize_endpoint_path(
-                    str(u1.get("file") or ""), scan_offset, path_basis=active_clone_basis
-                )
-                u2_f = _canonicalize_endpoint_path(
-                    str(u2.get("file") or ""), scan_offset, path_basis=active_clone_basis
-                )
-                u1_h = compute_unit_structural_hash(u1)
-                u2_h = compute_unit_structural_hash(u2)
+            for u1, u2, u1_f, u2_f, u1_h, u2_h, c_names in scoped_clone_metadata:
                 if _matches_boundary_and_structural_hashes(
                     r_repo_fa, r_repo_fb, h_a, h_b, u1_f, u2_f, u1_h, u2_h, resolver=resolver
                 ):
-                    c_names = sorted([str(u1.get("name") or ""), str(u2.get("name") or "")])
                     if not item.get("name_a") or _record_matches_names(item, c_names):
                         is_active = True
                         is_boundary_matched = True

@@ -1075,7 +1075,7 @@ def scan_target(
 
         for idx in active_indices:
             u = units[idx]
-            keys = u.get("vector", {}).keys() if bag_of_tokens else u["shingles"]
+            keys = u.get("vector", {}).keys() if bag_of_tokens else (u.get("shingles") or ())
             for k in keys:
                 if effective_stop_shingles and k in effective_stop_shingles:
                     continue
@@ -1212,7 +1212,7 @@ def scan_target(
         active_candidate_units = {idx for pair in candidate_pairs for idx in pair}
         for u_idx in active_candidate_units:
             u = units[u_idx]
-            u_keys = u.get("vector", {}).keys() if bag_of_tokens else u["shingles"]
+            u_keys = u.get("vector", {}).keys() if bag_of_tokens else (u.get("shingles") or ())
             for k in u_keys:
                 if not (effective_stop_shingles and k in effective_stop_shingles):
                     keys_to_weight.add(k)

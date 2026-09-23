@@ -5050,3 +5050,29 @@ def test_match_clone_record_preserves_empty_root_namespace() -> None:
     assert matched is rec
 
 
+def test_numeric_sanitizers_reject_booleans() -> None:
+    """Verifies that _safe_total_units, _safe_int, and _safe_index_frequency reject booleans."""
+    from pydoppelgangerhunt.baseline import _safe_index_frequency, _safe_int, _safe_total_units
+
+    assert _safe_total_units(True) == 0
+    assert _safe_total_units(False) == 0
+    assert _safe_int(True, min_val=1) is None
+    assert _safe_int(False, min_val=0) is None
+    assert _safe_index_frequency(True) is None
+    assert _safe_index_frequency(False) is None
+
+
+def test_load_baseline_failure_diagnostic_logging(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Verifies that load_baseline logs diagnostic debug message on load failure."""
+    import logging
+    invalid_file = tmp_path / "corrupt_baseline.json"
+    invalid_file.write_text("{invalid json", encoding="utf-8")
+
+    with caplog.at_level(logging.DEBUG):
+        base = load_baseline(str(invalid_file))
+        assert len(base) == 0
+
+    assert any("Failed to load baseline at" in record.message for record in caplog.records)
+
+
+

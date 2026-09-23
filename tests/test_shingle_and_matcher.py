@@ -1750,6 +1750,30 @@ def test_legacy_calibration_missing_frequencies_falls_back_to_stop_shingles(
     assert len(clones_none) >= 3
 
 
+def test_matcher_units_missing_shingles_no_key_error(tmp_path: Path) -> None:
+    """Verifies that scan_target with tfidf=True handles units missing shingles key without KeyError."""
+    from unittest.mock import patch
+    import pydoppelgangerhunt.matcher
+
+    f = tmp_path / "code.py"
+    f.write_text("def a():\n    return 1\ndef b():\n    return 1\n", encoding="utf-8")
+
+    orig_harvest = pydoppelgangerhunt.matcher.harvest_file_units
+
+    def mock_harvest(*args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
+        units = orig_harvest(*args, **kwargs)
+        if units:
+            units[0].pop("shingles", None)
+            if len(units) > 1:
+                units[1]["shingles"] = None
+        return units
+
+    with patch.object(pydoppelgangerhunt.matcher, "harvest_file_units", side_effect=mock_harvest):
+        clones = scan_target(str(tmp_path), tfidf=True, min_lines=1)
+        assert isinstance(clones, list)
+
+
+
 
 
 

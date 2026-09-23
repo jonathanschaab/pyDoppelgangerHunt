@@ -419,3 +419,25 @@ def test_resolver_root_directories_no_double_slash() -> None:
     assert res_win_repo.absolute_lexical == "C:/worker.py"
     assert "C://" not in res_win_repo.absolute_lexical
 
+
+def test_resolver_simulated_windows_file_target_normalization() -> None:
+    """Verifies that _normalize_root_directory normalizes simulated Windows file targets to parents."""
+    from unittest.mock import patch
+    from pydoppelgangerhunt.canonical_path import _normalize_root_directory
+
+    with patch("os.name", "posix"):
+        _, _, sim_lex = _normalize_root_directory("C:/repo/src/worker.py", is_windows=True)
+        assert sim_lex == "C:/repo/src"
+        _, _, sim_nb = _normalize_root_directory("C:/repo/src/analysis.ipynb", is_windows=True)
+        assert sim_nb == "C:/repo/src"
+        _, _, sim_drive_file = _normalize_root_directory("C:/worker.py", is_windows=True)
+        assert sim_drive_file == "C:/"
+
+
+def test_resolver_equivalent_disjoint_repo_bounded_traversal() -> None:
+    """Verifies that equivalent does not perform unbounded upward traversal when target is not in repo."""
+    resolver = CanonicalPathResolver(target_root="/some/target", repo_root="/other/repo")
+    assert resolver.target_in_repo is None
+    assert not resolver.equivalent("nonexistent_a.py", "nonexistent_b.py")
+
+
