@@ -3525,6 +3525,17 @@ def test_calibration_config_hash_determinism_and_sensitivity() -> None:
     from pydoppelgangerhunt.baseline import _extract_calibration_settings  # pylint: disable=import-outside-toplevel
     assert _extract_calibration_settings({"min_corpus_units": 150})["min_corpus_size"] == 150
     assert _extract_calibration_settings({"min_corpus_size": 0, "min_corpus_units": 150})["min_corpus_size"] == 0
+    # Fallback to exclude when excludes is absent or None
+    assert _extract_calibration_settings({"exclude": ["vendor/*"]})["excludes"] == ["vendor/*"]
+    assert _extract_calibration_settings({"excludes": None, "exclude": ["vendor/*"]})["excludes"] == ["vendor/*"]
+    assert _extract_calibration_settings({"excludes": ["build/*"], "exclude": ["vendor/*"]})["excludes"] == ["build/*"]
+
+    # Defensively handle explicit None in calls and vector during calibration
+    from pydoppelgangerhunt.baseline import compute_corpus_calibration  # pylint: disable=import-outside-toplevel
+    calib_calls_none = compute_corpus_calibration([{"calls": None}], call_sequences=True)
+    assert calib_calls_none["total_units"] == 1
+    calib_vector_none = compute_corpus_calibration([{"vector": None}], bag_of_tokens=True)
+    assert calib_vector_none["total_units"] == 1
 
 
 

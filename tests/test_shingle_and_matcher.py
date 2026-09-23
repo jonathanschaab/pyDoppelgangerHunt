@@ -877,6 +877,11 @@ def test_batch_49_matcher_similarity_and_subclones(tmp_path: Path) -> None:
     )
     assert len(clones_tfidf_calls) == 1
 
+    from pydoppelgangerhunt.matcher import _extract_unit_shingle_keys  # pylint: disable=import-outside-toplevel
+    assert _extract_unit_shingle_keys({"calls": None}, call_sequences=True) == set()
+    assert _extract_unit_shingle_keys({"vector": None}, bag_of_tokens=True) == set()
+    assert _extract_unit_shingle_keys({"shingles": None}) == set()
+
     clones_bag = scan_target(
         str(pkg_scan),
         threshold=0.8,

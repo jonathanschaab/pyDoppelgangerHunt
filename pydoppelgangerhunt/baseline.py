@@ -127,6 +127,8 @@ def _extract_calibration_settings(source: Dict[str, Any]) -> Dict[str, Any]:
     settings["min_corpus_size"] = _safe_int(raw_mcs, min_val=0)
 
     raw_excludes = source.get("excludes")
+    if raw_excludes is None:
+        raw_excludes = source.get("exclude")
     if raw_excludes and isinstance(raw_excludes, (list, tuple, set)):
         try:
             cleaned_excludes = sorted({
@@ -329,9 +331,9 @@ def compute_corpus_calibration(
     shingle_frequencies: Dict[Any, int] = {}
     for u in units:
         if call_sequences:
-            keys = set(u.get("calls", []))
+            keys = set(u.get("calls") or ())
         elif bag_of_tokens:
-            keys = set(u.get("vector", {}).keys())
+            keys = set(u.get("vector") or ())
         elif "shingles" in u and u["shingles"]:
             keys = set(u["shingles"])
         elif "vector" in u and u["vector"]:

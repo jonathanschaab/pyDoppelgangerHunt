@@ -628,9 +628,9 @@ def _extract_unit_shingle_keys(
 ) -> Set[Any]:
     """Extracts shingle keys for indexing, DF counting, or TF-IDF weighting."""
     if call_sequences:
-        return set(u.get("calls", []))
+        return set(u.get("calls") or ())
     if bag_of_tokens:
-        return set(u.get("vector", {}))
+        return set(u.get("vector") or ())
     return set(u.get("shingles") or ())
 
 

@@ -374,17 +374,6 @@ def _safe_call_git_diff_helper(
         return fn(since_ref=since_ref)
 
 
-def _resolve_target_relative_path(
-    p_str: str,
-    res_git: Path,
-    res_target: Path,
-) -> Optional[str]:
-    """Attempts to resolve a git-worktree-relative path relative to a target directory root."""
-    resolver = CanonicalPathResolver(target_root=res_target, repo_root=res_git)
-    cp = resolver.resolve(p_str, basis="repo")
-    return cp.target_relative
-
-
 def _normalize_git_paths_for_target(
     raw_paths: Sequence[str],
     git_root: str,
@@ -399,11 +388,13 @@ def _normalize_git_paths_for_target(
     if res_git == res_target:
         return [p for p in raw_paths if p]
 
+    resolver = CanonicalPathResolver(target_root=res_target, repo_root=res_git)
     normalized: List[str] = []
     for p_str in raw_paths:
         if not p_str:
             continue
-        rel = _resolve_target_relative_path(p_str, res_git, res_target)
+        cp = resolver.resolve(p_str, basis="repo")
+        rel = cp.target_relative
         if rel and rel != ".":
             if p_str not in normalized:
                 normalized.append(p_str)
@@ -424,11 +415,13 @@ def _normalize_modified_ranges_for_target(
     if res_git == res_target:
         return modified_ranges
 
+    resolver = CanonicalPathResolver(target_root=res_target, repo_root=res_git)
     target_ranges: Dict[str, List[Tuple[int, int]]] = {}
     for p_str, ranges in modified_ranges.items():
         if not p_str:
             continue
-        rel = _resolve_target_relative_path(p_str, res_git, res_target)
+        cp = resolver.resolve(p_str, basis="repo")
+        rel = cp.target_relative
         if rel and rel != ".":
             target_ranges[rel] = ranges
             target_ranges[p_str] = ranges
