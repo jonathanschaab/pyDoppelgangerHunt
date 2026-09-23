@@ -4829,18 +4829,85 @@ def test_record_baseline_finalizes_calibration_scope_and_hash(tmp_path: Path) ->
     assert not _is_calibration_mode_compatible(loaded.corpus_calibration, target_scope=None)
 
 
+def test_load_baseline_preserves_empty_shingle_frequencies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that load_baseline preserves an empty shingle_frequencies dictionary as {} rather than None."""
+    from pydoppelgangerhunt import matcher  # pylint: disable=import-outside-toplevel
 
+    base_file_empty = tmp_path / "baseline_empty_freqs.json"
+    raw_data_empty: Dict[str, Any] = {
+        "version": "1.5.0",
+        "clone_count": 0,
+        "fingerprints": [],
+        "corpus_calibration": {
+            "total_units": 0,
+            "max_index_frequency": 0.25,
+            "global_stop_shingles": [],
+            "shingle_frequencies": {},
+            "min_lines": 4,
+            "min_tokens": 10,
+        },
+    }
+    base_file_empty.write_text(json.dumps(raw_data_empty), encoding="utf-8")
 
+    loaded_empty = load_baseline(str(base_file_empty))
+    assert loaded_empty.corpus_calibration is not None
+    assert isinstance(loaded_empty.corpus_calibration["shingle_frequencies"], dict)
+    assert loaded_empty.corpus_calibration["shingle_frequencies"] == {}
 
+    src_dir = tmp_path / "src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    code1 = (
+        "def sample_fn_one(a, b, c, d):\n"
+        "    x = (a * 2) + (b * 3)\n"
+        "    y = (c * 4) + (d * 5)\n"
+        "    return x + y if x > y else y - x\n"
+    )
+    code2 = (
+        "def sample_fn_two(a, b, c, d):\n"
+        "    x = (a * 2) + (b * 3)\n"
+        "    y = (c * 4) + (d * 5)\n"
+        "    return x + y if x > y else y - x\n"
+    )
+    (src_dir / "mod1.py").write_text(code1, encoding="utf-8")
+    (src_dir / "mod2.py").write_text(code2, encoding="utf-8")
 
+    # In modern empty calibration, novel shingles are budget-bounded
+    monkeypatch.setattr(matcher, "MAX_NOVEL_SHINGLE_PAIR_BUDGET", 0)
+    clones_bounded = scan_target(
+        str(src_dir),
+        min_lines=4,
+        min_tokens=10,
+        threshold=0.80,
+        corpus_calibration=loaded_empty.corpus_calibration,
+    )
+    # Budget of 0 rejects novel candidate pairs
+    assert len(clones_bounded) == 0
 
+    # Contrast with legacy baseline where shingle_frequencies is omitted (None)
+    base_file_legacy = tmp_path / "baseline_legacy.json"
+    raw_data_legacy: Dict[str, Any] = {
+        "version": "1.4.0",
+        "clone_count": 0,
+        "fingerprints": [],
+        "corpus_calibration": {
+            "total_units": 10,
+            "max_index_frequency": 0.25,
+            "global_stop_shingles": [],
+            "min_lines": 4,
+            "min_tokens": 10,
+        },
+    }
+    base_file_legacy.write_text(json.dumps(raw_data_legacy), encoding="utf-8")
+    loaded_legacy = load_baseline(str(base_file_legacy))
+    assert loaded_legacy.corpus_calibration is not None
+    assert loaded_legacy.corpus_calibration["shingle_frequencies"] is None
 
-
-
-
-
-
-
-
-
-
+    # In legacy calibration, novel budget capping is bypassed
+    clones_legacy = scan_target(
+        str(src_dir),
+        min_lines=4,
+        min_tokens=10,
+        threshold=0.80,
+        corpus_calibration=loaded_legacy.corpus_calibration,
+    )
+    assert len(clones_legacy) == 1

@@ -736,7 +736,7 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
             calib_total_units = _safe_total_units(raw_calib.get("total_units"))
             raw_freqs = raw_calib.get("shingle_frequencies")
             decoded_freqs: Optional[Dict[Any, int]] = None
-            if isinstance(raw_freqs, dict) and raw_freqs:
+            if isinstance(raw_freqs, dict):
                 decoded_freqs = _sanitize_shingle_frequency_dict(
                     raw_freqs,
                     _deserialize_shingle_key,
