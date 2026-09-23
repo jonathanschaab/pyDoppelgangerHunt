@@ -1626,6 +1626,11 @@ def prune_baseline(
             item = dict(raw_item)
         else:
             continue
+        f_a = str(item.get("file_a") or "")
+        f_b = str(item.get("file_b") or "")
+        if not f_a and not f_b:
+            f_a, _, _, f_b, _, _ = _extract_record_endpoint_data(item)
+
         h_a = str(item.get("hash_a", ""))
         h_b = str(item.get("hash_b", ""))
         if not h_a and not h_b and item.get("structural_fingerprint"):
@@ -1719,21 +1724,21 @@ def prune_baseline(
             )
             if can_rewrite and matched_clone is not None:
                 u1, u2 = matched_clone
-                f_a = str(u1.get("file") or "")
-                f_b = str(u2.get("file") or "")
+                rw_fa = str(u1.get("file") or "")
+                rw_fb = str(u2.get("file") or "")
                 if base_basis == "target_relative" and active_clone_basis == "repo_relative" and scan_offset:
-                    rel_fa = lexical_relative_to(f_a, scan_offset)
+                    rel_fa = lexical_relative_to(rw_fa, scan_offset)
                     if rel_fa:
-                        f_a = rel_fa
-                    rel_fb = lexical_relative_to(f_b, scan_offset)
+                        rw_fa = rel_fa
+                    rel_fb = lexical_relative_to(rw_fb, scan_offset)
                     if rel_fb:
-                        f_b = rel_fb
+                        rw_fb = rel_fb
                 elif base_basis in ("repo_relative", "worktree_relative") and active_clone_basis == "target_relative" and scan_offset:
                     off_prefix = normalize_lexical_posix(scan_offset).strip("/")
-                    f_a = f"{off_prefix}/{f_a}"
-                    f_b = f"{off_prefix}/{f_b}"
-                f_a_norm = normalize_path_string(f_a, strip_anchor=False)
-                f_b_norm = normalize_path_string(f_b, strip_anchor=False)
+                    rw_fa = f"{off_prefix}/{rw_fa}"
+                    rw_fb = f"{off_prefix}/{rw_fb}"
+                f_a_norm = normalize_path_string(rw_fa, strip_anchor=False)
+                f_b_norm = normalize_path_string(rw_fb, strip_anchor=False)
                 u1_rewritten = dict(u1, file=f_a_norm)
                 u2_rewritten = dict(u2, file=f_b_norm)
                 item["file_a"] = f_a_norm
@@ -1750,8 +1755,6 @@ def prune_baseline(
                 item["hash_b"] = compute_unit_structural_hash(u2)
             retained.append(item)
         else:
-            f_a = str(item.get("file_a") or "")
-            f_b = str(item.get("file_b") or "")
             is_dirty = bool(
                 unstaged_modified_ranges
                 and (

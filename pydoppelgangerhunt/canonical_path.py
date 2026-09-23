@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import sys
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 import unicodedata
 
 
@@ -110,7 +110,8 @@ def lexical_relative_to(
         return _resolve_relative_segments(p_clean.lstrip("/"))
 
     if not b_clean:
-        return p_clean if not p_clean.startswith("/") else None
+        is_abs = p_clean.startswith("/") or (len(p_clean) >= 2 and p_clean[1] == ":")
+        return None if is_abs else p_clean
 
     p_compare = p_clean.lower() if case_fold else p_clean
     b_compare = b_clean.lower() if case_fold else b_clean
@@ -207,6 +208,7 @@ class CanonicalPathResolver:
         )
 
         self._cache: Dict[Tuple[str, str, bool], CanonicalPath] = {}
+        self._tagged_keys_cache: Optional[Tuple[Any, bool]] = None
 
     def _cache_set(self, key: Tuple[str, str, bool], value: CanonicalPath) -> None:
         if len(self._cache) >= MAX_RESOLVER_CACHE_ENTRIES:
@@ -259,6 +261,7 @@ class CanonicalPathResolver:
             if (
                 os.name == "nt"
                 and abs_lex.startswith("/")
+                and not abs_lex.startswith("//")
                 and not (len(abs_lex) >= 2 and abs_lex[1] == ":")
                 and len(self.target_lexical) >= 2
                 and self.target_lexical[1] == ":"
@@ -477,12 +480,20 @@ class CanonicalPathResolver:
         diff_keys: Set[str],
         basis: str = "target",
         strip_anchor: bool = True,
+        has_tagged: Optional[bool] = None,
     ) -> bool:
         """Checks if a unit file path matches any diff key without ambiguous suffix matching."""
         if not unit_file or not diff_keys:
             return False
 
-        has_tagged = any(k.startswith(("repo:", "target:")) for k in diff_keys)
+        if has_tagged is None:
+            cached = self._tagged_keys_cache
+            if cached is not None and cached[0] is diff_keys:
+                has_tagged = cached[1]
+            else:
+                has_tagged = any(k.startswith(("repo:", "target:")) for k in diff_keys)
+                self._tagged_keys_cache = (diff_keys, has_tagged)
+
         if self._probe_keys_in_diff(
             self.target_key(unit_file, basis=basis, strip_anchor=False),
             self.repo_key(unit_file, basis=basis, strip_anchor=False),

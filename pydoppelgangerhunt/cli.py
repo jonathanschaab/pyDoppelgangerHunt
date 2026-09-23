@@ -390,7 +390,7 @@ def _normalize_git_paths_for_target(
     git_root: str,
     target_repo_root: str,
 ) -> List[str]:
-    """Normalizes worktree-relative Git paths to target-relative paths when targeting a subdirectory."""
+    """Filters and retains worktree-relative Git paths located within the target subdirectory."""
     try:
         res_git = Path(git_root).resolve()
         res_target = Path(target_repo_root).resolve()

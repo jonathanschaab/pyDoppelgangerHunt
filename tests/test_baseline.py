@@ -4911,3 +4911,67 @@ def test_load_baseline_preserves_empty_shingle_frequencies(tmp_path: Path, monke
         corpus_calibration=loaded_legacy.corpus_calibration,
     )
     assert len(clones_legacy) == 1
+
+
+def test_prune_baseline_inactive_first_record_no_unbound_local(tmp_path: Path) -> None:
+    """Verifies that prune_baseline does not raise UnboundLocalError when the first record is inactive and dirty."""
+    from pydoppelgangerhunt.baseline import prune_baseline  # pylint: disable=import-outside-toplevel
+
+    base_json = tmp_path / "baseline.json"
+    base_json.write_text(
+        json.dumps({
+            "version": "1.5.0",
+            "clone_count": 2,
+            "fingerprints": [
+                {
+                    "file_a": "pkg/inactive_a.py",
+                    "file_b": "pkg/inactive_b.py",
+                    "name_a": "fn_a",
+                    "name_b": "fn_b",
+                    "fingerprint": "pkg/inactive_a.py:fn_a <===> pkg/inactive_b.py:fn_b",
+                    "structural_fingerprint": "pkg/inactive_a.py#hash1 <===> pkg/inactive_b.py#hash2",
+                },
+                {
+                    "file_a": "pkg/active_a.py",
+                    "file_b": "pkg/active_b.py",
+                    "name_a": "fn_active_a",
+                    "name_b": "fn_active_b",
+                    "fingerprint": "pkg/active_a.py:fn_active_a <===> pkg/active_b.py:fn_active_b",
+                    "structural_fingerprint": "pkg/active_a.py#hash_act_1 <===> pkg/active_b.py#hash_act_2",
+                },
+            ],
+        }),
+        encoding="utf-8",
+    )
+    # The first record is NOT in active_clones, but pkg/inactive_a.py is dirty in unstaged_modified_ranges
+    u1 = {"file": "pkg/active_a.py", "name": "fn_active_a", "structural_hash": "hash_act_1"}
+    u2 = {"file": "pkg/active_b.py", "name": "fn_active_b", "structural_hash": "hash_act_2"}
+    prune_res = prune_baseline(
+        str(base_json),
+        [(1.0, u1, u2)],
+        unstaged_modified_ranges={"pkg/inactive_a.py": [(1, 10)]},
+    )
+    # The inactive dirty record is retained (skipped dirty), and active record is retained
+    assert prune_res.retained_count == 2
+    assert prune_res.pruned_count == 0
+
+    # Also test legacy string format as first record
+    base_json_legacy = tmp_path / "baseline_legacy_str.json"
+    base_json_legacy.write_text(
+        json.dumps({
+            "version": "1.4.0",
+            "clone_count": 1,
+            "fingerprints": [
+                "pkg/legacy_a.py:fn_leg_a <===> pkg/legacy_b.py:fn_leg_b",
+            ],
+        }),
+        encoding="utf-8",
+    )
+    prune_res_legacy = prune_baseline(
+        str(base_json_legacy),
+        [],
+        unstaged_modified_ranges={"pkg/legacy_a.py": [(1, 10)]},
+    )
+    assert prune_res_legacy.retained_count == 1
+    assert prune_res_legacy.pruned_count == 0
+

@@ -330,7 +330,49 @@ def test_lexical_relative_to_filesystem_root() -> None:
     assert resolver.matches_diff("/tmp/worker.py", diff_keys, basis="repo")
 
 
+def test_canonical_path_preserves_unc_network_paths_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that CanonicalPathResolver does not corrupt UNC network paths with drive letters on Windows."""
+    monkeypatch.setattr(os, "name", "nt")
+    resolver = CanonicalPathResolver(target_root="C:/repo/src", repo_root="C:/repo")
+
+    unc_path = "//server/share/folder/file.py"
+    res = resolver.resolve(unc_path)
+    assert res.absolute_lexical == unc_path
+    assert not res.absolute_lexical.startswith("C:")
+    assert not res.absolute_lexical.startswith("C://")
+
+    # Also test backslash UNC path input
+    unc_backslash = r"\\server\share\folder\file.py"
+    res_bs = resolver.resolve(unc_backslash)
+    assert res_bs.absolute_lexical == unc_path
+    assert not res_bs.absolute_lexical.startswith("C:")
 
 
+def test_lexical_relative_to_empty_base_windows_drive() -> None:
+    """Verifies that lexical_relative_to guards Windows drive paths when base is empty."""
+    assert lexical_relative_to("C:/project/foo.py", "") is None
+    assert lexical_relative_to("d:/project/bar.py", "") is None
+    assert lexical_relative_to("/project/foo.py", "") is None
+    assert lexical_relative_to("project/foo.py", "") == "project/foo.py"
 
 
+def test_matches_diff_has_tagged_caching() -> None:
+    """Verifies matches_diff caches has_tagged per diff_keys and respects explicit parameter."""
+    resolver = CanonicalPathResolver(target_root="/repo/src", repo_root="/repo")
+    diff_keys = {"target:mod.py", "repo:src/mod.py"}
+
+    # Initially cache is None
+    assert resolver._tagged_keys_cache is None  # pylint: disable=protected-access
+
+    # First call populates cache
+    assert resolver.matches_diff("mod.py", diff_keys)
+    assert resolver._tagged_keys_cache is not None  # pylint: disable=protected-access
+    assert resolver._tagged_keys_cache[0] is diff_keys  # pylint: disable=protected-access
+    assert resolver._tagged_keys_cache[1] is True  # pylint: disable=protected-access
+
+    # Subsequent call reuses cached value
+    assert resolver.matches_diff("mod.py", diff_keys)
+
+    # Explicit parameter overrides/bypasses cache check
+    assert resolver.matches_diff("mod.py", diff_keys, has_tagged=True)
+    assert not resolver.matches_diff("mod.py", diff_keys, has_tagged=False)

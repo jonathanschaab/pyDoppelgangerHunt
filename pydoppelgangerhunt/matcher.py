@@ -984,14 +984,16 @@ def scan_target(
         diff_keys = build_diff_path_keys(diff_files, resolver)
         unique_unit_files = {u.get("file") for u in units if u.get("file")}
         is_target_relative_harvest = (
-            effective_repo_root.resolve() == target_root_dir.resolve()
+            effective_repo_root == target_root_dir
         )
         unit_basis = "target" if is_target_relative_harvest else "repo"
+        has_tagged = any(k.startswith(("repo:", "target:")) for k in diff_keys)
         matching_files = {
             f
             for f in unique_unit_files
-            if resolver.matches_diff(f, diff_keys, basis=unit_basis)
+            if resolver.matches_diff(f, diff_keys, basis=unit_basis, has_tagged=has_tagged)
         }
+
         diff_unit_indices = {
             idx
             for idx, u in enumerate(units)
