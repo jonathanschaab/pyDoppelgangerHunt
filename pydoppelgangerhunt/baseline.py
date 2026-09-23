@@ -1309,7 +1309,9 @@ def _match_clone_record(
                     rec, base_offset, path_basis=path_basis
                 )
             else:
-                r_namespaces = sorted(filter(None, [rec.get("namespace_a"), rec.get("namespace_b")]))
+                r_namespaces = sorted(
+                    [x for x in (rec.get("namespace_a"), rec.get("namespace_b")) if x is not None]
+                )
                 if not r_namespaces:
                     _, _, _, _, _, r_namespaces = _get_rec_repo_data(
                         rec, base_offset, path_basis=path_basis
@@ -1773,10 +1775,13 @@ def prune_baseline(
     data["version"] = "1.5.0"
     if "path_basis" not in data or not data["path_basis"]:
         data["path_basis"] = base_basis
-    if "target_repo_relative" not in data and base_target is not None:
-        base_res = _build_baseline_path_resolver(base_target)
-        if base_res is not None and base_res.target_in_repo:
-            data["target_repo_relative"] = base_res.target_in_repo
+    if "target_repo_relative" not in data:
+        if base_offset:
+            data["target_repo_relative"] = base_offset
+        elif base_target is not None:
+            base_res = _build_baseline_path_resolver(root=repo_root, baseline_target=base_target)
+            if base_res is not None and base_res.target_in_repo:
+                data["target_repo_relative"] = base_res.target_in_repo
     if isinstance(data.get("corpus_calibration"), dict):
         calib_entry = data["corpus_calibration"]
         target_rel = data.get("target_repo_relative")

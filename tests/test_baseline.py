@@ -29,6 +29,7 @@ from pydoppelgangerhunt import (
     generate_refactoring_patch,
     load_baseline,
     parse_git_diff_hunks,
+    prune_baseline,
     record_baseline,
     refactor_module_units,
     replace_unit_in_source,
@@ -4974,4 +4975,78 @@ def test_prune_baseline_inactive_first_record_no_unbound_local(tmp_path: Path) -
     )
     assert prune_res_legacy.retained_count == 1
     assert prune_res_legacy.pruned_count == 0
+
+
+def test_prune_baseline_upgrades_legacy_target_repo_relative(tmp_path: Path) -> None:
+    """Verifies that prune_baseline correctly populates target_repo_relative for legacy baselines."""
+    repo_dir = tmp_path / "myrepo"
+    src_dir = repo_dir / "src"
+    src_dir.mkdir(parents=True)
+    base_file = repo_dir / "baseline.json"
+
+    base_file.write_text(
+        json.dumps({
+            "version": "1.4.0",
+            "target": "src",
+            "clone_count": 1,
+            "fingerprints": [{
+                "file_a": "service.py",
+                "file_b": "worker.py",
+                "name_a": "fn_a",
+                "name_b": "fn_b",
+                "structural_hash_a": "hash1",
+                "structural_hash_b": "hash2",
+                "structural_fingerprint": "service.py#hash1 <===> worker.py#hash2",
+            }],
+        }),
+        encoding="utf-8",
+    )
+
+    active = [(1.0, {
+        "file": "service.py",
+        "name": "fn_a",
+        "structural_hash": "hash1",
+    }, {
+        "file": "worker.py",
+        "name": "fn_b",
+        "structural_hash": "hash2",
+    })]
+
+    res = prune_baseline(
+        str(base_file),
+        active,
+        repo_root=str(repo_dir),
+        target=str(src_dir),
+    )
+    assert res.retained_count == 1
+    data = json.loads(base_file.read_text(encoding="utf-8"))
+    assert data.get("target_repo_relative") == "src"
+
+
+def test_match_clone_record_preserves_empty_root_namespace() -> None:
+    """Verifies that _match_clone_record does not drop empty string root namespaces in Pass 4."""
+    from pydoppelgangerhunt.baseline import _match_clone_record
+
+    rec = {
+        "file_a": "main.py",
+        "file_b": "pkg/mod.py",
+        "namespace_a": "",
+        "namespace_b": "pkg",
+        "pure_structural_fingerprint": "h1 <===> h2",
+        "name_a": "run",
+        "name_b": "worker",
+    }
+    unconsumed = [rec]
+    c_keys = {
+        "file_a": "renamed_main.py",
+        "file_b": "pkg/renamed_mod.py",
+        "name_a": "run",
+        "name_b": "worker",
+        "hash_a": "h1",
+        "hash_b": "h2",
+        "pure_sfp": "h1 <===> h2",
+    }
+    matched = _match_clone_record(c_keys, unconsumed)
+    assert matched is rec
+
 

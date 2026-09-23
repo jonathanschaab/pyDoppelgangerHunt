@@ -127,6 +127,22 @@ def lexical_relative_to(
     return None
 
 
+def _join_lexical_posix(base: str, rel: str) -> str:
+    """Joins a base directory and relative path without duplicating slashes.
+
+    Args:
+        base: Normalized posix base directory string.
+        rel: Normalized posix relative path string.
+
+    Returns:
+        Cleanly joined posix path string without redundant root slashes.
+    """
+    base_clean = base.rstrip("/")
+    if not base_clean:
+        return f"/{rel}".rstrip("/")
+    return f"{base_clean}/{rel}".rstrip("/")
+
+
 @dataclass(frozen=True)
 class CanonicalPath:
     """Immutable representation of a path across multiple coordinate systems.
@@ -333,14 +349,14 @@ class CanonicalPathResolver:
                     target_rel = norm
             else:
                 target_rel = None
-            abs_lex = f"{self.repo_lexical}/{norm}".rstrip("/")
+            abs_lex = _join_lexical_posix(self.repo_lexical, norm)
         elif basis in ("target", "target_relative"):
             target_rel = norm
             if self.target_in_repo is not None:
                 repo_rel = f"{self.target_in_repo}/{norm}" if self.target_in_repo else norm
             else:
                 repo_rel = None
-            abs_lex = f"{self.target_lexical}/{norm}".rstrip("/")
+            abs_lex = _join_lexical_posix(self.target_lexical, norm)
         else:
             # "auto" basis
             target_in_repo = self.target_in_repo
@@ -356,16 +372,16 @@ class CanonicalPathResolver:
                     target_rel = lexical_relative_to(
                         norm, target_in_repo, case_fold=self.case_fold
                     )
-                    abs_lex = f"{self.repo_lexical}/{norm}".rstrip("/")
+                    abs_lex = _join_lexical_posix(self.repo_lexical, norm)
                 else:
                     # Default relative path from scanner/units is target-relative
                     target_rel = norm
                     repo_rel = f"{target_in_repo}/{norm}" if target_in_repo else norm
-                    abs_lex = f"{self.target_lexical}/{norm}".rstrip("/")
+                    abs_lex = _join_lexical_posix(self.target_lexical, norm)
             else:
                 target_rel = norm
                 repo_rel = None
-                abs_lex = f"{self.target_lexical}/{norm}".rstrip("/")
+                abs_lex = _join_lexical_posix(self.target_lexical, norm)
 
         res = CanonicalPath(
             raw=raw_str,

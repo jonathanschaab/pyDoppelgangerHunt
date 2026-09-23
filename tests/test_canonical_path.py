@@ -394,3 +394,28 @@ def test_matches_diff_has_tagged_caching() -> None:
     # Explicit parameter overrides/bypasses cache check
     assert resolver.matches_diff("mod.py", diff_keys, has_tagged=True)
     assert not resolver.matches_diff("mod.py", diff_keys, has_tagged=False)
+
+
+def test_resolver_root_directories_no_double_slash() -> None:
+    """Verifies that relative path resolution under root directories does not introduce double slashes."""
+    resolver = CanonicalPathResolver(target_root="/", repo_root="/")
+    res = resolver.resolve("worker.py", basis="target")
+    assert res.absolute_lexical is not None
+    assert not res.absolute_lexical.startswith("//")
+    assert "://" not in res.absolute_lexical
+
+    res_repo = resolver.resolve("worker.py", basis="repo")
+    assert res_repo.absolute_lexical is not None
+    assert not res_repo.absolute_lexical.startswith("//")
+    assert "://" not in res_repo.absolute_lexical
+
+    # Windows drive root
+    resolver_win = CanonicalPathResolver(target_root="C:/", repo_root="C:/", is_windows=True)
+    res_win = resolver_win.resolve("worker.py", basis="target")
+    assert res_win.absolute_lexical == "C:/worker.py"
+    assert "C://" not in res_win.absolute_lexical
+
+    res_win_repo = resolver_win.resolve("worker.py", basis="repo")
+    assert res_win_repo.absolute_lexical == "C:/worker.py"
+    assert "C://" not in res_win_repo.absolute_lexical
+
