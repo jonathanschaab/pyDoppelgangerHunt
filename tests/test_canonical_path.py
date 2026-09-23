@@ -350,6 +350,20 @@ def test_canonical_path_preserves_unc_network_paths_on_windows() -> None:
     res_drive_rel = resolver.resolve("/folder/file.py")
     assert res_drive_rel.absolute_lexical == "C:/folder/file.py"
 
+    # Verify coordinate translation with Windows drive paths
+    res_file = resolver.resolve("C:/repo/src/sub/file.py")
+    assert res_file.target_relative == "sub/file.py"
+    assert res_file.repo_relative == "src/sub/file.py"
+
+    # Verify UNC target and repo roots
+    resolver_unc = CanonicalPathResolver(
+        target_root="//server/share/src", repo_root="//server/share", is_windows=True
+    )
+    assert resolver_unc.target_in_repo == "src"
+    res_unc = resolver_unc.resolve("//server/share/src/sub/file.py")
+    assert res_unc.target_relative == "sub/file.py"
+    assert res_unc.repo_relative == "src/sub/file.py"
+
 
 
 def test_lexical_relative_to_empty_base_windows_drive() -> None:

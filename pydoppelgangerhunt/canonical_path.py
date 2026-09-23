@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import posixpath
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 import unicodedata
@@ -151,6 +152,43 @@ class CanonicalPath:
         return self.display_path
 
 
+def _normalize_root_directory(
+    root: Union[str, Path],
+    is_windows: bool,
+) -> Tuple[Path, Path, str]:
+    """Resolves and normalizes a root directory path across OS platforms.
+
+    Args:
+        root: Directory path as string or Path object.
+        is_windows: Whether to operate in Windows filesystem mode.
+
+    Returns:
+        Tuple of (path_obj, resolved_path_obj, lexical_posix_str).
+    """
+    norm_raw = normalize_lexical_posix(str(root))
+    has_drive = len(norm_raw) >= 2 and norm_raw[1] == ":"
+    is_unc = norm_raw.startswith("//") and is_windows
+
+    if (has_drive or is_unc) and os.name != "nt":
+        norm_clean = posixpath.normpath(norm_raw)
+        if len(norm_clean) == 2 and norm_clean[1] == ":":
+            norm_clean += "/"
+        path_obj = Path(norm_clean)
+        return path_obj, path_obj, normalize_lexical_posix(norm_clean)
+
+    path_obj = Path(root)
+    try:
+        resolved_obj = path_obj.resolve()
+    except (ValueError, OSError, RuntimeError):
+        resolved_obj = path_obj
+
+    if resolved_obj.is_file():
+        resolved_obj = resolved_obj.parent
+        path_obj = path_obj.parent
+
+    return path_obj, resolved_obj, normalize_lexical_posix(str(resolved_obj))
+
+
 MAX_RESOLVER_CACHE_ENTRIES: int = 50_000
 
 
@@ -178,25 +216,6 @@ class CanonicalPathResolver:
             is_windows: Whether to operate in Windows filesystem mode (drive letters and UNC paths).
                 If None, defaults to True on Windows and False on other platforms.
         """
-        self.target_path = Path(target_root)
-        try:
-            self.target_resolved = self.target_path.resolve()
-        except (ValueError, OSError, RuntimeError):
-            self.target_resolved = self.target_path
-        if self.target_resolved.is_file():
-            self.target_resolved = self.target_resolved.parent
-            self.target_path = self.target_path.parent
-
-        if repo_root is not None:
-            self.repo_path: Optional[Path] = Path(repo_root)
-            try:
-                self.repo_resolved: Optional[Path] = self.repo_path.resolve()
-            except (ValueError, OSError, RuntimeError):
-                self.repo_resolved = self.repo_path
-        else:
-            self.repo_path = self.target_path
-            self.repo_resolved = self.target_resolved
-
         if case_fold is None:
             self.case_fold = os.name == "nt" or sys.platform == "win32"
         else:
@@ -207,9 +226,24 @@ class CanonicalPathResolver:
         else:
             self.is_windows = bool(is_windows)
 
+        target_p, target_res, target_lex = _normalize_root_directory(
+            target_root, is_windows=self.is_windows
+        )
+        self.target_path = target_p
+        self.target_resolved = target_res
+        self.target_lexical = target_lex
 
-        self.target_lexical = normalize_lexical_posix(str(self.target_resolved))
-        self.repo_lexical = normalize_lexical_posix(str(self.repo_resolved))
+        if repo_root is not None:
+            repo_p, repo_res, repo_lex = _normalize_root_directory(
+                repo_root, is_windows=self.is_windows
+            )
+            self.repo_path: Optional[Path] = repo_p
+            self.repo_resolved: Optional[Path] = repo_res
+            self.repo_lexical = repo_lex
+        else:
+            self.repo_path = self.target_path
+            self.repo_resolved = self.target_resolved
+            self.repo_lexical = self.target_lexical
 
         # Determine target's repo-relative offset if target is inside repo
         self.target_in_repo = lexical_relative_to(
