@@ -324,6 +324,7 @@ def compute_corpus_calibration(
     filter_stop_shingles: bool = False,
     stop_shingles: Optional[Set[Any]] = None,
     *,
+    min_frequency: int = 1,
     bag_of_tokens: bool = False,
     call_sequences: bool = False,
     excludes: Optional[Sequence[str]] = None,
@@ -332,6 +333,21 @@ def compute_corpus_calibration(
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Computes global shingle document frequencies and calibrated stop-shingles for a repository corpus.
+
+    Args:
+        units: Sequence of harvested AST code units.
+        max_index_frequency: Maximum corpus frequency threshold for stop shingles.
+        min_corpus_size: Minimum units required to activate stop-shingle filtering.
+        filter_stop_shingles: Whether stop-shingle filtering is active.
+        stop_shingles: Accepted for signature parity; ignored to record unskewed empirical stats.
+        min_frequency: Minimum document frequency threshold to retain in calibration.
+            Defaults to 1 (all shingles retained). In large monorepos (>100,000 units),
+            setting min_frequency >= 2 prunes singleton shingles, keeping baseline JSON compact.
+        bag_of_tokens: Whether bag-of-tokens indexing is enabled.
+        call_sequences: Whether call sequence indexing is enabled.
+        excludes: Ignored directory patterns.
+        scope: Target scope relative to repository worktree root.
+        target_repo_relative: Worktree-relative path of target directory.
 
     Note:
         The stop_shingles argument is accepted for signature parity with scanner
@@ -372,6 +388,11 @@ def compute_corpus_calibration(
                         global_stop_shingles.add(sh)
         except (ValueError, TypeError, OverflowError):
             pass
+
+    if min_frequency > 1:
+        shingle_frequencies = {
+            sh: count for sh, count in shingle_frequencies.items() if count >= min_frequency
+        }
 
     calib: Dict[str, Any] = {
         "total_units": total_units,

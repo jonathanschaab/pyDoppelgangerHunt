@@ -255,6 +255,7 @@ class CanonicalPathResolver:
         self.target_path = target_p
         self.target_resolved = target_res
         self.target_lexical = target_lex
+        self.target_raw_lexical = normalize_lexical_posix(str(target_p))
 
         if repo_root is not None:
             repo_p, repo_res, repo_lex = _normalize_root_directory(
@@ -263,10 +264,12 @@ class CanonicalPathResolver:
             self.repo_path: Optional[Path] = repo_p
             self.repo_resolved: Optional[Path] = repo_res
             self.repo_lexical = repo_lex
+            self.repo_raw_lexical = normalize_lexical_posix(str(repo_p))
         else:
             self.repo_path = self.target_path
             self.repo_resolved = self.target_resolved
             self.repo_lexical = self.target_lexical
+            self.repo_raw_lexical = self.target_raw_lexical
 
         # Determine target's repo-relative offset if target is inside repo
         self.target_in_repo = lexical_relative_to(
@@ -280,6 +283,20 @@ class CanonicalPathResolver:
         """Clears memoized path resolutions and cached diff key metadata."""
         self._cache.clear()
         self._tagged_keys_cache = None
+
+    def invalidate_path(self, path: Union[str, Path, CanonicalPath]) -> None:
+        """Invalidates memoized path resolutions for a specific path.
+
+        Allows long-running language server (LSP) or file-watcher daemon processes
+        to purge stale path entries upon file modification/deletion events without clearing
+        the entire resolution cache.
+        """
+        raw_str = str(getattr(path, "raw", path) or "").rstrip("\r\n")
+        if not raw_str:
+            return
+        keys_to_remove = [k for k in self._cache if k[0] == raw_str]
+        for k in keys_to_remove:
+            self._cache.pop(k, None)
 
     def _cache_set(self, key: Tuple[str, str, bool], value: CanonicalPath) -> None:
         if len(self._cache) >= MAX_RESOLVER_CACHE_ENTRIES:
@@ -341,7 +358,15 @@ class CanonicalPathResolver:
             ):
                 abs_lex = self.target_lexical[:2] + abs_lex
             rel_target = lexical_relative_to(abs_lex, self.target_lexical, case_fold=self.case_fold)
+            if rel_target is None and self.target_raw_lexical != self.target_lexical:
+                rel_target = lexical_relative_to(
+                    abs_lex, self.target_raw_lexical, case_fold=self.case_fold
+                )
             rel_repo = lexical_relative_to(abs_lex, self.repo_lexical, case_fold=self.case_fold)
+            if rel_repo is None and self.repo_raw_lexical != self.repo_lexical:
+                rel_repo = lexical_relative_to(
+                    abs_lex, self.repo_raw_lexical, case_fold=self.case_fold
+                )
             res = CanonicalPath(
                 raw=raw_str,
                 repo_relative=rel_repo,

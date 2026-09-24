@@ -5284,4 +5284,32 @@ def test_is_absolute_path_str_drive_strictness() -> None:
     assert _is_absolute_path_str("") is False
 
 
+def test_compute_corpus_calibration_min_frequency_cutoff() -> None:
+    """Verifies that compute_corpus_calibration prunes shingles below min_frequency."""
+    from pydoppelgangerhunt.baseline import compute_corpus_calibration  # pylint: disable=import-outside-toplevel
+
+    u1 = {"file": "a.py", "name": "f1", "shingles": ["singleton_a", "shared"]}
+    u2 = {"file": "b.py", "name": "f2", "shingles": ["singleton_b", "shared"]}
+    u3 = {"file": "c.py", "name": "f3", "shingles": ["shared"]}
+
+    # Default min_frequency=1 keeps all shingles
+    calib_all = compute_corpus_calibration([u1, u2, u3])
+    freqs_all = calib_all["shingle_frequencies"]
+    assert "singleton_a" in freqs_all
+    assert freqs_all["singleton_a"] == 1
+    assert "singleton_b" in freqs_all
+    assert freqs_all["singleton_b"] == 1
+    assert "shared" in freqs_all
+    assert freqs_all["shared"] == 3
+
+    # Cutoff min_frequency=2 prunes singletons (df < 2)
+    calib_pruned = compute_corpus_calibration([u1, u2, u3], min_frequency=2)
+    freqs_pruned = calib_pruned["shingle_frequencies"]
+    assert "singleton_a" not in freqs_pruned
+    assert "singleton_b" not in freqs_pruned
+    assert "shared" in freqs_pruned
+    assert freqs_pruned["shared"] == 3
+
+
+
 

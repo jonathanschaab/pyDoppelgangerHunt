@@ -496,3 +496,41 @@ def test_resolver_matches_diff_notebook_anchor_with_literal_hash() -> None:
     diff_keys = {"target:experiments/run#1.ipynb"}
     assert resolver.matches_diff("experiments/run#1.ipynb#cell_3", diff_keys)
     assert not resolver.matches_diff("experiments/run#2.ipynb#cell_3", diff_keys)
+
+
+def test_resolver_invalidate_path() -> None:
+    """Verifies that invalidate_path removes only matching path entries without purging full cache."""
+    resolver = CanonicalPathResolver(target_root="/repo", repo_root="/repo")
+    resolver.resolve("foo.py")
+    resolver.resolve("bar.py")
+
+    assert len(resolver._cache) == 2  # pylint: disable=protected-access
+
+    # Invalidate foo.py: only foo.py is removed, bar.py stays cached
+    resolver.invalidate_path("foo.py")
+    assert len(resolver._cache) == 1  # pylint: disable=protected-access
+    assert any(k[0] == "bar.py" for k in resolver._cache)  # pylint: disable=protected-access
+    assert not any(k[0] == "foo.py" for k in resolver._cache)  # pylint: disable=protected-access
+
+    # Invalidate empty or non-existent path does nothing
+    resolver.invalidate_path("")
+    assert len(resolver._cache) == 1  # pylint: disable=protected-access
+
+
+def test_resolver_raw_lexical_root_symlink_fallback(tmp_path: Path) -> None:
+    """Verifies that absolute paths referencing raw symlink roots resolve when files do not exist physically."""
+    real_repo = tmp_path / "real_repo"
+    real_repo.mkdir()
+    sym_repo = tmp_path / "sym_repo"
+
+    try:
+        sym_repo.symlink_to(real_repo, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks not supported in this environment")
+
+    resolver = CanonicalPathResolver(target_root=sym_repo, repo_root=sym_repo)
+    # File does not exist on disk (e.g. deleted file from diff)
+    deleted_abs_symlink = normalize_lexical_posix(str(sym_repo / "deleted_file.py"))
+    cp = resolver.resolve(deleted_abs_symlink)
+    assert cp.target_relative == "deleted_file.py"
+    assert cp.repo_relative == "deleted_file.py"
