@@ -336,6 +336,8 @@ def test_lexical_relative_to_filesystem_root() -> None:
     assert lexical_relative_to("/", "/") == ""
     assert lexical_relative_to("/tmp/../../escaped.py", "/") is None
     assert lexical_relative_to("/a/b/c.py", "/") == "a/b/c.py"
+    assert lexical_relative_to("//server/share/file.py", "/") is None
+    assert lexical_relative_to("C:/repo/file.py", "/") is None
 
     resolver = CanonicalPathResolver(target_root="/tmp", repo_root="/")
     assert resolver.target_in_repo == "tmp"
@@ -398,11 +400,12 @@ def test_matches_diff_has_tagged_caching() -> None:
     # Initially cache is None
     assert resolver._tagged_keys_cache is None  # pylint: disable=protected-access
 
-    # First call populates cache
+    # First call populates cache without strongly referencing diff_keys
     assert resolver.matches_diff("mod.py", diff_keys)
     assert resolver._tagged_keys_cache is not None  # pylint: disable=protected-access
-    assert resolver._tagged_keys_cache[0] is diff_keys  # pylint: disable=protected-access
-    assert resolver._tagged_keys_cache[1] is True  # pylint: disable=protected-access
+    assert resolver._tagged_keys_cache[0] == id(diff_keys)  # pylint: disable=protected-access
+    assert resolver._tagged_keys_cache[1] == len(diff_keys)  # pylint: disable=protected-access
+    assert resolver._tagged_keys_cache[2] is True  # pylint: disable=protected-access
 
     # Subsequent call reuses cached value
     assert resolver.matches_diff("mod.py", diff_keys)
@@ -410,6 +413,10 @@ def test_matches_diff_has_tagged_caching() -> None:
     # Explicit parameter overrides/bypasses cache check
     assert resolver.matches_diff("mod.py", diff_keys, has_tagged=True)
     assert not resolver.matches_diff("mod.py", diff_keys, has_tagged=False)
+
+    # clear_cache empties both resolution cache and diff key metadata cache
+    resolver.clear_cache()
+    assert resolver._tagged_keys_cache is None  # pylint: disable=protected-access
 
 
 def test_resolver_root_directories_no_double_slash() -> None:

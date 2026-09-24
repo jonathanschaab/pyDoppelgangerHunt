@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import posixpath
 import sys
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 import unicodedata
 
 
@@ -106,7 +106,7 @@ def lexical_relative_to(
     if base_posix and set(base_posix) == {"/"}:
         if not p_clean:
             return ""
-        if len(p_clean) >= 2 and p_clean[1] == ":":
+        if (len(p_clean) >= 2 and p_clean[1] == ":") or p_clean.startswith("//"):
             return None
         return _resolve_relative_segments(p_clean.lstrip("/"))
 
@@ -274,11 +274,16 @@ class CanonicalPathResolver:
         )
 
         self._cache: Dict[Tuple[str, str, bool], CanonicalPath] = {}
-        self._tagged_keys_cache: Optional[Tuple[Any, bool]] = None
+        self._tagged_keys_cache: Optional[Tuple[int, int, bool]] = None
+
+    def clear_cache(self) -> None:
+        """Clears memoized path resolutions and cached diff key metadata."""
+        self._cache.clear()
+        self._tagged_keys_cache = None
 
     def _cache_set(self, key: Tuple[str, str, bool], value: CanonicalPath) -> None:
         if len(self._cache) >= MAX_RESOLVER_CACHE_ENTRIES:
-            self._cache.clear()
+            self.clear_cache()
         self._cache[key] = value
 
     def resolve(
@@ -557,11 +562,13 @@ class CanonicalPathResolver:
 
         if has_tagged is None:
             cached = self._tagged_keys_cache
-            if cached is not None and cached[0] is diff_keys:
-                has_tagged = cached[1]
+            diff_id = id(diff_keys)
+            diff_len = len(diff_keys)
+            if cached is not None and cached[0] == diff_id and cached[1] == diff_len:
+                has_tagged = cached[2]
             else:
                 has_tagged = any(k.startswith(("repo:", "target:")) for k in diff_keys)
-                self._tagged_keys_cache = (diff_keys, has_tagged)
+                self._tagged_keys_cache = (diff_id, diff_len, has_tagged)
 
         if self._probe_keys_in_diff(
             self.target_key(unit_file, basis=basis, strip_anchor=False),
