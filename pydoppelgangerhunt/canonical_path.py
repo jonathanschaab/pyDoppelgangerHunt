@@ -301,7 +301,9 @@ class CanonicalPathResolver:
             Resolved CanonicalPath.
         """
         if isinstance(path, CanonicalPath):
-            return path
+            if not strip_anchor or not (path.raw and "#" in path.raw):
+                return path
+            path = path.raw
 
         raw_str = str(path).rstrip("\r\n")
         cache_key = (raw_str, basis, bool(strip_anchor))

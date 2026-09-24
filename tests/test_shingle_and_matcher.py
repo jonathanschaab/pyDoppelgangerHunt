@@ -1344,9 +1344,10 @@ def test_uncalibrated_novel_shingle_pair_budget_bounds_explosion(tmp_path: Path)
 
 
 def test_cumulative_novel_shingle_pair_budget_bounds_multiple_shingles(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Verifies that the candidate-pair budget is tracked globally across multiple distinct novel shingles."""
+    import logging
     import pydoppelgangerhunt.matcher as matcher  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
 
@@ -1382,13 +1383,14 @@ def test_cumulative_novel_shingle_pair_budget_bounds_multiple_shingles(
 
     # Group 1 uses 3 pairs (remaining budget = 2).
     # Group 2 needs 3 pairs, which exceeds the remaining budget 2, so Group 2 is skipped.
-    clones = scan_target(
-        str(tmp_path),
-        diff_files=["multi_novel.py"],
-        min_lines=3,
-        threshold=0.70,
-        corpus_calibration=calib,
-    )
+    with caplog.at_level(logging.DEBUG):
+        clones = scan_target(
+            str(tmp_path),
+            diff_files=["multi_novel.py"],
+            min_lines=3,
+            threshold=0.70,
+            corpus_calibration=calib,
+        )
     group_one_clones = [
         c for c in clones
         if "group_one_fn" in (c[1].get("name") or "") or "group_one_fn" in (c[2].get("name") or "")
@@ -1399,6 +1401,7 @@ def test_cumulative_novel_shingle_pair_budget_bounds_multiple_shingles(
     ]
     assert len(group_one_clones) > 0
     assert len(group_two_clones) == 0
+    assert any("Novel shingle pair budget exceeded" in record.message for record in caplog.records)
 
 
 def test_unit_drift_computed_when_target_units_drop_to_zero(tmp_path: Path) -> None:
@@ -1614,9 +1617,10 @@ def test_scan_target_git_root_discovered_for_single_file_target(
 
 
 def test_shingle_iteration_order_is_deterministic_under_novel_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Verifies that novel shingle admission order is strictly deterministic regardless of file discovery order."""
+    import logging
     import pydoppelgangerhunt.matcher as matcher  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
 
@@ -1653,18 +1657,19 @@ def test_shingle_iteration_order_is_deterministic_under_novel_budget(
         "shingle_frequencies": {},
     }
 
-    clones_1 = scan_target(
-        str(dir_1),
-        min_lines=3,
-        threshold=0.70,
-        corpus_calibration=calib,
-    )
-    clones_2 = scan_target(
-        str(dir_2),
-        min_lines=3,
-        threshold=0.70,
-        corpus_calibration=calib,
-    )
+    with caplog.at_level(logging.DEBUG):
+        clones_1 = scan_target(
+            str(dir_1),
+            min_lines=3,
+            threshold=0.70,
+            corpus_calibration=calib,
+        )
+        clones_2 = scan_target(
+            str(dir_2),
+            min_lines=3,
+            threshold=0.70,
+            corpus_calibration=calib,
+        )
 
     names_1 = sorted({(c[1]["name"], c[2]["name"]) for c in clones_1})
     names_2 = sorted({(c[1]["name"], c[2]["name"]) for c in clones_2})
@@ -1672,6 +1677,7 @@ def test_shingle_iteration_order_is_deterministic_under_novel_budget(
     # Both runs must discover the exact same clone pairs despite opposite file discovery order
     assert len(names_1) > 0
     assert names_1 == names_2
+    assert any("Novel shingle pair budget exceeded" in record.message for record in caplog.records)
 
 
 def test_legacy_calibration_missing_frequencies_falls_back_to_stop_shingles(

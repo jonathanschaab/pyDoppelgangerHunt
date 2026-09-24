@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -29,6 +30,8 @@ from pydoppelgangerhunt.baseline import (
     compute_calibration_config_hash,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
+
+logger = logging.getLogger(__name__)
 
 MAX_NOVEL_SHINGLE_PAIR_BUDGET: int = 10_000
 
@@ -1167,19 +1170,25 @@ def scan_target(
 
         is_novel = calib_freqs_map is not None and not is_global_shingle
 
-        if diff_unit_indices is not None and is_novel:
-            df_unmodified = len(u_indices) - df_local
-            if effective_max_posting is not None and df_unmodified > effective_max_posting:
-                continue
-            potential_pairs = (df_local * (df_local - 1)) // 2 + df_local * df_unmodified
+        if is_novel:
+            if diff_unit_indices is not None:
+                df_unmodified = len(u_indices) - df_local
+                if effective_max_posting is not None and df_unmodified > effective_max_posting:
+                    continue
+                potential_pairs = (df_local * (df_local - 1)) // 2 + df_local * df_unmodified
+            else:
+                if effective_max_posting is not None and combined_df > effective_max_posting:
+                    continue
+                potential_pairs = (len(u_indices) * (len(u_indices) - 1)) // 2
             if potential_pairs > remaining_novel_pair_budget:
+                logger.debug(
+                    "Novel shingle pair budget exceeded (needed %d, remaining %d); skipping novel shingle pairs",
+                    potential_pairs,
+                    remaining_novel_pair_budget,
+                )
                 continue
         elif effective_max_posting is not None and combined_df > effective_max_posting:
             continue
-        elif is_novel:
-            potential_pairs = (len(u_indices) * (len(u_indices) - 1)) // 2
-            if potential_pairs > remaining_novel_pair_budget:
-                continue
 
         pairs_before = len(candidate_pairs) if is_novel else 0
         _add_candidate_pairs(candidate_pairs, u_indices, diff_unit_indices)

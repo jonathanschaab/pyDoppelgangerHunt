@@ -229,6 +229,17 @@ def test_canonical_path_security_and_cache_isolation() -> None:
     p2 = resolver.resolve("script.ipynb#cell_1", strip_anchor=True)
     assert p2.target_relative == "script.ipynb"
 
+    # Re-resolving CanonicalPath instance with strip_anchor=True
+    p3 = resolver.resolve(p1, strip_anchor=True)
+    assert p3.target_relative == "script.ipynb"
+    assert resolver.target_key(p1, strip_anchor=True) == "script.ipynb"
+    assert resolver.repo_key(p1, strip_anchor=True) == "script.ipynb"
+
+    # CanonicalPath instance without anchors returns identical instance
+    p_no_anchor = resolver.resolve("script.py", strip_anchor=False)
+    assert resolver.resolve(p_no_anchor, strip_anchor=True) is p_no_anchor
+    assert resolver.resolve(p_no_anchor, strip_anchor=False) is p_no_anchor
+
     # 3. Path traversal escape guard in lexical_relative_to
     assert lexical_relative_to("/repo/src/../../etc/passwd", "/repo/src") is None
     assert lexical_relative_to("/repo/src/pkg/../pkg/mod.py", "/repo/src") == "pkg/mod.py"
@@ -243,6 +254,9 @@ def test_matches_diff_notebook_anchor_support() -> None:
 
     assert resolver.matches_diff("analysis.ipynb#cell_1", diff_keys)
     assert resolver.matches_diff("analysis.ipynb#cell_99", diff_keys)
+    # Passing pre-resolved CanonicalPath instance
+    cp_anchored = resolver.resolve("analysis.ipynb#cell_1", strip_anchor=False)
+    assert resolver.matches_diff(cp_anchored, diff_keys, strip_anchor=True)
     assert not resolver.matches_diff("other_notebook.ipynb#cell_1", diff_keys)
     assert not resolver.matches_diff("packages/other_pkg/analysis.ipynb#cell_1", diff_keys)
 
