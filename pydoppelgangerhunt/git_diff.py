@@ -112,6 +112,10 @@ def parse_git_diff_hunks(diff_text: str) -> Dict[str, List[Tuple[int, int]]]:
             if rest in ("/dev/null", ""):
                 current_file = None
             else:
+                # Strip standard Git diff destination prefixes (e.g. b/, i/, w/, c/).
+                # Internal diff commands explicitly pass --src-prefix=a/ --dst-prefix=b/.
+                # If external --no-prefix diffs with single-letter root dirs are supported,
+                # checking filesystem existence before stripping can serve as a fallback.
                 if len(rest) > 2 and rest[1] == "/" and rest[0] in "biwc":
                     rest = rest[2:]
                 current_file = normalize_path_string(rest, strip_anchor=False)

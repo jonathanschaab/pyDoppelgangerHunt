@@ -538,6 +538,9 @@ class CanonicalPathResolver:
     ) -> bool:
         """Probes coordinate keys against diff set respecting coordinate tag isolation."""
         if has_tagged:
+            # Tagged keys ("target:...", "repo:...") isolate coordinates across worktrees.
+            # If scaling to 100k+ units under differential scans, separate target/repo sets
+            # or pre-tagged tuples can be used to eliminate per-probe string allocations.
             return bool(
                 (t_key and f"target:{t_key}" in diff_keys)
                 or (r_key and f"repo:{r_key}" in diff_keys)
