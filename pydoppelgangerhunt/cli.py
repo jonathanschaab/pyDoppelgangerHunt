@@ -390,14 +390,15 @@ def _normalize_git_paths_for_target(
 
     resolver = CanonicalPathResolver(target_root=res_target, repo_root=res_git)
     normalized: List[str] = []
+    seen: Set[str] = set()
     for p_str in raw_paths:
-        if not p_str:
+        if not p_str or p_str in seen:
             continue
         cp = resolver.resolve(p_str, basis="repo")
         rel = cp.target_relative
         if rel and rel != ".":
-            if p_str not in normalized:
-                normalized.append(p_str)
+            seen.add(p_str)
+            normalized.append(p_str)
     return normalized
 
 

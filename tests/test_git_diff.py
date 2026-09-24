@@ -1232,3 +1232,23 @@ def test_parse_git_diff_hunks_no_prefix_single_letter_dir() -> None:
     hunks_forced = parse_git_diff_hunks(diff_custom, strip_prefix=True)
     assert "mod.py" in hunks_forced
 
+
+def test_normalize_git_paths_deduplicates_while_preserving_order(tmp_path: Path) -> None:
+    """Verifies that _normalize_git_paths_for_target deduplicates duplicate paths and preserves order."""
+    from pydoppelgangerhunt.cli import _normalize_git_paths_for_target  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo"
+    pkg = repo / "pkg"
+    pkg.mkdir(parents=True)
+
+    raw_paths = [
+        "pkg/a.py",
+        "pkg/b.py",
+        "pkg/a.py",
+        "pkg/c.py",
+        "pkg/b.py",
+        "pkg/a.py",
+    ]
+    norm_paths = _normalize_git_paths_for_target(raw_paths, str(repo), str(pkg))
+    assert norm_paths == ["pkg/a.py", "pkg/b.py", "pkg/c.py"]
+
