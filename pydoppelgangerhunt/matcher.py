@@ -26,7 +26,6 @@ from pydoppelgangerhunt.baseline import (
     _safe_index_frequency,
     _safe_min_corpus,
     _safe_total_units,
-    _serialize_shingle_key,
     compute_calibration_config_hash,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
@@ -114,6 +113,13 @@ def _normalize_exemption_endpoint(
 def _sorted_pair(a: str, b: str) -> Tuple[str, str]:
     """Returns an order-invariant sorted 2-tuple of two string keys."""
     return (a, b) if a <= b else (b, a)
+
+
+def _shingle_sort_key(k: Any) -> Tuple[int, Any]:
+    """Fast, deterministic sort key for shingle indexing without JSON serialization overhead."""
+    if isinstance(k, tuple):
+        return (0, k)
+    return (1, str(k))
 
 
 
@@ -1131,7 +1137,7 @@ def scan_target(
 
     remaining_novel_pair_budget: int = MAX_NOVEL_SHINGLE_PAIR_BUDGET
 
-    sorted_shingle_keys = sorted(shingle_index.keys(), key=_serialize_shingle_key)
+    sorted_shingle_keys = sorted(shingle_index.keys(), key=_shingle_sort_key)
     for sh in sorted_shingle_keys:
         u_indices = shingle_index[sh]
         if len(u_indices) <= 1:

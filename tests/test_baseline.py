@@ -3651,6 +3651,23 @@ def test_compute_calibration_config_hash_lossless_float() -> None:
     assert hash_a != hash_b
 
 
+def test_compute_calibration_config_hash_malformed_frequency_fallback() -> None:
+    """Verifies that unparseable max_index_frequency values fall back to 0.25 in config hash."""
+    from pydoppelgangerhunt.baseline import compute_calibration_config_hash  # pylint: disable=import-outside-toplevel
+
+    hash_default = compute_calibration_config_hash({"max_index_frequency": 0.25})
+    hash_invalid_str = compute_calibration_config_hash({"max_index_frequency": "invalid_frequency"})
+    hash_invalid_bool = compute_calibration_config_hash({"max_index_frequency": True})
+    hash_invalid_neg = compute_calibration_config_hash({"max_index_frequency": -0.5})
+    assert hash_invalid_str == hash_default
+    assert hash_invalid_bool == hash_default
+    assert hash_invalid_neg == hash_default
+
+    # Explicit None remains distinct
+    hash_none = compute_calibration_config_hash({"max_index_frequency": None})
+    assert hash_none != hash_default
+
+
 def test_matches_boundary_and_structural_hashes_no_suffix_fallback(tmp_path: Path) -> None:
     """Verifies that _matches_boundary_and_structural_hashes disables suffix fallback when resolver is provided."""
     from pydoppelgangerhunt.canonical_path import CanonicalPathResolver  # pylint: disable=import-outside-toplevel
@@ -4775,6 +4792,28 @@ def test_detect_clone_path_basis_notebook_anchors(tmp_path: Path) -> None:
         target=str(src),
     )
     assert basis == "repo_relative"
+
+
+def test_detect_clone_path_basis_nonexistent_directory_target(tmp_path: Path) -> None:
+    """Verifies that _detect_clone_path_basis preserves non-existent directory targets without collapsing to parent."""
+    from pydoppelgangerhunt.baseline import _detect_clone_path_basis  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo_virtual"
+    repo.mkdir()
+    target_virtual_dir = repo / "virtual_subpkg"
+    # virtual_subpkg does NOT exist on disk as a directory
+    assert not target_virtual_dir.exists()
+
+    clones = [
+        (0.90, {"file": "mod.py", "name": "u1"}, {"file": "mod.py", "name": "u2"})
+    ]
+    basis = _detect_clone_path_basis(
+        clones,
+        scan_offset="virtual_subpkg",
+        repo_root=str(repo),
+        target=str(target_virtual_dir),
+    )
+    assert basis == "target_relative"
 
 
 def test_probe_directory_normalization_case_insensitive(tmp_path: Path) -> None:

@@ -306,8 +306,11 @@ def compute_calibration_config_hash(source: Dict[str, Any]) -> str:
     settings = _extract_calibration_settings(source)
     if "max_index_frequency" in source:
         raw_mif = source.get("max_index_frequency")
-        parsed_mif = _safe_index_frequency(raw_mif) if raw_mif is not None else None
-        settings["max_index_frequency"] = parsed_mif if parsed_mif is not None else None
+        if raw_mif is None:
+            settings["max_index_frequency"] = None
+        else:
+            parsed_mif = _safe_index_frequency(raw_mif)
+            settings["max_index_frequency"] = parsed_mif if parsed_mif is not None else 0.25
     else:
         settings["max_index_frequency"] = 0.25
     canonical_json = json.dumps(settings, sort_keys=True, separators=(",", ":"))
@@ -1132,10 +1135,18 @@ def _detect_clone_path_basis(
             if not tp.is_absolute() and repo_root is not None:
                 tp = Path(repo_root) / tp
             tp = tp.resolve()
-            target_p = tp if tp.is_dir() else tp.parent
+            target_p = (
+                tp.parent
+                if (tp.is_file() or (not tp.is_dir() and tp.suffix.lower() in (".py", ".ipynb")))
+                else tp
+            )
         if repo_root is not None:
             rp = Path(repo_root).resolve()
-            repo_p = rp if rp.is_dir() else rp.parent
+            repo_p = (
+                rp.parent
+                if (rp.is_file() or (not rp.is_dir() and rp.suffix.lower() in (".py", ".ipynb")))
+                else rp
+            )
     except (ValueError, OSError, RuntimeError):
         target_p = None
         repo_p = None

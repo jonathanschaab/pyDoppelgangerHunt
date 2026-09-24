@@ -1775,6 +1775,35 @@ def test_matcher_units_missing_shingles_no_key_error(tmp_path: Path) -> None:
         assert isinstance(clones, list)
 
 
+def test_shingle_sort_key_determinism_and_types() -> None:
+    """Verifies that _shingle_sort_key partitions and orders tuples and strings deterministically."""
+    from pydoppelgangerhunt.matcher import _shingle_sort_key  # pylint: disable=import-outside-toplevel
+
+    assert _shingle_sort_key(("FunctionDef", "arguments")) == (0, ("FunctionDef", "arguments"))
+    assert _shingle_sort_key("token_str") == (1, "token_str")
+    assert _shingle_sort_key(42) == (1, "42")
+
+    raw_keys = [
+        "zebra_token",
+        ("Module", "If", "Compare"),
+        "apple_token",
+        ("FunctionDef", "arguments", "arg"),
+        "beta_token",
+        ("ClassDef", "Name"),
+    ]
+    sorted_keys = sorted(raw_keys, key=_shingle_sort_key)
+    expected = [
+        ("ClassDef", "Name"),
+        ("FunctionDef", "arguments", "arg"),
+        ("Module", "If", "Compare"),
+        "apple_token",
+        "beta_token",
+        "zebra_token",
+    ]
+    assert sorted_keys == expected
+
+
+
 
 
 
