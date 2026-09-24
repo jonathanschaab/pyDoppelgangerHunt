@@ -137,7 +137,7 @@ def find_python_files(
         return []
     valid_suffixes = (".py", ".ipynb") if include_notebooks else (".py",)
     if target_path.is_file():
-        return [target_path] if target_path.suffix in valid_suffixes else []
+        return [target_path] if target_path.suffix.lower() in valid_suffixes else []
 
     target_clean = str(target_path).replace("\\", "/").strip("./")
     active_excludes = [
@@ -162,7 +162,8 @@ def find_python_files(
         if _is_excluded(norm_root, rel_root):
             continue
         for file in files:
-            if not any(file.endswith(sfx) for sfx in valid_suffixes):
+            file_lower = file.lower()
+            if not any(file_lower.endswith(sfx) for sfx in valid_suffixes):
                 continue
             path = os.path.join(root, file)
             rel_file = os.path.relpath(path, target_str).replace("\\", "/")

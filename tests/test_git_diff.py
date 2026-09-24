@@ -1188,3 +1188,47 @@ def test_run_git_diff_clean_since_ref() -> None:
         _run_git_diff(["--name-only"], since_ref="  HEAD~1  ")
         mock_cmd.assert_called_once_with(["diff", "--name-only", "HEAD~1", "--"], cwd=None)
 
+
+def test_parse_git_diff_hunks_no_prefix_single_letter_dir() -> None:
+    """Verifies that parse_git_diff_hunks does not strip b/ on --no-prefix diffs for single-letter root dirs."""
+    from pydoppelgangerhunt.git_diff import parse_git_diff_hunks  # pylint: disable=import-outside-toplevel
+
+    # 1. Unified diff produced with --no-prefix on real repo path b/worker.py
+    diff_no_prefix = (
+        "diff --git b/worker.py b/worker.py\n"
+        "--- b/worker.py\n"
+        "+++ b/worker.py\n"
+        "@@ -10,3 +10,3 @@\n"
+        "+# change in worker\n"
+    )
+    hunks_np = parse_git_diff_hunks(diff_no_prefix)
+    assert "b/worker.py" in hunks_np
+    assert "worker.py" not in hunks_np
+    assert hunks_np["b/worker.py"] == [(10, 12)]
+
+    # 2. Standard diff with a/ and b/ prefixes for real repo path b/worker.py
+    diff_prefixed = (
+        "diff --git a/b/worker.py b/b/worker.py\n"
+        "--- a/b/worker.py\n"
+        "+++ b/b/worker.py\n"
+        "@@ -10,3 +10,3 @@\n"
+        "+# change in worker\n"
+    )
+    hunks_pref = parse_git_diff_hunks(diff_prefixed)
+    assert "b/worker.py" in hunks_pref
+    assert hunks_pref["b/worker.py"] == [(10, 12)]
+
+    # 3. Explicit strip_prefix=False preserves prefix even on a/b/ headers
+    hunks_explicit_false = parse_git_diff_hunks(diff_prefixed, strip_prefix=False)
+    assert "b/b/worker.py" in hunks_explicit_false
+
+    # 4. Explicit strip_prefix=True forces prefix stripping
+    diff_custom = (
+        "--- old/mod.py\n"
+        "+++ b/mod.py\n"
+        "@@ -5,1 +5,1 @@\n"
+        "+line\n"
+    )
+    hunks_forced = parse_git_diff_hunks(diff_custom, strip_prefix=True)
+    assert "mod.py" in hunks_forced
+

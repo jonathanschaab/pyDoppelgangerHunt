@@ -701,4 +701,56 @@ def test_extract_unit_source_code_rejects_global_tempdir_when_repo_root_omitted(
     assert res == ["# Source for secret lines 1-1\n"]
 
 
+def test_extract_unit_source_code_uppercase_notebook_and_case_insensitive_cell_anchor(tmp_path: Path) -> None:
+    """Verifies that extract_unit_source_code, parser, and config handle uppercase notebooks case-insensitively."""
+    import json
+    from pydoppelgangerhunt.config import find_python_files  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.metrics import compute_repository_dry_stats  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.parser import harvest_file_units  # pylint: disable=import-outside-toplevel
+
+    nb_file = tmp_path / "ANALYSIS.IPYNB"
+    nb_content = {
+        "cells": [
+            {
+                "cell_type": "code",
+                "source": ["def calculate_total():\n", "    val = 42\n", "    return val\n"],
+            }
+        ]
+    }
+    nb_file.write_text(json.dumps(nb_content), encoding="utf-8")
+
+    # 1. extract_unit_source_code extracts code cell lines, not raw JSON
+    unit = {
+        "file": "ANALYSIS.IPYNB#cell_1",
+        "start": 1,
+        "end": 3,
+        "name": "calculate_total",
+    }
+    lines = extract_unit_source_code(unit, repo_root=str(tmp_path))
+    assert lines == ["def calculate_total():\n", "    val = 42\n", "    return val\n"]
+
+    # 2. Case-insensitive #CELL_1 anchor
+    unit_upper_anchor = {
+        "file": "ANALYSIS.IPYNB#CELL_1",
+        "start": 1,
+        "end": 3,
+        "name": "calculate_total",
+    }
+    lines_upper = extract_unit_source_code(unit_upper_anchor, repo_root=str(tmp_path))
+    assert lines_upper == ["def calculate_total():\n", "    val = 42\n", "    return val\n"]
+
+    # 3. find_python_files discovers uppercase .IPYNB
+    discovered = find_python_files(str(tmp_path), include_notebooks=True)
+    assert any(p.name == "ANALYSIS.IPYNB" for p in discovered)
+
+    # 4. harvest_file_units harvests AST units from uppercase .IPYNB
+    harvested = harvest_file_units(str(nb_file), repo_root=str(tmp_path), min_lines=1, min_tokens=1)
+    assert len(harvested) >= 1
+    assert any("calculate_total" in (u.get("name") or "") for u in harvested)
+
+    # 5. compute_repository_dry_stats counts SLOC for uppercase .IPYNB
+    stats = compute_repository_dry_stats(str(tmp_path), clones=[], include_notebooks=True)
+    assert stats["sloc"] >= 3
+
+
 

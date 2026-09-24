@@ -92,33 +92,79 @@ def _decode_git_cstyle_path(raw_path: str) -> str:
     return trimmed
 
 
-def parse_git_diff_hunks(diff_text: str) -> Dict[str, List[Tuple[int, int]]]:
-    """Parses unified diff output into mapping of file paths to changed line ranges."""
+def _extract_diff_header_path(line_header: str) -> Optional[str]:
+    """Extracts decoded file path from a unified diff --- or +++ header line."""
+    rest = line_header.rstrip("\r\n")
+    if rest.startswith('"'):
+        closing_idx = rest.rfind('"')
+        if 0 < closing_idx < len(rest) - 1:
+            rest = rest[: closing_idx + 1]
+    elif "\t" in rest:
+        rest = rest.split("\t", 1)[0]
+    rest = _decode_git_cstyle_path(rest)
+    if rest in ("/dev/null", ""):
+        return None
+    return rest
+
+
+def parse_git_diff_hunks(
+    diff_text: str,
+    strip_prefix: Optional[bool] = None,
+) -> Dict[str, List[Tuple[int, int]]]:
+    """Parses unified diff output into mapping of file paths to changed line ranges.
+
+    Args:
+        diff_text: Raw unified diff output string.
+        strip_prefix: Explicit prefix stripping control:
+            - True: always strip standard destination prefixes (e.g. b/, i/, w/, c/).
+            - False: preserve path strings verbatim without prefix stripping.
+            - None (default): automatically infer from diff headers. Preserves identical
+              source/dest pairs (e.g. --no-prefix diffs with paths like b/worker.py)
+              while stripping standard paired prefixes (e.g. a/file.py -> b/file.py).
+    """
     modified_ranges: Dict[str, List[Tuple[int, int]]] = {}
     current_file: Optional[str] = None
+    last_source_file: Optional[str] = None
 
     for line in diff_text.splitlines():
         if line.startswith("--- "):
             current_file = None
+            last_source_file = _extract_diff_header_path(line[4:])
         elif line.startswith("+++ "):
-            rest = line[4:].rstrip("\r\n")
-            if rest.startswith('"'):
-                closing_idx = rest.rfind('"')
-                if 0 < closing_idx < len(rest) - 1:
-                    rest = rest[: closing_idx + 1]
-            elif "\t" in rest:
-                rest = rest.split("\t", 1)[0]
-            rest = _decode_git_cstyle_path(rest)
-            if rest in ("/dev/null", ""):
+            dst = _extract_diff_header_path(line[4:])
+            if not dst:
                 current_file = None
             else:
-                # Strip standard Git diff destination prefixes (e.g. b/, i/, w/, c/).
-                # Internal diff commands explicitly pass --src-prefix=a/ --dst-prefix=b/.
-                # If external --no-prefix diffs with single-letter root dirs are supported,
-                # checking filesystem existence before stripping can serve as a fallback.
-                if len(rest) > 2 and rest[1] == "/" and rest[0] in "biwc":
-                    rest = rest[2:]
-                current_file = normalize_path_string(rest, strip_anchor=False)
+                has_dest_prefix = len(dst) > 2 and dst[1] == "/" and dst[0] in "biwc"
+                if strip_prefix is True:
+                    should_strip = has_dest_prefix
+                elif strip_prefix is False:
+                    should_strip = False
+                else:
+                    # Auto-detect: if source and destination paths match identically,
+                    # the diff was produced without prefixes (--no-prefix); preserve b/worker.py.
+                    if last_source_file is not None:
+                        src_str = str(last_source_file)
+                        if src_str == dst:
+                            should_strip = False
+                        elif (
+                            has_dest_prefix
+                            and src_str.startswith(("a/", "i/", "w/", "c/"))
+                            and src_str[2:] == dst[2:]
+                        ):
+                            should_strip = True
+                        elif has_dest_prefix:
+                            should_strip = True
+                        else:
+                            should_strip = False
+                    elif has_dest_prefix:
+                        should_strip = True
+                    else:
+                        should_strip = False
+
+                if should_strip:
+                    dst = dst[2:]
+                current_file = normalize_path_string(dst, strip_anchor=False)
         elif line.startswith("@@ ") and current_file:
             parts = line.split(" ")
             plus_parts = [p for p in parts if p.startswith("+")]
@@ -171,7 +217,7 @@ def get_git_modified_line_ranges(
     if not diff_output:
         return {}
 
-    return parse_git_diff_hunks(diff_output)
+    return parse_git_diff_hunks(diff_output, strip_prefix=True)
 
 
 def get_git_modified_files(

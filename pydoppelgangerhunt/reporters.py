@@ -100,9 +100,15 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
         return placeholder
 
     try:
-        if resolved_file.suffix == ".ipynb" and "#cell_" in raw_file:
+        raw_lower = raw_file.lower()
+        if resolved_file.suffix.lower() == ".ipynb" and (
+            "#cell_" in raw_lower or "#cell" in raw_lower
+        ):
             try:
-                cell_idx_str = raw_file.split("#cell_", 1)[-1]
+                if "#cell_" in raw_lower:
+                    cell_idx_str = raw_lower.split("#cell_", 1)[-1]
+                else:
+                    cell_idx_str = raw_lower.split("#cell", 1)[-1]
                 cell_idx = int(cell_idx_str) - 1
                 nb_data = json.loads(resolved_file.read_text(encoding="utf-8", errors="replace"))
                 cells = nb_data.get("cells", [])
