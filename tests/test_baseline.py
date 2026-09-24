@@ -3536,6 +3536,10 @@ def test_calibration_config_hash_determinism_and_sensitivity() -> None:
     assert calib_calls_none["total_units"] == 1
     calib_vector_none = compute_corpus_calibration([{"vector": None}], bag_of_tokens=True)
     assert calib_vector_none["total_units"] == 1
+    # Defensively handle collection without .keys() in vector when bag_of_tokens is unset
+    calib_vector_list = compute_corpus_calibration([{"vector": ["t1", "t2"]}], bag_of_tokens=False)
+    assert calib_vector_list["total_units"] == 1
+    assert "t1" in calib_vector_list["shingle_frequencies"]
 
 
 
@@ -4747,6 +4751,50 @@ def test_detect_clone_path_basis_ambiguous_probes_retains_target_relative(tmp_pa
         repo_root=str(repo),
         target=str(src),
     ) == "target_relative"
+
+
+def test_detect_clone_path_basis_notebook_anchors(tmp_path: Path) -> None:
+    """Verifies that _detect_clone_path_basis strips notebook anchors before probing filesystem."""
+    from pydoppelgangerhunt.baseline import _detect_clone_path_basis  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo_nb"
+    src = repo / "src"
+    nb = src / "analysis.ipynb"
+    nb.parent.mkdir(parents=True)
+    nb.write_text("{}", encoding="utf-8")
+
+    # Clones with #cell_1 fragment anchor referencing repo-relative path repo/src/analysis.ipynb
+    clones = [
+        (0.90, {"file": "src/analysis.ipynb#cell_1", "name": "u1"}, {"file": "src/analysis.ipynb#cell_2", "name": "u2"})
+    ]
+    basis = _detect_clone_path_basis(
+        clones,
+        scan_offset="src",
+        repo_root=str(repo),
+        target=str(src),
+    )
+    assert basis == "repo_relative"
+
+
+def test_probe_directory_normalization_case_insensitive(tmp_path: Path) -> None:
+    """Verifies that probe directory and offset resolution normalize non-existent files with uppercase extensions."""
+    from pydoppelgangerhunt.baseline import _compute_path_offset, _derive_target_offsets  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo_case"
+    repo.mkdir()
+    # Non-existent files with uppercase extensions
+    sub_file = str(repo / "src" / "worker.PY")
+    offset = _compute_path_offset(sub_file, str(repo))
+    assert offset == "src"
+
+    b_offset, s_offset = _derive_target_offsets(
+        base_target=str(repo / "src" / "mod.IPYNB"),
+        base_target_rel=None,
+        repo_root=str(repo),
+        target=str(repo / "src" / "other.PY"),
+    )
+    assert b_offset == "src"
+    assert s_offset == "src"
 
 
 def test_record_baseline_resolves_absolute_endpoints(tmp_path: Path) -> None:

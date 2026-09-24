@@ -66,7 +66,7 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
         return placeholder
 
     file_path = Path(f_raw)
-    if file_path.suffix not in (".py", ".ipynb"):
+    if file_path.suffix.lower() not in (".py", ".ipynb"):
         return placeholder
 
     if repo_root:

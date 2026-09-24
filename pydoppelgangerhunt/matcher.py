@@ -574,7 +574,7 @@ def _resolve_git_root_path(target: Union[str, Path]) -> Optional[Path]:
     target_dir: Union[str, Path]
     try:
         t_p = Path(target)
-        target_dir = t_p.parent if (t_p.is_file() or (not t_p.is_dir() and t_p.suffix in (".py", ".ipynb"))) else t_p
+        target_dir = t_p.parent if (t_p.is_file() or (not t_p.is_dir() and t_p.suffix.lower() in (".py", ".ipynb"))) else t_p
     except (ValueError, OSError, RuntimeError):
         target_dir = target
     raw_root = get_git_repo_root(repo_root=target_dir)

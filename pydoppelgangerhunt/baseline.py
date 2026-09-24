@@ -337,7 +337,7 @@ def compute_corpus_calibration(
         elif "shingles" in u and u["shingles"]:
             keys = set(u["shingles"])
         elif "vector" in u and u["vector"]:
-            keys = set(u["vector"].keys())
+            keys = set(u["vector"].keys() if hasattr(u["vector"], "keys") else u["vector"])
         elif "calls" in u and u["calls"]:
             keys = set(u["calls"])
         else:
@@ -553,7 +553,7 @@ def record_baseline(
         t_p = Path(probe_target) if probe_target is not None else None
         probe_dir = (
             t_p.parent
-            if (t_p and (t_p.is_file() or (not t_p.is_dir() and t_p.suffix in (".py", ".ipynb"))))
+            if (t_p and (t_p.is_file() or (not t_p.is_dir() and t_p.suffix.lower() in (".py", ".ipynb"))))
             else t_p
         )
     except (ValueError, OSError, RuntimeError):
@@ -884,10 +884,10 @@ def _compute_path_offset(
             root_res = root_p
 
         try:
-            if sub_res.is_file() or (not sub_res.is_dir() and sub_p.suffix in (".py", ".ipynb")):
+            if sub_res.is_file() or (not sub_res.is_dir() and sub_p.suffix.lower() in (".py", ".ipynb")):
                 sub_res = sub_res.parent
                 sub_p = sub_p.parent
-            if root_res.is_file() or (not root_res.is_dir() and root_p.suffix in (".py", ".ipynb")):
+            if root_res.is_file() or (not root_res.is_dir() and root_p.suffix.lower() in (".py", ".ipynb")):
                 root_res = root_res.parent
                 root_p = root_p.parent
         except (ValueError, OSError, RuntimeError):
@@ -926,7 +926,7 @@ def _derive_target_offsets(
             c_p = Path(cand)
             cand_dir: Union[str, Path] = (
                 c_p.parent
-                if (c_p.is_file() or (not c_p.is_dir() and c_p.suffix in (".py", ".ipynb")))
+                if (c_p.is_file() or (not c_p.is_dir() and c_p.suffix.lower() in (".py", ".ipynb")))
                 else c_p
             )
             git_root = git_diff.get_git_repo_root(repo_root=cand_dir)
@@ -938,12 +938,12 @@ def _derive_target_offsets(
     if not git_root and base_target is not None and target is not None:
         try:
             t_p = Path(target)
-            t_p_parent = t_p.parent if (t_p.is_file() or (not t_p.is_dir() and t_p.suffix in (".py", ".ipynb"))) else t_p
+            t_p_parent = t_p.parent if (t_p.is_file() or (not t_p.is_dir() and t_p.suffix.lower() in (".py", ".ipynb"))) else t_p
         except (ValueError, OSError, RuntimeError):
             t_p_parent = Path(target)
         try:
             b_p = Path(base_target)
-            b_p_parent = b_p.parent if (b_p.is_file() or (not b_p.is_dir() and b_p.suffix in (".py", ".ipynb"))) else b_p
+            b_p_parent = b_p.parent if (b_p.is_file() or (not b_p.is_dir() and b_p.suffix.lower() in (".py", ".ipynb"))) else b_p
         except (ValueError, OSError, RuntimeError):
             b_p_parent = Path(base_target)
 
@@ -1080,7 +1080,7 @@ def _build_baseline_path_resolver(
         a_p = Path(anchor)
         anchor_dir: Union[str, Path] = (
             a_p.parent
-            if (a_p.is_file() or (not a_p.is_dir() and a_p.suffix in (".py", ".ipynb")))
+            if (a_p.is_file() or (not a_p.is_dir() and a_p.suffix.lower() in (".py", ".ipynb")))
             else a_p
         )
     except (ValueError, OSError, RuntimeError):
@@ -1185,12 +1185,13 @@ def _detect_clone_path_basis(
         found_repo_only = False
         has_ambiguous_probe = False
         for f in candidate_files:
+            f_clean = normalize_lexical_posix(f, strip_anchor=True)
             try:
-                exists_target = (target_p / f).is_file()
+                exists_target = (target_p / f_clean).is_file()
             except (ValueError, OSError):
                 exists_target = False
             try:
-                exists_repo = (repo_p / f).is_file()
+                exists_repo = (repo_p / f_clean).is_file()
             except (ValueError, OSError):
                 exists_repo = False
 
