@@ -857,6 +857,7 @@ def test_batch_38_windows_path_case_insensitivity_and_unicode_resilience(tmp_pat
     assert val == 42
     val_rel = find_matching_path_value("sub/module.py", data_map)
     assert val_rel == 42
+    assert find_matching_path_value("experiments/run#1.ipynb#cell_3", {"experiments/run#1.ipynb": 100}) == 100
 
     # 3. _is_same_file_path using boundary matching
     assert _is_same_file_path("./Sub/Module.ipynb#cell1", "sub/module.ipynb")
@@ -5123,8 +5124,13 @@ def test_match_clone_record_preserves_empty_root_namespace() -> None:
 
 
 def test_numeric_sanitizers_reject_booleans() -> None:
-    """Verifies that _safe_total_units, _safe_int, and _safe_index_frequency reject booleans."""
-    from pydoppelgangerhunt.baseline import _safe_index_frequency, _safe_int, _safe_total_units
+    """Verifies that _safe_total_units, _safe_int, _safe_index_frequency, and _sanitize_shingle_frequency_dict reject booleans."""
+    from pydoppelgangerhunt.baseline import (
+        _safe_index_frequency,
+        _safe_int,
+        _safe_total_units,
+        _sanitize_shingle_frequency_dict,
+    )
 
     assert _safe_total_units(True) == 0
     assert _safe_total_units(False) == 0
@@ -5132,6 +5138,35 @@ def test_numeric_sanitizers_reject_booleans() -> None:
     assert _safe_int(False, min_val=0) is None
     assert _safe_index_frequency(True) is None
     assert _safe_index_frequency(False) is None
+
+    # Test _sanitize_shingle_frequency_dict explicitly ignores booleans
+    raw_freqs = {"valid": 5, "bool_t": True, "bool_f": False, "str_num": "4", "neg": -2, "zero": 0}
+    sanitized = _sanitize_shingle_frequency_dict(raw_freqs, key_transform=lambda k: k)
+    assert sanitized == {"valid": 5, "str_num": 4}
+
+
+def test_extract_record_endpoint_data_structural_hash_fallbacks() -> None:
+    """Verifies that _extract_record_endpoint_data extracts structural_hash_a/b and structural_hash."""
+    from pydoppelgangerhunt.baseline import _extract_record_endpoint_data
+
+    # structural_hash_a and structural_hash_b
+    rec1 = {"file_a": "a.py", "file_b": "b.py", "structural_hash_a": "sha", "structural_hash_b": "shb"}
+    assert _extract_record_endpoint_data(rec1) == ("a.py", "", "sha", "b.py", "", "shb")
+
+    # structural_hash common fallback
+    rec2 = {"file_a": "a.py", "file_b": "b.py", "structural_hash": "sh_common"}
+    assert _extract_record_endpoint_data(rec2) == ("a.py", "", "sh_common", "b.py", "", "sh_common")
+
+    # hash_a/hash_b priority over structural_hash_a/b
+    rec3 = {
+        "file_a": "a.py",
+        "file_b": "b.py",
+        "hash_a": "ha",
+        "hash_b": "hb",
+        "structural_hash_a": "sha",
+        "structural_hash_b": "shb",
+    }
+    assert _extract_record_endpoint_data(rec3) == ("a.py", "", "ha", "b.py", "", "hb")
 
 
 def test_load_baseline_failure_diagnostic_logging(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:

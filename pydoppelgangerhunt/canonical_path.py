@@ -41,7 +41,7 @@ def normalize_lexical_posix(path_str: Optional[str], strip_anchor: bool = False)
     if strip_anchor and "#" in raw:
         last_seg = raw.replace("\\", "/").rsplit("/", 1)[-1]
         if "#" in last_seg:
-            fname, fragment = last_seg.split("#", 1)
+            fname, fragment = last_seg.rsplit("#", 1)
             fname_lower = fname.lower()
             frag_lower = fragment.lower()
             if fname_lower.endswith(".ipynb") and (
@@ -576,7 +576,7 @@ class CanonicalPathResolver:
             if "#" in raw_str:
                 last_seg = raw_str.replace("\\", "/").rsplit("/", 1)[-1]
                 if "#" in last_seg:
-                    fname, fragment = last_seg.split("#", 1)
+                    fname, fragment = last_seg.rsplit("#", 1)
                     if fname.lower().endswith(".ipynb") and (
                         fragment.lower().startswith("cell_") or fragment.lower().startswith("cell")
                     ):

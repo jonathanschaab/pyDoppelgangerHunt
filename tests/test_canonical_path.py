@@ -31,6 +31,8 @@ def test_normalize_lexical_posix_separators_and_anchors() -> None:
     assert normalize_lexical_posix(".\\.\\foo\\bar.py") == "foo/bar.py"
     assert normalize_lexical_posix("foo/bar.ipynb#cell_1", strip_anchor=True) == "foo/bar.ipynb"
     assert normalize_lexical_posix("foo/bar.ipynb#cell_1", strip_anchor=False) == "foo/bar.ipynb#cell_1"
+    assert normalize_lexical_posix("foo/experiment#1.ipynb#cell_4", strip_anchor=True) == "foo/experiment#1.ipynb"
+    assert normalize_lexical_posix("foo/experiment#1.ipynb#cell_4", strip_anchor=False) == "foo/experiment#1.ipynb#cell_4"
     assert normalize_lexical_posix("foo/bar.py#cell_1", strip_anchor=True) == "foo/bar.py#cell_1"
     assert normalize_lexical_posix("worker.py#cell_data.py", strip_anchor=True) == "worker.py#cell_data.py"
     assert normalize_lexical_posix("worker.py#v1", strip_anchor=True) == "worker.py#v1"
@@ -459,4 +461,9 @@ def test_resolver_native_nonexistent_file_target_normalization(tmp_path: Path) -
     assert lex_nb == expected_parent
 
 
-
+def test_resolver_matches_diff_notebook_anchor_with_literal_hash() -> None:
+    """Verifies matches_diff strips notebook anchors properly when filename contains literal #."""
+    resolver = CanonicalPathResolver(target_root="/repo", repo_root="/repo")
+    diff_keys = {"target:experiments/run#1.ipynb"}
+    assert resolver.matches_diff("experiments/run#1.ipynb#cell_3", diff_keys)
+    assert not resolver.matches_diff("experiments/run#2.ipynb#cell_3", diff_keys)

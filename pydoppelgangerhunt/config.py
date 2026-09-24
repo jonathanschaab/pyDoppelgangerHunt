@@ -105,7 +105,7 @@ def find_matching_path_value(
     if "#" in target_raw:
         last_seg = target_raw.replace("\\", "/").rsplit("/", 1)[-1]
         if "#" in last_seg:
-            fname, fragment = last_seg.split("#", 1)
+            fname, fragment = last_seg.rsplit("#", 1)
             if fname.lower().endswith(".ipynb") and (
                 fragment.lower().startswith("cell_") or fragment.lower().startswith("cell")
             ):

@@ -260,6 +260,8 @@ def _sanitize_shingle_frequency_dict(
         return cleaned
     for k, v in raw_freqs.items():
         try:
+            if isinstance(v, bool):
+                continue
             freq_val = int(v)
             if freq_val > 0:
                 if max_units is not None and max_units > 0:
@@ -982,8 +984,8 @@ def _extract_record_endpoint_data(
     fb = str(item.get("file_b") or "")
     na = str(item.get("name_a") or "")
     nb = str(item.get("name_b") or "")
-    ha = str(item.get("hash_a") or "")
-    hb = str(item.get("hash_b") or "")
+    ha = str(item.get("hash_a") or item.get("structural_hash_a") or item.get("structural_hash") or "")
+    hb = str(item.get("hash_b") or item.get("structural_hash_b") or item.get("structural_hash") or "")
 
     raw_fp = item.get("fingerprint") or item.get("fp")
     if not fa and not fb and raw_fp:
