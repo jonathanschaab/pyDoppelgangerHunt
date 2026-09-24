@@ -118,7 +118,7 @@ def _sorted_pair(a: str, b: str) -> Tuple[str, str]:
 def _shingle_sort_key(k: Any) -> Tuple[int, Any]:
     """Fast, deterministic sort key for shingle indexing without JSON serialization overhead."""
     if isinstance(k, tuple):
-        return (0, k)
+        return (0, tuple((type(x).__name__, x if isinstance(x, (int, float, str)) else str(x)) for x in k))
     return (1, str(k))
 
 
@@ -1169,9 +1169,6 @@ def scan_target(
                 combined_df = max(df_local, df_global)
         else:
             combined_df = len(u_indices)
-
-        if effective_stop_shingles and sh in effective_stop_shingles:
-            continue
 
         is_novel = calib_freqs_map is not None and not is_global_shingle
 

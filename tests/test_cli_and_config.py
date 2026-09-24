@@ -2049,6 +2049,39 @@ def test_cli_diff_only_empty_diff_skips_full_scan(
     assert "No structural code clones found" in out
 
 
+def test_cli_main_passes_notebooks_and_exemptions_to_scan_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that cli.main passes include_notebooks and config exemptions to scan_target."""
+    import pydoppelgangerhunt.cli
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    pyproject = repo / "pyproject.toml"
+    pyproject.write_text(
+        '[tool.pydoppelgangerhunt]\nexemptions = [["a.py:foo", "b.py:foo"]]\n',
+        encoding="utf-8",
+    )
+    (repo / "dummy.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--notebooks",
+        ],
+    )
+    with mock.patch("pydoppelgangerhunt.cli.scan_target", wraps=pydoppelgangerhunt.cli.scan_target) as mock_scan:
+        res = main()
+        assert res == 0
+        mock_scan.assert_called_once()
+        _, kwargs = mock_scan.call_args
+        assert kwargs.get("include_notebooks") is True
+        assert kwargs.get("exemptions") == [("a.py:foo", "b.py:foo")]
+
+
 
 
 

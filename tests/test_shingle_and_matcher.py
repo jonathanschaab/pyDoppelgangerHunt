@@ -1779,9 +1779,14 @@ def test_shingle_sort_key_determinism_and_types() -> None:
     """Verifies that _shingle_sort_key partitions and orders tuples and strings deterministically."""
     from pydoppelgangerhunt.matcher import _shingle_sort_key  # pylint: disable=import-outside-toplevel
 
-    assert _shingle_sort_key(("FunctionDef", "arguments")) == (0, ("FunctionDef", "arguments"))
+    assert _shingle_sort_key(("FunctionDef", "arguments")) == (0, (("str", "FunctionDef"), ("str", "arguments")))
     assert _shingle_sort_key("token_str") == (1, "token_str")
     assert _shingle_sort_key(42) == (1, "42")
+
+    # Heterogeneous tuple elements (int vs str) do not trigger TypeError
+    hetero_keys = [("call", "arg"), ("call", 10), ("call", 2), "token"]
+    sorted_hetero = sorted(hetero_keys, key=_shingle_sort_key)
+    assert sorted_hetero == [("call", 2), ("call", 10), ("call", "arg"), "token"]
 
     raw_keys = [
         "zebra_token",

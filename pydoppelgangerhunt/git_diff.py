@@ -198,7 +198,13 @@ def get_git_repo_root(
     repo_root: Optional[Union[str, Path]] = None,
     cwd: Optional[Union[str, Path]] = None,
 ) -> Optional[str]:
-    """Resolves the top-level root directory of the current Git worktree, or None if not in a repository."""
+    """Resolves the top-level root directory of the current Git worktree, or None if not in a repository.
+
+    Note:
+        The since_ref parameter is accepted for signature compatibility with
+        polymorphic git diff helper invocations in _safe_call_git_diff_helper,
+        but is not utilized for repository root discovery.
+    """
     _ = since_ref
     target_cwd = str(repo_root or cwd) if (repo_root or cwd) else None
     raw = _run_git_command(["rev-parse", "--show-toplevel"], cwd=target_cwd)
