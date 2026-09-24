@@ -846,7 +846,12 @@ def _is_absolute_path_str(path_str: str) -> bool:
     if not path_str:
         return False
     return (
-        (len(path_str) >= 2 and path_str[1] == ":" and path_str[0].isalpha())
+        (
+            len(path_str) >= 3
+            and path_str[1] == ":"
+            and path_str[0].isalpha()
+            and path_str[2] in ("/\\")
+        )
         or path_str.startswith("/")
         or path_str.startswith("\\")
     )

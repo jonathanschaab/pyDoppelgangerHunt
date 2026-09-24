@@ -5269,4 +5269,19 @@ def test_extract_record_endpoint_data_intra_file_clone_hash_order() -> None:
     assert hb2 == "hash_b"
 
 
+def test_is_absolute_path_str_drive_strictness() -> None:
+    """Verifies that _is_absolute_path_str distinguishes drive-absolute from drive-relative paths."""
+    from pydoppelgangerhunt.baseline import _is_absolute_path_str  # pylint: disable=import-outside-toplevel
+
+    assert _is_absolute_path_str("C:/foo.py") is True
+    assert _is_absolute_path_str(r"C:\foo.py") is True
+    assert _is_absolute_path_str("/foo.py") is True
+    assert _is_absolute_path_str(r"\foo.py") is True
+    assert _is_absolute_path_str("//server/share/foo.py") is True
+    assert _is_absolute_path_str("C:foo.py") is False
+    assert _is_absolute_path_str("d:sub/foo.py") is False
+    assert _is_absolute_path_str("foo.py") is False
+    assert _is_absolute_path_str("") is False
+
+
 
