@@ -5221,4 +5221,52 @@ def test_load_baseline_failure_diagnostic_logging(tmp_path: Path, caplog: pytest
     assert any("Failed to load baseline at" in record.message for record in caplog.records)
 
 
+def test_matches_boundary_and_structural_hashes_identical_hashes_swapped_endpoints() -> None:
+    """Verifies that _matches_boundary_and_structural_hashes matches swapped endpoints with identical hashes when resolver is None."""
+    from pydoppelgangerhunt.baseline import _matches_boundary_and_structural_hashes  # pylint: disable=import-outside-toplevel
+
+    # Both units share identical structural hash 'common_hash'
+    # Baseline recorded as r_fa='dir1/mod.py', r_fb='dir2/mod.py'
+    # Candidate scan harvested as c_fa='dir2/mod.py', c_fb='dir1/mod.py' (swapped orientation)
+    assert _matches_boundary_and_structural_hashes(
+        r_fa="dir1/mod.py",
+        r_fb="dir2/mod.py",
+        r_ha="common_hash",
+        r_hb="common_hash",
+        c_fa="dir2/mod.py",
+        c_fb="dir1/mod.py",
+        c_ha="common_hash",
+        c_hb="common_hash",
+        resolver=None,
+    )
+
+
+def test_extract_record_endpoint_data_intra_file_clone_hash_order() -> None:
+    """Verifies that _extract_record_endpoint_data does not invert hashes for intra-file clone pairs."""
+    from pydoppelgangerhunt.baseline import _extract_record_endpoint_data  # pylint: disable=import-outside-toplevel
+
+    # Intra-file clone where file_a == file_b == "worker.py"
+    # Structural fingerprint formatted as "worker.py#hash_a <===> worker.py#hash_b"
+    item = {
+        "file_a": "worker.py",
+        "file_b": "worker.py",
+        "structural_fingerprint": "worker.py#hash_a <===> worker.py#hash_b",
+    }
+    fa, _, ha, fb, _, hb = _extract_record_endpoint_data(item)
+    assert fa == "worker.py"
+    assert fb == "worker.py"
+    assert ha == "hash_a"
+    assert hb == "hash_b"
+
+    # Also verify when file_a and file_b are not provided upfront
+    item_no_files = {
+        "structural_fingerprint": "worker.py#hash_a <===> worker.py#hash_b",
+    }
+    fa2, _, ha2, fb2, _, hb2 = _extract_record_endpoint_data(item_no_files)
+    assert fa2 == "worker.py"
+    assert fb2 == "worker.py"
+    assert ha2 == "hash_a"
+    assert hb2 == "hash_b"
+
+
 

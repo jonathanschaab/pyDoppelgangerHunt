@@ -1803,6 +1803,14 @@ def test_shingle_sort_key_determinism_and_types() -> None:
     assert sorted_keys == expected
 
 
+def test_scan_target_accepts_path_instance(tmp_path: Path) -> None:
+    """Verifies that scan_target accepts Path instances for target_dir without type or runtime errors."""
+    f = tmp_path / "sample.py"
+    f.write_text("def foo():\n    return 42\n", encoding="utf-8")
+    clones = scan_target(tmp_path)
+    assert isinstance(clones, list)
+
+
 
 
 

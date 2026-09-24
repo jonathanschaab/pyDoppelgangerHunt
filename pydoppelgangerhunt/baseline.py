@@ -331,7 +331,14 @@ def compute_corpus_calibration(
     target_repo_relative: Optional[str] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    """Computes global shingle document frequencies and calibrated stop-shingles for a repository corpus."""
+    """Computes global shingle document frequencies and calibrated stop-shingles for a repository corpus.
+
+    Note:
+        The stop_shingles argument is accepted for signature parity with scanner
+        pipelines, but is deliberately not incorporated into corpus calibration so
+        calibrations record unskewed empirical document frequency statistics.
+    """
+    _ = stop_shingles
     total_units = len(units)
     shingle_frequencies: Dict[Any, int] = {}
     for u in units:
@@ -1003,7 +1010,7 @@ def _extract_record_endpoint_data(
         p_fa, p_ha, p_fb, p_hb = _parse_structural_fingerprint(str(raw_sfp))
         if not fa and not fb:
             fa, fb = p_fa, p_fb
-        if fa == p_fb and fb == p_fa:
+        if fa != fb and fa == p_fb and fb == p_fa:
             ha, hb = p_hb, p_ha
         else:
             ha, hb = p_ha, p_hb
@@ -1066,9 +1073,11 @@ def _matches_boundary_and_structural_hashes(
             return False
 
     if r_ha == c_ha and r_hb == c_hb:
-        return paths_match_boundary(r_fa, c_fa) and paths_match_boundary(r_fb, c_fb)
+        if paths_match_boundary(r_fa, c_fa) and paths_match_boundary(r_fb, c_fb):
+            return True
     if r_ha == c_hb and r_hb == c_ha:
-        return paths_match_boundary(r_fa, c_fb) and paths_match_boundary(r_fb, c_fa)
+        if paths_match_boundary(r_fa, c_fb) and paths_match_boundary(r_fb, c_fa):
+            return True
     return False
 
 

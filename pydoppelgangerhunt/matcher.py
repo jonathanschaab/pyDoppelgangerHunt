@@ -804,7 +804,7 @@ def _worker_harvest_file(task_kwargs: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 @overload
 def scan_target(
-    target_dir: str,
+    target_dir: Union[str, Path],
     *,
     return_calibration: Literal[False] = False,
     diff_files: Optional[Sequence[str]] = None,
@@ -814,7 +814,7 @@ def scan_target(
 
 @overload
 def scan_target(
-    target_dir: str,
+    target_dir: Union[str, Path],
     *,
     return_calibration: Literal[True],
     diff_files: Optional[Sequence[str]] = None,
@@ -824,7 +824,7 @@ def scan_target(
 
 @overload
 def scan_target(
-    target_dir: str,
+    target_dir: Union[str, Path],
     *,
     return_calibration: bool = False,
     diff_files: Optional[Sequence[str]] = None,
@@ -836,7 +836,7 @@ def scan_target(
 
 
 def scan_target(
-    target_dir: str,
+    target_dir: Union[str, Path],
     *,
     min_lines: int = 8,
     min_tokens: int = 15,
@@ -965,7 +965,6 @@ def scan_target(
                 )
             )
 
-    target_root_dir = res_target_dir if res_target_dir.is_dir() else res_target_dir.parent
     effective_repo = git_root_resolved or effective_repo_root
     resolver = CanonicalPathResolver(target_root=target_root_dir, repo_root=effective_repo)
 
@@ -1257,7 +1256,7 @@ def scan_target(
                 b2 = f"{base_f2}:{sym2}" if sym2 is not None else base_f2
                 basename_exemptions.add(_sorted_pair(b1, b2))
 
-    target_norm = target_dir.replace("\\", "/").strip("./").rstrip("/")
+    target_norm = str(target_dir).replace("\\", "/").strip("./").rstrip("/")
     target_pfx = f"{target_norm}/" if target_norm and target_norm != "." else ""
     target_prefixes = (
         (target_pfx, "src/", "pydoppelgangerhunt/")
