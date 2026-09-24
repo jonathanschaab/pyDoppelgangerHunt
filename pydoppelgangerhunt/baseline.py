@@ -21,7 +21,7 @@ from pydoppelgangerhunt.config import (
     normalize_path_string,
     paths_match_boundary,
 )
-from pydoppelgangerhunt import git_diff
+from . import git_diff
 
 logger = logging.getLogger(__name__)
 
