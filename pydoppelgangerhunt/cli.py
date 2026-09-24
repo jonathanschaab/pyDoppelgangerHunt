@@ -1060,6 +1060,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     )
                 )
 
+        skipped_novel = (
+            calib_dict.get("skipped_novel_shingles") if isinstance(calib_dict, dict) else None
+        )
+        if skipped_novel and getattr(args, "verbose", False):
+            print(
+                colorize(
+                    f"Info: {skipped_novel} high-density novel shingle(s) exceeded candidate pair budget during differential scan.",
+                    COLOR_YELLOW,
+                    use_color,
+                )
+            )
+
     if args.record_baseline:
         try:
             bp = record_baseline(

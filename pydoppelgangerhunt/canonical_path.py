@@ -274,7 +274,7 @@ class CanonicalPathResolver:
         )
 
         self._cache: Dict[Tuple[str, str, bool], CanonicalPath] = {}
-        self._tagged_keys_cache: Optional[Tuple[int, int, bool]] = None
+        self._tagged_keys_cache: Optional[Tuple[int, int, Optional[str], bool]] = None
 
     def clear_cache(self) -> None:
         """Clears memoized path resolutions and cached diff key metadata."""
@@ -567,11 +567,17 @@ class CanonicalPathResolver:
             cached = self._tagged_keys_cache
             diff_id = id(diff_keys)
             diff_len = len(diff_keys)
-            if cached is not None and cached[0] == diff_id and cached[1] == diff_len:
-                has_tagged = cached[2]
+            if (
+                cached is not None
+                and cached[0] == diff_id
+                and cached[1] == diff_len
+                and (cached[2] is None or cached[2] in diff_keys)
+            ):
+                has_tagged = cached[3]
             else:
                 has_tagged = any(k.startswith(("repo:", "target:")) for k in diff_keys)
-                self._tagged_keys_cache = (diff_id, diff_len, has_tagged)
+                sample_key = next(iter(diff_keys), None) if diff_keys else None
+                self._tagged_keys_cache = (diff_id, diff_len, sample_key, has_tagged)
 
         if self._probe_keys_in_diff(
             self.target_key(unit_file, basis=basis, strip_anchor=False),

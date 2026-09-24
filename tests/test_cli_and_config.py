@@ -2082,6 +2082,72 @@ def test_cli_main_passes_notebooks_and_exemptions_to_scan_target(
         assert kwargs.get("exemptions") == [("a.py:foo", "b.py:foo")]
 
 
+def test_cli_skipped_novel_shingles_verbose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that cli.main prints an informational notice in text mode when novel shingles exceed budget under -v."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.baseline import compute_corpus_calibration, record_baseline  # pylint: disable=import-outside-toplevel
+    import pydoppelgangerhunt.matcher
+
+    repo = tmp_path / "repo_novel"
+    repo.mkdir(parents=True)
+    f = repo / "module.py"
+    f.write_text(
+        "def f1():\n    x = 1\n    y = 2\n    return x + y\n\n"
+        "def f2():\n    x = 1\n    y = 2\n    return x + y\n\n"
+        "def f3():\n    x = 1\n    y = 2\n    return x + y\n",
+        encoding="utf-8",
+    )
+
+    baseline_file = tmp_path / "baseline.json"
+    calib = compute_corpus_calibration([], min_lines=3)
+    calib["total_units"] = 100
+    calib["shingle_frequencies"] = {}
+    record_baseline([], str(baseline_file), str(repo), 0.90, corpus_calibration=calib)
+
+    monkeypatch.setattr(pydoppelgangerhunt.matcher, "MAX_NOVEL_SHINGLE_PAIR_BUDGET", 1)
+
+    # Run without -v: should NOT print advisory
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(baseline_file),
+            "--min-lines",
+            "3",
+            "--format",
+            "text",
+            "--no-color",
+        ],
+    )
+    assert main() == 0
+    out_default = capsys.readouterr().out
+    assert "high-density novel shingle(s) exceeded candidate pair budget" not in out_default
+
+    # Run with -v: should print advisory
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(baseline_file),
+            "--min-lines",
+            "3",
+            "--format",
+            "text",
+            "--no-color",
+            "-v",
+        ],
+    )
+    assert main() == 0
+    out_verbose = capsys.readouterr().out
+    assert "high-density novel shingle(s) exceeded candidate pair budget during differential scan." in out_verbose
+
+
 
 
 

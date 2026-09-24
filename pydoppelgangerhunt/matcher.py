@@ -1135,6 +1135,7 @@ def scan_target(
         )
 
     remaining_novel_pair_budget: int = MAX_NOVEL_SHINGLE_PAIR_BUDGET
+    skipped_novel_shingles: int = 0
 
     sorted_shingle_keys = sorted(shingle_index.keys(), key=_shingle_sort_key)
     for sh in sorted_shingle_keys:
@@ -1183,6 +1184,7 @@ def scan_target(
                     continue
                 potential_pairs = (len(u_indices) * (len(u_indices) - 1)) // 2
             if potential_pairs > remaining_novel_pair_budget:
+                skipped_novel_shingles += 1
                 logger.debug(
                     "Novel shingle pair budget exceeded (needed %d, remaining %d); skipping novel shingle pairs",
                     potential_pairs,
@@ -1197,6 +1199,15 @@ def scan_target(
         if is_novel:
             added_pairs = len(candidate_pairs) - pairs_before
             remaining_novel_pair_budget = max(0, remaining_novel_pair_budget - added_pairs)
+
+    if skipped_novel_shingles > 0:
+        logger.info(
+            "Novel shingle pair budget reached: %d high-density novel shingle(s) skipped to limit quadratic candidate expansion. "
+            "Consider re-recording baseline calibration to index new symbols.",
+            skipped_novel_shingles,
+        )
+        if corpus_calibration is not None:
+            corpus_calibration["skipped_novel_shingles"] = skipped_novel_shingles
 
     if tfidf and units and candidate_pairs:
         keys_to_weight: Set[Any] = set(df_counts.keys())

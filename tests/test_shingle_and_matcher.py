@@ -1816,6 +1816,38 @@ def test_scan_target_accepts_path_instance(tmp_path: Path) -> None:
     assert isinstance(clones, list)
 
 
+def test_novel_shingle_pair_budget_visibility(tmp_path: Path, monkeypatch: Any, caplog: Any) -> None:
+    """Verifies that novel shingle budget exclusions log an info advisory and populate corpus_calibration."""
+    import logging
+    import pydoppelgangerhunt.matcher
+    from pydoppelgangerhunt.baseline import compute_corpus_calibration  # pylint: disable=import-outside-toplevel
+
+    f = tmp_path / "clones.py"
+    f.write_text(
+        "def func_a():\n    x = 1\n    y = 2\n    return x + y\n\n"
+        "def func_b():\n    x = 1\n    y = 2\n    return x + y\n\n"
+        "def func_c():\n    x = 1\n    y = 2\n    return x + y\n",
+        encoding="utf-8",
+    )
+
+    calib = compute_corpus_calibration([], min_lines=3)
+    calib["total_units"] = 100
+    calib["shingle_frequencies"] = {}
+
+    with monkeypatch.context() as m, caplog.at_level(logging.INFO):
+        m.setattr(pydoppelgangerhunt.matcher, "MAX_NOVEL_SHINGLE_PAIR_BUDGET", 1)
+        scan_target(
+            str(tmp_path),
+            min_lines=3,
+            threshold=0.80,
+            corpus_calibration=calib,
+        )
+
+    assert calib.get("skipped_novel_shingles") is not None
+    assert calib["skipped_novel_shingles"] > 0
+    assert any("Novel shingle pair budget reached" in record.message for record in caplog.records)
+
+
 
 
 

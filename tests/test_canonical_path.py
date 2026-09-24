@@ -405,10 +405,18 @@ def test_matches_diff_has_tagged_caching() -> None:
     assert resolver._tagged_keys_cache is not None  # pylint: disable=protected-access
     assert resolver._tagged_keys_cache[0] == id(diff_keys)  # pylint: disable=protected-access
     assert resolver._tagged_keys_cache[1] == len(diff_keys)  # pylint: disable=protected-access
-    assert resolver._tagged_keys_cache[2] is True  # pylint: disable=protected-access
+    assert resolver._tagged_keys_cache[2] in diff_keys  # pylint: disable=protected-access
+    assert resolver._tagged_keys_cache[3] is True  # pylint: disable=protected-access
 
     # Subsequent call reuses cached value
     assert resolver.matches_diff("mod.py", diff_keys)
+
+    # Simulated memory ID reuse: same id & len but sample key not in new set causes safe cache miss
+    untagged_keys = {"mod.py", "other.py"}
+    resolver._tagged_keys_cache = (id(untagged_keys), len(untagged_keys), "stale_key", True)  # pylint: disable=protected-access
+    # Because "stale_key" not in untagged_keys, cache is invalidated and recomputed to False
+    assert resolver.matches_diff("mod.py", untagged_keys)
+    assert resolver._tagged_keys_cache[3] is False  # pylint: disable=protected-access
 
     # Explicit parameter overrides/bypasses cache check
     assert resolver.matches_diff("mod.py", diff_keys, has_tagged=True)
