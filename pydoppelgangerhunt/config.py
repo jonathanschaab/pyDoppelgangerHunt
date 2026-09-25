@@ -62,7 +62,7 @@ def canonical_path_key(path_str: Optional[str], strip_anchor: bool = False) -> s
 def paths_match_boundary(
     p1: Optional[str],
     p2: Optional[str],
-    strip_anchor: bool = False,
+    strip_anchor: bool = True,
 ) -> bool:
     """Checks whether two normalized paths refer to the same file respecting directory boundaries."""
     n1 = normalize_lexical_posix(p1, strip_anchor=strip_anchor)

@@ -753,4 +753,55 @@ def test_extract_unit_source_code_uppercase_notebook_and_case_insensitive_cell_a
     assert stats["sloc"] >= 3
 
 
+def test_extract_unit_source_code_notebook_with_literal_hash_in_filename(tmp_path: Path) -> None:
+    """Verifies that extract_unit_source_code distinguishes literal hashes in filenames from cell anchors."""
+    import json
+    from pydoppelgangerhunt.reporters import extract_unit_source_code  # pylint: disable=import-outside-toplevel
+
+    nb_file = tmp_path / "report#cellular.ipynb"
+    nb_content = {
+        "cells": [
+            {
+                "cell_type": "code",
+                "source": ["def run_cell_one():\n", "    return 1\n"],
+            },
+            {
+                "cell_type": "code",
+                "source": ["def run_cell_two():\n", "    return 2\n"],
+            },
+        ]
+    }
+    nb_file.write_text(json.dumps(nb_content), encoding="utf-8")
+
+    # 1. Whole file without cell anchor does not misparse #cellular as an anchor
+    unit_whole = {
+        "file": "report#cellular.ipynb",
+        "start": 1,
+        "end": 2,
+    }
+    whole_lines = extract_unit_source_code(unit_whole, repo_root=str(tmp_path))
+    assert len(whole_lines) >= 1
+    assert "{" in "".join(whole_lines)  # reads notebook raw JSON lines without crashing
+
+    # 2. File with valid cell anchor extracts code from that specific cell
+    unit_cell1 = {
+        "file": "report#cellular.ipynb#cell_1",
+        "start": 1,
+        "end": 2,
+        "name": "run_cell_one",
+    }
+    lines_cell1 = extract_unit_source_code(unit_cell1, repo_root=str(tmp_path))
+    assert lines_cell1 == ["def run_cell_one():\n", "    return 1\n"]
+
+    unit_cell2 = {
+        "file": "report#cellular.ipynb#cell_2",
+        "start": 1,
+        "end": 2,
+        "name": "run_cell_two",
+    }
+    lines_cell2 = extract_unit_source_code(unit_cell2, repo_root=str(tmp_path))
+    assert lines_cell2 == ["def run_cell_two():\n", "    return 2\n"]
+
+
+
 

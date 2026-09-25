@@ -100,16 +100,25 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
         return placeholder
 
     try:
-        raw_lower = raw_file.lower()
-        if resolved_file.suffix.lower() == ".ipynb" and (
-            "#cell_" in raw_lower or "#cell" in raw_lower
-        ):
+        is_cell_anchor = False
+        cell_idx = -1
+        if resolved_file.suffix.lower() == ".ipynb" and "#" in raw_file:
+            last_seg = raw_file.replace("\\", "/").rsplit("/", 1)[-1]
+            if "#" in last_seg:
+                fname, fragment = last_seg.rsplit("#", 1)
+                fname_lower = fname.lower()
+                frag_lower = fragment.lower()
+                if fname_lower.endswith(".ipynb") and (
+                    frag_lower.startswith("cell_") or frag_lower.startswith("cell")
+                ):
+                    prefix = "cell_" if frag_lower.startswith("cell_") else "cell"
+                    suffix = frag_lower[len(prefix) :]
+                    if suffix.isdigit():
+                        cell_idx = int(suffix) - 1
+                        is_cell_anchor = True
+
+        if is_cell_anchor:
             try:
-                if "#cell_" in raw_lower:
-                    cell_idx_str = raw_lower.split("#cell_", 1)[-1]
-                else:
-                    cell_idx_str = raw_lower.split("#cell", 1)[-1]
-                cell_idx = int(cell_idx_str) - 1
                 nb_data = json.loads(resolved_file.read_text(encoding="utf-8", errors="replace"))
                 cells = nb_data.get("cells", [])
                 if 0 <= cell_idx < len(cells):

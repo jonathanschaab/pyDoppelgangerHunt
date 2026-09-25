@@ -2240,6 +2240,25 @@ def test_cli_min_calibration_frequency_flag_and_pyproject_toml(
     assert base_toml.corpus_calibration.get("min_frequency") == 3
 
 
+def test_paths_match_boundary_notebook_anchors_default() -> None:
+    """Verifies that paths_match_boundary defaults to strip_anchor=True for notebook cells while preserving literal hashes."""
+    from pydoppelgangerhunt.config import paths_match_boundary  # pylint: disable=import-outside-toplevel
+
+    # 1. Default strip_anchor=True matches different cells of the same notebook
+    assert paths_match_boundary("analysis.ipynb#cell_1", "analysis.ipynb#cell_2")
+    assert paths_match_boundary("sub/analysis.ipynb#cell_1", "analysis.ipynb#cell_2")
+    assert paths_match_boundary("analysis.ipynb#cell_1", "analysis.ipynb")
+
+    # 2. Explicit strip_anchor=False compares full strings with anchors
+    assert not paths_match_boundary("analysis.ipynb#cell_1", "analysis.ipynb#cell_2", strip_anchor=False)
+    assert paths_match_boundary("analysis.ipynb#cell_1", "sub/analysis.ipynb#cell_1", strip_anchor=False)
+
+    # 3. Literal # in filename is NOT stripped as a cell anchor
+    assert paths_match_boundary("report#cellular.ipynb", "other/report#cellular.ipynb")
+    assert not paths_match_boundary("report#1.py", "report#2.py")
+
+
+
 
 
 
