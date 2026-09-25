@@ -1183,11 +1183,33 @@ def scan_target(
             else:
                 df_global = 0
             if diff_unit_indices is not None:
-                # Conservative Candidate Pruning:
-                # In differential scans, modified units may have removed occurrences of shingle `sh`
-                # that were present at baseline. To guarantee calibration never suppresses a potentially
-                # valid clone candidate (preventing false negatives), pruning_df estimates the lower bound
-                # of current corpus DF by subtracting the maximum possible removals in modified units.
+                # Conservative Candidate Pruning (Mathematical Derivation):
+                # --------------------------------------------------------
+                # In differential mode, only units in `diff_unit_indices` have been modified
+                # or added; all other units in the repository remain unchanged since baseline.
+                #
+                # At baseline:
+                #   df_global = df_unchanged + df_modified_baseline
+                # where df_modified_baseline <= len(diff_unit_indices).
+                #
+                # In the current working tree:
+                #   df_local = modified units currently containing shingle `sh`.
+                #
+                # Therefore, between baseline and current state, at most
+                #   max_removals = max(len(diff_unit_indices) - df_local, 0)
+                # units that contained `sh` at baseline could have had `sh` removed.
+                #
+                # The minimum possible occurrences of `sh` in the current corpus is:
+                #   df_current >= df_global - max_removals
+                #
+                # Additionally, we directly observe at least len(u_indices) units in the
+                # active scan containing `sh`. Thus, the guaranteed lower bound is:
+                #   pruning_df = max(len(u_indices), df_global - max_removals)
+                #
+                # By only pruning `sh` if pruning_df > effective_max_posting, we ensure that
+                # a shingle is pruned if and only if its true current corpus DF is mathematically
+                # guaranteed to exceed the threshold. This strictly prevents false-negative
+                # clone candidate suppressions when edits remove shingles.
                 max_removals = max(len(diff_unit_indices) - df_local, 0)
                 pruning_df = max(len(u_indices), df_global - max_removals)
             else:
