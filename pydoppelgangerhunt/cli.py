@@ -152,6 +152,12 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
     parser.add_argument("--max-index-frequency", type=float, default=None, help="Inverted index frequency threshold to prune ubiquitous shingles (default: 0.25)")
     parser.add_argument("--min-corpus-units", type=int, default=None, help="Minimum corpus unit count before activating dynamic frequency stop-shingle pruning (default: 4)")
     parser.add_argument(
+        "--min-calibration-frequency",
+        type=int,
+        default=None,
+        help="Minimum corpus document frequency threshold to retain shingle in baseline calibration (default: 1)",
+    )
+    parser.add_argument(
         "--method-binding",
         type=str,
         choices=["auto", "method", "module"],
@@ -804,18 +810,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ("min_corpus_size", "min_corpus_units", args.min_corpus_units, 0, None),
         ("window_size", "window_size", args.window_size, 1, 5),
         ("min_expr_complexity", "min_expr_complexity", args.min_expr_complexity, 1, 4),
+        ("min_frequency", "min_calibration_frequency", args.min_calibration_frequency, 1, 1),
     )
     resolved_ints: Dict[str, Optional[int]] = {}
     for calib_key, cfg_key, cli_arg, min_bound, default_val in int_specs:
+        cfg_val = tool_cfg.get(cfg_key) if cfg_key in tool_cfg else tool_cfg.get(calib_key)
+        has_cfg_entry = (cfg_key in tool_cfg) or (calib_key in tool_cfg)
         if cli_arg is not None:
             resolved_ints[calib_key] = cli_arg
-        elif has_explicit_cfg and cfg_key in tool_cfg:
-            resolved_ints[calib_key] = _safe_int(tool_cfg[cfg_key], min_val=min_bound)
+        elif has_explicit_cfg and has_cfg_entry:
+            resolved_ints[calib_key] = _safe_int(cfg_val, min_val=min_bound)
         elif calib_key in active_calib:
             resolved_ints[calib_key] = _safe_int(active_calib[calib_key], min_val=min_bound)
         else:
-            raw_cfg = tool_cfg.get(cfg_key)
-            parsed_cfg = _safe_int(raw_cfg, min_val=min_bound) if raw_cfg is not None else None
+            parsed_cfg = _safe_int(cfg_val, min_val=min_bound) if cfg_val is not None else None
             resolved_ints[calib_key] = parsed_cfg if parsed_cfg is not None else default_val
 
     min_lines = resolved_ints.get("min_lines", 8) or 8
@@ -823,6 +831,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     min_corpus_size = resolved_ints.get("min_corpus_size")
     window_size = resolved_ints.get("window_size", 5) or 5
     min_expr_complexity = resolved_ints.get("min_expr_complexity", 4) or 4
+    min_frequency = resolved_ints.get("min_frequency", 1) or 1
     effective_window_size = window_size
     effective_min_expr_complexity = min_expr_complexity
 
@@ -942,6 +951,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "idioms": idioms_enabled,
                 "abstract_expressions": args.abstract_expressions,
                 "strip_docstrings": strip_docstrings,
+                "min_frequency": min_frequency,
                 "excludes": excludes,
                 "scope": scan_offset,
             }
@@ -1018,6 +1028,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         min_corpus_size=min_corpus_size,
         corpus_calibration=calib_dict,
         return_calibration=bool(args.record_baseline),
+        min_frequency=min_frequency,
     )
 
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]]

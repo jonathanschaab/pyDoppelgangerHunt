@@ -126,6 +126,15 @@ def _extract_calibration_settings(source: Dict[str, Any]) -> Dict[str, Any]:
         raw_mcs = source.get("min_corpus_units")
     settings["min_corpus_size"] = _safe_int(raw_mcs, min_val=0)
 
+    raw_mf = source.get("min_frequency")
+    if raw_mf is None:
+        raw_mf = source.get("min_calibration_frequency")
+    if raw_mf is not None:
+        mf_val = _safe_int(raw_mf, min_val=1)
+        if mf_val is not None and mf_val > 1:
+            settings["min_frequency"] = mf_val
+
+
     raw_excludes = source.get("excludes")
     if raw_excludes is None:
         raw_excludes = source.get("exclude")
@@ -399,12 +408,14 @@ def compute_corpus_calibration(
         "max_index_frequency": valid_max_freq,
         "global_stop_shingles": global_stop_shingles,
         "shingle_frequencies": shingle_frequencies,
+        "min_frequency": min_frequency,
     }
     flags_dict: Dict[str, Any] = {
         "bag_of_tokens": bag_of_tokens,
         "call_sequences": call_sequences,
         "filter_stop_shingles": filter_stop_shingles,
         "min_corpus_size": min_corpus_size,
+        "min_frequency": min_frequency,
         "excludes": excludes,
         "scope": scope,
         "target_repo_relative": target_repo_relative,

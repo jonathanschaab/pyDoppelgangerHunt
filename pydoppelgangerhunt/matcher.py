@@ -881,8 +881,16 @@ def scan_target(
     min_corpus_size: Optional[int] = None,
     corpus_calibration: Optional[Dict[str, Any]] = None,
     return_calibration: bool = False,
+    min_frequency: int = 1,
     **kwargs: Any,
 ) -> Union[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Dict[str, Any]]]:
+    effective_min_freq = min_frequency
+    if "min_calibration_frequency" in kwargs and kwargs["min_calibration_frequency"] is not None:
+        try:
+            effective_min_freq = max(1, int(kwargs["min_calibration_frequency"]))
+        except (ValueError, TypeError):
+            pass
+
     units: List[Dict[str, Any]] = []
     try:
         res_target_dir = Path(target_dir).resolve()
@@ -1003,6 +1011,7 @@ def scan_target(
                     excludes=excludes,
                     scope=resolver.target_in_repo,
                     target_repo_relative=resolver.target_in_repo,
+                    min_frequency=effective_min_freq,
                     **harvest_mode_opts,
                 )
             return []
@@ -1387,6 +1396,7 @@ def scan_target(
             excludes=excludes,
             scope=resolver.target_in_repo,
             target_repo_relative=resolver.target_in_repo,
+            min_frequency=effective_min_freq,
             **harvest_mode_opts,
         )
         return clones, calib_dict

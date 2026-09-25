@@ -499,22 +499,42 @@ def test_resolver_matches_diff_notebook_anchor_with_literal_hash() -> None:
 
 
 def test_resolver_invalidate_path() -> None:
-    """Verifies that invalidate_path removes only matching path entries without purging full cache."""
+    """Verifies that invalidate_path removes matching path entries across separators, case, and notebook anchors."""
     resolver = CanonicalPathResolver(target_root="/repo", repo_root="/repo")
     resolver.resolve("foo.py")
     resolver.resolve("bar.py")
+    resolver.resolve("pkg/worker.py")
+    resolver.resolve("experiments/run.ipynb#cell_1")
+    resolver.resolve("experiments/run.ipynb#cell_2")
 
-    assert len(resolver._cache) == 2  # pylint: disable=protected-access
+    assert len(resolver._cache) == 5  # pylint: disable=protected-access
 
-    # Invalidate foo.py: only foo.py is removed, bar.py stays cached
+    # 1. Invalidate foo.py: only foo.py is removed
     resolver.invalidate_path("foo.py")
-    assert len(resolver._cache) == 1  # pylint: disable=protected-access
-    assert any(k[0] == "bar.py" for k in resolver._cache)  # pylint: disable=protected-access
+    assert len(resolver._cache) == 4  # pylint: disable=protected-access
     assert not any(k[0] == "foo.py" for k in resolver._cache)  # pylint: disable=protected-access
 
-    # Invalidate empty or non-existent path does nothing
-    resolver.invalidate_path("")
+    # 2. Windows backslash invalidation evicts POSIX forward slash entry (pkg\worker.py -> pkg/worker.py)
+    resolver.invalidate_path(r"pkg\worker.py")
+    assert len(resolver._cache) == 3  # pylint: disable=protected-access
+    assert not any("worker.py" in k[0] for k in resolver._cache)  # pylint: disable=protected-access
+
+    # 3. Invalidating parent notebook without anchor evicts all child cell entries
+    resolver.invalidate_path(r"experiments\run.ipynb")
     assert len(resolver._cache) == 1  # pylint: disable=protected-access
+    assert any(k[0] == "bar.py" for k in resolver._cache)  # pylint: disable=protected-access
+
+    # 4. Invalidate empty or non-existent path does nothing
+    resolver.invalidate_path("")
+    resolver.invalidate_path("non_existent.py")
+    assert len(resolver._cache) == 1  # pylint: disable=protected-access
+
+    # 5. Cell-specific invalidation evicts only that specific cell
+    resolver.resolve("demo.ipynb#cell_1")
+    resolver.resolve("demo.ipynb#cell_2")
+    resolver.invalidate_path("demo.ipynb#cell_1")
+    assert any(k[0] == "demo.ipynb#cell_2" for k in resolver._cache)  # pylint: disable=protected-access
+    assert not any(k[0] == "demo.ipynb#cell_1" for k in resolver._cache)  # pylint: disable=protected-access
 
 
 def test_resolver_raw_lexical_root_symlink_fallback(tmp_path: Path) -> None:

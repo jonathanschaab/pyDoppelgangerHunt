@@ -2148,6 +2148,99 @@ def test_cli_skipped_novel_shingles_verbose(
     assert "high-density novel shingle(s) exceeded candidate pair budget during differential scan." in out_verbose
 
 
+def test_cli_min_calibration_frequency_flag_and_pyproject_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies --min-calibration-frequency CLI flag and pyproject.toml loading."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.baseline import load_baseline  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "min_calib_freq_repo"
+    repo.mkdir(parents=True)
+    f1 = repo / "a.py"
+    f2 = repo / "b.py"
+    f3 = repo / "c.py"
+
+    code_shared = "def common_task():\n    return 42\n"
+    code_singleton = "def unique_task():\n    return 9999\n"
+
+    f1.write_text(code_shared, encoding="utf-8")
+    f2.write_text(code_shared, encoding="utf-8")
+    f3.write_text(code_singleton, encoding="utf-8")
+
+    bl_file = repo / "baseline_cutoff.json"
+
+    # 1. Record baseline with --min-calibration-frequency 2
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--min-lines",
+            "2",
+            "--threshold",
+            "0.80",
+            "--record-baseline",
+            str(bl_file),
+            "--min-calibration-frequency",
+            "2",
+        ],
+    )
+    assert main() == 0
+
+    base_obj = load_baseline(str(bl_file))
+    calib = base_obj.corpus_calibration
+    assert calib is not None
+    assert calib.get("min_frequency") == 2
+    freqs = calib.get("shingle_frequencies", {})
+    # All retained shingles must have frequency >= 2
+    for count in freqs.values():
+        assert count >= 2
+
+    # 2. Re-run scan with --baseline (no explicit flag) -> inherits min_frequency=2 without warning
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--min-lines",
+            "2",
+            "--threshold",
+            "0.80",
+            "--baseline",
+            str(bl_file),
+            "--no-color",
+        ],
+    )
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "Warning: Active scan configuration does not match baseline calibration config" not in out
+
+    # 3. pyproject.toml configuration test
+    pyproject = repo / "pyproject.toml"
+    pyproject.write_text(
+        "[tool.pydoppelgangerhunt]\nmin_calibration_frequency = 3\nmin_lines = 2\nthreshold = 0.80\n",
+        encoding="utf-8",
+    )
+    bl_file_toml = repo / "baseline_toml.json"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--config",
+            str(pyproject),
+            "--record-baseline",
+            str(bl_file_toml),
+        ],
+    )
+    assert main() == 0
+    base_toml = load_baseline(str(bl_file_toml))
+    assert base_toml.corpus_calibration is not None
+    assert base_toml.corpus_calibration.get("min_frequency") == 3
+
+
+
 
 
 

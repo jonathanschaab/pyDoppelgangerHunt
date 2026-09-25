@@ -289,12 +289,29 @@ class CanonicalPathResolver:
 
         Allows long-running language server (LSP) or file-watcher daemon processes
         to purge stale path entries upon file modification/deletion events without clearing
-        the entire resolution cache.
+        the entire resolution cache. Handles platform separator differences (Windows backslashes
+        vs POSIX slashes), case-folding, and parent notebook anchor invalidation.
         """
         raw_str = str(getattr(path, "raw", path) or "").rstrip("\r\n")
         if not raw_str:
             return
-        keys_to_remove = [k for k in self._cache if k[0] == raw_str]
+        norm_target = normalize_lexical_posix(raw_str)
+        norm_target_cmp = norm_target.lower() if self.case_fold else norm_target
+        target_has_anchor = "#" in norm_target_cmp
+
+        keys_to_remove: List[Tuple[str, str, bool]] = []
+        for k in self._cache:
+            if k[0] == raw_str:
+                keys_to_remove.append(k)
+                continue
+            k_norm = normalize_lexical_posix(k[0])
+            if self.case_fold:
+                k_norm = k_norm.lower()
+            if k_norm == norm_target_cmp:
+                keys_to_remove.append(k)
+            elif not target_has_anchor and k_norm.split("#", 1)[0] == norm_target_cmp:
+                keys_to_remove.append(k)
+
         for k in keys_to_remove:
             self._cache.pop(k, None)
 

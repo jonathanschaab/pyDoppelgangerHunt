@@ -5311,5 +5311,24 @@ def test_compute_corpus_calibration_min_frequency_cutoff() -> None:
     assert freqs_pruned["shared"] == 3
 
 
+def test_compute_calibration_config_hash_min_frequency() -> None:
+    """Verifies that compute_calibration_config_hash treats min_frequency=1 backward-compatibly and hashes >1 thresholds."""
+    from pydoppelgangerhunt.baseline import compute_calibration_config_hash  # pylint: disable=import-outside-toplevel
+
+    # Default / legacy (unspecified or min_frequency=1) produce identical hash
+    hash_empty = compute_calibration_config_hash({})
+    hash_default = compute_calibration_config_hash({"min_frequency": 1})
+    assert hash_empty == hash_default
+
+    # min_frequency > 1 produces distinct hash
+    hash_freq2 = compute_calibration_config_hash({"min_frequency": 2})
+    assert hash_freq2 != hash_default
+
+    # Alias min_calibration_frequency produces identical hash to min_frequency
+    hash_alias = compute_calibration_config_hash({"min_calibration_frequency": 2})
+    assert hash_alias == hash_freq2
+
+
+
 
 
