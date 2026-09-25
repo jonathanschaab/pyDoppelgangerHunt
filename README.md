@@ -200,9 +200,9 @@ pydoppelgangerhunt --init
 
 ### Baseline Calibration & Massive Monorepo Deployments
 
-When running differential scans in CI pipelines (`--diff-only --baseline baseline.json`), `pyDoppelgangerHunt` reuses pre-computed corpus calibration metadata (shingle frequencies and corpus size) from the recorded baseline to maintain exact IDF weighting and dynamic stop-shingle pruning bounds without re-scanning unchanged repository files.
+When running differential scans in CI pipelines (`--diff-only --baseline baseline.json`), `pyDoppelgangerHunt` reuses pre-computed corpus calibration metadata (shingle frequencies and corpus size) from the recorded baseline to provide fast, approximate IDF weighting and dynamic stop-shingle pruning bounds without re-scanning unchanged repository files. To guarantee that calibration never suppresses potentially valid clone candidates (preventing false negatives), candidate pruning is conservative when calibrated document frequencies are near the pruning cutoff.
 
-For massive monorepos (> 100k AST units), `compute_corpus_calibration` retains shingles across the entire codebase. By default, singleton shingles (appearing in only 1 unit) are indexed. Setting `--min-calibration-frequency 2` (or configuring `min_calibration_frequency = 2` in `pyproject.toml`) discards singleton shingles during `--record-baseline`, dramatically compressing baseline JSON file size and in-memory footprint while preserving identical stop-shingle pruning accuracy.
+For massive monorepos (> 100k AST units), `compute_corpus_calibration` retains shingles across the entire codebase. By default, singleton shingles (appearing in only 1 unit) are indexed. Setting `--min-calibration-frequency 2` (or configuring `min_calibration_frequency = 2` in `pyproject.toml`) discards singleton shingles during `--record-baseline`, dramatically compressing baseline JSON file size and in-memory footprint while providing high stop-shingle pruning efficiency with approximate IDF weighting.
 
 
 ---

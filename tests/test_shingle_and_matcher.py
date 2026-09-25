@@ -1969,3 +1969,71 @@ def test_scan_target_differential_calibration_replacement_model(tmp_path: Path) 
         threshold=0.80,
     )
     assert len(clones) >= 1
+
+
+def test_scan_target_differential_calibration_conservative_pruning_removal(tmp_path: Path) -> None:
+    """Verifies that conservative candidate pruning retains shingles when baseline df > cutoff but actual df <= cutoff due to removals."""
+    from pydoppelgangerhunt.baseline import _serialize_shingle_key
+    from pydoppelgangerhunt.matcher import harvest_file_units
+
+    repo = tmp_path / "diff_removal_repo"
+    repo.mkdir()
+    f1 = repo / "a.py"
+    f2 = repo / "b.py"
+    f3 = repo / "c.py"
+
+    code1 = (
+        "def compute_alpha(a, b):\n"
+        "    res = a * 10 + b\n"
+        "    return res * 2\n"
+    )
+    code2 = (
+        "def compute_beta(a, b):\n"
+        "    res = a * 10 + b\n"
+        "    return res * 2\n"
+    )
+    # c.py was modified in this PR to remove the clone shingle
+    code3 = (
+        "def unrelated_worker(x):\n"
+        "    msg = 'hello ' + str(x)\n"
+        "    return msg.upper()\n"
+    )
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+    f3.write_text(code3, encoding="utf-8")
+
+    units = harvest_file_units(str(f1), str(repo), min_lines=3)
+    assert len(units) >= 1
+    sample_unit = units[0]
+    shingles = sample_unit.get("shingles") or []
+    assert len(shingles) >= 1
+
+    # Cutoff = 3 (10 units total, max_index_frequency = 0.35 -> max_posting_len = floor(10 * 0.35) = 3)
+    # Baseline global df = cutoff + 1 = 4.
+    # At baseline: two modified units (a.py and c.py) contained the shingle.
+    # Current state: diff_files = ["a.py", "c.py"].
+    # Only one of those modified units (a.py) now contains the shingle (df_local = 1).
+    # Actual current df across corpus = 4 - 1 = 3 = cutoff.
+    # Under naive max(df_local, df_global) = max(1, 4) = 4 > 3 -> false-negative pruning.
+    # Under conservative candidate pruning:
+    # max_removals = len(diff_unit_indices) - df_local = 2 - 1 = 1.
+    # pruning_df = max(len(u_indices), df_global - max_removals) = max(2, 4 - 1) = 3 <= 3.
+    # Shingle is NOT pruned, detecting the clone between a.py and b.py.
+    calib_shingle_freqs = {_serialize_shingle_key(sh): 4 for sh in shingles}
+    corpus_calib = {
+        "total_units": 10,
+        "max_index_frequency": 0.35,
+        "min_corpus_size": 4,
+        "global_stop_shingles": [],
+        "shingle_frequencies": calib_shingle_freqs,
+    }
+
+    clones = scan_target(
+        str(repo),
+        diff_files=["a.py", "c.py"],
+        corpus_calibration=corpus_calib,
+        min_lines=3,
+        threshold=0.80,
+    )
+    assert len(clones) >= 1
+

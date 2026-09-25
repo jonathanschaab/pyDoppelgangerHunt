@@ -1190,8 +1190,19 @@ def scan_target(
             # additively, preventing artificial frequency inflation (double-counting) of shingles
             # present in modified files that were already indexed in the commit N baseline.
             combined_df = max(df_local, df_global)
+            if diff_unit_indices is not None:
+                # Conservative Candidate Pruning:
+                # In differential scans, modified units may have removed occurrences of shingle `sh`
+                # that were present at baseline. To guarantee calibration never suppresses a potentially
+                # valid clone candidate (preventing false negatives), pruning_df estimates the lower bound
+                # of current corpus DF by subtracting the maximum possible removals in modified units.
+                max_removals = max(len(diff_unit_indices) - df_local, 0)
+                pruning_df = max(len(u_indices), df_global - max_removals)
+            else:
+                pruning_df = combined_df
         else:
             combined_df = len(u_indices)
+            pruning_df = len(u_indices)
 
         is_novel = calib_freqs_map is not None and not is_global_shingle
 
@@ -1202,7 +1213,7 @@ def scan_target(
                     continue
                 potential_pairs = (df_local * (df_local - 1)) // 2 + df_local * df_unmodified
             else:
-                if effective_max_posting is not None and combined_df > effective_max_posting:
+                if effective_max_posting is not None and pruning_df > effective_max_posting:
                     continue
                 potential_pairs = (len(u_indices) * (len(u_indices) - 1)) // 2
             if potential_pairs > remaining_novel_pair_budget:
@@ -1213,7 +1224,7 @@ def scan_target(
                     remaining_novel_pair_budget,
                 )
                 continue
-        elif effective_max_posting is not None and combined_df > effective_max_posting:
+        elif effective_max_posting is not None and pruning_df > effective_max_posting:
             continue
 
         pairs_before = len(candidate_pairs) if is_novel else 0
@@ -1254,9 +1265,9 @@ def scan_target(
                     valid_calib_df = 0
             else:
                 valid_calib_df = 0
-            # Empirical calibration frequency estimation for TF-IDF weights (Replacement Model):
-            # Uses max(df, valid_calib_df) to prevent double-counting modified units that were
-            # already indexed in the global baseline.
+            # Empirical calibration frequency estimation for TF-IDF weights (Approximate Replacement Model):
+            # Uses max(df, valid_calib_df) to approximate current corpus document frequency without
+            # double-counting modified units that were already indexed in the global baseline.
             combined_df = max(df, valid_calib_df)
             try:
                 weight = math.log((1.0 + corpus_size) / (1.0 + combined_df)) + 1.0

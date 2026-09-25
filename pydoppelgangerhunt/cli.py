@@ -379,8 +379,10 @@ def _safe_call_git_diff_helper(
     """Invokes git diff helper function supporting optional repo_root parameter."""
     try:
         return fn(since_ref=since_ref, repo_root=repo_root)
-    except TypeError:
-        return fn(since_ref=since_ref)
+    except TypeError as exc:
+        if "repo_root" in str(exc) or "unexpected keyword" in str(exc):
+            return fn(since_ref=since_ref)
+        raise
 
 
 def _normalize_git_paths_for_target(
@@ -464,21 +466,13 @@ def _apply_baseline_and_diff_filters(
         if not os.path.exists(baseline_path):
             print(f"[ERROR] Baseline file '{baseline_path}' not found")
             return clones, 1
-        try:
-            prune_res = prune_baseline(
-                baseline_path,
-                clones,
-                repo_root=git_worktree_root,
-                target=target_val,
-                clone_basis="target_relative",
-            )
-        except TypeError:
-            try:
-                prune_res = prune_baseline(
-                    baseline_path, clones, repo_root=git_worktree_root, target=target_val
-                )
-            except TypeError:
-                prune_res = prune_baseline(baseline_path, clones)
+        prune_res = prune_baseline(
+            baseline_path,
+            clones,
+            repo_root=git_worktree_root,
+            target=target_val,
+            clone_basis="target_relative",
+        )
         pruned_count = prune_res[0]
         retained_count = prune_res[1]
         skipped_dirty = getattr(prune_res, "skipped_dirty_count", 0)
@@ -753,10 +747,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 else (os.path.dirname(target_arg) or ".")
             )
             if target_dir != ".":
-                try:
-                    tool_cfg = load_tool_config(repo_root=target_dir)
-                except TypeError:
-                    pass
+                tool_cfg = load_tool_config(repo_root=target_dir)
         if not tool_cfg:
             tool_cfg = load_tool_config()
     cfg_target = str(tool_cfg.get("target") or "")

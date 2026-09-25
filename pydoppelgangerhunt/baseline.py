@@ -1611,12 +1611,9 @@ def prune_baseline(
 
     if unstaged_modified_ranges is None:
         try:
-            try:
-                unstaged_modified_ranges = git_diff.get_git_modified_line_ranges(
-                    since_ref=None, repo_root=repo_root
-                )
-            except TypeError:
-                unstaged_modified_ranges = git_diff.get_git_modified_line_ranges(since_ref=None)
+            unstaged_modified_ranges = git_diff.get_git_modified_line_ranges(
+                since_ref=None, repo_root=repo_root
+            )
         except Exception as err:
             # Pragmatic fallback when git is unavailable, outside a repo, or query fails
             logger.debug(
