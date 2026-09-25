@@ -186,6 +186,8 @@ pydoppelgangerhunt --init
 | `--summary` | `PATH` | Path to write GitHub Step Summary Markdown report |
 | `--baseline` | `PATH` | Path to grandfathered baseline JSON file to suppress |
 | `--record-baseline` | `PATH` | Path to record detected clones into baseline JSON file |
+| `--prune-baseline` | Flag | Prune orphaned fingerprints from baseline JSON file |
+| `--min-calibration-frequency` | `INT` | Document frequency threshold to retain shingle in calibration (default: `1`; recommend $\ge 2$ for monorepos $>100\text{k}$ units) |
 | `--sliding-window` | Flag | Enable sliding statement window scanner |
 | `--harvest-closures` | Flag | Harvest nested closures and inner functions |
 | `--idioms` | Flag | Canonicalize Python idioms (loops, comprehensions, search loops) |
@@ -195,6 +197,13 @@ pydoppelgangerhunt --init
 | `--preserve-annotations`| Flag | Preserve PEP 484/526 type annotations (annotations stripped by default) |
 | `--max-index-frequency` | `FLOAT` | Inverted index frequency threshold to prune ubiquitous shingles (default: `0.25`) |
 | `--workers` | `INT` | Number of worker processes for parallel AST harvesting |
+
+### Baseline Calibration & Massive Monorepo Deployments
+
+When running differential scans in CI pipelines (`--diff-only --baseline baseline.json`), `pyDoppelgangerHunt` reuses pre-computed corpus calibration metadata (shingle frequencies and corpus size) from the recorded baseline to maintain exact IDF weighting and dynamic stop-shingle pruning bounds without re-scanning unchanged repository files.
+
+For massive monorepos (> 100k AST units), `compute_corpus_calibration` retains shingles across the entire codebase. By default, singleton shingles (appearing in only 1 unit) are indexed. Setting `--min-calibration-frequency 2` (or configuring `min_calibration_frequency = 2` in `pyproject.toml`) discards singleton shingles during `--record-baseline`, dramatically compressing baseline JSON file size and in-memory footprint while preserving identical stop-shingle pruning accuracy.
+
 
 ---
 

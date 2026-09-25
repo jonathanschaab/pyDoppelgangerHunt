@@ -1465,8 +1465,7 @@ def test_scan_target_diff_files_in_subdirectory(tmp_path: Path, monkeypatch: pyt
     )
     assert len(clones2) >= 1
 
-    # diff_files passed in Git CLI scenario: target="sub_pkg", repo_root="sub_pkg", diff_files=["sub_pkg/w1.py"]
-    # (Inside Git worktree `repo`, so git_root_resolved is `repo`)
+    # diff_files passed in Git CLI scenario: target="sub_pkg", auto-detecting Git worktree `repo`
     norm_repo = str(repo).replace("\\", "/")
     monkeypatch.setattr(
         "pydoppelgangerhunt.git_diff._run_git_command",
@@ -1478,7 +1477,6 @@ def test_scan_target_diff_files_in_subdirectory(tmp_path: Path, monkeypatch: pyt
     )
     clones3 = scan_target(
         str(sub),
-        repo_root=str(sub),
         diff_files=["sub_pkg/w1.py"],
         min_lines=3,
         threshold=0.80,
@@ -1515,10 +1513,10 @@ def test_scan_target_diff_files_single_file_target(
         ),
     )
 
-    # 1. Single file scan with repo_root as containing directory (CLI scenario)
+    # 1. Single file scan with explicit repo_root as Git worktree root
     clones = scan_target(
         str(target_file),
-        repo_root=str(src),
+        repo_root=str(repo),
         diff_files=["src/a.py"],
         min_lines=3,
         threshold=0.80,
@@ -1882,10 +1880,92 @@ def test_scan_target_explicit_repo_root_precedence(tmp_path: Path, monkeypatch: 
     assert calib_git.get("scope") != "subpkg/feature"
 
 
+def test_scan_target_explicit_repo_root_equals_target_dir_precedence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies explicit repo_root has precedence over git root even when repo_root equals target_dir."""
+    import pydoppelgangerhunt.matcher
+
+    repo = tmp_path / "outer_git_repo"
+    target_dir = repo / "subpkg"
+    target_dir.mkdir(parents=True)
+
+    f = target_dir / "worker.py"
+    f.write_text("def run():\n    pass\n", encoding="utf-8")
+
+    # Simulate running inside git repo `repo`
+    monkeypatch.setattr(pydoppelgangerhunt.matcher, "_resolve_git_root_path", lambda _: repo)
+
+    # 1. Calling scan_target with repo_root == target_dir
+    _, calib_explicit = scan_target(
+        str(target_dir),
+        repo_root=str(target_dir),
+        return_calibration=True,
+    )
+    # Target is at the root of the specified repository root, so scope must be None (not "subpkg")
+    assert calib_explicit.get("scope") is None
+
+    # 2. Calling scan_target with repo_root=None auto-detects git root `repo`
+    _, calib_auto = scan_target(
+        str(target_dir),
+        repo_root=None,
+        return_calibration=True,
+    )
+    # Scope must be "subpkg" relative to outer git repo
+    assert calib_auto.get("scope") == "subpkg"
 
 
+def test_scan_target_differential_calibration_replacement_model(tmp_path: Path) -> None:
+    """Verifies that differential scan uses replacement approximation max(df_local, df_global) preventing double-counting."""
+    from pydoppelgangerhunt.baseline import _serialize_shingle_key
+    from pydoppelgangerhunt.matcher import harvest_file_units
 
+    repo = tmp_path / "diff_repo"
+    repo.mkdir()
+    f1 = repo / "a.py"
+    f2 = repo / "b.py"
 
+    code1 = (
+        "def compute_alpha(a, b):\n"
+        "    res = a * 10 + b\n"
+        "    return res * 2\n"
+    )
+    code2 = (
+        "def compute_beta(a, b):\n"
+        "    res = a * 10 + b\n"
+        "    return res * 2\n"
+    )
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
 
+    # Harvest shingles of compute_alpha
+    units = harvest_file_units(str(f1), str(repo), min_lines=3)
+    assert len(units) >= 1
+    sample_unit = units[0]
+    shingles = sample_unit.get("shingles") or []
+    assert len(shingles) >= 1
 
+    # Calibrate: 10 units total, max_index_frequency = 0.35 -> max_posting_len = floor(10 * 0.35) = 3
+    # Set df_global = 3 for all shingles of the sample unit
+    calib_shingle_freqs = {_serialize_shingle_key(sh): 3 for sh in shingles}
+    corpus_calib = {
+        "total_units": 10,
+        "max_index_frequency": 0.35,
+        "min_corpus_size": 4,
+        "global_stop_shingles": [],
+        "shingle_frequencies": calib_shingle_freqs,
+    }
 
+    # Under replacement model:
+    # f1 is in diff_files, so df_local = 1.
+    # combined_df = max(df_local, df_global) = max(1, 3) = 3 <= 3 (retained, clone discovered!)
+    # Under old additive model:
+    # combined_df = 1 + 3 = 4 > 3 (would be pruned as ubiquitous, missing the clone!)
+    clones = scan_target(
+        str(repo),
+        diff_files=["a.py"],
+        corpus_calibration=corpus_calib,
+        min_lines=3,
+        threshold=0.80,
+    )
+    assert len(clones) >= 1

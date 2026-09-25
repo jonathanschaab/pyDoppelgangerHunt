@@ -158,7 +158,7 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         "--min-calibration-frequency",
         type=int,
         default=None,
-        help="Minimum corpus document frequency threshold to retain shingle in baseline calibration (default: 1)",
+        help="Minimum corpus document frequency threshold to retain shingle in baseline calibration (default: 1; recommend >= 2 for monorepos > 100k units to prune singleton shingles and compress baseline JSON)",
     )
     parser.add_argument(
         "--method-binding",
@@ -499,18 +499,13 @@ def _apply_baseline_and_diff_filters(
             base_fps = preloaded_baseline
         else:
             base_fps = load_baseline(baseline_path)
-        try:
-            clones, suppressed_count = filter_clones_by_baseline(
-                clones,
-                base_fps,
-                repo_root=git_worktree_root,
-                target=target_val,
-                clone_basis="target_relative",
-            )
-        except TypeError:
-            clones, suppressed_count = filter_clones_by_baseline(
-                clones, base_fps, repo_root=git_worktree_root, target=target_val
-            )
+        clones, suppressed_count = filter_clones_by_baseline(
+            clones,
+            base_fps,
+            repo_root=git_worktree_root,
+            target=target_val,
+            clone_basis="target_relative",
+        )
         if args.format == "text":
             print(f"[BASELINE] Suppressed {suppressed_count} grandfathered clone(s). {len(clones)} un-grandfathered clone(s) remaining.")
 
@@ -1014,7 +1009,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     scan_res = scan_target(
         target,
-        repo_root=target_repo_root,
+        repo_root=git_worktree_root,
         diff_files=diff_files,
         min_lines=min_lines,
         min_tokens=min_tokens,
@@ -1113,25 +1108,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
 
     if args.record_baseline:
-        try:
-            bp = record_baseline(
-                clones,
-                args.record_baseline,
-                target,
-                threshold,
-                corpus_calibration=recorded_calib,
-                repo_root=git_worktree_root,
-                clone_basis="target_relative",
-            )
-        except TypeError:
-            bp = record_baseline(
-                clones,
-                args.record_baseline,
-                target,
-                threshold,
-                corpus_calibration=recorded_calib,
-                repo_root=git_worktree_root,
-            )
+        bp = record_baseline(
+            clones,
+            args.record_baseline,
+            target,
+            threshold,
+            corpus_calibration=recorded_calib,
+            repo_root=git_worktree_root,
+            clone_basis="target_relative",
+        )
         print(f"[OK] Recorded {len(clones)} clone baseline pair(s) to {bp}")
         return 0
 

@@ -984,10 +984,11 @@ def scan_target(
                 )
             )
 
-    if repo_root is not None and effective_repo_root != target_root_dir:
-        effective_repo = effective_repo_root
-    else:
-        effective_repo = git_root_resolved or effective_repo_root
+    effective_repo = (
+        effective_repo_root
+        if repo_root is not None
+        else (git_root_resolved or effective_repo_root)
+    )
     resolver = CanonicalPathResolver(target_root=target_root_dir, repo_root=effective_repo)
 
     diff_unit_indices: Optional[Set[int]] = None
@@ -1074,13 +1075,10 @@ def scan_target(
     if tfidf and units:
         if corpus_calibration is not None:
             calib_units_tfidf = _safe_total_units(corpus_calibration.get("total_units"))
-            if diff_unit_indices is not None:
-                local_units_count = len(diff_unit_indices)
-                corpus_size = local_units_count + calib_units_tfidf
-                active_indices: Union[Set[int], range] = diff_unit_indices
-            else:
-                corpus_size = max(len(units), calib_units_tfidf)
-                active_indices = range(len(units))
+            corpus_size = max(len(units), calib_units_tfidf)
+            active_indices: Union[Set[int], range] = (
+                diff_unit_indices if diff_unit_indices is not None else range(len(units))
+            )
         else:
             corpus_size = len(units)
             active_indices = range(len(units))
@@ -1131,11 +1129,7 @@ def scan_target(
     active_max_freq = _safe_index_frequency(max_index_frequency)
     if corpus_calibration is not None:
         calib_units = _safe_total_units(corpus_calibration.get("total_units"))
-        if diff_unit_indices is not None:
-            local_units_count = len(diff_unit_indices)
-            total_corpus_units = local_units_count + calib_units
-        else:
-            total_corpus_units = max(len(units), calib_units)
+        total_corpus_units = max(len(units), calib_units)
         calib_freqs_raw = corpus_calibration.get("shingle_frequencies")
         calib_freqs_map = (
             calib_freqs_raw if isinstance(calib_freqs_raw, dict) else None
@@ -1188,19 +1182,14 @@ def scan_target(
                     df_global = 0
             else:
                 df_global = 0
-            # Calibration Frequency Approximation:
-            # combined_df combines global baseline calibration frequency with local scan counts.
-            # In differential scans (diff_unit_indices is not None), combined_df = df_global + df_local
-            # treats the modified diff units as an additive delta over the global corpus.
-            # In full scans, combined_df = max(df_local, df_global) reconciles local unit counts
-            # with pre-calibrated baseline frequencies.
-            # This is an empirical estimator that balances memory and performance without requiring
-            # a full re-scan of untouched repository files, but may slightly over- or under-prune
-            # shingle postings compared to a fresh, global re-indexing of the entire codebase.
-            if diff_unit_indices is not None:
-                combined_df = df_global + df_local
-            else:
-                combined_df = max(df_local, df_global)
+            # Calibration Frequency Approximation (Replacement Model):
+            # combined_df reconciles global baseline calibration frequency with local scan counts.
+            # We use max(df_local, df_global) across both full scans and differential scans
+            # (where diff_unit_indices is not None). This replacement approximation models modified
+            # units as updating/replacing their baseline counterparts rather than summing them
+            # additively, preventing artificial frequency inflation (double-counting) of shingles
+            # present in modified files that were already indexed in the commit N baseline.
+            combined_df = max(df_local, df_global)
         else:
             combined_df = len(u_indices)
 
@@ -1265,11 +1254,10 @@ def scan_target(
                     valid_calib_df = 0
             else:
                 valid_calib_df = 0
-            # Empirical calibration frequency estimation for TF-IDF weights:
-            if diff_unit_indices is not None:
-                combined_df = df + valid_calib_df
-            else:
-                combined_df = max(df, valid_calib_df)
+            # Empirical calibration frequency estimation for TF-IDF weights (Replacement Model):
+            # Uses max(df, valid_calib_df) to prevent double-counting modified units that were
+            # already indexed in the global baseline.
+            combined_df = max(df, valid_calib_df)
             try:
                 weight = math.log((1.0 + corpus_size) / (1.0 + combined_df)) + 1.0
                 idf_weights[k] = max(0.0, weight)
