@@ -2258,6 +2258,27 @@ def test_paths_match_boundary_notebook_anchors_default() -> None:
     assert not paths_match_boundary("report#1.py", "report#2.py")
 
 
+def test_cli_warns_on_conflicting_strip_and_preserve_flags(tmp_path: Path, capsys: Any) -> None:
+    """Verifies that CLI warns when both strip and preserve flags are supplied and prioritizes preserve."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    target_file = tmp_path / "sample.py"
+    target_file.write_text("x: int = 1\n", encoding="utf-8")
+
+    # 1. Conflicting annotations flags
+    code = main([str(target_file), "--strip-annotations", "--preserve-annotations"])
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "Conflicting flags --strip-annotations and --preserve-annotations specified" in captured.err
+
+    # 2. Conflicting docstring flags
+    code_doc = main([str(target_file), "--strip-docstrings", "--preserve-docstrings"])
+    assert code_doc == 0
+    captured_doc = capsys.readouterr()
+    assert "Conflicting flags --strip-docstrings and --preserve-docstrings specified" in captured_doc.err
+
+
+
 
 
 

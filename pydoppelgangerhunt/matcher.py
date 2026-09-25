@@ -24,6 +24,7 @@ from pydoppelgangerhunt.baseline import (
     HARVEST_BOOLEAN_MODES,
     _safe_bool,
     _safe_index_frequency,
+    _safe_int,
     _safe_min_corpus,
     _safe_total_units,
     compute_calibration_config_hash,
@@ -688,6 +689,7 @@ def _is_calibration_mode_compatible(
     include_notebooks: bool = False,
     max_index_frequency: Optional[float] = 0.25,
     min_corpus_size: Optional[int] = None,
+    min_frequency: int = 1,
     excludes: Optional[Sequence[str]] = None,
     target_scope: Optional[str] = None,
     **kwargs: Any,
@@ -714,6 +716,7 @@ def _is_calibration_mode_compatible(
                 "include_notebooks": include_notebooks,
                 "max_index_frequency": max_index_frequency,
                 "min_corpus_size": effective_mcs,
+                "min_frequency": min_frequency,
                 "excludes": clean_active_ex,
                 "scope": target_scope,
             })
@@ -760,6 +763,14 @@ def _is_calibration_mode_compatible(
     if calib_freq is not None and active_freq is not None:
         if not math.isclose(calib_freq, active_freq, rel_tol=1e-9, abs_tol=1e-12):
             return False
+
+    calib_min_frequency = (
+        _safe_int(calib.get("min_frequency") or calib.get("min_calibration_frequency"), min_val=1)
+        or 1
+    )
+    active_min_frequency = _safe_int(min_frequency, min_val=1) or 1
+    if calib_min_frequency != active_min_frequency:
+        return False
 
     for flag, default_val in HARVEST_BOOLEAN_MODES:
         scan_val = kwargs.get(flag, default_val)
@@ -973,7 +984,10 @@ def scan_target(
                 )
             )
 
-    effective_repo = git_root_resolved or effective_repo_root
+    if repo_root is not None and effective_repo_root != target_root_dir:
+        effective_repo = effective_repo_root
+    else:
+        effective_repo = git_root_resolved or effective_repo_root
     resolver = CanonicalPathResolver(target_root=target_root_dir, repo_root=effective_repo)
 
     diff_unit_indices: Optional[Set[int]] = None
@@ -1034,6 +1048,7 @@ def scan_target(
         min_corpus_size=min_corpus_size,
         excludes=excludes,
         target_scope=resolver.target_in_repo,
+        min_frequency=effective_min_freq,
         **harvest_mode_opts,
     ):
         corpus_calibration = None
@@ -1173,6 +1188,15 @@ def scan_target(
                     df_global = 0
             else:
                 df_global = 0
+            # Calibration Frequency Approximation:
+            # combined_df combines global baseline calibration frequency with local scan counts.
+            # In differential scans (diff_unit_indices is not None), combined_df = df_global + df_local
+            # treats the modified diff units as an additive delta over the global corpus.
+            # In full scans, combined_df = max(df_local, df_global) reconciles local unit counts
+            # with pre-calibrated baseline frequencies.
+            # This is an empirical estimator that balances memory and performance without requiring
+            # a full re-scan of untouched repository files, but may slightly over- or under-prune
+            # shingle postings compared to a fresh, global re-indexing of the entire codebase.
             if diff_unit_indices is not None:
                 combined_df = df_global + df_local
             else:
@@ -1241,6 +1265,7 @@ def scan_target(
                     valid_calib_df = 0
             else:
                 valid_calib_df = 0
+            # Empirical calibration frequency estimation for TF-IDF weights:
             if diff_unit_indices is not None:
                 combined_df = df + valid_calib_df
             else:
@@ -1282,6 +1307,12 @@ def scan_target(
     )
 
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
+    # Determinism vs Scaling Rationale:
+    # candidate_pairs is explicitly sorted by (i, j) index tuples to guarantee 100% deterministic,
+    # reproducible clone detection orders across OS platforms, Python hash seeds, and thread scheduling.
+    # While sorting O(P log P) introduces minor overhead for very large pair sets, P is bounded by
+    # index posting limits and the novel shingle budget, making deterministic ordering paramount
+    # for baseline fingerprint stability and differential CI test reproducibility.
     for i, j in sorted(candidate_pairs):
         u1, u2 = units[i], units[j]
 

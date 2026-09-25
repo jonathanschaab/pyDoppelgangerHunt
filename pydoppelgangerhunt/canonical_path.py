@@ -44,9 +44,7 @@ def normalize_lexical_posix(path_str: Optional[str], strip_anchor: bool = False)
             fname, fragment = last_seg.rsplit("#", 1)
             fname_lower = fname.lower()
             frag_lower = fragment.lower()
-            if fname_lower.endswith(".ipynb") and (
-                frag_lower.startswith("cell_") or frag_lower.startswith("cell")
-            ):
+            if fname_lower.endswith(".ipynb") and frag_lower.startswith("cell"):
                 raw = raw[: len(raw) - len(fragment) - 1]
 
     norm = raw.replace("\\", "/")
@@ -340,7 +338,7 @@ class CanonicalPathResolver:
             Resolved CanonicalPath.
         """
         if isinstance(path, CanonicalPath):
-            if not strip_anchor or not (path.raw and "#" in path.raw):
+            if basis == "auto" and (not strip_anchor or not (path.raw and "#" in path.raw)):
                 return path
             path = path.raw
 
@@ -499,12 +497,21 @@ class CanonicalPathResolver:
     ) -> bool:
         """Determines whether two paths refer to the same file in this resolver's scope.
 
-        Checks:
-        1. target_relative equivalence
-        2. repo_relative equivalence
-        3. absolute_lexical equivalence
-        4. physical resolution (if both files exist on disk)
-        5. optional boundary suffix matching (for legacy unanchored baseline strings)
+        Evaluation order:
+        1. target_relative equivalence (lexical)
+        2. repo_relative equivalence (lexical)
+        3. absolute_lexical equivalence (lexical)
+        4. Physical resolution fallback if files exist on disk:
+           Walks upwards from target_root to repo_root checking for physical existence,
+           then compares resolved inode/canonical symlink targets via .resolve().
+           Note: Directory walking involves filesystem I/O only for relative paths when
+           the file is not found directly under target_root or repo_root.
+        5. Boundary suffix fallback (approximate compatibility fallback):
+           When allow_suffix_fallback=True (default), permits matching unanchored legacy
+           baseline paths or suffix-only strings. Note that suffix matching is inherently
+           heuristic/approximate and may yield false positives if two distinct files share
+           identical subpath suffixes across different module packages. Set allow_suffix_fallback=False
+           for strict canonical boundary isolation.
         """
         s_a = str(path_a or "").rstrip("\r\n")
         s_b = str(path_b or "").rstrip("\r\n")
@@ -637,9 +644,7 @@ class CanonicalPathResolver:
                 last_seg = raw_str.replace("\\", "/").rsplit("/", 1)[-1]
                 if "#" in last_seg:
                     fname, fragment = last_seg.rsplit("#", 1)
-                    if fname.lower().endswith(".ipynb") and (
-                        fragment.lower().startswith("cell_") or fragment.lower().startswith("cell")
-                    ):
+                    if fname.lower().endswith(".ipynb") and fragment.lower().startswith("cell"):
                         return self._probe_keys_in_diff(
                             self.target_key(unit_file, basis=basis, strip_anchor=True),
                             self.repo_key(unit_file, basis=basis, strip_anchor=True),

@@ -554,3 +554,34 @@ def test_resolver_raw_lexical_root_symlink_fallback(tmp_path: Path) -> None:
     cp = resolver.resolve(deleted_abs_symlink)
     assert cp.target_relative == "deleted_file.py"
     assert cp.repo_relative == "deleted_file.py"
+
+
+def test_resolver_re_resolve_canonical_path_with_explicit_basis(tmp_path: Path) -> None:
+    """Verifies that re-resolving an existing CanonicalPath with an explicit basis re-evaluates coordinates."""
+    repo = tmp_path / "repo"
+    pkg = repo / "pkg"
+    pkg.mkdir(parents=True)
+
+    resolver = CanonicalPathResolver(target_root=pkg, repo_root=repo)
+
+    # 1. Resolve with default basis="auto" (treated as target-relative)
+    cp_auto = resolver.resolve("worker.py", basis="auto")
+    assert cp_auto.target_relative == "worker.py"
+    assert cp_auto.repo_relative == "pkg/worker.py"
+
+    # 2. Re-resolve the CanonicalPath instance with basis="repo"
+    cp_repo = resolver.resolve(cp_auto, basis="repo")
+    assert cp_repo.repo_relative == "worker.py"
+    assert cp_repo.target_relative is None
+
+    # 3. Passing CanonicalPath with basis="auto" and no anchor returns same instance (fast-path)
+    cp_cached = resolver.resolve(cp_auto, basis="auto")
+    assert cp_cached is cp_auto
+
+    # 4. Passing anchored CanonicalPath with strip_anchor=True extracts raw and strips anchor
+    cp_anchored = resolver.resolve("notebook.ipynb#cell_3", basis="auto")
+    assert "#cell_3" in cp_anchored.raw
+    cp_stripped = resolver.resolve(cp_anchored, basis="auto", strip_anchor=True)
+    assert cp_stripped.target_relative == "notebook.ipynb"
+    assert cp_stripped.repo_relative == "pkg/notebook.ipynb"
+    assert cp_stripped.raw == "notebook.ipynb#cell_3"

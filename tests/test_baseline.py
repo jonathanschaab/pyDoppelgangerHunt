@@ -5329,6 +5329,109 @@ def test_compute_calibration_config_hash_min_frequency() -> None:
     assert hash_alias == hash_freq2
 
 
+def test_is_calibration_mode_compatible_min_frequency_fallback() -> None:
+    """Verifies that _is_calibration_mode_compatible rejects mismatched min_frequency on fallback path."""
+    from pydoppelgangerhunt.matcher import _is_calibration_mode_compatible  # pylint: disable=import-outside-toplevel
+
+    # Unhashed or legacy calibration with min_frequency=2
+    calib_freq2 = {
+        "bag_of_tokens": False,
+        "call_sequences": False,
+        "filter_stop_shingles": False,
+        "audit_tests": False,
+        "include_notebooks": False,
+        "max_index_frequency": 0.25,
+        "min_frequency": 2,
+    }
+
+    # Compatible when active scan also specifies min_frequency=2
+    assert _is_calibration_mode_compatible(calib_freq2, min_frequency=2) is True
+
+    # Incompatible when active scan runs with default min_frequency=1
+    assert _is_calibration_mode_compatible(calib_freq2, min_frequency=1) is False
+
+    # Unhashed calibration with default min_frequency=1
+    calib_freq1 = {
+        "bag_of_tokens": False,
+        "call_sequences": False,
+        "filter_stop_shingles": False,
+        "audit_tests": False,
+        "include_notebooks": False,
+        "max_index_frequency": 0.25,
+        "min_frequency": 1,
+    }
+    assert _is_calibration_mode_compatible(calib_freq1, min_frequency=1) is True
+    assert _is_calibration_mode_compatible(calib_freq1, min_frequency=2) is False
+
+
+def test_match_clone_record_pass5_heuristics_and_adversarial_ordering() -> None:
+    """Verifies that _match_clone_record honors pass precedence and Pass 5 heuristics."""
+    from pydoppelgangerhunt.baseline import _match_clone_record  # pylint: disable=import-outside-toplevel
+
+    # Pass 5 candidate: cross-namespace, distinct hashes (h1 != h2), matching names
+    rec_pass5 = {
+        "pure_structural_fingerprint": "hash_alpha <===> hash_beta",
+        "hash_a": "hash_alpha",
+        "hash_b": "hash_beta",
+        "namespace_a": "pkg_old",
+        "namespace_b": "pkg_old",
+        "name_a": "worker_func",
+        "name_b": "worker_func",
+    }
+
+    # Pass 3 candidate: same namespace (pkg_new), matching namespaced structural fingerprint
+    rec_pass3 = {
+        "namespaced_structural_fingerprint": "pkg_new#hash_alpha <===> pkg_new#hash_beta",
+        "pure_structural_fingerprint": "hash_alpha <===> hash_beta",
+        "hash_a": "hash_alpha",
+        "hash_b": "hash_beta",
+        "namespace_a": "pkg_new",
+        "namespace_b": "pkg_new",
+        "name_a": "worker_func",
+        "name_b": "worker_func",
+    }
+
+    # Query keys matching pkg_new namespace and hash_alpha / hash_beta
+    query_keys = {
+        "fp": "nomatch",
+        "sfp": "nomatch",
+        "ns_sfp": "pkg_new#hash_alpha <===> pkg_new#hash_beta",
+        "pure_sfp": "hash_alpha <===> hash_beta",
+        "namespaces": ["pkg_new", "pkg_new"],
+        "names": ["worker_func", "worker_func"],
+    }
+
+    # 1. Adversarial ordering: rec_pass5 appears first, but rec_pass3 must win due to Pass 3 priority
+    matched = _match_clone_record(query_keys, [rec_pass5, rec_pass3])
+    assert matched is rec_pass3
+
+    # 2. When Pass 3 is absent, Pass 5 matches cross-namespace moved clone because hashes are distinct
+    matched_cross = _match_clone_record(query_keys, [rec_pass5])
+    assert matched_cross is rec_pass5
+
+    # 3. Pass 5 rejects cross-namespace matching when structural hashes are identical (h_a == h_b boilerplate)
+    rec_boilerplate = {
+        "pure_structural_fingerprint": "hash_dup <===> hash_dup",
+        "hash_a": "hash_dup",
+        "hash_b": "hash_dup",
+        "namespace_a": "other_pkg",
+        "namespace_b": "other_pkg",
+        "name_a": "worker_func",
+        "name_b": "worker_func",
+    }
+    query_boilerplate = {
+        "fp": "nomatch",
+        "sfp": "nomatch",
+        "ns_sfp": "target_pkg#hash_dup <===> target_pkg#hash_dup",
+        "pure_sfp": "hash_dup <===> hash_dup",
+        "namespaces": ["target_pkg", "target_pkg"],
+        "names": ["worker_func", "worker_func"],
+    }
+    matched_boiler = _match_clone_record(query_boilerplate, [rec_boilerplate])
+    assert matched_boiler is None
+
+
+
 
 
 

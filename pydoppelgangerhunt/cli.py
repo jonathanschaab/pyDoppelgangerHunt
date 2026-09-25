@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 from pathlib import Path
 import sys
@@ -58,6 +59,8 @@ from pydoppelgangerhunt.reporters import (
     supports_color,
     synthesize_refactoring_suggestion,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
@@ -666,11 +669,36 @@ def _resolve_strip_option(
     preserve_name: str,
 ) -> bool:
     """Resolves strip/preserve boolean flags with precedence: CLI preserve -> CLI strip -> config -> calibration -> default."""
-    if getattr(args, preserve_name, None):
-        return False
+    cli_preserve = getattr(args, preserve_name, None)
     cli_strip = getattr(args, strip_name, None)
+    if cli_preserve and cli_strip:
+        flag_strip = "--" + strip_name.replace("_", "-")
+        flag_preserve = "--" + preserve_name.replace("_", "-")
+        logger.warning(
+            "Conflicting flags %s and %s specified; precedence given to %s",
+            flag_strip,
+            flag_preserve,
+            flag_preserve,
+        )
+        print(
+            f"Warning: Conflicting flags {flag_strip} and {flag_preserve} specified; precedence given to {flag_preserve}.",
+            file=sys.stderr,
+        )
+    if cli_preserve:
+        return False
     if cli_strip is not None:
         return bool(cli_strip)
+    if has_explicit_cfg and strip_name in tool_cfg and preserve_name in tool_cfg:
+        logger.warning(
+            "Conflicting configuration keys '%s' and '%s' specified in pyproject.toml; precedence given to '%s'",
+            strip_name,
+            preserve_name,
+            strip_name,
+        )
+        print(
+            f"Warning: Conflicting configuration keys '{strip_name}' and '{preserve_name}' specified in pyproject.toml; precedence given to '{strip_name}'.",
+            file=sys.stderr,
+        )
     if has_explicit_cfg and strip_name in tool_cfg:
         return bool(tool_cfg[strip_name])
     if has_explicit_cfg and preserve_name in tool_cfg:

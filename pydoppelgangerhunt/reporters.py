@@ -108,9 +108,7 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
                 fname, fragment = last_seg.rsplit("#", 1)
                 fname_lower = fname.lower()
                 frag_lower = fragment.lower()
-                if fname_lower.endswith(".ipynb") and (
-                    frag_lower.startswith("cell_") or frag_lower.startswith("cell")
-                ):
+                if fname_lower.endswith(".ipynb") and frag_lower.startswith("cell"):
                     prefix = "cell_" if frag_lower.startswith("cell_") else "cell"
                     suffix = frag_lower[len(prefix) :]
                     if suffix.isdigit():

@@ -1848,6 +1848,40 @@ def test_novel_shingle_pair_budget_visibility(tmp_path: Path, monkeypatch: Any, 
     assert any("Novel shingle pair budget reached" in record.message for record in caplog.records)
 
 
+def test_scan_target_explicit_repo_root_precedence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that scan_target respects explicit repo_root over auto-detected git root."""
+    import pydoppelgangerhunt.matcher
+
+    custom_root = tmp_path / "custom_root"
+    target_dir = custom_root / "subpkg" / "feature"
+    target_dir.mkdir(parents=True)
+
+    fake_git_root = tmp_path / "fake_git"
+    fake_git_root.mkdir()
+
+    f = target_dir / "worker.py"
+    f.write_text("def run():\n    pass\n", encoding="utf-8")
+
+    # Mock _resolve_git_root_path to simulate running inside a git repository
+    monkeypatch.setattr(pydoppelgangerhunt.matcher, "_resolve_git_root_path", lambda _: fake_git_root)
+
+    # 1. Calling scan_target with explicit repo_root must prioritize custom_root
+    _, calib_custom = scan_target(
+        str(target_dir),
+        repo_root=str(custom_root),
+        return_calibration=True,
+    )
+    assert calib_custom.get("scope") == "subpkg/feature"
+
+    # 2. Calling scan_target without repo_root falls back to git root
+    _, calib_git = scan_target(
+        str(target_dir),
+        return_calibration=True,
+    )
+    # Target is outside fake_git_root so scope is target directory itself or resolved relative
+    assert calib_git.get("scope") != "subpkg/feature"
+
+
 
 
 

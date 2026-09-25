@@ -1252,3 +1252,37 @@ def test_normalize_git_paths_deduplicates_while_preserving_order(tmp_path: Path)
     norm_paths = _normalize_git_paths_for_target(raw_paths, str(repo), str(pkg))
     assert norm_paths == ["pkg/a.py", "pkg/b.py", "pkg/c.py"]
 
+
+def test_decode_git_cstyle_path_backslashes_and_astral_emojis() -> None:
+    """Stress tests _decode_git_cstyle_path with escaped backslashes, mixed slashes, and astral plane emojis."""
+    from pydoppelgangerhunt.git_diff import _decode_git_cstyle_path  # pylint: disable=import-outside-toplevel
+
+    # 1. Unquoted Windows backslashes
+    assert _decode_git_cstyle_path(r"pkg\sub\worker.py") == r"pkg\sub\worker.py"
+
+    # 2. Quoted escaped backslashes
+    assert _decode_git_cstyle_path(r'"pkg\\sub\\worker.py"') == r"pkg\sub\worker.py"
+    assert _decode_git_cstyle_path(r'"pkg\\\\worker.py"') == r"pkg\\worker.py"
+    assert _decode_git_cstyle_path(r'"src/pkg\\sub/file.py"') == r"src/pkg\sub/file.py"
+
+    # 3. 4-byte astral plane emojis via octal escapes (e.g. core.quotepath = true default)
+    # Rocket emoji 🚀 (U+1F680): \xf0\x9f\x9a\x80 -> \360\237\232\200
+    p_rocket = r'"pkg/\360\237\232\200_launch.py"'
+    assert _decode_git_cstyle_path(p_rocket) == "pkg/🚀_launch.py"
+
+    # Snake emoji 🐍 (U+1F40D): \xf0\x9f\x90\x8d -> \360\237\220\215
+    p_snake = r'"src/\360\237\220\215.py"'
+    assert _decode_git_cstyle_path(p_snake) == "src/🐍.py"
+
+    # Sparkles emoji ✨ (U+2728): \xe2\x9c\xa8 -> \342\234\250
+    p_sparkles = r'"tests/\342\234\250_test.py"'
+    assert _decode_git_cstyle_path(p_sparkles) == "tests/✨_test.py"
+
+    # 4. Quoted literal UTF-8 astral plane emoji (core.quotepath = false)
+    assert _decode_git_cstyle_path('"pkg/🚀_launch.py"') == "pkg/🚀_launch.py"
+
+    # 5. Combined literal Unicode + escaped backslash + octal emoji
+    p_combo = r'"café/\360\237\232\200\\worker.py"'
+    assert _decode_git_cstyle_path(p_combo) == "café/🚀\\worker.py"
+
+
