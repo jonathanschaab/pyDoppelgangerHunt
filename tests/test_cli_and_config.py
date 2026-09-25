@@ -2278,14 +2278,76 @@ def test_cli_warns_on_conflicting_strip_and_preserve_flags(tmp_path: Path, capsy
     assert "Conflicting flags --strip-docstrings and --preserve-docstrings specified" in captured_doc.err
 
 
+def test_resolve_effective_config_precedence_and_calibration_export() -> None:
+    """Verifies that _resolve_effective_config properly handles precedence hierarchy and calibration dict export."""
+    from pydoppelgangerhunt.cli import (  # pylint: disable=import-outside-toplevel
+        build_arg_parser,
+        _resolve_effective_config,
+    )
 
+    parser = build_arg_parser()
 
+    # 1. Defaults with empty tool_cfg and empty calib_dict
+    args = parser.parse_args([])
+    eff = _resolve_effective_config(args, tool_cfg={}, calib_dict={})
+    assert eff.min_lines == 8
+    assert eff.min_tokens == 15
+    assert eff.window_size == 5
+    assert eff.min_expr_complexity == 4
+    assert eff.min_frequency == 1
+    assert eff.max_index_frequency == 0.25
+    assert not eff.call_sequences
+    assert not eff.audit_tests
+    assert not eff.idioms
+    assert not eff.stop_shingles
 
+    # 2. Calibration inheritance when CLI and tool_cfg are absent
+    calib = {
+        "min_lines": 14,
+        "min_tokens": 25,
+        "window_size": 7,
+        "min_expr_complexity": 6,
+        "min_frequency": 3,
+        "max_index_frequency": 0.12,
+        "excludes": ["custom_calib_exclude"],
+        "call_sequences": True,
+        "audit_tests": True,
+        "idioms": True,
+        "filter_stop_shingles": True,
+    }
+    args_calib = parser.parse_args([])
+    eff_calib = _resolve_effective_config(args_calib, tool_cfg={}, calib_dict=calib)
+    assert eff_calib.min_lines == 14
+    assert eff_calib.min_tokens == 25
+    assert eff_calib.window_size == 7
+    assert eff_calib.min_expr_complexity == 6
+    assert eff_calib.min_frequency == 3
+    assert eff_calib.max_index_frequency == 0.12
+    assert "custom_calib_exclude" in eff_calib.excludes
+    assert eff_calib.call_sequences
+    assert eff_calib.audit_tests
+    assert eff_calib.idioms
+    assert eff_calib.stop_shingles
 
+    # 3. CLI override takes highest precedence
+    args_override = parser.parse_args([
+        "--min-lines",
+        "22",
+        "--min-calibration-frequency",
+        "5",
+        "--call-sequences",
+        "--no-idioms",
+    ])
+    eff_override = _resolve_effective_config(args_override, tool_cfg={"min_lines": 18}, calib_dict=calib)
+    assert eff_override.min_lines == 22
+    assert eff_override.min_frequency == 5
+    assert eff_override.call_sequences
+    assert not eff_override.idioms
 
-
-
-
-
-
-
+    # 4. to_calibration_config export
+    calib_export = eff_override.to_calibration_config(args_override, scope="sub/pkg")
+    assert calib_export["min_lines"] == 22
+    assert calib_export["min_frequency"] == 5
+    assert calib_export["call_sequences"] is True
+    assert calib_export["idioms"] is False
+    assert calib_export["scope"] == "sub/pkg"

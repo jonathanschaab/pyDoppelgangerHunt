@@ -1182,14 +1182,6 @@ def scan_target(
                     df_global = 0
             else:
                 df_global = 0
-            # Calibration Frequency Approximation (Replacement Model):
-            # combined_df reconciles global baseline calibration frequency with local scan counts.
-            # We use max(df_local, df_global) across both full scans and differential scans
-            # (where diff_unit_indices is not None). This replacement approximation models modified
-            # units as updating/replacing their baseline counterparts rather than summing them
-            # additively, preventing artificial frequency inflation (double-counting) of shingles
-            # present in modified files that were already indexed in the commit N baseline.
-            combined_df = max(df_local, df_global)
             if diff_unit_indices is not None:
                 # Conservative Candidate Pruning:
                 # In differential scans, modified units may have removed occurrences of shingle `sh`
@@ -1199,9 +1191,12 @@ def scan_target(
                 max_removals = max(len(diff_unit_indices) - df_local, 0)
                 pruning_df = max(len(u_indices), df_global - max_removals)
             else:
+                # Full-Scan Candidate Pruning (Replacement Model):
+                # combined_df reconciles global baseline calibration frequency with local scan counts
+                # without double-counting (only used for full-scan pruning).
+                combined_df = max(df_local, df_global)
                 pruning_df = combined_df
         else:
-            combined_df = len(u_indices)
             pruning_df = len(u_indices)
 
         is_novel = calib_freqs_map is not None and not is_global_shingle
