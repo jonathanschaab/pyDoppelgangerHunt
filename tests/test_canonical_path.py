@@ -1007,3 +1007,16 @@ def test_parse_notebook_cell_anchor_canonical_path_object_transparency(tmp_path:
     assert parse_notebook_cell_anchor(cp_literal) is None
 
 
+def test_resolve_coordinate_diff_keys_extracts_from_diff_path_key_set(tmp_path: Path) -> None:
+    """Verifies that _resolve_coordinate_diff_keys extracts dt_keys and dr_keys from DiffPathKeySet."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    resolver = CanonicalPathResolver(target_root=repo)
+    keys = DiffPathKeySet(["target:foo.py", "repo:src/foo.py"])
+    dt_keys, dr_keys = resolver._resolve_coordinate_diff_keys(keys, None, None)
+    assert dt_keys is keys.diff_target_keys
+    assert dr_keys is keys.diff_repo_keys
+    assert dt_keys == {"foo.py"}
+    assert dr_keys == {"src/foo.py"}
+
+

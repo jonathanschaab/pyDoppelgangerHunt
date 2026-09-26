@@ -5782,5 +5782,34 @@ def test_match_clone_record_pass1_derives_missing_structural_fingerprint() -> No
     assert matched is rec_legacy
 
 
+def test_record_baseline_flat_dictionary_records(tmp_path: Path) -> None:
+    """Verifies that record_baseline correctly extracts file_a/b, name_a/b, and hash_a/b from flat dict records."""
+    import json
+    from pydoppelgangerhunt.baseline import record_baseline  # pylint: disable=import-outside-toplevel
 
+    baseline_file = tmp_path / "baseline.json"
+    flat_record = {
+        "similarity": 0.95,
+        "file_a": "pkg/mod_a.py",
+        "file_b": "pkg/mod_b.py",
+        "name_a": "compute_metric",
+        "name_b": "calculate_metric",
+        "hash_a": "aaaa1111bbbb2222",
+        "hash_b": "cccc3333dddd4444",
+    }
+    record_baseline([flat_record], str(baseline_file), target=str(tmp_path), threshold=0.85)
+
+    data = json.loads(baseline_file.read_text(encoding="utf-8"))
+    assert data["clone_count"] == 1
+    fp_rec = data["fingerprints"][0]
+    assert fp_rec["file_a"] == "pkg/mod_a.py"
+    assert fp_rec["file_b"] == "pkg/mod_b.py"
+    assert fp_rec["name_a"] == "compute_metric"
+    assert fp_rec["name_b"] == "calculate_metric"
+    assert fp_rec["hash_a"] == "aaaa1111bbbb2222"
+    assert fp_rec["hash_b"] == "cccc3333dddd4444"
+    assert "pkg/mod_a.py:compute_metric" in fp_rec["fingerprint"]
+    assert "pkg/mod_b.py:calculate_metric" in fp_rec["fingerprint"]
+    assert "pkg/mod_a.py#aaaa1111bbbb2222" in fp_rec["structural_fingerprint"]
+    assert "pkg/mod_b.py#cccc3333dddd4444" in fp_rec["structural_fingerprint"]
 

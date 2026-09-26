@@ -46,11 +46,9 @@ class DiffRangeMap(Dict[str, List[Tuple[int, int]]]):
         if unit_basis == "repo" and self.repo_ranges:
             if f_norm in self.repo_ranges:
                 return self.repo_ranges[f_norm]
-            return self.repo_ranges.get(f_norm)
-        if unit_basis == "target" and self.target_ranges:
+        elif unit_basis == "target" and self.target_ranges:
             if f_norm in self.target_ranges:
                 return self.target_ranges[f_norm]
-            return self.target_ranges.get(f_norm)
 
         # 2. Tagged lookup fallback (e.g. repo:<path> or target:<path>)
         tagged_key = f"{unit_basis}:{f_norm}"
@@ -58,10 +56,14 @@ class DiffRangeMap(Dict[str, List[Tuple[int, int]]]):
             return self[tagged_key]
 
         # 3. Direct un-tagged dict key lookup
-        if f_norm in self:
-            return self[f_norm]
+        # Do not fall back to un-tagged dictionary keys if the requested coordinate
+        # basis already has an authoritative coordinate set that did not match.
+        if unit_basis == "repo" and self.repo_ranges:
+            return None
+        if unit_basis == "target" and self.target_ranges:
+            return None
 
-        return None
+        return self.get(f_norm)
 
 _GIT_C_ESCAPES: Dict[int, int] = {
     ord(b"a"): 0x07,

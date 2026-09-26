@@ -547,7 +547,7 @@ def clone_pair_fingerprint(u1: Dict[str, Any], u2: Dict[str, Any]) -> ClonePairF
 
 
 def record_baseline(
-    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
+    clones: Sequence[Union[Tuple[float, Dict[str, Any], Dict[str, Any]], Dict[str, Any]]],
     baseline_path: str,
     target: str,
     threshold: float,
@@ -582,10 +582,14 @@ def record_baseline(
         elif isinstance(item, dict):
             sim = float(item.get("similarity", 1.0))
             u1 = item.get("u1") or item.get("unit_a") or item
-            u2 = item.get("u2") or item.get("unit_b") or {}
+            u2 = item.get("u2") or item.get("unit_b") or item
 
-        fa_raw = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
-        fb_raw = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
+        fa_raw = normalize_path_string(
+            str(u1.get("file") or u1.get("file_a") or ""), strip_anchor=False
+        )
+        fb_raw = normalize_path_string(
+            str(u2.get("file") or u2.get("file_b") or ""), strip_anchor=False
+        )
 
         fa_target = fa_raw
         fb_target = fb_raw
@@ -615,6 +619,14 @@ def record_baseline(
 
         u1_rec = dict(u1, file=fa_target)
         u2_rec = dict(u2, file=fb_target)
+        if "name" not in u1_rec and "name_a" in u1:
+            u1_rec["name"] = u1["name_a"]
+        if "name" not in u2_rec and "name_b" in u2:
+            u2_rec["name"] = u2["name_b"]
+        if "structural_hash" not in u1_rec and "hash_a" in u1:
+            u1_rec["structural_hash"] = u1["hash_a"]
+        if "structural_hash" not in u2_rec and "hash_b" in u2:
+            u2_rec["structural_hash"] = u2["hash_b"]
 
         fingerprints.append({
             "fingerprint": clone_pair_fingerprint(u1_rec, u2_rec),
@@ -623,12 +635,12 @@ def record_baseline(
             "pure_structural_fingerprint": pure_structural_fingerprint(u1_rec, u2_rec),
             "similarity": round(sim, 4),
             "file_a": fa_target,
-            "name_a": str(u1.get("name") or "unit1"),
-            "hash_a": compute_unit_structural_hash(u1),
+            "name_a": str(u1_rec.get("name") or "unit1"),
+            "hash_a": compute_unit_structural_hash(u1_rec),
             "namespace_a": extract_unit_namespace(fa_target),
             "file_b": fb_target,
-            "name_b": str(u2.get("name") or "unit2"),
-            "hash_b": compute_unit_structural_hash(u2),
+            "name_b": str(u2_rec.get("name") or "unit2"),
+            "hash_b": compute_unit_structural_hash(u2_rec),
             "namespace_b": extract_unit_namespace(fb_target),
         })
 

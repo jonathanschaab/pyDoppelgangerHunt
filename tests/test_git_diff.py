@@ -1332,3 +1332,33 @@ def test_decode_git_cstyle_path_backslashes_and_astral_emojis() -> None:
     assert _decode_git_cstyle_path(p_combo) == "café/🚀\\worker.py"
 
 
+def test_diff_range_map_get_ranges_for_unit_fallbacks_and_anti_collision() -> None:
+    """Verifies that DiffRangeMap.get_ranges_for_unit correctly falls through without dead code or collision."""
+    from pydoppelgangerhunt.git_diff import DiffRangeMap  # pylint: disable=import-outside-toplevel
+
+    # 1. Tagged key fallback
+    tagged_map = DiffRangeMap({"repo:worker.py": [(1, 5)], "target:worker.py": [(10, 15)]})
+    assert tagged_map.get_ranges_for_unit({"file": "worker.py"}, unit_basis="repo") == [(1, 5)]
+    assert tagged_map.get_ranges_for_unit({"file": "worker.py"}, unit_basis="target") == [(10, 15)]
+
+    # 2. Plain un-tagged key fallback (no coordinate sets)
+    plain_map = DiffRangeMap({"worker.py": [(20, 25)]})
+    assert plain_map.get_ranges_for_unit({"file": "worker.py"}, unit_basis="repo") == [(20, 25)]
+    assert plain_map.get_ranges_for_unit({"file": "worker.py"}, unit_basis="target") == [(20, 25)]
+
+    # 3. Coordinate isolation and anti-collision
+    # repo/src/foo.py was modified (repo: 'src/foo.py', target: 'foo.py')
+    isolated = DiffRangeMap(
+        {"repo:src/foo.py": [(1, 5)], "src/foo.py": [(1, 5)], "target:foo.py": [(1, 5)]},
+        repo_ranges={"src/foo.py": [(1, 5)]},
+        target_ranges={"foo.py": [(1, 5)]},
+    )
+    # Repo basis: 'src/foo.py' matches, 'foo.py' does NOT match
+    assert isolated.get_ranges_for_unit({"file": "src/foo.py"}, unit_basis="repo") == [(1, 5)]
+    assert isolated.get_ranges_for_unit({"file": "foo.py"}, unit_basis="repo") is None
+
+    # Target basis: 'foo.py' matches, 'src/foo.py' does NOT match (crucial anti-collision test)
+    assert isolated.get_ranges_for_unit({"file": "foo.py"}, unit_basis="target") == [(1, 5)]
+    assert isolated.get_ranges_for_unit({"file": "src/foo.py"}, unit_basis="target") is None
+
+
