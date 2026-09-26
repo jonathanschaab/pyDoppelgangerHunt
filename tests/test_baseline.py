@@ -4600,6 +4600,35 @@ def test_cli_record_baseline_subdirectory_persists_target_repo_relative(
     raw_data = json.loads(baseline_out.read_text(encoding="utf-8"))
     assert raw_data.get("target_repo_relative") == "src"
     assert raw_data.get("recorded_commit") == head_hash
+    assert raw_data.get("path_basis") == "target_relative"
+    assert len(raw_data.get("fingerprints", [])) == 1
+    rec = raw_data["fingerprints"][0]
+    assert rec.get("file_a") == "a.py"
+    assert rec.get("file_b") == "b.py"
+
+    # Subsequent scan with --baseline must suppress the grandfathered clone
+    exit_filter = main([
+        str(src_dir),
+        "--baseline", str(baseline_out),
+        "--min-lines", "3",
+        "--min-tokens", "5",
+        "--threshold", "0.80",
+    ])
+    assert exit_filter == 0
+
+    # Subsequent scan with --prune-baseline must retain the active clone
+    exit_prune = main([
+        str(src_dir),
+        "--baseline", str(baseline_out),
+        "--prune-baseline",
+        "--min-lines", "3",
+        "--min-tokens", "5",
+        "--threshold", "0.80",
+    ])
+    assert exit_prune == 0
+    pruned_data = json.loads(baseline_out.read_text(encoding="utf-8"))
+    assert len(pruned_data.get("fingerprints", [])) == 1
+    assert pruned_data["fingerprints"][0].get("file_a") == "a.py"
 
 
 def test_run_git_command_normalizes_file_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -472,7 +472,6 @@ def _apply_baseline_and_diff_filters(
             clones,
             repo_root=git_worktree_root,
             target=target_val,
-            clone_basis="target_relative",
         )
         pruned_count = prune_res[0]
         retained_count = prune_res[1]
@@ -499,7 +498,6 @@ def _apply_baseline_and_diff_filters(
             base_fps,
             repo_root=git_worktree_root,
             target=target_val,
-            clone_basis="target_relative",
         )
         if args.format == "text":
             print(f"[BASELINE] Suppressed {suppressed_count} grandfathered clone(s). {len(clones)} un-grandfathered clone(s) remaining.")
@@ -1152,7 +1150,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             threshold,
             corpus_calibration=recorded_calib,
             repo_root=git_worktree_root,
-            clone_basis="target_relative",
         )
         print(f"[OK] Recorded {len(clones)} clone baseline pair(s) to {bp}")
         return 0
