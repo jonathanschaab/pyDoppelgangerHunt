@@ -2577,4 +2577,90 @@ def test_cli_record_baseline_displays_size_and_calibration_compression_metrics(
     assert "shingles pruned" not in out_default
 
 
+def test_cli_verbose_discarded_calibration_mismatch_advisory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that cli.main prints discarded calibration advisory to sys.stderr under -v."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "calib_mismatch_repo"
+    repo.mkdir()
+    code = (
+        "def compute_something(a, b, c):\n"
+        "    res = a * 2 + b * 3 + c * 4\n"
+        "    for val in range(10):\n"
+        "        res += val\n"
+        "    return res\n"
+    )
+    (repo / "mod.py").write_text(code, encoding="utf-8")
+
+    bl_file = tmp_path / "baseline_no_bag.json"
+
+    # Step 1: Record baseline without bag-of-tokens
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.80",
+            "--record-baseline",
+            str(bl_file),
+        ],
+    )
+    assert main() == 0
+    capsys.readouterr()
+
+    # Step 2: Run scan with --bag-of-tokens (configuration mismatch) WITHOUT -v
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(bl_file),
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.80",
+            "--bag-of-tokens",
+            "--format",
+            "text",
+            "--no-color",
+        ],
+    )
+    assert main() == 0
+    captured_default = capsys.readouterr()
+    assert "Corpus calibration was discarded due to configuration mismatch" not in captured_default.err
+    assert "Corpus calibration was discarded due to configuration mismatch" not in captured_default.out
+
+    # Step 3: Run scan with --bag-of-tokens WITH -v
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(bl_file),
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.80",
+            "--bag-of-tokens",
+            "--format",
+            "text",
+            "--no-color",
+            "-v",
+        ],
+    )
+    assert main() == 0
+    captured_verbose = capsys.readouterr()
+    assert "Corpus calibration was discarded due to configuration mismatch" in captured_verbose.err
+    assert "bag_of_tokens" in captured_verbose.err
+    assert "falling back to full corpus scan" in captured_verbose.err
+
+
+
 

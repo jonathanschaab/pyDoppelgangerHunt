@@ -1255,6 +1255,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
 
     if (calib_dict is not None or preloaded_baseline is not None) and args.format == "text":
+        discarded_mismatch = (
+            calib_dict.get("discarded_mismatch")
+            if isinstance(calib_dict, dict)
+            else (
+                getattr(preloaded_baseline, "corpus_calibration", {}).get("discarded_mismatch")
+                if preloaded_baseline
+                and isinstance(getattr(preloaded_baseline, "corpus_calibration", None), dict)
+                else None
+            )
+        )
+        if discarded_mismatch and getattr(args, "verbose", False):
+            print(
+                colorize(
+                    f"Info: Corpus calibration was discarded due to configuration mismatch "
+                    f"({discarded_mismatch}); falling back to full corpus scan.",
+                    COLOR_YELLOW,
+                    use_color,
+                ),
+                file=sys.stderr,
+            )
+
         base_commit_raw = (
             (calib_dict.get("recorded_commit") if isinstance(calib_dict, dict) else None)
             or getattr(preloaded_baseline, "recorded_commit", None)

@@ -1132,6 +1132,10 @@ def scan_target(
                 "Corpus calibration was discarded due to configuration mismatch (%s); falling back to full corpus scan.",
                 calib_mismatch,
             )
+            try:
+                corpus_calibration["discarded_mismatch"] = calib_mismatch
+            except (TypeError, ValueError):
+                pass
             corpus_calibration = None
     if corpus_calibration is not None:
         calib_total = _safe_total_units(corpus_calibration.get("total_units"))
