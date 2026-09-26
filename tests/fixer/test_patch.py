@@ -6281,3 +6281,65 @@ def test_unit_desc_strict_validation_and_parsing() -> None:
     with pytest.raises(ValueError, match="Overlapping unit collision detected between 'fn1' \\(1-2\\) and 'fn2' \\(1-2\\)"):
         refactor_module_units("x = 1\ny = 2\n", [(u1, "x = 10\n"), (u2, "y = 20\n")])
 
+
+def test_is_valid_unit_coordinates_scenarios() -> None:
+    """Verifies that _is_valid_unit_coordinates validates dictionary and integer coordinates."""
+    from pydoppelgangerhunt.fixer.patch import _is_valid_unit_coordinates
+
+    assert _is_valid_unit_coordinates(None) is False
+    assert _is_valid_unit_coordinates("string_unit") is False
+    assert _is_valid_unit_coordinates(["list_unit"]) is False
+    assert _is_valid_unit_coordinates({}) is True
+    assert _is_valid_unit_coordinates({"start": 1, "end": 5}) is True
+    assert _is_valid_unit_coordinates({"start": "1", "end": "5"}) is True
+    assert _is_valid_unit_coordinates({"start": "not_an_int"}) is False
+    assert _is_valid_unit_coordinates({"start": 1, "end": [2]}) is False
+    assert _is_valid_unit_coordinates({"start": 1, "end": 5, "start_col": "invalid"}) is False
+    assert _is_valid_unit_coordinates({"start": 1, "end": 5, "end_col": {}}) is False
+
+
+def test_compute_replacement_line_deltas_raises_on_overlapping_units() -> None:
+    """Verifies that _compute_replacement_line_deltas raises ValueError on overlapping units."""
+    import pytest
+    from pydoppelgangerhunt.fixer.patch import _compute_replacement_line_deltas
+
+    orig_text = "def f1():\n    return 1\n\ndef f2():\n    return 2\n"
+    u1 = {"file": "sample.py", "name": "fn1", "start": 1, "end": 3}
+    u2 = {"file": "sample.py", "name": "fn2", "start": 2, "end": 5}
+
+    with pytest.raises(
+        ValueError,
+        match="Overlapping unit collision detected in line delta computation between 'fn1' and 'fn2'",
+    ):
+        _compute_replacement_line_deltas([(u1, "# rep 1\n"), (u2, "# rep 2\n")], orig_text)
+
+
+def test_generate_refactoring_patch_skips_malformed_clone_pair_without_aborting_batch(
+    tmp_path: Path,
+) -> None:
+    """Verifies that a malformed clone pair in a batch does not abort valid clone pair refactoring."""
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text("def run_a(val: int) -> int:\n    return val * 2\n", encoding="utf-8")
+    f2.write_text("def run_b(val: int) -> int:\n    return val * 2\n", encoding="utf-8")
+
+    # Pair 1: Malformed coordinates that would fail coordinate parsing
+    bad_u1 = {"file": str(f1), "name": "run_a", "start": "not_an_int", "end": 2}
+    bad_u2 = {"file": str(f2), "name": "run_b", "start": 1, "end": 2}
+
+    # Pair 2: Fully valid clone pair
+    good_u1 = {"file": str(f1), "name": "run_a", "start": 1, "end": 2, "kind": "function"}
+    good_u2 = {"file": str(f2), "name": "run_b", "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(0.9, bad_u1, bad_u2), (1.0, good_u1, good_u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+
+    # Valid pair should have successfully generated patch despite bad pair in batch
+    assert "--- a/mod1.py" in patch
+    assert "--- a/mod2.py" in patch
+    assert "_shared_run_a_run_b" in patch
+
+

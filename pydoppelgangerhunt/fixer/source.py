@@ -537,6 +537,9 @@ def compute_unit_spans(
     except (ValueError, TypeError) as err:
         raise ValueError(f"Malformed unit: invalid 'end' line: {unit.get('end')!r}") from err
 
+    # Note on inverted ranges: compute_unit_spans treats start > end as an empty 0-width EOF
+    # span to ensure no source code is modified during replacement. In contrast, check_units_overlap
+    # normalizes inverted line boundaries into [min(s, e), max(s, e)] for bounding-box overlap testing.
     if start > len(lines) or start > end:
         sz_c = len(source_text)
         sz_b = len(source_text.encode("utf-8"))

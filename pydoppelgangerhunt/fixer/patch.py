@@ -100,6 +100,10 @@ def check_units_overlap(
         try:
             s = _parse_unit_coord(u, "start", default=1)
             e = _parse_unit_coord(u, "end", default=s)
+            # Note on inverted ranges: For symmetric geometric overlap testing, _parse_lines
+            # normalizes inverted line boundaries into an inclusive interval [min(s, e), max(s, e)].
+            # In contrast, compute_unit_spans treats start > end as an empty 0-width EOF slice
+            # to ensure no physical buffer contents are modified.
             return (e, s) if s > e else (s, e)
         except (ValueError, TypeError) as err:
             raise ValueError(f"Malformed unit: invalid line boundary in {label} ({file_path}): {err}") from err
@@ -568,6 +572,29 @@ class _FilePatchPlan:
         self.used_helper_names: Set[str] = set()
         self.claimed_units: List[Dict[str, Any]] = []
 
+    def snapshot(self) -> Dict[str, Any]:
+        """Creates a snapshot of mutable plan state for transactional rollback."""
+        return {
+            "replacements": list(self.replacements),
+            "method_helpers": list(self.method_helpers),
+            "module_helpers": list(self.module_helpers),
+            "missing_imports": list(self.missing_imports),
+            "comments": list(self.comments),
+            "used_helper_names": set(self.used_helper_names),
+            "claimed_units": list(self.claimed_units),
+        }
+
+    def restore(self, snap: Dict[str, Any]) -> None:
+        """Restores mutable plan state from a snapshot."""
+        self.replacements = list(snap["replacements"])
+        self.method_helpers = list(snap["method_helpers"])
+        self.module_helpers = list(snap["module_helpers"])
+        self.missing_imports = list(snap["missing_imports"])
+        self.comments = list(snap["comments"])
+        self.used_helper_names = set(snap["used_helper_names"])
+        self.claimed_units = list(snap["claimed_units"])
+
+
 
 def _compute_replacement_line_deltas(
     reps: Sequence[Tuple[Dict[str, Any], str]],
@@ -585,13 +612,13 @@ def _compute_replacement_line_deltas(
 
     Raises:
         TypeError: If any replacement unit is not a dictionary.
-        ValueError: If any unit contains invalid line coordinates.
+        ValueError: If any unit contains invalid line coordinates or if candidate replacements overlap.
     """
-    deltas: List[Tuple[int, int]] = []
     if lines is None:
         lines = orig_text.splitlines(keepends=True)
     if line_char_offsets is None or line_byte_offsets is None:
         line_char_offsets, line_byte_offsets = _compute_line_offsets(lines)
+    computed: List[Tuple[ReplacementItem, int, int]] = []
     for u, rep in reps:
         if not isinstance(u, dict):
             raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
@@ -610,7 +637,21 @@ def _compute_replacement_line_deltas(
         )
         orig_nl = orig_text[item.start_char : item.end_char].count("\n")
         rep_nl = item.final_rep.count("\n")
-        deltas.append((end_l, rep_nl - orig_nl))
+        computed.append((item, end_l, rep_nl - orig_nl))
+
+    sorted_items = sorted(computed, key=lambda x: (x[0].start_byte, x[0].end_byte))
+    for i in range(len(sorted_items) - 1):
+        curr_item = sorted_items[i][0]
+        next_item = sorted_items[i + 1][0]
+        if curr_item.end_byte > next_item.start_byte:
+            n1 = str(curr_item.unit.get("name") or "unit")
+            n2 = str(next_item.unit.get("name") or "unit")
+            raise ValueError(
+                f"Overlapping unit collision detected in line delta computation "
+                f"between '{n1}' and '{n2}'."
+            )
+
+    deltas = [(end_l, d) for _, end_l, d in computed]
     deltas.sort(key=lambda item: item[0])
     return deltas
 
@@ -2175,6 +2216,28 @@ def _resolve_safe_clone_file_path(
     return resolved
 
 
+def _is_valid_unit_coordinates(u: Any) -> bool:
+    """Verifies that an AST unit dictionary has valid integer coordinates."""
+    if not isinstance(u, dict):
+        return False
+    try:
+        s_val = u.get("start")
+        if s_val is not None:
+            int(s_val)
+        e_val = u.get("end")
+        if e_val is not None:
+            int(e_val)
+        sc_val = u.get("start_col")
+        if sc_val is not None:
+            int(sc_val)
+        ec_val = u.get("end_col")
+        if ec_val is not None:
+            int(ec_val)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
 def generate_refactoring_patch(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     repo_root: Optional[str] = None,
@@ -2238,693 +2301,398 @@ def generate_refactoring_patch(
     )
 
     for sim, u1, u2 in clones:
-        f1_raw = normalize_path_string(str(u1.get("file") or ""), strip_anchor=True)
-        if not f1_raw:
-            continue
-        f1_path, is_f1_rejected = _validate_clone_file_path(
-            f1_raw, candidate_roots
-        )
-        if is_f1_rejected or f1_path is None:
-            continue
-
-        rel_f1 = _format_patch_relative_path(f1_path, patch_root, fs_root)
-
-        f1_plan = file_plans.get(f1_path)
-        if f1_plan is None:
-            try:
-                orig_text = f1_path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
-            f1_plan = _get_plan(f1_path, rel_f1, orig_text)
-        else:
-            orig_text = f1_plan.orig_text
-
-        orig_lines = f1_plan.orig_lines
-
-        f2_raw = normalize_path_string(str(u2.get("file") or ""), strip_anchor=True)
-        f2_path: Optional[Path] = None
-        if f2_raw:
-            f2_path, is_f2_rejected = _validate_clone_file_path(
-                f2_raw, candidate_roots
+        if not _is_valid_unit_coordinates(u1) or not _is_valid_unit_coordinates(u2):
+            logger.debug(
+                "Skipping clone pair with malformed unit coordinates: (%s, %s)", u1, u2
             )
-            if is_f2_rejected:
+            continue
+
+        plans_snapshot = {p: plan.snapshot() for p, plan in file_plans.items()}
+        graph_snapshot = graph_holder[0].copy() if graph_holder[0] is not None else None
+
+        try:
+            f1_raw = normalize_path_string(str(u1.get("file") or ""), strip_anchor=True)
+            if not f1_raw:
+                continue
+            f1_path, is_f1_rejected = _validate_clone_file_path(
+                f1_raw, candidate_roots
+            )
+            if is_f1_rejected or f1_path is None:
                 continue
 
-        is_same_file = False
-        if f2_path is not None and f1_path is not None:
-            is_same_file = (f1_path == f2_path or f1_path.resolve() == f2_path.resolve())
-        elif not f2_raw:
-            is_same_file = True
-        elif _is_same_file_path(f1_raw, f2_raw, repo_root=str(root)):
-            is_same_file = True
+            rel_f1 = _format_patch_relative_path(f1_path, patch_root, fs_root)
 
-        enc1 = find_enclosing_class(orig_text, u1)
-        fn1 = find_enclosing_function(orig_text, u1)
+            f1_plan = file_plans.get(f1_path)
+            if f1_plan is None:
+                try:
+                    orig_text = f1_path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                f1_plan = _get_plan(f1_path, rel_f1, orig_text)
+            else:
+                orig_text = f1_plan.orig_text
 
-        enc2 = None
-        fn2 = None
-        f2_plan: Optional[_FilePatchPlan] = None
-        if is_same_file:
-            enc2 = find_enclosing_class(orig_text, u2)
-            fn2 = find_enclosing_function(orig_text, u2)
-        elif f2_raw:
-            if f2_path is not None:
-                rel_f2 = _format_patch_relative_path(f2_path, patch_root, fs_root)
-                f2_plan = file_plans.get(f2_path)
-                if f2_plan is None:
-                    try:
-                        f2_text = f2_path.read_text(encoding="utf-8")
-                        f2_plan = _get_plan(f2_path, rel_f2, f2_text)
-                    except (OSError, UnicodeDecodeError):
-                        f2_plan = None
-                if f2_plan is not None:
-                    enc2 = find_enclosing_class(f2_plan.orig_text, u2)
-                    fn2 = find_enclosing_function(f2_plan.orig_text, u2)
-        else:
-            continue
+            orig_lines = f1_plan.orig_lines
 
-        u1_lines = orig_lines
-        u2_lines = orig_lines if is_same_file else (f2_plan.orig_lines if f2_plan is not None else [])
-        u1_eff = dict(u1, source_lines=u1_lines)
-        u2_eff = dict(u2, source_lines=u2_lines)
+            f2_raw = normalize_path_string(str(u2.get("file") or ""), strip_anchor=True)
+            f2_path: Optional[Path] = None
+            if f2_raw:
+                f2_path, is_f2_rejected = _validate_clone_file_path(
+                    f2_raw, candidate_roots
+                )
+                if is_f2_rejected:
+                    continue
 
-        if replace_clones:
-            u1_claimed = any(
-                check_units_overlap(u1, prev_u, repo_root=str(root))
-                for prev_u in f1_plan.claimed_units
-            )
+            is_same_file = False
+            if f2_path is not None and f1_path is not None:
+                is_same_file = (f1_path == f2_path or f1_path.resolve() == f2_path.resolve())
+            elif not f2_raw:
+                is_same_file = True
+            elif _is_same_file_path(f1_raw, f2_raw, repo_root=str(root)):
+                is_same_file = True
+
+            enc1 = find_enclosing_class(orig_text, u1)
+            fn1 = find_enclosing_function(orig_text, u1)
+
+            enc2 = None
+            fn2 = None
+            f2_plan: Optional[_FilePatchPlan] = None
             if is_same_file:
-                u2_claimed = any(
-                    check_units_overlap(u2, prev_u, repo_root=str(root))
+                enc2 = find_enclosing_class(orig_text, u2)
+                fn2 = find_enclosing_function(orig_text, u2)
+            elif f2_raw:
+                if f2_path is not None:
+                    rel_f2 = _format_patch_relative_path(f2_path, patch_root, fs_root)
+                    f2_plan = file_plans.get(f2_path)
+                    if f2_plan is None:
+                        try:
+                            f2_text = f2_path.read_text(encoding="utf-8")
+                            f2_plan = _get_plan(f2_path, rel_f2, f2_text)
+                        except (OSError, UnicodeDecodeError):
+                            f2_plan = None
+                    if f2_plan is not None:
+                        enc2 = find_enclosing_class(f2_plan.orig_text, u2)
+                        fn2 = find_enclosing_function(f2_plan.orig_text, u2)
+            else:
+                continue
+
+            u1_lines = orig_lines
+            u2_lines = orig_lines if is_same_file else (f2_plan.orig_lines if f2_plan is not None else [])
+            u1_eff = dict(u1, source_lines=u1_lines)
+            u2_eff = dict(u2, source_lines=u2_lines)
+
+            if replace_clones:
+                u1_claimed = any(
+                    check_units_overlap(u1, prev_u, repo_root=str(root))
                     for prev_u in f1_plan.claimed_units
                 )
-            else:
-                u2_claimed = (
-                    any(
+                if is_same_file:
+                    u2_claimed = any(
                         check_units_overlap(u2, prev_u, repo_root=str(root))
-                        for prev_u in f2_plan.claimed_units
+                        for prev_u in f1_plan.claimed_units
                     )
-                    if f2_plan is not None
-                    else False
-                )
-            if u1_claimed or u2_claimed:
+                else:
+                    u2_claimed = (
+                        any(
+                            check_units_overlap(u2, prev_u, repo_root=str(root))
+                            for prev_u in f2_plan.claimed_units
+                        )
+                        if f2_plan is not None
+                        else False
+                    )
+                if u1_claimed or u2_claimed:
+                    continue
+
+            is_same_class = bool(
+                is_same_file
+                and enc1
+                and enc2
+                and enc1["name"] == enc2["name"]
+                and enc1["start"] == enc2["start"]
+            )
+
+            if not _is_method_of_class(fn1, enc1):
+                fn1 = None
+            if not _is_method_of_class(fn2, enc2):
+                fn2 = None
+
+            non_method_kinds = ("closure", "class", "comprehension", "data_table", "complex_expr")
+            fn1_kind = _get_enclosing_receiver_kind(fn1) if fn1 else (u1.get("receiver_kind") or ("instance" if enc1 and u1.get("kind") not in non_method_kinds else "none"))
+            fn2_kind = _get_enclosing_receiver_kind(fn2) if fn2 else (u2.get("receiver_kind") or ("instance" if enc2 and u2.get("kind") not in non_method_kinds else "none"))
+            receiver_kinds_differ = bool(fn1_kind != fn2_kind)
+            is_in_method = bool(
+                fn1
+                and fn2
+                and u1.get("kind") not in ("comprehension", "complex_expr")
+                and u2.get("kind") not in ("comprehension", "complex_expr")
+                and (fn1.get("receiver_param") or fn1.get("is_static"))
+                and (fn2.get("receiver_param") or fn2.get("is_static"))
+            )
+            if fn1 and "receiver_param" not in u1:
+                u1["receiver_param"] = fn1.get("receiver_param")
+                u1_eff["receiver_param"] = fn1.get("receiver_param")
+            if fn2 and "receiver_param" not in u2:
+                u2["receiver_param"] = fn2.get("receiver_param")
+                u2_eff["receiver_param"] = fn2.get("receiver_param")
+            if fn1 and fn2:
+                is_static = bool(fn1.get("is_static") and fn2.get("is_static"))
+            else:
+                is_static = bool((fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static")))
+
+            s1 = analyze_unit_variable_scope(u1_eff, repo_root=str(root))
+            s2 = analyze_unit_variable_scope(u2_eff, repo_root=str(root))
+            if bool(s1.get("is_async")) != bool(s2.get("is_async")):
                 continue
-
-        is_same_class = bool(
-            is_same_file
-            and enc1
-            and enc2
-            and enc1["name"] == enc2["name"]
-            and enc1["start"] == enc2["start"]
-        )
-
-        if not _is_method_of_class(fn1, enc1):
-            fn1 = None
-        if not _is_method_of_class(fn2, enc2):
-            fn2 = None
-
-        non_method_kinds = ("closure", "class", "comprehension", "data_table", "complex_expr")
-        fn1_kind = _get_enclosing_receiver_kind(fn1) if fn1 else (u1.get("receiver_kind") or ("instance" if enc1 and u1.get("kind") not in non_method_kinds else "none"))
-        fn2_kind = _get_enclosing_receiver_kind(fn2) if fn2 else (u2.get("receiver_kind") or ("instance" if enc2 and u2.get("kind") not in non_method_kinds else "none"))
-        receiver_kinds_differ = bool(fn1_kind != fn2_kind)
-        is_in_method = bool(
-            fn1
-            and fn2
-            and u1.get("kind") not in ("comprehension", "complex_expr")
-            and u2.get("kind") not in ("comprehension", "complex_expr")
-            and (fn1.get("receiver_param") or fn1.get("is_static"))
-            and (fn2.get("receiver_param") or fn2.get("is_static"))
-        )
-        if fn1 and "receiver_param" not in u1:
-            u1["receiver_param"] = fn1.get("receiver_param")
-            u1_eff["receiver_param"] = fn1.get("receiver_param")
-        if fn2 and "receiver_param" not in u2:
-            u2["receiver_param"] = fn2.get("receiver_param")
-            u2_eff["receiver_param"] = fn2.get("receiver_param")
-        if fn1 and fn2:
-            is_static = bool(fn1.get("is_static") and fn2.get("is_static"))
-        else:
-            is_static = bool((fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static")))
-
-        s1 = analyze_unit_variable_scope(u1_eff, repo_root=str(root))
-        s2 = analyze_unit_variable_scope(u2_eff, repo_root=str(root))
-        if bool(s1.get("is_async")) != bool(s2.get("is_async")):
-            continue
-        if bool(s1.get("has_yield")) != bool(s2.get("has_yield")):
-            continue
-        if s1.get("nonlocals") or s2.get("nonlocals"):
-            continue
-        if not is_same_file and (s1.get("globals") or s2.get("globals")):
-            continue
-        rec1 = u1.get("receiver_param") or ("cls" if fn1_kind == "class" else "self")
-        rec2 = u2.get("receiver_param") or ("cls" if fn2_kind == "class" else "self")
-        if (
-            _normalize_receiver_attrs(s1.get("attrs_read", []), rec1)
-            != _normalize_receiver_attrs(s2.get("attrs_read", []), rec2)
-            or _normalize_receiver_attrs(s1.get("attrs_written", []), rec1)
-            != _normalize_receiver_attrs(s2.get("attrs_written", []), rec2)
-        ):
-            continue
-
-        hazards1 = set(s1.get("control_flow_hazards", []))
-        hazards2 = set(s2.get("control_flow_hazards", []))
-        if any(h in ("naked_break", "naked_continue") for h in hazards1 | hazards2):
-            continue
-        if "embedded_return" in hazards1 | hazards2:
-            lines1 = u1_lines
-            lines2 = u2_lines
-            if not (
-                _has_unconditional_terminal_return(u1, lines1)
-                and _has_unconditional_terminal_return(u2, lines2)
+            if bool(s1.get("has_yield")) != bool(s2.get("has_yield")):
+                continue
+            if s1.get("nonlocals") or s2.get("nonlocals"):
+                continue
+            if not is_same_file and (s1.get("globals") or s2.get("globals")):
+                continue
+            rec1 = u1.get("receiver_param") or ("cls" if fn1_kind == "class" else "self")
+            rec2 = u2.get("receiver_param") or ("cls" if fn2_kind == "class" else "self")
+            if (
+                _normalize_receiver_attrs(s1.get("attrs_read", []), rec1)
+                != _normalize_receiver_attrs(s2.get("attrs_read", []), rec2)
+                or _normalize_receiver_attrs(s1.get("attrs_written", []), rec1)
+                != _normalize_receiver_attrs(s2.get("attrs_written", []), rec2)
             ):
                 continue
 
-        if receiver_kinds_differ:
-            if _has_receiver_reference(u1_eff, s1, repo_root=str(root)) or _has_receiver_reference(u2_eff, s2, repo_root=str(root)):
+            hazards1 = set(s1.get("control_flow_hazards", []))
+            hazards2 = set(s2.get("control_flow_hazards", []))
+            if any(h in ("naked_break", "naked_continue") for h in hazards1 | hazards2):
+                continue
+            if "embedded_return" in hazards1 | hazards2:
+                lines1 = u1_lines
+                lines2 = u2_lines
+                if not (
+                    _has_unconditional_terminal_return(u1, lines1)
+                    and _has_unconditional_terminal_return(u2, lines2)
+                ):
+                    continue
+
+            if receiver_kinds_differ:
+                if _has_receiver_reference(u1_eff, s1, repo_root=str(root)) or _has_receiver_reference(u2_eff, s2, repo_root=str(root)):
+                    continue
+
+            effective_binding = _resolve_effective_binding(
+                method_binding,
+                is_same_class,
+                is_static=is_static,
+                receiver_kinds_differ=receiver_kinds_differ,
+                is_in_method=is_in_method,
+                receiver_kind=fn1_kind,
+            )
+
+            has_super = bool(s1.get("has_super") or s2.get("has_super"))
+            if has_super and (effective_binding == "module" or is_static):
                 continue
 
-        effective_binding = _resolve_effective_binding(
-            method_binding,
-            is_same_class,
-            is_static=is_static,
-            receiver_kinds_differ=receiver_kinds_differ,
-            is_in_method=is_in_method,
-            receiver_kind=fn1_kind,
-        )
-
-        has_super = bool(s1.get("has_super") or s2.get("has_super"))
-        if has_super and (effective_binding == "module" or is_static):
-            continue
-
-        has_mangled = bool(s1.get("has_mangled_names") or s2.get("has_mangled_names"))
-        if has_mangled and (effective_binding != "method" or not is_same_class or is_static):
-            continue
-
-        helper_indent = (
-            enc1["method_indent"]
-            if (effective_binding == "method" and enc1)
-            else ("    " if effective_binding == "method" else "")
-        )
-        step = (
-            enc1["method_indent"][len(enc1["indent"]):]
-            if (
-                enc1
-                and enc1.get("indent") is not None
-                and enc1["method_indent"].startswith(enc1["indent"])
-                and len(enc1["method_indent"]) > len(enc1["indent"])
-            )
-            else None
-        )
-        step = _derive_unit_indent_step(u1, orig_lines, step)
-
-        scope = analyze_unit_variable_scope(u1_eff, u2_eff, repo_root=str(root))
-        inputs = list(scope.get("inputs", []))
-        if effective_binding == "module":
-            inputs = _prune_unshared_receivers(inputs, u1_eff, u2_eff, s1, s2, repo_root=str(root))
-        outputs = [
-            v for v in scope.get("outputs", [])
-            if v not in scope.get("globals", [])
-            and v not in scope.get("nonlocals", [])
-        ]
-        u1_outs = [
-            v for v in s1.get("outputs", [])
-            if v not in s1.get("globals", [])
-            and v not in s1.get("nonlocals", [])
-        ]
-        u2_outs = [
-            v for v in s2.get("outputs", [])
-            if v not in s2.get("globals", [])
-            and v not in s2.get("nonlocals", [])
-        ]
-        if set(u2_outs) == set(outputs):
-            target_outs2 = outputs
-        elif len(u2_outs) == len(outputs):
-            out_map = {o: o for o in set(outputs) & set(u2_outs)}
-            rem_o = [o for o in outputs if o not in out_map]
-            rem_u2 = [o for o in u2_outs if o not in out_map]
-            for o1, o2 in zip(rem_o, rem_u2):
-                out_map[o1] = o2
-            target_outs2 = [out_map.get(o, o) for o in outputs]
-        else:
-            target_outs2 = outputs
-        t_inputs1 = list(s1.get("inputs", []))
-        t_inputs2 = list(s2.get("inputs", []))
-        if effective_binding == "module":
-            t_inputs1 = _prune_unshared_receivers(
-                t_inputs1, u1_eff, u2_eff, s1, s2, repo_root=str(root)
-            )
-            t_inputs2 = _prune_unshared_receivers(
-                t_inputs2, u2_eff, u1_eff, s2, s1, repo_root=str(root)
-            )
-
-        if replace_clones and (
-            len(t_inputs1) != len(inputs)
-            or len(t_inputs2) != len(inputs)
-            or len(u1_outs) != len(outputs)
-            or len(u2_outs) != len(outputs)
-        ):
-            continue
-
-        base_name1 = _base_unit_name(u1)
-        base_name2 = _base_unit_name(u2)
-        base_helper = (
-            f"_shared_{base_name1}" if base_name1 == base_name2 else f"_shared_{base_name1}_{base_name2}"
-        )
-        shared_p: Optional[Path] = None
-        target_host_plan: Optional[_FilePatchPlan] = None
-        target_host_text: Optional[str] = None
-        cross_file_action = cross_file_strategy
-        if not is_same_file and cross_file_action in ("skip", "none"):
-            continue
-        if cross_file_action == "auto" and not is_same_file and f2_plan is not None:
-            common_dir = find_nearest_common_package(f1_path, f2_plan.path, patch_root)
-            try:
-                res_common = common_dir.resolve()
-                res_patch_root = patch_root.resolve()
-                res_src = (patch_root / "src").resolve()
-                res_import_root = import_root.resolve()
-                is_top_level = res_common in (res_patch_root, res_src, res_import_root)
-            except (OSError, RuntimeError, ValueError):
-                is_top_level = False
-            if is_top_level:
-                cross_file_action = "host_module"
-            else:
-                cross_file_action = "shared_module"
-
-        if (
-            not is_same_file
-            and f2_plan is not None
-            and cross_file_action in ("shared_module", "shared")
-        ):
-            maybe_shared_p = _safely_resolve_shared_module_file(
-                f1_path, f2_plan.path, patch_root, shared_module_name, f1_plan, f2_plan
-            )
-            if maybe_shared_p is None:
+            has_mangled = bool(s1.get("has_mangled_names") or s2.get("has_mangled_names"))
+            if has_mangled and (effective_binding != "method" or not is_same_class or is_static):
                 continue
-            shared_p = maybe_shared_p
 
-            if _is_same_file_or_resolved(shared_p, f1_path):
-                target_host_plan = f1_plan
-            elif _is_same_file_or_resolved(shared_p, f2_plan.path):
-                target_host_plan = f2_plan
+            helper_indent = (
+                enc1["method_indent"]
+                if (effective_binding == "method" and enc1)
+                else ("    " if effective_binding == "method" else "")
+            )
+            step = (
+                enc1["method_indent"][len(enc1["indent"]):]
+                if (
+                    enc1
+                    and enc1.get("indent") is not None
+                    and enc1["method_indent"].startswith(enc1["indent"])
+                    and len(enc1["method_indent"]) > len(enc1["indent"])
+                )
+                else None
+            )
+            step = _derive_unit_indent_step(u1, orig_lines, step)
+
+            scope = analyze_unit_variable_scope(u1_eff, u2_eff, repo_root=str(root))
+            inputs = list(scope.get("inputs", []))
+            if effective_binding == "module":
+                inputs = _prune_unshared_receivers(inputs, u1_eff, u2_eff, s1, s2, repo_root=str(root))
+            outputs = [
+                v for v in scope.get("outputs", [])
+                if v not in scope.get("globals", [])
+                and v not in scope.get("nonlocals", [])
+            ]
+            u1_outs = [
+                v for v in s1.get("outputs", [])
+                if v not in s1.get("globals", [])
+                and v not in s1.get("nonlocals", [])
+            ]
+            u2_outs = [
+                v for v in s2.get("outputs", [])
+                if v not in s2.get("globals", [])
+                and v not in s2.get("nonlocals", [])
+            ]
+            if set(u2_outs) == set(outputs):
+                target_outs2 = outputs
+            elif len(u2_outs) == len(outputs):
+                out_map = {o: o for o in set(outputs) & set(u2_outs)}
+                rem_o = [o for o in outputs if o not in out_map]
+                rem_u2 = [o for o in u2_outs if o not in out_map]
+                for o1, o2 in zip(rem_o, rem_u2):
+                    out_map[o1] = o2
+                target_outs2 = [out_map.get(o, o) for o in outputs]
             else:
-                target_host_plan = file_plans.get(shared_p)
+                target_outs2 = outputs
+            t_inputs1 = list(s1.get("inputs", []))
+            t_inputs2 = list(s2.get("inputs", []))
+            if effective_binding == "module":
+                t_inputs1 = _prune_unshared_receivers(
+                    t_inputs1, u1_eff, u2_eff, s1, s2, repo_root=str(root)
+                )
+                t_inputs2 = _prune_unshared_receivers(
+                    t_inputs2, u2_eff, u1_eff, s2, s1, repo_root=str(root)
+                )
+
+            if replace_clones and (
+                len(t_inputs1) != len(inputs)
+                or len(t_inputs2) != len(inputs)
+                or len(u1_outs) != len(outputs)
+                or len(u2_outs) != len(outputs)
+            ):
+                continue
+
+            base_name1 = _base_unit_name(u1)
+            base_name2 = _base_unit_name(u2)
+            base_helper = (
+                f"_shared_{base_name1}" if base_name1 == base_name2 else f"_shared_{base_name1}_{base_name2}"
+            )
+            shared_p: Optional[Path] = None
+            target_host_plan: Optional[_FilePatchPlan] = None
+            target_host_text: Optional[str] = None
+            cross_file_action = cross_file_strategy
+            if not is_same_file and cross_file_action in ("skip", "none"):
+                continue
+            if cross_file_action == "auto" and not is_same_file and f2_plan is not None:
+                common_dir = find_nearest_common_package(f1_path, f2_plan.path, patch_root)
                 try:
-                    if target_host_plan is None and shared_p.is_file() and not shared_p.is_symlink():
-                        try:
-                            shared_p.resolve().relative_to(patch_root.resolve())
-                            target_host_text = shared_p.read_text(encoding="utf-8")
-                        except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
-                            pass
+                    res_common = common_dir.resolve()
+                    res_patch_root = patch_root.resolve()
+                    res_src = (patch_root / "src").resolve()
+                    res_import_root = import_root.resolve()
+                    is_top_level = res_common in (res_patch_root, res_src, res_import_root)
                 except (OSError, RuntimeError, ValueError):
-                    pass
+                    is_top_level = False
+                if is_top_level:
+                    cross_file_action = "host_module"
+                else:
+                    cross_file_action = "shared_module"
 
-        helper_name = base_helper
-        h_idx = 2
-        while (
-            helper_name in f1_plan.used_helper_names
-            or bool(re.search(rf"\b{re.escape(helper_name)}\b", orig_text))
-            or (
-                f2_plan is not None
-                and (
-                    helper_name in f2_plan.used_helper_names
-                    or bool(re.search(rf"\b{re.escape(helper_name)}\b", f2_plan.orig_text))
+            if (
+                not is_same_file
+                and f2_plan is not None
+                and cross_file_action in ("shared_module", "shared")
+            ):
+                maybe_shared_p = _safely_resolve_shared_module_file(
+                    f1_path, f2_plan.path, patch_root, shared_module_name, f1_plan, f2_plan
                 )
-            )
-            or (
-                target_host_plan is not None
-                and (
-                    helper_name in target_host_plan.used_helper_names
-                    or bool(re.search(rf"\b{re.escape(helper_name)}\b", target_host_plan.orig_text))
-                )
-            )
-            or (
-                target_host_text is not None
-                and bool(re.search(rf"\b{re.escape(helper_name)}\b", target_host_text))
-            )
-        ):
-            helper_name = f"{base_helper}_{h_idx}"
-            h_idx += 1
-        f1_plan.used_helper_names.add(helper_name)
-        if f2_plan is not None:
-            f2_plan.used_helper_names.add(helper_name)
-        if target_host_plan is not None:
-            target_host_plan.used_helper_names.add(helper_name)
-
-        helper_code = synthesize_shared_helper_code(
-            u1_eff,
-            u2_eff,
-            type_merge_strategy=type_merge_strategy,
-            method_binding=effective_binding,
-            indent=helper_indent,
-            is_static=is_static,
-            receiver_kind=fn1_kind if effective_binding == "method" else None,
-            step=step,
-            repo_root=str(root),
-            helper_name=helper_name,
-        )
-        if not helper_code:
-            continue
-
-        await_prefix = "await " if scope.get("is_async") else ""
-
-        f1_disp = normalize_path_string(str(u1.get("file") or "file1"), strip_anchor=False)
-        f2_disp = normalize_path_string(str(u2.get("file") or "file2"), strip_anchor=False)
-        pair_comment = f"# Clone Pair ({sim:.1%}): {f1_disp} <===> {f2_disp}\n"
-        f1_plan.comments.append(pair_comment)
-
-        candidate_units = [u1]
-        if is_same_file and not check_units_overlap(u1, u2, repo_root=str(root)):
-            candidate_units.append(u2)
-
-        def _unit_start(u: Dict[str, Any]) -> int:
-            return _parse_unit_coord(u, "start", default=1)
-
-        earliest_unit = min(candidate_units, key=_unit_start)
-        enc_fn_earliest = (
-            find_enclosing_function(orig_text, earliest_unit)
-            if effective_binding == "method"
-            else None
-        )
-        insert_line = (
-            enc_fn_earliest["start"]
-            if enc_fn_earliest
-            else _unit_start(earliest_unit)
-        )
-
-        if is_same_file:
-            mod1 = _derive_module_import_path(f1_path, import_root)
-            is_pkg1 = f1_path.name == "__init__.py"
-            helper_code, maybe_imports = _safely_prepare_helper_and_imports(
-                host_plan=f1_plan,
-                helper_code=helper_code,
-                scope=scope,
-                source_texts=[(orig_text, mod1, is_pkg1)],
-                f1_plan=f1_plan,
-                f2_plan=f2_plan,
-                host_mod=mod1,
-                is_host_pkg=is_pkg1,
-            )
-            if maybe_imports is None:
-                continue
-            host_imports = maybe_imports
-
-            if replace_clones:
-                _delegate_unit_in_plan(
-                    u1,
-                    f1_plan,
-                    helper_name=helper_name,
-                    inputs=inputs,
-                    outputs=outputs,
-                    scope=scope,
-                    target_inputs=t_inputs1,
-                    target_outputs=outputs,
-                    await_prefix=await_prefix,
-                    binding=effective_binding,
-                    step=step,
-                )
-                if len(candidate_units) > 1:
-                    _delegate_unit_in_plan(
-                        u2,
-                        f1_plan,
-                        helper_name=helper_name,
-                        inputs=inputs,
-                        outputs=outputs,
-                        scope=scope,
-                        target_inputs=t_inputs2,
-                        target_outputs=target_outs2,
-                        await_prefix=await_prefix,
-                        binding=effective_binding,
-                        step=step,
-                    )
-            _attach_helper_to_plan(
-                f1_plan,
-                binding=effective_binding,
-                insert_line=insert_line,
-                helper_code=helper_code,
-                missing_imports=host_imports,
-            )
-        elif f2_plan is not None:
-            if cross_file_action in ("skip", "none"):
-                continue
-            if cross_file_action in ("shared_module", "shared"):
-                if shared_p is None:
-                    maybe_shared_p = _safely_resolve_shared_module_file(
-                        f1_path, f2_plan.path, patch_root, shared_module_name, f1_plan, f2_plan
-                    )
-                    if maybe_shared_p is None:
-                        continue
-                    shared_p = maybe_shared_p
-
-                rel_shared = _format_patch_relative_path(shared_p, patch_root, fs_root)
+                if maybe_shared_p is None:
+                    continue
+                shared_p = maybe_shared_p
 
                 if _is_same_file_or_resolved(shared_p, f1_path):
-                    host_plan = f1_plan
-                    callers = [(f2_plan, u2, t_inputs2, target_outs2)]
+                    target_host_plan = f1_plan
                 elif _is_same_file_or_resolved(shared_p, f2_plan.path):
-                    host_plan = f2_plan
-                    callers = [(f1_plan, u1, t_inputs1, outputs)]
+                    target_host_plan = f2_plan
                 else:
-                    shared_plan = file_plans.get(shared_p)
-                    if shared_plan is None:
-                        is_bad_target = False
-                        kind_desc = ""
-                        try:
-                            if shared_p.is_symlink() or shared_p.is_dir():
-                                is_bad_target = True
-                                kind_desc = (
-                                    "an existing symlink"
-                                    if shared_p.is_symlink()
-                                    else "an existing directory"
-                                )
-                        except (OSError, RuntimeError, ValueError) as exc:
-                            is_bad_target = True
-                            kind_desc = f"unresolvable ({exc})"
-
-                        if is_bad_target:
-                            skip_msg = (
-                                f"# Note: Cross-module clone pair; shared module path {rel_shared} "
-                                f"is {kind_desc}; skipping extraction.\n"
-                            )
-                            f1_plan.comments.append(skip_msg)
-                            f2_plan.comments.append(skip_msg)
-                            continue
-
-                        try:
-                            is_existing_file = shared_p.is_file()
-                        except (OSError, RuntimeError, ValueError):
-                            is_existing_file = False
-
-                        if is_existing_file:
+                    target_host_plan = file_plans.get(shared_p)
+                    try:
+                        if target_host_plan is None and shared_p.is_file() and not shared_p.is_symlink():
                             try:
                                 shared_p.resolve().relative_to(patch_root.resolve())
-                                shared_text = shared_p.read_text(encoding="utf-8")
-                                shared_plan = _get_plan(
-                                    shared_p, rel_shared, shared_text, is_new_file=False
-                                )
+                                target_host_text = shared_p.read_text(encoding="utf-8")
                             except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
-                                read_err_msg = (
-                                    f"# Note: Cross-module clone pair; shared module file {rel_shared} "
-                                    f"exists but could not be read; skipping extraction.\n"
-                                )
-                                f1_plan.comments.append(read_err_msg)
-                                f2_plan.comments.append(read_err_msg)
-                                continue
-                        else:
-                            shared_plan = _get_plan(
-                                shared_p, rel_shared, "", is_new_file=True
-                            )
-                    host_plan = shared_plan
-                    callers = [
-                        (f1_plan, u1, t_inputs1, outputs),
-                        (f2_plan, u2, t_inputs2, target_outs2),
-                    ]
+                                pass
+                    except (OSError, RuntimeError, ValueError):
+                        pass
 
-                mod1 = _derive_module_import_path(f1_path, import_root)
-                mod2 = _derive_module_import_path(f2_plan.path, import_root)
-                is_pkg1 = f1_path.name == "__init__.py"
-                is_pkg2 = f2_plan.path.name == "__init__.py"
-                mod_host = _derive_module_import_path(host_plan.path, import_root)
-                is_host_pkg = host_plan.path.name == "__init__.py"
-                helper_code, maybe_imports = _safely_prepare_helper_and_imports(
-                    host_plan=host_plan,
-                    helper_code=helper_code,
-                    scope=scope,
-                    source_texts=[(orig_text, mod1, is_pkg1), (f2_plan.orig_text, mod2, is_pkg2)],
-                    f1_plan=f1_plan,
-                    f2_plan=f2_plan,
-                    host_mod=mod_host,
-                    is_host_pkg=is_host_pkg,
+            helper_name = base_helper
+            h_idx = 2
+            while (
+                helper_name in f1_plan.used_helper_names
+                or bool(re.search(rf"\b{re.escape(helper_name)}\b", orig_text))
+                or (
+                    f2_plan is not None
+                    and (
+                        helper_name in f2_plan.used_helper_names
+                        or bool(re.search(rf"\b{re.escape(helper_name)}\b", f2_plan.orig_text))
+                    )
                 )
-                if maybe_imports is None:
-                    continue
-                host_imports = maybe_imports
-
-                host_disp = normalize_path_string(str(host_plan.rel_path), strip_anchor=False)
-                dg = _get_depgraph()
-                if mod_host and host_imports:
-                    host_cycle = dg.check_cycle_if_imports_added(
-                        mod_host,
-                        host_imports,
-                        file_path=host_plan.path,
-                        is_package=is_host_pkg,
+                or (
+                    target_host_plan is not None
+                    and (
+                        helper_name in target_host_plan.used_helper_names
+                        or bool(re.search(rf"\b{re.escape(helper_name)}\b", target_host_plan.orig_text))
                     )
-                    if host_cycle:
-                        cycle_desc = f"Circular import detected (cycle: {' -> '.join(host_cycle)})"
-                        cycle_msg = (
-                            f"# Note: Cross-module clone pair; helper extraction to {host_disp} "
-                            f"rejected due to circular dependency ({cycle_desc}).\n"
-                        )
-                        f1_plan.comments.append(cycle_msg)
-                        f2_plan.comments.append(cycle_msg)
-                        continue
+                )
+                or (
+                    target_host_text is not None
+                    and bool(re.search(rf"\b{re.escape(helper_name)}\b", target_host_text))
+                )
+            ):
+                helper_name = f"{base_helper}_{h_idx}"
+                h_idx += 1
+            f1_plan.used_helper_names.add(helper_name)
+            if f2_plan is not None:
+                f2_plan.used_helper_names.add(helper_name)
+            if target_host_plan is not None:
+                target_host_plan.used_helper_names.add(helper_name)
 
-                tentative_dg = dg.copy()
-                if mod_host:
-                    _register_plan_dependencies_in_graph(
-                        tentative_dg, mod_host, host_plan.path, host_imports
-                    )
+            helper_code = synthesize_shared_helper_code(
+                u1_eff,
+                u2_eff,
+                type_merge_strategy=type_merge_strategy,
+                method_binding=effective_binding,
+                indent=helper_indent,
+                is_static=is_static,
+                receiver_kind=fn1_kind if effective_binding == "method" else None,
+                step=step,
+                repo_root=str(root),
+                helper_name=helper_name,
+            )
+            if not helper_code:
+                continue
 
-                caller_evaluations: List[
-                    Tuple[
-                        _FilePatchPlan,
-                        Dict[str, Any],
-                        List[str],
-                        List[str],
-                        str,
-                        Optional[List[str]],
-                    ]
-                ] = []
-                for c_plan, c_unit, c_tin, c_tout in callers:
-                    c_mod = _derive_module_import_path(c_plan.path, import_root)
-                    c_cycle = (
-                        tentative_dg.check_cycle_if_added(c_mod, mod_host)
-                        if (c_mod and mod_host)
-                        else None
-                    )
-                    caller_evaluations.append(
-                        (c_plan, c_unit, c_tin, c_tout, c_mod, c_cycle)
-                    )
+            await_prefix = "await " if scope.get("is_async") else ""
 
-                if host_plan in (f1_plan, f2_plan) and caller_evaluations:
-                    c_plan, _, _, _, c_mod, c_cycle = caller_evaluations[0]
-                    if c_cycle or not mod_host or not c_mod:
-                        c_disp = normalize_path_string(str(c_plan.rel_path), strip_anchor=False)
-                        c_desc = f" (cycle: {' -> '.join(c_cycle)})" if c_cycle else ""
-                        c_msg = (
-                            f"# Note: Cross-module clone pair; helper extraction to {host_disp} rejected. "
-                            f"Circular import or unresolvable module path{c_desc}.\n"
-                        )
-                        f1_plan.comments.append(c_msg)
-                        f2_plan.comments.append(c_msg)
-                        continue
+            f1_disp = normalize_path_string(str(u1.get("file") or "file1"), strip_anchor=False)
+            f2_disp = normalize_path_string(str(u2.get("file") or "file2"), strip_anchor=False)
+            pair_comment = f"# Clone Pair ({sim:.1%}): {f1_disp} <===> {f2_disp}\n"
+            f1_plan.comments.append(pair_comment)
 
-                if host_plan not in (f1_plan, f2_plan) and all(
-                    bool(cycle or not mod_host or not m_call)
-                    for _, _, _, _, m_call, cycle in caller_evaluations
-                ):
-                    c_descs = [
-                        f"{m_call}: {' -> '.join(cycle)}"
-                        for _, _, _, _, m_call, cycle in caller_evaluations
-                        if cycle
-                    ]
-                    c_txt = f" ({'; '.join(c_descs)})" if c_descs else ""
-                    skip_msg = (
-                        f"# Note: Cross-module clone pair; helper extraction to {host_disp} "
-                        f"rejected due to circular dependency{c_txt}.\n"
-                    )
-                    f1_plan.comments.append(skip_msg)
-                    f2_plan.comments.append(skip_msg)
-                    continue
+            candidate_units = [u1]
+            if is_same_file and not check_units_overlap(u1, u2, repo_root=str(root)):
+                candidate_units.append(u2)
 
-                host_plan.module_helpers.append(helper_code)
-                host_plan.missing_imports.extend(host_imports)
-                host_plan.used_helper_names.add(helper_name)
-                host_plan.comments.append(pair_comment)
+            def _unit_start(u: Dict[str, Any]) -> int:
+                return _parse_unit_coord(u, "start", default=1)
 
-                if mod_host:
-                    _register_plan_dependencies_in_graph(
-                        dg, mod_host, host_plan.path, host_imports
-                    )
+            earliest_unit = min(candidate_units, key=_unit_start)
+            enc_fn_earliest = (
+                find_enclosing_function(orig_text, earliest_unit)
+                if effective_binding == "method"
+                else None
+            )
+            insert_line = (
+                enc_fn_earliest["start"]
+                if enc_fn_earliest
+                else _unit_start(earliest_unit)
+            )
 
-                if replace_clones:
-                    if host_plan is f1_plan:
-                        _delegate_unit_in_plan(
-                            u1,
-                            f1_plan,
-                            helper_name=helper_name,
-                            inputs=inputs,
-                            outputs=outputs,
-                            scope=scope,
-                            target_inputs=t_inputs1,
-                            target_outputs=outputs,
-                            await_prefix=await_prefix,
-                            binding=effective_binding,
-                            step=step,
-                        )
-                    elif host_plan is f2_plan:
-                        _delegate_unit_in_plan(
-                            u2,
-                            f2_plan,
-                            helper_name=helper_name,
-                            inputs=inputs,
-                            outputs=outputs,
-                            scope=scope,
-                            target_inputs=t_inputs2,
-                            target_outputs=target_outs2,
-                            await_prefix=await_prefix,
-                            binding="module",
-                        )
-
-                for c_plan, c_unit, c_tin, c_tout, mod_caller, cycle in caller_evaluations:
-                    c_plan.comments.append(pair_comment)
-                    c_disp = normalize_path_string(str(c_plan.rel_path), strip_anchor=False)
-                    if cycle or not mod_host or not mod_caller:
-                        cycle_desc = ""
-                        if cycle:
-                            cycle_desc = f"Circular import detected (cycle: {' -> '.join(cycle)})"
-                        else:
-                            cycle_desc = "Unresolvable module import path"
-                        cycle_msg = (
-                            f"# Note: Cross-module clone pair; helper extracted to {host_disp}. "
-                            f"{cycle_desc}; import manually into {c_disp}.\n"
-                        )
-                        c_plan.comments.append(cycle_msg)
-                        host_plan.comments.append(cycle_msg)
-                    else:
-                        c_plan.missing_imports.append(f"from {mod_host} import {helper_name}")
-                        if mod_caller and mod_host:
-                            dg.add_dependency(mod_caller, mod_host)
-                        if replace_clones:
-                            _delegate_unit_in_plan(
-                                c_unit,
-                                c_plan,
-                                helper_name=helper_name,
-                                inputs=inputs,
-                                outputs=outputs,
-                                scope=scope,
-                                target_inputs=c_tin,
-                                target_outputs=c_tout,
-                                await_prefix=await_prefix,
-                                binding="module",
-                            )
-                        else:
-                            c_plan.comments.append(
-                                f"# Note: Cross-module clone pair; helper extracted to {host_disp}. "
-                                f"Complete refactoring by replacing the clone with a call in {c_disp}.\n"
-                            )
-            else:
+            if is_same_file:
                 mod1 = _derive_module_import_path(f1_path, import_root)
-                mod2 = _derive_module_import_path(f2_plan.path, import_root)
                 is_pkg1 = f1_path.name == "__init__.py"
-                is_pkg2 = f2_plan.path.name == "__init__.py"
-                dg = _get_depgraph()
-
                 helper_code, maybe_imports = _safely_prepare_helper_and_imports(
                     host_plan=f1_plan,
                     helper_code=helper_code,
                     scope=scope,
-                    source_texts=[(orig_text, mod1, is_pkg1), (f2_plan.orig_text, mod2, is_pkg2)],
+                    source_texts=[(orig_text, mod1, is_pkg1)],
                     f1_plan=f1_plan,
                     f2_plan=f2_plan,
                     host_mod=mod1,
@@ -2934,81 +2702,423 @@ def generate_refactoring_patch(
                     continue
                 host_imports = maybe_imports
 
-                if mod1 and host_imports:
-                    host_cycle = dg.check_cycle_if_imports_added(
-                        mod1,
-                        host_imports,
-                        file_path=f1_plan.path,
-                        is_package=is_pkg1,
+                if replace_clones:
+                    _delegate_unit_in_plan(
+                        u1,
+                        f1_plan,
+                        helper_name=helper_name,
+                        inputs=inputs,
+                        outputs=outputs,
+                        scope=scope,
+                        target_inputs=t_inputs1,
+                        target_outputs=outputs,
+                        await_prefix=await_prefix,
+                        binding=effective_binding,
+                        step=step,
                     )
-                    if host_cycle:
-                        cycle_desc = f" (cycle: {' -> '.join(host_cycle)})"
+                    if len(candidate_units) > 1:
+                        _delegate_unit_in_plan(
+                            u2,
+                            f1_plan,
+                            helper_name=helper_name,
+                            inputs=inputs,
+                            outputs=outputs,
+                            scope=scope,
+                            target_inputs=t_inputs2,
+                            target_outputs=target_outs2,
+                            await_prefix=await_prefix,
+                            binding=effective_binding,
+                            step=step,
+                        )
+                _attach_helper_to_plan(
+                    f1_plan,
+                    binding=effective_binding,
+                    insert_line=insert_line,
+                    helper_code=helper_code,
+                    missing_imports=host_imports,
+                )
+            elif f2_plan is not None:
+                if cross_file_action in ("skip", "none"):
+                    continue
+                if cross_file_action in ("shared_module", "shared"):
+                    if shared_p is None:
+                        maybe_shared_p = _safely_resolve_shared_module_file(
+                            f1_path, f2_plan.path, patch_root, shared_module_name, f1_plan, f2_plan
+                        )
+                        if maybe_shared_p is None:
+                            continue
+                        shared_p = maybe_shared_p
+
+                    rel_shared = _format_patch_relative_path(shared_p, patch_root, fs_root)
+
+                    if _is_same_file_or_resolved(shared_p, f1_path):
+                        host_plan = f1_plan
+                        callers = [(f2_plan, u2, t_inputs2, target_outs2)]
+                    elif _is_same_file_or_resolved(shared_p, f2_plan.path):
+                        host_plan = f2_plan
+                        callers = [(f1_plan, u1, t_inputs1, outputs)]
+                    else:
+                        shared_plan = file_plans.get(shared_p)
+                        if shared_plan is None:
+                            is_bad_target = False
+                            kind_desc = ""
+                            try:
+                                if shared_p.is_symlink() or shared_p.is_dir():
+                                    is_bad_target = True
+                                    kind_desc = (
+                                        "an existing symlink"
+                                        if shared_p.is_symlink()
+                                        else "an existing directory"
+                                    )
+                            except (OSError, RuntimeError, ValueError) as exc:
+                                is_bad_target = True
+                                kind_desc = f"unresolvable ({exc})"
+
+                            if is_bad_target:
+                                skip_msg = (
+                                    f"# Note: Cross-module clone pair; shared module path {rel_shared} "
+                                    f"is {kind_desc}; skipping extraction.\n"
+                                )
+                                f1_plan.comments.append(skip_msg)
+                                f2_plan.comments.append(skip_msg)
+                                continue
+
+                            try:
+                                is_existing_file = shared_p.is_file()
+                            except (OSError, RuntimeError, ValueError):
+                                is_existing_file = False
+
+                            if is_existing_file:
+                                try:
+                                    shared_p.resolve().relative_to(patch_root.resolve())
+                                    shared_text = shared_p.read_text(encoding="utf-8")
+                                    shared_plan = _get_plan(
+                                        shared_p, rel_shared, shared_text, is_new_file=False
+                                    )
+                                except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
+                                    read_err_msg = (
+                                        f"# Note: Cross-module clone pair; shared module file {rel_shared} "
+                                        f"exists but could not be read; skipping extraction.\n"
+                                    )
+                                    f1_plan.comments.append(read_err_msg)
+                                    f2_plan.comments.append(read_err_msg)
+                                    continue
+                            else:
+                                shared_plan = _get_plan(
+                                    shared_p, rel_shared, "", is_new_file=True
+                                )
+                        host_plan = shared_plan
+                        callers = [
+                            (f1_plan, u1, t_inputs1, outputs),
+                            (f2_plan, u2, t_inputs2, target_outs2),
+                        ]
+
+                    mod1 = _derive_module_import_path(f1_path, import_root)
+                    mod2 = _derive_module_import_path(f2_plan.path, import_root)
+                    is_pkg1 = f1_path.name == "__init__.py"
+                    is_pkg2 = f2_plan.path.name == "__init__.py"
+                    mod_host = _derive_module_import_path(host_plan.path, import_root)
+                    is_host_pkg = host_plan.path.name == "__init__.py"
+                    helper_code, maybe_imports = _safely_prepare_helper_and_imports(
+                        host_plan=host_plan,
+                        helper_code=helper_code,
+                        scope=scope,
+                        source_texts=[(orig_text, mod1, is_pkg1), (f2_plan.orig_text, mod2, is_pkg2)],
+                        f1_plan=f1_plan,
+                        f2_plan=f2_plan,
+                        host_mod=mod_host,
+                        is_host_pkg=is_host_pkg,
+                    )
+                    if maybe_imports is None:
+                        continue
+                    host_imports = maybe_imports
+
+                    host_disp = normalize_path_string(str(host_plan.rel_path), strip_anchor=False)
+                    dg = _get_depgraph()
+                    if mod_host and host_imports:
+                        host_cycle = dg.check_cycle_if_imports_added(
+                            mod_host,
+                            host_imports,
+                            file_path=host_plan.path,
+                            is_package=is_host_pkg,
+                        )
+                        if host_cycle:
+                            cycle_desc = f"Circular import detected (cycle: {' -> '.join(host_cycle)})"
+                            cycle_msg = (
+                                f"# Note: Cross-module clone pair; helper extraction to {host_disp} "
+                                f"rejected due to circular dependency ({cycle_desc}).\n"
+                            )
+                            f1_plan.comments.append(cycle_msg)
+                            f2_plan.comments.append(cycle_msg)
+                            continue
+
+                    tentative_dg = dg.copy()
+                    if mod_host:
+                        _register_plan_dependencies_in_graph(
+                            tentative_dg, mod_host, host_plan.path, host_imports
+                        )
+
+                    caller_evaluations: List[
+                        Tuple[
+                            _FilePatchPlan,
+                            Dict[str, Any],
+                            List[str],
+                            List[str],
+                            str,
+                            Optional[List[str]],
+                        ]
+                    ] = []
+                    for c_plan, c_unit, c_tin, c_tout in callers:
+                        c_mod = _derive_module_import_path(c_plan.path, import_root)
+                        c_cycle = (
+                            tentative_dg.check_cycle_if_added(c_mod, mod_host)
+                            if (c_mod and mod_host)
+                            else None
+                        )
+                        caller_evaluations.append(
+                            (c_plan, c_unit, c_tin, c_tout, c_mod, c_cycle)
+                        )
+
+                    if host_plan in (f1_plan, f2_plan) and caller_evaluations:
+                        c_plan, _, _, _, c_mod, c_cycle = caller_evaluations[0]
+                        if c_cycle or not mod_host or not c_mod:
+                            c_disp = normalize_path_string(str(c_plan.rel_path), strip_anchor=False)
+                            c_desc = f" (cycle: {' -> '.join(c_cycle)})" if c_cycle else ""
+                            c_msg = (
+                                f"# Note: Cross-module clone pair; helper extraction to {host_disp} rejected. "
+                                f"Circular import or unresolvable module path{c_desc}.\n"
+                            )
+                            f1_plan.comments.append(c_msg)
+                            f2_plan.comments.append(c_msg)
+                            continue
+
+                    if host_plan not in (f1_plan, f2_plan) and all(
+                        bool(cycle or not mod_host or not m_call)
+                        for _, _, _, _, m_call, cycle in caller_evaluations
+                    ):
+                        c_descs = [
+                            f"{m_call}: {' -> '.join(cycle)}"
+                            for _, _, _, _, m_call, cycle in caller_evaluations
+                            if cycle
+                        ]
+                        c_txt = f" ({'; '.join(c_descs)})" if c_descs else ""
+                        skip_msg = (
+                            f"# Note: Cross-module clone pair; helper extraction to {host_disp} "
+                            f"rejected due to circular dependency{c_txt}.\n"
+                        )
+                        f1_plan.comments.append(skip_msg)
+                        f2_plan.comments.append(skip_msg)
+                        continue
+
+                    host_plan.module_helpers.append(helper_code)
+                    host_plan.missing_imports.extend(host_imports)
+                    host_plan.used_helper_names.add(helper_name)
+                    host_plan.comments.append(pair_comment)
+
+                    if mod_host:
+                        _register_plan_dependencies_in_graph(
+                            dg, mod_host, host_plan.path, host_imports
+                        )
+
+                    if replace_clones:
+                        if host_plan is f1_plan:
+                            _delegate_unit_in_plan(
+                                u1,
+                                f1_plan,
+                                helper_name=helper_name,
+                                inputs=inputs,
+                                outputs=outputs,
+                                scope=scope,
+                                target_inputs=t_inputs1,
+                                target_outputs=outputs,
+                                await_prefix=await_prefix,
+                                binding=effective_binding,
+                                step=step,
+                            )
+                        elif host_plan is f2_plan:
+                            _delegate_unit_in_plan(
+                                u2,
+                                f2_plan,
+                                helper_name=helper_name,
+                                inputs=inputs,
+                                outputs=outputs,
+                                scope=scope,
+                                target_inputs=t_inputs2,
+                                target_outputs=target_outs2,
+                                await_prefix=await_prefix,
+                                binding="module",
+                            )
+
+                    for c_plan, c_unit, c_tin, c_tout, mod_caller, cycle in caller_evaluations:
+                        c_plan.comments.append(pair_comment)
+                        c_disp = normalize_path_string(str(c_plan.rel_path), strip_anchor=False)
+                        if cycle or not mod_host or not mod_caller:
+                            cycle_desc = ""
+                            if cycle:
+                                cycle_desc = f"Circular import detected (cycle: {' -> '.join(cycle)})"
+                            else:
+                                cycle_desc = "Unresolvable module import path"
+                            cycle_msg = (
+                                f"# Note: Cross-module clone pair; helper extracted to {host_disp}. "
+                                f"{cycle_desc}; import manually into {c_disp}.\n"
+                            )
+                            c_plan.comments.append(cycle_msg)
+                            host_plan.comments.append(cycle_msg)
+                        else:
+                            c_plan.missing_imports.append(f"from {mod_host} import {helper_name}")
+                            if mod_caller and mod_host:
+                                dg.add_dependency(mod_caller, mod_host)
+                            if replace_clones:
+                                _delegate_unit_in_plan(
+                                    c_unit,
+                                    c_plan,
+                                    helper_name=helper_name,
+                                    inputs=inputs,
+                                    outputs=outputs,
+                                    scope=scope,
+                                    target_inputs=c_tin,
+                                    target_outputs=c_tout,
+                                    await_prefix=await_prefix,
+                                    binding="module",
+                                )
+                            else:
+                                c_plan.comments.append(
+                                    f"# Note: Cross-module clone pair; helper extracted to {host_disp}. "
+                                    f"Complete refactoring by replacing the clone with a call in {c_disp}.\n"
+                                )
+                else:
+                    mod1 = _derive_module_import_path(f1_path, import_root)
+                    mod2 = _derive_module_import_path(f2_plan.path, import_root)
+                    is_pkg1 = f1_path.name == "__init__.py"
+                    is_pkg2 = f2_plan.path.name == "__init__.py"
+                    dg = _get_depgraph()
+
+                    helper_code, maybe_imports = _safely_prepare_helper_and_imports(
+                        host_plan=f1_plan,
+                        helper_code=helper_code,
+                        scope=scope,
+                        source_texts=[(orig_text, mod1, is_pkg1), (f2_plan.orig_text, mod2, is_pkg2)],
+                        f1_plan=f1_plan,
+                        f2_plan=f2_plan,
+                        host_mod=mod1,
+                        is_host_pkg=is_pkg1,
+                    )
+                    if maybe_imports is None:
+                        continue
+                    host_imports = maybe_imports
+
+                    if mod1 and host_imports:
+                        host_cycle = dg.check_cycle_if_imports_added(
+                            mod1,
+                            host_imports,
+                            file_path=f1_plan.path,
+                            is_package=is_pkg1,
+                        )
+                        if host_cycle:
+                            cycle_desc = f" (cycle: {' -> '.join(host_cycle)})"
+                            cycle_msg = (
+                                f"# Note: Cross-module clone pair; helper extraction to {f1_disp} "
+                                f"rejected due to circular dependency{cycle_desc}.\n"
+                            )
+                            for plan in (f1_plan, f2_plan):
+                                plan.comments.append(cycle_msg)
+                            continue
+
+                    tentative_dg = dg.copy()
+                    if mod1:
+                        _register_plan_dependencies_in_graph(
+                            tentative_dg, mod1, f1_plan.path, host_imports
+                        )
+
+                    cycle = (
+                        tentative_dg.check_cycle_if_added(mod2, mod1)
+                        if (mod1 and mod2)
+                        else None
+                    )
+                    direct_import = bool(
+                        mod2
+                        and _module_imports_target(
+                            orig_text, mod2, current_mod=mod1, is_package=is_pkg1
+                        )
+                    )
+                    is_circular = bool(cycle or direct_import)
+
+                    if is_circular or not mod1 or not mod2:
+                        cycle_desc = ""
+                        if cycle:
+                            cycle_desc = f" (cycle: {' -> '.join(cycle)})"
+                        elif direct_import:
+                            cycle_desc = f" (cycle: {mod2} -> {mod1} -> {mod2})"
                         cycle_msg = (
-                            f"# Note: Cross-module clone pair; helper extraction to {f1_disp} "
-                            f"rejected due to circular dependency{cycle_desc}.\n"
+                            f"# Note: Cross-module clone pair; helper extraction to {f1_disp} rejected. "
+                            f"Circular import or unresolvable module path{cycle_desc}.\n"
                         )
                         for plan in (f1_plan, f2_plan):
                             plan.comments.append(cycle_msg)
                         continue
 
-                tentative_dg = dg.copy()
-                if mod1:
-                    _register_plan_dependencies_in_graph(
-                        tentative_dg, mod1, f1_plan.path, host_imports
-                    )
+                    if mod1:
+                        _register_plan_dependencies_in_graph(
+                            dg, mod1, f1_plan.path, host_imports
+                        )
 
-                cycle = (
-                    tentative_dg.check_cycle_if_added(mod2, mod1)
-                    if (mod1 and mod2)
-                    else None
-                )
-                direct_import = bool(
-                    mod2
-                    and _module_imports_target(
-                        orig_text, mod2, current_mod=mod1, is_package=is_pkg1
+                    _wire_cross_module_host_delegation(
+                        f1_plan=f1_plan,
+                        f2_plan=f2_plan,
+                        u2=u2,
+                        mod1=mod1,
+                        helper_name=helper_name,
+                        pair_comment=pair_comment,
+                        f1_disp=f1_disp,
+                        f2_disp=f2_disp,
+                        replace_clones=replace_clones,
+                        inputs=inputs,
+                        outputs=outputs,
+                        scope=scope,
+                        t_inputs2=t_inputs2,
+                        target_outs2=target_outs2,
+                        await_prefix=await_prefix,
                     )
-                )
-                is_circular = bool(cycle or direct_import)
+                    if replace_clones and mod1 and mod2:
+                        dg.add_dependency(mod2, mod1)
 
-                if is_circular or not mod1 or not mod2:
-                    cycle_desc = ""
-                    if cycle:
-                        cycle_desc = f" (cycle: {' -> '.join(cycle)})"
-                    elif direct_import:
-                        cycle_desc = f" (cycle: {mod2} -> {mod1} -> {mod2})"
-                    cycle_msg = (
-                        f"# Note: Cross-module clone pair; helper extraction to {f1_disp} rejected. "
-                        f"Circular import or unresolvable module path{cycle_desc}.\n"
+                    _finalize_host_unit_and_helper(
+                        plan=f1_plan,
+                        unit=u1,
+                        helper_name=helper_name,
+                        inputs=inputs,
+                        outputs=outputs,
+                        scope=scope,
+                        target_inputs=t_inputs1,
+                        binding=effective_binding,
+                        step=step,
+                        insert_line=insert_line,
+                        helper_code=helper_code,
+                        missing_imports=host_imports,
+                        await_prefix=await_prefix,
+                        replace_clones=replace_clones,
                     )
-                    for plan in (f1_plan, f2_plan):
-                        plan.comments.append(cycle_msg)
-                    continue
-
-                if mod1:
-                    _register_plan_dependencies_in_graph(
-                        dg, mod1, f1_plan.path, host_imports
-                    )
-
-                _wire_cross_module_host_delegation(
+            else:
+                mod1 = _derive_module_import_path(f1_path, import_root)
+                is_pkg1 = f1_path.name == "__init__.py"
+                helper_code, maybe_imports = _safely_prepare_helper_and_imports(
+                    host_plan=f1_plan,
+                    helper_code=helper_code,
+                    scope=scope,
+                    source_texts=[(orig_text, mod1, is_pkg1)],
                     f1_plan=f1_plan,
                     f2_plan=f2_plan,
-                    u2=u2,
-                    mod1=mod1,
-                    helper_name=helper_name,
-                    pair_comment=pair_comment,
-                    f1_disp=f1_disp,
-                    f2_disp=f2_disp,
-                    replace_clones=replace_clones,
-                    inputs=inputs,
-                    outputs=outputs,
-                    scope=scope,
-                    t_inputs2=t_inputs2,
-                    target_outs2=target_outs2,
-                    await_prefix=await_prefix,
+                    host_mod=mod1,
+                    is_host_pkg=is_pkg1,
                 )
-                if replace_clones and mod1 and mod2:
-                    dg.add_dependency(mod2, mod1)
+                if maybe_imports is None:
+                    continue
+                host_imports = maybe_imports
 
+                f1_plan.comments.append(
+                    f"# Note: Cross-module clone pair; helper generated in {f1_disp}. "
+                    f"Complete refactoring by importing the helper into {f2_disp}.\n"
+                )
                 _finalize_host_unit_and_helper(
                     plan=f1_plan,
                     unit=u1,
@@ -3025,43 +3135,17 @@ def generate_refactoring_patch(
                     await_prefix=await_prefix,
                     replace_clones=replace_clones,
                 )
-        else:
-            mod1 = _derive_module_import_path(f1_path, import_root)
-            is_pkg1 = f1_path.name == "__init__.py"
-            helper_code, maybe_imports = _safely_prepare_helper_and_imports(
-                host_plan=f1_plan,
-                helper_code=helper_code,
-                scope=scope,
-                source_texts=[(orig_text, mod1, is_pkg1)],
-                f1_plan=f1_plan,
-                f2_plan=f2_plan,
-                host_mod=mod1,
-                is_host_pkg=is_pkg1,
+        except (ValueError, TypeError) as exc:
+            logger.debug(
+                "Skipping clone pair due to coordinate or processing error: %s", exc
             )
-            if maybe_imports is None:
-                continue
-            host_imports = maybe_imports
-
-            f1_plan.comments.append(
-                f"# Note: Cross-module clone pair; helper generated in {f1_disp}. "
-                f"Complete refactoring by importing the helper into {f2_disp}.\n"
-            )
-            _finalize_host_unit_and_helper(
-                plan=f1_plan,
-                unit=u1,
-                helper_name=helper_name,
-                inputs=inputs,
-                outputs=outputs,
-                scope=scope,
-                target_inputs=t_inputs1,
-                binding=effective_binding,
-                step=step,
-                insert_line=insert_line,
-                helper_code=helper_code,
-                missing_imports=host_imports,
-                await_prefix=await_prefix,
-                replace_clones=replace_clones,
-            )
+            for p in list(file_plans.keys()):
+                if p not in plans_snapshot:
+                    del file_plans[p]
+                else:
+                    file_plans[p].restore(plans_snapshot[p])
+            graph_holder[0] = graph_snapshot
+            continue
 
     patch_chunks: List[str] = []
     seen_comments: Set[str] = set()
