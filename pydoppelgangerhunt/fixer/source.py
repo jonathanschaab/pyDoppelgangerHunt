@@ -411,9 +411,9 @@ def col_offset_to_char_offset(line: str, col_offset: Optional[Union[int, str]] =
     """Translates a 0-indexed column offset into a character index within line.
 
     Python's AST emits col_offset and end_col_offset as UTF-8 byte offsets.
-    This helper translates that byte offset into the character index into line,
-    safely falling back to min(len(line), col_offset) if col_offset is already
-    a character index or on decode anomalies.
+    This helper translates that byte offset into the character index into line.
+    If col_offset lands in the middle of a multi-byte UTF-8 sequence, it safely
+    clamps to the nearest valid character boundary preceding the malformed offset.
     """
     if col_offset is None:
         return 0
@@ -430,7 +430,8 @@ def col_offset_to_char_offset(line: str, col_offset: Optional[Union[int, str]] =
         prefix = line_bytes[:c_off].decode("utf-8")
         return len(prefix)
     except UnicodeDecodeError:
-        return min(len(line), c_off)
+        # Clamps to the nearest valid character boundary preceding the malformed byte offset
+        return len(line_bytes[:c_off].decode("utf-8", errors="ignore"))
 
 
 def _compute_unit_spans(

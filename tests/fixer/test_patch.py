@@ -5945,6 +5945,57 @@ def test_check_units_overlap_multiline_end_boundary_single_line() -> None:
     assert "fast_res + offset\n" in refactored
 
 
+def test_check_units_overlap_multiline_start_boundary_single_line() -> None:
+    """Verifies column-aware overlap detection when a single-line unit shares a multi-line unit's start line."""
+    from pydoppelgangerhunt.fixer import check_units_overlap
+
+    u_multi = {
+        "file": "pkg/mod.py",
+        "start": 1,
+        "end": 3,
+        "start_col": 20,
+        "end_col": 30,
+    }
+    u_single = {
+        "file": "pkg/mod.py",
+        "start": 1,
+        "end": 1,
+        "start_col": 40,
+        "end_col": 50,
+    }
+
+    assert not check_units_overlap(u_multi, u_single)
+    assert not check_units_overlap(u_single, u_multi)
+
+    u_single_overlap = {
+        "file": "pkg/mod.py",
+        "start": 1,
+        "end": 1,
+        "start_col": 25,
+        "end_col": 35,
+    }
+
+    assert check_units_overlap(u_multi, u_single_overlap)
+    assert check_units_overlap(u_single_overlap, u_multi)
+
+
+def test_col_offset_to_char_offset_clamps_malformed_utf8_offset() -> None:
+    """Verifies that col_offset_to_char_offset clamps to the nearest valid character boundary when offset lands mid-sequence."""
+    from pydoppelgangerhunt.fixer import col_offset_to_char_offset
+
+    line = "header = '\U0001F680'; data = 42\n"
+    # '\U0001F680' begins at byte 10 and ends at byte 14 (UTF-8 bytes: 10, 11, 12, 13)
+    # Byte offset 10 points to the emoji character (char index 10)
+    assert col_offset_to_char_offset(line, 10) == 10
+    # Byte offsets 11, 12, 13 land in the middle of '\U0001F680' and clamp to char index 10
+    assert col_offset_to_char_offset(line, 11) == 10
+    assert col_offset_to_char_offset(line, 12) == 10
+    assert col_offset_to_char_offset(line, 13) == 10
+    # Byte offset 14 points past the emoji (char index 11)
+    assert col_offset_to_char_offset(line, 14) == 11
+
+
+
 
 
 

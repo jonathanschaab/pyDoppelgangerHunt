@@ -119,25 +119,15 @@ def check_units_overlap(
     sc1, ec1 = _safe_col(u1.get("start_col")), _safe_col(u1.get("end_col"))
     sc2, ec2 = _safe_col(u2.get("start_col")), _safe_col(u2.get("end_col"))
 
-    if start1 == end1 == start2 == end2:
-        if sc1 is not None and ec1 is not None and sc2 is not None and ec2 is not None:
-            if sc1 <= ec1 and sc2 <= ec2:
-                return max(sc1, sc2) < min(ec1, ec2)
-            return False
-
-    # When units share exactly one line (start, end, or touching boundary),
-    # check sub-line column disjointness at that shared boundary line:
-    # 1. Unit 1 ends on the line Unit 2 starts (including Unit 1 single-line at Unit 2 start,
-    #    or Unit 2 single-line at Unit 1 end): end1 == start2
-    # 2. Unit 2 ends on the line Unit 1 starts (including Unit 2 single-line at Unit 1 start,
-    #    or Unit 1 single-line at Unit 2 end): end2 == start1
+    # When units share exactly one boundary line (max(start1, start2) == min(end1, end2)),
+    # check sub-line column disjointness on that shared line:
     if max(start1, start2) == min(end1, end2):
-        if end1 == start2:
-            if ec1 is not None and sc2 is not None:
-                return sc2 < ec1
-        elif end2 == start1:
-            if ec2 is not None and sc1 is not None:
-                return sc1 < ec2
+        if sc1 is not None and ec1 is not None and sc2 is not None and ec2 is not None:
+            if start1 == end1 and sc1 > ec1:
+                return False
+            if start2 == end2 and sc2 > ec2:
+                return False
+            return max(sc1, sc2) < min(ec1, ec2)
 
     return max(start1, start2) <= min(end1, end2)
 
