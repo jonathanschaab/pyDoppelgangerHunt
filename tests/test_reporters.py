@@ -802,6 +802,18 @@ def test_extract_unit_source_code_notebook_with_literal_hash_in_filename(tmp_pat
     lines_cell2 = extract_unit_source_code(unit_cell2, repo_root=str(tmp_path))
     assert lines_cell2 == ["def run_cell_two():\n", "    return 2\n"]
 
+    # 3. Notebook file with literal #cellular in filename must not be treated as a cell anchor
+    nb_cell_file = tmp_path / "report.ipynb#cellular.ipynb"
+    nb_cell_file.write_text(json.dumps(nb_content), encoding="utf-8")
+    unit_literal_cell = {
+        "file": "report.ipynb#cellular.ipynb",
+        "start": 1,
+        "end": 2,
+    }
+    literal_lines = extract_unit_source_code(unit_literal_cell, repo_root=str(tmp_path))
+    assert len(literal_lines) >= 1
+    assert "{" in "".join(literal_lines)
+
 
 
 

@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
+from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
 from pydoppelgangerhunt.config import normalize_path_string
 
 
@@ -103,17 +104,10 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
         is_cell_anchor = False
         cell_idx = -1
         if resolved_file.suffix.lower() == ".ipynb" and "#" in raw_file:
-            last_seg = raw_file.replace("\\", "/").rsplit("/", 1)[-1]
-            if "#" in last_seg:
-                fname, fragment = last_seg.rsplit("#", 1)
-                fname_lower = fname.lower()
-                frag_lower = fragment.lower()
-                if fname_lower.endswith(".ipynb") and frag_lower.startswith("cell"):
-                    prefix = "cell_" if frag_lower.startswith("cell_") else "cell"
-                    suffix = frag_lower[len(prefix) :]
-                    if suffix.isdigit():
-                        cell_idx = int(suffix) - 1
-                        is_cell_anchor = True
+            parsed_nb = parse_notebook_cell_anchor(raw_file)
+            if parsed_nb is not None:
+                cell_idx = parsed_nb[1]
+                is_cell_anchor = True
 
         if is_cell_anchor:
             try:

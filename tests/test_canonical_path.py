@@ -32,13 +32,42 @@ def test_normalize_lexical_posix_separators_and_anchors() -> None:
     assert normalize_lexical_posix("././foo/bar.py") == "foo/bar.py"
     assert normalize_lexical_posix(".\\.\\foo\\bar.py") == "foo/bar.py"
     assert normalize_lexical_posix("foo/bar.ipynb#cell_1", strip_anchor=True) == "foo/bar.ipynb"
+    assert normalize_lexical_posix("foo/bar.ipynb#cell1", strip_anchor=True) == "foo/bar.ipynb"
     assert normalize_lexical_posix("foo/bar.ipynb#cell_1", strip_anchor=False) == "foo/bar.ipynb#cell_1"
     assert normalize_lexical_posix("foo/experiment#1.ipynb#cell_4", strip_anchor=True) == "foo/experiment#1.ipynb"
     assert normalize_lexical_posix("foo/experiment#1.ipynb#cell_4", strip_anchor=False) == "foo/experiment#1.ipynb#cell_4"
+    # Literal hash paths with fragments starting with cell but not digits must NOT be stripped
+    assert normalize_lexical_posix("foo/report.ipynb#cellular", strip_anchor=True) == "foo/report.ipynb#cellular"
+    assert normalize_lexical_posix("foo/report.ipynb#cell", strip_anchor=True) == "foo/report.ipynb#cell"
+    assert normalize_lexical_posix("foo/report.ipynb#cell_", strip_anchor=True) == "foo/report.ipynb#cell_"
+    assert normalize_lexical_posix("foo/report.ipynb#cell_abc", strip_anchor=True) == "foo/report.ipynb#cell_abc"
+    assert normalize_lexical_posix("foo/report#cellular.ipynb#cell_2", strip_anchor=True) == "foo/report#cellular.ipynb"
     assert normalize_lexical_posix("foo/bar.py#cell_1", strip_anchor=True) == "foo/bar.py#cell_1"
     assert normalize_lexical_posix("worker.py#cell_data.py", strip_anchor=True) == "worker.py#cell_data.py"
     assert normalize_lexical_posix("worker.py#v1", strip_anchor=True) == "worker.py#v1"
     assert normalize_lexical_posix("repo#1/pkg#2/mod.py", strip_anchor=False) == "repo#1/pkg#2/mod.py"
+
+
+def test_parse_notebook_cell_anchor() -> None:
+    """Verifies that parse_notebook_cell_anchor extracts base path and 0-based index strictly for digit suffixes."""
+    from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor  # pylint: disable=import-outside-toplevel
+
+    assert parse_notebook_cell_anchor(None) is None
+    assert parse_notebook_cell_anchor("") is None
+    assert parse_notebook_cell_anchor("script.py") is None
+    assert parse_notebook_cell_anchor("notebook.ipynb") is None
+    assert parse_notebook_cell_anchor("notebook.ipynb#cellular") is None
+    assert parse_notebook_cell_anchor("notebook.ipynb#cell") is None
+    assert parse_notebook_cell_anchor("notebook.ipynb#cell_") is None
+    assert parse_notebook_cell_anchor("notebook.ipynb#cell_abc") is None
+    assert parse_notebook_cell_anchor("notebook.py#cell_1") is None
+
+    # Valid anchors
+    assert parse_notebook_cell_anchor("analysis.ipynb#cell_1") == ("analysis.ipynb", 0)
+    assert parse_notebook_cell_anchor("analysis.ipynb#cell1") == ("analysis.ipynb", 0)
+    assert parse_notebook_cell_anchor("dir/sub/analysis.ipynb#cell_10") == ("dir/sub/analysis.ipynb", 9)
+    assert parse_notebook_cell_anchor("dir\\sub\\analysis.ipynb#cell_5") == ("dir\\sub\\analysis.ipynb", 4)
+    assert parse_notebook_cell_anchor("report#cellular.ipynb#cell_3") == ("report#cellular.ipynb", 2)
 
 
 def test_normalize_lexical_posix_windows_drive_letters() -> None:

@@ -31,6 +31,7 @@ from pydoppelgangerhunt.canonical_path import (
     build_diff_path_keys,
     lexical_relative_to,
     normalize_lexical_posix,
+    parse_notebook_cell_anchor,
 )
 from pydoppelgangerhunt.cli import build_arg_parser, main
 from pydoppelgangerhunt.clustering import (
@@ -222,6 +223,7 @@ __all__ = [
     "CanonicalPath",
     "CanonicalPathResolver",
     "normalize_lexical_posix",
+    "parse_notebook_cell_anchor",
     "lexical_relative_to",
     "build_diff_path_keys",
     "DiffPathKeySet",

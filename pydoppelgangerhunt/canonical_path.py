@@ -16,6 +16,39 @@ from typing import AbstractSet, Dict, Iterable, List, Optional, Sequence, Set, T
 import unicodedata
 
 
+def parse_notebook_cell_anchor(path_str: Optional[str]) -> Optional[Tuple[str, int]]:
+    """Extracts base path and 0-based cell index from an anchored notebook path.
+
+    Requires documented notebook cell anchor formats: `#cell_` + digits or `#cell` + digits
+    (e.g., `analysis.ipynb#cell_1` or `analysis.ipynb#cell1`).
+    Literal filenames with hash fragments (e.g. `report.ipynb#cellular`) return None.
+
+    Args:
+        path_str: Path string that may contain a notebook cell fragment.
+
+    Returns:
+        (base_path, 0-based cell_index) if path has a valid notebook cell anchor, else None.
+    """
+    if path_str is None:
+        return None
+    raw = str(path_str).rstrip("\r\n")
+    if "#" not in raw:
+        return None
+    last_seg = raw.replace("\\", "/").rsplit("/", 1)[-1]
+    if "#" not in last_seg:
+        return None
+    fname, fragment = last_seg.rsplit("#", 1)
+    fname_lower = fname.lower()
+    frag_lower = fragment.lower()
+    if fname_lower.endswith(".ipynb") and frag_lower.startswith("cell"):
+        prefix = "cell_" if frag_lower.startswith("cell_") else "cell"
+        suffix = frag_lower[len(prefix) :]
+        if suffix.isdigit():
+            base_path = raw[: len(raw) - len(fragment) - 1]
+            return base_path, int(suffix) - 1
+    return None
+
+
 def normalize_lexical_posix(path_str: Optional[str], strip_anchor: bool = False) -> str:
     """Normalizes a path string to forward slashes with drive and anchor handling.
 
@@ -39,13 +72,9 @@ def normalize_lexical_posix(path_str: Optional[str], strip_anchor: bool = False)
         return ""
 
     if strip_anchor and "#" in raw:
-        last_seg = raw.replace("\\", "/").rsplit("/", 1)[-1]
-        if "#" in last_seg:
-            fname, fragment = last_seg.rsplit("#", 1)
-            fname_lower = fname.lower()
-            frag_lower = fragment.lower()
-            if fname_lower.endswith(".ipynb") and frag_lower.startswith("cell"):
-                raw = raw[: len(raw) - len(fragment) - 1]
+        parsed_nb = parse_notebook_cell_anchor(raw)
+        if parsed_nb is not None:
+            raw = parsed_nb[0]
 
     norm = raw.replace("\\", "/")
     while norm.startswith("./"):
@@ -736,20 +765,16 @@ class CanonicalPathResolver:
         # Stripped anchor match (for documented notebook cell anchors like .ipynb#cell_1 or .ipynb#cell1)
         if strip_anchor:
             raw_str = str(getattr(unit_file, "raw", unit_file) or "")
-            if "#" in raw_str:
-                last_seg = raw_str.replace("\\", "/").rsplit("/", 1)[-1]
-                if "#" in last_seg:
-                    fname, fragment = last_seg.rsplit("#", 1)
-                    if fname.lower().endswith(".ipynb") and fragment.lower().startswith("cell"):
-                        return self._probe_keys_in_diff(
-                            self.target_key(unit_file, basis=basis, strip_anchor=True),
-                            self.repo_key(unit_file, basis=basis, strip_anchor=True),
-                            self.canonical_key(unit_file, basis=basis, strip_anchor=True),
-                            diff_keys,
-                            has_tagged=bool(has_tagged),
-                            diff_target_keys=dt_keys,
-                            diff_repo_keys=dr_keys,
-                        )
+            if parse_notebook_cell_anchor(raw_str) is not None:
+                return self._probe_keys_in_diff(
+                    self.target_key(unit_file, basis=basis, strip_anchor=True),
+                    self.repo_key(unit_file, basis=basis, strip_anchor=True),
+                    self.canonical_key(unit_file, basis=basis, strip_anchor=True),
+                    diff_keys,
+                    has_tagged=bool(has_tagged),
+                    diff_target_keys=dt_keys,
+                    diff_repo_keys=dr_keys,
+                )
 
         return False
 
