@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.config import find_matching_path_value, normalize_path_string
+
+logger = logging.getLogger(__name__)
 
 MAJOR_POLICY_THRESHOLD: float = 0.50
 NEW_POLICY_THRESHOLD: float = 0.80
@@ -448,19 +451,60 @@ def filter_clones_by_git_diff(
     if not modified_ranges:
         return []
     filtered: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
+    matched_units_count = 0
+    total_units_count = 0
     for sim, u1, u2 in clones:
+        total_units_count += 2
         u1_mod = is_unit_in_modified_ranges(
             u1, modified_ranges, min_overlap_ratio=min_overlap_ratio, policy=policy, unit_basis=unit_basis
         )
         u2_mod = is_unit_in_modified_ranges(
             u2, modified_ranges, min_overlap_ratio=min_overlap_ratio, policy=policy, unit_basis=unit_basis
         )
+        if u1_mod:
+            matched_units_count += 1
+        if u2_mod:
+            matched_units_count += 1
         if both_units:
             if u1_mod and u2_mod:
                 filtered.append((sim, u1, u2))
         else:
             if u1_mod or u2_mod:
                 filtered.append((sim, u1, u2))
+
+    if clones and matched_units_count == 0:
+        if isinstance(modified_ranges, DiffRangeMap) or (
+            hasattr(modified_ranges, "repo_ranges") and hasattr(modified_ranges, "target_ranges")
+        ):
+            target_map = getattr(modified_ranges, "target_ranges", {})
+            repo_map = getattr(modified_ranges, "repo_ranges", {})
+            active_coord_set = repo_map if unit_basis == "repo" else target_map
+            alt_coord_set = target_map if unit_basis == "repo" else repo_map
+            if active_coord_set:
+                alt_basis = "target" if unit_basis == "repo" else "repo"
+                alt_matches = 0
+                for _, u1, u2 in clones:
+                    for u in (u1, u2):
+                        rf = str(u.get("file") or "")
+                        fn = normalize_path_string(rf, strip_anchor=True)
+                        if fn and fn in alt_coord_set:
+                            alt_matches += 1
+                if alt_matches > 0:
+                    logger.debug(
+                        "DiffRangeMap lookup with authoritative coordinate set '%s' came back empty across all %d unit(s), "
+                        "but %d unit(s) matched alternative basis '%s'. Possible basis mismatch.",
+                        unit_basis,
+                        total_units_count,
+                        alt_matches,
+                        alt_basis,
+                    )
+                else:
+                    logger.debug(
+                        "DiffRangeMap lookup with authoritative coordinate set '%s' came back empty across all %d unit(s).",
+                        unit_basis,
+                        total_units_count,
+                    )
+
     return filtered
 
 

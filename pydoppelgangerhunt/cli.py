@@ -560,12 +560,37 @@ def _apply_baseline_and_diff_filters(
             modified_ranges = _normalize_modified_ranges_for_target(
                 modified_ranges, git_diff_root, target_repo_root
             )
+        chosen_basis = "repo"
+        if (
+            clones
+            and isinstance(modified_ranges, DiffRangeMap)
+            and modified_ranges.target_ranges
+            and modified_ranges.repo_ranges
+        ):
+            sample_units = [u for item in clones[:10] for u in (item[1], item[2]) if isinstance(u, dict)]
+            target_hits = sum(
+                1
+                for u in sample_units
+                if normalize_path_string(str(u.get("file") or ""), strip_anchor=True) in modified_ranges.target_ranges
+            )
+            repo_hits = sum(
+                1
+                for u in sample_units
+                if normalize_path_string(str(u.get("file") or ""), strip_anchor=True) in modified_ranges.repo_ranges
+            )
+            if target_hits > 0 and repo_hits == 0:
+                logger.debug(
+                    "Detected target-relative clone endpoints at filter callsite (%d target hits vs 0 repo hits); using unit_basis='target'",
+                    target_hits,
+                )
+                chosen_basis = "target"
+
         clones = filter_clones_by_git_diff(
             clones,
             modified_ranges,
             policy=diff_policy,
             min_overlap_ratio=min_overlap,
-            unit_basis="repo",
+            unit_basis=chosen_basis,
         )
         if args.format == "text":
             print(f"[INFO] Filtered by git diff (policy={diff_policy}): {len(clones)} clone pair(s) touch modified lines.")

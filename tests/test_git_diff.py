@@ -1362,3 +1362,90 @@ def test_diff_range_map_get_ranges_for_unit_fallbacks_and_anti_collision() -> No
     assert isolated.get_ranges_for_unit({"file": "src/foo.py"}, unit_basis="target") is None
 
 
+def test_filter_clones_by_git_diff_debug_logging_on_empty_lookup(caplog: pytest.LogCaptureFixture) -> None:
+    """Verifies filter_clones_by_git_diff emits debug logs when DiffRangeMap lookup is empty across all units."""
+    import logging
+    from pydoppelgangerhunt.git_diff import (  # pylint: disable=import-outside-toplevel
+        DiffRangeMap,
+        filter_clones_by_git_diff,
+    )
+
+    u1 = {"file": "foo.py", "start": 1, "end": 10}
+    u2 = {"file": "other.py", "start": 1, "end": 10}
+    clones = [(1.0, u1, u2)]
+
+    diff_map = DiffRangeMap(
+        {"repo:src/foo.py": [(1, 5)], "src/foo.py": [(1, 5)], "target:foo.py": [(1, 5)]},
+        repo_ranges={"src/foo.py": [(1, 5)]},
+        target_ranges={"foo.py": [(1, 5)]},
+    )
+
+    # 1. Querying with unit_basis="repo" when units are target-relative:
+    # 'foo.py' does not match repo_ranges, but matches target_ranges -> triggers basis mismatch log
+    with caplog.at_level(logging.DEBUG, logger="pydoppelgangerhunt.git_diff"):
+        caplog.clear()
+        res = filter_clones_by_git_diff(clones, diff_map, unit_basis="repo")
+        assert len(res) == 0
+        assert any(
+            "Possible basis mismatch" in record.message and "authoritative coordinate set 'repo'" in record.message
+            for record in caplog.records
+        )
+
+    # 2. Querying when no units match either coordinate set:
+    u_unrelated1 = {"file": "unrelated1.py", "start": 1, "end": 10}
+    u_unrelated2 = {"file": "unrelated2.py", "start": 1, "end": 10}
+    unrelated_clones = [(1.0, u_unrelated1, u_unrelated2)]
+    with caplog.at_level(logging.DEBUG, logger="pydoppelgangerhunt.git_diff"):
+        caplog.clear()
+        res2 = filter_clones_by_git_diff(unrelated_clones, diff_map, unit_basis="repo")
+        assert len(res2) == 0
+        assert any(
+            "came back empty across all 2 unit(s)" in record.message and "Possible basis mismatch" not in record.message
+            for record in caplog.records
+        )
+
+
+def test_apply_baseline_and_diff_filters_adapts_to_target_relative_clones(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    """Verifies _apply_baseline_and_diff_filters adapts to target-relative clones when repo basis misses."""
+    import argparse
+    import logging
+    from unittest.mock import patch  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.cli import _apply_baseline_and_diff_filters  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+    foo = src / "foo.py"
+    foo.write_text("def a(): pass\n", encoding="utf-8")
+
+    u1 = {"file": "foo.py", "start": 1, "end": 5}
+    u2 = {"file": "foo.py", "start": 1, "end": 5}
+    clones = [(1.0, u1, u2)]
+
+    args = argparse.Namespace(
+        baseline=None,
+        prune_baseline=False,
+        diff_only=True,
+        partial_hunk_policy="any",
+        min_diff_overlap=0.0,
+        since=None,
+        format="json",
+    )
+    with patch("pydoppelgangerhunt.cli._safe_call_git_diff_helper") as mock_diff:
+        mock_diff.return_value = {"src/foo.py": [(1, 5)]}
+        with caplog.at_level(logging.DEBUG, logger="pydoppelgangerhunt.cli"):
+            filtered, _ = _apply_baseline_and_diff_filters(
+                clones,
+                args,
+                tool_cfg={},
+                target_repo_root=str(src),
+                target=str(src),
+                repo_root=str(repo),
+            )
+            assert len(filtered) == 1
+            assert any("using unit_basis='target'" in record.message for record in caplog.records)
+
+
+

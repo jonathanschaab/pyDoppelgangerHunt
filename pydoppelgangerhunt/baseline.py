@@ -581,6 +581,9 @@ def record_baseline(
             u2 = item[2] if isinstance(item[2], dict) else {}
         elif isinstance(item, dict):
             sim = float(item.get("similarity", 1.0))
+            # Supports both nested unit dictionaries (item["u1"]/item["u2"] or item["unit_a"]/item["unit_b"])
+            # and flat baseline records (where item directly contains file_a/b, name_a/b, hash_a/b).
+            # When flat, both u1 and u2 reference item so endpoint lookups fall back to their _a and _b variants.
             u1 = item.get("u1") or item.get("unit_a") or item
             u2 = item.get("u2") or item.get("unit_b") or item
 
