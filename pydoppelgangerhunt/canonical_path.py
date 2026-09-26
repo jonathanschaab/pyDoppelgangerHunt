@@ -278,6 +278,7 @@ class CanonicalPathResolver:
         self._tagged_keys_cache: Optional[
             Tuple[int, int, Optional[str], bool, Optional[Set[str]], Optional[Set[str]]]
         ] = None
+        self._bound_diff_id: Optional[int] = None
         self.diff_target_keys: Optional[Set[str]] = None
         self.diff_repo_keys: Optional[Set[str]] = None
 
@@ -285,6 +286,7 @@ class CanonicalPathResolver:
         """Clears memoized path resolutions and cached diff key metadata."""
         self._cache.clear()
         self._tagged_keys_cache = None
+        self._bound_diff_id = None
         self.diff_target_keys = None
         self.diff_repo_keys = None
 
@@ -600,6 +602,37 @@ class CanonicalPathResolver:
             self.diff_target_keys = {k[7:] for k in diff_keys if k.startswith("target:")}
             self.diff_repo_keys = {k[5:] for k in diff_keys if k.startswith("repo:")}
 
+        self._bound_diff_id = id(diff_keys)
+        sample_key = next(iter(diff_keys), None) if diff_keys else None
+        has_tagged = any(k.startswith(("repo:", "target:")) for k in diff_keys)
+        self._tagged_keys_cache = (
+            id(diff_keys),
+            len(diff_keys),
+            sample_key,
+            bool(has_tagged),
+            self.diff_target_keys,
+            self.diff_repo_keys,
+        )
+
+    def _resolve_coordinate_diff_keys(
+        self,
+        diff_keys: Set[str],
+        diff_target_keys: Optional[Set[str]],
+        diff_repo_keys: Optional[Set[str]],
+    ) -> Tuple[Optional[Set[str]], Optional[Set[str]]]:
+        """Resolves target and repo diff keys from explicit args, DiffPathKeySet, or bound resolver state."""
+        dt_keys = diff_target_keys
+        dr_keys = diff_repo_keys
+        if dt_keys is None and hasattr(diff_keys, "diff_target_keys"):
+            dt_keys = getattr(diff_keys, "diff_target_keys")
+        if dr_keys is None and hasattr(diff_keys, "diff_repo_keys"):
+            dr_keys = getattr(diff_keys, "diff_repo_keys")
+        if dt_keys is None and self.diff_target_keys is not None:
+            if self._bound_diff_id is not None and self._bound_diff_id == id(diff_keys):
+                dt_keys = self.diff_target_keys
+                dr_keys = self.diff_repo_keys
+        return dt_keys, dr_keys
+
     def _probe_keys_in_diff(
         self,
         t_key: Optional[str],
@@ -611,8 +644,10 @@ class CanonicalPathResolver:
         diff_repo_keys: Optional[Set[str]] = None,
     ) -> bool:
         """Probes coordinate keys against diff set respecting coordinate tag isolation."""
-        dt_keys = diff_target_keys if diff_target_keys is not None else self.diff_target_keys
-        dr_keys = diff_repo_keys if diff_repo_keys is not None else self.diff_repo_keys
+        dt_keys, dr_keys = self._resolve_coordinate_diff_keys(
+            diff_keys, diff_target_keys, diff_repo_keys
+        )
+
         if has_tagged:
             if dt_keys is not None and dr_keys is not None:
                 return bool(
@@ -643,8 +678,9 @@ class CanonicalPathResolver:
         if not unit_file or not diff_keys:
             return False
 
-        dt_keys = diff_target_keys if diff_target_keys is not None else self.diff_target_keys
-        dr_keys = diff_repo_keys if diff_repo_keys is not None else self.diff_repo_keys
+        dt_keys, dr_keys = self._resolve_coordinate_diff_keys(
+            diff_keys, diff_target_keys, diff_repo_keys
+        )
 
         if has_tagged is None or dt_keys is None or dr_keys is None:
             cached = self._tagged_keys_cache
@@ -667,12 +703,8 @@ class CanonicalPathResolver:
                     has_tagged = any(k.startswith(("repo:", "target:")) for k in diff_keys)
                 sample_key = next(iter(diff_keys), None) if diff_keys else None
                 if has_tagged and (dt_keys is None or dr_keys is None):
-                    if hasattr(diff_keys, "diff_target_keys") and hasattr(diff_keys, "diff_repo_keys"):
-                        dt_keys = getattr(diff_keys, "diff_target_keys")
-                        dr_keys = getattr(diff_keys, "diff_repo_keys")
-                    else:
-                        dt_keys = {k[7:] for k in diff_keys if k.startswith("target:")}
-                        dr_keys = {k[5:] for k in diff_keys if k.startswith("repo:")}
+                    dt_keys = {k[7:] for k in diff_keys if k.startswith("target:")}
+                    dr_keys = {k[5:] for k in diff_keys if k.startswith("repo:")}
                 self._tagged_keys_cache = (
                     diff_id,
                     diff_len,
@@ -681,11 +713,6 @@ class CanonicalPathResolver:
                     dt_keys,
                     dr_keys,
                 )
-
-        if self.diff_target_keys is None and dt_keys is not None:
-            self.diff_target_keys = dt_keys
-        if self.diff_repo_keys is None and dr_keys is not None:
-            self.diff_repo_keys = dr_keys
 
         if self._probe_keys_in_diff(
             self.target_key(unit_file, basis=basis, strip_anchor=False),
@@ -760,6 +787,13 @@ class DiffPathKeySet(set[str]):
             else {k[5:] for k in self if k.startswith("repo:")}
         )
 
+    def _untrack_key(self, element: object) -> None:
+        if isinstance(element, str):
+            if element.startswith("target:"):
+                self.diff_target_keys.discard(element[7:])
+            elif element.startswith("repo:"):
+                self.diff_repo_keys.discard(element[5:])
+
     def add(self, element: str) -> None:
         """Adds an element to the set and tracks coordinate sub-sets."""
         super().add(element)
@@ -767,6 +801,28 @@ class DiffPathKeySet(set[str]):
             self.diff_target_keys.add(element[7:])
         elif element.startswith("repo:"):
             self.diff_repo_keys.add(element[5:])
+
+    def discard(self, element: object) -> None:
+        """Removes an element from the set if present and tracks coordinate sub-sets."""
+        super().discard(element)
+        self._untrack_key(element)
+
+    def remove(self, element: str) -> None:
+        """Removes an element from the set and tracks coordinate sub-sets. Raises KeyError if missing."""
+        super().remove(element)
+        self._untrack_key(element)
+
+    def clear(self) -> None:
+        """Removes all elements from the set and clears coordinate sub-sets."""
+        super().clear()
+        self.diff_target_keys.clear()
+        self.diff_repo_keys.clear()
+
+    def pop(self) -> str:
+        """Removes and returns an arbitrary element from the set and tracks coordinate sub-sets."""
+        element = super().pop()
+        self._untrack_key(element)
+        return element
 
     def update(self, *s: Iterable[str]) -> None:
         """Updates the set with elements from all iterables and tracks coordinate sub-sets."""
@@ -808,6 +864,5 @@ def build_diff_path_keys(
                 keys.add(f"target:{t_key}")
                 target_keys.add(t_key)
     result = DiffPathKeySet(keys, diff_target_keys=target_keys, diff_repo_keys=repo_keys)
-    resolver.diff_target_keys = target_keys
-    resolver.diff_repo_keys = repo_keys
+    resolver.set_diff_keys(result, diff_target_keys=target_keys, diff_repo_keys=repo_keys)
     return result

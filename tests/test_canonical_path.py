@@ -12,6 +12,7 @@ import pytest
 from pydoppelgangerhunt.canonical_path import (
     CanonicalPath,
     CanonicalPathResolver,
+    DiffPathKeySet,
     build_diff_path_keys,
     lexical_relative_to,
     normalize_lexical_posix,
@@ -636,6 +637,33 @@ def test_diff_path_key_set_and_zero_allocation_probing(tmp_path: Path) -> None:
     assert "util.py" in copy_keys.diff_target_keys
     assert "src/util.py" in copy_keys.diff_repo_keys
 
+    # Mutation parity: discard
+    copy_keys.discard("target:util.py")
+    assert "target:util.py" not in copy_keys
+    assert "util.py" not in copy_keys.diff_target_keys
+    copy_keys.discard("repo:src/util.py")
+    assert "repo:src/util.py" not in copy_keys
+    assert "src/util.py" not in copy_keys.diff_repo_keys
+
+    # Mutation parity: remove
+    copy_keys.remove("target:helper.py")
+    assert "target:helper.py" not in copy_keys
+    assert "helper.py" not in copy_keys.diff_target_keys
+
+    # Mutation parity: pop
+    popped = copy_keys.pop()
+    assert popped not in copy_keys
+    if popped.startswith("target:"):
+        assert popped[7:] not in copy_keys.diff_target_keys
+    elif popped.startswith("repo:"):
+        assert popped[5:] not in copy_keys.diff_repo_keys
+
+    # Mutation parity: clear
+    copy_keys.clear()
+    assert len(copy_keys) == 0
+    assert len(copy_keys.diff_target_keys) == 0
+    assert len(copy_keys.diff_repo_keys) == 0
+
     # 5. set_diff_keys on resolver
     resolver.clear_cache()
     assert resolver.diff_target_keys is None
@@ -676,3 +704,53 @@ def test_diff_path_key_set_and_zero_allocation_probing(tmp_path: Path) -> None:
         diff_target_keys={"a.py"},
         diff_repo_keys=set(),
     )
+
+
+def test_matches_diff_state_isolation_across_different_diff_keys(tmp_path: Path) -> None:
+    """Verifies that consecutive matches_diff calls across different diff_keys do not leak state."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    f_a = repo / "a.py"
+    f_a.write_text("x = 1\n", encoding="utf-8")
+    f_b = repo / "b.py"
+    f_b.write_text("y = 2\n", encoding="utf-8")
+
+    resolver = CanonicalPathResolver(target_root=repo)
+    assert resolver.diff_target_keys is None
+    assert resolver.diff_repo_keys is None
+
+    # Call 1 with diff containing target:a.py
+    diff_a = {"target:a.py"}
+    assert resolver.matches_diff("a.py", diff_a) is True
+    assert resolver.matches_diff("b.py", diff_a) is False
+    # Verify matches_diff does NOT mutate resolver.diff_target_keys
+    assert resolver.diff_target_keys is None
+    assert resolver.diff_repo_keys is None
+
+    # Call 2 with completely separate diff containing target:b.py
+    diff_b = {"target:b.py"}
+    assert resolver.matches_diff("b.py", diff_b) is True
+    # If state leaked from Call 1, "a.py" might evaluate to True; verify strict isolation
+    assert resolver.matches_diff("a.py", diff_b) is False
+    assert resolver.diff_target_keys is None
+
+    # Call 3 with DiffPathKeySet
+    dp_keys = DiffPathKeySet({"target:a.py"})
+    assert resolver.matches_diff("a.py", dp_keys) is True
+    assert resolver.matches_diff("b.py", dp_keys) is False
+
+    # Now mutate dp_keys in place using discard
+    dp_keys.discard("target:a.py")
+    dp_keys.add("target:b.py")
+    assert resolver.matches_diff("a.py", dp_keys) is False
+    assert resolver.matches_diff("b.py", dp_keys) is True
+
+    # Call 4: set_diff_keys binds to specific diff_keys
+    resolver.set_diff_keys(diff_a)
+    assert resolver.diff_target_keys == {"a.py"}
+    assert resolver.matches_diff("a.py", diff_a) is True
+    assert resolver.matches_diff("b.py", diff_a) is False
+
+    # Calling with diff_b ignores resolver.diff_target_keys bound to diff_a because id() doesn't match
+    assert resolver.matches_diff("b.py", diff_b) is True
+    assert resolver.matches_diff("a.py", diff_b) is False
