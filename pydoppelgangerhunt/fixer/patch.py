@@ -52,6 +52,7 @@ from pydoppelgangerhunt.fixer.source import (
     _get_module_imported_names,
     _insert_imports_into_module,
     _is_docstring_node,
+    _is_valid_unit_coordinates,
     _parse_unit_coord,
     _scan_sig_line,
     resolve_unit_replacement,
@@ -267,6 +268,7 @@ def refactor_module_units(
                     f"'{n2}' ({s2}-{e2}) in {f1}."
                 )
 
+    # Note: order_index provides deterministic tie-breaking for stability among non-overlapping units.
     sorted_replacements = sorted(
         computed_entries,
         key=lambda item: (item.start_byte, item.end_byte, item.order_index),
@@ -2214,28 +2216,6 @@ def _resolve_safe_clone_file_path(
     if is_rejected or resolved is None:
         return None
     return resolved
-
-
-def _is_valid_unit_coordinates(u: Any) -> bool:
-    """Verifies that an AST unit dictionary has valid integer coordinates."""
-    if not isinstance(u, dict):
-        return False
-    try:
-        s_val = u.get("start")
-        if s_val is not None:
-            int(s_val)
-        e_val = u.get("end")
-        if e_val is not None:
-            int(e_val)
-        sc_val = u.get("start_col")
-        if sc_val is not None:
-            int(sc_val)
-        ec_val = u.get("end_col")
-        if ec_val is not None:
-            int(ec_val)
-        return True
-    except (ValueError, TypeError):
-        return False
 
 
 def generate_refactoring_patch(

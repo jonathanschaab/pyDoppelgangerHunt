@@ -32,6 +32,29 @@ def _parse_unit_coord(unit: Dict[str, Any], key: str, default: int = 1) -> int:
     return int(val if val is not None else default)
 
 
+def _is_valid_unit_coordinates(u: Any) -> bool:
+    """Verifies that an AST unit dictionary has valid integer coordinates."""
+    if not isinstance(u, dict):
+        return False
+    try:
+        s_val = u.get("start")
+        if s_val is not None:
+            int(s_val)
+        e_val = u.get("end")
+        if e_val is not None:
+            int(e_val)
+        sc_val = u.get("start_col")
+        if sc_val is not None:
+            int(sc_val)
+        ec_val = u.get("end_col")
+        if ec_val is not None:
+            int(ec_val)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+
 def _is_docstring_node(node: Optional[ast.AST]) -> bool:
     """Returns True if the AST node is a string literal docstring expression."""
     return bool(

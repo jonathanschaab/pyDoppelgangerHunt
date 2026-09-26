@@ -6284,8 +6284,10 @@ def test_unit_desc_strict_validation_and_parsing() -> None:
 
 def test_is_valid_unit_coordinates_scenarios() -> None:
     """Verifies that _is_valid_unit_coordinates validates dictionary and integer coordinates."""
-    from pydoppelgangerhunt.fixer.patch import _is_valid_unit_coordinates
+    from pydoppelgangerhunt.fixer.patch import _is_valid_unit_coordinates as is_valid_patch
+    from pydoppelgangerhunt.fixer.source import _is_valid_unit_coordinates
 
+    assert is_valid_patch is _is_valid_unit_coordinates
     assert _is_valid_unit_coordinates(None) is False
     assert _is_valid_unit_coordinates("string_unit") is False
     assert _is_valid_unit_coordinates(["list_unit"]) is False
