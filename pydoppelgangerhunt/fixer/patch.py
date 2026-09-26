@@ -44,14 +44,17 @@ from pydoppelgangerhunt.fixer.scope import (
 )
 
 from pydoppelgangerhunt.fixer.source import (
+    ReplacementItem,
+    _compute_line_offsets,
     _detect_indent_step,
     _find_module_helper_insertion_index,
     _find_sig_colon,
     _get_module_imported_names,
     _insert_imports_into_module,
     _is_docstring_node,
+    _parse_unit_coord,
     _scan_sig_line,
-    replace_unit_in_source,
+    resolve_unit_replacement,
 )
 from pydoppelgangerhunt.fixer.synthesis import (
     _extract_required_typing_imports,
@@ -70,6 +73,14 @@ def check_units_overlap(
 ) -> bool:
     """Determines whether two AST code units in the same file share overlapping line ranges.
 
+    Acts as Tier 1 of the dual-tier overlap defense. When column offsets ('start_col',
+    'end_col') are omitted from either unit, this check conservatively assumes the unit
+    spans whole lines and treats any shared line as an overlap conflict. When units share
+    a single boundary line (same-line, touching boundary, or a boundary line of a multi-line
+    unit), it checks sub-line column intervals for half-open intersection. Units with inverted
+    column bounds (start_col > end_col) on a shared boundary line represent empty ranges
+    and evaluate to False.
+
     Args:
         u1: First AST unit dictionary with 'file', 'start', and 'end'.
         u2: Second AST unit dictionary with 'file', 'start', and 'end'.
@@ -79,38 +90,44 @@ def check_units_overlap(
         True if both units reside in the same normalized file path and their [start, end]
         intervals overlap; False otherwise.
     """
+    if not isinstance(u1, dict) or not isinstance(u2, dict):
+        raise TypeError(f"Units must be dictionaries, got {type(u1).__name__} and {type(u2).__name__}")
     f1 = normalize_path_string(str(u1.get("file") or ""))
     f2 = normalize_path_string(str(u2.get("file") or ""))
     if not f1 or not f2 or not _is_same_file_path(f1, f2, repo_root=repo_root):
         return False
-    start1 = int(u1.get("start") or 1)
-    end1 = int(u1.get("end") or start1)
-    start2 = int(u2.get("start") or 1)
-    end2 = int(u2.get("end") or start2)
+    def _parse_lines(u: Dict[str, Any], label: str, file_path: str) -> Tuple[int, int]:
+        try:
+            s = _parse_unit_coord(u, "start", default=1)
+            e = _parse_unit_coord(u, "end", default=s)
+            return (e, s) if s > e else (s, e)
+        except (ValueError, TypeError) as err:
+            raise ValueError(f"Malformed unit: invalid line boundary in {label} ({file_path}): {err}") from err
+
+    start1, end1 = _parse_lines(u1, "u1", f1)
+    start2, end2 = _parse_lines(u2, "u2", f2)
 
     if end1 < start2 or end2 < start1:
         return False
 
-    s_col1 = u1.get("start_col")
-    e_col1 = u1.get("end_col")
-    s_col2 = u2.get("start_col")
-    e_col2 = u2.get("end_col")
+    def _parse_col(val: Any, col_name: str, file_path: str) -> Optional[int]:
+        if val is None:
+            return None
+        try:
+            return int(val)
+        except (ValueError, TypeError) as err:
+            raise ValueError(f"Malformed unit: invalid column offset '{col_name}'={val!r} in {file_path}") from err
 
-    if start1 == end1 == start2 == end2:
-        if s_col1 is not None and e_col1 is not None and s_col2 is not None and e_col2 is not None:
-            sc1, ec1 = int(s_col1), int(e_col1)
-            sc2, ec2 = int(s_col2), int(e_col2)
-            if sc1 <= ec1 and sc2 <= ec2:
-                return max(sc1, sc2) < min(ec1, ec2)
-            return False
+    sc1, ec1 = _parse_col(u1.get("start_col"), "start_col", f1), _parse_col(u1.get("end_col"), "end_col", f1)
+    sc2, ec2 = _parse_col(u2.get("start_col"), "start_col", f2), _parse_col(u2.get("end_col"), "end_col", f2)
 
-    if start1 < start2 and end1 == start2:
-        if e_col1 is not None and s_col2 is not None:
-            return int(s_col2) < int(e_col1)
-
-    if start2 < start1 and end2 == start1:
-        if e_col2 is not None and s_col1 is not None:
-            return int(s_col1) < int(e_col2)
+    # When units share exactly one boundary line (max(start1, start2) == min(end1, end2)),
+    # check sub-line column disjointness on that shared line:
+    if max(start1, start2) == min(end1, end2):
+        if sc1 is not None and ec1 is not None and sc2 is not None and ec2 is not None:
+            if sc1 > ec1 or sc2 > ec2:
+                return False
+            return max(sc1, sc2) < min(ec1, ec2)
 
     return max(start1, start2) <= min(end1, end2)
 
@@ -150,15 +167,13 @@ def filter_overlapping_clone_units(
 
     retained: List[Dict[str, Any]] = []
     for _, file_units in file_groups:
-        sorted_candidates = sorted(
-            file_units,
-            key=lambda u: (
-                -(int(u.get("end") or int(u.get("start") or 0)) - int(u.get("start") or 0)),
-                int(u.get("start") or 0),
-                int(u.get("start_col") or 0),
-                str(u.get("name") or ""),
-            ),
-        )
+        def _sort_key(u: Dict[str, Any]) -> Tuple[int, int, int, str]:
+            s = _parse_unit_coord(u, "start", default=0)
+            e = _parse_unit_coord(u, "end", default=s)
+            sc = _parse_unit_coord(u, "start_col", default=0)
+            return (-(e - s), s, sc, str(u.get("name") or ""))
+
+        sorted_candidates = sorted(file_units, key=_sort_key)
         file_retained: List[Dict[str, Any]] = []
         for cand in sorted_candidates:
             if not any(check_units_overlap(cand, prev, repo_root=repo_root) for prev in file_retained):
@@ -191,17 +206,57 @@ def refactor_module_units(
     if not replacements:
         return source_text
 
+    def _unit_desc(u: Any) -> Tuple[str, int, int, str]:
+        if not isinstance(u, dict):
+            raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
+        n = str(u.get("name") or "unit")
+        s = _parse_unit_coord(u, "start", default=1)
+        e = _parse_unit_coord(u, "end", default=s)
+        f = normalize_path_string(str(u.get("file") or ""), strip_anchor=False)
+        return n, s, e, f
+
+    # Tier 1 Semantic Overlap Check:
+    # Conservatively reject candidate pairs that share lines when column bounds are
+    # omitted or incomplete (whole-line / statement replacements inherently conflict
+    # with any other edit on the same line), or when column intervals overlap.
     rep_list = list(replacements)
     for i, (u1, _) in enumerate(rep_list):
         for u2, _ in rep_list[i + 1:]:
             if check_units_overlap(u1, u2):
-                n1 = str(u1.get("name") or "unit")
-                s1 = int(u1.get("start") or 1)
-                e1 = int(u1.get("end") or s1)
-                n2 = str(u2.get("name") or "unit")
-                s2 = int(u2.get("start") or 1)
-                e2 = int(u2.get("end") or s2)
-                f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+                n1, s1, e1, f1 = _unit_desc(u1)
+                n2, s2, e2, _ = _unit_desc(u2)
+                raise ValueError(
+                    f"Overlapping unit collision detected between "
+                    f"'{n1}' ({s1}-{e1}) and "
+                    f"'{n2}' ({s2}-{e2}) in {f1}."
+                )
+
+    computed_entries: List[ReplacementItem] = []
+    lines = source_text.splitlines(keepends=True)
+    line_char_offsets, line_byte_offsets = _compute_line_offsets(lines)
+
+    for i, (unit, rep) in enumerate(rep_list):
+        item = resolve_unit_replacement(
+            source_text,
+            unit,
+            rep,
+            lines=lines,
+            line_char_offsets=line_char_offsets,
+            line_byte_offsets=line_byte_offsets,
+            order_index=i,
+        )
+        computed_entries.append(item)
+
+    # Tier 2 Physical Byte-Span Overlap Check:
+    # After computing exact UTF-8 byte slices in the underlying source buffer,
+    # verify that no two physical byte intervals [s_b, e_b) collide.
+    for i, c1 in enumerate(computed_entries):
+        for c2 in computed_entries[i + 1:]:
+            s1_b, e1_b = c1.start_byte, c1.end_byte
+            s2_b, e2_b = c2.start_byte, c2.end_byte
+            if max(s1_b, s2_b) < min(e1_b, e2_b):
+                n1, s1, e1, f1 = _unit_desc(c1.unit)
+                n2, s2, e2, _ = _unit_desc(c2.unit)
                 raise ValueError(
                     f"Overlapping unit collision detected between "
                     f"'{n1}' ({s1}-{e1}) and "
@@ -209,17 +264,16 @@ def refactor_module_units(
                 )
 
     sorted_replacements = sorted(
-        rep_list,
-        key=lambda item: (
-            int(item[0].get("start") or 0),
-            int(item[0].get("start_col") or 0),
-        ),
+        computed_entries,
+        key=lambda item: (item.start_byte, item.end_byte, item.order_index),
         reverse=True,
     )
 
     current_text = source_text
-    for unit, replacement in sorted_replacements:
-        current_text = replace_unit_in_source(current_text, unit, replacement)
+    for item in sorted_replacements:
+        s_c = item.start_char
+        e_c = item.end_char
+        current_text = current_text[:s_c] + item.final_rep + current_text[e_c:]
 
     return current_text
 
@@ -236,8 +290,8 @@ def _build_whole_method_delegation(
 ) -> str:
     """Builds a delegated method replacement body preserving method signature and docstring."""
     lines = source_text.splitlines(keepends=True)
-    u_start = int(unit.get("start") or 1)
-    u_end = int(unit.get("end") or max(u_start, len(lines)))
+    u_start = _parse_unit_coord(unit, "start", default=1)
+    u_end = _parse_unit_coord(unit, "end", default=max(u_start, len(lines)))
 
     lead = lines[u_start - 1] if 1 <= u_start <= len(lines) else ""
     indent = lead[: len(lead) - len(lead.lstrip())]
@@ -347,8 +401,8 @@ def _has_unconditional_terminal_return(
     unit: Dict[str, Any], orig_lines: Sequence[str]
 ) -> bool:
     """Checks whether an AST code unit terminates with an unconditional return at its base indentation."""
-    u_start = max(1, int(unit.get("start") or 1))
-    u_end = min(len(orig_lines), int(unit.get("end") or u_start))
+    u_start = max(1, _parse_unit_coord(unit, "start", default=1))
+    u_end = min(len(orig_lines), _parse_unit_coord(unit, "end", default=u_start))
     if u_start > len(orig_lines) or u_start > u_end:
         return False
     cand_lines = orig_lines[u_start - 1 : u_end]
@@ -380,7 +434,7 @@ def _build_unit_delegation_call(
     step: Optional[str] = None,
 ) -> str:
     """Constructs replacement delegation call statement for a clone unit in refactoring patches."""
-    u_start = int(target_unit.get("start") or 1)
+    u_start = _parse_unit_coord(target_unit, "start", default=1)
     lead = orig_lines[u_start - 1] if 1 <= u_start <= len(orig_lines) else ""
     indent = lead[: len(lead) - len(lead.lstrip())]
 
@@ -515,26 +569,110 @@ class _FilePatchPlan:
         self.claimed_units: List[Dict[str, Any]] = []
 
 
+def _compute_replacement_line_deltas(
+    reps: Sequence[Tuple[Dict[str, Any], str]],
+    orig_text: str,
+    lines: Optional[Sequence[str]] = None,
+    line_char_offsets: Optional[Sequence[int]] = None,
+    line_byte_offsets: Optional[Sequence[int]] = None,
+) -> List[Tuple[int, int]]:
+    """Computes (end_line, line_delta) tuples for replacements in source text.
+
+    For each replacement, calculates net change in line count (newlines added - newlines removed).
+    Because candidate replacements are non-overlapping, their line deltas are strictly additive.
+    Each entry is an (end_line, delta) tuple where end_line serves as the boundary cutoff
+    for downstream target line adjustments in _adjust_line_for_replacements (end_line < target_line).
+
+    Raises:
+        TypeError: If any replacement unit is not a dictionary.
+        ValueError: If any unit contains invalid line coordinates.
+    """
+    deltas: List[Tuple[int, int]] = []
+    if lines is None:
+        lines = orig_text.splitlines(keepends=True)
+    if line_char_offsets is None or line_byte_offsets is None:
+        line_char_offsets, line_byte_offsets = _compute_line_offsets(lines)
+    for u, rep in reps:
+        if not isinstance(u, dict):
+            raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
+        try:
+            fallback = _parse_unit_coord(u, "start", default=1)
+            end_l = _parse_unit_coord(u, "end", default=fallback)
+        except (ValueError, TypeError) as err:
+            raise ValueError(f"Malformed unit: invalid line boundary in {u.get('file', '')}: {err}") from err
+        item = resolve_unit_replacement(
+            orig_text,
+            u,
+            rep,
+            lines=lines,
+            line_char_offsets=line_char_offsets,
+            line_byte_offsets=line_byte_offsets,
+        )
+        orig_nl = orig_text[item.start_char : item.end_char].count("\n")
+        rep_nl = item.final_rep.count("\n")
+        deltas.append((end_l, rep_nl - orig_nl))
+    deltas.sort(key=lambda item: item[0])
+    return deltas
+
+
 def _adjust_line_for_replacements(
     target_line: int,
     reps: Sequence[Tuple[Dict[str, Any], str]],
     orig_text: str,
+    lines: Optional[Sequence[str]] = None,
+    line_char_offsets: Optional[Sequence[int]] = None,
+    line_byte_offsets: Optional[Sequence[int]] = None,
 ) -> int:
-    """Adjusts a target source line number to account for upstream line expansions or contractions."""
-    orig_lines = orig_text.splitlines(keepends=True)
-    offset = 0
-    for u, rep in reps:
-        u_start = int(u.get("start") or 1)
-        u_end = int(u.get("end") or u_start)
-        if u_end < target_line:
-            orig_count = u_end - u_start + 1
-            unit_orig_text = "".join(orig_lines[u_start - 1 : u_end])
-            replaced_text = replace_unit_in_source(
-                unit_orig_text, {**u, "start": 1, "end": orig_count}, rep
-            )
-            new_count = len(replaced_text.splitlines(keepends=True))
-            offset += (new_count - orig_count)
-    return max(1, target_line + offset)
+    """Adjusts a target source line number to account for upstream line expansions or contractions.
+
+    Evaluates cumulative line shift from replacements that conclude strictly prior to
+    target_line (end_line < target_line). If a unit's end_line coincides exactly with
+    target_line (end_line == target_line), its line delta is NOT included, which preserves
+    insertion coordinates immediately preceding target_line (such as prepending helper
+    definitions before the first candidate function or class).
+
+    Args:
+        target_line: 1-indexed target line number to adjust.
+        reps: Sequence of (unit, replacement_text) tuples.
+        orig_text: Original unmodified source code.
+        lines: Optional pre-split lines of orig_text.
+        line_char_offsets: Optional precomputed line start character offsets.
+        line_byte_offsets: Optional precomputed line start UTF-8 byte offsets.
+
+    Returns:
+        Adjusted 1-indexed line number in the refactored source text.
+    """
+    try:
+        t_line = int(target_line)
+    except (ValueError, TypeError):
+        t_line = 1
+    if t_line <= 1 or not reps:
+        return max(1, t_line)
+    if lines is None:
+        lines = orig_text.splitlines(keepends=True)
+    deltas = _compute_replacement_line_deltas(
+        reps,
+        orig_text,
+        lines=lines,
+        line_char_offsets=line_char_offsets,
+        line_byte_offsets=line_byte_offsets,
+    )
+    line_delta = sum(d for end_line, d in deltas if end_line < t_line)
+    return max(1, t_line + line_delta)
+
+
+def _derive_unit_indent_step(
+    unit: Dict[str, Any],
+    lines: Sequence[str],
+    step: Optional[str] = None,
+) -> str:
+    """Derives indentation step for a unit from its starting line indentation if not provided."""
+    if step is not None:
+        return step
+    u_s = _parse_unit_coord(unit, "start", default=1)
+    u_lead = lines[u_s - 1] if 1 <= u_s <= len(lines) else ""
+    u_ind = u_lead[: len(u_lead) - len(u_lead.lstrip())]
+    return _detect_indent_step(u_ind)
 
 
 def _delegate_unit_in_plan(
@@ -551,11 +689,7 @@ def _delegate_unit_in_plan(
     step: Optional[str] = None,
 ) -> None:
     """Builds and records a delegation call replacement for a unit inside a file plan."""
-    if step is None:
-        u_s = int(unit.get("start") or 1)
-        u_lead = plan.orig_lines[u_s - 1] if 1 <= u_s <= len(plan.orig_lines) else ""
-        u_ind = u_lead[: len(u_lead) - len(u_lead.lstrip())]
-        step = _detect_indent_step(u_ind)
+    step = _derive_unit_indent_step(unit, plan.orig_lines, step)
 
     rep_stmt = _build_unit_delegation_call(
         unit,
@@ -734,10 +868,17 @@ def _render_file_patch_plan(
         current_text = plan.orig_text
 
     if plan.method_helpers:
+        deltas = (
+            _compute_replacement_line_deltas(
+                filtered_reps, plan.orig_text, lines=plan.orig_lines
+            )
+            if replace_clones and filtered_reps
+            else []
+        )
         adjusted_methods = [
             (
-                _adjust_line_for_replacements(ins_line, filtered_reps, plan.orig_text)
-                if replace_clones and filtered_reps
+                max(1, ins_line + sum(d for end_line, d in deltas if end_line < ins_line))
+                if deltas
                 else ins_line,
                 h_code,
             )
@@ -2294,11 +2435,7 @@ def generate_refactoring_patch(
             )
             else None
         )
-        if step is None:
-            u1_s = int(u1.get("start") or 1)
-            u1_lead = orig_lines[u1_s - 1] if 1 <= u1_s <= len(orig_lines) else ""
-            u1_ind = u1_lead[: len(u1_lead) - len(u1_lead.lstrip())]
-            step = _detect_indent_step(u1_ind)
+        step = _derive_unit_indent_step(u1, orig_lines, step)
 
         scope = analyze_unit_variable_scope(u1_eff, u2_eff, repo_root=str(root))
         inputs = list(scope.get("inputs", []))
@@ -2460,14 +2597,19 @@ def generate_refactoring_patch(
         if is_same_file and not check_units_overlap(u1, u2, repo_root=str(root)):
             candidate_units.append(u2)
 
-        earliest_unit = min(candidate_units, key=lambda u: int(u.get("start") or 1))
+        def _unit_start(u: Dict[str, Any]) -> int:
+            return _parse_unit_coord(u, "start", default=1)
+
+        earliest_unit = min(candidate_units, key=_unit_start)
         enc_fn_earliest = (
             find_enclosing_function(orig_text, earliest_unit)
             if effective_binding == "method"
             else None
         )
         insert_line = (
-            enc_fn_earliest["start"] if enc_fn_earliest else int(earliest_unit.get("start") or 1)
+            enc_fn_earliest["start"]
+            if enc_fn_earliest
+            else _unit_start(earliest_unit)
         )
 
         if is_same_file:
