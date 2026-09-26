@@ -1118,7 +1118,7 @@ def _get_rec_repo_data(
     rec: Dict[str, Any],
     base_offset: Optional[str],
     path_basis: Optional[str] = "target_relative",
-) -> Tuple[str, str, str, str, str, List[str]]:
+) -> Tuple[str, str, str, str, str, List[str], str, str]:
     """Derives canonical repository-relative path and fingerprint representation for a baseline record."""
     r_fa, r_na, r_ha, r_fb, r_nb, r_hb = _extract_record_endpoint_data(rec)
     rec_basis = rec.get("path_basis") or path_basis or "target_relative"
@@ -1131,7 +1131,16 @@ def _get_rec_repo_data(
     r_repo_ns_b = extract_unit_namespace(r_repo_fb)
     r_repo_ns_sfp = _format_paired_endpoints(f"{r_repo_ns_a}#{r_ha}", f"{r_repo_ns_b}#{r_hb}")
     r_repo_namespaces = sorted([r_repo_ns_a, r_repo_ns_b])
-    return r_repo_fa, r_repo_fb, r_repo_fp, r_repo_sfp, r_repo_ns_sfp, r_repo_namespaces
+    return (
+        r_repo_fa,
+        r_repo_fb,
+        r_repo_fp,
+        r_repo_sfp,
+        r_repo_ns_sfp,
+        r_repo_namespaces,
+        r_ha,
+        r_hb,
+    )
 
 
 def _get_rec_fingerprint_value(
@@ -1379,10 +1388,10 @@ def _match_exact_and_namespaced_passes(
 
         r_repo_fp = rec.get("fingerprint")
         r_repo_sfp = rec.get("structural_fingerprint")
-        if base_offset or not r_repo_fp:
-            _, _, r_repo_fp, r_repo_sfp, _, _ = _get_rec_repo_data(
-                rec, base_offset, path_basis=path_basis
-            )
+        if base_offset or not r_repo_fp or not r_repo_sfp:
+            repo_data = _get_rec_repo_data(rec, base_offset, path_basis=path_basis)
+            r_repo_fp = repo_data[2]
+            r_repo_sfp = repo_data[3]
 
         if r_repo_fp == c_repo_fp:
             if c_ha and c_hb and r_repo_sfp == c_repo_sfp:
@@ -1439,17 +1448,17 @@ def _match_structural_and_boundary_passes(
             continue
         if rec.get("pure_structural_fingerprint") == c_pure_sfp:
             if base_offset:
-                _, _, _, _, _, r_namespaces = _get_rec_repo_data(
+                r_namespaces = _get_rec_repo_data(
                     rec, base_offset, path_basis=path_basis
-                )
+                )[5]
             else:
                 r_namespaces = sorted(
                     [x for x in (rec.get("namespace_a"), rec.get("namespace_b")) if x is not None]
                 )
                 if not r_namespaces:
-                    _, _, _, _, _, r_namespaces = _get_rec_repo_data(
+                    r_namespaces = _get_rec_repo_data(
                         rec, base_offset, path_basis=path_basis
-                    )
+                    )[5]
             if r_namespaces == c_namespaces:
                 if _record_matches_names(rec, c_names):
                     return rec
@@ -1483,15 +1492,11 @@ def _match_structural_and_boundary_passes(
     for rec in unconsumed:
         if consumed_ids is not None and id(rec) in consumed_ids:
             continue
-        r_repo_fa, r_repo_fb, _, _, _, _ = _get_rec_repo_data(
-            rec, base_offset, path_basis=path_basis
-        )
-        r_ha = str(rec.get("hash_a") or "")
-        r_hb = str(rec.get("hash_b") or "")
-        if (not r_ha or not r_hb) and rec.get("structural_fingerprint"):
-            _, p_ha, _, p_hb = _parse_structural_fingerprint(str(rec["structural_fingerprint"]))
-            r_ha = r_ha or p_ha
-            r_hb = r_hb or p_hb
+        repo_data = _get_rec_repo_data(rec, base_offset, path_basis=path_basis)
+        r_repo_fa = repo_data[0]
+        r_repo_fb = repo_data[1]
+        r_ha = repo_data[6]
+        r_hb = repo_data[7]
         if _matches_boundary_and_structural_hashes(
             r_repo_fa, r_repo_fb, r_ha, r_hb, c_repo_fa, c_repo_fb, c_ha, c_hb, resolver=resolver
         ):
@@ -2175,11 +2180,20 @@ def _evaluate_single_prune_record(
     if not h_a and not h_b and item.get("structural_fingerprint"):
         _, h_a, _, h_b = _parse_structural_fingerprint(str(item["structural_fingerprint"]))
 
-    r_repo_fa, r_repo_fb, r_repo_fp, r_repo_sfp, r_repo_ns_sfp, r_repo_namespaces = (
-        _get_rec_repo_data(item, ctx.base_offset, path_basis=ctx.base_basis)
-    )
-    if not h_a and not h_b and r_repo_sfp:
-        _, h_a, _, h_b = _parse_structural_fingerprint(str(r_repo_sfp))
+    (
+        r_repo_fa,
+        r_repo_fb,
+        r_repo_fp,
+        r_repo_sfp,
+        r_repo_ns_sfp,
+        r_repo_namespaces,
+        r_ha,
+        r_hb,
+    ) = _get_rec_repo_data(item, ctx.base_offset, path_basis=ctx.base_basis)
+    if not h_a:
+        h_a = r_ha
+    if not h_b:
+        h_b = r_hb
 
     item_pure_sfp = item.get("pure_structural_fingerprint")
     if not item_pure_sfp and h_a and h_b:

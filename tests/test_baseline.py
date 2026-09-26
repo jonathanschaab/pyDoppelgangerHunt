@@ -5724,4 +5724,63 @@ def test_match_clone_record_pass5_and_pass6_asymmetric_hash_recovery() -> None:
     assert matched6 is rec_pass6
 
 
+def test_match_clone_record_pass6_oriented_endpoint_hashes() -> None:
+    """Verifies Pass 6 correctly associates oriented hashes when rec endpoint ordering is reversed relative to structural_fingerprint."""
+    from pydoppelgangerhunt.baseline import _match_structural_and_boundary_passes  # pylint: disable=import-outside-toplevel
+
+    # rec has file_a as b.py and file_b as a.py, but structural_fingerprint is "dir/a.py#h_a <===> dir/b.py#h_b"
+    # hash_a and hash_b are omitted in the record dict, so they must be derived from structural_fingerprint
+    # and oriented to match file_a (b.py -> h_b) and file_b (a.py -> h_a)
+    rec_pass6_rev = {
+        "file_a": "dir/b.py",
+        "file_b": "dir/a.py",
+        "structural_fingerprint": "dir/a.py#h_a <===> dir/b.py#h_b",
+        "name_a": "fn_b",
+        "name_b": "fn_a",
+    }
+    # Query clone where candidate has repo_fa="dir/b.py", ha="h_b" and repo_fb="dir/a.py", hb="h_a"
+    matched = _match_structural_and_boundary_passes(
+        [rec_pass6_rev],
+        c_pure_sfp="h_a <===> h_b",
+        c_namespaces=["other", "other"],
+        c_names=["fn_a", "fn_b"],
+        c_repo_fa="dir/b.py",
+        c_repo_fb="dir/a.py",
+        c_ha="h_b",
+        c_hb="h_a",
+    )
+    assert matched is rec_pass6_rev
+
+
+def test_match_clone_record_pass1_derives_missing_structural_fingerprint() -> None:
+    """Verifies Pass 1 derives structural_fingerprint when omitted from record and verifies matching structural hashes."""
+    from pydoppelgangerhunt.baseline import _match_clone_record  # pylint: disable=import-outside-toplevel
+
+    # Legacy record has fingerprint and endpoint hashes, but structural_fingerprint was omitted
+    rec_legacy = {
+        "fingerprint": "pkg/mod.py:run <===> pkg/util.py:run",
+        "file_a": "pkg/mod.py",
+        "file_b": "pkg/util.py",
+        "name_a": "run",
+        "name_b": "run",
+        "hash_a": "h_mod",
+        "hash_b": "h_util",
+        # structural_fingerprint omitted
+    }
+    # Query clone with matching symbol fingerprint AND matching structural hashes
+    query = {
+        "file_a": "pkg/mod.py",
+        "file_b": "pkg/util.py",
+        "name_a": "run",
+        "name_b": "run",
+        "hash_a": "h_mod",
+        "hash_b": "h_util",
+        "fp": "pkg/mod.py:run <===> pkg/util.py:run",
+        "sfp": "pkg/mod.py#h_mod <===> pkg/util.py#h_util",
+    }
+    matched = _match_clone_record(query, [rec_legacy], base_offset=None)
+    assert matched is rec_legacy
+
+
+
 

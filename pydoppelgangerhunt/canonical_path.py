@@ -16,7 +16,9 @@ from typing import AbstractSet, Dict, Iterable, List, Optional, Sequence, Set, T
 import unicodedata
 
 
-def parse_notebook_cell_anchor(path_str: Optional[str]) -> Optional[Tuple[str, int]]:
+def parse_notebook_cell_anchor(
+    path_str: Optional[Union[str, Path, CanonicalPath]],
+) -> Optional[Tuple[str, int]]:
     """Extracts base path and 0-based cell index from an anchored notebook path.
 
     Requires documented notebook cell anchor formats: `#cell_` + digits or `#cell` + digits
@@ -24,14 +26,14 @@ def parse_notebook_cell_anchor(path_str: Optional[str]) -> Optional[Tuple[str, i
     Literal filenames with hash fragments (e.g. `report.ipynb#cellular`) return None.
 
     Args:
-        path_str: Path string that may contain a notebook cell fragment.
+        path_str: Path string, Path object, or CanonicalPath that may contain a notebook cell fragment.
 
     Returns:
         (base_path, 0-based cell_index) if path has a valid notebook cell anchor, else None.
     """
     if path_str is None:
         return None
-    raw = str(path_str).rstrip("\r\n")
+    raw = str(getattr(path_str, "raw", path_str) or "").rstrip("\r\n")
     if "#" not in raw:
         return None
     last_seg = raw.replace("\\", "/").rsplit("/", 1)[-1]

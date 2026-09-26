@@ -990,3 +990,20 @@ def test_resolver_resolve_none(tmp_path: Path) -> None:
     resolved = resolver.resolve(None)
     assert resolved == CanonicalPath(raw="", repo_relative="", target_relative="", absolute_lexical="")
 
+
+def test_parse_notebook_cell_anchor_canonical_path_object_transparency(tmp_path: Path) -> None:
+    """Verifies parse_notebook_cell_anchor accepts CanonicalPath instances unwrapping .raw."""
+    from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor  # pylint: disable=import-outside-toplevel
+
+    resolver = CanonicalPathResolver(target_root=tmp_path)
+    cp = resolver.resolve("notebooks/analysis.ipynb#cell_4")
+    parsed = parse_notebook_cell_anchor(cp)
+    assert parsed == ("notebooks/analysis.ipynb", 3)
+
+    cp_plain = resolver.resolve("notebooks/analysis.ipynb")
+    assert parse_notebook_cell_anchor(cp_plain) is None
+
+    cp_literal = resolver.resolve("notebooks/analysis.ipynb#cellular")
+    assert parse_notebook_cell_anchor(cp_literal) is None
+
+
