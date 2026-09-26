@@ -5753,29 +5753,41 @@ def test_generate_refactoring_patch_same_file_multiple_methods_and_helpers(tmp_p
 
 
 def test_edge_case_robustness_non_dict_and_invalid_units() -> None:
-    """Verifies that non-dict or malformed units do not raise unhandled exceptions."""
+    """Verifies that non-dict or malformed units raise descriptive errors rather than silently defaulting."""
+    import pytest
     from typing import cast, Any, Dict
     from pydoppelgangerhunt.fixer import (
         check_units_overlap,
         compute_unit_byte_offsets,
         compute_unit_char_offsets,
         compute_unit_replacement_span,
+        compute_unit_spans,
         refactor_module_units,
     )
     from pydoppelgangerhunt.fixer.patch import _adjust_line_for_replacements
     from pydoppelgangerhunt.fixer.source import _compute_unit_spans
 
-    # Non-dict units
-    assert not check_units_overlap(cast(Dict[str, Any], None), {"file": "a.py", "start": 1, "end": 2})
-    assert not check_units_overlap({"file": "a.py", "start": 1, "end": 2}, cast(Dict[str, Any], "invalid"))
+    # Non-dict units raise TypeError
+    with pytest.raises(TypeError, match="Units must be dictionaries"):
+        check_units_overlap(cast(Dict[str, Any], None), {"file": "a.py", "start": 1, "end": 2})
+    with pytest.raises(TypeError, match="Units must be dictionaries"):
+        check_units_overlap({"file": "a.py", "start": 1, "end": 2}, cast(Dict[str, Any], "invalid"))
 
-    # Malformed unit types in span calculations
-    chars, bytes_, bounded = _compute_unit_spans("line 1\n", cast(Dict[str, Any], None))
-    assert chars == (0, 0) and bytes_ == (0, 0) and not bounded
+    # Malformed unit types in span calculations raise TypeError
+    with pytest.raises(TypeError, match="Unit must be a dictionary"):
+        compute_unit_spans("line 1\n", cast(Dict[str, Any], None))
+    with pytest.raises(TypeError, match="Unit must be a dictionary"):
+        _compute_unit_spans("line 1\n", cast(Dict[str, Any], None))
 
-    # Replacement span with invalid unit
-    span = compute_unit_replacement_span("line 1\n", cast(Dict[str, Any], None), "rep")
-    assert span == (0, 0, "rep")
+    # Replacement span with invalid unit raises TypeError
+    with pytest.raises(TypeError, match="Unit must be a dictionary"):
+        compute_unit_replacement_span("line 1\n", cast(Dict[str, Any], None), "rep")
+
+    # Malformed line numbers raise ValueError rather than silently returning false defaults
+    with pytest.raises(ValueError, match="Malformed unit"):
+        check_units_overlap({"file": "a.py", "start": "bad", "end": 2}, {"file": "a.py", "start": 1, "end": 2})
+    with pytest.raises(ValueError, match="Malformed unit"):
+        compute_unit_char_offsets("a\nb\nc\n", {"file": "a.py", "start": "bad", "end": 2})
 
     # Inverted lines in unit
     inv_unit = {"file": "a.py", "start": 5, "end": 2}
@@ -5788,6 +5800,7 @@ def test_edge_case_robustness_non_dict_and_invalid_units() -> None:
 
 def test_edge_case_robustness_columns_and_empty_inputs() -> None:
     """Verifies handling of invalid column types, inverted column offsets, and empty inputs."""
+    import pytest
     from typing import cast
     from pydoppelgangerhunt.fixer import (
         check_units_overlap,
@@ -5798,8 +5811,16 @@ def test_edge_case_robustness_columns_and_empty_inputs() -> None:
 
     # col_offset_to_char_offset with string or non-numeric offsets
     assert col_offset_to_char_offset("hello world", cast(int, "5")) == 5
-    assert col_offset_to_char_offset("hello world", cast(int, "invalid")) == 0
     assert col_offset_to_char_offset("hello world", -10) == 0
+    with pytest.raises(ValueError, match="Malformed column offset"):
+        col_offset_to_char_offset("hello world", cast(int, "invalid"))
+
+    # Malformed column offsets in check_units_overlap raise ValueError
+    with pytest.raises(ValueError, match="Malformed unit"):
+        check_units_overlap(
+            {"file": "a.py", "start": 1, "end": 1, "start_col": "invalid"},
+            {"file": "a.py", "start": 1, "end": 1, "start_col": 0, "end_col": 10},
+        )
 
     # Inverted column bounds on a single line: end_byte must not precede start_byte
     inv_col_unit = {"file": "a.py", "start": 1, "end": 1, "start_col": 15, "end_col": 5}
@@ -5995,9 +6016,101 @@ def test_col_offset_to_char_offset_clamps_malformed_utf8_offset() -> None:
     assert col_offset_to_char_offset(line, 14) == 11
 
 
+def test_unit_span_namedtuple_and_compute_unit_spans() -> None:
+    """Verifies that UnitSpan carries character/byte bounds and line/col metadata without recomputation."""
+    from pydoppelgangerhunt.fixer import UnitSpan, compute_unit_spans, compute_unit_replacement_span
+
+    source = "header = '🚀'; data = [x for x in items]\n"
+    unit = {
+        "file": "test.py",
+        "start": 1,
+        "end": 1,
+        "start_col": 25,
+        "end_col": 42,
+        "kind": "comprehension",
+    }
+    span = compute_unit_spans(source, unit)
+    assert isinstance(span, UnitSpan)
+    assert span.start_char == 22
+    assert span.end_char == 39
+    assert span.start_byte == 25
+    assert span.end_byte == 42
+    assert span.is_column_bounded is True
+    assert span.start_line == 1
+    assert span.end_line == 1
+    assert span.start_col_char == 22
+    assert span.end_col_char == 39
+
+    # Verify threading into compute_unit_replacement_span avoids recomputation
+    s_c, e_c, rep = compute_unit_replacement_span(source, unit, "helper(items)", unit_span=span)
+    assert s_c == 22
+    assert e_c == 39
+    assert rep == "helper(items)"
 
 
+def test_adjust_line_for_replacements_additive_deltas() -> None:
+    """Verifies that _compute_replacement_line_deltas and _adjust_line_for_replacements compute exact line shifts."""
+    from pydoppelgangerhunt.fixer.patch import (
+        _adjust_line_for_replacements,
+        _compute_replacement_line_deltas,
+    )
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    orig_text = (
+        "line 1\n"
+        "line 2\n"
+        "line 3\n"
+        "line 4\n"
+        "line 5\n"
+        "line 6\n"
+        "line 7\n"
+        "line 8\n"
+    )
+    # Unit 1: lines 2-3 (2 lines) replaced with 4 lines (+2 delta)
+    u1 = {"file": "mod.py", "start": 2, "end": 3}
+    # Unit 2: lines 5-6 (2 lines) replaced with 1 line (-1 delta)
+    u2 = {"file": "mod.py", "start": 5, "end": 6}
+    reps = [(u1, "a\nb\nc\nd\n"), (u2, "single\n")]
+
+    deltas = _compute_replacement_line_deltas(reps, orig_text)
+    assert deltas == [(3, 2), (6, -1)]
+
+    # Target line 4 (after u1, before u2): should shift by +2 from line 4 to line 6
+    adj4 = _adjust_line_for_replacements(4, reps, orig_text)
+    assert adj4 == 6
+
+    # Target line 7 (after u1 and u2): net shift is +2 - 1 = +1, so line 7 shifts to line 8
+    adj7 = _adjust_line_for_replacements(7, reps, orig_text)
+    assert adj7 == 8
+
+    # Parity check against actual refactor_module_units
+    refactored = refactor_module_units(orig_text, reps)
+    ref_lines = refactored.splitlines(keepends=True)
+    assert ref_lines[adj4 - 1] == "line 4\n"
+    assert ref_lines[adj7 - 1] == "line 7\n"
 
 
+def test_check_units_overlap_malformed_inputs_raise_errors() -> None:
+    """Verifies that check_units_overlap raises descriptive errors rather than silently returning False on invalid units."""
+    import pytest
+    from pydoppelgangerhunt.fixer import check_units_overlap
 
+    u_valid = {"file": "mod.py", "start": 1, "end": 5}
 
+    # Non-dictionary units raise TypeError
+    with pytest.raises(TypeError, match="Units must be dictionaries"):
+        check_units_overlap(123, u_valid)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="Units must be dictionaries"):
+        check_units_overlap(u_valid, "invalid")  # type: ignore[arg-type]
+
+    # Malformed start/end lines raise ValueError
+    with pytest.raises(ValueError, match="Malformed unit: invalid line boundary"):
+        check_units_overlap({"file": "mod.py", "start": "bad_int", "end": 5}, u_valid)
+    with pytest.raises(ValueError, match="Malformed unit: invalid line boundary"):
+        check_units_overlap(u_valid, {"file": "mod.py", "start": 1, "end": "bad_int"})
+
+    # Malformed column offsets raise ValueError
+    with pytest.raises(ValueError, match="Malformed unit: invalid column offset"):
+        check_units_overlap({"file": "mod.py", "start": 1, "end": 5, "start_col": "invalid"}, u_valid)
+    with pytest.raises(ValueError, match="Malformed unit: invalid column offset"):
+        check_units_overlap(u_valid, {"file": "mod.py", "start": 1, "end": 5, "end_col": "invalid"})

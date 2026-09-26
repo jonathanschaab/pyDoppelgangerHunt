@@ -55,11 +55,13 @@ from pydoppelgangerhunt.coverage import (
     read_coverage_data,
 )
 from pydoppelgangerhunt.fixer import (
+    UnitSpan,
     analyze_unit_variable_scope,
     check_units_overlap,
     compute_unit_byte_offsets,
     compute_unit_char_offsets,
     compute_unit_replacement_span,
+    compute_unit_spans,
     extract_unit_comments_and_pragmas,
     filter_overlapping_clone_units,
     find_enclosing_class,
@@ -195,6 +197,8 @@ __all__ = [
     "compute_unit_byte_offsets",
     "compute_unit_char_offsets",
     "compute_unit_replacement_span",
+    "compute_unit_spans",
+    "UnitSpan",
     "filter_overlapping_clone_units",
     "find_enclosing_class",
     "find_enclosing_function",

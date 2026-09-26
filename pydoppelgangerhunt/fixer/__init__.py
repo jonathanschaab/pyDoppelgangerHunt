@@ -77,10 +77,12 @@ from pydoppelgangerhunt.fixer.source import (
     _is_docstring_node,
     _scan_sig_line,
     _slice_unit_token_lines,
+    UnitSpan,
     col_offset_to_char_offset,
     compute_unit_byte_offsets,
     compute_unit_char_offsets,
     compute_unit_replacement_span,
+    compute_unit_spans,
     extract_unit_comments_and_pragmas,
     replace_unit_in_source,
     slice_source_by_token_range,
@@ -98,6 +100,7 @@ from pydoppelgangerhunt.fixer.synthesis import (
 
 __all__ = [
     "ModuleDependencyGraph",
+    "UnitSpan",
     "analyze_unit_variable_scope",
     "build_module_graph",
     "check_units_overlap",
@@ -105,6 +108,7 @@ __all__ = [
     "compute_unit_byte_offsets",
     "compute_unit_char_offsets",
     "compute_unit_replacement_span",
+    "compute_unit_spans",
     "derive_module_import_path",
     "derive_shared_module_import",
     "extract_unit_comments_and_pragmas",

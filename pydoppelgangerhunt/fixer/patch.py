@@ -51,8 +51,8 @@ from pydoppelgangerhunt.fixer.source import (
     _insert_imports_into_module,
     _is_docstring_node,
     _scan_sig_line,
-    compute_unit_byte_offsets,
     compute_unit_replacement_span,
+    compute_unit_spans,
 )
 from pydoppelgangerhunt.fixer.synthesis import (
     _extract_required_typing_imports,
@@ -87,37 +87,37 @@ def check_units_overlap(
         intervals overlap; False otherwise.
     """
     if not isinstance(u1, dict) or not isinstance(u2, dict):
-        return False
+        raise TypeError(f"Units must be dictionaries, got {type(u1).__name__} and {type(u2).__name__}")
     f1 = normalize_path_string(str(u1.get("file") or ""))
     f2 = normalize_path_string(str(u2.get("file") or ""))
     if not f1 or not f2 or not _is_same_file_path(f1, f2, repo_root=repo_root):
         return False
-    try:
-        start1 = int(u1.get("start") or 1)
-        end1 = int(u1.get("end") or start1)
-        start2 = int(u2.get("start") or 1)
-        end2 = int(u2.get("end") or start2)
-    except (ValueError, TypeError):
-        return False
+    def _parse_lines(u: Dict[str, Any], label: str, file_path: str) -> Tuple[int, int]:
+        try:
+            s_val = u.get("start")
+            s = int(s_val if s_val is not None else 1)
+            e_val = u.get("end")
+            e = int(e_val if e_val is not None else s)
+            return (e, s) if s > e else (s, e)
+        except (ValueError, TypeError) as err:
+            raise ValueError(f"Malformed unit: invalid line boundary in {label} ({file_path}): {err}") from err
 
-    if start1 > end1:
-        start1, end1 = end1, start1
-    if start2 > end2:
-        start2, end2 = end2, start2
+    start1, end1 = _parse_lines(u1, "u1", f1)
+    start2, end2 = _parse_lines(u2, "u2", f2)
 
     if end1 < start2 or end2 < start1:
         return False
 
-    def _safe_col(val: Any) -> Optional[int]:
+    def _parse_col(val: Any, col_name: str, file_path: str) -> Optional[int]:
         if val is None:
             return None
         try:
             return int(val)
-        except (ValueError, TypeError):
-            return None
+        except (ValueError, TypeError) as err:
+            raise ValueError(f"Malformed unit: invalid column offset '{col_name}'={val!r} in {file_path}") from err
 
-    sc1, ec1 = _safe_col(u1.get("start_col")), _safe_col(u1.get("end_col"))
-    sc2, ec2 = _safe_col(u2.get("start_col")), _safe_col(u2.get("end_col"))
+    sc1, ec1 = _parse_col(u1.get("start_col"), "start_col", f1), _parse_col(u1.get("end_col"), "end_col", f1)
+    sc2, ec2 = _parse_col(u2.get("start_col"), "start_col", f2), _parse_col(u2.get("end_col"), "end_col", f2)
 
     # When units share exactly one boundary line (max(start1, start2) == min(end1, end2)),
     # check sub-line column disjointness on that shared line:
@@ -240,13 +240,37 @@ def refactor_module_units(
                 )
 
     computed_entries: List[Dict[str, Any]] = []
+    lines = source_text.splitlines(keepends=True)
+    line_char_offsets = [0]
+    line_byte_offsets = [0]
+    for ln in lines:
+        line_char_offsets.append(line_char_offsets[-1] + len(ln))
+        line_byte_offsets.append(line_byte_offsets[-1] + len(ln.encode("utf-8")))
+
     for unit, rep in rep_list:
-        start_char, end_char, final_rep = compute_unit_replacement_span(source_text, unit, rep)
-        start_byte, end_byte = compute_unit_byte_offsets(source_text, unit)
-        # If boundary pragma preservation extended the replacement slice to line end,
-        # synchronize end_byte so physical interval collision checks cover the full slice.
-        actual_end_byte = len(source_text[:end_char].encode("utf-8"))
-        end_byte = max(end_byte, actual_end_byte)
+        unit_span = compute_unit_spans(
+            source_text,
+            unit,
+            lines=lines,
+            line_char_offsets=line_char_offsets,
+            line_byte_offsets=line_byte_offsets,
+        )
+        start_char, end_char, final_rep = compute_unit_replacement_span(
+            source_text,
+            unit,
+            rep,
+            unit_span=unit_span,
+            lines=lines,
+        )
+        start_byte = unit_span.start_byte
+        if end_char == unit_span.end_char:
+            end_byte = unit_span.end_byte
+        else:
+            # Boundary pragma preservation extended slice to line end:
+            # Look up byte offset of the line end directly from line_byte_offsets in O(1).
+            end_line = unit_span.end_line
+            end_byte = line_byte_offsets[min(len(lines), end_line)]
+
         computed_entries.append({
             "unit": unit,
             "start_char": start_char,
@@ -578,6 +602,32 @@ class _FilePatchPlan:
         self.claimed_units: List[Dict[str, Any]] = []
 
 
+def _compute_replacement_line_deltas(
+    reps: Sequence[Tuple[Dict[str, Any], str]],
+    orig_text: str,
+) -> List[Tuple[int, int]]:
+    """Computes (end_line, line_delta) tuples for replacements in source text.
+
+    For each replacement, calculates net change in line count (newlines added - newlines removed).
+    Because candidate replacements are non-overlapping, their line deltas are strictly additive.
+    """
+    deltas: List[Tuple[int, int]] = []
+    lines = orig_text.splitlines(keepends=True)
+    for u, rep in reps:
+        if not isinstance(u, dict):
+            continue
+        try:
+            end_l = int(u.get("end") or u.get("start") or 1)
+        except (ValueError, TypeError):
+            continue
+        s_c, e_c, final_rep = compute_unit_replacement_span(orig_text, u, rep, lines=lines)
+        orig_nl = orig_text[s_c:e_c].count("\n")
+        rep_nl = final_rep.count("\n")
+        deltas.append((end_l, rep_nl - orig_nl))
+    deltas.sort(key=lambda item: item[0])
+    return deltas
+
+
 def _adjust_line_for_replacements(
     target_line: int,
     reps: Sequence[Tuple[Dict[str, Any], str]],
@@ -590,28 +640,8 @@ def _adjust_line_for_replacements(
         t_line = 1
     if t_line <= 1 or not reps:
         return max(1, t_line)
-    orig_lines = orig_text.splitlines(keepends=True)
-    effective_target = min(t_line, len(orig_lines) + 1)
-
-    def _get_unit_end(u: Any) -> int:
-        if not isinstance(u, dict):
-            return 1
-        try:
-            return int(u.get("end") or u.get("start") or 1)
-        except (ValueError, TypeError):
-            return 1
-
-    upstream_reps = [
-        (u, rep)
-        for u, rep in reps
-        if _get_unit_end(u) < effective_target
-    ]
-    if not upstream_reps:
-        return max(1, t_line)
-    prefix = "".join(orig_lines[: effective_target - 1])
-    new_prefix = refactor_module_units(prefix, upstream_reps)
-    new_prefix_lines = len(new_prefix.splitlines(keepends=True))
-    line_delta = new_prefix_lines - (effective_target - 1)
+    deltas = _compute_replacement_line_deltas(reps, orig_text)
+    line_delta = sum(d for end_line, d in deltas if end_line < t_line)
     return max(1, t_line + line_delta)
 
 
@@ -812,10 +842,15 @@ def _render_file_patch_plan(
         current_text = plan.orig_text
 
     if plan.method_helpers:
+        deltas = (
+            _compute_replacement_line_deltas(filtered_reps, plan.orig_text)
+            if replace_clones and filtered_reps
+            else []
+        )
         adjusted_methods = [
             (
-                _adjust_line_for_replacements(ins_line, filtered_reps, plan.orig_text)
-                if replace_clones and filtered_reps
+                max(1, ins_line + sum(d for end_line, d in deltas if end_line < ins_line))
+                if deltas
                 else ins_line,
                 h_code,
             )
