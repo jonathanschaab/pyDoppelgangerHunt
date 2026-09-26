@@ -1448,4 +1448,55 @@ def test_apply_baseline_and_diff_filters_adapts_to_target_relative_clones(
             assert any("using unit_basis='target'" in record.message for record in caplog.records)
 
 
+def test_apply_baseline_and_diff_filters_adapts_past_initial_untouched_clones(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    """Verifies that basis inference searches beyond the first 10 clones when initial clones are untouched."""
+    import argparse
+    import logging
+    from unittest.mock import patch  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.cli import _apply_baseline_and_diff_filters  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+    foo = src / "foo.py"
+    foo.write_text("def a(): pass\n", encoding="utf-8")
+
+    # 15 initial clone pairs in untouched files
+    untouched_clones = [
+        (1.0, {"file": f"untouched_{i}.py", "start": 1, "end": 5}, {"file": f"untouched_{i}.py", "start": 10, "end": 15})
+        for i in range(15)
+    ]
+    # Clone #16 is target-relative touching the diff in src/foo.py
+    target_rel_clone = (1.0, {"file": "foo.py", "start": 1, "end": 5}, {"file": "foo.py", "start": 1, "end": 5})
+    all_clones = untouched_clones + [target_rel_clone]
+
+    args = argparse.Namespace(
+        baseline=None,
+        prune_baseline=False,
+        diff_only=True,
+        partial_hunk_policy="any",
+        min_diff_overlap=0.0,
+        since=None,
+        format="json",
+    )
+    with patch("pydoppelgangerhunt.cli._safe_call_git_diff_helper") as mock_diff:
+        mock_diff.return_value = {"src/foo.py": [(1, 5)]}
+        with caplog.at_level(logging.DEBUG, logger="pydoppelgangerhunt.cli"):
+            filtered, _ = _apply_baseline_and_diff_filters(
+                all_clones,
+                args,
+                tool_cfg={},
+                target_repo_root=str(src),
+                target=str(src),
+                repo_root=str(repo),
+            )
+            # The 16th clone must be detected and retained under unit_basis='target'
+            assert len(filtered) == 1
+            assert filtered[0][1]["file"] == "foo.py"
+            assert any("using unit_basis='target'" in record.message for record in caplog.records)
+
+
+
 

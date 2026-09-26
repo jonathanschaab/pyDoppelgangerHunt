@@ -567,23 +567,31 @@ def _apply_baseline_and_diff_filters(
             and modified_ranges.target_ranges
             and modified_ranges.repo_ranges
         ):
-            sample_units = [u for item in clones[:10] for u in (item[1], item[2]) if isinstance(u, dict)]
-            target_hits = sum(
-                1
-                for u in sample_units
-                if normalize_path_string(str(u.get("file") or ""), strip_anchor=True) in modified_ranges.target_ranges
-            )
-            repo_hits = sum(
-                1
-                for u in sample_units
-                if normalize_path_string(str(u.get("file") or ""), strip_anchor=True) in modified_ranges.repo_ranges
-            )
-            if target_hits > 0 and repo_hits == 0:
-                logger.debug(
-                    "Detected target-relative clone endpoints at filter callsite (%d target hits vs 0 repo hits); using unit_basis='target'",
-                    target_hits,
-                )
-                chosen_basis = "target"
+            for item in clones:
+                if isinstance(item, (tuple, list)) and len(item) >= 3:
+                    u1, u2 = item[1], item[2]
+                elif isinstance(item, dict):
+                    u1 = item.get("u1") or item.get("unit_a") or item
+                    u2 = item.get("u2") or item.get("unit_b") or item
+                else:
+                    continue
+                t_hit = False
+                r_hit = False
+                for u in (u1, u2):
+                    if isinstance(u, dict):
+                        f_raw = u.get("file") or u.get("file_a") or u.get("file_b") or ""
+                        f_norm = normalize_path_string(str(f_raw), strip_anchor=True)
+                        if f_norm in modified_ranges.target_ranges:
+                            t_hit = True
+                        if f_norm in modified_ranges.repo_ranges:
+                            r_hit = True
+                if t_hit or r_hit:
+                    if t_hit and not r_hit:
+                        logger.debug(
+                            "Detected target-relative clone endpoints at filter callsite; using unit_basis='target'",
+                        )
+                        chosen_basis = "target"
+                    break
 
         clones = filter_clones_by_git_diff(
             clones,

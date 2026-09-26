@@ -728,7 +728,33 @@ class CanonicalPathResolver:
         diff_target_keys: Optional[Set[str]] = None,
         diff_repo_keys: Optional[Set[str]] = None,
     ) -> bool:
-        """Checks if a unit file path matches any diff key without ambiguous suffix matching."""
+        """Checks if a unit file path matches any diff key without ambiguous suffix matching.
+
+        Args:
+            unit_file: Path to candidate unit file (relative or absolute).
+            diff_keys: Set or collection of diff keys (e.g. from build_diff_path_keys).
+            basis: Coordinate interpretation basis for relative paths ('target', 'repo', 'auto').
+            strip_anchor: Whether to strip notebook cell fragments when evaluating diff matches.
+            has_tagged: Optional precomputed boolean indicating if diff_keys contains 'target:' or 'repo:' tags.
+            diff_target_keys: Optional precomputed target coordinate subset.
+            diff_repo_keys: Optional precomputed repo coordinate subset.
+
+        Performance Note for External API Consumers:
+            When probing diff keys across large corpora (e.g. thousands of unit files):
+              - Passing a :class:`DiffPathKeySet` (returned by :func:`build_diff_path_keys`) or
+                explicit coordinate sets (``diff_target_keys`` and ``diff_repo_keys``) enables
+                zero-allocation, O(1) attribute lookups, bypassing coordinate set isolation passes.
+              - Passing an immutable :class:`frozenset` allows fast O(1) object identity caching
+                without content comparison overhead.
+              - Passing a standard mutable :class:`set` requires safety validation against in-place
+                set mutations (validating full set equality against the cached snapshot), which can
+                introduce O(N) comparison overhead per call when coordinate subsets are omitted.
+                External consumers executing high-volume differential loops should supply a
+                :class:`frozenset` or :class:`DiffPathKeySet`.
+
+        Returns:
+            True if the unit file matches any key in diff_keys, False otherwise.
+        """
         if not unit_file or not diff_keys:
             return False
 
