@@ -334,7 +334,7 @@ class CanonicalPathResolver:
 
     def resolve(
         self,
-        path: Union[str, Path, CanonicalPath],
+        path: Optional[Union[str, Path, CanonicalPath]],
         basis: str = "auto",
         strip_anchor: bool = False,
     ) -> CanonicalPath:
@@ -351,6 +351,8 @@ class CanonicalPathResolver:
         Returns:
             Resolved CanonicalPath.
         """
+        if path is None:
+            return CanonicalPath(raw="", repo_relative="", target_relative="", absolute_lexical="")
         if isinstance(path, CanonicalPath):
             if basis == "auto" and (not strip_anchor or not (path.raw and "#" in path.raw)):
                 return path

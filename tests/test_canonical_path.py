@@ -951,3 +951,13 @@ def test_join_lexical_posix_empty_and_root_bases() -> None:
     assert _join_lexical_posix("/", "foo/bar.py") == "/foo/bar.py"
     assert _join_lexical_posix("/root", "foo/bar.py") == "/root/foo/bar.py"
     assert _join_lexical_posix("rel/dir", "foo/bar.py") == "rel/dir/foo/bar.py"
+
+
+def test_resolver_resolve_none(tmp_path: Path) -> None:
+    """Verifies that CanonicalPathResolver.resolve(None) safely returns empty CanonicalPath."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    resolver = CanonicalPathResolver(target_root=repo)
+    resolved = resolver.resolve(None)
+    assert resolved == CanonicalPath(raw="", repo_relative="", target_relative="", absolute_lexical="")
+

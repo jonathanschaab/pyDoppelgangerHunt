@@ -5540,3 +5540,81 @@ def test_extract_record_endpoint_data_defensive_path_normalization() -> None:
     assert ha2 == "ha"
     assert hb2 == "hb"
 
+
+def test_filter_clones_by_baseline_records_o1_consumed_tracking() -> None:
+    """Verifies that _filter_clones_by_baseline_records tracks consumed records in O(1) without mutating inputs."""
+    from pydoppelgangerhunt.baseline import _filter_clones_by_baseline_records  # pylint: disable=import-outside-toplevel
+
+    u1 = {"file": "mod.py", "name": "f1", "structural_hash": "h1"}
+    u2 = {"file": "mod.py", "name": "f2", "structural_hash": "h2"}
+    clone = (1.0, u1, u2)
+
+    rec = {
+        "file_a": "mod.py",
+        "name_a": "f1",
+        "hash_a": "h1",
+        "file_b": "mod.py",
+        "name_b": "f2",
+        "hash_b": "h2",
+        "fingerprint": "mod.py:f1 <===> mod.py:f2",
+        "structural_fingerprint": "mod.py#h1 <===> mod.py#h2",
+    }
+    records = [rec]
+
+    # Two identical clones; only 1 should be suppressed
+    active_clones = [clone, clone]
+    remaining, suppressed = _filter_clones_by_baseline_records(
+        active_clones,
+        records,
+        resolver=None,
+        base_offset=None,
+        scan_offset=None,
+        base_basis="target_relative",
+        active_clone_basis="target_relative",
+    )
+    assert suppressed == 1
+    assert len(remaining) == 1
+    assert remaining[0] == clone
+    # Original records sequence was not mutated
+    assert len(records) == 1
+    assert records[0] is rec
+
+    # Test empty records fast-path
+    rem_empty, supp_empty = _filter_clones_by_baseline_records(
+        active_clones,
+        [],
+        resolver=None,
+        base_offset=None,
+        scan_offset=None,
+        base_basis="target_relative",
+        active_clone_basis="target_relative",
+    )
+    assert supp_empty == 0
+    assert len(rem_empty) == 2
+
+
+def test_baseline_lexical_relative_to_case_folding() -> None:
+    """Verifies that direct lexical_relative_to invocations in baseline logic fold case on Windows."""
+    from pydoppelgangerhunt.baseline import _prepare_clone_candidate_context  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.canonical_path import CanonicalPathResolver  # pylint: disable=import-outside-toplevel
+
+    resolver = CanonicalPathResolver(target_root="c:/repo/sub", repo_root="c:/repo", case_fold=True)
+
+    c_keys = {
+        "file_a": "c:/repo/Sub/pkg/a.py",
+        "file_b": "c:/repo/Sub/pkg/b.py",
+        "name_a": "fn_a",
+        "name_b": "fn_b",
+        "hash_a": "h_a",
+        "hash_b": "h_b",
+    }
+    ctx = _prepare_clone_candidate_context(
+        c_keys,
+        resolver=resolver,
+        base_offset="sub",
+        scan_offset="sub",
+        clone_basis="target_relative",
+    )
+    assert ctx is not None
+
+

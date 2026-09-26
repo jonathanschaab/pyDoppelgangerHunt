@@ -8,7 +8,9 @@ import hashlib
 import json
 import logging
 import math
+import os
 from pathlib import Path
+import sys
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.canonical_path import (
@@ -39,6 +41,7 @@ ShingleKeyWireFormat = str
 
 
 MAX_CALIBRATION_UNITS: int = 1_000_000_000
+_CASE_FOLD_PLATFORM: bool = os.name == "nt" or sys.platform == "win32"
 
 
 def _safe_total_units(raw_units: Any) -> int:
@@ -586,6 +589,7 @@ def record_baseline(
 
         fa_target = fa_raw
         fb_target = fb_raw
+        cf = res.case_fold if res is not None else _CASE_FOLD_PLATFORM
         if res is not None:
             resolved_a = res.resolve(fa_raw, basis=active_clone_basis)
             if resolved_a.target_relative:
@@ -594,18 +598,18 @@ def record_baseline(
             if resolved_b.target_relative:
                 fb_target = resolved_b.target_relative
         elif target_repo_rel and active_clone_basis == "repo_relative":
-            rel_a = lexical_relative_to(fa_raw, target_repo_rel)
+            rel_a = lexical_relative_to(fa_raw, target_repo_rel, case_fold=cf)
             if rel_a:
                 fa_target = rel_a
-            rel_b = lexical_relative_to(fb_raw, target_repo_rel)
+            rel_b = lexical_relative_to(fb_raw, target_repo_rel, case_fold=cf)
             if rel_b:
                 fb_target = rel_b
         elif target is not None:
             t_norm = normalize_lexical_posix(str(target))
-            rel_a = lexical_relative_to(fa_raw, t_norm)
+            rel_a = lexical_relative_to(fa_raw, t_norm, case_fold=cf)
             if rel_a:
                 fa_target = rel_a
-            rel_b = lexical_relative_to(fb_raw, t_norm)
+            rel_b = lexical_relative_to(fb_raw, t_norm, case_fold=cf)
             if rel_b:
                 fb_target = rel_b
 
@@ -994,14 +998,14 @@ def _compute_path_offset(
         sub_norm = normalize_lexical_posix(str(sub_res))
         root_norm = normalize_lexical_posix(str(root_res))
         if sub_norm and root_norm and sub_norm != root_norm:
-            rel = lexical_relative_to(sub_norm, root_norm)
+            rel = lexical_relative_to(sub_norm, root_norm, case_fold=_CASE_FOLD_PLATFORM)
             if rel is not None:
                 return rel.strip("/")
 
         raw_sub = normalize_lexical_posix(str(sub_p))
         raw_root = normalize_lexical_posix(str(root_p))
         if raw_sub and raw_root and raw_sub != raw_root:
-            rel = lexical_relative_to(raw_sub, raw_root)
+            rel = lexical_relative_to(raw_sub, raw_root, case_fold=_CASE_FOLD_PLATFORM)
             if rel is not None:
                 return rel.strip("/")
     except (ValueError, TypeError):
@@ -1048,9 +1052,9 @@ def _derive_target_offsets(
         t_norm = normalize_lexical_posix(str(t_p_parent))
         b_norm = normalize_lexical_posix(str(b_p_parent))
         if t_norm and b_norm and t_norm != b_norm:
-            if lexical_relative_to(t_norm, b_norm) is not None:
+            if lexical_relative_to(t_norm, b_norm, case_fold=_CASE_FOLD_PLATFORM) is not None:
                 effective_repo = base_target
-            elif lexical_relative_to(b_norm, t_norm) is not None:
+            elif lexical_relative_to(b_norm, t_norm, case_fold=_CASE_FOLD_PLATFORM) is not None:
                 effective_repo = target
 
     base_offset = (
@@ -1130,6 +1134,21 @@ def _get_rec_repo_data(
     return r_repo_fa, r_repo_fb, r_repo_fp, r_repo_sfp, r_repo_ns_sfp, r_repo_namespaces
 
 
+def _get_rec_fingerprint_value(
+    rec: Dict[str, Any],
+    key: str,
+    base_offset: Optional[str],
+    path_basis: Optional[str],
+) -> str:
+    """Retrieves cached fingerprint from record or recomputes repo-offset representation."""
+    val = str(rec.get(key) or "")
+    if base_offset or not val:
+        repo_data = _get_rec_repo_data(rec, base_offset, path_basis=path_basis)
+        return repo_data[3] if key == "structural_fingerprint" else repo_data[4]
+    return val
+
+
+
 def _record_matches_names(rec: Dict[str, Any], target_names: List[str]) -> bool:
     """Checks if a baseline record's paired symbol names match target clone names."""
     rec_names = sorted([str(rec.get("name_a") or ""), str(rec.get("name_b") or "")])
@@ -1199,9 +1218,9 @@ def _build_baseline_path_resolver(
             t_norm = normalize_lexical_posix(str(target))
             b_norm = normalize_lexical_posix(str(baseline_target))
             if t_norm and b_norm and t_norm != b_norm:
-                if lexical_relative_to(t_norm, b_norm) is not None:
+                if lexical_relative_to(t_norm, b_norm, case_fold=_CASE_FOLD_PLATFORM) is not None:
                     return CanonicalPathResolver(target_root=target, repo_root=baseline_target)
-                if lexical_relative_to(b_norm, t_norm) is not None:
+                if lexical_relative_to(b_norm, t_norm, case_fold=_CASE_FOLD_PLATFORM) is not None:
                     return CanonicalPathResolver(target_root=baseline_target, repo_root=target)
         return CanonicalPathResolver(target_root=effective_target, repo_root=effective_repo)
     except (ValueError, OSError, RuntimeError):
@@ -1343,11 +1362,18 @@ def _match_exact_and_namespaced_passes(
     c_hb: str,
     base_offset: Optional[str] = None,
     path_basis: Optional[str] = "target_relative",
+    consumed_ids: Optional[Set[int]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Evaluates Pass 1 (symbol-path), Pass 2 (path-structural), and Pass 3 (namespaced structural)."""
+    candidates = (
+        [rec for rec in unconsumed if id(rec) not in consumed_ids]
+        if consumed_ids is not None
+        else unconsumed
+    )
+
     # Pass 1: exact symbol-path fingerprint (file:name <===> file:name) prioritizing matching structural hash
     cand_pass1: Optional[Dict[str, Any]] = None
-    for rec in unconsumed:
+    for rec in candidates:
         _, _, r_repo_fp, r_repo_sfp, _, _ = _get_rec_repo_data(
             rec, base_offset, path_basis=path_basis
         )
@@ -1360,26 +1386,14 @@ def _match_exact_and_namespaced_passes(
         return cand_pass1
 
     # Pass 2: exact path-structural fingerprint (file#hash <===> file#hash) resilient to function renames
-    for rec in unconsumed:
-        r_sfp = rec.get("structural_fingerprint")
-        if base_offset or not r_sfp:
-            _, _, _, r_repo_sfp, _, _ = _get_rec_repo_data(
-                rec, base_offset, path_basis=path_basis
-            )
-            r_sfp = r_repo_sfp
-        if r_sfp == c_sfp:
+    for rec in candidates:
+        if _get_rec_fingerprint_value(rec, "structural_fingerprint", base_offset, path_basis) == c_sfp:
             return rec
 
     # Pass 3: namespaced structural fingerprint (namespace#hash <===> namespace#hash) resilient to file renames within package
     cand_pass3: Optional[Dict[str, Any]] = None
-    for rec in unconsumed:
-        r_ns_sfp = rec.get("namespaced_structural_fingerprint")
-        if base_offset or not r_ns_sfp:
-            _, _, _, _, r_repo_ns_sfp, _ = _get_rec_repo_data(
-                rec, base_offset, path_basis=path_basis
-            )
-            r_ns_sfp = r_repo_ns_sfp
-        if r_ns_sfp == c_ns_sfp:
+    for rec in candidates:
+        if _get_rec_fingerprint_value(rec, "namespaced_structural_fingerprint", base_offset, path_basis) == c_ns_sfp:
             if _record_matches_names(rec, c_names):
                 return rec
             if cand_pass3 is None:
@@ -1403,12 +1417,19 @@ def _match_structural_and_boundary_passes(
     resolver: Optional[CanonicalPathResolver] = None,
     base_offset: Optional[str] = None,
     path_basis: Optional[str] = "target_relative",
+    consumed_ids: Optional[Set[int]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Evaluates Pass 4 (pure structural with namespace), Pass 5 (cross-namespace moved), and Pass 6 (boundary)."""
+    candidates = (
+        [rec for rec in unconsumed if id(rec) not in consumed_ids]
+        if consumed_ids is not None
+        else unconsumed
+    )
+
     # Pass 4: pure structural fingerprint (hash <===> hash) strictly requiring matching module namespaces,
     # preventing identical boilerplate functions across different modules from colliding
     cand_pass4: Optional[Dict[str, Any]] = None
-    for rec in unconsumed:
+    for rec in candidates:
         if rec.get("pure_structural_fingerprint") == c_pure_sfp:
             if base_offset:
                 _, _, _, _, _, r_namespaces = _get_rec_repo_data(
@@ -1432,7 +1453,7 @@ def _match_structural_and_boundary_passes(
 
     # Pass 5: pure structural fallback for cross-namespace moved files; requires distinct structural hashes
     # (h_a != h_b) and matching symbols, preventing a grandfathered entry from being hijacked by unrelated cross-namespace code
-    for rec in unconsumed:
+    for rec in candidates:
         if rec.get("pure_structural_fingerprint") == c_pure_sfp:
             h_a = str(rec.get("hash_a", ""))
             h_b = str(rec.get("hash_b", ""))
@@ -1447,7 +1468,7 @@ def _match_structural_and_boundary_passes(
                     return rec
 
     # Pass 6: cross-root boundary-aware matching (e.g. baseline recorded at repo root vs scan targeting subdirectory)
-    for rec in unconsumed:
+    for rec in candidates:
         r_repo_fa, r_repo_fb, _, _, _, _ = _get_rec_repo_data(
             rec, base_offset, path_basis=path_basis
         )
@@ -1513,8 +1534,9 @@ def _prepare_clone_candidate_context(
     c_repo_fb = _resolve_clone_endpoint_repo_path(c_fb, scan_offset, active_basis, resolver)
 
     if base_offset:
-        rel_a = lexical_relative_to(c_repo_fa, base_offset)
-        rel_b = lexical_relative_to(c_repo_fb, base_offset)
+        cf = resolver.case_fold if resolver is not None else _CASE_FOLD_PLATFORM
+        rel_a = lexical_relative_to(c_repo_fa, base_offset, case_fold=cf)
+        rel_b = lexical_relative_to(c_repo_fb, base_offset, case_fold=cf)
         if rel_a is None or rel_b is None:
             return None
 
@@ -1553,6 +1575,8 @@ def _match_clone_record(
     scan_offset: Optional[str] = None,
     path_basis: Optional[str] = "target_relative",
     clone_basis: Optional[str] = None,
+    *,
+    consumed_ids: Optional[Set[int]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Finds matching unconsumed baseline record prioritizing exact and namespaced fingerprints."""
     ctx = _prepare_clone_candidate_context(
@@ -1576,6 +1600,7 @@ def _match_clone_record(
         c_hb=ctx.c_hb,
         base_offset=base_offset,
         path_basis=path_basis,
+        consumed_ids=consumed_ids,
     )
     if matched is not None:
         return matched
@@ -1592,6 +1617,7 @@ def _match_clone_record(
         resolver=resolver,
         base_offset=base_offset,
         path_basis=path_basis,
+        consumed_ids=consumed_ids,
     )
 
 
@@ -1608,9 +1634,17 @@ def _filter_clones_by_baseline_records(
 ) -> Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], int]:
     """Filters active clones against structured baseline fingerprint records."""
     unconsumed = list(records)
+    if not unconsumed:
+        return list(clones), 0
+
+    consumed_ids: Set[int] = set()
+    total_records = len(unconsumed)
     new_clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
     suppressed_count = 0
     for sim, u1, u2 in clones:
+        if len(consumed_ids) >= total_records:
+            new_clones.append((sim, u1, u2))
+            continue
         c_keys = {
             "fp": clone_pair_fingerprint(u1, u2),
             "sfp": clone_pair_structural_fingerprint(u1, u2),
@@ -1636,10 +1670,11 @@ def _filter_clones_by_baseline_records(
             scan_offset=scan_offset,
             path_basis=base_basis,
             clone_basis=active_clone_basis,
+            consumed_ids=consumed_ids,
         )
         if matched_rec is not None:
             suppressed_count += 1
-            unconsumed.remove(matched_rec)
+            consumed_ids.add(id(matched_rec))
         else:
             new_clones.append((sim, u1, u2))
     return new_clones, suppressed_count
@@ -1912,8 +1947,8 @@ def _build_pruning_active_clone_indices(
             str(u2.get("file") or ""), scan_offset, path_basis=active_clone_basis
         )
         if base_offset:
-            rel_1 = lexical_relative_to(u1_repo, base_offset)
-            rel_2 = lexical_relative_to(u2_repo, base_offset)
+            rel_1 = lexical_relative_to(u1_repo, base_offset, case_fold=_CASE_FOLD_PLATFORM)
+            rel_2 = lexical_relative_to(u2_repo, base_offset, case_fold=_CASE_FOLD_PLATFORM)
             if rel_1 is None or rel_2 is None:
                 continue
 
@@ -2033,10 +2068,10 @@ def _rewrite_pruned_record(
     rw_fa = str(u1.get("file") or "")
     rw_fb = str(u2.get("file") or "")
     if base_basis == "target_relative" and active_clone_basis == "repo_relative" and scan_offset:
-        rel_fa = lexical_relative_to(rw_fa, scan_offset)
+        rel_fa = lexical_relative_to(rw_fa, scan_offset, case_fold=_CASE_FOLD_PLATFORM)
         if rel_fa:
             rw_fa = rel_fa
-        rel_fb = lexical_relative_to(rw_fb, scan_offset)
+        rel_fb = lexical_relative_to(rw_fb, scan_offset, case_fold=_CASE_FOLD_PLATFORM)
         if rel_fb:
             rw_fb = rel_fb
     elif base_basis in ("repo_relative", "worktree_relative") and active_clone_basis == "target_relative" and scan_offset:
