@@ -13,6 +13,7 @@ from pydoppelgangerhunt.parser import is_decorator_named
 from pydoppelgangerhunt.fixer.scope import (
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
 )
+from pydoppelgangerhunt.fixer.source import _parse_unit_coord
 
 def _find_innermost_enclosing_node(
     source_text: str,
@@ -28,10 +29,8 @@ def _find_innermost_enclosing_node(
     except (SyntaxError, ValueError, UnicodeDecodeError):
         return None
 
-    s_val = unit.get("start")
-    u_start = int(s_val if s_val is not None else 0)
-    e_val = unit.get("end")
-    u_end = int(e_val if e_val is not None else u_start)
+    u_start = _parse_unit_coord(unit, "start", default=0)
+    u_end = _parse_unit_coord(unit, "end", default=u_start)
     if u_start <= 0:
         return None
 

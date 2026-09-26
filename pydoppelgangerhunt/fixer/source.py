@@ -26,6 +26,12 @@ __all__ = [
 ]
 
 
+def _parse_unit_coord(unit: Dict[str, Any], key: str, default: int = 1) -> int:
+    """Extracts and parses an integer coordinate from a unit dictionary."""
+    val = unit.get(key)
+    return int(val if val is not None else default)
+
+
 def _is_docstring_node(node: Optional[ast.AST]) -> bool:
     """Returns True if the AST node is a string literal docstring expression."""
     return bool(
@@ -153,7 +159,7 @@ def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]
     """Slices source lines to the exact start_col and end_col offsets of the unit."""
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
         return lines
-    s_col = unit.get("start_col", 0) or 0
+    s_col = _parse_unit_coord(unit, "start_col", default=0)
     e_col = unit.get("end_col")
     res = list(lines)
     if len(res) == 1:
@@ -522,14 +528,12 @@ def compute_unit_spans(
         return UnitSpan(0, 0, 0, 0, False, 1, 1, 0, 0)
 
     try:
-        start_val = unit.get("start")
-        start = max(1, int(start_val if start_val is not None else 1))
+        start = max(1, _parse_unit_coord(unit, "start", default=1))
     except (ValueError, TypeError) as err:
         raise ValueError(f"Malformed unit: invalid 'start' line: {unit.get('start')!r}") from err
 
     try:
-        end_val = unit.get("end")
-        end = min(len(lines), int(end_val if end_val is not None else len(lines)))
+        end = min(len(lines), _parse_unit_coord(unit, "end", default=len(lines)))
     except (ValueError, TypeError) as err:
         raise ValueError(f"Malformed unit: invalid 'end' line: {unit.get('end')!r}") from err
 
@@ -722,12 +726,12 @@ def resolve_unit_replacement(
 
     attached_pragmas: List[str] = []
     if preserve_boundary_pragmas:
-        raw_sc = unit.get("start_col")
-        raw_ec = unit.get("end_col")
-        start_col = int(raw_sc) if raw_sc is not None else None
-        end_col = int(raw_ec) if raw_ec is not None else None
         boundary_comments = extract_unit_comments_and_pragmas(
-            source_text, start_line=start, end_line=end, start_col=start_col or 0, end_col=end_col
+            source_text,
+            start_line=start,
+            end_line=end,
+            start_col=unit_span.start_col_char,
+            end_col=unit_span.end_col_char,
         )
         for c in boundary_comments:
             if c["is_pragma"] and c["line"] in (start, end):

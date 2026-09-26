@@ -6249,3 +6249,35 @@ def test_adjust_line_for_replacements_boundary_coincidence() -> None:
     # Both deltas apply: -2 + 1 = -1. Result is 6 + (-1) = 5.
     assert _adjust_line_for_replacements(6, reps, orig_text) == 5
 
+
+def test_check_units_overlap_multiline_inverted_column_bounds() -> None:
+    """Verifies that check_units_overlap evaluates inverted column bounds on multi-line units as False."""
+    from pydoppelgangerhunt.fixer import check_units_overlap
+
+    # Multi-line unit with inverted column bounds (start_col > end_col) on a shared boundary line
+    u_multi_inverted = {"file": "mod.py", "start": 1, "end": 3, "start_col": 30, "end_col": 10}
+    u_single = {"file": "mod.py", "start": 1, "end": 1, "start_col": 15, "end_col": 25}
+
+    assert check_units_overlap(u_multi_inverted, u_single) is False
+    assert check_units_overlap(u_single, u_multi_inverted) is False
+
+
+def test_unit_desc_strict_validation_and_parsing() -> None:
+    """Verifies that _unit_desc in refactor_module_units strictly raises TypeError and ValueError."""
+    import pytest
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    # Non-dictionary unit raises TypeError
+    with pytest.raises(TypeError, match="Unit must be a dictionary"):
+        refactor_module_units("x = 1\n", [("invalid", "y = 2\n")])  # type: ignore[list-item]
+
+    # Non-integer start line raises ValueError
+    with pytest.raises(ValueError, match="Malformed unit: invalid 'start' line"):
+        refactor_module_units("x = 1\n", [({"file": "m.py", "start": "bad", "end": 1}, "y = 2\n")])
+
+    # Overlapping collision error formatting with valid units
+    u1 = {"file": "m.py", "start": 1, "end": 2, "name": "fn1"}
+    u2 = {"file": "m.py", "start": 1, "end": 2, "name": "fn2"}
+    with pytest.raises(ValueError, match="Overlapping unit collision detected between 'fn1' \\(1-2\\) and 'fn2' \\(1-2\\)"):
+        refactor_module_units("x = 1\ny = 2\n", [(u1, "x = 10\n"), (u2, "y = 20\n")])
+
