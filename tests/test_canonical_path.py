@@ -13,6 +13,7 @@ from pydoppelgangerhunt.canonical_path import (
     CanonicalPath,
     CanonicalPathResolver,
     DiffPathKeySet,
+    _join_lexical_posix,
     build_diff_path_keys,
     lexical_relative_to,
     normalize_lexical_posix,
@@ -666,6 +667,36 @@ def test_diff_path_key_set_and_zero_allocation_probing(tmp_path: Path) -> None:
     assert len(copy_keys.diff_target_keys) == 0
     assert len(copy_keys.diff_repo_keys) == 0
 
+    # Mutation parity: difference_update and -=
+    mut_keys = DiffPathKeySet(["target:a.py", "target:b.py", "repo:src/a.py"])
+    mut_keys.difference_update(["target:b.py"])
+    assert "target:b.py" not in mut_keys
+    assert "b.py" not in mut_keys.diff_target_keys
+
+    mut_keys -= {"target:a.py"}
+    assert "target:a.py" not in mut_keys
+    assert "a.py" not in mut_keys.diff_target_keys
+    assert mut_keys.diff_repo_keys == {"src/a.py"}
+
+    # Mutation parity: intersection_update and &=
+    mut_keys2 = DiffPathKeySet(["target:x.py", "target:y.py", "repo:src/x.py"])
+    mut_keys2.intersection_update(["target:x.py", "repo:src/x.py"])
+    assert "target:y.py" not in mut_keys2
+    assert "y.py" not in mut_keys2.diff_target_keys
+    assert mut_keys2.diff_target_keys == {"x.py"}
+
+    mut_keys2 &= {"target:x.py"}
+    assert "repo:src/x.py" not in mut_keys2
+    assert len(mut_keys2.diff_repo_keys) == 0
+
+    # Mutation parity: symmetric_difference_update
+    mut_keys3 = DiffPathKeySet(["target:m.py"])
+    mut_keys3.symmetric_difference_update(["target:m.py", "target:n.py"])
+    assert "target:m.py" not in mut_keys3
+    assert "m.py" not in mut_keys3.diff_target_keys
+    assert "target:n.py" in mut_keys3
+    assert "n.py" in mut_keys3.diff_target_keys
+
     # 5. set_diff_keys on resolver
     resolver.clear_cache()
     assert resolver.diff_target_keys is None
@@ -756,3 +787,39 @@ def test_matches_diff_state_isolation_across_different_diff_keys(tmp_path: Path)
     # Calling with diff_b ignores resolver.diff_target_keys bound to diff_a because id() doesn't match
     assert resolver.matches_diff("b.py", diff_b) is True
     assert resolver.matches_diff("a.py", diff_b) is False
+
+
+def test_cache_set_eviction_preserves_bound_diff_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that _cache_set capacity eviction clears path cache without resetting bound diff keys."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    f1 = repo / "a.py"
+    f1.write_text("x = 1\n", encoding="utf-8")
+
+    resolver = CanonicalPathResolver(target_root=repo)
+    resolver.set_diff_keys({"target:a.py"}, diff_target_keys={"a.py"}, diff_repo_keys=set())
+    assert resolver.diff_target_keys == {"a.py"}
+    assert resolver._bound_diff_id is not None
+
+    # Resolve a path to populate _cache
+    resolver.resolve("a.py")
+    assert len(resolver._cache) > 0
+
+    # Lower MAX_RESOLVER_CACHE_ENTRIES to force eviction on next _cache_set
+    monkeypatch.setattr("pydoppelgangerhunt.canonical_path.MAX_RESOLVER_CACHE_ENTRIES", 1)
+
+    # Resolve another path causing cache eviction
+    resolver.resolve("b.py")
+
+    # Verify path cache rolled over but bound diff keys survived
+    assert len(resolver._cache) == 1
+    assert resolver.diff_target_keys == {"a.py"}
+    assert resolver._bound_diff_id is not None
+
+
+def test_join_lexical_posix_empty_and_root_bases() -> None:
+    """Verifies _join_lexical_posix distinguishes relative empty base from filesystem root."""
+    assert _join_lexical_posix("", "foo/bar.py") == "foo/bar.py"
+    assert _join_lexical_posix("/", "foo/bar.py") == "/foo/bar.py"
+    assert _join_lexical_posix("/root", "foo/bar.py") == "/root/foo/bar.py"
+    assert _join_lexical_posix("rel/dir", "foo/bar.py") == "rel/dir/foo/bar.py"

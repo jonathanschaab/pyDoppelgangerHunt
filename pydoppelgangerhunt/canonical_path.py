@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import posixpath
 import sys
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import AbstractSet, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 import unicodedata
 
 
@@ -135,6 +135,8 @@ def _join_lexical_posix(base: str, rel: str) -> str:
     Returns:
         Cleanly joined posix path string without redundant root slashes.
     """
+    if not base:
+        return rel.rstrip("/")
     base_clean = base.rstrip("/")
     if not base_clean:
         return f"/{rel}".rstrip("/")
@@ -282,9 +284,13 @@ class CanonicalPathResolver:
         self.diff_target_keys: Optional[Set[str]] = None
         self.diff_repo_keys: Optional[Set[str]] = None
 
+    def clear_path_cache(self) -> None:
+        """Clears memoized path resolutions without resetting bound diff key state."""
+        self._cache.clear()
+
     def clear_cache(self) -> None:
         """Clears memoized path resolutions and cached diff key metadata."""
-        self._cache.clear()
+        self.clear_path_cache()
         self._tagged_keys_cache = None
         self._bound_diff_id = None
         self.diff_target_keys = None
@@ -323,7 +329,7 @@ class CanonicalPathResolver:
 
     def _cache_set(self, key: Tuple[str, str, bool], value: CanonicalPath) -> None:
         if len(self._cache) >= MAX_RESOLVER_CACHE_ENTRIES:
-            self.clear_cache()
+            self.clear_path_cache()
         self._cache[key] = value
 
     def resolve(
@@ -828,6 +834,38 @@ class DiffPathKeySet(set[str]):
         """Updates the set with elements from all iterables and tracks coordinate sub-sets."""
         for items in s:
             for item in items:
+                self.add(item)
+
+    def difference_update(self, *s: Iterable[object]) -> None:
+        """Removes all elements of other iterables from this set and tracks coordinate sub-sets."""
+        for other in s:
+            for item in other:
+                self.discard(item)
+
+    def __isub__(self, other: AbstractSet[object]) -> DiffPathKeySet:
+        """Removes all elements of another set from this set in-place."""
+        self.difference_update(other)
+        return self
+
+    def intersection_update(self, *s: Iterable[object]) -> None:
+        """Updates the set, keeping only elements found in it and all other iterables."""
+        for other in s:
+            other_set = set(other)
+            to_remove = [item for item in self if item not in other_set]
+            for item in to_remove:
+                self.discard(item)
+
+    def __iand__(self, other: AbstractSet[object]) -> DiffPathKeySet:
+        """Updates the set with the intersection of itself and another in-place."""
+        self.intersection_update(other)
+        return self
+
+    def symmetric_difference_update(self, s: Iterable[str]) -> None:
+        """Updates the set with the symmetric difference of itself and another."""
+        for item in s:
+            if item in self:
+                self.discard(item)
+            else:
                 self.add(item)
 
     def copy(self) -> DiffPathKeySet:
