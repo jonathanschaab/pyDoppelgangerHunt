@@ -409,6 +409,10 @@ def compute_corpus_calibration(
         calibrations record unskewed empirical document frequency statistics.
     """
     _ = stop_shingles
+    if min_frequency == 1 and "min_calibration_frequency" in kwargs:
+        mf_cand = _safe_int(kwargs.get("min_calibration_frequency"), min_val=1)
+        if mf_cand is not None:
+            min_frequency = mf_cand
     total_units = len(units)
     shingle_frequencies: Dict[Any, int] = {}
     for u in units:
@@ -1088,14 +1092,18 @@ def _extract_record_endpoint_data(
         nb = str(parsed.get("name_b") or "")
 
     raw_sfp = item.get("structural_fingerprint") or item.get("sfp")
-    if not ha and not hb and raw_sfp:
+    if (not ha or not hb) and raw_sfp:
         p_fa, p_ha, p_fb, p_hb = _parse_structural_fingerprint(str(raw_sfp))
         if not fa and not fb:
             fa, fb = p_fa, p_fb
         if fa != fb and fa == p_fb and fb == p_fa:
-            ha, hb = p_hb, p_ha
+            parsed_ha, parsed_hb = p_hb, p_ha
         else:
-            ha, hb = p_ha, p_hb
+            parsed_ha, parsed_hb = p_ha, p_hb
+        if not ha:
+            ha = parsed_ha
+        if not hb:
+            hb = parsed_hb
 
     return fa, na, ha, fb, nb, hb
 

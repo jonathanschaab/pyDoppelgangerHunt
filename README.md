@@ -187,7 +187,7 @@ pydoppelgangerhunt --init
 | `--baseline` | `PATH` | Path to grandfathered baseline JSON file to suppress |
 | `--record-baseline` | `PATH` | Path to record detected clones into baseline JSON file |
 | `--prune-baseline` | Flag | Prune orphaned fingerprints from baseline JSON file |
-| `--min-calibration-frequency` | `INT` | Document frequency threshold to retain shingle in calibration (default: `1`; recommend $\ge 2$ for monorepos $>100\text{k}$ units) |
+| `--min-calibration-frequency` | `INT` | Document frequency threshold to retain shingle in calibration (default: `1`; recommend >= 2 for monorepos > 100k units) |
 | `--sliding-window` | Flag | Enable sliding statement window scanner |
 | `--harvest-closures` | Flag | Harvest nested closures and inner functions |
 | `--idioms` | Flag | Canonicalize Python idioms (loops, comprehensions, search loops) |

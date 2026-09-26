@@ -5460,7 +5460,51 @@ def test_match_clone_record_pass5_heuristics_and_adversarial_ordering() -> None:
     assert matched_boiler is None
 
 
+def test_compute_corpus_calibration_min_calibration_frequency_alias() -> None:
+    """Verifies that compute_corpus_calibration resolves min_calibration_frequency keyword alias."""
+    from pydoppelgangerhunt.baseline import compute_corpus_calibration  # pylint: disable=import-outside-toplevel
+
+    u1 = {"name": "u1", "shingles": ["shared_shingle", "singleton_1"]}
+    u2 = {"name": "u2", "shingles": ["shared_shingle", "singleton_2"]}
+
+    # Pass min_calibration_frequency=2 via kwargs (with default min_frequency=1)
+    calib = compute_corpus_calibration([u1, u2], min_calibration_frequency=2)
+
+    assert calib["min_frequency"] == 2
+    # Singletons must be pruned when min_calibration_frequency=2 is passed
+    freqs = calib["shingle_frequencies"]
+    assert "shared_shingle" in freqs
+    assert freqs["shared_shingle"] == 2
+    assert "singleton_1" not in freqs
+    assert "singleton_2" not in freqs
 
 
+def test_extract_record_endpoint_data_asymmetric_structural_hash() -> None:
+    """Verifies that _extract_record_endpoint_data parses structural_fingerprint when ha or hb is missing."""
+    from pydoppelgangerhunt.baseline import _extract_record_endpoint_data  # pylint: disable=import-outside-toplevel
 
+    # Item with only hash_a provided, missing hash_b
+    item_missing_hb = {
+        "file_a": "foo.py",
+        "file_b": "bar.py",
+        "hash_a": "hash_alpha",
+        "structural_fingerprint": "bar.py#hash_beta <===> foo.py#hash_alpha",
+    }
+    fa, _, ha, fb, _, hb = _extract_record_endpoint_data(item_missing_hb)
+    assert fa == "foo.py"
+    assert fb == "bar.py"
+    assert ha == "hash_alpha"
+    assert hb == "hash_beta"
 
+    # Item with only hash_b provided, missing hash_a
+    item_missing_ha = {
+        "file_a": "foo.py",
+        "file_b": "bar.py",
+        "hash_b": "hash_beta",
+        "structural_fingerprint": "bar.py#hash_beta <===> foo.py#hash_alpha",
+    }
+    fa2, _, ha2, fb2, _, hb2 = _extract_record_endpoint_data(item_missing_ha)
+    assert fa2 == "foo.py"
+    assert fb2 == "bar.py"
+    assert ha2 == "hash_alpha"
+    assert hb2 == "hash_beta"

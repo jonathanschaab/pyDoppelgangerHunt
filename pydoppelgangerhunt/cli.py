@@ -1042,6 +1042,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             diff_files = []
 
+    has_baseline_filter = bool(args.baseline or tool_cfg.get("baseline"))
+    scan_top_n = None if (has_baseline_filter or args.diff_only) else args.top
+
     scan_res = scan_target(
         target,
         repo_root=git_worktree_root,
@@ -1078,7 +1081,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         exemptions=cfg_exemptions,
         workers=args.workers,
         sort_by=sort_by,
-        top_n=args.top,
+        top_n=scan_top_n,
         include_notebooks=bool(args.notebooks),
         strip_docstrings=eff_cfg.strip_docstrings,
         max_index_frequency=eff_cfg.max_index_frequency,
@@ -1164,6 +1167,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     if early_exit is not None:
         return early_exit
+
+    if args.top is not None and args.top > 0 and len(clones) > args.top:
+        clones = clones[:args.top]
 
     families: Optional[List[Dict[str, Any]]] = None
     if args.cluster:

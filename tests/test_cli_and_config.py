@@ -2351,3 +2351,48 @@ def test_resolve_effective_config_precedence_and_calibration_export() -> None:
     assert calib_export["call_sequences"] is True
     assert calib_export["idioms"] is False
     assert calib_export["scope"] == "sub/pkg"
+
+
+def test_cli_top_n_interaction_with_baseline_suppression(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that --top truncation occurs after baseline suppression, preserving unsuppressed clones."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.baseline import record_baseline  # pylint: disable=import-outside-toplevel
+    import pydoppelgangerhunt.cli as cli_mod  # pylint: disable=import-outside-toplevel
+
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    f1 = pkg / "a.py"
+    f2 = pkg / "b.py"
+    f3 = pkg / "c.py"
+    code = "def duplicate():\n    v1 = 1\n    v2 = 2\n    v3 = 3\n    return v1 + v2 + v3\n"
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+    f3.write_text(code, encoding="utf-8")
+
+    u_a = {"file": "a.py", "name": "duplicate", "tokens": ["def", "duplicate"]}
+    u_b = {"file": "b.py", "name": "duplicate", "tokens": ["def", "duplicate"]}
+    base_file = tmp_path / "base.json"
+    record_baseline([(1.0, u_a, u_b)], str(base_file), target=str(pkg), threshold=0.80)
+
+    captured_clones = []
+    orig_render = cli_mod._render_text_violations
+
+    def mock_render(clones: Any, *args: Any, **kwargs: Any) -> Any:
+        captured_clones.extend(clones)
+        return orig_render(clones, *args, **kwargs)
+
+    monkeypatch.setattr(cli_mod, "_render_text_violations", mock_render)
+
+    exit_code = main([
+        str(pkg),
+        "--baseline", str(base_file),
+        "--top", "1",
+        "--min-lines", "3",
+        "--min-tokens", "5",
+        "--threshold", "0.80",
+    ])
+    assert exit_code == 1
+    assert len(captured_clones) == 1
+    files = {captured_clones[0][1].get("file"), captured_clones[0][2].get("file")}
+    assert not (files == {"a.py", "b.py"})
+
