@@ -407,6 +407,163 @@ def extract_unit_comments_and_pragmas(
     return results
 
 
+def col_offset_to_char_offset(line: str, col_offset: Optional[int]) -> int:
+    """Translates a 0-indexed column offset into a character index within line.
+
+    Python's AST emits col_offset and end_col_offset as UTF-8 byte offsets.
+    This helper translates that byte offset into the character index into line,
+    safely falling back to min(len(line), col_offset) if col_offset is already
+    a character index or on decode anomalies.
+    """
+    if col_offset is None or col_offset <= 0:
+        return 0
+    line_bytes = line.encode("utf-8")
+    if col_offset >= len(line_bytes):
+        return len(line)
+    try:
+        prefix = line_bytes[:col_offset].decode("utf-8")
+        return len(prefix)
+    except UnicodeDecodeError:
+        return min(len(line), col_offset)
+
+
+def _compute_unit_spans(
+    source_text: str,
+    unit: Dict[str, Any],
+) -> Tuple[Tuple[int, int], Tuple[int, int], bool]:
+    """Computes ((start_char, end_char), (start_byte, end_byte), is_column_bounded)."""
+    lines = source_text.splitlines(keepends=True)
+    if not lines:
+        return (0, 0), (0, 0), False
+    start = max(1, int(unit.get("start") or 1))
+    end = min(len(lines), int(unit.get("end") or len(lines)))
+    if start > len(lines) or start > end:
+        sz_c = len(source_text)
+        sz_b = len(source_text.encode("utf-8"))
+        return (sz_c, sz_c), (sz_b, sz_b), False
+
+    line_char_offsets = [0]
+    line_byte_offsets = [0]
+    for ln in lines:
+        line_char_offsets.append(line_char_offsets[-1] + len(ln))
+        line_byte_offsets.append(line_byte_offsets[-1] + len(ln.encode("utf-8")))
+
+    first_line = lines[start - 1]
+    last_line = lines[end - 1]
+    start_col = unit.get("start_col")
+    end_col = unit.get("end_col")
+
+    start_c = col_offset_to_char_offset(first_line, start_col) if start_col is not None else 0
+    end_c = col_offset_to_char_offset(last_line, end_col) if end_col is not None else len(last_line)
+    if start == end:
+        end_c = max(start_c, end_c)
+
+    prefix_is_whitespace = not first_line[:start_c].strip()
+    suffix_stripped = last_line[end_c:].strip()
+    suffix_is_boundary_only = not suffix_stripped or suffix_stripped.startswith("#")
+    is_expr_kind = unit.get("kind") in ("comprehension", "complex_expr")
+    is_column_bounded = (start_col is not None or end_col is not None) and (
+        is_expr_kind or not (prefix_is_whitespace and suffix_is_boundary_only)
+    )
+
+    if is_column_bounded:
+        start_char = line_char_offsets[start - 1] + start_c
+        end_char = line_char_offsets[end - 1] + end_c
+        start_b = int(start_col) if start_col is not None else 0
+        end_b = int(end_col) if end_col is not None else len(last_line.encode("utf-8"))
+        start_byte = line_byte_offsets[start - 1] + start_b
+        end_byte = line_byte_offsets[end - 1] + end_b
+    else:
+        start_char = line_char_offsets[start - 1]
+        end_char = line_char_offsets[end] if end < len(lines) else len(source_text)
+        start_byte = line_byte_offsets[start - 1]
+        end_byte = line_byte_offsets[end] if end < len(lines) else len(source_text.encode("utf-8"))
+
+    return (start_char, end_char), (start_byte, end_byte), is_column_bounded
+
+
+def compute_unit_byte_offsets(source_text: str, unit: Dict[str, Any]) -> Tuple[int, int]:
+    """Computes exact 0-indexed UTF-8 byte offsets (start_byte, end_byte) for an AST unit."""
+    return _compute_unit_spans(source_text, unit)[1]
+
+
+def compute_unit_char_offsets(source_text: str, unit: Dict[str, Any]) -> Tuple[int, int]:
+    """Computes exact 0-indexed character offsets (start_char, end_char) for an AST unit."""
+    return _compute_unit_spans(source_text, unit)[0]
+
+
+def compute_unit_replacement_span(
+    source_text: str,
+    unit: Dict[str, Any],
+    replacement_text: str,
+    preserve_boundary_pragmas: bool = True,
+) -> Tuple[int, int, str]:
+    """Computes exact character slice offsets and formatted replacement text for unit refactoring.
+
+    Returns:
+        Tuple of (start_char_offset, end_char_offset, final_replacement_text).
+    """
+    (start_char, end_char), _, is_column_bounded = _compute_unit_spans(source_text, unit)
+    lines = source_text.splitlines(keepends=True)
+    if not lines or (start_char >= len(source_text) and end_char >= len(source_text)):
+        return start_char, end_char, replacement_text
+
+    start = max(1, int(unit.get("start") or 1))
+    end = min(len(lines), int(unit.get("end") or len(lines)))
+    start_col = unit.get("start_col")
+    end_col = unit.get("end_col")
+
+    attached_pragmas: List[str] = []
+    if preserve_boundary_pragmas:
+        boundary_comments = extract_unit_comments_and_pragmas(
+            source_text, start_line=start, end_line=end, start_col=start_col or 0, end_col=end_col
+        )
+        for c in boundary_comments:
+            if c["is_pragma"] and c["line"] in (start, end):
+                p_text = c["text"].strip()
+                if p_text not in replacement_text and p_text not in attached_pragmas:
+                    attached_pragmas.append(p_text)
+
+    first_line = lines[start - 1]
+    last_line = lines[end - 1]
+    start_c = col_offset_to_char_offset(first_line, start_col) if start_col is not None else 0
+    end_c = col_offset_to_char_offset(last_line, end_col) if end_col is not None else len(last_line)
+    if start == end:
+        end_c = max(start_c, end_c)
+    suffix_line = last_line[end_c:]
+    suffix_stripped = suffix_line.strip()
+
+    final_rep = replacement_text
+    if is_column_bounded:
+        if attached_pragmas and not any(p in suffix_line for p in attached_pragmas):
+            pragma_suffix = "  " + "  ".join(attached_pragmas)
+            if not suffix_stripped or suffix_stripped.startswith("#"):
+                if final_rep.endswith("\n"):
+                    final_rep = final_rep[:-1] + pragma_suffix + "\n"
+                else:
+                    final_rep += pragma_suffix
+            else:
+                final_rep += pragma_suffix
+        return start_char, end_char, final_rep
+
+    # Whole-line replacement
+    if attached_pragmas and final_rep:
+        pragma_suffix = "  " + "  ".join(attached_pragmas)
+        rep_lines = final_rep.splitlines(keepends=True)
+        if rep_lines:
+            last_rep = rep_lines[-1]
+            if last_rep.endswith("\n"):
+                rep_lines[-1] = last_rep[:-1] + pragma_suffix + "\n"
+            else:
+                rep_lines[-1] = last_rep + pragma_suffix
+            final_rep = "".join(rep_lines)
+
+    if final_rep and not final_rep.endswith("\n"):
+        final_rep += "\n"
+
+    return start_char, end_char, final_rep
+
+
 def replace_unit_in_source(
     source_text: str,
     unit: Dict[str, Any],
@@ -430,89 +587,13 @@ def replace_unit_in_source(
     Returns:
         The modified source code with comments, type ignores, and whitespace outside the unit preserved.
     """
-    lines = source_text.splitlines(keepends=True)
-    start = max(1, int(unit.get("start") or 1))
-    end = min(len(lines), int(unit.get("end") or len(lines)))
-    if start > len(lines) or start > end:
-        return source_text
-
-    start_col = unit.get("start_col")
-    end_col = unit.get("end_col")
-
-    rep = replacement_text
-
-    # Extract boundary pragmas if requested
-    attached_pragmas: List[str] = []
-    if preserve_boundary_pragmas:
-        boundary_comments = extract_unit_comments_and_pragmas(
-            source_text, start_line=start, end_line=end, start_col=start_col or 0, end_col=end_col
-        )
-        for c in boundary_comments:
-            if c["is_pragma"] and c["line"] in (start, end):
-                p_text = c["text"].strip()
-                if p_text not in rep and p_text not in attached_pragmas:
-                    attached_pragmas.append(p_text)
-
-    first_line = lines[start - 1]
-    start_c = max(0, min(len(first_line), int(start_col or 0)))
-    last_line = lines[end - 1]
-    end_c = len(last_line) if end_col is None else max(0, min(len(last_line), int(end_col)))
-    if start == end:
-        end_c = max(start_c, end_c)
-
-    prefix_is_whitespace = not first_line[:start_c].strip()
-    suffix_stripped = last_line[end_c:].strip()
-    suffix_is_boundary_only = not suffix_stripped or suffix_stripped.startswith("#")
-    is_expr_kind = unit.get("kind") in ("comprehension", "complex_expr")
-    is_column_bounded = (start_col is not None or end_col is not None) and (
-        is_expr_kind or not (prefix_is_whitespace and suffix_is_boundary_only)
+    start_char, end_char, final_rep = compute_unit_replacement_span(
+        source_text,
+        unit,
+        replacement_text,
+        preserve_boundary_pragmas=preserve_boundary_pragmas,
     )
-
-    if is_column_bounded:
-        prefix_line = first_line[:start_c]
-        suffix_line = last_line[end_c:]
-
-        prefix_all = "".join(lines[: start - 1]) + prefix_line
-        suffix_all = suffix_line + "".join(lines[end:])
-
-        final_rep = rep
-        if attached_pragmas and not any(p in suffix_line for p in attached_pragmas):
-            pragma_suffix = "  " + "  ".join(attached_pragmas)
-            if not suffix_stripped or suffix_stripped.startswith("#"):
-                if final_rep.endswith("\n"):
-                    final_rep = final_rep[:-1] + pragma_suffix + "\n"
-                else:
-                    final_rep += pragma_suffix
-            else:
-                s_lines = suffix_all.splitlines(keepends=True)
-                if s_lines:
-                    first_s = s_lines[0]
-                    if first_s.endswith("\n"):
-                        s_lines[0] = first_s[:-1].rstrip() + pragma_suffix + "\n"
-                    else:
-                        s_lines[0] = first_s.rstrip() + pragma_suffix
-                    suffix_all = "".join(s_lines)
-
-        return prefix_all + final_rep + suffix_all
-
-    # Whole-line replacement
-    if attached_pragmas and rep:
-        pragma_suffix = "  " + "  ".join(attached_pragmas)
-        rep_lines = rep.splitlines(keepends=True)
-        if rep_lines:
-            last_rep = rep_lines[-1]
-            if last_rep.endswith("\n"):
-                rep_lines[-1] = last_rep[:-1] + pragma_suffix + "\n"
-            else:
-                rep_lines[-1] = last_rep + pragma_suffix
-            rep = "".join(rep_lines)
-
-    if rep and not rep.endswith("\n"):
-        rep += "\n"
-
-    prefix_lines = lines[: start - 1]
-    suffix_lines = lines[end:]
-    return "".join(prefix_lines) + rep + "".join(suffix_lines)
+    return source_text[:start_char] + final_rep + source_text[end_char:]
 
 
 def _scan_sig_line(line: str, initial_paren_depth: int = 0) -> Tuple[int, int]:

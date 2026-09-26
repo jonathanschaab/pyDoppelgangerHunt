@@ -5386,4 +5386,371 @@ def test_format_patch_relative_path_nested_directories(tmp_path: Path) -> None:
     assert res == "sub/nested/file.py"
 
 
+def test_col_offset_to_char_offset_ascii_and_multibyte() -> None:
+    """Verifies that col_offset_to_char_offset translates UTF-8 byte offsets to character indices."""
+    from pydoppelgangerhunt.fixer import col_offset_to_char_offset
+
+    # Edge cases
+    assert col_offset_to_char_offset("", None) == 0
+    assert col_offset_to_char_offset("abc", 0) == 0
+    assert col_offset_to_char_offset("abc", -5) == 0
+    assert col_offset_to_char_offset("abc", 100) == 3
+
+    # ASCII line: byte offset equals character index
+    ascii_line = "alpha = beta + gamma\n"
+    assert col_offset_to_char_offset(ascii_line, 8) == 8
+    assert col_offset_to_char_offset(ascii_line, 15) == 15
+
+    # Multi-byte line with emojis (4 bytes each in UTF-8, 1 char in str)
+    # "msg = '🚀🚀' + str(val)\n"
+    # len("msg = '") = 7 bytes / 7 chars
+    # '🚀🚀' = 8 bytes / 2 chars
+    # "' + str(" = 8 bytes / 8 chars
+    # Total byte offset of 'val' = 7 + 8 + 8 = 23 bytes
+    # Total char index of 'val' = 7 + 2 + 8 = 17 chars
+    emoji_line = "msg = '\U0001F680\U0001F680' + str(val)\n"
+    assert col_offset_to_char_offset(emoji_line, 23) == 17
+    assert emoji_line[17:20] == "val"
+
+    # Multi-byte line with Chinese characters (3 bytes each in UTF-8, 1 char in str)
+    # "title = '中文测试' + name\n"
+    # len("title = '") = 9 bytes / 9 chars
+    # '中文测试' = 12 bytes / 4 chars
+    # "' + " = 4 bytes / 4 chars
+    # Total byte offset of 'name' = 9 + 12 + 4 = 25 bytes
+    # Total char index of 'name' = 9 + 4 + 4 = 17 chars
+    cjk_line = "title = '中文测试' + name\n"
+    assert col_offset_to_char_offset(cjk_line, 25) == 17
+    assert cjk_line[17:21] == "name"
+
+
+def test_compute_unit_byte_and_char_offsets() -> None:
+    """Verifies that compute_unit_byte_offsets and compute_unit_char_offsets compute exact spans."""
+    from pydoppelgangerhunt.fixer import (
+        compute_unit_byte_offsets,
+        compute_unit_char_offsets,
+    )
+
+    source = (
+        "def compute(data):\n"
+        "    msg = '\U0001F680' + str([x for x in data])\n"
+        "    return msg\n"
+    )
+    # Unit for the list comprehension on line 2
+    # In UTF-8: line 2 starts at byte 19 ("def compute(data):\n" is 19 bytes)
+    # On line 2: "    msg = '\U0001F680' + str(" is 4 + 7 + 4 + 8 = 23 bytes
+    # [x for x in data] is 17 bytes -> end col 40
+    tree = ast.parse(source)
+    comp_node = next(n for n in ast.walk(tree) if isinstance(n, ast.ListComp))
+
+    unit = {
+        "file": "test.py",
+        "start": comp_node.lineno,
+        "end": comp_node.end_lineno,
+        "start_col": comp_node.col_offset,
+        "end_col": comp_node.end_col_offset,
+        "kind": "comprehension",
+    }
+
+    char_span = compute_unit_char_offsets(source, unit)
+    byte_span = compute_unit_byte_offsets(source, unit)
+
+    # Character slice must match AST source segment
+    assert source[char_span[0]:char_span[1]] == "[x for x in data]"
+    # Byte slice in UTF-8 bytes must match
+    source_bytes = source.encode("utf-8")
+    assert source_bytes[byte_span[0]:byte_span[1]] == b"[x for x in data]"
+
+
+def test_compute_unit_replacement_span_pragmas_and_whole_line() -> None:
+    """Verifies that compute_unit_replacement_span correctly formats replacements and retains boundary pragmas."""
+    from pydoppelgangerhunt.fixer import compute_unit_replacement_span
+
+    # 1. Whole-line function replacement ensures trailing newline
+    source = "def foo():\n    return 1\n\ndef bar():\n    return 2\n"
+    u_foo = {"file": "test.py", "start": 1, "end": 2, "kind": "function"}
+    s_c, e_c, rep = compute_unit_replacement_span(source, u_foo, "def foo():\n    return 42")
+    assert rep.endswith("\n")
+    assert source[s_c:e_c] == "def foo():\n    return 1\n"
+
+    # 2. Boundary pragma on line is retained
+    source_pragma = "def calc():\n    val = 10  # type: ignore\n    return val\n"
+    u_stmt = {"file": "test.py", "start": 2, "end": 2, "kind": "statement"}
+    s_c2, e_c2, rep2 = compute_unit_replacement_span(
+        source_pragma, u_stmt, "    val = compute_shared()", preserve_boundary_pragmas=True
+    )
+    assert "# type: ignore" in rep2
+    assert source_pragma[s_c2:e_c2] == "    val = 10  # type: ignore\n"
+
+
+def test_refactor_module_units_descending_offset_shuffled_order() -> None:
+    """Verifies that refactor_module_units sorts replacements by descending offset regardless of input order."""
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    source = (
+        "def first():\n"
+        "    return 1\n"
+        "\n"
+        "def second():\n"
+        "    return 2\n"
+        "\n"
+        "def third():\n"
+        "    return 3\n"
+    )
+    u1 = {"file": "t.py", "start": 1, "end": 2, "name": "first"}
+    u2 = {"file": "t.py", "start": 4, "end": 5, "name": "second"}
+    u3 = {"file": "t.py", "start": 7, "end": 8, "name": "third"}
+
+    r1 = (u1, "def first():\n    return 10\n")
+    r2 = (u2, "def second():\n    return 20\n")
+    r3 = (u3, "def third():\n    return 30\n")
+
+    # Pass in shuffled order [r2, r1, r3]
+    result = refactor_module_units(source, [r2, r1, r3])
+    expected = (
+        "def first():\n"
+        "    return 10\n"
+        "\n"
+        "def second():\n"
+        "    return 20\n"
+        "\n"
+        "def third():\n"
+        "    return 30\n"
+    )
+    assert result == expected
+    assert ast.parse(result)
+
+
+def test_refactor_module_units_same_line_multiline_expansion_no_drift() -> None:
+    """Verifies that a downstream multi-line replacement on the same line preserves upstream coordinates."""
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    source = "val = [a for a in b] + [c for c in d]\n"
+    u1 = {
+        "file": "test.py",
+        "start": 1,
+        "end": 1,
+        "start_col": 6,
+        "end_col": 20,
+        "kind": "comprehension",
+    }
+    u2 = {
+        "file": "test.py",
+        "start": 1,
+        "end": 1,
+        "start_col": 23,
+        "end_col": 37,
+        "kind": "comprehension",
+    }
+    # Downstream replacement is multi-line with indentation
+    rep2 = "helper(\n    d,\n    extra=True,\n)"
+    rep1 = "helper(b)"
+
+    # Pass in forward order: [u1, u2]
+    refactored = refactor_module_units(source, [(u1, rep1), (u2, rep2)])
+    expected = (
+        "val = helper(b) + helper(\n"
+        "    d,\n"
+        "    extra=True,\n"
+        ")\n"
+    )
+    assert refactored == expected
+    assert ast.parse(refactored)
+
+
+def test_refactor_module_units_touching_line_boundaries_no_drift() -> None:
+    """Verifies that units touching line boundaries are refactored without line truncation or coordinate drift."""
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    source = (
+        "# calculation\n"
+        "res = (\n"
+        "    compute_a(items) +\n"
+        "    compute_b(items)\n"
+        ")\n"
+    )
+    # Unit 1 is compute_a(items) on line 3, cols 4..20
+    # Unit 2 is compute_b(items) on line 4, cols 4..20
+    u1 = {
+        "file": "test.py",
+        "start": 3,
+        "end": 3,
+        "start_col": 4,
+        "end_col": 20,
+        "kind": "complex_expr",
+    }
+    u2 = {
+        "file": "test.py",
+        "start": 4,
+        "end": 4,
+        "start_col": 4,
+        "end_col": 20,
+        "kind": "complex_expr",
+    }
+    rep1 = "shared_a(\n        items,\n        mode='fast',\n    )"
+    rep2 = "shared_b(\n        items,\n        mode='slow',\n    )"
+
+    refactored = refactor_module_units(source, [(u1, rep1), (u2, rep2)])
+    expected = (
+        "# calculation\n"
+        "res = (\n"
+        "    shared_a(\n"
+        "        items,\n"
+        "        mode='fast',\n"
+        "    ) +\n"
+        "    shared_b(\n"
+        "        items,\n"
+        "        mode='slow',\n"
+        "    )\n"
+        ")\n"
+    )
+    assert refactored == expected
+    assert ast.parse(refactored)
+
+
+def test_refactor_module_units_unicode_multibyte_source_code() -> None:
+    """Verifies that source code containing multi-byte UTF-8 emojis and symbols refactors cleanly."""
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    source = (
+        "# Banner: \U0001F680 Space Rocket Launch \U0001F680\n"
+        "title = 'Rocket: \U0001F680' + str([x for x in telemetry])\n"
+        "notes = 'Details: \U0001F31F' + str([y for y in status])\n"
+    )
+    tree = ast.parse(source)
+    comps = [n for n in ast.walk(tree) if isinstance(n, ast.ListComp)]
+    comps.sort(key=lambda n: n.lineno)
+
+    u1 = {
+        "file": "rocket.py",
+        "start": comps[0].lineno,
+        "end": comps[0].end_lineno,
+        "start_col": comps[0].col_offset,
+        "end_col": comps[0].end_col_offset,
+        "kind": "comprehension",
+    }
+    u2 = {
+        "file": "rocket.py",
+        "start": comps[1].lineno,
+        "end": comps[1].end_lineno,
+        "start_col": comps[1].col_offset,
+        "end_col": comps[1].end_col_offset,
+        "kind": "comprehension",
+    }
+
+    rep1 = "process_telemetry(telemetry)"
+    rep2 = "process_status(status)"
+
+    refactored = refactor_module_units(source, [(u1, rep1), (u2, rep2)])
+    assert "process_telemetry(telemetry)" in refactored
+    assert "process_status(status)" in refactored
+    assert "\U0001F680" in refactored
+    assert "\U0001F31F" in refactored
+    assert ast.parse(refactored)
+
+
+def test_adjust_line_for_replacements_exact_parity() -> None:
+    """Verifies that _adjust_line_for_replacements produces exact line numbers matching refactor_module_units."""
+    from pydoppelgangerhunt.fixer.patch import _adjust_line_for_replacements
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    orig_text = (
+        "line 1\n"
+        "line 2\n"
+        "line 3\n"
+        "line 4\n"
+        "line 5\n"
+        "line 6\n"
+        "line 7\n"
+        "line 8\n"
+        "line 9\n"
+        "line 10\n"
+    )
+    # Edge cases
+    assert _adjust_line_for_replacements(0, [], orig_text) == 1
+    assert _adjust_line_for_replacements(1, [], orig_text) == 1
+    assert _adjust_line_for_replacements(5, [], orig_text) == 5
+
+    # Case 1: Line expansion upstream (lines 3-4 [2 lines] replaced with 5 lines -> +3 delta)
+    u_exp = {"file": "t.py", "start": 3, "end": 4}
+    r_exp = (u_exp, "r1\nr2\nr3\nr4\nr5\n")
+    # Target line 7 should shift by +3 to line 10
+    adjusted = _adjust_line_for_replacements(7, [r_exp], orig_text)
+    assert adjusted == 10
+
+    # Verify against actual refactored text
+    refactored = refactor_module_units(orig_text, [r_exp])
+    ref_lines = refactored.splitlines(keepends=True)
+    # The original line 7 ("line 7\n") should now be at 1-indexed line 10
+    assert ref_lines[adjusted - 1] == "line 7\n"
+
+    # Case 2: Line contraction upstream (lines 2-5 [4 lines] replaced with 1 line -> -3 delta)
+    u_con = {"file": "t.py", "start": 2, "end": 5}
+    r_con = (u_con, "single_replacement\n")
+    # Target line 8 should shift by -3 to line 5
+    adjusted_con = _adjust_line_for_replacements(8, [r_con], orig_text)
+    assert adjusted_con == 5
+    refactored_con = refactor_module_units(orig_text, [r_con])
+    ref_con_lines = refactored_con.splitlines(keepends=True)
+    assert ref_con_lines[adjusted_con - 1] == "line 8\n"
+
+
+def test_generate_refactoring_patch_same_file_multiple_methods_and_helpers(tmp_path: Path) -> None:
+    """Verifies that generate_refactoring_patch coordinates reverse-order replacements and method helper insertion."""
+    from pydoppelgangerhunt.fixer import generate_refactoring_patch
+
+    code = (
+        "class ProcessingEngine:\n"
+        "    def step_one(self, data: list) -> list:\n"
+        "        cleaned = [x.strip() for x in data if x]\n"
+        "        validated = [c for c in cleaned if len(c) > 3]\n"
+        "        return validated\n"
+        "\n"
+        "    def step_two(self, data: list) -> list:\n"
+        "        cleaned = [x.strip() for x in data if x]\n"
+        "        validated = [c for c in cleaned if len(c) > 3]\n"
+        "        return validated\n"
+    )
+    f = tmp_path / "engine.py"
+    f.write_text(code, encoding="utf-8")
+
+    tree = ast.parse(code)
+    fns = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+    fns.sort(key=lambda n: n.lineno)
+    fn1, fn2 = fns[0], fns[1]
+
+    # Target the inner body statements (lines 3-4 and lines 8-9)
+    u1 = {
+        "name": "ProcessingEngine.step_one",
+        "file": str(f),
+        "start": fn1.body[0].lineno,
+        "end": fn1.body[1].end_lineno,
+        "kind": "statement_sequence",
+        "enclosing_class": "ProcessingEngine",
+        "enclosing_class_start": 1,
+    }
+    u2 = {
+        "name": "ProcessingEngine.step_two",
+        "file": str(f),
+        "start": fn2.body[0].lineno,
+        "end": fn2.body[1].end_lineno,
+        "kind": "statement_sequence",
+        "enclosing_class": "ProcessingEngine",
+        "enclosing_class_start": 1,
+    }
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert patch != ""
+    assert "--- a/engine.py" in patch
+    assert "+++ b/engine.py" in patch
+    assert "def _shared_" in patch
+    assert "self._shared_" in patch
+    assert "-        cleaned = [x.strip() for x in data if x]" in patch
+
+
+
 

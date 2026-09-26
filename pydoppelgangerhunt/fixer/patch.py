@@ -51,7 +51,8 @@ from pydoppelgangerhunt.fixer.source import (
     _insert_imports_into_module,
     _is_docstring_node,
     _scan_sig_line,
-    replace_unit_in_source,
+    compute_unit_byte_offsets,
+    compute_unit_replacement_span,
 )
 from pydoppelgangerhunt.fixer.synthesis import (
     _extract_required_typing_imports,
@@ -109,6 +110,14 @@ def check_units_overlap(
             return int(s_col2) < int(e_col1)
 
     if start2 < start1 and end2 == start1:
+        if e_col2 is not None and s_col1 is not None:
+            return int(s_col1) < int(e_col2)
+
+    if start1 == end1 == start2 and start2 < end2:
+        if e_col1 is not None and s_col2 is not None:
+            return int(s_col2) < int(e_col1)
+
+    if start2 == end2 == start1 and start1 < end1:
         if e_col2 is not None and s_col1 is not None:
             return int(s_col1) < int(e_col2)
 
@@ -208,18 +217,50 @@ def refactor_module_units(
                     f"'{n2}' ({s2}-{e2}) in {f1}."
                 )
 
+    computed_entries: List[Dict[str, Any]] = []
+    for unit, rep in rep_list:
+        start_char, end_char, final_rep = compute_unit_replacement_span(source_text, unit, rep)
+        start_byte, end_byte = compute_unit_byte_offsets(source_text, unit)
+        computed_entries.append({
+            "unit": unit,
+            "start_char": start_char,
+            "end_char": end_char,
+            "start_byte": start_byte,
+            "end_byte": end_byte,
+            "final_rep": final_rep,
+        })
+
+    for i, c1 in enumerate(computed_entries):
+        for c2 in computed_entries[i + 1:]:
+            s1_b, e1_b = c1["start_byte"], c1["end_byte"]
+            s2_b, e2_b = c2["start_byte"], c2["end_byte"]
+            if max(s1_b, s2_b) < min(e1_b, e2_b):
+                u1 = c1["unit"]
+                u2 = c2["unit"]
+                n1 = str(u1.get("name") or "unit")
+                s1 = int(u1.get("start") or 1)
+                e1 = int(u1.get("end") or s1)
+                n2 = str(u2.get("name") or "unit")
+                s2 = int(u2.get("start") or 1)
+                e2 = int(u2.get("end") or s2)
+                f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+                raise ValueError(
+                    f"Overlapping unit collision detected between "
+                    f"'{n1}' ({s1}-{e1}) and "
+                    f"'{n2}' ({s2}-{e2}) in {f1}."
+                )
+
     sorted_replacements = sorted(
-        rep_list,
-        key=lambda item: (
-            int(item[0].get("start") or 0),
-            int(item[0].get("start_col") or 0),
-        ),
+        computed_entries,
+        key=lambda item: (item["start_byte"], item["end_byte"]),
         reverse=True,
     )
 
     current_text = source_text
-    for unit, replacement in sorted_replacements:
-        current_text = replace_unit_in_source(current_text, unit, replacement)
+    for item in sorted_replacements:
+        s_c = item["start_char"]
+        e_c = item["end_char"]
+        current_text = current_text[:s_c] + item["final_rep"] + current_text[e_c:]
 
     return current_text
 
@@ -521,20 +562,22 @@ def _adjust_line_for_replacements(
     orig_text: str,
 ) -> int:
     """Adjusts a target source line number to account for upstream line expansions or contractions."""
+    if target_line <= 1 or not reps:
+        return max(1, target_line)
     orig_lines = orig_text.splitlines(keepends=True)
-    offset = 0
-    for u, rep in reps:
-        u_start = int(u.get("start") or 1)
-        u_end = int(u.get("end") or u_start)
-        if u_end < target_line:
-            orig_count = u_end - u_start + 1
-            unit_orig_text = "".join(orig_lines[u_start - 1 : u_end])
-            replaced_text = replace_unit_in_source(
-                unit_orig_text, {**u, "start": 1, "end": orig_count}, rep
-            )
-            new_count = len(replaced_text.splitlines(keepends=True))
-            offset += (new_count - orig_count)
-    return max(1, target_line + offset)
+    effective_target = min(target_line, len(orig_lines) + 1)
+    upstream_reps = [
+        (u, rep)
+        for u, rep in reps
+        if int(u.get("end") or u.get("start") or 1) < effective_target
+    ]
+    if not upstream_reps:
+        return max(1, target_line)
+    prefix = "".join(orig_lines[: effective_target - 1])
+    new_prefix = refactor_module_units(prefix, upstream_reps)
+    new_prefix_lines = len(new_prefix.splitlines(keepends=True))
+    line_delta = new_prefix_lines - (effective_target - 1)
+    return max(1, target_line + line_delta)
 
 
 def _delegate_unit_in_plan(
