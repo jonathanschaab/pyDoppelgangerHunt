@@ -765,6 +765,66 @@ def test_diff_path_key_set_and_zero_allocation_probing(tmp_path: Path) -> None:
     assert self_mut == {"target:item.py"}
     assert self_mut.diff_target_keys == {"item.py"}
 
+    # Binary set operators: |, -, &, ^ and methods union, difference, intersection, symmetric_difference
+    bin1 = DiffPathKeySet(["target:a.py", "repo:b.py"])
+    bin2 = DiffPathKeySet(["target:a.py", "target:c.py"])
+
+    # Union |
+    res_or = bin1 | bin2
+    assert isinstance(res_or, DiffPathKeySet)
+    assert res_or == {"target:a.py", "repo:b.py", "target:c.py"}
+    assert res_or.diff_target_keys == {"a.py", "c.py"}
+    assert res_or.diff_repo_keys == {"b.py"}
+    res_or_meth = bin1.union(["target:d.py"])
+    assert isinstance(res_or_meth, DiffPathKeySet)
+    assert res_or_meth.diff_target_keys == {"a.py", "d.py"}
+
+    # Difference -
+    res_sub = bin1 - bin2
+    assert isinstance(res_sub, DiffPathKeySet)
+    assert res_sub == {"repo:b.py"}
+    assert res_sub.diff_target_keys == set()
+    assert res_sub.diff_repo_keys == {"b.py"}
+    res_sub_meth = bin1.difference(["target:a.py"])
+    assert isinstance(res_sub_meth, DiffPathKeySet)
+    assert res_sub_meth == {"repo:b.py"}
+
+    # Intersection &
+    res_and = bin1 & bin2
+    assert isinstance(res_and, DiffPathKeySet)
+    assert res_and == {"target:a.py"}
+    assert res_and.diff_target_keys == {"a.py"}
+    assert res_and.diff_repo_keys == set()
+    res_and_meth = bin1.intersection(["target:a.py"])
+    assert isinstance(res_and_meth, DiffPathKeySet)
+    assert res_and_meth == {"target:a.py"}
+
+    # Symmetric Difference ^
+    res_xor = bin1 ^ bin2
+    assert isinstance(res_xor, DiffPathKeySet)
+    assert res_xor == {"repo:b.py", "target:c.py"}
+    assert res_xor.diff_target_keys == {"c.py"}
+    assert res_xor.diff_repo_keys == {"b.py"}
+    res_xor_meth = bin1.symmetric_difference(["target:a.py", "target:c.py"])
+    assert isinstance(res_xor_meth, DiffPathKeySet)
+    assert res_xor_meth == {"repo:b.py", "target:c.py"}
+
+    # Self binary operations
+    assert isinstance(bin1 - bin1, DiffPathKeySet) and len(bin1 - bin1) == 0
+    assert isinstance(bin1 ^ bin1, DiffPathKeySet) and len(bin1 ^ bin1) == 0
+    assert isinstance(bin1 & bin1, DiffPathKeySet) and bin1 & bin1 == bin1
+    assert isinstance(bin1 | bin1, DiffPathKeySet) and bin1 | bin1 == bin1
+
+    # TypeError on invalid operand types for operators
+    with pytest.raises(TypeError):
+        _ = bin1 - ["target:a.py"]  # type: ignore[operator]
+    with pytest.raises(TypeError):
+        _ = bin1 | ["target:a.py"]  # type: ignore[operator]
+    with pytest.raises(TypeError):
+        _ = bin1 & ["target:a.py"]  # type: ignore[operator]
+    with pytest.raises(TypeError):
+        _ = bin1 ^ ["target:a.py"]  # type: ignore[operator]
+
     # 5. set_diff_keys on resolver
     resolver.clear_cache()
     assert resolver.diff_target_keys is None

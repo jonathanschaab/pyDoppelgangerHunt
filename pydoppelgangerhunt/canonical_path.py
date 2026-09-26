@@ -889,6 +889,54 @@ class DiffPathKeySet(set[str]):
         self.symmetric_difference_update(other)
         return self
 
+    def difference(self, *s: Iterable[object]) -> DiffPathKeySet:
+        """Returns a new DiffPathKeySet with elements from this set not in the others."""
+        result = self.copy()
+        result.difference_update(*s)
+        return result
+
+    def __sub__(self, other: AbstractSet[object]) -> DiffPathKeySet:
+        """Returns a new DiffPathKeySet with elements from this set not in another set."""
+        if not isinstance(other, (set, frozenset, AbstractSet)):
+            return NotImplemented
+        return self.difference(other)
+
+    def intersection(self, *s: Iterable[object]) -> DiffPathKeySet:
+        """Returns a new DiffPathKeySet with elements common to this set and all others."""
+        result = self.copy()
+        result.intersection_update(*s)
+        return result
+
+    def __and__(self, other: AbstractSet[object]) -> DiffPathKeySet:
+        """Returns a new DiffPathKeySet with elements common to this set and another set."""
+        if not isinstance(other, (set, frozenset, AbstractSet)):
+            return NotImplemented
+        return self.intersection(other)
+
+    def union(self, *s: Iterable[str]) -> DiffPathKeySet:  # type: ignore[override]
+        """Returns a new DiffPathKeySet with elements from this set and all others."""
+        result = self.copy()
+        result.update(*s)
+        return result
+
+    def __or__(self, other: AbstractSet[str]) -> DiffPathKeySet:  # type: ignore[override]
+        """Returns a new DiffPathKeySet with elements from this set and another set."""
+        if not isinstance(other, (set, frozenset, AbstractSet)):
+            return NotImplemented
+        return self.union(other)
+
+    def symmetric_difference(self, s: Iterable[str]) -> DiffPathKeySet:  # type: ignore[override]
+        """Returns a new DiffPathKeySet with elements in either this set or another, but not both."""
+        result = self.copy()
+        result.symmetric_difference_update(s)
+        return result
+
+    def __xor__(self, other: AbstractSet[str]) -> DiffPathKeySet:  # type: ignore[override]
+        """Returns a new DiffPathKeySet with elements in either this set or another set, but not both."""
+        if not isinstance(other, (set, frozenset, AbstractSet)):
+            return NotImplemented
+        return self.symmetric_difference(other)
+
     def copy(self) -> DiffPathKeySet:
         """Returns a shallow copy of the DiffPathKeySet."""
         return DiffPathKeySet(

@@ -5508,3 +5508,35 @@ def test_extract_record_endpoint_data_asymmetric_structural_hash() -> None:
     assert fb2 == "bar.py"
     assert ha2 == "hash_alpha"
     assert hb2 == "hash_beta"
+
+
+def test_extract_record_endpoint_data_defensive_path_normalization() -> None:
+    """Verifies that _extract_record_endpoint_data normalizes un-normalized Windows backslashes."""
+    from pydoppelgangerhunt.baseline import _extract_record_endpoint_data  # pylint: disable=import-outside-toplevel
+
+    item = {
+        "file_a": r"pkg\worker.py",
+        "file_b": r"pkg\sub\util.py",
+        "name_a": "run",
+        "name_b": "helper",
+        "structural_fingerprint": "pkg/sub/util.py#hb <===> pkg/worker.py#ha",
+    }
+    fa, na, ha, fb, nb, hb = _extract_record_endpoint_data(item)
+    assert fa == "pkg/worker.py"
+    assert fb == "pkg/sub/util.py"
+    assert na == "run"
+    assert nb == "helper"
+    assert ha == "ha"
+    assert hb == "hb"
+
+    item_sfp_backslashes = {
+        "file_a": "pkg/a.py",
+        "file_b": "pkg/b.py",
+        "structural_fingerprint": r"pkg\b.py#hb <===> pkg\a.py#ha",
+    }
+    fa2, _, ha2, fb2, _, hb2 = _extract_record_endpoint_data(item_sfp_backslashes)
+    assert fa2 == "pkg/a.py"
+    assert fb2 == "pkg/b.py"
+    assert ha2 == "ha"
+    assert hb2 == "hb"
+

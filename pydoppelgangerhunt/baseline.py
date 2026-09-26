@@ -1076,8 +1076,8 @@ def _extract_record_endpoint_data(
     item: Dict[str, Any],
 ) -> Tuple[str, str, str, str, str, str]:
     """Extracts (file_a, name_a, hash_a, file_b, name_b, hash_b) from a clone or baseline dictionary."""
-    fa = str(item.get("file_a") or "")
-    fb = str(item.get("file_b") or "")
+    fa = normalize_path_string(str(item.get("file_a") or ""), strip_anchor=False)
+    fb = normalize_path_string(str(item.get("file_b") or ""), strip_anchor=False)
     na = str(item.get("name_a") or "")
     nb = str(item.get("name_b") or "")
     ha = str(item.get("hash_a") or item.get("structural_hash_a") or item.get("structural_hash") or "")
@@ -1086,14 +1086,16 @@ def _extract_record_endpoint_data(
     raw_fp = item.get("fingerprint") or item.get("fp")
     if not fa and not fb and raw_fp:
         parsed = _parse_legacy_fingerprint_record(str(raw_fp))
-        fa = str(parsed.get("file_a") or "")
-        fb = str(parsed.get("file_b") or "")
+        fa = normalize_path_string(str(parsed.get("file_a") or ""), strip_anchor=False)
+        fb = normalize_path_string(str(parsed.get("file_b") or ""), strip_anchor=False)
         na = str(parsed.get("name_a") or "")
         nb = str(parsed.get("name_b") or "")
 
     raw_sfp = item.get("structural_fingerprint") or item.get("sfp")
     if (not ha or not hb) and raw_sfp:
         p_fa, p_ha, p_fb, p_hb = _parse_structural_fingerprint(str(raw_sfp))
+        p_fa = normalize_path_string(p_fa, strip_anchor=False)
+        p_fb = normalize_path_string(p_fb, strip_anchor=False)
         if not fa and not fb:
             fa, fb = p_fa, p_fb
         if fa != fb and fa == p_fb and fb == p_fa:
