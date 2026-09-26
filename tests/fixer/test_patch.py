@@ -5752,5 +5752,72 @@ def test_generate_refactoring_patch_same_file_multiple_methods_and_helpers(tmp_p
     assert "-        cleaned = [x.strip() for x in data if x]" in patch
 
 
+def test_edge_case_robustness_non_dict_and_invalid_units() -> None:
+    """Verifies that non-dict or malformed units do not raise unhandled exceptions."""
+    from typing import cast, Any, Dict
+    from pydoppelgangerhunt.fixer import (
+        check_units_overlap,
+        compute_unit_byte_offsets,
+        compute_unit_char_offsets,
+        compute_unit_replacement_span,
+        refactor_module_units,
+    )
+    from pydoppelgangerhunt.fixer.patch import _adjust_line_for_replacements
+    from pydoppelgangerhunt.fixer.source import _compute_unit_spans
+
+    # Non-dict units
+    assert not check_units_overlap(cast(Dict[str, Any], None), {"file": "a.py", "start": 1, "end": 2})
+    assert not check_units_overlap({"file": "a.py", "start": 1, "end": 2}, cast(Dict[str, Any], "invalid"))
+
+    # Malformed unit types in span calculations
+    chars, bytes_, bounded = _compute_unit_spans("line 1\n", cast(Dict[str, Any], None))
+    assert chars == (0, 0) and bytes_ == (0, 0) and not bounded
+
+    # Replacement span with invalid unit
+    span = compute_unit_replacement_span("line 1\n", cast(Dict[str, Any], None), "rep")
+    assert span == (0, 0, "rep")
+
+    # Inverted lines in unit
+    inv_unit = {"file": "a.py", "start": 5, "end": 2}
+    assert compute_unit_char_offsets("a\nb\nc\n", inv_unit) == (6, 6)
+
+    # _adjust_line_for_replacements with invalid target_line or non-dict unit
+    adj = _adjust_line_for_replacements(cast(int, "invalid"), [(cast(Dict[str, Any], None), "rep")], "line 1\n")
+    assert adj == 1
+
+
+def test_edge_case_robustness_columns_and_empty_inputs() -> None:
+    """Verifies handling of invalid column types, inverted column offsets, and empty inputs."""
+    from typing import cast
+    from pydoppelgangerhunt.fixer import (
+        check_units_overlap,
+        col_offset_to_char_offset,
+        compute_unit_byte_offsets,
+        refactor_module_units,
+    )
+
+    # col_offset_to_char_offset with string or non-numeric offsets
+    assert col_offset_to_char_offset("hello world", cast(int, "5")) == 5
+    assert col_offset_to_char_offset("hello world", cast(int, "invalid")) == 0
+    assert col_offset_to_char_offset("hello world", -10) == 0
+
+    # Inverted column bounds on a single line: end_byte must not precede start_byte
+    inv_col_unit = {"file": "a.py", "start": 1, "end": 1, "start_col": 15, "end_col": 5}
+    s_b, e_b = compute_unit_byte_offsets("01234567890123456789\n", inv_col_unit)
+    assert s_b <= e_b
+
+    # check_units_overlap with string columns
+    u_str1 = {"file": "a.py", "start": 1, "end": 1, "start_col": "5", "end_col": "10"}
+    u_str2 = {"file": "a.py", "start": 1, "end": 1, "start_col": "8", "end_col": "15"}
+    assert check_units_overlap(u_str1, u_str2)
+
+    # Empty source text and empty replacement in refactor_module_units
+    assert refactor_module_units("", []) == ""
+    assert refactor_module_units("content", []) == "content"
+    del_unit = {"file": "a.py", "start": 1, "end": 1}
+    assert refactor_module_units("remove this\nkeep this\n", [(del_unit, "")]) == "keep this\n"
+
+
+
 
 

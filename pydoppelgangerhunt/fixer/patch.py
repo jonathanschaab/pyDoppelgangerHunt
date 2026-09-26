@@ -80,46 +80,60 @@ def check_units_overlap(
         True if both units reside in the same normalized file path and their [start, end]
         intervals overlap; False otherwise.
     """
+    if not isinstance(u1, dict) or not isinstance(u2, dict):
+        return False
     f1 = normalize_path_string(str(u1.get("file") or ""))
     f2 = normalize_path_string(str(u2.get("file") or ""))
     if not f1 or not f2 or not _is_same_file_path(f1, f2, repo_root=repo_root):
         return False
-    start1 = int(u1.get("start") or 1)
-    end1 = int(u1.get("end") or start1)
-    start2 = int(u2.get("start") or 1)
-    end2 = int(u2.get("end") or start2)
+    try:
+        start1 = int(u1.get("start") or 1)
+        end1 = int(u1.get("end") or start1)
+        start2 = int(u2.get("start") or 1)
+        end2 = int(u2.get("end") or start2)
+    except (ValueError, TypeError):
+        return False
+
+    if start1 > end1:
+        start1, end1 = end1, start1
+    if start2 > end2:
+        start2, end2 = end2, start2
 
     if end1 < start2 or end2 < start1:
         return False
 
-    s_col1 = u1.get("start_col")
-    e_col1 = u1.get("end_col")
-    s_col2 = u2.get("start_col")
-    e_col2 = u2.get("end_col")
+    def _safe_col(val: Any) -> Optional[int]:
+        if val is None:
+            return None
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return None
+
+    sc1, ec1 = _safe_col(u1.get("start_col")), _safe_col(u1.get("end_col"))
+    sc2, ec2 = _safe_col(u2.get("start_col")), _safe_col(u2.get("end_col"))
 
     if start1 == end1 == start2 == end2:
-        if s_col1 is not None and e_col1 is not None and s_col2 is not None and e_col2 is not None:
-            sc1, ec1 = int(s_col1), int(e_col1)
-            sc2, ec2 = int(s_col2), int(e_col2)
+        if sc1 is not None and ec1 is not None and sc2 is not None and ec2 is not None:
             if sc1 <= ec1 and sc2 <= ec2:
                 return max(sc1, sc2) < min(ec1, ec2)
             return False
 
     if start1 < start2 and end1 == start2:
-        if e_col1 is not None and s_col2 is not None:
-            return int(s_col2) < int(e_col1)
+        if ec1 is not None and sc2 is not None:
+            return sc2 < ec1
 
     if start2 < start1 and end2 == start1:
-        if e_col2 is not None and s_col1 is not None:
-            return int(s_col1) < int(e_col2)
+        if ec2 is not None and sc1 is not None:
+            return sc1 < ec2
 
     if start1 == end1 == start2 and start2 < end2:
-        if e_col1 is not None and s_col2 is not None:
-            return int(s_col2) < int(e_col1)
+        if ec1 is not None and sc2 is not None:
+            return sc2 < ec1
 
     if start2 == end2 == start1 and start1 < end1:
-        if e_col2 is not None and s_col1 is not None:
-            return int(s_col1) < int(e_col2)
+        if ec2 is not None and sc1 is not None:
+            return sc1 < ec2
 
     return max(start1, start2) <= min(end1, end2)
 
@@ -200,17 +214,27 @@ def refactor_module_units(
     if not replacements:
         return source_text
 
+    def _unit_desc(u: Any) -> Tuple[str, int, int, str]:
+        if not isinstance(u, dict):
+            return "unit", 1, 1, ""
+        n = str(u.get("name") or "unit")
+        try:
+            s = int(u.get("start") or 1)
+        except (ValueError, TypeError):
+            s = 1
+        try:
+            e = int(u.get("end") or s)
+        except (ValueError, TypeError):
+            e = s
+        f = normalize_path_string(str(u.get("file") or ""), strip_anchor=False)
+        return n, s, e, f
+
     rep_list = list(replacements)
     for i, (u1, _) in enumerate(rep_list):
         for u2, _ in rep_list[i + 1:]:
             if check_units_overlap(u1, u2):
-                n1 = str(u1.get("name") or "unit")
-                s1 = int(u1.get("start") or 1)
-                e1 = int(u1.get("end") or s1)
-                n2 = str(u2.get("name") or "unit")
-                s2 = int(u2.get("start") or 1)
-                e2 = int(u2.get("end") or s2)
-                f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+                n1, s1, e1, f1 = _unit_desc(u1)
+                n2, s2, e2, _ = _unit_desc(u2)
                 raise ValueError(
                     f"Overlapping unit collision detected between "
                     f"'{n1}' ({s1}-{e1}) and "
@@ -235,15 +259,8 @@ def refactor_module_units(
             s1_b, e1_b = c1["start_byte"], c1["end_byte"]
             s2_b, e2_b = c2["start_byte"], c2["end_byte"]
             if max(s1_b, s2_b) < min(e1_b, e2_b):
-                u1 = c1["unit"]
-                u2 = c2["unit"]
-                n1 = str(u1.get("name") or "unit")
-                s1 = int(u1.get("start") or 1)
-                e1 = int(u1.get("end") or s1)
-                n2 = str(u2.get("name") or "unit")
-                s2 = int(u2.get("start") or 1)
-                e2 = int(u2.get("end") or s2)
-                f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
+                n1, s1, e1, f1 = _unit_desc(c1["unit"])
+                n2, s2, e2, _ = _unit_desc(c2["unit"])
                 raise ValueError(
                     f"Overlapping unit collision detected between "
                     f"'{n1}' ({s1}-{e1}) and "
@@ -562,22 +579,35 @@ def _adjust_line_for_replacements(
     orig_text: str,
 ) -> int:
     """Adjusts a target source line number to account for upstream line expansions or contractions."""
-    if target_line <= 1 or not reps:
-        return max(1, target_line)
+    try:
+        t_line = int(target_line)
+    except (ValueError, TypeError):
+        t_line = 1
+    if t_line <= 1 or not reps:
+        return max(1, t_line)
     orig_lines = orig_text.splitlines(keepends=True)
-    effective_target = min(target_line, len(orig_lines) + 1)
+    effective_target = min(t_line, len(orig_lines) + 1)
+
+    def _get_unit_end(u: Any) -> int:
+        if not isinstance(u, dict):
+            return 1
+        try:
+            return int(u.get("end") or u.get("start") or 1)
+        except (ValueError, TypeError):
+            return 1
+
     upstream_reps = [
         (u, rep)
         for u, rep in reps
-        if int(u.get("end") or u.get("start") or 1) < effective_target
+        if _get_unit_end(u) < effective_target
     ]
     if not upstream_reps:
-        return max(1, target_line)
+        return max(1, t_line)
     prefix = "".join(orig_lines[: effective_target - 1])
     new_prefix = refactor_module_units(prefix, upstream_reps)
     new_prefix_lines = len(new_prefix.splitlines(keepends=True))
     line_delta = new_prefix_lines - (effective_target - 1)
-    return max(1, target_line + line_delta)
+    return max(1, t_line + line_delta)
 
 
 def _delegate_unit_in_plan(

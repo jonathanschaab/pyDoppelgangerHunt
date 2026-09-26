@@ -7,7 +7,7 @@ import io
 import logging
 import textwrap
 import tokenize
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -407,7 +407,7 @@ def extract_unit_comments_and_pragmas(
     return results
 
 
-def col_offset_to_char_offset(line: str, col_offset: Optional[int]) -> int:
+def col_offset_to_char_offset(line: str, col_offset: Optional[Union[int, str]] = None) -> int:
     """Translates a 0-indexed column offset into a character index within line.
 
     Python's AST emits col_offset and end_col_offset as UTF-8 byte offsets.
@@ -415,16 +415,22 @@ def col_offset_to_char_offset(line: str, col_offset: Optional[int]) -> int:
     safely falling back to min(len(line), col_offset) if col_offset is already
     a character index or on decode anomalies.
     """
-    if col_offset is None or col_offset <= 0:
+    if col_offset is None:
+        return 0
+    try:
+        c_off = int(col_offset)
+    except (ValueError, TypeError):
+        return 0
+    if c_off <= 0:
         return 0
     line_bytes = line.encode("utf-8")
-    if col_offset >= len(line_bytes):
+    if c_off >= len(line_bytes):
         return len(line)
     try:
-        prefix = line_bytes[:col_offset].decode("utf-8")
+        prefix = line_bytes[:c_off].decode("utf-8")
         return len(prefix)
     except UnicodeDecodeError:
-        return min(len(line), col_offset)
+        return min(len(line), c_off)
 
 
 def _compute_unit_spans(
@@ -433,10 +439,16 @@ def _compute_unit_spans(
 ) -> Tuple[Tuple[int, int], Tuple[int, int], bool]:
     """Computes ((start_char, end_char), (start_byte, end_byte), is_column_bounded)."""
     lines = source_text.splitlines(keepends=True)
-    if not lines:
+    if not lines or not isinstance(unit, dict):
         return (0, 0), (0, 0), False
-    start = max(1, int(unit.get("start") or 1))
-    end = min(len(lines), int(unit.get("end") or len(lines)))
+    try:
+        start = max(1, int(unit.get("start") or 1))
+    except (ValueError, TypeError):
+        start = 1
+    try:
+        end = min(len(lines), int(unit.get("end") or len(lines)))
+    except (ValueError, TypeError):
+        end = len(lines)
     if start > len(lines) or start > end:
         sz_c = len(source_text)
         sz_b = len(source_text.encode("utf-8"))
@@ -469,8 +481,19 @@ def _compute_unit_spans(
     if is_column_bounded:
         start_char = line_char_offsets[start - 1] + start_c
         end_char = line_char_offsets[end - 1] + end_c
-        start_b = int(start_col) if start_col is not None else 0
-        end_b = int(end_col) if end_col is not None else len(last_line.encode("utf-8"))
+        try:
+            start_b = int(start_col) if start_col is not None else 0
+        except (ValueError, TypeError):
+            start_b = 0
+        last_b_len = len(last_line.encode("utf-8"))
+        try:
+            end_b = int(end_col) if end_col is not None else last_b_len
+        except (ValueError, TypeError):
+            end_b = last_b_len
+        start_b = max(0, min(last_b_len if start == end else len(first_line.encode("utf-8")), start_b))
+        end_b = max(0, min(last_b_len, end_b))
+        if start == end:
+            end_b = max(start_b, end_b)
         start_byte = line_byte_offsets[start - 1] + start_b
         end_byte = line_byte_offsets[end - 1] + end_b
     else:
@@ -505,11 +528,20 @@ def compute_unit_replacement_span(
     """
     (start_char, end_char), _, is_column_bounded = _compute_unit_spans(source_text, unit)
     lines = source_text.splitlines(keepends=True)
-    if not lines or (start_char >= len(source_text) and end_char >= len(source_text)):
+    if not lines or not isinstance(unit, dict) or (start_char >= len(source_text) and end_char >= len(source_text)):
         return start_char, end_char, replacement_text
 
-    start = max(1, int(unit.get("start") or 1))
-    end = min(len(lines), int(unit.get("end") or len(lines)))
+    try:
+        start = max(1, int(unit.get("start") or 1))
+    except (ValueError, TypeError):
+        start = 1
+    try:
+        end = min(len(lines), int(unit.get("end") or len(lines)))
+    except (ValueError, TypeError):
+        end = len(lines)
+    if start > len(lines) or start > end:
+        return start_char, end_char, replacement_text
+
     start_col = unit.get("start_col")
     end_col = unit.get("end_col")
 
