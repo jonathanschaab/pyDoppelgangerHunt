@@ -294,8 +294,9 @@ def _run_type4_semantic_audit(
 
 
 def _format_scan_mode_description(
-    args: argparse.Namespace,
+    args: Optional[argparse.Namespace] = None,
     *,
+    eff_cfg: Optional[EffectiveScanConfig] = None,
     strip_annotations: bool,
     strip_docstrings: bool,
     idioms_enabled: bool,
@@ -304,34 +305,41 @@ def _format_scan_mode_description(
     stop_shingles_enabled: bool,
 ) -> str:
     """Builds human-readable description string of active AST scanning modes."""
+    def _flag(name: str) -> bool:
+        if eff_cfg is not None and hasattr(eff_cfg, name):
+            return bool(getattr(eff_cfg, name))
+        if args is not None and hasattr(args, name):
+            return bool(getattr(args, name))
+        return False
+
     modes: List[str] = ["functions"]
-    if not args.functions_only:
+    if not _flag("functions_only"):
         modes.append("compound blocks")
     flag_modes = [
-        (args.sliding_window, "sliding windows"),
-        (args.complex_expressions, "complex expressions"),
-        (args.clause_level, "clause branches"),
-        (args.data_tables, "data tables"),
-        (args.class_level, "classes"),
-        (args.merge_subtrees, "merged subtrees"),
-        (args.blind_indexing, "blind indexed"),
+        (_flag("sliding_window"), "sliding windows"),
+        (_flag("complex_expressions"), "complex expressions"),
+        (_flag("clause_level"), "clause branches"),
+        (_flag("data_tables"), "data tables"),
+        (_flag("class_level"), "classes"),
+        (_flag("merge_subtrees"), "merged subtrees"),
+        (_flag("blind_indexing"), "blind indexed"),
         (strip_annotations, "untyped"),
         (strip_docstrings, "docstrings stripped"),
-        (args.blind_literals, "blind literals"),
-        (args.bag_of_tokens, "bag of tokens"),
-        (args.filter_boilerplate, "filtered boilerplate"),
-        (args.consistent_renaming, "consistent renaming"),
-        (args.tfidf, "tfidf weighted"),
-        (args.harvest_closures, "closure harvesting"),
-        (args.commutative, "commutative"),
-        (args.comprehensions, "comprehensions"),
+        (_flag("blind_literals"), "blind literals"),
+        (_flag("bag_of_tokens"), "bag of tokens"),
+        (_flag("filter_boilerplate"), "filtered boilerplate"),
+        (_flag("consistent_renaming"), "consistent renaming"),
+        (_flag("tfidf"), "tfidf weighted"),
+        (_flag("harvest_closures"), "closure harvesting"),
+        (_flag("commutative"), "commutative"),
+        (_flag("comprehensions"), "comprehensions"),
         (idioms_enabled, "idioms canonicalized"),
-        (args.abstract_expressions, "abstract expressions"),
-        (args.gapped_tolerance, "gapped tolerance"),
+        (_flag("abstract_expressions"), "abstract expressions"),
+        (_flag("gapped_tolerance"), "gapped tolerance"),
         (call_seq_enabled, "call sequences"),
         (audit_tests_enabled, "audit tests"),
         (stop_shingles_enabled, "stop-shingles filtered"),
-        (args.nms, "nms suppressed"),
+        (_flag("nms"), "nms suppressed"),
     ]
     for is_enabled, label in flag_modes:
         if is_enabled:
@@ -654,6 +662,21 @@ def _render_text_violations(
     return report_lines
 
 
+def _lookup_config_value(
+    tool_cfg: Dict[str, Any],
+    *keys: str,
+) -> Tuple[bool, Any]:
+    """Looks up the first present key from a sequence of alias names in configuration.
+
+    Returns:
+        (has_entry, value) where has_entry indicates if any alias was found in tool_cfg.
+    """
+    for key in keys:
+        if key in tool_cfg:
+            return True, tool_cfg[key]
+    return False, None
+
+
 def _resolve_strip_option(
     args: argparse.Namespace,
     tool_cfg: Dict[str, Any],
@@ -747,39 +770,58 @@ class EffectiveScanConfig:
     bag_of_tokens: bool
     tfidf: bool
     novel_pair_budget: Optional[int] = None
+    include_notebooks: bool = False
+    functions_only: bool = False
+    sliding_window: bool = False
+    blind_indexing: bool = False
+    merge_subtrees: bool = False
+    complex_expressions: bool = False
+    clause_level: bool = False
+    data_tables: bool = False
+    nms: bool = False
+    class_level: bool = False
+    blind_literals: bool = False
+    filter_boilerplate: bool = False
+    consistent_renaming: bool = False
+    harvest_closures: bool = False
+    commutative: bool = False
+    comprehensions: bool = False
+    abstract_expressions: bool = False
+    gapped_tolerance: bool = False
 
-    def to_calibration_config(self, args: argparse.Namespace, scope: Optional[str] = None) -> Dict[str, Any]:
+    def to_calibration_config(self, args: Optional[argparse.Namespace] = None, scope: Optional[str] = None) -> Dict[str, Any]:
         """Builds active configuration dictionary for calibration hashing and comparison."""
+        inc_notebooks = self.include_notebooks if self.include_notebooks else (bool(getattr(args, "notebooks", False)) if args else False)
         return {
             "bag_of_tokens": self.bag_of_tokens,
             "call_sequences": self.call_sequences,
             "filter_stop_shingles": self.stop_shingles,
             "audit_tests": self.audit_tests,
-            "include_notebooks": bool(args.notebooks),
+            "include_notebooks": inc_notebooks,
             "max_index_frequency": self.max_index_frequency,
             "min_corpus_size": self.min_corpus_size,
             "min_lines": self.min_lines,
             "min_tokens": self.min_tokens,
-            "functions_only": args.functions_only,
-            "sliding_window": args.sliding_window,
+            "functions_only": self.functions_only,
+            "sliding_window": self.sliding_window,
             "window_size": self.window_size,
-            "blind_indexing": args.blind_indexing,
-            "merge_subtrees": args.merge_subtrees,
-            "complex_expressions": args.complex_expressions,
+            "blind_indexing": self.blind_indexing,
+            "merge_subtrees": self.merge_subtrees,
+            "complex_expressions": self.complex_expressions,
             "min_expr_complexity": self.min_expr_complexity,
-            "clause_level": args.clause_level,
-            "data_tables": args.data_tables,
+            "clause_level": self.clause_level,
+            "data_tables": self.data_tables,
             "strip_annotations": self.strip_annotations,
-            "nms": args.nms,
-            "class_level": args.class_level,
-            "blind_literals": args.blind_literals,
-            "filter_boilerplate": args.filter_boilerplate,
-            "consistent_renaming": args.consistent_renaming,
-            "harvest_closures": args.harvest_closures,
-            "commutative": args.commutative,
-            "comprehensions": args.comprehensions,
+            "nms": self.nms,
+            "class_level": self.class_level,
+            "blind_literals": self.blind_literals,
+            "filter_boilerplate": self.filter_boilerplate,
+            "consistent_renaming": self.consistent_renaming,
+            "harvest_closures": self.harvest_closures,
+            "commutative": self.commutative,
+            "comprehensions": self.comprehensions,
             "idioms": self.idioms,
-            "abstract_expressions": args.abstract_expressions,
+            "abstract_expressions": self.abstract_expressions,
             "strip_docstrings": self.strip_docstrings,
             "min_frequency": self.min_frequency,
             "excludes": self.excludes,
@@ -800,36 +842,18 @@ def _resolve_effective_config(
         args.max_index_frequency, tool_cfg, active_calib, has_explicit_cfg
     )
 
-    int_specs: Sequence[Tuple[str, str, Optional[int], int, Optional[int]]] = (
-        ("min_lines", "min_lines", args.min_lines, 1, 8),
-        ("min_tokens", "min_tokens", args.min_tokens, 1, 15),
-        ("min_corpus_size", "min_corpus_units", args.min_corpus_units, 0, None),
-        ("window_size", "window_size", args.window_size, 1, 5),
-        ("min_expr_complexity", "min_expr_complexity", args.min_expr_complexity, 1, 4),
-        ("min_frequency", "min_calibration_frequency", args.min_calibration_frequency, 1, 1),
-        ("novel_pair_budget", "novel_pair_budget", args.novel_pair_budget, 0, None),
+    int_specs: Sequence[Tuple[str, Tuple[str, ...], Optional[int], int, Optional[int]]] = (
+        ("min_lines", ("min_lines",), args.min_lines, 1, 8),
+        ("min_tokens", ("min_tokens",), args.min_tokens, 1, 15),
+        ("min_corpus_size", ("min_corpus_units", "min_corpus_size"), args.min_corpus_units, 0, None),
+        ("window_size", ("window_size",), args.window_size, 1, 5),
+        ("min_expr_complexity", ("min_expr_complexity",), args.min_expr_complexity, 1, 4),
+        ("min_frequency", ("min_calibration_frequency", "min_frequency"), args.min_calibration_frequency, 1, 1),
+        ("novel_pair_budget", ("novel_pair_budget", "max_novel_shingle_pair_budget", "novel_shingle_pair_budget"), args.novel_pair_budget, 0, None),
     )
     resolved_ints: Dict[str, Optional[int]] = {}
-    for calib_key, cfg_key, cli_arg, min_bound, default_val in int_specs:
-        cfg_val = (
-            tool_cfg.get(cfg_key)
-            if cfg_key in tool_cfg
-            else (
-                tool_cfg.get(calib_key)
-                if calib_key in tool_cfg
-                else (
-                    tool_cfg.get("max_novel_shingle_pair_budget")
-                    or tool_cfg.get("novel_shingle_pair_budget")
-                    if calib_key == "novel_pair_budget"
-                    else None
-                )
-            )
-        )
-        has_cfg_entry = (
-            (cfg_key in tool_cfg)
-            or (calib_key in tool_cfg)
-            or (calib_key == "novel_pair_budget" and any(k in tool_cfg for k in ("max_novel_shingle_pair_budget", "novel_shingle_pair_budget")))
-        )
+    for calib_key, cfg_aliases, cli_arg, min_bound, default_val in int_specs:
+        has_cfg_entry, cfg_val = _lookup_config_value(tool_cfg, *cfg_aliases)
         if cli_arg is not None:
             resolved_ints[calib_key] = cli_arg
         elif has_explicit_cfg and has_cfg_entry:
@@ -889,23 +913,29 @@ def _resolve_effective_config(
         ("comprehensions", "comprehensions", "comprehensions", False),
         ("complex_expressions", "complex_expressions", "complex_expressions", False),
     )
+    resolved_bools: Dict[str, bool] = {}
     for calib_key, cli_attr, cfg_key, default_val in bool_specs:
+        has_cfg, cfg_val = _lookup_config_value(tool_cfg, cfg_key, calib_key)
         cli_val = getattr(args, cli_attr, None)
         if cli_val is not None:
             resolved_bool = bool(cli_val)
-        elif has_explicit_cfg and (cfg_key in tool_cfg or calib_key in tool_cfg):
-            resolved_bool = bool(tool_cfg.get(cfg_key, tool_cfg.get(calib_key)))
+        elif has_explicit_cfg and has_cfg:
+            resolved_bool = bool(cfg_val)
         elif calib_key in active_calib:
             resolved_bool = _safe_bool(active_calib[calib_key])
         else:
-            resolved_bool = bool(tool_cfg.get(cfg_key, tool_cfg.get(calib_key, default_val)))
+            resolved_bool = bool(cfg_val if has_cfg else default_val)
         if calib_key == "filter_stop_shingles" and getattr(args, "diff_only", False) and cli_val is None:
+            # Diff-only runs mandate stop-shingle filtering for throughput regardless of config unless overridden by CLI
             resolved_bool = True
         setattr(args, cli_attr, resolved_bool)
+        resolved_bools[cli_attr] = resolved_bool
 
     for extra_flag in ("nms", "merge_subtrees", "tfidf", "gapped_tolerance"):
         extra_val = getattr(args, extra_flag, None)
-        setattr(args, extra_flag, bool(tool_cfg.get(extra_flag, False)) if extra_val is None else bool(extra_val))
+        resolved_extra = bool(tool_cfg.get(extra_flag, False)) if extra_val is None else bool(extra_val)
+        setattr(args, extra_flag, resolved_extra)
+        resolved_bools[extra_flag] = resolved_extra
 
     return EffectiveScanConfig(
         min_lines=min_lines,
@@ -918,13 +948,31 @@ def _resolve_effective_config(
         excludes=excludes,
         strip_annotations=strip_annotations,
         strip_docstrings=strip_docstrings,
-        call_sequences=bool(args.call_sequences),
-        audit_tests=bool(args.audit_tests),
-        idioms=bool(args.idioms),
-        stop_shingles=bool(args.stop_shingles),
-        bag_of_tokens=bool(args.bag_of_tokens),
-        tfidf=bool(args.tfidf),
+        call_sequences=resolved_bools["call_sequences"],
+        audit_tests=resolved_bools["audit_tests"],
+        idioms=resolved_bools["idioms"],
+        stop_shingles=resolved_bools["stop_shingles"],
+        bag_of_tokens=resolved_bools["bag_of_tokens"],
+        tfidf=resolved_bools["tfidf"],
         novel_pair_budget=novel_pair_budget,
+        include_notebooks=resolved_bools["notebooks"],
+        functions_only=resolved_bools["functions_only"],
+        sliding_window=resolved_bools["sliding_window"],
+        blind_indexing=resolved_bools["blind_indexing"],
+        merge_subtrees=resolved_bools["merge_subtrees"],
+        complex_expressions=resolved_bools["complex_expressions"],
+        clause_level=resolved_bools["clause_level"],
+        data_tables=resolved_bools["data_tables"],
+        nms=resolved_bools["nms"],
+        class_level=resolved_bools["class_level"],
+        blind_literals=resolved_bools["blind_literals"],
+        filter_boilerplate=resolved_bools["filter_boilerplate"],
+        consistent_renaming=resolved_bools["consistent_renaming"],
+        harvest_closures=resolved_bools["harvest_closures"],
+        commutative=resolved_bools["commutative"],
+        comprehensions=resolved_bools["comprehensions"],
+        abstract_expressions=resolved_bools["abstract_expressions"],
+        gapped_tolerance=resolved_bools["gapped_tolerance"],
     )
 
 
@@ -1027,6 +1075,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     mode_desc = _format_scan_mode_description(
         args,
+        eff_cfg=eff_cfg,
         strip_annotations=eff_cfg.strip_annotations,
         strip_docstrings=eff_cfg.strip_docstrings,
         idioms_enabled=eff_cfg.idioms,
@@ -1084,36 +1133,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         min_tokens=eff_cfg.min_tokens,
         threshold=threshold,
         excludes=excludes,
-        functions_only=args.functions_only,
-        sliding_window=args.sliding_window,
+        functions_only=eff_cfg.functions_only,
+        sliding_window=eff_cfg.sliding_window,
         window_size=eff_cfg.window_size,
-        blind_indexing=args.blind_indexing,
-        merge_subtrees=args.merge_subtrees,
-        complex_expressions=args.complex_expressions,
+        blind_indexing=eff_cfg.blind_indexing,
+        merge_subtrees=eff_cfg.merge_subtrees,
+        complex_expressions=eff_cfg.complex_expressions,
         min_expr_complexity=eff_cfg.min_expr_complexity,
-        clause_level=args.clause_level,
-        data_tables=args.data_tables,
+        clause_level=eff_cfg.clause_level,
+        data_tables=eff_cfg.data_tables,
         strip_annotations=eff_cfg.strip_annotations,
-        nms=args.nms,
-        class_level=args.class_level,
-        blind_literals=args.blind_literals,
+        nms=eff_cfg.nms,
+        class_level=eff_cfg.class_level,
+        blind_literals=eff_cfg.blind_literals,
         bag_of_tokens=eff_cfg.bag_of_tokens,
-        filter_boilerplate=args.filter_boilerplate,
-        consistent_renaming=args.consistent_renaming,
+        filter_boilerplate=eff_cfg.filter_boilerplate,
+        consistent_renaming=eff_cfg.consistent_renaming,
         tfidf=eff_cfg.tfidf,
-        harvest_closures=args.harvest_closures,
-        commutative=args.commutative,
-        comprehensions=args.comprehensions,
+        harvest_closures=eff_cfg.harvest_closures,
+        commutative=eff_cfg.commutative,
+        comprehensions=eff_cfg.comprehensions,
         idioms=eff_cfg.idioms,
-        abstract_expressions=args.abstract_expressions,
-        gapped_tolerance=args.gapped_tolerance,
+        abstract_expressions=eff_cfg.abstract_expressions,
+        gapped_tolerance=eff_cfg.gapped_tolerance,
         call_sequences=eff_cfg.call_sequences,
         audit_tests=audit_tests_enabled,
         exemptions=cfg_exemptions,
         workers=args.workers,
         sort_by=sort_by,
         top_n=scan_top_n,
-        include_notebooks=bool(args.notebooks),
+        include_notebooks=eff_cfg.include_notebooks,
         strip_docstrings=eff_cfg.strip_docstrings,
         max_index_frequency=eff_cfg.max_index_frequency,
         filter_stop_shingles=eff_cfg.stop_shingles,
