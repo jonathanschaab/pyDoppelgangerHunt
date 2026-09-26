@@ -6,6 +6,8 @@ import ast
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+import pytest
+
 from pydoppelgangerhunt import (
     get_ast_characteristic_vector,
     get_ast_shingles,
@@ -865,6 +867,21 @@ def test_batch_49_matcher_similarity_and_subclones(tmp_path: Path) -> None:
     clones_calls = scan_target(str(pkg_scan), threshold=0.8, min_lines=2, min_tokens=3, call_sequences=True)
     assert len(clones_calls) == 1
 
+    clones_tfidf_calls = scan_target(
+        str(pkg_scan),
+        threshold=0.8,
+        min_lines=2,
+        min_tokens=3,
+        tfidf=True,
+        call_sequences=True,
+    )
+    assert len(clones_tfidf_calls) == 1
+
+    from pydoppelgangerhunt.matcher import _extract_unit_shingle_keys  # pylint: disable=import-outside-toplevel
+    assert _extract_unit_shingle_keys({"calls": None}, call_sequences=True) == set()
+    assert _extract_unit_shingle_keys({"vector": None}, bag_of_tokens=True) == set()
+    assert _extract_unit_shingle_keys({"shingles": None}) == set()
+
     clones_bag = scan_target(
         str(pkg_scan),
         threshold=0.8,
@@ -1193,3 +1210,1071 @@ def test_batch_82_matcher_sloc_and_priority_score_bounds() -> None:
         reverse=True,
     )
     assert len(clone_pairs) == 2
+
+
+def test_differential_scan_multi_unit_file_and_shingle_dedup(tmp_path: Path) -> None:
+    """Verifies differential scanning with multi-unit files and candidate pair monotonic ordering."""
+    from pydoppelgangerhunt.matcher import _add_candidate_pairs  # pylint: disable=import-outside-toplevel
+
+    file_a = tmp_path / "file_a.py"
+    file_a.write_text(
+        "def func_one(x: int) -> int:\n"
+        "    a = x + 1\n"
+        "    b = a * 2\n"
+        "    c = b - 3\n"
+        "    return c * 4\n\n"
+        "def func_two(x: int) -> int:\n"
+        "    a = x + 1\n"
+        "    b = a * 2\n"
+        "    c = b - 3\n"
+        "    return c * 4\n\n"
+        "def func_three(x: int) -> int:\n"
+        "    return x ** 2 + 100\n",
+        encoding="utf-8",
+    )
+
+    file_b = tmp_path / "file_b.py"
+    file_b.write_text(
+        "def func_four(x: int) -> int:\n"
+        "    a = x + 1\n"
+        "    b = a * 2\n"
+        "    c = b - 3\n"
+        "    return c * 4\n",
+        encoding="utf-8",
+    )
+
+    clones = scan_target(
+        str(tmp_path),
+        diff_files=["file_a.py"],
+        threshold=0.85,
+        min_lines=3,
+        min_tokens=5,
+    )
+    assert len(clones) >= 1
+    for _, u1, u2 in clones:
+        files = {Path(u1["file"]).name, Path(u2["file"]).name}
+        assert "file_a.py" in files
+
+    cand_pairs: set[Tuple[int, int]] = set()
+    _add_candidate_pairs(cand_pairs, [0, 2, 4], diff_unit_indices={0, 4})
+    assert cand_pairs == {(0, 4), (0, 2), (2, 4)}
+    for idx1, idx2 in cand_pairs:
+        assert idx1 < idx2
+
+
+def test_uncalibrated_novel_shingle_pair_budget_bounds_explosion(tmp_path: Path) -> None:
+    """Verifies that novel shingles generating massive candidate pairings are bounded by MAX_NOVEL_SHINGLE_PAIR_BUDGET."""
+    from pydoppelgangerhunt.matcher import (  # pylint: disable=import-outside-toplevel
+        MAX_NOVEL_SHINGLE_PAIR_BUDGET,
+        scan_target,
+    )
+
+    assert MAX_NOVEL_SHINGLE_PAIR_BUDGET == 10_000
+
+    # Generate a file with 150 identical functions sharing an uncalibrated novel shingle:
+    # 150 * 149 // 2 = 11,175 potential pairs (> 10,000 budget)
+    lines: list[str] = []
+    for i in range(150):
+        lines.append(
+            f"def action_handler_burst_{i}(arg_a, arg_b, arg_c):\n"
+            "    novel_token_sequence_xyz = arg_a + arg_b + arg_c\n"
+            "    return novel_token_sequence_xyz * 42\n"
+        )
+    test_file = tmp_path / "burst.py"
+    test_file.write_text("\n".join(lines), encoding="utf-8")
+
+    calib = {
+        "total_units": 5000,
+        "max_index_frequency": 0.25,
+        "min_lines": 3,
+        "min_corpus_size": 4,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {},
+    }
+
+    # In differential scan against burst.py, the novel token produces > 10,000 pairs and is skipped
+    clones = scan_target(
+        str(tmp_path),
+        diff_files=["burst.py"],
+        min_lines=3,
+        threshold=0.90,
+        corpus_calibration=calib,
+    )
+    # The unbounded candidate explosion was prevented, suppressing pairs for this shingle
+    assert isinstance(clones, list)
+    assert len(clones) == 0
+
+    # Legacy calibration (missing shingle_frequencies) falls back to legacy stop-shingle behavior
+    # and does not drop valid pairs under the novel-pair budget
+    calib_legacy = {
+        "total_units": 5000,
+        "max_index_frequency": 0.25,
+        "min_lines": 3,
+        "min_corpus_size": 4,
+        "global_stop_shingles": set(),
+    }
+    clones_legacy = scan_target(
+        str(tmp_path),
+        diff_files=["burst.py"],
+        min_lines=3,
+        threshold=0.90,
+        corpus_calibration=calib_legacy,
+    )
+    assert len(clones_legacy) > 0
+
+    # When pairs are within budget (40 functions = 780 pairs <= 10,000), clones are detected
+    small_lines: list[str] = []
+    for i in range(40):
+        small_lines.append(
+            f"def action_handler_small_{i}(arg_a, arg_b, arg_c):\n"
+            "    novel_token_sequence_xyz = arg_a + arg_b + arg_c\n"
+            "    return novel_token_sequence_xyz * 42\n"
+        )
+    small_file = tmp_path / "small.py"
+    small_file.write_text("\n".join(small_lines), encoding="utf-8")
+
+    clones_small = scan_target(
+        str(tmp_path),
+        diff_files=["small.py"],
+        min_lines=3,
+        threshold=0.90,
+        corpus_calibration=calib,
+    )
+    assert len(clones_small) > 0
+
+
+def test_cumulative_novel_shingle_pair_budget_bounds_multiple_shingles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies that the candidate-pair budget is tracked globally across multiple distinct novel shingles."""
+    import logging
+    import pydoppelgangerhunt.matcher as matcher  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    # Set a tight global novel pair budget: e.g. 5 pairs
+    monkeypatch.setattr(matcher, "MAX_NOVEL_SHINGLE_PAIR_BUDGET", 5)
+
+    # Shingle 1 group: 3 functions = 3 pairs <= 5
+    # Shingle 2 group: 3 functions = 3 pairs (cumulative 6 > 5)
+    lines: list[str] = []
+    for i in range(3):
+        lines.append(
+            f"def group_one_fn_{i}(val_x, val_y):\n"
+            f"    novel_token_group_one = val_x + val_y + {i}\n"
+            "    return novel_token_group_one * 10\n"
+        )
+    for i in range(3):
+        lines.append(
+            f"def group_two_fn_{i}(val_a, val_b):\n"
+            f"    novel_token_group_two = val_a * val_b + {i}\n"
+            "    return novel_token_group_two * 20\n"
+        )
+    test_file = tmp_path / "multi_novel.py"
+    test_file.write_text("\n".join(lines), encoding="utf-8")
+
+    calib = {
+        "total_units": 5000,
+        "max_index_frequency": 0.25,
+        "min_lines": 3,
+        "min_corpus_size": 4,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {},
+    }
+
+    # Group 1 uses 3 pairs (remaining budget = 2).
+    # Group 2 needs 3 pairs, which exceeds the remaining budget 2, so Group 2 is skipped.
+    with caplog.at_level(logging.DEBUG):
+        clones = scan_target(
+            str(tmp_path),
+            diff_files=["multi_novel.py"],
+            min_lines=3,
+            threshold=0.70,
+            corpus_calibration=calib,
+        )
+    group_one_clones = [
+        c for c in clones
+        if "group_one_fn" in (c[1].get("name") or "") or "group_one_fn" in (c[2].get("name") or "")
+    ]
+    group_two_clones = [
+        c for c in clones
+        if "group_two_fn" in (c[1].get("name") or "") or "group_two_fn" in (c[2].get("name") or "")
+    ]
+    assert len(group_one_clones) > 0
+    assert len(group_two_clones) == 0
+    assert any("Novel shingle pair budget exceeded" in record.message for record in caplog.records)
+
+
+def test_unit_drift_computed_when_target_units_drop_to_zero(tmp_path: Path) -> None:
+    """Verifies that unit_drift is computed as 1.0 (100% drift) when active target units drop to 0."""
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    empty_dir = tmp_path / "empty_dir"
+    empty_dir.mkdir()
+
+    calib = {
+        "total_units": 50,
+        "max_index_frequency": 0.25,
+        "min_lines": 8,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {},
+    }
+
+    scan_target(str(empty_dir), corpus_calibration=calib)
+    assert calib.get("current_units") == 0
+    assert calib.get("unit_drift") == 1.0
+
+
+def test_scan_target_diff_files_in_subdirectory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies scan_target correctly resolves diff_files when scanning a subdirectory with repo_root."""
+    repo = tmp_path / "diff_repo"
+    repo.mkdir()
+    sub = repo / "sub_pkg"
+    sub.mkdir()
+
+    code1 = (
+        "def worker_alpha(val_a, val_b):\n"
+        "    res = val_a * 10 + val_b\n"
+        "    res_scaled = res * 2\n"
+        "    return res_scaled\n"
+    )
+    code2 = (
+        "def worker_beta(val_a, val_b):\n"
+        "    res = val_a * 10 + val_b\n"
+        "    res_scaled = res * 2\n"
+        "    return res_scaled\n"
+    )
+    (sub / "w1.py").write_text(code1, encoding="utf-8")
+    (sub / "w2.py").write_text(code2, encoding="utf-8")
+
+    # diff_files passed as repo-relative path 'sub_pkg/w1.py'
+    clones = scan_target(
+        str(sub),
+        repo_root=str(repo),
+        diff_files=["sub_pkg/w1.py"],
+        min_lines=3,
+        threshold=0.80,
+    )
+    assert len(clones) >= 1
+
+    # diff_files passed when target is itself the repo root
+    clones2 = scan_target(
+        str(sub),
+        diff_files=["w1.py"],
+        min_lines=3,
+        threshold=0.80,
+    )
+    assert len(clones2) >= 1
+
+    # diff_files passed in Git CLI scenario: target="sub_pkg", auto-detecting Git worktree `repo`
+    norm_repo = str(repo).replace("\\", "/")
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: (
+            norm_repo + "\n"
+            if args == ["rev-parse", "--show-toplevel"]
+            else None
+        ),
+    )
+    clones3 = scan_target(
+        str(sub),
+        diff_files=["sub_pkg/w1.py"],
+        min_lines=3,
+        threshold=0.80,
+    )
+    assert len(clones3) >= 1
+
+
+def test_scan_target_diff_files_single_file_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies scan_target correctly normalizes single-file targets to containing directory for diff keys."""
+    repo = tmp_path / "single_file_repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+
+    code = (
+        "def compute_alpha(val_a, val_b):\n"
+        "    temp = val_a * 10 + val_b\n"
+        "    return temp * 2\n\n"
+        "def compute_beta(val_a, val_b):\n"
+        "    temp = val_a * 10 + val_b\n"
+        "    return temp * 2\n"
+    )
+    target_file = src / "a.py"
+    target_file.write_text(code, encoding="utf-8")
+
+    norm_repo = str(repo).replace("\\", "/")
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: (
+            norm_repo + "\n"
+            if args == ["rev-parse", "--show-toplevel"]
+            else None
+        ),
+    )
+
+    # 1. Single file scan with explicit repo_root as Git worktree root
+    clones = scan_target(
+        str(target_file),
+        repo_root=str(repo),
+        diff_files=["src/a.py"],
+        min_lines=3,
+        threshold=0.80,
+    )
+    assert len(clones) >= 1
+
+    # 2. Single file scan without explicit repo_root (falls back to Git worktree root)
+    clones2 = scan_target(
+        str(target_file),
+        diff_files=["src/a.py"],
+        min_lines=3,
+        threshold=0.80,
+    )
+    assert len(clones2) >= 1
+
+
+def test_scan_target_calibration_scope_mismatch_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that scan_target discards calibration when target directory scope differs from calibration scope."""
+    repo = tmp_path / "scope_repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+    tests_dir = repo / "tests"
+    tests_dir.mkdir(parents=True)
+
+    norm_repo = str(repo).replace("\\", "/")
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: (
+            norm_repo + "\n"
+            if args == ["rev-parse", "--show-toplevel"]
+            else None
+        ),
+    )
+
+    code = "def sample():\n    x = 10\n    return x * 2\n"
+    (src / "worker.py").write_text(code, encoding="utf-8")
+    (tests_dir / "test_worker.py").write_text(code, encoding="utf-8")
+
+    # Generate calibration for src
+    _, calib_src = scan_target(str(src), return_calibration=True)
+    assert calib_src.get("scope") == "src"
+
+    # Running scan on repo root (scope="") with calib_src:
+    # calib_src should be rejected and NOT used (so calib_src does not record unit_drift)
+    calib_copy = dict(calib_src)
+    scan_target(str(repo), corpus_calibration=calib_copy)
+    assert "unit_drift" not in calib_copy
+
+
+def test_scan_target_git_root_discovered_for_single_file_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that scan_target correctly probes git root when targeting a single file in a git repo."""
+    repo = tmp_path / "git_single_repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+    f_target = src / "target.py"
+    code = (
+        "def compute_val(a, b):\n"
+        "    res = 0\n"
+        "    for val in a:\n"
+        "        res += val * b + 42\n"
+        "    return res\n"
+    )
+    code_clone = (
+        "def compute_val2(a, b):\n"
+        "    res = 0\n"
+        "    for val in a:\n"
+        "        res += val * b + 42\n"
+        "    return res\n"
+    )
+    f_target.write_text(code + "\n" + code_clone, encoding="utf-8")
+
+    norm_repo = str(repo).replace("\\", "/")
+
+    def mock_run_git(args: Any, cwd: Any = None) -> Any:
+        if args == ["rev-parse", "--show-toplevel"]:
+            if cwd is not None and not Path(cwd).is_dir():
+                raise NotADirectoryError(f"{cwd} is not a directory")
+            return norm_repo + "\n"
+        return None
+
+    monkeypatch.setattr("pydoppelgangerhunt.git_diff._run_git_command", mock_run_git)
+
+    # Differential scan targeting single file f_target with diff_files referencing git-worktree-relative "src/target.py"
+    # without passing repo_root (relying on _resolve_git_root_path to find git root)
+    clones = scan_target(
+        str(f_target),
+        diff_files=["src/target.py"],
+        min_lines=5,
+        threshold=0.80,
+    )
+    assert len(clones) >= 1
+
+
+def test_shingle_iteration_order_is_deterministic_under_novel_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies that novel shingle admission order is strictly deterministic regardless of file discovery order."""
+    import logging
+    import pydoppelgangerhunt.matcher as matcher  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    # Budget allows only one 3-function group (3 * 2 // 2 = 3 pairs <= 4)
+    monkeypatch.setattr(matcher, "MAX_NOVEL_SHINGLE_PAIR_BUDGET", 4)
+
+    lines_alpha = [
+        f"def alpha_unique_proc_{i}(v1, v2):\n    token_alpha_shingle = v1 + v2 + {i}\n    return token_alpha_shingle\n"
+        for i in range(3)
+    ]
+    lines_omega = [
+        f"def omega_unique_proc_{i}(v1, v2):\n    token_omega_shingle = v1 * v2 + {i}\n    return token_omega_shingle\n"
+        for i in range(3)
+    ]
+
+    dir_1 = tmp_path / "order_1"
+    dir_1.mkdir()
+    # In dir_1: write alpha first, then omega
+    (dir_1 / "1_alpha.py").write_text("\n".join(lines_alpha), encoding="utf-8")
+    (dir_1 / "2_omega.py").write_text("\n".join(lines_omega), encoding="utf-8")
+
+    dir_2 = tmp_path / "order_2"
+    dir_2.mkdir()
+    # In dir_2: write omega first, then alpha
+    (dir_2 / "1_omega.py").write_text("\n".join(lines_omega), encoding="utf-8")
+    (dir_2 / "2_alpha.py").write_text("\n".join(lines_alpha), encoding="utf-8")
+
+    calib = {
+        "total_units": 1000,
+        "max_index_frequency": 0.25,
+        "min_lines": 3,
+        "min_corpus_size": 4,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {},
+    }
+
+    with caplog.at_level(logging.DEBUG):
+        clones_1 = scan_target(
+            str(dir_1),
+            min_lines=3,
+            threshold=0.70,
+            corpus_calibration=calib,
+        )
+        clones_2 = scan_target(
+            str(dir_2),
+            min_lines=3,
+            threshold=0.70,
+            corpus_calibration=calib,
+        )
+
+    names_1 = sorted({(c[1]["name"], c[2]["name"]) for c in clones_1})
+    names_2 = sorted({(c[1]["name"], c[2]["name"]) for c in clones_2})
+
+    # Both runs must discover the exact same clone pairs despite opposite file discovery order
+    assert len(names_1) > 0
+    assert names_1 == names_2
+    assert any("Novel shingle pair budget exceeded" in record.message for record in caplog.records)
+
+
+def test_legacy_calibration_missing_frequencies_falls_back_to_stop_shingles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that legacy calibrations without shingle_frequencies fall back to stop shingles without novel budget capping."""
+    import pydoppelgangerhunt.matcher as matcher  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    # Artificially tiny novel budget: 2 pairs max if shingles were marked novel
+    monkeypatch.setattr(matcher, "MAX_NOVEL_SHINGLE_PAIR_BUDGET", 2)
+
+    lines_a = (
+        "def func_a1(x, y):\n"
+        "    alpha_calc = x * 10 + y * 20\n"
+        "    return alpha_calc + 1\n\n"
+        "def func_a2(x, y):\n"
+        "    alpha_calc = x * 10 + y * 20\n"
+        "    return alpha_calc + 1\n"
+    )
+    lines_b = (
+        "def func_b1(x, y):\n"
+        "    beta_calc = x ** 2 + y ** 2\n"
+        "    return beta_calc + 2\n\n"
+        "def func_b2(x, y):\n"
+        "    beta_calc = x ** 2 + y ** 2\n"
+        "    return beta_calc + 2\n"
+    )
+    lines_c = (
+        "def func_c1(x, y):\n"
+        "    gamma_calc = (x + y) * (x - y)\n"
+        "    return gamma_calc + 3\n\n"
+        "def func_c2(x, y):\n"
+        "    gamma_calc = (x + y) * (x - y)\n"
+        "    return gamma_calc + 3\n"
+    )
+    (tmp_path / "mod_a.py").write_text(lines_a, encoding="utf-8")
+    (tmp_path / "mod_b.py").write_text(lines_b, encoding="utf-8")
+    (tmp_path / "mod_c.py").write_text(lines_c, encoding="utf-8")
+
+    # Legacy calibration has total_units and stop shingles, but NO shingle_frequencies key
+    legacy_calib = {
+        "total_units": 100,
+        "max_index_frequency": 0.50,
+        "global_stop_shingles": [],
+    }
+
+    clones = scan_target(
+        str(tmp_path),
+        min_lines=3,
+        threshold=0.80,
+        corpus_calibration=legacy_calib,
+    )
+
+    # All 3 clone pairs must be discovered (not dropped by novel-pair budget of 2)
+    clone_pairs = {(c[1]["name"], c[2]["name"]) for c in clones}
+    assert len(clone_pairs) >= 3
+
+    # Now verify with shingle_frequencies: None
+    legacy_calib_none = {
+        "total_units": 100,
+        "max_index_frequency": 0.50,
+        "global_stop_shingles": [],
+        "shingle_frequencies": None,
+    }
+    clones_none = scan_target(
+        str(tmp_path),
+        min_lines=3,
+        threshold=0.80,
+        corpus_calibration=legacy_calib_none,
+    )
+    assert len(clones_none) >= 3
+
+
+def test_matcher_units_missing_shingles_no_key_error(tmp_path: Path) -> None:
+    """Verifies that scan_target with tfidf=True handles units missing shingles key without KeyError."""
+    from unittest.mock import patch
+    import pydoppelgangerhunt.matcher
+
+    f = tmp_path / "code.py"
+    f.write_text("def a():\n    return 1\ndef b():\n    return 1\n", encoding="utf-8")
+
+    orig_harvest = pydoppelgangerhunt.matcher.harvest_file_units
+
+    def mock_harvest(*args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
+        units = orig_harvest(*args, **kwargs)
+        if units:
+            units[0].pop("shingles", None)
+            if len(units) > 1:
+                units[1]["shingles"] = None
+        return units
+
+    with patch.object(pydoppelgangerhunt.matcher, "harvest_file_units", side_effect=mock_harvest):
+        clones = scan_target(str(tmp_path), tfidf=True, min_lines=1)
+        assert isinstance(clones, list)
+
+
+def test_shingle_sort_key_determinism_and_types() -> None:
+    """Verifies that _shingle_sort_key partitions and orders tuples and strings deterministically."""
+    from pydoppelgangerhunt.matcher import _shingle_sort_key  # pylint: disable=import-outside-toplevel
+
+    assert _shingle_sort_key(("FunctionDef", "arguments")) == (0, (("str", "FunctionDef"), ("str", "arguments")))
+    assert _shingle_sort_key("token_str") == (1, "token_str")
+    assert _shingle_sort_key(42) == (1, "42")
+
+    # Heterogeneous tuple elements (int vs str) do not trigger TypeError
+    hetero_keys = [("call", "arg"), ("call", 10), ("call", 2), "token"]
+    sorted_hetero = sorted(hetero_keys, key=_shingle_sort_key)
+    assert sorted_hetero == [("call", 2), ("call", 10), ("call", "arg"), "token"]
+
+    raw_keys = [
+        "zebra_token",
+        ("Module", "If", "Compare"),
+        "apple_token",
+        ("FunctionDef", "arguments", "arg"),
+        "beta_token",
+        ("ClassDef", "Name"),
+    ]
+    sorted_keys = sorted(raw_keys, key=_shingle_sort_key)
+    expected = [
+        ("ClassDef", "Name"),
+        ("FunctionDef", "arguments", "arg"),
+        ("Module", "If", "Compare"),
+        "apple_token",
+        "beta_token",
+        "zebra_token",
+    ]
+    assert sorted_keys == expected
+
+
+def test_scan_target_accepts_path_instance(tmp_path: Path) -> None:
+    """Verifies that scan_target accepts Path instances for target_dir without type or runtime errors."""
+    f = tmp_path / "sample.py"
+    f.write_text("def foo():\n    return 42\n", encoding="utf-8")
+    clones = scan_target(tmp_path)
+    assert isinstance(clones, list)
+
+
+def test_novel_shingle_pair_budget_visibility(tmp_path: Path, monkeypatch: Any, caplog: Any) -> None:
+    """Verifies that novel shingle budget exclusions log an info advisory and populate corpus_calibration."""
+    import logging
+    import pydoppelgangerhunt.matcher
+    from pydoppelgangerhunt.baseline import compute_corpus_calibration  # pylint: disable=import-outside-toplevel
+
+    f = tmp_path / "clones.py"
+    f.write_text(
+        "def func_a():\n    x = 1\n    y = 2\n    return x + y\n\n"
+        "def func_b():\n    x = 1\n    y = 2\n    return x + y\n\n"
+        "def func_c():\n    x = 1\n    y = 2\n    return x + y\n",
+        encoding="utf-8",
+    )
+
+    calib = compute_corpus_calibration([], min_lines=3)
+    calib["total_units"] = 100
+    calib["shingle_frequencies"] = {}
+
+    with monkeypatch.context() as m, caplog.at_level(logging.INFO):
+        m.setattr(pydoppelgangerhunt.matcher, "MAX_NOVEL_SHINGLE_PAIR_BUDGET", 1)
+        scan_target(
+            str(tmp_path),
+            min_lines=3,
+            threshold=0.80,
+            corpus_calibration=calib,
+        )
+
+    assert calib.get("skipped_novel_shingles") is not None
+    assert calib["skipped_novel_shingles"] > 0
+    assert any("Novel shingle pair budget reached" in record.message for record in caplog.records)
+
+
+def test_scan_target_explicit_repo_root_precedence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that scan_target respects explicit repo_root over auto-detected git root."""
+    import pydoppelgangerhunt.matcher
+
+    custom_root = tmp_path / "custom_root"
+    target_dir = custom_root / "subpkg" / "feature"
+    target_dir.mkdir(parents=True)
+
+    fake_git_root = tmp_path / "fake_git"
+    fake_git_root.mkdir()
+
+    f = target_dir / "worker.py"
+    f.write_text("def run():\n    pass\n", encoding="utf-8")
+
+    # Mock _resolve_git_root_path to simulate running inside a git repository
+    monkeypatch.setattr(pydoppelgangerhunt.matcher, "_resolve_git_root_path", lambda _: fake_git_root)
+
+    # 1. Calling scan_target with explicit repo_root must prioritize custom_root
+    _, calib_custom = scan_target(
+        str(target_dir),
+        repo_root=str(custom_root),
+        return_calibration=True,
+    )
+    assert calib_custom.get("scope") == "subpkg/feature"
+
+    # 2. Calling scan_target without repo_root falls back to git root
+    _, calib_git = scan_target(
+        str(target_dir),
+        return_calibration=True,
+    )
+    # Target is outside fake_git_root so scope is target directory itself or resolved relative
+    assert calib_git.get("scope") != "subpkg/feature"
+
+
+def test_scan_target_explicit_repo_root_equals_target_dir_precedence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies explicit repo_root has precedence over git root even when repo_root equals target_dir."""
+    import pydoppelgangerhunt.matcher
+
+    repo = tmp_path / "outer_git_repo"
+    target_dir = repo / "subpkg"
+    target_dir.mkdir(parents=True)
+
+    f = target_dir / "worker.py"
+    f.write_text("def run():\n    pass\n", encoding="utf-8")
+
+    # Simulate running inside git repo `repo`
+    monkeypatch.setattr(pydoppelgangerhunt.matcher, "_resolve_git_root_path", lambda _: repo)
+
+    # 1. Calling scan_target with repo_root == target_dir
+    _, calib_explicit = scan_target(
+        str(target_dir),
+        repo_root=str(target_dir),
+        return_calibration=True,
+    )
+    # Target is at the root of the specified repository root, so scope must be None (not "subpkg")
+    assert calib_explicit.get("scope") is None
+
+    # 2. Calling scan_target with repo_root=None auto-detects git root `repo`
+    _, calib_auto = scan_target(
+        str(target_dir),
+        repo_root=None,
+        return_calibration=True,
+    )
+    # Scope must be "subpkg" relative to outer git repo
+    assert calib_auto.get("scope") == "subpkg"
+
+
+def test_scan_target_differential_calibration_replacement_model(tmp_path: Path) -> None:
+    """Verifies that differential scan uses replacement approximation max(df_local, df_global) preventing double-counting."""
+    from pydoppelgangerhunt.baseline import _serialize_shingle_key
+    from pydoppelgangerhunt.matcher import harvest_file_units
+
+    repo = tmp_path / "diff_repo"
+    repo.mkdir()
+    f1 = repo / "a.py"
+    f2 = repo / "b.py"
+
+    code1 = (
+        "def compute_alpha(a, b):\n"
+        "    res = a * 10 + b\n"
+        "    return res * 2\n"
+    )
+    code2 = (
+        "def compute_beta(a, b):\n"
+        "    res = a * 10 + b\n"
+        "    return res * 2\n"
+    )
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+
+    # Harvest shingles of compute_alpha
+    units = harvest_file_units(str(f1), str(repo), min_lines=3)
+    assert len(units) >= 1
+    sample_unit = units[0]
+    shingles = sample_unit.get("shingles") or []
+    assert len(shingles) >= 1
+
+    # Calibrate: 10 units total, max_index_frequency = 0.35 -> max_posting_len = floor(10 * 0.35) = 3
+    # Set df_global = 3 for all shingles of the sample unit
+    calib_shingle_freqs = {_serialize_shingle_key(sh): 3 for sh in shingles}
+    corpus_calib = {
+        "total_units": 10,
+        "max_index_frequency": 0.35,
+        "min_corpus_size": 4,
+        "global_stop_shingles": [],
+        "shingle_frequencies": calib_shingle_freqs,
+    }
+
+    # Under replacement model:
+    # f1 is in diff_files, so df_local = 1.
+    # combined_df = max(df_local, df_global) = max(1, 3) = 3 <= 3 (retained, clone discovered!)
+    # Under old additive model:
+    # combined_df = 1 + 3 = 4 > 3 (would be pruned as ubiquitous, missing the clone!)
+    clones = scan_target(
+        str(repo),
+        diff_files=["a.py"],
+        corpus_calibration=corpus_calib,
+        min_lines=3,
+        threshold=0.80,
+    )
+    assert len(clones) >= 1
+
+
+def test_scan_target_differential_calibration_conservative_pruning_removal(tmp_path: Path) -> None:
+    """Verifies that conservative candidate pruning retains shingles when baseline df > cutoff but actual df <= cutoff due to removals."""
+    from pydoppelgangerhunt.baseline import _serialize_shingle_key
+    from pydoppelgangerhunt.matcher import harvest_file_units
+
+    repo = tmp_path / "diff_removal_repo"
+    repo.mkdir()
+    f1 = repo / "a.py"
+    f2 = repo / "b.py"
+    f3 = repo / "c.py"
+
+    code1 = (
+        "def compute_alpha(a, b):\n"
+        "    res = a * 10 + b\n"
+        "    return res * 2\n"
+    )
+    code2 = (
+        "def compute_beta(a, b):\n"
+        "    res = a * 10 + b\n"
+        "    return res * 2\n"
+    )
+    # c.py was modified in this PR to remove the clone shingle
+    code3 = (
+        "def unrelated_worker(x):\n"
+        "    msg = 'hello ' + str(x)\n"
+        "    return msg.upper()\n"
+    )
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+    f3.write_text(code3, encoding="utf-8")
+
+    units = harvest_file_units(str(f1), str(repo), min_lines=3)
+    assert len(units) >= 1
+    sample_unit = units[0]
+    shingles = sample_unit.get("shingles") or []
+    assert len(shingles) >= 1
+
+    # Cutoff = 3 (10 units total, max_index_frequency = 0.35 -> max_posting_len = floor(10 * 0.35) = 3)
+    # Baseline global df = cutoff + 1 = 4.
+    # At baseline: two modified units (a.py and c.py) contained the shingle.
+    # Current state: diff_files = ["a.py", "c.py"].
+    # Only one of those modified units (a.py) now contains the shingle (df_local = 1).
+    # Actual current df across corpus = 4 - 1 = 3 = cutoff.
+    # Under naive max(df_local, df_global) = max(1, 4) = 4 > 3 -> false-negative pruning.
+    # Under conservative candidate pruning:
+    # max_removals = len(diff_unit_indices) - df_local = 2 - 1 = 1.
+    # pruning_df = max(len(u_indices), df_global - max_removals) = max(2, 4 - 1) = 3 <= 3.
+    # Shingle is NOT pruned, detecting the clone between a.py and b.py.
+    calib_shingle_freqs = {_serialize_shingle_key(sh): 4 for sh in shingles}
+    corpus_calib = {
+        "total_units": 10,
+        "max_index_frequency": 0.35,
+        "min_corpus_size": 4,
+        "global_stop_shingles": [],
+        "shingle_frequencies": calib_shingle_freqs,
+    }
+
+    clones = scan_target(
+        str(repo),
+        diff_files=["a.py", "c.py"],
+        corpus_calibration=corpus_calib,
+        min_lines=3,
+        threshold=0.80,
+    )
+    assert len(clones) >= 1
+
+
+def test_find_calibration_mode_mismatch_identifies_all_incompatibilities() -> None:
+    """Verifies that _find_calibration_mode_mismatch pinpoints exact mismatch fields."""
+    from pydoppelgangerhunt.matcher import _find_calibration_mode_mismatch  # pylint: disable=import-outside-toplevel
+
+    # Non-dict
+    assert _find_calibration_mode_mismatch("not_a_dict") == "calibration metadata is not a dictionary"
+
+    # Valid base calibration
+    base = {
+        "bag_of_tokens": False,
+        "call_sequences": False,
+        "filter_stop_shingles": False,
+        "audit_tests": False,
+        "include_notebooks": False,
+        "max_index_frequency": 0.25,
+        "min_corpus_size": 4,
+        "min_frequency": 1,
+        "min_lines": 8,
+        "min_tokens": 15,
+        "excludes": ["tests"],
+        "scope": "src",
+    }
+    assert _find_calibration_mode_mismatch(base, excludes=["tests"], target_scope="src", min_corpus_size=4) is None
+
+    # Mismatch bag_of_tokens
+    assert "bag_of_tokens" in str(_find_calibration_mode_mismatch(base, bag_of_tokens=True, excludes=["tests"], target_scope="src"))
+
+    # Mismatch call_sequences
+    assert "call_sequences" in str(_find_calibration_mode_mismatch(base, call_sequences=True, excludes=["tests"], target_scope="src"))
+
+    # Mismatch filter_stop_shingles (calibrated with True, scan with False)
+    base_stop = dict(base, filter_stop_shingles=True)
+    assert "filter_stop_shingles" in str(_find_calibration_mode_mismatch(base_stop, filter_stop_shingles=False, excludes=["tests"], target_scope="src"))
+
+    # Mismatch audit_tests
+    assert "audit_tests" in str(_find_calibration_mode_mismatch(base, audit_tests=True, excludes=["tests"], target_scope="src"))
+
+    # Mismatch include_notebooks
+    assert "include_notebooks" in str(_find_calibration_mode_mismatch(base, include_notebooks=True, excludes=["tests"], target_scope="src"))
+
+    # Mismatch max_index_frequency
+    assert "max_index_frequency" in str(_find_calibration_mode_mismatch(base, max_index_frequency=0.50, excludes=["tests"], target_scope="src"))
+
+    # Mismatch min_frequency
+    assert "min_frequency" in str(_find_calibration_mode_mismatch(base, min_frequency=2, excludes=["tests"], target_scope="src"))
+
+    # Mismatch excludes
+    assert "excludes" in str(_find_calibration_mode_mismatch(base, excludes=["vendor"], target_scope="src"))
+
+    # Mismatch scope
+    assert "scope" in str(_find_calibration_mode_mismatch(base, excludes=["tests"], target_scope="other"))
+
+    # Malformed integer in bounds
+    malformed = dict(base, min_lines="invalid")
+    assert "min_lines (malformed integer)" in str(_find_calibration_mode_mismatch(malformed, excludes=["tests"], target_scope="src"))
+
+
+def test_scan_target_logs_info_on_incompatible_corpus_calibration(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies that scan_target logs an INFO message and falls back to full corpus scan on mismatched calibration."""
+    import logging
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    f = tmp_path / "mod.py"
+    f.write_text("def worker():\n    return 42\n", encoding="utf-8")
+
+    calib = {
+        "bag_of_tokens": True,
+        "call_sequences": False,
+        "filter_stop_shingles": False,
+        "total_units": 10,
+    }
+
+    with caplog.at_level(logging.INFO):
+        scan_target(str(tmp_path), corpus_calibration=calib, bag_of_tokens=False, min_lines=2)
+
+    assert any(
+        "Corpus calibration was discarded due to configuration mismatch" in record.message
+        and "bag_of_tokens" in record.message
+        for record in caplog.records
+    )
+
+
+def test_scan_target_novel_pair_budget_parameter(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies that scan_target respects explicit novel_pair_budget parameter."""
+    import logging
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    lines: list[str] = []
+    for i in range(3):
+        lines.append(
+            f"def fn_a_{i}(vx, vy):\n"
+            f"    novel_tok_a = vx + vy + {i}\n"
+            "    return novel_tok_a * 10\n"
+        )
+    for i in range(3):
+        lines.append(
+            f"def fn_b_{i}(va, vb):\n"
+            f"    novel_tok_b = va * vb + {i}\n"
+            "    return novel_tok_b * 20\n"
+        )
+    test_file = tmp_path / "budget_test.py"
+    test_file.write_text("\n".join(lines), encoding="utf-8")
+
+    calib = {
+        "total_units": 5000,
+        "max_index_frequency": 0.25,
+        "min_lines": 3,
+        "min_corpus_size": 4,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {},
+    }
+
+    # Pass novel_pair_budget=5: Group 1 takes 3 pairs (leaving 2), Group 2 needs 3 pairs (> 2), so skipped
+    with caplog.at_level(logging.DEBUG):
+        clones = scan_target(
+            str(tmp_path),
+            diff_files=["budget_test.py"],
+            min_lines=3,
+            threshold=0.70,
+            corpus_calibration=calib,
+            novel_pair_budget=5,
+        )
+
+    fn_a_clones = [c for c in clones if "fn_a_" in (c[1].get("name") or "") or "fn_a_" in (c[2].get("name") or "")]
+    fn_b_clones = [c for c in clones if "fn_b_" in (c[1].get("name") or "") or "fn_b_" in (c[2].get("name") or "")]
+    assert len(fn_a_clones) > 0
+    assert len(fn_b_clones) == 0
+    assert any("Novel shingle pair budget exceeded" in record.message for record in caplog.records)
+
+
+def test_find_calibration_mode_mismatch_symmetric_scope_normalization() -> None:
+    """Verifies that empty/root target scopes ('/' or '.') match calibrated None scope symmetrically."""
+    from pydoppelgangerhunt.matcher import _find_calibration_mode_mismatch  # pylint: disable=import-outside-toplevel
+
+    calib = {
+        "bag_of_tokens": False,
+        "call_sequences": False,
+        "filter_stop_shingles": False,
+        "audit_tests": False,
+        "include_notebooks": False,
+        "scope": None,
+    }
+    # Passing target_scope="/" or "." must not trigger a false scope mismatch
+    assert _find_calibration_mode_mismatch(calib, target_scope="/") is None
+    assert _find_calibration_mode_mismatch(calib, target_scope=".") is None
+    assert _find_calibration_mode_mismatch(calib, target_scope="") is None
+    assert _find_calibration_mode_mismatch(calib, target_scope=None) is None
+    # Truly distinct scope must still mismatch
+    mismatch = _find_calibration_mode_mismatch(calib, target_scope="packages/sub")
+    assert mismatch is not None
+    assert "scope" in mismatch
+
+
+def test_scan_target_conservative_candidate_pruning_accounts_for_deleted_baseline_units(
+    tmp_path: Path,
+) -> None:
+    """Verifies that candidate pruning accounts for deleted baseline units, preventing false negatives.
+
+    Scenario:
+    - Baseline had 4 units: a.py, b.py, c.py, and deleted.py, all sharing a clone shingle.
+      df_global = 4, total_units = 4.
+    - Cutoff is 3 (max_index_frequency = 0.75 -> ceil(4 * 0.75) = 3).
+    - Current working tree: deleted.py was deleted; a.py was modified and retains the shingle.
+      b.py and c.py are unchanged.
+    - Old formula: max_removals = len(diff_unit_indices) - df_local = 1 - 1 = 0,
+      so pruning_df = max(3, 4 - 0) = 4 > 3 -> false-negative pruning!
+    - New formula: unchanged_units = 3 - 1 = 2 (b.py, c.py).
+      max_touched = 4 - 2 = 2 (a.py and deleted.py).
+      max_removals = max_touched - df_local = 2 - 1 = 1.
+      pruning_df = max(3, 4 - 1) = 3 <= 3 -> not pruned, detecting clone with modified a.py!
+    """
+    from pydoppelgangerhunt.baseline import _serialize_shingle_key  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.matcher import harvest_file_units  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "deleted_unit_repo"
+    repo.mkdir()
+    clone_code_a = (
+        "def compute_alpha(x, y):\n"
+        "    res = x * 10 + y * 5\n"
+        "    for step in range(5):\n"
+        "        res += step\n"
+        "    return res\n"
+    )
+    clone_code_b = (
+        "def compute_alpha_clone(x, y):\n"
+        "    res = x * 10 + y * 5\n"
+        "    for step in range(5):\n"
+        "        res += step\n"
+        "    return res\n"
+    )
+    code_c = (
+        "def helper_c(val):\n"
+        "    total = 0\n"
+        "    for i in range(10):\n"
+        "        total += i * val\n"
+        "    return total\n"
+    )
+    f_a = repo / "a.py"
+    f_b = repo / "b.py"
+    f_c = repo / "c.py"
+    f_a.write_text(clone_code_a, encoding="utf-8")
+    f_b.write_text(clone_code_b, encoding="utf-8")
+    f_c.write_text(code_c, encoding="utf-8")
+
+    units_a = harvest_file_units(str(f_a), str(repo), min_lines=3)
+    assert len(units_a) >= 1
+    shingles = units_a[0].get("shingles") or []
+    assert len(shingles) >= 1
+
+    calib_freqs = {_serialize_shingle_key(sh): 4 for sh in shingles}
+    corpus_calib = {
+        "total_units": 4,
+        "max_index_frequency": 0.75,
+        "min_corpus_size": 3,
+        "global_stop_shingles": [],
+        "shingle_frequencies": calib_freqs,
+    }
+
+    # diff_files includes modified a.py and deleted deleted.py
+    clones = scan_target(
+        str(repo),
+        diff_files=["a.py", "deleted.py"],
+        corpus_calibration=corpus_calib,
+        min_lines=3,
+        threshold=0.80,
+    )
+    # The clone between modified a.py and unchanged b.py must be detected
+    assert len(clones) >= 1
+    assert any(
+        ("a.py" in str(c[1].get("file")) and "b.py" in str(c[2].get("file")))
+        or ("b.py" in str(c[1].get("file")) and "a.py" in str(c[2].get("file")))
+        for c in clones
+    )
+
+
+

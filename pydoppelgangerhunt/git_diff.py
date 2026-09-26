@@ -2,24 +2,101 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.config import find_matching_path_value, normalize_path_string
+
+logger = logging.getLogger(__name__)
 
 MAJOR_POLICY_THRESHOLD: float = 0.50
 NEW_POLICY_THRESHOLD: float = 0.80
 
 
+class DiffRangeMap(Dict[str, List[Tuple[int, int]]]):
+    """Stores modified line ranges with isolated target-relative and repo-relative coordinate sets.
+
+    Prevents coordinate collisions between target-relative and repository-relative paths
+    (e.g., distinguishing repo/src/src/foo.py from repo/src/foo.py during subdirectory scans).
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        target_ranges: Optional[Dict[str, List[Tuple[int, int]]]] = None,
+        repo_ranges: Optional[Dict[str, List[Tuple[int, int]]]] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.target_ranges: Dict[str, List[Tuple[int, int]]] = dict(target_ranges or {})
+        self.repo_ranges: Dict[str, List[Tuple[int, int]]] = dict(repo_ranges or {})
+
+    def get_ranges_for_unit(
+        self,
+        unit: Dict[str, Any],
+        unit_basis: str = "repo",
+    ) -> Optional[List[Tuple[int, int]]]:
+        """Looks up modified ranges for a unit based on its coordinate basis."""
+        raw_file = str(unit.get("file") or "")
+        f_norm = normalize_path_string(raw_file, strip_anchor=True)
+        if not f_norm:
+            return None
+
+        # 1. Coordinate-isolated lookup based on unit_basis
+        if unit_basis == "repo" and self.repo_ranges:
+            if f_norm in self.repo_ranges:
+                return self.repo_ranges[f_norm]
+        elif unit_basis == "target" and self.target_ranges:
+            if f_norm in self.target_ranges:
+                return self.target_ranges[f_norm]
+
+        # 2. Tagged lookup fallback (e.g. repo:<path> or target:<path>)
+        tagged_key = f"{unit_basis}:{f_norm}"
+        if tagged_key in self:
+            return self[tagged_key]
+
+        # 3. Direct un-tagged dict key lookup
+        # Do not fall back to un-tagged dictionary keys if the requested coordinate
+        # basis already has an authoritative coordinate set that did not match.
+        if unit_basis == "repo" and self.repo_ranges:
+            return None
+        if unit_basis == "target" and self.target_ranges:
+            return None
+
+        return self.get(f_norm)
+
+_GIT_C_ESCAPES: Dict[int, int] = {
+    ord(b"a"): 0x07,
+    ord(b"b"): 0x08,
+    ord(b"t"): 0x09,
+    ord(b"n"): 0x0A,
+    ord(b"v"): 0x0B,
+    ord(b"f"): 0x0C,
+    ord(b"r"): 0x0D,
+    ord(b'"'): 0x22,
+    ord(b"\\"): 0x5C,
+}
+
+
 def _run_git_command(args: Sequence[str], cwd: Optional[str] = None) -> Optional[str]:
     """Executes a git command safely and returns standard output, or None on failure."""
+    effective_cwd = cwd or os.getcwd()
+    try:
+        if effective_cwd and os.path.isfile(effective_cwd):
+            effective_cwd = os.path.dirname(effective_cwd) or "."
+    except (OSError, ValueError):
+        pass
     try:
         proc = subprocess.run(
             ["git", *args],
-            cwd=cwd or os.getcwd(),
+            cwd=effective_cwd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
         if proc.returncode == 0:
@@ -29,26 +106,121 @@ def _run_git_command(args: Sequence[str], cwd: Optional[str] = None) -> Optional
     return None
 
 
-def parse_git_diff_hunks(diff_text: str) -> Dict[str, List[Tuple[int, int]]]:
-    """Parses unified diff output into mapping of file paths to changed line ranges."""
+def _decode_git_cstyle_path(raw_path: str) -> str:
+    """Decodes C-style octal and escape sequences in git quotepath strings while preserving literal UTF-8."""
+    trimmed = raw_path.rstrip("\r\n")
+    if not trimmed or not trimmed.strip():
+        return ""
+    if trimmed.startswith('"') and trimmed.endswith('"') and len(trimmed) >= 2:
+        inner = trimmed[1:-1]
+        try:
+            raw_bytes = bytearray()
+            inner_bytes = inner.encode("utf-8", errors="replace")
+            i = 0
+            n = len(inner_bytes)
+            while i < n:
+                b = inner_bytes[i]
+                if b == 0x5C and i + 1 < n:
+                    nxt = inner_bytes[i + 1]
+                    if 0x30 <= nxt <= 0x37:
+                        octal_val = nxt - 0x30
+                        i += 2
+                        for _ in range(2):
+                            if i < n and 0x30 <= inner_bytes[i] <= 0x37:
+                                octal_val = (octal_val << 3) + (inner_bytes[i] - 0x30)
+                                i += 1
+                            else:
+                                break
+                        raw_bytes.append(octal_val & 0xFF)
+                        continue
+                    if nxt in _GIT_C_ESCAPES:
+                        raw_bytes.append(_GIT_C_ESCAPES[nxt])
+                        i += 2
+                        continue
+                    raw_bytes.append(nxt)
+                    i += 2
+                    continue
+                raw_bytes.append(b)
+                i += 1
+            return raw_bytes.decode("utf-8", errors="replace")
+        except (UnicodeError, ValueError):
+            return inner
+    return trimmed
+
+
+def _extract_diff_header_path(line_header: str) -> Optional[str]:
+    """Extracts decoded file path from a unified diff --- or +++ header line."""
+    rest = line_header.rstrip("\r\n")
+    if rest.startswith('"'):
+        closing_idx = rest.rfind('"')
+        if 0 < closing_idx < len(rest) - 1:
+            rest = rest[: closing_idx + 1]
+    elif "\t" in rest:
+        rest = rest.split("\t", 1)[0]
+    rest = _decode_git_cstyle_path(rest)
+    if rest in ("/dev/null", ""):
+        return None
+    return rest
+
+
+def parse_git_diff_hunks(
+    diff_text: str,
+    strip_prefix: Optional[bool] = None,
+) -> Dict[str, List[Tuple[int, int]]]:
+    """Parses unified diff output into mapping of file paths to changed line ranges.
+
+    Args:
+        diff_text: Raw unified diff output string.
+        strip_prefix: Explicit prefix stripping control:
+            - True: always strip standard destination prefixes (e.g. b/, i/, w/, c/).
+            - False: preserve path strings verbatim without prefix stripping.
+            - None (default): automatically infer from diff headers. Preserves identical
+              source/dest pairs (e.g. --no-prefix diffs with paths like b/worker.py)
+              while stripping standard paired prefixes (e.g. a/file.py -> b/file.py).
+    """
     modified_ranges: Dict[str, List[Tuple[int, int]]] = {}
     current_file: Optional[str] = None
+    last_source_file: Optional[str] = None
 
     for line in diff_text.splitlines():
         if line.startswith("--- "):
             current_file = None
+            last_source_file = _extract_diff_header_path(line[4:])
         elif line.startswith("+++ "):
-            rest = line[4:].strip()
-            if "\t" in rest:
-                rest = rest.split("\t", 1)[0].strip()
-            if rest.startswith('"') and rest.endswith('"') and len(rest) >= 2:
-                rest = rest[1:-1]
-            if rest in ("/dev/null", ""):
+            dst = _extract_diff_header_path(line[4:])
+            if not dst:
                 current_file = None
             else:
-                if len(rest) > 2 and rest[1] == "/" and rest[0] in "biwc":
-                    rest = rest[2:]
-                current_file = normalize_path_string(rest.strip('"'), strip_anchor=False)
+                has_dest_prefix = len(dst) > 2 and dst[1] == "/" and dst[0] in "biwc"
+                if strip_prefix is True:
+                    should_strip = has_dest_prefix
+                elif strip_prefix is False:
+                    should_strip = False
+                else:
+                    # Auto-detect: if source and destination paths match identically,
+                    # the diff was produced without prefixes (--no-prefix); preserve b/worker.py.
+                    if last_source_file is not None:
+                        src_str = str(last_source_file)
+                        if src_str == dst:
+                            should_strip = False
+                        elif (
+                            has_dest_prefix
+                            and src_str.startswith(("a/", "i/", "w/", "c/"))
+                            and src_str[2:] == dst[2:]
+                        ):
+                            should_strip = True
+                        elif has_dest_prefix:
+                            should_strip = True
+                        else:
+                            should_strip = False
+                    elif has_dest_prefix:
+                        should_strip = True
+                    else:
+                        should_strip = False
+
+                if should_strip:
+                    dst = dst[2:]
+                current_file = normalize_path_string(dst, strip_anchor=False)
         elif line.startswith("@@ ") and current_file:
             parts = line.split(" ")
             plus_parts = [p for p in parts if p.startswith("+")]
@@ -70,27 +242,107 @@ def parse_git_diff_hunks(diff_text: str) -> Dict[str, List[Tuple[int, int]]]:
     return modified_ranges
 
 
+def _run_git_diff(
+    diff_flags: Sequence[str],
+    since_ref: Optional[str] = None,
+    cwd: Optional[str] = None,
+) -> Optional[str]:
+    """Builds and executes a safe git diff command isolating revisions from pathspecs."""
+    clean_ref = since_ref.strip() if since_ref else None
+    if clean_ref and clean_ref.startswith("-"):
+        return None
+    args = ["diff", *diff_flags]
+    if clean_ref:
+        args.extend([clean_ref, "--"])
+    else:
+        args.append("--")
+    return _run_git_command(args, cwd=cwd)
+
+
 def get_git_modified_line_ranges(
     since_ref: Optional[str] = None,
     repo_root: Optional[str] = None,
     cwd: Optional[str] = None,
 ) -> Dict[str, List[Tuple[int, int]]]:
     """Extracts modified line ranges for files using git diff --unified=0."""
-    args = ["diff", "--unified=0", "--src-prefix=a/", "--dst-prefix=b/"]
-    if since_ref:
-        args.append(since_ref)
-
-    effective_cwd = repo_root or cwd
-    diff_output = _run_git_command(args, cwd=effective_cwd)
+    diff_output = _run_git_diff(
+        ["--unified=0", "--src-prefix=a/", "--dst-prefix=b/"],
+        since_ref=since_ref,
+        cwd=repo_root or cwd,
+    )
     if not diff_output:
         return {}
 
-    return parse_git_diff_hunks(diff_output)
+    return parse_git_diff_hunks(diff_output, strip_prefix=True)
+
+
+def get_git_modified_files(
+    since_ref: Optional[str] = None,
+    repo_root: Optional[str] = None,
+    cwd: Optional[str] = None,
+) -> List[str]:
+    """Extracts normalized file paths of modified files from git diff."""
+    diff_output = _run_git_diff(
+        ["--name-only"],
+        since_ref=since_ref,
+        cwd=repo_root or cwd,
+    )
+    if not diff_output:
+        return []
+    modified_files: List[str] = []
+    for line in diff_output.splitlines():
+        trimmed = _decode_git_cstyle_path(line)
+        if trimmed:
+            norm = normalize_path_string(trimmed, strip_anchor=False)
+            if norm and norm not in modified_files:
+                modified_files.append(norm)
+    return modified_files
+
+
+def get_git_repo_root(
+    since_ref: Optional[str] = None,
+    repo_root: Optional[Union[str, Path]] = None,
+    cwd: Optional[Union[str, Path]] = None,
+) -> Optional[str]:
+    """Resolves the top-level root directory of the current Git worktree, or None if not in a repository.
+
+    Note:
+        The since_ref parameter is accepted for signature compatibility with
+        polymorphic git diff helper invocations in _safe_call_git_diff_helper,
+        but is not utilized for repository root discovery.
+    """
+    _ = since_ref
+    target_cwd = str(repo_root or cwd) if (repo_root or cwd) else None
+    raw = _run_git_command(["rev-parse", "--show-toplevel"], cwd=target_cwd)
+    if not raw:
+        return None
+    top = raw.rstrip("\r\n")
+    if top and top.strip():
+        return normalize_path_string(top, strip_anchor=False)
+    return None
+
+
+def get_git_head_commit(
+    repo_root: Optional[Union[str, Path]] = None,
+    cwd: Optional[Union[str, Path]] = None,
+) -> Optional[str]:
+    """Resolves the current HEAD commit hash of the Git repository, or None if not available."""
+    target_cwd = str(repo_root or cwd) if (repo_root or cwd) else None
+    raw = _run_git_command(["rev-parse", "HEAD"], cwd=target_cwd)
+    if not raw:
+        return None
+    commit = raw.strip()
+    if len(commit) in (40, 64) and all(c in "0123456789abcdefABCDEF" for c in commit):
+        return commit.lower()
+    return None
+
+
 
 
 def compute_unit_diff_overlap(
     unit: Dict[str, Any],
     modified_ranges: Dict[str, List[Tuple[int, int]]],
+    unit_basis: str = "repo",
 ) -> Tuple[int, float]:
     """Computes the number of modified lines and the fractional overlap ratio for an AST unit.
 
@@ -115,7 +367,29 @@ def compute_unit_diff_overlap(
         >>> overlap_ratio
         0.625
     """
-    target_ranges = find_matching_path_value(str(unit.get("file") or ""), modified_ranges)
+    target_ranges: Optional[List[Tuple[int, int]]] = None
+    if isinstance(modified_ranges, DiffRangeMap) or hasattr(modified_ranges, "get_ranges_for_unit"):
+        target_ranges = modified_ranges.get_ranges_for_unit(unit, unit_basis=unit_basis)
+    elif hasattr(modified_ranges, "repo_ranges") and unit_basis == "repo":
+        repo_map = getattr(modified_ranges, "repo_ranges")
+        if isinstance(repo_map, dict):
+            raw_f = str(unit.get("file") or "")
+            f_norm = normalize_path_string(raw_f, strip_anchor=True)
+            target_ranges = repo_map.get(f_norm)
+    elif hasattr(modified_ranges, "target_ranges") and unit_basis == "target":
+        target_map = getattr(modified_ranges, "target_ranges")
+        if isinstance(target_map, dict):
+            raw_f = str(unit.get("file") or "")
+            f_norm = normalize_path_string(raw_f, strip_anchor=True)
+            target_ranges = target_map.get(f_norm)
+    else:
+        raw_f = str(unit.get("file") or "")
+        f_norm = normalize_path_string(raw_f, strip_anchor=True)
+        if f_norm in modified_ranges:
+            target_ranges = modified_ranges[f_norm]
+        else:
+            target_ranges = find_matching_path_value(raw_f, modified_ranges)
+
     if not target_ranges:
         return 0, 0.0
 
@@ -140,6 +414,7 @@ def is_unit_in_modified_ranges(
     modified_ranges: Dict[str, List[Tuple[int, int]]],
     min_overlap_ratio: float = 0.0,
     policy: str = "any",
+    unit_basis: str = "repo",
 ) -> bool:
     """Checks if AST unit overlaps with git-modified line ranges according to the partial hunk policy.
 
@@ -148,7 +423,9 @@ def is_unit_in_modified_ranges(
         - "major": Overlaps if at least 50% of the unit lines are modified (or min_overlap_ratio if > 0).
         - "new": Overlaps if at least 80% of the unit lines are modified (or min_overlap_ratio if > 0).
     """
-    overlap_count, ratio = compute_unit_diff_overlap(unit, modified_ranges)
+    overlap_count, ratio = compute_unit_diff_overlap(
+        unit, modified_ranges, unit_basis=unit_basis
+    )
     if overlap_count == 0:
         return False
 
@@ -168,24 +445,66 @@ def filter_clones_by_git_diff(
     policy: str = "any",
     min_overlap_ratio: float = 0.0,
     both_units: bool = False,
+    unit_basis: str = "repo",
 ) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]:
     """Filters clones based on git-modified line ranges and partial hunk policy."""
     if not modified_ranges:
         return []
     filtered: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
+    matched_units_count = 0
+    total_units_count = 0
     for sim, u1, u2 in clones:
+        total_units_count += 2
         u1_mod = is_unit_in_modified_ranges(
-            u1, modified_ranges, min_overlap_ratio=min_overlap_ratio, policy=policy
+            u1, modified_ranges, min_overlap_ratio=min_overlap_ratio, policy=policy, unit_basis=unit_basis
         )
         u2_mod = is_unit_in_modified_ranges(
-            u2, modified_ranges, min_overlap_ratio=min_overlap_ratio, policy=policy
+            u2, modified_ranges, min_overlap_ratio=min_overlap_ratio, policy=policy, unit_basis=unit_basis
         )
+        if u1_mod:
+            matched_units_count += 1
+        if u2_mod:
+            matched_units_count += 1
         if both_units:
             if u1_mod and u2_mod:
                 filtered.append((sim, u1, u2))
         else:
             if u1_mod or u2_mod:
                 filtered.append((sim, u1, u2))
+
+    if clones and matched_units_count == 0:
+        if isinstance(modified_ranges, DiffRangeMap) or (
+            hasattr(modified_ranges, "repo_ranges") and hasattr(modified_ranges, "target_ranges")
+        ):
+            target_map = getattr(modified_ranges, "target_ranges", {})
+            repo_map = getattr(modified_ranges, "repo_ranges", {})
+            active_coord_set = repo_map if unit_basis == "repo" else target_map
+            alt_coord_set = target_map if unit_basis == "repo" else repo_map
+            if active_coord_set:
+                alt_basis = "target" if unit_basis == "repo" else "repo"
+                alt_matches = 0
+                for _, u1, u2 in clones:
+                    for u in (u1, u2):
+                        rf = str(u.get("file") or "")
+                        fn = normalize_path_string(rf, strip_anchor=True)
+                        if fn and fn in alt_coord_set:
+                            alt_matches += 1
+                if alt_matches > 0:
+                    logger.debug(
+                        "DiffRangeMap lookup with authoritative coordinate set '%s' came back empty across all %d unit(s), "
+                        "but %d unit(s) matched alternative basis '%s'. Possible basis mismatch.",
+                        unit_basis,
+                        total_units_count,
+                        alt_matches,
+                        alt_basis,
+                    )
+                else:
+                    logger.debug(
+                        "DiffRangeMap lookup with authoritative coordinate set '%s' came back empty across all %d unit(s).",
+                        unit_basis,
+                        total_units_count,
+                    )
+
     return filtered
 
 
@@ -201,7 +520,7 @@ def get_git_blame_info(
         return {"author": "Unknown", "commit": "unknown", "timestamp": 0, "summary": ""}
     start_l = max(1, start_line)
     end_l = max(start_l, end_line)
-    args = ["blame", "-L", f"{start_l},{end_l}", "--porcelain", norm_file]
+    args = ["blame", "-L", f"{start_l},{end_l}", "--porcelain", "--", norm_file]
 
     blame_text = _run_git_command(args, cwd=repo_root)
     if not blame_text:

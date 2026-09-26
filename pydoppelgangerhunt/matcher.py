@@ -3,13 +3,37 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
+import logging
 import math
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Set, Tuple, Union, overload
 
-from pydoppelgangerhunt.config import canonical_path_key, find_python_files
+from pydoppelgangerhunt.canonical_path import (
+    CanonicalPathResolver,
+    build_diff_path_keys,
+    normalize_lexical_posix,
+)
+from pydoppelgangerhunt.config import (
+    canonical_path_key,
+    find_python_files,
+)
+from pydoppelgangerhunt.git_diff import get_git_repo_root
+from pydoppelgangerhunt.baseline import (
+    HARVEST_BOOLEAN_MODES,
+    _safe_bool,
+    _safe_index_frequency,
+    _safe_int,
+    _safe_min_corpus,
+    _safe_total_units,
+    compute_calibration_config_hash,
+)
 from pydoppelgangerhunt.parser import harvest_file_units
+
+logger = logging.getLogger(__name__)
+
+MAX_NOVEL_SHINGLE_PAIR_BUDGET: int = 10_000
 
 DEFAULT_STOP_SHINGLES: Set[Tuple[str, ...]] = {
     # Main guard boilerplate: if __name__ == "__main__":
@@ -90,6 +114,13 @@ def _normalize_exemption_endpoint(
 def _sorted_pair(a: str, b: str) -> Tuple[str, str]:
     """Returns an order-invariant sorted 2-tuple of two string keys."""
     return (a, b) if a <= b else (b, a)
+
+
+def _shingle_sort_key(k: Any) -> Tuple[int, Any]:
+    """Fast, deterministic sort key for shingle indexing without JSON serialization overhead."""
+    if isinstance(k, tuple):
+        return (0, tuple((type(x).__name__, x if isinstance(x, (int, float, str)) else str(x)) for x in k))
+    return (1, str(k))
 
 
 
@@ -492,18 +523,395 @@ def suppress_subclones(
     return [c for idx, c in enumerate(clones) if idx not in suppressed_indices]
 
 
+
+
+def _lookup_calib_freq(calib_freqs: Optional[Dict[Any, Any]], key: Any) -> Optional[Any]:
+    """Looks up a shingle key in calibration frequencies supporting tuples, tagged keys, and legacy keys."""
+    if not calib_freqs or not isinstance(calib_freqs, dict):
+        return None
+    val = calib_freqs.get(key)
+    if val is not None:
+        return val
+    if isinstance(key, (tuple, list)):
+        try:
+            dumped = json.dumps(list(key))
+            val = calib_freqs.get("t:" + dumped)
+            if val is not None:
+                return val
+            val = calib_freqs.get(dumped)
+            if val is not None:
+                return val
+        except (TypeError, ValueError):
+            pass
+    elif isinstance(key, str):
+        val = calib_freqs.get("s:" + key)
+        if val is not None:
+            return val
+    elif isinstance(key, bool):
+        val = calib_freqs.get("b:" + ("1" if key else "0"))
+        if val is not None:
+            return val
+    elif isinstance(key, int):
+        val = calib_freqs.get("i:" + str(key))
+        if val is not None:
+            return val
+    elif isinstance(key, float):
+        val = calib_freqs.get("f:" + str(key))
+        if val is not None:
+            return val
+    return None
+
+
+def _compute_max_posting_len(
+    total_units: int,
+    freq: Optional[float],
+    min_corpus: int,
+    fallback: Optional[int] = None,
+) -> Optional[int]:
+    """Calculates max posting length for frequency-based pruning, handling overflow safely."""
+    try:
+        if freq is not None and int(total_units) >= int(min_corpus):
+            posting_float = total_units * freq
+            if math.isfinite(posting_float):
+                return max(2, int(math.ceil(posting_float)))
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return fallback
+
+
+def _resolve_git_root_path(target: Union[str, Path]) -> Optional[Path]:
+    """Resolves Git worktree root as an absolute Path, or None if not in a git repository."""
+    target_dir: Union[str, Path]
+    try:
+        t_p = Path(target)
+        target_dir = t_p.parent if (t_p.is_file() or (not t_p.is_dir() and t_p.suffix.lower() in (".py", ".ipynb"))) else t_p
+    except (ValueError, OSError, RuntimeError):
+        target_dir = target
+    raw_root = get_git_repo_root(repo_root=target_dir)
+    if raw_root:
+        try:
+            p = Path(raw_root).resolve()
+            if p.exists():
+                return p
+        except (ValueError, OSError, RuntimeError):
+            pass
+    return None
+
+
+def _add_candidate_pairs(
+    candidate_pairs: Set[Tuple[int, int]],
+    indices: Sequence[int],
+    diff_unit_indices: Optional[Set[int]] = None,
+) -> None:
+    """Populates candidate pairs from posting list, filtering by diff units if active."""
+    if diff_unit_indices is None:
+        for i, idx1 in enumerate(indices):
+            for idx2 in indices[i + 1:]:
+                candidate_pairs.add((idx1, idx2))
+        return
+
+    diff_in: List[int] = []
+    diff_out: List[int] = []
+    for idx in indices:
+        if idx in diff_unit_indices:
+            diff_in.append(idx)
+        else:
+            diff_out.append(idx)
+
+    if not diff_in:
+        return
+
+    for i, idx1 in enumerate(diff_in):
+        for idx2 in diff_in[i + 1:]:
+            candidate_pairs.add((idx1, idx2))
+
+    for idx1 in diff_in:
+        for idx2 in diff_out:
+            candidate_pairs.add((idx1, idx2) if idx1 < idx2 else (idx2, idx1))
+
+
+def _extract_unit_shingle_keys(
+    u: Dict[str, Any],
+    *,
+    call_sequences: bool = False,
+    bag_of_tokens: bool = False,
+) -> Set[Any]:
+    """Extracts shingle keys for indexing, DF counting, or TF-IDF weighting."""
+    if call_sequences:
+        return set(u.get("calls") or ())
+    if bag_of_tokens:
+        return set(u.get("vector") or ())
+    return set(u.get("shingles") or ())
+
+
+def _build_calibration_metadata(
+    units: Sequence[Dict[str, Any]],
+    *,
+    max_index_frequency: Optional[float],
+    min_corpus_size: Optional[int],
+    filter_stop_shingles: bool,
+    stop_shingles: Optional[Set[Any]],
+    bag_of_tokens: bool,
+    call_sequences: bool,
+    audit_tests: bool = False,
+    include_notebooks: bool = False,
+    excludes: Optional[Sequence[str]] = None,
+    scope: Optional[str] = None,
+    target_repo_relative: Optional[str] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Helper to compute baseline corpus calibration dictionary."""
+    from pydoppelgangerhunt.baseline import compute_corpus_calibration
+    return compute_corpus_calibration(
+        units,
+        max_index_frequency=max_index_frequency,
+        min_corpus_size=min_corpus_size,
+        filter_stop_shingles=filter_stop_shingles,
+        stop_shingles=stop_shingles,
+        bag_of_tokens=bag_of_tokens,
+        call_sequences=call_sequences,
+        audit_tests=audit_tests,
+        include_notebooks=include_notebooks,
+        excludes=excludes,
+        scope=scope,
+        target_repo_relative=target_repo_relative,
+        **kwargs,
+    )
+
+
+def _find_calibration_mode_mismatch(
+    calib: Any,
+    *,
+    bag_of_tokens: bool = False,
+    call_sequences: bool = False,
+    filter_stop_shingles: bool = False,
+    audit_tests: bool = False,
+    include_notebooks: bool = False,
+    max_index_frequency: Optional[float] = 0.25,
+    min_corpus_size: Optional[int] = None,
+    min_frequency: int = 1,
+    excludes: Optional[Sequence[str]] = None,
+    target_scope: Optional[str] = None,
+    **kwargs: Any,
+) -> Optional[str]:
+    """Validates that corpus calibration was generated with compatible representation, filtering, and AST shaping features.
+
+    Returns:
+        A human-readable description of the first mismatched setting, or None if compatible.
+    """
+    if not isinstance(calib, dict):
+        return "calibration metadata is not a dictionary"
+    calib_hash = calib.get("config_hash")
+    clean_active_ex = sorted({
+        str(x).replace("\\", "/").rstrip("\r\n").strip()
+        for x in (excludes or [])
+        if str(x).strip()
+    })
+    if calib_hash:
+        persisted_calib_hash = compute_calibration_config_hash(calib)
+        if calib_hash == persisted_calib_hash:
+            effective_mcs = min_corpus_size if min_corpus_size is not None else calib.get("min_corpus_size")
+            active_cfg = dict(kwargs)
+            active_cfg.update({
+                "bag_of_tokens": bag_of_tokens,
+                "call_sequences": call_sequences,
+                "filter_stop_shingles": filter_stop_shingles,
+                "audit_tests": audit_tests,
+                "include_notebooks": include_notebooks,
+                "max_index_frequency": max_index_frequency,
+                "min_corpus_size": effective_mcs,
+                "min_frequency": min_frequency,
+                "excludes": clean_active_ex,
+                "scope": target_scope,
+            })
+            if calib_hash == compute_calibration_config_hash(active_cfg):
+                return None
+    if _safe_bool(calib.get("bag_of_tokens", False)) != bool(bag_of_tokens):
+        return f"bag_of_tokens (calibrated: {calib.get('bag_of_tokens', False)}, scan: {bag_of_tokens})"
+    if _safe_bool(calib.get("call_sequences", False)) != bool(call_sequences):
+        return f"call_sequences (calibrated: {calib.get('call_sequences', False)}, scan: {call_sequences})"
+    if _safe_bool(calib.get("filter_stop_shingles", False)) and not filter_stop_shingles:
+        return "filter_stop_shingles (calibrated with stop-shingles, but disabled in scan)"
+    if _safe_bool(calib.get("audit_tests", False)) != bool(audit_tests):
+        return f"audit_tests (calibrated: {calib.get('audit_tests', False)}, scan: {audit_tests})"
+    if _safe_bool(calib.get("include_notebooks", False)) != bool(include_notebooks):
+        return f"include_notebooks (calibrated: {calib.get('include_notebooks', False)}, scan: {include_notebooks})"
+
+    raw_calib_ex = calib.get("excludes")
+    calib_ex = (
+        sorted({
+            str(x).replace("\\", "/").rstrip("\r\n").strip()
+            for x in raw_calib_ex
+            if str(x).strip()
+        })
+        if isinstance(raw_calib_ex, (list, tuple, set))
+        else []
+    )
+    if calib_ex != clean_active_ex:
+        return f"excludes (calibrated: {calib_ex}, scan: {clean_active_ex})"
+
+    if min_corpus_size is not None:
+        scan_mcs = _safe_min_corpus(min_corpus_size, filter_stop_shingles)
+        calib_mcs = _safe_min_corpus(calib.get("min_corpus_size"), filter_stop_shingles)
+        if scan_mcs != calib_mcs:
+            return f"min_corpus_size (calibrated: {calib_mcs}, scan: {scan_mcs})"
+
+    calib_freq = (
+        _safe_index_frequency(calib["max_index_frequency"])
+        if "max_index_frequency" in calib
+        else 0.25
+    )
+    active_freq = _safe_index_frequency(max_index_frequency)
+    if (calib_freq is None) != (active_freq is None):
+        return f"max_index_frequency (calibrated: {calib_freq}, scan: {active_freq})"
+    if calib_freq is not None and active_freq is not None:
+        if not math.isclose(calib_freq, active_freq, rel_tol=1e-9, abs_tol=1e-12):
+            return f"max_index_frequency (calibrated: {calib_freq}, scan: {active_freq})"
+
+    calib_min_frequency = (
+        _safe_int(calib.get("min_frequency") or calib.get("min_calibration_frequency"), min_val=1)
+        or 1
+    )
+    active_min_frequency = _safe_int(min_frequency, min_val=1) or 1
+    if calib_min_frequency != active_min_frequency:
+        return f"min_frequency (calibrated: {calib_min_frequency}, scan: {active_min_frequency})"
+
+    for flag, default_val in HARVEST_BOOLEAN_MODES:
+        scan_val = kwargs.get(flag, default_val)
+        if _safe_bool(calib.get(flag, default_val)) != bool(scan_val):
+            return f"{flag} (calibrated: {calib.get(flag, default_val)}, scan: {scan_val})"
+
+    int_bounds = (
+        (None, "min_lines", 8),
+        (None, "min_tokens", 15),
+        ("sliding_window", "window_size", 5),
+        ("complex_expressions", "min_expr_complexity", 4),
+    )
+    for flag_active, int_key, default_int in int_bounds:
+        if flag_active is None or kwargs.get(flag_active, False):
+            try:
+                if int(calib.get(int_key, default_int)) != int(kwargs.get(int_key, default_int)):
+                    return f"{int_key} (calibrated: {calib.get(int_key, default_int)}, scan: {kwargs.get(int_key, default_int)})"
+            except (ValueError, TypeError, OverflowError):
+                return f"{int_key} (malformed integer)"
+
+    calib_scope = calib.get("scope") or calib.get("target_repo_relative")
+    norm_calib_scope = (
+        normalize_lexical_posix(str(calib_scope)).strip("/")
+        if calib_scope
+        else None
+    ) or None
+    if norm_calib_scope == ".":
+        norm_calib_scope = None
+
+    norm_target_scope = (
+        normalize_lexical_posix(str(target_scope)).strip("/")
+        if target_scope
+        else None
+    ) or None
+    if norm_target_scope == ".":
+        norm_target_scope = None
+
+    if norm_calib_scope != norm_target_scope:
+        return f"scope (calibrated: '{norm_calib_scope}', scan: '{norm_target_scope}')"
+
+    if calib_hash:
+        return f"config_hash mismatch (calibrated: {calib_hash})"
+
+    return None
+
+
+def _is_calibration_mode_compatible(
+    calib: Any,
+    *,
+    bag_of_tokens: bool = False,
+    call_sequences: bool = False,
+    filter_stop_shingles: bool = False,
+    audit_tests: bool = False,
+    include_notebooks: bool = False,
+    max_index_frequency: Optional[float] = 0.25,
+    min_corpus_size: Optional[int] = None,
+    min_frequency: int = 1,
+    excludes: Optional[Sequence[str]] = None,
+    target_scope: Optional[str] = None,
+    **kwargs: Any,
+) -> bool:
+    """Validates that corpus calibration was generated with compatible representation, filtering, and AST shaping features."""
+    mismatch = _find_calibration_mode_mismatch(
+        calib,
+        bag_of_tokens=bag_of_tokens,
+        call_sequences=call_sequences,
+        filter_stop_shingles=filter_stop_shingles,
+        audit_tests=audit_tests,
+        include_notebooks=include_notebooks,
+        max_index_frequency=max_index_frequency,
+        min_corpus_size=min_corpus_size,
+        min_frequency=min_frequency,
+        excludes=excludes,
+        target_scope=target_scope,
+        **kwargs,
+    )
+    if mismatch is not None:
+        logger.debug("Corpus calibration is incompatible with active scan configuration: %s", mismatch)
+        return False
+    return True
+
+
 def _worker_harvest_file(task_kwargs: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Worker task wrapper for process pool executor."""
     return harvest_file_units(**task_kwargs)
 
 
+@overload
 def scan_target(
-    target_dir: str,
+    target_dir: Union[str, Path],
+    *,
+    return_calibration: Literal[False] = False,
+    diff_files: Optional[Sequence[str]] = None,
+    call_sequences: bool = False,
+    bag_of_tokens: bool = False,
+    novel_pair_budget: Optional[int] = None,
+    **kwargs: Any,
+) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]: ...
+
+
+@overload
+def scan_target(
+    target_dir: Union[str, Path],
+    *,
+    return_calibration: Literal[True],
+    diff_files: Optional[Sequence[str]] = None,
+    call_sequences: bool = False,
+    bag_of_tokens: bool = False,
+    novel_pair_budget: Optional[int] = None,
+    **kwargs: Any,
+) -> Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Dict[str, Any]]: ...
+
+
+@overload
+def scan_target(
+    target_dir: Union[str, Path],
+    *,
+    return_calibration: bool = False,
+    diff_files: Optional[Sequence[str]] = None,
+    call_sequences: bool = False,
+    bag_of_tokens: bool = False,
+    novel_pair_budget: Optional[int] = None,
+    **kwargs: Any,
+) -> Union[
+    List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
+    Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Dict[str, Any]],
+]: ...
+
+
+def scan_target(
+    target_dir: Union[str, Path],
     *,
     min_lines: int = 8,
     min_tokens: int = 15,
     threshold: float = 0.90,
     repo_root: Optional[Union[str, Path]] = None,
+    diff_files: Optional[Sequence[str]] = None,
     excludes: Optional[List[str]] = None,
     functions_only: bool = False,
     sliding_window: bool = False,
@@ -536,25 +944,59 @@ def scan_target(
     top_n: Optional[int] = None,
     include_notebooks: bool = False,
     strip_docstrings: bool = True,
-    max_index_frequency: float = 0.25,
+    max_index_frequency: Optional[float] = 0.25,
     filter_stop_shingles: bool = False,
     stop_shingles: Optional[Set[Any]] = None,
     min_corpus_size: Optional[int] = None,
-) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]:
+    corpus_calibration: Optional[Dict[str, Any]] = None,
+    return_calibration: bool = False,
+    min_frequency: int = 1,
+    novel_pair_budget: Optional[int] = None,
+    **kwargs: Any,
+) -> Union[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Dict[str, Any]]]:
+    effective_min_freq = min_frequency
+    if "min_calibration_frequency" in kwargs and kwargs["min_calibration_frequency"] is not None:
+        try:
+            effective_min_freq = max(1, int(kwargs["min_calibration_frequency"]))
+        except (ValueError, TypeError):
+            pass
+
+    effective_novel_budget = (
+        _safe_int(novel_pair_budget, min_val=0)
+        if novel_pair_budget is not None
+        else MAX_NOVEL_SHINGLE_PAIR_BUDGET
+    )
+    if effective_novel_budget is None:
+        effective_novel_budget = MAX_NOVEL_SHINGLE_PAIR_BUDGET
+
     units: List[Dict[str, Any]] = []
+    try:
+        res_target_dir = Path(target_dir).resolve()
+    except (ValueError, OSError, RuntimeError):
+        res_target_dir = Path(target_dir)
+
+    target_root_dir = res_target_dir if res_target_dir.is_dir() else res_target_dir.parent
+    git_root_resolved = _resolve_git_root_path(target_root_dir)
+
     if repo_root is not None:
-        effective_repo_root = Path(repo_root)
+        try:
+            effective_repo_root = Path(repo_root).resolve()
+        except (ValueError, OSError, RuntimeError):
+            effective_repo_root = Path(repo_root)
+    elif git_root_resolved is not None:
+        effective_repo_root = git_root_resolved
     else:
         try:
-            target_path = Path(target_dir).resolve()
             cwd = Path.cwd().resolve()
             try:
-                target_path.relative_to(cwd)
+                target_root_dir.relative_to(cwd)
                 effective_repo_root = cwd
             except ValueError:
-                effective_repo_root = target_path if target_path.is_dir() else target_path.parent
+                effective_repo_root = target_root_dir
         except (ValueError, OSError):
             effective_repo_root = Path.cwd()
+    if diff_files is not None and not diff_files and not return_calibration:
+        return []
     file_list = find_python_files(
         target_dir,
         excludes=excludes,
@@ -563,33 +1005,36 @@ def scan_target(
     )
 
     effective_workers = workers if workers is not None else 1
+    harvest_mode_opts: Dict[str, Any] = {
+        "min_lines": min_lines,
+        "min_tokens": min_tokens,
+        "functions_only": functions_only,
+        "sliding_window": sliding_window,
+        "window_size": window_size,
+        "blind_indexing": blind_indexing,
+        "complex_expressions": complex_expressions,
+        "min_expr_complexity": min_expr_complexity,
+        "clause_level": clause_level,
+        "data_tables": data_tables,
+        "strip_annotations": strip_annotations,
+        "class_level": class_level,
+        "blind_literals": blind_literals,
+        "filter_boilerplate": filter_boilerplate,
+        "consistent_renaming": consistent_renaming,
+        "harvest_closures": harvest_closures,
+        "commutative": commutative,
+        "comprehensions": comprehensions,
+        "idioms": idioms,
+        "abstract_expressions": abstract_expressions,
+        "strip_docstrings": strip_docstrings,
+    }
     # Multi-core process pool when requested or on large repos
     if effective_workers > 1 and len(file_list) >= 10:
         task_list = [
             {
                 "file_path": str(p),
                 "repo_root": str(effective_repo_root),
-                "min_lines": min_lines,
-                "min_tokens": min_tokens,
-                "functions_only": functions_only,
-                "sliding_window": sliding_window,
-                "window_size": window_size,
-                "blind_indexing": blind_indexing,
-                "complex_expressions": complex_expressions,
-                "min_expr_complexity": min_expr_complexity,
-                "clause_level": clause_level,
-                "data_tables": data_tables,
-                "strip_annotations": strip_annotations,
-                "class_level": class_level,
-                "blind_literals": blind_literals,
-                "filter_boilerplate": filter_boilerplate,
-                "consistent_renaming": consistent_renaming,
-                "harvest_closures": harvest_closures,
-                "commutative": commutative,
-                "comprehensions": comprehensions,
-                "idioms": idioms,
-                "abstract_expressions": abstract_expressions,
-                "strip_docstrings": strip_docstrings,
+                **harvest_mode_opts,
             }
             for p in file_list
         ]
@@ -602,80 +1047,337 @@ def scan_target(
                 harvest_file_units(
                     str(p),
                     str(effective_repo_root),
-                    min_lines=min_lines,
-                    min_tokens=min_tokens,
-                    functions_only=functions_only,
-                    sliding_window=sliding_window,
-                    window_size=window_size,
-                    blind_indexing=blind_indexing,
-                    complex_expressions=complex_expressions,
-                    min_expr_complexity=min_expr_complexity,
-                    clause_level=clause_level,
-                    data_tables=data_tables,
-                    strip_annotations=strip_annotations,
-                    class_level=class_level,
-                    blind_literals=blind_literals,
-                    filter_boilerplate=filter_boilerplate,
-                    consistent_renaming=consistent_renaming,
-                    harvest_closures=harvest_closures,
-                    commutative=commutative,
-                    comprehensions=comprehensions,
-                    idioms=idioms,
-                    abstract_expressions=abstract_expressions,
-                    strip_docstrings=strip_docstrings,
+                    **harvest_mode_opts,
                 )
             )
+
+    effective_repo = (
+        effective_repo_root
+        if repo_root is not None
+        else (git_root_resolved or effective_repo_root)
+    )
+    resolver = CanonicalPathResolver(target_root=target_root_dir, repo_root=effective_repo)
+
+    diff_unit_indices: Optional[Set[int]] = None
+    if diff_files is not None:
+        diff_keys = build_diff_path_keys(diff_files, resolver)
+        unique_unit_files = {u.get("file") for u in units if u.get("file")}
+        is_target_relative_harvest = (
+            effective_repo_root == target_root_dir
+        )
+        unit_basis = "target" if is_target_relative_harvest else "repo"
+        has_tagged = any(k.startswith(("repo:", "target:")) for k in diff_keys)
+        matching_files = {
+            f
+            for f in unique_unit_files
+            if resolver.matches_diff(
+                f,
+                diff_keys,
+                basis=unit_basis,
+                has_tagged=has_tagged,
+                diff_target_keys=resolver.diff_target_keys,
+                diff_repo_keys=resolver.diff_repo_keys,
+            )
+        }
+
+        diff_unit_indices = {
+            idx
+            for idx, u in enumerate(units)
+            if u.get("file") in matching_files
+        }
+        if not diff_unit_indices:
+            if return_calibration:
+                return [], _build_calibration_metadata(
+                    units,
+                    max_index_frequency=max_index_frequency,
+                    min_corpus_size=min_corpus_size,
+                    filter_stop_shingles=filter_stop_shingles,
+                    stop_shingles=stop_shingles,
+                    bag_of_tokens=bag_of_tokens,
+                    call_sequences=call_sequences,
+                    audit_tests=audit_tests,
+                    include_notebooks=include_notebooks,
+                    excludes=excludes,
+                    scope=resolver.target_in_repo,
+                    target_repo_relative=resolver.target_in_repo,
+                    min_frequency=effective_min_freq,
+                    **harvest_mode_opts,
+                )
+            return []
 
     effective_stop_shingles: Set[Any] = set()
     if filter_stop_shingles:
         effective_stop_shingles.update(DEFAULT_STOP_SHINGLES)
     if stop_shingles is not None:
         effective_stop_shingles.update(stop_shingles)
+    if not isinstance(corpus_calibration, dict):
+        corpus_calibration = None
+    else:
+        calib_mismatch = _find_calibration_mode_mismatch(
+            corpus_calibration,
+            bag_of_tokens=bag_of_tokens,
+            call_sequences=call_sequences,
+            filter_stop_shingles=filter_stop_shingles,
+            audit_tests=audit_tests,
+            include_notebooks=include_notebooks,
+            max_index_frequency=max_index_frequency,
+            min_corpus_size=min_corpus_size,
+            excludes=excludes,
+            target_scope=resolver.target_in_repo,
+            min_frequency=effective_min_freq,
+            **harvest_mode_opts,
+        )
+        if calib_mismatch is not None:
+            logger.info(
+                "Corpus calibration was discarded due to configuration mismatch (%s); falling back to full corpus scan.",
+                calib_mismatch,
+            )
+            try:
+                corpus_calibration["discarded_mismatch"] = calib_mismatch
+            except (TypeError, ValueError):
+                pass
+            corpus_calibration = None
+    if corpus_calibration is not None:
+        calib_total = _safe_total_units(corpus_calibration.get("total_units"))
+        if calib_total > 0:
+            corpus_calibration["current_units"] = len(units)
+            corpus_calibration["unit_drift"] = round(abs(len(units) - calib_total) / calib_total, 4)
+        calib_stops = corpus_calibration.get("global_stop_shingles")
+        if calib_stops and isinstance(calib_stops, (list, set, tuple)):
+            from pydoppelgangerhunt.baseline import _deep_tuple
+            for s in calib_stops:
+                try:
+                    effective_stop_shingles.add(_deep_tuple(s))
+                except (TypeError, ValueError, RecursionError):
+                    continue
 
     idf_weights: Dict[Any, float] = {}
+    df_counts: Dict[Any, int] = {}
+    calib_units_tfidf = 0
+    corpus_size = len(units)
+    calib_freqs: Dict[Any, Any] = {}
     if tfidf and units:
-        corpus_size = len(units)
-        df_counts: Dict[Any, int] = {}
-        for u in units:
-            keys = u.get("vector", {}).keys() if bag_of_tokens else u["shingles"]
+        if corpus_calibration is not None:
+            calib_units_tfidf = _safe_total_units(corpus_calibration.get("total_units"))
+            corpus_size = max(len(units), calib_units_tfidf)
+            active_indices: Union[Set[int], range] = (
+                diff_unit_indices if diff_unit_indices is not None else range(len(units))
+            )
+        else:
+            corpus_size = len(units)
+            active_indices = range(len(units))
+            calib_units_tfidf = 0
+
+        for idx in active_indices:
+            u = units[idx]
+            keys = _extract_unit_shingle_keys(
+                u, call_sequences=call_sequences, bag_of_tokens=bag_of_tokens
+            )
             for k in keys:
                 if effective_stop_shingles and k in effective_stop_shingles:
                     continue
                 df_counts[k] = df_counts.get(k, 0) + 1
-        for k, df in df_counts.items():
-            idf_weights[k] = math.log((1.0 + corpus_size) / (1.0 + df)) + 1.0
+        calib_freqs_raw = (
+            corpus_calibration.get("shingle_frequencies")
+            if corpus_calibration is not None
+            else None
+        )
+        calib_freqs = (
+            calib_freqs_raw if isinstance(calib_freqs_raw, dict) else {}
+        )
 
     shingle_index: Dict[Any, List[int]] = {}
     for idx, u in enumerate(units):
-        if call_sequences:
-            index_keys = list(set(u.get("calls", [])))
-        elif bag_of_tokens:
-            index_keys = list(u.get("vector", {}).keys())
-        else:
-            index_keys = list(u["shingles"])
+        index_keys = _extract_unit_shingle_keys(
+            u, call_sequences=call_sequences, bag_of_tokens=bag_of_tokens
+        )
         for sh in index_keys:
             if effective_stop_shingles and sh in effective_stop_shingles:
                 continue
             shingle_index.setdefault(sh, []).append(idx)
 
-    effective_min_corpus = (
+    raw_min_corpus = (
         min_corpus_size
         if min_corpus_size is not None
-        else (4 if filter_stop_shingles else 30)
+        else (
+            corpus_calibration.get("min_corpus_size")
+            if corpus_calibration is not None and "min_corpus_size" in corpus_calibration
+            else None
+        )
     )
-
-    max_posting_len = (
-        max(2, int(math.ceil(len(units) * max_index_frequency)))
-        if (max_index_frequency is not None and len(units) >= effective_min_corpus)
-        else len(units) + 1
-    )
+    effective_min_corpus = _safe_min_corpus(raw_min_corpus, filter_stop_shingles)
 
     candidate_pairs: Set[Tuple[int, int]] = set()
-    for u_indices in shingle_index.values():
-        if 1 < len(u_indices) <= max_posting_len:
-            for i, idx1 in enumerate(u_indices):
-                for idx2 in u_indices[i + 1:]:
-                    candidate_pairs.add((min(idx1, idx2), max(idx1, idx2)))
+    calib_freqs_map: Optional[Dict[Any, Any]] = None
+    calib_units = 0
+    active_max_freq = _safe_index_frequency(max_index_frequency)
+    if corpus_calibration is not None:
+        calib_units = _safe_total_units(corpus_calibration.get("total_units"))
+        total_corpus_units = max(len(units), calib_units)
+        calib_freqs_raw = corpus_calibration.get("shingle_frequencies")
+        calib_freqs_map = (
+            calib_freqs_raw if isinstance(calib_freqs_raw, dict) else None
+        )
+        max_posting_len = _compute_max_posting_len(
+            total_corpus_units, active_max_freq, effective_min_corpus, fallback=None
+        )
+    else:
+        max_posting_len = _compute_max_posting_len(
+            len(units), active_max_freq, effective_min_corpus, fallback=len(units) + 1
+        ) or (len(units) + 1)
+
+    effective_max_posting = max_posting_len
+    if (
+        effective_max_posting is None
+        and active_max_freq is not None
+        and len(units) >= effective_min_corpus
+    ):
+        effective_max_posting = _compute_max_posting_len(
+            len(units), active_max_freq, effective_min_corpus, fallback=None
+        )
+
+    remaining_novel_pair_budget: int = effective_novel_budget
+    skipped_novel_shingles: int = 0
+
+    sorted_shingle_keys = sorted(shingle_index.keys(), key=_shingle_sort_key)
+    for sh in sorted_shingle_keys:
+        u_indices = shingle_index[sh]
+        if len(u_indices) <= 1:
+            continue
+        if diff_unit_indices is not None:
+            df_local = sum(1 for idx in u_indices if idx in diff_unit_indices)
+            if df_local == 0:
+                continue
+        else:
+            df_local = len(u_indices)
+
+        is_global_shingle = False
+        if calib_freqs_map is not None:
+            raw_global = _lookup_calib_freq(calib_freqs_map, sh)
+            if raw_global is not None:
+                try:
+                    val = int(raw_global)
+                    if calib_units > 0 and val > 0:
+                        is_global_shingle = True
+                        df_global = min(calib_units, val)
+                    else:
+                        df_global = 0
+                except (ValueError, TypeError, OverflowError):
+                    df_global = 0
+            else:
+                df_global = 0
+            if diff_unit_indices is not None:
+                # Conservative Candidate Pruning (Mathematical Derivation):
+                # --------------------------------------------------------
+                # In differential mode, diff_unit_indices contains current active units
+                # from modified or added files; all other harvested units belong to unchanged files.
+                #
+                # Let unchanged_units = len(units) - len(diff_unit_indices).
+                # These units were untouched by the diff, so at baseline the unchanged files
+                # contained at least unchanged_units units.
+                #
+                # If baseline calibration total_units (calib_units) is available and
+                # calib_units >= unchanged_units, the maximum number of baseline units that
+                # could have belonged to changed or deleted files is:
+                #   max_touched = calib_units - unchanged_units
+                #
+                # Therefore, between baseline and current state, at most
+                #   max_removals = max(max_touched - df_local, 0)
+                # occurrences of shingle `sh` could have been removed across the entire repository.
+                #
+                # The guaranteed lower bound on current occurrences is:
+                #   pruning_df = max(len(u_indices), df_global - max_removals)
+                #
+                # If reliable baseline counts are unavailable (calib_units <= 0 or
+                # calib_units < unchanged_units), calibrated pruning is disabled to prevent
+                # false negatives, falling back to directly observed units:
+                #   pruning_df = len(u_indices)
+                unchanged_units = max(0, len(units) - len(diff_unit_indices))
+                if calib_units > 0 and calib_units >= unchanged_units:
+                    max_touched = calib_units - unchanged_units
+                    max_removals = max(max_touched - df_local, 0)
+                    pruning_df = max(len(u_indices), df_global - max_removals)
+                else:
+                    pruning_df = len(u_indices)
+            else:
+                # Full-Scan Candidate Pruning (Replacement Model):
+                # combined_df reconciles global baseline calibration frequency with local scan counts
+                # without double-counting (only used for full-scan pruning).
+                combined_df = max(df_local, df_global)
+                pruning_df = combined_df
+        else:
+            pruning_df = len(u_indices)
+
+        is_novel = calib_freqs_map is not None and not is_global_shingle
+
+        if is_novel:
+            if diff_unit_indices is not None:
+                df_unmodified = len(u_indices) - df_local
+                if effective_max_posting is not None and df_unmodified > effective_max_posting:
+                    continue
+                potential_pairs = (df_local * (df_local - 1)) // 2 + df_local * df_unmodified
+            else:
+                if effective_max_posting is not None and pruning_df > effective_max_posting:
+                    continue
+                potential_pairs = (len(u_indices) * (len(u_indices) - 1)) // 2
+            if potential_pairs > remaining_novel_pair_budget:
+                skipped_novel_shingles += 1
+                logger.debug(
+                    "Novel shingle pair budget exceeded (needed %d, remaining %d); skipping novel shingle pairs",
+                    potential_pairs,
+                    remaining_novel_pair_budget,
+                )
+                continue
+        elif effective_max_posting is not None and pruning_df > effective_max_posting:
+            continue
+
+        pairs_before = len(candidate_pairs) if is_novel else 0
+        _add_candidate_pairs(candidate_pairs, u_indices, diff_unit_indices)
+        if is_novel:
+            added_pairs = len(candidate_pairs) - pairs_before
+            remaining_novel_pair_budget = max(0, remaining_novel_pair_budget - added_pairs)
+
+    if skipped_novel_shingles > 0:
+        logger.info(
+            "Novel shingle pair budget reached: %d high-density novel shingle(s) skipped to limit quadratic candidate expansion. "
+            "Consider re-recording baseline calibration to index new symbols.",
+            skipped_novel_shingles,
+        )
+        if corpus_calibration is not None:
+            corpus_calibration["skipped_novel_shingles"] = skipped_novel_shingles
+
+    if tfidf and units and candidate_pairs:
+        keys_to_weight: Set[Any] = set(df_counts.keys())
+        active_candidate_units = {idx for pair in candidate_pairs for idx in pair}
+        for u_idx in active_candidate_units:
+            u = units[u_idx]
+            u_keys = _extract_unit_shingle_keys(
+                u, call_sequences=call_sequences, bag_of_tokens=bag_of_tokens
+            )
+            for k in u_keys:
+                if not (effective_stop_shingles and k in effective_stop_shingles):
+                    keys_to_weight.add(k)
+
+        for k in keys_to_weight:
+            df = df_counts.get(k, 0)
+            if calib_units_tfidf > 0 and calib_freqs:
+                calib_df = _lookup_calib_freq(calib_freqs, k)
+                try:
+                    parsed_calib = int(calib_df or 0)
+                    valid_calib_df = min(calib_units_tfidf, parsed_calib) if parsed_calib > 0 else 0
+                except (ValueError, TypeError, OverflowError):
+                    valid_calib_df = 0
+            else:
+                valid_calib_df = 0
+            # Empirical calibration frequency estimation for TF-IDF weights (Approximate Replacement Model):
+            # Uses max(df, valid_calib_df) to approximate current corpus document frequency without
+            # double-counting modified units that were already indexed in the global baseline.
+            combined_df = max(df, valid_calib_df)
+            try:
+                weight = math.log((1.0 + corpus_size) / (1.0 + combined_df)) + 1.0
+                idf_weights[k] = max(0.0, weight)
+            except (ValueError, TypeError, OverflowError):
+                idf_weights[k] = 1.0
 
     raw_exemptions = exemptions if exemptions is not None else []
     normalized_exemptions: Set[Tuple[str, str]] = set()
@@ -699,7 +1401,7 @@ def scan_target(
                 b2 = f"{base_f2}:{sym2}" if sym2 is not None else base_f2
                 basename_exemptions.add(_sorted_pair(b1, b2))
 
-    target_norm = target_dir.replace("\\", "/").strip("./").rstrip("/")
+    target_norm = str(target_dir).replace("\\", "/").strip("./").rstrip("/")
     target_pfx = f"{target_norm}/" if target_norm and target_norm != "." else ""
     target_prefixes = (
         (target_pfx, "src/", "pydoppelgangerhunt/")
@@ -708,7 +1410,13 @@ def scan_target(
     )
 
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
-    for i, j in candidate_pairs:
+    # Determinism vs Scaling Rationale:
+    # candidate_pairs is explicitly sorted by (i, j) index tuples to guarantee 100% deterministic,
+    # reproducible clone detection orders across OS platforms, Python hash seeds, and thread scheduling.
+    # While sorting O(P log P) introduces minor overhead for very large pair sets, P is bounded by
+    # index posting limits and the novel shingle budget, making deterministic ordering paramount
+    # for baseline fingerprint stability and differential CI test reproducibility.
+    for i, j in sorted(candidate_pairs):
         u1, u2 = units[i], units[j]
 
         if audit_tests and not (u1["name"].startswith("test_") and u2["name"].startswith("test_")):
@@ -807,6 +1515,25 @@ def scan_target(
 
     if top_n is not None and top_n > 0:
         clones = clones[:top_n]
+
+    if return_calibration:
+        calib_dict = _build_calibration_metadata(
+            units,
+            max_index_frequency=max_index_frequency,
+            min_corpus_size=min_corpus_size,
+            filter_stop_shingles=filter_stop_shingles,
+            stop_shingles=stop_shingles,
+            bag_of_tokens=bag_of_tokens,
+            call_sequences=call_sequences,
+            audit_tests=audit_tests,
+            include_notebooks=include_notebooks,
+            excludes=excludes,
+            scope=resolver.target_in_repo,
+            target_repo_relative=resolver.target_in_repo,
+            min_frequency=effective_min_freq,
+            **harvest_mode_opts,
+        )
+        return clones, calib_dict
 
     return clones
 

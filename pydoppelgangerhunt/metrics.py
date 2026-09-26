@@ -27,7 +27,7 @@ def compute_repository_dry_stats(
 
     for p in file_list:
         try:
-            if p.suffix == ".ipynb":
+            if p.suffix.lower() == ".ipynb":
                 try:
                     nb_data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
                     count = 0

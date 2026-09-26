@@ -186,6 +186,9 @@ pydoppelgangerhunt --init
 | `--summary` | `PATH` | Path to write GitHub Step Summary Markdown report |
 | `--baseline` | `PATH` | Path to grandfathered baseline JSON file to suppress |
 | `--record-baseline` | `PATH` | Path to record detected clones into baseline JSON file |
+| `--prune-baseline` | Flag | Prune orphaned fingerprints from baseline JSON file |
+| `--min-calibration-frequency` | `INT` | Document frequency threshold to retain shingle in calibration (default: `1`; recommend >= 2 for monorepos > 100k units) |
+| `--novel-pair-budget` | `INT` | Candidate pair budget cap for novel shingles in differential scans (default: `10000`) |
 | `--sliding-window` | Flag | Enable sliding statement window scanner |
 | `--harvest-closures` | Flag | Harvest nested closures and inner functions |
 | `--idioms` | Flag | Canonicalize Python idioms (loops, comprehensions, search loops) |
@@ -195,6 +198,13 @@ pydoppelgangerhunt --init
 | `--preserve-annotations`| Flag | Preserve PEP 484/526 type annotations (annotations stripped by default) |
 | `--max-index-frequency` | `FLOAT` | Inverted index frequency threshold to prune ubiquitous shingles (default: `0.25`) |
 | `--workers` | `INT` | Number of worker processes for parallel AST harvesting |
+
+### Baseline Calibration & Massive Monorepo Deployments
+
+When running differential scans in CI pipelines (`--diff-only --baseline baseline.json`), `pyDoppelgangerHunt` reuses pre-computed corpus calibration metadata (shingle frequencies and corpus size) from the recorded baseline to provide fast, approximate IDF weighting and dynamic stop-shingle pruning bounds without having to recompute global repository frequency statistics from scratch. To guarantee that calibration never suppresses potentially valid clone candidates (preventing false negatives), candidate pruning is conservative when calibrated document frequencies are near the pruning cutoff.
+
+For massive monorepos (> 100k AST units), `compute_corpus_calibration` retains shingles across the entire codebase. By default, singleton shingles (appearing in only 1 unit) are indexed. Setting `--min-calibration-frequency 2` (or configuring `min_calibration_frequency = 2` in `pyproject.toml`) discards singleton shingles during `--record-baseline`, dramatically compressing baseline JSON file size and in-memory footprint while providing high stop-shingle pruning efficiency with approximate IDF weighting. When `--min-calibration-frequency` is specified during `--record-baseline`, `pyDoppelgangerHunt` records detailed shingle pruning counts, compression ratios, and estimated payload savings directly inside the `corpus_calibration` metadata and prints summary compression metrics upon baseline generation to facilitate CI compression benchmarking across diverse codebase topologies. In addition, `--novel-pair-budget 10000` (configurable via `novel_pair_budget` in `pyproject.toml`) bounds the pairwise candidate comparison budget for novel shingles introduced during differential scans.
+
 
 ---
 

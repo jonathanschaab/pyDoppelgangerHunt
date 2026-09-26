@@ -701,4 +701,119 @@ def test_extract_unit_source_code_rejects_global_tempdir_when_repo_root_omitted(
     assert res == ["# Source for secret lines 1-1\n"]
 
 
+def test_extract_unit_source_code_uppercase_notebook_and_case_insensitive_cell_anchor(tmp_path: Path) -> None:
+    """Verifies that extract_unit_source_code, parser, and config handle uppercase notebooks case-insensitively."""
+    import json
+    from pydoppelgangerhunt.config import find_python_files  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.metrics import compute_repository_dry_stats  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.parser import harvest_file_units  # pylint: disable=import-outside-toplevel
+
+    nb_file = tmp_path / "ANALYSIS.IPYNB"
+    nb_content = {
+        "cells": [
+            {
+                "cell_type": "code",
+                "source": ["def calculate_total():\n", "    val = 42\n", "    return val\n"],
+            }
+        ]
+    }
+    nb_file.write_text(json.dumps(nb_content), encoding="utf-8")
+
+    # 1. extract_unit_source_code extracts code cell lines, not raw JSON
+    unit = {
+        "file": "ANALYSIS.IPYNB#cell_1",
+        "start": 1,
+        "end": 3,
+        "name": "calculate_total",
+    }
+    lines = extract_unit_source_code(unit, repo_root=str(tmp_path))
+    assert lines == ["def calculate_total():\n", "    val = 42\n", "    return val\n"]
+
+    # 2. Case-insensitive #CELL_1 anchor
+    unit_upper_anchor = {
+        "file": "ANALYSIS.IPYNB#CELL_1",
+        "start": 1,
+        "end": 3,
+        "name": "calculate_total",
+    }
+    lines_upper = extract_unit_source_code(unit_upper_anchor, repo_root=str(tmp_path))
+    assert lines_upper == ["def calculate_total():\n", "    val = 42\n", "    return val\n"]
+
+    # 3. find_python_files discovers uppercase .IPYNB
+    discovered = find_python_files(str(tmp_path), include_notebooks=True)
+    assert any(p.name == "ANALYSIS.IPYNB" for p in discovered)
+
+    # 4. harvest_file_units harvests AST units from uppercase .IPYNB
+    harvested = harvest_file_units(str(nb_file), repo_root=str(tmp_path), min_lines=1, min_tokens=1)
+    assert len(harvested) >= 1
+    assert any("calculate_total" in (u.get("name") or "") for u in harvested)
+
+    # 5. compute_repository_dry_stats counts SLOC for uppercase .IPYNB
+    stats = compute_repository_dry_stats(str(tmp_path), clones=[], include_notebooks=True)
+    assert stats["sloc"] >= 3
+
+
+def test_extract_unit_source_code_notebook_with_literal_hash_in_filename(tmp_path: Path) -> None:
+    """Verifies that extract_unit_source_code distinguishes literal hashes in filenames from cell anchors."""
+    import json
+    from pydoppelgangerhunt.reporters import extract_unit_source_code  # pylint: disable=import-outside-toplevel
+
+    nb_file = tmp_path / "report#cellular.ipynb"
+    nb_content = {
+        "cells": [
+            {
+                "cell_type": "code",
+                "source": ["def run_cell_one():\n", "    return 1\n"],
+            },
+            {
+                "cell_type": "code",
+                "source": ["def run_cell_two():\n", "    return 2\n"],
+            },
+        ]
+    }
+    nb_file.write_text(json.dumps(nb_content), encoding="utf-8")
+
+    # 1. Whole file without cell anchor does not misparse #cellular as an anchor
+    unit_whole = {
+        "file": "report#cellular.ipynb",
+        "start": 1,
+        "end": 2,
+    }
+    whole_lines = extract_unit_source_code(unit_whole, repo_root=str(tmp_path))
+    assert len(whole_lines) >= 1
+    assert "{" in "".join(whole_lines)  # reads notebook raw JSON lines without crashing
+
+    # 2. File with valid cell anchor extracts code from that specific cell
+    unit_cell1 = {
+        "file": "report#cellular.ipynb#cell_1",
+        "start": 1,
+        "end": 2,
+        "name": "run_cell_one",
+    }
+    lines_cell1 = extract_unit_source_code(unit_cell1, repo_root=str(tmp_path))
+    assert lines_cell1 == ["def run_cell_one():\n", "    return 1\n"]
+
+    unit_cell2 = {
+        "file": "report#cellular.ipynb#cell_2",
+        "start": 1,
+        "end": 2,
+        "name": "run_cell_two",
+    }
+    lines_cell2 = extract_unit_source_code(unit_cell2, repo_root=str(tmp_path))
+    assert lines_cell2 == ["def run_cell_two():\n", "    return 2\n"]
+
+    # 3. Notebook file with literal #cellular in filename must not be treated as a cell anchor
+    nb_cell_file = tmp_path / "report.ipynb#cellular.ipynb"
+    nb_cell_file.write_text(json.dumps(nb_content), encoding="utf-8")
+    unit_literal_cell = {
+        "file": "report.ipynb#cellular.ipynb",
+        "start": 1,
+        "end": 2,
+    }
+    literal_lines = extract_unit_source_code(unit_literal_cell, repo_root=str(tmp_path))
+    assert len(literal_lines) >= 1
+    assert "{" in "".join(literal_lines)
+
+
+
 

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Union
 
-import os
+from pydoppelgangerhunt.canonical_path import normalize_lexical_posix, parse_notebook_cell_anchor
 
 DEFAULT_EXCLUDES: List[str] = [
     "checks/encapsulated",
@@ -45,20 +46,12 @@ idioms = true
 
 def normalize_path_string(path_str: Optional[str], strip_anchor: bool = True) -> str:
     """Normalizes a file path string by optionally stripping anchors, converting backslashes, and stripping leading './'."""
-    if not path_str:
-        return ""
-    raw = str(path_str)
-    if strip_anchor and "#" in raw:
-        raw = raw.split("#", maxsplit=1)[0]
-    norm = raw.replace("\\", "/")
-    while norm.startswith("./"):
-        norm = norm[2:]
-    return norm
+    return normalize_lexical_posix(path_str, strip_anchor=strip_anchor)
 
 
 def canonical_path_key(path_str: Optional[str], strip_anchor: bool = False) -> str:
     """Returns canonical normalized path key, folding case on Windows for equivalence."""
-    norm = normalize_path_string(path_str, strip_anchor=strip_anchor)
+    norm = normalize_lexical_posix(path_str, strip_anchor=strip_anchor)
     if os.name == "nt" or sys.platform == "win32":
         return norm.lower()
     return norm
@@ -66,24 +59,22 @@ def canonical_path_key(path_str: Optional[str], strip_anchor: bool = False) -> s
 
 
 
-def paths_match_boundary(p1: Optional[str], p2: Optional[str]) -> bool:
+def paths_match_boundary(
+    p1: Optional[str],
+    p2: Optional[str],
+    strip_anchor: bool = True,
+) -> bool:
     """Checks whether two normalized paths refer to the same file respecting directory boundaries."""
-    n1 = normalize_path_string(p1)
-    n2 = normalize_path_string(p2)
+    n1 = normalize_lexical_posix(p1, strip_anchor=strip_anchor)
+    n2 = normalize_lexical_posix(p2, strip_anchor=strip_anchor)
     if not n1 or not n2:
         return False
+    if os.name == "nt" or sys.platform == "win32":
+        n1 = n1.lower()
+        n2 = n2.lower()
     if n1 == n2:
         return True
-    if n1.endswith("/" + n2) or n2.endswith("/" + n1):
-        return True
-    if os.name == "nt" or sys.platform == "win32":
-        n1_lower = n1.lower()
-        n2_lower = n2.lower()
-        if n1_lower == n2_lower:
-            return True
-        if n1_lower.endswith("/" + n2_lower) or n2_lower.endswith("/" + n1_lower):
-            return True
-    return False
+    return n1.endswith("/" + n2) or n2.endswith("/" + n1)
 
 
 def find_matching_path_value(
@@ -91,15 +82,39 @@ def find_matching_path_value(
     path_map: Dict[str, Any],
 ) -> Any:
     """Finds a value in a path-keyed mapping where keys match target_path respecting directory boundaries."""
-    target_norm = normalize_path_string(target_path)
-    if not target_norm or not path_map:
+    if not target_path or not path_map:
         return None
-    direct = path_map.get(target_norm)
+    direct = path_map.get(target_path)
     if direct is not None:
         return direct
+    # 1. Match exact normalized path (preserving anchors)
+    norm_exact = normalize_path_string(target_path, strip_anchor=False)
+    if norm_exact in path_map:
+        return path_map[norm_exact]
+    key_exact = canonical_path_key(norm_exact, strip_anchor=False)
     for k, val in path_map.items():
-        if paths_match_boundary(target_norm, k):
+        k_clean = normalize_path_string(k, strip_anchor=False)
+        if norm_exact == k_clean or key_exact == canonical_path_key(k_clean, strip_anchor=False):
             return val
+    for k, val in path_map.items():
+        if paths_match_boundary(norm_exact, k, strip_anchor=False):
+            return val
+
+    # 2. If target_path contains a notebook cell anchor, fallback to stripped anchor matching
+    target_raw = str(target_path)
+    if parse_notebook_cell_anchor(target_raw) is not None:
+        target_stripped = normalize_path_string(target_raw, strip_anchor=True)
+        if target_stripped:
+            if target_stripped in path_map:
+                return path_map[target_stripped]
+            key_stripped = canonical_path_key(target_stripped, strip_anchor=False)
+            for k, val in path_map.items():
+                k_clean = normalize_path_string(k, strip_anchor=False)
+                if target_stripped == k_clean or key_stripped == canonical_path_key(k_clean, strip_anchor=False):
+                    return val
+            for k, val in path_map.items():
+                if paths_match_boundary(target_stripped, k, strip_anchor=False):
+                    return val
     return None
 
 
@@ -116,7 +131,7 @@ def find_python_files(
         return []
     valid_suffixes = (".py", ".ipynb") if include_notebooks else (".py",)
     if target_path.is_file():
-        return [target_path] if target_path.suffix in valid_suffixes else []
+        return [target_path] if target_path.suffix.lower() in valid_suffixes else []
 
     target_clean = str(target_path).replace("\\", "/").strip("./")
     active_excludes = [
@@ -141,7 +156,8 @@ def find_python_files(
         if _is_excluded(norm_root, rel_root):
             continue
         for file in files:
-            if not any(file.endswith(sfx) for sfx in valid_suffixes):
+            file_lower = file.lower()
+            if not any(file_lower.endswith(sfx) for sfx in valid_suffixes):
                 continue
             path = os.path.join(root, file)
             rel_file = os.path.relpath(path, target_str).replace("\\", "/")

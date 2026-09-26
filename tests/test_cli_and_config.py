@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+from unittest import mock
+import pytest
+
 import pydoppelgangerhunt
 
 from pydoppelgangerhunt import (
@@ -1402,3 +1405,1262 @@ def test_parse_toml_array_value_escaped_quotes_and_commas() -> None:
     raw = '["hello \\"world\\", here", "item2", \'another \\\'escaped\\\', comma\']'
     parsed = _parse_toml_array_value(raw)
     assert parsed == ['hello "world", here', 'item2', "another 'escaped', comma"]
+
+
+def test_cli_record_baseline_and_differential_scan_calibration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that main() records baseline with corpus_calibration and passes it during --baseline runs."""
+    from pydoppelgangerhunt.baseline import load_baseline  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "cli_repo"
+    repo.mkdir()
+
+    # Create dummy python files
+    shared = (
+        "def compute_total(a, b, c):\n"
+        "    res = 0\n"
+        "    for val in [a, b, c]:\n"
+        "        if val > 0:\n"
+        "            res += val * 2\n"
+        "        else:\n"
+        "            res -= val\n"
+        "    return res\n"
+    )
+    (repo / "m1.py").write_text(shared, encoding="utf-8")
+    (repo / "m2.py").write_text(shared, encoding="utf-8")
+
+    baseline_json = tmp_path / "baseline.json"
+
+    # Step 1: Record baseline via CLI
+    test_args_record = [
+        "pydoppelgangerhunt",
+        str(repo),
+        "--record-baseline",
+        str(baseline_json),
+        "--threshold",
+        "0.90",
+        "--min-lines",
+        "6",
+    ]
+    monkeypatch.setattr("sys.argv", test_args_record)
+    exit_code_record = main()
+    assert exit_code_record == 0
+    assert baseline_json.is_file()
+
+    # Verify baseline contents
+    loaded = load_baseline(str(baseline_json))
+    assert loaded.corpus_calibration is not None
+    assert loaded.corpus_calibration["total_units"] >= 2
+
+    # Step 2: Run scan with --baseline to ensure calibration forwarding to scan_target
+    import pydoppelgangerhunt.cli as cli_mod  # pylint: disable=import-outside-toplevel
+    captured_kwargs: List[Dict[str, Any]] = []
+    orig_scan = cli_mod.scan_target
+
+    def spy_scan_target(*args: Any, **kwargs: Any) -> Any:
+        captured_kwargs.append(dict(kwargs))
+        return orig_scan(*args, **kwargs)
+
+    monkeypatch.setattr(cli_mod, "scan_target", spy_scan_target)
+
+    test_args_scan = [
+        "pydoppelgangerhunt",
+        str(repo),
+        "--baseline",
+        str(baseline_json),
+        "--threshold",
+        "0.90",
+        "--min-lines",
+        "6",
+    ]
+    monkeypatch.setattr("sys.argv", test_args_scan)
+    exit_code_scan = main()
+    assert exit_code_scan == 0
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0].get("corpus_calibration") is not None
+    assert captured_kwargs[0]["corpus_calibration"]["total_units"] >= 2
+
+    # Step 3: Run differential scan with --baseline and --diff-only to verify differential forwarding
+    captured_kwargs.clear()
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.cli.get_git_modified_files",
+        lambda since_ref=None, repo_root=None: [str(repo / "m1.py")],
+    )
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.cli.get_git_modified_line_ranges",
+        lambda since_ref=None, repo_root=None: {str(repo / "m1.py"): [(1, 10)]},
+    )
+    test_args_diff = [
+        "pydoppelgangerhunt",
+        str(repo),
+        "--baseline",
+        str(baseline_json),
+        "--diff-only",
+        "--threshold",
+        "0.90",
+        "--min-lines",
+        "6",
+    ]
+    monkeypatch.setattr("sys.argv", test_args_diff)
+    exit_code_diff = main()
+    assert exit_code_diff == 0
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0].get("corpus_calibration") is not None
+    assert captured_kwargs[0]["corpus_calibration"]["total_units"] >= 2
+    assert captured_kwargs[0].get("diff_files") is not None
+    assert str(repo / "m1.py") in captured_kwargs[0]["diff_files"]
+
+
+def test_normalize_path_string_nfc_normalization(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies normalize_path_string converts macOS NFD decomposed Unicode into canonical NFC while preserving POSIX identity."""
+    import unicodedata
+    from pydoppelgangerhunt.config import normalize_path_string, paths_match_boundary
+
+    nfc_path = "src/café_module.py"
+    nfd_path = unicodedata.normalize("NFD", nfc_path)
+    assert nfc_path != nfd_path
+
+    # 1. On macOS (darwin), NFD paths are normalized to canonical NFC to align with Git precomposeunicode
+    monkeypatch.setattr("sys.platform", "darwin")
+    norm_darwin_nfd = normalize_path_string(nfd_path)
+    norm_darwin_nfc = normalize_path_string(nfc_path)
+    assert norm_darwin_nfd == norm_darwin_nfc == "src/café_module.py"
+    assert paths_match_boundary(nfd_path, nfc_path)
+    assert paths_match_boundary(nfc_path, nfd_path)
+
+    # 2. On standard POSIX (linux), distinct composed and decomposed filenames preserve filesystem identity
+    monkeypatch.setattr("sys.platform", "linux")
+    norm_posix_nfd = normalize_path_string(nfd_path)
+    norm_posix_nfc = normalize_path_string(nfc_path)
+    assert norm_posix_nfd != norm_posix_nfc
+    assert norm_posix_nfd == nfd_path
+    assert norm_posix_nfc == nfc_path
+    assert not paths_match_boundary(nfd_path, nfc_path)
+
+
+def test_cli_warns_on_calibration_config_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that main() emits an advisory warning when scan configuration differs from baseline calibration."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo_cfg_mismatch"
+    repo.mkdir()
+    code = (
+        "def sample_func(x):\n"
+        "    a = x + 1\n"
+        "    b = a * 2\n"
+        "    c = b - 3\n"
+        "    return c * 4\n"
+    )
+    (repo / "f1.py").write_text(code, encoding="utf-8")
+    baseline_file = tmp_path / "baseline_mismatch.json"
+
+    # 1. Record baseline with min_lines=4
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--record-baseline",
+            str(baseline_file),
+            "--min-lines",
+            "4",
+            "--threshold",
+            "0.90",
+        ],
+    )
+    assert main() == 0
+    capsys.readouterr()
+
+    # 2. Run scan with min_lines=10 (config mismatch)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(baseline_file),
+            "--min-lines",
+            "10",
+            "--threshold",
+            "0.90",
+        ],
+    )
+    exit_code = main()
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Warning: Active scan configuration does not match baseline calibration config" in out
+
+
+def test_cli_warns_on_calibration_unit_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that main() emits a calibration drift warning when repository units drift >= 20% from baseline."""
+    import json  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo_unit_drift"
+    repo.mkdir()
+    code = (
+        "def helper_action(val):\n"
+        "    res = [x * 2 for x in val if x > 0]\n"
+        "    return sum(res)\n"
+    )
+    (repo / "f1.py").write_text(code, encoding="utf-8")
+    baseline_file = tmp_path / "baseline_drift.json"
+
+    # 1. Record baseline with CLI to guarantee identical configuration settings
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--record-baseline",
+            str(baseline_file),
+            "--threshold",
+            "0.90",
+            "--min-lines",
+            "3",
+        ],
+    )
+    assert main() == 0
+    capsys.readouterr()
+
+    # 2. Artificially simulate repository unit drift in the recorded baseline
+    raw_data = json.loads(baseline_file.read_text(encoding="utf-8"))
+    assert "corpus_calibration" in raw_data
+    raw_data["corpus_calibration"]["total_units"] = 100
+    baseline_file.write_text(json.dumps(raw_data), encoding="utf-8")
+
+    # 3. Run scan with --baseline (same config, but drifted unit count)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(baseline_file),
+            "--threshold",
+            "0.90",
+            "--min-lines",
+            "3",
+        ],
+    )
+    exit_code = main()
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Warning: Calibration drift detected: repository units drifted by" in out
+
+
+def test_cli_inherits_baseline_min_corpus_size_without_mismatch_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that running --baseline without --min-corpus-units inherits min_corpus_size without spurious warnings."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo_inherit_mcs"
+    repo.mkdir()
+    code = (
+        "def compute_delta(x, y):\n"
+        "    diff = x - y\n"
+        "    return diff * 2 if diff > 0 else 0\n"
+    )
+    (repo / "f1.py").write_text(code, encoding="utf-8")
+    baseline_file = tmp_path / "baseline_mcs.json"
+
+    # 1. Record baseline with --min-corpus-units 50
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--record-baseline",
+            str(baseline_file),
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.90",
+            "--min-corpus-units",
+            "50",
+        ],
+    )
+    assert main() == 0
+    capsys.readouterr()
+
+    # 2. Run scan without --min-corpus-units (should inherit from baseline cleanly without config mismatch warning)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(baseline_file),
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.90",
+        ],
+    )
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "Warning: Active scan configuration does not match baseline calibration config" not in out
+
+
+def test_cli_verbose_flag_and_commit_divergence_reporting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that -v/--verbose flag is recognized and reports commit differences without AttributeError."""
+    import json  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.cli import build_arg_parser, main  # pylint: disable=import-outside-toplevel
+    import pydoppelgangerhunt.cli as cli_mod  # pylint: disable=import-outside-toplevel
+
+    parser = build_arg_parser()
+    parsed_v = parser.parse_args(["-v"])
+    assert parsed_v.verbose is True
+    parsed_verbose = parser.parse_args(["--verbose"])
+    assert parsed_verbose.verbose is True
+    parsed_none = parser.parse_args([])
+    assert parsed_none.verbose is False
+
+    repo = tmp_path / "repo_verbose"
+    repo.mkdir(parents=True)
+    (repo / "mod.py").write_text("def fn():\n    return 1\n", encoding="utf-8")
+
+    baseline_file = repo / "baseline.json"
+    recorded_hash = "1111222233334444555566667777888899990000"
+    current_hash = "aaaabbbbccccddddeeeeffff0000111122223333"
+
+    # Record baseline with recorded_commit
+    data = {
+        "version": "1.5.0",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "target": str(repo),
+        "path_basis": "target_relative",
+        "threshold": 0.90,
+        "clone_count": 0,
+        "recorded_commit": recorded_hash,
+        "fingerprints": [],
+    }
+    baseline_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    monkeypatch.setattr(cli_mod, "get_git_head_commit", lambda repo_root=None: current_hash)
+
+    # 1. Run without -v: should not report commit divergence, should not raise AttributeError
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(baseline_file),
+            "--min-lines",
+            "3",
+        ],
+    )
+    assert main() == 0
+    out_default = capsys.readouterr().out
+    assert "differs from baseline recorded commit" not in out_default
+
+    # 2. Run with -v: should report commit divergence
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(baseline_file),
+            "--min-lines",
+            "3",
+            "-v",
+        ],
+    )
+    assert main() == 0
+    out_verbose = capsys.readouterr().out
+    assert f"Repository HEAD commit {current_hash[:8]} differs from baseline recorded commit {recorded_hash[:8]}" in out_verbose
+
+
+def test_cli_inherits_all_unspecified_bounds_from_calibration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that cli.main inherits unspecified pruning/harvesting bounds from loaded calibration."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo_bounds"
+    repo.mkdir(parents=True)
+    code_fn = """
+def sample_logic():
+    a = 10
+    b = 20
+    c = 30
+    d = 40
+    e = 50
+    f = 60
+    g = 70
+    h = 80
+    i = 90
+    j = 100
+    k = 110
+    l = 120
+    return a + b + c + d + e + f + g + h + i + j + k + l
+"""
+    (repo / "sample1.py").write_text(code_fn, encoding="utf-8")
+    (repo / "sample2.py").write_text(code_fn, encoding="utf-8")
+
+    baseline_file = repo / "baseline.json"
+
+    # 1. Record baseline with non-default bounds: min-lines=12, min-tokens=20, max-index-frequency=0.15, min-corpus-units=50
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--record-baseline",
+            str(baseline_file),
+            "--min-lines",
+            "12",
+            "--min-tokens",
+            "20",
+            "--max-index-frequency",
+            "0.15",
+            "--min-corpus-units",
+            "50",
+            "--threshold",
+            "0.90",
+        ],
+    )
+    assert main() == 0
+    capsys.readouterr()
+
+    # 2. Run scan with ONLY --baseline (no --min-lines, no --min-tokens, no --max-index-frequency, no --min-corpus-units)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(baseline_file),
+            "--threshold",
+            "0.90",
+        ],
+    )
+    assert main() == 0
+    out = capsys.readouterr().out
+    # The scan banner must reflect inherited min_lines=12
+    assert "min_lines=12" in out
+    # Calibration must be accepted without mismatch warning
+    assert "Warning: Active scan configuration does not match baseline calibration config" not in out
+
+
+def test_cli_inherits_representation_and_harvesting_modes_from_calibration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that representation and harvesting modes are inherited from baseline calibration unless overridden."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    pkg_dir = tmp_path / "custom_modes_repo"
+    pkg_dir.mkdir(parents=True)
+    file_content = (
+        "def compute_alpha(vals: list) -> int:\n"
+        "    total = 0\n"
+        "    for v in vals:\n"
+        "        total += v\n"
+        "    return total\n"
+    )
+    (pkg_dir / "mod_a.py").write_text(file_content, encoding="utf-8")
+    (pkg_dir / "mod_b.py").write_text(file_content, encoding="utf-8")
+
+    bl_path = pkg_dir / "baseline.json"
+
+    # Step 1: Record baseline with --idioms, --bag-of-tokens, and --preserve-annotations
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(pkg_dir),
+            "--record-baseline",
+            str(bl_path),
+            "--idioms",
+            "--bag-of-tokens",
+            "--preserve-annotations",
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.80",
+        ],
+    )
+    exit_code_rec = main()
+    assert exit_code_rec == 0
+    capsys.readouterr()
+
+    # Step 2: Scan with --baseline only (unspecified --idioms/--bag-of-tokens/--preserve-annotations)
+    # Options should be inherited from active calibration, matching hash and avoiding warning
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(pkg_dir),
+            "--baseline",
+            str(bl_path),
+            "--threshold",
+            "0.80",
+        ],
+    )
+    exit_code_scan = main()
+    assert exit_code_scan == 0
+    scan_out = capsys.readouterr().out
+    assert "Warning: Active scan configuration does not match baseline calibration config" not in scan_out
+    assert "idioms canonicalized" in scan_out
+    assert "bag of tokens" in scan_out
+    assert "untyped" not in scan_out  # preserve-annotations was active
+
+    # Step 3: Explicit override (--no-idioms) must trigger configuration mismatch warning
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(pkg_dir),
+            "--baseline",
+            str(bl_path),
+            "--no-idioms",
+            "--threshold",
+            "0.80",
+        ],
+    )
+    exit_code_override = main()
+    assert exit_code_override == 0
+    override_out = capsys.readouterr().out
+    assert "Warning: Active scan configuration does not match baseline calibration config" in override_out
+
+
+def test_cli_inherits_null_max_index_frequency_from_calibration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that max_index_frequency: null in calibration is preserved as None without reverting to 0.25."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.baseline import compute_corpus_calibration, record_baseline  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def sample_operation_handler():\n"
+        "    val_one = 100\n"
+        "    val_two = 200\n"
+        "    val_three = 300\n"
+        "    return val_one + val_two + val_three\n"
+    )
+    repo = tmp_path / "null_freq_repo"
+    repo.mkdir(parents=True)
+    (repo / "comp_a.py").write_text(code, encoding="utf-8")
+    (repo / "comp_b.py").write_text(code, encoding="utf-8")
+
+    bl_file = repo / "baseline_null_freq.json"
+
+    # 1. Create and record baseline with max_index_frequency=None (disabled frequency pruning)
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+    clones = scan_target(str(repo), min_lines=3, threshold=0.80)
+    calib = compute_corpus_calibration([], max_index_frequency=None, min_lines=3, min_tokens=15, min_corpus_size=4)
+    record_baseline(
+        clones,
+        str(bl_file),
+        str(repo),
+        0.80,
+        repo_root=str(repo),
+        corpus_calibration=calib,
+    )
+
+    # 2. Run CLI scan with ONLY --baseline (unspecified max_index_frequency)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(bl_file),
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.80",
+        ],
+    )
+    res = main()
+    assert res == 0
+    out = capsys.readouterr().out
+    # Calibration should be accepted without configuration mismatch warning
+    assert "Warning: Active scan configuration does not match baseline calibration config" not in out
+
+    # 3. Explicit override (--max-index-frequency 0.20) should trigger configuration mismatch warning
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(bl_file),
+            "--max-index-frequency",
+            "0.20",
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.80",
+        ],
+    )
+    res_override = main()
+    assert res_override == 0
+    out_override = capsys.readouterr().out
+    assert "Warning: Active scan configuration does not match baseline calibration config" in out_override
+
+
+def test_cli_diff_only_empty_diff_skips_full_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that --diff-only with an empty diff passes diff_files=[] to scan_target and skips scanning."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    f1 = repo / "a.py"
+    f2 = repo / "b.py"
+    code = "def duplicate():\n    x = 1\n    y = 2\n    return x + y\n"
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.cli._safe_call_git_diff_helper",
+        lambda helper, *args, **kwargs: [] if "modified" in helper.__name__ else str(repo),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--diff-only",
+            "--threshold",
+            "0.80",
+            "--min-lines",
+            "3",
+        ],
+    )
+    with mock.patch("pydoppelgangerhunt.cli.scan_target", wraps=pydoppelgangerhunt.cli.scan_target) as mock_scan:
+        res = main()
+        assert res == 0
+        mock_scan.assert_called_once()
+        _, kwargs = mock_scan.call_args
+        assert kwargs.get("diff_files") == []
+    out = capsys.readouterr().out
+    assert "No structural code clones found" in out
+
+
+def test_cli_main_passes_notebooks_and_exemptions_to_scan_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that cli.main passes include_notebooks and config exemptions to scan_target."""
+    import pydoppelgangerhunt.cli
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    pyproject = repo / "pyproject.toml"
+    pyproject.write_text(
+        '[tool.pydoppelgangerhunt]\nexemptions = [["a.py:foo", "b.py:foo"]]\n',
+        encoding="utf-8",
+    )
+    (repo / "dummy.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--notebooks",
+        ],
+    )
+    with mock.patch("pydoppelgangerhunt.cli.scan_target", wraps=pydoppelgangerhunt.cli.scan_target) as mock_scan:
+        res = main()
+        assert res == 0
+        mock_scan.assert_called_once()
+        _, kwargs = mock_scan.call_args
+        assert kwargs.get("include_notebooks") is True
+        assert kwargs.get("exemptions") == [("a.py:foo", "b.py:foo")]
+
+
+def test_cli_skipped_novel_shingles_verbose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that cli.main prints an informational notice in text mode when novel shingles exceed budget under -v."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.baseline import compute_corpus_calibration, record_baseline  # pylint: disable=import-outside-toplevel
+    import pydoppelgangerhunt.matcher
+
+    repo = tmp_path / "repo_novel"
+    repo.mkdir(parents=True)
+    f = repo / "module.py"
+    f.write_text(
+        "def f1():\n    x = 1\n    y = 2\n    return x + y\n\n"
+        "def f2():\n    x = 1\n    y = 2\n    return x + y\n\n"
+        "def f3():\n    x = 1\n    y = 2\n    return x + y\n",
+        encoding="utf-8",
+    )
+
+    baseline_file = tmp_path / "baseline.json"
+    calib = compute_corpus_calibration([], min_lines=3)
+    calib["total_units"] = 100
+    calib["shingle_frequencies"] = {}
+    record_baseline([], str(baseline_file), str(repo), 0.90, corpus_calibration=calib)
+
+    monkeypatch.setattr(pydoppelgangerhunt.matcher, "MAX_NOVEL_SHINGLE_PAIR_BUDGET", 1)
+
+    # Run without -v: should NOT print advisory
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(baseline_file),
+            "--min-lines",
+            "3",
+            "--format",
+            "text",
+            "--no-color",
+        ],
+    )
+    assert main() == 0
+    out_default = capsys.readouterr().out
+    assert "high-density novel shingle(s) exceeded candidate pair budget" not in out_default
+
+    # Run with -v: should print advisory
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(baseline_file),
+            "--min-lines",
+            "3",
+            "--format",
+            "text",
+            "--no-color",
+            "-v",
+        ],
+    )
+    assert main() == 0
+    out_verbose = capsys.readouterr().out
+    assert "high-density novel shingle(s) exceeded candidate pair budget during differential scan." in out_verbose
+
+
+def test_cli_min_calibration_frequency_flag_and_pyproject_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies --min-calibration-frequency CLI flag and pyproject.toml loading."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.baseline import load_baseline  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "min_calib_freq_repo"
+    repo.mkdir(parents=True)
+    f1 = repo / "a.py"
+    f2 = repo / "b.py"
+    f3 = repo / "c.py"
+
+    code_shared = "def common_task():\n    return 42\n"
+    code_singleton = "def unique_task():\n    return 9999\n"
+
+    f1.write_text(code_shared, encoding="utf-8")
+    f2.write_text(code_shared, encoding="utf-8")
+    f3.write_text(code_singleton, encoding="utf-8")
+
+    bl_file = repo / "baseline_cutoff.json"
+
+    # 1. Record baseline with --min-calibration-frequency 2
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--min-lines",
+            "2",
+            "--threshold",
+            "0.80",
+            "--record-baseline",
+            str(bl_file),
+            "--min-calibration-frequency",
+            "2",
+        ],
+    )
+    assert main() == 0
+
+    base_obj = load_baseline(str(bl_file))
+    calib = base_obj.corpus_calibration
+    assert calib is not None
+    assert calib.get("min_frequency") == 2
+    freqs = calib.get("shingle_frequencies", {})
+    # All retained shingles must have frequency >= 2
+    for count in freqs.values():
+        assert count >= 2
+
+    # 2. Re-run scan with --baseline (no explicit flag) -> inherits min_frequency=2 without warning
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--min-lines",
+            "2",
+            "--threshold",
+            "0.80",
+            "--baseline",
+            str(bl_file),
+            "--no-color",
+        ],
+    )
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "Warning: Active scan configuration does not match baseline calibration config" not in out
+
+    # 3. pyproject.toml configuration test
+    pyproject = repo / "pyproject.toml"
+    pyproject.write_text(
+        "[tool.pydoppelgangerhunt]\nmin_calibration_frequency = 3\nmin_lines = 2\nthreshold = 0.80\n",
+        encoding="utf-8",
+    )
+    bl_file_toml = repo / "baseline_toml.json"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--config",
+            str(pyproject),
+            "--record-baseline",
+            str(bl_file_toml),
+        ],
+    )
+    assert main() == 0
+    base_toml = load_baseline(str(bl_file_toml))
+    assert base_toml.corpus_calibration is not None
+    assert base_toml.corpus_calibration.get("min_frequency") == 3
+
+
+def test_paths_match_boundary_notebook_anchors_default() -> None:
+    """Verifies that paths_match_boundary defaults to strip_anchor=True for notebook cells while preserving literal hashes."""
+    from pydoppelgangerhunt.config import paths_match_boundary  # pylint: disable=import-outside-toplevel
+
+    # 1. Default strip_anchor=True matches different cells of the same notebook
+    assert paths_match_boundary("analysis.ipynb#cell_1", "analysis.ipynb#cell_2")
+    assert paths_match_boundary("sub/analysis.ipynb#cell_1", "analysis.ipynb#cell_2")
+    assert paths_match_boundary("analysis.ipynb#cell_1", "analysis.ipynb")
+
+    # 2. Explicit strip_anchor=False compares full strings with anchors
+    assert not paths_match_boundary("analysis.ipynb#cell_1", "analysis.ipynb#cell_2", strip_anchor=False)
+    assert paths_match_boundary("analysis.ipynb#cell_1", "sub/analysis.ipynb#cell_1", strip_anchor=False)
+
+    # 3. Literal # in filename is NOT stripped as a cell anchor
+    assert paths_match_boundary("report#cellular.ipynb", "other/report#cellular.ipynb")
+    assert not paths_match_boundary("report#1.py", "report#2.py")
+
+
+def test_cli_warns_on_conflicting_strip_and_preserve_flags(tmp_path: Path, capsys: Any) -> None:
+    """Verifies that CLI warns when both strip and preserve flags are supplied and prioritizes preserve."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    target_file = tmp_path / "sample.py"
+    target_file.write_text("x: int = 1\n", encoding="utf-8")
+
+    # 1. Conflicting annotations flags
+    code = main([str(target_file), "--strip-annotations", "--preserve-annotations"])
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "Conflicting flags --strip-annotations and --preserve-annotations specified" in captured.err
+
+    # 2. Conflicting docstring flags
+    code_doc = main([str(target_file), "--strip-docstrings", "--preserve-docstrings"])
+    assert code_doc == 0
+    captured_doc = capsys.readouterr()
+    assert "Conflicting flags --strip-docstrings and --preserve-docstrings specified" in captured_doc.err
+
+
+def test_resolve_effective_config_precedence_and_calibration_export() -> None:
+    """Verifies that _resolve_effective_config properly handles precedence hierarchy and calibration dict export."""
+    from pydoppelgangerhunt.cli import (  # pylint: disable=import-outside-toplevel
+        build_arg_parser,
+        _resolve_effective_config,
+    )
+
+    parser = build_arg_parser()
+
+    # 1. Defaults with empty tool_cfg and empty calib_dict
+    args = parser.parse_args([])
+    eff = _resolve_effective_config(args, tool_cfg={}, calib_dict={})
+    assert eff.min_lines == 8
+    assert eff.min_tokens == 15
+    assert eff.window_size == 5
+    assert eff.min_expr_complexity == 4
+    assert eff.min_frequency == 1
+    assert eff.max_index_frequency == 0.25
+    assert not eff.call_sequences
+    assert not eff.audit_tests
+    assert not eff.idioms
+    assert not eff.stop_shingles
+    assert not eff.bag_of_tokens
+    assert not eff.tfidf
+
+    # 2. Calibration inheritance when CLI and tool_cfg are absent
+    calib = {
+        "min_lines": 14,
+        "min_tokens": 25,
+        "window_size": 7,
+        "min_expr_complexity": 6,
+        "min_frequency": 3,
+        "max_index_frequency": 0.12,
+        "excludes": ["custom_calib_exclude"],
+        "call_sequences": True,
+        "audit_tests": True,
+        "idioms": True,
+        "filter_stop_shingles": True,
+        "bag_of_tokens": True,
+    }
+    args_calib = parser.parse_args([])
+    eff_calib = _resolve_effective_config(args_calib, tool_cfg={}, calib_dict=calib)
+    assert eff_calib.min_lines == 14
+    assert eff_calib.min_tokens == 25
+    assert eff_calib.window_size == 7
+    assert eff_calib.min_expr_complexity == 6
+    assert eff_calib.min_frequency == 3
+    assert eff_calib.max_index_frequency == 0.12
+    assert "custom_calib_exclude" in eff_calib.excludes
+    assert eff_calib.call_sequences
+    assert eff_calib.audit_tests
+    assert eff_calib.idioms
+    assert eff_calib.stop_shingles
+    assert eff_calib.bag_of_tokens
+    assert not eff_calib.tfidf
+
+    # 2b. tool_cfg inheritance for tfidf
+    eff_tool = _resolve_effective_config(parser.parse_args([]), tool_cfg={"tfidf": True}, calib_dict={})
+    assert eff_tool.tfidf
+
+    # 3. CLI override takes highest precedence
+    args_override = parser.parse_args([
+        "--min-lines",
+        "22",
+        "--min-calibration-frequency",
+        "5",
+        "--call-sequences",
+        "--no-idioms",
+        "--bag-of-tokens",
+        "--tfidf",
+    ])
+    eff_override = _resolve_effective_config(args_override, tool_cfg={"min_lines": 18}, calib_dict=calib)
+    assert eff_override.min_lines == 22
+    assert eff_override.min_frequency == 5
+    assert eff_override.call_sequences
+    assert not eff_override.idioms
+    assert eff_override.bag_of_tokens
+    assert eff_override.tfidf
+
+    # 4. to_calibration_config export
+    calib_export = eff_override.to_calibration_config(args_override, scope="sub/pkg")
+    assert calib_export["min_lines"] == 22
+    assert calib_export["min_frequency"] == 5
+    assert calib_export["call_sequences"] is True
+    assert calib_export["idioms"] is False
+    assert calib_export["bag_of_tokens"] is True
+    assert calib_export["scope"] == "sub/pkg"
+
+
+def test_cli_top_n_interaction_with_baseline_suppression(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that --top truncation occurs after baseline suppression, preserving unsuppressed clones."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.baseline import record_baseline  # pylint: disable=import-outside-toplevel
+    import pydoppelgangerhunt.cli as cli_mod  # pylint: disable=import-outside-toplevel
+
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    f1 = pkg / "a.py"
+    f2 = pkg / "b.py"
+    f3 = pkg / "c.py"
+    code = "def duplicate():\n    v1 = 1\n    v2 = 2\n    v3 = 3\n    return v1 + v2 + v3\n"
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+    f3.write_text(code, encoding="utf-8")
+
+    u_a = {"file": "a.py", "name": "duplicate", "tokens": ["def", "duplicate"]}
+    u_b = {"file": "b.py", "name": "duplicate", "tokens": ["def", "duplicate"]}
+    base_file = tmp_path / "base.json"
+    record_baseline([(1.0, u_a, u_b)], str(base_file), target=str(pkg), threshold=0.80)
+
+    captured_clones = []
+    orig_render = cli_mod._render_text_violations
+
+    def mock_render(clones: Any, *args: Any, **kwargs: Any) -> Any:
+        captured_clones.extend(clones)
+        return orig_render(clones, *args, **kwargs)
+
+    monkeypatch.setattr(cli_mod, "_render_text_violations", mock_render)
+
+    exit_code = main([
+        str(pkg),
+        "--baseline", str(base_file),
+        "--top", "1",
+        "--min-lines", "3",
+        "--min-tokens", "5",
+        "--threshold", "0.80",
+    ])
+    assert exit_code == 1
+    assert len(captured_clones) == 1
+    files = {captured_clones[0][1].get("file"), captured_clones[0][2].get("file")}
+    assert not (files == {"a.py", "b.py"})
+
+
+def test_cli_main_passes_bag_of_tokens_and_tfidf_to_scan_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that cli.main correctly forwards resolved bag_of_tokens and tfidf to scan_target."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    import pydoppelgangerhunt.cli as cli_mod  # pylint: disable=import-outside-toplevel
+
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    f1 = pkg / "mod.py"
+    f1.write_text("x = 1\n", encoding="utf-8")
+
+    captured_kwargs: Dict[str, Any] = {}
+
+    def mock_scan_target(*args: Any, **kwargs: Any) -> List[Any]:
+        captured_kwargs.update(kwargs)
+        return []
+
+    monkeypatch.setattr(cli_mod, "scan_target", mock_scan_target)
+
+    # 1. Flags enabled via CLI
+    main([str(pkg), "--bag-of-tokens", "--tfidf"])
+    assert captured_kwargs.get("bag_of_tokens") is True
+    assert captured_kwargs.get("tfidf") is True
+
+    # 2. Flags disabled via CLI
+    captured_kwargs.clear()
+    main([str(pkg), "--no-bag-of-tokens", "--no-tfidf"])
+    assert captured_kwargs.get("bag_of_tokens") is False
+    assert captured_kwargs.get("tfidf") is False
+
+
+def test_cli_novel_pair_budget_resolution_and_forwarding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that novel_pair_budget is resolved from CLI and tool_cfg aliases and passed to scan_target."""
+    from pydoppelgangerhunt.cli import (  # pylint: disable=import-outside-toplevel
+        build_arg_parser,
+        main,
+        _resolve_effective_config,
+    )
+    import pydoppelgangerhunt.cli as cli_mod  # pylint: disable=import-outside-toplevel
+
+    parser = build_arg_parser()
+
+    # 1. Defaults with empty tool_cfg and empty calib_dict
+    args_default = parser.parse_args([])
+    eff_default = _resolve_effective_config(args_default, tool_cfg={}, calib_dict={})
+    assert eff_default.novel_pair_budget is None
+
+    # 2. tool_cfg setting
+    eff_tool = _resolve_effective_config(parser.parse_args([]), tool_cfg={"novel_pair_budget": 25000}, calib_dict={})
+    assert eff_tool.novel_pair_budget == 25000
+
+    # 2b. tool_cfg aliases
+    eff_alias1 = _resolve_effective_config(parser.parse_args([]), tool_cfg={"max_novel_shingle_pair_budget": 30000}, calib_dict={})
+    assert eff_alias1.novel_pair_budget == 30000
+
+    eff_alias2 = _resolve_effective_config(parser.parse_args([]), tool_cfg={"novel_shingle_pair_budget": 40000}, calib_dict={})
+    assert eff_alias2.novel_pair_budget == 40000
+
+    # 3. CLI override takes highest precedence
+    args_cli = parser.parse_args(["--novel-pair-budget", "5000"])
+    eff_cli = _resolve_effective_config(args_cli, tool_cfg={"novel_pair_budget": 25000}, calib_dict={})
+    assert eff_cli.novel_pair_budget == 5000
+
+    # 4. CLI main forwards to scan_target
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "mod.py").write_text("x = 1\n", encoding="utf-8")
+
+    captured_kwargs: Dict[str, Any] = {}
+
+    def mock_scan_target(*args: Any, **kwargs: Any) -> List[Any]:
+        captured_kwargs.update(kwargs)
+        return []
+
+    monkeypatch.setattr(cli_mod, "scan_target", mock_scan_target)
+
+    main([str(pkg), "--novel-pair-budget", "15000"])
+    assert captured_kwargs.get("novel_pair_budget") == 15000
+
+
+def test_cli_record_baseline_displays_size_and_calibration_compression_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that CLI --record-baseline prints file size and calibration reduction metrics."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.baseline import load_baseline  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "bench_repo"
+    repo.mkdir()
+    code_common = (
+        "def task_common(a, b, c):\n"
+        "    res = a * 2 + b * 3 + c * 4\n"
+        "    for val in range(10):\n"
+        "        res += val\n"
+        "    return res\n"
+    )
+    code_unique = (
+        "def task_unique(x, y, z):\n"
+        "    total = x * 10 + y * 20 + z * 30\n"
+        "    for item in [1, 2, 3, 4]:\n"
+        "        total -= item\n"
+        "    return total\n"
+    )
+    (repo / "f1.py").write_text(code_common, encoding="utf-8")
+    (repo / "f2.py").write_text(code_common, encoding="utf-8")
+    (repo / "f3.py").write_text(code_unique, encoding="utf-8")
+
+    bl_calib_pruned = tmp_path / "baseline_calib_pruned.json"
+
+    # 1. Run with --min-calibration-frequency 2
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.80",
+            "--record-baseline",
+            str(bl_calib_pruned),
+            "--min-calibration-frequency",
+            "2",
+        ],
+    )
+    assert main() == 0
+    out_pruned = capsys.readouterr().out
+    assert "[OK] Recorded" in out_pruned
+    assert "KB]" in out_pruned
+    assert "Calibration:" in out_pruned
+    assert "shingles pruned" in out_pruned
+    assert "reduction" in out_pruned
+    assert "compression via min-frequency 2" in out_pruned
+
+    # Verify baseline JSON contents
+    loaded = load_baseline(str(bl_calib_pruned))
+    assert loaded.corpus_calibration is not None
+    assert loaded.corpus_calibration["pruned_shingle_count"] > 0
+    assert loaded.calibration_reduction_ratio is not None
+    assert loaded.calibration_reduction_ratio > 0.0
+
+    # 2. Run with default min-frequency (1) - no pruning
+    bl_default = tmp_path / "baseline_default.json"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.80",
+            "--record-baseline",
+            str(bl_default),
+        ],
+    )
+    assert main() == 0
+    out_default = capsys.readouterr().out
+    assert "[OK] Recorded" in out_default
+    assert "KB]" in out_default
+    assert "shingles pruned" not in out_default
+
+
+def test_cli_verbose_discarded_calibration_mismatch_advisory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that cli.main prints discarded calibration advisory to sys.stderr under -v."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "calib_mismatch_repo"
+    repo.mkdir()
+    code = (
+        "def compute_something(a, b, c):\n"
+        "    res = a * 2 + b * 3 + c * 4\n"
+        "    for val in range(10):\n"
+        "        res += val\n"
+        "    return res\n"
+    )
+    (repo / "mod.py").write_text(code, encoding="utf-8")
+
+    bl_file = tmp_path / "baseline_no_bag.json"
+
+    # Step 1: Record baseline without bag-of-tokens
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.80",
+            "--record-baseline",
+            str(bl_file),
+        ],
+    )
+    assert main() == 0
+    capsys.readouterr()
+
+    # Step 2: Run scan with --bag-of-tokens (configuration mismatch) WITHOUT -v
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(bl_file),
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.80",
+            "--bag-of-tokens",
+            "--format",
+            "text",
+            "--no-color",
+        ],
+    )
+    assert main() == 0
+    captured_default = capsys.readouterr()
+    assert "Corpus calibration was discarded due to configuration mismatch" not in captured_default.err
+    assert "Corpus calibration was discarded due to configuration mismatch" not in captured_default.out
+
+    # Step 3: Run scan with --bag-of-tokens WITH -v
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--baseline",
+            str(bl_file),
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.80",
+            "--bag-of-tokens",
+            "--format",
+            "text",
+            "--no-color",
+            "-v",
+        ],
+    )
+    assert main() == 0
+    captured_verbose = capsys.readouterr()
+    assert "Corpus calibration was discarded due to configuration mismatch" in captured_verbose.err
+    assert "bag_of_tokens" in captured_verbose.err
+    assert "falling back to full corpus scan" in captured_verbose.err
+
+
+
+

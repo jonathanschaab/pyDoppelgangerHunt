@@ -1146,7 +1146,7 @@ def harvest_file_units(
     strip_docstrings: bool = True,
 ) -> List[Dict[str, Any]]:
     """Harvests AST code units from a single Python source file. Picklable for multi-core worker pools."""
-    if file_path.endswith(".ipynb"):
+    if file_path.lower().endswith(".ipynb"):
         return harvest_notebook_units(
             file_path,
             repo_root,

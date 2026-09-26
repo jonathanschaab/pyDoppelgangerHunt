@@ -217,6 +217,20 @@ def test_compute_unit_diff_overlap_with_notebook_cell_fragment() -> None:
     assert count == 5
     assert ratio == round(5 / 11, 4)
 
+
+def test_compute_unit_diff_overlap_with_literal_hash_in_path() -> None:
+    """Verifies that filenames with literal # (e.g. c#_repo or pkg#2) do not truncate and match properly."""
+    from pydoppelgangerhunt.git_diff import compute_unit_diff_overlap  # pylint: disable=import-outside-toplevel
+
+    unit = {"file": "c#_repo/worker.py", "start": 10, "end": 20}
+    modified_ranges = {"c#_repo/worker.py": [(12, 16)]}
+    count, ratio = compute_unit_diff_overlap(unit, modified_ranges)
+    assert count == 5
+    assert ratio == round(5 / 11, 4)
+
+    # Different path without hash does not match
+    assert compute_unit_diff_overlap(unit, {"c/worker.py": [(12, 16)]}) == (0, 0.0)
+
 def test_compute_unit_diff_overlap_missing_file() -> None:
     """Verifies that compute_unit_diff_overlap safely returns (0, 0.0) when file key is missing or empty."""
     from pydoppelgangerhunt.git_diff import compute_unit_diff_overlap  # pylint: disable=import-outside-toplevel
@@ -350,34 +364,36 @@ def test_batch_41_unified_path_normalization_and_html_escaping(tmp_path: Path) -
     # 1. normalize_path_string handles repetitive dot-slash and backslashes
     assert normalize_path_string("././foo/bar.py") == "foo/bar.py"
     assert normalize_path_string(".\\.\\foo\\bar.py") == "foo/bar.py"
-    assert normalize_path_string("./foo/bar.py#cell_1", strip_anchor=False) == "foo/bar.py#cell_1"
-    assert normalize_path_string("./foo/bar.py#cell_1", strip_anchor=True) == "foo/bar.py"
+    assert normalize_path_string("./foo/bar.ipynb#cell_1", strip_anchor=False) == "foo/bar.ipynb#cell_1"
+    assert normalize_path_string("./foo/bar.ipynb#cell_1", strip_anchor=True) == "foo/bar.ipynb"
+    assert normalize_path_string("./foo/bar.py#cell_1", strip_anchor=True) == "foo/bar.py#cell_1"
+    assert normalize_path_string("worker.py#cell_data.py", strip_anchor=True) == "worker.py#cell_data.py"
 
     # 2. format_json_report normalizes paths while preserving anchors
-    u1 = {"file": "./pkg/mod.py#cell_1", "start": 5, "end": 10, "name": "fn1", "token_count": 25}
-    u2 = {"file": ".\\pkg\\mod.py#cell_2", "start": 15, "end": 20, "name": "fn2", "token_count": 25}
+    u1 = {"file": "./pkg/mod.ipynb#cell_1", "start": 5, "end": 10, "name": "fn1", "token_count": 25}
+    u2 = {"file": ".\\pkg\\mod.ipynb#cell_2", "start": 15, "end": 20, "name": "fn2", "token_count": 25}
     mock_fam = {
         "family_id": "CF-100",
         "member_count": 2,
-        "unique_files": ["pkg/mod.py"],
+        "unique_files": ["pkg/mod.ipynb"],
         "avg_similarity": 0.95,
         "max_similarity": 0.95,
         "min_similarity": 0.95,
         "coherence": 1.0,
         "total_lines": 10,
-        "medoid": {"file": "./pkg/mod.py#cell_1", "name": "fn1", "start": 5, "end": 10},
+        "medoid": {"file": "./pkg/mod.ipynb#cell_1", "name": "fn1", "start": 5, "end": 10},
         "members": [u1, u2],
     }
     json_out = format_json_report([(0.95, u1, u2)], "repo", 0.9, families=[mock_fam])
-    assert json_out["clones"][0]["unit_a"]["file"] == "pkg/mod.py#cell_1"
-    assert json_out["clones"][0]["unit_b"]["file"] == "pkg/mod.py#cell_2"
-    assert json_out["families"][0]["medoid"]["file"] == "pkg/mod.py#cell_1"
-    assert json_out["families"][0]["members"][1]["file"] == "pkg/mod.py#cell_2"
+    assert json_out["clones"][0]["unit_a"]["file"] == "pkg/mod.ipynb#cell_1"
+    assert json_out["clones"][0]["unit_b"]["file"] == "pkg/mod.ipynb#cell_2"
+    assert json_out["families"][0]["medoid"]["file"] == "pkg/mod.ipynb#cell_1"
+    assert json_out["families"][0]["members"][1]["file"] == "pkg/mod.ipynb#cell_2"
 
     # 3. format_github_annotations strips anchors and leading dot-slash
     annots = format_github_annotations([(0.95, u1, u2)])
     assert len(annots) == 2
-    assert "file=pkg/mod.py," in annots[0]
+    assert "file=pkg/mod.ipynb," in annots[0]
     assert "#cell_" not in annots[0]
 
     # 4. generate_html_report escapes target and renders normalized paths
@@ -385,13 +401,13 @@ def test_batch_41_unified_path_normalization_and_html_escaping(tmp_path: Path) -
     html_report = generate_html_report([(0.95, u1, u2)], dangerous_target, 0.9, families=[mock_fam])
     assert "<script>alert('pwned')</script>" not in html_report
     assert "&lt;script&gt;alert(&#x27;pwned&#x27;)&lt;/script&gt;&amp;foo" in html_report
-    assert "pkg/mod.py#cell_1" in html_report
-    assert "pkg/mod.py#cell_2" in html_report
+    assert "pkg/mod.ipynb#cell_1" in html_report
+    assert "pkg/mod.ipynb#cell_2" in html_report
 
     # 5. _audit_clone_risk_warnings path normalization
-    cov_data = {"pkg/mod.py#cell_1": {5, 6, 7, 8, 9, 10}, "pkg/mod.py#cell_2": set()}
+    cov_data = {"pkg/mod.ipynb#cell_1": {5, 6, 7, 8, 9, 10}, "pkg/mod.ipynb#cell_2": set()}
     warn_lines = _audit_clone_risk_warnings(u1, u2, cov_data=cov_data, use_color=False)
-    assert any("Asymmetric test coverage: pkg/mod.py#cell_1 (100%) vs pkg/mod.py#cell_2 (0%)" in w for w in warn_lines)
+    assert any("Asymmetric test coverage: pkg/mod.ipynb#cell_1 (100%) vs pkg/mod.ipynb#cell_2 (0%)" in w for w in warn_lines)
 
     # 6. parse_git_diff_hunks path normalization
     diff_raw = "--- a/pkg/mod.py\n+++ b/./pkg/mod.py\n@@ -1,5 +1,5 @@\n+line\n"
@@ -672,3 +688,815 @@ def test_batch_65_git_sha256_diff_prefixes_and_quoted_toml_arrays(
     cov_data = {"mod.py": {10, 11, 12}}  # 3 of 5 lines covered
     ratio = compute_unit_coverage(u_cov, cov_data)
     assert ratio == 0.6
+
+
+def test_get_git_modified_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test extracting normalized modified files list from git diff --name-only."""
+    from typing import Sequence  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.git_diff import get_git_modified_files  # pylint: disable=import-outside-toplevel
+
+    captured_args: List[Sequence[str]] = []
+
+    def mock_run_diff(args: Sequence[str], cwd: Optional[str] = None) -> Optional[str]:
+        captured_args.append(args)
+        return "pkg/mod1.py\npkg/sub/mod2.py\n\npkg/mod1.py\n"
+
+    monkeypatch.setattr("pydoppelgangerhunt.git_diff._run_git_command", mock_run_diff)
+    files = get_git_modified_files(since_ref="main", repo_root="/repo")
+    assert "--name-only" in captured_args[0]
+    assert "main" in captured_args[0]
+    assert files == ["pkg/mod1.py", "pkg/sub/mod2.py"]
+
+    # Quoted filenames from git diff (e.g. core.quotepath with spaces, quotes, octal UTF-8)
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: '"pkg/mod with spaces.py"\n"pkg/sub/mod2.py"\n"pkg/\\\"quoted\\\".py"\n"pkg/caf\\303\\251.py"\n',
+    )
+    assert get_git_modified_files() == [
+        "pkg/mod with spaces.py",
+        "pkg/sub/mod2.py",
+        'pkg/"quoted".py',
+        "pkg/café.py",
+    ]
+
+    # When git returns None
+    monkeypatch.setattr("pydoppelgangerhunt.git_diff._run_git_command", lambda args, cwd=None: None)
+    assert get_git_modified_files() == []
+
+    # Dash-prefixed since_ref must be rejected immediately to prevent option injection
+    from pydoppelgangerhunt.git_diff import get_git_modified_line_ranges  # pylint: disable=import-outside-toplevel
+    assert get_git_modified_files(since_ref="--output=/tmp/pwned") == []
+    assert get_git_modified_files(since_ref="-h") == []
+    assert get_git_modified_line_ranges(since_ref="--diff-filter=A") == {}
+    assert get_git_modified_line_ranges(since_ref="-R") == {}
+
+
+def test_parse_git_diff_hunks_cstyle_and_blame_dash_dash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test parse_git_diff_hunks decodes C-style octal paths and blame porcelain uses '--'."""
+    from typing import Sequence  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.git_diff import get_git_blame_info  # pylint: disable=import-outside-toplevel
+
+    diff_sample = (
+        'diff --git "a/pkg/caf\\303\\251.py" "b/pkg/caf\\303\\251.py"\n'
+        '--- "a/pkg/caf\\303\\251.py"\n'
+        '+++ "b/pkg/caf\\303\\251.py"\n'
+        '@@ -10,3 +10,5 @@\n'
+        '+def cafe():\n'
+    )
+    hunks = parse_git_diff_hunks(diff_sample)
+    assert "pkg/café.py" in hunks
+    assert (10, 14) in hunks["pkg/café.py"]
+
+    blame_args: List[Sequence[str]] = []
+
+    def mock_run_blame(args: Sequence[str], cwd: Optional[str] = None) -> Optional[str]:
+        blame_args.append(args)
+        return (
+            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2 1 1 1\n"
+            "author Ada\nauthor-time 1700000000\nsummary test\n"
+        )
+
+    monkeypatch.setattr("pydoppelgangerhunt.git_diff._run_git_command", mock_run_blame)
+    get_git_blame_info("pkg/café.py", 1, 5, repo_root="/repo")
+    assert blame_args
+    assert "--" in blame_args[0]
+    assert blame_args[0][blame_args[0].index("--") + 1] == "pkg/café.py"
+
+
+def test_git_diff_args_contain_double_dash_delimiter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that get_git_modified_files and get_git_modified_line_ranges isolate revisions with '--'."""
+    from typing import Sequence  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.git_diff import (  # pylint: disable=import-outside-toplevel
+        get_git_modified_files,
+        get_git_modified_line_ranges,
+    )
+
+    captured_cmds: List[Sequence[str]] = []
+
+    def mock_run(args: Sequence[str], cwd: Optional[str] = None) -> Optional[str]:
+        captured_cmds.append(args)
+        return ""
+
+    monkeypatch.setattr("pydoppelgangerhunt.git_diff._run_git_command", mock_run)
+
+    # 1. With since_ref
+    get_git_modified_files(since_ref="release_branch")
+    assert len(captured_cmds) == 1
+    assert captured_cmds[0] == ["diff", "--name-only", "release_branch", "--"]
+
+    get_git_modified_line_ranges(since_ref="release_branch")
+    assert len(captured_cmds) == 2
+    assert captured_cmds[1] == ["diff", "--unified=0", "--src-prefix=a/", "--dst-prefix=b/", "release_branch", "--"]
+
+    # 2. Without since_ref (unstaged working tree diff)
+    get_git_modified_files()
+    assert len(captured_cmds) == 3
+    assert captured_cmds[2] == ["diff", "--name-only", "--"]
+
+    get_git_modified_line_ranges()
+    assert len(captured_cmds) == 4
+    assert captured_cmds[3] == ["diff", "--unified=0", "--src-prefix=a/", "--dst-prefix=b/", "--"]
+
+
+def test_run_git_command_utf8_decoding_and_replace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that _run_git_command enforces utf-8 encoding and replace error handling."""
+    from unittest import mock  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.git_diff import _run_git_command  # pylint: disable=import-outside-toplevel
+
+    captured_kwargs: Dict[str, Any] = {}
+
+    def mock_subprocess_run(*args: Any, **kwargs: Any) -> Any:
+        captured_kwargs.update(kwargs)
+        mock_proc = mock.MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = "pkg/café.py\npkg/🚀_launch.py\n"
+        return mock_proc
+
+    monkeypatch.setattr("subprocess.run", mock_subprocess_run)
+    out = _run_git_command(["diff", "--name-only"])
+    assert captured_kwargs.get("encoding") == "utf-8"
+    assert captured_kwargs.get("errors") == "replace"
+    assert captured_kwargs.get("text") is True
+    assert out is not None
+    assert "pkg/café.py" in out
+    assert "pkg/🚀_launch.py" in out
+
+
+def test_decode_git_cstyle_path_quoted_literal_unicode() -> None:
+    """Verifies that _decode_git_cstyle_path preserves literal Unicode and parses C-style octal escapes."""
+    from pydoppelgangerhunt.git_diff import (  # pylint: disable=import-outside-toplevel
+        _decode_git_cstyle_path,
+        parse_git_diff_hunks,
+    )
+
+    # 1. Literal Unicode in quoted path (core.quotepath = false or non-ASCII characters quoted due to space)
+    p1 = '"pkg/café file.py"'
+    assert _decode_git_cstyle_path(p1) == "pkg/café file.py"
+
+    # 2. Octal escaped Unicode (core.quotepath = true default)
+    p2 = '"pkg/caf\\303\\251 file.py"'
+    assert _decode_git_cstyle_path(p2) == "pkg/café file.py"
+
+    # 3. Mixed quotes, backslashes, tabs, and octal escapes
+    p3 = '"pkg/\\"quoted\\"\\\\file\\t\\303\\251.py"'
+    assert _decode_git_cstyle_path(p3) == 'pkg/"quoted"\\file\té.py'
+
+    # 4. Standard C escapes
+    p4 = '"pkg/line\\nbreak\\rreturn.py"'
+    assert _decode_git_cstyle_path(p4) == "pkg/line\nbreak\rreturn.py"
+
+    # 5. Unquoted plain path
+    p5 = "pkg/plain_path.py"
+    assert _decode_git_cstyle_path(p5) == "pkg/plain_path.py"
+
+    # 6. Integration with parse_git_diff_hunks
+    diff_sample = (
+        'diff --git "a/pkg/café file.py" "b/pkg/café file.py"\n'
+        '--- "a/pkg/café file.py"\n'
+        '+++ "b/pkg/café file.py"\n'
+        "@@ -1,5 +1,5 @@\n"
+        "+# modified line\n"
+    )
+    hunks = parse_git_diff_hunks(diff_sample)
+    assert any("café file.py" in k for k in hunks)
+
+
+def test_parse_git_diff_hunks_preserves_literal_quotes_in_filename() -> None:
+    """Verifies that parse_git_diff_hunks does not strip legitimate quotes from decoded filenames."""
+    from pydoppelgangerhunt.git_diff import parse_git_diff_hunks  # pylint: disable=import-outside-toplevel
+
+    # Git quotes a file containing leading/trailing quotes, escaping internal quotes:
+    # e.g., file `"pkg.py"` is output by git as `"\"pkg.py\""`
+    diff_with_quotes = (
+        'diff --git "a/\\"pkg.py\\"" "b/\\"pkg.py\\""\n'
+        '--- "a/\\"pkg.py\\""\n'
+        '+++ "b/\\"pkg.py\\""\n'
+        "@@ -10,3 +10,3 @@\n"
+        "+# modified line\n"
+    )
+    hunks = parse_git_diff_hunks(diff_with_quotes)
+    # The parsed filename should retain the literal quote character rather than having it stripped
+    assert any('"pkg.py"' in k or '"pkg.py' in k for k in hunks)
+
+
+def test_parse_git_diff_hunks_quoted_paths_with_timestamps_and_escapes() -> None:
+    """Verifies that parse_git_diff_hunks strips trailing timestamps outside quoted filenames without breaking path content."""
+    from pydoppelgangerhunt.git_diff import parse_git_diff_hunks  # pylint: disable=import-outside-toplevel
+
+    diff_timestamp = (
+        'diff --git "a/path with space.py" "b/path with space.py"\n'
+        '--- "a/path with space.py"\t2026-09-20 12:00:00.000000000 +0000\n'
+        '+++ "b/path with space.py"\t2026-09-20 12:00:00.000000000 +0000\n'
+        "@@ -5,2 +5,2 @@\n"
+        "+# change\n"
+    )
+    hunks = parse_git_diff_hunks(diff_timestamp)
+    assert any("path with space.py" in k for k in hunks)
+    assert not any("2026-09-20" in k for k in hunks)
+
+    # Unquoted with timestamp
+    diff_unquoted = (
+        "diff --git a/simple.py b/simple.py\n"
+        "--- a/simple.py\t2026-09-20 12:00:00.000000000 +0000\n"
+        "+++ b/simple.py\t2026-09-20 12:00:00.000000000 +0000\n"
+        "@@ -1,1 +1,1 @@\n"
+        "+# change\n"
+    )
+    hunks_unquoted = parse_git_diff_hunks(diff_unquoted)
+    assert any("simple.py" in k for k in hunks_unquoted)
+    assert not any("2026-09-20" in k for k in hunks_unquoted)
+
+
+def test_get_git_repo_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies get_git_repo_root resolves normalized worktree top-level path and handles non-git fallbacks."""
+    from pydoppelgangerhunt.git_diff import get_git_repo_root  # pylint: disable=import-outside-toplevel
+
+    sub_dir = tmp_path / "src" / "pkg"
+    sub_dir.mkdir(parents=True)
+    expected_root = str(tmp_path).replace("\\", "/")
+
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: expected_root + "\n" if args == ["rev-parse", "--show-toplevel"] else None,
+    )
+    resolved = get_git_repo_root(repo_root=sub_dir)
+    assert resolved == expected_root
+
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: None,
+    )
+    assert get_git_repo_root(repo_root=sub_dir) is None
+
+
+def test_subdirectory_scan_in_git_worktree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies CLI differential scan targeting a subdirectory inside a Git worktree resolves worktree root."""
+    repo = tmp_path / "worktree_repo"
+    repo.mkdir()
+    subpkg = repo / "src" / "subpkg"
+    subpkg.mkdir(parents=True)
+
+    foo_code = (
+        "def execute_pipeline(data_batch, multiplier):\n"
+        "    res = 0\n"
+        "    for val in data_batch:\n"
+        "        res += val * multiplier + 10\n"
+        "    return res\n"
+    )
+    clone_code = (
+        "def execute_pipeline(data_batch, multiplier):\n"
+        "    res = 0\n"
+        "    for val in data_batch:\n"
+        "        res += val * multiplier + 10\n"
+        "    return res\n"
+    )
+
+    (subpkg / "worker.py").write_text(foo_code, encoding="utf-8")
+    (subpkg / "worker_clone.py").write_text(clone_code, encoding="utf-8")
+
+    norm_repo = str(repo).replace("\\", "/")
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: (
+            norm_repo + "\n"
+            if args == ["rev-parse", "--show-toplevel"]
+            else (
+                "src/subpkg/worker.py\n"
+                if args == ["diff", "--name-only", "--"]
+                else (
+                    "diff --git a/src/subpkg/worker.py b/src/subpkg/worker.py\n"
+                    "--- a/src/subpkg/worker.py\n"
+                    "+++ b/src/subpkg/worker.py\n"
+                    "@@ -1,5 +1,5 @@\n"
+                    "+# change\n"
+                    if "--unified=0" in args
+                    else None
+                )
+            )
+        ),
+    )
+
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    html_out = repo / "report.html"
+    patch_out = repo / "patch.patch"
+    test_args = [
+        "pydoppelgangerhunt",
+        str(subpkg),
+        "--diff-only",
+        "--threshold",
+        "0.90",
+        "--min-lines",
+        "5",
+        "--diff",
+        "--suggest",
+        "--html",
+        str(html_out),
+        "--patch",
+        str(patch_out),
+    ]
+    monkeypatch.setattr("sys.argv", test_args)
+    exit_code = main()
+    assert exit_code == 1
+
+    # Downstream consumers must use git_worktree_root: no placeholders in HTML or patch
+    assert html_out.exists()
+    html_text = html_out.read_text(encoding="utf-8")
+    assert "# Source for" not in html_text
+    assert "execute_pipeline" in html_text
+
+    assert patch_out.exists()
+    patch_text = patch_out.read_text(encoding="utf-8")
+    assert "execute_pipeline" in patch_text
+
+
+def test_get_git_repo_root_security_and_edge_cases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies get_git_repo_root handles non-existent paths, null bytes, and corrupted git metadata safely."""
+    from pydoppelgangerhunt.git_diff import get_git_repo_root  # pylint: disable=import-outside-toplevel
+
+    # 1. Non-existent path returns None without raising exceptions
+    non_existent = tmp_path / "definitely_does_not_exist_12345"
+    assert get_git_repo_root(repo_root=non_existent) is None
+
+    # 2. Path with null byte is safely handled
+    null_byte_path = str(tmp_path) + "\x00invalid"
+    assert get_git_repo_root(repo_root=null_byte_path) is None
+
+    # 3. Empty or whitespace-only git output returns None
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: "   \n\t\n  ",
+    )
+    assert get_git_repo_root(repo_root=tmp_path) is None
+
+    # 4. Git error / non-zero exit returns None
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: None,
+    )
+    assert get_git_repo_root(repo_root=tmp_path) is None
+
+    # 5. Repository path containing hash characters is preserved (not stripped as an anchor)
+    hash_repo = "/tmp/repo#1/subproject"
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: hash_repo + "\n" if args == ["rev-parse", "--show-toplevel"] else None,
+    )
+    assert get_git_repo_root(repo_root=tmp_path) == hash_repo
+
+    # 6. Repository path containing significant trailing/leading space is preserved
+    spaced_repo = "/tmp/repo "
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.git_diff._run_git_command",
+        lambda args, cwd=None: spaced_repo + "\r\n" if args == ["rev-parse", "--show-toplevel"] else None,
+    )
+    assert get_git_repo_root(repo_root=tmp_path) == spaced_repo
+
+
+
+def test_diff_unit_matching_subprocess_efficiency(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies scan_target resolves git root once rather than executing git subprocess for every unit."""
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    code_file = tmp_path / "sample.py"
+    # Generate multiple functions
+    functions_code = "\n\n".join(
+        f"def fn_{i}(a, b):\n    val = a * 2 + b * {i}\n    return val + 10\n"
+        for i in range(20)
+    )
+    code_file.write_text(functions_code, encoding="utf-8")
+
+    git_call_count = 0
+
+    def counting_git_command(args: Any, cwd: Any = None) -> Optional[str]:  # pylint: disable=unused-argument
+        nonlocal git_call_count
+        if args == ["rev-parse", "--show-toplevel"]:
+            git_call_count += 1
+            return str(tmp_path).replace("\\", "/") + "\n"
+        return None
+
+    monkeypatch.setattr("pydoppelgangerhunt.git_diff._run_git_command", counting_git_command)
+
+    # Run scan_target with diff_files specifying a non-matching file
+    scan_target(
+        str(tmp_path),
+        min_lines=2,
+        min_tokens=3,
+        threshold=0.90,
+        diff_files=["other_unrelated_file.py"],
+    )
+
+    # Crucial assertion: get_git_repo_root must not be invoked per unit
+    assert git_call_count <= 2
+
+
+def test_normalize_git_paths_and_ranges_excludes_out_of_target_files(tmp_path: Path) -> None:
+    """Verifies that git paths and modified ranges outside target directory are excluded."""
+    from pydoppelgangerhunt.cli import (  # pylint: disable=import-outside-toplevel
+        _normalize_git_paths_for_target,
+        _normalize_modified_ranges_for_target,
+    )
+
+    repo_dir = tmp_path / "repo"
+    target_dir = repo_dir / "pkg"
+    target_dir.mkdir(parents=True)
+
+    raw_paths = ["foo.py", "pkg/bar.py", "other/baz.py"]
+    norm_paths = _normalize_git_paths_for_target(raw_paths, str(repo_dir), str(target_dir))
+    assert "foo.py" not in norm_paths
+    assert "other/baz.py" not in norm_paths
+    assert "pkg/bar.py" in norm_paths
+    assert "bar.py" not in norm_paths
+
+    ranges = {
+        "foo.py": [(1, 10)],
+        "pkg/bar.py": [(20, 30)],
+        "other/baz.py": [(5, 15)],
+    }
+    norm_ranges = _normalize_modified_ranges_for_target(ranges, str(repo_dir), str(target_dir))
+    assert "foo.py" not in norm_ranges.repo_ranges
+    assert "other/baz.py" not in norm_ranges.repo_ranges
+    assert "foo.py" not in norm_ranges.target_ranges
+    assert "other/baz.py" not in norm_ranges.target_ranges
+    assert norm_ranges.target_ranges["bar.py"] == [(20, 30)]
+    assert norm_ranges.repo_ranges["pkg/bar.py"] == [(20, 30)]
+    assert "bar.py" not in norm_ranges.repo_ranges
+
+
+def test_normalize_git_paths_prevents_unchanged_same_named_file_collision(tmp_path: Path) -> None:
+    """Verifies that _normalize_git_paths_for_target does not add target-relative alias which collides with unchanged files."""
+    from pydoppelgangerhunt.cli import (  # pylint: disable=import-outside-toplevel
+        _normalize_git_paths_for_target,
+        _normalize_modified_ranges_for_target,
+    )
+    from pydoppelgangerhunt.canonical_path import CanonicalPathResolver, build_diff_path_keys  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.git_diff import compute_unit_diff_overlap  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo"
+    src = repo / "src"
+    nested_src = src / "src"
+    nested_src.mkdir(parents=True)
+
+    # Modified file is repo/src/src/foo.py
+    raw_paths = ["src/src/foo.py"]
+    norm_paths = _normalize_git_paths_for_target(raw_paths, str(repo), str(src))
+    assert norm_paths == ["src/src/foo.py"]
+    assert "src/foo.py" not in norm_paths
+
+    resolver = CanonicalPathResolver(target_root=src, repo_root=repo)
+    diff_keys = build_diff_path_keys(norm_paths, resolver)
+    # Unchanged file at repo/src/foo.py (target-relative 'foo.py', repo-relative 'src/foo.py') must NOT match
+    assert not resolver.matches_diff("foo.py", diff_keys, basis="target")
+    # Modified file at repo/src/src/foo.py (target-relative 'src/foo.py', repo-relative 'src/src/foo.py') MUST match
+    assert resolver.matches_diff("src/foo.py", diff_keys, basis="target")
+
+    # Range map coordinate isolation:
+    # A modified line range at repo/src/src/foo.py lines 10-20
+    ranges = {"src/src/foo.py": [(10, 20)]}
+    norm_ranges = _normalize_modified_ranges_for_target(ranges, str(repo), str(src))
+
+    # In repo basis (used by worktree-relative units):
+    unit_modified_repo = {"file": "src/src/foo.py", "start": 10, "end": 20}
+    unit_unchanged_repo = {"file": "src/foo.py", "start": 10, "end": 20}
+    mod_overlap, _ = compute_unit_diff_overlap(unit_modified_repo, norm_ranges, unit_basis="repo")
+    unmod_overlap, _ = compute_unit_diff_overlap(unit_unchanged_repo, norm_ranges, unit_basis="repo")
+    assert mod_overlap == 11
+    assert unmod_overlap == 0  # CRUCIAL: Unchanged src/foo.py must NOT collide with src/src/foo.py
+
+    # In target basis (used by target-relative units):
+    unit_modified_target = {"file": "src/foo.py", "start": 10, "end": 20}
+    unit_unchanged_target = {"file": "foo.py", "start": 10, "end": 20}
+    mod_overlap_t, _ = compute_unit_diff_overlap(unit_modified_target, norm_ranges, unit_basis="target")
+    unmod_overlap_t, _ = compute_unit_diff_overlap(unit_unchanged_target, norm_ranges, unit_basis="target")
+    assert mod_overlap_t == 11
+    assert unmod_overlap_t == 0
+
+
+def test_decode_git_cstyle_path_preserves_spaces() -> None:
+    """Verifies that _decode_git_cstyle_path preserves significant leading/trailing whitespace in unquoted paths."""
+    from pydoppelgangerhunt.git_diff import _decode_git_cstyle_path  # pylint: disable=import-outside-toplevel
+
+    assert _decode_git_cstyle_path(" foo.py\n") == " foo.py"
+    assert _decode_git_cstyle_path("bar.py \r\n") == "bar.py "
+    assert _decode_git_cstyle_path("  pkg/baz.py  \n") == "  pkg/baz.py  "
+    assert _decode_git_cstyle_path('" foo.py"\n') == " foo.py"
+    assert _decode_git_cstyle_path("   \n") == ""
+
+
+def test_parse_git_diff_hunks_preserves_trailing_spaces_unquoted() -> None:
+    """Verifies that parse_git_diff_hunks preserves trailing spaces in unquoted diff filenames."""
+    from pydoppelgangerhunt.git_diff import parse_git_diff_hunks  # pylint: disable=import-outside-toplevel
+
+    # 1. Unquoted diff header with trailing space before newline
+    diff_unquoted_trailing_space = (
+        "diff --git a/foo.py  b/foo.py \n"
+        "--- a/foo.py \n"
+        "+++ b/foo.py \n"
+        "@@ -1,3 +1,3 @@\n"
+        "+# modified line\n"
+    )
+    hunks = parse_git_diff_hunks(diff_unquoted_trailing_space)
+    assert "foo.py " in hunks
+    assert hunks["foo.py "] == [(1, 3)]
+
+    # 2. Unquoted diff header with trailing space before timestamp tab
+    diff_unquoted_timestamp = (
+        "diff --git a/bar.py  b/bar.py \n"
+        "--- a/bar.py \t2026-09-22 12:00:00.000000000 +0000\n"
+        "+++ b/bar.py \t2026-09-22 12:00:00.000000000 +0000\n"
+        "@@ -10,2 +10,2 @@\n"
+        "+# modified line\n"
+    )
+    hunks_ts = parse_git_diff_hunks(diff_unquoted_timestamp)
+    assert "bar.py " in hunks_ts
+    assert hunks_ts["bar.py "] == [(10, 11)]
+
+
+def test_run_git_diff_clean_since_ref() -> None:
+    """Verifies that _run_git_diff cleans since_ref, rejects leading hyphens, and ignores whitespace-only refs."""
+    from pydoppelgangerhunt.git_diff import _run_git_diff  # pylint: disable=import-outside-toplevel
+
+    with mock.patch("pydoppelgangerhunt.git_diff._run_git_command") as mock_cmd:
+        mock_cmd.return_value = ""
+        # 1. Whitespace-only ref behaves like unstaged diff without passing whitespace to git
+        _run_git_diff(["--name-only"], since_ref="   ")
+        mock_cmd.assert_called_once_with(["diff", "--name-only", "--"], cwd=None)
+
+    with mock.patch("pydoppelgangerhunt.git_diff._run_git_command") as mock_cmd:
+        # 2. Leading hyphen rejection
+        res = _run_git_diff(["--name-only"], since_ref="  --invalid-flag  ")
+        assert res is None
+        mock_cmd.assert_not_called()
+
+    with mock.patch("pydoppelgangerhunt.git_diff._run_git_command") as mock_cmd:
+        mock_cmd.return_value = ""
+        # 3. Valid ref with surrounding whitespace is stripped
+        _run_git_diff(["--name-only"], since_ref="  HEAD~1  ")
+        mock_cmd.assert_called_once_with(["diff", "--name-only", "HEAD~1", "--"], cwd=None)
+
+
+def test_parse_git_diff_hunks_no_prefix_single_letter_dir() -> None:
+    """Verifies that parse_git_diff_hunks does not strip b/ on --no-prefix diffs for single-letter root dirs."""
+    from pydoppelgangerhunt.git_diff import parse_git_diff_hunks  # pylint: disable=import-outside-toplevel
+
+    # 1. Unified diff produced with --no-prefix on real repo path b/worker.py
+    diff_no_prefix = (
+        "diff --git b/worker.py b/worker.py\n"
+        "--- b/worker.py\n"
+        "+++ b/worker.py\n"
+        "@@ -10,3 +10,3 @@\n"
+        "+# change in worker\n"
+    )
+    hunks_np = parse_git_diff_hunks(diff_no_prefix)
+    assert "b/worker.py" in hunks_np
+    assert "worker.py" not in hunks_np
+    assert hunks_np["b/worker.py"] == [(10, 12)]
+
+    # 2. Standard diff with a/ and b/ prefixes for real repo path b/worker.py
+    diff_prefixed = (
+        "diff --git a/b/worker.py b/b/worker.py\n"
+        "--- a/b/worker.py\n"
+        "+++ b/b/worker.py\n"
+        "@@ -10,3 +10,3 @@\n"
+        "+# change in worker\n"
+    )
+    hunks_pref = parse_git_diff_hunks(diff_prefixed)
+    assert "b/worker.py" in hunks_pref
+    assert hunks_pref["b/worker.py"] == [(10, 12)]
+
+    # 3. Explicit strip_prefix=False preserves prefix even on a/b/ headers
+    hunks_explicit_false = parse_git_diff_hunks(diff_prefixed, strip_prefix=False)
+    assert "b/b/worker.py" in hunks_explicit_false
+
+    # 4. Explicit strip_prefix=True forces prefix stripping
+    diff_custom = (
+        "--- old/mod.py\n"
+        "+++ b/mod.py\n"
+        "@@ -5,1 +5,1 @@\n"
+        "+line\n"
+    )
+    hunks_forced = parse_git_diff_hunks(diff_custom, strip_prefix=True)
+    assert "mod.py" in hunks_forced
+
+
+def test_normalize_git_paths_deduplicates_while_preserving_order(tmp_path: Path) -> None:
+    """Verifies that _normalize_git_paths_for_target deduplicates duplicate paths and preserves order."""
+    from pydoppelgangerhunt.cli import _normalize_git_paths_for_target  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo"
+    pkg = repo / "pkg"
+    pkg.mkdir(parents=True)
+
+    raw_paths = [
+        "pkg/a.py",
+        "pkg/b.py",
+        "pkg/a.py",
+        "pkg/c.py",
+        "pkg/b.py",
+        "pkg/a.py",
+    ]
+    norm_paths = _normalize_git_paths_for_target(raw_paths, str(repo), str(pkg))
+    assert norm_paths == ["pkg/a.py", "pkg/b.py", "pkg/c.py"]
+
+
+def test_decode_git_cstyle_path_backslashes_and_astral_emojis() -> None:
+    """Stress tests _decode_git_cstyle_path with escaped backslashes, mixed slashes, and astral plane emojis."""
+    from pydoppelgangerhunt.git_diff import _decode_git_cstyle_path  # pylint: disable=import-outside-toplevel
+
+    # 1. Unquoted Windows backslashes
+    assert _decode_git_cstyle_path(r"pkg\sub\worker.py") == r"pkg\sub\worker.py"
+
+    # 2. Quoted escaped backslashes
+    assert _decode_git_cstyle_path(r'"pkg\\sub\\worker.py"') == r"pkg\sub\worker.py"
+    assert _decode_git_cstyle_path(r'"pkg\\\\worker.py"') == r"pkg\\worker.py"
+    assert _decode_git_cstyle_path(r'"src/pkg\\sub/file.py"') == r"src/pkg\sub/file.py"
+
+    # 3. 4-byte astral plane emojis via octal escapes (e.g. core.quotepath = true default)
+    # Rocket emoji 🚀 (U+1F680): \xf0\x9f\x9a\x80 -> \360\237\232\200
+    p_rocket = r'"pkg/\360\237\232\200_launch.py"'
+    assert _decode_git_cstyle_path(p_rocket) == "pkg/🚀_launch.py"
+
+    # Snake emoji 🐍 (U+1F40D): \xf0\x9f\x90\x8d -> \360\237\220\215
+    p_snake = r'"src/\360\237\220\215.py"'
+    assert _decode_git_cstyle_path(p_snake) == "src/🐍.py"
+
+    # Sparkles emoji ✨ (U+2728): \xe2\x9c\xa8 -> \342\234\250
+    p_sparkles = r'"tests/\342\234\250_test.py"'
+    assert _decode_git_cstyle_path(p_sparkles) == "tests/✨_test.py"
+
+    # 4. Quoted literal UTF-8 astral plane emoji (core.quotepath = false)
+    assert _decode_git_cstyle_path('"pkg/🚀_launch.py"') == "pkg/🚀_launch.py"
+
+    # 5. Combined literal Unicode + escaped backslash + octal emoji
+    p_combo = r'"café/\360\237\232\200\\worker.py"'
+    assert _decode_git_cstyle_path(p_combo) == "café/🚀\\worker.py"
+
+
+def test_diff_range_map_get_ranges_for_unit_fallbacks_and_anti_collision() -> None:
+    """Verifies that DiffRangeMap.get_ranges_for_unit correctly falls through without dead code or collision."""
+    from pydoppelgangerhunt.git_diff import DiffRangeMap  # pylint: disable=import-outside-toplevel
+
+    # 1. Tagged key fallback
+    tagged_map = DiffRangeMap({"repo:worker.py": [(1, 5)], "target:worker.py": [(10, 15)]})
+    assert tagged_map.get_ranges_for_unit({"file": "worker.py"}, unit_basis="repo") == [(1, 5)]
+    assert tagged_map.get_ranges_for_unit({"file": "worker.py"}, unit_basis="target") == [(10, 15)]
+
+    # 2. Plain un-tagged key fallback (no coordinate sets)
+    plain_map = DiffRangeMap({"worker.py": [(20, 25)]})
+    assert plain_map.get_ranges_for_unit({"file": "worker.py"}, unit_basis="repo") == [(20, 25)]
+    assert plain_map.get_ranges_for_unit({"file": "worker.py"}, unit_basis="target") == [(20, 25)]
+
+    # 3. Coordinate isolation and anti-collision
+    # repo/src/foo.py was modified (repo: 'src/foo.py', target: 'foo.py')
+    isolated = DiffRangeMap(
+        {"repo:src/foo.py": [(1, 5)], "src/foo.py": [(1, 5)], "target:foo.py": [(1, 5)]},
+        repo_ranges={"src/foo.py": [(1, 5)]},
+        target_ranges={"foo.py": [(1, 5)]},
+    )
+    # Repo basis: 'src/foo.py' matches, 'foo.py' does NOT match
+    assert isolated.get_ranges_for_unit({"file": "src/foo.py"}, unit_basis="repo") == [(1, 5)]
+    assert isolated.get_ranges_for_unit({"file": "foo.py"}, unit_basis="repo") is None
+
+    # Target basis: 'foo.py' matches, 'src/foo.py' does NOT match (crucial anti-collision test)
+    assert isolated.get_ranges_for_unit({"file": "foo.py"}, unit_basis="target") == [(1, 5)]
+    assert isolated.get_ranges_for_unit({"file": "src/foo.py"}, unit_basis="target") is None
+
+
+def test_filter_clones_by_git_diff_debug_logging_on_empty_lookup(caplog: pytest.LogCaptureFixture) -> None:
+    """Verifies filter_clones_by_git_diff emits debug logs when DiffRangeMap lookup is empty across all units."""
+    import logging
+    from pydoppelgangerhunt.git_diff import (  # pylint: disable=import-outside-toplevel
+        DiffRangeMap,
+        filter_clones_by_git_diff,
+    )
+
+    u1 = {"file": "foo.py", "start": 1, "end": 10}
+    u2 = {"file": "other.py", "start": 1, "end": 10}
+    clones = [(1.0, u1, u2)]
+
+    diff_map = DiffRangeMap(
+        {"repo:src/foo.py": [(1, 5)], "src/foo.py": [(1, 5)], "target:foo.py": [(1, 5)]},
+        repo_ranges={"src/foo.py": [(1, 5)]},
+        target_ranges={"foo.py": [(1, 5)]},
+    )
+
+    # 1. Querying with unit_basis="repo" when units are target-relative:
+    # 'foo.py' does not match repo_ranges, but matches target_ranges -> triggers basis mismatch log
+    with caplog.at_level(logging.DEBUG, logger="pydoppelgangerhunt.git_diff"):
+        caplog.clear()
+        res = filter_clones_by_git_diff(clones, diff_map, unit_basis="repo")
+        assert len(res) == 0
+        assert any(
+            "Possible basis mismatch" in record.message and "authoritative coordinate set 'repo'" in record.message
+            for record in caplog.records
+        )
+
+    # 2. Querying when no units match either coordinate set:
+    u_unrelated1 = {"file": "unrelated1.py", "start": 1, "end": 10}
+    u_unrelated2 = {"file": "unrelated2.py", "start": 1, "end": 10}
+    unrelated_clones = [(1.0, u_unrelated1, u_unrelated2)]
+    with caplog.at_level(logging.DEBUG, logger="pydoppelgangerhunt.git_diff"):
+        caplog.clear()
+        res2 = filter_clones_by_git_diff(unrelated_clones, diff_map, unit_basis="repo")
+        assert len(res2) == 0
+        assert any(
+            "came back empty across all 2 unit(s)" in record.message and "Possible basis mismatch" not in record.message
+            for record in caplog.records
+        )
+
+
+def test_apply_baseline_and_diff_filters_adapts_to_target_relative_clones(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    """Verifies _apply_baseline_and_diff_filters adapts to target-relative clones when repo basis misses."""
+    import argparse
+    import logging
+    from unittest.mock import patch  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.cli import _apply_baseline_and_diff_filters  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+    foo = src / "foo.py"
+    foo.write_text("def a(): pass\n", encoding="utf-8")
+
+    u1 = {"file": "foo.py", "start": 1, "end": 5}
+    u2 = {"file": "foo.py", "start": 1, "end": 5}
+    clones = [(1.0, u1, u2)]
+
+    args = argparse.Namespace(
+        baseline=None,
+        prune_baseline=False,
+        diff_only=True,
+        partial_hunk_policy="any",
+        min_diff_overlap=0.0,
+        since=None,
+        format="json",
+    )
+    with patch("pydoppelgangerhunt.cli._safe_call_git_diff_helper") as mock_diff:
+        mock_diff.return_value = {"src/foo.py": [(1, 5)]}
+        with caplog.at_level(logging.DEBUG, logger="pydoppelgangerhunt.cli"):
+            filtered, _ = _apply_baseline_and_diff_filters(
+                clones,
+                args,
+                tool_cfg={},
+                target_repo_root=str(src),
+                target=str(src),
+                repo_root=str(repo),
+            )
+            assert len(filtered) == 1
+            assert any("using unit_basis='target'" in record.message for record in caplog.records)
+
+
+def test_apply_baseline_and_diff_filters_adapts_past_initial_untouched_clones(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    """Verifies that basis inference searches beyond the first 10 clones when initial clones are untouched."""
+    import argparse
+    import logging
+    from unittest.mock import patch  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.cli import _apply_baseline_and_diff_filters  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+    foo = src / "foo.py"
+    foo.write_text("def a(): pass\n", encoding="utf-8")
+
+    # 15 initial clone pairs in untouched files
+    untouched_clones = [
+        (1.0, {"file": f"untouched_{i}.py", "start": 1, "end": 5}, {"file": f"untouched_{i}.py", "start": 10, "end": 15})
+        for i in range(15)
+    ]
+    # Clone #16 is target-relative touching the diff in src/foo.py
+    target_rel_clone = (1.0, {"file": "foo.py", "start": 1, "end": 5}, {"file": "foo.py", "start": 1, "end": 5})
+    all_clones = untouched_clones + [target_rel_clone]
+
+    args = argparse.Namespace(
+        baseline=None,
+        prune_baseline=False,
+        diff_only=True,
+        partial_hunk_policy="any",
+        min_diff_overlap=0.0,
+        since=None,
+        format="json",
+    )
+    with patch("pydoppelgangerhunt.cli._safe_call_git_diff_helper") as mock_diff:
+        mock_diff.return_value = {"src/foo.py": [(1, 5)]}
+        with caplog.at_level(logging.DEBUG, logger="pydoppelgangerhunt.cli"):
+            filtered, _ = _apply_baseline_and_diff_filters(
+                all_clones,
+                args,
+                tool_cfg={},
+                target_repo_root=str(src),
+                target=str(src),
+                repo_root=str(repo),
+            )
+            # The 16th clone must be detected and retained under unit_basis='target'
+            assert len(filtered) == 1
+            assert filtered[0][1]["file"] == "foo.py"
+            assert any("using unit_basis='target'" in record.message for record in caplog.records)
+
+
+
+
