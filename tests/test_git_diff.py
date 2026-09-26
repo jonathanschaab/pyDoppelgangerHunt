@@ -978,6 +978,8 @@ def test_subdirectory_scan_in_git_worktree(tmp_path: Path, monkeypatch: pytest.M
 
     from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
 
+    html_out = repo / "report.html"
+    patch_out = repo / "patch.patch"
     test_args = [
         "pydoppelgangerhunt",
         str(subpkg),
@@ -986,10 +988,26 @@ def test_subdirectory_scan_in_git_worktree(tmp_path: Path, monkeypatch: pytest.M
         "0.90",
         "--min-lines",
         "5",
+        "--diff",
+        "--suggest",
+        "--html",
+        str(html_out),
+        "--patch",
+        str(patch_out),
     ]
     monkeypatch.setattr("sys.argv", test_args)
     exit_code = main()
     assert exit_code == 1
+
+    # Downstream consumers must use git_worktree_root: no placeholders in HTML or patch
+    assert html_out.exists()
+    html_text = html_out.read_text(encoding="utf-8")
+    assert "# Source for" not in html_text
+    assert "execute_pipeline" in html_text
+
+    assert patch_out.exists()
+    patch_text = patch_out.read_text(encoding="utf-8")
+    assert "execute_pipeline" in patch_text
 
 
 def test_get_git_repo_root_security_and_edge_cases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1096,16 +1114,23 @@ def test_normalize_git_paths_and_ranges_excludes_out_of_target_files(tmp_path: P
         "other/baz.py": [(5, 15)],
     }
     norm_ranges = _normalize_modified_ranges_for_target(ranges, str(repo_dir), str(target_dir))
-    assert "foo.py" not in norm_ranges
-    assert "other/baz.py" not in norm_ranges
-    assert norm_ranges["bar.py"] == [(20, 30)]
-    assert norm_ranges["pkg/bar.py"] == [(20, 30)]
+    assert "foo.py" not in norm_ranges.repo_ranges
+    assert "other/baz.py" not in norm_ranges.repo_ranges
+    assert "foo.py" not in norm_ranges.target_ranges
+    assert "other/baz.py" not in norm_ranges.target_ranges
+    assert norm_ranges.target_ranges["bar.py"] == [(20, 30)]
+    assert norm_ranges.repo_ranges["pkg/bar.py"] == [(20, 30)]
+    assert "bar.py" not in norm_ranges.repo_ranges
 
 
 def test_normalize_git_paths_prevents_unchanged_same_named_file_collision(tmp_path: Path) -> None:
     """Verifies that _normalize_git_paths_for_target does not add target-relative alias which collides with unchanged files."""
-    from pydoppelgangerhunt.cli import _normalize_git_paths_for_target  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.cli import (  # pylint: disable=import-outside-toplevel
+        _normalize_git_paths_for_target,
+        _normalize_modified_ranges_for_target,
+    )
     from pydoppelgangerhunt.canonical_path import CanonicalPathResolver, build_diff_path_keys  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.git_diff import compute_unit_diff_overlap  # pylint: disable=import-outside-toplevel
 
     repo = tmp_path / "repo"
     src = repo / "src"
@@ -1124,6 +1149,27 @@ def test_normalize_git_paths_prevents_unchanged_same_named_file_collision(tmp_pa
     assert not resolver.matches_diff("foo.py", diff_keys, basis="target")
     # Modified file at repo/src/src/foo.py (target-relative 'src/foo.py', repo-relative 'src/src/foo.py') MUST match
     assert resolver.matches_diff("src/foo.py", diff_keys, basis="target")
+
+    # Range map coordinate isolation:
+    # A modified line range at repo/src/src/foo.py lines 10-20
+    ranges = {"src/src/foo.py": [(10, 20)]}
+    norm_ranges = _normalize_modified_ranges_for_target(ranges, str(repo), str(src))
+
+    # In repo basis (used by worktree-relative units):
+    unit_modified_repo = {"file": "src/src/foo.py", "start": 10, "end": 20}
+    unit_unchanged_repo = {"file": "src/foo.py", "start": 10, "end": 20}
+    mod_overlap, _ = compute_unit_diff_overlap(unit_modified_repo, norm_ranges, unit_basis="repo")
+    unmod_overlap, _ = compute_unit_diff_overlap(unit_unchanged_repo, norm_ranges, unit_basis="repo")
+    assert mod_overlap == 11
+    assert unmod_overlap == 0  # CRUCIAL: Unchanged src/foo.py must NOT collide with src/src/foo.py
+
+    # In target basis (used by target-relative units):
+    unit_modified_target = {"file": "src/foo.py", "start": 10, "end": 20}
+    unit_unchanged_target = {"file": "foo.py", "start": 10, "end": 20}
+    mod_overlap_t, _ = compute_unit_diff_overlap(unit_modified_target, norm_ranges, unit_basis="target")
+    unmod_overlap_t, _ = compute_unit_diff_overlap(unit_unchanged_target, norm_ranges, unit_basis="target")
+    assert mod_overlap_t == 11
+    assert unmod_overlap_t == 0
 
 
 def test_decode_git_cstyle_path_preserves_spaces() -> None:

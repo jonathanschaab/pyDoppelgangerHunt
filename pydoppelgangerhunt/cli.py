@@ -33,6 +33,7 @@ from pydoppelgangerhunt.canonical_path import CanonicalPathResolver
 from pydoppelgangerhunt.coverage import check_asymmetric_coverage, read_coverage_data
 from pydoppelgangerhunt.fixer import generate_refactoring_patch
 from pydoppelgangerhunt.git_diff import (
+    DiffRangeMap,
     check_temporal_divergence,
     filter_clones_by_git_diff,
     get_git_head_commit,
@@ -364,20 +365,22 @@ def _render_pair_diff_and_suggestions(
     u2: Dict[str, Any],
     *,
     args: argparse.Namespace,
-    target_repo_root: str,
+    target_repo_root: str = ".",
+    repo_root: Optional[str] = None,
     use_color: bool,
     indent: str = "    ",
 ) -> List[str]:
     """Renders optional refactoring suggestion and unified diff for a pair of clone units."""
+    effective_root = repo_root or target_repo_root
     lines: List[str] = []
     if args.suggest:
-        sug = synthesize_refactoring_suggestion(u1, u2, repo_root=target_repo_root)
+        sug = synthesize_refactoring_suggestion(u1, u2, repo_root=effective_root)
         sug_colored = colorize(sug, COLOR_YELLOW, use_color)
         print(indent + sug_colored.replace("\n", "\n" + indent))
         lines.append(indent + sug.replace("\n", "\n" + indent))
     if args.diff:
         diff_out = generate_clone_diff(
-            u1, u2, repo_root=target_repo_root, color=use_color
+            u1, u2, repo_root=effective_root, color=use_color
         )
         if diff_out:
             print(f"{indent}--- Diff ---")
@@ -432,17 +435,30 @@ def _normalize_modified_ranges_for_target(
     modified_ranges: Dict[str, List[Tuple[int, int]]],
     git_root: str,
     target_repo_root: str,
-) -> Dict[str, List[Tuple[int, int]]]:
-    """Expands modified ranges to include target-relative paths alongside worktree-relative paths."""
+) -> DiffRangeMap:
+    """Partitions modified ranges into isolated target-relative and repo-relative coordinate mappings.
+
+    Excludes files outside the target subdirectory and guarantees that target-relative
+    and repository-relative coordinate spaces do not collide in a single flat namespace.
+    """
     try:
         res_git = Path(git_root).resolve()
         res_target = Path(target_repo_root).resolve()
     except (ValueError, OSError, RuntimeError):
-        return modified_ranges
+        return DiffRangeMap(
+            modified_ranges,
+            repo_ranges=modified_ranges,
+            target_ranges=modified_ranges,
+        )
     if res_git == res_target:
-        return modified_ranges
+        return DiffRangeMap(
+            modified_ranges,
+            repo_ranges=modified_ranges,
+            target_ranges=modified_ranges,
+        )
 
     resolver = CanonicalPathResolver(target_root=res_target, repo_root=res_git)
+    repo_ranges: Dict[str, List[Tuple[int, int]]] = {}
     target_ranges: Dict[str, List[Tuple[int, int]]] = {}
     for p_str, ranges in modified_ranges.items():
         if not p_str:
@@ -450,18 +466,31 @@ def _normalize_modified_ranges_for_target(
         cp = resolver.resolve(p_str, basis="repo")
         rel = cp.target_relative
         if rel and rel != ".":
+            repo_ranges[p_str] = ranges
             target_ranges[rel] = ranges
-            target_ranges[p_str] = ranges
-    return target_ranges
+
+    flat_tagged: Dict[str, List[Tuple[int, int]]] = {}
+    for p, r in repo_ranges.items():
+        flat_tagged[f"repo:{p}"] = r
+        flat_tagged[p] = r
+    for p, r in target_ranges.items():
+        flat_tagged[f"target:{p}"] = r
+
+    return DiffRangeMap(
+        flat_tagged,
+        target_ranges=target_ranges,
+        repo_ranges=repo_ranges,
+    )
 
 
 def _apply_baseline_and_diff_filters(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     args: argparse.Namespace,
     tool_cfg: Dict[str, Any],
-    target_repo_root: str,
+    target_repo_root: str = ".",
     preloaded_baseline: Optional[BaselineFingerprints] = None,
     target: Optional[str] = None,
+    repo_root: Optional[str] = None,
 ) -> Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Optional[int]]:
     """Applies baseline pruning, baseline suppression, and git diff line filtering.
 
@@ -472,7 +501,7 @@ def _apply_baseline_and_diff_filters(
 
     target_val = target or getattr(args, "target", None) or target_repo_root
     git_root = _safe_call_git_diff_helper(get_git_repo_root, None, target_repo_root)
-    git_worktree_root = git_root if git_root and os.path.exists(git_root) else target_repo_root
+    git_worktree_root = repo_root or (git_root if git_root and os.path.exists(git_root) else target_repo_root)
 
     if args.prune_baseline:
         if not baseline_path:
@@ -536,6 +565,7 @@ def _apply_baseline_and_diff_filters(
             modified_ranges,
             policy=diff_policy,
             min_overlap_ratio=min_overlap,
+            unit_basis="repo",
         )
         if args.format == "text":
             print(f"[INFO] Filtered by git diff (policy={diff_policy}): {len(clones)} clone pair(s) touch modified lines.")
@@ -553,9 +583,11 @@ def _render_text_violations(
     cov_data: Optional[Dict[str, Set[int]]] = None,
     use_color: bool = False,
     target_repo_root: str = ".",
+    repo_root: Optional[str] = None,
     audit_tests_enabled: bool = False,
 ) -> List[str]:
     """Renders human-readable text output for clone violations (either clustered families or pairwise)."""
+    effective_root = repo_root or target_repo_root
     report_lines: List[str] = []
     active_cov = cov_data or {}
     if args.cluster and families is not None:
@@ -595,7 +627,7 @@ def _render_text_violations(
                         cov_data=active_cov,
                         use_color=use_color,
                         indent="      ",
-                        repo_root=target_repo_root,
+                        repo_root=effective_root,
                     )
                 )
                 report_lines.extend(
@@ -603,7 +635,7 @@ def _render_text_violations(
                         fam["members"][0],
                         fam["members"][1],
                         args=args,
-                        target_repo_root=target_repo_root,
+                        target_repo_root=effective_root,
                         use_color=use_color,
                         indent="      ",
                     )
@@ -638,7 +670,7 @@ def _render_text_violations(
                     cov_data=active_cov,
                     use_color=use_color,
                     indent="    ",
-                    repo_root=target_repo_root,
+                    repo_root=effective_root,
                 )
             )
             if audit_tests_enabled and n1.startswith("test_") and n2.startswith("test_"):
@@ -650,7 +682,7 @@ def _render_text_violations(
                     u1,
                     u2,
                     args=args,
-                    target_repo_root=target_repo_root,
+                    target_repo_root=effective_root,
                     use_color=use_color,
                     indent="    ",
                 )
@@ -1245,6 +1277,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         target_repo_root=target_repo_root,
         preloaded_baseline=preloaded_baseline,
         target=target,
+        repo_root=git_worktree_root,
     )
     if early_exit is not None:
         return early_exit
@@ -1294,7 +1327,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             threshold,
             families=families,
             stats=stats,
-            repo_root=target_repo_root,
+            repo_root=git_worktree_root,
         )
         _write_artifact_file(args.html, html_report, "HTML", args.format == "text")
 
@@ -1302,7 +1335,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         patch_text = (
             generate_refactoring_patch(
                 clones,
-                repo_root=target_repo_root,
+                repo_root=git_worktree_root,
                 type_merge_strategy=type_merge_strategy,
                 replace_clones=replace_clones,
                 method_binding=method_binding,
@@ -1360,7 +1393,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         families=families,
         cov_data=cov_data,
         use_color=use_color,
-        target_repo_root=target_repo_root,
+        target_repo_root=git_worktree_root,
         audit_tests_enabled=audit_tests_enabled,
     )
 

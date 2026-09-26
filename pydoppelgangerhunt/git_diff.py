@@ -12,6 +12,57 @@ from pydoppelgangerhunt.config import find_matching_path_value, normalize_path_s
 MAJOR_POLICY_THRESHOLD: float = 0.50
 NEW_POLICY_THRESHOLD: float = 0.80
 
+
+class DiffRangeMap(Dict[str, List[Tuple[int, int]]]):
+    """Stores modified line ranges with isolated target-relative and repo-relative coordinate sets.
+
+    Prevents coordinate collisions between target-relative and repository-relative paths
+    (e.g., distinguishing repo/src/src/foo.py from repo/src/foo.py during subdirectory scans).
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        target_ranges: Optional[Dict[str, List[Tuple[int, int]]]] = None,
+        repo_ranges: Optional[Dict[str, List[Tuple[int, int]]]] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.target_ranges: Dict[str, List[Tuple[int, int]]] = dict(target_ranges or {})
+        self.repo_ranges: Dict[str, List[Tuple[int, int]]] = dict(repo_ranges or {})
+
+    def get_ranges_for_unit(
+        self,
+        unit: Dict[str, Any],
+        unit_basis: str = "repo",
+    ) -> Optional[List[Tuple[int, int]]]:
+        """Looks up modified ranges for a unit based on its coordinate basis."""
+        raw_file = str(unit.get("file") or "")
+        f_norm = normalize_path_string(raw_file, strip_anchor=True)
+        if not f_norm:
+            return None
+
+        # 1. Coordinate-isolated lookup based on unit_basis
+        if unit_basis == "repo" and self.repo_ranges:
+            if f_norm in self.repo_ranges:
+                return self.repo_ranges[f_norm]
+            return self.repo_ranges.get(f_norm)
+        if unit_basis == "target" and self.target_ranges:
+            if f_norm in self.target_ranges:
+                return self.target_ranges[f_norm]
+            return self.target_ranges.get(f_norm)
+
+        # 2. Tagged lookup fallback (e.g. repo:<path> or target:<path>)
+        tagged_key = f"{unit_basis}:{f_norm}"
+        if tagged_key in self:
+            return self[tagged_key]
+
+        # 3. Direct un-tagged dict key lookup
+        if f_norm in self:
+            return self[f_norm]
+
+        return None
+
 _GIT_C_ESCAPES: Dict[int, int] = {
     ord(b"a"): 0x07,
     ord(b"b"): 0x08,
@@ -286,6 +337,7 @@ def get_git_head_commit(
 def compute_unit_diff_overlap(
     unit: Dict[str, Any],
     modified_ranges: Dict[str, List[Tuple[int, int]]],
+    unit_basis: str = "repo",
 ) -> Tuple[int, float]:
     """Computes the number of modified lines and the fractional overlap ratio for an AST unit.
 
@@ -310,7 +362,29 @@ def compute_unit_diff_overlap(
         >>> overlap_ratio
         0.625
     """
-    target_ranges = find_matching_path_value(str(unit.get("file") or ""), modified_ranges)
+    target_ranges: Optional[List[Tuple[int, int]]] = None
+    if isinstance(modified_ranges, DiffRangeMap) or hasattr(modified_ranges, "get_ranges_for_unit"):
+        target_ranges = modified_ranges.get_ranges_for_unit(unit, unit_basis=unit_basis)
+    elif hasattr(modified_ranges, "repo_ranges") and unit_basis == "repo":
+        repo_map = getattr(modified_ranges, "repo_ranges")
+        if isinstance(repo_map, dict):
+            raw_f = str(unit.get("file") or "")
+            f_norm = normalize_path_string(raw_f, strip_anchor=True)
+            target_ranges = repo_map.get(f_norm)
+    elif hasattr(modified_ranges, "target_ranges") and unit_basis == "target":
+        target_map = getattr(modified_ranges, "target_ranges")
+        if isinstance(target_map, dict):
+            raw_f = str(unit.get("file") or "")
+            f_norm = normalize_path_string(raw_f, strip_anchor=True)
+            target_ranges = target_map.get(f_norm)
+    else:
+        raw_f = str(unit.get("file") or "")
+        f_norm = normalize_path_string(raw_f, strip_anchor=True)
+        if f_norm in modified_ranges:
+            target_ranges = modified_ranges[f_norm]
+        else:
+            target_ranges = find_matching_path_value(raw_f, modified_ranges)
+
     if not target_ranges:
         return 0, 0.0
 
@@ -335,6 +409,7 @@ def is_unit_in_modified_ranges(
     modified_ranges: Dict[str, List[Tuple[int, int]]],
     min_overlap_ratio: float = 0.0,
     policy: str = "any",
+    unit_basis: str = "repo",
 ) -> bool:
     """Checks if AST unit overlaps with git-modified line ranges according to the partial hunk policy.
 
@@ -343,7 +418,9 @@ def is_unit_in_modified_ranges(
         - "major": Overlaps if at least 50% of the unit lines are modified (or min_overlap_ratio if > 0).
         - "new": Overlaps if at least 80% of the unit lines are modified (or min_overlap_ratio if > 0).
     """
-    overlap_count, ratio = compute_unit_diff_overlap(unit, modified_ranges)
+    overlap_count, ratio = compute_unit_diff_overlap(
+        unit, modified_ranges, unit_basis=unit_basis
+    )
     if overlap_count == 0:
         return False
 
@@ -363,6 +440,7 @@ def filter_clones_by_git_diff(
     policy: str = "any",
     min_overlap_ratio: float = 0.0,
     both_units: bool = False,
+    unit_basis: str = "repo",
 ) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]:
     """Filters clones based on git-modified line ranges and partial hunk policy."""
     if not modified_ranges:
@@ -370,10 +448,10 @@ def filter_clones_by_git_diff(
     filtered: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
     for sim, u1, u2 in clones:
         u1_mod = is_unit_in_modified_ranges(
-            u1, modified_ranges, min_overlap_ratio=min_overlap_ratio, policy=policy
+            u1, modified_ranges, min_overlap_ratio=min_overlap_ratio, policy=policy, unit_basis=unit_basis
         )
         u2_mod = is_unit_in_modified_ranges(
-            u2, modified_ranges, min_overlap_ratio=min_overlap_ratio, policy=policy
+            u2, modified_ranges, min_overlap_ratio=min_overlap_ratio, policy=policy, unit_basis=unit_basis
         )
         if both_units:
             if u1_mod and u2_mod:

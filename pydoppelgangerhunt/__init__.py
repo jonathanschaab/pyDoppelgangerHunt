@@ -68,6 +68,7 @@ from pydoppelgangerhunt.fixer import (
     synthesize_shared_helper_code,
 )
 from pydoppelgangerhunt.git_diff import (
+    DiffRangeMap,
     MAJOR_POLICY_THRESHOLD,
     NEW_POLICY_THRESHOLD,
     check_temporal_divergence,
@@ -170,6 +171,7 @@ __all__ = [
     "get_git_repo_root",
     "get_git_head_commit",
     "compute_unit_diff_overlap",
+    "DiffRangeMap",
     "is_unit_in_modified_ranges",
     "filter_clones_by_git_diff",
     "MAJOR_POLICY_THRESHOLD",
