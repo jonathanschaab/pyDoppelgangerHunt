@@ -864,6 +864,7 @@ def scan_target(
     diff_files: Optional[Sequence[str]] = None,
     call_sequences: bool = False,
     bag_of_tokens: bool = False,
+    novel_pair_budget: Optional[int] = None,
     **kwargs: Any,
 ) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]: ...
 
@@ -876,6 +877,7 @@ def scan_target(
     diff_files: Optional[Sequence[str]] = None,
     call_sequences: bool = False,
     bag_of_tokens: bool = False,
+    novel_pair_budget: Optional[int] = None,
     **kwargs: Any,
 ) -> Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Dict[str, Any]]: ...
 
@@ -888,6 +890,7 @@ def scan_target(
     diff_files: Optional[Sequence[str]] = None,
     call_sequences: bool = False,
     bag_of_tokens: bool = False,
+    novel_pair_budget: Optional[int] = None,
     **kwargs: Any,
 ) -> Union[
     List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
@@ -942,6 +945,7 @@ def scan_target(
     corpus_calibration: Optional[Dict[str, Any]] = None,
     return_calibration: bool = False,
     min_frequency: int = 1,
+    novel_pair_budget: Optional[int] = None,
     **kwargs: Any,
 ) -> Union[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Dict[str, Any]]]:
     effective_min_freq = min_frequency
@@ -950,6 +954,14 @@ def scan_target(
             effective_min_freq = max(1, int(kwargs["min_calibration_frequency"]))
         except (ValueError, TypeError):
             pass
+
+    effective_novel_budget = (
+        _safe_int(novel_pair_budget, min_val=0)
+        if novel_pair_budget is not None
+        else MAX_NOVEL_SHINGLE_PAIR_BUDGET
+    )
+    if effective_novel_budget is None:
+        effective_novel_budget = MAX_NOVEL_SHINGLE_PAIR_BUDGET
 
     units: List[Dict[str, Any]] = []
     try:
@@ -1052,7 +1064,14 @@ def scan_target(
         matching_files = {
             f
             for f in unique_unit_files
-            if resolver.matches_diff(f, diff_keys, basis=unit_basis, has_tagged=has_tagged)
+            if resolver.matches_diff(
+                f,
+                diff_keys,
+                basis=unit_basis,
+                has_tagged=has_tagged,
+                diff_target_keys=resolver.diff_target_keys,
+                diff_repo_keys=resolver.diff_repo_keys,
+            )
         }
 
         diff_unit_indices = {
@@ -1207,7 +1226,7 @@ def scan_target(
             len(units), active_max_freq, effective_min_corpus, fallback=None
         )
 
-    remaining_novel_pair_budget: int = MAX_NOVEL_SHINGLE_PAIR_BUDGET
+    remaining_novel_pair_budget: int = effective_novel_budget
     skipped_novel_shingles: int = 0
 
     sorted_shingle_keys = sorted(shingle_index.keys(), key=_shingle_sort_key)

@@ -585,3 +585,94 @@ def test_resolver_re_resolve_canonical_path_with_explicit_basis(tmp_path: Path) 
     assert cp_stripped.target_relative == "notebook.ipynb"
     assert cp_stripped.repo_relative == "pkg/notebook.ipynb"
     assert cp_stripped.raw == "notebook.ipynb#cell_3"
+
+
+def test_diff_path_key_set_and_zero_allocation_probing(tmp_path: Path) -> None:
+    """Verifies DiffPathKeySet sub-sets and zero-allocation diff probing in CanonicalPathResolver."""
+    from pydoppelgangerhunt.canonical_path import (  # pylint: disable=import-outside-toplevel
+        CanonicalPathResolver,
+        DiffPathKeySet,
+        build_diff_path_keys,
+    )
+
+    repo = tmp_path / "repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+    f1 = src / "worker.py"
+    f1.write_text("x = 1\n", encoding="utf-8")
+
+    resolver = CanonicalPathResolver(target_root=src, repo_root=repo)
+
+    # 1. build_diff_path_keys produces DiffPathKeySet with separate target and repo keys
+    diff_keys = build_diff_path_keys(["src/worker.py"], resolver)
+    assert isinstance(diff_keys, DiffPathKeySet)
+    assert isinstance(diff_keys, set)
+    assert "target:worker.py" in diff_keys
+    assert "repo:src/worker.py" in diff_keys
+    assert diff_keys.diff_target_keys == {"worker.py"}
+    assert diff_keys.diff_repo_keys == {"src/worker.py"}
+
+    # 2. resolver stores separate diff_target_keys and diff_repo_keys
+    assert resolver.diff_target_keys == {"worker.py"}
+    assert resolver.diff_repo_keys == {"src/worker.py"}
+
+    # 3. matches_diff uses separate sets
+    assert resolver.matches_diff("worker.py", diff_keys, basis="target")
+    assert resolver.matches_diff("src/worker.py", diff_keys, basis="repo")
+    assert not resolver.matches_diff("other.py", diff_keys)
+
+    # 4. DiffPathKeySet copy, add, update methods
+    copy_keys = diff_keys.copy()
+    assert isinstance(copy_keys, DiffPathKeySet)
+    assert copy_keys.diff_target_keys == {"worker.py"}
+    assert copy_keys.diff_repo_keys == {"src/worker.py"}
+
+    copy_keys.add("target:helper.py")
+    copy_keys.add("repo:src/helper.py")
+    assert "helper.py" in copy_keys.diff_target_keys
+    assert "src/helper.py" in copy_keys.diff_repo_keys
+
+    copy_keys.update(["target:util.py", "repo:src/util.py"])
+    assert "util.py" in copy_keys.diff_target_keys
+    assert "src/util.py" in copy_keys.diff_repo_keys
+
+    # 5. set_diff_keys on resolver
+    resolver.clear_cache()
+    assert resolver.diff_target_keys is None
+    assert resolver.diff_repo_keys is None
+
+    # Set from DiffPathKeySet
+    resolver.set_diff_keys(diff_keys)
+    assert resolver.diff_target_keys == {"worker.py"}
+    assert resolver.diff_repo_keys == {"src/worker.py"}
+
+    # Set from raw set
+    raw_set = {"target:mod.py", "repo:pkg/mod.py"}
+    resolver.set_diff_keys(raw_set)
+    assert resolver.diff_target_keys == {"mod.py"}
+    assert resolver.diff_repo_keys == {"pkg/mod.py"}
+
+    # Explicit sets
+    resolver.set_diff_keys(set(), diff_target_keys={"a.py"}, diff_repo_keys={"pkg/a.py"})
+    assert resolver.diff_target_keys == {"a.py"}
+    assert resolver.diff_repo_keys == {"pkg/a.py"}
+
+    # 6. _probe_keys_in_diff with explicit sets
+    assert resolver._probe_keys_in_diff(
+        t_key="a.py",
+        r_key=None,
+        c_key=None,
+        diff_keys=set(),
+        has_tagged=True,
+        diff_target_keys={"a.py"},
+        diff_repo_keys=set(),
+    )
+    assert not resolver._probe_keys_in_diff(
+        t_key="b.py",
+        r_key=None,
+        c_key=None,
+        diff_keys=set(),
+        has_tagged=True,
+        diff_target_keys={"a.py"},
+        diff_repo_keys=set(),
+    )

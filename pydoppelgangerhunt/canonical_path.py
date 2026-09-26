@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import posixpath
 import sys
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 import unicodedata
 
 
@@ -275,12 +275,18 @@ class CanonicalPathResolver:
         )
 
         self._cache: Dict[Tuple[str, str, bool], CanonicalPath] = {}
-        self._tagged_keys_cache: Optional[Tuple[int, int, Optional[str], bool]] = None
+        self._tagged_keys_cache: Optional[
+            Tuple[int, int, Optional[str], bool, Optional[Set[str]], Optional[Set[str]]]
+        ] = None
+        self.diff_target_keys: Optional[Set[str]] = None
+        self.diff_repo_keys: Optional[Set[str]] = None
 
     def clear_cache(self) -> None:
         """Clears memoized path resolutions and cached diff key metadata."""
         self._cache.clear()
         self._tagged_keys_cache = None
+        self.diff_target_keys = None
+        self.diff_repo_keys = None
 
     def invalidate_path(self, path: Union[str, Path, CanonicalPath]) -> None:
         """Invalidates memoized path resolutions for a specific path.
@@ -577,6 +583,23 @@ class CanonicalPathResolver:
 
         return False
 
+    def set_diff_keys(
+        self,
+        diff_keys: Union[Set[str], DiffPathKeySet],
+        diff_target_keys: Optional[Set[str]] = None,
+        diff_repo_keys: Optional[Set[str]] = None,
+    ) -> None:
+        """Stores separate target and repo diff key sets for zero-allocation probing."""
+        if diff_target_keys is not None and diff_repo_keys is not None:
+            self.diff_target_keys = diff_target_keys
+            self.diff_repo_keys = diff_repo_keys
+        elif hasattr(diff_keys, "diff_target_keys") and hasattr(diff_keys, "diff_repo_keys"):
+            self.diff_target_keys = getattr(diff_keys, "diff_target_keys")
+            self.diff_repo_keys = getattr(diff_keys, "diff_repo_keys")
+        else:
+            self.diff_target_keys = {k[7:] for k in diff_keys if k.startswith("target:")}
+            self.diff_repo_keys = {k[5:] for k in diff_keys if k.startswith("repo:")}
+
     def _probe_keys_in_diff(
         self,
         t_key: Optional[str],
@@ -584,12 +607,18 @@ class CanonicalPathResolver:
         c_key: Optional[str],
         diff_keys: Set[str],
         has_tagged: bool,
+        diff_target_keys: Optional[Set[str]] = None,
+        diff_repo_keys: Optional[Set[str]] = None,
     ) -> bool:
         """Probes coordinate keys against diff set respecting coordinate tag isolation."""
+        dt_keys = diff_target_keys if diff_target_keys is not None else self.diff_target_keys
+        dr_keys = diff_repo_keys if diff_repo_keys is not None else self.diff_repo_keys
         if has_tagged:
-            # Tagged keys ("target:...", "repo:...") isolate coordinates across worktrees.
-            # If scaling to 100k+ units under differential scans, separate target/repo sets
-            # or pre-tagged tuples can be used to eliminate per-probe string allocations.
+            if dt_keys is not None and dr_keys is not None:
+                return bool(
+                    (t_key and t_key in dt_keys)
+                    or (r_key and r_key in dr_keys)
+                )
             return bool(
                 (t_key and f"target:{t_key}" in diff_keys)
                 or (r_key and f"repo:{r_key}" in diff_keys)
@@ -607,12 +636,17 @@ class CanonicalPathResolver:
         basis: str = "target",
         strip_anchor: bool = True,
         has_tagged: Optional[bool] = None,
+        diff_target_keys: Optional[Set[str]] = None,
+        diff_repo_keys: Optional[Set[str]] = None,
     ) -> bool:
         """Checks if a unit file path matches any diff key without ambiguous suffix matching."""
         if not unit_file or not diff_keys:
             return False
 
-        if has_tagged is None:
+        dt_keys = diff_target_keys if diff_target_keys is not None else self.diff_target_keys
+        dr_keys = diff_repo_keys if diff_repo_keys is not None else self.diff_repo_keys
+
+        if has_tagged is None or dt_keys is None or dr_keys is None:
             cached = self._tagged_keys_cache
             diff_id = id(diff_keys)
             diff_len = len(diff_keys)
@@ -622,18 +656,45 @@ class CanonicalPathResolver:
                 and cached[1] == diff_len
                 and (cached[2] is None or cached[2] in diff_keys)
             ):
-                has_tagged = cached[3]
+                if has_tagged is None:
+                    has_tagged = cached[3]
+                if dt_keys is None:
+                    dt_keys = cached[4]
+                if dr_keys is None:
+                    dr_keys = cached[5]
             else:
-                has_tagged = any(k.startswith(("repo:", "target:")) for k in diff_keys)
+                if has_tagged is None:
+                    has_tagged = any(k.startswith(("repo:", "target:")) for k in diff_keys)
                 sample_key = next(iter(diff_keys), None) if diff_keys else None
-                self._tagged_keys_cache = (diff_id, diff_len, sample_key, has_tagged)
+                if has_tagged and (dt_keys is None or dr_keys is None):
+                    if hasattr(diff_keys, "diff_target_keys") and hasattr(diff_keys, "diff_repo_keys"):
+                        dt_keys = getattr(diff_keys, "diff_target_keys")
+                        dr_keys = getattr(diff_keys, "diff_repo_keys")
+                    else:
+                        dt_keys = {k[7:] for k in diff_keys if k.startswith("target:")}
+                        dr_keys = {k[5:] for k in diff_keys if k.startswith("repo:")}
+                self._tagged_keys_cache = (
+                    diff_id,
+                    diff_len,
+                    sample_key,
+                    bool(has_tagged),
+                    dt_keys,
+                    dr_keys,
+                )
+
+        if self.diff_target_keys is None and dt_keys is not None:
+            self.diff_target_keys = dt_keys
+        if self.diff_repo_keys is None and dr_keys is not None:
+            self.diff_repo_keys = dr_keys
 
         if self._probe_keys_in_diff(
             self.target_key(unit_file, basis=basis, strip_anchor=False),
             self.repo_key(unit_file, basis=basis, strip_anchor=False),
             self.canonical_key(unit_file, basis=basis, strip_anchor=False),
             diff_keys,
-            has_tagged,
+            has_tagged=bool(has_tagged),
+            diff_target_keys=dt_keys,
+            diff_repo_keys=dr_keys,
         ):
             return True
 
@@ -650,7 +711,9 @@ class CanonicalPathResolver:
                             self.repo_key(unit_file, basis=basis, strip_anchor=True),
                             self.canonical_key(unit_file, basis=basis, strip_anchor=True),
                             diff_keys,
-                            has_tagged,
+                            has_tagged=bool(has_tagged),
+                            diff_target_keys=dt_keys,
+                            diff_repo_keys=dr_keys,
                         )
 
         return False
@@ -669,12 +732,65 @@ class CanonicalPathResolver:
         return n1.endswith("/" + n2) or n2.endswith("/" + n1)
 
 
+class DiffPathKeySet(set[str]):
+    """Set of diff path keys supporting separate target and repo sub-sets for zero-allocation probing."""
+
+    diff_target_keys: Set[str]
+    diff_repo_keys: Set[str]
+
+    def __init__(
+        self,
+        elements: Optional[Iterable[str]] = None,
+        *,
+        diff_target_keys: Optional[Set[str]] = None,
+        diff_repo_keys: Optional[Set[str]] = None,
+    ) -> None:
+        if elements is not None:
+            super().__init__(elements)
+        else:
+            super().__init__()
+        self.diff_target_keys = (
+            diff_target_keys
+            if diff_target_keys is not None
+            else {k[7:] for k in self if k.startswith("target:")}
+        )
+        self.diff_repo_keys = (
+            diff_repo_keys
+            if diff_repo_keys is not None
+            else {k[5:] for k in self if k.startswith("repo:")}
+        )
+
+    def add(self, element: str) -> None:
+        """Adds an element to the set and tracks coordinate sub-sets."""
+        super().add(element)
+        if element.startswith("target:"):
+            self.diff_target_keys.add(element[7:])
+        elif element.startswith("repo:"):
+            self.diff_repo_keys.add(element[5:])
+
+    def update(self, *s: Iterable[str]) -> None:
+        """Updates the set with elements from all iterables and tracks coordinate sub-sets."""
+        for items in s:
+            for item in items:
+                self.add(item)
+
+    def copy(self) -> DiffPathKeySet:
+        """Returns a shallow copy of the DiffPathKeySet."""
+        return DiffPathKeySet(
+            self,
+            diff_target_keys=set(self.diff_target_keys),
+            diff_repo_keys=set(self.diff_repo_keys),
+        )
+
+
 def build_diff_path_keys(
     diff_files: Sequence[str],
     resolver: CanonicalPathResolver,
-) -> Set[str]:
+) -> DiffPathKeySet:
     """Builds canonical lookup keys for diff files using the canonical path resolver."""
     keys: Set[str] = set()
+    target_keys: Set[str] = set()
+    repo_keys: Set[str] = set()
     for d in diff_files:
         if not d:
             continue
@@ -685,8 +801,13 @@ def build_diff_path_keys(
         r_key = resolver.repo_key(cp, strip_anchor=False)
         if r_key:
             keys.add(f"repo:{r_key}")
+            repo_keys.add(r_key)
         if cp.target_relative is not None:
             t_key = resolver.target_key(cp, strip_anchor=False)
             if t_key:
                 keys.add(f"target:{t_key}")
-    return keys
+                target_keys.add(t_key)
+    result = DiffPathKeySet(keys, diff_target_keys=target_keys, diff_repo_keys=repo_keys)
+    resolver.diff_target_keys = target_keys
+    resolver.diff_repo_keys = repo_keys
+    return result

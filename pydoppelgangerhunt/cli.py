@@ -162,6 +162,12 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         help="Minimum corpus document frequency threshold to retain shingle in baseline calibration (default: 1; recommend >= 2 for monorepos > 100k units to prune singleton shingles and compress baseline JSON)",
     )
     parser.add_argument(
+        "--novel-pair-budget",
+        type=int,
+        default=None,
+        help="Maximum candidate pairs to generate from novel shingles during differential scan (default: 10000)",
+    )
+    parser.add_argument(
         "--method-binding",
         type=str,
         choices=["auto", "method", "module"],
@@ -740,6 +746,7 @@ class EffectiveScanConfig:
     stop_shingles: bool
     bag_of_tokens: bool
     tfidf: bool
+    novel_pair_budget: Optional[int] = None
 
     def to_calibration_config(self, args: argparse.Namespace, scope: Optional[str] = None) -> Dict[str, Any]:
         """Builds active configuration dictionary for calibration hashing and comparison."""
@@ -800,11 +807,29 @@ def _resolve_effective_config(
         ("window_size", "window_size", args.window_size, 1, 5),
         ("min_expr_complexity", "min_expr_complexity", args.min_expr_complexity, 1, 4),
         ("min_frequency", "min_calibration_frequency", args.min_calibration_frequency, 1, 1),
+        ("novel_pair_budget", "novel_pair_budget", args.novel_pair_budget, 0, None),
     )
     resolved_ints: Dict[str, Optional[int]] = {}
     for calib_key, cfg_key, cli_arg, min_bound, default_val in int_specs:
-        cfg_val = tool_cfg.get(cfg_key) if cfg_key in tool_cfg else tool_cfg.get(calib_key)
-        has_cfg_entry = (cfg_key in tool_cfg) or (calib_key in tool_cfg)
+        cfg_val = (
+            tool_cfg.get(cfg_key)
+            if cfg_key in tool_cfg
+            else (
+                tool_cfg.get(calib_key)
+                if calib_key in tool_cfg
+                else (
+                    tool_cfg.get("max_novel_shingle_pair_budget")
+                    or tool_cfg.get("novel_shingle_pair_budget")
+                    if calib_key == "novel_pair_budget"
+                    else None
+                )
+            )
+        )
+        has_cfg_entry = (
+            (cfg_key in tool_cfg)
+            or (calib_key in tool_cfg)
+            or (calib_key == "novel_pair_budget" and any(k in tool_cfg for k in ("max_novel_shingle_pair_budget", "novel_shingle_pair_budget")))
+        )
         if cli_arg is not None:
             resolved_ints[calib_key] = cli_arg
         elif has_explicit_cfg and has_cfg_entry:
@@ -821,6 +846,7 @@ def _resolve_effective_config(
     window_size = resolved_ints.get("window_size", 5) or 5
     min_expr_complexity = resolved_ints.get("min_expr_complexity", 4) or 4
     min_frequency = resolved_ints.get("min_frequency", 1) or 1
+    novel_pair_budget = resolved_ints.get("novel_pair_budget")
 
     if not args.exclude and (not has_explicit_cfg or "exclude" not in tool_cfg) and "excludes" in active_calib:
         raw_ex = active_calib.get("excludes")
@@ -898,6 +924,7 @@ def _resolve_effective_config(
         stop_shingles=bool(args.stop_shingles),
         bag_of_tokens=bool(args.bag_of_tokens),
         tfidf=bool(args.tfidf),
+        novel_pair_budget=novel_pair_budget,
     )
 
 
@@ -1094,6 +1121,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         corpus_calibration=calib_dict,
         return_calibration=bool(args.record_baseline),
         min_frequency=eff_cfg.min_frequency,
+        novel_pair_budget=eff_cfg.novel_pair_budget,
     )
 
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]]

@@ -2121,3 +2121,53 @@ def test_scan_target_logs_info_on_incompatible_corpus_calibration(
         for record in caplog.records
     )
 
+
+def test_scan_target_novel_pair_budget_parameter(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies that scan_target respects explicit novel_pair_budget parameter."""
+    import logging
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    lines: list[str] = []
+    for i in range(3):
+        lines.append(
+            f"def fn_a_{i}(vx, vy):\n"
+            f"    novel_tok_a = vx + vy + {i}\n"
+            "    return novel_tok_a * 10\n"
+        )
+    for i in range(3):
+        lines.append(
+            f"def fn_b_{i}(va, vb):\n"
+            f"    novel_tok_b = va * vb + {i}\n"
+            "    return novel_tok_b * 20\n"
+        )
+    test_file = tmp_path / "budget_test.py"
+    test_file.write_text("\n".join(lines), encoding="utf-8")
+
+    calib = {
+        "total_units": 5000,
+        "max_index_frequency": 0.25,
+        "min_lines": 3,
+        "min_corpus_size": 4,
+        "global_stop_shingles": set(),
+        "shingle_frequencies": {},
+    }
+
+    # Pass novel_pair_budget=5: Group 1 takes 3 pairs (leaving 2), Group 2 needs 3 pairs (> 2), so skipped
+    with caplog.at_level(logging.DEBUG):
+        clones = scan_target(
+            str(tmp_path),
+            diff_files=["budget_test.py"],
+            min_lines=3,
+            threshold=0.70,
+            corpus_calibration=calib,
+            novel_pair_budget=5,
+        )
+
+    fn_a_clones = [c for c in clones if "fn_a_" in (c[1].get("name") or "") or "fn_a_" in (c[2].get("name") or "")]
+    fn_b_clones = [c for c in clones if "fn_b_" in (c[1].get("name") or "") or "fn_b_" in (c[2].get("name") or "")]
+    assert len(fn_a_clones) > 0
+    assert len(fn_b_clones) == 0
+    assert any("Novel shingle pair budget exceeded" in record.message for record in caplog.records)
+

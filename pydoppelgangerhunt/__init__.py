@@ -27,6 +27,7 @@ from pydoppelgangerhunt.baseline import (
 from pydoppelgangerhunt.canonical_path import (
     CanonicalPath,
     CanonicalPathResolver,
+    DiffPathKeySet,
     build_diff_path_keys,
     lexical_relative_to,
     normalize_lexical_posix,
@@ -223,6 +224,7 @@ __all__ = [
     "normalize_lexical_posix",
     "lexical_relative_to",
     "build_diff_path_keys",
+    "DiffPathKeySet",
     "COMPOUND_BLOCK_TYPES",
     "BRANCH_NODE_TYPES",
 ]

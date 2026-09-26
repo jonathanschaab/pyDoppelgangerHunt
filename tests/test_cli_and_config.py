@@ -2443,3 +2443,54 @@ def test_cli_main_passes_bag_of_tokens_and_tfidf_to_scan_target(
     assert captured_kwargs.get("tfidf") is False
 
 
+def test_cli_novel_pair_budget_resolution_and_forwarding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that novel_pair_budget is resolved from CLI and tool_cfg aliases and passed to scan_target."""
+    from pydoppelgangerhunt.cli import (  # pylint: disable=import-outside-toplevel
+        build_arg_parser,
+        main,
+        _resolve_effective_config,
+    )
+    import pydoppelgangerhunt.cli as cli_mod  # pylint: disable=import-outside-toplevel
+
+    parser = build_arg_parser()
+
+    # 1. Defaults with empty tool_cfg and empty calib_dict
+    args_default = parser.parse_args([])
+    eff_default = _resolve_effective_config(args_default, tool_cfg={}, calib_dict={})
+    assert eff_default.novel_pair_budget is None
+
+    # 2. tool_cfg setting
+    eff_tool = _resolve_effective_config(parser.parse_args([]), tool_cfg={"novel_pair_budget": 25000}, calib_dict={})
+    assert eff_tool.novel_pair_budget == 25000
+
+    # 2b. tool_cfg aliases
+    eff_alias1 = _resolve_effective_config(parser.parse_args([]), tool_cfg={"max_novel_shingle_pair_budget": 30000}, calib_dict={})
+    assert eff_alias1.novel_pair_budget == 30000
+
+    eff_alias2 = _resolve_effective_config(parser.parse_args([]), tool_cfg={"novel_shingle_pair_budget": 40000}, calib_dict={})
+    assert eff_alias2.novel_pair_budget == 40000
+
+    # 3. CLI override takes highest precedence
+    args_cli = parser.parse_args(["--novel-pair-budget", "5000"])
+    eff_cli = _resolve_effective_config(args_cli, tool_cfg={"novel_pair_budget": 25000}, calib_dict={})
+    assert eff_cli.novel_pair_budget == 5000
+
+    # 4. CLI main forwards to scan_target
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "mod.py").write_text("x = 1\n", encoding="utf-8")
+
+    captured_kwargs: Dict[str, Any] = {}
+
+    def mock_scan_target(*args: Any, **kwargs: Any) -> List[Any]:
+        captured_kwargs.update(kwargs)
+        return []
+
+    monkeypatch.setattr(cli_mod, "scan_target", mock_scan_target)
+
+    main([str(pkg), "--novel-pair-budget", "15000"])
+    assert captured_kwargs.get("novel_pair_budget") == 15000
+
+
