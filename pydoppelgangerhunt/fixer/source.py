@@ -575,7 +575,15 @@ def compute_unit_replacement_span(
                 else:
                     final_rep += pragma_suffix
             else:
-                final_rep += pragma_suffix
+                if suffix_line.endswith("\n"):
+                    final_suffix = suffix_line[:-1].rstrip() + pragma_suffix + "\n"
+                else:
+                    final_suffix = suffix_line.rstrip() + pragma_suffix
+                if final_rep.endswith("\n"):
+                    final_rep = final_rep[:-1] + final_suffix
+                else:
+                    final_rep = final_rep + final_suffix
+                end_char += len(suffix_line)
         return start_char, end_char, final_rep
 
     # Whole-line replacement

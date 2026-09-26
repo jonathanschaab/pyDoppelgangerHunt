@@ -5818,6 +5818,105 @@ def test_edge_case_robustness_columns_and_empty_inputs() -> None:
     assert refactor_module_units("remove this\nkeep this\n", [(del_unit, "")]) == "keep this\n"
 
 
+def test_column_bounded_replacement_preserves_suffix_and_pragma() -> None:
+    """Verifies that column-bounded replacements preserve trailing code and place boundary pragmas at line end."""
+    import ast
+    from pydoppelgangerhunt.fixer import compute_unit_replacement_span, replace_unit_in_source
+
+    # Case 1: Mid-line expression followed by binary operation and trailing type ignore
+    source1 = "result = expensive_call() + other_expression  # type: ignore\n"
+    u_call = {"file": "test_mod.py", "start": 1, "end": 1, "start_col": 9, "end_col": 25, "kind": "complex_expr"}
+    refactored1 = replace_unit_in_source(source1, u_call, "shared_call()")
+    assert refactored1 == "result = shared_call() + other_expression  # type: ignore\n"
+    assert ast.parse(refactored1)
+
+    # Case 2: compute_unit_replacement_span with boundary pragma attached to unit on line with trailing code
+    source2 = "val = calculate() + offset  # type: ignore\n"
+    u_calc = {"file": "test_mod.py", "start": 1, "end": 1, "start_col": 6, "end_col": 17, "kind": "complex_expr"}
+    s_c, e_c, final_rep = compute_unit_replacement_span(source2, u_calc, "new_calc()", preserve_boundary_pragmas=True)
+    assembled = source2[:s_c] + final_rep + source2[e_c:]
+    assert assembled == "val = new_calc() + offset  # type: ignore\n"
+    assert ast.parse(assembled)
+
+    # Case 3: Trailing code without terminal newline at EOF
+    source3 = "out = compute_val() + 10  # noqa"
+    u_comp = {"file": "test_mod.py", "start": 1, "end": 1, "start_col": 6, "end_col": 19, "kind": "complex_expr"}
+    refactored3 = replace_unit_in_source(source3, u_comp, "fast_val()")
+    assert refactored3 == "out = fast_val() + 10  # noqa"
+    assert ast.parse(refactored3)
+
+
+def test_refactor_module_units_same_line_emoji_prefix_replacement() -> None:
+    """Verifies that AST byte offsets are translated to character offsets when replacing code units preceded by emojis."""
+    import ast
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    # Single emoji before list comprehension on the same line
+    emoji_source = "prefix = '🚀'; value = [x for x in data]\n"
+    tree1 = ast.parse(emoji_source)
+    comp_node = next(n for n in ast.walk(tree1) if isinstance(n, ast.ListComp))
+    assert comp_node.col_offset == 25  # In UTF-8 bytes ('🚀' is 4 bytes vs 1 char)
+    u_comp = {
+        "file": "emoji_mod.py",
+        "start": comp_node.lineno,
+        "end": comp_node.end_lineno,
+        "start_col": comp_node.col_offset,
+        "end_col": comp_node.end_col_offset,
+        "kind": "comprehension",
+    }
+    refactored_emoji = refactor_module_units(emoji_source, [(u_comp, "helper(data)")])
+    assert refactored_emoji == "prefix = '🚀'; value = helper(data)\n"
+    assert ast.parse(refactored_emoji)
+
+    # Multiple multi-byte characters and trailing statements
+    multi_emoji_source = "tag = '🎉✨🔥'; items = [i * 2 for i in raw_items]; done = True\n"
+    tree2 = ast.parse(multi_emoji_source)
+    comp_node2 = next(n for n in ast.walk(tree2) if isinstance(n, ast.ListComp))
+    u_comp2 = {
+        "file": "emoji_mod.py",
+        "start": comp_node2.lineno,
+        "end": comp_node2.end_lineno,
+        "start_col": comp_node2.col_offset,
+        "end_col": comp_node2.end_col_offset,
+        "kind": "comprehension",
+    }
+    refactored_multi = refactor_module_units(multi_emoji_source, [(u_comp2, "transform(raw_items)")])
+    assert refactored_multi == "tag = '🎉✨🔥'; items = transform(raw_items); done = True\n"
+    assert ast.parse(refactored_multi)
+
+
+def test_dual_tier_overlap_conservative_missing_column_rejection() -> None:
+    """Verifies intentional dual-tier overlap behavior: conservative whole-line rejection vs exact byte collision."""
+    import pytest
+    from pydoppelgangerhunt.fixer import check_units_overlap, refactor_module_units
+
+    # Tier 1: When one unit omits column offsets, check_units_overlap conservatively assumes whole-line conflict
+    unit_with_cols = {"file": "mod.py", "start": 3, "end": 3, "start_col": 0, "end_col": 10}
+    unit_without_cols = {"file": "mod.py", "start": 3, "end": 3}
+    assert check_units_overlap(unit_with_cols, unit_without_cols)
+    sample_text = "line1\nline2\ncall_one() and call_two()\nline4\n"
+    with pytest.raises(ValueError, match="Overlapping unit collision detected"):
+        refactor_module_units(sample_text, [(unit_with_cols, "new_one()"), (unit_without_cols, "new_stmt()")])
+
+    # Tier 1 Acceptance: Disjoint column ranges on the same line are accepted
+    unit_left = {"file": "mod.py", "start": 3, "end": 3, "start_col": 0, "end_col": 10}
+    unit_right = {"file": "mod.py", "start": 3, "end": 3, "start_col": 15, "end_col": 25}
+    assert not check_units_overlap(unit_left, unit_right)
+    success_refactor = refactor_module_units(sample_text, [(unit_left, "first_rep"), (unit_right, "second_rep")])
+    assert "first_rep and second_rep\n" in success_refactor
+
+    # Tier 2 Catch: Pragma slice expansion extending to line end collides with subsequent unit on same line
+    src_expand = "x = 1  # type: ignore\ny = calc() + tail\n"
+    unit_calc = {"file": "mod.py", "start": 1, "end": 2, "start_col": 0, "end_col": 10, "kind": "complex_expr"}
+    unit_tail = {"file": "mod.py", "start": 2, "end": 2, "start_col": 13, "end_col": 17, "kind": "complex_expr"}
+    # Tier 1 allows because line 2 column bounds (10 vs 13) are disjoint:
+    assert not check_units_overlap(unit_calc, unit_tail)
+    # Tier 2 catches collision because unit_calc extends slice to end of line 2 to attach pragma:
+    with pytest.raises(ValueError, match="Overlapping unit collision detected"):
+        refactor_module_units(src_expand, [(unit_calc, "new_y"), (unit_tail, "new_tail")])
+
+
+
 
 
 

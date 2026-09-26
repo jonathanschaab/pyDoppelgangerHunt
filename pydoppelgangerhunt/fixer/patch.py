@@ -71,6 +71,11 @@ def check_units_overlap(
 ) -> bool:
     """Determines whether two AST code units in the same file share overlapping line ranges.
 
+    Acts as Tier 1 of the dual-tier overlap defense. When column offsets ('start_col',
+    'end_col') are omitted from either unit, this check conservatively assumes the unit
+    spans whole lines and treats any shared line as an overlap conflict. When both units
+    provide column offsets on the same line, it checks whether their column spans overlap.
+
     Args:
         u1: First AST unit dictionary with 'file', 'start', and 'end'.
         u2: Second AST unit dictionary with 'file', 'start', and 'end'.
@@ -229,6 +234,10 @@ def refactor_module_units(
         f = normalize_path_string(str(u.get("file") or ""), strip_anchor=False)
         return n, s, e, f
 
+    # Tier 1 Semantic Overlap Check:
+    # Conservatively reject candidate pairs that share lines when column bounds are
+    # omitted or incomplete (whole-line / statement replacements inherently conflict
+    # with any other edit on the same line), or when column intervals overlap.
     rep_list = list(replacements)
     for i, (u1, _) in enumerate(rep_list):
         for u2, _ in rep_list[i + 1:]:
@@ -245,6 +254,10 @@ def refactor_module_units(
     for unit, rep in rep_list:
         start_char, end_char, final_rep = compute_unit_replacement_span(source_text, unit, rep)
         start_byte, end_byte = compute_unit_byte_offsets(source_text, unit)
+        # If boundary pragma preservation extended the replacement slice to line end,
+        # synchronize end_byte so physical interval collision checks cover the full slice.
+        actual_end_byte = len(source_text[:end_char].encode("utf-8"))
+        end_byte = max(end_byte, actual_end_byte)
         computed_entries.append({
             "unit": unit,
             "start_char": start_char,
@@ -254,6 +267,9 @@ def refactor_module_units(
             "final_rep": final_rep,
         })
 
+    # Tier 2 Physical Byte-Span Overlap Check:
+    # After computing exact UTF-8 byte slices in the underlying source buffer,
+    # verify that no two physical byte intervals [s_b, e_b) collide.
     for i, c1 in enumerate(computed_entries):
         for c2 in computed_entries[i + 1:]:
             s1_b, e1_b = c1["start_byte"], c1["end_byte"]
