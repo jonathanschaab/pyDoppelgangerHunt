@@ -862,11 +862,22 @@ class DiffPathKeySet(set[str]):
 
     def symmetric_difference_update(self, s: Iterable[str]) -> None:
         """Updates the set with the symmetric difference of itself and another."""
-        for item in s:
+        other = s if isinstance(s, (set, frozenset)) else set(s)
+        for item in other:
             if item in self:
                 self.discard(item)
             else:
                 self.add(item)
+
+    def __ior__(self, other: AbstractSet[str]) -> DiffPathKeySet:  # type: ignore[override,misc]
+        """Updates the set with the union of itself and another in-place."""
+        self.update(other)
+        return self
+
+    def __ixor__(self, other: AbstractSet[str]) -> DiffPathKeySet:  # type: ignore[override,misc]
+        """Updates the set with the symmetric difference of itself and another in-place."""
+        self.symmetric_difference_update(other)
+        return self
 
     def copy(self) -> DiffPathKeySet:
         """Returns a shallow copy of the DiffPathKeySet."""

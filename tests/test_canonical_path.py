@@ -697,6 +697,31 @@ def test_diff_path_key_set_and_zero_allocation_probing(tmp_path: Path) -> None:
     assert "target:n.py" in mut_keys3
     assert "n.py" in mut_keys3.diff_target_keys
 
+    # Mutation parity: symmetric_difference_update with duplicate elements in operand
+    mut_keys_dup = DiffPathKeySet(["target:a.py"])
+    mut_keys_dup.symmetric_difference_update(["target:a.py", "target:a.py"])
+    assert "target:a.py" not in mut_keys_dup
+    assert "a.py" not in mut_keys_dup.diff_target_keys
+
+    mut_keys_dup2 = DiffPathKeySet()
+    mut_keys_dup2.symmetric_difference_update(["target:b.py", "target:b.py"])
+    assert "target:b.py" in mut_keys_dup2
+    assert "b.py" in mut_keys_dup2.diff_target_keys
+
+    # Mutation parity: in-place operators |= and ^=
+    mut_op = DiffPathKeySet(["target:orig.py"])
+    mut_op |= {"target:added.py", "repo:src/added.py"}
+    assert "target:orig.py" in mut_op
+    assert "target:added.py" in mut_op
+    assert mut_op.diff_target_keys == {"orig.py", "added.py"}
+    assert mut_op.diff_repo_keys == {"src/added.py"}
+
+    mut_op ^= {"target:orig.py", "target:flipped.py"}
+    assert "target:orig.py" not in mut_op
+    assert "orig.py" not in mut_op.diff_target_keys
+    assert "target:flipped.py" in mut_op
+    assert "flipped.py" in mut_op.diff_target_keys
+
     # 5. set_diff_keys on resolver
     resolver.clear_cache()
     assert resolver.diff_target_keys is None
