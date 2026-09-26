@@ -1020,3 +1020,54 @@ def test_resolve_coordinate_diff_keys_extracts_from_diff_path_key_set(tmp_path: 
     assert dr_keys == {"src/foo.py"}
 
 
+def test_parse_notebook_cell_anchor_rejects_zero_and_negative_indices() -> None:
+    """Verifies that parse_notebook_cell_anchor requires positive 1-based indices and rejects zero/negative/overflow."""
+    from pydoppelgangerhunt.canonical_path import (  # pylint: disable=import-outside-toplevel
+        normalize_lexical_posix,
+        parse_notebook_cell_anchor,
+    )
+
+    # Valid positive 1-based anchors
+    assert parse_notebook_cell_anchor("notebook.ipynb#cell_1") == ("notebook.ipynb", 0)
+    assert parse_notebook_cell_anchor("notebook.ipynb#cell1") == ("notebook.ipynb", 0)
+    assert parse_notebook_cell_anchor("notebook.ipynb#cell_42") == ("notebook.ipynb", 41)
+    assert parse_notebook_cell_anchor("notebook.ipynb#cell01") == ("notebook.ipynb", 0)
+
+    # Invalid zero-based or non-positive anchors
+    assert parse_notebook_cell_anchor("notebook.ipynb#cell0") is None
+    assert parse_notebook_cell_anchor("notebook.ipynb#cell_0") is None
+    assert parse_notebook_cell_anchor("notebook.ipynb#cell_00") is None
+
+    # Literal filename hashes containing #cell0 or #cell_0 are preserved and not stripped
+    assert normalize_lexical_posix("notebook.ipynb#cell0", strip_anchor=True) == "notebook.ipynb#cell0"
+    assert normalize_lexical_posix("notebook.ipynb#cell_0", strip_anchor=True) == "notebook.ipynb#cell_0"
+
+    # Overflow / huge integers guarded safely
+    huge_anchor = "notebook.ipynb#cell_" + ("9" * 5000)
+    assert parse_notebook_cell_anchor(huge_anchor) is None
+
+
+def test_matches_diff_in_place_set_mutation_invalidates_cached_coordinates(tmp_path: Path) -> None:
+    """Verifies that in-place mutations of plain sets invalidate cached coordinate sets."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    resolver = CanonicalPathResolver(target_root=repo)
+
+    # Initial plain set with two elements
+    diff_keys = {"target:a.py", "target:b.py"}
+    assert resolver.matches_diff("a.py", diff_keys) is True
+    assert resolver.matches_diff("b.py", diff_keys) is True
+    assert resolver.matches_diff("c.py", diff_keys) is False
+
+    # Mutate plain set in-place: swap b.py for c.py (preserves set id, length, and sample key a.py)
+    diff_keys.remove("target:b.py")
+    diff_keys.add("target:c.py")
+
+    # If stale coordinates were reused, c.py would be False and b.py would be True.
+    # With content snapshot validation, cache invalidates and reflects true set state.
+    assert resolver.matches_diff("c.py", diff_keys) is True
+    assert resolver.matches_diff("b.py", diff_keys) is False
+    assert resolver.matches_diff("a.py", diff_keys) is True
+
+
+

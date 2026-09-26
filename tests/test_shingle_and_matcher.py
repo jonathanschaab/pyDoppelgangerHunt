@@ -2195,3 +2195,86 @@ def test_find_calibration_mode_mismatch_symmetric_scope_normalization() -> None:
     assert "scope" in mismatch
 
 
+def test_scan_target_conservative_candidate_pruning_accounts_for_deleted_baseline_units(
+    tmp_path: Path,
+) -> None:
+    """Verifies that candidate pruning accounts for deleted baseline units, preventing false negatives.
+
+    Scenario:
+    - Baseline had 4 units: a.py, b.py, c.py, and deleted.py, all sharing a clone shingle.
+      df_global = 4, total_units = 4.
+    - Cutoff is 3 (max_index_frequency = 0.75 -> ceil(4 * 0.75) = 3).
+    - Current working tree: deleted.py was deleted; a.py was modified and retains the shingle.
+      b.py and c.py are unchanged.
+    - Old formula: max_removals = len(diff_unit_indices) - df_local = 1 - 1 = 0,
+      so pruning_df = max(3, 4 - 0) = 4 > 3 -> false-negative pruning!
+    - New formula: unchanged_units = 3 - 1 = 2 (b.py, c.py).
+      max_touched = 4 - 2 = 2 (a.py and deleted.py).
+      max_removals = max_touched - df_local = 2 - 1 = 1.
+      pruning_df = max(3, 4 - 1) = 3 <= 3 -> not pruned, detecting clone with modified a.py!
+    """
+    from pydoppelgangerhunt.baseline import _serialize_shingle_key  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.matcher import harvest_file_units  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "deleted_unit_repo"
+    repo.mkdir()
+    clone_code_a = (
+        "def compute_alpha(x, y):\n"
+        "    res = x * 10 + y * 5\n"
+        "    for step in range(5):\n"
+        "        res += step\n"
+        "    return res\n"
+    )
+    clone_code_b = (
+        "def compute_alpha_clone(x, y):\n"
+        "    res = x * 10 + y * 5\n"
+        "    for step in range(5):\n"
+        "        res += step\n"
+        "    return res\n"
+    )
+    code_c = (
+        "def helper_c(val):\n"
+        "    total = 0\n"
+        "    for i in range(10):\n"
+        "        total += i * val\n"
+        "    return total\n"
+    )
+    f_a = repo / "a.py"
+    f_b = repo / "b.py"
+    f_c = repo / "c.py"
+    f_a.write_text(clone_code_a, encoding="utf-8")
+    f_b.write_text(clone_code_b, encoding="utf-8")
+    f_c.write_text(code_c, encoding="utf-8")
+
+    units_a = harvest_file_units(str(f_a), str(repo), min_lines=3)
+    assert len(units_a) >= 1
+    shingles = units_a[0].get("shingles") or []
+    assert len(shingles) >= 1
+
+    calib_freqs = {_serialize_shingle_key(sh): 4 for sh in shingles}
+    corpus_calib = {
+        "total_units": 4,
+        "max_index_frequency": 0.75,
+        "min_corpus_size": 3,
+        "global_stop_shingles": [],
+        "shingle_frequencies": calib_freqs,
+    }
+
+    # diff_files includes modified a.py and deleted deleted.py
+    clones = scan_target(
+        str(repo),
+        diff_files=["a.py", "deleted.py"],
+        corpus_calibration=corpus_calib,
+        min_lines=3,
+        threshold=0.80,
+    )
+    # The clone between modified a.py and unchanged b.py must be detected
+    assert len(clones) >= 1
+    assert any(
+        ("a.py" in str(c[1].get("file")) and "b.py" in str(c[2].get("file")))
+        or ("b.py" in str(c[1].get("file")) and "a.py" in str(c[2].get("file")))
+        for c in clones
+    )
+
+
+

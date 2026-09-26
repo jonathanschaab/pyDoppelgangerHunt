@@ -1269,33 +1269,36 @@ def scan_target(
             if diff_unit_indices is not None:
                 # Conservative Candidate Pruning (Mathematical Derivation):
                 # --------------------------------------------------------
-                # In differential mode, only units in `diff_unit_indices` have been modified
-                # or added; all other units in the repository remain unchanged since baseline.
+                # In differential mode, diff_unit_indices contains current active units
+                # from modified or added files; all other harvested units belong to unchanged files.
                 #
-                # At baseline:
-                #   df_global = df_unchanged + df_modified_baseline
-                # where df_modified_baseline <= len(diff_unit_indices).
+                # Let unchanged_units = len(units) - len(diff_unit_indices).
+                # These units were untouched by the diff, so at baseline the unchanged files
+                # contained at least unchanged_units units.
                 #
-                # In the current working tree:
-                #   df_local = modified units currently containing shingle `sh`.
+                # If baseline calibration total_units (calib_units) is available and
+                # calib_units >= unchanged_units, the maximum number of baseline units that
+                # could have belonged to changed or deleted files is:
+                #   max_touched = calib_units - unchanged_units
                 #
                 # Therefore, between baseline and current state, at most
-                #   max_removals = max(len(diff_unit_indices) - df_local, 0)
-                # units that contained `sh` at baseline could have had `sh` removed.
+                #   max_removals = max(max_touched - df_local, 0)
+                # occurrences of shingle `sh` could have been removed across the entire repository.
                 #
-                # The minimum possible occurrences of `sh` in the current corpus is:
-                #   df_current >= df_global - max_removals
-                #
-                # Additionally, we directly observe at least len(u_indices) units in the
-                # active scan containing `sh`. Thus, the guaranteed lower bound is:
+                # The guaranteed lower bound on current occurrences is:
                 #   pruning_df = max(len(u_indices), df_global - max_removals)
                 #
-                # By only pruning `sh` if pruning_df > effective_max_posting, we ensure that
-                # a shingle is pruned if and only if its true current corpus DF is mathematically
-                # guaranteed to exceed the threshold. This strictly prevents false-negative
-                # clone candidate suppressions when edits remove shingles.
-                max_removals = max(len(diff_unit_indices) - df_local, 0)
-                pruning_df = max(len(u_indices), df_global - max_removals)
+                # If reliable baseline counts are unavailable (calib_units <= 0 or
+                # calib_units < unchanged_units), calibrated pruning is disabled to prevent
+                # false negatives, falling back to directly observed units:
+                #   pruning_df = len(u_indices)
+                unchanged_units = max(0, len(units) - len(diff_unit_indices))
+                if calib_units > 0 and calib_units >= unchanged_units:
+                    max_touched = calib_units - unchanged_units
+                    max_removals = max(max_touched - df_local, 0)
+                    pruning_df = max(len(u_indices), df_global - max_removals)
+                else:
+                    pruning_df = len(u_indices)
             else:
                 # Full-Scan Candidate Pruning (Replacement Model):
                 # combined_df reconciles global baseline calibration frequency with local scan counts

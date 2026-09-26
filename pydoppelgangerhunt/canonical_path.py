@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import posixpath
 import sys
-from typing import AbstractSet, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import AbstractSet, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple, Union
 import unicodedata
 
 
@@ -46,8 +46,13 @@ def parse_notebook_cell_anchor(
         prefix = "cell_" if frag_lower.startswith("cell_") else "cell"
         suffix = frag_lower[len(prefix) :]
         if suffix.isdigit():
-            base_path = raw[: len(raw) - len(fragment) - 1]
-            return base_path, int(suffix) - 1
+            try:
+                cell_num = int(suffix)
+                if cell_num > 0:
+                    base_path = raw[: len(raw) - len(fragment) - 1]
+                    return base_path, cell_num - 1
+            except (ValueError, OverflowError):
+                pass
     return None
 
 
@@ -309,7 +314,15 @@ class CanonicalPathResolver:
 
         self._cache: Dict[Tuple[str, str, bool], CanonicalPath] = {}
         self._tagged_keys_cache: Optional[
-            Tuple[int, int, Optional[str], bool, Optional[Set[str]], Optional[Set[str]]]
+            Tuple[
+                int,
+                int,
+                Optional[str],
+                bool,
+                Optional[Set[str]],
+                Optional[Set[str]],
+                Optional[FrozenSet[str]],
+            ]
         ] = None
         self._bound_diff_id: Optional[int] = None
         self.diff_target_keys: Optional[Set[str]] = None
@@ -644,6 +657,7 @@ class CanonicalPathResolver:
         self._bound_diff_id = id(diff_keys)
         sample_key = next(iter(diff_keys), None) if diff_keys else None
         has_tagged = any(k.startswith(("repo:", "target:")) for k in diff_keys)
+        snapshot = diff_keys if isinstance(diff_keys, frozenset) else frozenset(diff_keys)
         self._tagged_keys_cache = (
             id(diff_keys),
             len(diff_keys),
@@ -651,6 +665,7 @@ class CanonicalPathResolver:
             bool(has_tagged),
             self.diff_target_keys,
             self.diff_repo_keys,
+            snapshot,
         )
 
     def _resolve_coordinate_diff_keys(
@@ -725,12 +740,21 @@ class CanonicalPathResolver:
             cached = self._tagged_keys_cache
             diff_id = id(diff_keys)
             diff_len = len(diff_keys)
+            cache_valid = False
             if (
                 cached is not None
                 and cached[0] == diff_id
                 and cached[1] == diff_len
                 and (cached[2] is None or cached[2] in diff_keys)
             ):
+                if isinstance(diff_keys, frozenset):
+                    cache_valid = True
+                elif len(cached) > 6 and cached[6] is not None:
+                    cache_valid = diff_keys == cached[6]
+                else:
+                    cache_valid = True
+
+            if cache_valid and cached is not None:
                 if has_tagged is None:
                     has_tagged = cached[3]
                 if dt_keys is None:
@@ -744,6 +768,7 @@ class CanonicalPathResolver:
                 if has_tagged and (dt_keys is None or dr_keys is None):
                     dt_keys = {k[7:] for k in diff_keys if k.startswith("target:")}
                     dr_keys = {k[5:] for k in diff_keys if k.startswith("repo:")}
+                snapshot = diff_keys if isinstance(diff_keys, frozenset) else frozenset(diff_keys)
                 self._tagged_keys_cache = (
                     diff_id,
                     diff_len,
@@ -751,6 +776,7 @@ class CanonicalPathResolver:
                     bool(has_tagged),
                     dt_keys,
                     dr_keys,
+                    snapshot,
                 )
 
         if self._probe_keys_in_diff(
