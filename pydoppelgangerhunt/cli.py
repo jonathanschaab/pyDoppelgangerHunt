@@ -738,11 +738,13 @@ class EffectiveScanConfig:
     audit_tests: bool
     idioms: bool
     stop_shingles: bool
+    bag_of_tokens: bool
+    tfidf: bool
 
     def to_calibration_config(self, args: argparse.Namespace, scope: Optional[str] = None) -> Dict[str, Any]:
         """Builds active configuration dictionary for calibration hashing and comparison."""
         return {
-            "bag_of_tokens": args.bag_of_tokens,
+            "bag_of_tokens": self.bag_of_tokens,
             "call_sequences": self.call_sequences,
             "filter_stop_shingles": self.stop_shingles,
             "audit_tests": self.audit_tests,
@@ -894,6 +896,8 @@ def _resolve_effective_config(
         audit_tests=bool(args.audit_tests),
         idioms=bool(args.idioms),
         stop_shingles=bool(args.stop_shingles),
+        bag_of_tokens=bool(args.bag_of_tokens),
+        tfidf=bool(args.tfidf),
     )
 
 
@@ -1066,10 +1070,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         nms=args.nms,
         class_level=args.class_level,
         blind_literals=args.blind_literals,
-        bag_of_tokens=args.bag_of_tokens,
+        bag_of_tokens=eff_cfg.bag_of_tokens,
         filter_boilerplate=args.filter_boilerplate,
         consistent_renaming=args.consistent_renaming,
-        tfidf=args.tfidf,
+        tfidf=eff_cfg.tfidf,
         harvest_closures=args.harvest_closures,
         commutative=args.commutative,
         comprehensions=args.comprehensions,

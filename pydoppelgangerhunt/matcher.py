@@ -679,8 +679,8 @@ def _build_calibration_metadata(
     )
 
 
-def _is_calibration_mode_compatible(
-    calib: Dict[str, Any],
+def _find_calibration_mode_mismatch(
+    calib: Any,
     *,
     bag_of_tokens: bool = False,
     call_sequences: bool = False,
@@ -693,10 +693,14 @@ def _is_calibration_mode_compatible(
     excludes: Optional[Sequence[str]] = None,
     target_scope: Optional[str] = None,
     **kwargs: Any,
-) -> bool:
-    """Validates that corpus calibration was generated with compatible representation, filtering, and AST shaping features."""
+) -> Optional[str]:
+    """Validates that corpus calibration was generated with compatible representation, filtering, and AST shaping features.
+
+    Returns:
+        A human-readable description of the first mismatched setting, or None if compatible.
+    """
     if not isinstance(calib, dict):
-        return False
+        return "calibration metadata is not a dictionary"
     calib_hash = calib.get("config_hash")
     clean_active_ex = sorted({
         str(x).replace("\\", "/").rstrip("\r\n").strip()
@@ -721,17 +725,17 @@ def _is_calibration_mode_compatible(
                 "scope": target_scope,
             })
             if calib_hash == compute_calibration_config_hash(active_cfg):
-                return True
+                return None
     if _safe_bool(calib.get("bag_of_tokens", False)) != bool(bag_of_tokens):
-        return False
+        return f"bag_of_tokens (calibrated: {calib.get('bag_of_tokens', False)}, scan: {bag_of_tokens})"
     if _safe_bool(calib.get("call_sequences", False)) != bool(call_sequences):
-        return False
+        return f"call_sequences (calibrated: {calib.get('call_sequences', False)}, scan: {call_sequences})"
     if _safe_bool(calib.get("filter_stop_shingles", False)) and not filter_stop_shingles:
-        return False
+        return "filter_stop_shingles (calibrated with stop-shingles, but disabled in scan)"
     if _safe_bool(calib.get("audit_tests", False)) != bool(audit_tests):
-        return False
+        return f"audit_tests (calibrated: {calib.get('audit_tests', False)}, scan: {audit_tests})"
     if _safe_bool(calib.get("include_notebooks", False)) != bool(include_notebooks):
-        return False
+        return f"include_notebooks (calibrated: {calib.get('include_notebooks', False)}, scan: {include_notebooks})"
 
     raw_calib_ex = calib.get("excludes")
     calib_ex = (
@@ -744,13 +748,13 @@ def _is_calibration_mode_compatible(
         else []
     )
     if calib_ex != clean_active_ex:
-        return False
+        return f"excludes (calibrated: {calib_ex}, scan: {clean_active_ex})"
 
     if min_corpus_size is not None:
         scan_mcs = _safe_min_corpus(min_corpus_size, filter_stop_shingles)
         calib_mcs = _safe_min_corpus(calib.get("min_corpus_size"), filter_stop_shingles)
         if scan_mcs != calib_mcs:
-            return False
+            return f"min_corpus_size (calibrated: {calib_mcs}, scan: {scan_mcs})"
 
     calib_freq = (
         _safe_index_frequency(calib["max_index_frequency"])
@@ -759,10 +763,10 @@ def _is_calibration_mode_compatible(
     )
     active_freq = _safe_index_frequency(max_index_frequency)
     if (calib_freq is None) != (active_freq is None):
-        return False
+        return f"max_index_frequency (calibrated: {calib_freq}, scan: {active_freq})"
     if calib_freq is not None and active_freq is not None:
         if not math.isclose(calib_freq, active_freq, rel_tol=1e-9, abs_tol=1e-12):
-            return False
+            return f"max_index_frequency (calibrated: {calib_freq}, scan: {active_freq})"
 
     calib_min_frequency = (
         _safe_int(calib.get("min_frequency") or calib.get("min_calibration_frequency"), min_val=1)
@@ -770,12 +774,12 @@ def _is_calibration_mode_compatible(
     )
     active_min_frequency = _safe_int(min_frequency, min_val=1) or 1
     if calib_min_frequency != active_min_frequency:
-        return False
+        return f"min_frequency (calibrated: {calib_min_frequency}, scan: {active_min_frequency})"
 
     for flag, default_val in HARVEST_BOOLEAN_MODES:
         scan_val = kwargs.get(flag, default_val)
         if _safe_bool(calib.get(flag, default_val)) != bool(scan_val):
-            return False
+            return f"{flag} (calibrated: {calib.get(flag, default_val)}, scan: {scan_val})"
 
     int_bounds = (
         (None, "min_lines", 8),
@@ -787,9 +791,9 @@ def _is_calibration_mode_compatible(
         if flag_active is None or kwargs.get(flag_active, False):
             try:
                 if int(calib.get(int_key, default_int)) != int(kwargs.get(int_key, default_int)):
-                    return False
+                    return f"{int_key} (calibrated: {calib.get(int_key, default_int)}, scan: {kwargs.get(int_key, default_int)})"
             except (ValueError, TypeError, OverflowError):
-                return False
+                return f"{int_key} (malformed integer)"
 
     calib_scope = calib.get("scope") or calib.get("target_repo_relative")
     norm_calib_scope = (
@@ -803,8 +807,47 @@ def _is_calibration_mode_compatible(
         else None
     )
     if norm_calib_scope != norm_target_scope:
-        return False
+        return f"scope (calibrated: '{norm_calib_scope}', scan: '{norm_target_scope}')"
 
+    if calib_hash:
+        return f"config_hash mismatch (calibrated: {calib_hash})"
+
+    return None
+
+
+def _is_calibration_mode_compatible(
+    calib: Any,
+    *,
+    bag_of_tokens: bool = False,
+    call_sequences: bool = False,
+    filter_stop_shingles: bool = False,
+    audit_tests: bool = False,
+    include_notebooks: bool = False,
+    max_index_frequency: Optional[float] = 0.25,
+    min_corpus_size: Optional[int] = None,
+    min_frequency: int = 1,
+    excludes: Optional[Sequence[str]] = None,
+    target_scope: Optional[str] = None,
+    **kwargs: Any,
+) -> bool:
+    """Validates that corpus calibration was generated with compatible representation, filtering, and AST shaping features."""
+    mismatch = _find_calibration_mode_mismatch(
+        calib,
+        bag_of_tokens=bag_of_tokens,
+        call_sequences=call_sequences,
+        filter_stop_shingles=filter_stop_shingles,
+        audit_tests=audit_tests,
+        include_notebooks=include_notebooks,
+        max_index_frequency=max_index_frequency,
+        min_corpus_size=min_corpus_size,
+        min_frequency=min_frequency,
+        excludes=excludes,
+        target_scope=target_scope,
+        **kwargs,
+    )
+    if mismatch is not None:
+        logger.debug("Corpus calibration is incompatible with active scan configuration: %s", mismatch)
+        return False
     return True
 
 
@@ -819,6 +862,8 @@ def scan_target(
     *,
     return_calibration: Literal[False] = False,
     diff_files: Optional[Sequence[str]] = None,
+    call_sequences: bool = False,
+    bag_of_tokens: bool = False,
     **kwargs: Any,
 ) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]: ...
 
@@ -829,6 +874,8 @@ def scan_target(
     *,
     return_calibration: Literal[True],
     diff_files: Optional[Sequence[str]] = None,
+    call_sequences: bool = False,
+    bag_of_tokens: bool = False,
     **kwargs: Any,
 ) -> Tuple[List[Tuple[float, Dict[str, Any], Dict[str, Any]]], Dict[str, Any]]: ...
 
@@ -839,6 +886,8 @@ def scan_target(
     *,
     return_calibration: bool = False,
     diff_files: Optional[Sequence[str]] = None,
+    call_sequences: bool = False,
+    bag_of_tokens: bool = False,
     **kwargs: Any,
 ) -> Union[
     List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
@@ -1038,21 +1087,27 @@ def scan_target(
         effective_stop_shingles.update(stop_shingles)
     if not isinstance(corpus_calibration, dict):
         corpus_calibration = None
-    elif not _is_calibration_mode_compatible(
-        corpus_calibration,
-        bag_of_tokens=bag_of_tokens,
-        call_sequences=call_sequences,
-        filter_stop_shingles=filter_stop_shingles,
-        audit_tests=audit_tests,
-        include_notebooks=include_notebooks,
-        max_index_frequency=max_index_frequency,
-        min_corpus_size=min_corpus_size,
-        excludes=excludes,
-        target_scope=resolver.target_in_repo,
-        min_frequency=effective_min_freq,
-        **harvest_mode_opts,
-    ):
-        corpus_calibration = None
+    else:
+        calib_mismatch = _find_calibration_mode_mismatch(
+            corpus_calibration,
+            bag_of_tokens=bag_of_tokens,
+            call_sequences=call_sequences,
+            filter_stop_shingles=filter_stop_shingles,
+            audit_tests=audit_tests,
+            include_notebooks=include_notebooks,
+            max_index_frequency=max_index_frequency,
+            min_corpus_size=min_corpus_size,
+            excludes=excludes,
+            target_scope=resolver.target_in_repo,
+            min_frequency=effective_min_freq,
+            **harvest_mode_opts,
+        )
+        if calib_mismatch is not None:
+            logger.info(
+                "Corpus calibration was discarded due to configuration mismatch (%s); falling back to full corpus scan.",
+                calib_mismatch,
+            )
+            corpus_calibration = None
     if corpus_calibration is not None:
         calib_total = _safe_total_units(corpus_calibration.get("total_units"))
         if calib_total > 0:

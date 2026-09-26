@@ -2300,6 +2300,8 @@ def test_resolve_effective_config_precedence_and_calibration_export() -> None:
     assert not eff.audit_tests
     assert not eff.idioms
     assert not eff.stop_shingles
+    assert not eff.bag_of_tokens
+    assert not eff.tfidf
 
     # 2. Calibration inheritance when CLI and tool_cfg are absent
     calib = {
@@ -2314,6 +2316,7 @@ def test_resolve_effective_config_precedence_and_calibration_export() -> None:
         "audit_tests": True,
         "idioms": True,
         "filter_stop_shingles": True,
+        "bag_of_tokens": True,
     }
     args_calib = parser.parse_args([])
     eff_calib = _resolve_effective_config(args_calib, tool_cfg={}, calib_dict=calib)
@@ -2328,6 +2331,12 @@ def test_resolve_effective_config_precedence_and_calibration_export() -> None:
     assert eff_calib.audit_tests
     assert eff_calib.idioms
     assert eff_calib.stop_shingles
+    assert eff_calib.bag_of_tokens
+    assert not eff_calib.tfidf
+
+    # 2b. tool_cfg inheritance for tfidf
+    eff_tool = _resolve_effective_config(parser.parse_args([]), tool_cfg={"tfidf": True}, calib_dict={})
+    assert eff_tool.tfidf
 
     # 3. CLI override takes highest precedence
     args_override = parser.parse_args([
@@ -2337,12 +2346,16 @@ def test_resolve_effective_config_precedence_and_calibration_export() -> None:
         "5",
         "--call-sequences",
         "--no-idioms",
+        "--bag-of-tokens",
+        "--tfidf",
     ])
     eff_override = _resolve_effective_config(args_override, tool_cfg={"min_lines": 18}, calib_dict=calib)
     assert eff_override.min_lines == 22
     assert eff_override.min_frequency == 5
     assert eff_override.call_sequences
     assert not eff_override.idioms
+    assert eff_override.bag_of_tokens
+    assert eff_override.tfidf
 
     # 4. to_calibration_config export
     calib_export = eff_override.to_calibration_config(args_override, scope="sub/pkg")
@@ -2350,6 +2363,7 @@ def test_resolve_effective_config_precedence_and_calibration_export() -> None:
     assert calib_export["min_frequency"] == 5
     assert calib_export["call_sequences"] is True
     assert calib_export["idioms"] is False
+    assert calib_export["bag_of_tokens"] is True
     assert calib_export["scope"] == "sub/pkg"
 
 
@@ -2395,4 +2409,37 @@ def test_cli_top_n_interaction_with_baseline_suppression(tmp_path: Path, monkeyp
     assert len(captured_clones) == 1
     files = {captured_clones[0][1].get("file"), captured_clones[0][2].get("file")}
     assert not (files == {"a.py", "b.py"})
+
+
+def test_cli_main_passes_bag_of_tokens_and_tfidf_to_scan_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that cli.main correctly forwards resolved bag_of_tokens and tfidf to scan_target."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    import pydoppelgangerhunt.cli as cli_mod  # pylint: disable=import-outside-toplevel
+
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    f1 = pkg / "mod.py"
+    f1.write_text("x = 1\n", encoding="utf-8")
+
+    captured_kwargs: Dict[str, Any] = {}
+
+    def mock_scan_target(*args: Any, **kwargs: Any) -> List[Any]:
+        captured_kwargs.update(kwargs)
+        return []
+
+    monkeypatch.setattr(cli_mod, "scan_target", mock_scan_target)
+
+    # 1. Flags enabled via CLI
+    main([str(pkg), "--bag-of-tokens", "--tfidf"])
+    assert captured_kwargs.get("bag_of_tokens") is True
+    assert captured_kwargs.get("tfidf") is True
+
+    # 2. Flags disabled via CLI
+    captured_kwargs.clear()
+    main([str(pkg), "--no-bag-of-tokens", "--no-tfidf"])
+    assert captured_kwargs.get("bag_of_tokens") is False
+    assert captured_kwargs.get("tfidf") is False
+
 

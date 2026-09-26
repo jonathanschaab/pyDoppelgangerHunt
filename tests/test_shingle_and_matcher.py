@@ -2037,3 +2037,87 @@ def test_scan_target_differential_calibration_conservative_pruning_removal(tmp_p
     )
     assert len(clones) >= 1
 
+
+def test_find_calibration_mode_mismatch_identifies_all_incompatibilities() -> None:
+    """Verifies that _find_calibration_mode_mismatch pinpoints exact mismatch fields."""
+    from pydoppelgangerhunt.matcher import _find_calibration_mode_mismatch  # pylint: disable=import-outside-toplevel
+
+    # Non-dict
+    assert _find_calibration_mode_mismatch("not_a_dict") == "calibration metadata is not a dictionary"
+
+    # Valid base calibration
+    base = {
+        "bag_of_tokens": False,
+        "call_sequences": False,
+        "filter_stop_shingles": False,
+        "audit_tests": False,
+        "include_notebooks": False,
+        "max_index_frequency": 0.25,
+        "min_corpus_size": 4,
+        "min_frequency": 1,
+        "min_lines": 8,
+        "min_tokens": 15,
+        "excludes": ["tests"],
+        "scope": "src",
+    }
+    assert _find_calibration_mode_mismatch(base, excludes=["tests"], target_scope="src", min_corpus_size=4) is None
+
+    # Mismatch bag_of_tokens
+    assert "bag_of_tokens" in str(_find_calibration_mode_mismatch(base, bag_of_tokens=True, excludes=["tests"], target_scope="src"))
+
+    # Mismatch call_sequences
+    assert "call_sequences" in str(_find_calibration_mode_mismatch(base, call_sequences=True, excludes=["tests"], target_scope="src"))
+
+    # Mismatch filter_stop_shingles (calibrated with True, scan with False)
+    base_stop = dict(base, filter_stop_shingles=True)
+    assert "filter_stop_shingles" in str(_find_calibration_mode_mismatch(base_stop, filter_stop_shingles=False, excludes=["tests"], target_scope="src"))
+
+    # Mismatch audit_tests
+    assert "audit_tests" in str(_find_calibration_mode_mismatch(base, audit_tests=True, excludes=["tests"], target_scope="src"))
+
+    # Mismatch include_notebooks
+    assert "include_notebooks" in str(_find_calibration_mode_mismatch(base, include_notebooks=True, excludes=["tests"], target_scope="src"))
+
+    # Mismatch max_index_frequency
+    assert "max_index_frequency" in str(_find_calibration_mode_mismatch(base, max_index_frequency=0.50, excludes=["tests"], target_scope="src"))
+
+    # Mismatch min_frequency
+    assert "min_frequency" in str(_find_calibration_mode_mismatch(base, min_frequency=2, excludes=["tests"], target_scope="src"))
+
+    # Mismatch excludes
+    assert "excludes" in str(_find_calibration_mode_mismatch(base, excludes=["vendor"], target_scope="src"))
+
+    # Mismatch scope
+    assert "scope" in str(_find_calibration_mode_mismatch(base, excludes=["tests"], target_scope="other"))
+
+    # Malformed integer in bounds
+    malformed = dict(base, min_lines="invalid")
+    assert "min_lines (malformed integer)" in str(_find_calibration_mode_mismatch(malformed, excludes=["tests"], target_scope="src"))
+
+
+def test_scan_target_logs_info_on_incompatible_corpus_calibration(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies that scan_target logs an INFO message and falls back to full corpus scan on mismatched calibration."""
+    import logging
+    from pydoppelgangerhunt.matcher import scan_target  # pylint: disable=import-outside-toplevel
+
+    f = tmp_path / "mod.py"
+    f.write_text("def worker():\n    return 42\n", encoding="utf-8")
+
+    calib = {
+        "bag_of_tokens": True,
+        "call_sequences": False,
+        "filter_stop_shingles": False,
+        "total_units": 10,
+    }
+
+    with caplog.at_level(logging.INFO):
+        scan_target(str(tmp_path), corpus_calibration=calib, bag_of_tokens=False, min_lines=2)
+
+    assert any(
+        "Corpus calibration was discarded due to configuration mismatch" in record.message
+        and "bag_of_tokens" in record.message
+        for record in caplog.records
+    )
+
