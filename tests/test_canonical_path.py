@@ -722,6 +722,49 @@ def test_diff_path_key_set_and_zero_allocation_probing(tmp_path: Path) -> None:
     assert "target:flipped.py" in mut_op
     assert "flipped.py" in mut_op.diff_target_keys
 
+    # Self-mutation tests: s -= s, s ^= s, s &= s, s |= s and method calls
+    self_mut = DiffPathKeySet(["target:item.py", "repo:src/item.py"])
+    self_mut -= self_mut
+    assert len(self_mut) == 0
+    assert len(self_mut.diff_target_keys) == 0
+    assert len(self_mut.diff_repo_keys) == 0
+
+    self_mut = DiffPathKeySet(["target:item.py", "repo:src/item.py"])
+    self_mut ^= self_mut
+    assert len(self_mut) == 0
+    assert len(self_mut.diff_target_keys) == 0
+    assert len(self_mut.diff_repo_keys) == 0
+
+    self_mut = DiffPathKeySet(["target:item.py", "repo:src/item.py"])
+    self_mut &= self_mut
+    assert self_mut == {"target:item.py", "repo:src/item.py"}
+    assert self_mut.diff_target_keys == {"item.py"}
+    assert self_mut.diff_repo_keys == {"src/item.py"}
+
+    self_mut |= self_mut
+    assert self_mut == {"target:item.py", "repo:src/item.py"}
+    assert self_mut.diff_target_keys == {"item.py"}
+    assert self_mut.diff_repo_keys == {"src/item.py"}
+
+    self_mut.difference_update(self_mut)
+    assert len(self_mut) == 0
+    assert len(self_mut.diff_target_keys) == 0
+    assert len(self_mut.diff_repo_keys) == 0
+
+    self_mut = DiffPathKeySet(["target:item.py"])
+    self_mut.symmetric_difference_update(self_mut)
+    assert len(self_mut) == 0
+    assert len(self_mut.diff_target_keys) == 0
+
+    self_mut = DiffPathKeySet(["target:item.py"])
+    self_mut.intersection_update(self_mut)
+    assert self_mut == {"target:item.py"}
+    assert self_mut.diff_target_keys == {"item.py"}
+
+    self_mut.update(self_mut)
+    assert self_mut == {"target:item.py"}
+    assert self_mut.diff_target_keys == {"item.py"}
+
     # 5. set_diff_keys on resolver
     resolver.clear_cache()
     assert resolver.diff_target_keys is None

@@ -833,12 +833,17 @@ class DiffPathKeySet(set[str]):
     def update(self, *s: Iterable[str]) -> None:
         """Updates the set with elements from all iterables and tracks coordinate sub-sets."""
         for items in s:
+            if items is self:
+                continue
             for item in items:
                 self.add(item)
 
     def difference_update(self, *s: Iterable[object]) -> None:
         """Removes all elements of other iterables from this set and tracks coordinate sub-sets."""
         for other in s:
+            if other is self:
+                self.clear()
+                continue
             for item in other:
                 self.discard(item)
 
@@ -850,6 +855,8 @@ class DiffPathKeySet(set[str]):
     def intersection_update(self, *s: Iterable[object]) -> None:
         """Updates the set, keeping only elements found in it and all other iterables."""
         for other in s:
+            if other is self:
+                continue
             other_set = set(other)
             to_remove = [item for item in self if item not in other_set]
             for item in to_remove:
@@ -862,6 +869,9 @@ class DiffPathKeySet(set[str]):
 
     def symmetric_difference_update(self, s: Iterable[str]) -> None:
         """Updates the set with the symmetric difference of itself and another."""
+        if s is self:
+            self.clear()
+            return
         other = s if isinstance(s, (set, frozenset)) else set(s)
         for item in other:
             if item in self:
