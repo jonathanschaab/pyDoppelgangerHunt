@@ -1292,7 +1292,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             corpus_calibration=recorded_calib,
             repo_root=git_worktree_root,
         )
-        print(f"[OK] Recorded {len(clones)} clone baseline pair(s) to {bp}")
+        file_size_info = ""
+        try:
+            bp_path = Path(bp)
+            if bp_path.is_file():
+                sz_bytes = bp_path.stat().st_size
+                sz_kb = sz_bytes / 1024.0
+                sz_str = f"{sz_kb:.1f} KB" if sz_kb < 1024.0 else f"{sz_kb / 1024.0:.2f} MB"
+                file_size_info = f" [{sz_str}]"
+        except (OSError, ValueError):
+            pass
+
+        calib_info = ""
+        if isinstance(recorded_calib, dict) and (
+            recorded_calib.get("pruned_shingle_count", 0) > 0
+            or recorded_calib.get("min_frequency", 1) > 1
+        ):
+            pruned = int(recorded_calib.get("pruned_shingle_count", 0))
+            raw = int(recorded_calib.get("raw_shingle_count", pruned))
+            ratio = recorded_calib.get("shingle_reduction_ratio")
+            pct_val = (
+                (ratio * 100.0)
+                if ratio is not None
+                else ((pruned / raw * 100.0) if raw > 0 else 0.0)
+            )
+            comp_ratio = recorded_calib.get("shingle_compression_ratio")
+            comp_str = f", {comp_ratio:.2f}x compression" if comp_ratio is not None else ""
+            mf = recorded_calib.get("min_frequency", eff_cfg.min_frequency)
+            calib_info = (
+                f" (Calibration: {pruned:,} of {raw:,} shingles pruned, "
+                f"{pct_val:.1f}% reduction{comp_str} via min-frequency {mf})"
+            )
+
+        print(f"[OK] Recorded {len(clones)} clone baseline pair(s) to {bp}{file_size_info}{calib_info}")
         return 0
 
     clones, early_exit = _apply_baseline_and_diff_filters(

@@ -2494,3 +2494,87 @@ def test_cli_novel_pair_budget_resolution_and_forwarding(
     assert captured_kwargs.get("novel_pair_budget") == 15000
 
 
+def test_cli_record_baseline_displays_size_and_calibration_compression_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies that CLI --record-baseline prints file size and calibration reduction metrics."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.baseline import load_baseline  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "bench_repo"
+    repo.mkdir()
+    code_common = (
+        "def task_common(a, b, c):\n"
+        "    res = a * 2 + b * 3 + c * 4\n"
+        "    for val in range(10):\n"
+        "        res += val\n"
+        "    return res\n"
+    )
+    code_unique = (
+        "def task_unique(x, y, z):\n"
+        "    total = x * 10 + y * 20 + z * 30\n"
+        "    for item in [1, 2, 3, 4]:\n"
+        "        total -= item\n"
+        "    return total\n"
+    )
+    (repo / "f1.py").write_text(code_common, encoding="utf-8")
+    (repo / "f2.py").write_text(code_common, encoding="utf-8")
+    (repo / "f3.py").write_text(code_unique, encoding="utf-8")
+
+    bl_calib_pruned = tmp_path / "baseline_calib_pruned.json"
+
+    # 1. Run with --min-calibration-frequency 2
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.80",
+            "--record-baseline",
+            str(bl_calib_pruned),
+            "--min-calibration-frequency",
+            "2",
+        ],
+    )
+    assert main() == 0
+    out_pruned = capsys.readouterr().out
+    assert "[OK] Recorded" in out_pruned
+    assert "KB]" in out_pruned
+    assert "Calibration:" in out_pruned
+    assert "shingles pruned" in out_pruned
+    assert "reduction" in out_pruned
+    assert "compression via min-frequency 2" in out_pruned
+
+    # Verify baseline JSON contents
+    loaded = load_baseline(str(bl_calib_pruned))
+    assert loaded.corpus_calibration is not None
+    assert loaded.corpus_calibration["pruned_shingle_count"] > 0
+    assert loaded.calibration_reduction_ratio is not None
+    assert loaded.calibration_reduction_ratio > 0.0
+
+    # 2. Run with default min-frequency (1) - no pruning
+    bl_default = tmp_path / "baseline_default.json"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pydoppelgangerhunt",
+            str(repo),
+            "--min-lines",
+            "3",
+            "--threshold",
+            "0.80",
+            "--record-baseline",
+            str(bl_default),
+        ],
+    )
+    assert main() == 0
+    out_default = capsys.readouterr().out
+    assert "[OK] Recorded" in out_default
+    assert "KB]" in out_default
+    assert "shingles pruned" not in out_default
+
+
+

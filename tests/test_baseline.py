@@ -5813,3 +5813,114 @@ def test_record_baseline_flat_dictionary_records(tmp_path: Path) -> None:
     assert "pkg/mod_a.py#aaaa1111bbbb2222" in fp_rec["structural_fingerprint"]
     assert "pkg/mod_b.py#cccc3333dddd4444" in fp_rec["structural_fingerprint"]
 
+
+def test_compute_corpus_calibration_reduction_metrics_calculation() -> None:
+    """Verifies that compute_corpus_calibration calculates shingle reduction counts and compression ratios."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        compute_corpus_calibration,
+    )
+
+    # 4 units: 2 shared shingles across all units, 4 singleton shingles (1 per unit)
+    u1 = {"name": "u1", "shingles": ["sh_shared_1", "sh_shared_2", "sh_single_1"]}
+    u2 = {"name": "u2", "shingles": ["sh_shared_1", "sh_shared_2", "sh_single_2"]}
+    u3 = {"name": "u3", "shingles": ["sh_shared_1", "sh_shared_2", "sh_single_3"]}
+    u4 = {"name": "u4", "shingles": ["sh_shared_1", "sh_shared_2", "sh_single_4"]}
+    units = [u1, u2, u3, u4]
+
+    # Baseline with default min_frequency=1 (no pruning)
+    calib_mf1 = compute_corpus_calibration(units, min_frequency=1)
+    assert calib_mf1["raw_shingle_count"] == 6
+    assert calib_mf1["retained_shingle_count"] == 6
+    assert calib_mf1["pruned_shingle_count"] == 0
+    assert calib_mf1["shingle_reduction_ratio"] == 0.0
+    assert calib_mf1["shingle_compression_ratio"] == 1.0
+    assert calib_mf1["bytes_saved_estimate"] == 0
+    assert calib_mf1["bytes_reduction_ratio"] == 0.0
+    assert calib_mf1["bytes_compression_ratio"] == 1.0
+    assert isinstance(calib_mf1["reduction_stats"], dict)
+
+    # Baseline with min_frequency=2 (prunes all 4 singletons, retains 2 shared shingles)
+    calib_mf2 = compute_corpus_calibration(units, min_frequency=2)
+    assert calib_mf2["raw_shingle_count"] == 6
+    assert calib_mf2["retained_shingle_count"] == 2
+    assert calib_mf2["pruned_shingle_count"] == 4
+    assert calib_mf2["shingle_reduction_ratio"] == round(4 / 6, 4)
+    assert calib_mf2["shingle_compression_ratio"] == 3.0  # 6 / 2
+    assert calib_mf2["bytes_saved_estimate"] > 0
+    assert calib_mf2["bytes_reduction_ratio"] > 0.0
+    assert calib_mf2["bytes_compression_ratio"] > 1.0
+
+    # Test reduction_stats dictionary sub-object matches top-level metrics
+    stats = calib_mf2["reduction_stats"]
+    assert stats["raw_shingle_count"] == 6
+    assert stats["retained_shingle_count"] == 2
+    assert stats["pruned_shingle_count"] == 4
+    assert stats["shingle_reduction_ratio"] == round(4 / 6, 4)
+    assert stats["shingle_compression_ratio"] == 3.0
+
+
+def test_corpus_calibration_reduction_metrics_roundtrip_and_config_hash_stability(tmp_path: Path) -> None:
+    """Verifies that record_baseline and load_baseline preserve reduction metrics without altering config_hash."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        compute_calibration_config_hash,
+        compute_corpus_calibration,
+        load_baseline,
+        record_baseline,
+    )
+
+    u1 = {"name": "u1", "shingles": ["common", "u1_only"]}
+    u2 = {"name": "u2", "shingles": ["common", "u2_only"]}
+    calib = compute_corpus_calibration([u1, u2], min_frequency=2)
+
+    expected_hash = compute_calibration_config_hash(calib)
+    assert calib["config_hash"] == expected_hash
+
+    baseline_file = tmp_path / "baseline_calib_reduction.json"
+    record_baseline(
+        [],
+        str(baseline_file),
+        target=str(tmp_path),
+        threshold=0.85,
+        corpus_calibration=calib,
+    )
+
+    loaded = load_baseline(str(baseline_file))
+    assert loaded.corpus_calibration is not None
+    assert loaded.config_hash == expected_hash
+    assert loaded.corpus_calibration["config_hash"] == expected_hash
+
+    # Verify reduction metrics round-tripped accurately
+    assert loaded.corpus_calibration["raw_shingle_count"] == 3
+    assert loaded.corpus_calibration["retained_shingle_count"] == 1
+    assert loaded.corpus_calibration["pruned_shingle_count"] == 2
+    assert loaded.corpus_calibration["shingle_reduction_ratio"] == round(2 / 3, 4)
+    assert loaded.corpus_calibration["shingle_compression_ratio"] == 3.0
+    assert loaded.calibration_reduction_ratio == round(2 / 3, 4)
+    assert loaded.calibration_compression_ratio == 3.0
+    assert "reduction_stats" in loaded.corpus_calibration
+
+
+def test_corpus_calibration_reduction_metrics_empty_units_and_edge_cases() -> None:
+    """Verifies boundary conditions for reduction metric calculations (empty units, all pruned)."""
+    from pydoppelgangerhunt.baseline import (  # pylint: disable=import-outside-toplevel
+        compute_corpus_calibration,
+    )
+
+    # Empty corpus
+    calib_empty = compute_corpus_calibration([], min_frequency=2)
+    assert calib_empty["raw_shingle_count"] == 0
+    assert calib_empty["retained_shingle_count"] == 0
+    assert calib_empty["pruned_shingle_count"] == 0
+    assert calib_empty["shingle_reduction_ratio"] == 0.0
+    assert calib_empty["shingle_compression_ratio"] == 1.0
+
+    # Corpus where all shingles are singletons and pruned
+    u_single = [{"name": "singleton_only", "shingles": ["unique_shingle_xyz"]}]
+    calib_all_pruned = compute_corpus_calibration(u_single, min_frequency=2)
+    assert calib_all_pruned["raw_shingle_count"] == 1
+    assert calib_all_pruned["retained_shingle_count"] == 0
+    assert calib_all_pruned["pruned_shingle_count"] == 1
+    assert calib_all_pruned["shingle_reduction_ratio"] == 1.0
+    assert calib_all_pruned["shingle_compression_ratio"] == 1.0
+
+

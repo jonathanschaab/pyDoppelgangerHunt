@@ -374,6 +374,96 @@ def compute_calibration_config_hash(source: Dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
 
+CALIBRATION_REDUCTION_METRIC_KEYS: Tuple[str, ...] = (
+    "raw_shingle_count",
+    "unpruned_shingle_count",
+    "retained_shingle_count",
+    "pruned_shingle_count",
+    "shingle_reduction_ratio",
+    "shingle_compression_ratio",
+    "raw_bytes_estimate",
+    "retained_bytes_estimate",
+    "bytes_saved_estimate",
+    "bytes_reduction_ratio",
+    "bytes_compression_ratio",
+)
+
+
+def _compute_calibration_reduction_metrics(
+    raw_shingle_count: int,
+    retained_shingle_count: int,
+    raw_bytes_est: int,
+    retained_bytes_est: int,
+) -> Dict[str, Any]:
+    """Computes compression and pruning metrics for corpus calibration."""
+    pruned_count = max(0, raw_shingle_count - retained_shingle_count)
+    shingle_reduction_ratio = (
+        round(pruned_count / raw_shingle_count, 4) if raw_shingle_count > 0 else 0.0
+    )
+    shingle_compression_ratio = (
+        round(raw_shingle_count / retained_shingle_count, 2)
+        if retained_shingle_count > 0
+        else 1.0
+    )
+    bytes_reduction_ratio = (
+        round((raw_bytes_est - retained_bytes_est) / raw_bytes_est, 4)
+        if raw_bytes_est > 0
+        else 0.0
+    )
+    bytes_compression_ratio = (
+        round(raw_bytes_est / retained_bytes_est, 2)
+        if retained_bytes_est > 0
+        else 1.0
+    )
+    bytes_saved_est = max(0, raw_bytes_est - retained_bytes_est)
+    return {
+        "raw_shingle_count": raw_shingle_count,
+        "unpruned_shingle_count": raw_shingle_count,
+        "retained_shingle_count": retained_shingle_count,
+        "pruned_shingle_count": pruned_count,
+        "shingle_reduction_ratio": shingle_reduction_ratio,
+        "shingle_compression_ratio": shingle_compression_ratio,
+        "raw_bytes_estimate": raw_bytes_est,
+        "retained_bytes_estimate": retained_bytes_est,
+        "bytes_saved_estimate": bytes_saved_est,
+        "bytes_reduction_ratio": bytes_reduction_ratio,
+        "bytes_compression_ratio": bytes_compression_ratio,
+    }
+
+
+def _extract_finite_numeric_metrics(
+    source: Optional[Dict[str, Any]],
+) -> Dict[str, Union[int, float]]:
+    """Extracts finite numeric reduction metrics from a calibration dictionary."""
+    metrics: Dict[str, Union[int, float]] = {}
+    if not isinstance(source, dict):
+        return metrics
+    for k in CALIBRATION_REDUCTION_METRIC_KEYS:
+        if k in source:
+            v = source[k]
+            if isinstance(v, (int, float)) and math.isfinite(v):
+                metrics[k] = v
+    return metrics
+
+
+def _attach_reduction_metrics(
+    target: Dict[str, Any],
+    source: Optional[Dict[str, Any]],
+) -> None:
+    """Attaches sanitized finite reduction metrics and reduction_stats sub-dict to target calibration."""
+    if not isinstance(source, dict):
+        return
+    extracted = _extract_finite_numeric_metrics(source)
+    if extracted:
+        target.update(extracted)
+    raw_sub = source.get("reduction_stats")
+    if isinstance(raw_sub, dict):
+        sub_metrics = _extract_finite_numeric_metrics(raw_sub)
+        if sub_metrics:
+            target["reduction_stats"] = sub_metrics
+
+
+
 def compute_corpus_calibration(
     units: Sequence[Dict[str, Any]],
     max_index_frequency: Optional[float] = 0.25,
@@ -450,10 +540,24 @@ def compute_corpus_calibration(
         except (ValueError, TypeError, OverflowError):
             pass
 
+    raw_shingle_count = len(shingle_frequencies)
+    raw_bytes_est = sum(
+        len(str(k)) + len(str(c)) + 8 for k, c in shingle_frequencies.items()
+    )
     if min_frequency > 1:
         shingle_frequencies = {
             sh: count for sh, count in shingle_frequencies.items() if count >= min_frequency
         }
+    retained_shingle_count = len(shingle_frequencies)
+    retained_bytes_est = (
+        raw_bytes_est
+        if min_frequency <= 1
+        else sum(len(str(k)) + len(str(c)) + 8 for k, c in shingle_frequencies.items())
+    )
+
+    reduction_metrics = _compute_calibration_reduction_metrics(
+        raw_shingle_count, retained_shingle_count, raw_bytes_est, retained_bytes_est
+    )
 
     calib: Dict[str, Any] = {
         "total_units": total_units,
@@ -461,7 +565,9 @@ def compute_corpus_calibration(
         "global_stop_shingles": global_stop_shingles,
         "shingle_frequencies": shingle_frequencies,
         "min_frequency": min_frequency,
+        "reduction_stats": dict(reduction_metrics),
     }
+    calib.update(reduction_metrics)
     flags_dict: Dict[str, Any] = {
         "bag_of_tokens": bag_of_tokens,
         "call_sequences": call_sequences,
@@ -707,6 +813,7 @@ def record_baseline(
             "shingle_frequencies": dict(sorted(safe_shingle_freqs.items(), key=lambda item: item[0])),
         }
         _attach_calibration_flags(calib_entry, corpus_calibration)
+        _attach_reduction_metrics(calib_entry, corpus_calibration)
         if target_repo_rel:
             calib_entry["target_repo_relative"] = target_repo_rel
             calib_entry["scope"] = target_repo_rel
@@ -751,6 +858,24 @@ class BaselineFingerprints(set):  # type: ignore[type-arg]
         self.config_hash: Optional[str] = config_hash
         self.recorded_commit: Optional[str] = recorded_commit
         self.target: Optional[str] = target
+
+    def _get_calibration_float(self, key: str) -> Optional[float]:
+        """Extracts a finite floating-point metric from corpus calibration, or None."""
+        if isinstance(self.corpus_calibration, dict):
+            val = self.corpus_calibration.get(key)
+            if isinstance(val, (int, float)):
+                return float(val)
+        return None
+
+    @property
+    def calibration_reduction_ratio(self) -> Optional[float]:
+        """Returns shingle reduction ratio from corpus calibration, if available."""
+        return self._get_calibration_float("shingle_reduction_ratio")
+
+    @property
+    def calibration_compression_ratio(self) -> Optional[float]:
+        """Returns shingle compression ratio from corpus calibration, if available."""
+        return self._get_calibration_float("shingle_compression_ratio")
 
 
 def _parse_legacy_fingerprint_record(raw_fp: str) -> Dict[str, Any]:
@@ -884,6 +1009,7 @@ def load_baseline(baseline_path: str) -> BaselineFingerprints:
             if calib_commit:
                 corpus_calibration["recorded_commit"] = calib_commit
             _attach_calibration_flags(corpus_calibration, raw_calib)
+            _attach_reduction_metrics(corpus_calibration, raw_calib)
 
         top_cfg_hash = calib_cfg_hash or _safe_hex_hash(data.get("config_hash"), (64,))
         top_commit = calib_commit or _safe_hex_hash(data.get("recorded_commit"), (40, 64))
