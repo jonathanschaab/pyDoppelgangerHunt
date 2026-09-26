@@ -5916,6 +5916,36 @@ def test_dual_tier_overlap_conservative_missing_column_rejection() -> None:
         refactor_module_units(src_expand, [(unit_calc, "new_y"), (unit_tail, "new_tail")])
 
 
+def test_check_units_overlap_multiline_end_boundary_single_line() -> None:
+    """Verifies column-aware overlap detection when a single-line unit shares a multi-line unit's end line."""
+    from pydoppelgangerhunt.fixer import check_units_overlap, refactor_module_units
+
+    # Reviewer test case: multi-line unit 1 (lines 1..3, cols 0..10) and single-line unit 2 (line 3, cols 20..30)
+    u_multi = {"file": "pkg/mod.py", "start": 1, "end": 3, "start_col": 0, "end_col": 10}
+    u_single = {"file": "pkg/mod.py", "start": 3, "end": 3, "start_col": 20, "end_col": 30}
+    assert not check_units_overlap(u_multi, u_single)
+    assert not check_units_overlap(u_single, u_multi)
+
+    # Overlapping columns on the shared end boundary line
+    u_single_overlap = {"file": "pkg/mod.py", "start": 3, "end": 3, "start_col": 5, "end_col": 15}
+    assert check_units_overlap(u_multi, u_single_overlap)
+    assert check_units_overlap(u_single_overlap, u_multi)
+
+    # Multi-line units overlapping across interior lines (lines 1..3 vs lines 2..3)
+    u_interior = {"file": "pkg/mod.py", "start": 2, "end": 3, "start_col": 20, "end_col": 30}
+    assert check_units_overlap(u_multi, u_interior)
+    assert check_units_overlap(u_interior, u_multi)
+
+    # End-to-end refactoring with non-overlapping multi-line and single-line end-boundary units
+    src_code = "first_stmt = 1\nsecond_stmt = 2\nres = calc() + tail\n"
+    unit_m = {"file": "pkg/mod.py", "start": 1, "end": 3, "start_col": 0, "end_col": 12, "kind": "complex_expr"}
+    unit_s = {"file": "pkg/mod.py", "start": 3, "end": 3, "start_col": 15, "end_col": 19, "kind": "complex_expr"}
+    assert not check_units_overlap(unit_m, unit_s)
+    refactored = refactor_module_units(src_code, [(unit_m, "fast_res"), (unit_s, "offset")])
+    assert "fast_res + offset\n" in refactored
+
+
+
 
 
 

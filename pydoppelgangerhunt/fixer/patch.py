@@ -73,8 +73,9 @@ def check_units_overlap(
 
     Acts as Tier 1 of the dual-tier overlap defense. When column offsets ('start_col',
     'end_col') are omitted from either unit, this check conservatively assumes the unit
-    spans whole lines and treats any shared line as an overlap conflict. When both units
-    provide column offsets on the same line, it checks whether their column spans overlap.
+    spans whole lines and treats any shared line as an overlap conflict. When units share
+    a single boundary line (same-line, touching boundary, or a single-line unit at the
+    start or end boundary of a multi-line unit), it verifies column spans on that line.
 
     Args:
         u1: First AST unit dictionary with 'file', 'start', and 'end'.
@@ -124,21 +125,19 @@ def check_units_overlap(
                 return max(sc1, sc2) < min(ec1, ec2)
             return False
 
-    if start1 < start2 and end1 == start2:
-        if ec1 is not None and sc2 is not None:
-            return sc2 < ec1
-
-    if start2 < start1 and end2 == start1:
-        if ec2 is not None and sc1 is not None:
-            return sc1 < ec2
-
-    if start1 == end1 == start2 and start2 < end2:
-        if ec1 is not None and sc2 is not None:
-            return sc2 < ec1
-
-    if start2 == end2 == start1 and start1 < end1:
-        if ec2 is not None and sc1 is not None:
-            return sc1 < ec2
+    # When units share exactly one line (start, end, or touching boundary),
+    # check sub-line column disjointness at that shared boundary line:
+    # 1. Unit 1 ends on the line Unit 2 starts (including Unit 1 single-line at Unit 2 start,
+    #    or Unit 2 single-line at Unit 1 end): end1 == start2
+    # 2. Unit 2 ends on the line Unit 1 starts (including Unit 2 single-line at Unit 1 start,
+    #    or Unit 1 single-line at Unit 2 end): end2 == start1
+    if max(start1, start2) == min(end1, end2):
+        if end1 == start2:
+            if ec1 is not None and sc2 is not None:
+                return sc2 < ec1
+        elif end2 == start1:
+            if ec2 is not None and sc1 is not None:
+                return sc1 < ec2
 
     return max(start1, start2) <= min(end1, end2)
 
