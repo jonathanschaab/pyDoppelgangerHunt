@@ -644,6 +644,8 @@ def test_diff_path_key_set_and_zero_allocation_probing(tmp_path: Path) -> None:
     copy_keys.discard("repo:src/util.py")
     assert "repo:src/util.py" not in copy_keys
     assert "src/util.py" not in copy_keys.diff_repo_keys
+    # Non-string object discard should safely no-op
+    copy_keys.discard(12345)
 
     # Mutation parity: remove
     copy_keys.remove("target:helper.py")

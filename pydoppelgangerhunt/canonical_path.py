@@ -787,12 +787,11 @@ class DiffPathKeySet(set[str]):
             else {k[5:] for k in self if k.startswith("repo:")}
         )
 
-    def _untrack_key(self, element: object) -> None:
-        if isinstance(element, str):
-            if element.startswith("target:"):
-                self.diff_target_keys.discard(element[7:])
-            elif element.startswith("repo:"):
-                self.diff_repo_keys.discard(element[5:])
+    def _untrack_key(self, element: str) -> None:
+        if element.startswith("target:"):
+            self.diff_target_keys.discard(element[7:])
+        elif element.startswith("repo:"):
+            self.diff_repo_keys.discard(element[5:])
 
     def add(self, element: str) -> None:
         """Adds an element to the set and tracks coordinate sub-sets."""
@@ -804,8 +803,9 @@ class DiffPathKeySet(set[str]):
 
     def discard(self, element: object) -> None:
         """Removes an element from the set if present and tracks coordinate sub-sets."""
-        super().discard(element)
-        self._untrack_key(element)
+        if isinstance(element, str):
+            super().discard(element)
+            self._untrack_key(element)
 
     def remove(self, element: str) -> None:
         """Removes an element from the set and tracks coordinate sub-sets. Raises KeyError if missing."""
