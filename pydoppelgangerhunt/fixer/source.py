@@ -11,6 +11,20 @@ from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, 
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "ReplacementItem",
+    "UnitSpan",
+    "col_offset_to_char_offset",
+    "compute_unit_byte_offsets",
+    "compute_unit_char_offsets",
+    "compute_unit_replacement_span",
+    "compute_unit_spans",
+    "extract_unit_comments_and_pragmas",
+    "replace_unit_in_source",
+    "resolve_unit_replacement",
+    "slice_source_by_token_range",
+]
+
 
 def _is_docstring_node(node: Optional[ast.AST]) -> bool:
     """Returns True if the AST node is a string literal docstring expression."""
@@ -421,6 +435,19 @@ class UnitSpan(NamedTuple):
     end_col_char: int = 0
 
 
+class ReplacementItem(NamedTuple):
+    """Encapsulates a fully resolved unit replacement with synchronized spans."""
+
+    unit: Dict[str, Any]
+    start_char: int
+    end_char: int
+    start_byte: int
+    end_byte: int
+    final_rep: str
+    consumes_line_suffix: bool = False
+    order_index: int = 0
+
+
 def col_offset_to_char_offset(line: str, col_offset: Optional[Union[int, str]] = None) -> int:
     """Translates a 0-indexed column offset into a character index within line.
 
@@ -449,6 +476,16 @@ def col_offset_to_char_offset(line: str, col_offset: Optional[Union[int, str]] =
     except UnicodeDecodeError:
         # Clamps to the nearest valid character boundary preceding the malformed byte offset
         return len(line_bytes[:c_off].decode("utf-8", errors="ignore"))
+
+
+def _compute_line_offsets(lines: Sequence[str]) -> Tuple[List[int], List[int]]:
+    """Computes cumulative character and UTF-8 byte offsets for line starts."""
+    char_offsets = [0]
+    byte_offsets = [0]
+    for ln in lines:
+        char_offsets.append(char_offsets[-1] + len(ln))
+        byte_offsets.append(byte_offsets[-1] + len(ln.encode("utf-8")))
+    return char_offsets, byte_offsets
 
 
 def compute_unit_spans(
@@ -502,13 +539,7 @@ def compute_unit_spans(
         return UnitSpan(sz_c, sz_c, sz_b, sz_b, False, start, end, 0, 0)
 
     if line_char_offsets is None or line_byte_offsets is None:
-        l_char_offs = [0]
-        l_byte_offs = [0]
-        for ln in lines:
-            l_char_offs.append(l_char_offs[-1] + len(ln))
-            l_byte_offs.append(l_byte_offs[-1] + len(ln.encode("utf-8")))
-        line_char_offsets = l_char_offs
-        line_byte_offsets = l_byte_offs
+        line_char_offsets, line_byte_offsets = _compute_line_offsets(lines)
 
     first_line = lines[start - 1]
     last_line = lines[end - 1]
@@ -573,7 +604,11 @@ def _compute_unit_spans(
     source_text: str,
     unit: Dict[str, Any],
 ) -> Tuple[Tuple[int, int], Tuple[int, int], bool]:
-    """Computes ((start_char, end_char), (start_byte, end_byte), is_column_bounded)."""
+    """Computes ((start_char, end_char), (start_byte, end_byte), is_column_bounded).
+
+    .. deprecated:: 1.4.0
+        Use :func:`compute_unit_spans` instead, which returns a structured :class:`UnitSpan`.
+    """
     span = compute_unit_spans(source_text, unit)
     return (span.start_char, span.end_char), (span.start_byte, span.end_byte), span.is_column_bounded
 
@@ -590,47 +625,107 @@ def compute_unit_char_offsets(source_text: str, unit: Dict[str, Any]) -> Tuple[i
     return span.start_char, span.end_char
 
 
-def compute_unit_replacement_span(
+def resolve_unit_replacement(
     source_text: str,
     unit: Dict[str, Any],
     replacement_text: str,
     preserve_boundary_pragmas: bool = True,
     unit_span: Optional[UnitSpan] = None,
     lines: Optional[Sequence[str]] = None,
-) -> Tuple[int, int, str]:
-    """Computes exact character slice offsets and formatted replacement text for unit refactoring.
+    line_char_offsets: Optional[Sequence[int]] = None,
+    line_byte_offsets: Optional[Sequence[int]] = None,
+    order_index: int = 0,
+) -> ReplacementItem:
+    """Resolves character and byte slice boundaries and formatted replacement text for unit refactoring.
+
+    Explicitly tracks whether trailing line content is consumed (`consumes_line_suffix`) when
+    preserving attached boundary pragmas on column-bounded units, ensuring that `start_char`,
+    `end_char`, `start_byte`, and `end_byte` are synchronously updated at the point of origin.
+
+    Args:
+        source_text: The complete original Python source code.
+        unit: AST unit dictionary with 1-indexed 'start' and 'end' lines.
+        replacement_text: The proposed replacement code string.
+        preserve_boundary_pragmas: Whether to attach boundary comments/pragmas.
+        unit_span: Optional precomputed UnitSpan.
+        lines: Optional pre-split lines of source_text.
+        line_char_offsets: Optional precomputed line start character offsets.
+        line_byte_offsets: Optional precomputed line start UTF-8 byte offsets.
+        order_index: Original replacement sequence index for stable tie-breaking.
 
     Returns:
-        Tuple of (start_char_offset, end_char_offset, final_replacement_text).
+        ReplacementItem containing synchronized offsets, final replacement, and flags.
+
+    Raises:
+        TypeError: If unit is not a dictionary.
+        ValueError: If line or column coordinates fail to parse as integers.
     """
+    if not isinstance(unit, dict):
+        raise TypeError(f"Unit must be a dictionary, got {type(unit).__name__}")
+
     if lines is None:
         lines = source_text.splitlines(keepends=True)
-    if not lines or not isinstance(unit, dict):
-        if not isinstance(unit, dict):
-            raise TypeError(f"Unit must be a dictionary, got {type(unit).__name__}")
-        return 0, 0, replacement_text
+    if not lines:
+        return ReplacementItem(
+            unit=unit,
+            start_char=0,
+            end_char=0,
+            start_byte=0,
+            end_byte=0,
+            final_rep=replacement_text,
+            consumes_line_suffix=False,
+            order_index=order_index,
+        )
+
+    if line_char_offsets is None or line_byte_offsets is None:
+        line_char_offsets, line_byte_offsets = _compute_line_offsets(lines)
 
     if unit_span is None:
-        unit_span = compute_unit_spans(source_text, unit, lines=lines)
+        unit_span = compute_unit_spans(
+            source_text,
+            unit,
+            lines=lines,
+            line_char_offsets=line_char_offsets,
+            line_byte_offsets=line_byte_offsets,
+        )
 
     start_char = unit_span.start_char
     end_char = unit_span.end_char
+    start_byte = unit_span.start_byte
+    end_byte = unit_span.end_byte
     is_column_bounded = unit_span.is_column_bounded
     if start_char >= len(source_text) and end_char >= len(source_text):
-        return start_char, end_char, replacement_text
+        return ReplacementItem(
+            unit=unit,
+            start_char=start_char,
+            end_char=end_char,
+            start_byte=start_byte,
+            end_byte=end_byte,
+            final_rep=replacement_text,
+            consumes_line_suffix=False,
+            order_index=order_index,
+        )
 
     start = unit_span.start_line
     end = unit_span.end_line
     if start > len(lines) or start > end:
-        return start_char, end_char, replacement_text
-
-    raw_sc = unit.get("start_col")
-    raw_ec = unit.get("end_col")
-    start_col = int(raw_sc) if raw_sc is not None else None
-    end_col = int(raw_ec) if raw_ec is not None else None
+        return ReplacementItem(
+            unit=unit,
+            start_char=start_char,
+            end_char=end_char,
+            start_byte=start_byte,
+            end_byte=end_byte,
+            final_rep=replacement_text,
+            consumes_line_suffix=False,
+            order_index=order_index,
+        )
 
     attached_pragmas: List[str] = []
     if preserve_boundary_pragmas:
+        raw_sc = unit.get("start_col")
+        raw_ec = unit.get("end_col")
+        start_col = int(raw_sc) if raw_sc is not None else None
+        end_col = int(raw_ec) if raw_ec is not None else None
         boundary_comments = extract_unit_comments_and_pragmas(
             source_text, start_line=start, end_line=end, start_col=start_col or 0, end_col=end_col
         )
@@ -646,6 +741,8 @@ def compute_unit_replacement_span(
     suffix_stripped = suffix_line.strip()
 
     final_rep = replacement_text
+    consumes_line_suffix = False
+
     if is_column_bounded:
         if attached_pragmas and not any(p in suffix_line for p in attached_pragmas):
             pragma_suffix = "  " + "  ".join(attached_pragmas)
@@ -657,6 +754,7 @@ def compute_unit_replacement_span(
                     final_rep += pragma_suffix
             else:
                 # Non-comment code follows on the same line: preserve suffix_line and append pragma to line end
+                consumes_line_suffix = True
                 final_suffix = (
                     suffix_line[:-1].rstrip() + pragma_suffix + "\n"
                     if suffix_line.endswith("\n")
@@ -666,8 +764,19 @@ def compute_unit_replacement_span(
                     final_rep = final_rep[:-1] + final_suffix
                 else:
                     final_rep = final_rep + final_suffix
-                end_char += len(suffix_line)
-        return start_char, end_char, final_rep
+                end_char = line_char_offsets[end] if end < len(lines) else len(source_text)
+                end_byte = line_byte_offsets[end] if end < len(lines) else len(source_text.encode("utf-8"))
+
+        return ReplacementItem(
+            unit=unit,
+            start_char=start_char,
+            end_char=end_char,
+            start_byte=start_byte,
+            end_byte=end_byte,
+            final_rep=final_rep,
+            consumes_line_suffix=consumes_line_suffix,
+            order_index=order_index,
+        )
 
     # Whole-line replacement
     if attached_pragmas and final_rep:
@@ -684,7 +793,41 @@ def compute_unit_replacement_span(
     if final_rep and not final_rep.endswith("\n"):
         final_rep += "\n"
 
-    return start_char, end_char, final_rep
+    return ReplacementItem(
+        unit=unit,
+        start_char=start_char,
+        end_char=end_char,
+        start_byte=start_byte,
+        end_byte=end_byte,
+        final_rep=final_rep,
+        consumes_line_suffix=False,
+        order_index=order_index,
+    )
+
+
+def compute_unit_replacement_span(
+    source_text: str,
+    unit: Dict[str, Any],
+    replacement_text: str,
+    preserve_boundary_pragmas: bool = True,
+    unit_span: Optional[UnitSpan] = None,
+    lines: Optional[Sequence[str]] = None,
+) -> Tuple[int, int, str]:
+    """Computes exact character slice offsets and formatted replacement text for unit refactoring.
+
+    Returns:
+        Tuple of (start_char_offset, end_char_offset, final_replacement_text).
+    """
+    item = resolve_unit_replacement(
+        source_text,
+        unit,
+        replacement_text,
+        preserve_boundary_pragmas=preserve_boundary_pragmas,
+        unit_span=unit_span,
+        lines=lines,
+    )
+    return item.start_char, item.end_char, item.final_rep
+
 
 
 def replace_unit_in_source(

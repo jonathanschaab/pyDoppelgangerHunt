@@ -28,8 +28,10 @@ def _find_innermost_enclosing_node(
     except (SyntaxError, ValueError, UnicodeDecodeError):
         return None
 
-    u_start = int(unit.get("start") or 0)
-    u_end = int(unit.get("end") or u_start)
+    s_val = unit.get("start")
+    u_start = int(s_val if s_val is not None else 0)
+    e_val = unit.get("end")
+    u_end = int(e_val if e_val is not None else u_start)
     if u_start <= 0:
         return None
 

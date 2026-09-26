@@ -55,6 +55,7 @@ from pydoppelgangerhunt.coverage import (
     read_coverage_data,
 )
 from pydoppelgangerhunt.fixer import (
+    ReplacementItem,
     UnitSpan,
     analyze_unit_variable_scope,
     check_units_overlap,
@@ -69,6 +70,7 @@ from pydoppelgangerhunt.fixer import (
     generate_refactoring_patch,
     refactor_module_units,
     replace_unit_in_source,
+    resolve_unit_replacement,
     slice_source_by_token_range,
     synthesize_shared_helper_code,
 )
@@ -199,6 +201,8 @@ __all__ = [
     "compute_unit_replacement_span",
     "compute_unit_spans",
     "UnitSpan",
+    "ReplacementItem",
+    "resolve_unit_replacement",
     "filter_overlapping_clone_units",
     "find_enclosing_class",
     "find_enclosing_function",

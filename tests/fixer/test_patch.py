@@ -5769,19 +5769,19 @@ def test_edge_case_robustness_non_dict_and_invalid_units() -> None:
 
     # Non-dict units raise TypeError
     with pytest.raises(TypeError, match="Units must be dictionaries"):
-        check_units_overlap(cast(Dict[str, Any], None), {"file": "a.py", "start": 1, "end": 2})
+        check_units_overlap(None, {"file": "a.py", "start": 1, "end": 2})  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="Units must be dictionaries"):
-        check_units_overlap({"file": "a.py", "start": 1, "end": 2}, cast(Dict[str, Any], "invalid"))
+        check_units_overlap({"file": "a.py", "start": 1, "end": 2}, "invalid")  # type: ignore[arg-type]
 
     # Malformed unit types in span calculations raise TypeError
     with pytest.raises(TypeError, match="Unit must be a dictionary"):
-        compute_unit_spans("line 1\n", cast(Dict[str, Any], None))
+        compute_unit_spans("line 1\n", None)  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="Unit must be a dictionary"):
-        _compute_unit_spans("line 1\n", cast(Dict[str, Any], None))
+        _compute_unit_spans("line 1\n", None)  # type: ignore[arg-type]
 
     # Replacement span with invalid unit raises TypeError
     with pytest.raises(TypeError, match="Unit must be a dictionary"):
-        compute_unit_replacement_span("line 1\n", cast(Dict[str, Any], None), "rep")
+        compute_unit_replacement_span("line 1\n", None, "rep")  # type: ignore[arg-type]
 
     # Malformed line numbers raise ValueError rather than silently returning false defaults
     with pytest.raises(ValueError, match="Malformed unit"):
@@ -5794,14 +5794,15 @@ def test_edge_case_robustness_non_dict_and_invalid_units() -> None:
     assert compute_unit_char_offsets("a\nb\nc\n", inv_unit) == (6, 6)
 
     # _adjust_line_for_replacements with invalid target_line or non-dict unit
-    adj = _adjust_line_for_replacements(cast(int, "invalid"), [(cast(Dict[str, Any], None), "rep")], "line 1\n")
+    adj = _adjust_line_for_replacements("invalid", [], "line 1\n")  # type: ignore[arg-type]
     assert adj == 1
+    with pytest.raises(TypeError, match="Unit must be a dictionary"):
+        _adjust_line_for_replacements(2, [(None, "rep")], "line 1\n")  # type: ignore[arg-type,list-item]
 
 
 def test_edge_case_robustness_columns_and_empty_inputs() -> None:
     """Verifies handling of invalid column types, inverted column offsets, and empty inputs."""
     import pytest
-    from typing import cast
     from pydoppelgangerhunt.fixer import (
         check_units_overlap,
         col_offset_to_char_offset,
@@ -5810,10 +5811,10 @@ def test_edge_case_robustness_columns_and_empty_inputs() -> None:
     )
 
     # col_offset_to_char_offset with string or non-numeric offsets
-    assert col_offset_to_char_offset("hello world", cast(int, "5")) == 5
+    assert col_offset_to_char_offset("hello world", "5") == 5  # type: ignore[arg-type]
     assert col_offset_to_char_offset("hello world", -10) == 0
     with pytest.raises(ValueError, match="Malformed column offset"):
-        col_offset_to_char_offset("hello world", cast(int, "invalid"))
+        col_offset_to_char_offset("hello world", "invalid")  # type: ignore[arg-type]
 
     # Malformed column offsets in check_units_overlap raise ValueError
     with pytest.raises(ValueError, match="Malformed unit"):
@@ -6114,3 +6115,137 @@ def test_check_units_overlap_malformed_inputs_raise_errors() -> None:
         check_units_overlap({"file": "mod.py", "start": 1, "end": 5, "start_col": "invalid"}, u_valid)
     with pytest.raises(ValueError, match="Malformed unit: invalid column offset"):
         check_units_overlap(u_valid, {"file": "mod.py", "start": 1, "end": 5, "end_col": "invalid"})
+
+
+def test_multi_unit_expansion_with_boundary_pragma_line_suffix_extension() -> None:
+    """Verifies multi-unit replacements where both units expand and one has a trailing boundary pragma."""
+    from pydoppelgangerhunt.fixer import (
+        ReplacementItem,
+        refactor_module_units,
+        resolve_unit_replacement,
+    )
+
+    source_text = (
+        "x = 1  # type: ignore\n"
+        "y = [1, 2, 3] ; extra = 10\n"
+        "z = [4, 5, 6]\n"
+        "out = None\n"
+    )
+    # Unit 1: spans lines 1 to 2, ending at column 13 on line 2 (cols 0-13)
+    u1 = {
+        "file": "calc.py",
+        "name": "u1",
+        "start": 1,
+        "end": 2,
+        "start_col": 0,
+        "end_col": 13,
+        "kind": "complex_expr",
+    }
+    # Unit 2: 'z = [4, 5, 6]' on line 3 (cols 0-13)
+    u2 = {
+        "file": "calc.py",
+        "name": "u2",
+        "start": 3,
+        "end": 3,
+        "start_col": 0,
+        "end_col": 13,
+        "kind": "comprehension",
+    }
+
+    rep1 = "x = 1\ny = (\n    1,\n    2,\n    3,\n)"
+    rep2 = "z = (\n    4,\n    5,\n    6,\n)"
+
+    # Test resolve_unit_replacement directly
+    item1 = resolve_unit_replacement(source_text, u1, rep1, preserve_boundary_pragmas=True)
+    assert isinstance(item1, ReplacementItem)
+    assert item1.consumes_line_suffix is True
+    line1_len = len("x = 1  # type: ignore\n")
+    line2_len = len("y = [1, 2, 3] ; extra = 10\n")
+    assert item1.end_char == line1_len + line2_len
+    assert "# type: ignore" in item1.final_rep
+    assert "; extra = 10" in item1.final_rep
+
+    # Test refactor_module_units applying both multi-line expansions
+    reps = [(u1, rep1), (u2, rep2)]
+    refactored = refactor_module_units(source_text, reps)
+
+    assert "y = (\n    1,\n    2,\n    3,\n) ; extra = 10  # type: ignore\n" in refactored
+    assert "z = (\n    4,\n    5,\n    6,\n)" in refactored
+    assert "out = None\n" in refactored
+
+
+def test_col_offset_to_char_offset_utf8_multibyte_clamping_and_exact_boundary() -> None:
+    """Verifies that col_offset_to_char_offset accurately handles multi-byte UTF-8 boundaries and clamps."""
+    from pydoppelgangerhunt.fixer import (
+        col_offset_to_char_offset,
+        compute_unit_spans,
+    )
+
+    # Greek characters: each 'α', 'β', 'γ' is 2 UTF-8 bytes.
+    # Total bytes: 2 ('α') + 2 ('β') + 2 ('γ') + 1 ('\n') = 7 bytes.
+    line = "αβγ\n"
+    assert line.encode("utf-8") == b"\xce\xb1\xce\xb2\xce\xb3\n"
+
+    # Landing exactly at byte 0: char 0 ("")
+    assert col_offset_to_char_offset(line, 0) == 0
+    # Landing exactly at byte 2 (end of 'α'): char 1 ("α")
+    assert col_offset_to_char_offset(line, 2) == 1
+    # Landing at byte 3 (middle of 'β' byte sequence): clamped safely to preceding valid char boundary (char 1)
+    assert col_offset_to_char_offset(line, 3) == 1
+    # Landing exactly at byte 4 (end of 'β'): char 2 ("αβ")
+    assert col_offset_to_char_offset(line, 4) == 2
+    # Landing at byte 5 (middle of 'γ'): clamped safely to preceding char boundary (char 2)
+    assert col_offset_to_char_offset(line, 5) == 2
+    # Landing exactly at byte 6 (end of 'γ'): char 3 ("αβγ")
+    assert col_offset_to_char_offset(line, 6) == 3
+
+    # Test through compute_unit_spans with exact and clamped column bounds
+    u_exact = {"file": "greek.py", "start": 1, "end": 1, "start_col": 0, "end_col": 4, "kind": "complex_expr"}
+    span_exact = compute_unit_spans(line, u_exact)
+    assert span_exact.start_char == 0
+    assert span_exact.end_char == 2
+    assert span_exact.start_byte == 0
+    assert span_exact.end_byte == 4
+
+    u_clamped = {"file": "greek.py", "start": 1, "end": 1, "start_col": 0, "end_col": 3, "kind": "complex_expr"}
+    span_clamped = compute_unit_spans(line, u_clamped)
+    assert span_clamped.start_char == 0
+    assert span_clamped.end_char == 1
+    assert span_clamped.start_byte == 0
+    assert span_clamped.end_byte == 3
+
+
+def test_adjust_line_for_replacements_boundary_coincidence() -> None:
+    """Verifies that _adjust_line_for_replacements does not shift a target line when a unit ends on that target line."""
+    from pydoppelgangerhunt.fixer.patch import _adjust_line_for_replacements
+
+    orig_text = (
+        "line 1\n"
+        "line 2\n"
+        "line 3\n"
+        "line 4\n"
+        "line 5\n"
+        "line 6\n"
+    )
+    # Unit 1: lines 1-3 replaced with 1 line (delta = -2)
+    u1 = {"file": "mod.py", "start": 1, "end": 3}
+    # Unit 2: lines 4-5 replaced with 3 lines (delta = +1)
+    u2 = {"file": "mod.py", "start": 4, "end": 5}
+    reps = [(u1, "single_1_to_3\n"), (u2, "exp_4_1\nexp_4_2\nexp_4_3\n")]
+
+    # Target line 3: coincides with end of u1. Since end_line < target_line is 3 < 3 (False),
+    # u1's delta is NOT added to target line 3. Result remains 3.
+    assert _adjust_line_for_replacements(3, reps, orig_text) == 3
+
+    # Target line 4: strictly downstream of u1 (3 < 4), but coincides with start of u2.
+    # u1 applies (delta -2), u2 does not apply (5 < 4 is False). Result is 4 + (-2) = 2.
+    assert _adjust_line_for_replacements(4, reps, orig_text) == 2
+
+    # Target line 5: coincides with end of u2. u1 applies (3 < 5, delta -2),
+    # but u2 ending on line 5 does NOT apply (5 < 5 is False). Result is 5 + (-2) = 3.
+    assert _adjust_line_for_replacements(5, reps, orig_text) == 3
+
+    # Target line 6: downstream of both u1 and u2 (3 < 6 and 5 < 6).
+    # Both deltas apply: -2 + 1 = -1. Result is 6 + (-1) = 5.
+    assert _adjust_line_for_replacements(6, reps, orig_text) == 5
+

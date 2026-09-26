@@ -44,6 +44,8 @@ from pydoppelgangerhunt.fixer.scope import (
 )
 
 from pydoppelgangerhunt.fixer.source import (
+    ReplacementItem,
+    _compute_line_offsets,
     _detect_indent_step,
     _find_module_helper_insertion_index,
     _find_sig_colon,
@@ -52,7 +54,7 @@ from pydoppelgangerhunt.fixer.source import (
     _is_docstring_node,
     _scan_sig_line,
     compute_unit_replacement_span,
-    compute_unit_spans,
+    resolve_unit_replacement,
 )
 from pydoppelgangerhunt.fixer.synthesis import (
     _extract_required_typing_imports,
@@ -74,8 +76,10 @@ def check_units_overlap(
     Acts as Tier 1 of the dual-tier overlap defense. When column offsets ('start_col',
     'end_col') are omitted from either unit, this check conservatively assumes the unit
     spans whole lines and treats any shared line as an overlap conflict. When units share
-    a single boundary line (same-line, touching boundary, or a single-line unit at the
-    start or end boundary of a multi-line unit), it verifies column spans on that line.
+    a single boundary line (same-line, touching boundary, or a boundary line of a multi-line
+    unit), it checks sub-line column intervals for half-open intersection. Single-line units
+    with inverted column bounds (start_col > end_col) represent empty ranges and evaluate to False.
+    Callers must supply ordered column bounds.
 
     Args:
         u1: First AST unit dictionary with 'file', 'start', and 'end'.
@@ -167,15 +171,16 @@ def filter_overlapping_clone_units(
 
     retained: List[Dict[str, Any]] = []
     for _, file_units in file_groups:
-        sorted_candidates = sorted(
-            file_units,
-            key=lambda u: (
-                -(int(u.get("end") or int(u.get("start") or 0)) - int(u.get("start") or 0)),
-                int(u.get("start") or 0),
-                int(u.get("start_col") or 0),
-                str(u.get("name") or ""),
-            ),
-        )
+        def _sort_key(u: Dict[str, Any]) -> Tuple[int, int, int, str]:
+            s_val = u.get("start")
+            s = int(s_val if s_val is not None else 0)
+            e_val = u.get("end")
+            e = int(e_val if e_val is not None else s)
+            sc_val = u.get("start_col")
+            sc = int(sc_val if sc_val is not None else 0)
+            return (-(e - s), s, sc, str(u.get("name") or ""))
+
+        sorted_candidates = sorted(file_units, key=_sort_key)
         file_retained: List[Dict[str, Any]] = []
         for cand in sorted_candidates:
             if not any(check_units_overlap(cand, prev, repo_root=repo_root) for prev in file_retained):
@@ -213,11 +218,13 @@ def refactor_module_units(
             return "unit", 1, 1, ""
         n = str(u.get("name") or "unit")
         try:
-            s = int(u.get("start") or 1)
+            s_val = u.get("start")
+            s = int(s_val if s_val is not None else 1)
         except (ValueError, TypeError):
             s = 1
         try:
-            e = int(u.get("end") or s)
+            e_val = u.get("end")
+            e = int(e_val if e_val is not None else s)
         except (ValueError, TypeError):
             e = s
         f = normalize_path_string(str(u.get("file") or ""), strip_anchor=False)
@@ -239,57 +246,32 @@ def refactor_module_units(
                     f"'{n2}' ({s2}-{e2}) in {f1}."
                 )
 
-    computed_entries: List[Dict[str, Any]] = []
+    computed_entries: List[ReplacementItem] = []
     lines = source_text.splitlines(keepends=True)
-    line_char_offsets = [0]
-    line_byte_offsets = [0]
-    for ln in lines:
-        line_char_offsets.append(line_char_offsets[-1] + len(ln))
-        line_byte_offsets.append(line_byte_offsets[-1] + len(ln.encode("utf-8")))
+    line_char_offsets, line_byte_offsets = _compute_line_offsets(lines)
 
-    for unit, rep in rep_list:
-        unit_span = compute_unit_spans(
-            source_text,
-            unit,
-            lines=lines,
-            line_char_offsets=line_char_offsets,
-            line_byte_offsets=line_byte_offsets,
-        )
-        start_char, end_char, final_rep = compute_unit_replacement_span(
+    for i, (unit, rep) in enumerate(rep_list):
+        item = resolve_unit_replacement(
             source_text,
             unit,
             rep,
-            unit_span=unit_span,
             lines=lines,
+            line_char_offsets=line_char_offsets,
+            line_byte_offsets=line_byte_offsets,
+            order_index=i,
         )
-        start_byte = unit_span.start_byte
-        if end_char == unit_span.end_char:
-            end_byte = unit_span.end_byte
-        else:
-            # Boundary pragma preservation extended slice to line end:
-            # Look up byte offset of the line end directly from line_byte_offsets in O(1).
-            end_line = unit_span.end_line
-            end_byte = line_byte_offsets[min(len(lines), end_line)]
-
-        computed_entries.append({
-            "unit": unit,
-            "start_char": start_char,
-            "end_char": end_char,
-            "start_byte": start_byte,
-            "end_byte": end_byte,
-            "final_rep": final_rep,
-        })
+        computed_entries.append(item)
 
     # Tier 2 Physical Byte-Span Overlap Check:
     # After computing exact UTF-8 byte slices in the underlying source buffer,
     # verify that no two physical byte intervals [s_b, e_b) collide.
     for i, c1 in enumerate(computed_entries):
         for c2 in computed_entries[i + 1:]:
-            s1_b, e1_b = c1["start_byte"], c1["end_byte"]
-            s2_b, e2_b = c2["start_byte"], c2["end_byte"]
+            s1_b, e1_b = c1.start_byte, c1.end_byte
+            s2_b, e2_b = c2.start_byte, c2.end_byte
             if max(s1_b, s2_b) < min(e1_b, e2_b):
-                n1, s1, e1, f1 = _unit_desc(c1["unit"])
-                n2, s2, e2, _ = _unit_desc(c2["unit"])
+                n1, s1, e1, f1 = _unit_desc(c1.unit)
+                n2, s2, e2, _ = _unit_desc(c2.unit)
                 raise ValueError(
                     f"Overlapping unit collision detected between "
                     f"'{n1}' ({s1}-{e1}) and "
@@ -298,15 +280,15 @@ def refactor_module_units(
 
     sorted_replacements = sorted(
         computed_entries,
-        key=lambda item: (item["start_byte"], item["end_byte"]),
+        key=lambda item: (item.start_byte, item.end_byte, item.order_index),
         reverse=True,
     )
 
     current_text = source_text
     for item in sorted_replacements:
-        s_c = item["start_char"]
-        e_c = item["end_char"]
-        current_text = current_text[:s_c] + item["final_rep"] + current_text[e_c:]
+        s_c = item.start_char
+        e_c = item.end_char
+        current_text = current_text[:s_c] + item.final_rep + current_text[e_c:]
 
     return current_text
 
@@ -323,8 +305,10 @@ def _build_whole_method_delegation(
 ) -> str:
     """Builds a delegated method replacement body preserving method signature and docstring."""
     lines = source_text.splitlines(keepends=True)
-    u_start = int(unit.get("start") or 1)
-    u_end = int(unit.get("end") or max(u_start, len(lines)))
+    s_val = unit.get("start")
+    u_start = int(s_val if s_val is not None else 1)
+    e_val = unit.get("end")
+    u_end = int(e_val if e_val is not None else max(u_start, len(lines)))
 
     lead = lines[u_start - 1] if 1 <= u_start <= len(lines) else ""
     indent = lead[: len(lead) - len(lead.lstrip())]
@@ -434,8 +418,10 @@ def _has_unconditional_terminal_return(
     unit: Dict[str, Any], orig_lines: Sequence[str]
 ) -> bool:
     """Checks whether an AST code unit terminates with an unconditional return at its base indentation."""
-    u_start = max(1, int(unit.get("start") or 1))
-    u_end = min(len(orig_lines), int(unit.get("end") or u_start))
+    s_val = unit.get("start")
+    u_start = max(1, int(s_val if s_val is not None else 1))
+    e_val = unit.get("end")
+    u_end = min(len(orig_lines), int(e_val if e_val is not None else u_start))
     if u_start > len(orig_lines) or u_start > u_end:
         return False
     cand_lines = orig_lines[u_start - 1 : u_end]
@@ -467,7 +453,8 @@ def _build_unit_delegation_call(
     step: Optional[str] = None,
 ) -> str:
     """Constructs replacement delegation call statement for a clone unit in refactoring patches."""
-    u_start = int(target_unit.get("start") or 1)
+    t_s_val = target_unit.get("start")
+    u_start = int(t_s_val if t_s_val is not None else 1)
     lead = orig_lines[u_start - 1] if 1 <= u_start <= len(orig_lines) else ""
     indent = lead[: len(lead) - len(lead.lstrip())]
 
@@ -605,21 +592,29 @@ class _FilePatchPlan:
 def _compute_replacement_line_deltas(
     reps: Sequence[Tuple[Dict[str, Any], str]],
     orig_text: str,
+    lines: Optional[Sequence[str]] = None,
 ) -> List[Tuple[int, int]]:
     """Computes (end_line, line_delta) tuples for replacements in source text.
 
     For each replacement, calculates net change in line count (newlines added - newlines removed).
     Because candidate replacements are non-overlapping, their line deltas are strictly additive.
+
+    Raises:
+        TypeError: If any replacement unit is not a dictionary.
+        ValueError: If any unit contains invalid line coordinates.
     """
     deltas: List[Tuple[int, int]] = []
-    lines = orig_text.splitlines(keepends=True)
+    if lines is None:
+        lines = orig_text.splitlines(keepends=True)
     for u, rep in reps:
         if not isinstance(u, dict):
-            continue
+            raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
         try:
-            end_l = int(u.get("end") or u.get("start") or 1)
-        except (ValueError, TypeError):
-            continue
+            e_val = u.get("end")
+            s_val = u.get("start")
+            end_l = int(e_val if e_val is not None else (s_val if s_val is not None else 1))
+        except (ValueError, TypeError) as err:
+            raise ValueError(f"Malformed unit: invalid line boundary in {u.get('file', '')}: {err}") from err
         s_c, e_c, final_rep = compute_unit_replacement_span(orig_text, u, rep, lines=lines)
         orig_nl = orig_text[s_c:e_c].count("\n")
         rep_nl = final_rep.count("\n")
@@ -632,6 +627,7 @@ def _adjust_line_for_replacements(
     target_line: int,
     reps: Sequence[Tuple[Dict[str, Any], str]],
     orig_text: str,
+    lines: Optional[Sequence[str]] = None,
 ) -> int:
     """Adjusts a target source line number to account for upstream line expansions or contractions."""
     try:
@@ -640,9 +636,26 @@ def _adjust_line_for_replacements(
         t_line = 1
     if t_line <= 1 or not reps:
         return max(1, t_line)
-    deltas = _compute_replacement_line_deltas(reps, orig_text)
+    if lines is None:
+        lines = orig_text.splitlines(keepends=True)
+    deltas = _compute_replacement_line_deltas(reps, orig_text, lines=lines)
     line_delta = sum(d for end_line, d in deltas if end_line < t_line)
     return max(1, t_line + line_delta)
+
+
+def _derive_unit_indent_step(
+    unit: Dict[str, Any],
+    lines: Sequence[str],
+    step: Optional[str] = None,
+) -> str:
+    """Derives indentation step for a unit from its starting line indentation if not provided."""
+    if step is not None:
+        return step
+    u_s_val = unit.get("start")
+    u_s = int(u_s_val if u_s_val is not None else 1)
+    u_lead = lines[u_s - 1] if 1 <= u_s <= len(lines) else ""
+    u_ind = u_lead[: len(u_lead) - len(u_lead.lstrip())]
+    return _detect_indent_step(u_ind)
 
 
 def _delegate_unit_in_plan(
@@ -659,11 +672,7 @@ def _delegate_unit_in_plan(
     step: Optional[str] = None,
 ) -> None:
     """Builds and records a delegation call replacement for a unit inside a file plan."""
-    if step is None:
-        u_s = int(unit.get("start") or 1)
-        u_lead = plan.orig_lines[u_s - 1] if 1 <= u_s <= len(plan.orig_lines) else ""
-        u_ind = u_lead[: len(u_lead) - len(u_lead.lstrip())]
-        step = _detect_indent_step(u_ind)
+    step = _derive_unit_indent_step(unit, plan.orig_lines, step)
 
     rep_stmt = _build_unit_delegation_call(
         unit,
@@ -2407,11 +2416,7 @@ def generate_refactoring_patch(
             )
             else None
         )
-        if step is None:
-            u1_s = int(u1.get("start") or 1)
-            u1_lead = orig_lines[u1_s - 1] if 1 <= u1_s <= len(orig_lines) else ""
-            u1_ind = u1_lead[: len(u1_lead) - len(u1_lead.lstrip())]
-            step = _detect_indent_step(u1_ind)
+        step = _derive_unit_indent_step(u1, orig_lines, step)
 
         scope = analyze_unit_variable_scope(u1_eff, u2_eff, repo_root=str(root))
         inputs = list(scope.get("inputs", []))
@@ -2573,14 +2578,20 @@ def generate_refactoring_patch(
         if is_same_file and not check_units_overlap(u1, u2, repo_root=str(root)):
             candidate_units.append(u2)
 
-        earliest_unit = min(candidate_units, key=lambda u: int(u.get("start") or 1))
+        def _unit_start(u: Dict[str, Any]) -> int:
+            s_val = u.get("start")
+            return int(s_val) if s_val is not None else 1
+
+        earliest_unit = min(candidate_units, key=_unit_start)
         enc_fn_earliest = (
             find_enclosing_function(orig_text, earliest_unit)
             if effective_binding == "method"
             else None
         )
         insert_line = (
-            enc_fn_earliest["start"] if enc_fn_earliest else int(earliest_unit.get("start") or 1)
+            enc_fn_earliest["start"]
+            if enc_fn_earliest
+            else _unit_start(earliest_unit)
         )
 
         if is_same_file:
