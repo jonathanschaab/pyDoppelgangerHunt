@@ -1462,33 +1462,53 @@ def _match_structural_and_boundary_passes(
     return None
 
 
-def _match_clone_record(
-    c_keys: Dict[str, Any],
-    unconsumed: List[Dict[str, Any]],
+def _resolve_clone_endpoint_repo_path(
+    file_path: str,
+    scan_offset: Optional[str],
+    active_basis: str,
     resolver: Optional[CanonicalPathResolver] = None,
-    base_offset: Optional[str] = None,
-    scan_offset: Optional[str] = None,
-    path_basis: Optional[str] = "target_relative",
-    clone_basis: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    """Finds matching unconsumed baseline record prioritizing exact and namespaced fingerprints."""
+) -> str:
+    """Resolves an endpoint file path to its canonical repository-relative path."""
+    if resolver is not None and _is_absolute_path_str(file_path):
+        res = resolver.resolve(file_path, basis=active_basis)
+        return res.repo_relative or file_path
+    return _canonicalize_endpoint_path(file_path, scan_offset, path_basis=active_basis)
+
+
+@dataclass
+class _CloneMatchCandidateContext:
+    """Canonical representations and query fingerprints for baseline candidate matching."""
+
+    c_repo_fa: str
+    c_repo_fb: str
+    c_names: List[str]
+    c_ha: str
+    c_hb: str
+    c_repo_fp: str
+    c_repo_sfp: str
+    c_sfp: str
+    c_ns_sfp: str
+    c_namespaces: List[str]
+    c_pure_sfp: str
+
+
+def _prepare_clone_candidate_context(
+    c_keys: Dict[str, Any],
+    *,
+    resolver: Optional[CanonicalPathResolver],
+    base_offset: Optional[str],
+    scan_offset: Optional[str],
+    clone_basis: Optional[str],
+) -> Optional[_CloneMatchCandidateContext]:
+    """Derives and validates canonical candidate representations for matching against baseline records."""
     c_fa, c_na, c_ha, c_fb, c_nb, c_hb = _extract_record_endpoint_data(c_keys)
     active_basis = (
         "repo_relative"
         if clone_basis in ("repo", "repo_relative", "worktree_relative")
         else "target_relative"
     )
-    if resolver is not None and _is_absolute_path_str(c_fa):
-        res_a = resolver.resolve(c_fa, basis=active_basis)
-        c_repo_fa = res_a.repo_relative or c_fa
-    else:
-        c_repo_fa = _canonicalize_endpoint_path(c_fa, scan_offset, path_basis=active_basis)
-
-    if resolver is not None and _is_absolute_path_str(c_fb):
-        res_b = resolver.resolve(c_fb, basis=active_basis)
-        c_repo_fb = res_b.repo_relative or c_fb
-    else:
-        c_repo_fb = _canonicalize_endpoint_path(c_fb, scan_offset, path_basis=active_basis)
+    c_repo_fa = _resolve_clone_endpoint_repo_path(c_fa, scan_offset, active_basis, resolver)
+    c_repo_fb = _resolve_clone_endpoint_repo_path(c_fb, scan_offset, active_basis, resolver)
 
     if base_offset:
         rel_a = lexical_relative_to(c_repo_fa, base_offset)
@@ -1508,15 +1528,50 @@ def _match_clone_record(
     c_ns_sfp = c_repo_ns_sfp if scan_offset else (c_keys.get("ns_sfp") or c_repo_ns_sfp)
     c_namespaces = c_repo_namespaces if scan_offset else (c_keys.get("namespaces") or c_repo_namespaces)
 
-    matched = _match_exact_and_namespaced_passes(
-        unconsumed,
+    return _CloneMatchCandidateContext(
+        c_repo_fa=c_repo_fa,
+        c_repo_fb=c_repo_fb,
+        c_names=c_names,
+        c_ha=c_ha,
+        c_hb=c_hb,
         c_repo_fp=c_repo_fp,
         c_repo_sfp=c_repo_sfp,
         c_sfp=c_sfp,
         c_ns_sfp=c_ns_sfp,
-        c_names=c_names,
-        c_ha=c_ha,
-        c_hb=c_hb,
+        c_namespaces=c_namespaces,
+        c_pure_sfp=c_pure_sfp,
+    )
+
+
+def _match_clone_record(
+    c_keys: Dict[str, Any],
+    unconsumed: List[Dict[str, Any]],
+    resolver: Optional[CanonicalPathResolver] = None,
+    base_offset: Optional[str] = None,
+    scan_offset: Optional[str] = None,
+    path_basis: Optional[str] = "target_relative",
+    clone_basis: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Finds matching unconsumed baseline record prioritizing exact and namespaced fingerprints."""
+    ctx = _prepare_clone_candidate_context(
+        c_keys,
+        resolver=resolver,
+        base_offset=base_offset,
+        scan_offset=scan_offset,
+        clone_basis=clone_basis,
+    )
+    if ctx is None:
+        return None
+
+    matched = _match_exact_and_namespaced_passes(
+        unconsumed,
+        c_repo_fp=ctx.c_repo_fp,
+        c_repo_sfp=ctx.c_repo_sfp,
+        c_sfp=ctx.c_sfp,
+        c_ns_sfp=ctx.c_ns_sfp,
+        c_names=ctx.c_names,
+        c_ha=ctx.c_ha,
+        c_hb=ctx.c_hb,
         base_offset=base_offset,
         path_basis=path_basis,
     )
@@ -1525,17 +1580,18 @@ def _match_clone_record(
 
     return _match_structural_and_boundary_passes(
         unconsumed,
-        c_pure_sfp=c_pure_sfp,
-        c_namespaces=c_namespaces,
-        c_names=c_names,
-        c_repo_fa=c_repo_fa,
-        c_repo_fb=c_repo_fb,
-        c_ha=c_ha,
-        c_hb=c_hb,
+        c_pure_sfp=ctx.c_pure_sfp,
+        c_namespaces=ctx.c_namespaces,
+        c_names=ctx.c_names,
+        c_repo_fa=ctx.c_repo_fa,
+        c_repo_fb=ctx.c_repo_fb,
+        c_ha=ctx.c_ha,
+        c_hb=ctx.c_hb,
         resolver=resolver,
         base_offset=base_offset,
         path_basis=path_basis,
     )
+
 
 
 def _filter_clones_by_baseline_records(
@@ -1618,6 +1674,67 @@ def _filter_clones_by_plain_fingerprint_set(
     return new_clones_plain, suppressed_count_plain
 
 
+@dataclass
+class _BaselineCoordinateContext:
+    """Encapsulates resolved path offsets, coordinate basis, and canonical path resolver."""
+
+    resolver: Optional[CanonicalPathResolver]
+    base_offset: Optional[str]
+    scan_offset: Optional[str]
+    base_basis: str
+    base_target: Optional[str]
+
+
+def _resolve_baseline_coordinate_context(
+    source: Any,
+    repo_root: Optional[str],
+    target: Optional[str],
+) -> _BaselineCoordinateContext:
+    """Derives canonical path resolver, base/scan offsets, and coordinate basis from baseline metadata."""
+    if isinstance(source, dict):
+        base_target = _safe_str(source.get("target"))
+        target_repo_rel = source.get("target_repo_relative")
+        raw_base_basis = source.get("path_basis")
+        sample_records = source.get("fingerprints") or []
+    else:
+        raw_target = getattr(source, "target", None)
+        base_target = _safe_str(raw_target) if raw_target is not None else None
+        target_repo_rel = getattr(source, "target_repo_relative", None)
+        raw_base_basis = getattr(source, "path_basis", None)
+        sample_records = getattr(source, "records", None) or []
+
+    resolver = _build_baseline_path_resolver(repo_root, baseline_target=base_target, target=target)
+    base_offset, scan_offset = _derive_target_offsets(
+        base_target,
+        target_repo_rel,
+        repo_root,
+        target=target,
+    )
+    if not raw_base_basis and sample_records:
+        inferred_offset = (
+            base_offset
+            or (normalize_lexical_posix(base_target).strip("./").rstrip("/") if base_target else None)
+        )
+        raw_base_basis = _detect_clone_path_basis(
+            sample_records,
+            inferred_offset,
+            repo_root=repo_root,
+            target=base_target or target,
+        )
+    base_basis = (
+        "repo_relative"
+        if raw_base_basis in ("repo", "repo_relative", "worktree_relative")
+        else "target_relative"
+    )
+    return _BaselineCoordinateContext(
+        resolver=resolver,
+        base_offset=base_offset,
+        scan_offset=scan_offset,
+        base_basis=base_basis,
+        base_target=base_target,
+    )
+
+
 def filter_clones_by_baseline(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     baseline_fingerprints: Union[Set[str], BaselineFingerprints],
@@ -1629,38 +1746,14 @@ def filter_clones_by_baseline(
     if not baseline_fingerprints:
         return clones, 0
 
-    base_target = getattr(baseline_fingerprints, "target", None)
-    resolver = _build_baseline_path_resolver(repo_root, baseline_target=base_target, target=target)
-    base_offset, scan_offset = _derive_target_offsets(
-        base_target,
-        getattr(baseline_fingerprints, "target_repo_relative", None),
-        repo_root,
-        target=target,
-    )
-    raw_base_basis = getattr(baseline_fingerprints, "path_basis", None)
-    if not raw_base_basis and isinstance(baseline_fingerprints, BaselineFingerprints):
-        records_obj = getattr(baseline_fingerprints, "records", None)
-        inferred_offset = (
-            base_offset
-            or (normalize_lexical_posix(base_target).strip("./").rstrip("/") if base_target else None)
-        )
-        raw_base_basis = _detect_clone_path_basis(
-            records_obj or [],
-            inferred_offset,
-            repo_root=repo_root,
-            target=base_target or target,
-        )
-    base_basis = (
-        "repo_relative"
-        if raw_base_basis in ("repo", "repo_relative", "worktree_relative")
-        else "target_relative"
-    )
-
     records = getattr(baseline_fingerprints, "records", None)
     if records:
+        ctx = _resolve_baseline_coordinate_context(
+            baseline_fingerprints, repo_root=repo_root, target=target
+        )
         active_clone_basis = _detect_clone_path_basis(
             clones,
-            scan_offset,
+            ctx.scan_offset,
             explicit_basis=clone_basis,
             repo_root=repo_root,
             target=target,
@@ -1668,10 +1761,10 @@ def filter_clones_by_baseline(
         return _filter_clones_by_baseline_records(
             clones,
             records,
-            resolver=resolver,
-            base_offset=base_offset,
-            scan_offset=scan_offset,
-            base_basis=base_basis,
+            resolver=ctx.resolver,
+            base_offset=ctx.base_offset,
+            scan_offset=ctx.scan_offset,
+            base_basis=ctx.base_basis,
             active_clone_basis=active_clone_basis,
         )
 
@@ -1726,55 +1819,19 @@ def prune_baseline(
     if not isinstance(data, dict) or "fingerprints" not in data:
         return PruneResult(0, 0, 0)
 
-    base_target = _safe_str(data.get("target")) if isinstance(data, dict) else None
-    resolver = _build_baseline_path_resolver(repo_root, baseline_target=base_target, target=target)
-    base_offset, scan_offset = _derive_target_offsets(
-        base_target,
-        data.get("target_repo_relative"),
-        repo_root,
-        target=target,
-    )
-    raw_base_basis = data.get("path_basis") if isinstance(data, dict) else None
-    if raw_base_basis:
-        base_basis = (
-            "repo_relative"
-            if raw_base_basis in ("repo", "repo_relative", "worktree_relative")
-            else "target_relative"
-        )
-    else:
-        inferred_offset = (
-            base_offset
-            or (normalize_lexical_posix(base_target).strip("./").rstrip("/") if base_target else None)
-        )
-        base_basis = _detect_clone_path_basis(
-            data.get("fingerprints", []),
-            inferred_offset,
-            repo_root=repo_root,
-            target=base_target or target,
-        )
-
+    ctx = _resolve_baseline_coordinate_context(data, repo_root=repo_root, target=target)
     if unstaged_modified_ranges is None:
-        try:
-            unstaged_modified_ranges = git_diff.get_git_modified_line_ranges(
-                since_ref=None, repo_root=repo_root
-            )
-        except Exception as err:
-            # Pragmatic fallback when git is unavailable, outside a repo, or query fails
-            logger.debug(
-                "Failed to query unstaged git modified line ranges during baseline pruning: %s",
-                err,
-            )
-            unstaged_modified_ranges = {}
+        unstaged_modified_ranges = _resolve_unstaged_modified_ranges(repo_root)
 
     active_clone_basis = _detect_clone_path_basis(
         active_clones,
-        scan_offset,
+        ctx.scan_offset,
         explicit_basis=clone_basis,
         repo_root=repo_root,
         target=target,
     )
     indices = _build_pruning_active_clone_indices(
-        active_clones, base_offset, scan_offset, active_clone_basis
+        active_clones, ctx.base_offset, ctx.scan_offset, active_clone_basis
     )
 
     retained: List[Dict[str, Any]] = []
@@ -1782,74 +1839,22 @@ def prune_baseline(
     skipped_dirty_count = 0
 
     for raw_item in data.get("fingerprints", []):
-        if isinstance(raw_item, str):
-            item = _parse_legacy_fingerprint_record(raw_item)
-        elif isinstance(raw_item, dict):
-            item = dict(raw_item)
-        else:
-            continue
-        f_a = str(item.get("file_a") or "")
-        f_b = str(item.get("file_b") or "")
-        if not f_a and not f_b:
-            f_a, _, _, f_b, _, _ = _extract_record_endpoint_data(item)
-
-        h_a = str(item.get("hash_a", ""))
-        h_b = str(item.get("hash_b", ""))
-        if not h_a and not h_b and item.get("structural_fingerprint"):
-            _, h_a, _, h_b = _parse_structural_fingerprint(str(item["structural_fingerprint"]))
-
-        r_repo_fa, r_repo_fb, r_repo_fp, r_repo_sfp, r_repo_ns_sfp, r_repo_namespaces = (
-            _get_rec_repo_data(item, base_offset, path_basis=base_basis)
-        )
-        if not h_a and not h_b and r_repo_sfp:
-            _, h_a, _, h_b = _parse_structural_fingerprint(str(r_repo_sfp))
-
-        item_pure_sfp = item.get("pure_structural_fingerprint")
-        if not item_pure_sfp and h_a and h_b:
-            item_pure_sfp = _format_paired_endpoints(h_a, h_b)
-            item["pure_structural_fingerprint"] = item_pure_sfp
-
-        is_active, matched_clone, is_boundary_matched = _match_record_against_active_indices(
-            item,
-            indices,
-            r_repo_fa,
-            r_repo_fb,
-            r_repo_fp,
-            r_repo_sfp,
-            r_repo_ns_sfp,
-            r_repo_namespaces,
-            h_a,
-            h_b,
-            item_pure_sfp,
-            resolver=resolver,
-            scan_offset=scan_offset,
+        item, is_pruned, is_skipped_dirty = _evaluate_single_prune_record(
+            raw_item,
+            indices=indices,
+            ctx=ctx,
             active_clone_basis=active_clone_basis,
+            unstaged_modified_ranges=unstaged_modified_ranges,
         )
-
-        if is_active:
-            can_rewrite = (
-                base_offset == scan_offset
-                and not is_boundary_matched
-                and matched_clone is not None
-                and (
-                    item.get("fingerprint") not in indices.active_target_fps
-                    or item.get("structural_fingerprint") not in indices.active_target_sfps
-                )
-            )
-            if can_rewrite and matched_clone is not None:
-                _rewrite_pruned_record(
-                    item, matched_clone, base_basis, active_clone_basis, scan_offset
-                )
+        if item is not None:
             retained.append(item)
-        else:
-            if _is_pruned_record_dirty(f_a, f_b, r_repo_fa, r_repo_fb, unstaged_modified_ranges):
+            if is_skipped_dirty:
                 skipped_dirty_count += 1
-                retained.append(item)
-            else:
-                pruned_count += 1
+        elif is_pruned:
+            pruned_count += 1
 
     _update_pruned_calibration_metadata(
-        data, base_offset, base_target, repo_root, base_basis
+        data, ctx.base_offset, ctx.base_target, repo_root, ctx.base_basis
     )
     data["clone_count"] = len(retained)
     data["fingerprints"] = retained
@@ -2070,6 +2075,101 @@ def _is_pruned_record_dirty(
         or find_matching_path_value(r_repo_fa, unstaged_modified_ranges) is not None
         or find_matching_path_value(r_repo_fb, unstaged_modified_ranges) is not None
     )
+
+
+def _resolve_unstaged_modified_ranges(
+    repo_root: Optional[str],
+) -> Dict[str, List[Tuple[int, int]]]:
+    """Queries git for unstaged modified line ranges, falling back cleanly if git fails."""
+    try:
+        return git_diff.get_git_modified_line_ranges(since_ref=None, repo_root=repo_root)
+    except Exception as err:
+        logger.debug(
+            "Failed to query unstaged git modified line ranges during baseline pruning: %s",
+            err,
+        )
+        return {}
+
+
+def _evaluate_single_prune_record(
+    raw_item: Any,
+    *,
+    indices: _ActivePruningIndices,
+    ctx: _BaselineCoordinateContext,
+    active_clone_basis: str,
+    unstaged_modified_ranges: Optional[Dict[str, List[Tuple[int, int]]]],
+) -> Tuple[Optional[Dict[str, Any]], bool, bool]:
+    """Evaluates a single baseline fingerprint record for retention, pruning, or dirty skipping.
+
+    Returns:
+        A tuple of (retained_item, is_pruned, is_skipped_dirty).
+        retained_item is None when the record is discarded (pruned) or invalid.
+    """
+    if isinstance(raw_item, str):
+        item = _parse_legacy_fingerprint_record(raw_item)
+    elif isinstance(raw_item, dict):
+        item = dict(raw_item)
+    else:
+        return None, False, False
+
+    f_a = str(item.get("file_a") or "")
+    f_b = str(item.get("file_b") or "")
+    if not f_a and not f_b:
+        f_a, _, _, f_b, _, _ = _extract_record_endpoint_data(item)
+
+    h_a = str(item.get("hash_a", ""))
+    h_b = str(item.get("hash_b", ""))
+    if not h_a and not h_b and item.get("structural_fingerprint"):
+        _, h_a, _, h_b = _parse_structural_fingerprint(str(item["structural_fingerprint"]))
+
+    r_repo_fa, r_repo_fb, r_repo_fp, r_repo_sfp, r_repo_ns_sfp, r_repo_namespaces = (
+        _get_rec_repo_data(item, ctx.base_offset, path_basis=ctx.base_basis)
+    )
+    if not h_a and not h_b and r_repo_sfp:
+        _, h_a, _, h_b = _parse_structural_fingerprint(str(r_repo_sfp))
+
+    item_pure_sfp = item.get("pure_structural_fingerprint")
+    if not item_pure_sfp and h_a and h_b:
+        item_pure_sfp = _format_paired_endpoints(h_a, h_b)
+        item["pure_structural_fingerprint"] = item_pure_sfp
+
+    is_active, matched_clone, is_boundary_matched = _match_record_against_active_indices(
+        item,
+        indices,
+        r_repo_fa,
+        r_repo_fb,
+        r_repo_fp,
+        r_repo_sfp,
+        r_repo_ns_sfp,
+        r_repo_namespaces,
+        h_a,
+        h_b,
+        item_pure_sfp,
+        resolver=ctx.resolver,
+        scan_offset=ctx.scan_offset,
+        active_clone_basis=active_clone_basis,
+    )
+
+    if is_active:
+        can_rewrite = (
+            ctx.base_offset == ctx.scan_offset
+            and not is_boundary_matched
+            and matched_clone is not None
+            and (
+                item.get("fingerprint") not in indices.active_target_fps
+                or item.get("structural_fingerprint") not in indices.active_target_sfps
+            )
+        )
+        if can_rewrite and matched_clone is not None:
+            _rewrite_pruned_record(
+                item, matched_clone, ctx.base_basis, active_clone_basis, ctx.scan_offset
+            )
+        return item, False, False
+
+    if _is_pruned_record_dirty(f_a, f_b, r_repo_fa, r_repo_fb, unstaged_modified_ranges):
+        return item, False, True
+
+    return None, True, False
 
 
 def _update_pruned_calibration_metadata(
