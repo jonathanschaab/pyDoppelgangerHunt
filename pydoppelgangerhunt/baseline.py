@@ -1144,7 +1144,13 @@ def _get_rec_fingerprint_value(
     val = str(rec.get(key) or "")
     if base_offset or not val:
         repo_data = _get_rec_repo_data(rec, base_offset, path_basis=path_basis)
-        return repo_data[3] if key == "structural_fingerprint" else repo_data[4]
+        if key == "structural_fingerprint":
+            return repo_data[3]
+        if key == "namespaced_structural_fingerprint":
+            return repo_data[4]
+        if key in ("fingerprint", "fp"):
+            return repo_data[2]
+        return repo_data[3]
     return val
 
 
@@ -1365,18 +1371,19 @@ def _match_exact_and_namespaced_passes(
     consumed_ids: Optional[Set[int]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Evaluates Pass 1 (symbol-path), Pass 2 (path-structural), and Pass 3 (namespaced structural)."""
-    candidates = (
-        [rec for rec in unconsumed if id(rec) not in consumed_ids]
-        if consumed_ids is not None
-        else unconsumed
-    )
-
     # Pass 1: exact symbol-path fingerprint (file:name <===> file:name) prioritizing matching structural hash
     cand_pass1: Optional[Dict[str, Any]] = None
-    for rec in candidates:
-        _, _, r_repo_fp, r_repo_sfp, _, _ = _get_rec_repo_data(
-            rec, base_offset, path_basis=path_basis
-        )
+    for rec in unconsumed:
+        if consumed_ids is not None and id(rec) in consumed_ids:
+            continue
+
+        r_repo_fp = rec.get("fingerprint")
+        r_repo_sfp = rec.get("structural_fingerprint")
+        if base_offset or not r_repo_fp:
+            _, _, r_repo_fp, r_repo_sfp, _, _ = _get_rec_repo_data(
+                rec, base_offset, path_basis=path_basis
+            )
+
         if r_repo_fp == c_repo_fp:
             if c_ha and c_hb and r_repo_sfp == c_repo_sfp:
                 return rec
@@ -1386,13 +1393,17 @@ def _match_exact_and_namespaced_passes(
         return cand_pass1
 
     # Pass 2: exact path-structural fingerprint (file#hash <===> file#hash) resilient to function renames
-    for rec in candidates:
+    for rec in unconsumed:
+        if consumed_ids is not None and id(rec) in consumed_ids:
+            continue
         if _get_rec_fingerprint_value(rec, "structural_fingerprint", base_offset, path_basis) == c_sfp:
             return rec
 
     # Pass 3: namespaced structural fingerprint (namespace#hash <===> namespace#hash) resilient to file renames within package
     cand_pass3: Optional[Dict[str, Any]] = None
-    for rec in candidates:
+    for rec in unconsumed:
+        if consumed_ids is not None and id(rec) in consumed_ids:
+            continue
         if _get_rec_fingerprint_value(rec, "namespaced_structural_fingerprint", base_offset, path_basis) == c_ns_sfp:
             if _record_matches_names(rec, c_names):
                 return rec
@@ -1420,16 +1431,12 @@ def _match_structural_and_boundary_passes(
     consumed_ids: Optional[Set[int]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Evaluates Pass 4 (pure structural with namespace), Pass 5 (cross-namespace moved), and Pass 6 (boundary)."""
-    candidates = (
-        [rec for rec in unconsumed if id(rec) not in consumed_ids]
-        if consumed_ids is not None
-        else unconsumed
-    )
-
     # Pass 4: pure structural fingerprint (hash <===> hash) strictly requiring matching module namespaces,
     # preventing identical boilerplate functions across different modules from colliding
     cand_pass4: Optional[Dict[str, Any]] = None
-    for rec in candidates:
+    for rec in unconsumed:
+        if consumed_ids is not None and id(rec) in consumed_ids:
+            continue
         if rec.get("pure_structural_fingerprint") == c_pure_sfp:
             if base_offset:
                 _, _, _, _, _, r_namespaces = _get_rec_repo_data(
@@ -1453,29 +1460,38 @@ def _match_structural_and_boundary_passes(
 
     # Pass 5: pure structural fallback for cross-namespace moved files; requires distinct structural hashes
     # (h_a != h_b) and matching symbols, preventing a grandfathered entry from being hijacked by unrelated cross-namespace code
-    for rec in candidates:
+    for rec in unconsumed:
+        if consumed_ids is not None and id(rec) in consumed_ids:
+            continue
         if rec.get("pure_structural_fingerprint") == c_pure_sfp:
             h_a = str(rec.get("hash_a", ""))
             h_b = str(rec.get("hash_b", ""))
-            if not h_a and not h_b and rec.get("structural_fingerprint"):
-                _, h_a, _, h_b = _parse_structural_fingerprint(str(rec["structural_fingerprint"]))
-            if not h_a and not h_b and rec.get("pure_structural_fingerprint"):
+            if (not h_a or not h_b) and rec.get("structural_fingerprint"):
+                _, p_ha, _, p_hb = _parse_structural_fingerprint(str(rec["structural_fingerprint"]))
+                h_a = h_a or p_ha
+                h_b = h_b or p_hb
+            if (not h_a or not h_b) and rec.get("pure_structural_fingerprint"):
                 parts = str(rec["pure_structural_fingerprint"]).split(" <===> ")
                 if len(parts) == 2:
-                    h_a, h_b = parts[0], parts[1]
+                    h_a = h_a or parts[0]
+                    h_b = h_b or parts[1]
             if h_a and h_b and h_a != h_b:
                 if not rec.get("name_a") or _record_matches_names(rec, c_names):
                     return rec
 
     # Pass 6: cross-root boundary-aware matching (e.g. baseline recorded at repo root vs scan targeting subdirectory)
-    for rec in candidates:
+    for rec in unconsumed:
+        if consumed_ids is not None and id(rec) in consumed_ids:
+            continue
         r_repo_fa, r_repo_fb, _, _, _, _ = _get_rec_repo_data(
             rec, base_offset, path_basis=path_basis
         )
         r_ha = str(rec.get("hash_a") or "")
         r_hb = str(rec.get("hash_b") or "")
-        if not r_ha and not r_hb and rec.get("structural_fingerprint"):
-            _, r_ha, _, r_hb = _parse_structural_fingerprint(str(rec["structural_fingerprint"]))
+        if (not r_ha or not r_hb) and rec.get("structural_fingerprint"):
+            _, p_ha, _, p_hb = _parse_structural_fingerprint(str(rec["structural_fingerprint"]))
+            r_ha = r_ha or p_ha
+            r_hb = r_hb or p_hb
         if _matches_boundary_and_structural_hashes(
             r_repo_fa, r_repo_fb, r_ha, r_hb, c_repo_fa, c_repo_fb, c_ha, c_hb, resolver=resolver
         ):

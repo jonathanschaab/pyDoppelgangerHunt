@@ -2171,3 +2171,27 @@ def test_scan_target_novel_pair_budget_parameter(
     assert len(fn_b_clones) == 0
     assert any("Novel shingle pair budget exceeded" in record.message for record in caplog.records)
 
+
+def test_find_calibration_mode_mismatch_symmetric_scope_normalization() -> None:
+    """Verifies that empty/root target scopes ('/' or '.') match calibrated None scope symmetrically."""
+    from pydoppelgangerhunt.matcher import _find_calibration_mode_mismatch  # pylint: disable=import-outside-toplevel
+
+    calib = {
+        "bag_of_tokens": False,
+        "call_sequences": False,
+        "filter_stop_shingles": False,
+        "audit_tests": False,
+        "include_notebooks": False,
+        "scope": None,
+    }
+    # Passing target_scope="/" or "." must not trigger a false scope mismatch
+    assert _find_calibration_mode_mismatch(calib, target_scope="/") is None
+    assert _find_calibration_mode_mismatch(calib, target_scope=".") is None
+    assert _find_calibration_mode_mismatch(calib, target_scope="") is None
+    assert _find_calibration_mode_mismatch(calib, target_scope=None) is None
+    # Truly distinct scope must still mismatch
+    mismatch = _find_calibration_mode_mismatch(calib, target_scope="packages/sub")
+    assert mismatch is not None
+    assert "scope" in mismatch
+
+

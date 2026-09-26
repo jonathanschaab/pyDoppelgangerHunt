@@ -800,12 +800,18 @@ def _find_calibration_mode_mismatch(
         normalize_lexical_posix(str(calib_scope)).strip("/")
         if calib_scope
         else None
-    )
+    ) or None
+    if norm_calib_scope == ".":
+        norm_calib_scope = None
+
     norm_target_scope = (
         normalize_lexical_posix(str(target_scope)).strip("/")
         if target_scope
         else None
-    )
+    ) or None
+    if norm_target_scope == ".":
+        norm_target_scope = None
+
     if norm_calib_scope != norm_target_scope:
         return f"scope (calibrated: '{norm_calib_scope}', scan: '{norm_target_scope}')"
 

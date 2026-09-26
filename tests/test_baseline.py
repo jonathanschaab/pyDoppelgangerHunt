@@ -5618,3 +5618,110 @@ def test_baseline_lexical_relative_to_case_folding() -> None:
     assert ctx is not None
 
 
+def test_get_rec_fingerprint_value_explicit_keys() -> None:
+    """Verifies that _get_rec_fingerprint_value maps all fingerprint keys explicitly."""
+    from pydoppelgangerhunt.baseline import _get_rec_fingerprint_value  # pylint: disable=import-outside-toplevel
+
+    rec = {
+        "file_a": "pkg/a.py",
+        "file_b": "pkg/b.py",
+        "name_a": "fn_a",
+        "name_b": "fn_b",
+        "hash_a": "ha",
+        "hash_b": "hb",
+        "fingerprint": "pkg/a.py:fn_a <===> pkg/b.py:fn_b",
+        "structural_fingerprint": "pkg/a.py#ha <===> pkg/b.py#hb",
+        "namespaced_structural_fingerprint": "pkg#ha <===> pkg#hb",
+    }
+    # When base_offset is present, derives from _get_rec_repo_data
+    assert _get_rec_fingerprint_value(rec, "structural_fingerprint", "root", None) == "root/pkg/a.py#ha <===> root/pkg/b.py#hb"
+    assert _get_rec_fingerprint_value(rec, "namespaced_structural_fingerprint", "root", None) == "root/pkg#ha <===> root/pkg#hb"
+    assert _get_rec_fingerprint_value(rec, "fingerprint", "root", None) == "root/pkg/a.py:fn_a <===> root/pkg/b.py:fn_b"
+    assert _get_rec_fingerprint_value(rec, "fp", "root", None) == "root/pkg/a.py:fn_a <===> root/pkg/b.py:fn_b"
+    assert _get_rec_fingerprint_value(rec, "unknown", "root", None) == "root/pkg/a.py#ha <===> root/pkg/b.py#hb"
+
+    # When base_offset is None and key exists, returns direct cached string
+    assert _get_rec_fingerprint_value(rec, "fingerprint", None, None) == rec["fingerprint"]
+    assert _get_rec_fingerprint_value(rec, "structural_fingerprint", None, None) == rec["structural_fingerprint"]
+    assert _get_rec_fingerprint_value(rec, "namespaced_structural_fingerprint", None, None) == rec["namespaced_structural_fingerprint"]
+
+
+def test_match_clone_record_pass1_short_circuits_without_base_offset() -> None:
+    """Verifies that Pass 1 matches direct fingerprint when base_offset is None."""
+    from pydoppelgangerhunt.baseline import _match_clone_record  # pylint: disable=import-outside-toplevel
+
+    rec = {
+        "fingerprint": "a.py:f1 <===> b.py:f2",
+        "structural_fingerprint": "a.py#h1 <===> b.py#h2",
+        "file_a": "a.py",
+        "name_a": "f1",
+        "file_b": "b.py",
+        "name_b": "f2",
+        "hash_a": "h1",
+        "hash_b": "h2",
+    }
+    c_keys = {
+        "file_a": "a.py",
+        "file_b": "b.py",
+        "name_a": "f1",
+        "name_b": "f2",
+        "hash_a": "h1",
+        "hash_b": "h2",
+        "fp": "a.py:f1 <===> b.py:f2",
+        "sfp": "a.py#h1 <===> b.py#h2",
+    }
+    matched = _match_clone_record(c_keys, [rec], base_offset=None)
+    assert matched is rec
+
+
+def test_match_clone_record_pass5_and_pass6_asymmetric_hash_recovery() -> None:
+    """Verifies that Pass 5 and Pass 6 recover missing structural hashes when only one hash is populated."""
+    from pydoppelgangerhunt.baseline import _match_clone_record, _match_structural_and_boundary_passes  # pylint: disable=import-outside-toplevel
+
+    # Pass 5: rec has hash_a but missing hash_b (only in structural_fingerprint)
+    rec_pass5 = {
+        "pure_structural_fingerprint": "ha_unique <===> hb_unique",
+        "structural_fingerprint": "old_ns/mod.py#ha_unique <===> old_ns/other.py#hb_unique",
+        "hash_a": "ha_unique",
+        # hash_b is intentionally omitted
+        "name_a": "run",
+        "name_b": "run",
+    }
+    query_pass5 = {
+        "file_a": "new_ns/mod.py",
+        "file_b": "new_ns/other.py",
+        "name_a": "run",
+        "name_b": "run",
+        "hash_a": "ha_unique",
+        "hash_b": "hb_unique",
+        "pure_sfp": "ha_unique <===> hb_unique",
+        "namespaces": ["new_ns", "new_ns"],
+        "names": ["run", "run"],
+    }
+    matched5 = _match_clone_record(query_pass5, [rec_pass5])
+    assert matched5 is rec_pass5
+
+    # Pass 6: boundary matching where hash_a was present but hash_b was missing
+    rec_pass6 = {
+        "file_a": "repo_sub/mod.py",
+        "file_b": "repo_sub/util.py",
+        "structural_fingerprint": "repo_sub/mod.py#h_x <===> repo_sub/util.py#h_y",
+        "hash_a": "h_x",
+        # hash_b is omitted
+        "name_a": "work",
+        "name_b": "work",
+    }
+    matched6 = _match_structural_and_boundary_passes(
+        [rec_pass6],
+        c_pure_sfp="h_x <===> h_y",
+        c_namespaces=["other", "other"],
+        c_names=["work", "work"],
+        c_repo_fa="repo_sub/mod.py",
+        c_repo_fb="repo_sub/util.py",
+        c_ha="h_x",
+        c_hb="h_y",
+    )
+    assert matched6 is rec_pass6
+
+
+
