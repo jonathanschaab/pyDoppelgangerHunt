@@ -6856,32 +6856,55 @@ def test_col_offset_to_char_offset_surrogate_code_points() -> None:
 
 
 def test_resolve_unit_replacement_crlf_line_endings_no_dangling_carriage_return() -> None:
-    """Verifies that CRLF line endings (\\r\\n) do not produce orphaned \\r carriage returns."""
-    from pydoppelgangerhunt.fixer import refactor_module_units, resolve_unit_replacement
+    """Verifies that CRLF line endings (\r\n) do not produce orphaned \r carriage returns."""
+    from pydoppelgangerhunt.fixer import resolve_unit_replacement
 
-    # CRLF source code with pragma comment
-    crlf_code = "def calc():\r\n    total = sum(x for x in nums)  # type: ignore\r\n    return total\r\n"
-    unit = {
+    # 1. Column-bounded unit with boundary pragma on line 1, ending on line 3 with suffix code
+    crlf_col_code = "x = calc(  # type: ignore\r\n    data\r\n) + tail\r\n"
+    col_unit = {
         "file": "calc.py",
-        "name": "comp",
-        "start": 2,
-        "end": 2,
-        "start_col": 12,
-        "end_col": 33,
-        "kind": "comprehension",
+        "name": "calc",
+        "start": 1,
+        "end": 3,
+        "start_col": 4,
+        "end_col": 1,
+        "kind": "complex_expr",
     }
-    # Column-bounded replacement
-    rep_item = resolve_unit_replacement(crlf_code, unit, "aggregate(nums)\r\n")
-    # Verify no orphaned '\r' before pragma
+    rep_item = resolve_unit_replacement(crlf_col_code, col_unit, "fast_calc(data)")
+    assert rep_item.consumes_line_suffix is True
     assert "\r " not in rep_item.final_rep
     assert "\r\r" not in rep_item.final_rep
     assert rep_item.final_rep.endswith("\r\n")
+    assert "# type: ignore" in rep_item.final_rep
+    assert "+ tail" in rep_item.final_rep
 
-    # Whole-line replacement on CRLF
-    fn_unit = {"file": "calc.py", "name": "calc", "start": 1, "end": 3, "kind": "function"}
-    whole_rep_item = resolve_unit_replacement(crlf_code, fn_unit, "def calc():\r\n    return 42\r\n")
+    # 2. Column-bounded unit with boundary pragma on line 1, ending on line 2 without suffix code
+    col_unit_clean = {
+        "file": "calc.py",
+        "name": "calc",
+        "start": 1,
+        "end": 2,
+        "start_col": 4,
+        "end_col": 8,
+        "kind": "complex_expr",
+    }
+    clean_rep_item = resolve_unit_replacement(crlf_col_code, col_unit_clean, "fast_calc(data)")
+    assert clean_rep_item.consumes_line_suffix is True
+    assert "\r " not in clean_rep_item.final_rep
+    assert "\r\r" not in clean_rep_item.final_rep
+    assert clean_rep_item.final_rep.endswith("\r\n")
+    assert "# type: ignore" in clean_rep_item.final_rep
+
+    # 3. Whole-line replacement with pragma on start boundary line (line 1)
+    crlf_fn_code = "def calc():  # type: ignore\r\n    return 42\r\n"
+    fn_unit = {"file": "calc.py", "name": "calc", "start": 1, "end": 2, "kind": "function"}
+    whole_rep_item = resolve_unit_replacement(
+        crlf_fn_code, fn_unit, "def calc():\r\n    return 100\r\n"
+    )
     assert "\r " not in whole_rep_item.final_rep
+    assert "\r\r" not in whole_rep_item.final_rep
     assert whole_rep_item.final_rep.endswith("\r\n")
+    assert "# type: ignore" in whole_rep_item.final_rep
 
 
 def test_refactor_module_units_missing_file_key_defaults_to_module() -> None:
@@ -6898,3 +6921,4 @@ def test_refactor_module_units_missing_file_key_defaults_to_module() -> None:
         refactor_module_units(code, [(u1, "rep1\n"), (u2, "rep2\n")])
     assert "<module>" in str(exc_info.value)
     assert "Overlapping unit collision detected" in str(exc_info.value)
+

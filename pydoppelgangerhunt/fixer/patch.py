@@ -100,17 +100,16 @@ def _check_sequential_touch(
 
 
 def _check_boundary_sharing(
-    is_start: bool,
-    multi_col: Optional[int],
+    multi_sc: Optional[int],
     single_sc: Optional[int],
     single_ec: Optional[int],
 ) -> bool:
-    """Case 4: Multi-line and single-line units sharing a start or end boundary line."""
-    if multi_col is None or single_sc is None or single_ec is None:
+    """Case 4: Multi-line and single-line units sharing a start boundary line."""
+    if multi_sc is None or single_sc is None or single_ec is None:
         return True
     if single_sc >= single_ec:
         return False
-    return (multi_col < single_ec) if is_start else (single_sc < multi_col)
+    return multi_sc < single_ec
 
 
 def check_units_overlap(
@@ -187,9 +186,8 @@ def check_units_overlap(
     #   -> u1 ends on the line u2 begins: overlap if sc2 < ec1.
     # Case 3: Sequential touch (start2 < start1 and end2 == start1)
     #   -> u2 ends on the line u1 begins: overlap if sc1 < ec2.
-    # Case 4: Boundary line sharing between a multi-line unit and a single-line unit:
+    # Case 4: Start boundary line sharing between a multi-line unit and a single-line unit:
     #   -> Shared start line: overlap if single unit ends after multi begins (multi_sc < single_ec).
-    #   -> Shared end line: overlap if single unit starts before multi ends (single_sc < multi_ec).
     #   -> Multi-line vs. multi-line sharing a boundary line: conservatively overlap (True).
     # Case 5: Multi-line interior overlap (units span multiple shared lines)
     #   -> Units overlap across interior lines: unconditionally conflict (True).
@@ -212,9 +210,9 @@ def check_units_overlap(
     # (e.g. u1 lines 1..3, u2 line 3..3) have end1 == start2 and are fully handled by Case 2/3 above.
     if start1 == start2:
         if start1 < end1 and start2 == end2:
-            return _check_boundary_sharing(True, sc1, sc2, ec2)
+            return _check_boundary_sharing(sc1, sc2, ec2)
         if start2 < end2 and start1 == end1:
-            return _check_boundary_sharing(True, sc2, sc1, ec1)
+            return _check_boundary_sharing(sc2, sc1, ec1)
         return True
 
     if end1 == end2:
