@@ -7520,3 +7520,35 @@ def test_refactor_module_units_zero_width_insertion_collision() -> None:
     u3 = {"file": "sample.py", "start": 1, "end": 1, "start_col": 4, "end_col": 4}
     res = refactor_module_units(code, [(u1, "#1 "), (u3, "#2 ")])
     assert res == "x #1 = #2 1\ny = 2\n"
+
+
+def test_detect_line_ending_true_majority_vote_resilience() -> None:
+    """Verifies that detect_line_ending performs a true majority vote across all lines and resists stray terminators."""
+    from pydoppelgangerhunt.fixer import detect_line_ending
+    from pydoppelgangerhunt.fixer.source import _insert_imports_into_module
+
+    # Overwhelmingly LF with stray CRLF early in file
+    lf_with_stray_crlf = ["import os\n", "stray = 1\r\n"] + ["x = 2\n"] * 50
+    assert detect_line_ending(*lf_with_stray_crlf) == "\n"
+    assert detect_line_ending("".join(lf_with_stray_crlf)) == "\n"
+
+    # Verify import insertion into overwhelmingly LF module with stray CRLF uses \n
+    inserted_lines = _insert_imports_into_module(lf_with_stray_crlf, ["import sys"])
+    assert any("import sys\n" == ln for ln in inserted_lines)
+    assert not any("import sys\r\n" == ln for ln in inserted_lines)
+
+    # Overwhelmingly CRLF with stray LF early in file
+    crlf_with_stray_lf = ["import os\r\n", "stray = 1\n"] + ["x = 2\r\n"] * 50
+    assert detect_line_ending(*crlf_with_stray_lf) == "\r\n"
+    assert detect_line_ending("".join(crlf_with_stray_lf)) == "\r\n"
+
+    # Overwhelmingly lone CR with stray LF
+    cr_with_stray_lf = ["import os\r", "stray = 1\n"] + ["x = 2\r"] * 50
+    assert detect_line_ending(*cr_with_stray_lf) == "\r"
+    assert detect_line_ending("".join(cr_with_stray_lf)) == "\r"
+
+    # Tie-breaking priority among non-zero counts (CRLF -> CR -> LF)
+    assert detect_line_ending("a\r\nb\n") == "\r\n"
+    assert detect_line_ending("a\rb\n") == "\r"
+    assert detect_line_ending("a\r\nb\r") == "\r\n"
+

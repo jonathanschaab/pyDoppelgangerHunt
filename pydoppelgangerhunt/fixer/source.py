@@ -331,7 +331,7 @@ def _insert_imports_into_module(
             while insert_idx < len(orig_lines) and not orig_lines[insert_idx].strip():
                 insert_idx += 1
 
-    nl = detect_line_ending(*orig_lines[:10])
+    nl = detect_line_ending(*orig_lines)
     formatted = [imp.rstrip("\r\n") + nl for imp in deduped_imports]
     return orig_lines[:insert_idx] + formatted + [nl] + orig_lines[insert_idx:]
 
@@ -359,32 +359,46 @@ def count_physical_newlines(text: str) -> int:
 def detect_line_ending(*sources: Optional[str]) -> str:
     """Detects the predominant physical newline terminator (\\r\\n, \\r, or \\n) across strings.
 
-    Inspects line endings in priority order: CRLF (\\r\\n), lone CR (\\r), or LF (\\n).
+    Performs a majority vote across all line endings present in the provided sources.
+    In the event of an exact tie among non-zero counts, the tie-breaking priority order
+    is CRLF (\\r\\n), lone CR (\\r), then LF (\\n). If no physical newlines are present,
+    defaults to '\\n'.
 
     Args:
         *sources: One or more text strings or line sequences to probe.
 
     Returns:
-        '\\r\\n' if CRLF is detected, '\\r' if lone CR is detected, otherwise '\\n'.
+        '\\r\\n' if CRLF is predominant, '\\r' if lone CR is predominant, otherwise '\\n'.
     """
-    valid_sources = [s for s in sources if s]
-    if not valid_sources:
+    crlf_count = 0
+    cr_count = 0
+    lf_count = 0
+
+    for s in sources:
+        if not s:
+            continue
+        c = s.count("\r\n")
+        crlf_count += c
+        cr_count += s.count("\r") - c
+        lf_count += s.count("\n") - c
+
+    if crlf_count == 0 and cr_count == 0 and lf_count == 0:
         return "\n"
-    for s in valid_sources:
-        if s.endswith("\r\n"):
-            return "\r\n"
-    for s in valid_sources:
-        if s.endswith("\r"):
-            return "\r"
-    for s in valid_sources:
-        if s.endswith("\n"):
-            return "\n"
-    for s in valid_sources:
-        sample = s[:4096]
-        if "\r\n" in sample or (sample.endswith("\r") and s.startswith("\r\n", len(sample) - 1)):
-            return "\r\n"
-        if "\r" in sample:
-            return "\r"
+
+    # Strict majority vote
+    if crlf_count > cr_count and crlf_count > lf_count:
+        return "\r\n"
+    if cr_count > crlf_count and cr_count > lf_count:
+        return "\r"
+    if lf_count > crlf_count and lf_count > cr_count:
+        return "\n"
+
+    # Deterministic tie-breaking priority among non-zero counts: CRLF -> lone CR -> LF
+    max_count = max(crlf_count, cr_count, lf_count)
+    if crlf_count == max_count:
+        return "\r\n"
+    if cr_count == max_count:
+        return "\r"
     return "\n"
 
 
