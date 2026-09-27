@@ -92,7 +92,7 @@ def _check_sequential_touch(
 ) -> bool:
     """Cases 2 & 3: Sequential touch where one unit ends on the line the other begins."""
     if prior_ec is not None and next_sc is not None:
-        if next_is_single and next_ec is not None and next_sc > next_ec:
+        if next_is_single and next_ec is not None and next_sc >= next_ec:
             return False
         return next_sc < prior_ec
     return True
@@ -107,7 +107,7 @@ def _check_boundary_sharing(
     """Case 4: Multi-line and single-line units sharing a start or end boundary line."""
     if multi_col is None or single_sc is None or single_ec is None:
         return True
-    if single_sc > single_ec:
+    if single_sc >= single_ec:
         return False
     return (multi_col < single_ec) if is_start else (single_sc < multi_col)
 
@@ -124,8 +124,8 @@ def check_units_overlap(
     spans whole lines and treats any shared line as an overlap conflict. When units share
     a single boundary line (same-line, touching boundary, or a boundary line of a multi-line
     unit), it checks sub-line column intervals for half-open intersection. Single-line units
-    or boundary intervals with inverted column bounds (start_col > end_col) represent empty ranges
-    and evaluate to False. Any shared interior lines between multi-line units unconditionally conflict.
+    or boundary intervals with inverted or zero-width column bounds (start_col >= end_col) represent
+    empty ranges and evaluate to False. Any shared interior lines between multi-line units unconditionally conflict.
 
     Args:
         u1: First AST unit dictionary with 'file', 'start', and 'end'.
@@ -147,8 +147,8 @@ def check_units_overlap(
 
     def _parse_lines(u: Dict[str, Any], label: str, file_path: str) -> Tuple[int, int]:
         try:
-            s = _parse_unit_coord(u, "start", default=1)
-            e = _parse_unit_coord(u, "end", default=s)
+            s = max(1, _parse_unit_coord(u, "start", default=1))
+            e = max(1, _parse_unit_coord(u, "end", default=s))
             # Note on inverted ranges: For symmetric geometric overlap testing, _parse_lines
             # normalizes inverted line boundaries into an inclusive interval [min(s, e), max(s, e)].
             # In contrast, compute_unit_spans treats start > end as an empty 0-width EOF slice

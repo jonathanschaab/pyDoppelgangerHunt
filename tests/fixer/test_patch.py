@@ -6314,6 +6314,26 @@ def test_check_units_overlap_multiline_inverted_column_bounds() -> None:
     assert check_units_overlap(u_multi, u_empty) is False
     assert check_units_overlap(u_empty, u_multi) is False
 
+    # Single-line unit with zero-width column bounds (start_col == end_col) represents an empty range (disjoint)
+    u_zero_start = {"file": "mod.py", "start": 1, "end": 1, "start_col": 35, "end_col": 35}
+    assert check_units_overlap(u_multi, u_zero_start) is False
+    assert check_units_overlap(u_zero_start, u_multi) is False
+
+    u_zero_end = {"file": "mod.py", "start": 3, "end": 3, "start_col": 5, "end_col": 5}
+    assert check_units_overlap(u_multi, u_zero_end) is False
+    assert check_units_overlap(u_zero_end, u_multi) is False
+
+    # Sequential touch with zero-width single unit represents an empty range (disjoint)
+    u_prev = {"file": "mod.py", "start": 1, "end": 2, "start_col": 0, "end_col": 20}
+    u_zero_touch = {"file": "mod.py", "start": 2, "end": 2, "start_col": 10, "end_col": 10}
+    assert check_units_overlap(u_prev, u_zero_touch) is False
+    assert check_units_overlap(u_zero_touch, u_prev) is False
+
+    # Coordinate clamping parity: start: 0 and end: 0 clamped to line >= 1
+    u_zero_line1 = {"file": "mod.py", "start": 0, "end": 0, "start_col": 0, "end_col": 10}
+    u_line1 = {"file": "mod.py", "start": 1, "end": 1, "start_col": 5, "end_col": 15}
+    assert check_units_overlap(u_zero_line1, u_line1) is True
+
 
 def test_unit_desc_strict_validation_and_parsing() -> None:
     """Verifies that _unit_desc in refactor_module_units strictly raises TypeError and ValueError."""
