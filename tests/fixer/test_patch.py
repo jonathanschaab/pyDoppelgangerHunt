@@ -12,6 +12,7 @@ from unittest import mock
 import pytest
 
 from pydoppelgangerhunt import (
+    analyze_unit_variable_scope,
     check_units_overlap,
     extract_unit_source_code,
     generate_refactoring_patch,
@@ -5774,7 +5775,8 @@ def test_edge_case_robustness_non_dict_and_invalid_units() -> None:
     with pytest.raises(TypeError, match="Unit must be a dictionary"):
         compute_unit_spans("line 1\n", None)  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="Unit must be a dictionary"):
-        _compute_unit_spans("line 1\n", None)  # type: ignore[arg-type]
+        with pytest.deprecated_call(match="_compute_unit_spans is deprecated"):
+            _compute_unit_spans("line 1\n", None)  # type: ignore[arg-type]
 
     # Replacement span with invalid unit raises TypeError
     with pytest.raises(TypeError, match="Unit must be a dictionary"):
@@ -6990,5 +6992,69 @@ def test_tier2_sweep_zero_width_slice_collision() -> None:
     # Disjoint intervals
     assert _intervals_overlap(10, 20, 25, 25) is False
     assert _intervals_overlap(10, 20, 5, 5) is False
+
+
+def test_compute_unit_spans_deprecation_warning() -> None:
+    """Verifies that _compute_unit_spans emits a runtime DeprecationWarning with stacklevel=2."""
+    from pydoppelgangerhunt.fixer.source import _compute_unit_spans
+
+    code = "def sample():\n    return 42\n"
+    unit = {"file": "sample.py", "name": "sample", "start": 1, "end": 2}
+    with pytest.deprecated_call(match="_compute_unit_spans is deprecated"):
+        result = _compute_unit_spans(code, unit)
+
+    assert result == ((0, 28), (0, 28), False)
+
+
+def test_generate_refactoring_patch_unexpected_exception_keyerror_rollback(
+    tmp_path: Path,
+) -> None:
+    """Verifies that unexpected KeyError during clone pair synthesis triggers rollback and debug log."""
+    from unittest.mock import patch as mock_patch
+
+    src_file_x = tmp_path / "trans_keyerr_x.py"
+    src_file_y = tmp_path / "trans_keyerr_y.py"
+    src_file_x.write_text(
+        "def transform_alpha(item: str) -> str:\n    return item.strip().lower()\n\n"
+        "def transform_beta(data: bytes) -> bytes:\n    return data.lstrip()\n",
+        encoding="utf-8",
+    )
+    src_file_y.write_text(
+        "def transform_alpha_replica(item: str) -> str:\n    return item.strip().lower()\n\n"
+        "def transform_beta_replica(data: bytes) -> bytes:\n    return data.lstrip()\n",
+        encoding="utf-8",
+    )
+
+    pair_err_u1 = {"file": str(src_file_x), "name": "transform_alpha", "start": 1, "end": 2, "kind": "function"}
+    pair_err_u2 = {"file": str(src_file_y), "name": "transform_alpha_replica", "start": 1, "end": 2, "kind": "function"}
+
+    pair_ok_u1 = {"file": str(src_file_x), "name": "transform_beta", "start": 4, "end": 5, "kind": "function"}
+    pair_ok_u2 = {"file": str(src_file_y), "name": "transform_beta_replica", "start": 4, "end": 5, "kind": "function"}
+
+    real_scope_analyzer = analyze_unit_variable_scope
+
+    def _exploding_scope_analyzer(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        for arg in args:
+            if isinstance(arg, dict) and "alpha" in arg.get("name", ""):
+                raise KeyError("simulated_corrupt_symbol_key")
+        return real_scope_analyzer(*args, **kwargs)
+
+    with mock_patch(
+        "pydoppelgangerhunt.fixer.patch.analyze_unit_variable_scope",
+        side_effect=_exploding_scope_analyzer,
+    ):
+        patch_out = generate_refactoring_patch(
+            [(0.95, pair_err_u1, pair_err_u2), (0.98, pair_ok_u1, pair_ok_u2)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+        )
+
+    # First pair with KeyError was skipped and rolled back
+    assert "Clone Pair (95.0%)" not in patch_out
+    assert "_shared_transform_alpha" not in patch_out
+    # Second pair succeeded
+    assert "Clone Pair (98.0%)" in patch_out
+    assert "_shared_transform_beta" in patch_out
+
 
 

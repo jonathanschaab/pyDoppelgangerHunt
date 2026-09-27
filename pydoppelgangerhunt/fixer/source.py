@@ -7,6 +7,7 @@ import io
 import logging
 import textwrap
 import tokenize
+import warnings
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
@@ -707,6 +708,12 @@ def _compute_unit_spans(
     .. deprecated:: 1.4.0
         Use :func:`compute_unit_spans` instead, which returns a structured :class:`UnitSpan`.
     """
+    warnings.warn(
+        "_compute_unit_spans is deprecated and will be removed in a future release; "
+        "use compute_unit_spans instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     span = compute_unit_spans(source_text, unit)
     return (span.start_char, span.end_char), (span.start_byte, span.end_byte), span.is_column_bounded
 

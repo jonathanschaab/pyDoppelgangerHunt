@@ -2908,7 +2908,8 @@ def generate_refactoring_patch(
                 if cross_file_action in ("skip", "none"):
                     continue
                 if cross_file_action in ("shared_module", "shared"):
-                    assert shared_p is not None
+                    if shared_p is None:
+                        continue
                     rel_shared = _format_patch_relative_path(shared_p, patch_root, fs_root)
 
                     if _is_same_file_or_resolved(shared_p, f1_path):
@@ -3304,7 +3305,7 @@ def generate_refactoring_patch(
                     await_prefix=await_prefix,
                     replace_clones=replace_clones,
                 )
-        except (ValueError, TypeError, SyntaxError) as exc:
+        except Exception as exc:
             logger.debug(
                 "Skipping clone pair due to coordinate, syntax, or processing error: %s",
                 exc,
