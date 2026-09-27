@@ -619,13 +619,20 @@ def compute_unit_spans(
     # clamped character offsets derived from AST byte columns via col_offset_to_char_offset.
     # In contrast, start_byte and end_byte retain the original AST UTF-8 byte coordinates
     # (bounded to line length) rather than being recalculated from character offsets.
-    if start > len(lines) or start > end:
-        sz_c = len(source_text)
-        sz_b = len(source_text.encode("utf-8", errors="surrogatepass"))
-        return UnitSpan(sz_c, sz_c, sz_b, sz_b, False, start, end, 0, 0)
-
     if line_char_offsets is None or line_byte_offsets is None:
         line_char_offsets, line_byte_offsets = _compute_line_offsets(lines)
+
+    # Note on inverted ranges: compute_unit_spans treats start > end as an empty 0-width EOF
+    # span to ensure no source code is modified during replacement. Harmonized with check_units_overlap,
+    # which treats inverted line ranges as empty disjoint sets that never conflict.
+    # Note on byte vs. character offsets: start_col_char and end_col_char are translated and
+    # clamped character offsets derived from AST byte columns via col_offset_to_char_offset.
+    # In contrast, start_byte and end_byte retain the original AST UTF-8 byte coordinates
+    # (clamped to line byte length) rather than being recalculated from character offsets.
+    if start > len(lines) or start > end:
+        sz_c = line_char_offsets[-1]
+        sz_b = line_byte_offsets[-1]
+        return UnitSpan(sz_c, sz_c, sz_b, sz_b, False, start, end, 0, 0)
 
     first_line = lines[start - 1]
     last_line = lines[end - 1]
@@ -660,17 +667,26 @@ def compute_unit_spans(
     if is_column_bounded:
         start_char = line_char_offsets[start - 1] + start_c
         end_char = line_char_offsets[end - 1] + end_c
-        start_b = start_col if start_col is not None else 0
-        last_b_len = len(last_line.encode("utf-8", errors="surrogatepass"))
-        last_b_code_len = len(last_line.rstrip("\r\n").encode("utf-8", errors="surrogatepass"))
-        end_b = end_col if end_col is not None else last_b_code_len
-        start_b = max(
-            0,
-            min(
-                last_b_len if start == end else len(first_line.encode("utf-8", errors="surrogatepass")),
-                start_b,
-            ),
+
+        first_b_len = (
+            len(first_line)
+            if first_line.isascii()
+            else len(first_line.encode("utf-8", errors="surrogatepass"))
         )
+        if start == end:
+            last_b_len = first_b_len
+        elif last_line.isascii():
+            last_b_len = len(last_line)
+        else:
+            last_b_len = len(last_line.encode("utf-8", errors="surrogatepass"))
+
+        nl_len = 2 if last_line.endswith("\r\n") else (1 if last_line.endswith(("\r", "\n")) else 0)
+        last_b_code_len = max(0, last_b_len - nl_len)
+
+        start_b = start_col if start_col is not None else 0
+        end_b = end_col if end_col is not None else last_b_code_len
+
+        start_b = max(0, min(first_b_len, start_b))
         end_b = max(0, min(last_b_len, end_b))
         if start == end:
             end_b = max(start_b, end_b)
@@ -678,13 +694,9 @@ def compute_unit_spans(
         end_byte = line_byte_offsets[end - 1] + end_b
     else:
         start_char = line_char_offsets[start - 1]
-        end_char = line_char_offsets[end] if end < len(lines) else len(source_text)
+        end_char = line_char_offsets[end] if end < len(line_char_offsets) else line_char_offsets[-1]
         start_byte = line_byte_offsets[start - 1]
-        end_byte = (
-            line_byte_offsets[end]
-            if end < len(lines)
-            else len(source_text.encode("utf-8", errors="surrogatepass"))
-        )
+        end_byte = line_byte_offsets[end] if end < len(line_byte_offsets) else line_byte_offsets[-1]
 
     return UnitSpan(
         start_char=start_char,

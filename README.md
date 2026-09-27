@@ -145,6 +145,31 @@ When refactoring clones across different files with `--patch` and `--replace-clo
 
 If any proposed cross-module extraction would introduce a circular import or unresolvable path, `pyDoppelgangerHunt` records a descriptive advisory comment and keeps the refactoring transactional without emitting broken imports.
 
+### Programmatic Refactoring API
+
+`pyDoppelgangerHunt` exposes a programmatic API for AST unit inspection, byte-to-character column translation, reverse-order buffer replacement, and multi-file patch synthesis:
+
+```python
+from pydoppelgangerhunt import (
+    UnitCollisionError,
+    UnitSpan,
+    ReplacementItem,
+    compute_unit_spans,
+    compute_unit_byte_offsets,
+    compute_unit_char_offsets,
+    compute_unit_replacement_span,
+    refactor_module_units,
+    generate_refactoring_patch,
+)
+```
+
+- **`UnitCollisionError`**: Subclasses `ValueError`. Raised when candidate replacement units collide or overlap within the same source buffer (either during Tier 1 semantic AST coordinate checks or Tier 2 physical byte sweeps). Because it inherits from `ValueError`, standard exception handlers catch it transparently, while specialized handlers can differentiate collision conditions.
+- **`compute_unit_spans(source_text, unit)`**: Calculates exact 0-indexed character and UTF-8 byte spans for an AST unit, returning a structured `UnitSpan(start_char, end_char, start_byte, end_byte, is_column_bounded, start_line, end_line, start_col_char, end_col_char)`.
+- **`compute_unit_byte_offsets(source_text, unit)`** & **`compute_unit_char_offsets(source_text, unit)`**: Fast convenience helpers returning `(start_byte, end_byte)` or `(start_char, end_char)` coordinate tuples.
+- **`compute_unit_replacement_span(source_text, unit, replacement_text, preserve_boundary_pragmas=True)`**: Resolves a replacement into a `(start_char, end_char, final_replacement_text)` tuple against the unmodified source text while preserving attached `# type: ignore` or `# noqa` boundary pragmas.
+- **`refactor_module_units(source_text, replacements)`**: Applies multiple non-overlapping unit replacements in strict **reverse source order** (descending byte offsets) using single-pass buffer slicing, guaranteeing that downstream text expansions or contractions never invalidate upstream coordinates.
+- **`generate_refactoring_patch(candidate_pairs, repo_root=..., replace_clones=...)`**: Synthesizes a multi-file unified diff (`git apply` compatible) with dependency cycle detection and per-pair transactional snapshot rollback.
+
 To generate a starter configuration file in your project root:
 
 ```bash

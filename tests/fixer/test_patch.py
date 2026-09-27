@@ -6424,7 +6424,7 @@ def test_compute_replacement_line_deltas_raises_on_overlapping_units() -> None:
 
     with pytest.raises(
         ValueError,
-        match="Overlapping unit collision detected in line delta computation between 'fn1' and 'fn2'",
+        match=r"Overlapping unit collision detected in line delta computation between 'fn1' \(1-3\) and 'fn2' \(2-5\) in sample\.py",
     ):
         _compute_replacement_line_deltas([(u1, "# rep 1\n"), (u2, "# rep 2\n")], orig_text)
 
@@ -7100,6 +7100,64 @@ def test_generate_refactoring_patch_programming_bugs_fail_loudly(
     ):
         with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
             generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path))
+
+
+def test_plan_snapshot_typed_dict_and_restore(tmp_path: Path) -> None:
+    """Verifies that _FilePatchPlan.snapshot() conforms to _PlanSnapshot and restores state cleanly."""
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _PlanSnapshot
+
+    f = tmp_path / "plan_snap.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+    plan = _FilePatchPlan(f, "x = 1\n", "plan_snap.py")
+    plan.replacements.append(({"file": str(f), "start": 1, "end": 1}, "x = 2\n"))
+    plan.module_helpers.append("def helper(): pass\n")
+    plan.method_helpers.append((1, "def method(): pass\n"))
+    plan.missing_imports.append("import math")
+    plan.comments.append("# comment\n")
+    plan.used_helper_names.add("_shared_x")
+    plan.claimed_units.append({"file": str(f), "name": "x"})
+
+    snap: _PlanSnapshot = plan.snapshot()
+    # Validate TypedDict keys match expected annotations
+    assert set(snap.keys()) == set(_PlanSnapshot.__annotations__.keys())
+
+    # Mutate plan state
+    plan.replacements.clear()
+    plan.module_helpers.clear()
+    plan.used_helper_names.clear()
+
+    # Restore from snapshot
+    plan.restore(snap)
+    assert len(plan.replacements) == 1
+    assert len(plan.module_helpers) == 1
+    assert "_shared_x" in plan.used_helper_names
+    assert len(plan.claimed_units) == 1
+
+
+def test_compute_unit_spans_start_col_exceeds_line_length_clamping() -> None:
+    """Verifies that start_col > len(line_bytes) safely clamps to the line length boundary."""
+    from pydoppelgangerhunt.fixer import compute_unit_spans
+
+    # ASCII line (length 10: "x = 42\n" -> 7 bytes)
+    code_ascii = "x = 42\n"
+    unit_ascii = {"file": "a.py", "start": 1, "end": 1, "start_col": 999, "end_col": 1200}
+    span_ascii = compute_unit_spans(code_ascii, unit_ascii)
+    # Line length is 7 bytes (7 characters)
+    assert span_ascii.start_byte == 7
+    assert span_ascii.end_byte == 7
+    assert span_ascii.start_char == 7
+    assert span_ascii.end_char == 7
+
+    # Multibyte Unicode line: "🚀 = 'rocket'\n" (rocket emoji: 4 bytes, 1 char)
+    code_unicode = "🚀 = 'rocket'\n"
+    # Line is 14 bytes, 11 characters
+    unit_unicode = {"file": "u.py", "start": 1, "end": 1, "start_col": 500, "end_col": 600}
+    span_unicode = compute_unit_spans(code_unicode, unit_unicode)
+    assert span_unicode.start_byte == len(code_unicode.encode("utf-8"))
+    assert span_unicode.end_byte == len(code_unicode.encode("utf-8"))
+    assert span_unicode.start_char == len(code_unicode)
+    assert span_unicode.end_char == len(code_unicode)
+
 
 
 

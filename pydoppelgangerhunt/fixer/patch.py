@@ -9,7 +9,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, TypedDict, Union
 
 from pydoppelgangerhunt.config import normalize_path_string
 from pydoppelgangerhunt.fixer.binding import (
@@ -68,7 +68,12 @@ _BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
 
 class UnitCollisionError(ValueError):
-    """Raised when two or more refactoring replacement units collide or overlap."""
+    """Raised when two or more refactoring replacement units collide or overlap.
+
+    Subclasses :class:`ValueError` so callers expecting standard Python coordinate
+    or mapping exceptions can catch it transparently, while allowing specialized
+    handlers to differentiate physical and semantic AST coordinate collisions.
+    """
 
 
 def _check_same_line_overlap(
@@ -283,6 +288,41 @@ def _intervals_overlap(s1: int, e1: int, s2: int, e2: int) -> bool:
     return max(s1, s2) < min(e1, e2)
 
 
+def _format_unit_desc(u: Any) -> Tuple[str, int, int, str]:
+    """Extracts (name, start_line, end_line, file_path) from an AST unit dictionary."""
+    if not isinstance(u, dict):
+        raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
+    n = str(u.get("name") or "unit")
+    s = parse_unit_coord(u, "start", default=1)
+    e = parse_unit_coord(u, "end", default=s)
+    f = normalize_path_string(str(u.get("file") or ""), strip_anchor=False) or "<module>"
+    return n, s, e, f
+
+
+def _assert_no_interval_collisions(
+    items: Sequence[ReplacementItem],
+    context: str = "",
+) -> None:
+    """Verifies that a sorted sequence of ReplacementItems does not contain overlapping byte intervals."""
+    max_end_item: Optional[ReplacementItem] = None
+    ctx_prefix = f" in {context} " if context else " "
+    for item in items:
+        if (
+            max_end_item is not None
+            and _intervals_overlap(
+                max_end_item.start_byte, max_end_item.end_byte, item.start_byte, item.end_byte
+            )
+        ):
+            n1, s1, e1, f1 = _format_unit_desc(max_end_item.unit)
+            n2, s2, e2, _ = _format_unit_desc(item.unit)
+            raise UnitCollisionError(
+                f"Overlapping unit collision detected{ctx_prefix}"
+                f"between '{n1}' ({s1}-{e1}) and '{n2}' ({s2}-{e2}) in {f1}."
+            )
+        if max_end_item is None or item.end_byte > max_end_item.end_byte:
+            max_end_item = item
+
+
 def refactor_module_units(
     source_text: str,
     replacements: Sequence[Tuple[Dict[str, Any], str]],
@@ -312,15 +352,6 @@ def refactor_module_units(
     if not replacements:
         return source_text
 
-    def _unit_desc(u: Any) -> Tuple[str, int, int, str]:
-        if not isinstance(u, dict):
-            raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
-        n = str(u.get("name") or "unit")
-        s = parse_unit_coord(u, "start", default=1)
-        e = parse_unit_coord(u, "end", default=s)
-        f = normalize_path_string(str(u.get("file") or ""), strip_anchor=False)
-        return n, s, e, f
-
     # Tier 1 Semantic Overlap Check:
     # Conservatively reject candidate pairs that share lines when column bounds are
     # omitted or incomplete (whole-line / statement replacements inherently conflict
@@ -337,8 +368,8 @@ def refactor_module_units(
     for i, (u1, _) in enumerate(rep_list):
         for u2, _ in rep_list[i + 1:]:
             if check_units_overlap(u1, u2):
-                n1, s1, e1, f1 = _unit_desc(u1)
-                n2, s2, e2, _ = _unit_desc(u2)
+                n1, s1, e1, f1 = _format_unit_desc(u1)
+                n2, s2, e2, _ = _format_unit_desc(u2)
                 raise UnitCollisionError(
                     f"Overlapping unit collision detected between "
                     f"'{n1}' ({s1}-{e1}) and "
@@ -370,23 +401,7 @@ def refactor_module_units(
         computed_entries,
         key=lambda item: (item.start_byte, item.end_byte, item.order_index),
     )
-    max_end_item: Optional[ReplacementItem] = None
-    for c in sorted_by_start:
-        if (
-            max_end_item is not None
-            and _intervals_overlap(
-                max_end_item.start_byte, max_end_item.end_byte, c.start_byte, c.end_byte
-            )
-        ):
-            n1, s1, e1, f1 = _unit_desc(max_end_item.unit)
-            n2, s2, e2, _ = _unit_desc(c.unit)
-            raise UnitCollisionError(
-                f"Overlapping unit collision detected between "
-                f"'{n1}' ({s1}-{e1}) and "
-                f"'{n2}' ({s2}-{e2}) in {f1}."
-            )
-        if max_end_item is None or c.end_byte > max_end_item.end_byte:
-            max_end_item = c
+    _assert_no_interval_collisions(sorted_by_start)
 
     # Note: reverse order ensures downstream replacements do not alter upstream character offsets
     sorted_replacements = list(reversed(sorted_by_start))
@@ -667,6 +682,18 @@ def _module_imports_target(
     return False
 
 
+class _PlanSnapshot(TypedDict):
+    """Encapsulates a snapshot of mutable _FilePatchPlan state for transactional rollback."""
+
+    replacements: List[Tuple[Dict[str, Any], str]]
+    method_helpers: List[Tuple[int, str]]
+    module_helpers: List[str]
+    missing_imports: List[str]
+    comments: List[str]
+    used_helper_names: Set[str]
+    claimed_units: List[Dict[str, Any]]
+
+
 class _FilePatchPlan:
     """Internal accumulator of proposed transformations for a single file."""
 
@@ -695,7 +722,7 @@ class _FilePatchPlan:
         self.used_helper_names: Set[str] = set()
         self.claimed_units: List[Dict[str, Any]] = []
 
-    def snapshot(self) -> Dict[str, Any]:
+    def snapshot(self) -> _PlanSnapshot:
         """Creates a snapshot of mutable plan state for transactional rollback."""
         return {
             "replacements": list(self.replacements),
@@ -707,7 +734,7 @@ class _FilePatchPlan:
             "claimed_units": list(self.claimed_units),
         }
 
-    def restore(self, snap: Dict[str, Any]) -> None:
+    def restore(self, snap: _PlanSnapshot) -> None:
         """Restores mutable plan state from a snapshot."""
         self.replacements = list(snap["replacements"])
         self.method_helpers = list(snap["method_helpers"])
@@ -767,22 +794,10 @@ def _compute_replacement_line_deltas(
         computed,
         key=lambda x: (x[0].start_byte, x[0].end_byte, x[0].order_index),
     )
-    max_end_item: Optional[ReplacementItem] = None
-    for item, _, _ in sorted_items:
-        if (
-            max_end_item is not None
-            and _intervals_overlap(
-                max_end_item.start_byte, max_end_item.end_byte, item.start_byte, item.end_byte
-            )
-        ):
-            n1 = str(max_end_item.unit.get("name") or "unit")
-            n2 = str(item.unit.get("name") or "unit")
-            raise UnitCollisionError(
-                f"Overlapping unit collision detected in line delta computation "
-                f"between '{n1}' and '{n2}'."
-            )
-        if max_end_item is None or item.end_byte > max_end_item.end_byte:
-            max_end_item = item
+    _assert_no_interval_collisions(
+        [item for item, _, _ in sorted_items],
+        context="line delta computation",
+    )
 
     deltas = [(end_l, d) for _, end_l, d in computed]
     deltas.sort(key=lambda item: item[0])
@@ -2471,7 +2486,7 @@ def generate_refactoring_patch(
         # Performance: Snapshot only plans touched in this pair (f1, f2, and potential shared module)
         # to ensure O(touched_plans) = O(1) complexity per pair rather than O(pairs * total_plans).
         initial_plan_keys = set(file_plans.keys())
-        plans_snapshot: Dict[Path, Any] = {}
+        plans_snapshot: Dict[Path, _PlanSnapshot] = {}
         graph_snapshot = graph_holder[0].copy() if graph_holder[0] is not None else None
 
         try:
