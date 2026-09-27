@@ -544,6 +544,7 @@ def col_offset_to_char_offset(line: str, col_offset: Optional[Union[int, str]] =
         return len(prefix)
     except UnicodeDecodeError:
         # Clamps to the nearest valid character boundary preceding the malformed byte offset
+        # (RFC 3629: UTF-8 sequences are at most 4 bytes, so decrementing by 1..3 bytes reaches the boundary).
         for back in range(1, 4):
             if c_off - back <= 0:
                 return 0
@@ -836,11 +837,18 @@ def resolve_unit_replacement(
         missing_pragmas = [p for p in attached_pragmas if p not in suffix_line]
         if missing_pragmas:
             pragma_suffix = "  " + "  ".join(missing_pragmas)
+            nl = (
+                "\r\n"
+                if suffix_line.endswith("\r\n")
+                or final_rep.endswith("\r\n")
+                or source_text.endswith("\r\n")
+                else "\n"
+            )
             if not suffix_stripped:
                 # Clean line end: consume line suffix cleanly to prevent duplicate \n
                 consumes_line_suffix = True
-                has_nl = suffix_line.endswith("\n") or final_rep.endswith("\n")
-                final_rep = final_rep.rstrip("\r\n") + pragma_suffix + ("\n" if has_nl else "")
+                has_nl = suffix_line.endswith(("\r", "\n")) or final_rep.endswith(("\r", "\n"))
+                final_rep = final_rep.rstrip("\r\n") + pragma_suffix + (nl if has_nl else "")
                 end_char = line_char_offsets[end] if end < len(lines) else len(source_text)
                 end_byte = (
                     line_byte_offsets[end]
@@ -852,15 +860,11 @@ def resolve_unit_replacement(
                 # consume line suffix to end of line, preserving suffix_line content
                 # and appending pragma to the line end.
                 consumes_line_suffix = True
+                has_suffix_nl = suffix_line.endswith(("\r", "\n"))
                 final_suffix = (
-                    suffix_line[:-1].rstrip() + pragma_suffix + "\n"
-                    if suffix_line.endswith("\n")
-                    else suffix_line.rstrip() + pragma_suffix
+                    suffix_line.rstrip("\r\n") + pragma_suffix + (nl if has_suffix_nl else "")
                 )
-                if final_rep.endswith("\n"):
-                    final_rep = final_rep[:-1] + final_suffix
-                else:
-                    final_rep = final_rep + final_suffix
+                final_rep = final_rep.rstrip("\r\n") + final_suffix
                 end_char = line_char_offsets[end] if end < len(lines) else len(source_text)
                 end_byte = (
                     line_byte_offsets[end]
@@ -885,14 +889,18 @@ def resolve_unit_replacement(
         rep_lines = final_rep.splitlines(keepends=True)
         if rep_lines:
             last_rep = rep_lines[-1]
-            if last_rep.endswith("\n"):
-                rep_lines[-1] = last_rep[:-1] + pragma_suffix + "\n"
-            else:
-                rep_lines[-1] = last_rep + pragma_suffix
+            nl = (
+                "\r\n"
+                if last_rep.endswith("\r\n") or source_text.endswith("\r\n")
+                else "\n"
+            )
+            has_nl = last_rep.endswith(("\r", "\n"))
+            rep_lines[-1] = last_rep.rstrip("\r\n") + pragma_suffix + (nl if has_nl else "")
             final_rep = "".join(rep_lines)
 
-    if final_rep and not final_rep.endswith("\n"):
-        final_rep += "\n"
+    if final_rep and not final_rep.endswith(("\r", "\n")):
+        nl = "\r\n" if source_text.endswith("\r\n") else "\n"
+        final_rep += nl
 
     return ReplacementItem(
         unit=unit,

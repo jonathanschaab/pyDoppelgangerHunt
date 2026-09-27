@@ -207,13 +207,18 @@ def check_units_overlap(
     if start2 < start1 and end2 == start1:
         return _check_sequential_touch(ec2, sc1, start1 == end1, ec1)
 
-    # Case 4: Multi-line units sharing boundary lines at start or end
-    if start1 == start2 or end1 == end2:
-        is_start = start1 == start2
+    # Case 4: Units sharing start line (start1 == start2), or multi-line units sharing end line (end1 == end2).
+    # Note: Sequential touches and single-line units sharing the end-line of a multi-line unit
+    # (e.g. u1 lines 1..3, u2 line 3..3) have end1 == start2 and are fully handled by Case 2/3 above.
+    if start1 == start2:
         if start1 < end1 and start2 == end2:
-            return _check_boundary_sharing(is_start, sc1 if is_start else ec1, sc2, ec2)
+            return _check_boundary_sharing(True, sc1, sc2, ec2)
         if start2 < end2 and start1 == end1:
-            return _check_boundary_sharing(is_start, sc2 if is_start else ec2, sc1, ec1)
+            return _check_boundary_sharing(True, sc2, sc1, ec1)
+        return True
+
+    if end1 == end2:
+        # Multi-line vs. multi-line sharing an end line (single-line sharing end line is handled in Case 2/3)
         return True
 
     # Case 5: Multi-line interior overlap
@@ -307,7 +312,15 @@ def refactor_module_units(
     # Conservatively reject candidate pairs that share lines when column bounds are
     # omitted or incomplete (whole-line / statement replacements inherently conflict
     # with any other edit on the same line), or when column intervals overlap.
-    rep_list = list(replacements)
+    rep_list: List[Tuple[Dict[str, Any], str]] = []
+    for u, rep in replacements:
+        if isinstance(u, dict) and not u.get("file"):
+            u_norm = dict(u)
+            u_norm["file"] = "<module>"
+            rep_list.append((u_norm, rep))
+        else:
+            rep_list.append((u, rep))
+
     for i, (u1, _) in enumerate(rep_list):
         for u2, _ in rep_list[i + 1:]:
             if check_units_overlap(u1, u2):
@@ -844,6 +857,12 @@ def _delegate_unit_in_plan(
     )
     plan.replacements.append((unit, rep_stmt))
     plan.claimed_units.append(unit)
+    try:
+        refactor_module_units(plan.orig_text, plan.replacements)
+    except Exception:
+        plan.replacements.pop()
+        plan.claimed_units.pop()
+        raise
 
 
 def _wire_cross_module_host_delegation(
@@ -2838,16 +2857,7 @@ def generate_refactoring_patch(
                 if cross_file_action in ("skip", "none"):
                     continue
                 if cross_file_action in ("shared_module", "shared"):
-                    if shared_p is None:
-                        maybe_shared_p = _safely_resolve_shared_module_file(
-                            f1_path, f2_plan.path, patch_root, shared_module_name, f1_plan, f2_plan
-                        )
-                        if maybe_shared_p is None:
-                            continue
-                        shared_p = maybe_shared_p
-                        if shared_p in initial_plan_keys and shared_p not in plans_snapshot:
-                            plans_snapshot[shared_p] = file_plans[shared_p].snapshot()
-
+                    assert shared_p is not None
                     rel_shared = _format_patch_relative_path(shared_p, patch_root, fs_root)
 
                     if _is_same_file_or_resolved(shared_p, f1_path):

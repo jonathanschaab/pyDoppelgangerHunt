@@ -6511,22 +6511,67 @@ def test_col_offset_to_char_offset_ascii_fast_path_equivalence() -> None:
 
 def test_delegate_unit_in_plan_tier2_collision_raises_and_rolls_back(tmp_path: Path) -> None:
     """Verifies that physical byte-span collisions in _delegate_unit_in_plan trigger transactional rollback."""
+    from pydoppelgangerhunt.fixer import UnitCollisionError
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _delegate_unit_in_plan
+
     f1 = tmp_path / "mod1.py"
     f2 = tmp_path / "mod2.py"
     f1.write_text("def a():\n    v = 1\n    return v\n", encoding="utf-8")
     f2.write_text("def b():\n    v = 1\n    return v\n", encoding="utf-8")
 
-    # Construct two units in f1 that overlap in byte spans but might slip through coarse line checks
     u1 = {"file": str(f1), "name": "a", "start": 2, "end": 3, "kind": "function"}
     u2 = {"file": str(f2), "name": "b", "start": 2, "end": 3, "kind": "function"}
 
-    # Valid clone pair works cleanly
+    # Valid clone pair works cleanly via batch patch generation
     patch = generate_refactoring_patch(
         [(0.95, u1, u2)],
         repo_root=str(tmp_path),
         replace_clones=True,
     )
     assert "_shared_a_b" in patch
+
+    # Verify direct _delegate_unit_in_plan collision detection and transactional rollback
+    plan = _FilePatchPlan(
+        file_path=f1,
+        rel_path="mod1.py",
+        orig_text=f1.read_text(encoding="utf-8"),
+        is_new_file=False,
+    )
+    # First unit delegation succeeds
+    _delegate_unit_in_plan(
+        u1,
+        plan,
+        helper_name="_shared_a_b",
+        inputs=[],
+        outputs=["v"],
+        scope={"is_async": False, "has_yield": False},
+        target_inputs=None,
+        target_outputs=None,
+        await_prefix="",
+    )
+    assert len(plan.replacements) == 1
+    assert len(plan.claimed_units) == 1
+
+    # Colliding unit overlapping with u1 triggers UnitCollisionError
+    u_colliding = {"file": str(f1), "name": "inner", "start": 2, "end": 2, "kind": "statement"}
+    with pytest.raises(UnitCollisionError):
+        _delegate_unit_in_plan(
+            u_colliding,
+            plan,
+            helper_name="_shared_inner",
+            inputs=[],
+            outputs=["v"],
+            scope={"is_async": False, "has_yield": False},
+            target_inputs=None,
+            target_outputs=None,
+            await_prefix="",
+        )
+
+    # Local transactional rollback: plan state is restored to pre-collision state
+    assert len(plan.replacements) == 1
+    assert plan.replacements[0][0] == u1
+    assert len(plan.claimed_units) == 1
+    assert plan.claimed_units[0] == u1
 
 
 def test_render_file_patch_plan_tier2_collision_fallback() -> None:
@@ -6810,7 +6855,46 @@ def test_col_offset_to_char_offset_surrogate_code_points() -> None:
     assert span.end_byte > 0
 
 
+def test_resolve_unit_replacement_crlf_line_endings_no_dangling_carriage_return() -> None:
+    """Verifies that CRLF line endings (\\r\\n) do not produce orphaned \\r carriage returns."""
+    from pydoppelgangerhunt.fixer import refactor_module_units, resolve_unit_replacement
+
+    # CRLF source code with pragma comment
+    crlf_code = "def calc():\r\n    total = sum(x for x in nums)  # type: ignore\r\n    return total\r\n"
+    unit = {
+        "file": "calc.py",
+        "name": "comp",
+        "start": 2,
+        "end": 2,
+        "start_col": 12,
+        "end_col": 33,
+        "kind": "comprehension",
+    }
+    # Column-bounded replacement
+    rep_item = resolve_unit_replacement(crlf_code, unit, "aggregate(nums)\r\n")
+    # Verify no orphaned '\r' before pragma
+    assert "\r " not in rep_item.final_rep
+    assert "\r\r" not in rep_item.final_rep
+    assert rep_item.final_rep.endswith("\r\n")
+
+    # Whole-line replacement on CRLF
+    fn_unit = {"file": "calc.py", "name": "calc", "start": 1, "end": 3, "kind": "function"}
+    whole_rep_item = resolve_unit_replacement(crlf_code, fn_unit, "def calc():\r\n    return 42\r\n")
+    assert "\r " not in whole_rep_item.final_rep
+    assert whole_rep_item.final_rep.endswith("\r\n")
 
 
+def test_refactor_module_units_missing_file_key_defaults_to_module() -> None:
+    """Verifies that refactor_module_units defaults missing 'file' keys to <module> for Tier 1 validation."""
+    import pytest
+    from pydoppelgangerhunt.fixer import UnitCollisionError, refactor_module_units
 
+    code = "x = 1\ny = 2\nz = 3\n"
+    # Units without 'file' keys that overlap in line ranges
+    u1 = {"name": "u1", "start": 1, "end": 2}
+    u2 = {"name": "u2", "start": 2, "end": 3}
 
+    with pytest.raises(UnitCollisionError) as exc_info:
+        refactor_module_units(code, [(u1, "rep1\n"), (u2, "rep2\n")])
+    assert "<module>" in str(exc_info.value)
+    assert "Overlapping unit collision detected" in str(exc_info.value)
