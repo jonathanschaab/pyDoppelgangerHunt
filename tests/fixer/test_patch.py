@@ -6465,6 +6465,47 @@ def test_generate_refactoring_patch_skips_malformed_clone_pair_without_aborting_
     assert "_shared_run_a_run_b" in patch
 
 
+def test_generate_refactoring_patch_skips_syntax_error_pair_without_aborting_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that an unexpected SyntaxError during clone pair processing does not abort valid refactorings."""
+    import pydoppelgangerhunt.fixer.patch as patch_mod
+
+    f1 = tmp_path / "mod_valid1.py"
+    f2 = tmp_path / "mod_valid2.py"
+    f1.write_text("def process_a(val: int) -> int:\n    return val + 10\n", encoding="utf-8")
+    f2.write_text("def process_b(val: int) -> int:\n    return val + 10\n", encoding="utf-8")
+
+    good_u1 = {"file": str(f1), "name": "process_a", "start": 1, "end": 2, "kind": "function"}
+    good_u2 = {"file": str(f2), "name": "process_b", "start": 1, "end": 2, "kind": "function"}
+
+    # Pair 1: clone unit that triggers SyntaxError during scope analysis
+    bad_u1 = {"file": str(f1), "name": "syntax_err", "start": 1, "end": 2, "kind": "function"}
+    bad_u2 = {"file": str(f2), "name": "syntax_err", "start": 1, "end": 2, "kind": "function"}
+
+    original_scope = patch_mod.analyze_unit_variable_scope
+    called = [False]
+
+    def mock_scope(*args: Any, **kwargs: Any) -> Any:
+        if not called[0]:
+            called[0] = True
+            raise SyntaxError("Unexpected syntax error in scope analysis")
+        return original_scope(*args, **kwargs)
+
+    monkeypatch.setattr(patch_mod, "analyze_unit_variable_scope", mock_scope)
+
+    patch = generate_refactoring_patch(
+        [(0.9, bad_u1, bad_u2), (1.0, good_u1, good_u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+
+    # Valid pair should have successfully generated patch despite SyntaxError on first pair
+    assert "--- a/mod_valid1.py" in patch
+    assert "--- a/mod_valid2.py" in patch
+    assert "_shared_process_a_process_b" in patch
+
+
 def test_compute_unit_spans_unpadded_line_length_and_no_double_newline() -> None:
     """Verifies that compute_unit_spans does not leave stray double newlines on statement replacements."""
     from pydoppelgangerhunt.fixer import compute_unit_spans, refactor_module_units

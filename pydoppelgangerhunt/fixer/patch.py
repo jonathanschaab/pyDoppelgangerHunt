@@ -855,6 +855,10 @@ def _delegate_unit_in_plan(
     )
     plan.replacements.append((unit, rep_stmt))
     plan.claimed_units.append(unit)
+    # Defensive physical dry-run: verify that the newly delegated replacement does not collide
+    # with existing replacements in physical byte spans (e.g. pragma suffix extensions).
+    # Scales as O(K) per delegation (O(K^2) overall across K replacements in a file plan).
+    # Because K is typically small (<= 20), overhead is negligible (< 1ms).
     try:
         refactor_module_units(plan.orig_text, plan.replacements)
     except Exception:
@@ -3251,9 +3255,10 @@ def generate_refactoring_patch(
                     await_prefix=await_prefix,
                     replace_clones=replace_clones,
                 )
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError, SyntaxError) as exc:
             logger.debug(
-                "Skipping clone pair due to coordinate or processing error: %s", exc
+                "Skipping clone pair due to coordinate, syntax, or processing error: %s",
+                exc,
             )
             for p, snap in plans_snapshot.items():
                 if p in file_plans:
