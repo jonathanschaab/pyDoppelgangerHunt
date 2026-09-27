@@ -274,9 +274,21 @@ def filter_overlapping_clone_units(
     return retained
 
 
+def _intervals_overlap(s1: int, e1: int, s2: int, e2: int) -> bool:
+    """Checks whether two half-open byte intervals [s1, e1) and [s2, e2) overlap, including zero-width boundaries."""
+    if s1 == e1:
+        return s2 < s1 < e2
+    if s2 == e2:
+        return s1 < s2 < e1
+    return max(s1, s2) < min(e1, e2)
+
+
 def refactor_module_units(
     source_text: str,
     replacements: Sequence[Tuple[Dict[str, Any], str]],
+    lines: Optional[Sequence[str]] = None,
+    line_char_offsets: Optional[Sequence[int]] = None,
+    line_byte_offsets: Optional[Sequence[int]] = None,
 ) -> str:
     """Applies multiple non-overlapping unit replacements in reverse source order.
 
@@ -287,6 +299,9 @@ def refactor_module_units(
     Args:
         source_text: The complete original Python source code.
         replacements: Sequence of (unit, replacement_text) tuples.
+        lines: Optional precomputed line strings of source_text.
+        line_char_offsets: Optional precomputed character offsets of line starts.
+        line_byte_offsets: Optional precomputed UTF-8 byte offsets of line starts.
 
     Returns:
         The refactored module source text.
@@ -331,8 +346,10 @@ def refactor_module_units(
                 )
 
     computed_entries: List[ReplacementItem] = []
-    lines = source_text.splitlines(keepends=True)
-    line_char_offsets, line_byte_offsets = compute_line_offsets(lines)
+    if lines is None:
+        lines = source_text.splitlines(keepends=True)
+    if line_char_offsets is None or line_byte_offsets is None:
+        line_char_offsets, line_byte_offsets = compute_line_offsets(lines)
 
     for i, (unit, rep) in enumerate(rep_list):
         item = resolve_unit_replacement(
@@ -357,7 +374,9 @@ def refactor_module_units(
     for c in sorted_by_start:
         if (
             max_end_item is not None
-            and max(max_end_item.start_byte, c.start_byte) < min(max_end_item.end_byte, c.end_byte)
+            and _intervals_overlap(
+                max_end_item.start_byte, max_end_item.end_byte, c.start_byte, c.end_byte
+            )
         ):
             n1, s1, e1, f1 = _unit_desc(max_end_item.unit)
             n2, s2, e2, _ = _unit_desc(c.unit)
@@ -663,6 +682,11 @@ class _FilePatchPlan:
         self.orig_lines = [] if is_new_file else orig_text.splitlines(keepends=True)
         self.rel_path = rel_path
         self.is_new_file = is_new_file
+        if is_new_file:
+            self.line_char_offsets: Sequence[int] = [0]
+            self.line_byte_offsets: Sequence[int] = [0]
+        else:
+            self.line_char_offsets, self.line_byte_offsets = compute_line_offsets(self.orig_lines)
         self.replacements: List[Tuple[Dict[str, Any], str]] = []
         self.method_helpers: List[Tuple[int, str]] = []
         self.module_helpers: List[str] = []
@@ -747,7 +771,9 @@ def _compute_replacement_line_deltas(
     for item, _, _ in sorted_items:
         if (
             max_end_item is not None
-            and max(max_end_item.start_byte, item.start_byte) < min(max_end_item.end_byte, item.end_byte)
+            and _intervals_overlap(
+                max_end_item.start_byte, max_end_item.end_byte, item.start_byte, item.end_byte
+            )
         ):
             n1 = str(max_end_item.unit.get("name") or "unit")
             n2 = str(item.unit.get("name") or "unit")
@@ -857,10 +883,17 @@ def _delegate_unit_in_plan(
     plan.claimed_units.append(unit)
     # Defensive physical dry-run: verify that the newly delegated replacement does not collide
     # with existing replacements in physical byte spans (e.g. pragma suffix extensions).
+    # Reuses precomputed plan lines and line offsets to avoid redundant string allocations.
     # Scales as O(K) per delegation (O(K^2) overall across K replacements in a file plan).
     # Because K is typically small (<= 20), overhead is negligible (< 1ms).
     try:
-        refactor_module_units(plan.orig_text, plan.replacements)
+        refactor_module_units(
+            plan.orig_text,
+            plan.replacements,
+            lines=plan.orig_lines,
+            line_char_offsets=plan.line_char_offsets,
+            line_byte_offsets=plan.line_byte_offsets,
+        )
     except Exception:
         plan.replacements.pop()
         plan.claimed_units.pop()
@@ -1022,7 +1055,13 @@ def _render_file_patch_plan(
 
     if replace_clones and filtered_reps:
         try:
-            current_text = refactor_module_units(plan.orig_text, filtered_reps)
+            current_text = refactor_module_units(
+                plan.orig_text,
+                filtered_reps,
+                lines=plan.orig_lines,
+                line_char_offsets=plan.line_char_offsets,
+                line_byte_offsets=plan.line_byte_offsets,
+            )
         except UnitCollisionError as exc:
             logger.warning(
                 "Collision detected during patch rendering for %s (%s); filtering conflicting replacements",
@@ -1033,7 +1072,13 @@ def _render_file_patch_plan(
             candidate_text = plan.orig_text
             for item in filtered_reps:
                 try:
-                    candidate_text = refactor_module_units(plan.orig_text, valid_reps + [item])
+                    candidate_text = refactor_module_units(
+                        plan.orig_text,
+                        valid_reps + [item],
+                        lines=plan.orig_lines,
+                        line_char_offsets=plan.line_char_offsets,
+                        line_byte_offsets=plan.line_byte_offsets,
+                    )
                     valid_reps.append(item)
                 except UnitCollisionError:
                     logger.debug("Omitted conflicting replacement in %s", plan.rel_path)
@@ -1045,7 +1090,11 @@ def _render_file_patch_plan(
     if plan.method_helpers:
         deltas = (
             _compute_replacement_line_deltas(
-                filtered_reps, plan.orig_text, lines=plan.orig_lines
+                filtered_reps,
+                plan.orig_text,
+                lines=plan.orig_lines,
+                line_char_offsets=plan.line_char_offsets,
+                line_byte_offsets=plan.line_byte_offsets,
             )
             if replace_clones and filtered_reps
             else []

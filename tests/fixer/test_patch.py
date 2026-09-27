@@ -99,7 +99,6 @@ def test_comment_and_formatting_preservation(tmp_path: Path) -> None:
 
 def test_inter_block_overlap_collision_detection_and_reverse_offset_refactoring(tmp_path: Path) -> None:
     """Verifies overlap collision detection, maximal subset filtering, and reverse-order refactoring."""
-    import pytest  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.fixer import (  # pylint: disable=import-outside-toplevel
         check_units_overlap,
         filter_overlapping_clone_units,
@@ -5754,8 +5753,6 @@ def test_generate_refactoring_patch_same_file_multiple_methods_and_helpers(tmp_p
 
 def test_edge_case_robustness_non_dict_and_invalid_units() -> None:
     """Verifies that non-dict or malformed units raise descriptive errors rather than silently defaulting."""
-    import pytest
-    from typing import cast, Any, Dict
     from pydoppelgangerhunt.fixer import (
         check_units_overlap,
         compute_unit_byte_offsets,
@@ -5802,7 +5799,6 @@ def test_edge_case_robustness_non_dict_and_invalid_units() -> None:
 
 def test_edge_case_robustness_columns_and_empty_inputs() -> None:
     """Verifies handling of invalid column types, inverted column offsets, and empty inputs."""
-    import pytest
     from pydoppelgangerhunt.fixer import (
         check_units_overlap,
         col_offset_to_char_offset,
@@ -5842,7 +5838,6 @@ def test_edge_case_robustness_columns_and_empty_inputs() -> None:
 
 def test_column_bounded_replacement_preserves_suffix_and_pragma() -> None:
     """Verifies that column-bounded replacements preserve trailing code and place boundary pragmas at line end."""
-    import ast
     from pydoppelgangerhunt.fixer import (
         compute_unit_replacement_span,
         replace_unit_in_source,
@@ -5891,7 +5886,6 @@ def test_column_bounded_replacement_preserves_suffix_and_pragma() -> None:
 
 def test_refactor_module_units_same_line_emoji_prefix_replacement() -> None:
     """Verifies that AST byte offsets are translated to character offsets when replacing code units preceded by emojis."""
-    import ast
     from pydoppelgangerhunt.fixer import refactor_module_units
 
     # Single emoji before list comprehension on the same line
@@ -5930,7 +5924,6 @@ def test_refactor_module_units_same_line_emoji_prefix_replacement() -> None:
 
 def test_dual_tier_overlap_conservative_missing_column_rejection() -> None:
     """Verifies intentional dual-tier overlap behavior: conservative whole-line rejection vs exact byte collision."""
-    import pytest
     from pydoppelgangerhunt.fixer import check_units_overlap, refactor_module_units
 
     # Tier 1: When one unit omits column offsets, check_units_overlap conservatively assumes whole-line conflict
@@ -6116,7 +6109,6 @@ def test_adjust_line_for_replacements_additive_deltas() -> None:
 
 def test_check_units_overlap_malformed_inputs_raise_errors() -> None:
     """Verifies that check_units_overlap raises descriptive errors rather than silently returning False on invalid units."""
-    import pytest
     from pydoppelgangerhunt.fixer import check_units_overlap
 
     u_valid = {"file": "mod.py", "start": 1, "end": 5}
@@ -6337,7 +6329,6 @@ def test_check_units_overlap_multiline_inverted_column_bounds() -> None:
 
 def test_unit_desc_strict_validation_and_parsing() -> None:
     """Verifies that _unit_desc in refactor_module_units strictly raises TypeError and ValueError."""
-    import pytest
     from pydoppelgangerhunt.fixer import refactor_module_units
 
     # Non-dictionary unit raises TypeError
@@ -6422,7 +6413,6 @@ def test_is_valid_unit_coordinates_scenarios() -> None:
 
 def test_compute_replacement_line_deltas_raises_on_overlapping_units() -> None:
     """Verifies that _compute_replacement_line_deltas raises ValueError on overlapping units."""
-    import pytest
     from pydoppelgangerhunt.fixer.patch import _compute_replacement_line_deltas
 
     orig_text = "def f1():\n    return 1\n\ndef f2():\n    return 2\n"
@@ -6840,7 +6830,6 @@ def test_check_units_overlap_inverted_line_ranges_are_disjoint() -> None:
 
 def test_refactor_module_units_tier2_sweep_catches_nested_and_adjacent_collisions() -> None:
     """Verifies that O(N log N) Tier 2 physical sweep catches nested intervals and collisions."""
-    import pytest
     from pydoppelgangerhunt.fixer import UnitCollisionError, refactor_module_units
 
     text = "alpha = 1\nbeta = 2\ngamma = 3\n"
@@ -6855,7 +6844,6 @@ def test_refactor_module_units_tier2_sweep_catches_nested_and_adjacent_collision
 
 def test_compute_replacement_line_deltas_sweep_catches_nested_interval_collision() -> None:
     """Verifies that _compute_replacement_line_deltas catches nested intervals via max_end_item sweep."""
-    import pytest
     from pydoppelgangerhunt.fixer import UnitCollisionError
     from pydoppelgangerhunt.fixer.patch import _compute_replacement_line_deltas
 
@@ -6950,7 +6938,6 @@ def test_resolve_unit_replacement_crlf_line_endings_no_dangling_carriage_return(
 
 def test_refactor_module_units_missing_file_key_defaults_to_module() -> None:
     """Verifies that refactor_module_units defaults missing 'file' keys to <module> for Tier 1 validation."""
-    import pytest
     from pydoppelgangerhunt.fixer import UnitCollisionError, refactor_module_units
 
     code = "x = 1\ny = 2\nz = 3\n"
@@ -6962,4 +6949,46 @@ def test_refactor_module_units_missing_file_key_defaults_to_module() -> None:
         refactor_module_units(code, [(u1, "rep1\n"), (u2, "rep2\n")])
     assert "<module>" in str(exc_info.value)
     assert "Overlapping unit collision detected" in str(exc_info.value)
+
+
+def test_column_bounded_replacement_clean_line_end_no_duplicate_newline() -> None:
+    """Verifies that a column-bounded expression at clean line-end without pragmas does not duplicate newlines."""
+    from pydoppelgangerhunt.fixer import refactor_module_units, resolve_unit_replacement
+
+    code = "val = [x for x in data]\nprint(val)\n"
+    unit = {
+        "file": "test_mod.py",
+        "name": "comp",
+        "start": 1,
+        "end": 1,
+        "start_col": 6,
+        "end_col": 23,
+        "kind": "comprehension",
+    }
+    item = resolve_unit_replacement(code, unit, "helper(data)\n")
+    assert item.consumes_line_suffix is True
+    assert item.final_rep == "helper(data)\n"
+
+    result = refactor_module_units(code, [(unit, "helper(data)\n")])
+    assert result == "val = helper(data)\nprint(val)\n"
+
+
+def test_tier2_sweep_zero_width_slice_collision() -> None:
+    """Verifies that _intervals_overlap and Tier 2 sweep detect collisions with zero-width slices."""
+    from pydoppelgangerhunt.fixer.patch import _intervals_overlap
+
+    # Zero-width point strictly inside active interval [10, 20)
+    assert _intervals_overlap(10, 20, 15, 15) is True
+    assert _intervals_overlap(15, 15, 10, 20) is True
+
+    # Zero-width point touching interval boundaries exactly does not collide
+    assert _intervals_overlap(10, 20, 10, 10) is False
+    assert _intervals_overlap(10, 20, 20, 20) is False
+    assert _intervals_overlap(10, 10, 10, 20) is False
+    assert _intervals_overlap(20, 20, 10, 20) is False
+
+    # Disjoint intervals
+    assert _intervals_overlap(10, 20, 25, 25) is False
+    assert _intervals_overlap(10, 20, 5, 5) is False
+
 

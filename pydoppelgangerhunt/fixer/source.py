@@ -835,42 +835,41 @@ def resolve_unit_replacement(
 
     if is_column_bounded:
         missing_pragmas = [p for p in attached_pragmas if p not in suffix_line]
-        if missing_pragmas:
-            pragma_suffix = "  " + "  ".join(missing_pragmas)
-            nl = (
-                "\r\n"
-                if suffix_line.endswith("\r\n")
-                or final_rep.endswith("\r\n")
-                or source_text.endswith("\r\n")
-                else "\n"
+        pragma_suffix = ("  " + "  ".join(missing_pragmas)) if missing_pragmas else ""
+        nl = (
+            "\r\n"
+            if suffix_line.endswith("\r\n")
+            or final_rep.endswith("\r\n")
+            or source_text.endswith("\r\n")
+            else "\n"
+        )
+        if not suffix_stripped and (missing_pragmas or final_rep.endswith(("\r", "\n"))):
+            # Clean line end: consume line suffix cleanly to prevent duplicate \n
+            consumes_line_suffix = True
+            has_nl = suffix_line.endswith(("\r", "\n")) or final_rep.endswith(("\r", "\n"))
+            final_rep = final_rep.rstrip("\r\n") + pragma_suffix + (nl if has_nl else "")
+            end_char = line_char_offsets[end] if end < len(lines) else len(source_text)
+            end_byte = (
+                line_byte_offsets[end]
+                if end < len(lines)
+                else len(source_text.encode("utf-8", errors="surrogatepass"))
             )
-            if not suffix_stripped:
-                # Clean line end: consume line suffix cleanly to prevent duplicate \n
-                consumes_line_suffix = True
-                has_nl = suffix_line.endswith(("\r", "\n")) or final_rep.endswith(("\r", "\n"))
-                final_rep = final_rep.rstrip("\r\n") + pragma_suffix + (nl if has_nl else "")
-                end_char = line_char_offsets[end] if end < len(lines) else len(source_text)
-                end_byte = (
-                    line_byte_offsets[end]
-                    if end < len(lines)
-                    else len(source_text.encode("utf-8", errors="surrogatepass"))
-                )
-            else:
-                # Non-comment code or existing trailing comments follow on the same line:
-                # consume line suffix to end of line, preserving suffix_line content
-                # and appending pragma to the line end.
-                consumes_line_suffix = True
-                has_suffix_nl = suffix_line.endswith(("\r", "\n"))
-                final_suffix = (
-                    suffix_line.rstrip("\r\n") + pragma_suffix + (nl if has_suffix_nl else "")
-                )
-                final_rep = final_rep.rstrip("\r\n") + final_suffix
-                end_char = line_char_offsets[end] if end < len(lines) else len(source_text)
-                end_byte = (
-                    line_byte_offsets[end]
-                    if end < len(lines)
-                    else len(source_text.encode("utf-8", errors="surrogatepass"))
-                )
+        elif missing_pragmas:
+            # Non-comment code or existing trailing comments follow on the same line:
+            # consume line suffix to end of line, preserving suffix_line content
+            # and appending pragma to the line end.
+            consumes_line_suffix = True
+            has_suffix_nl = suffix_line.endswith(("\r", "\n"))
+            final_suffix = (
+                suffix_line.rstrip("\r\n") + pragma_suffix + (nl if has_suffix_nl else "")
+            )
+            final_rep = final_rep.rstrip("\r\n") + final_suffix
+            end_char = line_char_offsets[end] if end < len(lines) else len(source_text)
+            end_byte = (
+                line_byte_offsets[end]
+                if end < len(lines)
+                else len(source_text.encode("utf-8", errors="surrogatepass"))
+            )
 
         return ReplacementItem(
             unit=unit,
