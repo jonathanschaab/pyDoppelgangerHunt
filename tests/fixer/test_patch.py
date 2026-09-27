@@ -4260,7 +4260,7 @@ def test_cross_file_host_local_definition_conflict_rejected(
     assert "_shared_process_service1_process_service2" not in patch
 
     # Direct collector verification for conflicting and unresolved symbols
-    host_plan = patch_mod._FilePatchPlan(f_host, src_host, "host_mod.py")
+    host_plan = patch_mod._FilePatchPlan(file_path=f_host, rel_path="host_mod.py", orig_text=src_host)
     helper_code = "def _shared(svc: LocalService) -> int:\n    return 42\n"
     with pytest.raises(ValueError, match="conflicting local definition 'LocalService'"):
         patch_mod._collect_host_missing_imports(
@@ -4307,7 +4307,7 @@ def test_host_local_definition_omits_self_import_when_caller_imports_from_host(
     f_caller.write_text(caller_src, encoding="utf-8")
 
     # 1. Direct collector check
-    host_plan = patch_mod._FilePatchPlan(f_host, host_src, "self_import_pkg/host_mod.py")
+    host_plan = patch_mod._FilePatchPlan(file_path=f_host, rel_path="self_import_pkg/host_mod.py", orig_text=host_src)
     helper_code = "def _shared_process_item1_process_item2(item: LocalDep) -> int:\n    return 42\n"
     imports = patch_mod._collect_host_missing_imports(
         host_plan=host_plan,
@@ -4994,9 +4994,9 @@ def test_collect_host_missing_imports_substring_safety() -> None:
         "    return os_helper.run()\n"
     )
     host_plan = patch_mod._FilePatchPlan(
-        Path("app/main.py"),
-        host_code,
-        "app/main.py",
+        file_path=Path("app/main.py"),
+        rel_path="app/main.py",
+        orig_text=host_code,
     )
     helper_code = "def helper_fn():\n    return os.path.exists('foo')\n"
     scope = {"module": "app.main"}
@@ -5042,9 +5042,9 @@ def test_collect_host_missing_imports_rejects_rebound_conflicts() -> None:
         "    return transform(x)\n"
     )
     host_plan = patch_mod._FilePatchPlan(
-        Path("common.py"),
-        "",
-        "common.py",
+        file_path=Path("common.py"),
+        rel_path="common.py",
+        orig_text="",
         is_new_file=True,
     )
     helper_code = "def helper_fn(x: int) -> int:\n    return transform(x)\n"
@@ -5073,9 +5073,9 @@ def test_collect_host_missing_imports_rejects_cross_file_guarded_imports() -> No
         "    return transform(x)\n"
     )
     host_plan = patch_mod._FilePatchPlan(
-        Path("pkg/_common.py"),
-        "",
-        "pkg/_common.py",
+        file_path=Path("pkg/_common.py"),
+        rel_path="pkg/_common.py",
+        orig_text="",
         is_new_file=True,
     )
     helper_code = "def helper_fn(x: int) -> int:\n    return transform(x)\n"
@@ -5104,9 +5104,9 @@ def test_collect_host_missing_imports_same_file_preserves_guarded_imports() -> N
         "    return json.dumps(d)\n"
     )
     host_plan = patch_mod._FilePatchPlan(
-        Path("pkg/worker.py"),
-        source_code,
-        "pkg/worker.py",
+        file_path=Path("pkg/worker.py"),
+        rel_path="pkg/worker.py",
+        orig_text=source_code,
         is_new_file=False,
     )
     helper_code = "def helper_fn(d):\n    return json.dumps(d)\n"
@@ -5167,7 +5167,12 @@ def test_extract_module_defined_names_augassign_and_walrus() -> None:
 
 def test_collect_host_missing_imports_rejects_import_rebound_by_definition(tmp_path: Path) -> None:
     """Verifies that attempting cross-file extraction of a symbol rebound by local definition is rejected."""
-    plan = patch_mod._FilePatchPlan(tmp_path / "mod_target.py", "", "mod_target.py", is_new_file=True)
+    plan = patch_mod._FilePatchPlan(
+        file_path=tmp_path / "mod_target.py",
+        rel_path="mod_target.py",
+        orig_text="",
+        is_new_file=True,
+    )
     source_code = (
         "from dep_lib import process\n"
         "def process(x: int) -> int:\n"
@@ -7108,7 +7113,11 @@ def test_plan_snapshot_typed_dict_and_restore(tmp_path: Path) -> None:
 
     f = tmp_path / "plan_snap.py"
     f.write_text("x = 1\n", encoding="utf-8")
-    plan = _FilePatchPlan(f, "x = 1\n", "plan_snap.py")
+    plan = _FilePatchPlan(
+        file_path=f,
+        rel_path="plan_snap.py",
+        orig_text="x = 1\n",
+    )
     plan.replacements.append(({"file": str(f), "start": 1, "end": 1}, "x = 2\n"))
     plan.module_helpers.append("def helper(): pass\n")
     plan.method_helpers.append((1, "def method(): pass\n"))
@@ -7159,6 +7168,54 @@ def test_compute_unit_spans_start_col_exceeds_line_length_clamping() -> None:
     assert span_unicode.end_char == len(code_unicode)
 
 
+def test_refactor_module_units_dry_run_validation() -> None:
+    """Verifies that refactor_module_units with dry_run=True validates collisions without mutating source."""
+    from pydoppelgangerhunt.fixer import UnitCollisionError, refactor_module_units
+
+    code = "def f1():\n    return 1\n\ndef f2():\n    return 2\n"
+    u1 = {"file": "sample.py", "start": 1, "end": 2}
+    u2 = {"file": "sample.py", "start": 4, "end": 5}
+
+    # Dry run with valid non-overlapping replacements returns original source_text unchanged
+    res = refactor_module_units(
+        code,
+        [(u1, "def f1_new():\n    return 10\n"), (u2, "def f2_new():\n    return 20\n")],
+        dry_run=True,
+    )
+    assert res == code
+
+    # Dry run with colliding replacements still raises UnitCollisionError
+    u_collide = {"file": "sample.py", "start": 2, "end": 4}
+    with pytest.raises(UnitCollisionError):
+        refactor_module_units(
+            code,
+            [(u1, "def f1_new():\n    return 10\n"), (u_collide, "pass\n")],
+            dry_run=True,
+        )
 
 
+def test_apply_line_deltas_edge_cases() -> None:
+    """Verifies that _apply_line_deltas handles boundary conditions and non-integer inputs."""
+    from pydoppelgangerhunt.fixer.patch import _apply_line_deltas
 
+    # Empty deltas
+    assert _apply_line_deltas(10, []) == 10
+
+    # Target line <= 1 returns max(1, t_line)
+    assert _apply_line_deltas(0, [(5, 2)]) == 1
+    assert _apply_line_deltas(-5, [(5, 2)]) == 1
+    assert _apply_line_deltas(1, [(5, 2)]) == 1
+
+    # Malformed target line input
+    assert _apply_line_deltas("invalid", [(5, 2)]) == 1  # type: ignore[arg-type]
+
+    # Precomputed deltas: (end_line, delta)
+    deltas = [(3, 2), (7, -1), (12, 4)]
+    # Target line 3: strictly before end_line 3 (end_line < target_line is False for 3 < 3)
+    assert _apply_line_deltas(3, deltas) == 3
+    # Target line 5: after end_line 3, before 7 (+2)
+    assert _apply_line_deltas(5, deltas) == 7
+    # Target line 10: after 3 and 7 (+2 - 1 = +1)
+    assert _apply_line_deltas(10, deltas) == 11
+    # Target line 15: after 3, 7, and 12 (+2 - 1 + 4 = +5)
+    assert _apply_line_deltas(15, deltas) == 20

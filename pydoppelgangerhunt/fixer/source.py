@@ -561,8 +561,10 @@ def compute_line_offsets(lines: Sequence[str]) -> Tuple[List[int], List[int]]:
     char_offsets = [0]
     byte_offsets = [0]
     for ln in lines:
-        char_offsets.append(char_offsets[-1] + len(ln))
-        byte_offsets.append(byte_offsets[-1] + len(ln.encode("utf-8", errors="surrogatepass")))
+        ln_len = len(ln)
+        char_offsets.append(char_offsets[-1] + ln_len)
+        byte_len = ln_len if ln.isascii() else len(ln.encode("utf-8", errors="surrogatepass"))
+        byte_offsets.append(byte_offsets[-1] + byte_len)
     return char_offsets, byte_offsets
 
 
@@ -612,13 +614,6 @@ def compute_unit_spans(
     except (ValueError, TypeError) as err:
         raise ValueError(f"Malformed unit: invalid 'end' line: {unit.get('end')!r}") from err
 
-    # Note on inverted ranges: compute_unit_spans treats start > end as an empty 0-width EOF
-    # span to ensure no source code is modified during replacement. Harmonized with check_units_overlap,
-    # which treats inverted line ranges as empty disjoint sets that never conflict.
-    # Note on byte vs. character offsets: start_col_char and end_col_char are translated and
-    # clamped character offsets derived from AST byte columns via col_offset_to_char_offset.
-    # In contrast, start_byte and end_byte retain the original AST UTF-8 byte coordinates
-    # (bounded to line length) rather than being recalculated from character offsets.
     if line_char_offsets is None or line_byte_offsets is None:
         line_char_offsets, line_byte_offsets = _compute_line_offsets(lines)
 

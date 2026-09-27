@@ -329,6 +329,7 @@ def refactor_module_units(
     lines: Optional[Sequence[str]] = None,
     line_char_offsets: Optional[Sequence[int]] = None,
     line_byte_offsets: Optional[Sequence[int]] = None,
+    dry_run: bool = False,
 ) -> str:
     """Applies multiple non-overlapping unit replacements in reverse source order.
 
@@ -342,9 +343,11 @@ def refactor_module_units(
         lines: Optional precomputed line strings of source_text.
         line_char_offsets: Optional precomputed character offsets of line starts.
         line_byte_offsets: Optional precomputed UTF-8 byte offsets of line starts.
+        dry_run: If True, executes Tier 1 and Tier 2 collision validation without slicing or
+            modifying the source buffer.
 
     Returns:
-        The refactored module source text.
+        The refactored module source text (or unmodified source_text if dry_run=True).
 
     Raises:
         ValueError: If any pair of units in replacements shares overlapping line ranges.
@@ -403,6 +406,9 @@ def refactor_module_units(
     )
     _assert_no_interval_collisions(sorted_by_start)
 
+    if dry_run:
+        return source_text
+
     # Note: reverse order ensures downstream replacements do not alter upstream character offsets
     sorted_replacements = list(reversed(sorted_by_start))
 
@@ -413,6 +419,7 @@ def refactor_module_units(
         current_text = current_text[:s_c] + item.final_rep + current_text[e_c:]
 
     return current_text
+
 
 def _build_whole_method_delegation(
     source_text: str,
@@ -700,14 +707,14 @@ class _FilePatchPlan:
     def __init__(
         self,
         file_path: Path,
-        orig_text: str,
         rel_path: str,
+        orig_text: str,
         is_new_file: bool = False,
     ) -> None:
         self.path = file_path
+        self.rel_path = rel_path
         self.orig_text = orig_text
         self.orig_lines = [] if is_new_file else orig_text.splitlines(keepends=True)
-        self.rel_path = rel_path
         self.is_new_file = is_new_file
         if is_new_file:
             self.line_char_offsets: Sequence[int] = [0]
@@ -743,7 +750,6 @@ class _FilePatchPlan:
         self.comments = list(snap["comments"])
         self.used_helper_names = set(snap["used_helper_names"])
         self.claimed_units = list(snap["claimed_units"])
-
 
 
 def _compute_replacement_line_deltas(
@@ -804,6 +810,18 @@ def _compute_replacement_line_deltas(
     return deltas
 
 
+def _apply_line_deltas(target_line: int, deltas: Sequence[Tuple[int, int]]) -> int:
+    """Adjusts a target line number given precomputed (end_line, delta) tuples."""
+    try:
+        t_line = int(target_line)
+    except (ValueError, TypeError):
+        t_line = 1
+    if not deltas or t_line <= 1:
+        return max(1, t_line)
+    line_delta = sum(d for end_line, d in deltas if end_line < t_line)
+    return max(1, t_line + line_delta)
+
+
 def _adjust_line_for_replacements(
     target_line: int,
     reps: Sequence[Tuple[Dict[str, Any], str]],
@@ -846,8 +864,7 @@ def _adjust_line_for_replacements(
         line_char_offsets=line_char_offsets,
         line_byte_offsets=line_byte_offsets,
     )
-    line_delta = sum(d for end_line, d in deltas if end_line < t_line)
-    return max(1, t_line + line_delta)
+    return _apply_line_deltas(t_line, deltas)
 
 
 def _derive_unit_indent_step(
@@ -898,7 +915,8 @@ def _delegate_unit_in_plan(
     plan.claimed_units.append(unit)
     # Defensive physical dry-run: verify that the newly delegated replacement does not collide
     # with existing replacements in physical byte spans (e.g. pragma suffix extensions).
-    # Reuses precomputed plan lines and line offsets to avoid redundant string allocations.
+    # Reuses precomputed plan lines and line offsets, and passes dry_run=True to validate
+    # interval overlap without performing redundant string slicing and allocations.
     # Scales as O(K) per delegation (O(K^2) overall across K replacements in a file plan).
     # Because K is typically small (<= 20), overhead is negligible (< 1ms).
     try:
@@ -908,6 +926,7 @@ def _delegate_unit_in_plan(
             lines=plan.orig_lines,
             line_char_offsets=plan.line_char_offsets,
             line_byte_offsets=plan.line_byte_offsets,
+            dry_run=True,
         )
     except Exception:
         plan.replacements.pop()
@@ -1116,9 +1135,7 @@ def _render_file_patch_plan(
         )
         adjusted_methods = [
             (
-                max(1, ins_line + sum(d for end_line, d in deltas if end_line < ins_line))
-                if deltas
-                else ins_line,
+                _apply_line_deltas(ins_line, deltas),
                 h_code,
             )
             for ins_line, h_code in plan.method_helpers
@@ -2468,7 +2485,7 @@ def generate_refactoring_patch(
     ) -> _FilePatchPlan:
         if file_p not in file_plans:
             file_plans[file_p] = _FilePatchPlan(
-                file_p, text, rel_f, is_new_file=is_new_file
+                file_p, rel_f, text, is_new_file=is_new_file
             )
         return file_plans[file_p]
 
