@@ -284,6 +284,8 @@ def filter_overlapping_clone_units(
 
 def _intervals_overlap(s1: int, e1: int, s2: int, e2: int) -> bool:
     """Checks whether two half-open byte intervals [s1, e1) and [s2, e2) overlap, including zero-width boundaries."""
+    if s1 == e1 and s2 == e2:
+        return s1 == s2
     if s1 == e1:
         return s2 < s1 < e2
     if s2 == e2:
@@ -322,7 +324,7 @@ def _assert_no_interval_collisions(
                 f"Overlapping unit collision detected{ctx_prefix}"
                 f"between '{n1}' ({s1}-{e1}) and '{n2}' ({s2}-{e2}) in {f1}."
             )
-        if max_end_item is None or item.end_byte > max_end_item.end_byte:
+        if max_end_item is None or item.end_byte >= max_end_item.end_byte:
             max_end_item = item
 
 

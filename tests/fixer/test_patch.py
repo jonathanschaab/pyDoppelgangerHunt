@@ -6995,6 +6995,10 @@ def test_tier2_sweep_zero_width_slice_collision() -> None:
     assert _intervals_overlap(10, 10, 10, 20) is False
     assert _intervals_overlap(20, 20, 10, 20) is False
 
+    # Zero-width points at the exact same offset collide
+    assert _intervals_overlap(10, 10, 10, 10) is True
+    assert _intervals_overlap(10, 10, 15, 15) is False
+
     # Disjoint intervals
     assert _intervals_overlap(10, 20, 25, 25) is False
     assert _intervals_overlap(10, 20, 5, 5) is False
@@ -7483,3 +7487,36 @@ def test_package_reexport_newline_helpers() -> None:
         assert callable(getattr(pdgh_fixer, name))
 
 
+def test_detect_line_ending_sample_boundary_and_straddle() -> None:
+    """Verifies that detect_line_ending handles boundary-straddling CRLF and expanded sample buffers."""
+    from pydoppelgangerhunt.fixer import detect_line_ending
+
+    # Case 1: CRLF at legacy 1024-byte sample boundary without EOF newline
+    text_1024 = "x" * 1023 + "\r\n" + "y = 1"
+    assert detect_line_ending(text_1024) == "\r\n"
+
+    # Case 2: CRLF straddles the 4096-byte sample boundary (char 4095 is \r, 4096 is \n)
+    text_4096_crlf = "a" * 4095 + "\r\n" + "b = 2"
+    assert detect_line_ending(text_4096_crlf) == "\r\n"
+
+    # Case 3: Lone CR at char 4095 followed by non-\n
+    text_4096_cr = "a" * 4095 + "\r" + "b = 2"
+    assert detect_line_ending(text_4096_cr) == "\r"
+
+
+def test_refactor_module_units_zero_width_insertion_collision() -> None:
+    """Verifies that refactor_module_units detects collisions between distinct zero-width insertions."""
+    from pydoppelgangerhunt.fixer import UnitCollisionError, refactor_module_units
+
+    code = "x = 1\ny = 2\n"
+    # Two zero-width units at the exact same line and column offset collide in Tier 2
+    u1 = {"file": "sample.py", "start": 1, "end": 1, "start_col": 2, "end_col": 2}
+    u2 = {"file": "sample.py", "start": 1, "end": 1, "start_col": 2, "end_col": 2}
+
+    with pytest.raises(UnitCollisionError, match="Overlapping unit collision detected"):
+        refactor_module_units(code, [(u1, "# ins1 "), (u2, "# ins2 ")])
+
+    # Two zero-width units at distinct column offsets succeed without collision
+    u3 = {"file": "sample.py", "start": 1, "end": 1, "start_col": 4, "end_col": 4}
+    res = refactor_module_units(code, [(u1, "#1 "), (u3, "#2 ")])
+    assert res == "x #1 = #2 1\ny = 2\n"

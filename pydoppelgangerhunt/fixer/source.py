@@ -380,8 +380,8 @@ def detect_line_ending(*sources: Optional[str]) -> str:
         if s.endswith("\n"):
             return "\n"
     for s in valid_sources:
-        sample = s[:1024]
-        if "\r\n" in sample:
+        sample = s[:4096]
+        if "\r\n" in sample or (sample.endswith("\r") and s.startswith("\r\n", len(sample) - 1)):
             return "\r\n"
         if "\r" in sample:
             return "\r"
