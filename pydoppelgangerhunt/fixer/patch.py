@@ -3305,11 +3305,20 @@ def generate_refactoring_patch(
                     await_prefix=await_prefix,
                     replace_clones=replace_clones,
                 )
+        except (AttributeError, NameError, RecursionError, ImportError):
+            raise
         except Exception as exc:
-            logger.debug(
-                "Skipping clone pair due to coordinate, syntax, or processing error: %s",
-                exc,
-            )
+            if isinstance(exc, (ValueError, TypeError, SyntaxError)):
+                logger.debug(
+                    "Skipping clone pair due to coordinate, syntax, or processing error: %s",
+                    exc,
+                )
+            else:
+                logger.warning(
+                    "Unexpected failure processing clone pair; rolling back changes for this pair: %s",
+                    exc,
+                    exc_info=True,
+                )
             for p, snap in plans_snapshot.items():
                 if p in file_plans:
                     file_plans[p].restore(snap)

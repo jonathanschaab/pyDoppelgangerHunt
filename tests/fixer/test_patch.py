@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -7008,8 +7009,9 @@ def test_compute_unit_spans_deprecation_warning() -> None:
 
 def test_generate_refactoring_patch_unexpected_exception_keyerror_rollback(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Verifies that unexpected KeyError during clone pair synthesis triggers rollback and debug log."""
+    """Verifies that unexpected KeyError during clone pair synthesis triggers rollback and WARNING log."""
     from unittest.mock import patch as mock_patch
 
     src_file_x = tmp_path / "trans_keyerr_x.py"
@@ -7039,15 +7041,16 @@ def test_generate_refactoring_patch_unexpected_exception_keyerror_rollback(
                 raise KeyError("simulated_corrupt_symbol_key")
         return real_scope_analyzer(*args, **kwargs)
 
-    with mock_patch(
-        "pydoppelgangerhunt.fixer.patch.analyze_unit_variable_scope",
-        side_effect=_exploding_scope_analyzer,
-    ):
-        patch_out = generate_refactoring_patch(
-            [(0.95, pair_err_u1, pair_err_u2), (0.98, pair_ok_u1, pair_ok_u2)],
-            repo_root=str(tmp_path),
-            replace_clones=True,
-        )
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt.fixer.patch"):
+        with mock_patch(
+            "pydoppelgangerhunt.fixer.patch.analyze_unit_variable_scope",
+            side_effect=_exploding_scope_analyzer,
+        ):
+            patch_out = generate_refactoring_patch(
+                [(0.95, pair_err_u1, pair_err_u2), (0.98, pair_ok_u1, pair_ok_u2)],
+                repo_root=str(tmp_path),
+                replace_clones=True,
+            )
 
     # First pair with KeyError was skipped and rolled back
     assert "Clone Pair (95.0%)" not in patch_out
@@ -7055,6 +7058,49 @@ def test_generate_refactoring_patch_unexpected_exception_keyerror_rollback(
     # Second pair succeeded
     assert "Clone Pair (98.0%)" in patch_out
     assert "_shared_transform_beta" in patch_out
+
+    # Unexpected error was logged loudly at WARNING with exc_info
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warning_records) == 1
+    assert "Unexpected failure processing clone pair" in warning_records[0].message
+    assert warning_records[0].exc_info is not None
+
+
+def test_generate_refactoring_patch_programming_bugs_fail_loudly(
+    tmp_path: Path,
+) -> None:
+    """Verifies that internal developer bugs (AttributeError, NameError, RecursionError) fail loudly."""
+    from unittest.mock import patch as mock_patch
+
+    f = tmp_path / "bug_loud.py"
+    f.write_text("def work():\n    return 1\n", encoding="utf-8")
+    u1 = {"file": str(f), "name": "work", "start": 1, "end": 2, "kind": "function"}
+    u2 = {"file": str(f), "name": "work", "start": 1, "end": 2, "kind": "function"}
+
+    # AttributeError
+    with mock_patch(
+        "pydoppelgangerhunt.fixer.patch.analyze_unit_variable_scope",
+        side_effect=AttributeError("internal attribute missing due to developer typo"),
+    ):
+        with pytest.raises(AttributeError, match="developer typo"):
+            generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path))
+
+    # NameError
+    with mock_patch(
+        "pydoppelgangerhunt.fixer.patch.analyze_unit_variable_scope",
+        side_effect=NameError("internal name not defined"),
+    ):
+        with pytest.raises(NameError, match="internal name not defined"):
+            generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path))
+
+    # RecursionError
+    with mock_patch(
+        "pydoppelgangerhunt.fixer.patch.analyze_unit_variable_scope",
+        side_effect=RecursionError("maximum recursion depth exceeded"),
+    ):
+        with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+            generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path))
+
 
 
 
