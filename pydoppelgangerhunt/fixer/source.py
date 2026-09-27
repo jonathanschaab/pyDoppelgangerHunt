@@ -774,28 +774,20 @@ def resolve_unit_replacement(
     start_byte = unit_span.start_byte
     end_byte = unit_span.end_byte
     is_column_bounded = unit_span.is_column_bounded
-    if start_char >= len(source_text) and end_char >= len(source_text):
-        return ReplacementItem(
-            unit=unit,
-            start_char=start_char,
-            end_char=end_char,
-            start_byte=start_byte,
-            end_byte=end_byte,
-            final_rep=replacement_text,
-            consumes_line_suffix=False,
-            order_index=order_index,
-        )
-
     start = unit_span.start_line
     end = unit_span.end_line
-    if start > len(lines) or start > end:
+    if (
+        (start_char >= len(source_text) and end_char >= len(source_text))
+        or start > len(lines)
+        or start > end
+    ):
         return ReplacementItem(
             unit=unit,
             start_char=start_char,
             end_char=end_char,
             start_byte=start_byte,
             end_byte=end_byte,
-            final_rep=replacement_text,
+            final_rep="",  # Ensure zero modifications to buffer on empty/invalid slices
             consumes_line_suffix=False,
             order_index=order_index,
         )
@@ -828,11 +820,12 @@ def resolve_unit_replacement(
         if missing_pragmas:
             pragma_suffix = "  " + "  ".join(missing_pragmas)
             if not suffix_stripped:
-                # Clean line end: append pragma directly to final_rep
-                if final_rep.endswith("\n"):
-                    final_rep = final_rep[:-1] + pragma_suffix + "\n"
-                else:
-                    final_rep += pragma_suffix
+                # Clean line end: consume line suffix cleanly to prevent duplicate \n
+                consumes_line_suffix = True
+                has_nl = suffix_line.endswith("\n") or final_rep.endswith("\n")
+                final_rep = final_rep.rstrip("\r\n") + pragma_suffix + ("\n" if has_nl else "")
+                end_char = line_char_offsets[end] if end < len(lines) else len(source_text)
+                end_byte = line_byte_offsets[end] if end < len(lines) else len(source_text.encode("utf-8"))
             else:
                 # Non-comment code or existing trailing comments follow on the same line:
                 # consume line suffix to end of line, preserving suffix_line content

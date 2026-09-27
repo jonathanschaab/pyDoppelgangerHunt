@@ -6689,4 +6689,83 @@ def test_package_reexport_unit_collision_error() -> None:
     assert issubclass(pdgh_fixer.UnitCollisionError, ValueError)
 
 
+def test_refactor_module_units_inverted_line_range_is_noop() -> None:
+    """Verifies that inverted line ranges (start > end) or out-of-bounds lines do not append text to EOF."""
+    from pydoppelgangerhunt.fixer import refactor_module_units, replace_unit_in_source
+
+    original_code = "line1\nline2\nline3\n"
+    inverted_unit = {"file": "sample.py", "name": "bad_inv", "start": 5, "end": 2}
+
+    # refactor_module_units should leave buffer untouched (no append at EOF)
+    result_refactor = refactor_module_units(original_code, [(inverted_unit, "INVERTED_REPLACEMENT\n")])
+    assert result_refactor == original_code
+
+    # replace_unit_in_source should also leave buffer untouched
+    result_replace = replace_unit_in_source(original_code, inverted_unit, "INVERTED_REPLACEMENT\n")
+    assert result_replace == original_code
+
+    # Out of bounds start line
+    oob_unit = {"file": "sample.py", "name": "bad_oob", "start": 99, "end": 100}
+    result_oob = refactor_module_units(original_code, [(oob_unit, "OOB_REPLACEMENT\n")])
+    assert result_oob == original_code
+
+
+def test_column_bounded_replacement_no_double_newline_on_clean_line_end() -> None:
+    """Verifies that column-bounded replacements on clean line ends do not produce duplicate double newlines."""
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    code_buffer = (
+        "# type: ignore\n"
+        "result = [e * 2 for e in elements]\n"
+        "return result\n"
+    )
+    # Unit covering line 1 to line 2 with clean line end on line 2
+    expr_unit = {
+        "file": "calc.py",
+        "name": "comp_expr",
+        "start": 1,
+        "end": 2,
+        "start_col": 0,
+        "end_col": 34,
+        "kind": "comprehension",
+    }
+    # Replacement string ending in newline (e.g. from helper or multi-line expansion)
+    rep_text = "transform_elements(elements)\n"
+    repaired_code = refactor_module_units(code_buffer, [(expr_unit, rep_text)])
+
+    # Must contain single newline, not double newline (\n\n) before 'return result'
+    assert "\n\n" not in repaired_code
+    assert repaired_code == "transform_elements(elements)  # type: ignore\nreturn result\n"
+
+
+def test_check_units_overlap_inverted_line_ranges_are_disjoint() -> None:
+    """Verifies that check_units_overlap treats inverted line ranges (start > end) as empty and disjoint."""
+    from pydoppelgangerhunt.fixer import check_units_overlap
+
+    valid_unit = {"file": "mod.py", "start": 2, "end": 4}
+    inv_u1 = {"file": "mod.py", "start": 5, "end": 2}
+    inv_u2 = {"file": "mod.py", "start": 3, "end": 1}
+
+    # Inverted ranges represent empty sets; they cannot collide with valid or inverted units
+    assert check_units_overlap(inv_u1, valid_unit) is False
+    assert check_units_overlap(valid_unit, inv_u1) is False
+    assert check_units_overlap(inv_u1, inv_u2) is False
+
+
+def test_refactor_module_units_tier2_sweep_catches_nested_and_adjacent_collisions() -> None:
+    """Verifies that O(N log N) Tier 2 physical sweep catches nested intervals and collisions."""
+    import pytest
+    from pydoppelgangerhunt.fixer import UnitCollisionError, refactor_module_units
+
+    text = "alpha = 1\nbeta = 2\ngamma = 3\n"
+    # c_wide covers lines 1-3, c_inner covers line 2 (nested within c_wide)
+    c_wide = {"file": "f.py", "name": "wide", "start": 1, "end": 3}
+    c_inner = {"file": "f.py", "name": "inner", "start": 2, "end": 2}
+
+    with pytest.raises(UnitCollisionError) as err:
+        refactor_module_units(text, [(c_wide, "# wide\n"), (c_inner, "# inner\n")])
+    assert "Overlapping unit collision detected" in str(err.value)
+
+
+
 

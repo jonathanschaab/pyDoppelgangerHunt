@@ -150,11 +150,7 @@ def check_units_overlap(
         try:
             s = max(1, parse_unit_coord(u, "start", default=1))
             e = max(1, parse_unit_coord(u, "end", default=s))
-            # Note on inverted ranges: For symmetric geometric overlap testing, _parse_lines
-            # normalizes inverted line boundaries into an inclusive interval [min(s, e), max(s, e)].
-            # In contrast, compute_unit_spans treats start > end as an empty 0-width EOF slice
-            # to ensure no physical buffer contents are modified.
-            return (e, s) if s > e else (s, e)
+            return s, e
         except (ValueError, TypeError) as err:
             raise ValueError(
                 f"Malformed unit: invalid line boundary in {label} ({file_path}): {err}"
@@ -163,7 +159,8 @@ def check_units_overlap(
     start1, end1 = _parse_lines(u1, "u1", f1)
     start2, end2 = _parse_lines(u2, "u2", f2)
 
-    if end1 < start2 or end2 < start1:
+    # Inverted line ranges (start > end) represent empty 0-width ranges, which cannot overlap.
+    if start1 > end1 or start2 > end2 or end1 < start2 or end2 < start1:
         return False
 
     def _parse_col(val: Any, col_name: str, file_path: str) -> Optional[int]:
@@ -340,26 +337,29 @@ def refactor_module_units(
 
     # Tier 2 Physical Byte-Span Overlap Check:
     # After computing exact UTF-8 byte slices in the underlying source buffer,
-    # verify that no two physical byte intervals [s_b, e_b) collide.
-    for i, c1 in enumerate(computed_entries):
-        for c2 in computed_entries[i + 1:]:
-            s1_b, e1_b = c1.start_byte, c1.end_byte
-            s2_b, e2_b = c2.start_byte, c2.end_byte
-            if max(s1_b, s2_b) < min(e1_b, e2_b):
-                n1, s1, e1, f1 = _unit_desc(c1.unit)
-                n2, s2, e2, _ = _unit_desc(c2.unit)
-                raise UnitCollisionError(
-                    f"Overlapping unit collision detected between "
-                    f"'{n1}' ({s1}-{e1}) and "
-                    f"'{n2}' ({s2}-{e2}) in {f1}."
-                )
-
-    # Note: order_index is only for stability among non-overlapping units
-    sorted_replacements = sorted(
+    # verify via an O(N log N) sweep that no two physical byte intervals [s_b, e_b) collide.
+    sorted_by_start = sorted(
         computed_entries,
         key=lambda item: (item.start_byte, item.end_byte, item.order_index),
-        reverse=True,
     )
+    max_end_item: Optional[ReplacementItem] = None
+    for c in sorted_by_start:
+        if (
+            max_end_item is not None
+            and max(max_end_item.start_byte, c.start_byte) < min(max_end_item.end_byte, c.end_byte)
+        ):
+            n1, s1, e1, f1 = _unit_desc(max_end_item.unit)
+            n2, s2, e2, _ = _unit_desc(c.unit)
+            raise UnitCollisionError(
+                f"Overlapping unit collision detected between "
+                f"'{n1}' ({s1}-{e1}) and "
+                f"'{n2}' ({s2}-{e2}) in {f1}."
+            )
+        if max_end_item is None or c.end_byte > max_end_item.end_byte:
+            max_end_item = c
+
+    # Note: reverse order ensures downstream replacements do not alter upstream character offsets
+    sorted_replacements = list(reversed(sorted_by_start))
 
     current_text = source_text
     for item in sorted_replacements:
