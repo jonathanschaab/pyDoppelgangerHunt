@@ -7303,3 +7303,91 @@ def test_package_reexport_split_source_lines() -> None:
     assert hasattr(pdgh_fixer, "split_source_lines")
     assert "split_source_lines" in pdgh_fixer.__all__
     assert callable(pdgh_fixer.split_source_lines)
+
+
+def test_compute_unit_spans_non_positive_line_clamping() -> None:
+    """Verifies that compute_unit_spans clamps non-positive line numbers to line 1 matching check_units_overlap."""
+    from pydoppelgangerhunt.fixer import check_units_overlap, compute_unit_spans, refactor_module_units
+
+    src = "x = 1\ny = 2\nz = 3\n"
+    unit_zero = {"file": "test.py", "start": 0, "end": 0}
+
+    # compute_unit_spans clamps start and end to line 1
+    span = compute_unit_spans(src, unit_zero)
+    assert span.start_line == 1
+    assert span.end_line == 1
+    assert span.start_char == 0
+    assert span.end_char == 6  # length of "x = 1\n"
+
+    # check_units_overlap harmoniously treats start:0, end:0 as line 1
+    assert check_units_overlap(unit_zero, {"file": "test.py", "start": 1, "end": 1})
+    assert not check_units_overlap(unit_zero, {"file": "test.py", "start": 2, "end": 2})
+
+    # refactor_module_units replaces line 1 cleanly
+    res = refactor_module_units(src, [(unit_zero, "x = 99\n")])
+    assert res == "x = 99\ny = 2\nz = 3\n"
+
+    # Negative coordinates clamp to line 1
+    unit_neg = {"file": "test.py", "start": -10, "end": -5}
+    span_neg = compute_unit_spans(src, unit_neg)
+    assert span_neg.start_line == 1
+    assert span_neg.end_line == 1
+
+    # Inverted coordinates with non-positive end (start=3, end=0) clamp to end=1 (start > end)
+    unit_inverted = {"file": "test.py", "start": 3, "end": 0}
+    span_inv = compute_unit_spans(src, unit_inverted)
+    assert span_inv.start_line == 3
+    assert span_inv.end_line == 1
+    assert span_inv.start_char == span_inv.end_char == len(src)
+
+
+def test_render_file_patch_plan_preserves_crlf_in_helpers() -> None:
+    """Verifies that _render_file_patch_plan uses CRLF line endings when splicing helpers into CRLF files."""
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _render_file_patch_plan
+
+    crlf_source = "class MyClass:\r\n    def target(self):\r\n        return 1\r\n"
+    plan = _FilePatchPlan(
+        file_path=Path("crlf_sample.py"),
+        rel_path="crlf_sample.py",
+        orig_text=crlf_source,
+        is_new_file=False,
+    )
+    plan.method_helpers.append((2, "    def helper(self):\r\n        return 42"))
+    plan.module_helpers.append("def global_helper():\r\n    return 99")
+
+    diff = _render_file_patch_plan(plan, replace_clones=False)
+    assert "--- a/crlf_sample.py" in diff
+    assert "+    def helper(self):\r\n" in diff
+    assert "+def global_helper():\r\n" in diff
+    # Ensure no bare \n line endings within the inserted helper diff lines
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("+") and not line.startswith("+++"):
+            assert line.endswith("\r\n"), f"Expected CRLF line ending in hunk line: {line!r}"
+
+
+def test_split_source_lines_finditer_avoid_intermediate_allocation() -> None:
+    """Verifies that split_source_lines with finditer produces identical results across all line ending types."""
+    import io
+    from pydoppelgangerhunt.fixer import split_source_lines
+
+    cases = [
+        "",
+        "single line",
+        "single line\n",
+        "single line\r\n",
+        "single line\r",
+        "line 1\r\nline 2\r\nline 3\r\n",
+        "line 1\nline 2\nline 3\n",
+        "line 1\rline 2\rline 3\r",
+        "mixed\r\nline 2\nline 3\rline 4",
+        "\n\n\n",
+        "\r\n\r\n",
+        "def fn():\n\x0c    pass\n",
+    ]
+
+    for case in cases:
+        result = split_source_lines(case)
+        expected = io.StringIO(case, newline="").readlines()
+        assert result == expected, f"Mismatch on {case!r}: {result!r} != {expected!r}"
+        assert all(isinstance(ln, str) and ln for ln in result)
+

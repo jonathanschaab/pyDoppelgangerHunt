@@ -329,8 +329,9 @@ def _insert_imports_into_module(
             while insert_idx < len(orig_lines) and not orig_lines[insert_idx].strip():
                 insert_idx += 1
 
-    formatted = [imp.rstrip("\r\n") + "\n" for imp in deduped_imports]
-    return orig_lines[:insert_idx] + formatted + ["\n"] + orig_lines[insert_idx:]
+    nl = "\r\n" if orig_lines and any(l.endswith("\r\n") for l in orig_lines[:10]) else "\n"
+    formatted = [imp.rstrip("\r\n") + nl for imp in deduped_imports]
+    return orig_lines[:insert_idx] + formatted + [nl] + orig_lines[insert_idx:]
 
 
 _PHYSICAL_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
@@ -341,7 +342,8 @@ def split_source_lines(source_text: str) -> List[str]:
 
     Unlike str.splitlines(), this only splits on physical Python newline sequences
     (\\r\\n, \\r, \\n) and never splits on form feeds (\\f / \\x0c) or vertical tabs (\\v),
-    matching Python grammar and AST line coordinate semantics.
+    matching Python grammar and AST line coordinate semantics. Uses regex finditer to
+    avoid intermediate match list allocations.
 
     Args:
         source_text: The complete original Python source code.
@@ -351,7 +353,7 @@ def split_source_lines(source_text: str) -> List[str]:
     """
     if not source_text:
         return []
-    return [line for line in _PHYSICAL_LINE_RE.findall(source_text) if line]
+    return [m.group(0) for m in _PHYSICAL_LINE_RE.finditer(source_text) if m.group(0)]
 
 
 def slice_source_by_token_range(
@@ -633,7 +635,7 @@ def compute_unit_spans(
         raise ValueError(f"Malformed unit: invalid 'start' line: {unit.get('start')!r}") from err
 
     try:
-        end = min(len(lines), _parse_unit_coord(unit, "end", default=len(lines)))
+        end = max(1, min(len(lines), _parse_unit_coord(unit, "end", default=len(lines))))
     except (ValueError, TypeError) as err:
         raise ValueError(f"Malformed unit: invalid 'end' line: {unit.get('end')!r}") from err
 

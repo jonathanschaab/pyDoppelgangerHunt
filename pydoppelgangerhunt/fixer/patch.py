@@ -1122,6 +1122,7 @@ def _render_file_patch_plan(
     else:
         current_text = plan.orig_text
 
+    nl = "\r\n" if plan.orig_text.endswith("\r\n") or "\r\n" in plan.orig_text[:1024] else "\n"
     if plan.method_helpers:
         deltas = (
             _compute_replacement_line_deltas(
@@ -1145,7 +1146,7 @@ def _render_file_patch_plan(
         for ins_line, h_code in sorted_methods:
             c_lines = split_source_lines(current_text)
             idx = max(0, ins_line - 1)
-            h_lines = [ln + "\n" for ln in h_code.splitlines()] + ["\n"]
+            h_lines = [ln + nl for ln in h_code.splitlines()] + [nl]
             current_text = "".join(c_lines[:idx] + h_lines + c_lines[idx:])
 
     c_lines = split_source_lines(current_text)
@@ -1156,7 +1157,7 @@ def _render_file_patch_plan(
         ins_idx = _find_module_helper_insertion_index(lines_with_imports)
         all_h_lines: List[str] = []
         for h_code in plan.module_helpers:
-            all_h_lines.extend(["\n"] + [ln + "\n" for ln in h_code.splitlines()] + ["\n"])
+            all_h_lines.extend([nl] + [ln + nl for ln in h_code.splitlines()] + [nl])
         modified_lines = lines_with_imports[:ins_idx] + all_h_lines + lines_with_imports[ins_idx:]
     else:
         modified_lines = lines_with_imports
