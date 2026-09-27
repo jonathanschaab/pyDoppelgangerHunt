@@ -707,7 +707,7 @@ def _compute_replacement_line_deltas(
     if line_char_offsets is None or line_byte_offsets is None:
         line_char_offsets, line_byte_offsets = compute_line_offsets(lines)
     computed: List[Tuple[ReplacementItem, int, int]] = []
-    for u, rep in reps:
+    for i, (u, rep) in enumerate(reps):
         if not isinstance(u, dict):
             raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
         try:
@@ -722,22 +722,30 @@ def _compute_replacement_line_deltas(
             lines=lines,
             line_char_offsets=line_char_offsets,
             line_byte_offsets=line_byte_offsets,
+            order_index=i,
         )
         orig_nl = orig_text[item.start_char : item.end_char].count("\n")
         rep_nl = item.final_rep.count("\n")
         computed.append((item, end_l, rep_nl - orig_nl))
 
-    sorted_items = sorted(computed, key=lambda x: (x[0].start_byte, x[0].end_byte))
-    for i in range(len(sorted_items) - 1):
-        curr_item = sorted_items[i][0]
-        next_item = sorted_items[i + 1][0]
-        if curr_item.end_byte > next_item.start_byte:
-            n1 = str(curr_item.unit.get("name") or "unit")
-            n2 = str(next_item.unit.get("name") or "unit")
+    sorted_items = sorted(
+        computed,
+        key=lambda x: (x[0].start_byte, x[0].end_byte, x[0].order_index),
+    )
+    max_end_item: Optional[ReplacementItem] = None
+    for item, _, _ in sorted_items:
+        if (
+            max_end_item is not None
+            and max(max_end_item.start_byte, item.start_byte) < min(max_end_item.end_byte, item.end_byte)
+        ):
+            n1 = str(max_end_item.unit.get("name") or "unit")
+            n2 = str(item.unit.get("name") or "unit")
             raise UnitCollisionError(
                 f"Overlapping unit collision detected in line delta computation "
                 f"between '{n1}' and '{n2}'."
             )
+        if max_end_item is None or item.end_byte > max_end_item.end_byte:
+            max_end_item = item
 
     deltas = [(end_l, d) for _, end_l, d in computed]
     deltas.sort(key=lambda item: item[0])
@@ -1001,17 +1009,15 @@ def _render_file_patch_plan(
                 exc,
             )
             valid_reps: List[Tuple[Dict[str, Any], str]] = []
+            candidate_text = plan.orig_text
             for item in filtered_reps:
                 try:
-                    refactor_module_units(plan.orig_text, valid_reps + [item])
+                    candidate_text = refactor_module_units(plan.orig_text, valid_reps + [item])
                     valid_reps.append(item)
                 except UnitCollisionError:
                     logger.debug("Omitted conflicting replacement in %s", plan.rel_path)
             filtered_reps = valid_reps
-            if filtered_reps:
-                current_text = refactor_module_units(plan.orig_text, filtered_reps)
-            else:
-                current_text = plan.orig_text
+            current_text = candidate_text
     else:
         current_text = plan.orig_text
 

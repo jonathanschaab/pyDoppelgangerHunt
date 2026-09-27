@@ -6767,5 +6767,21 @@ def test_refactor_module_units_tier2_sweep_catches_nested_and_adjacent_collision
     assert "Overlapping unit collision detected" in str(err.value)
 
 
+def test_compute_replacement_line_deltas_sweep_catches_nested_interval_collision() -> None:
+    """Verifies that _compute_replacement_line_deltas catches nested intervals via max_end_item sweep."""
+    import pytest
+    from pydoppelgangerhunt.fixer import UnitCollisionError
+    from pydoppelgangerhunt.fixer.patch import _compute_replacement_line_deltas
+
+    text = "line_one = 1\nline_two = 2\nline_three = 3\n"
+    c_wide = {"file": "f.py", "name": "wide", "start": 1, "end": 3}
+    c_inner = {"file": "f.py", "name": "inner", "start": 2, "end": 2}
+
+    with pytest.raises(UnitCollisionError) as err:
+        _compute_replacement_line_deltas([(c_wide, "# wide\n"), (c_inner, "# inner\n")], text)
+    assert "Overlapping unit collision detected in line delta computation" in str(err.value)
+
+
+
 
 

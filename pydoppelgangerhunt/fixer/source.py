@@ -604,8 +604,8 @@ def compute_unit_spans(
         raise ValueError(f"Malformed unit: invalid 'end' line: {unit.get('end')!r}") from err
 
     # Note on inverted ranges: compute_unit_spans treats start > end as an empty 0-width EOF
-    # span to ensure no source code is modified during replacement. In contrast, check_units_overlap
-    # normalizes inverted line boundaries into [min(s, e), max(s, e)] for bounding-box overlap testing.
+    # span to ensure no source code is modified during replacement. Harmonized with check_units_overlap,
+    # which treats inverted line ranges as empty disjoint sets that never conflict.
     # Note on byte vs. character offsets: start_col_char and end_col_char are translated and
     # clamped character offsets derived from AST byte columns via col_offset_to_char_offset.
     # In contrast, start_byte and end_byte retain the original AST UTF-8 byte coordinates
