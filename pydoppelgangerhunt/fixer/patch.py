@@ -45,16 +45,16 @@ from pydoppelgangerhunt.fixer.scope import (
 
 from pydoppelgangerhunt.fixer.source import (
     ReplacementItem,
-    _compute_line_offsets,
     _detect_indent_step,
     _find_module_helper_insertion_index,
     _find_sig_colon,
     _get_module_imported_names,
     _insert_imports_into_module,
     _is_docstring_node,
-    _is_valid_unit_coordinates,
-    _parse_unit_coord,
     _scan_sig_line,
+    compute_line_offsets,
+    is_valid_unit_coordinates,
+    parse_unit_coord,
     resolve_unit_replacement,
 )
 from pydoppelgangerhunt.fixer.synthesis import (
@@ -65,6 +65,9 @@ from pydoppelgangerhunt.fixer.synthesis import (
 
 logger = logging.getLogger(__name__)
 _BUILTIN_NAMES: Set[str] = set(dir(builtins))
+_compute_line_offsets = compute_line_offsets
+_is_valid_unit_coordinates = is_valid_unit_coordinates
+_parse_unit_coord = parse_unit_coord
 
 
 def check_units_overlap(
@@ -783,7 +786,6 @@ def _delegate_unit_in_plan(
     )
     plan.replacements.append((unit, rep_stmt))
     plan.claimed_units.append(unit)
-    refactor_module_units(plan.orig_text, plan.replacements)
 
 
 def _wire_cross_module_host_delegation(

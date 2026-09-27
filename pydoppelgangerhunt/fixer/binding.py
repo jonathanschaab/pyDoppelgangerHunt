@@ -13,7 +13,9 @@ from pydoppelgangerhunt.parser import is_decorator_named
 from pydoppelgangerhunt.fixer.scope import (
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
 )
-from pydoppelgangerhunt.fixer.source import _parse_unit_coord
+from pydoppelgangerhunt.fixer.source import parse_unit_coord
+
+_parse_unit_coord = parse_unit_coord
 
 def _find_innermost_enclosing_node(
     source_text: str,

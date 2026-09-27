@@ -15,24 +15,30 @@ __all__ = [
     "ReplacementItem",
     "UnitSpan",
     "col_offset_to_char_offset",
+    "compute_line_offsets",
     "compute_unit_byte_offsets",
     "compute_unit_char_offsets",
     "compute_unit_replacement_span",
     "compute_unit_spans",
     "extract_unit_comments_and_pragmas",
+    "is_valid_unit_coordinates",
+    "parse_unit_coord",
     "replace_unit_in_source",
     "resolve_unit_replacement",
     "slice_source_by_token_range",
 ]
 
 
-def _parse_unit_coord(unit: Dict[str, Any], key: str, default: int = 1) -> int:
+def parse_unit_coord(unit: Dict[str, Any], key: str, default: int = 1) -> int:
     """Extracts and parses an integer coordinate from a unit dictionary."""
     val = unit.get(key)
     return int(val if val is not None else default)
 
 
-def _is_valid_unit_coordinates(u: Any) -> bool:
+_parse_unit_coord = parse_unit_coord
+
+
+def is_valid_unit_coordinates(u: Any) -> bool:
     """Verifies that an AST unit dictionary has valid integer coordinates."""
     if not isinstance(u, dict):
         return False
@@ -52,6 +58,9 @@ def _is_valid_unit_coordinates(u: Any) -> bool:
         return True
     except (ValueError, TypeError):
         return False
+
+
+_is_valid_unit_coordinates = is_valid_unit_coordinates
 
 
 
@@ -451,7 +460,23 @@ def extract_unit_comments_and_pragmas(
 
 
 class UnitSpan(NamedTuple):
-    """Encapsulates exact character and byte offsets for an AST unit."""
+    """Encapsulates exact character and byte offsets for an AST unit.
+
+    Attributes:
+        start_char: 0-indexed character offset of the unit start in source text.
+        end_char: 0-indexed character offset of the unit end in source text.
+        start_byte: 0-indexed UTF-8 byte offset of the unit start in source text.
+            Retains original AST UTF-8 byte coordinates (clamped to line byte length).
+        end_byte: 0-indexed UTF-8 byte offset of the unit end in source text.
+            Retains original AST UTF-8 byte coordinates (clamped to line byte length).
+        is_column_bounded: True if the unit is delimited by sub-line column bounds.
+        start_line: 1-indexed start line number.
+        end_line: 1-indexed end line number.
+        start_col_char: 0-indexed character offset within start_line (translated and
+            clamped from AST UTF-8 byte offset via col_offset_to_char_offset).
+        end_col_char: 0-indexed character offset within end_line (translated and
+            clamped from AST UTF-8 byte offset via col_offset_to_char_offset).
+    """
 
     start_char: int
     end_char: int
@@ -465,7 +490,20 @@ class UnitSpan(NamedTuple):
 
 
 class ReplacementItem(NamedTuple):
-    """Encapsulates a fully resolved unit replacement with synchronized spans."""
+    """Encapsulates a fully resolved unit replacement with synchronized spans.
+
+    Attributes:
+        unit: AST unit dictionary with 1-indexed 'start' and 'end' lines.
+        start_char: 0-indexed character offset of the replacement start.
+        end_char: 0-indexed character offset of the replacement end.
+        start_byte: 0-indexed UTF-8 byte offset of the replacement start.
+        end_byte: 0-indexed UTF-8 byte offset of the replacement end.
+        final_rep: Fully formatted replacement text with preserved pragmas/comments.
+        consumes_line_suffix: True if trailing line suffix was consumed by pragma preservation.
+        order_index: Original replacement sequence index used as a tie-breaker to
+            guarantee deterministic, stable descending sorting among non-overlapping
+            replacements that share identical starting offsets (e.g. 0-width insertions).
+    """
 
     unit: Dict[str, Any]
     start_char: int
@@ -509,7 +547,7 @@ def col_offset_to_char_offset(line: str, col_offset: Optional[Union[int, str]] =
         return len(line_bytes[:c_off].decode("utf-8", errors="ignore"))
 
 
-def _compute_line_offsets(lines: Sequence[str]) -> Tuple[List[int], List[int]]:
+def compute_line_offsets(lines: Sequence[str]) -> Tuple[List[int], List[int]]:
     """Computes cumulative character and UTF-8 byte offsets for line starts."""
     char_offsets = [0]
     byte_offsets = [0]
@@ -517,6 +555,9 @@ def _compute_line_offsets(lines: Sequence[str]) -> Tuple[List[int], List[int]]:
         char_offsets.append(char_offsets[-1] + len(ln))
         byte_offsets.append(byte_offsets[-1] + len(ln.encode("utf-8")))
     return char_offsets, byte_offsets
+
+
+_compute_line_offsets = compute_line_offsets
 
 
 def compute_unit_spans(
@@ -565,6 +606,10 @@ def compute_unit_spans(
     # Note on inverted ranges: compute_unit_spans treats start > end as an empty 0-width EOF
     # span to ensure no source code is modified during replacement. In contrast, check_units_overlap
     # normalizes inverted line boundaries into [min(s, e), max(s, e)] for bounding-box overlap testing.
+    # Note on byte vs. character offsets: start_col_char and end_col_char are translated and
+    # clamped character offsets derived from AST byte columns via col_offset_to_char_offset.
+    # In contrast, start_byte and end_byte retain the original AST UTF-8 byte coordinates
+    # (bounded to line length) rather than being recalculated from character offsets.
     if start > len(lines) or start > end:
         sz_c = len(source_text)
         sz_b = len(source_text.encode("utf-8"))
@@ -780,16 +825,19 @@ def resolve_unit_replacement(
     consumes_line_suffix = False
 
     if is_column_bounded:
-        if attached_pragmas and not any(p in suffix_line for p in attached_pragmas):
-            pragma_suffix = "  " + "  ".join(attached_pragmas)
-            if not suffix_stripped or suffix_stripped.startswith("#"):
-                # Clean line end or only comments follow: append pragma directly to final_rep
+        missing_pragmas = [p for p in attached_pragmas if p not in suffix_line]
+        if missing_pragmas:
+            pragma_suffix = "  " + "  ".join(missing_pragmas)
+            if not suffix_stripped:
+                # Clean line end: append pragma directly to final_rep
                 if final_rep.endswith("\n"):
                     final_rep = final_rep[:-1] + pragma_suffix + "\n"
                 else:
                     final_rep += pragma_suffix
             else:
-                # Non-comment code follows on the same line: preserve suffix_line and append pragma to line end
+                # Non-comment code or existing trailing comments follow on the same line:
+                # consume line suffix to end of line, preserving suffix_line content
+                # and appending pragma to the line end.
                 consumes_line_suffix = True
                 final_suffix = (
                     suffix_line[:-1].rstrip() + pragma_suffix + "\n"

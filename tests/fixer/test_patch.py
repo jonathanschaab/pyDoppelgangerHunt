@@ -5843,7 +5843,11 @@ def test_edge_case_robustness_columns_and_empty_inputs() -> None:
 def test_column_bounded_replacement_preserves_suffix_and_pragma() -> None:
     """Verifies that column-bounded replacements preserve trailing code and place boundary pragmas at line end."""
     import ast
-    from pydoppelgangerhunt.fixer import compute_unit_replacement_span, replace_unit_in_source
+    from pydoppelgangerhunt.fixer import (
+        compute_unit_replacement_span,
+        replace_unit_in_source,
+        resolve_unit_replacement,
+    )
 
     # Case 1: Mid-line expression followed by binary operation and trailing type ignore
     source1 = "result = expensive_call() + other_expression  # type: ignore\n"
@@ -5866,6 +5870,23 @@ def test_column_bounded_replacement_preserves_suffix_and_pragma() -> None:
     refactored3 = replace_unit_in_source(source3, u_comp, "fast_val()")
     assert refactored3 == "out = fast_val() + 10  # noqa"
     assert ast.parse(refactored3)
+
+    # Case 4: Attached boundary pragma (# type: ignore) on multi-line unit with different pragma in suffix (# noqa)
+    source4 = "res = calculate(  # type: ignore\n    data\n)  # noqa: E501\n"
+    u_multi = {"file": "test_mod.py", "start": 1, "end": 3, "start_col": 6, "end_col": 1, "kind": "complex_expr"}
+    item4 = resolve_unit_replacement(source4, u_multi, "fast_calc(data)", preserve_boundary_pragmas=True)
+    assert item4.consumes_line_suffix is True
+    refactored4 = replace_unit_in_source(source4, u_multi, "fast_calc(data)", preserve_boundary_pragmas=True)
+    assert refactored4 == "res = fast_calc(data)  # noqa: E501  # type: ignore\n"
+    assert ast.parse(refactored4)
+
+    # Case 5: Attached boundary pragma on multi-line unit with regular comment in suffix
+    source5 = "res = calculate(  # type: ignore\n    data\n)  # compute offset\n"
+    item5 = resolve_unit_replacement(source5, u_multi, "fast_calc(data)", preserve_boundary_pragmas=True)
+    assert item5.consumes_line_suffix is True
+    refactored5 = replace_unit_in_source(source5, u_multi, "fast_calc(data)", preserve_boundary_pragmas=True)
+    assert refactored5 == "res = fast_calc(data)  # compute offset  # type: ignore\n"
+    assert ast.parse(refactored5)
 
 
 def test_refactor_module_units_same_line_emoji_prefix_replacement() -> None:
@@ -6315,21 +6336,54 @@ def test_unit_desc_strict_validation_and_parsing() -> None:
 
 
 def test_is_valid_unit_coordinates_scenarios() -> None:
-    """Verifies that _is_valid_unit_coordinates validates dictionary and integer coordinates."""
-    from pydoppelgangerhunt.fixer.patch import _is_valid_unit_coordinates as is_valid_patch
-    from pydoppelgangerhunt.fixer.source import _is_valid_unit_coordinates
+    """Verifies that is_valid_unit_coordinates, parse_unit_coord, and compute_line_offsets validate and extract coordinates."""
+    from pydoppelgangerhunt.fixer.patch import (
+        _compute_line_offsets as compute_line_offsets_patch,
+        _is_valid_unit_coordinates as is_valid_patch,
+        _parse_unit_coord as parse_unit_coord_patch,
+        compute_line_offsets as compute_line_offsets_pub,
+        is_valid_unit_coordinates as is_valid_pub,
+        parse_unit_coord as parse_unit_coord_pub,
+    )
+    from pydoppelgangerhunt.fixer.source import (
+        _compute_line_offsets,
+        _is_valid_unit_coordinates,
+        _parse_unit_coord,
+        compute_line_offsets,
+        is_valid_unit_coordinates,
+        parse_unit_coord,
+    )
+    import pydoppelgangerhunt as pdgh
+    import pydoppelgangerhunt.fixer as pdgh_fixer
 
-    assert is_valid_patch is _is_valid_unit_coordinates
-    assert _is_valid_unit_coordinates(None) is False
-    assert _is_valid_unit_coordinates("string_unit") is False
-    assert _is_valid_unit_coordinates(["list_unit"]) is False
-    assert _is_valid_unit_coordinates({}) is True
-    assert _is_valid_unit_coordinates({"start": 1, "end": 5}) is True
-    assert _is_valid_unit_coordinates({"start": "1", "end": "5"}) is True
-    assert _is_valid_unit_coordinates({"start": "not_an_int"}) is False
-    assert _is_valid_unit_coordinates({"start": 1, "end": [2]}) is False
-    assert _is_valid_unit_coordinates({"start": 1, "end": 5, "start_col": "invalid"}) is False
-    assert _is_valid_unit_coordinates({"start": 1, "end": 5, "end_col": {}}) is False
+    assert is_valid_patch is is_valid_unit_coordinates is is_valid_pub is _is_valid_unit_coordinates
+    assert parse_unit_coord_patch is parse_unit_coord is parse_unit_coord_pub is _parse_unit_coord
+    assert compute_line_offsets_patch is compute_line_offsets is compute_line_offsets_pub is _compute_line_offsets
+    assert pdgh_fixer.is_valid_unit_coordinates is is_valid_unit_coordinates
+    assert pdgh_fixer.parse_unit_coord is parse_unit_coord
+    assert pdgh_fixer.compute_line_offsets is compute_line_offsets
+    assert pdgh.is_valid_unit_coordinates is is_valid_unit_coordinates
+    assert pdgh.parse_unit_coord is parse_unit_coord
+    assert pdgh.compute_line_offsets is compute_line_offsets
+
+    assert is_valid_unit_coordinates(None) is False
+    assert is_valid_unit_coordinates("string_unit") is False
+    assert is_valid_unit_coordinates(["list_unit"]) is False
+    assert is_valid_unit_coordinates({}) is True
+    assert is_valid_unit_coordinates({"start": 1, "end": 5}) is True
+    assert is_valid_unit_coordinates({"start": "1", "end": "5"}) is True
+    assert is_valid_unit_coordinates({"start": "not_an_int"}) is False
+    assert is_valid_unit_coordinates({"start": 1, "end": [2]}) is False
+    assert is_valid_unit_coordinates({"start": 1, "end": 5, "start_col": "invalid"}) is False
+    assert is_valid_unit_coordinates({"start": 1, "end": 5, "end_col": {}}) is False
+
+    assert parse_unit_coord({"start": 10}, "start") == 10
+    assert parse_unit_coord({"start": "15"}, "start") == 15
+    assert parse_unit_coord({}, "start", default=42) == 42
+
+    c_offs, b_offs = compute_line_offsets(["hello\n", "world 🚀\n"])
+    assert c_offs == [0, 6, 14]
+    assert b_offs == [0, 6, 17]
 
 
 def test_compute_replacement_line_deltas_raises_on_overlapping_units() -> None:
