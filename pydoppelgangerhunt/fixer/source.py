@@ -536,14 +536,21 @@ def col_offset_to_char_offset(line: str, col_offset: Optional[Union[int, str]] =
         return 0
     if line.isascii():
         return min(len(line), c_off)
-    line_bytes = line.encode("utf-8")
+    line_bytes = line.encode("utf-8", errors="surrogatepass")
     if c_off >= len(line_bytes):
         return len(line)
     try:
-        prefix = line_bytes[:c_off].decode("utf-8")
+        prefix = line_bytes[:c_off].decode("utf-8", errors="surrogatepass")
         return len(prefix)
     except UnicodeDecodeError:
         # Clamps to the nearest valid character boundary preceding the malformed byte offset
+        for back in range(1, 4):
+            if c_off - back <= 0:
+                return 0
+            try:
+                return len(line_bytes[: c_off - back].decode("utf-8", errors="surrogatepass"))
+            except UnicodeDecodeError:
+                continue
         return len(line_bytes[:c_off].decode("utf-8", errors="ignore"))
 
 
@@ -553,7 +560,7 @@ def compute_line_offsets(lines: Sequence[str]) -> Tuple[List[int], List[int]]:
     byte_offsets = [0]
     for ln in lines:
         char_offsets.append(char_offsets[-1] + len(ln))
-        byte_offsets.append(byte_offsets[-1] + len(ln.encode("utf-8")))
+        byte_offsets.append(byte_offsets[-1] + len(ln.encode("utf-8", errors="surrogatepass")))
     return char_offsets, byte_offsets
 
 
@@ -612,7 +619,7 @@ def compute_unit_spans(
     # (bounded to line length) rather than being recalculated from character offsets.
     if start > len(lines) or start > end:
         sz_c = len(source_text)
-        sz_b = len(source_text.encode("utf-8"))
+        sz_b = len(source_text.encode("utf-8", errors="surrogatepass"))
         return UnitSpan(sz_c, sz_c, sz_b, sz_b, False, start, end, 0, 0)
 
     if line_char_offsets is None or line_byte_offsets is None:
@@ -652,10 +659,16 @@ def compute_unit_spans(
         start_char = line_char_offsets[start - 1] + start_c
         end_char = line_char_offsets[end - 1] + end_c
         start_b = start_col if start_col is not None else 0
-        last_b_len = len(last_line.encode("utf-8"))
-        last_b_code_len = len(last_line.rstrip("\r\n").encode("utf-8"))
+        last_b_len = len(last_line.encode("utf-8", errors="surrogatepass"))
+        last_b_code_len = len(last_line.rstrip("\r\n").encode("utf-8", errors="surrogatepass"))
         end_b = end_col if end_col is not None else last_b_code_len
-        start_b = max(0, min(last_b_len if start == end else len(first_line.encode("utf-8")), start_b))
+        start_b = max(
+            0,
+            min(
+                last_b_len if start == end else len(first_line.encode("utf-8", errors="surrogatepass")),
+                start_b,
+            ),
+        )
         end_b = max(0, min(last_b_len, end_b))
         if start == end:
             end_b = max(start_b, end_b)
@@ -665,7 +678,11 @@ def compute_unit_spans(
         start_char = line_char_offsets[start - 1]
         end_char = line_char_offsets[end] if end < len(lines) else len(source_text)
         start_byte = line_byte_offsets[start - 1]
-        end_byte = line_byte_offsets[end] if end < len(lines) else len(source_text.encode("utf-8"))
+        end_byte = (
+            line_byte_offsets[end]
+            if end < len(lines)
+            else len(source_text.encode("utf-8", errors="surrogatepass"))
+        )
 
     return UnitSpan(
         start_char=start_char,
@@ -825,7 +842,11 @@ def resolve_unit_replacement(
                 has_nl = suffix_line.endswith("\n") or final_rep.endswith("\n")
                 final_rep = final_rep.rstrip("\r\n") + pragma_suffix + ("\n" if has_nl else "")
                 end_char = line_char_offsets[end] if end < len(lines) else len(source_text)
-                end_byte = line_byte_offsets[end] if end < len(lines) else len(source_text.encode("utf-8"))
+                end_byte = (
+                    line_byte_offsets[end]
+                    if end < len(lines)
+                    else len(source_text.encode("utf-8", errors="surrogatepass"))
+                )
             else:
                 # Non-comment code or existing trailing comments follow on the same line:
                 # consume line suffix to end of line, preserving suffix_line content
@@ -841,7 +862,11 @@ def resolve_unit_replacement(
                 else:
                     final_rep = final_rep + final_suffix
                 end_char = line_char_offsets[end] if end < len(lines) else len(source_text)
-                end_byte = line_byte_offsets[end] if end < len(lines) else len(source_text.encode("utf-8"))
+                end_byte = (
+                    line_byte_offsets[end]
+                    if end < len(lines)
+                    else len(source_text.encode("utf-8", errors="surrogatepass"))
+                )
 
         return ReplacementItem(
             unit=unit,

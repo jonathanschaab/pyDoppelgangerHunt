@@ -6782,6 +6782,35 @@ def test_compute_replacement_line_deltas_sweep_catches_nested_interval_collision
     assert "Overlapping unit collision detected in line delta computation" in str(err.value)
 
 
+def test_col_offset_to_char_offset_surrogate_code_points() -> None:
+    """Verifies that col_offset_to_char_offset and compute_unit_spans handle lone surrogates without error."""
+    from pydoppelgangerhunt.fixer import col_offset_to_char_offset
+    from pydoppelgangerhunt.fixer.source import compute_unit_spans
+
+    # Lone surrogate character (U+D800) encoded in UTF-8 as 3 bytes (0xED 0xA0 0x80)
+    surrogate_line = "val = '\ud800'"
+    # Offset 0..7: 'val = \'' (7 ASCII characters, bytes 0..7)
+    assert col_offset_to_char_offset(surrogate_line, 6) == 6
+    assert col_offset_to_char_offset(surrogate_line, 7) == 7
+    # Offset 8 & 9: mid-sequence bytes within the 3-byte surrogate; clamps back to 7
+    assert col_offset_to_char_offset(surrogate_line, 8) == 7
+    assert col_offset_to_char_offset(surrogate_line, 9) == 7
+    # Offset 10: boundary after surrogate character (character index 8)
+    assert col_offset_to_char_offset(surrogate_line, 10) == 8
+    # Offset 11: boundary after closing quote (character index 9)
+    assert col_offset_to_char_offset(surrogate_line, 11) == 9
+
+    # compute_unit_spans with surrogate code points
+    source_with_surrogate = "val = '\ud800'\nprint(val)\n"
+    unit = {"file": "surrogate.py", "start": 1, "end": 1, "start_col": 0, "end_col": 10}
+    span = compute_unit_spans(source_with_surrogate, unit)
+    assert span.start_char == 0
+    assert span.start_byte == 0
+    assert span.end_char > 0
+    assert span.end_byte > 0
+
+
+
 
 
 
