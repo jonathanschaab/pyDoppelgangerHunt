@@ -15,7 +15,6 @@ from pydoppelgangerhunt.fixer.scope import (
 )
 from pydoppelgangerhunt.fixer.source import parse_unit_coord
 
-_parse_unit_coord = parse_unit_coord
 
 def _find_innermost_enclosing_node(
     source_text: str,
@@ -31,8 +30,8 @@ def _find_innermost_enclosing_node(
     except (SyntaxError, ValueError, UnicodeDecodeError):
         return None
 
-    u_start = _parse_unit_coord(unit, "start", default=0)
-    u_end = _parse_unit_coord(unit, "end", default=u_start)
+    u_start = parse_unit_coord(unit, "start", default=0)
+    u_end = parse_unit_coord(unit, "end", default=u_start)
     if u_start <= 0:
         return None
 

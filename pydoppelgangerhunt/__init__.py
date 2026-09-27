@@ -56,6 +56,7 @@ from pydoppelgangerhunt.coverage import (
 )
 from pydoppelgangerhunt.fixer import (
     ReplacementItem,
+    UnitCollisionError,
     UnitSpan,
     analyze_unit_variable_scope,
     check_units_overlap,
@@ -206,6 +207,7 @@ __all__ = [
     "compute_unit_char_offsets",
     "compute_unit_replacement_span",
     "compute_unit_spans",
+    "UnitCollisionError",
     "UnitSpan",
     "ReplacementItem",
     "resolve_unit_replacement",

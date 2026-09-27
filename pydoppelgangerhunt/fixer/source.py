@@ -639,8 +639,7 @@ def compute_unit_spans(
     if start == end:
         end_c = max(start_c, end_c)
 
-    first_indent_len = len(first_line) - len(first_line.lstrip(" \t"))
-    prefix_is_whitespace = start_c <= first_indent_len
+    prefix_is_whitespace = not first_line[:start_c].strip()
     suffix_code = last_line[end_c:line_code_len].strip()
     suffix_is_boundary_only = not suffix_code or suffix_code.startswith("#")
     is_expr_kind = unit.get("kind") in ("comprehension", "complex_expr")

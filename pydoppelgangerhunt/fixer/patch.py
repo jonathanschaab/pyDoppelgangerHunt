@@ -65,9 +65,10 @@ from pydoppelgangerhunt.fixer.synthesis import (
 
 logger = logging.getLogger(__name__)
 _BUILTIN_NAMES: Set[str] = set(dir(builtins))
-_compute_line_offsets = compute_line_offsets
-_is_valid_unit_coordinates = is_valid_unit_coordinates
-_parse_unit_coord = parse_unit_coord
+
+
+class UnitCollisionError(ValueError):
+    """Raised when two or more refactoring replacement units collide or overlap."""
 
 
 def _check_same_line_overlap(
@@ -147,8 +148,8 @@ def check_units_overlap(
 
     def _parse_lines(u: Dict[str, Any], label: str, file_path: str) -> Tuple[int, int]:
         try:
-            s = max(1, _parse_unit_coord(u, "start", default=1))
-            e = max(1, _parse_unit_coord(u, "end", default=s))
+            s = max(1, parse_unit_coord(u, "start", default=1))
+            e = max(1, parse_unit_coord(u, "end", default=s))
             # Note on inverted ranges: For symmetric geometric overlap testing, _parse_lines
             # normalizes inverted line boundaries into an inclusive interval [min(s, e), max(s, e)].
             # In contrast, compute_unit_spans treats start > end as an empty 0-width EOF slice
@@ -258,9 +259,9 @@ def filter_overlapping_clone_units(
     retained: List[Dict[str, Any]] = []
     for _, file_units in file_groups:
         def _sort_key(u: Dict[str, Any]) -> Tuple[int, int, int, str]:
-            s = _parse_unit_coord(u, "start", default=0)
-            e = _parse_unit_coord(u, "end", default=s)
-            sc = _parse_unit_coord(u, "start_col", default=0)
+            s = parse_unit_coord(u, "start", default=0)
+            e = parse_unit_coord(u, "end", default=s)
+            sc = parse_unit_coord(u, "start_col", default=0)
             return (-(e - s), s, sc, str(u.get("name") or ""))
 
         sorted_candidates = sorted(file_units, key=_sort_key)
@@ -300,8 +301,8 @@ def refactor_module_units(
         if not isinstance(u, dict):
             raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
         n = str(u.get("name") or "unit")
-        s = _parse_unit_coord(u, "start", default=1)
-        e = _parse_unit_coord(u, "end", default=s)
+        s = parse_unit_coord(u, "start", default=1)
+        e = parse_unit_coord(u, "end", default=s)
         f = normalize_path_string(str(u.get("file") or ""), strip_anchor=False)
         return n, s, e, f
 
@@ -315,7 +316,7 @@ def refactor_module_units(
             if check_units_overlap(u1, u2):
                 n1, s1, e1, f1 = _unit_desc(u1)
                 n2, s2, e2, _ = _unit_desc(u2)
-                raise ValueError(
+                raise UnitCollisionError(
                     f"Overlapping unit collision detected between "
                     f"'{n1}' ({s1}-{e1}) and "
                     f"'{n2}' ({s2}-{e2}) in {f1}."
@@ -323,7 +324,7 @@ def refactor_module_units(
 
     computed_entries: List[ReplacementItem] = []
     lines = source_text.splitlines(keepends=True)
-    line_char_offsets, line_byte_offsets = _compute_line_offsets(lines)
+    line_char_offsets, line_byte_offsets = compute_line_offsets(lines)
 
     for i, (unit, rep) in enumerate(rep_list):
         item = resolve_unit_replacement(
@@ -347,7 +348,7 @@ def refactor_module_units(
             if max(s1_b, s2_b) < min(e1_b, e2_b):
                 n1, s1, e1, f1 = _unit_desc(c1.unit)
                 n2, s2, e2, _ = _unit_desc(c2.unit)
-                raise ValueError(
+                raise UnitCollisionError(
                     f"Overlapping unit collision detected between "
                     f"'{n1}' ({s1}-{e1}) and "
                     f"'{n2}' ({s2}-{e2}) in {f1}."
@@ -381,8 +382,8 @@ def _build_whole_method_delegation(
 ) -> str:
     """Builds a delegated method replacement body preserving method signature and docstring."""
     lines = source_text.splitlines(keepends=True)
-    u_start = _parse_unit_coord(unit, "start", default=1)
-    u_end = _parse_unit_coord(unit, "end", default=max(u_start, len(lines)))
+    u_start = parse_unit_coord(unit, "start", default=1)
+    u_end = parse_unit_coord(unit, "end", default=max(u_start, len(lines)))
 
     lead = lines[u_start - 1] if 1 <= u_start <= len(lines) else ""
     indent = lead[: len(lead) - len(lead.lstrip())]
@@ -492,8 +493,8 @@ def _has_unconditional_terminal_return(
     unit: Dict[str, Any], orig_lines: Sequence[str]
 ) -> bool:
     """Checks whether an AST code unit terminates with an unconditional return at its base indentation."""
-    u_start = max(1, _parse_unit_coord(unit, "start", default=1))
-    u_end = min(len(orig_lines), _parse_unit_coord(unit, "end", default=u_start))
+    u_start = max(1, parse_unit_coord(unit, "start", default=1))
+    u_end = min(len(orig_lines), parse_unit_coord(unit, "end", default=u_start))
     if u_start > len(orig_lines) or u_start > u_end:
         return False
     cand_lines = orig_lines[u_start - 1 : u_end]
@@ -525,7 +526,7 @@ def _build_unit_delegation_call(
     step: Optional[str] = None,
 ) -> str:
     """Constructs replacement delegation call statement for a clone unit in refactoring patches."""
-    u_start = _parse_unit_coord(target_unit, "start", default=1)
+    u_start = parse_unit_coord(target_unit, "start", default=1)
     lead = orig_lines[u_start - 1] if 1 <= u_start <= len(orig_lines) else ""
     indent = lead[: len(lead) - len(lead.lstrip())]
 
@@ -704,14 +705,14 @@ def _compute_replacement_line_deltas(
     if lines is None:
         lines = orig_text.splitlines(keepends=True)
     if line_char_offsets is None or line_byte_offsets is None:
-        line_char_offsets, line_byte_offsets = _compute_line_offsets(lines)
+        line_char_offsets, line_byte_offsets = compute_line_offsets(lines)
     computed: List[Tuple[ReplacementItem, int, int]] = []
     for u, rep in reps:
         if not isinstance(u, dict):
             raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
         try:
-            fallback = _parse_unit_coord(u, "start", default=1)
-            end_l = _parse_unit_coord(u, "end", default=fallback)
+            fallback = parse_unit_coord(u, "start", default=1)
+            end_l = parse_unit_coord(u, "end", default=fallback)
         except (ValueError, TypeError) as err:
             raise ValueError(f"Malformed unit: invalid line boundary in {u.get('file', '')}: {err}") from err
         item = resolve_unit_replacement(
@@ -733,7 +734,7 @@ def _compute_replacement_line_deltas(
         if curr_item.end_byte > next_item.start_byte:
             n1 = str(curr_item.unit.get("name") or "unit")
             n2 = str(next_item.unit.get("name") or "unit")
-            raise ValueError(
+            raise UnitCollisionError(
                 f"Overlapping unit collision detected in line delta computation "
                 f"between '{n1}' and '{n2}'."
             )
@@ -797,7 +798,7 @@ def _derive_unit_indent_step(
     """Derives indentation step for a unit from its starting line indentation if not provided."""
     if step is not None:
         return step
-    u_s = _parse_unit_coord(unit, "start", default=1)
+    u_s = parse_unit_coord(unit, "start", default=1)
     u_lead = lines[u_s - 1] if 1 <= u_s <= len(lines) else ""
     u_ind = u_lead[: len(u_lead) - len(u_lead.lstrip())]
     return _detect_indent_step(u_ind)
@@ -993,7 +994,7 @@ def _render_file_patch_plan(
     if replace_clones and filtered_reps:
         try:
             current_text = refactor_module_units(plan.orig_text, filtered_reps)
-        except ValueError as exc:
+        except UnitCollisionError as exc:
             logger.warning(
                 "Collision detected during patch rendering for %s (%s); filtering conflicting replacements",
                 plan.rel_path,
@@ -1004,7 +1005,7 @@ def _render_file_patch_plan(
                 try:
                     refactor_module_units(plan.orig_text, valid_reps + [item])
                     valid_reps.append(item)
-                except ValueError:
+                except UnitCollisionError:
                     logger.debug("Omitted conflicting replacement in %s", plan.rel_path)
             filtered_reps = valid_reps
             if filtered_reps:
@@ -2385,13 +2386,16 @@ def generate_refactoring_patch(
     )
 
     for sim, u1, u2 in clones:
-        if not _is_valid_unit_coordinates(u1) or not _is_valid_unit_coordinates(u2):
+        if not is_valid_unit_coordinates(u1) or not is_valid_unit_coordinates(u2):
             logger.debug(
                 "Skipping clone pair with malformed unit coordinates: (%s, %s)", u1, u2
             )
             continue
 
-        plans_snapshot = {p: plan.snapshot() for p, plan in file_plans.items()}
+        # Performance: Snapshot only plans touched in this pair (f1, f2, and potential shared module)
+        # to ensure O(touched_plans) = O(1) complexity per pair rather than O(pairs * total_plans).
+        initial_plan_keys = set(file_plans.keys())
+        plans_snapshot: Dict[Path, Any] = {}
         graph_snapshot = graph_holder[0].copy() if graph_holder[0] is not None else None
 
         try:
@@ -2403,6 +2407,9 @@ def generate_refactoring_patch(
             )
             if is_f1_rejected or f1_path is None:
                 continue
+
+            if f1_path in initial_plan_keys and f1_path not in plans_snapshot:
+                plans_snapshot[f1_path] = file_plans[f1_path].snapshot()
 
             rel_f1 = _format_patch_relative_path(f1_path, patch_root, fs_root)
 
@@ -2426,6 +2433,8 @@ def generate_refactoring_patch(
                 )
                 if is_f2_rejected:
                     continue
+                if f2_path is not None and f2_path in initial_plan_keys and f2_path not in plans_snapshot:
+                    plans_snapshot[f2_path] = file_plans[f2_path].snapshot()
 
             is_same_file = False
             if f2_path is not None and f1_path is not None:
@@ -2679,6 +2688,8 @@ def generate_refactoring_patch(
                 if maybe_shared_p is None:
                     continue
                 shared_p = maybe_shared_p
+                if shared_p in initial_plan_keys and shared_p not in plans_snapshot:
+                    plans_snapshot[shared_p] = file_plans[shared_p].snapshot()
 
                 if _is_same_file_or_resolved(shared_p, f1_path):
                     target_host_plan = f1_plan
@@ -2748,7 +2759,7 @@ def generate_refactoring_patch(
                 candidate_units.append(u2)
 
             def _unit_start(u: Dict[str, Any]) -> int:
-                return _parse_unit_coord(u, "start", default=1)
+                return parse_unit_coord(u, "start", default=1)
 
             earliest_unit = min(candidate_units, key=_unit_start)
             enc_fn_earliest = (
@@ -2828,6 +2839,8 @@ def generate_refactoring_patch(
                         if maybe_shared_p is None:
                             continue
                         shared_p = maybe_shared_p
+                        if shared_p in initial_plan_keys and shared_p not in plans_snapshot:
+                            plans_snapshot[shared_p] = file_plans[shared_p].snapshot()
 
                     rel_shared = _format_patch_relative_path(shared_p, patch_root, fs_root)
 
@@ -3228,11 +3241,12 @@ def generate_refactoring_patch(
             logger.debug(
                 "Skipping clone pair due to coordinate or processing error: %s", exc
             )
+            for p, snap in plans_snapshot.items():
+                if p in file_plans:
+                    file_plans[p].restore(snap)
             for p in list(file_plans.keys()):
-                if p not in plans_snapshot:
+                if p not in initial_plan_keys:
                     del file_plans[p]
-                else:
-                    file_plans[p].restore(plans_snapshot[p])
             graph_holder[0] = graph_snapshot
             continue
 

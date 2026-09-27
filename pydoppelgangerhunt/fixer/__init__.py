@@ -31,6 +31,7 @@ from pydoppelgangerhunt.fixer.depgraph import (
     resolve_shared_module_file,
 )
 from pydoppelgangerhunt.fixer.patch import (
+    UnitCollisionError,
     _FilePatchPlan,
     _adjust_line_for_replacements,
     _build_unit_delegation_call,
@@ -106,6 +107,7 @@ from pydoppelgangerhunt.fixer.synthesis import (
 __all__ = [
     "ModuleDependencyGraph",
     "ReplacementItem",
+    "UnitCollisionError",
     "UnitSpan",
     "analyze_unit_variable_scope",
     "build_module_graph",

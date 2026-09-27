@@ -6358,9 +6358,6 @@ def test_unit_desc_strict_validation_and_parsing() -> None:
 def test_is_valid_unit_coordinates_scenarios() -> None:
     """Verifies that is_valid_unit_coordinates, parse_unit_coord, and compute_line_offsets validate and extract coordinates."""
     from pydoppelgangerhunt.fixer.patch import (
-        _compute_line_offsets as compute_line_offsets_patch,
-        _is_valid_unit_coordinates as is_valid_patch,
-        _parse_unit_coord as parse_unit_coord_patch,
         compute_line_offsets as compute_line_offsets_pub,
         is_valid_unit_coordinates as is_valid_pub,
         parse_unit_coord as parse_unit_coord_pub,
@@ -6391,7 +6388,6 @@ def test_is_valid_unit_coordinates_scenarios() -> None:
     ]
     for tc in test_cases:
         expected = is_valid_unit_coordinates(tc)
-        assert is_valid_patch(tc) == expected
         assert is_valid_pub(tc) == expected
         assert _is_valid_unit_coordinates(tc) == expected
         assert pdgh_fixer.is_valid_unit_coordinates(tc) == expected
@@ -6405,7 +6401,6 @@ def test_is_valid_unit_coordinates_scenarios() -> None:
     ]
     for u_data, key, def_val, expected_val in coord_cases:
         assert parse_unit_coord(u_data, key, default=def_val) == expected_val
-        assert parse_unit_coord_patch(u_data, key, default=def_val) == expected_val
         assert parse_unit_coord_pub(u_data, key, default=def_val) == expected_val
         assert _parse_unit_coord(u_data, key, default=def_val) == expected_val
         assert pdgh_fixer.parse_unit_coord(u_data, key, default=def_val) == expected_val
@@ -6419,7 +6414,6 @@ def test_is_valid_unit_coordinates_scenarios() -> None:
     for lines_input, (exp_c, exp_b) in line_cases:
         res = compute_line_offsets(lines_input)
         assert res == (exp_c, exp_b)
-        assert compute_line_offsets_patch(lines_input) == (exp_c, exp_b)
         assert compute_line_offsets_pub(lines_input) == (exp_c, exp_b)
         assert _compute_line_offsets(lines_input) == (exp_c, exp_b)
         assert pdgh_fixer.compute_line_offsets(lines_input) == (exp_c, exp_b)
@@ -6585,6 +6579,114 @@ def test_package_reexport_col_offset_to_char_offset() -> None:
     assert hasattr(pydoppelgangerhunt, "col_offset_to_char_offset")
     assert "col_offset_to_char_offset" in pydoppelgangerhunt.__all__
     assert callable(pydoppelgangerhunt.col_offset_to_char_offset)
+
+
+def test_unit_collision_error_hierarchy_and_render_fallback() -> None:
+    """Verifies that UnitCollisionError subclasses ValueError and is raised on collisions."""
+    from pydoppelgangerhunt.fixer import UnitCollisionError, refactor_module_units
+
+    assert issubclass(UnitCollisionError, ValueError)
+
+    collision_u1 = {"file": "collision_target.py", "name": "block_alpha", "start": 1, "end": 2}
+    collision_u2 = {"file": "collision_target.py", "name": "block_beta", "start": 1, "end": 2}
+
+    with pytest.raises(UnitCollisionError) as exc_info:
+        refactor_module_units("x = 1\ny = 2\n", [(collision_u1, "x = 10\n"), (collision_u2, "y = 20\n")])
+    assert "Overlapping unit collision detected" in str(exc_info.value)
+    assert isinstance(exc_info.value, ValueError)
+
+
+def test_generate_refactoring_patch_rolls_back_partial_mutations_on_deep_failure(
+    tmp_path: Path,
+) -> None:
+    """Verifies that when a deep failure occurs during candidate pair processing,
+
+    transactional rollback restores snapshotted plans and depgraph, leaving no leaked state.
+    """
+    from unittest.mock import patch as mock_patch
+    from pydoppelgangerhunt.fixer.patch import _build_unit_delegation_call
+
+    module_a = tmp_path / "rollback_mod_a.py"
+    module_b = tmp_path / "rollback_mod_b.py"
+    module_a.write_text(
+        "def compute_cube(val: int) -> int:\n    return val ** 3\n\n"
+        "def compute_square(num: int) -> int:\n    return num ** 2\n",
+        encoding="utf-8",
+    )
+    module_b.write_text(
+        "def compute_cube_replica(val: int) -> int:\n    return val ** 3\n\n"
+        "def compute_square_replica(num: int) -> int:\n    return num ** 2\n",
+        encoding="utf-8",
+    )
+
+    pair_failing_u1 = {"file": str(module_a), "name": "compute_cube", "start": 1, "end": 2, "kind": "function"}
+    pair_failing_u2 = {"file": str(module_b), "name": "compute_cube_replica", "start": 1, "end": 2, "kind": "function"}
+
+    pair_success_u1 = {"file": str(module_a), "name": "compute_square", "start": 4, "end": 5, "kind": "function"}
+    pair_success_u2 = {"file": str(module_b), "name": "compute_square_replica", "start": 4, "end": 5, "kind": "function"}
+
+    invocation_count = 0
+    original_delegation_builder = _build_unit_delegation_call
+
+    def mocked_delegation_builder(*args: Any, **kwargs: Any) -> str:
+        nonlocal invocation_count
+        invocation_count += 1
+        if invocation_count == 1:
+            raise ValueError("Simulated deep mid-pipeline AST delegation failure")
+        return original_delegation_builder(*args, **kwargs)
+
+    with mock_patch(
+        "pydoppelgangerhunt.fixer.patch._build_unit_delegation_call",
+        side_effect=mocked_delegation_builder,
+    ):
+        patch_result = generate_refactoring_patch(
+            [(0.92, pair_failing_u1, pair_failing_u2), (1.0, pair_success_u1, pair_success_u2)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+        )
+
+    # First pair must be completely rolled back: no helper or comments referencing compute_cube
+    assert "Clone Pair (92.0%)" not in patch_result
+    assert "_shared_compute_cube" not in patch_result
+    assert "return _shared_compute_cube" not in patch_result
+
+    # Second pair must succeed cleanly
+    assert "Clone Pair (100.0%)" in patch_result
+    assert "_shared_compute_square" in patch_result
+    assert "--- a/rollback_mod_a.py" in patch_result
+    assert "--- a/rollback_mod_b.py" in patch_result
+
+
+def test_compute_unit_spans_whitespace_parity_with_form_feed() -> None:
+    """Verifies that compute_unit_spans correctly classifies whitespace with form-feeds (\\f)."""
+    from pydoppelgangerhunt.fixer import compute_unit_spans
+
+    # Form feed in indentation before statement: \f    x = 10\n
+    source_with_ff = "def fn():\n\f    x = 10\n    return x\n"
+    unit_indented_stmt = {"file": "ff_test.py", "start": 2, "end": 2, "start_col": 5, "end_col": 11}
+    span_ff = compute_unit_spans(source_with_ff, unit_indented_stmt)
+    # The prefix \f    is pure whitespace, suffix is empty, so whole-line statement is NOT column bounded
+    assert not span_ff.is_column_bounded
+
+    # Non-whitespace prefix on the same line:
+    source_code_prefix = "def fn():\n    flag = x = 10\n    return x\n"
+    unit_sub_expr = {"file": "ff_test.py", "start": 2, "end": 2, "start_col": 11, "end_col": 17}
+    span_sub = compute_unit_spans(source_code_prefix, unit_sub_expr)
+    assert span_sub.is_column_bounded
+
+
+def test_package_reexport_unit_collision_error() -> None:
+    """Verifies that UnitCollisionError is re-exported in root and fixer packages."""
+    import pydoppelgangerhunt as pdgh
+    import pydoppelgangerhunt.fixer as pdgh_fixer
+
+    assert hasattr(pdgh, "UnitCollisionError")
+    assert "UnitCollisionError" in pdgh.__all__
+    assert issubclass(pdgh.UnitCollisionError, ValueError)
+
+    assert hasattr(pdgh_fixer, "UnitCollisionError")
+    assert "UnitCollisionError" in pdgh_fixer.__all__
+    assert issubclass(pdgh_fixer.UnitCollisionError, ValueError)
 
 
 
