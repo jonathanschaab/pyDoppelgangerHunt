@@ -496,6 +496,8 @@ def col_offset_to_char_offset(line: str, col_offset: Optional[Union[int, str]] =
         raise ValueError(f"Malformed column offset: {col_offset!r}") from err
     if c_off <= 0:
         return 0
+    if line.isascii():
+        return min(len(line), c_off)
     line_bytes = line.encode("utf-8")
     if c_off >= len(line_bytes):
         return len(line)
@@ -586,17 +588,20 @@ def compute_unit_spans(
     except (ValueError, TypeError) as err:
         raise ValueError(f"Malformed unit: invalid 'end_col' offset: {raw_ec!r}") from err
 
+    line_code_len = len(last_line.rstrip("\r\n"))
     start_c = col_offset_to_char_offset(first_line, start_col) if start_col is not None else 0
-    end_c = col_offset_to_char_offset(last_line, end_col) if end_col is not None else len(last_line)
+    end_c = col_offset_to_char_offset(last_line, end_col) if end_col is not None else line_code_len
     if start == end:
         end_c = max(start_c, end_c)
 
-    prefix_is_whitespace = not first_line[:start_c].strip()
-    suffix_stripped = last_line[end_c:].strip()
-    suffix_is_boundary_only = not suffix_stripped or suffix_stripped.startswith("#")
+    first_indent_len = len(first_line) - len(first_line.lstrip(" \t"))
+    prefix_is_whitespace = start_c <= first_indent_len
+    suffix_code = last_line[end_c:line_code_len].strip()
+    suffix_is_boundary_only = not suffix_code or suffix_code.startswith("#")
     is_expr_kind = unit.get("kind") in ("comprehension", "complex_expr")
-    is_column_bounded = (start_col is not None or end_col is not None) and (
-        is_expr_kind or not (prefix_is_whitespace and suffix_is_boundary_only)
+    is_column_bounded = bool(
+        (start_col is not None or end_col is not None)
+        and (is_expr_kind or not (prefix_is_whitespace and suffix_is_boundary_only))
     )
 
     if is_column_bounded:
@@ -604,7 +609,8 @@ def compute_unit_spans(
         end_char = line_char_offsets[end - 1] + end_c
         start_b = start_col if start_col is not None else 0
         last_b_len = len(last_line.encode("utf-8"))
-        end_b = end_col if end_col is not None else last_b_len
+        last_b_code_len = len(last_line.rstrip("\r\n").encode("utf-8"))
+        end_b = end_col if end_col is not None else last_b_code_len
         start_b = max(0, min(last_b_len if start == end else len(first_line.encode("utf-8")), start_b))
         end_b = max(0, min(last_b_len, end_b))
         if start == end:

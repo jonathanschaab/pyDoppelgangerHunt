@@ -78,9 +78,9 @@ def check_units_overlap(
     'end_col') are omitted from either unit, this check conservatively assumes the unit
     spans whole lines and treats any shared line as an overlap conflict. When units share
     a single boundary line (same-line, touching boundary, or a boundary line of a multi-line
-    unit), it checks sub-line column intervals for half-open intersection. Units with inverted
-    column bounds (start_col > end_col) on a shared boundary line represent empty ranges
-    and evaluate to False.
+    unit), it checks sub-line column intervals for half-open intersection. Single-line units
+    or boundary intervals with inverted column bounds (start_col > end_col) represent empty ranges
+    and evaluate to False. Any shared interior lines between multi-line units unconditionally conflict.
 
     Args:
         u1: First AST unit dictionary with 'file', 'start', and 'end'.
@@ -126,14 +126,47 @@ def check_units_overlap(
     sc1, ec1 = _parse_col(u1.get("start_col"), "start_col", f1), _parse_col(u1.get("end_col"), "end_col", f1)
     sc2, ec2 = _parse_col(u2.get("start_col"), "start_col", f2), _parse_col(u2.get("end_col"), "end_col", f2)
 
-    # When units share exactly one boundary line (max(start1, start2) == min(end1, end2)),
-    # check sub-line column disjointness on that shared line:
-    if max(start1, start2) == min(end1, end2):
+    # Case 1: Both units reside on the exact same single line
+    if start1 == end1 == start2 == end2:
         if sc1 is not None and ec1 is not None and sc2 is not None and ec2 is not None:
-            if sc1 > ec1 or sc2 > ec2:
-                return False
-            return max(sc1, sc2) < min(ec1, ec2)
+            if sc1 <= ec1 and sc2 <= ec2:
+                return max(sc1, sc2) < min(ec1, ec2)
+            return False
+        return True
 
+    # Case 2 & 3: Sequential boundary touch (one unit ends where the other begins)
+    if (start1 < start2 and end1 == start2) or (start2 < start1 and end2 == start1):
+        prior_ec, next_sc = (ec1, sc2) if start1 < start2 else (ec2, sc1)
+        next_is_single = (start2 == end2) if start1 < start2 else (start1 == end1)
+        next_ec = ec2 if start1 < start2 else ec1
+        if prior_ec is not None and next_sc is not None:
+            if next_is_single and next_ec is not None and next_sc > next_ec:
+                return False
+            return next_sc < prior_ec
+        return True
+
+    def _check_boundary_sharing(
+        is_start: bool,
+        multi_col: Optional[int],
+        single_sc: Optional[int],
+        single_ec: Optional[int],
+    ) -> bool:
+        if multi_col is None or single_sc is None or single_ec is None:
+            return True
+        if single_sc > single_ec:
+            return False
+        return (multi_col < single_ec) if is_start else (single_sc < multi_col)
+
+    # Case 4: Multi-line units sharing boundary lines at start or end
+    if start1 == start2 or end1 == end2:
+        is_start = start1 == start2
+        if start1 < end1 and start2 == end2:
+            return _check_boundary_sharing(is_start, sc1 if is_start else ec1, sc2, ec2)
+        if start2 < end2 and start1 == end1:
+            return _check_boundary_sharing(is_start, sc2 if is_start else ec2, sc1, ec1)
+        return True
+
+    # Case 5: Multi-line interior overlap
     return max(start1, start2) <= min(end1, end2)
 
 
@@ -750,6 +783,7 @@ def _delegate_unit_in_plan(
     )
     plan.replacements.append((unit, rep_stmt))
     plan.claimed_units.append(unit)
+    refactor_module_units(plan.orig_text, plan.replacements)
 
 
 def _wire_cross_module_host_delegation(
@@ -906,7 +940,26 @@ def _render_file_patch_plan(
                 filtered_reps.append((u, rep))
 
     if replace_clones and filtered_reps:
-        current_text = refactor_module_units(plan.orig_text, filtered_reps)
+        try:
+            current_text = refactor_module_units(plan.orig_text, filtered_reps)
+        except ValueError as exc:
+            logger.warning(
+                "Collision detected during patch rendering for %s (%s); filtering conflicting replacements",
+                plan.rel_path,
+                exc,
+            )
+            valid_reps: List[Tuple[Dict[str, Any], str]] = []
+            for item in filtered_reps:
+                try:
+                    refactor_module_units(plan.orig_text, valid_reps + [item])
+                    valid_reps.append(item)
+                except ValueError:
+                    logger.debug("Omitted conflicting replacement in %s", plan.rel_path)
+            filtered_reps = valid_reps
+            if filtered_reps:
+                current_text = refactor_module_units(plan.orig_text, filtered_reps)
+            else:
+                current_text = plan.orig_text
     else:
         current_text = plan.orig_text
 
@@ -2618,12 +2671,6 @@ def generate_refactoring_patch(
             ):
                 helper_name = f"{base_helper}_{h_idx}"
                 h_idx += 1
-            f1_plan.used_helper_names.add(helper_name)
-            if f2_plan is not None:
-                f2_plan.used_helper_names.add(helper_name)
-            if target_host_plan is not None:
-                target_host_plan.used_helper_names.add(helper_name)
-
             helper_code = synthesize_shared_helper_code(
                 u1_eff,
                 u2_eff,
@@ -2644,7 +2691,6 @@ def generate_refactoring_patch(
             f1_disp = normalize_path_string(str(u1.get("file") or "file1"), strip_anchor=False)
             f2_disp = normalize_path_string(str(u2.get("file") or "file2"), strip_anchor=False)
             pair_comment = f"# Clone Pair ({sim:.1%}): {f1_disp} <===> {f2_disp}\n"
-            f1_plan.comments.append(pair_comment)
 
             candidate_units = [u1]
             if is_same_file and not check_units_overlap(u1, u2, repo_root=str(root)):
@@ -2681,6 +2727,9 @@ def generate_refactoring_patch(
                 if maybe_imports is None:
                     continue
                 host_imports = maybe_imports
+
+                f1_plan.used_helper_names.add(helper_name)
+                f1_plan.comments.append(pair_comment)
 
                 if replace_clones:
                     _delegate_unit_in_plan(
@@ -2893,6 +2942,9 @@ def generate_refactoring_patch(
                     host_plan.module_helpers.append(helper_code)
                     host_plan.missing_imports.extend(host_imports)
                     host_plan.used_helper_names.add(helper_name)
+                    f1_plan.used_helper_names.add(helper_name)
+                    if f2_plan is not None:
+                        f2_plan.used_helper_names.add(helper_name)
                     host_plan.comments.append(pair_comment)
 
                     if mod_host:
@@ -3042,6 +3094,10 @@ def generate_refactoring_patch(
                             dg, mod1, f1_plan.path, host_imports
                         )
 
+                    f1_plan.used_helper_names.add(helper_name)
+                    f2_plan.used_helper_names.add(helper_name)
+                    f1_plan.comments.append(pair_comment)
+
                     _wire_cross_module_host_delegation(
                         f1_plan=f1_plan,
                         f2_plan=f2_plan,
@@ -3095,6 +3151,8 @@ def generate_refactoring_patch(
                     continue
                 host_imports = maybe_imports
 
+                f1_plan.used_helper_names.add(helper_name)
+                f1_plan.comments.append(pair_comment)
                 f1_plan.comments.append(
                     f"# Note: Cross-module clone pair; helper generated in {f1_disp}. "
                     f"Complete refactoring by importing the helper into {f2_disp}.\n"

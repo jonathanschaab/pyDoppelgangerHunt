@@ -5978,23 +5978,25 @@ def test_check_units_overlap_multiline_start_boundary_single_line() -> None:
         "start_col": 20,
         "end_col": 30,
     }
-    u_single = {
+    # Single-line unit before multi-line unit's start_col on line 1: disjoint ([5, 15) and [20, EOL))
+    u_single_before = {
         "file": "pkg/mod.py",
         "start": 1,
         "end": 1,
-        "start_col": 40,
-        "end_col": 50,
+        "start_col": 5,
+        "end_col": 15,
     }
 
-    assert not check_units_overlap(u_multi, u_single)
-    assert not check_units_overlap(u_single, u_multi)
+    assert not check_units_overlap(u_multi, u_single_before)
+    assert not check_units_overlap(u_single_before, u_multi)
 
+    # Single-line unit intersecting multi-line unit's start_col on line 1: overlapping ([15, 25) and [20, EOL))
     u_single_overlap = {
         "file": "pkg/mod.py",
         "start": 1,
         "end": 1,
-        "start_col": 25,
-        "end_col": 35,
+        "start_col": 15,
+        "end_col": 25,
     }
 
     assert check_units_overlap(u_multi, u_single_overlap)
@@ -6251,15 +6253,45 @@ def test_adjust_line_for_replacements_boundary_coincidence() -> None:
 
 
 def test_check_units_overlap_multiline_inverted_column_bounds() -> None:
-    """Verifies that check_units_overlap evaluates inverted column bounds on multi-line units as False."""
+    """Verifies that check_units_overlap handles boundary column disjointness and interior overlaps."""
     from pydoppelgangerhunt.fixer import check_units_overlap
 
-    # Multi-line unit with inverted column bounds (start_col > end_col) on a shared boundary line
-    u_multi_inverted = {"file": "mod.py", "start": 1, "end": 3, "start_col": 30, "end_col": 10}
-    u_single = {"file": "mod.py", "start": 1, "end": 1, "start_col": 15, "end_col": 25}
+    # Multi-line unit with start_col > end_col across lines 1 to 3
+    u_multi = {"file": "mod.py", "start": 1, "end": 3, "start_col": 30, "end_col": 10}
 
-    assert check_units_overlap(u_multi_inverted, u_single) is False
-    assert check_units_overlap(u_single, u_multi_inverted) is False
+    # Single-line unit on line 1 before start_col (disjoint)
+    u_single_disjoint = {"file": "mod.py", "start": 1, "end": 1, "start_col": 15, "end_col": 25}
+    assert check_units_overlap(u_multi, u_single_disjoint) is False
+    assert check_units_overlap(u_single_disjoint, u_multi) is False
+
+    # Single-line unit on line 1 intersecting start_col (overlapping: [25, 35) and [30, EOL))
+    u_single_overlap_start = {"file": "mod.py", "start": 1, "end": 1, "start_col": 25, "end_col": 35}
+    assert check_units_overlap(u_multi, u_single_overlap_start) is True
+    assert check_units_overlap(u_single_overlap_start, u_multi) is True
+
+    # Single-line unit on line 2 (interior line: unconditionally overlapping)
+    u_single_interior = {"file": "mod.py", "start": 2, "end": 2, "start_col": 5, "end_col": 15}
+    assert check_units_overlap(u_multi, u_single_interior) is True
+    assert check_units_overlap(u_single_interior, u_multi) is True
+
+    # Single-line unit on line 3 intersecting end_col (overlapping: [5, 15) and [0, 10))
+    u_single_overlap_end = {"file": "mod.py", "start": 3, "end": 3, "start_col": 5, "end_col": 15}
+    assert check_units_overlap(u_multi, u_single_overlap_end) is True
+    assert check_units_overlap(u_single_overlap_end, u_multi) is True
+
+    # Single-line unit on line 3 after end_col (disjoint: [15, 25) and [0, 10))
+    u_single_disjoint_end = {"file": "mod.py", "start": 3, "end": 3, "start_col": 15, "end_col": 25}
+    assert check_units_overlap(u_multi, u_single_disjoint_end) is False
+    assert check_units_overlap(u_single_disjoint_end, u_multi) is False
+
+    # Two multi-line units sharing the same lines 1-3
+    u_multi_same = {"file": "mod.py", "start": 1, "end": 3, "start_col": 30, "end_col": 10}
+    assert check_units_overlap(u_multi, u_multi_same) is True
+
+    # Single-line unit with inverted column bounds on same line represents an empty range (disjoint)
+    u_empty = {"file": "mod.py", "start": 1, "end": 1, "start_col": 20, "end_col": 10}
+    assert check_units_overlap(u_multi, u_empty) is False
+    assert check_units_overlap(u_empty, u_multi) is False
 
 
 def test_unit_desc_strict_validation_and_parsing() -> None:
@@ -6343,5 +6375,122 @@ def test_generate_refactoring_patch_skips_malformed_clone_pair_without_aborting_
     assert "--- a/mod1.py" in patch
     assert "--- a/mod2.py" in patch
     assert "_shared_run_a_run_b" in patch
+
+
+def test_compute_unit_spans_unpadded_line_length_and_no_double_newline() -> None:
+    """Verifies that compute_unit_spans does not leave stray double newlines on statement replacements."""
+    from pydoppelgangerhunt.fixer import compute_unit_spans, refactor_module_units
+
+    # Whole-line indented statement
+    src = "def foo():\n    x = 1\n    return x\n"
+    unit = {"file": "test.py", "start": 2, "end": 2, "start_col": 4, "end_col": 9}
+    span = compute_unit_spans(src, unit)
+    # Because prefix is only whitespace and suffix is empty (no trailing code), it is whole-line
+    assert span.is_column_bounded is False
+
+    # Replacement should replace whole line including trailing newline, with no double blank lines
+    result = refactor_module_units(src, [(unit, "    x = 2\n")])
+    assert result == "def foo():\n    x = 2\n    return x\n"
+    assert "\n\n" not in result
+
+    # Multi-byte UTF-8 line where byte offset differs from character length
+    src_emoji = "def foo():\n    msg = '🚀 rocket'\n    return msg\n"
+    # AST end_col_offset in UTF-8 bytes for "    msg = '🚀 rocket'" is 24 bytes
+    unit_emoji = {"file": "test.py", "start": 2, "end": 2, "start_col": 4, "end_col": 24}
+    span_emoji = compute_unit_spans(src_emoji, unit_emoji)
+    assert span_emoji.is_column_bounded is False
+    res_emoji = refactor_module_units(src_emoji, [(unit_emoji, "    msg = '🌟 star'\n")])
+    assert res_emoji == "def foo():\n    msg = '🌟 star'\n    return msg\n"
+    assert "\n\n" not in res_emoji
+
+    # Mid-line expression with trailing code on the same line MUST be column-bounded
+    src_mid = "x = 1; y = 2\n"
+    unit_mid = {"file": "test.py", "start": 1, "end": 1, "start_col": 0, "end_col": 5}
+    span_mid = compute_unit_spans(src_mid, unit_mid)
+    assert span_mid.is_column_bounded is True
+
+
+def test_col_offset_to_char_offset_ascii_fast_path_equivalence() -> None:
+    """Verifies that the ASCII fast-path in col_offset_to_char_offset matches UTF-8 decoding."""
+    from pydoppelgangerhunt.fixer import col_offset_to_char_offset
+
+    line = "def calculate_total(price, tax):"
+    assert line.isascii() is True
+
+    for c in [-5, 0, 3, 10, len(line), len(line) + 10]:
+        assert col_offset_to_char_offset(line, c) == max(0, min(len(line), c))
+
+
+def test_delegate_unit_in_plan_tier2_collision_raises_and_rolls_back(tmp_path: Path) -> None:
+    """Verifies that physical byte-span collisions in _delegate_unit_in_plan trigger transactional rollback."""
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text("def a():\n    v = 1\n    return v\n", encoding="utf-8")
+    f2.write_text("def b():\n    v = 1\n    return v\n", encoding="utf-8")
+
+    # Construct two units in f1 that overlap in byte spans but might slip through coarse line checks
+    u1 = {"file": str(f1), "name": "a", "start": 2, "end": 3, "kind": "function"}
+    u2 = {"file": str(f2), "name": "b", "start": 2, "end": 3, "kind": "function"}
+
+    # Valid clone pair works cleanly
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "_shared_a_b" in patch
+
+
+def test_render_file_patch_plan_tier2_collision_fallback() -> None:
+    """Verifies that _render_file_patch_plan safely recovers and filters when replacements collide."""
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _render_file_patch_plan
+
+    plan = _FilePatchPlan(
+        file_path=Path("test.py"),
+        rel_path="test.py",
+        orig_text="a = 1\nb = 2\nc = 3\n",
+        is_new_file=False,
+    )
+    u1 = {"file": "test.py", "start": 1, "end": 2}
+    u2 = {"file": "test.py", "start": 2, "end": 3}  # Collides physically on line 2
+    plan.replacements.append((u1, "# replaced 1\n"))
+    plan.replacements.append((u2, "# replaced 2\n"))
+
+    # _render_file_patch_plan should not raise ValueError; it should filter the collision and render a valid patch
+    diff = _render_file_patch_plan(plan, replace_clones=True)
+    assert "--- a/test.py" in diff
+    assert "# replaced 1" in diff
+    assert "# replaced 2" not in diff
+
+
+def test_generate_refactoring_patch_no_state_leakage_on_skipped_pair(tmp_path: Path) -> None:
+    """Verifies that helper names and comments are not leaked when clone extraction is skipped."""
+    f1 = tmp_path / "m1.py"
+    f2 = tmp_path / "m2.py"
+    # m1 imports m2 and m2 imports m1 (circular dependency)
+    f1.write_text("import m2\ndef fn():\n    return 42\n", encoding="utf-8")
+    f2.write_text("import m1\ndef fn():\n    return 42\n", encoding="utf-8")
+
+    u1 = {"file": str(f1), "name": "fn", "start": 2, "end": 3, "kind": "function"}
+    u2 = {"file": str(f2), "name": "fn", "start": 2, "end": 3, "kind": "function"}
+
+    # Circular import rejection should leave comments and plans clean without orphan helper registrations
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    # Patch should contain circular dependency rejection notice
+    assert "Circular import or unresolvable module path" in patch
+
+
+def test_package_reexport_col_offset_to_char_offset() -> None:
+    """Verifies that col_offset_to_char_offset is exported in the root pydoppelgangerhunt package."""
+    import pydoppelgangerhunt
+
+    assert hasattr(pydoppelgangerhunt, "col_offset_to_char_offset")
+    assert "col_offset_to_char_offset" in pydoppelgangerhunt.__all__
+    assert callable(pydoppelgangerhunt.col_offset_to_char_offset)
+
 
 
