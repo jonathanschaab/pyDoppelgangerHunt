@@ -92,6 +92,7 @@ from pydoppelgangerhunt.fixer.source import (
     replace_unit_in_source,
     resolve_unit_replacement,
     slice_source_by_token_range,
+    split_source_lines,
 )
 from pydoppelgangerhunt.fixer.synthesis import (
     TYPING_SYMBOLS,
@@ -133,5 +134,6 @@ __all__ = [
     "resolve_shared_module_file",
     "resolve_unit_replacement",
     "slice_source_by_token_range",
+    "split_source_lines",
     "synthesize_shared_helper_code",
 ]

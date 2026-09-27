@@ -159,6 +159,7 @@ from pydoppelgangerhunt import (
     compute_unit_char_offsets,
     compute_unit_replacement_span,
     refactor_module_units,
+    split_source_lines,
     generate_refactoring_patch,
 )
 ```
@@ -167,6 +168,7 @@ from pydoppelgangerhunt import (
 - **`compute_unit_spans(source_text, unit)`**: Calculates exact 0-indexed character and UTF-8 byte spans for an AST unit, returning a structured `UnitSpan(start_char, end_char, start_byte, end_byte, is_column_bounded, start_line, end_line, start_col_char, end_col_char)`.
 - **`compute_unit_byte_offsets(source_text, unit)`** & **`compute_unit_char_offsets(source_text, unit)`**: Fast convenience helpers returning `(start_byte, end_byte)` or `(start_char, end_char)` coordinate tuples.
 - **`compute_unit_replacement_span(source_text, unit, replacement_text, preserve_boundary_pragmas=True)`**: Resolves a replacement into a `(start_char, end_char, final_replacement_text)` tuple against the unmodified source text while preserving attached `# type: ignore` or `# noqa` boundary pragmas.
+- **`split_source_lines(source_text)`**: Splits source code into physical lines with line terminators preserved. Unlike `str.splitlines()`, it splits strictly on physical Python newline sequences (`\r\n`, `\r`, `\n`) and never on form feeds (`\f`) or vertical tabs (`\v`), matching Python grammar and AST coordinate semantics.
 - **`refactor_module_units(source_text, replacements)`**: Applies multiple non-overlapping unit replacements in strict **reverse source order** (descending byte offsets) using single-pass buffer slicing, guaranteeing that downstream text expansions or contractions never invalidate upstream coordinates.
 - **`generate_refactoring_patch(candidate_pairs, repo_root=..., replace_clones=...)`**: Synthesizes a multi-file unified diff (`git apply` compatible) with dependency cycle detection and per-pair transactional snapshot rollback.
 

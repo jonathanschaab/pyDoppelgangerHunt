@@ -56,6 +56,7 @@ from pydoppelgangerhunt.fixer.source import (
     is_valid_unit_coordinates,
     parse_unit_coord,
     resolve_unit_replacement,
+    split_source_lines,
 )
 from pydoppelgangerhunt.fixer.synthesis import (
     _extract_required_typing_imports,
@@ -381,7 +382,7 @@ def refactor_module_units(
 
     computed_entries: List[ReplacementItem] = []
     if lines is None:
-        lines = source_text.splitlines(keepends=True)
+        lines = split_source_lines(source_text)
     if line_char_offsets is None or line_byte_offsets is None:
         line_char_offsets, line_byte_offsets = compute_line_offsets(lines)
 
@@ -433,7 +434,7 @@ def _build_whole_method_delegation(
     has_yield: bool = False,
 ) -> str:
     """Builds a delegated method replacement body preserving method signature and docstring."""
-    lines = source_text.splitlines(keepends=True)
+    lines = split_source_lines(source_text)
     u_start = parse_unit_coord(unit, "start", default=1)
     u_end = parse_unit_coord(unit, "end", default=max(u_start, len(lines)))
 
@@ -714,7 +715,7 @@ class _FilePatchPlan:
         self.path = file_path
         self.rel_path = rel_path
         self.orig_text = orig_text
-        self.orig_lines = [] if is_new_file else orig_text.splitlines(keepends=True)
+        self.orig_lines = [] if is_new_file else split_source_lines(orig_text)
         self.is_new_file = is_new_file
         if is_new_file:
             self.line_char_offsets: Sequence[int] = [0]
@@ -771,7 +772,7 @@ def _compute_replacement_line_deltas(
         ValueError: If any unit contains invalid line coordinates or if candidate replacements overlap.
     """
     if lines is None:
-        lines = orig_text.splitlines(keepends=True)
+        lines = split_source_lines(orig_text)
     if line_char_offsets is None or line_byte_offsets is None:
         line_char_offsets, line_byte_offsets = compute_line_offsets(lines)
     computed: List[Tuple[ReplacementItem, int, int]] = []
@@ -856,7 +857,7 @@ def _adjust_line_for_replacements(
     if t_line <= 1 or not reps:
         return max(1, t_line)
     if lines is None:
-        lines = orig_text.splitlines(keepends=True)
+        lines = split_source_lines(orig_text)
     deltas = _compute_replacement_line_deltas(
         reps,
         orig_text,
@@ -1142,12 +1143,12 @@ def _render_file_patch_plan(
         ]
         sorted_methods = sorted(adjusted_methods, key=lambda m: m[0], reverse=True)
         for ins_line, h_code in sorted_methods:
-            c_lines = current_text.splitlines(keepends=True)
+            c_lines = split_source_lines(current_text)
             idx = max(0, ins_line - 1)
             h_lines = [ln + "\n" for ln in h_code.splitlines()] + ["\n"]
             current_text = "".join(c_lines[:idx] + h_lines + c_lines[idx:])
 
-    c_lines = current_text.splitlines(keepends=True)
+    c_lines = split_source_lines(current_text)
     deduped_imports = list(dict.fromkeys(plan.missing_imports))
     lines_with_imports = _insert_imports_into_module(c_lines, deduped_imports)
 

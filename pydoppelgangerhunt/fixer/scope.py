@@ -10,7 +10,7 @@ import textwrap
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.reporters import extract_unit_source_code
-from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
+from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines, split_source_lines
 
 logger = logging.getLogger(__name__)
 
@@ -1238,7 +1238,7 @@ def _inspect_unit_scope(
 
     all_receivers = inst_receivers | class_receivers
 
-    cand_lines = cand_text.splitlines(keepends=True)
+    cand_lines = split_source_lines(cand_text)
     is_sub = is_subroutine or (
         cand_text == dedented and isinstance(tree, ast.Module) and len(tree.body) > 1
     )

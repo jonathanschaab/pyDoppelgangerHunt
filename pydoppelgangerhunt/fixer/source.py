@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import io
 import logging
+import re
 import textwrap
 import tokenize
 import warnings
@@ -27,6 +28,7 @@ __all__ = [
     "replace_unit_in_source",
     "resolve_unit_replacement",
     "slice_source_by_token_range",
+    "split_source_lines",
 ]
 
 
@@ -331,6 +333,27 @@ def _insert_imports_into_module(
     return orig_lines[:insert_idx] + formatted + ["\n"] + orig_lines[insert_idx:]
 
 
+_PHYSICAL_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
+
+
+def split_source_lines(source_text: str) -> List[str]:
+    """Splits source code into physical lines preserving line endings.
+
+    Unlike str.splitlines(), this only splits on physical Python newline sequences
+    (\\r\\n, \\r, \\n) and never splits on form feeds (\\f / \\x0c) or vertical tabs (\\v),
+    matching Python grammar and AST line coordinate semantics.
+
+    Args:
+        source_text: The complete original Python source code.
+
+    Returns:
+        A list of physical line strings with line terminators preserved.
+    """
+    if not source_text:
+        return []
+    return [line for line in _PHYSICAL_LINE_RE.findall(source_text) if line]
+
+
 def slice_source_by_token_range(
     source_text: str,
     start_line: int,
@@ -352,7 +375,7 @@ def slice_source_by_token_range(
     """
     if not source_text:
         return ""
-    lines = source_text.splitlines(keepends=True)
+    lines = split_source_lines(source_text)
     if not lines or start_line < 1 or start_line > len(lines) or start_line > end_line:
         return ""
 
@@ -409,7 +432,7 @@ def extract_unit_comments_and_pragmas(
     if not source_text:
         return []
 
-    lines = source_text.splitlines(keepends=True)
+    lines = split_source_lines(source_text)
     min_check_line = start_line
     if include_leading and start_line > 1:
         curr = start_line - 1
@@ -600,7 +623,7 @@ def compute_unit_spans(
         raise TypeError(f"Unit must be a dictionary, got {type(unit).__name__}")
 
     if lines is None:
-        lines = source_text.splitlines(keepends=True)
+        lines = split_source_lines(source_text)
     if not lines:
         return UnitSpan(0, 0, 0, 0, False, 1, 1, 0, 0)
 
@@ -776,7 +799,7 @@ def resolve_unit_replacement(
         raise TypeError(f"Unit must be a dictionary, got {type(unit).__name__}")
 
     if lines is None:
-        lines = source_text.splitlines(keepends=True)
+        lines = split_source_lines(source_text)
     if not lines:
         return ReplacementItem(
             unit=unit,
@@ -784,7 +807,7 @@ def resolve_unit_replacement(
             end_char=0,
             start_byte=0,
             end_byte=0,
-            final_rep=replacement_text,
+            final_rep="",
             consumes_line_suffix=False,
             order_index=order_index,
         )

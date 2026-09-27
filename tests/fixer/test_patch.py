@@ -7219,3 +7219,87 @@ def test_apply_line_deltas_edge_cases() -> None:
     assert _apply_line_deltas(10, deltas) == 11
     # Target line 15: after 3, 7, and 12 (+2 - 1 + 4 = +5)
     assert _apply_line_deltas(15, deltas) == 20
+
+
+def test_split_source_lines_physical_newlines_and_form_feed() -> None:
+    """Verifies that split_source_lines splits strictly on physical newlines and preserves form-feed characters."""
+    import io
+    from pydoppelgangerhunt.fixer import split_source_lines
+
+    assert split_source_lines("") == []
+    assert split_source_lines("x = 1") == ["x = 1"]
+    assert split_source_lines("x = 1\n") == ["x = 1\n"]
+    assert split_source_lines("x = 1\r\ny = 2\rz = 3\n") == ["x = 1\r\n", "y = 2\r", "z = 3\n"]
+    assert split_source_lines("\n\n") == ["\n", "\n"]
+
+    # Form-feed (\f) and vertical tab (\v) are kept within the line, matching Python AST
+    ff_code = "def fn():\n\x0c    x = 10\n    return x\n"
+    lines = split_source_lines(ff_code)
+    assert len(lines) == 3
+    assert lines[0] == "def fn():\n"
+    assert lines[1] == "\x0c    x = 10\n"
+    assert lines[2] == "    return x\n"
+
+    # Parity with io.StringIO readlines
+    for s in ["", "a", "a\n", "a\r\nb\nc", "def fn():\n\x0c    pass\n"]:
+        assert split_source_lines(s) == io.StringIO(s, newline="").readlines()
+
+
+def test_refactor_module_units_form_feed_line_replacement() -> None:
+    """Verifies that refactor_module_units replaces whole statements with form-feed indentation cleanly."""
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    source_with_ff = "def fn():\n\x0c    x = 10\n    return x\n"
+    unit_stmt = {"file": "ff_test.py", "start": 2, "end": 2, "start_col": 5, "end_col": 11}
+    # Whole-statement replacement must replace the entire line including \f, not just \f
+    res = refactor_module_units(source_with_ff, [(unit_stmt, "    x = 20\n")])
+    assert res == "def fn():\n    x = 20\n    return x\n"
+
+    # Sub-expression replacement inside a form-feed line
+    source_ff_expr = "def fn():\n\x0c    flag = x = 10\n    return x\n"
+    # Column offset 12 is 'x = 10' (\f is 1 byte, 4 spaces is 4 bytes, 'flag = ' is 7 bytes: 1+4+7=12)
+    unit_sub = {"file": "ff_test.py", "start": 2, "end": 2, "start_col": 12, "end_col": 18}
+    res_sub = refactor_module_units(source_ff_expr, [(unit_sub, "y = 99")])
+    assert res_sub == "def fn():\n\x0c    flag = y = 99\n    return x\n"
+
+
+def test_empty_source_buffer_replacement_is_noop() -> None:
+    """Verifies that replacements targeting an empty source buffer return empty string without inserting text."""
+    from pydoppelgangerhunt.fixer import (
+        compute_unit_replacement_span,
+        refactor_module_units,
+        replace_unit_in_source,
+        resolve_unit_replacement,
+    )
+
+    unit = {"file": "empty.py", "start": 1, "end": 1}
+
+    # resolve_unit_replacement
+    item = resolve_unit_replacement("", unit, "x = 1\n")
+    assert item.final_rep == ""
+    assert item.start_char == 0
+    assert item.end_char == 0
+
+    # compute_unit_replacement_span
+    start_c, end_c, final_rep = compute_unit_replacement_span("", unit, "x = 1\n")
+    assert (start_c, end_c, final_rep) == (0, 0, "")
+
+    # replace_unit_in_source
+    assert replace_unit_in_source("", unit, "x = 1\n") == ""
+
+    # refactor_module_units
+    assert refactor_module_units("", [(unit, "x = 1\n")]) == ""
+
+
+def test_package_reexport_split_source_lines() -> None:
+    """Verifies that split_source_lines is re-exported from package root and fixer subpackages."""
+    import pydoppelgangerhunt as pdgh
+    import pydoppelgangerhunt.fixer as pdgh_fixer
+
+    assert hasattr(pdgh, "split_source_lines")
+    assert "split_source_lines" in pdgh.__all__
+    assert callable(pdgh.split_source_lines)
+
+    assert hasattr(pdgh_fixer, "split_source_lines")
+    assert "split_source_lines" in pdgh_fixer.__all__
+    assert callable(pdgh_fixer.split_source_lines)

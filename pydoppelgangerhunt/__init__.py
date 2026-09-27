@@ -77,6 +77,7 @@ from pydoppelgangerhunt.fixer import (
     replace_unit_in_source,
     resolve_unit_replacement,
     slice_source_by_token_range,
+    split_source_lines,
     synthesize_shared_helper_code,
 )
 from pydoppelgangerhunt.git_diff import (
@@ -217,6 +218,7 @@ __all__ = [
     "is_valid_unit_coordinates",
     "parse_unit_coord",
     "refactor_module_units",
+    "split_source_lines",
     "generate_refactoring_patch",
     "compute_unit_structural_hash",
     "extract_unit_namespace",

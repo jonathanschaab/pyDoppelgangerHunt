@@ -13,7 +13,7 @@ from pydoppelgangerhunt.parser import is_decorator_named
 from pydoppelgangerhunt.fixer.scope import (
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
 )
-from pydoppelgangerhunt.fixer.source import parse_unit_coord
+from pydoppelgangerhunt.fixer.source import parse_unit_coord, split_source_lines
 
 
 def _find_innermost_enclosing_node(
@@ -112,7 +112,7 @@ def find_enclosing_class(
     if not meta:
         return None
 
-    lines = source_text.splitlines(keepends=True)
+    lines = split_source_lines(source_text)
     c_start = meta["start"]
     cls_line = lines[c_start - 1] if 1 <= c_start <= len(lines) else ""
     indent = cls_line[: len(cls_line) - len(cls_line.lstrip())]
