@@ -6,7 +6,7 @@ import ast
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Tuple
 from unittest import mock
 
 import pytest
@@ -6356,34 +6356,54 @@ def test_is_valid_unit_coordinates_scenarios() -> None:
     import pydoppelgangerhunt as pdgh
     import pydoppelgangerhunt.fixer as pdgh_fixer
 
-    assert is_valid_patch is is_valid_unit_coordinates is is_valid_pub is _is_valid_unit_coordinates
-    assert parse_unit_coord_patch is parse_unit_coord is parse_unit_coord_pub is _parse_unit_coord
-    assert compute_line_offsets_patch is compute_line_offsets is compute_line_offsets_pub is _compute_line_offsets
-    assert pdgh_fixer.is_valid_unit_coordinates is is_valid_unit_coordinates
-    assert pdgh_fixer.parse_unit_coord is parse_unit_coord
-    assert pdgh_fixer.compute_line_offsets is compute_line_offsets
-    assert pdgh.is_valid_unit_coordinates is is_valid_unit_coordinates
-    assert pdgh.parse_unit_coord is parse_unit_coord
-    assert pdgh.compute_line_offsets is compute_line_offsets
+    # Test behavioural equivalence of public functions, package exports, and backward-compatible aliases
+    test_cases: List[Any] = [
+        None,
+        "string_unit",
+        ["list_unit"],
+        {},
+        {"start": 1, "end": 5},
+        {"start": "1", "end": "5"},
+        {"start": "not_an_int"},
+        {"start": 1, "end": [2]},
+        {"start": 1, "end": 5, "start_col": "invalid"},
+        {"start": 1, "end": 5, "end_col": {}},
+    ]
+    for tc in test_cases:
+        expected = is_valid_unit_coordinates(tc)
+        assert is_valid_patch(tc) == expected
+        assert is_valid_pub(tc) == expected
+        assert _is_valid_unit_coordinates(tc) == expected
+        assert pdgh_fixer.is_valid_unit_coordinates(tc) == expected
+        assert pdgh.is_valid_unit_coordinates(tc) == expected
 
-    assert is_valid_unit_coordinates(None) is False
-    assert is_valid_unit_coordinates("string_unit") is False
-    assert is_valid_unit_coordinates(["list_unit"]) is False
-    assert is_valid_unit_coordinates({}) is True
-    assert is_valid_unit_coordinates({"start": 1, "end": 5}) is True
-    assert is_valid_unit_coordinates({"start": "1", "end": "5"}) is True
-    assert is_valid_unit_coordinates({"start": "not_an_int"}) is False
-    assert is_valid_unit_coordinates({"start": 1, "end": [2]}) is False
-    assert is_valid_unit_coordinates({"start": 1, "end": 5, "start_col": "invalid"}) is False
-    assert is_valid_unit_coordinates({"start": 1, "end": 5, "end_col": {}}) is False
+    coord_cases: List[Tuple[Dict[str, Any], str, int, int]] = [
+        ({"start": 10}, "start", 1, 10),
+        ({"start": "15"}, "start", 1, 15),
+        ({}, "start", 42, 42),
+        ({"end": 99}, "end", 0, 99),
+    ]
+    for u_data, key, def_val, expected_val in coord_cases:
+        assert parse_unit_coord(u_data, key, default=def_val) == expected_val
+        assert parse_unit_coord_patch(u_data, key, default=def_val) == expected_val
+        assert parse_unit_coord_pub(u_data, key, default=def_val) == expected_val
+        assert _parse_unit_coord(u_data, key, default=def_val) == expected_val
+        assert pdgh_fixer.parse_unit_coord(u_data, key, default=def_val) == expected_val
+        assert pdgh.parse_unit_coord(u_data, key, default=def_val) == expected_val
 
-    assert parse_unit_coord({"start": 10}, "start") == 10
-    assert parse_unit_coord({"start": "15"}, "start") == 15
-    assert parse_unit_coord({}, "start", default=42) == 42
-
-    c_offs, b_offs = compute_line_offsets(["hello\n", "world 🚀\n"])
-    assert c_offs == [0, 6, 14]
-    assert b_offs == [0, 6, 17]
+    line_cases: List[Tuple[List[str], Tuple[List[int], List[int]]]] = [
+        (["hello\n", "world 🚀\n"], ([0, 6, 14], [0, 6, 17])),
+        ([], ([0], [0])),
+        (["line1\n", "line2\n"], ([0, 6, 12], [0, 6, 12])),
+    ]
+    for lines_input, (exp_c, exp_b) in line_cases:
+        res = compute_line_offsets(lines_input)
+        assert res == (exp_c, exp_b)
+        assert compute_line_offsets_patch(lines_input) == (exp_c, exp_b)
+        assert compute_line_offsets_pub(lines_input) == (exp_c, exp_b)
+        assert _compute_line_offsets(lines_input) == (exp_c, exp_b)
+        assert pdgh_fixer.compute_line_offsets(lines_input) == (exp_c, exp_b)
+        assert pdgh.compute_line_offsets(lines_input) == (exp_c, exp_b)
 
 
 def test_compute_replacement_line_deltas_raises_on_overlapping_units() -> None:

@@ -70,6 +70,48 @@ _is_valid_unit_coordinates = is_valid_unit_coordinates
 _parse_unit_coord = parse_unit_coord
 
 
+def _check_same_line_overlap(
+    sc1: Optional[int],
+    ec1: Optional[int],
+    sc2: Optional[int],
+    ec2: Optional[int],
+) -> bool:
+    """Case 1: Half-open column interval intersection on the same single line."""
+    if sc1 is not None and ec1 is not None and sc2 is not None and ec2 is not None:
+        if sc1 <= ec1 and sc2 <= ec2:
+            return max(sc1, sc2) < min(ec1, ec2)
+        return False
+    return True
+
+
+def _check_sequential_touch(
+    prior_ec: Optional[int],
+    next_sc: Optional[int],
+    next_is_single: bool,
+    next_ec: Optional[int],
+) -> bool:
+    """Cases 2 & 3: Sequential touch where one unit ends on the line the other begins."""
+    if prior_ec is not None and next_sc is not None:
+        if next_is_single and next_ec is not None and next_sc > next_ec:
+            return False
+        return next_sc < prior_ec
+    return True
+
+
+def _check_boundary_sharing(
+    is_start: bool,
+    multi_col: Optional[int],
+    single_sc: Optional[int],
+    single_ec: Optional[int],
+) -> bool:
+    """Case 4: Multi-line and single-line units sharing a start or end boundary line."""
+    if multi_col is None or single_sc is None or single_ec is None:
+        return True
+    if single_sc > single_ec:
+        return False
+    return (multi_col < single_ec) if is_start else (single_sc < multi_col)
+
+
 def check_units_overlap(
     u1: Dict[str, Any],
     u2: Dict[str, Any],
@@ -95,11 +137,14 @@ def check_units_overlap(
         intervals overlap; False otherwise.
     """
     if not isinstance(u1, dict) or not isinstance(u2, dict):
-        raise TypeError(f"Units must be dictionaries, got {type(u1).__name__} and {type(u2).__name__}")
+        raise TypeError(
+            f"Units must be dictionaries, got {type(u1).__name__} and {type(u2).__name__}"
+        )
     f1 = normalize_path_string(str(u1.get("file") or ""))
     f2 = normalize_path_string(str(u2.get("file") or ""))
     if not f1 or not f2 or not _is_same_file_path(f1, f2, repo_root=repo_root):
         return False
+
     def _parse_lines(u: Dict[str, Any], label: str, file_path: str) -> Tuple[int, int]:
         try:
             s = _parse_unit_coord(u, "start", default=1)
@@ -110,7 +155,9 @@ def check_units_overlap(
             # to ensure no physical buffer contents are modified.
             return (e, s) if s > e else (s, e)
         except (ValueError, TypeError) as err:
-            raise ValueError(f"Malformed unit: invalid line boundary in {label} ({file_path}): {err}") from err
+            raise ValueError(
+                f"Malformed unit: invalid line boundary in {label} ({file_path}): {err}"
+            ) from err
 
     start1, end1 = _parse_lines(u1, "u1", f1)
     start2, end2 = _parse_lines(u2, "u2", f2)
@@ -124,41 +171,43 @@ def check_units_overlap(
         try:
             return int(val)
         except (ValueError, TypeError) as err:
-            raise ValueError(f"Malformed unit: invalid column offset '{col_name}'={val!r} in {file_path}") from err
+            raise ValueError(
+                f"Malformed unit: invalid column offset '{col_name}'={val!r} in {file_path}"
+            ) from err
 
-    sc1, ec1 = _parse_col(u1.get("start_col"), "start_col", f1), _parse_col(u1.get("end_col"), "end_col", f1)
-    sc2, ec2 = _parse_col(u2.get("start_col"), "start_col", f2), _parse_col(u2.get("end_col"), "end_col", f2)
+    sc1 = _parse_col(u1.get("start_col"), "start_col", f1)
+    ec1 = _parse_col(u1.get("end_col"), "end_col", f1)
+    sc2 = _parse_col(u2.get("start_col"), "start_col", f2)
+    ec2 = _parse_col(u2.get("end_col"), "end_col", f2)
+
+    # -------------------------------------------------------------------------
+    # Case -> Expected Behaviour Mapping:
+    # -------------------------------------------------------------------------
+    # Case 1: Same line (start1 == end1 == start2 == end2)
+    #   -> Overlap if half-open column intervals intersect: max(sc1, sc2) < min(ec1, ec2).
+    # Case 2: Sequential touch (start1 < start2 and end1 == start2)
+    #   -> u1 ends on the line u2 begins: overlap if sc2 < ec1.
+    # Case 3: Sequential touch (start2 < start1 and end2 == start1)
+    #   -> u2 ends on the line u1 begins: overlap if sc1 < ec2.
+    # Case 4: Boundary line sharing between a multi-line unit and a single-line unit:
+    #   -> Shared start line: overlap if single unit ends after multi begins (multi_sc < single_ec).
+    #   -> Shared end line: overlap if single unit starts before multi ends (single_sc < multi_ec).
+    #   -> Multi-line vs. multi-line sharing a boundary line: conservatively overlap (True).
+    # Case 5: Multi-line interior overlap (units span multiple shared lines)
+    #   -> Units overlap across interior lines: unconditionally conflict (True).
+    # -------------------------------------------------------------------------
 
     # Case 1: Both units reside on the exact same single line
     if start1 == end1 == start2 == end2:
-        if sc1 is not None and ec1 is not None and sc2 is not None and ec2 is not None:
-            if sc1 <= ec1 and sc2 <= ec2:
-                return max(sc1, sc2) < min(ec1, ec2)
-            return False
-        return True
+        return _check_same_line_overlap(sc1, ec1, sc2, ec2)
 
-    # Case 2 & 3: Sequential boundary touch (one unit ends where the other begins)
-    if (start1 < start2 and end1 == start2) or (start2 < start1 and end2 == start1):
-        prior_ec, next_sc = (ec1, sc2) if start1 < start2 else (ec2, sc1)
-        next_is_single = (start2 == end2) if start1 < start2 else (start1 == end1)
-        next_ec = ec2 if start1 < start2 else ec1
-        if prior_ec is not None and next_sc is not None:
-            if next_is_single and next_ec is not None and next_sc > next_ec:
-                return False
-            return next_sc < prior_ec
-        return True
+    # Case 2: Sequential boundary touch (u1 ends where u2 begins)
+    if start1 < start2 and end1 == start2:
+        return _check_sequential_touch(ec1, sc2, start2 == end2, ec2)
 
-    def _check_boundary_sharing(
-        is_start: bool,
-        multi_col: Optional[int],
-        single_sc: Optional[int],
-        single_ec: Optional[int],
-    ) -> bool:
-        if multi_col is None or single_sc is None or single_ec is None:
-            return True
-        if single_sc > single_ec:
-            return False
-        return (multi_col < single_ec) if is_start else (single_sc < multi_col)
+    # Case 3: Sequential boundary touch (u2 ends where u1 begins)
+    if start2 < start1 and end2 == start1:
+        return _check_sequential_touch(ec2, sc1, start1 == end1, ec1)
 
     # Case 4: Multi-line units sharing boundary lines at start or end
     if start1 == start2 or end1 == end2:
@@ -304,7 +353,7 @@ def refactor_module_units(
                     f"'{n2}' ({s2}-{e2}) in {f1}."
                 )
 
-    # Note: order_index provides deterministic tie-breaking for stability among non-overlapping units.
+    # Note: order_index is only for stability among non-overlapping units
     sorted_replacements = sorted(
         computed_entries,
         key=lambda item: (item.start_byte, item.end_byte, item.order_index),
