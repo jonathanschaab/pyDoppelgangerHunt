@@ -946,11 +946,15 @@ def resolve_unit_replacement(
             consumes_line_suffix = True
             has_nl = suffix_line.endswith(("\r", "\n")) or final_rep.endswith(("\r", "\n"))
             final_rep = final_rep.rstrip("\r\n") + pragma_suffix + (nl if has_nl else "")
-            end_char = line_char_offsets[end] if end < len(lines) else len(source_text)
+            end_char = (
+                line_char_offsets[end]
+                if end < len(line_char_offsets)
+                else line_char_offsets[-1]
+            )
             end_byte = (
                 line_byte_offsets[end]
-                if end < len(lines)
-                else len(source_text.encode("utf-8", errors="surrogatepass"))
+                if end < len(line_byte_offsets)
+                else line_byte_offsets[-1]
             )
         elif missing_pragmas:
             # Non-comment code or existing trailing comments follow on the same line:
@@ -962,11 +966,15 @@ def resolve_unit_replacement(
                 suffix_line.rstrip("\r\n") + pragma_suffix + (nl if has_suffix_nl else "")
             )
             final_rep = final_rep.rstrip("\r\n") + final_suffix
-            end_char = line_char_offsets[end] if end < len(lines) else len(source_text)
+            end_char = (
+                line_char_offsets[end]
+                if end < len(line_char_offsets)
+                else line_char_offsets[-1]
+            )
             end_byte = (
                 line_byte_offsets[end]
-                if end < len(lines)
-                else len(source_text.encode("utf-8", errors="surrogatepass"))
+                if end < len(line_byte_offsets)
+                else line_byte_offsets[-1]
             )
 
         return ReplacementItem(

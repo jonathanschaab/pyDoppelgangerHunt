@@ -1052,7 +1052,11 @@ def _render_file_patch_plan(
         formatted_imports = [imp.rstrip("\r\n") + "\n" for imp in ordered_imports]
         new_h_lines: List[str] = []
         for h_code in plan.module_helpers:
-            new_h_lines.extend(["\n"] + [ln + "\n" for ln in h_code.splitlines()] + ["\n"])
+            new_h_lines.extend(
+                ["\n"]
+                + [ln.rstrip("\r\n") + "\n" for ln in split_source_lines(h_code)]
+                + ["\n"]
+            )
         new_lines: List[str] = []
         if formatted_imports:
             new_lines.extend(formatted_imports + ["\n"])
@@ -1150,7 +1154,7 @@ def _render_file_patch_plan(
         for ins_line, h_code in sorted_methods:
             c_lines = split_source_lines(current_text)
             idx = max(0, ins_line - 1)
-            h_lines = [ln + nl for ln in h_code.splitlines()] + [nl]
+            h_lines = [ln.rstrip("\r\n") + nl for ln in split_source_lines(h_code)] + [nl]
             current_text = "".join(c_lines[:idx] + h_lines + c_lines[idx:])
 
     c_lines = split_source_lines(current_text)
@@ -1161,7 +1165,11 @@ def _render_file_patch_plan(
         ins_idx = _find_module_helper_insertion_index(lines_with_imports)
         all_h_lines: List[str] = []
         for h_code in plan.module_helpers:
-            all_h_lines.extend([nl] + [ln + nl for ln in h_code.splitlines()] + [nl])
+            all_h_lines.extend(
+                [nl]
+                + [ln.rstrip("\r\n") + nl for ln in split_source_lines(h_code)]
+                + [nl]
+            )
         modified_lines = lines_with_imports[:ins_idx] + all_h_lines + lines_with_imports[ins_idx:]
     else:
         modified_lines = lines_with_imports
@@ -1416,7 +1424,8 @@ def _canonicalize_helper_relative_imports(
         ),
         reverse=True,
     )
-    lines = helper_code.splitlines()
+    nl = detect_line_ending(helper_code)
+    lines = [ln.rstrip("\r\n") for ln in split_source_lines(helper_code)]
 
     for node in import_nodes:
         resolved_targets: Set[str] = set()
@@ -1468,9 +1477,9 @@ def _canonicalize_helper_relative_imports(
             new_stmt = f"{indent}from {resolved} import {names_str}{trailing_comment}"
             lines[start_idx:end_idx] = [new_stmt]
 
-    result = "\n".join(lines)
-    if helper_code.endswith("\n") and not result.endswith("\n"):
-        result += "\n"
+    result = nl.join(lines)
+    if helper_code.endswith(("\r", "\n")) and not result.endswith(("\r", "\n")):
+        result += nl
     return result
 
 

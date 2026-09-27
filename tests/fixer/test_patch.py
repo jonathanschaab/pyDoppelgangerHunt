@@ -7583,3 +7583,91 @@ def test_refactor_module_units_boundary_touching_zero_width_insertion_order() ->
     assert res_end == "abXYZ_INSfghij\n"
 
 
+def test_render_file_patch_plan_form_feed_in_helpers() -> None:
+    """Verifies that _render_file_patch_plan preserves form feeds in method and module helpers."""
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _render_file_patch_plan
+
+    plan = _FilePatchPlan(
+        file_path=Path("test.py"),
+        rel_path="test.py",
+        orig_text="class A:\n    pass\n",
+        is_new_file=False,
+    )
+    plan.method_helpers.append((2, "    def helper(self):\x0c        return 1\n"))
+    plan.module_helpers.append("def top_helper():\x0c    return 2\n")
+
+    diff = _render_file_patch_plan(plan, replace_clones=True)
+    assert "+    def helper(self):\x0c        return 1" in diff
+    assert "+def top_helper():\x0c    return 2" in diff
+
+    new_plan = _FilePatchPlan(
+        file_path=Path("new.py"),
+        rel_path="new.py",
+        orig_text="",
+        is_new_file=True,
+    )
+    new_plan.module_helpers.append("def new_helper():\x0c    return 3\n")
+    diff_new = _render_file_patch_plan(new_plan, replace_clones=True)
+    assert "+def new_helper():\x0c    return 3" in diff_new
+
+
+def test_resolve_unit_replacement_last_line_offset_indexing() -> None:
+    """Verifies resolve_unit_replacement on the last line uses offset arrays without string re-encoding."""
+    from pydoppelgangerhunt.fixer import resolve_unit_replacement
+    from pydoppelgangerhunt.fixer.source import _compute_line_offsets, split_source_lines
+
+    # Case 1: Clean line end with replacement ending in newline
+    code1 = "x = 1\ny = 2 + 3\n"
+    lines1 = split_source_lines(code1)
+    char_offs1, byte_offs1 = _compute_line_offsets(lines1)
+    unit1 = {"file": "test.py", "start": 2, "end": 2, "start_col": 4, "end_col": 9}
+    item1 = resolve_unit_replacement(
+        code1,
+        unit1,
+        "42\n",
+        preserve_boundary_pragmas=True,
+        lines=lines1,
+        line_char_offsets=char_offs1,
+        line_byte_offsets=byte_offs1,
+    )
+    assert item1.consumes_line_suffix is True
+    assert item1.end_char == char_offs1[2]
+    assert item1.end_byte == byte_offs1[2]
+    assert item1.final_rep == "42\n"
+
+    # Case 2: Unclean suffix with missing pragmas appending to line end
+    code2 = "a = 1  # type: ignore\ny = (2 + 3) * 5\n"
+    lines2 = split_source_lines(code2)
+    char_offs2, byte_offs2 = _compute_line_offsets(lines2)
+    unit2 = {"file": "test.py", "start": 1, "end": 2, "start_col": 0, "end_col": 11}
+    item2 = resolve_unit_replacement(
+        code2,
+        unit2,
+        "res = 42",
+        preserve_boundary_pragmas=True,
+        lines=lines2,
+        line_char_offsets=char_offs2,
+        line_byte_offsets=byte_offs2,
+    )
+    assert item2.consumes_line_suffix is True
+    assert item2.end_char == char_offs2[2]
+    assert item2.end_byte == byte_offs2[2]
+    assert item2.final_rep == "res = 42 * 5  # type: ignore\n"
+
+
+def test_canonicalize_helper_relative_imports_form_feed_and_crlf() -> None:
+    """Verifies that _canonicalize_helper_relative_imports preserves form feeds and line endings."""
+    from pydoppelgangerhunt.fixer.patch import _canonicalize_helper_relative_imports
+
+    helper_code = "\x0cdef foo():\r\n    from .bar import baz\r\n    x = 1\x0c + 2\r\n    return baz()\r\n"
+    res = _canonicalize_helper_relative_imports(
+        helper_code,
+        [("pkg.sub", False)],
+    )
+    assert "\x0c" in res
+    assert "from pkg.bar import baz" in res
+    assert "\r\n" in res
+    assert "x = 1\x0c + 2" in res
+
+
+
