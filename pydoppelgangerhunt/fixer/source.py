@@ -22,6 +22,8 @@ __all__ = [
     "compute_unit_char_offsets",
     "compute_unit_replacement_span",
     "compute_unit_spans",
+    "count_physical_newlines",
+    "detect_line_ending",
     "extract_unit_comments_and_pragmas",
     "is_valid_unit_coordinates",
     "parse_unit_coord",
@@ -329,12 +331,61 @@ def _insert_imports_into_module(
             while insert_idx < len(orig_lines) and not orig_lines[insert_idx].strip():
                 insert_idx += 1
 
-    nl = "\r\n" if orig_lines and any(l.endswith("\r\n") for l in orig_lines[:10]) else "\n"
+    nl = detect_line_ending(*orig_lines[:10])
     formatted = [imp.rstrip("\r\n") + nl for imp in deduped_imports]
     return orig_lines[:insert_idx] + formatted + [nl] + orig_lines[insert_idx:]
 
 
 _PHYSICAL_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
+_PHYSICAL_NEWLINE_RE = re.compile(r"\r\n|\r|\n")
+
+
+def count_physical_newlines(text: str) -> int:
+    """Counts the number of physical line terminators (\\r\\n, \\r, or \\n) in text.
+
+    Args:
+        text: Input string to scan for line terminators.
+
+    Returns:
+        Total count of physical line endings.
+    """
+    if not text:
+        return 0
+    if "\r" not in text:
+        return text.count("\n")
+    return sum(1 for _ in _PHYSICAL_NEWLINE_RE.finditer(text))
+
+
+def detect_line_ending(*sources: Optional[str]) -> str:
+    """Detects the predominant physical newline terminator (\\r\\n, \\r, or \\n) across strings.
+
+    Inspects line endings in priority order: CRLF (\\r\\n), lone CR (\\r), or LF (\\n).
+
+    Args:
+        *sources: One or more text strings or line sequences to probe.
+
+    Returns:
+        '\\r\\n' if CRLF is detected, '\\r' if lone CR is detected, otherwise '\\n'.
+    """
+    valid_sources = [s for s in sources if s]
+    if not valid_sources:
+        return "\n"
+    for s in valid_sources:
+        if s.endswith("\r\n"):
+            return "\r\n"
+    for s in valid_sources:
+        if s.endswith("\r"):
+            return "\r"
+    for s in valid_sources:
+        if s.endswith("\n"):
+            return "\n"
+    for s in valid_sources:
+        sample = s[:1024]
+        if "\r\n" in sample:
+            return "\r\n"
+        if "\r" in sample:
+            return "\r"
+    return "\n"
 
 
 def split_source_lines(source_text: str) -> List[str]:
@@ -875,13 +926,7 @@ def resolve_unit_replacement(
     if is_column_bounded:
         missing_pragmas = [p for p in attached_pragmas if p not in suffix_line]
         pragma_suffix = ("  " + "  ".join(missing_pragmas)) if missing_pragmas else ""
-        nl = (
-            "\r\n"
-            if suffix_line.endswith("\r\n")
-            or final_rep.endswith("\r\n")
-            or source_text.endswith("\r\n")
-            else "\n"
-        )
+        nl = detect_line_ending(suffix_line, final_rep, source_text)
         if not suffix_stripped and (missing_pragmas or final_rep.endswith(("\r", "\n"))):
             # Clean line end: consume line suffix cleanly to prevent duplicate \n
             consumes_line_suffix = True
@@ -927,17 +972,13 @@ def resolve_unit_replacement(
         rep_lines = final_rep.splitlines(keepends=True)
         if rep_lines:
             last_rep = rep_lines[-1]
-            nl = (
-                "\r\n"
-                if last_rep.endswith("\r\n") or source_text.endswith("\r\n")
-                else "\n"
-            )
+            nl = detect_line_ending(last_rep, source_text)
             has_nl = last_rep.endswith(("\r", "\n"))
             rep_lines[-1] = last_rep.rstrip("\r\n") + pragma_suffix + (nl if has_nl else "")
             final_rep = "".join(rep_lines)
 
     if final_rep and not final_rep.endswith(("\r", "\n")):
-        nl = "\r\n" if source_text.endswith("\r\n") else "\n"
+        nl = detect_line_ending(source_text)
         final_rep += nl
 
     return ReplacementItem(

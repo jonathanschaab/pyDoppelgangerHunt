@@ -7391,3 +7391,95 @@ def test_split_source_lines_finditer_avoid_intermediate_allocation() -> None:
         assert result == expected, f"Mismatch on {case!r}: {result!r} != {expected!r}"
         assert all(isinstance(ln, str) and ln for ln in result)
 
+
+def test_count_physical_newlines_and_detect_line_ending() -> None:
+    """Verifies physical newline counting and line ending detection across LF, CRLF, and lone CR."""
+    from pydoppelgangerhunt.fixer import count_physical_newlines, detect_line_ending
+
+    # count_physical_newlines
+    assert count_physical_newlines("") == 0
+    assert count_physical_newlines("no newline") == 0
+    assert count_physical_newlines("a\nb\n") == 2
+    assert count_physical_newlines("a\r\nb\r\n") == 2
+    assert count_physical_newlines("a\rb\r") == 2
+    assert count_physical_newlines("a\r\nb\nc\rd") == 3
+
+    # detect_line_ending
+    assert detect_line_ending() == "\n"
+    assert detect_line_ending("") == "\n"
+    assert detect_line_ending("x = 1\n") == "\n"
+    assert detect_line_ending("x = 1\r\n") == "\r\n"
+    assert detect_line_ending("x = 1\r") == "\r"
+    assert detect_line_ending("x = 1", "y = 2\r\n") == "\r\n"
+    assert detect_line_ending("x = 1", "y = 2\r") == "\r"
+
+
+def test_compute_replacement_line_deltas_lone_cr_source() -> None:
+    """Verifies that _compute_replacement_line_deltas accurately computes line delta for lone-CR sources."""
+    from pydoppelgangerhunt.fixer.patch import _compute_replacement_line_deltas
+
+    # 3 lines of CR-only source
+    src_cr = "def foo():\r    x = 1\r    return x\r"
+    # Replace lines 1-2 with 1 line -> delta must be -1
+    u = {"file": "cr_test.py", "start": 1, "end": 2}
+    deltas = _compute_replacement_line_deltas([(u, "def foo():\r")], src_cr)
+    assert deltas == [(2, -1)]
+
+
+def test_resolve_unit_replacement_lone_cr_source() -> None:
+    """Verifies that resolve_unit_replacement and replace_unit_in_source preserve lone-CR line terminators."""
+    from pydoppelgangerhunt.fixer import replace_unit_in_source
+
+    # Column-bounded replacement consuming line suffix with boundary pragma on CR source
+    src_cr = "x = calc()  # type: ignore\ry = 1\r"
+    unit_col = {"file": "cr_test.py", "start": 1, "end": 1, "start_col": 0, "end_col": 10}
+    res_col = replace_unit_in_source(src_cr, unit_col, "x = new_calc()")
+    # Must preserve \r before y = 1\r without introducing \n
+    assert res_col == "x = new_calc()  # type: ignore\ry = 1\r"
+    assert "\n" not in res_col
+
+    # Whole-line replacement on CR source
+    src_cr_line = "x = 1\ry = 2\r"
+    unit_line = {"file": "cr_test.py", "start": 1, "end": 1}
+    res_line = replace_unit_in_source(src_cr_line, unit_line, "x = 10")
+    assert res_line == "x = 10\ry = 2\r"
+    assert "\n" not in res_line
+
+
+def test_render_file_patch_plan_lone_cr_helpers() -> None:
+    """Verifies that _render_file_patch_plan preserves lone-CR line terminators when splicing helpers."""
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _render_file_patch_plan
+
+    cr_source = "class MyClass:\r    def target(self):\r        return 1\r"
+    plan = _FilePatchPlan(
+        file_path=Path("cr_sample.py"),
+        rel_path="cr_sample.py",
+        orig_text=cr_source,
+        is_new_file=False,
+    )
+    plan.method_helpers.append((2, "    def helper(self):\r        return 42"))
+    plan.module_helpers.append("def global_helper():\r    return 99")
+
+    diff = _render_file_patch_plan(plan, replace_clones=False)
+    assert "--- a/cr_sample.py" in diff
+    # Ensure all added helper lines terminate with \r (and not \r\n or bare \n)
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("+") and not line.startswith("+++"):
+            assert line.endswith("\r"), f"Expected lone-CR line ending in hunk line: {line!r}"
+            assert not line.endswith("\r\n"), f"Did not expect CRLF in CR hunk line: {line!r}"
+
+
+def test_package_reexport_newline_helpers() -> None:
+    """Verifies that count_physical_newlines and detect_line_ending are re-exported from package roots."""
+    import pydoppelgangerhunt as pdgh
+    import pydoppelgangerhunt.fixer as pdgh_fixer
+
+    for name in ("count_physical_newlines", "detect_line_ending"):
+        assert hasattr(pdgh, name)
+        assert name in pdgh.__all__
+        assert callable(getattr(pdgh, name))
+        assert hasattr(pdgh_fixer, name)
+        assert name in pdgh_fixer.__all__
+        assert callable(getattr(pdgh_fixer, name))
+
+

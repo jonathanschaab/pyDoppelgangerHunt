@@ -53,6 +53,8 @@ from pydoppelgangerhunt.fixer.source import (
     _is_docstring_node,
     _scan_sig_line,
     compute_line_offsets,
+    count_physical_newlines,
+    detect_line_ending,
     is_valid_unit_coordinates,
     parse_unit_coord,
     resolve_unit_replacement,
@@ -793,8 +795,8 @@ def _compute_replacement_line_deltas(
             line_byte_offsets=line_byte_offsets,
             order_index=i,
         )
-        orig_nl = orig_text[item.start_char : item.end_char].count("\n")
-        rep_nl = item.final_rep.count("\n")
+        orig_nl = count_physical_newlines(orig_text[item.start_char : item.end_char])
+        rep_nl = count_physical_newlines(item.final_rep)
         computed.append((item, end_l, rep_nl - orig_nl))
 
     sorted_items = sorted(
@@ -1122,7 +1124,7 @@ def _render_file_patch_plan(
     else:
         current_text = plan.orig_text
 
-    nl = "\r\n" if plan.orig_text.endswith("\r\n") or "\r\n" in plan.orig_text[:1024] else "\n"
+    nl = detect_line_ending(plan.orig_text)
     if plan.method_helpers:
         deltas = (
             _compute_replacement_line_deltas(
