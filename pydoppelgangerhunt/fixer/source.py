@@ -337,7 +337,6 @@ def _insert_imports_into_module(
 
 
 _PHYSICAL_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
-_PHYSICAL_NEWLINE_RE = re.compile(r"\r\n|\r|\n")
 
 
 def count_physical_newlines(text: str) -> int:
@@ -353,7 +352,8 @@ def count_physical_newlines(text: str) -> int:
         return 0
     if "\r" not in text:
         return text.count("\n")
-    return sum(1 for _ in _PHYSICAL_NEWLINE_RE.finditer(text))
+    # Total newlines = (LF including CRLF) + (CR including CRLF) - (CRLF counted twice)
+    return text.count("\n") + text.count("\r") - text.count("\r\n")
 
 
 def detect_line_ending(*sources: Optional[str]) -> str:
@@ -983,7 +983,7 @@ def resolve_unit_replacement(
     # Whole-line replacement
     if attached_pragmas and final_rep:
         pragma_suffix = "  " + "  ".join(attached_pragmas)
-        rep_lines = final_rep.splitlines(keepends=True)
+        rep_lines = split_source_lines(final_rep)
         if rep_lines:
             last_rep = rep_lines[-1]
             nl = detect_line_ending(last_rep, source_text)

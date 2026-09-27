@@ -7553,3 +7553,33 @@ def test_detect_line_ending_true_majority_vote_resilience() -> None:
     assert detect_line_ending("a\r\nb\r") == "\r\n"
     assert detect_line_ending("a\r\nb\nc\r") == "\n"
 
+
+def test_resolve_unit_replacement_form_feed_in_final_rep() -> None:
+    """Verifies that resolve_unit_replacement uses physical line splitting for final_rep containing form feeds."""
+    from pydoppelgangerhunt.fixer import resolve_unit_replacement
+
+    source = "x = 1  # type: ignore\ny = 2\n"
+    unit = {"file": "test.py", "start": 1, "end": 1}
+    rep_with_ff = "\x0cx = 2\x0c"
+    item = resolve_unit_replacement(source, unit, rep_with_ff, preserve_boundary_pragmas=True)
+    assert item.final_rep == "\x0cx = 2\x0c  # type: ignore\n"
+
+
+def test_refactor_module_units_boundary_touching_zero_width_insertion_order() -> None:
+    """Verifies deterministic application order for zero-width insertions touching replacement boundaries."""
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    code = "abcdefghij\n"
+    u_rep = {"file": "test.py", "start": 1, "end": 1, "start_col": 2, "end_col": 5}
+
+    # Zero-width insertion at start boundary [2, 2) is applied before replacement text [2, 5)
+    u_ins_start = {"file": "test.py", "start": 1, "end": 1, "start_col": 2, "end_col": 2}
+    res_start = refactor_module_units(code, [(u_rep, "XYZ"), (u_ins_start, "INS_")])
+    assert res_start == "abINS_XYZfghij\n"
+
+    # Zero-width insertion at end boundary [5, 5) is applied after replacement text [2, 5)
+    u_ins_end = {"file": "test.py", "start": 1, "end": 1, "start_col": 5, "end_col": 5}
+    res_end = refactor_module_units(code, [(u_rep, "XYZ"), (u_ins_end, "_INS")])
+    assert res_end == "abXYZ_INSfghij\n"
+
+
