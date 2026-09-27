@@ -361,14 +361,14 @@ def detect_line_ending(*sources: Optional[str]) -> str:
 
     Performs a majority vote across all line endings present in the provided sources.
     In the event of an exact tie among non-zero counts, the tie-breaking priority order
-    is CRLF (\\r\\n), lone CR (\\r), then LF (\\n). If no physical newlines are present,
+    is LF (\\n), CRLF (\\r\\n), then lone CR (\\r). If no physical newlines are present,
     defaults to '\\n'.
 
     Args:
         *sources: One or more text strings or line sequences to probe.
 
     Returns:
-        '\\r\\n' if CRLF is predominant, '\\r' if lone CR is predominant, otherwise '\\n'.
+        '\\n' if LF is predominant, '\\r\\n' if CRLF is predominant, otherwise '\\r'.
     """
     crlf_count = 0
     cr_count = 0
@@ -386,20 +386,20 @@ def detect_line_ending(*sources: Optional[str]) -> str:
         return "\n"
 
     # Strict majority vote
-    if crlf_count > cr_count and crlf_count > lf_count:
-        return "\r\n"
-    if cr_count > crlf_count and cr_count > lf_count:
-        return "\r"
     if lf_count > crlf_count and lf_count > cr_count:
         return "\n"
+    if crlf_count > lf_count and crlf_count > cr_count:
+        return "\r\n"
+    if cr_count > lf_count and cr_count > crlf_count:
+        return "\r"
 
-    # Deterministic tie-breaking priority among non-zero counts: CRLF -> lone CR -> LF
-    max_count = max(crlf_count, cr_count, lf_count)
+    # Deterministic tie-breaking priority among non-zero counts: LF -> CRLF -> lone CR
+    max_count = max(lf_count, crlf_count, cr_count)
+    if lf_count == max_count:
+        return "\n"
     if crlf_count == max_count:
         return "\r\n"
-    if cr_count == max_count:
-        return "\r"
-    return "\n"
+    return "\r"
 
 
 def split_source_lines(source_text: str) -> List[str]:

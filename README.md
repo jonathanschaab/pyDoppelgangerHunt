@@ -172,7 +172,7 @@ from pydoppelgangerhunt import (
 - **`compute_unit_replacement_span(source_text, unit, replacement_text, preserve_boundary_pragmas=True)`**: Resolves a replacement into a `(start_char, end_char, final_replacement_text)` tuple against the unmodified source text while preserving attached `# type: ignore` or `# noqa` boundary pragmas.
 - **`split_source_lines(source_text)`**: Splits source code into physical lines with line terminators preserved. Unlike `str.splitlines()`, it splits strictly on physical Python newline sequences (`\r\n`, `\r`, `\n`) and never on form feeds (`\f`) or vertical tabs (`\v`), matching Python grammar and AST coordinate semantics.
 - **`count_physical_newlines(text)`**: Accurately counts physical line endings (`\r\n`, `\r`, `\n`) across mixed and legacy lone-CR formats.
-- **`detect_line_ending(*sources)`**: Detects predominant line ending format across source strings via majority vote (`\r\n`, `\r`, or `\n`), breaking ties in priority order (`\r\n` → `\r` → `\n`).
+- **`detect_line_ending(*sources)`**: Detects predominant line ending format across source strings via majority vote (`\n`, `\r\n`, or `\r`), breaking ties in priority order (`\n` → `\r\n` → `\r`).
 - **`refactor_module_units(source_text, replacements)`**: Applies multiple non-overlapping unit replacements in strict **reverse source order** (descending byte offsets) using single-pass buffer slicing, guaranteeing that downstream text expansions or contractions never invalidate upstream coordinates.
 - **`generate_refactoring_patch(candidate_pairs, repo_root=..., replace_clones=...)`**: Synthesizes a multi-file unified diff (`git apply` compatible) with dependency cycle detection and per-pair transactional snapshot rollback.
 

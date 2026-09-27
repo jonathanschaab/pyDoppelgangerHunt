@@ -7547,8 +7547,9 @@ def test_detect_line_ending_true_majority_vote_resilience() -> None:
     assert detect_line_ending(*cr_with_stray_lf) == "\r"
     assert detect_line_ending("".join(cr_with_stray_lf)) == "\r"
 
-    # Tie-breaking priority among non-zero counts (CRLF -> CR -> LF)
-    assert detect_line_ending("a\r\nb\n") == "\r\n"
-    assert detect_line_ending("a\rb\n") == "\r"
+    # Tie-breaking priority among non-zero counts (LF -> CRLF -> CR)
+    assert detect_line_ending("a\r\nb\n") == "\n"
+    assert detect_line_ending("a\rb\n") == "\n"
     assert detect_line_ending("a\r\nb\r") == "\r\n"
+    assert detect_line_ending("a\r\nb\nc\r") == "\n"
 
