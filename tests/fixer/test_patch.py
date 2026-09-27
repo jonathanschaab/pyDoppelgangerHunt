@@ -7670,4 +7670,165 @@ def test_canonicalize_helper_relative_imports_form_feed_and_crlf() -> None:
     assert "x = 1\x0c + 2" in res
 
 
+def test_detect_line_ending_iterable_and_mixed_arguments() -> None:
+    """Verifies that detect_line_ending accepts iterables, generators, sequences, and None values."""
+    from pydoppelgangerhunt.fixer import detect_line_ending
+
+    # Passing list of lines directly
+    lines = ["first\r\n", "second\r\n", "third\n"]
+    assert detect_line_ending(lines) == "\r\n"
+
+    # Generator expression
+    assert detect_line_ending(l for l in lines) == "\r\n"
+
+    # Mixed arguments
+    assert detect_line_ending("prefix\n", ["nested\n", "other\n"], None, "stray\r\n") == "\n"
+
+    # Empty / none
+    assert detect_line_ending() == "\n"
+    assert detect_line_ending([]) == "\n"
+    assert detect_line_ending(None) == "\n"
+
+
+def test_intervals_overlap_public_helper() -> None:
+    """Verifies intervals_overlap on disjoint, overlapping, touching, and zero-width intervals."""
+    from pydoppelgangerhunt.fixer import intervals_overlap
+
+    # Disjoint intervals
+    assert intervals_overlap(0, 5, 5, 10) is False
+    assert intervals_overlap(0, 5, 6, 10) is False
+
+    # Overlapping intervals
+    assert intervals_overlap(0, 5, 4, 10) is True
+    assert intervals_overlap(2, 8, 1, 4) is True
+
+    # Zero-width interval inside range
+    assert intervals_overlap(0, 5, 3, 3) is True
+    assert intervals_overlap(3, 3, 0, 5) is True
+
+    # Zero-width interval at boundary (touching does not overlap)
+    assert intervals_overlap(0, 5, 0, 0) is False
+    assert intervals_overlap(0, 5, 5, 5) is False
+
+    # Two zero-width intervals
+    assert intervals_overlap(5, 5, 5, 5) is True
+    assert intervals_overlap(5, 5, 6, 6) is False
+
+
+def test_validate_module_unit_replacements_and_tier_toggles() -> None:
+    """Verifies validate_module_unit_replacements and tier1/tier2 toggles in refactor_module_units."""
+    from pydoppelgangerhunt.fixer import (
+        UnitCollisionError,
+        refactor_module_units,
+        validate_module_unit_replacements,
+    )
+
+    code = "x = 1\ny = 2\nz = 3\n"
+    u1 = {"file": "test.py", "start": 1, "end": 1, "start_col": 0, "end_col": 5}
+    u2 = {"file": "test.py", "start": 2, "end": 2, "start_col": 0, "end_col": 5}
+
+    # Non-colliding replacements pass validation
+    validate_module_unit_replacements(code, [(u1, "x = 10"), (u2, "y = 20")])
+
+    # Colliding replacements raise UnitCollisionError
+    u1_collide = {"file": "test.py", "start": 1, "end": 1, "start_col": 2, "end_col": 5}
+    with pytest.raises(UnitCollisionError):
+        validate_module_unit_replacements(code, [(u1, "x = 10"), (u1_collide, "100")])
+
+    # Tier 1 vs Tier 2 toggling
+    # With tier1=False and tier2=False, collisions are not checked
+    res = refactor_module_units(
+        code,
+        [(u1, "x = 10"), (u2, "y = 20")],
+        tier1=False,
+        tier2=False,
+    )
+    assert "x = 10" in res
+
+
+def test_delegate_unit_in_plan_incremental_scaling_and_collision() -> None:
+    """Verifies incremental O(K) collision checking and snapshot rollback in _FilePatchPlan."""
+    from pydoppelgangerhunt.fixer.patch import (
+        UnitCollisionError,
+        _FilePatchPlan,
+        _delegate_unit_in_plan,
+    )
+
+    code = "def foo():\n    a = 1\n    b = 2\n    return a + b\n"
+    plan = _FilePatchPlan(
+        file_path=Path("test.py"),
+        rel_path="test.py",
+        orig_text=code,
+    )
+
+    u1 = {"file": "test.py", "start": 2, "end": 2, "start_col": 4, "end_col": 9}
+    _delegate_unit_in_plan(
+        unit=u1,
+        plan=plan,
+        helper_name="_h1",
+        inputs=[],
+        outputs=["a"],
+        scope={},
+        target_inputs=None,
+        target_outputs=None,
+        await_prefix="",
+    )
+    assert len(plan.replacements) == 1
+    assert len(plan.replacement_items) == 1
+
+    # Snapshot state
+    snap = plan.snapshot()
+
+    # Attempt colliding unit
+    u_collide = {"file": "test.py", "start": 2, "end": 2, "start_col": 4, "end_col": 9}
+    with pytest.raises(UnitCollisionError):
+        _delegate_unit_in_plan(
+            unit=u_collide,
+            plan=plan,
+            helper_name="_h2",
+            inputs=[],
+            outputs=["a"],
+            scope={},
+            target_inputs=None,
+            target_outputs=None,
+            await_prefix="",
+        )
+
+    # Verify plan was not mutated by failed delegation
+    assert len(plan.replacements) == 1
+    assert len(plan.replacement_items) == 1
+
+    # Restore snapshot and verify parity
+    plan.restore(snap)
+    assert len(plan.replacements) == 1
+    assert len(plan.replacement_items) == 1
+
+
+def test_extract_unit_body_lines_and_synthesis_form_feed(tmp_path: Path) -> None:
+    """Verifies that _extract_unit_body_lines and synthesize_shared_helper_code preserve form feeds."""
+    from pydoppelgangerhunt.fixer.source import _extract_unit_body_lines
+    from pydoppelgangerhunt.fixer.synthesis import synthesize_shared_helper_code
+
+    raw_fn = [
+        "def helper(x):\n",
+        "\x0c    res = x + 1\n",
+        "    return res\n",
+    ]
+    unit = {"file": "m.py", "start": 1, "end": 3, "kind": "function"}
+    body_lines = _extract_unit_body_lines(unit, raw_fn)
+    assert any("\x0c" in ln for ln in body_lines)
+
+    f1 = tmp_path / "f1.py"
+    f2 = tmp_path / "f2.py"
+    code = "def calc(x):\n\x0c    res = x + 10\n    return res\n"
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 1, "end": 3, "kind": "function"}
+    u2 = {"file": str(f2), "start": 1, "end": 3, "kind": "function"}
+    h_code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "\x0c" in h_code
+
+
+
 

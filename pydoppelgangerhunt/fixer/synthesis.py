@@ -29,6 +29,7 @@ from pydoppelgangerhunt.fixer.source import (
     _extract_unit_body_lines,
     _slice_unit_token_lines,
     extract_unit_comments_and_pragmas,
+    split_source_lines,
 )
 
 def _format_call_arguments(
@@ -642,7 +643,10 @@ def synthesize_shared_helper_code(
     params_str = ", ".join(params) if params else "*args: Any, **kwargs: Any"
 
     # Dedent common_lines first so relative block indentation is normalized
-    common_lines = textwrap.dedent("\n".join(common_lines)).splitlines()
+    common_lines = [
+        ln.rstrip("\r\n")
+        for ln in split_source_lines(textwrap.dedent("\n".join(common_lines)))
+    ]
 
     # Prepend scope modifiers and conditional variable initializations to preserve runtime safety
     prefix_stmts: List[str] = []

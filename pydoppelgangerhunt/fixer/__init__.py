@@ -42,7 +42,9 @@ from pydoppelgangerhunt.fixer.patch import (
     check_units_overlap,
     filter_overlapping_clone_units,
     generate_refactoring_patch,
+    intervals_overlap,
     refactor_module_units,
+    validate_module_unit_replacements,
 )
 from pydoppelgangerhunt.fixer.scope import (
     BUILTIN_NAMES,
@@ -131,6 +133,7 @@ __all__ = [
     "find_enclosing_function",
     "find_nearest_common_package",
     "generate_refactoring_patch",
+    "intervals_overlap",
     "is_valid_unit_coordinates",
     "parse_unit_coord",
     "refactor_module_units",
@@ -140,4 +143,5 @@ __all__ = [
     "slice_source_by_token_range",
     "split_source_lines",
     "synthesize_shared_helper_code",
+    "validate_module_unit_replacements",
 ]

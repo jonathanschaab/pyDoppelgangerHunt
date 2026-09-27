@@ -282,7 +282,7 @@ def filter_overlapping_clone_units(
     return retained
 
 
-def _intervals_overlap(s1: int, e1: int, s2: int, e2: int) -> bool:
+def intervals_overlap(s1: int, e1: int, s2: int, e2: int) -> bool:
     """Checks whether two half-open byte intervals [s1, e1) and [s2, e2) overlap, including zero-width boundaries."""
     if s1 == e1 and s2 == e2:
         return s1 == s2
@@ -291,6 +291,9 @@ def _intervals_overlap(s1: int, e1: int, s2: int, e2: int) -> bool:
     if s2 == e2:
         return s1 < s2 < e1
     return max(s1, s2) < min(e1, e2)
+
+
+_intervals_overlap = intervals_overlap
 
 
 def _format_unit_desc(u: Any) -> Tuple[str, int, int, str]:
@@ -304,13 +307,27 @@ def _format_unit_desc(u: Any) -> Tuple[str, int, int, str]:
     return n, s, e, f
 
 
+def _raise_unit_collision_error(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    context: str = "",
+) -> None:
+    """Formats and raises a UnitCollisionError between two conflicting units."""
+    n1, s1, e1, f1 = _format_unit_desc(u1)
+    n2, s2, e2, _ = _format_unit_desc(u2)
+    ctx_prefix = f" in {context} " if context else " "
+    raise UnitCollisionError(
+        f"Overlapping unit collision detected{ctx_prefix}"
+        f"between '{n1}' ({s1}-{e1}) and '{n2}' ({s2}-{e2}) in {f1}."
+    )
+
+
 def _assert_no_interval_collisions(
     items: Sequence[ReplacementItem],
     context: str = "",
 ) -> None:
     """Verifies that a sorted sequence of ReplacementItems does not contain overlapping byte intervals."""
     max_end_item: Optional[ReplacementItem] = None
-    ctx_prefix = f" in {context} " if context else " "
     for item in items:
         if (
             max_end_item is not None
@@ -318,12 +335,7 @@ def _assert_no_interval_collisions(
                 max_end_item.start_byte, max_end_item.end_byte, item.start_byte, item.end_byte
             )
         ):
-            n1, s1, e1, f1 = _format_unit_desc(max_end_item.unit)
-            n2, s2, e2, _ = _format_unit_desc(item.unit)
-            raise UnitCollisionError(
-                f"Overlapping unit collision detected{ctx_prefix}"
-                f"between '{n1}' ({s1}-{e1}) and '{n2}' ({s2}-{e2}) in {f1}."
-            )
+            _raise_unit_collision_error(max_end_item.unit, item.unit, context=context)
         if max_end_item is None or item.end_byte >= max_end_item.end_byte:
             max_end_item = item
 
@@ -335,6 +347,8 @@ def refactor_module_units(
     line_char_offsets: Optional[Sequence[int]] = None,
     line_byte_offsets: Optional[Sequence[int]] = None,
     dry_run: bool = False,
+    tier1: bool = True,
+    tier2: bool = True,
 ) -> str:
     """Applies multiple non-overlapping unit replacements in reverse source order.
 
@@ -348,8 +362,9 @@ def refactor_module_units(
         lines: Optional precomputed line strings of source_text.
         line_char_offsets: Optional precomputed character offsets of line starts.
         line_byte_offsets: Optional precomputed UTF-8 byte offsets of line starts.
-        dry_run: If True, executes Tier 1 and Tier 2 collision validation without slicing or
-            modifying the source buffer.
+        dry_run: If True, executes collision validation without slicing or modifying the source buffer.
+        tier1: If True, executes Tier 1 semantic line/column overlap validation.
+        tier2: If True, executes Tier 2 physical UTF-8 byte interval sweep validation.
 
     Returns:
         The refactored module source text (or unmodified source_text if dry_run=True).
@@ -373,16 +388,11 @@ def refactor_module_units(
         else:
             rep_list.append((u, rep))
 
-    for i, (u1, _) in enumerate(rep_list):
-        for u2, _ in rep_list[i + 1:]:
-            if check_units_overlap(u1, u2):
-                n1, s1, e1, f1 = _format_unit_desc(u1)
-                n2, s2, e2, _ = _format_unit_desc(u2)
-                raise UnitCollisionError(
-                    f"Overlapping unit collision detected between "
-                    f"'{n1}' ({s1}-{e1}) and "
-                    f"'{n2}' ({s2}-{e2}) in {f1}."
-                )
+    if tier1:
+        for i, (u1, _) in enumerate(rep_list):
+            for u2, _ in rep_list[i + 1:]:
+                if check_units_overlap(u1, u2):
+                    _raise_unit_collision_error(u1, u2)
 
     computed_entries: List[ReplacementItem] = []
     if lines is None:
@@ -409,7 +419,8 @@ def refactor_module_units(
         computed_entries,
         key=lambda item: (item.start_byte, item.end_byte, item.order_index),
     )
-    _assert_no_interval_collisions(sorted_by_start)
+    if tier2:
+        _assert_no_interval_collisions(sorted_by_start)
 
     if dry_run:
         return source_text
@@ -424,6 +435,44 @@ def refactor_module_units(
         current_text = current_text[:s_c] + item.final_rep + current_text[e_c:]
 
     return current_text
+
+
+def validate_module_unit_replacements(
+    source_text: str,
+    replacements: Sequence[Tuple[Dict[str, Any], str]],
+    lines: Optional[Sequence[str]] = None,
+    line_char_offsets: Optional[Sequence[int]] = None,
+    line_byte_offsets: Optional[Sequence[int]] = None,
+    tier1: bool = True,
+    tier2: bool = True,
+) -> None:
+    """Validates that candidate unit replacements do not contain interval collisions.
+
+    Runs Tier 1 (AST line/column range overlap) and/or Tier 2 (physical UTF-8 byte span
+    sweep) validation without modifying or allocating new source string buffers.
+
+    Args:
+        source_text: The complete original Python source code.
+        replacements: Sequence of (unit, replacement_text) tuples.
+        lines: Optional precomputed line strings of source_text.
+        line_char_offsets: Optional precomputed character offsets of line starts.
+        line_byte_offsets: Optional precomputed UTF-8 byte offsets of line starts.
+        tier1: If True, executes Tier 1 semantic line/column overlap validation.
+        tier2: If True, executes Tier 2 physical UTF-8 byte interval sweep validation.
+
+    Raises:
+        UnitCollisionError: If any pair of units collides under active validation tiers.
+    """
+    refactor_module_units(
+        source_text,
+        replacements,
+        lines=lines,
+        line_char_offsets=line_char_offsets,
+        line_byte_offsets=line_byte_offsets,
+        dry_run=True,
+        tier1=tier1,
+        tier2=tier2,
+    )
 
 
 def _build_whole_method_delegation(
@@ -698,6 +747,7 @@ class _PlanSnapshot(TypedDict):
     """Encapsulates a snapshot of mutable _FilePatchPlan state for transactional rollback."""
 
     replacements: List[Tuple[Dict[str, Any], str]]
+    replacement_items: List[ReplacementItem]
     method_helpers: List[Tuple[int, str]]
     module_helpers: List[str]
     missing_imports: List[str]
@@ -727,6 +777,7 @@ class _FilePatchPlan:
         else:
             self.line_char_offsets, self.line_byte_offsets = compute_line_offsets(self.orig_lines)
         self.replacements: List[Tuple[Dict[str, Any], str]] = []
+        self.replacement_items: List[ReplacementItem] = []
         self.method_helpers: List[Tuple[int, str]] = []
         self.module_helpers: List[str] = []
         self.missing_imports: List[str] = []
@@ -738,6 +789,7 @@ class _FilePatchPlan:
         """Creates a snapshot of mutable plan state for transactional rollback."""
         return {
             "replacements": list(self.replacements),
+            "replacement_items": list(self.replacement_items),
             "method_helpers": list(self.method_helpers),
             "module_helpers": list(self.module_helpers),
             "missing_imports": list(self.missing_imports),
@@ -749,6 +801,7 @@ class _FilePatchPlan:
     def restore(self, snap: _PlanSnapshot) -> None:
         """Restores mutable plan state from a snapshot."""
         self.replacements = list(snap["replacements"])
+        self.replacement_items = list(snap.get("replacement_items", []))
         self.method_helpers = list(snap["method_helpers"])
         self.module_helpers = list(snap["module_helpers"])
         self.missing_imports = list(snap["missing_imports"])
@@ -916,27 +969,48 @@ def _delegate_unit_in_plan(
         await_prefix=await_prefix,
         step=step,
     )
-    plan.replacements.append((unit, rep_stmt))
-    plan.claimed_units.append(unit)
-    # Defensive physical dry-run: verify that the newly delegated replacement does not collide
-    # with existing replacements in physical byte spans (e.g. pragma suffix extensions).
-    # Reuses precomputed plan lines and line offsets, and passes dry_run=True to validate
-    # interval overlap without performing redundant string slicing and allocations.
-    # Scales as O(K) per delegation (O(K^2) overall across K replacements in a file plan).
-    # Because K is typically small (<= 20), overhead is negligible (< 1ms).
-    try:
-        refactor_module_units(
+    # Tier 1 Semantic Overlap Check against existing plan replacements: O(K)
+    for existing_u, _ in plan.replacements:
+        if check_units_overlap(existing_u, unit):
+            _raise_unit_collision_error(existing_u, unit)
+
+    # Synchronize replacement_items if plan.replacements was populated externally (e.g. fixtures)
+    while len(plan.replacement_items) < len(plan.replacements):
+        idx = len(plan.replacement_items)
+        u_prev, rep_prev = plan.replacements[idx]
+        item_prev = resolve_unit_replacement(
             plan.orig_text,
-            plan.replacements,
+            u_prev,
+            rep_prev,
             lines=plan.orig_lines,
             line_char_offsets=plan.line_char_offsets,
             line_byte_offsets=plan.line_byte_offsets,
-            dry_run=True,
+            order_index=idx,
         )
-    except Exception:
-        plan.replacements.pop()
-        plan.claimed_units.pop()
-        raise
+        plan.replacement_items.append(item_prev)
+
+    # Tier 2 Physical Byte-Span Overlap Check against existing replacement items: O(K)
+    new_item = resolve_unit_replacement(
+        plan.orig_text,
+        unit,
+        rep_stmt,
+        lines=plan.orig_lines,
+        line_char_offsets=plan.line_char_offsets,
+        line_byte_offsets=plan.line_byte_offsets,
+        order_index=len(plan.replacement_items),
+    )
+    for existing_item in plan.replacement_items:
+        if intervals_overlap(
+            existing_item.start_byte,
+            existing_item.end_byte,
+            new_item.start_byte,
+            new_item.end_byte,
+        ):
+            _raise_unit_collision_error(existing_item.unit, unit)
+
+    plan.replacements.append((unit, rep_stmt))
+    plan.replacement_items.append(new_item)
+    plan.claimed_units.append(unit)
 
 
 def _wire_cross_module_host_delegation(

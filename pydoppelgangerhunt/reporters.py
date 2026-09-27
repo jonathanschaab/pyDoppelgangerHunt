@@ -7,6 +7,7 @@ import html
 import json
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -116,7 +117,15 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
                 if 0 <= cell_idx < len(cells):
                     cell = cells[cell_idx]
                     src = cell.get("source", [])
-                    raw_lines = src if isinstance(src, list) else str(src).splitlines(keepends=True)
+                    raw_lines = (
+                        src
+                        if isinstance(src, list)
+                        else [
+                            m.group(0)
+                            for m in re.finditer(r"[^\r\n]*(?:\r\n|\r|\n|$)", str(src))
+                            if m.group(0)
+                        ]
+                    )
                     all_lines = [l if l.endswith("\n") else l + "\n" for l in raw_lines]
                 else:
                     all_lines = []

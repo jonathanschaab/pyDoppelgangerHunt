@@ -73,6 +73,7 @@ from pydoppelgangerhunt.fixer import (
     find_enclosing_class,
     find_enclosing_function,
     generate_refactoring_patch,
+    intervals_overlap,
     is_valid_unit_coordinates,
     parse_unit_coord,
     refactor_module_units,
@@ -81,6 +82,7 @@ from pydoppelgangerhunt.fixer import (
     slice_source_by_token_range,
     split_source_lines,
     synthesize_shared_helper_code,
+    validate_module_unit_replacements,
 )
 from pydoppelgangerhunt.git_diff import (
     DiffRangeMap,
@@ -219,10 +221,12 @@ __all__ = [
     "filter_overlapping_clone_units",
     "find_enclosing_class",
     "find_enclosing_function",
+    "intervals_overlap",
     "is_valid_unit_coordinates",
     "parse_unit_coord",
     "refactor_module_units",
     "split_source_lines",
+    "validate_module_unit_replacements",
     "generate_refactoring_patch",
     "compute_unit_structural_hash",
     "extract_unit_namespace",

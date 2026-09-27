@@ -9,7 +9,7 @@ import re
 import textwrap
 import tokenize
 import warnings
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +90,28 @@ def _extract_docstring_end_line(tree: ast.AST) -> int:
 _extract_module_docstring_end_line = _extract_docstring_end_line
 
 
+_PHYSICAL_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
+
+
+def split_source_lines(source_text: str) -> List[str]:
+    """Splits source code into physical lines preserving line endings.
+
+    Unlike str.splitlines(), this only splits on physical Python newline sequences
+    (\\r\\n, \\r, \\n) and never splits on form feeds (\\f / \\x0c) or vertical tabs (\\v),
+    matching Python grammar and AST line coordinate semantics. Uses regex finditer to
+    avoid intermediate match list allocations.
+
+    Args:
+        source_text: The complete original Python source code.
+
+    Returns:
+        A list of physical line strings with line terminators preserved.
+    """
+    if not source_text:
+        return []
+    return [m.group(0) for m in _PHYSICAL_LINE_RE.finditer(source_text) if m.group(0)]
+
+
 def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List[str]:
     """Extracts executable body lines for a unit, stripping function headers and docstrings for whole functions."""
     if unit.get("kind") not in ("function", "closure", "method"):
@@ -107,7 +129,7 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
             if body_nodes and _is_docstring_node(body_nodes[0]):
                 body_nodes = body_nodes[1:]
             if body_nodes:
-                d_lines = dedented.splitlines()
+                d_lines = [ln.rstrip("\r\n") for ln in split_source_lines(dedented)]
                 first_body = body_nodes[0]
                 start_l = first_body.lineno
                 end_l = getattr(body_nodes[-1], "end_lineno", len(d_lines))
@@ -116,7 +138,10 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
                     if start_l == fn_node.lineno:
                         b_col = getattr(first_body, "col_offset", 0)
                         extracted[0] = extracted[0][b_col:]
-                    return textwrap.dedent("\n".join(extracted)).splitlines()
+                    return [
+                        ln.rstrip("\r\n")
+                        for ln in split_source_lines(textwrap.dedent("\n".join(extracted)))
+                    ]
     except Exception:
         pass
     return raw_lines
@@ -331,12 +356,9 @@ def _insert_imports_into_module(
             while insert_idx < len(orig_lines) and not orig_lines[insert_idx].strip():
                 insert_idx += 1
 
-    nl = detect_line_ending(*orig_lines)
+    nl = detect_line_ending(orig_lines)
     formatted = [imp.rstrip("\r\n") + nl for imp in deduped_imports]
     return orig_lines[:insert_idx] + formatted + [nl] + orig_lines[insert_idx:]
-
-
-_PHYSICAL_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
 
 
 def count_physical_newlines(text: str) -> int:
@@ -356,16 +378,32 @@ def count_physical_newlines(text: str) -> int:
     return text.count("\n") + text.count("\r") - text.count("\r\n")
 
 
-def detect_line_ending(*sources: Optional[str]) -> str:
-    """Detects the predominant physical newline terminator (\\r\\n, \\r, or \\n) across strings.
+def _iter_sources(
+    sources: Sequence[Union[Optional[str], Iterable[Any]]]
+) -> Iterator[str]:
+    """Flattens mixed string arguments and string iterables into a flat stream of non-empty strings."""
+    for item in sources:
+        if not item:
+            continue
+        if isinstance(item, str):
+            yield item
+        elif isinstance(item, Iterable):
+            for sub in item:
+                if isinstance(sub, str) and sub:
+                    yield sub
+
+
+def detect_line_ending(*sources: Union[Optional[str], Iterable[Optional[str]]]) -> str:
+    """Detects the predominant physical newline terminator (\\r\\n, \\r, or \\n) across strings or line sequences.
 
     Performs a majority vote across all line endings present in the provided sources.
+    Accepts arbitrary string arguments, iterables/sequences of strings, or a mix of both.
     In the event of an exact tie among non-zero counts, the tie-breaking priority order
     is LF (\\n), CRLF (\\r\\n), then lone CR (\\r). If no physical newlines are present,
     defaults to '\\n'.
 
     Args:
-        *sources: One or more text strings or line sequences to probe.
+        *sources: One or more text strings, or collections/iterables of text strings to probe.
 
     Returns:
         '\\n' if LF is predominant, '\\r\\n' if CRLF is predominant, otherwise '\\r'.
@@ -374,9 +412,7 @@ def detect_line_ending(*sources: Optional[str]) -> str:
     cr_count = 0
     lf_count = 0
 
-    for s in sources:
-        if not s:
-            continue
+    for s in _iter_sources(sources):
         c = s.count("\r\n")
         crlf_count += c
         cr_count += s.count("\r") - c
@@ -400,25 +436,6 @@ def detect_line_ending(*sources: Optional[str]) -> str:
     if crlf_count == max_count:
         return "\r\n"
     return "\r"
-
-
-def split_source_lines(source_text: str) -> List[str]:
-    """Splits source code into physical lines preserving line endings.
-
-    Unlike str.splitlines(), this only splits on physical Python newline sequences
-    (\\r\\n, \\r, \\n) and never splits on form feeds (\\f / \\x0c) or vertical tabs (\\v),
-    matching Python grammar and AST line coordinate semantics. Uses regex finditer to
-    avoid intermediate match list allocations.
-
-    Args:
-        source_text: The complete original Python source code.
-
-    Returns:
-        A list of physical line strings with line terminators preserved.
-    """
-    if not source_text:
-        return []
-    return [m.group(0) for m in _PHYSICAL_LINE_RE.finditer(source_text) if m.group(0)]
 
 
 def slice_source_by_token_range(
