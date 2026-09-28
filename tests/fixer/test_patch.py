@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import ast
+import logging
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Tuple
 from unittest import mock
 
 import pytest
 
 from pydoppelgangerhunt import (
+    analyze_unit_variable_scope,
     check_units_overlap,
     extract_unit_source_code,
     generate_refactoring_patch,
@@ -24,7 +26,6 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     patch as patch_mod,
 )
 from pydoppelgangerhunt.fixer.depgraph import build_module_graph
-from pydoppelgangerhunt.parser import harvest_file_units
 
 
 def test_audit_tests_parametrize_candidate_detection(tmp_path: Path) -> None:
@@ -99,7 +100,6 @@ def test_comment_and_formatting_preservation(tmp_path: Path) -> None:
 
 def test_inter_block_overlap_collision_detection_and_reverse_offset_refactoring(tmp_path: Path) -> None:
     """Verifies overlap collision detection, maximal subset filtering, and reverse-order refactoring."""
-    import pytest  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.fixer import (  # pylint: disable=import-outside-toplevel
         check_units_overlap,
         filter_overlapping_clone_units,
@@ -4259,7 +4259,7 @@ def test_cross_file_host_local_definition_conflict_rejected(
     assert "_shared_process_service1_process_service2" not in patch
 
     # Direct collector verification for conflicting and unresolved symbols
-    host_plan = patch_mod._FilePatchPlan(f_host, src_host, "host_mod.py")
+    host_plan = patch_mod._FilePatchPlan(file_path=f_host, rel_path="host_mod.py", orig_text=src_host)
     helper_code = "def _shared(svc: LocalService) -> int:\n    return 42\n"
     with pytest.raises(ValueError, match="conflicting local definition 'LocalService'"):
         patch_mod._collect_host_missing_imports(
@@ -4306,7 +4306,7 @@ def test_host_local_definition_omits_self_import_when_caller_imports_from_host(
     f_caller.write_text(caller_src, encoding="utf-8")
 
     # 1. Direct collector check
-    host_plan = patch_mod._FilePatchPlan(f_host, host_src, "self_import_pkg/host_mod.py")
+    host_plan = patch_mod._FilePatchPlan(file_path=f_host, rel_path="self_import_pkg/host_mod.py", orig_text=host_src)
     helper_code = "def _shared_process_item1_process_item2(item: LocalDep) -> int:\n    return 42\n"
     imports = patch_mod._collect_host_missing_imports(
         host_plan=host_plan,
@@ -4993,9 +4993,9 @@ def test_collect_host_missing_imports_substring_safety() -> None:
         "    return os_helper.run()\n"
     )
     host_plan = patch_mod._FilePatchPlan(
-        Path("app/main.py"),
-        host_code,
-        "app/main.py",
+        file_path=Path("app/main.py"),
+        rel_path="app/main.py",
+        orig_text=host_code,
     )
     helper_code = "def helper_fn():\n    return os.path.exists('foo')\n"
     scope = {"module": "app.main"}
@@ -5041,9 +5041,9 @@ def test_collect_host_missing_imports_rejects_rebound_conflicts() -> None:
         "    return transform(x)\n"
     )
     host_plan = patch_mod._FilePatchPlan(
-        Path("common.py"),
-        "",
-        "common.py",
+        file_path=Path("common.py"),
+        rel_path="common.py",
+        orig_text="",
         is_new_file=True,
     )
     helper_code = "def helper_fn(x: int) -> int:\n    return transform(x)\n"
@@ -5072,9 +5072,9 @@ def test_collect_host_missing_imports_rejects_cross_file_guarded_imports() -> No
         "    return transform(x)\n"
     )
     host_plan = patch_mod._FilePatchPlan(
-        Path("pkg/_common.py"),
-        "",
-        "pkg/_common.py",
+        file_path=Path("pkg/_common.py"),
+        rel_path="pkg/_common.py",
+        orig_text="",
         is_new_file=True,
     )
     helper_code = "def helper_fn(x: int) -> int:\n    return transform(x)\n"
@@ -5103,9 +5103,9 @@ def test_collect_host_missing_imports_same_file_preserves_guarded_imports() -> N
         "    return json.dumps(d)\n"
     )
     host_plan = patch_mod._FilePatchPlan(
-        Path("pkg/worker.py"),
-        source_code,
-        "pkg/worker.py",
+        file_path=Path("pkg/worker.py"),
+        rel_path="pkg/worker.py",
+        orig_text=source_code,
         is_new_file=False,
     )
     helper_code = "def helper_fn(d):\n    return json.dumps(d)\n"
@@ -5166,7 +5166,12 @@ def test_extract_module_defined_names_augassign_and_walrus() -> None:
 
 def test_collect_host_missing_imports_rejects_import_rebound_by_definition(tmp_path: Path) -> None:
     """Verifies that attempting cross-file extraction of a symbol rebound by local definition is rejected."""
-    plan = patch_mod._FilePatchPlan(tmp_path / "mod_target.py", "", "mod_target.py", is_new_file=True)
+    plan = patch_mod._FilePatchPlan(
+        file_path=tmp_path / "mod_target.py",
+        rel_path="mod_target.py",
+        orig_text="",
+        is_new_file=True,
+    )
     source_code = (
         "from dep_lib import process\n"
         "def process(x: int) -> int:\n"
@@ -5386,4 +5391,2508 @@ def test_format_patch_relative_path_nested_directories(tmp_path: Path) -> None:
     assert res == "sub/nested/file.py"
 
 
+def test_col_offset_to_char_offset_ascii_and_multibyte() -> None:
+    """Verifies that col_offset_to_char_offset translates UTF-8 byte offsets to character indices."""
+    from pydoppelgangerhunt.fixer import col_offset_to_char_offset
 
+    # Edge cases
+    assert col_offset_to_char_offset("", None) == 0
+    assert col_offset_to_char_offset("abc", 0) == 0
+    assert col_offset_to_char_offset("abc", -5) == 0
+    assert col_offset_to_char_offset("abc", 100) == 3
+
+    # ASCII line: byte offset equals character index
+    ascii_line = "alpha = beta + gamma\n"
+    assert col_offset_to_char_offset(ascii_line, 8) == 8
+    assert col_offset_to_char_offset(ascii_line, 15) == 15
+
+    # Multi-byte line with emojis (4 bytes each in UTF-8, 1 char in str)
+    # "msg = '🚀🚀' + str(val)\n"
+    # len("msg = '") = 7 bytes / 7 chars
+    # '🚀🚀' = 8 bytes / 2 chars
+    # "' + str(" = 8 bytes / 8 chars
+    # Total byte offset of 'val' = 7 + 8 + 8 = 23 bytes
+    # Total char index of 'val' = 7 + 2 + 8 = 17 chars
+    emoji_line = "msg = '\U0001F680\U0001F680' + str(val)\n"
+    assert col_offset_to_char_offset(emoji_line, 23) == 17
+    assert emoji_line[17:20] == "val"
+
+    # Multi-byte line with Chinese characters (3 bytes each in UTF-8, 1 char in str)
+    # "title = '中文测试' + name\n"
+    # len("title = '") = 9 bytes / 9 chars
+    # '中文测试' = 12 bytes / 4 chars
+    # "' + " = 4 bytes / 4 chars
+    # Total byte offset of 'name' = 9 + 12 + 4 = 25 bytes
+    # Total char index of 'name' = 9 + 4 + 4 = 17 chars
+    cjk_line = "title = '中文测试' + name\n"
+    assert col_offset_to_char_offset(cjk_line, 25) == 17
+    assert cjk_line[17:21] == "name"
+
+
+def test_compute_unit_byte_and_char_offsets() -> None:
+    """Verifies that compute_unit_byte_offsets and compute_unit_char_offsets compute exact spans."""
+    from pydoppelgangerhunt.fixer import (
+        compute_unit_byte_offsets,
+        compute_unit_char_offsets,
+    )
+
+    source = (
+        "def compute(data):\n"
+        "    msg = '\U0001F680' + str([x for x in data])\n"
+        "    return msg\n"
+    )
+    # Unit for the list comprehension on line 2
+    # In UTF-8: line 2 starts at byte 19 ("def compute(data):\n" is 19 bytes)
+    # On line 2: "    msg = '\U0001F680' + str(" is 4 + 7 + 4 + 8 = 23 bytes
+    # [x for x in data] is 17 bytes -> end col 40
+    tree = ast.parse(source)
+    comp_node = next(n for n in ast.walk(tree) if isinstance(n, ast.ListComp))
+
+    unit = {
+        "file": "test.py",
+        "start": comp_node.lineno,
+        "end": comp_node.end_lineno,
+        "start_col": comp_node.col_offset,
+        "end_col": comp_node.end_col_offset,
+        "kind": "comprehension",
+    }
+
+    char_span = compute_unit_char_offsets(source, unit)
+    byte_span = compute_unit_byte_offsets(source, unit)
+
+    # Character slice must match AST source segment
+    assert source[char_span[0]:char_span[1]] == "[x for x in data]"
+    # Byte slice in UTF-8 bytes must match
+    source_bytes = source.encode("utf-8")
+    assert source_bytes[byte_span[0]:byte_span[1]] == b"[x for x in data]"
+
+
+def test_compute_unit_replacement_span_pragmas_and_whole_line() -> None:
+    """Verifies that compute_unit_replacement_span correctly formats replacements and retains boundary pragmas."""
+    from pydoppelgangerhunt.fixer import compute_unit_replacement_span
+
+    # 1. Whole-line function replacement ensures trailing newline
+    source = "def foo():\n    return 1\n\ndef bar():\n    return 2\n"
+    u_foo = {"file": "test.py", "start": 1, "end": 2, "kind": "function"}
+    s_c, e_c, rep = compute_unit_replacement_span(source, u_foo, "def foo():\n    return 42")
+    assert rep.endswith("\n")
+    assert source[s_c:e_c] == "def foo():\n    return 1\n"
+
+    # 2. Boundary pragma on line is retained
+    source_pragma = "def calc():\n    val = 10  # type: ignore\n    return val\n"
+    u_stmt = {"file": "test.py", "start": 2, "end": 2, "kind": "statement"}
+    s_c2, e_c2, rep2 = compute_unit_replacement_span(
+        source_pragma, u_stmt, "    val = compute_shared()", preserve_boundary_pragmas=True
+    )
+    assert "# type: ignore" in rep2
+    assert source_pragma[s_c2:e_c2] == "    val = 10  # type: ignore\n"
+
+
+def test_refactor_module_units_descending_offset_shuffled_order() -> None:
+    """Verifies that refactor_module_units sorts replacements by descending offset regardless of input order."""
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    source = (
+        "def first():\n"
+        "    return 1\n"
+        "\n"
+        "def second():\n"
+        "    return 2\n"
+        "\n"
+        "def third():\n"
+        "    return 3\n"
+    )
+    u1 = {"file": "t.py", "start": 1, "end": 2, "name": "first"}
+    u2 = {"file": "t.py", "start": 4, "end": 5, "name": "second"}
+    u3 = {"file": "t.py", "start": 7, "end": 8, "name": "third"}
+
+    r1 = (u1, "def first():\n    return 10\n")
+    r2 = (u2, "def second():\n    return 20\n")
+    r3 = (u3, "def third():\n    return 30\n")
+
+    # Pass in shuffled order [r2, r1, r3]
+    result = refactor_module_units(source, [r2, r1, r3])
+    expected = (
+        "def first():\n"
+        "    return 10\n"
+        "\n"
+        "def second():\n"
+        "    return 20\n"
+        "\n"
+        "def third():\n"
+        "    return 30\n"
+    )
+    assert result == expected
+    assert ast.parse(result)
+
+
+def test_refactor_module_units_same_line_multiline_expansion_no_drift() -> None:
+    """Verifies that a downstream multi-line replacement on the same line preserves upstream coordinates."""
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    source = "val = [a for a in b] + [c for c in d]\n"
+    u1 = {
+        "file": "test.py",
+        "start": 1,
+        "end": 1,
+        "start_col": 6,
+        "end_col": 20,
+        "kind": "comprehension",
+    }
+    u2 = {
+        "file": "test.py",
+        "start": 1,
+        "end": 1,
+        "start_col": 23,
+        "end_col": 37,
+        "kind": "comprehension",
+    }
+    # Downstream replacement is multi-line with indentation
+    rep2 = "helper(\n    d,\n    extra=True,\n)"
+    rep1 = "helper(b)"
+
+    # Pass in forward order: [u1, u2]
+    refactored = refactor_module_units(source, [(u1, rep1), (u2, rep2)])
+    expected = (
+        "val = helper(b) + helper(\n"
+        "    d,\n"
+        "    extra=True,\n"
+        ")\n"
+    )
+    assert refactored == expected
+    assert ast.parse(refactored)
+
+
+def test_refactor_module_units_touching_line_boundaries_no_drift() -> None:
+    """Verifies that units touching line boundaries are refactored without line truncation or coordinate drift."""
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    source = (
+        "# calculation\n"
+        "res = (\n"
+        "    compute_a(items) +\n"
+        "    compute_b(items)\n"
+        ")\n"
+    )
+    # Unit 1 is compute_a(items) on line 3, cols 4..20
+    # Unit 2 is compute_b(items) on line 4, cols 4..20
+    u1 = {
+        "file": "test.py",
+        "start": 3,
+        "end": 3,
+        "start_col": 4,
+        "end_col": 20,
+        "kind": "complex_expr",
+    }
+    u2 = {
+        "file": "test.py",
+        "start": 4,
+        "end": 4,
+        "start_col": 4,
+        "end_col": 20,
+        "kind": "complex_expr",
+    }
+    rep1 = "shared_a(\n        items,\n        mode='fast',\n    )"
+    rep2 = "shared_b(\n        items,\n        mode='slow',\n    )"
+
+    refactored = refactor_module_units(source, [(u1, rep1), (u2, rep2)])
+    expected = (
+        "# calculation\n"
+        "res = (\n"
+        "    shared_a(\n"
+        "        items,\n"
+        "        mode='fast',\n"
+        "    ) +\n"
+        "    shared_b(\n"
+        "        items,\n"
+        "        mode='slow',\n"
+        "    )\n"
+        ")\n"
+    )
+    assert refactored == expected
+    assert ast.parse(refactored)
+
+
+def test_refactor_module_units_unicode_multibyte_source_code() -> None:
+    """Verifies that source code containing multi-byte UTF-8 emojis and symbols refactors cleanly."""
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    source = (
+        "# Banner: \U0001F680 Space Rocket Launch \U0001F680\n"
+        "title = 'Rocket: \U0001F680' + str([x for x in telemetry])\n"
+        "notes = 'Details: \U0001F31F' + str([y for y in status])\n"
+    )
+    tree = ast.parse(source)
+    comps = [n for n in ast.walk(tree) if isinstance(n, ast.ListComp)]
+    comps.sort(key=lambda n: n.lineno)
+
+    u1 = {
+        "file": "rocket.py",
+        "start": comps[0].lineno,
+        "end": comps[0].end_lineno,
+        "start_col": comps[0].col_offset,
+        "end_col": comps[0].end_col_offset,
+        "kind": "comprehension",
+    }
+    u2 = {
+        "file": "rocket.py",
+        "start": comps[1].lineno,
+        "end": comps[1].end_lineno,
+        "start_col": comps[1].col_offset,
+        "end_col": comps[1].end_col_offset,
+        "kind": "comprehension",
+    }
+
+    rep1 = "process_telemetry(telemetry)"
+    rep2 = "process_status(status)"
+
+    refactored = refactor_module_units(source, [(u1, rep1), (u2, rep2)])
+    assert "process_telemetry(telemetry)" in refactored
+    assert "process_status(status)" in refactored
+    assert "\U0001F680" in refactored
+    assert "\U0001F31F" in refactored
+    assert ast.parse(refactored)
+
+
+def test_adjust_line_for_replacements_exact_parity() -> None:
+    """Verifies that _adjust_line_for_replacements produces exact line numbers matching refactor_module_units."""
+    from pydoppelgangerhunt.fixer.patch import _adjust_line_for_replacements
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    orig_text = (
+        "line 1\n"
+        "line 2\n"
+        "line 3\n"
+        "line 4\n"
+        "line 5\n"
+        "line 6\n"
+        "line 7\n"
+        "line 8\n"
+        "line 9\n"
+        "line 10\n"
+    )
+    # Edge cases
+    assert _adjust_line_for_replacements(0, [], orig_text) == 1
+    assert _adjust_line_for_replacements(1, [], orig_text) == 1
+    assert _adjust_line_for_replacements(5, [], orig_text) == 5
+
+    # Case 1: Line expansion upstream (lines 3-4 [2 lines] replaced with 5 lines -> +3 delta)
+    u_exp = {"file": "t.py", "start": 3, "end": 4}
+    r_exp = (u_exp, "r1\nr2\nr3\nr4\nr5\n")
+    # Target line 7 should shift by +3 to line 10
+    adjusted = _adjust_line_for_replacements(7, [r_exp], orig_text)
+    assert adjusted == 10
+
+    # Verify against actual refactored text
+    refactored = refactor_module_units(orig_text, [r_exp])
+    ref_lines = refactored.splitlines(keepends=True)
+    # The original line 7 ("line 7\n") should now be at 1-indexed line 10
+    assert ref_lines[adjusted - 1] == "line 7\n"
+
+    # Case 2: Line contraction upstream (lines 2-5 [4 lines] replaced with 1 line -> -3 delta)
+    u_con = {"file": "t.py", "start": 2, "end": 5}
+    r_con = (u_con, "single_replacement\n")
+    # Target line 8 should shift by -3 to line 5
+    adjusted_con = _adjust_line_for_replacements(8, [r_con], orig_text)
+    assert adjusted_con == 5
+    refactored_con = refactor_module_units(orig_text, [r_con])
+    ref_con_lines = refactored_con.splitlines(keepends=True)
+    assert ref_con_lines[adjusted_con - 1] == "line 8\n"
+
+
+def test_generate_refactoring_patch_same_file_multiple_methods_and_helpers(tmp_path: Path) -> None:
+    """Verifies that generate_refactoring_patch coordinates reverse-order replacements and method helper insertion."""
+    from pydoppelgangerhunt.fixer import generate_refactoring_patch
+
+    code = (
+        "class ProcessingEngine:\n"
+        "    def step_one(self, data: list) -> list:\n"
+        "        cleaned = [x.strip() for x in data if x]\n"
+        "        validated = [c for c in cleaned if len(c) > 3]\n"
+        "        return validated\n"
+        "\n"
+        "    def step_two(self, data: list) -> list:\n"
+        "        cleaned = [x.strip() for x in data if x]\n"
+        "        validated = [c for c in cleaned if len(c) > 3]\n"
+        "        return validated\n"
+    )
+    f = tmp_path / "engine.py"
+    f.write_text(code, encoding="utf-8")
+
+    tree = ast.parse(code)
+    fns = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+    fns.sort(key=lambda n: n.lineno)
+    fn1, fn2 = fns[0], fns[1]
+
+    # Target the inner body statements (lines 3-4 and lines 8-9)
+    u1 = {
+        "name": "ProcessingEngine.step_one",
+        "file": str(f),
+        "start": fn1.body[0].lineno,
+        "end": fn1.body[1].end_lineno,
+        "kind": "statement_sequence",
+        "enclosing_class": "ProcessingEngine",
+        "enclosing_class_start": 1,
+    }
+    u2 = {
+        "name": "ProcessingEngine.step_two",
+        "file": str(f),
+        "start": fn2.body[0].lineno,
+        "end": fn2.body[1].end_lineno,
+        "kind": "statement_sequence",
+        "enclosing_class": "ProcessingEngine",
+        "enclosing_class_start": 1,
+    }
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert patch != ""
+    assert "--- a/engine.py" in patch
+    assert "+++ b/engine.py" in patch
+    assert "def _shared_" in patch
+    assert "self._shared_" in patch
+    assert "-        cleaned = [x.strip() for x in data if x]" in patch
+
+
+def test_edge_case_robustness_non_dict_and_invalid_units() -> None:
+    """Verifies that non-dict or malformed units raise descriptive errors rather than silently defaulting."""
+    from pydoppelgangerhunt.fixer import (
+        check_units_overlap,
+        compute_unit_byte_offsets,
+        compute_unit_char_offsets,
+        compute_unit_replacement_span,
+        compute_unit_spans,
+        refactor_module_units,
+    )
+    from pydoppelgangerhunt.fixer.patch import _adjust_line_for_replacements
+    from pydoppelgangerhunt.fixer.source import _compute_unit_spans
+
+    # Non-dict units raise TypeError
+    with pytest.raises(TypeError, match="Units must be dictionaries"):
+        check_units_overlap(None, {"file": "a.py", "start": 1, "end": 2})  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="Units must be dictionaries"):
+        check_units_overlap({"file": "a.py", "start": 1, "end": 2}, "invalid")  # type: ignore[arg-type]
+
+    # Malformed unit types in span calculations raise TypeError
+    with pytest.raises(TypeError, match="Unit must be a dictionary"):
+        compute_unit_spans("line 1\n", None)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="Unit must be a dictionary"):
+        with pytest.deprecated_call(match="_compute_unit_spans is deprecated"):
+            _compute_unit_spans("line 1\n", None)  # type: ignore[arg-type]
+
+    # Replacement span with invalid unit raises TypeError
+    with pytest.raises(TypeError, match="Unit must be a dictionary"):
+        compute_unit_replacement_span("line 1\n", None, "rep")  # type: ignore[arg-type]
+
+    # Malformed line numbers raise ValueError rather than silently returning false defaults
+    with pytest.raises(ValueError, match="Malformed unit"):
+        check_units_overlap({"file": "a.py", "start": "bad", "end": 2}, {"file": "a.py", "start": 1, "end": 2})
+    with pytest.raises(ValueError, match="Malformed unit"):
+        compute_unit_char_offsets("a\nb\nc\n", {"file": "a.py", "start": "bad", "end": 2})
+
+    # Inverted lines in unit
+    inv_unit = {"file": "a.py", "start": 5, "end": 2}
+    assert compute_unit_char_offsets("a\nb\nc\n", inv_unit) == (6, 6)
+
+    # _adjust_line_for_replacements with invalid target_line or non-dict unit
+    adj = _adjust_line_for_replacements("invalid", [], "line 1\n")  # type: ignore[arg-type]
+    assert adj == 1
+    with pytest.raises(TypeError, match="Unit must be a dictionary"):
+        _adjust_line_for_replacements(2, [(None, "rep")], "line 1\n")  # type: ignore[arg-type,list-item]
+
+
+def test_edge_case_robustness_columns_and_empty_inputs() -> None:
+    """Verifies handling of invalid column types, inverted column offsets, and empty inputs."""
+    from pydoppelgangerhunt.fixer import (
+        check_units_overlap,
+        col_offset_to_char_offset,
+        compute_unit_byte_offsets,
+        refactor_module_units,
+    )
+
+    # col_offset_to_char_offset with string or non-numeric offsets
+    assert col_offset_to_char_offset("hello world", "5") == 5  # type: ignore[arg-type]
+    assert col_offset_to_char_offset("hello world", -10) == 0
+    with pytest.raises(ValueError, match="Malformed column offset"):
+        col_offset_to_char_offset("hello world", "invalid")  # type: ignore[arg-type]
+
+    # Malformed column offsets in check_units_overlap raise ValueError
+    with pytest.raises(ValueError, match="Malformed unit"):
+        check_units_overlap(
+            {"file": "a.py", "start": 1, "end": 1, "start_col": "invalid"},
+            {"file": "a.py", "start": 1, "end": 1, "start_col": 0, "end_col": 10},
+        )
+
+    # Inverted column bounds on a single line: end_byte must not precede start_byte
+    inv_col_unit = {"file": "a.py", "start": 1, "end": 1, "start_col": 15, "end_col": 5}
+    s_b, e_b = compute_unit_byte_offsets("01234567890123456789\n", inv_col_unit)
+    assert s_b <= e_b
+
+    # check_units_overlap with string columns
+    u_str1 = {"file": "a.py", "start": 1, "end": 1, "start_col": "5", "end_col": "10"}
+    u_str2 = {"file": "a.py", "start": 1, "end": 1, "start_col": "8", "end_col": "15"}
+    assert check_units_overlap(u_str1, u_str2)
+
+    # Empty source text and empty replacement in refactor_module_units
+    assert refactor_module_units("", []) == ""
+    assert refactor_module_units("content", []) == "content"
+    del_unit = {"file": "a.py", "start": 1, "end": 1}
+    assert refactor_module_units("remove this\nkeep this\n", [(del_unit, "")]) == "keep this\n"
+
+
+def test_column_bounded_replacement_preserves_suffix_and_pragma() -> None:
+    """Verifies that column-bounded replacements preserve trailing code and place boundary pragmas at line end."""
+    from pydoppelgangerhunt.fixer import (
+        compute_unit_replacement_span,
+        replace_unit_in_source,
+        resolve_unit_replacement,
+    )
+
+    # Case 1: Mid-line expression followed by binary operation and trailing type ignore
+    source1 = "result = expensive_call() + other_expression  # type: ignore\n"
+    u_call = {"file": "test_mod.py", "start": 1, "end": 1, "start_col": 9, "end_col": 25, "kind": "complex_expr"}
+    refactored1 = replace_unit_in_source(source1, u_call, "shared_call()")
+    assert refactored1 == "result = shared_call() + other_expression  # type: ignore\n"
+    assert ast.parse(refactored1)
+
+    # Case 2: compute_unit_replacement_span with boundary pragma attached to unit on line with trailing code
+    source2 = "val = calculate() + offset  # type: ignore\n"
+    u_calc = {"file": "test_mod.py", "start": 1, "end": 1, "start_col": 6, "end_col": 17, "kind": "complex_expr"}
+    s_c, e_c, final_rep = compute_unit_replacement_span(source2, u_calc, "new_calc()", preserve_boundary_pragmas=True)
+    assembled = source2[:s_c] + final_rep + source2[e_c:]
+    assert assembled == "val = new_calc() + offset  # type: ignore\n"
+    assert ast.parse(assembled)
+
+    # Case 3: Trailing code without terminal newline at EOF
+    source3 = "out = compute_val() + 10  # noqa"
+    u_comp = {"file": "test_mod.py", "start": 1, "end": 1, "start_col": 6, "end_col": 19, "kind": "complex_expr"}
+    refactored3 = replace_unit_in_source(source3, u_comp, "fast_val()")
+    assert refactored3 == "out = fast_val() + 10  # noqa"
+    assert ast.parse(refactored3)
+
+    # Case 4: Attached boundary pragma (# type: ignore) on multi-line unit with different pragma in suffix (# noqa)
+    source4 = "res = calculate(  # type: ignore\n    data\n)  # noqa: E501\n"
+    u_multi = {"file": "test_mod.py", "start": 1, "end": 3, "start_col": 6, "end_col": 1, "kind": "complex_expr"}
+    item4 = resolve_unit_replacement(source4, u_multi, "fast_calc(data)", preserve_boundary_pragmas=True)
+    assert item4.consumes_line_suffix is True
+    refactored4 = replace_unit_in_source(source4, u_multi, "fast_calc(data)", preserve_boundary_pragmas=True)
+    assert refactored4 == "res = fast_calc(data)  # noqa: E501  # type: ignore\n"
+    assert ast.parse(refactored4)
+
+    # Case 5: Attached boundary pragma on multi-line unit with regular comment in suffix
+    source5 = "res = calculate(  # type: ignore\n    data\n)  # compute offset\n"
+    item5 = resolve_unit_replacement(source5, u_multi, "fast_calc(data)", preserve_boundary_pragmas=True)
+    assert item5.consumes_line_suffix is True
+    refactored5 = replace_unit_in_source(source5, u_multi, "fast_calc(data)", preserve_boundary_pragmas=True)
+    assert refactored5 == "res = fast_calc(data)  # compute offset  # type: ignore\n"
+    assert ast.parse(refactored5)
+
+
+def test_refactor_module_units_same_line_emoji_prefix_replacement() -> None:
+    """Verifies that AST byte offsets are translated to character offsets when replacing code units preceded by emojis."""
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    # Single emoji before list comprehension on the same line
+    emoji_source = "prefix = '🚀'; value = [x for x in data]\n"
+    tree1 = ast.parse(emoji_source)
+    comp_node = next(n for n in ast.walk(tree1) if isinstance(n, ast.ListComp))
+    assert comp_node.col_offset == 25  # In UTF-8 bytes ('🚀' is 4 bytes vs 1 char)
+    u_comp = {
+        "file": "emoji_mod.py",
+        "start": comp_node.lineno,
+        "end": comp_node.end_lineno,
+        "start_col": comp_node.col_offset,
+        "end_col": comp_node.end_col_offset,
+        "kind": "comprehension",
+    }
+    refactored_emoji = refactor_module_units(emoji_source, [(u_comp, "helper(data)")])
+    assert refactored_emoji == "prefix = '🚀'; value = helper(data)\n"
+    assert ast.parse(refactored_emoji)
+
+    # Multiple multi-byte characters and trailing statements
+    multi_emoji_source = "tag = '🎉✨🔥'; items = [i * 2 for i in raw_items]; done = True\n"
+    tree2 = ast.parse(multi_emoji_source)
+    comp_node2 = next(n for n in ast.walk(tree2) if isinstance(n, ast.ListComp))
+    u_comp2 = {
+        "file": "emoji_mod.py",
+        "start": comp_node2.lineno,
+        "end": comp_node2.end_lineno,
+        "start_col": comp_node2.col_offset,
+        "end_col": comp_node2.end_col_offset,
+        "kind": "comprehension",
+    }
+    refactored_multi = refactor_module_units(multi_emoji_source, [(u_comp2, "transform(raw_items)")])
+    assert refactored_multi == "tag = '🎉✨🔥'; items = transform(raw_items); done = True\n"
+    assert ast.parse(refactored_multi)
+
+
+def test_dual_tier_overlap_conservative_missing_column_rejection() -> None:
+    """Verifies intentional dual-tier overlap behavior: conservative whole-line rejection vs exact byte collision."""
+    from pydoppelgangerhunt.fixer import check_units_overlap, refactor_module_units
+
+    # Tier 1: When one unit omits column offsets, check_units_overlap conservatively assumes whole-line conflict
+    unit_with_cols = {"file": "mod.py", "start": 3, "end": 3, "start_col": 0, "end_col": 10}
+    unit_without_cols = {"file": "mod.py", "start": 3, "end": 3}
+    assert check_units_overlap(unit_with_cols, unit_without_cols)
+    sample_text = "line1\nline2\ncall_one() and call_two()\nline4\n"
+    with pytest.raises(ValueError, match="Overlapping unit collision detected"):
+        refactor_module_units(sample_text, [(unit_with_cols, "new_one()"), (unit_without_cols, "new_stmt()")])
+
+    # Tier 1 Acceptance: Disjoint column ranges on the same line are accepted
+    unit_left = {"file": "mod.py", "start": 3, "end": 3, "start_col": 0, "end_col": 10}
+    unit_right = {"file": "mod.py", "start": 3, "end": 3, "start_col": 15, "end_col": 25}
+    assert not check_units_overlap(unit_left, unit_right)
+    success_refactor = refactor_module_units(sample_text, [(unit_left, "first_rep"), (unit_right, "second_rep")])
+    assert "first_rep and second_rep\n" in success_refactor
+
+    # Tier 2 Catch: Pragma slice expansion extending to line end collides with subsequent unit on same line
+    src_expand = "x = 1  # type: ignore\ny = calc() + tail\n"
+    unit_calc = {"file": "mod.py", "start": 1, "end": 2, "start_col": 0, "end_col": 10, "kind": "complex_expr"}
+    unit_tail = {"file": "mod.py", "start": 2, "end": 2, "start_col": 13, "end_col": 17, "kind": "complex_expr"}
+    # Tier 1 allows because line 2 column bounds (10 vs 13) are disjoint:
+    assert not check_units_overlap(unit_calc, unit_tail)
+    # Tier 2 catches collision because unit_calc extends slice to end of line 2 to attach pragma:
+    with pytest.raises(ValueError, match="Overlapping unit collision detected"):
+        refactor_module_units(src_expand, [(unit_calc, "new_y"), (unit_tail, "new_tail")])
+
+
+def test_check_units_overlap_multiline_end_boundary_single_line() -> None:
+    """Verifies column-aware overlap detection when a single-line unit shares a multi-line unit's end line."""
+    from pydoppelgangerhunt.fixer import check_units_overlap, refactor_module_units
+
+    # Reviewer test case: multi-line unit 1 (lines 1..3, cols 0..10) and single-line unit 2 (line 3, cols 20..30)
+    u_multi = {"file": "pkg/mod.py", "start": 1, "end": 3, "start_col": 0, "end_col": 10}
+    u_single = {"file": "pkg/mod.py", "start": 3, "end": 3, "start_col": 20, "end_col": 30}
+    assert not check_units_overlap(u_multi, u_single)
+    assert not check_units_overlap(u_single, u_multi)
+
+    # Overlapping columns on the shared end boundary line
+    u_single_overlap = {"file": "pkg/mod.py", "start": 3, "end": 3, "start_col": 5, "end_col": 15}
+    assert check_units_overlap(u_multi, u_single_overlap)
+    assert check_units_overlap(u_single_overlap, u_multi)
+
+    # Multi-line units overlapping across interior lines (lines 1..3 vs lines 2..3)
+    u_interior = {"file": "pkg/mod.py", "start": 2, "end": 3, "start_col": 20, "end_col": 30}
+    assert check_units_overlap(u_multi, u_interior)
+    assert check_units_overlap(u_interior, u_multi)
+
+    # End-to-end refactoring with non-overlapping multi-line and single-line end-boundary units
+    src_code = "first_stmt = 1\nsecond_stmt = 2\nres = calc() + tail\n"
+    unit_m = {"file": "pkg/mod.py", "start": 1, "end": 3, "start_col": 0, "end_col": 12, "kind": "complex_expr"}
+    unit_s = {"file": "pkg/mod.py", "start": 3, "end": 3, "start_col": 15, "end_col": 19, "kind": "complex_expr"}
+    assert not check_units_overlap(unit_m, unit_s)
+    refactored = refactor_module_units(src_code, [(unit_m, "fast_res"), (unit_s, "offset")])
+    assert "fast_res + offset\n" in refactored
+
+
+def test_check_units_overlap_multiline_start_boundary_single_line() -> None:
+    """Verifies column-aware overlap detection when a single-line unit shares a multi-line unit's start line."""
+    from pydoppelgangerhunt.fixer import check_units_overlap
+
+    u_multi = {
+        "file": "pkg/mod.py",
+        "start": 1,
+        "end": 3,
+        "start_col": 20,
+        "end_col": 30,
+    }
+    # Single-line unit before multi-line unit's start_col on line 1: disjoint ([5, 15) and [20, EOL))
+    u_single_before = {
+        "file": "pkg/mod.py",
+        "start": 1,
+        "end": 1,
+        "start_col": 5,
+        "end_col": 15,
+    }
+
+    assert not check_units_overlap(u_multi, u_single_before)
+    assert not check_units_overlap(u_single_before, u_multi)
+
+    # Single-line unit intersecting multi-line unit's start_col on line 1: overlapping ([15, 25) and [20, EOL))
+    u_single_overlap = {
+        "file": "pkg/mod.py",
+        "start": 1,
+        "end": 1,
+        "start_col": 15,
+        "end_col": 25,
+    }
+
+    assert check_units_overlap(u_multi, u_single_overlap)
+    assert check_units_overlap(u_single_overlap, u_multi)
+
+
+def test_col_offset_to_char_offset_clamps_malformed_utf8_offset() -> None:
+    """Verifies that col_offset_to_char_offset clamps to the nearest valid character boundary when offset lands mid-sequence."""
+    from pydoppelgangerhunt.fixer import col_offset_to_char_offset
+
+    line = "header = '\U0001F680'; data = 42\n"
+    # '\U0001F680' begins at byte 10 and ends at byte 14 (UTF-8 bytes: 10, 11, 12, 13)
+    # Byte offset 10 points to the emoji character (char index 10)
+    assert col_offset_to_char_offset(line, 10) == 10
+    # Byte offsets 11, 12, 13 land in the middle of '\U0001F680' and clamp to char index 10
+    assert col_offset_to_char_offset(line, 11) == 10
+    assert col_offset_to_char_offset(line, 12) == 10
+    assert col_offset_to_char_offset(line, 13) == 10
+    # Byte offset 14 points past the emoji (char index 11)
+    assert col_offset_to_char_offset(line, 14) == 11
+
+
+def test_unit_span_namedtuple_and_compute_unit_spans() -> None:
+    """Verifies that UnitSpan carries character/byte bounds and line/col metadata without recomputation."""
+    from pydoppelgangerhunt.fixer import UnitSpan, compute_unit_spans, compute_unit_replacement_span
+
+    source = "header = '🚀'; data = [x for x in items]\n"
+    unit = {
+        "file": "test.py",
+        "start": 1,
+        "end": 1,
+        "start_col": 25,
+        "end_col": 42,
+        "kind": "comprehension",
+    }
+    span = compute_unit_spans(source, unit)
+    assert isinstance(span, UnitSpan)
+    assert span.start_char == 22
+    assert span.end_char == 39
+    assert span.start_byte == 25
+    assert span.end_byte == 42
+    assert span.is_column_bounded is True
+    assert span.start_line == 1
+    assert span.end_line == 1
+    assert span.start_col_char == 22
+    assert span.end_col_char == 39
+
+    # Verify threading into compute_unit_replacement_span avoids recomputation
+    s_c, e_c, rep = compute_unit_replacement_span(source, unit, "helper(items)", unit_span=span)
+    assert s_c == 22
+    assert e_c == 39
+    assert rep == "helper(items)"
+
+
+def test_adjust_line_for_replacements_additive_deltas() -> None:
+    """Verifies that _compute_replacement_line_deltas and _adjust_line_for_replacements compute exact line shifts."""
+    from pydoppelgangerhunt.fixer.patch import (
+        _adjust_line_for_replacements,
+        _compute_replacement_line_deltas,
+    )
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    orig_text = (
+        "line 1\n"
+        "line 2\n"
+        "line 3\n"
+        "line 4\n"
+        "line 5\n"
+        "line 6\n"
+        "line 7\n"
+        "line 8\n"
+    )
+    # Unit 1: lines 2-3 (2 lines) replaced with 4 lines (+2 delta)
+    u1 = {"file": "mod.py", "start": 2, "end": 3}
+    # Unit 2: lines 5-6 (2 lines) replaced with 1 line (-1 delta)
+    u2 = {"file": "mod.py", "start": 5, "end": 6}
+    reps = [(u1, "a\nb\nc\nd\n"), (u2, "single\n")]
+
+    deltas = _compute_replacement_line_deltas(reps, orig_text)
+    assert deltas == [(3, 2), (6, -1)]
+
+    # Target line 4 (after u1, before u2): should shift by +2 from line 4 to line 6
+    adj4 = _adjust_line_for_replacements(4, reps, orig_text)
+    assert adj4 == 6
+
+    # Target line 7 (after u1 and u2): net shift is +2 - 1 = +1, so line 7 shifts to line 8
+    adj7 = _adjust_line_for_replacements(7, reps, orig_text)
+    assert adj7 == 8
+
+    # Parity check against actual refactor_module_units
+    refactored = refactor_module_units(orig_text, reps)
+    ref_lines = refactored.splitlines(keepends=True)
+    assert ref_lines[adj4 - 1] == "line 4\n"
+    assert ref_lines[adj7 - 1] == "line 7\n"
+
+
+def test_check_units_overlap_malformed_inputs_raise_errors() -> None:
+    """Verifies that check_units_overlap raises descriptive errors rather than silently returning False on invalid units."""
+    from pydoppelgangerhunt.fixer import check_units_overlap
+
+    u_valid = {"file": "mod.py", "start": 1, "end": 5}
+
+    # Non-dictionary units raise TypeError
+    with pytest.raises(TypeError, match="Units must be dictionaries"):
+        check_units_overlap(123, u_valid)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="Units must be dictionaries"):
+        check_units_overlap(u_valid, "invalid")  # type: ignore[arg-type]
+
+    # Malformed start/end lines raise ValueError
+    with pytest.raises(ValueError, match="Malformed unit: invalid line boundary"):
+        check_units_overlap({"file": "mod.py", "start": "bad_int", "end": 5}, u_valid)
+    with pytest.raises(ValueError, match="Malformed unit: invalid line boundary"):
+        check_units_overlap(u_valid, {"file": "mod.py", "start": 1, "end": "bad_int"})
+
+    # Malformed column offsets raise ValueError
+    with pytest.raises(ValueError, match="Malformed unit: invalid column offset"):
+        check_units_overlap({"file": "mod.py", "start": 1, "end": 5, "start_col": "invalid"}, u_valid)
+    with pytest.raises(ValueError, match="Malformed unit: invalid column offset"):
+        check_units_overlap(u_valid, {"file": "mod.py", "start": 1, "end": 5, "end_col": "invalid"})
+
+
+def test_multi_unit_expansion_with_boundary_pragma_line_suffix_extension() -> None:
+    """Verifies multi-unit replacements where both units expand and one has a trailing boundary pragma."""
+    from pydoppelgangerhunt.fixer import (
+        ReplacementItem,
+        refactor_module_units,
+        resolve_unit_replacement,
+    )
+
+    source_text = (
+        "x = 1  # type: ignore\n"
+        "y = [1, 2, 3] ; extra = 10\n"
+        "z = [4, 5, 6]\n"
+        "out = None\n"
+    )
+    # Unit 1: spans lines 1 to 2, ending at column 13 on line 2 (cols 0-13)
+    u1 = {
+        "file": "calc.py",
+        "name": "u1",
+        "start": 1,
+        "end": 2,
+        "start_col": 0,
+        "end_col": 13,
+        "kind": "complex_expr",
+    }
+    # Unit 2: 'z = [4, 5, 6]' on line 3 (cols 0-13)
+    u2 = {
+        "file": "calc.py",
+        "name": "u2",
+        "start": 3,
+        "end": 3,
+        "start_col": 0,
+        "end_col": 13,
+        "kind": "comprehension",
+    }
+
+    rep1 = "x = 1\ny = (\n    1,\n    2,\n    3,\n)"
+    rep2 = "z = (\n    4,\n    5,\n    6,\n)"
+
+    # Test resolve_unit_replacement directly
+    item1 = resolve_unit_replacement(source_text, u1, rep1, preserve_boundary_pragmas=True)
+    assert isinstance(item1, ReplacementItem)
+    assert item1.consumes_line_suffix is True
+    line1_len = len("x = 1  # type: ignore\n")
+    line2_len = len("y = [1, 2, 3] ; extra = 10\n")
+    assert item1.end_char == line1_len + line2_len
+    assert "# type: ignore" in item1.final_rep
+    assert "; extra = 10" in item1.final_rep
+
+    # Test refactor_module_units applying both multi-line expansions
+    reps = [(u1, rep1), (u2, rep2)]
+    refactored = refactor_module_units(source_text, reps)
+
+    assert "y = (\n    1,\n    2,\n    3,\n) ; extra = 10  # type: ignore\n" in refactored
+    assert "z = (\n    4,\n    5,\n    6,\n)" in refactored
+    assert "out = None\n" in refactored
+
+
+def test_col_offset_to_char_offset_utf8_multibyte_clamping_and_exact_boundary() -> None:
+    """Verifies that col_offset_to_char_offset accurately handles multi-byte UTF-8 boundaries and clamps."""
+    from pydoppelgangerhunt.fixer import (
+        col_offset_to_char_offset,
+        compute_unit_spans,
+    )
+
+    # Greek characters: each 'α', 'β', 'γ' is 2 UTF-8 bytes.
+    # Total bytes: 2 ('α') + 2 ('β') + 2 ('γ') + 1 ('\n') = 7 bytes.
+    line = "αβγ\n"
+    assert line.encode("utf-8") == b"\xce\xb1\xce\xb2\xce\xb3\n"
+
+    # Landing exactly at byte 0: char 0 ("")
+    assert col_offset_to_char_offset(line, 0) == 0
+    # Landing exactly at byte 2 (end of 'α'): char 1 ("α")
+    assert col_offset_to_char_offset(line, 2) == 1
+    # Landing at byte 3 (middle of 'β' byte sequence): clamped safely to preceding valid char boundary (char 1)
+    assert col_offset_to_char_offset(line, 3) == 1
+    # Landing exactly at byte 4 (end of 'β'): char 2 ("αβ")
+    assert col_offset_to_char_offset(line, 4) == 2
+    # Landing at byte 5 (middle of 'γ'): clamped safely to preceding char boundary (char 2)
+    assert col_offset_to_char_offset(line, 5) == 2
+    # Landing exactly at byte 6 (end of 'γ'): char 3 ("αβγ")
+    assert col_offset_to_char_offset(line, 6) == 3
+
+    # Test through compute_unit_spans with exact and clamped column bounds
+    u_exact = {"file": "greek.py", "start": 1, "end": 1, "start_col": 0, "end_col": 4, "kind": "complex_expr"}
+    span_exact = compute_unit_spans(line, u_exact)
+    assert span_exact.start_char == 0
+    assert span_exact.end_char == 2
+    assert span_exact.start_byte == 0
+    assert span_exact.end_byte == 4
+
+    u_clamped = {"file": "greek.py", "start": 1, "end": 1, "start_col": 0, "end_col": 3, "kind": "complex_expr"}
+    span_clamped = compute_unit_spans(line, u_clamped)
+    assert span_clamped.start_char == 0
+    assert span_clamped.end_char == 1
+    assert span_clamped.start_byte == 0
+    assert span_clamped.end_byte == 3
+
+
+def test_adjust_line_for_replacements_boundary_coincidence() -> None:
+    """Verifies that _adjust_line_for_replacements does not shift a target line when a unit ends on that target line."""
+    from pydoppelgangerhunt.fixer.patch import _adjust_line_for_replacements
+
+    orig_text = (
+        "line 1\n"
+        "line 2\n"
+        "line 3\n"
+        "line 4\n"
+        "line 5\n"
+        "line 6\n"
+    )
+    # Unit 1: lines 1-3 replaced with 1 line (delta = -2)
+    u1 = {"file": "mod.py", "start": 1, "end": 3}
+    # Unit 2: lines 4-5 replaced with 3 lines (delta = +1)
+    u2 = {"file": "mod.py", "start": 4, "end": 5}
+    reps = [(u1, "single_1_to_3\n"), (u2, "exp_4_1\nexp_4_2\nexp_4_3\n")]
+
+    # Target line 3: coincides with end of u1. Since end_line < target_line is 3 < 3 (False),
+    # u1's delta is NOT added to target line 3. Result remains 3.
+    assert _adjust_line_for_replacements(3, reps, orig_text) == 3
+
+    # Target line 4: strictly downstream of u1 (3 < 4), but coincides with start of u2.
+    # u1 applies (delta -2), u2 does not apply (5 < 4 is False). Result is 4 + (-2) = 2.
+    assert _adjust_line_for_replacements(4, reps, orig_text) == 2
+
+    # Target line 5: coincides with end of u2. u1 applies (3 < 5, delta -2),
+    # but u2 ending on line 5 does NOT apply (5 < 5 is False). Result is 5 + (-2) = 3.
+    assert _adjust_line_for_replacements(5, reps, orig_text) == 3
+
+    # Target line 6: downstream of both u1 and u2 (3 < 6 and 5 < 6).
+    # Both deltas apply: -2 + 1 = -1. Result is 6 + (-1) = 5.
+    assert _adjust_line_for_replacements(6, reps, orig_text) == 5
+
+
+def test_check_units_overlap_multiline_inverted_column_bounds() -> None:
+    """Verifies that check_units_overlap handles boundary column disjointness and interior overlaps."""
+    from pydoppelgangerhunt.fixer import check_units_overlap
+
+    # Multi-line unit with start_col > end_col across lines 1 to 3
+    u_multi = {"file": "mod.py", "start": 1, "end": 3, "start_col": 30, "end_col": 10}
+
+    # Single-line unit on line 1 before start_col (disjoint)
+    u_single_disjoint = {"file": "mod.py", "start": 1, "end": 1, "start_col": 15, "end_col": 25}
+    assert check_units_overlap(u_multi, u_single_disjoint) is False
+    assert check_units_overlap(u_single_disjoint, u_multi) is False
+
+    # Single-line unit on line 1 intersecting start_col (overlapping: [25, 35) and [30, EOL))
+    u_single_overlap_start = {"file": "mod.py", "start": 1, "end": 1, "start_col": 25, "end_col": 35}
+    assert check_units_overlap(u_multi, u_single_overlap_start) is True
+    assert check_units_overlap(u_single_overlap_start, u_multi) is True
+
+    # Single-line unit on line 2 (interior line: unconditionally overlapping)
+    u_single_interior = {"file": "mod.py", "start": 2, "end": 2, "start_col": 5, "end_col": 15}
+    assert check_units_overlap(u_multi, u_single_interior) is True
+    assert check_units_overlap(u_single_interior, u_multi) is True
+
+    # Single-line unit on line 3 intersecting end_col (overlapping: [5, 15) and [0, 10))
+    u_single_overlap_end = {"file": "mod.py", "start": 3, "end": 3, "start_col": 5, "end_col": 15}
+    assert check_units_overlap(u_multi, u_single_overlap_end) is True
+    assert check_units_overlap(u_single_overlap_end, u_multi) is True
+
+    # Single-line unit on line 3 after end_col (disjoint: [15, 25) and [0, 10))
+    u_single_disjoint_end = {"file": "mod.py", "start": 3, "end": 3, "start_col": 15, "end_col": 25}
+    assert check_units_overlap(u_multi, u_single_disjoint_end) is False
+    assert check_units_overlap(u_single_disjoint_end, u_multi) is False
+
+    # Two multi-line units sharing the same lines 1-3
+    u_multi_same = {"file": "mod.py", "start": 1, "end": 3, "start_col": 30, "end_col": 10}
+    assert check_units_overlap(u_multi, u_multi_same) is True
+
+    # Single-line unit with inverted column bounds on same line represents an empty range (disjoint)
+    u_empty = {"file": "mod.py", "start": 1, "end": 1, "start_col": 20, "end_col": 10}
+    assert check_units_overlap(u_multi, u_empty) is False
+    assert check_units_overlap(u_empty, u_multi) is False
+
+    # Single-line unit with zero-width column bounds (start_col == end_col) represents an empty range (disjoint)
+    u_zero_start = {"file": "mod.py", "start": 1, "end": 1, "start_col": 35, "end_col": 35}
+    assert check_units_overlap(u_multi, u_zero_start) is False
+    assert check_units_overlap(u_zero_start, u_multi) is False
+
+    u_zero_end = {"file": "mod.py", "start": 3, "end": 3, "start_col": 5, "end_col": 5}
+    assert check_units_overlap(u_multi, u_zero_end) is False
+    assert check_units_overlap(u_zero_end, u_multi) is False
+
+    # Sequential touch with zero-width single unit represents an empty range (disjoint)
+    u_prev = {"file": "mod.py", "start": 1, "end": 2, "start_col": 0, "end_col": 20}
+    u_zero_touch = {"file": "mod.py", "start": 2, "end": 2, "start_col": 10, "end_col": 10}
+    assert check_units_overlap(u_prev, u_zero_touch) is False
+    assert check_units_overlap(u_zero_touch, u_prev) is False
+
+    # Coordinate clamping parity: start: 0 and end: 0 clamped to line >= 1
+    u_zero_line1 = {"file": "mod.py", "start": 0, "end": 0, "start_col": 0, "end_col": 10}
+    u_line1 = {"file": "mod.py", "start": 1, "end": 1, "start_col": 5, "end_col": 15}
+    assert check_units_overlap(u_zero_line1, u_line1) is True
+
+
+def test_unit_desc_strict_validation_and_parsing() -> None:
+    """Verifies that _unit_desc in refactor_module_units strictly raises TypeError and ValueError."""
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    # Non-dictionary unit raises TypeError
+    with pytest.raises(TypeError, match="Unit must be a dictionary"):
+        refactor_module_units("x = 1\n", [("invalid", "y = 2\n")])  # type: ignore[list-item]
+
+    # Non-integer start line raises ValueError
+    with pytest.raises(ValueError, match="Malformed unit: invalid 'start' line"):
+        refactor_module_units("x = 1\n", [({"file": "m.py", "start": "bad", "end": 1}, "y = 2\n")])
+
+    # Overlapping collision error formatting with valid units
+    u1 = {"file": "m.py", "start": 1, "end": 2, "name": "fn1"}
+    u2 = {"file": "m.py", "start": 1, "end": 2, "name": "fn2"}
+    with pytest.raises(ValueError, match="Overlapping unit collision detected between 'fn1' \\(1-2\\) and 'fn2' \\(1-2\\)"):
+        refactor_module_units("x = 1\ny = 2\n", [(u1, "x = 10\n"), (u2, "y = 20\n")])
+
+
+def test_is_valid_unit_coordinates_scenarios() -> None:
+    """Verifies that is_valid_unit_coordinates, parse_unit_coord, and compute_line_offsets validate and extract coordinates."""
+    from pydoppelgangerhunt.fixer.patch import (
+        compute_line_offsets as compute_line_offsets_pub,
+        is_valid_unit_coordinates as is_valid_pub,
+        parse_unit_coord as parse_unit_coord_pub,
+    )
+    from pydoppelgangerhunt.fixer.source import (
+        _compute_line_offsets,
+        _is_valid_unit_coordinates,
+        _parse_unit_coord,
+        compute_line_offsets,
+        is_valid_unit_coordinates,
+        parse_unit_coord,
+    )
+    import pydoppelgangerhunt as pdgh
+    import pydoppelgangerhunt.fixer as pdgh_fixer
+
+    # Test behavioural equivalence of public functions, package exports, and backward-compatible aliases
+    test_cases: List[Any] = [
+        None,
+        "string_unit",
+        ["list_unit"],
+        {},
+        {"start": 1, "end": 5},
+        {"start": "1", "end": "5"},
+        {"start": "not_an_int"},
+        {"start": 1, "end": [2]},
+        {"start": 1, "end": 5, "start_col": "invalid"},
+        {"start": 1, "end": 5, "end_col": {}},
+    ]
+    for tc in test_cases:
+        expected = is_valid_unit_coordinates(tc)
+        assert is_valid_pub(tc) == expected
+        assert _is_valid_unit_coordinates(tc) == expected
+        assert pdgh_fixer.is_valid_unit_coordinates(tc) == expected
+        assert pdgh.is_valid_unit_coordinates(tc) == expected
+
+    coord_cases: List[Tuple[Dict[str, Any], str, int, int]] = [
+        ({"start": 10}, "start", 1, 10),
+        ({"start": "15"}, "start", 1, 15),
+        ({}, "start", 42, 42),
+        ({"end": 99}, "end", 0, 99),
+    ]
+    for u_data, key, def_val, expected_val in coord_cases:
+        assert parse_unit_coord(u_data, key, default=def_val) == expected_val
+        assert parse_unit_coord_pub(u_data, key, default=def_val) == expected_val
+        assert _parse_unit_coord(u_data, key, default=def_val) == expected_val
+        assert pdgh_fixer.parse_unit_coord(u_data, key, default=def_val) == expected_val
+        assert pdgh.parse_unit_coord(u_data, key, default=def_val) == expected_val
+
+    line_cases: List[Tuple[List[str], Tuple[List[int], List[int]]]] = [
+        (["hello\n", "world 🚀\n"], ([0, 6, 14], [0, 6, 17])),
+        ([], ([0], [0])),
+        (["line1\n", "line2\n"], ([0, 6, 12], [0, 6, 12])),
+    ]
+    for lines_input, (exp_c, exp_b) in line_cases:
+        res = compute_line_offsets(lines_input)
+        assert res == (exp_c, exp_b)
+        assert compute_line_offsets_pub(lines_input) == (exp_c, exp_b)
+        assert _compute_line_offsets(lines_input) == (exp_c, exp_b)
+        assert pdgh_fixer.compute_line_offsets(lines_input) == (exp_c, exp_b)
+        assert pdgh.compute_line_offsets(lines_input) == (exp_c, exp_b)
+
+
+def test_compute_replacement_line_deltas_raises_on_overlapping_units() -> None:
+    """Verifies that _compute_replacement_line_deltas raises ValueError on overlapping units."""
+    from pydoppelgangerhunt.fixer.patch import _compute_replacement_line_deltas
+
+    orig_text = "def f1():\n    return 1\n\ndef f2():\n    return 2\n"
+    u1 = {"file": "sample.py", "name": "fn1", "start": 1, "end": 3}
+    u2 = {"file": "sample.py", "name": "fn2", "start": 2, "end": 5}
+
+    with pytest.raises(
+        ValueError,
+        match=r"Overlapping unit collision detected in line delta computation between 'fn1' \(1-3\) and 'fn2' \(2-5\) in sample\.py",
+    ):
+        _compute_replacement_line_deltas([(u1, "# rep 1\n"), (u2, "# rep 2\n")], orig_text)
+
+
+def test_generate_refactoring_patch_skips_malformed_clone_pair_without_aborting_batch(
+    tmp_path: Path,
+) -> None:
+    """Verifies that a malformed clone pair in a batch does not abort valid clone pair refactoring."""
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text("def run_a(val: int) -> int:\n    return val * 2\n", encoding="utf-8")
+    f2.write_text("def run_b(val: int) -> int:\n    return val * 2\n", encoding="utf-8")
+
+    # Pair 1: Malformed coordinates that would fail coordinate parsing
+    bad_u1 = {"file": str(f1), "name": "run_a", "start": "not_an_int", "end": 2}
+    bad_u2 = {"file": str(f2), "name": "run_b", "start": 1, "end": 2}
+
+    # Pair 2: Fully valid clone pair
+    good_u1 = {"file": str(f1), "name": "run_a", "start": 1, "end": 2, "kind": "function"}
+    good_u2 = {"file": str(f2), "name": "run_b", "start": 1, "end": 2, "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(0.9, bad_u1, bad_u2), (1.0, good_u1, good_u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+
+    # Valid pair should have successfully generated patch despite bad pair in batch
+    assert "--- a/mod1.py" in patch
+    assert "--- a/mod2.py" in patch
+    assert "_shared_run_a_run_b" in patch
+
+
+def test_generate_refactoring_patch_skips_syntax_error_pair_without_aborting_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that an unexpected SyntaxError during clone pair processing does not abort valid refactorings."""
+    import pydoppelgangerhunt.fixer.patch as patch_mod
+
+    f1 = tmp_path / "mod_valid1.py"
+    f2 = tmp_path / "mod_valid2.py"
+    f1.write_text("def process_a(val: int) -> int:\n    return val + 10\n", encoding="utf-8")
+    f2.write_text("def process_b(val: int) -> int:\n    return val + 10\n", encoding="utf-8")
+
+    good_u1 = {"file": str(f1), "name": "process_a", "start": 1, "end": 2, "kind": "function"}
+    good_u2 = {"file": str(f2), "name": "process_b", "start": 1, "end": 2, "kind": "function"}
+
+    # Pair 1: clone unit that triggers SyntaxError during scope analysis
+    bad_u1 = {"file": str(f1), "name": "syntax_err", "start": 1, "end": 2, "kind": "function"}
+    bad_u2 = {"file": str(f2), "name": "syntax_err", "start": 1, "end": 2, "kind": "function"}
+
+    original_scope = patch_mod.analyze_unit_variable_scope
+    called = [False]
+
+    def mock_scope(*args: Any, **kwargs: Any) -> Any:
+        if not called[0]:
+            called[0] = True
+            raise SyntaxError("Unexpected syntax error in scope analysis")
+        return original_scope(*args, **kwargs)
+
+    monkeypatch.setattr(patch_mod, "analyze_unit_variable_scope", mock_scope)
+
+    patch = generate_refactoring_patch(
+        [(0.9, bad_u1, bad_u2), (1.0, good_u1, good_u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+
+    # Valid pair should have successfully generated patch despite SyntaxError on first pair
+    assert "--- a/mod_valid1.py" in patch
+    assert "--- a/mod_valid2.py" in patch
+    assert "_shared_process_a_process_b" in patch
+
+
+def test_compute_unit_spans_unpadded_line_length_and_no_double_newline() -> None:
+    """Verifies that compute_unit_spans does not leave stray double newlines on statement replacements."""
+    from pydoppelgangerhunt.fixer import compute_unit_spans, refactor_module_units
+
+    # Whole-line indented statement
+    src = "def foo():\n    x = 1\n    return x\n"
+    unit = {"file": "test.py", "start": 2, "end": 2, "start_col": 4, "end_col": 9}
+    span = compute_unit_spans(src, unit)
+    # Because prefix is only whitespace and suffix is empty (no trailing code), it is whole-line
+    assert span.is_column_bounded is False
+
+    # Replacement should replace whole line including trailing newline, with no double blank lines
+    result = refactor_module_units(src, [(unit, "    x = 2\n")])
+    assert result == "def foo():\n    x = 2\n    return x\n"
+    assert "\n\n" not in result
+
+    # Multi-byte UTF-8 line where byte offset differs from character length
+    src_emoji = "def foo():\n    msg = '🚀 rocket'\n    return msg\n"
+    # AST end_col_offset in UTF-8 bytes for "    msg = '🚀 rocket'" is 24 bytes
+    unit_emoji = {"file": "test.py", "start": 2, "end": 2, "start_col": 4, "end_col": 24}
+    span_emoji = compute_unit_spans(src_emoji, unit_emoji)
+    assert span_emoji.is_column_bounded is False
+    res_emoji = refactor_module_units(src_emoji, [(unit_emoji, "    msg = '🌟 star'\n")])
+    assert res_emoji == "def foo():\n    msg = '🌟 star'\n    return msg\n"
+    assert "\n\n" not in res_emoji
+
+    # Mid-line expression with trailing code on the same line MUST be column-bounded
+    src_mid = "x = 1; y = 2\n"
+    unit_mid = {"file": "test.py", "start": 1, "end": 1, "start_col": 0, "end_col": 5}
+    span_mid = compute_unit_spans(src_mid, unit_mid)
+    assert span_mid.is_column_bounded is True
+
+
+def test_col_offset_to_char_offset_ascii_fast_path_equivalence() -> None:
+    """Verifies that the ASCII fast-path in col_offset_to_char_offset matches UTF-8 decoding."""
+    from pydoppelgangerhunt.fixer import col_offset_to_char_offset
+
+    line = "def calculate_total(price, tax):"
+    assert line.isascii() is True
+
+    for c in [-5, 0, 3, 10, len(line), len(line) + 10]:
+        assert col_offset_to_char_offset(line, c) == max(0, min(len(line), c))
+
+
+def test_delegate_unit_in_plan_tier2_collision_raises_and_rolls_back(tmp_path: Path) -> None:
+    """Verifies that physical byte-span collisions in _delegate_unit_in_plan trigger transactional rollback."""
+    from pydoppelgangerhunt.fixer import UnitCollisionError
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _delegate_unit_in_plan
+
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text("def a():\n    v = 1\n    return v\n", encoding="utf-8")
+    f2.write_text("def b():\n    v = 1\n    return v\n", encoding="utf-8")
+
+    u1 = {"file": str(f1), "name": "a", "start": 2, "end": 3, "kind": "function"}
+    u2 = {"file": str(f2), "name": "b", "start": 2, "end": 3, "kind": "function"}
+
+    # Valid clone pair works cleanly via batch patch generation
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "_shared_a_b" in patch
+
+    # Verify direct _delegate_unit_in_plan collision detection and transactional rollback
+    plan = _FilePatchPlan(
+        file_path=f1,
+        rel_path="mod1.py",
+        orig_text=f1.read_text(encoding="utf-8"),
+        is_new_file=False,
+    )
+    # First unit delegation succeeds
+    _delegate_unit_in_plan(
+        u1,
+        plan,
+        helper_name="_shared_a_b",
+        inputs=[],
+        outputs=["v"],
+        scope={"is_async": False, "has_yield": False},
+        target_inputs=None,
+        target_outputs=None,
+        await_prefix="",
+    )
+    assert len(plan.replacements) == 1
+    assert len(plan.claimed_units) == 1
+
+    # Colliding unit overlapping with u1 triggers UnitCollisionError
+    u_colliding = {"file": str(f1), "name": "inner", "start": 2, "end": 2, "kind": "statement"}
+    with pytest.raises(UnitCollisionError):
+        _delegate_unit_in_plan(
+            u_colliding,
+            plan,
+            helper_name="_shared_inner",
+            inputs=[],
+            outputs=["v"],
+            scope={"is_async": False, "has_yield": False},
+            target_inputs=None,
+            target_outputs=None,
+            await_prefix="",
+        )
+
+    # Local transactional rollback: plan state is restored to pre-collision state
+    assert len(plan.replacements) == 1
+    assert plan.replacements[0][0] == u1
+    assert len(plan.claimed_units) == 1
+    assert plan.claimed_units[0] == u1
+
+
+def test_render_file_patch_plan_tier2_collision_fallback() -> None:
+    """Verifies that _render_file_patch_plan safely recovers and filters when replacements collide."""
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _render_file_patch_plan
+
+    plan = _FilePatchPlan(
+        file_path=Path("test.py"),
+        rel_path="test.py",
+        orig_text="a = 1\nb = 2\nc = 3\n",
+        is_new_file=False,
+    )
+    u1 = {"file": "test.py", "start": 1, "end": 2}
+    u2 = {"file": "test.py", "start": 2, "end": 3}  # Collides physically on line 2
+    plan.replacements.append((u1, "# replaced 1\n"))
+    plan.replacements.append((u2, "# replaced 2\n"))
+
+    # _render_file_patch_plan should not raise ValueError; it should filter the collision and render a valid patch
+    diff = _render_file_patch_plan(plan, replace_clones=True)
+    assert "--- a/test.py" in diff
+    assert "# replaced 1" in diff
+    assert "# replaced 2" not in diff
+
+
+def test_generate_refactoring_patch_no_state_leakage_on_skipped_pair(tmp_path: Path) -> None:
+    """Verifies that helper names and comments are not leaked when clone extraction is skipped."""
+    f1 = tmp_path / "m1.py"
+    f2 = tmp_path / "m2.py"
+    # m1 imports m2 and m2 imports m1 (circular dependency)
+    f1.write_text("import m2\ndef fn():\n    return 42\n", encoding="utf-8")
+    f2.write_text("import m1\ndef fn():\n    return 42\n", encoding="utf-8")
+
+    u1 = {"file": str(f1), "name": "fn", "start": 2, "end": 3, "kind": "function"}
+    u2 = {"file": str(f2), "name": "fn", "start": 2, "end": 3, "kind": "function"}
+
+    # Circular import rejection should leave comments and plans clean without orphan helper registrations
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    # Patch should contain circular dependency rejection notice
+    assert "Circular import or unresolvable module path" in patch
+
+
+def test_package_reexport_col_offset_to_char_offset() -> None:
+    """Verifies that col_offset_to_char_offset is exported in the root pydoppelgangerhunt package."""
+    import pydoppelgangerhunt
+
+    assert hasattr(pydoppelgangerhunt, "col_offset_to_char_offset")
+    assert "col_offset_to_char_offset" in pydoppelgangerhunt.__all__
+    assert callable(pydoppelgangerhunt.col_offset_to_char_offset)
+
+
+def test_unit_collision_error_hierarchy_and_render_fallback() -> None:
+    """Verifies that UnitCollisionError subclasses ValueError and is raised on collisions."""
+    from pydoppelgangerhunt.fixer import UnitCollisionError, refactor_module_units
+
+    assert issubclass(UnitCollisionError, ValueError)
+
+    collision_u1 = {"file": "collision_target.py", "name": "block_alpha", "start": 1, "end": 2}
+    collision_u2 = {"file": "collision_target.py", "name": "block_beta", "start": 1, "end": 2}
+
+    with pytest.raises(UnitCollisionError) as exc_info:
+        refactor_module_units("x = 1\ny = 2\n", [(collision_u1, "x = 10\n"), (collision_u2, "y = 20\n")])
+    assert "Overlapping unit collision detected" in str(exc_info.value)
+    assert isinstance(exc_info.value, ValueError)
+
+
+def test_generate_refactoring_patch_rolls_back_partial_mutations_on_deep_failure(
+    tmp_path: Path,
+) -> None:
+    """Verifies that when a deep failure occurs during candidate pair processing,
+
+    transactional rollback restores snapshotted plans and depgraph, leaving no leaked state.
+    """
+    from unittest.mock import patch as mock_patch
+    from pydoppelgangerhunt.fixer.patch import _build_unit_delegation_call
+
+    module_a = tmp_path / "rollback_mod_a.py"
+    module_b = tmp_path / "rollback_mod_b.py"
+    module_a.write_text(
+        "def compute_cube(val: int) -> int:\n    return val ** 3\n\n"
+        "def compute_square(num: int) -> int:\n    return num ** 2\n",
+        encoding="utf-8",
+    )
+    module_b.write_text(
+        "def compute_cube_replica(val: int) -> int:\n    return val ** 3\n\n"
+        "def compute_square_replica(num: int) -> int:\n    return num ** 2\n",
+        encoding="utf-8",
+    )
+
+    pair_failing_u1 = {"file": str(module_a), "name": "compute_cube", "start": 1, "end": 2, "kind": "function"}
+    pair_failing_u2 = {"file": str(module_b), "name": "compute_cube_replica", "start": 1, "end": 2, "kind": "function"}
+
+    pair_success_u1 = {"file": str(module_a), "name": "compute_square", "start": 4, "end": 5, "kind": "function"}
+    pair_success_u2 = {"file": str(module_b), "name": "compute_square_replica", "start": 4, "end": 5, "kind": "function"}
+
+    invocation_count = 0
+    original_delegation_builder = _build_unit_delegation_call
+
+    def mocked_delegation_builder(*args: Any, **kwargs: Any) -> str:
+        nonlocal invocation_count
+        invocation_count += 1
+        if invocation_count == 1:
+            raise ValueError("Simulated deep mid-pipeline AST delegation failure")
+        return original_delegation_builder(*args, **kwargs)
+
+    with mock_patch(
+        "pydoppelgangerhunt.fixer.patch._build_unit_delegation_call",
+        side_effect=mocked_delegation_builder,
+    ):
+        patch_result = generate_refactoring_patch(
+            [(0.92, pair_failing_u1, pair_failing_u2), (1.0, pair_success_u1, pair_success_u2)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+        )
+
+    # First pair must be completely rolled back: no helper or comments referencing compute_cube
+    assert "Clone Pair (92.0%)" not in patch_result
+    assert "_shared_compute_cube" not in patch_result
+    assert "return _shared_compute_cube" not in patch_result
+
+    # Second pair must succeed cleanly
+    assert "Clone Pair (100.0%)" in patch_result
+    assert "_shared_compute_square" in patch_result
+    assert "--- a/rollback_mod_a.py" in patch_result
+    assert "--- a/rollback_mod_b.py" in patch_result
+
+
+def test_compute_unit_spans_whitespace_parity_with_form_feed() -> None:
+    """Verifies that compute_unit_spans correctly classifies whitespace with form-feeds (\\f)."""
+    from pydoppelgangerhunt.fixer import compute_unit_spans
+
+    # Form feed in indentation before statement: \f    x = 10\n
+    source_with_ff = "def fn():\n\f    x = 10\n    return x\n"
+    unit_indented_stmt = {"file": "ff_test.py", "start": 2, "end": 2, "start_col": 5, "end_col": 11}
+    span_ff = compute_unit_spans(source_with_ff, unit_indented_stmt)
+    # The prefix \f    is pure whitespace, suffix is empty, so whole-line statement is NOT column bounded
+    assert not span_ff.is_column_bounded
+
+    # Non-whitespace prefix on the same line:
+    source_code_prefix = "def fn():\n    flag = x = 10\n    return x\n"
+    unit_sub_expr = {"file": "ff_test.py", "start": 2, "end": 2, "start_col": 11, "end_col": 17}
+    span_sub = compute_unit_spans(source_code_prefix, unit_sub_expr)
+    assert span_sub.is_column_bounded
+
+
+def test_package_reexport_unit_collision_error() -> None:
+    """Verifies that UnitCollisionError is re-exported in root and fixer packages."""
+    import pydoppelgangerhunt as pdgh
+    import pydoppelgangerhunt.fixer as pdgh_fixer
+
+    assert hasattr(pdgh, "UnitCollisionError")
+    assert "UnitCollisionError" in pdgh.__all__
+    assert issubclass(pdgh.UnitCollisionError, ValueError)
+
+    assert hasattr(pdgh_fixer, "UnitCollisionError")
+    assert "UnitCollisionError" in pdgh_fixer.__all__
+    assert issubclass(pdgh_fixer.UnitCollisionError, ValueError)
+
+
+def test_refactor_module_units_inverted_line_range_is_noop() -> None:
+    """Verifies that inverted line ranges (start > end) or out-of-bounds lines do not append text to EOF."""
+    from pydoppelgangerhunt.fixer import refactor_module_units, replace_unit_in_source
+
+    original_code = "line1\nline2\nline3\n"
+    inverted_unit = {"file": "sample.py", "name": "bad_inv", "start": 5, "end": 2}
+
+    # refactor_module_units should leave buffer untouched (no append at EOF)
+    result_refactor = refactor_module_units(original_code, [(inverted_unit, "INVERTED_REPLACEMENT\n")])
+    assert result_refactor == original_code
+
+    # replace_unit_in_source should also leave buffer untouched
+    result_replace = replace_unit_in_source(original_code, inverted_unit, "INVERTED_REPLACEMENT\n")
+    assert result_replace == original_code
+
+    # Out of bounds start line
+    oob_unit = {"file": "sample.py", "name": "bad_oob", "start": 99, "end": 100}
+    result_oob = refactor_module_units(original_code, [(oob_unit, "OOB_REPLACEMENT\n")])
+    assert result_oob == original_code
+
+
+def test_column_bounded_replacement_no_double_newline_on_clean_line_end() -> None:
+    """Verifies that column-bounded replacements on clean line ends do not produce duplicate double newlines."""
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    code_buffer = (
+        "# type: ignore\n"
+        "result = [e * 2 for e in elements]\n"
+        "return result\n"
+    )
+    # Unit covering line 1 to line 2 with clean line end on line 2
+    expr_unit = {
+        "file": "calc.py",
+        "name": "comp_expr",
+        "start": 1,
+        "end": 2,
+        "start_col": 0,
+        "end_col": 34,
+        "kind": "comprehension",
+    }
+    # Replacement string ending in newline (e.g. from helper or multi-line expansion)
+    rep_text = "transform_elements(elements)\n"
+    repaired_code = refactor_module_units(code_buffer, [(expr_unit, rep_text)])
+
+    # Must contain single newline, not double newline (\n\n) before 'return result'
+    assert "\n\n" not in repaired_code
+    assert repaired_code == "transform_elements(elements)  # type: ignore\nreturn result\n"
+
+
+def test_check_units_overlap_inverted_line_ranges_are_disjoint() -> None:
+    """Verifies that check_units_overlap treats inverted line ranges (start > end) as empty and disjoint."""
+    from pydoppelgangerhunt.fixer import check_units_overlap
+
+    valid_unit = {"file": "mod.py", "start": 2, "end": 4}
+    inv_u1 = {"file": "mod.py", "start": 5, "end": 2}
+    inv_u2 = {"file": "mod.py", "start": 3, "end": 1}
+
+    # Inverted ranges represent empty sets; they cannot collide with valid or inverted units
+    assert check_units_overlap(inv_u1, valid_unit) is False
+    assert check_units_overlap(valid_unit, inv_u1) is False
+    assert check_units_overlap(inv_u1, inv_u2) is False
+
+
+def test_refactor_module_units_tier2_sweep_catches_nested_and_adjacent_collisions() -> None:
+    """Verifies that O(N log N) Tier 2 physical sweep catches nested intervals and collisions."""
+    from pydoppelgangerhunt.fixer import UnitCollisionError, refactor_module_units
+
+    text = "alpha = 1\nbeta = 2\ngamma = 3\n"
+    # c_wide covers lines 1-3, c_inner covers line 2 (nested within c_wide)
+    c_wide = {"file": "f.py", "name": "wide", "start": 1, "end": 3}
+    c_inner = {"file": "f.py", "name": "inner", "start": 2, "end": 2}
+
+    with pytest.raises(UnitCollisionError) as err:
+        refactor_module_units(text, [(c_wide, "# wide\n"), (c_inner, "# inner\n")])
+    assert "Overlapping unit collision detected" in str(err.value)
+
+
+def test_compute_replacement_line_deltas_sweep_catches_nested_interval_collision() -> None:
+    """Verifies that _compute_replacement_line_deltas catches nested intervals via max_end_item sweep."""
+    from pydoppelgangerhunt.fixer import UnitCollisionError
+    from pydoppelgangerhunt.fixer.patch import _compute_replacement_line_deltas
+
+    text = "line_one = 1\nline_two = 2\nline_three = 3\n"
+    c_wide = {"file": "f.py", "name": "wide", "start": 1, "end": 3}
+    c_inner = {"file": "f.py", "name": "inner", "start": 2, "end": 2}
+
+    with pytest.raises(UnitCollisionError) as err:
+        _compute_replacement_line_deltas([(c_wide, "# wide\n"), (c_inner, "# inner\n")], text)
+    assert "Overlapping unit collision detected in line delta computation" in str(err.value)
+
+
+def test_col_offset_to_char_offset_surrogate_code_points() -> None:
+    """Verifies that col_offset_to_char_offset and compute_unit_spans handle lone surrogates without error."""
+    from pydoppelgangerhunt.fixer import col_offset_to_char_offset
+    from pydoppelgangerhunt.fixer.source import compute_unit_spans
+
+    # Lone surrogate character (U+D800) encoded in UTF-8 as 3 bytes (0xED 0xA0 0x80)
+    surrogate_line = "val = '\ud800'"
+    # Offset 0..7: 'val = \'' (7 ASCII characters, bytes 0..7)
+    assert col_offset_to_char_offset(surrogate_line, 6) == 6
+    assert col_offset_to_char_offset(surrogate_line, 7) == 7
+    # Offset 8 & 9: mid-sequence bytes within the 3-byte surrogate; clamps back to 7
+    assert col_offset_to_char_offset(surrogate_line, 8) == 7
+    assert col_offset_to_char_offset(surrogate_line, 9) == 7
+    # Offset 10: boundary after surrogate character (character index 8)
+    assert col_offset_to_char_offset(surrogate_line, 10) == 8
+    # Offset 11: boundary after closing quote (character index 9)
+    assert col_offset_to_char_offset(surrogate_line, 11) == 9
+
+    # compute_unit_spans with surrogate code points
+    source_with_surrogate = "val = '\ud800'\nprint(val)\n"
+    unit = {"file": "surrogate.py", "start": 1, "end": 1, "start_col": 0, "end_col": 10}
+    span = compute_unit_spans(source_with_surrogate, unit)
+    assert span.start_char == 0
+    assert span.start_byte == 0
+    assert span.end_char > 0
+    assert span.end_byte > 0
+
+
+def test_resolve_unit_replacement_crlf_line_endings_no_dangling_carriage_return() -> None:
+    """Verifies that CRLF line endings (\r\n) do not produce orphaned \r carriage returns."""
+    from pydoppelgangerhunt.fixer import resolve_unit_replacement
+
+    # 1. Column-bounded unit with boundary pragma on line 1, ending on line 3 with suffix code
+    crlf_col_code = "x = calc(  # type: ignore\r\n    data\r\n) + tail\r\n"
+    col_unit = {
+        "file": "calc.py",
+        "name": "calc",
+        "start": 1,
+        "end": 3,
+        "start_col": 4,
+        "end_col": 1,
+        "kind": "complex_expr",
+    }
+    rep_item = resolve_unit_replacement(crlf_col_code, col_unit, "fast_calc(data)")
+    assert rep_item.consumes_line_suffix is True
+    assert "\r " not in rep_item.final_rep
+    assert "\r\r" not in rep_item.final_rep
+    assert rep_item.final_rep.endswith("\r\n")
+    assert "# type: ignore" in rep_item.final_rep
+    assert "+ tail" in rep_item.final_rep
+
+    # 2. Column-bounded unit with boundary pragma on line 1, ending on line 2 without suffix code
+    col_unit_clean = {
+        "file": "calc.py",
+        "name": "calc",
+        "start": 1,
+        "end": 2,
+        "start_col": 4,
+        "end_col": 8,
+        "kind": "complex_expr",
+    }
+    clean_rep_item = resolve_unit_replacement(crlf_col_code, col_unit_clean, "fast_calc(data)")
+    assert clean_rep_item.consumes_line_suffix is True
+    assert "\r " not in clean_rep_item.final_rep
+    assert "\r\r" not in clean_rep_item.final_rep
+    assert clean_rep_item.final_rep.endswith("\r\n")
+    assert "# type: ignore" in clean_rep_item.final_rep
+
+    # 3. Whole-line replacement with pragma on start boundary line (line 1)
+    crlf_fn_code = "def calc():  # type: ignore\r\n    return 42\r\n"
+    fn_unit = {"file": "calc.py", "name": "calc", "start": 1, "end": 2, "kind": "function"}
+    whole_rep_item = resolve_unit_replacement(
+        crlf_fn_code, fn_unit, "def calc():\r\n    return 100\r\n"
+    )
+    assert "\r " not in whole_rep_item.final_rep
+    assert "\r\r" not in whole_rep_item.final_rep
+    assert whole_rep_item.final_rep.endswith("\r\n")
+    assert "# type: ignore" in whole_rep_item.final_rep
+
+
+def test_refactor_module_units_missing_file_key_defaults_to_module() -> None:
+    """Verifies that refactor_module_units defaults missing 'file' keys to <module> for Tier 1 validation."""
+    from pydoppelgangerhunt.fixer import UnitCollisionError, refactor_module_units
+
+    code = "x = 1\ny = 2\nz = 3\n"
+    # Units without 'file' keys that overlap in line ranges
+    u1 = {"name": "u1", "start": 1, "end": 2}
+    u2 = {"name": "u2", "start": 2, "end": 3}
+
+    with pytest.raises(UnitCollisionError) as exc_info:
+        refactor_module_units(code, [(u1, "rep1\n"), (u2, "rep2\n")])
+    assert "<module>" in str(exc_info.value)
+    assert "Overlapping unit collision detected" in str(exc_info.value)
+
+
+def test_column_bounded_replacement_clean_line_end_no_duplicate_newline() -> None:
+    """Verifies that a column-bounded expression at clean line-end without pragmas does not duplicate newlines."""
+    from pydoppelgangerhunt.fixer import refactor_module_units, resolve_unit_replacement
+
+    code = "val = [x for x in data]\nprint(val)\n"
+    unit = {
+        "file": "test_mod.py",
+        "name": "comp",
+        "start": 1,
+        "end": 1,
+        "start_col": 6,
+        "end_col": 23,
+        "kind": "comprehension",
+    }
+    item = resolve_unit_replacement(code, unit, "helper(data)\n")
+    assert item.consumes_line_suffix is True
+    assert item.final_rep == "helper(data)\n"
+
+    result = refactor_module_units(code, [(unit, "helper(data)\n")])
+    assert result == "val = helper(data)\nprint(val)\n"
+
+
+def test_tier2_sweep_zero_width_slice_collision() -> None:
+    """Verifies that _intervals_overlap and Tier 2 sweep detect collisions with zero-width slices."""
+    from pydoppelgangerhunt.fixer.patch import _intervals_overlap
+
+    # Zero-width point strictly inside active interval [10, 20)
+    assert _intervals_overlap(10, 20, 15, 15) is True
+    assert _intervals_overlap(15, 15, 10, 20) is True
+
+    # Zero-width point touching interval boundaries exactly does not collide
+    assert _intervals_overlap(10, 20, 10, 10) is False
+    assert _intervals_overlap(10, 20, 20, 20) is False
+    assert _intervals_overlap(10, 10, 10, 20) is False
+    assert _intervals_overlap(20, 20, 10, 20) is False
+
+    # Zero-width points at the exact same offset collide
+    assert _intervals_overlap(10, 10, 10, 10) is True
+    assert _intervals_overlap(10, 10, 15, 15) is False
+
+    # Disjoint intervals
+    assert _intervals_overlap(10, 20, 25, 25) is False
+    assert _intervals_overlap(10, 20, 5, 5) is False
+
+
+def test_compute_unit_spans_deprecation_warning() -> None:
+    """Verifies that _compute_unit_spans emits a runtime DeprecationWarning with stacklevel=2."""
+    from pydoppelgangerhunt.fixer.source import _compute_unit_spans
+
+    code = "def sample():\n    return 42\n"
+    unit = {"file": "sample.py", "name": "sample", "start": 1, "end": 2}
+    with pytest.deprecated_call(match="_compute_unit_spans is deprecated"):
+        result = _compute_unit_spans(code, unit)
+
+    assert result == ((0, 28), (0, 28), False)
+
+
+def test_generate_refactoring_patch_unexpected_exception_keyerror_rollback(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies that unexpected KeyError during clone pair synthesis triggers rollback and WARNING log."""
+    from unittest.mock import patch as mock_patch
+
+    src_file_x = tmp_path / "trans_keyerr_x.py"
+    src_file_y = tmp_path / "trans_keyerr_y.py"
+    src_file_x.write_text(
+        "def transform_alpha(item: str) -> str:\n    return item.strip().lower()\n\n"
+        "def transform_beta(data: bytes) -> bytes:\n    return data.lstrip()\n",
+        encoding="utf-8",
+    )
+    src_file_y.write_text(
+        "def transform_alpha_replica(item: str) -> str:\n    return item.strip().lower()\n\n"
+        "def transform_beta_replica(data: bytes) -> bytes:\n    return data.lstrip()\n",
+        encoding="utf-8",
+    )
+
+    pair_err_u1 = {"file": str(src_file_x), "name": "transform_alpha", "start": 1, "end": 2, "kind": "function"}
+    pair_err_u2 = {"file": str(src_file_y), "name": "transform_alpha_replica", "start": 1, "end": 2, "kind": "function"}
+
+    pair_ok_u1 = {"file": str(src_file_x), "name": "transform_beta", "start": 4, "end": 5, "kind": "function"}
+    pair_ok_u2 = {"file": str(src_file_y), "name": "transform_beta_replica", "start": 4, "end": 5, "kind": "function"}
+
+    real_scope_analyzer = analyze_unit_variable_scope
+
+    def _exploding_scope_analyzer(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        for arg in args:
+            if isinstance(arg, dict) and "alpha" in arg.get("name", ""):
+                raise KeyError("simulated_corrupt_symbol_key")
+        return real_scope_analyzer(*args, **kwargs)
+
+    with caplog.at_level(logging.WARNING, logger="pydoppelgangerhunt.fixer.patch"):
+        with mock_patch(
+            "pydoppelgangerhunt.fixer.patch.analyze_unit_variable_scope",
+            side_effect=_exploding_scope_analyzer,
+        ):
+            patch_out = generate_refactoring_patch(
+                [(0.95, pair_err_u1, pair_err_u2), (0.98, pair_ok_u1, pair_ok_u2)],
+                repo_root=str(tmp_path),
+                replace_clones=True,
+            )
+
+    # First pair with KeyError was skipped and rolled back
+    assert "Clone Pair (95.0%)" not in patch_out
+    assert "_shared_transform_alpha" not in patch_out
+    # Second pair succeeded
+    assert "Clone Pair (98.0%)" in patch_out
+    assert "_shared_transform_beta" in patch_out
+
+    # Unexpected error was logged loudly at WARNING with exc_info
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warning_records) == 1
+    assert "Unexpected failure processing clone pair" in warning_records[0].message
+    assert warning_records[0].exc_info is not None
+
+
+def test_generate_refactoring_patch_programming_bugs_fail_loudly(
+    tmp_path: Path,
+) -> None:
+    """Verifies that internal developer bugs (AttributeError, NameError, RecursionError) fail loudly."""
+    from unittest.mock import patch as mock_patch
+
+    f = tmp_path / "bug_loud.py"
+    f.write_text("def work():\n    return 1\n", encoding="utf-8")
+    u1 = {"file": str(f), "name": "work", "start": 1, "end": 2, "kind": "function"}
+    u2 = {"file": str(f), "name": "work", "start": 1, "end": 2, "kind": "function"}
+
+    # AttributeError
+    with mock_patch(
+        "pydoppelgangerhunt.fixer.patch.analyze_unit_variable_scope",
+        side_effect=AttributeError("internal attribute missing due to developer typo"),
+    ):
+        with pytest.raises(AttributeError, match="developer typo"):
+            generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path))
+
+    # NameError
+    with mock_patch(
+        "pydoppelgangerhunt.fixer.patch.analyze_unit_variable_scope",
+        side_effect=NameError("internal name not defined"),
+    ):
+        with pytest.raises(NameError, match="internal name not defined"):
+            generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path))
+
+    # RecursionError
+    with mock_patch(
+        "pydoppelgangerhunt.fixer.patch.analyze_unit_variable_scope",
+        side_effect=RecursionError("maximum recursion depth exceeded"),
+    ):
+        with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+            generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path))
+
+
+def test_plan_snapshot_typed_dict_and_restore(tmp_path: Path) -> None:
+    """Verifies that _FilePatchPlan.snapshot() conforms to _PlanSnapshot and restores state cleanly."""
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _PlanSnapshot
+
+    f = tmp_path / "plan_snap.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+    plan = _FilePatchPlan(
+        file_path=f,
+        rel_path="plan_snap.py",
+        orig_text="x = 1\n",
+    )
+    plan.replacements.append(({"file": str(f), "start": 1, "end": 1}, "x = 2\n"))
+    plan.module_helpers.append("def helper(): pass\n")
+    plan.method_helpers.append((1, "def method(): pass\n"))
+    plan.missing_imports.append("import math")
+    plan.comments.append("# comment\n")
+    plan.used_helper_names.add("_shared_x")
+    plan.claimed_units.append({"file": str(f), "name": "x"})
+
+    snap: _PlanSnapshot = plan.snapshot()
+    # Validate TypedDict keys match expected annotations
+    assert set(snap.keys()) == set(_PlanSnapshot.__annotations__.keys())
+
+    # Mutate plan state
+    plan.replacements.clear()
+    plan.module_helpers.clear()
+    plan.used_helper_names.clear()
+
+    # Restore from snapshot
+    plan.restore(snap)
+    assert len(plan.replacements) == 1
+    assert len(plan.module_helpers) == 1
+    assert "_shared_x" in plan.used_helper_names
+    assert len(plan.claimed_units) == 1
+
+
+def test_compute_unit_spans_start_col_exceeds_line_length_clamping() -> None:
+    """Verifies that start_col > len(line_bytes) safely clamps to the line length boundary."""
+    from pydoppelgangerhunt.fixer import compute_unit_spans
+
+    # ASCII line (length 10: "x = 42\n" -> 7 bytes)
+    code_ascii = "x = 42\n"
+    unit_ascii = {"file": "a.py", "start": 1, "end": 1, "start_col": 999, "end_col": 1200}
+    span_ascii = compute_unit_spans(code_ascii, unit_ascii)
+    # Line length is 7 bytes (7 characters)
+    assert span_ascii.start_byte == 7
+    assert span_ascii.end_byte == 7
+    assert span_ascii.start_char == 7
+    assert span_ascii.end_char == 7
+
+    # Multibyte Unicode line: "🚀 = 'rocket'\n" (rocket emoji: 4 bytes, 1 char)
+    code_unicode = "🚀 = 'rocket'\n"
+    # Line is 14 bytes, 11 characters
+    unit_unicode = {"file": "u.py", "start": 1, "end": 1, "start_col": 500, "end_col": 600}
+    span_unicode = compute_unit_spans(code_unicode, unit_unicode)
+    assert span_unicode.start_byte == len(code_unicode.encode("utf-8"))
+    assert span_unicode.end_byte == len(code_unicode.encode("utf-8"))
+    assert span_unicode.start_char == len(code_unicode)
+    assert span_unicode.end_char == len(code_unicode)
+
+
+def test_refactor_module_units_dry_run_validation() -> None:
+    """Verifies that refactor_module_units with dry_run=True validates collisions without mutating source."""
+    from pydoppelgangerhunt.fixer import UnitCollisionError, refactor_module_units
+
+    code = "def f1():\n    return 1\n\ndef f2():\n    return 2\n"
+    u1 = {"file": "sample.py", "start": 1, "end": 2}
+    u2 = {"file": "sample.py", "start": 4, "end": 5}
+
+    # Dry run with valid non-overlapping replacements returns original source_text unchanged
+    res = refactor_module_units(
+        code,
+        [(u1, "def f1_new():\n    return 10\n"), (u2, "def f2_new():\n    return 20\n")],
+        dry_run=True,
+    )
+    assert res == code
+
+    # Dry run with colliding replacements still raises UnitCollisionError
+    u_collide = {"file": "sample.py", "start": 2, "end": 4}
+    with pytest.raises(UnitCollisionError):
+        refactor_module_units(
+            code,
+            [(u1, "def f1_new():\n    return 10\n"), (u_collide, "pass\n")],
+            dry_run=True,
+        )
+
+
+def test_apply_line_deltas_edge_cases() -> None:
+    """Verifies that _apply_line_deltas handles boundary conditions and non-integer inputs."""
+    from pydoppelgangerhunt.fixer.patch import _apply_line_deltas
+
+    # Empty deltas
+    assert _apply_line_deltas(10, []) == 10
+
+    # Target line <= 1 returns max(1, t_line)
+    assert _apply_line_deltas(0, [(5, 2)]) == 1
+    assert _apply_line_deltas(-5, [(5, 2)]) == 1
+    assert _apply_line_deltas(1, [(5, 2)]) == 1
+
+    # Malformed target line input
+    assert _apply_line_deltas("invalid", [(5, 2)]) == 1  # type: ignore[arg-type]
+
+    # Precomputed deltas: (end_line, delta)
+    deltas = [(3, 2), (7, -1), (12, 4)]
+    # Target line 3: strictly before end_line 3 (end_line < target_line is False for 3 < 3)
+    assert _apply_line_deltas(3, deltas) == 3
+    # Target line 5: after end_line 3, before 7 (+2)
+    assert _apply_line_deltas(5, deltas) == 7
+    # Target line 10: after 3 and 7 (+2 - 1 = +1)
+    assert _apply_line_deltas(10, deltas) == 11
+    # Target line 15: after 3, 7, and 12 (+2 - 1 + 4 = +5)
+    assert _apply_line_deltas(15, deltas) == 20
+
+
+def test_split_source_lines_physical_newlines_and_form_feed() -> None:
+    """Verifies that split_source_lines splits strictly on physical newlines and preserves form-feed characters."""
+    import io
+    from pydoppelgangerhunt.fixer import split_source_lines
+
+    assert split_source_lines("") == []
+    assert split_source_lines("x = 1") == ["x = 1"]
+    assert split_source_lines("x = 1\n") == ["x = 1\n"]
+    assert split_source_lines("x = 1\r\ny = 2\rz = 3\n") == ["x = 1\r\n", "y = 2\r", "z = 3\n"]
+    assert split_source_lines("\n\n") == ["\n", "\n"]
+
+    # Form-feed (\f) and vertical tab (\v) are kept within the line, matching Python AST
+    ff_code = "def fn():\n\x0c    x = 10\n    return x\n"
+    lines = split_source_lines(ff_code)
+    assert len(lines) == 3
+    assert lines[0] == "def fn():\n"
+    assert lines[1] == "\x0c    x = 10\n"
+    assert lines[2] == "    return x\n"
+
+    # Parity with io.StringIO readlines
+    for s in ["", "a", "a\n", "a\r\nb\nc", "def fn():\n\x0c    pass\n"]:
+        assert split_source_lines(s) == io.StringIO(s, newline="").readlines()
+
+
+def test_refactor_module_units_form_feed_line_replacement() -> None:
+    """Verifies that refactor_module_units replaces whole statements with form-feed indentation cleanly."""
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    source_with_ff = "def fn():\n\x0c    x = 10\n    return x\n"
+    unit_stmt = {"file": "ff_test.py", "start": 2, "end": 2, "start_col": 5, "end_col": 11}
+    # Whole-statement replacement must replace the entire line including \f, not just \f
+    res = refactor_module_units(source_with_ff, [(unit_stmt, "    x = 20\n")])
+    assert res == "def fn():\n    x = 20\n    return x\n"
+
+    # Sub-expression replacement inside a form-feed line
+    source_ff_expr = "def fn():\n\x0c    flag = x = 10\n    return x\n"
+    # Column offset 12 is 'x = 10' (\f is 1 byte, 4 spaces is 4 bytes, 'flag = ' is 7 bytes: 1+4+7=12)
+    unit_sub = {"file": "ff_test.py", "start": 2, "end": 2, "start_col": 12, "end_col": 18}
+    res_sub = refactor_module_units(source_ff_expr, [(unit_sub, "y = 99")])
+    assert res_sub == "def fn():\n\x0c    flag = y = 99\n    return x\n"
+
+
+def test_empty_source_buffer_replacement_is_noop() -> None:
+    """Verifies that replacements targeting an empty source buffer return empty string without inserting text."""
+    from pydoppelgangerhunt.fixer import (
+        compute_unit_replacement_span,
+        refactor_module_units,
+        replace_unit_in_source,
+        resolve_unit_replacement,
+    )
+
+    unit = {"file": "empty.py", "start": 1, "end": 1}
+
+    # resolve_unit_replacement
+    item = resolve_unit_replacement("", unit, "x = 1\n")
+    assert item.final_rep == ""
+    assert item.start_char == 0
+    assert item.end_char == 0
+
+    # compute_unit_replacement_span
+    start_c, end_c, final_rep = compute_unit_replacement_span("", unit, "x = 1\n")
+    assert (start_c, end_c, final_rep) == (0, 0, "")
+
+    # replace_unit_in_source
+    assert replace_unit_in_source("", unit, "x = 1\n") == ""
+
+    # refactor_module_units
+    assert refactor_module_units("", [(unit, "x = 1\n")]) == ""
+
+
+def test_package_reexport_split_source_lines() -> None:
+    """Verifies that split_source_lines is re-exported from package root and fixer subpackages."""
+    import pydoppelgangerhunt as pdgh
+    import pydoppelgangerhunt.fixer as pdgh_fixer
+
+    assert hasattr(pdgh, "split_source_lines")
+    assert "split_source_lines" in pdgh.__all__
+    assert callable(pdgh.split_source_lines)
+
+    assert hasattr(pdgh_fixer, "split_source_lines")
+    assert "split_source_lines" in pdgh_fixer.__all__
+    assert callable(pdgh_fixer.split_source_lines)
+
+
+def test_compute_unit_spans_non_positive_line_clamping() -> None:
+    """Verifies that compute_unit_spans clamps non-positive line numbers to line 1 matching check_units_overlap."""
+    from pydoppelgangerhunt.fixer import check_units_overlap, compute_unit_spans, refactor_module_units
+
+    src = "x = 1\ny = 2\nz = 3\n"
+    unit_zero = {"file": "test.py", "start": 0, "end": 0}
+
+    # compute_unit_spans clamps start and end to line 1
+    span = compute_unit_spans(src, unit_zero)
+    assert span.start_line == 1
+    assert span.end_line == 1
+    assert span.start_char == 0
+    assert span.end_char == 6  # length of "x = 1\n"
+
+    # check_units_overlap harmoniously treats start:0, end:0 as line 1
+    assert check_units_overlap(unit_zero, {"file": "test.py", "start": 1, "end": 1})
+    assert not check_units_overlap(unit_zero, {"file": "test.py", "start": 2, "end": 2})
+
+    # refactor_module_units replaces line 1 cleanly
+    res = refactor_module_units(src, [(unit_zero, "x = 99\n")])
+    assert res == "x = 99\ny = 2\nz = 3\n"
+
+    # Negative coordinates clamp to line 1
+    unit_neg = {"file": "test.py", "start": -10, "end": -5}
+    span_neg = compute_unit_spans(src, unit_neg)
+    assert span_neg.start_line == 1
+    assert span_neg.end_line == 1
+
+    # Inverted coordinates with non-positive end (start=3, end=0) clamp to end=1 (start > end)
+    unit_inverted = {"file": "test.py", "start": 3, "end": 0}
+    span_inv = compute_unit_spans(src, unit_inverted)
+    assert span_inv.start_line == 3
+    assert span_inv.end_line == 1
+    assert span_inv.start_char == span_inv.end_char == len(src)
+
+
+def test_render_file_patch_plan_preserves_crlf_in_helpers() -> None:
+    """Verifies that _render_file_patch_plan uses CRLF line endings when splicing helpers into CRLF files."""
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _render_file_patch_plan
+
+    crlf_source = "class MyClass:\r\n    def target(self):\r\n        return 1\r\n"
+    plan = _FilePatchPlan(
+        file_path=Path("crlf_sample.py"),
+        rel_path="crlf_sample.py",
+        orig_text=crlf_source,
+        is_new_file=False,
+    )
+    plan.method_helpers.append((2, "    def helper(self):\r\n        return 42"))
+    plan.module_helpers.append("def global_helper():\r\n    return 99")
+
+    diff = _render_file_patch_plan(plan, replace_clones=False)
+    assert "--- a/crlf_sample.py" in diff
+    assert "+    def helper(self):\r\n" in diff
+    assert "+def global_helper():\r\n" in diff
+    # Ensure no bare \n line endings within the inserted helper diff lines
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("+") and not line.startswith("+++"):
+            assert line.endswith("\r\n"), f"Expected CRLF line ending in hunk line: {line!r}"
+
+
+def test_split_source_lines_finditer_avoid_intermediate_allocation() -> None:
+    """Verifies that split_source_lines with finditer produces identical results across all line ending types."""
+    import io
+    from pydoppelgangerhunt.fixer import split_source_lines
+
+    cases = [
+        "",
+        "single line",
+        "single line\n",
+        "single line\r\n",
+        "single line\r",
+        "line 1\r\nline 2\r\nline 3\r\n",
+        "line 1\nline 2\nline 3\n",
+        "line 1\rline 2\rline 3\r",
+        "mixed\r\nline 2\nline 3\rline 4",
+        "\n\n\n",
+        "\r\n\r\n",
+        "def fn():\n\x0c    pass\n",
+    ]
+
+    for case in cases:
+        result = split_source_lines(case)
+        expected = io.StringIO(case, newline="").readlines()
+        assert result == expected, f"Mismatch on {case!r}: {result!r} != {expected!r}"
+        assert all(isinstance(ln, str) and ln for ln in result)
+
+
+def test_count_physical_newlines_and_detect_line_ending() -> None:
+    """Verifies physical newline counting and line ending detection across LF, CRLF, and lone CR."""
+    from pydoppelgangerhunt.fixer import count_physical_newlines, detect_line_ending
+
+    # count_physical_newlines
+    assert count_physical_newlines("") == 0
+    assert count_physical_newlines("no newline") == 0
+    assert count_physical_newlines("a\nb\n") == 2
+    assert count_physical_newlines("a\r\nb\r\n") == 2
+    assert count_physical_newlines("a\rb\r") == 2
+    assert count_physical_newlines("a\r\nb\nc\rd") == 3
+
+    # detect_line_ending
+    assert detect_line_ending() == "\n"
+    assert detect_line_ending("") == "\n"
+    assert detect_line_ending("x = 1\n") == "\n"
+    assert detect_line_ending("x = 1\r\n") == "\r\n"
+    assert detect_line_ending("x = 1\r") == "\r"
+    assert detect_line_ending("x = 1", "y = 2\r\n") == "\r\n"
+    assert detect_line_ending("x = 1", "y = 2\r") == "\r"
+
+
+def test_compute_replacement_line_deltas_lone_cr_source() -> None:
+    """Verifies that _compute_replacement_line_deltas accurately computes line delta for lone-CR sources."""
+    from pydoppelgangerhunt.fixer.patch import _compute_replacement_line_deltas
+
+    # 3 lines of CR-only source
+    src_cr = "def foo():\r    x = 1\r    return x\r"
+    # Replace lines 1-2 with 1 line -> delta must be -1
+    u = {"file": "cr_test.py", "start": 1, "end": 2}
+    deltas = _compute_replacement_line_deltas([(u, "def foo():\r")], src_cr)
+    assert deltas == [(2, -1)]
+
+
+def test_resolve_unit_replacement_lone_cr_source() -> None:
+    """Verifies that resolve_unit_replacement and replace_unit_in_source preserve lone-CR line terminators."""
+    from pydoppelgangerhunt.fixer import replace_unit_in_source
+
+    # Column-bounded replacement consuming line suffix with boundary pragma on CR source
+    src_cr = "x = calc()  # type: ignore\ry = 1\r"
+    unit_col = {"file": "cr_test.py", "start": 1, "end": 1, "start_col": 0, "end_col": 10}
+    res_col = replace_unit_in_source(src_cr, unit_col, "x = new_calc()")
+    # Must preserve \r before y = 1\r without introducing \n
+    assert res_col == "x = new_calc()  # type: ignore\ry = 1\r"
+    assert "\n" not in res_col
+
+    # Whole-line replacement on CR source
+    src_cr_line = "x = 1\ry = 2\r"
+    unit_line = {"file": "cr_test.py", "start": 1, "end": 1}
+    res_line = replace_unit_in_source(src_cr_line, unit_line, "x = 10")
+    assert res_line == "x = 10\ry = 2\r"
+    assert "\n" not in res_line
+
+
+def test_render_file_patch_plan_lone_cr_helpers() -> None:
+    """Verifies that _render_file_patch_plan preserves lone-CR line terminators when splicing helpers."""
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _render_file_patch_plan
+
+    cr_source = "class MyClass:\r    def target(self):\r        return 1\r"
+    plan = _FilePatchPlan(
+        file_path=Path("cr_sample.py"),
+        rel_path="cr_sample.py",
+        orig_text=cr_source,
+        is_new_file=False,
+    )
+    plan.method_helpers.append((2, "    def helper(self):\r        return 42"))
+    plan.module_helpers.append("def global_helper():\r    return 99")
+
+    diff = _render_file_patch_plan(plan, replace_clones=False)
+    assert "--- a/cr_sample.py" in diff
+    # Ensure all added helper lines terminate with \r (and not \r\n or bare \n)
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("+") and not line.startswith("+++"):
+            assert line.endswith("\r"), f"Expected lone-CR line ending in hunk line: {line!r}"
+            assert not line.endswith("\r\n"), f"Did not expect CRLF in CR hunk line: {line!r}"
+
+
+def test_package_reexport_newline_helpers() -> None:
+    """Verifies that count_physical_newlines and detect_line_ending are re-exported from package roots."""
+    import pydoppelgangerhunt as pdgh
+    import pydoppelgangerhunt.fixer as pdgh_fixer
+
+    for name in ("count_physical_newlines", "detect_line_ending"):
+        assert hasattr(pdgh, name)
+        assert name in pdgh.__all__
+        assert callable(getattr(pdgh, name))
+        assert hasattr(pdgh_fixer, name)
+        assert name in pdgh_fixer.__all__
+        assert callable(getattr(pdgh_fixer, name))
+
+
+def test_detect_line_ending_sample_boundary_and_straddle() -> None:
+    """Verifies that detect_line_ending handles boundary-straddling CRLF and expanded sample buffers."""
+    from pydoppelgangerhunt.fixer import detect_line_ending
+
+    # Case 1: CRLF at legacy 1024-byte sample boundary without EOF newline
+    text_1024 = "x" * 1023 + "\r\n" + "y = 1"
+    assert detect_line_ending(text_1024) == "\r\n"
+
+    # Case 2: CRLF straddles the 4096-byte sample boundary (char 4095 is \r, 4096 is \n)
+    text_4096_crlf = "a" * 4095 + "\r\n" + "b = 2"
+    assert detect_line_ending(text_4096_crlf) == "\r\n"
+
+    # Case 3: Lone CR at char 4095 followed by non-\n
+    text_4096_cr = "a" * 4095 + "\r" + "b = 2"
+    assert detect_line_ending(text_4096_cr) == "\r"
+
+
+def test_refactor_module_units_zero_width_insertion_collision() -> None:
+    """Verifies that refactor_module_units detects collisions between distinct zero-width insertions."""
+    from pydoppelgangerhunt.fixer import UnitCollisionError, refactor_module_units
+
+    code = "x = 1\ny = 2\n"
+    # Two zero-width units at the exact same line and column offset collide in Tier 2
+    u1 = {"file": "sample.py", "start": 1, "end": 1, "start_col": 2, "end_col": 2}
+    u2 = {"file": "sample.py", "start": 1, "end": 1, "start_col": 2, "end_col": 2}
+
+    with pytest.raises(UnitCollisionError, match="Overlapping unit collision detected"):
+        refactor_module_units(code, [(u1, "# ins1 "), (u2, "# ins2 ")])
+
+    # Two zero-width units at distinct column offsets succeed without collision
+    u3 = {"file": "sample.py", "start": 1, "end": 1, "start_col": 4, "end_col": 4}
+    res = refactor_module_units(code, [(u1, "#1 "), (u3, "#2 ")])
+    assert res == "x #1 = #2 1\ny = 2\n"
+
+
+def test_detect_line_ending_true_majority_vote_resilience() -> None:
+    """Verifies that detect_line_ending performs a true majority vote across all lines and resists stray terminators."""
+    from pydoppelgangerhunt.fixer import detect_line_ending
+    from pydoppelgangerhunt.fixer.source import _insert_imports_into_module
+
+    # Overwhelmingly LF with stray CRLF early in file
+    lf_with_stray_crlf = ["import os\n", "stray = 1\r\n"] + ["x = 2\n"] * 50
+    assert detect_line_ending(*lf_with_stray_crlf) == "\n"
+    assert detect_line_ending("".join(lf_with_stray_crlf)) == "\n"
+
+    # Verify import insertion into overwhelmingly LF module with stray CRLF uses \n
+    inserted_lines = _insert_imports_into_module(lf_with_stray_crlf, ["import sys"])
+    assert any("import sys\n" == ln for ln in inserted_lines)
+    assert not any("import sys\r\n" == ln for ln in inserted_lines)
+
+    # Overwhelmingly CRLF with stray LF early in file
+    crlf_with_stray_lf = ["import os\r\n", "stray = 1\n"] + ["x = 2\r\n"] * 50
+    assert detect_line_ending(*crlf_with_stray_lf) == "\r\n"
+    assert detect_line_ending("".join(crlf_with_stray_lf)) == "\r\n"
+
+    # Overwhelmingly lone CR with stray LF
+    cr_with_stray_lf = ["import os\r", "stray = 1\n"] + ["x = 2\r"] * 50
+    assert detect_line_ending(*cr_with_stray_lf) == "\r"
+    assert detect_line_ending("".join(cr_with_stray_lf)) == "\r"
+
+    # Tie-breaking priority among non-zero counts (LF -> CRLF -> CR)
+    assert detect_line_ending("a\r\nb\n") == "\n"
+    assert detect_line_ending("a\rb\n") == "\n"
+    assert detect_line_ending("a\r\nb\r") == "\r\n"
+    assert detect_line_ending("a\r\nb\nc\r") == "\n"
+
+
+def test_resolve_unit_replacement_form_feed_in_final_rep() -> None:
+    """Verifies that resolve_unit_replacement uses physical line splitting for final_rep containing form feeds."""
+    from pydoppelgangerhunt.fixer import resolve_unit_replacement
+
+    source = "x = 1  # type: ignore\ny = 2\n"
+    unit = {"file": "test.py", "start": 1, "end": 1}
+    rep_with_ff = "\x0cx = 2\x0c"
+    item = resolve_unit_replacement(source, unit, rep_with_ff, preserve_boundary_pragmas=True)
+    assert item.final_rep == "\x0cx = 2\x0c  # type: ignore\n"
+
+
+def test_refactor_module_units_boundary_touching_zero_width_insertion_order() -> None:
+    """Verifies deterministic application order for zero-width insertions touching replacement boundaries."""
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    code = "abcdefghij\n"
+    u_rep = {"file": "test.py", "start": 1, "end": 1, "start_col": 2, "end_col": 5}
+
+    # Zero-width insertion at start boundary [2, 2) is applied before replacement text [2, 5)
+    u_ins_start = {"file": "test.py", "start": 1, "end": 1, "start_col": 2, "end_col": 2}
+    res_start = refactor_module_units(code, [(u_rep, "XYZ"), (u_ins_start, "INS_")])
+    assert res_start == "abINS_XYZfghij\n"
+
+    # Zero-width insertion at end boundary [5, 5) is applied after replacement text [2, 5)
+    u_ins_end = {"file": "test.py", "start": 1, "end": 1, "start_col": 5, "end_col": 5}
+    res_end = refactor_module_units(code, [(u_rep, "XYZ"), (u_ins_end, "_INS")])
+    assert res_end == "abXYZ_INSfghij\n"
+
+
+def test_render_file_patch_plan_form_feed_in_helpers() -> None:
+    """Verifies that _render_file_patch_plan preserves form feeds in method and module helpers."""
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _render_file_patch_plan
+
+    plan = _FilePatchPlan(
+        file_path=Path("test.py"),
+        rel_path="test.py",
+        orig_text="class A:\n    pass\n",
+        is_new_file=False,
+    )
+    plan.method_helpers.append((2, "    def helper(self):\x0c        return 1\n"))
+    plan.module_helpers.append("def top_helper():\x0c    return 2\n")
+
+    diff = _render_file_patch_plan(plan, replace_clones=True)
+    assert "+    def helper(self):\x0c        return 1" in diff
+    assert "+def top_helper():\x0c    return 2" in diff
+
+    new_plan = _FilePatchPlan(
+        file_path=Path("new.py"),
+        rel_path="new.py",
+        orig_text="",
+        is_new_file=True,
+    )
+    new_plan.module_helpers.append("def new_helper():\x0c    return 3\n")
+    diff_new = _render_file_patch_plan(new_plan, replace_clones=True)
+    assert "+def new_helper():\x0c    return 3" in diff_new
+
+
+def test_resolve_unit_replacement_last_line_offset_indexing() -> None:
+    """Verifies resolve_unit_replacement on the last line uses offset arrays without string re-encoding."""
+    from pydoppelgangerhunt.fixer import resolve_unit_replacement
+    from pydoppelgangerhunt.fixer.source import _compute_line_offsets, split_source_lines
+
+    # Case 1: Clean line end with replacement ending in newline
+    code1 = "x = 1\ny = 2 + 3\n"
+    lines1 = split_source_lines(code1)
+    char_offs1, byte_offs1 = _compute_line_offsets(lines1)
+    unit1 = {"file": "test.py", "start": 2, "end": 2, "start_col": 4, "end_col": 9}
+    item1 = resolve_unit_replacement(
+        code1,
+        unit1,
+        "42\n",
+        preserve_boundary_pragmas=True,
+        lines=lines1,
+        line_char_offsets=char_offs1,
+        line_byte_offsets=byte_offs1,
+    )
+    assert item1.consumes_line_suffix is True
+    assert item1.end_char == char_offs1[2]
+    assert item1.end_byte == byte_offs1[2]
+    assert item1.final_rep == "42\n"
+
+    # Case 2: Unclean suffix with missing pragmas appending to line end
+    code2 = "a = 1  # type: ignore\ny = (2 + 3) * 5\n"
+    lines2 = split_source_lines(code2)
+    char_offs2, byte_offs2 = _compute_line_offsets(lines2)
+    unit2 = {"file": "test.py", "start": 1, "end": 2, "start_col": 0, "end_col": 11}
+    item2 = resolve_unit_replacement(
+        code2,
+        unit2,
+        "res = 42",
+        preserve_boundary_pragmas=True,
+        lines=lines2,
+        line_char_offsets=char_offs2,
+        line_byte_offsets=byte_offs2,
+    )
+    assert item2.consumes_line_suffix is True
+    assert item2.end_char == char_offs2[2]
+    assert item2.end_byte == byte_offs2[2]
+    assert item2.final_rep == "res = 42 * 5  # type: ignore\n"
+
+
+def test_canonicalize_helper_relative_imports_form_feed_and_crlf() -> None:
+    """Verifies that _canonicalize_helper_relative_imports preserves form feeds and line endings."""
+    from pydoppelgangerhunt.fixer.patch import _canonicalize_helper_relative_imports
+
+    helper_code = "\x0cdef foo():\r\n    from .bar import baz\r\n    x = 1\x0c + 2\r\n    return baz()\r\n"
+    res = _canonicalize_helper_relative_imports(
+        helper_code,
+        [("pkg.sub", False)],
+    )
+    assert "\x0c" in res
+    assert "from pkg.bar import baz" in res
+    assert "\r\n" in res
+    assert "x = 1\x0c + 2" in res
+
+
+def test_detect_line_ending_iterable_and_mixed_arguments() -> None:
+    """Verifies that detect_line_ending accepts iterables, generators, sequences, and None values."""
+    from pydoppelgangerhunt.fixer import detect_line_ending
+
+    # Passing list of lines directly
+    lines = ["first\r\n", "second\r\n", "third\n"]
+    assert detect_line_ending(lines) == "\r\n"
+
+    # Generator expression
+    assert detect_line_ending(l for l in lines) == "\r\n"
+
+    # Mixed arguments
+    assert detect_line_ending("prefix\n", ["nested\n", "other\n"], None, "stray\r\n") == "\n"
+
+    # Empty / none
+    assert detect_line_ending() == "\n"
+    assert detect_line_ending([]) == "\n"
+    assert detect_line_ending(None) == "\n"
+
+
+def test_intervals_overlap_public_helper() -> None:
+    """Verifies intervals_overlap on disjoint, overlapping, touching, and zero-width intervals."""
+    from pydoppelgangerhunt.fixer import intervals_overlap
+
+    # Disjoint intervals
+    assert intervals_overlap(0, 5, 5, 10) is False
+    assert intervals_overlap(0, 5, 6, 10) is False
+
+    # Overlapping intervals
+    assert intervals_overlap(0, 5, 4, 10) is True
+    assert intervals_overlap(2, 8, 1, 4) is True
+
+    # Zero-width interval inside range
+    assert intervals_overlap(0, 5, 3, 3) is True
+    assert intervals_overlap(3, 3, 0, 5) is True
+
+    # Zero-width interval at boundary (touching does not overlap)
+    assert intervals_overlap(0, 5, 0, 0) is False
+    assert intervals_overlap(0, 5, 5, 5) is False
+
+    # Two zero-width intervals
+    assert intervals_overlap(5, 5, 5, 5) is True
+    assert intervals_overlap(5, 5, 6, 6) is False
+
+
+def test_validate_module_unit_replacements_and_tier_toggles() -> None:
+    """Verifies validate_module_unit_replacements and tier1/tier2 toggles in refactor_module_units."""
+    from pydoppelgangerhunt.fixer import (
+        UnitCollisionError,
+        refactor_module_units,
+        validate_module_unit_replacements,
+    )
+
+    code = "x = 1\ny = 2\nz = 3\n"
+    u1 = {"file": "test.py", "start": 1, "end": 1, "start_col": 0, "end_col": 5}
+    u2 = {"file": "test.py", "start": 2, "end": 2, "start_col": 0, "end_col": 5}
+
+    # Non-colliding replacements pass validation
+    validate_module_unit_replacements(code, [(u1, "x = 10"), (u2, "y = 20")])
+
+    # Colliding replacements raise UnitCollisionError
+    u1_collide = {"file": "test.py", "start": 1, "end": 1, "start_col": 2, "end_col": 5}
+    with pytest.raises(UnitCollisionError):
+        validate_module_unit_replacements(code, [(u1, "x = 10"), (u1_collide, "100")])
+
+    # Tier 1 vs Tier 2 toggling
+    # With tier1=False and tier2=False, collisions are not checked
+    res = refactor_module_units(
+        code,
+        [(u1, "x = 10"), (u2, "y = 20")],
+        tier1=False,
+        tier2=False,
+    )
+    assert "x = 10" in res
+
+
+def test_delegate_unit_in_plan_incremental_scaling_and_collision() -> None:
+    """Verifies incremental O(K) collision checking and snapshot rollback in _FilePatchPlan."""
+    from pydoppelgangerhunt.fixer.patch import (
+        UnitCollisionError,
+        _FilePatchPlan,
+        _delegate_unit_in_plan,
+    )
+
+    code = "def foo():\n    a = 1\n    b = 2\n    return a + b\n"
+    plan = _FilePatchPlan(
+        file_path=Path("test.py"),
+        rel_path="test.py",
+        orig_text=code,
+    )
+
+    u1 = {"file": "test.py", "start": 2, "end": 2, "start_col": 4, "end_col": 9}
+    _delegate_unit_in_plan(
+        unit=u1,
+        plan=plan,
+        helper_name="_h1",
+        inputs=[],
+        outputs=["a"],
+        scope={},
+        target_inputs=None,
+        target_outputs=None,
+        await_prefix="",
+    )
+    assert len(plan.replacements) == 1
+    assert len(plan.replacement_items) == 1
+
+    # Snapshot state
+    snap = plan.snapshot()
+
+    # Attempt colliding unit
+    u_collide = {"file": "test.py", "start": 2, "end": 2, "start_col": 4, "end_col": 9}
+    with pytest.raises(UnitCollisionError):
+        _delegate_unit_in_plan(
+            unit=u_collide,
+            plan=plan,
+            helper_name="_h2",
+            inputs=[],
+            outputs=["a"],
+            scope={},
+            target_inputs=None,
+            target_outputs=None,
+            await_prefix="",
+        )
+
+    # Verify plan was not mutated by failed delegation
+    assert len(plan.replacements) == 1
+    assert len(plan.replacement_items) == 1
+
+    # Restore snapshot and verify parity
+    plan.restore(snap)
+    assert len(plan.replacements) == 1
+    assert len(plan.replacement_items) == 1
+
+
+def test_extract_unit_body_lines_and_synthesis_form_feed(tmp_path: Path) -> None:
+    """Verifies that _extract_unit_body_lines and synthesize_shared_helper_code preserve form feeds."""
+    from pydoppelgangerhunt.fixer.source import _extract_unit_body_lines
+    from pydoppelgangerhunt.fixer.synthesis import synthesize_shared_helper_code
+
+    raw_fn = [
+        "def helper(x):\n",
+        "\x0c    res = x + 1\n",
+        "    return res\n",
+    ]
+    unit = {"file": "m.py", "start": 1, "end": 3, "kind": "function"}
+    body_lines = _extract_unit_body_lines(unit, raw_fn)
+    assert any("\x0c" in ln for ln in body_lines)
+
+    f1 = tmp_path / "f1.py"
+    f2 = tmp_path / "f2.py"
+    code = "def calc(x):\n\x0c    res = x + 10\n    return res\n"
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 1, "end": 3, "kind": "function"}
+    u2 = {"file": str(f2), "start": 1, "end": 3, "kind": "function"}
+    h_code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "\x0c" in h_code
+
+
+def test_negative_column_clamping_in_check_units_overlap() -> None:
+    """Verifies that negative column offsets clamp to 0 and do not produce erroneous collisions."""
+    # Negative start column clamps to 0: [0, 5) and [5, 10) touch but do not overlap
+    u_neg1 = {"file": "mod.py", "start": 1, "end": 1, "start_col": -10, "end_col": 5}
+    u_pos = {"file": "mod.py", "start": 1, "end": 1, "start_col": 5, "end_col": 10}
+    assert check_units_overlap(u_neg1, u_pos) is False
+
+    # Negative start column clamps to 0: [0, 6) and [5, 10) overlap at [5, 6)
+    u_neg2 = {"file": "mod.py", "start": 1, "end": 1, "start_col": -10, "end_col": 6}
+    assert check_units_overlap(u_neg2, u_pos) is True
+
+    # Both negative clamp to 0: [0, 0) is empty zero-width, so no collision
+    u_neg_zero = {"file": "mod.py", "start": 1, "end": 1, "start_col": -10, "end_col": -2}
+    assert check_units_overlap(u_neg_zero, u_pos) is False
+
+
+def test_dual_tier_rejection_and_pragma_expanded_catch() -> None:
+    """Verifies both Tier 1 coordinate rejection and Tier 2 pragma-expanded collision catch."""
+    from pydoppelgangerhunt.fixer.patch import UnitCollisionError
+
+    # 1. Tier 1 Semantic Overlap Rejection
+    u_t1_a = {"name": "fn1", "file": "mod.py", "start": 1, "end": 2}
+    u_t1_b = {"name": "fn2", "file": "mod.py", "start": 2, "end": 3}
+    assert check_units_overlap(u_t1_a, u_t1_b) is True
+    with pytest.raises(UnitCollisionError, match="Overlapping unit collision detected"):
+        refactor_module_units("x = 1\ny = 2\nz = 3\n", [(u_t1_a, "pass\n"), (u_t1_b, "pass\n")], tier1=True, tier2=False)
+
+    # 2. Tier 2 Catch of Pragma-Expanded Collision
+    src = "a = 1  # type: ignore\nb = 2\n"
+    # u1: line 1, col 0..5 (statement part). Because line 1 has a trailing pragma,
+    # resolve_unit_replacement expands it to whole line [0, line_bytes[1]) to preserve pragma.
+    u_p1 = {"name": "u1", "file": "mod.py", "start": 1, "end": 1, "start_col": 0, "end_col": 5}
+    # u2: line 1, col 7..21 (pointing into trailing comment/token on same line).
+    u_p2 = {"name": "u2", "file": "mod.py", "start": 1, "end": 1, "start_col": 7, "end_col": 21, "kind": "complex_expr"}
+
+    # In Tier 1, column intervals [0, 5) and [7, 21) do not overlap
+    assert check_units_overlap(u_p1, u_p2) is False
+
+    # Tier 1 alone allows it without error
+    out = refactor_module_units(src, [(u_p1, "a = 10\n"), (u_p2, "comment")], tier1=True, tier2=False)
+    assert out is not None
+
+    # Tier 2 catches the physical interval collision caused by pragma whole-line expansion
+    with pytest.raises(UnitCollisionError, match="Overlapping unit collision detected between 'u1' \\(1-1\\) and 'u2' \\(1-1\\)"):
+        refactor_module_units(src, [(u_p1, "a = 10\n"), (u_p2, "comment")], tier1=True, tier2=True)
+
+
+def test_reporters_precompiled_physical_line_regex_notebook_cells(tmp_path: Path) -> None:
+    """Verifies that extract_unit_source_code uses _PHYSICAL_LINE_RE and preserves form feeds."""
+    import json
+    from pydoppelgangerhunt.reporters import extract_unit_source_code
+    from pydoppelgangerhunt.source_lines import _PHYSICAL_LINE_RE
+
+    assert _PHYSICAL_LINE_RE.pattern == r"[^\r\n]*(?:\r\n|\r|\n|$)"
+
+    nb_data = {
+        "cells": [
+            {"cell_type": "code", "source": "val = 1\n\x0cres = val + 2\n"}
+        ]
+    }
+    nb_file = tmp_path / "notebook.ipynb"
+    nb_file.write_text(json.dumps(nb_data), encoding="utf-8")
+
+    unit = {"file": str(nb_file) + "#cell_1", "start": 1, "end": 2}
+    lines = extract_unit_source_code(unit, repo_root=str(tmp_path))
+    assert lines == ["val = 1\n", "\x0cres = val + 2\n"]
+    assert "\x0c" in lines[1]

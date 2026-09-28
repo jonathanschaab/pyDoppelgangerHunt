@@ -1068,6 +1068,3 @@ def test_matches_diff_in_place_set_mutation_invalidates_cached_coordinates(tmp_p
     assert resolver.matches_diff("c.py", diff_keys) is True
     assert resolver.matches_diff("b.py", diff_keys) is False
     assert resolver.matches_diff("a.py", diff_keys) is True
-
-
-

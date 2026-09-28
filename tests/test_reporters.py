@@ -813,7 +813,3 @@ def test_extract_unit_source_code_notebook_with_literal_hash_in_filename(tmp_pat
     literal_lines = extract_unit_source_code(unit_literal_cell, repo_root=str(tmp_path))
     assert len(literal_lines) >= 1
     assert "{" in "".join(literal_lines)
-
-
-
-

@@ -13,6 +13,8 @@ from pydoppelgangerhunt.parser import is_decorator_named
 from pydoppelgangerhunt.fixer.scope import (
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
 )
+from pydoppelgangerhunt.fixer.source import parse_unit_coord, split_source_lines
+
 
 def _find_innermost_enclosing_node(
     source_text: str,
@@ -28,8 +30,8 @@ def _find_innermost_enclosing_node(
     except (SyntaxError, ValueError, UnicodeDecodeError):
         return None
 
-    u_start = int(unit.get("start") or 0)
-    u_end = int(unit.get("end") or u_start)
+    u_start = parse_unit_coord(unit, "start", default=0)
+    u_end = parse_unit_coord(unit, "end", default=u_start)
     if u_start <= 0:
         return None
 
@@ -110,7 +112,7 @@ def find_enclosing_class(
     if not meta:
         return None
 
-    lines = source_text.splitlines(keepends=True)
+    lines = split_source_lines(source_text)
     c_start = meta["start"]
     cls_line = lines[c_start - 1] if 1 <= c_start <= len(lines) else ""
     indent = cls_line[: len(cls_line) - len(cls_line.lstrip())]

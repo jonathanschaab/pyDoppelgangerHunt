@@ -1147,4 +1147,3 @@ def test_format_call_arguments_order_preservation_and_custom_receivers() -> None
         receiver_to_omit="receivers",
     )
     assert args_rec == "data"
-

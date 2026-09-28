@@ -2275,6 +2275,3 @@ def test_scan_target_conservative_candidate_pruning_accounts_for_deleted_baselin
         or ("b.py" in str(c[1].get("file")) and "a.py" in str(c[2].get("file")))
         for c in clones
     )
-
-
-

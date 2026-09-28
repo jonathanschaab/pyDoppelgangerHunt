@@ -5922,5 +5922,3 @@ def test_corpus_calibration_reduction_metrics_empty_units_and_edge_cases() -> No
     assert calib_all_pruned["pruned_shingle_count"] == 1
     assert calib_all_pruned["shingle_reduction_ratio"] == 1.0
     assert calib_all_pruned["shingle_compression_ratio"] == 1.0
-
-

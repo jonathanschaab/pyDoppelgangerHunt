@@ -185,6 +185,7 @@ enable = [
     "W0404",
     "W1514",
     "R1710",
+    "trailing-newlines",
 ]
 
 [tool.pylint.reports]

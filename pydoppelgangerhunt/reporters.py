@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
 from pydoppelgangerhunt.config import normalize_path_string
+from pydoppelgangerhunt.source_lines import split_source_lines
 
 
 # ANSI Color Codes
@@ -116,7 +117,11 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
                 if 0 <= cell_idx < len(cells):
                     cell = cells[cell_idx]
                     src = cell.get("source", [])
-                    raw_lines = src if isinstance(src, list) else str(src).splitlines(keepends=True)
+                    raw_lines = (
+                        src
+                        if isinstance(src, list)
+                        else split_source_lines(str(src))
+                    )
                     all_lines = [l if l.endswith("\n") else l + "\n" for l in raw_lines]
                 else:
                     all_lines = []

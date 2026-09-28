@@ -10,6 +10,8 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
+from pydoppelgangerhunt.source_lines import split_source_lines
+
 BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
 COMPOUND_BLOCK_TYPES: Tuple[type, ...] = tuple(
@@ -1057,7 +1059,10 @@ def harvest_notebook_units(
         except SyntaxError:
             continue
 
-        file_lines = cell_code.splitlines()
+        file_lines = [
+            ln.rstrip("\r\n")
+            for ln in split_source_lines(cell_code)
+        ]
         if idioms:
             tree = _IdiomCanonicalizer().visit(tree)
             ast.fix_missing_locations(tree)
@@ -1167,7 +1172,10 @@ def harvest_file_units(
     p = Path(file_path)
     try:
         source = p.read_text(encoding="utf-8")
-        file_lines = source.splitlines()
+        file_lines = [
+            ln.rstrip("\r\n")
+            for ln in split_source_lines(source)
+        ]
         tree = ast.parse(source, filename=str(p))
     except (SyntaxError, UnicodeDecodeError, OSError):
         return units

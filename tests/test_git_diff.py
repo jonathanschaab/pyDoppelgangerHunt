@@ -1496,7 +1496,3 @@ def test_apply_baseline_and_diff_filters_adapts_past_initial_untouched_clones(
             assert len(filtered) == 1
             assert filtered[0][1]["file"] == "foo.py"
             assert any("using unit_basis='target'" in record.message for record in caplog.records)
-
-
-
-
