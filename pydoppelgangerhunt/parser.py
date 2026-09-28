@@ -8,11 +8,11 @@ import hashlib
 import json
 from collections import deque
 from pathlib import Path
-import re
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
+from pydoppelgangerhunt.source_lines import split_source_lines
+
 BUILTIN_NAMES: Set[str] = set(dir(builtins))
-_PHYSICAL_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
 
 COMPOUND_BLOCK_TYPES: Tuple[type, ...] = tuple(
     cls
@@ -1060,9 +1060,8 @@ def harvest_notebook_units(
             continue
 
         file_lines = [
-            m.group(0).rstrip("\r\n")
-            for m in _PHYSICAL_LINE_RE.finditer(cell_code)
-            if m.group(0)
+            ln.rstrip("\r\n")
+            for ln in split_source_lines(cell_code)
         ]
         if idioms:
             tree = _IdiomCanonicalizer().visit(tree)
@@ -1174,9 +1173,8 @@ def harvest_file_units(
     try:
         source = p.read_text(encoding="utf-8")
         file_lines = [
-            m.group(0).rstrip("\r\n")
-            for m in _PHYSICAL_LINE_RE.finditer(source)
-            if m.group(0)
+            ln.rstrip("\r\n")
+            for ln in split_source_lines(source)
         ]
         tree = ast.parse(source, filename=str(p))
     except (SyntaxError, UnicodeDecodeError, OSError):

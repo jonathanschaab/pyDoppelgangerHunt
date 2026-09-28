@@ -142,6 +142,7 @@ from pydoppelgangerhunt.reporters import (
     supports_color,
     synthesize_refactoring_suggestion,
 )
+from pydoppelgangerhunt.source_lines import _PHYSICAL_LINE_RE
 
 __version__ = "1.0.0"
 __all__ = [
@@ -228,6 +229,7 @@ __all__ = [
     "parse_unit_coord",
     "refactor_module_units",
     "split_source_lines",
+    "_PHYSICAL_LINE_RE",
     "validate_module_unit_replacements",
     "generate_refactoring_patch",
     "compute_unit_structural_hash",

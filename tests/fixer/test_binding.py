@@ -1373,4 +1373,3 @@ def test_prune_unshared_receivers_custom_receiver() -> None:
     scope1_ref: Dict[str, Any] = {"inputs": ["this", "val"], "has_receiver_access": True, "instance_attrs": ["this.x"], "class_attrs": []}
     unpruned = _prune_unshared_receivers(inputs, u1, u2, scope1_ref, scope2)
     assert unpruned == ["this", "val"]
-

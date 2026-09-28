@@ -1501,4 +1501,3 @@ def test_scope_inspection_custom_receiver_attributes(tmp_path: Path) -> None:
     assert "klass.count" in s_cls["attrs_read"]
     assert "klass.count" in s_cls["class_attrs"]
     assert s_cls["inputs"][0] == "klass"
-

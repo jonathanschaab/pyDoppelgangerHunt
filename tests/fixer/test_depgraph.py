@@ -1501,4 +1501,3 @@ def test_has_symlink_component_rejects_symlink_root_alias(
     res_path, is_rejected = _is_safe_repo_python_path(file_via_alias, root=repo)
     assert is_rejected
     assert res_path is None
-

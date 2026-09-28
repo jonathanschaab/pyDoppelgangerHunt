@@ -538,4 +538,3 @@ def test_find_module_helper_insertion_index_with_suppress() -> None:
     src = "".join(lines)
     names = _get_module_imported_names(src, include_conditional=True)
     assert "optional_dep" in names
-

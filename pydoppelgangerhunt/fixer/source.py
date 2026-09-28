@@ -5,11 +5,16 @@ from __future__ import annotations
 import ast
 import io
 import logging
-import re
 import textwrap
 import tokenize
 import warnings
-from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
+
+from pydoppelgangerhunt.source_lines import (
+    count_physical_newlines,
+    detect_line_ending,
+    split_source_lines,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,28 +96,6 @@ def _extract_docstring_end_line(tree: ast.AST) -> int:
 
 
 _extract_module_docstring_end_line = _extract_docstring_end_line
-
-
-_PHYSICAL_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
-
-
-def split_source_lines(source_text: str) -> List[str]:
-    """Splits source code into physical lines preserving line endings.
-
-    Unlike str.splitlines(), this only splits on physical Python newline sequences
-    (\\r\\n, \\r, \\n) and never splits on form feeds (\\f / \\x0c) or vertical tabs (\\v),
-    matching Python grammar and AST line coordinate semantics. Uses regex finditer to
-    avoid intermediate match list allocations.
-
-    Args:
-        source_text: The complete original Python source code.
-
-    Returns:
-        A list of physical line strings with line terminators preserved.
-    """
-    if not source_text:
-        return []
-    return [m.group(0) for m in _PHYSICAL_LINE_RE.finditer(source_text) if m.group(0)]
 
 
 def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List[str]:
@@ -362,83 +345,6 @@ def _insert_imports_into_module(
     nl = detect_line_ending(orig_lines)
     formatted = [imp.rstrip("\r\n") + nl for imp in deduped_imports]
     return orig_lines[:insert_idx] + formatted + [nl] + orig_lines[insert_idx:]
-
-
-def count_physical_newlines(text: str) -> int:
-    """Counts the number of physical line terminators (\\r\\n, \\r, or \\n) in text.
-
-    Args:
-        text: Input string to scan for line terminators.
-
-    Returns:
-        Total count of physical line endings.
-    """
-    if not text:
-        return 0
-    if "\r" not in text:
-        return text.count("\n")
-    # Total newlines = (LF including CRLF) + (CR including CRLF) - (CRLF counted twice)
-    return text.count("\n") + text.count("\r") - text.count("\r\n")
-
-
-def _iter_sources(
-    sources: Sequence[Union[Optional[str], Iterable[Any]]]
-) -> Iterator[str]:
-    """Flattens mixed string arguments and string iterables into a flat stream of non-empty strings."""
-    for item in sources:
-        if not item:
-            continue
-        if isinstance(item, str):
-            yield item
-        elif isinstance(item, Iterable):
-            for sub in item:
-                if isinstance(sub, str) and sub:
-                    yield sub
-
-
-def detect_line_ending(*sources: Union[Optional[str], Iterable[Optional[str]]]) -> str:
-    """Detects the predominant physical newline terminator (\\r\\n, \\r, or \\n) across strings or line sequences.
-
-    Performs a majority vote across all line endings present in the provided sources.
-    Accepts arbitrary string arguments, iterables/sequences of strings, or a mix of both.
-    In the event of an exact tie among non-zero counts, the tie-breaking priority order
-    is LF (\\n), CRLF (\\r\\n), then lone CR (\\r). If no physical newlines are present,
-    defaults to '\\n'.
-
-    Args:
-        *sources: One or more text strings, or collections/iterables of text strings to probe.
-
-    Returns:
-        '\\n' if LF is predominant, '\\r\\n' if CRLF is predominant, otherwise '\\r'.
-    """
-    crlf_count = 0
-    cr_count = 0
-    lf_count = 0
-
-    for s in _iter_sources(sources):
-        c = s.count("\r\n")
-        crlf_count += c
-        cr_count += s.count("\r") - c
-        lf_count += s.count("\n") - c
-
-    if crlf_count == 0 and cr_count == 0 and lf_count == 0:
-        return "\n"
-
-    # Strict majority vote
-    if lf_count > crlf_count and lf_count > cr_count:
-        return "\n"
-    if crlf_count > lf_count and crlf_count > cr_count:
-        return "\r\n"
-    if cr_count > lf_count and cr_count > crlf_count:
-        return "\r"
-
-    # Deterministic tie-breaking priority among non-zero counts: LF -> CRLF -> lone CR
-    max_count = max(lf_count, crlf_count, cr_count)
-    if lf_count == max_count:
-        return "\n"
-    if crlf_count == max_count:
-        return "\r\n"
-    return "\r"
 
 
 def slice_source_by_token_range(

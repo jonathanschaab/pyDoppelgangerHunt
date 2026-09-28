@@ -2660,7 +2660,3 @@ def test_cli_verbose_discarded_calibration_mismatch_advisory(
     assert "Corpus calibration was discarded due to configuration mismatch" in captured_verbose.err
     assert "bag_of_tokens" in captured_verbose.err
     assert "falling back to full corpus scan" in captured_verbose.err
-
-
-
-

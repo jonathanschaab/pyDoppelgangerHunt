@@ -7,12 +7,12 @@ import html
 import json
 import os
 from pathlib import Path
-import re
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
 from pydoppelgangerhunt.config import normalize_path_string
+from pydoppelgangerhunt.source_lines import split_source_lines
 
 
 # ANSI Color Codes
@@ -24,8 +24,6 @@ COLOR_YELLOW = "\033[33m"
 COLOR_BLUE = "\033[34m"
 COLOR_MAGENTA = "\033[35m"
 COLOR_CYAN = "\033[36m"
-
-_PHYSICAL_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
 
 
 def supports_color(color_override: Optional[bool] = None) -> bool:
@@ -122,11 +120,7 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
                     raw_lines = (
                         src
                         if isinstance(src, list)
-                        else [
-                            m.group(0)
-                            for m in _PHYSICAL_LINE_RE.finditer(str(src))
-                            if m.group(0)
-                        ]
+                        else split_source_lines(str(src))
                     )
                     all_lines = [l if l.endswith("\n") else l + "\n" for l in raw_lines]
                 else:

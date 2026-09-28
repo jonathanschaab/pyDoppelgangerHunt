@@ -26,7 +26,6 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     patch as patch_mod,
 )
 from pydoppelgangerhunt.fixer.depgraph import build_module_graph
-from pydoppelgangerhunt.parser import harvest_file_units
 
 
 def test_audit_tests_parametrize_candidate_detection(tmp_path: Path) -> None:
@@ -7880,7 +7879,8 @@ def test_dual_tier_rejection_and_pragma_expanded_catch() -> None:
 def test_reporters_precompiled_physical_line_regex_notebook_cells(tmp_path: Path) -> None:
     """Verifies that extract_unit_source_code uses _PHYSICAL_LINE_RE and preserves form feeds."""
     import json
-    from pydoppelgangerhunt.reporters import _PHYSICAL_LINE_RE, extract_unit_source_code
+    from pydoppelgangerhunt.reporters import extract_unit_source_code
+    from pydoppelgangerhunt.source_lines import _PHYSICAL_LINE_RE
 
     assert _PHYSICAL_LINE_RE.pattern == r"[^\r\n]*(?:\r\n|\r|\n|$)"
 
@@ -7896,8 +7896,3 @@ def test_reporters_precompiled_physical_line_regex_notebook_cells(tmp_path: Path
     lines = extract_unit_source_code(unit, repo_root=str(tmp_path))
     assert lines == ["val = 1\n", "\x0cres = val + 2\n"]
     assert "\x0c" in lines[1]
-
-
-
-
-
