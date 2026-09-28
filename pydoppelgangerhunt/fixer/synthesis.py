@@ -743,6 +743,12 @@ def synthesize_shared_helper_code(
         and v not in scope.get("nonlocals", [])
     ]
 
+    has_yield = bool(
+        scope.get("has_yield") or scope1.get("has_yield") or scope2.get("has_yield")
+    )
+    if has_yield and is_async and helper_outputs:
+        return ""
+
     return_type = _infer_helper_return_type(
         resolved_ret,
         helper_outputs,

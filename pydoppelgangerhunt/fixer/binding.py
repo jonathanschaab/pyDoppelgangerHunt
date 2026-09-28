@@ -6,7 +6,7 @@ import ast
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.config import normalize_path_string, paths_match_boundary
 from pydoppelgangerhunt.parser import is_decorator_named
@@ -175,8 +175,210 @@ def find_enclosing_function(
     return meta
 
 
+class _BaseScopeVisitor(ast.NodeVisitor):
+    """Shared helpers for scope visitors."""
+
+    @staticmethod
+    def _record_import_names(
+        node: Union[ast.Import, ast.ImportFrom], store_set: Set[str]
+    ) -> None:
+        for alias in node.names:
+            bound = (
+                alias.asname
+                or (alias.name if isinstance(node, ast.ImportFrom) else alias.name.split(".", 1)[0])
+            )
+            if bound != "*":
+                store_set.add(bound)
+
+    def _visit_nested_func(
+        self,
+        node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+        store_set: Set[str],
+        reads_set: Set[str],
+    ) -> None:
+        store_set.add(node.name)
+        for dec in node.decorator_list:
+            self.visit(dec)
+        for d in node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]:
+            self.visit(d)
+        reads_set.update(_extract_nested_scope_free_reads(node))
+
+    def _visit_nested_class(
+        self,
+        node: ast.ClassDef,
+        store_set: Set[str],
+        reads_set: Set[str],
+    ) -> None:
+        store_set.add(node.name)
+        for dec in node.decorator_list:
+            self.visit(dec)
+        for b in node.bases:
+            self.visit(b)
+        for kw in node.keywords:
+            self.visit(kw.value)
+        reads_set.update(_extract_nested_scope_free_reads(node))
+
+
+class _FuncScopeVisitor(_BaseScopeVisitor):
+    """Tracks local bindings and free variable loads escaping a nested function or lambda scope."""
+
+    def __init__(self) -> None:
+        self.params: Set[str] = set()
+        self.local_stores: Set[str] = set()
+        self.globals: Set[str] = set()
+        self.nonlocals: Set[str] = set()
+        self.direct_loads: Set[str] = set()
+        self.nested_free_reads: Set[str] = set()
+
+    def visit_Global(self, node: ast.Global) -> None:
+        self.globals.update(node.names)
+
+    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+        self.nonlocals.update(node.names)
+
+    def visit_FunctionDef(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
+    ) -> None:
+        self._visit_nested_func(node, self.local_stores, self.nested_free_reads)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._visit_nested_class(node, self.local_stores, self.nested_free_reads)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        for d in node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]:
+            self.visit(d)
+        self.nested_free_reads.update(_extract_nested_scope_free_reads(node))
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Store):
+            self.local_stores.add(node.id)
+        elif isinstance(node.ctx, ast.Load):
+            self.direct_loads.add(node.id)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self._record_import_names(node, self.local_stores)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self._record_import_names(node, self.local_stores)
+
+
+class _ClassScopeVisitor(_BaseScopeVisitor):
+    """Tracks class attributes and free variable reads escaping an executed class body."""
+
+    def __init__(self) -> None:
+        self.class_stores: Set[str] = set()
+        self.free_reads: Set[str] = set()
+
+    def visit_FunctionDef(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
+    ) -> None:
+        self._visit_nested_func(node, self.class_stores, self.free_reads)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._visit_nested_class(node, self.class_stores, self.free_reads)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        for t in node.targets:
+            self.visit(t)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        if isinstance(node.target, ast.Name):
+            if node.target.id not in self.class_stores:
+                self.free_reads.add(node.target.id)
+            self.visit(node.value)
+            self.class_stores.add(node.target.id)
+        else:
+            self.visit(node.target)
+            self.visit(node.value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.visit(node.annotation)
+        if node.value is not None:
+            self.visit(node.value)
+        self.visit(node.target)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Load):
+            if node.id not in self.class_stores:
+                self.free_reads.add(node.id)
+        elif isinstance(node.ctx, ast.Store):
+            self.class_stores.add(node.id)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self._record_import_names(node, self.class_stores)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self._record_import_names(node, self.class_stores)
+
+
+def _extract_nested_scope_free_reads(
+    node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef],
+) -> Set[str]:
+    """Extracts free variable references escaping a nested function or executed class body."""
+    if isinstance(node, ast.ClassDef):
+        class_visitor = _ClassScopeVisitor()
+        for b in node.bases:
+            class_visitor.visit(b)
+        for kw in node.keywords:
+            class_visitor.visit(kw.value)
+        for dec in node.decorator_list:
+            class_visitor.visit(dec)
+        for stmt in node.body:
+            class_visitor.visit(stmt)
+        return class_visitor.free_reads
+
+    func_visitor = _FuncScopeVisitor()
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        for dec in node.decorator_list:
+            func_visitor.visit(dec)
+        all_args = (
+            list(getattr(node.args, "posonlyargs", []))
+            + list(node.args.args)
+            + list(node.args.kwonlyargs)
+        )
+        if node.args.vararg:
+            all_args.append(node.args.vararg)
+        if node.args.kwarg:
+            all_args.append(node.args.kwarg)
+        for a in all_args:
+            func_visitor.params.add(a.arg)
+        for d in node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]:
+            func_visitor.visit(d)
+        for stmt in node.body:
+            func_visitor.visit(stmt)
+    elif isinstance(node, ast.Lambda):
+        all_args = (
+            list(getattr(node.args, "posonlyargs", []))
+            + list(node.args.args)
+            + list(node.args.kwonlyargs)
+        )
+        if node.args.vararg:
+            all_args.append(node.args.vararg)
+        if node.args.kwarg:
+            all_args.append(node.args.kwarg)
+        for a in all_args:
+            func_visitor.params.add(a.arg)
+        for d in node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]:
+            func_visitor.visit(d)
+        func_visitor.visit(node.body)
+
+    escaped = (
+        (func_visitor.direct_loads | func_visitor.nested_free_reads)
+        - (func_visitor.params | func_visitor.local_stores)
+    ) | func_visitor.nonlocals
+    escaped -= func_visitor.globals
+    return escaped
+
+
 class _DownstreamReadVisitor(ast.NodeVisitor):
-    """Walks AST statements in a lexical scope without entering nested function or class bodies."""
+    """Walks AST statements in a lexical scope tracking direct and nested free reads."""
 
     def __init__(
         self,
@@ -189,33 +391,46 @@ class _DownstreamReadVisitor(ast.NodeVisitor):
         self.candidates = candidates
         self.loaded: Set[str] = set()
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        # Stop traversal: do not enter nested function scopes
-        return
+    def _is_node_after_unit(self, node: ast.AST) -> bool:
+        lineno = getattr(node, "lineno", None)
+        if lineno is None:
+            return False
+        if lineno > self.u_end:
+            return True
+        if lineno == self.u_end:
+            return self.u_end_col is not None and getattr(node, "col_offset", 0) >= int(self.u_end_col)
+        return False
+
+    def visit_FunctionDef(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
+    ) -> None:
+        if self._is_node_after_unit(node):
+            free_reads = _extract_nested_scope_free_reads(node)
+            for name in free_reads:
+                if self.candidates is None or name in self.candidates:
+                    self.loaded.add(name)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        # Stop traversal: do not enter nested async function scopes
-        return
+        self.visit_FunctionDef(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        # Stop traversal: do not enter nested class scopes
-        return
+        if self._is_node_after_unit(node):
+            free_reads = _extract_nested_scope_free_reads(node)
+            for name in free_reads:
+                if self.candidates is None or name in self.candidates:
+                    self.loaded.add(name)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        if self._is_node_after_unit(node):
+            free_reads = _extract_nested_scope_free_reads(node)
+            for name in free_reads:
+                if self.candidates is None or name in self.candidates:
+                    self.loaded.add(name)
 
     def visit_Name(self, node: ast.Name) -> None:
-        if isinstance(node.ctx, ast.Load):
-            lineno = getattr(node, "lineno", None)
-            if lineno is not None:
-                is_after = (
-                    lineno > self.u_end
-                    or (
-                        lineno == self.u_end
-                        and self.u_end_col is not None
-                        and getattr(node, "col_offset", 0) >= int(self.u_end_col)
-                    )
-                )
-                if is_after:
-                    if self.candidates is None or node.id in self.candidates:
-                        self.loaded.add(node.id)
+        if isinstance(node.ctx, ast.Load) and self._is_node_after_unit(node):
+            if self.candidates is None or node.id in self.candidates:
+                self.loaded.add(node.id)
         self.generic_visit(node)
 
 
@@ -239,13 +454,23 @@ def collect_downstream_read_names(
     if u_start <= 0 or u_end <= 0:
         return None
 
+    u_end_col: Optional[int] = None
+    for col_key in ("end_col_offset", "end_col"):
+        col_val = unit.get(col_key)
+        if col_val is not None:
+            try:
+                u_end_col = int(col_val)
+                break
+            except (ValueError, TypeError):
+                pass
+
     enc = _find_innermost_enclosing_node(
         source_text, unit, (ast.FunctionDef, ast.AsyncFunctionDef), tree=tree
     )
     scope_node: ast.AST = enc[0] if enc is not None else tree
 
     visitor = _DownstreamReadVisitor(
-        u_end, unit.get("end_col_offset"), candidates=candidates
+        u_end, u_end_col, candidates=candidates
     )
     for stmt in getattr(scope_node, "body", []):
         visitor.visit(stmt)
@@ -293,15 +518,13 @@ def resolve_generator_subroutine_outputs(
     Fail-Closed Policy:
     1. If output arities differ, every required downstream output must have a verified counterpart
        on the other side. If any needed output lacks a counterpart, the candidate is rejected (returns None).
-    2. Definite Assignment Invariant: Any output retained for the synthesized helper (belonging to u1)
-       must be definitely assigned along every path through the helper (in u1_definite if supplied).
-    3. Safe Fallback: When downstream usage is unknown (None), fallback only considers outputs that
-       are definitely assigned, preventing unassigned loop variables from reintroducing UnboundLocalError.
+    2. Safe Fallback: When downstream usage is unknown (None), fallback only considers outputs that
+       are definitely assigned (in u1_definite / u2_definite if supplied), preventing unassigned loop
+       variables from being conservatively retained.
 
     Returns:
         (outputs, target_outs2) if all needed downstream outputs have valid counterparts and can be
-        safely returned; None if counterpart mismatches or definite assignment hazards prevent
-        safe refactoring.
+        safely returned; None if counterpart mismatches prevent safe refactoring.
     """
     d1_needed = (
         downstream1
@@ -333,10 +556,6 @@ def resolve_generator_subroutine_outputs(
         for o1, o2 in pairs
         if o1 in d1_needed or o2 in d2_needed
     ]
-
-    # Definite assignment invariant: every helper return output (o1) must be definitely assigned
-    if u1_definite is not None and any(o1 not in u1_definite for o1, _ in kept_pairs):
-        return None
 
     return [o1 for o1, _ in kept_pairs], [o2 for _, o2 in kept_pairs]
 

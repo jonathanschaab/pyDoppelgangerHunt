@@ -8143,3 +8143,184 @@ def test_generate_refactoring_patch_async_generator_with_bare_return_accepted(tm
     assert "async def _shared_agen1_agen2" in patch
     assert "-> AsyncIterator[" in patch
 
+
+def test_generate_refactoring_patch_sync_generator_classdef_downstream_execution(tmp_path: Path) -> None:
+    """Verifies that class bodies executing immediately after a generator unit retain the observed variable."""
+    src1 = (
+        "def f1(items: list[int]):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    class C:\n"
+        "        value = x\n"
+        "    return C\n"
+    )
+    src2 = (
+        "def f2(items: list[int]):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    class C:\n"
+        "        value = x\n"
+        "    return C\n"
+    )
+    f1 = tmp_path / "cg1.py"
+    f2 = tmp_path / "cg2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    eval_script = (
+        "import cg1, cg2\n"
+        "for mod_name, fn in [('cg1', cg1.f1), ('cg2', cg2.f2)]:\n"
+        "    gen = fn([1, 2, 3])\n"
+        "    while True:\n"
+        "        try:\n"
+        "            next(gen)\n"
+        "        except StopIteration as e:\n"
+        "            cls_res = e.value\n"
+        "            break\n"
+        "    print(f'{mod_name}:{cls_res.value}')\n"
+    )
+    before_proc = subprocess.run(
+        [sys.executable, "-c", eval_script],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert before_proc.returncode == 0, f"Original execution failed: {before_proc.stderr}"
+    assert before_proc.stdout.strip() == "cg1:3\ncg2:3"
+
+    u1 = {"file": str(f1), "start": 2, "end": 3, "name": "f1:for", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 3, "name": "f2:for", "kind": "compound_block"}
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch != ""
+    assert "return x" in patch
+    assert "x = (yield from _shared_f1_f2(items))" in patch
+
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    after_proc = subprocess.run(
+        [sys.executable, "-c", eval_script],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert after_proc.returncode == 0, f"Refactored execution failed: {after_proc.stderr}"
+    assert after_proc.stdout == before_proc.stdout
+
+
+def test_generate_refactoring_patch_async_generator_with_downstream_outputs_rejected(tmp_path: Path) -> None:
+    """Verifies that async generator clones requiring downstream outputs are rejected to prevent lost bindings."""
+    src1 = (
+        "async def af1(items: list[int]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    return total\n"
+    )
+    src2 = (
+        "async def af2(items: list[int]):\n"
+        "    count = 0\n"
+        "    for x in items:\n"
+        "        count += x\n"
+        "        yield x\n"
+        "    return count\n"
+    )
+    f1 = tmp_path / "ag_out1.py"
+    f2 = tmp_path / "ag_out2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 2, "end": 5, "name": "af1:for", "kind": "compound_block", "is_async": True}
+    u2 = {"file": str(f2), "start": 2, "end": 5, "name": "af2:for", "kind": "compound_block", "is_async": True}
+
+    patch = generate_refactoring_patch([(0.90, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch == ""
+
+
+def test_generate_refactoring_patch_sync_generator_closure_capture(tmp_path: Path) -> None:
+    """Verifies that closure captures downstream retain captured variables in generator return."""
+    src1 = (
+        "def f1(items: list[int]):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    def get_x():\n"
+        "        return x\n"
+        "    return get_x\n"
+    )
+    src2 = (
+        "def f2(items: list[int]):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    def get_x():\n"
+        "        return x\n"
+        "    return get_x\n"
+    )
+    f1 = tmp_path / "clo1.py"
+    f2 = tmp_path / "clo2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    eval_script = (
+        "import clo1, clo2\n"
+        "for mod_name, fn in [('clo1', clo1.f1), ('clo2', clo2.f2)]:\n"
+        "    gen = fn([10, 20, 30])\n"
+        "    while True:\n"
+        "        try:\n"
+        "            next(gen)\n"
+        "        except StopIteration as e:\n"
+        "            getter = e.value\n"
+        "            break\n"
+        "    print(f'{mod_name}:{getter()}')\n"
+    )
+    before_proc = subprocess.run(
+        [sys.executable, "-c", eval_script],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert before_proc.returncode == 0, f"Original execution failed: {before_proc.stderr}"
+    assert before_proc.stdout.strip() == "clo1:30\nclo2:30"
+
+    u1 = {"file": str(f1), "start": 2, "end": 3, "name": "f1:for", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 3, "name": "f2:for", "kind": "compound_block"}
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch != ""
+    assert "return x" in patch
+    assert "x = (yield from _shared_f1_f2(items))" in patch
+
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    after_proc = subprocess.run(
+        [sys.executable, "-c", eval_script],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert after_proc.returncode == 0, f"Refactored execution failed: {after_proc.stderr}"
+    assert after_proc.stdout == before_proc.stdout
+
+

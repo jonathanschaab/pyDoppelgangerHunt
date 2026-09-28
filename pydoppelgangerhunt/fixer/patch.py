@@ -2894,6 +2894,14 @@ def generate_refactoring_patch(
                 if resolved_sub_outs is None:
                     continue
                 outputs, target_outs2 = resolved_sub_outs
+                is_async_gen = bool(
+                    s1.get("is_async")
+                    or s2.get("is_async")
+                    or u1.get("is_async")
+                    or u2.get("is_async")
+                )
+                if is_async_gen and (outputs or target_outs2):
+                    continue
             else:
                 pairs = _pair_clone_outputs(outputs, u2_outs)
                 target_outs2 = [o2 for _, o2 in pairs] if len(pairs) == len(outputs) else outputs

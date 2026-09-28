@@ -1339,10 +1339,11 @@ def test_async_generator_with_return_rejected_in_synthesis(tmp_path: Path) -> No
     assert "-> AsyncIterator[" in helper_bare
 
 
-def test_collect_downstream_read_names_skips_nested_scopes() -> None:
-    """Verifies that collect_downstream_read_names skips nested def/class bodies and respects candidates filter."""
+def test_collect_downstream_read_names_scope_and_closure_capture() -> None:
+    """Verifies that collect_downstream_read_names captures free variables and immediate class body reads, while respecting shadowed locals."""
     from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
 
+    # Case 1: Immediately executed class body (class C: value = x) and closure capture (def inner(): return x)
     code = (
         "def outer(items):\n"
         "    total = 0\n"
@@ -1360,13 +1361,95 @@ def test_collect_downstream_read_names_skips_nested_scopes() -> None:
     )
     unit = {"start": 3, "end": 5}
 
-    # 1. With candidates: only 'total' should be found; 'x' is in nested scopes, 'print' is not in candidates
+    # With candidates: both 'total' and 'x' are captured downstream
     reads = collect_downstream_read_names(code, unit, candidates={"total", "x"})
-    assert reads == {"total"}
+    assert reads == {"total", "x"}
 
-    # 2. Without candidates: 'total' and 'print' in outer scope are found, but 'x' in inner/C is skipped
+    # Without candidates: all loaded names in outer scope and escaping nested scopes are found
     all_reads = collect_downstream_read_names(code, unit)
-    assert all_reads == {"total", "print"}
+    assert all_reads == {"total", "x", "print"}
+
+    # Case 2: Shadowed variables in nested functions/classes do NOT escape to outer scope
+    code_shadowed = (
+        "def outer(items):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "\n"
+        "    def inner_param(x):\n"
+        "        return x\n"
+        "\n"
+        "    def inner_local():\n"
+        "        x = 10\n"
+        "        return x\n"
+        "\n"
+        "    class ClassShadowed:\n"
+        "        x = 10\n"
+        "        value = x\n"
+        "\n"
+        "    print(total)\n"
+    )
+    reads_shadowed = collect_downstream_read_names(code_shadowed, unit, candidates={"total", "x"})
+    assert reads_shadowed == {"total"}
+
+
+def test_collect_downstream_read_names_positional_and_expression_boundaries() -> None:
+    """Verifies same-line boundaries, same-expression, enclosing-expression, and multiline expression reads."""
+    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
+
+    # 1. Same-line unit boundary: statement after semicolon
+    code_sameline = (
+        "def f(items):\n"
+        "    total = 0\n"
+        "    for x in items: yield x; print(total)\n"
+    )
+    u_sameline = {"start": 3, "end": 3, "end_col": 27}
+    reads_sameline = collect_downstream_read_names(code_sameline, u_sameline, candidates={"total", "x"})
+    assert reads_sameline == {"total"}
+
+    # 2. Output used later in the same expression: (yield x) + x
+    code_same_expr = (
+        "def f(x):\n"
+        "    res = (yield x) + x\n"
+        "    return res\n"
+    )
+    u_same_expr = {"start": 2, "end": 2, "end_col": 19}
+    reads_same_expr = collect_downstream_read_names(code_same_expr, u_same_expr, candidates={"x"})
+    assert reads_same_expr == {"x"}
+
+    # 3. Output used in an enclosing call expression: func((yield x), x)
+    code_call_expr = (
+        "def f(x):\n"
+        "    res = func((yield x), x)\n"
+        "    return res\n"
+    )
+    u_call_expr = {"start": 2, "end": 2, "end_col": 25}
+    reads_call_expr = collect_downstream_read_names(code_call_expr, u_call_expr, candidates={"x"})
+    assert reads_call_expr == {"x"}
+
+    # 4. Multiline expression: argument on subsequent line
+    code_multiline = (
+        "def f(x):\n"
+        "    res = func(\n"
+        "        (yield x),\n"
+        "        x,\n"
+        "    )\n"
+        "    return res\n"
+    )
+    u_multiline = {"start": 3, "end": 3, "end_col": 17}
+    reads_multiline = collect_downstream_read_names(code_multiline, u_multiline, candidates={"x"})
+    assert reads_multiline == {"x"}
+
+    # 5. Output used BEFORE the unit on the same line: not downstream
+    code_prior = (
+        "def f(x):\n"
+        "    res = x + (yield x)\n"
+        "    return res\n"
+    )
+    u_prior = {"start": 2, "end": 2, "end_col": 23}
+    reads_prior = collect_downstream_read_names(code_prior, u_prior, candidates={"x"})
+    assert reads_prior == set()
 
 
 def test_resolve_generator_subroutine_outputs_preserves_per_side_necessity_and_safe_fallback() -> None:
@@ -1431,13 +1514,13 @@ def test_resolve_generator_subroutine_outputs_preserves_per_side_necessity_and_s
     )
     assert res_unequal is None
 
-    # 6. Needed output is not definitely assigned along every path through helper: fails closed
-    res_indef = resolve_generator_subroutine_outputs(
+    # 6. Downstream explicitly requires output assigned in loop: retained even if not in definite_stores
+    res_needed = resolve_generator_subroutine_outputs(
         ["x"],
         ["x"],
         downstream1={"x"},
         downstream2={"x"},
         u1_definite=set(),
     )
-    assert res_indef is None
+    assert res_needed == (["x"], ["x"])
 
