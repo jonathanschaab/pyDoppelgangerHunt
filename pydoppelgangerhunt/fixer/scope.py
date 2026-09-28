@@ -1371,7 +1371,7 @@ def _inspect_unit_scope(
         "has_mangled_names": visitor.has_mangled_names,
         "local_imports": visitor.local_imports,
         "yield_expr_names": visitor.yield_expr_names,
-        "is_async": visitor.is_async,
+        "is_async": visitor.is_async or bool(unit.get("is_async")),
         "conditional_outputs": conditional_outputs,
         "definite_stores": sorted(def_assigned),
         "has_instance_binding": has_instance_binding,

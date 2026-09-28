@@ -2731,6 +2731,8 @@ def generate_refactoring_patch(
                 and enc1["start"] == enc2["start"]
             )
 
+            orig_fn1 = fn1
+            orig_fn2 = fn2
             if not _is_method_of_class(fn1, enc1):
                 fn1 = None
             if not _is_method_of_class(fn2, enc2):
@@ -2754,6 +2756,12 @@ def generate_refactoring_patch(
             if fn2 and "receiver_param" not in u2:
                 u2["receiver_param"] = fn2.get("receiver_param")
                 u2_eff["receiver_param"] = fn2.get("receiver_param")
+            if orig_fn1 and "is_async" not in u1 and orig_fn1.get("is_async"):
+                u1["is_async"] = True
+                u1_eff["is_async"] = True
+            if orig_fn2 and "is_async" not in u2 and orig_fn2.get("is_async"):
+                u2["is_async"] = True
+                u2_eff["is_async"] = True
             if fn1 and fn2:
                 is_static = bool(fn1.get("is_static") and fn2.get("is_static"))
             else:
@@ -2764,6 +2772,8 @@ def generate_refactoring_patch(
             if bool(s1.get("is_async")) != bool(s2.get("is_async")):
                 continue
             if bool(s1.get("has_yield")) != bool(s2.get("has_yield")):
+                continue
+            if s1.get("has_yield") and s1.get("is_async") and (s1.get("has_return") or s2.get("has_return")):
                 continue
             if s1.get("nonlocals") or s2.get("nonlocals"):
                 continue

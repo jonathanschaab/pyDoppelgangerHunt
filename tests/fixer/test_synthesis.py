@@ -1147,3 +1147,95 @@ def test_format_call_arguments_order_preservation_and_custom_receivers() -> None
         receiver_to_omit="receivers",
     )
     assert args_rec == "data"
+
+
+def test_sync_generator_helper_synthesis_with_outputs_emits_return_and_generator_type(tmp_path: Path) -> None:
+    """Verifies that synthesizing helpers from sync generators with outputs emits return and Generator type."""
+    code1 = (
+        "def count_and_yield1(items: list[int]):\n"
+        "    count = 0\n"
+        "    for x in items:\n"
+        "        count += 1\n"
+        "        yield x\n"
+    )
+    code2 = (
+        "def count_and_yield2(items: list[int]):\n"
+        "    count = 0\n"
+        "    for x in items:\n"
+        "        count += 1\n"
+        "        yield x\n"
+    )
+    f1 = tmp_path / "cy1.py"
+    f2 = tmp_path / "cy2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+
+    u1 = {"file": "cy1.py", "start": 2, "end": 5, "name": "count_and_yield1:for", "kind": "compound_block"}
+    u2 = {"file": "cy2.py", "start": 2, "end": 5, "name": "count_and_yield2:for", "kind": "compound_block"}
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "-> Generator[" in helper
+    assert "return count, x" in helper
+
+
+def test_infer_helper_return_type_sync_generator_with_outputs_and_return() -> None:
+    """Verifies return type inference for sync generators with single/multiple outputs and return statements."""
+    from pydoppelgangerhunt.fixer import _infer_helper_return_type  # pylint: disable=import-outside-toplevel
+
+    # 1. Single output
+    scope_single = {"has_yield": True, "yield_expr_names": [("yield", ":literal:int")]}
+    res_single = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=["total"],
+        conditional_outs=set(),
+        scope=scope_single,
+        meta1={"total": {"type": "int"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_single == "Generator[int, None, int]"
+
+    # 2. Multiple outputs (Tuple return)
+    scope_multi = {"has_yield": True, "yield_expr_names": [("yield", ":literal:str")]}
+    res_multi = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=["total", "status"],
+        conditional_outs=set(),
+        scope=scope_multi,
+        meta1={"total": {"type": "int"}, "status": {"type": "str"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_multi == "Generator[str, None, Tuple[int, str]]"
+
+    # 3. Explicit generator return preserved
+    res_explicit = _infer_helper_return_type(
+        resolved_ret="Generator[int, None, float]",
+        helper_outputs=["total"],
+        conditional_outs=set(),
+        scope={"has_yield": True, "yield_expr_names": []},
+        meta1={},
+        meta2={},
+        is_async=False,
+    )
+    assert res_explicit == "Generator[int, None, float]"
+
+
+def test_async_generator_with_return_rejected_in_synthesis(tmp_path: Path) -> None:
+    """Verifies that synthesize_shared_helper_code returns empty string when an async generator has return statement."""
+    code = (
+        "async def agen_returns(items: list[int]):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    return 42\n"
+    )
+    f1 = tmp_path / "ao1.py"
+    f2 = tmp_path / "ao2.py"
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+
+    u1 = {"file": "ao1.py", "start": 1, "end": 4, "name": "agen_returns", "kind": "function", "is_async": True}
+    u2 = {"file": "ao2.py", "start": 1, "end": 4, "name": "agen_returns", "kind": "function", "is_async": True}
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper == ""

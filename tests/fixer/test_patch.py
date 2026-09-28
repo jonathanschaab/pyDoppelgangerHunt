@@ -7896,3 +7896,62 @@ def test_reporters_precompiled_physical_line_regex_notebook_cells(tmp_path: Path
     lines = extract_unit_source_code(unit, repo_root=str(tmp_path))
     assert lines == ["val = 1\n", "\x0cres = val + 2\n"]
     assert "\x0c" in lines[1]
+
+
+def test_generate_refactoring_patch_sync_generator_with_outputs_and_return(tmp_path: Path) -> None:
+    """Verifies that refactoring sync generators with outputs generates return in helper and captures via yield from."""
+    src1 = (
+        "def produce_and_sum1(items: list[int]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    return total\n"
+    )
+    src2 = (
+        "def produce_and_sum2(items: list[int]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    return total\n"
+    )
+    f1 = tmp_path / "ps1.py"
+    f2 = tmp_path / "ps2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 2, "end": 5, "name": "produce_and_sum1:for", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 5, "name": "produce_and_sum2:for", "kind": "compound_block"}
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch
+    assert "return total, x" in patch
+    assert "total, x = (yield from _shared_produce_and_sum1_produce_and_sum2(items))" in patch
+    assert "-> Generator[" in patch
+
+
+def test_generate_refactoring_patch_async_generator_with_return_rejected(tmp_path: Path) -> None:
+    """Verifies that clone pairs of async generators with return statements are rejected without creating invalid patches."""
+    src1 = (
+        "async def agen1(items: list[int]):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    return 42\n"
+    )
+    src2 = (
+        "async def agen2(items: list[int]):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    return 42\n"
+    )
+    f1 = tmp_path / "as1.py"
+    f2 = tmp_path / "as2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 1, "end": 4, "name": "agen1", "kind": "function"}
+    u2 = {"file": str(f2), "start": 1, "end": 4, "name": "agen2", "kind": "function"}
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch == ""

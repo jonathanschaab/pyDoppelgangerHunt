@@ -162,6 +162,7 @@ def find_enclosing_function(
 
     decs = meta.pop("decorators", [])
     node = meta.pop("node", None)
+    meta["is_async"] = isinstance(node, ast.AsyncFunctionDef)
     meta["is_static"] = any(is_decorator_named(d, "staticmethod") for d in decs)
     meta["is_class_method"] = any(is_decorator_named(d, "classmethod") for d in decs)
     receiver_param = None
