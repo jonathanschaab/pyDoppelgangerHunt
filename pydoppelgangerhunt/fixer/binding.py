@@ -421,36 +421,66 @@ def _collect_func_params(args: ast.arguments) -> Set[str]:
     return {a.arg for a in _collect_func_args(args)}
 
 
+class _OuterExprVisitor(_BaseScopeVisitor):
+    """Collects loaded names from outer-scope expressions (defaults, decorators, annotations, bases)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.names: Set[str] = set()
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Load) and not self._is_in_comp(node.id):
+            self.names.add(node.id)
+
+    def visit_FunctionDef(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef]
+    ) -> None:
+        dummy_stores: Set[str] = set()
+        self._visit_nested_named_scope(node, dummy_stores, self.names)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._visit_nested_lambda(node, self.names)
+
+
 def _extract_nested_scope_free_reads(
     node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef],
 ) -> Set[str]:
     """Extracts free variable references escaping a nested function or executed class body."""
+    outer_visitor = _OuterExprVisitor()
     if isinstance(node, ast.ClassDef):
-        class_visitor = _ClassScopeVisitor()
         for b in node.bases:
-            class_visitor.visit(b)
+            outer_visitor.visit(b)
         for kw in node.keywords:
-            class_visitor.visit(kw.value)
+            outer_visitor.visit(kw.value)
         for dec in node.decorator_list:
-            class_visitor.visit(dec)
+            outer_visitor.visit(dec)
+        class_visitor = _ClassScopeVisitor()
         for stmt in node.body:
             class_visitor.visit(stmt)
-        return class_visitor.free_reads
+        return outer_visitor.names | class_visitor.free_reads
 
-    func_visitor = _FuncScopeVisitor()
-    func_visitor.params = _collect_func_params(node.args)
-    for arg in _collect_func_args(node.args):
-        if arg.annotation is not None:
-            func_visitor.visit(arg.annotation)
     defaults = node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]
     for d in defaults:
-        func_visitor.visit(d)
+        outer_visitor.visit(d)
+    for arg in _collect_func_args(node.args):
+        if arg.annotation is not None:
+            outer_visitor.visit(arg.annotation)
 
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         for dec in node.decorator_list:
-            func_visitor.visit(dec)
+            outer_visitor.visit(dec)
         if node.returns is not None:
-            func_visitor.visit(node.returns)
+            outer_visitor.visit(node.returns)
+
+    func_visitor = _FuncScopeVisitor()
+    func_visitor.params = _collect_func_params(node.args)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         for stmt in node.body:
             func_visitor.visit(stmt)
     elif isinstance(node, ast.Lambda):
@@ -461,7 +491,7 @@ def _extract_nested_scope_free_reads(
         - (func_visitor.params | func_visitor.local_stores)
     ) | func_visitor.nonlocals
     escaped -= func_visitor.globals
-    return escaped
+    return outer_visitor.names | escaped
 
 
 class _DownstreamReadVisitor(_BaseScopeVisitor):
@@ -503,7 +533,17 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self.visit_FunctionDef(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        self.visit_FunctionDef(node)
+        if self._is_node_after_unit(node):
+            free_reads = _extract_nested_scope_free_reads(node)
+            for name in free_reads:
+                if self.candidates is None or name in self.candidates:
+                    self.loaded.add(name)
+        else:
+            n_start = getattr(node, "lineno", 0)
+            n_end = getattr(node, "end_lineno", None) or n_start
+            if n_start <= self.u_end <= n_end:
+                for stmt in node.body:
+                    self.visit(stmt)
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         self.visit_FunctionDef(node)
@@ -573,8 +613,8 @@ def _pair_clone_outputs(
     (`len(u1_outs) == len(u2_outs)`), AST statements follow identical top-to-bottom execution sequence.
     Because unit outputs are harvested in lexical AST store order (first write per variable), the
     positional sequence of outputs reflects the corresponding semantic role of each output slot.
-    Identically-named variables (common names) are mapped to themselves first (e.g. loop index 'x'),
-    and the remaining unique names are paired in AST declaration order (e.g. 'total' <-> 'count').
+    Positional 1-to-1 alignment (`zip(u1_dedup, u2_dedup)`) strictly preserves AST semantic roles
+    across renamed variables, preventing inverted variable assignments when common names collide.
 
     When candidate output lengths differ (`len(u1_outs) != len(u2_outs)`), positional alignment across
     distinct variable names no longer holds. In this unequal-length scenario, only identical common
@@ -584,12 +624,9 @@ def _pair_clone_outputs(
     u1_dedup = list(dict.fromkeys(u1_outs))
     u2_dedup = list(dict.fromkeys(u2_outs))
     if len(u1_dedup) == len(u2_dedup):
-        out_map = {o: o for o in set(u1_dedup) & set(u2_dedup)}
-        rem_u1 = [o for o in u1_dedup if o not in out_map]
-        rem_u2 = [o for o in u2_dedup if o not in out_map]
-        for o1, o2 in zip(rem_u1, rem_u2):
-            out_map[o1] = o2
-        return [(o1, out_map.get(o1, o1)) for o1 in u1_dedup]
+        if set(u1_dedup) == set(u2_dedup):
+            return [(o, o) for o in u1_dedup]
+        return list(zip(u1_dedup, u2_dedup))
     common = [o for o in u1_dedup if o in u2_dedup]
     return [(o, o) for o in common]
 

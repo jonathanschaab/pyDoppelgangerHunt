@@ -290,9 +290,10 @@ def _infer_outputs_return_type(
         out_types: List[str] = []
         for idx, out_var in enumerate(helper_outputs):
             t1 = meta1.get(out_var, {}).get("type")
-            m2 = meta2.get(out_var, {})
-            if not m2 and outputs2 and idx < len(outputs2):
+            if outputs2 and idx < len(outputs2):
                 m2 = meta2.get(outputs2[idx], {})
+            else:
+                m2 = meta2.get(out_var, {})
             t2 = m2.get("type")
             t_merged = _merge_types(t1, t2, type_merge_strategy)
             if out_var in conditional_outs:
@@ -304,9 +305,10 @@ def _infer_outputs_return_type(
     if len(helper_outputs) == 1:
         out_var = helper_outputs[0]
         t1 = meta1.get(out_var, {}).get("type")
-        m2 = meta2.get(out_var, {})
-        if not m2 and outputs2 and len(outputs2) >= 1:
+        if outputs2 and len(outputs2) >= 1:
             m2 = meta2.get(outputs2[0], {})
+        else:
+            m2 = meta2.get(out_var, {})
         t2 = m2.get("type")
         out_t = _merge_types(t1, t2, type_merge_strategy)
         return_type = resolved_ret if resolved_ret != "Any" else out_t
@@ -666,7 +668,11 @@ def synthesize_shared_helper_code(
     downstream2: Optional[Set[str]] = None
     has_yield = bool(scope.get("has_yield") or scope1.get("has_yield") or scope2.get("has_yield"))
     if "outputs" in u1 and isinstance(u1["outputs"], (list, tuple, set)):
-        outputs = list(u1["outputs"])
+        outputs = [
+            v for v in u1["outputs"]
+            if v not in scope1.get("globals", [])
+            and v not in scope1.get("nonlocals", [])
+        ]
         if "outputs" in u2 and isinstance(u2["outputs"], (list, tuple, set)):
             u2_outs = [
                 v for v in u2["outputs"]

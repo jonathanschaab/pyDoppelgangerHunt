@@ -2784,17 +2784,13 @@ def generate_refactoring_patch(
                 and (fn1.get("receiver_param") or fn1.get("is_static"))
                 and (fn2.get("receiver_param") or fn2.get("is_static"))
             )
-            if fn1 and "receiver_param" not in u1:
-                u1["receiver_param"] = fn1.get("receiver_param")
+            if fn1 and "receiver_param" not in u1_eff:
                 u1_eff["receiver_param"] = fn1.get("receiver_param")
-            if fn2 and "receiver_param" not in u2:
-                u2["receiver_param"] = fn2.get("receiver_param")
+            if fn2 and "receiver_param" not in u2_eff:
                 u2_eff["receiver_param"] = fn2.get("receiver_param")
-            if orig_fn1 and "is_async" not in u1 and orig_fn1.get("is_async"):
-                u1["is_async"] = True
+            if orig_fn1 and "is_async" not in u1_eff and orig_fn1.get("is_async"):
                 u1_eff["is_async"] = True
-            if orig_fn2 and "is_async" not in u2 and orig_fn2.get("is_async"):
-                u2["is_async"] = True
+            if orig_fn2 and "is_async" not in u2_eff and orig_fn2.get("is_async"):
                 u2_eff["is_async"] = True
             if fn1 and fn2:
                 is_static = bool(fn1.get("is_static") and fn2.get("is_static"))
@@ -2817,8 +2813,8 @@ def generate_refactoring_patch(
                 continue
             if not is_same_file and (s1.get("globals") or s2.get("globals")):
                 continue
-            rec1 = u1.get("receiver_param") or ("cls" if fn1_kind == "class" else "self")
-            rec2 = u2.get("receiver_param") or ("cls" if fn2_kind == "class" else "self")
+            rec1 = u1_eff.get("receiver_param") or ("cls" if fn1_kind == "class" else "self")
+            rec2 = u2_eff.get("receiver_param") or ("cls" if fn2_kind == "class" else "self")
             if (
                 _normalize_receiver_attrs(s1.get("attrs_read", []), rec1)
                 != _normalize_receiver_attrs(s2.get("attrs_read", []), rec2)

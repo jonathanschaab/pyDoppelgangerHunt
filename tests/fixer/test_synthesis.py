@@ -1912,3 +1912,180 @@ def test_patch_subroutine_is_async_propagation(tmp_path: Path) -> None:
     # returning total via a generator subroutine is illegal under PEP 525 and must be rejected.
     patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
     assert patch == ""
+
+
+def test_pair_clone_outputs_positional_alignment() -> None:
+    """Verifies that _pair_clone_outputs preserves 1-to-1 positional order even when variable names collide."""
+    from pydoppelgangerhunt.fixer.binding import _pair_clone_outputs  # pylint: disable=import-outside-toplevel
+
+    # Colliding variable names across different semantic positions
+    pairs = _pair_clone_outputs(["a", "b"], ["b", "c"])
+    assert pairs == [("a", "b"), ("b", "c")]
+
+    # Swapped variable names with identical name set preserve canonical identity mapping
+    pairs_swapped = _pair_clone_outputs(["x", "y"], ["y", "x"])
+    assert pairs_swapped == [("x", "x"), ("y", "y")]
+
+
+def test_extract_nested_scope_free_reads_outer_scope_shadowing() -> None:
+    """Verifies that defaults, decorators, and annotations in nested functions are not wiped by inner local stores."""
+    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def outer():\n"
+        "    for x in range(10):\n"
+        "        yield x\n"
+        "    def inner_default(a=x):\n"
+        "        x = 1\n"
+        "        return a + x\n"
+        "    def dec(fn):\n"
+        "        return fn\n"
+        "    @dec(x)\n"
+        "    def inner_dec():\n"
+        "        x = 2\n"
+        "        return x\n"
+        "    def inner_ann() -> x:\n"
+        "        x = 3\n"
+        "        return x\n"
+        "    class InnerClass(x):\n"
+        "        x = 4\n"
+    )
+    unit = {"start": 2, "end": 3}
+    reads = collect_downstream_read_names(code, unit, candidates={"x", "dec"})
+    assert reads is not None
+    assert "x" in reads
+
+
+def test_infer_outputs_return_type_counterpart_lookup() -> None:
+    """Verifies that counterpart variable types from outputs2 take precedence over name collisions."""
+    from pydoppelgangerhunt.fixer.synthesis import _infer_outputs_return_type  # pylint: disable=import-outside-toplevel
+
+    meta1 = {"a": {"type": "int"}, "c": {"type": "float"}}
+    meta2 = {
+        "a": {"type": "str"},  # Unrelated variable in clone 2 scope
+        "b": {"type": "int"},  # True counterpart to 'a'
+        "c": {"type": "bool"},  # Unrelated variable in clone 2 scope
+        "d": {"type": "float"},  # True counterpart to 'c'
+    }
+
+    # Multiple outputs
+    ret_multi = _infer_outputs_return_type(
+        ["a", "c"],
+        set(),
+        meta1,
+        meta2,
+        outputs2=["b", "d"],
+    )
+    assert ret_multi == "Tuple[int, float]"
+
+    # Single output
+    ret_single = _infer_outputs_return_type(
+        ["a"],
+        set(),
+        meta1,
+        meta2,
+        outputs2=["b"],
+    )
+    assert ret_single == "int"
+
+
+def test_downstream_reads_in_enclosing_class() -> None:
+    """Verifies that collect_downstream_read_names traverses statements and methods in an enclosing class."""
+    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "class ProcessingEngine:\n"
+        "    x = 10\n"
+        "    total = x * 2\n"
+        "    downstream_attr = total + 5\n"
+        "    def get_total(self):\n"
+        "        return total\n"
+    )
+    unit = {"start": 2, "end": 3}
+    reads = collect_downstream_read_names(code, unit, candidates={"total", "x"})
+    assert reads is not None
+    assert "total" in reads
+
+
+def test_caller_unit_dicts_immutable_during_patch(tmp_path: Path) -> None:
+    """Verifies that generate_refactoring_patch does not mutate caller unit dictionaries in-place."""
+    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch  # pylint: disable=import-outside-toplevel
+
+    code1 = (
+        "async def fn1():\n"
+        "    x = 1\n"
+        "    y = 2\n"
+        "    return x + y\n"
+    )
+    code2 = (
+        "async def fn2():\n"
+        "    x = 1\n"
+        "    y = 2\n"
+        "    return x + y\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 2, "end": 3, "name": "fn1", "kind": "block"}
+    u2 = {"file": str(f2), "start": 2, "end": 3, "name": "fn2", "kind": "block"}
+
+    u1_copy = dict(u1)
+    u2_copy = dict(u2)
+
+    generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=False)
+
+    assert u1 == u1_copy
+    assert u2 == u2_copy
+    assert "is_async" not in u1
+    assert "is_async" not in u2
+    assert "receiver_param" not in u1
+    assert "receiver_param" not in u2
+
+
+def test_synthesize_shared_helper_code_symmetric_global_filtering(tmp_path: Path) -> None:
+    """Verifies that synthesize_shared_helper_code filters globals/nonlocals from both u1 and u2 outputs."""
+    from pydoppelgangerhunt.fixer.synthesis import synthesize_shared_helper_code  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "global_var = 0\n"
+        "def fn1():\n"
+        "    global global_var\n"
+        "    global_var = 100\n"
+        "    common_calc = 10\n"
+        "    local_var = common_calc + 1\n"
+        "def fn2():\n"
+        "    global global_var\n"
+        "    global_var = 200\n"
+        "    common_calc = 10\n"
+        "    local_var = common_calc + 1\n"
+    )
+    f = tmp_path / "mod.py"
+    f.write_text(code, encoding="utf-8")
+
+    u1 = {
+        "file": str(f),
+        "start": 2,
+        "end": 6,
+        "name": "fn1",
+        "kind": "function",
+        "outputs": ["local_var", "global_var"],
+    }
+    u2 = {
+        "file": str(f),
+        "start": 7,
+        "end": 11,
+        "name": "fn2",
+        "kind": "function",
+        "outputs": ["local_var", "global_var"],
+    }
+
+    helper = synthesize_shared_helper_code(
+        u1,
+        u2,
+        repo_root=str(tmp_path),
+        helper_name="_shared_helper",
+    )
+    assert "return local_var" in helper
+    assert "return local_var, global_var" not in helper
