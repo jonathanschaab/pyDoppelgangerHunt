@@ -402,8 +402,8 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
         self._record_import_names(node, self.class_stores)
 
 
-def _collect_func_params(args: ast.arguments) -> Set[str]:
-    """Collects parameter names declared in a function or lambda signature."""
+def _collect_func_args(args: ast.arguments) -> List[ast.arg]:
+    """Collects all arg objects declared in a function or lambda signature."""
     all_args = (
         list(getattr(args, "posonlyargs", []))
         + list(args.args)
@@ -413,7 +413,12 @@ def _collect_func_params(args: ast.arguments) -> Set[str]:
         all_args.append(args.vararg)
     if args.kwarg:
         all_args.append(args.kwarg)
-    return {a.arg for a in all_args}
+    return all_args
+
+
+def _collect_func_params(args: ast.arguments) -> Set[str]:
+    """Collects parameter names declared in a function or lambda signature."""
+    return {a.arg for a in _collect_func_args(args)}
 
 
 def _extract_nested_scope_free_reads(
@@ -434,6 +439,9 @@ def _extract_nested_scope_free_reads(
 
     func_visitor = _FuncScopeVisitor()
     func_visitor.params = _collect_func_params(node.args)
+    for arg in _collect_func_args(node.args):
+        if arg.annotation is not None:
+            func_visitor.visit(arg.annotation)
     defaults = node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]
     for d in defaults:
         func_visitor.visit(d)
@@ -441,6 +449,8 @@ def _extract_nested_scope_free_reads(
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         for dec in node.decorator_list:
             func_visitor.visit(dec)
+        if node.returns is not None:
+            func_visitor.visit(node.returns)
         for stmt in node.body:
             func_visitor.visit(stmt)
     elif isinstance(node, ast.Lambda):
@@ -505,6 +515,13 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
                 if self.candidates is None or node.id in self.candidates:
                     self.loaded.add(node.id)
 
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        if isinstance(node.target, ast.Name) and self._is_node_after_unit(node.target):
+            if not self._is_in_comp(node.target.id):
+                if self.candidates is None or node.target.id in self.candidates:
+                    self.loaded.add(node.target.id)
+        self.generic_visit(node)
+
 
 def collect_downstream_read_names(
     source_text: str,
@@ -564,14 +581,16 @@ def _pair_clone_outputs(
     names `(o, o)` present in both units can be safely paired without guessing correspondence, and any
     unique names are excluded from pairing.
     """
-    if len(u1_outs) == len(u2_outs):
-        out_map = {o: o for o in set(u1_outs) & set(u2_outs)}
-        rem_u1 = [o for o in u1_outs if o not in out_map]
-        rem_u2 = [o for o in u2_outs if o not in out_map]
+    u1_dedup = list(dict.fromkeys(u1_outs))
+    u2_dedup = list(dict.fromkeys(u2_outs))
+    if len(u1_dedup) == len(u2_dedup):
+        out_map = {o: o for o in set(u1_dedup) & set(u2_dedup)}
+        rem_u1 = [o for o in u1_dedup if o not in out_map]
+        rem_u2 = [o for o in u2_dedup if o not in out_map]
         for o1, o2 in zip(rem_u1, rem_u2):
             out_map[o1] = o2
-        return [(o1, out_map[o1]) for o1 in u1_outs]
-    common = [o for o in u1_outs if o in u2_outs]
+        return [(o1, out_map.get(o1, o1)) for o1 in u1_dedup]
+    common = [o for o in u1_dedup if o in u2_dedup]
     return [(o, o) for o in common]
 
 

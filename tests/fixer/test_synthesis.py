@@ -1820,5 +1820,95 @@ def test_is_async_generator_with_return_value_policy() -> None:
     assert not is_async_generator_with_return_value(sync_gen, has_outputs=True)
 
 
+def test_downstream_read_visitor_aug_assign() -> None:
+    """Verifies that augmented assignments downstream of a unit are captured as reads."""
+    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def compute_running_total(items):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    total += x\n"
+        "    counts[0] += 1\n"
+    )
+    unit = {"start": 2, "end": 3}
+    reads = collect_downstream_read_names(code, unit, candidates={"total", "x"})
+    assert reads == {"total", "x"}
 
 
+def test_pair_clone_outputs_duplicate_names() -> None:
+    """Verifies that _pair_clone_outputs does not raise KeyError on duplicate output names."""
+    from pydoppelgangerhunt.fixer.binding import _pair_clone_outputs  # pylint: disable=import-outside-toplevel
+
+    # Equal lengths with duplicates on one side (len(dedup) differs -> common names only)
+    pairs1 = _pair_clone_outputs(["a", "b"], ["a", "a"])
+    assert pairs1 == [("a", "a")]
+
+    # Equal raw lengths with duplicate on one side and disjoint names (returns empty without KeyError)
+    pairs2 = _pair_clone_outputs(["x", "y"], ["z", "z"])
+    assert pairs2 == []
+
+    # Equal deduplicated lengths with duplicates on both sides
+    pairs3 = _pair_clone_outputs(["a", "b", "a"], ["c", "d", "c"])
+    assert pairs3 == [("a", "c"), ("b", "d")]
+
+    # Unequal raw lengths with duplicates
+    pairs4 = _pair_clone_outputs(["a", "b", "a"], ["a", "a"])
+    assert pairs4 == [("a", "a")]
+
+
+def test_extract_nested_scope_free_reads_type_annotations() -> None:
+    """Verifies that type annotations on parameters and return types in nested functions are captured as free reads."""
+    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def outer():\n"
+        "    class MyType:\n"
+        "        pass\n"
+        "    class ReturnType:\n"
+        "        pass\n"
+        "    for x in range(10):\n"
+        "        yield x\n"
+        "    def nested(param: MyType) -> ReturnType:\n"
+        "        return None\n"
+    )
+    unit = {"start": 6, "end": 7}
+    reads = collect_downstream_read_names(code, unit, candidates={"MyType", "ReturnType", "x"})
+    assert reads is not None
+    assert "MyType" in reads
+    assert "ReturnType" in reads
+
+
+def test_patch_subroutine_is_async_propagation(tmp_path: Path) -> None:
+    """Verifies that is_async from enclosing functions propagates to s1/s2 and rejects illegal returns."""
+    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch  # pylint: disable=import-outside-toplevel
+
+    code1 = (
+        "async def process_data(items):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    return total\n"
+    )
+    code2 = (
+        "async def process_data_alt(items):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    return total\n"
+    )
+    f1 = tmp_path / "proc1.py"
+    f2 = tmp_path / "proc2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+
+    # compound_block without is_async explicitly set in unit dictionary
+    u1 = {"file": str(f1), "start": 3, "end": 5, "name": "process_data", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 3, "end": 5, "name": "process_data_alt", "kind": "compound_block"}
+
+    # Because total is needed downstream and the enclosing function is async def (async generator),
+    # returning total via a generator subroutine is illegal under PEP 525 and must be rejected.
+    patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch == ""

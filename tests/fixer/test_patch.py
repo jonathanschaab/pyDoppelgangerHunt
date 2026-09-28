@@ -8382,7 +8382,3 @@ def test_generate_refactoring_patch_mixed_async_sync_rejected(tmp_path: Path) ->
 
     assert synthesize_shared_helper_code(u_ag, u_sg, repo_root=str(tmp_path)) == ""
     assert generate_refactoring_patch([(1.0, u_ag, u_sg)], repo_root=str(tmp_path), replace_clones=True) == ""
-
-
-
-

@@ -2803,6 +2803,10 @@ def generate_refactoring_patch(
 
             s1 = analyze_unit_variable_scope(u1_eff, repo_root=str(root))
             s2 = analyze_unit_variable_scope(u2_eff, repo_root=str(root))
+            if orig_fn1 and orig_fn1.get("is_async"):
+                s1["is_async"] = True
+            if orig_fn2 and orig_fn2.get("is_async"):
+                s2["is_async"] = True
             if bool(s1.get("is_async")) != bool(s2.get("is_async")):
                 continue
             if bool(s1.get("has_yield")) != bool(s2.get("has_yield")):
