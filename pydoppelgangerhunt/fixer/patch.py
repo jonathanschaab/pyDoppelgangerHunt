@@ -26,6 +26,7 @@ from pydoppelgangerhunt.fixer.binding import (
     collect_downstream_read_names,
     find_enclosing_class,
     find_enclosing_function,
+    is_async_generator_with_return_value,
     resolve_generator_subroutine_outputs,
 )
 from pydoppelgangerhunt.fixer.depgraph import (
@@ -2806,11 +2807,7 @@ def generate_refactoring_patch(
                 continue
             if bool(s1.get("has_yield")) != bool(s2.get("has_yield")):
                 continue
-            if (
-                (s1.get("has_yield") or s2.get("has_yield"))
-                and (s1.get("is_async") or s2.get("is_async"))
-                and (s1.get("has_return_value") or s2.get("has_return_value"))
-            ):
+            if is_async_generator_with_return_value(s1, s2):
                 continue
             if s1.get("nonlocals") or s2.get("nonlocals"):
                 continue
@@ -2905,10 +2902,10 @@ def generate_refactoring_patch(
                 tree1 = f1_plan.parsed_tree
                 tree2 = f2_plan.parsed_tree if f2_plan is not None else tree1
                 downstream1 = collect_downstream_read_names(
-                    f1_plan.orig_text, u1, orig_fn1, candidates=set(u1_outs), tree=tree1
+                    f1_plan.orig_text, u1, candidates=set(u1_outs), tree=tree1
                 )
                 downstream2 = collect_downstream_read_names(
-                    f2_text, u2, orig_fn2, candidates=set(u2_outs), tree=tree2
+                    f2_text, u2, candidates=set(u2_outs), tree=tree2
                 )
                 u1_def = set(s1.get("definite_stores", [])) | set(s1.get("inputs", []))
                 u2_def = set(s2.get("definite_stores", [])) | set(s2.get("inputs", []))
@@ -2918,8 +2915,9 @@ def generate_refactoring_patch(
                 if resolved_sub_outs is None:
                     continue
                 outputs, target_outs2 = resolved_sub_outs
-                is_async_gen = bool(s1.get("is_async") or s2.get("is_async"))
-                if is_async_gen and (outputs or target_outs2):
+                if is_async_generator_with_return_value(
+                    s1, s2, has_outputs=bool(outputs or target_outs2)
+                ):
                     continue
             else:
                 pairs = _pair_clone_outputs(outputs, u2_outs)

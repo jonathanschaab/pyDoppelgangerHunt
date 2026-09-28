@@ -1784,4 +1784,41 @@ def test_generator_clone_side_data_interface() -> None:
     assert resolve_generator_subroutine_outputs(side1, side_unpaired) is None
 
 
+def test_is_async_generator_with_return_value_policy() -> None:
+    """Verifies that is_async_generator_with_return_value strictly enforces PEP 525 constraints."""
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
+        is_async_generator_with_return_value,
+    )
+
+    # Clean sync generator with return value (allowed in Python 3.3+)
+    sync_gen = {"has_yield": True, "is_async": False, "has_return_value": True}
+    assert not is_async_generator_with_return_value(sync_gen)
+
+    # Clean async function with return value (allowed)
+    async_fn = {"has_yield": False, "is_async": True, "has_return_value": True}
+    assert not is_async_generator_with_return_value(async_fn)
+
+    # Async generator without return value (allowed)
+    async_gen_no_ret = {"has_yield": True, "is_async": True, "has_return_value": False}
+    assert not is_async_generator_with_return_value(async_gen_no_ret)
+
+    # Async generator with explicit return value (illegal under PEP 525)
+    async_gen_with_ret = {"has_yield": True, "is_async": True, "has_return_value": True}
+    assert is_async_generator_with_return_value(async_gen_with_ret)
+
+    # Multi-scope evaluation: if the merged helper combines yield, async, and return value, it is rejected
+    assert is_async_generator_with_return_value(async_gen_no_ret, async_gen_with_ret)
+    assert is_async_generator_with_return_value(async_gen_no_ret, sync_gen)
+
+    # When no scope contains return values and has_outputs is False, not rejected
+    clean_async = {"has_yield": False, "is_async": True, "has_return_value": False}
+    sync_gen_no_ret = {"has_yield": True, "is_async": False, "has_return_value": False}
+    assert not is_async_generator_with_return_value(clean_async, sync_gen_no_ret)
+
+    # Async generator attempting to propagate downstream outputs (illegal under PEP 525)
+    assert is_async_generator_with_return_value(async_gen_no_ret, has_outputs=True)
+    assert not is_async_generator_with_return_value(sync_gen, has_outputs=True)
+
+
+
 

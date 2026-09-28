@@ -509,7 +509,6 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
 def collect_downstream_read_names(
     source_text: str,
     unit: Dict[str, Any],
-    _enclosing_fn: Optional[Dict[str, Any]] = None,
     candidates: Optional[Set[str]] = None,
     *,
     tree: Optional[ast.AST] = None,
@@ -655,6 +654,24 @@ def resolve_generator_subroutine_outputs(
     ]
 
     return [o1 for o1, _ in kept_pairs], [o2 for _, o2 in kept_pairs]
+
+
+def is_async_generator_with_return_value(
+    *scopes: Optional[Dict[str, Any]],
+    has_outputs: bool = False,
+) -> bool:
+    """Checks whether scopes represent an async generator attempting to return values or outputs.
+
+    Under PEP 525, asynchronous generators cannot return values via StopAsyncIteration.
+    Any attempt to return explicit values or propagate downstream outputs from an async
+    generator subroutine is illegal and must be rejected.
+    """
+    has_yield = any(bool(s.get("has_yield")) for s in scopes if s is not None)
+    is_async = any(bool(s.get("is_async")) for s in scopes if s is not None)
+    has_ret = has_outputs or any(
+        bool(s.get("has_return_value")) for s in scopes if s is not None
+    )
+    return has_yield and is_async and has_ret
 
 
 def _normalize_file_path(

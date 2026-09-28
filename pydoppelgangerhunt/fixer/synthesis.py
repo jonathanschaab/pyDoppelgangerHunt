@@ -22,6 +22,7 @@ from pydoppelgangerhunt.fixer.binding import (
     _prune_unshared_receivers,
     _resolve_effective_binding,
     collect_downstream_read_names,
+    is_async_generator_with_return_value,
     resolve_generator_subroutine_outputs,
 )
 from pydoppelgangerhunt.fixer.scope import (
@@ -582,15 +583,8 @@ def synthesize_shared_helper_code(
         return ""
     if bool(scope1.get("has_yield")) != bool(scope2.get("has_yield")):
         return ""
-    if (bool(scope1.get("has_yield")) or bool(scope2.get("has_yield"))) and (
-        bool(scope1.get("is_async")) or bool(scope2.get("is_async"))
-    ):
-        if (
-            bool(scope1.get("has_return_value"))
-            or bool(scope2.get("has_return_value"))
-            or bool(scope.get("has_return_value"))
-        ):
-            return ""
+    if is_async_generator_with_return_value(scope1, scope2, scope):
+        return ""
     if scope1.get("nonlocals") or scope2.get("nonlocals") or scope.get("nonlocals"):
         return ""
     if not is_same_class and not _is_same_file_path(f1, f2, repo_root=repo_root) and (
@@ -761,7 +755,9 @@ def synthesize_shared_helper_code(
         and v not in scope.get("nonlocals", [])
     ]
 
-    if has_yield and is_async and helper_outputs:
+    if is_async_generator_with_return_value(
+        scope, scope1, scope2, has_outputs=bool(helper_outputs)
+    ):
         return ""
 
     return_type = _infer_helper_return_type(

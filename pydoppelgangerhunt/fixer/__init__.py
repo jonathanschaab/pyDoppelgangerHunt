@@ -23,6 +23,7 @@ from pydoppelgangerhunt.fixer.binding import (
     collect_downstream_read_names,
     find_enclosing_class,
     find_enclosing_function,
+    is_async_generator_with_return_value,
     resolve_generator_subroutine_outputs,
 )
 from pydoppelgangerhunt.fixer.depgraph import (
@@ -141,6 +142,7 @@ __all__ = [
     "generate_refactoring_patch",
     "GeneratorCloneSideData",
     "intervals_overlap",
+    "is_async_generator_with_return_value",
     "is_valid_unit_coordinates",
     "parse_unit_coord",
     "refactor_module_units",
