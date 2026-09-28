@@ -21,6 +21,7 @@ from pydoppelgangerhunt.fixer.binding import (
     _prune_unshared_receivers,
     _resolve_effective_binding,
     collect_downstream_read_names,
+    resolve_generator_subroutine_outputs,
 )
 from pydoppelgangerhunt.fixer.scope import (
     _normalize_receiver_attrs,
@@ -664,8 +665,29 @@ def synthesize_shared_helper_code(
     downstream2: Optional[Set[str]] = None
     if "outputs" in u1 and isinstance(u1["outputs"], (list, tuple, set)):
         outputs = list(u1["outputs"])
+        if "outputs" in u2 and isinstance(u2["outputs"], (list, tuple, set)):
+            u2_outs = [
+                v for v in u2["outputs"]
+                if v not in scope2.get("globals", [])
+                and v not in scope2.get("nonlocals", [])
+            ]
+        else:
+            u2_outs = [
+                v for v in scope2.get("outputs", [])
+                if v not in scope2.get("globals", [])
+                and v not in scope2.get("nonlocals", [])
+            ]
     else:
-        outputs = list(scope.get("outputs", []))
+        u1_raw = [
+            v for v in scope1.get("outputs", [])
+            if v not in scope1.get("globals", [])
+            and v not in scope1.get("nonlocals", [])
+        ]
+        u2_raw = [
+            v for v in scope2.get("outputs", [])
+            if v not in scope2.get("globals", [])
+            and v not in scope2.get("nonlocals", [])
+        ]
         has_yield = bool(scope.get("has_yield") or scope1.get("has_yield") or scope2.get("has_yield"))
         if has_yield and (
             u1.get("kind") in ("compound_block", "sliding_window", "clause_branch")
@@ -673,7 +695,7 @@ def synthesize_shared_helper_code(
         ):
             root_path = Path(repo_root or os.getcwd())
             collected_downstreams: List[Optional[Set[str]]] = []
-            for unit_target in (u1, u2):
+            for unit_target, cand_set in ((u1, set(u1_raw)), (u2, set(u2_raw))):
                 f_str = str(unit_target.get("file") or "")
                 d_reads: Optional[Set[str]] = None
                 if f_str:
@@ -682,19 +704,22 @@ def synthesize_shared_helper_code(
                     if p_full.is_file():
                         try:
                             d_reads = collect_downstream_read_names(
-                                p_full.read_text(encoding="utf-8"), unit_target
+                                p_full.read_text(encoding="utf-8"), unit_target, candidates=cand_set
                             )
                         except (OSError, UnicodeDecodeError):
                             d_reads = None
                 collected_downstreams.append(d_reads)
             downstream1, downstream2 = collected_downstreams[0], collected_downstreams[1]
-            if downstream1 is not None or downstream2 is not None:
-                needed: Set[str] = set()
-                if downstream1 is not None:
-                    needed.update(downstream1)
-                if downstream2 is not None:
-                    needed.update(downstream2)
-                outputs = [v for v in outputs if v in needed]
+            outputs, u2_outs = resolve_generator_subroutine_outputs(
+                u1_raw, u2_raw, downstream1, downstream2
+            )
+        else:
+            outputs = [
+                v for v in scope.get("outputs", [])
+                if v not in scope.get("globals", [])
+                and v not in scope.get("nonlocals", [])
+            ]
+            u2_outs = u2_raw
 
     conditional_outs = set(scope.get("conditional_outputs", []))
     is_async = scope.get("is_async", False)
@@ -707,23 +732,6 @@ def synthesize_shared_helper_code(
         if v not in scope.get("globals", [])
         and v not in scope.get("nonlocals", [])
     ]
-
-    if "outputs" in u2 and isinstance(u2["outputs"], (list, tuple, set)):
-        u2_outs = [
-            v for v in u2["outputs"]
-            if v not in scope2.get("globals", [])
-            and v not in scope2.get("nonlocals", [])
-        ]
-    else:
-        u2_raw = list(scope2.get("outputs", []))
-        if downstream1 is not None or downstream2 is not None:
-            needed2 = downstream2 if downstream2 is not None else (downstream1 if downstream1 is not None else set(u2_raw))
-            u2_raw = [v for v in u2_raw if v in needed2]
-        u2_outs = [
-            v for v in u2_raw
-            if v not in scope2.get("globals", [])
-            and v not in scope2.get("nonlocals", [])
-        ]
 
     return_type = _infer_helper_return_type(
         resolved_ret,

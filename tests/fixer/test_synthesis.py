@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import ast
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict
-
-import pytest
 
 from pydoppelgangerhunt import (
     check_units_overlap,
@@ -1340,3 +1337,62 @@ def test_async_generator_with_return_rejected_in_synthesis(tmp_path: Path) -> No
     assert helper_bare != ""
     assert "async def" in helper_bare
     assert "-> AsyncIterator[" in helper_bare
+
+
+def test_collect_downstream_read_names_skips_nested_scopes() -> None:
+    """Verifies that collect_downstream_read_names skips nested def/class bodies and respects candidates filter."""
+    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def outer(items):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "\n"
+        "    def inner():\n"
+        "        return x\n"
+        "\n"
+        "    class C:\n"
+        "        value = x\n"
+        "\n"
+        "    print(total)\n"
+    )
+    unit = {"start": 3, "end": 5}
+
+    # 1. With candidates: only 'total' should be found; 'x' is in nested scopes, 'print' is not in candidates
+    reads = collect_downstream_read_names(code, unit, candidates={"total", "x"})
+    assert reads == {"total"}
+
+    # 2. Without candidates: 'total' and 'print' in outer scope are found, but 'x' in inner/C is skipped
+    all_reads = collect_downstream_read_names(code, unit)
+    assert all_reads == {"total", "print"}
+
+
+def test_resolve_generator_subroutine_outputs_preserves_per_side_necessity_and_safe_fallback() -> None:
+    """Verifies that resolve_generator_subroutine_outputs pairs renamed outputs and guards against partial knowledge."""
+    from pydoppelgangerhunt.fixer.binding import resolve_generator_subroutine_outputs  # pylint: disable=import-outside-toplevel
+
+    u1_outs = ["total", "x"]
+    u2_outs = ["count", "x"]
+
+    # 1. Both sides known: only the mapped total/count slot is needed, x is discarded
+    out1, out2 = resolve_generator_subroutine_outputs(
+        u1_outs, u2_outs, downstream1={"total"}, downstream2={"count"}
+    )
+    assert out1 == ["total"]
+    assert out2 == ["count"]
+
+    # 2. Unknown fallback: if side 2 is None, all outputs of side 2 are conservatively preserved
+    fb_out1, fb_out2 = resolve_generator_subroutine_outputs(
+        u1_outs, u2_outs, downstream1={"total"}, downstream2=None
+    )
+    assert fb_out1 == ["total", "x"]
+    assert fb_out2 == ["count", "x"]
+
+    # 3. Neither side needs outputs
+    none_out1, none_out2 = resolve_generator_subroutine_outputs(
+        u1_outs, u2_outs, downstream1=set(), downstream2=set()
+    )
+    assert none_out1 == []
+    assert none_out2 == []

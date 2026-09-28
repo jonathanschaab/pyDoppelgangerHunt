@@ -24,6 +24,7 @@ from pydoppelgangerhunt.fixer.binding import (
     collect_downstream_read_names,
     find_enclosing_class,
     find_enclosing_function,
+    resolve_generator_subroutine_outputs,
 )
 from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
@@ -2870,30 +2871,30 @@ def generate_refactoring_patch(
             )
             has_yield = bool(s1.get("has_yield") or s2.get("has_yield"))
             if is_sub and has_yield:
-                f2_text = f1_plan.orig_text if f2_plan is None else f2_plan.orig_text
-                downstream1 = collect_downstream_read_names(f1_plan.orig_text, u1, orig_fn1)
-                downstream2 = collect_downstream_read_names(f2_text, u2, orig_fn2)
-                if downstream1 is not None or downstream2 is not None:
-                    needed_outs: Set[str] = set()
-                    if downstream1 is not None:
-                        needed_outs.update(downstream1)
-                    if downstream2 is not None:
-                        needed_outs.update(downstream2)
-                    outputs = [v for v in outputs if v in needed_outs]
-                    u1_outs = [v for v in u1_outs if v in (downstream1 if downstream1 is not None else needed_outs)]
-                    u2_outs = [v for v in u2_outs if v in (downstream2 if downstream2 is not None else needed_outs)]
-
-            if set(u2_outs) == set(outputs):
-                target_outs2 = outputs
-            elif len(u2_outs) == len(outputs):
-                out_map = {o: o for o in set(outputs) & set(u2_outs)}
-                rem_o = [o for o in outputs if o not in out_map]
-                rem_u2 = [o for o in u2_outs if o not in out_map]
-                for o1, o2 in zip(rem_o, rem_u2):
-                    out_map[o1] = o2
-                target_outs2 = [out_map.get(o, o) for o in outputs]
+                # For single-file clones, f2_plan is None and both units reside in f1_plan.orig_text.
+                # For cross-file clones, f2_plan holds the original text for the second file.
+                f2_text = f2_plan.orig_text if f2_plan is not None else f1_plan.orig_text
+                downstream1 = collect_downstream_read_names(
+                    f1_plan.orig_text, u1, orig_fn1, candidates=set(u1_outs)
+                )
+                downstream2 = collect_downstream_read_names(
+                    f2_text, u2, orig_fn2, candidates=set(u2_outs)
+                )
+                outputs, target_outs2 = resolve_generator_subroutine_outputs(
+                    u1_outs, u2_outs, downstream1, downstream2
+                )
             else:
-                target_outs2 = outputs
+                if set(u2_outs) == set(outputs):
+                    target_outs2 = outputs
+                elif len(u2_outs) == len(outputs):
+                    out_map = {o: o for o in set(outputs) & set(u2_outs)}
+                    rem_o = [o for o in outputs if o not in out_map]
+                    rem_u2 = [o for o in u2_outs if o not in out_map]
+                    for o1, o2 in zip(rem_o, rem_u2):
+                        out_map[o1] = o2
+                    target_outs2 = [out_map.get(o, o) for o in outputs]
+                else:
+                    target_outs2 = outputs
             u1_eff["outputs"] = outputs
             u2_eff["outputs"] = target_outs2
             t_inputs1 = list(s1.get("inputs", []))
@@ -2906,11 +2907,15 @@ def generate_refactoring_patch(
                     t_inputs2, u2_eff, u1_eff, s2, s1, repo_root=str(root)
                 )
 
+            outputs_mismatch = (
+                len(target_outs2) != len(outputs)
+                if (is_sub and has_yield)
+                else (len(u1_outs) != len(outputs) or len(u2_outs) != len(outputs))
+            )
             if replace_clones and (
                 len(t_inputs1) != len(inputs)
                 or len(t_inputs2) != len(inputs)
-                or len(u1_outs) != len(outputs)
-                or len(u2_outs) != len(outputs)
+                or outputs_mismatch
             ):
                 continue
 

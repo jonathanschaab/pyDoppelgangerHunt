@@ -20,15 +20,16 @@ def _find_innermost_enclosing_node(
     source_text: str,
     unit: Dict[str, Any],
     node_types: Tuple[type, ...],
+    tree: Optional[ast.AST] = None,
 ) -> Optional[Tuple[ast.AST, int, int]]:
     """Locates the innermost AST node of matching types enclosing the given unit."""
-    if not source_text.strip():
-        return None
-
-    try:
-        tree = ast.parse(source_text)
-    except (SyntaxError, ValueError, UnicodeDecodeError):
-        return None
+    if tree is None:
+        if not source_text.strip():
+            return None
+        try:
+            tree = ast.parse(source_text)
+        except (SyntaxError, ValueError, UnicodeDecodeError):
+            return None
 
     u_start = parse_unit_coord(unit, "start", default=0)
     u_end = parse_unit_coord(unit, "end", default=u_start)
@@ -174,12 +175,57 @@ def find_enclosing_function(
     return meta
 
 
+class _DownstreamReadVisitor(ast.NodeVisitor):
+    """Walks AST statements in a lexical scope without entering nested function or class bodies."""
+
+    def __init__(
+        self,
+        u_end: int,
+        u_end_col: Optional[int],
+        candidates: Optional[Set[str]] = None,
+    ) -> None:
+        self.u_end = u_end
+        self.u_end_col = u_end_col
+        self.candidates = candidates
+        self.loaded: Set[str] = set()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        # Stop traversal: do not enter nested function scopes
+        return
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        # Stop traversal: do not enter nested async function scopes
+        return
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        # Stop traversal: do not enter nested class scopes
+        return
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Load):
+            lineno = getattr(node, "lineno", None)
+            if lineno is not None:
+                is_after = (
+                    lineno > self.u_end
+                    or (
+                        lineno == self.u_end
+                        and self.u_end_col is not None
+                        and getattr(node, "col_offset", 0) >= int(self.u_end_col)
+                    )
+                )
+                if is_after:
+                    if self.candidates is None or node.id in self.candidates:
+                        self.loaded.add(node.id)
+        self.generic_visit(node)
+
+
 def collect_downstream_read_names(
     source_text: str,
     unit: Dict[str, Any],
-    enclosing_fn: Optional[Dict[str, Any]] = None,
+    _enclosing_fn: Optional[Dict[str, Any]] = None,
+    candidates: Optional[Set[str]] = None,
 ) -> Optional[Set[str]]:
-    """Identifies variable names loaded downstream of a unit within its enclosing function or module."""
+    """Identifies variable names loaded downstream of a unit within its lexical execution scope."""
     if not source_text.strip():
         return None
 
@@ -188,28 +234,57 @@ def collect_downstream_read_names(
     except (SyntaxError, ValueError, UnicodeDecodeError):
         return None
 
-    u_end = int(unit.get("end") or 0)
-    if u_end <= 0:
+    u_start = parse_unit_coord(unit, "start", default=0)
+    u_end = parse_unit_coord(unit, "end", default=u_start)
+    if u_start <= 0 or u_end <= 0:
         return None
 
-    fn_meta = enclosing_fn if enclosing_fn is not None else find_enclosing_function(source_text, unit)
-    scope_end = int(fn_meta["end"]) if fn_meta and fn_meta.get("end") else None
-    u_end_col = unit.get("end_col_offset")
+    enc = _find_innermost_enclosing_node(
+        source_text, unit, (ast.FunctionDef, ast.AsyncFunctionDef), tree=tree
+    )
+    scope_node: ast.AST = enc[0] if enc is not None else tree
 
-    loaded: Set[str] = set()
-    for node in ast.walk(tree):
-        lineno = getattr(node, "lineno", None)
-        if lineno is None:
-            continue
-        is_after = (
-            lineno > u_end
-            or (lineno == u_end and u_end_col is not None and getattr(node, "col_offset", 0) >= int(u_end_col))
-        )
-        if is_after and (scope_end is None or lineno <= scope_end):
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-                loaded.add(node.id)
+    visitor = _DownstreamReadVisitor(
+        u_end, unit.get("end_col_offset"), candidates=candidates
+    )
+    for stmt in getattr(scope_node, "body", []):
+        visitor.visit(stmt)
 
-    return loaded
+    return visitor.loaded
+
+
+def _pair_clone_outputs(
+    u1_outs: Sequence[str],
+    u2_outs: Sequence[str],
+) -> List[Tuple[str, str]]:
+    """Establishes an ordered 1-to-1 mapping between clone output variables."""
+    if len(u1_outs) == len(u2_outs):
+        out_map = {o: o for o in set(u1_outs) & set(u2_outs)}
+        rem_u1 = [o for o in u1_outs if o not in out_map]
+        rem_u2 = [o for o in u2_outs if o not in out_map]
+        for o1, o2 in zip(rem_u1, rem_u2):
+            out_map[o1] = o2
+        return [(o1, out_map[o1]) for o1 in u1_outs]
+    common = [o for o in u1_outs if o in u2_outs]
+    return [(o, o) for o in common]
+
+
+def resolve_generator_subroutine_outputs(
+    u1_outs: Sequence[str],
+    u2_outs: Sequence[str],
+    downstream1: Optional[Set[str]],
+    downstream2: Optional[Set[str]],
+) -> Tuple[List[str], List[str]]:
+    """Selects output variables needed downstream by either clone side, preserving per-side necessity."""
+    d1_needed = downstream1 if downstream1 is not None else set(u1_outs)
+    d2_needed = downstream2 if downstream2 is not None else set(u2_outs)
+    pairs = _pair_clone_outputs(u1_outs, u2_outs)
+    kept_pairs = [
+        (o1, o2)
+        for o1, o2 in pairs
+        if o1 in d1_needed or o2 in d2_needed
+    ]
+    return [o1 for o1, _ in kept_pairs], [o2 for _, o2 in kept_pairs]
 
 
 def _normalize_file_path(
