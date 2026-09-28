@@ -7926,9 +7926,47 @@ def test_generate_refactoring_patch_sync_generator_with_outputs_and_return(tmp_p
 
     patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
     assert patch
-    assert "return total, x" in patch
-    assert "total, x = (yield from _shared_produce_and_sum1_produce_and_sum2(items))" in patch
+    assert "return total" in patch
+    assert "return total, x" not in patch
+    assert "total = (yield from _shared_produce_and_sum1_produce_and_sum2(items))" in patch
     assert "-> Generator[" in patch
+
+    # Semantic contract validation: git apply and execute refactored code across empty, 1-element, and multi-element inputs
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    eval_code = (
+        "import ps1, ps2\n"
+        "for mod_name, fn in [('ps1', ps1.produce_and_sum1), ('ps2', ps2.produce_and_sum2)]:\n"
+        "    for test_items in [[], [42], [1, 2, 3, 4]]:\n"
+        "        gen = fn(test_items)\n"
+        "        yielded = []\n"
+        "        while True:\n"
+        "            try:\n"
+        "                yielded.append(next(gen))\n"
+        "            except StopIteration as e:\n"
+        "                ret = e.value\n"
+        "                break\n"
+        "        assert yielded == test_items, f'{mod_name} yielded {yielded} != {test_items}'\n"
+        "        assert ret == sum(test_items), f'{mod_name} ret {ret} != {sum(test_items)}'\n"
+        "print('CONTRACT_OK')\n"
+    )
+    run_proc = subprocess.run(
+        [sys.executable, "-c", eval_code],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+    )
+    assert run_proc.returncode == 0, f"Runtime failure: {run_proc.stderr}"
+    assert "CONTRACT_OK" in run_proc.stdout
 
 
 def test_generate_refactoring_patch_async_generator_with_return_rejected(tmp_path: Path) -> None:
@@ -7955,3 +7993,34 @@ def test_generate_refactoring_patch_async_generator_with_return_rejected(tmp_pat
 
     patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
     assert patch == ""
+
+
+def test_generate_refactoring_patch_async_generator_with_bare_return_accepted(tmp_path: Path) -> None:
+    """Verifies that clone pairs of async generators with bare return statements are accepted and refactored."""
+    src1 = (
+        "async def agen1(items: list[int]):\n"
+        "    for x in items:\n"
+        "        if x < 0:\n"
+        "            return\n"
+        "        yield x\n"
+    )
+    src2 = (
+        "async def agen2(items: list[int]):\n"
+        "    for x in items:\n"
+        "        if x < 0:\n"
+        "            return\n"
+        "        yield x\n"
+    )
+    f1 = tmp_path / "as1.py"
+    f2 = tmp_path / "as2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 1, "end": 5, "name": "agen1", "kind": "function"}
+    u2 = {"file": str(f2), "start": 1, "end": 5, "name": "agen2", "kind": "function"}
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch != ""
+    assert "async def _shared_agen1_agen2" in patch
+    assert "-> AsyncIterator[" in patch
+

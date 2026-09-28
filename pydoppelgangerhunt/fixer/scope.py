@@ -100,6 +100,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.loop_offset: int = loop_offset
         self.loop_depth: int = 0
         self.has_return: bool = False
+        self.has_return_value: bool = False
         self.has_yield: bool = False
         self.has_super: bool = False
         self.has_mangled_names: bool = False
@@ -544,6 +545,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         if len(self._scope_stack) <= 1:
             self.has_return = True
             if node.value is not None:
+                self.has_return_value = True
                 if isinstance(node.value, ast.Name):
                     if node.value.id not in self.returns:
                         self.returns.append(node.value.id)
@@ -1160,6 +1162,7 @@ def _inspect_unit_scope(
         "is_control_flow_safe": True,
         "has_yield": False,
         "has_return": False,
+        "has_return_value": False,
         "has_super": False,
         "has_mangled_names": False,
         "local_imports": [],
@@ -1311,7 +1314,9 @@ def _inspect_unit_scope(
 
     # Unit outputs: explicit returns if present; for subroutines without explicit
     # returns, all local variable stores act as unit outputs to preserve caller mutations.
-    if visitor.returns:
+    if "outputs" in unit and isinstance(unit["outputs"], (list, tuple, set)):
+        outputs = list(unit["outputs"])
+    elif visitor.returns:
         outputs = list(visitor.returns)
     elif is_subroutine:
         outputs = [
@@ -1322,6 +1327,9 @@ def _inspect_unit_scope(
             and v not in visitor.deleted_names
             and v not in visitor.imported_names
         ]
+        if "downstream_reads" in unit and isinstance(unit["downstream_reads"], (set, list, tuple)):
+            downstream_set = set(unit["downstream_reads"])
+            outputs = [v for v in outputs if v in downstream_set]
     else:
         outputs = []
 
@@ -1367,6 +1375,7 @@ def _inspect_unit_scope(
         "is_control_flow_safe": is_control_flow_safe,
         "has_yield": visitor.has_yield,
         "has_return": visitor.has_return,
+        "has_return_value": visitor.has_return_value,
         "has_super": visitor.has_super,
         "has_mangled_names": visitor.has_mangled_names,
         "local_imports": visitor.local_imports,
@@ -1426,6 +1435,7 @@ def analyze_unit_variable_scope(
         is_safe = info1["is_control_flow_safe"] and info2["is_control_flow_safe"]
         has_yield = info1["has_yield"] or info2["has_yield"]
         has_return = info1["has_return"] or info2["has_return"]
+        has_return_value = bool(info1.get("has_return_value") or info2.get("has_return_value"))
         has_super = bool(info1.get("has_super", False) or info2.get("has_super", False))
         has_mangled = bool(info1.get("has_mangled_names", False) or info2.get("has_mangled_names", False))
         local_imports = list(dict.fromkeys(info1["local_imports"] + info2["local_imports"]))
@@ -1451,6 +1461,7 @@ def analyze_unit_variable_scope(
         is_safe = info1["is_control_flow_safe"]
         has_yield = info1["has_yield"]
         has_return = info1["has_return"]
+        has_return_value = bool(info1.get("has_return_value"))
         has_super = bool(info1.get("has_super", False))
         has_mangled = bool(info1.get("has_mangled_names", False))
         local_imports = info1["local_imports"]
@@ -1492,6 +1503,7 @@ def analyze_unit_variable_scope(
         "is_control_flow_safe": is_safe,
         "has_yield": has_yield,
         "has_return": has_return,
+        "has_return_value": has_return_value,
         "has_super": has_super,
         "has_mangled_names": has_mangled,
         "local_imports": local_imports,

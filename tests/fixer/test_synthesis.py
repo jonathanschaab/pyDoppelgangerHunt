@@ -1151,12 +1151,14 @@ def test_format_call_arguments_order_preservation_and_custom_receivers() -> None
 
 def test_sync_generator_helper_synthesis_with_outputs_emits_return_and_generator_type(tmp_path: Path) -> None:
     """Verifies that synthesizing helpers from sync generators with outputs emits return and Generator type."""
+    # 1. With downstream return: helper returns count, prunes loop variable x, and has Generator type
     code1 = (
         "def count_and_yield1(items: list[int]):\n"
         "    count = 0\n"
         "    for x in items:\n"
         "        count += 1\n"
         "        yield x\n"
+        "    return count\n"
     )
     code2 = (
         "def count_and_yield2(items: list[int]):\n"
@@ -1164,6 +1166,7 @@ def test_sync_generator_helper_synthesis_with_outputs_emits_return_and_generator
         "    for x in items:\n"
         "        count += 1\n"
         "        yield x\n"
+        "    return count\n"
     )
     f1 = tmp_path / "cy1.py"
     f2 = tmp_path / "cy2.py"
@@ -1175,7 +1178,35 @@ def test_sync_generator_helper_synthesis_with_outputs_emits_return_and_generator
 
     helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert "-> Generator[" in helper
-    assert "return count, x" in helper
+    assert "return count" in helper
+    assert "return count, x" not in helper
+
+    # 2. Without downstream return: loop variable is not needed downstream, so return is omitted and Iterator type used
+    code_no_ret1 = (
+        "def pure_yield1(items: list[int]):\n"
+        "    count = 0\n"
+        "    for x in items:\n"
+        "        count += 1\n"
+        "        yield x\n"
+    )
+    code_no_ret2 = (
+        "def pure_yield2(items: list[int]):\n"
+        "    count = 0\n"
+        "    for x in items:\n"
+        "        count += 1\n"
+        "        yield x\n"
+    )
+    f3 = tmp_path / "py1.py"
+    f4 = tmp_path / "py2.py"
+    f3.write_text(code_no_ret1, encoding="utf-8")
+    f4.write_text(code_no_ret2, encoding="utf-8")
+
+    u3 = {"file": "py1.py", "start": 2, "end": 5, "name": "pure_yield1:for", "kind": "compound_block"}
+    u4 = {"file": "py2.py", "start": 2, "end": 5, "name": "pure_yield2:for", "kind": "compound_block"}
+
+    helper_no_ret = synthesize_shared_helper_code(u3, u4, repo_root=str(tmp_path))
+    assert "-> Iterator[" in helper_no_ret
+    assert "return " not in helper_no_ret
 
 
 def test_infer_helper_return_type_sync_generator_with_outputs_and_return() -> None:
@@ -1220,10 +1251,59 @@ def test_infer_helper_return_type_sync_generator_with_outputs_and_return() -> No
     )
     assert res_explicit == "Generator[int, None, float]"
 
+    # 4. Explicit return type with has_return_value
+    res_explicit_int = _infer_helper_return_type(
+        resolved_ret="int",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={"has_yield": True, "yield_expr_names": [], "has_return_value": True},
+        meta1={},
+        meta2={},
+        is_async=False,
+    )
+    assert res_explicit_int == "Generator[Any, None, int]"
+
+    # 5. Conditional outputs
+    res_cond = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=["total"],
+        conditional_outs={"total"},
+        scope={"has_yield": True, "yield_expr_names": [("yield", ":literal:int")]},
+        meta1={"total": {"type": "int"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_cond == "Generator[int, None, Optional[int]]"
+
+    # 6. Bare return with no value -> Iterator
+    res_bare = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={"has_yield": True, "yield_expr_names": [], "has_return": True, "has_return_value": False},
+        meta1={},
+        meta2={},
+        is_async=False,
+    )
+    assert res_bare == "Iterator[Any]"
+
+    # 7. No return at all -> Iterator
+    res_no_ret = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={"has_yield": True, "yield_expr_names": [], "has_return": False, "has_return_value": False},
+        meta1={},
+        meta2={},
+        is_async=False,
+    )
+    assert res_no_ret == "Iterator[Any]"
+
 
 def test_async_generator_with_return_rejected_in_synthesis(tmp_path: Path) -> None:
-    """Verifies that synthesize_shared_helper_code returns empty string when an async generator has return statement."""
-    code = (
+    """Verifies that synthesize_shared_helper_code rejects async generators with return value but accepts bare return."""
+    # 1. Async generator with return <value> must be rejected
+    code_val = (
         "async def agen_returns(items: list[int]):\n"
         "    for x in items:\n"
         "        yield x\n"
@@ -1231,11 +1311,32 @@ def test_async_generator_with_return_rejected_in_synthesis(tmp_path: Path) -> No
     )
     f1 = tmp_path / "ao1.py"
     f2 = tmp_path / "ao2.py"
-    f1.write_text(code, encoding="utf-8")
-    f2.write_text(code, encoding="utf-8")
+    f1.write_text(code_val, encoding="utf-8")
+    f2.write_text(code_val, encoding="utf-8")
 
     u1 = {"file": "ao1.py", "start": 1, "end": 4, "name": "agen_returns", "kind": "function", "is_async": True}
     u2 = {"file": "ao2.py", "start": 1, "end": 4, "name": "agen_returns", "kind": "function", "is_async": True}
 
-    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
-    assert helper == ""
+    helper_val = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper_val == ""
+
+    # 2. Async generator with bare return (no value) is valid Python (PEP 525) and should be synthesized
+    code_bare = (
+        "async def agen_bare(items: list[int]):\n"
+        "    for x in items:\n"
+        "        if x < 0:\n"
+        "            return\n"
+        "        yield x\n"
+    )
+    f3 = tmp_path / "ab1.py"
+    f4 = tmp_path / "ab2.py"
+    f3.write_text(code_bare, encoding="utf-8")
+    f4.write_text(code_bare, encoding="utf-8")
+
+    u3 = {"file": "ab1.py", "start": 1, "end": 5, "name": "agen_bare", "kind": "function", "is_async": True}
+    u4 = {"file": "ab2.py", "start": 1, "end": 5, "name": "agen_bare", "kind": "function", "is_async": True}
+
+    helper_bare = synthesize_shared_helper_code(u3, u4, repo_root=str(tmp_path))
+    assert helper_bare != ""
+    assert "async def" in helper_bare
+    assert "-> AsyncIterator[" in helper_bare

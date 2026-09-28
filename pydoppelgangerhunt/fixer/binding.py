@@ -174,6 +174,44 @@ def find_enclosing_function(
     return meta
 
 
+def collect_downstream_read_names(
+    source_text: str,
+    unit: Dict[str, Any],
+    enclosing_fn: Optional[Dict[str, Any]] = None,
+) -> Optional[Set[str]]:
+    """Identifies variable names loaded downstream of a unit within its enclosing function or module."""
+    if not source_text.strip():
+        return None
+
+    try:
+        tree = ast.parse(source_text)
+    except (SyntaxError, ValueError, UnicodeDecodeError):
+        return None
+
+    u_end = int(unit.get("end") or 0)
+    if u_end <= 0:
+        return None
+
+    fn_meta = enclosing_fn if enclosing_fn is not None else find_enclosing_function(source_text, unit)
+    scope_end = int(fn_meta["end"]) if fn_meta and fn_meta.get("end") else None
+    u_end_col = unit.get("end_col_offset")
+
+    loaded: Set[str] = set()
+    for node in ast.walk(tree):
+        lineno = getattr(node, "lineno", None)
+        if lineno is None:
+            continue
+        is_after = (
+            lineno > u_end
+            or (lineno == u_end and u_end_col is not None and getattr(node, "col_offset", 0) >= int(u_end_col))
+        )
+        if is_after and (scope_end is None or lineno <= scope_end):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                loaded.add(node.id)
+
+    return loaded
+
+
 def _normalize_file_path(
     f_str: str,
     repo_root: Optional[str] = None,

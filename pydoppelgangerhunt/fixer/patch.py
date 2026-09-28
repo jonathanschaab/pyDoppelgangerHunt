@@ -21,6 +21,7 @@ from pydoppelgangerhunt.fixer.binding import (
     _is_same_file_path,
     _prune_unshared_receivers,
     _resolve_effective_binding,
+    collect_downstream_read_names,
     find_enclosing_class,
     find_enclosing_function,
 )
@@ -2773,7 +2774,11 @@ def generate_refactoring_patch(
                 continue
             if bool(s1.get("has_yield")) != bool(s2.get("has_yield")):
                 continue
-            if s1.get("has_yield") and s1.get("is_async") and (s1.get("has_return") or s2.get("has_return")):
+            if (
+                (s1.get("has_yield") or s2.get("has_yield"))
+                and (s1.get("is_async") or s2.get("is_async"))
+                and (s1.get("has_return_value") or s2.get("has_return_value"))
+            ):
                 continue
             if s1.get("nonlocals") or s2.get("nonlocals"):
                 continue
@@ -2859,6 +2864,25 @@ def generate_refactoring_patch(
                 if v not in s2.get("globals", [])
                 and v not in s2.get("nonlocals", [])
             ]
+            is_sub = (
+                u1.get("kind") in ("compound_block", "sliding_window", "clause_branch")
+                or ":" in str(u1.get("name") or "")
+            )
+            has_yield = bool(s1.get("has_yield") or s2.get("has_yield"))
+            if is_sub and has_yield:
+                f2_text = f1_plan.orig_text if f2_plan is None else f2_plan.orig_text
+                downstream1 = collect_downstream_read_names(f1_plan.orig_text, u1, orig_fn1)
+                downstream2 = collect_downstream_read_names(f2_text, u2, orig_fn2)
+                if downstream1 is not None or downstream2 is not None:
+                    needed_outs: Set[str] = set()
+                    if downstream1 is not None:
+                        needed_outs.update(downstream1)
+                    if downstream2 is not None:
+                        needed_outs.update(downstream2)
+                    outputs = [v for v in outputs if v in needed_outs]
+                    u1_outs = [v for v in u1_outs if v in (downstream1 if downstream1 is not None else needed_outs)]
+                    u2_outs = [v for v in u2_outs if v in (downstream2 if downstream2 is not None else needed_outs)]
+
             if set(u2_outs) == set(outputs):
                 target_outs2 = outputs
             elif len(u2_outs) == len(outputs):
@@ -2870,6 +2894,8 @@ def generate_refactoring_patch(
                 target_outs2 = [out_map.get(o, o) for o in outputs]
             else:
                 target_outs2 = outputs
+            u1_eff["outputs"] = outputs
+            u2_eff["outputs"] = target_outs2
             t_inputs1 = list(s1.get("inputs", []))
             t_inputs2 = list(s2.get("inputs", []))
             if effective_binding == "module":
