@@ -52,6 +52,53 @@ def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def _resolve_unit_ast_end_col(
+    scope_node: ast.AST, unit: Dict[str, Any]
+) -> Optional[int]:
+    """Resolves end column offset from statement boundaries within the enclosing scope."""
+    u_start = parse_unit_coord(unit, "start", default=0)
+    u_end = parse_unit_coord(unit, "end", default=u_start)
+    if u_end <= 0:
+        return None
+
+    start_col_raw = unit.get("start_col")
+    if start_col_raw is None:
+        start_col_raw = unit.get("start_col_offset")
+    start_col = None
+    if start_col_raw is not None:
+        try:
+            start_col = int(start_col_raw)
+        except (ValueError, TypeError):
+            pass
+
+    cand_stmts: List[ast.stmt] = [
+        node for node in ast.walk(scope_node) if isinstance(node, ast.stmt)
+    ]
+    inner_stmts = [
+        s
+        for s in cand_stmts
+        if getattr(s, "end_lineno", getattr(s, "lineno", 0)) == u_end
+        and not any(
+            other is not s
+            and isinstance(other, ast.stmt)
+            and getattr(other, "end_lineno", getattr(other, "lineno", 0)) == u_end
+            for other in ast.walk(s)
+        )
+    ]
+    if not inner_stmts:
+        return None
+
+    inner_stmts.sort(key=lambda s: getattr(s, "col_offset", 0))
+    if start_col is not None:
+        matched = [s for s in inner_stmts if getattr(s, "col_offset", 0) >= start_col]
+        target_stmt = matched[0] if matched else inner_stmts[0]
+    else:
+        target_stmt = inner_stmts[0]
+
+    end_col = getattr(target_stmt, "end_col_offset", None)
+    return int(end_col) if end_col is not None else None
+
+
 def _find_innermost_enclosing_node(
     source_text: str,
     unit: Dict[str, Any],
@@ -289,6 +336,29 @@ class _BaseScopeVisitor(ast.NodeVisitor):
     ) -> None:
         reads_set.update(_extract_nested_scope_free_reads(node))
 
+    @staticmethod
+    def _extract_pattern_bound_name(node: ast.AST) -> Optional[str]:
+        """Extracts identifier bound by MatchAs, MatchStar, or MatchMapping pattern nodes."""
+        name = getattr(node, "name", None) or getattr(node, "rest", None)
+        if isinstance(name, str) and name and name != "_":
+            return name
+        return None
+
+    def _record_pattern_binding(self, node: ast.AST, store_set: Set[str]) -> None:
+        bound = self._extract_pattern_bound_name(node)
+        if bound is not None and not self._is_in_comp(bound):
+            store_set.add(bound)
+        self.generic_visit(node)
+
+    def visit_MatchStar(self, node: ast.AST) -> None:
+        self.visit_MatchAs(node)
+
+    def visit_MatchMapping(self, node: ast.AST) -> None:
+        self.visit_MatchAs(node)
+
+    def visit_MatchAs(self, node: ast.AST) -> None:
+        self.generic_visit(node)
+
 
 class _FuncScopeVisitor(_BaseScopeVisitor):
     """Tracks local bindings and free variable loads escaping a nested function or lambda scope."""
@@ -324,6 +394,9 @@ class _FuncScopeVisitor(_BaseScopeVisitor):
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self._visit_named_expr(node, self.local_stores, check_comp=False)
+
+    def visit_MatchAs(self, node: ast.AST) -> None:
+        self._record_pattern_binding(node, self.local_stores)
 
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Store):
@@ -386,6 +459,9 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self._visit_named_expr(node, self.class_stores, check_comp=True)
+
+    def visit_MatchAs(self, node: ast.AST) -> None:
+        self._record_pattern_binding(node, self.class_stores)
 
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Load):
@@ -494,6 +570,20 @@ def _extract_nested_scope_free_reads(
     return outer_visitor.names | escaped
 
 
+def _extract_assigned_names(target: ast.AST) -> List[str]:
+    """Extracts bare variable names bound by an assignment target."""
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: List[str] = []
+        for elt in target.elts:
+            names.extend(_extract_assigned_names(elt))
+        return names
+    if isinstance(target, ast.Starred):
+        return _extract_assigned_names(target.value)
+    return []
+
+
 class _DownstreamReadVisitor(_BaseScopeVisitor):
     """Walks AST statements in a lexical scope tracking direct and nested free reads."""
 
@@ -508,6 +598,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self.u_end_col = u_end_col
         self.candidates = candidates
         self.loaded: Set[str] = set()
+        self.killed: Set[str] = set()
 
     def _is_node_after_unit(self, node: ast.AST) -> bool:
         lineno = getattr(node, "lineno", None)
@@ -519,6 +610,13 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             return self.u_end_col is not None and getattr(node, "col_offset", 0) >= int(self.u_end_col)
         return False
 
+    def _record_killed_targets(self, targets: Iterable[ast.AST]) -> None:
+        for t in targets:
+            if self._is_node_after_unit(t):
+                for name in _extract_assigned_names(t):
+                    if not self._is_in_comp(name):
+                        self.killed.add(name)
+
     def visit_FunctionDef(
         self,
         node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef],
@@ -526,8 +624,12 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         if self._is_node_after_unit(node):
             free_reads = _extract_nested_scope_free_reads(node)
             for name in free_reads:
-                if self.candidates is None or name in self.candidates:
-                    self.loaded.add(name)
+                if name not in self.killed:
+                    if self.candidates is None or name in self.candidates:
+                        self.loaded.add(name)
+            name_attr = getattr(node, "name", None)
+            if name_attr and not self._is_in_comp(name_attr):
+                self.killed.add(name_attr)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self.visit_FunctionDef(node)
@@ -536,8 +638,11 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         if self._is_node_after_unit(node):
             free_reads = _extract_nested_scope_free_reads(node)
             for name in free_reads:
-                if self.candidates is None or name in self.candidates:
-                    self.loaded.add(name)
+                if name not in self.killed:
+                    if self.candidates is None or name in self.candidates:
+                        self.loaded.add(name)
+            if not self._is_in_comp(node.name):
+                self.killed.add(node.name)
         else:
             n_start = getattr(node, "lineno", 0)
             n_end = getattr(node, "end_lineno", None) or n_start
@@ -551,16 +656,142 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
     def visit_Name(self, node: ast.Name) -> None:
         self.generic_visit(node)
         if isinstance(node.ctx, ast.Load) and self._is_node_after_unit(node):
-            if not self._is_in_comp(node.id):
+            if not self._is_in_comp(node.id) and node.id not in self.killed:
                 if self.candidates is None or node.id in self.candidates:
                     self.loaded.add(node.id)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         if isinstance(node.target, ast.Name) and self._is_node_after_unit(node.target):
-            if not self._is_in_comp(node.target.id):
+            if not self._is_in_comp(node.target.id) and node.target.id not in self.killed:
                 if self.candidates is None or node.target.id in self.candidates:
                     self.loaded.add(node.target.id)
         self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        for t in node.targets:
+            self.visit(t)
+        self._record_killed_targets(node.targets)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.visit(node.annotation)
+        if node.value is not None:
+            self.visit(node.value)
+            self.visit(node.target)
+            self._record_killed_targets([node.target])
+        else:
+            self.visit(node.target)
+
+    def visit_Delete(self, node: ast.Delete) -> None:
+        for t in node.targets:
+            self.visit(t)
+        self._record_killed_targets(node.targets)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.visit(node.value)
+        self.visit(node.target)
+        if isinstance(node.target, ast.Name) and self._is_node_after_unit(node.target):
+            if not self._is_in_comp(node.target.id):
+                self.killed.add(node.target.id)
+
+    def visit_If(self, node: ast.If) -> None:
+        self.visit(node.test)
+        killed_before = set(self.killed)
+        self.killed = set(killed_before)
+        for stmt in node.body:
+            self.visit(stmt)
+        killed_body = set(self.killed)
+
+        if node.orelse:
+            self.killed = set(killed_before)
+            for stmt in node.orelse:
+                self.visit(stmt)
+            self.killed = killed_body & self.killed
+        else:
+            self.killed = killed_before
+
+    def visit_For(self, node: ast.For) -> None:
+        self.visit(node.iter)
+        killed_before = set(self.killed)
+        self._record_killed_targets([node.target])
+        for stmt in node.body:
+            self.visit(stmt)
+        for stmt in node.orelse:
+            self.visit(stmt)
+        self.killed = killed_before
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self.visit_For(node)  # type: ignore[arg-type]
+
+    def visit_While(self, node: ast.While) -> None:
+        killed_before = set(self.killed)
+        self.visit(node.test)
+        for stmt in node.body:
+            self.visit(stmt)
+        for stmt in node.orelse:
+            self.visit(stmt)
+        self.killed = killed_before
+
+    def visit_Try(self, node: ast.Try) -> None:
+        killed_before = set(self.killed)
+        for stmt in node.body:
+            self.visit(stmt)
+        for handler in node.handlers:
+            self.killed = set(killed_before)
+            if handler.type is not None:
+                self.visit(handler.type)
+            if handler.name:
+                self.killed.add(handler.name)
+            for stmt in handler.body:
+                self.visit(stmt)
+        for stmt in node.orelse:
+            self.visit(stmt)
+        for stmt in node.finalbody:
+            self.visit(stmt)
+        self.killed = killed_before
+
+    def visit_TryStar(self, node: ast.AST) -> None:
+        self.visit_Try(node)  # type: ignore[arg-type]
+
+    def visit_With(self, node: ast.With) -> None:
+        killed_before = set(self.killed)
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self._record_killed_targets([item.optional_vars])
+        for stmt in node.body:
+            self.visit(stmt)
+        self.killed = killed_before
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+        self.visit_With(node)  # type: ignore[arg-type]
+
+    def visit_Match(self, node: ast.AST) -> None:
+        self.visit(getattr(node, "subject"))
+        killed_before = set(self.killed)
+        for case in getattr(node, "cases", []):
+            self.killed = set(killed_before)
+            self.visit(case.pattern)
+            if case.guard is not None:
+                self.visit(case.guard)
+            for stmt in case.body:
+                self.visit(stmt)
+        self.killed = killed_before
+
+    def visit_MatchAs(self, node: ast.AST) -> None:
+        bound = self._extract_pattern_bound_name(node)
+        if bound is not None and self._is_node_after_unit(node):
+            if not self._is_in_comp(bound):
+                self.killed.add(bound)
+        self.generic_visit(node)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        if self._is_node_after_unit(node):
+            self._record_import_names(node, self.killed)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if self._is_node_after_unit(node):
+            self._record_import_names(node, self.killed)
 
 
 def collect_downstream_read_names(
@@ -593,8 +824,12 @@ def collect_downstream_read_names(
             return None
         scope_node = scope_tree
 
+    u_end_col = _extract_unit_end_col(unit)
+    if u_end_col is None:
+        u_end_col = _resolve_unit_ast_end_col(scope_node, unit)
+
     visitor = _DownstreamReadVisitor(
-        u_end, _extract_unit_end_col(unit), candidates=candidates
+        u_end, u_end_col, candidates=candidates
     )
     for stmt in getattr(scope_node, "body", []):
         visitor.visit(stmt)

@@ -379,7 +379,7 @@ def _infer_helper_return_type(
             ret_t = outputs_ret or (
                 resolved_ret
                 if resolved_ret not in ("Any", "None") and scope.get("has_return_value")
-                else None
+                else ("Any" if scope.get("has_return_value") else None)
             )
             if ret_t:
                 return f"Generator[{yield_t}, None, {ret_t}]"

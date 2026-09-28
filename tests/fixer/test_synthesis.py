@@ -2089,3 +2089,159 @@ def test_synthesize_shared_helper_code_symmetric_global_filtering(tmp_path: Path
     )
     assert "return local_var" in helper
     assert "return local_var, global_var" not in helper
+
+
+def test_downstream_read_visitor_reaching_definitions_reassigned_variable() -> None:
+    """Verifies that reaching definitions clear variables killed by unconditional assignments before reads."""
+    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
+
+    # Case 1: Unconditional reassignment kills reaching definition
+    code1 = (
+        "def worker():\n"
+        "    x = 1\n"
+        "    y = 2\n"
+        "    x = 10\n"
+        "    print(x)\n"
+    )
+    unit1 = {"start": 2, "end": 3}
+    reads1 = collect_downstream_read_names(code1, unit1, candidates={"x", "y"})
+    assert reads1 is not None
+    assert "x" not in reads1
+    assert "y" not in reads1
+
+    # Case 2: Read in RHS before kill retains the read
+    code2 = (
+        "def worker():\n"
+        "    x = 1\n"
+        "    x = x + 10\n"
+    )
+    unit2 = {"start": 2, "end": 2}
+    reads2 = collect_downstream_read_names(code2, unit2, candidates={"x"})
+    assert reads2 is not None
+    assert "x" in reads2
+
+    # Case 3: Conditional If without else does NOT kill reaching definition
+    code3 = (
+        "def worker():\n"
+        "    x = 1\n"
+        "    if condition:\n"
+        "        x = 10\n"
+        "    print(x)\n"
+    )
+    unit3 = {"start": 2, "end": 2}
+    reads3 = collect_downstream_read_names(code3, unit3, candidates={"x"})
+    assert reads3 is not None
+    assert "x" in reads3
+
+    # Case 4: Conditional If with else in both branches kills reaching definition
+    code4 = (
+        "def worker():\n"
+        "    x = 1\n"
+        "    if condition:\n"
+        "        x = 10\n"
+        "    else:\n"
+        "        x = 20\n"
+        "    print(x)\n"
+    )
+    unit4 = {"start": 2, "end": 2}
+    reads4 = collect_downstream_read_names(code4, unit4, candidates={"x"})
+    assert reads4 is not None
+    assert "x" not in reads4
+
+    # Case 5: AnnAssign with value kills, but without value does not kill
+    code5_with_val = (
+        "def worker():\n"
+        "    x = 1\n"
+        "    x: int = 10\n"
+        "    print(x)\n"
+    )
+    assert "x" not in collect_downstream_read_names(code5_with_val, {"start": 2, "end": 2}, candidates={"x"})  # type: ignore[operator]
+
+    code5_no_val = (
+        "def worker():\n"
+        "    x = 1\n"
+        "    x: int\n"
+        "    print(x)\n"
+    )
+    assert "x" in collect_downstream_read_names(code5_no_val, {"start": 2, "end": 2}, candidates={"x"})  # type: ignore[operator]
+
+
+def test_infer_helper_return_type_untyped_generator_return_value() -> None:
+    """Verifies that a generator with explicit return value and untyped return emits Generator[yield_t, None, Any]."""
+    from pydoppelgangerhunt.fixer.synthesis import _infer_helper_return_type  # pylint: disable=protected-access
+
+    scope = {
+        "has_yield": True,
+        "is_async": False,
+        "has_return_value": True,
+        "yield_expr_names": [("yield", ":literal:int")],
+        "return_type": None,
+    }
+    ret_t = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope=scope,
+        meta1={},
+        meta2={},
+    )
+    assert ret_t == "Generator[int, None, Any]"
+
+
+def test_pattern_match_variable_bindings_scope() -> None:
+    """Verifies that Python 3.10+ pattern match bindings are recognized as local stores, not escaping reads."""
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
+        _extract_nested_scope_free_reads,
+        collect_downstream_read_names,
+    )
+
+    code = (
+        "def process(val):\n"
+        "    match val:\n"
+        "        case int(x):\n"
+        "            return x\n"
+        "        case [first, *rest]:\n"
+        "            return (first, rest)\n"
+        "        case {'data': item, **extra}:\n"
+        "            return (item, extra)\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    escaped = _extract_nested_scope_free_reads(fn_node)  # type: ignore[arg-type]
+    # val is a param; x, first, rest, item, extra are bound by pattern matching and should NOT escape
+    assert "x" not in escaped
+    assert "first" not in escaped
+    assert "rest" not in escaped
+    assert "item" not in escaped
+    assert "extra" not in escaped
+
+    # In downstream read visitor, pattern match binding kills prior reaching definition
+    downstream_code = (
+        "def worker():\n"
+        "    x = 1\n"
+        "    match val:\n"
+        "        case int(x):\n"
+        "            print(x)\n"
+    )
+    unit = {"start": 2, "end": 2}
+    reads = collect_downstream_read_names(downstream_code, unit, candidates={"x"})
+    assert reads is not None
+    assert "x" not in reads
+
+
+def test_same_line_unit_boundaries_semicolon_downstream_resolution() -> None:
+    """Verifies that same-line units without column offsets correctly resolve downstream statements after semicolons."""
+    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def runner():\n"
+        "    yield x; print(total)\n"
+    )
+    # Unit on line 2 with NO start_col or end_col
+    unit = {"start": 2, "end": 2}
+    reads = collect_downstream_read_names(code, unit, candidates={"total", "x"})
+    assert reads is not None
+    # total is downstream of yield x on the same line
+    assert "total" in reads
+    # x is inside the unit, so it should NOT be reported as a downstream read
+    assert "x" not in reads
