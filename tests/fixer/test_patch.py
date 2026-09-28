@@ -20,6 +20,7 @@ from pydoppelgangerhunt import (
     refactor_module_units,
     replace_unit_in_source,
     scan_target,
+    synthesize_shared_helper_code,
 )
 from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _build_whole_method_delegation,
@@ -8325,7 +8326,7 @@ def test_generate_refactoring_patch_sync_generator_closure_capture(tmp_path: Pat
 
 
 def test_generate_refactoring_patch_mixed_async_sync_rejected(tmp_path: Path) -> None:
-    """Verifies that pairing an async function with a sync function is rejected."""
+    """Verifies that pairing an async function or generator with a sync counterpart is rejected in synthesis and patch."""
     src1 = (
         "async def compute1(items: list[int]):\n"
         "    total = 0\n"
@@ -8348,8 +8349,40 @@ def test_generate_refactoring_patch_mixed_async_sync_rejected(tmp_path: Path) ->
     u1 = {"file": str(f1), "start": 1, "end": 5, "name": "compute1", "kind": "function", "is_async": True}
     u2 = {"file": str(f2), "start": 1, "end": 5, "name": "compute2", "kind": "function", "is_async": False}
 
+    # 1. Direct synthesis check: verify synthesis.py:577 rejects mixed async parity
+    mixed_helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert mixed_helper == ""
+
+    # 2. Control check: matching sync parity synthesizes cleanly
+    sync_helper = synthesize_shared_helper_code(u2, u2, repo_root=str(tmp_path))
+    assert sync_helper != ""
+    assert "def _shared_compute2" in sync_helper
+
+    # 3. Patch generation check: verify patch.py:2776 rejects mixed async parity
     patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
     assert patch == ""
+
+    # 4. Mixed async generator vs sync generator: verify rejection
+    src_ag = (
+        "async def ag1(items: list[int]):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+    )
+    src_sg = (
+        "def sg2(items: list[int]):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+    )
+    f_ag = tmp_path / "ag.py"
+    f_sg = tmp_path / "sg.py"
+    f_ag.write_text(src_ag, encoding="utf-8")
+    f_sg.write_text(src_sg, encoding="utf-8")
+    u_ag = {"file": str(f_ag), "start": 1, "end": 3, "name": "ag1", "kind": "function", "is_async": True}
+    u_sg = {"file": str(f_sg), "start": 1, "end": 3, "name": "sg2", "kind": "function", "is_async": False}
+
+    assert synthesize_shared_helper_code(u_ag, u_sg, repo_root=str(tmp_path)) == ""
+    assert generate_refactoring_patch([(1.0, u_ag, u_sg)], repo_root=str(tmp_path), replace_clones=True) == ""
+
 
 
 

@@ -2873,9 +2873,6 @@ def generate_refactoring_patch(
             )
             has_yield = bool(s1.get("has_yield") or s2.get("has_yield"))
             if is_sub and has_yield:
-                # For single-file clones, f2_plan is None and both units reside in f1_plan.orig_text.
-                # For cross-file clones, f2_plan holds the original text for the second file.
-                f2_text = f2_plan.orig_text if f2_plan is not None else f1_plan.orig_text
                 downstream1 = collect_downstream_read_names(
                     f1_plan.orig_text, u1, orig_fn1, candidates=set(u1_outs)
                 )
