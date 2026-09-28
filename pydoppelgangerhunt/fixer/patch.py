@@ -2733,6 +2733,7 @@ def generate_refactoring_patch(
                 and enc1["name"] == enc2["name"]
                 and enc1["start"] == enc2["start"]
             )
+            f2_text = f2_plan.orig_text if f2_plan is not None else f1_plan.orig_text
 
             orig_fn1 = fn1
             orig_fn2 = fn2
@@ -2894,12 +2895,7 @@ def generate_refactoring_patch(
                 if resolved_sub_outs is None:
                     continue
                 outputs, target_outs2 = resolved_sub_outs
-                is_async_gen = bool(
-                    s1.get("is_async")
-                    or s2.get("is_async")
-                    or u1.get("is_async")
-                    or u2.get("is_async")
-                )
+                is_async_gen = bool(s1.get("is_async") or s2.get("is_async"))
                 if is_async_gen and (outputs or target_outs2):
                     continue
             else:
@@ -3022,6 +3018,8 @@ def generate_refactoring_patch(
                 step=step,
                 repo_root=str(root),
                 helper_name=helper_name,
+                source_text1=f1_plan.orig_text,
+                source_text2=f2_text,
             )
             if not helper_code:
                 continue

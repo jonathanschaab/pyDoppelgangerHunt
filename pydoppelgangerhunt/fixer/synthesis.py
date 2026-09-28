@@ -459,6 +459,8 @@ def synthesize_shared_helper_code(
     step: Optional[str] = None,
     repo_root: Optional[str] = None,
     helper_name: Optional[str] = None,
+    source_text1: Optional[str] = None,
+    source_text2: Optional[str] = None,
 ) -> str:
     """Synthesizes a proposed shared helper function stub from two clone units.
 
@@ -663,6 +665,7 @@ def synthesize_shared_helper_code(
 
     downstream1: Optional[Set[str]] = None
     downstream2: Optional[Set[str]] = None
+    has_yield = bool(scope.get("has_yield") or scope1.get("has_yield") or scope2.get("has_yield"))
     if "outputs" in u1 and isinstance(u1["outputs"], (list, tuple, set)):
         outputs = list(u1["outputs"])
         if "outputs" in u2 and isinstance(u2["outputs"], (list, tuple, set)):
@@ -688,26 +691,33 @@ def synthesize_shared_helper_code(
             if v not in scope2.get("globals", [])
             and v not in scope2.get("nonlocals", [])
         ]
-        has_yield = bool(scope.get("has_yield") or scope1.get("has_yield") or scope2.get("has_yield"))
         if has_yield and (
             u1.get("kind") in ("compound_block", "sliding_window", "clause_branch")
             or ":" in str(u1.get("name") or "")
         ):
             root_path = Path(repo_root or os.getcwd())
             collected_downstreams: List[Optional[Set[str]]] = []
-            for unit_target, cand_set in ((u1, set(u1_raw)), (u2, set(u2_raw))):
-                f_str = str(unit_target.get("file") or "")
+            for unit_target, cand_set, in_mem_text in (
+                (u1, set(u1_raw), source_text1),
+                (u2, set(u2_raw), source_text2),
+            ):
                 d_reads: Optional[Set[str]] = None
-                if f_str:
-                    p_obj = Path(normalize_path_string(f_str, strip_anchor=True))
-                    p_full = p_obj if p_obj.is_file() or p_obj.is_absolute() else (root_path / p_obj)
-                    if p_full.is_file():
-                        try:
-                            d_reads = collect_downstream_read_names(
-                                p_full.read_text(encoding="utf-8"), unit_target, candidates=cand_set
-                            )
-                        except (OSError, UnicodeDecodeError):
-                            d_reads = None
+                if in_mem_text is not None:
+                    d_reads = collect_downstream_read_names(
+                        in_mem_text, unit_target, candidates=cand_set
+                    )
+                else:
+                    f_str = str(unit_target.get("file") or "")
+                    if f_str:
+                        p_obj = Path(normalize_path_string(f_str, strip_anchor=True))
+                        p_full = p_obj if p_obj.is_file() or p_obj.is_absolute() else (root_path / p_obj)
+                        if p_full.is_file():
+                            try:
+                                d_reads = collect_downstream_read_names(
+                                    p_full.read_text(encoding="utf-8"), unit_target, candidates=cand_set
+                                )
+                            except (OSError, UnicodeDecodeError):
+                                d_reads = None
                 collected_downstreams.append(d_reads)
             downstream1, downstream2 = collected_downstreams[0], collected_downstreams[1]
             u1_def = set(scope1.get("definite_stores", [])) | set(scope1.get("inputs", []))
@@ -743,9 +753,6 @@ def synthesize_shared_helper_code(
         and v not in scope.get("nonlocals", [])
     ]
 
-    has_yield = bool(
-        scope.get("has_yield") or scope1.get("has_yield") or scope2.get("has_yield")
-    )
     if has_yield and is_async and helper_outputs:
         return ""
 

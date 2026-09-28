@@ -8324,3 +8324,32 @@ def test_generate_refactoring_patch_sync_generator_closure_capture(tmp_path: Pat
     assert after_proc.stdout == before_proc.stdout
 
 
+def test_generate_refactoring_patch_mixed_async_sync_rejected(tmp_path: Path) -> None:
+    """Verifies that pairing an async function with a sync function is rejected."""
+    src1 = (
+        "async def compute1(items: list[int]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "    return total\n"
+    )
+    src2 = (
+        "def compute2(items: list[int]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "    return total\n"
+    )
+    f1 = tmp_path / "as1.py"
+    f2 = tmp_path / "as2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 1, "end": 5, "name": "compute1", "kind": "function", "is_async": True}
+    u2 = {"file": str(f2), "start": 1, "end": 5, "name": "compute2", "kind": "function", "is_async": False}
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch == ""
+
+
+

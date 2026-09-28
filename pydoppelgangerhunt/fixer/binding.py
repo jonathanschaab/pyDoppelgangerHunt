@@ -178,6 +178,57 @@ def find_enclosing_function(
 class _BaseScopeVisitor(ast.NodeVisitor):
     """Shared helpers for scope visitors."""
 
+    def __init__(self) -> None:
+        self._comp_targets: List[Set[str]] = []
+
+    def _is_in_comp(self, name: str) -> bool:
+        return any(name in targets for targets in self._comp_targets)
+
+    def _visit_comprehension(
+        self,
+        node: Union[ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp],
+    ) -> None:
+        comp_set: Set[str] = set()
+        self._comp_targets.append(comp_set)
+        try:
+            for gen in node.generators:
+                self.visit(gen.iter)
+                comp_set.update(n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name))
+                for if_expr in gen.ifs:
+                    self.visit(if_expr)
+            if isinstance(node, ast.DictComp):
+                self.visit(node.key)
+                self.visit(node.value)
+            else:
+                self.visit(node.elt)
+        finally:
+            self._comp_targets.pop()
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node)
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node)
+
+    def _visit_named_expr(
+        self,
+        node: ast.NamedExpr,
+        store_set: Set[str],
+        check_comp: bool = False,
+    ) -> None:
+        self.visit(node.value)
+        if isinstance(node.target, ast.Name):
+            if not check_comp or not self._is_in_comp(node.target.id):
+                store_set.add(node.target.id)
+        else:
+            self.visit(node.target)
+
     @staticmethod
     def _record_import_names(
         node: Union[ast.Import, ast.ImportFrom], store_set: Set[str]
@@ -223,6 +274,7 @@ class _FuncScopeVisitor(_BaseScopeVisitor):
     """Tracks local bindings and free variable loads escaping a nested function or lambda scope."""
 
     def __init__(self) -> None:
+        super().__init__()
         self.params: Set[str] = set()
         self.local_stores: Set[str] = set()
         self.globals: Set[str] = set()
@@ -252,11 +304,16 @@ class _FuncScopeVisitor(_BaseScopeVisitor):
             self.visit(d)
         self.nested_free_reads.update(_extract_nested_scope_free_reads(node))
 
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self._visit_named_expr(node, self.local_stores, check_comp=False)
+
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Store):
-            self.local_stores.add(node.id)
+            if not self._is_in_comp(node.id):
+                self.local_stores.add(node.id)
         elif isinstance(node.ctx, ast.Load):
-            self.direct_loads.add(node.id)
+            if not self._is_in_comp(node.id):
+                self.direct_loads.add(node.id)
 
     def visit_Import(self, node: ast.Import) -> None:
         self._record_import_names(node, self.local_stores)
@@ -269,6 +326,7 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
     """Tracks class attributes and free variable reads escaping an executed class body."""
 
     def __init__(self) -> None:
+        super().__init__()
         self.class_stores: Set[str] = set()
         self.free_reads: Set[str] = set()
 
@@ -290,10 +348,11 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         if isinstance(node.target, ast.Name):
-            if node.target.id not in self.class_stores:
+            if not self._is_in_comp(node.target.id) and node.target.id not in self.class_stores:
                 self.free_reads.add(node.target.id)
             self.visit(node.value)
-            self.class_stores.add(node.target.id)
+            if not self._is_in_comp(node.target.id):
+                self.class_stores.add(node.target.id)
         else:
             self.visit(node.target)
             self.visit(node.value)
@@ -304,12 +363,16 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
             self.visit(node.value)
         self.visit(node.target)
 
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self._visit_named_expr(node, self.class_stores, check_comp=True)
+
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Load):
-            if node.id not in self.class_stores:
+            if not self._is_in_comp(node.id) and node.id not in self.class_stores:
                 self.free_reads.add(node.id)
         elif isinstance(node.ctx, ast.Store):
-            self.class_stores.add(node.id)
+            if not self._is_in_comp(node.id):
+                self.class_stores.add(node.id)
 
     def visit_Import(self, node: ast.Import) -> None:
         self._record_import_names(node, self.class_stores)
@@ -377,7 +440,7 @@ def _extract_nested_scope_free_reads(
     return escaped
 
 
-class _DownstreamReadVisitor(ast.NodeVisitor):
+class _DownstreamReadVisitor(_BaseScopeVisitor):
     """Walks AST statements in a lexical scope tracking direct and nested free reads."""
 
     def __init__(
@@ -386,6 +449,7 @@ class _DownstreamReadVisitor(ast.NodeVisitor):
         u_end_col: Optional[int],
         candidates: Optional[Set[str]] = None,
     ) -> None:
+        super().__init__()
         self.u_end = u_end
         self.u_end_col = u_end_col
         self.candidates = candidates
@@ -402,7 +466,8 @@ class _DownstreamReadVisitor(ast.NodeVisitor):
         return False
 
     def visit_FunctionDef(
-        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
+        self,
+        node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef],
     ) -> None:
         if self._is_node_after_unit(node):
             free_reads = _extract_nested_scope_free_reads(node)
@@ -414,23 +479,16 @@ class _DownstreamReadVisitor(ast.NodeVisitor):
         self.visit_FunctionDef(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        if self._is_node_after_unit(node):
-            free_reads = _extract_nested_scope_free_reads(node)
-            for name in free_reads:
-                if self.candidates is None or name in self.candidates:
-                    self.loaded.add(name)
+        self.visit_FunctionDef(node)
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
-        if self._is_node_after_unit(node):
-            free_reads = _extract_nested_scope_free_reads(node)
-            for name in free_reads:
-                if self.candidates is None or name in self.candidates:
-                    self.loaded.add(name)
+        self.visit_FunctionDef(node)
 
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Load) and self._is_node_after_unit(node):
-            if self.candidates is None or node.id in self.candidates:
-                self.loaded.add(node.id)
+            if not self._is_in_comp(node.id):
+                if self.candidates is None or node.id in self.candidates:
+                    self.loaded.add(node.id)
         self.generic_visit(node)
 
 

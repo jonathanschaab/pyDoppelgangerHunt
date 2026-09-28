@@ -1524,3 +1524,78 @@ def test_resolve_generator_subroutine_outputs_preserves_per_side_necessity_and_s
     )
     assert res_needed == (["x"], ["x"])
 
+
+def test_collect_downstream_read_names_comprehensions_and_walrus() -> None:
+    """Verifies that comprehension targets do not pollute enclosing scope and walrus bindings are scoped correctly."""
+    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
+
+    # 1. Comprehension inside downstream closure: target variable 'x' is comprehension-local,
+    # so 'return x' correctly reads outer 'x' as a free variable
+    code_closure_comp = (
+        "def outer(items):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "\n"
+        "    def inner():\n"
+        "        _ = [x for x in items]\n"
+        "        return x\n"
+        "\n"
+        "    return inner\n"
+    )
+    u_closure_comp = {"start": 2, "end": 3}
+    reads_closure = collect_downstream_read_names(code_closure_comp, u_closure_comp, candidates={"x"})
+    assert reads_closure == {"x"}
+
+    # 2. Walrus operator (:=) inside comprehension: binds to enclosing function scope per PEP 572
+    code_walrus = (
+        "def outer(items):\n"
+        "    for w in items:\n"
+        "        yield w\n"
+        "\n"
+        "    def inner():\n"
+        "        _ = [(w := y) for y in items]\n"
+        "        return w\n"
+        "\n"
+        "    return inner\n"
+    )
+    u_walrus = {"start": 2, "end": 3}
+    reads_walrus = collect_downstream_read_names(code_walrus, u_walrus, candidates={"w"})
+    # 'w' is bound locally inside 'inner' by the walrus expression, not read from outer
+    assert reads_walrus == set()
+
+    # 3. Direct comprehension downstream: comprehension target is not a read of generator variable
+    code_direct_comp = (
+        "def outer(items):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    res = [x for x in items]\n"
+        "    return res\n"
+    )
+    u_direct = {"start": 2, "end": 3}
+    reads_direct = collect_downstream_read_names(code_direct_comp, u_direct, candidates={"x"})
+    assert reads_direct == set()
+
+    # 4. Direct comprehension referencing outer variable in if-filter
+    code_filter_comp = (
+        "def outer(items):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    res = [y for y in items if y == x]\n"
+        "    return res\n"
+    )
+    reads_filter = collect_downstream_read_names(code_filter_comp, u_direct, candidates={"x"})
+    assert reads_filter == {"x"}
+
+    # 5. Comprehension inside downstream ClassDef body: target is not class attribute, iter is free read
+    code_class_comp = (
+        "def outer(data):\n"
+        "    for x in data:\n"
+        "        yield x\n"
+        "    class C:\n"
+        "        items = [x for x in data]\n"
+        "    return C\n"
+    )
+    reads_class = collect_downstream_read_names(code_class_comp, u_direct, candidates={"x", "data"})
+    assert reads_class == {"data"}
+
+
