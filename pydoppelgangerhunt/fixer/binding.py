@@ -257,7 +257,18 @@ def _pair_clone_outputs(
     u1_outs: Sequence[str],
     u2_outs: Sequence[str],
 ) -> List[Tuple[str, str]]:
-    """Establishes an ordered 1-to-1 mapping between clone output variables."""
+    """Establishes an ordered 1-to-1 mapping between clone output variables.
+
+    Structural Semantic Invariant:
+    For isomorphic Type-1 (identical) and Type-2 (renamed variable) clones, AST statements
+    follow the identical top-to-bottom execution sequence. Because unit outputs are harvested
+    in lexical AST store order (first write per variable), the positional sequence of outputs
+    reflects the semantic role of each output slot across both units.
+    Identically-named variables (common names) are mapped to themselves first (e.g. loop index 'x'),
+    and the remaining unique names are paired in AST declaration order (e.g. 'total' <-> 'count').
+    When candidate output lengths differ, only identical common names (o, o) can be safely
+    paired without guessing variable correspondences.
+    """
     if len(u1_outs) == len(u2_outs):
         out_map = {o: o for o in set(u1_outs) & set(u2_outs)}
         rem_u1 = [o for o in u1_outs if o not in out_map]
@@ -274,16 +285,59 @@ def resolve_generator_subroutine_outputs(
     u2_outs: Sequence[str],
     downstream1: Optional[Set[str]],
     downstream2: Optional[Set[str]],
-) -> Tuple[List[str], List[str]]:
-    """Selects output variables needed downstream by either clone side, preserving per-side necessity."""
-    d1_needed = downstream1 if downstream1 is not None else set(u1_outs)
-    d2_needed = downstream2 if downstream2 is not None else set(u2_outs)
+    u1_definite: Optional[Set[str]] = None,
+    u2_definite: Optional[Set[str]] = None,
+) -> Optional[Tuple[List[str], List[str]]]:
+    """Selects output variables needed downstream by either clone side, preserving per-side necessity.
+
+    Fail-Closed Policy:
+    1. If output arities differ, every required downstream output must have a verified counterpart
+       on the other side. If any needed output lacks a counterpart, the candidate is rejected (returns None).
+    2. Definite Assignment Invariant: Any output retained for the synthesized helper (belonging to u1)
+       must be definitely assigned along every path through the helper (in u1_definite if supplied).
+    3. Safe Fallback: When downstream usage is unknown (None), fallback only considers outputs that
+       are definitely assigned, preventing unassigned loop variables from reintroducing UnboundLocalError.
+
+    Returns:
+        (outputs, target_outs2) if all needed downstream outputs have valid counterparts and can be
+        safely returned; None if counterpart mismatches or definite assignment hazards prevent
+        safe refactoring.
+    """
+    d1_needed = (
+        downstream1
+        if downstream1 is not None
+        else (set(u1_outs) & u1_definite if u1_definite is not None else set(u1_outs))
+    )
+    d2_needed = (
+        downstream2
+        if downstream2 is not None
+        else (set(u2_outs) & u2_definite if u2_definite is not None else set(u2_outs))
+    )
+
+    needed1 = [o for o in u1_outs if o in d1_needed]
+    needed2 = [o for o in u2_outs if o in d2_needed]
+
+    if not needed1 and not needed2:
+        return [], []
+
     pairs = _pair_clone_outputs(u1_outs, u2_outs)
+    paired_u1 = {o1 for o1, _ in pairs}
+    paired_u2 = {o2 for _, o2 in pairs}
+
+    # Fail closed: every required downstream output must have a paired counterpart
+    if any(o1 not in paired_u1 for o1 in needed1) or any(o2 not in paired_u2 for o2 in needed2):
+        return None
+
     kept_pairs = [
         (o1, o2)
         for o1, o2 in pairs
         if o1 in d1_needed or o2 in d2_needed
     ]
+
+    # Definite assignment invariant: every helper return output (o1) must be definitely assigned
+    if u1_definite is not None and any(o1 not in u1_definite for o1, _ in kept_pairs):
+        return None
+
     return [o1 for o1, _ in kept_pairs], [o2 for _, o2 in kept_pairs]
 
 

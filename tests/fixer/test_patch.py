@@ -8056,6 +8056,38 @@ def test_generate_refactoring_patch_sync_generator_renamed_downstream_outputs(tm
     assert after_proc.stdout == before_proc.stdout
 
 
+def test_generate_refactoring_patch_sync_generator_unequal_output_counts_rejected(tmp_path: Path) -> None:
+    """Verifies that generator clones with unequal output counts and un-counterparted needed outputs are rejected."""
+    src1 = (
+        "def f1(items: list[int]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    return total\n"
+    )
+    src2 = (
+        "def f2(items: list[int]):\n"
+        "    count = 0\n"
+        "    status = 0\n"
+        "    for x in items:\n"
+        "        count += x\n"
+        "        status += 1\n"
+        "        yield x\n"
+        "    return count\n"
+    )
+    f1 = tmp_path / "u_out1.py"
+    f2 = tmp_path / "u_out2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 2, "end": 5, "name": "f1:for", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 7, "name": "f2:for", "kind": "compound_block"}
+
+    patch = generate_refactoring_patch([(0.90, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch == ""
+
+
 def test_generate_refactoring_patch_async_generator_with_return_rejected(tmp_path: Path) -> None:
     """Verifies that clone pairs of async generators with return statements are rejected without creating invalid patches."""
     src1 = (

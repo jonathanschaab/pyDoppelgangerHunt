@@ -1377,22 +1377,67 @@ def test_resolve_generator_subroutine_outputs_preserves_per_side_necessity_and_s
     u2_outs = ["count", "x"]
 
     # 1. Both sides known: only the mapped total/count slot is needed, x is discarded
-    out1, out2 = resolve_generator_subroutine_outputs(
-        u1_outs, u2_outs, downstream1={"total"}, downstream2={"count"}
+    res1 = resolve_generator_subroutine_outputs(
+        u1_outs,
+        u2_outs,
+        downstream1={"total"},
+        downstream2={"count"},
+        u1_definite={"total"},
+        u2_definite={"count"},
     )
+    assert res1 is not None
+    out1, out2 = res1
     assert out1 == ["total"]
     assert out2 == ["count"]
 
-    # 2. Unknown fallback: if side 2 is None, all outputs of side 2 are conservatively preserved
-    fb_out1, fb_out2 = resolve_generator_subroutine_outputs(
+    # 2. Unknown fallback with definite sets: prunes conditionally assigned loop variable x
+    res2 = resolve_generator_subroutine_outputs(
+        u1_outs,
+        u2_outs,
+        downstream1={"total"},
+        downstream2=None,
+        u1_definite={"total"},
+        u2_definite={"count"},
+    )
+    assert res2 is not None
+    fb_def1, fb_def2 = res2
+    assert fb_def1 == ["total"]
+    assert fb_def2 == ["count"]
+
+    # 3. Unknown fallback without definite sets: unconstrained fallback preserves all paired outputs
+    res3 = resolve_generator_subroutine_outputs(
         u1_outs, u2_outs, downstream1={"total"}, downstream2=None
     )
+    assert res3 is not None
+    fb_out1, fb_out2 = res3
     assert fb_out1 == ["total", "x"]
     assert fb_out2 == ["count", "x"]
 
-    # 3. Neither side needs outputs
-    none_out1, none_out2 = resolve_generator_subroutine_outputs(
+    # 4. Neither side needs outputs
+    res4 = resolve_generator_subroutine_outputs(
         u1_outs, u2_outs, downstream1=set(), downstream2=set()
     )
+    assert res4 is not None
+    none_out1, none_out2 = res4
     assert none_out1 == []
     assert none_out2 == []
+
+    # 5. Unequal output counts where needed output has no counterpart: fails closed (returns None)
+    res_unequal = resolve_generator_subroutine_outputs(
+        ["total"],
+        ["count", "status"],
+        downstream1={"total"},
+        downstream2={"count"},
+    )
+    assert res_unequal is None
+
+    # 6. Needed output is not definitely assigned along every path through helper: fails closed
+    res_indef = resolve_generator_subroutine_outputs(
+        ["x"],
+        ["x"],
+        downstream1={"x"},
+        downstream2={"x"},
+        u1_definite=set(),
+    )
+    assert res_indef is None
+

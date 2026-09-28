@@ -19,6 +19,7 @@ from pydoppelgangerhunt.fixer.binding import (
     _has_receiver_reference,
     _is_method_of_class,
     _is_same_file_path,
+    _pair_clone_outputs,
     _prune_unshared_receivers,
     _resolve_effective_binding,
     collect_downstream_read_names,
@@ -2880,21 +2881,22 @@ def generate_refactoring_patch(
                 downstream2 = collect_downstream_read_names(
                     f2_text, u2, orig_fn2, candidates=set(u2_outs)
                 )
-                outputs, target_outs2 = resolve_generator_subroutine_outputs(
-                    u1_outs, u2_outs, downstream1, downstream2
+                u1_def = set(s1.get("definite_stores", [])) | set(s1.get("inputs", []))
+                u2_def = set(s2.get("definite_stores", [])) | set(s2.get("inputs", []))
+                resolved_sub_outs = resolve_generator_subroutine_outputs(
+                    u1_outs,
+                    u2_outs,
+                    downstream1,
+                    downstream2,
+                    u1_definite=u1_def,
+                    u2_definite=u2_def,
                 )
+                if resolved_sub_outs is None:
+                    continue
+                outputs, target_outs2 = resolved_sub_outs
             else:
-                if set(u2_outs) == set(outputs):
-                    target_outs2 = outputs
-                elif len(u2_outs) == len(outputs):
-                    out_map = {o: o for o in set(outputs) & set(u2_outs)}
-                    rem_o = [o for o in outputs if o not in out_map]
-                    rem_u2 = [o for o in u2_outs if o not in out_map]
-                    for o1, o2 in zip(rem_o, rem_u2):
-                        out_map[o1] = o2
-                    target_outs2 = [out_map.get(o, o) for o in outputs]
-                else:
-                    target_outs2 = outputs
+                pairs = _pair_clone_outputs(outputs, u2_outs)
+                target_outs2 = [o2 for _, o2 in pairs] if len(pairs) == len(outputs) else outputs
             u1_eff["outputs"] = outputs
             u2_eff["outputs"] = target_outs2
             t_inputs1 = list(s1.get("inputs", []))

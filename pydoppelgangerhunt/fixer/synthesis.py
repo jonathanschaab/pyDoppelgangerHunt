@@ -710,9 +710,19 @@ def synthesize_shared_helper_code(
                             d_reads = None
                 collected_downstreams.append(d_reads)
             downstream1, downstream2 = collected_downstreams[0], collected_downstreams[1]
-            outputs, u2_outs = resolve_generator_subroutine_outputs(
-                u1_raw, u2_raw, downstream1, downstream2
+            u1_def = set(scope1.get("definite_stores", [])) | set(scope1.get("inputs", []))
+            u2_def = set(scope2.get("definite_stores", [])) | set(scope2.get("inputs", []))
+            resolved_sub_outs = resolve_generator_subroutine_outputs(
+                u1_raw,
+                u2_raw,
+                downstream1,
+                downstream2,
+                u1_definite=u1_def,
+                u2_definite=u2_def,
             )
+            if resolved_sub_outs is None:
+                return ""
+            outputs, u2_outs = resolved_sub_outs
         else:
             outputs = [
                 v for v in scope.get("outputs", [])
