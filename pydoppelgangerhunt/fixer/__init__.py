@@ -7,6 +7,7 @@ shared helper synthesis, and unified diff patch generation.
 from __future__ import annotations
 
 from pydoppelgangerhunt.fixer.binding import (
+    GeneratorCloneSideData,
     _base_unit_name,
     _extract_child_indentation,
     _find_innermost_enclosing_node,
@@ -19,8 +20,10 @@ from pydoppelgangerhunt.fixer.binding import (
     _populate_unit_receiver_metadata,
     _prune_unshared_receivers,
     _resolve_effective_binding,
+    collect_downstream_read_names,
     find_enclosing_class,
     find_enclosing_function,
+    resolve_generator_subroutine_outputs,
 )
 from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
@@ -120,6 +123,7 @@ __all__ = [
     "build_module_graph",
     "check_units_overlap",
     "col_offset_to_char_offset",
+    "collect_downstream_read_names",
     "compute_line_offsets",
     "compute_unit_byte_offsets",
     "compute_unit_char_offsets",
@@ -135,11 +139,13 @@ __all__ = [
     "find_enclosing_function",
     "find_nearest_common_package",
     "generate_refactoring_patch",
+    "GeneratorCloneSideData",
     "intervals_overlap",
     "is_valid_unit_coordinates",
     "parse_unit_coord",
     "refactor_module_units",
     "replace_unit_in_source",
+    "resolve_generator_subroutine_outputs",
     "resolve_shared_module_file",
     "resolve_unit_replacement",
     "slice_source_by_token_range",

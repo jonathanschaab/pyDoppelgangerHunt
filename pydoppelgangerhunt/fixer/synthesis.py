@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from pydoppelgangerhunt.config import normalize_path_string
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.fixer.binding import (
+    GeneratorCloneSideData,
     _base_unit_name,
     _has_receiver_reference,
     _is_same_file_path,
@@ -326,6 +327,7 @@ def _infer_helper_return_type(
     scope: Dict[str, Any],
     meta1: Dict[str, Any],
     meta2: Dict[str, Any],
+    *,
     type_merge_strategy: str = "fallback_any",
     is_async: bool = False,
     unit_kind: Optional[str] = None,
@@ -580,8 +582,14 @@ def synthesize_shared_helper_code(
         return ""
     if bool(scope1.get("has_yield")) != bool(scope2.get("has_yield")):
         return ""
-    if (scope1.get("has_yield") or scope2.get("has_yield")) and (scope1.get("is_async") or scope2.get("is_async")):
-        if scope1.get("has_return_value") or scope2.get("has_return_value") or scope.get("has_return_value"):
+    if (bool(scope1.get("has_yield")) or bool(scope2.get("has_yield"))) and (
+        bool(scope1.get("is_async")) or bool(scope2.get("is_async"))
+    ):
+        if (
+            bool(scope1.get("has_return_value"))
+            or bool(scope2.get("has_return_value"))
+            or bool(scope.get("has_return_value"))
+        ):
             return ""
     if scope1.get("nonlocals") or scope2.get("nonlocals") or scope.get("nonlocals"):
         return ""
@@ -702,9 +710,14 @@ def synthesize_shared_helper_code(
                 (u2, set(u2_raw), source_text2),
             ):
                 d_reads: Optional[Set[str]] = None
-                if in_mem_text is not None:
+                text_to_use = (
+                    in_mem_text
+                    if in_mem_text is not None
+                    else (unit_target.get("source_text") or unit_target.get("file_source"))
+                )
+                if text_to_use is not None:
                     d_reads = collect_downstream_read_names(
-                        in_mem_text, unit_target, candidates=cand_set
+                        str(text_to_use), unit_target, candidates=cand_set
                     )
                 else:
                     f_str = str(unit_target.get("file") or "")
@@ -722,14 +735,9 @@ def synthesize_shared_helper_code(
             downstream1, downstream2 = collected_downstreams[0], collected_downstreams[1]
             u1_def = set(scope1.get("definite_stores", [])) | set(scope1.get("inputs", []))
             u2_def = set(scope2.get("definite_stores", [])) | set(scope2.get("inputs", []))
-            resolved_sub_outs = resolve_generator_subroutine_outputs(
-                u1_raw,
-                u2_raw,
-                downstream1,
-                downstream2,
-                u1_definite=u1_def,
-                u2_definite=u2_def,
-            )
+            side1 = GeneratorCloneSideData(u1_raw, downstream1, u1_def)
+            side2 = GeneratorCloneSideData(u2_raw, downstream2, u2_def)
+            resolved_sub_outs = resolve_generator_subroutine_outputs(side1, side2)
             if resolved_sub_outs is None:
                 return ""
             outputs, u2_outs = resolved_sub_outs
@@ -742,7 +750,7 @@ def synthesize_shared_helper_code(
             u2_outs = u2_raw
 
     conditional_outs = set(scope.get("conditional_outputs", []))
-    is_async = scope.get("is_async", False)
+    is_async = bool(scope.get("is_async", False))
     func_keyword = "async def" if is_async else "def"
     await_prefix = "await " if is_async else ""
 
@@ -807,7 +815,7 @@ def synthesize_shared_helper_code(
             expr_inner = [f"{eff_step}{ln}" for ln in common_lines]
             common_lines = ["return ("] + expr_inner + [")"]
         helper_outputs = []
-    elif not has_trailing_return and helper_outputs and not (scope.get("has_yield") and is_async):
+    elif not has_trailing_return and helper_outputs and not (bool(scope.get("has_yield")) and is_async):
         if len(helper_outputs) >= 2:
             common_lines = common_lines + [f"return {', '.join(helper_outputs)}"]
         else:

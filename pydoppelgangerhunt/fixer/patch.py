@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, TypedDict, U
 
 from pydoppelgangerhunt.config import normalize_path_string
 from pydoppelgangerhunt.fixer.binding import (
+    GeneratorCloneSideData,
     _base_unit_name,
     _extract_child_indentation,
     _get_enclosing_receiver_kind,
@@ -717,7 +718,7 @@ def _build_unit_delegation_call(
 
     call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
     rep_step = step or ("\t" if "\t" in indent else "    ")
-    if scope.get("has_yield") and scope.get("is_async"):
+    if bool(scope.get("has_yield")) and bool(scope.get("is_async")):
         return (
             f"{indent}async for _item in {call_expr}:\n"
             f"{indent}{rep_step}yield _item\n"
@@ -762,6 +763,21 @@ def _module_imports_target(
     return False
 
 
+def _outputs_compatible(
+    target_outs2: Sequence[str],
+    outputs: Sequence[str],
+    u1_outs: Sequence[str],
+    u2_outs: Sequence[str],
+    *,
+    is_subroutine: bool,
+    has_yield: bool,
+) -> bool:
+    """Checks whether candidate clone outputs match synthesized helper outputs."""
+    if is_subroutine and has_yield:
+        return len(target_outs2) == len(outputs)
+    return len(u1_outs) == len(outputs) and len(u2_outs) == len(outputs)
+
+
 class _PlanSnapshot(TypedDict):
     """Encapsulates a snapshot of mutable _FilePatchPlan state for transactional rollback."""
 
@@ -803,6 +819,19 @@ class _FilePatchPlan:
         self.comments: List[str] = []
         self.used_helper_names: Set[str] = set()
         self.claimed_units: List[UnitDict] = []
+        self._cached_ast: Optional[ast.AST] = None
+        self._ast_attempted: bool = False
+
+    @property
+    def parsed_tree(self) -> Optional[ast.AST]:
+        """Lazily parsed AST of orig_text, cached for reuse across operations."""
+        if not self._ast_attempted:
+            self._ast_attempted = True
+            try:
+                self._cached_ast = ast.parse(self.orig_text)
+            except (SyntaxError, ValueError, UnicodeDecodeError):
+                self._cached_ast = None
+        return self._cached_ast
 
     def snapshot(self) -> _PlanSnapshot:
         """Creates a snapshot of mutable plan state for transactional rollback."""
@@ -2873,22 +2902,19 @@ def generate_refactoring_patch(
             )
             has_yield = bool(s1.get("has_yield") or s2.get("has_yield"))
             if is_sub and has_yield:
+                tree1 = f1_plan.parsed_tree
+                tree2 = f2_plan.parsed_tree if f2_plan is not None else tree1
                 downstream1 = collect_downstream_read_names(
-                    f1_plan.orig_text, u1, orig_fn1, candidates=set(u1_outs)
+                    f1_plan.orig_text, u1, orig_fn1, candidates=set(u1_outs), tree=tree1
                 )
                 downstream2 = collect_downstream_read_names(
-                    f2_text, u2, orig_fn2, candidates=set(u2_outs)
+                    f2_text, u2, orig_fn2, candidates=set(u2_outs), tree=tree2
                 )
                 u1_def = set(s1.get("definite_stores", [])) | set(s1.get("inputs", []))
                 u2_def = set(s2.get("definite_stores", [])) | set(s2.get("inputs", []))
-                resolved_sub_outs = resolve_generator_subroutine_outputs(
-                    u1_outs,
-                    u2_outs,
-                    downstream1,
-                    downstream2,
-                    u1_definite=u1_def,
-                    u2_definite=u2_def,
-                )
+                side1 = GeneratorCloneSideData(u1_outs, downstream1, u1_def)
+                side2 = GeneratorCloneSideData(u2_outs, downstream2, u2_def)
+                resolved_sub_outs = resolve_generator_subroutine_outputs(side1, side2)
                 if resolved_sub_outs is None:
                     continue
                 outputs, target_outs2 = resolved_sub_outs
@@ -2910,15 +2936,17 @@ def generate_refactoring_patch(
                     t_inputs2, u2_eff, u1_eff, s2, s1, repo_root=str(root)
                 )
 
-            outputs_mismatch = (
-                len(target_outs2) != len(outputs)
-                if (is_sub and has_yield)
-                else (len(u1_outs) != len(outputs) or len(u2_outs) != len(outputs))
-            )
             if replace_clones and (
                 len(t_inputs1) != len(inputs)
                 or len(t_inputs2) != len(inputs)
-                or outputs_mismatch
+                or not _outputs_compatible(
+                    target_outs2,
+                    outputs,
+                    u1_outs,
+                    u2_outs,
+                    is_subroutine=is_sub,
+                    has_yield=has_yield,
+                )
             ):
                 continue
 

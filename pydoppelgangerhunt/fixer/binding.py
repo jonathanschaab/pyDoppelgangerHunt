@@ -6,7 +6,7 @@ import ast
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.config import normalize_path_string, paths_match_boundary
 from pydoppelgangerhunt.parser import is_decorator_named
@@ -16,6 +16,42 @@ from pydoppelgangerhunt.fixer.scope import (
 from pydoppelgangerhunt.fixer.source import parse_unit_coord, split_source_lines
 
 
+def _parse_source_tree(
+    source_text: str,
+    tree: Optional[ast.AST] = None,
+) -> Optional[ast.AST]:
+    """Parses Python source code into an AST tree if not already provided."""
+    if tree is not None:
+        return tree
+    if not source_text.strip():
+        return None
+    try:
+        return ast.parse(source_text)
+    except (SyntaxError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def _get_valid_unit_bounds(unit: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+    """Extracts positive start and end line coordinates from a unit dict."""
+    u_start = parse_unit_coord(unit, "start", default=0)
+    u_end = parse_unit_coord(unit, "end", default=u_start)
+    if u_start <= 0 or u_end <= 0:
+        return None
+    return u_start, u_end
+
+
+def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
+    """Extracts end column offset from unit dictionary if present."""
+    for col_key in ("end_col_offset", "end_col"):
+        col_val = unit.get(col_key)
+        if col_val is not None:
+            try:
+                return int(col_val)
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
 def _find_innermost_enclosing_node(
     source_text: str,
     unit: Dict[str, Any],
@@ -23,21 +59,17 @@ def _find_innermost_enclosing_node(
     tree: Optional[ast.AST] = None,
 ) -> Optional[Tuple[ast.AST, int, int]]:
     """Locates the innermost AST node of matching types enclosing the given unit."""
-    if tree is None:
-        if not source_text.strip():
-            return None
-        try:
-            tree = ast.parse(source_text)
-        except (SyntaxError, ValueError, UnicodeDecodeError):
-            return None
+    bounds = _get_valid_unit_bounds(unit)
+    if bounds is None:
+        return None
+    u_start, u_end = bounds
 
-    u_start = parse_unit_coord(unit, "start", default=0)
-    u_end = parse_unit_coord(unit, "end", default=u_start)
-    if u_start <= 0:
+    parsed_tree = _parse_source_tree(source_text, tree=tree)
+    if parsed_tree is None:
         return None
 
     candidates: List[Tuple[int, ast.AST, int, int]] = []
-    for node in ast.walk(tree):
+    for node in ast.walk(parsed_tree):
         if isinstance(node, node_types):
             n_start = getattr(node, "lineno", 0)
             n_end = getattr(node, "end_lineno", n_start)
@@ -241,32 +273,20 @@ class _BaseScopeVisitor(ast.NodeVisitor):
             if bound != "*":
                 store_set.add(bound)
 
-    def _visit_nested_func(
+    def _visit_nested_named_scope(
         self,
-        node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+        node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef],
         store_set: Set[str],
         reads_set: Set[str],
     ) -> None:
         store_set.add(node.name)
-        for dec in node.decorator_list:
-            self.visit(dec)
-        for d in node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]:
-            self.visit(d)
         reads_set.update(_extract_nested_scope_free_reads(node))
 
-    def _visit_nested_class(
+    def _visit_nested_lambda(
         self,
-        node: ast.ClassDef,
-        store_set: Set[str],
+        node: ast.Lambda,
         reads_set: Set[str],
     ) -> None:
-        store_set.add(node.name)
-        for dec in node.decorator_list:
-            self.visit(dec)
-        for b in node.bases:
-            self.visit(b)
-        for kw in node.keywords:
-            self.visit(kw.value)
         reads_set.update(_extract_nested_scope_free_reads(node))
 
 
@@ -291,18 +311,16 @@ class _FuncScopeVisitor(_BaseScopeVisitor):
     def visit_FunctionDef(
         self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
     ) -> None:
-        self._visit_nested_func(node, self.local_stores, self.nested_free_reads)
+        self._visit_nested_named_scope(node, self.local_stores, self.nested_free_reads)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self.visit_FunctionDef(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        self._visit_nested_class(node, self.local_stores, self.nested_free_reads)
+        self._visit_nested_named_scope(node, self.local_stores, self.nested_free_reads)
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
-        for d in node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]:
-            self.visit(d)
-        self.nested_free_reads.update(_extract_nested_scope_free_reads(node))
+        self._visit_nested_lambda(node, self.nested_free_reads)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self._visit_named_expr(node, self.local_stores, check_comp=False)
@@ -333,13 +351,16 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
     def visit_FunctionDef(
         self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
     ) -> None:
-        self._visit_nested_func(node, self.class_stores, self.free_reads)
+        self._visit_nested_named_scope(node, self.class_stores, self.free_reads)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self.visit_FunctionDef(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        self._visit_nested_class(node, self.class_stores, self.free_reads)
+        self._visit_nested_named_scope(node, self.class_stores, self.free_reads)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._visit_nested_lambda(node, self.free_reads)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
@@ -381,6 +402,20 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
         self._record_import_names(node, self.class_stores)
 
 
+def _collect_func_params(args: ast.arguments) -> Set[str]:
+    """Collects parameter names declared in a function or lambda signature."""
+    all_args = (
+        list(getattr(args, "posonlyargs", []))
+        + list(args.args)
+        + list(args.kwonlyargs)
+    )
+    if args.vararg:
+        all_args.append(args.vararg)
+    if args.kwarg:
+        all_args.append(args.kwarg)
+    return {a.arg for a in all_args}
+
+
 def _extract_nested_scope_free_reads(
     node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef],
 ) -> Set[str]:
@@ -398,38 +433,17 @@ def _extract_nested_scope_free_reads(
         return class_visitor.free_reads
 
     func_visitor = _FuncScopeVisitor()
+    func_visitor.params = _collect_func_params(node.args)
+    defaults = node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]
+    for d in defaults:
+        func_visitor.visit(d)
+
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         for dec in node.decorator_list:
             func_visitor.visit(dec)
-        all_args = (
-            list(getattr(node.args, "posonlyargs", []))
-            + list(node.args.args)
-            + list(node.args.kwonlyargs)
-        )
-        if node.args.vararg:
-            all_args.append(node.args.vararg)
-        if node.args.kwarg:
-            all_args.append(node.args.kwarg)
-        for a in all_args:
-            func_visitor.params.add(a.arg)
-        for d in node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]:
-            func_visitor.visit(d)
         for stmt in node.body:
             func_visitor.visit(stmt)
     elif isinstance(node, ast.Lambda):
-        all_args = (
-            list(getattr(node.args, "posonlyargs", []))
-            + list(node.args.args)
-            + list(node.args.kwonlyargs)
-        )
-        if node.args.vararg:
-            all_args.append(node.args.vararg)
-        if node.args.kwarg:
-            all_args.append(node.args.kwarg)
-        for a in all_args:
-            func_visitor.params.add(a.arg)
-        for d in node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]:
-            func_visitor.visit(d)
         func_visitor.visit(node.body)
 
     escaped = (
@@ -485,11 +499,11 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self.visit_FunctionDef(node)
 
     def visit_Name(self, node: ast.Name) -> None:
+        self.generic_visit(node)
         if isinstance(node.ctx, ast.Load) and self._is_node_after_unit(node):
             if not self._is_in_comp(node.id):
                 if self.candidates is None or node.id in self.candidates:
                     self.loaded.add(node.id)
-        self.generic_visit(node)
 
 
 def collect_downstream_read_names(
@@ -497,38 +511,34 @@ def collect_downstream_read_names(
     unit: Dict[str, Any],
     _enclosing_fn: Optional[Dict[str, Any]] = None,
     candidates: Optional[Set[str]] = None,
+    *,
+    tree: Optional[ast.AST] = None,
 ) -> Optional[Set[str]]:
-    """Identifies variable names loaded downstream of a unit within its lexical execution scope."""
-    if not source_text.strip():
-        return None
+    """Identifies variable names loaded downstream of a unit within its lexical execution scope.
 
-    try:
-        tree = ast.parse(source_text)
-    except (SyntaxError, ValueError, UnicodeDecodeError):
+    Algorithmic Complexity & Scope Capping:
+    Traversal is capped to the body of the innermost enclosing function (`scope_node.body`),
+    limiting visitor complexity to $O(S)$ where $S$ is the statement count within the enclosing
+    lexical scope, rather than scanning the entire module. Passing a pre-parsed AST via `tree`
+    avoids redundant full-module parsing across multiple units.
+    """
+    u_end = parse_unit_coord(unit, "end", default=parse_unit_coord(unit, "start", default=0))
+    if u_end <= 0:
         return None
-
-    u_start = parse_unit_coord(unit, "start", default=0)
-    u_end = parse_unit_coord(unit, "end", default=u_start)
-    if u_start <= 0 or u_end <= 0:
-        return None
-
-    u_end_col: Optional[int] = None
-    for col_key in ("end_col_offset", "end_col"):
-        col_val = unit.get(col_key)
-        if col_val is not None:
-            try:
-                u_end_col = int(col_val)
-                break
-            except (ValueError, TypeError):
-                pass
 
     enc = _find_innermost_enclosing_node(
         source_text, unit, (ast.FunctionDef, ast.AsyncFunctionDef), tree=tree
     )
-    scope_node: ast.AST = enc[0] if enc is not None else tree
+    if enc is not None:
+        scope_node: ast.AST = enc[0]
+    else:
+        scope_tree = _parse_source_tree(source_text, tree=tree)
+        if scope_tree is None:
+            return None
+        scope_node = scope_tree
 
     visitor = _DownstreamReadVisitor(
-        u_end, u_end_col, candidates=candidates
+        u_end, _extract_unit_end_col(unit), candidates=candidates
     )
     for stmt in getattr(scope_node, "body", []):
         visitor.visit(stmt)
@@ -543,14 +553,17 @@ def _pair_clone_outputs(
     """Establishes an ordered 1-to-1 mapping between clone output variables.
 
     Structural Semantic Invariant:
-    For isomorphic Type-1 (identical) and Type-2 (renamed variable) clones, AST statements
-    follow the identical top-to-bottom execution sequence. Because unit outputs are harvested
-    in lexical AST store order (first write per variable), the positional sequence of outputs
-    reflects the semantic role of each output slot across both units.
+    For isomorphic Type-1 (identical) and Type-2 (renamed variable) clones of equal output arity
+    (`len(u1_outs) == len(u2_outs)`), AST statements follow identical top-to-bottom execution sequence.
+    Because unit outputs are harvested in lexical AST store order (first write per variable), the
+    positional sequence of outputs reflects the corresponding semantic role of each output slot.
     Identically-named variables (common names) are mapped to themselves first (e.g. loop index 'x'),
     and the remaining unique names are paired in AST declaration order (e.g. 'total' <-> 'count').
-    When candidate output lengths differ, only identical common names (o, o) can be safely
-    paired without guessing variable correspondences.
+
+    When candidate output lengths differ (`len(u1_outs) != len(u2_outs)`), positional alignment across
+    distinct variable names no longer holds. In this unequal-length scenario, only identical common
+    names `(o, o)` present in both units can be safely paired without guessing correspondence, and any
+    unique names are excluded from pairing.
     """
     if len(u1_outs) == len(u2_outs):
         out_map = {o: o for o in set(u1_outs) & set(u2_outs)}
@@ -563,11 +576,20 @@ def _pair_clone_outputs(
     return [(o, o) for o in common]
 
 
+class GeneratorCloneSideData(NamedTuple):
+    """Encapsulates per-side output candidates, downstream reads, and definite stores for generator refactoring."""
+
+    outputs: Sequence[str]
+    downstream: Optional[Set[str]] = None
+    definite: Optional[Set[str]] = None
+
+
 def resolve_generator_subroutine_outputs(
-    u1_outs: Sequence[str],
-    u2_outs: Sequence[str],
-    downstream1: Optional[Set[str]],
-    downstream2: Optional[Set[str]],
+    u1_outs: Union[GeneratorCloneSideData, Sequence[str]],
+    u2_outs: Union[GeneratorCloneSideData, Sequence[str]] = (),
+    *,
+    downstream1: Optional[Set[str]] = None,
+    downstream2: Optional[Set[str]] = None,
     u1_definite: Optional[Set[str]] = None,
     u2_definite: Optional[Set[str]] = None,
 ) -> Optional[Tuple[List[str], List[str]]]:
@@ -584,24 +606,41 @@ def resolve_generator_subroutine_outputs(
         (outputs, target_outs2) if all needed downstream outputs have valid counterparts and can be
         safely returned; None if counterpart mismatches prevent safe refactoring.
     """
+    if isinstance(u1_outs, GeneratorCloneSideData):
+        s1 = u1_outs
+    else:
+        s1 = GeneratorCloneSideData(u1_outs, downstream1, u1_definite)
+
+    if isinstance(u2_outs, GeneratorCloneSideData):
+        s2 = u2_outs
+    else:
+        s2 = GeneratorCloneSideData(u2_outs, downstream2, u2_definite)
+
+    outs1 = list(s1.outputs)
+    outs2 = list(s2.outputs)
+    d1_raw = s1.downstream
+    d2_raw = s2.downstream
+    u1_def = s1.definite
+    u2_def = s2.definite
+
     d1_needed = (
-        downstream1
-        if downstream1 is not None
-        else (set(u1_outs) & u1_definite if u1_definite is not None else set(u1_outs))
+        d1_raw
+        if d1_raw is not None
+        else (set(outs1) & u1_def if u1_def is not None else set(outs1))
     )
     d2_needed = (
-        downstream2
-        if downstream2 is not None
-        else (set(u2_outs) & u2_definite if u2_definite is not None else set(u2_outs))
+        d2_raw
+        if d2_raw is not None
+        else (set(outs2) & u2_def if u2_def is not None else set(outs2))
     )
 
-    needed1 = [o for o in u1_outs if o in d1_needed]
-    needed2 = [o for o in u2_outs if o in d2_needed]
+    needed1 = [o for o in outs1 if o in d1_needed]
+    needed2 = [o for o in outs2 if o in d2_needed]
 
     if not needed1 and not needed2:
         return [], []
 
-    pairs = _pair_clone_outputs(u1_outs, u2_outs)
+    pairs = _pair_clone_outputs(outs1, outs2)
     paired_u1 = {o1 for o1, _ in pairs}
     paired_u2 = {o2 for _, o2 in pairs}
 

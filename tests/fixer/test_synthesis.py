@@ -1599,3 +1599,189 @@ def test_collect_downstream_read_names_comprehensions_and_walrus() -> None:
     assert reads_class == {"data"}
 
 
+def test_generator_clone_with_nested_genexpr(tmp_path: Path) -> None:
+    """Verifies that nested generator expressions inside generator units do not leak comprehension targets into scope."""
+    code1 = (
+        "def process_matrix(matrix: list[list[int]]):\n"
+        "    grand_total = 0\n"
+        "    for row in matrix:\n"
+        "        row_sum = sum(x * 2 for x in row)\n"
+        "        grand_total += row_sum\n"
+        "        yield row_sum\n"
+        "    return grand_total\n"
+    )
+    code2 = (
+        "def process_matrix_alt(matrix: list[list[int]]):\n"
+        "    grand_total = 0\n"
+        "    for row in matrix:\n"
+        "        row_sum = sum(y * 2 for y in row)\n"
+        "        grand_total += row_sum\n"
+        "        yield row_sum\n"
+        "    return grand_total\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+
+    u1 = {
+        "file": "mod1.py",
+        "start": 3,
+        "end": 6,
+        "name": "process_matrix",
+        "kind": "compound_block",
+    }
+    u2 = {
+        "file": "mod2.py",
+        "start": 3,
+        "end": 6,
+        "name": "process_matrix_alt",
+        "kind": "compound_block",
+    }
+
+    helper = synthesize_shared_helper_code(
+        u1,
+        u2,
+        repo_root=str(tmp_path),
+        source_text1=code1,
+        source_text2=code2,
+    )
+    assert helper != ""
+    assert "def _shared" in helper
+    assert "yield row_sum" in helper
+    assert "return grand_total" in helper
+    # Comprehension targets x and y must not be parameters of the synthesized helper
+    sig_line = helper.splitlines()[0]
+    params_part = sig_line[sig_line.index("(") + 1 : sig_line.rindex(")")]
+    param_names = [p.split(":")[0].strip() for p in params_part.split(",") if p.strip()]
+    assert "x" not in param_names and "y" not in param_names
+    assert "grand_total" in param_names
+
+    patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch != ""
+    assert "_shared" in patch
+
+
+def test_generator_clone_with_yield_from_and_returns(tmp_path: Path) -> None:
+    """Verifies that generator clones containing yield from delegate return values and propagate outputs correctly."""
+    code1 = (
+        "def stream_blocks(blocks: list[list[int]]):\n"
+        "    total_count = 0\n"
+        "    for b in blocks:\n"
+        "        yield from b\n"
+        "        total_count += len(b)\n"
+        "    return total_count\n"
+    )
+    code2 = (
+        "def stream_blocks_alt(blocks: list[list[int]]):\n"
+        "    total_count = 0\n"
+        "    for b in blocks:\n"
+        "        yield from b\n"
+        "        total_count += len(b)\n"
+        "    return total_count\n"
+    )
+    f1 = tmp_path / "stream1.py"
+    f2 = tmp_path / "stream2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+
+    u1 = {
+        "file": "stream1.py",
+        "start": 3,
+        "end": 5,
+        "name": "stream_blocks",
+        "kind": "compound_block",
+    }
+    u2 = {
+        "file": "stream2.py",
+        "start": 3,
+        "end": 5,
+        "name": "stream_blocks_alt",
+        "kind": "compound_block",
+    }
+
+    helper = synthesize_shared_helper_code(
+        u1,
+        u2,
+        repo_root=str(tmp_path),
+        source_text1=code1,
+        source_text2=code2,
+    )
+    assert helper != ""
+    assert "yield from b" in helper
+    assert "return total_count" in helper
+
+    patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch != ""
+    assert "(yield from _shared" in patch
+
+
+def test_collect_downstream_read_names_nonlocal_and_global_declarations() -> None:
+    """Verifies that downstream nonlocal declarations are captured as escaping free reads, while globals are excluded."""
+    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
+
+    code_nonlocal = (
+        "def outer(items):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "\n"
+        "    def inner():\n"
+        "        nonlocal x\n"
+        "        return x\n"
+        "    return inner\n"
+    )
+    u = {"start": 2, "end": 3}
+    reads_nonlocal = collect_downstream_read_names(code_nonlocal, u, candidates={"x"})
+    assert reads_nonlocal == {"x"}
+
+    code_global = (
+        "def outer(items):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "\n"
+        "    def inner():\n"
+        "        global x\n"
+        "        return x\n"
+        "    return inner\n"
+    )
+    reads_global = collect_downstream_read_names(code_global, u, candidates={"x"})
+    # 'global x' accesses module global x, not outer's local x
+    assert reads_global == set()
+
+    # Pre-parsed tree parameter equivalence
+    tree = ast.parse(code_nonlocal)
+    reads_with_tree = collect_downstream_read_names(code_nonlocal, u, candidates={"x"}, tree=tree)
+    assert reads_with_tree == {"x"}
+
+
+def test_generator_clone_side_data_interface() -> None:
+    """Verifies that GeneratorCloneSideData cleanly encapsulates per-side clone context."""
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
+        GeneratorCloneSideData,
+        resolve_generator_subroutine_outputs,
+    )
+
+    side1 = GeneratorCloneSideData(
+        outputs=["total", "x"],
+        downstream={"total"},
+        definite={"total"},
+    )
+    side2 = GeneratorCloneSideData(
+        outputs=["count", "x"],
+        downstream={"count"},
+        definite={"count"},
+    )
+
+    resolved = resolve_generator_subroutine_outputs(side1, side2)
+    assert resolved == (["total"], ["count"])
+
+    # Fail closed on unequal output counts when counterpart is missing
+    side_unpaired = GeneratorCloneSideData(
+        outputs=["count", "extra", "status"],
+        downstream={"count", "extra"},
+        definite={"count", "extra"},
+    )
+    assert resolve_generator_subroutine_outputs(side1, side_unpaired) is None
+
+
+
