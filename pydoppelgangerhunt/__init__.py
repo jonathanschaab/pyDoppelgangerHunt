@@ -57,6 +57,7 @@ from pydoppelgangerhunt.coverage import (
 from pydoppelgangerhunt.fixer import (
     ReplacementItem,
     UnitCollisionError,
+    UnitDict,
     UnitSpan,
     analyze_unit_variable_scope,
     check_units_overlap,
@@ -215,6 +216,7 @@ __all__ = [
     "count_physical_newlines",
     "detect_line_ending",
     "UnitCollisionError",
+    "UnitDict",
     "UnitSpan",
     "ReplacementItem",
     "resolve_unit_replacement",

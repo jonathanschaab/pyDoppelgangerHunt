@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ReplacementItem",
+    "UnitDict",
     "UnitSpan",
     "col_offset_to_char_offset",
     "compute_line_offsets",
@@ -33,8 +34,10 @@ __all__ = [
     "split_source_lines",
 ]
 
+UnitDict = Dict[str, Any]
 
-def parse_unit_coord(unit: Dict[str, Any], key: str, default: int = 1) -> int:
+
+def parse_unit_coord(unit: UnitDict, key: str, default: int = 1) -> int:
     """Extracts and parses an integer coordinate from a unit dictionary."""
     val = unit.get(key)
     return int(val if val is not None else default)
@@ -613,7 +616,7 @@ class ReplacementItem(NamedTuple):
             replacements that share identical starting offsets (e.g. 0-width insertions).
     """
 
-    unit: Dict[str, Any]
+    unit: UnitDict
     start_char: int
     end_char: int
     start_byte: int

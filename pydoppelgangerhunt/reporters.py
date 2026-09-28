@@ -25,6 +25,8 @@ COLOR_BLUE = "\033[34m"
 COLOR_MAGENTA = "\033[35m"
 COLOR_CYAN = "\033[36m"
 
+_PHYSICAL_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
+
 
 def supports_color(color_override: Optional[bool] = None) -> bool:
     """Determines whether the terminal environment supports ANSI colors."""
@@ -122,7 +124,7 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
                         if isinstance(src, list)
                         else [
                             m.group(0)
-                            for m in re.finditer(r"[^\r\n]*(?:\r\n|\r|\n|$)", str(src))
+                            for m in _PHYSICAL_LINE_RE.finditer(str(src))
                             if m.group(0)
                         ]
                     )

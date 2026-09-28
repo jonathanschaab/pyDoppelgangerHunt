@@ -7830,5 +7830,74 @@ def test_extract_unit_body_lines_and_synthesis_form_feed(tmp_path: Path) -> None
     assert "\x0c" in h_code
 
 
+def test_negative_column_clamping_in_check_units_overlap() -> None:
+    """Verifies that negative column offsets clamp to 0 and do not produce erroneous collisions."""
+    # Negative start column clamps to 0: [0, 5) and [5, 10) touch but do not overlap
+    u_neg1 = {"file": "mod.py", "start": 1, "end": 1, "start_col": -10, "end_col": 5}
+    u_pos = {"file": "mod.py", "start": 1, "end": 1, "start_col": 5, "end_col": 10}
+    assert check_units_overlap(u_neg1, u_pos) is False
+
+    # Negative start column clamps to 0: [0, 6) and [5, 10) overlap at [5, 6)
+    u_neg2 = {"file": "mod.py", "start": 1, "end": 1, "start_col": -10, "end_col": 6}
+    assert check_units_overlap(u_neg2, u_pos) is True
+
+    # Both negative clamp to 0: [0, 0) is empty zero-width, so no collision
+    u_neg_zero = {"file": "mod.py", "start": 1, "end": 1, "start_col": -10, "end_col": -2}
+    assert check_units_overlap(u_neg_zero, u_pos) is False
+
+
+def test_dual_tier_rejection_and_pragma_expanded_catch() -> None:
+    """Verifies both Tier 1 coordinate rejection and Tier 2 pragma-expanded collision catch."""
+    from pydoppelgangerhunt.fixer.patch import UnitCollisionError
+
+    # 1. Tier 1 Semantic Overlap Rejection
+    u_t1_a = {"name": "fn1", "file": "mod.py", "start": 1, "end": 2}
+    u_t1_b = {"name": "fn2", "file": "mod.py", "start": 2, "end": 3}
+    assert check_units_overlap(u_t1_a, u_t1_b) is True
+    with pytest.raises(UnitCollisionError, match="Overlapping unit collision detected"):
+        refactor_module_units("x = 1\ny = 2\nz = 3\n", [(u_t1_a, "pass\n"), (u_t1_b, "pass\n")], tier1=True, tier2=False)
+
+    # 2. Tier 2 Catch of Pragma-Expanded Collision
+    src = "a = 1  # type: ignore\nb = 2\n"
+    # u1: line 1, col 0..5 (statement part). Because line 1 has a trailing pragma,
+    # resolve_unit_replacement expands it to whole line [0, line_bytes[1]) to preserve pragma.
+    u_p1 = {"name": "u1", "file": "mod.py", "start": 1, "end": 1, "start_col": 0, "end_col": 5}
+    # u2: line 1, col 7..21 (pointing into trailing comment/token on same line).
+    u_p2 = {"name": "u2", "file": "mod.py", "start": 1, "end": 1, "start_col": 7, "end_col": 21, "kind": "complex_expr"}
+
+    # In Tier 1, column intervals [0, 5) and [7, 21) do not overlap
+    assert check_units_overlap(u_p1, u_p2) is False
+
+    # Tier 1 alone allows it without error
+    out = refactor_module_units(src, [(u_p1, "a = 10\n"), (u_p2, "comment")], tier1=True, tier2=False)
+    assert out is not None
+
+    # Tier 2 catches the physical interval collision caused by pragma whole-line expansion
+    with pytest.raises(UnitCollisionError, match="Overlapping unit collision detected between 'u1' \\(1-1\\) and 'u2' \\(1-1\\)"):
+        refactor_module_units(src, [(u_p1, "a = 10\n"), (u_p2, "comment")], tier1=True, tier2=True)
+
+
+def test_reporters_precompiled_physical_line_regex_notebook_cells(tmp_path: Path) -> None:
+    """Verifies that extract_unit_source_code uses _PHYSICAL_LINE_RE and preserves form feeds."""
+    import json
+    from pydoppelgangerhunt.reporters import _PHYSICAL_LINE_RE, extract_unit_source_code
+
+    assert _PHYSICAL_LINE_RE.pattern == r"[^\r\n]*(?:\r\n|\r|\n|$)"
+
+    nb_data = {
+        "cells": [
+            {"cell_type": "code", "source": "val = 1\n\x0cres = val + 2\n"}
+        ]
+    }
+    nb_file = tmp_path / "notebook.ipynb"
+    nb_file.write_text(json.dumps(nb_data), encoding="utf-8")
+
+    unit = {"file": str(nb_file) + "#cell_1", "start": 1, "end": 2}
+    lines = extract_unit_source_code(unit, repo_root=str(tmp_path))
+    assert lines == ["val = 1\n", "\x0cres = val + 2\n"]
+    assert "\x0c" in lines[1]
+
+
+
 
 
