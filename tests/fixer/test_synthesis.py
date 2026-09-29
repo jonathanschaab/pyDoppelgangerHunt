@@ -2248,3 +2248,43 @@ def test_same_line_unit_boundaries_semicolon_downstream_resolution() -> None:
     assert "total" in reads
     # x is inside the unit, so it should NOT be reported as a downstream read
     assert "x" not in reads
+
+
+def test_downstream_read_visitor_try_except_else_kills() -> None:
+    """Verifies that exception handler kills do not leak into node.orelse in visit_Try."""
+    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def worker():\n"
+        "    total = 10\n"
+        "    try:\n"
+        "        pass\n"
+        "    except Exception as total:\n"
+        "        pass\n"
+        "    else:\n"
+        "        print(total)\n"
+    )
+    unit = {"start": 2, "end": 2}
+    reads = collect_downstream_read_names(code, unit, candidates={"total"})
+    assert reads is not None
+    assert "total" in reads
+
+
+def test_resolve_unit_ast_end_col_multiline_unit_statements() -> None:
+    """Verifies that multi-line units ending on a line with multiple statements include all statements up through the line end."""
+    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def worker():\n"
+        "    a = 1\n"
+        "    total = 10; count = 20\n"
+        "    print(res)\n"
+    )
+    # Multi-line unit covering lines 2 to 3
+    unit = {"start": 2, "end": 3}
+    reads = collect_downstream_read_names(code, unit, candidates={"total", "count", "res"})
+    assert reads is not None
+    # total and count are on line 3 (end line of multi-line unit), so they are NOT downstream reads
+    assert "total" not in reads
+    assert "count" not in reads
+

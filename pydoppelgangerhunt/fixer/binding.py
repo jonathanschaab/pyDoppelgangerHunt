@@ -61,16 +61,6 @@ def _resolve_unit_ast_end_col(
     if u_end <= 0:
         return None
 
-    start_col_raw = unit.get("start_col")
-    if start_col_raw is None:
-        start_col_raw = unit.get("start_col_offset")
-    start_col = None
-    if start_col_raw is not None:
-        try:
-            start_col = int(start_col_raw)
-        except (ValueError, TypeError):
-            pass
-
     cand_stmts: List[ast.stmt] = [
         node for node in ast.walk(scope_node) if isinstance(node, ast.stmt)
     ]
@@ -89,11 +79,22 @@ def _resolve_unit_ast_end_col(
         return None
 
     inner_stmts.sort(key=lambda s: getattr(s, "col_offset", 0))
-    if start_col is not None:
-        matched = [s for s in inner_stmts if getattr(s, "col_offset", 0) >= start_col]
-        target_stmt = matched[0] if matched else inner_stmts[0]
+    if u_start == u_end:
+        start_col_raw = unit.get("start_col")
+        if start_col_raw is None:
+            start_col_raw = unit.get("start_col_offset")
+        try:
+            start_col = int(start_col_raw) if start_col_raw is not None else None
+        except (ValueError, TypeError):
+            start_col = None
+
+        if start_col is not None:
+            matched = [s for s in inner_stmts if getattr(s, "col_offset", 0) >= start_col]
+            target_stmt = matched[0] if matched else inner_stmts[0]
+        else:
+            target_stmt = inner_stmts[0]
     else:
-        target_stmt = inner_stmts[0]
+        target_stmt = inner_stmts[-1]
 
     end_col = getattr(target_stmt, "end_col_offset", None)
     return int(end_col) if end_col is not None else None
@@ -736,6 +737,8 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         killed_before = set(self.killed)
         for stmt in node.body:
             self.visit(stmt)
+        killed_try_body = set(self.killed)
+
         for handler in node.handlers:
             self.killed = set(killed_before)
             if handler.type is not None:
@@ -744,8 +747,12 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
                 self.killed.add(handler.name)
             for stmt in handler.body:
                 self.visit(stmt)
+
+        self.killed = killed_try_body
         for stmt in node.orelse:
             self.visit(stmt)
+
+        self.killed = killed_before
         for stmt in node.finalbody:
             self.visit(stmt)
         self.killed = killed_before
