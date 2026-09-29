@@ -2493,3 +2493,127 @@ def test_extract_nested_scope_free_reads_pep695_type_params() -> None:
     assert "BoundType" in escaped
 
 
+def test_is_subroutine_unit_classification() -> None:
+    """Verifies that is_subroutine_unit accurately classifies subroutines vs functions and expressions."""
+    from pydoppelgangerhunt.fixer import is_subroutine_unit  # pylint: disable=import-outside-toplevel
+
+    # True for compound blocks, sliding windows, and clause branches
+    assert is_subroutine_unit({"kind": "compound_block"}) is True
+    assert is_subroutine_unit({"kind": "sliding_window"}) is True
+    assert is_subroutine_unit({"kind": "clause_branch"}) is True
+
+    # False for top-level functions, closures, methods, comprehensions, and expressions
+    assert is_subroutine_unit({"kind": "function"}) is False
+    assert is_subroutine_unit({"kind": "method"}) is False
+    assert is_subroutine_unit({"kind": "closure"}) is False
+    assert is_subroutine_unit({"kind": "comprehension"}) is False
+    assert is_subroutine_unit({"kind": "complex_expr"}) is False
+
+    # Name-based fallback when kind is unspecified
+    assert is_subroutine_unit({"name": "process_module:10-25"}) is True
+    assert is_subroutine_unit({"name": "plain_function"}) is False
+    assert is_subroutine_unit({}) is False
+
+
+def test_resolve_unit_ast_end_col_bounds_validation() -> None:
+    """Verifies bounds validation in _resolve_unit_ast_end_col."""
+    from pydoppelgangerhunt.fixer.binding import _resolve_unit_ast_end_col  # pylint: disable=import-outside-toplevel
+
+    tree = ast.parse("x = 10\ny = 20\n")
+    # Inverted start and end coordinates
+    assert _resolve_unit_ast_end_col(tree, {"start": 5, "end": 2}) is None
+    # Zero or negative start
+    assert _resolve_unit_ast_end_col(tree, {"start": 0, "end": 2}) is None
+    assert _resolve_unit_ast_end_col(tree, {"start": -1, "end": 2}) is None
+    # Zero or negative end
+    assert _resolve_unit_ast_end_col(tree, {"start": 1, "end": 0}) is None
+    assert _resolve_unit_ast_end_col(tree, {"start": 1, "end": -1}) is None
+
+
+def test_resolve_clone_generator_subroutine_outputs_precomputed_and_fallback(tmp_path: Path) -> None:
+    """Verifies resolve_clone_generator_subroutine_outputs with precomputed outputs and file fallback."""
+    from pydoppelgangerhunt.fixer import resolve_clone_generator_subroutine_outputs  # pylint: disable=import-outside-toplevel
+
+    # Case 1: Precomputed outputs present on u1 and u2
+    u1_pre = {"outputs": ["a", "b"]}
+    u2_pre = {"outputs": ["x", "y"]}
+    s1 = {"globals": ["b"], "nonlocals": []}
+    s2 = {"globals": [], "nonlocals": ["y"]}
+    res = resolve_clone_generator_subroutine_outputs(u1_pre, u2_pre, s1, s2)
+    assert res is not None
+    outs1, outs2 = res
+    assert outs1 == ["a"]
+    assert outs2 == ["x"]
+
+    # Case 2: On-disk file resolution and downstream reads
+    src1 = (
+        "def gen1():\n"
+        "    total = 0\n"
+        "    yield total\n"
+        "    print(total)\n"
+    )
+    src2 = (
+        "def gen2():\n"
+        "    total = 0\n"
+        "    yield total\n"
+        "    print(total)\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    unit1 = {"file": str(f1), "start": 2, "end": 3}
+    unit2 = {"file": str(f2), "start": 2, "end": 3}
+    scope1 = {"outputs": ["total"], "definite_stores": ["total"], "inputs": []}
+    scope2 = {"outputs": ["total"], "definite_stores": ["total"], "inputs": []}
+    res_disk = resolve_clone_generator_subroutine_outputs(
+        unit1, unit2, scope1, scope2, repo_root=str(tmp_path)
+    )
+    assert res_disk is not None
+    assert res_disk == (["total"], ["total"])
+
+    # Case 3: Fail-closed counterpart mismatch on unequal arity with needed downstream output
+    src3_extra = (
+        "def gen1():\n"
+        "    total = 0\n"
+        "    extra = 1\n"
+        "    yield total\n"
+        "    print(total, extra)\n"
+    )
+    scope1_extra = {"outputs": ["total", "extra"], "definite_stores": ["total", "extra"], "inputs": []}
+    scope2_single = {"outputs": ["other"], "definite_stores": ["other"], "inputs": []}
+    res_mismatch = resolve_clone_generator_subroutine_outputs(
+        unit1, unit2, scope1_extra, scope2_single, source_text1=src3_extra, source_text2=src2
+    )
+    assert res_mismatch is None
+
+
+def test_downstream_read_visitor_record_downstream_read_and_comprehensions() -> None:
+    """Verifies that _record_downstream_read correctly respects comprehension scoping and killed variables."""
+    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def runner():\n"
+        "    data = [1, 2, 3]\n"
+        "    res = [item for item in data]\n"
+        "    def nested():\n"
+        "        return [val for val in data]\n"
+        "    class Helper:\n"
+        "        stored = [elem for elem in data]\n"
+        "    total = 0\n"
+        "    total += 5\n"
+        "    return total\n"
+    )
+    unit = {"start": 2, "end": 2}
+    reads = collect_downstream_read_names(code, unit, candidates={"data", "item", "val", "elem", "total"})
+    assert reads is not None
+    assert "data" in reads
+    assert "item" not in reads
+    assert "val" not in reads
+    assert "elem" not in reads
+    assert "total" not in reads
+
+
+
+

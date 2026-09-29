@@ -4,31 +4,29 @@ from __future__ import annotations
 
 import ast
 import difflib
-import os
 import re
 import textwrap
 import typing
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.config import normalize_path_string
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.fixer.binding import (
-    GeneratorCloneSideData,
     _base_unit_name,
+    _extract_effective_unit_outputs,
     _has_receiver_reference,
     _is_same_file_path,
     _populate_unit_receiver_metadata,
     _prune_unshared_receivers,
     _resolve_effective_binding,
-    collect_downstream_read_names,
     is_async_generator_with_return_value,
-    resolve_generator_subroutine_outputs,
+    resolve_clone_generator_subroutine_outputs,
 )
 from pydoppelgangerhunt.fixer.scope import (
     _normalize_receiver_attrs,
     _rank_param_kind,
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
+    is_subroutine_unit,
 )
 from pydoppelgangerhunt.fixer.source import (
     _detect_indent_step,
@@ -663,88 +661,26 @@ def synthesize_shared_helper_code(
     r1 = scope1.get("return_type")
     r2 = scope2.get("return_type")
     resolved_ret = _merge_types(r1, r2, type_merge_strategy)
-
-    downstream1: Optional[Set[str]] = None
-    downstream2: Optional[Set[str]] = None
     has_yield = bool(scope.get("has_yield") or scope1.get("has_yield") or scope2.get("has_yield"))
     if "outputs" in u1 and isinstance(u1["outputs"], (list, tuple, set)):
-        outputs = [
-            v for v in u1["outputs"]
-            if v not in scope1.get("globals", [])
-            and v not in scope1.get("nonlocals", [])
-        ]
-        if "outputs" in u2 and isinstance(u2["outputs"], (list, tuple, set)):
-            u2_outs = [
-                v for v in u2["outputs"]
-                if v not in scope2.get("globals", [])
-                and v not in scope2.get("nonlocals", [])
-            ]
-        else:
-            u2_outs = [
-                v for v in scope2.get("outputs", [])
-                if v not in scope2.get("globals", [])
-                and v not in scope2.get("nonlocals", [])
-            ]
+        outputs = _extract_effective_unit_outputs(u1, scope1)
+        u2_outs = _extract_effective_unit_outputs(u2, scope2)
+    elif has_yield and is_subroutine_unit(u1):
+        resolved_sub_outs = resolve_clone_generator_subroutine_outputs(
+            u1=u1,
+            u2=u2,
+            scope1=scope1,
+            scope2=scope2,
+            source_text1=source_text1,
+            source_text2=source_text2,
+            repo_root=repo_root,
+        )
+        if resolved_sub_outs is None:
+            return ""
+        outputs, u2_outs = resolved_sub_outs
     else:
-        u1_raw = [
-            v for v in scope1.get("outputs", [])
-            if v not in scope1.get("globals", [])
-            and v not in scope1.get("nonlocals", [])
-        ]
-        u2_raw = [
-            v for v in scope2.get("outputs", [])
-            if v not in scope2.get("globals", [])
-            and v not in scope2.get("nonlocals", [])
-        ]
-        if has_yield and (
-            u1.get("kind") in ("compound_block", "sliding_window", "clause_branch")
-            or ":" in str(u1.get("name") or "")
-        ):
-            root_path = Path(repo_root or os.getcwd())
-            collected_downstreams: List[Optional[Set[str]]] = []
-            for unit_target, cand_set, in_mem_text in (
-                (u1, set(u1_raw), source_text1),
-                (u2, set(u2_raw), source_text2),
-            ):
-                d_reads: Optional[Set[str]] = None
-                text_to_use = (
-                    in_mem_text
-                    if in_mem_text is not None
-                    else (unit_target.get("source_text") or unit_target.get("file_source"))
-                )
-                if text_to_use is not None:
-                    d_reads = collect_downstream_read_names(
-                        str(text_to_use), unit_target, candidates=cand_set
-                    )
-                else:
-                    f_str = str(unit_target.get("file") or "")
-                    if f_str:
-                        p_obj = Path(normalize_path_string(f_str, strip_anchor=True))
-                        p_full = p_obj if p_obj.is_file() or p_obj.is_absolute() else (root_path / p_obj)
-                        if p_full.is_file():
-                            try:
-                                d_reads = collect_downstream_read_names(
-                                    p_full.read_text(encoding="utf-8"), unit_target, candidates=cand_set
-                                )
-                            except (OSError, UnicodeDecodeError):
-                                d_reads = None
-                collected_downstreams.append(d_reads)
-            downstream1, downstream2 = collected_downstreams[0], collected_downstreams[1]
-            u1_def = set(scope1.get("definite_stores", [])) | set(scope1.get("inputs", []))
-            u2_def = set(scope2.get("definite_stores", [])) | set(scope2.get("inputs", []))
-            side1 = GeneratorCloneSideData(u1_raw, downstream1, u1_def)
-            side2 = GeneratorCloneSideData(u2_raw, downstream2, u2_def)
-            resolved_sub_outs = resolve_generator_subroutine_outputs(side1, side2)
-            if resolved_sub_outs is None:
-                return ""
-            outputs, u2_outs = resolved_sub_outs
-        else:
-            outputs = [
-                v for v in scope.get("outputs", [])
-                if v not in scope.get("globals", [])
-                and v not in scope.get("nonlocals", [])
-            ]
-            u2_outs = u2_raw
+        outputs = _extract_effective_unit_outputs(u1, scope)
+        u2_outs = _extract_effective_unit_outputs(u2, scope2)
 
     conditional_outs = set(scope.get("conditional_outputs", []))
     is_async = bool(scope.get("is_async", False))

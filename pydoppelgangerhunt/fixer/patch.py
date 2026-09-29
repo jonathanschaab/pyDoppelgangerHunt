@@ -13,9 +13,9 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, TypedDict, U
 
 from pydoppelgangerhunt.config import normalize_path_string
 from pydoppelgangerhunt.fixer.binding import (
-    GeneratorCloneSideData,
     _base_unit_name,
     _extract_child_indentation,
+    _extract_effective_unit_outputs,
     _get_enclosing_receiver_kind,
     _has_receiver_reference,
     _is_method_of_class,
@@ -23,11 +23,10 @@ from pydoppelgangerhunt.fixer.binding import (
     _pair_clone_outputs,
     _prune_unshared_receivers,
     _resolve_effective_binding,
-    collect_downstream_read_names,
     find_enclosing_class,
     find_enclosing_function,
     is_async_generator_with_return_value,
-    resolve_generator_subroutine_outputs,
+    resolve_clone_generator_subroutine_outputs,
 )
 from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
@@ -46,6 +45,7 @@ from pydoppelgangerhunt.fixer.scope import (
     _extract_arg_names,
     _normalize_receiver_attrs,
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
+    is_subroutine_unit,
 )
 
 from pydoppelgangerhunt.fixer.source import (
@@ -2878,40 +2878,25 @@ def generate_refactoring_patch(
             inputs = list(scope.get("inputs", []))
             if effective_binding == "module":
                 inputs = _prune_unshared_receivers(inputs, u1_eff, u2_eff, s1, s2, repo_root=str(root))
-            outputs = [
-                v for v in scope.get("outputs", [])
-                if v not in scope.get("globals", [])
-                and v not in scope.get("nonlocals", [])
-            ]
-            u1_outs = [
-                v for v in s1.get("outputs", [])
-                if v not in s1.get("globals", [])
-                and v not in s1.get("nonlocals", [])
-            ]
-            u2_outs = [
-                v for v in s2.get("outputs", [])
-                if v not in s2.get("globals", [])
-                and v not in s2.get("nonlocals", [])
-            ]
-            is_sub = (
-                u1.get("kind") in ("compound_block", "sliding_window", "clause_branch")
-                or ":" in str(u1.get("name") or "")
-            )
+            outputs = _extract_effective_unit_outputs(u1, scope)
+            u1_outs = _extract_effective_unit_outputs(u1, s1)
+            u2_outs = _extract_effective_unit_outputs(u2, s2)
+            is_sub = is_subroutine_unit(u1)
             has_yield = bool(s1.get("has_yield") or s2.get("has_yield"))
             if is_sub and has_yield:
                 tree1 = f1_plan.parsed_tree
                 tree2 = f2_plan.parsed_tree if f2_plan is not None else tree1
-                downstream1 = collect_downstream_read_names(
-                    f1_plan.orig_text, u1, candidates=set(u1_outs), tree=tree1
+                resolved_sub_outs = resolve_clone_generator_subroutine_outputs(
+                    u1=u1,
+                    u2=u2,
+                    scope1=s1,
+                    scope2=s2,
+                    source_text1=f1_plan.orig_text,
+                    source_text2=f2_text,
+                    tree1=tree1,
+                    tree2=tree2,
+                    repo_root=str(root),
                 )
-                downstream2 = collect_downstream_read_names(
-                    f2_text, u2, candidates=set(u2_outs), tree=tree2
-                )
-                u1_def = set(s1.get("definite_stores", [])) | set(s1.get("inputs", []))
-                u2_def = set(s2.get("definite_stores", [])) | set(s2.get("inputs", []))
-                side1 = GeneratorCloneSideData(u1_outs, downstream1, u1_def)
-                side2 = GeneratorCloneSideData(u2_outs, downstream2, u2_def)
-                resolved_sub_outs = resolve_generator_subroutine_outputs(side1, side2)
                 if resolved_sub_outs is None:
                     continue
                 outputs, target_outs2 = resolved_sub_outs

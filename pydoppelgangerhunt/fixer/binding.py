@@ -55,10 +55,25 @@ def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
 def _resolve_unit_ast_end_col(
     scope_node: ast.AST, unit: Dict[str, Any]
 ) -> Optional[int]:
-    """Resolves end column offset from statement boundaries within the enclosing scope."""
+    """Resolves end column offset from statement boundaries within the enclosing scope.
+
+    Limitations & Heuristics:
+    This AST-based statement boundary derivation is a heuristic fallback when an explicit
+    'end_col' or 'end_col_offset' is absent from the unit dict. It assumes unit boundaries
+    align with top-level or leaf statement boundaries. Specifically:
+    - Units ending mid-statement (such as sub-expressions or chained method calls) cannot be
+      accurately resolved and may extend past the unit's actual token span.
+    - Nested or compound statements sharing the same end line may cause ambiguities.
+    - When u_start == u_end, the first statement on that line with col_offset >= start_col
+      is selected.
+    - When u_start < u_end, the last leaf statement ending on u_end is selected.
+    Callers should supply an explicit token-level end_col whenever available. If this function
+    returns None, downstream callers safely fall back to whole-line granularity (treating only
+    nodes with lineno > u_end as downstream).
+    """
     u_start = parse_unit_coord(unit, "start", default=0)
     u_end = parse_unit_coord(unit, "end", default=u_start)
-    if u_end <= 0:
+    if u_start <= 0 or u_end <= 0 or u_start > u_end:
         return None
 
     cand_stmts: List[ast.stmt] = [
@@ -637,6 +652,12 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
                     if not self._is_in_comp(name):
                         self.killed.add(name)
 
+    def _record_downstream_read(self, name: str) -> None:
+        if self._is_in_comp(name) or name in self.killed:
+            return
+        if self.candidates is None or name in self.candidates:
+            self.loaded.add(name)
+
     def visit_FunctionDef(
         self,
         node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef],
@@ -644,9 +665,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         if self._is_node_after_unit(node):
             free_reads = _extract_nested_scope_free_reads(node)
             for name in free_reads:
-                if name not in self.killed:
-                    if self.candidates is None or name in self.candidates:
-                        self.loaded.add(name)
+                self._record_downstream_read(name)
             name_attr = getattr(node, "name", None)
             if name_attr and not self._is_in_comp(name_attr):
                 self.killed.add(name_attr)
@@ -658,9 +677,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         if self._is_node_after_unit(node):
             free_reads = _extract_nested_scope_free_reads(node)
             for name in free_reads:
-                if name not in self.killed:
-                    if self.candidates is None or name in self.candidates:
-                        self.loaded.add(name)
+                self._record_downstream_read(name)
             if not self._is_in_comp(node.name):
                 self.killed.add(node.name)
         else:
@@ -676,15 +693,11 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
     def visit_Name(self, node: ast.Name) -> None:
         self.generic_visit(node)
         if isinstance(node.ctx, ast.Load) and self._is_node_after_unit(node):
-            if not self._is_in_comp(node.id) and node.id not in self.killed:
-                if self.candidates is None or node.id in self.candidates:
-                    self.loaded.add(node.id)
+            self._record_downstream_read(node.id)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         if isinstance(node.target, ast.Name) and self._is_node_after_unit(node.target):
-            if not self._is_in_comp(node.target.id) and node.target.id not in self.killed:
-                if self.candidates is None or node.target.id in self.candidates:
-                    self.loaded.add(node.target.id)
+            self._record_downstream_read(node.target.id)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
@@ -1002,6 +1015,91 @@ def is_async_generator_with_return_value(
     return has_yield and is_async and has_ret
 
 
+def _load_unit_file_text(
+    unit: Dict[str, Any],
+    repo_root: Optional[str] = None,
+) -> Optional[str]:
+    """Reads source text from disk for a unit when not provided in-memory."""
+    f_raw = normalize_path_string(str(unit.get("file") or ""), strip_anchor=True)
+    if not f_raw:
+        return None
+    p = Path(f_raw)
+    f_path = p if p.is_file() or p.is_absolute() else (Path(repo_root or os.getcwd()) / p)
+    if not f_path.is_file():
+        return None
+    try:
+        return f_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _extract_effective_unit_outputs(
+    unit: Dict[str, Any], scope: Dict[str, Any]
+) -> List[str]:
+    """Extracts non-global, non-local outputs from precomputed unit dict or analyzed scope."""
+    raw = unit.get("outputs")
+    cands = raw if isinstance(raw, (list, tuple, set)) else scope.get("outputs", [])
+    excluded = set(scope.get("globals", [])) | set(scope.get("nonlocals", []))
+    return [v for v in cands if v not in excluded]
+
+
+def resolve_clone_generator_subroutine_outputs(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    scope1: Dict[str, Any],
+    scope2: Dict[str, Any],
+    source_text1: Optional[str] = None,
+    source_text2: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
+    repo_root: Optional[str] = None,
+) -> Optional[Tuple[List[str], List[str]]]:
+    """Resolves output variable bindings for clone generator subroutines across two code units.
+
+    Prefers precomputed 'outputs' on u1 and u2 if already present. Otherwise, computes
+    downstream read names for both clone sides, combines definite stores and inputs, and
+    delegates to resolve_generator_subroutine_outputs.
+
+    Returns:
+        A tuple of (outputs_side1, outputs_side2) if compatible; None if output
+        counterpart mismatches prevent safe refactoring.
+    """
+    if "outputs" in u1 and isinstance(u1["outputs"], (list, tuple, set)):
+        return _extract_effective_unit_outputs(u1, scope1), _extract_effective_unit_outputs(u2, scope2)
+
+    u1_raw = _extract_effective_unit_outputs(u1, scope1)
+    u2_raw = _extract_effective_unit_outputs(u2, scope2)
+
+    targets = [
+        (u1, set(u1_raw), source_text1, tree1),
+        (u2, set(u2_raw), source_text2, tree2),
+    ]
+    downstreams: List[Optional[Set[str]]] = []
+    for unit_target, cand_set, in_mem_text, parsed_ast in targets:
+        text_to_use = (
+            in_mem_text
+            if in_mem_text is not None
+            else (unit_target.get("source_text") or unit_target.get("file_source"))
+        )
+        if text_to_use is None:
+            text_to_use = _load_unit_file_text(unit_target, repo_root=repo_root)
+
+        if text_to_use is not None:
+            d_reads = collect_downstream_read_names(
+                str(text_to_use), unit_target, candidates=cand_set, tree=parsed_ast
+            )
+        else:
+            d_reads = None
+        downstreams.append(d_reads)
+
+    downstream1, downstream2 = downstreams[0], downstreams[1]
+    u1_def = set(scope1.get("definite_stores", [])) | set(scope1.get("inputs", []))
+    u2_def = set(scope2.get("definite_stores", [])) | set(scope2.get("inputs", []))
+    side1 = GeneratorCloneSideData(u1_raw, downstream1, u1_def)
+    side2 = GeneratorCloneSideData(u2_raw, downstream2, u2_def)
+    return resolve_generator_subroutine_outputs(side1, side2)
+
+
 def _normalize_file_path(
     f_str: str,
     repo_root: Optional[str] = None,
@@ -1128,38 +1226,30 @@ def _populate_unit_receiver_metadata(
         and "receiver_param" in unit
     ):
         return
-    f_raw = normalize_path_string(str(unit.get("file") or ""), strip_anchor=True)
-    if not f_raw:
+    source = _load_unit_file_text(unit, repo_root=repo_root)
+    if source is None:
         return
-    p = Path(f_raw)
-    f_path = p if p.is_file() or p.is_absolute() else (Path(repo_root or os.getcwd()) / p)
-    if not f_path.is_file():
-        return
-    try:
-        source = f_path.read_text(encoding="utf-8")
-        fn_meta = find_enclosing_function(source, unit)
-        cls_meta = find_enclosing_class(source, unit)
-        if cls_meta:
-            if "enclosing_class" not in unit:
-                unit["enclosing_class"] = cls_meta["name"]
-            if "enclosing_class_start" not in unit:
-                unit["enclosing_class_start"] = cls_meta["start"]
-        is_method = _is_method_of_class(fn_meta, cls_meta)
-        if "receiver_kind" not in unit:
-            if is_method:
-                rec_k = _get_enclosing_receiver_kind(fn_meta)
-                unit["receiver_kind"] = rec_k
-                if rec_k == "static":
-                    unit["is_static"] = True
-            else:
-                unit["receiver_kind"] = None
-        if "receiver_param" not in unit:
-            if is_method and unit.get("receiver_kind") in ("instance", "class"):
-                unit["receiver_param"] = fn_meta.get("receiver_param") if fn_meta else None
-            else:
-                unit["receiver_param"] = None
-    except (OSError, UnicodeDecodeError):
-        pass
+    fn_meta = find_enclosing_function(source, unit)
+    cls_meta = find_enclosing_class(source, unit)
+    if cls_meta:
+        if "enclosing_class" not in unit:
+            unit["enclosing_class"] = cls_meta["name"]
+        if "enclosing_class_start" not in unit:
+            unit["enclosing_class_start"] = cls_meta["start"]
+    is_method = _is_method_of_class(fn_meta, cls_meta)
+    if "receiver_kind" not in unit:
+        if is_method:
+            rec_k = _get_enclosing_receiver_kind(fn_meta)
+            unit["receiver_kind"] = rec_k
+            if rec_k == "static":
+                unit["is_static"] = True
+        else:
+            unit["receiver_kind"] = None
+    if "receiver_param" not in unit:
+        if is_method and unit.get("receiver_kind") in ("instance", "class"):
+            unit["receiver_param"] = fn_meta.get("receiver_param") if fn_meta else None
+        else:
+            unit["receiver_param"] = None
 
 
 def _base_unit_name(u: Dict[str, Any]) -> str:

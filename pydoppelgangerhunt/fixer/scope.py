@@ -53,6 +53,16 @@ def _normalize_receiver_attr_name(
     return attr
 
 
+def is_subroutine_unit(unit: Dict[str, Any]) -> bool:
+    """Checks whether an AST code unit is a subroutine block rather than a whole function or expression."""
+    unit_kind = str(unit.get("kind") or "")
+    if unit_kind in ("compound_block", "sliding_window", "clause_branch"):
+        return True
+    if unit_kind in ("function", "closure", "method", "comprehension", "complex_expr"):
+        return False
+    return ":" in str(unit.get("name") or "")
+
+
 def _normalize_receiver_attrs(
     attrs: Sequence[str],
     receiver_param: Optional[str] = None,
@@ -1221,11 +1231,7 @@ def _inspect_unit_scope(
     if tree is None:
         return empty_res
 
-    unit_name = str(unit.get("name") or "")
-    unit_kind = str(unit.get("kind") or "")
-    is_subroutine = unit_kind in ("compound_block", "sliding_window", "clause_branch") or (
-        unit_kind not in ("function", "closure", "method", "comprehension", "complex_expr") and ":" in unit_name
-    )
+    is_subroutine = is_subroutine_unit(unit)
 
     rec_param = unit.get("receiver_param")
     rec_kind = unit.get("receiver_kind")

@@ -24,6 +24,7 @@ from pydoppelgangerhunt.fixer.binding import (
     find_enclosing_class,
     find_enclosing_function,
     is_async_generator_with_return_value,
+    resolve_clone_generator_subroutine_outputs,
     resolve_generator_subroutine_outputs,
 )
 from pydoppelgangerhunt.fixer.depgraph import (
@@ -70,6 +71,7 @@ from pydoppelgangerhunt.fixer.scope import (
     _walrus_assignment_in_expr,
     _walrus_in_sequence,
     analyze_unit_variable_scope,
+    is_subroutine_unit,
 )
 from pydoppelgangerhunt.fixer.source import (
     _detect_indent_step,
@@ -143,10 +145,12 @@ __all__ = [
     "GeneratorCloneSideData",
     "intervals_overlap",
     "is_async_generator_with_return_value",
+    "is_subroutine_unit",
     "is_valid_unit_coordinates",
     "parse_unit_coord",
     "refactor_module_units",
     "replace_unit_in_source",
+    "resolve_clone_generator_subroutine_outputs",
     "resolve_generator_subroutine_outputs",
     "resolve_shared_module_file",
     "resolve_unit_replacement",
