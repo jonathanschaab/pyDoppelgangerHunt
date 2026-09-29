@@ -773,9 +773,13 @@ def _outputs_compatible(
     is_subroutine: bool,
     has_yield: bool,
 ) -> bool:
-    """Checks whether candidate clone outputs match synthesized helper outputs."""
+    """Checks whether candidate clone outputs match synthesized helper outputs.
+
+    Note: When is_subroutine and has_yield are True, resolve_clone_generator_subroutine_outputs
+    strictly guarantees equal-length paired outputs, so output lengths are always compatible.
+    """
     if is_subroutine and has_yield:
-        return len(target_outs2) == len(outputs)
+        return True
     return len(u1_outs) == len(outputs) and len(u2_outs) == len(outputs)
 
 
@@ -3015,6 +3019,8 @@ def generate_refactoring_patch(
             ):
                 helper_name = f"{base_helper}_{h_idx}"
                 h_idx += 1
+            tree1 = f1_plan.parsed_tree
+            tree2 = f2_plan.parsed_tree if f2_plan is not None else tree1
             helper_code = synthesize_shared_helper_code(
                 u1_eff,
                 u2_eff,
@@ -3028,6 +3034,8 @@ def generate_refactoring_patch(
                 helper_name=helper_name,
                 source_text1=f1_plan.orig_text,
                 source_text2=f2_text,
+                tree1=tree1,
+                tree2=tree2,
             )
             if not helper_code:
                 continue

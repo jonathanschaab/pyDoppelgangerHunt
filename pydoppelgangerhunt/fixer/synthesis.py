@@ -16,6 +16,7 @@ from pydoppelgangerhunt.fixer.binding import (
     _extract_effective_unit_outputs,
     _has_receiver_reference,
     _is_same_file_path,
+    _pair_clone_outputs,
     _populate_unit_receiver_metadata,
     _prune_unshared_receivers,
     _resolve_effective_binding,
@@ -413,7 +414,19 @@ def _infer_helper_return_type(
                         if m_t.startswith(prefix) and m_t.endswith("]"):
                             parts = _split_type_args(m_t)
                             if parts:
-                                inferred_yield_type = parts[0]
+                                if prefix.lower().startswith("tuple["):
+                                    if len(parts) == 2 and parts[1] == "...":
+                                        inferred_yield_type = parts[0]
+                                    else:
+                                        unique_types = list(dict.fromkeys(parts))
+                                        if len(unique_types) == 1:
+                                            inferred_yield_type = unique_types[0]
+                                        else:
+                                            inferred_yield_type = (
+                                                f"Union[{', '.join(unique_types)}]"
+                                            )
+                                else:
+                                    inferred_yield_type = parts[0]
                             break
                     if inferred_yield_type:
                         break
@@ -445,6 +458,14 @@ def _infer_helper_return_type(
             return f"Iterator[{yield_t}]"
 
         return f"AsyncIterator[{yield_t}]"
+
+    is_sub = (
+        is_subroutine_unit({"kind": unit_kind})
+        if unit_kind
+        else is_subroutine_unit(scope)
+    )
+    if not is_sub and resolved_ret not in ("Any", "None"):
+        return resolved_ret
 
     outputs_ret = _infer_outputs_return_type(
         helper_outputs,
@@ -522,6 +543,8 @@ def synthesize_shared_helper_code(
     helper_name: Optional[str] = None,
     source_text1: Optional[str] = None,
     source_text2: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
 ) -> str:
     """Synthesizes a proposed shared helper function stub from two clone units.
 
@@ -588,9 +611,11 @@ def synthesize_shared_helper_code(
     _populate_unit_receiver_metadata(u2, repo_root=repo_root)
 
     # Variable scope analysis for concrete parameter signatures
-    scope1 = analyze_unit_variable_scope(u1, repo_root=repo_root)
-    scope2 = analyze_unit_variable_scope(u2, repo_root=repo_root)
-    scope = analyze_unit_variable_scope(u1, u2, repo_root=repo_root)
+    scope1 = analyze_unit_variable_scope(u1, repo_root=repo_root, tree1=tree1)
+    scope2 = analyze_unit_variable_scope(u2, repo_root=repo_root, tree1=tree2)
+    scope = analyze_unit_variable_scope(
+        u1, u2, repo_root=repo_root, tree1=tree1, tree2=tree2
+    )
 
     enc1 = u1.get("enclosing_class")
     enc2 = u2.get("enclosing_class")
@@ -722,11 +747,10 @@ def synthesize_shared_helper_code(
     r1 = scope1.get("return_type")
     r2 = scope2.get("return_type")
     resolved_ret = _merge_types(r1, r2, type_merge_strategy)
-    has_yield = bool(scope.get("has_yield") or scope1.get("has_yield") or scope2.get("has_yield"))
-    if "outputs" in u1 and isinstance(u1["outputs"], (list, tuple, set)):
-        outputs = _extract_effective_unit_outputs(u1, scope1)
-        u2_outs = _extract_effective_unit_outputs(u2, scope2)
-    elif has_yield and is_subroutine_unit(u1):
+    has_yield = bool(
+        scope.get("has_yield") or scope1.get("has_yield") or scope2.get("has_yield")
+    )
+    if has_yield and is_subroutine_unit(u1):
         resolved_sub_outs = resolve_clone_generator_subroutine_outputs(
             u1=u1,
             u2=u2,
@@ -734,11 +758,26 @@ def synthesize_shared_helper_code(
             scope2=scope2,
             source_text1=source_text1,
             source_text2=source_text2,
+            tree1=tree1,
+            tree2=tree2,
             repo_root=repo_root,
         )
         if resolved_sub_outs is None:
             return ""
         outputs, u2_outs = resolved_sub_outs
+    elif (
+        "outputs" in u1
+        and isinstance(u1["outputs"], (list, tuple, set))
+        and "outputs" in u2
+        and isinstance(u2["outputs"], (list, tuple, set))
+    ):
+        outputs = _extract_effective_unit_outputs(u1, scope1)
+        u2_outs = _extract_effective_unit_outputs(u2, scope2)
+        pairs = _pair_clone_outputs(outputs, u2_outs)
+        if len(pairs) != len(outputs) or len(pairs) != len(u2_outs):
+            return ""
+        outputs = [p[0] for p in pairs]
+        u2_outs = [p[1] for p in pairs]
     else:
         outputs = _extract_effective_unit_outputs(u1, scope)
         u2_outs = _extract_effective_unit_outputs(u2, scope2)

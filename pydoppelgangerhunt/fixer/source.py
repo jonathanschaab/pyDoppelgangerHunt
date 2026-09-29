@@ -1040,14 +1040,16 @@ def find_enclosing_function_is_async(
     source_text: str,
     start_line: int,
     end_line: int,
+    tree: Optional[ast.AST] = None,
 ) -> bool:
     """Checks whether the given line range is enclosed within an AsyncFunctionDef."""
     if start_line <= 0 or end_line < start_line:
         return False
-    try:
-        tree = ast.parse(source_text)
-    except (SyntaxError, ValueError, UnicodeDecodeError):
-        return False
+    if tree is None:
+        try:
+            tree = ast.parse(source_text)
+        except (SyntaxError, ValueError, UnicodeDecodeError):
+            return False
     candidates: List[Tuple[int, bool]] = []
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):

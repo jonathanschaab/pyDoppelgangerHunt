@@ -7,10 +7,10 @@ import builtins
 import logging
 import sys
 import textwrap
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.reporters import extract_unit_source_code
+from pydoppelgangerhunt.fixer.dataflow import _load_unit_file_text
 from pydoppelgangerhunt.fixer.source import (
     _slice_unit_token_lines,
     find_enclosing_function_is_async,
@@ -1158,6 +1158,7 @@ def _rank_param_kind(
 def _inspect_unit_scope(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
+    file_tree: Optional[ast.AST] = None,
 ) -> Dict[str, Any]:
     """Extracts lexical and AST scope metadata for a single unit."""
     raw_lines = _slice_unit_token_lines(unit, extract_unit_source_code(unit, repo_root=repo_root))
@@ -1338,9 +1339,6 @@ def _inspect_unit_scope(
             and v not in visitor.deleted_names
             and v not in visitor.imported_names
         ]
-        if "downstream_reads" in unit and isinstance(unit["downstream_reads"], (set, list, tuple)):
-            downstream_set = set(unit["downstream_reads"])
-            outputs = [v for v in outputs if v in downstream_set]
     else:
         outputs = []
 
@@ -1373,19 +1371,9 @@ def _inspect_unit_scope(
 
     unit_is_async = unit.get("is_async")
     if unit_is_async is None:
-        file_path = unit.get("file")
         s_line = int(unit.get("start") or 1)
         e_line = int(unit.get("end") or s_line)
-        source_text: Optional[str] = (
-            unit.get("source_text") or unit.get("file_source")
-        )
-        if source_text is None and file_path:
-            full_path = Path(repo_root) / file_path if repo_root else Path(file_path)
-            if full_path.is_file():
-                try:
-                    source_text = full_path.read_text(encoding="utf-8")
-                except (OSError, UnicodeDecodeError):
-                    source_text = None
+        source_text: Optional[str] = _load_unit_file_text(unit, repo_root=repo_root)
         if (
             source_text is None
             and "source_lines" in unit
@@ -1393,7 +1381,9 @@ def _inspect_unit_scope(
         ):
             source_text = "".join(unit["source_lines"])
         if source_text:
-            unit_is_async = find_enclosing_function_is_async(source_text, s_line, e_line)
+            unit_is_async = find_enclosing_function_is_async(
+                source_text, s_line, e_line, tree=file_tree
+            )
         else:
             unit_is_async = False
 
@@ -1440,11 +1430,13 @@ def analyze_unit_variable_scope(
     u1: Dict[str, Any],
     u2: Optional[Dict[str, Any]] = None,
     repo_root: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
-    info1 = _inspect_unit_scope(u1, repo_root=repo_root)
+    info1 = _inspect_unit_scope(u1, repo_root=repo_root, file_tree=tree1)
     if u2 is not None:
-        info2 = _inspect_unit_scope(u2, repo_root=repo_root)
+        info2 = _inspect_unit_scope(u2, repo_root=repo_root, file_tree=tree2)
         common_inputs = [var for var in info1["inputs"] if var in info2["inputs"]]
         if len(info1["inputs"]) == len(info2["inputs"]):
             inputs = common_inputs if len(common_inputs) == len(info1["inputs"]) else info1["inputs"]
@@ -1567,8 +1559,13 @@ def dispatch_analyze_unit_variable_scope(
     u1: Dict[str, Any],
     u2: Optional[Dict[str, Any]] = None,
     repo_root: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
 ) -> Dict[str, Any]:
     """Dispatches analyze_unit_variable_scope, honoring active mock patches on pydoppelgangerhunt.fixer."""
     pkg = sys.modules.get("pydoppelgangerhunt.fixer")
     target = getattr(pkg, "analyze_unit_variable_scope", analyze_unit_variable_scope)
-    return target(u1, u2=u2, repo_root=repo_root)
+    try:
+        return target(u1, u2=u2, repo_root=repo_root, tree1=tree1, tree2=tree2)
+    except TypeError:
+        return target(u1, u2=u2, repo_root=repo_root)

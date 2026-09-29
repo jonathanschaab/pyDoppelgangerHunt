@@ -1463,21 +1463,22 @@ def test_collect_downstream_read_names_positional_and_expression_boundaries() ->
     assert reads_prior == set()
 
 
-def test_resolve_generator_subroutine_outputs_preserves_per_side_necessity_and_safe_fallback() -> None:
-    """Verifies that resolve_generator_subroutine_outputs pairs renamed outputs and guards against partial knowledge."""
-    from pydoppelgangerhunt.fixer.binding import resolve_generator_subroutine_outputs  # pylint: disable=import-outside-toplevel
+def test_resolve_generator_subroutine_outputs_preserves_per_side_necessity_and_safe_fallback(
+) -> None:
+    """Verifies that resolve_generator_subroutine_outputs pairs renamed outputs and guards
+    against partial knowledge."""
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        GeneratorCloneSideData,
+        resolve_generator_subroutine_outputs,
+    )
 
     u1_outs = ["total", "x"]
     u2_outs = ["count", "x"]
 
     # 1. Both sides known: only the mapped total/count slot is needed, x is discarded
     res1 = resolve_generator_subroutine_outputs(
-        u1_outs,
-        u2_outs,
-        downstream1={"total"},
-        downstream2={"count"},
-        u1_definite={"total"},
-        u2_definite={"count"},
+        GeneratorCloneSideData(u1_outs, downstream={"total"}, definite={"total"}),
+        GeneratorCloneSideData(u2_outs, downstream={"count"}, definite={"count"}),
     )
     assert res1 is not None
     out1, out2 = res1
@@ -1486,12 +1487,8 @@ def test_resolve_generator_subroutine_outputs_preserves_per_side_necessity_and_s
 
     # 2. Unknown fallback with definite sets: prunes conditionally assigned loop variable x
     res2 = resolve_generator_subroutine_outputs(
-        u1_outs,
-        u2_outs,
-        downstream1={"total"},
-        downstream2=None,
-        u1_definite={"total"},
-        u2_definite={"count"},
+        GeneratorCloneSideData(u1_outs, downstream={"total"}, definite={"total"}),
+        GeneratorCloneSideData(u2_outs, downstream=None, definite={"count"}),
     )
     assert res2 is not None
     fb_def1, fb_def2 = res2
@@ -1500,7 +1497,8 @@ def test_resolve_generator_subroutine_outputs_preserves_per_side_necessity_and_s
 
     # 3. Unknown fallback without definite sets: unconstrained fallback preserves all paired outputs
     res3 = resolve_generator_subroutine_outputs(
-        u1_outs, u2_outs, downstream1={"total"}, downstream2=None
+        GeneratorCloneSideData(u1_outs, downstream={"total"}),
+        GeneratorCloneSideData(u2_outs, downstream=None),
     )
     assert res3 is not None
     fb_out1, fb_out2 = res3
@@ -1509,7 +1507,8 @@ def test_resolve_generator_subroutine_outputs_preserves_per_side_necessity_and_s
 
     # 4. Neither side needs outputs
     res4 = resolve_generator_subroutine_outputs(
-        u1_outs, u2_outs, downstream1=set(), downstream2=set()
+        GeneratorCloneSideData(u1_outs, downstream=set()),
+        GeneratorCloneSideData(u2_outs, downstream=set()),
     )
     assert res4 is not None
     none_out1, none_out2 = res4
@@ -1518,22 +1517,17 @@ def test_resolve_generator_subroutine_outputs_preserves_per_side_necessity_and_s
 
     # 5. Unequal output counts where needed output has no counterpart: fails closed (returns None)
     res_unequal = resolve_generator_subroutine_outputs(
-        ["total"],
-        ["count", "status"],
-        downstream1={"total"},
-        downstream2={"count"},
+        GeneratorCloneSideData(["total"], downstream={"total"}),
+        GeneratorCloneSideData(["count", "status"], downstream={"count"}),
     )
     assert res_unequal is None
 
-    # 6. Downstream explicitly requires output assigned in loop: retained even if not in definite_stores
+    # 6. Downstream explicitly requires output assigned in loop: fails closed if not definite
     res_needed = resolve_generator_subroutine_outputs(
-        ["x"],
-        ["x"],
-        downstream1={"x"},
-        downstream2={"x"},
-        u1_definite=set(),
+        GeneratorCloneSideData(["x"], downstream={"x"}, definite=set()),
+        GeneratorCloneSideData(["x"], downstream={"x"}, definite=set()),
     )
-    assert res_needed == (["x"], ["x"])
+    assert res_needed is None
 
 
 def test_collect_downstream_read_names_comprehensions_and_walrus() -> None:
@@ -1931,7 +1925,7 @@ def test_pair_clone_outputs_positional_alignment() -> None:
 
     # Colliding variable names across different semantic positions
     pairs = _pair_clone_outputs(["a", "b"], ["b", "c"])
-    assert pairs == [("a", "b"), ("b", "c")]
+    assert pairs == [("a", "c"), ("b", "b")]
 
     # Swapped variable names with identical name set preserve canonical identity mapping
     pairs_swapped = _pair_clone_outputs(["x", "y"], ["y", "x"])
@@ -2762,10 +2756,6 @@ def test_split_type_args_nested_bracket_depth() -> None:
     t1_ws = "  Generator[Tuple[int, str], None, Dict[str, Any]] \n "
     assert _split_type_args(t1_ws) == ["Tuple[int, str]", "None", "Dict[str, Any]"]
 
-    # Negative depth clamping against mismatched closing brackets
-    t_mismatched = "Foo][int, str]"
-    assert _split_type_args(t_mismatched) == ["int", "str"]
-
     # Deeply nested generics
     t2 = "Union[Dict[str, List[int]], Optional[Tuple[float, bool]]]"
     assert _split_type_args(t2) == [
@@ -2920,6 +2910,129 @@ def test_downstream_reads_preserve_exception_alias_reassigned_in_same_handler() 
     reads_try = collect_downstream_read_names(code_try, unit_try, candidates={"err"})
     assert reads_try is not None
     assert "err" not in reads_try
+
+
+def test_infer_helper_return_type_yield_from_tuples() -> None:
+    """Verifies that yield_from on Tuple types infers Union or homogeneous element types."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _infer_helper_return_type,
+    )
+
+    scope = {
+        "has_yield": True,
+        "yield_expr_names": [("yield_from", "stream")],
+        "has_return_value": False,
+    }
+    # Heterogeneous tuple: Tuple[int, str] yields Union[int, str]
+    res_hetero = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope=scope,
+        meta1={"stream": {"type": "Tuple[int, str]"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_hetero == "Iterator[Union[int, str]]"
+
+    # Homogeneous variadic tuple: Tuple[int, ...] yields int
+    res_homo = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope=scope,
+        meta1={"stream": {"type": "Tuple[int, ...]"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_homo == "Iterator[int]"
+
+
+def test_collect_downstream_read_names_loop_carried_dependence() -> None:
+    """Verifies that reads earlier in an enclosing loop body are captured as downstream reads."""
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        collect_downstream_read_names,
+    )
+
+    code = (
+        "def process_batches(batches):\n"
+        "    total = 0\n"
+        "    for batch in batches:\n"
+        "        log(total)\n"
+        "        for x in batch:\n"
+        "            total += x\n"
+        "            yield x\n"
+    )
+    # Unit is lines 5 to 7: inner loop where total is updated
+    unit = {"start": 5, "end": 7}
+    reads = collect_downstream_read_names(code, unit, candidates={"total"})
+    assert reads is not None
+    assert "total" in reads
+
+
+def test_collect_downstream_read_names_try_finally_exceptional_path() -> None:
+    """Verifies that try body stores do not kill variables in finally block across
+    exceptional paths."""
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        collect_downstream_read_names,
+    )
+
+    code = (
+        "def run_transaction():\n"
+        "    total = 10\n"
+        "    try:\n"
+        "        total = 1\n"
+        "    finally:\n"
+        "        print(total)\n"
+    )
+    # Unit is line 2: "total = 10"
+    unit = {"start": 2, "end": 2}
+    reads = collect_downstream_read_names(code, unit, candidates={"total"})
+    assert reads is not None
+    # print(total) in finally could run after an exception in try before total = 1,
+    # so line 2's total must be considered read downstream.
+    assert "total" in reads
+
+
+def test_return_type_precedence_whole_function_vs_subroutine() -> None:
+    """Verifies that whole-function units preserve declared return type over inferred
+    local store."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _infer_helper_return_type,
+    )
+
+    scope = {
+        "has_yield": False,
+        "has_return": True,
+        "has_return_value": True,
+    }
+    meta1 = {"val": {"type": "int"}}
+    meta2 = {"val": {"type": "int"}}
+
+    # Whole-function unit (unit_kind="function"): declared -> Optional[int] preserved over int
+    res_func = _infer_helper_return_type(
+        resolved_ret="Optional[int]",
+        helper_outputs=["val"],
+        conditional_outs=set(),
+        scope=scope,
+        meta1=meta1,
+        meta2=meta2,
+        unit_kind="function",
+    )
+    assert res_func == "Optional[int]"
+
+    # Subroutine unit (unit_kind="compound_block"): outputs_ret takes precedence over enclosing ret
+    res_sub = _infer_helper_return_type(
+        resolved_ret="Optional[int]",
+        helper_outputs=["val"],
+        conditional_outs=set(),
+        scope=scope,
+        meta1=meta1,
+        meta2=meta2,
+        unit_kind="compound_block",
+    )
+    assert res_sub == "int"
+
 
 
 

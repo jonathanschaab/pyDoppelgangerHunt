@@ -8149,6 +8149,7 @@ def test_generate_refactoring_patch_sync_generator_classdef_downstream_execution
     """Verifies that class bodies executing immediately after a generator unit retain the observed variable."""
     src1 = (
         "def f1(items: list[int]):\n"
+        "    x = 0\n"
         "    for x in items:\n"
         "        yield x\n"
         "    class C:\n"
@@ -8157,6 +8158,7 @@ def test_generate_refactoring_patch_sync_generator_classdef_downstream_execution
     )
     src2 = (
         "def f2(items: list[int]):\n"
+        "    x = 0\n"
         "    for x in items:\n"
         "        yield x\n"
         "    class C:\n"
@@ -8171,14 +8173,15 @@ def test_generate_refactoring_patch_sync_generator_classdef_downstream_execution
     eval_script = (
         "import cg1, cg2\n"
         "for mod_name, fn in [('cg1', cg1.f1), ('cg2', cg2.f2)]:\n"
-        "    gen = fn([1, 2, 3])\n"
-        "    while True:\n"
-        "        try:\n"
-        "            next(gen)\n"
-        "        except StopIteration as e:\n"
-        "            cls_res = e.value\n"
-        "            break\n"
-        "    print(f'{mod_name}:{cls_res.value}')\n"
+        "    for test_items in [[1, 2, 3], []]:\n"
+        "        gen = fn(test_items)\n"
+        "        while True:\n"
+        "            try:\n"
+        "                next(gen)\n"
+        "            except StopIteration as e:\n"
+        "                cls_res = e.value\n"
+        "                break\n"
+        "        print(f'{mod_name}:{cls_res.value}')\n"
     )
     before_proc = subprocess.run(
         [sys.executable, "-c", eval_script],
@@ -8188,10 +8191,10 @@ def test_generate_refactoring_patch_sync_generator_classdef_downstream_execution
         check=False,
     )
     assert before_proc.returncode == 0, f"Original execution failed: {before_proc.stderr}"
-    assert before_proc.stdout.strip() == "cg1:3\ncg2:3"
+    assert before_proc.stdout.strip() == "cg1:3\ncg1:0\ncg2:3\ncg2:0"
 
-    u1 = {"file": str(f1), "start": 2, "end": 3, "name": "f1:for", "kind": "compound_block"}
-    u2 = {"file": str(f2), "start": 2, "end": 3, "name": "f2:for", "kind": "compound_block"}
+    u1 = {"file": str(f1), "start": 2, "end": 4, "name": "f1:for", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 4, "name": "f2:for", "kind": "compound_block"}
 
     patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
     assert patch != ""
@@ -8254,6 +8257,7 @@ def test_generate_refactoring_patch_sync_generator_closure_capture(tmp_path: Pat
     """Verifies that closure captures downstream retain captured variables in generator return."""
     src1 = (
         "def f1(items: list[int]):\n"
+        "    x = 0\n"
         "    for x in items:\n"
         "        yield x\n"
         "    def get_x():\n"
@@ -8262,6 +8266,7 @@ def test_generate_refactoring_patch_sync_generator_closure_capture(tmp_path: Pat
     )
     src2 = (
         "def f2(items: list[int]):\n"
+        "    x = 0\n"
         "    for x in items:\n"
         "        yield x\n"
         "    def get_x():\n"
@@ -8276,14 +8281,15 @@ def test_generate_refactoring_patch_sync_generator_closure_capture(tmp_path: Pat
     eval_script = (
         "import clo1, clo2\n"
         "for mod_name, fn in [('clo1', clo1.f1), ('clo2', clo2.f2)]:\n"
-        "    gen = fn([10, 20, 30])\n"
-        "    while True:\n"
-        "        try:\n"
-        "            next(gen)\n"
-        "        except StopIteration as e:\n"
-        "            getter = e.value\n"
-        "            break\n"
-        "    print(f'{mod_name}:{getter()}')\n"
+        "    for test_items in [[10, 20, 30], []]:\n"
+        "        gen = fn(test_items)\n"
+        "        while True:\n"
+        "            try:\n"
+        "                next(gen)\n"
+        "            except StopIteration as e:\n"
+        "                getter = e.value\n"
+        "                break\n"
+        "        print(f'{mod_name}:{getter()}')\n"
     )
     before_proc = subprocess.run(
         [sys.executable, "-c", eval_script],
@@ -8293,10 +8299,10 @@ def test_generate_refactoring_patch_sync_generator_closure_capture(tmp_path: Pat
         check=False,
     )
     assert before_proc.returncode == 0, f"Original execution failed: {before_proc.stderr}"
-    assert before_proc.stdout.strip() == "clo1:30\nclo2:30"
+    assert before_proc.stdout.strip() == "clo1:30\nclo1:0\nclo2:30\nclo2:0"
 
-    u1 = {"file": str(f1), "start": 2, "end": 3, "name": "f1:for", "kind": "compound_block"}
-    u2 = {"file": str(f2), "start": 2, "end": 3, "name": "f2:for", "kind": "compound_block"}
+    u1 = {"file": str(f1), "start": 2, "end": 4, "name": "f1:for", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 4, "name": "f2:for", "kind": "compound_block"}
 
     patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
     assert patch != ""
