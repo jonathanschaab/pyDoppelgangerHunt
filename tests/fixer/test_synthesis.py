@@ -2390,7 +2390,7 @@ def test_downstream_read_visitor_try_except_else_joint_kills() -> None:
 
 
 def test_downstream_read_visitor_chained_with_context_managers() -> None:
-    """Verifies that chained context managers in a with statement do not kill targets prematurely."""
+    """Verifies that earlier context manager targets kill prior reaching definitions for later items."""
     from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
 
     code = (
@@ -2402,7 +2402,19 @@ def test_downstream_read_visitor_chained_with_context_managers() -> None:
     unit = {"start": 2, "end": 2}
     reads = collect_downstream_read_names(code, unit, candidates={"x"})
     assert reads is not None
-    assert "x" in reads
+    # x was killed by open_mgr() as x before use_mgr(x) was evaluated
+    assert "x" not in reads
+
+    # Also verify intra-item evaluation: open_mgr(x) evaluates BEFORE as x kills it
+    code_intra = (
+        "def worker():\n"
+        "    x = 10\n"
+        "    with open_mgr(x) as x:\n"
+        "        pass\n"
+    )
+    reads_intra = collect_downstream_read_names(code_intra, unit, candidates={"x"})
+    assert reads_intra is not None
+    assert "x" in reads_intra
 
 
 def test_class_scope_visitor_global_and_nonlocal() -> None:

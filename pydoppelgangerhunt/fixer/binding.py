@@ -794,7 +794,6 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         killed_before = set(self.killed)
         for item in node.items:
             self.visit(item.context_expr)
-        for item in node.items:
             if item.optional_vars is not None:
                 self._record_killed_targets([item.optional_vars])
         for stmt in node.body:
