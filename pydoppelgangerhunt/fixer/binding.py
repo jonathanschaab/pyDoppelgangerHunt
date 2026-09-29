@@ -260,6 +260,14 @@ class _BaseScopeVisitor(ast.NodeVisitor):
 
     def __init__(self) -> None:
         self._comp_targets: List[Set[str]] = []
+        self.globals: Set[str] = set()
+        self.nonlocals: Set[str] = set()
+
+    def visit_Global(self, node: ast.Global) -> None:
+        self.globals.update(node.names)
+
+    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+        self.nonlocals.update(node.names)
 
     def _is_in_comp(self, name: str) -> bool:
         return any(name in targets for targets in self._comp_targets)
@@ -368,16 +376,8 @@ class _FuncScopeVisitor(_BaseScopeVisitor):
         super().__init__()
         self.params: Set[str] = set()
         self.local_stores: Set[str] = set()
-        self.globals: Set[str] = set()
-        self.nonlocals: Set[str] = set()
         self.direct_loads: Set[str] = set()
         self.nested_free_reads: Set[str] = set()
-
-    def visit_Global(self, node: ast.Global) -> None:
-        self.globals.update(node.names)
-
-    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
-        self.nonlocals.update(node.names)
 
     def visit_FunctionDef(
         self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
@@ -422,6 +422,14 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
         self.class_stores: Set[str] = set()
         self.free_reads: Set[str] = set()
 
+    def _record_class_load(self, name: str) -> None:
+        if not self._is_in_comp(name) and name not in (self.class_stores | self.globals):
+            self.free_reads.add(name)
+
+    def _record_class_store(self, name: str) -> None:
+        if not self._is_in_comp(name) and name not in (self.globals | self.nonlocals):
+            self.class_stores.add(name)
+
     def visit_FunctionDef(
         self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
     ) -> None:
@@ -443,11 +451,9 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         if isinstance(node.target, ast.Name):
-            if not self._is_in_comp(node.target.id) and node.target.id not in self.class_stores:
-                self.free_reads.add(node.target.id)
+            self._record_class_load(node.target.id)
             self.visit(node.value)
-            if not self._is_in_comp(node.target.id):
-                self.class_stores.add(node.target.id)
+            self._record_class_store(node.target.id)
         else:
             self.visit(node.target)
             self.visit(node.value)
@@ -466,11 +472,9 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
 
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Load):
-            if not self._is_in_comp(node.id) and node.id not in self.class_stores:
-                self.free_reads.add(node.id)
+            self._record_class_load(node.id)
         elif isinstance(node.ctx, ast.Store):
-            if not self._is_in_comp(node.id):
-                self.class_stores.add(node.id)
+            self._record_class_store(node.id)
 
     def visit_Import(self, node: ast.Import) -> None:
         self._record_import_names(node, self.class_stores)
@@ -529,7 +533,16 @@ def _extract_nested_scope_free_reads(
     node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef],
 ) -> Set[str]:
     """Extracts free variable references escaping a nested function or executed class body."""
+    type_param_names: Set[str] = set()
+    for tp in getattr(node, "type_params", []):
+        tp_name = getattr(tp, "name", None)
+        if isinstance(tp_name, str):
+            type_param_names.add(tp_name)
+
     outer_visitor = _OuterExprVisitor()
+    for tp in getattr(node, "type_params", []):
+        outer_visitor.visit(tp)
+
     if isinstance(node, ast.ClassDef):
         for b in node.bases:
             outer_visitor.visit(b)
@@ -538,9 +551,13 @@ def _extract_nested_scope_free_reads(
         for dec in node.decorator_list:
             outer_visitor.visit(dec)
         class_visitor = _ClassScopeVisitor()
+        for tp_name in type_param_names:
+            class_visitor.class_stores.add(tp_name)
         for stmt in node.body:
             class_visitor.visit(stmt)
-        return outer_visitor.names | class_visitor.free_reads
+        return (outer_visitor.names - type_param_names) | (
+            class_visitor.free_reads - class_visitor.globals - type_param_names
+        )
 
     defaults = node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]
     for d in defaults:
@@ -556,6 +573,8 @@ def _extract_nested_scope_free_reads(
             outer_visitor.visit(node.returns)
 
     func_visitor = _FuncScopeVisitor()
+    for tp_name in type_param_names:
+        func_visitor.local_stores.add(tp_name)
     func_visitor.params = _collect_func_params(node.args)
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         for stmt in node.body:
@@ -568,7 +587,7 @@ def _extract_nested_scope_free_reads(
         - (func_visitor.params | func_visitor.local_stores)
     ) | func_visitor.nonlocals
     escaped -= func_visitor.globals
-    return outer_visitor.names | escaped
+    return (outer_visitor.names - type_param_names) | escaped
 
 
 def _extract_assigned_names(target: ast.AST) -> List[str]:
@@ -739,6 +758,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             self.visit(stmt)
         killed_try_body = set(self.killed)
 
+        handler_kills: List[Set[str]] = []
         for handler in node.handlers:
             self.killed = set(killed_before)
             if handler.type is not None:
@@ -747,15 +767,25 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
                 self.killed.add(handler.name)
             for stmt in handler.body:
                 self.visit(stmt)
+            if handler.name:
+                self.killed.discard(handler.name)
+            handler_kills.append(set(self.killed))
 
         self.killed = killed_try_body
         for stmt in node.orelse:
             self.visit(stmt)
+        killed_try_else = set(self.killed)
 
-        self.killed = killed_before
+        if node.handlers:
+            surviving = killed_try_else
+            for hk in handler_kills:
+                surviving = surviving & hk
+        else:
+            surviving = killed_try_else
+
+        self.killed = surviving
         for stmt in node.finalbody:
             self.visit(stmt)
-        self.killed = killed_before
 
     def visit_TryStar(self, node: ast.AST) -> None:
         self.visit_Try(node)  # type: ignore[arg-type]
@@ -764,6 +794,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         killed_before = set(self.killed)
         for item in node.items:
             self.visit(item.context_expr)
+        for item in node.items:
             if item.optional_vars is not None:
                 self._record_killed_targets([item.optional_vars])
         for stmt in node.body:

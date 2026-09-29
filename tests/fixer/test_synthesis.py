@@ -2288,3 +2288,196 @@ def test_resolve_unit_ast_end_col_multiline_unit_statements() -> None:
     assert "total" not in reads
     assert "count" not in reads
 
+
+def test_downstream_read_visitor_try_finally_unconditional_kills() -> None:
+    """Verifies that unconditional assignments in finally: kill reaching definitions downstream."""
+    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
+
+    code_killed = (
+        "def worker():\n"
+        "    total = 10\n"
+        "    try:\n"
+        "        do_something()\n"
+        "    finally:\n"
+        "        total = 99\n"
+        "    print(total)\n"
+    )
+    unit = {"start": 2, "end": 2}
+    reads = collect_downstream_read_names(code_killed, unit, candidates={"total"})
+    assert reads is not None
+    assert "total" not in reads
+
+    code_retained = (
+        "def worker():\n"
+        "    total = 10\n"
+        "    try:\n"
+        "        do_something()\n"
+        "    finally:\n"
+        "        pass\n"
+        "    print(total)\n"
+    )
+    reads_retained = collect_downstream_read_names(code_retained, unit, candidates={"total"})
+    assert reads_retained is not None
+    assert "total" in reads_retained
+
+
+def test_downstream_read_visitor_try_except_else_joint_kills() -> None:
+    """Verifies that reaching definitions are killed only when all try/except/else branches assign."""
+    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
+
+    # All branches assign total -> killed downstream
+    code_all_killed = (
+        "def worker():\n"
+        "    total = 10\n"
+        "    try:\n"
+        "        total = 1\n"
+        "    except ValueError:\n"
+        "        total = 2\n"
+        "    except TypeError:\n"
+        "        total = 3\n"
+        "    print(total)\n"
+    )
+    unit = {"start": 2, "end": 2}
+    reads = collect_downstream_read_names(code_all_killed, unit, candidates={"total"})
+    assert reads is not None
+    assert "total" not in reads
+
+    # One except branch does not assign total -> total reaches downstream
+    code_partial = (
+        "def worker():\n"
+        "    total = 10\n"
+        "    try:\n"
+        "        total = 1\n"
+        "    except ValueError:\n"
+        "        pass\n"
+        "    except TypeError:\n"
+        "        total = 3\n"
+        "    print(total)\n"
+    )
+    reads_partial = collect_downstream_read_names(code_partial, unit, candidates={"total"})
+    assert reads_partial is not None
+    assert "total" in reads_partial
+
+    # Try body does not assign, but else and all except assign -> killed downstream
+    code_else_killed = (
+        "def worker():\n"
+        "    total = 10\n"
+        "    try:\n"
+        "        pass\n"
+        "    except ValueError:\n"
+        "        total = 2\n"
+        "    else:\n"
+        "        total = 1\n"
+        "    print(total)\n"
+    )
+    reads_else = collect_downstream_read_names(code_else_killed, unit, candidates={"total"})
+    assert reads_else is not None
+    assert "total" not in reads_else
+
+    # Exception name is deleted at except block exit in Python 3 -> reaches downstream
+    code_as_name = (
+        "def worker():\n"
+        "    total = 10\n"
+        "    try:\n"
+        "        pass\n"
+        "    except Exception as total:\n"
+        "        pass\n"
+        "    print(total)\n"
+    )
+    reads_as_name = collect_downstream_read_names(code_as_name, unit, candidates={"total"})
+    assert reads_as_name is not None
+    assert "total" in reads_as_name
+
+
+def test_downstream_read_visitor_chained_with_context_managers() -> None:
+    """Verifies that chained context managers in a with statement do not kill targets prematurely."""
+    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def worker():\n"
+        "    x = 10\n"
+        "    with open_mgr() as x, use_mgr(x) as y:\n"
+        "        pass\n"
+    )
+    unit = {"start": 2, "end": 2}
+    reads = collect_downstream_read_names(code, unit, candidates={"x"})
+    assert reads is not None
+    assert "x" in reads
+
+
+def test_class_scope_visitor_global_and_nonlocal() -> None:
+    """Verifies that global declarations in class bodies are excluded from free reads and class stores."""
+    from pydoppelgangerhunt.fixer.binding import _extract_nested_scope_free_reads  # pylint: disable=import-outside-toplevel
+
+    code_global = (
+        "class MyClass:\n"
+        "    global g_val\n"
+        "    g_val = 100\n"
+        "    x = g_val\n"
+        "    y = outer_read\n"
+    )
+    tree_g = ast.parse(code_global)
+    class_node = tree_g.body[0]
+    escaped_g = _extract_nested_scope_free_reads(class_node)  # type: ignore[arg-type]
+    assert "g_val" not in escaped_g
+    assert "outer_read" in escaped_g
+
+    code_nonlocal = (
+        "def outer():\n"
+        "    n_val = 1\n"
+        "    class Inner:\n"
+        "        nonlocal n_val\n"
+        "        n_val = 2\n"
+        "        z = n_val\n"
+    )
+    tree_nl = ast.parse(code_nonlocal)
+    func_node = tree_nl.body[0]
+    inner_class_node = func_node.body[1]  # type: ignore[attr-defined]
+    escaped_nl = _extract_nested_scope_free_reads(inner_class_node)  # type: ignore[arg-type]
+    # n_val is nonlocal to Inner, so it escapes Inner as a free read referencing outer scope
+    assert "n_val" in escaped_nl
+
+
+def test_infer_outputs_return_type_single_output_precedence() -> None:
+    """Verifies that explicit single-output type takes precedence over enclosing resolved_ret unless Any."""
+    from pydoppelgangerhunt.fixer.synthesis import _infer_outputs_return_type  # pylint: disable=import-outside-toplevel
+
+    # Known output type "str" should override enclosing resolved_ret "int"
+    ret = _infer_outputs_return_type(
+        helper_outputs=["res"],
+        conditional_outs=set(),
+        meta1={"res": {"type": "str"}},
+        meta2={"res": {"type": "str"}},
+        type_merge_strategy="prefer_first",
+        resolved_ret="int",
+    )
+    assert ret == "str"
+
+    # When output type is "Any", fall back to enclosing resolved_ret "int"
+    ret_fallback = _infer_outputs_return_type(
+        helper_outputs=["res"],
+        conditional_outs=set(),
+        meta1={"res": {"type": "Any"}},
+        meta2={"res": {"type": "Any"}},
+        type_merge_strategy="prefer_first",
+        resolved_ret="int",
+    )
+    assert ret_fallback == "int"
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 type_params syntax requires Python 3.12+")
+def test_extract_nested_scope_free_reads_pep695_type_params() -> None:
+    """Verifies that PEP 695 type parameter scopes do not treat type vars as free reads."""
+    from pydoppelgangerhunt.fixer.binding import _extract_nested_scope_free_reads  # pylint: disable=import-outside-toplevel
+
+    code = (
+        "def inner[T: BoundType](val: T) -> T:\n"
+        "    return val\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    escaped = _extract_nested_scope_free_reads(fn_node)  # type: ignore[arg-type]
+    assert "T" not in escaped
+    assert "BoundType" in escaped
+
+

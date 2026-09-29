@@ -311,7 +311,7 @@ def _infer_outputs_return_type(
             m2 = meta2.get(out_var, {})
         t2 = m2.get("type")
         out_t = _merge_types(t1, t2, type_merge_strategy)
-        return_type = resolved_ret if resolved_ret != "Any" else out_t
+        return_type = out_t if out_t != "Any" else resolved_ret
         if out_var in conditional_outs:
             if not return_type.startswith("Optional[") and "None" not in return_type and return_type != "None":
                 return_type = f"Optional[{return_type}]"
