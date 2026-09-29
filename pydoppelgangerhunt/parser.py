@@ -1116,6 +1116,7 @@ def harvest_notebook_units(
                     consistent_renaming=consistent_renaming,
                     abstract_expressions=abstract_expressions,
                     strip_docstrings=strip_docstrings,
+                    is_async=isinstance(node, ast.AsyncFunctionDef),
                 )
 
     return units

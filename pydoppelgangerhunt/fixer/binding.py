@@ -812,7 +812,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             self.killed = set(killed_before)
             if handler.type is not None:
                 self.visit(handler.type)
-            if handler.name:
+            if handler.name and self._is_node_after_unit(handler):
                 self.killed.add(handler.name)
             for stmt in handler.body:
                 self.visit(stmt)

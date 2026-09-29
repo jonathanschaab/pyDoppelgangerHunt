@@ -2888,5 +2888,39 @@ def test_resolve_clone_generator_subroutine_outputs_requires_both_outputs() -> N
     assert outs2 == ["b"]
 
 
+def test_downstream_reads_preserve_exception_alias_reassigned_in_same_handler() -> None:
+    """Verifies reassigning an exception alias in handler preserves downstream reads."""
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
+        collect_downstream_read_names,
+    )
+
+    code = (
+        "def process():\n"
+        "    try:\n"
+        "        do_work()\n"
+        "    except ValueError as err:\n"
+        "        err = 'custom: ' + str(err)\n"
+        "        log(err)\n"
+    )
+    # Unit is line 5: "err = 'custom: ' + str(err)"
+    unit = {"start": 5, "end": 5}
+    reads = collect_downstream_read_names(code, unit, candidates={"err"})
+    assert reads is not None
+    assert "err" in reads
+
+    # Conversely, if unit is inside try body, the subsequent except handler DOES kill err
+    code_try = (
+        "def process_try():\n"
+        "    try:\n"
+        "        err = 'initial'\n"
+        "    except ValueError as err:\n"
+        "        log(err)\n"
+    )
+    unit_try = {"start": 3, "end": 3}
+    reads_try = collect_downstream_read_names(code_try, unit_try, candidates={"err"})
+    assert reads_try is not None
+    assert "err" not in reads_try
+
+
 
 

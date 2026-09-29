@@ -692,6 +692,46 @@ def test_jupyter_notebook_harvesting_and_clones(tmp_path: Path) -> None:
     assert any("#cell_" in clones[0][1]["file"] for _ in [0])
 
 
+def test_harvest_notebook_async_function_is_async_metadata(tmp_path: Path) -> None:
+    """Verifies that harvest_notebook_units records is_async=True for async function nodes."""
+    import json  # pylint: disable=import-outside-toplevel
+    nb_data = {
+        "cells": [
+            {
+                "cell_type": "code",
+                "execution_count": 1,
+                "metadata": {},
+                "outputs": [],
+                "source": [
+                    "async def fetch_async(url: str) -> str:\n",
+                    "    step1 = url.strip()\n",
+                    "    step2 = step1.lower()\n",
+                    "    return step2\n",
+                    "\n",
+                    "def fetch_sync(url: str) -> str:\n",
+                    "    step1 = url.strip()\n",
+                    "    step2 = step1.lower()\n",
+                    "    return step2\n",
+                ],
+            }
+        ],
+        "metadata": {},
+        "nbformat": 4,
+        "nbformat_minor": 2,
+    }
+    nb_file = tmp_path / "async_test.ipynb"
+    nb_file.write_text(json.dumps(nb_data), encoding="utf-8")
+
+    units = harvest_notebook_units(str(nb_file), str(tmp_path), min_lines=2, min_tokens=5)
+    async_units = [u for u in units if u.get("name") == "fetch_async"]
+    sync_units = [u for u in units if u.get("name") == "fetch_sync"]
+
+    assert len(async_units) >= 1
+    assert async_units[0]["is_async"] is True
+
+    assert len(sync_units) >= 1
+    assert sync_units[0]["is_async"] is False
+
 
 def test_coverage_missing_files_and_boilerplate_nodes() -> None:
     """Test read_coverage_data with missing files and is_boilerplate_node classifications."""
