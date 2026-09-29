@@ -2758,6 +2758,14 @@ def test_split_type_args_nested_bracket_depth() -> None:
     t1 = "Generator[Tuple[int, str], None, Dict[str, Any]]"
     assert _split_type_args(t1) == ["Tuple[int, str]", "None", "Dict[str, Any]"]
 
+    # Stray leading and trailing whitespace immunity
+    t1_ws = "  Generator[Tuple[int, str], None, Dict[str, Any]] \n "
+    assert _split_type_args(t1_ws) == ["Tuple[int, str]", "None", "Dict[str, Any]"]
+
+    # Negative depth clamping against mismatched closing brackets
+    t_mismatched = "Foo][int, str]"
+    assert _split_type_args(t_mismatched) == ["int", "str"]
+
     # Deeply nested generics
     t2 = "Union[Dict[str, List[int]], Optional[Tuple[float, bool]]]"
     assert _split_type_args(t2) == [

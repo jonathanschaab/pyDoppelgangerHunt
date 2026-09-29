@@ -276,9 +276,10 @@ def _format_helper_parameters(
 
 def _split_type_args(type_str: str) -> List[str]:
     """Splits top-level arguments of a generic type string, respecting nested brackets."""
-    if "[" not in type_str or not type_str.endswith("]"):
+    cleaned = type_str.strip()
+    if "[" not in cleaned or not cleaned.endswith("]"):
         return []
-    inner = type_str.split("[", 1)[1][:-1]
+    inner = cleaned.split("[", 1)[1][:-1]
     args: List[str] = []
     current: List[str] = []
     depth = 0
@@ -286,7 +287,7 @@ def _split_type_args(type_str: str) -> List[str]:
         if char == "[":
             depth += 1
         elif char == "]":
-            depth -= 1
+            depth = max(0, depth - 1)
         elif char == "," and depth == 0:
             args.append("".join(current).strip())
             current = []
