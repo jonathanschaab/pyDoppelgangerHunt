@@ -275,6 +275,7 @@ class _BaseScopeVisitor(ast.NodeVisitor):
 
     def __init__(self) -> None:
         self._comp_targets: List[Set[str]] = []
+        self._in_comp_body: int = 0
         self.globals: Set[str] = set()
         self.nonlocals: Set[str] = set()
 
@@ -291,12 +292,20 @@ class _BaseScopeVisitor(ast.NodeVisitor):
         self,
         node: Union[ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp],
     ) -> None:
+        if not node.generators:
+            return
+        # First generator's iter evaluates in enclosing scope (class scope if in class body)
+        self.visit(node.generators[0].iter)
         comp_set: Set[str] = set()
         self._comp_targets.append(comp_set)
+        self._in_comp_body += 1
         try:
-            for gen in node.generators:
-                self.visit(gen.iter)
-                comp_set.update(n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name))
+            for idx, gen in enumerate(node.generators):
+                if idx > 0:
+                    self.visit(gen.iter)
+                comp_set.update(
+                    n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name)
+                )
                 for if_expr in gen.ifs:
                     self.visit(if_expr)
             if isinstance(node, ast.DictComp):
@@ -305,6 +314,7 @@ class _BaseScopeVisitor(ast.NodeVisitor):
             else:
                 self.visit(node.elt)
         finally:
+            self._in_comp_body -= 1
             self._comp_targets.pop()
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
@@ -438,11 +448,21 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
         self.free_reads: Set[str] = set()
 
     def _record_class_load(self, name: str) -> None:
-        if not self._is_in_comp(name) and name not in (self.class_stores | self.globals):
+        if self._is_in_comp(name):
+            return
+        if self._in_comp_body > 0:
+            # Comprehensions in class bodies cannot resolve class attributes (PEP 227)
+            if name not in self.globals:
+                self.free_reads.add(name)
+        elif name not in (self.class_stores | self.globals):
             self.free_reads.add(name)
 
     def _record_class_store(self, name: str) -> None:
-        if not self._is_in_comp(name) and name not in (self.globals | self.nonlocals):
+        if (
+            not self._is_in_comp(name)
+            and self._in_comp_body == 0
+            and name not in (self.globals | self.nonlocals)
+        ):
             self.class_stores.add(name)
 
     def visit_FunctionDef(
@@ -730,9 +750,8 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)
         self.visit(node.target)
-        if isinstance(node.target, ast.Name) and self._is_node_after_unit(node.target):
-            if not self._is_in_comp(node.target.id):
-                self.killed.add(node.target.id)
+        # Named expressions (:=) may be conditionally evaluated (e.g. in 'and', 'or',
+        # 'if', or comprehensions). Conservatively do not treat them as definite kills.
 
     def visit_If(self, node: ast.If) -> None:
         self.visit(node.test)
@@ -1234,6 +1253,7 @@ def _populate_unit_receiver_metadata(
         and "enclosing_class" in unit
         and "enclosing_class_start" in unit
         and "receiver_param" in unit
+        and "is_async" in unit
     ):
         return
     source = _load_unit_file_text(unit, repo_root=repo_root)
@@ -1260,6 +1280,8 @@ def _populate_unit_receiver_metadata(
             unit["receiver_param"] = fn_meta.get("receiver_param") if fn_meta else None
         else:
             unit["receiver_param"] = None
+    if "is_async" not in unit:
+        unit["is_async"] = bool(fn_meta.get("is_async")) if fn_meta else False
 
 
 def _base_unit_name(u: Dict[str, Any]) -> str:

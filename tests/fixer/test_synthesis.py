@@ -19,10 +19,13 @@ from pydoppelgangerhunt import (
 )
 from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _format_call_arguments,
+    _infer_helper_return_type,
+    analyze_unit_variable_scope,
     is_subroutine_unit,
     resolve_clone_generator_subroutine_outputs,
 )
 from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=protected-access
+    _pair_clone_outputs,
     _resolve_unit_ast_end_col,
     collect_downstream_read_names,
 )
@@ -2619,6 +2622,125 @@ def test_downstream_read_visitor_record_downstream_read_and_comprehensions() -> 
     assert "val" not in reads
     assert "elem" not in reads
     assert "total" not in reads
+
+
+def test_class_body_comprehension_free_reads() -> None:
+    """Verifies that class-body comprehensions do not resolve class attributes (PEP 227)."""
+    code = (
+        "def outer():\n"
+        "    x = 10\n"
+        "    class C:\n"
+        "        x = 100\n"
+        "        values = [x for _ in range(1)]\n"
+        "    return C\n"
+    )
+    unit = {"start": 2, "end": 2}
+    reads = collect_downstream_read_names(code, unit, candidates={"x"})
+    assert reads is not None
+    assert "x" in reads
+
+
+def test_conditional_named_expr_does_not_kill_variables() -> None:
+    """Verifies that conditionally evaluated named expressions do not kill reaching definitions."""
+    code = (
+        "def compute(flag, items):\n"
+        "    total = 10\n"
+        "    if flag and (total := 20):\n"
+        "        pass\n"
+        "    return total\n"
+    )
+    unit = {"start": 2, "end": 2}
+    reads = collect_downstream_read_names(code, unit, candidates={"total"})
+    assert reads is not None
+    assert "total" in reads
+
+
+def test_pair_clone_outputs_swapped_names_and_positional_roles() -> None:
+    """Verifies positional pairing across renamed variable roles and identity on permutations."""
+    # Equal arity with different names: preserves positional sequence
+    pairs_pos = _pair_clone_outputs(["x", "y"], ["b", "a"])
+    assert pairs_pos == [("x", "b"), ("y", "a")]
+
+    # Identical name sets preserve identity mapping to avoid swapping variables on reordering
+    pairs_ident = _pair_clone_outputs(["x", "y"], ["y", "x"])
+    assert pairs_ident == [("x", "x"), ("y", "y")]
+
+    # Mismatched arity: only common names paired
+    pairs_mismatched = _pair_clone_outputs(["a", "b"], ["b"])
+    assert pairs_mismatched == [("b", "b")]
+
+
+def test_harvested_subroutine_inherits_async_status_and_rejection(
+    tmp_path: Path,
+) -> None:
+    """Verifies harvested compound block in async def inherits is_async and rejects return."""
+    source = (
+        "async def process_stream(data):\n"
+        "    total = 0\n"
+        "    for item in data:\n"
+        "        total += item\n"
+        "        yield total\n"
+        "    print(total)\n"
+    )
+    f = tmp_path / "stream.py"
+    f.write_text(source, encoding="utf-8")
+
+    units = harvest_file_units(str(f), str(tmp_path), min_lines=2, min_tokens=5)
+    compound_units = [u for u in units if u.get("kind") == "compound_block"]
+    assert len(compound_units) >= 1
+    assert compound_units[0].get("is_async") is True
+
+    # Scope analysis inherits async status
+    scope_info = analyze_unit_variable_scope(compound_units[0], repo_root=str(tmp_path))
+    assert scope_info.get("is_async") is True
+
+    # Refactoring patch rejects async generator subroutine with outputs
+    u2 = dict(compound_units[0])
+    u2["start"] = 3
+    u2["end"] = 5
+    patch = generate_refactoring_patch(
+        [(0.95, compound_units[0], u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch == ""
+
+
+def test_infer_helper_return_type_generator_with_outputs_and_iterator() -> None:
+    """Verifies Iterator annotations are converted to Generator when outputs are returned."""
+    # 1. Iterator[int] with helper output of type str becomes Generator[int, None, str]
+    res_replaced = _infer_helper_return_type(
+        resolved_ret="Iterator[int]",
+        helper_outputs=["total"],
+        conditional_outs=set(),
+        scope={"has_yield": True, "yield_expr_names": []},
+        meta1={"total": {"type": "str"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_replaced == "Generator[int, None, str]"
+
+    # 2. Iterable[int] with explicit return value becomes Generator[int, None, Any]
+    res_ret_val = _infer_helper_return_type(
+        resolved_ret="Iterable[int]",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={"has_yield": True, "yield_expr_names": [], "has_return_value": True},
+        meta1={},
+        meta2={},
+        is_async=False,
+    )
+    assert res_ret_val == "Generator[int, None, Any]"
+
+    # 3. Iterator[float] without return values remains Iterator[float]
+    res_kept = _infer_helper_return_type(
+        resolved_ret="Iterator[float]",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={"has_yield": True, "yield_expr_names": []},
+        meta1={},
+        meta2={},
+        is_async=False,
+    )
+    assert res_kept == "Iterator[float]"
 
 
 

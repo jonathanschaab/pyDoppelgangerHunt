@@ -31,6 +31,7 @@ __all__ = [
     "count_physical_newlines",
     "detect_line_ending",
     "extract_unit_comments_and_pragmas",
+    "find_enclosing_function_is_async",
     "is_valid_unit_coordinates",
     "parse_unit_coord",
     "replace_unit_in_source",
@@ -1033,3 +1034,31 @@ def _find_sig_colon(line: str) -> int:
     if colon_idx != -1:
         return colon_idx
     return line.rfind(":")
+
+
+def find_enclosing_function_is_async(
+    source_text: str,
+    start_line: int,
+    end_line: int,
+) -> bool:
+    """Checks whether the given line range is enclosed within an AsyncFunctionDef."""
+    if start_line <= 0 or end_line < start_line:
+        return False
+    try:
+        tree = ast.parse(source_text)
+    except (SyntaxError, ValueError, UnicodeDecodeError):
+        return False
+    candidates: List[Tuple[int, bool]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            n_start = getattr(node, "lineno", 0)
+            n_end = getattr(node, "end_lineno", n_start)
+            if n_start <= start_line and end_line <= n_end:
+                candidates.append((
+                    n_end - n_start,
+                    isinstance(node, ast.AsyncFunctionDef),
+                ))
+    if not candidates:
+        return False
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]

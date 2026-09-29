@@ -309,9 +309,25 @@ def _infer_outputs_return_type(
             m2 = meta2.get(out_var, {})
         t2 = m2.get("type")
         out_t = _merge_types(t1, t2, type_merge_strategy)
-        return_type = out_t if out_t != "Any" else resolved_ret
+        fallback = resolved_ret
+        if resolved_ret.startswith((
+            "Generator[", "Iterator[", "Iterable[",
+            "AsyncGenerator[", "AsyncIterator[", "AsyncIterable[",
+        )):
+            if resolved_ret.startswith("Generator[") and resolved_ret.endswith("]"):
+                parts = [
+                    p.strip() for p in resolved_ret.split("[", 1)[1][:-1].split(",")
+                ]
+                fallback = parts[2] if len(parts) >= 3 else "Any"
+            else:
+                fallback = "Any"
+        return_type = out_t if out_t != "Any" else fallback
         if out_var in conditional_outs:
-            if not return_type.startswith("Optional[") and "None" not in return_type and return_type != "None":
+            if (
+                not return_type.startswith("Optional[")
+                and "None" not in return_type
+                and return_type != "None"
+            ):
                 return_type = f"Optional[{return_type}]"
         return return_type
 
@@ -333,35 +349,55 @@ def _infer_helper_return_type(
 ) -> str:
     """Infers the return type annotation for a synthesized shared helper function."""
     if scope.get("has_yield"):
-        if resolved_ret not in ("Any", "None"):
+        has_return_val = bool(helper_outputs or scope.get("has_return_value"))
+        if not has_return_val and resolved_ret not in ("Any", "None"):
             if resolved_ret.startswith((
-                "Generator[", "Iterator[", "Iterable[", "AsyncGenerator[", "AsyncIterator[", "AsyncIterable["
+                "Generator[", "Iterator[", "Iterable[",
+                "AsyncGenerator[", "AsyncIterator[", "AsyncIterable[",
             )):
                 return resolved_ret
+        if has_return_val and not helper_outputs and resolved_ret.startswith("Generator["):
+            return resolved_ret
+
         inferred_yield_type = None
-        for kind, name in scope.get("yield_expr_names", []):
-            if name.startswith(":literal:"):
-                inferred_yield_type = name[len(":literal:") :]
-                break
-            m_t = meta1.get(name, {}).get("type") or meta2.get(name, {}).get("type")
-            if not m_t:
-                continue
-            if kind == "yield":
-                inferred_yield_type = m_t
-                break
-            if kind == "yield_from":
-                for prefix in (
-                    "Iterator[", "Iterable[", "List[", "Sequence[", "Set[", "Tuple[", "Collection[",
-                    "list[", "set[", "tuple[", "sequence[", "iterable[", "iterator[",
-                ):
-                    if m_t.startswith(prefix) and m_t.endswith("]"):
-                        inner = m_t[len(prefix) : -1].strip()
-                        if "," in inner:
-                            inner = inner.split(",")[0].strip()
-                        inferred_yield_type = inner
-                        break
-                if inferred_yield_type:
+        inferred_gen_ret_type = None
+        if (
+            resolved_ret.startswith(("Iterator[", "Iterable[", "Generator["))
+            and resolved_ret.endswith("]")
+        ):
+            inner_parts = [
+                p.strip() for p in resolved_ret.split("[", 1)[1][:-1].split(",")
+            ]
+            if inner_parts:
+                inferred_yield_type = inner_parts[0]
+            if resolved_ret.startswith("Generator[") and len(inner_parts) >= 3:
+                inferred_gen_ret_type = inner_parts[2]
+
+        if not inferred_yield_type:
+            for kind, name in scope.get("yield_expr_names", []):
+                if name.startswith(":literal:"):
+                    inferred_yield_type = name[len(":literal:") :]
                     break
+                m_t = meta1.get(name, {}).get("type") or meta2.get(name, {}).get("type")
+                if not m_t:
+                    continue
+                if kind == "yield":
+                    inferred_yield_type = m_t
+                    break
+                if kind == "yield_from":
+                    for prefix in (
+                        "Iterator[", "Iterable[", "List[", "Sequence[", "Set[",
+                        "Tuple[", "Collection[", "list[", "set[", "tuple[",
+                        "sequence[", "iterable[", "iterator[",
+                    ):
+                        if m_t.startswith(prefix) and m_t.endswith("]"):
+                            inner = m_t[len(prefix) : -1].strip()
+                            if "," in inner:
+                                inner = inner.split(",")[0].strip()
+                            inferred_yield_type = inner
+                            break
+                    if inferred_yield_type:
+                        break
 
         yield_t = inferred_yield_type if inferred_yield_type else "Any"
         if not is_async:
@@ -374,11 +410,17 @@ def _infer_helper_return_type(
                 resolved_ret=resolved_ret,
                 outputs2=outputs2,
             )
-            ret_t = outputs_ret or (
+            is_iter_annotation = resolved_ret.startswith((
+                "Iterator[", "Iterable[", "Generator["
+            ))
+            fallback_ret = inferred_gen_ret_type or (
                 resolved_ret
-                if resolved_ret not in ("Any", "None") and scope.get("has_return_value")
-                else ("Any" if scope.get("has_return_value") else None)
+                if resolved_ret not in ("Any", "None")
+                and not is_iter_annotation
+                and scope.get("has_return_value")
+                else ("Any" if (scope.get("has_return_value") or helper_outputs) else None)
             )
+            ret_t = outputs_ret or fallback_ret
             if ret_t:
                 return f"Generator[{yield_t}, None, {ret_t}]"
             return f"Iterator[{yield_t}]"

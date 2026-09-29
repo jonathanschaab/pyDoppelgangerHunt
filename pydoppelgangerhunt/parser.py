@@ -810,6 +810,7 @@ def _record_unit(
     enclosing_class_start: Optional[int] = None,
     receiver_kind: Optional[str] = None,
     is_static: bool = False,
+    is_async: bool = False,
 ) -> None:
     """Records an AST unit if it satisfies thresholds and is not suppressed by inline comments."""
     if file_lines and check_inline_suppression(file_lines, start, end):
@@ -909,6 +910,7 @@ def _record_unit(
                 "enclosing_class_start": enclosing_class_start,
                 "receiver_kind": receiver_kind,
                 "is_static": is_static,
+                "is_async": is_async,
             })
 
 
@@ -933,6 +935,7 @@ def _record_clause_branch(
     enclosing_class_start: Optional[int] = None,
     receiver_kind: Optional[str] = None,
     is_static: bool = False,
+    is_async: bool = False,
 ) -> None:
     """Records an if-branch or except-handler clause if it contains at least 3 statements."""
     if len(body) < 3:
@@ -961,6 +964,7 @@ def _record_clause_branch(
         enclosing_class_start=enclosing_class_start,
         receiver_kind=receiver_kind,
         is_static=is_static,
+        is_async=is_async,
     )
 
 
@@ -984,6 +988,7 @@ def _record_node_unit(
     enclosing_class_start: Optional[int] = None,
     receiver_kind: Optional[str] = None,
     is_static: bool = False,
+    is_async: bool = False,
 ) -> None:
     """Records an AST node unit by extracting its start and end line bounds."""
     start = getattr(node, "lineno", 0)
@@ -1010,6 +1015,7 @@ def _record_node_unit(
         enclosing_class_start=enclosing_class_start,
         receiver_kind=receiver_kind,
         is_static=is_static,
+        is_async=is_async,
     )
 
 
@@ -1217,6 +1223,7 @@ def harvest_file_units(
             decs = getattr(node, "decorator_list", [])
             fn_is_static = any(is_decorator_named(d, "staticmethod") for d in decs)
             fn_is_class_method = any(is_decorator_named(d, "classmethod") for d in decs)
+            fn_is_async = isinstance(node, ast.AsyncFunctionDef)
             is_nested = id(node) in closure_parents
             is_closure = harvest_closures and is_nested
             if is_nested:
@@ -1261,6 +1268,7 @@ def harvest_file_units(
                     enclosing_class_start=enc_class_start,
                     receiver_kind=fn_receiver_kind,
                     is_static=fn_is_static,
+                    is_async=fn_is_async,
                 )
 
             if not functions_only:
@@ -1292,6 +1300,7 @@ def harvest_file_units(
                                 enclosing_class_start=enc_class_start,
                                 receiver_kind=fn_receiver_kind,
                                 is_static=fn_is_static,
+                                is_async=fn_is_async,
                             )
 
             if sliding_window and hasattr(node, "body"):
@@ -1323,6 +1332,7 @@ def harvest_file_units(
                             enclosing_class_start=enc_class_start,
                             receiver_kind=fn_receiver_kind,
                             is_static=fn_is_static,
+                            is_async=fn_is_async,
                         )
 
             if clause_level and hasattr(node, "body"):
@@ -1335,6 +1345,7 @@ def harvest_file_units(
                     e_start: Optional[int] = enc_class_start,
                     r_kind: Optional[str] = fn_receiver_kind,
                     static_fn: bool = fn_is_static,
+                    async_fn: bool = fn_is_async,
                 ) -> None:
                     _record_clause_branch(
                         units,
@@ -1357,6 +1368,7 @@ def harvest_file_units(
                         enclosing_class_start=e_start,
                         receiver_kind=r_kind,
                         is_static=static_fn,
+                        is_async=async_fn,
                     )
 
                 for stmt in _iter_local_nodes(node):

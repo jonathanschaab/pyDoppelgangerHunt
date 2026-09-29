@@ -7,10 +7,15 @@ import builtins
 import logging
 import sys
 import textwrap
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.reporters import extract_unit_source_code
-from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines, split_source_lines
+from pydoppelgangerhunt.fixer.source import (
+    _slice_unit_token_lines,
+    find_enclosing_function_is_async,
+    split_source_lines,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1366,6 +1371,27 @@ def _inspect_unit_scope(
         )
     )
 
+    unit_is_async = unit.get("is_async")
+    if unit_is_async is None:
+        file_path = unit.get("file")
+        s_line = int(unit.get("start") or 1)
+        e_line = int(unit.get("end") or s_line)
+        source_text: Optional[str] = None
+        if "source_lines" in unit and isinstance(unit["source_lines"], (list, tuple)):
+            source_text = "".join(unit["source_lines"])
+        elif file_path:
+            full_path = Path(repo_root) / file_path if repo_root else Path(file_path)
+            if full_path.is_file():
+                try:
+                    source_text = full_path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    source_text = None
+        if source_text:
+            unit_is_async = find_enclosing_function_is_async(source_text, s_line, e_line)
+            unit["is_async"] = unit_is_async
+        else:
+            unit_is_async = False
+
     return {
         "inputs": inputs,
         "outputs": outputs,
@@ -1386,7 +1412,7 @@ def _inspect_unit_scope(
         "has_mangled_names": visitor.has_mangled_names,
         "local_imports": visitor.local_imports,
         "yield_expr_names": visitor.yield_expr_names,
-        "is_async": visitor.is_async or bool(unit.get("is_async")),
+        "is_async": visitor.is_async or bool(unit_is_async),
         "conditional_outputs": conditional_outputs,
         "definite_stores": sorted(def_assigned),
         "has_instance_binding": has_instance_binding,
