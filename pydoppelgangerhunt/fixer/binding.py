@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import logging
 import os
 import re
 from pathlib import Path
@@ -24,8 +23,6 @@ from pydoppelgangerhunt.fixer.scope import (
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
 )
 from pydoppelgangerhunt.fixer.source import split_source_lines
-
-logger = logging.getLogger(__name__)
 
 __all__ = [
     "GeneratorCloneSideData",

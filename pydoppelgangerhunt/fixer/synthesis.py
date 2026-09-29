@@ -369,6 +369,8 @@ def _infer_helper_return_type(
     *,
     type_merge_strategy: str = "fallback_any",
     is_async: bool = False,
+    is_subroutine: Optional[bool] = None,
+    unit: Optional[Dict[str, Any]] = None,
     unit_kind: Optional[str] = None,
     outputs2: Optional[List[str]] = None,
 ) -> str:
@@ -461,11 +463,14 @@ def _infer_helper_return_type(
 
         return f"AsyncIterator[{yield_t}]"
 
-    is_sub = (
-        is_subroutine_unit({"kind": unit_kind})
-        if unit_kind
-        else is_subroutine_unit(scope)
-    )
+    if is_subroutine is not None:
+        is_sub = is_subroutine
+    elif unit is not None:
+        is_sub = is_subroutine_unit(unit)
+    elif unit_kind is not None:
+        is_sub = is_subroutine_unit({"kind": unit_kind})
+    else:
+        is_sub = False
     if not is_sub and resolved_ret not in ("Any", "None"):
         return resolved_ret
 
@@ -752,7 +757,13 @@ def synthesize_shared_helper_code(
     has_yield = bool(
         scope.get("has_yield") or scope1.get("has_yield") or scope2.get("has_yield")
     )
-    if has_yield and is_subroutine_unit(u1):
+    is_sub1 = is_subroutine_unit(u1)
+    is_sub2 = is_subroutine_unit(u2)
+    if has_yield and (is_sub1 != is_sub2):
+        return ""
+    is_sub = is_sub1 if not has_yield else (is_sub1 and is_sub2)
+
+    if has_yield and is_sub:
         resolved_sub_outs = resolve_clone_generator_subroutine_outputs(
             u1=u1,
             u2=u2,
@@ -810,7 +821,8 @@ def synthesize_shared_helper_code(
         meta2,
         type_merge_strategy=type_merge_strategy,
         is_async=is_async,
-        unit_kind=u1.get("kind"),
+        is_subroutine=is_sub,
+        unit=u1,
         outputs2=u2_outs if len(u2_outs) == len(helper_outputs) else None,
     )
 

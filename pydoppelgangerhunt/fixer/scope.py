@@ -1554,6 +1554,7 @@ def analyze_unit_variable_scope(
         )),
     }
 
+
 def dispatch_analyze_unit_variable_scope(
     u1: Dict[str, Any],
     u2: Optional[Dict[str, Any]] = None,

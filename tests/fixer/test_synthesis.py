@@ -18,6 +18,7 @@ from pydoppelgangerhunt import (
     synthesize_shared_helper_code,
 )
 from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
+    _extract_required_typing_imports,
     _format_call_arguments,
     _infer_helper_return_type,
     analyze_unit_variable_scope,
@@ -1355,8 +1356,6 @@ def test_async_generator_with_return_rejected_in_synthesis(tmp_path: Path) -> No
 
 def test_collect_downstream_read_names_scope_and_closure_capture() -> None:
     """Verifies that collect_downstream_read_names captures free variables and immediate class body reads, while respecting shadowed locals."""
-    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
-
     # Case 1: Immediately executed class body (class C: value = x) and closure capture (def inner(): return x)
     code = (
         "def outer(items):\n"
@@ -1410,8 +1409,6 @@ def test_collect_downstream_read_names_scope_and_closure_capture() -> None:
 
 def test_collect_downstream_read_names_positional_and_expression_boundaries() -> None:
     """Verifies same-line boundaries, same-expression, enclosing-expression, and multiline expression reads."""
-    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
-
     # 1. Same-line unit boundary: statement after semicolon
     code_sameline = (
         "def f(items):\n"
@@ -1535,7 +1532,6 @@ def test_resolve_generator_subroutine_outputs_preserves_per_side_necessity_and_s
 
 def test_collect_downstream_read_names_comprehensions_and_walrus() -> None:
     """Verifies that comprehension targets do not pollute enclosing scope and walrus bindings are scoped correctly."""
-    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
 
     # 1. Comprehension inside downstream closure: target variable 'x' is comprehension-local,
     # so 'return x' correctly reads outer 'x' as a free variable
@@ -1726,7 +1722,6 @@ def test_generator_clone_with_yield_from_and_returns(tmp_path: Path) -> None:
 
 def test_collect_downstream_read_names_nonlocal_and_global_declarations() -> None:
     """Verifies that downstream nonlocal declarations are captured as escaping free reads, while globals are excluded."""
-    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
 
     code_nonlocal = (
         "def outer(items):\n"
@@ -1830,7 +1825,6 @@ def test_is_async_generator_with_return_value_policy() -> None:
 
 def test_downstream_read_visitor_aug_assign() -> None:
     """Verifies that augmented assignments downstream of a unit are captured as reads."""
-    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
 
     code = (
         "def compute_running_total(items):\n"
@@ -1865,7 +1859,6 @@ def test_pair_clone_outputs_duplicate_names() -> None:
 
 def test_extract_nested_scope_free_reads_type_annotations() -> None:
     """Verifies that type annotations on parameters and return types in nested functions are captured as free reads."""
-    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
 
     code = (
         "def outer():\n"
@@ -1933,7 +1926,6 @@ def test_pair_clone_outputs_positional_alignment() -> None:
 
 def test_extract_nested_scope_free_reads_outer_scope_shadowing() -> None:
     """Verifies that defaults, decorators, and annotations in nested functions are not wiped by inner local stores."""
-    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
 
     code = (
         "def outer():\n"
@@ -1995,7 +1987,6 @@ def test_infer_outputs_return_type_counterpart_lookup() -> None:
 
 def test_downstream_reads_in_enclosing_class() -> None:
     """Verifies that collect_downstream_read_names traverses statements and methods in an enclosing class."""
-    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
 
     code = (
         "class ProcessingEngine:\n"
@@ -2036,7 +2027,10 @@ def test_caller_unit_dicts_immutable_during_patch(tmp_path: Path) -> None:
     u1_copy = dict(u1)
     u2_copy = dict(u2)
 
-    generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch != ""
 
     assert u1 == u1_copy
     assert u2 == u2_copy
@@ -2093,7 +2087,6 @@ def test_synthesize_shared_helper_code_symmetric_global_filtering(tmp_path: Path
 
 def test_downstream_read_visitor_reaching_definitions_reassigned_variable() -> None:
     """Verifies that reaching definitions clear variables killed by unconditional assignments before reads."""
-    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
 
     # Case 1: Unconditional reassignment kills reaching definition
     code1 = (
@@ -2227,7 +2220,6 @@ def test_pattern_match_variable_bindings_scope() -> None:
 
 def test_same_line_unit_boundaries_semicolon_downstream_resolution() -> None:
     """Verifies that same-line units without column offsets correctly resolve downstream statements after semicolons."""
-    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
 
     code = (
         "def runner():\n"
@@ -2245,7 +2237,6 @@ def test_same_line_unit_boundaries_semicolon_downstream_resolution() -> None:
 
 def test_downstream_read_visitor_try_except_else_kills() -> None:
     """Verifies that exception handler kills do not leak into node.orelse in visit_Try."""
-    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
 
     code = (
         "def worker():\n"
@@ -2265,7 +2256,6 @@ def test_downstream_read_visitor_try_except_else_kills() -> None:
 
 def test_resolve_unit_ast_end_col_multiline_unit_statements() -> None:
     """Verifies that multi-line units ending on a line with multiple statements include all statements up through the line end."""
-    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
 
     code = (
         "def worker():\n"
@@ -2284,7 +2274,6 @@ def test_resolve_unit_ast_end_col_multiline_unit_statements() -> None:
 
 def test_downstream_read_visitor_try_finally_unconditional_kills() -> None:
     """Verifies that unconditional assignments in finally: kill reaching definitions downstream."""
-    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
 
     code_killed = (
         "def worker():\n"
@@ -2316,7 +2305,6 @@ def test_downstream_read_visitor_try_finally_unconditional_kills() -> None:
 
 def test_downstream_read_visitor_try_except_else_joint_kills() -> None:
     """Verifies that reaching definitions are killed only when all try/except/else branches assign."""
-    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
 
     # All branches assign total -> killed downstream
     code_all_killed = (
@@ -2384,7 +2372,6 @@ def test_downstream_read_visitor_try_except_else_joint_kills() -> None:
 
 def test_downstream_read_visitor_chained_with_context_managers() -> None:
     """Verifies that earlier context manager targets kill prior reaching definitions for later items."""
-    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
 
     code = (
         "def worker():\n"
@@ -3072,10 +3059,6 @@ def test_downstream_reads_named_expr_target_is_not_recorded_as_read() -> None:
 
 def test_synthesize_shared_helper_union_yield_type_imports() -> None:
     """Verifies that Union is injected into typing imports when a helper has a union yield type."""
-    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access
-        _extract_required_typing_imports,
-    )
-
     helper_code = (
         "def _shared_helper() -> Iterator[Union[int, str]]:\n"
         "    yield 1\n"
@@ -3083,3 +3066,53 @@ def test_synthesize_shared_helper_union_yield_type_imports() -> None:
     needed = _extract_required_typing_imports(helper_code)
     assert "Iterator" in needed
     assert "Union" in needed
+
+
+def test_downstream_reads_del_bare_name_is_read_not_killed() -> None:
+    """Verifies that bare 'del name' downstream is counted as a read and not added to killed."""
+    src = (
+        "def fn(items):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    del total\n"
+    )
+    unit = {"file": "mod.py", "start": 3, "end": 5, "name": "unit", "kind": "compound_block"}
+    reads = collect_downstream_read_names(src, unit, candidates={"total"})
+    assert reads is not None
+    assert "total" in reads
+
+
+def test_downstream_reads_pre_unit_def_in_if_block() -> None:
+    """Verifies that pre-unit closures defined in nested blocks (if, try, for) are discovered."""
+    src = (
+        "def fn(cond, items):\n"
+        "    if cond:\n"
+        "        def helper():\n"
+        "            return total\n"
+        "    for x in items:\n"
+        "        total = x * 2\n"
+        "        yield x\n"
+        "    helper()\n"
+    )
+    unit = {"file": "mod.py", "start": 5, "end": 7, "name": "unit", "kind": "compound_block"}
+    reads = collect_downstream_read_names(src, unit, candidates={"total"})
+    assert reads is not None
+    assert "total" in reads
+
+
+def test_downstream_reads_pre_unit_lambda_assignment() -> None:
+    """Verifies that pre-unit lambda assignments (cb = lambda: total) are mapped to free reads."""
+    src = (
+        "def fn(items):\n"
+        "    cb = lambda: total\n"
+        "    for x in items:\n"
+        "        total = x * 2\n"
+        "        yield x\n"
+        "    cb()\n"
+    )
+    unit = {"file": "mod.py", "start": 3, "end": 5, "name": "unit", "kind": "compound_block"}
+    reads = collect_downstream_read_names(src, unit, candidates={"total"})
+    assert reads is not None
+    assert "total" in reads

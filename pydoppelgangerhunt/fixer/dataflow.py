@@ -698,8 +698,11 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
 
     def visit_Delete(self, node: ast.Delete) -> None:
         for t in node.targets:
+            for subnode in ast.walk(t):
+                if isinstance(subnode, ast.Name) and isinstance(subnode.ctx, ast.Del):
+                    if self._should_inspect_read(subnode):
+                        self._record_downstream_read(subnode.id)
             self.visit(t)
-        self._record_killed_targets(node.targets)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)
@@ -826,6 +829,63 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             self._record_import_names(node, self.killed)
 
 
+def _collect_pre_unit_closures(
+    scope_node: ast.AST,
+    u_start: int,
+) -> Dict[str, Set[str]]:
+    """Discovers functions and lambdas defined prior to the unit in the same lexical scope."""
+    pre_unit_closures: Dict[str, Set[str]] = {}
+
+    def _walk_stmts(stmts: Iterable[ast.stmt]) -> None:
+        for stmt in stmts:
+            stmt_start = getattr(stmt, "lineno", 0)
+            decorators = getattr(stmt, "decorator_list", [])
+            if decorators:
+                dec_start = min(getattr(d, "lineno", stmt_start) for d in decorators)
+                stmt_start = min(stmt_start, dec_start)
+
+            if stmt_start >= u_start:
+                continue
+
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                pre_unit_closures[stmt.name] = _extract_nested_scope_free_reads(stmt)
+                continue
+
+            if isinstance(stmt, ast.ClassDef):
+                continue
+
+            if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Lambda):
+                free_reads = _extract_nested_scope_free_reads(stmt.value)
+                for target in stmt.targets:
+                    for name in _extract_assigned_names(target):
+                        pre_unit_closures[name] = set(free_reads)
+                continue
+
+            if (
+                isinstance(stmt, ast.AnnAssign)
+                and stmt.value is not None
+                and isinstance(stmt.value, ast.Lambda)
+            ):
+                free_reads = _extract_nested_scope_free_reads(stmt.value)
+                for name in _extract_assigned_names(stmt.target):
+                    pre_unit_closures[name] = set(free_reads)
+                continue
+
+            for attr in ("body", "orelse", "finalbody"):
+                sub_stmts = getattr(stmt, attr, None)
+                if isinstance(sub_stmts, list):
+                    _walk_stmts(sub_stmts)
+
+            for handler in getattr(stmt, "handlers", []):
+                _walk_stmts(getattr(handler, "body", []))
+
+            for case in getattr(stmt, "cases", []):
+                _walk_stmts(getattr(case, "body", []))
+
+    _walk_stmts(getattr(scope_node, "body", []))
+    return pre_unit_closures
+
+
 def collect_downstream_read_names(
     source_text: str,
     unit: Dict[str, Any],
@@ -865,12 +925,7 @@ def collect_downstream_read_names(
                     enclosing_loops.append((l_start, l_end))
 
     # Pre-unit closures with free variables
-    pre_unit_closures: Dict[str, Set[str]] = {}
-    for node in getattr(scope_node, "body", []):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            fn_start = getattr(node, "lineno", 0)
-            if fn_start < u_start:
-                pre_unit_closures[node.name] = _extract_nested_scope_free_reads(node)
+    pre_unit_closures = _collect_pre_unit_closures(scope_node, u_start)
 
     visitor = _DownstreamReadVisitor(
         u_start,
@@ -1016,7 +1071,11 @@ def resolve_clone_generator_subroutine_outputs(
     tree2: Optional[ast.AST] = None,
     repo_root: Optional[str] = None,
 ) -> Optional[Tuple[List[str], List[str]]]:
-    """Resolves output variable bindings for clone generator subroutines across two code units."""
+    """Resolves output variable bindings for clone generator subroutines across two code units.
+
+    Note: When both u1 and u2 supply precomputed 'outputs', this fast path skips downstream read
+    and definiteness checks, assuming caller resolution has already validated output necessity.
+    """
     if (
         isinstance(u1.get("outputs"), (list, tuple, set))
         and isinstance(u2.get("outputs"), (list, tuple, set))

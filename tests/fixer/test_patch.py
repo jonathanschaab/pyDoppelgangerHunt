@@ -13,10 +13,6 @@ from unittest import mock
 
 import pytest
 
-requires_git = pytest.mark.skipif(
-    shutil.which("git") is None, reason="git CLI not available"
-)
-
 from pydoppelgangerhunt import (
     analyze_unit_variable_scope,
     check_units_overlap,
@@ -32,6 +28,10 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     patch as patch_mod,
 )
 from pydoppelgangerhunt.fixer.depgraph import build_module_graph
+
+requires_git = pytest.mark.skipif(
+    shutil.which("git") is None, reason="git CLI not available"
+)
 
 
 def test_audit_tests_parametrize_candidate_detection(tmp_path: Path) -> None:
@@ -7904,6 +7904,7 @@ def test_reporters_precompiled_physical_line_regex_notebook_cells(tmp_path: Path
     assert "\x0c" in lines[1]
 
 
+@requires_git
 def test_generate_refactoring_patch_sync_generator_with_outputs_and_return(tmp_path: Path) -> None:
     """Verifies that refactoring sync generators with outputs generates return in helper and captures via yield from."""
     src1 = (
@@ -8457,3 +8458,172 @@ def test_generate_refactoring_patch_symmetric_global_filtering(tmp_path: Path) -
     assert patch != ""
     assert "return local_var" in patch
     assert "return local_var, global_var" not in patch
+
+
+def test_generate_refactoring_patch_sync_generator_indefinite_loop_var_rejected(
+    tmp_path: Path,
+) -> None:
+    """Verifies that generator clones where downstream reads depend on a loop variable that
+    is not definitely assigned inside the unit (initialization is outside the unit) are rejected."""
+    src1 = (
+        "def f1(items: list[int]):\n"
+        "    x = 0\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    class C:\n"
+        "        value = x\n"
+        "    return C\n"
+    )
+    src2 = (
+        "def f2(items: list[int]):\n"
+        "    x = 0\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    class C:\n"
+        "        value = x\n"
+        "    return C\n"
+    )
+    f1 = tmp_path / "indef1.py"
+    f2 = tmp_path / "indef2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    # Unit starts at line 3 (for x in items: ...), so line 2 (x = 0) is outside the unit!
+    u1 = {"file": str(f1), "start": 3, "end": 4, "name": "f1:for", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 3, "end": 4, "name": "f2:for", "kind": "compound_block"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch == ""
+
+
+@requires_git
+def test_generate_refactoring_patch_sync_generator_with_union_yield_type(
+    tmp_path: Path,
+) -> None:
+    """Verifies that generator clones yielding union types inject Union into typing imports
+    and successfully apply via git."""
+    src1 = (
+        "def produce1(items: tuple[int, str]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        if isinstance(x, int):\n"
+        "            total += x\n"
+        "    yield from items\n"
+        "    return total\n"
+    )
+    src2 = (
+        "def produce2(items: tuple[int, str]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        if isinstance(x, int):\n"
+        "            total += x\n"
+        "    yield from items\n"
+        "    return total\n"
+    )
+    f1 = tmp_path / "u1.py"
+    f2 = tmp_path / "u2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 1, "end": 7, "name": "produce1", "kind": "function"}
+    u2 = {"file": str(f2), "start": 1, "end": 7, "name": "produce2", "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch != ""
+    assert "Union[int, str]" in patch
+    assert "from typing import" in patch
+    assert "Union" in patch
+    assert "Generator" in patch
+
+    eval_script = (
+        "import u1, u2\n"
+        "for mod_name, fn in [('u1', u1.produce1), ('u2', u2.produce2)]:\n"
+        "    gen = fn((10, 'hello'))\n"
+        "    yielded = []\n"
+        "    while True:\n"
+        "        try:\n"
+        "            yielded.append(next(gen))\n"
+        "        except StopIteration as e:\n"
+        "            ret = e.value\n"
+        "            break\n"
+        "    print(f'{mod_name}:{yielded}:{ret}')\n"
+    )
+    before_proc = subprocess.run(
+        [sys.executable, "-c", eval_script],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert before_proc.returncode == 0, f"Original execution failed: {before_proc.stderr}"
+
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True
+    )
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True
+    )
+
+    apply_proc = subprocess.run(
+        ["git", "apply"],
+        input=patch,
+        text=True,
+        cwd=str(tmp_path),
+        capture_output=True,
+        check=False,
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    after_proc = subprocess.run(
+        [sys.executable, "-c", eval_script],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert after_proc.returncode == 0, f"Refactored execution failed: {after_proc.stderr}"
+    assert after_proc.stdout == before_proc.stdout
+
+
+def test_generate_refactoring_patch_mismatched_subroutine_kinds_rejected(
+    tmp_path: Path,
+) -> None:
+    """Verifies that clone pairs where one unit is a block and the other is a
+    whole function are rejected."""
+    src1 = (
+        "def f1(items: list[int]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    return total\n"
+    )
+    src2 = (
+        "def f2(items: list[int]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    return total\n"
+    )
+    f1 = tmp_path / "m1.py"
+    f2 = tmp_path / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    # u1 is a compound block ("f1:for"), u2 is a whole function ("f2")
+    u1 = {"file": str(f1), "start": 2, "end": 5, "name": "f1:for", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 1, "end": 6, "name": "f2", "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch == ""
+
