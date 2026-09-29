@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import logging
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,10 @@ from typing import Any, Dict, List, Tuple
 from unittest import mock
 
 import pytest
+
+requires_git = pytest.mark.skipif(
+    shutil.which("git") is None, reason="git CLI not available"
+)
 
 from pydoppelgangerhunt import (
     analyze_unit_variable_scope,
@@ -7978,6 +7983,7 @@ def test_generate_refactoring_patch_sync_generator_with_outputs_and_return(tmp_p
     assert after_proc.stdout == before_proc.stdout
 
 
+@requires_git
 def test_generate_refactoring_patch_sync_generator_renamed_downstream_outputs(tmp_path: Path) -> None:
     """Verifies that generator clones with distinct renamed outputs map outputs 1-to-1 without returning unassigned variables."""
     src1 = (
@@ -8145,6 +8151,7 @@ def test_generate_refactoring_patch_async_generator_with_bare_return_accepted(tm
     assert "-> AsyncIterator[" in patch
 
 
+@requires_git
 def test_generate_refactoring_patch_sync_generator_classdef_downstream_execution(tmp_path: Path) -> None:
     """Verifies that class bodies executing immediately after a generator unit retain the observed variable."""
     src1 = (
@@ -8253,6 +8260,7 @@ def test_generate_refactoring_patch_async_generator_with_downstream_outputs_reje
     assert patch == ""
 
 
+@requires_git
 def test_generate_refactoring_patch_sync_generator_closure_capture(tmp_path: Path) -> None:
     """Verifies that closure captures downstream retain captured variables in generator return."""
     src1 = (
@@ -8355,7 +8363,7 @@ def test_generate_refactoring_patch_mixed_async_sync_rejected(tmp_path: Path) ->
     u1 = {"file": str(f1), "start": 1, "end": 5, "name": "compute1", "kind": "function", "is_async": True}
     u2 = {"file": str(f2), "start": 1, "end": 5, "name": "compute2", "kind": "function", "is_async": False}
 
-    # 1. Direct synthesis check: verify synthesis.py:577 rejects mixed async parity
+    # 1. Direct synthesis check: verify synthesis rejects mixed async parity
     mixed_helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert mixed_helper == ""
 
@@ -8364,8 +8372,10 @@ def test_generate_refactoring_patch_mixed_async_sync_rejected(tmp_path: Path) ->
     assert sync_helper != ""
     assert "def _shared_compute2" in sync_helper
 
-    # 3. Patch generation check: verify patch.py:2776 rejects mixed async parity
-    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    # 3. Patch generation check: verify patch generation rejects mixed async parity
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
     assert patch == ""
 
     # 4. Mixed async generator vs sync generator: verify rejection
@@ -8383,8 +8393,67 @@ def test_generate_refactoring_patch_mixed_async_sync_rejected(tmp_path: Path) ->
     f_sg = tmp_path / "sg.py"
     f_ag.write_text(src_ag, encoding="utf-8")
     f_sg.write_text(src_sg, encoding="utf-8")
-    u_ag = {"file": str(f_ag), "start": 1, "end": 3, "name": "ag1", "kind": "function", "is_async": True}
-    u_sg = {"file": str(f_sg), "start": 1, "end": 3, "name": "sg2", "kind": "function", "is_async": False}
+    u_ag = {
+        "file": str(f_ag),
+        "start": 1,
+        "end": 3,
+        "name": "ag1",
+        "kind": "function",
+        "is_async": True,
+    }
+    u_sg = {
+        "file": str(f_sg),
+        "start": 1,
+        "end": 3,
+        "name": "sg2",
+        "kind": "function",
+        "is_async": False,
+    }
 
     assert synthesize_shared_helper_code(u_ag, u_sg, repo_root=str(tmp_path)) == ""
-    assert generate_refactoring_patch([(1.0, u_ag, u_sg)], repo_root=str(tmp_path), replace_clones=True) == ""
+    assert generate_refactoring_patch(
+        [(1.0, u_ag, u_sg)], repo_root=str(tmp_path), replace_clones=True
+    ) == ""
+
+
+def test_generate_refactoring_patch_symmetric_global_filtering(tmp_path: Path) -> None:
+    """Verifies generate_refactoring_patch filters globals/nonlocals from u1/u2 outputs."""
+    code = (
+        "global_var = 0\n"
+        "def fn1():\n"
+        "    global global_var\n"
+        "    global_var = 100\n"
+        "    common_calc = 10\n"
+        "    local_var = common_calc + 1\n"
+        "def fn2():\n"
+        "    global global_var\n"
+        "    global_var = 200\n"
+        "    common_calc = 10\n"
+        "    local_var = common_calc + 1\n"
+    )
+    f = tmp_path / "mod.py"
+    f.write_text(code, encoding="utf-8")
+
+    u1 = {
+        "file": str(f),
+        "start": 2,
+        "end": 6,
+        "name": "fn1",
+        "kind": "function",
+        "outputs": ["local_var", "global_var"],
+    }
+    u2 = {
+        "file": str(f),
+        "start": 7,
+        "end": 11,
+        "name": "fn2",
+        "kind": "function",
+        "outputs": ["local_var", "global_var"],
+    }
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch != ""
+    assert "return local_var" in patch
+    assert "return local_var, global_var" not in patch

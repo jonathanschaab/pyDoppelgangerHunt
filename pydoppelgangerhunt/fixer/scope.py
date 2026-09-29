@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import inspect
 import logging
 import sys
 import textwrap
@@ -1553,8 +1554,6 @@ def analyze_unit_variable_scope(
         )),
     }
 
-
-
 def dispatch_analyze_unit_variable_scope(
     u1: Dict[str, Any],
     u2: Optional[Dict[str, Any]] = None,
@@ -1565,7 +1564,16 @@ def dispatch_analyze_unit_variable_scope(
     """Dispatches analyze_unit_variable_scope, honoring active mock patches on pydoppelgangerhunt.fixer."""
     pkg = sys.modules.get("pydoppelgangerhunt.fixer")
     target = getattr(pkg, "analyze_unit_variable_scope", analyze_unit_variable_scope)
+    supports_trees = True
     try:
+        sig = inspect.signature(target)
+        has_var_kw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+        supports_trees = "tree1" in sig.parameters or has_var_kw
+    except (ValueError, TypeError):
+        supports_trees = True
+
+    if supports_trees:
         return target(u1, u2=u2, repo_root=repo_root, tree1=tree1, tree2=tree2)
-    except TypeError:
-        return target(u1, u2=u2, repo_root=repo_root)
+    return target(u1, u2=u2, repo_root=repo_root)

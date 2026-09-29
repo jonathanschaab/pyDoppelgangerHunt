@@ -17,15 +17,8 @@ from pydoppelgangerhunt.fixer.dataflow import (
     is_async_generator_with_return_value,
     resolve_clone_generator_subroutine_outputs,
     resolve_generator_subroutine_outputs,
-    _extract_effective_unit_outputs,
-    _extract_nested_scope_free_reads,
-    _extract_unit_end_col,
     _find_innermost_enclosing_node,
-    _get_valid_unit_bounds,
     _load_unit_file_text,
-    _pair_clone_outputs,
-    _parse_source_tree,
-    _resolve_unit_ast_end_col,
 )
 from pydoppelgangerhunt.fixer.scope import (
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
@@ -43,15 +36,6 @@ __all__ = [
     "is_async_generator_with_return_value",
     "resolve_clone_generator_subroutine_outputs",
     "resolve_generator_subroutine_outputs",
-    "_extract_effective_unit_outputs",
-    "_extract_nested_scope_free_reads",
-    "_extract_unit_end_col",
-    "_find_innermost_enclosing_node",
-    "_get_valid_unit_bounds",
-    "_load_unit_file_text",
-    "_pair_clone_outputs",
-    "_parse_source_tree",
-    "_resolve_unit_ast_end_col",
 ]
 
 

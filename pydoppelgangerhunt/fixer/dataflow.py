@@ -33,6 +33,8 @@ def _load_unit_file_text(
         return f_path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
+
+
 def _parse_source_tree(
     source_text: str,
     tree: Optional[ast.AST] = None,
@@ -557,6 +559,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         candidates: Optional[Set[str]] = None,
         enclosing_loops: Optional[List[Tuple[int, int]]] = None,
         pre_unit_closures: Optional[Dict[str, Set[str]]] = None,
+        pass_mode: str = "after_unit",
     ) -> None:
         super().__init__()
         self.u_start = u_start
@@ -565,6 +568,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self.candidates = candidates
         self.enclosing_loops = enclosing_loops or []
         self.pre_unit_closures = pre_unit_closures or {}
+        self.pass_mode = pass_mode
         self.loaded: Set[str] = set()
         self.killed: Set[str] = set()
 
@@ -606,23 +610,34 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         return any(l_start <= lineno <= l_end for l_start, l_end in self.enclosing_loops)
 
     def _should_inspect_read(self, node: ast.AST) -> bool:
-        return self._is_node_after_unit(node) or self._is_loop_carried(node)
+        if self.pass_mode == "loop_carried":
+            return self._is_loop_carried(node)
+        return self._is_node_after_unit(node)
 
     def _record_killed_targets(self, targets: Iterable[ast.AST]) -> None:
         for t in targets:
-            if self._is_node_after_unit(t) or self._is_loop_carried(t):
+            if self._should_inspect_read(t):
                 for name in _extract_assigned_names(t):
                     if not self._is_in_comp(name):
                         self.killed.add(name)
 
-    def _record_downstream_read(self, name: str) -> None:
+    def _record_downstream_read(
+        self,
+        name: str,
+        visited_closures: Optional[Set[str]] = None,
+    ) -> None:
         if self._is_in_comp(name) or name in self.killed:
             return
         if self.candidates is None or name in self.candidates:
             self.loaded.add(name)
         if name in self.pre_unit_closures:
+            if visited_closures is None:
+                visited_closures = set()
+            if name in visited_closures:
+                return
+            visited_closures.add(name)
             for free_var in self.pre_unit_closures[name]:
-                self._record_downstream_read(free_var)
+                self._record_downstream_read(free_var, visited_closures=visited_closures)
 
     def visit_FunctionDef(
         self,
@@ -688,9 +703,6 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)
-        if isinstance(node.target, ast.Name):
-            if self._should_inspect_read(node):
-                self._record_downstream_read(node.target.id)
 
     def visit_If(self, node: ast.If) -> None:
         self.visit(node.test)
@@ -867,11 +879,27 @@ def collect_downstream_read_names(
         candidates=candidates,
         enclosing_loops=enclosing_loops,
         pre_unit_closures=pre_unit_closures,
+        pass_mode="after_unit",
     )
     for stmt in getattr(scope_node, "body", []):
         visitor.visit(stmt)
 
-    return visitor.loaded
+    loaded = set(visitor.loaded)
+    if enclosing_loops:
+        loop_visitor = _DownstreamReadVisitor(
+            u_start,
+            u_end,
+            u_end_col,
+            candidates=candidates,
+            enclosing_loops=enclosing_loops,
+            pre_unit_closures=pre_unit_closures,
+            pass_mode="loop_carried",
+        )
+        for stmt in getattr(scope_node, "body", []):
+            loop_visitor.visit(stmt)
+        loaded.update(loop_visitor.loaded)
+
+    return loaded
 
 
 def _pair_clone_outputs(

@@ -24,10 +24,13 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     is_subroutine_unit,
     resolve_clone_generator_subroutine_outputs,
 )
-from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=protected-access
+from pydoppelgangerhunt.fixer.binding import (
+    collect_downstream_read_names,
+)
+from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
+    _extract_nested_scope_free_reads,
     _pair_clone_outputs,
     _resolve_unit_ast_end_col,
-    collect_downstream_read_names,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
 
@@ -1843,8 +1846,6 @@ def test_downstream_read_visitor_aug_assign() -> None:
 
 def test_pair_clone_outputs_duplicate_names() -> None:
     """Verifies that _pair_clone_outputs does not raise KeyError on duplicate output names."""
-    from pydoppelgangerhunt.fixer.binding import _pair_clone_outputs  # pylint: disable=import-outside-toplevel
-
     # Equal lengths with duplicates on one side (len(dedup) differs -> common names only)
     pairs1 = _pair_clone_outputs(["a", "b"], ["a", "a"])
     assert pairs1 == [("a", "a")]
@@ -1921,8 +1922,6 @@ def test_patch_subroutine_is_async_propagation(tmp_path: Path) -> None:
 
 def test_pair_clone_outputs_positional_alignment() -> None:
     """Verifies that _pair_clone_outputs preserves 1-to-1 positional order even when variable names collide."""
-    from pydoppelgangerhunt.fixer.binding import _pair_clone_outputs  # pylint: disable=import-outside-toplevel
-
     # Colliding variable names across different semantic positions
     pairs = _pair_clone_outputs(["a", "b"], ["b", "c"])
     assert pairs == [("a", "c"), ("b", "b")]
@@ -2014,8 +2013,6 @@ def test_downstream_reads_in_enclosing_class() -> None:
 
 def test_caller_unit_dicts_immutable_during_patch(tmp_path: Path) -> None:
     """Verifies that generate_refactoring_patch does not mutate caller unit dictionaries in-place."""
-    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch  # pylint: disable=import-outside-toplevel
-
     code1 = (
         "async def fn1():\n"
         "    x = 1\n"
@@ -2033,13 +2030,13 @@ def test_caller_unit_dicts_immutable_during_patch(tmp_path: Path) -> None:
     f1.write_text(code1, encoding="utf-8")
     f2.write_text(code2, encoding="utf-8")
 
-    u1 = {"file": str(f1), "start": 2, "end": 3, "name": "fn1", "kind": "block"}
-    u2 = {"file": str(f2), "start": 2, "end": 3, "name": "fn2", "kind": "block"}
+    u1 = {"file": str(f1), "start": 2, "end": 3, "name": "fn1", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 3, "name": "fn2", "kind": "compound_block"}
 
     u1_copy = dict(u1)
     u2_copy = dict(u2)
 
-    generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=False)
+    generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
 
     assert u1 == u1_copy
     assert u2 == u2_copy
@@ -2051,8 +2048,6 @@ def test_caller_unit_dicts_immutable_during_patch(tmp_path: Path) -> None:
 
 def test_synthesize_shared_helper_code_symmetric_global_filtering(tmp_path: Path) -> None:
     """Verifies that synthesize_shared_helper_code filters globals/nonlocals from both u1 and u2 outputs."""
-    from pydoppelgangerhunt.fixer.synthesis import synthesize_shared_helper_code  # pylint: disable=import-outside-toplevel
-
     code = (
         "global_var = 0\n"
         "def fn1():\n"
@@ -2196,11 +2191,6 @@ def test_infer_helper_return_type_untyped_generator_return_value() -> None:
 @pytest.mark.skipif(sys.version_info < (3, 10), reason="Pattern matching requires Python 3.10+")
 def test_pattern_match_variable_bindings_scope() -> None:
     """Verifies that Python 3.10+ pattern match bindings are recognized as local stores, not escaping reads."""
-    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
-        _extract_nested_scope_free_reads,
-        collect_downstream_read_names,
-    )
-
     code = (
         "def process(val):\n"
         "    match val:\n"
@@ -2422,8 +2412,6 @@ def test_downstream_read_visitor_chained_with_context_managers() -> None:
 
 def test_class_scope_visitor_global_and_nonlocal() -> None:
     """Verifies that global declarations in class bodies are excluded from free reads and class stores."""
-    from pydoppelgangerhunt.fixer.binding import _extract_nested_scope_free_reads  # pylint: disable=import-outside-toplevel
-
     code_global = (
         "class MyClass:\n"
         "    global g_val\n"
@@ -2483,8 +2471,6 @@ def test_infer_outputs_return_type_single_output_precedence() -> None:
 @pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 type_params syntax requires Python 3.12+")
 def test_extract_nested_scope_free_reads_pep695_type_params() -> None:
     """Verifies that PEP 695 type parameter scopes do not treat type vars as free reads."""
-    from pydoppelgangerhunt.fixer.binding import _extract_nested_scope_free_reads  # pylint: disable=import-outside-toplevel
-
     code = (
         "def inner[T: BoundType](val: T) -> T:\n"
         "    return val\n"
@@ -2783,11 +2769,6 @@ def test_split_type_args_nested_bracket_depth() -> None:
 
 def test_except_handler_name_not_treated_as_escaping_free_read() -> None:
     """Verifies ast.ExceptHandler.name is recorded as local store and not an escaping read."""
-    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
-        _extract_nested_scope_free_reads,
-    )
-    import ast  # pylint: disable=import-outside-toplevel
-
     # Nested function with except handler
     func_src = (
         "def nested():\n"
@@ -2858,10 +2839,6 @@ def test_inspect_unit_scope_prioritizes_full_source_text_over_sliced_lines() -> 
 
 def test_resolve_clone_generator_subroutine_outputs_requires_both_outputs() -> None:
     """Verifies resolve_clone_generator_subroutine_outputs requires both sides to have outputs."""
-    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
-        resolve_clone_generator_subroutine_outputs,
-    )
-
     u1 = {"outputs": ["a"], "start": 2, "end": 2}
     u2 = {"start": 2, "end": 2}  # No precomputed outputs
     scope1 = {"outputs": ["a"], "definite_stores": ["a"], "inputs": []}
@@ -2880,10 +2857,6 @@ def test_resolve_clone_generator_subroutine_outputs_requires_both_outputs() -> N
 
 def test_downstream_reads_preserve_exception_alias_reassigned_in_same_handler() -> None:
     """Verifies reassigning an exception alias in handler preserves downstream reads."""
-    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
-        collect_downstream_read_names,
-    )
-
     code = (
         "def process():\n"
         "    try:\n"
@@ -3034,6 +3007,79 @@ def test_return_type_precedence_whole_function_vs_subroutine() -> None:
     assert res_sub == "int"
 
 
+def test_downstream_reads_pre_unit_loop_assign_does_not_kill_post_unit() -> None:
+    """Verifies that pre-unit assignments in enclosing loops do not kill post-unit reads."""
+    src = (
+        "for batch in batches:\n"
+        "    total = 0\n"
+        "    for x in batch:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    print(total)\n"
+    )
+    unit = {"file": "mod.py", "start": 3, "end": 5, "name": "unit", "kind": "compound_block"}
+    reads = collect_downstream_read_names(src, unit, candidates={"total", "x"})
+    assert reads is not None
+    assert "total" in reads
 
 
+def test_downstream_reads_recursive_closure_no_infinite_recursion() -> None:
+    """Verifies that recursive pre-unit closures do not cause infinite recursion."""
+    src = (
+        "def helper(n):\n"
+        "    return helper(n - 1) if n else 0\n"
+        "\n"
+        "x = 1\n"
+        "y = 2\n"
+        "helper(3)\n"
+    )
+    unit = {"file": "mod.py", "start": 4, "end": 5, "name": "unit", "kind": "block"}
+    reads = collect_downstream_read_names(src, unit, candidates={"helper", "x", "y"})
+    assert reads is not None
+    assert "helper" in reads
 
+
+def test_downstream_reads_mutually_recursive_closures_no_recursion_error() -> None:
+    """Verifies that mutually recursive pre-unit closures do not cause recursion errors."""
+    src = (
+        "def foo(n):\n"
+        "    return bar(n - 1) if n else 0\n"
+        "def bar(n):\n"
+        "    return foo(n - 1) if n else 0\n"
+        "\n"
+        "x = 1\n"
+        "y = 2\n"
+        "foo(5)\n"
+    )
+    unit = {"file": "mod.py", "start": 6, "end": 7, "name": "unit", "kind": "block"}
+    reads = collect_downstream_read_names(src, unit, candidates={"foo", "bar", "x", "y"})
+    assert reads is not None
+    assert "foo" in reads
+
+
+def test_downstream_reads_named_expr_target_is_not_recorded_as_read() -> None:
+    """Verifies that walrus expression targets in downstream code are not recorded as reads."""
+    src = (
+        "z = 1\n"
+        "if (z := 42):\n"
+        "    pass\n"
+    )
+    unit = {"file": "mod.py", "start": 1, "end": 1, "name": "unit", "kind": "block"}
+    reads = collect_downstream_read_names(src, unit, candidates={"z"})
+    assert reads is not None
+    assert "z" not in reads
+
+
+def test_synthesize_shared_helper_union_yield_type_imports() -> None:
+    """Verifies that Union is injected into typing imports when a helper has a union yield type."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access
+        _extract_required_typing_imports,
+    )
+
+    helper_code = (
+        "def _shared_helper() -> Iterator[Union[int, str]]:\n"
+        "    yield 1\n"
+    )
+    needed = _extract_required_typing_imports(helper_code)
+    assert "Iterator" in needed
+    assert "Union" in needed

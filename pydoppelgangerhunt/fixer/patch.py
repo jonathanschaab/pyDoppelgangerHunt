@@ -15,18 +15,20 @@ from pydoppelgangerhunt.config import normalize_path_string
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
     _extract_child_indentation,
-    _extract_effective_unit_outputs,
     _get_enclosing_receiver_kind,
     _has_receiver_reference,
     _is_method_of_class,
     _is_same_file_path,
-    _pair_clone_outputs,
     _prune_unshared_receivers,
     _resolve_effective_binding,
     find_enclosing_class,
     find_enclosing_function,
     is_async_generator_with_return_value,
     resolve_clone_generator_subroutine_outputs,
+)
+from pydoppelgangerhunt.fixer.dataflow import (
+    _extract_effective_unit_outputs,
+    _pair_clone_outputs,
 )
 from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
@@ -765,7 +767,6 @@ def _module_imports_target(
 
 
 def _outputs_compatible(
-    target_outs2: Sequence[str],
     outputs: Sequence[str],
     u1_outs: Sequence[str],
     u2_outs: Sequence[str],
@@ -2801,8 +2802,10 @@ def generate_refactoring_patch(
             else:
                 is_static = bool((fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static")))
 
-            s1 = analyze_unit_variable_scope(u1_eff, repo_root=str(root))
-            s2 = analyze_unit_variable_scope(u2_eff, repo_root=str(root))
+            tree1 = f1_plan.parsed_tree
+            tree2 = f2_plan.parsed_tree if f2_plan is not None else tree1
+            s1 = analyze_unit_variable_scope(u1_eff, repo_root=str(root), tree1=tree1)
+            s2 = analyze_unit_variable_scope(u2_eff, repo_root=str(root), tree1=tree2)
             if orig_fn1 and orig_fn1.get("is_async"):
                 s1["is_async"] = True
             if orig_fn2 and orig_fn2.get("is_async"):
@@ -2841,7 +2844,10 @@ def generate_refactoring_patch(
                     continue
 
             if receiver_kinds_differ:
-                if _has_receiver_reference(u1_eff, s1, repo_root=str(root)) or _has_receiver_reference(u2_eff, s2, repo_root=str(root)):
+                if (
+                    _has_receiver_reference(u1_eff, s1, repo_root=str(root))
+                    or _has_receiver_reference(u2_eff, s2, repo_root=str(root))
+                ):
                     continue
 
             effective_binding = _resolve_effective_binding(
@@ -2878,7 +2884,9 @@ def generate_refactoring_patch(
             )
             step = _derive_unit_indent_step(u1, orig_lines, step)
 
-            scope = analyze_unit_variable_scope(u1_eff, u2_eff, repo_root=str(root))
+            scope = analyze_unit_variable_scope(
+                u1_eff, u2_eff, repo_root=str(root), tree1=tree1, tree2=tree2
+            )
             inputs = list(scope.get("inputs", []))
             if effective_binding == "module":
                 inputs = _prune_unshared_receivers(inputs, u1_eff, u2_eff, s1, s2, repo_root=str(root))
@@ -2888,8 +2896,6 @@ def generate_refactoring_patch(
             is_sub = is_subroutine_unit(u1)
             has_yield = bool(s1.get("has_yield") or s2.get("has_yield"))
             if is_sub and has_yield:
-                tree1 = f1_plan.parsed_tree
-                tree2 = f2_plan.parsed_tree if f2_plan is not None else tree1
                 resolved_sub_outs = resolve_clone_generator_subroutine_outputs(
                     u1=u1,
                     u2=u2,
@@ -2927,7 +2933,6 @@ def generate_refactoring_patch(
                 len(t_inputs1) != len(inputs)
                 or len(t_inputs2) != len(inputs)
                 or not _outputs_compatible(
-                    target_outs2,
                     outputs,
                     u1_outs,
                     u2_outs,

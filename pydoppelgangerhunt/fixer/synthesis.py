@@ -13,15 +13,17 @@ from pydoppelgangerhunt.config import normalize_path_string
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
-    _extract_effective_unit_outputs,
     _has_receiver_reference,
     _is_same_file_path,
-    _pair_clone_outputs,
     _populate_unit_receiver_metadata,
     _prune_unshared_receivers,
     _resolve_effective_binding,
     is_async_generator_with_return_value,
     resolve_clone_generator_subroutine_outputs,
+)
+from pydoppelgangerhunt.fixer.dataflow import (
+    _extract_effective_unit_outputs,
+    _pair_clone_outputs,
 )
 from pydoppelgangerhunt.fixer.scope import (
     _normalize_receiver_attrs,
