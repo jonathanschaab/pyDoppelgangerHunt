@@ -620,7 +620,11 @@ def _extract_assigned_names(target: ast.AST) -> List[str]:
 
 
 class _DownstreamReadVisitor(_BaseScopeVisitor):
-    """Walks AST statements in a lexical scope tracking direct and nested free reads."""
+    """Walks AST statements in a lexical scope tracking direct and nested free reads.
+
+    Note: Control-flow kill tracking is a practical must/may approximation,
+    not a full data-flow engine.
+    """
 
     def __init__(
         self,
@@ -642,7 +646,10 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         if lineno > self.u_end:
             return True
         if lineno == self.u_end:
-            return self.u_end_col is not None and getattr(node, "col_offset", 0) >= int(self.u_end_col)
+            return (
+                self.u_end_col is not None
+                and getattr(node, "col_offset", 0) >= int(self.u_end_col)
+            )
         return False
 
     def _record_killed_targets(self, targets: Iterable[ast.AST]) -> None:
@@ -1065,7 +1072,10 @@ def resolve_clone_generator_subroutine_outputs(
         counterpart mismatches prevent safe refactoring.
     """
     if "outputs" in u1 and isinstance(u1["outputs"], (list, tuple, set)):
-        return _extract_effective_unit_outputs(u1, scope1), _extract_effective_unit_outputs(u2, scope2)
+        return (
+            _extract_effective_unit_outputs(u1, scope1),
+            _extract_effective_unit_outputs(u2, scope2),
+        )
 
     u1_raw = _extract_effective_unit_outputs(u1, scope1)
     u2_raw = _extract_effective_unit_outputs(u2, scope2)

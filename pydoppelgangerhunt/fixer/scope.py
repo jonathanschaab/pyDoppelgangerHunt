@@ -54,7 +54,7 @@ def _normalize_receiver_attr_name(
 
 
 def is_subroutine_unit(unit: Dict[str, Any]) -> bool:
-    """Checks whether an AST code unit is a subroutine block rather than a whole function or expression."""
+    """Checks whether an AST code unit is a subroutine block rather than a whole function."""
     unit_kind = str(unit.get("kind") or "")
     if unit_kind in ("compound_block", "sliding_window", "clause_branch"):
         return True

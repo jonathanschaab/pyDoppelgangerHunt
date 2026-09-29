@@ -19,6 +19,12 @@ from pydoppelgangerhunt import (
 )
 from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _format_call_arguments,
+    is_subroutine_unit,
+    resolve_clone_generator_subroutine_outputs,
+)
+from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=protected-access
+    _resolve_unit_ast_end_col,
+    collect_downstream_read_names,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
 
@@ -2494,9 +2500,7 @@ def test_extract_nested_scope_free_reads_pep695_type_params() -> None:
 
 
 def test_is_subroutine_unit_classification() -> None:
-    """Verifies that is_subroutine_unit accurately classifies subroutines vs functions and expressions."""
-    from pydoppelgangerhunt.fixer import is_subroutine_unit  # pylint: disable=import-outside-toplevel
-
+    """Verifies that is_subroutine_unit classifies subroutines vs functions and expressions."""
     # True for compound blocks, sliding windows, and clause branches
     assert is_subroutine_unit({"kind": "compound_block"}) is True
     assert is_subroutine_unit({"kind": "sliding_window"}) is True
@@ -2517,8 +2521,6 @@ def test_is_subroutine_unit_classification() -> None:
 
 def test_resolve_unit_ast_end_col_bounds_validation() -> None:
     """Verifies bounds validation in _resolve_unit_ast_end_col."""
-    from pydoppelgangerhunt.fixer.binding import _resolve_unit_ast_end_col  # pylint: disable=import-outside-toplevel
-
     tree = ast.parse("x = 10\ny = 20\n")
     # Inverted start and end coordinates
     assert _resolve_unit_ast_end_col(tree, {"start": 5, "end": 2}) is None
@@ -2530,10 +2532,10 @@ def test_resolve_unit_ast_end_col_bounds_validation() -> None:
     assert _resolve_unit_ast_end_col(tree, {"start": 1, "end": -1}) is None
 
 
-def test_resolve_clone_generator_subroutine_outputs_precomputed_and_fallback(tmp_path: Path) -> None:
-    """Verifies resolve_clone_generator_subroutine_outputs with precomputed outputs and file fallback."""
-    from pydoppelgangerhunt.fixer import resolve_clone_generator_subroutine_outputs  # pylint: disable=import-outside-toplevel
-
+def test_resolve_clone_generator_subroutine_outputs_precomputed_and_fallback(
+    tmp_path: Path,
+) -> None:
+    """Verifies generator subroutine output resolution with precomputed outputs and fallback."""
     # Case 1: Precomputed outputs present on u1 and u2
     u1_pre = {"outputs": ["a", "b"]}
     u2_pre = {"outputs": ["x", "y"]}
@@ -2581,7 +2583,11 @@ def test_resolve_clone_generator_subroutine_outputs_precomputed_and_fallback(tmp
         "    yield total\n"
         "    print(total, extra)\n"
     )
-    scope1_extra = {"outputs": ["total", "extra"], "definite_stores": ["total", "extra"], "inputs": []}
+    scope1_extra = {
+        "outputs": ["total", "extra"],
+        "definite_stores": ["total", "extra"],
+        "inputs": [],
+    }
     scope2_single = {"outputs": ["other"], "definite_stores": ["other"], "inputs": []}
     res_mismatch = resolve_clone_generator_subroutine_outputs(
         unit1, unit2, scope1_extra, scope2_single, source_text1=src3_extra, source_text2=src2
@@ -2590,9 +2596,7 @@ def test_resolve_clone_generator_subroutine_outputs_precomputed_and_fallback(tmp
 
 
 def test_downstream_read_visitor_record_downstream_read_and_comprehensions() -> None:
-    """Verifies that _record_downstream_read correctly respects comprehension scoping and killed variables."""
-    from pydoppelgangerhunt.fixer.binding import collect_downstream_read_names  # pylint: disable=import-outside-toplevel
-
+    """Verifies that _record_downstream_read respects comprehension scoping and killed variables."""
     code = (
         "def runner():\n"
         "    data = [1, 2, 3]\n"
@@ -2606,7 +2610,9 @@ def test_downstream_read_visitor_record_downstream_read_and_comprehensions() -> 
         "    return total\n"
     )
     unit = {"start": 2, "end": 2}
-    reads = collect_downstream_read_names(code, unit, candidates={"data", "item", "val", "elem", "total"})
+    reads = collect_downstream_read_names(
+        code, unit, candidates={"data", "item", "val", "elem", "total"}
+    )
     assert reads is not None
     assert "data" in reads
     assert "item" not in reads
