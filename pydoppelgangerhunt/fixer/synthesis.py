@@ -274,6 +274,29 @@ def _format_helper_parameters(
     return params
 
 
+def _split_type_args(type_str: str) -> List[str]:
+    """Splits top-level arguments of a generic type string, respecting nested brackets."""
+    if "[" not in type_str or not type_str.endswith("]"):
+        return []
+    inner = type_str.split("[", 1)[1][:-1]
+    args: List[str] = []
+    current: List[str] = []
+    depth = 0
+    for char in inner:
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+        elif char == "," and depth == 0:
+            args.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+    if current:
+        args.append("".join(current).strip())
+    return args
+
+
 def _infer_outputs_return_type(
     helper_outputs: List[str],
     conditional_outs: Set[str],
@@ -315,9 +338,7 @@ def _infer_outputs_return_type(
             "AsyncGenerator[", "AsyncIterator[", "AsyncIterable[",
         )):
             if resolved_ret.startswith("Generator[") and resolved_ret.endswith("]"):
-                parts = [
-                    p.strip() for p in resolved_ret.split("[", 1)[1][:-1].split(",")
-                ]
+                parts = _split_type_args(resolved_ret)
                 fallback = parts[2] if len(parts) >= 3 else "Any"
             else:
                 fallback = "Any"
@@ -365,9 +386,7 @@ def _infer_helper_return_type(
             resolved_ret.startswith(("Iterator[", "Iterable[", "Generator["))
             and resolved_ret.endswith("]")
         ):
-            inner_parts = [
-                p.strip() for p in resolved_ret.split("[", 1)[1][:-1].split(",")
-            ]
+            inner_parts = _split_type_args(resolved_ret)
             if inner_parts:
                 inferred_yield_type = inner_parts[0]
             if resolved_ret.startswith("Generator[") and len(inner_parts) >= 3:
@@ -391,10 +410,9 @@ def _infer_helper_return_type(
                         "sequence[", "iterable[", "iterator[",
                     ):
                         if m_t.startswith(prefix) and m_t.endswith("]"):
-                            inner = m_t[len(prefix) : -1].strip()
-                            if "," in inner:
-                                inner = inner.split(",")[0].strip()
-                            inferred_yield_type = inner
+                            parts = _split_type_args(m_t)
+                            if parts:
+                                inferred_yield_type = parts[0]
                             break
                     if inferred_yield_type:
                         break

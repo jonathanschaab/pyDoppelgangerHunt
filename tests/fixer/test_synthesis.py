@@ -2743,5 +2743,142 @@ def test_infer_helper_return_type_generator_with_outputs_and_iterator() -> None:
     assert res_kept == "Iterator[float]"
 
 
+def test_split_type_args_nested_bracket_depth() -> None:
+    """Verifies bracket-depth aware splitting of nested generic type arguments."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _split_type_args,
+        _infer_helper_return_type,
+    )
+
+    # Empty or non-generic strings
+    assert _split_type_args("int") == []
+    assert _split_type_args("") == []
+
+    # Multi-argument nested generic
+    t1 = "Generator[Tuple[int, str], None, Dict[str, Any]]"
+    assert _split_type_args(t1) == ["Tuple[int, str]", "None", "Dict[str, Any]"]
+
+    # Deeply nested generics
+    t2 = "Union[Dict[str, List[int]], Optional[Tuple[float, bool]]]"
+    assert _split_type_args(t2) == [
+        "Dict[str, List[int]]",
+        "Optional[Tuple[float, bool]]",
+    ]
+
+    # Inference in _infer_helper_return_type preserving nested tuple yield type
+    scope = {
+        "has_yield": True,
+        "yield_expr_names": [("yield_from", "stream")],
+        "has_return_value": False,
+    }
+    res = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope=scope,
+        meta1={"stream": {"type": "Iterator[Tuple[int, str]]"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res == "Iterator[Tuple[int, str]]"
+
+
+def test_except_handler_name_not_treated_as_escaping_free_read() -> None:
+    """Verifies ast.ExceptHandler.name is recorded as local store and not an escaping read."""
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
+        _extract_nested_scope_free_reads,
+    )
+    import ast  # pylint: disable=import-outside-toplevel
+
+    # Nested function with except handler
+    func_src = (
+        "def nested():\n"
+        "    try:\n"
+        "        pass\n"
+        "    except Exception as err:\n"
+        "        return str(err)\n"
+    )
+    node = ast.parse(func_src).body[0]
+    assert isinstance(node, ast.FunctionDef)
+    free = _extract_nested_scope_free_reads(node)
+    assert "err" not in free
+
+    # Nested class with except handler in body
+    cls_src = (
+        "class NestedClass:\n"
+        "    try:\n"
+        "        pass\n"
+        "    except Exception as err:\n"
+        "        err_msg = str(err)\n"
+    )
+    cls_node = ast.parse(cls_src).body[0]
+    assert isinstance(cls_node, ast.ClassDef)
+    cls_free = _extract_nested_scope_free_reads(cls_node)
+    assert "err" not in cls_free
+
+
+def test_analyze_unit_variable_scope_does_not_mutate_caller_unit() -> None:
+    """Verifies analyze_unit_variable_scope does not mutate the passed unit dictionary in-place."""
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        analyze_unit_variable_scope,
+    )
+
+    unit = {
+        "start": 2,
+        "end": 3,
+        "source_lines": ["def sample():\n", "    x = 1\n", "    return x\n"],
+    }
+    original_keys = set(unit.keys())
+    res = analyze_unit_variable_scope(unit)
+    assert "is_async" in res
+    assert set(unit.keys()) == original_keys
+    assert "is_async" not in unit
+
+
+def test_inspect_unit_scope_prioritizes_full_source_text_over_sliced_lines() -> None:
+    """Verifies full source text is prioritized over sliced unit lines to resolve async status."""
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        analyze_unit_variable_scope,
+    )
+
+    full_text = (
+        "async def async_worker(items):\n"
+        "    total = 0\n"
+        "    for item in items:\n"
+        "        total += item\n"
+        "    return total\n"
+    )
+    unit = {
+        "start": 3,
+        "end": 4,
+        "source_lines": ["    for item in items:\n", "        total += item\n"],
+        "source_text": full_text,
+    }
+    scope = analyze_unit_variable_scope(unit)
+    assert scope["is_async"] is True
+
+
+def test_resolve_clone_generator_subroutine_outputs_requires_both_outputs() -> None:
+    """Verifies resolve_clone_generator_subroutine_outputs requires both sides to have outputs."""
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
+        resolve_clone_generator_subroutine_outputs,
+    )
+
+    u1 = {"outputs": ["a"], "start": 2, "end": 2}
+    u2 = {"start": 2, "end": 2}  # No precomputed outputs
+    scope1 = {"outputs": ["a"], "definite_stores": ["a"], "inputs": []}
+    scope2 = {"outputs": ["b"], "definite_stores": ["b"], "inputs": []}
+
+    src1 = "def f1():\n    a = 1\n    return a\n"
+    src2 = "def f2():\n    b = 2\n    return b\n"
+    res = resolve_clone_generator_subroutine_outputs(
+        u1, u2, scope1, scope2, source_text1=src1, source_text2=src2
+    )
+    assert res is not None
+    outs1, outs2 = res
+    assert outs1 == ["a"]
+    assert outs2 == ["b"]
+
+
 
 

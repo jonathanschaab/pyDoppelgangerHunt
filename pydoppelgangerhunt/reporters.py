@@ -55,6 +55,11 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
     if source_lines is not None and isinstance(source_lines, (list, tuple)):
         if not source_lines:
             return placeholder
+        if len(source_lines) == (e_d - s_d + 1) and s_d > 1:
+            return [
+                ln if ln.endswith("\n") else ln + "\n"
+                for ln in source_lines
+            ]
         start = max(1, s_d)
         end = min(len(source_lines), int(unit.get("end") or len(source_lines)))
         return [

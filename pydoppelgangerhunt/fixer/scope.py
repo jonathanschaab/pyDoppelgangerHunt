@@ -1376,19 +1376,24 @@ def _inspect_unit_scope(
         file_path = unit.get("file")
         s_line = int(unit.get("start") or 1)
         e_line = int(unit.get("end") or s_line)
-        source_text: Optional[str] = None
-        if "source_lines" in unit and isinstance(unit["source_lines"], (list, tuple)):
-            source_text = "".join(unit["source_lines"])
-        elif file_path:
+        source_text: Optional[str] = (
+            unit.get("source_text") or unit.get("file_source")
+        )
+        if source_text is None and file_path:
             full_path = Path(repo_root) / file_path if repo_root else Path(file_path)
             if full_path.is_file():
                 try:
                     source_text = full_path.read_text(encoding="utf-8")
                 except (OSError, UnicodeDecodeError):
                     source_text = None
+        if (
+            source_text is None
+            and "source_lines" in unit
+            and isinstance(unit["source_lines"], (list, tuple))
+        ):
+            source_text = "".join(unit["source_lines"])
         if source_text:
             unit_is_async = find_enclosing_function_is_async(source_text, s_line, e_line)
-            unit["is_async"] = unit_is_async
         else:
             unit_is_async = False
 

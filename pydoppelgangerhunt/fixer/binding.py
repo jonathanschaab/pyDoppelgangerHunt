@@ -424,6 +424,11 @@ class _FuncScopeVisitor(_BaseScopeVisitor):
     def visit_MatchAs(self, node: ast.AST) -> None:
         self._record_pattern_binding(node, self.local_stores)
 
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.name and not self._is_in_comp(node.name):
+            self.local_stores.add(node.name)
+        self.generic_visit(node)
+
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Store):
             if not self._is_in_comp(node.id):
@@ -478,6 +483,11 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         self._visit_nested_lambda(node, self.free_reads)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.name:
+            self._record_class_store(node.name)
+        self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
@@ -1090,7 +1100,12 @@ def resolve_clone_generator_subroutine_outputs(
         A tuple of (outputs_side1, outputs_side2) if compatible; None if output
         counterpart mismatches prevent safe refactoring.
     """
-    if "outputs" in u1 and isinstance(u1["outputs"], (list, tuple, set)):
+    if (
+        "outputs" in u1
+        and isinstance(u1["outputs"], (list, tuple, set))
+        and "outputs" in u2
+        and isinstance(u2["outputs"], (list, tuple, set))
+    ):
         return (
             _extract_effective_unit_outputs(u1, scope1),
             _extract_effective_unit_outputs(u2, scope2),
