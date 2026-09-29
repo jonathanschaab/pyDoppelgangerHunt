@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
+import pytest
+
 from pydoppelgangerhunt import (
     check_units_overlap,
     extract_unit_source_code,
@@ -2188,6 +2190,7 @@ def test_infer_helper_return_type_untyped_generator_return_value() -> None:
     assert ret_t == "Generator[int, None, Any]"
 
 
+@pytest.mark.skipif(sys.version_info < (3, 10), reason="Pattern matching requires Python 3.10+")
 def test_pattern_match_variable_bindings_scope() -> None:
     """Verifies that Python 3.10+ pattern match bindings are recognized as local stores, not escaping reads."""
     from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
