@@ -122,6 +122,7 @@ __all__ = [
     "UnitCollisionError",
     "UnitDict",
     "UnitSpan",
+    "_extract_required_typing_imports",
     "analyze_unit_variable_scope",
     "build_module_graph",
     "check_units_overlap",

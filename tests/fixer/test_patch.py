@@ -8627,3 +8627,35 @@ def test_generate_refactoring_patch_mismatched_subroutine_kinds_rejected(
     )
     assert patch == ""
 
+
+def test_generate_refactoring_patch_non_generator_mismatched_kinds_rejected(
+    tmp_path: Path,
+) -> None:
+    """Verifies that non-generator clone pairs where one unit is a block and the other is a
+    whole function are unconditionally rejected."""
+    src1 = (
+        "def f1(items: list[int]) -> int:\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "    return total\n"
+    )
+    src2 = (
+        "def f2(items: list[int]) -> int:\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "    return total\n"
+    )
+    f1 = tmp_path / "ng1.py"
+    f2 = tmp_path / "ng2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 2, "end": 4, "name": "f1:for", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 1, "end": 5, "name": "f2", "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch == ""

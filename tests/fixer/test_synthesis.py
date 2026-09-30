@@ -25,13 +25,11 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     is_subroutine_unit,
     resolve_clone_generator_subroutine_outputs,
 )
-from pydoppelgangerhunt.fixer.binding import (
-    collect_downstream_read_names,
-)
 from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
     _extract_nested_scope_free_reads,
     _pair_clone_outputs,
     _resolve_unit_ast_end_col,
+    collect_downstream_read_names,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
 
@@ -2785,10 +2783,6 @@ def test_except_handler_name_not_treated_as_escaping_free_read() -> None:
 
 def test_analyze_unit_variable_scope_does_not_mutate_caller_unit() -> None:
     """Verifies analyze_unit_variable_scope does not mutate the passed unit dictionary in-place."""
-    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
-        analyze_unit_variable_scope,
-    )
-
     unit = {
         "start": 2,
         "end": 3,
@@ -2803,10 +2797,6 @@ def test_analyze_unit_variable_scope_does_not_mutate_caller_unit() -> None:
 
 def test_inspect_unit_scope_prioritizes_full_source_text_over_sliced_lines() -> None:
     """Verifies full source text is prioritized over sliced unit lines to resolve async status."""
-    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
-        analyze_unit_variable_scope,
-    )
-
     full_text = (
         "async def async_worker(items):\n"
         "    total = 0\n"
@@ -2874,10 +2864,6 @@ def test_downstream_reads_preserve_exception_alias_reassigned_in_same_handler() 
 
 def test_infer_helper_return_type_yield_from_tuples() -> None:
     """Verifies that yield_from on Tuple types infers Union or homogeneous element types."""
-    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
-        _infer_helper_return_type,
-    )
-
     scope = {
         "has_yield": True,
         "yield_expr_names": [("yield_from", "stream")],
@@ -2910,10 +2896,6 @@ def test_infer_helper_return_type_yield_from_tuples() -> None:
 
 def test_collect_downstream_read_names_loop_carried_dependence() -> None:
     """Verifies that reads earlier in an enclosing loop body are captured as downstream reads."""
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
-        collect_downstream_read_names,
-    )
-
     code = (
         "def process_batches(batches):\n"
         "    total = 0\n"
@@ -2933,10 +2915,6 @@ def test_collect_downstream_read_names_loop_carried_dependence() -> None:
 def test_collect_downstream_read_names_try_finally_exceptional_path() -> None:
     """Verifies that try body stores do not kill variables in finally block across
     exceptional paths."""
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
-        collect_downstream_read_names,
-    )
-
     code = (
         "def run_transaction():\n"
         "    total = 10\n"
@@ -2957,10 +2935,6 @@ def test_collect_downstream_read_names_try_finally_exceptional_path() -> None:
 def test_return_type_precedence_whole_function_vs_subroutine() -> None:
     """Verifies that whole-function units preserve declared return type over inferred
     local store."""
-    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
-        _infer_helper_return_type,
-    )
-
     scope = {
         "has_yield": False,
         "has_return": True,
@@ -3042,6 +3016,7 @@ def test_downstream_reads_mutually_recursive_closures_no_recursion_error() -> No
     reads = collect_downstream_read_names(src, unit, candidates={"foo", "bar", "x", "y"})
     assert reads is not None
     assert "foo" in reads
+    assert "bar" in reads
 
 
 def test_downstream_reads_named_expr_target_is_not_recorded_as_read() -> None:
@@ -3116,3 +3091,72 @@ def test_downstream_reads_pre_unit_lambda_assignment() -> None:
     reads = collect_downstream_read_names(src, unit, candidates={"total"})
     assert reads is not None
     assert "total" in reads
+
+
+def test_downstream_reads_pre_unit_loop_assign_inside_def_exercises_innermost_node() -> None:
+    """Verifies that pre-unit loop assignments inside a function do not kill post-unit reads,
+    exercising _find_innermost_enclosing_node."""
+    src = (
+        "def process(batches):\n"
+        "    for batch in batches:\n"
+        "        total = 0\n"
+        "        for x in batch:\n"
+        "            total += x\n"
+        "            yield x\n"
+        "        print(total)\n"
+    )
+    unit = {"file": "mod.py", "start": 4, "end": 6, "name": "unit", "kind": "compound_block"}
+    reads = collect_downstream_read_names(src, unit, candidates={"total", "x"})
+    assert reads is not None
+    assert "total" in reads
+
+
+def test_downstream_reads_class_method_deferred_read() -> None:
+    """Verifies that class methods defined prior to a unit are mapped to their deferred
+    free reads when the class is instantiated or called downstream."""
+    src = (
+        "class K:\n"
+        "    def m(self):\n"
+        "        return total\n"
+        "\n"
+        "for x in items:\n"
+        "    total = x\n"
+        "    yield x\n"
+        "K().m()\n"
+    )
+    unit = {"file": "mod.py", "start": 5, "end": 7, "name": "unit", "kind": "compound_block"}
+    reads = collect_downstream_read_names(src, unit, candidates={"total"})
+    assert reads is not None
+    assert "total" in reads
+
+
+def test_synthesize_shared_helper_code_comprehension_unit_return_type_any(
+    tmp_path: Path,
+) -> None:
+    """Verifies that comprehension units with no explicit return type synthesize -> Any."""
+    src = (
+        "def f(items):\n"
+        "    return [x * 2 for x in items]\n"
+        "\n"
+        "def g(items):\n"
+        "    return [x * 2 for x in items]\n"
+    )
+    f_path = tmp_path / "comp_mod.py"
+    f_path.write_text(src, encoding="utf-8")
+    u1 = {
+        "name": "f:listcomp",
+        "file": str(f_path),
+        "start": 2,
+        "end": 2,
+        "kind": "comprehension",
+    }
+    u2 = {
+        "name": "g:listcomp",
+        "file": str(f_path),
+        "start": 5,
+        "end": 5,
+        "kind": "comprehension",
+    }
+    code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "-> Any:" in code
+    assert "-> None:" not in code

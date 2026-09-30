@@ -180,7 +180,13 @@ def test_fixer_control_flow_and_side_effect_safety(tmp_path: Path) -> None:
         '    return a + b\n',
         encoding="utf-8",
     )
-    u_patch1 = {"file": str(file_target), "start": 5, "end": 6, "name": "run_step"}
+    u_patch1 = {
+        "file": str(file_target),
+        "start": 5,
+        "end": 6,
+        "name": "run_step:stmts",
+        "kind": "sliding_window",
+    }
     patch = generate_refactoring_patch([(0.95, u_mut, u_patch1)], repo_root=str(tmp_path))
     assert "+from typing import" in patch
     assert "Tuple" in patch

@@ -463,12 +463,15 @@ def _infer_helper_return_type(
 
         return f"AsyncIterator[{yield_t}]"
 
+    effective_unit_kind = unit_kind if unit_kind is not None else (
+        unit.get("kind") if unit is not None else None
+    )
     if is_subroutine is not None:
         is_sub = is_subroutine
     elif unit is not None:
         is_sub = is_subroutine_unit(unit)
-    elif unit_kind is not None:
-        is_sub = is_subroutine_unit({"kind": unit_kind})
+    elif effective_unit_kind is not None:
+        is_sub = is_subroutine_unit({"kind": effective_unit_kind})
     else:
         is_sub = False
     if not is_sub and resolved_ret not in ("Any", "None"):
@@ -487,7 +490,7 @@ def _infer_helper_return_type(
         return outputs_ret
 
     if not helper_outputs and not scope.get("has_return") and resolved_ret == "Any":
-        return "Any" if unit_kind in ("comprehension", "complex_expr") else "None"
+        return "Any" if effective_unit_kind in ("comprehension", "complex_expr") else "None"
 
     return resolved_ret
 
@@ -759,9 +762,9 @@ def synthesize_shared_helper_code(
     )
     is_sub1 = is_subroutine_unit(u1)
     is_sub2 = is_subroutine_unit(u2)
-    if has_yield and (is_sub1 != is_sub2):
+    if is_sub1 != is_sub2:
         return ""
-    is_sub = is_sub1 if not has_yield else (is_sub1 and is_sub2)
+    is_sub = is_sub1
 
     if has_yield and is_sub:
         resolved_sub_outs = resolve_clone_generator_subroutine_outputs(
@@ -823,6 +826,7 @@ def synthesize_shared_helper_code(
         is_async=is_async,
         is_subroutine=is_sub,
         unit=u1,
+        unit_kind=u1.get("kind"),
         outputs2=u2_outs if len(u2_outs) == len(helper_outputs) else None,
     )
 

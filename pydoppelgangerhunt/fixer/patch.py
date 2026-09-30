@@ -2895,10 +2895,9 @@ def generate_refactoring_patch(
             u2_outs = _extract_effective_unit_outputs(u2, s2)
             is_sub1 = is_subroutine_unit(u1)
             is_sub2 = is_subroutine_unit(u2)
-            has_yield = bool(s1.get("has_yield") or s2.get("has_yield"))
-            if has_yield and (is_sub1 != is_sub2):
+            if is_sub1 != is_sub2:
                 logger.debug(
-                    "Skipping clone pair (%s, %s): mismatched subroutine kinds for generator "
+                    "Skipping clone pair (%s, %s): mismatched subroutine kinds "
                     "(is_sub1=%s, is_sub2=%s)",
                     u1.get("name"),
                     u2.get("name"),
@@ -2906,7 +2905,8 @@ def generate_refactoring_patch(
                     is_sub2,
                 )
                 continue
-            is_sub = is_sub1 if not has_yield else (is_sub1 and is_sub2)
+            is_sub = is_sub1
+            has_yield = bool(s1.get("has_yield") or s2.get("has_yield"))
             if is_sub and has_yield:
                 resolved_sub_outs = resolve_clone_generator_subroutine_outputs(
                     u1=u1,
