@@ -3075,8 +3075,8 @@ def test_downstream_reads_pre_unit_loop_assign_inside_def_exercises_innermost_no
 
 
 def test_downstream_reads_class_method_deferred_read() -> None:
-    """Verifies that class methods defined prior to a unit are mapped to their deferred
-    free reads when the class is instantiated or called downstream."""
+    """Verifies that pre-unit class methods capturing candidate variables have their free
+    reads preserved directly under the blanket pre-unit rule."""
     src = (
         "class K:\n"
         "    def m(self):\n"

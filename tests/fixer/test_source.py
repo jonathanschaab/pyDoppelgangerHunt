@@ -567,4 +567,3 @@ def test_find_enclosing_function_is_async_decorated() -> None:
         "    return x * 2\n"
     )
     assert find_enclosing_function_is_async(sync_src, start_line=1, end_line=3) is False
-

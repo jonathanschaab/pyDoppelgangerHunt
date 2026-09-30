@@ -1433,15 +1433,9 @@ def analyze_unit_variable_scope(
     repo_root: Optional[str] = None,
     tree1: Optional[ast.AST] = None,
     tree2: Optional[ast.AST] = None,
-    tree: Optional[ast.AST] = None,
 ) -> Dict[str, Any]:
-    """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes.
-
-    When analyzing a single unit (u2 is None), 'tree' may be passed as a readable alias
-    for 'tree1'.
-    """
-    effective_tree1 = tree1 if tree1 is not None else tree
-    info1 = _inspect_unit_scope(u1, repo_root=repo_root, file_tree=effective_tree1)
+    """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
+    info1 = _inspect_unit_scope(u1, repo_root=repo_root, file_tree=tree1)
     if u2 is not None:
         info2 = _inspect_unit_scope(u2, repo_root=repo_root, file_tree=tree2)
         common_inputs = [var for var in info1["inputs"] if var in info2["inputs"]]
@@ -1567,31 +1561,20 @@ def dispatch_analyze_unit_variable_scope(
     repo_root: Optional[str] = None,
     tree1: Optional[ast.AST] = None,
     tree2: Optional[ast.AST] = None,
-    tree: Optional[ast.AST] = None,
 ) -> Dict[str, Any]:
     """Dispatches analyze_unit_variable_scope, honoring active mock patches on pydoppelgangerhunt.fixer."""
-    effective_tree1 = tree1 if tree1 is not None else tree
     pkg = sys.modules.get("pydoppelgangerhunt.fixer")
     target = getattr(pkg, "analyze_unit_variable_scope", analyze_unit_variable_scope)
     supports_trees = True
-    supports_tree_alias = False
     try:
         sig = inspect.signature(target)
         has_var_kw = any(
             p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
         )
         supports_trees = "tree1" in sig.parameters or has_var_kw
-        supports_tree_alias = "tree" in sig.parameters or has_var_kw
     except (ValueError, TypeError):
         supports_trees = True
-        supports_tree_alias = True
 
     if supports_trees:
-        if supports_tree_alias and tree is not None:
-            return target(
-                u1, u2=u2, repo_root=repo_root, tree1=tree1, tree2=tree2, tree=tree
-            )
-        return target(
-            u1, u2=u2, repo_root=repo_root, tree1=effective_tree1, tree2=tree2
-        )
+        return target(u1, u2=u2, repo_root=repo_root, tree1=tree1, tree2=tree2)
     return target(u1, u2=u2, repo_root=repo_root)

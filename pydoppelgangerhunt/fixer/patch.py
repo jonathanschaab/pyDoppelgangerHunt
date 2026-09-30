@@ -2806,9 +2806,10 @@ def generate_refactoring_patch(
 
             tree1 = f1_plan.parsed_tree
             tree2 = f2_plan.parsed_tree if f2_plan is not None else tree1
-            # When analyzing a single unit, 'tree' aliases 'tree1' for the first positional unit
-            s1 = analyze_unit_variable_scope(u1_eff, repo_root=str(root), tree=tree1)
-            s2 = analyze_unit_variable_scope(u2_eff, repo_root=str(root), tree=tree2)
+            # Analyze each unit's scope individually.
+            # Each unit occupies positional slot u1, so tree1 supplies its corresponding AST.
+            s1 = analyze_unit_variable_scope(u1_eff, repo_root=str(root), tree1=tree1)
+            s2 = analyze_unit_variable_scope(u2_eff, repo_root=str(root), tree1=tree2)
             if orig_fn1 and orig_fn1.get("is_async"):
                 s1["is_async"] = True
             if orig_fn2 and orig_fn2.get("is_async"):
