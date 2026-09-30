@@ -2581,7 +2581,7 @@ def test_conditional_named_expr_does_not_kill_variables() -> None:
 
 
 def test_pair_clone_outputs_swapped_names_and_positional_roles() -> None:
-    """Verifies positional pairing across renamed variable roles and identity on permutations."""
+    """Verifies identity-first pairing for matching variable names and positional pairing for remaining renamed roles."""
     # Equal arity with different names: preserves positional sequence
     pairs_pos = _pair_clone_outputs(["x", "y"], ["b", "a"])
     assert pairs_pos == [("x", "b"), ("y", "a")]

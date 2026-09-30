@@ -558,7 +558,6 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         u_end_col: Optional[int],
         candidates: Optional[Set[str]] = None,
         enclosing_loops: Optional[List[Tuple[int, int]]] = None,
-        pre_unit_closures: Optional[Dict[str, Set[str]]] = None,
         pass_mode: str = "after_unit",
     ) -> None:
         super().__init__()
@@ -567,7 +566,6 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self.u_end_col = u_end_col
         self.candidates = candidates
         self.enclosing_loops = enclosing_loops or []
-        self.pre_unit_closures = pre_unit_closures or {}
         self.pass_mode = pass_mode
         self.loaded: Set[str] = set()
         self.killed: Set[str] = set()
@@ -621,23 +619,11 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
                     if not self._is_in_comp(name):
                         self.killed.add(name)
 
-    def _record_downstream_read(
-        self,
-        name: str,
-        visited_closures: Optional[Set[str]] = None,
-    ) -> None:
+    def _record_downstream_read(self, name: str) -> None:
         if self._is_in_comp(name) or name in self.killed:
             return
         if self.candidates is None or name in self.candidates:
             self.loaded.add(name)
-        if name in self.pre_unit_closures:
-            if visited_closures is None:
-                visited_closures = set()
-            if name in visited_closures:
-                return
-            visited_closures.add(name)
-            for free_var in self.pre_unit_closures[name]:
-                self._record_downstream_read(free_var, visited_closures=visited_closures)
 
     def visit_FunctionDef(
         self,
@@ -832,12 +818,18 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
 def _collect_pre_unit_closures(
     scope_node: ast.AST,
     u_start: int,
-) -> Dict[str, Set[str]]:
-    """Discovers functions, methods, and lambdas defined prior to the unit in the same lexical scope.
+) -> Set[str]:
+    """Discovers free variables captured by functions, class methods, and lambdas defined prior
+    to the unit in the same lexical scope.
 
-    Note: Closure names and single-hop alias references are tracked on a best-effort basis.
+    Scope Boundary:
+    This inspects closures defined before the unit in the same lexical scope to ensure fail-closed
+    safety for escaping closures (e.g. callbacks registered prior to unit execution). Closures
+    defined downstream of the unit are inspected by the normal downstream AST traversal; closures
+    defined in sibling scopes outside the current enclosing scope (e.g. sibling methods in a
+    class) are not inspected.
     """
-    pre_unit_closures: Dict[str, Set[str]] = {}
+    captured_reads: Set[str] = set()
 
     def _walk_stmts(stmts: Iterable[ast.stmt]) -> None:
         for stmt in stmts:
@@ -851,41 +843,20 @@ def _collect_pre_unit_closures(
                 continue
 
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                pre_unit_closures.setdefault(stmt.name, set()).update(
-                    _extract_nested_scope_free_reads(stmt)
-                )
+                captured_reads.update(_extract_nested_scope_free_reads(stmt))
                 continue
 
             if isinstance(stmt, ast.ClassDef):
-                cls_method_reads: Set[str] = set()
                 for item in ast.walk(stmt):
                     if item is not stmt and isinstance(
                         item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
                     ):
-                        cls_method_reads.update(_extract_nested_scope_free_reads(item))
-                if cls_method_reads:
-                    pre_unit_closures.setdefault(stmt.name, set()).update(cls_method_reads)
+                        captured_reads.update(_extract_nested_scope_free_reads(item))
                 continue
 
-            if isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt.value is not None:
-                assign_targets = (
-                    stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
-                )
-                if isinstance(stmt.value, ast.Lambda):
-                    free_reads = _extract_nested_scope_free_reads(stmt.value)
-                    for target in assign_targets:
-                        for name in _extract_assigned_names(target):
-                            pre_unit_closures.setdefault(name, set()).update(free_reads)
-                    continue
-                if isinstance(stmt.value, ast.Call) and isinstance(stmt.value.func, ast.Name):
-                    callee = stmt.value.func.id
-                    if callee in pre_unit_closures:
-                        for target in assign_targets:
-                            for name in _extract_assigned_names(target):
-                                pre_unit_closures.setdefault(name, set()).update(
-                                    pre_unit_closures[callee]
-                                )
-                        continue
+            for subnode in ast.walk(stmt):
+                if isinstance(subnode, ast.Lambda):
+                    captured_reads.update(_extract_nested_scope_free_reads(subnode))
 
             for attr in ("body", "orelse", "finalbody"):
                 sub_stmts = getattr(stmt, attr, None)
@@ -899,7 +870,7 @@ def _collect_pre_unit_closures(
                 _walk_stmts(getattr(case, "body", []))
 
     _walk_stmts(getattr(scope_node, "body", []))
-    return pre_unit_closures
+    return captured_reads
 
 
 def collect_downstream_read_names(
@@ -909,7 +880,16 @@ def collect_downstream_read_names(
     *,
     tree: Optional[ast.AST] = None,
 ) -> Optional[Set[str]]:
-    """Identifies variable names loaded downstream of a unit within its lexical execution scope."""
+    """Identifies variable names loaded downstream of a unit within its lexical execution scope.
+
+    Module-Level Fallback:
+    When a unit is defined at top-level module scope (having no enclosing FunctionDef),
+    `scope_node` defaults to the module AST. All top-level function and class definitions
+    prior to the unit in the module contribute their free global reads into the live candidate
+    set. If an output candidate matches one of these captured names without a definite store
+    beforehand, the generator subroutine will fail the definiteness check and fail closed
+    (skipped during refactoring patch synthesis with a diagnostic DEBUG log).
+    """
     u_start = parse_unit_coord(unit, "start", default=0)
     u_end = parse_unit_coord(unit, "end", default=u_start)
     if u_start <= 0 or u_end <= 0:
@@ -940,8 +920,8 @@ def collect_downstream_read_names(
                 if (l_start, l_end) != (u_start, u_end):
                     enclosing_loops.append((l_start, l_end))
 
-    # Pre-unit closures with free variables
-    pre_unit_closures = _collect_pre_unit_closures(scope_node, u_start)
+    # Free variables captured by pre-unit closures
+    pre_unit_captured_reads = _collect_pre_unit_closures(scope_node, u_start)
 
     visitor = _DownstreamReadVisitor(
         u_start,
@@ -949,7 +929,6 @@ def collect_downstream_read_names(
         u_end_col,
         candidates=candidates,
         enclosing_loops=enclosing_loops,
-        pre_unit_closures=pre_unit_closures,
         pass_mode="after_unit",
     )
     for stmt in getattr(scope_node, "body", []):
@@ -963,21 +942,19 @@ def collect_downstream_read_names(
             u_end_col,
             candidates=candidates,
             enclosing_loops=enclosing_loops,
-            pre_unit_closures=pre_unit_closures,
             pass_mode="loop_carried",
         )
         for stmt in getattr(scope_node, "body", []):
             loop_visitor.visit(stmt)
         loaded.update(loop_visitor.loaded)
 
-    # Any pre-unit closure or lambda capturing an output candidate could escape or be invoked
-    # indirectly (e.g. registered into a callback table prior to unit execution).
+    # Any pre-unit closure, lambda, or class method capturing an output candidate could escape
+    # or be invoked indirectly (e.g. registered into a callback table prior to unit execution).
     # Treat captured candidates as live to ensure fail-closed safety.
-    for free_reads in pre_unit_closures.values():
-        if candidates is not None:
-            loaded.update(free_reads & candidates)
-        else:
-            loaded.update(free_reads)
+    if candidates is not None:
+        loaded.update(pre_unit_captured_reads & candidates)
+    else:
+        loaded.update(pre_unit_captured_reads)
 
     return loaded
 
