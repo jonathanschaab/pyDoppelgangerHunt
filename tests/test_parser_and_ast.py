@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
 
 from pydoppelgangerhunt import (
@@ -640,8 +641,6 @@ def test_cyclomatic_complexity_and_priority() -> None:
 
 def test_jupyter_notebook_harvesting_and_clones(tmp_path: Path) -> None:
     """Test parsing and clone detection on Jupyter notebook (.ipynb) files."""
-    import json
-
     nb_data = {
         "cells": [
             {
@@ -694,7 +693,6 @@ def test_jupyter_notebook_harvesting_and_clones(tmp_path: Path) -> None:
 
 def test_harvest_notebook_async_function_is_async_metadata(tmp_path: Path) -> None:
     """Verifies that harvest_notebook_units records is_async=True for async function nodes."""
-    import json  # pylint: disable=import-outside-toplevel
     nb_data = {
         "cells": [
             {
@@ -1031,7 +1029,6 @@ def test_batch_45_idiom_canonicalizer_and_baseline_legacy(tmp_path: Path) -> Non
     assert len(sw_kinds) >= 1
 
     # 4. Legacy string-list baseline support in load_baseline and prune_baseline
-    import json
     from pydoppelgangerhunt.baseline import load_baseline, prune_baseline
     legacy_file = tmp_path / "legacy_baseline.json"
     legacy_file.write_text(
@@ -1058,7 +1055,6 @@ def test_batch_45_idiom_canonicalizer_and_baseline_legacy(tmp_path: Path) -> Non
 def test_batch_50_parser_and_baseline_deep_hardening(tmp_path: Path) -> None:
     """Batch 50: Test AST canonicalization, scope visitor, decorator inspection, and baseline pruning."""
     # pylint: disable=import-outside-toplevel,protected-access
-    import json
     from typing import Any
     from pydoppelgangerhunt.baseline import prune_baseline
     from pydoppelgangerhunt.parser import (

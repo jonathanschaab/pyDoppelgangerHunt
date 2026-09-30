@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import shutil
 import subprocess
@@ -7884,8 +7885,6 @@ def test_dual_tier_rejection_and_pragma_expanded_catch() -> None:
 
 def test_reporters_precompiled_physical_line_regex_notebook_cells(tmp_path: Path) -> None:
     """Verifies that extract_unit_source_code uses _PHYSICAL_LINE_RE and preserves form feeds."""
-    import json
-    from pydoppelgangerhunt.reporters import extract_unit_source_code
     from pydoppelgangerhunt.source_lines import _PHYSICAL_LINE_RE
 
     assert _PHYSICAL_LINE_RE.pattern == r"[^\r\n]*(?:\r\n|\r|\n|$)"

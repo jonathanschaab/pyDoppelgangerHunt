@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest import mock
@@ -600,8 +602,6 @@ def test_batch_53_cli_method_binding_and_repo_root(tmp_path: Path) -> None:
 def test_batch_55_baseline_prune_repo_root_and_html_reporter(tmp_path: Path) -> None:
     """Batch 55: Test prune_baseline repo_root, generate_html_report repo_root, and deque AST walk."""
     # pylint: disable=import-outside-toplevel
-    import ast
-    from unittest import mock
     from pydoppelgangerhunt.baseline import prune_baseline, record_baseline
     from pydoppelgangerhunt.parser import _walk_ast_nodes
     from pydoppelgangerhunt.reporters import generate_html_report
@@ -1597,7 +1597,6 @@ def test_cli_warns_on_calibration_unit_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Verifies that main() emits a calibration drift warning when repository units drift >= 20% from baseline."""
-    import json  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
 
     repo = tmp_path / "repo_unit_drift"
@@ -1711,7 +1710,6 @@ def test_cli_verbose_flag_and_commit_divergence_reporting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Verifies that -v/--verbose flag is recognized and reports commit differences without AttributeError."""
-    import json  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.cli import build_arg_parser, main  # pylint: disable=import-outside-toplevel
     import pydoppelgangerhunt.cli as cli_mod  # pylint: disable=import-outside-toplevel
 

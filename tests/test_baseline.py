@@ -910,7 +910,6 @@ def test_batch_38_windows_path_case_insensitivity_and_unicode_resilience(tmp_pat
 
 def test_batch_40_notebook_source_code_and_matcher_path_robustness(tmp_path: Any) -> None:
     """Tests Batch 40: notebook cell source extraction, clone diffing, and matcher/baseline path equivalence."""
-    import json
     from pydoppelgangerhunt.baseline import (
         clone_pair_fingerprint,
         clone_pair_structural_fingerprint,
@@ -4560,7 +4559,6 @@ def test_cli_record_baseline_subdirectory_persists_target_repo_relative(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Verifies that CLI --record-baseline on a subdirectory records target_repo_relative."""
-    import json  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
 
     repo_dir = tmp_path / "cli_git_repo"
@@ -5784,9 +5782,6 @@ def test_match_clone_record_pass1_derives_missing_structural_fingerprint() -> No
 
 def test_record_baseline_flat_dictionary_records(tmp_path: Path) -> None:
     """Verifies that record_baseline correctly extracts file_a/b, name_a/b, and hash_a/b from flat dict records."""
-    import json
-    from pydoppelgangerhunt.baseline import record_baseline  # pylint: disable=import-outside-toplevel
-
     baseline_file = tmp_path / "baseline.json"
     flat_record = {
         "similarity": 0.95,

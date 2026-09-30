@@ -27,7 +27,6 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _normalize_file_path,
     analyze_unit_variable_scope,
     is_subroutine_unit,
-    resolve_clone_generator_subroutine_outputs,
 )
 from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
     GeneratorCloneSideData,
@@ -36,6 +35,7 @@ from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-acc
     _resolve_unit_ast_end_col,
     collect_downstream_read_names,
     is_async_generator_with_return_value,
+    resolve_clone_generator_subroutine_outputs,
     resolve_generator_subroutine_outputs,
 )
 from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access
@@ -2956,7 +2956,13 @@ def test_downstream_reads_recursive_closure_no_infinite_recursion() -> None:
 
 
 def test_downstream_reads_mutually_recursive_closures_no_recursion_error() -> None:
-    """Verifies that mutually recursive pre-unit closures do not cause recursion errors."""
+    """Verifies that mutually recursive pre-unit closures do not cause recursion errors.
+
+    Under the blanket pre-unit closure rule, all pre-unit closures' free variables are
+    unioned directly into the candidate read set. Asserting both 'foo' and 'bar' proves
+    that mutual definitions are safely traversed without infinite recursion, though
+    reachability is satisfied directly by the union rather than a transitive walk.
+    """
     src = (
         "def foo(n):\n"
         "    return bar(n - 1) if n else 0\n"
@@ -3033,7 +3039,9 @@ def test_downstream_reads_pre_unit_def_in_if_block() -> None:
 
 
 def test_downstream_reads_pre_unit_lambda_assignment() -> None:
-    """Verifies that pre-unit lambda assignments (cb = lambda: total) are mapped to free reads."""
+    """Verifies that pre-unit lambda assignments (cb = lambda: total) have their captured
+    reads preserved under the blanket pre-unit rule without requiring alias tracking or
+    downstream call resolution."""
     src = (
         "def fn(items):\n"
         "    cb = lambda: total\n"
@@ -3118,8 +3126,8 @@ def test_synthesize_shared_helper_code_comprehension_unit_return_type_any(
 
 
 def test_downstream_reads_class_instance_alias_deferred_read() -> None:
-    """Verifies that an instance alias created prior to a unit correctly triggers
-    deferred free reads when its methods are invoked downstream."""
+    """Verifies that pre-unit class methods capturing candidate variables are preserved
+    by the blanket pre-unit rule regardless of instance aliasing (obj = K())."""
     src = (
         "class K:\n"
         "    def m(self):\n"

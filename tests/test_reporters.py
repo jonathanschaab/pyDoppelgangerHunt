@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -703,7 +704,6 @@ def test_extract_unit_source_code_rejects_global_tempdir_when_repo_root_omitted(
 
 def test_extract_unit_source_code_uppercase_notebook_and_case_insensitive_cell_anchor(tmp_path: Path) -> None:
     """Verifies that extract_unit_source_code, parser, and config handle uppercase notebooks case-insensitively."""
-    import json
     from pydoppelgangerhunt.config import find_python_files  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.metrics import compute_repository_dry_stats  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.parser import harvest_file_units  # pylint: disable=import-outside-toplevel
@@ -755,7 +755,6 @@ def test_extract_unit_source_code_uppercase_notebook_and_case_insensitive_cell_a
 
 def test_extract_unit_source_code_notebook_with_literal_hash_in_filename(tmp_path: Path) -> None:
     """Verifies that extract_unit_source_code distinguishes literal hashes in filenames from cell anchors."""
-    import json
     from pydoppelgangerhunt.reporters import extract_unit_source_code  # pylint: disable=import-outside-toplevel
 
     nb_file = tmp_path / "report#cellular.ipynb"
