@@ -54,7 +54,7 @@ def _get_valid_unit_bounds(unit: Dict[str, Any]) -> Optional[Tuple[int, int]]:
     """Extracts positive start and end line coordinates from a unit dict."""
     u_start = parse_unit_coord(unit, "start", default=0)
     u_end = parse_unit_coord(unit, "end", default=u_start)
-    if u_start <= 0 or u_end <= 0:
+    if u_start <= 0 or u_end <= 0 or u_start > u_end:
         return None
     return u_start, u_end
 
@@ -907,7 +907,7 @@ def collect_downstream_read_names(
     """
     u_start = parse_unit_coord(unit, "start", default=0)
     u_end = parse_unit_coord(unit, "end", default=u_start)
-    if u_start <= 0 or u_end <= 0:
+    if u_start <= 0 or u_end <= 0 or u_start > u_end:
         return None
 
     enc = _find_innermost_enclosing_node(

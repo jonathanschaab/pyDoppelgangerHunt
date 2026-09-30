@@ -3241,3 +3241,11 @@ def test_synthesize_shared_helper_code_unpaired_output_fallback_aligned(
     assert code != ""
     assert "Tuple[int, str]" in code
     assert "return a, b" in code
+
+
+def test_collect_downstream_read_names_inverted_coordinates() -> None:
+    """Verifies that inverted unit coordinates (start > end) safely return None."""
+    src = "x = 1\ny = 2\nz = x + y\n"
+    unit = {"file": "mod.py", "start": 3, "end": 1, "name": "inverted"}
+    reads = collect_downstream_read_names(src, unit, candidates={"x", "y", "z"})
+    assert reads is None
