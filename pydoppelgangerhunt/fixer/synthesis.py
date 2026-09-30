@@ -411,8 +411,8 @@ def _infer_helper_return_type(
                 if kind == "yield_from":
                     for prefix in (
                         "Iterator[", "Iterable[", "List[", "Sequence[", "Set[",
-                        "Tuple[", "Collection[", "list[", "set[", "tuple[",
-                        "sequence[", "iterable[", "iterator[",
+                        "Tuple[", "Dict[", "Collection[", "list[", "set[",
+                        "tuple[", "dict[", "sequence[", "iterable[", "iterator[",
                     ):
                         if m_t.startswith(prefix) and m_t.endswith("]"):
                             parts = _split_type_args(m_t)
@@ -792,6 +792,10 @@ def synthesize_shared_helper_code(
     else:
         outputs = _extract_effective_unit_outputs(u1, scope)
         u2_outs = _extract_effective_unit_outputs(u2, scope2)
+        pairs = _pair_clone_outputs(outputs, u2_outs)
+        if len(pairs) == len(outputs) == len(u2_outs):
+            outputs = [p[0] for p in pairs]
+            u2_outs = [p[1] for p in pairs]
 
     conditional_outs = set(scope.get("conditional_outputs", []))
     is_async = bool(scope.get("is_async", False))

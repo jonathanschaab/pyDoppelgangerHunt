@@ -80,20 +80,31 @@ def _resolve_unit_ast_end_col(
     if u_start <= 0 or u_end <= 0 or u_start > u_end:
         return None
 
-    cand_stmts: List[ast.stmt] = [
-        node for node in ast.walk(scope_node) if isinstance(node, ast.stmt)
-    ]
-    inner_stmts = [
-        s
-        for s in cand_stmts
-        if getattr(s, "end_lineno", getattr(s, "lineno", 0)) == u_end
-        and not any(
-            other is not s
-            and isinstance(other, ast.stmt)
-            and getattr(other, "end_lineno", getattr(other, "lineno", 0)) == u_end
-            for other in ast.walk(s)
-        )
-    ]
+    parent_map: Dict[ast.AST, ast.AST] = {}
+    matching_stmts: List[ast.stmt] = []
+    for parent in ast.walk(scope_node):
+        for child in ast.iter_child_nodes(parent):
+            parent_map[child] = parent
+        if (
+            isinstance(parent, ast.stmt)
+            and getattr(parent, "end_lineno", getattr(parent, "lineno", 0)) == u_end
+        ):
+            matching_stmts.append(parent)
+
+    inner_stmts: List[ast.stmt] = []
+    if matching_stmts:
+        matching_set = set(matching_stmts)
+        non_leaf_stmts: Set[ast.stmt] = set()
+        for s in matching_stmts:
+            curr = parent_map.get(s)
+            while curr is not None:
+                if isinstance(curr, ast.stmt) and curr in matching_set:
+                    if curr in non_leaf_stmts:
+                        break
+                    non_leaf_stmts.add(curr)
+                curr = parent_map.get(curr)
+
+        inner_stmts = [s for s in matching_stmts if s not in non_leaf_stmts]
     if not inner_stmts:
         logger.debug(
             "No statement ending at line %d found in scope; falling back to whole-line",
@@ -851,12 +862,16 @@ def _collect_pre_unit_closures(
                     if item is not stmt and isinstance(
                         item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
                     ):
-                        captured_reads.update(_extract_nested_scope_free_reads(item))
+                        item_start = getattr(item, "lineno", stmt_start)
+                        if item_start < u_start:
+                            captured_reads.update(_extract_nested_scope_free_reads(item))
                 continue
 
             for subnode in ast.walk(stmt):
                 if isinstance(subnode, ast.Lambda):
-                    captured_reads.update(_extract_nested_scope_free_reads(subnode))
+                    sub_lineno = getattr(subnode, "lineno", stmt_start)
+                    if sub_lineno < u_start:
+                        captured_reads.update(_extract_nested_scope_free_reads(subnode))
 
             for attr in ("body", "orelse", "finalbody"):
                 sub_stmts = getattr(stmt, attr, None)

@@ -3183,3 +3183,61 @@ def test_downstream_reads_escaping_closure_registered_before_unit() -> None:
     reads = collect_downstream_read_names(src, unit, candidates={"total"})
     assert reads is not None
     assert "total" in reads
+
+
+def test_downstream_reads_compound_statement_lambda_after_unit_not_pre_captured() -> None:
+    """Verifies that lambdas occurring after u_start inside an enclosing compound statement
+    are not prematurely captured into pre_unit_captured_reads."""
+    src = (
+        "if condition:\n"
+        "    a = 1\n"
+        "    for x in items:\n"
+        "        fn = lambda: total\n"
+        "        total = x * 2\n"
+        "        yield x\n"
+    )
+    unit = {"file": "mod.py", "start": 3, "end": 6, "name": "unit", "kind": "compound_block"}
+    reads = collect_downstream_read_names(src, unit, candidates={"total"})
+    assert reads is not None
+    assert "total" not in reads
+
+
+def test_infer_helper_return_type_yield_from_dict_keys() -> None:
+    """Verifies that yield from on a Dict/dict mapping type infers Iterator[KeyType]."""
+    scope = {"has_yield": True, "yield_expr_names": [("yield_from", "mapping")]}
+    meta1 = {"mapping": {"type": "Dict[str, int]"}}
+    meta2 = {"mapping": {"type": "dict[str, int]"}}
+    ret = _infer_helper_return_type(
+        "Any",
+        [],
+        set(),
+        scope,
+        meta1,
+        meta2,
+    )
+    assert ret == "Iterator[str]"
+
+
+def test_synthesize_shared_helper_code_unpaired_output_fallback_aligned(
+    tmp_path: Path,
+) -> None:
+    """Verifies that the fallback else: branch in synthesize_shared_helper_code aligns
+    u1 and u2 output ordering using _pair_clone_outputs."""
+    src1 = (
+        "def f(a: int, b: str):\n"
+        "    return a, b\n"
+    )
+    src2 = (
+        "def g(b: str, a: int):\n"
+        "    return b, a\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+    u1 = {"file": str(f1), "start": 1, "end": 2, "name": "f", "kind": "function"}
+    u2 = {"file": str(f2), "start": 1, "end": 2, "name": "g", "kind": "function"}
+    code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert code != ""
+    assert "Tuple[int, str]" in code
+    assert "return a, b" in code
