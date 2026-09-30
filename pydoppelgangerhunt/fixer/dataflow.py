@@ -833,7 +833,10 @@ def _collect_pre_unit_closures(
     scope_node: ast.AST,
     u_start: int,
 ) -> Dict[str, Set[str]]:
-    """Discovers functions and lambdas defined prior to the unit in the same lexical scope."""
+    """Discovers functions, methods, and lambdas defined prior to the unit in the same lexical scope.
+
+    Note: Closure names and single-hop alias references are tracked on a best-effort basis.
+    """
     pre_unit_closures: Dict[str, Set[str]] = {}
 
     def _walk_stmts(stmts: Iterable[ast.stmt]) -> None:
@@ -848,7 +851,9 @@ def _collect_pre_unit_closures(
                 continue
 
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                pre_unit_closures[stmt.name] = _extract_nested_scope_free_reads(stmt)
+                pre_unit_closures.setdefault(stmt.name, set()).update(
+                    _extract_nested_scope_free_reads(stmt)
+                )
                 continue
 
             if isinstance(stmt, ast.ClassDef):
@@ -859,38 +864,27 @@ def _collect_pre_unit_closures(
                     ):
                         cls_method_reads.update(_extract_nested_scope_free_reads(item))
                 if cls_method_reads:
-                    pre_unit_closures[stmt.name] = cls_method_reads
+                    pre_unit_closures.setdefault(stmt.name, set()).update(cls_method_reads)
                 continue
 
-            if isinstance(stmt, ast.Assign):
+            if isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt.value is not None:
+                assign_targets = (
+                    stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+                )
                 if isinstance(stmt.value, ast.Lambda):
                     free_reads = _extract_nested_scope_free_reads(stmt.value)
-                    for target in stmt.targets:
+                    for target in assign_targets:
                         for name in _extract_assigned_names(target):
-                            pre_unit_closures[name] = set(free_reads)
+                            pre_unit_closures.setdefault(name, set()).update(free_reads)
                     continue
                 if isinstance(stmt.value, ast.Call) and isinstance(stmt.value.func, ast.Name):
                     callee = stmt.value.func.id
                     if callee in pre_unit_closures:
-                        for target in stmt.targets:
+                        for target in assign_targets:
                             for name in _extract_assigned_names(target):
-                                pre_unit_closures[name] = set(pre_unit_closures[callee])
-                        continue
-
-            if (
-                isinstance(stmt, ast.AnnAssign)
-                and stmt.value is not None
-            ):
-                if isinstance(stmt.value, ast.Lambda):
-                    free_reads = _extract_nested_scope_free_reads(stmt.value)
-                    for name in _extract_assigned_names(stmt.target):
-                        pre_unit_closures[name] = set(free_reads)
-                    continue
-                if isinstance(stmt.value, ast.Call) and isinstance(stmt.value.func, ast.Name):
-                    callee = stmt.value.func.id
-                    if callee in pre_unit_closures:
-                        for name in _extract_assigned_names(stmt.target):
-                            pre_unit_closures[name] = set(pre_unit_closures[callee])
+                                pre_unit_closures.setdefault(name, set()).update(
+                                    pre_unit_closures[callee]
+                                )
                         continue
 
             for attr in ("body", "orelse", "finalbody"):
@@ -975,6 +969,15 @@ def collect_downstream_read_names(
         for stmt in getattr(scope_node, "body", []):
             loop_visitor.visit(stmt)
         loaded.update(loop_visitor.loaded)
+
+    # Any pre-unit closure or lambda capturing an output candidate could escape or be invoked
+    # indirectly (e.g. registered into a callback table prior to unit execution).
+    # Treat captured candidates as live to ensure fail-closed safety.
+    for free_reads in pre_unit_closures.values():
+        if candidates is not None:
+            loaded.update(free_reads & candidates)
+        else:
+            loaded.update(free_reads)
 
     return loaded
 

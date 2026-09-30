@@ -12,24 +12,35 @@ import pytest
 from pydoppelgangerhunt import (
     check_units_overlap,
     extract_unit_source_code,
+    filter_overlapping_clone_units,
     generate_clone_diff,
     generate_refactoring_patch,
     synthesize_refactoring_suggestion,
     synthesize_shared_helper_code,
 )
 from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
+    _base_unit_name,
     _extract_required_typing_imports,
     _format_call_arguments,
     _infer_helper_return_type,
+    _is_same_file_path,
+    _normalize_file_path,
     analyze_unit_variable_scope,
     is_subroutine_unit,
     resolve_clone_generator_subroutine_outputs,
 )
 from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
+    GeneratorCloneSideData,
     _extract_nested_scope_free_reads,
     _pair_clone_outputs,
     _resolve_unit_ast_end_col,
     collect_downstream_read_names,
+    is_async_generator_with_return_value,
+    resolve_generator_subroutine_outputs,
+)
+from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access
+    _infer_outputs_return_type,
+    _split_type_args,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
 
@@ -572,8 +583,6 @@ def test_closures_in_classes_synthesize_module_helper_auto_mode(tmp_path: Path) 
 
 def test_base_unit_name_fallback_for_underscore_or_empty_name() -> None:
     """Verifies that _base_unit_name falls back to 'helper' when unit name has only underscores."""
-    from pydoppelgangerhunt.fixer import _base_unit_name  # pylint: disable=protected-access
-
     assert _base_unit_name({"name": "_", "kind": "function"}) == "helper"
     assert _base_unit_name({"name": "___", "kind": "function"}) == "helper"
     assert _base_unit_name({"name": "", "kind": "function"}) == "helper"
@@ -615,8 +624,6 @@ def test_synthesize_shared_helper_code_body_typing_imports(tmp_path: Path) -> No
 
 def test_defensive_unit_file_and_name_none_handling() -> None:
     """Verifies that units with None or missing file/name attributes are handled without exceptions."""
-    from pydoppelgangerhunt.fixer import filter_overlapping_clone_units  # pylint: disable=import-outside-toplevel
-
     u_none_file: Dict[str, Any] = {"file": None, "start": 1, "end": 5, "name": "test"}
     assert filter_overlapping_clone_units([u_none_file]) == [u_none_file]
     assert not check_units_overlap(u_none_file, {"file": "a.py", "start": 1, "end": 5})
@@ -627,14 +634,6 @@ def test_defensive_unit_file_and_name_none_handling() -> None:
 
 def test_batch_36_path_resolution_and_same_file_matching(tmp_path: Any) -> None:
     """Tests Batch 36: robust path normalization and resolution across duplicate units."""
-    from pydoppelgangerhunt.fixer import (
-        _is_same_file_path,
-        _normalize_file_path,
-        check_units_overlap,
-        filter_overlapping_clone_units,
-        generate_refactoring_patch,
-        synthesize_shared_helper_code,
-    )
 
     # 1. Base string equivalence and anchor handling
     assert not _is_same_file_path("", "foo.py")
@@ -723,10 +722,6 @@ def test_batch_36_path_resolution_and_same_file_matching(tmp_path: Any) -> None:
 
 def test_batch_58_parenthesized_return_and_relative_path_resolution(tmp_path: Path) -> None:
     """Batch 58: Test parenthesized/tabbed return detection and relative path resolution in patch/harvest."""
-    # pylint: disable=import-outside-toplevel
-    from pydoppelgangerhunt.fixer import generate_refactoring_patch, synthesize_shared_helper_code
-    from pydoppelgangerhunt.parser import harvest_file_units
-
     # 1. Test parenthesized return 'return(res)' in synthesize_shared_helper_code
     code_paren = (
         "def compute_paren(val: int) -> int:\n"
@@ -789,8 +784,6 @@ def test_batch_58_parenthesized_return_and_relative_path_resolution(tmp_path: Pa
 
 def test_batch_60_generator_docstring_call_site_and_overlap(tmp_path: Path) -> None:
     """Test generator call site docstring synthesis and check_units_overlap column boundary validation."""
-    from pydoppelgangerhunt.fixer import check_units_overlap, synthesize_shared_helper_code
-
     # 1. Sync generator without return value
     gen_file = tmp_path / "gen_logic.py"
     gen_file.write_text(
@@ -1010,8 +1003,6 @@ def test_type_merge_positional_alignment_renamed_parameters(tmp_path: Path) -> N
 
 def test_infer_helper_return_type_generator_literal_and_explicit_types() -> None:
     """Verifies that _infer_helper_return_type infers literal yield types and preserves explicit annotations."""
-    from pydoppelgangerhunt.fixer import _infer_helper_return_type  # pylint: disable=import-outside-toplevel
-
     # 1. Sync generator with literal integer yield
     scope_int = {"has_yield": True, "yield_expr_names": [("yield", ":literal:int")]}
     res_int = _infer_helper_return_type(
@@ -1075,11 +1066,6 @@ def test_generator_helper_synthesis_literal_yields(tmp_path: Path) -> None:
 
 def test_batch_82_generator_container_literal_and_pep585_return_type_inference(tmp_path: Path) -> None:
     """Verifies that container literals and PEP 585 lowercase types in yield from are properly inferred."""
-    from pydoppelgangerhunt.fixer import (  # pylint: disable=import-outside-toplevel
-        _infer_helper_return_type,
-        synthesize_shared_helper_code,
-    )
-
     # 1. PEP 585 lowercase list[int] and tuple[str, ...]
     assert _infer_helper_return_type(
         "Any", [], set(),
@@ -1125,8 +1111,6 @@ def test_batch_82_generator_container_literal_and_pep585_return_type_inference(t
 
 def test_format_call_arguments_order_preservation_and_custom_receivers() -> None:
     """Verifies that call argument formatting preserves name identity across load permutations and omits custom receivers."""
-    from pydoppelgangerhunt.fixer.synthesis import _format_call_arguments  # pylint: disable=import-outside-toplevel
-
     # 1. Identical input names in permuted target_inputs must not be swapped
     inputs = ["alpha", "beta", "gamma"]
     target_inputs = ["gamma", "alpha", "beta"]
@@ -1221,8 +1205,6 @@ def test_sync_generator_helper_synthesis_with_outputs_emits_return_and_generator
 
 def test_infer_helper_return_type_sync_generator_with_outputs_and_return() -> None:
     """Verifies return type inference for sync generators with single/multiple outputs and return statements."""
-    from pydoppelgangerhunt.fixer import _infer_helper_return_type  # pylint: disable=import-outside-toplevel
-
     # 1. Single output
     scope_single = {"has_yield": True, "yield_expr_names": [("yield", ":literal:int")]}
     res_single = _infer_helper_return_type(
@@ -1465,11 +1447,6 @@ def test_resolve_generator_subroutine_outputs_preserves_per_side_necessity_and_s
 ) -> None:
     """Verifies that resolve_generator_subroutine_outputs pairs renamed outputs and guards
     against partial knowledge."""
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
-        GeneratorCloneSideData,
-        resolve_generator_subroutine_outputs,
-    )
-
     u1_outs = ["total", "x"]
     u2_outs = ["count", "x"]
 
@@ -1510,8 +1487,8 @@ def test_resolve_generator_subroutine_outputs_preserves_per_side_necessity_and_s
     )
     assert res4 is not None
     none_out1, none_out2 = res4
-    assert none_out1 == []
-    assert none_out2 == []
+    assert not none_out1
+    assert not none_out2
 
     # 5. Unequal output counts where needed output has no counterpart: fails closed (returns None)
     res_unequal = resolve_generator_subroutine_outputs(
@@ -1757,11 +1734,6 @@ def test_collect_downstream_read_names_nonlocal_and_global_declarations() -> Non
 
 def test_generator_clone_side_data_interface() -> None:
     """Verifies that GeneratorCloneSideData cleanly encapsulates per-side clone context."""
-    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
-        GeneratorCloneSideData,
-        resolve_generator_subroutine_outputs,
-    )
-
     side1 = GeneratorCloneSideData(
         outputs=["total", "x"],
         downstream={"total"},
@@ -1787,10 +1759,6 @@ def test_generator_clone_side_data_interface() -> None:
 
 def test_is_async_generator_with_return_value_policy() -> None:
     """Verifies that is_async_generator_with_return_value strictly enforces PEP 525 constraints."""
-    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
-        is_async_generator_with_return_value,
-    )
-
     # Clean sync generator with return value (allowed in Python 3.3+)
     sync_gen = {"has_yield": True, "is_async": False, "has_return_value": True}
     assert not is_async_generator_with_return_value(sync_gen)
@@ -1878,8 +1846,6 @@ def test_extract_nested_scope_free_reads_type_annotations() -> None:
 
 def test_patch_subroutine_is_async_propagation(tmp_path: Path) -> None:
     """Verifies that is_async from enclosing functions propagates to s1/s2 and rejects illegal returns."""
-    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch  # pylint: disable=import-outside-toplevel
-
     code1 = (
         "async def process_data(items):\n"
         "    total = 0\n"
@@ -1912,7 +1878,7 @@ def test_patch_subroutine_is_async_propagation(tmp_path: Path) -> None:
 
 
 def test_pair_clone_outputs_positional_alignment() -> None:
-    """Verifies that _pair_clone_outputs preserves 1-to-1 positional order even when variable names collide."""
+    """Verifies that _pair_clone_outputs prioritizes common identity mapping before pairing remaining outputs."""
     # Colliding variable names across different semantic positions
     pairs = _pair_clone_outputs(["a", "b"], ["b", "c"])
     assert pairs == [("a", "c"), ("b", "b")]
@@ -1952,8 +1918,6 @@ def test_extract_nested_scope_free_reads_outer_scope_shadowing() -> None:
 
 def test_infer_outputs_return_type_counterpart_lookup() -> None:
     """Verifies that counterpart variable types from outputs2 take precedence over name collisions."""
-    from pydoppelgangerhunt.fixer.synthesis import _infer_outputs_return_type  # pylint: disable=import-outside-toplevel
-
     meta1 = {"a": {"type": "int"}, "c": {"type": "float"}}
     meta2 = {
         "a": {"type": "str"},  # Unrelated variable in clone 2 scope
@@ -2159,8 +2123,6 @@ def test_downstream_read_visitor_reaching_definitions_reassigned_variable() -> N
 
 def test_infer_helper_return_type_untyped_generator_return_value() -> None:
     """Verifies that a generator with explicit return value and untyped return emits Generator[yield_t, None, Any]."""
-    from pydoppelgangerhunt.fixer.synthesis import _infer_helper_return_type  # pylint: disable=protected-access
-
     scope = {
         "has_yield": True,
         "is_async": False,
@@ -2428,8 +2390,6 @@ def test_class_scope_visitor_global_and_nonlocal() -> None:
 
 def test_infer_outputs_return_type_single_output_precedence() -> None:
     """Verifies that explicit single-output type takes precedence over enclosing resolved_ret unless Any."""
-    from pydoppelgangerhunt.fixer.synthesis import _infer_outputs_return_type  # pylint: disable=import-outside-toplevel
-
     # Known output type "str" should override enclosing resolved_ret "int"
     ret = _infer_outputs_return_type(
         helper_outputs=["res"],
@@ -2710,14 +2670,9 @@ def test_infer_helper_return_type_generator_with_outputs_and_iterator() -> None:
 
 def test_split_type_args_nested_bracket_depth() -> None:
     """Verifies bracket-depth aware splitting of nested generic type arguments."""
-    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
-        _split_type_args,
-        _infer_helper_return_type,
-    )
-
     # Empty or non-generic strings
-    assert _split_type_args("int") == []
-    assert _split_type_args("") == []
+    assert not _split_type_args("int")
+    assert not _split_type_args("")
 
     # Multi-argument nested generic
     t1 = "Generator[Tuple[int, str], None, Dict[str, Any]]"
@@ -3160,3 +3115,63 @@ def test_synthesize_shared_helper_code_comprehension_unit_return_type_any(
     code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert "-> Any:" in code
     assert "-> None:" not in code
+
+
+def test_downstream_reads_class_instance_alias_deferred_read() -> None:
+    """Verifies that an instance alias created prior to a unit correctly triggers
+    deferred free reads when its methods are invoked downstream."""
+    src = (
+        "class K:\n"
+        "    def m(self):\n"
+        "        return total\n"
+        "\n"
+        "obj = K()\n"
+        "for x in items:\n"
+        "    total = x\n"
+        "    yield x\n"
+        "obj.m()\n"
+    )
+    unit = {"file": "mod.py", "start": 6, "end": 8, "name": "unit", "kind": "compound_block"}
+    reads = collect_downstream_read_names(src, unit, candidates={"total"})
+    assert reads is not None
+    assert "total" in reads
+
+
+def test_downstream_reads_pre_unit_closure_redefinition_in_branches() -> None:
+    """Verifies that closures redefined across conditional branches merge free variable sets."""
+    src = (
+        "if flag:\n"
+        "    def h():\n"
+        "        return total\n"
+        "else:\n"
+        "    def h():\n"
+        "        return other\n"
+        "\n"
+        "for x in items:\n"
+        "    total = x\n"
+        "    yield x\n"
+        "h()\n"
+    )
+    unit = {"file": "mod.py", "start": 8, "end": 10, "name": "unit", "kind": "compound_block"}
+    reads = collect_downstream_read_names(src, unit, candidates={"total", "other"})
+    assert reads is not None
+    assert "total" in reads
+
+
+def test_downstream_reads_escaping_closure_registered_before_unit() -> None:
+    """Verifies that pre-unit closures capturing candidate variables are treated as live
+    even when invoked indirectly through pre-registered handlers."""
+    src = (
+        "def cb():\n"
+        "    return total\n"
+        "\n"
+        "register(cb)\n"
+        "for x in items:\n"
+        "    total = x\n"
+        "    yield x\n"
+        "fire()\n"
+    )
+    unit = {"file": "mod.py", "start": 5, "end": 7, "name": "unit", "kind": "compound_block"}
+    reads = collect_downstream_read_names(src, unit, candidates={"total"})
+    assert reads is not None
+    assert "total" in reads
