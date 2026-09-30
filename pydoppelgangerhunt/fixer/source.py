@@ -1055,9 +1055,16 @@ def find_enclosing_function_is_async(
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             n_start = getattr(node, "lineno", 0)
             n_end = getattr(node, "end_lineno", n_start)
-            if n_start <= start_line and end_line <= n_end:
+            decorators = getattr(node, "decorator_list", [])
+            dec_start = (
+                min(getattr(d, "lineno", n_start) for d in decorators)
+                if decorators
+                else n_start
+            )
+            earliest_start = min(dec_start, n_start)
+            if earliest_start <= start_line and end_line <= n_end:
                 candidates.append((
-                    n_end - n_start,
+                    n_end - earliest_start,
                     isinstance(node, ast.AsyncFunctionDef),
                 ))
     if not candidates:

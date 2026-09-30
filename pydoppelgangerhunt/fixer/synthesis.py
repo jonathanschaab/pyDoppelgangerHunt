@@ -614,9 +614,10 @@ def synthesize_shared_helper_code(
     _populate_unit_receiver_metadata(u1, repo_root=repo_root)
     _populate_unit_receiver_metadata(u2, repo_root=repo_root)
 
-    # Variable scope analysis for concrete parameter signatures
-    scope1 = analyze_unit_variable_scope(u1, repo_root=repo_root, tree1=tree1)
-    scope2 = analyze_unit_variable_scope(u2, repo_root=repo_root, tree1=tree2)
+    # Variable scope analysis for concrete parameter signatures.
+    # Note: 'tree' aliases 'tree1' when analyzing a single unit.
+    scope1 = analyze_unit_variable_scope(u1, repo_root=repo_root, tree=tree1)
+    scope2 = analyze_unit_variable_scope(u2, repo_root=repo_root, tree=tree2)
     scope = analyze_unit_variable_scope(
         u1, u2, repo_root=repo_root, tree1=tree1, tree2=tree2
     )

@@ -214,10 +214,12 @@ def check_units_overlap(
         return _check_same_line_overlap(sc1, ec1, sc2, ec2)
 
     # Case 2: Sequential boundary touch (u1 ends where u2 begins)
+    # Note: start1 < start2 == end1 checks start1 < start2 and start2 == end1
     if start1 < start2 == end1:
         return _check_sequential_touch(ec1, sc2, start2 == end2, ec2)
 
     # Case 3: Sequential boundary touch (u2 ends where u1 begins)
+    # Note: start2 < start1 == end2 checks start2 < start1 and start1 == end2
     if start2 < start1 == end2:
         return _check_sequential_touch(ec2, sc1, start1 == end1, ec1)
 
@@ -2804,8 +2806,9 @@ def generate_refactoring_patch(
 
             tree1 = f1_plan.parsed_tree
             tree2 = f2_plan.parsed_tree if f2_plan is not None else tree1
-            s1 = analyze_unit_variable_scope(u1_eff, repo_root=str(root), tree1=tree1)
-            s2 = analyze_unit_variable_scope(u2_eff, repo_root=str(root), tree1=tree2)
+            # When analyzing a single unit, 'tree' aliases 'tree1' for the first positional unit
+            s1 = analyze_unit_variable_scope(u1_eff, repo_root=str(root), tree=tree1)
+            s2 = analyze_unit_variable_scope(u2_eff, repo_root=str(root), tree=tree2)
             if orig_fn1 and orig_fn1.get("is_async"):
                 s1["is_async"] = True
             if orig_fn2 and orig_fn2.get("is_async"):

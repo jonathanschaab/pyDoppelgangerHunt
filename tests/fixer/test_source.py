@@ -21,6 +21,7 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _get_module_imported_names,
     _insert_imports_into_module,
 )
+from pydoppelgangerhunt.fixer.source import find_enclosing_function_is_async
 
 
 def test_fixer_feedback_and_advanced_robustness(tmp_path: Path) -> None:
@@ -538,3 +539,32 @@ def test_find_module_helper_insertion_index_with_suppress() -> None:
     src = "".join(lines)
     names = _get_module_imported_names(src, include_conditional=True)
     assert "optional_dep" in names
+
+
+def test_find_enclosing_function_is_async_decorated() -> None:
+    """Verifies that find_enclosing_function_is_async recognizes decorated async functions
+    when the unit start line begins on or after the decorator."""
+    src = (
+        "@deco1\n"
+        "@deco2(arg=True)\n"
+        "async def async_worker(x):\n"
+        "    res = x * 2\n"
+        "    return res\n"
+    )
+    # Unit starting on the decorator itself
+    assert find_enclosing_function_is_async(src, start_line=1, end_line=5) is True
+    # Unit starting on second decorator
+    assert find_enclosing_function_is_async(src, start_line=2, end_line=4) is True
+    # Unit inside function body
+    assert find_enclosing_function_is_async(src, start_line=4, end_line=4) is True
+    # Out of range
+    assert find_enclosing_function_is_async(src, start_line=6, end_line=7) is False
+
+    # Sync decorated function should return False
+    sync_src = (
+        "@deco\n"
+        "def sync_worker(x):\n"
+        "    return x * 2\n"
+    )
+    assert find_enclosing_function_is_async(sync_src, start_line=1, end_line=3) is False
+

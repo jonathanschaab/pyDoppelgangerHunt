@@ -1507,3 +1507,22 @@ def test_scope_inspection_custom_receiver_attributes(tmp_path: Path) -> None:
     assert "klass.count" in s_cls["attrs_read"]
     assert "klass.count" in s_cls["class_attrs"]
     assert s_cls["inputs"][0] == "klass"
+
+
+def test_analyze_unit_variable_scope_tree_alias_parameter(tmp_path: Path) -> None:
+    """Verifies that analyze_unit_variable_scope accepts tree as a readable alias for tree1."""
+    f = tmp_path / "single_unit.py"
+    src = "def calculate(a, b):\n    c = a + b\n    return c\n"
+    f.write_text(src, encoding="utf-8")
+    u = {"file": str(f), "start": 1, "end": 3, "name": "calculate", "kind": "function"}
+    parsed_tree = ast.parse(src)
+
+    # Calling with tree=parsed_tree alias
+    res_alias = analyze_unit_variable_scope(u, repo_root=str(tmp_path), tree=parsed_tree)
+    # Calling with tree1=parsed_tree
+    res_direct = analyze_unit_variable_scope(u, repo_root=str(tmp_path), tree1=parsed_tree)
+
+    assert res_alias["inputs"] == res_direct["inputs"] == ["a", "b"]
+    assert res_alias["outputs"] == res_direct["outputs"] == ["c"]
+    assert res_alias["return_type"] == res_direct["return_type"]
+
