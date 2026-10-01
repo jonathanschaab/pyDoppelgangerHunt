@@ -67,16 +67,24 @@ def _get_valid_unit_bounds(unit: Dict[str, Any]) -> Optional[Tuple[int, int]]:
     return u_start, u_end
 
 
-def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
-    """Extracts end column offset from unit dictionary if present."""
-    for col_key in ("end_col_offset", "end_col"):
-        col_val = unit.get(col_key)
-        if col_val is not None:
+def _extract_first_unit_coord(
+    unit: Dict[str, Any], keys: Sequence[str]
+) -> Optional[int]:
+    """Returns the first successfully parsed coordinate among candidate keys."""
+    for key in keys:
+        if key in unit and unit.get(key) is not None:
             try:
-                return int(col_val)
+                val = parse_unit_coord(unit, key, default=None)
+                if val is not None:
+                    return val
             except (ValueError, TypeError):
                 pass
     return None
+
+
+def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
+    """Extracts end column offset from unit dictionary if present."""
+    return _extract_first_unit_coord(unit, ("end_col_offset", "end_col"))
 
 
 def _resolve_unit_ast_end_col(
@@ -122,14 +130,7 @@ def _resolve_unit_ast_end_col(
 
     inner_stmts.sort(key=lambda s: getattr(s, "col_offset", 0))
     if u_start == u_end:
-        start_col_raw = unit.get("start_col")
-        if start_col_raw is None:
-            start_col_raw = unit.get("start_col_offset")
-        try:
-            start_col = int(start_col_raw) if start_col_raw is not None else None
-        except (ValueError, TypeError):
-            start_col = None
-
+        start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
         if start_col is not None:
             matched = [s for s in inner_stmts if getattr(s, "col_offset", 0) >= start_col]
             target_stmt = matched[0] if matched else inner_stmts[0]
@@ -746,6 +747,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self._record_killed_targets([node.target])
         for stmt in node.body:
             self.visit(stmt)
+        self.killed = set(killed_before)
         for stmt in node.orelse:
             self.visit(stmt)
         self.killed = killed_before
@@ -758,6 +760,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self.visit(node.test)
         for stmt in node.body:
             self.visit(stmt)
+        self.killed = set(killed_before)
         for stmt in node.orelse:
             self.visit(stmt)
         self.killed = killed_before

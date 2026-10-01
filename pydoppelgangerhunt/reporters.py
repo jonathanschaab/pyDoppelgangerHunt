@@ -79,7 +79,7 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
                 for ln in source_lines
             ]
         start = max(1, s_d)
-        end = min(len(source_lines), parse_unit_coord(unit, "end", default=len(source_lines)))
+        end = min(len(source_lines), e_d)
         return [
             ln if ln.endswith("\n") else ln + "\n"
             for ln in source_lines[start - 1 : end]

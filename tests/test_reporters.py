@@ -847,3 +847,17 @@ def test_extract_unit_source_code_source_lines_is_sliced_flag_and_source_text() 
     }
     extracted_text = extract_unit_source_code(unit_source_text)
     assert extracted_text == ["line 2\n", "line 3\n"]
+
+
+def test_extract_unit_source_code_end_coord_resolution() -> None:
+    """Verifies that extract_unit_source_code slices using resolved e_d."""
+    lines = [f"line {i}\n" for i in range(1, 10)]
+    unit = {
+        "start": "3:0",
+        "end": "5:10",
+        "source_lines": lines,
+        "source_lines_is_sliced": False,
+    }
+    extracted = extract_unit_source_code(unit)
+    assert extracted == ["line 3\n", "line 4\n", "line 5\n"]
+

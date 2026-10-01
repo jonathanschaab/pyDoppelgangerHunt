@@ -31,6 +31,7 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
 from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
     GeneratorCloneSideData,
     _extract_nested_scope_free_reads,
+    _extract_unit_end_col,
     _load_unit_file_text,
     _pair_clone_outputs,
     _resolve_unit_ast_end_col,
@@ -39,6 +40,7 @@ from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-acc
     resolve_clone_generator_subroutine_outputs,
     resolve_generator_subroutine_outputs,
 )
+from pydoppelgangerhunt.source_lines import parse_unit_coord
 from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access
     _infer_outputs_return_type,
     _split_type_args,
@@ -3490,3 +3492,61 @@ def test_resolve_unit_ast_end_col_multiline_semicolon_closing_line() -> None:
     unit = {"start": 2, "end": 3}
     end_col = _resolve_unit_ast_end_col(scope_fn, unit)
     assert end_col == len("    y = 2; z = 3")
+
+
+def test_loop_orelse_reaching_definitions_for_and_while() -> None:
+    """Verifies that reads in loop orelse blocks see reaching definitions entering the loop.
+
+    When the loop body does not execute (e.g. empty sequence for For, or immediately False
+    condition for While), assignments inside the loop body must not mask reaching definitions
+    needed by the orelse clause.
+    """
+    src_for = (
+        "def f(items):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total = 10\n"
+        "    else:\n"
+        "        print(total)\n"
+    )
+    unit_for = {"start": 2, "end": 2}
+    reads_for = collect_downstream_read_names(src_for, unit_for, candidates={"total"})
+    assert reads_for == {"total"}
+
+    src_while = (
+        "def f(cond):\n"
+        "    total = 0\n"
+        "    while cond:\n"
+        "        total = 10\n"
+        "    else:\n"
+        "        print(total)\n"
+    )
+    unit_while = {"start": 2, "end": 2}
+    reads_while = collect_downstream_read_names(src_while, unit_while, candidates={"total"})
+    assert reads_while == {"total"}
+
+
+def test_extract_and_resolve_unit_col_coord_strings() -> None:
+    """Verifies that column offset helpers safely parse coordinate strings with offsets."""
+    u_end_str = {"end_col": "25:0"}
+    assert _extract_unit_end_col(u_end_str) == 25
+
+    u_end_offset_str = {"end_col_offset": "40:5"}
+    assert _extract_unit_end_col(u_end_offset_str) == 40
+
+    tree = ast.parse("x = 10; y = 20\n")
+    scope_fn = tree
+    u_start_str = {"start": 1, "end": 1, "start_col": "8:0"}
+    end_col = _resolve_unit_ast_end_col(scope_fn, u_start_str)
+    assert end_col == len("x = 10; y = 20")
+
+
+def test_parse_unit_coord_overload_and_default_none() -> None:
+    """Verifies parse_unit_coord behavior with default=None and formatted coordinates."""
+    assert parse_unit_coord({"col": None}, "col", default=None) is None
+    assert parse_unit_coord({}, "col", default=None) is None
+    assert parse_unit_coord({"col": 42}, "col", default=None) == 42
+    assert parse_unit_coord({"col": "42:0"}, "col", default=None) == 42
+    assert parse_unit_coord({"col": 42}, "col") == 42
+    assert parse_unit_coord({}, "col", default=10) == 10
+

@@ -3057,8 +3057,6 @@ def generate_refactoring_patch(
             ):
                 helper_name = f"{base_helper}_{h_idx}"
                 h_idx += 1
-            tree1 = f1_plan.parsed_tree
-            tree2 = f2_plan.parsed_tree if f2_plan is not None else tree1
             helper_code = synthesize_shared_helper_code(
                 u1_eff,
                 u2_eff,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Union, overload
 
 _PHYSICAL_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
 
@@ -16,7 +16,31 @@ __all__ = [
 ]
 
 
-def parse_unit_coord(unit: Dict[str, Any], key: str, default: int = 1) -> int:
+@overload
+def parse_unit_coord(unit: Dict[str, Any], key: str) -> int:
+    ...
+
+
+@overload
+def parse_unit_coord(unit: Dict[str, Any], key: str, default: int) -> int:
+    ...
+
+
+@overload
+def parse_unit_coord(unit: Dict[str, Any], key: str, default: None) -> Optional[int]:
+    ...
+
+
+@overload
+def parse_unit_coord(
+    unit: Dict[str, Any], key: str, default: Optional[int]
+) -> Optional[int]:
+    ...
+
+
+def parse_unit_coord(
+    unit: Dict[str, Any], key: str, default: Optional[int] = 1
+) -> Optional[int]:
     """Extracts and parses an integer coordinate from a unit dictionary.
 
     Safely handles integers, numeric strings, and coordinate strings with column
