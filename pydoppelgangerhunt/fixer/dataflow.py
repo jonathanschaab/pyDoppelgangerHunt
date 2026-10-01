@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
@@ -25,7 +24,13 @@ def _load_unit_file_text(
     f_raw = normalize_path_string(str(unit.get("file") or ""), strip_anchor=True)
     if f_raw:
         p = Path(f_raw)
-        f_path = p if p.is_file() or p.is_absolute() else (Path(repo_root or os.getcwd()) / p)
+        if p.is_absolute():
+            f_path = p
+        elif repo_root:
+            cand = Path(repo_root) / p
+            f_path = cand if cand.is_file() else p
+        else:
+            f_path = p
         if f_path.is_file():
             try:
                 return f_path.read_text(encoding="utf-8")
@@ -127,6 +132,10 @@ def _resolve_unit_ast_end_col(
             matched = [s for s in inner_stmts if getattr(s, "col_offset", 0) >= start_col]
             target_stmt = matched[0] if matched else inner_stmts[0]
         else:
+            # When start_col is omitted for a single-line unit, default to the first
+            # statement on the line (e.g. 'yield x; print(total)'). Note that if a unit
+            # represents a subsequent statement on a semicolon-separated line, supplying
+            # 'start_col' during harvesting ensures exact boundary matching.
             target_stmt = inner_stmts[0]
     else:
         target_stmt = inner_stmts[-1]

@@ -3416,3 +3416,46 @@ def test_patch_subroutine_effective_units_with_precomputed_outputs(
     assert "yield from _shared" in patch
     assert "total, x = (yield from _shared" in patch
     assert "count, y = (yield from _shared" in patch
+
+
+def test_load_unit_file_text_prioritizes_repo_root_over_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that _load_unit_file_text checks repo_root before cwd for relative paths,
+    avoiding path shadowing when the process working directory is not the repository root."""
+    cwd_dir = tmp_path / "cwd_dir"
+    repo_dir = tmp_path / "repo_dir"
+    cwd_dir.mkdir()
+    repo_dir.mkdir()
+
+    (cwd_dir / "mod.py").write_text("# cwd version\n", encoding="utf-8")
+    (repo_dir / "mod.py").write_text("# repo version\n", encoding="utf-8")
+
+    monkeypatch.chdir(cwd_dir)
+    unit = {"file": "mod.py", "start": 1, "end": 1}
+    # When repo_root is specified, the file in repo_root must take precedence over cwd
+    text_repo = _load_unit_file_text(unit, repo_root=str(repo_dir))
+    assert text_repo == "# repo version\n"
+
+    # When repo_root is not specified, it falls back to cwd
+    text_cwd = _load_unit_file_text(unit)
+    assert text_cwd == "# cwd version\n"
+
+
+def test_resolve_unit_ast_end_col_single_line_semicolon_with_and_without_start_col() -> None:
+    """Verifies that _resolve_unit_ast_end_col defaults to the first statement on a line
+    when start_col is omitted, but accurately selects subsequent statements when start_col
+    is supplied."""
+    code = "def f(): x = 1; y = 2\n"
+    tree = ast.parse(code)
+    scope_fn = tree.body[0]
+
+    # Without start_col: defaults to first statement x = 1
+    unit_no_col = {"start": 1, "end": 1}
+    end_col_first = _resolve_unit_ast_end_col(scope_fn, unit_no_col)
+    assert end_col_first == len("def f(): x = 1")
+
+    # With start_col: accurately matches second statement y = 2
+    unit_with_col = {"start": 1, "end": 1, "start_col": len("def f(): x = 1; ")}
+    end_col_second = _resolve_unit_ast_end_col(scope_fn, unit_with_col)
+    assert end_col_second == len("def f(): x = 1; y = 2")
