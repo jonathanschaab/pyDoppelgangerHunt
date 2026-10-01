@@ -45,17 +45,35 @@ def colorize(text: str, color_code: str, enabled: bool) -> str:
 
 
 def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:
-    """Reads raw source code lines for a given unit from provided lines or disk."""
+    """Reads raw source code lines for a given unit from provided lines or disk.
+
+    Supports pre-sliced unit lines, full-file line lists, in-memory source_text,
+    or disk-based source reading. Callers can explicitly specify
+    'source_lines_is_sliced': True (or False) to disambiguate whether 'source_lines'
+    represents a pre-sliced excerpt or the complete file.
+    """
     s_d = parse_unit_coord(unit, "start", default=1)
     e_d = parse_unit_coord(unit, "end", default=s_d)
     n_d = str(unit.get("name") or "unit")
     placeholder = [f"# Source for {n_d} lines {s_d}-{e_d}\n"]
 
     source_lines = unit.get("source_lines")
+    if source_lines is None and unit.get("source_text") is not None:
+        source_lines = split_source_lines(str(unit["source_text"]))
+
     if source_lines is not None and isinstance(source_lines, (list, tuple)):
         if not source_lines:
             return placeholder
-        if len(source_lines) == (e_d - s_d + 1) and s_d > 1:
+        # Sliced lines fast-path:
+        # If 'source_lines_is_sliced' is explicitly set, honor caller intent.
+        # Otherwise, heuristic: if len(source_lines) == (e_d - s_d + 1) and s_d > 1,
+        # the list is treated as already sliced to unit boundaries (since for any valid
+        # file containing the unit, len(file) >= e_d > e_d - s_d + 1, making an exact
+        # length match impossible unless the file is out-of-bounds).
+        is_sliced = unit.get("source_lines_is_sliced")
+        if is_sliced is True or (
+            is_sliced is None and len(source_lines) == (e_d - s_d + 1) and s_d > 1
+        ):
             return [
                 ln if ln.endswith("\n") else ln + "\n"
                 for ln in source_lines
