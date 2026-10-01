@@ -839,6 +839,17 @@ def _collect_pre_unit_closures(
     defined downstream of the unit are inspected by the normal downstream AST traversal; closures
     defined in sibling scopes outside the current enclosing scope (e.g. sibling methods in a
     class) are not inspected.
+
+    Line-Granularity Limitation:
+    Statements and subnodes are filtered by line number (strictly less than `u_start`). A closure
+    defined on the exact start line of the unit (such as `cb = lambda: total; for x in ...` on a
+    single line) begins at `lineno == u_start` and is therefore not treated as pre-unit.
+
+    Over-Capture Trade-off:
+    `ast.walk` over compound statements prior to `u_start` also traverses lambdas inside nested
+    functions. Free variables of such lambdas that reference intermediate nested locals are
+    unioned into captured reads, potentially causing benign over-rejection. This fail-closed
+    behavior is intentional.
     """
     captured_reads: Set[str] = set()
 

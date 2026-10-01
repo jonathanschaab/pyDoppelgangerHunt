@@ -3222,7 +3222,16 @@ def test_synthesize_shared_helper_code_unpaired_output_fallback_aligned(
     tmp_path: Path,
 ) -> None:
     """Verifies that the fallback else: branch in synthesize_shared_helper_code aligns
-    u1 and u2 output ordering using _pair_clone_outputs."""
+    u1 and u2 output ordering using _pair_clone_outputs.
+
+    Note on pairing semantics:
+    _pair_clone_outputs uses identity-first pairing. In this test, f returns (a, b) and g
+    returns (b, a). Positionally, f's slot 0 ('a') corresponds to g's slot 0 ('b'), but
+    identity-first pairing intentionally matches identical symbol names across clones
+    ('a' -> 'a', 'b' -> 'b'). This reorders u2_outs to ['a', 'b'], ensuring that
+    type inference looks up types by counterpart symbol name (int with int, str with str)
+    rather than unaligned positional slots (int with str).
+    """
     src1 = (
         "def f(a: int, b: str):\n"
         "    return a, b\n"
@@ -3241,6 +3250,31 @@ def test_synthesize_shared_helper_code_unpaired_output_fallback_aligned(
     assert code != ""
     assert "Tuple[int, str]" in code
     assert "return a, b" in code
+
+
+def test_synthesize_shared_helper_code_unpaired_output_positional_aligned(
+    tmp_path: Path,
+) -> None:
+    """Verifies that when clone output names differ across units, positional pairing
+    correctly aligns counterpart types."""
+    src1 = (
+        "def f(x: int, y: str):\n"
+        "    return x, y\n"
+    )
+    src2 = (
+        "def g(a: int, b: str):\n"
+        "    return a, b\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+    u1 = {"file": str(f1), "start": 1, "end": 2, "name": "f", "kind": "function"}
+    u2 = {"file": str(f2), "start": 1, "end": 2, "name": "g", "kind": "function"}
+    code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert code != ""
+    assert "Tuple[int, str]" in code
+    assert "return x, y" in code
 
 
 def test_collect_downstream_read_names_inverted_coordinates() -> None:
