@@ -3459,3 +3459,34 @@ def test_resolve_unit_ast_end_col_single_line_semicolon_with_and_without_start_c
     unit_with_col = {"start": 1, "end": 1, "start_col": len("def f(): x = 1; ")}
     end_col_second = _resolve_unit_ast_end_col(scope_fn, unit_with_col)
     assert end_col_second == len("def f(): x = 1; y = 2")
+
+
+def test_load_unit_file_text_explicit_empty_string_source_text(tmp_path: Path) -> None:
+    """Verifies that an explicit empty string in source_text or file_source does not fall
+    through to disk."""
+    f = tmp_path / "on_disk.py"
+    f.write_text("# disk content\n", encoding="utf-8")
+
+    # Explicit empty string in source_text must return "" and not read disk
+    unit_empty = {"file": str(f), "source_text": ""}
+    assert _load_unit_file_text(unit_empty) == ""
+
+    # Explicit empty string in file_source when source_text is None
+    unit_empty_file_source = {"file": str(f), "file_source": ""}
+    assert _load_unit_file_text(unit_empty_file_source) == ""
+
+
+def test_resolve_unit_ast_end_col_multiline_semicolon_closing_line() -> None:
+    """Verifies that for multi-line units ending on a line with multiple statements,
+    _resolve_unit_ast_end_col defaults to the last statement on line u_end."""
+    code = (
+        "def f():\n"
+        "    x = 1\n"
+        "    y = 2; z = 3\n"
+    )
+    tree = ast.parse(code)
+    scope_fn = tree.body[0]
+
+    unit = {"start": 2, "end": 3}
+    end_col = _resolve_unit_ast_end_col(scope_fn, unit)
+    assert end_col == len("    y = 2; z = 3")

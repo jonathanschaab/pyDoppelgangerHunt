@@ -18,7 +18,9 @@ def _load_unit_file_text(
     repo_root: Optional[str] = None,
 ) -> Optional[str]:
     """Reads source text from disk or unit dictionary for a unit."""
-    source_text = unit.get("source_text") or unit.get("file_source")
+    source_text = unit.get("source_text")
+    if source_text is None:
+        source_text = unit.get("file_source")
     if source_text is not None:
         return str(source_text)
     f_raw = normalize_path_string(str(unit.get("file") or ""), strip_anchor=True)
@@ -138,6 +140,10 @@ def _resolve_unit_ast_end_col(
             # 'start_col' during harvesting ensures exact boundary matching.
             target_stmt = inner_stmts[0]
     else:
+        # For multi-line units (u_start != u_end), default to the last statement ending
+        # on line u_end (inner_stmts[-1]). In the rare event of semicolon-separated statements
+        # on the closing line of a block where the unit terminates earlier, providing
+        # 'end_col' during harvesting ensures exact sub-line boundary resolution.
         target_stmt = inner_stmts[-1]
 
     end_col = getattr(target_stmt, "end_col_offset", None)
