@@ -22,6 +22,8 @@ def _load_unit_file_text(
     source_text = unit.get("source_text") or unit.get("file_source")
     if source_text is not None:
         return str(source_text)
+    if "source_lines" in unit and isinstance(unit["source_lines"], (list, tuple)):
+        return "".join(unit["source_lines"])
     f_raw = normalize_path_string(str(unit.get("file") or ""), strip_anchor=True)
     if not f_raw:
         return None
@@ -510,9 +512,12 @@ def _extract_nested_scope_free_reads(
             class_visitor.class_stores.add(tp_name)
         for stmt in node.body:
             class_visitor.visit(stmt)
-        return (outer_visitor.names - type_param_names) | (
-            class_visitor.free_reads - class_visitor.globals - type_param_names
+        class_free = (
+            (class_visitor.free_reads | class_visitor.nonlocals)
+            - class_visitor.globals
+            - type_param_names
         )
+        return (outer_visitor.names - type_param_names) | class_free
 
     defaults = node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]
     for d in defaults:
@@ -1112,7 +1117,8 @@ def resolve_clone_generator_subroutine_outputs(
         outs2 = _extract_effective_unit_outputs(u2, scope2)
         if len(outs1) == len(outs2):
             pairs = _pair_clone_outputs(outs1, outs2)
-            return [p[0] for p in pairs], [p[1] for p in pairs]
+            if len(pairs) == len(outs1):
+                return [p[0] for p in pairs], [p[1] for p in pairs]
         return None
 
     u1_raw = _extract_effective_unit_outputs(u1, scope1)

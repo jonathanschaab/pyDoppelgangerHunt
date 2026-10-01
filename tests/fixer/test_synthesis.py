@@ -31,6 +31,7 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
 from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
     GeneratorCloneSideData,
     _extract_nested_scope_free_reads,
+    _load_unit_file_text,
     _pair_clone_outputs,
     _resolve_unit_ast_end_col,
     collect_downstream_read_names,
@@ -3283,3 +3284,43 @@ def test_collect_downstream_read_names_inverted_coordinates() -> None:
     unit = {"file": "mod.py", "start": 3, "end": 1, "name": "inverted"}
     reads = collect_downstream_read_names(src, unit, candidates={"x", "y", "z"})
     assert reads is None
+
+
+def test_resolve_clone_generator_subroutine_outputs_duplicate_names_fails_closed() -> None:
+    """Verifies that resolve_clone_generator_subroutine_outputs fails closed (returns None)
+    when precomputed outputs contain duplicate names causing arity collapse."""
+    u1 = {"file": "mod1.py", "start": 1, "end": 2, "outputs": ["a", "b"]}
+    u2 = {"file": "mod2.py", "start": 1, "end": 2, "outputs": ["c", "c"]}
+    scope1 = {"inputs": [], "definite_stores": ["a", "b"]}
+    scope2 = {"inputs": [], "definite_stores": ["c"]}
+    res = resolve_clone_generator_subroutine_outputs(
+        u1, u2, scope1, scope2, source_text1="yield 1", source_text2="yield 1"
+    )
+    assert res is None
+
+
+def test_load_unit_file_text_source_lines_fallback() -> None:
+    """Verifies that _load_unit_file_text falls back to in-memory source_lines
+    when file is not on disk."""
+    unit = {
+        "file": "virtual/unwritten.py",
+        "start": 1,
+        "end": 2,
+        "source_lines": ["def foo():\n", "    pass\n"],
+    }
+    loaded = _load_unit_file_text(unit)
+    assert loaded == "def foo():\n    pass\n"
+
+
+def test_extract_nested_scope_free_reads_class_assigned_nonlocal() -> None:
+    """Verifies that _extract_nested_scope_free_reads unions assigned nonlocal variables
+    in class bodies into escaped free reads for parity with function scopes."""
+    code = (
+        "class C:\n"
+        "    nonlocal captured_var\n"
+        "    captured_var = 42\n"
+    )
+    class_node = ast.parse(code).body[0]
+    assert isinstance(class_node, ast.ClassDef)
+    free_reads = _extract_nested_scope_free_reads(class_node)
+    assert "captured_var" in free_reads
