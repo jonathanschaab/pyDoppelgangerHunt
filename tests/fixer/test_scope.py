@@ -1507,3 +1507,25 @@ def test_scope_inspection_custom_receiver_attributes(tmp_path: Path) -> None:
     assert "klass.count" in s_cls["attrs_read"]
     assert "klass.count" in s_cls["class_attrs"]
     assert s_cls["inputs"][0] == "klass"
+
+
+def test_dispatch_analyze_unit_variable_scope_mock_fallback() -> None:
+    """Verifies that dispatch_analyze_unit_variable_scope falls back gracefully when patched."""
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        dispatch_analyze_unit_variable_scope,
+    )
+
+    u1 = {"file": "mod.py", "start": 1, "end": 2}
+
+    # 1. Default dispatch invokes analyze_unit_variable_scope directly
+    res_default = dispatch_analyze_unit_variable_scope(u1)
+    assert isinstance(res_default, dict)
+
+    # 2. Mock that only accepts (u1, u2=None, repo_root=None) without tree1/tree2
+    def mock_legacy_scope(unit1: Any, u2: Any = None, repo_root: Any = None) -> Dict[str, Any]:
+        return {"mocked": True, "unit": unit1}
+
+    with mock.patch("pydoppelgangerhunt.fixer.analyze_unit_variable_scope", mock_legacy_scope):
+        res_mock = dispatch_analyze_unit_variable_scope(u1, tree1=ast.parse("x = 1\n"))
+        assert res_mock == {"mocked": True, "unit": u1}
+

@@ -3550,3 +3550,60 @@ def test_parse_unit_coord_overload_and_default_none() -> None:
     assert parse_unit_coord({"col": 42}, "col") == 42
     assert parse_unit_coord({}, "col", default=10) == 10
 
+
+def test_module_level_unit_prior_function_free_reads() -> None:
+    """Verifies that module-level units treat free reads from prior top-level functions as live."""
+    src = (
+        "def log_value():\n"
+        "    return g_total\n"
+        "\n"
+        "g_total = 100\n"
+        "print('done')\n"
+    )
+    unit = {"start": 4, "end": 5}
+    reads = collect_downstream_read_names(src, unit, candidates={"g_total"})
+    assert reads == {"g_total"}
+
+
+def test_collect_downstream_read_names_empty_candidates_early_out() -> None:
+    """Verifies that empty candidates set triggers early-out returning empty set."""
+    src = "x = 1\ny = 2\n"
+    unit = {"start": 1, "end": 1}
+    assert collect_downstream_read_names(src, unit, candidates=set()) == set()
+
+
+def test_collect_downstream_read_names_skip_pre_unit_closures() -> None:
+    """Verifies that skip_pre_unit_closures=True bypasses pre-unit closure read extraction."""
+    src = (
+        "def outer():\n"
+        "    cb = lambda: val\n"
+        "    val = 10\n"
+        "    print('done')\n"
+    )
+    unit = {"start": 3, "end": 3}
+    reads_default = collect_downstream_read_names(src, unit, candidates={"val"})
+    assert reads_default == {"val"}
+
+    reads_skipped = collect_downstream_read_names(
+        src, unit, candidates={"val"}, skip_pre_unit_closures=True
+    )
+    assert reads_skipped == set()
+
+
+def test_extract_nested_scope_free_reads_memoization() -> None:
+    """Verifies that _extract_nested_scope_free_reads memoizes free reads on AST nodes."""
+    code = (
+        "def compute(a):\n"
+        "    return a + b + c\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    free_reads = _extract_nested_scope_free_reads(fn_node)  # type: ignore[arg-type]
+    assert free_reads == {"b", "c"}
+    assert getattr(fn_node, "_free_reads_cache") == frozenset({"b", "c"})
+
+    # Subsequent call hits the cache
+    free_reads_cached = _extract_nested_scope_free_reads(fn_node)  # type: ignore[arg-type]
+    assert free_reads_cached == {"b", "c"}
+
+

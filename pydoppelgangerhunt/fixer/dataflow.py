@@ -503,8 +503,17 @@ class _OuterExprVisitor(_BaseScopeVisitor):
 
 def _extract_nested_scope_free_reads(
     node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef],
+    cache: Optional[Dict[int, Set[str]]] = None,
 ) -> Set[str]:
     """Extracts free variable references escaping a nested function or executed class body."""
+    if cache is not None and id(node) in cache:
+        return set(cache[id(node)])
+    cached: Optional[Union[frozenset[str], Set[str]]] = getattr(node, "_free_reads_cache", None)
+    if cached is not None:
+        if cache is not None:
+            cache[id(node)] = set(cached)
+        return set(cached)
+
     type_param_names: Set[str] = set()
     for tp in getattr(node, "type_params", []):
         tp_name = getattr(tp, "name", None)
@@ -532,7 +541,14 @@ def _extract_nested_scope_free_reads(
             - class_visitor.globals
             - type_param_names
         )
-        return (outer_visitor.names - type_param_names) | class_free
+        class_res = (outer_visitor.names - type_param_names) | class_free
+        try:
+            setattr(node, "_free_reads_cache", frozenset(class_res))
+        except AttributeError:
+            pass
+        if cache is not None:
+            cache[id(node)] = set(class_res)
+        return class_res
 
     defaults = node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]
     for d in defaults:
@@ -562,7 +578,14 @@ def _extract_nested_scope_free_reads(
         - (func_visitor.params | func_visitor.local_stores)
     ) | func_visitor.nonlocals
     escaped -= func_visitor.globals
-    return (outer_visitor.names - type_param_names) | escaped
+    func_res = (outer_visitor.names - type_param_names) | escaped
+    try:
+        setattr(node, "_free_reads_cache", frozenset(func_res))
+    except AttributeError:
+        pass
+    if cache is not None:
+        cache[id(node)] = set(func_res)
+    return func_res
 
 
 def _extract_assigned_names(target: ast.AST) -> List[str]:
@@ -713,12 +736,16 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         else:
             self.visit(node.target)
 
+    def _record_delete_reads(self, target: ast.AST) -> None:
+        """Records variables targeted for deletion as downstream reads if within unit boundary."""
+        for subnode in ast.walk(target):
+            if isinstance(subnode, ast.Name) and isinstance(subnode.ctx, ast.Del):
+                if self._should_inspect_read(subnode):
+                    self._record_downstream_read(subnode.id)
+
     def visit_Delete(self, node: ast.Delete) -> None:
         for t in node.targets:
-            for subnode in ast.walk(t):
-                if isinstance(subnode, ast.Name) and isinstance(subnode.ctx, ast.Del):
-                    if self._should_inspect_read(subnode):
-                        self._record_downstream_read(subnode.id)
+            self._record_delete_reads(t)
             self.visit(t)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
@@ -741,7 +768,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         else:
             self.killed = killed_before
 
-    def visit_For(self, node: ast.For) -> None:
+    def visit_For(self, node: Union[ast.For, ast.AsyncFor]) -> None:
         self.visit(node.iter)
         killed_before = set(self.killed)
         self._record_killed_targets([node.target])
@@ -753,7 +780,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self.killed = killed_before
 
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
-        self.visit_For(node)  # type: ignore[arg-type]
+        self.visit_For(node)
 
     def visit_While(self, node: ast.While) -> None:
         killed_before = set(self.killed)
@@ -765,14 +792,14 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             self.visit(stmt)
         self.killed = killed_before
 
-    def visit_Try(self, node: ast.Try) -> None:
+    def visit_Try(self, node: Union[ast.Try, ast.AST]) -> None:
         killed_before = set(self.killed)
-        for stmt in node.body:
+        for stmt in getattr(node, "body", []):
             self.visit(stmt)
         killed_try_body = set(self.killed)
 
         handler_kills: List[Set[str]] = []
-        for handler in node.handlers:
+        for handler in getattr(node, "handlers", []):
             self.killed = set(killed_before)
             if handler.type is not None:
                 self.visit(handler.type)
@@ -785,11 +812,12 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             handler_kills.append(set(self.killed))
 
         self.killed = killed_try_body
-        for stmt in node.orelse:
+        for stmt in getattr(node, "orelse", []):
             self.visit(stmt)
         killed_try_else = set(self.killed)
 
-        if node.handlers:
+        handlers = getattr(node, "handlers", [])
+        if handlers:
             surviving = killed_try_else
             for hk in handler_kills:
                 surviving = surviving & hk
@@ -799,15 +827,15 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         # Seed finalbody with killed_before because exceptions in try body
         # could cause finalbody to run without executing try body assignments
         self.killed = set(killed_before)
-        for stmt in node.finalbody:
+        for stmt in getattr(node, "finalbody", []):
             self.visit(stmt)
 
         self.killed = surviving | set(self.killed)
 
     def visit_TryStar(self, node: ast.AST) -> None:
-        self.visit_Try(node)  # type: ignore[arg-type]
+        self.visit_Try(node)
 
-    def visit_With(self, node: ast.With) -> None:
+    def visit_With(self, node: Union[ast.With, ast.AsyncWith]) -> None:
         killed_before = set(self.killed)
         for item in node.items:
             self.visit(item.context_expr)
@@ -818,7 +846,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self.killed = killed_before
 
     def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
-        self.visit_With(node)  # type: ignore[arg-type]
+        self.visit_With(node)
 
     def visit_Match(self, node: ast.AST) -> None:
         self.visit(getattr(node, "subject"))
@@ -927,6 +955,7 @@ def collect_downstream_read_names(
     candidates: Optional[Set[str]] = None,
     *,
     tree: Optional[ast.AST] = None,
+    skip_pre_unit_closures: bool = False,
 ) -> Optional[Set[str]]:
     """Identifies variable names loaded downstream of a unit within its lexical execution scope.
 
@@ -942,6 +971,10 @@ def collect_downstream_read_names(
     u_end = parse_unit_coord(unit, "end", default=u_start)
     if u_start <= 0 or u_end <= 0 or u_start > u_end:
         return None
+
+    # Fast-path early out: if candidate set is explicitly empty, no outputs can match
+    if candidates is not None and not candidates:
+        return set()
 
     enc = _find_innermost_enclosing_node(
         source_text, unit, (ast.FunctionDef, ast.AsyncFunctionDef), tree=tree
@@ -968,8 +1001,11 @@ def collect_downstream_read_names(
                 if (l_start, l_end) != (u_start, u_end):
                     enclosing_loops.append((l_start, l_end))
 
-    # Free variables captured by pre-unit closures
-    pre_unit_captured_reads = _collect_pre_unit_closures(scope_node, u_start)
+    # Free variables captured by pre-unit closures (skippable in fast mode when precomputed)
+    if skip_pre_unit_closures:
+        pre_unit_captured_reads: Set[str] = set()
+    else:
+        pre_unit_captured_reads = _collect_pre_unit_closures(scope_node, u_start)
 
     visitor = _DownstreamReadVisitor(
         u_start,
@@ -1011,7 +1047,17 @@ def _pair_clone_outputs(
     u1_outs: Sequence[str],
     u2_outs: Sequence[str],
 ) -> List[Tuple[str, str]]:
-    """Establishes an ordered 1-to-1 mapping between clone output variables."""
+    """Establishes an ordered 1-to-1 mapping between clone output variables.
+
+    Pairing Algorithm:
+    1. Input deduplication: preserves first-occurrence order via dict.fromkeys.
+    2. Arity equivalence: if the deduplicated counts match (len(u1_dedup) == len(u2_dedup)),
+       it pairs identical names first ('identity-first'), then maps remaining names by position.
+    3. Arity collapse: if deduplicated counts differ (e.g., duplicate output variable names
+       collapsing one side to fewer unique names), it falls back to identical names only.
+       Downstream callers (such as `resolve_generator_subroutine_outputs`) enforce strict
+       arity retention and fail closed if any required output is left unpaired.
+    """
     u1_dedup = list(dict.fromkeys(u1_outs))
     u2_dedup = list(dict.fromkeys(u2_outs))
     if len(u1_dedup) == len(u2_dedup):
@@ -1070,6 +1116,13 @@ def resolve_generator_subroutine_outputs(
 
     # Fail closed: every required downstream output must have a paired counterpart
     if any(o1 not in paired_u1 for o1 in needed1) or any(o2 not in paired_u2 for o2 in needed2):
+        logger.debug(
+            "Rejecting generator subroutine outputs: required downstream outputs "
+            "could not be paired (needed1=%s, needed2=%s, pairs=%s)",
+            needed1,
+            needed2,
+            pairs,
+        )
         return None
 
     kept_pairs = [
@@ -1079,10 +1132,17 @@ def resolve_generator_subroutine_outputs(
     ]
 
     # Fail closed on non-definitely assigned outputs to prevent UnboundLocalError
-    if u1_def is not None and any(o1 not in u1_def for o1, _ in kept_pairs):
-        return None
-    if u2_def is not None and any(o2 not in u2_def for _, o2 in kept_pairs):
-        return None
+    for side_label, def_set, col_idx in (("u1", u1_def, 0), ("u2", u2_def, 1)):
+        if def_set is not None:
+            missing = [p[col_idx] for p in kept_pairs if p[col_idx] not in def_set]
+            if missing:
+                logger.debug(
+                    "Rejecting generator subroutine outputs: %s output lacks definite store "
+                    "before exit, risking UnboundLocalError: %s",
+                    side_label,
+                    missing,
+                )
+                return None
 
     return [o1 for o1, _ in kept_pairs], [o2 for _, o2 in kept_pairs]
 
@@ -1120,6 +1180,7 @@ def resolve_clone_generator_subroutine_outputs(
     tree1: Optional[ast.AST] = None,
     tree2: Optional[ast.AST] = None,
     repo_root: Optional[str] = None,
+    skip_pre_unit_closures: bool = False,
 ) -> Optional[Tuple[List[str], List[str]]]:
     """Resolves output variable bindings for clone generator subroutines across two code units.
 
@@ -1149,7 +1210,13 @@ def resolve_clone_generator_subroutine_outputs(
     for u, cands, s_text, tr in targets:
         src = s_text if s_text is not None else _load_unit_file_text(u, repo_root=repo_root)
         if src is not None:
-            reads = collect_downstream_read_names(src, u, candidates=cands, tree=tr)
+            reads = collect_downstream_read_names(
+                src,
+                u,
+                candidates=cands,
+                tree=tr,
+                skip_pre_unit_closures=skip_pre_unit_closures,
+            )
         else:
             reads = None
         downstream_reads.append(reads)

@@ -220,6 +220,27 @@ Refactoring executes in linear-logarithmic time with incremental validation:
 - **Incremental Collision Checking**: Delegation checks candidate units incrementally ($O(K)$ per unit against existing replacements and physical items), eliminating expensive $O(K \log K)$ buffer dry-runs per clone pair.
 - **Micro-Benchmark**: For modules with 100+ replacements and 10,000+ lines, dual-tier validation and single-pass descending buffer slicing executes in under 5 ms on modern hardware.
 
+#### Safety Model & Fail-Closed Refactoring Guarantees
+
+When synthesizing refactoring patches and shared helpers, `pyDoppelgangerHunt` enforces
+strict fail-closed safety invariants:
+- **Lexical Scope Containment & Pre-Unit Closure Isolation**: Any closures, lambdas, or nested
+  class definitions preceding a candidate unit within the enclosing lexical scope that capture
+  potential output variables are conservatively treated as escaping reads. Even if a closure
+  is not called directly within the unit's immediate block, it may have registered into
+  callback tables or event loops. Candidate outputs captured by pre-unit closures are preserved
+  or cause the pair to fail closed rather than risk silent state corruption.
+- **Definite Assignment Verification**: Synthesized helper return values and tuple-unpacked
+  subroutine outputs require definite assignments along all incoming and internal execution
+  paths. If an output variable could remain unassigned before helper exit, refactoring is
+  rejected to prevent `UnboundLocalError`.
+- **Async Generator Value Prohibition**: In Python, asynchronous generators cannot combine
+  `yield` with explicit `return <value>`. Any candidate clone pair where either unit is an async
+  generator attempting to propagate return values or outputs is unconditionally skipped.
+- **Dual-Tier Transactional Rollback**: If helper extraction or call replacement encounters
+  semantic overlap, token collisions, or dependency graph cycles, the entire refactoring
+  operation rolls back cleanly without leaving partial mutations or corrupting host source files.
+
 To generate a starter configuration file in your project root:
 
 ```bash
