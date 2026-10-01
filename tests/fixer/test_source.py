@@ -567,3 +567,27 @@ def test_find_enclosing_function_is_async_decorated() -> None:
         "    return x * 2\n"
     )
     assert find_enclosing_function_is_async(sync_src, start_line=1, end_line=3) is False
+
+
+def test_find_enclosing_function_is_async_nested_tiebreaker() -> None:
+    """Verifies that when multiple candidate functions enclose a unit, candidates are
+    sorted primarily by span and tie-broken by -earliest_start to select the innermost function."""
+    # Outer sync function enclosing inner async function
+    src_sync_outer = (
+        "def outer():\n"
+        "    async def inner():\n"
+        "        yield 1\n"
+        "    return inner\n"
+    )
+    # Unit inside inner (line 3) -> should resolve to inner's async status (True)
+    assert find_enclosing_function_is_async(src_sync_outer, start_line=3, end_line=3) is True
+
+    # Outer async function enclosing inner sync function
+    src_async_outer = (
+        "async def outer():\n"
+        "    def inner():\n"
+        "        return 1\n"
+        "    return inner()\n"
+    )
+    # Unit inside inner (line 3) -> should resolve to inner's sync status (False)
+    assert find_enclosing_function_is_async(src_async_outer, start_line=3, end_line=3) is False

@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
 from pydoppelgangerhunt.config import normalize_path_string
-from pydoppelgangerhunt.source_lines import split_source_lines
+from pydoppelgangerhunt.source_lines import parse_unit_coord, split_source_lines
 
 
 # ANSI Color Codes
@@ -46,8 +46,8 @@ def colorize(text: str, color_code: str, enabled: bool) -> str:
 
 def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:
     """Reads raw source code lines for a given unit from provided lines or disk."""
-    s_d = int(unit.get("start") or 1)
-    e_d = int(unit.get("end") or s_d)
+    s_d = parse_unit_coord(unit, "start", default=1)
+    e_d = parse_unit_coord(unit, "end", default=s_d)
     n_d = str(unit.get("name") or "unit")
     placeholder = [f"# Source for {n_d} lines {s_d}-{e_d}\n"]
 
@@ -61,7 +61,7 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
                 for ln in source_lines
             ]
         start = max(1, s_d)
-        end = min(len(source_lines), int(unit.get("end") or len(source_lines)))
+        end = min(len(source_lines), parse_unit_coord(unit, "end", default=len(source_lines)))
         return [
             ln if ln.endswith("\n") else ln + "\n"
             for ln in source_lines[start - 1 : end]
@@ -136,7 +136,7 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
             with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
                 all_lines = fh.readlines()
         start = max(1, s_d)
-        end = min(len(all_lines), int(unit.get("end") or len(all_lines)))
+        end = min(len(all_lines), parse_unit_coord(unit, "end", default=len(all_lines)))
         return all_lines[start - 1 : end]
     except OSError:
         return [f"# Unable to read {str(unit.get('file') or '')}\n"]

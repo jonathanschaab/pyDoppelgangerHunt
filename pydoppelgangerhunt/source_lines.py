@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Iterable, Iterator, List, Optional, Sequence, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Union
 
 _PHYSICAL_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
 
@@ -11,8 +11,23 @@ __all__ = [
     "_PHYSICAL_LINE_RE",
     "count_physical_newlines",
     "detect_line_ending",
+    "parse_unit_coord",
     "split_source_lines",
 ]
+
+
+def parse_unit_coord(unit: Dict[str, Any], key: str, default: int = 1) -> int:
+    """Extracts and parses an integer coordinate from a unit dictionary.
+
+    Safely handles integers, numeric strings, and coordinate strings with column
+    offsets (e.g. '12:0'). Raises ValueError for non-numeric strings.
+    """
+    val = unit.get(key)
+    if val is None:
+        return default
+    if isinstance(val, str) and ":" in val:
+        val = val.split(":", 1)[0].strip()
+    return int(val)
 
 
 def split_source_lines(source_text: str) -> List[str]:

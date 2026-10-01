@@ -15,6 +15,7 @@ from pydoppelgangerhunt.fixer.dataflow import _load_unit_file_text
 from pydoppelgangerhunt.fixer.source import (
     _slice_unit_token_lines,
     find_enclosing_function_is_async,
+    parse_unit_coord,
     split_source_lines,
 )
 
@@ -1372,8 +1373,8 @@ def _inspect_unit_scope(
 
     unit_is_async = unit.get("is_async")
     if unit_is_async is None:
-        s_line = int(unit.get("start") or 1)
-        e_line = int(unit.get("end") or s_line)
+        s_line = parse_unit_coord(unit, "start", default=1)
+        e_line = parse_unit_coord(unit, "end", default=s_line)
         source_text: Optional[str] = _load_unit_file_text(unit, repo_root=repo_root)
         if source_text:
             unit_is_async = find_enclosing_function_is_async(

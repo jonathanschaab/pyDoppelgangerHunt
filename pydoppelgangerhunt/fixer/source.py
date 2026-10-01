@@ -13,6 +13,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, 
 from pydoppelgangerhunt.source_lines import (
     count_physical_newlines,
     detect_line_ending,
+    parse_unit_coord,
     split_source_lines,
 )
 
@@ -42,13 +43,6 @@ __all__ = [
 
 UnitDict = Dict[str, Any]
 
-
-def parse_unit_coord(unit: UnitDict, key: str, default: int = 1) -> int:
-    """Extracts and parses an integer coordinate from a unit dictionary."""
-    val = unit.get(key)
-    return int(val if val is not None else default)
-
-
 _parse_unit_coord = parse_unit_coord
 
 
@@ -57,18 +51,12 @@ def is_valid_unit_coordinates(u: Any) -> bool:
     if not isinstance(u, dict):
         return False
     try:
-        s_val = u.get("start")
-        if s_val is not None:
-            int(s_val)
-        e_val = u.get("end")
-        if e_val is not None:
-            int(e_val)
-        sc_val = u.get("start_col")
-        if sc_val is not None:
-            int(sc_val)
-        ec_val = u.get("end_col")
-        if ec_val is not None:
-            int(ec_val)
+        for key in ("start", "end", "start_col", "end_col"):
+            val = u.get(key)
+            if val is not None:
+                if isinstance(val, str) and ":" in val:
+                    val = val.split(":", 1)[0].strip()
+                int(val)
         return True
     except (ValueError, TypeError):
         return False
@@ -1050,7 +1038,7 @@ def find_enclosing_function_is_async(
             tree = ast.parse(source_text)
         except (SyntaxError, ValueError, UnicodeDecodeError):
             return False
-    candidates: List[Tuple[int, bool]] = []
+    candidates: List[Tuple[int, bool, int]] = []
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             n_start = getattr(node, "lineno", 0)
@@ -1066,8 +1054,9 @@ def find_enclosing_function_is_async(
                 candidates.append((
                     n_end - earliest_start,
                     isinstance(node, ast.AsyncFunctionDef),
+                    earliest_start,
                 ))
     if not candidates:
         return False
-    candidates.sort(key=lambda item: item[0])
+    candidates.sort(key=lambda item: (item[0], -item[2]))
     return candidates[0][1]

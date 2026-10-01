@@ -2894,11 +2894,11 @@ def generate_refactoring_patch(
             inputs = list(scope.get("inputs", []))
             if effective_binding == "module":
                 inputs = _prune_unshared_receivers(inputs, u1_eff, u2_eff, s1, s2, repo_root=str(root))
-            outputs = _extract_effective_unit_outputs(u1, scope)
-            u1_outs = _extract_effective_unit_outputs(u1, s1)
-            u2_outs = _extract_effective_unit_outputs(u2, s2)
-            is_sub1 = is_subroutine_unit(u1)
-            is_sub2 = is_subroutine_unit(u2)
+            outputs = _extract_effective_unit_outputs(u1_eff, scope)
+            u1_outs = _extract_effective_unit_outputs(u1_eff, s1)
+            u2_outs = _extract_effective_unit_outputs(u2_eff, s2)
+            is_sub1 = is_subroutine_unit(u1_eff)
+            is_sub2 = is_subroutine_unit(u2_eff)
             if is_sub1 != is_sub2:
                 logger.debug(
                     "Skipping clone pair (%s, %s): mismatched subroutine kinds "
@@ -2913,8 +2913,8 @@ def generate_refactoring_patch(
             has_yield = bool(s1.get("has_yield") or s2.get("has_yield"))
             if is_sub and has_yield:
                 resolved_sub_outs = resolve_clone_generator_subroutine_outputs(
-                    u1=u1,
-                    u2=u2,
+                    u1=u1_eff,
+                    u2=u2_eff,
                     scope1=s1,
                     scope2=s2,
                     source_text1=f1_plan.orig_text,

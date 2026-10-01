@@ -22,19 +22,18 @@ def _load_unit_file_text(
     source_text = unit.get("source_text") or unit.get("file_source")
     if source_text is not None:
         return str(source_text)
+    f_raw = normalize_path_string(str(unit.get("file") or ""), strip_anchor=True)
+    if f_raw:
+        p = Path(f_raw)
+        f_path = p if p.is_file() or p.is_absolute() else (Path(repo_root or os.getcwd()) / p)
+        if f_path.is_file():
+            try:
+                return f_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                pass
     if "source_lines" in unit and isinstance(unit["source_lines"], (list, tuple)):
         return "".join(unit["source_lines"])
-    f_raw = normalize_path_string(str(unit.get("file") or ""), strip_anchor=True)
-    if not f_raw:
-        return None
-    p = Path(f_raw)
-    f_path = p if p.is_file() or p.is_absolute() else (Path(repo_root or os.getcwd()) / p)
-    if not f_path.is_file():
-        return None
-    try:
-        return f_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return None
+    return None
 
 
 def _parse_source_tree(

@@ -3324,3 +3324,95 @@ def test_extract_nested_scope_free_reads_class_assigned_nonlocal() -> None:
     assert isinstance(class_node, ast.ClassDef)
     free_reads = _extract_nested_scope_free_reads(class_node)
     assert "captured_var" in free_reads
+
+
+def test_inspect_unit_scope_coordinate_string_with_column_offset() -> None:
+    """Verifies that _inspect_unit_scope parses coordinate strings with column offsets."""
+    full_text = (
+        "async def async_worker(items):\n"
+        "    total = 0\n"
+        "    for item in items:\n"
+        "        total += item\n"
+        "    return total\n"
+    )
+    unit = {
+        "start": "3:4",
+        "end": "4:20",
+        "source_lines": ["    for item in items:\n", "        total += item\n"],
+        "source_text": full_text,
+    }
+    scope = analyze_unit_variable_scope(unit)
+    assert scope["is_async"] is True
+
+
+def test_load_unit_file_text_prioritizes_disk_file_over_sliced_source_lines(
+    tmp_path: Path,
+) -> None:
+    """Verifies that _load_unit_file_text prefers reading the full file from disk when it exists,
+    falling back to sliced source_lines only when the file is not on disk."""
+    full_file = tmp_path / "worker.py"
+    disk_content = (
+        "async def worker():\n"
+        "    for i in range(10):\n"
+        "        yield i\n"
+    )
+    full_file.write_text(disk_content, encoding="utf-8")
+    unit = {
+        "file": str(full_file),
+        "start": 2,
+        "end": 3,
+        "source_lines": ["    for i in range(10):\n", "        yield i\n"],
+    }
+    loaded = _load_unit_file_text(unit, repo_root=str(tmp_path))
+    assert loaded == disk_content
+
+
+def test_patch_subroutine_effective_units_with_precomputed_outputs(
+    tmp_path: Path,
+) -> None:
+    """Verifies that generate_refactoring_patch uses effective units with precomputed outputs
+    when resolving generator subroutine outputs."""
+    src1 = (
+        "def process1(items):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    return total\n"
+    )
+    src2 = (
+        "def process2(items):\n"
+        "    count = 0\n"
+        "    for y in items:\n"
+        "        count += y\n"
+        "        yield y\n"
+        "    return count\n"
+    )
+    f1 = tmp_path / "p1.py"
+    f2 = tmp_path / "p2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {
+        "file": str(f1),
+        "start": 3,
+        "end": 5,
+        "name": "process1:for",
+        "kind": "compound_block",
+        "outputs": ["total", "x"],
+    }
+    u2 = {
+        "file": str(f2),
+        "start": 3,
+        "end": 5,
+        "name": "process2:for",
+        "kind": "compound_block",
+        "outputs": ["count", "y"],
+    }
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch != ""
+    assert "yield from _shared" in patch
+    assert "total, x = (yield from _shared" in patch
+    assert "count, y = (yield from _shared" in patch
