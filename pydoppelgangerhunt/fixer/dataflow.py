@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from collections import OrderedDict
 import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
@@ -503,17 +504,8 @@ class _OuterExprVisitor(_BaseScopeVisitor):
 
 def _extract_nested_scope_free_reads(
     node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef],
-    cache: Optional[Dict[int, Set[str]]] = None,
 ) -> Set[str]:
     """Extracts free variable references escaping a nested function or executed class body."""
-    if cache is not None and id(node) in cache:
-        return set(cache[id(node)])
-    cached: Optional[Union[frozenset[str], Set[str]]] = getattr(node, "_free_reads_cache", None)
-    if cached is not None:
-        if cache is not None:
-            cache[id(node)] = set(cached)
-        return set(cached)
-
     type_param_names: Set[str] = set()
     for tp in getattr(node, "type_params", []):
         tp_name = getattr(tp, "name", None)
@@ -541,14 +533,7 @@ def _extract_nested_scope_free_reads(
             - class_visitor.globals
             - type_param_names
         )
-        class_res = (outer_visitor.names - type_param_names) | class_free
-        try:
-            setattr(node, "_free_reads_cache", frozenset(class_res))
-        except AttributeError:
-            pass
-        if cache is not None:
-            cache[id(node)] = set(class_res)
-        return class_res
+        return (outer_visitor.names - type_param_names) | class_free
 
     defaults = node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]
     for d in defaults:
@@ -578,14 +563,7 @@ def _extract_nested_scope_free_reads(
         - (func_visitor.params | func_visitor.local_stores)
     ) | func_visitor.nonlocals
     escaped -= func_visitor.globals
-    func_res = (outer_visitor.names - type_param_names) | escaped
-    try:
-        setattr(node, "_free_reads_cache", frozenset(func_res))
-    except AttributeError:
-        pass
-    if cache is not None:
-        cache[id(node)] = set(func_res)
-    return func_res
+    return (outer_visitor.names - type_param_names) | escaped
 
 
 def _extract_assigned_names(target: ast.AST) -> List[str]:
@@ -949,6 +927,15 @@ def _collect_pre_unit_closures(
     return captured_reads
 
 
+_MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
+_downstream_reads_cache: OrderedDict[Tuple[Any, ...], frozenset[str]] = OrderedDict()
+
+
+def _clear_downstream_reads_cache() -> None:
+    """Clears the downstream read memoization cache."""
+    _downstream_reads_cache.clear()
+
+
 def collect_downstream_read_names(
     source_text: str,
     unit: Dict[str, Any],
@@ -975,6 +962,26 @@ def collect_downstream_read_names(
     # Fast-path early out: if candidate set is explicitly empty, no outputs can match
     if candidates is not None and not candidates:
         return set()
+
+    # Form memoization cache key to accelerate repeated candidate pair inspections
+    tree_key = id(tree) if tree is not None else (len(source_text), hash(source_text))
+    start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
+    end_col = _extract_unit_end_col(unit)
+    cands_key = frozenset(candidates) if candidates is not None else None
+    cache_key = (
+        tree_key,
+        unit.get("file", ""),
+        u_start,
+        u_end,
+        start_col,
+        end_col,
+        cands_key,
+        bool(skip_pre_unit_closures),
+    )
+    if cache_key in _downstream_reads_cache:
+        cached = _downstream_reads_cache[cache_key]
+        _downstream_reads_cache.move_to_end(cache_key)
+        return set(cached)
 
     enc = _find_innermost_enclosing_node(
         source_text, unit, (ast.FunctionDef, ast.AsyncFunctionDef), tree=tree
@@ -1039,6 +1046,10 @@ def collect_downstream_read_names(
         loaded.update(pre_unit_captured_reads & candidates)
     else:
         loaded.update(pre_unit_captured_reads)
+
+    if len(_downstream_reads_cache) >= _MAX_DOWNSTREAM_CACHE_SIZE:
+        _downstream_reads_cache.popitem(last=False)
+    _downstream_reads_cache[cache_key] = frozenset(loaded)
 
     return loaded
 

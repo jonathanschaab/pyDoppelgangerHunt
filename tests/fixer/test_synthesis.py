@@ -30,6 +30,7 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
 )
 from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
     GeneratorCloneSideData,
+    _clear_downstream_reads_cache,
     _extract_nested_scope_free_reads,
     _extract_unit_end_col,
     _load_unit_file_text,
@@ -3590,8 +3591,8 @@ def test_collect_downstream_read_names_skip_pre_unit_closures() -> None:
     assert reads_skipped == set()
 
 
-def test_extract_nested_scope_free_reads_memoization() -> None:
-    """Verifies that _extract_nested_scope_free_reads memoizes free reads on AST nodes."""
+def test_extract_nested_scope_free_reads_pure_ast_immutability() -> None:
+    """Verifies that _extract_nested_scope_free_reads does not mutate AST nodes."""
     code = (
         "def compute(a):\n"
         "    return a + b + c\n"
@@ -3600,10 +3601,30 @@ def test_extract_nested_scope_free_reads_memoization() -> None:
     fn_node = tree.body[0]
     free_reads = _extract_nested_scope_free_reads(fn_node)  # type: ignore[arg-type]
     assert free_reads == {"b", "c"}
-    assert getattr(fn_node, "_free_reads_cache") == frozenset({"b", "c"})
-
-    # Subsequent call hits the cache
-    free_reads_cached = _extract_nested_scope_free_reads(fn_node)  # type: ignore[arg-type]
-    assert free_reads_cached == {"b", "c"}
+    assert not hasattr(fn_node, "_free_reads_cache")
 
 
+def test_collect_downstream_read_names_lru_caching() -> None:
+    """Verifies that collect_downstream_read_names uses an LRU cache across repeated calls."""
+    _clear_downstream_reads_cache()
+    code = (
+        "def run():\n"
+        "    cb = lambda: extra\n"
+        "    for x in range(10):\n"
+        "        yield x\n"
+        "        extra = x\n"
+        "    print(extra)\n"
+    )
+    tree = ast.parse(code)
+    unit = {"file": "mod.py", "start": 3, "end": 5}
+    reads1 = collect_downstream_read_names(code, unit, candidates={"extra"}, tree=tree)
+    assert reads1 == {"extra"}
+
+    # Subsequent call hits the cache and returns a fresh copy of the set
+    reads2 = collect_downstream_read_names(code, unit, candidates={"extra"}, tree=tree)
+    assert reads2 == {"extra"}
+    assert reads1 is not reads2
+
+    reads1.add("mutated")
+    reads3 = collect_downstream_read_names(code, unit, candidates={"extra"}, tree=tree)
+    assert reads3 == {"extra"}

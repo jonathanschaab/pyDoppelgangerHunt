@@ -198,7 +198,10 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         type=str,
         choices=["strict", "lenient"],
         default=None,
-        help="Closure analysis strictness for generator subroutines ('strict' or 'lenient')",
+        help=(
+            "Closure strictness ('strict' or 'lenient'; "
+            "takes precedence over --skip-pre-unit-closures)"
+        ),
     )
 
     color_group = parser.add_mutually_exclusive_group()

@@ -229,7 +229,9 @@ strict fail-closed safety invariants:
   potential output variables are conservatively treated as escaping reads. Even if a closure
   is not called directly within the unit's immediate block, it may have registered into
   callback tables or event loops. Candidate outputs captured by pre-unit closures are preserved
-  or cause the pair to fail closed rather than risk silent state corruption.
+  or cause the pair to fail closed rather than risk silent state corruption. To bypass pre-unit
+  closure scanning when closures are known not to escape, pass `--skip-pre-unit-closures` or
+  `--closure-strictness lenient` (when both are supplied, `--closure-strictness` takes precedence).
 - **Definite Assignment Verification**: Synthesized helper return values and tuple-unpacked
   subroutine outputs require definite assignments along all incoming and internal execution
   paths. If an output variable could remain unassigned before helper exit, refactoring is
@@ -267,7 +269,7 @@ pydoppelgangerhunt --init
 | `--cross-file-strategy` | `auto\|shared_module\|host_module\|skip` | Cross-module deduplication strategy (`auto`, `shared_module`, `host_module`, or `skip`; default: `auto`) |
 | `--shared-module-name` | `FILENAME` | Target filename for shared utility extractions (default: `_common.py`) |
 | `--skip-pre-unit-closures` | Flag | Skip pre-unit closure scan during subroutine extraction |
-| `--closure-strictness` | `strict\|lenient` | Closure strictness mode (`strict` or `lenient`) |
+| `--closure-strictness` | `strict\|lenient` | Closure strictness mode (precedes boolean flag) |
 | `--sort-by` | `similarity\|priority\|sloc` | Sort clone hits (default: `similarity`) |
 | `--priority` | Flag | Sort clones by Priority score: $\text{Sim} \times \text{SLOC} \times \text{Complexity}$ |
 | `--top` | `INT` | Truncate report to top $N$ clone pairs |

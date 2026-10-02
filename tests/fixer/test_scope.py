@@ -1529,3 +1529,10 @@ def test_dispatch_analyze_unit_variable_scope_mock_fallback() -> None:
         res_mock = dispatch_analyze_unit_variable_scope(u1, tree1=ast.parse("x = 1\n"))
         assert res_mock == {"mocked": True, "unit": u1}
 
+    # 3. Target accepts tree1 but raises TypeError internally; must not be swallowed
+    def mock_raising_scope(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        raise TypeError("tree1 parameter has an unexpected invalid type")
+
+    with mock.patch("pydoppelgangerhunt.fixer.analyze_unit_variable_scope", mock_raising_scope):
+        with pytest.raises(TypeError, match="tree1 parameter has an unexpected invalid type"):
+            dispatch_analyze_unit_variable_scope(u1, tree1=ast.parse("x = 1\n"))

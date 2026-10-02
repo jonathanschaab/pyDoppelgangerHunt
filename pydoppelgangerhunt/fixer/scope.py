@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import inspect
 import logging
 import sys
 import textwrap
@@ -1564,9 +1565,16 @@ def dispatch_analyze_unit_variable_scope(
             u1, u2=u2, repo_root=repo_root, tree1=tree1, tree2=tree2
         )
 
+    supports_trees = True
     try:
+        sig = inspect.signature(target)
+        has_var_kw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+        supports_trees = "tree1" in sig.parameters or has_var_kw
+    except (ValueError, TypeError):
+        supports_trees = True
+
+    if supports_trees:
         return target(u1, u2=u2, repo_root=repo_root, tree1=tree1, tree2=tree2)
-    except TypeError as exc:
-        if "tree1" in str(exc) or "tree2" in str(exc):
-            return target(u1, u2=u2, repo_root=repo_root)
-        raise
+    return target(u1, u2=u2, repo_root=repo_root)
