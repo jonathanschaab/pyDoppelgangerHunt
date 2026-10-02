@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from collections import OrderedDict
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
@@ -36,8 +37,9 @@ def _load_unit_file_text(
             f_path = p
         if f_path.is_file():
             try:
-                return f_path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
+                with open(f_path, "r", encoding="utf-8", errors="replace") as fh:
+                    return fh.read()
+            except OSError:
                 pass
     if "source_lines" in unit and isinstance(unit["source_lines"], (list, tuple)):
         return "".join(unit["source_lines"])
@@ -788,6 +790,12 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
                 self.killed.add(handler.name)
             for stmt in handler.body:
                 self.visit(stmt)
+            # PEP 3110: Exception variables bound via 'except ... as e:' are implicitly
+            # cleared (equivalent to 'del e') at the end of the except block in Python 3.
+            # Discarding handler.name leaves the variable in whatever killed state it held
+            # prior to the handler. This is conservatively safe: if a prior unit defined 'e',
+            # subsequent reads of 'e' after the try/except continue to be treated as requiring
+            # the unit's output rather than pruning it.
             if handler.name:
                 self.killed.discard(handler.name)
             handler_kills.append(set(self.killed))
@@ -969,15 +977,25 @@ def collect_downstream_read_names(
         return set()
 
     # Form memoization cache key to accelerate repeated candidate pair inspections.
-    # Note: keyed by content hash (len, hash) rather than id(tree) to prevent collisions
-    # across recycled AST memory addresses in long-running processes.
-    src_key = (len(source_text), hash(source_text))
+    # Keyed by content length, hash, SHA-256 digest prefix, and file mtime to prevent
+    # collisions across recycled AST addresses, same-length edits, and disk modifications.
+    file_path_str = str(unit.get("file") or "")
+    mtime = unit.get("mtime") or unit.get("timestamp")
+    if mtime is None and file_path_str:
+        try:
+            mtime = Path(file_path_str).stat().st_mtime_ns
+        except OSError:
+            mtime = None
+    content_digest = hashlib.sha256(
+        source_text.encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
+    src_key = (len(source_text), hash(source_text), content_digest, mtime)
     start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
     end_col = _extract_unit_end_col(unit)
     cands_key = frozenset(candidates) if candidates is not None else None
     cache_key = (
         src_key,
-        unit.get("file", ""),
+        file_path_str,
         u_start,
         u_end,
         start_col,

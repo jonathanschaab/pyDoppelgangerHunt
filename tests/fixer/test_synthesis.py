@@ -3662,3 +3662,41 @@ def test_collect_downstream_read_names_cache_isolation_on_content_change() -> No
     reads2 = collect_downstream_read_names(code2, unit)
     assert reads1 == {"x"}
     assert reads2 == {"y"}
+
+
+def test_load_unit_file_text_resilience_to_non_utf8_bytes(tmp_path: Path) -> None:
+    """Verifies that _load_unit_file_text uses errors='replace' on non-UTF-8 bytes."""
+    latin1_file = tmp_path / "latin1.py"
+    latin1_file.write_bytes(b"def compute():\n    # Legacy comment \xe9\n    return 42\n")
+    loaded = _load_unit_file_text({"file": str(latin1_file)})
+    assert loaded is not None
+    assert "return 42" in loaded
+    assert "\ufffd" in loaded
+
+
+def test_collect_downstream_read_names_cache_invalidation_on_mtime() -> None:
+    """Verifies that changing mtime creates distinct cache entries for downstream reads."""
+    _clear_downstream_reads_cache()
+    code = "def f():\n    x = 1\n    return x\n"
+    unit1 = {"file": "f.py", "start": 2, "end": 2, "mtime": 100}
+    unit2 = {"file": "f.py", "start": 2, "end": 2, "mtime": 200}
+    reads1 = collect_downstream_read_names(code, unit1)
+    reads2 = collect_downstream_read_names(code, unit2)
+    assert reads1 == {"x"}
+    assert reads2 == {"x"}
+
+
+def test_collect_downstream_read_names_disk_mtime_invalidation(tmp_path: Path) -> None:
+    """Verifies that disk mtime is incorporated into cache key for downstream reads."""
+    _clear_downstream_reads_cache()
+    f_path = tmp_path / "target.py"
+    code1 = "def f():\n    x = 1\n    return x\n"
+    f_path.write_text(code1, encoding="utf-8")
+    unit = {"file": str(f_path), "start": 2, "end": 2}
+    reads1 = collect_downstream_read_names(code1, unit)
+    assert reads1 == {"x"}
+
+    code2 = "def f():\n    y = 2\n    return y\n"
+    f_path.write_text(code2, encoding="utf-8")
+    reads2 = collect_downstream_read_names(code2, unit)
+    assert reads2 == {"y"}
