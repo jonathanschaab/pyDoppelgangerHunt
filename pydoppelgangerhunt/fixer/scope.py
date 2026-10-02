@@ -61,7 +61,15 @@ def _normalize_receiver_attr_name(
 
 
 def is_subroutine_unit(unit: Dict[str, Any]) -> bool:
-    """Checks whether an AST code unit is a subroutine block rather than a whole function."""
+    """Checks whether an AST code unit is a subroutine block rather than a whole function.
+
+    Classification Rules:
+    1. Known subroutine kinds ('compound_block', 'sliding_window', 'clause_branch') return True.
+    2. Whole-callable or expression kinds ('function', 'closure', 'method', 'comprehension',
+       'complex_expr') return False.
+    3. Name heuristic fallback: when 'kind' is unspecified or unrecognized, units whose 'name'
+       contains ':' (e.g. 'fn:for#1' or 'process:if') are classified as subroutine blocks.
+    """
     unit_kind = str(unit.get("kind") or "")
     if unit_kind in ("compound_block", "sliding_window", "clause_branch"):
         return True

@@ -31,7 +31,10 @@ from pydoppelgangerhunt.config import (
 )
 from pydoppelgangerhunt.canonical_path import CanonicalPathResolver
 from pydoppelgangerhunt.coverage import check_asymmetric_coverage, read_coverage_data
-from pydoppelgangerhunt.fixer import generate_refactoring_patch
+from pydoppelgangerhunt.fixer import (
+    generate_refactoring_patch,
+    resolve_closure_strictness_mode,
+)
 from pydoppelgangerhunt.git_diff import (
     DiffRangeMap,
     check_temporal_divergence,
@@ -1118,14 +1121,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     shared_module_name = str(args.shared_module_name or tool_cfg.get("shared_module_name", "_common.py"))
     raw_strictness = args.closure_strictness or tool_cfg.get("closure_strictness")
-    if raw_strictness is not None:
-        closure_strictness = str(raw_strictness).strip().lower()
-        if closure_strictness not in ("strict", "lenient"):
-            closure_strictness = "strict"
-    else:
-        cfg_skip = bool(tool_cfg.get("skip_pre_unit_closures", False))
-        closure_strictness = "lenient" if args.skip_pre_unit_closures or cfg_skip else "strict"
-    skip_pre_unit_closures = closure_strictness == "lenient"
+    cfg_skip = bool(tool_cfg.get("skip_pre_unit_closures", False))
+    effective_skip_bool = bool(args.skip_pre_unit_closures or cfg_skip)
+    closure_strictness, skip_pre_unit_closures = resolve_closure_strictness_mode(
+        closure_strictness=raw_strictness,
+        skip_pre_unit_closures=effective_skip_bool,
+    )
 
     baseline_path = args.baseline or tool_cfg.get("baseline")
     preloaded_baseline: Optional[BaselineFingerprints] = None

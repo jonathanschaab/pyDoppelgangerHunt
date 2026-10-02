@@ -27,6 +27,7 @@ from pydoppelgangerhunt import (
 from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _build_whole_method_delegation,
     patch as patch_mod,
+    resolve_closure_strictness_mode,
 )
 from pydoppelgangerhunt.fixer.depgraph import build_module_graph
 
@@ -8713,3 +8714,53 @@ def test_generate_refactoring_patch_closure_strictness_knob(tmp_path: Path) -> N
         skip_pre_unit_closures=True,
     )
     assert patch_bool != ""
+
+
+def test_resolve_closure_strictness_mode_aliases() -> None:
+    """Verifies resolve_closure_strictness_mode maps all aliases and honors precedence."""
+    assert resolve_closure_strictness_mode("lenient") == ("lenient", True)
+    assert resolve_closure_strictness_mode("fast") == ("lenient", True)
+    assert resolve_closure_strictness_mode("skip") == ("lenient", True)
+    assert resolve_closure_strictness_mode("strict") == ("strict", False)
+    assert resolve_closure_strictness_mode("fail_closed") == ("strict", False)
+
+    # Boolean fallback when None
+    assert resolve_closure_strictness_mode(None, skip_pre_unit_closures=True) == ("lenient", True)
+    assert resolve_closure_strictness_mode(None, skip_pre_unit_closures=False) == ("strict", False)
+
+    # Precedence: explicit strictness overrides boolean flag
+    assert resolve_closure_strictness_mode(
+        "strict", skip_pre_unit_closures=True
+    ) == ("strict", False)
+    assert resolve_closure_strictness_mode(
+        "lenient", skip_pre_unit_closures=False
+    ) == ("lenient", True)
+
+
+def test_generate_refactoring_patch_subroutine_unpaired_outputs_rejected(tmp_path: Path) -> None:
+    """Verifies that non-generator subroutines with unpaired outputs fail closed safely."""
+    f1 = tmp_path / "f1.py"
+    f2 = tmp_path / "f2.py"
+    f1.write_text("def run1():\n    a = 1\n    return a\n", encoding="utf-8")
+    f2.write_text("def run2():\n    b = 1\n    c = 2\n    return b + c\n", encoding="utf-8")
+
+    u1 = {
+        "file": str(f1),
+        "start": 2,
+        "end": 2,
+        "name": "run1:block",
+        "kind": "compound_block",
+        "outputs": ["a", "a"],
+    }
+    u2 = {
+        "file": str(f2),
+        "start": 2,
+        "end": 3,
+        "name": "run2:block",
+        "kind": "compound_block",
+        "outputs": ["b", "c"],
+    }
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch == ""

@@ -31,8 +31,10 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
 from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
     GeneratorCloneSideData,
     _clear_downstream_reads_cache,
+    _extract_effective_unit_outputs,
     _extract_nested_scope_free_reads,
     _extract_unit_end_col,
+    _get_valid_unit_bounds,
     _load_unit_file_text,
     _pair_clone_outputs,
     _resolve_unit_ast_end_col,
@@ -3628,3 +3630,35 @@ def test_collect_downstream_read_names_lru_caching() -> None:
     reads1.add("mutated")
     reads3 = collect_downstream_read_names(code, unit, candidates={"extra"}, tree=tree)
     assert reads3 == {"extra"}
+
+
+def test_get_valid_unit_bounds_malformed_coordinates() -> None:
+    """Verifies that _get_valid_unit_bounds handles malformed coordinates defensively."""
+    assert _get_valid_unit_bounds({"start": "invalid"}) is None
+    assert _get_valid_unit_bounds({"start": "10", "end": "invalid"}) is None
+    assert _get_valid_unit_bounds({"start": None}) is None
+    assert _get_valid_unit_bounds({"start": 0}) is None
+    assert _get_valid_unit_bounds({"start": 5, "end": 2}) is None
+    assert _get_valid_unit_bounds({"start": "2", "end": "5"}) == (2, 5)
+
+
+def test_collect_downstream_read_names_malformed_coordinates() -> None:
+    """Verifies that collect_downstream_read_names handles malformed coordinates gracefully."""
+    assert collect_downstream_read_names("x = 1\n", {"start": "invalid"}) is None
+
+
+def test_extract_effective_unit_outputs_set_normalized_sorted() -> None:
+    """Verifies that set outputs are normalized to a deterministic sorted list."""
+    assert _extract_effective_unit_outputs({"outputs": {"z", "a", "m"}}, {}) == ["a", "m", "z"]
+
+
+def test_collect_downstream_read_names_cache_isolation_on_content_change() -> None:
+    """Verifies that downstream read cache isolates entries when source content changes."""
+    _clear_downstream_reads_cache()
+    code1 = "def f():\n    x = 1\n    return x\n"
+    code2 = "def f():\n    y = 2\n    return y\n"
+    unit = {"file": "f.py", "start": 2, "end": 2}
+    reads1 = collect_downstream_read_names(code1, unit)
+    reads2 = collect_downstream_read_names(code2, unit)
+    assert reads1 == {"x"}
+    assert reads2 == {"y"}

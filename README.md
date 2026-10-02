@@ -243,6 +243,16 @@ strict fail-closed safety invariants:
   semantic overlap, token collisions, or dependency graph cycles, the entire refactoring
   operation rolls back cleanly without leaving partial mutations or corrupting host source files.
 
+### Troubleshooting: When the Patcher Refuses a Candidate Pair
+If `pyDoppelgangerHunt` reports clones but does not propose extractions for a pair when running
+with `--patch`, check verbose logs (`-v` or logging level `DEBUG`):
+- **Pre-Unit Closure Escapes**: If candidate outputs are captured by closures or callbacks defined
+  prior to the unit, run with `--skip-pre-unit-closures` or `--closure-strictness lenient`.
+- **Indefinite Stores**: If an output variable lacks definite assignment along every internal
+  path, the extraction is rejected to protect against runtime `UnboundLocalError`.
+- **Unpaired Outputs**: When duplicate variable names or arity mismatches prevent 1-to-1 output
+  pairing, the pair fails closed safely.
+
 To generate a starter configuration file in your project root:
 
 ```bash

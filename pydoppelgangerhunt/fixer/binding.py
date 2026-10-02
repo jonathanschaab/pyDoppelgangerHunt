@@ -15,6 +15,7 @@ from pydoppelgangerhunt.fixer.dataflow import (
     collect_downstream_read_names,
     is_async_generator_with_return_value,
     resolve_clone_generator_subroutine_outputs,
+    resolve_closure_strictness_mode,
     resolve_generator_subroutine_outputs,
     _find_innermost_enclosing_node,
     _load_unit_file_text,
@@ -32,6 +33,7 @@ __all__ = [
     "find_enclosing_function",
     "is_async_generator_with_return_value",
     "resolve_clone_generator_subroutine_outputs",
+    "resolve_closure_strictness_mode",
     "resolve_generator_subroutine_outputs",
 ]
 

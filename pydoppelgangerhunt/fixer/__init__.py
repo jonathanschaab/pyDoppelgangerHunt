@@ -25,6 +25,7 @@ from pydoppelgangerhunt.fixer.binding import (
     find_enclosing_function,
     is_async_generator_with_return_value,
     resolve_clone_generator_subroutine_outputs,
+    resolve_closure_strictness_mode,
     resolve_generator_subroutine_outputs,
 )
 from pydoppelgangerhunt.fixer.depgraph import (
@@ -151,6 +152,7 @@ __all__ = [
     "refactor_module_units",
     "replace_unit_in_source",
     "resolve_clone_generator_subroutine_outputs",
+    "resolve_closure_strictness_mode",
     "resolve_generator_subroutine_outputs",
     "resolve_shared_module_file",
     "resolve_unit_replacement",

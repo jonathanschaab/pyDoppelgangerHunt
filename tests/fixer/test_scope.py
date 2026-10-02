@@ -176,14 +176,16 @@ def test_fixer_control_flow_and_side_effect_safety(tmp_path: Path) -> None:
     file_target.write_text(
         '"""Target module docstring."""\n\n'
         'from __future__ import annotations\n\n'
-        'def run_step(a: int, b: int) -> int:\n'
-        '    return a + b\n',
+        'def run_step(a: int, b: int) -> tuple[int, int]:\n'
+        '    a += b\n'
+        '    b += 1\n'
+        '    return a, b\n',
         encoding="utf-8",
     )
     u_patch1 = {
         "file": str(file_target),
-        "start": 5,
-        "end": 6,
+        "start": 6,
+        "end": 7,
         "name": "run_step:stmts",
         "kind": "sliding_window",
     }

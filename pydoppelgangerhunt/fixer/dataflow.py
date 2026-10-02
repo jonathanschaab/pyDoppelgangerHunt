@@ -61,8 +61,11 @@ def _parse_source_tree(
 
 def _get_valid_unit_bounds(unit: Dict[str, Any]) -> Optional[Tuple[int, int]]:
     """Extracts positive start and end line coordinates from a unit dict."""
-    u_start = parse_unit_coord(unit, "start", default=0)
-    u_end = parse_unit_coord(unit, "end", default=u_start)
+    try:
+        u_start = parse_unit_coord(unit, "start", default=0)
+        u_end = parse_unit_coord(unit, "end", default=u_start)
+    except (ValueError, TypeError):
+        return None
     if u_start <= 0 or u_end <= 0 or u_start > u_end:
         return None
     return u_start, u_end
@@ -954,22 +957,26 @@ def collect_downstream_read_names(
     beforehand, the generator subroutine will fail the definiteness check and fail closed
     (skipped during refactoring patch synthesis with a diagnostic DEBUG log).
     """
-    u_start = parse_unit_coord(unit, "start", default=0)
-    u_end = parse_unit_coord(unit, "end", default=u_start)
-    if u_start <= 0 or u_end <= 0 or u_start > u_end:
+    # Invariant: downstream live names originate from three distinct sources:
+    # (1) post-unit statements, (2) enclosing loop-carried paths, (3) escaping pre-unit closures.
+    bounds = _get_valid_unit_bounds(unit)
+    if bounds is None:
         return None
+    u_start, u_end = bounds
 
     # Fast-path early out: if candidate set is explicitly empty, no outputs can match
     if candidates is not None and not candidates:
         return set()
 
-    # Form memoization cache key to accelerate repeated candidate pair inspections
-    tree_key = id(tree) if tree is not None else (len(source_text), hash(source_text))
+    # Form memoization cache key to accelerate repeated candidate pair inspections.
+    # Note: keyed by content hash (len, hash) rather than id(tree) to prevent collisions
+    # across recycled AST memory addresses in long-running processes.
+    src_key = (len(source_text), hash(source_text))
     start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
     end_col = _extract_unit_end_col(unit)
     cands_key = frozenset(candidates) if candidates is not None else None
     cache_key = (
-        tree_key,
+        src_key,
         unit.get("file", ""),
         u_start,
         u_end,
@@ -1012,6 +1019,8 @@ def collect_downstream_read_names(
     if skip_pre_unit_closures:
         pre_unit_captured_reads: Set[str] = set()
     else:
+        # Note: may intentionally over-capture nested lambda free variables as documented
+        # in _collect_pre_unit_closures to guarantee fail-closed safety for escaping callbacks.
         pre_unit_captured_reads = _collect_pre_unit_closures(scope_node, u_start)
 
     visitor = _DownstreamReadVisitor(
@@ -1176,9 +1185,36 @@ def _extract_effective_unit_outputs(
 ) -> List[str]:
     """Extracts non-global, non-local outputs from precomputed unit dict or analyzed scope."""
     raw = unit.get("outputs")
-    cands = raw if isinstance(raw, (list, tuple, set)) else scope.get("outputs", [])
+    if isinstance(raw, set):
+        cands: Sequence[str] = sorted(raw)
+    elif isinstance(raw, (list, tuple)):
+        cands = list(raw)
+    else:
+        cands = scope.get("outputs", [])
     excluded = set(scope.get("globals", [])) | set(scope.get("nonlocals", []))
     return [v for v in cands if v not in excluded]
+
+
+def resolve_closure_strictness_mode(
+    closure_strictness: Optional[str] = None,
+    skip_pre_unit_closures: bool = False,
+) -> Tuple[str, bool]:
+    """Resolves canonical closure strictness mode ('strict' or 'lenient') and boolean skip flag.
+
+    Precedence:
+    Explicit closure_strictness takes precedence over the boolean flag. Permissive aliases
+    ('lenient', 'fast', 'skip') map to ('lenient', True), while conservative aliases
+    ('strict', 'fail_closed') map to ('strict', False). If unspecified or unrecognized,
+    falls back to skip_pre_unit_closures.
+    """
+    if closure_strictness is not None:
+        c_mode = str(closure_strictness).strip().lower()
+        if c_mode in ("lenient", "fast", "skip"):
+            return "lenient", True
+        if c_mode in ("strict", "fail_closed"):
+            return "strict", False
+    is_lenient = bool(skip_pre_unit_closures)
+    return ("lenient" if is_lenient else "strict"), is_lenient
 
 
 def resolve_clone_generator_subroutine_outputs(
