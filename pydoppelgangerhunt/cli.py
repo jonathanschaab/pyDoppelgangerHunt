@@ -188,6 +188,18 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         default=None,
         help="Module filename for shared utility extractions (default: '_common.py')",
     )
+    parser.add_argument(
+        "--skip-pre-unit-closures",
+        action="store_true",
+        help="Skip scanning pre-unit closures for live variables during subroutine extraction",
+    )
+    parser.add_argument(
+        "--closure-strictness",
+        type=str,
+        choices=["strict", "lenient"],
+        default=None,
+        help="Closure analysis strictness for generator subroutines ('strict' or 'lenient')",
+    )
 
     color_group = parser.add_mutually_exclusive_group()
     color_group.add_argument("--color", dest="color", action="store_true", default=None, help="Force colorized terminal output")
@@ -1102,6 +1114,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else "auto"
     )
     shared_module_name = str(args.shared_module_name or tool_cfg.get("shared_module_name", "_common.py"))
+    raw_strictness = args.closure_strictness or tool_cfg.get("closure_strictness")
+    if raw_strictness is not None:
+        closure_strictness = str(raw_strictness).strip().lower()
+        if closure_strictness not in ("strict", "lenient"):
+            closure_strictness = "strict"
+    else:
+        cfg_skip = bool(tool_cfg.get("skip_pre_unit_closures", False))
+        closure_strictness = "lenient" if args.skip_pre_unit_closures or cfg_skip else "strict"
+    skip_pre_unit_closures = closure_strictness == "lenient"
 
     baseline_path = args.baseline or tool_cfg.get("baseline")
     preloaded_baseline: Optional[BaselineFingerprints] = None
@@ -1427,6 +1448,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 method_binding=method_binding,
                 cross_file_strategy=cross_file_strategy,
                 shared_module_name=shared_module_name,
+                skip_pre_unit_closures=skip_pre_unit_closures,
+                closure_strictness=closure_strictness,
             )
             if clones
             else ""

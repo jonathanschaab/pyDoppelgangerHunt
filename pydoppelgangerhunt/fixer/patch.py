@@ -2599,6 +2599,8 @@ def generate_refactoring_patch(
     cross_file_strategy: str = "auto",
     shared_module_name: str = "_common.py",
     depgraph: Optional[ModuleDependencyGraph] = None,
+    skip_pre_unit_closures: bool = False,
+    closure_strictness: Optional[str] = None,
 ) -> str:
     """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
     if not clones:
@@ -2626,6 +2628,16 @@ def generate_refactoring_patch(
     method_binding = (method_binding or "auto").strip().lower()
     if method_binding not in ("auto", "method", "module"):
         method_binding = "auto"
+    if closure_strictness is not None:
+        c_mode = closure_strictness.strip().lower()
+        if c_mode in ("lenient", "fast", "skip"):
+            effective_skip_closures = True
+        elif c_mode in ("strict", "fail_closed"):
+            effective_skip_closures = False
+        else:
+            effective_skip_closures = bool(skip_pre_unit_closures)
+    else:
+        effective_skip_closures = bool(skip_pre_unit_closures)
     graph_holder: List[Optional[ModuleDependencyGraph]] = [
         depgraph.copy() if depgraph is not None else None
     ]
@@ -2922,6 +2934,7 @@ def generate_refactoring_patch(
                     tree1=tree1,
                     tree2=tree2,
                     repo_root=str(root),
+                    skip_pre_unit_closures=effective_skip_closures,
                 )
                 if resolved_sub_outs is None:
                     logger.debug(

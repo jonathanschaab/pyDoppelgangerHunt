@@ -8658,3 +8658,58 @@ def test_generate_refactoring_patch_non_generator_mismatched_kinds_rejected(
         [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
     )
     assert patch == ""
+
+
+def test_generate_refactoring_patch_closure_strictness_knob(tmp_path: Path) -> None:
+    """Verifies closure_strictness knob controls pre-unit closure isolation in patch generation."""
+    src1 = (
+        "def g1(items: list[int]) -> int:\n"
+        "    cb = lambda: extra\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "        extra = x\n"
+        "    return 0\n"
+    )
+    src2 = (
+        "def g2(items: list[int]) -> int:\n"
+        "    for y in items:\n"
+        "        yield y\n"
+        "        extra = y\n"
+        "    return 0\n"
+    )
+    f1 = tmp_path / "g1.py"
+    f2 = tmp_path / "g2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 3, "end": 5, "name": "g1:block", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 4, "name": "g2:block", "kind": "compound_block"}
+
+    # 1. Default strict mode: fails closed because cb = lambda: extra captures extra
+    # before extra is definitely assigned prior to unit start
+    patch_strict = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        closure_strictness="strict",
+    )
+    assert patch_strict == ""
+
+    # 2. Lenient mode: bypasses pre-unit closure scan, successfully synthesizing patch
+    patch_lenient = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        closure_strictness="lenient",
+    )
+    assert patch_lenient != ""
+    assert "yield from" in patch_lenient
+
+    # 3. Direct boolean flag skip_pre_unit_closures=True
+    patch_bool = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        skip_pre_unit_closures=True,
+    )
+    assert patch_bool != ""

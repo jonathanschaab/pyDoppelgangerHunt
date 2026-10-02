@@ -2658,3 +2658,55 @@ def test_cli_verbose_discarded_calibration_mismatch_advisory(
     assert "Corpus calibration was discarded due to configuration mismatch" in captured_verbose.err
     assert "bag_of_tokens" in captured_verbose.err
     assert "falling back to full corpus scan" in captured_verbose.err
+
+
+def test_cli_closure_strictness_and_skip_closures_flags(tmp_path: Path) -> None:
+    """Verifies CLI accepts --skip-pre-unit-closures and --closure-strictness flags."""
+    # pylint: disable=import-outside-toplevel
+    from unittest import mock
+    from pydoppelgangerhunt.cli import build_arg_parser, main
+
+    # 1. Test build_arg_parser defaults
+    parser = build_arg_parser()
+    args_default = parser.parse_args([])
+    assert args_default.skip_pre_unit_closures is False
+    assert args_default.closure_strictness is None
+
+    # 2. Test flag parsing
+    args_skip = parser.parse_args(["--skip-pre-unit-closures"])
+    assert args_skip.skip_pre_unit_closures is True
+
+    args_strict = parser.parse_args(["--closure-strictness", "strict"])
+    assert args_strict.closure_strictness == "strict"
+
+    args_lenient = parser.parse_args(["--closure-strictness", "lenient"])
+    assert args_lenient.closure_strictness == "lenient"
+
+    # 3. Test execution and propagation to generate_refactoring_patch
+    repo = tmp_path / "patch_repo"
+    repo.mkdir()
+    patch_out = repo / "refactor.patch"
+    (repo / "f.py").write_text("x = 1\n", encoding="utf-8")
+
+    dummy_clone = (
+        0.95,
+        {"name": "u1", "file": "f.py", "start": 1, "end": 1},
+        {"name": "u2", "file": "f.py", "start": 1, "end": 1},
+    )
+
+    with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[dummy_clone]):
+        with mock.patch(
+            "pydoppelgangerhunt.cli.generate_refactoring_patch", return_value="# patch\n"
+        ) as mock_patch:
+            exit_code = main([
+                str(repo),
+                "--patch",
+                str(patch_out),
+                "--closure-strictness",
+                "lenient",
+            ])
+            assert exit_code == 1
+            mock_patch.assert_called_once()
+            _, kwargs = mock_patch.call_args
+            assert kwargs.get("skip_pre_unit_closures") is True
+            assert kwargs.get("closure_strictness") == "lenient"
