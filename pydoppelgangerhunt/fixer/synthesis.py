@@ -20,6 +20,7 @@ from pydoppelgangerhunt.fixer.binding import (
     _resolve_effective_binding,
     is_async_generator_with_return_value,
     resolve_clone_generator_subroutine_outputs,
+    resolve_closure_strictness_mode,
 )
 from pydoppelgangerhunt.fixer.dataflow import (
     _extract_effective_unit_outputs,
@@ -321,7 +322,9 @@ def _infer_outputs_return_type(
                 m2 = meta2.get(out_var, {})
             t2 = m2.get("type")
             t_merged = _merge_types(t1, t2, type_merge_strategy)
-            if out_var in conditional_outs:
+            u2_var = outputs2[idx] if (outputs2 and idx < len(outputs2)) else out_var
+            is_conditional = (out_var in conditional_outs) or (u2_var in conditional_outs)
+            if is_conditional:
                 if not t_merged.startswith("Optional[") and "None" not in t_merged:
                     t_merged = f"Optional[{t_merged}]"
             out_types.append(t_merged)
@@ -347,7 +350,9 @@ def _infer_outputs_return_type(
             else:
                 fallback = "Any"
         return_type = out_t if out_t != "Any" else fallback
-        if out_var in conditional_outs:
+        u2_var = outputs2[0] if (outputs2 and len(outputs2) >= 1) else out_var
+        is_conditional = (out_var in conditional_outs) or (u2_var in conditional_outs)
+        if is_conditional:
             if (
                 not return_type.startswith("Optional[")
                 and "None" not in return_type
@@ -549,6 +554,8 @@ def synthesize_shared_helper_code(
     source_text2: Optional[str] = None,
     tree1: Optional[ast.AST] = None,
     tree2: Optional[ast.AST] = None,
+    skip_pre_unit_closures: bool = False,
+    closure_strictness: Optional[str] = None,
 ) -> str:
     """Synthesizes a proposed shared helper function stub from two clone units.
 
@@ -570,6 +577,9 @@ def synthesize_shared_helper_code(
         step: Indentation step per indentation level (defaults to "\t" for tabs, 4 spaces otherwise).
         repo_root: Optional root directory of the repository for relative path resolution.
         helper_name: Optional custom helper name override.
+        skip_pre_unit_closures: Whether to bypass scanning pre-unit AST closures.
+        closure_strictness: Closure isolation strictness ("strict" / "fail_closed" vs
+            "lenient" / "fast" / "skip").
     """
     lines1 = _slice_unit_token_lines(
         u1,
@@ -761,6 +771,11 @@ def synthesize_shared_helper_code(
         return ""
     is_sub = is_sub1
 
+    _, effective_skip_closures = resolve_closure_strictness_mode(
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+    )
+
     if has_yield and is_sub:
         resolved_sub_outs = resolve_clone_generator_subroutine_outputs(
             u1=u1,
@@ -772,6 +787,7 @@ def synthesize_shared_helper_code(
             tree1=tree1,
             tree2=tree2,
             repo_root=repo_root,
+            skip_pre_unit_closures=effective_skip_closures,
         )
         if resolved_sub_outs is None:
             return ""

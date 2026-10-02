@@ -11,7 +11,10 @@ import textwrap
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.reporters import extract_unit_source_code
-from pydoppelgangerhunt.fixer.dataflow import _load_unit_file_text
+from pydoppelgangerhunt.fixer.dataflow import (
+    _load_unit_file_text,
+    is_subroutine_unit,
+)
 from pydoppelgangerhunt.fixer.source import (
     _slice_unit_token_lines,
     find_enclosing_function_is_async,
@@ -58,24 +61,6 @@ def _normalize_receiver_attr_name(
         if attr.startswith(pfx):
             return "<rec>." + attr[len(pfx):]
     return attr
-
-
-def is_subroutine_unit(unit: Dict[str, Any]) -> bool:
-    """Checks whether an AST code unit is a subroutine block rather than a whole function.
-
-    Classification Rules:
-    1. Known subroutine kinds ('compound_block', 'sliding_window', 'clause_branch') return True.
-    2. Whole-callable or expression kinds ('function', 'closure', 'method', 'comprehension',
-       'complex_expr') return False.
-    3. Name heuristic fallback: when 'kind' is unspecified or unrecognized, units whose 'name'
-       contains ':' (e.g. 'fn:for#1' or 'process:if') are classified as subroutine blocks.
-    """
-    unit_kind = str(unit.get("kind") or "")
-    if unit_kind in ("compound_block", "sliding_window", "clause_branch"):
-        return True
-    if unit_kind in ("function", "closure", "method", "comprehension", "complex_expr"):
-        return False
-    return ":" in str(unit.get("name") or "")
 
 
 def _normalize_receiver_attrs(

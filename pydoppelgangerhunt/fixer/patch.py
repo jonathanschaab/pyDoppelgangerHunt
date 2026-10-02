@@ -3087,6 +3087,8 @@ def generate_refactoring_patch(
                 source_text2=f2_text,
                 tree1=tree1,
                 tree2=tree2,
+                skip_pre_unit_closures=effective_skip_closures,
+                closure_strictness=closure_strictness,
             )
             if not helper_code:
                 continue

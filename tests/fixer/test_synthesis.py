@@ -6,6 +6,7 @@ import ast
 import sys
 from pathlib import Path
 from typing import Any, Dict
+from unittest.mock import patch
 
 import pytest
 
@@ -3700,3 +3701,96 @@ def test_collect_downstream_read_names_disk_mtime_invalidation(tmp_path: Path) -
     f_path.write_text(code2, encoding="utf-8")
     reads2 = collect_downstream_read_names(code2, unit)
     assert reads2 == {"y"}
+
+
+def test_infer_outputs_return_type_symmetric_conditional_outs() -> None:
+    """Verifies that conditional_outs checks both primary and paired clone variables."""
+    # 1. Single output: u1 has 'total' (definite), u2 has 'count' (conditional)
+    meta1 = {"total": {"type": "int"}}
+    meta2 = {"count": {"type": "int"}}
+    res_single = _infer_outputs_return_type(
+        helper_outputs=["total"],
+        conditional_outs={"count"},
+        meta1=meta1,
+        meta2=meta2,
+        type_merge_strategy="fallback_any",
+        outputs2=["count"],
+    )
+    assert res_single == "Optional[int]"
+
+    # 2. Multi-output: 'b' in u1 paired with 'y' in u2 where 'y' is conditional
+    meta1_multi = {"a": {"type": "int"}, "b": {"type": "str"}}
+    meta2_multi = {"x": {"type": "int"}, "y": {"type": "str"}}
+    res_multi = _infer_outputs_return_type(
+        helper_outputs=["a", "b"],
+        conditional_outs={"y"},
+        meta1=meta1_multi,
+        meta2=meta2_multi,
+        type_merge_strategy="fallback_any",
+        outputs2=["x", "y"],
+    )
+    assert res_multi == "Tuple[int, Optional[str]]"
+
+
+def test_resolve_unit_ast_end_col_single_line_compound_block() -> None:
+    """Verifies that single-line compound blocks resolve to trailing child statement."""
+    code = (
+        "def process(items):\n"
+        "    for x in items: total += x; yield x\n"
+    )
+    tree = ast.parse(code)
+    scope_fn = tree.body[0]
+    unit = {"start": 2, "end": 2, "kind": "compound_block"}
+    end_col = _resolve_unit_ast_end_col(scope_fn, unit)
+    expected_col = len("    for x in items: total += x; yield x")
+    assert end_col == expected_col
+
+
+def test_collect_downstream_read_names_no_disk_stat_call() -> None:
+    """Verifies that collect_downstream_read_names avoids redundant disk stat() calls."""
+    _clear_downstream_reads_cache()
+    code = "def f():\n    x = 1\n    return x\n"
+    unit = {"file": "virtual_module.py", "start": 2, "end": 2}
+    with patch.object(Path, "stat") as mock_stat:
+        reads = collect_downstream_read_names(code, unit)
+        assert reads == {"x"}
+        mock_stat.assert_not_called()
+
+
+def test_synthesize_shared_helper_code_strictness_propagation(tmp_path: Path) -> None:
+    """Verifies that closure strictness parameters configure generator output synthesis."""
+    code = (
+        "def outer(items):\n"
+        "    cb = lambda: total\n"
+        "    for x in items:\n"
+        "        total = x\n"
+        "        yield x\n"
+        "    return 0\n"
+    )
+    f = tmp_path / "strictness_mod.py"
+    f.write_text(code, encoding="utf-8")
+    u = {
+        "file": str(f),
+        "start": 3,
+        "end": 5,
+        "kind": "sliding_window",
+        "name": "outer:stmts",
+    }
+    # Strict mode: fails closed due to pre-unit closure capturing 'total'
+    res_strict = synthesize_shared_helper_code(
+        u, u, repo_root=str(tmp_path), closure_strictness="strict"
+    )
+    assert res_strict == ""
+
+    # Lenient mode: bypasses pre-unit closure check and synthesizes helper
+    res_lenient = synthesize_shared_helper_code(
+        u, u, repo_root=str(tmp_path), closure_strictness="lenient"
+    )
+    assert "def _shared_outer" in res_lenient
+    assert "yield" in res_lenient
+
+    # Direct skip_pre_unit_closures=True flag behaves identically
+    res_skip = synthesize_shared_helper_code(
+        u, u, repo_root=str(tmp_path), skip_pre_unit_closures=True
+    )
+    assert "def _shared_outer" in res_skip

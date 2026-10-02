@@ -88,6 +88,24 @@ def _extract_first_unit_coord(
     return None
 
 
+def is_subroutine_unit(unit: Dict[str, Any]) -> bool:
+    """Checks whether an AST code unit is a subroutine block rather than a whole function.
+
+    Classification Rules:
+    1. Known subroutine kinds ('compound_block', 'sliding_window', 'clause_branch') return True.
+    2. Whole-callable or expression kinds ('function', 'closure', 'method', 'comprehension',
+       'complex_expr') return False.
+    3. Name heuristic fallback: when 'kind' is unspecified or unrecognized, units whose 'name'
+       contains ':' (e.g. 'fn:for#1' or 'process:if') are classified as subroutine blocks.
+    """
+    unit_kind = str(unit.get("kind") or "")
+    if unit_kind in ("compound_block", "sliding_window", "clause_branch"):
+        return True
+    if unit_kind in ("function", "closure", "method", "comprehension", "complex_expr"):
+        return False
+    return ":" in str(unit.get("name") or "")
+
+
 def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
     """Extracts end column offset from unit dictionary if present."""
     return _extract_first_unit_coord(unit, ("end_col_offset", "end_col"))
@@ -140,8 +158,12 @@ def _resolve_unit_ast_end_col(
         if start_col is not None:
             matched = [s for s in inner_stmts if getattr(s, "col_offset", 0) >= start_col]
             target_stmt = matched[0] if matched else inner_stmts[0]
+        elif is_subroutine_unit(unit):
+            # For single-line compound blocks or sliding windows without explicit start_col,
+            # encompass the full body of the compound statement through its trailing child.
+            target_stmt = inner_stmts[-1]
         else:
-            # When start_col is omitted for a single-line unit, default to the first
+            # When start_col is omitted for a single-line standalone unit, default to the first
             # statement on the line (e.g. 'yield x; print(total)'). Note that if a unit
             # represents a subsequent statement on a semicolon-separated line, supplying
             # 'start_col' during harvesting ensures exact boundary matching.
@@ -979,13 +1001,10 @@ def collect_downstream_read_names(
     # Form memoization cache key to accelerate repeated candidate pair inspections.
     # Keyed by content length, hash, SHA-256 digest prefix, and file mtime to prevent
     # collisions across recycled AST addresses, same-length edits, and disk modifications.
+    # Note: Bypasses redundant Path.stat() disk syscalls because in-memory source_text
+    # is already hashed via SHA-256; explicit mtime/timestamp in unit is still honored.
     file_path_str = str(unit.get("file") or "")
     mtime = unit.get("mtime") or unit.get("timestamp")
-    if mtime is None and file_path_str:
-        try:
-            mtime = Path(file_path_str).stat().st_mtime_ns
-        except OSError:
-            mtime = None
     content_digest = hashlib.sha256(
         source_text.encode("utf-8", errors="replace")
     ).hexdigest()[:16]
