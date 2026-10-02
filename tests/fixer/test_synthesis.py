@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Set, Tuple
 from unittest.mock import patch
 
 import pytest
@@ -3633,14 +3633,22 @@ def test_collect_downstream_read_names_lru_caching() -> None:
     assert reads3 == {"extra"}
 
 
-def test_get_valid_unit_bounds_malformed_coordinates() -> None:
+@pytest.mark.parametrize(
+    ("unit_dict", "expected"),
+    [
+        ({"start": "invalid"}, None),
+        ({"start": "10", "end": "invalid"}, None),
+        ({"start": None}, None),
+        ({"start": 0}, None),
+        ({"start": 5, "end": 2}, None),
+        ({"start": "2", "end": "5"}, (2, 5)),
+    ],
+)
+def test_get_valid_unit_bounds_malformed_coordinates(
+    unit_dict: Dict[str, Any], expected: Optional[Tuple[int, int]]
+) -> None:
     """Verifies that _get_valid_unit_bounds handles malformed coordinates defensively."""
-    assert _get_valid_unit_bounds({"start": "invalid"}) is None
-    assert _get_valid_unit_bounds({"start": "10", "end": "invalid"}) is None
-    assert _get_valid_unit_bounds({"start": None}) is None
-    assert _get_valid_unit_bounds({"start": 0}) is None
-    assert _get_valid_unit_bounds({"start": 5, "end": 2}) is None
-    assert _get_valid_unit_bounds({"start": "2", "end": "5"}) == (2, 5)
+    assert _get_valid_unit_bounds(unit_dict) == expected
 
 
 def test_collect_downstream_read_names_malformed_coordinates() -> None:
@@ -3703,33 +3711,69 @@ def test_collect_downstream_read_names_disk_mtime_invalidation(tmp_path: Path) -
     assert reads2 == {"y"}
 
 
-def test_infer_outputs_return_type_symmetric_conditional_outs() -> None:
+@pytest.mark.parametrize(
+    ("helper_outs", "outs2", "cond_outs", "meta1", "meta2", "expected"),
+    [
+        (
+            ["total"],
+            ["count"],
+            {"count"},
+            {"total": {"type": "int"}},
+            {"count": {"type": "int"}},
+            "Optional[int]",
+        ),
+        (
+            ["total"],
+            ["count"],
+            {"total"},
+            {"total": {"type": "int"}},
+            {"count": {"type": "int"}},
+            "Optional[int]",
+        ),
+        (
+            ["total"],
+            ["count"],
+            set(),
+            {"total": {"type": "int"}},
+            {"count": {"type": "int"}},
+            "int",
+        ),
+        (
+            ["a", "b"],
+            ["x", "y"],
+            {"y"},
+            {"a": {"type": "int"}, "b": {"type": "str"}},
+            {"x": {"type": "int"}, "y": {"type": "str"}},
+            "Tuple[int, Optional[str]]",
+        ),
+        (
+            ["a", "b"],
+            ["x", "y"],
+            {"a"},
+            {"a": {"type": "int"}, "b": {"type": "str"}},
+            {"x": {"type": "int"}, "y": {"type": "str"}},
+            "Tuple[Optional[int], str]",
+        ),
+    ],
+)
+def test_infer_outputs_return_type_symmetric_conditional_outs(
+    helper_outs: List[str],
+    outs2: List[str],
+    cond_outs: Set[str],
+    meta1: Dict[str, Any],
+    meta2: Dict[str, Any],
+    expected: str,
+) -> None:
     """Verifies that conditional_outs checks both primary and paired clone variables."""
-    # 1. Single output: u1 has 'total' (definite), u2 has 'count' (conditional)
-    meta1 = {"total": {"type": "int"}}
-    meta2 = {"count": {"type": "int"}}
-    res_single = _infer_outputs_return_type(
-        helper_outputs=["total"],
-        conditional_outs={"count"},
+    res = _infer_outputs_return_type(
+        helper_outputs=helper_outs,
+        conditional_outs=cond_outs,
         meta1=meta1,
         meta2=meta2,
         type_merge_strategy="fallback_any",
-        outputs2=["count"],
+        outputs2=outs2,
     )
-    assert res_single == "Optional[int]"
-
-    # 2. Multi-output: 'b' in u1 paired with 'y' in u2 where 'y' is conditional
-    meta1_multi = {"a": {"type": "int"}, "b": {"type": "str"}}
-    meta2_multi = {"x": {"type": "int"}, "y": {"type": "str"}}
-    res_multi = _infer_outputs_return_type(
-        helper_outputs=["a", "b"],
-        conditional_outs={"y"},
-        meta1=meta1_multi,
-        meta2=meta2_multi,
-        type_merge_strategy="fallback_any",
-        outputs2=["x", "y"],
-    )
-    assert res_multi == "Tuple[int, Optional[str]]"
+    assert res == expected
 
 
 def test_resolve_unit_ast_end_col_single_line_compound_block() -> None:

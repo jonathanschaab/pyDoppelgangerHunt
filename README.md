@@ -163,6 +163,7 @@ from pydoppelgangerhunt import (
     detect_line_ending,
     generate_refactoring_patch,
     intervals_overlap,
+    is_subroutine_unit,
     refactor_module_units,
     split_source_lines,
     validate_module_unit_replacements,
@@ -177,6 +178,9 @@ from pydoppelgangerhunt import (
 - **`count_physical_newlines(text)`**: Accurately counts physical line endings (`\r\n`, `\r`, `\n`) across mixed and legacy lone-CR formats.
 - **`detect_line_ending(*sources)`**: Detects predominant line ending format across source strings or iterables via majority vote (`\n`, `\r\n`, or `\r`), breaking ties in priority order (`\n` → `\r\n` → `\r`).
 - **`intervals_overlap(s1, e1, s2, e2)`**: Fast primitive returning `True` if two half-open intervals `[s1, e1)` and `[s2, e2)` intersect; `False` otherwise.
+- **`is_subroutine_unit(unit)`**: Inspects unit metadata to determine if a clone unit represents
+  an inner compound block, sliding window, or clause branch rather than an entire callable,
+  applying heuristic fallbacks when `kind` is unspecified.
 - **`refactor_module_units(source_text, replacements, tier1=True, tier2=True, dry_run=False)`**: Applies multiple non-overlapping unit replacements in strict **reverse source order** (descending byte offsets) using single-pass buffer slicing, guaranteeing that downstream text expansions or contractions never invalidate upstream coordinates.
 - **`validate_module_unit_replacements(source_text, replacements, tier1=True, tier2=True)`**: Non-mutating validation helper that verifies candidate replacements for collisions across Tier 1 (AST coordinate overlap) and Tier 2 (physical byte interval sweep) without modifying or allocating new source string buffers.
 - **`generate_refactoring_patch(candidate_pairs, repo_root=..., replace_clones=...)`**: Synthesizes a multi-file unified diff (`git apply` compatible) with dependency cycle detection and per-pair transactional snapshot rollback. For generator subroutines, downstream variable liveness and reaching definitions ensure output parameters are paired safely; pre-unit closures, lambdas, and class methods treat captured variables as live to protect escaping callbacks. When a unit is analyzed at top-level module scope, prior module functions contribute their global reads, causing un-definitely assigned candidates to fail closed safely (diagnostics emitted at DEBUG log level).
@@ -219,6 +223,23 @@ except UnitCollisionError as exc:
 Refactoring executes in linear-logarithmic time with incremental validation:
 - **Incremental Collision Checking**: Delegation checks candidate units incrementally ($O(K)$ per unit against existing replacements and physical items), eliminating expensive $O(K \log K)$ buffer dry-runs per clone pair.
 - **Micro-Benchmark**: For modules with 100+ replacements and 10,000+ lines, dual-tier validation and single-pass descending buffer slicing executes in under 5 ms on modern hardware.
+
+##### Performance Notes: Closure Scanning & Throughput
+
+When extracting subroutine clones that assign variables, `pyDoppelgangerHunt` conducts a pre-unit
+AST walk within the enclosing scope to detect closures, lambdas, or nested classes that capture
+candidate outputs prior to unit execution. Because such closures may escape into callback tables
+or event loops, strict mode treats these captured names as live, guaranteeing fail-closed safety.
+
+- **Memoization & Cache Invalidation**: Downstream liveness analysis caches AST traversal results
+  in an LRU cache keyed by source length, content hash, SHA-256 digest prefix, unit line/column
+  coordinates, candidate outputs, and unit modification timestamp (`mtime`), eliminating duplicate
+  traversals across identical clone boundaries.
+- **Lenient Mode Bypass**: For large codebases or batch runs where callback-escaping closures are
+  known not to occur, pre-unit closure scanning can be bypassed by specifying
+  `--closure-strictness lenient` (or `--skip-pre-unit-closures`, or setting
+  `closure_strictness = "lenient"` in `pyproject.toml`). When both CLI flags are supplied,
+  `--closure-strictness` takes precedence over `--skip-pre-unit-closures`.
 
 #### Safety Model & Fail-Closed Refactoring Guarantees
 

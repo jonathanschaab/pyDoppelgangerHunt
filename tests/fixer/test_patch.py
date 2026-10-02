@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from unittest import mock
 
 import pytest
@@ -8716,25 +8716,30 @@ def test_generate_refactoring_patch_closure_strictness_knob(tmp_path: Path) -> N
     assert patch_bool != ""
 
 
-def test_resolve_closure_strictness_mode_aliases() -> None:
+@pytest.mark.parametrize(
+    ("mode_arg", "skip_flag", "expected"),
+    [
+        ("lenient", None, ("lenient", True)),
+        ("fast", None, ("lenient", True)),
+        ("skip", None, ("lenient", True)),
+        ("strict", None, ("strict", False)),
+        ("fail_closed", None, ("strict", False)),
+        (None, True, ("lenient", True)),
+        (None, False, ("strict", False)),
+        ("strict", True, ("strict", False)),
+        ("lenient", False, ("lenient", True)),
+    ],
+)
+def test_resolve_closure_strictness_mode_aliases(
+    mode_arg: Optional[str],
+    skip_flag: Optional[bool],
+    expected: Tuple[str, bool],
+) -> None:
     """Verifies resolve_closure_strictness_mode maps all aliases and honors precedence."""
-    assert resolve_closure_strictness_mode("lenient") == ("lenient", True)
-    assert resolve_closure_strictness_mode("fast") == ("lenient", True)
-    assert resolve_closure_strictness_mode("skip") == ("lenient", True)
-    assert resolve_closure_strictness_mode("strict") == ("strict", False)
-    assert resolve_closure_strictness_mode("fail_closed") == ("strict", False)
-
-    # Boolean fallback when None
-    assert resolve_closure_strictness_mode(None, skip_pre_unit_closures=True) == ("lenient", True)
-    assert resolve_closure_strictness_mode(None, skip_pre_unit_closures=False) == ("strict", False)
-
-    # Precedence: explicit strictness overrides boolean flag
     assert resolve_closure_strictness_mode(
-        "strict", skip_pre_unit_closures=True
-    ) == ("strict", False)
-    assert resolve_closure_strictness_mode(
-        "lenient", skip_pre_unit_closures=False
-    ) == ("lenient", True)
+        mode_arg,
+        skip_pre_unit_closures=skip_flag if skip_flag is not None else False,
+    ) == expected
 
 
 def test_generate_refactoring_patch_subroutine_unpaired_outputs_rejected(tmp_path: Path) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from collections import OrderedDict
+from enum import Enum
 import hashlib
 import logging
 from pathlib import Path
@@ -607,6 +608,13 @@ def _extract_assigned_names(target: ast.AST) -> List[str]:
     return []
 
 
+class _VisitorPassMode(str, Enum):
+    """Execution pass mode for downstream AST read analysis."""
+
+    AFTER_UNIT = "after_unit"
+    LOOP_CARRIED = "loop_carried"
+
+
 class _DownstreamReadVisitor(_BaseScopeVisitor):
     """Walks AST statements in a lexical scope tracking direct, nested, and loop-carried reads."""
 
@@ -617,7 +625,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         u_end_col: Optional[int],
         candidates: Optional[Set[str]] = None,
         enclosing_loops: Optional[List[Tuple[int, int]]] = None,
-        pass_mode: str = "after_unit",
+        pass_mode: Union[_VisitorPassMode, str] = _VisitorPassMode.AFTER_UNIT,
     ) -> None:
         super().__init__()
         self.u_start = u_start
@@ -625,7 +633,11 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self.u_end_col = u_end_col
         self.candidates = candidates
         self.enclosing_loops = enclosing_loops or []
-        self.pass_mode = pass_mode
+        self.pass_mode = (
+            _VisitorPassMode(pass_mode)
+            if isinstance(pass_mode, str)
+            else pass_mode
+        )
         self.loaded: Set[str] = set()
         self.killed: Set[str] = set()
 
@@ -667,7 +679,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         return any(l_start <= lineno <= l_end for l_start, l_end in self.enclosing_loops)
 
     def _should_inspect_read(self, node: ast.AST) -> bool:
-        if self.pass_mode == "loop_carried":
+        if self.pass_mode is _VisitorPassMode.LOOP_CARRIED:
             return self._is_loop_carried(node)
         return self._is_node_after_unit(node)
 
@@ -969,6 +981,90 @@ def _clear_downstream_reads_cache() -> None:
     _downstream_reads_cache.clear()
 
 
+def _build_downstream_cache_key(
+    source_text: str,
+    unit: Dict[str, Any],
+    u_start: int,
+    u_end: int,
+    candidates: Optional[Set[str]],
+    skip_pre_unit_closures: bool,
+) -> Tuple[Any, ...]:
+    """Forms a persistent cache key for downstream AST read analysis."""
+    file_path_str = str(unit.get("file") or "")
+    mtime = unit.get("mtime") or unit.get("timestamp")
+    content_digest = hashlib.sha256(
+        source_text.encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
+    src_key = (len(source_text), hash(source_text), content_digest, mtime)
+    start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
+    end_col = _extract_unit_end_col(unit)
+    cands_key = frozenset(candidates) if candidates is not None else None
+    return (
+        src_key,
+        file_path_str,
+        u_start,
+        u_end,
+        start_col,
+        end_col,
+        cands_key,
+        bool(skip_pre_unit_closures),
+    )
+
+
+def _resolve_downstream_scope_node(
+    source_text: str,
+    unit: Dict[str, Any],
+    tree: Optional[ast.AST],
+) -> Optional[ast.AST]:
+    """Resolves the innermost enclosing function AST node or falls back to module scope."""
+    enc = _find_innermost_enclosing_node(
+        source_text, unit, (ast.FunctionDef, ast.AsyncFunctionDef), tree=tree
+    )
+    if enc is not None:
+        return enc[0]
+    return _parse_source_tree(source_text, tree=tree)
+
+
+def _find_enclosing_loops(
+    scope_node: ast.AST,
+    u_start: int,
+    u_end: int,
+) -> List[Tuple[int, int]]:
+    """Detects loops enclosing the unit boundaries for loop-carried dependence analysis."""
+    loops: List[Tuple[int, int]] = []
+    for node in ast.walk(scope_node):
+        if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            l_start = getattr(node, "lineno", 0)
+            l_end = getattr(node, "end_lineno", l_start)
+            if l_start <= u_start and u_end <= l_end:
+                if (l_start, l_end) != (u_start, u_end):
+                    loops.append((l_start, l_end))
+    return loops
+
+
+def _merge_pre_unit_closure_reads(
+    loaded: Set[str],
+    pre_unit_captured_reads: Set[str],
+    candidates: Optional[Set[str]],
+) -> None:
+    """Merges escaping pre-unit closure free reads into live downstream names fail-closed."""
+    if candidates is not None:
+        effective_captured = pre_unit_captured_reads & candidates
+        if effective_captured:
+            logger.debug(
+                "Captured pre-unit closure candidate reads (fail-closed callback protection): %s",
+                sorted(effective_captured),
+            )
+        loaded.update(effective_captured)
+    else:
+        if pre_unit_captured_reads:
+            logger.debug(
+                "Captured pre-unit closure reads (fail-closed callback protection): %s",
+                sorted(pre_unit_captured_reads),
+            )
+        loaded.update(pre_unit_captured_reads)
+
+
 def collect_downstream_read_names(
     source_text: str,
     unit: Dict[str, Any],
@@ -998,66 +1094,27 @@ def collect_downstream_read_names(
     if candidates is not None and not candidates:
         return set()
 
-    # Form memoization cache key to accelerate repeated candidate pair inspections.
-    # Keyed by content length, hash, SHA-256 digest prefix, and file mtime to prevent
-    # collisions across recycled AST addresses, same-length edits, and disk modifications.
-    # Note: Bypasses redundant Path.stat() disk syscalls because in-memory source_text
-    # is already hashed via SHA-256; explicit mtime/timestamp in unit is still honored.
-    file_path_str = str(unit.get("file") or "")
-    mtime = unit.get("mtime") or unit.get("timestamp")
-    content_digest = hashlib.sha256(
-        source_text.encode("utf-8", errors="replace")
-    ).hexdigest()[:16]
-    src_key = (len(source_text), hash(source_text), content_digest, mtime)
-    start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
-    end_col = _extract_unit_end_col(unit)
-    cands_key = frozenset(candidates) if candidates is not None else None
-    cache_key = (
-        src_key,
-        file_path_str,
-        u_start,
-        u_end,
-        start_col,
-        end_col,
-        cands_key,
-        bool(skip_pre_unit_closures),
+    cache_key = _build_downstream_cache_key(
+        source_text, unit, u_start, u_end, candidates, skip_pre_unit_closures
     )
     if cache_key in _downstream_reads_cache:
         cached = _downstream_reads_cache[cache_key]
         _downstream_reads_cache.move_to_end(cache_key)
         return set(cached)
 
-    enc = _find_innermost_enclosing_node(
-        source_text, unit, (ast.FunctionDef, ast.AsyncFunctionDef), tree=tree
-    )
-    if enc is not None:
-        scope_node: ast.AST = enc[0]
-    else:
-        scope_tree = _parse_source_tree(source_text, tree=tree)
-        if scope_tree is None:
-            return None
-        scope_node = scope_tree
+    scope_node = _resolve_downstream_scope_node(source_text, unit, tree)
+    if scope_node is None:
+        return None
 
     u_end_col = _extract_unit_end_col(unit)
     if u_end_col is None:
         u_end_col = _resolve_unit_ast_end_col(scope_node, unit)
 
-    # Detect loops enclosing the unit for loop-carried dependence analysis
-    enclosing_loops: List[Tuple[int, int]] = []
-    for node in ast.walk(scope_node):
-        if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
-            l_start = getattr(node, "lineno", 0)
-            l_end = getattr(node, "end_lineno", l_start)
-            if l_start <= u_start and u_end <= l_end:
-                if (l_start, l_end) != (u_start, u_end):
-                    enclosing_loops.append((l_start, l_end))
+    enclosing_loops = _find_enclosing_loops(scope_node, u_start, u_end)
 
-    # Free variables captured by pre-unit closures (skippable in fast mode when precomputed)
     if skip_pre_unit_closures:
         pre_unit_captured_reads: Set[str] = set()
     else:
-        # Note: may intentionally over-capture nested lambda free variables as documented
-        # in _collect_pre_unit_closures to guarantee fail-closed safety for escaping callbacks.
         pre_unit_captured_reads = _collect_pre_unit_closures(scope_node, u_start)
 
     visitor = _DownstreamReadVisitor(
@@ -1066,7 +1123,7 @@ def collect_downstream_read_names(
         u_end_col,
         candidates=candidates,
         enclosing_loops=enclosing_loops,
-        pass_mode="after_unit",
+        pass_mode=_VisitorPassMode.AFTER_UNIT,
     )
     for stmt in getattr(scope_node, "body", []):
         visitor.visit(stmt)
@@ -1079,19 +1136,13 @@ def collect_downstream_read_names(
             u_end_col,
             candidates=candidates,
             enclosing_loops=enclosing_loops,
-            pass_mode="loop_carried",
+            pass_mode=_VisitorPassMode.LOOP_CARRIED,
         )
         for stmt in getattr(scope_node, "body", []):
             loop_visitor.visit(stmt)
         loaded.update(loop_visitor.loaded)
 
-    # Any pre-unit closure, lambda, or class method capturing an output candidate could escape
-    # or be invoked indirectly (e.g. registered into a callback table prior to unit execution).
-    # Treat captured candidates as live to ensure fail-closed safety.
-    if candidates is not None:
-        loaded.update(pre_unit_captured_reads & candidates)
-    else:
-        loaded.update(pre_unit_captured_reads)
+    _merge_pre_unit_closure_reads(loaded, pre_unit_captured_reads, candidates)
 
     if len(_downstream_reads_cache) >= _MAX_DOWNSTREAM_CACHE_SIZE:
         _downstream_reads_cache.popitem(last=False)
@@ -1269,12 +1320,15 @@ def resolve_clone_generator_subroutine_outputs(
     """Resolves output variable bindings for clone generator subroutines across two code units.
 
     Note: When both u1 and u2 supply precomputed 'outputs', this fast path skips downstream read
-    and definiteness checks, assuming caller resolution has already validated output necessity.
+    and definiteness checks. The caller is responsible for having already validated that these
+    precomputed outputs are necessary, safe, and definitely bound before passing them here.
     """
     if (
         isinstance(u1.get("outputs"), (list, tuple, set))
         and isinstance(u2.get("outputs"), (list, tuple, set))
     ):
+        # Fast path for precomputed outputs: bypasses downstream read and definiteness analysis;
+        # the caller is responsible for having pre-validated output necessity and safety.
         outs1 = _extract_effective_unit_outputs(u1, scope1)
         outs2 = _extract_effective_unit_outputs(u2, scope2)
         if len(outs1) == len(outs2):
