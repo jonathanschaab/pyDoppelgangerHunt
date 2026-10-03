@@ -1623,7 +1623,8 @@ def test_generate_refactoring_patch_cross_receiver_attrs_matching(tmp_path: Path
 
 
 def test_generate_refactoring_patch_permuted_outputs_alignment(tmp_path: Path) -> None:
-    """Verifies that when clone 2 assigns variables in permuted order, the unpacking tuple aligns with the helper's return."""
+    """Verifies that when clone 2 assigns variables in permuted order, output pairing fails
+    closed under replace_clones=True to prevent silent variable swapping."""
     src1 = (
         "def compute_1(a: int, b: int) -> tuple:\n"
         "    x = a * 10\n"
@@ -1641,15 +1642,32 @@ def test_generate_refactoring_patch_permuted_outputs_alignment(tmp_path: Path) -
     f1.write_text(src1, encoding="utf-8")
     f2.write_text(src2, encoding="utf-8")
 
-    u1 = {"file": "mod1.py", "start": 2, "end": 3, "name": "compute_1:block", "kind": "compound_block"}
-    u2 = {"file": "mod2.py", "start": 2, "end": 3, "name": "compute_2:block", "kind": "compound_block"}
+    u1 = {
+        "file": "mod1.py",
+        "start": 2,
+        "end": 3,
+        "name": "compute_1:block",
+        "kind": "compound_block",
+    }
+    u2 = {
+        "file": "mod2.py",
+        "start": 2,
+        "end": 3,
+        "name": "compute_2:block",
+        "kind": "compound_block",
+    }
 
-    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
-    assert "--- a/mod1.py" in patch
-    assert "--- a/mod2.py" in patch
-    # Both call sites should unpack x, y in canonical helper return order
-    assert "+    x, y = _shared_compute_1" in patch
-    assert "y, x = _shared_compute_1" not in patch
+    # Under replace_clones=True, conflicting output orders cannot be soundly paired and must skip
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch == ""
+
+    # Under replace_clones=False, helper-only mode emits the shared helper
+    patch_preview = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=False
+    )
+    assert "_shared_compute_1" in patch_preview
 
 
 def test_generate_refactoring_patch_cross_module_auto_creates_common_module(tmp_path: Path) -> None:
@@ -8837,4 +8855,5 @@ def test_generate_refactoring_patch_replace_clones_false_emits_helper_with_diffe
         [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=False
     )
     assert "def _shared_run1_run2" in patch_preview
+
 

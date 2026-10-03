@@ -43,9 +43,12 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
 from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
     GeneratorCloneSideData,
     _clear_downstream_reads_cache,
+    _downstream_cache_lock,
+    _downstream_reads_cache,
     _extract_effective_unit_outputs,
     _extract_nested_scope_free_reads,
     _extract_unit_end_col,
+    _find_enclosing_loops,
     _get_valid_unit_bounds,
     _load_unit_file_text,
     _pair_clone_outputs,
@@ -4038,4 +4041,57 @@ def test_downstream_reads_non_ascii_same_line_semicolon() -> None:
         code, unit_no_end_col, candidates={"total", "tag"}
     )
     assert reads_fallback == {"total"}
+
+
+def test_find_enclosing_loops_explicit_none_end_lineno() -> None:
+    """Verifies that _find_enclosing_loops handles AST nodes with end_lineno explicitly None."""
+    code = (
+        "for i in range(10):\n"
+        "    x = i\n"
+    )
+    tree = ast.parse(code)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.For):
+            # Explicitly set end_lineno attribute to None
+            node.end_lineno = None  # type: ignore[assignment]
+    # Should not raise TypeError when end_lineno is None
+    loops = _find_enclosing_loops(tree, u_start=2, u_end=2)
+    assert loops == []
+
+
+def test_downstream_cache_update_prevents_premature_eviction() -> None:
+    """Verifies that updating an existing key in _downstream_reads_cache does not evict."""
+    _clear_downstream_reads_cache()
+    try:
+        with _downstream_cache_lock:
+            # Fill cache with initial items
+            for i in range(10):
+                _downstream_reads_cache[(f"key_{i}",)] = frozenset([f"var_{i}"])
+
+        # Create a unit and code to populate cache
+        code = (
+            "def worker():\n"
+            "    total = 0\n"
+            "    yield total\n"
+            "    print(total)\n"
+        )
+        unit = {"file": "worker.py", "start": 3, "end": 3}
+        reads1 = collect_downstream_read_names(code, unit, candidates={"total"})
+        assert reads1 == {"total"}
+
+        with _downstream_cache_lock:
+            initial_count = len(_downstream_reads_cache)
+            keys_before = list(_downstream_reads_cache.keys())
+
+        # Calling again on the same unit updates/hits without shrinking or premature eviction
+        reads2 = collect_downstream_read_names(code, unit, candidates={"total"})
+        assert reads2 == {"total"}
+
+        with _downstream_cache_lock:
+            assert len(_downstream_reads_cache) == initial_count
+            # Most recently updated/accessed key moved to the end
+            assert list(_downstream_reads_cache.keys())[-1] == keys_before[-1]
+    finally:
+        _clear_downstream_reads_cache()
+
 

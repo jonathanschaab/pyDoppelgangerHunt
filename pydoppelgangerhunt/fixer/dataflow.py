@@ -736,7 +736,8 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             self.visit(node.target)
 
     def _record_delete_reads(self, target: ast.AST) -> None:
-        """Records variables targeted for deletion as downstream reads if within unit boundary."""
+        """Records variables targeted for deletion as downstream reads if downstream of
+        unit boundary."""
         for subnode in ast.walk(target):
             if isinstance(subnode, ast.Name) and isinstance(subnode.ctx, ast.Del):
                 if self._should_inspect_read(subnode):
@@ -1023,7 +1024,7 @@ def _find_enclosing_loops(
     for node in ast.walk(scope_node):
         if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
             l_start = getattr(node, "lineno", 0)
-            l_end = getattr(node, "end_lineno", l_start)
+            l_end = getattr(node, "end_lineno", None) or l_start
             if l_start <= u_start and u_end <= l_end:
                 if (l_start, l_end) != (u_start, u_end):
                     loops.append((l_start, l_end))
@@ -1134,9 +1135,13 @@ def collect_downstream_read_names(
     _merge_pre_unit_closure_reads(loaded, pre_unit_captured_reads, candidates)
 
     with _downstream_cache_lock:
-        if len(_downstream_reads_cache) >= _MAX_DOWNSTREAM_CACHE_SIZE:
+        if (
+            cache_key not in _downstream_reads_cache
+            and len(_downstream_reads_cache) >= _MAX_DOWNSTREAM_CACHE_SIZE
+        ):
             _downstream_reads_cache.popitem(last=False)
         _downstream_reads_cache[cache_key] = frozenset(loaded)
+        _downstream_reads_cache.move_to_end(cache_key)
 
     return loaded
 
