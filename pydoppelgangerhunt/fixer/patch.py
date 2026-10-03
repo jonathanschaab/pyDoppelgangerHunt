@@ -183,7 +183,10 @@ def check_units_overlap(
         if val is None:
             return None
         try:
-            return max(0, int(val))
+            parsed = parse_unit_coord({col_name: val}, col_name, default=None)
+            if parsed is None:
+                return None
+            return max(0, parsed)
         except (ValueError, TypeError) as err:
             raise ValueError(
                 f"Malformed unit: invalid column offset '{col_name}'={val!r} in {file_path}"

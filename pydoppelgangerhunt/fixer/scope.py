@@ -206,6 +206,21 @@ class _ScopeVisitor(ast.NodeVisitor):
             self.stores.append(name)
 
     def _process_func(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
+        if node.name == "_wrapper":
+            body = node.body
+            if (
+                self.loop_offset > 0
+                and len(body) == 1
+                and isinstance(body[0], (ast.For, ast.AsyncFor, ast.While))
+            ):
+                body = body[0].body
+                self.loop_offset = 0
+            if isinstance(node, ast.AsyncFunctionDef):
+                self.is_async = True
+            for stmt in body:
+                self.visit(stmt)
+            return
+
         is_top = (
             len(self._scope_stack) == 0
             and not self.is_subroutine

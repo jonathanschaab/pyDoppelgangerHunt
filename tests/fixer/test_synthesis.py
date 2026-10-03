@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -12,12 +13,22 @@ import pytest
 
 from pydoppelgangerhunt import (
     check_units_overlap,
+    compute_unit_spans,
     extract_unit_source_code,
     filter_overlapping_clone_units,
     generate_clone_diff,
     generate_refactoring_patch,
     synthesize_refactoring_suggestion,
     synthesize_shared_helper_code,
+)
+from pydoppelgangerhunt.fixer.scope import _inspect_unit_scope  # pylint: disable=protected-access
+from pydoppelgangerhunt.matcher import (  # pylint: disable=protected-access
+    _check_column_bounds_relationship,
+    _update_merged_unit_columns,
+)
+from pydoppelgangerhunt.reporters import (
+    format_github_annotations,
+    format_sarif_report,
 )
 from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _base_unit_name,
@@ -3838,3 +3849,104 @@ def test_synthesize_shared_helper_code_strictness_propagation(tmp_path: Path) ->
         u, u, repo_root=str(tmp_path), skip_pre_unit_closures=True
     )
     assert "def _shared_outer" in res_skip
+
+
+def test_resolve_clone_generator_subroutine_outputs_precomputed_definite_stores() -> None:
+    """Verifies precomputed outputs are validated against definite stores when available."""
+    u1 = {"outputs": ["x", "unassigned"]}
+    u2 = {"outputs": ["a", "b"]}
+    # Scope 1 only definitely assigns x, leaving unassigned lacking definite store
+    s1 = {"definite_stores": ["x"], "inputs": []}
+    s2 = {"definite_stores": ["a", "b"], "inputs": []}
+    res_rejected = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
+    assert res_rejected is None
+
+    # When both sides definitely assign all precomputed outputs, pairing succeeds
+    s1_valid = {"definite_stores": ["x", "unassigned"], "inputs": []}
+    res_valid = resolve_clone_generator_subroutine_outputs(u1, u2, s1_valid, s2)
+    assert res_valid == (["x", "unassigned"], ["a", "b"])
+
+
+def test_inspect_unit_scope_synthetic_wrapper_explicit_return_and_hazards(
+    tmp_path: Path,
+) -> None:
+    """Verifies that explicit returns and hazards inside wrapped subroutines are detected."""
+    # A subroutine unit with an indented yield and return inside a compound block
+    code = (
+        "def outer(items):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "        return x\n"
+    )
+    mod_file = tmp_path / "sub_wrapped.py"
+    mod_file.write_text(code, encoding="utf-8")
+    u = {
+        "file": str(mod_file),
+        "start": 3,
+        "end": 4,
+        "kind": "compound_block",
+        "name": "outer:for",
+    }
+    scope = _inspect_unit_scope(u, repo_root=str(tmp_path))
+    assert scope["has_yield"] is True
+    assert scope["has_return"] is True
+    assert scope["has_return_value"] is True
+    assert "x" in scope["outputs"]
+    # Embedded return hazard is correctly identified on the subroutine block
+    assert "embedded_return" in scope["control_flow_hazards"]
+    assert scope["is_control_flow_safe"] is False
+
+    # Nested helper function inside subroutine should not leak return out to the subroutine
+    code_nested = (
+        "def outer(items):\n"
+        "    for x in items:\n"
+        "        def helper():\n"
+        "            return 99\n"
+        "        yield helper()\n"
+    )
+    mod_file2 = tmp_path / "sub_nested.py"
+    mod_file2.write_text(code_nested, encoding="utf-8")
+    u2 = {
+        "file": str(mod_file2),
+        "start": 3,
+        "end": 5,
+        "kind": "compound_block",
+        "name": "outer:for",
+    }
+    scope2 = _inspect_unit_scope(u2, repo_root=str(tmp_path))
+    assert scope2["has_yield"] is True
+    assert scope2["has_return"] is False
+    assert scope2["has_return_value"] is False
+    assert "embedded_return" not in scope2["control_flow_hazards"]
+
+
+def test_coordinate_parsing_colon_formatted_columns_across_subsystems(
+    tmp_path: Path,
+) -> None:
+    """Verifies that colon-formatted columns (e.g. '8:0') parse safely across all subsystems."""
+    u1 = {"file": "mod.py", "start": 1, "end": 1, "start_col": "8:0", "end_col": "15:0"}
+    u2 = {"file": "mod.py", "start": 1, "end": 1, "start_col": "16:0", "end_col": "22:0"}
+
+    # 1. check_units_overlap
+    assert check_units_overlap(u1, u2) is False
+
+    # 2. compute_unit_spans
+    src = "        val = compute()  # code\n"
+    span = compute_unit_spans(src, u1)
+    assert span.start_col_char == 8
+    assert span.end_col_char == 15
+
+    # 3. Matcher column bounds comparison & propagation
+    enclosed, _ = _check_column_bounds_relationship(1, 1, 1, 1, u1, u2)
+    assert enclosed is False
+    target = {"start_col": "8:0", "end_col": "20:0"}
+    donor = {"start_col": "4:0", "end_col": "25:0"}
+    _update_merged_unit_columns(target, donor, 1, 1, 1, 1)
+    assert target["start_col"] == 4
+    assert target["end_col"] == 25
+
+    # 4. Reporters
+    sarif = format_sarif_report([(0.9, u1, u2)], target=".", threshold=0.8)
+    assert "startColumn" in json.dumps(sarif)
+    ann = format_github_annotations([(0.9, u1, u2)])
+    assert any("col=9" in a for a in ann)

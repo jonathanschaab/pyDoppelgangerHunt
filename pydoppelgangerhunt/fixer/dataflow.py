@@ -1180,6 +1180,40 @@ def _pair_clone_outputs(
     return [(o, o) for o in common_names]
 
 
+def _extract_scope_valid_bindings(scope: Dict[str, Any]) -> Optional[Set[str]]:
+    """Extracts valid candidate bindings (stores, locals, definite_stores, inputs) from scope."""
+    if any(k in scope for k in ("stores", "locals", "definite_stores", "inputs")):
+        return (
+            set(scope.get("definite_stores", []))
+            | set(scope.get("stores", []))
+            | set(scope.get("locals", []))
+            | set(scope.get("inputs", []))
+        )
+    return None
+
+
+def _filter_valid_output_pairs(
+    pairs: Sequence[Tuple[str, str]],
+    u1_allowed: Optional[Set[str]],
+    u2_allowed: Optional[Set[str]],
+    *,
+    reason: str,
+) -> Optional[Tuple[List[str], List[str]]]:
+    """Validates output pairs against allowed bindings and returns separated output lists."""
+    for side_label, allowed_set, col_idx in (("u1", u1_allowed, 0), ("u2", u2_allowed, 1)):
+        if allowed_set is not None:
+            missing = [p[col_idx] for p in pairs if p[col_idx] not in allowed_set]
+            if missing:
+                logger.debug(
+                    "Rejecting generator subroutine outputs: %s output %s: %s",
+                    side_label,
+                    reason,
+                    missing,
+                )
+                return None
+    return [p[0] for p in pairs], [p[1] for p in pairs]
+
+
 class GeneratorCloneSideData(NamedTuple):
     """Encapsulates per-side output candidates, downstream reads, and definite stores."""
 
@@ -1240,19 +1274,12 @@ def resolve_generator_subroutine_outputs(
     ]
 
     # Fail closed on non-definitely assigned outputs to prevent UnboundLocalError
-    for side_label, def_set, col_idx in (("u1", u1_def, 0), ("u2", u2_def, 1)):
-        if def_set is not None:
-            missing = [p[col_idx] for p in kept_pairs if p[col_idx] not in def_set]
-            if missing:
-                logger.debug(
-                    "Rejecting generator subroutine outputs: %s output lacks definite store "
-                    "before exit, risking UnboundLocalError: %s",
-                    side_label,
-                    missing,
-                )
-                return None
-
-    return [o1 for o1, _ in kept_pairs], [o2 for _, o2 in kept_pairs]
+    return _filter_valid_output_pairs(
+        kept_pairs,
+        u1_def,
+        u2_def,
+        reason="lacks definite store before exit, risking UnboundLocalError",
+    )
 
 
 def is_async_generator_with_return_value(
@@ -1319,22 +1346,25 @@ def resolve_clone_generator_subroutine_outputs(
 ) -> Optional[Tuple[List[str], List[str]]]:
     """Resolves output variable bindings for clone generator subroutines across two code units.
 
-    Note: When both u1 and u2 supply precomputed 'outputs', this fast path skips downstream read
-    and definiteness checks. The caller is responsible for having already validated that these
-    precomputed outputs are necessary, safe, and definitely bound before passing them here.
+    Note: When both u1 and u2 supply precomputed 'outputs', this path pairs outputs and validates
+    that all precomputed outputs are definitely assigned before unit exit when definite store
+    analysis is present in the scopes.
     """
     if (
         isinstance(u1.get("outputs"), (list, tuple, set))
         and isinstance(u2.get("outputs"), (list, tuple, set))
     ):
-        # Fast path for precomputed outputs: bypasses downstream read and definiteness analysis;
-        # the caller is responsible for having pre-validated output necessity and safety.
         outs1 = _extract_effective_unit_outputs(u1, scope1)
         outs2 = _extract_effective_unit_outputs(u2, scope2)
         if len(outs1) == len(outs2):
             pairs = _pair_clone_outputs(outs1, outs2)
             if len(pairs) == len(outs1):
-                return [p[0] for p in pairs], [p[1] for p in pairs]
+                return _filter_valid_output_pairs(
+                    pairs,
+                    _extract_scope_valid_bindings(scope1),
+                    _extract_scope_valid_bindings(scope2),
+                    reason="lacks store or input binding in unit",
+                )
         return None
 
     u1_raw = _extract_effective_unit_outputs(u1, scope1)
@@ -1359,8 +1389,12 @@ def resolve_clone_generator_subroutine_outputs(
             reads = None
         downstream_reads.append(reads)
 
-    u1_def = set(scope1.get("definite_stores", [])) | set(scope1.get("inputs", []))
-    u2_def = set(scope2.get("definite_stores", [])) | set(scope2.get("inputs", []))
+    u1_def: Optional[Set[str]] = None
+    if "definite_stores" in scope1 or "inputs" in scope1:
+        u1_def = set(scope1.get("definite_stores", [])) | set(scope1.get("inputs", []))
+    u2_def: Optional[Set[str]] = None
+    if "definite_stores" in scope2 or "inputs" in scope2:
+        u2_def = set(scope2.get("definite_stores", [])) | set(scope2.get("inputs", []))
 
     side1 = GeneratorCloneSideData(u1_raw, downstream_reads[0], u1_def)
     side2 = GeneratorCloneSideData(u2_raw, downstream_reads[1], u2_def)

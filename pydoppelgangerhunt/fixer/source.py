@@ -197,7 +197,7 @@ def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
         return lines
     s_col = _parse_unit_coord(unit, "start_col", default=0)
-    e_col = unit.get("end_col")
+    e_col = _parse_unit_coord(unit, "end_col", default=None)
     res = list(lines)
     if len(res) == 1:
         res[0] = res[0][s_col:e_col] if (e_col is None or e_col > s_col) else res[0][s_col:]
@@ -640,12 +640,12 @@ def compute_unit_spans(
     raw_ec = unit.get("end_col")
 
     try:
-        start_col = int(raw_sc) if raw_sc is not None else None
+        start_col = _parse_unit_coord(unit, "start_col", default=None)
     except (ValueError, TypeError) as err:
         raise ValueError(f"Malformed unit: invalid 'start_col' offset: {raw_sc!r}") from err
 
     try:
-        end_col = int(raw_ec) if raw_ec is not None else None
+        end_col = _parse_unit_coord(unit, "end_col", default=None)
     except (ValueError, TypeError) as err:
         raise ValueError(f"Malformed unit: invalid 'end_col' offset: {raw_ec!r}") from err
 
