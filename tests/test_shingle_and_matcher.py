@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -914,7 +915,6 @@ def test_batch_49_matcher_similarity_and_subclones(tmp_path: Path) -> None:
 def test_batch_51_matcher_defensive_bounds_and_raw_set_baseline(tmp_path: Path) -> None:
     """Batch 51: Test defensive bounds in matcher merging/subclones, and raw set baseline filtering."""
     # pylint: disable=import-outside-toplevel
-    import json
     from pydoppelgangerhunt.baseline import (
         clone_pair_structural_fingerprint,
         filter_clones_by_baseline,
@@ -1083,7 +1083,6 @@ def test_batch_59_scan_target_repo_root_and_diff_hunk_prefixes(tmp_path: Path) -
 def test_batch_70_review_fixes(tmp_path: Path) -> None:
     """Batch 70: Test TRY_NODE_TYPES compatibility, path-specific exemption isolation, and absolute path normalization."""
     # pylint: disable=import-outside-toplevel
-    import ast
     from pydoppelgangerhunt.matcher import (
         _normalize_exemption_endpoint,
         scan_target,

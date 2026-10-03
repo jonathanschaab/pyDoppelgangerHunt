@@ -228,7 +228,6 @@ def test_batch_37_directory_boundary_path_matching_and_exclude_filtering(tmp_pat
 
 def test_batch_39_notebook_cell_clustering_and_metrics_isolation(tmp_path: Any) -> None:
     """Tests Batch 39: notebook cell clustering isolation, notebook SLOC/DLOC metrics, and indent step detection."""
-    import json
     from pydoppelgangerhunt.clustering import cluster_clone_families
     from pydoppelgangerhunt.fixer import _detect_indent_step
     from pydoppelgangerhunt.metrics import compute_repository_dry_stats

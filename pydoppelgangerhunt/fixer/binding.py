@@ -10,52 +10,36 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.config import normalize_path_string, paths_match_boundary
 from pydoppelgangerhunt.parser import is_decorator_named
+from pydoppelgangerhunt.fixer.dataflow import (
+    GeneratorCloneSideData,
+    collect_downstream_read_names,
+    is_async_generator_with_return_value,
+    is_subroutine_unit,
+    resolve_clone_generator_subroutine_outputs,
+    resolve_closure_strictness_mode,
+    resolve_generator_subroutine_outputs,
+    _load_unit_file_text,
+)
 from pydoppelgangerhunt.fixer.scope import (
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
 )
-from pydoppelgangerhunt.fixer.source import parse_unit_coord, split_source_lines
+from pydoppelgangerhunt.fixer.source import (
+    _find_innermost_enclosing_node,
+    split_source_lines,
+)
 
-
-def _find_innermost_enclosing_node(
-    source_text: str,
-    unit: Dict[str, Any],
-    node_types: Tuple[type, ...],
-) -> Optional[Tuple[ast.AST, int, int]]:
-    """Locates the innermost AST node of matching types enclosing the given unit."""
-    if not source_text.strip():
-        return None
-
-    try:
-        tree = ast.parse(source_text)
-    except (SyntaxError, ValueError, UnicodeDecodeError):
-        return None
-
-    u_start = parse_unit_coord(unit, "start", default=0)
-    u_end = parse_unit_coord(unit, "end", default=u_start)
-    if u_start <= 0:
-        return None
-
-    candidates: List[Tuple[int, ast.AST, int, int]] = []
-    for node in ast.walk(tree):
-        if isinstance(node, node_types):
-            n_start = getattr(node, "lineno", 0)
-            n_end = getattr(node, "end_lineno", n_start)
-            decorators = getattr(node, "decorator_list", [])
-            dec_start = (
-                min(getattr(d, "lineno", n_start) for d in decorators)
-                if decorators
-                else n_start
-            )
-            earliest_start = min(dec_start, n_start)
-            if earliest_start <= u_start <= u_end <= n_end:
-                candidates.append((n_end - earliest_start, node, earliest_start, n_end))
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda item: (item[0], -item[2]))
-    _, matched_node, n_start, n_end = candidates[0]
-    return matched_node, n_start, n_end
+__all__ = [
+    "GeneratorCloneSideData",
+    "analyze_unit_variable_scope",
+    "collect_downstream_read_names",
+    "find_enclosing_class",
+    "find_enclosing_function",
+    "is_async_generator_with_return_value",
+    "is_subroutine_unit",
+    "resolve_clone_generator_subroutine_outputs",
+    "resolve_closure_strictness_mode",
+    "resolve_generator_subroutine_outputs",
+]
 
 
 def _inspect_enclosing_node(
@@ -162,6 +146,7 @@ def find_enclosing_function(
 
     decs = meta.pop("decorators", [])
     node = meta.pop("node", None)
+    meta["is_async"] = isinstance(node, ast.AsyncFunctionDef)
     meta["is_static"] = any(is_decorator_named(d, "staticmethod") for d in decs)
     meta["is_class_method"] = any(is_decorator_named(d, "classmethod") for d in decs)
     receiver_param = None
@@ -297,40 +282,35 @@ def _populate_unit_receiver_metadata(
         and "enclosing_class" in unit
         and "enclosing_class_start" in unit
         and "receiver_param" in unit
+        and "is_async" in unit
     ):
         return
-    f_raw = normalize_path_string(str(unit.get("file") or ""), strip_anchor=True)
-    if not f_raw:
+    source = _load_unit_file_text(unit, repo_root=repo_root)
+    if source is None:
         return
-    p = Path(f_raw)
-    f_path = p if p.is_file() or p.is_absolute() else (Path(repo_root or os.getcwd()) / p)
-    if not f_path.is_file():
-        return
-    try:
-        source = f_path.read_text(encoding="utf-8")
-        fn_meta = find_enclosing_function(source, unit)
-        cls_meta = find_enclosing_class(source, unit)
-        if cls_meta:
-            if "enclosing_class" not in unit:
-                unit["enclosing_class"] = cls_meta["name"]
-            if "enclosing_class_start" not in unit:
-                unit["enclosing_class_start"] = cls_meta["start"]
-        is_method = _is_method_of_class(fn_meta, cls_meta)
-        if "receiver_kind" not in unit:
-            if is_method:
-                rec_k = _get_enclosing_receiver_kind(fn_meta)
-                unit["receiver_kind"] = rec_k
-                if rec_k == "static":
-                    unit["is_static"] = True
-            else:
-                unit["receiver_kind"] = None
-        if "receiver_param" not in unit:
-            if is_method and unit.get("receiver_kind") in ("instance", "class"):
-                unit["receiver_param"] = fn_meta.get("receiver_param") if fn_meta else None
-            else:
-                unit["receiver_param"] = None
-    except (OSError, UnicodeDecodeError):
-        pass
+    fn_meta = find_enclosing_function(source, unit)
+    cls_meta = find_enclosing_class(source, unit)
+    if cls_meta:
+        if "enclosing_class" not in unit:
+            unit["enclosing_class"] = cls_meta["name"]
+        if "enclosing_class_start" not in unit:
+            unit["enclosing_class_start"] = cls_meta["start"]
+    is_method = _is_method_of_class(fn_meta, cls_meta)
+    if "receiver_kind" not in unit:
+        if is_method:
+            rec_k = _get_enclosing_receiver_kind(fn_meta)
+            unit["receiver_kind"] = rec_k
+            if rec_k == "static":
+                unit["is_static"] = True
+        else:
+            unit["receiver_kind"] = None
+    if "receiver_param" not in unit:
+        if is_method and unit.get("receiver_kind") in ("instance", "class"):
+            unit["receiver_param"] = fn_meta.get("receiver_param") if fn_meta else None
+        else:
+            unit["receiver_param"] = None
+    if "is_async" not in unit:
+        unit["is_async"] = bool(fn_meta.get("is_async")) if fn_meta else False
 
 
 def _base_unit_name(u: Dict[str, Any]) -> str:

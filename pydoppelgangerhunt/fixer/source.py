@@ -13,6 +13,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, 
 from pydoppelgangerhunt.source_lines import (
     count_physical_newlines,
     detect_line_ending,
+    parse_unit_coord,
     split_source_lines,
 )
 
@@ -31,6 +32,7 @@ __all__ = [
     "count_physical_newlines",
     "detect_line_ending",
     "extract_unit_comments_and_pragmas",
+    "find_enclosing_function_is_async",
     "is_valid_unit_coordinates",
     "parse_unit_coord",
     "replace_unit_in_source",
@@ -41,13 +43,6 @@ __all__ = [
 
 UnitDict = Dict[str, Any]
 
-
-def parse_unit_coord(unit: UnitDict, key: str, default: int = 1) -> int:
-    """Extracts and parses an integer coordinate from a unit dictionary."""
-    val = unit.get(key)
-    return int(val if val is not None else default)
-
-
 _parse_unit_coord = parse_unit_coord
 
 
@@ -56,18 +51,12 @@ def is_valid_unit_coordinates(u: Any) -> bool:
     if not isinstance(u, dict):
         return False
     try:
-        s_val = u.get("start")
-        if s_val is not None:
-            int(s_val)
-        e_val = u.get("end")
-        if e_val is not None:
-            int(e_val)
-        sc_val = u.get("start_col")
-        if sc_val is not None:
-            int(sc_val)
-        ec_val = u.get("end_col")
-        if ec_val is not None:
-            int(ec_val)
+        for key in ("start", "end", "start_col", "end_col"):
+            val = u.get(key)
+            if val is not None:
+                if isinstance(val, str) and ":" in val:
+                    val = val.split(":", 1)[0].strip()
+                int(val)
         return True
     except (ValueError, TypeError):
         return False
@@ -208,7 +197,7 @@ def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
         return lines
     s_col = _parse_unit_coord(unit, "start_col", default=0)
-    e_col = unit.get("end_col")
+    e_col = _parse_unit_coord(unit, "end_col", default=None)
     res = list(lines)
     if len(res) == 1:
         res[0] = res[0][s_col:e_col] if (e_col is None or e_col > s_col) else res[0][s_col:]
@@ -651,12 +640,12 @@ def compute_unit_spans(
     raw_ec = unit.get("end_col")
 
     try:
-        start_col = int(raw_sc) if raw_sc is not None else None
+        start_col = _parse_unit_coord(unit, "start_col", default=None)
     except (ValueError, TypeError) as err:
         raise ValueError(f"Malformed unit: invalid 'start_col' offset: {raw_sc!r}") from err
 
     try:
-        end_col = int(raw_ec) if raw_ec is not None else None
+        end_col = _parse_unit_coord(unit, "end_col", default=None)
     except (ValueError, TypeError) as err:
         raise ValueError(f"Malformed unit: invalid 'end_col' offset: {raw_ec!r}") from err
 
@@ -1033,3 +1022,69 @@ def _find_sig_colon(line: str) -> int:
     if colon_idx != -1:
         return colon_idx
     return line.rfind(":")
+
+
+def _find_innermost_enclosing_node(
+    source_text: str,
+    unit: Dict[str, Any],
+    node_types: Tuple[type, ...],
+    tree: Optional[ast.AST] = None,
+) -> Optional[Tuple[ast.AST, int, int]]:
+    """Locates the innermost AST node of matching types enclosing the given unit."""
+    if not isinstance(unit, dict):
+        return None
+    try:
+        u_start = parse_unit_coord(unit, "start", default=0)
+        u_end = parse_unit_coord(unit, "end", default=u_start)
+    except (ValueError, TypeError):
+        return None
+    if u_start <= 0 or u_end <= 0 or u_start > u_end:
+        return None
+
+    if tree is None:
+        if not source_text.strip():
+            return None
+        try:
+            tree = ast.parse(source_text)
+        except (SyntaxError, ValueError, UnicodeDecodeError):
+            return None
+
+    candidates: List[Tuple[int, ast.AST, int, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, node_types):
+            n_start = getattr(node, "lineno", 0)
+            n_end = getattr(node, "end_lineno", n_start)
+            decorators = getattr(node, "decorator_list", [])
+            dec_start = (
+                min(getattr(d, "lineno", n_start) for d in decorators)
+                if decorators
+                else n_start
+            )
+            earliest_start = min(dec_start, n_start)
+            if earliest_start <= u_start <= u_end <= n_end:
+                candidates.append((n_end - earliest_start, node, earliest_start, n_end))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[0], -item[2]))
+    _, matched_node, n_start, n_end = candidates[0]
+    return matched_node, n_start, n_end
+
+
+def find_enclosing_function_is_async(
+    source_text: str,
+    start_line: int,
+    end_line: int,
+    tree: Optional[ast.AST] = None,
+) -> bool:
+    """Checks whether the given line range is enclosed within an AsyncFunctionDef."""
+    res = _find_innermost_enclosing_node(
+        source_text,
+        {"start": start_line, "end": end_line},
+        (ast.FunctionDef, ast.AsyncFunctionDef),
+        tree=tree,
+    )
+    if res is None:
+        return False
+    return isinstance(res[0], ast.AsyncFunctionDef)

@@ -4,17 +4,30 @@ from __future__ import annotations
 
 import ast
 import builtins
+import inspect
 import logging
 import sys
 import textwrap
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.reporters import extract_unit_source_code
-from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines, split_source_lines
+from pydoppelgangerhunt.fixer.dataflow import (
+    _load_unit_file_text,
+    is_subroutine_unit,
+)
+from pydoppelgangerhunt.fixer.source import (
+    _slice_unit_token_lines,
+    find_enclosing_function_is_async,
+    parse_unit_coord,
+    split_source_lines,
+)
 
 logger = logging.getLogger(__name__)
 
 BUILTIN_NAMES: Set[str] = set(dir(builtins))
+
+
+_SYNTHETIC_WRAPPER_NAME: str = "__pdh_wrapper__"
 
 
 def _is_mangled_name(name: str) -> bool:
@@ -100,6 +113,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.loop_offset: int = loop_offset
         self.loop_depth: int = 0
         self.has_return: bool = False
+        self.has_return_value: bool = False
         self.has_yield: bool = False
         self.has_super: bool = False
         self.has_mangled_names: bool = False
@@ -195,6 +209,25 @@ class _ScopeVisitor(ast.NodeVisitor):
             self.stores.append(name)
 
     def _process_func(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
+        if (
+            self.is_subroutine
+            and len(self._scope_stack) == 0
+            and node.name == _SYNTHETIC_WRAPPER_NAME
+        ):
+            body = node.body
+            if (
+                self.loop_offset > 0
+                and len(body) == 1
+                and isinstance(body[0], (ast.For, ast.AsyncFor, ast.While))
+            ):
+                body = body[0].body
+                self.loop_offset = 0
+            if isinstance(node, ast.AsyncFunctionDef):
+                self.is_async = True
+            for stmt in body:
+                self.visit(stmt)
+            return
+
         is_top = (
             len(self._scope_stack) == 0
             and not self.is_subroutine
@@ -544,6 +577,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         if len(self._scope_stack) <= 1:
             self.has_return = True
             if node.value is not None:
+                self.has_return_value = True
                 if isinstance(node.value, ast.Name):
                     if node.value.id not in self.returns:
                         self.returns.append(node.value.id)
@@ -1141,6 +1175,7 @@ def _rank_param_kind(
 def _inspect_unit_scope(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
+    file_tree: Optional[ast.AST] = None,
 ) -> Dict[str, Any]:
     """Extracts lexical and AST scope metadata for a single unit."""
     raw_lines = _slice_unit_token_lines(unit, extract_unit_source_code(unit, repo_root=repo_root))
@@ -1160,6 +1195,7 @@ def _inspect_unit_scope(
         "is_control_flow_safe": True,
         "has_yield": False,
         "has_return": False,
+        "has_return_value": False,
         "has_super": False,
         "has_mangled_names": False,
         "local_imports": [],
@@ -1183,10 +1219,18 @@ def _inspect_unit_scope(
 
     parse_candidates = [
         (dedented, 0),
-        (f"async def _wrapper():\n{textwrap.indent(dedented, '    ')}", 0),
-        (f"def _wrapper():\n{textwrap.indent(dedented, '    ')}", 0),
-        (f"async def _wrapper():\n    for _ in (0,):\n{textwrap.indent(dedented, '        ')}", 1),
-        (f"def _wrapper():\n    for _ in (0,):\n{textwrap.indent(dedented, '        ')}", 1),
+        (f"async def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
+        (f"def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
+        (
+            f"async def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
+            f"{textwrap.indent(dedented, '        ')}",
+            1,
+        ),
+        (
+            f"def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
+            f"{textwrap.indent(dedented, '        ')}",
+            1,
+        ),
     ]
 
     for cand_text, offset in parse_candidates:
@@ -1218,11 +1262,7 @@ def _inspect_unit_scope(
     if tree is None:
         return empty_res
 
-    unit_name = str(unit.get("name") or "")
-    unit_kind = str(unit.get("kind") or "")
-    is_subroutine = unit_kind in ("compound_block", "sliding_window", "clause_branch") or (
-        unit_kind not in ("function", "closure", "method", "comprehension", "complex_expr") and ":" in unit_name
-    )
+    is_subroutine = is_subroutine_unit(unit)
 
     rec_param = unit.get("receiver_param")
     rec_kind = unit.get("receiver_kind")
@@ -1311,7 +1351,10 @@ def _inspect_unit_scope(
 
     # Unit outputs: explicit returns if present; for subroutines without explicit
     # returns, all local variable stores act as unit outputs to preserve caller mutations.
-    if visitor.returns:
+    pre_outs = unit.get("precomputed_outputs") or unit.get("outputs")
+    if is_subroutine and isinstance(pre_outs, (list, tuple, set)):
+        outputs = list(pre_outs)
+    elif visitor.returns:
         outputs = list(visitor.returns)
     elif is_subroutine:
         outputs = [
@@ -1352,6 +1395,18 @@ def _inspect_unit_scope(
         )
     )
 
+    unit_is_async = unit.get("is_async")
+    if unit_is_async is None:
+        s_line = parse_unit_coord(unit, "start", default=1)
+        e_line = parse_unit_coord(unit, "end", default=s_line)
+        source_text: Optional[str] = _load_unit_file_text(unit, repo_root=repo_root)
+        if source_text:
+            unit_is_async = find_enclosing_function_is_async(
+                source_text, s_line, e_line, tree=file_tree
+            )
+        else:
+            unit_is_async = False
+
     return {
         "inputs": inputs,
         "outputs": outputs,
@@ -1367,11 +1422,12 @@ def _inspect_unit_scope(
         "is_control_flow_safe": is_control_flow_safe,
         "has_yield": visitor.has_yield,
         "has_return": visitor.has_return,
+        "has_return_value": visitor.has_return_value,
         "has_super": visitor.has_super,
         "has_mangled_names": visitor.has_mangled_names,
         "local_imports": visitor.local_imports,
         "yield_expr_names": visitor.yield_expr_names,
-        "is_async": visitor.is_async,
+        "is_async": visitor.is_async or bool(unit_is_async),
         "conditional_outputs": conditional_outputs,
         "definite_stores": sorted(def_assigned),
         "has_instance_binding": has_instance_binding,
@@ -1394,11 +1450,13 @@ def analyze_unit_variable_scope(
     u1: Dict[str, Any],
     u2: Optional[Dict[str, Any]] = None,
     repo_root: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
-    info1 = _inspect_unit_scope(u1, repo_root=repo_root)
+    info1 = _inspect_unit_scope(u1, repo_root=repo_root, file_tree=tree1)
     if u2 is not None:
-        info2 = _inspect_unit_scope(u2, repo_root=repo_root)
+        info2 = _inspect_unit_scope(u2, repo_root=repo_root, file_tree=tree2)
         common_inputs = [var for var in info1["inputs"] if var in info2["inputs"]]
         if len(info1["inputs"]) == len(info2["inputs"]):
             inputs = common_inputs if len(common_inputs) == len(info1["inputs"]) else info1["inputs"]
@@ -1426,6 +1484,7 @@ def analyze_unit_variable_scope(
         is_safe = info1["is_control_flow_safe"] and info2["is_control_flow_safe"]
         has_yield = info1["has_yield"] or info2["has_yield"]
         has_return = info1["has_return"] or info2["has_return"]
+        has_return_value = bool(info1.get("has_return_value") or info2.get("has_return_value"))
         has_super = bool(info1.get("has_super", False) or info2.get("has_super", False))
         has_mangled = bool(info1.get("has_mangled_names", False) or info2.get("has_mangled_names", False))
         local_imports = list(dict.fromkeys(info1["local_imports"] + info2["local_imports"]))
@@ -1451,6 +1510,7 @@ def analyze_unit_variable_scope(
         is_safe = info1["is_control_flow_safe"]
         has_yield = info1["has_yield"]
         has_return = info1["has_return"]
+        has_return_value = bool(info1.get("has_return_value"))
         has_super = bool(info1.get("has_super", False))
         has_mangled = bool(info1.get("has_mangled_names", False))
         local_imports = info1["local_imports"]
@@ -1492,6 +1552,7 @@ def analyze_unit_variable_scope(
         "is_control_flow_safe": is_safe,
         "has_yield": has_yield,
         "has_return": has_return,
+        "has_return_value": has_return_value,
         "has_super": has_super,
         "has_mangled_names": has_mangled,
         "local_imports": local_imports,
@@ -1513,13 +1574,31 @@ def analyze_unit_variable_scope(
     }
 
 
-
 def dispatch_analyze_unit_variable_scope(
     u1: Dict[str, Any],
     u2: Optional[Dict[str, Any]] = None,
     repo_root: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
 ) -> Dict[str, Any]:
     """Dispatches analyze_unit_variable_scope, honoring active mock patches on pydoppelgangerhunt.fixer."""
     pkg = sys.modules.get("pydoppelgangerhunt.fixer")
     target = getattr(pkg, "analyze_unit_variable_scope", analyze_unit_variable_scope)
+    if target is analyze_unit_variable_scope:
+        return analyze_unit_variable_scope(
+            u1, u2=u2, repo_root=repo_root, tree1=tree1, tree2=tree2
+        )
+
+    supports_trees = True
+    try:
+        sig = inspect.signature(target)
+        has_var_kw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+        supports_trees = "tree1" in sig.parameters or has_var_kw
+    except (ValueError, TypeError):
+        supports_trees = True
+
+    if supports_trees:
+        return target(u1, u2=u2, repo_root=repo_root, tree1=tree1, tree2=tree2)
     return target(u1, u2=u2, repo_root=repo_root)

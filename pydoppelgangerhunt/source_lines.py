@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Iterable, Iterator, List, Optional, Sequence, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Union, overload
 
 _PHYSICAL_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
 
@@ -11,8 +11,50 @@ __all__ = [
     "_PHYSICAL_LINE_RE",
     "count_physical_newlines",
     "detect_line_ending",
+    "parse_unit_coord",
     "split_source_lines",
 ]
+
+
+@overload
+def parse_unit_coord(unit: Dict[str, Any], key: str) -> int:
+    ...
+
+
+@overload
+def parse_unit_coord(unit: Dict[str, Any], key: str, default: int) -> int:
+    ...
+
+
+@overload
+def parse_unit_coord(unit: Dict[str, Any], key: str, default: None) -> Optional[int]:
+    ...
+
+
+@overload
+def parse_unit_coord(
+    unit: Dict[str, Any], key: str, default: Optional[int]
+) -> Optional[int]:
+    ...
+
+
+def parse_unit_coord(
+    unit: Dict[str, Any], key: str, default: Optional[int] = 1
+) -> Optional[int]:
+    """Extracts and parses an integer coordinate from a unit dictionary.
+
+    Safely handles integers, numeric strings, and colon-delimited coordinate strings
+    (e.g., '12:0' or '8:0'). For colon-formatted coordinates emitted by external linters
+    or diagnostics (where the suffix denotes a sub-column or character index), the primary
+    leading coordinate prefix before the colon is parsed as the integer value.
+    Raises ValueError for non-numeric strings.
+    """
+    val = unit.get(key)
+    if val is None:
+        return default
+    if isinstance(val, str) and ":" in val:
+        val = val.split(":", 1)[0].strip()
+    return int(val)
 
 
 def split_source_lines(source_text: str) -> List[str]:

@@ -31,7 +31,10 @@ from pydoppelgangerhunt.config import (
 )
 from pydoppelgangerhunt.canonical_path import CanonicalPathResolver
 from pydoppelgangerhunt.coverage import check_asymmetric_coverage, read_coverage_data
-from pydoppelgangerhunt.fixer import generate_refactoring_patch
+from pydoppelgangerhunt.fixer import (
+    generate_refactoring_patch,
+    resolve_closure_strictness_mode,
+)
 from pydoppelgangerhunt.git_diff import (
     DiffRangeMap,
     check_temporal_divergence,
@@ -187,6 +190,21 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         type=str,
         default=None,
         help="Module filename for shared utility extractions (default: '_common.py')",
+    )
+    parser.add_argument(
+        "--skip-pre-unit-closures",
+        action="store_true",
+        help="Skip scanning pre-unit closures for live variables during subroutine extraction",
+    )
+    parser.add_argument(
+        "--closure-strictness",
+        type=str,
+        choices=["strict", "lenient"],
+        default=None,
+        help=(
+            "Closure strictness ('strict' or 'lenient'; "
+            "takes precedence over --skip-pre-unit-closures)"
+        ),
     )
 
     color_group = parser.add_mutually_exclusive_group()
@@ -1102,6 +1120,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else "auto"
     )
     shared_module_name = str(args.shared_module_name or tool_cfg.get("shared_module_name", "_common.py"))
+    if args.closure_strictness is not None:
+        cli_strictness: Optional[str] = args.closure_strictness
+        cli_skip: bool = False
+    elif args.skip_pre_unit_closures:
+        cli_strictness = "lenient"
+        cli_skip = True
+    else:
+        cli_strictness = tool_cfg.get("closure_strictness")
+        cli_skip = bool(tool_cfg.get("skip_pre_unit_closures", False))
+
+    closure_strictness, skip_pre_unit_closures = resolve_closure_strictness_mode(
+        closure_strictness=cli_strictness,
+        skip_pre_unit_closures=cli_skip,
+    )
 
     baseline_path = args.baseline or tool_cfg.get("baseline")
     preloaded_baseline: Optional[BaselineFingerprints] = None
@@ -1368,7 +1400,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if early_exit is not None:
         return early_exit
 
-    if args.top is not None and args.top > 0 and len(clones) > args.top:
+    if args.top is not None and 0 < args.top < len(clones):
         clones = clones[:args.top]
 
     families: Optional[List[Dict[str, Any]]] = None
@@ -1427,6 +1459,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 method_binding=method_binding,
                 cross_file_strategy=cross_file_strategy,
                 shared_module_name=shared_module_name,
+                skip_pre_unit_closures=skip_pre_unit_closures,
+                closure_strictness=closure_strictness,
             )
             if clones
             else ""

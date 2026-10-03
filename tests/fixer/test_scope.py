@@ -176,11 +176,19 @@ def test_fixer_control_flow_and_side_effect_safety(tmp_path: Path) -> None:
     file_target.write_text(
         '"""Target module docstring."""\n\n'
         'from __future__ import annotations\n\n'
-        'def run_step(a: int, b: int) -> int:\n'
-        '    return a + b\n',
+        'def run_step(a: int, b: int) -> tuple[int, int]:\n'
+        '    a += b\n'
+        '    b += 1\n'
+        '    return a, b\n',
         encoding="utf-8",
     )
-    u_patch1 = {"file": str(file_target), "start": 5, "end": 6, "name": "run_step"}
+    u_patch1 = {
+        "file": str(file_target),
+        "start": 6,
+        "end": 7,
+        "name": "run_step:stmts",
+        "kind": "sliding_window",
+    }
     patch = generate_refactoring_patch([(0.95, u_mut, u_patch1)], repo_root=str(tmp_path))
     assert "+from typing import" in patch
     assert "Tuple" in patch
@@ -1501,3 +1509,32 @@ def test_scope_inspection_custom_receiver_attributes(tmp_path: Path) -> None:
     assert "klass.count" in s_cls["attrs_read"]
     assert "klass.count" in s_cls["class_attrs"]
     assert s_cls["inputs"][0] == "klass"
+
+
+def test_dispatch_analyze_unit_variable_scope_mock_fallback() -> None:
+    """Verifies that dispatch_analyze_unit_variable_scope falls back gracefully when patched."""
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        dispatch_analyze_unit_variable_scope,
+    )
+
+    u1 = {"file": "mod.py", "start": 1, "end": 2}
+
+    # 1. Default dispatch invokes analyze_unit_variable_scope directly
+    res_default = dispatch_analyze_unit_variable_scope(u1)
+    assert isinstance(res_default, dict)
+
+    # 2. Mock that only accepts (u1, u2=None, repo_root=None) without tree1/tree2
+    def mock_legacy_scope(unit1: Any, u2: Any = None, repo_root: Any = None) -> Dict[str, Any]:
+        return {"mocked": True, "unit": unit1}
+
+    with mock.patch("pydoppelgangerhunt.fixer.analyze_unit_variable_scope", mock_legacy_scope):
+        res_mock = dispatch_analyze_unit_variable_scope(u1, tree1=ast.parse("x = 1\n"))
+        assert res_mock == {"mocked": True, "unit": u1}
+
+    # 3. Target accepts tree1 but raises TypeError internally; must not be swallowed
+    def mock_raising_scope(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        raise TypeError("tree1 parameter has an unexpected invalid type")
+
+    with mock.patch("pydoppelgangerhunt.fixer.analyze_unit_variable_scope", mock_raising_scope):
+        with pytest.raises(TypeError, match="tree1 parameter has an unexpected invalid type"):
+            dispatch_analyze_unit_variable_scope(u1, tree1=ast.parse("x = 1\n"))

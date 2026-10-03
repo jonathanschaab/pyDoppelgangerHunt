@@ -20,6 +20,7 @@ from pydoppelgangerhunt.config import (
     find_python_files,
 )
 from pydoppelgangerhunt.git_diff import get_git_repo_root
+from pydoppelgangerhunt.source_lines import parse_unit_coord
 from pydoppelgangerhunt.baseline import (
     HARVEST_BOOLEAN_MODES,
     _safe_bool,
@@ -270,9 +271,12 @@ def _update_merged_unit_columns(
         if is_expanded:
             target_unit[key] = donor_unit.get(key)
         elif d_pos == t_pos and donor_unit.get(key) is not None:
-            curr_val = target_unit.get(key)
-            donor_val = donor_unit[key]
-            target_unit[key] = agg(curr_val, donor_val) if curr_val is not None else donor_val
+            curr_val = parse_unit_coord(target_unit, key, default=None)
+            donor_val = parse_unit_coord(donor_unit, key, default=None)
+            if curr_val is not None and donor_val is not None:
+                target_unit[key] = agg(curr_val, donor_val)
+            elif donor_val is not None:
+                target_unit[key] = donor_val
 
 
 def _check_column_bounds_relationship(
@@ -288,20 +292,22 @@ def _check_column_bounds_relationship(
     Returns:
         A tuple of (is_enclosed, is_strictly_smaller).
     """
-    p_sc, c_sc = p_unit.get("start_col"), c_unit.get("start_col")
-    p_ec, c_ec = p_unit.get("end_col"), c_unit.get("end_col")
+    p_sc = parse_unit_coord(p_unit, "start_col", default=None)
+    c_sc = parse_unit_coord(c_unit, "start_col", default=None)
+    p_ec = parse_unit_coord(p_unit, "end_col", default=None)
+    c_ec = parse_unit_coord(c_unit, "end_col", default=None)
 
     if c_start == p_start and p_sc is not None and c_sc is not None:
-        if int(c_sc) < int(p_sc):
+        if c_sc < p_sc:
             return False, False
 
     if c_end == p_end and p_ec is not None and c_ec is not None:
-        if int(c_ec) > int(p_ec):
+        if c_ec > p_ec:
             return False, False
 
     strictly_smaller = (
-        (c_start == p_start and p_sc is not None and c_sc is not None and int(c_sc) > int(p_sc))
-        or (c_end == p_end and p_ec is not None and c_ec is not None and int(c_ec) < int(p_ec))
+        (c_start == p_start and p_sc is not None and c_sc is not None and c_sc > p_sc)
+        or (c_end == p_end and p_ec is not None and c_ec is not None and c_ec < p_ec)
     )
     return True, strictly_smaller
 

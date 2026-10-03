@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -703,7 +704,6 @@ def test_extract_unit_source_code_rejects_global_tempdir_when_repo_root_omitted(
 
 def test_extract_unit_source_code_uppercase_notebook_and_case_insensitive_cell_anchor(tmp_path: Path) -> None:
     """Verifies that extract_unit_source_code, parser, and config handle uppercase notebooks case-insensitively."""
-    import json
     from pydoppelgangerhunt.config import find_python_files  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.metrics import compute_repository_dry_stats  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.parser import harvest_file_units  # pylint: disable=import-outside-toplevel
@@ -755,7 +755,6 @@ def test_extract_unit_source_code_uppercase_notebook_and_case_insensitive_cell_a
 
 def test_extract_unit_source_code_notebook_with_literal_hash_in_filename(tmp_path: Path) -> None:
     """Verifies that extract_unit_source_code distinguishes literal hashes in filenames from cell anchors."""
-    import json
     from pydoppelgangerhunt.reporters import extract_unit_source_code  # pylint: disable=import-outside-toplevel
 
     nb_file = tmp_path / "report#cellular.ipynb"
@@ -813,3 +812,52 @@ def test_extract_unit_source_code_notebook_with_literal_hash_in_filename(tmp_pat
     literal_lines = extract_unit_source_code(unit_literal_cell, repo_root=str(tmp_path))
     assert len(literal_lines) >= 1
     assert "{" in "".join(literal_lines)
+
+
+def test_extract_unit_source_code_source_lines_is_sliced_flag_and_source_text() -> None:
+    """Verifies that source_lines_is_sliced flag explicitly overrides the length heuristic,
+    and in-memory source_text is used when source_lines is not provided."""
+    # 1. When source_lines_is_sliced is False, slice full-file line list even if count matches
+    whole_file_lines = ["line 1\n", "line 2\n", "line 3\n"]
+    # Unit whose span happens to equal len(whole_file_lines): start=2, end=4 (span=3)
+    unit_full_file = {
+        "start": 2,
+        "end": 3,
+        "source_lines": whole_file_lines,
+        "source_lines_is_sliced": False,
+    }
+    extracted = extract_unit_source_code(unit_full_file)
+    assert extracted == ["line 2\n", "line 3\n"]
+
+    # 2. When source_lines_is_sliced is True, return source_lines as-is
+    unit_sliced = {
+        "start": 10,
+        "end": 20,
+        "source_lines": ["part a\n", "part b\n"],
+        "source_lines_is_sliced": True,
+    }
+    extracted_sliced = extract_unit_source_code(unit_sliced)
+    assert extracted_sliced == ["part a\n", "part b\n"]
+
+    # 3. In-memory source_text fallback when source_lines is None
+    unit_source_text = {
+        "start": 2,
+        "end": 3,
+        "source_text": "line 1\nline 2\nline 3\nline 4\n",
+    }
+    extracted_text = extract_unit_source_code(unit_source_text)
+    assert extracted_text == ["line 2\n", "line 3\n"]
+
+
+def test_extract_unit_source_code_end_coord_resolution() -> None:
+    """Verifies that extract_unit_source_code slices using resolved e_d."""
+    lines = [f"line {i}\n" for i in range(1, 10)]
+    unit = {
+        "start": "3:0",
+        "end": "5:10",
+        "source_lines": lines,
+        "source_lines_is_sliced": False,
+    }
+    extracted = extract_unit_source_code(unit)
+    assert extracted == ["line 3\n", "line 4\n", "line 5\n"]
+

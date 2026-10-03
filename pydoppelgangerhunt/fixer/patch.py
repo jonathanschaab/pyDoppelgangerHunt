@@ -24,6 +24,13 @@ from pydoppelgangerhunt.fixer.binding import (
     find_enclosing_class,
     find_enclosing_function,
 )
+from pydoppelgangerhunt.fixer.dataflow import (
+    _extract_effective_unit_outputs,
+    _pair_clone_outputs,
+    is_async_generator_with_return_value,
+    resolve_clone_generator_subroutine_outputs,
+    resolve_closure_strictness_mode,
+)
 from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
     _collect_top_level_import_nodes,
@@ -41,6 +48,7 @@ from pydoppelgangerhunt.fixer.scope import (
     _extract_arg_names,
     _normalize_receiver_attrs,
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
+    is_subroutine_unit,
 )
 
 from pydoppelgangerhunt.fixer.source import (
@@ -175,7 +183,10 @@ def check_units_overlap(
         if val is None:
             return None
         try:
-            return max(0, int(val))
+            parsed = parse_unit_coord({col_name: val}, col_name, default=None)
+            if parsed is None:
+                return None
+            return max(0, parsed)
         except (ValueError, TypeError) as err:
             raise ValueError(
                 f"Malformed unit: invalid column offset '{col_name}'={val!r} in {file_path}"
@@ -714,7 +725,7 @@ def _build_unit_delegation_call(
 
     call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
     rep_step = step or ("\t" if "\t" in indent else "    ")
-    if scope.get("has_yield") and scope.get("is_async"):
+    if bool(scope.get("has_yield")) and bool(scope.get("is_async")):
         return (
             f"{indent}async for _item in {call_expr}:\n"
             f"{indent}{rep_step}yield _item\n"
@@ -759,6 +770,24 @@ def _module_imports_target(
     return False
 
 
+def _outputs_compatible(
+    outputs: Sequence[str],
+    u1_outs: Sequence[str],
+    u2_outs: Sequence[str],
+    *,
+    is_subroutine: bool,
+    has_yield: bool,
+) -> bool:
+    """Checks whether candidate clone outputs match synthesized helper outputs.
+
+    Note: When is_subroutine and has_yield are True, resolve_clone_generator_subroutine_outputs
+    strictly guarantees equal-length paired outputs, so output lengths are always compatible.
+    """
+    if is_subroutine and has_yield:
+        return True
+    return len(u1_outs) == len(outputs) and len(u2_outs) == len(outputs)
+
+
 class _PlanSnapshot(TypedDict):
     """Encapsulates a snapshot of mutable _FilePatchPlan state for transactional rollback."""
 
@@ -800,6 +829,19 @@ class _FilePatchPlan:
         self.comments: List[str] = []
         self.used_helper_names: Set[str] = set()
         self.claimed_units: List[UnitDict] = []
+        self._cached_ast: Optional[ast.AST] = None
+        self._ast_attempted: bool = False
+
+    @property
+    def parsed_tree(self) -> Optional[ast.AST]:
+        """Lazily parsed AST of orig_text, cached for reuse across operations."""
+        if not self._ast_attempted:
+            self._ast_attempted = True
+            try:
+                self._cached_ast = ast.parse(self.orig_text)
+            except (SyntaxError, ValueError, UnicodeDecodeError):
+                self._cached_ast = None
+        return self._cached_ast
 
     def snapshot(self) -> _PlanSnapshot:
         """Creates a snapshot of mutable plan state for transactional rollback."""
@@ -2559,6 +2601,8 @@ def generate_refactoring_patch(
     cross_file_strategy: str = "auto",
     shared_module_name: str = "_common.py",
     depgraph: Optional[ModuleDependencyGraph] = None,
+    skip_pre_unit_closures: bool = False,
+    closure_strictness: Optional[str] = None,
 ) -> str:
     """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
     if not clones:
@@ -2586,6 +2630,10 @@ def generate_refactoring_patch(
     method_binding = (method_binding or "auto").strip().lower()
     if method_binding not in ("auto", "method", "module"):
         method_binding = "auto"
+    _, effective_skip_closures = resolve_closure_strictness_mode(
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+    )
     graph_holder: List[Optional[ModuleDependencyGraph]] = [
         depgraph.copy() if depgraph is not None else None
     ]
@@ -2730,7 +2778,10 @@ def generate_refactoring_patch(
                 and enc1["name"] == enc2["name"]
                 and enc1["start"] == enc2["start"]
             )
+            f2_text = f2_plan.orig_text if f2_plan is not None else f1_plan.orig_text
 
+            orig_fn1 = fn1
+            orig_fn2 = fn2
             if not _is_method_of_class(fn1, enc1):
                 fn1 = None
             if not _is_method_of_class(fn2, enc2):
@@ -2748,29 +2799,41 @@ def generate_refactoring_patch(
                 and (fn1.get("receiver_param") or fn1.get("is_static"))
                 and (fn2.get("receiver_param") or fn2.get("is_static"))
             )
-            if fn1 and "receiver_param" not in u1:
-                u1["receiver_param"] = fn1.get("receiver_param")
+            if fn1 and "receiver_param" not in u1_eff:
                 u1_eff["receiver_param"] = fn1.get("receiver_param")
-            if fn2 and "receiver_param" not in u2:
-                u2["receiver_param"] = fn2.get("receiver_param")
+            if fn2 and "receiver_param" not in u2_eff:
                 u2_eff["receiver_param"] = fn2.get("receiver_param")
+            if orig_fn1 and "is_async" not in u1_eff and orig_fn1.get("is_async"):
+                u1_eff["is_async"] = True
+            if orig_fn2 and "is_async" not in u2_eff and orig_fn2.get("is_async"):
+                u2_eff["is_async"] = True
             if fn1 and fn2:
                 is_static = bool(fn1.get("is_static") and fn2.get("is_static"))
             else:
                 is_static = bool((fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static")))
 
-            s1 = analyze_unit_variable_scope(u1_eff, repo_root=str(root))
-            s2 = analyze_unit_variable_scope(u2_eff, repo_root=str(root))
+            tree1 = f1_plan.parsed_tree
+            tree2 = f2_plan.parsed_tree if f2_plan is not None else tree1
+            # Analyze each unit's scope individually.
+            # Each unit occupies positional slot u1, so tree1 supplies its corresponding AST.
+            s1 = analyze_unit_variable_scope(u1_eff, repo_root=str(root), tree1=tree1)
+            s2 = analyze_unit_variable_scope(u2_eff, repo_root=str(root), tree1=tree2)
+            if orig_fn1 and orig_fn1.get("is_async"):
+                s1["is_async"] = True
+            if orig_fn2 and orig_fn2.get("is_async"):
+                s2["is_async"] = True
             if bool(s1.get("is_async")) != bool(s2.get("is_async")):
                 continue
             if bool(s1.get("has_yield")) != bool(s2.get("has_yield")):
+                continue
+            if is_async_generator_with_return_value(s1, s2):
                 continue
             if s1.get("nonlocals") or s2.get("nonlocals"):
                 continue
             if not is_same_file and (s1.get("globals") or s2.get("globals")):
                 continue
-            rec1 = u1.get("receiver_param") or ("cls" if fn1_kind == "class" else "self")
-            rec2 = u2.get("receiver_param") or ("cls" if fn2_kind == "class" else "self")
+            rec1 = u1_eff.get("receiver_param") or ("cls" if fn1_kind == "class" else "self")
+            rec2 = u2_eff.get("receiver_param") or ("cls" if fn2_kind == "class" else "self")
             if (
                 _normalize_receiver_attrs(s1.get("attrs_read", []), rec1)
                 != _normalize_receiver_attrs(s2.get("attrs_read", []), rec2)
@@ -2793,7 +2856,10 @@ def generate_refactoring_patch(
                     continue
 
             if receiver_kinds_differ:
-                if _has_receiver_reference(u1_eff, s1, repo_root=str(root)) or _has_receiver_reference(u2_eff, s2, repo_root=str(root)):
+                if (
+                    _has_receiver_reference(u1_eff, s1, repo_root=str(root))
+                    or _has_receiver_reference(u2_eff, s2, repo_root=str(root))
+                ):
                     continue
 
             effective_binding = _resolve_effective_binding(
@@ -2830,36 +2896,79 @@ def generate_refactoring_patch(
             )
             step = _derive_unit_indent_step(u1, orig_lines, step)
 
-            scope = analyze_unit_variable_scope(u1_eff, u2_eff, repo_root=str(root))
+            scope = analyze_unit_variable_scope(
+                u1_eff, u2_eff, repo_root=str(root), tree1=tree1, tree2=tree2
+            )
             inputs = list(scope.get("inputs", []))
             if effective_binding == "module":
                 inputs = _prune_unshared_receivers(inputs, u1_eff, u2_eff, s1, s2, repo_root=str(root))
-            outputs = [
-                v for v in scope.get("outputs", [])
-                if v not in scope.get("globals", [])
-                and v not in scope.get("nonlocals", [])
-            ]
-            u1_outs = [
-                v for v in s1.get("outputs", [])
-                if v not in s1.get("globals", [])
-                and v not in s1.get("nonlocals", [])
-            ]
-            u2_outs = [
-                v for v in s2.get("outputs", [])
-                if v not in s2.get("globals", [])
-                and v not in s2.get("nonlocals", [])
-            ]
-            if set(u2_outs) == set(outputs):
-                target_outs2 = outputs
-            elif len(u2_outs) == len(outputs):
-                out_map = {o: o for o in set(outputs) & set(u2_outs)}
-                rem_o = [o for o in outputs if o not in out_map]
-                rem_u2 = [o for o in u2_outs if o not in out_map]
-                for o1, o2 in zip(rem_o, rem_u2):
-                    out_map[o1] = o2
-                target_outs2 = [out_map.get(o, o) for o in outputs]
+            outputs = _extract_effective_unit_outputs(u1_eff, scope)
+            u1_outs = _extract_effective_unit_outputs(u1_eff, s1)
+            u2_outs = _extract_effective_unit_outputs(u2_eff, s2)
+            is_sub1 = is_subroutine_unit(u1_eff)
+            is_sub2 = is_subroutine_unit(u2_eff)
+            if is_sub1 != is_sub2:
+                logger.debug(
+                    "Skipping clone pair (%s, %s): mismatched subroutine kinds "
+                    "(is_sub1=%s, is_sub2=%s)",
+                    u1.get("name"),
+                    u2.get("name"),
+                    is_sub1,
+                    is_sub2,
+                )
+                continue
+            is_sub = is_sub1
+            has_yield = bool(s1.get("has_yield") or s2.get("has_yield"))
+            if is_sub and has_yield:
+                resolved_sub_outs = resolve_clone_generator_subroutine_outputs(
+                    u1=u1_eff,
+                    u2=u2_eff,
+                    scope1=s1,
+                    scope2=s2,
+                    source_text1=f1_plan.orig_text,
+                    source_text2=f2_text,
+                    tree1=tree1,
+                    tree2=tree2,
+                    repo_root=str(root),
+                    skip_pre_unit_closures=effective_skip_closures,
+                )
+                if resolved_sub_outs is None:
+                    logger.debug(
+                        "Skipping clone pair (%s, %s): failed to resolve generator subroutine "
+                        "outputs (necessity or definiteness check failed)",
+                        u1.get("name"),
+                        u2.get("name"),
+                    )
+                    continue
+                outputs, target_outs2 = resolved_sub_outs
+                if is_async_generator_with_return_value(
+                    s1, s2, has_outputs=bool(outputs or target_outs2)
+                ):
+                    logger.debug(
+                        "Skipping clone pair (%s, %s): async generator cannot return "
+                        "values or outputs",
+                        u1.get("name"),
+                        u2.get("name"),
+                    )
+                    continue
             else:
-                target_outs2 = outputs
+                pairs = _pair_clone_outputs(outputs, u2_outs)
+                if replace_clones and (
+                    len(pairs) != len(outputs) or len(pairs) != len(u2_outs)
+                ):
+                    logger.debug(
+                        "Skipping clone pair (%s, %s): cannot pair subroutine outputs",
+                        u1.get("name"),
+                        u2.get("name"),
+                    )
+                    continue
+                target_outs2 = (
+                    [o2 for _, o2 in pairs]
+                    if len(pairs) == len(outputs)
+                    else outputs
+                )
+            u1_eff["outputs"] = outputs
+            u2_eff["outputs"] = target_outs2
             t_inputs1 = list(s1.get("inputs", []))
             t_inputs2 = list(s2.get("inputs", []))
             if effective_binding == "module":
@@ -2873,9 +2982,19 @@ def generate_refactoring_patch(
             if replace_clones and (
                 len(t_inputs1) != len(inputs)
                 or len(t_inputs2) != len(inputs)
-                or len(u1_outs) != len(outputs)
-                or len(u2_outs) != len(outputs)
+                or not _outputs_compatible(
+                    outputs,
+                    u1_outs,
+                    u2_outs,
+                    is_subroutine=is_sub,
+                    has_yield=has_yield,
+                )
             ):
+                logger.debug(
+                    "Skipping clone pair (%s, %s): incompatible inputs or outputs",
+                    u1.get("name"),
+                    u2.get("name"),
+                )
                 continue
 
             base_name1 = _base_unit_name(u1)
@@ -2971,6 +3090,12 @@ def generate_refactoring_patch(
                 step=step,
                 repo_root=str(root),
                 helper_name=helper_name,
+                source_text1=f1_plan.orig_text,
+                source_text2=f2_text,
+                tree1=tree1,
+                tree2=tree2,
+                skip_pre_unit_closures=effective_skip_closures,
+                closure_strictness=closure_strictness,
             )
             if not helper_code:
                 continue

@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
 from pydoppelgangerhunt.config import normalize_path_string
-from pydoppelgangerhunt.source_lines import split_source_lines
+from pydoppelgangerhunt.source_lines import parse_unit_coord, split_source_lines
 
 
 # ANSI Color Codes
@@ -45,18 +45,41 @@ def colorize(text: str, color_code: str, enabled: bool) -> str:
 
 
 def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:
-    """Reads raw source code lines for a given unit from provided lines or disk."""
-    s_d = int(unit.get("start") or 1)
-    e_d = int(unit.get("end") or s_d)
+    """Reads raw source code lines for a given unit from provided lines or disk.
+
+    Supports pre-sliced unit lines, full-file line lists, in-memory source_text,
+    or disk-based source reading. Callers can explicitly specify
+    'source_lines_is_sliced': True (or False) to disambiguate whether 'source_lines'
+    represents a pre-sliced excerpt or the complete file.
+    """
+    s_d = parse_unit_coord(unit, "start", default=1)
+    e_d = parse_unit_coord(unit, "end", default=s_d)
     n_d = str(unit.get("name") or "unit")
     placeholder = [f"# Source for {n_d} lines {s_d}-{e_d}\n"]
 
     source_lines = unit.get("source_lines")
+    if source_lines is None and unit.get("source_text") is not None:
+        source_lines = split_source_lines(str(unit["source_text"]))
+
     if source_lines is not None and isinstance(source_lines, (list, tuple)):
         if not source_lines:
             return placeholder
+        # Sliced lines fast-path:
+        # If 'source_lines_is_sliced' is explicitly set, honor caller intent.
+        # Otherwise, heuristic: if len(source_lines) == (e_d - s_d + 1) and s_d > 1,
+        # the list is treated as already sliced to unit boundaries (since for any valid
+        # file containing the unit, len(file) >= e_d > e_d - s_d + 1, making an exact
+        # length match impossible unless the file is out-of-bounds).
+        is_sliced = unit.get("source_lines_is_sliced")
+        if is_sliced is True or (
+            is_sliced is None and len(source_lines) == (e_d - s_d + 1) and s_d > 1
+        ):
+            return [
+                ln if ln.endswith("\n") else ln + "\n"
+                for ln in source_lines
+            ]
         start = max(1, s_d)
-        end = min(len(source_lines), int(unit.get("end") or len(source_lines)))
+        end = min(len(source_lines), e_d)
         return [
             ln if ln.endswith("\n") else ln + "\n"
             for ln in source_lines[start - 1 : end]
@@ -131,7 +154,7 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
             with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
                 all_lines = fh.readlines()
         start = max(1, s_d)
-        end = min(len(all_lines), int(unit.get("end") or len(all_lines)))
+        end = min(len(all_lines), parse_unit_coord(unit, "end", default=len(all_lines)))
         return all_lines[start - 1 : end]
     except OSError:
         return [f"# Unable to read {str(unit.get('file') or '')}\n"]
@@ -248,19 +271,23 @@ def format_sarif_report(
             "startLine": s1,
             "endLine": e1,
         }
-        if u1.get("start_col") is not None:
-            r1["startColumn"] = max(1, int(u1["start_col"]) + 1)
-        if u1.get("end_col") is not None:
-            r1["endColumn"] = max(1, int(u1["end_col"]) + 1)
+        sc1 = parse_unit_coord(u1, "start_col", default=None)
+        if sc1 is not None:
+            r1["startColumn"] = max(1, sc1 + 1)
+        ec1 = parse_unit_coord(u1, "end_col", default=None)
+        if ec1 is not None:
+            r1["endColumn"] = max(1, ec1 + 1)
 
         r2: Dict[str, Any] = {
             "startLine": s2,
             "endLine": e2,
         }
-        if u2.get("start_col") is not None:
-            r2["startColumn"] = max(1, int(u2["start_col"]) + 1)
-        if u2.get("end_col") is not None:
-            r2["endColumn"] = max(1, int(u2["end_col"]) + 1)
+        sc2 = parse_unit_coord(u2, "start_col", default=None)
+        if sc2 is not None:
+            r2["startColumn"] = max(1, sc2 + 1)
+        ec2 = parse_unit_coord(u2, "end_col", default=None)
+        if ec2 is not None:
+            r2["endColumn"] = max(1, ec2 + 1)
 
         result_item: Dict[str, Any] = {
             "ruleId": rule_id,
@@ -481,22 +508,30 @@ def format_github_annotations(
         n2 = str(u2.get("name") or "unit2")
         msg1 = f"Structural clone ({sim:.1%}) matching {f2}:{s2}-{e2} ({n2})"
         col_part1 = ""
-        if u1.get("start_col") is not None:
-            col_part1 += f",col={max(1, int(u1['start_col']) + 1)}"
-            if u1.get("end_col") is not None:
-                col_part1 += f",endColumn={max(1, int(u1['end_col']) + 1)}"
-        annotations.append(
-            f"::warning file={f1},line={s1},endLine={e1}{col_part1},title=pyDoppelgangerHunt Duplicate Code::{msg1}"
+        sc1 = parse_unit_coord(u1, "start_col", default=None)
+        if sc1 is not None:
+            col_part1 += f",col={max(1, sc1 + 1)}"
+            ec1 = parse_unit_coord(u1, "end_col", default=None)
+            if ec1 is not None:
+                col_part1 += f",endColumn={max(1, ec1 + 1)}"
+        ann1 = (
+            f"::warning file={f1},line={s1},endLine={e1}{col_part1},"
+            f"title=pyDoppelgangerHunt Duplicate Code::{msg1}"
         )
+        annotations.append(ann1)
         msg2 = f"Structural clone ({sim:.1%}) matching {f1}:{s1}-{e1} ({n1})"
         col_part2 = ""
-        if u2.get("start_col") is not None:
-            col_part2 += f",col={max(1, int(u2['start_col']) + 1)}"
-            if u2.get("end_col") is not None:
-                col_part2 += f",endColumn={max(1, int(u2['end_col']) + 1)}"
-        annotations.append(
-            f"::warning file={f2},line={s2},endLine={e2}{col_part2},title=pyDoppelgangerHunt Duplicate Code::{msg2}"
+        sc2 = parse_unit_coord(u2, "start_col", default=None)
+        if sc2 is not None:
+            col_part2 += f",col={max(1, sc2 + 1)}"
+            ec2 = parse_unit_coord(u2, "end_col", default=None)
+            if ec2 is not None:
+                col_part2 += f",endColumn={max(1, ec2 + 1)}"
+        ann2 = (
+            f"::warning file={f2},line={s2},endLine={e2}{col_part2},"
+            f"title=pyDoppelgangerHunt Duplicate Code::{msg2}"
         )
+        annotations.append(ann2)
     return annotations
 
 

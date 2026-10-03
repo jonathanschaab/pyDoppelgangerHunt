@@ -19,10 +19,18 @@ from pydoppelgangerhunt.fixer.binding import (
     _prune_unshared_receivers,
     _resolve_effective_binding,
 )
+from pydoppelgangerhunt.fixer.dataflow import (
+    _extract_effective_unit_outputs,
+    _pair_clone_outputs,
+    is_async_generator_with_return_value,
+    resolve_clone_generator_subroutine_outputs,
+    resolve_closure_strictness_mode,
+)
 from pydoppelgangerhunt.fixer.scope import (
     _normalize_receiver_attrs,
     _rank_param_kind,
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
+    is_subroutine_unit,
 )
 from pydoppelgangerhunt.fixer.source import (
     _detect_indent_step,
@@ -270,61 +278,53 @@ def _format_helper_parameters(
     return params
 
 
-def _infer_helper_return_type(
-    resolved_ret: str,
+def _split_type_args(type_str: str) -> List[str]:
+    """Splits top-level arguments of a generic type string, respecting nested brackets."""
+    cleaned = type_str.strip()
+    if "[" not in cleaned or not cleaned.endswith("]"):
+        return []
+    inner = cleaned.split("[", 1)[1][:-1]
+    args: List[str] = []
+    current: List[str] = []
+    depth = 0
+    for char in inner:
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            args.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+    if current:
+        args.append("".join(current).strip())
+    return args
+
+
+def _infer_outputs_return_type(
     helper_outputs: List[str],
     conditional_outs: Set[str],
-    scope: Dict[str, Any],
     meta1: Dict[str, Any],
     meta2: Dict[str, Any],
     type_merge_strategy: str = "fallback_any",
-    is_async: bool = False,
-    unit_kind: Optional[str] = None,
+    resolved_ret: str = "Any",
     outputs2: Optional[List[str]] = None,
-) -> str:
-    """Infers the return type annotation for a synthesized shared helper function."""
-    if scope.get("has_yield"):
-        if resolved_ret != "Any":
-            return resolved_ret
-        inferred_yield_type = None
-        for kind, name in scope.get("yield_expr_names", []):
-            if name.startswith(":literal:"):
-                inferred_yield_type = name[len(":literal:") :]
-                break
-            m_t = meta1.get(name, {}).get("type") or meta2.get(name, {}).get("type")
-            if not m_t:
-                continue
-            if kind == "yield":
-                inferred_yield_type = m_t
-                break
-            if kind == "yield_from":
-                for prefix in (
-                    "Iterator[", "Iterable[", "List[", "Sequence[", "Set[", "Tuple[", "Collection[",
-                    "list[", "set[", "tuple[", "sequence[", "iterable[", "iterator[",
-                ):
-                    if m_t.startswith(prefix) and m_t.endswith("]"):
-                        inner = m_t[len(prefix) : -1].strip()
-                        if "," in inner:
-                            inner = inner.split(",")[0].strip()
-                        inferred_yield_type = inner
-                        break
-                if inferred_yield_type:
-                    break
-        iter_name = "AsyncIterator" if is_async else "Iterator"
-        if inferred_yield_type:
-            return f"{iter_name}[{inferred_yield_type}]"
-        return f"{iter_name}[Any]"
-
+) -> Optional[str]:
+    """Infers the aggregated return type annotation for helper outputs."""
     if len(helper_outputs) >= 2:
         out_types: List[str] = []
         for idx, out_var in enumerate(helper_outputs):
             t1 = meta1.get(out_var, {}).get("type")
-            m2 = meta2.get(out_var, {})
-            if not m2 and outputs2 and idx < len(outputs2):
+            if outputs2 and idx < len(outputs2):
                 m2 = meta2.get(outputs2[idx], {})
+            else:
+                m2 = meta2.get(out_var, {})
             t2 = m2.get("type")
             t_merged = _merge_types(t1, t2, type_merge_strategy)
-            if out_var in conditional_outs:
+            u2_var = outputs2[idx] if (outputs2 and idx < len(outputs2)) else out_var
+            is_conditional = (out_var in conditional_outs) or (u2_var in conditional_outs)
+            if is_conditional:
                 if not t_merged.startswith("Optional[") and "None" not in t_merged:
                     t_merged = f"Optional[{t_merged}]"
             out_types.append(t_merged)
@@ -333,19 +333,160 @@ def _infer_helper_return_type(
     if len(helper_outputs) == 1:
         out_var = helper_outputs[0]
         t1 = meta1.get(out_var, {}).get("type")
-        m2 = meta2.get(out_var, {})
-        if not m2 and outputs2 and len(outputs2) >= 1:
+        if outputs2 and len(outputs2) >= 1:
             m2 = meta2.get(outputs2[0], {})
+        else:
+            m2 = meta2.get(out_var, {})
         t2 = m2.get("type")
         out_t = _merge_types(t1, t2, type_merge_strategy)
-        if out_var in conditional_outs:
-            if not out_t.startswith("Optional[") and "None" not in out_t:
-                out_t = f"Optional[{out_t}]"
-        return_type = resolved_ret if resolved_ret != "Any" else out_t
-        if out_var in conditional_outs:
-            if not return_type.startswith("Optional[") and "None" not in return_type and return_type != "None":
+        fallback = resolved_ret
+        if resolved_ret.startswith((
+            "Generator[", "Iterator[", "Iterable[",
+            "AsyncGenerator[", "AsyncIterator[", "AsyncIterable[",
+        )):
+            if resolved_ret.startswith("Generator[") and resolved_ret.endswith("]"):
+                parts = _split_type_args(resolved_ret)
+                fallback = parts[2] if len(parts) >= 3 else "Any"
+            else:
+                fallback = "Any"
+        return_type = out_t if out_t != "Any" else fallback
+        u2_var = outputs2[0] if (outputs2 and len(outputs2) >= 1) else out_var
+        is_conditional = (out_var in conditional_outs) or (u2_var in conditional_outs)
+        if is_conditional:
+            if (
+                not return_type.startswith("Optional[")
+                and "None" not in return_type
+                and return_type != "None"
+            ):
                 return_type = f"Optional[{return_type}]"
         return return_type
+
+    return None
+
+
+def _infer_helper_return_type(
+    resolved_ret: str,
+    helper_outputs: List[str],
+    conditional_outs: Set[str],
+    scope: Dict[str, Any],
+    meta1: Dict[str, Any],
+    meta2: Dict[str, Any],
+    *,
+    type_merge_strategy: str = "fallback_any",
+    is_async: bool = False,
+    is_subroutine: Optional[bool] = None,
+    unit_kind: Optional[str] = None,
+    outputs2: Optional[List[str]] = None,
+) -> str:
+    """Infers the return type annotation for a synthesized shared helper function."""
+    if scope.get("has_yield"):
+        has_return_val = bool(helper_outputs or scope.get("has_return_value"))
+        if not has_return_val and resolved_ret not in ("Any", "None"):
+            if resolved_ret.startswith((
+                "Generator[", "Iterator[", "Iterable[",
+                "AsyncGenerator[", "AsyncIterator[", "AsyncIterable[",
+            )):
+                return resolved_ret
+        if has_return_val and not helper_outputs and resolved_ret.startswith("Generator["):
+            return resolved_ret
+
+        inferred_yield_type = None
+        inferred_gen_ret_type = None
+        if (
+            resolved_ret.startswith(("Iterator[", "Iterable[", "Generator["))
+            and resolved_ret.endswith("]")
+        ):
+            inner_parts = _split_type_args(resolved_ret)
+            if inner_parts:
+                inferred_yield_type = inner_parts[0]
+            if resolved_ret.startswith("Generator[") and len(inner_parts) >= 3:
+                inferred_gen_ret_type = inner_parts[2]
+
+        if not inferred_yield_type:
+            for kind, name in scope.get("yield_expr_names", []):
+                if name.startswith(":literal:"):
+                    inferred_yield_type = name[len(":literal:") :]
+                    break
+                m_t = meta1.get(name, {}).get("type") or meta2.get(name, {}).get("type")
+                if not m_t:
+                    continue
+                if kind == "yield":
+                    inferred_yield_type = m_t
+                    break
+                if kind == "yield_from":
+                    for prefix in (
+                        "Iterator[", "Iterable[", "List[", "Sequence[", "Set[",
+                        "Tuple[", "Dict[", "Collection[", "list[", "set[",
+                        "tuple[", "dict[", "sequence[", "iterable[", "iterator[",
+                    ):
+                        if m_t.startswith(prefix) and m_t.endswith("]"):
+                            parts = _split_type_args(m_t)
+                            if parts:
+                                if prefix.lower().startswith("tuple["):
+                                    if len(parts) == 2 and parts[1] == "...":
+                                        inferred_yield_type = parts[0]
+                                    else:
+                                        unique_types = list(dict.fromkeys(parts))
+                                        if len(unique_types) == 1:
+                                            inferred_yield_type = unique_types[0]
+                                        else:
+                                            inferred_yield_type = (
+                                                f"Union[{', '.join(unique_types)}]"
+                                            )
+                                else:
+                                    inferred_yield_type = parts[0]
+                            break
+                    if inferred_yield_type:
+                        break
+
+        yield_t = inferred_yield_type if inferred_yield_type else "Any"
+        if not is_async:
+            outputs_ret = _infer_outputs_return_type(
+                helper_outputs,
+                conditional_outs,
+                meta1,
+                meta2,
+                type_merge_strategy=type_merge_strategy,
+                resolved_ret=resolved_ret,
+                outputs2=outputs2,
+            )
+            is_iter_annotation = resolved_ret.startswith((
+                "Iterator[", "Iterable[", "Generator["
+            ))
+            fallback_ret = inferred_gen_ret_type or (
+                resolved_ret
+                if resolved_ret not in ("Any", "None")
+                and not is_iter_annotation
+                and scope.get("has_return_value")
+                else ("Any" if (scope.get("has_return_value") or helper_outputs) else None)
+            )
+            ret_t = outputs_ret or fallback_ret
+            if ret_t:
+                return f"Generator[{yield_t}, None, {ret_t}]"
+            return f"Iterator[{yield_t}]"
+
+        return f"AsyncIterator[{yield_t}]"
+
+    if is_subroutine is not None:
+        is_sub = is_subroutine
+    elif unit_kind is not None:
+        is_sub = is_subroutine_unit({"kind": unit_kind})
+    else:
+        is_sub = False
+    if not is_sub and resolved_ret not in ("Any", "None"):
+        return resolved_ret
+
+    outputs_ret = _infer_outputs_return_type(
+        helper_outputs,
+        conditional_outs,
+        meta1,
+        meta2,
+        type_merge_strategy=type_merge_strategy,
+        resolved_ret=resolved_ret,
+        outputs2=outputs2,
+    )
+    if outputs_ret is not None:
+        return outputs_ret
 
     if not helper_outputs and not scope.get("has_return") and resolved_ret == "Any":
         return "Any" if unit_kind in ("comprehension", "complex_expr") else "None"
@@ -409,6 +550,12 @@ def synthesize_shared_helper_code(
     step: Optional[str] = None,
     repo_root: Optional[str] = None,
     helper_name: Optional[str] = None,
+    source_text1: Optional[str] = None,
+    source_text2: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
+    skip_pre_unit_closures: bool = False,
+    closure_strictness: Optional[str] = None,
 ) -> str:
     """Synthesizes a proposed shared helper function stub from two clone units.
 
@@ -430,6 +577,9 @@ def synthesize_shared_helper_code(
         step: Indentation step per indentation level (defaults to "\t" for tabs, 4 spaces otherwise).
         repo_root: Optional root directory of the repository for relative path resolution.
         helper_name: Optional custom helper name override.
+        skip_pre_unit_closures: Whether to bypass scanning pre-unit AST closures.
+        closure_strictness: Closure isolation strictness ("strict" / "fail_closed" vs
+            "lenient" / "fast" / "skip").
     """
     lines1 = _slice_unit_token_lines(
         u1,
@@ -474,10 +624,13 @@ def synthesize_shared_helper_code(
     _populate_unit_receiver_metadata(u1, repo_root=repo_root)
     _populate_unit_receiver_metadata(u2, repo_root=repo_root)
 
-    # Variable scope analysis for concrete parameter signatures
-    scope1 = analyze_unit_variable_scope(u1, repo_root=repo_root)
-    scope2 = analyze_unit_variable_scope(u2, repo_root=repo_root)
-    scope = analyze_unit_variable_scope(u1, u2, repo_root=repo_root)
+    # Variable scope analysis for concrete parameter signatures.
+    # Note: each unit occupies positional slot u1, so tree1 supplies its AST.
+    scope1 = analyze_unit_variable_scope(u1, repo_root=repo_root, tree1=tree1)
+    scope2 = analyze_unit_variable_scope(u2, repo_root=repo_root, tree1=tree2)
+    scope = analyze_unit_variable_scope(
+        u1, u2, repo_root=repo_root, tree1=tree1, tree2=tree2
+    )
 
     enc1 = u1.get("enclosing_class")
     enc2 = u2.get("enclosing_class")
@@ -527,6 +680,8 @@ def synthesize_shared_helper_code(
     if bool(scope1.get("is_async")) != bool(scope2.get("is_async")):
         return ""
     if bool(scope1.get("has_yield")) != bool(scope2.get("has_yield")):
+        return ""
+    if is_async_generator_with_return_value(scope1, scope2, scope):
         return ""
     if scope1.get("nonlocals") or scope2.get("nonlocals") or scope.get("nonlocals"):
         return ""
@@ -607,10 +762,59 @@ def synthesize_shared_helper_code(
     r1 = scope1.get("return_type")
     r2 = scope2.get("return_type")
     resolved_ret = _merge_types(r1, r2, type_merge_strategy)
+    has_yield = bool(
+        scope.get("has_yield") or scope1.get("has_yield") or scope2.get("has_yield")
+    )
+    is_sub1 = is_subroutine_unit(u1)
+    is_sub2 = is_subroutine_unit(u2)
+    if is_sub1 != is_sub2:
+        return ""
+    is_sub = is_sub1
 
-    outputs = list(scope.get("outputs", []))
+    _, effective_skip_closures = resolve_closure_strictness_mode(
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+    )
+
+    if has_yield and is_sub:
+        resolved_sub_outs = resolve_clone_generator_subroutine_outputs(
+            u1=u1,
+            u2=u2,
+            scope1=scope1,
+            scope2=scope2,
+            source_text1=source_text1,
+            source_text2=source_text2,
+            tree1=tree1,
+            tree2=tree2,
+            repo_root=repo_root,
+            skip_pre_unit_closures=effective_skip_closures,
+        )
+        if resolved_sub_outs is None:
+            return ""
+        outputs, u2_outs = resolved_sub_outs
+    elif (
+        "outputs" in u1
+        and isinstance(u1["outputs"], (list, tuple, set))
+        and "outputs" in u2
+        and isinstance(u2["outputs"], (list, tuple, set))
+    ):
+        outputs = _extract_effective_unit_outputs(u1, scope1)
+        u2_outs = _extract_effective_unit_outputs(u2, scope2)
+        pairs = _pair_clone_outputs(outputs, u2_outs)
+        if len(pairs) != len(outputs) or len(pairs) != len(u2_outs):
+            return ""
+        outputs = [p[0] for p in pairs]
+        u2_outs = [p[1] for p in pairs]
+    else:
+        outputs = _extract_effective_unit_outputs(u1, scope)
+        u2_outs = _extract_effective_unit_outputs(u2, scope2)
+        pairs = _pair_clone_outputs(outputs, u2_outs)
+        if len(pairs) == len(outputs) == len(u2_outs):
+            outputs = [p[0] for p in pairs]
+            u2_outs = [p[1] for p in pairs]
+
     conditional_outs = set(scope.get("conditional_outputs", []))
-    is_async = scope.get("is_async", False)
+    is_async = bool(scope.get("is_async", False))
     func_keyword = "async def" if is_async else "def"
     await_prefix = "await " if is_async else ""
 
@@ -621,11 +825,10 @@ def synthesize_shared_helper_code(
         and v not in scope.get("nonlocals", [])
     ]
 
-    u2_outs = [
-        v for v in scope2.get("outputs", [])
-        if v not in scope2.get("globals", [])
-        and v not in scope2.get("nonlocals", [])
-    ]
+    if is_async_generator_with_return_value(
+        scope, scope1, scope2, has_outputs=bool(helper_outputs)
+    ):
+        return ""
 
     return_type = _infer_helper_return_type(
         resolved_ret,
@@ -636,6 +839,7 @@ def synthesize_shared_helper_code(
         meta2,
         type_merge_strategy=type_merge_strategy,
         is_async=is_async,
+        is_subroutine=is_sub,
         unit_kind=u1.get("kind"),
         outputs2=u2_outs if len(u2_outs) == len(helper_outputs) else None,
     )
@@ -678,7 +882,7 @@ def synthesize_shared_helper_code(
             expr_inner = [f"{eff_step}{ln}" for ln in common_lines]
             common_lines = ["return ("] + expr_inner + [")"]
         helper_outputs = []
-    elif not has_trailing_return and helper_outputs and not scope.get("has_yield"):
+    elif not has_trailing_return and helper_outputs and not (bool(scope.get("has_yield")) and is_async):
         if len(helper_outputs) >= 2:
             common_lines = common_lines + [f"return {', '.join(helper_outputs)}"]
         else:
