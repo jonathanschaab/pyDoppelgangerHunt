@@ -23,12 +23,12 @@ from pydoppelgangerhunt.fixer.binding import (
     _resolve_effective_binding,
     find_enclosing_class,
     find_enclosing_function,
-    is_async_generator_with_return_value,
-    resolve_clone_generator_subroutine_outputs,
 )
 from pydoppelgangerhunt.fixer.dataflow import (
     _extract_effective_unit_outputs,
     _pair_clone_outputs,
+    is_async_generator_with_return_value,
+    resolve_clone_generator_subroutine_outputs,
     resolve_closure_strictness_mode,
 )
 from pydoppelgangerhunt.fixer.depgraph import (
@@ -2955,14 +2955,19 @@ def generate_refactoring_patch(
                     continue
             else:
                 pairs = _pair_clone_outputs(outputs, u2_outs)
-                if len(pairs) != len(outputs) or len(pairs) != len(u2_outs):
+                if replace_clones and (
+                    len(pairs) != len(outputs) or len(pairs) != len(u2_outs)
+                ):
                     logger.debug(
                         "Skipping clone pair (%s, %s): cannot pair subroutine outputs",
                         u1.get("name"),
                         u2.get("name"),
                     )
-                    continue
-                target_outs2 = [o2 for _, o2 in pairs]
+                target_outs2 = (
+                    [o2 for _, o2 in pairs]
+                    if len(pairs) == len(outputs)
+                    else outputs
+                )
             u1_eff["outputs"] = outputs
             u2_eff["outputs"] = target_outs2
             t_inputs1 = list(s1.get("inputs", []))

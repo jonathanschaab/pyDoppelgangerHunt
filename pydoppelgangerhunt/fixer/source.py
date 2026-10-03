@@ -1024,23 +1024,34 @@ def _find_sig_colon(line: str) -> int:
     return line.rfind(":")
 
 
-def find_enclosing_function_is_async(
+def _find_innermost_enclosing_node(
     source_text: str,
-    start_line: int,
-    end_line: int,
+    unit: Dict[str, Any],
+    node_types: Tuple[type, ...],
     tree: Optional[ast.AST] = None,
-) -> bool:
-    """Checks whether the given line range is enclosed within an AsyncFunctionDef."""
-    if start_line <= 0 or end_line < start_line:
-        return False
+) -> Optional[Tuple[ast.AST, int, int]]:
+    """Locates the innermost AST node of matching types enclosing the given unit."""
+    if not isinstance(unit, dict):
+        return None
+    try:
+        u_start = parse_unit_coord(unit, "start", default=0)
+        u_end = parse_unit_coord(unit, "end", default=u_start)
+    except (ValueError, TypeError):
+        return None
+    if u_start <= 0 or u_end <= 0 or u_start > u_end:
+        return None
+
     if tree is None:
+        if not source_text.strip():
+            return None
         try:
             tree = ast.parse(source_text)
         except (SyntaxError, ValueError, UnicodeDecodeError):
-            return False
-    candidates: List[Tuple[int, bool, int]] = []
+            return None
+
+    candidates: List[Tuple[int, ast.AST, int, int]] = []
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(node, node_types):
             n_start = getattr(node, "lineno", 0)
             n_end = getattr(node, "end_lineno", n_start)
             decorators = getattr(node, "decorator_list", [])
@@ -1050,13 +1061,30 @@ def find_enclosing_function_is_async(
                 else n_start
             )
             earliest_start = min(dec_start, n_start)
-            if earliest_start <= start_line and end_line <= n_end:
-                candidates.append((
-                    n_end - earliest_start,
-                    isinstance(node, ast.AsyncFunctionDef),
-                    earliest_start,
-                ))
+            if earliest_start <= u_start <= u_end <= n_end:
+                candidates.append((n_end - earliest_start, node, earliest_start, n_end))
+
     if not candidates:
-        return False
+        return None
+
     candidates.sort(key=lambda item: (item[0], -item[2]))
-    return candidates[0][1]
+    _, matched_node, n_start, n_end = candidates[0]
+    return matched_node, n_start, n_end
+
+
+def find_enclosing_function_is_async(
+    source_text: str,
+    start_line: int,
+    end_line: int,
+    tree: Optional[ast.AST] = None,
+) -> bool:
+    """Checks whether the given line range is enclosed within an AsyncFunctionDef."""
+    res = _find_innermost_enclosing_node(
+        source_text,
+        {"start": start_line, "end": end_line},
+        (ast.FunctionDef, ast.AsyncFunctionDef),
+        tree=tree,
+    )
+    if res is None:
+        return False
+    return isinstance(res[0], ast.AsyncFunctionDef)

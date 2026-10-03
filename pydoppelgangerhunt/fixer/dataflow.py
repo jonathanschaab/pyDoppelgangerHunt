@@ -8,12 +8,26 @@ from enum import Enum
 import hashlib
 import logging
 from pathlib import Path
+import threading
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.config import normalize_path_string
-from pydoppelgangerhunt.fixer.source import parse_unit_coord
+from pydoppelgangerhunt.fixer.source import (
+    _find_innermost_enclosing_node,
+    parse_unit_coord,
+)
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "GeneratorCloneSideData",
+    "collect_downstream_read_names",
+    "is_async_generator_with_return_value",
+    "is_subroutine_unit",
+    "resolve_clone_generator_subroutine_outputs",
+    "resolve_closure_strictness_mode",
+    "resolve_generator_subroutine_outputs",
+]
 
 
 def _load_unit_file_text(
@@ -43,6 +57,13 @@ def _load_unit_file_text(
             except OSError:
                 pass
     if "source_lines" in unit and isinstance(unit["source_lines"], (list, tuple)):
+        is_sliced = unit.get("source_lines_is_sliced")
+        if is_sliced is True:
+            return None
+        s_d = parse_unit_coord(unit, "start", default=1)
+        e_d = parse_unit_coord(unit, "end", default=s_d)
+        if is_sliced is None and len(unit["source_lines"]) == (e_d - s_d + 1) and s_d > 1:
+            return None
         return "".join(unit["source_lines"])
     return None
 
@@ -184,45 +205,6 @@ def _resolve_unit_ast_end_col(
         )
         return None
     return int(end_col)
-
-
-def _find_innermost_enclosing_node(
-    source_text: str,
-    unit: Dict[str, Any],
-    node_types: Tuple[type, ...],
-    tree: Optional[ast.AST] = None,
-) -> Optional[Tuple[ast.AST, int, int]]:
-    """Locates the innermost AST node of matching types enclosing the given unit."""
-    bounds = _get_valid_unit_bounds(unit)
-    if bounds is None:
-        return None
-    u_start, u_end = bounds
-
-    parsed_tree = _parse_source_tree(source_text, tree=tree)
-    if parsed_tree is None:
-        return None
-
-    candidates: List[Tuple[int, ast.AST, int, int]] = []
-    for node in ast.walk(parsed_tree):
-        if isinstance(node, node_types):
-            n_start = getattr(node, "lineno", 0)
-            n_end = getattr(node, "end_lineno", n_start)
-            decorators = getattr(node, "decorator_list", [])
-            dec_start = (
-                min(getattr(d, "lineno", n_start) for d in decorators)
-                if decorators
-                else n_start
-            )
-            earliest_start = min(dec_start, n_start)
-            if earliest_start <= u_start <= u_end <= n_end:
-                candidates.append((n_end - earliest_start, node, earliest_start, n_end))
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda item: (item[0], -item[2]))
-    _, matched_node, n_start, n_end = candidates[0]
-    return matched_node, n_start, n_end
 
 
 class _BaseScopeVisitor(ast.NodeVisitor):
@@ -974,11 +956,13 @@ def _collect_pre_unit_closures(
 
 _MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
 _downstream_reads_cache: OrderedDict[Tuple[Any, ...], frozenset[str]] = OrderedDict()
+_downstream_cache_lock: threading.Lock = threading.Lock()
 
 
 def _clear_downstream_reads_cache() -> None:
     """Clears the downstream read memoization cache."""
-    _downstream_reads_cache.clear()
+    with _downstream_cache_lock:
+        _downstream_reads_cache.clear()
 
 
 def _build_downstream_cache_key(
@@ -995,17 +979,21 @@ def _build_downstream_cache_key(
     content_digest = hashlib.sha256(
         source_text.encode("utf-8", errors="replace")
     ).hexdigest()[:16]
-    src_key = (len(source_text), hash(source_text), content_digest, mtime)
     start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
     end_col = _extract_unit_end_col(unit)
     cands_key = frozenset(candidates) if candidates is not None else None
+    unit_kind = unit.get("kind")
+    unit_name = unit.get("name")
     return (
-        src_key,
+        content_digest,
+        mtime,
         file_path_str,
         u_start,
         u_end,
         start_col,
         end_col,
+        unit_kind,
+        unit_name,
         cands_key,
         bool(skip_pre_unit_closures),
     )
@@ -1097,10 +1085,11 @@ def collect_downstream_read_names(
     cache_key = _build_downstream_cache_key(
         source_text, unit, u_start, u_end, candidates, skip_pre_unit_closures
     )
-    if cache_key in _downstream_reads_cache:
-        cached = _downstream_reads_cache[cache_key]
-        _downstream_reads_cache.move_to_end(cache_key)
-        return set(cached)
+    with _downstream_cache_lock:
+        if cache_key in _downstream_reads_cache:
+            cached = _downstream_reads_cache[cache_key]
+            _downstream_reads_cache.move_to_end(cache_key)
+            return set(cached)
 
     scope_node = _resolve_downstream_scope_node(source_text, unit, tree)
     if scope_node is None:
@@ -1144,9 +1133,10 @@ def collect_downstream_read_names(
 
     _merge_pre_unit_closure_reads(loaded, pre_unit_captured_reads, candidates)
 
-    if len(_downstream_reads_cache) >= _MAX_DOWNSTREAM_CACHE_SIZE:
-        _downstream_reads_cache.popitem(last=False)
-    _downstream_reads_cache[cache_key] = frozenset(loaded)
+    with _downstream_cache_lock:
+        if len(_downstream_reads_cache) >= _MAX_DOWNSTREAM_CACHE_SIZE:
+            _downstream_reads_cache.popitem(last=False)
+        _downstream_reads_cache[cache_key] = frozenset(loaded)
 
     return loaded
 
@@ -1155,21 +1145,19 @@ def _pair_clone_outputs(
     u1_outs: Sequence[str],
     u2_outs: Sequence[str],
 ) -> List[Tuple[str, str]]:
-    """Establishes an ordered 1-to-1 mapping between clone output variables.
-
-    Pairing Algorithm:
-    1. Input deduplication: preserves first-occurrence order via dict.fromkeys.
-    2. Arity equivalence: if the deduplicated counts match (len(u1_dedup) == len(u2_dedup)),
-       it pairs identical names first ('identity-first'), then maps remaining names by position.
-    3. Arity collapse: if deduplicated counts differ (e.g., duplicate output variable names
-       collapsing one side to fewer unique names), it falls back to identical names only.
-       Downstream callers (such as `resolve_generator_subroutine_outputs`) enforce strict
-       arity retention and fail closed if any required output is left unpaired.
-    """
+    """Establishes an ordered 1-to-1 mapping between clone output variables."""
     u1_dedup = list(dict.fromkeys(u1_outs))
     u2_dedup = list(dict.fromkeys(u2_outs))
     if len(u1_dedup) == len(u2_dedup):
         common = set(u1_dedup) & set(u2_dedup)
+        if len(common) == len(u1_dedup) and u1_dedup != u2_dedup:
+            logger.debug(
+                "Rejecting clone output pairing: identical name sets with conflicting "
+                "positional orderings (%s vs %s)",
+                u1_dedup,
+                u2_dedup,
+            )
+            return []
         out_map = {o: o for o in common}
         rem_u1 = [o for o in u1_dedup if o not in common]
         rem_u2 = [o for o in u2_dedup if o not in common]
@@ -1178,18 +1166,6 @@ def _pair_clone_outputs(
         return [(o1, out_map[o1]) for o1 in u1_dedup]
     common_names = [o for o in u1_dedup if o in u2_dedup]
     return [(o, o) for o in common_names]
-
-
-def _extract_scope_valid_bindings(scope: Dict[str, Any]) -> Optional[Set[str]]:
-    """Extracts valid candidate bindings (stores, locals, definite_stores, inputs) from scope."""
-    if any(k in scope for k in ("stores", "locals", "definite_stores", "inputs")):
-        return (
-            set(scope.get("definite_stores", []))
-            | set(scope.get("stores", []))
-            | set(scope.get("locals", []))
-            | set(scope.get("inputs", []))
-        )
-    return None
 
 
 def _filter_valid_output_pairs(
@@ -1328,6 +1304,12 @@ def resolve_closure_strictness_mode(
             return "lenient", True
         if c_mode in ("strict", "fail_closed"):
             return "strict", False
+        fallback = "lenient" if skip_pre_unit_closures else "strict"
+        logger.warning(
+            "Unrecognized closure_strictness '%s'; falling back to %s mode",
+            closure_strictness,
+            fallback,
+        )
     is_lenient = bool(skip_pre_unit_closures)
     return ("lenient" if is_lenient else "strict"), is_lenient
 
@@ -1346,48 +1328,21 @@ def resolve_clone_generator_subroutine_outputs(
 ) -> Optional[Tuple[List[str], List[str]]]:
     """Resolves output variable bindings for clone generator subroutines across two code units.
 
-    Note: When both u1 and u2 supply precomputed 'outputs', this path pairs outputs and validates
-    that all precomputed outputs are definitely assigned before unit exit when definite store
-    analysis is present in the scopes.
+    Ensures necessity by analyzing downstream reads and enforces definite assignment
+    before unit exit to prevent runtime UnboundLocalError at exhaustion.
     """
-    if (
+    is_precomputed = (
         isinstance(u1.get("outputs"), (list, tuple, set))
         and isinstance(u2.get("outputs"), (list, tuple, set))
-    ):
+    )
+    if is_precomputed:
+        outs1 = list(dict.fromkeys(_extract_effective_unit_outputs(u1, scope1)))
+        outs2 = list(dict.fromkeys(_extract_effective_unit_outputs(u2, scope2)))
+        if len(outs1) != len(outs2):
+            return None
+    else:
         outs1 = _extract_effective_unit_outputs(u1, scope1)
         outs2 = _extract_effective_unit_outputs(u2, scope2)
-        if len(outs1) == len(outs2):
-            pairs = _pair_clone_outputs(outs1, outs2)
-            if len(pairs) == len(outs1):
-                return _filter_valid_output_pairs(
-                    pairs,
-                    _extract_scope_valid_bindings(scope1),
-                    _extract_scope_valid_bindings(scope2),
-                    reason="lacks store or input binding in unit",
-                )
-        return None
-
-    u1_raw = _extract_effective_unit_outputs(u1, scope1)
-    u2_raw = _extract_effective_unit_outputs(u2, scope2)
-
-    targets = [
-        (u1, set(u1_raw), source_text1, tree1),
-        (u2, set(u2_raw), source_text2, tree2),
-    ]
-    downstream_reads: List[Optional[Set[str]]] = []
-    for u, cands, s_text, tr in targets:
-        src = s_text if s_text is not None else _load_unit_file_text(u, repo_root=repo_root)
-        if src is not None:
-            reads = collect_downstream_read_names(
-                src,
-                u,
-                candidates=cands,
-                tree=tr,
-                skip_pre_unit_closures=skip_pre_unit_closures,
-            )
-        else:
-            reads = None
-        downstream_reads.append(reads)
 
     u1_def: Optional[Set[str]] = None
     if "definite_stores" in scope1 or "inputs" in scope1:
@@ -1396,7 +1351,32 @@ def resolve_clone_generator_subroutine_outputs(
     if "definite_stores" in scope2 or "inputs" in scope2:
         u2_def = set(scope2.get("definite_stores", [])) | set(scope2.get("inputs", []))
 
-    side1 = GeneratorCloneSideData(u1_raw, downstream_reads[0], u1_def)
-    side2 = GeneratorCloneSideData(u2_raw, downstream_reads[1], u2_def)
+    cands1 = set(outs1)
+    cands2 = set(outs2)
 
+    targets = [
+        (u1, cands1, source_text1, tree1),
+        (u2, cands2, source_text2, tree2),
+    ]
+    downstream_reads: List[Optional[Set[str]]] = []
+    for u_item, cands, s_text, tr in targets:
+        src = (
+            s_text
+            if s_text is not None
+            else _load_unit_file_text(u_item, repo_root=repo_root)
+        )
+        if src is not None:
+            reads = collect_downstream_read_names(
+                src,
+                u_item,
+                candidates=cands,
+                tree=tr,
+                skip_pre_unit_closures=skip_pre_unit_closures,
+            )
+        else:
+            reads = None
+        downstream_reads.append(reads)
+
+    side1 = GeneratorCloneSideData(outs1, downstream_reads[0], u1_def)
+    side2 = GeneratorCloneSideData(outs2, downstream_reads[1], u2_def)
     return resolve_generator_subroutine_outputs(side1, side2)

@@ -43,8 +43,11 @@ def parse_unit_coord(
 ) -> Optional[int]:
     """Extracts and parses an integer coordinate from a unit dictionary.
 
-    Safely handles integers, numeric strings, and coordinate strings with column
-    offsets (e.g. '12:0'). Raises ValueError for non-numeric strings.
+    Safely handles integers, numeric strings, and colon-delimited coordinate strings
+    (e.g., '12:0' or '8:0'). For colon-formatted coordinates emitted by external linters
+    or diagnostics (where the suffix denotes a sub-column or character index), the primary
+    leading coordinate prefix before the colon is parsed as the integer value.
+    Raises ValueError for non-numeric strings.
     """
     val = unit.get(key)
     if val is None:

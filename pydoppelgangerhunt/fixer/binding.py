@@ -18,13 +18,15 @@ from pydoppelgangerhunt.fixer.dataflow import (
     resolve_clone_generator_subroutine_outputs,
     resolve_closure_strictness_mode,
     resolve_generator_subroutine_outputs,
-    _find_innermost_enclosing_node,
     _load_unit_file_text,
 )
 from pydoppelgangerhunt.fixer.scope import (
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
 )
-from pydoppelgangerhunt.fixer.source import split_source_lines
+from pydoppelgangerhunt.fixer.source import (
+    _find_innermost_enclosing_node,
+    split_source_lines,
+)
 
 __all__ = [
     "GeneratorCloneSideData",

@@ -1120,12 +1120,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else "auto"
     )
     shared_module_name = str(args.shared_module_name or tool_cfg.get("shared_module_name", "_common.py"))
-    raw_strictness = args.closure_strictness or tool_cfg.get("closure_strictness")
-    cfg_skip = bool(tool_cfg.get("skip_pre_unit_closures", False))
-    effective_skip_bool = bool(args.skip_pre_unit_closures or cfg_skip)
+    if args.closure_strictness is not None:
+        cli_strictness: Optional[str] = args.closure_strictness
+        cli_skip: bool = False
+    elif args.skip_pre_unit_closures:
+        cli_strictness = "lenient"
+        cli_skip = True
+    else:
+        cli_strictness = tool_cfg.get("closure_strictness")
+        cli_skip = bool(tool_cfg.get("skip_pre_unit_closures", False))
+
     closure_strictness, skip_pre_unit_closures = resolve_closure_strictness_mode(
-        closure_strictness=raw_strictness,
-        skip_pre_unit_closures=effective_skip_bool,
+        closure_strictness=cli_strictness,
+        skip_pre_unit_closures=cli_skip,
     )
 
     baseline_path = args.baseline or tool_cfg.get("baseline")

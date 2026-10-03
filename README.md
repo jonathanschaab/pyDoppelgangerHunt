@@ -226,14 +226,15 @@ Refactoring executes in linear-logarithmic time with incremental validation:
 
 ##### Performance Notes: Closure Scanning & Throughput
 
-When extracting subroutine clones that assign variables, `pyDoppelgangerHunt` conducts a pre-unit
-AST walk within the enclosing scope to detect closures, lambdas, or nested classes that capture
-candidate outputs prior to unit execution. Because such closures may escape into callback tables
-or event loops, strict mode treats these captured names as live, guaranteeing fail-closed safety.
+When extracting generator subroutine clones that assign variables, `pyDoppelgangerHunt` conducts
+a pre-unit AST walk within the enclosing scope to detect closures, lambdas, or nested classes
+that capture candidate outputs prior to unit execution. Because such closures may escape into
+callback tables or event loops, strict mode treats these captured names as live, guaranteeing
+fail-closed safety.
 
 - **Memoization & Cache Invalidation**: Downstream liveness analysis caches AST traversal results
-  in an LRU cache keyed by source length, content hash, SHA-256 digest prefix, unit line/column
-  coordinates, candidate outputs, and unit modification timestamp (`mtime`), eliminating duplicate
+  in a thread-safe LRU cache keyed by SHA-256 digest prefix, unit line/column coordinates, unit
+  kind and name, candidate outputs, and unit modification timestamp (`mtime`), eliminating duplicate
   traversals across identical clone boundaries.
 - **Lenient Mode Bypass**: For large codebases or batch runs where callback-escaping closures are
   known not to occur, pre-unit closure scanning can be bypassed by specifying
@@ -245,14 +246,15 @@ or event loops, strict mode treats these captured names as live, guaranteeing fa
 
 When synthesizing refactoring patches and shared helpers, `pyDoppelgangerHunt` enforces
 strict fail-closed safety invariants:
-- **Lexical Scope Containment & Pre-Unit Closure Isolation**: Any closures, lambdas, or nested
-  class definitions preceding a candidate unit within the enclosing lexical scope that capture
-  potential output variables are conservatively treated as escaping reads. Even if a closure
-  is not called directly within the unit's immediate block, it may have registered into
-  callback tables or event loops. Candidate outputs captured by pre-unit closures are preserved
-  or cause the pair to fail closed rather than risk silent state corruption. To bypass pre-unit
-  closure scanning when closures are known not to escape, pass `--skip-pre-unit-closures` or
-  `--closure-strictness lenient` (when both are supplied, `--closure-strictness` takes precedence).
+- **Lexical Scope Containment & Pre-Unit Closure Isolation (Generator Subroutines)**: For generator
+  subroutines, any closures, lambdas, or nested class definitions preceding a candidate unit within
+  the enclosing lexical scope that capture potential output variables are conservatively treated as
+  escaping reads. Even if a closure is not called directly within the unit's immediate block, it may
+  have registered into callback tables or event loops. Candidate outputs captured by pre-unit
+  closures are preserved or cause the pair to fail closed rather than risk silent state corruption.
+  To bypass pre-unit closure scanning when closures are known not to escape, pass
+  `--skip-pre-unit-closures` or `--closure-strictness lenient` (when both are supplied,
+  `--closure-strictness` takes precedence).
 - **Definite Assignment Verification**: Synthesized helper return values and tuple-unpacked
   subroutine outputs require definite assignments along all incoming and internal execution
   paths. If an output variable could remain unassigned before helper exit, refactoring is

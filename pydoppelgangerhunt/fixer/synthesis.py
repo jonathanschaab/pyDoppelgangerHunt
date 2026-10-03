@@ -18,13 +18,13 @@ from pydoppelgangerhunt.fixer.binding import (
     _populate_unit_receiver_metadata,
     _prune_unshared_receivers,
     _resolve_effective_binding,
-    is_async_generator_with_return_value,
-    resolve_clone_generator_subroutine_outputs,
-    resolve_closure_strictness_mode,
 )
 from pydoppelgangerhunt.fixer.dataflow import (
     _extract_effective_unit_outputs,
     _pair_clone_outputs,
+    is_async_generator_with_return_value,
+    resolve_clone_generator_subroutine_outputs,
+    resolve_closure_strictness_mode,
 )
 from pydoppelgangerhunt.fixer.scope import (
     _normalize_receiver_attrs,

@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-from unittest.mock import patch
+from unittest import mock
 
 import pytest
 
@@ -1901,9 +1901,9 @@ def test_pair_clone_outputs_positional_alignment() -> None:
     pairs = _pair_clone_outputs(["a", "b"], ["b", "c"])
     assert pairs == [("a", "c"), ("b", "b")]
 
-    # Swapped variable names with identical name set preserve canonical identity mapping
+    # Swapped variable names with identical name set fail closed to prevent miscompilation
     pairs_swapped = _pair_clone_outputs(["x", "y"], ["y", "x"])
-    assert pairs_swapped == [("x", "x"), ("y", "y")]
+    assert pairs_swapped == []
 
 
 def test_extract_nested_scope_free_reads_outer_scope_shadowing() -> None:
@@ -2599,14 +2599,14 @@ def test_conditional_named_expr_does_not_kill_variables() -> None:
 
 
 def test_pair_clone_outputs_swapped_names_and_positional_roles() -> None:
-    """Verifies identity-first pairing for matching variable names and positional pairing for remaining renamed roles."""
+    """Verifies positional pairing across renamed variable roles and identity on permutations."""
     # Equal arity with different names: preserves positional sequence
     pairs_pos = _pair_clone_outputs(["x", "y"], ["b", "a"])
     assert pairs_pos == [("x", "b"), ("y", "a")]
 
-    # Identical name sets preserve identity mapping to avoid swapping variables on reordering
+    # Identical name sets with conflicting order fail closed to prevent miscompilation
     pairs_ident = _pair_clone_outputs(["x", "y"], ["y", "x"])
-    assert pairs_ident == [("x", "x"), ("y", "y")]
+    assert pairs_ident == []
 
     # Mismatched arity: only common names paired
     pairs_mismatched = _pair_clone_outputs(["a", "b"], ["b"])
@@ -3239,16 +3239,9 @@ def test_infer_helper_return_type_yield_from_dict_keys() -> None:
 def test_synthesize_shared_helper_code_unpaired_output_fallback_aligned(
     tmp_path: Path,
 ) -> None:
-    """Verifies that the fallback else: branch in synthesize_shared_helper_code aligns
-    u1 and u2 output ordering using _pair_clone_outputs.
-
-    Note on pairing semantics:
-    _pair_clone_outputs uses identity-first pairing. In this test, f returns (a, b) and g
-    returns (b, a). Positionally, f's slot 0 ('a') corresponds to g's slot 0 ('b'), but
-    identity-first pairing intentionally matches identical symbol names across clones
-    ('a' -> 'a', 'b' -> 'b'). This reorders u2_outs to ['a', 'b'], ensuring that
-    type inference looks up types by counterpart symbol name (int with int, str with str)
-    rather than unaligned positional slots (int with str).
+    """Verifies that when clone output name sets match but positional orderings conflict,
+    _pair_clone_outputs fails closed, safely falling back to positional type inference
+    (Tuple[Any, Any]) rather than silently miscompiling or swapping return semantics.
     """
     src1 = (
         "def f(a: int, b: str):\n"
@@ -3266,7 +3259,7 @@ def test_synthesize_shared_helper_code_unpaired_output_fallback_aligned(
     u2 = {"file": str(f2), "start": 1, "end": 2, "name": "g", "kind": "function"}
     code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert code != ""
-    assert "Tuple[int, str]" in code
+    assert "Tuple[Any, Any]" in code
     assert "return a, b" in code
 
 
@@ -3431,8 +3424,10 @@ def test_patch_subroutine_effective_units_with_precomputed_outputs(
     )
     assert patch != ""
     assert "yield from _shared" in patch
-    assert "total, x = (yield from _shared" in patch
-    assert "count, y = (yield from _shared" in patch
+    assert "total = (yield from _shared" in patch
+    assert "count = (yield from _shared" in patch
+    assert "total, x" not in patch
+    assert "count, y" not in patch
 
 
 def test_load_unit_file_text_prioritizes_repo_root_over_cwd(
@@ -3707,19 +3702,24 @@ def test_collect_downstream_read_names_cache_invalidation_on_mtime() -> None:
 
 
 def test_collect_downstream_read_names_disk_mtime_invalidation(tmp_path: Path) -> None:
-    """Verifies that disk mtime is incorporated into cache key for downstream reads."""
+    """Verifies that differing mtime produces distinct cache entries for downstream reads."""
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        _downstream_reads_cache,
+    )
+
     _clear_downstream_reads_cache()
     f_path = tmp_path / "target.py"
-    code1 = "def f():\n    x = 1\n    return x\n"
-    f_path.write_text(code1, encoding="utf-8")
-    unit = {"file": str(f_path), "start": 2, "end": 2}
-    reads1 = collect_downstream_read_names(code1, unit)
+    code = "def f():\n    x = 1\n    return x\n"
+    f_path.write_text(code, encoding="utf-8")
+    unit1 = {"file": str(f_path), "start": 2, "end": 2, "mtime": 1000.0}
+    reads1 = collect_downstream_read_names(code, unit1)
     assert reads1 == {"x"}
+    assert len(_downstream_reads_cache) == 1
 
-    code2 = "def f():\n    y = 2\n    return y\n"
-    f_path.write_text(code2, encoding="utf-8")
-    reads2 = collect_downstream_read_names(code2, unit)
-    assert reads2 == {"y"}
+    unit2 = {"file": str(f_path), "start": 2, "end": 2, "mtime": 2000.0}
+    reads2 = collect_downstream_read_names(code, unit2)
+    assert reads2 == {"x"}
+    assert len(_downstream_reads_cache) == 2
 
 
 @pytest.mark.parametrize(
@@ -3806,7 +3806,7 @@ def test_collect_downstream_read_names_no_disk_stat_call() -> None:
     _clear_downstream_reads_cache()
     code = "def f():\n    x = 1\n    return x\n"
     unit = {"file": "virtual_module.py", "start": 2, "end": 2}
-    with patch.object(Path, "stat") as mock_stat:
+    with mock.patch.object(Path, "stat") as mock_stat:
         reads = collect_downstream_read_names(code, unit)
         assert reads == {"x"}
         mock_stat.assert_not_called()
@@ -3950,3 +3950,92 @@ def test_coordinate_parsing_colon_formatted_columns_across_subsystems(
     assert "startColumn" in json.dumps(sarif)
     ann = format_github_annotations([(0.9, u1, u2)])
     assert any("col=9" in a for a in ann)
+
+
+def test_process_func_does_not_flatten_user_inner_wrapper(tmp_path: Path) -> None:
+    """Verifies that an inner function named _wrapper in a whole-function unit is not flattened."""
+    code = (
+        "def my_decorator(fn):\n"
+        "    inner_var = 1\n"
+        "    def _wrapper(*args, **kwargs):\n"
+        "        wrapper_local = 2\n"
+        "        return fn(*args, **kwargs)\n"
+        "    return _wrapper\n"
+    )
+    f = tmp_path / "dec.py"
+    f.write_text(code, encoding="utf-8")
+    unit = {
+        "file": str(f),
+        "start": 1,
+        "end": 6,
+        "name": "my_decorator",
+        "kind": "function",
+    }
+    scope_info = analyze_unit_variable_scope(unit, repo_root=str(tmp_path))
+    assert "wrapper_local" not in scope_info.get("stores", set())
+    assert "wrapper_local" not in scope_info.get("outputs", [])
+    assert "_wrapper" in scope_info.get("outputs", [])
+
+
+def test_load_unit_file_text_honors_sliced_lines() -> None:
+    """Verifies that _load_unit_file_text returns None when source_lines is marked as sliced."""
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        _load_unit_file_text,
+    )
+
+    unit_sliced = {
+        "file": "virtual.py",
+        "start": 10,
+        "end": 12,
+        "source_lines": ["    x = 1\n", "    y = 2\n", "    z = 3\n"],
+        "source_lines_is_sliced": True,
+    }
+    assert _load_unit_file_text(unit_sliced) is None
+
+    unit_heuristic = {
+        "file": "virtual.py",
+        "start": 10,
+        "end": 12,
+        "source_lines": ["    x = 1\n", "    y = 2\n", "    z = 3\n"],
+    }
+    assert _load_unit_file_text(unit_heuristic) is None
+
+    unit_full = {
+        "file": "virtual.py",
+        "start": 1,
+        "end": 3,
+        "source_lines": ["x = 1\n", "y = 2\n", "z = 3\n"],
+    }
+    assert _load_unit_file_text(unit_full) == "x = 1\ny = 2\nz = 3\n"
+
+
+def test_downstream_reads_non_ascii_same_line_semicolon() -> None:
+    """Verifies downstream read analysis with non-ASCII characters preceding same-line unit."""
+    code = (
+        "def f():\n"
+        "    tag = 'café'; total = 1; print(total)\n"
+    )
+    unit = {
+        "file": "test_ascii.py",
+        "start": 2,
+        "end": 2,
+        "start_col": 19,
+        "end_col": 28,
+        "kind": "compound_block",
+    }
+    reads = collect_downstream_read_names(code, unit, candidates={"total", "tag"})
+    assert reads == {"total"}
+
+    # Fallback end_col resolution without end_col in unit
+    unit_no_end_col = {
+        "file": "test_ascii.py",
+        "start": 2,
+        "end": 2,
+        "start_col": 19,
+        "kind": "compound_block",
+    }
+    reads_fallback = collect_downstream_read_names(
+        code, unit_no_end_col, candidates={"total", "tag"}
+    )
+    assert reads_fallback == {"total"}
+

@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
 
+_SYNTHETIC_WRAPPER_NAME: str = "__pdh_wrapper__"
+
+
 def _is_mangled_name(name: str) -> bool:
     """Checks if an identifier is subject to Python private name mangling (__foo, not __foo__)."""
     return name.startswith("__") and not name.endswith("__") and len(name) > 2
@@ -206,7 +209,11 @@ class _ScopeVisitor(ast.NodeVisitor):
             self.stores.append(name)
 
     def _process_func(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
-        if node.name == "_wrapper":
+        if (
+            self.is_subroutine
+            and len(self._scope_stack) == 0
+            and node.name == _SYNTHETIC_WRAPPER_NAME
+        ):
             body = node.body
             if (
                 self.loop_offset > 0
@@ -1212,10 +1219,18 @@ def _inspect_unit_scope(
 
     parse_candidates = [
         (dedented, 0),
-        (f"async def _wrapper():\n{textwrap.indent(dedented, '    ')}", 0),
-        (f"def _wrapper():\n{textwrap.indent(dedented, '    ')}", 0),
-        (f"async def _wrapper():\n    for _ in (0,):\n{textwrap.indent(dedented, '        ')}", 1),
-        (f"def _wrapper():\n    for _ in (0,):\n{textwrap.indent(dedented, '        ')}", 1),
+        (f"async def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
+        (f"def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
+        (
+            f"async def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
+            f"{textwrap.indent(dedented, '        ')}",
+            1,
+        ),
+        (
+            f"def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
+            f"{textwrap.indent(dedented, '        ')}",
+            1,
+        ),
     ]
 
     for cand_text, offset in parse_candidates:
@@ -1336,8 +1351,9 @@ def _inspect_unit_scope(
 
     # Unit outputs: explicit returns if present; for subroutines without explicit
     # returns, all local variable stores act as unit outputs to preserve caller mutations.
-    if "outputs" in unit and isinstance(unit["outputs"], (list, tuple, set)):
-        outputs = list(unit["outputs"])
+    pre_outs = unit.get("precomputed_outputs") or unit.get("outputs")
+    if is_subroutine and isinstance(pre_outs, (list, tuple, set)):
+        outputs = list(pre_outs)
     elif visitor.returns:
         outputs = list(visitor.returns)
     elif is_subroutine:

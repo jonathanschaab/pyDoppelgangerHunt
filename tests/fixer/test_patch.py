@@ -7966,7 +7966,12 @@ def test_generate_refactoring_patch_sync_generator_with_outputs_and_return(tmp_p
     subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
     subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
     subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", "commit", "-m", "init"],
+        cwd=str(tmp_path),
+        check=True,
+        capture_output=True,
+    )
 
     apply_proc = subprocess.run(
         ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
@@ -8046,7 +8051,12 @@ def test_generate_refactoring_patch_sync_generator_renamed_downstream_outputs(tm
     subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
     subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
     subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", "commit", "-m", "init"],
+        cwd=str(tmp_path),
+        check=True,
+        capture_output=True,
+    )
 
     apply_proc = subprocess.run(
         ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
@@ -8213,7 +8223,12 @@ def test_generate_refactoring_patch_sync_generator_classdef_downstream_execution
     subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
     subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
     subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", "commit", "-m", "init"],
+        cwd=str(tmp_path),
+        check=True,
+        capture_output=True,
+    )
 
     apply_proc = subprocess.run(
         ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
@@ -8322,7 +8337,12 @@ def test_generate_refactoring_patch_sync_generator_closure_capture(tmp_path: Pat
     subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
     subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
     subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", "commit", "-m", "init"],
+        cwd=str(tmp_path),
+        check=True,
+        capture_output=True,
+    )
 
     apply_proc = subprocess.run(
         ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
@@ -8568,7 +8588,10 @@ def test_generate_refactoring_patch_sync_generator_with_union_yield_type(
     )
     subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
     subprocess.run(
-        ["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True
+        ["git", "-c", "commit.gpgsign=false", "commit", "-m", "init"],
+        cwd=str(tmp_path),
+        check=True,
+        capture_output=True,
     )
 
     apply_proc = subprocess.run(
@@ -8769,3 +8792,49 @@ def test_generate_refactoring_patch_subroutine_unpaired_outputs_rejected(tmp_pat
         [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
     )
     assert patch == ""
+
+
+def test_generate_refactoring_patch_replace_clones_false_emits_helper_with_differing_outputs(
+    tmp_path: Path,
+) -> None:
+    """Verifies that suggestion mode (replace_clones=False) emits shared helper
+    despite output difference."""
+    f = tmp_path / "single.py"
+    f.write_text(
+        "def run1():\n"
+        "    a = 1\n"
+        "    return a\n"
+        "\n"
+        "def run2():\n"
+        "    b = 1\n"
+        "    c = 2\n"
+        "    return b + c\n",
+        encoding="utf-8",
+    )
+    u1 = {
+        "file": str(f),
+        "start": 2,
+        "end": 2,
+        "name": "run1:block",
+        "kind": "compound_block",
+    }
+    u2 = {
+        "file": str(f),
+        "start": 6,
+        "end": 7,
+        "name": "run2:block",
+        "kind": "compound_block",
+    }
+
+    # When replacing clones, arity mismatch skips delegation
+    patch_replace = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch_replace == ""
+
+    # When replace_clones=False, helper-only suggestion mode emits the shared helper definition
+    patch_preview = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=False
+    )
+    assert "def _shared_run1_run2" in patch_preview
+
