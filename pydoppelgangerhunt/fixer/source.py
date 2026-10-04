@@ -52,11 +52,8 @@ def is_valid_unit_coordinates(u: Any) -> bool:
         return False
     try:
         for key in ("start", "end", "start_col", "end_col"):
-            val = u.get(key)
-            if val is not None:
-                if isinstance(val, str) and ":" in val:
-                    val = val.split(":", 1)[0].strip()
-                int(val)
+            if key in u and u.get(key) is not None:
+                parse_unit_coord(u, key, default=None)
         return True
     except (ValueError, TypeError):
         return False

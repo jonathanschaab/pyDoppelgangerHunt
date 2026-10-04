@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.config import canonical_path_key
+from pydoppelgangerhunt.source_lines import parse_unit_coord
 
 
 class UnionFind:
@@ -48,8 +49,8 @@ def _normalize_unit_file(unit: Dict[str, Any]) -> str:
 def unit_key(unit: Dict[str, Any]) -> str:
     """Generates unique deterministic string key for an AST unit."""
     norm_file = canonical_path_key(str(unit.get("file") or ""), strip_anchor=False)
-    s = int(unit.get("start") or 1)
-    e = int(unit.get("end") or s)
+    s = parse_unit_coord(unit, "start", default=1)
+    e = parse_unit_coord(unit, "end", default=s)
     name = str(unit.get("name") or "unit")
     return f"{norm_file}:{s}-{e}:{name}"
 
@@ -291,7 +292,7 @@ def cluster_clone_families(
         members.sort(
             key=lambda u: (
                 canonical_path_key(str(u.get("file") or ""), strip_anchor=False),
-                int(u.get("start") or 1),
+                parse_unit_coord(u, "start", default=1),
             )
         )
         member_set = set(member_keys)
@@ -301,7 +302,9 @@ def cluster_clone_families(
         ]
         unique_files = sorted(list({_normalize_unit_file(u) for u in members}))
         total_lines = sum(
-            int(u.get("end") or int(u.get("start") or 1)) - int(u.get("start") or 1) + 1
+            parse_unit_coord(u, "end", default=parse_unit_coord(u, "start", default=1))
+            - parse_unit_coord(u, "start", default=1)
+            + 1
             for u in members
         )
         avg_sim = (sum(family_sims) / len(family_sims)) if family_sims else 1.0
@@ -331,7 +334,7 @@ def cluster_clone_families(
             -f["member_count"],
             -round(f["avg_similarity"], 9),
             _normalize_unit_file(f["members"][0]),
-            int(f["members"][0].get("start") or 1),
+            parse_unit_coord(f["members"][0], "start", default=1),
             str(f["medoid"].get("name") or "") if isinstance(f.get("medoid"), dict) else "",
         )
     )

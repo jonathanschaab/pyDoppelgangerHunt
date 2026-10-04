@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pydoppelgangerhunt.clustering import cluster_clone_families
 from pydoppelgangerhunt.config import canonical_path_key, find_python_files
+from pydoppelgangerhunt.source_lines import parse_unit_coord
 
 
 def compute_repository_dry_stats(
@@ -61,8 +62,8 @@ def compute_repository_dry_stats(
     for _sim, u1, u2 in clones:
         for u in (u1, u2):
             f_norm = canonical_path_key(str(u.get("file") or ""), strip_anchor=False)
-            s = max(1, int(u.get("start") or 1))
-            e = max(s, int(u.get("end") or s))
+            s = max(1, parse_unit_coord(u, "start", default=1))
+            e = max(s, parse_unit_coord(u, "end", default=s))
             duplicated_lines_by_file.setdefault(f_norm, set()).update(
                 range(s, e + 1)
             )

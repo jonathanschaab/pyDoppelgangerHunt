@@ -6405,6 +6405,8 @@ def test_is_valid_unit_coordinates_scenarios() -> None:
         {},
         {"start": 1, "end": 5},
         {"start": "1", "end": "5"},
+        {"start": "12:0", "end": "15:0"},
+        {"start": "12:0", "end": "15:0", "start_col": "4:0", "end_col": "10:0"},
         {"start": "not_an_int"},
         {"start": 1, "end": [2]},
         {"start": 1, "end": 5, "start_col": "invalid"},
@@ -6420,6 +6422,8 @@ def test_is_valid_unit_coordinates_scenarios() -> None:
     coord_cases: List[Tuple[Dict[str, Any], str, int, int]] = [
         ({"start": 10}, "start", 1, 10),
         ({"start": "15"}, "start", 1, 15),
+        ({"start": "10:0"}, "start", 1, 10),
+        ({"start_col": "8:2"}, "start_col", 0, 8),
         ({}, "start", 42, 42),
         ({"end": 99}, "end", 0, 99),
     ]

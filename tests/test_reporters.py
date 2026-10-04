@@ -861,3 +861,66 @@ def test_extract_unit_source_code_end_coord_resolution() -> None:
     extracted = extract_unit_source_code(unit)
     assert extracted == ["line 3\n", "line 4\n", "line 5\n"]
 
+
+def test_reports_with_colon_formatted_line_coordinates(tmp_path: Path) -> None:
+    """Verifies that reporters handle colon-formatted line coordinates safely."""
+    f1 = tmp_path / "foo.py"
+    f1.write_text("def a():\n    pass\n", encoding="utf-8")
+    f2 = tmp_path / "bar.py"
+    f2.write_text("def b():\n    pass\n", encoding="utf-8")
+
+    u1 = {
+        "name": "a",
+        "file": str(f1),
+        "start": "1:0",
+        "end": "2:4",
+        "kind": "function",
+        "token_count": 10,
+    }
+    u2 = {
+        "name": "b",
+        "file": str(f2),
+        "start": "1:0",
+        "end": "2:4",
+        "kind": "function",
+        "token_count": 10,
+    }
+    clones = [(0.95, u1, u2)]
+
+    # 1. SARIF report
+    sarif = format_sarif_report(clones, target=str(tmp_path), threshold=0.8)
+    res = sarif["runs"][0]["results"][0]
+    assert res["locations"][0]["physicalLocation"]["region"]["startLine"] == 1
+    assert res["locations"][0]["physicalLocation"]["region"]["endLine"] == 2
+
+    # 2. GitHub annotations
+    ann = format_github_annotations(clones)
+    assert len(ann) == 2
+    assert "line=1,endLine=2" in ann[0]
+
+    # 3. JSON report
+    fam = {
+        "family_id": "CF-001",
+        "member_count": 2,
+        "unique_files": [str(f1), str(f2)],
+        "avg_similarity": 0.95,
+        "max_similarity": 0.95,
+        "total_lines": 4,
+        "medoid": u1,
+        "members": [u1, u2],
+    }
+    json_rep = format_json_report(clones, target=str(tmp_path), threshold=0.8, families=[fam])
+    assert json_rep["clones"][0]["unit_a"]["start"] == 1
+    assert json_rep["clones"][0]["unit_a"]["end"] == 2
+    assert json_rep["families"][0]["medoid"]["start"] == 1
+    assert json_rep["families"][0]["members"][0]["start"] == 1
+
+    # 4. Clone diff
+    diff_txt = generate_clone_diff(u1, u2, repo_root=str(tmp_path))
+    assert "1-2" in diff_txt
+
+    # 5. HTML report
+    html_rep = generate_html_report(clones, target=str(tmp_path), threshold=0.8, families=[fam])
+    assert "1-2" in html_rep
+
+

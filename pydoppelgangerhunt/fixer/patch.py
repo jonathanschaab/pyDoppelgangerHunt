@@ -1231,8 +1231,10 @@ def _render_file_patch_plan(
             u is r
             or (
                 u.get("file") == r.get("file")
-                and u.get("start") == r.get("start")
-                and u.get("end") == r.get("end")
+                and parse_unit_coord(u, "start", default=1)
+                == parse_unit_coord(r, "start", default=1)
+                and parse_unit_coord(u, "end", default=1)
+                == parse_unit_coord(r, "end", default=1)
             )
             for r in retained_cands
         ):

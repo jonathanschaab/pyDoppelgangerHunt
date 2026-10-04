@@ -3955,6 +3955,67 @@ def test_coordinate_parsing_colon_formatted_columns_across_subsystems(
     assert any("col=9" in a for a in ann)
 
 
+def test_coordinate_parsing_colon_formatted_lines_across_subsystems() -> None:
+    """Verifies that colon-formatted lines (e.g. '10:0') parse safely across all subsystems."""
+    from pydoppelgangerhunt.clustering import cluster_clone_families, unit_key
+    from pydoppelgangerhunt.coverage import compute_unit_coverage
+    from pydoppelgangerhunt.git_diff import compute_unit_diff_overlap
+    from pydoppelgangerhunt.matcher import compute_priority_score
+    from pydoppelgangerhunt.fixer.source import is_valid_unit_coordinates
+
+    u1 = {
+        "file": "mod.py",
+        "name": "f1",
+        "start": "10:0",
+        "end": "20:0",
+        "kind": "function",
+        "token_count": 30,
+        "complexity": 2,
+    }
+    u2 = {
+        "file": "mod.py",
+        "name": "f2",
+        "start": "30:0",
+        "end": "40:0",
+        "kind": "function",
+        "token_count": 30,
+        "complexity": 2,
+    }
+
+    # 1. unit_key
+    k1 = unit_key(u1)
+    assert "10-20:f1" in k1
+
+    # 2. compute_priority_score
+    p_score = compute_priority_score(0.9, u1, u2)
+    assert p_score > 0
+
+    # 3. cluster_clone_families
+    clones = [(0.9, u1, u2)]
+    fams = cluster_clone_families(clones)
+    assert len(fams) == 1
+    assert fams[0]["total_lines"] == 22
+
+    # 4. compute_unit_coverage
+    cov_data = {"mod.py": {10, 11, 12}}
+    cov = compute_unit_coverage(u1, cov_data)
+    assert 0.0 < cov < 1.0
+
+    # 5. compute_unit_diff_overlap
+    overlap_count, ratio = compute_unit_diff_overlap(
+        u1, {"mod.py": [(10, 15)]}
+    )
+    assert overlap_count == 6
+    assert ratio > 0.0
+
+    # 6. check_units_overlap
+    assert check_units_overlap(u1, u2) is False
+
+    # 7. is_valid_unit_coordinates
+    assert is_valid_unit_coordinates(u1) is True
+    assert is_valid_unit_coordinates({"start": "invalid:foo"}) is False
+
+
 def test_process_func_does_not_flatten_user_inner_wrapper(tmp_path: Path) -> None:
     """Verifies that an inner function named _wrapper in a whole-function unit is not flattened."""
     code = (

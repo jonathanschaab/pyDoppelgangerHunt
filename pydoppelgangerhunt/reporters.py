@@ -44,6 +44,12 @@ def colorize(text: str, color_code: str, enabled: bool) -> str:
     return f"{color_code}{text}{COLOR_RESET}"
 
 
+def _unit_line_bounds(unit: Dict[str, Any]) -> Tuple[int, int]:
+    """Extracts parsed (start, end) line coordinates from a unit dictionary."""
+    s = parse_unit_coord(unit, "start", default=1)
+    return s, parse_unit_coord(unit, "end", default=s)
+
+
 def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:
     """Reads raw source code lines for a given unit from provided lines or disk.
 
@@ -52,8 +58,7 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
     'source_lines_is_sliced': True (or False) to disambiguate whether 'source_lines'
     represents a pre-sliced excerpt or the complete file.
     """
-    s_d = parse_unit_coord(unit, "start", default=1)
-    e_d = parse_unit_coord(unit, "end", default=s_d)
+    s_d, e_d = _unit_line_bounds(unit)
     n_d = str(unit.get("name") or "unit")
     placeholder = [f"# Source for {n_d} lines {s_d}-{e_d}\n"]
 
@@ -171,10 +176,8 @@ def generate_clone_diff(
     lines2 = extract_unit_source_code(u2, repo_root)
     f1_norm = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
     f2_norm = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
-    s1 = int(u1.get("start") or 1)
-    e1 = int(u1.get("end") or s1)
-    s2 = int(u2.get("start") or 1)
-    e2 = int(u2.get("end") or s2)
+    s1, e1 = _unit_line_bounds(u1)
+    s2, e2 = _unit_line_bounds(u2)
     n1 = str(u1.get("name") or "unit1")
     n2 = str(u2.get("name") or "unit2")
     from_label = f"{f1_norm}:{s1}-{e1} ({n1})"
@@ -255,10 +258,8 @@ def format_sarif_report(
     for idx, (sim, u1, u2) in enumerate(clones):
         f1_norm = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
         f2_norm = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
-        s1 = int(u1.get("start") or 1)
-        e1 = int(u1.get("end") or s1)
-        s2 = int(u2.get("start") or 1)
-        e2 = int(u2.get("end") or s2)
+        s1, e1 = _unit_line_bounds(u1)
+        s2, e2 = _unit_line_bounds(u2)
         n1 = str(u1.get("name") or "unit1")
         n2 = str(u2.get("name") or "unit2")
         rule_id = "PYDOPPEL001"
@@ -362,6 +363,23 @@ def format_sarif_report(
     }
 
 
+def _format_unit_json(
+    unit: Dict[str, Any], default_name: str, include_tokens: bool = False
+) -> Dict[str, Any]:
+    """Formats an AST unit into a structured JSON dictionary."""
+    s, e = _unit_line_bounds(unit)
+    data: Dict[str, Any] = {
+        "name": str(unit.get("name") or default_name),
+        "file": normalize_path_string(str(unit.get("file") or ""), strip_anchor=False),
+        "start": s,
+        "end": e,
+        "kind": unit.get("kind"),
+    }
+    if include_tokens:
+        data["tokens"] = unit.get("token_count", 0)
+    return data
+
+
 def format_json_report(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     target: str,
@@ -379,22 +397,8 @@ def format_json_report(
         "clones": [
             {
                 "similarity": round(sim, 4),
-                "unit_a": {
-                    "name": str(u1.get("name") or "unit1"),
-                    "file": normalize_path_string(str(u1.get("file") or ""), strip_anchor=False),
-                    "start": int(u1.get("start") or 1),
-                    "end": int(u1.get("end") or int(u1.get("start") or 1)),
-                    "kind": u1.get("kind"),
-                    "tokens": u1.get("token_count", 0),
-                },
-                "unit_b": {
-                    "name": str(u2.get("name") or "unit2"),
-                    "file": normalize_path_string(str(u2.get("file") or ""), strip_anchor=False),
-                    "start": int(u2.get("start") or 1),
-                    "end": int(u2.get("end") or int(u2.get("start") or 1)),
-                    "kind": u2.get("kind"),
-                    "tokens": u2.get("token_count", 0),
-                },
+                "unit_a": _format_unit_json(u1, "unit1", include_tokens=True),
+                "unit_b": _format_unit_json(u2, "unit2", include_tokens=True),
             }
             for sim, u1, u2 in clones
         ],
@@ -411,24 +415,12 @@ def format_json_report(
                 "coherence": round(f.get("coherence", 1.0), 4),
                 "total_lines": f["total_lines"],
                 "medoid": (
-                    {
-                        "name": str(f["medoid"].get("name") or "medoid"),
-                        "file": normalize_path_string(str(f["medoid"].get("file") or ""), strip_anchor=False),
-                        "start": int(f["medoid"].get("start") or 1),
-                        "end": int(f["medoid"].get("end") or int(f["medoid"].get("start") or 1)),
-                        "kind": f["medoid"].get("kind"),
-                    }
+                    _format_unit_json(f["medoid"], "medoid")
                     if "medoid" in f and f["medoid"]
                     else None
                 ),
                 "members": [
-                    {
-                        "name": str(m.get("name") or "member"),
-                        "file": normalize_path_string(str(m.get("file") or ""), strip_anchor=False),
-                        "start": int(m.get("start") or 1),
-                        "end": int(m.get("end") or int(m.get("start") or 1)),
-                        "kind": m.get("kind"),
-                    }
+                    _format_unit_json(m, "member")
                     for m in f["members"]
                 ],
             }
@@ -499,11 +491,9 @@ def format_github_annotations(
     annotations: List[str] = []
     for sim, u1, u2 in clones:
         f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=True)
-        s1 = int(u1.get("start") or 1)
-        e1 = int(u1.get("end") or s1)
+        s1, e1 = _unit_line_bounds(u1)
         f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=True)
-        s2 = int(u2.get("start") or 1)
-        e2 = int(u2.get("end") or s2)
+        s2, e2 = _unit_line_bounds(u2)
         n1 = str(u1.get("name") or "unit1")
         n2 = str(u2.get("name") or "unit2")
         msg1 = f"Structural clone ({sim:.1%}) matching {f2}:{s2}-{e2} ({n2})"
@@ -574,10 +564,8 @@ def generate_html_report(
 
         f1_norm = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
         f2_norm = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
-        s1 = int(u1.get("start") or 1)
-        e1 = int(u1.get("end") or s1)
-        s2 = int(u2.get("start") or 1)
-        e2 = int(u2.get("end") or s2)
+        s1, e1 = _unit_line_bounds(u1)
+        s2, e2 = _unit_line_bounds(u2)
         n1 = str(u1.get("name") or "unit1")
         n2 = str(u2.get("name") or "unit2")
 
@@ -626,8 +614,7 @@ def generate_html_report(
                 m_file = html.escape(
                     normalize_path_string(str(m.get("file") or ""), strip_anchor=False)
                 )
-                m_start = int(m.get("start") or 1)
-                m_end = int(m.get("end") or m_start)
+                m_start, m_end = _unit_line_bounds(m)
                 raw_m_name = str(m.get("name") or "member")
                 m_name = html.escape(raw_m_name)
                 is_medoid = bool(medoid_name and raw_m_name == medoid_name)

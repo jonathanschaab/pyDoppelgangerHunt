@@ -329,8 +329,8 @@ def merge_adjacent_clones(
     for sim, u1, u2 in clones:
         f1 = _normalize_matcher_file(u1.get("file"))
         f2 = _normalize_matcher_file(u2.get("file"))
-        k1 = (f1, int(u1.get("start") or 1), str(u1.get("name") or ""))
-        k2 = (f2, int(u2.get("start") or 1), str(u2.get("name") or ""))
+        k1 = (f1, parse_unit_coord(u1, "start", default=1), str(u1.get("name") or ""))
+        k2 = (f2, parse_unit_coord(u2, "start", default=1), str(u2.get("name") or ""))
         if k1 <= k2:
             canonical.append((sim, dict(u1), dict(u2)))
         else:
@@ -371,15 +371,15 @@ def merge_adjacent_clones(
                 if fn1_a != fn1_b or fn2_a != fn2_b:
                     continue
 
-                u1_b_start = int(u1_b.get("start") or 1)
-                u1_b_end = int(u1_b.get("end") or u1_b_start)
-                curr_u1_start = int(current_u1.get("start") or 1)
-                curr_u1_end = int(current_u1.get("end") or curr_u1_start)
+                u1_b_start = parse_unit_coord(u1_b, "start", default=1)
+                u1_b_end = parse_unit_coord(u1_b, "end", default=u1_b_start)
+                curr_u1_start = parse_unit_coord(current_u1, "start", default=1)
+                curr_u1_end = parse_unit_coord(current_u1, "end", default=curr_u1_start)
 
-                u2_b_start = int(u2_b.get("start") or 1)
-                u2_b_end = int(u2_b.get("end") or u2_b_start)
-                curr_u2_start = int(current_u2.get("start") or 1)
-                curr_u2_end = int(current_u2.get("end") or curr_u2_start)
+                u2_b_start = parse_unit_coord(u2_b, "start", default=1)
+                u2_b_end = parse_unit_coord(u2_b, "end", default=u2_b_start)
+                curr_u2_start = parse_unit_coord(current_u2, "start", default=1)
+                curr_u2_end = parse_unit_coord(current_u2, "end", default=curr_u2_start)
 
                 adj1 = (u1_b_start <= curr_u1_end + line_tolerance) and (
                     u1_b_end >= curr_u1_start - line_tolerance
@@ -489,14 +489,14 @@ def suppress_subclones(
             c1_corr = c1 if direct_match else c2
             c2_corr = c2 if direct_match else c1
 
-            p1_start = int(p1.get("start") or 1)
-            p1_end = int(p1.get("end") or p1_start)
-            p2_start = int(p2.get("start") or 1)
-            p2_end = int(p2.get("end") or p2_start)
-            c1_start = int(c1_corr.get("start") or 1)
-            c1_end = int(c1_corr.get("end") or c1_start)
-            c2_start = int(c2_corr.get("start") or 1)
-            c2_end = int(c2_corr.get("end") or c2_start)
+            p1_start = parse_unit_coord(p1, "start", default=1)
+            p1_end = parse_unit_coord(p1, "end", default=p1_start)
+            p2_start = parse_unit_coord(p2, "start", default=1)
+            p2_end = parse_unit_coord(p2, "end", default=p2_start)
+            c1_start = parse_unit_coord(c1_corr, "start", default=1)
+            c1_end = parse_unit_coord(c1_corr, "end", default=c1_start)
+            c2_start = parse_unit_coord(c2_corr, "start", default=1)
+            c2_end = parse_unit_coord(c2_corr, "end", default=c2_start)
 
             c1_enclosed = p1_start <= c1_start and c1_end <= p1_end
             c2_enclosed = p2_start <= c2_start and c2_end <= p2_end
@@ -1434,10 +1434,14 @@ def scan_target(
         if f1 == f2:
             fn1 = u1["name"].split(":")[0]
             fn2 = u2["name"].split(":")[0]
+            u1_s = parse_unit_coord(u1, "start", default=1)
+            u1_e = parse_unit_coord(u1, "end", default=u1_s)
+            u2_s = parse_unit_coord(u2, "start", default=1)
+            u2_e = parse_unit_coord(u2, "end", default=u2_s)
             if fn1 == fn2:
-                if max(u1["start"], u2["start"]) <= min(u1["end"], u2["end"]):
+                if max(u1_s, u2_s) <= min(u1_e, u2_e):
                     continue
-            elif (u1["start"] <= u2["start"] and u1["end"] >= u2["end"]) or (u2["start"] <= u1["start"] and u2["end"] >= u1["end"]):
+            elif (u1_s <= u2_s and u1_e >= u2_e) or (u2_s <= u1_s and u2_e >= u1_e):
                 continue
 
         # Skip if size differs significantly
@@ -1510,10 +1514,7 @@ def scan_target(
         clones.sort(key=lambda x: compute_priority_score(x[0], x[1], x[2]), reverse=True)
     elif sort_by == "sloc":
         clones.sort(
-            key=lambda x: (
-                max(0, int(x[1].get("end") or int(x[1].get("start") or 1)) - int(x[1].get("start") or 1) + 1)
-                + max(0, int(x[2].get("end") or int(x[2].get("start") or 1)) - int(x[2].get("start") or 1) + 1)
-            ),
+            key=lambda x: _unit_sloc(x[1]) + _unit_sloc(x[2]),
             reverse=True,
         )
     else:
@@ -1544,16 +1545,19 @@ def scan_target(
     return clones
 
 
+def _unit_sloc(unit: Dict[str, Any]) -> int:
+    """Computes non-negative line count for an AST unit using parsed coordinates."""
+    s = parse_unit_coord(unit, "start", default=1)
+    e = parse_unit_coord(unit, "end", default=s)
+    return max(0, e - s + 1)
+
+
 def compute_priority_score(
     sim: float,
     u1: Dict[str, Any],
     u2: Dict[str, Any],
 ) -> float:
     """Calculates refactoring priority based on similarity, line length, and cyclomatic complexity."""
-    s1 = int(u1.get("start") or 1)
-    e1 = int(u1.get("end") or s1)
-    s2 = int(u2.get("start") or 1)
-    e2 = int(u2.get("end") or s2)
-    avg_sloc = (max(0, e1 - s1 + 1) + max(0, e2 - s2 + 1)) / 2.0
+    avg_sloc = (_unit_sloc(u1) + _unit_sloc(u2)) / 2.0
     max_comp = max(1, int(u1.get("complexity") or 1), int(u2.get("complexity") or 1))
     return float(round(sim * avg_sloc * max_comp, 1))
