@@ -218,11 +218,11 @@ def check_units_overlap(
         return _check_same_line_overlap(sc1, ec1, sc2, ec2)
 
     # Case 2: Sequential boundary touch (u1 ends where u2 begins)
-    if start1 < start2 and end1 == start2:
+    if start1 < start2 == end1:
         return _check_sequential_touch(ec1, sc2, start2 == end2, ec2)
 
     # Case 3: Sequential boundary touch (u2 ends where u1 begins)
-    if start2 < start1 and end2 == start1:
+    if start2 < start1 == end2:
         return _check_sequential_touch(ec2, sc1, start1 == end1, ec1)
 
     # Case 4: Units sharing start line (start1 == start2), or multi-line units sharing end line (end1 == end2).
