@@ -2711,6 +2711,37 @@ def test_cli_closure_strictness_and_skip_closures_flags(tmp_path: Path) -> None:
             assert kwargs.get("skip_pre_unit_closures") is True
             assert kwargs.get("closure_strictness") == "lenient"
 
+            # Unrecognized strictness string combined with --skip-pre-unit-closures
+            mock_patch.reset_mock()
+            exit_code = main([
+                str(repo),
+                "--patch",
+                str(patch_out),
+                "--closure-strictness",
+                "custom_unrecognized",
+                "--skip-pre-unit-closures",
+            ])
+            assert exit_code == 1
+            mock_patch.assert_called_once()
+            _, kwargs = mock_patch.call_args
+            assert kwargs.get("skip_pre_unit_closures") is True
+            assert kwargs.get("closure_strictness") == "lenient"
+
+            # Unrecognized strictness string alone falls back to strict
+            mock_patch.reset_mock()
+            exit_code = main([
+                str(repo),
+                "--patch",
+                str(patch_out),
+                "--closure-strictness",
+                "custom_unrecognized",
+            ])
+            assert exit_code == 1
+            mock_patch.assert_called_once()
+            _, kwargs = mock_patch.call_args
+            assert kwargs.get("skip_pre_unit_closures") is False
+            assert kwargs.get("closure_strictness") == "strict"
+
 
 def test_cli_main_omitted_top_does_not_raise(tmp_path: Path) -> None:
     """Verifies that omitting --top leaves args.top=None without raising TypeError."""

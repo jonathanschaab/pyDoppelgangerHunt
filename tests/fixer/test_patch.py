@@ -6411,6 +6411,8 @@ def test_is_valid_unit_coordinates_scenarios() -> None:
         {"start": 1, "end": [2]},
         {"start": 1, "end": 5, "start_col": "invalid"},
         {"start": 1, "end": 5, "end_col": {}},
+        {"start": ""},
+        {"start": 1, "end": 5, "start_col": ""},
     ]
     for tc in test_cases:
         expected = is_valid_unit_coordinates(tc)
@@ -6424,6 +6426,9 @@ def test_is_valid_unit_coordinates_scenarios() -> None:
         ({"start": "15"}, "start", 1, 15),
         ({"start": "10:0"}, "start", 1, 10),
         ({"start_col": "8:2"}, "start_col", 0, 8),
+        ({"start": ""}, "start", 1, 1),
+        ({"start": "   "}, "start", 1, 1),
+        ({"start": ":0"}, "start", 1, 1),
         ({}, "start", 42, 42),
         ({"end": 99}, "end", 0, 99),
     ]

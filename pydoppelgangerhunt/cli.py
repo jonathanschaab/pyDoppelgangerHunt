@@ -200,7 +200,6 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
     parser.add_argument(
         "--closure-strictness",
         type=str,
-        choices=["strict", "lenient"],
         default=None,
         help=(
             "Closure strictness ('strict' or 'lenient'; "
@@ -1121,12 +1120,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else "auto"
     )
     shared_module_name = str(args.shared_module_name or tool_cfg.get("shared_module_name", "_common.py"))
-    if args.closure_strictness is not None:
+    if args.closure_strictness is not None or args.skip_pre_unit_closures:
         cli_strictness: Optional[str] = args.closure_strictness
-        cli_skip: bool = False
-    elif args.skip_pre_unit_closures:
-        cli_strictness = "lenient"
-        cli_skip = True
+        cli_skip: bool = bool(args.skip_pre_unit_closures)
     else:
         cli_strictness = tool_cfg.get("closure_strictness")
         cli_skip = bool(tool_cfg.get("skip_pre_unit_closures", False))

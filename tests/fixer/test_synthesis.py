@@ -1899,10 +1899,18 @@ def test_patch_subroutine_is_async_propagation(tmp_path: Path) -> None:
 
 
 def test_pair_clone_outputs_positional_alignment() -> None:
-    """Verifies that _pair_clone_outputs prioritizes common identity mapping before pairing remaining outputs."""
-    # Colliding variable names across different semantic positions
-    pairs = _pair_clone_outputs(["a", "b"], ["b", "c"])
-    assert pairs == [("a", "c"), ("b", "b")]
+    """Verifies that _pair_clone_outputs pairs outputs by position and fails closed on conflicts."""
+    # Colliding variable names across different semantic positions fail closed
+    pairs_conflict = _pair_clone_outputs(["a", "b"], ["b", "c"])
+    assert pairs_conflict == []
+
+    # Partial common names with conflicting indices fail closed to prevent variable swapping
+    pairs_scrambled = _pair_clone_outputs(["a", "b", "c"], ["x", "a", "b"])
+    assert pairs_scrambled == []
+
+    # Common names at matching positions succeed with 1-to-1 positional pairing
+    pairs_aligned = _pair_clone_outputs(["a", "b", "c"], ["a", "x", "c"])
+    assert pairs_aligned == [("a", "a"), ("b", "x"), ("c", "c")]
 
     # Swapped variable names with identical name set fail closed to prevent miscompilation
     pairs_swapped = _pair_clone_outputs(["x", "y"], ["y", "x"])
@@ -3558,6 +3566,12 @@ def test_parse_unit_coord_overload_and_default_none() -> None:
     """Verifies parse_unit_coord behavior with default=None and formatted coordinates."""
     assert parse_unit_coord({"col": None}, "col", default=None) is None
     assert parse_unit_coord({}, "col", default=None) is None
+    assert parse_unit_coord({"col": ""}, "col", default=None) is None
+    assert parse_unit_coord({"col": "   "}, "col", default=None) is None
+    assert parse_unit_coord({"col": ":0"}, "col", default=None) is None
+    assert parse_unit_coord({"col": ""}, "col", default=1) == 1
+    assert parse_unit_coord({"col": "   "}, "col", default=1) == 1
+    assert parse_unit_coord({"col": ":0"}, "col", default=1) == 1
     assert parse_unit_coord({"col": 42}, "col", default=None) == 42
     assert parse_unit_coord({"col": "42:0"}, "col", default=None) == 42
     assert parse_unit_coord({"col": 42}, "col") == 42

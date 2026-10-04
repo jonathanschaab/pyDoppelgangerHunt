@@ -1155,20 +1155,17 @@ def _pair_clone_outputs(
     u2_dedup = list(dict.fromkeys(u2_outs))
     if len(u1_dedup) == len(u2_dedup):
         common = set(u1_dedup) & set(u2_dedup)
-        if len(common) == len(u1_dedup) and u1_dedup != u2_dedup:
+        # Fail closed if any common variable occupies different positional indices
+        if any(u1_dedup.index(name) != u2_dedup.index(name) for name in common):
             logger.debug(
-                "Rejecting clone output pairing: identical name sets with conflicting "
+                "Rejecting clone output pairing: common variables have conflicting "
                 "positional orderings (%s vs %s)",
                 u1_dedup,
                 u2_dedup,
             )
             return []
-        out_map = {o: o for o in common}
-        rem_u1 = [o for o in u1_dedup if o not in common]
-        rem_u2 = [o for o in u2_dedup if o not in common]
-        for o1, o2 in zip(rem_u1, rem_u2):
-            out_map[o1] = o2
-        return [(o1, out_map[o1]) for o1 in u1_dedup]
+        # True 1-to-1 positional pairing
+        return list(zip(u1_dedup, u2_dedup))
     common_names = [o for o in u1_dedup if o in u2_dedup]
     return [(o, o) for o in common_names]
 

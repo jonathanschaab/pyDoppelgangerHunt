@@ -53,7 +53,8 @@ def is_valid_unit_coordinates(u: Any) -> bool:
     try:
         for key in ("start", "end", "start_col", "end_col"):
             if key in u and u.get(key) is not None:
-                parse_unit_coord(u, key, default=None)
+                if parse_unit_coord(u, key, default=None) is None:
+                    return False
         return True
     except (ValueError, TypeError):
         return False

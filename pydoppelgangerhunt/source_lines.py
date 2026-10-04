@@ -47,13 +47,16 @@ def parse_unit_coord(
     (e.g., '12:0' or '8:0'). For colon-formatted coordinates emitted by external linters
     or diagnostics (where the suffix denotes a sub-column or character index), the primary
     leading coordinate prefix before the colon is parsed as the integer value.
+    If the coordinate value is missing or empty, falls back to default.
     Raises ValueError for non-numeric strings.
     """
     val = unit.get(key)
     if val is None:
         return default
-    if isinstance(val, str) and ":" in val:
+    if isinstance(val, str):
         val = val.split(":", 1)[0].strip()
+        if not val:
+            return default
     return int(val)
 
 
