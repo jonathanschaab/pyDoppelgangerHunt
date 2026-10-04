@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
 from pydoppelgangerhunt.config import normalize_path_string
+from pydoppelgangerhunt.fixer.source import _resolve_safe_unit_file_path
 from pydoppelgangerhunt.source_lines import parse_unit_coord, split_source_lines
 
 
@@ -91,42 +92,8 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
         ]
 
     raw_file = str(unit.get("file") or "")
-    f_raw = normalize_path_string(raw_file, strip_anchor=True)
-    if not f_raw:
-        return placeholder
-
-    file_path = Path(f_raw)
-    if file_path.suffix.lower() not in (".py", ".ipynb"):
-        return placeholder
-
-    if repo_root:
-        effective_root = Path(repo_root).resolve()
-        if effective_root.is_file():
-            effective_root = effective_root.parent
-        target_root = effective_root
-        if not file_path.is_absolute():
-            file_path = effective_root / file_path
-    else:
-        target_root = Path.cwd().resolve()
-        if not file_path.is_absolute():
-            file_path = target_root / file_path
-
-
-    try:
-        if not file_path.is_file() or file_path.is_symlink():
-            return placeholder
-        for parent in file_path.parents:
-            if parent.is_symlink():
-                return placeholder
-            if parent == target_root:
-                break
-
-
-        resolved_file = file_path.resolve()
-        if resolved_file.is_symlink() or not resolved_file.is_file():
-            return placeholder
-        resolved_file.relative_to(target_root)
-    except (OSError, RuntimeError, ValueError):
+    resolved_file = _resolve_safe_unit_file_path(unit, repo_root=repo_root)
+    if resolved_file is None:
         return placeholder
 
     try:

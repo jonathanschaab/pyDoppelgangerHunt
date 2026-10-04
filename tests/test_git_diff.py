@@ -1521,4 +1521,3 @@ def test_git_diff_zero_and_colon_coordinates_clamped(tmp_path: Path) -> None:
         assert mock_blame.call_count == 2
         mock_blame.assert_any_call("a.py", 1, 1, repo_root=str(tmp_path))
         mock_blame.assert_any_call("b.py", 1, 1, repo_root=str(tmp_path))
-

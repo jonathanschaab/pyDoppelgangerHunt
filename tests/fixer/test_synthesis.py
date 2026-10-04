@@ -1481,15 +1481,21 @@ def test_resolve_generator_subroutine_outputs_preserves_per_side_necessity_and_s
     assert out1 == ["total"]
     assert out2 == ["count"]
 
-    # 2. Unknown fallback with definite sets: prunes conditionally assigned loop variable x
+    # 2. Unknown fallback with definite sets: fails closed when candidate lacks definite store
     res2 = resolve_generator_subroutine_outputs(
         GeneratorCloneSideData(u1_outs, downstream={"total"}, definite={"total"}),
         GeneratorCloneSideData(u2_outs, downstream=None, definite={"count"}),
     )
-    assert res2 is not None
-    fb_def1, fb_def2 = res2
-    assert fb_def1 == ["total"]
-    assert fb_def2 == ["count"]
+    assert res2 is None
+
+    res2_def = resolve_generator_subroutine_outputs(
+        GeneratorCloneSideData(u1_outs, downstream={"total"}, definite={"total", "x"}),
+        GeneratorCloneSideData(u2_outs, downstream=None, definite={"count", "x"}),
+    )
+    assert res2_def is not None
+    fb_def1, fb_def2 = res2_def
+    assert fb_def1 == ["total", "x"]
+    assert fb_def2 == ["count", "x"]
 
     # 3. Unknown fallback without definite sets: unconstrained fallback preserves all paired outputs
     res3 = resolve_generator_subroutine_outputs(
@@ -1827,9 +1833,9 @@ def test_downstream_read_visitor_aug_assign() -> None:
 
 def test_pair_clone_outputs_duplicate_names() -> None:
     """Verifies that _pair_clone_outputs does not raise KeyError on duplicate output names."""
-    # Equal lengths with duplicates on one side (len(dedup) differs -> common names only)
+    # Equal lengths with duplicates on one side (len(dedup) differs -> unequal arities fail closed)
     pairs1 = _pair_clone_outputs(["a", "b"], ["a", "a"])
-    assert pairs1 == [("a", "a")]
+    assert pairs1 == []
 
     # Equal raw lengths with duplicate on one side and disjoint names (returns empty without KeyError)
     pairs2 = _pair_clone_outputs(["x", "y"], ["z", "z"])
@@ -1839,9 +1845,9 @@ def test_pair_clone_outputs_duplicate_names() -> None:
     pairs3 = _pair_clone_outputs(["a", "b", "a"], ["c", "d", "c"])
     assert pairs3 == [("a", "c"), ("b", "d")]
 
-    # Unequal raw lengths with duplicates
+    # Unequal raw lengths with duplicates (unequal arities fail closed)
     pairs4 = _pair_clone_outputs(["a", "b", "a"], ["a", "a"])
-    assert pairs4 == [("a", "a")]
+    assert pairs4 == []
 
 
 def test_extract_nested_scope_free_reads_type_annotations() -> None:
@@ -2619,9 +2625,9 @@ def test_pair_clone_outputs_swapped_names_and_positional_roles() -> None:
     pairs_ident = _pair_clone_outputs(["x", "y"], ["y", "x"])
     assert pairs_ident == []
 
-    # Mismatched arity: only common names paired
+    # Mismatched arity fails closed
     pairs_mismatched = _pair_clone_outputs(["a", "b"], ["b"])
-    assert pairs_mismatched == [("b", "b")]
+    assert pairs_mismatched == []
 
 
 def test_harvested_subroutine_inherits_async_status_and_rejection(
@@ -2695,6 +2701,33 @@ def test_infer_helper_return_type_generator_with_outputs_and_iterator() -> None:
         is_async=False,
     )
     assert res_kept == "Iterator[float]"
+
+
+def test_infer_helper_return_type_generator_with_yield_assignment() -> None:
+    """Verifies that yield expressions in assignment context infer Any send type instead of None."""
+    # When scope has_yield_assignment is True, send type defaults to Any
+    res = _infer_helper_return_type(
+        resolved_ret="Iterator[int]",
+        helper_outputs=["total"],
+        conditional_outs=set(),
+        scope={"has_yield": True, "has_yield_assignment": True, "yield_expr_names": []},
+        meta1={"total": {"type": "str"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res == "Generator[int, Any, str]"
+
+    # Existing explicit send type in resolved_ret is preserved
+    res_explicit = _infer_helper_return_type(
+        resolved_ret="Generator[int, str, None]",
+        helper_outputs=["total"],
+        conditional_outs=set(),
+        scope={"has_yield": True, "has_yield_assignment": True, "yield_expr_names": []},
+        meta1={"total": {"type": "str"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_explicit == "Generator[int, str, str]"
 
 
 def test_split_type_args_nested_bracket_depth() -> None:
@@ -3612,6 +3645,14 @@ def test_parse_unit_coord_overload_and_default_none() -> None:
     assert parse_unit_coord({}, "col", default=10) == 10
     with pytest.raises(ValueError):
         parse_unit_coord({"col": "invalid"}, "col")
+    with pytest.raises(ValueError):
+        parse_unit_coord({"col": float("inf")}, "col")
+    with pytest.raises(ValueError):
+        parse_unit_coord({"col": "inf"}, "col")
+    with pytest.raises(ValueError):
+        parse_unit_coord({"col": float("nan")}, "col")
+    with pytest.raises(ValueError):
+        parse_unit_coord({"col": "nan"}, "col")
 
 
 def test_module_level_unit_prior_function_free_reads() -> None:
@@ -3733,13 +3774,17 @@ def test_collect_downstream_read_names_cache_isolation_on_content_change() -> No
 
 
 def test_load_unit_file_text_resilience_to_non_utf8_bytes(tmp_path: Path) -> None:
-    """Verifies that _load_unit_file_text uses errors='replace' on non-UTF-8 bytes."""
+    """Verifies that _load_unit_file_text uses errors='replace' on non-UTF-8 bytes
+    and enforces containment."""
     latin1_file = tmp_path / "latin1.py"
     latin1_file.write_bytes(b"def compute():\n    # Legacy comment \xe9\n    return 42\n")
-    loaded = _load_unit_file_text({"file": str(latin1_file)})
+    loaded = _load_unit_file_text({"file": str(latin1_file)}, repo_root=str(tmp_path))
     assert loaded is not None
     assert "return 42" in loaded
     assert "\ufffd" in loaded
+
+    # When repo_root is omitted, files in global tempdir outside CWD are rejected fail-closed
+    assert _load_unit_file_text({"file": str(latin1_file)}, repo_root=None) is None
 
 
 def test_collect_downstream_read_names_cache_invalidation_on_mtime() -> None:
@@ -4226,6 +4271,3 @@ def test_infer_helper_return_type_subroutine_no_outputs_ignores_resolved_ret() -
         is_subroutine=True,
     )
     assert ret == "None"
-
-
-

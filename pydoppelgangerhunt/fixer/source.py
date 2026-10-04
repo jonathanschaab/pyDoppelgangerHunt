@@ -8,8 +8,10 @@ import logging
 import textwrap
 import tokenize
 import warnings
+from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
+from pydoppelgangerhunt.config import normalize_path_string
 from pydoppelgangerhunt.source_lines import (
     count_physical_newlines,
     detect_line_ending,
@@ -23,6 +25,7 @@ __all__ = [
     "ReplacementItem",
     "UnitDict",
     "UnitSpan",
+    "_resolve_safe_unit_file_path",
     "col_offset_to_char_offset",
     "compute_line_offsets",
     "compute_unit_byte_offsets",
@@ -61,6 +64,53 @@ def is_valid_unit_coordinates(u: Any) -> bool:
 
 
 _is_valid_unit_coordinates = is_valid_unit_coordinates
+
+
+def _resolve_safe_unit_file_path(
+    unit: Dict[str, Any],
+    repo_root: Optional[str] = None,
+    allowed_suffixes: Sequence[str] = (".py", ".ipynb"),
+) -> Optional[Path]:
+    """Safely resolves and validates a unit's file path on disk within repo_root or CWD."""
+    raw_file = str(unit.get("file") or "")
+    f_raw = normalize_path_string(raw_file, strip_anchor=True)
+    if not f_raw:
+        return None
+
+    file_path = Path(f_raw)
+    norm_suffixes = tuple(s.lower() for s in allowed_suffixes)
+    if file_path.suffix.lower() not in norm_suffixes:
+        return None
+
+    if repo_root:
+        effective_root = Path(repo_root).resolve()
+        if effective_root.is_file():
+            effective_root = effective_root.parent
+        target_root = effective_root
+        if not file_path.is_absolute():
+            file_path = effective_root / file_path
+    else:
+        target_root = Path.cwd().resolve()
+        if not file_path.is_absolute():
+            file_path = target_root / file_path
+
+    try:
+        if not file_path.is_file() or file_path.is_symlink():
+            return None
+        for parent in file_path.parents:
+            if parent.is_symlink():
+                return None
+            if parent == target_root:
+                break
+
+        resolved_file = file_path.resolve()
+        if resolved_file.is_symlink() or not resolved_file.is_file():
+            return None
+        resolved_file.relative_to(target_root)
+        return resolved_file
+    except (OSError, RuntimeError, ValueError):
+        return None
+
 
 
 

@@ -48,7 +48,7 @@ def parse_unit_coord(
     or diagnostics (where the suffix denotes a sub-column or character index), the primary
     leading coordinate prefix before the colon is parsed as the integer value.
     If the coordinate value is missing or empty, falls back to default.
-    Raises ValueError for non-numeric strings.
+    Raises ValueError for non-numeric strings or unconvertible/overflow values.
     """
     val = unit.get(key)
     if val is None:
@@ -60,8 +60,18 @@ def parse_unit_coord(
         try:
             return int(val)
         except ValueError:
-            return int(float(val))
-    return int(val)
+            try:
+                return int(float(val))
+            except (ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"Invalid coordinate {val!r}: cannot convert to integer"
+                ) from exc
+    try:
+        return int(val)
+    except (ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"Invalid coordinate {val!r}: cannot convert to integer"
+        ) from exc
 
 
 def split_source_lines(source_text: str) -> List[str]:

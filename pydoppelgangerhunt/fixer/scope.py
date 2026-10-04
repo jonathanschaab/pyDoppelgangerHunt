@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import inspect
 import logging
 import sys
 import textwrap
@@ -114,6 +115,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.has_return: bool = False
         self.has_return_value: bool = False
         self.has_yield: bool = False
+        self.has_yield_assignment: bool = False
         self.has_super: bool = False
         self.has_mangled_names: bool = False
         self.naked_breaks: int = 0
@@ -390,12 +392,20 @@ class _ScopeVisitor(ast.NodeVisitor):
         for stmt in node.body:
             self.visit(stmt)
 
+    def _check_yield_assignment(self, node: Optional[ast.AST]) -> None:
+        if node is not None and any(
+            isinstance(s, (ast.Yield, ast.YieldFrom)) for s in ast.walk(node)
+        ):
+            self.has_yield_assignment = True
+
     def visit_Assign(self, node: ast.Assign) -> None:
+        self._check_yield_assignment(node.value)
         self.visit(node.value)
         for target in node.targets:
             self.visit(target)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self._check_yield_assignment(node.value)
         # AugAssign both loads and stores the target
         if isinstance(node.target, ast.Name):
             self._record_load_name(node.target.id)
@@ -414,6 +424,7 @@ class _ScopeVisitor(ast.NodeVisitor):
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         if node.value is not None:
+            self._check_yield_assignment(node.value)
             self.visit(node.value)
             if isinstance(node.target, ast.Name):
                 self._record_store_name(node.target.id)
@@ -421,6 +432,7 @@ class _ScopeVisitor(ast.NodeVisitor):
                 self.visit(node.target)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self._check_yield_assignment(node.value)
         self.visit(node.value)
         if isinstance(node.target, ast.Name):
             target_id = node.target.id
@@ -1193,6 +1205,7 @@ def _inspect_unit_scope(
         "control_flow_hazards": [],
         "is_control_flow_safe": True,
         "has_yield": False,
+        "has_yield_assignment": False,
         "has_return": False,
         "has_return_value": False,
         "has_super": False,
@@ -1420,6 +1433,7 @@ def _inspect_unit_scope(
         "control_flow_hazards": hazards,
         "is_control_flow_safe": is_control_flow_safe,
         "has_yield": visitor.has_yield,
+        "has_yield_assignment": visitor.has_yield_assignment,
         "has_return": visitor.has_return,
         "has_return_value": visitor.has_return_value,
         "has_super": visitor.has_super,
@@ -1482,6 +1496,10 @@ def analyze_unit_variable_scope(
         hazards = list(dict.fromkeys(info1["control_flow_hazards"] + info2["control_flow_hazards"]))
         is_safe = info1["is_control_flow_safe"] and info2["is_control_flow_safe"]
         has_yield = info1["has_yield"] or info2["has_yield"]
+        has_yield_assignment = bool(
+            info1.get("has_yield_assignment", False)
+            or info2.get("has_yield_assignment", False)
+        )
         has_return = info1["has_return"] or info2["has_return"]
         has_return_value = bool(info1.get("has_return_value") or info2.get("has_return_value"))
         has_super = bool(info1.get("has_super", False) or info2.get("has_super", False))
@@ -1508,6 +1526,7 @@ def analyze_unit_variable_scope(
         hazards = info1["control_flow_hazards"]
         is_safe = info1["is_control_flow_safe"]
         has_yield = info1["has_yield"]
+        has_yield_assignment = bool(info1.get("has_yield_assignment", False))
         has_return = info1["has_return"]
         has_return_value = bool(info1.get("has_return_value"))
         has_super = bool(info1.get("has_super", False))
@@ -1550,6 +1569,7 @@ def analyze_unit_variable_scope(
         "control_flow_hazards": hazards,
         "is_control_flow_safe": is_safe,
         "has_yield": has_yield,
+        "has_yield_assignment": has_yield_assignment,
         "has_return": has_return,
         "has_return_value": has_return_value,
         "has_super": has_super,
@@ -1583,9 +1603,15 @@ def dispatch_analyze_unit_variable_scope(
     """Dispatches analyze_unit_variable_scope, honoring active mock patches on pydoppelgangerhunt.fixer."""
     pkg = sys.modules.get("pydoppelgangerhunt.fixer")
     target = getattr(pkg, "analyze_unit_variable_scope", analyze_unit_variable_scope)
+    supports_trees = False
     try:
+        sig = inspect.signature(target)
+        supports_trees = "tree1" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+    except (ValueError, TypeError):
+        supports_trees = True
+
+    if supports_trees:
         return target(u1, u2=u2, repo_root=repo_root, tree1=tree1, tree2=tree2)
-    except TypeError as exc:
-        if "tree1" in str(exc) or "unexpected keyword" in str(exc):
-            return target(u1, u2=u2, repo_root=repo_root)
-        raise
+    return target(u1, u2=u2, repo_root=repo_root)

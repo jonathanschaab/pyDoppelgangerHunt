@@ -313,8 +313,8 @@ def _format_unit_desc(u: UnitDict) -> Tuple[str, int, int, str]:
     if not isinstance(u, dict):
         raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
     n = str(u.get("name") or "unit")
-    s = parse_unit_coord(u, "start", default=1)
-    e = parse_unit_coord(u, "end", default=s)
+    s = max(1, parse_unit_coord(u, "start", default=1))
+    e = max(s, parse_unit_coord(u, "end", default=s))
     f = normalize_path_string(str(u.get("file") or ""), strip_anchor=False) or "<module>"
     return n, s, e, f
 
@@ -515,8 +515,8 @@ def _build_whole_method_delegation(
 ) -> str:
     """Builds a delegated method replacement body preserving method signature and docstring."""
     lines = split_source_lines(source_text)
-    u_start = parse_unit_coord(unit, "start", default=1)
-    u_end = parse_unit_coord(unit, "end", default=max(u_start, len(lines)))
+    u_start = max(1, parse_unit_coord(unit, "start", default=1))
+    u_end = max(u_start, parse_unit_coord(unit, "end", default=max(u_start, len(lines))))
 
     lead = lines[u_start - 1] if 1 <= u_start <= len(lines) else ""
     indent = lead[: len(lead) - len(lead.lstrip())]
@@ -659,7 +659,7 @@ def _build_unit_delegation_call(
     step: Optional[str] = None,
 ) -> str:
     """Constructs replacement delegation call statement for a clone unit in refactoring patches."""
-    u_start = parse_unit_coord(target_unit, "start", default=1)
+    u_start = max(1, parse_unit_coord(target_unit, "start", default=1))
     lead = orig_lines[u_start - 1] if 1 <= u_start <= len(orig_lines) else ""
     indent = lead[: len(lead) - len(lead.lstrip())]
 
@@ -895,8 +895,8 @@ def _compute_replacement_line_deltas(
         if not isinstance(u, dict):
             raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
         try:
-            fallback = parse_unit_coord(u, "start", default=1)
-            end_l = parse_unit_coord(u, "end", default=fallback)
+            fallback = max(1, parse_unit_coord(u, "start", default=1))
+            end_l = max(fallback, parse_unit_coord(u, "end", default=fallback))
         except (ValueError, TypeError) as err:
             raise ValueError(f"Malformed unit: invalid line boundary in {u.get('file', '')}: {err}") from err
         item = resolve_unit_replacement(
@@ -991,7 +991,7 @@ def _derive_unit_indent_step(
     """Derives indentation step for a unit from its starting line indentation if not provided."""
     if step is not None:
         return step
-    u_s = parse_unit_coord(unit, "start", default=1)
+    u_s = max(1, parse_unit_coord(unit, "start", default=1))
     u_lead = lines[u_s - 1] if 1 <= u_s <= len(lines) else ""
     u_ind = u_lead[: len(u_lead) - len(u_lead.lstrip())]
     return _detect_indent_step(u_ind)
@@ -1231,10 +1231,10 @@ def _render_file_patch_plan(
             u is r
             or (
                 u.get("file") == r.get("file")
-                and parse_unit_coord(u, "start", default=1)
-                == parse_unit_coord(r, "start", default=1)
-                and parse_unit_coord(u, "end", default=1)
-                == parse_unit_coord(r, "end", default=1)
+                and max(1, parse_unit_coord(u, "start", default=1))
+                == max(1, parse_unit_coord(r, "start", default=1))
+                and max(1, parse_unit_coord(u, "end", default=1))
+                == max(1, parse_unit_coord(r, "end", default=1))
             )
             for r in retained_cands
         ):
@@ -2636,6 +2636,8 @@ def generate_refactoring_patch(
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
     )
+    if effective_skip_closures:
+        logger.info("Generating patches in lenient closure strictness mode")
     graph_holder: List[Optional[ModuleDependencyGraph]] = [
         depgraph.copy() if depgraph is not None else None
     ]
@@ -2780,7 +2782,11 @@ def generate_refactoring_patch(
                 and enc1["name"] == enc2["name"]
                 and enc1["start"] == enc2["start"]
             )
-            f2_text = f2_plan.orig_text if f2_plan is not None else f1_plan.orig_text
+            f2_text = (
+                f2_plan.orig_text
+                if f2_plan is not None
+                else (f1_plan.orig_text if is_same_file else "")
+            )
 
             orig_fn1 = fn1
             orig_fn2 = fn2
@@ -2815,7 +2821,11 @@ def generate_refactoring_patch(
                 is_static = bool((fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static")))
 
             tree1 = f1_plan.parsed_tree
-            tree2 = f2_plan.parsed_tree if f2_plan is not None else tree1
+            tree2 = (
+                f2_plan.parsed_tree
+                if f2_plan is not None
+                else (tree1 if is_same_file else None)
+            )
             # Analyze each unit's scope individually.
             # Each unit occupies positional slot u1, so tree1 supplies its corresponding AST.
             s1 = analyze_unit_variable_scope(u1_eff, repo_root=str(root), tree1=tree1)
@@ -3113,7 +3123,7 @@ def generate_refactoring_patch(
                 candidate_units.append(u2)
 
             def _unit_start(u: Dict[str, Any]) -> int:
-                return parse_unit_coord(u, "start", default=1)
+                return max(1, parse_unit_coord(u, "start", default=1))
 
             earliest_unit = min(candidate_units, key=_unit_start)
             enc_fn_earliest = (

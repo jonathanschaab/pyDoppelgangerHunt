@@ -201,6 +201,7 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         "--closure-strictness",
         type=str,
         default=None,
+        choices=["strict", "lenient", "fail_closed", "fast", "skip"],
         help=(
             "Closure strictness ('strict' or 'lenient'; "
             "takes precedence over --skip-pre-unit-closures)"
@@ -662,8 +663,8 @@ def _render_text_violations(
             )
             for m in fam.get("members", []):
                 m_file = normalize_path_string(str(m.get("file") or ""), strip_anchor=False)
-                m_start = parse_unit_coord(m, "start", default=1)
-                m_end = parse_unit_coord(m, "end", default=m_start)
+                m_start = max(1, parse_unit_coord(m, "start", default=1))
+                m_end = max(m_start, parse_unit_coord(m, "end", default=m_start))
                 m_name = str(m.get("name") or "member")
                 m_tag = " [medoid]" if medoid_name and m_name == medoid_name else ""
                 m_line = f"      - {m_file}:{m_start}-{m_end} ({m_name}){m_tag}"
@@ -704,10 +705,10 @@ def _render_text_violations(
                 prefix = f"  * {sim_badge} {p_badge}"
             f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
             f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
-            s1 = parse_unit_coord(u1, "start", default=1)
-            e1 = parse_unit_coord(u1, "end", default=s1)
-            s2 = parse_unit_coord(u2, "start", default=1)
-            e2 = parse_unit_coord(u2, "end", default=s2)
+            s1 = max(1, parse_unit_coord(u1, "start", default=1))
+            e1 = max(s1, parse_unit_coord(u1, "end", default=s1))
+            s2 = max(1, parse_unit_coord(u2, "start", default=1))
+            e2 = max(s2, parse_unit_coord(u2, "end", default=s2))
             n1 = str(u1.get("name") or "unit1")
             n2 = str(u2.get("name") or "unit2")
             line = f"{prefix} {f1}:{s1}-{e1} ({n1}) <===> {f2}:{s2}-{e2} ({n2})"
@@ -1127,10 +1128,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cli_strictness = tool_cfg.get("closure_strictness")
         cli_skip = bool(tool_cfg.get("skip_pre_unit_closures", False))
 
+    if cli_strictness is not None and str(cli_strictness).strip().lower() not in (
+        "strict", "lenient", "fail_closed", "fast", "skip"
+    ):
+        parser.error(
+            f"invalid closure_strictness configuration: {cli_strictness!r} "
+            "(choose from 'strict', 'lenient')"
+        )
+
     closure_strictness, skip_pre_unit_closures = resolve_closure_strictness_mode(
         closure_strictness=cli_strictness,
         skip_pre_unit_closures=cli_skip,
     )
+    if skip_pre_unit_closures:
+        logger.info(
+            "Lenient closure mode active; skipping pre-unit closure scan during refactoring"
+        )
 
     baseline_path = args.baseline or tool_cfg.get("baseline")
     preloaded_baseline: Optional[BaselineFingerprints] = None

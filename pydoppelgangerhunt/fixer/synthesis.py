@@ -404,6 +404,7 @@ def _infer_helper_return_type(
             return resolved_ret
 
         inferred_yield_type = None
+        inferred_send_type = None
         inferred_gen_ret_type = None
         if (
             resolved_ret.startswith(("Iterator[", "Iterable[", "Generator["))
@@ -412,6 +413,9 @@ def _infer_helper_return_type(
             inner_parts = _split_type_args(resolved_ret)
             if inner_parts:
                 inferred_yield_type = inner_parts[0]
+            if resolved_ret.startswith("Generator[") and len(inner_parts) >= 2:
+                if inner_parts[1] not in ("None", "Any"):
+                    inferred_send_type = inner_parts[1]
             if resolved_ret.startswith("Generator[") and len(inner_parts) >= 3:
                 inferred_gen_ret_type = inner_parts[2]
 
@@ -474,9 +478,13 @@ def _infer_helper_return_type(
                 and scope.get("has_return_value")
                 else ("Any" if (scope.get("has_return_value") or helper_outputs) else None)
             )
+            send_t = (
+                inferred_send_type
+                or ("Any" if scope.get("has_yield_assignment") else "None")
+            )
             ret_t = outputs_ret or fallback_ret
             if ret_t:
-                return f"Generator[{yield_t}, None, {ret_t}]"
+                return f"Generator[{yield_t}, {send_t}, {ret_t}]"
             return f"Iterator[{yield_t}]"
 
         return f"AsyncIterator[{yield_t}]"

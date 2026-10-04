@@ -261,12 +261,16 @@ strict fail-closed safety invariants:
   termination (`gen.close()`, `throw()`, or an exception) causes `yield from` to exit abruptly
   without returning, bypassing assignment to output variables (e.g. `total = (yield from ...)`
   never assigns `total`), leaving exception/cleanup handlers with unassigned or stale values.
-- **Dynamic Scope & Evaluation Caveats**: Static analysis tracks lexical scopes, closures, lambdas,
-  and generator expressions. Dynamic constructs downstream or within the unit such as `eval()`,
-  `exec()`, `locals()`, or `vars()` cannot be inspected statically and fall outside static liveness
-  guarantees.
+  Similarly, swallowing `except` handlers that fall through to downstream post-`try` reads are
+  rejected to ensure unassigned outputs are never accessed.
+- **Module-Level Units & Global Scope**: Intra-file AST analysis analyzes downstream variable
+  reads within the local module file. For module-level units, variables defined within the unit
+  are module-level globals that may be imported or referenced by external files; the intra-file
+  analyzer cannot inspect external package consumers. Ensure module-level refactorings do not
+  alter globals exported as public module API.
 - **Coordinate Clamping**: Coordinates accept integer or colon format (`"start:end"` or
-  `"line:col"`), with line numbers clamped to at least line 1 and end clamped to at least start.
+  `"line:col"`), with line numbers clamped to at least line 1 and end clamped to at least start
+  across all CLI reports, JSON/SARIF exports, clustering, git diff, and matcher deduplication.
 - **Definite Assignment Verification**: Synthesized helper return values and tuple-unpacked
   subroutine outputs require definite assignments along all incoming and internal execution
   paths. If an output variable could remain unassigned before helper exit, refactoring is

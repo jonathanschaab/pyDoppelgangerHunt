@@ -8,13 +8,12 @@ from collections import OrderedDict
 from enum import Enum
 import hashlib
 import logging
-from pathlib import Path
 import threading
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
-from pydoppelgangerhunt.config import normalize_path_string
 from pydoppelgangerhunt.fixer.source import (
     _find_innermost_enclosing_node,
+    _resolve_safe_unit_file_path,
     parse_unit_coord,
 )
 
@@ -37,40 +36,39 @@ def _load_unit_file_text(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
 ) -> Optional[str]:
-    """Reads source text from disk or unit dictionary for a unit."""
+    """Reads full source text from memory or disk for downstream AST read analysis."""
+    is_sliced = unit.get("source_lines_is_sliced")
+    if is_sliced is True:
+        return None
+
+    s_d = max(1, parse_unit_coord(unit, "start", default=1))
+    e_d = max(s_d, parse_unit_coord(unit, "end", default=s_d))
+
     source_text = unit.get("source_text")
     if source_text is None:
         source_text = unit.get("file_source")
     if source_text is not None:
         return str(source_text)
-    f_raw = normalize_path_string(str(unit.get("file") or ""), strip_anchor=True)
-    if f_raw:
-        p = Path(f_raw)
-        if p.is_absolute():
-            f_path = p
-        elif repo_root:
-            cand = Path(repo_root) / p
-            f_path = cand if cand.is_file() else p
-        else:
-            f_path = p
-        if f_path.is_file():
-            try:
-                with open(f_path, "r", encoding="utf-8", errors="replace") as fh:
-                    return fh.read()
-            except OSError:
-                pass
+
+    s_d = max(1, parse_unit_coord(unit, "start", default=1))
+    e_d = max(s_d, parse_unit_coord(unit, "end", default=s_d))
+
     if "source_lines" in unit and isinstance(unit["source_lines"], (list, tuple)):
-        is_sliced = unit.get("source_lines_is_sliced")
-        if is_sliced is True:
-            return None
-        if is_sliced is False:
+        if is_sliced is False or len(unit["source_lines"]) > e_d:
             return "".join(unit["source_lines"])
-        s_d = parse_unit_coord(unit, "start", default=1)
-        e_d = parse_unit_coord(unit, "end", default=s_d)
-        num_lines = len(unit["source_lines"])
-        if num_lines < e_d or num_lines == (e_d - s_d + 1):
-            return None
-        return "".join(unit["source_lines"])
+
+    # Disk fallback: strictly only .py files within repo_root or CWD are accepted.
+    # Notebooks (.ipynb) and out-of-root files fail closed and return None.
+    resolved_file = _resolve_safe_unit_file_path(
+        unit, repo_root=repo_root, allowed_suffixes=(".py",)
+    )
+    if resolved_file is not None:
+        try:
+            with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except OSError:
+            pass
+
     return None
 
 
@@ -1069,13 +1067,46 @@ def _find_enclosing_loops(
     return loops
 
 
+def _stmt_definitely_terminates(stmt: ast.stmt) -> bool:
+    """Checks whether an AST statement unconditionally exits execution."""
+    if isinstance(stmt, (ast.Return, ast.Raise)):
+        return True
+    if isinstance(stmt, ast.If):
+        return (
+            bool(stmt.orelse)
+            and _block_definitely_terminates(stmt.body)
+            and _block_definitely_terminates(stmt.orelse)
+        )
+    if isinstance(stmt, ast.Try):
+        if stmt.finalbody and _block_definitely_terminates(stmt.finalbody):
+            return True
+        if stmt.handlers and _block_definitely_terminates(stmt.body):
+            return all(_block_definitely_terminates(h.body) for h in stmt.handlers)
+    try_star = getattr(ast, "TryStar", None)
+    if try_star is not None and isinstance(stmt, try_star):
+        finalbody = getattr(stmt, "finalbody", None)
+        if finalbody and _block_definitely_terminates(finalbody):
+            return True
+        handlers = getattr(stmt, "handlers", [])
+        body = getattr(stmt, "body", [])
+        if handlers and _block_definitely_terminates(body):
+            return all(_block_definitely_terminates(h.body) for h in handlers)
+    return False
+
+
+def _block_definitely_terminates(stmts: Sequence[ast.stmt]) -> bool:
+    """Checks whether any statement in a sequence unconditionally terminates execution."""
+    return any(_stmt_definitely_terminates(s) for s in stmts)
+
+
 def _enclosing_try_reads_outputs(
     scope_node: Optional[ast.AST],
     u_start: int,
     u_end: int,
     outputs: Set[str],
 ) -> bool:
-    """Returns True if unit is inside an enclosing try whose handlers/finally read outputs."""
+    """Returns True if unit is inside an enclosing try whose handlers/finally read outputs,
+    or whose handlers can fall through and outputs are read downstream of the try."""
     if scope_node is None or not outputs:
         return False
     for node in ast.walk(scope_node):
@@ -1104,6 +1135,27 @@ def _enclosing_try_reads_outputs(
                             and sub.id in outputs
                         ):
                             return True
+
+                # If any handler can fall through (e.g. swallows GeneratorExit or exceptions
+                # without re-raising or returning), check if any needed output is read
+                # downstream of the enclosing try block.
+                handlers = getattr(node, "handlers", [])
+                if handlers and any(
+                    not _block_definitely_terminates(h.body) for h in handlers
+                ):
+                    try_end_raw = getattr(node, "end_lineno", None)
+                    t_end = try_end_raw if isinstance(try_end_raw, int) else b_end
+                    post_try_visitor = _DownstreamReadVisitor(
+                        t_end,
+                        t_end,
+                        None,
+                        candidates=outputs,
+                        pass_mode=_VisitorPassMode.AFTER_UNIT,
+                    )
+                    for stmt in getattr(scope_node, "body", []):
+                        post_try_visitor.visit(stmt)
+                    if post_try_visitor.loaded & outputs:
+                        return True
     return False
 
 
@@ -1229,21 +1281,27 @@ def _pair_clone_outputs(
     """Establishes an ordered 1-to-1 mapping between clone output variables."""
     u1_dedup = list(dict.fromkeys(u1_outs))
     u2_dedup = list(dict.fromkeys(u2_outs))
-    if len(u1_dedup) == len(u2_dedup):
-        common = set(u1_dedup) & set(u2_dedup)
-        # Fail closed if any common variable occupies different positional indices
-        if any(u1_dedup.index(name) != u2_dedup.index(name) for name in common):
-            logger.debug(
-                "Rejecting clone output pairing: common variables have conflicting "
-                "positional orderings (%s vs %s)",
-                u1_dedup,
-                u2_dedup,
-            )
-            return []
-        # True 1-to-1 positional pairing
-        return list(zip(u1_dedup, u2_dedup))
-    common_names = [o for o in u1_dedup if o in u2_dedup]
-    return [(o, o) for o in common_names]
+    if len(u1_dedup) != len(u2_dedup):
+        logger.debug(
+            "Rejecting clone output pairing: output arities differ (%d vs %d: %s vs %s)",
+            len(u1_dedup),
+            len(u2_dedup),
+            u1_dedup,
+            u2_dedup,
+        )
+        return []
+    common = set(u1_dedup) & set(u2_dedup)
+    # Fail closed if any common variable occupies different positional indices
+    if any(u1_dedup.index(name) != u2_dedup.index(name) for name in common):
+        logger.debug(
+            "Rejecting clone output pairing: common variables have conflicting "
+            "positional orderings (%s vs %s)",
+            u1_dedup,
+            u2_dedup,
+        )
+        return []
+    # True 1-to-1 positional pairing
+    return list(zip(u1_dedup, u2_dedup))
 
 
 def _filter_valid_output_pairs(
@@ -1289,16 +1347,8 @@ def resolve_generator_subroutine_outputs(
     u1_def = side1.definite
     u2_def = side2.definite
 
-    d1_needed = (
-        d1_raw
-        if d1_raw is not None
-        else (set(outs1) & u1_def if u1_def is not None else set(outs1))
-    )
-    d2_needed = (
-        d2_raw
-        if d2_raw is not None
-        else (set(outs2) & u2_def if u2_def is not None else set(outs2))
-    )
+    d1_needed = d1_raw if d1_raw is not None else set(outs1)
+    d2_needed = d2_raw if d2_raw is not None else set(outs2)
 
     needed1 = [o for o in outs1 if o in d1_needed]
     needed2 = [o for o in outs2 if o in d2_needed]

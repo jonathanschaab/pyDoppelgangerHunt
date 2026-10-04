@@ -922,5 +922,3 @@ def test_reports_with_colon_formatted_line_coordinates(tmp_path: Path) -> None:
     # 5. HTML report
     html_rep = generate_html_report(clones, target=str(tmp_path), threshold=0.8, families=[fam])
     assert "1-2" in html_rep
-
-

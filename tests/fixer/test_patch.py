@@ -6416,6 +6416,9 @@ def test_is_valid_unit_coordinates_scenarios() -> None:
         {"start": 1, "end": 5, "end_col": {}},
         {"start": ""},
         {"start": 1, "end": 5, "start_col": ""},
+        {"start": float("inf"), "end": 5},
+        {"start": "inf", "end": 5},
+        {"start": 1, "end": float("nan")},
     ]
     for tc in test_cases:
         expected = is_valid_unit_coordinates(tc)
@@ -8924,6 +8927,47 @@ def test_generator_subroutine_enclosing_try_finally_read_rejected(tmp_path: Path
     assert cleanup_seen == [0]
 
 
+def test_generator_subroutine_enclosing_try_swallowing_handler_post_try_read_rejected(
+    tmp_path: Path,
+) -> None:
+    """Verifies that generator subroutine extraction is rejected when the unit is lexically
+    inside a try block whose handler can fall through and a needed output is read post-try."""
+    src1 = (
+        "def g1(items):\n"
+        "    try:\n"
+        "        total = 0\n"
+        "        for x in items:\n"
+        "            yield x\n"
+        "            total += x\n"
+        "    except GeneratorExit:\n"
+        "        pass\n"
+        "    print(total)\n"
+    )
+    src2 = (
+        "def g2(items):\n"
+        "    try:\n"
+        "        total = 0\n"
+        "        for y in items:\n"
+        "            yield y\n"
+        "            total += y\n"
+        "    except GeneratorExit:\n"
+        "        pass\n"
+        "    print(total)\n"
+    )
+    f1 = tmp_path / "g1_swallow.py"
+    f2 = tmp_path / "g2_swallow.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 3, "end": 6, "name": "g1:block", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 3, "end": 6, "name": "g2:block", "kind": "compound_block"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch == ""
+
+
 def test_pre_unit_generator_expression_lazy_read_captured(tmp_path: Path) -> None:
     """Verifies that pre-unit lazy generator expressions capturing unit variables fail closed."""
     src1 = (
@@ -9029,6 +9073,3 @@ def test_load_unit_file_text_truncated_at_start_line_fails_closed() -> None:
     # When explicitly marked not sliced, it returns the content
     unit_full = dict(unit, source_lines_is_sliced=False)
     assert _load_unit_file_text(unit_full) == "x = 1\ny = 2\nz = 3\n"
-
-
-

@@ -9,16 +9,15 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.config import normalize_path_string, paths_match_boundary
-from pydoppelgangerhunt.parser import is_decorator_named
 from pydoppelgangerhunt.fixer.dataflow import (
     GeneratorCloneSideData,
+    _load_unit_file_text,
     collect_downstream_read_names,
     is_async_generator_with_return_value,
     is_subroutine_unit,
     resolve_clone_generator_subroutine_outputs,
     resolve_closure_strictness_mode,
     resolve_generator_subroutine_outputs,
-    _load_unit_file_text,
 )
 from pydoppelgangerhunt.fixer.scope import (
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
@@ -27,9 +26,23 @@ from pydoppelgangerhunt.fixer.source import (
     _find_innermost_enclosing_node,
     split_source_lines,
 )
+from pydoppelgangerhunt.parser import is_decorator_named
 
 __all__ = [
     "GeneratorCloneSideData",
+    "_base_unit_name",
+    "_extract_child_indentation",
+    "_find_innermost_enclosing_node",
+    "_get_enclosing_receiver_kind",
+    "_has_receiver_reference",
+    "_inspect_enclosing_node",
+    "_is_method_of_class",
+    "_is_same_file_path",
+    "_load_unit_file_text",
+    "_normalize_file_path",
+    "_populate_unit_receiver_metadata",
+    "_prune_unshared_receivers",
+    "_resolve_effective_binding",
     "analyze_unit_variable_scope",
     "collect_downstream_read_names",
     "find_enclosing_class",
