@@ -1082,8 +1082,7 @@ def _stmt_definitely_terminates(stmt: ast.stmt) -> bool:
             return True
         if stmt.handlers and _block_definitely_terminates(stmt.body):
             return all(_block_definitely_terminates(h.body) for h in stmt.handlers)
-    try_star = getattr(ast, "TryStar", None)
-    if try_star is not None and isinstance(stmt, try_star):
+    if type(stmt).__name__ == "TryStar":
         finalbody = getattr(stmt, "finalbody", None)
         if finalbody and _block_definitely_terminates(finalbody):
             return True
