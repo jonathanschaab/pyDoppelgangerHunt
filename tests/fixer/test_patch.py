@@ -8968,6 +8968,53 @@ def test_pre_unit_generator_expression_lazy_read_captured(tmp_path: Path) -> Non
     assert patch_lenient != ""
 
 
+def test_pre_unit_class_generator_expression_lazy_read_captured(tmp_path: Path) -> None:
+    """Verifies that pre-unit class-body generator expressions capturing unit
+    variables fail closed."""
+    src1 = (
+        "def g1(items: list[int]):\n"
+        "    class C:\n"
+        "        gen = (extra for _ in items)\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "        extra = x\n"
+        "    return 0\n"
+    )
+    src2 = (
+        "def g2(items: list[int]):\n"
+        "    for y in items:\n"
+        "        yield y\n"
+        "        extra = y\n"
+        "    return 0\n"
+    )
+    f1 = tmp_path / "g1.py"
+    f2 = tmp_path / "g2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 4, "end": 6, "name": "g1:block", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 4, "name": "g2:block", "kind": "compound_block"}
+
+    # In strict mode (default), class genexp capturing 'extra' causes rejection
+    patch_strict = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        closure_strictness="strict",
+    )
+    assert patch_strict == ""
+
+    # In lenient mode, pre-unit closures are bypassed
+    patch_lenient = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        closure_strictness="lenient",
+    )
+    assert patch_lenient != ""
+
+
+
 def test_load_unit_file_text_truncated_at_start_line_fails_closed() -> None:
     """Verifies that _load_unit_file_text returns None when source_lines has ambiguous length."""
     unit = {

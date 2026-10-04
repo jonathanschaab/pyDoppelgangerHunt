@@ -429,8 +429,9 @@ def _infer_helper_return_type(
                 if kind == "yield_from":
                     for prefix in (
                         "Iterator[", "Iterable[", "List[", "Sequence[", "Set[",
-                        "Tuple[", "Dict[", "Collection[", "list[", "set[",
-                        "tuple[", "dict[", "sequence[", "iterable[", "iterator[",
+                        "Tuple[", "Dict[", "Collection[", "Mapping[", "list[",
+                        "set[", "tuple[", "dict[", "sequence[", "iterable[",
+                        "iterator[", "mapping[",
                     ):
                         if m_t.startswith(prefix) and m_t.endswith("]"):
                             parts = _split_type_args(m_t)

@@ -959,7 +959,13 @@ def _collect_pre_unit_closures(
             if isinstance(stmt, ast.ClassDef):
                 for item in ast.walk(stmt):
                     if item is not stmt and isinstance(
-                        item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+                        item,
+                        (
+                            ast.FunctionDef,
+                            ast.AsyncFunctionDef,
+                            ast.Lambda,
+                            ast.GeneratorExp,
+                        ),
                     ):
                         item_start = getattr(item, "lineno", stmt_start)
                         if item_start < u_start:

@@ -3260,6 +3260,23 @@ def test_infer_helper_return_type_yield_from_dict_keys() -> None:
     assert ret == "Iterator[str]"
 
 
+def test_infer_helper_return_type_yield_from_mapping_keys() -> None:
+    """Verifies that yield from on a Mapping/mapping type infers Iterator[KeyType]."""
+    scope = {"has_yield": True, "yield_expr_names": [("yield_from", "mapping")]}
+    meta1 = {"mapping": {"type": "Mapping[str, int]"}}
+    meta2 = {"mapping": {"type": "mapping[str, int]"}}
+    ret = _infer_helper_return_type(
+        "Any",
+        [],
+        set(),
+        scope,
+        meta1,
+        meta2,
+    )
+    assert ret == "Iterator[str]"
+
+
+
 def test_synthesize_shared_helper_code_unpaired_output_fallback_aligned(
     tmp_path: Path,
 ) -> None:
@@ -3588,8 +3605,13 @@ def test_parse_unit_coord_overload_and_default_none() -> None:
     assert parse_unit_coord({"col": ":0"}, "col", default=1) == 1
     assert parse_unit_coord({"col": 42}, "col", default=None) == 42
     assert parse_unit_coord({"col": "42:0"}, "col", default=None) == 42
+    assert parse_unit_coord({"col": "42.0"}, "col") == 42
+    assert parse_unit_coord({"col": "42.0:0"}, "col") == 42
+    assert parse_unit_coord({"col": 42.0}, "col") == 42
     assert parse_unit_coord({"col": 42}, "col") == 42
     assert parse_unit_coord({}, "col", default=10) == 10
+    with pytest.raises(ValueError):
+        parse_unit_coord({"col": "invalid"}, "col")
 
 
 def test_module_level_unit_prior_function_free_reads() -> None:

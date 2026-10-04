@@ -57,6 +57,10 @@ def parse_unit_coord(
         val = val.split(":", 1)[0].strip()
         if not val:
             return default
+        try:
+            return int(val)
+        except ValueError:
+            return int(float(val))
     return int(val)
 
 

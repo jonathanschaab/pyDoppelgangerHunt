@@ -17,8 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guarding against silent data loss on abnormal exit (`gen.close()`, `.throw()`, or loop-body
   exceptions) where `yield from` exits abruptly without assigning to call-site target outputs.
 - **Pre-Unit Generator Expression Capture**: Extended `_collect_pre_unit_closures` and
-  `_extract_nested_scope_free_reads` to inspect `ast.GeneratorExp` in addition to `def`,
-  `class`, and `lambda`, capturing lazy variable evaluations fail-closed.
+  `_extract_nested_scope_free_reads` to inspect `ast.GeneratorExp` in statements and within
+  `ClassDef` bodies in addition to `def`, `class`, and `lambda`, capturing lazy variable
+  evaluations fail-closed.
+- **Mapping Container Type Inference**: Added support for `Mapping[...]` and `mapping[...]`
+  container prefixes in `yield from` type unwrapping, inferring the iterated key type.
+- **Stringified Float Coordinate Support**: Extended `parse_unit_coord` to parse stringified
+  floating-point coordinate strings (e.g. `"12.0"` or `"12.0:0"`) safely without raising
+  ValueError.
 - **Forward Reference Quote Tracking**: Enhanced `_split_type_args` to track single and double
   quotes alongside bracket depth, preventing commas within literal strings from splitting
   type arguments.
@@ -48,7 +54,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subroutine units (blocks, sliding windows, clause branches) and whole functions/methods
   within refactoring patch and helper synthesis.
 - **Coordinate Clamping**: Clamped start coordinates to minimum line 1 and end coordinates
-  to at least start across `reporters.py`, `coverage.py`, and `clustering.py`.
+  to at least start across `reporters.py`, `coverage.py`, `clustering.py`, and `git_diff.py`
+  (guarding against `git blame -L 0,0` CLI failures).
 - **Synthetic Wrapper Sentinel**: Switched subroutine synthetic wrappers to `__pdh_wrapper__`
   and guarded against flattening user functions named `_wrapper`.
 - **Helper Return Type Inference**: Standardized `_infer_helper_return_type` signature to use

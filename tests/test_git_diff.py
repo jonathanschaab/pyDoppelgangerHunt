@@ -1496,3 +1496,29 @@ def test_apply_baseline_and_diff_filters_adapts_past_initial_untouched_clones(
             assert len(filtered) == 1
             assert filtered[0][1]["file"] == "foo.py"
             assert any("using unit_basis='target'" in record.message for record in caplog.records)
+
+
+def test_git_diff_zero_and_colon_coordinates_clamped(tmp_path: Path) -> None:
+    """Verifies that compute_unit_diff_overlap and check_temporal_divergence defensively
+    clamp zero or falsy coordinates to line 1 to avoid git blame -L 0,0 fatal errors."""
+    from pydoppelgangerhunt.git_diff import (  # pylint: disable=import-outside-toplevel
+        compute_unit_diff_overlap,
+    )
+
+    unit = {"file": "mod.py", "start": 0, "end": 0}
+    modified_ranges = {"mod.py": [(1, 5)]}
+    count, ratio = compute_unit_diff_overlap(unit, modified_ranges)
+    # Start/end clamped to 1, overlapping line 1 (1 line)
+    assert count == 1
+    assert ratio == 1.0
+
+    u1 = {"file": "a.py", "start": "0:0", "end": "0:0"}
+    u2 = {"file": "b.py", "start": 0, "end": 0}
+    with mock.patch("pydoppelgangerhunt.git_diff.get_git_blame_info") as mock_blame:
+        mock_blame.return_value = {"timestamp": 100, "author": "dev"}
+        check_temporal_divergence(u1, u2, repo_root=str(tmp_path))
+        # Both blame calls must be invoked with start >= 1 and end >= start
+        assert mock_blame.call_count == 2
+        mock_blame.assert_any_call("a.py", 1, 1, repo_root=str(tmp_path))
+        mock_blame.assert_any_call("b.py", 1, 1, repo_root=str(tmp_path))
+
