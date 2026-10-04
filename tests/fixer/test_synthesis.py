@@ -2718,6 +2718,19 @@ def test_split_type_args_nested_bracket_depth() -> None:
         "Optional[Tuple[float, bool]]",
     ]
 
+    # Forward references and string literals containing commas
+    t3 = "Tuple['Literal, Value', int]"
+    assert _split_type_args(t3) == ["'Literal, Value'", "int"]
+
+    t4 = 'Union[Literal["a, b", "c"], Dict[str, "X, Y"]]'
+    assert _split_type_args(t4) == [
+        'Literal["a, b", "c"]',
+        'Dict[str, "X, Y"]',
+    ]
+
+    t5 = r'Tuple["a\"b, c", int]'
+    assert _split_type_args(t5) == [r'"a\"b, c"', "int"]
+
     # Inference in _infer_helper_return_type preserving nested tuple yield type
     scope = {
         "has_yield": True,
