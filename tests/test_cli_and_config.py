@@ -2662,9 +2662,10 @@ def test_cli_verbose_discarded_calibration_mismatch_advisory(
 
 def test_cli_closure_strictness_and_skip_closures_flags(tmp_path: Path) -> None:
     """Verifies CLI accepts --skip-pre-unit-closures and --closure-strictness flags."""
-    # pylint: disable=import-outside-toplevel
-    from unittest import mock
-    from pydoppelgangerhunt.cli import build_arg_parser, main
+    from pydoppelgangerhunt.cli import (  # pylint: disable=import-outside-toplevel
+        build_arg_parser,
+        main,
+    )
 
     # 1. Test build_arg_parser defaults
     parser = build_arg_parser()

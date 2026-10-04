@@ -49,8 +49,8 @@ def _normalize_unit_file(unit: Dict[str, Any]) -> str:
 def unit_key(unit: Dict[str, Any]) -> str:
     """Generates unique deterministic string key for an AST unit."""
     norm_file = canonical_path_key(str(unit.get("file") or ""), strip_anchor=False)
-    s = parse_unit_coord(unit, "start", default=1)
-    e = parse_unit_coord(unit, "end", default=s)
+    s = max(1, parse_unit_coord(unit, "start", default=1))
+    e = max(s, parse_unit_coord(unit, "end", default=s))
     name = str(unit.get("name") or "unit")
     return f"{norm_file}:{s}-{e}:{name}"
 
@@ -292,7 +292,7 @@ def cluster_clone_families(
         members.sort(
             key=lambda u: (
                 canonical_path_key(str(u.get("file") or ""), strip_anchor=False),
-                parse_unit_coord(u, "start", default=1),
+                max(1, parse_unit_coord(u, "start", default=1)),
             )
         )
         member_set = set(member_keys)
@@ -300,13 +300,12 @@ def cluster_clone_families(
         family_sims = [
             sim for sim, k1, k2 in sorted_pairs if k1 in member_set and k2 in member_set
         ]
-        unique_files = sorted(list({_normalize_unit_file(u) for u in members}))
-        total_lines = sum(
-            parse_unit_coord(u, "end", default=parse_unit_coord(u, "start", default=1))
-            - parse_unit_coord(u, "start", default=1)
-            + 1
-            for u in members
-        )
+        unique_files = sorted(list({_normalize_unit_file(m) for m in members}))
+        total_lines = 0
+        for m_unit in members:
+            u_s = max(1, parse_unit_coord(m_unit, "start", default=1))
+            u_e = max(u_s, parse_unit_coord(m_unit, "end", default=u_s))
+            total_lines += u_e - u_s + 1
         avg_sim = (sum(family_sims) / len(family_sims)) if family_sims else 1.0
         max_sim = max(family_sims) if family_sims else 1.0
         min_sim = min(family_sims) if family_sims else 1.0
@@ -334,7 +333,7 @@ def cluster_clone_families(
             -f["member_count"],
             -round(f["avg_similarity"], 9),
             _normalize_unit_file(f["members"][0]),
-            parse_unit_coord(f["members"][0], "start", default=1),
+            max(1, parse_unit_coord(f["members"][0], "start", default=1)),
             str(f["medoid"].get("name") or "") if isinstance(f.get("medoid"), dict) else "",
         )
     )

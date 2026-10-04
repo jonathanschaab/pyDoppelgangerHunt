@@ -46,8 +46,8 @@ def colorize(text: str, color_code: str, enabled: bool) -> str:
 
 def _unit_line_bounds(unit: Dict[str, Any]) -> Tuple[int, int]:
     """Extracts parsed (start, end) line coordinates from a unit dictionary."""
-    s = parse_unit_coord(unit, "start", default=1)
-    return s, parse_unit_coord(unit, "end", default=s)
+    s = max(1, parse_unit_coord(unit, "start", default=1))
+    return s, max(s, parse_unit_coord(unit, "end", default=s))
 
 
 def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:
@@ -159,7 +159,7 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
             with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
                 all_lines = fh.readlines()
         start = max(1, s_d)
-        end = min(len(all_lines), parse_unit_coord(unit, "end", default=len(all_lines)))
+        end = min(len(all_lines), e_d)
         return all_lines[start - 1 : end]
     except OSError:
         return [f"# Unable to read {str(unit.get('file') or '')}\n"]

@@ -233,28 +233,40 @@ callback tables or event loops, strict mode treats these captured names as live,
 fail-closed safety.
 
 - **Memoization & Cache Invalidation**: Downstream liveness analysis caches AST traversal results
-  in a thread-safe LRU cache keyed by SHA-256 digest prefix, unit line/column coordinates, unit
-  kind and name, candidate outputs, and unit modification timestamp (`mtime`), eliminating duplicate
-  traversals across identical clone boundaries.
+  in a thread-safe LRU cache keyed by SHA-256 source digest prefix, unit line/column coordinates,
+  unit kind and name, candidate outputs, and unit modification timestamp (`mtime`, where available
+  on unit dictionaries; source content digest provides definitive invalidation), eliminating
+  duplicate traversals across identical clone boundaries.
 - **Lenient Mode Bypass**: For large codebases or batch runs where callback-escaping closures are
   known not to occur, pre-unit closure scanning can be bypassed by specifying
   `--closure-strictness lenient` (or `--skip-pre-unit-closures`, or setting
-  `closure_strictness = "lenient"` in `pyproject.toml`). When both CLI flags are supplied,
-  `--closure-strictness` takes precedence over `--skip-pre-unit-closures`.
+  `closure_strictness = "lenient"` / `skip_pre_unit_closures = true` in `pyproject.toml`). When both
+  CLI flags are supplied, `--closure-strictness` takes precedence over `--skip-pre-unit-closures`.
 
 #### Safety Model & Fail-Closed Refactoring Guarantees
 
 When synthesizing refactoring patches and shared helpers, `pyDoppelgangerHunt` enforces
 strict fail-closed safety invariants:
 - **Lexical Scope Containment & Pre-Unit Closure Isolation (Generator Subroutines)**: For generator
-  subroutines, any closures, lambdas, or nested class definitions preceding a candidate unit within
-  the enclosing lexical scope that capture potential output variables are conservatively treated as
-  escaping reads. Even if a closure is not called directly within the unit's immediate block, it may
-  have registered into callback tables or event loops. Candidate outputs captured by pre-unit
-  closures are preserved or cause the pair to fail closed rather than risk silent state corruption.
-  To bypass pre-unit closure scanning when closures are known not to escape, pass
-  `--skip-pre-unit-closures` or `--closure-strictness lenient` (when both are supplied,
+  subroutines, any closures, lambdas, generator expressions, or nested class definitions preceding a
+  candidate unit within the enclosing lexical scope that capture potential output variables are
+  conservatively treated as escaping reads. Even if a closure is not called directly within the
+  unit's immediate block, it may have registered into callback tables or event loops. Candidate
+  outputs captured by pre-unit closures are preserved or cause the pair to fail closed rather than
+  risk silent state corruption. To bypass pre-unit closure scanning when closures are known not to
+  escape, pass `--skip-pre-unit-closures` or `--closure-strictness lenient` (when both are supplied,
   `--closure-strictness` takes precedence).
+- **Abnormal Exit Loss Prevention**: Generator subroutines lexically enclosed in `try` blocks whose
+  `except` or `finally` handlers read needed outputs are rejected. In Python, abnormal generator
+  termination (`gen.close()`, `throw()`, or an exception) causes `yield from` to exit abruptly
+  without returning, bypassing assignment to output variables (e.g. `total = (yield from ...)`
+  never assigns `total`), leaving exception/cleanup handlers with unassigned or stale values.
+- **Dynamic Scope & Evaluation Caveats**: Static analysis tracks lexical scopes, closures, lambdas,
+  and generator expressions. Dynamic constructs downstream or within the unit such as `eval()`,
+  `exec()`, `locals()`, or `vars()` cannot be inspected statically and fall outside static liveness
+  guarantees.
+- **Coordinate Clamping**: Coordinates accept integer or colon format (`"start:end"` or
+  `"line:col"`), with line numbers clamped to at least line 1 and end clamped to at least start.
 - **Definite Assignment Verification**: Synthesized helper return values and tuple-unpacked
   subroutine outputs require definite assignments along all incoming and internal execution
   paths. If an output variable could remain unassigned before helper exit, refactoring is
@@ -271,6 +283,8 @@ If `pyDoppelgangerHunt` reports clones but does not propose extractions for a pa
 with `--patch`, check verbose logs (`-v` or logging level `DEBUG`):
 - **Pre-Unit Closure Escapes**: If candidate outputs are captured by closures or callbacks defined
   prior to the unit, run with `--skip-pre-unit-closures` or `--closure-strictness lenient`.
+- **Abnormal Exit Handlers**: If a generator subroutine is enclosed in a `try` block whose `finally`
+  or `except` handlers read needed outputs, extraction is rejected to protect cleanup integrity.
 - **Indefinite Stores**: If an output variable lacks definite assignment along every internal
   path, the extraction is rejected to protect against runtime `UnboundLocalError`.
 - **Unpaired Outputs**: When duplicate variable names or arity mismatches prevent 1-to-1 output

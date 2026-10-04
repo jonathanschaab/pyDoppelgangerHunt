@@ -29,6 +29,9 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     patch as patch_mod,
     resolve_closure_strictness_mode,
 )
+from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
+    _load_unit_file_text,
+)
 from pydoppelgangerhunt.fixer.depgraph import build_module_graph
 
 requires_git = pytest.mark.skipif(
@@ -8714,7 +8717,7 @@ def test_generate_refactoring_patch_non_generator_mismatched_kinds_rejected(
 def test_generate_refactoring_patch_closure_strictness_knob(tmp_path: Path) -> None:
     """Verifies closure_strictness knob controls pre-unit closure isolation in patch generation."""
     src1 = (
-        "def g1(items: list[int]) -> int:\n"
+        "def g1(items: list[int]):\n"
         "    cb = lambda: extra\n"
         "    for x in items:\n"
         "        yield x\n"
@@ -8722,7 +8725,7 @@ def test_generate_refactoring_patch_closure_strictness_knob(tmp_path: Path) -> N
         "    return 0\n"
     )
     src2 = (
-        "def g2(items: list[int]) -> int:\n"
+        "def g2(items: list[int]):\n"
         "    for y in items:\n"
         "        yield y\n"
         "        extra = y\n"
@@ -8864,5 +8867,121 @@ def test_generate_refactoring_patch_replace_clones_false_emits_helper_with_diffe
         [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=False
     )
     assert "def _shared_run1_run2" in patch_preview
+
+
+def test_generator_subroutine_enclosing_try_finally_read_rejected(tmp_path: Path) -> None:
+    """Verifies that generator subroutine extraction is rejected when the unit is lexically
+    inside a try block whose finally reads a needed output, guarding against abnormal exit loss."""
+    src1 = (
+        "def g1(items):\n"
+        "    try:\n"
+        "        total = 0\n"
+        "        for x in items:\n"
+        "            yield x\n"
+        "            total += x\n"
+        "    finally:\n"
+        "        print(total)\n"
+    )
+    src2 = (
+        "def g2(items):\n"
+        "    try:\n"
+        "        total = 0\n"
+        "        for y in items:\n"
+        "            yield y\n"
+        "            total += y\n"
+        "    finally:\n"
+        "        print(total)\n"
+    )
+    f1 = tmp_path / "g1.py"
+    f2 = tmp_path / "g2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 3, "end": 6, "name": "g1:block", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 3, "end": 6, "name": "g2:block", "kind": "compound_block"}
+
+    # Should be rejected because total is needed and read in enclosing try cleanup
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch == ""
+
+    # Runtime demonstration showing that abnormal exit preserves total in original generator
+    cleanup_seen: List[int] = []
+
+    def original_gen(items: List[int]) -> Any:
+        try:
+            total = 0
+            for item in items:
+                yield item
+                total += item
+        finally:
+            cleanup_seen.append(total)
+
+    gen = original_gen([10, 20, 30])
+    assert next(gen) == 10
+    gen.close()
+    assert cleanup_seen == [0]
+
+
+def test_pre_unit_generator_expression_lazy_read_captured(tmp_path: Path) -> None:
+    """Verifies that pre-unit lazy generator expressions capturing unit variables fail closed."""
+    src1 = (
+        "def g1(items: list[int]):\n"
+        "    g = (extra for _ in items)\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "        extra = x\n"
+        "    return 0\n"
+    )
+    src2 = (
+        "def g2(items: list[int]):\n"
+        "    for y in items:\n"
+        "        yield y\n"
+        "        extra = y\n"
+        "    return 0\n"
+    )
+    f1 = tmp_path / "g1.py"
+    f2 = tmp_path / "g2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 3, "end": 5, "name": "g1:block", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 4, "name": "g2:block", "kind": "compound_block"}
+
+    # In strict mode (default), lazy genexp capturing 'extra' causes rejection
+    patch_strict = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        closure_strictness="strict",
+    )
+    assert patch_strict == ""
+
+    # In lenient mode, pre-unit closures are bypassed
+    patch_lenient = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        closure_strictness="lenient",
+    )
+    assert patch_lenient != ""
+
+
+def test_load_unit_file_text_truncated_at_start_line_fails_closed() -> None:
+    """Verifies that _load_unit_file_text returns None when source_lines has ambiguous length."""
+    unit = {
+        "file": "dummy.py",
+        "start": 1,
+        "end": 3,
+        "source_lines": ["x = 1\n", "y = 2\n", "z = 3\n"],
+    }
+    # source_lines_is_sliced is None and len(source_lines) == (end - start + 1) -> fails closed
+    assert _load_unit_file_text(unit) is None
+
+    # When explicitly marked not sliced, it returns the content
+    unit_full = dict(unit, source_lines_is_sliced=False)
+    assert _load_unit_file_text(unit_full) == "x = 1\ny = 2\nz = 3\n"
+
 
 

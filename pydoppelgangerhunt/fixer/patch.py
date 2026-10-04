@@ -2748,8 +2748,8 @@ def generate_refactoring_patch(
 
             u1_lines = orig_lines
             u2_lines = orig_lines if is_same_file else (f2_plan.orig_lines if f2_plan is not None else [])
-            u1_eff = dict(u1, source_lines=u1_lines)
-            u2_eff = dict(u2, source_lines=u2_lines)
+            u1_eff = dict(u1, source_lines=u1_lines, source_lines_is_sliced=False)
+            u2_eff = dict(u2, source_lines=u2_lines, source_lines_is_sliced=False)
 
             if replace_clones:
                 u1_claimed = any(

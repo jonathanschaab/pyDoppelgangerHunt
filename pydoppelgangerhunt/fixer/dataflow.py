@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 from collections import OrderedDict
 from enum import Enum
 import hashlib
@@ -18,6 +19,8 @@ from pydoppelgangerhunt.fixer.source import (
 )
 
 logger = logging.getLogger(__name__)
+
+_BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
 __all__ = [
     "GeneratorCloneSideData",
@@ -60,9 +63,12 @@ def _load_unit_file_text(
         is_sliced = unit.get("source_lines_is_sliced")
         if is_sliced is True:
             return None
+        if is_sliced is False:
+            return "".join(unit["source_lines"])
         s_d = parse_unit_coord(unit, "start", default=1)
         e_d = parse_unit_coord(unit, "end", default=s_d)
-        if is_sliced is None and len(unit["source_lines"]) == (e_d - s_d + 1) and s_d > 1:
+        num_lines = len(unit["source_lines"])
+        if num_lines < e_d or num_lines == (e_d - s_d + 1):
             return None
         return "".join(unit["source_lines"])
     return None
@@ -513,9 +519,35 @@ class _OuterExprVisitor(_BaseScopeVisitor):
 
 
 def _extract_nested_scope_free_reads(
-    node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef],
+    node: Union[
+        ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.GeneratorExp
+    ],
 ) -> Set[str]:
-    """Extracts free variable references escaping a nested function or executed class body."""
+    """Extracts free variable references escaping a nested function, genexp, or class body."""
+    if isinstance(node, ast.GeneratorExp):
+        loop_targets: Set[str] = set()
+        for gen in node.generators:
+            for sub in ast.walk(gen.target):
+                if isinstance(sub, ast.Name):
+                    loop_targets.add(sub.id)
+        gen_free: Set[str] = set()
+        for sub in ast.walk(node.elt):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                if sub.id not in loop_targets:
+                    gen_free.add(sub.id)
+        for idx, gen in enumerate(node.generators):
+            for if_expr in gen.ifs:
+                for sub in ast.walk(if_expr):
+                    if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                        if sub.id not in loop_targets:
+                            gen_free.add(sub.id)
+            if idx > 0:
+                for sub in ast.walk(gen.iter):
+                    if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                        if sub.id not in loop_targets:
+                            gen_free.add(sub.id)
+        return gen_free - _BUILTIN_NAMES
+
     type_param_names: Set[str] = set()
     for tp in getattr(node, "type_params", []):
         tp_name = getattr(tp, "name", None)
@@ -935,7 +967,7 @@ def _collect_pre_unit_closures(
                 continue
 
             for subnode in ast.walk(stmt):
-                if isinstance(subnode, ast.Lambda):
+                if isinstance(subnode, (ast.Lambda, ast.GeneratorExp)):
                     sub_lineno = getattr(subnode, "lineno", stmt_start)
                     if sub_lineno < u_start:
                         captured_reads.update(_extract_nested_scope_free_reads(subnode))
@@ -1029,6 +1061,44 @@ def _find_enclosing_loops(
                 if (l_start, l_end) != (u_start, u_end):
                     loops.append((l_start, l_end))
     return loops
+
+
+def _enclosing_try_reads_outputs(
+    scope_node: Optional[ast.AST],
+    u_start: int,
+    u_end: int,
+    outputs: Set[str],
+) -> bool:
+    """Returns True if unit is inside an enclosing try whose handlers/finally read outputs."""
+    if scope_node is None or not outputs:
+        return False
+    for node in ast.walk(scope_node):
+        if isinstance(node, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+            body_nodes = getattr(node, "body", [])
+            if not body_nodes:
+                continue
+            b_start = getattr(body_nodes[0], "lineno", 0)
+            b_end_raw = getattr(body_nodes[-1], "end_lineno", None)
+            b_end: int = (
+                b_end_raw
+                if isinstance(b_end_raw, int)
+                else int(getattr(body_nodes[-1], "lineno", b_start) or b_start)
+            )
+            if b_start <= u_start and u_end <= b_end:
+                cleanup_nodes: List[ast.AST] = list(getattr(node, "finalbody", []))
+                for handler in getattr(node, "handlers", []):
+                    cleanup_nodes.extend(getattr(handler, "body", []))
+                    if getattr(handler, "type", None):
+                        cleanup_nodes.append(handler.type)
+                for c_node in cleanup_nodes:
+                    for sub in ast.walk(c_node):
+                        if (
+                            isinstance(sub, ast.Name)
+                            and isinstance(sub.ctx, ast.Load)
+                            and sub.id in outputs
+                        ):
+                            return True
+    return False
 
 
 def _merge_pre_unit_closure_reads(
@@ -1288,6 +1358,9 @@ def _extract_effective_unit_outputs(
     return [v for v in cands if v not in excluded]
 
 
+_warned_closure_strictness_values: Set[str] = set()
+
+
 def resolve_closure_strictness_mode(
     closure_strictness: Optional[str] = None,
     skip_pre_unit_closures: bool = False,
@@ -1307,11 +1380,14 @@ def resolve_closure_strictness_mode(
         if c_mode in ("strict", "fail_closed"):
             return "strict", False
         fallback = "lenient" if skip_pre_unit_closures else "strict"
-        logger.warning(
-            "Unrecognized closure_strictness '%s'; falling back to %s mode",
-            closure_strictness,
-            fallback,
-        )
+        raw_key = str(closure_strictness)
+        if raw_key not in _warned_closure_strictness_values:
+            _warned_closure_strictness_values.add(raw_key)
+            logger.warning(
+                "Unrecognized closure_strictness '%s'; falling back to %s mode",
+                closure_strictness,
+                fallback,
+            )
     is_lenient = bool(skip_pre_unit_closures)
     return ("lenient" if is_lenient else "strict"), is_lenient
 
@@ -1360,6 +1436,7 @@ def resolve_clone_generator_subroutine_outputs(
         (u1, cands1, source_text1, tree1),
         (u2, cands2, source_text2, tree2),
     ]
+    target_srcs: List[Optional[str]] = []
     downstream_reads: List[Optional[Set[str]]] = []
     for u_item, cands, s_text, tr in targets:
         src = (
@@ -1367,6 +1444,7 @@ def resolve_clone_generator_subroutine_outputs(
             if s_text is not None
             else _load_unit_file_text(u_item, repo_root=repo_root)
         )
+        target_srcs.append(src)
         if src is not None:
             reads = collect_downstream_read_names(
                 src,
@@ -1381,4 +1459,25 @@ def resolve_clone_generator_subroutine_outputs(
 
     side1 = GeneratorCloneSideData(outs1, downstream_reads[0], u1_def)
     side2 = GeneratorCloneSideData(outs2, downstream_reads[1], u2_def)
-    return resolve_generator_subroutine_outputs(side1, side2)
+    resolved = resolve_generator_subroutine_outputs(side1, side2)
+    if resolved is None:
+        return None
+
+    out1, out2 = resolved
+    for side_idx, (u_item, needed_outs, s_text, tr) in enumerate([
+        (u1, out1, target_srcs[0], tree1),
+        (u2, out2, target_srcs[1], tree2),
+    ]):
+        if needed_outs and s_text is not None:
+            scope_node = _resolve_downstream_scope_node(s_text, u_item, tr)
+            u_s = parse_unit_coord(u_item, "start", default=1)
+            u_e = parse_unit_coord(u_item, "end", default=u_s)
+            if _enclosing_try_reads_outputs(scope_node, u_s, u_e, set(needed_outs)):
+                logger.debug(
+                    "Rejecting generator subroutine pair: needed output(s) read in "
+                    "enclosing try cleanup for unit %s",
+                    side_idx + 1,
+                )
+                return None
+
+    return resolved

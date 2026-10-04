@@ -3341,6 +3341,7 @@ def test_load_unit_file_text_source_lines_fallback() -> None:
         "start": 1,
         "end": 2,
         "source_lines": ["def foo():\n", "    pass\n"],
+        "source_lines_is_sliced": False,
     }
     loaded = _load_unit_file_text(unit)
     assert loaded == "def foo():\n    pass\n"
@@ -4096,6 +4097,7 @@ def test_load_unit_file_text_honors_sliced_lines() -> None:
         "start": 1,
         "end": 3,
         "source_lines": ["x = 1\n", "y = 2\n", "z = 3\n"],
+        "source_lines_is_sliced": False,
     }
     assert _load_unit_file_text(unit_full) == "x = 1\ny = 2\nz = 3\n"
 
@@ -4147,13 +4149,17 @@ def test_find_enclosing_loops_explicit_none_end_lineno() -> None:
     assert loops == []
 
 
-def test_downstream_cache_update_prevents_premature_eviction() -> None:
-    """Verifies that updating an existing key in _downstream_reads_cache does not evict."""
+def test_downstream_cache_update_prevents_premature_eviction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies that updating an existing key in _downstream_reads_cache does not evict,
+    and exceeding capacity evicts the oldest item."""
+    monkeypatch.setattr("pydoppelgangerhunt.fixer.dataflow._MAX_DOWNSTREAM_CACHE_SIZE", 5)
     _clear_downstream_reads_cache()
     try:
         with _downstream_cache_lock:
-            # Fill cache with initial items
-            for i in range(10):
+            # Fill cache with 5 items
+            for i in range(5):
                 _downstream_reads_cache[(f"key_{i}",)] = frozenset([f"var_{i}"])
 
         # Create a unit and code to populate cache
@@ -4164,11 +4170,13 @@ def test_downstream_cache_update_prevents_premature_eviction() -> None:
             "    print(total)\n"
         )
         unit = {"file": "worker.py", "start": 3, "end": 3}
+        # First call: adds a new key when cache is at capacity, evicting key_0
         reads1 = collect_downstream_read_names(code, unit, candidates={"total"})
         assert reads1 == {"total"}
 
         with _downstream_cache_lock:
-            initial_count = len(_downstream_reads_cache)
+            assert len(_downstream_reads_cache) == 5
+            assert ("key_0",) not in _downstream_reads_cache
             keys_before = list(_downstream_reads_cache.keys())
 
         # Calling again on the same unit updates/hits without shrinking or premature eviction
@@ -4176,10 +4184,26 @@ def test_downstream_cache_update_prevents_premature_eviction() -> None:
         assert reads2 == {"total"}
 
         with _downstream_cache_lock:
-            assert len(_downstream_reads_cache) == initial_count
+            assert len(_downstream_reads_cache) == 5
             # Most recently updated/accessed key moved to the end
             assert list(_downstream_reads_cache.keys())[-1] == keys_before[-1]
     finally:
         _clear_downstream_reads_cache()
+
+
+def test_infer_helper_return_type_subroutine_no_outputs_ignores_resolved_ret() -> None:
+    """Verifies subroutine with no outputs and no return returns None, ignoring enclosing return."""
+    # pylint: disable=protected-access
+    ret = _infer_helper_return_type(
+        helper_outputs=[],
+        conditional_outs=set(),
+        meta1={},
+        meta2={},
+        scope={"has_return": False, "has_return_value": False},
+        resolved_ret="int",
+        is_subroutine=True,
+    )
+    assert ret == "None"
+
 
 

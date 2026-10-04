@@ -116,8 +116,8 @@ def compute_unit_coverage(
     if not covered_lines:
         return 0.0
 
-    start = parse_unit_coord(unit, "start", default=1)
-    end = parse_unit_coord(unit, "end", default=start)
+    start = max(1, parse_unit_coord(unit, "start", default=1))
+    end = max(start, parse_unit_coord(unit, "end", default=start))
     total_lines = max(1, end - start + 1)
     covered_count = sum(1 for ln in range(start, end + 1) if ln in covered_lines)
     return min(1.0, covered_count / float(total_lines))

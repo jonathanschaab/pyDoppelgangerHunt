@@ -501,8 +501,9 @@ def _infer_helper_return_type(
     if outputs_ret is not None:
         return outputs_ret
 
-    if not helper_outputs and not scope.get("has_return") and resolved_ret == "Any":
-        return "Any" if unit_kind in ("comprehension", "complex_expr") else "None"
+    if not helper_outputs and not scope.get("has_return"):
+        if is_sub or resolved_ret == "Any":
+            return "Any" if unit_kind in ("comprehension", "complex_expr") else "None"
 
     return resolved_ret
 
