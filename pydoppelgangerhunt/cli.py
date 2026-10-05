@@ -1133,7 +1133,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ):
         parser.error(
             f"invalid closure_strictness configuration: {cli_strictness!r} "
-            "(choose from 'strict', 'lenient')"
+            "(choose from 'strict', 'lenient', 'fail_closed', 'fast', 'skip')"
         )
 
     closure_strictness, skip_pre_unit_closures = resolve_closure_strictness_mode(

@@ -91,7 +91,6 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
             for ln in source_lines[start - 1 : end]
         ]
 
-    raw_file = str(unit.get("file") or "")
     resolved_file = _resolve_safe_unit_file_path(unit, repo_root=repo_root)
     if resolved_file is None:
         return placeholder
@@ -99,8 +98,9 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
     try:
         is_cell_anchor = False
         cell_idx = -1
-        if resolved_file.suffix.lower() == ".ipynb" and "#" in raw_file:
-            parsed_nb = parse_notebook_cell_anchor(raw_file)
+        u_file = str(unit.get("file") or "")
+        if resolved_file.suffix.lower() == ".ipynb" and "#" in u_file:
+            parsed_nb = parse_notebook_cell_anchor(u_file)
             if parsed_nb is not None:
                 cell_idx = parsed_nb[1]
                 is_cell_anchor = True

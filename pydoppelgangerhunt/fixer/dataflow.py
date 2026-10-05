@@ -36,13 +36,17 @@ def _load_unit_file_text(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
 ) -> Optional[str]:
-    """Reads full source text from memory or disk for downstream AST read analysis."""
+    """Reads full source text from memory or disk for downstream AST read analysis.
+
+    For in-memory units with 'source_lines', note that when 'source_lines_is_sliced' is
+    unspecified (None), len(unit["source_lines"]) must strictly exceed end line e_d
+    to prevent mistaking sliced excerpts as complete files. When a unit reaches EOF
+    (e_d == len(source_lines)), callers providing in-memory source_lines without a disk
+    backing file must explicitly specify source_lines_is_sliced=False.
+    """
     is_sliced = unit.get("source_lines_is_sliced")
     if is_sliced is True:
         return None
-
-    s_d = max(1, parse_unit_coord(unit, "start", default=1))
-    e_d = max(s_d, parse_unit_coord(unit, "end", default=s_d))
 
     source_text = unit.get("source_text")
     if source_text is None:
