@@ -1195,7 +1195,7 @@ def test_batch_82_matcher_sloc_and_priority_score_bounds() -> None:
     u1 = {"start": 20, "end": 10, "complexity": -5, "token_count": 50, "name": "bad1", "file": "f1.py"}
     u2 = {"start": 30, "end": 15, "complexity": 0, "token_count": 50, "name": "bad2", "file": "f2.py"}
     score = compute_priority_score(0.9, u1, u2)
-    assert score == 0.0
+    assert score == 0.9
 
     clone_pairs: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = [
         (0.9, u1, u2),

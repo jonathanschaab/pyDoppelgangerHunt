@@ -39,10 +39,11 @@ def _load_unit_file_text(
     """Reads full source text from memory or disk for downstream AST read analysis.
 
     For in-memory units with 'source_lines', note that when 'source_lines_is_sliced' is
-    unspecified (None), len(unit["source_lines"]) must strictly exceed end line e_d
-    to prevent mistaking sliced excerpts as complete files. When a unit reaches EOF
-    (e_d == len(source_lines)), callers providing in-memory source_lines without a disk
-    backing file must explicitly specify source_lines_is_sliced=False.
+    unspecified (None), len(unit["source_lines"]) must strictly exceed end line e_d,
+    or reach EOF with s_d > 1, to prevent mistaking sliced excerpts as complete files.
+    When a unit reaches EOF starting at line 1 (e_d == len(source_lines) and s_d == 1),
+    callers providing in-memory source_lines without a disk backing file should
+    explicitly specify source_lines_is_sliced=False.
     """
     is_sliced = unit.get("source_lines_is_sliced")
     if is_sliced is True:
@@ -58,7 +59,12 @@ def _load_unit_file_text(
     e_d = max(s_d, parse_unit_coord(unit, "end", default=s_d))
 
     if "source_lines" in unit and isinstance(unit["source_lines"], (list, tuple)):
-        if is_sliced is False or len(unit["source_lines"]) > e_d:
+        is_full_file = (
+            is_sliced is False
+            or len(unit["source_lines"]) > e_d
+            or (len(unit["source_lines"]) == e_d and s_d > 1)
+        )
+        if is_full_file:
             return "".join(unit["source_lines"])
 
     # Disk fallback: strictly only .py files within repo_root or CWD are accepted.
@@ -527,28 +533,9 @@ def _extract_nested_scope_free_reads(
 ) -> Set[str]:
     """Extracts free variable references escaping a nested function, genexp, or class body."""
     if isinstance(node, ast.GeneratorExp):
-        loop_targets: Set[str] = set()
-        for gen in node.generators:
-            for sub in ast.walk(gen.target):
-                if isinstance(sub, ast.Name):
-                    loop_targets.add(sub.id)
-        gen_free: Set[str] = set()
-        for sub in ast.walk(node.elt):
-            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
-                if sub.id not in loop_targets:
-                    gen_free.add(sub.id)
-        for idx, gen in enumerate(node.generators):
-            for if_expr in gen.ifs:
-                for sub in ast.walk(if_expr):
-                    if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
-                        if sub.id not in loop_targets:
-                            gen_free.add(sub.id)
-            if idx > 0:
-                for sub in ast.walk(gen.iter):
-                    if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
-                        if sub.id not in loop_targets:
-                            gen_free.add(sub.id)
-        return gen_free - _BUILTIN_NAMES
+        gen_visitor = _OuterExprVisitor()
+        gen_visitor.visit(node)
+        return gen_visitor.names - _BUILTIN_NAMES
 
     type_param_names: Set[str] = set()
     for tp in getattr(node, "type_params", []):

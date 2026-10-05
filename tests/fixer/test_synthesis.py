@@ -3653,6 +3653,10 @@ def test_parse_unit_coord_overload_and_default_none() -> None:
         parse_unit_coord({"col": float("nan")}, "col")
     with pytest.raises(ValueError):
         parse_unit_coord({"col": "nan"}, "col")
+    with pytest.raises(ValueError):
+        parse_unit_coord({"col": [10]}, "col")
+    with pytest.raises(ValueError):
+        parse_unit_coord({"col": {"nested": 1}}, "col")
 
 
 def test_module_level_unit_prior_function_free_reads() -> None:
@@ -3705,6 +3709,20 @@ def test_extract_nested_scope_free_reads_pure_ast_immutability() -> None:
     free_reads = _extract_nested_scope_free_reads(fn_node)  # type: ignore[arg-type]
     assert free_reads == {"b", "c"}
     assert not hasattr(fn_node, "_free_reads_cache")
+
+
+def test_extract_nested_scope_free_reads_generator_scope_isolation() -> None:
+    """Verifies that generator expressions isolate inner comprehensions and lambdas
+    without leaking loop targets or inner parameters as free reads."""
+    code1 = "([z for z in row] for row in matrix)"
+    gen_node1 = ast.parse(code1, mode="eval").body
+    free1 = _extract_nested_scope_free_reads(gen_node1)  # type: ignore[arg-type]
+    assert free1 == {"matrix"}
+
+    code2 = "(((lambda p: p + offset)(item)) for item in items)"
+    gen_node2 = ast.parse(code2, mode="eval").body
+    free2 = _extract_nested_scope_free_reads(gen_node2)  # type: ignore[arg-type]
+    assert free2 == {"items", "offset"}
 
 
 def test_collect_downstream_read_names_lru_caching() -> None:
@@ -4167,6 +4185,14 @@ def test_load_unit_file_text_honors_sliced_lines() -> None:
         "source_lines_is_sliced": False,
     }
     assert _load_unit_file_text(unit_full) == "x = 1\ny = 2\nz = 3\n"
+
+    unit_eof = {
+        "file": "virtual_eof.py",
+        "start": 2,
+        "end": 4,
+        "source_lines": ["a\n", "b\n", "c\n", "d\n"],
+    }
+    assert _load_unit_file_text(unit_eof) == "a\nb\nc\nd\n"
 
 
 def test_downstream_reads_non_ascii_same_line_semicolon() -> None:

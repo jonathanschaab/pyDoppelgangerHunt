@@ -68,7 +68,7 @@ def parse_unit_coord(
                 ) from exc
     try:
         return int(val)
-    except (ValueError, OverflowError) as exc:
+    except (ValueError, TypeError, OverflowError) as exc:
         raise ValueError(
             f"Invalid coordinate {val!r}: cannot convert to integer"
         ) from exc

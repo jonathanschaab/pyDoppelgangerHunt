@@ -1552,7 +1552,7 @@ def scan_target(
 def _unit_sloc(unit: Dict[str, Any]) -> int:
     """Computes non-negative line count for an AST unit using parsed coordinates."""
     s = max(1, parse_unit_coord(unit, "start", default=1))
-    e = max(1, parse_unit_coord(unit, "end", default=s))
+    e = max(s, parse_unit_coord(unit, "end", default=s))
     return max(0, e - s + 1)
 
 
