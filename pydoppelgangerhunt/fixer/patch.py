@@ -1692,39 +1692,27 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
             elif isinstance(node, ast.If):
                 _collect_top_defs(node.body)
                 _collect_top_defs(node.orelse)
-            elif isinstance(node, ast.Try) or (
-                hasattr(ast, "TryStar") and isinstance(node, getattr(ast, "TryStar"))
-            ):
+            elif isinstance(node, ast.Try) or type(node).__name__ == "TryStar":
                 _collect_top_defs(getattr(node, "body", []))
                 for handler in getattr(node, "handlers", []):
                     _collect_top_defs(getattr(handler, "body", []))
                 _collect_top_defs(getattr(node, "orelse", []))
                 _collect_top_defs(getattr(node, "finalbody", []))
-            elif hasattr(ast, "Match") and isinstance(node, getattr(ast, "Match")):
+            elif type(node).__name__ == "Match":
                 for case in getattr(node, "cases", []):
                     for sub in ast.walk(case.pattern):
                         if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
                             names.add(sub.id)
-                        elif (
-                            hasattr(ast, "MatchAs")
-                            and isinstance(sub, getattr(ast, "MatchAs"))
-                            and getattr(sub, "name", None)
-                        ):
-                            names.add(sub.name)
-                        elif (
-                            hasattr(ast, "MatchStar")
-                            and isinstance(sub, getattr(ast, "MatchStar"))
-                            and getattr(sub, "name", None)
-                        ):
-                            names.add(sub.name)
-                        elif (
-                            hasattr(ast, "MatchMapping")
-                            and isinstance(sub, getattr(ast, "MatchMapping"))
-                            and getattr(sub, "rest", None)
-                        ):
-                            names.add(sub.rest)
+                        elif type(sub).__name__ in ("MatchAs", "MatchStar"):
+                            sub_name = getattr(sub, "name", None)
+                            if isinstance(sub_name, str):
+                                names.add(sub_name)
+                        elif type(sub).__name__ == "MatchMapping":
+                            sub_rest = getattr(sub, "rest", None)
+                            if isinstance(sub_rest, str):
+                                names.add(sub_rest)
                     _collect_top_defs(case.body)
-            elif hasattr(ast, "TypeAlias") and isinstance(node, getattr(ast, "TypeAlias")):
+            elif type(node).__name__ == "TypeAlias":
                 tgt_name = getattr(node, "name", None)
                 if isinstance(tgt_name, ast.Name):
                     names.add(tgt_name.id)

@@ -733,12 +733,10 @@ def _is_irrefutable_pattern(pattern: Optional[ast.AST]) -> bool:  # pragma: no c
     """Recursively determines if a pattern matching AST node unconditionally matches any subject."""
     if pattern is None:
         return True
-    match_as = getattr(ast, "MatchAs", ())
-    if isinstance(pattern, match_as):
+    if type(pattern).__name__ == "MatchAs":
         sub_pat = getattr(pattern, "pattern", None)
         return sub_pat is None or _is_irrefutable_pattern(sub_pat)
-    match_or = getattr(ast, "MatchOr", ())
-    if isinstance(pattern, match_or):
+    if type(pattern).__name__ == "MatchOr":
         patterns = getattr(pattern, "patterns", [])
         return any(_is_irrefutable_pattern(p) for p in patterns)
     return False
@@ -768,12 +766,12 @@ def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
         elif isinstance(stmt, (ast.With, ast.AsyncWith)):
             if _block_terminates(stmt.body):
                 return True
-        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
+        elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
             cases = getattr(stmt, "cases", [])
             has_irrefutable = any(_is_irrefutable_case(c) for c in cases)
             if has_irrefutable and cases and all(_block_terminates(c.body) for c in cases):
                 return True
-        elif isinstance(stmt, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+        elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
             f_body = getattr(stmt, "finalbody", [])
             if f_body and _block_terminates(f_body):
                 return True
@@ -804,7 +802,7 @@ def _extract_deleted_names(statements: Sequence[ast.AST]) -> Set[str]:
             continue
         elif isinstance(stmt, ast.ExceptHandler):
             deleted.update(_extract_deleted_names(stmt.body))
-        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
+        elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
             for case in getattr(stmt, "cases", []):
                 deleted.update(_extract_deleted_names(getattr(case, "body", [])))
         else:
@@ -959,7 +957,7 @@ def _analyze_block_assignment(
                         if isinstance(p_node, ast.Name) and isinstance(p_node.ctx, ast.Store):
                             definite.add(p_node.id)
             _analyze_block_assignment(stmt.body, definite, conditional)
-        elif isinstance(stmt, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+        elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
             t_body = list(getattr(stmt, "body", []))
             t_def, t_cond = _analyze_block_assignment(t_body)
             t_term = _block_terminates(t_body)
@@ -1040,7 +1038,7 @@ def _analyze_block_assignment(
             f_body = list(getattr(stmt, "finalbody", []))
             if f_body:
                 _analyze_block_assignment(f_body, definite, conditional)
-        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
+        elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
             d_sub, c_sub = _walrus_assignment_in_expr(getattr(stmt, "subject", None))
             definite.update(d_sub)
             conditional.update(c_sub)

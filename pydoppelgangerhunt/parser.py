@@ -311,8 +311,7 @@ def _walk_ast_nodes(
             if (
                 abstract_expressions
                 and name == "guard"
-                and hasattr(ast, "match_case")
-                and isinstance(node, getattr(ast, "match_case"))  # pragma: no cover (py310+)
+                and type(node).__name__ == "match_case"  # pragma: no cover (py310+)
             ):
                 if isinstance(value, (ast.Compare, ast.BoolOp, ast.UnaryOp)):
                     nodes.append(ast.Name(id="__ABSTRACT_COND__", ctx=ast.Load()))
@@ -1393,7 +1392,7 @@ def harvest_file_units(
                         try_finally = getattr(stmt, "finalbody", None)
                         if try_finally:
                             _record_branch("try_finally", try_finally, t_line)
-                    elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
+                    elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
                         m_line = getattr(stmt, "lineno", 0)
                         for c_idx, case in enumerate(getattr(stmt, "cases", [])):
                             _record_branch(f"case_{c_idx + 1}", getattr(case, "body", []), m_line)

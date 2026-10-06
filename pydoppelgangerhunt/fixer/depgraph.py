@@ -637,13 +637,7 @@ def _collect_top_level_import_nodes(
                         stmt.orelse, include_classes=include_classes
                     )
                 )
-        elif isinstance(stmt, ast.Try):
-            result.extend(
-                _collect_try_block_imports(
-                    stmt, include_classes=include_classes
-                )
-            )
-        elif hasattr(ast, "TryStar") and isinstance(stmt, getattr(ast, "TryStar")):
+        elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
             result.extend(
                 _collect_try_block_imports(
                     stmt, include_classes=include_classes
@@ -673,7 +667,7 @@ def _collect_top_level_import_nodes(
                     stmt.orelse, include_classes=include_classes
                 )
             )
-        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):
+        elif type(stmt).__name__ == "Match":
             for case in getattr(stmt, "cases", []):
                 result.extend(
                     _collect_top_level_import_nodes(

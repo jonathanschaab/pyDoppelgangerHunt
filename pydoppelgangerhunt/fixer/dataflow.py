@@ -944,21 +944,15 @@ def _collect_pre_unit_closures(
                 if item.optional_vars is not None:
                     headers.append(item.optional_vars)
             return headers
-        if isinstance(s, ast.Try):
-            return [h.type for h in s.handlers if h.type is not None]
-        try_star_cls = getattr(ast, "TryStar", None)
-        if try_star_cls is not None and isinstance(s, try_star_cls):
-            return [
-                h.type
-                for h in getattr(s, "handlers", [])
-                if getattr(h, "type", None) is not None
-            ]
-        if hasattr(ast, "Match") and isinstance(s, ast.Match):
-            headers = [s.subject]
-            for case in s.cases:
-                headers.append(case.pattern)
-                if case.guard is not None:
-                    headers.append(case.guard)
+        if isinstance(s, ast.Try) or type(s).__name__ == "TryStar":
+            handlers = getattr(s, "handlers", [])
+            return [h.type for h in handlers if getattr(h, "type", None) is not None]
+        if type(s).__name__ == "Match":
+            headers = [getattr(s, "subject")]
+            for case in getattr(s, "cases", []):
+                headers.append(getattr(case, "pattern"))
+                if getattr(case, "guard", None) is not None:
+                    headers.append(getattr(case, "guard"))
             return headers
         return [s]
 
@@ -1138,7 +1132,7 @@ def _enclosing_try_reads_outputs(
     if scope_node is None or not outputs:
         return False
     for node in ast.walk(scope_node):
-        if isinstance(node, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+        if isinstance(node, ast.Try) or type(node).__name__ == "TryStar":
             body_nodes = getattr(node, "body", [])
             if not body_nodes:
                 continue

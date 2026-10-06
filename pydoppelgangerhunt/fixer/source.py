@@ -230,9 +230,9 @@ def _find_module_helper_insertion_index(lines: List[str]) -> int:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             end_l = getattr(node, "end_lineno", node.lineno)
             last_import_line = max(last_import_line, end_l)
-        elif isinstance(
-            node,
-            (ast.Try, getattr(ast, "TryStar", ast.Try), ast.If, ast.With, ast.AsyncWith),
+        elif (
+            isinstance(node, (ast.Try, ast.If, ast.With, ast.AsyncWith))
+            or type(node).__name__ == "TryStar"
         ):
             for sub in ast.walk(node):
                 if isinstance(sub, (ast.Import, ast.ImportFrom)):
@@ -280,9 +280,9 @@ def _get_module_imported_names(
         elif isinstance(stmt, ast.ImportFrom):
             for alias in stmt.names:
                 imported.add(alias.asname or alias.name)
-        elif include_conditional and isinstance(
-            stmt,
-            (ast.If, ast.Try, getattr(ast, "TryStar", ast.Try), ast.With, ast.AsyncWith),
+        elif include_conditional and (
+            isinstance(stmt, (ast.If, ast.Try, ast.With, ast.AsyncWith))
+            or type(stmt).__name__ == "TryStar"
         ):
             for sub in ast.walk(stmt):
                 if isinstance(sub, ast.Import):
