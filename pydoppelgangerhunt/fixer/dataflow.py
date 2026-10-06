@@ -11,11 +11,11 @@ import logging
 import threading
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
-from pydoppelgangerhunt.fixer.source import (
-    _find_innermost_enclosing_node,
+from pydoppelgangerhunt.source_lines import (
     _resolve_safe_unit_file_path,
     parse_unit_coord,
 )
+from pydoppelgangerhunt.fixer.source import _find_innermost_enclosing_node
 
 logger = logging.getLogger(__name__)
 
@@ -1124,51 +1124,91 @@ def _block_definitely_terminates(stmts: Sequence[ast.stmt]) -> bool:
     return any(_stmt_definitely_terminates(s) for s in stmts)
 
 
+def _stmts_enclose_unit(stmts: Sequence[ast.stmt], u_start: int, u_end: int) -> bool:
+    """Checks whether a sequence of AST statements spans and encloses the unit's line range."""
+    if not stmts:
+        return False
+    s_start = min(getattr(s, "lineno", 0) for s in stmts)
+    s_end = max(
+        int(getattr(s, "end_lineno", None) or getattr(s, "lineno", s_start) or s_start)
+        for s in stmts
+    )
+    return s_start <= u_start and u_end <= s_end
+
+
+def _nodes_load_any_name(nodes: Iterable[ast.AST], names: Set[str]) -> bool:
+    """Checks whether any AST node in the sequence loads one of the given variable names."""
+    for node in nodes:
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Name)
+                and isinstance(sub.ctx, ast.Load)
+                and sub.id in names
+            ):
+                return True
+    return False
+
+
 def _enclosing_try_reads_outputs(
     scope_node: Optional[ast.AST],
     u_start: int,
     u_end: int,
     outputs: Set[str],
 ) -> bool:
-    """Returns True if unit is inside an enclosing try whose handlers/finally read outputs,
-    or whose handlers can fall through and outputs are read downstream of the try."""
+    """Returns True if unit is inside an enclosing try, else, or except block whose
+    handlers/finally read outputs, or whose handlers fall through and outputs are read
+    downstream of the try block."""
     if scope_node is None or not outputs:
         return False
     for node in ast.walk(scope_node):
         if isinstance(node, ast.Try) or type(node).__name__ == "TryStar":
             body_nodes = getattr(node, "body", [])
-            if not body_nodes:
-                continue
-            b_start = getattr(body_nodes[0], "lineno", 0)
-            b_end_raw = getattr(body_nodes[-1], "end_lineno", None)
-            b_end: int = (
-                b_end_raw
-                if isinstance(b_end_raw, int)
-                else int(getattr(body_nodes[-1], "lineno", b_start) or b_start)
+            orelse_nodes = getattr(node, "orelse", [])
+            handlers = getattr(node, "handlers", [])
+            finalbody_nodes = getattr(node, "finalbody", [])
+
+            in_body = _stmts_enclose_unit(body_nodes, u_start, u_end)
+            in_orelse = _stmts_enclose_unit(orelse_nodes, u_start, u_end)
+            in_handler = any(
+                _stmts_enclose_unit(getattr(h, "body", []), u_start, u_end)
+                for h in handlers
             )
-            if b_start <= u_start and u_end <= b_end:
-                cleanup_nodes: List[ast.AST] = list(getattr(node, "finalbody", []))
-                for handler in getattr(node, "handlers", []):
-                    cleanup_nodes.extend(getattr(handler, "body", []))
+
+            if not (in_body or in_orelse or in_handler):
+                continue
+
+            # In body, else, or except blocks, finally executes on abnormal exit (e.g. gen.close()).
+            # If finally reads needed outputs, reject to prevent silent data loss or
+            # UnboundLocalError.
+            if _nodes_load_any_name(finalbody_nodes, outputs):
+                return True
+
+            # If unit is inside try body, exceptions during execution jump to handlers.
+            # If handlers read needed outputs, reject.
+            if in_body:
+                handler_nodes: List[ast.AST] = []
+                for handler in handlers:
+                    handler_nodes.extend(getattr(handler, "body", []))
                     if getattr(handler, "type", None):
-                        cleanup_nodes.append(handler.type)
-                for c_node in cleanup_nodes:
-                    for sub in ast.walk(c_node):
-                        if (
-                            isinstance(sub, ast.Name)
-                            and isinstance(sub.ctx, ast.Load)
-                            and sub.id in outputs
-                        ):
-                            return True
+                        handler_nodes.append(handler.type)
+                if _nodes_load_any_name(handler_nodes, outputs):
+                    return True
 
                 # If any handler can fall through (e.g. swallows GeneratorExit or exceptions
                 # without re-raising or returning), check if any needed output is read
                 # downstream of the enclosing try block.
-                handlers = getattr(node, "handlers", [])
                 if handlers and any(
                     not _block_definitely_terminates(h.body) for h in handlers
                 ):
                     try_end_raw = getattr(node, "end_lineno", None)
+                    b_end = max(
+                        int(
+                            getattr(s, "end_lineno", None)
+                            or getattr(s, "lineno", 0)
+                            or 0
+                        )
+                        for s in body_nodes
+                    )
                     t_end = try_end_raw if isinstance(try_end_raw, int) else b_end
                     post_try_visitor = _DownstreamReadVisitor(
                         t_end,
@@ -1559,8 +1599,22 @@ def resolve_clone_generator_subroutine_outputs(
         (u1, out1, target_srcs[0], tree1),
         (u2, out2, target_srcs[1], tree2),
     ]):
-        if needed_outs and s_text is not None:
-            scope_node = _resolve_downstream_scope_node(s_text, u_item, tr)
+        if needed_outs:
+            if s_text is None and tr is None:
+                logger.debug(
+                    "Rejecting generator subroutine pair: needed output(s) cannot be "
+                    "verified against enclosing try cleanup without source or AST for unit %s",
+                    side_idx + 1,
+                )
+                return None
+            scope_node = _resolve_downstream_scope_node(s_text or "", u_item, tr)
+            if scope_node is None:
+                logger.debug(
+                    "Rejecting generator subroutine pair: could not resolve scope AST to "
+                    "verify enclosing try cleanup for unit %s",
+                    side_idx + 1,
+                )
+                return None
             u_s = max(1, parse_unit_coord(u_item, "start", default=1))
             u_e = max(u_s, parse_unit_coord(u_item, "end", default=u_s))
             if _enclosing_try_reads_outputs(scope_node, u_s, u_e, set(needed_outs)):

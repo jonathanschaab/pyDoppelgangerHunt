@@ -14,11 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closure scanning behavior during generator subroutine refactoring, with informational logging
   when lenient mode is active.
 - **Abnormal Exit Loss Guard**: Rejects generator subroutine extraction when the candidate
-  unit is enclosed in a `try` block whose `except` or `finally` handlers read needed outputs,
-  or where swallowing `except` handlers (e.g. `except GeneratorExit: pass`) fall through to
-  downstream post-`try` reads, guarding against silent data loss on abnormal exit (`gen.close()`,
-  `.throw()`, or loop-body exceptions) where `yield from` exits abruptly without assigning to
-  call-site target outputs.
+  unit is enclosed in a `try`, `else`, or `except` block whose `finally` or `except` handlers
+  read needed outputs, or where swallowing `except` handlers (e.g. `except GeneratorExit: pass`)
+  fall through to downstream post-`try` reads, guarding against silent data loss on abnormal exit
+  (`gen.close()`, `.throw()`, or loop-body exceptions) where `yield from` exits abruptly without
+  assigning to call-site target outputs. Fails closed when source text or AST scope trees cannot
+  be resolved to verify try-cleanup safety.
 - **Pre-Unit Generator Expression Capture**: Extended `_collect_pre_unit_closures` and
   `_extract_nested_scope_free_reads` to inspect `ast.GeneratorExp` in statements and within
   `ClassDef` bodies in addition to `def`, `class`, and `lambda`, capturing lazy variable
@@ -43,12 +44,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Asynchronous Generator Detection**: Added `is_async_generator_with_return_value` and
   `is_async` unit metadata tagging to reject asynchronous generator subroutines with
   return values or downstream output assignments.
+- **Asynchronous Subroutine Inheritance & Context Isolation**: Subroutine units
+  (compound blocks, sliding windows, clause branches) enclosed within an `async def`
+  function inherit `is_async=True`, ensuring synthesized helper functions are defined as
+  `async def` and invoked via `await`. This preserves coroutine context isolation and
+  deliberately skips cross-context refactoring between asynchronous and synchronous callers
+  to avoid mixing event-loop-bound and blocking execution models.
 - **Colon-Formatted Coordinate Support**: Added support for colon-separated coordinates
-  (e.g. `"line:col"` in line coordinates and `"col:line"` in column fields) in
-  `parse_unit_coord` and `is_valid_unit_coordinates`.
+  (e.g. `"line:col"` in line coordinates and `"col:line"` in column fields, extracting
+  the leading coordinate prefix) in `parse_unit_coord` and `is_valid_unit_coordinates`.
 - **Downstream Read Analysis Cache**: Implemented a thread-safe, bounded LRU cache for
   downstream live read collection keyed by content SHA-256 digest, unit coordinates,
-  kind, name, candidate outputs, and file `mtime`.
+  kind, name, candidate outputs, and caller-provided `mtime` or timestamp metadata
+  (relying on content digests for cache invalidation without disk `stat()` overhead).
 
 ### Changed
 - **Fail-Closed Escaping Closure Protection (Generator Subroutines)**: For generator

@@ -269,8 +269,9 @@ strict fail-closed safety invariants:
   are module-level globals that may be imported or referenced by external files; the intra-file
   analyzer cannot inspect external package consumers. Ensure module-level refactorings do not
   alter globals exported as public module API.
-- **Coordinate Clamping**: Coordinates accept integer or colon format (`"start:end"` or
-  `"line:col"`), with line numbers clamped to at least line 1 and end clamped to at least start
+- **Coordinate Clamping**: Coordinates accept integer or colon format (e.g. `"line:col"`
+  in line coordinates and `"col:line"` in column fields, extracting the leading coordinate),
+  with line numbers clamped to at least line 1 and end clamped to at least start
   across all CLI reports, JSON/SARIF exports, clustering, git diff, and matcher deduplication.
 - **Definite Assignment Verification**: Synthesized helper return values and tuple-unpacked
   subroutine outputs require definite assignments along all incoming and internal execution

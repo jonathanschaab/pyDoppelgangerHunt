@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 import re
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Union, overload
+
+from pydoppelgangerhunt.config import normalize_path_string
 
 _PHYSICAL_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
 
 __all__ = [
     "_PHYSICAL_LINE_RE",
+    "_resolve_safe_unit_file_path",
     "count_physical_newlines",
     "detect_line_ending",
     "parse_unit_coord",
@@ -168,3 +172,58 @@ def detect_line_ending(*sources: Union[Optional[str], Iterable[Optional[str]]]) 
     if crlf_count == max_count:
         return "\r\n"
     return "\r"
+
+
+def _resolve_safe_unit_file_path(
+    unit: Dict[str, Any],
+    repo_root: Optional[str] = None,
+    allowed_suffixes: Sequence[str] = (".py", ".ipynb"),
+) -> Optional[Path]:
+    """Safely resolves and validates a unit's file path on disk within repo_root or CWD."""
+    raw_file = str(unit.get("file") or "")
+    f_raw = normalize_path_string(raw_file, strip_anchor=True)
+    if not f_raw:
+        return None
+
+    file_path = Path(f_raw)
+    norm_suffixes = tuple(s.lower() for s in allowed_suffixes)
+    if file_path.suffix.lower() not in norm_suffixes:
+        return None
+
+    if repo_root:
+        effective_root = Path(repo_root).resolve()
+        if effective_root.is_file():
+            effective_root = effective_root.parent
+        target_root = effective_root
+        if not file_path.is_absolute():
+            file_path = effective_root / file_path
+    else:
+        target_root = Path.cwd().resolve()
+        if not file_path.is_absolute():
+            file_path = target_root / file_path
+
+    try:
+        if file_path.is_symlink():
+            return None
+
+        if file_path.is_absolute():
+            try:
+                file_path = target_root / file_path.resolve().relative_to(target_root)
+            except ValueError:
+                return None
+
+        if not file_path.is_file():
+            return None
+        for parent in file_path.parents:
+            if parent.is_symlink():
+                return None
+            if parent == target_root or parent.resolve() == target_root:
+                break
+
+        resolved_file = file_path.resolve()
+        if not resolved_file.is_file():
+            return None
+        resolved_file.relative_to(target_root)
+        return resolved_file
+    except (OSError, RuntimeError, ValueError):
+        return None

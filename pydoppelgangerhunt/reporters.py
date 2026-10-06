@@ -12,8 +12,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
 from pydoppelgangerhunt.config import normalize_path_string
-from pydoppelgangerhunt.fixer.source import _resolve_safe_unit_file_path
-from pydoppelgangerhunt.source_lines import parse_unit_coord, split_source_lines
+from pydoppelgangerhunt.source_lines import (
+    _resolve_safe_unit_file_path,
+    parse_unit_coord,
+    split_source_lines,
+)
 
 
 # ANSI Color Codes

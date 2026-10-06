@@ -45,6 +45,7 @@ from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-acc
     _clear_downstream_reads_cache,
     _downstream_cache_lock,
     _downstream_reads_cache,
+    _enclosing_try_reads_outputs,
     _extract_effective_unit_outputs,
     _extract_nested_scope_free_reads,
     _extract_unit_end_col,
@@ -2500,8 +2501,8 @@ def test_resolve_clone_generator_subroutine_outputs_precomputed_and_fallback(
 ) -> None:
     """Verifies generator subroutine output resolution with precomputed outputs and fallback."""
     # Case 1: Precomputed outputs present on u1 and u2
-    u1_pre = {"outputs": ["a", "b"]}
-    u2_pre = {"outputs": ["x", "y"]}
+    u1_pre = {"outputs": ["a", "b"], "source_text": "def f():\n    a = 1\n"}
+    u2_pre = {"outputs": ["x", "y"], "source_text": "def g():\n    x = 1\n"}
     s1 = {"globals": ["b"], "nonlocals": []}
     s2 = {"globals": [], "nonlocals": ["y"]}
     res = resolve_clone_generator_subroutine_outputs(u1_pre, u2_pre, s1, s2)
@@ -4048,8 +4049,8 @@ def test_synthesize_shared_helper_code_strictness_propagation(tmp_path: Path) ->
 
 def test_resolve_clone_generator_subroutine_outputs_precomputed_definite_stores() -> None:
     """Verifies precomputed outputs are validated against definite stores when available."""
-    u1 = {"outputs": ["x", "unassigned"]}
-    u2 = {"outputs": ["a", "b"]}
+    u1 = {"outputs": ["x", "unassigned"], "source_text": "def f():\n    x = 1\n"}
+    u2 = {"outputs": ["a", "b"], "source_text": "def g():\n    a = 1\n"}
     # Scope 1 only definitely assigns x, leaving unassigned lacking definite store
     s1 = {"definite_stores": ["x"], "inputs": []}
     s2 = {"definite_stores": ["a", "b"], "inputs": []}
@@ -4422,3 +4423,77 @@ def test_infer_helper_return_type_subroutine_no_outputs_ignores_resolved_ret() -
         is_subroutine=True,
     )
     assert ret == "None"
+
+
+def test_resolve_clone_generator_subroutine_outputs_missing_source_fails_closed() -> None:
+    """Verifies that resolve_clone_generator_subroutine_outputs fails closed when outputs
+    are needed but source text and AST trees are unavailable to verify try-cleanup safety."""
+    u1 = {"outputs": ["x"]}
+    u2 = {"outputs": ["a"]}
+    s1 = {"definite_stores": ["x"], "inputs": []}
+    s2 = {"definite_stores": ["a"], "inputs": []}
+    # No source_text, file, or tree is provided
+    res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
+    assert res is None
+
+
+def test_enclosing_try_reads_outputs_in_else_and_except_finally_reads() -> None:
+    """Verifies that _enclosing_try_reads_outputs flags units in try/else/except when
+    finally reads outputs."""
+    # 1. Unit inside else: block whose finally reads outputs
+    code_else = (
+        "def run_else(items):\n"
+        "    try:\n"
+        "        open_res()\n"
+        "    except Exception:\n"
+        "        handle_err()\n"
+        "    else:\n"
+        "        for x in items:\n"
+        "            yield x\n"
+        "    finally:\n"
+        "        cleanup(out_var)\n"
+    )
+    tree_else = ast.parse(code_else)
+    scope_else = tree_else.body[0]
+    # Lines 7 to 8 are the unit inside else:
+    assert _enclosing_try_reads_outputs(scope_else, 7, 8, {"out_var"}) is True
+    # If finally does not read the output, returns False
+    assert _enclosing_try_reads_outputs(scope_else, 7, 8, {"other_var"}) is False
+
+    # 2. Unit inside except: block whose finally reads outputs
+    code_except = (
+        "def run_except(fallback):\n"
+        "    try:\n"
+        "        open_res()\n"
+        "    except IOError:\n"
+        "        for x in fallback:\n"
+        "            yield x\n"
+        "    finally:\n"
+        "        cleanup(out_var)\n"
+    )
+    tree_except = ast.parse(code_except)
+    scope_except = tree_except.body[0]
+    # Lines 5 to 6 are the unit inside except:
+    assert _enclosing_try_reads_outputs(scope_except, 5, 6, {"out_var"}) is True
+    assert _enclosing_try_reads_outputs(scope_except, 5, 6, {"other_var"}) is False
+
+    # 3. Unit inside else: rejected by resolve_clone_generator_subroutine_outputs
+    u1 = {
+        "file": "m1.py",
+        "start": 7,
+        "end": 8,
+        "source_text": code_else,
+        "outputs": ["out_var"],
+    }
+    u2 = {
+        "file": "m2.py",
+        "start": 7,
+        "end": 8,
+        "source_text": code_else,
+        "outputs": ["out_var"],
+    }
+    s1 = {"definite_stores": ["out_var"], "inputs": []}
+    s2 = {"definite_stores": ["out_var"], "inputs": []}
+    res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
+    assert res is None
+
