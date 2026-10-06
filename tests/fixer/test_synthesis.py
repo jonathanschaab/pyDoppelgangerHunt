@@ -2764,6 +2764,12 @@ def test_split_type_args_nested_bracket_depth() -> None:
     t5 = r'Tuple["a\"b, c", int]'
     assert _split_type_args(t5) == [r'"a\"b, c"', "int"]
 
+    # Mismatched bracket depth and unclosed quotes fail closed to empty list
+    assert not _split_type_args("Generator[int, Tuple[str, int]")
+    assert not _split_type_args("Dict[str, List[int]")
+    assert not _split_type_args("Tuple['unclosed, int]")
+    assert not _split_type_args('Tuple["unclosed, int]')
+
     # Inference in _infer_helper_return_type preserving nested tuple yield type
     scope = {
         "has_yield": True,
@@ -4056,6 +4062,43 @@ def test_resolve_clone_generator_subroutine_outputs_precomputed_definite_stores(
     assert res_valid == (["x", "unassigned"], ["a", "b"])
 
 
+def test_resolve_clone_generator_subroutine_outputs_inverted_and_zero_coords() -> None:
+    """Verifies that resolve_clone_generator_subroutine_outputs safely clamps inverted
+    or zero coordinates when inspecting enclosing try cleanup."""
+    code1 = (
+        "try:\n"
+        "    for x in range(10):\n"
+        "        yield x\n"
+        "finally:\n"
+        "    cleanup = total\n"
+    )
+    code2 = (
+        "try:\n"
+        "    for y in range(10):\n"
+        "        yield y\n"
+        "finally:\n"
+        "    cleanup = count\n"
+    )
+    u1 = {
+        "file": "mod1.py",
+        "start": 3,
+        "end": 2,
+        "source_text": code1,
+        "outputs": ["total"],
+    }
+    u2 = {
+        "file": "mod2.py",
+        "start": 0,
+        "end": 0,
+        "source_text": code2,
+        "outputs": ["count"],
+    }
+    s1 = {"definite_stores": ["total"], "inputs": []}
+    s2 = {"definite_stores": ["count"], "inputs": []}
+    res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
+    assert res is None
+
+
 def test_inspect_unit_scope_synthetic_wrapper_explicit_return_and_hazards(
     tmp_path: Path,
 ) -> None:
@@ -4266,6 +4309,15 @@ def test_load_unit_file_text_honors_sliced_lines() -> None:
         "source_lines": ["a\n", "b\n", "c\n", "d\n"],
     }
     assert _load_unit_file_text(unit_eof) == "a\nb\nc\nd\n"
+
+    unit_no_newlines = {
+        "file": "virtual_no_nl.py",
+        "start": 1,
+        "end": 2,
+        "source_lines": ["x = 1", "y = 2", "z = 3"],
+        "source_lines_is_sliced": False,
+    }
+    assert _load_unit_file_text(unit_no_newlines) == "x = 1\ny = 2\nz = 3\n"
 
 
 def test_downstream_reads_non_ascii_same_line_semicolon() -> None:

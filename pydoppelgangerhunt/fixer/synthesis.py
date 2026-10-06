@@ -310,6 +310,8 @@ def _split_type_args(type_str: str) -> List[str]:
             current = []
             continue
         current.append(char)
+    if depth != 0 or active_quote is not None:
+        return []
     if current:
         args.append("".join(current).strip())
     return args

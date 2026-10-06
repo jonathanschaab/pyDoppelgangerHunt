@@ -324,6 +324,17 @@ def test_resolve_safe_unit_file_path_symlinked_root_prefix(tmp_path: Path) -> No
     )
     assert res2 == target_py.resolve()
 
+    # Symlinked file inside the repository must be rejected
+    sym_file = real_repo / "sym_link.py"
+    try:
+        sym_file.symlink_to(target_py)
+    except (OSError, NotImplementedError):
+        pass
+    else:
+        assert _resolve_safe_unit_file_path(
+            {"file": str(sym_file)}, repo_root=str(real_repo)
+        ) is None
+
 def test_expression_unit_midline_pragma_placement() -> None:
     """Verifies that boundary pragmas are appended to the line end when trailing code is present."""
     source = "call([x for x in data], extra_arg)  # type: ignore\n"

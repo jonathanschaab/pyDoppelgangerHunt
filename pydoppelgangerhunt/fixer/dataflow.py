@@ -65,7 +65,10 @@ def _load_unit_file_text(
             or (len(unit["source_lines"]) == e_d and s_d > 1)
         )
         if is_full_file:
-            return "".join(unit["source_lines"])
+            return "".join(
+                ln if ln.endswith("\n") else ln + "\n"
+                for ln in unit["source_lines"]
+            )
 
     # Disk fallback: strictly only .py files within repo_root or CWD are accepted.
     # Notebooks (.ipynb) and out-of-root files fail closed and return None.
@@ -1558,8 +1561,8 @@ def resolve_clone_generator_subroutine_outputs(
     ]):
         if needed_outs and s_text is not None:
             scope_node = _resolve_downstream_scope_node(s_text, u_item, tr)
-            u_s = parse_unit_coord(u_item, "start", default=1)
-            u_e = parse_unit_coord(u_item, "end", default=u_s)
+            u_s = max(1, parse_unit_coord(u_item, "start", default=1))
+            u_e = max(u_s, parse_unit_coord(u_item, "end", default=u_s))
             if _enclosing_try_reads_outputs(scope_node, u_s, u_e, set(needed_outs)):
                 logger.debug(
                     "Rejecting generator subroutine pair: needed output(s) read in "
