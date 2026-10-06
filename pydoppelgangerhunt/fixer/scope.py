@@ -1363,7 +1363,7 @@ def _inspect_unit_scope(
     # returns, all local variable stores act as unit outputs to preserve caller mutations.
     pre_outs = unit.get("precomputed_outputs") or unit.get("outputs")
     if is_subroutine and isinstance(pre_outs, (list, tuple, set)):
-        outputs = list(pre_outs)
+        outputs = sorted(pre_outs) if isinstance(pre_outs, set) else list(pre_outs)
     elif visitor.returns:
         outputs = list(visitor.returns)
     elif is_subroutine:

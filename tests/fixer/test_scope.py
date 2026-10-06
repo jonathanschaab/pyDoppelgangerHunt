@@ -1538,3 +1538,38 @@ def test_dispatch_analyze_unit_variable_scope_mock_fallback() -> None:
     with mock.patch("pydoppelgangerhunt.fixer.analyze_unit_variable_scope", mock_raising_scope):
         with pytest.raises(TypeError, match="tree1 parameter has an unexpected invalid type"):
             dispatch_analyze_unit_variable_scope(u1, tree1=ast.parse("x = 1\n"))
+
+
+def test_inspect_unit_scope_deterministic_set_outputs() -> None:
+    """Verifies that analyze_unit_variable_scope deterministically sorts outputs
+    provided as a set on subroutine units."""
+    code = (
+        "def worker():\n"
+        "    for i in range(10):\n"
+        "        z = i\n"
+        "        a = i * 2\n"
+        "        yield a\n"
+    )
+    tree = ast.parse(code)
+    u_sub = {
+        "file": "test_mod.py",
+        "start": 2,
+        "end": 5,
+        "kind": "compound_block",
+        "outputs": {"z", "a", "m", "b"},
+        "source_text": code,
+    }
+    scope = analyze_unit_variable_scope(u_sub, tree1=tree)
+    assert scope["outputs"] == ["a", "b", "m", "z"]
+
+    u_sub2 = {
+        "file": "test_mod.py",
+        "start": 2,
+        "end": 5,
+        "kind": "compound_block",
+        "precomputed_outputs": {"z", "a", "m", "b"},
+        "source_text": code,
+    }
+    scope2 = analyze_unit_variable_scope(u_sub2, tree1=tree)
+    assert scope2["outputs"] == ["a", "b", "m", "z"]
+

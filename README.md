@@ -239,9 +239,10 @@ fail-closed safety.
   duplicate traversals across identical clone boundaries.
 - **Lenient Mode Bypass**: For large codebases or batch runs where callback-escaping closures are
   known not to occur, pre-unit closure scanning can be bypassed by specifying
-  `--closure-strictness lenient` (or `--skip-pre-unit-closures`, or setting
-  `closure_strictness = "lenient"` / `skip_pre_unit_closures = true` in `pyproject.toml`). When both
-  CLI flags are supplied, `--closure-strictness` takes precedence over `--skip-pre-unit-closures`.
+  `--closure-strictness lenient` (or aliases `fast` / `skip`, or `--skip-pre-unit-closures`,
+  or setting `closure_strictness = "lenient"` / `skip_pre_unit_closures = true` in
+  `pyproject.toml`). When both CLI flags are supplied, `--closure-strictness` takes precedence
+  over `--skip-pre-unit-closures`.
 
 #### Safety Model & Fail-Closed Refactoring Guarantees
 
@@ -320,7 +321,7 @@ pydoppelgangerhunt --init
 | `--cross-file-strategy` | `auto\|shared_module\|host_module\|skip` | Cross-module deduplication strategy (`auto`, `shared_module`, `host_module`, or `skip`; default: `auto`) |
 | `--shared-module-name` | `FILENAME` | Target filename for shared utility extractions (default: `_common.py`) |
 | `--skip-pre-unit-closures` | Flag | Skip pre-unit closure scan during subroutine extraction |
-| `--closure-strictness` | `strict\|lenient` | Closure strictness mode (precedes boolean flag) |
+| `--closure-strictness` | `strict\|lenient\|fail_closed\|fast\|skip` | Closure strictness mode (`strict` or `lenient`; aliases: `fail_closed`, `fast`, `skip`; precedes boolean flag) |
 | `--sort-by` | `similarity\|priority\|sloc` | Sort clone hits (default: `similarity`) |
 | `--priority` | Flag | Sort clones by Priority score: $\text{Sim} \times \text{SLOC} \times \text{Complexity}$ |
 | `--top` | `INT` | Truncate report to top $N$ clone pairs |
