@@ -1225,17 +1225,16 @@ def _render_file_patch_plan(
     retained_cands = filter_overlapping_clone_units(
         [u for u, _ in plan.replacements], repo_root=repo_root
     )
+
+    def _unit_span(unit: Dict[str, Any]) -> Tuple[int, int]:
+        s = max(1, parse_unit_coord(unit, "start", default=1))
+        return s, max(s, parse_unit_coord(unit, "end", default=s))
+
     filtered_reps: List[Tuple[Dict[str, Any], str]] = []
     for u, rep in plan.replacements:
+        u_span = _unit_span(u)
         if any(
-            u is r
-            or (
-                u.get("file") == r.get("file")
-                and max(1, parse_unit_coord(u, "start", default=1))
-                == max(1, parse_unit_coord(r, "start", default=1))
-                and max(1, parse_unit_coord(u, "end", default=1))
-                == max(1, parse_unit_coord(r, "end", default=1))
-            )
+            u is r or (u.get("file") == r.get("file") and u_span == _unit_span(r))
             for r in retained_cands
         ):
             if not any(

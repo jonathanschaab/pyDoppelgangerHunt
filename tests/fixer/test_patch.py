@@ -6675,6 +6675,25 @@ def test_render_file_patch_plan_tier2_collision_fallback() -> None:
     assert "# replaced 2" not in diff
 
 
+def test_render_file_patch_plan_unit_end_defaults_to_start() -> None:
+    """Verifies that _render_file_patch_plan retains units whose end coordinate is omitted
+    by correctly defaulting end to start."""
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _render_file_patch_plan
+
+    plan = _FilePatchPlan(
+        file_path=Path("test.py"),
+        rel_path="test.py",
+        orig_text="a = 1\nb = 2\nc = 3\n",
+        is_new_file=False,
+    )
+    u_no_end = {"file": "test.py", "start": 1}
+    plan.replacements.append((u_no_end, "# replaced line 1\n"))
+
+    diff = _render_file_patch_plan(plan, replace_clones=True)
+    assert "--- a/test.py" in diff
+    assert "# replaced line 1" in diff
+
+
 def test_generate_refactoring_patch_no_state_leakage_on_skipped_pair(tmp_path: Path) -> None:
     """Verifies that helper names and comments are not leaked when clone extraction is skipped."""
     f1 = tmp_path / "m1.py"
