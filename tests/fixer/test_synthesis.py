@@ -3751,6 +3751,79 @@ def test_collect_downstream_read_names_lru_caching() -> None:
     assert reads3 == {"extra"}
 
 
+def test_collect_pre_unit_closures_deeply_nested_compound_statements() -> None:
+    """Verifies that _collect_pre_unit_closures discovers pre-unit closures across nested
+    compound statements (if/for/try/with) without missing headers or corrupting scopes."""
+    from pydoppelgangerhunt.fixer.dataflow import _collect_pre_unit_closures
+
+    code = (
+        "if (lambda: cond_captured)():\n"
+        "    for item in (x for x in iter_captured):\n"
+        "        try:\n"
+        "            with ctx_captured as c:\n"
+        "                cb = lambda: inner_captured\n"
+        "        except Exception:\n"
+        "            handler_cb = lambda: err_captured\n"
+        "# Line 8: Unit starts here\n"
+        "result = 123\n"
+    )
+    tree = ast.parse(code)
+    captured = _collect_pre_unit_closures(tree, u_start=8)
+    expected = {
+        "cond_captured",
+        "iter_captured",
+        "inner_captured",
+        "err_captured",
+    }
+    assert expected.issubset(captured)
+
+
+def test_collect_downstream_read_names_source_digest_optimization() -> None:
+    """Verifies that collect_downstream_read_names uses precomputed source_digest in cache key."""
+    from pydoppelgangerhunt.fixer.dataflow import (
+        _clear_downstream_reads_cache,
+        collect_downstream_read_names,
+    )
+
+    _clear_downstream_reads_cache()
+    code = (
+        "def run():\n"
+        "    for x in range(10):\n"
+        "        yield x\n"
+        "        extra = x\n"
+        "    print(extra)\n"
+    )
+    unit = {"file": "mod.py", "start": 3, "end": 4}
+    digest = "fixed_hex_digest"
+
+    reads = collect_downstream_read_names(
+        code, unit, candidates={"extra"}, source_digest=digest
+    )
+    assert reads == {"extra"}
+
+    cached_reads = collect_downstream_read_names(
+        code, unit, candidates={"extra"}, source_digest=digest
+    )
+    assert cached_reads == {"extra"}
+
+
+def test_file_patch_plan_content_digest_caching() -> None:
+    """Verifies that _FilePatchPlan lazily computes and caches content_digest."""
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan
+
+    plan = _FilePatchPlan(
+        file_path=Path("test.py"),
+        rel_path="test.py",
+        orig_text="a = 1\nb = 2\n",
+        is_new_file=False,
+    )
+    digest1 = plan.content_digest
+    assert len(digest1) == 16
+    digest2 = plan.content_digest
+    assert digest1 == digest2
+    assert plan._content_digest is not None
+
+
 @pytest.mark.parametrize(
     ("unit_dict", "expected"),
     [

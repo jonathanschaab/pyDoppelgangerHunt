@@ -930,6 +930,38 @@ def _collect_pre_unit_closures(
     """
     captured_reads: Set[str] = set()
 
+    def _extract_header_nodes(s: ast.stmt) -> List[ast.AST]:
+        if isinstance(s, ast.If):
+            return [s.test]
+        if isinstance(s, (ast.For, ast.AsyncFor)):
+            return [s.target, s.iter]
+        if isinstance(s, ast.While):
+            return [s.test]
+        if isinstance(s, (ast.With, ast.AsyncWith)):
+            headers: List[ast.AST] = []
+            for item in s.items:
+                headers.append(item.context_expr)
+                if item.optional_vars is not None:
+                    headers.append(item.optional_vars)
+            return headers
+        if isinstance(s, ast.Try):
+            return [h.type for h in s.handlers if h.type is not None]
+        try_star_cls = getattr(ast, "TryStar", None)
+        if try_star_cls is not None and isinstance(s, try_star_cls):
+            return [
+                h.type
+                for h in getattr(s, "handlers", [])
+                if getattr(h, "type", None) is not None
+            ]
+        if hasattr(ast, "Match") and isinstance(s, ast.Match):
+            headers = [s.subject]
+            for case in s.cases:
+                headers.append(case.pattern)
+                if case.guard is not None:
+                    headers.append(case.guard)
+            return headers
+        return [s]
+
     def _walk_stmts(stmts: Iterable[ast.stmt]) -> None:
         for stmt in stmts:
             stmt_start = getattr(stmt, "lineno", 0)
@@ -961,11 +993,12 @@ def _collect_pre_unit_closures(
                             captured_reads.update(_extract_nested_scope_free_reads(item))
                 continue
 
-            for subnode in ast.walk(stmt):
-                if isinstance(subnode, (ast.Lambda, ast.GeneratorExp)):
-                    sub_lineno = getattr(subnode, "lineno", stmt_start)
-                    if sub_lineno < u_start:
-                        captured_reads.update(_extract_nested_scope_free_reads(subnode))
+            for hnode in _extract_header_nodes(stmt):
+                for subnode in ast.walk(hnode):
+                    if isinstance(subnode, (ast.Lambda, ast.GeneratorExp)):
+                        sub_lineno = getattr(subnode, "lineno", stmt_start)
+                        if sub_lineno < u_start:
+                            captured_reads.update(_extract_nested_scope_free_reads(subnode))
 
             for attr in ("body", "orelse", "finalbody"):
                 sub_stmts = getattr(stmt, attr, None)
@@ -1000,13 +1033,18 @@ def _build_downstream_cache_key(
     u_end: int,
     candidates: Optional[Set[str]],
     skip_pre_unit_closures: bool,
+    source_digest: Optional[str] = None,
 ) -> Tuple[Any, ...]:
     """Forms a persistent cache key for downstream AST read analysis."""
     file_path_str = str(unit.get("file") or "")
     mtime = unit.get("mtime") or unit.get("timestamp")
-    content_digest = hashlib.sha256(
-        source_text.encode("utf-8", errors="replace")
-    ).hexdigest()[:16]
+    digest = source_digest or unit.get("source_digest") or unit.get("content_digest")
+    if digest is not None:
+        content_digest = str(digest)[:16]
+    else:
+        content_digest = hashlib.sha256(
+            source_text.encode("utf-8", errors="replace")
+        ).hexdigest()[:16]
     start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
     end_col = _extract_unit_end_col(unit)
     cands_key = frozenset(candidates) if candidates is not None else None
@@ -1179,6 +1217,7 @@ def collect_downstream_read_names(
     *,
     tree: Optional[ast.AST] = None,
     skip_pre_unit_closures: bool = False,
+    source_digest: Optional[str] = None,
 ) -> Optional[Set[str]]:
     """Identifies variable names loaded downstream of a unit within its lexical execution scope.
 
@@ -1202,7 +1241,13 @@ def collect_downstream_read_names(
         return set()
 
     cache_key = _build_downstream_cache_key(
-        source_text, unit, u_start, u_end, candidates, skip_pre_unit_closures
+        source_text,
+        unit,
+        u_start,
+        u_end,
+        candidates,
+        skip_pre_unit_closures,
+        source_digest=source_digest,
     )
     with _downstream_cache_lock:
         if cache_key in _downstream_reads_cache:
@@ -1449,6 +1494,8 @@ def resolve_clone_generator_subroutine_outputs(
     tree2: Optional[ast.AST] = None,
     repo_root: Optional[str] = None,
     skip_pre_unit_closures: bool = False,
+    source_digest1: Optional[str] = None,
+    source_digest2: Optional[str] = None,
 ) -> Optional[Tuple[List[str], List[str]]]:
     """Resolves output variable bindings for clone generator subroutines across two code units.
 
@@ -1479,12 +1526,12 @@ def resolve_clone_generator_subroutine_outputs(
     cands2 = set(outs2)
 
     targets = [
-        (u1, cands1, source_text1, tree1),
-        (u2, cands2, source_text2, tree2),
+        (u1, cands1, source_text1, tree1, source_digest1),
+        (u2, cands2, source_text2, tree2, source_digest2),
     ]
     target_srcs: List[Optional[str]] = []
     downstream_reads: List[Optional[Set[str]]] = []
-    for u_item, cands, s_text, tr in targets:
+    for u_item, cands, s_text, tr, s_digest in targets:
         src = (
             s_text
             if s_text is not None
@@ -1498,6 +1545,7 @@ def resolve_clone_generator_subroutine_outputs(
                 candidates=cands,
                 tree=tr,
                 skip_pre_unit_closures=skip_pre_unit_closures,
+                source_digest=s_digest,
             )
         else:
             reads = None

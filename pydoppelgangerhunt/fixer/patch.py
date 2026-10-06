@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import builtins
 import difflib
+import hashlib
 import logging
 import os
 import re
@@ -831,6 +832,16 @@ class _FilePatchPlan:
         self.claimed_units: List[UnitDict] = []
         self._cached_ast: Optional[ast.AST] = None
         self._ast_attempted: bool = False
+        self._content_digest: Optional[str] = None
+
+    @property
+    def content_digest(self) -> str:
+        """SHA-256 digest prefix of orig_text, cached for reuse in downstream analysis."""
+        if self._content_digest is None:
+            self._content_digest = hashlib.sha256(
+                self.orig_text.encode("utf-8", errors="replace")
+            ).hexdigest()[:16]
+        return self._content_digest
 
     @property
     def parsed_tree(self) -> Optional[ast.AST]:
@@ -2825,6 +2836,12 @@ def generate_refactoring_patch(
                 if f2_plan is not None
                 else (tree1 if is_same_file else None)
             )
+            digest1 = f1_plan.content_digest
+            digest2 = (
+                f2_plan.content_digest
+                if f2_plan is not None
+                else (digest1 if is_same_file else None)
+            )
             # Analyze each unit's scope individually.
             # Each unit occupies positional slot u1, so tree1 supplies its corresponding AST.
             s1 = analyze_unit_variable_scope(u1_eff, repo_root=str(root), tree1=tree1)
@@ -2942,6 +2959,8 @@ def generate_refactoring_patch(
                     tree2=tree2,
                     repo_root=str(root),
                     skip_pre_unit_closures=effective_skip_closures,
+                    source_digest1=digest1,
+                    source_digest2=digest2,
                 )
                 if resolved_sub_outs is None:
                     logger.debug(

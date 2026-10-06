@@ -95,12 +95,18 @@ def _resolve_safe_unit_file_path(
             file_path = target_root / file_path
 
     try:
+        if file_path.is_absolute():
+            try:
+                file_path = target_root / file_path.resolve().relative_to(target_root)
+            except ValueError:
+                return None
+
         if not file_path.is_file() or file_path.is_symlink():
             return None
         for parent in file_path.parents:
             if parent.is_symlink():
                 return None
-            if parent == target_root:
+            if parent == target_root or parent.resolve() == target_root:
                 break
 
         resolved_file = file_path.resolve()

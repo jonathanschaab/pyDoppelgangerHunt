@@ -287,6 +287,43 @@ def test_extract_unit_source_code_empty_and_directory_path(tmp_path: Path) -> No
     u_dir = {"file": str(tmp_path), "name": "dir_unit", "start": 1, "end": 3}
     assert extract_unit_source_code(u_dir) == ["# Source for dir_unit lines 1-3\n"]
 
+
+def test_resolve_safe_unit_file_path_symlinked_root_prefix(tmp_path: Path) -> None:
+    """Verifies that _resolve_safe_unit_file_path handles absolute paths with symlink roots."""
+    from pydoppelgangerhunt.fixer.source import _resolve_safe_unit_file_path
+
+    real_repo = tmp_path / "real_repo"
+    real_repo.mkdir()
+    target_py = real_repo / "main.py"
+    target_py.write_text("print('hello')\n", encoding="utf-8")
+
+    # Direct resolution under real root
+    resolved = _resolve_safe_unit_file_path({"file": str(target_py)}, repo_root=str(real_repo))
+    assert resolved == target_py.resolve()
+
+    # Outside root should return None
+    outside_py = tmp_path / "outside.py"
+    outside_py.write_text("print('outside')\n", encoding="utf-8")
+    assert _resolve_safe_unit_file_path({"file": str(outside_py)}, repo_root=str(real_repo)) is None
+
+    # Platform symlinked root alias test (if symlinks supported on OS/privilege)
+    sym_repo = tmp_path / "sym_repo"
+    try:
+        sym_repo.symlink_to(real_repo, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        return
+
+    # When file path uses sym_repo prefix and repo_root uses real_repo (or vice versa)
+    res1 = _resolve_safe_unit_file_path(
+        {"file": str(sym_repo / "main.py")}, repo_root=str(real_repo)
+    )
+    assert res1 == target_py.resolve()
+
+    res2 = _resolve_safe_unit_file_path(
+        {"file": str(target_py)}, repo_root=str(sym_repo)
+    )
+    assert res2 == target_py.resolve()
+
 def test_expression_unit_midline_pragma_placement() -> None:
     """Verifies that boundary pragmas are appended to the line end when trailing code is present."""
     source = "call([x for x in data], extra_arg)  # type: ignore\n"
