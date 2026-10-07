@@ -1506,15 +1506,12 @@ def test_resolve_generator_subroutine_outputs_preserves_per_side_necessity_and_s
     assert fb_def1 == ["total", "x"]
     assert fb_def2 == ["count", "x"]
 
-    # 3. Unknown fallback without definite sets: unconstrained fallback preserves all paired outputs
+    # 3. Unknown fallback without definite sets: fails closed on non-definite outputs
     res3 = resolve_generator_subroutine_outputs(
         GeneratorCloneSideData(u1_outs, downstream={"total"}),
         GeneratorCloneSideData(u2_outs, downstream=None),
     )
-    assert res3 is not None
-    fb_out1, fb_out2 = res3
-    assert fb_out1 == ["total", "x"]
-    assert fb_out2 == ["count", "x"]
+    assert res3 is None
 
     # 4. Neither side needs outputs
     res4 = resolve_generator_subroutine_outputs(
@@ -3386,16 +3383,27 @@ def test_collect_downstream_read_names_inverted_coordinates() -> None:
 
 
 def test_resolve_clone_generator_subroutine_outputs_duplicate_names_fails_closed() -> None:
-    """Verifies that resolve_clone_generator_subroutine_outputs fails closed (returns None)
-    when precomputed outputs contain duplicate names causing arity collapse."""
+    """Verifies that resolve_clone_generator_subroutine_outputs returns ([], []) when outputs
+    are unneeded downstream, and fails closed (returns None) when downstream reads outputs and
+    precomputed outputs contain duplicate names causing arity collapse."""
     u1 = {"file": "mod1.py", "start": 1, "end": 2, "outputs": ["a", "b"]}
     u2 = {"file": "mod2.py", "start": 1, "end": 2, "outputs": ["c", "c"]}
     scope1 = {"inputs": [], "definite_stores": ["a", "b"]}
     scope2 = {"inputs": [], "definite_stores": ["c"]}
-    res = resolve_clone_generator_subroutine_outputs(
+    res_unneeded = resolve_clone_generator_subroutine_outputs(
         u1, u2, scope1, scope2, source_text1="yield 1", source_text2="yield 1"
     )
-    assert res is None
+    assert res_unneeded == ([], [])
+
+    res_needed = resolve_clone_generator_subroutine_outputs(
+        u1,
+        u2,
+        scope1,
+        scope2,
+        source_text1="yield 1\nyield 2\nprint(a, b)",
+        source_text2="yield 1\nyield 2\nprint(c)",
+    )
+    assert res_needed is None
 
 
 def test_load_unit_file_text_source_lines_fallback() -> None:
@@ -3903,10 +3911,16 @@ def test_collect_downstream_read_names_cache_invalidation_on_mtime() -> None:
     reads2 = collect_downstream_read_names(code, unit2)
     assert reads1 == {"x"}
     assert reads2 == {"x"}
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        _downstream_reads_cache,
+    )
+    # Content digest deduplication: identical content with differing timestamps shares the cache
+    assert len(_downstream_reads_cache) == 1
 
 
-def test_collect_downstream_read_names_disk_mtime_invalidation(tmp_path: Path) -> None:
-    """Verifies that differing mtime produces distinct cache entries for downstream reads."""
+def test_collect_downstream_read_names_digest_invalidation(tmp_path: Path) -> None:
+    """Verifies that differing content digest produces distinct cache entries for
+    downstream reads."""
     from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
         _downstream_reads_cache,
     )
@@ -3915,12 +3929,12 @@ def test_collect_downstream_read_names_disk_mtime_invalidation(tmp_path: Path) -
     f_path = tmp_path / "target.py"
     code = "def f():\n    x = 1\n    return x\n"
     f_path.write_text(code, encoding="utf-8")
-    unit1 = {"file": str(f_path), "start": 2, "end": 2, "mtime": 1000.0}
+    unit1 = {"file": str(f_path), "start": 2, "end": 2, "source_digest": "hash1"}
     reads1 = collect_downstream_read_names(code, unit1)
     assert reads1 == {"x"}
     assert len(_downstream_reads_cache) == 1
 
-    unit2 = {"file": str(f_path), "start": 2, "end": 2, "mtime": 2000.0}
+    unit2 = {"file": str(f_path), "start": 2, "end": 2, "source_digest": "hash2"}
     reads2 = collect_downstream_read_names(code, unit2)
     assert reads2 == {"x"}
     assert len(_downstream_reads_cache) == 2
@@ -4250,7 +4264,9 @@ def test_coordinate_parsing_colon_formatted_lines_across_subsystems() -> None:
     assert check_units_overlap(u1, u2) is False
 
     # 7. is_valid_unit_coordinates
-    assert is_valid_unit_coordinates(u1) is True
+    assert is_valid_unit_coordinates(u1, strict=False) is True
+    assert is_valid_unit_coordinates(u1) is False
+    assert is_valid_unit_coordinates(u1, strict=True) is False
     assert is_valid_unit_coordinates({"start": "invalid:foo"}) is False
 
 
@@ -4615,5 +4631,134 @@ def test_coordinate_clamping_debug_logs(caplog: pytest.LogCaptureFixture) -> Non
         bounds = _unit_line_bounds(unit_zero)
         assert bounds == (1, 1)
         assert "Clamped invalid unit coordinates" in caplog.text
+
+
+def test_downstream_dynamic_reads_fail_closed() -> None:
+    """Verifies that downstream calls to dynamic read functions (locals, vars, eval, exec, dir)
+    mark all candidate outputs as loaded fail-closed."""
+    code_locals = (
+        "def f():\n"
+        "    x = 1\n"
+        "    y = 2\n"
+        "    data = locals()\n"
+        "    return data\n"
+    )
+    unit = {"file": "mod.py", "start": 2, "end": 3}
+    reads = collect_downstream_read_names(code_locals, unit, candidates={"x", "y"})
+    assert reads == {"x", "y"}
+
+    code_eval = (
+        "def g():\n"
+        "    x = 10\n"
+        "    eval('x + 1')\n"
+    )
+    unit_g = {"file": "mod.py", "start": 2, "end": 2}
+    reads_g = collect_downstream_read_names(code_eval, unit_g, candidates={"x"})
+    assert reads_g == {"x"}
+
+
+def test_enclosing_with_reads_fail_closed() -> None:
+    """Verifies that an enclosing with statement (custom or non-suppress) whose outputs are read
+    downstream causes generator subroutine extraction to fail closed."""
+    code = (
+        "def f():\n"
+        "    with custom_manager():\n"
+        "        total = 10\n"
+        "        yield total\n"
+        "    print(total)\n"
+    )
+    tree = ast.parse(code)
+    scope_node = tree.body[0]
+    assert _enclosing_try_reads_outputs(scope_node, 3, 4, {"total"}) is True
+    assert _enclosing_try_reads_outputs(scope_node, 3, 4, {"other"}) is False
+
+
+def test_yield_send_type_non_expr_contexts() -> None:
+    """Verifies that yield expressions in non-ast.Expr parent contexts (return, call, if, assign)
+    set has_yield_assignment=True to preserve send-type analysis."""
+    # Context 1: return (yield x)
+    code_ret = "def g():\n    return (yield 42)\n"
+    u_ret = {"file": "m.py", "start": 2, "end": 2, "source_text": code_ret}
+    info_ret = inspect_single_unit_scope(u_ret)
+    assert info_ret.get("has_yield_assignment") is True
+
+    # Context 2: f((yield x))
+    code_call = "def g():\n    func((yield 1))\n"
+    u_call = {"file": "m.py", "start": 2, "end": 2, "source_text": code_call}
+    info_call = inspect_single_unit_scope(u_call)
+    assert info_call.get("has_yield_assignment") is True
+
+    # Context 3: if (yield x):
+    code_if = "def g():\n    if (yield 1):\n        pass\n"
+    u_if = {"file": "m.py", "start": 2, "end": 3, "source_text": code_if}
+    info_if = inspect_single_unit_scope(u_if)
+    assert info_if.get("has_yield_assignment") is True
+
+    # Context 4: bare statement yield (parent is ast.Expr)
+    code_expr = "def g():\n    yield 1\n"
+    u_expr = {"file": "m.py", "start": 2, "end": 2, "source_text": code_expr}
+    info_expr = inspect_single_unit_scope(u_expr)
+    assert info_expr.get("has_yield_assignment") is False
+
+
+def test_is_valid_unit_coordinates_strict_mode() -> None:
+    """Verifies that is_valid_unit_coordinates strictly rejects blank, colon, float, or missing
+    start coordinates in default strict mode, but permits colon-formatted coordinates in lenient
+    mode."""
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
+        is_valid_unit_coordinates,
+    )
+
+    assert is_valid_unit_coordinates({"start": 1, "end": 2}) is True
+    # Colon coordinates rejected in strict mode, accepted in lenient mode
+    colon_unit = {"start": "10:0", "end": "20:0"}
+    assert is_valid_unit_coordinates(colon_unit, strict=True) is False
+    assert is_valid_unit_coordinates(colon_unit, strict=False) is True
+    # Blank start rejected in both
+    assert is_valid_unit_coordinates({"start": ""}) is False
+    assert is_valid_unit_coordinates({"start": ""}, strict=False) is False
+    # Missing start rejected
+    assert is_valid_unit_coordinates({"end": 5}) is False
+    # Float rejected in strict mode
+    assert is_valid_unit_coordinates({"start": 12.0}) is False
+    assert is_valid_unit_coordinates({"start": 12.0}, strict=False) is True
+
+
+def test_subroutine_async_preservation_in_async_func(tmp_path: Path) -> None:
+    """Verifies that a pure synchronous subroutine block inside an async def does not
+    inherit is_async=True and can be successfully refactored with a sync clone."""
+    file1 = tmp_path / "mod1.py"
+    file2 = tmp_path / "mod2.py"
+    file1.write_text(
+        "async def handle_request(req):\n"
+        "    a = 1\n"
+        "    b = 2\n"
+        "    res = a + b\n"
+        "    await req.send(res)\n",
+        encoding="utf-8",
+    )
+    file2.write_text(
+        "def process_data():\n"
+        "    a = 1\n"
+        "    b = 2\n"
+        "    res = a + b\n"
+        "    return res\n",
+        encoding="utf-8",
+    )
+    u1 = {"file": str(file1), "start": 2, "end": 4, "is_subroutine": True}
+    scope1 = inspect_single_unit_scope(u1, repo_root=str(tmp_path))
+    assert scope1.get("is_async") is False
+    assert scope1.get("has_yield") is False
+
+    file_gen = tmp_path / "gen.py"
+    file_gen.write_text(
+        "async def gen_items():\n"
+        "    yield 1\n",
+        encoding="utf-8",
+    )
+    u_gen = {"file": str(file_gen), "start": 2, "end": 2, "is_subroutine": True}
+    scope_gen = inspect_single_unit_scope(u_gen, repo_root=str(tmp_path))
+    assert scope_gen.get("has_yield") is True
+
 
 

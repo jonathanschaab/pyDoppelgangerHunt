@@ -12,8 +12,9 @@ import threading
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.source_lines import (
-    _resolve_safe_unit_file_path,
+    is_sliced_unit_source_lines,
     parse_unit_coord,
+    resolve_safe_unit_file_path,
 )
 from pydoppelgangerhunt.fixer.source import _find_innermost_enclosing_node
 
@@ -36,15 +37,7 @@ def _load_unit_file_text(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
 ) -> Optional[str]:
-    """Reads full source text from memory or disk for downstream AST read analysis.
-
-    For in-memory units with 'source_lines', note that when 'source_lines_is_sliced' is
-    unspecified (None), len(unit["source_lines"]) must strictly exceed end line e_d,
-    or reach EOF with s_d > 1, to prevent mistaking sliced excerpts as complete files.
-    When a unit reaches EOF starting at line 1 (e_d == len(source_lines) and s_d == 1),
-    callers providing in-memory source_lines without a disk backing file should
-    explicitly specify source_lines_is_sliced=False.
-    """
+    """Reads full source text from memory or disk for downstream AST read analysis."""
     is_sliced = unit.get("source_lines_is_sliced")
     if is_sliced is True:
         return None
@@ -55,24 +48,17 @@ def _load_unit_file_text(
     if source_text is not None:
         return str(source_text)
 
-    s_d = max(1, parse_unit_coord(unit, "start", default=1))
-    e_d = max(s_d, parse_unit_coord(unit, "end", default=s_d))
-
-    if "source_lines" in unit and isinstance(unit["source_lines"], (list, tuple)):
-        is_full_file = (
-            is_sliced is False
-            or len(unit["source_lines"]) > e_d
-            or (len(unit["source_lines"]) == e_d and s_d > 1)
-        )
-        if is_full_file:
+    unit_lines = unit.get("source_lines")
+    if unit_lines and isinstance(unit_lines, (list, tuple)):
+        if not is_sliced_unit_source_lines(unit, unit_lines):
             return "".join(
                 ln if ln.endswith("\n") else ln + "\n"
-                for ln in unit["source_lines"]
+                for ln in unit_lines
             )
 
     # Disk fallback: strictly only .py files within repo_root or CWD are accepted.
     # Notebooks (.ipynb) and out-of-root files fail closed and return None.
-    resolved_file = _resolve_safe_unit_file_path(
+    resolved_file = resolve_safe_unit_file_path(
         unit, repo_root=repo_root, allowed_suffixes=(".py",)
     )
     if resolved_file is not None:
@@ -131,12 +117,15 @@ def is_subroutine_unit(unit: Dict[str, Any]) -> bool:
     """Checks whether an AST code unit is a subroutine block rather than a whole function.
 
     Classification Rules:
-    1. Known subroutine kinds ('compound_block', 'sliding_window', 'clause_branch') return True.
-    2. Whole-callable or expression kinds ('function', 'closure', 'method', 'comprehension',
+    1. Explicit 'is_subroutine' boolean in unit takes precedence if present.
+    2. Known subroutine kinds ('compound_block', 'sliding_window', 'clause_branch') return True.
+    3. Whole-callable or expression kinds ('function', 'closure', 'method', 'comprehension',
        'complex_expr') return False.
-    3. Name heuristic fallback: when 'kind' is unspecified or unrecognized, units whose 'name'
+    4. Name heuristic fallback: when 'kind' is unspecified or unrecognized, units whose 'name'
        contains ':' (e.g. 'fn:for#1' or 'process:if') are classified as subroutine blocks.
     """
+    if "is_subroutine" in unit and unit.get("is_subroutine") is not None:
+        return bool(unit["is_subroutine"])
     unit_kind = str(unit.get("kind") or "")
     if unit_kind in ("compound_block", "sliding_window", "clause_branch"):
         return True
@@ -658,6 +647,9 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         )
         self.loaded: Set[str] = set()
         self.killed: Set[str] = set()
+        self.has_dynamic_read: bool = False
+
+    _DYNAMIC_READ_FUNCS = frozenset({"locals", "vars", "eval", "exec", "dir"})
 
     def _is_node_after_unit(self, node: ast.AST) -> bool:
         lineno = getattr(node, "lineno", None)
@@ -929,6 +921,24 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         if self._should_inspect_read(node):
             self._record_import_names(node, self.killed)
 
+    def visit_Call(self, node: ast.Call) -> None:
+        self.generic_visit(node)
+        if self._should_inspect_read(node):
+            func_name = None
+            if isinstance(node.func, ast.Name):
+                func_name = node.func.id
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in ("builtins", "__builtins__")
+            ):
+                func_name = node.func.attr
+            if func_name in self._DYNAMIC_READ_FUNCS:
+                self.has_dynamic_read = True
+                if self.candidates is not None:
+                    for name in self.candidates:
+                        self._record_downstream_read(name)
+
 
 def _collect_scope_closures(scope_node: ast.AST) -> List[Tuple[int, Set[str]]]:
     """Discovers all closures defined in a scope, recorded with their starting line."""
@@ -1048,7 +1058,6 @@ def _build_downstream_cache_key(
 ) -> Tuple[Any, ...]:
     """Forms a persistent cache key for downstream AST read analysis."""
     file_path_str = str(unit.get("file") or "")
-    mtime = unit.get("mtime") or unit.get("timestamp")
     digest = source_digest or unit.get("source_digest") or unit.get("content_digest")
     if digest is not None:
         content_digest = str(digest)[:16]
@@ -1063,7 +1072,6 @@ def _build_downstream_cache_key(
     unit_name = unit.get("name")
     return (
         content_digest,
-        mtime,
         file_path_str,
         u_start,
         u_end,
@@ -1204,17 +1212,33 @@ def _scope_reads_outputs_after_line(
     line: int,
     outputs: Set[str],
 ) -> bool:
-    """Checks whether any statement in the scope loads outputs after the given line."""
+    """Checks whether any statement in the scope loads outputs after the given line,
+    including loop-carried reads if line sits inside an enclosing loop."""
+    enclosing_loops = _find_enclosing_loops(scope_node, line, line)
     visitor = _DownstreamReadVisitor(
         line,
         line,
         None,
         candidates=outputs,
+        enclosing_loops=enclosing_loops,
         pass_mode=_VisitorPassMode.AFTER_UNIT,
     )
     for stmt in getattr(scope_node, "body", []):
         visitor.visit(stmt)
-    return bool(visitor.loaded & outputs)
+    loaded = set(visitor.loaded)
+    if enclosing_loops and not loaded.intersection(outputs):
+        loop_visitor = _DownstreamReadVisitor(
+            line,
+            line,
+            None,
+            candidates=outputs,
+            enclosing_loops=enclosing_loops,
+            pass_mode=_VisitorPassMode.LOOP_CARRIED,
+        )
+        for stmt in getattr(scope_node, "body", []):
+            loop_visitor.visit(stmt)
+        loaded.update(loop_visitor.loaded)
+    return bool(loaded & outputs)
 
 
 def _enclosing_try_reads_outputs(
@@ -1232,10 +1256,7 @@ def _enclosing_try_reads_outputs(
     for node in _get_scope_try_and_with_blocks(scope_node):
         if isinstance(node, (ast.With, ast.AsyncWith)):
             with_body = getattr(node, "body", [])
-            if (
-                _stmts_enclose_unit(with_body, u_start, u_end)
-                and _is_swallowing_with_statement(node)
-            ):
+            if _stmts_enclose_unit(with_body, u_start, u_end):
                 w_end_raw = getattr(node, "end_lineno", None)
                 b_end = max(
                     int(
@@ -1412,6 +1433,15 @@ def collect_downstream_read_names(
             loop_visitor.visit(stmt)
         loaded.update(loop_visitor.loaded)
 
+    has_dynamic = visitor.has_dynamic_read or (
+        bool(enclosing_loops) and getattr(loop_visitor, "has_dynamic_read", False)
+    )
+    if has_dynamic and candidates is None:
+        for subnode in ast.walk(scope_node):
+            if isinstance(subnode, ast.Name) and isinstance(subnode.ctx, (ast.Store, ast.Load)):
+                if subnode.id not in _BUILTIN_NAMES and not subnode.id.startswith("__"):
+                    loaded.add(subnode.id)
+
     _merge_pre_unit_closure_reads(loaded, pre_unit_captured_reads, candidates)
 
     with _downstream_cache_lock:
@@ -1465,16 +1495,16 @@ def _filter_valid_output_pairs(
 ) -> Optional[Tuple[List[str], List[str]]]:
     """Validates output pairs against allowed bindings and returns separated output lists."""
     for side_label, allowed_set, col_idx in (("u1", u1_allowed, 0), ("u2", u2_allowed, 1)):
-        if allowed_set is not None:
-            missing = [p[col_idx] for p in pairs if p[col_idx] not in allowed_set]
-            if missing:
-                logger.debug(
-                    "Rejecting generator subroutine outputs: %s output %s: %s",
-                    side_label,
-                    reason,
-                    missing,
-                )
-                return None
+        effective_allowed = set() if allowed_set is None else allowed_set
+        missing = [p[col_idx] for p in pairs if p[col_idx] not in effective_allowed]
+        if missing:
+            logger.debug(
+                "Rejecting generator subroutine outputs: %s output %s: %s",
+                side_label,
+                reason,
+                missing,
+            )
+            return None
     return [p[0] for p in pairs], [p[1] for p in pairs]
 
 
@@ -1496,8 +1526,8 @@ def resolve_generator_subroutine_outputs(
     outs2 = list(side2.outputs)
     d1_raw = side1.downstream
     d2_raw = side2.downstream
-    u1_def = side1.definite
-    u2_def = side2.definite
+    u1_def = side1.definite if side1.definite is not None else set()
+    u2_def = side2.definite if side2.definite is not None else set()
 
     d1_needed = d1_raw if d1_raw is not None else set(outs1)
     d2_needed = d2_raw if d2_raw is not None else set(outs2)
@@ -1542,13 +1572,28 @@ def is_async_generator_with_return_value(
     *scopes: Optional[Dict[str, Any]],
     has_outputs: bool = False,
 ) -> bool:
-    """Checks whether scopes represent an async generator attempting to return values or outputs."""
+    """Checks whether scopes represent an async generator attempting to return values or outputs,
+    or involving delegation semantic loss (yield assignments, try/with cleanup blocks)."""
     has_yield = any(bool(s.get("has_yield")) for s in scopes if s is not None)
     is_async = any(bool(s.get("is_async")) for s in scopes if s is not None)
+    if not (has_yield and is_async):
+        return False
     has_ret = has_outputs or any(
         bool(s.get("has_return_value")) for s in scopes if s is not None
     )
-    return has_yield and is_async and has_ret
+    if has_ret:
+        return True
+    has_yield_assign = any(
+        bool(s.get("has_yield_assignment")) for s in scopes if s is not None
+    )
+    if has_yield_assign:
+        return True
+    has_try_or_with = any(
+        bool(s.get("has_try_or_with")) for s in scopes if s is not None
+    )
+    if has_try_or_with:
+        return True
+    return False
 
 
 def _extract_effective_unit_outputs(
@@ -1626,8 +1671,6 @@ def resolve_clone_generator_subroutine_outputs(
     if is_precomputed:
         outs1 = list(dict.fromkeys(_extract_effective_unit_outputs(u1, scope1)))
         outs2 = list(dict.fromkeys(_extract_effective_unit_outputs(u2, scope2)))
-        if len(outs1) != len(outs2):
-            return None
     else:
         outs1 = _extract_effective_unit_outputs(u1, scope1)
         outs2 = _extract_effective_unit_outputs(u2, scope2)

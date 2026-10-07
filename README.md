@@ -288,7 +288,10 @@ strict fail-closed safety invariants:
 If `pyDoppelgangerHunt` reports clones but does not propose extractions for a pair when running
 with `--patch`, check verbose logs (`-v` or logging level `DEBUG`):
 - **Pre-Unit Closure Escapes**: If candidate outputs are captured by closures or callbacks defined
-  prior to the unit, run with `--skip-pre-unit-closures` or `--closure-strictness lenient`.
+  prior to the unit, extraction fails closed to prevent the closure from observing stale local
+  state after subroutine extraction. If you have verified that the pre-unit closure is never
+  invoked after the extracted unit executes, you can enable `--closure-strictness lenient`
+  (or `--skip-pre-unit-closures`).
 - **Abnormal Exit Handlers**: If a generator subroutine is enclosed in a `try` block whose `finally`
   or `except` handlers read needed outputs, extraction is rejected to protect cleanup integrity.
 - **Indefinite Stores**: If an output variable lacks definite assignment along every internal

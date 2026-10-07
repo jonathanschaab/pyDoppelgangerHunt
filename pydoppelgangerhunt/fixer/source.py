@@ -11,10 +11,11 @@ import warnings
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.source_lines import (
-    _resolve_safe_unit_file_path,
     count_physical_newlines,
     detect_line_ending,
+    is_sliced_unit_source_lines,
     parse_unit_coord,
+    resolve_safe_unit_file_path,
     split_source_lines,
 )
 
@@ -24,7 +25,6 @@ __all__ = [
     "ReplacementItem",
     "UnitDict",
     "UnitSpan",
-    "_resolve_safe_unit_file_path",
     "col_offset_to_char_offset",
     "compute_line_offsets",
     "compute_unit_byte_offsets",
@@ -35,9 +35,11 @@ __all__ = [
     "detect_line_ending",
     "extract_unit_comments_and_pragmas",
     "find_enclosing_function_is_async",
+    "is_sliced_unit_source_lines",
     "is_valid_unit_coordinates",
     "parse_unit_coord",
     "replace_unit_in_source",
+    "resolve_safe_unit_file_path",
     "resolve_unit_replacement",
     "slice_source_by_token_range",
     "split_source_lines",
@@ -46,19 +48,31 @@ __all__ = [
 UnitDict = Dict[str, Any]
 
 _parse_unit_coord = parse_unit_coord
+_resolve_safe_unit_file_path = resolve_safe_unit_file_path
 
 
-def is_valid_unit_coordinates(u: Any) -> bool:
-    """Verifies that an AST unit dictionary has valid integer coordinates."""
+def is_valid_unit_coordinates(u: Any, strict: bool = True) -> bool:
+    """Verifies that an AST unit dictionary has valid integer coordinates.
+
+    In strict mode (default, for code refactoring and patching), start is required
+    and must parse strictly to a positive integer (rejecting floats, colons, and blank
+    strings). End, start_col, and end_col must also parse strictly if present.
+    """
     if not isinstance(u, dict):
         return False
+    if "start" not in u or u.get("start") is None:
+        return False
     try:
-        for key in ("start", "end", "start_col", "end_col"):
+        start_val = parse_unit_coord(u, "start", default=None, strict=strict)
+        if start_val is None or start_val <= 0:
+            return False
+        for key in ("end", "start_col", "end_col"):
             if key in u and u.get(key) is not None:
-                if parse_unit_coord(u, key, default=None) is None:
+                coord_val = parse_unit_coord(u, key, default=None, strict=strict)
+                if coord_val is None or coord_val < 0:
                     return False
         return True
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, KeyError):
         return False
 
 

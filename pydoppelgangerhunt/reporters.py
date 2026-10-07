@@ -15,6 +15,7 @@ from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
 from pydoppelgangerhunt.config import normalize_path_string
 from pydoppelgangerhunt.source_lines import (
     _resolve_safe_unit_file_path,
+    is_sliced_unit_source_lines,
     parse_unit_coord,
     resolve_unit_line_bounds,
     split_source_lines,
@@ -82,10 +83,7 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
         # the list is treated as already sliced to unit boundaries (since for any valid
         # file containing the unit, len(file) >= e_d > e_d - s_d + 1, making an exact
         # length match impossible unless the file is out-of-bounds).
-        is_sliced = unit.get("source_lines_is_sliced")
-        if is_sliced is True or (
-            is_sliced is None and len(source_lines) == (e_d - s_d + 1) and s_d > 1
-        ):
+        if is_sliced_unit_source_lines(unit, source_lines):
             return [
                 ln if ln.endswith("\n") else ln + "\n"
                 for ln in source_lines

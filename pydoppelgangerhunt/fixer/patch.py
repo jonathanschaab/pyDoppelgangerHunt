@@ -71,6 +71,7 @@ from pydoppelgangerhunt.fixer.source import (
     resolve_unit_replacement,
     split_source_lines,
 )
+from pydoppelgangerhunt.source_lines import resolve_unit_line_bounds
 from pydoppelgangerhunt.fixer.synthesis import (
     _extract_required_typing_imports,
     _format_call_arguments,
@@ -220,11 +221,11 @@ def check_units_overlap(
         return _check_same_line_overlap(sc1, ec1, sc2, ec2)
 
     # Case 2: Sequential boundary touch (u1 ends where u2 begins)
-    if start1 < start2 == end1:
+    if start1 < start2 and start2 == end1:
         return _check_sequential_touch(ec1, sc2, start2 == end2, ec2)
 
     # Case 3: Sequential boundary touch (u2 ends where u1 begins)
-    if start2 < start1 == end2:
+    if start2 < start1 and start1 == end2:
         return _check_sequential_touch(ec2, sc1, start1 == end1, ec1)
 
     # Case 4: Units sharing start line (start1 == start2), or multi-line units sharing end line (end1 == end2).
@@ -517,8 +518,7 @@ def _build_whole_method_delegation(
 ) -> str:
     """Builds a delegated method replacement body preserving method signature and docstring."""
     lines = split_source_lines(source_text)
-    u_start = max(1, parse_unit_coord(unit, "start", default=1))
-    u_end = max(u_start, parse_unit_coord(unit, "end", default=max(u_start, len(lines))))
+    u_start, u_end = resolve_unit_line_bounds(unit)
 
     lead = lines[u_start - 1] if 1 <= u_start <= len(lines) else ""
     indent = lead[: len(lead) - len(lead.lstrip())]
@@ -2748,9 +2748,16 @@ def generate_refactoring_patch(
                 continue
 
             u1_lines = orig_lines
-            u2_lines = orig_lines if is_same_file else (f2_plan.orig_lines if f2_plan is not None else [])
+            u2_lines = (
+                orig_lines
+                if is_same_file
+                else (f2_plan.orig_lines if f2_plan is not None else None)
+            )
             u1_eff = dict(u1, source_lines=u1_lines, source_lines_is_sliced=False)
-            u2_eff = dict(u2, source_lines=u2_lines, source_lines_is_sliced=False)
+            if u2_lines is not None:
+                u2_eff = dict(u2, source_lines=u2_lines, source_lines_is_sliced=False)
+            else:
+                u2_eff = dict(u2)
 
             if replace_clones:
                 u1_claimed = any(
@@ -2810,10 +2817,6 @@ def generate_refactoring_patch(
                 u1_eff["receiver_param"] = fn1.get("receiver_param")
             if fn2 and "receiver_param" not in u2_eff:
                 u2_eff["receiver_param"] = fn2.get("receiver_param")
-            if orig_fn1 and "is_async" not in u1_eff and orig_fn1.get("is_async"):
-                u1_eff["is_async"] = True
-            if orig_fn2 and "is_async" not in u2_eff and orig_fn2.get("is_async"):
-                u2_eff["is_async"] = True
             if fn1 and fn2:
                 is_static = bool(fn1.get("is_static") and fn2.get("is_static"))
             else:
@@ -2833,9 +2836,9 @@ def generate_refactoring_patch(
             )
             s1 = inspect_single_unit_scope(u1_eff, repo_root=str(root), tree=tree1)
             s2 = inspect_single_unit_scope(u2_eff, repo_root=str(root), tree=tree2)
-            if orig_fn1 and orig_fn1.get("is_async"):
+            if orig_fn1 and orig_fn1.get("is_async") and s1.get("has_yield"):
                 s1["is_async"] = True
-            if orig_fn2 and orig_fn2.get("is_async"):
+            if orig_fn2 and orig_fn2.get("is_async") and s2.get("has_yield"):
                 s2["is_async"] = True
             if bool(s1.get("is_async")) != bool(s2.get("is_async")):
                 continue
@@ -2864,6 +2867,8 @@ def generate_refactoring_patch(
             if "embedded_return" in hazards1 | hazards2:
                 lines1 = u1_lines
                 lines2 = u2_lines
+                if lines1 is None or lines2 is None:
+                    continue
                 if not (
                     _has_unconditional_terminal_return(u1, lines1)
                     and _has_unconditional_terminal_return(u2, lines2)

@@ -1123,10 +1123,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     shared_module_name = str(args.shared_module_name or tool_cfg.get("shared_module_name", "_common.py"))
     if args.closure_strictness is not None or args.skip_pre_unit_closures:
         cli_strictness: Optional[str] = args.closure_strictness
-        cli_skip: bool = bool(args.skip_pre_unit_closures)
+        cli_skip: bool = _safe_bool(args.skip_pre_unit_closures)
     else:
         cli_strictness = tool_cfg.get("closure_strictness")
-        cli_skip = bool(tool_cfg.get("skip_pre_unit_closures", False))
+        cli_skip = _safe_bool(tool_cfg.get("skip_pre_unit_closures", False))
 
     if cli_strictness is not None and str(cli_strictness).strip().lower() not in (
         "strict", "lenient", "fail_closed", "fast", "skip"
@@ -1140,7 +1140,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         closure_strictness=cli_strictness,
         skip_pre_unit_closures=cli_skip,
     )
-    if skip_pre_unit_closures:
+    if skip_pre_unit_closures and getattr(args, "patch", False):
         logger.info(
             "Lenient closure mode active; skipping pre-unit closure scan during refactoring"
         )

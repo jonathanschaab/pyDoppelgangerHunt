@@ -8,7 +8,18 @@ import inspect
 import logging
 import sys
 import textwrap
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+    cast,
+)
 
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.fixer.dataflow import (
@@ -116,6 +127,8 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.has_return_value: bool = False
         self.has_yield: bool = False
         self.has_yield_assignment: bool = False
+        self.has_try_or_with: bool = False
+        self._ancestors: List[ast.AST] = []
         self.has_super: bool = False
         self.has_mangled_names: bool = False
         self.naked_breaks: int = 0
@@ -132,6 +145,13 @@ class _ScopeVisitor(ast.NodeVisitor):
             if receiver_names is not None
             else ("self", "cls")
         )
+
+    def visit(self, node: ast.AST) -> Any:
+        self._ancestors.append(node)
+        try:
+            return super().visit(node)
+        finally:
+            self._ancestors.pop()
 
     def _record_arg(
         self,
@@ -529,9 +549,25 @@ class _ScopeVisitor(ast.NodeVisitor):
             self.is_async = True
         self._visit_loop(node)
 
+    def visit_With(self, node: ast.With) -> None:
+        if len(self._scope_stack) <= 1:
+            self.has_try_or_with = True
+        self.generic_visit(node)
+
     def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
         if len(self._scope_stack) <= 1:
             self.is_async = True
+            self.has_try_or_with = True
+        self.generic_visit(node)
+
+    def visit_Try(self, node: ast.Try) -> None:
+        if len(self._scope_stack) <= 1:
+            self.has_try_or_with = True
+        self.generic_visit(node)
+
+    def visit_TryStar(self, node: ast.AST) -> None:
+        if len(self._scope_stack) <= 1:
+            self.has_try_or_with = True
         self.generic_visit(node)
 
     def visit_While(self, node: ast.While) -> None:
@@ -576,12 +612,20 @@ class _ScopeVisitor(ast.NodeVisitor):
                         ):
                             self.yield_expr_names.append((kind, f":literal:{t_name}"))
 
+    def _inspect_yield_assignment(self) -> None:
+        if len(self._ancestors) >= 2:
+            immediate_parent = self._ancestors[-2]
+            if not isinstance(immediate_parent, ast.Expr):
+                self.has_yield_assignment = True
+
     def visit_Yield(self, node: ast.Yield) -> None:
         self._record_yield_expr("yield", node)
+        self._inspect_yield_assignment()
         self.generic_visit(node)
 
     def visit_YieldFrom(self, node: ast.YieldFrom) -> None:
         self._record_yield_expr("yield_from", node)
+        self._inspect_yield_assignment()
         self.generic_visit(node)
 
     def visit_Return(self, node: ast.Return) -> None:
@@ -1204,6 +1248,7 @@ def _inspect_unit_scope(
         "is_control_flow_safe": True,
         "has_yield": False,
         "has_yield_assignment": False,
+        "has_try_or_with": False,
         "has_return": False,
         "has_return_value": False,
         "has_super": False,
@@ -1432,13 +1477,18 @@ def _inspect_unit_scope(
         "is_control_flow_safe": is_control_flow_safe,
         "has_yield": visitor.has_yield,
         "has_yield_assignment": visitor.has_yield_assignment,
+        "has_try_or_with": visitor.has_try_or_with,
         "has_return": visitor.has_return,
         "has_return_value": visitor.has_return_value,
         "has_super": visitor.has_super,
         "has_mangled_names": visitor.has_mangled_names,
         "local_imports": visitor.local_imports,
         "yield_expr_names": visitor.yield_expr_names,
-        "is_async": visitor.is_async or bool(unit_is_async),
+        "is_async": (
+            (visitor.is_async or (bool(unit_is_async) and visitor.has_yield))
+            if is_subroutine
+            else (visitor.is_async or bool(unit_is_async))
+        ),
         "conditional_outputs": conditional_outputs,
         "definite_stores": sorted(def_assigned),
         "has_instance_binding": has_instance_binding,
@@ -1507,6 +1557,10 @@ def analyze_unit_variable_scope(
             info1.get("has_yield_assignment", False)
             or info2.get("has_yield_assignment", False)
         )
+        has_try_or_with = bool(
+            info1.get("has_try_or_with", False)
+            or info2.get("has_try_or_with", False)
+        )
         has_return = info1["has_return"] or info2["has_return"]
         has_return_value = bool(info1.get("has_return_value") or info2.get("has_return_value"))
         has_super = bool(info1.get("has_super", False) or info2.get("has_super", False))
@@ -1534,6 +1588,7 @@ def analyze_unit_variable_scope(
         is_safe = info1["is_control_flow_safe"]
         has_yield = info1["has_yield"]
         has_yield_assignment = bool(info1.get("has_yield_assignment", False))
+        has_try_or_with = bool(info1.get("has_try_or_with", False))
         has_return = info1["has_return"]
         has_return_value = bool(info1.get("has_return_value"))
         has_super = bool(info1.get("has_super", False))
@@ -1577,6 +1632,7 @@ def analyze_unit_variable_scope(
         "is_control_flow_safe": is_safe,
         "has_yield": has_yield,
         "has_yield_assignment": has_yield_assignment,
+        "has_try_or_with": has_try_or_with,
         "has_return": has_return,
         "has_return_value": has_return_value,
         "has_super": has_super,
@@ -1617,7 +1673,7 @@ def dispatch_analyze_unit_variable_scope(
             p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
         )
     except (ValueError, TypeError):
-        supports_trees = True
+        supports_trees = False
 
     if supports_trees:
         return target(u1, u2=u2, repo_root=repo_root, tree1=tree1, tree2=tree2)
@@ -1630,5 +1686,22 @@ def dispatch_inspect_single_unit_scope(
     tree: Optional[ast.AST] = None,
 ) -> Dict[str, Any]:
     """Dispatches single-unit scope analysis, honoring mock patches on
-    analyze_unit_variable_scope."""
-    return dispatch_analyze_unit_variable_scope(unit, repo_root=repo_root, tree1=tree)
+    inspect_single_unit_scope or analyze_unit_variable_scope."""
+    pkg = sys.modules.get("pydoppelgangerhunt.fixer")
+    target = getattr(pkg, "inspect_single_unit_scope", None)
+    if target is not None and target is not inspect_single_unit_scope:
+        try:
+            sig = inspect.signature(target)
+            if "tree" in sig.parameters or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            ):
+                return cast(Dict[str, Any], target(unit, repo_root=repo_root, tree=tree))
+        except (ValueError, TypeError):
+            pass
+        return cast(Dict[str, Any], target(unit, repo_root=repo_root))
+
+    analyze_target = getattr(pkg, "analyze_unit_variable_scope", None)
+    if analyze_target is not None and analyze_target is not analyze_unit_variable_scope:
+        return dispatch_analyze_unit_variable_scope(unit, repo_root=repo_root, tree1=tree)
+
+    return inspect_single_unit_scope(unit, repo_root=repo_root, tree=tree)

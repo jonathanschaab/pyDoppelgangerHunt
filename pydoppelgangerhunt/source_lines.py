@@ -14,40 +14,48 @@ logger = logging.getLogger(__name__)
 _PHYSICAL_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
 
 __all__ = [
-    "_PHYSICAL_LINE_RE",
-    "_resolve_safe_unit_file_path",
     "count_physical_newlines",
     "detect_line_ending",
+    "is_sliced_unit_source_lines",
     "parse_unit_coord",
+    "resolve_safe_unit_file_path",
     "resolve_unit_line_bounds",
     "split_source_lines",
 ]
 
 
 @overload
-def parse_unit_coord(unit: Dict[str, Any], key: str) -> int:
-    ...
-
-
-@overload
-def parse_unit_coord(unit: Dict[str, Any], key: str, default: int) -> int:
-    ...
-
-
-@overload
-def parse_unit_coord(unit: Dict[str, Any], key: str, default: None) -> Optional[int]:
+def parse_unit_coord(unit: Dict[str, Any], key: str, *, strict: bool = ...) -> int:
     ...
 
 
 @overload
 def parse_unit_coord(
-    unit: Dict[str, Any], key: str, default: Optional[int]
+    unit: Dict[str, Any], key: str, default: int, *, strict: bool = ...
+) -> int:
+    ...
+
+
+@overload
+def parse_unit_coord(
+    unit: Dict[str, Any], key: str, default: None, *, strict: bool = ...
+) -> Optional[int]:
+    ...
+
+
+@overload
+def parse_unit_coord(
+    unit: Dict[str, Any], key: str, default: Optional[int], *, strict: bool = ...
 ) -> Optional[int]:
     ...
 
 
 def parse_unit_coord(
-    unit: Dict[str, Any], key: str, default: Optional[int] = 1
+    unit: Dict[str, Any],
+    key: str,
+    default: Optional[int] = 1,
+    *,
+    strict: bool = False,
 ) -> Optional[int]:
     """Extracts and parses an integer coordinate from a unit dictionary.
 
@@ -55,12 +63,38 @@ def parse_unit_coord(
     (e.g., '12:0' or '8:0'). For colon-formatted coordinates emitted by external linters
     or diagnostics (where the suffix denotes a sub-column or character index), the primary
     leading coordinate prefix before the colon is parsed as the integer value.
-    If the coordinate value is missing or empty, falls back to default.
+    In strict mode (strict=True), colon-formatted coordinates, empty/whitespace strings,
+    and floating point values are strictly rejected with ValueError.
+    If the coordinate value is missing or empty (in non-strict mode), falls back to default.
     Raises ValueError for non-numeric strings or unconvertible/overflow values.
     """
     val = unit.get(key)
     if val is None:
         return default
+    if strict:
+        if isinstance(val, str):
+            if ":" in val:
+                raise ValueError(
+                    f"Invalid coordinate {val!r}: colon format not allowed in strict mode"
+                )
+            if not val.strip():
+                raise ValueError(
+                    f"Invalid coordinate {val!r}: blank coordinate not allowed in strict mode"
+                )
+            try:
+                return int(val)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid coordinate {val!r}: cannot convert to integer"
+                ) from exc
+        if isinstance(val, float):
+            raise ValueError(
+                f"Invalid coordinate {val!r}: float coordinate not allowed in strict mode"
+            )
+        if isinstance(val, int):
+            return val
+        return _coerce_int_coord(val)
+
     if isinstance(val, str):
         val = val.split(":", 1)[0].strip()
         if not val:
@@ -83,12 +117,35 @@ def parse_unit_coord(
         if not val.is_integer():
             raise ValueError(f"Invalid coordinate {val!r}: cannot convert non-integral float")
         return int(val)
+    return _coerce_int_coord(val)
+
+
+def _coerce_int_coord(val: Any) -> int:
+    """Coerces coordinate value to int or raises ValueError on invalid/overflow inputs."""
     try:
         return int(val)
     except (ValueError, TypeError, OverflowError) as exc:
-        raise ValueError(
-            f"Invalid coordinate {val!r}: cannot convert to integer"
-        ) from exc
+        raise ValueError(f"Invalid coordinate {val!r}: cannot convert to integer") from exc
+
+
+def is_sliced_unit_source_lines(
+    unit: Dict[str, Any],
+    source_lines: Optional[Sequence[str]] = None,
+) -> bool:
+    """Determines whether a unit's source_lines collection represents a pre-sliced excerpt."""
+    is_sliced = unit.get("source_lines_is_sliced")
+    if is_sliced is not None:
+        return bool(is_sliced)
+    lines = source_lines if source_lines is not None else unit.get("source_lines")
+    if not lines or not isinstance(lines, (list, tuple)):
+        return False
+    s_d, e_d = resolve_unit_line_bounds(unit)
+    expected_len = max(0, e_d - s_d + 1)
+    if len(lines) == expected_len:
+        return True
+    if len(lines) < e_d:
+        return True
+    return False
 
 
 def resolve_unit_line_bounds(unit: Dict[str, Any]) -> Tuple[int, int]:
@@ -208,7 +265,7 @@ def detect_line_ending(*sources: Union[Optional[str], Iterable[Optional[str]]]) 
     return "\r"
 
 
-def _resolve_safe_unit_file_path(
+def resolve_safe_unit_file_path(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
     allowed_suffixes: Sequence[str] = (".py", ".ipynb"),
@@ -262,3 +319,6 @@ def _resolve_safe_unit_file_path(
         return resolved_file
     except (OSError, RuntimeError, ValueError):
         return None
+
+
+_resolve_safe_unit_file_path = resolve_safe_unit_file_path

@@ -28,16 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Mapping Container Type Inference**: Added support for `Mapping[...]` and `mapping[...]`
   container prefixes in `yield from` type unwrapping, inferring the iterated key type.
 - **Generator Send Type Inference**: Infers `Generator[YieldT, Any, ReturnT]` when a generator
-  subroutine contains a yield expression in assignment context (`x = yield y`), preserving explicit
-  send types when present.
-- **Stringified Float, Overflow, and NaN Coordinate Handling**: Extended `parse_unit_coord` to
-  parse stringified floating-point coordinate strings (e.g. `"12.0"` or `"12.0:0"`) safely while
-  strictly enforcing `float.is_integer()`, catching `OverflowError` (e.g. `inf`, `nan`), raising
-  `ValueError` and failing validation safely on non-integral floats (e.g. `12.7`).
+  subroutine contains a yield expression in any non-expression context (e.g. `x = yield y`,
+  `return (yield x)`, `f((yield))`, `if (yield):`), preserving explicit send types when present.
+- **Strict and Non-Strict Coordinate Parsing**: Added `strict: bool = False` to `parse_unit_coord`.
+  In strict mode (used by `is_valid_unit_coordinates` during patch generation), blank strings,
+  colon-formatted strings, and floats are strictly rejected to prevent invalid coordinates from
+  targeting line 1 or masking bugs. In non-strict mode, integer floats and diagnostic colon
+  formats parse the leading integer.
 - **Safe Unit File Resolution**: Unified `_load_unit_file_text` and `extract_unit_source_code`
-  under `_resolve_safe_unit_file_path`, enforcing repo root / CWD containment, symlink traversal
-  prevention (rejecting symlinked directories and files within the repo while allowing symlinked
-  repo roots), and rejecting `.ipynb` files as raw Python text.
+  under `resolve_safe_unit_file_path`, checking unresolved parent directories below the repo root
+  for symlinks before resolution to prevent traversing internal directory symlinks, enforcing root
+  containment, and rejecting `.ipynb` files as raw Python text.
 - **Forward Reference Quote Tracking**: Enhanced `_split_type_args` to track single and double
   quotes alongside bracket depth, preventing commas within literal strings from splitting
   type arguments.
@@ -46,20 +47,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   methods, and expressions.
 - **Asynchronous Generator Detection**: Added `is_async_generator_with_return_value` and
   `is_async` unit metadata tagging to reject asynchronous generator subroutines with
-  return values or downstream output assignments.
-- **Asynchronous Subroutine Inheritance & Context Isolation**: Subroutine units
-  (compound blocks, sliding windows, clause branches) enclosed within an `async def`
-  function inherit `is_async=True`, ensuring synthesized helper functions are defined as
-  `async def` and invoked via `await`. This preserves coroutine context isolation and
-  deliberately skips cross-context refactoring between asynchronous and synchronous callers
-  to avoid mixing event-loop-bound and blocking execution models.
-- **Colon-Formatted Coordinate Support**: Added support for colon-separated coordinates
-  (e.g. `"line:col"` in line coordinates and `"col:line"` in column fields, extracting
-  the leading coordinate prefix) in `parse_unit_coord` and `is_valid_unit_coordinates`.
+  return values, yield assignments, try/finally, or async with blocks.
+- **Context-Aware Subroutine Async Classification**: Subroutines inside `async def` only
+  inherit `is_async=True` if the unit itself contains `await`/`async for`/`async with` or contains
+  `yield` (PEP 525 async generator return rule). Pure synchronous code inside an `async def`
+  remains a synchronous helper, allowing deduplication with synchronous callers.
 - **Downstream Read Analysis Cache**: Implemented a thread-safe, bounded LRU cache for
   downstream live read collection keyed by content SHA-256 digest, unit coordinates,
-  kind, name, candidate outputs, and caller-provided `mtime` or timestamp metadata
-  (relying on content digests for cache invalidation without disk `stat()` overhead).
+  kind, name, and candidate outputs (relying on content digests for cache deduplication
+  without timestamp fragmentation).
 
 ### Changed
 - **Fail-Closed Escaping Closure Protection (Generator Subroutines)**: For generator
@@ -72,7 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Strict Positional Output Alignment & Unequal Arity Rejection**: Refactored `_pair_clone_outputs`
   to strictly pair subroutine outputs by first-store position and fail closed if common variables
   have conflicting positional indices or unequal output counts (rejecting permuted outputs like
-  `a, b` vs `b, a`), preventing silent variable swapping or misalignment at call sites.
+  `a, b` vs `b, a`), removing previously proposing patches on reordered independent outputs to
+  prevent silent variable swapping or misalignment at call sites.
 - **Subroutine Kind Parity Enforcement**: Unconditionally reject clone pairs between
   subroutine units (blocks, sliding windows, clause branches) and whole functions/methods
   within refactoring patch and helper synthesis.
@@ -81,7 +78,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metrics, clustering, coverage, matcher (`merge_adjacent_clones`, `suppress_subclones`,
   `scan_target`), and CLI violation reports.
 - **Dynamic Scope Dispatch via `inspect.signature`**: Replaced exception message substring matching
-  in `dispatch_analyze_unit_variable_scope` with `inspect.signature` introspection.
+  in `dispatch_analyze_unit_variable_scope` with `inspect.signature` introspection, defaulting to
+  `supports_trees = False` on failure.
 - **Synthetic Wrapper Sentinel**: Switched subroutine synthetic wrappers to `__pdh_wrapper__`
   and guarded against flattening user functions named `_wrapper`.
 - **Helper Return Type Inference**: Standardized `_infer_helper_return_type` signature to use
@@ -89,7 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   annotations for comprehension and complex expression units, and returning `None` for
   subroutines without outputs or return values.
 - **Binding Module Structure**: Reordered imports to follow local package precedence and registered
-  all private re-exports in `__all__`.
+  all public re-exports in `__all__`.
 - **Default Missing/Zero Unit End Slicing**: `extract_unit_source_code` now defaults missing or
   zero `end` coordinates to `start` (slicing a single line) via `_unit_line_bounds` rather than
   slicing through end-of-file, ensuring consistent coordinate bounds handling across reporting
@@ -97,14 +95,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Coordinate Clamping Diagnostics**: Added `DEBUG`-level logging in `matcher._unit_sloc` and
   `reporters._unit_line_bounds` whenever coordinate clamping modifies an inverted or corrupt
   coordinate.
-- **Fail-Closed Unresolved End Column Downstream Detection**: In `_DownstreamReadVisitor`, when
-  `u_end_col` cannot be resolved, same-line trailing nodes on `u_end` are treated as downstream
-  reads while assignments on `u_end` do not kill candidate outputs, eliminating fail-open
-  whole-line bypasses.
+- **Fail-Closed Unresolved End Column Downstream Detection & Dynamic Reads**: In
+  `_DownstreamReadVisitor`, when `u_end_col` cannot be resolved, same-line trailing nodes on `u_end`
+  are treated as downstream reads while assignments on `u_end` do not kill candidate outputs.
+  Furthermore, downstream dynamic calls to `locals()`, `vars()`, `eval()`, `exec()`, or `dir()`
+  are treated as reading all candidate outputs fail-closed.
 - **Fail-Closed Definiteness in Clone Generator Subroutine Outputs**: Updated
-  `resolve_clone_generator_subroutine_outputs` to default missing definiteness information to
-  empty sets for hand-built or mocked scopes lacking `definite_stores` and `inputs`, rejecting
-  extractions when outputs are needed without proven definite assignment.
+  `GeneratorCloneSideData` and `resolve_clone_generator_subroutine_outputs` to treat
+  `definite=None` as `set()` (fail-closed), rejecting extractions when outputs are needed without
+  proven definite assignment.
 - **Single-Unit Scope Analysis Interface**: Introduced `inspect_single_unit_scope` taking a single
   `tree` keyword argument, eliminating positional `tree1=tree2` scope analysis naming hacks.
 - **AST Preprocessing Memoization**: Memoized per-scope parent maps, end-line statement indices,
