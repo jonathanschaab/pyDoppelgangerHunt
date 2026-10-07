@@ -20,7 +20,7 @@ from pydoppelgangerhunt.config import (
     find_python_files,
 )
 from pydoppelgangerhunt.git_diff import get_git_repo_root
-from pydoppelgangerhunt.source_lines import parse_unit_coord
+from pydoppelgangerhunt.source_lines import parse_unit_coord, resolve_unit_line_bounds
 from pydoppelgangerhunt.baseline import (
     HARVEST_BOOLEAN_MODES,
     _safe_bool,
@@ -1551,8 +1551,7 @@ def scan_target(
 
 def _unit_sloc(unit: Dict[str, Any]) -> int:
     """Computes non-negative line count for an AST unit using parsed coordinates."""
-    s = max(1, parse_unit_coord(unit, "start", default=1))
-    e = max(s, parse_unit_coord(unit, "end", default=s))
+    s, e = resolve_unit_line_bounds(unit)
     return max(0, e - s + 1)
 
 

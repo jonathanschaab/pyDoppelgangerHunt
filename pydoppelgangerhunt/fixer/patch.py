@@ -49,6 +49,7 @@ from pydoppelgangerhunt.fixer.scope import (
     _extract_arg_names,
     _normalize_receiver_attrs,
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
+    dispatch_inspect_single_unit_scope as inspect_single_unit_scope,
     is_subroutine_unit,
 )
 
@@ -2635,7 +2636,7 @@ def generate_refactoring_patch(
         skip_pre_unit_closures=skip_pre_unit_closures,
     )
     if effective_skip_closures:
-        logger.info("Generating patches in lenient closure strictness mode")
+        logger.debug("Generating patches in lenient closure strictness mode")
     graph_holder: List[Optional[ModuleDependencyGraph]] = [
         depgraph.copy() if depgraph is not None else None
     ]
@@ -2736,8 +2737,8 @@ def generate_refactoring_patch(
                     f2_plan = file_plans.get(f2_path)
                     if f2_plan is None:
                         try:
-                            f2_text = f2_path.read_text(encoding="utf-8")
-                            f2_plan = _get_plan(f2_path, rel_f2, f2_text)
+                            loaded_text = f2_path.read_text(encoding="utf-8")
+                            f2_plan = _get_plan(f2_path, rel_f2, loaded_text)
                         except (OSError, UnicodeDecodeError):
                             f2_plan = None
                     if f2_plan is not None:
@@ -2780,10 +2781,10 @@ def generate_refactoring_patch(
                 and enc1["name"] == enc2["name"]
                 and enc1["start"] == enc2["start"]
             )
-            f2_text = (
+            f2_text: Optional[str] = (
                 f2_plan.orig_text
                 if f2_plan is not None
-                else (f1_plan.orig_text if is_same_file else "")
+                else (f1_plan.orig_text if is_same_file else None)
             )
 
             orig_fn1 = fn1
@@ -2830,10 +2831,8 @@ def generate_refactoring_patch(
                 if f2_plan is not None
                 else (digest1 if is_same_file else None)
             )
-            # Analyze each unit's scope individually.
-            # Each unit occupies positional slot u1, so tree1 supplies its corresponding AST.
-            s1 = analyze_unit_variable_scope(u1_eff, repo_root=str(root), tree1=tree1)
-            s2 = analyze_unit_variable_scope(u2_eff, repo_root=str(root), tree1=tree2)
+            s1 = inspect_single_unit_scope(u1_eff, repo_root=str(root), tree=tree1)
+            s2 = inspect_single_unit_scope(u2_eff, repo_root=str(root), tree=tree2)
             if orig_fn1 and orig_fn1.get("is_async"):
                 s1["is_async"] = True
             if orig_fn2 and orig_fn2.get("is_async"):

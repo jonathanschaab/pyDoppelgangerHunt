@@ -150,6 +150,36 @@ def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
     return _extract_first_unit_coord(unit, ("end_col_offset", "end_col"))
 
 
+def _get_scope_parent_map(scope_node: ast.AST) -> Dict[ast.AST, ast.AST]:
+    """Retrieves or builds cached parent map for AST nodes within the scope."""
+    cached = getattr(scope_node, "_pydh_parent_map", None)
+    if isinstance(cached, dict):
+        return cached
+    parent_map: Dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(scope_node):
+        for child in ast.iter_child_nodes(parent):
+            parent_map[child] = parent
+    setattr(scope_node, "_pydh_parent_map", parent_map)
+    return parent_map
+
+
+def _get_scope_stmts_by_end_lineno(
+    scope_node: ast.AST,
+) -> Dict[int, List[ast.stmt]]:
+    """Retrieves or builds cached map of statement end line numbers to statement nodes."""
+    cached = getattr(scope_node, "_pydh_stmts_by_end", None)
+    if isinstance(cached, dict):
+        return cached
+    m: Dict[int, List[ast.stmt]] = {}
+    for node in ast.walk(scope_node):
+        if isinstance(node, ast.stmt):
+            e = getattr(node, "end_lineno", getattr(node, "lineno", 0))
+            if e > 0:
+                m.setdefault(e, []).append(node)
+    setattr(scope_node, "_pydh_stmts_by_end", m)
+    return m
+
+
 def _resolve_unit_ast_end_col(
     scope_node: ast.AST, unit: Dict[str, Any]
 ) -> Optional[int]:
@@ -159,16 +189,8 @@ def _resolve_unit_ast_end_col(
     if u_start <= 0 or u_end <= 0 or u_start > u_end:
         return None
 
-    parent_map: Dict[ast.AST, ast.AST] = {}
-    matching_stmts: List[ast.stmt] = []
-    for parent in ast.walk(scope_node):
-        for child in ast.iter_child_nodes(parent):
-            parent_map[child] = parent
-        if (
-            isinstance(parent, ast.stmt)
-            and getattr(parent, "end_lineno", getattr(parent, "lineno", 0)) == u_end
-        ):
-            matching_stmts.append(parent)
+    parent_map = _get_scope_parent_map(scope_node)
+    matching_stmts = list(_get_scope_stmts_by_end_lineno(scope_node).get(u_end, []))
 
     inner_stmts: List[ast.stmt] = []
     if matching_stmts:
@@ -198,20 +220,10 @@ def _resolve_unit_ast_end_col(
             matched = [s for s in inner_stmts if getattr(s, "col_offset", 0) >= start_col]
             target_stmt = matched[0] if matched else inner_stmts[0]
         elif is_subroutine_unit(unit):
-            # For single-line compound blocks or sliding windows without explicit start_col,
-            # encompass the full body of the compound statement through its trailing child.
             target_stmt = inner_stmts[-1]
         else:
-            # When start_col is omitted for a single-line standalone unit, default to the first
-            # statement on the line (e.g. 'yield x; print(total)'). Note that if a unit
-            # represents a subsequent statement on a semicolon-separated line, supplying
-            # 'start_col' during harvesting ensures exact boundary matching.
             target_stmt = inner_stmts[0]
     else:
-        # For multi-line units (u_start != u_end), default to the last statement ending
-        # on line u_end (inner_stmts[-1]). In the rare event of semicolon-separated statements
-        # on the closing line of a block where the unit terminates earlier, providing
-        # 'end_col' during harvesting ensures exact sub-line boundary resolution.
         target_stmt = inner_stmts[-1]
 
     end_col = getattr(target_stmt, "end_col_offset", None)
@@ -654,10 +666,11 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         if lineno > self.u_end:
             return True
         if lineno == self.u_end:
-            return (
-                self.u_end_col is not None
-                and getattr(node, "col_offset", 0) >= int(self.u_end_col)
-            )
+            if self.u_end_col is not None:
+                return getattr(node, "col_offset", 0) >= int(self.u_end_col)
+            # When u_end_col cannot be resolved, fail-closed by treating
+            # same-line nodes on u_end as downstream.
+            return True
         return False
 
     def _is_node_inside_unit(self, node: ast.AST) -> bool:
@@ -668,12 +681,12 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             return True
         if lineno == self.u_start == self.u_end:
             col = getattr(node, "col_offset", 0)
-            return self.u_end_col is None or col < int(self.u_end_col)
+            return self.u_end_col is not None and col < int(self.u_end_col)
         if lineno == self.u_start:
             return True
         if lineno == self.u_end:
             col = getattr(node, "col_offset", 0)
-            return self.u_end_col is None or col < int(self.u_end_col)
+            return self.u_end_col is not None and col < int(self.u_end_col)
         return False
 
     def _is_loop_carried(self, node: ast.AST) -> bool:
@@ -692,6 +705,9 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
     def _record_killed_targets(self, targets: Iterable[ast.AST]) -> None:
         for t in targets:
             if self._should_inspect_read(t):
+                lineno = getattr(t, "lineno", None)
+                if lineno == self.u_end and self.u_end_col is None:
+                    continue
                 for name in _extract_assigned_names(t):
                     if not self._is_in_comp(name):
                         self.killed.add(name)
@@ -711,7 +727,12 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             for name in free_reads:
                 self._record_downstream_read(name)
             name_attr = getattr(node, "name", None)
-            if name_attr and not self._is_in_comp(name_attr):
+            lineno = getattr(node, "lineno", None)
+            if (
+                name_attr
+                and not self._is_in_comp(name_attr)
+                and not (lineno == self.u_end and self.u_end_col is None)
+            ):
                 self.killed.add(name_attr)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
@@ -722,7 +743,10 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             free_reads = _extract_nested_scope_free_reads(node)
             for name in free_reads:
                 self._record_downstream_read(name)
-            if not self._is_in_comp(node.name):
+            lineno = getattr(node, "lineno", None)
+            if not self._is_in_comp(node.name) and not (
+                lineno == self.u_end and self.u_end_col is None
+            ):
                 self.killed.add(node.name)
         else:
             n_start = getattr(node, "lineno", 0)
@@ -906,32 +930,13 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             self._record_import_names(node, self.killed)
 
 
-def _collect_pre_unit_closures(
-    scope_node: ast.AST,
-    u_start: int,
-) -> Set[str]:
-    """Discovers free variables captured by functions, class methods, and lambdas defined prior
-    to the unit in the same lexical scope.
+def _collect_scope_closures(scope_node: ast.AST) -> List[Tuple[int, Set[str]]]:
+    """Discovers all closures defined in a scope, recorded with their starting line."""
+    cached = getattr(scope_node, "_pydh_scope_closures", None)
+    if isinstance(cached, list):
+        return cached
 
-    Scope Boundary:
-    This inspects closures defined before the unit in the same lexical scope to ensure fail-closed
-    safety for escaping closures (e.g. callbacks registered prior to unit execution). Closures
-    defined downstream of the unit are inspected by the normal downstream AST traversal; closures
-    defined in sibling scopes outside the current enclosing scope (e.g. sibling methods in a
-    class) are not inspected.
-
-    Line-Granularity Limitation:
-    Statements and subnodes are filtered by line number (strictly less than `u_start`). A closure
-    defined on the exact start line of the unit (such as `cb = lambda: total; for x in ...` on a
-    single line) begins at `lineno == u_start` and is therefore not treated as pre-unit.
-
-    Over-Capture Trade-off:
-    `ast.walk` over compound statements prior to `u_start` also traverses lambdas inside nested
-    functions. Free variables of such lambdas that reference intermediate nested locals are
-    unioned into captured reads, potentially causing benign over-rejection. This fail-closed
-    behavior is intentional.
-    """
-    captured_reads: Set[str] = set()
+    closures: List[Tuple[int, Set[str]]] = []
 
     def _extract_header_nodes(s: ast.stmt) -> List[ast.AST]:
         if isinstance(s, ast.If):
@@ -967,11 +972,8 @@ def _collect_pre_unit_closures(
                 dec_start = min(getattr(d, "lineno", stmt_start) for d in decorators)
                 stmt_start = min(stmt_start, dec_start)
 
-            if stmt_start >= u_start:
-                continue
-
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                captured_reads.update(_extract_nested_scope_free_reads(stmt))
+                closures.append((stmt_start, _extract_nested_scope_free_reads(stmt)))
                 continue
 
             if isinstance(stmt, ast.ClassDef):
@@ -986,16 +988,14 @@ def _collect_pre_unit_closures(
                         ),
                     ):
                         item_start = getattr(item, "lineno", stmt_start)
-                        if item_start < u_start:
-                            captured_reads.update(_extract_nested_scope_free_reads(item))
+                        closures.append((item_start, _extract_nested_scope_free_reads(item)))
                 continue
 
             for hnode in _extract_header_nodes(stmt):
                 for subnode in ast.walk(hnode):
                     if isinstance(subnode, (ast.Lambda, ast.GeneratorExp)):
                         sub_lineno = getattr(subnode, "lineno", stmt_start)
-                        if sub_lineno < u_start:
-                            captured_reads.update(_extract_nested_scope_free_reads(subnode))
+                        closures.append((sub_lineno, _extract_nested_scope_free_reads(subnode)))
 
             for attr in ("body", "orelse", "finalbody"):
                 sub_stmts = getattr(stmt, attr, None)
@@ -1009,6 +1009,20 @@ def _collect_pre_unit_closures(
                 _walk_stmts(getattr(case, "body", []))
 
     _walk_stmts(getattr(scope_node, "body", []))
+    setattr(scope_node, "_pydh_scope_closures", closures)
+    return closures
+
+
+def _collect_pre_unit_closures(
+    scope_node: ast.AST,
+    u_start: int,
+) -> Set[str]:
+    """Discovers free variables captured by functions, class methods, and lambdas defined prior
+    to the unit in the same lexical scope."""
+    captured_reads: Set[str] = set()
+    for c_line, reads in _collect_scope_closures(scope_node):
+        if c_line < u_start:
+            captured_reads.update(reads)
     return captured_reads
 
 
@@ -1082,15 +1096,20 @@ def _find_enclosing_loops(
     u_end: int,
 ) -> List[Tuple[int, int]]:
     """Detects loops enclosing the unit boundaries for loop-carried dependence analysis."""
-    loops: List[Tuple[int, int]] = []
-    for node in ast.walk(scope_node):
-        if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
-            l_start = getattr(node, "lineno", 0)
-            l_end = getattr(node, "end_lineno", None) or l_start
-            if l_start <= u_start and u_end <= l_end:
-                if (l_start, l_end) != (u_start, u_end):
-                    loops.append((l_start, l_end))
-    return loops
+    cached_loops: Optional[List[Tuple[int, int]]] = getattr(scope_node, "_pydh_loops", None)
+    if cached_loops is None:
+        cached_loops = []
+        for node in ast.walk(scope_node):
+            if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+                l_start = getattr(node, "lineno", 0)
+                l_end = getattr(node, "end_lineno", None) or l_start
+                cached_loops.append((l_start, l_end))
+        setattr(scope_node, "_pydh_loops", cached_loops)
+    return [
+        (l_start, l_end)
+        for l_start, l_end in cached_loops
+        if l_start <= u_start and u_end <= l_end and (l_start, l_end) != (u_start, u_end)
+    ]
 
 
 def _stmt_definitely_terminates(stmt: ast.stmt) -> bool:
@@ -1149,6 +1168,55 @@ def _nodes_load_any_name(nodes: Iterable[ast.AST], names: Set[str]) -> bool:
     return False
 
 
+def _is_swallowing_with_statement(node: Union[ast.With, ast.AsyncWith]) -> bool:
+    """Checks whether any withitem in a with statement uses a swallowing context manager."""
+    for item in node.items:
+        ctx = item.context_expr
+        if isinstance(ctx, ast.Call):
+            func = ctx.func
+            if isinstance(func, ast.Name) and "suppress" in func.id.lower():
+                return True
+            if isinstance(func, ast.Attribute) and "suppress" in func.attr.lower():
+                return True
+    return False
+
+
+def _get_scope_try_and_with_blocks(
+    scope_node: ast.AST,
+) -> List[ast.AST]:
+    """Caches all Try, TryStar, With, and AsyncWith blocks within scope."""
+    cached = getattr(scope_node, "_pydh_try_with_blocks", None)
+    if isinstance(cached, list):
+        return cached
+    blocks: List[ast.AST] = []
+    for node in ast.walk(scope_node):
+        if (
+            isinstance(node, (ast.Try, ast.With, ast.AsyncWith))
+            or type(node).__name__ == "TryStar"
+        ):
+            blocks.append(node)
+    setattr(scope_node, "_pydh_try_with_blocks", blocks)
+    return blocks
+
+
+def _scope_reads_outputs_after_line(
+    scope_node: ast.AST,
+    line: int,
+    outputs: Set[str],
+) -> bool:
+    """Checks whether any statement in the scope loads outputs after the given line."""
+    visitor = _DownstreamReadVisitor(
+        line,
+        line,
+        None,
+        candidates=outputs,
+        pass_mode=_VisitorPassMode.AFTER_UNIT,
+    )
+    for stmt in getattr(scope_node, "body", []):
+        visitor.visit(stmt)
+    return bool(visitor.loaded & outputs)
+
+
 def _enclosing_try_reads_outputs(
     scope_node: Optional[ast.AST],
     u_start: int,
@@ -1157,10 +1225,31 @@ def _enclosing_try_reads_outputs(
 ) -> bool:
     """Returns True if unit is inside an enclosing try, else, or except block whose
     handlers/finally read outputs, or whose handlers fall through and outputs are read
-    downstream of the try block."""
+    downstream of the try block, or inside a swallowing with block whose outputs are read
+    downstream."""
     if scope_node is None or not outputs:
         return False
-    for node in ast.walk(scope_node):
+    for node in _get_scope_try_and_with_blocks(scope_node):
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            with_body = getattr(node, "body", [])
+            if (
+                _stmts_enclose_unit(with_body, u_start, u_end)
+                and _is_swallowing_with_statement(node)
+            ):
+                w_end_raw = getattr(node, "end_lineno", None)
+                b_end = max(
+                    int(
+                        getattr(s, "end_lineno", None)
+                        or getattr(s, "lineno", 0)
+                        or 0
+                    )
+                    for s in with_body
+                )
+                w_end = w_end_raw if isinstance(w_end_raw, int) else b_end
+                if _scope_reads_outputs_after_line(scope_node, w_end, outputs):
+                    return True
+            continue
+
         if isinstance(node, ast.Try) or type(node).__name__ == "TryStar":
             body_nodes = getattr(node, "body", [])
             orelse_nodes = getattr(node, "orelse", [])
@@ -1210,16 +1299,7 @@ def _enclosing_try_reads_outputs(
                         for s in body_nodes
                     )
                     t_end = try_end_raw if isinstance(try_end_raw, int) else b_end
-                    post_try_visitor = _DownstreamReadVisitor(
-                        t_end,
-                        t_end,
-                        None,
-                        candidates=outputs,
-                        pass_mode=_VisitorPassMode.AFTER_UNIT,
-                    )
-                    for stmt in getattr(scope_node, "body", []):
-                        post_try_visitor.visit(stmt)
-                    if post_try_visitor.loaded & outputs:
+                    if _scope_reads_outputs_after_line(scope_node, t_end, outputs):
                         return True
     return False
 
@@ -1552,12 +1632,16 @@ def resolve_clone_generator_subroutine_outputs(
         outs1 = _extract_effective_unit_outputs(u1, scope1)
         outs2 = _extract_effective_unit_outputs(u2, scope2)
 
-    u1_def: Optional[Set[str]] = None
-    if "definite_stores" in scope1 or "inputs" in scope1:
-        u1_def = set(scope1.get("definite_stores", [])) | set(scope1.get("inputs", []))
-    u2_def: Optional[Set[str]] = None
-    if "definite_stores" in scope2 or "inputs" in scope2:
-        u2_def = set(scope2.get("definite_stores", [])) | set(scope2.get("inputs", []))
+    u1_def = (
+        set(scope1.get("definite_stores", [])) | set(scope1.get("inputs", []))
+        if ("definite_stores" in scope1 or "inputs" in scope1)
+        else set()
+    )
+    u2_def = (
+        set(scope2.get("definite_stores", [])) | set(scope2.get("inputs", []))
+        if ("definite_stores" in scope2 or "inputs" in scope2)
+        else set()
+    )
 
     cands1 = set(outs1)
     cands2 = set(outs2)

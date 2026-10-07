@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -21,12 +22,17 @@ from pydoppelgangerhunt import (
     synthesize_refactoring_suggestion,
     synthesize_shared_helper_code,
 )
-from pydoppelgangerhunt.fixer.scope import _inspect_unit_scope  # pylint: disable=protected-access
+from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=protected-access
+    _inspect_unit_scope,
+    inspect_single_unit_scope,
+)
 from pydoppelgangerhunt.matcher import (  # pylint: disable=protected-access
     _check_column_bounds_relationship,
+    _unit_sloc,
     _update_merged_unit_columns,
 )
 from pydoppelgangerhunt.reporters import (
+    _unit_line_bounds,
     format_github_annotations,
     format_sarif_report,
 )
@@ -42,6 +48,8 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
 )
 from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
     GeneratorCloneSideData,
+    _DownstreamReadVisitor,
+    _VisitorPassMode,
     _clear_downstream_reads_cache,
     _downstream_cache_lock,
     _downstream_reads_cache,
@@ -2503,8 +2511,8 @@ def test_resolve_clone_generator_subroutine_outputs_precomputed_and_fallback(
     # Case 1: Precomputed outputs present on u1 and u2
     u1_pre = {"outputs": ["a", "b"], "source_text": "def f():\n    a = 1\n"}
     u2_pre = {"outputs": ["x", "y"], "source_text": "def g():\n    x = 1\n"}
-    s1 = {"globals": ["b"], "nonlocals": []}
-    s2 = {"globals": [], "nonlocals": ["y"]}
+    s1 = {"definite_stores": ["a"], "globals": ["b"], "nonlocals": []}
+    s2 = {"definite_stores": ["x"], "globals": [], "nonlocals": ["y"]}
     res = resolve_clone_generator_subroutine_outputs(u1_pre, u2_pre, s1, s2)
     assert res is not None
     outs1, outs2 = res
@@ -4496,4 +4504,116 @@ def test_enclosing_try_reads_outputs_in_else_and_except_finally_reads() -> None:
     s2 = {"definite_stores": ["out_var"], "inputs": []}
     res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
     assert res is None
+
+
+def test_parse_unit_coord_non_integral_floats_rejected() -> None:
+    """Verifies that non-integral floats and float strings are rejected with ValueError."""
+    # Integral floats and strings are accepted
+    assert parse_unit_coord({"start": 10.0}, "start") == 10
+    assert parse_unit_coord({"start": "10.0"}, "start") == 10
+    assert parse_unit_coord({"start": "10.0:0"}, "start") == 10
+
+    # Non-integral floats are rejected
+    with pytest.raises(ValueError, match="cannot convert non-integral float"):
+        parse_unit_coord({"start": 10.5}, "start")
+
+    with pytest.raises(ValueError, match="cannot convert non-integral float"):
+        parse_unit_coord({"start": "12.7"}, "start")
+
+    with pytest.raises(ValueError, match="cannot convert non-integral float"):
+        parse_unit_coord({"start": "12.9:0"}, "start")
+
+
+def test_downstream_read_visitor_trailing_same_line_without_col() -> None:
+    """Verifies that trailing nodes on the same line are detected as downstream when
+    u_end_col is None."""
+    code = "x = 1; y = x + 1"
+    tree = ast.parse(code)
+    # Unit occupies line 1, end line 1, u_end_col is None (unresolved).
+    visitor = _DownstreamReadVisitor(
+        1,
+        1,
+        None,
+        candidates={"x"},
+        pass_mode=_VisitorPassMode.AFTER_UNIT,
+    )
+    visitor.visit(tree)
+    # The read of x in 'y = x + 1' must be detected as downstream because u_end_col is None.
+    assert "x" in visitor.loaded
+
+
+def test_enclosing_swallowing_with_block_rejects_outputs() -> None:
+    """Verifies that units enclosed in contextlib.suppress blocks with downstream reads
+    are rejected."""
+    code = (
+        "import contextlib\n"
+        "def f():\n"
+        "    with contextlib.suppress(GeneratorExit):\n"
+        "        total = 10\n"
+        "        yield total\n"
+        "    print(total)\n"
+    )
+    tree = ast.parse(code)
+    scope_node = tree.body[1]
+    # Unit lines 4 to 5 inside with block:
+    assert _enclosing_try_reads_outputs(scope_node, 4, 5, {"total"}) is True
+    assert _enclosing_try_reads_outputs(scope_node, 4, 5, {"other"}) is False
+
+    u1 = {
+        "file": "m1.py",
+        "start": 4,
+        "end": 5,
+        "source_text": code,
+        "outputs": ["total"],
+    }
+    u2 = {
+        "file": "m2.py",
+        "start": 4,
+        "end": 5,
+        "source_text": code,
+        "outputs": ["total"],
+    }
+    s1 = {"definite_stores": ["total"], "inputs": []}
+    s2 = {"definite_stores": ["total"], "inputs": []}
+    res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
+    assert res is None
+
+
+def test_generator_subroutine_outputs_mocked_scope_fails_closed() -> None:
+    """Verifies that mocked/hand-built scopes lacking definite_stores and inputs fail closed."""
+    u1 = {"outputs": ["val"], "source_text": "def f():\n    val = 1\n"}
+    u2 = {"outputs": ["val"], "source_text": "def g():\n    val = 2\n"}
+    # Scope dict missing both definite_stores and inputs
+    s1: Dict[str, Any] = {"globals": [], "nonlocals": []}
+    s2: Dict[str, Any] = {"globals": [], "nonlocals": []}
+    res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
+    assert res is None
+
+
+def test_inspect_single_unit_scope_interface() -> None:
+    """Verifies that inspect_single_unit_scope analyzes an individual unit with a single tree."""
+    code = "def f():\n    a = 1\n    return a + 2\n"
+    tree = ast.parse(code)
+    unit = {"file": "mod.py", "start": 2, "end": 3, "source_text": code}
+    info = inspect_single_unit_scope(unit, tree=tree)
+    assert "inputs" in info
+    assert "outputs" in info
+    assert "definite_stores" in info
+
+
+def test_coordinate_clamping_debug_logs(caplog: pytest.LogCaptureFixture) -> None:
+    """Verifies that clamping corrupt/inverted coordinates logs at DEBUG level."""
+    with caplog.at_level(logging.DEBUG):
+        unit_inverted = {"file": "test.py", "name": "foo", "start": 10, "end": 5}
+        sloc = _unit_sloc(unit_inverted)
+        assert sloc == 1
+        assert "Clamped invalid unit coordinates" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        unit_zero = {"file": "test.py", "name": "bar", "start": 0, "end": 0}
+        bounds = _unit_line_bounds(unit_zero)
+        assert bounds == (1, 1)
+        assert "Clamped invalid unit coordinates" in caplog.text
+
 

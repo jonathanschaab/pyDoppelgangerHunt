@@ -1457,6 +1457,15 @@ def _inspect_unit_scope(
 
 
 
+def inspect_single_unit_scope(
+    unit: Dict[str, Any],
+    repo_root: Optional[str] = None,
+    tree: Optional[ast.AST] = None,
+) -> Dict[str, Any]:
+    """Analyzes AST variable scoping for an individual code unit."""
+    return _inspect_unit_scope(unit, repo_root=repo_root, file_tree=tree)
+
+
 def analyze_unit_variable_scope(
     u1: Dict[str, Any],
     u2: Optional[Dict[str, Any]] = None,
@@ -1465,9 +1474,9 @@ def analyze_unit_variable_scope(
     tree2: Optional[ast.AST] = None,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
-    info1 = _inspect_unit_scope(u1, repo_root=repo_root, file_tree=tree1)
+    info1 = inspect_single_unit_scope(u1, repo_root=repo_root, tree=tree1)
     if u2 is not None:
-        info2 = _inspect_unit_scope(u2, repo_root=repo_root, file_tree=tree2)
+        info2 = inspect_single_unit_scope(u2, repo_root=repo_root, tree=tree2)
         common_inputs = [var for var in info1["inputs"] if var in info2["inputs"]]
         if len(info1["inputs"]) == len(info2["inputs"]):
             inputs = common_inputs if len(common_inputs) == len(info1["inputs"]) else info1["inputs"]
@@ -1613,3 +1622,13 @@ def dispatch_analyze_unit_variable_scope(
     if supports_trees:
         return target(u1, u2=u2, repo_root=repo_root, tree1=tree1, tree2=tree2)
     return target(u1, u2=u2, repo_root=repo_root)
+
+
+def dispatch_inspect_single_unit_scope(
+    unit: Dict[str, Any],
+    repo_root: Optional[str] = None,
+    tree: Optional[ast.AST] = None,
+) -> Dict[str, Any]:
+    """Dispatches single-unit scope analysis, honoring mock patches on
+    analyze_unit_variable_scope."""
+    return dispatch_analyze_unit_variable_scope(unit, repo_root=repo_root, tree1=tree)

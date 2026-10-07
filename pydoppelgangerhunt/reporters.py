@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 import html
 import json
+import logging
 import os
 from pathlib import Path
 import sys
@@ -15,8 +16,11 @@ from pydoppelgangerhunt.config import normalize_path_string
 from pydoppelgangerhunt.source_lines import (
     _resolve_safe_unit_file_path,
     parse_unit_coord,
+    resolve_unit_line_bounds,
     split_source_lines,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ANSI Color Codes
@@ -50,8 +54,7 @@ def colorize(text: str, color_code: str, enabled: bool) -> str:
 
 def _unit_line_bounds(unit: Dict[str, Any]) -> Tuple[int, int]:
     """Extracts parsed (start, end) line coordinates from a unit dictionary."""
-    s = max(1, parse_unit_coord(unit, "start", default=1))
-    return s, max(s, parse_unit_coord(unit, "end", default=s))
+    return resolve_unit_line_bounds(unit)
 
 
 def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:

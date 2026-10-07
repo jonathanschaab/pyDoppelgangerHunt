@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 import re
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Union, overload
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union, overload
 
 from pydoppelgangerhunt.config import normalize_path_string
+
+logger = logging.getLogger(__name__)
 
 _PHYSICAL_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
 
@@ -16,6 +19,7 @@ __all__ = [
     "count_physical_newlines",
     "detect_line_ending",
     "parse_unit_coord",
+    "resolve_unit_line_bounds",
     "split_source_lines",
 ]
 
@@ -65,17 +69,47 @@ def parse_unit_coord(
             return int(val)
         except ValueError:
             try:
-                return int(float(val))
+                f_val = float(val)
             except (ValueError, OverflowError) as exc:
                 raise ValueError(
                     f"Invalid coordinate {val!r}: cannot convert to integer"
                 ) from exc
+            if not f_val.is_integer():
+                raise ValueError(
+                    f"Invalid coordinate {val!r}: cannot convert non-integral float"
+                ) from None
+            return int(f_val)
+    if isinstance(val, float):
+        if not val.is_integer():
+            raise ValueError(f"Invalid coordinate {val!r}: cannot convert non-integral float")
+        return int(val)
     try:
         return int(val)
     except (ValueError, TypeError, OverflowError) as exc:
         raise ValueError(
             f"Invalid coordinate {val!r}: cannot convert to integer"
         ) from exc
+
+
+def resolve_unit_line_bounds(unit: Dict[str, Any]) -> Tuple[int, int]:
+    """Extracts clamped, positive (start, end) line coordinates from a unit dictionary.
+
+    Logs a DEBUG diagnostic whenever start is clamped to >= 1 or end is clamped to >= start.
+    """
+    raw_s = parse_unit_coord(unit, "start", default=1)
+    raw_e = parse_unit_coord(unit, "end", default=raw_s)
+    s = max(1, raw_s)
+    e = max(s, raw_e)
+    if s != raw_s or e != raw_e:
+        logger.debug(
+            "Clamped invalid unit coordinates (start=%r -> %d, end=%r -> %d) for unit %s",
+            raw_s,
+            s,
+            raw_e,
+            e,
+            unit.get("name") or unit.get("file"),
+        )
+    return s, e
 
 
 def split_source_lines(source_text: str) -> List[str]:
@@ -203,22 +237,23 @@ def _resolve_safe_unit_file_path(
             file_path = target_root / file_path
 
     try:
+        # Check that neither the file itself nor any unresolved parent directory below
+        # target_root is a symlink.
         if file_path.is_symlink():
             return None
-
-        if file_path.is_absolute():
-            try:
-                file_path = target_root / file_path.resolve().relative_to(target_root)
-            except ValueError:
-                return None
-
-        if not file_path.is_file():
-            return None
+        repo_root_path = Path(repo_root) if repo_root else target_root
         for parent in file_path.parents:
+            if target_root in parent.parents or repo_root_path in parent.parents:
+                if parent.is_symlink():
+                    return None
+            if (
+                parent == target_root
+                or parent == repo_root_path
+                or parent.resolve() == target_root
+            ):
+                break
             if parent.is_symlink():
                 return None
-            if parent == target_root or parent.resolve() == target_root:
-                break
 
         resolved_file = file_path.resolve()
         if not resolved_file.is_file():

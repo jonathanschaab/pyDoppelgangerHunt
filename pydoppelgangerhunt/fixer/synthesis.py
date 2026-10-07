@@ -30,6 +30,7 @@ from pydoppelgangerhunt.fixer.scope import (
     _normalize_receiver_attrs,
     _rank_param_kind,
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
+    dispatch_inspect_single_unit_scope as inspect_single_unit_scope,
     is_subroutine_unit,
 )
 from pydoppelgangerhunt.fixer.source import (
@@ -650,9 +651,8 @@ def synthesize_shared_helper_code(
     _populate_unit_receiver_metadata(u2, repo_root=repo_root)
 
     # Variable scope analysis for concrete parameter signatures.
-    # Note: each unit occupies positional slot u1, so tree1 supplies its AST.
-    scope1 = analyze_unit_variable_scope(u1, repo_root=repo_root, tree1=tree1)
-    scope2 = analyze_unit_variable_scope(u2, repo_root=repo_root, tree1=tree2)
+    scope1 = inspect_single_unit_scope(u1, repo_root=repo_root, tree=tree1)
+    scope2 = inspect_single_unit_scope(u2, repo_root=repo_root, tree=tree2)
     scope = analyze_unit_variable_scope(
         u1, u2, repo_root=repo_root, tree1=tree1, tree2=tree2
     )
