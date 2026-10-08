@@ -173,6 +173,19 @@ def _split_pipe_union_args(type_str: str) -> List[str]:
     )
 
 
+def _flatten_union_args(args: Sequence[str]) -> List[str]:
+    """Flattens nested Union and typing.Union parameter types into a flat argument list."""
+    flattened: List[str] = []
+    for a in args:
+        if (
+            a.startswith("Union[") or a.startswith("typing.Union[")
+        ) and a.endswith("]"):
+            flattened.extend(_split_type_args(a))
+        else:
+            flattened.append(a)
+    return flattened
+
+
 def _normalize_pipe_unions(type_str: str) -> str:
     """Normalizes PEP 604 pipe unions (A | B) to typing.Union[A, B] syntax."""
     cleaned = type_str.strip()
@@ -189,14 +202,8 @@ def _normalize_pipe_unions(type_str: str) -> str:
 
     pipe_parts = _split_pipe_union_args(cleaned)
     if len(pipe_parts) > 1:
-        flattened_parts: List[str] = []
-        for p in pipe_parts:
-            norm_p = _normalize_pipe_unions(p)
-            if norm_p.startswith("Union[") and norm_p.endswith("]"):
-                flattened_parts.extend(_split_type_args(norm_p))
-            else:
-                flattened_parts.append(norm_p)
-        unique_parts = list(dict.fromkeys(flattened_parts))
+        norm_parts = [_normalize_pipe_unions(p) for p in pipe_parts]
+        unique_parts = list(dict.fromkeys(_flatten_union_args(norm_parts)))
         if len(unique_parts) == 1:
             return unique_parts[0]
         return f"Union[{', '.join(unique_parts)}]"
@@ -224,14 +231,8 @@ def _normalize_pipe_unions(type_str: str) -> str:
             inner_args = _split_type_args(cleaned)
             if inner_args:
                 norm_args = [_normalize_pipe_unions(arg) for arg in inner_args]
-                if prefix == "Union":
-                    flattened: List[str] = []
-                    for a in norm_args:
-                        if a.startswith("Union[") and a.endswith("]"):
-                            flattened.extend(_split_type_args(a))
-                        else:
-                            flattened.append(a)
-                    unique = list(dict.fromkeys(flattened))
+                if prefix in ("Union", "typing.Union"):
+                    unique = list(dict.fromkeys(_flatten_union_args(norm_args)))
                     if len(unique) == 1:
                         return unique[0]
                     return f"Union[{', '.join(unique)}]"
@@ -730,6 +731,8 @@ def synthesize_shared_helper_code(
         closure_strictness: Closure isolation strictness ("strict" / "fail_closed" vs
             "lenient" / "fast" / "skip").
     """
+    u1 = dict(u1)
+    u2 = dict(u2)
     lines1 = _slice_unit_token_lines(
         u1,
         _extract_unit_body_lines(u1, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u1, repo_root=repo_root)]),

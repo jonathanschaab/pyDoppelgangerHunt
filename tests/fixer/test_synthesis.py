@@ -2071,6 +2071,35 @@ def test_caller_unit_dicts_immutable_during_patch(tmp_path: Path) -> None:
     assert "receiver_param" not in u2
 
 
+def test_caller_unit_dicts_immutable_during_synthesis(tmp_path: Path) -> None:
+    """Verifies that synthesize_shared_helper_code does not mutate caller dicts in-place."""
+    code = (
+        "class Worker:\n"
+        "    def run1(self):\n"
+        "        x = 1\n"
+        "        return x\n"
+        "    def run2(self):\n"
+        "        x = 1\n"
+        "        return x\n"
+    )
+    src_f = tmp_path / "worker.py"
+    src_f.write_text(code, encoding="utf-8")
+
+    u1 = {"file": str(src_f), "start": 2, "end": 4, "name": "run1", "kind": "function"}
+    u2 = {"file": str(src_f), "start": 5, "end": 7, "name": "run2", "kind": "function"}
+    u1_copy = dict(u1)
+    u2_copy = dict(u2)
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper != ""
+    assert u1 == u1_copy
+    assert u2 == u2_copy
+    assert "is_async" not in u1
+    assert "receiver_kind" not in u1
+    assert "is_async" not in u2
+    assert "receiver_kind" not in u2
+
+
 def test_synthesize_shared_helper_code_symmetric_global_filtering(tmp_path: Path) -> None:
     """Verifies that synthesize_shared_helper_code filters globals/nonlocals from both u1 and u2 outputs."""
     code = (
@@ -4932,6 +4961,13 @@ def test_normalize_pipe_unions_variants() -> None:
     assert _normalize_pipe_unions("tuple[int | str, ...]") == "tuple[Union[int, str], ...]"
     assert _normalize_pipe_unions("Tuple[int | str, float]") == "Tuple[Union[int, str], float]"
     assert _normalize_pipe_unions("Union[int | str, float]") == "Union[int, str, float]"
+    assert _normalize_pipe_unions("typing.Union[int | str, float]") == "Union[int, str, float]"
+    assert _normalize_pipe_unions("int | typing.Union[str, float]") == "Union[int, str, float]"
+    assert _normalize_pipe_unions("typing.Union[int]") == "int"
+    assert (
+        _normalize_pipe_unions("list[typing.Union[int | str, float]]")
+        == "list[Union[int, str, float]]"
+    )
     assert (
         _normalize_pipe_unions("Dict[str, list[int | None]]")
         == "Dict[str, list[Union[int, None]]]"

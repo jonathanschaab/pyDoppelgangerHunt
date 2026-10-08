@@ -8798,6 +8798,9 @@ def test_generate_refactoring_patch_closure_strictness_knob(tmp_path: Path) -> N
     [
         ("lenient", None, ("lenient", True)),
         ("strict", None, ("strict", False)),
+        ("fast", None, ("lenient", True)),
+        ("skip", None, ("lenient", True)),
+        ("fail_closed", None, ("strict", False)),
         (None, True, ("lenient", True)),
         (None, False, ("strict", False)),
         ("strict", True, ("strict", False)),

@@ -1073,14 +1073,13 @@ def _build_downstream_cache_key(
 ) -> Tuple[Any, ...]:
     """Forms a persistent cache key for downstream AST read analysis."""
     file_path_str = str(unit.get("file") or "")
-    computed_digest = hashlib.sha256(
-        source_text.encode("utf-8", errors="replace")
-    ).hexdigest()
     digest = source_digest or unit.get("source_digest") or unit.get("content_digest")
     if digest is not None:
-        content_digest = f"{computed_digest}:{digest}"
+        content_digest = str(digest)
     else:
-        content_digest = computed_digest
+        content_digest = hashlib.sha256(
+            source_text.encode("utf-8", errors="replace")
+        ).hexdigest()
     start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
     end_col = _extract_unit_end_col(unit)
     cands_key = frozenset(candidates) if candidates is not None else None

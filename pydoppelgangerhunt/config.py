@@ -22,16 +22,16 @@ def resolve_closure_strictness_mode(
     """Resolves canonical closure strictness mode ('strict' or 'lenient') and boolean skip flag.
 
     Precision vs Soundness Trade-off:
-    'strict' (default) preserves soundness by inspecting escaping closures and callbacks
-    that might execute after the unit.
-    'lenient' reduces false-positive rejections by bypassing pre-unit closure scanning,
-    at the cost of soundness for escaping closures.
+    'strict' (default; alias 'fail_closed') preserves soundness by inspecting escaping closures
+    and callbacks that might execute after the unit.
+    'lenient' (aliases 'fast', 'skip') reduces false-positive rejections by bypassing pre-unit
+    closure scanning, at the cost of soundness for escaping closures.
     """
     if closure_strictness is not None:
         c_mode = str(closure_strictness).strip().lower()
-        if c_mode == "lenient":
+        if c_mode in ("lenient", "fast", "skip"):
             return "lenient", True
-        if c_mode == "strict":
+        if c_mode in ("strict", "fail_closed"):
             return "strict", False
         fallback = "lenient" if skip_pre_unit_closures else "strict"
         raw_key = str(closure_strictness)
