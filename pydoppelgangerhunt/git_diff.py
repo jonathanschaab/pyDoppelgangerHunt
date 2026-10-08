@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.config import find_matching_path_value, normalize_path_string
-from pydoppelgangerhunt.source_lines import parse_unit_coord
+from pydoppelgangerhunt.source_lines import resolve_unit_line_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -394,8 +394,7 @@ def compute_unit_diff_overlap(
     if not target_ranges:
         return 0, 0.0
 
-    u_start = max(1, parse_unit_coord(unit, "start", default=1))
-    u_end = max(u_start, parse_unit_coord(unit, "end", default=u_start))
+    u_start, u_end = resolve_unit_line_bounds(unit)
     total_unit_lines = max(1, u_end - u_start + 1)
 
     overlapping_lines: Set[int] = set()
@@ -573,10 +572,8 @@ def check_temporal_divergence(
     f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
     if not f1 or not f2:
         return None
-    s1 = max(1, parse_unit_coord(u1, "start", default=1))
-    e1 = max(s1, parse_unit_coord(u1, "end", default=s1))
-    s2 = max(1, parse_unit_coord(u2, "start", default=1))
-    e2 = max(s2, parse_unit_coord(u2, "end", default=s2))
+    s1, e1 = resolve_unit_line_bounds(u1)
+    s2, e2 = resolve_unit_line_bounds(u2)
     b1 = get_git_blame_info(f1, s1, e1, repo_root=repo_root)
     b2 = get_git_blame_info(f2, s2, e2, repo_root=repo_root)
 

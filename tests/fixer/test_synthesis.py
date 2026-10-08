@@ -51,6 +51,7 @@ from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-acc
     _DownstreamReadVisitor,
     _VisitorPassMode,
     _clear_downstream_reads_cache,
+    _collect_pre_unit_closures,
     _downstream_cache_lock,
     _downstream_reads_cache,
     _enclosing_try_reads_outputs,
@@ -4759,6 +4760,63 @@ def test_subroutine_async_preservation_in_async_func(tmp_path: Path) -> None:
     u_gen = {"file": str(file_gen), "start": 2, "end": 2, "is_subroutine": True}
     scope_gen = inspect_single_unit_scope(u_gen, repo_root=str(tmp_path))
     assert scope_gen.get("has_yield") is True
+
+
+def test_collect_scope_closures_method_param_genexp_does_not_leak() -> None:
+    """Verifies that method parameters used in generator expressions inside pre-unit classes
+    do not escape as free reads into enclosing scope closures."""
+    code = (
+        "outer_var = 10\n"
+        "class PreUnitHelper:\n"
+        "    def calculate(self, total: int):\n"
+        "        return (x + outer_var for x in range(total))\n"
+        "\n"
+        "# Line 6: Unit starts here\n"
+        "total = 100\n"
+        "res = total + 1\n"
+    )
+    tree = ast.parse(code)
+    captured = _collect_pre_unit_closures(tree, u_start=6)
+    assert "total" not in captured
+    assert "outer_var" in captured
+
+
+def test_generator_send_type_preserved_when_return_type_none() -> None:
+    """Verifies that a generator with yield assignment but no outputs or return value
+    preserves send type as Generator[yield_t, send_t, None] rather than
+    falling back to Iterator."""
+    res = _infer_helper_return_type(
+        resolved_ret="Iterator[int]",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={
+            "has_yield": True,
+            "has_yield_assignment": True,
+            "yield_expr_names": [],
+            "has_return_value": False,
+        },
+        meta1={},
+        meta2={},
+        is_async=False,
+    )
+    assert res == "Generator[int, Any, None]"
+
+    res_inferred = _infer_helper_return_type(
+        resolved_ret="Generator[str, bytes, None]",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={
+            "has_yield": True,
+            "has_yield_assignment": True,
+            "yield_expr_names": [],
+            "has_return_value": False,
+        },
+        meta1={},
+        meta2={},
+        is_async=False,
+    )
+    assert res_inferred == "Generator[str, bytes, None]"
+
 
 
 

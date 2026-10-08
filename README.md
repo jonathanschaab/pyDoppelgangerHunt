@@ -234,9 +234,8 @@ fail-closed safety.
 
 - **Memoization & Cache Invalidation**: Downstream liveness analysis caches AST traversal results
   in a thread-safe LRU cache keyed by SHA-256 source digest prefix, unit line/column coordinates,
-  unit kind and name, candidate outputs, and unit modification timestamp (`mtime`, where available
-  on unit dictionaries; source content digest provides definitive invalidation), eliminating
-  duplicate traversals across identical clone boundaries.
+  unit kind and name, and candidate outputs (source content digest provides definitive
+  invalidation), eliminating duplicate traversals across identical clone boundaries.
 - **Lenient Mode Bypass**: For large codebases or batch runs where callback-escaping closures are
   known not to occur, pre-unit closure scanning can be bypassed by specifying
   `--closure-strictness lenient` (or aliases `fast` / `skip`, or `--skip-pre-unit-closures`,

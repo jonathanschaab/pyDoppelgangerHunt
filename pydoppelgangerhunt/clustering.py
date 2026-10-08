@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.config import canonical_path_key
-from pydoppelgangerhunt.source_lines import parse_unit_coord
+from pydoppelgangerhunt.source_lines import parse_unit_coord, resolve_unit_line_bounds
 
 
 class UnionFind:
@@ -49,8 +49,7 @@ def _normalize_unit_file(unit: Dict[str, Any]) -> str:
 def unit_key(unit: Dict[str, Any]) -> str:
     """Generates unique deterministic string key for an AST unit."""
     norm_file = canonical_path_key(str(unit.get("file") or ""), strip_anchor=False)
-    s = max(1, parse_unit_coord(unit, "start", default=1))
-    e = max(s, parse_unit_coord(unit, "end", default=s))
+    s, e = resolve_unit_line_bounds(unit)
     name = str(unit.get("name") or "unit")
     return f"{norm_file}:{s}-{e}:{name}"
 
@@ -303,8 +302,7 @@ def cluster_clone_families(
         unique_files = sorted(list({_normalize_unit_file(m) for m in members}))
         total_lines = 0
         for m_unit in members:
-            u_s = max(1, parse_unit_coord(m_unit, "start", default=1))
-            u_e = max(u_s, parse_unit_coord(m_unit, "end", default=u_s))
+            u_s, u_e = resolve_unit_line_bounds(m_unit)
             total_lines += u_e - u_s + 1
         avg_sim = (sum(family_sims) / len(family_sims)) if family_sims else 1.0
         max_sim = max(family_sims) if family_sims else 1.0

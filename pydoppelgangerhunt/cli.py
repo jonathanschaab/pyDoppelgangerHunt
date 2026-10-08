@@ -64,7 +64,7 @@ from pydoppelgangerhunt.reporters import (
     supports_color,
     synthesize_refactoring_suggestion,
 )
-from pydoppelgangerhunt.source_lines import parse_unit_coord
+from pydoppelgangerhunt.source_lines import resolve_unit_line_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -663,8 +663,7 @@ def _render_text_violations(
             )
             for m in fam.get("members", []):
                 m_file = normalize_path_string(str(m.get("file") or ""), strip_anchor=False)
-                m_start = max(1, parse_unit_coord(m, "start", default=1))
-                m_end = max(m_start, parse_unit_coord(m, "end", default=m_start))
+                m_start, m_end = resolve_unit_line_bounds(m)
                 m_name = str(m.get("name") or "member")
                 m_tag = " [medoid]" if medoid_name and m_name == medoid_name else ""
                 m_line = f"      - {m_file}:{m_start}-{m_end} ({m_name}){m_tag}"
@@ -705,10 +704,8 @@ def _render_text_violations(
                 prefix = f"  * {sim_badge} {p_badge}"
             f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
             f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
-            s1 = max(1, parse_unit_coord(u1, "start", default=1))
-            e1 = max(s1, parse_unit_coord(u1, "end", default=s1))
-            s2 = max(1, parse_unit_coord(u2, "start", default=1))
-            e2 = max(s2, parse_unit_coord(u2, "end", default=s2))
+            s1, e1 = resolve_unit_line_bounds(u1)
+            s2, e2 = resolve_unit_line_bounds(u2)
             n1 = str(u1.get("name") or "unit1")
             n2 = str(u2.get("name") or "unit2")
             line = f"{prefix} {f1}:{s1}-{e1} ({n1}) <===> {f2}:{s2}-{e2} ({n2})"

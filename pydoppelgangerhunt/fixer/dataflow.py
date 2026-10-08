@@ -15,6 +15,7 @@ from pydoppelgangerhunt.source_lines import (
     is_sliced_unit_source_lines,
     parse_unit_coord,
     resolve_safe_unit_file_path,
+    resolve_unit_line_bounds,
 )
 from pydoppelgangerhunt.fixer.source import _find_innermost_enclosing_node
 
@@ -987,18 +988,24 @@ def _collect_scope_closures(scope_node: ast.AST) -> List[Tuple[int, Set[str]]]:
                 continue
 
             if isinstance(stmt, ast.ClassDef):
-                for item in ast.walk(stmt):
-                    if item is not stmt and isinstance(
-                        item,
-                        (
-                            ast.FunctionDef,
-                            ast.AsyncFunctionDef,
-                            ast.Lambda,
-                            ast.GeneratorExp,
-                        ),
-                    ):
-                        item_start = getattr(item, "lineno", stmt_start)
+                for item in stmt.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        dec_list = getattr(item, "decorator_list", [])
+                        item_start = min(
+                            [getattr(d, "lineno", item.lineno) for d in dec_list]
+                            or [item.lineno]
+                        )
                         closures.append((item_start, _extract_nested_scope_free_reads(item)))
+                    elif isinstance(item, ast.ClassDef):
+                        _walk_stmts([item])
+                    elif isinstance(item, ast.stmt):
+                        for hnode in _extract_header_nodes(item):
+                            for subnode in ast.walk(hnode):
+                                if isinstance(subnode, (ast.Lambda, ast.GeneratorExp)):
+                                    sub_line = getattr(subnode, "lineno", stmt_start)
+                                    closures.append(
+                                        (sub_line, _extract_nested_scope_free_reads(subnode))
+                                    )
                 continue
 
             for hnode in _extract_header_nodes(stmt):
@@ -1175,18 +1182,6 @@ def _nodes_load_any_name(nodes: Iterable[ast.AST], names: Set[str]) -> bool:
                 return True
     return False
 
-
-def _is_swallowing_with_statement(node: Union[ast.With, ast.AsyncWith]) -> bool:
-    """Checks whether any withitem in a with statement uses a swallowing context manager."""
-    for item in node.items:
-        ctx = item.context_expr
-        if isinstance(ctx, ast.Call):
-            func = ctx.func
-            if isinstance(func, ast.Name) and "suppress" in func.id.lower():
-                return True
-            if isinstance(func, ast.Attribute) and "suppress" in func.attr.lower():
-                return True
-    return False
 
 
 def _get_scope_try_and_with_blocks(
@@ -1420,6 +1415,7 @@ def collect_downstream_read_names(
         visitor.visit(stmt)
 
     loaded = set(visitor.loaded)
+    loop_visitor: Optional[_DownstreamReadVisitor] = None
     if enclosing_loops:
         loop_visitor = _DownstreamReadVisitor(
             u_start,
@@ -1434,7 +1430,7 @@ def collect_downstream_read_names(
         loaded.update(loop_visitor.loaded)
 
     has_dynamic = visitor.has_dynamic_read or (
-        bool(enclosing_loops) and getattr(loop_visitor, "has_dynamic_read", False)
+        loop_visitor is not None and loop_visitor.has_dynamic_read
     )
     if has_dynamic and candidates is None:
         for subnode in ast.walk(scope_node):
@@ -1742,8 +1738,7 @@ def resolve_clone_generator_subroutine_outputs(
                     side_idx + 1,
                 )
                 return None
-            u_s = max(1, parse_unit_coord(u_item, "start", default=1))
-            u_e = max(u_s, parse_unit_coord(u_item, "end", default=u_s))
+            u_s, u_e = resolve_unit_line_bounds(u_item)
             if _enclosing_try_reads_outputs(scope_node, u_s, u_e, set(needed_outs)):
                 logger.debug(
                     "Rejecting generator subroutine pair: needed output(s) read in "

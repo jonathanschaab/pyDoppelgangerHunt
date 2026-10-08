@@ -397,9 +397,12 @@ def _infer_helper_return_type(
     """Infers the return type annotation for a synthesized shared helper function."""
     if scope.get("has_yield"):
         has_return_val = bool(helper_outputs or scope.get("has_return_value"))
+        has_yield_assign = bool(scope.get("has_yield_assignment"))
         if not has_return_val and resolved_ret not in ("Any", "None"):
-            if resolved_ret.startswith((
-                "Generator[", "Iterator[", "Iterable[",
+            if resolved_ret.startswith("Generator["):
+                return resolved_ret
+            if not has_yield_assign and resolved_ret.startswith((
+                "Iterator[", "Iterable[",
                 "AsyncGenerator[", "AsyncIterator[", "AsyncIterable[",
             )):
                 return resolved_ret
@@ -485,8 +488,8 @@ def _infer_helper_return_type(
                 inferred_send_type
                 or ("Any" if scope.get("has_yield_assignment") else "None")
             )
-            ret_t = outputs_ret or fallback_ret
-            if ret_t:
+            ret_t = outputs_ret or fallback_ret or ("None" if send_t != "None" else None)
+            if ret_t is not None:
                 return f"Generator[{yield_t}, {send_t}, {ret_t}]"
             return f"Iterator[{yield_t}]"
 
