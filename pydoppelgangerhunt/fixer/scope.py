@@ -1460,7 +1460,7 @@ def _inspect_unit_scope(
                 source_text, s_line, e_line, tree=file_tree
             )
         else:
-            unit_is_async = False
+            unit_is_async = None
 
     return {
         "inputs": inputs,
@@ -1485,9 +1485,17 @@ def _inspect_unit_scope(
         "local_imports": visitor.local_imports,
         "yield_expr_names": visitor.yield_expr_names,
         "is_async": (
-            (visitor.is_async or (bool(unit_is_async) and visitor.has_yield))
-            if is_subroutine
-            else (visitor.is_async or bool(unit_is_async))
+            True
+            if visitor.is_async
+            else (
+                (bool(unit_is_async) if unit_is_async is not None else None)
+                if visitor.has_yield
+                else (
+                    bool(unit_is_async)
+                    if (not is_subroutine and unit.get("kind") not in ("function", "method"))
+                    else False
+                )
+            )
         ),
         "conditional_outputs": conditional_outputs,
         "definite_stores": sorted(def_assigned),

@@ -6,8 +6,8 @@ shared helper synthesis, and unified diff patch generation.
 
 from __future__ import annotations
 
+from pydoppelgangerhunt.config import resolve_closure_strictness_mode
 from pydoppelgangerhunt.fixer.binding import (
-    GeneratorCloneSideData,
     _base_unit_name,
     _extract_child_indentation,
     _find_innermost_enclosing_node,
@@ -20,12 +20,15 @@ from pydoppelgangerhunt.fixer.binding import (
     _populate_unit_receiver_metadata,
     _prune_unshared_receivers,
     _resolve_effective_binding,
-    collect_downstream_read_names,
     find_enclosing_class,
     find_enclosing_function,
+)
+from pydoppelgangerhunt.fixer.dataflow import (
+    GeneratorCloneSideData,
+    collect_downstream_read_names,
+    has_async_generator_delegation_hazard,
     is_async_generator_with_return_value,
     resolve_clone_generator_subroutine_outputs,
-    resolve_closure_strictness_mode,
     resolve_generator_subroutine_outputs,
 )
 from pydoppelgangerhunt.fixer.depgraph import (
@@ -144,6 +147,7 @@ __all__ = [
     "find_nearest_common_package",
     "generate_refactoring_patch",
     "GeneratorCloneSideData",
+    "has_async_generator_delegation_hazard",
     "intervals_overlap",
     "is_async_generator_with_return_value",
     "is_subroutine_unit",

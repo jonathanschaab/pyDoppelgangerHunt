@@ -6675,9 +6675,9 @@ def test_render_file_patch_plan_tier2_collision_fallback() -> None:
     assert "# replaced 2" not in diff
 
 
-def test_render_file_patch_plan_unit_end_defaults_to_start() -> None:
-    """Verifies that _render_file_patch_plan retains units whose end coordinate is omitted
-    by correctly defaulting end to start."""
+def test_render_file_patch_plan_omits_unit_with_missing_or_invalid_end() -> None:
+    """Verifies that _render_file_patch_plan fails closed and omits units whose end
+    coordinate is omitted or inverted."""
     from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _render_file_patch_plan
 
     plan = _FilePatchPlan(
@@ -6687,11 +6687,13 @@ def test_render_file_patch_plan_unit_end_defaults_to_start() -> None:
         is_new_file=False,
     )
     u_no_end = {"file": "test.py", "start": 1}
+    u_inv = {"file": "test.py", "start": 3, "end": 1}
     plan.replacements.append((u_no_end, "# replaced line 1\n"))
+    plan.replacements.append((u_inv, "# replaced line 3\n"))
 
     diff = _render_file_patch_plan(plan, replace_clones=True)
-    assert "--- a/test.py" in diff
-    assert "# replaced line 1" in diff
+    assert "# replaced line 1" not in diff
+    assert "# replaced line 3" not in diff
 
 
 def test_generate_refactoring_patch_no_state_leakage_on_skipped_pair(tmp_path: Path) -> None:
@@ -8795,14 +8797,13 @@ def test_generate_refactoring_patch_closure_strictness_knob(tmp_path: Path) -> N
     ("mode_arg", "skip_flag", "expected"),
     [
         ("lenient", None, ("lenient", True)),
-        ("fast", None, ("lenient", True)),
-        ("skip", None, ("lenient", True)),
         ("strict", None, ("strict", False)),
-        ("fail_closed", None, ("strict", False)),
         (None, True, ("lenient", True)),
         (None, False, ("strict", False)),
         ("strict", True, ("strict", False)),
         ("lenient", False, ("lenient", True)),
+        ("unknown_mode", True, ("lenient", True)),
+        ("unknown_mode", False, ("strict", False)),
     ],
 )
 def test_resolve_closure_strictness_mode_aliases(

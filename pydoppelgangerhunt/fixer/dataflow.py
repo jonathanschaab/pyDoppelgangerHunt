@@ -11,6 +11,7 @@ import logging
 import threading
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
+from pydoppelgangerhunt.config import resolve_closure_strictness_mode
 from pydoppelgangerhunt.source_lines import (
     is_sliced_unit_source_lines,
     parse_unit_coord,
@@ -26,6 +27,7 @@ _BUILTIN_NAMES: Set[str] = set(dir(builtins))
 __all__ = [
     "GeneratorCloneSideData",
     "collect_downstream_read_names",
+    "has_async_generator_delegation_hazard",
     "is_async_generator_with_return_value",
     "is_subroutine_unit",
     "resolve_clone_generator_subroutine_outputs",
@@ -39,23 +41,21 @@ def _load_unit_file_text(
     repo_root: Optional[str] = None,
 ) -> Optional[str]:
     """Reads full source text from memory or disk for downstream AST read analysis."""
-    is_sliced = unit.get("source_lines_is_sliced")
-    if is_sliced is True:
-        return None
-
     source_text = unit.get("source_text")
     if source_text is None:
         source_text = unit.get("file_source")
     if source_text is not None:
         return str(source_text)
 
-    unit_lines = unit.get("source_lines")
-    if unit_lines and isinstance(unit_lines, (list, tuple)):
-        if not is_sliced_unit_source_lines(unit, unit_lines):
-            return "".join(
-                ln if ln.endswith("\n") else ln + "\n"
-                for ln in unit_lines
-            )
+    is_sliced = unit.get("source_lines_is_sliced")
+    if is_sliced is not True:
+        unit_lines = unit.get("source_lines")
+        if unit_lines and isinstance(unit_lines, (list, tuple)):
+            if not is_sliced_unit_source_lines(unit, unit_lines):
+                return "".join(
+                    ln if ln.endswith("\n") else ln + "\n"
+                    for ln in unit_lines
+                )
 
     # Disk fallback: strictly only .py files within repo_root or CWD are accepted.
     # Notebooks (.ipynb) and out-of-root files fail closed and return None.
@@ -650,7 +650,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self.killed: Set[str] = set()
         self.has_dynamic_read: bool = False
 
-    _DYNAMIC_READ_FUNCS = frozenset({"locals", "vars", "eval", "exec", "dir"})
+    _DYNAMIC_READ_FUNCS = frozenset({"locals", "vars", "eval", "exec", "dir", "globals"})
 
     def _is_node_after_unit(self, node: ast.AST) -> bool:
         lineno = getattr(node, "lineno", None)
@@ -1073,18 +1073,20 @@ def _build_downstream_cache_key(
 ) -> Tuple[Any, ...]:
     """Forms a persistent cache key for downstream AST read analysis."""
     file_path_str = str(unit.get("file") or "")
+    computed_digest = hashlib.sha256(
+        source_text.encode("utf-8", errors="replace")
+    ).hexdigest()
     digest = source_digest or unit.get("source_digest") or unit.get("content_digest")
     if digest is not None:
-        content_digest = str(digest)[:16]
+        content_digest = f"{computed_digest}:{digest}"
     else:
-        content_digest = hashlib.sha256(
-            source_text.encode("utf-8", errors="replace")
-        ).hexdigest()[:16]
+        content_digest = computed_digest
     start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
     end_col = _extract_unit_end_col(unit)
     cands_key = frozenset(candidates) if candidates is not None else None
     unit_kind = unit.get("kind")
     unit_name = unit.get("name")
+    is_sub = is_subroutine_unit(unit)
     return (
         content_digest,
         file_path_str,
@@ -1094,6 +1096,7 @@ def _build_downstream_cache_key(
         end_col,
         unit_kind,
         unit_name,
+        is_sub,
         cands_key,
         bool(skip_pre_unit_closures),
     )
@@ -1264,8 +1267,11 @@ def _enclosing_try_reads_outputs(
 ) -> bool:
     """Returns True if unit is inside an enclosing try, else, or except block whose
     handlers/finally read outputs, or whose handlers fall through and outputs are read
-    downstream of the try block, or inside a swallowing with block whose outputs are read
-    downstream."""
+    downstream of the try block, or inside any enclosing with or async with block whose
+    outputs are read downstream. Any enclosing with block whose outputs are read downstream
+    fails closed because context manager exit on premature termination or cleanup hazards
+    cannot be assumed safe across arbitrary context managers (including locks, transactions,
+    and streams)."""
     if scope_node is None or not outputs:
         return False
     for node in _get_scope_try_and_with_blocks(scope_node):
@@ -1594,8 +1600,13 @@ def is_async_generator_with_return_value(
     *scopes: Optional[Dict[str, Any]],
     has_outputs: bool = False,
 ) -> bool:
-    """Checks whether scopes represent an async generator attempting to return values or outputs,
-    or involving delegation semantic loss (yield assignments, try/with cleanup blocks)."""
+    """Checks whether scopes represent an async generator that cannot safely be delegated
+    via PEP 525 async for ...: yield delegation without semantic loss (including return values,
+    unpaired outputs, bidirectional yield assignments, or try/with/async with cleanup blocks
+    that lose athrow/aclose propagation).
+
+    Applies to both subroutine and whole-function async generator refactorings.
+    """
     has_yield = any(bool(s.get("has_yield")) for s in scopes if s is not None)
     is_async = any(bool(s.get("is_async")) for s in scopes if s is not None)
     if not (has_yield and is_async):
@@ -1618,6 +1629,9 @@ def is_async_generator_with_return_value(
     return False
 
 
+has_async_generator_delegation_hazard = is_async_generator_with_return_value
+
+
 def _extract_effective_unit_outputs(
     unit: Dict[str, Any], scope: Dict[str, Any]
 ) -> List[str]:
@@ -1631,40 +1645,6 @@ def _extract_effective_unit_outputs(
         cands = scope.get("outputs", [])
     excluded = set(scope.get("globals", [])) | set(scope.get("nonlocals", []))
     return [v for v in cands if v not in excluded]
-
-
-_warned_closure_strictness_values: Set[str] = set()
-
-
-def resolve_closure_strictness_mode(
-    closure_strictness: Optional[str] = None,
-    skip_pre_unit_closures: bool = False,
-) -> Tuple[str, bool]:
-    """Resolves canonical closure strictness mode ('strict' or 'lenient') and boolean skip flag.
-
-    Precedence:
-    Explicit closure_strictness takes precedence over the boolean flag. Permissive aliases
-    ('lenient', 'fast', 'skip') map to ('lenient', True), while conservative aliases
-    ('strict', 'fail_closed') map to ('strict', False). If unspecified or unrecognized,
-    falls back to skip_pre_unit_closures.
-    """
-    if closure_strictness is not None:
-        c_mode = str(closure_strictness).strip().lower()
-        if c_mode in ("lenient", "fast", "skip"):
-            return "lenient", True
-        if c_mode in ("strict", "fail_closed"):
-            return "strict", False
-        fallback = "lenient" if skip_pre_unit_closures else "strict"
-        raw_key = str(closure_strictness)
-        if raw_key not in _warned_closure_strictness_values:
-            _warned_closure_strictness_values.add(raw_key)
-            logger.warning(
-                "Unrecognized closure_strictness '%s'; falling back to %s mode",
-                closure_strictness,
-                fallback,
-            )
-    is_lenient = bool(skip_pre_unit_closures)
-    return ("lenient" if is_lenient else "strict"), is_lenient
 
 
 def resolve_clone_generator_subroutine_outputs(
@@ -1772,5 +1752,15 @@ def resolve_clone_generator_subroutine_outputs(
                     side_idx + 1,
                 )
                 return None
+            for c_line, reads in _collect_scope_closures(scope_node):
+                if u_s <= c_line <= u_e and bool(reads & set(needed_outs)):
+                    logger.debug(
+                        "Rejecting generator subroutine pair: intra-unit closure at line %d "
+                        "captures needed output(s) %r for unit %s",
+                        c_line,
+                        reads & set(needed_outs),
+                        side_idx + 1,
+                    )
+                    return None
 
     return resolved

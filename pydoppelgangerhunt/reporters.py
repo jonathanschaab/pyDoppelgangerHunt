@@ -14,9 +14,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
 from pydoppelgangerhunt.config import normalize_path_string
 from pydoppelgangerhunt.source_lines import (
-    _resolve_safe_unit_file_path,
     is_sliced_unit_source_lines,
     parse_unit_coord,
+    resolve_safe_unit_file_path,
     resolve_unit_line_bounds,
     split_source_lines,
 )
@@ -95,7 +95,7 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
             for ln in source_lines[start - 1 : end]
         ]
 
-    resolved_file = _resolve_safe_unit_file_path(unit, repo_root=repo_root)
+    resolved_file = resolve_safe_unit_file_path(unit, repo_root=repo_root)
     if resolved_file is None:
         return placeholder
 

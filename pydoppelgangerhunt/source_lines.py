@@ -147,8 +147,6 @@ def is_sliced_unit_source_lines(
     expected_len = max(0, e_d - s_d + 1)
     if len(lines) == expected_len:
         return True
-    if len(lines) < e_d:
-        return True
     return False
 
 
@@ -304,16 +302,13 @@ def resolve_safe_unit_file_path(
             return None
         repo_root_path = Path(repo_root) if repo_root else target_root
         for parent in file_path.parents:
-            if target_root in parent.parents or repo_root_path in parent.parents:
-                if parent.is_symlink():
-                    return None
-            if (
-                parent == target_root
-                or parent == repo_root_path
-                or parent.resolve() == target_root
-            ):
+            if parent in (target_root, repo_root_path):
                 break
             if parent.is_symlink():
+                if target_root in parent.parents or repo_root_path in parent.parents:
+                    return None
+                if parent.resolve() == target_root:
+                    break
                 return None
 
         resolved_file = file_path.resolve()

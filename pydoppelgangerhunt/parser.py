@@ -967,6 +967,24 @@ def _record_clause_branch(
     )
 
 
+def _node_is_effectively_async(
+    node: Union[ast.AST, Sequence[ast.AST]], enclosing_is_async: bool
+) -> bool:
+    """Checks whether an AST node or stmt sequence has async syntax or acts as an async generator."""
+    if isinstance(node, (list, tuple)):
+        nodes = list(node)
+    else:
+        nodes = [node]
+    for n in nodes:
+        if isinstance(n, ast.AST):
+            for sub in ast.walk(n):
+                if isinstance(sub, (ast.Await, ast.AsyncFor, ast.AsyncWith)):
+                    return True
+                if enclosing_is_async and isinstance(sub, (ast.Yield, ast.YieldFrom)):
+                    return True
+    return False
+
+
 def _record_node_unit(
     units: List[Dict[str, Any]],
     name: str,
@@ -1300,7 +1318,7 @@ def harvest_file_units(
                                 enclosing_class_start=enc_class_start,
                                 receiver_kind=fn_receiver_kind,
                                 is_static=fn_is_static,
-                                is_async=fn_is_async,
+                                is_async=_node_is_effectively_async(item, fn_is_async),
                             )
 
             if sliding_window and hasattr(node, "body"):
@@ -1332,7 +1350,7 @@ def harvest_file_units(
                             enclosing_class_start=enc_class_start,
                             receiver_kind=fn_receiver_kind,
                             is_static=fn_is_static,
-                            is_async=fn_is_async,
+                            is_async=_node_is_effectively_async(window_slice, fn_is_async),
                         )
 
             if clause_level and hasattr(node, "body"):
@@ -1368,7 +1386,7 @@ def harvest_file_units(
                         enclosing_class_start=e_start,
                         receiver_kind=r_kind,
                         is_static=static_fn,
-                        is_async=async_fn,
+                        is_async=_node_is_effectively_async(body, async_fn),
                     )
 
                 for stmt in _iter_local_nodes(node):

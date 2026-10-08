@@ -1367,6 +1367,30 @@ def test_async_generator_with_return_rejected_in_synthesis(tmp_path: Path) -> No
     assert "async def" in helper_bare
     assert "-> AsyncIterator[" in helper_bare
 
+    # 3. Whole-function async generator with try/finally or with block is rejected
+    # because delegation via async for ...: yield loses athrow()/aclose() propagation.
+    code_try = (
+        "async def agen_try(items: list[int]):\n"
+        "    try:\n"
+        "        for x in items:\n"
+        "            yield x\n"
+        "    finally:\n"
+        "        pass\n"
+    )
+    f5 = tmp_path / "at1.py"
+    f6 = tmp_path / "at2.py"
+    f5.write_text(code_try, encoding="utf-8")
+    f6.write_text(code_try, encoding="utf-8")
+    u5 = {
+        "file": "at1.py", "start": 1, "end": 6,
+        "name": "agen_try", "kind": "function", "is_async": True,
+    }
+    u6 = {
+        "file": "at2.py", "start": 1, "end": 6,
+        "name": "agen_try", "kind": "function", "is_async": True,
+    }
+    assert synthesize_shared_helper_code(u5, u6, repo_root=str(tmp_path)) == ""
+
 
 def test_collect_downstream_read_names_scope_and_closure_capture() -> None:
     """Verifies that collect_downstream_read_names captures free variables and immediate class body reads, while respecting shadowed locals."""
@@ -4723,6 +4747,16 @@ def test_is_valid_unit_coordinates_strict_mode() -> None:
     assert is_valid_unit_coordinates({"start": ""}, strict=False) is False
     # Missing start rejected
     assert is_valid_unit_coordinates({"end": 5}) is False
+    # Missing end rejected in strict mode
+    assert is_valid_unit_coordinates({"start": 5}, strict=True) is False
+    # Inverted coordinates rejected in both strict and lenient modes
+    assert is_valid_unit_coordinates({"start": 5, "end": 2}, strict=True) is False
+    assert is_valid_unit_coordinates({"start": 5, "end": 2}, strict=False) is False
+    # Zero or negative end rejected
+    assert is_valid_unit_coordinates({"start": 5, "end": 0}) is False
+    assert is_valid_unit_coordinates({"start": 5, "end": -1}) is False
+    # Inverted same-line column coordinates rejected
+    assert is_valid_unit_coordinates({"start": 1, "end": 1, "start_col": 10, "end_col": 5}) is False
     # Float rejected in strict mode
     assert is_valid_unit_coordinates({"start": 12.0}) is False
     assert is_valid_unit_coordinates({"start": 12.0}, strict=False) is True

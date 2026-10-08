@@ -4,21 +4,12 @@ from __future__ import annotations
 
 import ast
 import os
-import re
 from pathlib import Path
+import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.config import normalize_path_string, paths_match_boundary
-from pydoppelgangerhunt.fixer.dataflow import (
-    GeneratorCloneSideData,
-    _load_unit_file_text,
-    collect_downstream_read_names,
-    is_async_generator_with_return_value,
-    is_subroutine_unit,
-    resolve_clone_generator_subroutine_outputs,
-    resolve_closure_strictness_mode,
-    resolve_generator_subroutine_outputs,
-)
+from pydoppelgangerhunt.fixer.dataflow import _load_unit_file_text
 from pydoppelgangerhunt.fixer.scope import (
     dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
 )
@@ -29,7 +20,6 @@ from pydoppelgangerhunt.fixer.source import (
 from pydoppelgangerhunt.parser import is_decorator_named
 
 __all__ = [
-    "GeneratorCloneSideData",
     "_base_unit_name",
     "_extract_child_indentation",
     "_find_innermost_enclosing_node",
@@ -44,14 +34,8 @@ __all__ = [
     "_prune_unshared_receivers",
     "_resolve_effective_binding",
     "analyze_unit_variable_scope",
-    "collect_downstream_read_names",
     "find_enclosing_class",
     "find_enclosing_function",
-    "is_async_generator_with_return_value",
-    "is_subroutine_unit",
-    "resolve_clone_generator_subroutine_outputs",
-    "resolve_closure_strictness_mode",
-    "resolve_generator_subroutine_outputs",
 ]
 
 

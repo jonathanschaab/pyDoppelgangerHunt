@@ -2,12 +2,49 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from pydoppelgangerhunt.canonical_path import normalize_lexical_posix, parse_notebook_cell_anchor
+
+logger = logging.getLogger(__name__)
+
+_warned_closure_strictness_values: Set[str] = set()
+
+
+def resolve_closure_strictness_mode(
+    closure_strictness: Optional[str] = None,
+    skip_pre_unit_closures: bool = False,
+) -> Tuple[str, bool]:
+    """Resolves canonical closure strictness mode ('strict' or 'lenient') and boolean skip flag.
+
+    Precision vs Soundness Trade-off:
+    'strict' (default) preserves soundness by inspecting escaping closures and callbacks
+    that might execute after the unit.
+    'lenient' reduces false-positive rejections by bypassing pre-unit closure scanning,
+    at the cost of soundness for escaping closures.
+    """
+    if closure_strictness is not None:
+        c_mode = str(closure_strictness).strip().lower()
+        if c_mode == "lenient":
+            return "lenient", True
+        if c_mode == "strict":
+            return "strict", False
+        fallback = "lenient" if skip_pre_unit_closures else "strict"
+        raw_key = str(closure_strictness)
+        if raw_key not in _warned_closure_strictness_values:
+            _warned_closure_strictness_values.add(raw_key)
+            logger.warning(
+                "Unrecognized closure_strictness '%s'; falling back to %s mode",
+                closure_strictness,
+                fallback,
+            )
+    is_lenient = bool(skip_pre_unit_closures)
+    return ("lenient" if is_lenient else "strict"), is_lenient
+
 
 DEFAULT_EXCLUDES: List[str] = [
     "checks/encapsulated",

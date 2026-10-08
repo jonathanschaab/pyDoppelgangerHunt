@@ -9,7 +9,10 @@ import textwrap
 import typing
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-from pydoppelgangerhunt.config import normalize_path_string
+from pydoppelgangerhunt.config import (
+    normalize_path_string,
+    resolve_closure_strictness_mode,
+)
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
@@ -21,10 +24,10 @@ from pydoppelgangerhunt.fixer.binding import (
 )
 from pydoppelgangerhunt.fixer.dataflow import (
     _extract_effective_unit_outputs,
+    _load_unit_file_text,
     _pair_clone_outputs,
     is_async_generator_with_return_value,
     resolve_clone_generator_subroutine_outputs,
-    resolve_closure_strictness_mode,
 )
 from pydoppelgangerhunt.fixer.scope import (
     _normalize_receiver_attrs,
@@ -767,6 +770,24 @@ def synthesize_shared_helper_code(
                             common_lines[idx] = ln.rstrip() + f"  {p_text}"
                             break
 
+    def _resolve_tree(
+        given_tree: Optional[ast.AST],
+        given_src: Optional[str],
+        unit: Dict[str, Any],
+    ) -> Optional[ast.AST]:
+        if given_tree is not None:
+            return given_tree
+        raw_text = given_src or _load_unit_file_text(unit, repo_root=repo_root)
+        if raw_text:
+            try:
+                return ast.parse(raw_text)
+            except (SyntaxError, ValueError):
+                pass
+        return None
+
+    tree1 = _resolve_tree(tree1, source_text1, u1)
+    tree2 = _resolve_tree(tree2, source_text2, u2)
+
     _populate_unit_receiver_metadata(u1, repo_root=repo_root)
     _populate_unit_receiver_metadata(u2, repo_root=repo_root)
 
@@ -822,6 +843,8 @@ def synthesize_shared_helper_code(
     ):
         return ""
 
+    if scope1.get("is_async") is None or scope2.get("is_async") is None:
+        return ""
     if bool(scope1.get("is_async")) != bool(scope2.get("is_async")):
         return ""
     if bool(scope1.get("has_yield")) != bool(scope2.get("has_yield")):

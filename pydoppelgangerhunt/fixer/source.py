@@ -54,23 +54,50 @@ _resolve_safe_unit_file_path = resolve_safe_unit_file_path
 def is_valid_unit_coordinates(u: Any, strict: bool = True) -> bool:
     """Verifies that an AST unit dictionary has valid integer coordinates.
 
-    In strict mode (default, for code refactoring and patching), start is required
-    and must parse strictly to a positive integer (rejecting floats, colons, and blank
-    strings). End, start_col, and end_col must also parse strictly if present.
+    In strict mode (default, for code refactoring and patching), both start and end
+    are required and must parse strictly to positive integers (rejecting floats, colons,
+    and blank strings) with end >= start. End, start_col, and end_col must also parse
+    strictly if present, with end_col >= start_col if on the same line.
     """
     if not isinstance(u, dict):
         return False
     if "start" not in u or u.get("start") is None:
         return False
+    if strict and ("end" not in u or u.get("end") is None):
+        return False
     try:
         start_val = parse_unit_coord(u, "start", default=None, strict=strict)
         if start_val is None or start_val <= 0:
             return False
-        for key in ("end", "start_col", "end_col"):
-            if key in u and u.get(key) is not None:
-                coord_val = parse_unit_coord(u, key, default=None, strict=strict)
-                if coord_val is None or coord_val < 0:
-                    return False
+
+        end_val: Optional[int] = None
+        if "end" in u and u.get("end") is not None:
+            end_val = parse_unit_coord(u, "end", default=None, strict=strict)
+            if end_val is None or end_val <= 0 or end_val < start_val:
+                return False
+        elif strict:
+            return False
+
+        start_col: Optional[int] = None
+        end_col: Optional[int] = None
+        if "start_col" in u and u.get("start_col") is not None:
+            start_col = parse_unit_coord(u, "start_col", default=None, strict=strict)
+            if start_col is None or start_col < 0:
+                return False
+        if "end_col" in u and u.get("end_col") is not None:
+            end_col = parse_unit_coord(u, "end_col", default=None, strict=strict)
+            if end_col is None or end_col < 0:
+                return False
+
+        if (
+            end_val is not None
+            and start_col is not None
+            and end_col is not None
+            and start_val == end_val
+            and end_col < start_col
+        ):
+            return False
+
         return True
     except (ValueError, TypeError, KeyError):
         return False

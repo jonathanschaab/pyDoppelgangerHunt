@@ -906,9 +906,13 @@ def _compute_replacement_line_deltas(
     for i, (u, rep) in enumerate(reps):
         if not isinstance(u, dict):
             raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
+        if not is_valid_unit_coordinates(u, strict=True):
+            raise ValueError(
+                f"Malformed unit: invalid line boundary in {u.get('file', '')}: {u}"
+            )
         try:
-            fallback = max(1, parse_unit_coord(u, "start", default=1))
-            end_l = max(fallback, parse_unit_coord(u, "end", default=fallback))
+            fallback = max(1, parse_unit_coord(u, "start", default=1, strict=True))
+            end_l = max(fallback, parse_unit_coord(u, "end", default=fallback, strict=True))
         except (ValueError, TypeError) as err:
             raise ValueError(f"Malformed unit: invalid line boundary in {u.get('file', '')}: {err}") from err
         item = resolve_unit_replacement(
@@ -1239,11 +1243,18 @@ def _render_file_patch_plan(
     )
 
     def _unit_span(unit: Dict[str, Any]) -> Tuple[int, int]:
-        s = max(1, parse_unit_coord(unit, "start", default=1))
-        return s, max(s, parse_unit_coord(unit, "end", default=s))
+        s = parse_unit_coord(unit, "start", default=1, strict=True)
+        return s, parse_unit_coord(unit, "end", default=s, strict=True)
 
     filtered_reps: List[Tuple[Dict[str, Any], str]] = []
     for u, rep in plan.replacements:
+        if not is_valid_unit_coordinates(u, strict=True):
+            logger.warning(
+                "Skipping replacement with invalid coordinates in %s: %r",
+                plan.rel_path,
+                u,
+            )
+            continue
         u_span = _unit_span(u)
         if any(
             u is r or (u.get("file") == r.get("file") and u_span == _unit_span(r))
@@ -2840,6 +2851,8 @@ def generate_refactoring_patch(
                 s1["is_async"] = True
             if orig_fn2 and orig_fn2.get("is_async") and s2.get("has_yield"):
                 s2["is_async"] = True
+            if s1.get("is_async") is None or s2.get("is_async") is None:
+                continue
             if bool(s1.get("is_async")) != bool(s2.get("is_async")):
                 continue
             if bool(s1.get("has_yield")) != bool(s2.get("has_yield")):
