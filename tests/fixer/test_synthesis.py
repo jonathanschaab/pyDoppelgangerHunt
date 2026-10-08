@@ -52,6 +52,7 @@ from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-acc
     _VisitorPassMode,
     _clear_downstream_reads_cache,
     _collect_pre_unit_closures,
+    _collect_scope_closures,
     _downstream_cache_lock,
     _downstream_reads_cache,
     _enclosing_try_reads_outputs,
@@ -63,6 +64,7 @@ from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-acc
     _load_unit_file_text,
     _pair_clone_outputs,
     _resolve_unit_ast_end_col,
+    _scope_reads_outputs_after_line,
     collect_downstream_read_names,
     is_async_generator_with_return_value,
     resolve_clone_generator_subroutine_outputs,
@@ -71,6 +73,7 @@ from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-acc
 from pydoppelgangerhunt.source_lines import parse_unit_coord
 from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access
     _infer_outputs_return_type,
+    _normalize_pipe_unions,
     _split_type_args,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
@@ -4816,6 +4819,146 @@ def test_generator_send_type_preserved_when_return_type_none() -> None:
         is_async=False,
     )
     assert res_inferred == "Generator[str, bytes, None]"
+
+
+def test_scope_reads_outputs_after_line_boundary_precision() -> None:
+    """Verifies that _scope_reads_outputs_after_line evaluates reads strictly post-line."""
+    code_no_post = (
+        "def run():\n"
+        "    with open('f') as fp:\n"
+        "        total = 42\n"
+        "        yield total\n"
+    )
+    tree_no_post = ast.parse(code_no_post)
+    func_node_no_post = tree_no_post.body[0]
+    # Line 4 is 'yield total', which is the end of the with-block
+    # Reads on line 4 itself must NOT be treated as occurring downstream after line 4
+    assert not _scope_reads_outputs_after_line(func_node_no_post, 4, {"total"})
+
+    code_with_post = (
+        "def run():\n"
+        "    with open('f') as fp:\n"
+        "        total = 42\n"
+        "        yield total\n"
+        "    print(total)\n"
+    )
+    tree_with_post = ast.parse(code_with_post)
+    func_node_with_post = tree_with_post.body[0]
+    # Reads on line 5 (after the with-block on line 4) MUST be detected
+    assert _scope_reads_outputs_after_line(func_node_with_post, 4, {"total"})
+
+
+def test_collect_scope_closures_class_compound_blocks() -> None:
+    """Verifies that _collect_scope_closures inspects methods inside compound blocks in classes."""
+    code = (
+        "def outer():\n"
+        "    outer_var = 10\n"
+        "    class C:\n"
+        "        if True:\n"
+        "            def helper(self):\n"
+        "                return outer_var\n"
+        "        try:\n"
+        "            def helper_try(self):\n"
+        "                return outer_var + 1\n"
+        "        except Exception:\n"
+        "            def helper_except(self):\n"
+        "                return outer_var + 2\n"
+        "    x = 1\n"
+    )
+    tree = ast.parse(code)
+    func_node = tree.body[0]
+    closures = _collect_scope_closures(func_node)
+    captured_vars = set()
+    for _, names in closures:
+        captured_vars.update(names)
+    assert "outer_var" in captured_vars
+
+
+def test_parse_unit_coord_strict_rejects_bool() -> None:
+    """Verifies that parse_unit_coord with strict=True rejects boolean literals."""
+    with pytest.raises(ValueError, match="boolean coordinate not allowed in strict mode"):
+        parse_unit_coord({"start": True}, "start", strict=True)
+
+    with pytest.raises(ValueError, match="boolean coordinate not allowed in strict mode"):
+        parse_unit_coord({"start": False}, "start", strict=True)
+
+    # In lenient mode, int(True) evaluates to 1
+    assert parse_unit_coord({"start": True}, "start", strict=False) == 1
+    # Valid int in strict mode succeeds
+    assert parse_unit_coord({"start": 42}, "start", strict=True) == 42
+
+
+def test_normalize_pipe_unions_variants() -> None:
+    """Verifies PEP 604 pipe union normalization across simple, nested, and quoted types."""
+    assert _normalize_pipe_unions("int | str") == "Union[int, str]"
+    assert _normalize_pipe_unions("int | str | float") == "Union[int, str, float]"
+    assert _normalize_pipe_unions("int | int") == "int"
+    assert _normalize_pipe_unions("list[int | str]") == "list[Union[int, str]]"
+    assert _normalize_pipe_unions("Iterator[int | None]") == "Iterator[Union[int, None]]"
+    assert _normalize_pipe_unions("tuple[int | str, ...]") == "tuple[Union[int, str], ...]"
+    assert _normalize_pipe_unions("Tuple[int | str, float]") == "Tuple[Union[int, str], float]"
+    assert _normalize_pipe_unions("Union[int | str, float]") == "Union[int, str, float]"
+    assert (
+        _normalize_pipe_unions("Dict[str, list[int | None]]")
+        == "Dict[str, list[Union[int, None]]]"
+    )
+    assert _normalize_pipe_unions("'int | str'") == "'Union[int, str]'"
+    assert _normalize_pipe_unions("int") == "int"
+    assert _normalize_pipe_unions("") == ""
+
+
+def test_infer_helper_return_type_pep604_pipe_union_in_container_yields() -> None:
+    """Verifies that _infer_helper_return_type normalizes pipe unions in container yields."""
+    # Container yield_from with list[int | str]
+    res_list = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={
+            "has_yield": True,
+            "has_yield_assignment": False,
+            "yield_expr_names": [("yield_from", "items")],
+            "has_return_value": False,
+        },
+        meta1={"items": {"type": "list[int | str]"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_list == "Iterator[Union[int, str]]"
+
+    # Container yield_from with tuple[int | str, ...]
+    res_tuple = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={
+            "has_yield": True,
+            "has_yield_assignment": False,
+            "yield_expr_names": [("yield_from", "items")],
+            "has_return_value": False,
+        },
+        meta1={"items": {"type": "tuple[int | str, ...]"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_tuple == "Iterator[Union[int, str]]"
+
+    # Direct yield with int | None
+    res_yield = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={
+            "has_yield": True,
+            "has_yield_assignment": False,
+            "yield_expr_names": [("yield", "item")],
+            "has_return_value": False,
+        },
+        meta1={"item": {"type": "int | None"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_yield == "Iterator[Union[int, None]]"
 
 
 

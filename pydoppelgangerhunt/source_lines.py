@@ -87,6 +87,10 @@ def parse_unit_coord(
                 raise ValueError(
                     f"Invalid coordinate {val!r}: cannot convert to integer"
                 ) from exc
+        if isinstance(val, bool):
+            raise ValueError(
+                f"Invalid coordinate {val!r}: boolean coordinate not allowed in strict mode"
+            )
         if isinstance(val, float):
             raise ValueError(
                 f"Invalid coordinate {val!r}: float coordinate not allowed in strict mode"

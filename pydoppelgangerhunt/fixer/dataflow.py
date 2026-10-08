@@ -1006,6 +1006,14 @@ def _collect_scope_closures(scope_node: ast.AST) -> List[Tuple[int, Set[str]]]:
                                     closures.append(
                                         (sub_line, _extract_nested_scope_free_reads(subnode))
                                     )
+                        for attr in ("body", "orelse", "finalbody"):
+                            sub_body = getattr(item, attr, None)
+                            if isinstance(sub_body, list):
+                                _walk_stmts(sub_body)
+                        for handler in getattr(item, "handlers", []):
+                            _walk_stmts(getattr(handler, "body", []))
+                        for case in getattr(item, "cases", []):
+                            _walk_stmts(getattr(case, "body", []))
                 continue
 
             for hnode in _extract_header_nodes(stmt):
@@ -1202,6 +1210,18 @@ def _get_scope_try_and_with_blocks(
     return blocks
 
 
+class _StrictPostLineVisitor(_DownstreamReadVisitor):
+    """Downstream read visitor that strictly checks nodes starting after a given line."""
+
+    def _is_node_after_unit(self, node: ast.AST) -> bool:
+        lineno = getattr(node, "lineno", None)
+        return lineno is not None and lineno > self.u_end
+
+    def _is_node_inside_unit(self, node: ast.AST) -> bool:
+        lineno = getattr(node, "lineno", None)
+        return lineno is not None and lineno == self.u_end
+
+
 def _scope_reads_outputs_after_line(
     scope_node: ast.AST,
     line: int,
@@ -1210,7 +1230,7 @@ def _scope_reads_outputs_after_line(
     """Checks whether any statement in the scope loads outputs after the given line,
     including loop-carried reads if line sits inside an enclosing loop."""
     enclosing_loops = _find_enclosing_loops(scope_node, line, line)
-    visitor = _DownstreamReadVisitor(
+    visitor = _StrictPostLineVisitor(
         line,
         line,
         None,
@@ -1222,7 +1242,7 @@ def _scope_reads_outputs_after_line(
         visitor.visit(stmt)
     loaded = set(visitor.loaded)
     if enclosing_loops and not loaded.intersection(outputs):
-        loop_visitor = _DownstreamReadVisitor(
+        loop_visitor = _StrictPostLineVisitor(
             line,
             line,
             None,

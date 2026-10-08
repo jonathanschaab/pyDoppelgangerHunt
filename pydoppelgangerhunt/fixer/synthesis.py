@@ -89,15 +89,159 @@ def _format_call_arguments(
             formatted_args.append(clean_t)
     return ", ".join(formatted_args)
 
+def _advance_quote_state(
+    char: str,
+    active_quote: Optional[str],
+    escaped: bool,
+) -> Tuple[Optional[str], bool]:
+    """Updates quote tracking state for a single character."""
+    if active_quote:
+        if escaped:
+            return active_quote, False
+        if char == "\\":
+            return active_quote, True
+        if char == active_quote:
+            return None, False
+        return active_quote, False
+    if char in ("'", '"'):
+        return char, False
+    return None, False
+
+
+def _split_delimited_type_string(
+    text: str,
+    delimiter: str,
+    *,
+    require_balanced: bool = True,
+    allow_empty: bool = True,
+) -> List[str]:
+    """Splits a type string by a top-level delimiter, respecting brackets and quotes."""
+    chunks: List[str] = []
+    current: List[str] = []
+    depth = 0
+    active_quote: Optional[str] = None
+    escaped = False
+    for char in text:
+        active_quote, escaped = _advance_quote_state(char, active_quote, escaped)
+        if active_quote:
+            current.append(char)
+            continue
+        if char in ("[", "(", "{"):
+            depth += 1
+        elif char in ("]", ")", "}"):
+            depth = max(0, depth - 1)
+        elif char == delimiter and depth == 0:
+            item = "".join(current).strip()
+            if item or allow_empty:
+                chunks.append(item)
+            current = []
+            continue
+        current.append(char)
+    if depth != 0 or active_quote is not None:
+        if require_balanced:
+            return []
+        return [text.strip()] if text.strip() else []
+    if current:
+        item = "".join(current).strip()
+        if item or allow_empty:
+            chunks.append(item)
+    return chunks
+
+
+def _split_type_args(type_str: str) -> List[str]:
+    """Splits top-level arguments of a generic type string, respecting brackets and quotes."""
+    cleaned = type_str.strip()
+    if "[" not in cleaned or not cleaned.endswith("]"):
+        return []
+    inner = cleaned.split("[", 1)[1][:-1]
+    return _split_delimited_type_string(inner, ",", require_balanced=True, allow_empty=True)
+
+
+def _split_pipe_union_args(type_str: str) -> List[str]:
+    """Splits top-level pipe-separated types outside brackets and quotes."""
+    return _split_delimited_type_string(
+        type_str, "|", require_balanced=False, allow_empty=False
+    )
+
+
+def _normalize_pipe_unions(type_str: str) -> str:
+    """Normalizes PEP 604 pipe unions (A | B) to typing.Union[A, B] syntax."""
+    cleaned = type_str.strip()
+    if not cleaned:
+        return cleaned
+
+    if (
+        (cleaned.startswith("'") and cleaned.endswith("'"))
+        or (cleaned.startswith('"') and cleaned.endswith('"'))
+    ) and len(cleaned) >= 2:
+        inner = cleaned[1:-1].strip()
+        norm_inner = _normalize_pipe_unions(inner)
+        return f"{cleaned[0]}{norm_inner}{cleaned[0]}"
+
+    pipe_parts = _split_pipe_union_args(cleaned)
+    if len(pipe_parts) > 1:
+        flattened_parts: List[str] = []
+        for p in pipe_parts:
+            norm_p = _normalize_pipe_unions(p)
+            if norm_p.startswith("Union[") and norm_p.endswith("]"):
+                flattened_parts.extend(_split_type_args(norm_p))
+            else:
+                flattened_parts.append(norm_p)
+        unique_parts = list(dict.fromkeys(flattened_parts))
+        if len(unique_parts) == 1:
+            return unique_parts[0]
+        return f"Union[{', '.join(unique_parts)}]"
+
+    if "[" in cleaned and cleaned.endswith("]"):
+        bracket_idx = cleaned.find("[")
+        prefix = cleaned[:bracket_idx].strip()
+        depth = 0
+        active_quote: Optional[str] = None
+        escaped = False
+        closes_at_end = False
+        for idx in range(bracket_idx, len(cleaned)):
+            ch = cleaned[idx]
+            active_quote, escaped = _advance_quote_state(ch, active_quote, escaped)
+            if active_quote:
+                continue
+            if ch in ("[", "(", "{"):
+                depth += 1
+            elif ch in ("]", ")", "}"):
+                depth -= 1
+                if depth == 0:
+                    closes_at_end = idx == len(cleaned) - 1
+                    break
+        if closes_at_end:
+            inner_args = _split_type_args(cleaned)
+            if inner_args:
+                norm_args = [_normalize_pipe_unions(arg) for arg in inner_args]
+                if prefix == "Union":
+                    flattened: List[str] = []
+                    for a in norm_args:
+                        if a.startswith("Union[") and a.endswith("]"):
+                            flattened.extend(_split_type_args(a))
+                        else:
+                            flattened.append(a)
+                    unique = list(dict.fromkeys(flattened))
+                    if len(unique) == 1:
+                        return unique[0]
+                    return f"Union[{', '.join(unique)}]"
+                return f"{prefix}[{', '.join(norm_args)}]"
+
+    return cleaned
+
+
 def _merge_types(t1: Optional[str], t2: Optional[str], strategy: str) -> str:
     """Merges two type annotations according to the specified merge strategy."""
     if t1 and t2:
         if t1 == t2:
-            return t1
+            return _normalize_pipe_unions(t1)
         if strategy == "union":
-            return f"Union[{t1}, {t2}]"
+            return _normalize_pipe_unions(f"Union[{t1}, {t2}]")
         return "Any"
-    return t1 or t2 or "Any"
+    res = t1 or t2 or "Any"
+    return _normalize_pipe_unions(res) if res != "Any" else "Any"
+
 
 TYPING_SYMBOLS: Set[str] = set(typing.__all__)
 
@@ -161,6 +305,7 @@ def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
                 if isinstance(sub, ast.Name) and sub.id in TYPING_SYMBOLS:
                     needed.add(sub.id)
     return sorted(needed)
+
 
 def _format_helper_parameters(
     inputs: Sequence[str],
@@ -253,7 +398,9 @@ def _format_helper_parameters(
     # Render formatted parameters
     for desc in descriptors:
         var = desc["var"]
-        resolved_type = desc["type"]
+        resolved_type = (
+            _normalize_pipe_unions(desc["type"]) if desc.get("type") else "Any"
+        )
         resolved_default = desc["default"]
         kind = desc["kind"]
         if kind in ("vararg", "kwarg"):
@@ -277,45 +424,6 @@ def _format_helper_parameters(
             params.append(f"{var_name}: {resolved_type}")
 
     return params
-
-
-def _split_type_args(type_str: str) -> List[str]:
-    """Splits top-level arguments of a generic type string, respecting brackets and quotes."""
-    cleaned = type_str.strip()
-    if "[" not in cleaned or not cleaned.endswith("]"):
-        return []
-    inner = cleaned.split("[", 1)[1][:-1]
-    args: List[str] = []
-    current: List[str] = []
-    depth = 0
-    active_quote: Optional[str] = None
-    escaped = False
-    for char in inner:
-        if active_quote:
-            current.append(char)
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == active_quote:
-                active_quote = None
-            continue
-        if char in ("'", '"'):
-            active_quote = char
-        elif char == "[":
-            depth += 1
-        elif char == "]":
-            depth = max(0, depth - 1)
-        elif char == "," and depth == 0:
-            args.append("".join(current).strip())
-            current = []
-            continue
-        current.append(char)
-    if depth != 0 or active_quote is not None:
-        return []
-    if current:
-        args.append("".join(current).strip())
-    return args
 
 
 def _infer_outputs_return_type(
@@ -343,7 +451,7 @@ def _infer_outputs_return_type(
             if is_conditional:
                 if not t_merged.startswith("Optional[") and "None" not in t_merged:
                     t_merged = f"Optional[{t_merged}]"
-            out_types.append(t_merged)
+            out_types.append(_normalize_pipe_unions(t_merged))
         return f"Tuple[{', '.join(out_types)}]"
 
     if len(helper_outputs) == 1:
@@ -375,7 +483,7 @@ def _infer_outputs_return_type(
                 and return_type != "None"
             ):
                 return_type = f"Optional[{return_type}]"
-        return return_type
+        return _normalize_pipe_unions(return_type)
 
     return None
 
@@ -400,14 +508,14 @@ def _infer_helper_return_type(
         has_yield_assign = bool(scope.get("has_yield_assignment"))
         if not has_return_val and resolved_ret not in ("Any", "None"):
             if resolved_ret.startswith("Generator["):
-                return resolved_ret
+                return _normalize_pipe_unions(resolved_ret)
             if not has_yield_assign and resolved_ret.startswith((
                 "Iterator[", "Iterable[",
                 "AsyncGenerator[", "AsyncIterator[", "AsyncIterable[",
             )):
-                return resolved_ret
+                return _normalize_pipe_unions(resolved_ret)
         if has_return_val and not helper_outputs and resolved_ret.startswith("Generator["):
-            return resolved_ret
+            return _normalize_pipe_unions(resolved_ret)
 
         inferred_yield_type = None
         inferred_send_type = None
@@ -418,23 +526,23 @@ def _infer_helper_return_type(
         ):
             inner_parts = _split_type_args(resolved_ret)
             if inner_parts:
-                inferred_yield_type = inner_parts[0]
+                inferred_yield_type = _normalize_pipe_unions(inner_parts[0])
             if resolved_ret.startswith("Generator[") and len(inner_parts) >= 2:
                 if inner_parts[1] not in ("None", "Any"):
-                    inferred_send_type = inner_parts[1]
+                    inferred_send_type = _normalize_pipe_unions(inner_parts[1])
             if resolved_ret.startswith("Generator[") and len(inner_parts) >= 3:
-                inferred_gen_ret_type = inner_parts[2]
+                inferred_gen_ret_type = _normalize_pipe_unions(inner_parts[2])
 
         if not inferred_yield_type:
             for kind, name in scope.get("yield_expr_names", []):
                 if name.startswith(":literal:"):
-                    inferred_yield_type = name[len(":literal:") :]
+                    inferred_yield_type = _normalize_pipe_unions(name[len(":literal:") :])
                     break
                 m_t = meta1.get(name, {}).get("type") or meta2.get(name, {}).get("type")
                 if not m_t:
                     continue
                 if kind == "yield":
-                    inferred_yield_type = m_t
+                    inferred_yield_type = _normalize_pipe_unions(m_t)
                     break
                 if kind == "yield_from":
                     for prefix in (
@@ -448,22 +556,24 @@ def _infer_helper_return_type(
                             if parts:
                                 if prefix.lower().startswith("tuple["):
                                     if len(parts) == 2 and parts[1] == "...":
-                                        inferred_yield_type = parts[0]
+                                        inferred_yield_type = _normalize_pipe_unions(parts[0])
                                     else:
-                                        unique_types = list(dict.fromkeys(parts))
+                                        unique_types = list(dict.fromkeys(
+                                            _normalize_pipe_unions(p) for p in parts
+                                        ))
                                         if len(unique_types) == 1:
                                             inferred_yield_type = unique_types[0]
                                         else:
-                                            inferred_yield_type = (
+                                            inferred_yield_type = _normalize_pipe_unions(
                                                 f"Union[{', '.join(unique_types)}]"
                                             )
                                 else:
-                                    inferred_yield_type = parts[0]
+                                    inferred_yield_type = _normalize_pipe_unions(parts[0])
                             break
                     if inferred_yield_type:
                         break
 
-        yield_t = inferred_yield_type if inferred_yield_type else "Any"
+        yield_t = _normalize_pipe_unions(inferred_yield_type) if inferred_yield_type else "Any"
         if not is_async:
             outputs_ret = _infer_outputs_return_type(
                 helper_outputs,
@@ -478,22 +588,23 @@ def _infer_helper_return_type(
                 "Iterator[", "Iterable[", "Generator["
             ))
             fallback_ret = inferred_gen_ret_type or (
-                resolved_ret
+                _normalize_pipe_unions(resolved_ret)
                 if resolved_ret not in ("Any", "None")
                 and not is_iter_annotation
                 and scope.get("has_return_value")
                 else ("Any" if (scope.get("has_return_value") or helper_outputs) else None)
             )
             send_t = (
-                inferred_send_type
-                or ("Any" if scope.get("has_yield_assignment") else "None")
+                _normalize_pipe_unions(inferred_send_type)
+                if inferred_send_type
+                else ("Any" if scope.get("has_yield_assignment") else "None")
             )
             ret_t = outputs_ret or fallback_ret or ("None" if send_t != "None" else None)
             if ret_t is not None:
-                return f"Generator[{yield_t}, {send_t}, {ret_t}]"
-            return f"Iterator[{yield_t}]"
+                return _normalize_pipe_unions(f"Generator[{yield_t}, {send_t}, {ret_t}]")
+            return _normalize_pipe_unions(f"Iterator[{yield_t}]")
 
-        return f"AsyncIterator[{yield_t}]"
+        return _normalize_pipe_unions(f"AsyncIterator[{yield_t}]")
 
     if is_subroutine is not None:
         is_sub = is_subroutine
@@ -502,7 +613,7 @@ def _infer_helper_return_type(
     else:
         is_sub = False
     if not is_sub and resolved_ret not in ("Any", "None"):
-        return resolved_ret
+        return _normalize_pipe_unions(resolved_ret)
 
     outputs_ret = _infer_outputs_return_type(
         helper_outputs,
@@ -514,13 +625,13 @@ def _infer_helper_return_type(
         outputs2=outputs2,
     )
     if outputs_ret is not None:
-        return outputs_ret
+        return _normalize_pipe_unions(outputs_ret)
 
     if not helper_outputs and not scope.get("has_return"):
         if is_sub or resolved_ret == "Any":
             return "Any" if unit_kind in ("comprehension", "complex_expr") else "None"
 
-    return resolved_ret
+    return _normalize_pipe_unions(resolved_ret)
 
 
 def _format_helper_docstring(
