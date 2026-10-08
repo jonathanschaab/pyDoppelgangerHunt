@@ -1274,12 +1274,15 @@ def _enclosing_try_reads_outputs(
             if _stmts_enclose_unit(with_body, u_start, u_end):
                 w_end_raw = getattr(node, "end_lineno", None)
                 b_end = max(
-                    int(
-                        getattr(s, "end_lineno", None)
-                        or getattr(s, "lineno", 0)
-                        or 0
-                    )
-                    for s in with_body
+                    (
+                        int(
+                            getattr(s, "end_lineno", None)
+                            or getattr(s, "lineno", 0)
+                            or 0
+                        )
+                        for s in with_body
+                    ),
+                    default=0,
                 )
                 w_end = w_end_raw if isinstance(w_end_raw, int) else b_end
                 if _scope_reads_outputs_after_line(scope_node, w_end, outputs):
@@ -1327,12 +1330,15 @@ def _enclosing_try_reads_outputs(
                 ):
                     try_end_raw = getattr(node, "end_lineno", None)
                     b_end = max(
-                        int(
-                            getattr(s, "end_lineno", None)
-                            or getattr(s, "lineno", 0)
-                            or 0
-                        )
-                        for s in body_nodes
+                        (
+                            int(
+                                getattr(s, "end_lineno", None)
+                                or getattr(s, "lineno", 0)
+                                or 0
+                            )
+                            for s in body_nodes
+                        ),
+                        default=0,
                     )
                     t_end = try_end_raw if isinstance(try_end_raw, int) else b_end
                     if _scope_reads_outputs_after_line(scope_node, t_end, outputs):

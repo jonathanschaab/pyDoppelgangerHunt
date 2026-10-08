@@ -113,7 +113,7 @@ def _split_delimited_type_string(
     delimiter: str,
     *,
     require_balanced: bool = True,
-    allow_empty: bool = True,
+    allow_empty: bool = False,
 ) -> List[str]:
     """Splits a type string by a top-level delimiter, respecting brackets and quotes."""
     chunks: List[str] = []
@@ -154,7 +154,13 @@ def _split_type_args(type_str: str) -> List[str]:
     if "[" not in cleaned or not cleaned.endswith("]"):
         return []
     inner = cleaned.split("[", 1)[1][:-1]
-    return _split_delimited_type_string(inner, ",", require_balanced=True, allow_empty=True)
+    return [
+        c
+        for c in _split_delimited_type_string(
+            inner, ",", require_balanced=True, allow_empty=False
+        )
+        if c
+    ]
 
 
 def _split_pipe_union_args(type_str: str) -> List[str]:

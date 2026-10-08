@@ -4961,5 +4961,27 @@ def test_infer_helper_return_type_pep604_pipe_union_in_container_yields() -> Non
     assert res_yield == "Iterator[Union[int, None]]"
 
 
+def test_split_type_args_trailing_comma() -> None:
+    """Verifies that _split_type_args ignores trailing commas and trailing whitespace."""
+    assert _split_type_args("Tuple[int,]") == ["int"]
+    assert _split_type_args("Tuple[int, ]") == ["int"]
+    assert _split_type_args("Tuple[int, str, ]") == ["int", "str"]
+    assert _split_type_args("Tuple[]") == []
+    assert _normalize_pipe_unions("Tuple[int | str, ]") == "Tuple[Union[int, str]]"
+
+
+def test_enclosing_try_reads_outputs_empty_body_nodes_mock() -> None:
+    """Verifies that _enclosing_try_reads_outputs gracefully handles empty body nodes."""
+    # Synthetic With node with empty body
+    empty_with = ast.With(items=[], body=[])
+    dummy_module = ast.Module(body=[empty_with], type_ignores=[])
+    assert not _enclosing_try_reads_outputs(dummy_module, 1, 2, {"out"})
+
+    # Synthetic Try node with empty body
+    empty_try = ast.Try(body=[], handlers=[], orelse=[], finalbody=[])
+    dummy_module_try = ast.Module(body=[empty_try], type_ignores=[])
+    assert not _enclosing_try_reads_outputs(dummy_module_try, 1, 2, {"out"})
+
+
 
 
