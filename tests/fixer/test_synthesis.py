@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import logging
 import sys
@@ -3898,7 +3899,8 @@ def test_file_patch_plan_content_digest_caching() -> None:
         is_new_file=False,
     )
     digest1 = plan.content_digest
-    assert len(digest1) == 16
+    assert len(digest1) == 64
+    assert digest1 == hashlib.sha256("a = 1\nb = 2\n".encode("utf-8")).hexdigest()
     digest2 = plan.content_digest
     assert digest1 == digest2
     assert plan._content_digest is not None
@@ -5053,5 +5055,107 @@ def test_enclosing_try_reads_outputs_empty_body_nodes_mock() -> None:
     assert not _enclosing_try_reads_outputs(dummy_module_try, 1, 2, {"out"})
 
 
+def test_get_scope_stmts_by_end_lineno_none_end_lineno() -> None:
+    """Verifies _get_scope_stmts_by_end_lineno gracefully handles nodes with end_lineno=None."""
+    from pydoppelgangerhunt.fixer.dataflow import _get_scope_stmts_by_end_lineno
+
+    stmt = ast.Pass()
+    stmt.lineno = 5
+    stmt.end_lineno = None  # Explicitly None
+    mod = ast.Module(body=[stmt], type_ignores=[])
+    res = _get_scope_stmts_by_end_lineno(mod)
+    assert 5 in res
+    assert res[5] == [stmt]
 
 
+def test_find_innermost_enclosing_node_none_end_lineno() -> None:
+    """Verifies _find_innermost_enclosing_node handles AST nodes with end_lineno=None."""
+    from pydoppelgangerhunt.fixer.source import _find_innermost_enclosing_node
+
+    fn = ast.FunctionDef(
+        name="foo",
+        args=ast.arguments(
+            posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]
+        ),
+        body=[ast.Pass(lineno=2, end_lineno=None)],
+        decorator_list=[],
+        lineno=1,
+    )
+    fn.end_lineno = None  # Explicitly None
+    mod = ast.Module(body=[fn], type_ignores=[])
+
+    matched_res = _find_innermost_enclosing_node(
+        source_text="",
+        unit={"start": 1, "end": 1},
+        node_types=(ast.FunctionDef,),
+        tree=mod,
+    )
+    assert matched_res is not None
+    matched, start, end = matched_res
+    assert matched is fn
+    assert start == 1
+    assert end == 1
+
+
+def test_enclosing_try_reads_outputs_fallback_b_end() -> None:
+    """Verifies _enclosing_try_reads_outputs fallback b_end when end_lineno is None."""
+    code = (
+        "def test():\n"
+        "    try:\n"
+        "        x = 1\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    finally:\n"
+        "        pass\n"
+        "    return x\n"
+    )
+    tree = ast.parse(code)
+    try_node = tree.body[0].body[0]  # type: ignore[attr-defined]
+    try_node.end_lineno = None  # Force fallback calculation of b_end
+    # With b_end spanning through finally (line 7), line 8 (return x) is recognized as downstream!
+    assert _enclosing_try_reads_outputs(tree.body[0], 3, 3, {"x"})
+
+
+def test_node_is_effectively_async_scope_pruning() -> None:
+    """Verifies _node_is_effectively_async prunes nested callable and class definitions."""
+    from pydoppelgangerhunt.parser import _node_is_effectively_async
+
+    # Inner sync generator inside an async def should not make a sync block effectively async
+    code_sync_gen = (
+        "if cond:\n"
+        "    def sync_helper():\n"
+        "        yield 1\n"
+    )
+    tree_sync = ast.parse(code_sync_gen)
+    assert not _node_is_effectively_async(tree_sync.body[0], enclosing_is_async=True)
+
+    # Inner async function inside a sync block should not make the outer sync block async
+    code_async_func = (
+        "if cond:\n"
+        "    async def async_helper():\n"
+        "        await something()\n"
+    )
+    tree_async = ast.parse(code_async_func)
+    assert not _node_is_effectively_async(tree_async.body[0], enclosing_is_async=False)
+
+    # Direct await inside the block IS async
+    code_direct_await = (
+        "if cond:\n"
+        "    await something()\n"
+    )
+    tree_direct = ast.parse(code_direct_await)
+    assert _node_is_effectively_async(tree_direct.body[0], enclosing_is_async=False)
+
+
+def test_parse_candidates_def_precedes_async_def() -> None:
+    """Verifies that synchronous def wrapper is attempted before async def wrapper in scope."""
+    from pydoppelgangerhunt.fixer.scope import _inspect_unit_scope
+
+    unit = {
+        "text": "return 42\n",
+        "file": "test.py",
+        "start": 1,
+        "end": 1,
+    }
+    res = _inspect_unit_scope(unit)
+    assert res is not None

@@ -976,12 +976,24 @@ def _node_is_effectively_async(
     else:
         nodes = [node]
     for n in nodes:
-        if isinstance(n, ast.AST):
-            for sub in ast.walk(n):
-                if isinstance(sub, (ast.Await, ast.AsyncFor, ast.AsyncWith)):
-                    return True
-                if enclosing_is_async and isinstance(sub, (ast.Yield, ast.YieldFrom)):
-                    return True
+        if not isinstance(n, ast.AST):
+            continue
+        if isinstance(n, ast.AsyncFunctionDef):
+            return True
+        if isinstance(n, (ast.FunctionDef, ast.ClassDef)):
+            continue
+        queue: deque[ast.AST] = deque([n])
+        while queue:
+            curr = queue.popleft()
+            if curr is not n and isinstance(
+                curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                continue
+            if isinstance(curr, (ast.Await, ast.AsyncFor, ast.AsyncWith)):
+                return True
+            if enclosing_is_async and isinstance(curr, (ast.Yield, ast.YieldFrom)):
+                return True
+            queue.extend(ast.iter_child_nodes(curr))
     return False
 
 

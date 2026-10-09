@@ -110,14 +110,18 @@ def find_enclosing_class(
             earliest_line = stmt_lineno
             decorators = getattr(stmt, "decorator_list", [])
             if decorators:
-                dec_lines = [int(getattr(d, "lineno", stmt_lineno)) for d in decorators]
+                dec_lines = [
+                    int(getattr(d, "lineno", None) or stmt_lineno) for d in decorators
+                ]
                 if dec_lines:
                     dec_start = min(dec_lines)
-                    earliest_line = min(dec_start, earliest_line) if earliest_line > 0 else dec_start
+                    earliest_line = (
+                        min(dec_start, earliest_line) if earliest_line > 0 else dec_start
+                    )
             if earliest_line > def_start:
                 cand_lines.append(earliest_line)
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                end_l = int(getattr(stmt, "end_lineno", stmt_lineno))
+                end_l = int(getattr(stmt, "end_lineno", None) or stmt_lineno)
                 direct_methods.add((earliest_line, end_l))
                 direct_methods.add((stmt_lineno, end_l))
         suite_indent = _extract_child_indentation(lines, cand_lines, indent)

@@ -536,10 +536,14 @@ def _build_whole_method_delegation(
         cand_nodes: List[Tuple[int, Union[ast.FunctionDef, ast.AsyncFunctionDef]]] = []
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                n_start = getattr(node, "lineno", 0)
-                n_end = getattr(node, "end_lineno", n_start)
+                n_start = getattr(node, "lineno", 0) or 0
+                n_end = getattr(node, "end_lineno", None) or n_start
                 decs = getattr(node, "decorator_list", [])
-                dec_start = min(getattr(d, "lineno", n_start) for d in decs) if decs else n_start
+                dec_start = (
+                    min((getattr(d, "lineno", None) or n_start) for d in decs)
+                    if decs
+                    else n_start
+                )
                 earliest_start = min(dec_start, n_start)
                 if u_start in (n_start, earliest_start):
                     cand_nodes.append((0, node))
@@ -570,7 +574,10 @@ def _build_whole_method_delegation(
                 else:
                     sig_end_line = first_body.lineno - 1
                     if _is_docstring_node(first_body):
-                        docstring_end_line = getattr(first_body, "end_lineno", first_body.lineno)
+                        docstring_end_line = (
+                            getattr(first_body, "end_lineno", None)
+                            or getattr(first_body, "lineno", 0)
+                        )
     except (SyntaxError, ValueError, UnicodeDecodeError):
         pass
 
@@ -837,11 +844,11 @@ class _FilePatchPlan:
 
     @property
     def content_digest(self) -> str:
-        """SHA-256 digest prefix of orig_text, cached for reuse in downstream analysis."""
+        """SHA-256 digest of orig_text, cached for reuse in downstream analysis."""
         if self._content_digest is None:
             self._content_digest = hashlib.sha256(
                 self.orig_text.encode("utf-8", errors="replace")
-            ).hexdigest()[:16]
+            ).hexdigest()
         return self._content_digest
 
     @property

@@ -163,7 +163,7 @@ def _get_scope_stmts_by_end_lineno(
     m: Dict[int, List[ast.stmt]] = {}
     for node in ast.walk(scope_node):
         if isinstance(node, ast.stmt):
-            e = getattr(node, "end_lineno", getattr(node, "lineno", 0))
+            e = getattr(node, "end_lineno", None) or getattr(node, "lineno", 0) or 0
             if e > 0:
                 m.setdefault(e, []).append(node)
     setattr(scope_node, "_pydh_stmts_by_end", m)
@@ -1334,6 +1334,12 @@ def _enclosing_try_reads_outputs(
                     not _block_definitely_terminates(h.body) for h in handlers
                 ):
                     try_end_raw = getattr(node, "end_lineno", None)
+                    all_try_stmts = (
+                        list(body_nodes)
+                        + [s for h in handlers for s in getattr(h, "body", [])]
+                        + list(orelse_nodes)
+                        + list(finalbody_nodes)
+                    )
                     b_end = max(
                         (
                             int(
@@ -1341,7 +1347,7 @@ def _enclosing_try_reads_outputs(
                                 or getattr(s, "lineno", 0)
                                 or 0
                             )
-                            for s in body_nodes
+                            for s in all_try_stmts
                         ),
                         default=0,
                     )

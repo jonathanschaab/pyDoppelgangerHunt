@@ -122,7 +122,7 @@ def _extract_docstring_end_line(tree: ast.AST) -> int:
     """Extracts the end line number of a module- or function-level docstring if present."""
     body = getattr(tree, "body", [])
     if body and _is_docstring_node(body[0]):
-        return int(getattr(body[0], "end_lineno", getattr(body[0], "lineno", 0)))
+        return int(getattr(body[0], "end_lineno", None) or getattr(body[0], "lineno", 0) or 0)
     return 0
 
 
@@ -216,7 +216,7 @@ def _find_module_helper_insertion_index(lines: List[str]) -> int:
         if first_def_line is not None and getattr(node, "lineno", 0) >= first_def_line:
             break
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            end_l = getattr(node, "end_lineno", node.lineno)
+            end_l = int(getattr(node, "end_lineno", None) or getattr(node, "lineno", 0) or 0)
             last_import_line = max(last_import_line, end_l)
         elif (
             isinstance(node, (ast.Try, ast.If, ast.With, ast.AsyncWith))
@@ -224,7 +224,9 @@ def _find_module_helper_insertion_index(lines: List[str]) -> int:
         ):
             for sub in ast.walk(node):
                 if isinstance(sub, (ast.Import, ast.ImportFrom)):
-                    end_l = getattr(node, "end_lineno", node.lineno)
+                    end_l = int(
+                        getattr(node, "end_lineno", None) or getattr(node, "lineno", 0) or 0
+                    )
                     last_import_line = max(last_import_line, end_l)
                     break
 
@@ -322,7 +324,11 @@ def _insert_imports_into_module(
         doc_end = _extract_module_docstring_end_line(tree)
         future_end = max(
             (
-                getattr(node, "end_lineno", node.lineno)
+                int(
+                    getattr(node, "end_lineno", None)
+                    or getattr(node, "lineno", 0)
+                    or 0
+                )
                 for node in tree.body
                 if isinstance(node, ast.ImportFrom) and node.module == "__future__"
             ),
@@ -1094,11 +1100,11 @@ def _find_innermost_enclosing_node(
     candidates: List[Tuple[int, ast.AST, int, int]] = []
     for node in ast.walk(tree):
         if isinstance(node, node_types):
-            n_start = getattr(node, "lineno", 0)
-            n_end = getattr(node, "end_lineno", n_start)
+            n_start = getattr(node, "lineno", 0) or 0
+            n_end = getattr(node, "end_lineno", None) or n_start
             decorators = getattr(node, "decorator_list", [])
             dec_start = (
-                min(getattr(d, "lineno", n_start) for d in decorators)
+                min((getattr(d, "lineno", None) or n_start) for d in decorators)
                 if decorators
                 else n_start
             )

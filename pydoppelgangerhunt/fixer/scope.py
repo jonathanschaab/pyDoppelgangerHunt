@@ -1274,15 +1274,15 @@ def _inspect_unit_scope(
 
     parse_candidates = [
         (dedented, 0),
-        (f"async def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
         (f"def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
+        (f"async def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
         (
-            f"async def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
+            f"def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
             f"{textwrap.indent(dedented, '        ')}",
             1,
         ),
         (
-            f"def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
+            f"async def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
             f"{textwrap.indent(dedented, '        ')}",
             1,
         ),
