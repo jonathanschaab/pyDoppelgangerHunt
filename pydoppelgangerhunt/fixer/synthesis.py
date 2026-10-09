@@ -228,6 +228,8 @@ def _normalize_pipe_unions(type_str: str) -> str:
                     closes_at_end = idx == len(cleaned) - 1
                     break
         if closes_at_end:
+            if prefix in ("Literal", "typing.Literal"):
+                return cleaned
             inner_args = _split_type_args(cleaned)
             if inner_args:
                 norm_args = [_normalize_pipe_unions(arg) for arg in inner_args]
@@ -267,9 +269,10 @@ def _unwrap_iterable_item_type(type_str: str) -> Optional[str]:
     target_t = norm_t[len("typing.") :] if norm_t.startswith("typing.") else norm_t
     prefixes = (
         "Iterator[", "Iterable[", "Generator[", "List[", "Sequence[", "Set[",
-        "Tuple[", "Dict[", "Collection[", "Mapping[", "list[",
-        "set[", "tuple[", "dict[", "sequence[", "iterable[",
-        "iterator[", "generator[", "mapping[",
+        "Tuple[", "Dict[", "Collection[", "Mapping[", "MutableMapping[",
+        "DefaultDict[", "OrderedDict[", "list[", "set[", "tuple[", "dict[",
+        "sequence[", "iterable[", "iterator[", "generator[", "mapping[",
+        "mutablemapping[", "defaultdict[", "ordereddict[",
     )
     for prefix in prefixes:
         if target_t.startswith(prefix) and target_t.endswith("]"):

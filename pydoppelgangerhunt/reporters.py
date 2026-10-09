@@ -79,10 +79,8 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
             return placeholder
         # Sliced lines fast-path:
         # If 'source_lines_is_sliced' is explicitly set, honor caller intent.
-        # Otherwise, heuristic: if len(source_lines) == (e_d - s_d + 1) and s_d > 1,
-        # the list is treated as already sliced to unit boundaries (since for any valid
-        # file containing the unit, len(file) >= e_d > e_d - s_d + 1, making an exact
-        # length match impossible unless the file is out-of-bounds).
+        # Otherwise, heuristic: if len(source_lines) == (e_d - s_d + 1),
+        # the list is treated as already sliced to unit boundaries.
         if is_sliced_unit_source_lines(unit, source_lines):
             return [
                 ln if ln.endswith("\n") else ln + "\n"

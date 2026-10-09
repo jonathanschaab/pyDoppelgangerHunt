@@ -977,11 +977,15 @@ def _collect_scope_closures(scope_node: ast.AST) -> List[Tuple[int, Set[str]]]:
 
     def _walk_stmts(stmts: Iterable[ast.stmt]) -> None:
         for stmt in stmts:
-            stmt_start = getattr(stmt, "lineno", 0)
+            stmt_start = int(getattr(stmt, "lineno", 0) or 0)
             decorators = getattr(stmt, "decorator_list", [])
             if decorators:
-                dec_start = min(getattr(d, "lineno", stmt_start) for d in decorators)
-                stmt_start = min(stmt_start, dec_start)
+                dec_lines = [
+                    int(getattr(d, "lineno", None) or stmt_start) for d in decorators
+                ]
+                if dec_lines:
+                    dec_start = min(dec_lines)
+                    stmt_start = min(stmt_start, dec_start)
 
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 closures.append((stmt_start, _extract_nested_scope_free_reads(stmt)))
@@ -991,10 +995,12 @@ def _collect_scope_closures(scope_node: ast.AST) -> List[Tuple[int, Set[str]]]:
                 for item in stmt.body:
                     if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         dec_list = getattr(item, "decorator_list", [])
-                        item_start = min(
-                            [getattr(d, "lineno", item.lineno) for d in dec_list]
-                            or [item.lineno]
-                        )
+                        item_lineno = int(getattr(item, "lineno", 0) or 0)
+                        dec_lines = [
+                            int(getattr(d, "lineno", None) or item_lineno)
+                            for d in dec_list
+                        ]
+                        item_start = min(dec_lines) if dec_lines else item_lineno
                         closures.append((item_start, _extract_nested_scope_free_reads(item)))
                     elif isinstance(item, ast.ClassDef):
                         _walk_stmts([item])
@@ -1002,7 +1008,7 @@ def _collect_scope_closures(scope_node: ast.AST) -> List[Tuple[int, Set[str]]]:
                         for hnode in _extract_header_nodes(item):
                             for subnode in ast.walk(hnode):
                                 if isinstance(subnode, (ast.Lambda, ast.GeneratorExp)):
-                                    sub_line = getattr(subnode, "lineno", stmt_start)
+                                    sub_line = int(getattr(subnode, "lineno", None) or stmt_start)
                                     closures.append(
                                         (sub_line, _extract_nested_scope_free_reads(subnode))
                                     )
@@ -1019,7 +1025,7 @@ def _collect_scope_closures(scope_node: ast.AST) -> List[Tuple[int, Set[str]]]:
             for hnode in _extract_header_nodes(stmt):
                 for subnode in ast.walk(hnode):
                     if isinstance(subnode, (ast.Lambda, ast.GeneratorExp)):
-                        sub_lineno = getattr(subnode, "lineno", stmt_start)
+                        sub_lineno = int(getattr(subnode, "lineno", None) or stmt_start)
                         closures.append((sub_lineno, _extract_nested_scope_free_reads(subnode)))
 
             for attr in ("body", "orelse", "finalbody"):

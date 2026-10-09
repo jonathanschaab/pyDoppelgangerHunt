@@ -6696,6 +6696,29 @@ def test_render_file_patch_plan_omits_unit_with_missing_or_invalid_end() -> None
     assert "# replaced line 3" not in diff
 
 
+def test_render_file_patch_plan_mixed_valid_and_colon_invalid_units() -> None:
+    """Verifies that _render_file_patch_plan safely filters valid units and ignores
+    colon-formatted invalid units without raising ValueError during retained candidate
+    cross-checking."""
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _render_file_patch_plan
+
+    plan = _FilePatchPlan(
+        file_path=Path("test.py"),
+        rel_path="test.py",
+        orig_text="a = 1\nb = 2\nc = 3\n",
+        is_new_file=False,
+    )
+    u_valid = {"file": "test.py", "start": 1, "end": 1}
+    u_colon = {"file": "test.py", "start": "2:0", "end": "2:5"}
+    plan.replacements.append((u_valid, "a = 99\n"))
+    plan.replacements.append((u_colon, "b = 100\n"))
+
+    diff = _render_file_patch_plan(plan, replace_clones=True)
+    assert "+a = 99" in diff
+    assert "b = 100" not in diff
+
+
+
 def test_generate_refactoring_patch_no_state_leakage_on_skipped_pair(tmp_path: Path) -> None:
     """Verifies that helper names and comments are not leaked when clone extraction is skipped."""
     f1 = tmp_path / "m1.py"

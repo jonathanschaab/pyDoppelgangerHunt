@@ -1245,15 +1245,7 @@ def _render_file_patch_plan(
         git_header = f"diff --git a/{plan.rel_path} b/{plan.rel_path}\nnew file mode 100644\n"
         deduped_comments = list(dict.fromkeys(plan.comments))
         return "".join(deduped_comments) + git_header + diff_str
-    retained_cands = filter_overlapping_clone_units(
-        [u for u, _ in plan.replacements], repo_root=repo_root
-    )
-
-    def _unit_span(unit: Dict[str, Any]) -> Tuple[int, int]:
-        s = parse_unit_coord(unit, "start", default=1, strict=True)
-        return s, parse_unit_coord(unit, "end", default=s, strict=True)
-
-    filtered_reps: List[Tuple[Dict[str, Any], str]] = []
+    coord_valid_reps: List[Tuple[Dict[str, Any], str]] = []
     for u, rep in plan.replacements:
         if not is_valid_unit_coordinates(u, strict=True):
             logger.warning(
@@ -1262,6 +1254,18 @@ def _render_file_patch_plan(
                 u,
             )
             continue
+        coord_valid_reps.append((u, rep))
+
+    retained_cands = filter_overlapping_clone_units(
+        [u for u, _ in coord_valid_reps], repo_root=repo_root
+    )
+
+    def _unit_span(unit: Dict[str, Any]) -> Tuple[int, int]:
+        s = parse_unit_coord(unit, "start", default=1, strict=True)
+        return s, parse_unit_coord(unit, "end", default=s, strict=True)
+
+    filtered_reps: List[Tuple[Dict[str, Any], str]] = []
+    for u, rep in coord_valid_reps:
         u_span = _unit_span(u)
         if any(
             u is r or (u.get("file") == r.get("file") and u_span == _unit_span(r))

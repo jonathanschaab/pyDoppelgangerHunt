@@ -42,6 +42,7 @@ def resolve_closure_strictness_mode(
                 closure_strictness,
                 fallback,
             )
+        return fallback, bool(skip_pre_unit_closures)
     is_lenient = bool(skip_pre_unit_closures)
     return ("lenient" if is_lenient else "strict"), is_lenient
 
