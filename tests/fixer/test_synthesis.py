@@ -5159,3 +5159,66 @@ def test_parse_candidates_def_precedes_async_def() -> None:
     }
     res = _inspect_unit_scope(unit)
     assert res is not None
+
+
+def test_unwrap_iterable_item_type_unions_and_iterables() -> None:
+    """Verifies _unwrap_iterable_item_type handles top-level unions and iterables."""
+    from pydoppelgangerhunt.fixer.synthesis import _unwrap_iterable_item_type
+
+    assert _unwrap_iterable_item_type("List[int] | List[str]") == "Union[int, str]"
+    assert _unwrap_iterable_item_type("Union[List[int], List[str]]") == "Union[int, str]"
+    assert _unwrap_iterable_item_type("typing.List[int] | typing.Set[str]") == "Union[int, str]"
+    assert _unwrap_iterable_item_type("Tuple[int, ...] | List[int]") == "int"
+    assert _unwrap_iterable_item_type("Tuple[int, str]") == "Union[int, str]"
+    assert _unwrap_iterable_item_type("Dict[str, int]") == "str"
+    assert _unwrap_iterable_item_type("Generator[int, None, None]") == "int"
+    assert _unwrap_iterable_item_type("int") is None
+    assert _unwrap_iterable_item_type("Union[List[int], int]") is None
+
+
+def test_infer_helper_return_type_yield_from_unsplit_pipe_union() -> None:
+    """Verifies _infer_helper_return_type unwraps pipe union iterables in yield from."""
+    from pydoppelgangerhunt.fixer.synthesis import _infer_helper_return_type
+
+    scope: Dict[str, Any] = {
+        "has_yield": True,
+        "yield_expr_names": [("yield_from", "items")],
+    }
+    meta1: Dict[str, Any] = {"items": {"type": "List[int] | List[str]"}}
+    meta2: Dict[str, Any] = {}
+    res = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope=scope,
+        meta1=meta1,
+        meta2=meta2,
+    )
+    assert res == "Iterator[Union[int, str]]"
+
+
+def test_subroutine_with_inner_wrapper_func_namespace_collision(tmp_path: Path) -> None:
+    """Verifies subroutine containing inner def _wrapper() is not flattened."""
+    code = (
+        "def _wrapper():\n"
+        "    hidden_var = 10\n"
+        "    return hidden_var\n"
+        "res = _wrapper()\n"
+    )
+    f = tmp_path / "sub.py"
+    f.write_text(code, encoding="utf-8")
+    unit = {
+        "file": str(f),
+        "start": 1,
+        "end": 4,
+        "name": "compound_block",
+        "kind": "compound_block",
+    }
+    scope_info = analyze_unit_variable_scope(unit, repo_root=str(tmp_path))
+    # hidden_var inside _wrapper must NOT be flattened into the subroutine's outer scope
+    assert "hidden_var" not in scope_info.get("stores", set())
+    assert "hidden_var" not in scope_info.get("outputs", [])
+    stores = scope_info.get("stores", set())
+    outputs = scope_info.get("outputs", [])
+    assert "_wrapper" in stores or "_wrapper" in outputs
+

@@ -241,6 +241,56 @@ def _normalize_pipe_unions(type_str: str) -> str:
     return cleaned
 
 
+def _unwrap_iterable_item_type(type_str: str) -> Optional[str]:
+    """Unwraps the yielded element type from an iterable or union-of-iterables type."""
+    norm_t = _normalize_pipe_unions(type_str)
+    if not norm_t:
+        return None
+
+    if (
+        norm_t.startswith("Union[") or norm_t.startswith("typing.Union[")
+    ) and norm_t.endswith("]"):
+        union_args = _split_type_args(norm_t)
+        if not union_args:
+            return None
+        unwrapped_members: List[str] = []
+        for arg in union_args:
+            unwrapped = _unwrap_iterable_item_type(arg)
+            if unwrapped is None:
+                return None
+            unwrapped_members.append(unwrapped)
+        unique_types = list(dict.fromkeys(_flatten_union_args(unwrapped_members)))
+        if len(unique_types) == 1:
+            return unique_types[0]
+        return f"Union[{', '.join(unique_types)}]"
+
+    target_t = norm_t[len("typing.") :] if norm_t.startswith("typing.") else norm_t
+    prefixes = (
+        "Iterator[", "Iterable[", "Generator[", "List[", "Sequence[", "Set[",
+        "Tuple[", "Dict[", "Collection[", "Mapping[", "list[",
+        "set[", "tuple[", "dict[", "sequence[", "iterable[",
+        "iterator[", "generator[", "mapping[",
+    )
+    for prefix in prefixes:
+        if target_t.startswith(prefix) and target_t.endswith("]"):
+            parts = _split_type_args(target_t)
+            if parts:
+                if prefix.lower().startswith("tuple["):
+                    if len(parts) == 2 and parts[1] == "...":
+                        return _normalize_pipe_unions(parts[0])
+                    unique_types = list(dict.fromkeys(
+                        _normalize_pipe_unions(p) for p in parts
+                    ))
+                    if len(unique_types) == 1:
+                        return unique_types[0]
+                    return _normalize_pipe_unions(
+                        f"Union[{', '.join(unique_types)}]"
+                    )
+                return _normalize_pipe_unions(parts[0])
+            break
+    return None
+
+
 def _merge_types(t1: Optional[str], t2: Optional[str], strategy: str) -> str:
     """Merges two type annotations according to the specified merge strategy."""
     if t1 and t2:
@@ -513,19 +563,20 @@ def _infer_helper_return_type(
     outputs2: Optional[List[str]] = None,
 ) -> str:
     """Infers the return type annotation for a synthesized shared helper function."""
+    resolved_ret = _normalize_pipe_unions(resolved_ret)
     if scope.get("has_yield"):
         has_return_val = bool(helper_outputs or scope.get("has_return_value"))
         has_yield_assign = bool(scope.get("has_yield_assignment"))
         if not has_return_val and resolved_ret not in ("Any", "None"):
             if resolved_ret.startswith("Generator["):
-                return _normalize_pipe_unions(resolved_ret)
+                return resolved_ret
             if not has_yield_assign and resolved_ret.startswith((
                 "Iterator[", "Iterable[",
                 "AsyncGenerator[", "AsyncIterator[", "AsyncIterable[",
             )):
-                return _normalize_pipe_unions(resolved_ret)
+                return resolved_ret
         if has_return_val and not helper_outputs and resolved_ret.startswith("Generator["):
-            return _normalize_pipe_unions(resolved_ret)
+            return resolved_ret
 
         inferred_yield_type = None
         inferred_send_type = None
@@ -542,6 +593,8 @@ def _infer_helper_return_type(
                     inferred_send_type = _normalize_pipe_unions(inner_parts[1])
             if resolved_ret.startswith("Generator[") and len(inner_parts) >= 3:
                 inferred_gen_ret_type = _normalize_pipe_unions(inner_parts[2])
+        elif not has_return_val and resolved_ret not in ("Any", "None"):
+            inferred_yield_type = _unwrap_iterable_item_type(resolved_ret)
 
         if not inferred_yield_type:
             for kind, name in scope.get("yield_expr_names", []):
@@ -555,31 +608,7 @@ def _infer_helper_return_type(
                     inferred_yield_type = _normalize_pipe_unions(m_t)
                     break
                 if kind == "yield_from":
-                    for prefix in (
-                        "Iterator[", "Iterable[", "List[", "Sequence[", "Set[",
-                        "Tuple[", "Dict[", "Collection[", "Mapping[", "list[",
-                        "set[", "tuple[", "dict[", "sequence[", "iterable[",
-                        "iterator[", "mapping[",
-                    ):
-                        if m_t.startswith(prefix) and m_t.endswith("]"):
-                            parts = _split_type_args(m_t)
-                            if parts:
-                                if prefix.lower().startswith("tuple["):
-                                    if len(parts) == 2 and parts[1] == "...":
-                                        inferred_yield_type = _normalize_pipe_unions(parts[0])
-                                    else:
-                                        unique_types = list(dict.fromkeys(
-                                            _normalize_pipe_unions(p) for p in parts
-                                        ))
-                                        if len(unique_types) == 1:
-                                            inferred_yield_type = unique_types[0]
-                                        else:
-                                            inferred_yield_type = _normalize_pipe_unions(
-                                                f"Union[{', '.join(unique_types)}]"
-                                            )
-                                else:
-                                    inferred_yield_type = _normalize_pipe_unions(parts[0])
-                            break
+                    inferred_yield_type = _unwrap_iterable_item_type(m_t)
                     if inferred_yield_type:
                         break
 
