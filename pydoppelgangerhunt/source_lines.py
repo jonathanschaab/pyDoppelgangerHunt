@@ -78,9 +78,14 @@ def parse_unit_coord(
                 raise ValueError(
                     f"Invalid coordinate {val!r}: colon format not allowed in strict mode"
                 )
-            if not val.strip():
+            stripped = val.strip()
+            if not stripped:
                 raise ValueError(
                     f"Invalid coordinate {val!r}: blank coordinate not allowed in strict mode"
+                )
+            if stripped.startswith(("+", "-")):
+                raise ValueError(
+                    f"Invalid coordinate {val!r}: signed prefix not allowed in strict mode"
                 )
             try:
                 return int(val)

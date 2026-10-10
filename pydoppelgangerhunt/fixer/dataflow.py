@@ -372,6 +372,10 @@ class _BaseScopeVisitor(ast.NodeVisitor):
         reads_set: Set[str],
     ) -> None:
         store_set.add(node.name)
+        for tp in getattr(node, "type_params", []):
+            tp_name = getattr(tp, "name", None)
+            if isinstance(tp_name, str):
+                store_set.add(tp_name)
         reads_set.update(_extract_nested_scope_free_reads(node))
 
     def _visit_nested_lambda(
@@ -380,6 +384,17 @@ class _BaseScopeVisitor(ast.NodeVisitor):
         reads_set: Set[str],
     ) -> None:
         reads_set.update(_extract_nested_scope_free_reads(node))
+
+    def _visit_type_alias_stmt(self, node: ast.AST, store_set: Set[str]) -> None:
+        name_node = getattr(node, "name", None)
+        if isinstance(name_node, ast.Name):
+            store_set.add(name_node.id)
+        for tp in getattr(node, "type_params", []):
+            tp_name = getattr(tp, "name", None)
+            if isinstance(tp_name, str):
+                store_set.add(tp_name)
+        if hasattr(node, "value"):
+            self.visit(getattr(node, "value"))
 
     @staticmethod
     def _extract_pattern_bound_name(node: ast.AST) -> Optional[str]:
@@ -453,6 +468,9 @@ class _FuncScopeVisitor(_BaseScopeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         self._record_import_names(node, self.local_stores)
+
+    def visit_TypeAlias(self, node: ast.AST) -> None:
+        self._visit_type_alias_stmt(node, self.local_stores)
 
 
 class _ClassScopeVisitor(_BaseScopeVisitor):
@@ -538,6 +556,9 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         self._record_import_names(node, self.class_stores)
 
+    def visit_TypeAlias(self, node: ast.AST) -> None:
+        self._visit_type_alias_stmt(node, self.class_stores)
+
 
 def _collect_func_args(args: ast.arguments) -> List[ast.arg]:
     """Collects all arg objects declared in a function or lambda signature."""
@@ -585,6 +606,17 @@ class _OuterExprVisitor(_BaseScopeVisitor):
     def visit_Lambda(self, node: ast.Lambda) -> None:
         self._visit_nested_lambda(node, self.names)
 
+    def visit_TypeAlias(self, node: ast.AST) -> None:
+        tp_names = {
+            getattr(tp, "name", None)
+            for tp in getattr(node, "type_params", [])
+            if isinstance(getattr(tp, "name", None), str)
+        }
+        sub_visitor = _OuterExprVisitor()
+        if hasattr(node, "value"):
+            sub_visitor.visit(getattr(node, "value"))
+        self.names.update(sub_visitor.names - tp_names)
+
 
 def _extract_nested_scope_free_reads(
     node: Union[
@@ -606,6 +638,17 @@ def _extract_nested_scope_free_reads(
         if isinstance(tp_name, str):
             type_param_names.add(tp_name)
 
+    inner_type_params: Set[str] = set()
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        for sub in ast.walk(node):
+            if sub is not node and hasattr(sub, "type_params"):
+                for tp in getattr(sub, "type_params", []):
+                    tp_name = getattr(tp, "name", None)
+                    if isinstance(tp_name, str):
+                        inner_type_params.add(tp_name)
+
+    all_type_params = type_param_names | inner_type_params
+
     outer_visitor = _OuterExprVisitor()
     for tp in getattr(node, "type_params", []):
         outer_visitor.visit(tp)
@@ -618,16 +661,16 @@ def _extract_nested_scope_free_reads(
         for dec in node.decorator_list:
             outer_visitor.visit(dec)
         class_visitor = _ClassScopeVisitor()
-        for tp_name in type_param_names:
+        for tp_name in all_type_params:
             class_visitor.class_stores.add(tp_name)
         for stmt in node.body:
             class_visitor.visit(stmt)
         class_free = (
             (class_visitor.free_reads | class_visitor.nonlocals)
             - class_visitor.globals
-            - type_param_names
+            - all_type_params
         )
-        class_reads = (outer_visitor.names - type_param_names) | class_free
+        class_reads = (outer_visitor.names - all_type_params) | class_free
         if candidates is not None:
             return class_reads & candidates
         return class_reads
@@ -646,7 +689,7 @@ def _extract_nested_scope_free_reads(
             outer_visitor.visit(node.returns)
 
     func_visitor = _FuncScopeVisitor()
-    for tp_name in type_param_names:
+    for tp_name in all_type_params:
         func_visitor.local_stores.add(tp_name)
     func_visitor.params = _collect_func_params(node.args)
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -660,7 +703,7 @@ def _extract_nested_scope_free_reads(
         - (func_visitor.params | func_visitor.local_stores)
     ) | func_visitor.nonlocals
     escaped -= func_visitor.globals
-    all_free = (outer_visitor.names - type_param_names) | escaped
+    all_free = (outer_visitor.names - all_type_params) | (escaped - inner_type_params)
     if candidates is not None:
         return all_free & candidates
     return all_free
@@ -814,6 +857,22 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         self.visit_FunctionDef(node)
+
+    def visit_TypeAlias(self, node: ast.AST) -> None:
+        if self._should_inspect_read(node):
+            tp_names = {
+                getattr(tp, "name", None)
+                for tp in getattr(node, "type_params", [])
+                if isinstance(getattr(tp, "name", None), str)
+            }
+            if hasattr(node, "value"):
+                sub_visitor = _OuterExprVisitor()
+                sub_visitor.visit(getattr(node, "value"))
+                for name in sub_visitor.names - tp_names:
+                    self._record_downstream_read(name)
+            name_node = getattr(node, "name", None)
+            if isinstance(name_node, ast.Name) and not self._is_in_comp(name_node.id):
+                self.killed.add(name_node.id)
 
     def visit_Name(self, node: ast.Name) -> None:
         self.generic_visit(node)
@@ -1682,11 +1741,11 @@ def collect_downstream_read_names(
 
 
 def _pair_clone_outputs(
-    u1_outs: Sequence[str],
-    u2_outs: Sequence[str],
+    u1_outs: Union[Sequence[str], Set[str], frozenset[str]],
+    u2_outs: Union[Sequence[str], Set[str], frozenset[str]],
 ) -> List[Tuple[str, str]]:
     """Establishes an ordered 1-to-1 mapping between clone output variables."""
-    if isinstance(u1_outs, set) or isinstance(u2_outs, set):
+    if isinstance(u1_outs, (set, frozenset)) or isinstance(u2_outs, (set, frozenset)):
         logger.debug(
             "Rejecting clone output pairing: set-valued outputs lack positional ordering"
         )
@@ -1840,7 +1899,7 @@ def _extract_effective_unit_outputs(
 ) -> List[str]:
     """Extracts non-global, non-local outputs from precomputed unit dict or analyzed scope."""
     raw = unit.get("outputs")
-    if isinstance(raw, set):
+    if isinstance(raw, (set, frozenset)):
         if len(raw) > 1:
             logger.debug(
                 "Rejecting set-valued outputs (%s): unordered set cannot establish "
@@ -1886,8 +1945,11 @@ def resolve_clone_generator_subroutine_outputs(
                 )
                 return None
 
-    if (isinstance(u1.get("outputs"), set) and len(u1.get("outputs", set())) > 1) or (
-        isinstance(u2.get("outputs"), set) and len(u2.get("outputs", set())) > 1
+    raw_o1 = u1.get("outputs")
+    raw_o2 = u2.get("outputs")
+    if (
+        (isinstance(raw_o1, (set, frozenset)) and len(raw_o1) > 1)
+        or (isinstance(raw_o2, (set, frozenset)) and len(raw_o2) > 1)
     ):
         logger.debug(
             "Rejecting generator subroutine pair: set-valued outputs lack positional ordering"
@@ -1895,8 +1957,8 @@ def resolve_clone_generator_subroutine_outputs(
         return None
 
     is_precomputed = (
-        isinstance(u1.get("outputs"), (list, tuple, set))
-        and isinstance(u2.get("outputs"), (list, tuple, set))
+        isinstance(raw_o1, (list, tuple, set, frozenset))
+        and isinstance(raw_o2, (list, tuple, set, frozenset))
     )
 
     if is_precomputed:
@@ -2036,16 +2098,16 @@ def resolve_clone_pair_outputs(
 
     has_precomputed = (
         "outputs" in u1
-        and isinstance(u1["outputs"], (list, tuple, set))
+        and isinstance(u1["outputs"], (list, tuple, set, frozenset))
         and "outputs" in u2
-        and isinstance(u2["outputs"], (list, tuple, set))
+        and isinstance(u2["outputs"], (list, tuple, set, frozenset))
     )
     strict_pairing = (is_sub or has_precomputed) if require_pairing is None else require_pairing
 
     for u_chk in (u1, u2):
         for out_key in ("outputs", "precomputed_outputs"):
             v = u_chk.get(out_key)
-            if isinstance(v, set) and len(v) > 1:
+            if isinstance(v, (set, frozenset)) and len(v) > 1:
                 logger.debug(
                     "Rejecting clone pair output resolution: set-valued outputs "
                     "lack positional ordering"

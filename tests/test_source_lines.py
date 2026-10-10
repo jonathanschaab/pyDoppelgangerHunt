@@ -377,3 +377,25 @@ def test_parse_unit_coord_strict_rejects_bool() -> None:
     assert parse_unit_coord({"start": True}, "start", strict=False) == 1
     # Valid int in strict mode succeeds
     assert parse_unit_coord({"start": 42}, "start", strict=True) == 42
+
+
+def test_parse_unit_coord_strict_rejects_signed_prefix() -> None:
+    """Verifies that parse_unit_coord with strict=True rejects signed prefix strings."""
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
+        is_valid_unit_coordinates,
+    )
+
+    with pytest.raises(ValueError, match="signed prefix not allowed in strict mode"):
+        parse_unit_coord({"start": "+1"}, "start", strict=True)
+
+    with pytest.raises(ValueError, match="signed prefix not allowed in strict mode"):
+        parse_unit_coord({"start": "-1"}, "start", strict=True)
+
+    # In lenient mode, signed strings parse to their integer values
+    assert parse_unit_coord({"start": "+1"}, "start", strict=False) == 1
+    assert parse_unit_coord({"start": "-1"}, "start", strict=False) == -1
+
+    # is_valid_unit_coordinates with strict=True rejects signed prefixes
+    assert is_valid_unit_coordinates({"start": "+1", "end": "5"}, strict=True) is False
+    assert is_valid_unit_coordinates({"start": "+1", "end": "5"}, strict=False) is True
+

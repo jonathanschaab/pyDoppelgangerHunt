@@ -2626,5 +2626,113 @@ def test_closure_pos_attributes_and_iteration() -> None:
     assert pos < 15
 
 
+def test_extract_nested_scope_free_reads_inner_type_params() -> None:
+    """Verifies that inner function and type alias type params do not escape to outer scope."""
+    from pydoppelgangerhunt.fixer.dataflow import _extract_nested_scope_free_reads
+
+    # Python 3.12+ generic function syntax
+    code = (
+        "def outer():\n"
+        "    def inner[T](val: T) -> T:\n"
+        "        return val + external_var\n"
+        "    return inner(1)\n"
+    )
+    tree = ast.parse(code)
+    func_node = tree.body[0]
+    assert isinstance(func_node, ast.FunctionDef)
+    reads = _extract_nested_scope_free_reads(func_node)
+    # external_var should be read, but T must NOT escape
+    assert "external_var" in reads
+    assert "T" not in reads
+
+    # Inner TypeAlias syntax
+    code_alias = (
+        "def outer_alias():\n"
+        "    type MyList[U] = list[U]\n"
+        "    return external_var\n"
+    )
+    tree_alias = ast.parse(code_alias)
+    func_alias = tree_alias.body[0]
+    assert isinstance(func_alias, ast.FunctionDef)
+    reads_alias = _extract_nested_scope_free_reads(func_alias)
+    assert "external_var" in reads_alias
+    assert "U" not in reads_alias
+
+
+def test_resolve_unit_ast_end_col_single_line_multiple_semicolons() -> None:
+    """Verifies that single-line units with multiple trailing semicolons fail closed by returning
+    None when columns are ambiguous, but resolve accurately when uniquely matched."""
+    from pydoppelgangerhunt.fixer.dataflow import _resolve_unit_ast_end_col
+
+    code = "for x in items: a = 1; b = 2; c = 3\n"
+    tree = ast.parse(code)
+    # col_offset of a is 16, b is 23, c is 30. end_col_offset of c is 35.
+    unit_ambiguous = {
+        "file": "test.py",
+        "start": 1,
+        "end": 1,
+        "start_col": 23,
+        "is_subroutine": True,
+    }
+    # Multiple statements (b = 2 and c = 3) match: fails closed to prevent swallowing downstream
+    end_col = _resolve_unit_ast_end_col(tree, unit_ambiguous)
+    assert end_col is None
+
+    # Single matching statement (c = 3) accurately resolves to 35
+    unit_unique = {
+        "file": "test.py",
+        "start": 1,
+        "end": 1,
+        "start_col": 30,
+        "is_subroutine": True,
+    }
+    assert _resolve_unit_ast_end_col(tree, unit_unique) == 35
+
+
+def test_frozenset_outputs_defensive_handling() -> None:
+    """Verifies that frozenset outputs are handled defensively across output pairing routines."""
+    from pydoppelgangerhunt.fixer.dataflow import (
+        _extract_effective_unit_outputs,
+        _pair_clone_outputs,
+        resolve_clone_generator_subroutine_outputs,
+        resolve_clone_pair_outputs,
+    )
+
+    # _pair_clone_outputs rejects frozenset
+    assert _pair_clone_outputs(frozenset(["a", "b"]), ["x", "y"]) == []
+    assert _pair_clone_outputs(["a", "b"], frozenset(["x", "y"])) == []
+
+    # _extract_effective_unit_outputs: multi-item frozenset returns []
+    u_multi = {"outputs": frozenset(["a", "b"])}
+    assert _extract_effective_unit_outputs(u_multi, {}) == []
+
+    # Single-item frozenset returns list of 1 element
+    u_single = {"outputs": frozenset(["a"])}
+    assert _extract_effective_unit_outputs(u_single, {}) == ["a"]
+
+    # resolve_clone_generator_subroutine_outputs rejects multi-item frozenset
+    assert (
+        resolve_clone_generator_subroutine_outputs(
+            {"outputs": frozenset(["a", "b"])},
+            {"outputs": ["x", "y"]},
+            {},
+            {},
+        )
+        is None
+    )
+
+    # resolve_clone_pair_outputs rejects multi-item frozenset
+    assert (
+        resolve_clone_pair_outputs(
+            {"outputs": frozenset(["a", "b"])},
+            {"outputs": ["x", "y"]},
+            {},
+            {},
+        )
+        is None
+    )
+
+
+
 
 

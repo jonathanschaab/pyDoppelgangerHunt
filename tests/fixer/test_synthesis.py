@@ -2681,3 +2681,24 @@ def test_normalize_pipe_unions_preserves_string_literal_pipes() -> None:
         _normalize_pipe_unions('int | Literal["r | w"]')
         == 'Union[int, Literal["r | w"]]'
     )
+
+
+def test_split_delimited_type_string_unmatched_closing_bracket() -> None:
+    """Verifies that _split_delimited_type_string handles unmatched closing brackets safely."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _split_delimited_type_string,
+        _split_pipe_union_args,
+    )
+
+    # With require_balanced=True, unmatched closing bracket returns []
+    assert _split_delimited_type_string("int] | str", "|", require_balanced=True) == []
+    assert _split_delimited_type_string("int) | str", "|", require_balanced=True) == []
+    assert _split_delimited_type_string("int} | str", "|", require_balanced=True) == []
+
+    # With require_balanced=False, fallback to unsplit string rather than partial split
+    assert (
+        _split_delimited_type_string("int] | str", "|", require_balanced=False)
+        == ["int] | str"]
+    )
+    assert _split_pipe_union_args("int] | str") == ["int] | str"]
+

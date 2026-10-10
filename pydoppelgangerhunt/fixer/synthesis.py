@@ -119,6 +119,7 @@ def _split_delimited_type_string(
     depth = 0
     active_quote: Optional[str] = None
     escaped = False
+    has_imbalance = False
     for char in text:
         active_quote, escaped = _advance_quote_state(char, active_quote, escaped)
         if active_quote:
@@ -127,7 +128,12 @@ def _split_delimited_type_string(
         if char in ("[", "(", "{"):
             depth += 1
         elif char in ("]", ")", "}"):
-            depth = max(0, depth - 1)
+            depth -= 1
+            if depth < 0:
+                if require_balanced:
+                    return []
+                depth = 0
+                has_imbalance = True
         elif char == delimiter and depth == 0:
             item = "".join(current).strip()
             if item or allow_empty:
@@ -135,7 +141,7 @@ def _split_delimited_type_string(
             current = []
             continue
         current.append(char)
-    if depth != 0 or active_quote is not None:
+    if depth != 0 or active_quote is not None or has_imbalance:
         if require_balanced:
             return []
         return [text.strip()] if text.strip() else []
