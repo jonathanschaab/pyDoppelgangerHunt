@@ -2647,6 +2647,57 @@ def test_closure_pos_attributes_and_iteration() -> None:
     assert pos < 15
 
 
+def test_collect_scope_closures_falsy_col_offset_preserved() -> None:
+    """Verifies that decorator and subnode column offset 0 is preserved and does not fall back."""
+    fn = ast.FunctionDef(
+        name="decorated",
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[],
+            vararg=None,
+            kwonlyargs=[],
+            kw_defaults=[],
+            kwarg=None,
+            defaults=[],
+        ),
+        body=[ast.Pass(lineno=3, col_offset=4)],
+        decorator_list=[
+            ast.Call(
+                func=ast.Name(id="dec", ctx=ast.Load(), lineno=2, col_offset=0),
+                args=[
+                    ast.Lambda(
+                        args=ast.arguments(
+                            posonlyargs=[],
+                            args=[],
+                            vararg=None,
+                            kwonlyargs=[],
+                            kw_defaults=[],
+                            kwarg=None,
+                            defaults=[],
+                        ),
+                        body=ast.Name(id="captured_val", ctx=ast.Load(), lineno=2, col_offset=5),
+                        lineno=2,
+                        col_offset=0,
+                    )
+                ],
+                keywords=[],
+                lineno=2,
+                col_offset=0,
+            )
+        ],
+        lineno=2,
+        col_offset=8,
+    )
+    mod = ast.Module(body=[fn], type_ignores=[])
+    closures = _collect_scope_closures(mod)
+    assert len(closures) == 1
+    pos, names = closures[0]
+    assert "captured_val" in names
+    assert int(pos) == 2
+    assert getattr(pos, "line", None) == 2
+    assert getattr(pos, "col", None) == 0  # Preserved as 0, not overridden by fn.col_offset (8)
+
+
 @pytest.mark.skipif(
     sys.version_info < (3, 12), reason="PEP 695 type_params syntax requires Python 3.12+"
 )

@@ -1114,13 +1114,16 @@ def _collect_scope_closures_uncached(
         s_col = int(getattr(s, "col_offset", 0) or 0)
         decs = getattr(s, "decorator_list", [])
         if decs:
-            dec_pos = [
-                (
-                    int(getattr(d, "lineno", None) or s_line),
-                    int(getattr(d, "col_offset", None) or s_col),
+            dec_pos = []
+            for d in decs:
+                d_l = getattr(d, "lineno", None)
+                d_c = getattr(d, "col_offset", None)
+                dec_pos.append(
+                    (
+                        int(d_l) if d_l is not None else s_line,
+                        int(d_c) if d_c is not None else s_col,
+                    )
                 )
-                for d in decs
-            ]
             if dec_pos:
                 min_l, min_c = min(dec_pos, key=lambda p: (p[0], p[1]))
                 if min_l < s_line or (min_l == s_line and min_c < s_col):
@@ -1133,8 +1136,10 @@ def _collect_scope_closures_uncached(
         for node in nodes:
             for subnode in ast.walk(node):
                 if isinstance(subnode, (ast.Lambda, ast.GeneratorExp)):
-                    sub_line = int(getattr(subnode, "lineno", None) or default_line)
-                    sub_col = int(getattr(subnode, "col_offset", None) or default_col)
+                    sub_l = getattr(subnode, "lineno", None)
+                    sub_c = getattr(subnode, "col_offset", None)
+                    sub_line = int(sub_l) if sub_l is not None else default_line
+                    sub_col = int(sub_c) if sub_c is not None else default_col
                     closures.append(
                         (
                             _ClosurePos(sub_line, sub_col),
