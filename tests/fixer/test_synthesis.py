@@ -2681,6 +2681,14 @@ def test_normalize_pipe_unions_preserves_string_literal_pipes() -> None:
         _normalize_pipe_unions('int | Literal["r | w"]')
         == 'Union[int, Literal["r | w"]]'
     )
+    assert (
+        _normalize_pipe_unions("typing_extensions.Literal['a | b']")
+        == "typing_extensions.Literal['a | b']"
+    )
+    assert (
+        _normalize_pipe_unions("typing_extensions.Union[int | str, float]")
+        == "Union[int, str, float]"
+    )
 
 
 def test_split_delimited_type_string_unmatched_closing_bracket() -> None:

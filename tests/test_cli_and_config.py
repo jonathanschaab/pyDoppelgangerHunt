@@ -2823,3 +2823,20 @@ def test_cli_closure_strictness_and_skip_closures_precedence_warning(
                 for r in caplog.records
             )
 
+
+def test_resolve_closure_strictness_mode_thread_safety() -> None:
+    """Verifies that concurrent invocations of resolve_closure_strictness_mode are thread-safe."""
+    import concurrent.futures  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        resolve_closure_strictness_mode,
+    )
+
+    def _worker(val: str) -> tuple[str, bool]:
+        return resolve_closure_strictness_mode(val)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(_worker, f"unknown_mode_{i % 3}") for i in range(50)]
+        results = [f.result() for f in futures]
+
+    assert all(r == ("strict", False) for r in results)
+

@@ -6,12 +6,14 @@ import logging
 import os
 from pathlib import Path
 import sys
+import threading
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from pydoppelgangerhunt.canonical_path import normalize_lexical_posix, parse_notebook_cell_anchor
 
 logger = logging.getLogger(__name__)
 
+_warned_closure_lock: threading.Lock = threading.Lock()
 _warned_closure_strictness_values: Set[str] = set()
 
 
@@ -35,8 +37,11 @@ def resolve_closure_strictness_mode(
             return "strict", False
         fallback = "lenient" if skip_pre_unit_closures else "strict"
         raw_key = str(closure_strictness)
-        if raw_key not in _warned_closure_strictness_values:
-            _warned_closure_strictness_values.add(raw_key)
+        with _warned_closure_lock:
+            should_warn = raw_key not in _warned_closure_strictness_values
+            if should_warn:
+                _warned_closure_strictness_values.add(raw_key)
+        if should_warn:
             logger.warning(
                 "Unrecognized closure_strictness '%s'; falling back to %s mode",
                 closure_strictness,

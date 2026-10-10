@@ -1170,6 +1170,7 @@ def _collect_scope_closures_uncached(
                     list(stmt.decorator_list)
                     + list(stmt.bases)
                     + [kw.value for kw in stmt.keywords]
+                    + list(getattr(stmt, "type_params", []))
                 )
                 _record_expr_closures(class_exprs, stmt_start, stmt_col)
                 for item in stmt.body:

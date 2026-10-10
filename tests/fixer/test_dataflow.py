@@ -42,6 +42,7 @@ from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-acc
     _scope_try_with_cache,
     _stmts_enclose_unit,
     collect_downstream_read_names,
+    has_async_generator_delegation_hazard,
     is_async_generator_with_return_value,
     resolve_clone_generator_subroutine_outputs,
     resolve_generator_subroutine_outputs,
@@ -476,6 +477,8 @@ def test_generator_clone_side_data_interface() -> None:
 
 def test_is_async_generator_with_return_value_policy() -> None:
     """Verifies that is_async_generator_with_return_value strictly enforces PEP 525 constraints."""
+    assert is_async_generator_with_return_value is has_async_generator_delegation_hazard
+
     # Clean sync generator with return value (allowed in Python 3.3+)
     sync_gen = {"has_yield": True, "is_async": False, "has_return_value": True}
     assert not is_async_generator_with_return_value(sync_gen)
@@ -2592,6 +2595,18 @@ def test_collect_scope_closures_class_header_expressions() -> None:
     assert "val1" in captured
     assert "val2" in captured
     assert "val3" in captured
+
+    code_gen = (
+        "def outer(val4):\n"
+        "    class GenericClass[T: (lambda: val4)]:\n"
+        "        pass\n"
+    )
+    tree_gen = ast.parse(code_gen)
+    closures_gen = _collect_scope_closures(tree_gen.body[0])
+    captured_gen = set()
+    for _, names in closures_gen:
+        captured_gen.update(names)
+    assert "val4" in captured_gen
 
 
 def test_collect_pre_unit_closures_same_line_semicolon() -> None:

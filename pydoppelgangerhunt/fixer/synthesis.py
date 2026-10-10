@@ -229,12 +229,12 @@ def _normalize_pipe_unions(type_str: str) -> str:
                     closes_at_end = idx == len(cleaned) - 1
                     break
         if closes_at_end:
-            if prefix in ("Literal", "typing.Literal"):
+            if prefix in ("Literal", "typing.Literal", "typing_extensions.Literal"):
                 return cleaned
             inner_args = _split_type_args(cleaned)
             if inner_args:
                 norm_args = [_normalize_pipe_unions(arg) for arg in inner_args]
-                if prefix in ("Union", "typing.Union"):
+                if prefix in ("Union", "typing.Union", "typing_extensions.Union"):
                     unique = list(dict.fromkeys(_flatten_union_args(norm_args)))
                     if len(unique) == 1:
                         return unique[0]
