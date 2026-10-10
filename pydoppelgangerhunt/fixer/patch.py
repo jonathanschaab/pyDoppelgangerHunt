@@ -2686,11 +2686,16 @@ def generate_refactoring_patch(
     )
 
     for sim, u1, u2 in clones:
-        if not is_valid_unit_coordinates(u1) or not is_valid_unit_coordinates(u2):
+        if (
+            not is_valid_unit_coordinates(u1, strict=True)
+            or not is_valid_unit_coordinates(u2, strict=True)
+        ):
             logger.debug(
                 "Skipping clone pair with malformed unit coordinates: (%s, %s)", u1, u2
             )
             continue
+
+
 
         # Performance: Snapshot only plans touched in this pair (f1, f2, and potential shared module)
         # to ensure O(touched_plans) = O(1) complexity per pair rather than O(pairs * total_plans).
@@ -2960,8 +2965,21 @@ def generate_refactoring_patch(
                     is_sub1,
                     is_sub2,
                 )
-                continue
             is_sub = is_sub1
+
+            has_multi_set_outputs = any(
+                isinstance(u_chk.get(k), set) and len(u_chk[k]) > 1
+                for u_chk in (u1_eff, u2_eff)
+                for k in ("outputs", "precomputed_outputs")
+            )
+            if has_multi_set_outputs:
+                logger.debug(
+                    "Skipping clone pair (%s, %s): set-valued outputs lack positional ordering",
+                    u1.get("name"),
+                    u2.get("name"),
+                )
+                continue
+
             has_yield = bool(s1.get("has_yield") or s2.get("has_yield"))
             if is_sub and has_yield:
                 resolved_sub_outs = resolve_clone_generator_subroutine_outputs(

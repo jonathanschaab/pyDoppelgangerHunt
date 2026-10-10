@@ -244,13 +244,13 @@ soundness.
   unit line/column coordinates, unit kind and name, subroutine flag (`is_subroutine`), candidate
   outputs, and closure strictness (`skip_pre_unit_closures`).
 - **Precision vs. Soundness Trade-off**: Pre-unit closure scanning can be configured via
-  `--closure-strictness {strict,lenient}` (or `--skip-pre-unit-closures`, or setting
+  `--closure-strictness {strict,lenient,fail_closed,fast,skip}` (or `--skip-pre-unit-closures`, or setting
   `closure_strictness = "strict"|"lenient"` in `pyproject.toml`):
-  - `strict` (default): Soundness-preserving mode that treats pre-unit closures capturing
-    candidate outputs as live escaping callbacks, guarding against callbacks registered in
+  - `strict` (alias: `fail_closed`, default): Soundness-preserving mode that treats pre-unit closures
+    capturing candidate outputs as live escaping callbacks, guarding against callbacks registered in
     event loops or tables.
-  - `lenient`: Precision-oriented mode that skips pre-unit closure scanning, reducing
-    false-positive pair rejections in codebases where pre-unit closures never escape, at the
+  - `lenient` (aliases: `fast`, `skip`): Precision-oriented mode that skips pre-unit closure scanning,
+    reducing false-positive pair rejections in codebases where pre-unit closures never escape, at the
     cost of soundness for escaping closures.
 
 #### Safety Model & Fail-Closed Refactoring Guarantees
@@ -338,7 +338,7 @@ pydoppelgangerhunt --init
 | `--cross-file-strategy` | `auto\|shared_module\|host_module\|skip` | Cross-module deduplication strategy (`auto`, `shared_module`, `host_module`, or `skip`; default: `auto`) |
 | `--shared-module-name` | `FILENAME` | Target filename for shared utility extractions (default: `_common.py`) |
 | `--skip-pre-unit-closures` | Flag | Skip pre-unit closure scan during subroutine extraction |
-| `--closure-strictness` | `strict\|lenient` | Closure strictness mode (`strict` [soundness] or `lenient` [fewer rejections]; default: `strict`) |
+| `--closure-strictness` | `strict\|lenient` | Closure strictness mode (`strict` / `fail_closed` [soundness] or `lenient` / `fast` / `skip` [fewer rejections]; default: `strict`) |
 | `--sort-by` | `similarity\|priority\|sloc` | Sort clone hits (default: `similarity`) |
 | `--priority` | Flag | Sort clones by Priority score: $\text{Sim} \times \text{SLOC} \times \text{Complexity}$ |
 | `--top` | `INT` | Truncate report to top $N$ clone pairs |

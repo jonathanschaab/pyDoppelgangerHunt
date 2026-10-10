@@ -79,6 +79,7 @@ exclude = [
 ]
 call_sequences = true
 idioms = true
+# closure_strictness = "strict"  # Options: "strict", "lenient"
 """
 
 
@@ -334,7 +335,10 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
         tool_sec = data.get("tool", {}) if isinstance(data, dict) else {}
         if isinstance(tool_sec, dict) and isinstance(tool_sec.get(section_name), dict):
             return dict(tool_sec[section_name])
-        if isinstance(data, dict) and any(k in data for k in ("threshold", "min_lines", "exemptions", "exclude")):
+        if isinstance(data, dict) and any(
+            k in data
+            for k in ("threshold", "min_lines", "exemptions", "exclude", "closure_strictness")
+        ):
             return dict(data)
     except (ImportError, OSError, ValueError, TypeError):
         pass
@@ -397,7 +401,10 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
                     except ValueError:
                         pass
         if not any(line.strip().startswith("[") for line in lines):
-            if any(k in config for k in ("threshold", "min_lines", "exemptions", "exclude")):
+            if any(
+                k in config
+                for k in ("threshold", "min_lines", "exemptions", "exclude", "closure_strictness")
+            ):
                 return config
             return {}
         return config

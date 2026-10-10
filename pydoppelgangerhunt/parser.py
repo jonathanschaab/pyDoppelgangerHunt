@@ -978,10 +978,9 @@ def _node_is_effectively_async(
     for n in nodes:
         if not isinstance(n, ast.AST):
             continue
-        if isinstance(n, ast.AsyncFunctionDef):
-            return True
-        if isinstance(n, (ast.FunctionDef, ast.ClassDef)):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
+
         queue: deque[ast.AST] = deque([n])
         while queue:
             curr = queue.popleft()

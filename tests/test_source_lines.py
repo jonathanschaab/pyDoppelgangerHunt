@@ -289,7 +289,7 @@ def test_coordinate_parsing_colon_formatted_lines_across_subsystems() -> None:
 
     # 7. is_valid_unit_coordinates
     assert is_valid_unit_coordinates(u1, strict=False) is True
-    assert is_valid_unit_coordinates(u1) is False
+    assert is_valid_unit_coordinates(u1) is True
     assert is_valid_unit_coordinates(u1, strict=True) is False
     assert is_valid_unit_coordinates({"start": "invalid:foo"}) is False
 
@@ -330,8 +330,8 @@ def test_coordinate_clamping_debug_logs(caplog: pytest.LogCaptureFixture) -> Non
 
 def test_is_valid_unit_coordinates_strict_mode() -> None:
     """Verifies that is_valid_unit_coordinates strictly rejects blank, colon, float, or missing
-    start coordinates in default strict mode, but permits colon-formatted coordinates in lenient
-    mode."""
+    coordinates in explicit strict mode, but permits colon-formatted and float coordinates in
+    default lenient mode."""
     from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
         is_valid_unit_coordinates,
     )
@@ -356,8 +356,9 @@ def test_is_valid_unit_coordinates_strict_mode() -> None:
     assert is_valid_unit_coordinates({"start": 5, "end": -1}) is False
     # Inverted same-line column coordinates rejected
     assert is_valid_unit_coordinates({"start": 1, "end": 1, "start_col": 10, "end_col": 5}) is False
-    # Float rejected in strict mode
-    assert is_valid_unit_coordinates({"start": 12.0}) is False
+    # Float rejected in strict mode, accepted in default/lenient mode
+    assert is_valid_unit_coordinates({"start": 12.0}, strict=True) is False
+    assert is_valid_unit_coordinates({"start": 12.0}) is True
     assert is_valid_unit_coordinates({"start": 12.0}, strict=False) is True
 
 

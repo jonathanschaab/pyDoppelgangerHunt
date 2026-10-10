@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union, overload
 
-from pydoppelgangerhunt.config import normalize_path_string
+from pydoppelgangerhunt.canonical_path import normalize_lexical_posix as normalize_path_string
 
 logger = logging.getLogger(__name__)
 

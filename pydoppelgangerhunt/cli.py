@@ -28,13 +28,12 @@ from pydoppelgangerhunt.config import (
     init_tool_configuration,
     load_tool_config,
     normalize_path_string,
+    resolve_closure_strictness_mode,
 )
 from pydoppelgangerhunt.canonical_path import CanonicalPathResolver
 from pydoppelgangerhunt.coverage import check_asymmetric_coverage, read_coverage_data
-from pydoppelgangerhunt.fixer import (
-    generate_refactoring_patch,
-    resolve_closure_strictness_mode,
-)
+from pydoppelgangerhunt.fixer import generate_refactoring_patch
+
 from pydoppelgangerhunt.git_diff import (
     DiffRangeMap,
     check_temporal_divergence,
@@ -1121,9 +1120,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.closure_strictness is not None or args.skip_pre_unit_closures:
         cli_strictness: Optional[str] = args.closure_strictness
         cli_skip: bool = _safe_bool(args.skip_pre_unit_closures)
+        if (
+            cli_strictness is not None
+            and str(cli_strictness).strip().lower() in ("strict", "fail_closed")
+            and args.skip_pre_unit_closures
+        ):
+            logger.warning(
+                "Conflicting flags: --closure-strictness '%s' takes precedence over "
+                "--skip-pre-unit-closures",
+                cli_strictness,
+            )
     else:
         cli_strictness = tool_cfg.get("closure_strictness")
         cli_skip = _safe_bool(tool_cfg.get("skip_pre_unit_closures", False))
+
 
     if cli_strictness is not None and str(cli_strictness).strip().lower() not in (
         "strict", "lenient", "fail_closed", "fast", "skip"

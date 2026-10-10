@@ -413,10 +413,18 @@ class _ScopeVisitor(ast.NodeVisitor):
             self.visit(stmt)
 
     def _check_yield_assignment(self, node: Optional[ast.AST]) -> None:
-        if node is not None and any(
-            isinstance(s, (ast.Yield, ast.YieldFrom)) for s in ast.walk(node)
-        ):
-            self.has_yield_assignment = True
+        if len(self._scope_stack) > 1 or node is None:
+            return
+        stack = [node]
+        while stack:
+            curr = stack.pop()
+            if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            if isinstance(curr, ast.Yield):
+                self.has_yield_assignment = True
+                return
+            for child in ast.iter_child_nodes(curr):
+                stack.append(child)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self._check_yield_assignment(node.value)
@@ -613,20 +621,21 @@ class _ScopeVisitor(ast.NodeVisitor):
                             self.yield_expr_names.append((kind, f":literal:{t_name}"))
 
     def _inspect_yield_assignment(self) -> None:
-        if len(self._ancestors) >= 2:
+        if len(self._scope_stack) <= 1 and len(self._ancestors) >= 2:
             immediate_parent = self._ancestors[-2]
             if not isinstance(immediate_parent, ast.Expr):
                 self.has_yield_assignment = True
 
     def visit_Yield(self, node: ast.Yield) -> None:
         self._record_yield_expr("yield", node)
-        self._inspect_yield_assignment()
+        if len(self._scope_stack) <= 1:
+            self._inspect_yield_assignment()
         self.generic_visit(node)
 
     def visit_YieldFrom(self, node: ast.YieldFrom) -> None:
         self._record_yield_expr("yield_from", node)
-        self._inspect_yield_assignment()
         self.generic_visit(node)
+
 
     def visit_Return(self, node: ast.Return) -> None:
         if len(self._scope_stack) <= 1:
@@ -1407,8 +1416,18 @@ def _inspect_unit_scope(
     # Unit outputs: explicit returns if present; for subroutines without explicit
     # returns, all local variable stores act as unit outputs to preserve caller mutations.
     pre_outs = unit.get("precomputed_outputs") or unit.get("outputs")
-    if is_subroutine and isinstance(pre_outs, (list, tuple, set)):
-        outputs = sorted(pre_outs) if isinstance(pre_outs, set) else list(pre_outs)
+    if is_subroutine and isinstance(pre_outs, (list, tuple)):
+        outputs = list(pre_outs)
+    elif is_subroutine and isinstance(pre_outs, set):
+        if len(pre_outs) > 1:
+            logger.debug(
+                "Rejecting set-valued outputs (%s): unordered set cannot establish "
+                "positional order",
+                pre_outs,
+            )
+            outputs = []
+        else:
+            outputs = list(pre_outs)
     elif visitor.returns:
         outputs = list(visitor.returns)
     elif is_subroutine:
@@ -1664,6 +1683,17 @@ def analyze_unit_variable_scope(
     }
 
 
+def _callable_supports_param(target: Any, param_name: str) -> bool:
+    """Checks whether a callable accepts param_name or **kwargs."""
+    try:
+        sig = inspect.signature(target)
+        return param_name in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+    except (ValueError, TypeError):
+        return False
+
+
 def dispatch_analyze_unit_variable_scope(
     u1: Dict[str, Any],
     u2: Optional[Dict[str, Any]] = None,
@@ -1674,16 +1704,7 @@ def dispatch_analyze_unit_variable_scope(
     """Dispatches analyze_unit_variable_scope, honoring active mock patches on pydoppelgangerhunt.fixer."""
     pkg = sys.modules.get("pydoppelgangerhunt.fixer")
     target = getattr(pkg, "analyze_unit_variable_scope", analyze_unit_variable_scope)
-    supports_trees = False
-    try:
-        sig = inspect.signature(target)
-        supports_trees = "tree1" in sig.parameters or any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-        )
-    except (ValueError, TypeError):
-        supports_trees = False
-
-    if supports_trees:
+    if _callable_supports_param(target, "tree1"):
         return target(u1, u2=u2, repo_root=repo_root, tree1=tree1, tree2=tree2)
     return target(u1, u2=u2, repo_root=repo_root)
 
@@ -1698,14 +1719,8 @@ def dispatch_inspect_single_unit_scope(
     pkg = sys.modules.get("pydoppelgangerhunt.fixer")
     target = getattr(pkg, "inspect_single_unit_scope", None)
     if target is not None and target is not inspect_single_unit_scope:
-        try:
-            sig = inspect.signature(target)
-            if "tree" in sig.parameters or any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            ):
-                return cast(Dict[str, Any], target(unit, repo_root=repo_root, tree=tree))
-        except (ValueError, TypeError):
-            pass
+        if _callable_supports_param(target, "tree"):
+            return cast(Dict[str, Any], target(unit, repo_root=repo_root, tree=tree))
         return cast(Dict[str, Any], target(unit, repo_root=repo_root))
 
     analyze_target = getattr(pkg, "analyze_unit_variable_scope", None)

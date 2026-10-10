@@ -75,6 +75,7 @@ from pydoppelgangerhunt.fixer.scope import (
     _walrus_assignment_in_expr,
     _walrus_in_sequence,
     analyze_unit_variable_scope,
+    inspect_single_unit_scope,
     is_subroutine_unit,
 )
 from pydoppelgangerhunt.fixer.source import (
@@ -148,6 +149,7 @@ __all__ = [
     "generate_refactoring_patch",
     "GeneratorCloneSideData",
     "has_async_generator_delegation_hazard",
+    "inspect_single_unit_scope",
     "intervals_overlap",
     "is_async_generator_with_return_value",
     "is_subroutine_unit",

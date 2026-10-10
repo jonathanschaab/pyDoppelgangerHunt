@@ -16,7 +16,6 @@ from pydoppelgangerhunt.source_lines import (
     is_sliced_unit_source_lines,
     parse_unit_coord,
     resolve_safe_unit_file_path,
-    resolve_unit_line_bounds,
 )
 from pydoppelgangerhunt.fixer.source import _find_innermost_enclosing_node
 
@@ -142,14 +141,16 @@ def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
 
 def _get_scope_parent_map(scope_node: ast.AST) -> Dict[ast.AST, ast.AST]:
     """Retrieves or builds cached parent map for AST nodes within the scope."""
-    cached = getattr(scope_node, "_pydh_parent_map", None)
-    if isinstance(cached, dict):
-        return cached
+    with _downstream_cache_lock:
+        cached = getattr(scope_node, "_pydh_parent_map", None)
+        if isinstance(cached, dict):
+            return cached
     parent_map: Dict[ast.AST, ast.AST] = {}
     for parent in ast.walk(scope_node):
         for child in ast.iter_child_nodes(parent):
             parent_map[child] = parent
-    setattr(scope_node, "_pydh_parent_map", parent_map)
+    with _downstream_cache_lock:
+        setattr(scope_node, "_pydh_parent_map", parent_map)
     return parent_map
 
 
@@ -157,17 +158,20 @@ def _get_scope_stmts_by_end_lineno(
     scope_node: ast.AST,
 ) -> Dict[int, List[ast.stmt]]:
     """Retrieves or builds cached map of statement end line numbers to statement nodes."""
-    cached = getattr(scope_node, "_pydh_stmts_by_end", None)
-    if isinstance(cached, dict):
-        return cached
+    with _downstream_cache_lock:
+        cached = getattr(scope_node, "_pydh_stmts_by_end", None)
+        if isinstance(cached, dict):
+            return cached
     m: Dict[int, List[ast.stmt]] = {}
     for node in ast.walk(scope_node):
         if isinstance(node, ast.stmt):
             e = getattr(node, "end_lineno", None) or getattr(node, "lineno", 0) or 0
             if e > 0:
                 m.setdefault(e, []).append(node)
-    setattr(scope_node, "_pydh_stmts_by_end", m)
+    with _downstream_cache_lock:
+        setattr(scope_node, "_pydh_stmts_by_end", m)
     return m
+
 
 
 def _resolve_unit_ast_end_col(
@@ -943,9 +947,11 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
 
 def _collect_scope_closures(scope_node: ast.AST) -> List[Tuple[int, Set[str]]]:
     """Discovers all closures defined in a scope, recorded with their starting line."""
-    cached = getattr(scope_node, "_pydh_scope_closures", None)
-    if isinstance(cached, list):
-        return cached
+    with _downstream_cache_lock:
+        cached = getattr(scope_node, "_pydh_scope_closures", None)
+        if isinstance(cached, list):
+            return cached
+
 
     closures: List[Tuple[int, Set[str]]] = []
 
@@ -1040,8 +1046,10 @@ def _collect_scope_closures(scope_node: ast.AST) -> List[Tuple[int, Set[str]]]:
                 _walk_stmts(getattr(case, "body", []))
 
     _walk_stmts(getattr(scope_node, "body", []))
-    setattr(scope_node, "_pydh_scope_closures", closures)
+    with _downstream_cache_lock:
+        setattr(scope_node, "_pydh_scope_closures", closures)
     return closures
+
 
 
 def _collect_pre_unit_closures(
@@ -1079,13 +1087,15 @@ def _build_downstream_cache_key(
 ) -> Tuple[Any, ...]:
     """Forms a persistent cache key for downstream AST read analysis."""
     file_path_str = str(unit.get("file") or "")
+    computed_digest = hashlib.sha256(
+        source_text.encode("utf-8", errors="replace")
+    ).hexdigest()
     digest = source_digest or unit.get("source_digest") or unit.get("content_digest")
     if digest is not None:
-        content_digest = str(digest)
+        content_digest = f"{computed_digest}:{digest}"
     else:
-        content_digest = hashlib.sha256(
-            source_text.encode("utf-8", errors="replace")
-        ).hexdigest()
+        content_digest = computed_digest
+
     start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
     end_col = _extract_unit_end_col(unit)
     cands_key = frozenset(candidates) if candidates is not None else None
@@ -1127,7 +1137,8 @@ def _find_enclosing_loops(
     u_end: int,
 ) -> List[Tuple[int, int]]:
     """Detects loops enclosing the unit boundaries for loop-carried dependence analysis."""
-    cached_loops: Optional[List[Tuple[int, int]]] = getattr(scope_node, "_pydh_loops", None)
+    with _downstream_cache_lock:
+        cached_loops: Optional[List[Tuple[int, int]]] = getattr(scope_node, "_pydh_loops", None)
     if cached_loops is None:
         cached_loops = []
         for node in ast.walk(scope_node):
@@ -1135,7 +1146,9 @@ def _find_enclosing_loops(
                 l_start = getattr(node, "lineno", 0)
                 l_end = getattr(node, "end_lineno", None) or l_start
                 cached_loops.append((l_start, l_end))
-        setattr(scope_node, "_pydh_loops", cached_loops)
+        with _downstream_cache_lock:
+            setattr(scope_node, "_pydh_loops", cached_loops)
+
     return [
         (l_start, l_end)
         for l_start, l_end in cached_loops
@@ -1204,9 +1217,10 @@ def _get_scope_try_and_with_blocks(
     scope_node: ast.AST,
 ) -> List[ast.AST]:
     """Caches all Try, TryStar, With, and AsyncWith blocks within scope."""
-    cached = getattr(scope_node, "_pydh_try_with_blocks", None)
-    if isinstance(cached, list):
-        return cached
+    with _downstream_cache_lock:
+        cached = getattr(scope_node, "_pydh_try_with_blocks", None)
+        if isinstance(cached, list):
+            return cached
     blocks: List[ast.AST] = []
     for node in ast.walk(scope_node):
         if (
@@ -1214,8 +1228,10 @@ def _get_scope_try_and_with_blocks(
             or type(node).__name__ == "TryStar"
         ):
             blocks.append(node)
-    setattr(scope_node, "_pydh_try_with_blocks", blocks)
+    with _downstream_cache_lock:
+        setattr(scope_node, "_pydh_try_with_blocks", blocks)
     return blocks
+
 
 
 class _StrictPostLineVisitor(_DownstreamReadVisitor):
@@ -1443,8 +1459,25 @@ def collect_downstream_read_names(
 
     if skip_pre_unit_closures:
         pre_unit_captured_reads: Set[str] = set()
+        potential_captures = _collect_pre_unit_closures(scope_node, u_start)
+        suppressed = (
+            (potential_captures & candidates)
+            if candidates is not None
+            else potential_captures
+        )
+        if suppressed:
+            logger.warning(
+                "Lenient closure mode active: suppressed pre-unit closure read capture "
+                "for variable(s) %s in %s (lines %d-%d); escaping callback mutations "
+                "may be unobserved",
+                sorted(suppressed),
+                unit.get("file", ""),
+                u_start,
+                u_end,
+            )
     else:
         pre_unit_captured_reads = _collect_pre_unit_closures(scope_node, u_start)
+
 
     visitor = _DownstreamReadVisitor(
         u_start,
@@ -1500,8 +1533,14 @@ def _pair_clone_outputs(
     u2_outs: Sequence[str],
 ) -> List[Tuple[str, str]]:
     """Establishes an ordered 1-to-1 mapping between clone output variables."""
+    if isinstance(u1_outs, set) or isinstance(u2_outs, set):
+        logger.debug(
+            "Rejecting clone output pairing: set-valued outputs lack positional ordering"
+        )
+        return []
     u1_dedup = list(dict.fromkeys(u1_outs))
     u2_dedup = list(dict.fromkeys(u2_outs))
+
     if len(u1_dedup) != len(u2_dedup):
         logger.debug(
             "Rejecting clone output pairing: output arities differ (%d vs %d: %s vs %s)",
@@ -1649,7 +1688,14 @@ def _extract_effective_unit_outputs(
     """Extracts non-global, non-local outputs from precomputed unit dict or analyzed scope."""
     raw = unit.get("outputs")
     if isinstance(raw, set):
-        cands: Sequence[str] = sorted(raw)
+        if len(raw) > 1:
+            logger.debug(
+                "Rejecting set-valued outputs (%s): unordered set cannot establish "
+                "positional order",
+                raw,
+            )
+            return []
+        cands: Sequence[str] = list(raw)
     elif isinstance(raw, (list, tuple)):
         cands = list(raw)
     else:
@@ -1677,10 +1723,29 @@ def resolve_clone_generator_subroutine_outputs(
     Ensures necessity by analyzing downstream reads and enforces definite assignment
     before unit exit to prevent runtime UnboundLocalError at exhaustion.
     """
+    for u_chk, side_lbl in ((u1, "u1"), (u2, "u2")):
+        if "start" in u_chk or "end" in u_chk:
+            if _get_valid_unit_bounds(u_chk) is None:
+                logger.debug(
+                    "Rejecting generator subroutine pair: invalid unit bounds on %s: %r",
+                    side_lbl,
+                    u_chk,
+                )
+                return None
+
+    if (isinstance(u1.get("outputs"), set) and len(u1.get("outputs", set())) > 1) or (
+        isinstance(u2.get("outputs"), set) and len(u2.get("outputs", set())) > 1
+    ):
+        logger.debug(
+            "Rejecting generator subroutine pair: set-valued outputs lack positional ordering"
+        )
+        return None
+
     is_precomputed = (
         isinstance(u1.get("outputs"), (list, tuple, set))
         and isinstance(u2.get("outputs"), (list, tuple, set))
     )
+
     if is_precomputed:
         outs1 = list(dict.fromkeys(_extract_effective_unit_outputs(u1, scope1)))
         outs2 = list(dict.fromkeys(_extract_effective_unit_outputs(u2, scope2)))
@@ -1755,7 +1820,8 @@ def resolve_clone_generator_subroutine_outputs(
                     side_idx + 1,
                 )
                 return None
-            u_s, u_e = resolve_unit_line_bounds(u_item)
+            u_s, u_e = _get_valid_unit_bounds(u_item) or (1, 1)
+
             if _enclosing_try_reads_outputs(scope_node, u_s, u_e, set(needed_outs)):
                 logger.debug(
                     "Rejecting generator subroutine pair: needed output(s) read in "

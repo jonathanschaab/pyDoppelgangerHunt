@@ -1686,9 +1686,11 @@ def test_collect_downstream_read_names_malformed_coordinates() -> None:
     assert collect_downstream_read_names("x = 1\n", {"start": "invalid"}) is None
 
 
-def test_extract_effective_unit_outputs_set_normalized_sorted() -> None:
-    """Verifies that set outputs are normalized to a deterministic sorted list."""
-    assert _extract_effective_unit_outputs({"outputs": {"z", "a", "m"}}, {}) == ["a", "m", "z"]
+def test_extract_effective_unit_outputs_set_handling() -> None:
+    """Verifies that multi-item set outputs are rejected to prevent unpositional pairing,
+    while single-item sets are supported."""
+    assert _extract_effective_unit_outputs({"outputs": {"z", "a", "m"}}, {}) == []
+    assert _extract_effective_unit_outputs({"outputs": {"single"}}, {}) == ["single"]
 
 
 def test_collect_downstream_read_names_cache_isolation_on_content_change() -> None:
@@ -1717,8 +1719,9 @@ def test_load_unit_file_text_resilience_to_non_utf8_bytes(tmp_path: Path) -> Non
     assert _load_unit_file_text({"file": str(latin1_file)}, repo_root=None) is None
 
 
-def test_collect_downstream_read_names_cache_invalidation_on_mtime() -> None:
-    """Verifies that changing mtime creates distinct cache entries for downstream reads."""
+def test_collect_downstream_read_names_mtime_independent_cache_sharing() -> None:
+    """Verifies that differing mtimes for identical content share cache entries via digest
+    deduplication."""
     _clear_downstream_reads_cache()
     code = "def f():\n    x = 1\n    return x\n"
     unit1 = {"file": "f.py", "start": 2, "end": 2, "mtime": 100}
@@ -2275,3 +2278,83 @@ def outer():
     assert len(closures) == 1
     assert closures[0][0] == inner_func.lineno
     assert "x" in closures[0][1]
+
+
+def test_set_valued_outputs_inverting_semantic_order_rejected() -> None:
+    """Verifies that set-valued outputs whose alphabetical ordering would invert semantic
+    store order are rejected to prevent unpositional pairing."""
+    # Semantic store order: side 1 stores (total, count), side 2 stores (sum_val, n_val)
+    # Alphabetical order: count < total, n_val < sum_val
+    outs1 = {"total", "count"}
+    outs2 = {"sum_val", "n_val"}
+
+    # 1. Direct output pairing rejects sets
+    assert _pair_clone_outputs(outs1, outs2) == []  # type: ignore[arg-type]
+
+    # 2. Generator subroutine resolution rejects set-valued outputs with len > 1
+    u1 = {"file": "m1.py", "start": 2, "end": 4, "outputs": outs1}
+    u2 = {"file": "m2.py", "start": 2, "end": 4, "outputs": outs2}
+    s1 = {"definite_stores": ["total", "count"], "inputs": []}
+    s2 = {"definite_stores": ["sum_val", "n_val"], "inputs": []}
+    res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
+    assert res is None
+
+    # 3. Helper synthesis fails closed on multi-item set outputs
+    assert synthesize_shared_helper_code(u1, u2) == ""
+
+
+def test_resolve_clone_generator_subroutine_outputs_side2_zero_coords_rejected() -> None:
+    """Verifies that resolve_clone_generator_subroutine_outputs rejects when side 1 has clean
+    coordinates but side 2 has (0, 0) coordinates."""
+    code1 = (
+        "try:\n"
+        "    for x in range(10):\n"
+        "        yield x\n"
+        "finally:\n"
+        "    cleanup = total\n"
+    )
+    code2 = (
+        "try:\n"
+        "    for y in range(10):\n"
+        "        yield y\n"
+        "finally:\n"
+        "    cleanup = count\n"
+    )
+    # Side 1 is clean and valid (lines 2-3)
+    u1 = {
+        "file": "mod1.py",
+        "start": 2,
+        "end": 3,
+        "source_text": code1,
+        "outputs": ["total"],
+    }
+    # Side 2 has invalid zero coordinates (0, 0)
+    u2 = {
+        "file": "mod2.py",
+        "start": 0,
+        "end": 0,
+        "source_text": code2,
+        "outputs": ["count"],
+    }
+    s1 = {"definite_stores": ["total"], "inputs": []}
+    s2 = {"definite_stores": ["count"], "inputs": []}
+    res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
+    assert res is None
+
+
+def test_collect_downstream_read_names_wrong_source_digest_isolation() -> None:
+    """Verifies that a caller-supplied wrong or colliding source_digest does not cause stale
+    cache sharing across differing source texts."""
+    _clear_downstream_reads_cache()
+    code1 = "def f():\n    var_a = 1\n    return var_a\n"
+    code2 = "def f():\n    var_b = 2\n    return var_b\n"
+    unit1 = {"file": "mod.py", "start": 2, "end": 2}
+    unit2 = {"file": "mod.py", "start": 2, "end": 2}
+
+    # Both calls supply the same source_digest, but have different source_text
+    reads1 = collect_downstream_read_names(code1, unit1, source_digest="colliding_digest")
+    reads2 = collect_downstream_read_names(code2, unit2, source_digest="colliding_digest")
+
+    assert reads1 == {"var_a"}
+    assert reads2 == {"var_b"}
+

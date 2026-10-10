@@ -266,14 +266,18 @@ def _unwrap_iterable_item_type(type_str: str) -> Optional[str]:
             return unique_types[0]
         return f"Union[{', '.join(unique_types)}]"
 
-    target_t = norm_t[len("typing.") :] if norm_t.startswith("typing.") else norm_t
+    target_t = norm_t
+    for pfx in ("typing.", "collections.abc.", "collections."):
+        if target_t.startswith(pfx):
+            target_t = target_t[len(pfx) :]
+            break
     prefixes = (
         "Iterator[", "Iterable[", "Generator[", "List[", "Sequence[", "Set[",
         "Tuple[", "Dict[", "Collection[", "Mapping[", "MutableMapping[",
         "DefaultDict[", "OrderedDict[", "list[", "set[", "tuple[", "dict[",
-        "sequence[", "iterable[", "iterator[", "generator[", "mapping[",
-        "mutablemapping[", "defaultdict[", "ordereddict[",
+        "defaultdict[",
     )
+
     for prefix in prefixes:
         if target_t.startswith(prefix) and target_t.endswith("]"):
             parts = _split_type_args(target_t)
@@ -489,6 +493,17 @@ def _format_helper_parameters(
     return params
 
 
+def _wrap_conditional_optional(type_str: str, is_conditional: bool) -> str:
+    """Wraps type annotation in Optional if conditionally assigned and None is absent."""
+    if (
+        is_conditional
+        and not type_str.startswith("Optional[")
+        and not re.search(r"\bNone\b", type_str)
+    ):
+        return f"Optional[{type_str}]"
+    return type_str
+
+
 def _infer_outputs_return_type(
     helper_outputs: List[str],
     conditional_outs: Set[str],
@@ -511,9 +526,7 @@ def _infer_outputs_return_type(
             t_merged = _merge_types(t1, t2, type_merge_strategy)
             u2_var = outputs2[idx] if (outputs2 and idx < len(outputs2)) else out_var
             is_conditional = (out_var in conditional_outs) or (u2_var in conditional_outs)
-            if is_conditional:
-                if not t_merged.startswith("Optional[") and "None" not in t_merged:
-                    t_merged = f"Optional[{t_merged}]"
+            t_merged = _wrap_conditional_optional(t_merged, is_conditional)
             out_types.append(_normalize_pipe_unions(t_merged))
         return f"Tuple[{', '.join(out_types)}]"
 
@@ -539,13 +552,7 @@ def _infer_outputs_return_type(
         return_type = out_t if out_t != "Any" else fallback
         u2_var = outputs2[0] if (outputs2 and len(outputs2) >= 1) else out_var
         is_conditional = (out_var in conditional_outs) or (u2_var in conditional_outs)
-        if is_conditional:
-            if (
-                not return_type.startswith("Optional[")
-                and "None" not in return_type
-                and return_type != "None"
-            ):
-                return_type = f"Optional[{return_type}]"
+        return_type = _wrap_conditional_optional(return_type, is_conditional)
         return _normalize_pipe_unions(return_type)
 
     return None
@@ -973,11 +980,16 @@ def synthesize_shared_helper_code(
     if is_sub1 != is_sub2:
         return ""
     is_sub = is_sub1
-
     _, effective_skip_closures = resolve_closure_strictness_mode(
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
     )
+
+    for u_chk in (u1, u2):
+        for out_key in ("outputs", "precomputed_outputs"):
+            v = u_chk.get(out_key)
+            if isinstance(v, set) and len(v) > 1:
+                return ""
 
     if has_yield and is_sub:
         resolved_sub_outs = resolve_clone_generator_subroutine_outputs(

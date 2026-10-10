@@ -1541,8 +1541,8 @@ def test_dispatch_analyze_unit_variable_scope_mock_fallback() -> None:
 
 
 def test_inspect_unit_scope_deterministic_set_outputs() -> None:
-    """Verifies that analyze_unit_variable_scope deterministically sorts outputs
-    provided as a set on subroutine units."""
+    """Verifies that analyze_unit_variable_scope rejects multi-item sets to prevent
+    unpositional output pairing, while single-item sets are supported."""
     code = (
         "def worker():\n"
         "    for i in range(10):\n"
@@ -1560,7 +1560,8 @@ def test_inspect_unit_scope_deterministic_set_outputs() -> None:
         "source_text": code,
     }
     scope = analyze_unit_variable_scope(u_sub, tree1=tree)
-    assert scope["outputs"] == ["a", "b", "m", "z"]
+    # Multi-item set outputs fail closed to empty list
+    assert scope["outputs"] == []
 
     u_sub2 = {
         "file": "test_mod.py",
@@ -1571,5 +1572,59 @@ def test_inspect_unit_scope_deterministic_set_outputs() -> None:
         "source_text": code,
     }
     scope2 = analyze_unit_variable_scope(u_sub2, tree1=tree)
-    assert scope2["outputs"] == ["a", "b", "m", "z"]
+    assert scope2["outputs"] == []
+
+    u_sub_single = {
+        "file": "test_mod.py",
+        "start": 2,
+        "end": 5,
+        "kind": "compound_block",
+        "outputs": {"single_var"},
+        "source_text": code,
+    }
+    scope_single = analyze_unit_variable_scope(u_sub_single, tree1=tree)
+    assert scope_single["outputs"] == ["single_var"]
+
+
+def test_nested_generator_yield_assignment_does_not_mark_outer_unit() -> None:
+    """Verifies that an inner/nested generator containing 'x = yield' does not mark
+    has_yield_assignment on the outer unit."""
+    code = (
+        "def outer():\n"
+        "    def inner():\n"
+        "        val = yield 42\n"
+        "        return val\n"
+        "    return inner\n"
+    )
+    tree = ast.parse(code)
+    unit = {
+        "file": "test_mod.py",
+        "start": 1,
+        "end": 5,
+        "kind": "function",
+        "name": "outer",
+        "source_text": code,
+    }
+    scope = analyze_unit_variable_scope(unit, tree1=tree)
+    assert scope.get("has_yield_assignment") is False
+    assert scope.get("has_yield") is False
+
+    # Also test that 'yield from' return assignment does not trigger has_yield_assignment
+    code_sub = (
+        "def run():\n"
+        "    def sub_gen():\n"
+        "        received = yield 10\n"
+        "        return received\n"
+        "    y = yield from sub_gen()\n"
+    )
+    tree_sub = ast.parse(code_sub)
+    u_sub = {
+        "file": "test_mod.py",
+        "start": 2,
+        "end": 5,
+        "kind": "compound_block",
+        "source_text": code_sub,
+    }
+    scope_sub = analyze_unit_variable_scope(u_sub, tree1=tree_sub)
+    assert scope_sub.get("has_yield_assignment") is False
 
