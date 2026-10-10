@@ -23,7 +23,6 @@ from typing import (
     TypeVar,
     Union,
 )
-import weakref
 
 from pydoppelgangerhunt.config import resolve_closure_strictness_mode
 from pydoppelgangerhunt.source_lines import (
@@ -44,6 +43,7 @@ __all__ = [
     "is_async_generator_with_return_value",
     "is_subroutine_unit",
     "resolve_clone_generator_subroutine_outputs",
+    "resolve_clone_pair_outputs",
     "resolve_closure_strictness_mode",
     "resolve_generator_subroutine_outputs",
 ]
@@ -52,46 +52,41 @@ _CacheValT = TypeVar("_CacheValT")
 
 _downstream_cache_lock: threading.Lock = threading.Lock()
 _MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
+_MAX_SCOPE_CACHE_SIZE: int = 1024
 _downstream_reads_cache: OrderedDict[Tuple[Any, ...], frozenset[str]] = OrderedDict()
 
-_scope_parent_maps: weakref.WeakKeyDictionary[ast.AST, Dict[ast.AST, ast.AST]] = (
-    weakref.WeakKeyDictionary()
-)
-_scope_stmts_by_end: weakref.WeakKeyDictionary[ast.AST, Dict[int, List[ast.stmt]]] = (
-    weakref.WeakKeyDictionary()
-)
-_scope_closures_cache: weakref.WeakKeyDictionary[ast.AST, List[Tuple[int, Set[str]]]] = (
-    weakref.WeakKeyDictionary()
-)
-_scope_loops_cache: weakref.WeakKeyDictionary[ast.AST, List[Tuple[int, int]]] = (
-    weakref.WeakKeyDictionary()
-)
-_scope_try_with_cache: weakref.WeakKeyDictionary[ast.AST, List[ast.AST]] = (
-    weakref.WeakKeyDictionary()
-)
+_scope_parent_maps: OrderedDict[ast.AST, Dict[ast.AST, ast.AST]] = OrderedDict()
+_scope_stmts_by_end: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
+_scope_closures_cache: OrderedDict[ast.AST, List[Tuple[int, Set[str]]]] = OrderedDict()
+_scope_loops_cache: OrderedDict[ast.AST, List[Tuple[int, int]]] = OrderedDict()
+_scope_try_with_cache: OrderedDict[ast.AST, List[ast.AST]] = OrderedDict()
+_warned_lenient_closure: List[bool] = [False]
 
 
 def _get_or_compute_scope_cached(
-    cache: weakref.WeakKeyDictionary[ast.AST, _CacheValT],
+    cache: OrderedDict[ast.AST, _CacheValT],
     scope_node: ast.AST,
     compute_fn: Callable[[], _CacheValT],
 ) -> _CacheValT:
     """Retrieves cached scope metadata or computes, caches, and returns it thread-safely."""
-    with _downstream_cache_lock:
-        try:
-            cached = cache.get(scope_node)
-            if cached is not None:
-                return cached
-        except TypeError:
-            pass
+    try:
+        with _downstream_cache_lock:
+            if scope_node in cache:
+                cache.move_to_end(scope_node)
+                return cache[scope_node]
+    except TypeError:
+        return compute_fn()
 
     computed = compute_fn()
 
-    with _downstream_cache_lock:
-        try:
+    try:
+        with _downstream_cache_lock:
+            if scope_node not in cache and len(cache) >= _MAX_SCOPE_CACHE_SIZE:
+                cache.popitem(last=False)
             cache[scope_node] = computed
-        except TypeError:
-            pass
+            cache.move_to_end(scope_node)
+    except TypeError:
+        pass
 
     return computed
 
@@ -174,25 +169,22 @@ def _extract_first_unit_coord(
     return None
 
 
+_SUBROUTINE_KINDS: frozenset[str] = frozenset(
+    {"compound_block", "sliding_window", "clause_branch"}
+)
+
+
 def is_subroutine_unit(unit: Dict[str, Any]) -> bool:
     """Checks whether an AST code unit is a subroutine block rather than a whole function.
 
     Classification Rules:
     1. Explicit 'is_subroutine' boolean in unit takes precedence if present.
     2. Known subroutine kinds ('compound_block', 'sliding_window', 'clause_branch') return True.
-    3. Whole-callable or expression kinds ('function', 'closure', 'method', 'comprehension',
-       'complex_expr') return False.
-    4. Name heuristic fallback: when 'kind' is unspecified or unrecognized, units whose 'name'
-       contains ':' (e.g. 'fn:for#1' or 'process:if') are classified as subroutine blocks.
+    3. All other kinds or unspecified kinds return False.
     """
     if "is_subroutine" in unit and unit.get("is_subroutine") is not None:
         return bool(unit["is_subroutine"])
-    unit_kind = str(unit.get("kind") or "")
-    if unit_kind in ("compound_block", "sliding_window", "clause_branch"):
-        return True
-    if unit_kind in ("function", "closure", "method", "comprehension", "complex_expr"):
-        return False
-    return ":" in str(unit.get("name") or "")
+    return str(unit.get("kind") or "") in _SUBROUTINE_KINDS
 
 
 def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
@@ -263,17 +255,20 @@ def _resolve_unit_ast_end_col(
         return None
 
     inner_stmts.sort(key=lambda s: getattr(s, "col_offset", 0))
-    if u_start == u_end:
+    if len(inner_stmts) == 1:
+        target_stmt = inner_stmts[0]
+    elif u_start == u_end:
         start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
         if start_col is not None:
             matched = [s for s in inner_stmts if getattr(s, "col_offset", 0) >= start_col]
-            target_stmt = matched[0] if matched else inner_stmts[0]
-        elif is_subroutine_unit(unit):
-            target_stmt = inner_stmts[-1]
+            if len(matched) == 1:
+                target_stmt = matched[0]
+            else:
+                return None
         else:
-            target_stmt = inner_stmts[0]
+            return None
     else:
-        target_stmt = inner_stmts[-1]
+        return None
 
     end_col = getattr(target_stmt, "end_col_offset", None)
     if end_col is None:
@@ -1545,10 +1540,16 @@ def collect_downstream_read_names(
             else potential_captures
         )
         if suppressed:
-            logger.warning(
-                "Lenient closure mode active: suppressed pre-unit closure read capture "
-                "for variable(s) %s in %s (lines %d-%d); escaping callback mutations "
-                "may be unobserved",
+            with _downstream_cache_lock:
+                if not _warned_lenient_closure[0]:
+                    _warned_lenient_closure[0] = True
+                    logger.warning(
+                        "Lenient closure mode active: suppressed pre-unit closure read capture; "
+                        "escaping callback mutations may be unobserved"
+                    )
+            logger.debug(
+                "Lenient closure mode suppressed pre-unit closure read capture "
+                "for variable(s) %s in %s (lines %d-%d)",
                 sorted(suppressed),
                 unit.get("file", ""),
                 u_start,
@@ -1727,7 +1728,7 @@ def resolve_generator_subroutine_outputs(
     )
 
 
-def is_async_generator_with_return_value(
+def has_async_generator_delegation_hazard(
     *scopes: Optional[Dict[str, Any]],
     has_outputs: bool = False,
 ) -> bool:
@@ -1760,7 +1761,7 @@ def is_async_generator_with_return_value(
     return False
 
 
-has_async_generator_delegation_hazard = is_async_generator_with_return_value
+is_async_generator_with_return_value = has_async_generator_delegation_hazard
 
 
 def _extract_effective_unit_outputs(
@@ -1894,14 +1895,17 @@ def resolve_clone_generator_subroutine_outputs(
                 )
                 return None
             scope_node = _resolve_downstream_scope_node(s_text or "", u_item, tr)
-            if scope_node is None:
+            bounds = _get_valid_unit_bounds(u_item)
+            if scope_node is None or bounds is None:
                 logger.debug(
-                    "Rejecting generator subroutine pair: could not resolve scope AST to "
-                    "verify enclosing try cleanup for unit %s",
+                    "Rejecting generator subroutine pair: could not resolve scope AST "
+                    "or valid bounds for unit %s (scope=%s, bounds=%s)",
                     side_idx + 1,
+                    scope_node is not None,
+                    bounds is not None,
                 )
                 return None
-            u_s, u_e = _get_valid_unit_bounds(u_item) or (1, 1)
+            u_s, u_e = bounds
 
             if _enclosing_try_reads_outputs(scope_node, u_s, u_e, set(needed_outs)):
                 logger.debug(
@@ -1922,3 +1926,100 @@ def resolve_clone_generator_subroutine_outputs(
                     return None
 
     return resolved
+
+
+def resolve_clone_pair_outputs(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    scope1: Dict[str, Any],
+    scope2: Dict[str, Any],
+    source_text1: Optional[str] = None,
+    source_text2: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
+    repo_root: Optional[str] = None,
+    skip_pre_unit_closures: bool = False,
+    source_digest1: Optional[str] = None,
+    source_digest2: Optional[str] = None,
+    closure_strictness: Optional[str] = None,
+    require_pairing: Optional[bool] = None,
+) -> Optional[Tuple[List[str], List[str]]]:
+    """Resolves output variable bindings between two clone units, enforcing
+    strict positional pairing and generator subroutine safety.
+
+    Returns:
+        (outputs1, outputs2) tuple of paired output names, or None if pairing
+        fails or safety invariants are violated.
+    """
+    is_sub1 = is_subroutine_unit(u1)
+    is_sub2 = is_subroutine_unit(u2)
+    if is_sub1 != is_sub2:
+        logger.debug(
+            "Rejecting clone pair output resolution: mismatched subroutine kinds "
+            "(is_sub1=%s, is_sub2=%s)",
+            is_sub1,
+            is_sub2,
+        )
+        return None
+    is_sub = is_sub1
+
+    has_precomputed = (
+        "outputs" in u1
+        and isinstance(u1["outputs"], (list, tuple, set))
+        and "outputs" in u2
+        and isinstance(u2["outputs"], (list, tuple, set))
+    )
+    strict_pairing = (is_sub or has_precomputed) if require_pairing is None else require_pairing
+
+    for u_chk in (u1, u2):
+        for out_key in ("outputs", "precomputed_outputs"):
+            v = u_chk.get(out_key)
+            if isinstance(v, set) and len(v) > 1:
+                logger.debug(
+                    "Rejecting clone pair output resolution: set-valued outputs "
+                    "lack positional ordering"
+                )
+                return None
+
+    _, effective_skip_closures = resolve_closure_strictness_mode(
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+    )
+
+    has_yield = bool(scope1.get("has_yield") or scope2.get("has_yield"))
+    if is_sub and has_yield:
+        return resolve_clone_generator_subroutine_outputs(
+            u1=u1,
+            u2=u2,
+            scope1=scope1,
+            scope2=scope2,
+            source_text1=source_text1,
+            source_text2=source_text2,
+            tree1=tree1,
+            tree2=tree2,
+            repo_root=repo_root,
+            skip_pre_unit_closures=effective_skip_closures,
+            source_digest1=source_digest1,
+            source_digest2=source_digest2,
+        )
+
+    outs1 = _extract_effective_unit_outputs(u1, scope1)
+    outs2 = _extract_effective_unit_outputs(u2, scope2)
+    if not outs1 and not outs2:
+        return [], []
+
+    pairs = _pair_clone_outputs(outs1, outs2)
+    if len(pairs) == len(outs1) == len(outs2):
+        return [p[0] for p in pairs], [p[1] for p in pairs]
+
+    if not strict_pairing:
+        return outs1, outs2
+
+    logger.debug(
+        "Rejecting clone pair output resolution: outputs could not be paired "
+        "(outs1=%s, outs2=%s, pairs=%s)",
+        outs1,
+        outs2,
+        pairs,
+    )
+    return None

@@ -10,9 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.config import normalize_path_string, paths_match_boundary
 from pydoppelgangerhunt.fixer.dataflow import _load_unit_file_text
-from pydoppelgangerhunt.fixer.scope import (
-    dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
-)
+from pydoppelgangerhunt.fixer.scope import analyze_unit_variable_scope
 from pydoppelgangerhunt.fixer.source import (
     _find_innermost_enclosing_node,
     split_source_lines,
@@ -20,20 +18,6 @@ from pydoppelgangerhunt.fixer.source import (
 from pydoppelgangerhunt.parser import is_decorator_named
 
 __all__ = [
-    "_base_unit_name",
-    "_extract_child_indentation",
-    "_find_innermost_enclosing_node",
-    "_get_enclosing_receiver_kind",
-    "_has_receiver_reference",
-    "_inspect_enclosing_node",
-    "_is_method_of_class",
-    "_is_same_file_path",
-    "_load_unit_file_text",
-    "_normalize_file_path",
-    "_populate_unit_receiver_metadata",
-    "_prune_unshared_receivers",
-    "_resolve_effective_binding",
-    "analyze_unit_variable_scope",
     "find_enclosing_class",
     "find_enclosing_function",
 ]

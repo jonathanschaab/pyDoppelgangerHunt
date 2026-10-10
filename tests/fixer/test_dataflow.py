@@ -700,20 +700,26 @@ def test_downstream_read_visitor_reaching_definitions_reassigned_variable() -> N
 
 
 def test_same_line_unit_boundaries_semicolon_downstream_resolution() -> None:
-    """Verifies that same-line units without column offsets correctly resolve downstream statements after semicolons."""
+    """Verifies that same-line units without column offsets fail closed and treat
+    same-line statements as downstream when end column is ambiguous."""
 
     code = (
         "def runner():\n"
         "    yield x; print(total)\n"
     )
-    # Unit on line 2 with NO start_col or end_col
+    # Unit on line 2 with NO start_col or end_col: fails closed and treats same-line reads as downstream
     unit = {"start": 2, "end": 2}
     reads = collect_downstream_read_names(code, unit, candidates={"total", "x"})
     assert reads is not None
-    # total is downstream of yield x on the same line
     assert "total" in reads
-    # x is inside the unit, so it should NOT be reported as a downstream read
-    assert "x" not in reads
+    assert "x" in reads
+
+    # When start_col / end_col are provided, disambiguation distinguishes in-unit vs downstream reads
+    unit_col = {"start": 2, "end": 2, "start_col": 4, "end_col": 11}
+    reads_col = collect_downstream_read_names(code, unit_col, candidates={"total", "x"})
+    assert reads_col is not None
+    assert "total" in reads_col
+    assert "x" not in reads_col
 
 
 def test_downstream_read_visitor_try_except_else_kills() -> None:
@@ -910,8 +916,18 @@ def test_resolve_clone_generator_subroutine_outputs_precomputed_and_fallback(
 ) -> None:
     """Verifies generator subroutine output resolution with precomputed outputs and fallback."""
     # Case 1: Precomputed outputs present on u1 and u2
-    u1_pre = {"outputs": ["a", "b"], "source_text": "def f():\n    a = 1\n"}
-    u2_pre = {"outputs": ["x", "y"], "source_text": "def g():\n    x = 1\n"}
+    u1_pre = {
+        "outputs": ["a", "b"],
+        "source_text": "def f():\n    a = 1\n    print(a)\n",
+        "start": 2,
+        "end": 2,
+    }
+    u2_pre = {
+        "outputs": ["x", "y"],
+        "source_text": "def g():\n    x = 1\n    print(x)\n",
+        "start": 2,
+        "end": 2,
+    }
     s1 = {"definite_stores": ["a"], "globals": ["b"], "nonlocals": []}
     s2 = {"definite_stores": ["x"], "globals": [], "nonlocals": ["y"]}
     res = resolve_clone_generator_subroutine_outputs(u1_pre, u2_pre, s1, s2)
@@ -1783,8 +1799,18 @@ def test_collect_downstream_read_names_no_disk_stat_call() -> None:
 
 def test_resolve_clone_generator_subroutine_outputs_precomputed_definite_stores() -> None:
     """Verifies precomputed outputs are validated against definite stores when available."""
-    u1 = {"outputs": ["x", "unassigned"], "source_text": "def f():\n    x = 1\n"}
-    u2 = {"outputs": ["a", "b"], "source_text": "def g():\n    a = 1\n"}
+    u1 = {
+        "outputs": ["x", "unassigned"],
+        "source_text": "def f():\n    x = 1\n    print(x, unassigned)\n",
+        "start": 2,
+        "end": 2,
+    }
+    u2 = {
+        "outputs": ["a", "b"],
+        "source_text": "def g():\n    a = 1\n    print(a, b)\n",
+        "start": 2,
+        "end": 2,
+    }
     # Scope 1 only definitely assigns x, leaving unassigned lacking definite store
     s1 = {"definite_stores": ["x"], "inputs": []}
     s2 = {"definite_stores": ["a", "b"], "inputs": []}
@@ -2429,18 +2455,34 @@ def test_scope_metadata_caching_and_cache_clear() -> None:
     assert func_node not in _scope_try_with_cache
 
 
-def test_scope_metadata_caching_non_weakref_object_fallback() -> None:
-    """Verifies that non-weakreferenceable objects fall back without raising TypeError."""
-    import weakref  # pylint: disable=import-outside-toplevel
+def test_scope_metadata_caching_unhashable_object_fallback() -> None:
+    """Verifies that unhashable objects fall back gracefully without raising TypeError."""
+    from collections import OrderedDict  # pylint: disable=import-outside-toplevel
 
-    class _MockNonWeakNode(ast.AST):
-        __slots__ = ()
+    class _MockUnhashableNode(ast.AST):
+        __hash__ = None  # type: ignore[assignment]
 
-    node = _MockNonWeakNode()
-    cache: weakref.WeakKeyDictionary[ast.AST, str] = weakref.WeakKeyDictionary()
+    node = _MockUnhashableNode()
+    cache: OrderedDict[ast.AST, str] = OrderedDict()
 
     result = _get_or_compute_scope_cached(cache, node, lambda: "computed_val")
     assert result == "computed_val"
+    assert len(cache) == 0
+
+
+def test_scope_metadata_caching_lru_eviction() -> None:
+    """Verifies that scope cache evicts oldest entries when capacity is exceeded."""
+    from collections import OrderedDict  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.dataflow import _MAX_SCOPE_CACHE_SIZE
+
+    cache: OrderedDict[ast.AST, str] = OrderedDict()
+    nodes = [ast.Pass() for _ in range(_MAX_SCOPE_CACHE_SIZE + 5)]
+    for idx, n in enumerate(nodes):
+        val_str = f"val_{idx}"
+        _get_or_compute_scope_cached(cache, n, lambda: val_str)
+    assert len(cache) == _MAX_SCOPE_CACHE_SIZE
+    assert nodes[0] not in cache
+    assert nodes[-1] in cache
 
 
 def test_extract_nested_scope_free_reads_generator_shadowed_builtin() -> None:
@@ -2494,6 +2536,43 @@ def test_stmts_enclose_unit_synthetic_or_unlocated_nodes() -> None:
     assert _stmts_enclose_unit(stmts, 11, 14)
     # Sequence of only synthetic statements with no lineno
     assert not _stmts_enclose_unit([synthetic], 1, 5)
+
+
+def test_resolve_clone_pair_outputs_clean_pair() -> None:
+    """Verifies that resolve_clone_pair_outputs successfully pairs matching outputs."""
+    from pydoppelgangerhunt.fixer.dataflow import resolve_clone_pair_outputs
+
+    u1 = {"kind": "function", "outputs": ["a", "b"]}
+    u2 = {"kind": "function", "outputs": ["x", "y"]}
+    s1: Dict[str, Any] = {"inputs": [], "definite_stores": ["a", "b"]}
+    s2: Dict[str, Any] = {"inputs": [], "definite_stores": ["x", "y"]}
+
+    res = resolve_clone_pair_outputs(u1, u2, s1, s2)
+    assert res == (["a", "b"], ["x", "y"])
+
+
+def test_resolve_clone_pair_outputs_mismatched_subroutine_kinds() -> None:
+    """Verifies that resolve_clone_pair_outputs rejects mismatched subroutine kinds."""
+    from pydoppelgangerhunt.fixer.dataflow import resolve_clone_pair_outputs
+
+    u1 = {"kind": "compound_block"}
+    u2 = {"kind": "function"}
+    s1: Dict[str, Any] = {"inputs": []}
+    s2: Dict[str, Any] = {"inputs": []}
+
+    assert resolve_clone_pair_outputs(u1, u2, s1, s2) is None
+
+
+def test_resolve_clone_pair_outputs_set_valued_rejection() -> None:
+    """Verifies that resolve_clone_pair_outputs rejects set-valued outputs with multiple items."""
+    from pydoppelgangerhunt.fixer.dataflow import resolve_clone_pair_outputs
+
+    u1 = {"kind": "function", "outputs": {"a", "b"}}
+    u2 = {"kind": "function", "outputs": ["x", "y"]}
+    s1: Dict[str, Any] = {"inputs": []}
+    s2: Dict[str, Any] = {"inputs": []}
+
+    assert resolve_clone_pair_outputs(u1, u2, s1, s2) is None
 
 
 

@@ -1511,33 +1511,17 @@ def test_scope_inspection_custom_receiver_attributes(tmp_path: Path) -> None:
     assert s_cls["inputs"][0] == "klass"
 
 
-def test_dispatch_analyze_unit_variable_scope_mock_fallback() -> None:
-    """Verifies that dispatch_analyze_unit_variable_scope falls back gracefully when patched."""
+def test_dispatch_analyze_unit_variable_scope_alias() -> None:
+    """Verifies that dispatch functions are direct aliases without dynamic overhead."""
     from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        analyze_unit_variable_scope,
         dispatch_analyze_unit_variable_scope,
+        dispatch_inspect_single_unit_scope,
+        inspect_single_unit_scope,
     )
 
-    u1 = {"file": "mod.py", "start": 1, "end": 2}
-
-    # 1. Default dispatch invokes analyze_unit_variable_scope directly
-    res_default = dispatch_analyze_unit_variable_scope(u1)
-    assert isinstance(res_default, dict)
-
-    # 2. Mock that only accepts (u1, u2=None, repo_root=None) without tree1/tree2
-    def mock_legacy_scope(unit1: Any, u2: Any = None, repo_root: Any = None) -> Dict[str, Any]:
-        return {"mocked": True, "unit": unit1}
-
-    with mock.patch("pydoppelgangerhunt.fixer.analyze_unit_variable_scope", mock_legacy_scope):
-        res_mock = dispatch_analyze_unit_variable_scope(u1, tree1=ast.parse("x = 1\n"))
-        assert res_mock == {"mocked": True, "unit": u1}
-
-    # 3. Target accepts tree1 but raises TypeError internally; must not be swallowed
-    def mock_raising_scope(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-        raise TypeError("tree1 parameter has an unexpected invalid type")
-
-    with mock.patch("pydoppelgangerhunt.fixer.analyze_unit_variable_scope", mock_raising_scope):
-        with pytest.raises(TypeError, match="tree1 parameter has an unexpected invalid type"):
-            dispatch_analyze_unit_variable_scope(u1, tree1=ast.parse("x = 1\n"))
+    assert dispatch_analyze_unit_variable_scope is analyze_unit_variable_scope
+    assert dispatch_inspect_single_unit_scope is inspect_single_unit_scope
 
 
 def test_inspect_unit_scope_deterministic_set_outputs() -> None:

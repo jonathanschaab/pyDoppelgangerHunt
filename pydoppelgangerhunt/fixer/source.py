@@ -54,10 +54,13 @@ _resolve_safe_unit_file_path = resolve_safe_unit_file_path
 def is_valid_unit_coordinates(u: Any, strict: bool = False) -> bool:
     """Verifies that an AST unit dictionary has valid integer coordinates.
 
-    In strict mode (for code refactoring and patching), both start and end
-    are required and must parse strictly to positive integers (rejecting floats, colons,
-    and blank strings) with end >= start. End, start_col, and end_col must also parse
-    strictly if present, with end_col >= start_col if on the same line.
+    Note (Behavior Change): When strict=False, a positive start coordinate
+    (start > 0) is required, and inverted coordinates (end < start) are
+    rejected. In strict mode (for code refactoring and patching), both start
+    and end are required and must parse strictly to positive integers (rejecting
+    floats, colons, and blank strings) with end >= start. End, start_col, and
+    end_col must also parse strictly if present, with end_col >= start_col if on
+    the same line.
     """
     if not isinstance(u, dict):
         return False

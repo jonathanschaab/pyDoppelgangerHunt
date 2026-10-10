@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import ast
 import builtins
-import inspect
 import logging
-import sys
 import textwrap
 from typing import (
     Any,
@@ -18,7 +16,6 @@ from typing import (
     Set,
     Tuple,
     Union,
-    cast,
 )
 
 from pydoppelgangerhunt.reporters import extract_unit_source_code
@@ -1686,48 +1683,5 @@ def analyze_unit_variable_scope(
     }
 
 
-def _callable_supports_param(target: Any, param_name: str) -> bool:
-    """Checks whether a callable accepts param_name or **kwargs."""
-    try:
-        sig = inspect.signature(target)
-        return param_name in sig.parameters or any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-        )
-    except (ValueError, TypeError):
-        return False
-
-
-def dispatch_analyze_unit_variable_scope(
-    u1: Dict[str, Any],
-    u2: Optional[Dict[str, Any]] = None,
-    repo_root: Optional[str] = None,
-    tree1: Optional[ast.AST] = None,
-    tree2: Optional[ast.AST] = None,
-) -> Dict[str, Any]:
-    """Dispatches analyze_unit_variable_scope, honoring active mock patches on pydoppelgangerhunt.fixer."""
-    pkg = sys.modules.get("pydoppelgangerhunt.fixer")
-    target = getattr(pkg, "analyze_unit_variable_scope", analyze_unit_variable_scope)
-    if _callable_supports_param(target, "tree1"):
-        return target(u1, u2=u2, repo_root=repo_root, tree1=tree1, tree2=tree2)
-    return target(u1, u2=u2, repo_root=repo_root)
-
-
-def dispatch_inspect_single_unit_scope(
-    unit: Dict[str, Any],
-    repo_root: Optional[str] = None,
-    tree: Optional[ast.AST] = None,
-) -> Dict[str, Any]:
-    """Dispatches single-unit scope analysis, honoring mock patches on
-    inspect_single_unit_scope or analyze_unit_variable_scope."""
-    pkg = sys.modules.get("pydoppelgangerhunt.fixer")
-    target = getattr(pkg, "inspect_single_unit_scope", None)
-    if target is not None and target is not inspect_single_unit_scope:
-        if _callable_supports_param(target, "tree"):
-            return cast(Dict[str, Any], target(unit, repo_root=repo_root, tree=tree))
-        return cast(Dict[str, Any], target(unit, repo_root=repo_root))
-
-    analyze_target = getattr(pkg, "analyze_unit_variable_scope", None)
-    if analyze_target is not None and analyze_target is not analyze_unit_variable_scope:
-        return dispatch_analyze_unit_variable_scope(unit, repo_root=repo_root, tree1=tree)
-
-    return inspect_single_unit_scope(unit, repo_root=repo_root, tree=tree)
+dispatch_analyze_unit_variable_scope = analyze_unit_variable_scope
+dispatch_inspect_single_unit_scope = inspect_single_unit_scope

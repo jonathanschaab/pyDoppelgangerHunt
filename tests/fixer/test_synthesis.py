@@ -1658,8 +1658,12 @@ def test_is_subroutine_unit_classification() -> None:
     assert is_subroutine_unit({"kind": "comprehension"}) is False
     assert is_subroutine_unit({"kind": "complex_expr"}) is False
 
-    # Name-based fallback when kind is unspecified
-    assert is_subroutine_unit({"name": "process_module:10-25"}) is True
+    # Explicit is_subroutine flag takes precedence
+    assert is_subroutine_unit({"is_subroutine": True}) is True
+    assert is_subroutine_unit({"is_subroutine": False, "kind": "compound_block"}) is False
+
+    # Name-based heuristic is eliminated; returns False for unknown/unspecified kinds
+    assert is_subroutine_unit({"name": "process_module:10-25"}) is False
     assert is_subroutine_unit({"name": "plain_function"}) is False
     assert is_subroutine_unit({}) is False
 
@@ -2585,13 +2589,15 @@ def test_parse_candidates_def_precedes_async_def() -> None:
     from pydoppelgangerhunt.fixer.scope import _inspect_unit_scope
 
     unit = {
-        "text": "return 42\n",
+        "source_text": "return 42\n",
         "file": "test.py",
         "start": 1,
         "end": 1,
     }
     res = _inspect_unit_scope(unit)
     assert res is not None
+    assert res["is_async"] is False
+    assert res["has_return_value"] is True
 
 
 def test_unwrap_iterable_item_type_unions_and_iterables() -> None:

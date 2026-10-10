@@ -9,10 +9,7 @@ import textwrap
 import typing
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-from pydoppelgangerhunt.config import (
-    normalize_path_string,
-    resolve_closure_strictness_mode,
-)
+from pydoppelgangerhunt.config import normalize_path_string
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
@@ -23,17 +20,15 @@ from pydoppelgangerhunt.fixer.binding import (
     _resolve_effective_binding,
 )
 from pydoppelgangerhunt.fixer.dataflow import (
-    _extract_effective_unit_outputs,
     _load_unit_file_text,
-    _pair_clone_outputs,
-    is_async_generator_with_return_value,
-    resolve_clone_generator_subroutine_outputs,
+    has_async_generator_delegation_hazard,
+    resolve_clone_pair_outputs,
 )
 from pydoppelgangerhunt.fixer.scope import (
     _normalize_receiver_attrs,
     _rank_param_kind,
-    dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
-    dispatch_inspect_single_unit_scope as inspect_single_unit_scope,
+    analyze_unit_variable_scope,
+    inspect_single_unit_scope,
     is_subroutine_unit,
 )
 from pydoppelgangerhunt.fixer.source import (
@@ -746,6 +741,8 @@ def synthesize_shared_helper_code(
     tree2: Optional[ast.AST] = None,
     skip_pre_unit_closures: bool = False,
     closure_strictness: Optional[str] = None,
+    outputs: Optional[List[str]] = None,
+    outputs2: Optional[List[str]] = None,
 ) -> str:
     """Synthesizes a proposed shared helper function stub from two clone units.
 
@@ -770,6 +767,8 @@ def synthesize_shared_helper_code(
         skip_pre_unit_closures: Whether to bypass scanning pre-unit AST closures.
         closure_strictness: Closure isolation strictness ("strict" / "fail_closed" vs
             "lenient" / "fast" / "skip").
+        outputs: Optional pre-resolved output variable names for u1.
+        outputs2: Optional pre-resolved output variable names for u2.
     """
     u1 = dict(u1)
     u2 = dict(u2)
@@ -892,7 +891,7 @@ def synthesize_shared_helper_code(
         return ""
     if bool(scope1.get("has_yield")) != bool(scope2.get("has_yield")):
         return ""
-    if is_async_generator_with_return_value(scope1, scope2, scope):
+    if has_async_generator_delegation_hazard(scope1, scope2, scope):
         return ""
     if scope1.get("nonlocals") or scope2.get("nonlocals") or scope.get("nonlocals"):
         return ""
@@ -973,27 +972,16 @@ def synthesize_shared_helper_code(
     r1 = scope1.get("return_type")
     r2 = scope2.get("return_type")
     resolved_ret = _merge_types(r1, r2, type_merge_strategy)
-    has_yield = bool(
-        scope.get("has_yield") or scope1.get("has_yield") or scope2.get("has_yield")
-    )
     is_sub1 = is_subroutine_unit(u1)
     is_sub2 = is_subroutine_unit(u2)
     if is_sub1 != is_sub2:
         return ""
     is_sub = is_sub1
-    _, effective_skip_closures = resolve_closure_strictness_mode(
-        closure_strictness=closure_strictness,
-        skip_pre_unit_closures=skip_pre_unit_closures,
-    )
 
-    for u_chk in (u1, u2):
-        for out_key in ("outputs", "precomputed_outputs"):
-            v = u_chk.get(out_key)
-            if isinstance(v, set) and len(v) > 1:
-                return ""
-
-    if has_yield and is_sub:
-        resolved_sub_outs = resolve_clone_generator_subroutine_outputs(
+    if outputs is not None and outputs2 is not None:
+        outputs, u2_outs = list(outputs), list(outputs2)
+    else:
+        resolved_outs = resolve_clone_pair_outputs(
             u1=u1,
             u2=u2,
             scope1=scope1,
@@ -1003,31 +991,12 @@ def synthesize_shared_helper_code(
             tree1=tree1,
             tree2=tree2,
             repo_root=repo_root,
-            skip_pre_unit_closures=effective_skip_closures,
+            skip_pre_unit_closures=skip_pre_unit_closures,
+            closure_strictness=closure_strictness,
         )
-        if resolved_sub_outs is None:
+        if resolved_outs is None:
             return ""
-        outputs, u2_outs = resolved_sub_outs
-    elif (
-        "outputs" in u1
-        and isinstance(u1["outputs"], (list, tuple, set))
-        and "outputs" in u2
-        and isinstance(u2["outputs"], (list, tuple, set))
-    ):
-        outputs = _extract_effective_unit_outputs(u1, scope1)
-        u2_outs = _extract_effective_unit_outputs(u2, scope2)
-        pairs = _pair_clone_outputs(outputs, u2_outs)
-        if len(pairs) != len(outputs) or len(pairs) != len(u2_outs):
-            return ""
-        outputs = [p[0] for p in pairs]
-        u2_outs = [p[1] for p in pairs]
-    else:
-        outputs = _extract_effective_unit_outputs(u1, scope)
-        u2_outs = _extract_effective_unit_outputs(u2, scope2)
-        pairs = _pair_clone_outputs(outputs, u2_outs)
-        if len(pairs) == len(outputs) == len(u2_outs):
-            outputs = [p[0] for p in pairs]
-            u2_outs = [p[1] for p in pairs]
+        outputs, u2_outs = resolved_outs
 
     conditional_outs = set(scope.get("conditional_outputs", []))
     is_async = bool(scope.get("is_async", False))
@@ -1041,7 +1010,7 @@ def synthesize_shared_helper_code(
         and v not in scope.get("nonlocals", [])
     ]
 
-    if is_async_generator_with_return_value(
+    if has_async_generator_delegation_hazard(
         scope, scope1, scope2, has_outputs=bool(helper_outputs)
     ):
         return ""

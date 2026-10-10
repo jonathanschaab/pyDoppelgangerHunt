@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, TypedDict, Union
 
-from pydoppelgangerhunt.config import normalize_path_string
+from pydoppelgangerhunt.config import normalize_path_string, resolve_closure_strictness_mode
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
     _extract_child_indentation,
@@ -26,11 +26,8 @@ from pydoppelgangerhunt.fixer.binding import (
     find_enclosing_function,
 )
 from pydoppelgangerhunt.fixer.dataflow import (
-    _extract_effective_unit_outputs,
-    _pair_clone_outputs,
-    is_async_generator_with_return_value,
-    resolve_clone_generator_subroutine_outputs,
-    resolve_closure_strictness_mode,
+    has_async_generator_delegation_hazard,
+    resolve_clone_pair_outputs,
 )
 from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
@@ -48,8 +45,8 @@ from pydoppelgangerhunt.fixer.depgraph import (
 from pydoppelgangerhunt.fixer.scope import (
     _extract_arg_names,
     _normalize_receiver_attrs,
-    dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
-    dispatch_inspect_single_unit_scope as inspect_single_unit_scope,
+    analyze_unit_variable_scope,
+    inspect_single_unit_scope,
     is_subroutine_unit,
 )
 
@@ -2873,7 +2870,7 @@ def generate_refactoring_patch(
                 continue
             if bool(s1.get("has_yield")) != bool(s2.get("has_yield")):
                 continue
-            if is_async_generator_with_return_value(s1, s2):
+            if has_async_generator_delegation_hazard(s1, s2):
                 continue
             if s1.get("nonlocals") or s2.get("nonlocals"):
                 continue
@@ -2950,10 +2947,10 @@ def generate_refactoring_patch(
             )
             inputs = list(scope.get("inputs", []))
             if effective_binding == "module":
-                inputs = _prune_unshared_receivers(inputs, u1_eff, u2_eff, s1, s2, repo_root=str(root))
-            outputs = _extract_effective_unit_outputs(u1_eff, scope)
-            u1_outs = _extract_effective_unit_outputs(u1_eff, s1)
-            u2_outs = _extract_effective_unit_outputs(u2_eff, s2)
+                inputs = _prune_unshared_receivers(
+                    inputs, u1_eff, u2_eff, s1, s2, repo_root=str(root)
+                )
+
             is_sub1 = is_subroutine_unit(u1_eff)
             is_sub2 = is_subroutine_unit(u2_eff)
             if is_sub1 != is_sub2:
@@ -2966,72 +2963,41 @@ def generate_refactoring_patch(
                     is_sub2,
                 )
                 continue
-            is_sub = is_sub1
 
-            has_multi_set_outputs = any(
-                isinstance(u_chk.get(k), set) and len(u_chk[k]) > 1
-                for u_chk in (u1_eff, u2_eff)
-                for k in ("outputs", "precomputed_outputs")
+            resolved_outs = resolve_clone_pair_outputs(
+                u1=u1_eff,
+                u2=u2_eff,
+                scope1=s1,
+                scope2=s2,
+                source_text1=f1_plan.orig_text,
+                source_text2=f2_text,
+                tree1=tree1,
+                tree2=tree2,
+                repo_root=str(root),
+                skip_pre_unit_closures=effective_skip_closures,
+                source_digest1=digest1,
+                source_digest2=digest2,
+                require_pairing=replace_clones,
             )
-            if has_multi_set_outputs:
+            if resolved_outs is None:
                 logger.debug(
-                    "Skipping clone pair (%s, %s): set-valued outputs lack positional ordering",
+                    "Skipping clone pair (%s, %s): failed to resolve clone pair outputs "
+                    "(necessity, pairing, or definiteness check failed)",
                     u1.get("name"),
                     u2.get("name"),
                 )
                 continue
-
-            has_yield = bool(s1.get("has_yield") or s2.get("has_yield"))
-            if is_sub and has_yield:
-                resolved_sub_outs = resolve_clone_generator_subroutine_outputs(
-                    u1=u1_eff,
-                    u2=u2_eff,
-                    scope1=s1,
-                    scope2=s2,
-                    source_text1=f1_plan.orig_text,
-                    source_text2=f2_text,
-                    tree1=tree1,
-                    tree2=tree2,
-                    repo_root=str(root),
-                    skip_pre_unit_closures=effective_skip_closures,
-                    source_digest1=digest1,
-                    source_digest2=digest2,
+            outputs, target_outs2 = resolved_outs
+            if has_async_generator_delegation_hazard(
+                s1, s2, has_outputs=bool(outputs or target_outs2)
+            ):
+                logger.debug(
+                    "Skipping clone pair (%s, %s): async generator cannot return "
+                    "values or outputs",
+                    u1.get("name"),
+                    u2.get("name"),
                 )
-                if resolved_sub_outs is None:
-                    logger.debug(
-                        "Skipping clone pair (%s, %s): failed to resolve generator subroutine "
-                        "outputs (necessity or definiteness check failed)",
-                        u1.get("name"),
-                        u2.get("name"),
-                    )
-                    continue
-                outputs, target_outs2 = resolved_sub_outs
-                if is_async_generator_with_return_value(
-                    s1, s2, has_outputs=bool(outputs or target_outs2)
-                ):
-                    logger.debug(
-                        "Skipping clone pair (%s, %s): async generator cannot return "
-                        "values or outputs",
-                        u1.get("name"),
-                        u2.get("name"),
-                    )
-                    continue
-            else:
-                pairs = _pair_clone_outputs(outputs, u2_outs)
-                if replace_clones and (
-                    len(pairs) != len(outputs) or len(pairs) != len(u2_outs)
-                ):
-                    logger.debug(
-                        "Skipping clone pair (%s, %s): cannot pair subroutine outputs",
-                        u1.get("name"),
-                        u2.get("name"),
-                    )
-                    continue
-                target_outs2 = (
-                    [o2 for _, o2 in pairs]
-                    if len(pairs) == len(outputs)
-                    else outputs
-                )
+                continue
             u1_eff["outputs"] = outputs
             u2_eff["outputs"] = target_outs2
             t_inputs1 = list(s1.get("inputs", []))
@@ -3049,10 +3015,10 @@ def generate_refactoring_patch(
                 or len(t_inputs2) != len(inputs)
                 or not _outputs_compatible(
                     outputs,
-                    u1_outs,
-                    u2_outs,
-                    is_subroutine=is_sub,
-                    has_yield=has_yield,
+                    outputs,
+                    target_outs2,
+                    is_subroutine=is_subroutine_unit(u1_eff),
+                    has_yield=bool(s1.get("has_yield") or s2.get("has_yield")),
                 )
             ):
                 logger.debug(
@@ -3161,6 +3127,8 @@ def generate_refactoring_patch(
                 tree2=tree2,
                 skip_pre_unit_closures=effective_skip_closures,
                 closure_strictness=closure_strictness,
+                outputs=outputs,
+                outputs2=target_outs2,
             )
             if not helper_code:
                 continue

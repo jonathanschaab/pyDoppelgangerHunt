@@ -5,7 +5,6 @@ from __future__ import annotations
 import difflib
 import html
 import json
-import logging
 import os
 from pathlib import Path
 import sys
@@ -21,7 +20,13 @@ from pydoppelgangerhunt.source_lines import (
     split_source_lines,
 )
 
-logger = logging.getLogger(__name__)
+
+def _safe_unit_coord(unit: Dict[str, Any], key: str) -> Optional[int]:
+    """Safely extracts and parses an integer coordinate, returning None on failure."""
+    try:
+        return parse_unit_coord(unit, key, default=None)
+    except (ValueError, TypeError):
+        return None
 
 
 # ANSI Color Codes
@@ -241,10 +246,10 @@ def format_sarif_report(
             "startLine": s1,
             "endLine": e1,
         }
-        sc1 = parse_unit_coord(u1, "start_col", default=None)
+        sc1 = _safe_unit_coord(u1, "start_col")
         if sc1 is not None:
             r1["startColumn"] = max(1, sc1 + 1)
-        ec1 = parse_unit_coord(u1, "end_col", default=None)
+        ec1 = _safe_unit_coord(u1, "end_col")
         if ec1 is not None:
             r1["endColumn"] = max(1, ec1 + 1)
 
@@ -252,10 +257,10 @@ def format_sarif_report(
             "startLine": s2,
             "endLine": e2,
         }
-        sc2 = parse_unit_coord(u2, "start_col", default=None)
+        sc2 = _safe_unit_coord(u2, "start_col")
         if sc2 is not None:
             r2["startColumn"] = max(1, sc2 + 1)
-        ec2 = parse_unit_coord(u2, "end_col", default=None)
+        ec2 = _safe_unit_coord(u2, "end_col")
         if ec2 is not None:
             r2["endColumn"] = max(1, ec2 + 1)
 
@@ -467,10 +472,10 @@ def format_github_annotations(
         n2 = str(u2.get("name") or "unit2")
         msg1 = f"Structural clone ({sim:.1%}) matching {f2}:{s2}-{e2} ({n2})"
         col_part1 = ""
-        sc1 = parse_unit_coord(u1, "start_col", default=None)
+        sc1 = _safe_unit_coord(u1, "start_col")
         if sc1 is not None:
             col_part1 += f",col={max(1, sc1 + 1)}"
-            ec1 = parse_unit_coord(u1, "end_col", default=None)
+            ec1 = _safe_unit_coord(u1, "end_col")
             if ec1 is not None:
                 col_part1 += f",endColumn={max(1, ec1 + 1)}"
         ann1 = (
@@ -480,10 +485,10 @@ def format_github_annotations(
         annotations.append(ann1)
         msg2 = f"Structural clone ({sim:.1%}) matching {f1}:{s1}-{e1} ({n1})"
         col_part2 = ""
-        sc2 = parse_unit_coord(u2, "start_col", default=None)
+        sc2 = _safe_unit_coord(u2, "start_col")
         if sc2 is not None:
             col_part2 += f",col={max(1, sc2 + 1)}"
-            ec2 = parse_unit_coord(u2, "end_col", default=None)
+            ec2 = _safe_unit_coord(u2, "end_col")
             if ec2 is not None:
                 col_part2 += f",endColumn={max(1, ec2 + 1)}"
         ann2 = (

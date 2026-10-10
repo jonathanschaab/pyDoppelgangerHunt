@@ -29,6 +29,7 @@ from pydoppelgangerhunt.fixer.dataflow import (
     has_async_generator_delegation_hazard,
     is_async_generator_with_return_value,
     resolve_clone_generator_subroutine_outputs,
+    resolve_clone_pair_outputs,
     resolve_generator_subroutine_outputs,
 )
 from pydoppelgangerhunt.fixer.depgraph import (
@@ -158,6 +159,7 @@ __all__ = [
     "refactor_module_units",
     "replace_unit_in_source",
     "resolve_clone_generator_subroutine_outputs",
+    "resolve_clone_pair_outputs",
     "resolve_closure_strictness_mode",
     "resolve_generator_subroutine_outputs",
     "resolve_shared_module_file",

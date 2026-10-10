@@ -33,7 +33,6 @@ from pydoppelgangerhunt.config import (
 from pydoppelgangerhunt.canonical_path import CanonicalPathResolver
 from pydoppelgangerhunt.coverage import check_asymmetric_coverage, read_coverage_data
 from pydoppelgangerhunt.fixer import generate_refactoring_patch
-
 from pydoppelgangerhunt.git_diff import (
     DiffRangeMap,
     check_temporal_divergence,
@@ -202,7 +201,7 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         default=None,
         choices=["strict", "lenient", "fail_closed", "fast", "skip"],
         help=(
-            "Closure strictness ('strict' or 'lenient'; "
+            "Closure strictness ('strict'/'fail_closed' vs 'lenient'/'fast'/'skip'; "
             "takes precedence over --skip-pre-unit-closures)"
         ),
     )
@@ -1150,7 +1149,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         cli_strictness = cfg_strictness
         cli_skip = cfg_skip
-
 
     if cli_strictness is not None and str(cli_strictness).strip().lower() not in (
         "strict", "lenient", "fail_closed", "fast", "skip"

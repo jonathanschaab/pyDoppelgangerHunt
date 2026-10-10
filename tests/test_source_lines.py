@@ -85,17 +85,17 @@ def test_inspect_unit_scope_coordinate_string_with_column_offset() -> None:
 
 
 def test_resolve_unit_ast_end_col_single_line_semicolon_with_and_without_start_col() -> None:
-    """Verifies that _resolve_unit_ast_end_col defaults to the first statement on a line
-    when start_col is omitted, but accurately selects subsequent statements when start_col
+    """Verifies that _resolve_unit_ast_end_col returns None when multiple statements share
+    a line without column bounds, but accurately selects subsequent statements when start_col
     is supplied."""
     code = "def f(): x = 1; y = 2\n"
     tree = ast.parse(code)
     scope_fn = tree.body[0]
 
-    # Without start_col: defaults to first statement x = 1
+    # Without start_col: ambiguous multiple statements fail closed by returning None
     unit_no_col = {"start": 1, "end": 1}
     end_col_first = _resolve_unit_ast_end_col(scope_fn, unit_no_col)
-    assert end_col_first == len("def f(): x = 1")
+    assert end_col_first is None
 
     # With start_col: accurately matches second statement y = 2
     unit_with_col = {"start": 1, "end": 1, "start_col": len("def f(): x = 1; ")}
@@ -105,7 +105,7 @@ def test_resolve_unit_ast_end_col_single_line_semicolon_with_and_without_start_c
 
 def test_resolve_unit_ast_end_col_multiline_semicolon_closing_line() -> None:
     """Verifies that for multi-line units ending on a line with multiple statements,
-    _resolve_unit_ast_end_col defaults to the last statement on line u_end."""
+    _resolve_unit_ast_end_col fails closed and returns None when columns are not given."""
     code = (
         "def f():\n"
         "    x = 1\n"
@@ -116,7 +116,7 @@ def test_resolve_unit_ast_end_col_multiline_semicolon_closing_line() -> None:
 
     unit = {"start": 2, "end": 3}
     end_col = _resolve_unit_ast_end_col(scope_fn, unit)
-    assert end_col == len("    y = 2; z = 3")
+    assert end_col is None
 
 
 def test_extract_and_resolve_unit_col_coord_strings() -> None:
@@ -186,7 +186,8 @@ def test_get_valid_unit_bounds_malformed_coordinates(
 
 
 def test_resolve_unit_ast_end_col_single_line_compound_block() -> None:
-    """Verifies that single-line compound blocks resolve to trailing child statement."""
+    """Verifies that single-line compound blocks with multiple trailing statements
+    fail closed and return None without column bounds."""
     code = (
         "def process(items):\n"
         "    for x in items: total += x; yield x\n"
@@ -195,8 +196,7 @@ def test_resolve_unit_ast_end_col_single_line_compound_block() -> None:
     scope_fn = tree.body[0]
     unit = {"start": 2, "end": 2, "kind": "compound_block"}
     end_col = _resolve_unit_ast_end_col(scope_fn, unit)
-    expected_col = len("    for x in items: total += x; yield x")
-    assert end_col == expected_col
+    assert end_col is None
 
 
 def test_coordinate_parsing_colon_formatted_columns_across_subsystems(
@@ -295,21 +295,24 @@ def test_coordinate_parsing_colon_formatted_lines_across_subsystems() -> None:
 
 
 def test_parse_unit_coord_non_integral_floats_rejected() -> None:
-    """Verifies that non-integral floats and float strings are rejected with ValueError."""
+    """Verifies that non-integral floats and float strings truncate in default mode
+    and are rejected in strict mode."""
     # Integral floats and strings are accepted
     assert parse_unit_coord({"start": 10.0}, "start") == 10
     assert parse_unit_coord({"start": "10.0"}, "start") == 10
     assert parse_unit_coord({"start": "10.0:0"}, "start") == 10
 
-    # Non-integral floats are rejected
-    with pytest.raises(ValueError, match="cannot convert non-integral float"):
-        parse_unit_coord({"start": 10.5}, "start")
+    # Non-integral floats truncate in lenient/default mode
+    assert parse_unit_coord({"start": 10.5}, "start") == 10
+    assert parse_unit_coord({"start": "12.7"}, "start") == 12
+    assert parse_unit_coord({"start": "12.9:0"}, "start") == 12
 
-    with pytest.raises(ValueError, match="cannot convert non-integral float"):
-        parse_unit_coord({"start": "12.7"}, "start")
+    # In strict mode, float coordinates are rejected
+    with pytest.raises(ValueError, match="float coordinate not allowed in strict mode"):
+        parse_unit_coord({"start": 10.5}, "start", strict=True)
 
-    with pytest.raises(ValueError, match="cannot convert non-integral float"):
-        parse_unit_coord({"start": "12.9:0"}, "start")
+    with pytest.raises(ValueError, match="cannot convert to integer"):
+        parse_unit_coord({"start": "12.7"}, "start", strict=True)
 
 
 def test_coordinate_clamping_debug_logs(caplog: pytest.LogCaptureFixture) -> None:

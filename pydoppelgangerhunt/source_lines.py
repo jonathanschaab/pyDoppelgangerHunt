@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 import re
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union, overload
 
-from pydoppelgangerhunt.canonical_path import normalize_lexical_posix as normalize_path_string
+from pydoppelgangerhunt.config import normalize_path_string
 
 logger = logging.getLogger(__name__)
 
@@ -105,21 +106,21 @@ def parse_unit_coord(
             return default
         try:
             return int(val)
-        except ValueError:
+        except ValueError as exc:
             try:
                 f_val = float(val)
-            except (ValueError, OverflowError) as exc:
+            except (ValueError, OverflowError) as f_exc:
                 raise ValueError(
                     f"Invalid coordinate {val!r}: cannot convert to integer"
-                ) from exc
-            if not f_val.is_integer():
+                ) from f_exc
+            if math.isnan(f_val) or math.isinf(f_val):
                 raise ValueError(
-                    f"Invalid coordinate {val!r}: cannot convert non-integral float"
-                ) from None
+                    f"Invalid coordinate {val!r}: cannot convert non-finite float"
+                ) from exc
             return int(f_val)
     if isinstance(val, float):
-        if not val.is_integer():
-            raise ValueError(f"Invalid coordinate {val!r}: cannot convert non-integral float")
+        if math.isnan(val) or math.isinf(val):
+            raise ValueError(f"Invalid coordinate {val!r}: cannot convert non-finite float")
         return int(val)
     return _coerce_int_coord(val)
 
@@ -155,8 +156,14 @@ def resolve_unit_line_bounds(unit: Dict[str, Any]) -> Tuple[int, int]:
 
     Logs a DEBUG diagnostic whenever start is clamped to >= 1 or end is clamped to >= start.
     """
-    raw_s = parse_unit_coord(unit, "start", default=1)
-    raw_e = parse_unit_coord(unit, "end", default=raw_s)
+    try:
+        raw_s = parse_unit_coord(unit, "start", default=1)
+    except (ValueError, TypeError):
+        raw_s = 1
+    try:
+        raw_e = parse_unit_coord(unit, "end", default=raw_s)
+    except (ValueError, TypeError):
+        raw_e = raw_s
     s = max(1, raw_s)
     e = max(s, raw_e)
     if s != raw_s or e != raw_e:

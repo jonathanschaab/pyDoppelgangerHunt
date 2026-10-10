@@ -38,9 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Enclosing `with` Block Exit Safety**: Any enclosing `with` or `async with` block whose
   outputs are read downstream causes generator subroutines to fail closed, preventing context
   manager premature exit or cleanup hazards across arbitrary context managers (locks, streams).
-- **Coordinate Validation Public API Contract**: `is_valid_unit_coordinates` preserves
-  `strict: bool = False` as default for public API backward compatibility, while refactoring patch
-  generation explicitly enforces `strict=True`.
+- **Coordinate Validation Behavior Change**: `is_valid_unit_coordinates` now requires a positive
+  `start` coordinate (`start > 0`) even when `strict=False`, rejecting empty dictionaries `{}` or
+  missing/zero/negative/inverted coordinates that previously passed, while refactoring patch
+  generation explicitly enforces `strict=True` requiring both `start` and `end`.
 - **Lexical Yield Assignment Scoping**: Confined `has_yield_assignment` to the outer unit scope
   (`len(self._scope_stack) <= 1`) and excluded `yield from` expressions, preventing inner nested
   generators or sub-generator return assignments from falsely classifying units as bidirectional.
