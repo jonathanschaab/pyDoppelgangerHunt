@@ -1417,7 +1417,7 @@ def _inspect_unit_scope(
     # returns, all local variable stores act as unit outputs to preserve caller mutations.
     pre_outs = unit.get("precomputed_outputs") or unit.get("outputs")
     if is_subroutine and isinstance(pre_outs, (list, tuple)):
-        outputs = list(pre_outs)
+        outputs = list(dict.fromkeys(pre_outs))
     elif is_subroutine and isinstance(pre_outs, set):
         if len(pre_outs) > 1:
             logger.debug(
@@ -1431,14 +1431,19 @@ def _inspect_unit_scope(
     elif visitor.returns:
         outputs = list(visitor.returns)
     elif is_subroutine:
-        outputs = [
-            v for v in visitor.stores
-            if v not in visitor.globals
-            and v not in BUILTIN_NAMES
-            and v not in visitor.except_vars
-            and v not in visitor.deleted_names
-            and v not in visitor.imported_names
-        ]
+        seen: Set[str] = set()
+        outputs = []
+        for v in visitor.stores:
+            if (
+                v not in visitor.globals
+                and v not in BUILTIN_NAMES
+                and v not in visitor.except_vars
+                and v not in visitor.deleted_names
+                and v not in visitor.imported_names
+                and v not in seen
+            ):
+                seen.add(v)
+                outputs.append(v)
     else:
         outputs = []
 

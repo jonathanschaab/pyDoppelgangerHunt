@@ -2884,6 +2884,112 @@ def test_collect_downstream_read_names_multithreaded_cache_concurrency() -> None
         assert "SENTINEL_MUTATION" not in cached_val
 
 
+def test_subroutine_outputs_duplicate_stores_deduplicated_and_paired() -> None:
+    """Verifies that multiple assignments to the same root variable in subroutines do not produce
+    duplicate outputs or cause unwarranted rejection in resolve_clone_pair_outputs."""
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        inspect_single_unit_scope,
+    )
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        resolve_clone_pair_outputs,
+    )
+
+    code1 = (
+        "def outer1(step):\n"
+        "    total = 0\n"
+        "    total += step\n"
+        "    print(total)\n"
+    )
+    code2 = (
+        "def outer2(delta):\n"
+        "    count = 0\n"
+        "    count += delta\n"
+        "    print(count)\n"
+    )
+
+    u1 = {
+        "kind": "compound_block",
+        "start": 2,
+        "end": 3,
+        "file": "f1.py",
+        "source_text": code1,
+    }
+    u2 = {
+        "kind": "compound_block",
+        "start": 2,
+        "end": 3,
+        "file": "f2.py",
+        "source_text": code2,
+    }
+
+    s1 = inspect_single_unit_scope(u1)
+    s2 = inspect_single_unit_scope(u2)
+
+    # Scopes must deduplicate outputs in order of first store
+    assert s1["outputs"] == ["total"]
+    assert s2["outputs"] == ["count"]
+
+    # resolve_clone_pair_outputs must successfully pair them
+    res = resolve_clone_pair_outputs(u1, u2, s1, s2)
+    assert res == (["total"], ["count"])
+
+    # Even if precomputed outputs contain duplicates, it must safely deduplicate and pair
+    u1_dup = {"kind": "compound_block", "outputs": ["total", "total"]}
+    u2_dup = {"kind": "compound_block", "outputs": ["count", "count"]}
+    res_dup = resolve_clone_pair_outputs(u1_dup, u2_dup, s1, s2)
+    assert res_dup == (["total"], ["count"])
+
+
+def test_clear_downstream_reads_cache_resets_warned_lenient_closure() -> None:
+    """Verifies that _clear_downstream_reads_cache resets _warned_lenient_closure flag."""
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        _clear_downstream_reads_cache,
+        _warned_lenient_closure,
+    )
+
+    _warned_lenient_closure[0] = True
+    assert _warned_lenient_closure[0] is True
+    _clear_downstream_reads_cache()
+    assert _warned_lenient_closure[0] is False
+
+
+def test_collect_downstream_read_names_cache_hit_with_and_without_end_col() -> None:
+    """Verifies that cache keys do not diverge whether end_col is pre-provided or AST-resolved."""
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        _clear_downstream_reads_cache,
+        _downstream_reads_cache,
+        collect_downstream_read_names,
+    )
+
+    _clear_downstream_reads_cache()
+    src = (
+        "def compute():\n"
+        "    x = 10\n"
+        "    return x + 5\n"
+    )
+    unit_no_end_col = {"file": "mod.py", "start": 2, "end": 2}
+    res1 = collect_downstream_read_names(src, unit_no_end_col)
+    assert res1 == {"x"}
+    assert len(_downstream_reads_cache) == 1
+
+    # Call with explicit end_col_offset matching AST resolution
+    cached_key = next(iter(_downstream_reads_cache.keys()))
+    resolved_end_col = cached_key[5]  # index 5 is end_col in _build_downstream_cache_key
+    assert resolved_end_col is not None
+
+    unit_with_end_col = {
+        "file": "mod.py",
+        "start": 2,
+        "end": 2,
+        "end_col_offset": resolved_end_col,
+    }
+    res2 = collect_downstream_read_names(src, unit_with_end_col)
+    assert res2 == {"x"}
+    # Cache size must still be 1 (cache hit, no key divergence!)
+    assert len(_downstream_reads_cache) == 1
+
+
+
 
 
 

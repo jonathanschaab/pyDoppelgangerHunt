@@ -1283,6 +1283,7 @@ def _clear_downstream_reads_cache() -> None:
         _scope_closures_cache.clear()
         _scope_loops_cache.clear()
         _scope_try_with_cache.clear()
+        _warned_lenient_closure[0] = False
 
 
 def _build_downstream_cache_key(
@@ -1293,6 +1294,7 @@ def _build_downstream_cache_key(
     candidates: Optional[Set[str]],
     skip_pre_unit_closures: bool,
     source_digest: Optional[str] = None,
+    resolved_end_col: Optional[int] = None,
 ) -> Tuple[Any, ...]:
     """Forms a persistent cache key for downstream AST read analysis."""
     file_path_str = str(unit.get("file") or "")
@@ -1305,7 +1307,11 @@ def _build_downstream_cache_key(
         ).hexdigest()
 
     start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
-    end_col = _extract_unit_end_col(unit)
+    end_col = (
+        resolved_end_col
+        if resolved_end_col is not None
+        else _extract_unit_end_col(unit)
+    )
     cands_key = frozenset(candidates) if candidates is not None else None
     unit_kind = unit.get("kind")
     unit_name = unit.get("name")
@@ -1650,6 +1656,14 @@ def collect_downstream_read_names(
     if candidates is not None and not candidates:
         return set()
 
+    u_end_col = _extract_unit_end_col(unit)
+    scope_node: Optional[ast.AST] = None
+    if u_end_col is None:
+        scope_node = _resolve_downstream_scope_node(source_text, unit, tree)
+        if scope_node is None:
+            return None
+        u_end_col = _resolve_unit_ast_end_col(scope_node, unit)
+
     cache_key = _build_downstream_cache_key(
         source_text,
         unit,
@@ -1658,6 +1672,7 @@ def collect_downstream_read_names(
         candidates,
         skip_pre_unit_closures,
         source_digest=source_digest,
+        resolved_end_col=u_end_col,
     )
     with _downstream_cache_lock:
         if cache_key in _downstream_reads_cache:
@@ -1665,13 +1680,10 @@ def collect_downstream_read_names(
             _downstream_reads_cache.move_to_end(cache_key)
             return set(cached)
 
-    scope_node = _resolve_downstream_scope_node(source_text, unit, tree)
     if scope_node is None:
-        return None
-
-    u_end_col = _extract_unit_end_col(unit)
-    if u_end_col is None:
-        u_end_col = _resolve_unit_ast_end_col(scope_node, unit)
+        scope_node = _resolve_downstream_scope_node(source_text, unit, tree)
+        if scope_node is None:
+            return None
 
     enclosing_loops = _find_enclosing_loops(scope_node, u_start, u_end)
 
@@ -1937,7 +1949,7 @@ def _extract_effective_unit_outputs(
     else:
         cands = scope.get("outputs", [])
     excluded = set(scope.get("globals", [])) | set(scope.get("nonlocals", []))
-    return [v for v in cands if v not in excluded]
+    return list(dict.fromkeys(v for v in cands if v not in excluded))
 
 
 def resolve_clone_generator_subroutine_outputs(
