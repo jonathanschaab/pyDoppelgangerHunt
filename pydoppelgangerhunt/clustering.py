@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.config import canonical_path_key
-from pydoppelgangerhunt.source_lines import parse_unit_coord, resolve_unit_line_bounds
+from pydoppelgangerhunt.source_lines import resolve_unit_line_bounds
 
 
 class UnionFind:
@@ -291,7 +291,7 @@ def cluster_clone_families(
         members.sort(
             key=lambda u: (
                 canonical_path_key(str(u.get("file") or ""), strip_anchor=False),
-                max(1, parse_unit_coord(u, "start", default=1)),
+                resolve_unit_line_bounds(u)[0],
             )
         )
         member_set = set(member_keys)
@@ -331,7 +331,7 @@ def cluster_clone_families(
             -f["member_count"],
             -round(f["avg_similarity"], 9),
             _normalize_unit_file(f["members"][0]),
-            max(1, parse_unit_coord(f["members"][0], "start", default=1)),
+            resolve_unit_line_bounds(f["members"][0])[0],
             str(f["medoid"].get("name") or "") if isinstance(f.get("medoid"), dict) else "",
         )
     )

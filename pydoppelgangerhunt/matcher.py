@@ -329,8 +329,8 @@ def merge_adjacent_clones(
     for sim, u1, u2 in clones:
         f1 = _normalize_matcher_file(u1.get("file"))
         f2 = _normalize_matcher_file(u2.get("file"))
-        k1 = (f1, max(1, parse_unit_coord(u1, "start", default=1)), str(u1.get("name") or ""))
-        k2 = (f2, max(1, parse_unit_coord(u2, "start", default=1)), str(u2.get("name") or ""))
+        k1 = (f1, resolve_unit_line_bounds(u1)[0], str(u1.get("name") or ""))
+        k2 = (f2, resolve_unit_line_bounds(u2)[0], str(u2.get("name") or ""))
         if k1 <= k2:
             canonical.append((sim, dict(u1), dict(u2)))
         else:
@@ -371,19 +371,11 @@ def merge_adjacent_clones(
                 if fn1_a != fn1_b or fn2_a != fn2_b:
                     continue
 
-                u1_b_start = max(1, parse_unit_coord(u1_b, "start", default=1))
-                u1_b_end = max(u1_b_start, parse_unit_coord(u1_b, "end", default=u1_b_start))
-                curr_u1_start = max(1, parse_unit_coord(current_u1, "start", default=1))
-                curr_u1_end = max(
-                    curr_u1_start, parse_unit_coord(current_u1, "end", default=curr_u1_start)
-                )
+                u1_b_start, u1_b_end = resolve_unit_line_bounds(u1_b)
+                curr_u1_start, curr_u1_end = resolve_unit_line_bounds(current_u1)
 
-                u2_b_start = max(1, parse_unit_coord(u2_b, "start", default=1))
-                u2_b_end = max(u2_b_start, parse_unit_coord(u2_b, "end", default=u2_b_start))
-                curr_u2_start = max(1, parse_unit_coord(current_u2, "start", default=1))
-                curr_u2_end = max(
-                    curr_u2_start, parse_unit_coord(current_u2, "end", default=curr_u2_start)
-                )
+                u2_b_start, u2_b_end = resolve_unit_line_bounds(u2_b)
+                curr_u2_start, curr_u2_end = resolve_unit_line_bounds(current_u2)
 
                 adj1 = (u1_b_start <= curr_u1_end + line_tolerance) and (
                     u1_b_end >= curr_u1_start - line_tolerance
@@ -493,14 +485,10 @@ def suppress_subclones(
             c1_corr = c1 if direct_match else c2
             c2_corr = c2 if direct_match else c1
 
-            p1_start = max(1, parse_unit_coord(p1, "start", default=1))
-            p1_end = max(p1_start, parse_unit_coord(p1, "end", default=p1_start))
-            p2_start = max(1, parse_unit_coord(p2, "start", default=1))
-            p2_end = max(p2_start, parse_unit_coord(p2, "end", default=p2_start))
-            c1_start = max(1, parse_unit_coord(c1_corr, "start", default=1))
-            c1_end = max(c1_start, parse_unit_coord(c1_corr, "end", default=c1_start))
-            c2_start = max(1, parse_unit_coord(c2_corr, "start", default=1))
-            c2_end = max(c2_start, parse_unit_coord(c2_corr, "end", default=c2_start))
+            p1_start, p1_end = resolve_unit_line_bounds(p1)
+            p2_start, p2_end = resolve_unit_line_bounds(p2)
+            c1_start, c1_end = resolve_unit_line_bounds(c1_corr)
+            c2_start, c2_end = resolve_unit_line_bounds(c2_corr)
 
             c1_enclosed = p1_start <= c1_start and c1_end <= p1_end
             c2_enclosed = p2_start <= c2_start and c2_end <= p2_end
@@ -1438,10 +1426,8 @@ def scan_target(
         if f1 == f2:
             fn1 = u1["name"].split(":")[0]
             fn2 = u2["name"].split(":")[0]
-            u1_s = max(1, parse_unit_coord(u1, "start", default=1))
-            u1_e = max(u1_s, parse_unit_coord(u1, "end", default=u1_s))
-            u2_s = max(1, parse_unit_coord(u2, "start", default=1))
-            u2_e = max(u2_s, parse_unit_coord(u2, "end", default=u2_s))
+            u1_s, u1_e = resolve_unit_line_bounds(u1)
+            u2_s, u2_e = resolve_unit_line_bounds(u2)
             if fn1 == fn2:
                 if max(u1_s, u2_s) <= min(u1_e, u2_e):
                     continue

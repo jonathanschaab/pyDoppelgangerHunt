@@ -26,7 +26,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sliding windows, and clause branches while excluding whole functions and methods.
 
 ### Breaking Changes
-- **Breaking Change in Coordinate Validation**: `is_valid_unit_coordinates` (when called with default `strict=False`) is no longer fully permissive: it now requires a positive `start` coordinate (`start > 0`) and rejects empty dictionaries `{}` as well as zero/negative/inverted coordinates (`end < start`). Previously, missing keys or non-positive coordinates returned `True` as long as present values were int-convertible. Callers requiring full coordinate validity for refactoring and patching should pass `strict=True` requiring both `start` and `end`.
+- **Breaking Change in Coordinate Validation**: `is_valid_unit_coordinates` (when called with
+  default `strict=False`) is no longer fully permissive: it now requires a positive `start`
+  coordinate (`start > 0`) and rejects empty dictionaries `{}` as well as zero/negative/inverted
+  coordinates (`end < start`). Previously, missing keys or non-positive coordinates returned `True`
+  as long as present values were int-convertible. Callers requiring full coordinate validity for
+  refactoring and patching should pass `strict=True` requiring both `start` and `end`.
+- **Default Missing-End Handling**: When the `end` coordinate is omitted in unit dictionaries,
+  `extract_unit_source_code` and `_compute_replacement_line_deltas` now default to `end = start`
+  (a single-line unit) via `resolve_unit_line_bounds` and `is_valid_unit_coordinates(strict=False)`,
+  rather than extending to EOF or raising ValueError.
+- **Subroutine Unit Classification Heuristic Removal**: `is_subroutine_unit` now strictly requires
+  an explicit `is_subroutine` boolean or a recognized `kind` (`compound_block`, `sliding_window`,
+  `clause_branch`). The legacy fallback detecting `":"` in the unit name has been removed to avoid
+  false subroutine classifications.
 
 ### Changed
 - **PEP 604 Pipe Union Normalization**: Synthesized helper parameter and return type annotations

@@ -46,9 +46,8 @@ from pydoppelgangerhunt.fixer.depgraph import (
 from pydoppelgangerhunt.fixer.scope import (
     _extract_arg_names,
     _normalize_receiver_attrs,
-    analyze_unit_variable_scope,
+    dispatch_analyze_unit_variable_scope,
     inspect_single_unit_scope,
-    is_subroutine_unit,
 )
 
 from pydoppelgangerhunt.fixer.source import (
@@ -64,6 +63,7 @@ from pydoppelgangerhunt.fixer.source import (
     compute_line_offsets,
     count_physical_newlines,
     detect_line_ending,
+    is_subroutine_unit,
     is_valid_unit_coordinates,
     parse_unit_coord,
     resolve_unit_replacement,
@@ -78,6 +78,9 @@ from pydoppelgangerhunt.fixer.synthesis import (
 
 logger = logging.getLogger(__name__)
 _BUILTIN_NAMES: Set[str] = set(dir(builtins))
+
+
+analyze_unit_variable_scope = dispatch_analyze_unit_variable_scope
 
 
 class UnitCollisionError(ValueError):
@@ -778,9 +781,8 @@ def _module_imports_target(
 
 
 def _outputs_compatible(
-    outputs: Sequence[str],
-    u1_outs: Sequence[str],
-    u2_outs: Sequence[str],
+    helper_outs: Sequence[str],
+    target_outs: Sequence[str],
     *,
     is_subroutine: bool,
     has_yield: bool,
@@ -792,7 +794,7 @@ def _outputs_compatible(
     """
     if is_subroutine and has_yield:
         return True
-    return len(u1_outs) == len(outputs) and len(u2_outs) == len(outputs)
+    return len(helper_outs) == len(target_outs)
 
 
 class _PlanSnapshot(TypedDict):
@@ -911,15 +913,17 @@ def _compute_replacement_line_deltas(
     for i, (u, rep) in enumerate(reps):
         if not isinstance(u, dict):
             raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
-        if not is_valid_unit_coordinates(u, strict=True):
+        if not is_valid_unit_coordinates(u, strict=False):
             raise ValueError(
                 f"Malformed unit: invalid line boundary in {u.get('file', '')}: {u}"
             )
         try:
-            fallback = max(1, parse_unit_coord(u, "start", default=1, strict=True))
-            end_l = max(fallback, parse_unit_coord(u, "end", default=fallback, strict=True))
+            fallback = max(1, parse_unit_coord(u, "start", default=1))
+            end_l = max(fallback, parse_unit_coord(u, "end", default=fallback))
         except (ValueError, TypeError) as err:
-            raise ValueError(f"Malformed unit: invalid line boundary in {u.get('file', '')}: {err}") from err
+            raise ValueError(
+                f"Malformed unit: invalid line boundary in {u.get('file', '')}: {err}"
+            ) from err
         item = resolve_unit_replacement(
             orig_text,
             u,
@@ -2634,7 +2638,36 @@ def generate_refactoring_patch(
     """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
     if not clones:
         return ""
+    _clear_downstream_reads_cache()
+    try:
+        return _generate_refactoring_patch_impl(
+            clones=clones,
+            repo_root=repo_root,
+            type_merge_strategy=type_merge_strategy,
+            replace_clones=replace_clones,
+            method_binding=method_binding,
+            cross_file_strategy=cross_file_strategy,
+            shared_module_name=shared_module_name,
+            depgraph=depgraph,
+            skip_pre_unit_closures=skip_pre_unit_closures,
+            closure_strictness=closure_strictness,
+        )
+    finally:
+        _clear_downstream_reads_cache()
 
+
+def _generate_refactoring_patch_impl(
+    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
+    repo_root: Optional[str] = None,
+    type_merge_strategy: str = "fallback_any",
+    replace_clones: bool = False,
+    method_binding: str = "auto",
+    cross_file_strategy: str = "auto",
+    shared_module_name: str = "_common.py",
+    depgraph: Optional[ModuleDependencyGraph] = None,
+    skip_pre_unit_closures: bool = False,
+    closure_strictness: Optional[str] = None,
+) -> str:
     fs_root = Path(repo_root or os.getcwd()).resolve()
     if fs_root.is_file():
         fs_root = fs_root.parent
@@ -2663,7 +2696,6 @@ def generate_refactoring_patch(
     )
     if effective_skip_closures:
         logger.debug("Generating patches in lenient closure strictness mode")
-    _clear_downstream_reads_cache()
     graph_holder: List[Optional[ModuleDependencyGraph]] = [
         depgraph.copy() if depgraph is not None else None
     ]
@@ -2873,6 +2905,11 @@ def generate_refactoring_patch(
             if orig_fn2 and orig_fn2.get("is_async") and s2.get("has_yield"):
                 s2["is_async"] = True
             if s1.get("is_async") is None or s2.get("is_async") is None:
+                logger.debug(
+                    "Skipping clone pair (%s, %s): indeterminate async state",
+                    u1.get("name"),
+                    u2.get("name"),
+                )
                 continue
             if bool(s1.get("is_async")) != bool(s2.get("is_async")):
                 continue
@@ -3022,7 +3059,6 @@ def generate_refactoring_patch(
                 len(t_inputs1) != len(inputs)
                 or len(t_inputs2) != len(inputs)
                 or not _outputs_compatible(
-                    outputs,
                     outputs,
                     target_outs2,
                     is_subroutine=is_subroutine_unit(u1_eff),
@@ -3658,5 +3694,4 @@ def generate_refactoring_patch(
                 seen_comments.add(chunk)
             patch_chunks.append(chunk)
 
-    _clear_downstream_reads_cache()
     return "\n".join(patch_chunks)

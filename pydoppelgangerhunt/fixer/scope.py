@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import ast
 import builtins
+import inspect
 import logging
+import sys
 import textwrap
+import threading
 from typing import (
     Any,
+    Callable,
     Dict,
     Iterable,
     List,
@@ -16,17 +20,17 @@ from typing import (
     Set,
     Tuple,
     Union,
+    cast,
 )
 
 from pydoppelgangerhunt.reporters import extract_unit_source_code
-from pydoppelgangerhunt.fixer.dataflow import (
-    _load_unit_file_text,
-    is_subroutine_unit,
-)
 from pydoppelgangerhunt.fixer.source import (
+    _load_unit_file_text,
     _slice_unit_token_lines,
     find_enclosing_function_is_async,
+    is_subroutine_unit,
     parse_unit_coord,
+    resolve_unit_declared_outputs,
     split_source_lines,
 )
 
@@ -427,13 +431,11 @@ class _ScopeVisitor(ast.NodeVisitor):
                 stack.append(child)
 
     def visit_Assign(self, node: ast.Assign) -> None:
-        self._check_yield_assignment(node.value)
         self.visit(node.value)
         for target in node.targets:
             self.visit(target)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
-        self._check_yield_assignment(node.value)
         # AugAssign both loads and stores the target
         if isinstance(node.target, ast.Name):
             self._record_load_name(node.target.id)
@@ -452,7 +454,6 @@ class _ScopeVisitor(ast.NodeVisitor):
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         if node.value is not None:
-            self._check_yield_assignment(node.value)
             self.visit(node.value)
             if isinstance(node.target, ast.Name):
                 self._record_store_name(node.target.id)
@@ -460,7 +461,6 @@ class _ScopeVisitor(ast.NodeVisitor):
                 self.visit(node.target)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
-        self._check_yield_assignment(node.value)
         self.visit(node.value)
         if isinstance(node.target, ast.Name):
             target_id = node.target.id
@@ -1273,6 +1273,7 @@ def _inspect_unit_scope(
         "has_receiver_access": False,
         "instance_attrs": [],
         "class_attrs": [],
+        "outputs_ambiguous": False,
     }
     if not dedented.strip():
         return empty_res
@@ -1415,10 +1416,12 @@ def _inspect_unit_scope(
 
     # Unit outputs: explicit returns if present; for subroutines without explicit
     # returns, all local variable stores act as unit outputs to preserve caller mutations.
-    pre_outs = unit.get("precomputed_outputs") or unit.get("outputs")
+    pre_outs = resolve_unit_declared_outputs(unit)
+
+    outputs_ambiguous = False
     if is_subroutine and isinstance(pre_outs, (list, tuple)):
         outputs = list(dict.fromkeys(pre_outs))
-    elif is_subroutine and isinstance(pre_outs, set):
+    elif is_subroutine and isinstance(pre_outs, (set, frozenset)):
         if len(pre_outs) > 1:
             logger.debug(
                 "Rejecting set-valued outputs (%s): unordered set cannot establish "
@@ -1426,6 +1429,7 @@ def _inspect_unit_scope(
                 pre_outs,
             )
             outputs = []
+            outputs_ambiguous = True
         else:
             outputs = list(pre_outs)
     elif visitor.returns:
@@ -1535,6 +1539,7 @@ def _inspect_unit_scope(
             a for a in visitor.attrs_read + visitor.attrs_written
             if any(a.startswith(f"{r}.") for r in class_receivers)
         ],
+        "outputs_ambiguous": outputs_ambiguous,
     }
 
 
@@ -1607,6 +1612,9 @@ def analyze_unit_variable_scope(
         definite_stores = sorted(
             set(info1.get("definite_stores", [])) & set(info2.get("definite_stores", []))
         )
+        outputs_ambiguous = bool(
+            info1.get("outputs_ambiguous", False) or info2.get("outputs_ambiguous", False)
+        )
     else:
         inputs = info1["inputs"]
         outputs = info1["outputs"]
@@ -1631,6 +1639,7 @@ def analyze_unit_variable_scope(
         is_async = info1.get("is_async", False)
         conditional_outputs = info1.get("conditional_outputs", [])
         definite_stores = info1.get("definite_stores", [])
+        outputs_ambiguous = bool(info1.get("outputs_ambiguous", False))
 
     has_instance_binding = info1.get("has_instance_binding", False) or (
         info2.get("has_instance_binding", False) if u2 is not None else False
@@ -1685,8 +1694,112 @@ def analyze_unit_variable_scope(
         "class_attrs": list(dict.fromkeys(
             info1.get("class_attrs", []) + (info2.get("class_attrs", []) if u2 is not None else [])
         )),
+        "outputs_ambiguous": outputs_ambiguous,
     }
 
 
-dispatch_analyze_unit_variable_scope = analyze_unit_variable_scope
-dispatch_inspect_single_unit_scope = inspect_single_unit_scope
+_dispatch_active = threading.local()
+
+
+def _resolve_dispatch_target(
+    func_name: str,
+    default_func: Callable[..., Any],
+    alias_func: Optional[Callable[..., Any]] = None,
+) -> Optional[Callable[..., Any]]:
+    """Resolves active mock patch on patch_mod or fixer package if overridden."""
+    patch_mod = sys.modules.get("pydoppelgangerhunt.fixer.patch")
+    target = getattr(patch_mod, func_name, None)
+    if target is None or target is default_func or target is alias_func:
+        pkg = sys.modules.get("pydoppelgangerhunt.fixer")
+        target = getattr(pkg, func_name, None)
+    if (
+        target is not None
+        and callable(target)
+        and target is not default_func
+        and target is not alias_func
+    ):
+        return cast(Callable[..., Any], target)
+    return None
+
+
+def _invoke_dynamic_target(
+    target: Callable[..., Any],
+    pos_args: Tuple[Any, ...],
+    tree_kwargs: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Invokes target attempting tree parameters first, falling back to positional."""
+    try:
+        sig = inspect.signature(target)
+        valid_kwargs = {k: v for k, v in tree_kwargs.items() if k in sig.parameters}
+        res = target(*pos_args, **valid_kwargs)
+        if isinstance(res, dict):
+            return res
+    except (ValueError, TypeError):
+        pass
+    fallback = target(*pos_args)
+    return fallback if isinstance(fallback, dict) else {}
+
+
+def _dispatch_or_call(
+    flag_attr: str,
+    func_name: str,
+    default_func: Callable[..., Any],
+    alias_func: Optional[Callable[..., Any]],
+    pos_args: Tuple[Any, ...],
+    kw_args: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Dispatches call through active mock patches with reentrancy protection."""
+    if getattr(_dispatch_active, flag_attr, False):
+        res = default_func(*pos_args, **kw_args)
+        return res if isinstance(res, dict) else {}
+    target = _resolve_dispatch_target(func_name, default_func, alias_func)
+    if target is None:
+        res = default_func(*pos_args, **kw_args)
+        return res if isinstance(res, dict) else {}
+    setattr(_dispatch_active, flag_attr, True)
+    try:
+        return _invoke_dynamic_target(target, pos_args, kw_args)
+    finally:
+        setattr(_dispatch_active, flag_attr, False)
+
+
+def dispatch_analyze_unit_variable_scope(
+    u1: Dict[str, Any],
+    u2: Optional[Dict[str, Any]] = None,
+    repo_root: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
+) -> Dict[str, Any]:
+    """Dispatches analyze_unit_variable_scope, honoring active mock patches on
+    pydoppelgangerhunt.fixer.patch or pydoppelgangerhunt.fixer."""
+    kwargs: Dict[str, Any] = {
+        "u2": u2,
+        "repo_root": repo_root,
+        "tree1": tree1,
+        "tree2": tree2,
+    }
+    return _dispatch_or_call(
+        "analyzing",
+        "analyze_unit_variable_scope",
+        analyze_unit_variable_scope,
+        dispatch_analyze_unit_variable_scope,
+        (u1,),
+        kwargs,
+    )
+
+
+def dispatch_inspect_single_unit_scope(
+    unit: Dict[str, Any],
+    repo_root: Optional[str] = None,
+    tree: Optional[ast.AST] = None,
+) -> Dict[str, Any]:
+    """Dispatches single-unit scope analysis, honoring mock patches on
+    inspect_single_unit_scope."""
+    return _dispatch_or_call(
+        "inspecting",
+        "inspect_single_unit_scope",
+        inspect_single_unit_scope,
+        dispatch_inspect_single_unit_scope,
+        (unit,),
+        {"repo_root": repo_root, "tree": tree},
+    )

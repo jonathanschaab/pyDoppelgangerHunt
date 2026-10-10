@@ -36,10 +36,12 @@ __all__ = [
     "extract_unit_comments_and_pragmas",
     "find_enclosing_function_is_async",
     "is_sliced_unit_source_lines",
+    "is_subroutine_unit",
     "is_valid_unit_coordinates",
     "parse_unit_coord",
     "replace_unit_in_source",
     "resolve_safe_unit_file_path",
+    "resolve_unit_declared_outputs",
     "resolve_unit_replacement",
     "slice_source_by_token_range",
     "split_source_lines",
@@ -108,7 +110,69 @@ def is_valid_unit_coordinates(u: Any, strict: bool = False) -> bool:
 
 _is_valid_unit_coordinates = is_valid_unit_coordinates
 
+_SUBROUTINE_KINDS: frozenset[str] = frozenset(
+    {"compound_block", "sliding_window", "clause_branch"}
+)
 
+
+def is_subroutine_unit(unit: Any) -> bool:
+    """Checks whether an AST code unit is a subroutine block rather than a whole function.
+
+    Classification Rules:
+    1. Explicit 'is_subroutine' boolean in unit takes precedence if present.
+    2. Known subroutine kinds ('compound_block', 'sliding_window', 'clause_branch') return True.
+    3. All other kinds or unspecified kinds return False.
+    """
+    if not isinstance(unit, dict):
+        return False
+    if "is_subroutine" in unit and unit.get("is_subroutine") is not None:
+        return bool(unit["is_subroutine"])
+    return str(unit.get("kind") or "") in _SUBROUTINE_KINDS
+
+
+def resolve_unit_declared_outputs(unit: Dict[str, Any]) -> Any:
+    """Extracts declared unit outputs, preferring precomputed_outputs over outputs."""
+    if "precomputed_outputs" in unit and unit["precomputed_outputs"] is not None:
+        return unit["precomputed_outputs"]
+    if "outputs" in unit and unit["outputs"] is not None:
+        return unit["outputs"]
+    return None
+
+
+def _load_unit_file_text(
+    unit: Dict[str, Any],
+    repo_root: Optional[str] = None,
+) -> Optional[str]:
+    """Reads full source text from memory or disk for AST inspection and read analysis."""
+    source_text = unit.get("source_text")
+    if source_text is None:
+        source_text = unit.get("file_source")
+    if source_text is not None:
+        return str(source_text)
+
+    is_sliced = unit.get("source_lines_is_sliced")
+    if is_sliced is not True:
+        unit_lines = unit.get("source_lines")
+        if unit_lines and isinstance(unit_lines, (list, tuple)):
+            if not is_sliced_unit_source_lines(unit, unit_lines):
+                return "".join(
+                    ln if ln.endswith(("\n", "\r")) else ln + "\n"
+                    for ln in unit_lines
+                )
+
+    # Disk fallback: strictly only .py files within repo_root or CWD are accepted.
+    # Notebooks (.ipynb) and out-of-root files fail closed and return None.
+    resolved_file = resolve_safe_unit_file_path(
+        unit, repo_root=repo_root, allowed_suffixes=(".py",)
+    )
+    if resolved_file is not None:
+        try:
+            with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except OSError:
+            pass
+
+    return None
 
 
 def _is_docstring_node(node: Optional[ast.AST]) -> bool:
@@ -243,8 +307,14 @@ def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]
     """Slices source lines to the exact start_col and end_col offsets of the unit."""
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
         return lines
-    s_col = _parse_unit_coord(unit, "start_col", default=0)
-    e_col = _parse_unit_coord(unit, "end_col", default=None)
+    try:
+        s_col = _parse_unit_coord(unit, "start_col", default=0)
+    except (ValueError, TypeError):
+        s_col = 0
+    try:
+        e_col = _parse_unit_coord(unit, "end_col", default=None)
+    except (ValueError, TypeError):
+        e_col = None
     res = list(lines)
     if len(res) == 1:
         res[0] = res[0][s_col:e_col] if (e_col is None or e_col > s_col) else res[0][s_col:]

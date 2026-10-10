@@ -24,7 +24,6 @@ from typing import (
     Callable,
     Dict,
     Iterable,
-    Iterator,
     List,
     NamedTuple,
     Optional,
@@ -36,12 +35,13 @@ from typing import (
 )
 
 from pydoppelgangerhunt.config import resolve_closure_strictness_mode
-from pydoppelgangerhunt.source_lines import (
-    is_sliced_unit_source_lines,
-    parse_unit_coord,
-    resolve_safe_unit_file_path,
+from pydoppelgangerhunt.source_lines import parse_unit_coord
+from pydoppelgangerhunt.fixer.source import (
+    _find_innermost_enclosing_node,
+    _load_unit_file_text,
+    is_subroutine_unit,
+    resolve_unit_declared_outputs,
 )
-from pydoppelgangerhunt.fixer.source import _find_innermost_enclosing_node
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +68,7 @@ _downstream_reads_cache: OrderedDict[Tuple[Any, ...], frozenset[str]] = OrderedD
 
 _scope_parent_maps: OrderedDict[ast.AST, Dict[ast.AST, ast.AST]] = OrderedDict()
 _scope_stmts_by_end: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
-_scope_closures_cache: OrderedDict[ast.AST, List[Tuple[int, Set[str]]]] = OrderedDict()
+_scope_closures_cache: OrderedDict[ast.AST, List[Tuple[_ClosurePos, Set[str]]]] = OrderedDict()
 _scope_loops_cache: OrderedDict[ast.AST, List[Tuple[int, int]]] = OrderedDict()
 _scope_try_with_cache: OrderedDict[ast.AST, List[ast.AST]] = OrderedDict()
 _warned_lenient_closure: List[bool] = [False]
@@ -100,42 +100,6 @@ def _get_or_compute_scope_cached(
         pass
 
     return computed
-
-
-def _load_unit_file_text(
-    unit: Dict[str, Any],
-    repo_root: Optional[str] = None,
-) -> Optional[str]:
-    """Reads full source text from memory or disk for downstream AST read analysis."""
-    source_text = unit.get("source_text")
-    if source_text is None:
-        source_text = unit.get("file_source")
-    if source_text is not None:
-        return str(source_text)
-
-    is_sliced = unit.get("source_lines_is_sliced")
-    if is_sliced is not True:
-        unit_lines = unit.get("source_lines")
-        if unit_lines and isinstance(unit_lines, (list, tuple)):
-            if not is_sliced_unit_source_lines(unit, unit_lines):
-                return "".join(
-                    ln if ln.endswith("\n") else ln + "\n"
-                    for ln in unit_lines
-                )
-
-    # Disk fallback: strictly only .py files within repo_root or CWD are accepted.
-    # Notebooks (.ipynb) and out-of-root files fail closed and return None.
-    resolved_file = resolve_safe_unit_file_path(
-        unit, repo_root=repo_root, allowed_suffixes=(".py",)
-    )
-    if resolved_file is not None:
-        try:
-            with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
-                return fh.read()
-        except OSError:
-            pass
-
-    return None
 
 
 def _parse_source_tree(
@@ -178,26 +142,6 @@ def _extract_first_unit_coord(
             except (ValueError, TypeError):
                 pass
     return None
-
-
-_SUBROUTINE_KINDS: frozenset[str] = frozenset(
-    {"compound_block", "sliding_window", "clause_branch"}
-)
-
-
-def is_subroutine_unit(unit: Any) -> bool:
-    """Checks whether an AST code unit is a subroutine block rather than a whole function.
-
-    Classification Rules:
-    1. Explicit 'is_subroutine' boolean in unit takes precedence if present.
-    2. Known subroutine kinds ('compound_block', 'sliding_window', 'clause_branch') return True.
-    3. All other kinds or unspecified kinds return False.
-    """
-    if not isinstance(unit, dict):
-        return False
-    if "is_subroutine" in unit and unit.get("is_subroutine") is not None:
-        return bool(unit["is_subroutine"])
-    return str(unit.get("kind") or "") in _SUBROUTINE_KINDS
 
 
 def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
@@ -757,6 +701,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         candidates: Optional[Set[str]] = None,
         enclosing_loops: Optional[List[Tuple[int, int]]] = None,
         pass_mode: Union[_VisitorPassMode, str] = _VisitorPassMode.AFTER_UNIT,
+        is_module_scope: bool = False,
     ) -> None:
         super().__init__()
         self.u_start = u_start
@@ -772,6 +717,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self.loaded: Set[str] = set()
         self.killed: Set[str] = set()
         self.has_dynamic_read: bool = False
+        self.is_module_scope = is_module_scope
 
     _DYNAMIC_READ_FUNCS = frozenset({"locals", "vars", "eval", "exec", "dir", "globals"})
 
@@ -1077,40 +1023,25 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             ):
                 func_name = node.func.attr
             if func_name in self._DYNAMIC_READ_FUNCS:
+                if func_name == "globals" and not self.is_module_scope:
+                    return
                 self.has_dynamic_read = True
                 if self.candidates is not None:
                     for name in self.candidates:
                         self._record_downstream_read(name)
 
 
-class _ClosurePos(int):
-    """Integer line number that encapsulates column position for precise boundary matching."""
+class _ClosurePos(NamedTuple):
+    """Line and column position of a closure for boundary matching."""
 
+    line: int
     col: int = 0
-
-    def __new__(cls, line: int, col: int = 0) -> _ClosurePos:
-        obj = super().__new__(cls, line)
-        obj.col = col
-        return obj
-
-    @property
-    def line(self) -> int:
-        return int(self)
-
-    def __getitem__(self, idx: int) -> int:
-        return (int(self), self.col)[idx]
-
-    def __iter__(self) -> Iterator[int]:
-        return iter((int(self), self.col))
-
-    def __len__(self) -> int:
-        return 2
 
 
 def _collect_scope_closures_uncached(
     scope_node: ast.AST,
-) -> List[Tuple[int, Set[str]]]:
-    closures: List[Tuple[int, Set[str]]] = []
+) -> List[Tuple[_ClosurePos, Set[str]]]:
+    closures: List[Tuple[_ClosurePos, Set[str]]] = []
 
     def _resolve_stmt_start_pos(s: ast.stmt) -> Tuple[int, int]:
         s_line = int(getattr(s, "lineno", 0) or 0)
@@ -1240,7 +1171,7 @@ def _collect_scope_closures_uncached(
     return closures
 
 
-def _collect_scope_closures(scope_node: ast.AST) -> List[Tuple[int, Set[str]]]:
+def _collect_scope_closures(scope_node: ast.AST) -> List[Tuple[_ClosurePos, Set[str]]]:
     """Discovers all closures defined in a scope, recorded with their starting line."""
     return _get_or_compute_scope_cached(
         _scope_closures_cache,
@@ -1260,14 +1191,14 @@ def _collect_pre_unit_closures(
     to the unit in the same lexical scope."""
     captured_reads: Set[str] = set()
     for c_pos, reads in _collect_scope_closures(scope_node):
-        if isinstance(c_pos, tuple) and len(c_pos) >= 2:
+        if isinstance(c_pos, (tuple, list)) and len(c_pos) >= 2:
             c_line, c_col = int(c_pos[0]), int(c_pos[1])
         else:
             c_line = int(c_pos)
             c_col = getattr(c_pos, "col", 0)
         is_pre = (
             c_line < u_start
-            or (c_line == u_start and u_start_col is not None and c_col < u_start_col)
+            or (c_line == u_start and (u_start_col is None or c_col < u_start_col))
         )
         if is_pre:
             if candidates is not None:
@@ -1481,29 +1412,18 @@ def _scope_reads_outputs_after_line(
     """Checks whether any statement in the scope loads outputs after the given line,
     including loop-carried reads if line sits inside an enclosing loop."""
     enclosing_loops = _find_enclosing_loops(scope_node, line, line)
-    visitor = _StrictPostLineVisitor(
-        line,
-        line,
-        None,
-        candidates=outputs,
-        enclosing_loops=enclosing_loops,
-        pass_mode=_VisitorPassMode.AFTER_UNIT,
-    )
-    for stmt in getattr(scope_node, "body", []):
-        visitor.visit(stmt)
-    loaded = set(visitor.loaded)
-    if enclosing_loops and not loaded.intersection(outputs):
-        loop_visitor = _StrictPostLineVisitor(
-            line,
-            line,
-            None,
-            candidates=outputs,
-            enclosing_loops=enclosing_loops,
-            pass_mode=_VisitorPassMode.LOOP_CARRIED,
+
+    def _execute_pass(mode: _VisitorPassMode) -> Set[str]:
+        v = _StrictPostLineVisitor(
+            line, line, None, candidates=outputs, enclosing_loops=enclosing_loops, pass_mode=mode
         )
         for stmt in getattr(scope_node, "body", []):
-            loop_visitor.visit(stmt)
-        loaded.update(loop_visitor.loaded)
+            v.visit(stmt)
+        return set(v.loaded)
+
+    loaded = _execute_pass(_VisitorPassMode.AFTER_UNIT)
+    if enclosing_loops and loaded.isdisjoint(outputs):
+        loaded.update(_execute_pass(_VisitorPassMode.LOOP_CARRIED))
     return bool(loaded & outputs)
 
 
@@ -1694,33 +1614,37 @@ def collect_downstream_read_names(
 
     if skip_pre_unit_closures:
         pre_unit_captured_reads: Set[str] = set()
-        potential_captures = _collect_pre_unit_closures(
-            scope_node,
-            u_start,
-            candidates=candidates,
-            u_start_col=u_start_col,
-        )
-        suppressed = (
-            (potential_captures & candidates)
-            if candidates is not None
-            else potential_captures
-        )
-        if suppressed:
-            with _downstream_cache_lock:
-                if not _warned_lenient_closure[0]:
-                    _warned_lenient_closure[0] = True
-                    logger.warning(
-                        "Lenient closure mode active: suppressed pre-unit closure read capture; "
-                        "escaping callback mutations may be unobserved"
-                    )
-            logger.debug(
-                "Lenient closure mode suppressed pre-unit closure read capture "
-                "for variable(s) %s in %s (lines %d-%d)",
-                sorted(suppressed),
-                unit.get("file", ""),
+        if logger.isEnabledFor(logging.DEBUG) or (
+            logger.isEnabledFor(logging.WARNING) and not _warned_lenient_closure[0]
+        ):
+            potential_captures = _collect_pre_unit_closures(
+                scope_node,
                 u_start,
-                u_end,
+                candidates=candidates,
+                u_start_col=u_start_col,
             )
+            suppressed = (
+                (potential_captures & candidates)
+                if candidates is not None
+                else potential_captures
+            )
+            if suppressed:
+                with _downstream_cache_lock:
+                    if not _warned_lenient_closure[0]:
+                        _warned_lenient_closure[0] = True
+                        logger.warning(
+                            "Lenient closure mode active: suppressed pre-unit "
+                            "closure read capture; escaping callback mutations "
+                            "may be unobserved"
+                        )
+                logger.debug(
+                    "Lenient closure mode suppressed pre-unit closure read capture "
+                    "for variable(s) %s in %s (lines %d-%d)",
+                    sorted(suppressed),
+                    unit.get("file", ""),
+                    u_start,
+                    u_end,
+                )
     else:
         pre_unit_captured_reads = _collect_pre_unit_closures(
             scope_node,
@@ -1729,6 +1653,7 @@ def collect_downstream_read_names(
             u_start_col=u_start_col,
         )
 
+    is_module = isinstance(scope_node, ast.Module)
 
     visitor = _DownstreamReadVisitor(
         u_start,
@@ -1737,6 +1662,7 @@ def collect_downstream_read_names(
         candidates=candidates,
         enclosing_loops=enclosing_loops,
         pass_mode=_VisitorPassMode.AFTER_UNIT,
+        is_module_scope=is_module,
     )
     for stmt in getattr(scope_node, "body", []):
         visitor.visit(stmt)
@@ -1751,6 +1677,7 @@ def collect_downstream_read_names(
             candidates=candidates,
             enclosing_loops=enclosing_loops,
             pass_mode=_VisitorPassMode.LOOP_CARRIED,
+            is_module_scope=is_module,
         )
         for stmt in getattr(scope_node, "body", []):
             loop_visitor.visit(stmt)
@@ -1802,7 +1729,14 @@ def _pair_clone_outputs(
         )
         return []
     common = set(u1_dedup) & set(u2_dedup)
-    # Fail closed if any common variable occupies different positional indices
+    # Design Note (Recall Trade-off & Semantic Soundness):
+    # For strictly alpha-equivalent clones, positional first-store pairing is theoretically
+    # sound regardless of name permutations. However, in practical refactoring of real codebases,
+    # when clones share variable names in differing orders (e.g. [a, b] vs [b, a]), this almost
+    # always signals semantic differences or Type-3 drift rather than pure alpha-renaming.
+    # Rejecting pairs with conflicting positional orders for common variables trades away a small
+    # amount of recall to decisively prevent silent semantic bugs (such as accidental variable
+    # swapping at extraction call sites).
     if any(u1_dedup.index(name) != u2_dedup.index(name) for name in common):
         logger.debug(
             "Rejecting clone output pairing: common variables have conflicting "
@@ -1937,7 +1871,8 @@ def _extract_effective_unit_outputs(
     unit: Dict[str, Any], scope: Dict[str, Any]
 ) -> List[str]:
     """Extracts non-global, non-local outputs from precomputed unit dict or analyzed scope."""
-    raw = unit.get("outputs")
+    raw = resolve_unit_declared_outputs(unit)
+
     if isinstance(raw, (set, frozenset)):
         if len(raw) > 1:
             logger.debug(
@@ -1949,6 +1884,8 @@ def _extract_effective_unit_outputs(
         cands: Sequence[str] = list(raw)
     elif isinstance(raw, (list, tuple)):
         cands = list(raw)
+    elif scope.get("outputs_ambiguous"):
+        return []
     else:
         cands = scope.get("outputs", [])
     excluded = set(scope.get("globals", [])) | set(scope.get("nonlocals", []))
@@ -1984,28 +1921,26 @@ def resolve_clone_generator_subroutine_outputs(
                 )
                 return None
 
-    raw_o1 = u1.get("outputs")
-    raw_o2 = u2.get("outputs")
-    if (
-        (isinstance(raw_o1, (set, frozenset)) and len(raw_o1) > 1)
-        or (isinstance(raw_o2, (set, frozenset)) and len(raw_o2) > 1)
-    ):
-        logger.debug(
-            "Rejecting generator subroutine pair: set-valued outputs lack positional ordering"
+    for u_chk, s_chk, side_lbl in ((u1, scope1, "u1"), (u2, scope2, "u2")):
+        raw_o = (
+            u_chk.get("precomputed_outputs")
+            if ("precomputed_outputs" in u_chk and u_chk.get("precomputed_outputs") is not None)
+            else u_chk.get("outputs")
         )
-        return None
+        if isinstance(raw_o, (set, frozenset)) and len(raw_o) > 1:
+            logger.debug(
+                "Rejecting generator subroutine pair: set-valued outputs lack positional ordering"
+            )
+            return None
+        if s_chk.get("outputs_ambiguous"):
+            logger.debug(
+                "Rejecting generator subroutine pair: ambiguous scope outputs "
+                "lack positional ordering"
+            )
+            return None
 
-    is_precomputed = (
-        isinstance(raw_o1, (list, tuple, set, frozenset))
-        and isinstance(raw_o2, (list, tuple, set, frozenset))
-    )
-
-    if is_precomputed:
-        outs1 = list(dict.fromkeys(_extract_effective_unit_outputs(u1, scope1)))
-        outs2 = list(dict.fromkeys(_extract_effective_unit_outputs(u2, scope2)))
-    else:
-        outs1 = _extract_effective_unit_outputs(u1, scope1)
-        outs2 = _extract_effective_unit_outputs(u2, scope2)
+    outs1 = _extract_effective_unit_outputs(u1, scope1)
+    outs2 = _extract_effective_unit_outputs(u2, scope2)
 
     u1_def = (
         set(scope1.get("definite_stores", [])) | set(scope1.get("inputs", []))
@@ -2153,6 +2088,13 @@ def resolve_clone_pair_outputs(
                     "lack positional ordering"
                 )
                 return None
+
+    if scope1.get("outputs_ambiguous") or scope2.get("outputs_ambiguous"):
+        logger.debug(
+            "Rejecting clone pair output resolution: ambiguous scope outputs "
+            "lack positional ordering"
+        )
+        return None
 
     _, effective_skip_closures = resolve_closure_strictness_mode(
         closure_strictness=closure_strictness,

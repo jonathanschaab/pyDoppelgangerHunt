@@ -9,10 +9,10 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.config import normalize_path_string, paths_match_boundary
-from pydoppelgangerhunt.fixer.dataflow import _load_unit_file_text
 from pydoppelgangerhunt.fixer.scope import analyze_unit_variable_scope
 from pydoppelgangerhunt.fixer.source import (
     _find_innermost_enclosing_node,
+    _load_unit_file_text,
     split_source_lines,
 )
 from pydoppelgangerhunt.parser import is_decorator_named

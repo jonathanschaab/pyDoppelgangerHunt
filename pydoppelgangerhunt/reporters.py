@@ -70,6 +70,11 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
     or disk-based source reading. Callers can explicitly specify
     'source_lines_is_sliced': True (or False) to disambiguate whether 'source_lines'
     represents a pre-sliced excerpt or the complete file.
+
+    Note:
+        When the 'end' coordinate is omitted in the unit dictionary, it defaults
+        to end = start (a single line), consistent with resolve_unit_line_bounds,
+        rather than extending to end-of-file.
     """
     s_d, e_d = _unit_line_bounds(unit)
     n_d = str(unit.get("name") or "unit")

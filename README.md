@@ -179,11 +179,14 @@ from pydoppelgangerhunt import (
 - **`detect_line_ending(*sources)`**: Detects predominant line ending format across source strings or iterables via majority vote (`\n`, `\r\n`, or `\r`), breaking ties in priority order (`\n` → `\r\n` → `\r`).
 - **`intervals_overlap(s1, e1, s2, e2)`**: Fast primitive returning `True` if two half-open intervals `[s1, e1)` and `[s2, e2)` intersect; `False` otherwise.
 - **`is_subroutine_unit(unit)`**: Inspects unit metadata to determine if a clone unit represents
-  an inner compound block, sliding window, or clause branch rather than an entire callable,
-  applying heuristic fallbacks when `kind` is unspecified.
+  an inner compound block, sliding window, or clause branch rather than an entire callable.
+  Explicit `is_subroutine` boolean takes precedence; returns `True` for known subroutine kinds
+  (`compound_block`, `sliding_window`, `clause_branch`), and `False` for all others (the legacy
+  `":"` naming heuristic has been removed).
 - **`refactor_module_units(source_text, replacements, tier1=True, tier2=True, dry_run=False)`**: Applies multiple non-overlapping unit replacements in strict **reverse source order** (descending byte offsets) using single-pass buffer slicing, guaranteeing that downstream text expansions or contractions never invalidate upstream coordinates.
 - **`validate_module_unit_replacements(source_text, replacements, tier1=True, tier2=True)`**: Non-mutating validation helper that verifies candidate replacements for collisions across Tier 1 (AST coordinate overlap) and Tier 2 (physical byte interval sweep) without modifying or allocating new source string buffers.
-- **`generate_refactoring_patch(candidate_pairs, repo_root=..., replace_clones=...)`**:
+- **`generate_refactoring_patch(candidate_pairs, repo_root=..., replace_clones=...,`**
+  **`closure_strictness="strict", skip_pre_unit_closures=False, ...)`**:
   Synthesizes a multi-file unified diff (`git apply` compatible) with dependency cycle detection
   and per-pair transactional snapshot rollback. For generator subroutines (within function or
   method definitions; module-level yields are a syntax error in Python), downstream variable

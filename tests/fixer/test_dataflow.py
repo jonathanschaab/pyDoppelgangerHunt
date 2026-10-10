@@ -2316,7 +2316,7 @@ def outer():
 
     closures = _collect_scope_closures(func)
     assert len(closures) == 1
-    assert closures[0][0] == inner_func.lineno
+    assert closures[0][0].line == inner_func.lineno
     assert "x" in closures[0][1]
 
 
@@ -2631,12 +2631,11 @@ def test_collect_pre_unit_closures_same_line_semicolon() -> None:
 
 
 def test_closure_pos_attributes_and_iteration() -> None:
-    """Verifies that _ClosurePos behaves as an integer while providing column and pair unpacking."""
+    """Verifies that _ClosurePos behaves as a NamedTuple with line, col, and tuple unpacking."""
     from pydoppelgangerhunt.fixer.dataflow import _ClosurePos
 
     pos = _ClosurePos(12, 4)
-    assert isinstance(pos, int)
-    assert pos == 12
+    assert isinstance(pos, tuple)
     assert pos.line == 12
     assert pos.col == 4
     assert pos[0] == 12
@@ -2644,7 +2643,7 @@ def test_closure_pos_attributes_and_iteration() -> None:
     assert len(pos) == 2
     line_val, col_val = pos
     assert line_val == 12 and col_val == 4
-    assert pos < 15
+    assert pos.line < 15
 
 
 def test_collect_scope_closures_falsy_col_offset_preserved() -> None:
@@ -2693,7 +2692,7 @@ def test_collect_scope_closures_falsy_col_offset_preserved() -> None:
     assert len(closures) == 1
     pos, names = closures[0]
     assert "captured_val" in names
-    assert int(pos) == 2
+    assert pos.line == 2
     assert getattr(pos, "line", None) == 2
     assert getattr(pos, "col", None) == 0  # Preserved as 0, not overridden by fn.col_offset (8)
 
@@ -3025,6 +3024,57 @@ def test_resolve_clone_generator_subroutine_outputs_closure_pos_tuple_normalizat
 
     res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
     assert res is None
+
+
+def test_collect_pre_unit_closures_same_line_missing_col_fails_closed() -> None:
+    """Verifies that same-line closures fail closed when column info is missing."""
+    from pydoppelgangerhunt.fixer.dataflow import _collect_pre_unit_closures
+
+    code = "cb = lambda: total; total = 1\n"
+    tree = ast.parse(code)
+    # With u_start_col=None, c_line == u_start is safely treated as pre-unit
+    pre_closures = _collect_pre_unit_closures(
+        tree, u_start=1, candidates={"total"}, u_start_col=None
+    )
+    assert "total" in pre_closures
+
+
+def test_precomputed_outputs_empty_list_precedence() -> None:
+    """Verifies that an explicitly empty precomputed_outputs list is honored over outputs."""
+    from pydoppelgangerhunt.fixer.scope import _inspect_unit_scope
+
+    code = (
+        "def worker():\n"
+        "    total = 0\n"
+        "    yield total\n"
+    )
+    unit = {
+        "file": "mod.py",
+        "start": 2,
+        "end": 3,
+        "kind": "compound_block",
+        "source_text": code,
+        "precomputed_outputs": [],
+        "outputs": ["total"],
+    }
+    scope = _inspect_unit_scope(unit)
+    assert scope["outputs"] == []
+
+
+def test_downstream_read_crlf_and_lone_cr_line_handling() -> None:
+    """Verifies that collect_downstream_read_names handles CRLF and lone-CR line endings."""
+    from pydoppelgangerhunt.fixer.dataflow import collect_downstream_read_names
+
+    crlf_code = "def f():\r\n    x = 1\r\n    y = x + 1\r\n    return y\r\n"
+    lone_cr_code = "def f():\r    x = 1\r    y = x + 1\r    return y\r"
+
+    u_crlf = {"file": "crlf.py", "source_text": crlf_code, "start": 2, "end": 2}
+    reads_crlf = collect_downstream_read_names(crlf_code, u_crlf, {"x"})
+    assert reads_crlf is not None and "x" in reads_crlf
+
+    u_cr = {"file": "cr.py", "source_text": lone_cr_code, "start": 2, "end": 2}
+    reads_cr = collect_downstream_read_names(lone_cr_code, u_cr, {"x"})
+    assert reads_cr is not None and "x" in reads_cr
 
 
 

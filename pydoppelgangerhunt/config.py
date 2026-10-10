@@ -16,6 +16,15 @@ logger = logging.getLogger(__name__)
 _warned_closure_lock: threading.Lock = threading.Lock()
 _warned_closure_strictness_values: Set[str] = set()
 
+_CONFIG_KEY_NAMES: Tuple[str, ...] = (
+    "threshold",
+    "min_lines",
+    "exemptions",
+    "exclude",
+    "closure_strictness",
+    "skip_pre_unit_closures",
+)
+
 
 def resolve_closure_strictness_mode(
     closure_strictness: Optional[str] = None,
@@ -346,17 +355,7 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
         tool_sec = data.get("tool", {}) if isinstance(data, dict) else {}
         if isinstance(tool_sec, dict) and isinstance(tool_sec.get(section_name), dict):
             return dict(tool_sec[section_name])
-        if isinstance(data, dict) and any(
-            k in data
-            for k in (
-                "threshold",
-                "min_lines",
-                "exemptions",
-                "exclude",
-                "closure_strictness",
-                "skip_pre_unit_closures",
-            )
-        ):
+        if isinstance(data, dict) and any(k in data for k in _CONFIG_KEY_NAMES):
             return dict(data)
     except (ImportError, OSError, ValueError, TypeError):
         pass
@@ -419,17 +418,7 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
                     except ValueError:
                         pass
         if not any(line.strip().startswith("[") for line in lines):
-            if any(
-                k in config
-                for k in (
-                    "threshold",
-                    "min_lines",
-                    "exemptions",
-                    "exclude",
-                    "closure_strictness",
-                    "skip_pre_unit_closures",
-                )
-            ):
+            if any(k in config for k in _CONFIG_KEY_NAMES):
                 return config
             return {}
         return config
