@@ -2596,6 +2596,12 @@ def test_collect_scope_closures_class_header_expressions() -> None:
     assert "val2" in captured
     assert "val3" in captured
 
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="PEP 695 type_params syntax requires Python 3.12+"
+)
+def test_collect_scope_closures_class_type_params() -> None:
+    """Verifies that _collect_scope_closures inspects class type parameters in Python 3.12+."""
     code_gen = (
         "def outer(val4):\n"
         "    class GenericClass[T: (lambda: val4)]:\n"
@@ -2641,6 +2647,9 @@ def test_closure_pos_attributes_and_iteration() -> None:
     assert pos < 15
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="PEP 695 type_params syntax requires Python 3.12+"
+)
 def test_extract_nested_scope_free_reads_inner_type_params() -> None:
     """Verifies that inner function and type alias type params do not escape to outer scope."""
     from pydoppelgangerhunt.fixer.dataflow import _extract_nested_scope_free_reads
@@ -2672,6 +2681,7 @@ def test_extract_nested_scope_free_reads_inner_type_params() -> None:
     reads_alias = _extract_nested_scope_free_reads(func_alias)
     assert "external_var" in reads_alias
     assert "U" not in reads_alias
+
 
 
 def test_resolve_unit_ast_end_col_single_line_multiple_semicolons() -> None:
