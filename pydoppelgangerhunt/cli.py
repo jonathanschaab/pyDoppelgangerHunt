@@ -1116,13 +1116,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if raw_cross_file in ("auto", "shared_module", "host_module", "host", "shared", "skip")
         else "auto"
     )
-    shared_module_name = str(args.shared_module_name or tool_cfg.get("shared_module_name", "_common.py"))
-    if args.closure_strictness is not None or args.skip_pre_unit_closures:
+    shared_module_name = str(
+        args.shared_module_name or tool_cfg.get("shared_module_name", "_common.py")
+    )
+    cfg_strictness = tool_cfg.get("closure_strictness")
+    cfg_skip = _safe_bool(tool_cfg.get("skip_pre_unit_closures", False))
+
+    if args.closure_strictness is not None:
         cli_strictness: Optional[str] = args.closure_strictness
         cli_skip: bool = _safe_bool(args.skip_pre_unit_closures)
         if (
-            cli_strictness is not None
-            and str(cli_strictness).strip().lower() in ("strict", "fail_closed")
+            str(cli_strictness).strip().lower() in ("strict", "fail_closed")
             and args.skip_pre_unit_closures
         ):
             logger.warning(
@@ -1130,9 +1134,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "--skip-pre-unit-closures",
                 cli_strictness,
             )
+    elif args.skip_pre_unit_closures:
+        cli_strictness = "lenient"
+        cli_skip = True
+        if cfg_strictness is not None and str(cfg_strictness).strip().lower() in (
+            "strict",
+            "fail_closed",
+        ):
+            logger.warning(
+                "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
+                "configured closure_strictness='%s'",
+                cfg_strictness,
+            )
     else:
-        cli_strictness = tool_cfg.get("closure_strictness")
-        cli_skip = _safe_bool(tool_cfg.get("skip_pre_unit_closures", False))
+        cli_strictness = cfg_strictness
+        cli_skip = cfg_skip
 
 
     if cli_strictness is not None and str(cli_strictness).strip().lower() not in (

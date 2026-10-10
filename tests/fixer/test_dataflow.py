@@ -27,9 +27,18 @@ from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-acc
     _extract_effective_unit_outputs,
     _extract_nested_scope_free_reads,
     _find_enclosing_loops,
+    _get_or_compute_scope_cached,
+    _get_scope_parent_map,
+    _get_scope_stmts_by_end_lineno,
+    _get_scope_try_and_with_blocks,
     _load_unit_file_text,
     _pair_clone_outputs,
+    _scope_closures_cache,
+    _scope_loops_cache,
+    _scope_parent_maps,
     _scope_reads_outputs_after_line,
+    _scope_stmts_by_end,
+    _scope_try_with_cache,
     collect_downstream_read_names,
     is_async_generator_with_return_value,
     resolve_clone_generator_subroutine_outputs,
@@ -2357,4 +2366,61 @@ def test_collect_downstream_read_names_wrong_source_digest_isolation() -> None:
 
     assert reads1 == {"var_a"}
     assert reads2 == {"var_b"}
+
+
+def test_scope_metadata_caching_and_cache_clear() -> None:
+    """Verifies that scope metadata is cached in WeakKeyDictionaries and purged on clear."""
+    code = (
+        "def f(x):\n"
+        "    for i in range(10):\n"
+        "        try:\n"
+        "            y = lambda: x\n"
+        "        except Exception:\n"
+        "            pass\n"
+    )
+    tree = ast.parse(code)
+    func_node = tree.body[0]
+
+    parent_map = _get_scope_parent_map(func_node)
+    assert func_node in _scope_parent_maps
+    assert _get_scope_parent_map(func_node) is parent_map
+
+    stmts_by_end = _get_scope_stmts_by_end_lineno(func_node)
+    assert func_node in _scope_stmts_by_end
+    assert _get_scope_stmts_by_end_lineno(func_node) is stmts_by_end
+
+    closures = _collect_scope_closures(func_node)
+    assert func_node in _scope_closures_cache
+    assert _collect_scope_closures(func_node) is closures
+
+    loops = _find_enclosing_loops(func_node, 3, 4)
+    assert func_node in _scope_loops_cache
+    assert _find_enclosing_loops(func_node, 3, 4) == loops
+
+    try_with = _get_scope_try_and_with_blocks(func_node)
+    assert func_node in _scope_try_with_cache
+    assert _get_scope_try_and_with_blocks(func_node) is try_with
+
+    _clear_downstream_reads_cache()
+
+    assert func_node not in _scope_parent_maps
+    assert func_node not in _scope_stmts_by_end
+    assert func_node not in _scope_closures_cache
+    assert func_node not in _scope_loops_cache
+    assert func_node not in _scope_try_with_cache
+
+
+def test_scope_metadata_caching_non_weakref_object_fallback() -> None:
+    """Verifies that non-weakreferenceable objects fall back without raising TypeError."""
+    import weakref  # pylint: disable=import-outside-toplevel
+
+    class _MockNonWeakNode(ast.AST):
+        __slots__ = ()
+
+    node = _MockNonWeakNode()
+    cache: weakref.WeakKeyDictionary[ast.AST, str] = weakref.WeakKeyDictionary()
+
+    result = _get_or_compute_scope_cached(cache, node, lambda: "computed_val")
+    assert result == "computed_val"
+
 

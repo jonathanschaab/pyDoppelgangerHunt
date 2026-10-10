@@ -9119,3 +9119,38 @@ def test_load_unit_file_text_truncated_at_start_line_fails_closed() -> None:
     # When explicitly marked not sliced, it returns the content
     unit_full = dict(unit, source_lines_is_sliced=False)
     assert _load_unit_file_text(unit_full) == "x = 1\ny = 2\nz = 3\n"
+
+
+def test_generate_refactoring_patch_skips_mismatched_subroutine_kinds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies that clone pairs with mismatched subroutine kinds immediately skip."""
+    import logging  # pylint: disable=import-outside-toplevel
+
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text("def fn():\n    x = 42\n    y = x + 1\n", encoding="utf-8")
+    f2.write_text("def fn2():\n    x = 42\n    y = x + 1\n", encoding="utf-8")
+
+    # u1 is a function (not a subroutine), u2 is a subroutine compound_block
+    u1 = {"file": str(f1), "start": 1, "end": 3, "name": "fn", "kind": "function"}
+    u2 = {"file": str(f2), "start": 2, "end": 3, "name": "fn2:sub", "kind": "compound_block"}
+
+    with caplog.at_level(logging.DEBUG, logger="pydoppelgangerhunt.fixer.patch"):
+        with mock.patch(
+            "pydoppelgangerhunt.fixer.patch.synthesize_shared_helper_code"
+        ) as mock_synth:
+            patch = generate_refactoring_patch(
+                [(1.0, u1, u2)],
+                repo_root=str(tmp_path),
+                replace_clones=True,
+            )
+            assert patch == ""
+            # Early exit: synthesize_shared_helper_code must not be called
+            mock_synth.assert_not_called()
+
+    assert any(
+        "mismatched subroutine kinds (is_sub1=False, is_sub2=True)" in r.message
+        for r in caplog.records
+    )
+

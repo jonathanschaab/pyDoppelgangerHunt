@@ -2965,6 +2965,7 @@ def generate_refactoring_patch(
                     is_sub1,
                     is_sub2,
                 )
+                continue
             is_sub = is_sub1
 
             has_multi_set_outputs = any(

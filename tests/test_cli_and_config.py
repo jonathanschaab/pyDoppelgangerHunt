@@ -2733,3 +2733,71 @@ def test_cli_main_omitted_top_does_not_raise(tmp_path: Path) -> None:
     with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[]):
         exit_code = pydoppelgangerhunt.main([str(repo)])
         assert exit_code == 0
+
+
+def test_cli_closure_strictness_and_skip_closures_precedence_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies precedence diagnostics and fallback when CLI flags and config interact."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "precedence_repo"
+    repo.mkdir()
+    patch_out = repo / "refactor.patch"
+    (repo / "f.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "pyproject.toml").write_text(
+        '[tool.pydoppelgangerhunt]\nclosure_strictness = "strict"\n',
+        encoding="utf-8",
+    )
+
+    dummy_clone = (
+        0.95,
+        {"name": "u1", "file": "f.py", "start": 1, "end": 1},
+        {"name": "u2", "file": "f.py", "start": 1, "end": 1},
+    )
+
+    with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[dummy_clone]):
+        with mock.patch(
+            "pydoppelgangerhunt.cli.generate_refactoring_patch", return_value="# patch\n"
+        ) as mock_patch:
+            # 1. Config strictness overridden by CLI --skip-pre-unit-closures
+            import logging  # pylint: disable=import-outside-toplevel
+            with caplog.at_level(logging.WARNING):
+                exit_code = main([
+                    str(repo),
+                    "--patch",
+                    str(patch_out),
+                    "--skip-pre-unit-closures",
+                ])
+            assert exit_code == 1
+            mock_patch.assert_called_once()
+            _, kwargs = mock_patch.call_args
+            assert kwargs.get("skip_pre_unit_closures") is True
+            assert kwargs.get("closure_strictness") == "lenient"
+            assert any(
+                "overrides configured closure_strictness='strict'" in r.message
+                for r in caplog.records
+            )
+
+            # 2. CLI --closure-strictness strict overrides CLI --skip-pre-unit-closures
+            caplog.clear()
+            mock_patch.reset_mock()
+            with caplog.at_level(logging.WARNING):
+                exit_code = main([
+                    str(repo),
+                    "--patch",
+                    str(patch_out),
+                    "--closure-strictness",
+                    "strict",
+                    "--skip-pre-unit-closures",
+                ])
+            assert exit_code == 1
+            mock_patch.assert_called_once()
+            _, kwargs = mock_patch.call_args
+            assert kwargs.get("skip_pre_unit_closures") is False
+            assert kwargs.get("closure_strictness") == "strict"
+            assert any(
+                "takes precedence over --skip-pre-unit-closures" in r.message
+                for r in caplog.records
+            )
+

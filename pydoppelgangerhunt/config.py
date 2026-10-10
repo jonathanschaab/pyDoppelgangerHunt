@@ -337,7 +337,14 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
             return dict(tool_sec[section_name])
         if isinstance(data, dict) and any(
             k in data
-            for k in ("threshold", "min_lines", "exemptions", "exclude", "closure_strictness")
+            for k in (
+                "threshold",
+                "min_lines",
+                "exemptions",
+                "exclude",
+                "closure_strictness",
+                "skip_pre_unit_closures",
+            )
         ):
             return dict(data)
     except (ImportError, OSError, ValueError, TypeError):
@@ -403,7 +410,14 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
         if not any(line.strip().startswith("[") for line in lines):
             if any(
                 k in config
-                for k in ("threshold", "min_lines", "exemptions", "exclude", "closure_strictness")
+                for k in (
+                    "threshold",
+                    "min_lines",
+                    "exemptions",
+                    "exclude",
+                    "closure_strictness",
+                    "skip_pre_unit_closures",
+                )
             ):
                 return config
             return {}

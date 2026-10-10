@@ -9,7 +9,21 @@ from enum import Enum
 import hashlib
 import logging
 import threading
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
+import weakref
 
 from pydoppelgangerhunt.config import resolve_closure_strictness_mode
 from pydoppelgangerhunt.source_lines import (
@@ -33,6 +47,53 @@ __all__ = [
     "resolve_closure_strictness_mode",
     "resolve_generator_subroutine_outputs",
 ]
+
+_CacheValT = TypeVar("_CacheValT")
+
+_downstream_cache_lock: threading.Lock = threading.Lock()
+_MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
+_downstream_reads_cache: OrderedDict[Tuple[Any, ...], frozenset[str]] = OrderedDict()
+
+_scope_parent_maps: weakref.WeakKeyDictionary[ast.AST, Dict[ast.AST, ast.AST]] = (
+    weakref.WeakKeyDictionary()
+)
+_scope_stmts_by_end: weakref.WeakKeyDictionary[ast.AST, Dict[int, List[ast.stmt]]] = (
+    weakref.WeakKeyDictionary()
+)
+_scope_closures_cache: weakref.WeakKeyDictionary[ast.AST, List[Tuple[int, Set[str]]]] = (
+    weakref.WeakKeyDictionary()
+)
+_scope_loops_cache: weakref.WeakKeyDictionary[ast.AST, List[Tuple[int, int]]] = (
+    weakref.WeakKeyDictionary()
+)
+_scope_try_with_cache: weakref.WeakKeyDictionary[ast.AST, List[ast.AST]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _get_or_compute_scope_cached(
+    cache: weakref.WeakKeyDictionary[ast.AST, _CacheValT],
+    scope_node: ast.AST,
+    compute_fn: Callable[[], _CacheValT],
+) -> _CacheValT:
+    """Retrieves cached scope metadata or computes, caches, and returns it thread-safely."""
+    with _downstream_cache_lock:
+        try:
+            cached = cache.get(scope_node)
+            if cached is not None:
+                return cached
+        except TypeError:
+            pass
+
+    computed = compute_fn()
+
+    with _downstream_cache_lock:
+        try:
+            cache[scope_node] = computed
+        except TypeError:
+            pass
+
+    return computed
 
 
 def _load_unit_file_text(
@@ -141,36 +202,30 @@ def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
 
 def _get_scope_parent_map(scope_node: ast.AST) -> Dict[ast.AST, ast.AST]:
     """Retrieves or builds cached parent map for AST nodes within the scope."""
-    with _downstream_cache_lock:
-        cached = getattr(scope_node, "_pydh_parent_map", None)
-        if isinstance(cached, dict):
-            return cached
-    parent_map: Dict[ast.AST, ast.AST] = {}
-    for parent in ast.walk(scope_node):
-        for child in ast.iter_child_nodes(parent):
-            parent_map[child] = parent
-    with _downstream_cache_lock:
-        setattr(scope_node, "_pydh_parent_map", parent_map)
-    return parent_map
+    def _compute() -> Dict[ast.AST, ast.AST]:
+        parent_map: Dict[ast.AST, ast.AST] = {}
+        for parent in ast.walk(scope_node):
+            for child in ast.iter_child_nodes(parent):
+                parent_map[child] = parent
+        return parent_map
+
+    return _get_or_compute_scope_cached(_scope_parent_maps, scope_node, _compute)
 
 
 def _get_scope_stmts_by_end_lineno(
     scope_node: ast.AST,
 ) -> Dict[int, List[ast.stmt]]:
     """Retrieves or builds cached map of statement end line numbers to statement nodes."""
-    with _downstream_cache_lock:
-        cached = getattr(scope_node, "_pydh_stmts_by_end", None)
-        if isinstance(cached, dict):
-            return cached
-    m: Dict[int, List[ast.stmt]] = {}
-    for node in ast.walk(scope_node):
-        if isinstance(node, ast.stmt):
-            e = getattr(node, "end_lineno", None) or getattr(node, "lineno", 0) or 0
-            if e > 0:
-                m.setdefault(e, []).append(node)
-    with _downstream_cache_lock:
-        setattr(scope_node, "_pydh_stmts_by_end", m)
-    return m
+    def _compute() -> Dict[int, List[ast.stmt]]:
+        m: Dict[int, List[ast.stmt]] = {}
+        for node in ast.walk(scope_node):
+            if isinstance(node, ast.stmt):
+                e = getattr(node, "end_lineno", None) or getattr(node, "lineno", 0) or 0
+                if e > 0:
+                    m.setdefault(e, []).append(node)
+        return m
+
+    return _get_or_compute_scope_cached(_scope_stmts_by_end, scope_node, _compute)
 
 
 
@@ -945,14 +1000,9 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
                         self._record_downstream_read(name)
 
 
-def _collect_scope_closures(scope_node: ast.AST) -> List[Tuple[int, Set[str]]]:
-    """Discovers all closures defined in a scope, recorded with their starting line."""
-    with _downstream_cache_lock:
-        cached = getattr(scope_node, "_pydh_scope_closures", None)
-        if isinstance(cached, list):
-            return cached
-
-
+def _collect_scope_closures_uncached(
+    scope_node: ast.AST,
+) -> List[Tuple[int, Set[str]]]:
     closures: List[Tuple[int, Set[str]]] = []
 
     def _extract_header_nodes(s: ast.stmt) -> List[ast.AST]:
@@ -1046,9 +1096,16 @@ def _collect_scope_closures(scope_node: ast.AST) -> List[Tuple[int, Set[str]]]:
                 _walk_stmts(getattr(case, "body", []))
 
     _walk_stmts(getattr(scope_node, "body", []))
-    with _downstream_cache_lock:
-        setattr(scope_node, "_pydh_scope_closures", closures)
     return closures
+
+
+def _collect_scope_closures(scope_node: ast.AST) -> List[Tuple[int, Set[str]]]:
+    """Discovers all closures defined in a scope, recorded with their starting line."""
+    return _get_or_compute_scope_cached(
+        _scope_closures_cache,
+        scope_node,
+        lambda: _collect_scope_closures_uncached(scope_node),
+    )
 
 
 
@@ -1065,15 +1122,15 @@ def _collect_pre_unit_closures(
     return captured_reads
 
 
-_MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
-_downstream_reads_cache: OrderedDict[Tuple[Any, ...], frozenset[str]] = OrderedDict()
-_downstream_cache_lock: threading.Lock = threading.Lock()
-
-
 def _clear_downstream_reads_cache() -> None:
-    """Clears the downstream read memoization cache."""
+    """Clears the downstream read memoization cache and AST scope caches."""
     with _downstream_cache_lock:
         _downstream_reads_cache.clear()
+        _scope_parent_maps.clear()
+        _scope_stmts_by_end.clear()
+        _scope_closures_cache.clear()
+        _scope_loops_cache.clear()
+        _scope_try_with_cache.clear()
 
 
 def _build_downstream_cache_key(
@@ -1137,18 +1194,18 @@ def _find_enclosing_loops(
     u_end: int,
 ) -> List[Tuple[int, int]]:
     """Detects loops enclosing the unit boundaries for loop-carried dependence analysis."""
-    with _downstream_cache_lock:
-        cached_loops: Optional[List[Tuple[int, int]]] = getattr(scope_node, "_pydh_loops", None)
-    if cached_loops is None:
-        cached_loops = []
+    def _compute() -> List[Tuple[int, int]]:
+        loops: List[Tuple[int, int]] = []
         for node in ast.walk(scope_node):
             if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
                 l_start = getattr(node, "lineno", 0)
                 l_end = getattr(node, "end_lineno", None) or l_start
-                cached_loops.append((l_start, l_end))
-        with _downstream_cache_lock:
-            setattr(scope_node, "_pydh_loops", cached_loops)
+                loops.append((l_start, l_end))
+        return loops
 
+    cached_loops = _get_or_compute_scope_cached(
+        _scope_loops_cache, scope_node, _compute
+    )
     return [
         (l_start, l_end)
         for l_start, l_end in cached_loops
@@ -1217,20 +1274,17 @@ def _get_scope_try_and_with_blocks(
     scope_node: ast.AST,
 ) -> List[ast.AST]:
     """Caches all Try, TryStar, With, and AsyncWith blocks within scope."""
-    with _downstream_cache_lock:
-        cached = getattr(scope_node, "_pydh_try_with_blocks", None)
-        if isinstance(cached, list):
-            return cached
-    blocks: List[ast.AST] = []
-    for node in ast.walk(scope_node):
-        if (
-            isinstance(node, (ast.Try, ast.With, ast.AsyncWith))
-            or type(node).__name__ == "TryStar"
-        ):
-            blocks.append(node)
-    with _downstream_cache_lock:
-        setattr(scope_node, "_pydh_try_with_blocks", blocks)
-    return blocks
+    def _compute() -> List[ast.AST]:
+        blocks: List[ast.AST] = []
+        for node in ast.walk(scope_node):
+            if (
+                isinstance(node, (ast.Try, ast.With, ast.AsyncWith))
+                or type(node).__name__ == "TryStar"
+            ):
+                blocks.append(node)
+        return blocks
+
+    return _get_or_compute_scope_cached(_scope_try_with_cache, scope_node, _compute)
 
 
 
