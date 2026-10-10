@@ -2583,6 +2583,22 @@ def test_node_is_effectively_async_scope_pruning() -> None:
     tree_direct = ast.parse(code_direct_await)
     assert _node_is_effectively_async(tree_direct.body[0], enclosing_is_async=False)
 
+    # Async list comprehension without explicit await is effectively async
+    code_async_comp = (
+        "if cond:\n"
+        "    res = [x async for x in items]\n"
+    )
+    tree_comp = ast.parse(code_async_comp)
+    assert _node_is_effectively_async(tree_comp.body[0], enclosing_is_async=False)
+
+    # Async generator comprehension is effectively async
+    code_async_gen = (
+        "if cond:\n"
+        "    res = (x async for x in items)\n"
+    )
+    tree_gen = ast.parse(code_async_gen)
+    assert _node_is_effectively_async(tree_gen.body[0], enclosing_is_async=False)
+
 
 def test_parse_candidates_def_precedes_async_def() -> None:
     """Verifies that synchronous def wrapper is attempted before async def wrapper in scope."""

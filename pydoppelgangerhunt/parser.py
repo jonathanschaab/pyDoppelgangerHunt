@@ -990,6 +990,8 @@ def _node_is_effectively_async(
                 continue
             if isinstance(curr, (ast.Await, ast.AsyncFor, ast.AsyncWith)):
                 return True
+            if isinstance(curr, ast.comprehension) and bool(curr.is_async):
+                return True
             if enclosing_is_async and isinstance(curr, (ast.Yield, ast.YieldFrom)):
                 return True
             queue.extend(ast.iter_child_nodes(curr))
