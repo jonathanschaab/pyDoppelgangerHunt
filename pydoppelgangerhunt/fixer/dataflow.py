@@ -198,6 +198,8 @@ def _get_scope_parent_map(scope_node: ast.AST) -> Dict[ast.AST, ast.AST]:
     def _compute() -> Dict[ast.AST, ast.AST]:
         parent_map: Dict[ast.AST, ast.AST] = {}
         for parent in ast.walk(scope_node):
+            if parent is scope_node:
+                continue
             for child in ast.iter_child_nodes(parent):
                 parent_map[child] = parent
         return parent_map
@@ -212,6 +214,8 @@ def _get_scope_stmts_by_end_lineno(
     def _compute() -> Dict[int, List[ast.stmt]]:
         m: Dict[int, List[ast.stmt]] = {}
         for node in ast.walk(scope_node):
+            if node is scope_node:
+                continue
             if isinstance(node, ast.stmt):
                 e = getattr(node, "end_lineno", None) or getattr(node, "lineno", 0) or 0
                 if e > 0:
@@ -1418,6 +1422,8 @@ def _get_scope_try_and_with_blocks(
     def _compute() -> List[ast.AST]:
         blocks: List[ast.AST] = []
         for node in ast.walk(scope_node):
+            if node is scope_node:
+                continue
             if (
                 isinstance(node, (ast.Try, ast.With, ast.AsyncWith))
                 or type(node).__name__ == "TryStar"

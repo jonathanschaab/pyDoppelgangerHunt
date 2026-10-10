@@ -2748,6 +2748,35 @@ def test_frozenset_outputs_defensive_handling() -> None:
     )
 
 
+def test_scope_parent_map_excludes_scope_node_and_stays_bounded() -> None:
+    """Verifies that _scope_parent_maps excludes scope_node itself to prevent circular
+    references, and that cache size stays strictly bounded across thousands of invocations."""
+    import gc  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        _get_scope_parent_map,
+        _scope_parent_maps,
+        collect_downstream_read_names,
+    )
+
+    # 1. Verify parent_map does not contain scope_node as value
+    code = "def sample():\n    x = 1\n    return x\n"
+    tree = ast.parse(code)
+    fn = tree.body[0]
+    parent_map = _get_scope_parent_map(fn)
+    assert fn not in parent_map.values()
+
+    # 2. Stress test: collect_downstream_read_names across 2,000 synthetic AST modules
+    for i in range(2000):
+        src = f"def f_{i}():\n    x = {i}\n    print(x)\n"
+        unit = {"file": f"mod_{i}.py", "start": 2, "end": 2}
+        collect_downstream_read_names(src, unit)
+
+    # Cache must stay bounded to _MAX_SCOPE_CACHE_SIZE (1024)
+    assert len(_scope_parent_maps) <= 1024
+    gc.collect()
+
+
+
 
 
 

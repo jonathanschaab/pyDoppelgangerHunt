@@ -2758,3 +2758,31 @@ def test_split_delimited_type_string_unmatched_closing_bracket() -> None:
     )
     assert _split_pipe_union_args("int] | str") == ["int] | str"]
 
+
+def test_split_type_args_and_delimited_string_malformed_inputs() -> None:
+    """Verifies that _split_type_args and _split_delimited_type_string strictly reject
+    malformed, unbalanced, or compound disjoint bracket inputs."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _split_delimited_type_string,
+        _split_type_args,
+    )
+
+    # 1. Excess closing bracket at the end
+    assert _split_type_args("Tuple[int]]") == []
+
+    # 2. Compound types with disjoint brackets
+    assert _split_type_args("Tuple[int] | List[str]") == []
+
+    # 3. Delimited type string with premature closing bracket
+    assert _split_delimited_type_string("a | b]", "|") == []
+
+    # 4. Missing opening bracket or unclosed bracket
+    assert _split_type_args("int]") == []
+    assert _split_type_args("[int") == []
+    assert _split_type_args("Tuple[[int]") == []
+
+    # 5. String literal containing brackets inside generic
+    assert _split_type_args('Literal["]"]') == ['"]"']
+    assert _split_type_args('Literal["["]') == ['"["']
+
+

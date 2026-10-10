@@ -155,9 +155,30 @@ def _split_delimited_type_string(
 def _split_type_args(type_str: str) -> List[str]:
     """Splits top-level arguments of a generic type string, respecting brackets and quotes."""
     cleaned = type_str.strip()
-    if "[" not in cleaned or not cleaned.endswith("]"):
+    if not cleaned.endswith("]") or "[" not in cleaned:
         return []
-    inner = cleaned.split("[", 1)[1][:-1]
+    bracket_idx = cleaned.find("[")
+    depth = 0
+    active_quote: Optional[str] = None
+    escaped = False
+    for idx in range(bracket_idx, len(cleaned)):
+        ch = cleaned[idx]
+        active_quote, escaped = _advance_quote_state(ch, active_quote, escaped)
+        if active_quote:
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                if idx != len(cleaned) - 1:
+                    return []
+                break
+            if depth < 0:
+                return []
+    if depth != 0 or active_quote is not None:
+        return []
+    inner = cleaned[bracket_idx + 1 : -1]
     return [
         c
         for c in _split_delimited_type_string(
