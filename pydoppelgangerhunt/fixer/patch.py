@@ -1261,12 +1261,18 @@ def _render_file_patch_plan(
         s = parse_unit_coord(unit, "start", default=1, strict=True)
         return s, parse_unit_coord(unit, "end", default=s, strict=True)
 
+    retained_ids: Set[int] = {id(r) for r in retained_cands}
+    retained_spans: Set[Tuple[Optional[str], int, int]] = {
+        (r.get("file"), _unit_span(r)[0], _unit_span(r)[1])
+        for r in retained_cands
+    }
+
     filtered_reps: List[Tuple[Dict[str, Any], str]] = []
     for u, rep in coord_valid_reps:
         u_span = _unit_span(u)
-        if any(
-            u is r or (u.get("file") == r.get("file") and u_span == _unit_span(r))
-            for r in retained_cands
+        if (
+            id(u) in retained_ids
+            or (u.get("file"), u_span[0], u_span[1]) in retained_spans
         ):
             if not any(
                 check_units_overlap(u, prev_u, repo_root=repo_root)

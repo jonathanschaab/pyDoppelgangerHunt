@@ -1211,6 +1211,23 @@ def test_batch_82_matcher_sloc_and_priority_score_bounds() -> None:
     assert len(clone_pairs) == 2
 
 
+def test_compute_priority_score_malformed_string_coordinates() -> None:
+    """Verifies that compute_priority_score defensively returns 0.0 on malformed coordinates."""
+    from pydoppelgangerhunt.matcher import (  # pylint: disable=import-outside-toplevel
+        compute_priority_score,
+    )
+
+    u1 = {"start": "not_an_int", "end": "5", "complexity": "high"}
+    u2 = {"start": 1, "end": 10, "complexity": 2}
+    assert compute_priority_score(0.9, u1, u2) == 0.0
+
+    u3 = {"start": 1, "end": 10, "complexity": "invalid"}
+    assert compute_priority_score(0.9, u2, u3) == 0.0
+
+    u4 = {"start": None, "end": None, "complexity": None}
+    assert compute_priority_score(0.9, u2, u4) >= 0.0
+
+
 def test_differential_scan_multi_unit_file_and_shingle_dedup(tmp_path: Path) -> None:
     """Verifies differential scanning with multi-unit files and candidate pair monotonic ordering."""
     from pydoppelgangerhunt.matcher import _add_candidate_pairs  # pylint: disable=import-outside-toplevel

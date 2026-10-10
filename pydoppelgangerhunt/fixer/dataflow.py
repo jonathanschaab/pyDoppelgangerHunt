@@ -14,6 +14,7 @@ from typing import (
     Callable,
     Dict,
     Iterable,
+    Iterator,
     List,
     NamedTuple,
     Optional,
@@ -1004,10 +1005,67 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
                         self._record_downstream_read(name)
 
 
+class _ClosurePos(int):
+    """Integer line number that encapsulates column position for precise boundary matching."""
+
+    col: int = 0
+
+    def __new__(cls, line: int, col: int = 0) -> _ClosurePos:
+        obj = super().__new__(cls, line)
+        obj.col = col
+        return obj
+
+    @property
+    def line(self) -> int:
+        return int(self)
+
+    def __getitem__(self, idx: int) -> int:
+        return (int(self), self.col)[idx]
+
+    def __iter__(self) -> Iterator[int]:
+        return iter((int(self), self.col))
+
+    def __len__(self) -> int:
+        return 2
+
+
 def _collect_scope_closures_uncached(
     scope_node: ast.AST,
 ) -> List[Tuple[int, Set[str]]]:
     closures: List[Tuple[int, Set[str]]] = []
+
+    def _resolve_stmt_start_pos(s: ast.stmt) -> Tuple[int, int]:
+        s_line = int(getattr(s, "lineno", 0) or 0)
+        s_col = int(getattr(s, "col_offset", 0) or 0)
+        decs = getattr(s, "decorator_list", [])
+        if decs:
+            dec_pos = [
+                (
+                    int(getattr(d, "lineno", None) or s_line),
+                    int(getattr(d, "col_offset", None) or s_col),
+                )
+                for d in decs
+            ]
+            if dec_pos:
+                min_l, min_c = min(dec_pos, key=lambda p: (p[0], p[1]))
+                if min_l < s_line or (min_l == s_line and min_c < s_col):
+                    s_line, s_col = min_l, min_c
+        return s_line, s_col
+
+    def _record_expr_closures(
+        nodes: Iterable[ast.AST], default_line: int, default_col: int
+    ) -> None:
+        for node in nodes:
+            for subnode in ast.walk(node):
+                if isinstance(subnode, (ast.Lambda, ast.GeneratorExp)):
+                    sub_line = int(getattr(subnode, "lineno", None) or default_line)
+                    sub_col = int(getattr(subnode, "col_offset", None) or default_col)
+                    closures.append(
+                        (
+                            _ClosurePos(sub_line, sub_col),
+                            _extract_nested_scope_free_reads(subnode),
+                        )
+                    )
 
     def _extract_header_nodes(s: ast.stmt) -> List[ast.AST]:
         if isinstance(s, ast.If):
@@ -1037,41 +1095,40 @@ def _collect_scope_closures_uncached(
 
     def _walk_stmts(stmts: Iterable[ast.stmt]) -> None:
         for stmt in stmts:
-            stmt_start = int(getattr(stmt, "lineno", 0) or 0)
-            decorators = getattr(stmt, "decorator_list", [])
-            if decorators:
-                dec_lines = [
-                    int(getattr(d, "lineno", None) or stmt_start) for d in decorators
-                ]
-                if dec_lines:
-                    dec_start = min(dec_lines)
-                    stmt_start = min(stmt_start, dec_start)
+            stmt_start, stmt_col = _resolve_stmt_start_pos(stmt)
 
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                closures.append((stmt_start, _extract_nested_scope_free_reads(stmt)))
+                closures.append(
+                    (
+                        _ClosurePos(stmt_start, stmt_col),
+                        _extract_nested_scope_free_reads(stmt),
+                    )
+                )
                 continue
 
             if isinstance(stmt, ast.ClassDef):
+                class_exprs = (
+                    list(stmt.decorator_list)
+                    + list(stmt.bases)
+                    + [kw.value for kw in stmt.keywords]
+                )
+                _record_expr_closures(class_exprs, stmt_start, stmt_col)
                 for item in stmt.body:
                     if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        dec_list = getattr(item, "decorator_list", [])
-                        item_lineno = int(getattr(item, "lineno", 0) or 0)
-                        dec_lines = [
-                            int(getattr(d, "lineno", None) or item_lineno)
-                            for d in dec_list
-                        ]
-                        item_start = min(dec_lines) if dec_lines else item_lineno
-                        closures.append((item_start, _extract_nested_scope_free_reads(item)))
+                        i_start, i_col = _resolve_stmt_start_pos(item)
+                        closures.append(
+                            (
+                                _ClosurePos(i_start, i_col),
+                                _extract_nested_scope_free_reads(item),
+                            )
+                        )
                     elif isinstance(item, ast.ClassDef):
                         _walk_stmts([item])
                     elif isinstance(item, ast.stmt):
-                        for hnode in _extract_header_nodes(item):
-                            for subnode in ast.walk(hnode):
-                                if isinstance(subnode, (ast.Lambda, ast.GeneratorExp)):
-                                    sub_line = int(getattr(subnode, "lineno", None) or stmt_start)
-                                    closures.append(
-                                        (sub_line, _extract_nested_scope_free_reads(subnode))
-                                    )
+                        i_start, i_col = _resolve_stmt_start_pos(item)
+                        _record_expr_closures(
+                            _extract_header_nodes(item), i_start, i_col
+                        )
                         for attr in ("body", "orelse", "finalbody"):
                             sub_body = getattr(item, attr, None)
                             if isinstance(sub_body, list):
@@ -1082,11 +1139,7 @@ def _collect_scope_closures_uncached(
                             _walk_stmts(getattr(case, "body", []))
                 continue
 
-            for hnode in _extract_header_nodes(stmt):
-                for subnode in ast.walk(hnode):
-                    if isinstance(subnode, (ast.Lambda, ast.GeneratorExp)):
-                        sub_lineno = int(getattr(subnode, "lineno", None) or stmt_start)
-                        closures.append((sub_lineno, _extract_nested_scope_free_reads(subnode)))
+            _record_expr_closures(_extract_header_nodes(stmt), stmt_start, stmt_col)
 
             for attr in ("body", "orelse", "finalbody"):
                 sub_stmts = getattr(stmt, attr, None)
@@ -1117,12 +1170,22 @@ def _collect_pre_unit_closures(
     scope_node: ast.AST,
     u_start: int,
     candidates: Optional[Set[str]] = None,
+    u_start_col: Optional[int] = None,
 ) -> Set[str]:
     """Discovers free variables captured by functions, class methods, and lambdas defined prior
     to the unit in the same lexical scope."""
     captured_reads: Set[str] = set()
-    for c_line, reads in _collect_scope_closures(scope_node):
-        if c_line < u_start:
+    for c_pos, reads in _collect_scope_closures(scope_node):
+        if isinstance(c_pos, tuple) and len(c_pos) >= 2:
+            c_line, c_col = int(c_pos[0]), int(c_pos[1])
+        else:
+            c_line = int(c_pos)
+            c_col = getattr(c_pos, "col", 0)
+        is_pre = (
+            c_line < u_start
+            or (c_line == u_start and u_start_col is not None and c_col < u_start_col)
+        )
+        if is_pre:
             if candidates is not None:
                 captured_reads.update(reads & candidates)
             else:
@@ -1529,10 +1592,15 @@ def collect_downstream_read_names(
 
     enclosing_loops = _find_enclosing_loops(scope_node, u_start, u_end)
 
+    u_start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
+
     if skip_pre_unit_closures:
         pre_unit_captured_reads: Set[str] = set()
         potential_captures = _collect_pre_unit_closures(
-            scope_node, u_start, candidates=candidates
+            scope_node,
+            u_start,
+            candidates=candidates,
+            u_start_col=u_start_col,
         )
         suppressed = (
             (potential_captures & candidates)
@@ -1557,7 +1625,10 @@ def collect_downstream_read_names(
             )
     else:
         pre_unit_captured_reads = _collect_pre_unit_closures(
-            scope_node, u_start, candidates=candidates
+            scope_node,
+            u_start,
+            candidates=candidates,
+            u_start_col=u_start_col,
         )
 
 

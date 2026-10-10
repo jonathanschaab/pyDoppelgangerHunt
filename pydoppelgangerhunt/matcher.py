@@ -1561,19 +1561,22 @@ def compute_priority_score(
     u2: Dict[str, Any],
 ) -> float:
     """Calculates refactoring priority based on similarity, line length, and cyclomatic complexity."""
-    raw_s1 = parse_unit_coord(u1, "start", default=1)
-    raw_e1 = parse_unit_coord(u1, "end", default=raw_s1)
-    raw_s2 = parse_unit_coord(u2, "start", default=1)
-    raw_e2 = parse_unit_coord(u2, "end", default=raw_s2)
-    if (
-        raw_e1 < raw_s1
-        or raw_e2 < raw_s2
-        or raw_s1 <= 0
-        or raw_s2 <= 0
-        or raw_e1 <= 0
-        or raw_e2 <= 0
-    ):
+    try:
+        raw_s1 = parse_unit_coord(u1, "start", default=1)
+        raw_e1 = parse_unit_coord(u1, "end", default=raw_s1)
+        raw_s2 = parse_unit_coord(u2, "start", default=1)
+        raw_e2 = parse_unit_coord(u2, "end", default=raw_s2)
+        if (
+            raw_e1 < raw_s1
+            or raw_e2 < raw_s2
+            or raw_s1 <= 0
+            or raw_s2 <= 0
+            or raw_e1 <= 0
+            or raw_e2 <= 0
+        ):
+            return 0.0
+        avg_sloc = (_unit_sloc(u1) + _unit_sloc(u2)) / 2.0
+        max_comp = max(1, int(u1.get("complexity") or 1), int(u2.get("complexity") or 1))
+        return float(round(sim * avg_sloc * max_comp, 1))
+    except (ValueError, TypeError):
         return 0.0
-    avg_sloc = (_unit_sloc(u1) + _unit_sloc(u2)) / 2.0
-    max_comp = max(1, int(u1.get("complexity") or 1), int(u2.get("complexity") or 1))
-    return float(round(sim * avg_sloc * max_comp, 1))

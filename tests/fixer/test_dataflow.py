@@ -2575,4 +2575,56 @@ def test_resolve_clone_pair_outputs_set_valued_rejection() -> None:
     assert resolve_clone_pair_outputs(u1, u2, s1, s2) is None
 
 
+def test_collect_scope_closures_class_header_expressions() -> None:
+    """Verifies that _collect_scope_closures inspects class decorators, bases, and keywords."""
+    code = (
+        "def outer(val1, val2, val3):\n"
+        "    @dec(lambda: val1)\n"
+        "    class MyClass(base(lambda: val2), metaclass=meta(lambda: val3)):\n"
+        "        pass\n"
+    )
+    tree = ast.parse(code)
+    func_node = tree.body[0]
+    closures = _collect_scope_closures(func_node)
+    captured = set()
+    for _, names in closures:
+        captured.update(names)
+    assert "val1" in captured
+    assert "val2" in captured
+    assert "val3" in captured
+
+
+def test_collect_pre_unit_closures_same_line_semicolon() -> None:
+    """Verifies that pre-unit closures defined before a semicolon on the same line are captured."""
+    code = "cb = lambda: val; total = [x for x in items]\n"
+    tree = ast.parse(code)
+    pre_closures = _collect_pre_unit_closures(
+        tree, u_start=1, candidates={"val"}, u_start_col=18
+    )
+    assert "val" in pre_closures
+
+    pre_closures_prior = _collect_pre_unit_closures(
+        tree, u_start=1, candidates={"val"}, u_start_col=0
+    )
+    assert "val" not in pre_closures_prior
+
+
+def test_closure_pos_attributes_and_iteration() -> None:
+    """Verifies that _ClosurePos behaves as an integer while providing column and pair unpacking."""
+    from pydoppelgangerhunt.fixer.dataflow import _ClosurePos
+
+    pos = _ClosurePos(12, 4)
+    assert isinstance(pos, int)
+    assert pos == 12
+    assert pos.line == 12
+    assert pos.col == 4
+    assert pos[0] == 12
+    assert pos[1] == 4
+    assert len(pos) == 2
+    line_val, col_val = pos
+    assert line_val == 12 and col_val == 4
+    assert pos < 15
+
+
+
 
