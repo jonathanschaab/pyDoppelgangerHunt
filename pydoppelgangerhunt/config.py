@@ -67,6 +67,12 @@ def resolve_closure_strictness_mode(
     return ("lenient" if is_lenient else "strict"), is_lenient
 
 
+def clear_closure_warning_cache() -> None:
+    """Clears the set of warned closure strictness values for multi-run lifecycle."""
+    with _warned_closure_lock:
+        _warned_closure_strictness_values.clear()
+
+
 DEFAULT_EXCLUDES: List[str] = [
     "checks/encapsulated",
     "checks\\encapsulated",

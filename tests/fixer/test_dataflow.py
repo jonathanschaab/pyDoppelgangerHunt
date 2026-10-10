@@ -3077,6 +3077,39 @@ def test_downstream_read_crlf_and_lone_cr_line_handling() -> None:
     assert reads_cr is not None and "x" in reads_cr
 
 
+def test_resolve_unit_ast_end_col_invalid_coords_fails_closed() -> None:
+    """Verifies that _resolve_unit_ast_end_col returns None on invalid coordinates."""
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        _resolve_unit_ast_end_col,
+    )
+
+    tree = ast.parse("def f():\n    x = 1\n")
+    assert _resolve_unit_ast_end_col(tree, {"start": "invalid"}) is None
+    assert _resolve_unit_ast_end_col(tree, {"start": 1, "end": "invalid"}) is None
+    assert _resolve_unit_ast_end_col(tree, {"start": -1}) is None
+    assert _resolve_unit_ast_end_col(tree, {"start": 5, "end": 2}) is None
+
+
+def test_clear_downstream_reads_cache_resets_closure_warning_cache() -> None:
+    """Verifies that _clear_downstream_reads_cache resets closure warning cache."""
+    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        _warned_closure_strictness_values,
+        clear_closure_warning_cache,
+        resolve_closure_strictness_mode,
+    )
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        _clear_downstream_reads_cache,
+    )
+
+    clear_closure_warning_cache()
+    resolve_closure_strictness_mode("unrecognized_mode_foo")
+    assert "unrecognized_mode_foo" in _warned_closure_strictness_values
+
+    _clear_downstream_reads_cache()
+    assert len(_warned_closure_strictness_values) == 0
+
+
+
 
 
 

@@ -1633,25 +1633,19 @@ def test_nested_generator_yield_assignment_does_not_mark_outer_unit() -> None:
     assert scope_sub.get("has_yield_assignment") is False
 
 
-def test_check_yield_assignment_prunes_generator_expression() -> None:
-    """Verifies that _check_yield_assignment prunes ast.GeneratorExp scopes."""
+def test_generator_expression_yield_does_not_set_yield_assignment() -> None:
+    """Verifies that yields inside GeneratorExp do not trigger has_yield_assignment."""
     from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
         _ScopeVisitor,
     )
 
     visitor = _ScopeVisitor()
-    yield_node = ast.Yield(value=ast.Constant(value=42))
-    comp = ast.comprehension(
-        target=ast.Name(id="i", ctx=ast.Store()),
-        iter=ast.List(elts=[], ctx=ast.Load()),
-        ifs=[],
-        is_async=0,
-    )
-    genexp = ast.GeneratorExp(elt=yield_node, generators=[comp])
-    assign_node = ast.Assign(targets=[ast.Name(id="g", ctx=ast.Store())], value=genexp)
-
-    # pylint: disable=protected-access
-    visitor._check_yield_assignment(assign_node.value)
+    tree = ast.parse("g = ((yield 42) for i in [])\nx = yield 100\n")
+    visitor.visit(tree.body[0])
     assert visitor.has_yield_assignment is False
+
+    visitor_assign = _ScopeVisitor()
+    visitor_assign.visit(tree.body[1])
+    assert visitor_assign.has_yield_assignment is True
 
 

@@ -413,23 +413,6 @@ class _ScopeVisitor(ast.NodeVisitor):
         for stmt in node.body:
             self.visit(stmt)
 
-    def _check_yield_assignment(self, node: Optional[ast.AST]) -> None:
-        if len(self._scope_stack) > 1 or node is None:
-            return
-        stack = [node]
-        while stack:
-            curr = stack.pop()
-            if isinstance(
-                curr,
-                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda, ast.GeneratorExp),
-            ):
-                continue
-            if isinstance(curr, ast.Yield):
-                self.has_yield_assignment = True
-                return
-            for child in ast.iter_child_nodes(curr):
-                stack.append(child)
-
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
         for target in node.targets:

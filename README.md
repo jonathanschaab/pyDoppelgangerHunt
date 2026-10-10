@@ -341,7 +341,7 @@ pydoppelgangerhunt --init
 | `--cross-file-strategy` | `auto\|shared_module\|host_module\|skip` | Cross-module deduplication strategy (`auto`, `shared_module`, `host_module`, or `skip`; default: `auto`) |
 | `--shared-module-name` | `FILENAME` | Target filename for shared utility extractions (default: `_common.py`) |
 | `--skip-pre-unit-closures` | Flag | Skip pre-unit closure scan during subroutine extraction |
-| `--closure-strictness` | `strict\|lenient` | Closure strictness mode (`strict` / `fail_closed` [soundness] or `lenient` / `fast` / `skip` [fewer rejections]; default: `strict`) |
+| `--closure-strictness` | `strict\|lenient\|fail_closed\|fast\|skip` | Closure strictness mode (`strict` / `fail_closed` [soundness] or `lenient` / `fast` / `skip` [fewer rejections]; default: `strict`) |
 | `--sort-by` | `similarity\|priority\|sloc` | Sort clone hits (default: `similarity`) |
 | `--priority` | Flag | Sort clones by Priority score: $\text{Sim} \times \text{SLOC} \times \text{Complexity}$ |
 | `--top` | `INT` | Truncate report to top $N$ clone pairs |

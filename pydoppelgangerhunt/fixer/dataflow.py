@@ -34,7 +34,10 @@ from typing import (
     Union,
 )
 
-from pydoppelgangerhunt.config import resolve_closure_strictness_mode
+from pydoppelgangerhunt.config import (
+    clear_closure_warning_cache,
+    resolve_closure_strictness_mode,
+)
 from pydoppelgangerhunt.source_lines import parse_unit_coord
 from pydoppelgangerhunt.fixer.source import (
     _find_innermost_enclosing_node,
@@ -49,6 +52,7 @@ _BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
 __all__ = [
     "GeneratorCloneSideData",
+    "clear_closure_warning_cache",
     "collect_downstream_read_names",
     "has_async_generator_delegation_hazard",
     "is_async_generator_with_return_value",
@@ -186,8 +190,11 @@ def _resolve_unit_ast_end_col(
     scope_node: ast.AST, unit: Dict[str, Any]
 ) -> Optional[int]:
     """Resolves end column offset from statement boundaries within the enclosing scope."""
-    u_start = parse_unit_coord(unit, "start", default=0)
-    u_end = parse_unit_coord(unit, "end", default=u_start)
+    try:
+        u_start = parse_unit_coord(unit, "start", default=0)
+        u_end = parse_unit_coord(unit, "end", default=u_start)
+    except (ValueError, TypeError):
+        return None
     if u_start <= 0 or u_end <= 0 or u_start > u_end:
         return None
 
@@ -1218,6 +1225,7 @@ def _clear_downstream_reads_cache() -> None:
         _scope_loops_cache.clear()
         _scope_try_with_cache.clear()
         _warned_lenient_closure[0] = False
+    clear_closure_warning_cache()
 
 
 def _build_downstream_cache_key(

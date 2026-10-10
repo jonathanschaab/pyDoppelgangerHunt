@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ast.GeneratorExp` within statements and class bodies alongside functions, classes, and lambdas.
 - **Subroutine Unit Classification**: Added `is_subroutine_unit` to detect compound blocks,
   sliding windows, and clause branches while excluding whole functions and methods.
+- **Closure Warning Cache Lifecycle**: Added `clear_closure_warning_cache` in `config.py`
+  (invoked by `_clear_downstream_reads_cache`) for reset in long-running processes.
 
 ### Breaking Changes
 - **Breaking Change in Coordinate Validation**: `is_valid_unit_coordinates` (when called with
@@ -87,6 +89,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-ancestor `parent.resolve()` calls and remove redundant symlink checks.
 - **Cross-File Missing Plan Text Fallback**: Fixed `f2_text` in `patch.py` to fall back to `None`
   instead of `""` when `f2_plan` is missing, allowing proper loading from disk.
+- **Defensive Coordinate Resolution in Dataflow**: Added `try/except (ValueError, TypeError)`
+  in `_resolve_unit_ast_end_col` to fail closed when passed unvalidated coordinate dictionaries.
+- **Orphaned Method Cleanup in Scope Visitor**: Removed dead `_check_yield_assignment` method
+  from `_ScopeVisitor`, using standard `_inspect_yield_assignment` during AST traversal.
 
 ## [1.0.0] - 2026-09-20
 ### Added
