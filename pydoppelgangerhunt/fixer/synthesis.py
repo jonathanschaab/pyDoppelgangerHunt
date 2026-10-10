@@ -275,7 +275,8 @@ def _unwrap_iterable_item_type(type_str: str) -> Optional[str]:
         "Iterator[", "Iterable[", "Generator[", "List[", "Sequence[", "Set[",
         "Tuple[", "Dict[", "Collection[", "Mapping[", "MutableMapping[",
         "DefaultDict[", "OrderedDict[", "list[", "set[", "tuple[", "dict[",
-        "defaultdict[",
+        "defaultdict[", "mapping[", "mutablemapping[", "sequence[", "iterable[",
+        "iterator[", "collection[",
     )
 
     for prefix in prefixes:

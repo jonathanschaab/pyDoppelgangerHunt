@@ -1985,7 +1985,7 @@ def test_infer_helper_return_type_yield_from_dict_keys() -> None:
 def test_infer_helper_return_type_yield_from_mapping_keys() -> None:
     """Verifies that yield from on a Mapping/mapping type infers Iterator[KeyType]."""
     scope = {"has_yield": True, "yield_expr_names": [("yield_from", "mapping")]}
-    meta1 = {"mapping": {"type": "Mapping[str, int]"}}
+    meta1 = {"mapping": {"type": "mapping[str, int]"}}
     meta2 = {"mapping": {"type": "mapping[str, int]"}}
     ret = _infer_helper_return_type(
         "Any",
@@ -2605,6 +2605,12 @@ def test_unwrap_iterable_item_type_unions_and_iterables() -> None:
     assert _unwrap_iterable_item_type("Tuple[int, str]") == "Union[int, str]"
     assert _unwrap_iterable_item_type("Dict[str, int]") == "str"
     assert _unwrap_iterable_item_type("Generator[int, None, None]") == "int"
+    assert _unwrap_iterable_item_type("mapping[str, int]") == "str"
+    assert _unwrap_iterable_item_type("mutablemapping[str, int]") == "str"
+    assert _unwrap_iterable_item_type("sequence[int]") == "int"
+    assert _unwrap_iterable_item_type("iterable[str]") == "str"
+    assert _unwrap_iterable_item_type("iterator[float]") == "float"
+    assert _unwrap_iterable_item_type("collection[bytes]") == "bytes"
     assert _unwrap_iterable_item_type("int") is None
     assert _unwrap_iterable_item_type("Union[List[int], int]") is None
 

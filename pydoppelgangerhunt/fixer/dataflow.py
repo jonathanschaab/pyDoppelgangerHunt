@@ -1144,14 +1144,13 @@ def _build_downstream_cache_key(
 ) -> Tuple[Any, ...]:
     """Forms a persistent cache key for downstream AST read analysis."""
     file_path_str = str(unit.get("file") or "")
-    computed_digest = hashlib.sha256(
-        source_text.encode("utf-8", errors="replace")
-    ).hexdigest()
     digest = source_digest or unit.get("source_digest") or unit.get("content_digest")
     if digest is not None:
-        content_digest = f"{computed_digest}:{digest}"
+        content_digest = str(digest)
     else:
-        content_digest = computed_digest
+        content_digest = hashlib.sha256(
+            source_text.encode("utf-8", errors="replace")
+        ).hexdigest()
 
     start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
     end_col = _extract_unit_end_col(unit)
@@ -1248,9 +1247,9 @@ def _stmts_enclose_unit(stmts: Sequence[ast.stmt], u_start: int, u_end: int) -> 
     """Checks whether a sequence of AST statements spans and encloses the unit's line range."""
     if not stmts:
         return False
-    s_start = min(getattr(s, "lineno", 0) for s in stmts)
+    s_start = min((getattr(s, "lineno", None) or 0) for s in stmts)
     s_end = max(
-        int(getattr(s, "end_lineno", None) or getattr(s, "lineno", s_start) or s_start)
+        int(getattr(s, "end_lineno", None) or getattr(s, "lineno", None) or s_start)
         for s in stmts
     )
     return s_start <= u_start and u_end <= s_end

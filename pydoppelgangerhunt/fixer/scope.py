@@ -418,7 +418,10 @@ class _ScopeVisitor(ast.NodeVisitor):
         stack = [node]
         while stack:
             curr = stack.pop()
-            if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            if isinstance(
+                curr,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda, ast.GeneratorExp),
+            ):
                 continue
             if isinstance(curr, ast.Yield):
                 self.has_yield_assignment = True

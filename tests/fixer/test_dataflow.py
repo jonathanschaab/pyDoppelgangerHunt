@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import sys
 from pathlib import Path
 from typing import Any, Dict
@@ -39,6 +40,7 @@ from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-acc
     _scope_reads_outputs_after_line,
     _scope_stmts_by_end,
     _scope_try_with_cache,
+    _stmts_enclose_unit,
     collect_downstream_read_names,
     is_async_generator_with_return_value,
     resolve_clone_generator_subroutine_outputs,
@@ -2351,21 +2353,38 @@ def test_resolve_clone_generator_subroutine_outputs_side2_zero_coords_rejected()
     assert res is None
 
 
-def test_collect_downstream_read_names_wrong_source_digest_isolation() -> None:
-    """Verifies that a caller-supplied wrong or colliding source_digest does not cause stale
-    cache sharing across differing source texts."""
+def test_collect_downstream_read_names_source_digest_avoids_rehash() -> None:
+    """Verifies that providing source_digest uses it directly and avoids rehashing source_text."""
     _clear_downstream_reads_cache()
     code1 = "def f():\n    var_a = 1\n    return var_a\n"
     code2 = "def f():\n    var_b = 2\n    return var_b\n"
     unit1 = {"file": "mod.py", "start": 2, "end": 2}
     unit2 = {"file": "mod.py", "start": 2, "end": 2}
 
-    # Both calls supply the same source_digest, but have different source_text
-    reads1 = collect_downstream_read_names(code1, unit1, source_digest="colliding_digest")
-    reads2 = collect_downstream_read_names(code2, unit2, source_digest="colliding_digest")
+    with mock.patch("pydoppelgangerhunt.fixer.dataflow.hashlib.sha256") as mock_sha:
+        reads1 = collect_downstream_read_names(code1, unit1, source_digest="digest_a")
+        mock_sha.assert_not_called()
+        assert reads1 == {"var_a"}
 
-    assert reads1 == {"var_a"}
-    assert reads2 == {"var_b"}
+        reads2 = collect_downstream_read_names(code2, unit2, source_digest="digest_b")
+        mock_sha.assert_not_called()
+        assert reads2 == {"var_b"}
+
+    # Without source_digest, hashlib.sha256 is called to hash source_text
+    with mock.patch(
+        "pydoppelgangerhunt.fixer.dataflow.hashlib.sha256", wraps=hashlib.sha256
+    ) as mock_sha_wrap:
+        reads3 = collect_downstream_read_names(code1, unit1)
+        mock_sha_wrap.assert_called()
+        assert reads3 == {"var_a"}
+
+
+def test_stmts_enclose_unit_with_explicit_none_lineno() -> None:
+    """Verifies that _stmts_enclose_unit handles statements where lineno is explicitly None."""
+    node = ast.Pass()
+    node.lineno = None  # type: ignore[assignment]
+    node.end_lineno = None  # type: ignore[assignment]
+    assert _stmts_enclose_unit([node], 1, 2) is False
 
 
 def test_scope_metadata_caching_and_cache_clear() -> None:
