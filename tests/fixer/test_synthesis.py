@@ -1699,6 +1699,12 @@ def test_is_subroutine_unit_classification() -> None:
     assert is_subroutine_unit({"name": "plain_function"}) is False
     assert is_subroutine_unit({}) is False
 
+    # Defensive handling of non-dict types (public API guard)
+    assert is_subroutine_unit(None) is False
+    assert is_subroutine_unit("invalid") is False
+    assert is_subroutine_unit(123) is False
+    assert is_subroutine_unit([]) is False
+
 
 def test_harvested_subroutine_inherits_async_status_and_rejection(
     tmp_path: Path,
@@ -2491,6 +2497,8 @@ def test_normalize_pipe_unions_variants() -> None:
     assert _normalize_pipe_unions("'int | str'") == "'Union[int, str]'"
     assert _normalize_pipe_unions("int") == "int"
     assert _normalize_pipe_unions("") == ""
+    assert _normalize_pipe_unions(None) == ""
+    assert _normalize_pipe_unions(123) == "123"  # type: ignore[arg-type]
 
 
 def test_infer_helper_return_type_pep604_pipe_union_in_container_yields() -> None:

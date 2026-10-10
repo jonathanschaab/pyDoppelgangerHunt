@@ -1,4 +1,14 @@
-"""AST dataflow visitors, downstream read analysis, and output pairing."""
+"""AST dataflow visitors, downstream read analysis, and output pairing.
+
+Disk Fallback Scope:
+    While reporting utilities in `reporters.py` allow both `.py` and `.ipynb` files
+    for source inspection and visual diffing, dataflow analysis and patch generation
+    in `dataflow.py` intentionally restrict disk-fallback loading to standard Python
+    source files (`.py`). Refactoring patches cannot safely modify Jupyter notebooks
+    via raw text diffs without corrupting JSON structures and cell offsets. Therefore,
+    notebook units lacking embedded source text fail closed for generator subroutine
+    extractions.
+"""
 
 from __future__ import annotations
 
@@ -175,7 +185,7 @@ _SUBROUTINE_KINDS: frozenset[str] = frozenset(
 )
 
 
-def is_subroutine_unit(unit: Dict[str, Any]) -> bool:
+def is_subroutine_unit(unit: Any) -> bool:
     """Checks whether an AST code unit is a subroutine block rather than a whole function.
 
     Classification Rules:
@@ -183,6 +193,8 @@ def is_subroutine_unit(unit: Dict[str, Any]) -> bool:
     2. Known subroutine kinds ('compound_block', 'sliding_window', 'clause_branch') return True.
     3. All other kinds or unspecified kinds return False.
     """
+    if not isinstance(unit, dict):
+        return False
     if "is_subroutine" in unit and unit.get("is_subroutine") is not None:
         return bool(unit["is_subroutine"])
     return str(unit.get("kind") or "") in _SUBROUTINE_KINDS

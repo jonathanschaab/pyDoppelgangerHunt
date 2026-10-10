@@ -208,8 +208,10 @@ def _flatten_union_args(args: Sequence[str]) -> List[str]:
     return flattened
 
 
-def _normalize_pipe_unions(type_str: str) -> str:
+def _normalize_pipe_unions(type_str: Optional[str]) -> str:
     """Normalizes PEP 604 pipe unions (A | B) to typing.Union[A, B] syntax."""
+    if not isinstance(type_str, str):
+        return "" if type_str is None else str(type_str)
     cleaned = type_str.strip()
     if not cleaned:
         return cleaned

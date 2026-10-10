@@ -2776,6 +2776,53 @@ def test_scope_parent_map_excludes_scope_node_and_stays_bounded() -> None:
     gc.collect()
 
 
+def test_load_unit_file_text_fails_closed_on_notebook(tmp_path: Path) -> None:
+    """Verifies that _load_unit_file_text restricts disk fallback to .py files and fails closed
+    (returns None) for Jupyter notebooks (.ipynb) to prevent unsafe patch synthesis."""
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        _load_unit_file_text,
+    )
+
+    nb_file = tmp_path / "notebook.ipynb"
+    nb_file.write_text('{"cells": []}', encoding="utf-8")
+
+    unit = {"file": str(nb_file), "start": 1, "end": 5}
+    loaded = _load_unit_file_text(unit, repo_root=str(tmp_path))
+    assert loaded is None
+
+
+def test_collect_downstream_read_names_multithreaded_cache_concurrency() -> None:
+    """Verifies that concurrent invocations across worker threads execute safely,
+    maintain cache boundedness, and return fresh mutable copies preventing cross-thread mutation."""
+    import concurrent.futures  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        _MAX_DOWNSTREAM_CACHE_SIZE,
+        _downstream_reads_cache,
+        collect_downstream_read_names,
+    )
+
+    def _worker(thread_idx: int) -> None:
+        for i in range(100):
+            var_name = f"val_{thread_idx}_{i}"
+            src = f"def worker_{thread_idx}_{i}():\n    {var_name} = 1\n    print({var_name})\n"
+            unit = {"file": f"thread_{thread_idx}_mod_{i}.py", "start": 2, "end": 2}
+            res = collect_downstream_read_names(src, unit)
+            assert res is not None
+            assert var_name in res
+            # Mutating the returned set must not affect any cache entry
+            res.add("SENTINEL_MUTATION")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(_worker, tid) for tid in range(8)]
+        for f in concurrent.futures.as_completed(futures):
+            f.result()
+
+    assert len(_downstream_reads_cache) <= _MAX_DOWNSTREAM_CACHE_SIZE
+    # Ensure no cache entry contains SENTINEL_MUTATION
+    for cached_val in _downstream_reads_cache.values():
+        assert "SENTINEL_MUTATION" not in cached_val
+
+
 
 
 
