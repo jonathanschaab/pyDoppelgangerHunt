@@ -1029,6 +1029,9 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
                 self._record_killed_targets([item.optional_vars])
         for stmt in node.body:
             self.visit(stmt)
+        # Deliberately fail-closed: context managers may exit early or swallow exceptions
+        # (e.g. contextlib.suppress), so re-assignments inside with-blocks do not kill prior
+        # live stores for subsequent statements.
         self.killed = killed_before
 
     def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
@@ -2083,7 +2086,8 @@ def resolve_clone_generator_subroutine_outputs(
                     side_idx + 1,
                 )
                 return None
-            for c_line, reads in _collect_scope_closures(scope_node):
+            for c_pos, reads in _collect_scope_closures(scope_node):
+                c_line = int(c_pos[0]) if isinstance(c_pos, (tuple, list)) else int(c_pos)
                 if u_s <= c_line <= u_e and bool(reads & set(needed_outs)):
                     logger.debug(
                         "Rejecting generator subroutine pair: intra-unit closure at line %d "

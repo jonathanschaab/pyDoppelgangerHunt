@@ -2794,3 +2794,19 @@ def test_split_type_args_and_delimited_string_malformed_inputs() -> None:
     assert _split_type_args('Literal["["]') == ['"["']
 
 
+def test_flatten_union_args_typing_extensions() -> None:
+    """Verifies that _flatten_union_args unnests typing_extensions.Union parameters."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _flatten_union_args,
+        _normalize_pipe_unions,
+    )
+
+    assert _flatten_union_args(["typing_extensions.Union[int, str]"]) == ["int", "str"]
+    assert _flatten_union_args(["Union[int, str]"]) == ["int", "str"]
+    assert _flatten_union_args(["typing.Union[int, str]"]) == ["int", "str"]
+    assert (
+        _normalize_pipe_unions("int | typing_extensions.Union[str, float]")
+        == "Union[int, str, float]"
+    )
+
+

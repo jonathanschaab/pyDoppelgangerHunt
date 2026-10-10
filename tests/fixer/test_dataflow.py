@@ -2417,7 +2417,7 @@ def test_stmts_enclose_unit_with_explicit_none_lineno() -> None:
 
 
 def test_scope_metadata_caching_and_cache_clear() -> None:
-    """Verifies that scope metadata is cached in WeakKeyDictionaries and purged on clear."""
+    """Verifies that scope metadata is cached in bounded OrderedDicts (LRU) and purged on clear."""
     code = (
         "def f(x):\n"
         "    for i in range(10):\n"
@@ -2987,6 +2987,44 @@ def test_collect_downstream_read_names_cache_hit_with_and_without_end_col() -> N
     assert res2 == {"x"}
     # Cache size must still be 1 (cache hit, no key divergence!)
     assert len(_downstream_reads_cache) == 1
+
+
+def test_resolve_clone_generator_subroutine_outputs_closure_pos_tuple_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies that resolve_clone_generator_subroutine_outputs safely normalizes
+    (line, col) tuple instances from _collect_scope_closures without TypeError."""
+    from pydoppelgangerhunt.fixer import dataflow
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        resolve_clone_generator_subroutine_outputs,
+    )
+
+    code1 = (
+        "def g1():\n"
+        "    cb = lambda: val\n"
+        "    val = 1\n"
+        "    yield val\n"
+        "    print(val)\n"
+    )
+    code2 = (
+        "def g2():\n"
+        "    val = 2\n"
+        "    yield val\n"
+        "    print(val)\n"
+    )
+
+    u1 = {"start": 2, "end": 4, "file": "mod1.py", "source_text": code1}
+    u2 = {"start": 2, "end": 4, "file": "mod2.py", "source_text": code2}
+    s1 = {"has_yield": True, "inputs": [], "outputs": ["val"], "definite_stores": ["val"]}
+    s2 = {"has_yield": True, "inputs": [], "outputs": ["val"], "definite_stores": ["val"]}
+
+    def _mock_closures(scope_node: Any) -> list[tuple[Any, set[str]]]:
+        return [((2, 4), {"val"})]
+
+    monkeypatch.setattr(dataflow, "_collect_scope_closures", _mock_closures)
+
+    res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
+    assert res is None
 
 
 

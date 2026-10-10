@@ -200,7 +200,7 @@ def _flatten_union_args(args: Sequence[str]) -> List[str]:
     flattened: List[str] = []
     for a in args:
         if (
-            a.startswith("Union[") or a.startswith("typing.Union[")
+            a.startswith(("Union[", "typing.Union[", "typing_extensions.Union["))
         ) and a.endswith("]"):
             flattened.extend(_split_type_args(a))
         else:
