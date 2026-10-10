@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Subroutine Unit Classification**: Added `is_subroutine_unit` to detect compound blocks,
   sliding windows, and clause branches while excluding whole functions and methods.
 
+### Breaking Changes
+- **Breaking Change in Coordinate Validation**: `is_valid_unit_coordinates` (when called with default `strict=False`) is no longer fully permissive: it now requires a positive `start` coordinate (`start > 0`) and rejects empty dictionaries `{}` as well as zero/negative/inverted coordinates (`end < start`). Previously, missing keys or non-positive coordinates returned `True` as long as present values were int-convertible. Callers requiring full coordinate validity for refactoring and patching should pass `strict=True` requiring both `start` and `end`.
+
 ### Changed
 - **PEP 604 Pipe Union Normalization**: Synthesized helper parameter and return type annotations
   normalize PEP 604 union pipes (`|`) to `typing.Union` across all parameter annotations for
@@ -38,10 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Enclosing `with` Block Exit Safety**: Any enclosing `with` or `async with` block whose
   outputs are read downstream causes generator subroutines to fail closed, preventing context
   manager premature exit or cleanup hazards across arbitrary context managers (locks, streams).
-- **Coordinate Validation Behavior Change**: `is_valid_unit_coordinates` now requires a positive
-  `start` coordinate (`start > 0`) even when `strict=False`, rejecting empty dictionaries `{}` or
-  missing/zero/negative/inverted coordinates that previously passed, while refactoring patch
-  generation explicitly enforces `strict=True` requiring both `start` and `end`.
 - **Lexical Yield Assignment Scoping**: Confined `has_yield_assignment` to the outer unit scope
   (`len(self._scope_stack) <= 1`) and excluded `yield from` expressions, preventing inner nested
   generators or sub-generator return assignments from falsely classifying units as bidirectional.

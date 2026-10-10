@@ -8955,23 +8955,6 @@ def test_generator_subroutine_enclosing_try_finally_read_rejected(tmp_path: Path
     )
     assert patch == ""
 
-    # Runtime demonstration showing that abnormal exit preserves total in original generator
-    cleanup_seen: List[int] = []
-
-    def original_gen(items: List[int]) -> Any:
-        try:
-            total = 0
-            for item in items:
-                yield item
-                total += item
-        finally:
-            cleanup_seen.append(total)
-
-    gen = original_gen([10, 20, 30])
-    assert next(gen) == 10
-    gen.close()
-    assert cleanup_seen == [0]
-
 
 def test_generator_subroutine_enclosing_try_swallowing_handler_post_try_read_rejected(
     tmp_path: Path,

@@ -26,6 +26,7 @@ from pydoppelgangerhunt.fixer.binding import (
     find_enclosing_function,
 )
 from pydoppelgangerhunt.fixer.dataflow import (
+    _clear_downstream_reads_cache,
     has_async_generator_delegation_hazard,
     resolve_clone_pair_outputs,
 )
@@ -2662,6 +2663,7 @@ def generate_refactoring_patch(
     )
     if effective_skip_closures:
         logger.debug("Generating patches in lenient closure strictness mode")
+    _clear_downstream_reads_cache()
     graph_holder: List[Optional[ModuleDependencyGraph]] = [
         depgraph.copy() if depgraph is not None else None
     ]
@@ -3656,4 +3658,5 @@ def generate_refactoring_patch(
                 seen_comments.add(chunk)
             patch_chunks.append(chunk)
 
+    _clear_downstream_reads_cache()
     return "\n".join(patch_chunks)

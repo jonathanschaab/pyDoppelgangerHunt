@@ -2840,3 +2840,24 @@ def test_resolve_closure_strictness_mode_thread_safety() -> None:
 
     assert all(r == ("strict", False) for r in results)
 
+
+def test_resolve_closure_strictness_mode_config_conflict_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies that resolve_closure_strictness_mode warns when closure_strictness='strict'
+    conflicts with skip_pre_unit_closures=True."""
+    import logging  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        resolve_closure_strictness_mode,
+    )
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        mode, skip = resolve_closure_strictness_mode("strict", skip_pre_unit_closures=True)
+    assert mode == "strict"
+    assert skip is False
+    assert any(
+        "Conflicting configuration: closure_strictness 'strict' takes precedence over" in r.message
+        for r in caplog.records
+    )
+

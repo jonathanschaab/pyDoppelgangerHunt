@@ -34,6 +34,12 @@ def resolve_closure_strictness_mode(
         if c_mode in ("lenient", "fast", "skip"):
             return "lenient", True
         if c_mode in ("strict", "fail_closed"):
+            if skip_pre_unit_closures:
+                logger.warning(
+                    "Conflicting configuration: closure_strictness '%s' takes precedence over "
+                    "skip_pre_unit_closures=True",
+                    closure_strictness,
+                )
             return "strict", False
         fallback = "lenient" if skip_pre_unit_closures else "strict"
         raw_key = str(closure_strictness)

@@ -848,6 +848,15 @@ def test_extract_unit_source_code_source_lines_is_sliced_flag_and_source_text() 
     extracted_text = extract_unit_source_code(unit_source_text)
     assert extracted_text == ["line 2\n", "line 3\n"]
 
+    # 4. In-memory source_text whose line count matches (end - start + 1) is not treated as sliced
+    unit_matching_len_source_text = {
+        "start": 2,
+        "end": 3,
+        "source_text": "line 1\nline 2\n",
+    }
+    extracted_match = extract_unit_source_code(unit_matching_len_source_text)
+    assert extracted_match == ["line 2\n"]
+
 
 def test_extract_unit_source_code_end_coord_resolution() -> None:
     """Verifies that extract_unit_source_code slices using resolved e_d."""

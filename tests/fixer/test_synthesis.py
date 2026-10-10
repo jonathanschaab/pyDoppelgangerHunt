@@ -1067,6 +1067,38 @@ def test_infer_helper_return_type_generator_literal_and_explicit_types() -> None
     )
     assert res_explicit == "AsyncIterator[float]"
 
+    # 4. Async generator with yield assignment infers AsyncGenerator[YieldT, SendT]
+    res_async_gen = _infer_helper_return_type(
+        "Any",
+        [],
+        set(),
+        scope={
+            "has_yield": True,
+            "has_yield_assignment": True,
+            "yield_expr_names": [("yield", "x")],
+        },
+        meta1={"x": {"type": "int"}},
+        meta2={},
+        is_async=True,
+    )
+    assert res_async_gen == "AsyncGenerator[int, Any]"
+
+    # 5. Async generator with explicit AsyncGenerator return annotation
+    res_async_gen_explicit = _infer_helper_return_type(
+        "AsyncGenerator[int, str]",
+        [],
+        set(),
+        scope={
+            "has_yield": True,
+            "has_yield_assignment": True,
+            "yield_expr_names": [],
+        },
+        meta1={},
+        meta2={},
+        is_async=True,
+    )
+    assert res_async_gen_explicit == "AsyncGenerator[int, str]"
+
 
 def test_generator_helper_synthesis_literal_yields(tmp_path: Path) -> None:
     """Verifies that synthesizing helpers from generator units infers Iterator types and executes cleanly."""

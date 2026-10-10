@@ -76,8 +76,10 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
     placeholder = [f"# Source for {n_d} lines {s_d}-{e_d}\n"]
 
     source_lines = unit.get("source_lines")
+    from_source_text = False
     if source_lines is None and unit.get("source_text") is not None:
         source_lines = split_source_lines(str(unit["source_text"]))
+        from_source_text = True
 
     if source_lines is not None and isinstance(source_lines, (list, tuple)):
         if not source_lines:
@@ -85,8 +87,8 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
         # Sliced lines fast-path:
         # If 'source_lines_is_sliced' is explicitly set, honor caller intent.
         # Otherwise, heuristic: if len(source_lines) == (e_d - s_d + 1),
-        # the list is treated as already sliced to unit boundaries.
-        if is_sliced_unit_source_lines(unit, source_lines):
+        # the list is treated as already sliced to unit boundaries (unless from full source_text).
+        if not from_source_text and is_sliced_unit_source_lines(unit, source_lines):
             return [
                 ln if ln.endswith("\n") else ln + "\n"
                 for ln in source_lines

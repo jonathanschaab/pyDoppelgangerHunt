@@ -594,13 +594,23 @@ def _infer_helper_return_type(
         inferred_send_type = None
         inferred_gen_ret_type = None
         if (
-            resolved_ret.startswith(("Iterator[", "Iterable[", "Generator["))
+            resolved_ret.startswith((
+                "Iterator[",
+                "Iterable[",
+                "Generator[",
+                "AsyncIterator[",
+                "AsyncIterable[",
+                "AsyncGenerator[",
+            ))
             and resolved_ret.endswith("]")
         ):
             inner_parts = _split_type_args(resolved_ret)
             if inner_parts:
                 inferred_yield_type = _normalize_pipe_unions(inner_parts[0])
-            if resolved_ret.startswith("Generator[") and len(inner_parts) >= 2:
+            if (
+                resolved_ret.startswith(("Generator[", "AsyncGenerator["))
+                and len(inner_parts) >= 2
+            ):
                 if inner_parts[1] not in ("None", "Any"):
                     inferred_send_type = _normalize_pipe_unions(inner_parts[1])
             if resolved_ret.startswith("Generator[") and len(inner_parts) >= 3:
@@ -655,6 +665,13 @@ def _infer_helper_return_type(
                 return _normalize_pipe_unions(f"Generator[{yield_t}, {send_t}, {ret_t}]")
             return _normalize_pipe_unions(f"Iterator[{yield_t}]")
 
+        send_t = (
+            _normalize_pipe_unions(inferred_send_type)
+            if inferred_send_type
+            else ("Any" if scope.get("has_yield_assignment") else "None")
+        )
+        if send_t != "None" or scope.get("has_yield_assignment"):
+            return _normalize_pipe_unions(f"AsyncGenerator[{yield_t}, {send_t}]")
         return _normalize_pipe_unions(f"AsyncIterator[{yield_t}]")
 
     if is_subroutine is not None:
