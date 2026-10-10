@@ -1129,6 +1129,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             str(cli_strictness).strip().lower() in ("strict", "fail_closed")
             and args.skip_pre_unit_closures
         ):
+            cli_skip = False
             logger.warning(
                 "Conflicting flags: --closure-strictness '%s' takes precedence over "
                 "--skip-pre-unit-closures",

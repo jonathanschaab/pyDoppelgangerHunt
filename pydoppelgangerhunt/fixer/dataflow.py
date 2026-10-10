@@ -594,12 +594,15 @@ def _extract_nested_scope_free_reads(
     node: Union[
         ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.GeneratorExp
     ],
+    candidates: Optional[Set[str]] = None,
 ) -> Set[str]:
     """Extracts free variable references escaping a nested function, genexp, or class body."""
     if isinstance(node, ast.GeneratorExp):
         gen_visitor = _OuterExprVisitor()
         gen_visitor.visit(node)
-        return gen_visitor.names - _BUILTIN_NAMES
+        if candidates is not None:
+            return gen_visitor.names & candidates
+        return gen_visitor.names
 
     type_param_names: Set[str] = set()
     for tp in getattr(node, "type_params", []):
@@ -628,7 +631,10 @@ def _extract_nested_scope_free_reads(
             - class_visitor.globals
             - type_param_names
         )
-        return (outer_visitor.names - type_param_names) | class_free
+        class_reads = (outer_visitor.names - type_param_names) | class_free
+        if candidates is not None:
+            return class_reads & candidates
+        return class_reads
 
     defaults = node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]
     for d in defaults:
@@ -658,7 +664,10 @@ def _extract_nested_scope_free_reads(
         - (func_visitor.params | func_visitor.local_stores)
     ) | func_visitor.nonlocals
     escaped -= func_visitor.globals
-    return (outer_visitor.names - type_param_names) | escaped
+    all_free = (outer_visitor.names - type_param_names) | escaped
+    if candidates is not None:
+        return all_free & candidates
+    return all_free
 
 
 def _extract_assigned_names(target: ast.AST) -> List[str]:
@@ -775,7 +784,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef],
     ) -> None:
         if self._should_inspect_read(node):
-            free_reads = _extract_nested_scope_free_reads(node)
+            free_reads = _extract_nested_scope_free_reads(node, candidates=self.candidates)
             for name in free_reads:
                 self._record_downstream_read(name)
             name_attr = getattr(node, "name", None)
@@ -792,7 +801,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         if self._should_inspect_read(node):
-            free_reads = _extract_nested_scope_free_reads(node)
+            free_reads = _extract_nested_scope_free_reads(node, candidates=self.candidates)
             for name in free_reads:
                 self._record_downstream_read(name)
             lineno = getattr(node, "lineno", None)
@@ -1112,13 +1121,17 @@ def _collect_scope_closures(scope_node: ast.AST) -> List[Tuple[int, Set[str]]]:
 def _collect_pre_unit_closures(
     scope_node: ast.AST,
     u_start: int,
+    candidates: Optional[Set[str]] = None,
 ) -> Set[str]:
     """Discovers free variables captured by functions, class methods, and lambdas defined prior
     to the unit in the same lexical scope."""
     captured_reads: Set[str] = set()
     for c_line, reads in _collect_scope_closures(scope_node):
         if c_line < u_start:
-            captured_reads.update(reads)
+            if candidates is not None:
+                captured_reads.update(reads & candidates)
+            else:
+                captured_reads.update(reads - _BUILTIN_NAMES)
     return captured_reads
 
 
@@ -1247,11 +1260,22 @@ def _stmts_enclose_unit(stmts: Sequence[ast.stmt], u_start: int, u_end: int) -> 
     """Checks whether a sequence of AST statements spans and encloses the unit's line range."""
     if not stmts:
         return False
-    s_start = min((getattr(s, "lineno", None) or 0) for s in stmts)
-    s_end = max(
+    valid_starts = [
+        int(getattr(s, "lineno", 0))
+        for s in stmts
+        if getattr(s, "lineno", None) is not None and getattr(s, "lineno", 0) > 0
+    ]
+    if not valid_starts:
+        return False
+    s_start = min(valid_starts)
+    valid_ends = [
         int(getattr(s, "end_lineno", None) or getattr(s, "lineno", None) or s_start)
         for s in stmts
-    )
+        if getattr(s, "end_lineno", None) is not None or getattr(s, "lineno", None) is not None
+    ]
+    if not valid_ends:
+        return False
+    s_end = max(valid_ends)
     return s_start <= u_start and u_end <= s_end
 
 
@@ -1512,7 +1536,9 @@ def collect_downstream_read_names(
 
     if skip_pre_unit_closures:
         pre_unit_captured_reads: Set[str] = set()
-        potential_captures = _collect_pre_unit_closures(scope_node, u_start)
+        potential_captures = _collect_pre_unit_closures(
+            scope_node, u_start, candidates=candidates
+        )
         suppressed = (
             (potential_captures & candidates)
             if candidates is not None
@@ -1529,7 +1555,9 @@ def collect_downstream_read_names(
                 u_end,
             )
     else:
-        pre_unit_captured_reads = _collect_pre_unit_closures(scope_node, u_start)
+        pre_unit_captured_reads = _collect_pre_unit_closures(
+            scope_node, u_start, candidates=candidates
+        )
 
 
     visitor = _DownstreamReadVisitor(

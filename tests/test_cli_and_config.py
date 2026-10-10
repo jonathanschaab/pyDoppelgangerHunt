@@ -2801,3 +2801,25 @@ def test_cli_closure_strictness_and_skip_closures_precedence_warning(
                 for r in caplog.records
             )
 
+            # 3. CLI --closure-strictness fail_closed overrides CLI --skip-pre-unit-closures
+            caplog.clear()
+            mock_patch.reset_mock()
+            with caplog.at_level(logging.WARNING):
+                exit_code = main([
+                    str(repo),
+                    "--patch",
+                    str(patch_out),
+                    "--closure-strictness",
+                    "fail_closed",
+                    "--skip-pre-unit-closures",
+                ])
+            assert exit_code == 1
+            mock_patch.assert_called_once()
+            _, kwargs = mock_patch.call_args
+            assert kwargs.get("skip_pre_unit_closures") is False
+            assert kwargs.get("closure_strictness") == "strict"
+            assert any(
+                "takes precedence over --skip-pre-unit-closures" in r.message
+                for r in caplog.records
+            )
+

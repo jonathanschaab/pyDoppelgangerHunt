@@ -2443,3 +2443,57 @@ def test_scope_metadata_caching_non_weakref_object_fallback() -> None:
     assert result == "computed_val"
 
 
+def test_extract_nested_scope_free_reads_generator_shadowed_builtin() -> None:
+    """Verifies that generator expressions preserve free variables shadowing builtins."""
+    code = "(id for _ in items)"
+    gen_node = ast.parse(code, mode="eval").body
+    assert _extract_nested_scope_free_reads(gen_node) == {"id", "items"}  # type: ignore[arg-type]
+    assert _extract_nested_scope_free_reads(
+        gen_node, candidates={"id"}  # type: ignore[arg-type]
+    ) == {"id"}
+    assert _extract_nested_scope_free_reads(
+        gen_node, candidates={"items"}  # type: ignore[arg-type]
+    ) == {"items"}
+    assert _extract_nested_scope_free_reads(
+        gen_node, candidates={"other"}  # type: ignore[arg-type]
+    ) == set()
+
+
+def test_collect_downstream_read_names_pre_unit_genexp_shadowed_builtin() -> None:
+    """Verifies that pre-unit generator expressions capturing shadowed builtins are detected."""
+    _clear_downstream_reads_cache()
+    code = (
+        "def compute(items):\n"
+        "    id = 42\n"
+        "    g = (id for _ in items)\n"
+        "    id = 100\n"
+    )
+    unit = {"file": "test_id.py", "start": 4, "end": 4}
+    reads = collect_downstream_read_names(
+        code, unit, candidates={"id"}, skip_pre_unit_closures=False
+    )
+    assert reads == {"id"}
+
+    reads_lenient = collect_downstream_read_names(
+        code, unit, candidates={"id"}, skip_pre_unit_closures=True
+    )
+    assert reads_lenient == set()
+
+
+def test_stmts_enclose_unit_synthetic_or_unlocated_nodes() -> None:
+    """Verifies that synthetic or unlocated nodes (lineno=None or 0) do not cause underflow."""
+    synthetic = ast.Pass()
+    real_stmt = ast.parse("x = 1").body[0]
+    real_stmt.lineno = 10
+    real_stmt.end_lineno = 15
+
+    stmts = [synthetic, real_stmt]
+    # Unit at lines 5-8 is before real statements starting at 10: must not be enclosed
+    assert not _stmts_enclose_unit(stmts, 5, 8)
+    # Unit at lines 11-14 is enclosed
+    assert _stmts_enclose_unit(stmts, 11, 14)
+    # Sequence of only synthetic statements with no lineno
+    assert not _stmts_enclose_unit([synthetic], 1, 5)
+
+
+
