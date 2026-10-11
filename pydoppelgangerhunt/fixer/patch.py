@@ -32,6 +32,7 @@ from pydoppelgangerhunt.fixer.dataflow import (
     _extract_first_unit_coord,
     _get_valid_unit_bounds,
     _resolve_downstream_scope_node,
+    clear_dataflow_cache,
     has_async_generator_delegation_hazard,
     resolve_clone_pair_outputs,
 )
@@ -489,6 +490,7 @@ def validate_module_unit_replacements(
     line_byte_offsets: Optional[Sequence[int]] = None,
     tier1: bool = True,
     tier2: bool = True,
+    strict: bool = True,
 ) -> None:
     """Validates that candidate unit replacements do not contain interval collisions.
 
@@ -503,6 +505,7 @@ def validate_module_unit_replacements(
         line_byte_offsets: Optional precomputed UTF-8 byte offsets of line starts.
         tier1: If True, executes Tier 1 semantic line/column overlap validation.
         tier2: If True, executes Tier 2 physical UTF-8 byte interval sweep validation.
+        strict: If True, enforces strict coordinate typing and positive bounds.
 
     Raises:
         UnitCollisionError: If any pair of units collides under active validation tiers.
@@ -516,6 +519,7 @@ def validate_module_unit_replacements(
         dry_run=True,
         tier1=tier1,
         tier2=tier2,
+        strict=strict,
     )
 
 
@@ -2649,22 +2653,44 @@ def _validate_helper_compilation(helper_code: str) -> bool:
     spurious IndentationError when checking combined helper strings, and wraps
     indented definitions in a compound block to preserve column-0 multiline strings.
     """
-    lines = helper_code.splitlines(keepends=True)
-    import_lines = [ln for ln in lines if ln.startswith(("import ", "from "))]
-    other_lines = [ln for ln in lines if not ln.startswith(("import ", "from "))]
+    if "\n\n\n" in helper_code:
+        header, body = helper_code.split("\n\n\n", 1)
+        try:
+            if header.strip():
+                compile(header, "<patch_imports>", "exec")
+            if body.strip():
+                if body.lstrip("\n").startswith((" ", "\t")):
+                    compile("if 1:\n" + body, "<patch_helper>", "exec")
+                else:
+                    compile(body, "<patch_helper>", "exec")
+            return True
+        except (SyntaxError, ValueError):
+            return False
     try:
-        if import_lines:
-            compile("".join(import_lines), "<patch_imports>", "exec")
-        other_code = "".join(other_lines)
-        if other_code.strip():
-            first_line = next((ln for ln in other_lines if ln.strip()), "")
-            if first_line.startswith((" ", "\t")):
-                compile("if 1:\n" + other_code, "<patch_helper>", "exec")
-            else:
-                compile(other_code, "<patch_helper>", "exec")
+        compile(helper_code, "<patch_helper>", "exec")
         return True
+    except IndentationError:
+        try:
+            compile("if 1:\n" + helper_code, "<patch_helper>", "exec")
+            return True
+        except (SyntaxError, ValueError):
+            return False
     except (SyntaxError, ValueError):
         return False
+
+
+def _unit_has_no_refactor_pragma(
+    unit: Dict[str, Any], file_lines: Optional[Sequence[str]]
+) -> bool:
+    """Checks whether the unit contains a '# pragma: no-refactor' directive."""
+    if not file_lines:
+        return False
+    u_start, u_end = resolve_unit_line_bounds(unit)
+    target_block = "".join(file_lines[max(0, u_start - 2):u_end]).lower()
+    return any(
+        p in target_block
+        for p in ("# pragma: no-refactor", "# pragma:no-refactor", "# pragma: no_refactor")
+    )
 
 
 def _determine_unit_receiver_kind(
@@ -2708,7 +2734,7 @@ def _unit_start(u: Dict[str, Any]) -> int:
     return max(1, parse_unit_coord(u, "start", default=1))
 
 
-def generate_refactoring_patch(
+def _generate_refactoring_patch_impl(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     repo_root: Optional[str] = None,
     type_merge_strategy: str = "fallback_any",
@@ -2888,6 +2914,25 @@ def generate_refactoring_patch(
                 u2_eff = dict(u2, source_lines=u2_lines, source_lines_is_sliced=False)
             else:
                 u2_eff = dict(u2)
+
+            if _unit_has_no_refactor_pragma(u1, u1_lines) or _unit_has_no_refactor_pragma(
+                u2, u2_lines
+            ):
+                f1_disp = normalize_path_string(
+                    str(u1.get("file") or "file1"), strip_anchor=False
+                )
+                f2_disp = normalize_path_string(
+                    str(u2.get("file") or "file2"), strip_anchor=False
+                )
+                _record_skip_comment(
+                    f1_plan,
+                    f2_plan,
+                    skip_reasons,
+                    "pragma inline suppression",
+                    f"# Note: Clone pair ({f1_disp} vs {f2_disp}) skipped: "
+                    f"inline '# pragma: no-refactor' present\n",
+                )
+                continue
 
             if replace_clones:
                 u1_claimed = any(
@@ -3306,9 +3351,6 @@ def generate_refactoring_patch(
                 outputs2=target_outs2,
             )
             if not helper_code:
-                skip_reasons["shared helper synthesis failed"] += 1
-                continue
-            if not _validate_helper_compilation(helper_code):
                 skip_reasons["shared helper synthesis failed"] += 1
                 continue
 
@@ -3861,3 +3903,33 @@ def generate_refactoring_patch(
             patch_chunks.append(chunk)
 
     return "\n".join(patch_chunks)
+
+
+def generate_refactoring_patch(
+    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
+    repo_root: Optional[str] = None,
+    type_merge_strategy: str = "fallback_any",
+    replace_clones: bool = False,
+    method_binding: str = "auto",
+    cross_file_strategy: str = "auto",
+    shared_module_name: str = "_common.py",
+    depgraph: Optional[ModuleDependencyGraph] = None,
+    skip_pre_unit_closures: bool = False,
+    closure_strictness: Optional[str] = None,
+) -> str:
+    """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
+    try:
+        return _generate_refactoring_patch_impl(
+            clones=clones,
+            repo_root=repo_root,
+            type_merge_strategy=type_merge_strategy,
+            replace_clones=replace_clones,
+            method_binding=method_binding,
+            cross_file_strategy=cross_file_strategy,
+            shared_module_name=shared_module_name,
+            depgraph=depgraph,
+            skip_pre_unit_closures=skip_pre_unit_closures,
+            closure_strictness=closure_strictness,
+        )
+    finally:
+        clear_dataflow_cache()

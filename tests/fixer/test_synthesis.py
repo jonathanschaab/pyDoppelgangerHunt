@@ -47,7 +47,7 @@ from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-ac
 from pydoppelgangerhunt.parser import harvest_file_units
 
 
-from tests.conftest import assert_valid_python
+from tests.helpers import assert_valid_python
 
 
 def test_generate_clone_diff_and_refactoring_suggestions(tmp_path: Path) -> None:

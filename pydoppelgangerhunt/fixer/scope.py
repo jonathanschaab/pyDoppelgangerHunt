@@ -1558,7 +1558,7 @@ def _inspect_unit_scope(
 
 
 
-def _inspect_single_unit_scope_impl(
+def inspect_single_unit_scope(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
     tree: Optional[ast.AST] = None,
@@ -1575,7 +1575,7 @@ def _align_symmetric_var_list(list1: List[str], list2: List[str]) -> List[str]:
     return common if common else list1
 
 
-def _analyze_unit_variable_scope_impl(
+def analyze_unit_variable_scope(
     u1: Dict[str, Any],
     u2: Optional[Dict[str, Any]] = None,
     repo_root: Optional[str] = None,
@@ -1738,7 +1738,3 @@ def _analyze_unit_variable_scope_impl(
         ),
         "outputs_ambiguous": outputs_ambiguous,
     }
-
-
-analyze_unit_variable_scope = _analyze_unit_variable_scope_impl
-inspect_single_unit_scope = _inspect_single_unit_scope_impl

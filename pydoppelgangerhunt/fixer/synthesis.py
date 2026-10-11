@@ -906,8 +906,15 @@ def synthesize_shared_helper_code(
 
     # Variable scope analysis for concrete parameter signatures.
     scopes: List[Dict[str, Any]] = []
-    for u_item, t_item in ((u1, tree1), (u2, tree2)):
-        _populate_unit_receiver_metadata(u_item, repo_root=repo_root)
+    for u_item, s_text, t_item in (
+        (u1, source_text1, tree1),
+        (u2, source_text2, tree2),
+    ):
+        if s_text is not None:
+            u_item.setdefault("source_text", s_text)
+        _populate_unit_receiver_metadata(
+            u_item, repo_root=repo_root, source_text=s_text, tree=t_item
+        )
         s_item = inspect_single_unit_scope(u_item, repo_root=repo_root, tree=t_item)
         if u_item.get("enclosing_is_async") and s_item.get("has_yield"):
             s_item["is_async"] = True
@@ -1052,8 +1059,8 @@ def synthesize_shared_helper_code(
     r1 = scope1.get("return_type")
     r2 = scope2.get("return_type")
     resolved_ret = _merge_types(r1, r2, type_merge_strategy)
-    is_sub1 = is_subroutine_unit(u1)
-    is_sub2 = is_subroutine_unit(u2)
+    is_sub1 = is_subroutine_unit(u1, source_text=source_text1, tree=tree1)
+    is_sub2 = is_subroutine_unit(u2, source_text=source_text2, tree=tree2)
     if is_sub1 != is_sub2:
         return ""
     is_sub = is_sub1

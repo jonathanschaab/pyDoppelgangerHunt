@@ -40,7 +40,7 @@ requires_git = pytest.mark.skipif(
 )
 
 
-from tests.conftest import assert_valid_python
+from tests.helpers import assert_valid_python
 
 
 def test_audit_tests_parametrize_candidate_detection(tmp_path: Path) -> None:
@@ -9345,6 +9345,76 @@ def test_unit_start_module_scope_helper() -> None:
     assert _unit_start({"start": 0}) == 1
     assert _unit_start({"start": -5}) == 1
     assert _unit_start({}) == 1
+
+
+def test_pragma_no_refactor_harvested_but_skipped_in_patch(tmp_path: Path) -> None:
+    """Verifies that units with # pragma: no-refactor are harvested for clone reporting
+    but skipped during patch generation."""
+    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch
+    from pydoppelgangerhunt.parser import harvest_file_units
+
+    code1 = (
+        "def compute_first(a, b):\n"
+        "    # pragma: no-refactor\n"
+        "    res = a * 2 + b * 3\n"
+        "    return res\n"
+    )
+    code2 = (
+        "def compute_second(a, b):\n"
+        "    res = a * 2 + b * 3\n"
+        "    return res\n"
+    )
+    p1 = tmp_path / "mod1.py"
+    p2 = tmp_path / "mod2.py"
+    p1.write_text(code1, encoding="utf-8")
+    p2.write_text(code2, encoding="utf-8")
+
+    units1 = harvest_file_units(str(p1), str(tmp_path), min_lines=3, min_tokens=5)
+    assert len(units1) > 0, "Pragma: no-refactor must not suppress unit harvesting"
+
+    units2 = harvest_file_units(str(p2), str(tmp_path), min_lines=3, min_tokens=5)
+    assert len(units2) > 0
+
+    u1 = dict(units1[0], file=str(p1.relative_to(tmp_path)))
+    u2 = dict(units2[0], file=str(p2.relative_to(tmp_path)))
+    clones = [(1.0, u1, u2)]
+
+    patch = generate_refactoring_patch(clones, repo_root=str(tmp_path), replace_clones=True)
+    assert "# Note: Clone pair" in patch
+    assert "inline '# pragma: no-refactor' present" in patch
+
+
+def test_validate_module_unit_replacements_strict_parameter() -> None:
+    """Verifies that validate_module_unit_replacements respects the strict parameter."""
+    from pydoppelgangerhunt.fixer.patch import validate_module_unit_replacements
+
+    code = "def foo():\n    return 42\n"
+    # Colon-delimited coordinate string (e.g. '1:0'): valid when strict=False,
+    # raises ValueError when strict=True
+    unit_colon = {"start": "1:0", "end": 2, "kind": "function", "file": "foo.py"}
+    replacements = [(unit_colon, "def foo():\n    return 100\n")]
+
+    validate_module_unit_replacements(code, replacements, strict=False)
+
+    with pytest.raises(ValueError):
+        validate_module_unit_replacements(code, replacements, strict=True)
+
+
+def test_validate_helper_compilation_multiline_imports() -> None:
+    """Verifies that multiline parenthesized imports compile cleanly in helper validation."""
+    from pydoppelgangerhunt.fixer.patch import _validate_helper_compilation
+    from tests.helpers import assert_valid_python
+
+    helper_code = (
+        "from os import (\n"
+        "    path,\n"
+        ")\n\n\n"
+        "def _shared_helper(a: int) -> int:\n"
+        "    return a + 1\n"
+    )
+    assert _validate_helper_compilation(helper_code) is True
+    assert_valid_python(helper_code)
+
 
 
 

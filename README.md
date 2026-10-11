@@ -187,8 +187,9 @@ from pydoppelgangerhunt import (
   determines whether the unit's line bounds strictly reside inside an enclosing function (`True`)
   or span the entire function definition (`False`), with kind-less units at module scope falling
   back to `True`.
-- **`refactor_module_units(source_text, replacements, tier1=True, tier2=True, dry_run=False)`**: Applies multiple non-overlapping unit replacements in strict **reverse source order** (descending byte offsets) using single-pass buffer slicing, guaranteeing that downstream text expansions or contractions never invalidate upstream coordinates.
-- **`validate_module_unit_replacements(source_text, replacements, tier1=True, tier2=True)`**: Non-mutating validation helper that verifies candidate replacements for collisions across Tier 1 (AST coordinate overlap) and Tier 2 (physical byte interval sweep) without modifying or allocating new source string buffers.
+- **`extract_unit_source_code(unit, repo_root=None)`**: Extracts the source lines corresponding to a code unit from memory or disk. When an AST unit is missing an `end` line coordinate, it safely falls back to returning the single line at `start` rather than slicing to the end of the file.
+- **`refactor_module_units(source_text, replacements, lines=None, line_char_offsets=None, line_byte_offsets=None, dry_run=False, tier1=True, tier2=True, strict=True)`**: Applies multiple non-overlapping unit replacements in strict **reverse source order** (descending byte offsets) using single-pass buffer slicing, guaranteeing that downstream text expansions or contractions never invalidate upstream coordinates.
+- **`validate_module_unit_replacements(source_text, replacements, lines=None, line_char_offsets=None, line_byte_offsets=None, tier1=True, tier2=True, strict=True)`**: Non-mutating validation helper that verifies candidate replacements for collisions across Tier 1 (AST coordinate overlap) and Tier 2 (physical byte interval sweep) without modifying or allocating new source string buffers.
 - **`generate_refactoring_patch(candidate_pairs, repo_root=..., replace_clones=..., ...)`**:
   Synthesizes a multi-file unified diff (`git apply` compatible) with dependency cycle detection
   and per-pair transactional snapshot rollback. For generator subroutines (within function or
@@ -246,9 +247,12 @@ callback tables or event loops, strict mode treats these captured names as live 
 escaping callbacks across lexical scopes.
 
 - **Memoization & Cache Invalidation**: Downstream liveness analysis caches AST traversal results
-  in a thread-safe LRU cache keyed by SHA-256 source digest (full 256-bit hash), file path,
-  unit line/column coordinates, unit kind and name, subroutine flag (`is_subroutine`), candidate
-  outputs, and closure strictness (`skip_pre_unit_closures`).
+  in a thread-safe LRU cache keyed by SHA-256 source digest (full 256-bit hash hex string),
+  unit line/column coordinates, candidate outputs, closure strictness (`skip_pre_unit_closures`),
+  and enclosing unit inputs (`unit_inputs`). Because cache keys depend solely on source content
+  digests and unit coordinates rather than file paths or unit names, cache entries are cleanly
+  shared across clones and files with identical content. All dataflow caches are thread-safely
+  cleared in a `finally` block upon completion of refactoring patch generation.
 - **Precision vs. Soundness Trade-off**: Pre-unit closure scanning can be configured via
   `--closure-strictness {strict,lenient,fail_closed,fast,skip}` (or `--skip-pre-unit-closures`, or setting
   `closure_strictness = "strict"|"lenient"` in `pyproject.toml`):
@@ -289,7 +293,8 @@ strict fail-closed safety invariants:
   and `globals()`. Dynamic reflection via runtime stack frame introspection (such as
   `sys._getframe()` or `inspect.currentframe().f_locals`) is not tracked statically; functions
   relying on frame-inspection reflection should be refactored manually or marked with
-  `# pragma: no-refactor`.
+  `# pragma: no-refactor` (which preserves clone detection and reporting visibility while
+  preventing automated patch synthesis and refactoring).
 - **Strict Coordinate Validation**: In patch generation (`--patch`), unit line coordinates must
   be strictly positive integers with `start <= end` (and `start_col <= end_col` on the same line).
   Units with missing, zero, or inverted coordinates fail closed and are rejected rather than

@@ -65,8 +65,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_pair_clone_outputs` strictly pairs subroutine outputs by first-store position and rejects
   conflicting positional orders (permuted outputs) or unequal counts.
 - **Downstream Read Analysis Cache Key**: Cache keys incorporate full 256-bit SHA-256 source
-  content digests, unit digests, file path, line/column coordinates, unit kind and name,
-  subroutine flag (`is_subroutine`), candidate outputs, unit inputs, and closure strictness flag.
+  content digests (hex string), line/column coordinates, candidate outputs, unit inputs, and
+  closure strictness flag. By omitting file path, unit names, and kinds, cache entries are cleanly
+  shared across identical files and clones.
 - **Liveness Model Dynamic Reads**: Added `globals()` to dynamic read detection alongside
   `locals()`, `vars()`, `eval()`, `exec()`, and `dir()`.
 - **Intra-Unit Closure Output Capture Rejection**: Rejects generator subroutine extraction
@@ -148,8 +149,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_populate_unit_receiver_metadata` (`binding.py`) with AST node traversal within unit bounds,
   and extended `_visit_comprehension` and `_inspect_unit_scope` (`scope.py`) to recognize async
   comprehensions at arbitrary nesting depths and honor `unit["is_async"]`.
-- **Pragma Inline Suppression**: Added `# pragma: no-refactor` to `check_inline_suppression`
-  (`parser.py`) aligning with documentation for reflections and manual refactorings.
+- **Pragma Refactoring Suppression**: Moved `# pragma: no-refactor` from harvesting suppression
+  to refactoring patch generation (`patch.py`), ensuring code units with `# pragma: no-refactor`
+  remain fully visible in clone detection and reporting while being skipped during automated patch
+  synthesis with a diagnostic comment.
+- **Loop-Carried Liveness in Enclosing Blocks**: Evaluates statement span `[start_line, stmt_end]`
+  with base `_DownstreamReadVisitor` in `_scope_reads_outputs_after_line` (`dataflow.py`), correctly
+  detecting loop-carried reads at the top of an enclosing loop prior to `with` / `try` blocks.
+- **Tree Resolution Alignment**: Unified `effective_tree` across downstream read analysis and
+  closure collection in `resolve_clone_generator_subroutine_outputs` (`dataflow.py`), preventing
+  module-level shadowing mismatch.
+- **Multi-line Import Header Support in Helper Validation**: Updated `_validate_helper_compilation`
+  (`patch.py`) and `assert_valid_python` (`tests/helpers.py`) to split headers cleanly on `\n\n\n`
+  rather than fragile line-by-line checks, supporting multiline parenthesized imports and column-0
+  strings. Dropped redundant compilation re-validation in `generate_refactoring_patch`.
+- **In-Memory Receiver Metadata Population**: Forwarded `source_text` and `tree` through
+  `synthesize_shared_helper_code` (`synthesis.py`) to `_populate_unit_receiver_metadata` and
+  `is_subroutine_unit`, ensuring virtual units without disk files accurately receive async and
+  receiver metadata.
+- **Transactional Dataflow Cache Clearance**: Wrapped `generate_refactoring_patch` in a
+  `try: ... finally: clear_dataflow_cache()` block to prevent memoized ASTs and downstream read
+  caches from lingering across patch runs.
+- **Strict Coordinate Parameter in Module Replacements**: Added `strict: bool = True` to
+  `validate_module_unit_replacements` (`patch.py`), forwarding to `refactor_module_units`.
+- **Missing `end` Single-Line Fallback**: Documented `extract_unit_source_code` safely returning a
+  single line when `end` coordinate is missing.
 - **Downstream Cache Key Unit Inputs Normalization**: Normalized `effective_unit_inputs` from
   `unit.get("inputs")` before generating `_build_downstream_cache_key`, ensuring calls with
   populated vs unpopulated unit inputs produce distinct cache keys in `_downstream_reads_cache`.

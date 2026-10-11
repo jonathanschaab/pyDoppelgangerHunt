@@ -267,9 +267,19 @@ def _unit_ast_has_async_or_yield(
     has_yield = False
     has_await = False
 
-    def _traverse(node: ast.AST) -> None:
-        nonlocal has_yield, has_await
+    stack: List[ast.AST] = [tree]
+    while stack:
+        node = stack.pop()
         lineno = getattr(node, "lineno", None)
+        end_lineno = getattr(node, "end_lineno", lineno)
+        if (
+            lineno is not None
+            and end_lineno is not None
+            and (end_lineno < u_start or lineno > u_end)
+            and not isinstance(node, (ast.Module, ast.Interactive, ast.Expression))
+        ):
+            continue
+
         if lineno is not None and u_start <= lineno <= u_end:
             if isinstance(node, (ast.Yield, ast.YieldFrom)):
                 has_yield = True
@@ -281,19 +291,23 @@ def _unit_ast_has_async_or_yield(
             ):
                 has_await = True
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                return
-        for child in ast.iter_child_nodes(node):
-            _traverse(child)
+                continue
 
-    _traverse(tree)
+        if has_yield and has_await:
+            break
+
+        stack.extend(ast.iter_child_nodes(node))
+
     return has_yield, has_await
 
 
 def _populate_unit_receiver_metadata(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
+    source_text: Optional[str] = None,
+    tree: Optional[ast.AST] = None,
 ) -> None:
-    """Populates receiver_kind, enclosing_class, and is_static on a unit from enclosing AST nodes if absent."""
+    """Populates receiver_kind, enclosing_class, and is_static on a unit from AST if absent."""
     if (
         "receiver_kind" in unit
         and "enclosing_class" in unit
@@ -303,7 +317,11 @@ def _populate_unit_receiver_metadata(
         and "enclosing_is_async" in unit
     ):
         return
-    source = _load_unit_file_text(unit, repo_root=repo_root)
+    source = (
+        source_text
+        if source_text is not None
+        else _load_unit_file_text(unit, repo_root=repo_root)
+    )
     if source is None:
         return
     fn_meta = find_enclosing_function(source, unit)
@@ -331,20 +349,23 @@ def _populate_unit_receiver_metadata(
     if "enclosing_is_async" not in unit:
         unit["enclosing_is_async"] = fn_is_async
     if "is_async" not in unit:
-        is_sub = is_subroutine_unit(unit, source_text=source)
+        is_sub = is_subroutine_unit(unit, source_text=source, tree=tree)
         if is_sub:
             has_yield = bool(unit.get("has_yield"))
             has_await = bool(unit.get("has_await"))
             if not (has_yield or has_await) and source is not None:
-                try:
-                    tree = ast.parse(source)
+                parsed_tree = tree
+                if parsed_tree is None:
+                    try:
+                        parsed_tree = ast.parse(source)
+                    except (SyntaxError, ValueError):
+                        parsed_tree = None
+                if parsed_tree is not None:
                     u_start = parse_unit_coord(unit, "start", default=1)
                     u_end = parse_unit_coord(unit, "end", default=u_start)
                     has_yield, has_await = _unit_ast_has_async_or_yield(
-                        tree, u_start, u_end
+                        parsed_tree, u_start, u_end
                     )
-                except (SyntaxError, ValueError):
-                    pass
             unit["is_async"] = fn_is_async if (has_yield or has_await) else False
         else:
             unit["is_async"] = fn_is_async

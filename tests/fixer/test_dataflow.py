@@ -3652,8 +3652,8 @@ def test_load_unit_file_text_synthetic_in_memory_fallback() -> None:
     assert text == "def foo():\n    return 42\n"
 
 
-def test_build_downstream_cache_key_source_text_subroutine_symmetry() -> None:
-    """Verifies that _build_downstream_cache_key passes source_text to is_subroutine_unit."""
+def test_build_downstream_cache_key_content_digest_isolation() -> None:
+    """Verifies that _build_downstream_cache_key shares entries across file paths and unit names."""
     from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
         _build_downstream_cache_key,
     )
@@ -3664,22 +3664,26 @@ def test_build_downstream_cache_key_source_text_subroutine_symmetry() -> None:
         "    b = 2\n"
         "    return a + b\n"
     )
-    # Kind-less unit inside enclosing function
-    unit = {
-        "file": "calc.py",
-        "start": 2,
-        "end": 3,
-    }
-    key_with_source = _build_downstream_cache_key(
+    unit1 = {"file": "file1.py", "name": "block1", "kind": "compound_block", "start": 2, "end": 3}
+    unit2 = {"file": "file2.py", "name": "block2", "kind": "sliding_window", "start": 2, "end": 3}
+    key1 = _build_downstream_cache_key(
         source_text=code,
-        unit=unit,
+        unit=unit1,
         u_start=2,
         u_end=3,
         candidates={"a", "b"},
         skip_pre_unit_closures=False,
     )
-    # Structural inspection inside enclosing function with source_text resolves is_subroutine=True
-    assert key_with_source.is_subroutine is True
+    key2 = _build_downstream_cache_key(
+        source_text=code,
+        unit=unit2,
+        u_start=2,
+        u_end=3,
+        candidates={"a", "b"},
+        skip_pre_unit_closures=False,
+    )
+    # Identical content digest and coordinates share cache entries regardless of file/name/kind
+    assert key1 == key2
 
 
 def test_extract_single_node_local_names_lambda_non_list_body() -> None:
@@ -3909,6 +3913,46 @@ def test_extract_unit_end_col_precedence() -> None:
     # Fallback to end_col_offset when end_col is missing
     unit_offset_only = {"end_col_offset": 15}
     assert _extract_unit_end_col(unit_offset_only) == 15
+
+
+def test_enclosing_with_loop_carried_read_at_loop_top_rejected() -> None:
+    """Verifies that a unit inside an enclosing with block whose output is read at
+    the top of an enclosing loop is identified as reading outputs downstream."""
+    from pydoppelgangerhunt.fixer.dataflow import _enclosing_try_reads_outputs
+
+    src = (
+        "def run(items):\n"
+        "    for x in items:\n"
+        "        print(total)\n"
+        "        with suppress_context:\n"
+        "            total = yield x\n"
+    )
+    tree = ast.parse(src)
+    # Unit is line 5 ('total = yield x'), with is lines 4-5, loop is lines 2-5
+    # Print at line 3 is before the with statement but inside the enclosing loop
+    fn_node = tree.body[0]
+    reads = _enclosing_try_reads_outputs(
+        fn_node, u_start=5, u_end=5, outputs={"total"}, u_end_col=None
+    )
+    assert reads is True
+
+
+def test_pair_clone_outputs_allow_permuted_outputs() -> None:
+    """Verifies that _pair_clone_outputs allows permuted output pairing when flag is enabled."""
+    from pydoppelgangerhunt.fixer.dataflow import _pair_clone_outputs
+
+    u1_outs = ["x", "y"]
+    u2_outs = ["y", "x"]
+
+    # Default rejects permuted common outputs
+    assert _pair_clone_outputs(u1_outs, u2_outs, allow_permuted_outputs=False) == []
+
+    # Enabled allows positional 1-to-1 pairing
+    assert _pair_clone_outputs(u1_outs, u2_outs, allow_permuted_outputs=True) == [
+        ("x", "y"),
+        ("y", "x"),
+    ]
+
 
 
 

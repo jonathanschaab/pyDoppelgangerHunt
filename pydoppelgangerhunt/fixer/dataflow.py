@@ -84,19 +84,22 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
     if tree is None:
         return
     tree_nodes = set(ast.walk(tree))
-    for node in tree_nodes:
-        _scope_parent_maps.pop(node, None)
-        _scope_stmts_by_end.pop(node, None)
-        _scope_closures_cache.pop(node, None)
-        _scope_loops_cache.pop(node, None)
-        _scope_try_with_cache.pop(node, None)
-    closure_keys_to_remove = [
-        k
-        for k in _scope_closures_cache
-        if isinstance(k, tuple) and len(k) == 2 and (k[0] in tree_nodes or k[1] in tree_nodes)
-    ]
-    for k in closure_keys_to_remove:
-        _scope_closures_cache.pop(k, None)
+    with _downstream_cache_lock:
+        for node in tree_nodes:
+            _scope_parent_maps.pop(node, None)
+            _scope_stmts_by_end.pop(node, None)
+            _scope_closures_cache.pop(node, None)
+            _scope_loops_cache.pop(node, None)
+            _scope_try_with_cache.pop(node, None)
+        closure_keys_to_remove = [
+            k
+            for k in _scope_closures_cache
+            if isinstance(k, tuple)
+            and len(k) == 2
+            and (k[0] in tree_nodes or k[1] in tree_nodes)
+        ]
+        for k in closure_keys_to_remove:
+            _scope_closures_cache.pop(k, None)
 
 
 def _store_lru_cache_entry(
@@ -105,14 +108,17 @@ def _store_lru_cache_entry(
     value: Any,
     max_size: int,
 ) -> None:
-    """Stores key-value pair in an OrderedDict LRU cache with eviction under lock."""
+    """Stores key-value pair in an OrderedDict LRU cache with eviction outside lock."""
+    evicted_tree: Optional[ast.AST] = None
     with _downstream_cache_lock:
         if key not in cache and len(cache) >= max_size:
             _, evicted_val = cache.popitem(last=False)
-            if cache is _parsed_tree_cache:
-                _evict_tree_scopes(evicted_val)
+            if cache is _parsed_tree_cache and isinstance(evicted_val, ast.AST):
+                evicted_tree = evicted_val
         cache[key] = value
         cache.move_to_end(key)
+    if evicted_tree is not None:
+        _evict_tree_scopes(evicted_tree)
 
 
 def _get_or_compute_scope_cached(
@@ -1608,14 +1614,10 @@ class _DownstreamCacheKey(NamedTuple):
     """Immutable cache key for downstream AST read analysis."""
 
     content_digest: str
-    file_path: str
     start: int
     end: int
     start_col: Optional[int]
     end_col: Optional[int]
-    kind: Optional[str]
-    name: Optional[str]
-    is_subroutine: bool
     candidates: Optional[frozenset[str]]
     skip_pre_unit_closures: bool
     unit_inputs: Optional[frozenset[str]] = None
@@ -1633,8 +1635,21 @@ def _build_downstream_cache_key(
     tree: Optional[ast.AST] = None,
     unit_inputs: Optional[Set[str]] = None,
 ) -> _DownstreamCacheKey:
-    """Forms a persistent cache key for downstream AST read analysis."""
-    file_path_str = str(unit.get("file") or "")
+    """Forms a persistent cache key for downstream AST read analysis.
+
+    Args:
+        source_text: Full module source code string.
+        unit: AST unit dictionary.
+        u_start: 1-indexed unit start line.
+        u_end: 1-indexed unit end line.
+        candidates: Candidate output variable names to inspect.
+        skip_pre_unit_closures: Whether pre-unit closure read capture is bypassed.
+        source_digest: Optional hex SHA-256 digest of source_text.
+        resolved_end_col: Pre-resolved end column offset if available.
+        tree: Optional pre-parsed module AST.
+        unit_inputs: Precomputed live unit inputs.
+    """
+    del tree
     if source_digest is not None:
         content_digest = str(source_digest)
     else:
@@ -1653,19 +1668,12 @@ def _build_downstream_cache_key(
     if unit_inputs_val is None and "inputs" in unit and unit["inputs"] is not None:
         unit_inputs_val = set(unit["inputs"])
     unit_inputs_key = frozenset(unit_inputs_val) if unit_inputs_val is not None else None
-    unit_kind = unit.get("kind")
-    unit_name = unit.get("name")
-    is_sub = is_subroutine_unit(unit, source_text=source_text, tree=tree)
     return _DownstreamCacheKey(
         content_digest=content_digest,
-        file_path=file_path_str,
         start=u_start,
         end=u_end,
         start_col=start_col,
         end_col=end_col,
-        kind=unit_kind,
-        name=unit_name,
-        is_subroutine=is_sub,
         candidates=cands_key,
         skip_pre_unit_closures=bool(skip_pre_unit_closures),
         unit_inputs=unit_inputs_key,
@@ -1826,34 +1834,99 @@ class _StrictPostLineVisitor(_DownstreamReadVisitor):
             return True
         return False
 
+def _execute_read_pass(
+    scope_node: ast.AST,
+    visitor_cls: type,
+    u_start: int,
+    u_end: int,
+    u_end_col: Optional[int],
+    candidates: Optional[Set[str]],
+    enclosing_loops: Sequence[Tuple[int, int]],
+    pass_mode: _VisitorPassMode,
+    is_module: bool,
+) -> Set[str]:
+    """Runs a downstream read visitor pass over a scope node and returns loaded names."""
+    visitor = visitor_cls(
+        u_start,
+        u_end,
+        u_end_col,
+        candidates=candidates,
+        enclosing_loops=enclosing_loops,
+        pass_mode=pass_mode,
+        is_module_scope=is_module,
+    )
+    for stmt in getattr(scope_node, "body", []):
+        visitor.visit(stmt)
+    return set(visitor.loaded)
+
 
 def _scope_reads_outputs_after_line(
     scope_node: ast.AST,
     line: int,
     outputs: Set[str],
     end_col: Optional[int] = None,
+    start_line: Optional[int] = None,
 ) -> bool:
     """Checks whether any statement in the scope loads outputs after the given line,
-    including loop-carried reads if line sits inside an enclosing loop."""
-    enclosing_loops = _find_enclosing_loops(scope_node, line, line)
+    including loop-carried reads if the statement sits inside an enclosing loop."""
+    stmt_start = start_line if start_line is not None else line
+    stmt_end = line
+    enclosing_loops = _find_enclosing_loops(scope_node, stmt_start, stmt_end)
+    is_module = isinstance(scope_node, ast.Module)
 
-    def _execute_pass(mode: _VisitorPassMode) -> Set[str]:
-        v = _StrictPostLineVisitor(
-            line,
-            line,
+    after_reads = _execute_read_pass(
+        scope_node,
+        _StrictPostLineVisitor,
+        stmt_end,
+        stmt_end,
+        end_col,
+        outputs,
+        enclosing_loops,
+        _VisitorPassMode.AFTER_UNIT,
+        is_module,
+    )
+    if not outputs.isdisjoint(after_reads):
+        return True
+
+    if enclosing_loops:
+        loop_reads = _execute_read_pass(
+            scope_node,
+            _DownstreamReadVisitor,
+            stmt_start,
+            stmt_end,
             end_col,
-            candidates=outputs,
-            enclosing_loops=enclosing_loops,
-            pass_mode=mode,
+            outputs,
+            enclosing_loops,
+            _VisitorPassMode.LOOP_CARRIED,
+            is_module,
         )
-        for stmt in getattr(scope_node, "body", []):
-            v.visit(stmt)
-        return set(v.loaded)
+        return not outputs.isdisjoint(loop_reads)
 
-    loaded = _execute_pass(_VisitorPassMode.AFTER_UNIT)
-    if enclosing_loops and loaded.isdisjoint(outputs):
-        loaded.update(_execute_pass(_VisitorPassMode.LOOP_CARRIED))
-    return bool(loaded & outputs)
+    return False
+
+
+def _compound_stmt_reads_outputs_after(
+    scope_node: ast.AST,
+    node: ast.AST,
+    stmts: Sequence[ast.AST],
+    outputs: Set[str],
+) -> bool:
+    """Checks whether outputs are read downstream of an enclosing compound statement."""
+    end_raw = getattr(node, "end_lineno", None)
+    end_col_raw = getattr(node, "end_col_offset", None)
+    b_end = max(
+        (
+            int(getattr(s, "end_lineno", None) or getattr(s, "lineno", 0) or 0)
+            for s in stmts
+        ),
+        default=0,
+    )
+    s_start = getattr(node, "lineno", None) or 1
+    s_end = end_raw if isinstance(end_raw, int) else b_end
+    s_end_col = end_col_raw if isinstance(end_col_raw, int) else None
+    return _scope_reads_outputs_after_line(
+        scope_node, s_end, outputs, end_col=s_end_col, start_line=s_start
+    )
 
 
 def _enclosing_try_reads_outputs(
@@ -1912,23 +1985,8 @@ def _enclosing_try_reads_outputs(
                     return True
 
                 # 2. Check if outputs are read downstream of the with block
-                w_end_raw = getattr(node, "end_lineno", None)
-                w_end_col_raw = getattr(node, "end_col_offset", None)
-                b_end = max(
-                    (
-                        int(
-                            getattr(s, "end_lineno", None)
-                            or getattr(s, "lineno", 0)
-                            or 0
-                        )
-                        for s in with_body
-                    ),
-                    default=0,
-                )
-                w_end = w_end_raw if isinstance(w_end_raw, int) else b_end
-                w_end_col = w_end_col_raw if isinstance(w_end_col_raw, int) else None
-                if _scope_reads_outputs_after_line(
-                    scope_node, w_end, outputs, end_col=w_end_col
+                if _compound_stmt_reads_outputs_after(
+                    scope_node, node, with_body, outputs
                 ):
                     return True
             continue
@@ -1972,31 +2030,14 @@ def _enclosing_try_reads_outputs(
                 if handlers and any(
                     not _block_definitely_terminates(h.body) for h in handlers
                 ):
-                    try_end_raw = getattr(node, "end_lineno", None)
-                    try_end_col_raw = getattr(node, "end_col_offset", None)
                     all_try_stmts = (
                         list(body_nodes)
                         + [s for h in handlers for s in getattr(h, "body", [])]
                         + list(orelse_nodes)
                         + list(finalbody_nodes)
                     )
-                    b_end = max(
-                        (
-                            int(
-                                getattr(s, "end_lineno", None)
-                                or getattr(s, "lineno", 0)
-                                or 0
-                            )
-                            for s in all_try_stmts
-                        ),
-                        default=0,
-                    )
-                    t_end = try_end_raw if isinstance(try_end_raw, int) else b_end
-                    t_end_col = (
-                        try_end_col_raw if isinstance(try_end_col_raw, int) else None
-                    )
-                    if _scope_reads_outputs_after_line(
-                        scope_node, t_end, outputs, end_col=t_end_col
+                    if _compound_stmt_reads_outputs_after(
+                        scope_node, node, all_try_stmts, outputs
                     ):
                         return True
     return False
@@ -2044,6 +2085,16 @@ def collect_downstream_read_names(
     set. If an output candidate matches one of these captured names without a definite store
     beforehand, the generator subroutine will fail the definiteness check and fail closed
     (skipped during refactoring patch synthesis with a diagnostic DEBUG log).
+
+    Args:
+        source_text: The complete original Python source code.
+        unit: AST unit mapping containing start and end coordinates.
+        candidates: Optional set of variable names to restrict analysis to.
+        tree: Optional pre-parsed module AST.
+        skip_pre_unit_closures: Whether pre-unit closure read capture is bypassed.
+        source_digest: Optional hex SHA-256 digest of source_text (must match
+            hashlib.sha256(source_text.encode('utf-8', 'replace')).hexdigest()).
+        unit_inputs: Precomputed live unit inputs.
     """
     # Invariant: downstream live names originate from three distinct sources:
     # (1) post-unit statements, (2) enclosing loop-carried paths, (3) escaping pre-unit closures.
@@ -2187,6 +2238,7 @@ def collect_downstream_read_names(
 def _pair_clone_outputs(
     u1_outs: Union[Sequence[str], Set[str], frozenset[str]],
     u2_outs: Union[Sequence[str], Set[str], frozenset[str]],
+    allow_permuted_outputs: bool = False,
 ) -> List[Tuple[str, str]]:
     """Establishes an ordered 1-to-1 mapping between clone output variables."""
     if isinstance(u1_outs, (set, frozenset)) or isinstance(u2_outs, (set, frozenset)):
@@ -2215,7 +2267,9 @@ def _pair_clone_outputs(
     # Rejecting pairs with conflicting positional orders for common variables trades away a small
     # amount of recall to decisively prevent silent semantic bugs (such as accidental variable
     # swapping at extraction call sites).
-    if any(u1_dedup.index(name) != u2_dedup.index(name) for name in common):
+    if not allow_permuted_outputs and any(
+        u1_dedup.index(name) != u2_dedup.index(name) for name in common
+    ):
         logger.debug(
             "Rejecting clone output pairing: common variables have conflicting "
             "positional orderings (%s vs %s)",
@@ -2260,6 +2314,7 @@ class GeneratorCloneSideData(NamedTuple):
 def resolve_generator_subroutine_outputs(
     side1: GeneratorCloneSideData,
     side2: GeneratorCloneSideData,
+    allow_permuted_outputs: bool = False,
 ) -> Optional[Tuple[List[str], List[str]]]:
     """Selects output variables needed downstream by either clone side, preserving
     per-side necessity."""
@@ -2279,7 +2334,9 @@ def resolve_generator_subroutine_outputs(
     if not needed1 and not needed2:
         return [], []
 
-    pairs = _pair_clone_outputs(outs1, outs2)
+    pairs = _pair_clone_outputs(
+        outs1, outs2, allow_permuted_outputs=allow_permuted_outputs
+    )
     paired_u1 = {o1 for o1, _ in pairs}
     paired_u2 = {o2 for _, o2 in pairs}
 
@@ -2383,6 +2440,7 @@ def resolve_clone_generator_subroutine_outputs(
     skip_pre_unit_closures: bool = False,
     source_digest1: Optional[str] = None,
     source_digest2: Optional[str] = None,
+    allow_permuted_outputs: bool = False,
 ) -> Optional[Tuple[List[str], List[str]]]:
     """Resolves output variable bindings for clone generator subroutines across two code units.
 
@@ -2439,6 +2497,7 @@ def resolve_clone_generator_subroutine_outputs(
         (u2, cands2, source_text2, tree2, source_digest2, scope2),
     ]
     target_srcs: List[Optional[str]] = []
+    target_trees: List[Optional[ast.AST]] = []
     downstream_reads: List[Optional[Set[str]]] = []
     for u_item, cands, s_text, tr, s_digest, sc in targets:
         src = (
@@ -2447,15 +2506,24 @@ def resolve_clone_generator_subroutine_outputs(
             else _load_unit_file_text(u_item, repo_root=repo_root)
         )
         target_srcs.append(src)
+        eff_tr = tr if tr is not None else (
+            _get_or_parse_tree(src, source_digest=s_digest) if src is not None else None
+        )
+        target_trees.append(eff_tr)
         if src is not None:
+            unit_inps = (
+                set(sc["inputs"])
+                if "inputs" in sc and sc["inputs"] is not None
+                else None
+            )
             reads = collect_downstream_read_names(
                 src,
                 u_item,
                 candidates=cands,
-                tree=tr,
+                tree=eff_tr,
                 skip_pre_unit_closures=skip_pre_unit_closures,
                 source_digest=s_digest,
-                unit_inputs=set(sc.get("inputs", [])),
+                unit_inputs=unit_inps,
             )
         else:
             reads = None
@@ -2463,24 +2531,26 @@ def resolve_clone_generator_subroutine_outputs(
 
     side1 = GeneratorCloneSideData(outs1, downstream_reads[0], u1_def)
     side2 = GeneratorCloneSideData(outs2, downstream_reads[1], u2_def)
-    resolved = resolve_generator_subroutine_outputs(side1, side2)
+    resolved = resolve_generator_subroutine_outputs(
+        side1, side2, allow_permuted_outputs=allow_permuted_outputs
+    )
     if resolved is None:
         return None
 
     out1, out2 = resolved
-    for side_idx, (u_item, needed_outs, s_text, tr) in enumerate([
-        (u1, out1, target_srcs[0], tree1),
-        (u2, out2, target_srcs[1], tree2),
+    for side_idx, (u_item, needed_outs, s_text, eff_tr) in enumerate([
+        (u1, out1, target_srcs[0], target_trees[0]),
+        (u2, out2, target_srcs[1], target_trees[1]),
     ]):
         if needed_outs:
-            if s_text is None and tr is None:
+            if s_text is None and eff_tr is None:
                 logger.debug(
                     "Rejecting generator subroutine pair: needed output(s) cannot be "
                     "verified against enclosing try cleanup without source or AST for unit %s",
                     side_idx + 1,
                 )
                 return None
-            scope_node = _resolve_downstream_scope_node(s_text or "", u_item, tr)
+            scope_node = _resolve_downstream_scope_node(s_text or "", u_item, eff_tr)
             bounds = _get_valid_unit_bounds(u_item)
             if scope_node is None or bounds is None:
                 logger.debug(
@@ -2507,7 +2577,7 @@ def resolve_clone_generator_subroutine_outputs(
             u_start_col = _extract_first_unit_coord(
                 u_item, ("start_col", "start_col_offset")
             )
-            for c_pos, reads in _collect_scope_closures(scope_node, module_tree=tr):
+            for c_pos, reads in _collect_scope_closures(scope_node, module_tree=eff_tr):
                 _, is_intra, _ = _classify_closure_position(
                     c_pos, u_s, u_e, u_start_col=u_start_col, u_end_col=u_end_col
                 )
@@ -2540,6 +2610,7 @@ def resolve_clone_pair_outputs(
     source_digest2: Optional[str] = None,
     closure_strictness: Optional[str] = None,
     require_pairing: Optional[bool] = None,
+    allow_permuted_outputs: bool = False,
 ) -> Optional[Tuple[List[str], List[str]]]:
     """Resolves output variable bindings between two clone units, enforcing
     strict positional pairing and generator subroutine safety.
@@ -2605,6 +2676,7 @@ def resolve_clone_pair_outputs(
             skip_pre_unit_closures=effective_skip_closures,
             source_digest1=source_digest1,
             source_digest2=source_digest2,
+            allow_permuted_outputs=allow_permuted_outputs,
         )
 
     outs1 = _extract_effective_unit_outputs(u1, scope1)
@@ -2612,7 +2684,9 @@ def resolve_clone_pair_outputs(
     if not outs1 and not outs2:
         return [], []
 
-    pairs = _pair_clone_outputs(outs1, outs2)
+    pairs = _pair_clone_outputs(
+        outs1, outs2, allow_permuted_outputs=allow_permuted_outputs
+    )
     if len(pairs) == len(outs1) == len(outs2):
         return [p[0] for p in pairs], [p[1] for p in pairs]
 

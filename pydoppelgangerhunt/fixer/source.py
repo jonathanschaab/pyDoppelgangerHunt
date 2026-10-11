@@ -116,6 +116,18 @@ def is_valid_unit_coordinates(u: Any, strict: bool = False) -> bool:
 
 _is_valid_unit_coordinates = is_valid_unit_coordinates
 
+def _is_sliced_excerpt_for_file(unit: Dict[str, Any], lines: Sequence[str]) -> bool:
+    """Returns True if lines represents a sliced excerpt rather than full file text."""
+    if unit.get("source_lines_is_sliced") is True:
+        return True
+    _, u_end = resolve_unit_line_bounds(unit)
+    if len(lines) < u_end:
+        return True
+    if is_sliced_unit_source_lines(unit, lines):
+        return True
+    return False
+
+
 _SUBROUTINE_KINDS: frozenset[str] = frozenset(
     {"compound_block", "sliding_window", "clause_branch"}
 )
@@ -165,7 +177,9 @@ def is_subroutine_unit(
 
     src = source_text or unit.get("source_text") or unit.get("file_source")
     if not src and isinstance(unit.get("source_lines"), (list, tuple)):
-        src = "".join(unit["source_lines"])
+        u_lines = unit["source_lines"]
+        if not _is_sliced_excerpt_for_file(unit, u_lines):
+            src = "".join(u_lines)
     if isinstance(src, (list, tuple)):
         src = "".join(src)
     if src and isinstance(src, str):
@@ -198,18 +212,6 @@ def resolve_unit_declared_outputs(unit: Dict[str, Any]) -> Any:
         return unit["outputs"]
     return None
 
-
-
-def _is_sliced_excerpt_for_file(unit: Dict[str, Any], lines: Sequence[str]) -> bool:
-    """Returns True if lines represents a sliced excerpt rather than full file text."""
-    if unit.get("source_lines_is_sliced") is True:
-        return True
-    _, u_end = resolve_unit_line_bounds(unit)
-    if len(lines) < u_end:
-        return True
-    if is_sliced_unit_source_lines(unit, lines):
-        return True
-    return False
 
 
 def _load_unit_file_text(
