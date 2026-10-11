@@ -217,8 +217,6 @@ def _get_scope_parent_map(scope_node: ast.AST) -> Dict[ast.AST, ast.AST]:
     def _compute() -> Dict[ast.AST, ast.AST]:
         parent_map: Dict[ast.AST, ast.AST] = {}
         for parent in ast.walk(scope_node):
-            if parent is scope_node:
-                continue
             for child in ast.iter_child_nodes(parent):
                 parent_map[child] = parent
         return parent_map
@@ -2303,8 +2301,8 @@ def resolve_clone_pair_outputs(
         (outputs1, outputs2) tuple of paired output names, or None if pairing
         fails or safety invariants are violated.
     """
-    is_sub1 = is_subroutine_unit(u1)
-    is_sub2 = is_subroutine_unit(u2)
+    is_sub1 = is_subroutine_unit(u1, source_text=source_text1, tree=tree1)
+    is_sub2 = is_subroutine_unit(u2, source_text=source_text2, tree=tree2)
     if is_sub1 != is_sub2:
         logger.debug(
             "Rejecting clone pair output resolution: mismatched subroutine kinds "

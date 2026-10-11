@@ -1446,9 +1446,11 @@ def test_patch_subroutine_is_async_propagation(tmp_path: Path) -> None:
     u2 = {"file": str(f2), "start": 3, "end": 5, "name": "process_data_alt", "kind": "compound_block"}
 
     # Because total is needed downstream and the enclosing function is async def (async generator),
-    # returning total via a generator subroutine is illegal under PEP 525 and must be rejected.
-    patch = generate_refactoring_patch([(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
     assert patch == ""
+    assert synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path)) == ""
 
 
 def test_infer_outputs_return_type_counterpart_lookup() -> None:

@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shadowed generator expressions from escaping unobserved.
 - **Multi-Type Union Normalization with `None`**: Updated `_format_union_or_optional` in
   `synthesis.py` so union annotations containing three or more types with `None` (e.g.
+  `int | str | None`) normalize to `Optional[Union[int, str]]` for Python 3.9 compatibility.
 - **Parser Emits Unit Async Status (`is_async`)**: AST parsing now populates `is_async` on code
   units containing asynchronous constructs (`AsyncFunctionDef`, `await`, `async for`, `async with`).
 

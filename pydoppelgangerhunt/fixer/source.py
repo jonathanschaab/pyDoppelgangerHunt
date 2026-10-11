@@ -94,11 +94,12 @@ def is_valid_unit_coordinates(u: Any, strict: bool = False) -> bool:
             if end_col is None or end_col < 0:
                 return False
 
+        effective_end = end_val if end_val is not None else start_val
         if (
-            end_val is not None
+            effective_end is not None
             and start_col is not None
             and end_col is not None
-            and start_val == end_val
+            and start_val == effective_end
             and end_col < start_col
         ):
             return False

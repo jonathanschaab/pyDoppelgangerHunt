@@ -896,15 +896,21 @@ def synthesize_shared_helper_code(
     tree1 = _resolve_tree(tree1, source_text1, u1)
     tree2 = _resolve_tree(tree2, source_text2, u2)
 
-    _populate_unit_receiver_metadata(u1, repo_root=repo_root)
-    _populate_unit_receiver_metadata(u2, repo_root=repo_root)
-
     # Variable scope analysis for concrete parameter signatures.
-    scope1 = inspect_single_unit_scope(u1, repo_root=repo_root, tree=tree1)
-    scope2 = inspect_single_unit_scope(u2, repo_root=repo_root, tree=tree2)
+    scopes: List[Dict[str, Any]] = []
+    for u_item, t_item in ((u1, tree1), (u2, tree2)):
+        _populate_unit_receiver_metadata(u_item, repo_root=repo_root)
+        s_item = inspect_single_unit_scope(u_item, repo_root=repo_root, tree=t_item)
+        if u_item.get("enclosing_is_async") and s_item.get("has_yield"):
+            s_item["is_async"] = True
+            u_item["is_async"] = True
+        scopes.append(s_item)
+    scope1, scope2 = scopes[0], scopes[1]
     scope = analyze_unit_variable_scope(
         u1, u2, repo_root=repo_root, tree1=tree1, tree2=tree2
     )
+    if scope1.get("is_async") or scope2.get("is_async"):
+        scope["is_async"] = True
 
     enc1 = u1.get("enclosing_class")
     enc2 = u2.get("enclosing_class")

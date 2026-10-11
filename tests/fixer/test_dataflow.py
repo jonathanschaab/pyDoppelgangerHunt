@@ -2774,14 +2774,16 @@ def test_frozenset_outputs_defensive_handling() -> None:
 
 
 def test_scope_parent_map_excludes_scope_node_and_stays_bounded() -> None:
-    """Verifies that _scope_parent_maps excludes scope_node itself to prevent circular
-    references, and that cache size stays strictly bounded across thousands of invocations."""
-    # 1. Verify parent_map does not contain scope_node as value
+    """Verifies that _scope_parent_maps excludes scope_node as key to prevent circular
+    references, maps direct children to scope_node, and that cache size stays bounded."""
+    # 1. Verify parent_map maps children to scope_node and does not assign a parent to scope_node
     code = "def sample():\n    x = 1\n    return x\n"
     tree = ast.parse(code)
     fn = tree.body[0]
+    assert isinstance(fn, ast.FunctionDef)
     parent_map = _get_scope_parent_map(fn)
-    assert fn not in parent_map.values()
+    assert fn not in parent_map
+    assert parent_map[fn.body[0]] is fn
 
     # 2. Stress test: collect_downstream_read_names across 2,000 synthetic AST modules
     for i in range(2000):
@@ -3459,4 +3461,37 @@ def test_eager_consumed_genexp_non_str_receiver_join() -> None:
     tree_str_call = ast.parse(code_str_call)
     closures_str_call = _collect_scope_closures(tree_str_call.body[0])
     assert len(closures_str_call) == 0
+
+
+def test_resolve_clone_pair_outputs_forwards_source_text_and_tree() -> None:
+    """Verifies resolve_clone_pair_outputs passes source_text and tree to is_subroutine_unit."""
+    src1 = (
+        "def outer1():\n"
+        "    x = 1\n"
+        "    y = 2\n"
+        "    return x + y\n"
+    )
+    src2 = (
+        "def outer2():\n"
+        "    x = 1\n"
+        "    y = 2\n"
+        "    return x + y\n"
+    )
+    u1 = {"file": "mod1.py", "start": 2, "end": 3}
+    u2 = {"file": "mod2.py", "start": 2, "end": 3}
+    s1 = {"stores": ["x", "y"], "inputs": []}
+    s2 = {"stores": ["x", "y"], "inputs": []}
+    t1 = ast.parse(src1)
+    t2 = ast.parse(src2)
+    res = resolve_clone_pair_outputs(
+        u1,
+        u2,
+        s1,
+        s2,
+        source_text1=src1,
+        source_text2=src2,
+        tree1=t1,
+        tree2=t2,
+    )
+    assert res is not None
 

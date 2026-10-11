@@ -6400,32 +6400,33 @@ def test_is_valid_unit_coordinates_scenarios() -> None:
     import pydoppelgangerhunt as pdgh
     import pydoppelgangerhunt.fixer as pdgh_fixer
 
-    # Test behavioural equivalence of public functions, package exports, and backward-compatible aliases
-    test_cases: List[Any] = [
-        None,
-        "string_unit",
-        ["list_unit"],
-        {},
-        {"start": 1, "end": 5},
-        {"start": "1", "end": "5"},
-        {"start": "12:0", "end": "15:0"},
-        {"start": "12:0", "end": "15:0", "start_col": "4:0", "end_col": "10:0"},
-        {"start": "not_an_int"},
-        {"start": 1, "end": [2]},
-        {"start": 1, "end": 5, "start_col": "invalid"},
-        {"start": 1, "end": 5, "end_col": {}},
-        {"start": ""},
-        {"start": 1, "end": 5, "start_col": ""},
-        {"start": float("inf"), "end": 5},
-        {"start": "inf", "end": 5},
-        {"start": 1, "end": float("nan")},
+    # Test correctness and behavioural equivalence across aliases
+    test_cases: List[Tuple[Any, bool]] = [
+        (None, False),
+        ("string_unit", False),
+        (["list_unit"], False),
+        ({}, False),
+        ({"start": 1, "end": 5}, True),
+        ({"start": "1", "end": "5"}, True),
+        ({"start": "12:0", "end": "15:0"}, True),
+        ({"start": "12:0", "end": "15:0", "start_col": "4:0", "end_col": "10:0"}, True),
+        ({"start": "not_an_int"}, False),
+        ({"start": 1, "end": [2]}, False),
+        ({"start": 1, "end": 5, "start_col": "invalid"}, False),
+        ({"start": 1, "end": 5, "end_col": {}}, False),
+        ({"start": ""}, False),
+        ({"start": 1, "end": 5, "start_col": ""}, False),
+        ({"start": float("inf"), "end": 5}, False),
+        ({"start": "inf", "end": 5}, False),
+        ({"start": 1, "end": float("nan")}, False),
+        ({"start": 5, "start_col": 20, "end_col": 10}, False),
     ]
-    for tc in test_cases:
-        expected = is_valid_unit_coordinates(tc)
-        assert is_valid_pub(tc) == expected
-        assert _is_valid_unit_coordinates(tc) == expected
-        assert pdgh_fixer.is_valid_unit_coordinates(tc) == expected
-        assert pdgh.is_valid_unit_coordinates(tc) == expected
+    for tc, expected in test_cases:
+        assert is_valid_unit_coordinates(tc) is expected
+        assert is_valid_pub(tc) is expected
+        assert _is_valid_unit_coordinates(tc) is expected
+        assert pdgh_fixer.is_valid_unit_coordinates(tc) is expected
+        assert pdgh.is_valid_unit_coordinates(tc) is expected
 
     coord_cases: List[Tuple[Dict[str, Any], str, int, int]] = [
         ({"start": 10}, "start", 1, 10),

@@ -17,6 +17,7 @@ from pydoppelgangerhunt.fixer.source import (
     split_source_lines,
 )
 from pydoppelgangerhunt.parser import is_decorator_named
+from pydoppelgangerhunt.reporters import extract_unit_source_code
 
 __all__ = [
     "find_enclosing_class",
@@ -303,7 +304,17 @@ def _populate_unit_receiver_metadata(
     if "is_async" not in unit:
         is_sub = is_subroutine_unit(unit, source_text=source)
         if is_sub:
-            unit["is_async"] = False
+            has_yield = (
+                bool(unit.get("has_yield"))
+                or ("yield" in str(unit.get("source_text") or ""))
+            )
+            has_await = "await" in str(unit.get("source_text") or "")
+            if not (has_yield or has_await) and source is not None:
+                u_lines = extract_unit_source_code(unit, repo_root=repo_root)
+                u_text = "".join(u_lines)
+                has_yield = "yield" in u_text
+                has_await = "await" in u_text
+            unit["is_async"] = fn_is_async if (has_yield or has_await) else False
         else:
             unit["is_async"] = fn_is_async
 
