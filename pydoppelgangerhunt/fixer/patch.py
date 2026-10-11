@@ -5,13 +5,14 @@ from __future__ import annotations
 import ast
 import builtins
 import difflib
+import hashlib
 import logging
 import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, TypedDict, Union
 
-from pydoppelgangerhunt.config import normalize_path_string
+from pydoppelgangerhunt.config import normalize_path_string, resolve_closure_strictness_mode
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
     _extract_child_indentation,
@@ -23,6 +24,10 @@ from pydoppelgangerhunt.fixer.binding import (
     _resolve_effective_binding,
     find_enclosing_class,
     find_enclosing_function,
+)
+from pydoppelgangerhunt.fixer.dataflow import (
+    has_async_generator_delegation_hazard,
+    resolve_clone_pair_outputs,
 )
 from pydoppelgangerhunt.fixer.depgraph import (
     ModuleDependencyGraph,
@@ -40,7 +45,8 @@ from pydoppelgangerhunt.fixer.depgraph import (
 from pydoppelgangerhunt.fixer.scope import (
     _extract_arg_names,
     _normalize_receiver_attrs,
-    dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
+    analyze_unit_variable_scope,
+    inspect_single_unit_scope,
 )
 
 from pydoppelgangerhunt.fixer.source import (
@@ -56,11 +62,13 @@ from pydoppelgangerhunt.fixer.source import (
     compute_line_offsets,
     count_physical_newlines,
     detect_line_ending,
+    is_subroutine_unit,
     is_valid_unit_coordinates,
     parse_unit_coord,
     resolve_unit_replacement,
     split_source_lines,
 )
+from pydoppelgangerhunt.source_lines import resolve_unit_line_bounds
 from pydoppelgangerhunt.fixer.synthesis import (
     _extract_required_typing_imports,
     _format_call_arguments,
@@ -175,7 +183,10 @@ def check_units_overlap(
         if val is None:
             return None
         try:
-            return max(0, int(val))
+            parsed = parse_unit_coord({col_name: val}, col_name, default=None)
+            if parsed is None:
+                return None
+            return max(0, parsed)
         except (ValueError, TypeError) as err:
             raise ValueError(
                 f"Malformed unit: invalid column offset '{col_name}'={val!r} in {file_path}"
@@ -207,11 +218,11 @@ def check_units_overlap(
         return _check_same_line_overlap(sc1, ec1, sc2, ec2)
 
     # Case 2: Sequential boundary touch (u1 ends where u2 begins)
-    if start1 < start2 and end1 == start2:
+    if start1 < start2 and start2 == end1:
         return _check_sequential_touch(ec1, sc2, start2 == end2, ec2)
 
     # Case 3: Sequential boundary touch (u2 ends where u1 begins)
-    if start2 < start1 and end2 == start1:
+    if start2 < start1 and start1 == end2:
         return _check_sequential_touch(ec2, sc1, start1 == end1, ec1)
 
     # Case 4: Units sharing start line (start1 == start2), or multi-line units sharing end line (end1 == end2).
@@ -302,8 +313,8 @@ def _format_unit_desc(u: UnitDict) -> Tuple[str, int, int, str]:
     if not isinstance(u, dict):
         raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
     n = str(u.get("name") or "unit")
-    s = parse_unit_coord(u, "start", default=1)
-    e = parse_unit_coord(u, "end", default=s)
+    s = max(1, parse_unit_coord(u, "start", default=1))
+    e = max(s, parse_unit_coord(u, "end", default=s))
     f = normalize_path_string(str(u.get("file") or ""), strip_anchor=False) or "<module>"
     return n, s, e, f
 
@@ -504,8 +515,7 @@ def _build_whole_method_delegation(
 ) -> str:
     """Builds a delegated method replacement body preserving method signature and docstring."""
     lines = split_source_lines(source_text)
-    u_start = parse_unit_coord(unit, "start", default=1)
-    u_end = parse_unit_coord(unit, "end", default=max(u_start, len(lines)))
+    u_start, u_end = resolve_unit_line_bounds(unit)
 
     lead = lines[u_start - 1] if 1 <= u_start <= len(lines) else ""
     indent = lead[: len(lead) - len(lead.lstrip())]
@@ -523,10 +533,14 @@ def _build_whole_method_delegation(
         cand_nodes: List[Tuple[int, Union[ast.FunctionDef, ast.AsyncFunctionDef]]] = []
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                n_start = getattr(node, "lineno", 0)
-                n_end = getattr(node, "end_lineno", n_start)
+                n_start = getattr(node, "lineno", 0) or 0
+                n_end = getattr(node, "end_lineno", None) or n_start
                 decs = getattr(node, "decorator_list", [])
-                dec_start = min(getattr(d, "lineno", n_start) for d in decs) if decs else n_start
+                dec_start = (
+                    min((getattr(d, "lineno", None) or n_start) for d in decs)
+                    if decs
+                    else n_start
+                )
                 earliest_start = min(dec_start, n_start)
                 if u_start in (n_start, earliest_start):
                     cand_nodes.append((0, node))
@@ -557,7 +571,10 @@ def _build_whole_method_delegation(
                 else:
                     sig_end_line = first_body.lineno - 1
                     if _is_docstring_node(first_body):
-                        docstring_end_line = getattr(first_body, "end_lineno", first_body.lineno)
+                        docstring_end_line = (
+                            getattr(first_body, "end_lineno", None)
+                            or getattr(first_body, "lineno", 0)
+                        )
     except (SyntaxError, ValueError, UnicodeDecodeError):
         pass
 
@@ -648,7 +665,7 @@ def _build_unit_delegation_call(
     step: Optional[str] = None,
 ) -> str:
     """Constructs replacement delegation call statement for a clone unit in refactoring patches."""
-    u_start = parse_unit_coord(target_unit, "start", default=1)
+    u_start = max(1, parse_unit_coord(target_unit, "start", default=1))
     lead = orig_lines[u_start - 1] if 1 <= u_start <= len(orig_lines) else ""
     indent = lead[: len(lead) - len(lead.lstrip())]
 
@@ -714,7 +731,7 @@ def _build_unit_delegation_call(
 
     call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
     rep_step = step or ("\t" if "\t" in indent else "    ")
-    if scope.get("has_yield") and scope.get("is_async"):
+    if bool(scope.get("has_yield")) and bool(scope.get("is_async")):
         return (
             f"{indent}async for _item in {call_expr}:\n"
             f"{indent}{rep_step}yield _item\n"
@@ -759,6 +776,23 @@ def _module_imports_target(
     return False
 
 
+def _outputs_compatible(
+    helper_outs: Sequence[str],
+    target_outs: Sequence[str],
+    *,
+    is_subroutine: bool,
+    has_yield: bool,
+) -> bool:
+    """Checks whether candidate clone outputs match synthesized helper outputs.
+
+    Note: When is_subroutine and has_yield are True, resolve_clone_generator_subroutine_outputs
+    strictly guarantees equal-length paired outputs, so output lengths are always compatible.
+    """
+    if is_subroutine and has_yield:
+        return True
+    return len(helper_outs) == len(target_outs)
+
+
 class _PlanSnapshot(TypedDict):
     """Encapsulates a snapshot of mutable _FilePatchPlan state for transactional rollback."""
 
@@ -800,6 +834,29 @@ class _FilePatchPlan:
         self.comments: List[str] = []
         self.used_helper_names: Set[str] = set()
         self.claimed_units: List[UnitDict] = []
+        self._cached_ast: Optional[ast.AST] = None
+        self._ast_attempted: bool = False
+        self._content_digest: Optional[str] = None
+
+    @property
+    def content_digest(self) -> str:
+        """SHA-256 digest of orig_text, cached for reuse in downstream analysis."""
+        if self._content_digest is None:
+            self._content_digest = hashlib.sha256(
+                self.orig_text.encode("utf-8", errors="replace")
+            ).hexdigest()
+        return self._content_digest
+
+    @property
+    def parsed_tree(self) -> Optional[ast.AST]:
+        """Lazily parsed AST of orig_text, cached for reuse across operations."""
+        if not self._ast_attempted:
+            self._ast_attempted = True
+            try:
+                self._cached_ast = ast.parse(self.orig_text)
+            except (SyntaxError, ValueError, UnicodeDecodeError):
+                self._cached_ast = None
+        return self._cached_ast
 
     def snapshot(self) -> _PlanSnapshot:
         """Creates a snapshot of mutable plan state for transactional rollback."""
@@ -852,11 +909,17 @@ def _compute_replacement_line_deltas(
     for i, (u, rep) in enumerate(reps):
         if not isinstance(u, dict):
             raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
+        if not is_valid_unit_coordinates(u, strict=False):
+            raise ValueError(
+                f"Malformed unit: invalid line boundary in {u.get('file', '')}: {u}"
+            )
         try:
-            fallback = parse_unit_coord(u, "start", default=1)
-            end_l = parse_unit_coord(u, "end", default=fallback)
+            fallback = max(1, parse_unit_coord(u, "start", default=1))
+            end_l = max(fallback, parse_unit_coord(u, "end", default=fallback))
         except (ValueError, TypeError) as err:
-            raise ValueError(f"Malformed unit: invalid line boundary in {u.get('file', '')}: {err}") from err
+            raise ValueError(
+                f"Malformed unit: invalid line boundary in {u.get('file', '')}: {err}"
+            ) from err
         item = resolve_unit_replacement(
             orig_text,
             u,
@@ -949,7 +1012,7 @@ def _derive_unit_indent_step(
     """Derives indentation step for a unit from its starting line indentation if not provided."""
     if step is not None:
         return step
-    u_s = parse_unit_coord(unit, "start", default=1)
+    u_s = max(1, parse_unit_coord(unit, "start", default=1))
     u_lead = lines[u_s - 1] if 1 <= u_s <= len(lines) else ""
     u_ind = u_lead[: len(u_lead) - len(u_lead.lstrip())]
     return _detect_indent_step(u_ind)
@@ -1180,19 +1243,37 @@ def _render_file_patch_plan(
         git_header = f"diff --git a/{plan.rel_path} b/{plan.rel_path}\nnew file mode 100644\n"
         deduped_comments = list(dict.fromkeys(plan.comments))
         return "".join(deduped_comments) + git_header + diff_str
-    retained_cands = filter_overlapping_clone_units(
-        [u for u, _ in plan.replacements], repo_root=repo_root
-    )
-    filtered_reps: List[Tuple[Dict[str, Any], str]] = []
+    coord_valid_reps: List[Tuple[Dict[str, Any], str]] = []
     for u, rep in plan.replacements:
-        if any(
-            u is r
-            or (
-                u.get("file") == r.get("file")
-                and u.get("start") == r.get("start")
-                and u.get("end") == r.get("end")
+        if not is_valid_unit_coordinates(u, strict=True):
+            logger.warning(
+                "Skipping replacement with invalid coordinates in %s: %r",
+                plan.rel_path,
+                u,
             )
-            for r in retained_cands
+            continue
+        coord_valid_reps.append((u, rep))
+
+    retained_cands = filter_overlapping_clone_units(
+        [u for u, _ in coord_valid_reps], repo_root=repo_root
+    )
+
+    def _unit_span(unit: Dict[str, Any]) -> Tuple[int, int]:
+        s = parse_unit_coord(unit, "start", default=1, strict=True)
+        return s, parse_unit_coord(unit, "end", default=s, strict=True)
+
+    retained_ids: Set[int] = {id(r) for r in retained_cands}
+    retained_spans: Set[Tuple[Optional[str], int, int]] = {
+        (r.get("file"), _unit_span(r)[0], _unit_span(r)[1])
+        for r in retained_cands
+    }
+
+    filtered_reps: List[Tuple[Dict[str, Any], str]] = []
+    for u, rep in coord_valid_reps:
+        u_span = _unit_span(u)
+        if (
+            id(u) in retained_ids
+            or (u.get("file"), u_span[0], u_span[1]) in retained_spans
         ):
             if not any(
                 check_units_overlap(u, prev_u, repo_root=repo_root)
@@ -1638,39 +1719,27 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
             elif isinstance(node, ast.If):
                 _collect_top_defs(node.body)
                 _collect_top_defs(node.orelse)
-            elif isinstance(node, ast.Try) or (
-                hasattr(ast, "TryStar") and isinstance(node, getattr(ast, "TryStar"))
-            ):
+            elif isinstance(node, ast.Try) or type(node).__name__ == "TryStar":
                 _collect_top_defs(getattr(node, "body", []))
                 for handler in getattr(node, "handlers", []):
                     _collect_top_defs(getattr(handler, "body", []))
                 _collect_top_defs(getattr(node, "orelse", []))
                 _collect_top_defs(getattr(node, "finalbody", []))
-            elif hasattr(ast, "Match") and isinstance(node, getattr(ast, "Match")):
+            elif type(node).__name__ == "Match":
                 for case in getattr(node, "cases", []):
                     for sub in ast.walk(case.pattern):
                         if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
                             names.add(sub.id)
-                        elif (
-                            hasattr(ast, "MatchAs")
-                            and isinstance(sub, getattr(ast, "MatchAs"))
-                            and getattr(sub, "name", None)
-                        ):
-                            names.add(sub.name)
-                        elif (
-                            hasattr(ast, "MatchStar")
-                            and isinstance(sub, getattr(ast, "MatchStar"))
-                            and getattr(sub, "name", None)
-                        ):
-                            names.add(sub.name)
-                        elif (
-                            hasattr(ast, "MatchMapping")
-                            and isinstance(sub, getattr(ast, "MatchMapping"))
-                            and getattr(sub, "rest", None)
-                        ):
-                            names.add(sub.rest)
+                        elif type(sub).__name__ in ("MatchAs", "MatchStar"):
+                            sub_name = getattr(sub, "name", None)
+                            if isinstance(sub_name, str):
+                                names.add(sub_name)
+                        elif type(sub).__name__ == "MatchMapping":
+                            sub_rest = getattr(sub, "rest", None)
+                            if isinstance(sub_rest, str):
+                                names.add(sub_rest)
                     _collect_top_defs(case.body)
-            elif hasattr(ast, "TypeAlias") and isinstance(node, getattr(ast, "TypeAlias")):
+            elif type(node).__name__ == "TypeAlias":
                 tgt_name = getattr(node, "name", None)
                 if isinstance(tgt_name, ast.Name):
                     names.add(tgt_name.id)
@@ -2559,11 +2628,38 @@ def generate_refactoring_patch(
     cross_file_strategy: str = "auto",
     shared_module_name: str = "_common.py",
     depgraph: Optional[ModuleDependencyGraph] = None,
+    skip_pre_unit_closures: bool = False,
+    closure_strictness: Optional[str] = None,
 ) -> str:
     """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
     if not clones:
         return ""
+    return _generate_refactoring_patch_impl(
+        clones=clones,
+        repo_root=repo_root,
+        type_merge_strategy=type_merge_strategy,
+        replace_clones=replace_clones,
+        method_binding=method_binding,
+        cross_file_strategy=cross_file_strategy,
+        shared_module_name=shared_module_name,
+        depgraph=depgraph,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+        closure_strictness=closure_strictness,
+    )
 
+
+def _generate_refactoring_patch_impl(
+    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
+    repo_root: Optional[str] = None,
+    type_merge_strategy: str = "fallback_any",
+    replace_clones: bool = False,
+    method_binding: str = "auto",
+    cross_file_strategy: str = "auto",
+    shared_module_name: str = "_common.py",
+    depgraph: Optional[ModuleDependencyGraph] = None,
+    skip_pre_unit_closures: bool = False,
+    closure_strictness: Optional[str] = None,
+) -> str:
     fs_root = Path(repo_root or os.getcwd()).resolve()
     if fs_root.is_file():
         fs_root = fs_root.parent
@@ -2586,6 +2682,12 @@ def generate_refactoring_patch(
     method_binding = (method_binding or "auto").strip().lower()
     if method_binding not in ("auto", "method", "module"):
         method_binding = "auto"
+    _, effective_skip_closures = resolve_closure_strictness_mode(
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+    )
+    if effective_skip_closures:
+        logger.debug("Generating patches in lenient closure strictness mode")
     graph_holder: List[Optional[ModuleDependencyGraph]] = [
         depgraph.copy() if depgraph is not None else None
     ]
@@ -2613,11 +2715,29 @@ def generate_refactoring_patch(
     )
 
     for sim, u1, u2 in clones:
-        if not is_valid_unit_coordinates(u1) or not is_valid_unit_coordinates(u2):
+        if (
+            not is_valid_unit_coordinates(u1, strict=True)
+            or not is_valid_unit_coordinates(u2, strict=True)
+        ):
             logger.debug(
                 "Skipping clone pair with malformed unit coordinates: (%s, %s)", u1, u2
             )
             continue
+
+        is_sub1 = is_subroutine_unit(u1)
+        is_sub2 = is_subroutine_unit(u2)
+        if is_sub1 != is_sub2:
+            logger.debug(
+                "Skipping clone pair (%s, %s): mismatched subroutine kinds "
+                "(is_sub1=%s, is_sub2=%s)",
+                u1.get("name"),
+                u2.get("name"),
+                is_sub1,
+                is_sub2,
+            )
+            continue
+
+
 
         # Performance: Snapshot only plans touched in this pair (f1, f2, and potential shared module)
         # to ensure O(touched_plans) = O(1) complexity per pair rather than O(pairs * total_plans).
@@ -2686,8 +2806,8 @@ def generate_refactoring_patch(
                     f2_plan = file_plans.get(f2_path)
                     if f2_plan is None:
                         try:
-                            f2_text = f2_path.read_text(encoding="utf-8")
-                            f2_plan = _get_plan(f2_path, rel_f2, f2_text)
+                            loaded_text = f2_path.read_text(encoding="utf-8")
+                            f2_plan = _get_plan(f2_path, rel_f2, loaded_text)
                         except (OSError, UnicodeDecodeError):
                             f2_plan = None
                     if f2_plan is not None:
@@ -2697,9 +2817,16 @@ def generate_refactoring_patch(
                 continue
 
             u1_lines = orig_lines
-            u2_lines = orig_lines if is_same_file else (f2_plan.orig_lines if f2_plan is not None else [])
-            u1_eff = dict(u1, source_lines=u1_lines)
-            u2_eff = dict(u2, source_lines=u2_lines)
+            u2_lines = (
+                orig_lines
+                if is_same_file
+                else (f2_plan.orig_lines if f2_plan is not None else None)
+            )
+            u1_eff = dict(u1, source_lines=u1_lines, source_lines_is_sliced=False)
+            if u2_lines is not None:
+                u2_eff = dict(u2, source_lines=u2_lines, source_lines_is_sliced=False)
+            else:
+                u2_eff = dict(u2)
 
             if replace_clones:
                 u1_claimed = any(
@@ -2730,7 +2857,14 @@ def generate_refactoring_patch(
                 and enc1["name"] == enc2["name"]
                 and enc1["start"] == enc2["start"]
             )
+            f2_text: Optional[str] = (
+                f2_plan.orig_text
+                if f2_plan is not None
+                else (f1_plan.orig_text if is_same_file else None)
+            )
 
+            orig_fn1 = fn1
+            orig_fn2 = fn2
             if not _is_method_of_class(fn1, enc1):
                 fn1 = None
             if not _is_method_of_class(fn2, enc2):
@@ -2748,29 +2882,52 @@ def generate_refactoring_patch(
                 and (fn1.get("receiver_param") or fn1.get("is_static"))
                 and (fn2.get("receiver_param") or fn2.get("is_static"))
             )
-            if fn1 and "receiver_param" not in u1:
-                u1["receiver_param"] = fn1.get("receiver_param")
+            if fn1 and "receiver_param" not in u1_eff:
                 u1_eff["receiver_param"] = fn1.get("receiver_param")
-            if fn2 and "receiver_param" not in u2:
-                u2["receiver_param"] = fn2.get("receiver_param")
+            if fn2 and "receiver_param" not in u2_eff:
                 u2_eff["receiver_param"] = fn2.get("receiver_param")
             if fn1 and fn2:
                 is_static = bool(fn1.get("is_static") and fn2.get("is_static"))
             else:
                 is_static = bool((fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static")))
 
-            s1 = analyze_unit_variable_scope(u1_eff, repo_root=str(root))
-            s2 = analyze_unit_variable_scope(u2_eff, repo_root=str(root))
+            tree1 = f1_plan.parsed_tree
+            tree2 = (
+                f2_plan.parsed_tree
+                if f2_plan is not None
+                else (tree1 if is_same_file else None)
+            )
+            digest1 = f1_plan.content_digest
+            digest2 = (
+                f2_plan.content_digest
+                if f2_plan is not None
+                else (digest1 if is_same_file else None)
+            )
+            s1 = inspect_single_unit_scope(u1_eff, repo_root=str(root), tree=tree1)
+            s2 = inspect_single_unit_scope(u2_eff, repo_root=str(root), tree=tree2)
+            if orig_fn1 and orig_fn1.get("is_async") and s1.get("has_yield"):
+                s1["is_async"] = True
+            if orig_fn2 and orig_fn2.get("is_async") and s2.get("has_yield"):
+                s2["is_async"] = True
+            if s1.get("is_async") is None or s2.get("is_async") is None:
+                logger.debug(
+                    "Skipping clone pair (%s, %s): indeterminate async state",
+                    u1.get("name"),
+                    u2.get("name"),
+                )
+                continue
             if bool(s1.get("is_async")) != bool(s2.get("is_async")):
                 continue
             if bool(s1.get("has_yield")) != bool(s2.get("has_yield")):
+                continue
+            if has_async_generator_delegation_hazard(s1, s2):
                 continue
             if s1.get("nonlocals") or s2.get("nonlocals"):
                 continue
             if not is_same_file and (s1.get("globals") or s2.get("globals")):
                 continue
-            rec1 = u1.get("receiver_param") or ("cls" if fn1_kind == "class" else "self")
-            rec2 = u2.get("receiver_param") or ("cls" if fn2_kind == "class" else "self")
+            rec1 = u1_eff.get("receiver_param") or ("cls" if fn1_kind == "class" else "self")
+            rec2 = u2_eff.get("receiver_param") or ("cls" if fn2_kind == "class" else "self")
             if (
                 _normalize_receiver_attrs(s1.get("attrs_read", []), rec1)
                 != _normalize_receiver_attrs(s2.get("attrs_read", []), rec2)
@@ -2786,6 +2943,8 @@ def generate_refactoring_patch(
             if "embedded_return" in hazards1 | hazards2:
                 lines1 = u1_lines
                 lines2 = u2_lines
+                if lines1 is None or lines2 is None:
+                    continue
                 if not (
                     _has_unconditional_terminal_return(u1, lines1)
                     and _has_unconditional_terminal_return(u2, lines2)
@@ -2793,7 +2952,10 @@ def generate_refactoring_patch(
                     continue
 
             if receiver_kinds_differ:
-                if _has_receiver_reference(u1_eff, s1, repo_root=str(root)) or _has_receiver_reference(u2_eff, s2, repo_root=str(root)):
+                if (
+                    _has_receiver_reference(u1_eff, s1, repo_root=str(root))
+                    or _has_receiver_reference(u2_eff, s2, repo_root=str(root))
+                ):
                     continue
 
             effective_binding = _resolve_effective_binding(
@@ -2830,36 +2992,57 @@ def generate_refactoring_patch(
             )
             step = _derive_unit_indent_step(u1, orig_lines, step)
 
-            scope = analyze_unit_variable_scope(u1_eff, u2_eff, repo_root=str(root))
+            scope = analyze_unit_variable_scope(
+                u1_eff,
+                u2_eff,
+                repo_root=str(root),
+                tree1=tree1,
+                tree2=tree2,
+                scope1=s1,
+                scope2=s2,
+            )
             inputs = list(scope.get("inputs", []))
             if effective_binding == "module":
-                inputs = _prune_unshared_receivers(inputs, u1_eff, u2_eff, s1, s2, repo_root=str(root))
-            outputs = [
-                v for v in scope.get("outputs", [])
-                if v not in scope.get("globals", [])
-                and v not in scope.get("nonlocals", [])
-            ]
-            u1_outs = [
-                v for v in s1.get("outputs", [])
-                if v not in s1.get("globals", [])
-                and v not in s1.get("nonlocals", [])
-            ]
-            u2_outs = [
-                v for v in s2.get("outputs", [])
-                if v not in s2.get("globals", [])
-                and v not in s2.get("nonlocals", [])
-            ]
-            if set(u2_outs) == set(outputs):
-                target_outs2 = outputs
-            elif len(u2_outs) == len(outputs):
-                out_map = {o: o for o in set(outputs) & set(u2_outs)}
-                rem_o = [o for o in outputs if o not in out_map]
-                rem_u2 = [o for o in u2_outs if o not in out_map]
-                for o1, o2 in zip(rem_o, rem_u2):
-                    out_map[o1] = o2
-                target_outs2 = [out_map.get(o, o) for o in outputs]
-            else:
-                target_outs2 = outputs
+                inputs = _prune_unshared_receivers(
+                    inputs, u1_eff, u2_eff, s1, s2, repo_root=str(root)
+                )
+
+            resolved_outs = resolve_clone_pair_outputs(
+                u1=u1_eff,
+                u2=u2_eff,
+                scope1=s1,
+                scope2=s2,
+                source_text1=f1_plan.orig_text,
+                source_text2=f2_text,
+                tree1=tree1,
+                tree2=tree2,
+                repo_root=str(root),
+                skip_pre_unit_closures=effective_skip_closures,
+                source_digest1=digest1,
+                source_digest2=digest2,
+                require_pairing=replace_clones,
+            )
+            if resolved_outs is None:
+                logger.debug(
+                    "Skipping clone pair (%s, %s): failed to resolve clone pair outputs "
+                    "(necessity, pairing, or definiteness check failed)",
+                    u1.get("name"),
+                    u2.get("name"),
+                )
+                continue
+            outputs, target_outs2 = resolved_outs
+            if has_async_generator_delegation_hazard(
+                s1, s2, has_outputs=bool(outputs or target_outs2)
+            ):
+                logger.debug(
+                    "Skipping clone pair (%s, %s): async generator cannot return "
+                    "values or outputs",
+                    u1.get("name"),
+                    u2.get("name"),
+                )
+                continue
+            u1_eff["outputs"] = outputs
+            u2_eff["outputs"] = target_outs2
             t_inputs1 = list(s1.get("inputs", []))
             t_inputs2 = list(s2.get("inputs", []))
             if effective_binding == "module":
@@ -2873,9 +3056,18 @@ def generate_refactoring_patch(
             if replace_clones and (
                 len(t_inputs1) != len(inputs)
                 or len(t_inputs2) != len(inputs)
-                or len(u1_outs) != len(outputs)
-                or len(u2_outs) != len(outputs)
+                or not _outputs_compatible(
+                    outputs,
+                    target_outs2,
+                    is_subroutine=is_subroutine_unit(u1_eff),
+                    has_yield=bool(s1.get("has_yield") or s2.get("has_yield")),
+                )
             ):
+                logger.debug(
+                    "Skipping clone pair (%s, %s): incompatible inputs or outputs",
+                    u1.get("name"),
+                    u2.get("name"),
+                )
                 continue
 
             base_name1 = _base_unit_name(u1)
@@ -2971,6 +3163,14 @@ def generate_refactoring_patch(
                 step=step,
                 repo_root=str(root),
                 helper_name=helper_name,
+                source_text1=f1_plan.orig_text,
+                source_text2=f2_text,
+                tree1=tree1,
+                tree2=tree2,
+                skip_pre_unit_closures=effective_skip_closures,
+                closure_strictness=closure_strictness,
+                outputs=outputs,
+                outputs2=target_outs2,
             )
             if not helper_code:
                 continue
@@ -2986,7 +3186,7 @@ def generate_refactoring_patch(
                 candidate_units.append(u2)
 
             def _unit_start(u: Dict[str, Any]) -> int:
-                return parse_unit_coord(u, "start", default=1)
+                return max(1, parse_unit_coord(u, "start", default=1))
 
             earliest_unit = min(candidate_units, key=_unit_start)
             enc_fn_earliest = (
@@ -3022,7 +3222,7 @@ def generate_refactoring_patch(
 
                 if replace_clones:
                     _delegate_unit_in_plan(
-                        u1,
+                        u1_eff,
                         f1_plan,
                         helper_name=helper_name,
                         inputs=inputs,
@@ -3036,7 +3236,7 @@ def generate_refactoring_patch(
                     )
                     if len(candidate_units) > 1:
                         _delegate_unit_in_plan(
-                            u2,
+                            u2_eff,
                             f1_plan,
                             helper_name=helper_name,
                             inputs=inputs,
@@ -3065,10 +3265,10 @@ def generate_refactoring_patch(
 
                     if _is_same_file_or_resolved(shared_p, f1_path):
                         host_plan = f1_plan
-                        callers = [(f2_plan, u2, t_inputs2, target_outs2)]
+                        callers = [(f2_plan, u2_eff, t_inputs2, target_outs2)]
                     elif _is_same_file_or_resolved(shared_p, f2_plan.path):
                         host_plan = f2_plan
-                        callers = [(f1_plan, u1, t_inputs1, outputs)]
+                        callers = [(f1_plan, u1_eff, t_inputs1, outputs)]
                     else:
                         shared_plan = file_plans.get(shared_p)
                         if shared_plan is None:
@@ -3121,8 +3321,8 @@ def generate_refactoring_patch(
                                 )
                         host_plan = shared_plan
                         callers = [
-                            (f1_plan, u1, t_inputs1, outputs),
-                            (f2_plan, u2, t_inputs2, target_outs2),
+                            (f1_plan, u1_eff, t_inputs1, outputs),
+                            (f2_plan, u2_eff, t_inputs2, target_outs2),
                         ]
 
                     mod1 = _derive_module_import_path(f1_path, import_root)
@@ -3238,7 +3438,7 @@ def generate_refactoring_patch(
                     if replace_clones:
                         if host_plan is f1_plan:
                             _delegate_unit_in_plan(
-                                u1,
+                                u1_eff,
                                 f1_plan,
                                 helper_name=helper_name,
                                 inputs=inputs,
@@ -3252,7 +3452,7 @@ def generate_refactoring_patch(
                             )
                         elif host_plan is f2_plan:
                             _delegate_unit_in_plan(
-                                u2,
+                                u2_eff,
                                 f2_plan,
                                 helper_name=helper_name,
                                 inputs=inputs,
@@ -3384,7 +3584,7 @@ def generate_refactoring_patch(
                     _wire_cross_module_host_delegation(
                         f1_plan=f1_plan,
                         f2_plan=f2_plan,
-                        u2=u2,
+                        u2=u2_eff,
                         mod1=mod1,
                         helper_name=helper_name,
                         pair_comment=pair_comment,
@@ -3403,7 +3603,7 @@ def generate_refactoring_patch(
 
                     _finalize_host_unit_and_helper(
                         plan=f1_plan,
-                        unit=u1,
+                        unit=u1_eff,
                         helper_name=helper_name,
                         inputs=inputs,
                         outputs=outputs,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 from typing import Any
 import pytest
@@ -1313,7 +1314,6 @@ def test_resolve_relative_import_path_boundary() -> None:
 
 def test_extract_guarded_compare_target_yoda_comparison() -> None:
     """Verifies that _is_type_checking_guard detects Yoda boolean comparisons."""
-    import ast  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.fixer.depgraph import (  # pylint: disable=import-outside-toplevel
         _is_type_checking_guard,
     )

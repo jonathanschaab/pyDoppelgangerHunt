@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.config import canonical_path_key
+from pydoppelgangerhunt.source_lines import resolve_unit_line_bounds
 
 
 class UnionFind:
@@ -48,8 +49,7 @@ def _normalize_unit_file(unit: Dict[str, Any]) -> str:
 def unit_key(unit: Dict[str, Any]) -> str:
     """Generates unique deterministic string key for an AST unit."""
     norm_file = canonical_path_key(str(unit.get("file") or ""), strip_anchor=False)
-    s = int(unit.get("start") or 1)
-    e = int(unit.get("end") or s)
+    s, e = resolve_unit_line_bounds(unit)
     name = str(unit.get("name") or "unit")
     return f"{norm_file}:{s}-{e}:{name}"
 
@@ -291,7 +291,7 @@ def cluster_clone_families(
         members.sort(
             key=lambda u: (
                 canonical_path_key(str(u.get("file") or ""), strip_anchor=False),
-                int(u.get("start") or 1),
+                resolve_unit_line_bounds(u)[0],
             )
         )
         member_set = set(member_keys)
@@ -299,11 +299,11 @@ def cluster_clone_families(
         family_sims = [
             sim for sim, k1, k2 in sorted_pairs if k1 in member_set and k2 in member_set
         ]
-        unique_files = sorted(list({_normalize_unit_file(u) for u in members}))
-        total_lines = sum(
-            int(u.get("end") or int(u.get("start") or 1)) - int(u.get("start") or 1) + 1
-            for u in members
-        )
+        unique_files = sorted(list({_normalize_unit_file(m) for m in members}))
+        total_lines = 0
+        for m_unit in members:
+            u_s, u_e = resolve_unit_line_bounds(m_unit)
+            total_lines += u_e - u_s + 1
         avg_sim = (sum(family_sims) / len(family_sims)) if family_sims else 1.0
         max_sim = max(family_sims) if family_sims else 1.0
         min_sim = min(family_sims) if family_sims else 1.0
@@ -331,7 +331,7 @@ def cluster_clone_families(
             -f["member_count"],
             -round(f["avg_similarity"], 9),
             _normalize_unit_file(f["members"][0]),
-            int(f["members"][0].get("start") or 1),
+            resolve_unit_line_bounds(f["members"][0])[0],
             str(f["medoid"].get("name") or "") if isinstance(f.get("medoid"), dict) else "",
         )
     )

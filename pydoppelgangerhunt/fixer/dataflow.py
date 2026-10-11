@@ -1,0 +1,2209 @@
+"""AST dataflow visitors, downstream read analysis, and output pairing.
+
+Disk Fallback Scope:
+    While reporting utilities in `reporters.py` allow both `.py` and `.ipynb` files
+    for source inspection and visual diffing, dataflow analysis and patch generation
+    in `dataflow.py` intentionally restrict disk-fallback loading to standard Python
+    source files (`.py`). Refactoring patches cannot safely modify Jupyter notebooks
+    via raw text diffs without corrupting JSON structures and cell offsets. Therefore,
+    notebook units lacking embedded source text fail closed for generator subroutine
+    extractions.
+"""
+
+from __future__ import annotations
+
+import ast
+import builtins
+from collections import OrderedDict
+from enum import Enum
+import hashlib
+import logging
+import threading
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
+
+from pydoppelgangerhunt.config import (
+    clear_closure_warning_cache,
+    resolve_closure_strictness_mode,
+)
+from pydoppelgangerhunt.source_lines import parse_unit_coord
+from pydoppelgangerhunt.fixer.source import (
+    _find_innermost_enclosing_node,
+    _load_unit_file_text,
+    is_subroutine_unit,
+    resolve_unit_declared_outputs,
+)
+
+logger = logging.getLogger(__name__)
+
+_BUILTIN_NAMES: Set[str] = set(dir(builtins))
+
+__all__ = [
+    "GeneratorCloneSideData",
+    "clear_closure_warning_cache",
+    "collect_downstream_read_names",
+    "has_async_generator_delegation_hazard",
+    "is_async_generator_with_return_value",
+    "is_subroutine_unit",
+    "resolve_clone_generator_subroutine_outputs",
+    "resolve_clone_pair_outputs",
+    "resolve_closure_strictness_mode",
+    "resolve_generator_subroutine_outputs",
+]
+
+_CacheValT = TypeVar("_CacheValT")
+
+_downstream_cache_lock: threading.Lock = threading.Lock()
+_MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
+_MAX_SCOPE_CACHE_SIZE: int = 1024
+_MAX_PARSED_TREE_CACHE_SIZE: int = 128
+_downstream_reads_cache: OrderedDict[Tuple[Any, ...], frozenset[str]] = OrderedDict()
+_parsed_tree_cache: OrderedDict[str, Optional[ast.AST]] = OrderedDict()
+
+_scope_parent_maps: OrderedDict[ast.AST, Dict[ast.AST, ast.AST]] = OrderedDict()
+_scope_stmts_by_end: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
+_scope_closures_cache: OrderedDict[ast.AST, List[Tuple[_ClosurePos, Set[str]]]] = OrderedDict()
+_scope_loops_cache: OrderedDict[ast.AST, List[Tuple[int, int]]] = OrderedDict()
+_scope_try_with_cache: OrderedDict[ast.AST, List[ast.AST]] = OrderedDict()
+_warned_lenient_closure: List[bool] = [False]
+
+
+def _store_lru_cache_entry(
+    cache: OrderedDict[Any, Any],
+    key: Any,
+    value: Any,
+    max_size: int,
+) -> None:
+    """Stores key-value pair in an OrderedDict LRU cache with eviction under lock."""
+    with _downstream_cache_lock:
+        if key not in cache and len(cache) >= max_size:
+            cache.popitem(last=False)
+        cache[key] = value
+        cache.move_to_end(key)
+
+
+def _get_or_compute_scope_cached(
+    cache: OrderedDict[ast.AST, _CacheValT],
+    scope_node: ast.AST,
+    compute_fn: Callable[[], _CacheValT],
+) -> _CacheValT:
+    """Retrieves cached scope metadata or computes, caches, and returns it thread-safely."""
+    try:
+        with _downstream_cache_lock:
+            if scope_node in cache:
+                cache.move_to_end(scope_node)
+                return cache[scope_node]
+    except TypeError:
+        return compute_fn()
+
+    computed = compute_fn()
+
+    try:
+        _store_lru_cache_entry(cache, scope_node, computed, _MAX_SCOPE_CACHE_SIZE)
+    except TypeError:
+        pass
+
+    return computed
+
+
+def _get_or_parse_tree(
+    source_text: str,
+    source_digest: Optional[str] = None,
+) -> Optional[ast.AST]:
+    """Retrieves cached AST tree or parses source_text into an AST tree."""
+    if not source_text.strip():
+        return None
+    key = (
+        source_digest
+        or hashlib.sha256(source_text.encode("utf-8", errors="replace")).hexdigest()
+    )
+    with _downstream_cache_lock:
+        if key in _parsed_tree_cache:
+            cached_tree = _parsed_tree_cache[key]
+            _parsed_tree_cache.move_to_end(key)
+            return cached_tree
+
+    parsed: Optional[ast.AST] = None
+    try:
+        parsed = ast.parse(source_text)
+    except (SyntaxError, ValueError, UnicodeDecodeError):
+        parsed = None
+
+    _store_lru_cache_entry(_parsed_tree_cache, key, parsed, _MAX_PARSED_TREE_CACHE_SIZE)
+    return parsed
+
+
+def _parse_source_tree(
+    source_text: str,
+    tree: Optional[ast.AST] = None,
+    source_digest: Optional[str] = None,
+) -> Optional[ast.AST]:
+    """Parses Python source code into an AST tree if not already provided."""
+    if tree is not None:
+        return tree
+    return _get_or_parse_tree(source_text, source_digest=source_digest)
+
+
+def _get_valid_unit_bounds(unit: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+    """Extracts positive start and end line coordinates from a unit dict."""
+    try:
+        u_start = parse_unit_coord(unit, "start", default=0)
+        u_end = parse_unit_coord(unit, "end", default=u_start)
+    except (ValueError, TypeError):
+        return None
+    if u_start <= 0 or u_end <= 0 or u_start > u_end:
+        return None
+    return u_start, u_end
+
+
+def _extract_first_unit_coord(
+    unit: Dict[str, Any], keys: Sequence[str]
+) -> Optional[int]:
+    """Returns the first successfully parsed coordinate among candidate keys."""
+    for key in keys:
+        if key in unit and unit.get(key) is not None:
+            try:
+                val = parse_unit_coord(unit, key, default=None)
+                if val is not None:
+                    return val
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
+def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
+    """Extracts end column offset from unit dictionary if present."""
+    return _extract_first_unit_coord(unit, ("end_col_offset", "end_col"))
+
+
+def _get_scope_parent_map(scope_node: ast.AST) -> Dict[ast.AST, ast.AST]:
+    """Retrieves or builds cached parent map for AST nodes within the scope."""
+    def _compute() -> Dict[ast.AST, ast.AST]:
+        parent_map: Dict[ast.AST, ast.AST] = {}
+        for parent in ast.walk(scope_node):
+            if parent is scope_node:
+                continue
+            for child in ast.iter_child_nodes(parent):
+                parent_map[child] = parent
+        return parent_map
+
+    return _get_or_compute_scope_cached(_scope_parent_maps, scope_node, _compute)
+
+
+def _get_scope_stmts_by_end_lineno(
+    scope_node: ast.AST,
+) -> Dict[int, List[ast.stmt]]:
+    """Retrieves or builds cached map of statement end line numbers to statement nodes."""
+    def _compute() -> Dict[int, List[ast.stmt]]:
+        m: Dict[int, List[ast.stmt]] = {}
+        for node in ast.walk(scope_node):
+            if node is scope_node:
+                continue
+            if isinstance(node, ast.stmt):
+                e = getattr(node, "end_lineno", None) or getattr(node, "lineno", 0) or 0
+                if e > 0:
+                    m.setdefault(e, []).append(node)
+        return m
+
+    return _get_or_compute_scope_cached(_scope_stmts_by_end, scope_node, _compute)
+
+
+
+def _resolve_unit_ast_end_col(
+    scope_node: ast.AST, unit: Dict[str, Any]
+) -> Optional[int]:
+    """Resolves end column offset from statement boundaries within the enclosing scope."""
+    try:
+        u_start = parse_unit_coord(unit, "start", default=0)
+        u_end = parse_unit_coord(unit, "end", default=u_start)
+    except (ValueError, TypeError):
+        return None
+    if u_start <= 0 or u_end <= 0 or u_start > u_end:
+        return None
+
+    parent_map = _get_scope_parent_map(scope_node)
+    matching_stmts = list(_get_scope_stmts_by_end_lineno(scope_node).get(u_end, []))
+
+    inner_stmts: List[ast.stmt] = []
+    if matching_stmts:
+        matching_set = set(matching_stmts)
+        non_leaf_stmts: Set[ast.stmt] = set()
+        for s in matching_stmts:
+            curr = parent_map.get(s)
+            while curr is not None:
+                if isinstance(curr, ast.stmt) and curr in matching_set:
+                    if curr in non_leaf_stmts:
+                        break
+                    non_leaf_stmts.add(curr)
+                curr = parent_map.get(curr)
+
+        inner_stmts = [s for s in matching_stmts if s not in non_leaf_stmts]
+    if not inner_stmts:
+        logger.debug(
+            "No statement ending at line %d found in scope; falling back to whole-line",
+            u_end,
+        )
+        return None
+
+    inner_stmts.sort(key=lambda s: getattr(s, "col_offset", 0))
+    if len(inner_stmts) == 1:
+        target_stmt = inner_stmts[0]
+    elif u_start == u_end:
+        start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
+        if start_col is not None:
+            matched = [s for s in inner_stmts if getattr(s, "col_offset", 0) >= start_col]
+            if len(matched) == 1:
+                target_stmt = matched[0]
+            else:
+                return None
+        else:
+            return None
+    else:
+        return None
+
+    end_col = getattr(target_stmt, "end_col_offset", None)
+    if end_col is None:
+        logger.debug(
+            "Statement ending at line %d has no end_col_offset; falling back to whole-line",
+            u_end,
+        )
+        return None
+    return int(end_col)
+
+
+class _BaseScopeVisitor(ast.NodeVisitor):
+    """Shared helpers for scope visitors."""
+
+    def __init__(self) -> None:
+        self._comp_targets: List[Set[str]] = []
+        self._in_comp_body: int = 0
+        self.globals: Set[str] = set()
+        self.nonlocals: Set[str] = set()
+
+    def visit_Global(self, node: ast.Global) -> None:
+        self.globals.update(node.names)
+
+    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+        self.nonlocals.update(node.names)
+
+    def _is_in_comp(self, name: str) -> bool:
+        return any(name in targets for targets in self._comp_targets)
+
+    def _visit_comprehension(
+        self,
+        node: Union[ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp],
+    ) -> None:
+        if not node.generators:
+            return
+        # First generator's iter evaluates in enclosing scope (class scope if in class body)
+        self.visit(node.generators[0].iter)
+        comp_set: Set[str] = set()
+        self._comp_targets.append(comp_set)
+        self._in_comp_body += 1
+        try:
+            for idx, gen in enumerate(node.generators):
+                if idx > 0:
+                    self.visit(gen.iter)
+                comp_set.update(
+                    n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name)
+                )
+                for if_expr in gen.ifs:
+                    self.visit(if_expr)
+            if isinstance(node, ast.DictComp):
+                self.visit(node.key)
+                self.visit(node.value)
+            else:
+                self.visit(node.elt)
+        finally:
+            self._in_comp_body -= 1
+            self._comp_targets.pop()
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node)
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node)
+
+    def _visit_named_expr(
+        self,
+        node: ast.NamedExpr,
+        store_set: Set[str],
+        check_comp: bool = False,
+    ) -> None:
+        self.visit(node.value)
+        if isinstance(node.target, ast.Name):
+            if not check_comp or not self._is_in_comp(node.target.id):
+                store_set.add(node.target.id)
+        else:
+            self.visit(node.target)
+
+    @staticmethod
+    def _record_import_names(
+        node: Union[ast.Import, ast.ImportFrom], store_set: Set[str]
+    ) -> None:
+        for alias in node.names:
+            bound = (
+                alias.asname
+                or (alias.name if isinstance(node, ast.ImportFrom) else alias.name.split(".", 1)[0])
+            )
+            if bound != "*":
+                store_set.add(bound)
+
+    def _visit_nested_named_scope(
+        self,
+        node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef],
+        store_set: Set[str],
+        reads_set: Set[str],
+    ) -> None:
+        store_set.add(node.name)
+        for tp in getattr(node, "type_params", []):
+            tp_name = getattr(tp, "name", None)
+            if isinstance(tp_name, str):
+                store_set.add(tp_name)
+        reads_set.update(_extract_nested_scope_free_reads(node))
+
+    def _visit_nested_lambda(
+        self,
+        node: ast.Lambda,
+        reads_set: Set[str],
+    ) -> None:
+        reads_set.update(_extract_nested_scope_free_reads(node))
+
+    def _visit_type_alias_stmt(self, node: ast.AST, store_set: Set[str]) -> None:
+        name_node = getattr(node, "name", None)
+        if isinstance(name_node, ast.Name):
+            store_set.add(name_node.id)
+        for tp in getattr(node, "type_params", []):
+            tp_name = getattr(tp, "name", None)
+            if isinstance(tp_name, str):
+                store_set.add(tp_name)
+        if hasattr(node, "value"):
+            self.visit(getattr(node, "value"))
+
+    @staticmethod
+    def _extract_pattern_bound_name(node: ast.AST) -> Optional[str]:
+        """Extracts identifier bound by MatchAs, MatchStar, or MatchMapping pattern nodes."""
+        name = getattr(node, "name", None) or getattr(node, "rest", None)
+        if isinstance(name, str) and name and name != "_":
+            return name
+        return None
+
+    def _record_pattern_binding(self, node: ast.AST, store_set: Set[str]) -> None:
+        bound = self._extract_pattern_bound_name(node)
+        if bound is not None and not self._is_in_comp(bound):
+            store_set.add(bound)
+        self.generic_visit(node)
+
+    def visit_MatchStar(self, node: ast.AST) -> None:
+        self.visit_MatchAs(node)
+
+    def visit_MatchMapping(self, node: ast.AST) -> None:
+        self.visit_MatchAs(node)
+
+    def visit_MatchAs(self, node: ast.AST) -> None:
+        self.generic_visit(node)
+
+
+class _FuncScopeVisitor(_BaseScopeVisitor):
+    """Tracks local bindings and free variable loads escaping a nested function or lambda scope."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.params: Set[str] = set()
+        self.local_stores: Set[str] = set()
+        self.direct_loads: Set[str] = set()
+        self.nested_free_reads: Set[str] = set()
+
+    def visit_FunctionDef(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
+    ) -> None:
+        self._visit_nested_named_scope(node, self.local_stores, self.nested_free_reads)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._visit_nested_named_scope(node, self.local_stores, self.nested_free_reads)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._visit_nested_lambda(node, self.nested_free_reads)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self._visit_named_expr(node, self.local_stores, check_comp=False)
+
+    def visit_MatchAs(self, node: ast.AST) -> None:
+        self._record_pattern_binding(node, self.local_stores)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.name and not self._is_in_comp(node.name):
+            self.local_stores.add(node.name)
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Store):
+            if not self._is_in_comp(node.id):
+                self.local_stores.add(node.id)
+        elif isinstance(node.ctx, ast.Load):
+            if not self._is_in_comp(node.id):
+                self.direct_loads.add(node.id)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self._record_import_names(node, self.local_stores)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self._record_import_names(node, self.local_stores)
+
+    def visit_TypeAlias(self, node: ast.AST) -> None:
+        self._visit_type_alias_stmt(node, self.local_stores)
+
+
+class _ClassScopeVisitor(_BaseScopeVisitor):
+    """Tracks class attributes and free variable reads escaping an executed class body."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.class_stores: Set[str] = set()
+        self.free_reads: Set[str] = set()
+
+    def _record_class_load(self, name: str) -> None:
+        if self._is_in_comp(name):
+            return
+        if self._in_comp_body > 0:
+            # Comprehensions in class bodies cannot resolve class attributes (PEP 227)
+            if name not in self.globals:
+                self.free_reads.add(name)
+        elif name not in (self.class_stores | self.globals):
+            self.free_reads.add(name)
+
+    def _record_class_store(self, name: str) -> None:
+        if (
+            not self._is_in_comp(name)
+            and self._in_comp_body == 0
+            and name not in (self.globals | self.nonlocals)
+        ):
+            self.class_stores.add(name)
+
+    def visit_FunctionDef(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
+    ) -> None:
+        self._visit_nested_named_scope(node, self.class_stores, self.free_reads)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._visit_nested_named_scope(node, self.class_stores, self.free_reads)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._visit_nested_lambda(node, self.free_reads)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.name:
+            self._record_class_store(node.name)
+        self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        for t in node.targets:
+            self.visit(t)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        if isinstance(node.target, ast.Name):
+            self._record_class_load(node.target.id)
+            self.visit(node.value)
+            self._record_class_store(node.target.id)
+        else:
+            self.visit(node.target)
+            self.visit(node.value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.visit(node.annotation)
+        if node.value is not None:
+            self.visit(node.value)
+        self.visit(node.target)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self._visit_named_expr(node, self.class_stores, check_comp=True)
+
+    def visit_MatchAs(self, node: ast.AST) -> None:
+        self._record_pattern_binding(node, self.class_stores)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Load):
+            self._record_class_load(node.id)
+        elif isinstance(node.ctx, ast.Store):
+            self._record_class_store(node.id)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self._record_import_names(node, self.class_stores)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self._record_import_names(node, self.class_stores)
+
+    def visit_TypeAlias(self, node: ast.AST) -> None:
+        self._visit_type_alias_stmt(node, self.class_stores)
+
+
+def _collect_func_args(args: ast.arguments) -> List[ast.arg]:
+    """Collects all arg objects declared in a function or lambda signature."""
+    all_args = (
+        list(getattr(args, "posonlyargs", []))
+        + list(args.args)
+        + list(args.kwonlyargs)
+    )
+    if args.vararg:
+        all_args.append(args.vararg)
+    if args.kwarg:
+        all_args.append(args.kwarg)
+    return all_args
+
+
+def _collect_func_params(args: ast.arguments) -> Set[str]:
+    """Collects parameter names declared in a function or lambda signature."""
+    return {a.arg for a in _collect_func_args(args)}
+
+
+class _OuterExprVisitor(_BaseScopeVisitor):
+    """Collects loaded names from outer-scope expressions (defaults, decorators,
+    annotations, bases)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.names: Set[str] = set()
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Load) and not self._is_in_comp(node.id):
+            self.names.add(node.id)
+
+    def visit_FunctionDef(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef]
+    ) -> None:
+        dummy_stores: Set[str] = set()
+        self._visit_nested_named_scope(node, dummy_stores, self.names)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._visit_nested_lambda(node, self.names)
+
+    def visit_TypeAlias(self, node: ast.AST) -> None:
+        tp_names = {
+            getattr(tp, "name", None)
+            for tp in getattr(node, "type_params", [])
+            if isinstance(getattr(tp, "name", None), str)
+        }
+        sub_visitor = _OuterExprVisitor()
+        if hasattr(node, "value"):
+            sub_visitor.visit(getattr(node, "value"))
+        self.names.update(sub_visitor.names - tp_names)
+
+
+def _extract_nested_scope_free_reads(
+    node: Union[
+        ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.GeneratorExp
+    ],
+    candidates: Optional[Set[str]] = None,
+) -> Set[str]:
+    """Extracts free variable references escaping a nested function, genexp, or class body."""
+    if isinstance(node, ast.GeneratorExp):
+        gen_visitor = _OuterExprVisitor()
+        gen_visitor.visit(node)
+        if candidates is not None:
+            return gen_visitor.names & candidates
+        return gen_visitor.names
+
+    type_param_names: Set[str] = set()
+    for tp in getattr(node, "type_params", []):
+        tp_name = getattr(tp, "name", None)
+        if isinstance(tp_name, str):
+            type_param_names.add(tp_name)
+
+    inner_type_params: Set[str] = set()
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        for sub in ast.walk(node):
+            if sub is not node and hasattr(sub, "type_params"):
+                for tp in getattr(sub, "type_params", []):
+                    tp_name = getattr(tp, "name", None)
+                    if isinstance(tp_name, str):
+                        inner_type_params.add(tp_name)
+
+    all_type_params = type_param_names | inner_type_params
+
+    outer_visitor = _OuterExprVisitor()
+    for tp in getattr(node, "type_params", []):
+        outer_visitor.visit(tp)
+
+    if isinstance(node, ast.ClassDef):
+        for b in node.bases:
+            outer_visitor.visit(b)
+        for kw in node.keywords:
+            outer_visitor.visit(kw.value)
+        for dec in node.decorator_list:
+            outer_visitor.visit(dec)
+        class_visitor = _ClassScopeVisitor()
+        for tp_name in all_type_params:
+            class_visitor.class_stores.add(tp_name)
+        for stmt in node.body:
+            class_visitor.visit(stmt)
+        class_free = (
+            (class_visitor.free_reads | class_visitor.nonlocals)
+            - class_visitor.globals
+            - all_type_params
+        )
+        class_reads = (outer_visitor.names - all_type_params) | class_free
+        if candidates is not None:
+            return class_reads & candidates
+        return class_reads
+
+    defaults = node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]
+    for d in defaults:
+        outer_visitor.visit(d)
+    for arg in _collect_func_args(node.args):
+        if arg.annotation is not None:
+            outer_visitor.visit(arg.annotation)
+
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        for dec in node.decorator_list:
+            outer_visitor.visit(dec)
+        if node.returns is not None:
+            outer_visitor.visit(node.returns)
+
+    func_visitor = _FuncScopeVisitor()
+    for tp_name in all_type_params:
+        func_visitor.local_stores.add(tp_name)
+    func_visitor.params = _collect_func_params(node.args)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        for stmt in node.body:
+            func_visitor.visit(stmt)
+    elif isinstance(node, ast.Lambda):
+        func_visitor.visit(node.body)
+
+    escaped = (
+        (func_visitor.direct_loads | func_visitor.nested_free_reads)
+        - (func_visitor.params | func_visitor.local_stores)
+    ) | func_visitor.nonlocals
+    escaped -= func_visitor.globals
+    all_free = (outer_visitor.names - all_type_params) | (escaped - inner_type_params)
+    if candidates is not None:
+        return all_free & candidates
+    return all_free
+
+
+def _extract_assigned_names(target: ast.AST) -> List[str]:
+    """Extracts bare variable names bound by an assignment target."""
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: List[str] = []
+        for elt in target.elts:
+            names.extend(_extract_assigned_names(elt))
+        return names
+    if isinstance(target, ast.Starred):
+        return _extract_assigned_names(target.value)
+    return []
+
+
+class _VisitorPassMode(str, Enum):
+    """Execution pass mode for downstream AST read analysis."""
+
+    AFTER_UNIT = "after_unit"
+    LOOP_CARRIED = "loop_carried"
+
+
+class _DownstreamReadVisitor(_BaseScopeVisitor):
+    """Walks AST statements in a lexical scope tracking direct, nested, and loop-carried reads."""
+
+    def __init__(
+        self,
+        u_start: int,
+        u_end: int,
+        u_end_col: Optional[int],
+        candidates: Optional[Set[str]] = None,
+        enclosing_loops: Optional[List[Tuple[int, int]]] = None,
+        pass_mode: Union[_VisitorPassMode, str] = _VisitorPassMode.AFTER_UNIT,
+        is_module_scope: bool = False,
+    ) -> None:
+        super().__init__()
+        self.u_start = u_start
+        self.u_end = u_end
+        self.u_end_col = u_end_col
+        self.candidates = candidates
+        self.enclosing_loops = enclosing_loops or []
+        self.pass_mode = (
+            _VisitorPassMode(pass_mode)
+            if isinstance(pass_mode, str)
+            else pass_mode
+        )
+        self.loaded: Set[str] = set()
+        self.killed: Set[str] = set()
+        self.has_dynamic_read: bool = False
+        self.is_module_scope = is_module_scope
+
+    _DYNAMIC_READ_FUNCS = frozenset({"locals", "vars", "eval", "exec", "dir", "globals"})
+
+    def _is_node_after_unit(self, node: ast.AST) -> bool:
+        lineno = getattr(node, "lineno", None)
+        if lineno is None:
+            return False
+        if lineno > self.u_end:
+            return True
+        if lineno == self.u_end:
+            if self.u_end_col is not None:
+                return getattr(node, "col_offset", 0) >= int(self.u_end_col)
+            # When u_end_col cannot be resolved, fail-closed by treating
+            # same-line nodes on u_end as downstream.
+            return True
+        return False
+
+    def _is_node_inside_unit(self, node: ast.AST) -> bool:
+        lineno = getattr(node, "lineno", None)
+        if lineno is None:
+            return False
+        if self.u_start < lineno < self.u_end:
+            return True
+        if lineno == self.u_start == self.u_end:
+            col = getattr(node, "col_offset", 0)
+            return self.u_end_col is not None and col < int(self.u_end_col)
+        if lineno == self.u_start:
+            return True
+        if lineno == self.u_end:
+            col = getattr(node, "col_offset", 0)
+            return self.u_end_col is not None and col < int(self.u_end_col)
+        return False
+
+    def _is_loop_carried(self, node: ast.AST) -> bool:
+        lineno = getattr(node, "lineno", None)
+        if lineno is None:
+            return False
+        if self._is_node_inside_unit(node) or self._is_node_after_unit(node):
+            return False
+        return any(l_start <= lineno <= l_end for l_start, l_end in self.enclosing_loops)
+
+    def _should_inspect_read(self, node: ast.AST) -> bool:
+        if self.pass_mode is _VisitorPassMode.LOOP_CARRIED:
+            return self._is_loop_carried(node)
+        return self._is_node_after_unit(node)
+
+    def _record_killed_targets(self, targets: Iterable[ast.AST]) -> None:
+        for t in targets:
+            if self._should_inspect_read(t):
+                lineno = getattr(t, "lineno", None)
+                if lineno == self.u_end and self.u_end_col is None:
+                    continue
+                for name in _extract_assigned_names(t):
+                    if not self._is_in_comp(name):
+                        self.killed.add(name)
+
+    def _record_downstream_read(self, name: str) -> None:
+        if self._is_in_comp(name) or name in self.killed:
+            return
+        if self.candidates is None or name in self.candidates:
+            self.loaded.add(name)
+
+    def visit_FunctionDef(
+        self,
+        node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef],
+    ) -> None:
+        if self._should_inspect_read(node):
+            free_reads = _extract_nested_scope_free_reads(node, candidates=self.candidates)
+            for name in free_reads:
+                self._record_downstream_read(name)
+            name_attr = getattr(node, "name", None)
+            lineno = getattr(node, "lineno", None)
+            if (
+                name_attr
+                and not self._is_in_comp(name_attr)
+                and not (lineno == self.u_end and self.u_end_col is None)
+            ):
+                self.killed.add(name_attr)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        if self._should_inspect_read(node):
+            free_reads = _extract_nested_scope_free_reads(node, candidates=self.candidates)
+            for name in free_reads:
+                self._record_downstream_read(name)
+            lineno = getattr(node, "lineno", None)
+            if not self._is_in_comp(node.name) and not (
+                lineno == self.u_end and self.u_end_col is None
+            ):
+                self.killed.add(node.name)
+        else:
+            n_start = getattr(node, "lineno", 0)
+            n_end = getattr(node, "end_lineno", None) or n_start
+            if n_start <= self.u_end <= n_end:
+                for stmt in node.body:
+                    self.visit(stmt)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_TypeAlias(self, node: ast.AST) -> None:
+        if self._should_inspect_read(node):
+            tp_names = {
+                getattr(tp, "name", None)
+                for tp in getattr(node, "type_params", [])
+                if isinstance(getattr(tp, "name", None), str)
+            }
+            if hasattr(node, "value"):
+                sub_visitor = _OuterExprVisitor()
+                sub_visitor.visit(getattr(node, "value"))
+                for name in sub_visitor.names - tp_names:
+                    self._record_downstream_read(name)
+            name_node = getattr(node, "name", None)
+            if isinstance(name_node, ast.Name) and not self._is_in_comp(name_node.id):
+                self.killed.add(name_node.id)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        self.generic_visit(node)
+        if isinstance(node.ctx, ast.Load) and self._should_inspect_read(node):
+            self._record_downstream_read(node.id)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        if isinstance(node.target, ast.Name) and self._should_inspect_read(node.target):
+            self._record_downstream_read(node.target.id)
+        self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        for t in node.targets:
+            self.visit(t)
+        self._record_killed_targets(node.targets)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.visit(node.annotation)
+        if node.value is not None:
+            self.visit(node.value)
+            self.visit(node.target)
+            self._record_killed_targets([node.target])
+        else:
+            self.visit(node.target)
+
+    def _record_delete_reads(self, target: ast.AST) -> None:
+        """Records variables targeted for deletion as downstream reads if downstream of
+        unit boundary."""
+        for subnode in ast.walk(target):
+            if isinstance(subnode, ast.Name) and isinstance(subnode.ctx, ast.Del):
+                if self._should_inspect_read(subnode):
+                    self._record_downstream_read(subnode.id)
+
+    def visit_Delete(self, node: ast.Delete) -> None:
+        for t in node.targets:
+            self._record_delete_reads(t)
+            self.visit(t)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.visit(node.value)
+
+    def visit_If(self, node: ast.If) -> None:
+        self.visit(node.test)
+        killed_before = set(self.killed)
+        for stmt in node.body:
+            self.visit(stmt)
+        killed_then = set(self.killed)
+
+        self.killed = set(killed_before)
+        for stmt in node.orelse:
+            self.visit(stmt)
+        killed_else = set(self.killed)
+
+        if node.orelse:
+            self.killed = killed_then & killed_else
+        else:
+            self.killed = killed_before
+
+    def visit_For(self, node: Union[ast.For, ast.AsyncFor]) -> None:
+        self.visit(node.iter)
+        killed_before = set(self.killed)
+        self._record_killed_targets([node.target])
+        for stmt in node.body:
+            self.visit(stmt)
+        self.killed = set(killed_before)
+        for stmt in node.orelse:
+            self.visit(stmt)
+        self.killed = killed_before
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self.visit_For(node)
+
+    def visit_While(self, node: ast.While) -> None:
+        killed_before = set(self.killed)
+        self.visit(node.test)
+        for stmt in node.body:
+            self.visit(stmt)
+        self.killed = set(killed_before)
+        for stmt in node.orelse:
+            self.visit(stmt)
+        self.killed = killed_before
+
+    def visit_Try(self, node: Union[ast.Try, ast.AST]) -> None:
+        killed_before = set(self.killed)
+        for stmt in getattr(node, "body", []):
+            self.visit(stmt)
+        killed_try_body = set(self.killed)
+
+        handler_kills: List[Set[str]] = []
+        for handler in getattr(node, "handlers", []):
+            self.killed = set(killed_before)
+            if handler.type is not None:
+                self.visit(handler.type)
+            if handler.name and self._should_inspect_read(handler):
+                self.killed.add(handler.name)
+            for stmt in handler.body:
+                self.visit(stmt)
+            # PEP 3110: Exception variables bound via 'except ... as e:' are implicitly
+            # cleared (equivalent to 'del e') at the end of the except block in Python 3.
+            # Discarding handler.name leaves the variable in whatever killed state it held
+            # prior to the handler. This is conservatively safe: if a prior unit defined 'e',
+            # subsequent reads of 'e' after the try/except continue to be treated as requiring
+            # the unit's output rather than pruning it.
+            if handler.name:
+                self.killed.discard(handler.name)
+            handler_kills.append(set(self.killed))
+
+        self.killed = killed_try_body
+        for stmt in getattr(node, "orelse", []):
+            self.visit(stmt)
+        killed_try_else = set(self.killed)
+
+        handlers = getattr(node, "handlers", [])
+        if handlers:
+            surviving = killed_try_else
+            for hk in handler_kills:
+                surviving = surviving & hk
+        else:
+            surviving = killed_try_else
+
+        # Seed finalbody with killed_before because exceptions in try body
+        # could cause finalbody to run without executing try body assignments
+        self.killed = set(killed_before)
+        for stmt in getattr(node, "finalbody", []):
+            self.visit(stmt)
+
+        self.killed = surviving | set(self.killed)
+
+    def visit_TryStar(self, node: ast.AST) -> None:
+        self.visit_Try(node)
+
+    def visit_With(self, node: Union[ast.With, ast.AsyncWith]) -> None:
+        killed_before = set(self.killed)
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self._record_killed_targets([item.optional_vars])
+        for stmt in node.body:
+            self.visit(stmt)
+        # Deliberately fail-closed: context managers may exit early or swallow exceptions
+        # (e.g. contextlib.suppress), so re-assignments inside with-blocks do not kill prior
+        # live stores for subsequent statements.
+        self.killed = killed_before
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+        self.visit_With(node)
+
+    def visit_Match(self, node: ast.AST) -> None:
+        self.visit(getattr(node, "subject"))
+        killed_before = set(self.killed)
+        for case in getattr(node, "cases", []):
+            self.killed = set(killed_before)
+            self.visit(case.pattern)
+            if case.guard is not None:
+                self.visit(case.guard)
+            for stmt in case.body:
+                self.visit(stmt)
+        self.killed = killed_before
+
+    def visit_MatchAs(self, node: ast.AST) -> None:
+        bound = self._extract_pattern_bound_name(node)
+        if bound is not None and self._should_inspect_read(node):
+            if not self._is_in_comp(bound):
+                self.killed.add(bound)
+        self.generic_visit(node)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        if self._should_inspect_read(node):
+            self._record_import_names(node, self.killed)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if self._should_inspect_read(node):
+            self._record_import_names(node, self.killed)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        self.generic_visit(node)
+        if self._should_inspect_read(node):
+            func_name = None
+            if isinstance(node.func, ast.Name):
+                func_name = node.func.id
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in ("builtins", "__builtins__")
+            ):
+                func_name = node.func.attr
+            if func_name in self._DYNAMIC_READ_FUNCS:
+                if func_name == "globals" and not self.is_module_scope:
+                    return
+                self.has_dynamic_read = True
+                if self.candidates is not None:
+                    for name in self.candidates:
+                        self._record_downstream_read(name)
+
+
+class _ClosurePos(NamedTuple):
+    """Line and column position of a closure for boundary matching."""
+
+    line: int
+    col: int = 0
+
+
+_EAGER_CONSUMER_NAMES: frozenset[str] = frozenset(
+    {"sum", "min", "max", "any", "all", "list", "set", "tuple", "dict", "sorted", "frozenset"}
+)
+
+
+def _is_eagerly_consumed_genexp(
+    genexp: ast.GeneratorExp, parent_map: Dict[ast.AST, ast.AST]
+) -> bool:
+    """Returns True if the generator expression is directly consumed by an eager built-in."""
+    parent = parent_map.get(genexp)
+    if isinstance(parent, ast.Call):
+        func = parent.func
+        if isinstance(func, ast.Name) and func.id in _EAGER_CONSUMER_NAMES:
+            return True
+        if isinstance(func, ast.Attribute) and func.attr == "join":
+            return True
+    return False
+
+
+def _collect_scope_closures_uncached(
+    scope_node: ast.AST,
+) -> List[Tuple[_ClosurePos, Set[str]]]:
+    closures: List[Tuple[_ClosurePos, Set[str]]] = []
+    parent_map = _get_scope_parent_map(scope_node)
+
+    def _resolve_stmt_start_pos(s: ast.stmt) -> Tuple[int, int]:
+        s_line = int(getattr(s, "lineno", 0) or 0)
+        s_col = int(getattr(s, "col_offset", 0) or 0)
+        decs = getattr(s, "decorator_list", [])
+        if decs:
+            dec_pos = []
+            for d in decs:
+                d_l = getattr(d, "lineno", None)
+                d_c = getattr(d, "col_offset", None)
+                dec_pos.append(
+                    (
+                        int(d_l) if d_l is not None else s_line,
+                        int(d_c) if d_c is not None else s_col,
+                    )
+                )
+            if dec_pos:
+                min_l, min_c = min(dec_pos, key=lambda p: (p[0], p[1]))
+                if min_l < s_line or (min_l == s_line and min_c < s_col):
+                    s_line, s_col = min_l, min_c
+        return s_line, s_col
+
+    def _record_expr_closures(
+        nodes: Iterable[ast.AST], default_line: int, default_col: int
+    ) -> None:
+        for node in nodes:
+            for subnode in ast.walk(node):
+                if isinstance(subnode, ast.GeneratorExp) and _is_eagerly_consumed_genexp(
+                    subnode, parent_map
+                ):
+                    continue
+                if isinstance(subnode, (ast.Lambda, ast.GeneratorExp)):
+                    sub_l = getattr(subnode, "lineno", None)
+                    sub_c = getattr(subnode, "col_offset", None)
+                    sub_line = int(sub_l) if sub_l is not None else default_line
+                    sub_col = int(sub_c) if sub_c is not None else default_col
+                    closures.append(
+                        (
+                            _ClosurePos(sub_line, sub_col),
+                            _extract_nested_scope_free_reads(subnode),
+                        )
+                    )
+
+    def _extract_header_nodes(s: ast.stmt) -> List[ast.AST]:
+        if isinstance(s, ast.If):
+            return [s.test]
+        if isinstance(s, (ast.For, ast.AsyncFor)):
+            return [s.target, s.iter]
+        if isinstance(s, ast.While):
+            return [s.test]
+        if isinstance(s, (ast.With, ast.AsyncWith)):
+            headers: List[ast.AST] = []
+            for item in s.items:
+                headers.append(item.context_expr)
+                if item.optional_vars is not None:
+                    headers.append(item.optional_vars)
+            return headers
+        if isinstance(s, ast.Try) or type(s).__name__ == "TryStar":
+            handlers = getattr(s, "handlers", [])
+            return [h.type for h in handlers if getattr(h, "type", None) is not None]
+        if type(s).__name__ == "Match":
+            headers = [getattr(s, "subject")]
+            for case in getattr(s, "cases", []):
+                headers.append(getattr(case, "pattern"))
+                if getattr(case, "guard", None) is not None:
+                    headers.append(getattr(case, "guard"))
+            return headers
+        return [s]
+
+    def _walk_stmts(stmts: Iterable[ast.stmt]) -> None:
+        for stmt in stmts:
+            stmt_start, stmt_col = _resolve_stmt_start_pos(stmt)
+
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                closures.append(
+                    (
+                        _ClosurePos(stmt_start, stmt_col),
+                        _extract_nested_scope_free_reads(stmt),
+                    )
+                )
+                continue
+
+            if isinstance(stmt, ast.ClassDef):
+                class_exprs = (
+                    list(stmt.decorator_list)
+                    + list(stmt.bases)
+                    + [kw.value for kw in stmt.keywords]
+                    + list(getattr(stmt, "type_params", []))
+                )
+                _record_expr_closures(class_exprs, stmt_start, stmt_col)
+                for item in stmt.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        i_start, i_col = _resolve_stmt_start_pos(item)
+                        closures.append(
+                            (
+                                _ClosurePos(i_start, i_col),
+                                _extract_nested_scope_free_reads(item),
+                            )
+                        )
+                    elif isinstance(item, ast.ClassDef):
+                        _walk_stmts([item])
+                    elif isinstance(item, ast.stmt):
+                        i_start, i_col = _resolve_stmt_start_pos(item)
+                        _record_expr_closures(
+                            _extract_header_nodes(item), i_start, i_col
+                        )
+                        for attr in ("body", "orelse", "finalbody"):
+                            sub_body = getattr(item, attr, None)
+                            if isinstance(sub_body, list):
+                                _walk_stmts(sub_body)
+                        for handler in getattr(item, "handlers", []):
+                            _walk_stmts(getattr(handler, "body", []))
+                        for case in getattr(item, "cases", []):
+                            _walk_stmts(getattr(case, "body", []))
+                continue
+
+            _record_expr_closures(_extract_header_nodes(stmt), stmt_start, stmt_col)
+
+            for attr in ("body", "orelse", "finalbody"):
+                sub_stmts = getattr(stmt, attr, None)
+                if isinstance(sub_stmts, list):
+                    _walk_stmts(sub_stmts)
+
+            for handler in getattr(stmt, "handlers", []):
+                _walk_stmts(getattr(handler, "body", []))
+
+            for case in getattr(stmt, "cases", []):
+                _walk_stmts(getattr(case, "body", []))
+
+    _walk_stmts(getattr(scope_node, "body", []))
+    return closures
+
+
+def _collect_scope_closures(scope_node: ast.AST) -> List[Tuple[_ClosurePos, Set[str]]]:
+    """Discovers all closures defined in a scope, recorded with their starting line."""
+    return _get_or_compute_scope_cached(
+        _scope_closures_cache,
+        scope_node,
+        lambda: _collect_scope_closures_uncached(scope_node),
+    )
+
+
+
+def _collect_pre_unit_closures(
+    scope_node: ast.AST,
+    u_start: int,
+    candidates: Optional[Set[str]] = None,
+    u_start_col: Optional[int] = None,
+) -> Set[str]:
+    """Discovers free variables captured by functions, class methods, and lambdas defined prior
+    to the unit in the same lexical scope."""
+    captured_reads: Set[str] = set()
+    for c_pos, reads in _collect_scope_closures(scope_node):
+        if isinstance(c_pos, (tuple, list)) and len(c_pos) >= 2:
+            c_line, c_col = int(c_pos[0]), int(c_pos[1])
+        else:
+            c_line = int(c_pos)
+            c_col = getattr(c_pos, "col", 0)
+        is_pre = (
+            c_line < u_start
+            or (c_line == u_start and (u_start_col is None or c_col < u_start_col))
+        )
+        if is_pre:
+            if candidates is not None:
+                captured_reads.update(reads & candidates)
+            else:
+                captured_reads.update(reads - _BUILTIN_NAMES)
+    return captured_reads
+
+
+def _clear_downstream_reads_cache() -> None:
+    """Clears the downstream read memoization cache and AST scope caches."""
+    with _downstream_cache_lock:
+        _downstream_reads_cache.clear()
+        _parsed_tree_cache.clear()
+        _scope_parent_maps.clear()
+        _scope_stmts_by_end.clear()
+        _scope_closures_cache.clear()
+        _scope_loops_cache.clear()
+        _scope_try_with_cache.clear()
+        _warned_lenient_closure[0] = False
+    clear_closure_warning_cache()
+
+
+def _build_downstream_cache_key(
+    source_text: str,
+    unit: Dict[str, Any],
+    u_start: int,
+    u_end: int,
+    candidates: Optional[Set[str]],
+    skip_pre_unit_closures: bool,
+    source_digest: Optional[str] = None,
+    resolved_end_col: Optional[int] = None,
+) -> Tuple[Any, ...]:
+    """Forms a persistent cache key for downstream AST read analysis."""
+    file_path_str = str(unit.get("file") or "")
+    digest = source_digest or unit.get("source_digest") or unit.get("content_digest")
+    if digest is not None:
+        content_digest = str(digest)
+    else:
+        content_digest = hashlib.sha256(
+            source_text.encode("utf-8", errors="replace")
+        ).hexdigest()
+
+    start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
+    end_col = (
+        resolved_end_col
+        if resolved_end_col is not None
+        else _extract_unit_end_col(unit)
+    )
+    cands_key = frozenset(candidates) if candidates is not None else None
+    unit_kind = unit.get("kind")
+    unit_name = unit.get("name")
+    is_sub = is_subroutine_unit(unit)
+    return (
+        content_digest,
+        file_path_str,
+        u_start,
+        u_end,
+        start_col,
+        end_col,
+        unit_kind,
+        unit_name,
+        is_sub,
+        cands_key,
+        bool(skip_pre_unit_closures),
+    )
+
+
+def _resolve_downstream_scope_node(
+    source_text: str,
+    unit: Dict[str, Any],
+    tree: Optional[ast.AST],
+) -> Optional[ast.AST]:
+    """Resolves the innermost enclosing function AST node or falls back to module scope."""
+    enc = _find_innermost_enclosing_node(
+        source_text, unit, (ast.FunctionDef, ast.AsyncFunctionDef), tree=tree
+    )
+    if enc is not None:
+        return enc[0]
+    return _parse_source_tree(source_text, tree=tree)
+
+
+def _find_enclosing_loops(
+    scope_node: ast.AST,
+    u_start: int,
+    u_end: int,
+) -> List[Tuple[int, int]]:
+    """Detects loops enclosing the unit boundaries for loop-carried dependence analysis."""
+    def _compute() -> List[Tuple[int, int]]:
+        loops: List[Tuple[int, int]] = []
+        for node in ast.walk(scope_node):
+            if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+                l_start = getattr(node, "lineno", 0)
+                l_end = getattr(node, "end_lineno", None) or l_start
+                loops.append((l_start, l_end))
+        return loops
+
+    cached_loops = _get_or_compute_scope_cached(
+        _scope_loops_cache, scope_node, _compute
+    )
+    return [
+        (l_start, l_end)
+        for l_start, l_end in cached_loops
+        if l_start <= u_start and u_end <= l_end and (l_start, l_end) != (u_start, u_end)
+    ]
+
+
+def _stmt_definitely_terminates(stmt: ast.stmt) -> bool:
+    """Checks whether an AST statement unconditionally exits execution."""
+    if isinstance(stmt, (ast.Return, ast.Raise)):
+        return True
+    if isinstance(stmt, ast.If):
+        return (
+            bool(stmt.orelse)
+            and _block_definitely_terminates(stmt.body)
+            and _block_definitely_terminates(stmt.orelse)
+        )
+    if isinstance(stmt, ast.Try):
+        if stmt.finalbody and _block_definitely_terminates(stmt.finalbody):
+            return True
+        if stmt.handlers and _block_definitely_terminates(stmt.body):
+            return all(_block_definitely_terminates(h.body) for h in stmt.handlers)
+    if type(stmt).__name__ == "TryStar":
+        finalbody = getattr(stmt, "finalbody", None)
+        if finalbody and _block_definitely_terminates(finalbody):
+            return True
+        handlers = getattr(stmt, "handlers", [])
+        body = getattr(stmt, "body", [])
+        if handlers and _block_definitely_terminates(body):
+            return all(_block_definitely_terminates(h.body) for h in handlers)
+    return False
+
+
+def _block_definitely_terminates(stmts: Sequence[ast.stmt]) -> bool:
+    """Checks whether any statement in a sequence unconditionally terminates execution."""
+    return any(_stmt_definitely_terminates(s) for s in stmts)
+
+
+def _stmts_enclose_unit(stmts: Sequence[ast.stmt], u_start: int, u_end: int) -> bool:
+    """Checks whether a sequence of AST statements spans and encloses the unit's line range."""
+    if not stmts:
+        return False
+    valid_starts = [
+        int(getattr(s, "lineno", 0))
+        for s in stmts
+        if getattr(s, "lineno", None) is not None and getattr(s, "lineno", 0) > 0
+    ]
+    if not valid_starts:
+        return False
+    s_start = min(valid_starts)
+    valid_ends = [
+        int(getattr(s, "end_lineno", None) or getattr(s, "lineno", None) or s_start)
+        for s in stmts
+        if getattr(s, "end_lineno", None) is not None or getattr(s, "lineno", None) is not None
+    ]
+    if not valid_ends:
+        return False
+    s_end = max(valid_ends)
+    return s_start <= u_start and u_end <= s_end
+
+
+def _nodes_load_any_name(nodes: Iterable[ast.AST], names: Set[str]) -> bool:
+    """Checks whether any AST node in the sequence loads one of the given variable names."""
+    for node in nodes:
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Name)
+                and isinstance(sub.ctx, ast.Load)
+                and sub.id in names
+            ):
+                return True
+    return False
+
+
+
+def _get_scope_try_and_with_blocks(
+    scope_node: ast.AST,
+) -> List[ast.AST]:
+    """Caches all Try, TryStar, With, and AsyncWith blocks within scope."""
+    def _compute() -> List[ast.AST]:
+        blocks: List[ast.AST] = []
+        for node in ast.walk(scope_node):
+            if node is scope_node:
+                continue
+            if (
+                isinstance(node, (ast.Try, ast.With, ast.AsyncWith))
+                or type(node).__name__ == "TryStar"
+            ):
+                blocks.append(node)
+        return blocks
+
+    return _get_or_compute_scope_cached(_scope_try_with_cache, scope_node, _compute)
+
+
+
+class _StrictPostLineVisitor(_DownstreamReadVisitor):
+    """Downstream read visitor that strictly checks nodes starting after a given line."""
+
+    def _is_node_after_unit(self, node: ast.AST) -> bool:
+        lineno = getattr(node, "lineno", None)
+        return lineno is not None and lineno > self.u_end
+
+    def _is_node_inside_unit(self, node: ast.AST) -> bool:
+        lineno = getattr(node, "lineno", None)
+        return lineno is not None and lineno == self.u_end
+
+
+def _scope_reads_outputs_after_line(
+    scope_node: ast.AST,
+    line: int,
+    outputs: Set[str],
+) -> bool:
+    """Checks whether any statement in the scope loads outputs after the given line,
+    including loop-carried reads if line sits inside an enclosing loop."""
+    enclosing_loops = _find_enclosing_loops(scope_node, line, line)
+
+    def _execute_pass(mode: _VisitorPassMode) -> Set[str]:
+        v = _StrictPostLineVisitor(
+            line, line, None, candidates=outputs, enclosing_loops=enclosing_loops, pass_mode=mode
+        )
+        for stmt in getattr(scope_node, "body", []):
+            v.visit(stmt)
+        return set(v.loaded)
+
+    loaded = _execute_pass(_VisitorPassMode.AFTER_UNIT)
+    if enclosing_loops and loaded.isdisjoint(outputs):
+        loaded.update(_execute_pass(_VisitorPassMode.LOOP_CARRIED))
+    return bool(loaded & outputs)
+
+
+def _enclosing_try_reads_outputs(
+    scope_node: Optional[ast.AST],
+    u_start: int,
+    u_end: int,
+    outputs: Set[str],
+) -> bool:
+    """Returns True if unit is inside an enclosing try, else, or except block whose
+    handlers/finally read outputs, or whose handlers fall through and outputs are read
+    downstream of the try block, or inside any enclosing with or async with block whose
+    outputs are read downstream. Any enclosing with block whose outputs are read downstream
+    fails closed because context manager exit on premature termination or cleanup hazards
+    cannot be assumed safe across arbitrary context managers (including locks, transactions,
+    and streams)."""
+    if scope_node is None or not outputs:
+        return False
+    for node in _get_scope_try_and_with_blocks(scope_node):
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            with_body = getattr(node, "body", [])
+            if _stmts_enclose_unit(with_body, u_start, u_end):
+                w_end_raw = getattr(node, "end_lineno", None)
+                b_end = max(
+                    (
+                        int(
+                            getattr(s, "end_lineno", None)
+                            or getattr(s, "lineno", 0)
+                            or 0
+                        )
+                        for s in with_body
+                    ),
+                    default=0,
+                )
+                w_end = w_end_raw if isinstance(w_end_raw, int) else b_end
+                if _scope_reads_outputs_after_line(scope_node, w_end, outputs):
+                    return True
+            continue
+
+        if isinstance(node, ast.Try) or type(node).__name__ == "TryStar":
+            body_nodes = getattr(node, "body", [])
+            orelse_nodes = getattr(node, "orelse", [])
+            handlers = getattr(node, "handlers", [])
+            finalbody_nodes = getattr(node, "finalbody", [])
+
+            in_body = _stmts_enclose_unit(body_nodes, u_start, u_end)
+            in_orelse = _stmts_enclose_unit(orelse_nodes, u_start, u_end)
+            in_handler = any(
+                _stmts_enclose_unit(getattr(h, "body", []), u_start, u_end)
+                for h in handlers
+            )
+
+            if not (in_body or in_orelse or in_handler):
+                continue
+
+            # In body, else, or except blocks, finally executes on abnormal exit (e.g. gen.close()).
+            # If finally reads needed outputs, reject to prevent silent data loss or
+            # UnboundLocalError.
+            if _nodes_load_any_name(finalbody_nodes, outputs):
+                return True
+
+            # If unit is inside try body, exceptions during execution jump to handlers.
+            # If handlers read needed outputs, reject.
+            if in_body:
+                handler_nodes: List[ast.AST] = []
+                for handler in handlers:
+                    handler_nodes.extend(getattr(handler, "body", []))
+                    if getattr(handler, "type", None):
+                        handler_nodes.append(handler.type)
+                if _nodes_load_any_name(handler_nodes, outputs):
+                    return True
+
+                # If any handler can fall through (e.g. swallows GeneratorExit or exceptions
+                # without re-raising or returning), check if any needed output is read
+                # downstream of the enclosing try block.
+                if handlers and any(
+                    not _block_definitely_terminates(h.body) for h in handlers
+                ):
+                    try_end_raw = getattr(node, "end_lineno", None)
+                    all_try_stmts = (
+                        list(body_nodes)
+                        + [s for h in handlers for s in getattr(h, "body", [])]
+                        + list(orelse_nodes)
+                        + list(finalbody_nodes)
+                    )
+                    b_end = max(
+                        (
+                            int(
+                                getattr(s, "end_lineno", None)
+                                or getattr(s, "lineno", 0)
+                                or 0
+                            )
+                            for s in all_try_stmts
+                        ),
+                        default=0,
+                    )
+                    t_end = try_end_raw if isinstance(try_end_raw, int) else b_end
+                    if _scope_reads_outputs_after_line(scope_node, t_end, outputs):
+                        return True
+    return False
+
+
+def _merge_pre_unit_closure_reads(
+    loaded: Set[str],
+    pre_unit_captured_reads: Set[str],
+    candidates: Optional[Set[str]],
+) -> None:
+    """Merges escaping pre-unit closure free reads into live downstream names fail-closed."""
+    if candidates is not None:
+        effective_captured = pre_unit_captured_reads & candidates
+        if effective_captured:
+            logger.debug(
+                "Captured pre-unit closure candidate reads (fail-closed callback protection): %s",
+                sorted(effective_captured),
+            )
+        loaded.update(effective_captured)
+    else:
+        if pre_unit_captured_reads:
+            logger.debug(
+                "Captured pre-unit closure reads (fail-closed callback protection): %s",
+                sorted(pre_unit_captured_reads),
+            )
+        loaded.update(pre_unit_captured_reads)
+
+
+def collect_downstream_read_names(
+    source_text: str,
+    unit: Dict[str, Any],
+    candidates: Optional[Set[str]] = None,
+    *,
+    tree: Optional[ast.AST] = None,
+    skip_pre_unit_closures: bool = False,
+    source_digest: Optional[str] = None,
+) -> Optional[Set[str]]:
+    """Identifies variable names loaded downstream of a unit within its lexical execution scope.
+
+    Module-Level Fallback:
+    When a unit is defined at top-level module scope (having no enclosing FunctionDef),
+    `scope_node` defaults to the module AST. All top-level function and class definitions
+    prior to the unit in the module contribute their free global reads into the live candidate
+    set. If an output candidate matches one of these captured names without a definite store
+    beforehand, the generator subroutine will fail the definiteness check and fail closed
+    (skipped during refactoring patch synthesis with a diagnostic DEBUG log).
+    """
+    # Invariant: downstream live names originate from three distinct sources:
+    # (1) post-unit statements, (2) enclosing loop-carried paths, (3) escaping pre-unit closures.
+    bounds = _get_valid_unit_bounds(unit)
+    if bounds is None:
+        return None
+    u_start, u_end = bounds
+
+    # Fast-path early out: if candidate set is explicitly empty, no outputs can match
+    if candidates is not None and not candidates:
+        return set()
+
+    effective_tree = tree
+    if effective_tree is None:
+        eff_digest = (
+            source_digest
+            or unit.get("source_digest")
+            or unit.get("content_digest")
+        )
+        effective_tree = _get_or_parse_tree(source_text, source_digest=eff_digest)
+
+    u_end_col = _extract_unit_end_col(unit)
+    scope_node: Optional[ast.AST] = None
+    if u_end_col is None:
+        scope_node = _resolve_downstream_scope_node(source_text, unit, effective_tree)
+        if scope_node is None:
+            return None
+        u_end_col = _resolve_unit_ast_end_col(scope_node, unit)
+
+    cache_key = _build_downstream_cache_key(
+        source_text,
+        unit,
+        u_start,
+        u_end,
+        candidates,
+        skip_pre_unit_closures,
+        source_digest=source_digest,
+        resolved_end_col=u_end_col,
+    )
+    with _downstream_cache_lock:
+        if cache_key in _downstream_reads_cache:
+            cached = _downstream_reads_cache[cache_key]
+            _downstream_reads_cache.move_to_end(cache_key)
+            return set(cached)
+
+    if scope_node is None:
+        scope_node = _resolve_downstream_scope_node(source_text, unit, effective_tree)
+        if scope_node is None:
+            return None
+
+    enclosing_loops = _find_enclosing_loops(scope_node, u_start, u_end)
+
+    u_start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
+
+    if skip_pre_unit_closures:
+        pre_unit_captured_reads: Set[str] = set()
+        with _downstream_cache_lock:
+            if not _warned_lenient_closure[0]:
+                _warned_lenient_closure[0] = True
+                logger.warning(
+                    "Lenient closure mode active: suppressed pre-unit "
+                    "closure read capture; escaping callback mutations "
+                    "may be unobserved"
+                )
+    else:
+        pre_unit_captured_reads = _collect_pre_unit_closures(
+            scope_node,
+            u_start,
+            candidates=candidates,
+            u_start_col=u_start_col,
+        )
+
+    is_module = isinstance(scope_node, ast.Module)
+
+    visitor = _DownstreamReadVisitor(
+        u_start,
+        u_end,
+        u_end_col,
+        candidates=candidates,
+        enclosing_loops=enclosing_loops,
+        pass_mode=_VisitorPassMode.AFTER_UNIT,
+        is_module_scope=is_module,
+    )
+    for stmt in getattr(scope_node, "body", []):
+        visitor.visit(stmt)
+
+    loaded = set(visitor.loaded)
+    loop_visitor: Optional[_DownstreamReadVisitor] = None
+    if enclosing_loops:
+        loop_visitor = _DownstreamReadVisitor(
+            u_start,
+            u_end,
+            u_end_col,
+            candidates=candidates,
+            enclosing_loops=enclosing_loops,
+            pass_mode=_VisitorPassMode.LOOP_CARRIED,
+            is_module_scope=is_module,
+        )
+        for stmt in getattr(scope_node, "body", []):
+            loop_visitor.visit(stmt)
+        loaded.update(loop_visitor.loaded)
+
+    has_dynamic = visitor.has_dynamic_read or (
+        loop_visitor is not None and loop_visitor.has_dynamic_read
+    )
+    if has_dynamic and candidates is None:
+        for subnode in ast.walk(scope_node):
+            if isinstance(subnode, ast.Name) and isinstance(subnode.ctx, (ast.Store, ast.Load)):
+                if subnode.id not in _BUILTIN_NAMES and not subnode.id.startswith("__"):
+                    loaded.add(subnode.id)
+
+    _merge_pre_unit_closure_reads(loaded, pre_unit_captured_reads, candidates)
+
+    _store_lru_cache_entry(
+        _downstream_reads_cache,
+        cache_key,
+        frozenset(loaded),
+        _MAX_DOWNSTREAM_CACHE_SIZE,
+    )
+
+    return loaded
+
+
+def _pair_clone_outputs(
+    u1_outs: Union[Sequence[str], Set[str], frozenset[str]],
+    u2_outs: Union[Sequence[str], Set[str], frozenset[str]],
+) -> List[Tuple[str, str]]:
+    """Establishes an ordered 1-to-1 mapping between clone output variables."""
+    if isinstance(u1_outs, (set, frozenset)) or isinstance(u2_outs, (set, frozenset)):
+        logger.debug(
+            "Rejecting clone output pairing: set-valued outputs lack positional ordering"
+        )
+        return []
+    u1_dedup = list(dict.fromkeys(u1_outs))
+    u2_dedup = list(dict.fromkeys(u2_outs))
+
+    if len(u1_dedup) != len(u2_dedup):
+        logger.debug(
+            "Rejecting clone output pairing: output arities differ (%d vs %d: %s vs %s)",
+            len(u1_dedup),
+            len(u2_dedup),
+            u1_dedup,
+            u2_dedup,
+        )
+        return []
+    common = set(u1_dedup) & set(u2_dedup)
+    # Design Note (Recall Trade-off & Semantic Soundness):
+    # For strictly alpha-equivalent clones, positional first-store pairing is theoretically
+    # sound regardless of name permutations. However, in practical refactoring of real codebases,
+    # when clones share variable names in differing orders (e.g. [a, b] vs [b, a]), this almost
+    # always signals semantic differences or Type-3 drift rather than pure alpha-renaming.
+    # Rejecting pairs with conflicting positional orders for common variables trades away a small
+    # amount of recall to decisively prevent silent semantic bugs (such as accidental variable
+    # swapping at extraction call sites).
+    if any(u1_dedup.index(name) != u2_dedup.index(name) for name in common):
+        logger.debug(
+            "Rejecting clone output pairing: common variables have conflicting "
+            "positional orderings (%s vs %s)",
+            u1_dedup,
+            u2_dedup,
+        )
+        return []
+    # True 1-to-1 positional pairing
+    return list(zip(u1_dedup, u2_dedup))
+
+
+def _filter_valid_output_pairs(
+    pairs: Sequence[Tuple[str, str]],
+    u1_allowed: Optional[Set[str]],
+    u2_allowed: Optional[Set[str]],
+    *,
+    reason: str,
+) -> Optional[Tuple[List[str], List[str]]]:
+    """Validates output pairs against allowed bindings and returns separated output lists."""
+    for side_label, allowed_set, col_idx in (("u1", u1_allowed, 0), ("u2", u2_allowed, 1)):
+        effective_allowed = set() if allowed_set is None else allowed_set
+        missing = [p[col_idx] for p in pairs if p[col_idx] not in effective_allowed]
+        if missing:
+            logger.debug(
+                "Rejecting generator subroutine outputs: %s output %s: %s",
+                side_label,
+                reason,
+                missing,
+            )
+            return None
+    return [p[0] for p in pairs], [p[1] for p in pairs]
+
+
+class GeneratorCloneSideData(NamedTuple):
+    """Encapsulates per-side output candidates, downstream reads, and definite stores."""
+
+    outputs: Sequence[str]
+    downstream: Optional[Set[str]] = None
+    definite: Optional[Set[str]] = None
+
+
+def resolve_generator_subroutine_outputs(
+    side1: GeneratorCloneSideData,
+    side2: GeneratorCloneSideData,
+) -> Optional[Tuple[List[str], List[str]]]:
+    """Selects output variables needed downstream by either clone side, preserving
+    per-side necessity."""
+    outs1 = list(side1.outputs)
+    outs2 = list(side2.outputs)
+    d1_raw = side1.downstream
+    d2_raw = side2.downstream
+    u1_def = side1.definite if side1.definite is not None else set()
+    u2_def = side2.definite if side2.definite is not None else set()
+
+    d1_needed = d1_raw if d1_raw is not None else set(outs1)
+    d2_needed = d2_raw if d2_raw is not None else set(outs2)
+
+    needed1 = [o for o in outs1 if o in d1_needed]
+    needed2 = [o for o in outs2 if o in d2_needed]
+
+    if not needed1 and not needed2:
+        return [], []
+
+    pairs = _pair_clone_outputs(outs1, outs2)
+    paired_u1 = {o1 for o1, _ in pairs}
+    paired_u2 = {o2 for _, o2 in pairs}
+
+    # Fail closed: every required downstream output must have a paired counterpart
+    if any(o1 not in paired_u1 for o1 in needed1) or any(o2 not in paired_u2 for o2 in needed2):
+        logger.debug(
+            "Rejecting generator subroutine outputs: required downstream outputs "
+            "could not be paired (needed1=%s, needed2=%s, pairs=%s)",
+            needed1,
+            needed2,
+            pairs,
+        )
+        return None
+
+    kept_pairs = [
+        (o1, o2)
+        for o1, o2 in pairs
+        if o1 in d1_needed or o2 in d2_needed
+    ]
+
+    # Fail closed on non-definitely assigned outputs to prevent UnboundLocalError
+    return _filter_valid_output_pairs(
+        kept_pairs,
+        u1_def,
+        u2_def,
+        reason="lacks definite store before exit, risking UnboundLocalError",
+    )
+
+
+def has_async_generator_delegation_hazard(
+    *scopes: Optional[Dict[str, Any]],
+    has_outputs: bool = False,
+) -> bool:
+    """Checks whether scopes represent an async generator that cannot safely be delegated
+    via PEP 525 async for ...: yield delegation without semantic loss (including return values,
+    unpaired outputs, bidirectional yield assignments, or try/with/async with cleanup blocks
+    that lose athrow/aclose propagation).
+
+    Applies to both subroutine and whole-function async generator refactorings.
+    """
+    has_yield = any(bool(s.get("has_yield")) for s in scopes if s is not None)
+    is_async = any(bool(s.get("is_async")) for s in scopes if s is not None)
+    if not (has_yield and is_async):
+        return False
+    has_ret = has_outputs or any(
+        bool(s.get("has_return_value")) for s in scopes if s is not None
+    )
+    if has_ret:
+        return True
+    has_yield_assign = any(
+        bool(s.get("has_yield_assignment")) for s in scopes if s is not None
+    )
+    if has_yield_assign:
+        return True
+    has_try_or_with = any(
+        bool(s.get("has_try_or_with")) for s in scopes if s is not None
+    )
+    if has_try_or_with:
+        return True
+    return False
+
+
+is_async_generator_with_return_value = has_async_generator_delegation_hazard
+
+
+def _extract_effective_unit_outputs(
+    unit: Dict[str, Any], scope: Dict[str, Any]
+) -> List[str]:
+    """Extracts non-global, non-local outputs from precomputed unit dict or analyzed scope."""
+    raw = resolve_unit_declared_outputs(unit)
+
+    if isinstance(raw, (set, frozenset)):
+        if len(raw) > 1:
+            logger.debug(
+                "Rejecting set-valued outputs (%s): unordered set cannot establish "
+                "positional order",
+                raw,
+            )
+            return []
+        cands: Sequence[str] = list(raw)
+    elif isinstance(raw, (list, tuple)):
+        cands = list(raw)
+    elif scope.get("outputs_ambiguous"):
+        return []
+    else:
+        cands = scope.get("outputs", [])
+    excluded = set(scope.get("globals", [])) | set(scope.get("nonlocals", []))
+    return list(dict.fromkeys(v for v in cands if v not in excluded))
+
+
+def resolve_clone_generator_subroutine_outputs(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    scope1: Dict[str, Any],
+    scope2: Dict[str, Any],
+    source_text1: Optional[str] = None,
+    source_text2: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
+    repo_root: Optional[str] = None,
+    skip_pre_unit_closures: bool = False,
+    source_digest1: Optional[str] = None,
+    source_digest2: Optional[str] = None,
+) -> Optional[Tuple[List[str], List[str]]]:
+    """Resolves output variable bindings for clone generator subroutines across two code units.
+
+    Ensures necessity by analyzing downstream reads and enforces definite assignment
+    before unit exit to prevent runtime UnboundLocalError at exhaustion.
+    """
+    for u_chk, side_lbl in ((u1, "u1"), (u2, "u2")):
+        if "start" in u_chk or "end" in u_chk:
+            if _get_valid_unit_bounds(u_chk) is None:
+                logger.debug(
+                    "Rejecting generator subroutine pair: invalid unit bounds on %s: %r",
+                    side_lbl,
+                    u_chk,
+                )
+                return None
+
+    for u_chk, s_chk, side_lbl in ((u1, scope1, "u1"), (u2, scope2, "u2")):
+        raw_o = (
+            u_chk.get("precomputed_outputs")
+            if ("precomputed_outputs" in u_chk and u_chk.get("precomputed_outputs") is not None)
+            else u_chk.get("outputs")
+        )
+        if isinstance(raw_o, (set, frozenset)) and len(raw_o) > 1:
+            logger.debug(
+                "Rejecting generator subroutine pair: set-valued outputs lack positional ordering"
+            )
+            return None
+        if s_chk.get("outputs_ambiguous"):
+            logger.debug(
+                "Rejecting generator subroutine pair: ambiguous scope outputs "
+                "lack positional ordering"
+            )
+            return None
+
+    outs1 = _extract_effective_unit_outputs(u1, scope1)
+    outs2 = _extract_effective_unit_outputs(u2, scope2)
+
+    u1_def = (
+        set(scope1.get("definite_stores", [])) | set(scope1.get("inputs", []))
+        if ("definite_stores" in scope1 or "inputs" in scope1)
+        else set()
+    )
+    u2_def = (
+        set(scope2.get("definite_stores", [])) | set(scope2.get("inputs", []))
+        if ("definite_stores" in scope2 or "inputs" in scope2)
+        else set()
+    )
+
+    cands1 = set(outs1)
+    cands2 = set(outs2)
+
+    targets = [
+        (u1, cands1, source_text1, tree1, source_digest1),
+        (u2, cands2, source_text2, tree2, source_digest2),
+    ]
+    target_srcs: List[Optional[str]] = []
+    downstream_reads: List[Optional[Set[str]]] = []
+    for u_item, cands, s_text, tr, s_digest in targets:
+        src = (
+            s_text
+            if s_text is not None
+            else _load_unit_file_text(u_item, repo_root=repo_root)
+        )
+        target_srcs.append(src)
+        if src is not None:
+            reads = collect_downstream_read_names(
+                src,
+                u_item,
+                candidates=cands,
+                tree=tr,
+                skip_pre_unit_closures=skip_pre_unit_closures,
+                source_digest=s_digest,
+            )
+        else:
+            reads = None
+        downstream_reads.append(reads)
+
+    side1 = GeneratorCloneSideData(outs1, downstream_reads[0], u1_def)
+    side2 = GeneratorCloneSideData(outs2, downstream_reads[1], u2_def)
+    resolved = resolve_generator_subroutine_outputs(side1, side2)
+    if resolved is None:
+        return None
+
+    out1, out2 = resolved
+    for side_idx, (u_item, needed_outs, s_text, tr) in enumerate([
+        (u1, out1, target_srcs[0], tree1),
+        (u2, out2, target_srcs[1], tree2),
+    ]):
+        if needed_outs:
+            if s_text is None and tr is None:
+                logger.debug(
+                    "Rejecting generator subroutine pair: needed output(s) cannot be "
+                    "verified against enclosing try cleanup without source or AST for unit %s",
+                    side_idx + 1,
+                )
+                return None
+            scope_node = _resolve_downstream_scope_node(s_text or "", u_item, tr)
+            bounds = _get_valid_unit_bounds(u_item)
+            if scope_node is None or bounds is None:
+                logger.debug(
+                    "Rejecting generator subroutine pair: could not resolve scope AST "
+                    "or valid bounds for unit %s (scope=%s, bounds=%s)",
+                    side_idx + 1,
+                    scope_node is not None,
+                    bounds is not None,
+                )
+                return None
+            u_s, u_e = bounds
+
+            if _enclosing_try_reads_outputs(scope_node, u_s, u_e, set(needed_outs)):
+                logger.debug(
+                    "Rejecting generator subroutine pair: needed output(s) read in "
+                    "enclosing try cleanup for unit %s",
+                    side_idx + 1,
+                )
+                return None
+            u_start_col = _extract_first_unit_coord(
+                u_item, ("start_col", "start_col_offset")
+            )
+            u_end_col = _extract_unit_end_col(u_item)
+            for c_pos, reads in _collect_scope_closures(scope_node):
+                if isinstance(c_pos, (tuple, list)) and len(c_pos) >= 2:
+                    c_line, c_col = int(c_pos[0]), int(c_pos[1])
+                else:
+                    c_line = int(c_pos)
+                    c_col = getattr(c_pos, "col", 0)
+                is_pre = (
+                    c_line < u_s
+                    or (c_line == u_s and u_start_col is not None and c_col < u_start_col)
+                )
+                is_post = (
+                    c_line > u_e
+                    or (c_line == u_e and u_end_col is not None and c_col > u_end_col)
+                )
+                is_intra = not is_pre and not is_post
+                if is_intra and bool(reads & set(needed_outs)):
+                    logger.debug(
+                        "Rejecting generator subroutine pair: intra-unit closure at line %d "
+                        "captures needed output(s) %r for unit %s",
+                        c_line,
+                        reads & set(needed_outs),
+                        side_idx + 1,
+                    )
+                    return None
+
+    return resolved
+
+
+def resolve_clone_pair_outputs(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    scope1: Dict[str, Any],
+    scope2: Dict[str, Any],
+    source_text1: Optional[str] = None,
+    source_text2: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
+    repo_root: Optional[str] = None,
+    skip_pre_unit_closures: bool = False,
+    source_digest1: Optional[str] = None,
+    source_digest2: Optional[str] = None,
+    closure_strictness: Optional[str] = None,
+    require_pairing: Optional[bool] = None,
+) -> Optional[Tuple[List[str], List[str]]]:
+    """Resolves output variable bindings between two clone units, enforcing
+    strict positional pairing and generator subroutine safety.
+
+    Returns:
+        (outputs1, outputs2) tuple of paired output names, or None if pairing
+        fails or safety invariants are violated.
+    """
+    is_sub1 = is_subroutine_unit(u1)
+    is_sub2 = is_subroutine_unit(u2)
+    if is_sub1 != is_sub2:
+        logger.debug(
+            "Rejecting clone pair output resolution: mismatched subroutine kinds "
+            "(is_sub1=%s, is_sub2=%s)",
+            is_sub1,
+            is_sub2,
+        )
+        return None
+    is_sub = is_sub1
+
+    has_precomputed = (
+        "outputs" in u1
+        and isinstance(u1["outputs"], (list, tuple, set, frozenset))
+        and "outputs" in u2
+        and isinstance(u2["outputs"], (list, tuple, set, frozenset))
+    )
+    strict_pairing = (is_sub or has_precomputed) if require_pairing is None else require_pairing
+
+    for u_chk in (u1, u2):
+        for out_key in ("outputs", "precomputed_outputs"):
+            v = u_chk.get(out_key)
+            if isinstance(v, (set, frozenset)) and len(v) > 1:
+                logger.debug(
+                    "Rejecting clone pair output resolution: set-valued outputs "
+                    "lack positional ordering"
+                )
+                return None
+
+    if scope1.get("outputs_ambiguous") or scope2.get("outputs_ambiguous"):
+        logger.debug(
+            "Rejecting clone pair output resolution: ambiguous scope outputs "
+            "lack positional ordering"
+        )
+        return None
+
+    _, effective_skip_closures = resolve_closure_strictness_mode(
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+    )
+
+    has_yield = bool(scope1.get("has_yield") or scope2.get("has_yield"))
+    if is_sub and has_yield:
+        return resolve_clone_generator_subroutine_outputs(
+            u1=u1,
+            u2=u2,
+            scope1=scope1,
+            scope2=scope2,
+            source_text1=source_text1,
+            source_text2=source_text2,
+            tree1=tree1,
+            tree2=tree2,
+            repo_root=repo_root,
+            skip_pre_unit_closures=effective_skip_closures,
+            source_digest1=source_digest1,
+            source_digest2=source_digest2,
+        )
+
+    outs1 = _extract_effective_unit_outputs(u1, scope1)
+    outs2 = _extract_effective_unit_outputs(u2, scope2)
+    if not outs1 and not outs2:
+        return [], []
+
+    pairs = _pair_clone_outputs(outs1, outs2)
+    if len(pairs) == len(outs1) == len(outs2):
+        return [p[0] for p in pairs], [p[1] for p in pairs]
+
+    if not strict_pairing:
+        return outs1, outs2
+
+    logger.debug(
+        "Rejecting clone pair output resolution: outputs could not be paired "
+        "(outs1=%s, outs2=%s, pairs=%s)",
+        outs1,
+        outs2,
+        pairs,
+    )
+    return None

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest import mock
@@ -600,8 +602,6 @@ def test_batch_53_cli_method_binding_and_repo_root(tmp_path: Path) -> None:
 def test_batch_55_baseline_prune_repo_root_and_html_reporter(tmp_path: Path) -> None:
     """Batch 55: Test prune_baseline repo_root, generate_html_report repo_root, and deque AST walk."""
     # pylint: disable=import-outside-toplevel
-    import ast
-    from unittest import mock
     from pydoppelgangerhunt.baseline import prune_baseline, record_baseline
     from pydoppelgangerhunt.parser import _walk_ast_nodes
     from pydoppelgangerhunt.reporters import generate_html_report
@@ -1597,7 +1597,6 @@ def test_cli_warns_on_calibration_unit_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Verifies that main() emits a calibration drift warning when repository units drift >= 20% from baseline."""
-    import json  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
 
     repo = tmp_path / "repo_unit_drift"
@@ -1711,7 +1710,6 @@ def test_cli_verbose_flag_and_commit_divergence_reporting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Verifies that -v/--verbose flag is recognized and reports commit differences without AttributeError."""
-    import json  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.cli import build_arg_parser, main  # pylint: disable=import-outside-toplevel
     import pydoppelgangerhunt.cli as cli_mod  # pylint: disable=import-outside-toplevel
 
@@ -2660,3 +2658,206 @@ def test_cli_verbose_discarded_calibration_mismatch_advisory(
     assert "Corpus calibration was discarded due to configuration mismatch" in captured_verbose.err
     assert "bag_of_tokens" in captured_verbose.err
     assert "falling back to full corpus scan" in captured_verbose.err
+
+
+def test_cli_closure_strictness_and_skip_closures_flags(tmp_path: Path) -> None:
+    """Verifies CLI accepts --skip-pre-unit-closures and --closure-strictness flags."""
+    from pydoppelgangerhunt.cli import (  # pylint: disable=import-outside-toplevel
+        build_arg_parser,
+        main,
+    )
+
+    # 1. Test build_arg_parser defaults
+    parser = build_arg_parser()
+    args_default = parser.parse_args([])
+    assert args_default.skip_pre_unit_closures is False
+    assert args_default.closure_strictness is None
+
+    # 2. Test flag parsing
+    args_skip = parser.parse_args(["--skip-pre-unit-closures"])
+    assert args_skip.skip_pre_unit_closures is True
+
+    args_strict = parser.parse_args(["--closure-strictness", "strict"])
+    assert args_strict.closure_strictness == "strict"
+
+    args_lenient = parser.parse_args(["--closure-strictness", "lenient"])
+    assert args_lenient.closure_strictness == "lenient"
+
+    # 3. Test execution and propagation to generate_refactoring_patch
+    repo = tmp_path / "patch_repo"
+    repo.mkdir()
+    patch_out = repo / "refactor.patch"
+    (repo / "f.py").write_text("x = 1\n", encoding="utf-8")
+
+    dummy_clone = (
+        0.95,
+        {"name": "u1", "file": "f.py", "start": 1, "end": 1},
+        {"name": "u2", "file": "f.py", "start": 1, "end": 1},
+    )
+
+    with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[dummy_clone]):
+        with mock.patch(
+            "pydoppelgangerhunt.cli.generate_refactoring_patch", return_value="# patch\n"
+        ) as mock_patch:
+            exit_code = main([
+                str(repo),
+                "--patch",
+                str(patch_out),
+                "--closure-strictness",
+                "lenient",
+            ])
+            assert exit_code == 1
+            mock_patch.assert_called_once()
+            _, kwargs = mock_patch.call_args
+            assert kwargs.get("skip_pre_unit_closures") is True
+            assert kwargs.get("closure_strictness") == "lenient"
+
+            # Unrecognized strictness string is rejected at parse time
+            mock_patch.reset_mock()
+            with pytest.raises(SystemExit):
+                main([
+                    str(repo),
+                    "--patch",
+                    str(patch_out),
+                    "--closure-strictness",
+                    "custom_unrecognized",
+                ])
+            mock_patch.assert_not_called()
+
+
+def test_cli_main_omitted_top_does_not_raise(tmp_path: Path) -> None:
+    """Verifies that omitting --top leaves args.top=None without raising TypeError."""
+    repo = tmp_path / "top_test_repo"
+    repo.mkdir()
+    (repo / "sample.py").write_text("a = 1\n", encoding="utf-8")
+    with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[]):
+        exit_code = pydoppelgangerhunt.main([str(repo)])
+        assert exit_code == 0
+
+
+def test_cli_closure_strictness_and_skip_closures_precedence_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies precedence diagnostics and fallback when CLI flags and config interact."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "precedence_repo"
+    repo.mkdir()
+    patch_out = repo / "refactor.patch"
+    (repo / "f.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "pyproject.toml").write_text(
+        '[tool.pydoppelgangerhunt]\nclosure_strictness = "strict"\n',
+        encoding="utf-8",
+    )
+
+    dummy_clone = (
+        0.95,
+        {"name": "u1", "file": "f.py", "start": 1, "end": 1},
+        {"name": "u2", "file": "f.py", "start": 1, "end": 1},
+    )
+
+    with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[dummy_clone]):
+        with mock.patch(
+            "pydoppelgangerhunt.cli.generate_refactoring_patch", return_value="# patch\n"
+        ) as mock_patch:
+            # 1. Config strictness overridden by CLI --skip-pre-unit-closures
+            import logging  # pylint: disable=import-outside-toplevel
+            with caplog.at_level(logging.WARNING):
+                exit_code = main([
+                    str(repo),
+                    "--patch",
+                    str(patch_out),
+                    "--skip-pre-unit-closures",
+                ])
+            assert exit_code == 1
+            mock_patch.assert_called_once()
+            _, kwargs = mock_patch.call_args
+            assert kwargs.get("skip_pre_unit_closures") is True
+            assert kwargs.get("closure_strictness") == "lenient"
+            assert any(
+                "overrides configured closure_strictness='strict'" in r.message
+                for r in caplog.records
+            )
+
+            # 2. CLI --closure-strictness strict overrides CLI --skip-pre-unit-closures
+            caplog.clear()
+            mock_patch.reset_mock()
+            with caplog.at_level(logging.WARNING):
+                exit_code = main([
+                    str(repo),
+                    "--patch",
+                    str(patch_out),
+                    "--closure-strictness",
+                    "strict",
+                    "--skip-pre-unit-closures",
+                ])
+            assert exit_code == 1
+            mock_patch.assert_called_once()
+            _, kwargs = mock_patch.call_args
+            assert kwargs.get("skip_pre_unit_closures") is False
+            assert kwargs.get("closure_strictness") == "strict"
+            assert any(
+                "takes precedence over --skip-pre-unit-closures" in r.message
+                for r in caplog.records
+            )
+
+            # 3. CLI --closure-strictness fail_closed overrides CLI --skip-pre-unit-closures
+            caplog.clear()
+            mock_patch.reset_mock()
+            with caplog.at_level(logging.WARNING):
+                exit_code = main([
+                    str(repo),
+                    "--patch",
+                    str(patch_out),
+                    "--closure-strictness",
+                    "fail_closed",
+                    "--skip-pre-unit-closures",
+                ])
+            assert exit_code == 1
+            mock_patch.assert_called_once()
+            _, kwargs = mock_patch.call_args
+            assert kwargs.get("skip_pre_unit_closures") is False
+            assert kwargs.get("closure_strictness") == "strict"
+            assert any(
+                "takes precedence over --skip-pre-unit-closures" in r.message
+                for r in caplog.records
+            )
+
+
+def test_resolve_closure_strictness_mode_thread_safety() -> None:
+    """Verifies that concurrent invocations of resolve_closure_strictness_mode are thread-safe."""
+    import concurrent.futures  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        resolve_closure_strictness_mode,
+    )
+
+    def _worker(val: str) -> tuple[str, bool]:
+        return resolve_closure_strictness_mode(val)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(_worker, f"unknown_mode_{i % 3}") for i in range(50)]
+        results = [f.result() for f in futures]
+
+    assert all(r == ("strict", False) for r in results)
+
+
+def test_resolve_closure_strictness_mode_config_conflict_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies that resolve_closure_strictness_mode warns when closure_strictness='strict'
+    conflicts with skip_pre_unit_closures=True."""
+    import logging  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        resolve_closure_strictness_mode,
+    )
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        mode, skip = resolve_closure_strictness_mode("strict", skip_pre_unit_closures=True)
+    assert mode == "strict"
+    assert skip is False
+    assert any(
+        "Conflicting configuration: closure_strictness 'strict' takes precedence over" in r.message
+        for r in caplog.records
+    )
+

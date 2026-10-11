@@ -28,6 +28,7 @@ from pydoppelgangerhunt.config import (
     init_tool_configuration,
     load_tool_config,
     normalize_path_string,
+    resolve_closure_strictness_mode,
 )
 from pydoppelgangerhunt.canonical_path import CanonicalPathResolver
 from pydoppelgangerhunt.coverage import check_asymmetric_coverage, read_coverage_data
@@ -61,6 +62,7 @@ from pydoppelgangerhunt.reporters import (
     supports_color,
     synthesize_refactoring_suggestion,
 )
+from pydoppelgangerhunt.source_lines import resolve_unit_line_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +189,21 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
         type=str,
         default=None,
         help="Module filename for shared utility extractions (default: '_common.py')",
+    )
+    parser.add_argument(
+        "--skip-pre-unit-closures",
+        action="store_true",
+        help="Skip scanning pre-unit closures for live variables during subroutine extraction",
+    )
+    parser.add_argument(
+        "--closure-strictness",
+        type=str,
+        default=None,
+        choices=["strict", "lenient", "fail_closed", "fast", "skip"],
+        help=(
+            "Closure strictness ('strict'/'fail_closed' vs 'lenient'/'fast'/'skip'; "
+            "takes precedence over --skip-pre-unit-closures)"
+        ),
     )
 
     color_group = parser.add_mutually_exclusive_group()
@@ -644,8 +661,7 @@ def _render_text_violations(
             )
             for m in fam.get("members", []):
                 m_file = normalize_path_string(str(m.get("file") or ""), strip_anchor=False)
-                m_start = int(m.get("start") or 1)
-                m_end = int(m.get("end") or m_start)
+                m_start, m_end = resolve_unit_line_bounds(m)
                 m_name = str(m.get("name") or "member")
                 m_tag = " [medoid]" if medoid_name and m_name == medoid_name else ""
                 m_line = f"      - {m_file}:{m_start}-{m_end} ({m_name}){m_tag}"
@@ -686,10 +702,8 @@ def _render_text_violations(
                 prefix = f"  * {sim_badge} {p_badge}"
             f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
             f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
-            s1 = int(u1.get("start") or 1)
-            e1 = int(u1.get("end") or s1)
-            s2 = int(u2.get("start") or 1)
-            e2 = int(u2.get("end") or s2)
+            s1, e1 = resolve_unit_line_bounds(u1)
+            s2, e2 = resolve_unit_line_bounds(u2)
             n1 = str(u1.get("name") or "unit1")
             n2 = str(u2.get("name") or "unit2")
             line = f"{prefix} {f1}:{s1}-{e1} ({n1}) <===> {f2}:{s2}-{e2} ({n2})"
@@ -1101,7 +1115,57 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if raw_cross_file in ("auto", "shared_module", "host_module", "host", "shared", "skip")
         else "auto"
     )
-    shared_module_name = str(args.shared_module_name or tool_cfg.get("shared_module_name", "_common.py"))
+    shared_module_name = str(
+        args.shared_module_name or tool_cfg.get("shared_module_name", "_common.py")
+    )
+    cfg_strictness = tool_cfg.get("closure_strictness")
+    cfg_skip = _safe_bool(tool_cfg.get("skip_pre_unit_closures", False))
+
+    if args.closure_strictness is not None:
+        cli_strictness: Optional[str] = args.closure_strictness
+        cli_skip: bool = _safe_bool(args.skip_pre_unit_closures)
+        if (
+            str(cli_strictness).strip().lower() in ("strict", "fail_closed")
+            and args.skip_pre_unit_closures
+        ):
+            cli_skip = False
+            logger.warning(
+                "Conflicting flags: --closure-strictness '%s' takes precedence over "
+                "--skip-pre-unit-closures",
+                cli_strictness,
+            )
+    elif args.skip_pre_unit_closures:
+        cli_strictness = "lenient"
+        cli_skip = True
+        if cfg_strictness is not None and str(cfg_strictness).strip().lower() in (
+            "strict",
+            "fail_closed",
+        ):
+            logger.warning(
+                "Conflicting configuration: CLI flag --skip-pre-unit-closures overrides "
+                "configured closure_strictness='%s'",
+                cfg_strictness,
+            )
+    else:
+        cli_strictness = cfg_strictness
+        cli_skip = cfg_skip
+
+    if cli_strictness is not None and str(cli_strictness).strip().lower() not in (
+        "strict", "lenient", "fail_closed", "fast", "skip"
+    ):
+        parser.error(
+            f"invalid closure_strictness configuration: {cli_strictness!r} "
+            "(choose from 'strict', 'lenient', 'fail_closed', 'fast', 'skip')"
+        )
+
+    closure_strictness, skip_pre_unit_closures = resolve_closure_strictness_mode(
+        closure_strictness=cli_strictness,
+        skip_pre_unit_closures=cli_skip,
+    )
+    if skip_pre_unit_closures and getattr(args, "patch", False):
+        logger.info(
+            "Lenient closure mode active; skipping pre-unit closure scan during refactoring"
+        )
 
     baseline_path = args.baseline or tool_cfg.get("baseline")
     preloaded_baseline: Optional[BaselineFingerprints] = None
@@ -1368,7 +1432,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if early_exit is not None:
         return early_exit
 
-    if args.top is not None and args.top > 0 and len(clones) > args.top:
+    if args.top is not None and 0 < args.top < len(clones):
         clones = clones[:args.top]
 
     families: Optional[List[Dict[str, Any]]] = None
@@ -1427,6 +1491,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 method_binding=method_binding,
                 cross_file_strategy=cross_file_strategy,
                 shared_module_name=shared_module_name,
+                skip_pre_unit_closures=skip_pre_unit_closures,
+                closure_strictness=closure_strictness,
             )
             if clones
             else ""

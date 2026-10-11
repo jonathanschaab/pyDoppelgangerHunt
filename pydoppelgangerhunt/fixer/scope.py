@@ -4,17 +4,42 @@ from __future__ import annotations
 
 import ast
 import builtins
+import inspect
 import logging
 import sys
 import textwrap
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+import threading
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+    cast,
+)
 
 from pydoppelgangerhunt.reporters import extract_unit_source_code
-from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines, split_source_lines
+from pydoppelgangerhunt.fixer.source import (
+    _load_unit_file_text,
+    _slice_unit_token_lines,
+    find_enclosing_function_is_async,
+    is_subroutine_unit,
+    parse_unit_coord,
+    resolve_unit_declared_outputs,
+    split_source_lines,
+)
 
 logger = logging.getLogger(__name__)
 
 BUILTIN_NAMES: Set[str] = set(dir(builtins))
+
+
+_SYNTHETIC_WRAPPER_NAME: str = "__pdh_wrapper__"
 
 
 def _is_mangled_name(name: str) -> bool:
@@ -70,9 +95,24 @@ def _extract_arg_names(args: ast.arguments) -> Set[str]:
     return arg_set
 
 
+def _block_contains_yield(node: ast.AST) -> bool:
+    """Returns True if the node contains a Yield or YieldFrom at the current scope level."""
+    stack = [node]
+    while stack:
+        curr = stack.pop()
+        for child in ast.iter_child_nodes(curr):
+            if isinstance(child, (ast.Yield, ast.YieldFrom)):
+                return True
+            if not isinstance(
+                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+            ):
+                stack.append(child)
+    return False
+
+
 class _ScopeVisitor(ast.NodeVisitor):
 
-    """Inspects AST loads, stores, function parameters, returns, nonlocals, globals, and attributes."""
+    """Inspects AST loads, stores, parameters, returns, nonlocals, globals, and attrs."""
 
     def __init__(
         self,
@@ -100,7 +140,11 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.loop_offset: int = loop_offset
         self.loop_depth: int = 0
         self.has_return: bool = False
+        self.has_return_value: bool = False
         self.has_yield: bool = False
+        self.has_yield_assignment: bool = False
+        self.has_try_or_with: bool = False
+        self._ancestors: List[ast.AST] = []
         self.has_super: bool = False
         self.has_mangled_names: bool = False
         self.naked_breaks: int = 0
@@ -117,6 +161,13 @@ class _ScopeVisitor(ast.NodeVisitor):
             if receiver_names is not None
             else ("self", "cls")
         )
+
+    def visit(self, node: ast.AST) -> Any:
+        self._ancestors.append(node)
+        try:
+            return super().visit(node)
+        finally:
+            self._ancestors.pop()
 
     def _record_arg(
         self,
@@ -195,6 +246,25 @@ class _ScopeVisitor(ast.NodeVisitor):
             self.stores.append(name)
 
     def _process_func(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
+        if (
+            self.is_subroutine
+            and len(self._scope_stack) == 0
+            and node.name == _SYNTHETIC_WRAPPER_NAME
+        ):
+            body = node.body
+            if (
+                self.loop_offset > 0
+                and len(body) == 1
+                and isinstance(body[0], (ast.For, ast.AsyncFor, ast.While))
+            ):
+                body = body[0].body
+                self.loop_offset = 0
+            if isinstance(node, ast.AsyncFunctionDef):
+                self.is_async = True
+            for stmt in body:
+                self.visit(stmt)
+            return
+
         is_top = (
             len(self._scope_stack) == 0
             and not self.is_subroutine
@@ -485,9 +555,26 @@ class _ScopeVisitor(ast.NodeVisitor):
             self.is_async = True
         self._visit_loop(node)
 
+    def visit_With(self, node: ast.With) -> None:
+        if len(self._scope_stack) <= 1 and _block_contains_yield(node):
+            self.has_try_or_with = True
+        self.generic_visit(node)
+
     def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
         if len(self._scope_stack) <= 1:
             self.is_async = True
+            if _block_contains_yield(node):
+                self.has_try_or_with = True
+        self.generic_visit(node)
+
+    def visit_Try(self, node: ast.Try) -> None:
+        if len(self._scope_stack) <= 1 and _block_contains_yield(node):
+            self.has_try_or_with = True
+        self.generic_visit(node)
+
+    def visit_TryStar(self, node: ast.AST) -> None:
+        if len(self._scope_stack) <= 1 and _block_contains_yield(node):
+            self.has_try_or_with = True
         self.generic_visit(node)
 
     def visit_While(self, node: ast.While) -> None:
@@ -532,18 +619,28 @@ class _ScopeVisitor(ast.NodeVisitor):
                         ):
                             self.yield_expr_names.append((kind, f":literal:{t_name}"))
 
+    def _inspect_yield_assignment(self) -> None:
+        if len(self._scope_stack) <= 1 and len(self._ancestors) >= 2:
+            immediate_parent = self._ancestors[-2]
+            if not isinstance(immediate_parent, ast.Expr):
+                self.has_yield_assignment = True
+
     def visit_Yield(self, node: ast.Yield) -> None:
         self._record_yield_expr("yield", node)
+        if len(self._scope_stack) <= 1:
+            self._inspect_yield_assignment()
         self.generic_visit(node)
 
     def visit_YieldFrom(self, node: ast.YieldFrom) -> None:
         self._record_yield_expr("yield_from", node)
         self.generic_visit(node)
 
+
     def visit_Return(self, node: ast.Return) -> None:
         if len(self._scope_stack) <= 1:
             self.has_return = True
             if node.value is not None:
+                self.has_return_value = True
                 if isinstance(node.value, ast.Name):
                     if node.value.id not in self.returns:
                         self.returns.append(node.value.id)
@@ -688,12 +785,10 @@ def _is_irrefutable_pattern(pattern: Optional[ast.AST]) -> bool:  # pragma: no c
     """Recursively determines if a pattern matching AST node unconditionally matches any subject."""
     if pattern is None:
         return True
-    match_as = getattr(ast, "MatchAs", ())
-    if isinstance(pattern, match_as):
+    if type(pattern).__name__ == "MatchAs":
         sub_pat = getattr(pattern, "pattern", None)
         return sub_pat is None or _is_irrefutable_pattern(sub_pat)
-    match_or = getattr(ast, "MatchOr", ())
-    if isinstance(pattern, match_or):
+    if type(pattern).__name__ == "MatchOr":
         patterns = getattr(pattern, "patterns", [])
         return any(_is_irrefutable_pattern(p) for p in patterns)
     return False
@@ -723,12 +818,12 @@ def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
         elif isinstance(stmt, (ast.With, ast.AsyncWith)):
             if _block_terminates(stmt.body):
                 return True
-        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
+        elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
             cases = getattr(stmt, "cases", [])
             has_irrefutable = any(_is_irrefutable_case(c) for c in cases)
             if has_irrefutable and cases and all(_block_terminates(c.body) for c in cases):
                 return True
-        elif isinstance(stmt, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+        elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
             f_body = getattr(stmt, "finalbody", [])
             if f_body and _block_terminates(f_body):
                 return True
@@ -759,7 +854,7 @@ def _extract_deleted_names(statements: Sequence[ast.AST]) -> Set[str]:
             continue
         elif isinstance(stmt, ast.ExceptHandler):
             deleted.update(_extract_deleted_names(stmt.body))
-        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
+        elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
             for case in getattr(stmt, "cases", []):
                 deleted.update(_extract_deleted_names(getattr(case, "body", [])))
         else:
@@ -914,7 +1009,7 @@ def _analyze_block_assignment(
                         if isinstance(p_node, ast.Name) and isinstance(p_node.ctx, ast.Store):
                             definite.add(p_node.id)
             _analyze_block_assignment(stmt.body, definite, conditional)
-        elif isinstance(stmt, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+        elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
             t_body = list(getattr(stmt, "body", []))
             t_def, t_cond = _analyze_block_assignment(t_body)
             t_term = _block_terminates(t_body)
@@ -995,7 +1090,7 @@ def _analyze_block_assignment(
             f_body = list(getattr(stmt, "finalbody", []))
             if f_body:
                 _analyze_block_assignment(f_body, definite, conditional)
-        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
+        elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
             d_sub, c_sub = _walrus_assignment_in_expr(getattr(stmt, "subject", None))
             definite.update(d_sub)
             conditional.update(c_sub)
@@ -1141,9 +1236,11 @@ def _rank_param_kind(
 def _inspect_unit_scope(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
+    file_tree: Optional[ast.AST] = None,
 ) -> Dict[str, Any]:
-    """Extracts lexical and AST scope metadata for a single unit."""
-    raw_lines = _slice_unit_token_lines(unit, extract_unit_source_code(unit, repo_root=repo_root))
+    full_source_text = _load_unit_file_text(unit, repo_root=repo_root)
+    unit_code_lines = extract_unit_source_code(unit, repo_root=repo_root)
+    raw_lines = _slice_unit_token_lines(unit, unit_code_lines)
     dedented = textwrap.dedent("".join(raw_lines))
     empty_res: Dict[str, Any] = {
         "inputs": [],
@@ -1159,7 +1256,10 @@ def _inspect_unit_scope(
         "control_flow_hazards": [],
         "is_control_flow_safe": True,
         "has_yield": False,
+        "has_yield_assignment": False,
+        "has_try_or_with": False,
         "has_return": False,
+        "has_return_value": False,
         "has_super": False,
         "has_mangled_names": False,
         "local_imports": [],
@@ -1173,6 +1273,7 @@ def _inspect_unit_scope(
         "has_receiver_access": False,
         "instance_attrs": [],
         "class_attrs": [],
+        "outputs_ambiguous": False,
     }
     if not dedented.strip():
         return empty_res
@@ -1183,10 +1284,18 @@ def _inspect_unit_scope(
 
     parse_candidates = [
         (dedented, 0),
-        (f"async def _wrapper():\n{textwrap.indent(dedented, '    ')}", 0),
-        (f"def _wrapper():\n{textwrap.indent(dedented, '    ')}", 0),
-        (f"async def _wrapper():\n    for _ in (0,):\n{textwrap.indent(dedented, '        ')}", 1),
-        (f"def _wrapper():\n    for _ in (0,):\n{textwrap.indent(dedented, '        ')}", 1),
+        (f"def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
+        (f"async def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
+        (
+            f"def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
+            f"{textwrap.indent(dedented, '        ')}",
+            1,
+        ),
+        (
+            f"async def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
+            f"{textwrap.indent(dedented, '        ')}",
+            1,
+        ),
     ]
 
     for cand_text, offset in parse_candidates:
@@ -1218,11 +1327,14 @@ def _inspect_unit_scope(
     if tree is None:
         return empty_res
 
-    unit_name = str(unit.get("name") or "")
-    unit_kind = str(unit.get("kind") or "")
-    is_subroutine = unit_kind in ("compound_block", "sliding_window", "clause_branch") or (
-        unit_kind not in ("function", "closure", "method", "comprehension", "complex_expr") and ":" in unit_name
-    )
+    is_subroutine = is_subroutine_unit(unit, source_text=full_source_text)
+    if not is_subroutine and "is_subroutine" not in unit and not unit.get("kind"):
+        if isinstance(tree, ast.Module):
+            if not (
+                len(tree.body) == 1
+                and isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))
+            ):
+                is_subroutine = True
 
     rec_param = unit.get("receiver_param")
     rec_kind = unit.get("receiver_kind")
@@ -1311,17 +1423,38 @@ def _inspect_unit_scope(
 
     # Unit outputs: explicit returns if present; for subroutines without explicit
     # returns, all local variable stores act as unit outputs to preserve caller mutations.
-    if visitor.returns:
+    pre_outs = resolve_unit_declared_outputs(unit)
+
+    outputs_ambiguous = False
+    if is_subroutine and isinstance(pre_outs, (list, tuple)):
+        outputs = list(dict.fromkeys(pre_outs))
+    elif is_subroutine and isinstance(pre_outs, (set, frozenset)):
+        if len(pre_outs) > 1:
+            logger.debug(
+                "Rejecting set-valued outputs (%s): unordered set cannot establish "
+                "positional order",
+                pre_outs,
+            )
+            outputs = []
+            outputs_ambiguous = True
+        else:
+            outputs = list(pre_outs)
+    elif visitor.returns:
         outputs = list(visitor.returns)
     elif is_subroutine:
-        outputs = [
-            v for v in visitor.stores
-            if v not in visitor.globals
-            and v not in BUILTIN_NAMES
-            and v not in visitor.except_vars
-            and v not in visitor.deleted_names
-            and v not in visitor.imported_names
-        ]
+        seen: Set[str] = set()
+        outputs = []
+        for v in visitor.stores:
+            if (
+                v not in visitor.globals
+                and v not in BUILTIN_NAMES
+                and v not in visitor.except_vars
+                and v not in visitor.deleted_names
+                and v not in visitor.imported_names
+                and v not in seen
+            ):
+                seen.add(v)
+                outputs.append(v)
     else:
         outputs = []
 
@@ -1352,6 +1485,20 @@ def _inspect_unit_scope(
         )
     )
 
+    unit_is_async = unit.get("is_async")
+    if unit_is_async is None:
+        if unit.get("is_subroutine") and not visitor.has_yield:
+            unit_is_async = visitor.is_async
+        else:
+            s_line = parse_unit_coord(unit, "start", default=1)
+            e_line = parse_unit_coord(unit, "end", default=s_line)
+            if full_source_text:
+                unit_is_async = find_enclosing_function_is_async(
+                    full_source_text, s_line, e_line, tree=file_tree
+                )
+            else:
+                unit_is_async = None
+
     return {
         "inputs": inputs,
         "outputs": outputs,
@@ -1366,12 +1513,30 @@ def _inspect_unit_scope(
         "control_flow_hazards": hazards,
         "is_control_flow_safe": is_control_flow_safe,
         "has_yield": visitor.has_yield,
+        "has_yield_assignment": visitor.has_yield_assignment,
+        "has_try_or_with": visitor.has_try_or_with,
         "has_return": visitor.has_return,
+        "has_return_value": visitor.has_return_value,
         "has_super": visitor.has_super,
         "has_mangled_names": visitor.has_mangled_names,
         "local_imports": visitor.local_imports,
         "yield_expr_names": visitor.yield_expr_names,
-        "is_async": visitor.is_async,
+        "is_async": (
+            True
+            if visitor.is_async
+            else (
+                (bool(unit_is_async) if unit_is_async is not None else None)
+                if visitor.has_yield
+                else (
+                    bool(unit_is_async)
+                    if (
+                        not unit.get("is_subroutine")
+                        and unit.get("kind") not in ("function", "method")
+                    )
+                    else False
+                )
+            )
+        ),
         "conditional_outputs": conditional_outputs,
         "definite_stores": sorted(def_assigned),
         "has_instance_binding": has_instance_binding,
@@ -1386,29 +1551,47 @@ def _inspect_unit_scope(
             a for a in visitor.attrs_read + visitor.attrs_written
             if any(a.startswith(f"{r}.") for r in class_receivers)
         ],
+        "outputs_ambiguous": outputs_ambiguous,
     }
 
 
 
-def analyze_unit_variable_scope(
+def _inspect_single_unit_scope_impl(
+    unit: Dict[str, Any],
+    repo_root: Optional[str] = None,
+    tree: Optional[ast.AST] = None,
+) -> Dict[str, Any]:
+    """Analyzes AST variable scoping for an individual code unit."""
+    return _inspect_unit_scope(unit, repo_root=repo_root, file_tree=tree)
+
+
+def _align_symmetric_var_list(list1: List[str], list2: List[str]) -> List[str]:
+    """Aligns shared variables between two units, preserving side 1 order if equal length."""
+    common = [var for var in list1 if var in list2]
+    if len(list1) == len(list2):
+        return common if len(common) == len(list1) else list1
+    return common if common else list1
+
+
+def _analyze_unit_variable_scope_impl(
     u1: Dict[str, Any],
     u2: Optional[Dict[str, Any]] = None,
     repo_root: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
+    scope1: Optional[Dict[str, Any]] = None,
+    scope2: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
-    info1 = _inspect_unit_scope(u1, repo_root=repo_root)
+    info1 = scope1 if scope1 is not None else inspect_single_unit_scope(
+        u1, repo_root=repo_root, tree=tree1
+    )
     if u2 is not None:
-        info2 = _inspect_unit_scope(u2, repo_root=repo_root)
-        common_inputs = [var for var in info1["inputs"] if var in info2["inputs"]]
-        if len(info1["inputs"]) == len(info2["inputs"]):
-            inputs = common_inputs if len(common_inputs) == len(info1["inputs"]) else info1["inputs"]
-        else:
-            inputs = common_inputs if common_inputs else info1["inputs"]
-        common_outputs = [var for var in info1["outputs"] if var in info2["outputs"]]
-        if len(info1["outputs"]) == len(info2["outputs"]):
-            outputs = common_outputs if len(common_outputs) == len(info1["outputs"]) else info1["outputs"]
-        else:
-            outputs = common_outputs if common_outputs else info1["outputs"]
+        info2 = scope2 if scope2 is not None else inspect_single_unit_scope(
+            u2, repo_root=repo_root, tree=tree2
+        )
+        inputs = _align_symmetric_var_list(info1["inputs"], info2["inputs"])
+        outputs = _align_symmetric_var_list(info1["outputs"], info2["outputs"])
         free_vars = list(dict.fromkeys(info1["free_vars"] + info2["free_vars"]))
         nonlocals = list(dict.fromkeys(info1["nonlocals"] + info2["nonlocals"]))
         globals_ = list(dict.fromkeys(info1["globals"] + info2["globals"]))
@@ -1425,9 +1608,20 @@ def analyze_unit_variable_scope(
         hazards = list(dict.fromkeys(info1["control_flow_hazards"] + info2["control_flow_hazards"]))
         is_safe = info1["is_control_flow_safe"] and info2["is_control_flow_safe"]
         has_yield = info1["has_yield"] or info2["has_yield"]
+        has_yield_assignment = bool(
+            info1.get("has_yield_assignment", False)
+            or info2.get("has_yield_assignment", False)
+        )
+        has_try_or_with = bool(
+            info1.get("has_try_or_with", False)
+            or info2.get("has_try_or_with", False)
+        )
         has_return = info1["has_return"] or info2["has_return"]
+        has_return_value = bool(info1.get("has_return_value") or info2.get("has_return_value"))
         has_super = bool(info1.get("has_super", False) or info2.get("has_super", False))
-        has_mangled = bool(info1.get("has_mangled_names", False) or info2.get("has_mangled_names", False))
+        has_mangled = bool(
+            info1.get("has_mangled_names", False) or info2.get("has_mangled_names", False)
+        )
         local_imports = list(dict.fromkeys(info1["local_imports"] + info2["local_imports"]))
         local_imports_by_unit = [info1["local_imports"], info2["local_imports"]]
         yield_expr_names = info1["yield_expr_names"] + info2["yield_expr_names"]
@@ -1437,6 +1631,9 @@ def analyze_unit_variable_scope(
         ))
         definite_stores = sorted(
             set(info1.get("definite_stores", [])) & set(info2.get("definite_stores", []))
+        )
+        outputs_ambiguous = bool(
+            info1.get("outputs_ambiguous", False) or info2.get("outputs_ambiguous", False)
         )
     else:
         inputs = info1["inputs"]
@@ -1450,7 +1647,10 @@ def analyze_unit_variable_scope(
         hazards = info1["control_flow_hazards"]
         is_safe = info1["is_control_flow_safe"]
         has_yield = info1["has_yield"]
+        has_yield_assignment = bool(info1.get("has_yield_assignment", False))
+        has_try_or_with = bool(info1.get("has_try_or_with", False))
         has_return = info1["has_return"]
+        has_return_value = bool(info1.get("has_return_value"))
         has_super = bool(info1.get("has_super", False))
         has_mangled = bool(info1.get("has_mangled_names", False))
         local_imports = info1["local_imports"]
@@ -1459,6 +1659,7 @@ def analyze_unit_variable_scope(
         is_async = info1.get("is_async", False)
         conditional_outputs = info1.get("conditional_outputs", [])
         definite_stores = info1.get("definite_stores", [])
+        outputs_ambiguous = bool(info1.get("outputs_ambiguous", False))
 
     has_instance_binding = info1.get("has_instance_binding", False) or (
         info2.get("has_instance_binding", False) if u2 is not None else False
@@ -1471,10 +1672,24 @@ def analyze_unit_variable_scope(
     )
     binding_kind = _determine_binding_kind(has_instance_binding, has_class_binding)
 
-    primary_rec = u1.get("receiver_param") or (u2.get("receiver_param") if u2 else None) or (
-        "cls" if (u1.get("receiver_kind") == "class" or (u2 and u2.get("receiver_kind") == "class")) else None
+    primary_rec = (
+        u1.get("receiver_param")
+        or (u2.get("receiver_param") if u2 else None)
+        or (
+            "cls"
+            if (
+                u1.get("receiver_kind") == "class"
+                or (u2 and u2.get("receiver_kind") == "class")
+            )
+            else None
+        )
     )
-    _normalize_receiver_order(inputs, has_instance_binding, has_class_binding, primary_receiver=primary_rec)
+    _normalize_receiver_order(
+        inputs,
+        has_instance_binding,
+        has_class_binding,
+        primary_receiver=primary_rec,
+    )
 
     locals_ = [var for var in info1["stores"] if var not in inputs]
     return {
@@ -1491,7 +1706,10 @@ def analyze_unit_variable_scope(
         "control_flow_hazards": hazards,
         "is_control_flow_safe": is_safe,
         "has_yield": has_yield,
+        "has_yield_assignment": has_yield_assignment,
+        "has_try_or_with": has_try_or_with,
         "has_return": has_return,
+        "has_return_value": has_return_value,
         "has_super": has_super,
         "has_mangled_names": has_mangled,
         "local_imports": local_imports,
@@ -1504,22 +1722,152 @@ def analyze_unit_variable_scope(
         "has_class_binding": has_class_binding,
         "binding_kind": binding_kind,
         "has_receiver_access": has_receiver_access,
-        "instance_attrs": list(dict.fromkeys(
-            info1.get("instance_attrs", []) + (info2.get("instance_attrs", []) if u2 is not None else [])
-        )),
-        "class_attrs": list(dict.fromkeys(
-            info1.get("class_attrs", []) + (info2.get("class_attrs", []) if u2 is not None else [])
-        )),
+        "instance_attrs": list(
+            dict.fromkeys(
+                info1.get("instance_attrs", [])
+                + (info2.get("instance_attrs", []) if u2 is not None else [])
+            )
+        ),
+        "class_attrs": list(
+            dict.fromkeys(
+                info1.get("class_attrs", [])
+                + (info2.get("class_attrs", []) if u2 is not None else [])
+            )
+        ),
+        "outputs_ambiguous": outputs_ambiguous,
     }
 
+
+_dispatch_active = threading.local()
+
+
+def _resolve_dispatch_target(
+    func_name: str,
+    default_func: Callable[..., Any],
+    alias_func: Optional[Callable[..., Any]] = None,
+) -> Optional[Callable[..., Any]]:
+    """Resolves active mock patch on patch_mod, fixer package, or scope_mod if overridden."""
+    patch_mod = sys.modules.get("pydoppelgangerhunt.fixer.patch")
+    target = getattr(patch_mod, func_name, None)
+    if target is None or target is default_func or target is alias_func:
+        pkg = sys.modules.get("pydoppelgangerhunt.fixer")
+        target = getattr(pkg, func_name, None)
+    if target is None or target is default_func or target is alias_func:
+        scope_mod = sys.modules.get("pydoppelgangerhunt.fixer.scope")
+        target = getattr(scope_mod, func_name, None)
+    if (
+        target is not None
+        and callable(target)
+        and target is not default_func
+        and target is not alias_func
+    ):
+        return cast(Callable[..., Any], target)
+    return None
+
+
+def _invoke_dynamic_target(
+    target: Callable[..., Any],
+    pos_args: Tuple[Any, ...],
+    tree_kwargs: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Invokes target after verifying argument compatibility with its signature."""
+    try:
+        sig = inspect.signature(target)
+    except (ValueError, TypeError):
+        res = target(*pos_args, **tree_kwargs)
+        return res if isinstance(res, dict) else {}
+
+    has_var_kw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+    call_kwargs = (
+        dict(tree_kwargs)
+        if has_var_kw
+        else {k: v for k, v in tree_kwargs.items() if k in sig.parameters}
+    )
+
+    can_bind_with_kwargs = False
+    try:
+        sig.bind(*pos_args, **call_kwargs)
+        can_bind_with_kwargs = True
+    except TypeError:
+        can_bind_with_kwargs = False
+
+    if can_bind_with_kwargs:
+        res = target(*pos_args, **call_kwargs)
+    else:
+        res = target(*pos_args)
+    return res if isinstance(res, dict) else {}
+
+
+def _dispatch_or_call(
+    flag_attr: str,
+    func_name: str,
+    default_func: Callable[..., Any],
+    alias_func: Optional[Callable[..., Any]],
+    pos_args: Tuple[Any, ...],
+    kw_args: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Dispatches call through active mock patches with reentrancy protection."""
+    if getattr(_dispatch_active, flag_attr, False):
+        res = default_func(*pos_args, **kw_args)
+        return res if isinstance(res, dict) else {}
+    target = _resolve_dispatch_target(func_name, default_func, alias_func)
+    if target is None:
+        res = default_func(*pos_args, **kw_args)
+        return res if isinstance(res, dict) else {}
+    setattr(_dispatch_active, flag_attr, True)
+    try:
+        return _invoke_dynamic_target(target, pos_args, kw_args)
+    finally:
+        setattr(_dispatch_active, flag_attr, False)
 
 
 def dispatch_analyze_unit_variable_scope(
     u1: Dict[str, Any],
     u2: Optional[Dict[str, Any]] = None,
     repo_root: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
+    scope1: Optional[Dict[str, Any]] = None,
+    scope2: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Dispatches analyze_unit_variable_scope, honoring active mock patches on pydoppelgangerhunt.fixer."""
-    pkg = sys.modules.get("pydoppelgangerhunt.fixer")
-    target = getattr(pkg, "analyze_unit_variable_scope", analyze_unit_variable_scope)
-    return target(u1, u2=u2, repo_root=repo_root)
+    """Dispatches analyze_unit_variable_scope, honoring active mock patches on
+    pydoppelgangerhunt.fixer.patch or pydoppelgangerhunt.fixer."""
+    kwargs: Dict[str, Any] = {
+        "u2": u2,
+        "repo_root": repo_root,
+        "tree1": tree1,
+        "tree2": tree2,
+        "scope1": scope1,
+        "scope2": scope2,
+    }
+    return _dispatch_or_call(
+        "analyzing",
+        "analyze_unit_variable_scope",
+        _analyze_unit_variable_scope_impl,
+        dispatch_analyze_unit_variable_scope,
+        (u1,),
+        kwargs,
+    )
+
+
+def dispatch_inspect_single_unit_scope(
+    unit: Dict[str, Any],
+    repo_root: Optional[str] = None,
+    tree: Optional[ast.AST] = None,
+) -> Dict[str, Any]:
+    """Dispatches single-unit scope analysis, honoring mock patches on
+    inspect_single_unit_scope."""
+    return _dispatch_or_call(
+        "inspecting",
+        "inspect_single_unit_scope",
+        _inspect_single_unit_scope_impl,
+        dispatch_inspect_single_unit_scope,
+        (unit,),
+        {"repo_root": repo_root, "tree": tree},
+    )
+
+
+analyze_unit_variable_scope = dispatch_analyze_unit_variable_scope
+inspect_single_unit_scope = dispatch_inspect_single_unit_scope

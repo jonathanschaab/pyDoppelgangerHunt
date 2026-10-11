@@ -163,6 +163,7 @@ from pydoppelgangerhunt import (
     detect_line_ending,
     generate_refactoring_patch,
     intervals_overlap,
+    is_subroutine_unit,
     refactor_module_units,
     split_source_lines,
     validate_module_unit_replacements,
@@ -177,9 +178,22 @@ from pydoppelgangerhunt import (
 - **`count_physical_newlines(text)`**: Accurately counts physical line endings (`\r\n`, `\r`, `\n`) across mixed and legacy lone-CR formats.
 - **`detect_line_ending(*sources)`**: Detects predominant line ending format across source strings or iterables via majority vote (`\n`, `\r\n`, or `\r`), breaking ties in priority order (`\n` → `\r\n` → `\r`).
 - **`intervals_overlap(s1, e1, s2, e2)`**: Fast primitive returning `True` if two half-open intervals `[s1, e1)` and `[s2, e2)` intersect; `False` otherwise.
+- **`is_subroutine_unit(unit)`**: Inspects unit metadata to determine if a clone unit represents
+  an inner compound block, sliding window, or clause branch rather than an entire callable.
+  Explicit `is_subroutine` boolean takes precedence; returns `True` for known subroutine kinds
+  (`compound_block`, `sliding_window`, `clause_branch`), and `False` for all others (the legacy
+  `":"` naming heuristic has been removed).
 - **`refactor_module_units(source_text, replacements, tier1=True, tier2=True, dry_run=False)`**: Applies multiple non-overlapping unit replacements in strict **reverse source order** (descending byte offsets) using single-pass buffer slicing, guaranteeing that downstream text expansions or contractions never invalidate upstream coordinates.
 - **`validate_module_unit_replacements(source_text, replacements, tier1=True, tier2=True)`**: Non-mutating validation helper that verifies candidate replacements for collisions across Tier 1 (AST coordinate overlap) and Tier 2 (physical byte interval sweep) without modifying or allocating new source string buffers.
-- **`generate_refactoring_patch(candidate_pairs, repo_root=..., replace_clones=...)`**: Synthesizes a multi-file unified diff (`git apply` compatible) with dependency cycle detection and per-pair transactional snapshot rollback.
+- **`generate_refactoring_patch(candidate_pairs, repo_root=..., replace_clones=...,`**
+  **`closure_strictness=None, skip_pre_unit_closures=False, ...)`**:
+  Synthesizes a multi-file unified diff (`git apply` compatible) with dependency cycle detection
+  and per-pair transactional snapshot rollback. For generator subroutines (within function or
+  method definitions; module-level yields are a syntax error in Python), downstream variable
+  liveness and reaching definitions ensure output parameters are paired safely; pre-unit closures,
+  lambdas, and class methods treat captured variables as live to protect escaping callbacks.
+  When an AST scope is analyzed at top-level module scope (e.g. in test suites), prior functions
+  contribute their global reads, failing closed safely on un-definitely assigned candidates.
 
 #### Dual-Tier Collision Validation & Pragma Preservation Example
 
@@ -220,6 +234,93 @@ Refactoring executes in linear-logarithmic time with incremental validation:
 - **Incremental Collision Checking**: Delegation checks candidate units incrementally ($O(K)$ per unit against existing replacements and physical items), eliminating expensive $O(K \log K)$ buffer dry-runs per clone pair.
 - **Micro-Benchmark**: For modules with 100+ replacements and 10,000+ lines, dual-tier validation and single-pass descending buffer slicing executes in under 5 ms on modern hardware.
 
+##### Precision & Soundness Trade-off: Closure Scanning
+
+When extracting generator subroutine clones that assign variables, `pyDoppelgangerHunt` conducts
+a pre-unit AST walk within the enclosing scope to detect closures, lambdas, or nested classes
+that capture candidate outputs prior to unit execution. Because such closures may escape into
+callback tables or event loops, strict mode treats these captured names as live, guaranteeing
+soundness.
+
+- **Memoization & Cache Invalidation**: Downstream liveness analysis caches AST traversal results
+  in a thread-safe LRU cache keyed by SHA-256 source digest (full 256-bit hash), file path,
+  unit line/column coordinates, unit kind and name, subroutine flag (`is_subroutine`), candidate
+  outputs, and closure strictness (`skip_pre_unit_closures`).
+- **Precision vs. Soundness Trade-off**: Pre-unit closure scanning can be configured via
+  `--closure-strictness {strict,lenient,fail_closed,fast,skip}` (or `--skip-pre-unit-closures`, or setting
+  `closure_strictness = "strict"|"lenient"` in `pyproject.toml`):
+  - `strict` (alias: `fail_closed`, default): Soundness-preserving mode that treats pre-unit closures
+    capturing candidate outputs as live escaping callbacks, guarding against callbacks registered in
+    event loops or tables.
+  - `lenient` (aliases: `fast`, `skip`): Precision-oriented mode that skips pre-unit closure scanning,
+    reducing false-positive pair rejections in codebases where pre-unit closures never escape, at the
+    cost of soundness for escaping closures.
+
+#### Safety Model & Fail-Closed Refactoring Guarantees
+
+When synthesizing refactoring patches and shared helpers, `pyDoppelgangerHunt` enforces
+strict fail-closed safety invariants:
+- **Lexical Scope Containment & Pre-Unit Closure Isolation (Generator Subroutines)**: For generator
+  subroutines, any closures, lambdas, generator expressions, or nested class definitions preceding a
+  candidate unit within the enclosing lexical scope that capture potential output variables are
+  conservatively treated as escaping reads. Even if a closure is not called directly within the
+  unit's immediate block, it may have registered into callback tables or event loops. Candidate
+  outputs captured by pre-unit closures are preserved or cause the pair to fail closed rather than
+  risk silent state corruption. In `lenient` mode (`--closure-strictness lenient`), pre-unit
+  closure scanning is skipped to reduce false-positive pair rejections where closures do not escape.
+- **Abnormal Exit Loss Prevention**: Generator subroutines lexically enclosed in `try` blocks whose
+  `except` or `finally` handlers read needed outputs are rejected. In Python, abnormal generator
+  termination (`gen.close()`, `throw()`, or an exception) causes `yield from` to exit abruptly
+  without returning, bypassing assignment to output variables (e.g. `total = (yield from ...)`
+  never assigns `total`), leaving exception/cleanup handlers with unassigned or stale values.
+  Similarly, any enclosing `with` or `async with` block whose outputs are read downstream fails
+  closed, as context manager exit on premature termination or cleanup hazards cannot be assumed
+  safe across arbitrary context managers (including locks, transactions, and streams).
+- **Module-Level Units & Global Scope**: Intra-file AST analysis resolves downstream variable
+  reads within the local module file. Because `yield` at module level is a Python `SyntaxError`,
+  generator return propagation applies strictly to functions and methods. For non-generator
+  module-level units, variables defined within the unit are module-level globals; ensure
+  module-level refactorings do not alter globals exported as public module API.
+- **Dynamic Scope Reflection Limitations**: Downstream variable liveness analysis statically
+  identifies dynamic local and global reads via `locals()`, `vars()`, `eval()`, `exec()`, `dir()`,
+  and `globals()`. Dynamic reflection via runtime stack frame introspection (such as
+  `sys._getframe()` or `inspect.currentframe().f_locals`) is not tracked statically; functions
+  relying on frame-inspection reflection should be refactored manually or marked with
+  `# pragma: no-refactor`.
+- **Strict Coordinate Validation**: In patch generation (`--patch`), unit line coordinates must
+  be strictly positive integers with `start <= end` (and `start_col <= end_col` on the same line).
+  Units with missing, zero, or inverted coordinates fail closed and are rejected rather than
+  silently collapsing multi-line definitions into single lines. Permissive coordinate clamping is
+  reserved for reporting, metrics, and visual displays.
+- **Definite Assignment Verification**: Synthesized helper return values and tuple-unpacked
+  subroutine outputs require definite assignments along all incoming and internal execution
+  paths. If an output variable could remain unassigned before helper exit, refactoring is
+  rejected to prevent `UnboundLocalError`.
+- **Async Generator Delegation Hazard Prohibition**: In Python, asynchronous generators cannot
+  combine `yield` with explicit `return <value>`. Furthermore, PEP 525 delegation via
+  `async for ...: yield` loses `athrow()`/`aclose()` exception propagation semantics,
+  bidirectional yield assignments, and try/with cleanup guarantees. Any clone pair where either
+  unit is an async generator with return values, yield assignments, or try/with blocks is
+  unconditionally skipped across both whole-function and subroutine extractions.
+- **Dual-Tier Transactional Rollback**: If helper extraction or call replacement encounters
+  semantic overlap, token collisions, or dependency graph cycles, the entire refactoring
+  operation rolls back cleanly without leaving partial mutations or corrupting host source files.
+
+### Troubleshooting: When the Patcher Refuses a Candidate Pair
+If `pyDoppelgangerHunt` reports clones but does not propose extractions for a pair when running
+with `--patch`, check verbose logs (`-v` or logging level `DEBUG`):
+- **Pre-Unit Closure Escapes**: If candidate outputs are captured by closures or callbacks defined
+  prior to the unit, extraction fails closed to prevent the closure from observing stale local
+  state after subroutine extraction. If you have verified that the pre-unit closure is never
+  invoked after the extracted unit executes, you can enable `--closure-strictness lenient`
+  (or `--skip-pre-unit-closures`).
+- **Abnormal Exit Handlers**: If a generator subroutine is enclosed in a `try` block whose `finally`
+  or `except` handlers read needed outputs, extraction is rejected to protect cleanup integrity.
+- **Indefinite Stores**: If an output variable lacks definite assignment along every internal
+  path, the extraction is rejected to protect against runtime `UnboundLocalError`.
+- **Unpaired Outputs**: When duplicate variable names or arity mismatches prevent 1-to-1 output
+  pairing, the pair fails closed safely.
+
 To generate a starter configuration file in your project root:
 
 ```bash
@@ -245,6 +346,8 @@ pydoppelgangerhunt --init
 | `--method-binding` | `auto\|method\|module` | Target helper binding strategy (`auto`, `method`, or `module`) |
 | `--cross-file-strategy` | `auto\|shared_module\|host_module\|skip` | Cross-module deduplication strategy (`auto`, `shared_module`, `host_module`, or `skip`; default: `auto`) |
 | `--shared-module-name` | `FILENAME` | Target filename for shared utility extractions (default: `_common.py`) |
+| `--skip-pre-unit-closures` | Flag | Skip pre-unit closure scan during subroutine extraction |
+| `--closure-strictness` | `strict\|lenient\|fail_closed\|fast\|skip` | Closure strictness mode (`strict` / `fail_closed` [soundness] or `lenient` / `fast` / `skip` [fewer rejections]; default: `strict`) |
 | `--sort-by` | `similarity\|priority\|sloc` | Sort clone hits (default: `similarity`) |
 | `--priority` | Flag | Sort clones by Priority score: $\text{Sim} \times \text{SLOC} \times \text{Complexity}$ |
 | `--top` | `INT` | Truncate report to top $N$ clone pairs |

@@ -311,8 +311,7 @@ def _walk_ast_nodes(
             if (
                 abstract_expressions
                 and name == "guard"
-                and hasattr(ast, "match_case")
-                and isinstance(node, getattr(ast, "match_case"))  # pragma: no cover (py310+)
+                and type(node).__name__ == "match_case"  # pragma: no cover (py310+)
             ):
                 if isinstance(value, (ast.Compare, ast.BoolOp, ast.UnaryOp)):
                     nodes.append(ast.Name(id="__ABSTRACT_COND__", ctx=ast.Load()))
@@ -810,6 +809,7 @@ def _record_unit(
     enclosing_class_start: Optional[int] = None,
     receiver_kind: Optional[str] = None,
     is_static: bool = False,
+    is_async: bool = False,
 ) -> None:
     """Records an AST unit if it satisfies thresholds and is not suppressed by inline comments."""
     if file_lines and check_inline_suppression(file_lines, start, end):
@@ -909,6 +909,7 @@ def _record_unit(
                 "enclosing_class_start": enclosing_class_start,
                 "receiver_kind": receiver_kind,
                 "is_static": is_static,
+                "is_async": is_async,
             })
 
 
@@ -933,6 +934,7 @@ def _record_clause_branch(
     enclosing_class_start: Optional[int] = None,
     receiver_kind: Optional[str] = None,
     is_static: bool = False,
+    is_async: bool = False,
 ) -> None:
     """Records an if-branch or except-handler clause if it contains at least 3 statements."""
     if len(body) < 3:
@@ -961,7 +963,39 @@ def _record_clause_branch(
         enclosing_class_start=enclosing_class_start,
         receiver_kind=receiver_kind,
         is_static=is_static,
+        is_async=is_async,
     )
+
+
+def _node_is_effectively_async(
+    node: Union[ast.AST, Sequence[ast.AST]], enclosing_is_async: bool
+) -> bool:
+    """Checks whether an AST node or stmt sequence has async syntax or acts as an async generator."""
+    if isinstance(node, (list, tuple)):
+        nodes = list(node)
+    else:
+        nodes = [node]
+    for n in nodes:
+        if not isinstance(n, ast.AST):
+            continue
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+
+        queue: deque[ast.AST] = deque([n])
+        while queue:
+            curr = queue.popleft()
+            if curr is not n and isinstance(
+                curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                continue
+            if isinstance(curr, (ast.Await, ast.AsyncFor, ast.AsyncWith)):
+                return True
+            if isinstance(curr, ast.comprehension) and bool(curr.is_async):
+                return True
+            if enclosing_is_async and isinstance(curr, (ast.Yield, ast.YieldFrom)):
+                return True
+            queue.extend(ast.iter_child_nodes(curr))
+    return False
 
 
 def _record_node_unit(
@@ -984,6 +1018,7 @@ def _record_node_unit(
     enclosing_class_start: Optional[int] = None,
     receiver_kind: Optional[str] = None,
     is_static: bool = False,
+    is_async: bool = False,
 ) -> None:
     """Records an AST node unit by extracting its start and end line bounds."""
     start = getattr(node, "lineno", 0)
@@ -1010,6 +1045,7 @@ def _record_node_unit(
         enclosing_class_start=enclosing_class_start,
         receiver_kind=receiver_kind,
         is_static=is_static,
+        is_async=is_async,
     )
 
 
@@ -1110,6 +1146,7 @@ def harvest_notebook_units(
                     consistent_renaming=consistent_renaming,
                     abstract_expressions=abstract_expressions,
                     strip_docstrings=strip_docstrings,
+                    is_async=isinstance(node, ast.AsyncFunctionDef),
                 )
 
     return units
@@ -1217,6 +1254,7 @@ def harvest_file_units(
             decs = getattr(node, "decorator_list", [])
             fn_is_static = any(is_decorator_named(d, "staticmethod") for d in decs)
             fn_is_class_method = any(is_decorator_named(d, "classmethod") for d in decs)
+            fn_is_async = isinstance(node, ast.AsyncFunctionDef)
             is_nested = id(node) in closure_parents
             is_closure = harvest_closures and is_nested
             if is_nested:
@@ -1261,6 +1299,7 @@ def harvest_file_units(
                     enclosing_class_start=enc_class_start,
                     receiver_kind=fn_receiver_kind,
                     is_static=fn_is_static,
+                    is_async=fn_is_async,
                 )
 
             if not functions_only:
@@ -1292,6 +1331,7 @@ def harvest_file_units(
                                 enclosing_class_start=enc_class_start,
                                 receiver_kind=fn_receiver_kind,
                                 is_static=fn_is_static,
+                                is_async=_node_is_effectively_async(item, fn_is_async),
                             )
 
             if sliding_window and hasattr(node, "body"):
@@ -1323,6 +1363,7 @@ def harvest_file_units(
                             enclosing_class_start=enc_class_start,
                             receiver_kind=fn_receiver_kind,
                             is_static=fn_is_static,
+                            is_async=_node_is_effectively_async(window_slice, fn_is_async),
                         )
 
             if clause_level and hasattr(node, "body"):
@@ -1335,6 +1376,7 @@ def harvest_file_units(
                     e_start: Optional[int] = enc_class_start,
                     r_kind: Optional[str] = fn_receiver_kind,
                     static_fn: bool = fn_is_static,
+                    async_fn: bool = fn_is_async,
                 ) -> None:
                     _record_clause_branch(
                         units,
@@ -1357,6 +1399,7 @@ def harvest_file_units(
                         enclosing_class_start=e_start,
                         receiver_kind=r_kind,
                         is_static=static_fn,
+                        is_async=_node_is_effectively_async(body, async_fn),
                     )
 
                 for stmt in _iter_local_nodes(node):
@@ -1380,7 +1423,7 @@ def harvest_file_units(
                         try_finally = getattr(stmt, "finalbody", None)
                         if try_finally:
                             _record_branch("try_finally", try_finally, t_line)
-                    elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
+                    elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
                         m_line = getattr(stmt, "lineno", 0)
                         for c_idx, case in enumerate(getattr(stmt, "cases", [])):
                             _record_branch(f"case_{c_idx + 1}", getattr(case, "body", []), m_line)

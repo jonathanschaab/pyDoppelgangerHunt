@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import ast
+import json
 import logging
+import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from unittest import mock
 
 import pytest
@@ -20,12 +22,21 @@ from pydoppelgangerhunt import (
     refactor_module_units,
     replace_unit_in_source,
     scan_target,
+    synthesize_shared_helper_code,
 )
 from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _build_whole_method_delegation,
     patch as patch_mod,
+    resolve_closure_strictness_mode,
+)
+from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
+    _load_unit_file_text,
 )
 from pydoppelgangerhunt.fixer.depgraph import build_module_graph
+
+requires_git = pytest.mark.skipif(
+    shutil.which("git") is None, reason="git CLI not available"
+)
 
 
 def test_audit_tests_parametrize_candidate_detection(tmp_path: Path) -> None:
@@ -1615,7 +1626,8 @@ def test_generate_refactoring_patch_cross_receiver_attrs_matching(tmp_path: Path
 
 
 def test_generate_refactoring_patch_permuted_outputs_alignment(tmp_path: Path) -> None:
-    """Verifies that when clone 2 assigns variables in permuted order, the unpacking tuple aligns with the helper's return."""
+    """Verifies that when clone 2 assigns variables in permuted order, output pairing fails
+    closed under replace_clones=True to prevent silent variable swapping."""
     src1 = (
         "def compute_1(a: int, b: int) -> tuple:\n"
         "    x = a * 10\n"
@@ -1633,15 +1645,32 @@ def test_generate_refactoring_patch_permuted_outputs_alignment(tmp_path: Path) -
     f1.write_text(src1, encoding="utf-8")
     f2.write_text(src2, encoding="utf-8")
 
-    u1 = {"file": "mod1.py", "start": 2, "end": 3, "name": "compute_1:block", "kind": "compound_block"}
-    u2 = {"file": "mod2.py", "start": 2, "end": 3, "name": "compute_2:block", "kind": "compound_block"}
+    u1 = {
+        "file": "mod1.py",
+        "start": 2,
+        "end": 3,
+        "name": "compute_1:block",
+        "kind": "compound_block",
+    }
+    u2 = {
+        "file": "mod2.py",
+        "start": 2,
+        "end": 3,
+        "name": "compute_2:block",
+        "kind": "compound_block",
+    }
 
-    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
-    assert "--- a/mod1.py" in patch
-    assert "--- a/mod2.py" in patch
-    # Both call sites should unpack x, y in canonical helper return order
-    assert "+    x, y = _shared_compute_1" in patch
-    assert "y, x = _shared_compute_1" not in patch
+    # Under replace_clones=True, conflicting output orders cannot be soundly paired and must skip
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch == ""
+
+    # Under replace_clones=False, helper-only mode emits the shared helper
+    patch_preview = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=False
+    )
+    assert "_shared_compute_1" in patch_preview
 
 
 def test_generate_refactoring_patch_cross_module_auto_creates_common_module(tmp_path: Path) -> None:
@@ -6379,10 +6408,17 @@ def test_is_valid_unit_coordinates_scenarios() -> None:
         {},
         {"start": 1, "end": 5},
         {"start": "1", "end": "5"},
+        {"start": "12:0", "end": "15:0"},
+        {"start": "12:0", "end": "15:0", "start_col": "4:0", "end_col": "10:0"},
         {"start": "not_an_int"},
         {"start": 1, "end": [2]},
         {"start": 1, "end": 5, "start_col": "invalid"},
         {"start": 1, "end": 5, "end_col": {}},
+        {"start": ""},
+        {"start": 1, "end": 5, "start_col": ""},
+        {"start": float("inf"), "end": 5},
+        {"start": "inf", "end": 5},
+        {"start": 1, "end": float("nan")},
     ]
     for tc in test_cases:
         expected = is_valid_unit_coordinates(tc)
@@ -6394,6 +6430,11 @@ def test_is_valid_unit_coordinates_scenarios() -> None:
     coord_cases: List[Tuple[Dict[str, Any], str, int, int]] = [
         ({"start": 10}, "start", 1, 10),
         ({"start": "15"}, "start", 1, 15),
+        ({"start": "10:0"}, "start", 1, 10),
+        ({"start_col": "8:2"}, "start_col", 0, 8),
+        ({"start": ""}, "start", 1, 1),
+        ({"start": "   "}, "start", 1, 1),
+        ({"start": ":0"}, "start", 1, 1),
         ({}, "start", 42, 42),
         ({"end": 99}, "end", 0, 99),
     ]
@@ -6632,6 +6673,50 @@ def test_render_file_patch_plan_tier2_collision_fallback() -> None:
     assert "--- a/test.py" in diff
     assert "# replaced 1" in diff
     assert "# replaced 2" not in diff
+
+
+def test_render_file_patch_plan_omits_unit_with_missing_or_invalid_end() -> None:
+    """Verifies that _render_file_patch_plan fails closed and omits units whose end
+    coordinate is omitted or inverted."""
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _render_file_patch_plan
+
+    plan = _FilePatchPlan(
+        file_path=Path("test.py"),
+        rel_path="test.py",
+        orig_text="a = 1\nb = 2\nc = 3\n",
+        is_new_file=False,
+    )
+    u_no_end = {"file": "test.py", "start": 1}
+    u_inv = {"file": "test.py", "start": 3, "end": 1}
+    plan.replacements.append((u_no_end, "# replaced line 1\n"))
+    plan.replacements.append((u_inv, "# replaced line 3\n"))
+
+    diff = _render_file_patch_plan(plan, replace_clones=True)
+    assert "# replaced line 1" not in diff
+    assert "# replaced line 3" not in diff
+
+
+def test_render_file_patch_plan_mixed_valid_and_colon_invalid_units() -> None:
+    """Verifies that _render_file_patch_plan safely filters valid units and ignores
+    colon-formatted invalid units without raising ValueError during retained candidate
+    cross-checking."""
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan, _render_file_patch_plan
+
+    plan = _FilePatchPlan(
+        file_path=Path("test.py"),
+        rel_path="test.py",
+        orig_text="a = 1\nb = 2\nc = 3\n",
+        is_new_file=False,
+    )
+    u_valid = {"file": "test.py", "start": 1, "end": 1}
+    u_colon = {"file": "test.py", "start": "2:0", "end": "2:5"}
+    plan.replacements.append((u_valid, "a = 99\n"))
+    plan.replacements.append((u_colon, "b = 100\n"))
+
+    diff = _render_file_patch_plan(plan, replace_clones=True)
+    assert "+a = 99" in diff
+    assert "b = 100" not in diff
+
 
 
 def test_generate_refactoring_patch_no_state_leakage_on_skipped_pair(tmp_path: Path) -> None:
@@ -7878,8 +7963,6 @@ def test_dual_tier_rejection_and_pragma_expanded_catch() -> None:
 
 def test_reporters_precompiled_physical_line_regex_notebook_cells(tmp_path: Path) -> None:
     """Verifies that extract_unit_source_code uses _PHYSICAL_LINE_RE and preserves form feeds."""
-    import json
-    from pydoppelgangerhunt.reporters import extract_unit_source_code
     from pydoppelgangerhunt.source_lines import _PHYSICAL_LINE_RE
 
     assert _PHYSICAL_LINE_RE.pattern == r"[^\r\n]*(?:\r\n|\r|\n|$)"
@@ -7896,3 +7979,1164 @@ def test_reporters_precompiled_physical_line_regex_notebook_cells(tmp_path: Path
     lines = extract_unit_source_code(unit, repo_root=str(tmp_path))
     assert lines == ["val = 1\n", "\x0cres = val + 2\n"]
     assert "\x0c" in lines[1]
+
+
+@requires_git
+def test_generate_refactoring_patch_sync_generator_with_outputs_and_return(tmp_path: Path) -> None:
+    """Verifies that refactoring sync generators with outputs generates return in helper and captures via yield from."""
+    src1 = (
+        "def produce_and_sum1(items: list[int]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    return total\n"
+    )
+    src2 = (
+        "def produce_and_sum2(items: list[int]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    return total\n"
+    )
+    f1 = tmp_path / "ps1.py"
+    f2 = tmp_path / "ps2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 2, "end": 5, "name": "produce_and_sum1:for", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 5, "name": "produce_and_sum2:for", "kind": "compound_block"}
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch
+    assert "return total" in patch
+    assert "return total, x" not in patch
+    assert "total = (yield from _shared_produce_and_sum1_produce_and_sum2(items))" in patch
+    assert "-> Generator[" in patch
+
+    # Semantic contract validation: execute original code, apply git patch, execute refactored code, and assert after == before
+    eval_code = (
+        "import ps1, ps2\n"
+        "for mod_name, fn in [('ps1', ps1.produce_and_sum1), ('ps2', ps2.produce_and_sum2)]:\n"
+        "    for test_items in [[], [42], [1, 2, 3, 4]]:\n"
+        "        gen = fn(test_items)\n"
+        "        yielded = []\n"
+        "        while True:\n"
+        "            try:\n"
+        "                yielded.append(next(gen))\n"
+        "            except StopIteration as e:\n"
+        "                ret = e.value\n"
+        "                break\n"
+        "        print(f'{mod_name}:{test_items}:{yielded}:{ret}')\n"
+    )
+    before_proc = subprocess.run(
+        [sys.executable, "-c", eval_code],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert before_proc.returncode == 0, f"Original execution failed: {before_proc.stderr}"
+
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", "commit", "-m", "init"],
+        cwd=str(tmp_path),
+        check=True,
+        capture_output=True,
+    )
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    after_proc = subprocess.run(
+        [sys.executable, "-c", eval_code],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert after_proc.returncode == 0, f"Refactored execution failed: {after_proc.stderr}"
+    assert after_proc.stdout == before_proc.stdout
+
+
+@requires_git
+def test_generate_refactoring_patch_sync_generator_renamed_downstream_outputs(tmp_path: Path) -> None:
+    """Verifies that generator clones with distinct renamed outputs map outputs 1-to-1 without returning unassigned variables."""
+    src1 = (
+        "def f1(items: list[int]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    return total\n"
+    )
+    src2 = (
+        "def f2(items: list[int]):\n"
+        "    count = 0\n"
+        "    for x in items:\n"
+        "        count += x\n"
+        "        yield x\n"
+        "    return count\n"
+    )
+    f1 = tmp_path / "ren1.py"
+    f2 = tmp_path / "ren2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    eval_script = (
+        "import ren1, ren2\n"
+        "for mod_name, fn in [('ren1', ren1.f1), ('ren2', ren2.f2)]:\n"
+        "    for items in [[], [42], [1, 2, 3, 4]]:\n"
+        "        gen = fn(items)\n"
+        "        yielded = []\n"
+        "        while True:\n"
+        "            try:\n"
+        "                yielded.append(next(gen))\n"
+        "            except StopIteration as e:\n"
+        "                ret = e.value\n"
+        "                break\n"
+        "        print(f'{mod_name}:{items}:{yielded}:{ret}')\n"
+    )
+    before_proc = subprocess.run(
+        [sys.executable, "-c", eval_script],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert before_proc.returncode == 0, f"Original execution failed: {before_proc.stderr}"
+
+    u1 = {"file": str(f1), "start": 2, "end": 5, "name": "f1:for", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 5, "name": "f2:for", "kind": "compound_block"}
+
+    patch = generate_refactoring_patch([(0.90, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch
+    assert "return total" in patch
+    assert "return total, count" not in patch
+    assert "return total, x" not in patch
+    assert "count = (yield from _shared_f1_f2(items))" in patch
+    assert "total = (yield from _shared_f1_f2(items))" in patch
+
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", "commit", "-m", "init"],
+        cwd=str(tmp_path),
+        check=True,
+        capture_output=True,
+    )
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    after_proc = subprocess.run(
+        [sys.executable, "-c", eval_script],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert after_proc.returncode == 0, f"Refactored execution failed: {after_proc.stderr}"
+    assert after_proc.stdout == before_proc.stdout
+
+
+def test_generate_refactoring_patch_sync_generator_unequal_output_counts_rejected(tmp_path: Path) -> None:
+    """Verifies that generator clones with unequal output counts and un-counterparted needed outputs are rejected."""
+    src1 = (
+        "def f1(items: list[int]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    return total\n"
+    )
+    src2 = (
+        "def f2(items: list[int]):\n"
+        "    count = 0\n"
+        "    status = 0\n"
+        "    for x in items:\n"
+        "        count += x\n"
+        "        status += 1\n"
+        "        yield x\n"
+        "    return count\n"
+    )
+    f1 = tmp_path / "u_out1.py"
+    f2 = tmp_path / "u_out2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 2, "end": 5, "name": "f1:for", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 7, "name": "f2:for", "kind": "compound_block"}
+
+    patch = generate_refactoring_patch([(0.90, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch == ""
+
+
+def test_generate_refactoring_patch_async_generator_with_return_rejected(tmp_path: Path) -> None:
+    """Verifies that clone pairs of async generators with return statements are rejected without creating invalid patches."""
+    src1 = (
+        "async def agen1(items: list[int]):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    return 42\n"
+    )
+    src2 = (
+        "async def agen2(items: list[int]):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    return 42\n"
+    )
+    f1 = tmp_path / "as1.py"
+    f2 = tmp_path / "as2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 1, "end": 4, "name": "agen1", "kind": "function"}
+    u2 = {"file": str(f2), "start": 1, "end": 4, "name": "agen2", "kind": "function"}
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch == ""
+
+
+def test_generate_refactoring_patch_async_generator_with_bare_return_accepted(tmp_path: Path) -> None:
+    """Verifies that clone pairs of async generators with bare return statements are accepted and refactored."""
+    src1 = (
+        "async def agen1(items: list[int]):\n"
+        "    for x in items:\n"
+        "        if x < 0:\n"
+        "            return\n"
+        "        yield x\n"
+    )
+    src2 = (
+        "async def agen2(items: list[int]):\n"
+        "    for x in items:\n"
+        "        if x < 0:\n"
+        "            return\n"
+        "        yield x\n"
+    )
+    f1 = tmp_path / "as1.py"
+    f2 = tmp_path / "as2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 1, "end": 5, "name": "agen1", "kind": "function"}
+    u2 = {"file": str(f2), "start": 1, "end": 5, "name": "agen2", "kind": "function"}
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch != ""
+    assert "async def _shared_agen1_agen2" in patch
+    assert "-> AsyncIterator[" in patch
+
+
+@requires_git
+def test_generate_refactoring_patch_sync_generator_classdef_downstream_execution(tmp_path: Path) -> None:
+    """Verifies that class bodies executing immediately after a generator unit retain the observed variable."""
+    src1 = (
+        "def f1(items: list[int]):\n"
+        "    x = 0\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    class C:\n"
+        "        value = x\n"
+        "    return C\n"
+    )
+    src2 = (
+        "def f2(items: list[int]):\n"
+        "    x = 0\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    class C:\n"
+        "        value = x\n"
+        "    return C\n"
+    )
+    f1 = tmp_path / "cg1.py"
+    f2 = tmp_path / "cg2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    eval_script = (
+        "import cg1, cg2\n"
+        "for mod_name, fn in [('cg1', cg1.f1), ('cg2', cg2.f2)]:\n"
+        "    for test_items in [[1, 2, 3], []]:\n"
+        "        gen = fn(test_items)\n"
+        "        while True:\n"
+        "            try:\n"
+        "                next(gen)\n"
+        "            except StopIteration as e:\n"
+        "                cls_res = e.value\n"
+        "                break\n"
+        "        print(f'{mod_name}:{cls_res.value}')\n"
+    )
+    before_proc = subprocess.run(
+        [sys.executable, "-c", eval_script],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert before_proc.returncode == 0, f"Original execution failed: {before_proc.stderr}"
+    assert before_proc.stdout.strip() == "cg1:3\ncg1:0\ncg2:3\ncg2:0"
+
+    u1 = {"file": str(f1), "start": 2, "end": 4, "name": "f1:for", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 4, "name": "f2:for", "kind": "compound_block"}
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch != ""
+    assert "return x" in patch
+    assert "x = (yield from _shared_f1_f2(items))" in patch
+
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", "commit", "-m", "init"],
+        cwd=str(tmp_path),
+        check=True,
+        capture_output=True,
+    )
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    after_proc = subprocess.run(
+        [sys.executable, "-c", eval_script],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert after_proc.returncode == 0, f"Refactored execution failed: {after_proc.stderr}"
+    assert after_proc.stdout == before_proc.stdout
+
+
+def test_generate_refactoring_patch_async_generator_with_downstream_outputs_rejected(tmp_path: Path) -> None:
+    """Verifies that async generator clones requiring downstream outputs are rejected to prevent lost bindings."""
+    src1 = (
+        "async def af1(items: list[int]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    return total\n"
+    )
+    src2 = (
+        "async def af2(items: list[int]):\n"
+        "    count = 0\n"
+        "    for x in items:\n"
+        "        count += x\n"
+        "        yield x\n"
+        "    return count\n"
+    )
+    f1 = tmp_path / "ag_out1.py"
+    f2 = tmp_path / "ag_out2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 2, "end": 5, "name": "af1:for", "kind": "compound_block", "is_async": True}
+    u2 = {"file": str(f2), "start": 2, "end": 5, "name": "af2:for", "kind": "compound_block", "is_async": True}
+
+    patch = generate_refactoring_patch([(0.90, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch == ""
+
+
+@requires_git
+def test_generate_refactoring_patch_sync_generator_closure_capture(tmp_path: Path) -> None:
+    """Verifies that closure captures downstream retain captured variables in generator return."""
+    src1 = (
+        "def f1(items: list[int]):\n"
+        "    x = 0\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    def get_x():\n"
+        "        return x\n"
+        "    return get_x\n"
+    )
+    src2 = (
+        "def f2(items: list[int]):\n"
+        "    x = 0\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    def get_x():\n"
+        "        return x\n"
+        "    return get_x\n"
+    )
+    f1 = tmp_path / "clo1.py"
+    f2 = tmp_path / "clo2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    eval_script = (
+        "import clo1, clo2\n"
+        "for mod_name, fn in [('clo1', clo1.f1), ('clo2', clo2.f2)]:\n"
+        "    for test_items in [[10, 20, 30], []]:\n"
+        "        gen = fn(test_items)\n"
+        "        while True:\n"
+        "            try:\n"
+        "                next(gen)\n"
+        "            except StopIteration as e:\n"
+        "                getter = e.value\n"
+        "                break\n"
+        "        print(f'{mod_name}:{getter()}')\n"
+    )
+    before_proc = subprocess.run(
+        [sys.executable, "-c", eval_script],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert before_proc.returncode == 0, f"Original execution failed: {before_proc.stderr}"
+    assert before_proc.stdout.strip() == "clo1:30\nclo1:0\nclo2:30\nclo2:0"
+
+    u1 = {"file": str(f1), "start": 2, "end": 4, "name": "f1:for", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 4, "name": "f2:for", "kind": "compound_block"}
+
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    assert patch != ""
+    assert "return x" in patch
+    assert "x = (yield from _shared_f1_f2(items))" in patch
+
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", "commit", "-m", "init"],
+        cwd=str(tmp_path),
+        check=True,
+        capture_output=True,
+    )
+
+    apply_proc = subprocess.run(
+        ["git", "apply"], input=patch, text=True, cwd=str(tmp_path), capture_output=True, check=False
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    after_proc = subprocess.run(
+        [sys.executable, "-c", eval_script],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert after_proc.returncode == 0, f"Refactored execution failed: {after_proc.stderr}"
+    assert after_proc.stdout == before_proc.stdout
+
+
+def test_generate_refactoring_patch_mixed_async_sync_rejected(tmp_path: Path) -> None:
+    """Verifies that pairing an async function or generator with a sync counterpart is rejected in synthesis and patch."""
+    src1 = (
+        "async def compute1(items: list[int]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "    return total\n"
+    )
+    src2 = (
+        "def compute2(items: list[int]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "    return total\n"
+    )
+    f1 = tmp_path / "as1.py"
+    f2 = tmp_path / "as2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 1, "end": 5, "name": "compute1", "kind": "function", "is_async": True}
+    u2 = {"file": str(f2), "start": 1, "end": 5, "name": "compute2", "kind": "function", "is_async": False}
+
+    # 1. Direct synthesis check: verify synthesis rejects mixed async parity
+    mixed_helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert mixed_helper == ""
+
+    # 2. Control check: matching sync parity synthesizes cleanly
+    sync_helper = synthesize_shared_helper_code(u2, u2, repo_root=str(tmp_path))
+    assert sync_helper != ""
+    assert "def _shared_compute2" in sync_helper
+
+    # 3. Patch generation check: verify patch generation rejects mixed async parity
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch == ""
+
+    # 4. Mixed async generator vs sync generator: verify rejection
+    src_ag = (
+        "async def ag1(items: list[int]):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+    )
+    src_sg = (
+        "def sg2(items: list[int]):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+    )
+    f_ag = tmp_path / "ag.py"
+    f_sg = tmp_path / "sg.py"
+    f_ag.write_text(src_ag, encoding="utf-8")
+    f_sg.write_text(src_sg, encoding="utf-8")
+    u_ag = {
+        "file": str(f_ag),
+        "start": 1,
+        "end": 3,
+        "name": "ag1",
+        "kind": "function",
+        "is_async": True,
+    }
+    u_sg = {
+        "file": str(f_sg),
+        "start": 1,
+        "end": 3,
+        "name": "sg2",
+        "kind": "function",
+        "is_async": False,
+    }
+
+    assert synthesize_shared_helper_code(u_ag, u_sg, repo_root=str(tmp_path)) == ""
+    assert generate_refactoring_patch(
+        [(1.0, u_ag, u_sg)], repo_root=str(tmp_path), replace_clones=True
+    ) == ""
+
+
+def test_generate_refactoring_patch_symmetric_global_filtering(tmp_path: Path) -> None:
+    """Verifies generate_refactoring_patch filters globals/nonlocals from u1/u2 outputs."""
+    code = (
+        "global_var = 0\n"
+        "def fn1():\n"
+        "    global global_var\n"
+        "    global_var = 100\n"
+        "    common_calc = 10\n"
+        "    local_var = common_calc + 1\n"
+        "def fn2():\n"
+        "    global global_var\n"
+        "    global_var = 200\n"
+        "    common_calc = 10\n"
+        "    local_var = common_calc + 1\n"
+    )
+    f = tmp_path / "mod.py"
+    f.write_text(code, encoding="utf-8")
+
+    u1 = {
+        "file": str(f),
+        "start": 2,
+        "end": 6,
+        "name": "fn1",
+        "kind": "function",
+        "outputs": ["local_var", "global_var"],
+    }
+    u2 = {
+        "file": str(f),
+        "start": 7,
+        "end": 11,
+        "name": "fn2",
+        "kind": "function",
+        "outputs": ["local_var", "global_var"],
+    }
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch != ""
+    assert "return local_var" in patch
+    assert "return local_var, global_var" not in patch
+
+
+def test_generate_refactoring_patch_sync_generator_indefinite_loop_var_rejected(
+    tmp_path: Path,
+) -> None:
+    """Verifies that generator clones where downstream reads depend on a loop variable that
+    is not definitely assigned inside the unit (initialization is outside the unit) are rejected."""
+    src1 = (
+        "def f1(items: list[int]):\n"
+        "    x = 0\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    class C:\n"
+        "        value = x\n"
+        "    return C\n"
+    )
+    src2 = (
+        "def f2(items: list[int]):\n"
+        "    x = 0\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "    class C:\n"
+        "        value = x\n"
+        "    return C\n"
+    )
+    f1 = tmp_path / "indef1.py"
+    f2 = tmp_path / "indef2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    # Unit starts at line 3 (for x in items: ...), so line 2 (x = 0) is outside the unit!
+    u1 = {"file": str(f1), "start": 3, "end": 4, "name": "f1:for", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 3, "end": 4, "name": "f2:for", "kind": "compound_block"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch == ""
+
+
+@requires_git
+def test_generate_refactoring_patch_sync_generator_with_union_yield_type(
+    tmp_path: Path,
+) -> None:
+    """Verifies that generator clones yielding union types inject Union into typing imports
+    and successfully apply via git."""
+    src1 = (
+        "def produce1(items: tuple[int, str]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        if isinstance(x, int):\n"
+        "            total += x\n"
+        "    yield from items\n"
+        "    return total\n"
+    )
+    src2 = (
+        "def produce2(items: tuple[int, str]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        if isinstance(x, int):\n"
+        "            total += x\n"
+        "    yield from items\n"
+        "    return total\n"
+    )
+    f1 = tmp_path / "u1.py"
+    f2 = tmp_path / "u2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 1, "end": 7, "name": "produce1", "kind": "function"}
+    u2 = {"file": str(f2), "start": 1, "end": 7, "name": "produce2", "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch != ""
+    assert "Union[int, str]" in patch
+    assert "from typing import" in patch
+    assert "Union" in patch
+    assert "Generator" in patch
+
+    eval_script = (
+        "import u1, u2\n"
+        "for mod_name, fn in [('u1', u1.produce1), ('u2', u2.produce2)]:\n"
+        "    gen = fn((10, 'hello'))\n"
+        "    yielded = []\n"
+        "    while True:\n"
+        "        try:\n"
+        "            yielded.append(next(gen))\n"
+        "        except StopIteration as e:\n"
+        "            ret = e.value\n"
+        "            break\n"
+        "    print(f'{mod_name}:{yielded}:{ret}')\n"
+    )
+    before_proc = subprocess.run(
+        [sys.executable, "-c", eval_script],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert before_proc.returncode == 0, f"Original execution failed: {before_proc.stderr}"
+
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(tmp_path), check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "ci@example.com"], cwd=str(tmp_path), check=True
+    )
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", "commit", "-m", "init"],
+        cwd=str(tmp_path),
+        check=True,
+        capture_output=True,
+    )
+
+    apply_proc = subprocess.run(
+        ["git", "apply"],
+        input=patch,
+        text=True,
+        cwd=str(tmp_path),
+        capture_output=True,
+        check=False,
+    )
+    assert apply_proc.returncode == 0, f"git apply failed: {apply_proc.stderr}"
+
+    after_proc = subprocess.run(
+        [sys.executable, "-c", eval_script],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert after_proc.returncode == 0, f"Refactored execution failed: {after_proc.stderr}"
+    assert after_proc.stdout == before_proc.stdout
+
+
+def test_generate_refactoring_patch_mismatched_subroutine_kinds_rejected(
+    tmp_path: Path,
+) -> None:
+    """Verifies that clone pairs where one unit is a block and the other is a
+    whole function are rejected."""
+    src1 = (
+        "def f1(items: list[int]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    return total\n"
+    )
+    src2 = (
+        "def f2(items: list[int]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    return total\n"
+    )
+    f1 = tmp_path / "m1.py"
+    f2 = tmp_path / "m2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    # u1 is a compound block ("f1:for"), u2 is a whole function ("f2")
+    u1 = {"file": str(f1), "start": 2, "end": 5, "name": "f1:for", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 1, "end": 6, "name": "f2", "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch == ""
+
+
+def test_generate_refactoring_patch_non_generator_mismatched_kinds_rejected(
+    tmp_path: Path,
+) -> None:
+    """Verifies that non-generator clone pairs where one unit is a block and the other is a
+    whole function are unconditionally rejected."""
+    src1 = (
+        "def f1(items: list[int]) -> int:\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "    return total\n"
+    )
+    src2 = (
+        "def f2(items: list[int]) -> int:\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "    return total\n"
+    )
+    f1 = tmp_path / "ng1.py"
+    f2 = tmp_path / "ng2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 2, "end": 4, "name": "f1:for", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 1, "end": 5, "name": "f2", "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch == ""
+
+
+def test_generate_refactoring_patch_closure_strictness_knob(tmp_path: Path) -> None:
+    """Verifies closure_strictness knob controls pre-unit closure isolation in patch generation."""
+    src1 = (
+        "def g1(items: list[int]):\n"
+        "    cb = lambda: extra\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "        extra = x\n"
+        "    return 0\n"
+    )
+    src2 = (
+        "def g2(items: list[int]):\n"
+        "    for y in items:\n"
+        "        yield y\n"
+        "        extra = y\n"
+        "    return 0\n"
+    )
+    f1 = tmp_path / "g1.py"
+    f2 = tmp_path / "g2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 3, "end": 5, "name": "g1:block", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 4, "name": "g2:block", "kind": "compound_block"}
+
+    # 1. Default strict mode: fails closed because cb = lambda: extra captures extra
+    # before extra is definitely assigned prior to unit start
+    patch_strict = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        closure_strictness="strict",
+    )
+    assert patch_strict == ""
+
+    # 2. Lenient mode: bypasses pre-unit closure scan, successfully synthesizing patch
+    patch_lenient = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        closure_strictness="lenient",
+    )
+    assert patch_lenient != ""
+    assert "yield from" in patch_lenient
+
+    # 3. Direct boolean flag skip_pre_unit_closures=True
+    patch_bool = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        skip_pre_unit_closures=True,
+    )
+    assert patch_bool != ""
+
+
+@pytest.mark.parametrize(
+    ("mode_arg", "skip_flag", "expected"),
+    [
+        ("lenient", None, ("lenient", True)),
+        ("strict", None, ("strict", False)),
+        ("fast", None, ("lenient", True)),
+        ("skip", None, ("lenient", True)),
+        ("fail_closed", None, ("strict", False)),
+        (None, True, ("lenient", True)),
+        (None, False, ("strict", False)),
+        ("strict", True, ("strict", False)),
+        ("lenient", False, ("lenient", True)),
+        ("unknown_mode", True, ("lenient", True)),
+        ("unknown_mode", False, ("strict", False)),
+    ],
+)
+def test_resolve_closure_strictness_mode_aliases(
+    mode_arg: Optional[str],
+    skip_flag: Optional[bool],
+    expected: Tuple[str, bool],
+) -> None:
+    """Verifies resolve_closure_strictness_mode maps all aliases and honors precedence."""
+    assert resolve_closure_strictness_mode(
+        mode_arg,
+        skip_pre_unit_closures=skip_flag if skip_flag is not None else False,
+    ) == expected
+
+
+def test_generate_refactoring_patch_subroutine_unpaired_outputs_rejected(tmp_path: Path) -> None:
+    """Verifies that non-generator subroutines with unpaired outputs fail closed safely."""
+    f1 = tmp_path / "f1.py"
+    f2 = tmp_path / "f2.py"
+    f1.write_text("def run1():\n    a = 1\n    return a\n", encoding="utf-8")
+    f2.write_text("def run2():\n    b = 1\n    c = 2\n    return b + c\n", encoding="utf-8")
+
+    u1 = {
+        "file": str(f1),
+        "start": 2,
+        "end": 2,
+        "name": "run1:block",
+        "kind": "compound_block",
+        "outputs": ["a", "a"],
+    }
+    u2 = {
+        "file": str(f2),
+        "start": 2,
+        "end": 3,
+        "name": "run2:block",
+        "kind": "compound_block",
+        "outputs": ["b", "c"],
+    }
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch == ""
+
+
+def test_generate_refactoring_patch_replace_clones_false_emits_helper_with_differing_outputs(
+    tmp_path: Path,
+) -> None:
+    """Verifies that suggestion mode (replace_clones=False) emits shared helper
+    despite output difference."""
+    f = tmp_path / "single.py"
+    f.write_text(
+        "def run1():\n"
+        "    a = 1\n"
+        "    return a\n"
+        "\n"
+        "def run2():\n"
+        "    b = 1\n"
+        "    c = 2\n"
+        "    return b + c\n",
+        encoding="utf-8",
+    )
+    u1 = {
+        "file": str(f),
+        "start": 2,
+        "end": 2,
+        "name": "run1:block",
+        "kind": "compound_block",
+    }
+    u2 = {
+        "file": str(f),
+        "start": 6,
+        "end": 7,
+        "name": "run2:block",
+        "kind": "compound_block",
+    }
+
+    # When replacing clones, arity mismatch skips delegation
+    patch_replace = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch_replace == ""
+
+    # When replace_clones=False, helper-only suggestion mode emits the shared helper definition
+    patch_preview = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=False
+    )
+    assert "def _shared_run1_run2" in patch_preview
+
+
+def test_generator_subroutine_enclosing_try_finally_read_rejected(tmp_path: Path) -> None:
+    """Verifies that generator subroutine extraction is rejected when the unit is lexically
+    inside a try block whose finally reads a needed output, guarding against abnormal exit loss."""
+    src1 = (
+        "def g1(items):\n"
+        "    try:\n"
+        "        total = 0\n"
+        "        for x in items:\n"
+        "            yield x\n"
+        "            total += x\n"
+        "    finally:\n"
+        "        print(total)\n"
+    )
+    src2 = (
+        "def g2(items):\n"
+        "    try:\n"
+        "        total = 0\n"
+        "        for y in items:\n"
+        "            yield y\n"
+        "            total += y\n"
+        "    finally:\n"
+        "        print(total)\n"
+    )
+    f1 = tmp_path / "g1.py"
+    f2 = tmp_path / "g2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 3, "end": 6, "name": "g1:block", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 3, "end": 6, "name": "g2:block", "kind": "compound_block"}
+
+    # Should be rejected because total is needed and read in enclosing try cleanup
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch == ""
+
+
+def test_generator_subroutine_enclosing_try_swallowing_handler_post_try_read_rejected(
+    tmp_path: Path,
+) -> None:
+    """Verifies that generator subroutine extraction is rejected when the unit is lexically
+    inside a try block whose handler can fall through and a needed output is read post-try."""
+    src1 = (
+        "def g1(items):\n"
+        "    try:\n"
+        "        total = 0\n"
+        "        for x in items:\n"
+        "            yield x\n"
+        "            total += x\n"
+        "    except GeneratorExit:\n"
+        "        pass\n"
+        "    print(total)\n"
+    )
+    src2 = (
+        "def g2(items):\n"
+        "    try:\n"
+        "        total = 0\n"
+        "        for y in items:\n"
+        "            yield y\n"
+        "            total += y\n"
+        "    except GeneratorExit:\n"
+        "        pass\n"
+        "    print(total)\n"
+    )
+    f1 = tmp_path / "g1_swallow.py"
+    f2 = tmp_path / "g2_swallow.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 3, "end": 6, "name": "g1:block", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 3, "end": 6, "name": "g2:block", "kind": "compound_block"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch == ""
+
+
+def test_pre_unit_generator_expression_lazy_read_captured(tmp_path: Path) -> None:
+    """Verifies that pre-unit lazy generator expressions capturing unit variables fail closed."""
+    src1 = (
+        "def g1(items: list[int]):\n"
+        "    g = (extra for _ in items)\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "        extra = x\n"
+        "    return 0\n"
+    )
+    src2 = (
+        "def g2(items: list[int]):\n"
+        "    for y in items:\n"
+        "        yield y\n"
+        "        extra = y\n"
+        "    return 0\n"
+    )
+    f1 = tmp_path / "g1.py"
+    f2 = tmp_path / "g2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 3, "end": 5, "name": "g1:block", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 4, "name": "g2:block", "kind": "compound_block"}
+
+    # In strict mode (default), lazy genexp capturing 'extra' causes rejection
+    patch_strict = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        closure_strictness="strict",
+    )
+    assert patch_strict == ""
+
+    # In lenient mode, pre-unit closures are bypassed
+    patch_lenient = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        closure_strictness="lenient",
+    )
+    assert patch_lenient != ""
+
+
+def test_pre_unit_class_generator_expression_lazy_read_captured(tmp_path: Path) -> None:
+    """Verifies that pre-unit class-body generator expressions capturing unit
+    variables fail closed."""
+    src1 = (
+        "def g1(items: list[int]):\n"
+        "    class C:\n"
+        "        gen = (extra for _ in items)\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "        extra = x\n"
+        "    return 0\n"
+    )
+    src2 = (
+        "def g2(items: list[int]):\n"
+        "    for y in items:\n"
+        "        yield y\n"
+        "        extra = y\n"
+        "    return 0\n"
+    )
+    f1 = tmp_path / "g1.py"
+    f2 = tmp_path / "g2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 4, "end": 6, "name": "g1:block", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 4, "name": "g2:block", "kind": "compound_block"}
+
+    # In strict mode (default), class genexp capturing 'extra' causes rejection
+    patch_strict = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        closure_strictness="strict",
+    )
+    assert patch_strict == ""
+
+    # In lenient mode, pre-unit closures are bypassed
+    patch_lenient = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+        closure_strictness="lenient",
+    )
+    assert patch_lenient != ""
+
+
+
+def test_load_unit_file_text_truncated_at_start_line_fails_closed() -> None:
+    """Verifies that _load_unit_file_text returns None when source_lines has ambiguous length."""
+    unit = {
+        "file": "dummy.py",
+        "start": 1,
+        "end": 3,
+        "source_lines": ["x = 1\n", "y = 2\n", "z = 3\n"],
+    }
+    # source_lines_is_sliced is None and len(source_lines) == (end - start + 1) -> fails closed
+    assert _load_unit_file_text(unit) is None
+
+    # When explicitly marked not sliced, it returns the content
+    unit_full = dict(unit, source_lines_is_sliced=False)
+    assert _load_unit_file_text(unit_full) == "x = 1\ny = 2\nz = 3\n"
+
+
+def test_generate_refactoring_patch_skips_mismatched_subroutine_kinds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies that clone pairs with mismatched subroutine kinds immediately skip."""
+    import logging  # pylint: disable=import-outside-toplevel
+
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text("def fn():\n    x = 42\n    y = x + 1\n", encoding="utf-8")
+    f2.write_text("def fn2():\n    x = 42\n    y = x + 1\n", encoding="utf-8")
+
+    # u1 is a function (not a subroutine), u2 is a subroutine compound_block
+    u1 = {"file": str(f1), "start": 1, "end": 3, "name": "fn", "kind": "function"}
+    u2 = {"file": str(f2), "start": 2, "end": 3, "name": "fn2:sub", "kind": "compound_block"}
+
+    with caplog.at_level(logging.DEBUG, logger="pydoppelgangerhunt.fixer.patch"):
+        with mock.patch(
+            "pydoppelgangerhunt.fixer.patch.synthesize_shared_helper_code"
+        ) as mock_synth, mock.patch(
+            "pydoppelgangerhunt.fixer.patch.inspect_single_unit_scope"
+        ) as mock_scope:
+            patch = generate_refactoring_patch(
+                [(1.0, u1, u2)],
+                repo_root=str(tmp_path),
+                replace_clones=True,
+            )
+            assert patch == ""
+            # Early exit: hoisted check prevents running scope analysis or synthesis
+            mock_synth.assert_not_called()
+            mock_scope.assert_not_called()
+
+    assert any(
+        "mismatched subroutine kinds (is_sub1=False, is_sub2=True)" in r.message
+        for r in caplog.records
+    )
+

@@ -13,6 +13,9 @@ from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, 
 from pydoppelgangerhunt.source_lines import (
     count_physical_newlines,
     detect_line_ending,
+    is_sliced_unit_source_lines,
+    parse_unit_coord,
+    resolve_safe_unit_file_path,
     split_source_lines,
 )
 
@@ -31,9 +34,14 @@ __all__ = [
     "count_physical_newlines",
     "detect_line_ending",
     "extract_unit_comments_and_pragmas",
+    "find_enclosing_function_is_async",
+    "is_sliced_unit_source_lines",
+    "is_subroutine_unit",
     "is_valid_unit_coordinates",
     "parse_unit_coord",
     "replace_unit_in_source",
+    "resolve_safe_unit_file_path",
+    "resolve_unit_declared_outputs",
     "resolve_unit_replacement",
     "slice_source_by_token_range",
     "split_source_lines",
@@ -41,40 +49,159 @@ __all__ = [
 
 UnitDict = Dict[str, Any]
 
-
-def parse_unit_coord(unit: UnitDict, key: str, default: int = 1) -> int:
-    """Extracts and parses an integer coordinate from a unit dictionary."""
-    val = unit.get(key)
-    return int(val if val is not None else default)
-
-
 _parse_unit_coord = parse_unit_coord
+_resolve_safe_unit_file_path = resolve_safe_unit_file_path
 
 
-def is_valid_unit_coordinates(u: Any) -> bool:
-    """Verifies that an AST unit dictionary has valid integer coordinates."""
+def is_valid_unit_coordinates(u: Any, strict: bool = False) -> bool:
+    """Verifies that an AST unit dictionary has valid integer coordinates.
+
+    Note (Behavior Change): When strict=False, a positive start coordinate
+    (start > 0) is required, and inverted coordinates (end < start) are
+    rejected. In strict mode (for code refactoring and patching), both start
+    and end are required and must parse strictly to positive integers (rejecting
+    floats, colons, and blank strings) with end >= start. End, start_col, and
+    end_col must also parse strictly if present, with end_col >= start_col if on
+    the same line.
+    """
     if not isinstance(u, dict):
         return False
+    if "start" not in u or u.get("start") is None:
+        return False
+    if strict and ("end" not in u or u.get("end") is None):
+        return False
     try:
-        s_val = u.get("start")
-        if s_val is not None:
-            int(s_val)
-        e_val = u.get("end")
-        if e_val is not None:
-            int(e_val)
-        sc_val = u.get("start_col")
-        if sc_val is not None:
-            int(sc_val)
-        ec_val = u.get("end_col")
-        if ec_val is not None:
-            int(ec_val)
+        start_val = parse_unit_coord(u, "start", default=None, strict=strict)
+        if start_val is None or start_val <= 0:
+            return False
+
+        end_val: Optional[int] = None
+        if "end" in u and u.get("end") is not None:
+            end_val = parse_unit_coord(u, "end", default=None, strict=strict)
+            if end_val is None or end_val <= 0 or end_val < start_val:
+                return False
+        elif strict:
+            return False
+
+        start_col: Optional[int] = None
+        end_col: Optional[int] = None
+        if "start_col" in u and u.get("start_col") is not None:
+            start_col = parse_unit_coord(u, "start_col", default=None, strict=strict)
+            if start_col is None or start_col < 0:
+                return False
+        if "end_col" in u and u.get("end_col") is not None:
+            end_col = parse_unit_coord(u, "end_col", default=None, strict=strict)
+            if end_col is None or end_col < 0:
+                return False
+
+        if (
+            end_val is not None
+            and start_col is not None
+            and end_col is not None
+            and start_val == end_val
+            and end_col < start_col
+        ):
+            return False
+
         return True
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, KeyError):
         return False
 
 
 _is_valid_unit_coordinates = is_valid_unit_coordinates
 
+_SUBROUTINE_KINDS: frozenset[str] = frozenset(
+    {"compound_block", "sliding_window", "clause_branch"}
+)
+
+
+def is_subroutine_unit(unit: Any, source_text: Optional[str] = None) -> bool:
+    """Checks whether an AST code unit is a subroutine block rather than a whole function.
+
+    Classification Rules:
+    1. Explicit 'is_subroutine' boolean in unit takes precedence if present.
+    2. Known subroutine kinds ('compound_block', 'sliding_window', 'clause_branch') return True.
+    3. Whole callable kinds ('function', 'method', 'async_function') return False.
+    4. Structural inspection: If source_text is available, checks whether the unit's
+       line bounds strictly reside inside an enclosing function (True) or cover it (False).
+    5. All other kinds or unspecified kinds without source return False.
+    """
+    if not isinstance(unit, dict):
+        return False
+    if "is_subroutine" in unit and unit.get("is_subroutine") is not None:
+        return bool(unit["is_subroutine"])
+    kind = str(unit.get("kind") or "")
+    if kind in _SUBROUTINE_KINDS:
+        return True
+    if kind in ("function", "method", "async_function"):
+        return False
+
+    src = source_text or unit.get("source_text") or unit.get("file_source")
+    if isinstance(src, (list, tuple)):
+        src = "".join(src)
+    if src and isinstance(src, str):
+        try:
+            u_start = _parse_unit_coord(unit, "start", default=0)
+            u_end = _parse_unit_coord(unit, "end", default=u_start)
+            if 0 < u_start <= u_end:
+                res = _find_innermost_enclosing_node(
+                    src, unit, (ast.FunctionDef, ast.AsyncFunctionDef)
+                )
+                if res is not None:
+                    matched_node, f_start, f_end = res
+                    fn_def_start = getattr(matched_node, "lineno", f_start)
+                    if u_start in (fn_def_start, f_start) and u_end == f_end:
+                        return False
+                    return True
+        except (ValueError, TypeError):
+            pass
+
+    return False
+
+
+def resolve_unit_declared_outputs(unit: Dict[str, Any]) -> Any:
+    """Extracts declared unit outputs, preferring precomputed_outputs over outputs."""
+    if "precomputed_outputs" in unit and unit["precomputed_outputs"] is not None:
+        return unit["precomputed_outputs"]
+    if "outputs" in unit and unit["outputs"] is not None:
+        return unit["outputs"]
+    return None
+
+
+def _load_unit_file_text(
+    unit: Dict[str, Any],
+    repo_root: Optional[str] = None,
+) -> Optional[str]:
+    """Reads full source text from memory or disk for AST inspection and read analysis."""
+    source_text = unit.get("source_text")
+    if source_text is None:
+        source_text = unit.get("file_source")
+    if source_text is not None:
+        return str(source_text)
+
+    is_sliced = unit.get("source_lines_is_sliced")
+    if is_sliced is not True:
+        unit_lines = unit.get("source_lines")
+        if unit_lines and isinstance(unit_lines, (list, tuple)):
+            if not is_sliced_unit_source_lines(unit, unit_lines):
+                return "".join(
+                    ln if ln.endswith(("\n", "\r")) else ln + "\n"
+                    for ln in unit_lines
+                )
+
+    # Disk fallback: strictly only .py files within repo_root or CWD are accepted.
+    # Notebooks (.ipynb) and out-of-root files fail closed and return None.
+    resolved_file = resolve_safe_unit_file_path(
+        unit, repo_root=repo_root, allowed_suffixes=(".py",)
+    )
+    if resolved_file is not None:
+        try:
+            with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except OSError:
+            pass
+
+    return None
 
 
 def _is_docstring_node(node: Optional[ast.AST]) -> bool:
@@ -91,7 +218,7 @@ def _extract_docstring_end_line(tree: ast.AST) -> int:
     """Extracts the end line number of a module- or function-level docstring if present."""
     body = getattr(tree, "body", [])
     if body and _is_docstring_node(body[0]):
-        return int(getattr(body[0], "end_lineno", getattr(body[0], "lineno", 0)))
+        return int(getattr(body[0], "end_lineno", None) or getattr(body[0], "lineno", 0) or 0)
     return 0
 
 
@@ -185,15 +312,17 @@ def _find_module_helper_insertion_index(lines: List[str]) -> int:
         if first_def_line is not None and getattr(node, "lineno", 0) >= first_def_line:
             break
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            end_l = getattr(node, "end_lineno", node.lineno)
+            end_l = int(getattr(node, "end_lineno", None) or getattr(node, "lineno", 0) or 0)
             last_import_line = max(last_import_line, end_l)
-        elif isinstance(
-            node,
-            (ast.Try, getattr(ast, "TryStar", ast.Try), ast.If, ast.With, ast.AsyncWith),
+        elif (
+            isinstance(node, (ast.Try, ast.If, ast.With, ast.AsyncWith))
+            or type(node).__name__ == "TryStar"
         ):
             for sub in ast.walk(node):
                 if isinstance(sub, (ast.Import, ast.ImportFrom)):
-                    end_l = getattr(node, "end_lineno", node.lineno)
+                    end_l = int(
+                        getattr(node, "end_lineno", None) or getattr(node, "lineno", 0) or 0
+                    )
                     last_import_line = max(last_import_line, end_l)
                     break
 
@@ -207,8 +336,14 @@ def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]
     """Slices source lines to the exact start_col and end_col offsets of the unit."""
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
         return lines
-    s_col = _parse_unit_coord(unit, "start_col", default=0)
-    e_col = unit.get("end_col")
+    try:
+        s_col = _parse_unit_coord(unit, "start_col", default=0)
+    except (ValueError, TypeError):
+        s_col = 0
+    try:
+        e_col = _parse_unit_coord(unit, "end_col", default=None)
+    except (ValueError, TypeError):
+        e_col = None
     res = list(lines)
     if len(res) == 1:
         res[0] = res[0][s_col:e_col] if (e_col is None or e_col > s_col) else res[0][s_col:]
@@ -237,9 +372,9 @@ def _get_module_imported_names(
         elif isinstance(stmt, ast.ImportFrom):
             for alias in stmt.names:
                 imported.add(alias.asname or alias.name)
-        elif include_conditional and isinstance(
-            stmt,
-            (ast.If, ast.Try, getattr(ast, "TryStar", ast.Try), ast.With, ast.AsyncWith),
+        elif include_conditional and (
+            isinstance(stmt, (ast.If, ast.Try, ast.With, ast.AsyncWith))
+            or type(stmt).__name__ == "TryStar"
         ):
             for sub in ast.walk(stmt):
                 if isinstance(sub, ast.Import):
@@ -291,7 +426,11 @@ def _insert_imports_into_module(
         doc_end = _extract_module_docstring_end_line(tree)
         future_end = max(
             (
-                getattr(node, "end_lineno", node.lineno)
+                int(
+                    getattr(node, "end_lineno", None)
+                    or getattr(node, "lineno", 0)
+                    or 0
+                )
                 for node in tree.body
                 if isinstance(node, ast.ImportFrom) and node.module == "__future__"
             ),
@@ -651,12 +790,12 @@ def compute_unit_spans(
     raw_ec = unit.get("end_col")
 
     try:
-        start_col = int(raw_sc) if raw_sc is not None else None
+        start_col = _parse_unit_coord(unit, "start_col", default=None)
     except (ValueError, TypeError) as err:
         raise ValueError(f"Malformed unit: invalid 'start_col' offset: {raw_sc!r}") from err
 
     try:
-        end_col = int(raw_ec) if raw_ec is not None else None
+        end_col = _parse_unit_coord(unit, "end_col", default=None)
     except (ValueError, TypeError) as err:
         raise ValueError(f"Malformed unit: invalid 'end_col' offset: {raw_ec!r}") from err
 
@@ -1033,3 +1172,74 @@ def _find_sig_colon(line: str) -> int:
     if colon_idx != -1:
         return colon_idx
     return line.rfind(":")
+
+
+def _find_innermost_enclosing_node(
+    source_text: str,
+    unit: Dict[str, Any],
+    node_types: Tuple[type, ...],
+    tree: Optional[ast.AST] = None,
+) -> Optional[Tuple[ast.AST, int, int]]:
+    """Locates the innermost AST node of matching types enclosing the given unit."""
+    if not isinstance(unit, dict):
+        return None
+    try:
+        u_start = parse_unit_coord(unit, "start", default=0)
+        u_end = parse_unit_coord(unit, "end", default=u_start)
+    except (ValueError, TypeError):
+        return None
+    if u_start <= 0 or u_end <= 0 or u_start > u_end:
+        return None
+
+    if isinstance(source_text, (list, tuple)):
+        source_text = "".join(source_text)
+    elif not isinstance(source_text, str):
+        return None
+
+    if tree is None:
+        if not source_text.strip():
+            return None
+        try:
+            tree = ast.parse(source_text)
+        except (SyntaxError, ValueError, UnicodeDecodeError):
+            return None
+
+    candidates: List[Tuple[int, ast.AST, int, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, node_types):
+            n_start = getattr(node, "lineno", 0) or 0
+            n_end = getattr(node, "end_lineno", None) or n_start
+            decorators = getattr(node, "decorator_list", [])
+            dec_start = (
+                min((getattr(d, "lineno", None) or n_start) for d in decorators)
+                if decorators
+                else n_start
+            )
+            earliest_start = min(dec_start, n_start)
+            if earliest_start <= u_start <= u_end <= n_end:
+                candidates.append((n_end - earliest_start, node, earliest_start, n_end))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[0], -item[2]))
+    _, matched_node, n_start, n_end = candidates[0]
+    return matched_node, n_start, n_end
+
+
+def find_enclosing_function_is_async(
+    source_text: str,
+    start_line: int,
+    end_line: int,
+    tree: Optional[ast.AST] = None,
+) -> bool:
+    """Checks whether the given line range is enclosed within an AsyncFunctionDef."""
+    res = _find_innermost_enclosing_node(
+        source_text,
+        {"start": start_line, "end": end_line},
+        (ast.FunctionDef, ast.AsyncFunctionDef),
+        tree=tree,
+    )
+    if res is None:
+        return False
+    return isinstance(res[0], ast.AsyncFunctionDef)

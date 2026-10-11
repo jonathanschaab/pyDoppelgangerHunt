@@ -176,11 +176,19 @@ def test_fixer_control_flow_and_side_effect_safety(tmp_path: Path) -> None:
     file_target.write_text(
         '"""Target module docstring."""\n\n'
         'from __future__ import annotations\n\n'
-        'def run_step(a: int, b: int) -> int:\n'
-        '    return a + b\n',
+        'def run_step(a: int, b: int) -> tuple[int, int]:\n'
+        '    a += b\n'
+        '    b += 1\n'
+        '    return a, b\n',
         encoding="utf-8",
     )
-    u_patch1 = {"file": str(file_target), "start": 5, "end": 6, "name": "run_step"}
+    u_patch1 = {
+        "file": str(file_target),
+        "start": 6,
+        "end": 7,
+        "name": "run_step:stmts",
+        "kind": "sliding_window",
+    }
     patch = generate_refactoring_patch([(0.95, u_mut, u_patch1)], repo_root=str(tmp_path))
     assert "+from typing import" in patch
     assert "Tuple" in patch
@@ -1501,3 +1509,143 @@ def test_scope_inspection_custom_receiver_attributes(tmp_path: Path) -> None:
     assert "klass.count" in s_cls["attrs_read"]
     assert "klass.count" in s_cls["class_attrs"]
     assert s_cls["inputs"][0] == "klass"
+
+
+def test_dispatch_analyze_unit_variable_scope_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that dispatch functions dynamically route to mock patches on fixer package."""
+    import pydoppelgangerhunt.fixer as fixer_mod
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        dispatch_analyze_unit_variable_scope,
+        dispatch_inspect_single_unit_scope,
+    )
+
+    dummy_unit = {"file": "mod.py", "source_text": "x = 1\n", "start": 1, "end": 1}
+
+    # 1. Unpatched execution routes directly
+    res_analyze = dispatch_analyze_unit_variable_scope(dummy_unit)
+    res_inspect = dispatch_inspect_single_unit_scope(dummy_unit)
+    assert res_analyze["locals"] == ["x"]
+    assert res_inspect["stores"] == ["x"]
+
+    # 2. Mocked execution on fixer package is honored
+    mock_sentinel = {"mocked": True, "outputs": ["mock_out"]}
+    monkeypatch.setattr(
+        fixer_mod, "analyze_unit_variable_scope", lambda *args, **kwargs: mock_sentinel
+    )
+    assert dispatch_analyze_unit_variable_scope(dummy_unit) is mock_sentinel
+
+    mock_inspect_sentinel = {"mocked_inspect": True, "stores": ["mock_store"]}
+    monkeypatch.setattr(
+        fixer_mod, "inspect_single_unit_scope", lambda *args, **kwargs: mock_inspect_sentinel
+    )
+    assert dispatch_inspect_single_unit_scope(dummy_unit) is mock_inspect_sentinel
+
+
+def test_inspect_unit_scope_deterministic_set_outputs() -> None:
+    """Verifies that analyze_unit_variable_scope rejects multi-item sets to prevent
+    unpositional output pairing, while single-item sets are supported."""
+    code = (
+        "def worker():\n"
+        "    for i in range(10):\n"
+        "        z = i\n"
+        "        a = i * 2\n"
+        "        yield a\n"
+    )
+    tree = ast.parse(code)
+    u_sub = {
+        "file": "test_mod.py",
+        "start": 2,
+        "end": 5,
+        "kind": "compound_block",
+        "outputs": {"z", "a", "m", "b"},
+        "source_text": code,
+    }
+    scope = analyze_unit_variable_scope(u_sub, tree1=tree)
+    # Multi-item set outputs fail closed to empty list and mark outputs_ambiguous
+    assert scope["outputs"] == []
+    assert scope.get("outputs_ambiguous") is True
+
+    u_sub2 = {
+        "file": "test_mod.py",
+        "start": 2,
+        "end": 5,
+        "kind": "compound_block",
+        "precomputed_outputs": {"z", "a", "m", "b"},
+        "source_text": code,
+    }
+    scope2 = analyze_unit_variable_scope(u_sub2, tree1=tree)
+    assert scope2["outputs"] == []
+    assert scope2.get("outputs_ambiguous") is True
+
+    u_sub_single = {
+        "file": "test_mod.py",
+        "start": 2,
+        "end": 5,
+        "kind": "compound_block",
+        "outputs": {"single_var"},
+        "source_text": code,
+    }
+    scope_single = analyze_unit_variable_scope(u_sub_single, tree1=tree)
+    assert scope_single["outputs"] == ["single_var"]
+    assert scope_single.get("outputs_ambiguous") is False
+
+
+def test_nested_generator_yield_assignment_does_not_mark_outer_unit() -> None:
+    """Verifies that an inner/nested generator containing 'x = yield' does not mark
+    has_yield_assignment on the outer unit."""
+    code = (
+        "def outer():\n"
+        "    def inner():\n"
+        "        val = yield 42\n"
+        "        return val\n"
+        "    return inner\n"
+    )
+    tree = ast.parse(code)
+    unit = {
+        "file": "test_mod.py",
+        "start": 1,
+        "end": 5,
+        "kind": "function",
+        "name": "outer",
+        "source_text": code,
+    }
+    scope = analyze_unit_variable_scope(unit, tree1=tree)
+    assert scope.get("has_yield_assignment") is False
+    assert scope.get("has_yield") is False
+
+    # Also test that 'yield from' return assignment does not trigger has_yield_assignment
+    code_sub = (
+        "def run():\n"
+        "    def sub_gen():\n"
+        "        received = yield 10\n"
+        "        return received\n"
+        "    y = yield from sub_gen()\n"
+    )
+    tree_sub = ast.parse(code_sub)
+    u_sub = {
+        "file": "test_mod.py",
+        "start": 2,
+        "end": 5,
+        "kind": "compound_block",
+        "source_text": code_sub,
+    }
+    scope_sub = analyze_unit_variable_scope(u_sub, tree1=tree_sub)
+    assert scope_sub.get("has_yield_assignment") is False
+
+
+def test_generator_expression_yield_does_not_set_yield_assignment() -> None:
+    """Verifies that yields inside GeneratorExp do not trigger has_yield_assignment."""
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        _ScopeVisitor,
+    )
+
+    visitor = _ScopeVisitor()
+    tree = ast.parse("g = ((yield 42) for i in [])\nx = yield 100\n")
+    visitor.visit(tree.body[0])
+    assert visitor.has_yield_assignment is False
+
+    visitor_assign = _ScopeVisitor()
+    visitor_assign.visit(tree.body[1])
+    assert visitor_assign.has_yield_assignment is True
+
+

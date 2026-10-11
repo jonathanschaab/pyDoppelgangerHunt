@@ -2,17 +2,185 @@
 
 from __future__ import annotations
 
+import logging
+import math
+from pathlib import Path
 import re
-from typing import Any, Iterable, Iterator, List, Optional, Sequence, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union, overload
+
+from pydoppelgangerhunt.config import normalize_path_string
+
+logger = logging.getLogger(__name__)
 
 _PHYSICAL_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
 
 __all__ = [
-    "_PHYSICAL_LINE_RE",
     "count_physical_newlines",
     "detect_line_ending",
+    "is_sliced_unit_source_lines",
+    "parse_unit_coord",
+    "resolve_safe_unit_file_path",
+    "resolve_unit_line_bounds",
     "split_source_lines",
 ]
+
+
+@overload
+def parse_unit_coord(unit: Dict[str, Any], key: str, *, strict: bool = ...) -> int:
+    ...
+
+
+@overload
+def parse_unit_coord(
+    unit: Dict[str, Any], key: str, default: int, *, strict: bool = ...
+) -> int:
+    ...
+
+
+@overload
+def parse_unit_coord(
+    unit: Dict[str, Any], key: str, default: None, *, strict: bool = ...
+) -> Optional[int]:
+    ...
+
+
+@overload
+def parse_unit_coord(
+    unit: Dict[str, Any], key: str, default: Optional[int], *, strict: bool = ...
+) -> Optional[int]:
+    ...
+
+
+def parse_unit_coord(
+    unit: Dict[str, Any],
+    key: str,
+    default: Optional[int] = 1,
+    *,
+    strict: bool = False,
+) -> Optional[int]:
+    """Extracts and parses an integer coordinate from a unit dictionary.
+
+    Safely handles integers, numeric strings, and colon-delimited coordinate strings
+    (e.g., '12:0' or '8:0'). For colon-formatted coordinates emitted by external linters
+    or diagnostics (where the suffix denotes a sub-column or character index), the primary
+    leading coordinate prefix before the colon is parsed as the integer value.
+    In strict mode (strict=True), colon-formatted coordinates, empty/whitespace strings,
+    and floating point values are strictly rejected with ValueError.
+    If the coordinate value is missing or empty (in non-strict mode), falls back to default.
+    Raises ValueError for non-numeric strings or unconvertible/overflow values.
+    """
+    val = unit.get(key)
+    if val is None:
+        return default
+    if strict:
+        if isinstance(val, str):
+            if ":" in val:
+                raise ValueError(
+                    f"Invalid coordinate {val!r}: colon format not allowed in strict mode"
+                )
+            stripped = val.strip()
+            if not stripped:
+                raise ValueError(
+                    f"Invalid coordinate {val!r}: blank coordinate not allowed in strict mode"
+                )
+            if stripped.startswith(("+", "-")):
+                raise ValueError(
+                    f"Invalid coordinate {val!r}: signed prefix not allowed in strict mode"
+                )
+            try:
+                return int(val)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid coordinate {val!r}: cannot convert to integer"
+                ) from exc
+        if isinstance(val, bool):
+            raise ValueError(
+                f"Invalid coordinate {val!r}: boolean coordinate not allowed in strict mode"
+            )
+        if isinstance(val, float):
+            raise ValueError(
+                f"Invalid coordinate {val!r}: float coordinate not allowed in strict mode"
+            )
+        if isinstance(val, int):
+            return val
+        return _coerce_int_coord(val)
+
+    if isinstance(val, str):
+        val = val.split(":", 1)[0].strip()
+        if not val:
+            return default
+        try:
+            return int(val)
+        except ValueError as exc:
+            try:
+                f_val = float(val)
+            except (ValueError, OverflowError) as f_exc:
+                raise ValueError(
+                    f"Invalid coordinate {val!r}: cannot convert to integer"
+                ) from f_exc
+            if math.isnan(f_val) or math.isinf(f_val):
+                raise ValueError(
+                    f"Invalid coordinate {val!r}: cannot convert non-finite float"
+                ) from exc
+            return int(f_val)
+    if isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            raise ValueError(f"Invalid coordinate {val!r}: cannot convert non-finite float")
+        return int(val)
+    return _coerce_int_coord(val)
+
+
+def _coerce_int_coord(val: Any) -> int:
+    """Coerces coordinate value to int or raises ValueError on invalid/overflow inputs."""
+    try:
+        return int(val)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise ValueError(f"Invalid coordinate {val!r}: cannot convert to integer") from exc
+
+
+def is_sliced_unit_source_lines(
+    unit: Dict[str, Any],
+    source_lines: Optional[Sequence[str]] = None,
+) -> bool:
+    """Determines whether a unit's source_lines collection represents a pre-sliced excerpt."""
+    is_sliced = unit.get("source_lines_is_sliced")
+    if is_sliced is not None:
+        return bool(is_sliced)
+    lines = source_lines if source_lines is not None else unit.get("source_lines")
+    if not lines or not isinstance(lines, (list, tuple)):
+        return False
+    s_d, e_d = resolve_unit_line_bounds(unit)
+    expected_len = max(0, e_d - s_d + 1)
+    if len(lines) == expected_len:
+        return True
+    return False
+
+
+def resolve_unit_line_bounds(unit: Dict[str, Any]) -> Tuple[int, int]:
+    """Extracts clamped, positive (start, end) line coordinates from a unit dictionary.
+
+    Logs a DEBUG diagnostic whenever start is clamped to >= 1 or end is clamped to >= start.
+    """
+    try:
+        raw_s = parse_unit_coord(unit, "start", default=1)
+    except (ValueError, TypeError):
+        raw_s = 1
+    try:
+        raw_e = parse_unit_coord(unit, "end", default=raw_s)
+    except (ValueError, TypeError):
+        raw_e = raw_s
+    s = max(1, raw_s)
+    e = max(s, raw_e)
+    if s != raw_s or e != raw_e:
+        logger.debug(
+            "Clamped invalid unit coordinates (start=%r -> %d, end=%r -> %d) for unit %s",
+            raw_s,
+            s,
+            raw_e,
+            e,
+            unit.get("name") or unit.get("file"),
+        )
+    return s, e
 
 
 def split_source_lines(source_text: str) -> List[str]:
@@ -109,3 +277,62 @@ def detect_line_ending(*sources: Union[Optional[str], Iterable[Optional[str]]]) 
     if crlf_count == max_count:
         return "\r\n"
     return "\r"
+
+
+def resolve_safe_unit_file_path(
+    unit: Dict[str, Any],
+    repo_root: Optional[str] = None,
+    allowed_suffixes: Sequence[str] = (".py", ".ipynb"),
+) -> Optional[Path]:
+    """Safely resolves and validates a unit's file path on disk within repo_root or CWD."""
+    raw_file = str(unit.get("file") or "")
+    f_raw = normalize_path_string(raw_file, strip_anchor=True)
+    if not f_raw:
+        return None
+
+    file_path = Path(f_raw)
+    norm_suffixes = tuple(s.lower() for s in allowed_suffixes)
+    if file_path.suffix.lower() not in norm_suffixes:
+        return None
+
+    if repo_root:
+        effective_root = Path(repo_root).resolve()
+        if effective_root.is_file():
+            effective_root = effective_root.parent
+        target_root = effective_root
+        if not file_path.is_absolute():
+            file_path = effective_root / file_path
+    else:
+        target_root = Path.cwd().resolve()
+        if not file_path.is_absolute():
+            file_path = target_root / file_path
+
+    try:
+        # Check that neither the file itself nor any unresolved parent directory below
+        # target_root is a symlink.
+        if file_path.is_symlink():
+            return None
+        repo_root_path = Path(repo_root) if repo_root else target_root
+        for parent in file_path.parents:
+            if parent in (target_root, repo_root_path):
+                break
+            if parent.is_symlink():
+                if target_root in parent.parents or repo_root_path in parent.parents:
+                    return None
+                if (
+                    parent.resolve() == target_root
+                    or parent.resolve() in target_root.parents
+                ):
+                    break
+                return None
+
+        resolved_file = file_path.resolve()
+        if not resolved_file.is_file():
+            return None
+        resolved_file.relative_to(target_root)
+        return resolved_file
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+_resolve_safe_unit_file_path = resolve_safe_unit_file_path
