@@ -38,11 +38,13 @@ from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-acc
     _extract_nested_scope_free_reads,
     _extract_scope_local_names,
     _extract_single_node_local_names,
+    _extract_unit_live_in_names,
     _find_enclosing_loops,
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
     _get_scope_stmts_by_end_lineno,
     _get_scope_try_and_with_blocks,
+    _is_ast_node_within_unit_bounds,
     _is_eagerly_consumed_genexp,
     _load_unit_file_text,
     _pair_clone_outputs,
@@ -3790,6 +3792,63 @@ def test_downstream_cache_lock_reentrancy() -> None:
     with _downstream_cache_lock:
         with _downstream_cache_lock:
             pass
+
+
+def test_is_ast_node_within_unit_bounds_unresolved_column_fallback() -> None:
+    """Verifies that _is_ast_node_within_unit_bounds falls back to whole-line containment
+    when u_end_col is None, on both single-line and multi-line units."""
+    sample_node = ast.Name(id="x", ctx=ast.Load())
+    sample_node.lineno = 5
+    sample_node.col_offset = 12
+
+    # Single-line unit: lines 5 to 5 without column information
+    assert _is_ast_node_within_unit_bounds(sample_node, 5, 5, u_end_col=None) is True
+    # Single-line unit with column bound after node
+    assert _is_ast_node_within_unit_bounds(sample_node, 5, 5, u_end_col=15) is True
+    # Single-line unit with column bound before node
+    assert _is_ast_node_within_unit_bounds(sample_node, 5, 5, u_end_col=10) is False
+
+    # Multi-line unit: node on final line without column information
+    assert _is_ast_node_within_unit_bounds(sample_node, 2, 5, u_end_col=None) is True
+    # Multi-line unit: node strictly outside line bounds
+    assert _is_ast_node_within_unit_bounds(sample_node, 6, 8, u_end_col=None) is False
+    assert _is_ast_node_within_unit_bounds(sample_node, 1, 4, u_end_col=None) is False
+
+    # Node missing lineno attribute
+    nodeless = ast.Pass()
+    assert _is_ast_node_within_unit_bounds(nodeless, 5, 5, u_end_col=None) is False
+
+
+def test_single_line_unit_unresolved_end_col_live_in_and_loop_carried() -> None:
+    """Verifies that single-line units without end column or precomputed inputs discover
+    live-in variables and accurately propagate loop-carried downstream reads."""
+    src = (
+        "def run_loop(records):\n"
+        "    running_sum = 0\n"
+        "    for rec in records:\n"
+        "        running_sum = running_sum + rec.val\n"
+        "    return running_sum\n"
+    )
+    unit_def = {
+        "file": "engine.py",
+        "start": 4,
+        "end": 4,
+        "kind": "for",
+    }
+    tree = ast.parse(src)
+
+    # 1. Live-in extraction directly discovers running_sum and rec
+    live_ins = _extract_unit_live_in_names(tree, 4, 4, u_end_col=None)
+    assert "running_sum" in live_ins
+    assert "rec" in live_ins
+
+    # 2. collect_downstream_read_names captures loop-carried accumulator read
+    reads = collect_downstream_read_names(
+        src, unit_def, candidates={"running_sum"}, tree=tree
+    )
+    assert reads is not None
+    assert "running_sum" in reads
+
 
 
 

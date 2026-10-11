@@ -96,6 +96,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `is_subroutine_unit` to avoid false subroutine classifications.
 
 ### Fixed
+- **Single-Line Unit Whole-Line Containment Fallback**: Updated `_is_ast_node_within_unit_bounds`
+  in `dataflow.py` to fall back to whole-line containment when `u_end_col` cannot be resolved
+  (`u_end_col is None`), harmonizing containment with the fail-closed downstream fallback and
+  ensuring single-line units without precomputed inputs accurately discover live-ins and
+  loop-carried dependencies.
 - **Sound Loop-Carried Kill Analysis**: Snapshotted `self.killed` (with proper branch merging across
   if/try/with blocks) as `unit_entry_killed` upon first reaching the unit in
   `_DownstreamReadVisitor`, preventing conditional resets prior to the unit from unsoundly
