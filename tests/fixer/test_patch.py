@@ -40,24 +40,7 @@ requires_git = pytest.mark.skipif(
 )
 
 
-def assert_valid_python(source: str, mode: str = "exec") -> None:
-    """Verifies that source is both syntactically and semantically valid Python."""
-    cleaned = textwrap.dedent(source)
-    try:
-        compile(cleaned, filename="<synthesized_helper>", mode=mode)
-    except IndentationError:
-        lines = source.splitlines(keepends=True)
-        import_lines = [ln for ln in lines if ln.startswith(("import ", "from "))]
-        other_lines = [ln for ln in lines if not ln.startswith(("import ", "from "))]
-        if import_lines and other_lines:
-            compile("".join(import_lines), filename="<synthesized_imports>", mode=mode)
-            compile(
-                textwrap.dedent("".join(other_lines)),
-                filename="<synthesized_helper>",
-                mode=mode,
-            )
-            return
-        raise
+from tests.conftest import assert_valid_python
 
 
 def test_audit_tests_parametrize_candidate_detection(tmp_path: Path) -> None:
@@ -6883,19 +6866,20 @@ def test_package_reexport_unit_collision_error() -> None:
 
 
 def test_refactor_module_units_inverted_line_range_is_noop() -> None:
-    """Verifies that inverted line ranges (start > end) or out-of-bounds lines do not append text to EOF."""
+    """Verifies that inverted line ranges (start > end) fail closed with ValueError
+    in mutation APIs."""
     from pydoppelgangerhunt.fixer import refactor_module_units, replace_unit_in_source
 
     original_code = "line1\nline2\nline3\n"
     inverted_unit = {"file": "sample.py", "name": "bad_inv", "start": 5, "end": 2}
 
-    # refactor_module_units should leave buffer untouched (no append at EOF)
-    result_refactor = refactor_module_units(original_code, [(inverted_unit, "INVERTED_REPLACEMENT\n")])
-    assert result_refactor == original_code
+    # refactor_module_units fails closed with ValueError
+    with pytest.raises(ValueError, match="invalid coordinates for refactoring"):
+        refactor_module_units(original_code, [(inverted_unit, "INVERTED_REPLACEMENT\n")])
 
-    # replace_unit_in_source should also leave buffer untouched
-    result_replace = replace_unit_in_source(original_code, inverted_unit, "INVERTED_REPLACEMENT\n")
-    assert result_replace == original_code
+    # replace_unit_in_source fails closed with ValueError
+    with pytest.raises(ValueError, match="invalid coordinates for replacement"):
+        replace_unit_in_source(original_code, inverted_unit, "INVERTED_REPLACEMENT\n")
 
     # Out of bounds start line
     oob_unit = {"file": "sample.py", "name": "bad_oob", "start": 99, "end": 100}
@@ -7442,9 +7426,9 @@ def test_compute_unit_spans_non_positive_line_clamping() -> None:
     assert check_units_overlap(unit_zero, {"file": "test.py", "start": 1, "end": 1})
     assert not check_units_overlap(unit_zero, {"file": "test.py", "start": 2, "end": 2})
 
-    # refactor_module_units replaces line 1 cleanly
-    res = refactor_module_units(src, [(unit_zero, "x = 99\n")])
-    assert res == "x = 99\ny = 2\nz = 3\n"
+    # refactor_module_units fails closed on non-positive coordinates
+    with pytest.raises(ValueError, match="invalid coordinates for refactoring"):
+        refactor_module_units(src, [(unit_zero, "x = 99\n")])
 
     # Negative coordinates clamp to line 1
     unit_neg = {"file": "test.py", "start": -10, "end": -5}
@@ -9256,5 +9240,35 @@ def test_validate_helper_compilation_indented_method_with_imports() -> None:
 
     # Truly invalid syntax should return False
     assert _validate_helper_compilation("def invalid syntax (:") is False
+
+
+def test_validate_helper_compilation_indented_method_with_multiline_string_at_col_0() -> None:
+    """Verifies that _validate_helper_compilation and assert_valid_python accept an indented
+    method helper containing a triple-quoted multiline string with lines at column 0."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _validate_helper_compilation,
+    )
+
+    helper_code = (
+        "    def _format_message(self, tag: str) -> str:\n"
+        '        template = """header:\n'
+        "col_0_line\n"
+        'footer"""\n'
+        "        return f'{tag}: {template}'\n"
+    )
+    assert _validate_helper_compilation(helper_code) is True
+    assert_valid_python(helper_code)
+
+    combined_helper = (
+        "from typing import Optional\n\n\n"
+        "    def _format_message(self, tag: str) -> Optional[str]:\n"
+        '        template = """header:\n'
+        "col_0_line\n"
+        'footer"""\n'
+        "        return f'{tag}: {template}'\n"
+    )
+    assert _validate_helper_compilation(combined_helper) is True
+    assert_valid_python(combined_helper)
+
 
 

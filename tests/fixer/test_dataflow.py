@@ -1206,6 +1206,26 @@ def test_collect_downstream_read_names_loop_carried_killed_before_unit() -> None
     assert "total" not in reads
 
 
+def test_collect_downstream_read_names_loop_carried_conditional_reset() -> None:
+    """Verifies that conditional resets before the unit inside an enclosing loop do not
+    unconditionally kill loop-carried dependencies."""
+    code = (
+        "def process_batches(batches):\n"
+        "    total = 0\n"
+        "    for batch in batches:\n"
+        "        if batch.reset:\n"
+        "            total = 0\n"
+        "        for x in batch.items:\n"
+        "            total += x\n"
+        "            yield total\n"
+    )
+    # Unit is lines 6 to 8: inner loop where total is updated
+    unit = {"start": 6, "end": 8}
+    reads = collect_downstream_read_names(code, unit, candidates={"total"})
+    assert reads is not None
+    assert "total" in reads
+
+
 def test_collect_downstream_read_names_try_finally_exceptional_path() -> None:
     """Verifies that try body stores do not kill variables in finally block across
     exceptional paths."""
@@ -1823,13 +1843,13 @@ def test_collect_downstream_read_names_digest_invalidation(tmp_path: Path) -> No
     f_path = tmp_path / "target.py"
     code = "def f():\n    x = 1\n    return x\n"
     f_path.write_text(code, encoding="utf-8")
-    unit1 = {"file": str(f_path), "start": 2, "end": 2, "source_digest": "hash1"}
-    reads1 = collect_downstream_read_names(code, unit1)
+    unit1 = {"file": str(f_path), "start": 2, "end": 2}
+    reads1 = collect_downstream_read_names(code, unit1, source_digest="hash1")
     assert reads1 == {"x"}
     assert len(_downstream_reads_cache) == 1
 
-    unit2 = {"file": str(f_path), "start": 2, "end": 2, "source_digest": "hash2"}
-    reads2 = collect_downstream_read_names(code, unit2)
+    unit2 = {"file": str(f_path), "start": 2, "end": 2}
+    reads2 = collect_downstream_read_names(code, unit2, source_digest="hash2")
     assert reads2 == {"x"}
     assert len(_downstream_reads_cache) == 2
 

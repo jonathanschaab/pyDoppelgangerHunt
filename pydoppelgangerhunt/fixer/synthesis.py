@@ -1218,7 +1218,10 @@ def synthesize_shared_helper_code(
     has_naked_ctrl = any(h in ("naked_break", "naked_continue") for h in hazards)
     if not has_naked_ctrl:
         try:
-            compile(dedent_source_text(helper_def), "<synthesized_helper>", "exec")
+            if indent:
+                compile("if 1:\n" + helper_def, "<synthesized_helper>", "exec")
+            else:
+                compile(helper_def, "<synthesized_helper>", "exec")
         except (SyntaxError, ValueError):
             return ""
 
@@ -1233,10 +1236,11 @@ def synthesize_shared_helper_code(
         if import_header_parts:
             combined = "\n".join(import_header_parts) + "\n\n\n" + helper_def
             try:
+                compile("\n".join(import_header_parts), "<synthesized_imports>", "exec")
                 if not indent:
-                    compile(dedent_source_text(combined), "<synthesized_helper>", "exec")
+                    compile(helper_def, "<synthesized_helper>", "exec")
                 else:
-                    compile("\n".join(import_header_parts), "<synthesized_imports>", "exec")
+                    compile("if 1:\n" + helper_def, "<synthesized_helper>", "exec")
             except (SyntaxError, ValueError):
                 return ""
             return combined

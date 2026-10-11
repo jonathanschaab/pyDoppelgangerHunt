@@ -796,6 +796,23 @@ def compute_line_offsets(lines: Sequence[str]) -> Tuple[List[int], List[int]]:
 _compute_line_offsets = compute_line_offsets
 
 
+def _validate_and_parse_unit_bound(
+    u: Dict[str, Any], coord_name: str, strict: bool = False
+) -> int:
+    """Extracts and validates a required unit coordinate, raising ValueError on failure."""
+    try:
+        val = parse_unit_coord(u, coord_name, default=None, strict=strict)
+    except (ValueError, TypeError) as err:
+        raise ValueError(
+            f"Malformed unit: invalid {coord_name!r} line: {u.get(coord_name)!r}"
+        ) from err
+    if val is None:
+        raise ValueError(
+            f"Malformed unit: missing required {coord_name!r} line coordinate"
+        )
+    return val
+
+
 def compute_unit_spans(
     source_text: str,
     unit: Dict[str, Any],
@@ -829,20 +846,10 @@ def compute_unit_spans(
     if not lines:
         return UnitSpan(0, 0, 0, 0, False, 1, 1, 0, 0)
 
-    try:
-        raw_start = _parse_unit_coord(unit, "start", default=None)
-    except (ValueError, TypeError) as err:
-        raise ValueError(f"Malformed unit: invalid 'start' line: {unit.get('start')!r}") from err
-    if raw_start is None:
-        raise ValueError("Malformed unit: missing required 'start' line coordinate")
+    raw_start = _validate_and_parse_unit_bound(unit, "start", strict=False)
     start = max(1, raw_start)
 
-    try:
-        raw_end = _parse_unit_coord(unit, "end", default=None)
-    except (ValueError, TypeError) as err:
-        raise ValueError(f"Malformed unit: invalid 'end' line: {unit.get('end')!r}") from err
-    if raw_end is None:
-        raise ValueError("Malformed unit: missing required 'end' line coordinate")
+    raw_end = _validate_and_parse_unit_bound(unit, "end", strict=False)
     end = max(1, min(len(lines), raw_end))
 
     if line_char_offsets is None or line_byte_offsets is None:
@@ -1186,6 +1193,7 @@ def replace_unit_in_source(
     unit: Dict[str, Any],
     replacement_text: str,
     preserve_boundary_pragmas: bool = True,
+    strict: bool = True,
 ) -> str:
     """Replaces an AST code unit in source text with replacement text, preserving comments and formatting.
 
@@ -1200,10 +1208,20 @@ def replace_unit_in_source(
         replacement_text: The text to substitute in place of the unit lines.
         preserve_boundary_pragmas: If True, retains boundary pragmas (# type: ignore / # noqa)
             attached to the original code unit and appends them to the replacement statement.
+        strict: If True, validates unit coordinates with strict positive integer rules.
 
     Returns:
         The modified source code with comments, type ignores, and whitespace outside the unit preserved.
     """
+    if not isinstance(unit, dict):
+        raise TypeError(f"Unit must be a dictionary, got {type(unit).__name__}")
+    _validate_and_parse_unit_bound(unit, "start", strict=strict)
+    _validate_and_parse_unit_bound(unit, "end", strict=strict)
+
+    if not is_valid_unit_coordinates(unit, strict=strict):
+        raise ValueError(
+            f"Malformed unit: invalid coordinates for replacement: {unit!r}"
+        )
     start_char, end_char, final_rep = compute_unit_replacement_span(
         source_text,
         unit,

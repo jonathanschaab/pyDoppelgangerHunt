@@ -53,15 +53,12 @@ _BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
 __all__ = [
     "GeneratorCloneSideData",
-    "clear_closure_warning_cache",
     "clear_dataflow_cache",
     "collect_downstream_read_names",
     "has_async_generator_delegation_hazard",
     "is_async_generator_with_return_value",
-    "is_subroutine_unit",
     "resolve_clone_generator_subroutine_outputs",
     "resolve_clone_pair_outputs",
-    "resolve_closure_strictness_mode",
     "resolve_generator_subroutine_outputs",
 ]
 
@@ -72,7 +69,7 @@ _MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
 _MAX_SCOPE_CACHE_SIZE: int = 1024
 _MAX_PARSED_TREE_CACHE_SIZE: int = 128
 _downstream_reads_cache: OrderedDict[Tuple[Any, ...], frozenset[str]] = OrderedDict()
-_parsed_tree_cache: OrderedDict[str, Optional[ast.AST]] = OrderedDict()
+_parsed_tree_cache: OrderedDict[Tuple[str, int], Optional[ast.AST]] = OrderedDict()
 
 _scope_parent_maps: OrderedDict[ast.AST, Dict[ast.AST, ast.AST]] = OrderedDict()
 _scope_stmts_by_end: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
@@ -149,10 +146,12 @@ def _get_or_parse_tree(
     """Retrieves cached AST tree or parses source_text into an AST tree."""
     if not source_text.strip():
         return None
-    key = (
+    content_hash = (
         source_digest
-        or hashlib.sha256(source_text.encode("utf-8", errors="replace")).hexdigest()
+        if source_digest is not None
+        else hashlib.sha256(source_text.encode("utf-8", errors="replace")).hexdigest()
     )
+    key = (content_hash, len(source_text))
     with _downstream_cache_lock:
         if key in _parsed_tree_cache:
             cached_tree = _parsed_tree_cache[key]
@@ -803,11 +802,16 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         )
         self.loaded: Set[str] = set()
         self.killed: Set[str] = set()
-        self.loop_killed: Set[str] = set()
+        self.unit_entry_killed: Optional[Set[str]] = None
         self.has_dynamic_read: bool = False
         self.is_module_scope = is_module_scope
 
     _DYNAMIC_READ_FUNCS = frozenset({"locals", "vars", "eval", "exec", "dir", "globals"})
+
+    def visit(self, node: ast.AST) -> Any:
+        if self.unit_entry_killed is None and self._is_node_inside_unit(node):
+            self.unit_entry_killed = set(self.killed)
+        return super().visit(node)
 
     def _is_node_after_unit(self, node: ast.AST) -> bool:
         lineno = getattr(node, "lineno", None)
@@ -850,8 +854,6 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
                 for name in _extract_assigned_names(t):
                     if not self._is_in_comp(name):
                         self.killed.add(name)
-                        if self.pass_mode is _VisitorPassMode.LOOP_CARRIED:
-                            self.loop_killed.add(name)
 
     def _record_downstream_read(self, name: str) -> None:
         if self._is_in_comp(name) or name in self.killed:
@@ -875,8 +877,6 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
                 and not (lineno == self.u_end and self.u_end_col is None)
             ):
                 self.killed.add(name_attr)
-                if self.pass_mode is _VisitorPassMode.LOOP_CARRIED:
-                    self.loop_killed.add(name_attr)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self.visit_FunctionDef(node)
@@ -891,8 +891,6 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
                 lineno == self.u_end and self.u_end_col is None
             ):
                 self.killed.add(node.name)
-                if self.pass_mode is _VisitorPassMode.LOOP_CARRIED:
-                    self.loop_killed.add(node.name)
         else:
             n_start = getattr(node, "lineno", 0)
             n_end = getattr(node, "end_lineno", None) or n_start
@@ -918,8 +916,6 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             name_node = getattr(node, "name", None)
             if isinstance(name_node, ast.Name) and not self._is_in_comp(name_node.id):
                 self.killed.add(name_node.id)
-                if self.pass_mode is _VisitorPassMode.LOOP_CARRIED:
-                    self.loop_killed.add(name_node.id)
 
     def visit_Name(self, node: ast.Name) -> None:
         self.generic_visit(node)
@@ -931,8 +927,6 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             self._record_downstream_read(node.target.id)
             if not self._is_in_comp(node.target.id):
                 self.killed.add(node.target.id)
-                if self.pass_mode is _VisitorPassMode.LOOP_CARRIED:
-                    self.loop_killed.add(node.target.id)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
@@ -1628,9 +1622,8 @@ def _build_downstream_cache_key(
 ) -> _DownstreamCacheKey:
     """Forms a persistent cache key for downstream AST read analysis."""
     file_path_str = str(unit.get("file") or "")
-    digest = source_digest or unit.get("source_digest") or unit.get("content_digest")
-    if digest is not None:
-        content_digest = str(digest)
+    if source_digest is not None:
+        content_digest = str(source_digest)
     else:
         content_digest = hashlib.sha256(
             source_text.encode("utf-8", errors="replace")
@@ -2038,12 +2031,7 @@ def collect_downstream_read_names(
 
     effective_tree = tree
     if effective_tree is None:
-        eff_digest = (
-            source_digest
-            or unit.get("source_digest")
-            or unit.get("content_digest")
-        )
-        effective_tree = _get_or_parse_tree(source_text, source_digest=eff_digest)
+        effective_tree = _get_or_parse_tree(source_text, source_digest=source_digest)
 
     u_end_col = _extract_unit_end_col(unit)
     scope_node: Optional[ast.AST] = None
@@ -2141,7 +2129,12 @@ def collect_downstream_read_names(
         cand_inputs = (
             set(candidates) & eff_inputs if candidates is not None else set(eff_inputs)
         )
-        loaded.update(cand_inputs - loop_visitor.loop_killed)
+        loop_killed = (
+            loop_visitor.unit_entry_killed
+            if loop_visitor.unit_entry_killed is not None
+            else set()
+        )
+        loaded.update(cand_inputs - loop_killed)
 
     has_dynamic = visitor.has_dynamic_read or (
         loop_visitor is not None and loop_visitor.has_dynamic_read

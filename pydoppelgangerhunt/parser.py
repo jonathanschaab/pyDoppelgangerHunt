@@ -748,6 +748,12 @@ def check_inline_suppression(file_lines: List[str], start: int, end: int) -> boo
                 return True
             if "noqa: clone" in comment or "noqa:clone" in comment or "noqa: duplicate" in comment:
                 return True
+            if (
+                "pragma: no-refactor" in comment
+                or "pragma:no-refactor" in comment
+                or "pragma: no_refactor" in comment
+            ):
+                return True
     return False
 
 

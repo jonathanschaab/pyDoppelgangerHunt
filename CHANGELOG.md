@@ -39,15 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `resolve_clone_generator_subroutine_outputs` to preserve unit inputs that are updated in
   enclosing loops across iterations, preventing accumulator variables from resetting across loop
   batches. Forwarded `tree` and `unit_inputs` into `_build_downstream_cache_key`.
-- **Coordinate Failure Policy**: Required explicit `start` and `end` line coordinates in
-  `compute_unit_spans`, `replace_unit_in_source`, and `refactor_module_units`, raising
-  `ValueError` on missing or invalid line coordinates rather than silently defaulting.
+- **BREAKING** - **Coordinate Failure Policy**: Required explicit `start` and `end` line
+  coordinates in `compute_unit_spans`, `replace_unit_in_source`, and `refactor_module_units`,
+  validating with `is_valid_unit_coordinates(u, strict=strict)` and raising `ValueError` on
+  missing, zero, negative, or inverted coordinates rather than silently defaulting.
 - **Subroutine Classification Scope**: Extended whole-unit kind classification in
   `is_subroutine_unit` with `class` and `data_table` (and `async_method`), preventing nested
   classes and data tables inside callables from being misclassified as subroutine blocks.
   Unified duplicate kindless-module heuristics from `_inspect_unit_scope`.
-- **Coordinate Validation Policy**: `is_valid_unit_coordinates` (when called with default
-  `strict=False`) requires a positive `start` coordinate (`start > 0`) and rejects empty
+- **BREAKING** - **Coordinate Validation Policy**: `is_valid_unit_coordinates` (when called with
+  default `strict=False`) requires a positive `start` coordinate (`start > 0`) and rejects empty
   dictionaries `{}` as well as zero/negative/inverted coordinates (`end < start`).
 - **Coordinate Parsing Function Evolution**: `parse_unit_coord` accepts composite line:column
   strings (e.g. `"12:0"` returning `12`), and returns `None` when `default=None` instead of
@@ -57,11 +58,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **PEP 604 Pipe Union Normalization**: Synthesized helper parameter and return type annotations
   normalize PEP 604 union pipes (`|`) to `typing.Union`, preserve `Annotated[T, ...]` metadata
   arguments, and convert `X | None` to `typing.Optional[X]` for Python 3.9 compatibility.
-- **Subroutine Kind Pairing Enforcement**: Refactoring patch synthesis enforces that clone pairs
-  must have matching subroutine kinds (`is_subroutine_unit(u1) == is_subroutine_unit(u2)`).
-- **Strict Positional Output Alignment & Unequal Arity Rejection**: `_pair_clone_outputs`
-  strictly pairs subroutine outputs by first-store position and rejects conflicting positional
-  orders or unequal counts.
+- **BREAKING** - **Subroutine Kind Pairing Enforcement**: Refactoring patch synthesis enforces
+  that clone pairs must have matching subroutine kinds
+  (`is_subroutine_unit(u1) == is_subroutine_unit(u2)`).
+- **BREAKING** - **Strict Positional Output Alignment & Permuted Output Rejection**:
+  `_pair_clone_outputs` strictly pairs subroutine outputs by first-store position and rejects
+  conflicting positional orders (permuted outputs) or unequal counts.
 - **Downstream Read Analysis Cache Key**: Cache keys incorporate full 256-bit SHA-256 source
   content digests, unit digests, file path, line/column coordinates, unit kind and name,
   subroutine flag (`is_subroutine`), candidate outputs, unit inputs, and closure strictness flag.
@@ -94,6 +96,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `is_subroutine_unit` to avoid false subroutine classifications.
 
 ### Fixed
+- **Sound Loop-Carried Kill Analysis**: Snapshotted `self.killed` (with proper branch merging across
+  if/try/with blocks) as `unit_entry_killed` upon first reaching the unit in
+  `_DownstreamReadVisitor`, preventing conditional resets prior to the unit from unsoundly
+  pruning loop-carried accumulator dependencies.
+- **Parse Cache Key Content Isolation**: Keyed `_parsed_tree_cache` on
+  `(content_hash, len(source_text))` and dropped unit-dict digest fallbacks, preventing AST cache
+  collisions from unit-level snippets or stale IDE entries.
+- **Indented Method Helper Compilation**: Replaced `textwrap.dedent` in
+  `_validate_helper_compilation` (`patch.py`), `synthesize_shared_helper_code` (`synthesis.py`),
+  and `assert_valid_python` (`conftest.py`) by wrapping indented method definitions in `if 1:\n`,
+  preventing margin zeroing and spurious `IndentationError` when helpers contain triple-quoted
+  strings with lines at column 0.
+- **AST-Based Subroutine Async Detection**: Replaced raw source text regex scanning in
+  `_populate_unit_receiver_metadata` (`binding.py`) with AST node traversal within unit bounds,
+  and extended `_visit_comprehension` and `_inspect_unit_scope` (`scope.py`) to recognize async
+  comprehensions at arbitrary nesting depths and honor `unit["is_async"]`.
+- **Pragma Inline Suppression**: Added `# pragma: no-refactor` to `check_inline_suppression`
+  (`parser.py`) aligning with documentation for reflections and manual refactorings.
 - **Downstream Cache Key Unit Inputs Normalization**: Normalized `effective_unit_inputs` from
   `unit.get("inputs")` before generating `_build_downstream_cache_key`, ensuring calls with
   populated vs unpopulated unit inputs produce distinct cache keys in `_downstream_reads_cache`.
@@ -103,10 +123,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Alternative Column Offset Validation**: Extended `is_valid_unit_coordinates` in `source.py`
   to validate both canonical (`start_col`, `end_col`) and offset alias keys (`start_col_offset`,
   `end_col_offset`), rejecting negative or inverted column bounds across all aliases.
-- **Indented Method Helper Compilation**: Replaced unconditional
-  `compile(dedent_source_text(helper_code), ...)` in `patch.py` with
-  `_validate_helper_compilation`, splitting top-level import headers from indented method
-  definitions to prevent spurious `IndentationError`.
 - **Fail-Open Fallback in File Loading**: Hardened in-memory fallbacks in `_load_unit_file_text`
   (`source.py`) with `_is_sliced_excerpt_for_file`, rejecting sliced line excerpts lacking the flag
   where `len(lines) < u_end` or `u_start > 1` so downstream analysis is not run against partial

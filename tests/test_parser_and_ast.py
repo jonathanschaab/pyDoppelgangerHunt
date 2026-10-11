@@ -612,6 +612,10 @@ def test_inline_comment_suppression(tmp_path: Path) -> None:
     assert check_inline_suppression(lines, 1, 2) is True
     lines_clean = ["def foo():", "    pass"]
     assert check_inline_suppression(lines_clean, 1, 2) is False
+    lines_pragma = ["def foo():  # pragma: no-refactor", "    pass"]
+    assert check_inline_suppression(lines_pragma, 1, 2) is True
+    lines_pragma_tight = ["def foo():  # pragma:no-refactor", "    pass"]
+    assert check_inline_suppression(lines_pragma_tight, 1, 2) is True
 
 
 

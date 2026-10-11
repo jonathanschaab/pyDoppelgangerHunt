@@ -47,24 +47,7 @@ from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-ac
 from pydoppelgangerhunt.parser import harvest_file_units
 
 
-def assert_valid_python(source: str, mode: str = "exec") -> None:
-    """Verifies that source is both syntactically and semantically valid Python."""
-    cleaned = textwrap.dedent(source)
-    try:
-        compile(cleaned, filename="<synthesized_helper>", mode=mode)
-    except IndentationError:
-        lines = source.splitlines(keepends=True)
-        import_lines = [ln for ln in lines if ln.startswith(("import ", "from "))]
-        other_lines = [ln for ln in lines if not ln.startswith(("import ", "from "))]
-        if import_lines and other_lines:
-            compile("".join(import_lines), filename="<synthesized_imports>", mode=mode)
-            compile(
-                textwrap.dedent("".join(other_lines)),
-                filename="<synthesized_helper>",
-                mode=mode,
-            )
-            return
-        raise
+from tests.conftest import assert_valid_python
 
 
 def test_generate_clone_diff_and_refactoring_suggestions(tmp_path: Path) -> None:

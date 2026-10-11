@@ -65,9 +65,9 @@ from pydoppelgangerhunt.fixer.source import (
     _insert_imports_into_module,
     _is_docstring_node,
     _scan_sig_line,
+    _validate_and_parse_unit_bound,
     compute_line_offsets,
     count_physical_newlines,
-    dedent_source_text,
     detect_line_ending,
     is_subroutine_unit,
     is_valid_unit_coordinates,
@@ -368,6 +368,7 @@ def refactor_module_units(
     dry_run: bool = False,
     tier1: bool = True,
     tier2: bool = True,
+    strict: bool = True,
 ) -> str:
     """Applies multiple non-overlapping unit replacements in reverse source order.
 
@@ -399,6 +400,7 @@ def refactor_module_units(
         dry_run: If True, executes collision validation without slicing or modifying the source buffer.
         tier1: If True, executes Tier 1 semantic line/column overlap validation.
         tier2: If True, executes Tier 2 physical UTF-8 byte interval sweep validation.
+        strict: If True, validates unit coordinates with strict positive integer rules.
 
     Returns:
         The refactored module source text (or unmodified source_text if dry_run=True).
@@ -415,7 +417,15 @@ def refactor_module_units(
     # with any other edit on the same line), or when column intervals overlap.
     rep_list: List[Tuple[Dict[str, Any], str]] = []
     for u, rep in replacements:
-        if isinstance(u, dict) and not u.get("file"):
+        if not isinstance(u, dict):
+            raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
+        _validate_and_parse_unit_bound(u, "start", strict=strict)
+        _validate_and_parse_unit_bound(u, "end", strict=strict)
+        if not is_valid_unit_coordinates(u, strict=strict):
+            raise ValueError(
+                f"Malformed unit: invalid coordinates for refactoring: {u!r}"
+            )
+        if not u.get("file"):
             u_norm = dict(u)
             u_norm["file"] = "<module>"
             rep_list.append((u_norm, rep))
@@ -2636,27 +2646,23 @@ def _validate_helper_compilation(helper_code: str) -> bool:
     """Validates that synthesized helper code compiles without syntax or indentation errors.
 
     Splits top-level import headers from indented method definitions to prevent
-    spurious IndentationError when checking combined helper strings.
+    spurious IndentationError when checking combined helper strings, and wraps
+    indented definitions in a compound block to preserve column-0 multiline strings.
     """
+    lines = helper_code.splitlines(keepends=True)
+    import_lines = [ln for ln in lines if ln.startswith(("import ", "from "))]
+    other_lines = [ln for ln in lines if not ln.startswith(("import ", "from "))]
     try:
-        compile(dedent_source_text(helper_code), "<patch>", "exec")
+        if import_lines:
+            compile("".join(import_lines), "<patch_imports>", "exec")
+        other_code = "".join(other_lines)
+        if other_code.strip():
+            first_line = next((ln for ln in other_lines if ln.strip()), "")
+            if first_line.startswith((" ", "\t")):
+                compile("if 1:\n" + other_code, "<patch_helper>", "exec")
+            else:
+                compile(other_code, "<patch_helper>", "exec")
         return True
-    except IndentationError:
-        lines = helper_code.splitlines(keepends=True)
-        import_lines = [ln for ln in lines if ln.startswith(("import ", "from "))]
-        other_lines = [ln for ln in lines if not ln.startswith(("import ", "from "))]
-        if import_lines and other_lines:
-            try:
-                compile("".join(import_lines), "<patch_imports>", "exec")
-                compile(
-                    dedent_source_text("".join(other_lines)),
-                    "<patch_helper>",
-                    "exec",
-                )
-                return True
-            except (SyntaxError, ValueError):
-                return False
-        return False
     except (SyntaxError, ValueError):
         return False
 

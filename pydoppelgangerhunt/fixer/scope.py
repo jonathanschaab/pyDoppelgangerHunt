@@ -486,8 +486,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         inner_vars: Set[str] = set()
         self._scope_stack.append(inner_vars)
         if any(getattr(g, "is_async", False) for g in node.generators):
-            if len(self._scope_stack) <= 2:
-                self.is_async = True
+            self.is_async = True
         for gen in node.generators:
             self.visit(gen.iter)
             for n in ast.walk(gen.target):
@@ -1524,15 +1523,19 @@ def _inspect_unit_scope(
             True
             if visitor.is_async
             else (
-                (bool(unit_is_async) if unit_is_async is not None else None)
-                if visitor.has_yield
+                bool(unit.get("is_async"))
+                if "is_async" in unit and unit.get("is_async") is not None
                 else (
-                    bool(unit_is_async)
-                    if (
-                        not unit.get("is_subroutine")
-                        and unit.get("kind") not in ("function", "method")
+                    (bool(unit_is_async) if unit_is_async is not None else None)
+                    if visitor.has_yield
+                    else (
+                        bool(unit_is_async)
+                        if (
+                            not unit.get("is_subroutine")
+                            and unit.get("kind") not in ("function", "method")
+                        )
+                        else False
                     )
-                    else False
                 )
             )
         ),

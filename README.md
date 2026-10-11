@@ -295,6 +295,10 @@ strict fail-closed safety invariants:
   Units with missing, zero, or inverted coordinates fail closed and are rejected rather than
   silently collapsing multi-line definitions into single lines. Permissive coordinate clamping is
   reserved for reporting, metrics, and visual displays.
+- **Strict Positional Output Alignment & Permuted Output Rejection**: Subroutine outputs are
+  paired 1:1 in strict first-store positional order. If clone candidates define matching outputs
+  in differing positional orders (permuted outputs) or differing counts, the pair is rejected
+  to prevent subtle tuple-unpacking bugs and preserve alpha-equivalent runtime semantics.
 - **Definite Assignment Verification**: Synthesized helper return values and tuple-unpacked
   subroutine outputs require definite assignments along all incoming and internal execution
   paths. If an output variable could remain unassigned before helper exit, refactoring is

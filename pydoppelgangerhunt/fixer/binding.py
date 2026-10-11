@@ -14,10 +14,10 @@ from pydoppelgangerhunt.fixer.source import (
     _find_innermost_enclosing_node,
     _load_unit_file_text,
     is_subroutine_unit,
+    parse_unit_coord,
     split_source_lines,
 )
 from pydoppelgangerhunt.parser import is_decorator_named
-from pydoppelgangerhunt.reporters import extract_unit_source_code
 
 __all__ = [
     "find_enclosing_class",
@@ -260,6 +260,35 @@ def _get_enclosing_receiver_kind(fn_info: Optional[Dict[str, Any]]) -> str:
     return "instance"
 
 
+def _unit_ast_has_async_or_yield(
+    tree: ast.AST, u_start: int, u_end: int
+) -> Tuple[bool, bool]:
+    """Detects whether AST statements within unit bounds contain yield or async operations."""
+    has_yield = False
+    has_await = False
+
+    def _traverse(node: ast.AST) -> None:
+        nonlocal has_yield, has_await
+        lineno = getattr(node, "lineno", None)
+        if lineno is not None and u_start <= lineno <= u_end:
+            if isinstance(node, (ast.Yield, ast.YieldFrom)):
+                has_yield = True
+            elif isinstance(node, (ast.Await, ast.AsyncFor, ast.AsyncWith)):
+                has_await = True
+            elif (
+                isinstance(node, ast.comprehension)
+                and bool(getattr(node, "is_async", False))
+            ):
+                has_await = True
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                return
+        for child in ast.iter_child_nodes(node):
+            _traverse(child)
+
+    _traverse(tree)
+    return has_yield, has_await
+
+
 def _populate_unit_receiver_metadata(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
@@ -304,22 +333,18 @@ def _populate_unit_receiver_metadata(
     if "is_async" not in unit:
         is_sub = is_subroutine_unit(unit, source_text=source)
         if is_sub:
-            u_src = str(unit.get("source_text") or "")
-            has_yield = (
-                bool(unit.get("has_yield"))
-                or bool(re.search(r"\b(yield|yield\s+from)\b", u_src))
-            )
-            has_await = (
-                bool(unit.get("has_await"))
-                or bool(re.search(r"\b(await|async\s+for|async\s+with)\b", u_src))
-            )
+            has_yield = bool(unit.get("has_yield"))
+            has_await = bool(unit.get("has_await"))
             if not (has_yield or has_await) and source is not None:
-                u_lines = extract_unit_source_code(unit, repo_root=repo_root)
-                u_text = "".join(u_lines)
-                has_yield = bool(re.search(r"\b(yield|yield\s+from)\b", u_text))
-                has_await = bool(
-                    re.search(r"\b(await|async\s+for|async\s+with)\b", u_text)
-                )
+                try:
+                    tree = ast.parse(source)
+                    u_start = parse_unit_coord(unit, "start", default=1)
+                    u_end = parse_unit_coord(unit, "end", default=u_start)
+                    has_yield, has_await = _unit_ast_has_async_or_yield(
+                        tree, u_start, u_end
+                    )
+                except (SyntaxError, ValueError):
+                    pass
             unit["is_async"] = fn_is_async if (has_yield or has_await) else False
         else:
             unit["is_async"] = fn_is_async
