@@ -208,7 +208,7 @@ def _extract_first_unit_coord(
 
 def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
     """Extracts end column offset from unit dictionary if present."""
-    return _extract_first_unit_coord(unit, ("end_col_offset", "end_col"))
+    return _extract_first_unit_coord(unit, ("end_col", "end_col_offset"))
 
 
 def _get_scope_parent_map(scope_node: ast.AST) -> Dict[ast.AST, ast.AST]:

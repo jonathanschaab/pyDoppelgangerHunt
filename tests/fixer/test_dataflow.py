@@ -3645,6 +3645,7 @@ def test_load_unit_file_text_synthetic_in_memory_fallback() -> None:
         "start": 1,
         "end": 2,
         "source_lines": ["def foo():\n", "    return 42\n"],
+        "source_lines_is_sliced": False,
     }
     # When file does not exist on disk, fallback to in-memory source_lines
     text = _load_unit_file_text(unit)
@@ -3895,6 +3896,20 @@ def test_enclosing_try_reads_outputs_same_line_unit_accumulator_in_with() -> Non
         tree_read, u_start=2, u_end=2, outputs={"acc"}, u_end_col=None
     )
     assert result_read is True
+
+
+def test_extract_unit_end_col_precedence() -> None:
+    """Verifies that _extract_unit_end_col prioritizes canonical end_col over end_col_offset."""
+    from pydoppelgangerhunt.fixer.dataflow import _extract_unit_end_col
+
+    # end_col takes precedence over end_col_offset
+    unit_both = {"end_col": 25, "end_col_offset": 10}
+    assert _extract_unit_end_col(unit_both) == 25
+
+    # Fallback to end_col_offset when end_col is missing
+    unit_offset_only = {"end_col_offset": 15}
+    assert _extract_unit_end_col(unit_offset_only) == 15
+
 
 
 

@@ -161,13 +161,15 @@ def resolve_unit_line_bounds(unit: Dict[str, Any]) -> Tuple[int, int]:
 
     Logs a DEBUG diagnostic whenever start is clamped to >= 1 or end is clamped to >= start.
     """
+    if not isinstance(unit, dict):
+        return 1, 1
     try:
         raw_s = parse_unit_coord(unit, "start", default=1)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
         raw_s = 1
     try:
         raw_e = parse_unit_coord(unit, "end", default=raw_s)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
         raw_e = raw_s
     s = max(1, raw_s)
     e = max(s, raw_e)

@@ -9126,19 +9126,19 @@ def test_pre_unit_class_generator_expression_lazy_read_captured(tmp_path: Path) 
 
 
 def test_load_unit_file_text_truncated_at_start_line_fails_closed() -> None:
-    """Verifies _load_unit_file_text falls back to in-memory lines unless marked sliced."""
+    """Verifies that _load_unit_file_text returns None when source_lines has ambiguous length."""
     unit = {
         "file": "dummy.py",
         "start": 1,
         "end": 3,
         "source_lines": ["x = 1\n", "y = 2\n", "z = 3\n"],
     }
-    # When file is not on disk and source_lines_is_sliced is not True, falls back to source_lines
-    assert _load_unit_file_text(unit) == "x = 1\ny = 2\nz = 3\n"
+    # source_lines_is_sliced is None and len(source_lines) == (end - start + 1) -> fails closed
+    assert _load_unit_file_text(unit) is None
 
-    # When explicitly marked sliced, it fails closed to None
-    unit_sliced = dict(unit, source_lines_is_sliced=True)
-    assert _load_unit_file_text(unit_sliced) is None
+    # When explicitly marked not sliced, it returns the content
+    unit_full = dict(unit, source_lines_is_sliced=False)
+    assert _load_unit_file_text(unit_full) == "x = 1\ny = 2\nz = 3\n"
 
 
 def test_generate_refactoring_patch_skips_mismatched_subroutine_kinds(
@@ -9317,6 +9317,35 @@ def test_same_file_delegation_preserves_renamed_inputs_and_outputs_on_clone_2(
     assert "+    total = _shared" in patch
     # Clone 2 must delegate using count and data, NOT total and items
     assert "+    count = _shared" in patch
+
+
+def test_record_skip_comment_same_file_plan_no_duplicate(tmp_path: Path) -> None:
+    """Verifies that _record_skip_comment does not duplicate comments when f1 and f2
+    alias the same file patch plan."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _FilePatchPlan,
+        _record_skip_comment,
+    )
+
+    f = tmp_path / "same.py"
+    plan = _FilePatchPlan(f, str(f.relative_to(tmp_path)), "x = 1\n")
+    skip_reasons: Dict[str, int] = {}
+    _record_skip_comment(plan, plan, skip_reasons, "test_skip", "# skip notice\n")
+    assert plan.comments == ["# skip notice\n"]
+    assert skip_reasons["test_skip"] == 1
+
+
+def test_unit_start_module_scope_helper() -> None:
+    """Verifies that _unit_start extracts and clamps unit start line coordinates."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _unit_start,
+    )
+
+    assert _unit_start({"start": 10}) == 10
+    assert _unit_start({"start": 0}) == 1
+    assert _unit_start({"start": -5}) == 1
+    assert _unit_start({}) == 1
+
 
 
 

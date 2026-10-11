@@ -204,10 +204,10 @@ def _is_sliced_excerpt_for_file(unit: Dict[str, Any], lines: Sequence[str]) -> b
     """Returns True if lines represents a sliced excerpt rather than full file text."""
     if unit.get("source_lines_is_sliced") is True:
         return True
-    u_start, u_end = resolve_unit_line_bounds(unit)
+    _, u_end = resolve_unit_line_bounds(unit)
     if len(lines) < u_end:
         return True
-    if u_start > 1 and is_sliced_unit_source_lines(unit, lines):
+    if is_sliced_unit_source_lines(unit, lines):
         return True
     return False
 
@@ -223,15 +223,7 @@ def _load_unit_file_text(
     if source_text is not None:
         return str(source_text)
 
-    unit_lines = unit.get("source_lines")
-    if unit_lines and isinstance(unit_lines, (list, tuple)):
-        if not _is_sliced_excerpt_for_file(unit, unit_lines):
-            return "".join(
-                ln if ln.endswith(("\n", "\r")) else ln + "\n"
-                for ln in unit_lines
-            )
-
-    # Disk fallback: strictly only .py files within repo_root or CWD are accepted.
+    # Disk resolution: strictly only .py files within repo_root or CWD are accepted.
     # Notebooks (.ipynb) and out-of-root files fail closed and return None.
     resolved_file = resolve_safe_unit_file_path(
         unit, repo_root=repo_root, allowed_suffixes=(".py",)
@@ -243,11 +235,13 @@ def _load_unit_file_text(
         except OSError:
             pass
 
-    # Secondary in-memory fallback for virtual/test units lacking disk presence
+    # In-memory fallback for virtual/test units lacking disk presence
+    unit_lines = unit.get("source_lines")
     if unit_lines and isinstance(unit_lines, (list, tuple)):
         if not _is_sliced_excerpt_for_file(unit, unit_lines):
             return "".join(
-                ln if ln.endswith(("\n", "\r")) else ln + "\n" for ln in unit_lines
+                ln if ln.endswith(("\n", "\r")) else ln + "\n"
+                for ln in unit_lines
             )
 
     return None

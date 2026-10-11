@@ -96,6 +96,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `is_subroutine_unit` to avoid false subroutine classifications.
 
 ### Fixed
+- **Disk-Prioritized Unit Source Loading and Excerpt Slicing**: Prioritized disk reading in
+  `_load_unit_file_text` (`fixer/source.py`) before falling back to in-memory `source_lines`,
+  eliminated duplicate fallback logic, and removed the `u_start > 1` constraint in
+  `_is_sliced_excerpt_for_file` so line-1 excerpts are correctly identified as sliced excerpts
+  rather than full-file text.
+- **End Column Key Precedence Alignment**: Aligned coordinate key lookup in `_extract_unit_end_col`
+  (`fixer/dataflow.py`) to `("end_col", "end_col_offset")`, matching the precedence established in
+  `start_col` and `fixer/source.py`.
+- **Duplicate Skip Comment Prevention on Same-File Plans**: Guarded diagnostic attachment in
+  `_record_skip_comment` (`fixer/patch.py`) with `f2_plan is not f1_plan` and safeguarded reason
+  counters with `.get(reason_key, 0) + 1`, preventing redundant comments when clone pairs share
+  the same file plan.
+- **Module-Level Hoisting of Unit Start Helper**: Hoisted `_unit_start` to module scope in
+  `fixer/patch.py`, eliminating per-iteration redefinition inside `generate_refactoring_patch`.
+- **Defensive Type and Attribute Handling in Line Bound Resolution**: Added non-dict type guards
+  and expanded exception catching to include `AttributeError` in `resolve_unit_line_bounds`
+  (`source_lines.py`), ensuring malformed unit inputs gracefully default to `(1, 1)`.
 - **Renamed Input and Output Propagation in Clone Delegation**: Forwarded resolved `target_outs2`
   (and caller outputs `c_tout`) to `_delegate_unit_in_plan` across same-file and host module
   delegations in `patch.py`, preventing clone 2 from incorrectly synthesizing delegation statements

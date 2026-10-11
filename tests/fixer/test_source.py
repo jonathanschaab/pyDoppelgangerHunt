@@ -721,3 +721,31 @@ def test_slice_unit_token_lines_invalid_or_negative_start_col() -> None:
     u_bad = {"kind": "comprehension", "start_col": "invalid", "end_col": 10}
     assert _slice_unit_token_lines(u_bad, lines) == lines
 
+
+def test_is_sliced_excerpt_for_file_starts_at_line_one() -> None:
+    """Verifies that _is_sliced_excerpt_for_file identifies an excerpt starting at line 1."""
+    from pydoppelgangerhunt.fixer.source import _is_sliced_excerpt_for_file
+
+    u = {"start": 1, "end": 3}
+    lines = ["a = 1\n", "b = 2\n", "c = 3\n"]
+    assert _is_sliced_excerpt_for_file(u, lines) is True
+
+
+def test_load_unit_file_text_prioritizes_disk_over_source_lines(tmp_path: Path) -> None:
+    """Verifies that _load_unit_file_text prioritizes disk file over in-memory source_lines."""
+    from pydoppelgangerhunt.fixer.source import _load_unit_file_text
+
+    full_text = "x = 1\ny = 2\nz = 3\nw = 4\nv = 5\n"
+    target_file = tmp_path / "module.py"
+    target_file.write_text(full_text, encoding="utf-8")
+
+    unit = {
+        "file": str(target_file),
+        "start": 1,
+        "end": 2,
+        "source_lines": ["x = 1\n", "y = 2\n"],
+    }
+    loaded = _load_unit_file_text(unit, repo_root=str(tmp_path))
+    assert loaded == full_text
+
+

@@ -446,3 +446,16 @@ def test_resolve_safe_unit_file_path_symlinked_ancestor_root(tmp_path: Path) -> 
         {"file": str(sym_repo_file)}, repo_root=str(real_repo)
     )
     assert resolved == target_py.resolve()
+
+
+def test_resolve_unit_line_bounds_defensive_non_dict() -> None:
+    """Verifies that resolve_unit_line_bounds handles non-dict objects gracefully."""
+    from pydoppelgangerhunt.source_lines import (  # pylint: disable=import-outside-toplevel
+        resolve_unit_line_bounds,
+    )
+
+    assert resolve_unit_line_bounds(None) == (1, 1)  # type: ignore[arg-type]
+    assert resolve_unit_line_bounds([1, 2, 3]) == (1, 1)  # type: ignore[arg-type]
+    assert resolve_unit_line_bounds("not_a_dict") == (1, 1)  # type: ignore[arg-type]
+    assert resolve_unit_line_bounds(123) == (1, 1)  # type: ignore[arg-type]
+

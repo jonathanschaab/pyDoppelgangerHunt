@@ -2697,10 +2697,15 @@ def _record_skip_comment(
     comment: str,
 ) -> None:
     """Records a rejection reason counter and attaches the diagnostic comment to file plans."""
-    skip_reasons[reason_key] += 1
+    skip_reasons[reason_key] = skip_reasons.get(reason_key, 0) + 1
     f1_plan.comments.append(comment)
-    if f2_plan is not None:
+    if f2_plan is not None and f2_plan is not f1_plan:
         f2_plan.comments.append(comment)
+
+
+def _unit_start(u: Dict[str, Any]) -> int:
+    """Returns the clamped 1-based start line of a unit dictionary."""
+    return max(1, parse_unit_coord(u, "start", default=1))
 
 
 def generate_refactoring_patch(
@@ -3316,9 +3321,6 @@ def generate_refactoring_patch(
             candidate_units = [u1]
             if is_same_file and not check_units_overlap(u1, u2, repo_root=str(root)):
                 candidate_units.append(u2)
-
-            def _unit_start(u: Dict[str, Any]) -> int:
-                return max(1, parse_unit_coord(u, "start", default=1))
 
             earliest_unit = min(candidate_units, key=_unit_start)
             enc_fn_earliest = (
