@@ -746,6 +746,21 @@ def _extract_assigned_names(target: ast.AST) -> List[str]:
     return []
 
 
+def _stmt_assigns_to_any_name(stmt: ast.AST, names: Set[str]) -> bool:
+    """Checks whether an AST statement binds any variable in the given names set."""
+    targets: List[ast.AST] = []
+    if isinstance(stmt, ast.Assign):
+        targets.extend(stmt.targets)
+    elif isinstance(stmt, (ast.AugAssign, ast.AnnAssign)):
+        targets.append(stmt.target)
+    elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+        targets.append(stmt.target)
+    for t in targets:
+        if any(name in names for name in _extract_assigned_names(t)):
+            return True
+    return False
+
+
 class _VisitorPassMode(str, Enum):
     """Execution pass mode for downstream AST read analysis."""
 
@@ -1436,11 +1451,11 @@ def _classify_closure_position(
         return False, False, True
 
     is_pre = (c_line == u_start and (u_start_col is None or c_col < u_start_col))
-    is_post = (c_line == u_end and (u_end_col is None or c_col > u_end_col))
+    is_post = (c_line == u_end and (u_end_col is None or c_col >= u_end_col))
 
     not_intra = (
         (c_line == u_start and u_start_col is not None and c_col < u_start_col)
-        or (c_line == u_end and u_end_col is not None and c_col > u_end_col)
+        or (c_line == u_end and u_end_col is not None and c_col >= u_end_col)
     )
     is_intra = not not_intra
     return is_pre, is_intra, is_post
@@ -1866,6 +1881,19 @@ def _enclosing_try_reads_outputs(
                 same_line_stmts = [
                     stmt for stmt in with_body if getattr(stmt, "lineno", None) == u_end
                 ]
+                target_stmt: Optional[ast.AST] = None
+                if same_line_stmts:
+                    for stmt in same_line_stmts:
+                        if _stmt_assigns_to_any_name(stmt, outputs):
+                            target_stmt = stmt
+                            break
+                    if target_stmt is None:
+                        target_stmt = same_line_stmts[0]
+                target_idx = (
+                    same_line_stmts.index(target_stmt)
+                    if target_stmt in same_line_stmts
+                    else 0
+                )
                 for s in with_body:
                     s_lineno = getattr(s, "lineno", None)
                     if s_lineno is None:
@@ -1877,8 +1905,9 @@ def _enclosing_try_reads_outputs(
                             s_col = getattr(s, "col_offset", None)
                             if s_col is not None and s_col >= int(u_end_col):
                                 post_unit_with_stmts.append(s)
-                        elif len(same_line_stmts) > 1 and s is not same_line_stmts[0]:
-                            post_unit_with_stmts.append(s)
+                        elif len(same_line_stmts) > 1 and s is not target_stmt:
+                            if s in same_line_stmts and same_line_stmts.index(s) > target_idx:
+                                post_unit_with_stmts.append(s)
                 if post_unit_with_stmts and _nodes_load_any_name(post_unit_with_stmts, outputs):
                     return True
 

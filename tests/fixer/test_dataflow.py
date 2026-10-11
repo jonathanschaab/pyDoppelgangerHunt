@@ -28,6 +28,7 @@ from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-acc
     _MAX_SCOPE_CACHE_SIZE,
     _VisitorPassMode,
     _build_downstream_cache_key,
+    _classify_closure_position,
     _clear_downstream_reads_cache,
     _collect_pre_unit_closures,
     _collect_scope_closures,
@@ -3848,6 +3849,53 @@ def test_single_line_unit_unresolved_end_col_live_in_and_loop_carried() -> None:
     )
     assert reads is not None
     assert "running_sum" in reads
+
+
+def test_classify_closure_position_boundary_at_end_col() -> None:
+    """Verifies that a closure starting exactly at u_end_col is classified as is_post
+    and not as intra-unit."""
+    # Closure at line 4, col 20. Unit is line 2 to line 4, end_col 20.
+    is_pre, is_intra, is_post = _classify_closure_position(
+        (4, 20), u_start=2, u_end=4, u_end_col=20
+    )
+    assert is_post is True
+    assert is_intra is False
+    assert is_pre is False
+
+    # Closure before end_col (col 19) is intra-unit
+    is_pre, is_intra, is_post = _classify_closure_position(
+        (4, 19), u_start=2, u_end=4, u_end_col=20
+    )
+    assert is_post is False
+    assert is_intra is True
+
+
+def test_enclosing_try_reads_outputs_same_line_unit_accumulator_in_with() -> None:
+    """Verifies that when multiple statements reside on u_end and u_end_col cannot be
+    resolved, a unit at same_line_stmts[1] updating an accumulator in place does not
+    falsely trigger enclosing with cleanup rejection."""
+    src = (
+        "with lock:\n"
+        "    init_step = 1; acc = acc + 1; cleanup_flag = True\n"
+    )
+    tree = ast.parse(src)
+    # Unit is 'acc = acc + 1' on line 2, outputs={'acc'}, u_end_col=None
+    result = _enclosing_try_reads_outputs(
+        tree, u_start=2, u_end=2, outputs={"acc"}, u_end_col=None
+    )
+    assert result is False
+
+    # If a subsequent statement on line 2 reads 'acc', reject
+    src_read = (
+        "with lock:\n"
+        "    init_step = 1; acc = acc + 1; print(acc)\n"
+    )
+    tree_read = ast.parse(src_read)
+    result_read = _enclosing_try_reads_outputs(
+        tree_read, u_start=2, u_end=2, outputs={"acc"}, u_end_col=None
+    )
+    assert result_read is True
+
 
 
 

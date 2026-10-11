@@ -9271,4 +9271,53 @@ def test_validate_helper_compilation_indented_method_with_multiline_string_at_co
     assert_valid_python(combined_helper)
 
 
+def test_same_file_delegation_preserves_renamed_inputs_and_outputs_on_clone_2(
+    tmp_path: Path,
+) -> None:
+    """Verifies that same-file subroutine delegation uses clone 2's renamed inputs
+    and outputs instead of incorrectly copying clone 1's variable names."""
+    f = tmp_path / "calc.py"
+    code = (
+        "def compute_alpha(items):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "    return total\n"
+        "\n"
+        "def compute_beta(data):\n"
+        "    count = 0\n"
+        "    for y in data:\n"
+        "        count += y\n"
+        "    return count\n"
+    )
+    f.write_text(code, encoding="utf-8")
+    u1 = {
+        "file": str(f),
+        "start": 3,
+        "end": 4,
+        "name": "compute_alpha:for",
+        "kind": "compound_block",
+        "inputs": ["items", "total"],
+        "outputs": ["total"],
+    }
+    u2 = {
+        "file": str(f),
+        "start": 9,
+        "end": 10,
+        "name": "compute_beta:for",
+        "kind": "compound_block",
+        "inputs": ["data", "count"],
+        "outputs": ["count"],
+    }
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch != ""
+    # Clone 1 delegates using total and items
+    assert "+    total = _shared" in patch
+    # Clone 2 must delegate using count and data, NOT total and items
+    assert "+    count = _shared" in patch
+
+
+
 
