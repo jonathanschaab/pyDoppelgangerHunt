@@ -76,10 +76,30 @@ _parsed_tree_cache: OrderedDict[str, Optional[ast.AST]] = OrderedDict()
 
 _scope_parent_maps: OrderedDict[ast.AST, Dict[ast.AST, ast.AST]] = OrderedDict()
 _scope_stmts_by_end: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
-_scope_closures_cache: OrderedDict[ast.AST, List[Tuple[_ClosurePos, Set[str]]]] = OrderedDict()
+_scope_closures_cache: OrderedDict[Any, List[Tuple[_ClosurePos, Set[str]]]] = OrderedDict()
 _scope_loops_cache: OrderedDict[ast.AST, List[Tuple[int, int]]] = OrderedDict()
 _scope_try_with_cache: OrderedDict[ast.AST, List[ast.AST]] = OrderedDict()
 _warned_lenient_closure: List[bool] = [False]
+
+
+def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
+    """Purges scope-cache entries belonging to an evicted AST tree."""
+    if tree is None:
+        return
+    tree_nodes = set(ast.walk(tree))
+    for node in tree_nodes:
+        _scope_parent_maps.pop(node, None)
+        _scope_stmts_by_end.pop(node, None)
+        _scope_closures_cache.pop(node, None)
+        _scope_loops_cache.pop(node, None)
+        _scope_try_with_cache.pop(node, None)
+    closure_keys_to_remove = [
+        k
+        for k in _scope_closures_cache
+        if isinstance(k, tuple) and len(k) == 2 and (k[0] in tree_nodes or k[1] in tree_nodes)
+    ]
+    for k in closure_keys_to_remove:
+        _scope_closures_cache.pop(k, None)
 
 
 def _store_lru_cache_entry(
@@ -91,14 +111,16 @@ def _store_lru_cache_entry(
     """Stores key-value pair in an OrderedDict LRU cache with eviction under lock."""
     with _downstream_cache_lock:
         if key not in cache and len(cache) >= max_size:
-            cache.popitem(last=False)
+            _, evicted_val = cache.popitem(last=False)
+            if cache is _parsed_tree_cache:
+                _evict_tree_scopes(evicted_val)
         cache[key] = value
         cache.move_to_end(key)
 
 
 def _get_or_compute_scope_cached(
-    cache: OrderedDict[ast.AST, _CacheValT],
-    scope_node: ast.AST,
+    cache: OrderedDict[Any, _CacheValT],
+    scope_node: Any,
     compute_fn: Callable[[], _CacheValT],
 ) -> _CacheValT:
     """Retrieves cached scope metadata or computes, caches, and returns it thread-safely."""
@@ -1099,7 +1121,7 @@ _INNER_SCOPE_TYPES = (
 )
 
 
-def _extract_scope_local_names(scope_node: ast.AST) -> Set[str]:
+def _extract_single_node_local_names(scope_node: ast.AST) -> Set[str]:
     """Extracts parameters and locally assigned/imported/defined symbols in scope_node."""
     names: Set[str] = set()
     node_name = getattr(scope_node, "name", None)
@@ -1137,6 +1159,52 @@ def _extract_scope_local_names(scope_node: ast.AST) -> Set[str]:
     return names
 
 
+def _extract_scope_local_names(
+    scope_node: ast.AST,
+    module_tree: Optional[ast.AST] = None,
+) -> Set[str]:
+    """Extracts parameters and locally assigned/imported/defined symbols in scope_node
+    and all enclosing scopes up to module level."""
+    names = _extract_single_node_local_names(scope_node)
+    if module_tree is not None and module_tree is not scope_node:
+        parent_map = _get_scope_parent_map(module_tree)
+        curr: Optional[ast.AST] = parent_map.get(scope_node)
+        while curr is not None:
+            if isinstance(
+                curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
+            ):
+                names.update(_extract_single_node_local_names(curr))
+            curr = parent_map.get(curr)
+        if isinstance(
+            module_tree, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            names.update(_extract_single_node_local_names(module_tree))
+    return names
+
+
+def _is_confirmed_str_receiver(
+    node: ast.AST,
+    shadowed_names: Optional[Set[str]] = None,
+) -> bool:
+    """Verifies that an AST node is definitively a string receiver for .join calls."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return True
+    if isinstance(node, ast.JoinedStr):
+        return True
+    if isinstance(node, ast.Name) and node.id == "str":
+        if shadowed_names is not None and "str" in shadowed_names:
+            return False
+        return True
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in ("builtins", "__builtins__")
+        and node.attr == "str"
+    ):
+        return True
+    return False
+
+
 def _is_eagerly_consumed_genexp(
     genexp: ast.GeneratorExp,
     parent_map: Dict[ast.AST, ast.AST],
@@ -1151,16 +1219,17 @@ def _is_eagerly_consumed_genexp(
                 return False
             return True
         if isinstance(func, ast.Attribute) and func.attr == "join":
-            return True
+            return _is_confirmed_str_receiver(func.value, shadowed_names=shadowed_names)
     return False
 
 
 def _collect_scope_closures_uncached(
     scope_node: ast.AST,
+    module_tree: Optional[ast.AST] = None,
 ) -> List[Tuple[_ClosurePos, Set[str]]]:
     closures: List[Tuple[_ClosurePos, Set[str]]] = []
     parent_map = _get_scope_parent_map(scope_node)
-    shadowed_names = _extract_scope_local_names(scope_node)
+    shadowed_names = _extract_scope_local_names(scope_node, module_tree=module_tree)
 
     def _resolve_stmt_start_pos(s: ast.stmt) -> Tuple[int, int]:
         s_line = int(getattr(s, "lineno", 0) or 0)
@@ -1294,14 +1363,58 @@ def _collect_scope_closures_uncached(
     return closures
 
 
-def _collect_scope_closures(scope_node: ast.AST) -> List[Tuple[_ClosurePos, Set[str]]]:
+def _collect_scope_closures(
+    scope_node: ast.AST,
+    module_tree: Optional[ast.AST] = None,
+) -> List[Tuple[_ClosurePos, Set[str]]]:
     """Discovers all closures defined in a scope, recorded with their starting line."""
+    cache_key: Any = scope_node if module_tree is None else (scope_node, module_tree)
     return _get_or_compute_scope_cached(
         _scope_closures_cache,
-        scope_node,
-        lambda: _collect_scope_closures_uncached(scope_node),
+        cache_key,
+        lambda: _collect_scope_closures_uncached(scope_node, module_tree=module_tree),
     )
 
+
+def _normalize_closure_position(c_pos: Any) -> Tuple[int, int]:
+    """Normalizes closure position into (line, col) integer coordinates."""
+    if isinstance(c_pos, _ClosurePos):
+        return c_pos.line, c_pos.col
+    if isinstance(c_pos, (tuple, list)) and len(c_pos) >= 2:
+        return int(c_pos[0]), int(c_pos[1])
+    line = int(getattr(c_pos, "line", c_pos))
+    col = int(getattr(c_pos, "col", 0))
+    return line, col
+
+
+def _classify_closure_position(
+    c_pos: Any,
+    u_start: int,
+    u_end: int,
+    u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
+) -> Tuple[bool, bool, bool]:
+    """Classifies closure position as (is_pre, is_intra, is_post) relative to unit bounds.
+
+    Same-line closures at boundary lines with unknown column offsets are conservatively
+    treated as touching that boundary (pre and intra at u_start, intra and post at u_end)
+    to fail closed across dataflow analysis.
+    """
+    c_line, c_col = _normalize_closure_position(c_pos)
+    if c_line < u_start:
+        return True, False, False
+    if c_line > u_end:
+        return False, False, True
+
+    is_pre = (c_line == u_start and (u_start_col is None or c_col < u_start_col))
+    is_post = (c_line == u_end and (u_end_col is None or c_col > u_end_col))
+
+    not_intra = (
+        (c_line == u_start and u_start_col is not None and c_col < u_start_col)
+        or (c_line == u_end and u_end_col is not None and c_col > u_end_col)
+    )
+    is_intra = not not_intra
+    return is_pre, is_intra, is_post
 
 
 def _collect_pre_unit_closures(
@@ -1309,19 +1422,14 @@ def _collect_pre_unit_closures(
     u_start: int,
     candidates: Optional[Set[str]] = None,
     u_start_col: Optional[int] = None,
+    module_tree: Optional[ast.AST] = None,
 ) -> Set[str]:
     """Discovers free variables captured by functions, class methods, and lambdas defined prior
     to the unit in the same lexical scope."""
     captured_reads: Set[str] = set()
-    for c_pos, reads in _collect_scope_closures(scope_node):
-        if isinstance(c_pos, (tuple, list)) and len(c_pos) >= 2:
-            c_line, c_col = int(c_pos[0]), int(c_pos[1])
-        else:
-            c_line = int(c_pos)
-            c_col = getattr(c_pos, "col", 0)
-        is_pre = (
-            c_line < u_start
-            or (c_line == u_start and (u_start_col is None or c_col < u_start_col))
+    for c_pos, reads in _collect_scope_closures(scope_node, module_tree=module_tree):
+        is_pre, _, _ = _classify_closure_position(
+            c_pos, u_start, u_start, u_start_col=u_start_col
         )
         if is_pre:
             if candidates is not None:
@@ -1348,6 +1456,22 @@ def clear_dataflow_cache() -> None:
 _clear_downstream_reads_cache = clear_dataflow_cache
 
 
+class _DownstreamCacheKey(NamedTuple):
+    """Immutable cache key for downstream AST read analysis."""
+
+    content_digest: str
+    file_path: str
+    start: int
+    end: int
+    start_col: Optional[int]
+    end_col: Optional[int]
+    kind: Optional[str]
+    name: Optional[str]
+    is_subroutine: bool
+    candidates: Optional[frozenset[str]]
+    skip_pre_unit_closures: bool
+
+
 def _build_downstream_cache_key(
     source_text: str,
     unit: Dict[str, Any],
@@ -1357,7 +1481,7 @@ def _build_downstream_cache_key(
     skip_pre_unit_closures: bool,
     source_digest: Optional[str] = None,
     resolved_end_col: Optional[int] = None,
-) -> Tuple[Any, ...]:
+) -> _DownstreamCacheKey:
     """Forms a persistent cache key for downstream AST read analysis."""
     file_path_str = str(unit.get("file") or "")
     digest = source_digest or unit.get("source_digest") or unit.get("content_digest")
@@ -1378,18 +1502,18 @@ def _build_downstream_cache_key(
     unit_kind = unit.get("kind")
     unit_name = unit.get("name")
     is_sub = is_subroutine_unit(unit)
-    return (
-        content_digest,
-        file_path_str,
-        u_start,
-        u_end,
-        start_col,
-        end_col,
-        unit_kind,
-        unit_name,
-        is_sub,
-        cands_key,
-        bool(skip_pre_unit_closures),
+    return _DownstreamCacheKey(
+        content_digest=content_digest,
+        file_path=file_path_str,
+        start=u_start,
+        end=u_end,
+        start_col=start_col,
+        end_col=end_col,
+        kind=unit_kind,
+        name=unit_name,
+        is_subroutine=is_sub,
+        candidates=cands_key,
+        skip_pre_unit_closures=bool(skip_pre_unit_closures),
     )
 
 
@@ -1765,6 +1889,7 @@ def collect_downstream_read_names(
             u_start,
             candidates=candidates,
             u_start_col=u_start_col,
+            module_tree=effective_tree,
         )
 
     is_module = isinstance(scope_node, ast.Module)
@@ -2137,22 +2262,12 @@ def resolve_clone_generator_subroutine_outputs(
                 u_item, ("start_col", "start_col_offset")
             )
             u_end_col = _extract_unit_end_col(u_item)
-            for c_pos, reads in _collect_scope_closures(scope_node):
-                if isinstance(c_pos, (tuple, list)) and len(c_pos) >= 2:
-                    c_line, c_col = int(c_pos[0]), int(c_pos[1])
-                else:
-                    c_line = int(c_pos)
-                    c_col = getattr(c_pos, "col", 0)
-                is_pre = (
-                    c_line < u_s
-                    or (c_line == u_s and u_start_col is not None and c_col < u_start_col)
+            for c_pos, reads in _collect_scope_closures(scope_node, module_tree=tr):
+                _, is_intra, _ = _classify_closure_position(
+                    c_pos, u_s, u_e, u_start_col=u_start_col, u_end_col=u_end_col
                 )
-                is_post = (
-                    c_line > u_e
-                    or (c_line == u_e and u_end_col is not None and c_col > u_end_col)
-                )
-                is_intra = not is_pre and not is_post
                 if is_intra and bool(reads & set(needed_outs)):
+                    c_line, _ = _normalize_closure_position(c_pos)
                     logger.debug(
                         "Rejecting generator subroutine pair: intra-unit closure at line %d "
                         "captures needed output(s) %r for unit %s",

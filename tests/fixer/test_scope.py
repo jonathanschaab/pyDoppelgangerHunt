@@ -1511,36 +1511,6 @@ def test_scope_inspection_custom_receiver_attributes(tmp_path: Path) -> None:
     assert s_cls["inputs"][0] == "klass"
 
 
-def test_dispatch_analyze_unit_variable_scope_alias(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verifies that dispatch functions dynamically route to mock patches on fixer package."""
-    import pydoppelgangerhunt.fixer as fixer_mod
-    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
-        dispatch_analyze_unit_variable_scope,
-        dispatch_inspect_single_unit_scope,
-    )
-
-    dummy_unit = {"file": "mod.py", "source_text": "x = 1\n", "start": 1, "end": 1}
-
-    # 1. Unpatched execution routes directly
-    res_analyze = dispatch_analyze_unit_variable_scope(dummy_unit)
-    res_inspect = dispatch_inspect_single_unit_scope(dummy_unit)
-    assert res_analyze["locals"] == ["x"]
-    assert res_inspect["stores"] == ["x"]
-
-    # 2. Mocked execution on fixer package is honored
-    mock_sentinel = {"mocked": True, "outputs": ["mock_out"]}
-    monkeypatch.setattr(
-        fixer_mod, "analyze_unit_variable_scope", lambda *args, **kwargs: mock_sentinel
-    )
-    assert dispatch_analyze_unit_variable_scope(dummy_unit) is mock_sentinel
-
-    mock_inspect_sentinel = {"mocked_inspect": True, "stores": ["mock_store"]}
-    monkeypatch.setattr(
-        fixer_mod, "inspect_single_unit_scope", lambda *args, **kwargs: mock_inspect_sentinel
-    )
-    assert dispatch_inspect_single_unit_scope(dummy_unit) is mock_inspect_sentinel
-
-
 def test_inspect_unit_scope_deterministic_set_outputs() -> None:
     """Verifies that analyze_unit_variable_scope rejects multi-item sets to prevent
     unpositional output pairing, while single-item sets are supported."""

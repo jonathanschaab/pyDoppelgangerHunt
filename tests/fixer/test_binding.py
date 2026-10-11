@@ -1373,3 +1373,41 @@ def test_prune_unshared_receivers_custom_receiver() -> None:
     scope1_ref: Dict[str, Any] = {"inputs": ["this", "val"], "has_receiver_access": True, "instance_attrs": ["this.x"], "class_attrs": []}
     unpruned = _prune_unshared_receivers(inputs, u1, u2, scope1_ref, scope2)
     assert unpruned == ["this", "val"]
+
+
+def test_populate_unit_receiver_metadata_two_is_async_meanings(tmp_path: Path) -> None:
+    """Verifies that pure-sync subroutines inside async functions get enclosing_is_async=True
+    while retaining is_async=False."""
+    src = (
+        "async def async_worker(items):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "    return total\n"
+    )
+    p = tmp_path / "worker.py"
+    p.write_text(src, encoding="utf-8")
+
+    # 1. Subroutine unit (compound block: for loop) inside async def
+    sub_unit = {
+        "file": str(p),
+        "kind": "compound_block",
+        "start": 3,
+        "end": 4,
+    }
+    _populate_unit_receiver_metadata(sub_unit, repo_root=str(tmp_path))
+    assert sub_unit.get("enclosing_is_async") is True
+    assert sub_unit.get("is_async") is False
+
+    # 2. Whole function unit for async def
+    fn_unit = {
+        "file": str(p),
+        "kind": "function",
+        "start": 1,
+        "end": 5,
+        "name": "async_worker",
+    }
+    _populate_unit_receiver_metadata(fn_unit, repo_root=str(tmp_path))
+    assert fn_unit.get("enclosing_is_async") is True
+    assert fn_unit.get("is_async") is True
+

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+from collections import defaultdict
 import difflib
 import hashlib
 import logging
@@ -26,6 +27,11 @@ from pydoppelgangerhunt.fixer.binding import (
     find_enclosing_function,
 )
 from pydoppelgangerhunt.fixer.dataflow import (
+    _collect_pre_unit_closures,
+    _extract_effective_unit_outputs,
+    _extract_first_unit_coord,
+    _get_valid_unit_bounds,
+    _resolve_downstream_scope_node,
     has_async_generator_delegation_hazard,
     resolve_clone_pair_outputs,
 )
@@ -2619,6 +2625,42 @@ def _resolve_safe_clone_file_path(
     return resolved
 
 
+def _determine_unit_receiver_kind(
+    fn: Optional[Dict[str, Any]],
+    unit: Dict[str, Any],
+    enc: Optional[Dict[str, Any]],
+) -> str:
+    """Determines the receiver kind ('instance', 'class', 'static', 'none') for a unit."""
+    non_method_kinds = (
+        "closure",
+        "class",
+        "comprehension",
+        "data_table",
+        "complex_expr",
+    )
+    if fn:
+        return _get_enclosing_receiver_kind(fn)
+    if unit.get("receiver_kind"):
+        return str(unit["receiver_kind"])
+    if enc and unit.get("kind") not in non_method_kinds:
+        return "instance"
+    return "none"
+
+
+def _record_skip_comment(
+    f1_plan: _FilePatchPlan,
+    f2_plan: Optional[_FilePatchPlan],
+    skip_reasons: Dict[str, int],
+    reason_key: str,
+    comment: str,
+) -> None:
+    """Records a rejection reason counter and attaches the diagnostic comment to file plans."""
+    skip_reasons[reason_key] += 1
+    f1_plan.comments.append(comment)
+    if f2_plan is not None:
+        f2_plan.comments.append(comment)
+
+
 def generate_refactoring_patch(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     repo_root: Optional[str] = None,
@@ -2634,32 +2676,7 @@ def generate_refactoring_patch(
     """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
     if not clones:
         return ""
-    return _generate_refactoring_patch_impl(
-        clones=clones,
-        repo_root=repo_root,
-        type_merge_strategy=type_merge_strategy,
-        replace_clones=replace_clones,
-        method_binding=method_binding,
-        cross_file_strategy=cross_file_strategy,
-        shared_module_name=shared_module_name,
-        depgraph=depgraph,
-        skip_pre_unit_closures=skip_pre_unit_closures,
-        closure_strictness=closure_strictness,
-    )
-
-
-def _generate_refactoring_patch_impl(
-    clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
-    repo_root: Optional[str] = None,
-    type_merge_strategy: str = "fallback_any",
-    replace_clones: bool = False,
-    method_binding: str = "auto",
-    cross_file_strategy: str = "auto",
-    shared_module_name: str = "_common.py",
-    depgraph: Optional[ModuleDependencyGraph] = None,
-    skip_pre_unit_closures: bool = False,
-    closure_strictness: Optional[str] = None,
-) -> str:
+    skip_reasons: Dict[str, int] = defaultdict(int)
     fs_root = Path(repo_root or os.getcwd()).resolve()
     if fs_root.is_file():
         fs_root = fs_root.parent
@@ -2719,21 +2736,9 @@ def _generate_refactoring_patch_impl(
             not is_valid_unit_coordinates(u1, strict=True)
             or not is_valid_unit_coordinates(u2, strict=True)
         ):
+            skip_reasons["malformed coordinates"] += 1
             logger.debug(
                 "Skipping clone pair with malformed unit coordinates: (%s, %s)", u1, u2
-            )
-            continue
-
-        is_sub1 = is_subroutine_unit(u1)
-        is_sub2 = is_subroutine_unit(u2)
-        if is_sub1 != is_sub2:
-            logger.debug(
-                "Skipping clone pair (%s, %s): mismatched subroutine kinds "
-                "(is_sub1=%s, is_sub2=%s)",
-                u1.get("name"),
-                u2.get("name"),
-                is_sub1,
-                is_sub2,
             )
             continue
 
@@ -2748,11 +2753,13 @@ def _generate_refactoring_patch_impl(
         try:
             f1_raw = normalize_path_string(str(u1.get("file") or ""), strip_anchor=True)
             if not f1_raw:
+                skip_reasons["empty file path"] += 1
                 continue
             f1_path, is_f1_rejected = _validate_clone_file_path(
                 f1_raw, candidate_roots
             )
             if is_f1_rejected or f1_path is None:
+                skip_reasons["invalid or rejected file path"] += 1
                 continue
 
             if f1_path in initial_plan_keys and f1_path not in plans_snapshot:
@@ -2765,6 +2772,7 @@ def _generate_refactoring_patch_impl(
                 try:
                     orig_text = f1_path.read_text(encoding="utf-8")
                 except (OSError, UnicodeDecodeError):
+                    skip_reasons["unreadable file"] += 1
                     continue
                 f1_plan = _get_plan(f1_path, rel_f1, orig_text)
             else:
@@ -2779,8 +2787,13 @@ def _generate_refactoring_patch_impl(
                     f2_raw, candidate_roots
                 )
                 if is_f2_rejected:
+                    skip_reasons["invalid or rejected file path"] += 1
                     continue
-                if f2_path is not None and f2_path in initial_plan_keys and f2_path not in plans_snapshot:
+                if (
+                    f2_path is not None
+                    and f2_path in initial_plan_keys
+                    and f2_path not in plans_snapshot
+                ):
                     plans_snapshot[f2_path] = file_plans[f2_path].snapshot()
 
             is_same_file = False
@@ -2814,6 +2827,7 @@ def _generate_refactoring_patch_impl(
                         enc2 = find_enclosing_class(f2_plan.orig_text, u2)
                         fn2 = find_enclosing_function(f2_plan.orig_text, u2)
             else:
+                skip_reasons["missing second file"] += 1
                 continue
 
             u1_lines = orig_lines
@@ -2848,6 +2862,7 @@ def _generate_refactoring_patch_impl(
                         else False
                     )
                 if u1_claimed or u2_claimed:
+                    skip_reasons["overlapping claimed unit"] += 1
                     continue
 
             is_same_class = bool(
@@ -2870,9 +2885,9 @@ def _generate_refactoring_patch_impl(
             if not _is_method_of_class(fn2, enc2):
                 fn2 = None
 
-            non_method_kinds = ("closure", "class", "comprehension", "data_table", "complex_expr")
-            fn1_kind = _get_enclosing_receiver_kind(fn1) if fn1 else (u1.get("receiver_kind") or ("instance" if enc1 and u1.get("kind") not in non_method_kinds else "none"))
-            fn2_kind = _get_enclosing_receiver_kind(fn2) if fn2 else (u2.get("receiver_kind") or ("instance" if enc2 and u2.get("kind") not in non_method_kinds else "none"))
+            fn1_kind = _determine_unit_receiver_kind(fn1, u1, enc1)
+            fn2_kind = _determine_unit_receiver_kind(fn2, u2, enc2)
+
             receiver_kinds_differ = bool(fn1_kind != fn2_kind)
             is_in_method = bool(
                 fn1
@@ -2889,7 +2904,9 @@ def _generate_refactoring_patch_impl(
             if fn1 and fn2:
                 is_static = bool(fn1.get("is_static") and fn2.get("is_static"))
             else:
-                is_static = bool((fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static")))
+                is_static = bool(
+                    (fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static"))
+                )
 
             tree1 = f1_plan.parsed_tree
             tree2 = (
@@ -2903,6 +2920,22 @@ def _generate_refactoring_patch_impl(
                 if f2_plan is not None
                 else (digest1 if is_same_file else None)
             )
+            is_sub1 = is_subroutine_unit(u1_eff, source_text=orig_text, tree=tree1)
+            is_sub2 = is_subroutine_unit(u2_eff, source_text=f2_text, tree=tree2)
+            u1_eff["is_subroutine"] = is_sub1
+            u2_eff["is_subroutine"] = is_sub2
+            if is_sub1 != is_sub2:
+                skip_reasons["mismatched subroutine kinds"] += 1
+                logger.debug(
+                    "Skipping clone pair (%s, %s): mismatched subroutine kinds "
+                    "(is_sub1=%s, is_sub2=%s)",
+                    u1.get("name"),
+                    u2.get("name"),
+                    is_sub1,
+                    is_sub2,
+                )
+                continue
+
             s1 = inspect_single_unit_scope(u1_eff, repo_root=str(root), tree=tree1)
             s2 = inspect_single_unit_scope(u2_eff, repo_root=str(root), tree=tree2)
             if orig_fn1 and orig_fn1.get("is_async") and s1.get("has_yield"):
@@ -2910,6 +2943,7 @@ def _generate_refactoring_patch_impl(
             if orig_fn2 and orig_fn2.get("is_async") and s2.get("has_yield"):
                 s2["is_async"] = True
             if s1.get("is_async") is None or s2.get("is_async") is None:
+                skip_reasons["indeterminate async state"] += 1
                 logger.debug(
                     "Skipping clone pair (%s, %s): indeterminate async state",
                     u1.get("name"),
@@ -2917,14 +2951,19 @@ def _generate_refactoring_patch_impl(
                 )
                 continue
             if bool(s1.get("is_async")) != bool(s2.get("is_async")):
+                skip_reasons["mismatched async state"] += 1
                 continue
             if bool(s1.get("has_yield")) != bool(s2.get("has_yield")):
+                skip_reasons["mismatched generator state"] += 1
                 continue
             if has_async_generator_delegation_hazard(s1, s2):
+                skip_reasons["async generator delegation hazard"] += 1
                 continue
             if s1.get("nonlocals") or s2.get("nonlocals"):
+                skip_reasons["nonlocal variables present"] += 1
                 continue
             if not is_same_file and (s1.get("globals") or s2.get("globals")):
+                skip_reasons["cross-file global variables"] += 1
                 continue
             rec1 = u1_eff.get("receiver_param") or ("cls" if fn1_kind == "class" else "self")
             rec2 = u2_eff.get("receiver_param") or ("cls" if fn2_kind == "class" else "self")
@@ -2934,21 +2973,25 @@ def _generate_refactoring_patch_impl(
                 or _normalize_receiver_attrs(s1.get("attrs_written", []), rec1)
                 != _normalize_receiver_attrs(s2.get("attrs_written", []), rec2)
             ):
+                skip_reasons["incompatible receiver attribute accesses"] += 1
                 continue
 
             hazards1 = set(s1.get("control_flow_hazards", []))
             hazards2 = set(s2.get("control_flow_hazards", []))
             if any(h in ("naked_break", "naked_continue") for h in hazards1 | hazards2):
+                skip_reasons["naked break or continue"] += 1
                 continue
             if "embedded_return" in hazards1 | hazards2:
                 lines1 = u1_lines
                 lines2 = u2_lines
                 if lines1 is None or lines2 is None:
+                    skip_reasons["missing source lines"] += 1
                     continue
                 if not (
                     _has_unconditional_terminal_return(u1, lines1)
                     and _has_unconditional_terminal_return(u2, lines2)
                 ):
+                    skip_reasons["embedded return hazard"] += 1
                     continue
 
             if receiver_kinds_differ:
@@ -2956,6 +2999,7 @@ def _generate_refactoring_patch_impl(
                     _has_receiver_reference(u1_eff, s1, repo_root=str(root))
                     or _has_receiver_reference(u2_eff, s2, repo_root=str(root))
                 ):
+                    skip_reasons["unbound receiver reference"] += 1
                     continue
 
             effective_binding = _resolve_effective_binding(
@@ -2969,10 +3013,12 @@ def _generate_refactoring_patch_impl(
 
             has_super = bool(s1.get("has_super") or s2.get("has_super"))
             if has_super and (effective_binding == "module" or is_static):
+                skip_reasons["super() in non-method helper"] += 1
                 continue
 
             has_mangled = bool(s1.get("has_mangled_names") or s2.get("has_mangled_names"))
             if has_mangled and (effective_binding != "method" or not is_same_class or is_static):
+                skip_reasons["mangled names in non-method helper"] += 1
                 continue
 
             helper_indent = (
@@ -3023,6 +3069,40 @@ def _generate_refactoring_patch_impl(
                 require_pairing=replace_clones,
             )
             if resolved_outs is None:
+                o1 = _extract_effective_unit_outputs(u1_eff, s1)
+                o2 = _extract_effective_unit_outputs(u2_eff, s2)
+                common = set(o1) & set(o2)
+                if s1.get("outputs_ambiguous") or s2.get("outputs_ambiguous"):
+                    skip_reasons["ambiguous outputs"] += 1
+                elif len(o1) != len(o2):
+                    skip_reasons["output arity mismatch"] += 1
+                elif any(o1.index(n) != o2.index(n) for n in common):
+                    skip_reasons["permuted outputs"] += 1
+                elif bool(s1.get("has_yield") or s2.get("has_yield")):
+                    has_pre = False
+                    if not effective_skip_closures:
+                        for u_item, s_text, tr in (
+                            (u1_eff, f1_plan.orig_text, tree1),
+                            (u2_eff, f2_text, tree2),
+                        ):
+                            sn = _resolve_downstream_scope_node(s_text or "", u_item, tr)
+                            b = _get_valid_unit_bounds(u_item)
+                            if sn and b:
+                                col = _extract_first_unit_coord(
+                                    u_item, ("start_col", "start_col_offset")
+                                )
+                                pre = _collect_pre_unit_closures(
+                                    sn, b[0], u_start_col=col, module_tree=tr
+                                )
+                                if pre:
+                                    has_pre = True
+                                    break
+                    if has_pre:
+                        skip_reasons["pre-unit closure"] += 1
+                    else:
+                        skip_reasons["generator output or closure conflict"] += 1
+                else:
+                    skip_reasons["unpaired outputs"] += 1
                 logger.debug(
                     "Skipping clone pair (%s, %s): failed to resolve clone pair outputs "
                     "(necessity, pairing, or definiteness check failed)",
@@ -3034,6 +3114,7 @@ def _generate_refactoring_patch_impl(
             if has_async_generator_delegation_hazard(
                 s1, s2, has_outputs=bool(outputs or target_outs2)
             ):
+                skip_reasons["async generator delegation hazard"] += 1
                 logger.debug(
                     "Skipping clone pair (%s, %s): async generator cannot return "
                     "values or outputs",
@@ -3059,10 +3140,11 @@ def _generate_refactoring_patch_impl(
                 or not _outputs_compatible(
                     outputs,
                     target_outs2,
-                    is_subroutine=is_subroutine_unit(u1_eff),
+                    is_subroutine=is_sub1,
                     has_yield=bool(s1.get("has_yield") or s2.get("has_yield")),
                 )
             ):
+                skip_reasons["incompatible inputs or outputs"] += 1
                 logger.debug(
                     "Skipping clone pair (%s, %s): incompatible inputs or outputs",
                     u1.get("name"),
@@ -3080,6 +3162,7 @@ def _generate_refactoring_patch_impl(
             target_host_text: Optional[str] = None
             cross_file_action = cross_file_strategy
             if not is_same_file and cross_file_action in ("skip", "none"):
+                skip_reasons["cross-file refactoring skipped"] += 1
                 continue
             if cross_file_action == "auto" and not is_same_file and f2_plan is not None:
                 common_dir = find_nearest_common_package(f1_path, f2_plan.path, patch_root)
@@ -3105,6 +3188,7 @@ def _generate_refactoring_patch_impl(
                     f1_path, f2_plan.path, patch_root, shared_module_name, f1_plan, f2_plan
                 )
                 if maybe_shared_p is None:
+                    skip_reasons["shared module path unresolvable"] += 1
                     continue
                 shared_p = maybe_shared_p
                 if shared_p in initial_plan_keys and shared_p not in plans_snapshot:
@@ -3120,7 +3204,9 @@ def _generate_refactoring_patch_impl(
                         if target_host_plan is None and shared_p.is_file() and not shared_p.is_symlink():
                             try:
                                 shared_p.resolve().relative_to(patch_root.resolve())
-                                target_host_text = shared_p.read_text(encoding="utf-8")
+                                target_host_text = shared_p.read_text(
+                                    encoding="utf-8"
+                                )
                             except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
                                 pass
                     except (OSError, RuntimeError, ValueError):
@@ -3173,6 +3259,7 @@ def _generate_refactoring_patch_impl(
                 outputs2=target_outs2,
             )
             if not helper_code:
+                skip_reasons["shared helper synthesis failed"] += 1
                 continue
 
             await_prefix = "await " if scope.get("is_async") else ""
@@ -3214,6 +3301,7 @@ def _generate_refactoring_patch_impl(
                     is_host_pkg=is_pkg1,
                 )
                 if maybe_imports is None:
+                    skip_reasons["circular import or unresolvable import"] += 1
                     continue
                 host_imports = maybe_imports
 
@@ -3257,9 +3345,11 @@ def _generate_refactoring_patch_impl(
                 )
             elif f2_plan is not None:
                 if cross_file_action in ("skip", "none"):
+                    skip_reasons["cross-file refactoring skipped"] += 1
                     continue
                 if cross_file_action in ("shared_module", "shared"):
                     if shared_p is None:
+                        skip_reasons["shared module path unresolvable"] += 1
                         continue
                     rel_shared = _format_patch_relative_path(shared_p, patch_root, fs_root)
 
@@ -3287,12 +3377,14 @@ def _generate_refactoring_patch_impl(
                                 kind_desc = f"unresolvable ({exc})"
 
                             if is_bad_target:
-                                skip_msg = (
-                                    f"# Note: Cross-module clone pair; shared module path {rel_shared} "
-                                    f"is {kind_desc}; skipping extraction.\n"
+                                _record_skip_comment(
+                                    f1_plan,
+                                    f2_plan,
+                                    skip_reasons,
+                                    "shared module target is symlink or directory",
+                                    f"# Note: Cross-module clone pair; shared module path "
+                                    f"{rel_shared} is {kind_desc}; skipping extraction.\n",
                                 )
-                                f1_plan.comments.append(skip_msg)
-                                f2_plan.comments.append(skip_msg)
                                 continue
 
                             try:
@@ -3303,17 +3395,22 @@ def _generate_refactoring_patch_impl(
                             if is_existing_file:
                                 try:
                                     shared_p.resolve().relative_to(patch_root.resolve())
-                                    shared_text = shared_p.read_text(encoding="utf-8")
+                                    shared_text = shared_p.read_text(
+                                        encoding="utf-8"
+                                    )
                                     shared_plan = _get_plan(
                                         shared_p, rel_shared, shared_text, is_new_file=False
                                     )
                                 except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
-                                    read_err_msg = (
-                                        f"# Note: Cross-module clone pair; shared module file {rel_shared} "
-                                        f"exists but could not be read; skipping extraction.\n"
+                                    _record_skip_comment(
+                                        f1_plan,
+                                        f2_plan,
+                                        skip_reasons,
+                                        "shared module read error",
+                                        f"# Note: Cross-module clone pair; shared module file "
+                                        f"{rel_shared} exists but could not be read; "
+                                        f"skipping extraction.\n",
                                     )
-                                    f1_plan.comments.append(read_err_msg)
-                                    f2_plan.comments.append(read_err_msg)
                                     continue
                             else:
                                 shared_plan = _get_plan(
@@ -3342,6 +3439,7 @@ def _generate_refactoring_patch_impl(
                         is_host_pkg=is_host_pkg,
                     )
                     if maybe_imports is None:
+                        skip_reasons["circular import or unresolvable import"] += 1
                         continue
                     host_imports = maybe_imports
 
@@ -3355,13 +3453,18 @@ def _generate_refactoring_patch_impl(
                             is_package=is_host_pkg,
                         )
                         if host_cycle:
-                            cycle_desc = f"Circular import detected (cycle: {' -> '.join(host_cycle)})"
-                            cycle_msg = (
-                                f"# Note: Cross-module clone pair; helper extraction to {host_disp} "
-                                f"rejected due to circular dependency ({cycle_desc}).\n"
+                            cycle_desc = (
+                                f"Circular import detected (cycle: {' -> '.join(host_cycle)})"
                             )
-                            f1_plan.comments.append(cycle_msg)
-                            f2_plan.comments.append(cycle_msg)
+                            _record_skip_comment(
+                                f1_plan,
+                                f2_plan,
+                                skip_reasons,
+                                "circular import detected",
+                                f"# Note: Cross-module clone pair; "
+                                f"helper extraction to {host_disp} "
+                                f"rejected due to circular dependency ({cycle_desc}).\n",
+                            )
                             continue
 
                     tentative_dg = dg.copy()
@@ -3394,14 +3497,19 @@ def _generate_refactoring_patch_impl(
                     if host_plan in (f1_plan, f2_plan) and caller_evaluations:
                         c_plan, _, _, _, c_mod, c_cycle = caller_evaluations[0]
                         if c_cycle or not mod_host or not c_mod:
-                            c_disp = normalize_path_string(str(c_plan.rel_path), strip_anchor=False)
-                            c_desc = f" (cycle: {' -> '.join(c_cycle)})" if c_cycle else ""
-                            c_msg = (
-                                f"# Note: Cross-module clone pair; helper extraction to {host_disp} rejected. "
-                                f"Circular import or unresolvable module path{c_desc}.\n"
+                            c_disp = normalize_path_string(
+                                str(c_plan.rel_path), strip_anchor=False
                             )
-                            f1_plan.comments.append(c_msg)
-                            f2_plan.comments.append(c_msg)
+                            c_desc = f" (cycle: {' -> '.join(c_cycle)})" if c_cycle else ""
+                            _record_skip_comment(
+                                f1_plan,
+                                f2_plan,
+                                skip_reasons,
+                                "circular import detected",
+                                f"# Note: Cross-module clone pair; "
+                                f"helper extraction to {host_disp} "
+                                f"rejected. Circular import or unresolvable module path{c_desc}.\n",
+                            )
                             continue
 
                     if host_plan not in (f1_plan, f2_plan) and all(
@@ -3414,12 +3522,14 @@ def _generate_refactoring_patch_impl(
                             if cycle
                         ]
                         c_txt = f" ({'; '.join(c_descs)})" if c_descs else ""
-                        skip_msg = (
+                        _record_skip_comment(
+                            f1_plan,
+                            f2_plan,
+                            skip_reasons,
+                            "circular import detected",
                             f"# Note: Cross-module clone pair; helper extraction to {host_disp} "
-                            f"rejected due to circular dependency{c_txt}.\n"
+                            f"rejected due to circular dependency{c_txt}.\n",
                         )
-                        f1_plan.comments.append(skip_msg)
-                        f2_plan.comments.append(skip_msg)
                         continue
 
                     host_plan.module_helpers.append(helper_code)
@@ -3519,6 +3629,7 @@ def _generate_refactoring_patch_impl(
                         is_host_pkg=is_pkg1,
                     )
                     if maybe_imports is None:
+                        skip_reasons["circular import or unresolvable import"] += 1
                         continue
                     host_imports = maybe_imports
 
@@ -3530,6 +3641,7 @@ def _generate_refactoring_patch_impl(
                             is_package=is_pkg1,
                         )
                         if host_cycle:
+                            skip_reasons["circular import detected"] += 1
                             cycle_desc = f" (cycle: {' -> '.join(host_cycle)})"
                             cycle_msg = (
                                 f"# Note: Cross-module clone pair; helper extraction to {f1_disp} "
@@ -3559,6 +3671,7 @@ def _generate_refactoring_patch_impl(
                     is_circular = bool(cycle or direct_import)
 
                     if is_circular or not mod1 or not mod2:
+                        skip_reasons["circular import detected"] += 1
                         cycle_desc = ""
                         if cycle:
                             cycle_desc = f" (cycle: {' -> '.join(cycle)})"
@@ -3631,6 +3744,7 @@ def _generate_refactoring_patch_impl(
                     is_host_pkg=is_pkg1,
                 )
                 if maybe_imports is None:
+                    skip_reasons["circular import or unresolvable import"] += 1
                     continue
                 host_imports = maybe_imports
 
@@ -3642,7 +3756,7 @@ def _generate_refactoring_patch_impl(
                 )
                 _finalize_host_unit_and_helper(
                     plan=f1_plan,
-                    unit=u1,
+                    unit=u1_eff,
                     helper_name=helper_name,
                     inputs=inputs,
                     outputs=outputs,
@@ -3659,6 +3773,7 @@ def _generate_refactoring_patch_impl(
         except (AttributeError, NameError, RecursionError, ImportError):
             raise
         except Exception as exc:
+            skip_reasons["processing exception"] += 1
             if isinstance(exc, (ValueError, TypeError, SyntaxError)):
                 logger.debug(
                     "Skipping clone pair due to coordinate, syntax, or processing error: %s",
@@ -3678,6 +3793,12 @@ def _generate_refactoring_patch_impl(
                     del file_plans[p]
             graph_holder[0] = graph_snapshot
             continue
+
+    total_skipped = sum(skip_reasons.values())
+    if total_skipped > 0:
+        sorted_reasons = sorted(skip_reasons.items(), key=lambda kv: (-kv[1], kv[0]))
+        reason_summary = ", ".join(f"{cnt} {reason}" for reason, cnt in sorted_reasons)
+        logger.info("%d clone pair(s) skipped: %s", total_skipped, reason_summary)
 
     patch_chunks: List[str] = []
     seen_comments: Set[str] = set()

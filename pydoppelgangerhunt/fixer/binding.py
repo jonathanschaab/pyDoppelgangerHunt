@@ -13,6 +13,7 @@ from pydoppelgangerhunt.fixer.scope import analyze_unit_variable_scope
 from pydoppelgangerhunt.fixer.source import (
     _find_innermost_enclosing_node,
     _load_unit_file_text,
+    is_subroutine_unit,
     split_source_lines,
 )
 from pydoppelgangerhunt.parser import is_decorator_named
@@ -132,6 +133,7 @@ def find_enclosing_function(
     decs = meta.pop("decorators", [])
     node = meta.pop("node", None)
     meta["is_async"] = isinstance(node, ast.AsyncFunctionDef)
+    meta["enclosing_is_async"] = meta["is_async"]
     meta["is_static"] = any(is_decorator_named(d, "staticmethod") for d in decs)
     meta["is_class_method"] = any(is_decorator_named(d, "classmethod") for d in decs)
     receiver_param = None
@@ -268,6 +270,7 @@ def _populate_unit_receiver_metadata(
         and "enclosing_class_start" in unit
         and "receiver_param" in unit
         and "is_async" in unit
+        and "enclosing_is_async" in unit
     ):
         return
     source = _load_unit_file_text(unit, repo_root=repo_root)
@@ -294,8 +297,15 @@ def _populate_unit_receiver_metadata(
             unit["receiver_param"] = fn_meta.get("receiver_param") if fn_meta else None
         else:
             unit["receiver_param"] = None
+    fn_is_async = bool(fn_meta.get("is_async")) if fn_meta else False
+    if "enclosing_is_async" not in unit:
+        unit["enclosing_is_async"] = fn_is_async
     if "is_async" not in unit:
-        unit["is_async"] = bool(fn_meta.get("is_async")) if fn_meta else False
+        is_sub = is_subroutine_unit(unit, source_text=source)
+        if is_sub:
+            unit["is_async"] = False
+        else:
+            unit["is_async"] = fn_is_async
 
 
 def _base_unit_name(u: Dict[str, Any]) -> str:

@@ -2824,3 +2824,20 @@ def test_flatten_union_args_typing_extensions() -> None:
         _normalize_pipe_unions("int | typing_extensions.Union[str, float]")
         == "Union[int, str, float]"
     )
+
+
+def test_format_union_or_optional_nonetype_and_none() -> None:
+    """Verifies that _format_union_or_optional returns 'None' when all elements
+    are 'None' or 'NoneType'."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _format_union_or_optional,
+        _normalize_pipe_unions,
+    )
+
+    assert _format_union_or_optional(["NoneType", "None"]) == "None"
+    assert _format_union_or_optional(["None", "NoneType"]) == "None"
+    assert _format_union_or_optional(["NoneType"]) == "None"
+    assert _format_union_or_optional(["None"]) == "None"
+    assert _normalize_pipe_unions("NoneType | None") == "None"
+    assert _normalize_pipe_unions("None | NoneType") == "None"
+

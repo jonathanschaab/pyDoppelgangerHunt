@@ -1214,6 +1214,7 @@ def test_batch_82_matcher_sloc_and_priority_score_bounds() -> None:
 def test_compute_priority_score_malformed_string_coordinates() -> None:
     """Verifies that compute_priority_score defensively returns 0.0 on malformed coordinates."""
     from pydoppelgangerhunt.matcher import (  # pylint: disable=import-outside-toplevel
+        _unit_sloc,
         compute_priority_score,
     )
 
@@ -1221,11 +1222,17 @@ def test_compute_priority_score_malformed_string_coordinates() -> None:
     u2 = {"start": 1, "end": 10, "complexity": 2}
     assert compute_priority_score(0.9, u1, u2) == 0.0
 
+    # Bad complexity safely falls back to 1 rather than silencing the entire score to 0.0
     u3 = {"start": 1, "end": 10, "complexity": "invalid"}
-    assert compute_priority_score(0.9, u2, u3) == 0.0
+    assert compute_priority_score(0.9, u2, u3) > 0.0
 
     u4 = {"start": None, "end": None, "complexity": None}
     assert compute_priority_score(0.9, u2, u4) >= 0.0
+
+    # _unit_sloc and compute_priority_score agree on inverted/invalid coordinates
+    inv_u = {"start": 20, "end": 10}
+    assert _unit_sloc(inv_u) == 1
+    assert compute_priority_score(0.9, inv_u, u2) == 0.0
 
 
 def test_differential_scan_multi_unit_file_and_shingle_dedup(tmp_path: Path) -> None:

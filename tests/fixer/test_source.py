@@ -311,7 +311,7 @@ def test_resolve_safe_unit_file_path_symlinked_root_prefix(tmp_path: Path) -> No
     try:
         sym_repo.symlink_to(real_repo, target_is_directory=True)
     except (OSError, NotImplementedError):
-        return
+        pytest.skip("Symlinks not supported on this platform/privilege")
 
     # When file path uses sym_repo prefix and repo_root uses real_repo (or vice versa)
     res1 = _resolve_safe_unit_file_path(
@@ -650,3 +650,58 @@ def test_find_enclosing_function_is_async_nested_tiebreaker() -> None:
     )
     # Unit inside inner (line 3) -> should resolve to inner's sync status (False)
     assert find_enclosing_function_is_async(src_async_outer, start_line=3, end_line=3) is False
+
+
+def test_is_subroutine_unit_comprehension_with_source() -> None:
+    """Verifies that comprehension, closure, and complex_expr units return False
+    from is_subroutine_unit even when full source text is provided."""
+    from pydoppelgangerhunt.fixer.source import is_subroutine_unit
+
+    src = (
+        "def compute(data):\n"
+        "    res = [x * 2 for x in data]\n"
+        "    return res\n"
+    )
+    tree = ast.parse(src)
+    comp_unit = {
+        "file": "test.py",
+        "kind": "comprehension",
+        "start": 2,
+        "end": 2,
+        "start_col": 10,
+        "end_col": 31,
+    }
+    # With source and tree provided, comprehension must NOT fall through to structural check
+    assert is_subroutine_unit(comp_unit, source_text=src, tree=tree) is False
+
+    closure_unit = {
+        "file": "test.py",
+        "kind": "closure",
+        "start": 2,
+        "end": 2,
+    }
+    assert is_subroutine_unit(closure_unit, source_text=src, tree=tree) is False
+
+    expr_unit = {
+        "file": "test.py",
+        "kind": "complex_expr",
+        "start": 2,
+        "end": 2,
+    }
+    assert is_subroutine_unit(expr_unit, source_text=src, tree=tree) is False
+
+
+def test_slice_unit_token_lines_invalid_or_negative_start_col() -> None:
+    """Verifies that _slice_unit_token_lines returns lines untouched on negative
+    or non-numeric start_col offsets."""
+    from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
+
+    lines = ["    res = [x for x in data]\n"]
+    # Negative start_col
+    u_neg = {"kind": "comprehension", "start_col": -5, "end_col": 10}
+    assert _slice_unit_token_lines(u_neg, lines) == lines
+
+    # Non-int start_col
+    u_bad = {"kind": "comprehension", "start_col": "invalid", "end_col": 10}
+    assert _slice_unit_token_lines(u_bad, lines) == lines
+

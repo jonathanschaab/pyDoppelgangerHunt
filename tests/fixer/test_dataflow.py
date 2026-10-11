@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import ast
+from collections import OrderedDict
+import concurrent.futures
+import gc
 import hashlib
 import sys
 from pathlib import Path
@@ -15,9 +18,13 @@ from pydoppelgangerhunt import (
     generate_refactoring_patch,
     synthesize_shared_helper_code,
 )
+from pydoppelgangerhunt.fixer import dataflow
 from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
     GeneratorCloneSideData,
+    _ClosurePos,
     _DownstreamReadVisitor,
+    _MAX_DOWNSTREAM_CACHE_SIZE,
+    _MAX_SCOPE_CACHE_SIZE,
     _VisitorPassMode,
     _clear_downstream_reads_cache,
     _collect_pre_unit_closures,
@@ -35,8 +42,8 @@ from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-acc
     _get_scope_try_and_with_blocks,
     _is_eagerly_consumed_genexp,
     _load_unit_file_text,
-    clear_dataflow_cache,
     _pair_clone_outputs,
+    _resolve_unit_ast_end_col,
     _scope_closures_cache,
     _scope_loops_cache,
     _scope_parent_maps,
@@ -44,10 +51,13 @@ from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-acc
     _scope_stmts_by_end,
     _scope_try_with_cache,
     _stmts_enclose_unit,
+    _warned_lenient_closure,
+    clear_dataflow_cache,
     collect_downstream_read_names,
     has_async_generator_delegation_hazard,
     is_async_generator_with_return_value,
     resolve_clone_generator_subroutine_outputs,
+    resolve_clone_pair_outputs,
     resolve_generator_subroutine_outputs,
 )
 
@@ -1661,8 +1671,6 @@ def test_collect_downstream_read_names_lru_caching() -> None:
 def test_collect_pre_unit_closures_deeply_nested_compound_statements() -> None:
     """Verifies that _collect_pre_unit_closures discovers pre-unit closures across nested
     compound statements (if/for/try/with) without missing headers or corrupting scopes."""
-    from pydoppelgangerhunt.fixer.dataflow import _collect_pre_unit_closures
-
     code = (
         "if (lambda: cond_captured)():\n"
         "    for item in (x for x in iter_captured):\n"
@@ -1687,11 +1695,6 @@ def test_collect_pre_unit_closures_deeply_nested_compound_statements() -> None:
 
 def test_collect_downstream_read_names_source_digest_optimization() -> None:
     """Verifies that collect_downstream_read_names uses precomputed source_digest in cache key."""
-    from pydoppelgangerhunt.fixer.dataflow import (
-        _clear_downstream_reads_cache,
-        collect_downstream_read_names,
-    )
-
     _clear_downstream_reads_cache()
     code = (
         "def run():\n"
@@ -1762,9 +1765,6 @@ def test_collect_downstream_read_names_content_digest_cache_sharing() -> None:
     reads2 = collect_downstream_read_names(code, unit2)
     assert reads1 == {"x"}
     assert reads2 == {"x"}
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
-        _downstream_reads_cache,
-    )
     # Content digest deduplication: identical content shares the cache
     assert len(_downstream_reads_cache) == 1
 
@@ -1772,10 +1772,6 @@ def test_collect_downstream_read_names_content_digest_cache_sharing() -> None:
 def test_collect_downstream_read_names_digest_invalidation(tmp_path: Path) -> None:
     """Verifies that differing content digest produces distinct cache entries for
     downstream reads."""
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
-        _downstream_reads_cache,
-    )
-
     _clear_downstream_reads_cache()
     f_path = tmp_path / "target.py"
     code = "def f():\n    x = 1\n    return x\n"
@@ -1865,10 +1861,6 @@ def test_resolve_clone_generator_subroutine_outputs_inverted_and_zero_coords() -
 
 def test_load_unit_file_text_honors_sliced_lines() -> None:
     """Verifies that _load_unit_file_text returns None when source_lines is marked as sliced."""
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
-        _load_unit_file_text,
-    )
-
     unit_sliced = {
         "file": "virtual.py",
         "start": 10,
@@ -2268,8 +2260,6 @@ def test_enclosing_try_reads_outputs_empty_body_nodes_mock() -> None:
 
 def test_get_scope_stmts_by_end_lineno_none_end_lineno() -> None:
     """Verifies _get_scope_stmts_by_end_lineno gracefully handles nodes with end_lineno=None."""
-    from pydoppelgangerhunt.fixer.dataflow import _get_scope_stmts_by_end_lineno
-
     stmt = ast.Pass()
     stmt.lineno = 5
     stmt.end_lineno = None  # Explicitly None
@@ -2460,8 +2450,6 @@ def test_scope_metadata_caching_and_cache_clear() -> None:
 
 def test_scope_metadata_caching_unhashable_object_fallback() -> None:
     """Verifies that unhashable objects fall back gracefully without raising TypeError."""
-    from collections import OrderedDict  # pylint: disable=import-outside-toplevel
-
     class _MockUnhashableNode(ast.AST):
         __hash__ = None  # type: ignore[assignment]
 
@@ -2475,9 +2463,6 @@ def test_scope_metadata_caching_unhashable_object_fallback() -> None:
 
 def test_scope_metadata_caching_lru_eviction() -> None:
     """Verifies that scope cache evicts oldest entries when capacity is exceeded."""
-    from collections import OrderedDict  # pylint: disable=import-outside-toplevel
-    from pydoppelgangerhunt.fixer.dataflow import _MAX_SCOPE_CACHE_SIZE
-
     cache: OrderedDict[ast.AST, str] = OrderedDict()
     nodes = [ast.Pass() for _ in range(_MAX_SCOPE_CACHE_SIZE + 5)]
     for idx, n in enumerate(nodes):
@@ -2543,8 +2528,6 @@ def test_stmts_enclose_unit_synthetic_or_unlocated_nodes() -> None:
 
 def test_resolve_clone_pair_outputs_clean_pair() -> None:
     """Verifies that resolve_clone_pair_outputs successfully pairs matching outputs."""
-    from pydoppelgangerhunt.fixer.dataflow import resolve_clone_pair_outputs
-
     u1 = {"kind": "function", "outputs": ["a", "b"]}
     u2 = {"kind": "function", "outputs": ["x", "y"]}
     s1: Dict[str, Any] = {"inputs": [], "definite_stores": ["a", "b"]}
@@ -2556,8 +2539,6 @@ def test_resolve_clone_pair_outputs_clean_pair() -> None:
 
 def test_resolve_clone_pair_outputs_mismatched_subroutine_kinds() -> None:
     """Verifies that resolve_clone_pair_outputs rejects mismatched subroutine kinds."""
-    from pydoppelgangerhunt.fixer.dataflow import resolve_clone_pair_outputs
-
     u1 = {"kind": "compound_block"}
     u2 = {"kind": "function"}
     s1: Dict[str, Any] = {"inputs": []}
@@ -2568,8 +2549,6 @@ def test_resolve_clone_pair_outputs_mismatched_subroutine_kinds() -> None:
 
 def test_resolve_clone_pair_outputs_set_valued_rejection() -> None:
     """Verifies that resolve_clone_pair_outputs rejects set-valued outputs with multiple items."""
-    from pydoppelgangerhunt.fixer.dataflow import resolve_clone_pair_outputs
-
     u1 = {"kind": "function", "outputs": {"a", "b"}}
     u2 = {"kind": "function", "outputs": ["x", "y"]}
     s1: Dict[str, Any] = {"inputs": []}
@@ -2632,8 +2611,6 @@ def test_collect_pre_unit_closures_same_line_semicolon() -> None:
 
 def test_closure_pos_attributes_and_iteration() -> None:
     """Verifies that _ClosurePos behaves as a NamedTuple with line, col, and tuple unpacking."""
-    from pydoppelgangerhunt.fixer.dataflow import _ClosurePos
-
     pos = _ClosurePos(12, 4)
     assert isinstance(pos, tuple)
     assert pos.line == 12
@@ -2702,8 +2679,6 @@ def test_collect_scope_closures_falsy_col_offset_preserved() -> None:
 )
 def test_extract_nested_scope_free_reads_inner_type_params() -> None:
     """Verifies that inner function and type alias type params do not escape to outer scope."""
-    from pydoppelgangerhunt.fixer.dataflow import _extract_nested_scope_free_reads
-
     # Python 3.12+ generic function syntax
     code = (
         "def outer():\n"
@@ -2733,12 +2708,9 @@ def test_extract_nested_scope_free_reads_inner_type_params() -> None:
     assert "U" not in reads_alias
 
 
-
 def test_resolve_unit_ast_end_col_single_line_multiple_semicolons() -> None:
     """Verifies that single-line units with multiple trailing semicolons fail closed by returning
     None when columns are ambiguous, but resolve accurately when uniquely matched."""
-    from pydoppelgangerhunt.fixer.dataflow import _resolve_unit_ast_end_col
-
     code = "for x in items: a = 1; b = 2; c = 3\n"
     tree = ast.parse(code)
     # col_offset of a is 16, b is 23, c is 30. end_col_offset of c is 35.
@@ -2766,13 +2738,6 @@ def test_resolve_unit_ast_end_col_single_line_multiple_semicolons() -> None:
 
 def test_frozenset_outputs_defensive_handling() -> None:
     """Verifies that frozenset outputs are handled defensively across output pairing routines."""
-    from pydoppelgangerhunt.fixer.dataflow import (
-        _extract_effective_unit_outputs,
-        _pair_clone_outputs,
-        resolve_clone_generator_subroutine_outputs,
-        resolve_clone_pair_outputs,
-    )
-
     # _pair_clone_outputs rejects frozenset
     assert _pair_clone_outputs(frozenset(["a", "b"]), ["x", "y"]) == []
     assert _pair_clone_outputs(["a", "b"], frozenset(["x", "y"])) == []
@@ -2811,13 +2776,6 @@ def test_frozenset_outputs_defensive_handling() -> None:
 def test_scope_parent_map_excludes_scope_node_and_stays_bounded() -> None:
     """Verifies that _scope_parent_maps excludes scope_node itself to prevent circular
     references, and that cache size stays strictly bounded across thousands of invocations."""
-    import gc  # pylint: disable=import-outside-toplevel
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
-        _get_scope_parent_map,
-        _scope_parent_maps,
-        collect_downstream_read_names,
-    )
-
     # 1. Verify parent_map does not contain scope_node as value
     code = "def sample():\n    x = 1\n    return x\n"
     tree = ast.parse(code)
@@ -2839,10 +2797,6 @@ def test_scope_parent_map_excludes_scope_node_and_stays_bounded() -> None:
 def test_load_unit_file_text_fails_closed_on_notebook(tmp_path: Path) -> None:
     """Verifies that _load_unit_file_text restricts disk fallback to .py files and fails closed
     (returns None) for Jupyter notebooks (.ipynb) to prevent unsafe patch synthesis."""
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
-        _load_unit_file_text,
-    )
-
     nb_file = tmp_path / "notebook.ipynb"
     nb_file.write_text('{"cells": []}', encoding="utf-8")
 
@@ -2854,13 +2808,6 @@ def test_load_unit_file_text_fails_closed_on_notebook(tmp_path: Path) -> None:
 def test_collect_downstream_read_names_multithreaded_cache_concurrency() -> None:
     """Verifies that concurrent invocations across worker threads execute safely,
     maintain cache boundedness, and return fresh mutable copies preventing cross-thread mutation."""
-    import concurrent.futures  # pylint: disable=import-outside-toplevel
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
-        _MAX_DOWNSTREAM_CACHE_SIZE,
-        _downstream_reads_cache,
-        collect_downstream_read_names,
-    )
-
     def _worker(thread_idx: int) -> None:
         for i in range(100):
             var_name = f"val_{thread_idx}_{i}"
@@ -2888,9 +2835,6 @@ def test_subroutine_outputs_duplicate_stores_deduplicated_and_paired() -> None:
     duplicate outputs or cause unwarranted rejection in resolve_clone_pair_outputs."""
     from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
         inspect_single_unit_scope,
-    )
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
-        resolve_clone_pair_outputs,
     )
 
     code1 = (
@@ -2941,11 +2885,6 @@ def test_subroutine_outputs_duplicate_stores_deduplicated_and_paired() -> None:
 
 def test_clear_downstream_reads_cache_resets_warned_lenient_closure() -> None:
     """Verifies that _clear_downstream_reads_cache resets _warned_lenient_closure flag."""
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
-        _clear_downstream_reads_cache,
-        _warned_lenient_closure,
-    )
-
     _warned_lenient_closure[0] = True
     assert _warned_lenient_closure[0] is True
     _clear_downstream_reads_cache()
@@ -2954,12 +2893,6 @@ def test_clear_downstream_reads_cache_resets_warned_lenient_closure() -> None:
 
 def test_collect_downstream_read_names_cache_hit_with_and_without_end_col() -> None:
     """Verifies that cache keys do not diverge whether end_col is pre-provided or AST-resolved."""
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
-        _clear_downstream_reads_cache,
-        _downstream_reads_cache,
-        collect_downstream_read_names,
-    )
-
     _clear_downstream_reads_cache()
     src = (
         "def compute():\n"
@@ -2973,7 +2906,7 @@ def test_collect_downstream_read_names_cache_hit_with_and_without_end_col() -> N
 
     # Call with explicit end_col_offset matching AST resolution
     cached_key = next(iter(_downstream_reads_cache.keys()))
-    resolved_end_col = cached_key[5]  # index 5 is end_col in _build_downstream_cache_key
+    resolved_end_col = cached_key.end_col if hasattr(cached_key, "end_col") else cached_key[5]
     assert resolved_end_col is not None
 
     unit_with_end_col = {
@@ -2993,11 +2926,6 @@ def test_resolve_clone_generator_subroutine_outputs_closure_pos_tuple_normalizat
 ) -> None:
     """Verifies that resolve_clone_generator_subroutine_outputs safely normalizes
     (line, col) tuple instances from _collect_scope_closures without TypeError."""
-    from pydoppelgangerhunt.fixer import dataflow
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
-        resolve_clone_generator_subroutine_outputs,
-    )
-
     code1 = (
         "def g1():\n"
         "    val = 1\n"
@@ -3020,7 +2948,7 @@ def test_resolve_clone_generator_subroutine_outputs_closure_pos_tuple_normalizat
     res_clean = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
     assert res_clean == (["val"], ["val"])
 
-    def _mock_closures(scope_node: Any) -> list[tuple[Any, set[str]]]:
+    def _mock_closures(scope_node: Any, **kwargs: Any) -> list[tuple[Any, set[str]]]:
         return [((2, 4), {"val"})]
 
     monkeypatch.setattr(dataflow, "_collect_scope_closures", _mock_closures)
@@ -3031,8 +2959,6 @@ def test_resolve_clone_generator_subroutine_outputs_closure_pos_tuple_normalizat
 
 def test_collect_pre_unit_closures_same_line_missing_col_fails_closed() -> None:
     """Verifies that same-line closures fail closed when column info is missing."""
-    from pydoppelgangerhunt.fixer.dataflow import _collect_pre_unit_closures
-
     code = "cb = lambda: total; total = 1\n"
     tree = ast.parse(code)
     # With u_start_col=None, c_line == u_start is safely treated as pre-unit
@@ -3066,8 +2992,6 @@ def test_precomputed_outputs_empty_list_precedence() -> None:
 
 def test_downstream_read_crlf_and_lone_cr_line_handling() -> None:
     """Verifies that collect_downstream_read_names handles CRLF and lone-CR line endings."""
-    from pydoppelgangerhunt.fixer.dataflow import collect_downstream_read_names
-
     crlf_code = "def f():\r\n    x = 1\r\n    y = x + 1\r\n    return y\r\n"
     lone_cr_code = "def f():\r    x = 1\r    y = x + 1\r    return y\r"
 
@@ -3082,10 +3006,6 @@ def test_downstream_read_crlf_and_lone_cr_line_handling() -> None:
 
 def test_resolve_unit_ast_end_col_invalid_coords_fails_closed() -> None:
     """Verifies that _resolve_unit_ast_end_col returns None on invalid coordinates."""
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
-        _resolve_unit_ast_end_col,
-    )
-
     tree = ast.parse("def f():\n    x = 1\n")
     assert _resolve_unit_ast_end_col(tree, {"start": "invalid"}) is None
     assert _resolve_unit_ast_end_col(tree, {"start": 1, "end": "invalid"}) is None
@@ -3099,9 +3019,6 @@ def test_clear_downstream_reads_cache_resets_closure_warning_cache() -> None:
         _warned_closure_strictness_values,
         clear_closure_warning_cache,
         resolve_closure_strictness_mode,
-    )
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
-        _clear_downstream_reads_cache,
     )
 
     clear_closure_warning_cache()
@@ -3117,10 +3034,6 @@ def test_outer_expr_visitor_multi_clause_comprehension_scoping() -> None:
 
     and subsequent iters with prior comprehension targets in scope.
     """
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
-        collect_downstream_read_names,
-    )
-
     # 1. First iter evaluates in outer scope (matrix), while subsequent clauses
     # and body read targets from earlier comprehension clauses.
     code_multi = (
@@ -3155,11 +3068,6 @@ def test_outer_expr_visitor_multi_clause_comprehension_scoping() -> None:
 def test_eagerly_consumed_genexp_not_treated_as_escaping_closure() -> None:
     """Verifies that generator expressions directly consumed by eager built-ins
     (e.g., sum) are not treated as escaping closures."""
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
-        _collect_scope_closures,
-        resolve_clone_generator_subroutine_outputs,
-    )
-
     code = (
         "def compute():\n"
         "    data = [1, 2, 3]\n"
@@ -3195,9 +3103,6 @@ def test_eagerly_consumed_genexp_not_treated_as_escaping_closure() -> None:
 def test_async_generator_try_without_yield_not_flagged_as_hazard() -> None:
     """Verifies that an async generator with try/except around an await
     (no yield inside the try) is not flagged as a control flow hazard."""
-    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
-        has_async_generator_delegation_hazard,
-    )
     from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
         inspect_single_unit_scope,
     )
@@ -3477,4 +3382,81 @@ def test_eager_builtin_scope_shadowing_scenarios() -> None:
     closures_no_leak = _collect_scope_closures(tree_no_leak.body[0])
     # Neither sum nor min are shadowed in compute scope -> 0 closures
     assert len(closures_no_leak) == 0
+
+
+def test_module_level_shadowing_of_eager_builtins() -> None:
+    """Verifies that module-level symbols shadowing eager built-ins prevent
+    inner generator expressions from being treated as eagerly consumed."""
+    # Module-level import shadows sum
+    code_mod_import = (
+        "from numpy import sum\n"
+        "\n"
+        "def compute():\n"
+        "    data = [1, 2, 3]\n"
+        "    res = sum(x * 2 for x in data)\n"
+        "    yield res\n"
+    )
+    tree_mod_import = ast.parse(code_mod_import)
+    fn_node = tree_mod_import.body[1]
+    # Without module_tree: sum looks like unshadowed built-in, 0 closures
+    closures_without = _collect_scope_closures(fn_node)
+    assert len(closures_without) == 0
+
+    # With module_tree: module-level sum is detected, genexp escapes as closure
+    closures_with = _collect_scope_closures(fn_node, module_tree=tree_mod_import)
+    assert len(closures_with) == 1
+
+    # Module-level function definition shadows any
+    code_mod_fn = (
+        "def any(iterable):\n"
+        "    return list(iterable)\n"
+        "\n"
+        "def check():\n"
+        "    items = [False, True]\n"
+        "    ok = any(x for x in items)\n"
+        "    yield ok\n"
+    )
+    tree_mod_fn = ast.parse(code_mod_fn)
+    fn_check = tree_mod_fn.body[1]
+    closures_check = _collect_scope_closures(fn_check, module_tree=tree_mod_fn)
+    assert len(closures_check) == 1
+
+
+def test_eager_consumed_genexp_non_str_receiver_join() -> None:
+    """Verifies that .join() calls only count as eager consumption when the
+    receiver is a confirmed string type, not arbitrary objects like Thread.join."""
+    # 1. Non-string receiver (e.g. thread.join(genexp)) should NOT be eager
+    code_thread = (
+        "def worker():\n"
+        "    import threading\n"
+        "    t = threading.Thread()\n"
+        "    t.join(x for x in [1, 2])\n"
+        "    yield t\n"
+    )
+    tree_thread = ast.parse(code_thread)
+    closures_thread = _collect_scope_closures(tree_thread.body[0])
+    # Escaping genexp is captured
+    assert len(closures_thread) == 1
+
+    # 2. Confirmed string literal receiver: eager, NOT captured
+    code_str_lit = (
+        "def worker():\n"
+        "    s = ', '.join(str(x) for x in [1, 2])\n"
+        "    yield s\n"
+    )
+    tree_str_lit = ast.parse(code_str_lit)
+    closures_str_lit = _collect_scope_closures(tree_str_lit.body[0])
+    assert len(closures_str_lit) == 0
+
+    # 3. Confirmed str.join or builtins.str.join: eager, NOT captured
+    code_str_call = (
+        "def worker():\n"
+        "    import builtins\n"
+        "    s1 = str.join(', ', (str(x) for x in [1, 2]))\n"
+        "    s2 = builtins.str.join(', ', (str(y) for y in [3, 4]))\n"
+        "    yield s1 + s2\n"
+    )
+    tree_str_call = ast.parse(code_str_call)
+    closures_str_call = _collect_scope_closures(tree_str_call.body[0])
+    assert len(closures_str_call) == 0
 

@@ -115,15 +115,21 @@ _SUBROUTINE_KINDS: frozenset[str] = frozenset(
 )
 
 
-def is_subroutine_unit(unit: Any, source_text: Optional[str] = None) -> bool:
+def is_subroutine_unit(
+    unit: Any,
+    source_text: Optional[str] = None,
+    tree: Optional[ast.AST] = None,
+) -> bool:
     """Checks whether an AST code unit is a subroutine block rather than a whole function.
 
     Classification Rules:
     1. Explicit 'is_subroutine' boolean in unit takes precedence if present.
     2. Known subroutine kinds ('compound_block', 'sliding_window', 'clause_branch') return True.
-    3. Whole callable kinds ('function', 'method', 'async_function') return False.
+    3. Whole callable and expression kinds ('function', 'method', 'async_function',
+       'closure', 'comprehension', 'complex_expr') return False.
     4. Structural inspection: If source_text is available, checks whether the unit's
        line bounds strictly reside inside an enclosing function (True) or cover it (False).
+       Kindless units at top-level module scope return True.
     5. All other kinds or unspecified kinds without source return False.
     """
     if not isinstance(unit, dict):
@@ -133,7 +139,14 @@ def is_subroutine_unit(unit: Any, source_text: Optional[str] = None) -> bool:
     kind = str(unit.get("kind") or "")
     if kind in _SUBROUTINE_KINDS:
         return True
-    if kind in ("function", "method", "async_function"):
+    if kind in (
+        "function",
+        "method",
+        "async_function",
+        "closure",
+        "comprehension",
+        "complex_expr",
+    ):
         return False
 
     src = source_text or unit.get("source_text") or unit.get("file_source")
@@ -145,13 +158,15 @@ def is_subroutine_unit(unit: Any, source_text: Optional[str] = None) -> bool:
             u_end = _parse_unit_coord(unit, "end", default=u_start)
             if 0 < u_start <= u_end:
                 res = _find_innermost_enclosing_node(
-                    src, unit, (ast.FunctionDef, ast.AsyncFunctionDef)
+                    src, unit, (ast.FunctionDef, ast.AsyncFunctionDef), tree=tree
                 )
                 if res is not None:
                     matched_node, f_start, f_end = res
                     fn_def_start = getattr(matched_node, "lineno", f_start)
                     if u_start in (fn_def_start, f_start) and u_end == f_end:
                         return False
+                    return True
+                if not kind:
                     return True
         except (ValueError, TypeError):
             pass
@@ -332,21 +347,31 @@ def _find_module_helper_insertion_index(lines: List[str]) -> int:
     return min(max(target_line, min_insert_idx), len(lines))
 
 
+def _extract_slice_col_offset(
+    unit: Dict[str, Any], key: str, default: Optional[int]
+) -> Optional[int]:
+    """Safely extracts a non-negative column coordinate, returning -1 on error."""
+    if unit.get(key) is None:
+        return default
+    try:
+        val = _parse_unit_coord(unit, key, default=None, strict=True)
+        return -1 if (val is None or val < 0) else val
+    except (ValueError, TypeError):
+        return -1
+
+
 def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]:
     """Slices source lines to the exact start_col and end_col offsets of the unit."""
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
         return lines
-    try:
-        s_col = _parse_unit_coord(unit, "start_col", default=0)
-    except (ValueError, TypeError):
-        s_col = 0
-    try:
-        e_col = _parse_unit_coord(unit, "end_col", default=None)
-    except (ValueError, TypeError):
-        e_col = None
+    s_col_opt = _extract_slice_col_offset(unit, "start_col", default=0)
+    e_col = _extract_slice_col_offset(unit, "end_col", default=None)
+    if s_col_opt is None or s_col_opt < 0 or e_col == -1:
+        return lines
+    s_col = s_col_opt
     res = list(lines)
     if len(res) == 1:
-        res[0] = res[0][s_col:e_col] if (e_col is None or e_col > s_col) else res[0][s_col:]
+        res[0] = res[0][s_col:e_col] if (e_col is not None and e_col >= s_col) else res[0][s_col:]
     else:
         res[0] = res[0][s_col:]
         if e_col is not None:

@@ -1541,6 +1541,18 @@ def _unit_sloc(unit: Dict[str, Any]) -> int:
     return max(0, e - s + 1)
 
 
+def _safe_unit_complexity(unit: Dict[str, Any]) -> int:
+    """Safely extracts integer cyclomatic complexity, defaulting to 1 on malformed values."""
+    raw = unit.get("complexity")
+    if raw is None:
+        return 1
+    try:
+        val = int(raw)
+        return max(1, val)
+    except (ValueError, TypeError):
+        return 1
+
+
 def compute_priority_score(
     sim: float,
     u1: Dict[str, Any],
@@ -1562,7 +1574,7 @@ def compute_priority_score(
         ):
             return 0.0
         avg_sloc = (_unit_sloc(u1) + _unit_sloc(u2)) / 2.0
-        max_comp = max(1, int(u1.get("complexity") or 1), int(u2.get("complexity") or 1))
+        max_comp = max(_safe_unit_complexity(u1), _safe_unit_complexity(u2))
         return float(round(sim * avg_sloc * max_comp, 1))
     except (ValueError, TypeError):
         return 0.0

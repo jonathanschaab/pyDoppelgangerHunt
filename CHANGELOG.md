@@ -35,9 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shadowed generator expressions from escaping unobserved.
 - **Multi-Type Union Normalization with `None`**: Updated `_format_union_or_optional` in
   `synthesis.py` so union annotations containing three or more types with `None` (e.g.
-  `int | str | None`) normalize to PEP 484 compliant `Optional[Union[...]]`.
+- **Parser Emits Unit Async Status (`is_async`)**: AST parsing now populates `is_async` on code
+  units containing asynchronous constructs (`AsyncFunctionDef`, `await`, `async for`, `async with`).
 
 ### Breaking Changes
+- **Private Line-Splitting Regex (`_PHYSICAL_LINE_RE`)**: Dropped `_PHYSICAL_LINE_RE` from
+  `source_lines.__all__` in favor of public helper functions `split_source_lines` and
+  `count_physical_newlines`.
 - **Breaking Change in Coordinate Validation**: `is_valid_unit_coordinates` (when called with
   default `strict=False`) is no longer fully permissive: it now requires a positive `start`
   coordinate (`start > 0`) and rejects empty dictionaries `{}` as well as zero/negative/inverted
@@ -60,7 +64,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   available. The legacy fallback detecting `":"` in the unit name has been removed to avoid
   false subroutine classifications.
 
-### Changed
+- **Source Extraction Pre-Sliced Line Detection**: `extract_unit_source_code` treats
+  `source_lines` as pre-sliced when the length matches the unit span (`end - start + 1`),
+  preventing double-slicing.
+- **Receiver Metadata Path Restriction**: `_populate_unit_receiver_metadata` confines
+  disk inspection strictly to `.py` files inside the repository root or CWD, preventing
+  out-of-root traversals.
 - **PEP 604 Pipe Union Normalization**: Synthesized helper parameter and return type annotations
   normalize PEP 604 union pipes (`|`) to `typing.Union`, preserve `Annotated[T, ...]` metadata
   arguments, and convert `X | None` to `typing.Optional[X]` for Python 3.9 compatibility.

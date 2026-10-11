@@ -4,14 +4,10 @@ from __future__ import annotations
 
 import ast
 import builtins
-import inspect
 import logging
-import sys
 import textwrap
-import threading
 from typing import (
     Any,
-    Callable,
     Dict,
     Iterable,
     List,
@@ -20,7 +16,6 @@ from typing import (
     Set,
     Tuple,
     Union,
-    cast,
 )
 
 from pydoppelgangerhunt.reporters import extract_unit_source_code
@@ -1238,7 +1233,15 @@ def _inspect_unit_scope(
     repo_root: Optional[str] = None,
     file_tree: Optional[ast.AST] = None,
 ) -> Dict[str, Any]:
-    full_source_text = _load_unit_file_text(unit, repo_root=repo_root)
+    cached_full_source: List[Optional[str]] = [None]
+    full_source_loaded: List[bool] = [False]
+
+    def _get_full_source() -> Optional[str]:
+        if not full_source_loaded[0]:
+            cached_full_source[0] = _load_unit_file_text(unit, repo_root=repo_root)
+            full_source_loaded[0] = True
+        return cached_full_source[0]
+
     unit_code_lines = extract_unit_source_code(unit, repo_root=repo_root)
     raw_lines = _slice_unit_token_lines(unit, unit_code_lines)
     dedented = textwrap.dedent("".join(raw_lines))
@@ -1327,7 +1330,12 @@ def _inspect_unit_scope(
     if tree is None:
         return empty_res
 
-    is_subroutine = is_subroutine_unit(unit, source_text=full_source_text)
+    if "is_subroutine" in unit and unit.get("is_subroutine") is not None:
+        is_subroutine = bool(unit["is_subroutine"])
+    else:
+        is_subroutine = is_subroutine_unit(
+            unit, source_text=_get_full_source(), tree=file_tree
+        )
     if not is_subroutine and "is_subroutine" not in unit and not unit.get("kind"):
         if isinstance(tree, ast.Module):
             if not (
@@ -1492,9 +1500,10 @@ def _inspect_unit_scope(
         else:
             s_line = parse_unit_coord(unit, "start", default=1)
             e_line = parse_unit_coord(unit, "end", default=s_line)
-            if full_source_text:
+            full_src = _get_full_source()
+            if full_src:
                 unit_is_async = find_enclosing_function_is_async(
-                    full_source_text, s_line, e_line, tree=file_tree
+                    full_src, s_line, e_line, tree=file_tree
                 )
             else:
                 unit_is_async = None
@@ -1738,136 +1747,5 @@ def _analyze_unit_variable_scope_impl(
     }
 
 
-_dispatch_active = threading.local()
-
-
-def _resolve_dispatch_target(
-    func_name: str,
-    default_func: Callable[..., Any],
-    alias_func: Optional[Callable[..., Any]] = None,
-) -> Optional[Callable[..., Any]]:
-    """Resolves active mock patch on patch_mod, fixer package, or scope_mod if overridden."""
-    patch_mod = sys.modules.get("pydoppelgangerhunt.fixer.patch")
-    target = getattr(patch_mod, func_name, None)
-    if target is None or target is default_func or target is alias_func:
-        pkg = sys.modules.get("pydoppelgangerhunt.fixer")
-        target = getattr(pkg, func_name, None)
-    if target is None or target is default_func or target is alias_func:
-        scope_mod = sys.modules.get("pydoppelgangerhunt.fixer.scope")
-        target = getattr(scope_mod, func_name, None)
-    if (
-        target is not None
-        and callable(target)
-        and target is not default_func
-        and target is not alias_func
-    ):
-        return cast(Callable[..., Any], target)
-    return None
-
-
-def _invoke_dynamic_target(
-    target: Callable[..., Any],
-    pos_args: Tuple[Any, ...],
-    tree_kwargs: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Invokes target after verifying argument compatibility with its signature."""
-    try:
-        sig = inspect.signature(target)
-    except (ValueError, TypeError):
-        res = target(*pos_args, **tree_kwargs)
-        return res if isinstance(res, dict) else {}
-
-    has_var_kw = any(
-        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-    )
-    call_kwargs = (
-        dict(tree_kwargs)
-        if has_var_kw
-        else {k: v for k, v in tree_kwargs.items() if k in sig.parameters}
-    )
-
-    can_bind_with_kwargs = False
-    try:
-        sig.bind(*pos_args, **call_kwargs)
-        can_bind_with_kwargs = True
-    except TypeError:
-        can_bind_with_kwargs = False
-
-    if can_bind_with_kwargs:
-        res = target(*pos_args, **call_kwargs)
-    else:
-        res = target(*pos_args)
-    return res if isinstance(res, dict) else {}
-
-
-def _dispatch_or_call(
-    flag_attr: str,
-    func_name: str,
-    default_func: Callable[..., Any],
-    alias_func: Optional[Callable[..., Any]],
-    pos_args: Tuple[Any, ...],
-    kw_args: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Dispatches call through active mock patches with reentrancy protection."""
-    if getattr(_dispatch_active, flag_attr, False):
-        res = default_func(*pos_args, **kw_args)
-        return res if isinstance(res, dict) else {}
-    target = _resolve_dispatch_target(func_name, default_func, alias_func)
-    if target is None:
-        res = default_func(*pos_args, **kw_args)
-        return res if isinstance(res, dict) else {}
-    setattr(_dispatch_active, flag_attr, True)
-    try:
-        return _invoke_dynamic_target(target, pos_args, kw_args)
-    finally:
-        setattr(_dispatch_active, flag_attr, False)
-
-
-def dispatch_analyze_unit_variable_scope(
-    u1: Dict[str, Any],
-    u2: Optional[Dict[str, Any]] = None,
-    repo_root: Optional[str] = None,
-    tree1: Optional[ast.AST] = None,
-    tree2: Optional[ast.AST] = None,
-    scope1: Optional[Dict[str, Any]] = None,
-    scope2: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Dispatches analyze_unit_variable_scope, honoring active mock patches on
-    pydoppelgangerhunt.fixer.patch or pydoppelgangerhunt.fixer."""
-    kwargs: Dict[str, Any] = {
-        "u2": u2,
-        "repo_root": repo_root,
-        "tree1": tree1,
-        "tree2": tree2,
-        "scope1": scope1,
-        "scope2": scope2,
-    }
-    return _dispatch_or_call(
-        "analyzing",
-        "analyze_unit_variable_scope",
-        _analyze_unit_variable_scope_impl,
-        dispatch_analyze_unit_variable_scope,
-        (u1,),
-        kwargs,
-    )
-
-
-def dispatch_inspect_single_unit_scope(
-    unit: Dict[str, Any],
-    repo_root: Optional[str] = None,
-    tree: Optional[ast.AST] = None,
-) -> Dict[str, Any]:
-    """Dispatches single-unit scope analysis, honoring mock patches on
-    inspect_single_unit_scope."""
-    return _dispatch_or_call(
-        "inspecting",
-        "inspect_single_unit_scope",
-        _inspect_single_unit_scope_impl,
-        dispatch_inspect_single_unit_scope,
-        (unit,),
-        {"repo_root": repo_root, "tree": tree},
-    )
-
-
-analyze_unit_variable_scope = dispatch_analyze_unit_variable_scope
-inspect_single_unit_scope = dispatch_inspect_single_unit_scope
+analyze_unit_variable_scope = _analyze_unit_variable_scope_impl
+inspect_single_unit_scope = _inspect_single_unit_scope_impl
