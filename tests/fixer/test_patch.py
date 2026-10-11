@@ -9090,19 +9090,19 @@ def test_pre_unit_class_generator_expression_lazy_read_captured(tmp_path: Path) 
 
 
 def test_load_unit_file_text_truncated_at_start_line_fails_closed() -> None:
-    """Verifies that _load_unit_file_text returns None when source_lines has ambiguous length."""
+    """Verifies _load_unit_file_text falls back to in-memory lines unless marked sliced."""
     unit = {
         "file": "dummy.py",
         "start": 1,
         "end": 3,
         "source_lines": ["x = 1\n", "y = 2\n", "z = 3\n"],
     }
-    # source_lines_is_sliced is None and len(source_lines) == (end - start + 1) -> fails closed
-    assert _load_unit_file_text(unit) is None
+    # When file is not on disk and source_lines_is_sliced is not True, falls back to source_lines
+    assert _load_unit_file_text(unit) == "x = 1\ny = 2\nz = 3\n"
 
-    # When explicitly marked not sliced, it returns the content
-    unit_full = dict(unit, source_lines_is_sliced=False)
-    assert _load_unit_file_text(unit_full) == "x = 1\ny = 2\nz = 3\n"
+    # When explicitly marked sliced, it fails closed to None
+    unit_sliced = dict(unit, source_lines_is_sliced=True)
+    assert _load_unit_file_text(unit_sliced) is None
 
 
 def test_generate_refactoring_patch_skips_mismatched_subroutine_kinds(

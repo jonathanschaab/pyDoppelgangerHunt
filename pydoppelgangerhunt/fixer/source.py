@@ -217,6 +217,17 @@ def _load_unit_file_text(
         except OSError:
             pass
 
+    # Secondary in-memory fallback for virtual/test units lacking disk presence
+    unit_lines = unit.get("source_lines")
+    if (
+        unit_lines
+        and isinstance(unit_lines, (list, tuple))
+        and unit.get("source_lines_is_sliced") is not True
+    ):
+        return "".join(
+            ln if ln.endswith(("\n", "\r")) else ln + "\n" for ln in unit_lines
+        )
+
     return None
 
 

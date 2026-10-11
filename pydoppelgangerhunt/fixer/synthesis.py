@@ -106,6 +106,9 @@ def _advance_quote_state(
     return None, False
 
 
+_MATCHING_BRACKETS: Dict[str, str] = {"]": "[", ")": "(", "}": "{"}
+
+
 def _split_delimited_type_string(
     text: str,
     delimiter: str,
@@ -116,7 +119,7 @@ def _split_delimited_type_string(
     """Splits a type string by a top-level delimiter, respecting brackets and quotes."""
     chunks: List[str] = []
     current: List[str] = []
-    depth = 0
+    bracket_stack: List[str] = []
     active_quote: Optional[str] = None
     escaped = False
     has_imbalance = False
@@ -126,22 +129,22 @@ def _split_delimited_type_string(
             current.append(char)
             continue
         if char in ("[", "(", "{"):
-            depth += 1
+            bracket_stack.append(char)
         elif char in ("]", ")", "}"):
-            depth -= 1
-            if depth < 0:
+            if not bracket_stack or bracket_stack[-1] != _MATCHING_BRACKETS[char]:
                 if require_balanced:
                     return []
-                depth = 0
                 has_imbalance = True
-        elif char == delimiter and depth == 0:
+            else:
+                bracket_stack.pop()
+        elif char == delimiter and not bracket_stack:
             item = "".join(current).strip()
             if item or allow_empty:
                 chunks.append(item)
             current = []
             continue
         current.append(char)
-    if depth != 0 or active_quote is not None or has_imbalance:
+    if bracket_stack or active_quote is not None or has_imbalance:
         if require_balanced:
             return []
         return [text.strip()] if text.strip() else []
@@ -540,9 +543,10 @@ def _format_helper_parameters(
 
 def _wrap_conditional_optional(type_str: str, is_conditional: bool) -> str:
     """Wraps type annotation in Optional if conditionally assigned and None is absent."""
+    opt_prefixes = ("Optional[", "typing.Optional[", "typing_extensions.Optional[")
     if (
         is_conditional
-        and not type_str.startswith("Optional[")
+        and not type_str.startswith(opt_prefixes)
         and not re.search(r"\bNone\b", type_str)
     ):
         return f"Optional[{type_str}]"

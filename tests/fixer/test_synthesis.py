@@ -2843,3 +2843,40 @@ def test_format_union_or_optional_nonetype_and_none() -> None:
     assert _normalize_pipe_unions("NoneType | None") == "None"
     assert _normalize_pipe_unions("None | NoneType") == "None"
 
+
+def test_wrap_conditional_optional_qualified_prefixes() -> None:
+    """Verifies that _wrap_conditional_optional does not double-wrap qualified Optional types."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _wrap_conditional_optional,
+    )
+
+    assert _wrap_conditional_optional("typing.Optional[int]", True) == "typing.Optional[int]"
+    assert (
+        _wrap_conditional_optional("typing_extensions.Optional[int]", True)
+        == "typing_extensions.Optional[int]"
+    )
+    assert _wrap_conditional_optional("Optional[int]", True) == "Optional[int]"
+    assert _wrap_conditional_optional("int", True) == "Optional[int]"
+    assert _wrap_conditional_optional("int", False) == "int"
+    assert _wrap_conditional_optional("Union[int, None]", True) == "Union[int, None]"
+
+
+def test_split_delimited_type_string_mismatched_brackets() -> None:
+    """Verifies that bracket mismatches are detected and rejected under require_balanced."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _split_delimited_type_string,
+        _split_type_args,
+    )
+
+    # Mismatched bracket types
+    assert _split_delimited_type_string("Tuple[int, str)", ",", require_balanced=True) == []
+    assert _split_delimited_type_string("Tuple(int, str]", ",", require_balanced=True) == []
+    assert _split_delimited_type_string("Dict{str: int]", ",", require_balanced=True) == []
+
+    # Valid balanced brackets
+    res = _split_delimited_type_string("Tuple[int, str], float", ",", require_balanced=True)
+    assert res == ["Tuple[int, str]", "float"]
+
+    # _split_type_args delegates to _split_delimited_type_string with require_balanced=True
+    assert _split_type_args("Tuple[int, str)") == []
+

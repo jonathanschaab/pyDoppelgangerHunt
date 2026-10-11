@@ -1860,7 +1860,8 @@ def test_resolve_clone_generator_subroutine_outputs_inverted_and_zero_coords() -
 
 
 def test_load_unit_file_text_honors_sliced_lines() -> None:
-    """Verifies that _load_unit_file_text returns None when source_lines is marked as sliced."""
+    """Verifies that _load_unit_file_text returns None when source_lines is marked as sliced,
+    and falls back to in-memory source_lines for virtual units when not explicitly sliced."""
     unit_sliced = {
         "file": "virtual.py",
         "start": 10,
@@ -1870,13 +1871,13 @@ def test_load_unit_file_text_honors_sliced_lines() -> None:
     }
     assert _load_unit_file_text(unit_sliced) is None
 
-    unit_heuristic = {
+    unit_fallback = {
         "file": "virtual.py",
         "start": 10,
         "end": 12,
         "source_lines": ["    x = 1\n", "    y = 2\n", "    z = 3\n"],
     }
-    assert _load_unit_file_text(unit_heuristic) is None
+    assert _load_unit_file_text(unit_fallback) == "    x = 1\n    y = 2\n    z = 3\n"
 
     unit_full = {
         "file": "virtual.py",
@@ -3317,6 +3318,8 @@ def test_extract_scope_local_names() -> None:
     assert "gen_var" not in names
     assert "inner_leak" not in names
     assert "class_attr" not in names
+    assert "math" not in names
+    assert "path" not in names
 
 
 def test_eager_builtin_scope_shadowing_scenarios() -> None:
@@ -3494,4 +3497,54 @@ def test_resolve_clone_pair_outputs_forwards_source_text_and_tree() -> None:
         tree2=t2,
     )
     assert res is not None
+
+
+def test_is_eagerly_consumed_genexp_call_arg_validation() -> None:
+    """Verifies that _is_eagerly_consumed_genexp checks that genexp is actually an argument."""
+    # 1. Genexp called directly as func: (x for x in data)()
+    genexp = ast.GeneratorExp(
+        elt=ast.Name(id="x", ctx=ast.Load()),
+        generators=[
+            ast.comprehension(
+                target=ast.Name(id="x", ctx=ast.Store()),
+                iter=ast.Name(id="data", ctx=ast.Load()),
+                ifs=[],
+                is_async=0,
+            )
+        ],
+    )
+    call_as_func = ast.Call(func=genexp, args=[], keywords=[])
+    parent_map: Dict[ast.AST, ast.AST] = {genexp: call_as_func}
+    assert _is_eagerly_consumed_genexp(genexp, parent_map) is False
+
+    # 2. Genexp passed as join argument: ",".join(x for x in data)
+    join_call = ast.Call(
+        func=ast.Attribute(value=ast.Constant(value=","), attr="join", ctx=ast.Load()),
+        args=[genexp],
+        keywords=[],
+    )
+    parent_map_join: Dict[ast.AST, ast.AST] = {genexp: join_call}
+    assert _is_eagerly_consumed_genexp(genexp, parent_map_join) is True
+
+    # 3. Genexp calling join: (x for x in data).join(",")
+    join_call_wrong_pos = ast.Call(
+        func=ast.Attribute(value=genexp, attr="join", ctx=ast.Load()),
+        args=[ast.Constant(value=",")],
+        keywords=[],
+    )
+    parent_map_wrong: Dict[ast.AST, ast.AST] = {genexp: join_call_wrong_pos}
+    assert _is_eagerly_consumed_genexp(genexp, parent_map_wrong) is False
+
+
+def test_load_unit_file_text_synthetic_in_memory_fallback() -> None:
+    """Verifies that _load_unit_file_text falls back to in-memory lines for virtual units."""
+    unit = {
+        "file": "nonexistent_virtual_module.py",
+        "start": 1,
+        "end": 2,
+        "source_lines": ["def foo():\n", "    return 42\n"],
+    }
+    # When file does not exist on disk, fallback to in-memory source_lines
+    text = _load_unit_file_text(unit)
+    assert text == "def foo():\n    return 42\n"
 

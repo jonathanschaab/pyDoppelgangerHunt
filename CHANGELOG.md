@@ -38,6 +38,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `int | str | None`) normalize to `Optional[Union[int, str]]` for Python 3.9 compatibility.
 - **Parser Emits Unit Async Status (`is_async`)**: AST parsing now populates `is_async` on code
   units containing asynchronous constructs (`AsyncFunctionDef`, `await`, `async for`, `async with`).
+- **Qualified `Optional` Prefix Support**: Updated `_wrap_conditional_optional` in `synthesis.py`
+  to recognize `typing.Optional` and `typing_extensions.Optional`, preventing redundant wrapping.
+- **Import Alias Isolation in Local Names**: Added `continue` after import and global/nonlocal nodes
+  in `_extract_single_node_local_names`, preventing aliased import names from leaking into scopes.
+- **Bracket-Stack Type Parsing**: Replaced scalar bracket depth in `_split_delimited_type_string`
+  with an explicit bracket stack to reject mismatched bracket pairs (e.g. `Tuple[int, str)`).
+- **Call Argument Validation for Generator Expressions**: Verified that `genexp` is an argument
+  in `_is_eagerly_consumed_genexp` before classifying it as consumed by eager built-ins or `.join`.
+- **In-Memory Fallback for Virtual Units**: Added secondary in-memory source line fallback in
+  `_load_unit_file_text` for synthetic or test units lacking disk presence.
 
 ### Breaking Changes
 - **Private Line-Splitting Regex (`_PHYSICAL_LINE_RE`)**: Dropped `_PHYSICAL_LINE_RE` from

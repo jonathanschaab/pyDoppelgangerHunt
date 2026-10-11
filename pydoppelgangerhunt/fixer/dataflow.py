@@ -1141,8 +1141,10 @@ def _extract_single_node_local_names(scope_node: ast.AST) -> Set[str]:
         elif isinstance(curr, (ast.Import, ast.ImportFrom)):
             for alias in curr.names:
                 names.add(alias.asname or alias.name.split(".", 1)[0])
+            continue
         elif isinstance(curr, (ast.Global, ast.Nonlocal)):
             names.update(curr.names)
+            continue
         else:
             bound_sym = getattr(curr, "name", None) or getattr(curr, "rest", None)
             if isinstance(bound_sym, str) and not isinstance(curr, ast.Attribute):
@@ -1211,13 +1213,20 @@ def _is_eagerly_consumed_genexp(
     """Returns True if the generator expression is directly consumed by an eager built-in."""
     parent = parent_map.get(genexp)
     if isinstance(parent, ast.Call):
+        is_arg = any(a is genexp for a in parent.args) or any(
+            kw.value is genexp for kw in parent.keywords
+        )
+        if not is_arg:
+            return False
         func = parent.func
         if isinstance(func, ast.Name) and func.id in _EAGER_CONSUMER_NAMES:
             if shadowed_names is not None and func.id in shadowed_names:
                 return False
             return True
         if isinstance(func, ast.Attribute) and func.attr == "join":
-            return _is_confirmed_str_receiver(func.value, shadowed_names=shadowed_names)
+            return any(a is genexp for a in parent.args) and _is_confirmed_str_receiver(
+                func.value, shadowed_names=shadowed_names
+            )
     return False
 
 
