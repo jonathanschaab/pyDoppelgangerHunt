@@ -208,6 +208,18 @@ def _flatten_union_args(args: Sequence[str]) -> List[str]:
     return flattened
 
 
+def _format_union_or_optional(unique_parts: List[str]) -> str:
+    """Formats unique union arguments, converting X | None to Optional[X]."""
+    if len(unique_parts) == 1:
+        return unique_parts[0]
+    if len(unique_parts) == 2:
+        if unique_parts[1] in ("None", "NoneType"):
+            return f"Optional[{unique_parts[0]}]"
+        if unique_parts[0] in ("None", "NoneType"):
+            return f"Optional[{unique_parts[1]}]"
+    return f"Union[{', '.join(unique_parts)}]"
+
+
 def _normalize_pipe_unions(type_str: Optional[str]) -> str:
     """Normalizes PEP 604 pipe unions (A | B) to typing.Union[A, B] syntax."""
     if not isinstance(type_str, str):
@@ -228,9 +240,7 @@ def _normalize_pipe_unions(type_str: Optional[str]) -> str:
     if len(pipe_parts) > 1:
         norm_parts = [_normalize_pipe_unions(p) for p in pipe_parts]
         unique_parts = list(dict.fromkeys(_flatten_union_args(norm_parts)))
-        if len(unique_parts) == 1:
-            return unique_parts[0]
-        return f"Union[{', '.join(unique_parts)}]"
+        return _format_union_or_optional(unique_parts)
 
     if "[" in cleaned and cleaned.endswith("]"):
         bracket_idx = cleaned.find("[")
@@ -256,12 +266,18 @@ def _normalize_pipe_unions(type_str: Optional[str]) -> str:
                 return cleaned
             inner_args = _split_type_args(cleaned)
             if inner_args:
+                if prefix in (
+                    "Annotated",
+                    "typing.Annotated",
+                    "typing_extensions.Annotated",
+                ):
+                    norm_first = _normalize_pipe_unions(inner_args[0])
+                    all_annotated = [norm_first] + list(inner_args[1:])
+                    return f"{prefix}[{', '.join(all_annotated)}]"
                 norm_args = [_normalize_pipe_unions(arg) for arg in inner_args]
                 if prefix in ("Union", "typing.Union", "typing_extensions.Union"):
                     unique = list(dict.fromkeys(_flatten_union_args(norm_args)))
-                    if len(unique) == 1:
-                        return unique[0]
-                    return f"Union[{', '.join(unique)}]"
+                    return _format_union_or_optional(unique)
                 return f"{prefix}[{', '.join(norm_args)}]"
 
     return cleaned

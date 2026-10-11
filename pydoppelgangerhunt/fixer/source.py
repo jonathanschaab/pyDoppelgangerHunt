@@ -115,19 +115,48 @@ _SUBROUTINE_KINDS: frozenset[str] = frozenset(
 )
 
 
-def is_subroutine_unit(unit: Any) -> bool:
+def is_subroutine_unit(unit: Any, source_text: Optional[str] = None) -> bool:
     """Checks whether an AST code unit is a subroutine block rather than a whole function.
 
     Classification Rules:
     1. Explicit 'is_subroutine' boolean in unit takes precedence if present.
     2. Known subroutine kinds ('compound_block', 'sliding_window', 'clause_branch') return True.
-    3. All other kinds or unspecified kinds return False.
+    3. Whole callable kinds ('function', 'method', 'async_function') return False.
+    4. Structural inspection: If source_text is available, checks whether the unit's
+       line bounds strictly reside inside an enclosing function (True) or cover it (False).
+    5. All other kinds or unspecified kinds without source return False.
     """
     if not isinstance(unit, dict):
         return False
     if "is_subroutine" in unit and unit.get("is_subroutine") is not None:
         return bool(unit["is_subroutine"])
-    return str(unit.get("kind") or "") in _SUBROUTINE_KINDS
+    kind = str(unit.get("kind") or "")
+    if kind in _SUBROUTINE_KINDS:
+        return True
+    if kind in ("function", "method", "async_function"):
+        return False
+
+    src = source_text or unit.get("source_text") or unit.get("file_source")
+    if isinstance(src, (list, tuple)):
+        src = "".join(src)
+    if src and isinstance(src, str):
+        try:
+            u_start = _parse_unit_coord(unit, "start", default=0)
+            u_end = _parse_unit_coord(unit, "end", default=u_start)
+            if 0 < u_start <= u_end:
+                res = _find_innermost_enclosing_node(
+                    src, unit, (ast.FunctionDef, ast.AsyncFunctionDef)
+                )
+                if res is not None:
+                    matched_node, f_start, f_end = res
+                    fn_def_start = getattr(matched_node, "lineno", f_start)
+                    if u_start in (fn_def_start, f_start) and u_end == f_end:
+                        return False
+                    return True
+        except (ValueError, TypeError):
+            pass
+
+    return False
 
 
 def resolve_unit_declared_outputs(unit: Dict[str, Any]) -> Any:
@@ -1160,6 +1189,11 @@ def _find_innermost_enclosing_node(
     except (ValueError, TypeError):
         return None
     if u_start <= 0 or u_end <= 0 or u_start > u_end:
+        return None
+
+    if isinstance(source_text, (list, tuple)):
+        source_text = "".join(source_text)
+    elif not isinstance(source_text, str):
         return None
 
     if tree is None:

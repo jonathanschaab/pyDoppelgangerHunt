@@ -1749,13 +1749,12 @@ def test_load_unit_file_text_resilience_to_non_utf8_bytes(tmp_path: Path) -> Non
     assert _load_unit_file_text({"file": str(latin1_file)}, repo_root=None) is None
 
 
-def test_collect_downstream_read_names_mtime_independent_cache_sharing() -> None:
-    """Verifies that differing mtimes for identical content share cache entries via digest
-    deduplication."""
+def test_collect_downstream_read_names_content_digest_cache_sharing() -> None:
+    """Verifies that identical content shares cache entries across distinct unit dicts."""
     _clear_downstream_reads_cache()
     code = "def f():\n    x = 1\n    return x\n"
-    unit1 = {"file": "f.py", "start": 2, "end": 2, "mtime": 100}
-    unit2 = {"file": "f.py", "start": 2, "end": 2, "mtime": 200}
+    unit1 = {"file": "f.py", "start": 2, "end": 2, "tag": "first"}
+    unit2 = {"file": "f.py", "start": 2, "end": 2, "tag": "second"}
     reads1 = collect_downstream_read_names(code, unit1)
     reads2 = collect_downstream_read_names(code, unit2)
     assert reads1 == {"x"}
@@ -1763,7 +1762,7 @@ def test_collect_downstream_read_names_mtime_independent_cache_sharing() -> None
     from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
         _downstream_reads_cache,
     )
-    # Content digest deduplication: identical content with differing timestamps shares the cache
+    # Content digest deduplication: identical content shares the cache
     assert len(_downstream_reads_cache) == 1
 
 
@@ -1789,15 +1788,13 @@ def test_collect_downstream_read_names_digest_invalidation(tmp_path: Path) -> No
     assert len(_downstream_reads_cache) == 2
 
 
-def test_collect_downstream_read_names_no_disk_stat_call() -> None:
-    """Verifies that collect_downstream_read_names avoids redundant disk stat() calls."""
+def test_collect_downstream_read_names_in_memory_no_disk_dependency() -> None:
+    """Verifies that collect_downstream_read_names executes purely in-memory from source_text."""
     _clear_downstream_reads_cache()
     code = "def f():\n    x = 1\n    return x\n"
-    unit = {"file": "virtual_module.py", "start": 2, "end": 2}
-    with mock.patch.object(Path, "stat") as mock_stat:
-        reads = collect_downstream_read_names(code, unit)
-        assert reads == {"x"}
-        mock_stat.assert_not_called()
+    unit = {"file": "virtual/nonexistent_path/mod.py", "start": 2, "end": 2}
+    reads = collect_downstream_read_names(code, unit)
+    assert reads == {"x"}
 
 
 def test_resolve_clone_generator_subroutine_outputs_precomputed_definite_stores() -> None:
@@ -3000,7 +2997,6 @@ def test_resolve_clone_generator_subroutine_outputs_closure_pos_tuple_normalizat
 
     code1 = (
         "def g1():\n"
-        "    cb = lambda: val\n"
         "    val = 1\n"
         "    yield val\n"
         "    print(val)\n"
@@ -3012,10 +3008,14 @@ def test_resolve_clone_generator_subroutine_outputs_closure_pos_tuple_normalizat
         "    print(val)\n"
     )
 
-    u1 = {"start": 2, "end": 4, "file": "mod1.py", "source_text": code1}
-    u2 = {"start": 2, "end": 4, "file": "mod2.py", "source_text": code2}
+    u1 = {"start": 2, "end": 3, "file": "mod1.py", "source_text": code1}
+    u2 = {"start": 2, "end": 3, "file": "mod2.py", "source_text": code2}
     s1 = {"has_yield": True, "inputs": [], "outputs": ["val"], "definite_stores": ["val"]}
     s2 = {"has_yield": True, "inputs": [], "outputs": ["val"], "definite_stores": ["val"]}
+
+    # Without closures, resolution succeeds and returns (["val"], ["val"])
+    res_clean = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
+    assert res_clean == (["val"], ["val"])
 
     def _mock_closures(scope_node: Any) -> list[tuple[Any, set[str]]]:
         return [((2, 4), {"val"})]
@@ -3149,10 +3149,184 @@ def test_outer_expr_visitor_multi_clause_comprehension_scoping() -> None:
     assert reads_first == {"row"}
 
 
+def test_eagerly_consumed_genexp_not_treated_as_escaping_closure() -> None:
+    """Verifies that generator expressions directly consumed by eager built-ins
+    (e.g., sum) are not treated as escaping closures."""
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        _collect_scope_closures,
+        resolve_clone_generator_subroutine_outputs,
+    )
+
+    code = (
+        "def compute():\n"
+        "    data = [1, 2, 3]\n"
+        "    total = sum(x * 2 for x in data)\n"
+        "    yield total\n"
+        "    print(total)\n"
+    )
+    tree = ast.parse(code)
+    func_node = tree.body[0]
+    closures = _collect_scope_closures(func_node)
+    # The eagerly consumed genexp in sum(...) should not be in closures
+    assert len(closures) == 0
+
+    code_escaping = (
+        "def compute_escaping():\n"
+        "    data = [1, 2, 3]\n"
+        "    gen = (x * 2 for x in data)\n"
+        "    yield gen\n"
+    )
+    tree_esc = ast.parse(code_escaping)
+    closures_esc = _collect_scope_closures(tree_esc.body[0])
+    assert len(closures_esc) == 1
+
+    # Verify that resolve_clone_generator_subroutine_outputs succeeds for the eager case
+    u1 = {"start": 2, "end": 4, "file": "f1.py", "source_text": code}
+    u2 = {"start": 2, "end": 4, "file": "f2.py", "source_text": code}
+    s1 = {"has_yield": True, "inputs": [], "outputs": ["total"], "definite_stores": ["total"]}
+    s2 = {"has_yield": True, "inputs": [], "outputs": ["total"], "definite_stores": ["total"]}
+    res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
+    assert res == (["total"], ["total"])
 
 
+def test_async_generator_try_without_yield_not_flagged_as_hazard() -> None:
+    """Verifies that an async generator with try/except around an await
+    (no yield inside the try) is not flagged as a control flow hazard."""
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        has_async_generator_delegation_hazard,
+    )
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        inspect_single_unit_scope,
+    )
+
+    code_safe = (
+        "async def fetch_stream():\n"
+        "    try:\n"
+        "        data = await fetch()\n"
+        "    except Exception:\n"
+        "        data = []\n"
+        "    yield data\n"
+    )
+    unit_safe = {
+        "file": "f.py",
+        "start": 1,
+        "end": 6,
+        "kind": "function",
+        "source_text": code_safe,
+    }
+    scope_safe = inspect_single_unit_scope(unit_safe)
+    assert scope_safe["has_yield"] is True
+    assert scope_safe["has_try_or_with"] is False
+    assert has_async_generator_delegation_hazard(scope_safe) is False
+
+    code_hazard = (
+        "async def fetch_stream_hazard():\n"
+        "    try:\n"
+        "        yield 1\n"
+        "    finally:\n"
+        "        cleanup()\n"
+    )
+    unit_hazard = {
+        "file": "f.py",
+        "start": 1,
+        "end": 5,
+        "kind": "function",
+        "source_text": code_hazard,
+    }
+    scope_hazard = inspect_single_unit_scope(unit_hazard)
+    assert scope_hazard["has_yield"] is True
+    assert scope_hazard["has_try_or_with"] is True
+    assert has_async_generator_delegation_hazard(scope_hazard) is True
 
 
+def test_handbuilt_unit_without_kind_treated_as_subroutine_mid_function() -> None:
+    """Verifies that hand-built units lacking kind or is_subroutine are detected
+    structurally as subroutines when located mid-function to prevent silent miscompilation."""
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        inspect_single_unit_scope,
+    )
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
+        is_subroutine_unit,
+    )
+
+    code = (
+        "def worker(x):\n"
+        "    a = x + 1\n"
+        "    b = a * 2\n"
+        "    c = b + 3\n"
+        "    return c\n"
+    )
+    # Unit covering only lines 2-3 (statement block mid-function)
+    unit_mid = {"file": "worker.py", "start": 2, "end": 3, "source_text": code}
+    assert is_subroutine_unit(unit_mid, source_text=code) is True
+
+    scope = inspect_single_unit_scope(unit_mid)
+    # Because it is treated as a subroutine, variable assignments are captured as outputs
+    assert "b" in scope["outputs"]
+    assert "a" in scope["inputs"] or "x" in scope["inputs"]
 
 
+def test_concurrent_generate_refactoring_patch_calls(tmp_path: Path) -> None:
+    """Verifies that concurrent calls to generate_refactoring_patch do not corrupt
+    or wipe shared caches or interfere with each other."""
+    import concurrent.futures
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        generate_refactoring_patch,
+    )
 
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    code1 = (
+        "def compute1(x: int) -> int:\n"
+        "    a = x * 2\n"
+        "    b = a + 3\n"
+        "    return b\n"
+    )
+    code2 = (
+        "def compute2(y: int) -> int:\n"
+        "    a = y * 2\n"
+        "    b = a + 3\n"
+        "    return b\n"
+    )
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+
+    clones = [
+        (
+            1.0,
+            {
+                "file": str(f1),
+                "start": 1,
+                "end": 4,
+                "name": "compute1",
+                "kind": "function",
+                "source_text": code1,
+            },
+            {
+                "file": str(f2),
+                "start": 1,
+                "end": 4,
+                "name": "compute2",
+                "kind": "function",
+                "source_text": code2,
+            },
+        )
+    ]
+
+    def _run_worker(worker_id: int) -> tuple[int, str | None]:
+        patch_text = generate_refactoring_patch(
+            clones,
+            repo_root=str(tmp_path),
+        )
+        return worker_id, patch_text
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(_run_worker, i) for i in range(8)]
+        results = [f.result() for f in futures]
+
+    assert len(results) == 8
+    first_patch_text = results[0][1]
+    assert first_patch_text is not None
+    assert len(first_patch_text) > 0
+    for _, patch_text in results[1:]:
+        assert patch_text == first_patch_text

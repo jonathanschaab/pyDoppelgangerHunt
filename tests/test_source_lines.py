@@ -35,21 +35,23 @@ from pydoppelgangerhunt.source_lines import parse_unit_coord
 
 
 def test_resolve_unit_ast_end_col_multiline_unit_statements() -> None:
-    """Verifies that multi-line units ending on a line with multiple statements include all statements up through the line end."""
-
+    """Verifies that multi-line units ending on a line with multiple statements
+    without column coordinates fail closed, treating loads on the end line as downstream."""
     code = (
         "def worker():\n"
         "    a = 1\n"
-        "    total = 10; count = 20\n"
+        "    use(x); use(y)\n"
         "    print(res)\n"
     )
-    # Multi-line unit covering lines 2 to 3
+    # Multi-line unit covering lines 2 to 3 without column bounds fails closed
     unit = {"start": 2, "end": 3}
-    reads = collect_downstream_read_names(code, unit, candidates={"total", "count", "res"})
+    reads = collect_downstream_read_names(code, unit, candidates={"x", "y", "res"})
     assert reads is not None
-    # total and count are on line 3 (end line of multi-line unit), so they are NOT downstream reads
-    assert "total" not in reads
-    assert "count" not in reads
+    # Because end_col is None for ambiguous trailing statements,
+    # fail-closed treats them as downstream reads
+    assert "x" in reads
+    assert "y" in reads
+    assert "res" in reads
 
 
 def test_resolve_unit_ast_end_col_bounds_validation() -> None:
@@ -399,3 +401,31 @@ def test_parse_unit_coord_strict_rejects_signed_prefix() -> None:
     assert is_valid_unit_coordinates({"start": "+1", "end": "5"}, strict=True) is False
     assert is_valid_unit_coordinates({"start": "+1", "end": "5"}, strict=False) is True
 
+
+def test_resolve_safe_unit_file_path_symlinked_ancestor_root(tmp_path: Path) -> None:
+    """Verifies resolve_safe_unit_file_path handles symlinked ancestor roots
+    (e.g., /var -> /private/var)."""
+    from pydoppelgangerhunt.source_lines import (  # pylint: disable=import-outside-toplevel
+        resolve_safe_unit_file_path,
+    )
+
+    private_dir = tmp_path / "private"
+    real_var = private_dir / "var"
+    real_var.mkdir(parents=True)
+    real_repo = real_var / "my_project"
+    real_repo.mkdir()
+    target_py = real_repo / "main.py"
+    target_py.write_text("print('symlink ancestor test')\n", encoding="utf-8")
+
+    sym_var = tmp_path / "var"
+    try:
+        sym_var.symlink_to(real_var, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("Filesystem does not support directory symlinks or lacks privileges")
+
+    sym_repo_file = sym_var / "my_project" / "main.py"
+    # Even though sym_var in parent chain is a symlink, target is an ancestor of repo root
+    resolved = resolve_safe_unit_file_path(
+        {"file": str(sym_repo_file)}, repo_root=str(real_repo)
+    )
+    assert resolved == target_py.resolve()

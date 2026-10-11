@@ -2479,7 +2479,10 @@ def test_normalize_pipe_unions_variants() -> None:
     assert _normalize_pipe_unions("int | str | float") == "Union[int, str, float]"
     assert _normalize_pipe_unions("int | int") == "int"
     assert _normalize_pipe_unions("list[int | str]") == "list[Union[int, str]]"
-    assert _normalize_pipe_unions("Iterator[int | None]") == "Iterator[Union[int, None]]"
+    assert _normalize_pipe_unions("int | None") == "Optional[int]"
+    assert _normalize_pipe_unions("None | int") == "Optional[int]"
+    assert _normalize_pipe_unions("Union[int, None]") == "Optional[int]"
+    assert _normalize_pipe_unions("Iterator[int | None]") == "Iterator[Optional[int]]"
     assert _normalize_pipe_unions("tuple[int | str, ...]") == "tuple[Union[int, str], ...]"
     assert _normalize_pipe_unions("Tuple[int | str, float]") == "Tuple[Union[int, str], float]"
     assert _normalize_pipe_unions("Union[int | str, float]") == "Union[int, str, float]"
@@ -2492,7 +2495,12 @@ def test_normalize_pipe_unions_variants() -> None:
     )
     assert (
         _normalize_pipe_unions("Dict[str, list[int | None]]")
-        == "Dict[str, list[Union[int, None]]]"
+        == "Dict[str, list[Optional[int]]]"
+    )
+    assert _normalize_pipe_unions('Annotated[int, "a | b"]') == 'Annotated[int, "a | b"]'
+    assert (
+        _normalize_pipe_unions('Annotated[int | None, "a | b"]')
+        == 'Annotated[Optional[int], "a | b"]'
     )
     assert _normalize_pipe_unions("'int | str'") == "'Union[int, str]'"
     assert _normalize_pipe_unions("int") == "int"
@@ -2552,7 +2560,7 @@ def test_infer_helper_return_type_pep604_pipe_union_in_container_yields() -> Non
         meta2={},
         is_async=False,
     )
-    assert res_yield == "Iterator[Union[int, None]]"
+    assert res_yield == "Iterator[Optional[int]]"
 
 
 def test_split_type_args_trailing_comma() -> None:
@@ -2808,5 +2816,3 @@ def test_flatten_union_args_typing_extensions() -> None:
         _normalize_pipe_unions("int | typing_extensions.Union[str, float]")
         == "Union[int, str, float]"
     )
-
-

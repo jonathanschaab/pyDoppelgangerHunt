@@ -186,7 +186,7 @@ from pydoppelgangerhunt import (
 - **`refactor_module_units(source_text, replacements, tier1=True, tier2=True, dry_run=False)`**: Applies multiple non-overlapping unit replacements in strict **reverse source order** (descending byte offsets) using single-pass buffer slicing, guaranteeing that downstream text expansions or contractions never invalidate upstream coordinates.
 - **`validate_module_unit_replacements(source_text, replacements, tier1=True, tier2=True)`**: Non-mutating validation helper that verifies candidate replacements for collisions across Tier 1 (AST coordinate overlap) and Tier 2 (physical byte interval sweep) without modifying or allocating new source string buffers.
 - **`generate_refactoring_patch(candidate_pairs, repo_root=..., replace_clones=...,`**
-  **`closure_strictness="strict", skip_pre_unit_closures=False, ...)`**:
+  **`closure_strictness=None, skip_pre_unit_closures=False, ...)`**:
   Synthesizes a multi-file unified diff (`git apply` compatible) with dependency cycle detection
   and per-pair transactional snapshot rollback. For generator subroutines (within function or
   method definitions; module-level yields are a syntax error in Python), downstream variable
@@ -281,6 +281,12 @@ strict fail-closed safety invariants:
   generator return propagation applies strictly to functions and methods. For non-generator
   module-level units, variables defined within the unit are module-level globals; ensure
   module-level refactorings do not alter globals exported as public module API.
+- **Dynamic Scope Reflection Limitations**: Downstream variable liveness analysis statically
+  identifies dynamic local and global reads via `locals()`, `vars()`, `eval()`, `exec()`, `dir()`,
+  and `globals()`. Dynamic reflection via runtime stack frame introspection (such as
+  `sys._getframe()` or `inspect.currentframe().f_locals`) is not tracked statically; functions
+  relying on frame-inspection reflection should be refactored manually or marked with
+  `# pragma: no-refactor`.
 - **Strict Coordinate Validation**: In patch generation (`--patch`), unit line coordinates must
   be strictly positive integers with `start <= end` (and `start_col <= end_col` on the same line).
   Units with missing, zero, or inverted coordinates fail closed and are rejected rather than

@@ -26,7 +26,6 @@ from pydoppelgangerhunt.fixer.binding import (
     find_enclosing_function,
 )
 from pydoppelgangerhunt.fixer.dataflow import (
-    _clear_downstream_reads_cache,
     has_async_generator_delegation_hazard,
     resolve_clone_pair_outputs,
 )
@@ -46,7 +45,7 @@ from pydoppelgangerhunt.fixer.depgraph import (
 from pydoppelgangerhunt.fixer.scope import (
     _extract_arg_names,
     _normalize_receiver_attrs,
-    dispatch_analyze_unit_variable_scope,
+    analyze_unit_variable_scope,
     inspect_single_unit_scope,
 )
 
@@ -78,9 +77,6 @@ from pydoppelgangerhunt.fixer.synthesis import (
 
 logger = logging.getLogger(__name__)
 _BUILTIN_NAMES: Set[str] = set(dir(builtins))
-
-
-analyze_unit_variable_scope = dispatch_analyze_unit_variable_scope
 
 
 class UnitCollisionError(ValueError):
@@ -2638,22 +2634,18 @@ def generate_refactoring_patch(
     """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
     if not clones:
         return ""
-    _clear_downstream_reads_cache()
-    try:
-        return _generate_refactoring_patch_impl(
-            clones=clones,
-            repo_root=repo_root,
-            type_merge_strategy=type_merge_strategy,
-            replace_clones=replace_clones,
-            method_binding=method_binding,
-            cross_file_strategy=cross_file_strategy,
-            shared_module_name=shared_module_name,
-            depgraph=depgraph,
-            skip_pre_unit_closures=skip_pre_unit_closures,
-            closure_strictness=closure_strictness,
-        )
-    finally:
-        _clear_downstream_reads_cache()
+    return _generate_refactoring_patch_impl(
+        clones=clones,
+        repo_root=repo_root,
+        type_merge_strategy=type_merge_strategy,
+        replace_clones=replace_clones,
+        method_binding=method_binding,
+        cross_file_strategy=cross_file_strategy,
+        shared_module_name=shared_module_name,
+        depgraph=depgraph,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+        closure_strictness=closure_strictness,
+    )
 
 
 def _generate_refactoring_patch_impl(
@@ -3001,7 +2993,13 @@ def _generate_refactoring_patch_impl(
             step = _derive_unit_indent_step(u1, orig_lines, step)
 
             scope = analyze_unit_variable_scope(
-                u1_eff, u2_eff, repo_root=str(root), tree1=tree1, tree2=tree2
+                u1_eff,
+                u2_eff,
+                repo_root=str(root),
+                tree1=tree1,
+                tree2=tree2,
+                scope1=s1,
+                scope2=s2,
             )
             inputs = list(scope.get("inputs", []))
             if effective_binding == "module":
@@ -3224,7 +3222,7 @@ def _generate_refactoring_patch_impl(
 
                 if replace_clones:
                     _delegate_unit_in_plan(
-                        u1,
+                        u1_eff,
                         f1_plan,
                         helper_name=helper_name,
                         inputs=inputs,
@@ -3238,7 +3236,7 @@ def _generate_refactoring_patch_impl(
                     )
                     if len(candidate_units) > 1:
                         _delegate_unit_in_plan(
-                            u2,
+                            u2_eff,
                             f1_plan,
                             helper_name=helper_name,
                             inputs=inputs,
@@ -3267,10 +3265,10 @@ def _generate_refactoring_patch_impl(
 
                     if _is_same_file_or_resolved(shared_p, f1_path):
                         host_plan = f1_plan
-                        callers = [(f2_plan, u2, t_inputs2, target_outs2)]
+                        callers = [(f2_plan, u2_eff, t_inputs2, target_outs2)]
                     elif _is_same_file_or_resolved(shared_p, f2_plan.path):
                         host_plan = f2_plan
-                        callers = [(f1_plan, u1, t_inputs1, outputs)]
+                        callers = [(f1_plan, u1_eff, t_inputs1, outputs)]
                     else:
                         shared_plan = file_plans.get(shared_p)
                         if shared_plan is None:
@@ -3323,8 +3321,8 @@ def _generate_refactoring_patch_impl(
                                 )
                         host_plan = shared_plan
                         callers = [
-                            (f1_plan, u1, t_inputs1, outputs),
-                            (f2_plan, u2, t_inputs2, target_outs2),
+                            (f1_plan, u1_eff, t_inputs1, outputs),
+                            (f2_plan, u2_eff, t_inputs2, target_outs2),
                         ]
 
                     mod1 = _derive_module_import_path(f1_path, import_root)
@@ -3440,7 +3438,7 @@ def _generate_refactoring_patch_impl(
                     if replace_clones:
                         if host_plan is f1_plan:
                             _delegate_unit_in_plan(
-                                u1,
+                                u1_eff,
                                 f1_plan,
                                 helper_name=helper_name,
                                 inputs=inputs,
@@ -3454,7 +3452,7 @@ def _generate_refactoring_patch_impl(
                             )
                         elif host_plan is f2_plan:
                             _delegate_unit_in_plan(
-                                u2,
+                                u2_eff,
                                 f2_plan,
                                 helper_name=helper_name,
                                 inputs=inputs,
@@ -3586,7 +3584,7 @@ def _generate_refactoring_patch_impl(
                     _wire_cross_module_host_delegation(
                         f1_plan=f1_plan,
                         f2_plan=f2_plan,
-                        u2=u2,
+                        u2=u2_eff,
                         mod1=mod1,
                         helper_name=helper_name,
                         pair_comment=pair_comment,
@@ -3605,7 +3603,7 @@ def _generate_refactoring_patch_impl(
 
                     _finalize_host_unit_and_helper(
                         plan=f1_plan,
-                        unit=u1,
+                        unit=u1_eff,
                         helper_name=helper_name,
                         inputs=inputs,
                         outputs=outputs,

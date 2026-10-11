@@ -68,7 +68,9 @@ _CacheValT = TypeVar("_CacheValT")
 _downstream_cache_lock: threading.Lock = threading.Lock()
 _MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
 _MAX_SCOPE_CACHE_SIZE: int = 1024
+_MAX_PARSED_TREE_CACHE_SIZE: int = 128
 _downstream_reads_cache: OrderedDict[Tuple[Any, ...], frozenset[str]] = OrderedDict()
+_parsed_tree_cache: OrderedDict[str, Optional[ast.AST]] = OrderedDict()
 
 _scope_parent_maps: OrderedDict[ast.AST, Dict[ast.AST, ast.AST]] = OrderedDict()
 _scope_stmts_by_end: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
@@ -76,6 +78,20 @@ _scope_closures_cache: OrderedDict[ast.AST, List[Tuple[_ClosurePos, Set[str]]]] 
 _scope_loops_cache: OrderedDict[ast.AST, List[Tuple[int, int]]] = OrderedDict()
 _scope_try_with_cache: OrderedDict[ast.AST, List[ast.AST]] = OrderedDict()
 _warned_lenient_closure: List[bool] = [False]
+
+
+def _store_lru_cache_entry(
+    cache: OrderedDict[Any, Any],
+    key: Any,
+    value: Any,
+    max_size: int,
+) -> None:
+    """Stores key-value pair in an OrderedDict LRU cache with eviction under lock."""
+    with _downstream_cache_lock:
+        if key not in cache and len(cache) >= max_size:
+            cache.popitem(last=False)
+        cache[key] = value
+        cache.move_to_end(key)
 
 
 def _get_or_compute_scope_cached(
@@ -95,30 +111,49 @@ def _get_or_compute_scope_cached(
     computed = compute_fn()
 
     try:
-        with _downstream_cache_lock:
-            if scope_node not in cache and len(cache) >= _MAX_SCOPE_CACHE_SIZE:
-                cache.popitem(last=False)
-            cache[scope_node] = computed
-            cache.move_to_end(scope_node)
+        _store_lru_cache_entry(cache, scope_node, computed, _MAX_SCOPE_CACHE_SIZE)
     except TypeError:
         pass
 
     return computed
 
 
+def _get_or_parse_tree(
+    source_text: str,
+    source_digest: Optional[str] = None,
+) -> Optional[ast.AST]:
+    """Retrieves cached AST tree or parses source_text into an AST tree."""
+    if not source_text.strip():
+        return None
+    key = (
+        source_digest
+        or hashlib.sha256(source_text.encode("utf-8", errors="replace")).hexdigest()
+    )
+    with _downstream_cache_lock:
+        if key in _parsed_tree_cache:
+            cached_tree = _parsed_tree_cache[key]
+            _parsed_tree_cache.move_to_end(key)
+            return cached_tree
+
+    parsed: Optional[ast.AST] = None
+    try:
+        parsed = ast.parse(source_text)
+    except (SyntaxError, ValueError, UnicodeDecodeError):
+        parsed = None
+
+    _store_lru_cache_entry(_parsed_tree_cache, key, parsed, _MAX_PARSED_TREE_CACHE_SIZE)
+    return parsed
+
+
 def _parse_source_tree(
     source_text: str,
     tree: Optional[ast.AST] = None,
+    source_digest: Optional[str] = None,
 ) -> Optional[ast.AST]:
     """Parses Python source code into an AST tree if not already provided."""
     if tree is not None:
         return tree
-    if not source_text.strip():
-        return None
-    try:
-        return ast.parse(source_text)
-    except (SyntaxError, ValueError, UnicodeDecodeError):
-        return None
+    return _get_or_parse_tree(source_text, source_digest=source_digest)
 
 
 def _get_valid_unit_bounds(unit: Dict[str, Any]) -> Optional[Tuple[int, int]]:
@@ -1045,10 +1080,30 @@ class _ClosurePos(NamedTuple):
     col: int = 0
 
 
+_EAGER_CONSUMER_NAMES: frozenset[str] = frozenset(
+    {"sum", "min", "max", "any", "all", "list", "set", "tuple", "dict", "sorted", "frozenset"}
+)
+
+
+def _is_eagerly_consumed_genexp(
+    genexp: ast.GeneratorExp, parent_map: Dict[ast.AST, ast.AST]
+) -> bool:
+    """Returns True if the generator expression is directly consumed by an eager built-in."""
+    parent = parent_map.get(genexp)
+    if isinstance(parent, ast.Call):
+        func = parent.func
+        if isinstance(func, ast.Name) and func.id in _EAGER_CONSUMER_NAMES:
+            return True
+        if isinstance(func, ast.Attribute) and func.attr == "join":
+            return True
+    return False
+
+
 def _collect_scope_closures_uncached(
     scope_node: ast.AST,
 ) -> List[Tuple[_ClosurePos, Set[str]]]:
     closures: List[Tuple[_ClosurePos, Set[str]]] = []
+    parent_map = _get_scope_parent_map(scope_node)
 
     def _resolve_stmt_start_pos(s: ast.stmt) -> Tuple[int, int]:
         s_line = int(getattr(s, "lineno", 0) or 0)
@@ -1076,6 +1131,10 @@ def _collect_scope_closures_uncached(
     ) -> None:
         for node in nodes:
             for subnode in ast.walk(node):
+                if isinstance(subnode, ast.GeneratorExp) and _is_eagerly_consumed_genexp(
+                    subnode, parent_map
+                ):
+                    continue
                 if isinstance(subnode, (ast.Lambda, ast.GeneratorExp)):
                     sub_l = getattr(subnode, "lineno", None)
                     sub_c = getattr(subnode, "col_offset", None)
@@ -1219,6 +1278,7 @@ def _clear_downstream_reads_cache() -> None:
     """Clears the downstream read memoization cache and AST scope caches."""
     with _downstream_cache_lock:
         _downstream_reads_cache.clear()
+        _parsed_tree_cache.clear()
         _scope_parent_maps.clear()
         _scope_stmts_by_end.clear()
         _scope_closures_cache.clear()
@@ -1587,10 +1647,19 @@ def collect_downstream_read_names(
     if candidates is not None and not candidates:
         return set()
 
+    effective_tree = tree
+    if effective_tree is None:
+        eff_digest = (
+            source_digest
+            or unit.get("source_digest")
+            or unit.get("content_digest")
+        )
+        effective_tree = _get_or_parse_tree(source_text, source_digest=eff_digest)
+
     u_end_col = _extract_unit_end_col(unit)
     scope_node: Optional[ast.AST] = None
     if u_end_col is None:
-        scope_node = _resolve_downstream_scope_node(source_text, unit, tree)
+        scope_node = _resolve_downstream_scope_node(source_text, unit, effective_tree)
         if scope_node is None:
             return None
         u_end_col = _resolve_unit_ast_end_col(scope_node, unit)
@@ -1612,7 +1681,7 @@ def collect_downstream_read_names(
             return set(cached)
 
     if scope_node is None:
-        scope_node = _resolve_downstream_scope_node(source_text, unit, tree)
+        scope_node = _resolve_downstream_scope_node(source_text, unit, effective_tree)
         if scope_node is None:
             return None
 
@@ -1622,36 +1691,13 @@ def collect_downstream_read_names(
 
     if skip_pre_unit_closures:
         pre_unit_captured_reads: Set[str] = set()
-        if logger.isEnabledFor(logging.DEBUG) or (
-            logger.isEnabledFor(logging.WARNING) and not _warned_lenient_closure[0]
-        ):
-            potential_captures = _collect_pre_unit_closures(
-                scope_node,
-                u_start,
-                candidates=candidates,
-                u_start_col=u_start_col,
-            )
-            suppressed = (
-                (potential_captures & candidates)
-                if candidates is not None
-                else potential_captures
-            )
-            if suppressed:
-                with _downstream_cache_lock:
-                    if not _warned_lenient_closure[0]:
-                        _warned_lenient_closure[0] = True
-                        logger.warning(
-                            "Lenient closure mode active: suppressed pre-unit "
-                            "closure read capture; escaping callback mutations "
-                            "may be unobserved"
-                        )
-                logger.debug(
-                    "Lenient closure mode suppressed pre-unit closure read capture "
-                    "for variable(s) %s in %s (lines %d-%d)",
-                    sorted(suppressed),
-                    unit.get("file", ""),
-                    u_start,
-                    u_end,
+        with _downstream_cache_lock:
+            if not _warned_lenient_closure[0]:
+                _warned_lenient_closure[0] = True
+                logger.warning(
+                    "Lenient closure mode active: suppressed pre-unit "
+                    "closure read capture; escaping callback mutations "
+                    "may be unobserved"
                 )
     else:
         pre_unit_captured_reads = _collect_pre_unit_closures(
@@ -1702,14 +1748,12 @@ def collect_downstream_read_names(
 
     _merge_pre_unit_closure_reads(loaded, pre_unit_captured_reads, candidates)
 
-    with _downstream_cache_lock:
-        if (
-            cache_key not in _downstream_reads_cache
-            and len(_downstream_reads_cache) >= _MAX_DOWNSTREAM_CACHE_SIZE
-        ):
-            _downstream_reads_cache.popitem(last=False)
-        _downstream_reads_cache[cache_key] = frozenset(loaded)
-        _downstream_reads_cache.move_to_end(cache_key)
+    _store_lru_cache_entry(
+        _downstream_reads_cache,
+        cache_key,
+        frozenset(loaded),
+        _MAX_DOWNSTREAM_CACHE_SIZE,
+    )
 
     return loaded
 
@@ -2029,9 +2073,26 @@ def resolve_clone_generator_subroutine_outputs(
                     side_idx + 1,
                 )
                 return None
+            u_start_col = _extract_first_unit_coord(
+                u_item, ("start_col", "start_col_offset")
+            )
+            u_end_col = _extract_unit_end_col(u_item)
             for c_pos, reads in _collect_scope_closures(scope_node):
-                c_line = int(c_pos[0]) if isinstance(c_pos, (tuple, list)) else int(c_pos)
-                if u_s <= c_line <= u_e and bool(reads & set(needed_outs)):
+                if isinstance(c_pos, (tuple, list)) and len(c_pos) >= 2:
+                    c_line, c_col = int(c_pos[0]), int(c_pos[1])
+                else:
+                    c_line = int(c_pos)
+                    c_col = getattr(c_pos, "col", 0)
+                is_pre = (
+                    c_line < u_s
+                    or (c_line == u_s and u_start_col is not None and c_col < u_start_col)
+                )
+                is_post = (
+                    c_line > u_e
+                    or (c_line == u_e and u_end_col is not None and c_col > u_end_col)
+                )
+                is_intra = not is_pre and not is_post
+                if is_intra and bool(reads & set(needed_outs)):
                     logger.debug(
                         "Rejecting generator subroutine pair: intra-unit closure at line %d "
                         "captures needed output(s) %r for unit %s",

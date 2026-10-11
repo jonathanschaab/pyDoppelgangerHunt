@@ -38,15 +38,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `extract_unit_source_code` and `_compute_replacement_line_deltas` now default to `end = start`
   (a single-line unit) via `resolve_unit_line_bounds` and `is_valid_unit_coordinates(strict=False)`,
   rather than extending to EOF or raising ValueError.
-- **Subroutine Unit Classification Heuristic Removal**: `is_subroutine_unit` now strictly requires
-  an explicit `is_subroutine` boolean or a recognized `kind` (`compound_block`, `sliding_window`,
-  `clause_branch`). The legacy fallback detecting `":"` in the unit name has been removed to avoid
+- **Coordinate Parsing Function Evolution**: `parse_unit_coord` now accepts composite line:column
+  strings (e.g. `"12:0"` returning `12`), and returns `None` when `default=None` instead of
+  raising `ValueError` or coercing to `0`.
+- **Keyword-Only Helper Type Inference**: `_infer_helper_return_type` signature transitioned to
+  keyword-only parameters following `meta2` (`*, is_async=..., ...`), requiring keyword arguments
+  for exported internal callers.
+- **Subroutine Unit Classification**: `is_subroutine_unit` now strictly requires an explicit
+  `is_subroutine` boolean, a recognized `kind` (`compound_block`, `sliding_window`,
+  `clause_branch`), or structural containment within an enclosing callable when source is
+  available. The legacy fallback detecting `":"` in the unit name has been removed to avoid
   false subroutine classifications.
 
 ### Changed
 - **PEP 604 Pipe Union Normalization**: Synthesized helper parameter and return type annotations
-  normalize PEP 604 union pipes (`|`) to `typing.Union` across all parameter annotations for
-  Python 3.9 compatibility.
+  normalize PEP 604 union pipes (`|`) to `typing.Union`, preserve `Annotated[T, ...]` metadata
+  arguments, and convert `X | None` to `typing.Optional[X]` for Python 3.9 compatibility.
 - **Subroutine Kind Pairing Enforcement**: Refactoring patch synthesis enforces that clone pairs
   must have matching subroutine kinds (`is_subroutine_unit(u1) == is_subroutine_unit(u2)`),
   skipping mismatched pairs that combine whole functions or methods with subroutines.
@@ -74,25 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Liveness Model Dynamic Reads**: Added `globals()` to dynamic read detection alongside
   `locals()`, `vars()`, `eval()`, `exec()`, and `dir()`.
 - **Intra-Unit Closure Output Capture Rejection**: Rejects generator subroutine extraction
-  when an intra-unit closure captures candidate outputs.
-- **Configuration Resolution Decoupling**: Moved `resolve_closure_strictness_mode` from
-  `dataflow.py` to `config.py`, and imported dataflow symbols directly in `fixer/__init__.py`.
+  when an intra-unit closure captures candidate outputs, taking into account column offsets.
 
 ### Fixed
 - **Priority Score on Inverted Coordinates**: Restored `compute_priority_score` to return `0.0`
   when unit coordinates are inverted or non-positive.
-- **Source Lines Slicing Heuristic**: Fixed `is_sliced_unit_source_lines` by removing premature
-  `len(lines) < e_d` heuristic so `extract_unit_source_code` slices appropriately.
-- **Sliced Lines Guard Scope in `_load_unit_file_text`**: Ensured `source_lines_is_sliced` only
-  guards the `source_lines` branch, preserving `source_text`, `file_source`, and disk fallbacks.
-- **Safe Unit File Resolution Performance**: Optimized `resolve_safe_unit_file_path` to eliminate
-  per-ancestor `parent.resolve()` calls and remove redundant symlink checks.
-- **Cross-File Missing Plan Text Fallback**: Fixed `f2_text` in `patch.py` to fall back to `None`
-  instead of `""` when `f2_plan` is missing, allowing proper loading from disk.
-- **Defensive Coordinate Resolution in Dataflow**: Added `try/except (ValueError, TypeError)`
-  in `_resolve_unit_ast_end_col` to fail closed when passed unvalidated coordinate dictionaries.
-- **Orphaned Method Cleanup in Scope Visitor**: Removed dead `_check_yield_assignment` method
-  from `_ScopeVisitor`, using standard `_inspect_yield_assignment` during AST traversal.
+- **Symlinked and Aliased Root Safe Path Resolution**: Updated `resolve_safe_unit_file_path`
+  to permit parent directories whose canonical paths match or are ancestors of `target_root`,
+  supporting symlinked system directories (e.g. macOS `/var` -> `/private/var`).
 
 ## [1.0.0] - 2026-09-20
 ### Added
