@@ -16,6 +16,7 @@ from pydoppelgangerhunt.source_lines import (
     is_sliced_unit_source_lines,
     parse_unit_coord,
     resolve_safe_unit_file_path,
+    resolve_unit_line_bounds,
     split_source_lines,
 )
 
@@ -116,6 +117,20 @@ _SUBROUTINE_KINDS: frozenset[str] = frozenset(
     {"compound_block", "sliding_window", "clause_branch"}
 )
 
+_WHOLE_UNIT_KINDS: frozenset[str] = frozenset(
+    {
+        "function",
+        "method",
+        "async_function",
+        "async_method",
+        "closure",
+        "comprehension",
+        "complex_expr",
+        "class",
+        "data_table",
+    }
+)
+
 
 def is_subroutine_unit(
     unit: Any,
@@ -127,8 +142,9 @@ def is_subroutine_unit(
     Classification Rules:
     1. Explicit 'is_subroutine' boolean in unit takes precedence if present.
     2. Known subroutine kinds ('compound_block', 'sliding_window', 'clause_branch') return True.
-    3. Whole callable and expression kinds ('function', 'method', 'async_function',
-       'closure', 'comprehension', 'complex_expr') return False.
+    3. Whole callable, class, and expression kinds ('function', 'method', 'async_function',
+       'async_method', 'closure', 'comprehension', 'complex_expr', 'class', 'data_table')
+       return False.
     4. Structural inspection: If source_text is available, checks whether the unit's
        line bounds strictly reside inside an enclosing function (True) or cover it (False).
        Kindless units at top-level module scope return True.
@@ -141,17 +157,12 @@ def is_subroutine_unit(
     kind = str(unit.get("kind") or "")
     if kind in _SUBROUTINE_KINDS:
         return True
-    if kind in (
-        "function",
-        "method",
-        "async_function",
-        "closure",
-        "comprehension",
-        "complex_expr",
-    ):
+    if kind in _WHOLE_UNIT_KINDS:
         return False
 
     src = source_text or unit.get("source_text") or unit.get("file_source")
+    if not src and isinstance(unit.get("source_lines"), (list, tuple)):
+        src = "".join(unit["source_lines"])
     if isinstance(src, (list, tuple)):
         src = "".join(src)
     if src and isinstance(src, str):
@@ -185,6 +196,19 @@ def resolve_unit_declared_outputs(unit: Dict[str, Any]) -> Any:
     return None
 
 
+
+def _is_sliced_excerpt_for_file(unit: Dict[str, Any], lines: Sequence[str]) -> bool:
+    """Returns True if lines represents a sliced excerpt rather than full file text."""
+    if unit.get("source_lines_is_sliced") is True:
+        return True
+    u_start, u_end = resolve_unit_line_bounds(unit)
+    if len(lines) < u_end:
+        return True
+    if u_start > 1 and is_sliced_unit_source_lines(unit, lines):
+        return True
+    return False
+
+
 def _load_unit_file_text(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
@@ -196,15 +220,13 @@ def _load_unit_file_text(
     if source_text is not None:
         return str(source_text)
 
-    is_sliced = unit.get("source_lines_is_sliced")
-    if is_sliced is not True:
-        unit_lines = unit.get("source_lines")
-        if unit_lines and isinstance(unit_lines, (list, tuple)):
-            if not is_sliced_unit_source_lines(unit, unit_lines):
-                return "".join(
-                    ln if ln.endswith(("\n", "\r")) else ln + "\n"
-                    for ln in unit_lines
-                )
+    unit_lines = unit.get("source_lines")
+    if unit_lines and isinstance(unit_lines, (list, tuple)):
+        if not _is_sliced_excerpt_for_file(unit, unit_lines):
+            return "".join(
+                ln if ln.endswith(("\n", "\r")) else ln + "\n"
+                for ln in unit_lines
+            )
 
     # Disk fallback: strictly only .py files within repo_root or CWD are accepted.
     # Notebooks (.ipynb) and out-of-root files fail closed and return None.
@@ -219,15 +241,11 @@ def _load_unit_file_text(
             pass
 
     # Secondary in-memory fallback for virtual/test units lacking disk presence
-    unit_lines = unit.get("source_lines")
-    if (
-        unit_lines
-        and isinstance(unit_lines, (list, tuple))
-        and unit.get("source_lines_is_sliced") is not True
-    ):
-        return "".join(
-            ln if ln.endswith(("\n", "\r")) else ln + "\n" for ln in unit_lines
-        )
+    if unit_lines and isinstance(unit_lines, (list, tuple)):
+        if not _is_sliced_excerpt_for_file(unit, unit_lines):
+            return "".join(
+                ln if ln.endswith(("\n", "\r")) else ln + "\n" for ln in unit_lines
+            )
 
     return None
 
@@ -809,14 +827,20 @@ def compute_unit_spans(
         return UnitSpan(0, 0, 0, 0, False, 1, 1, 0, 0)
 
     try:
-        start = max(1, _parse_unit_coord(unit, "start", default=1))
+        raw_start = _parse_unit_coord(unit, "start", default=None)
     except (ValueError, TypeError) as err:
         raise ValueError(f"Malformed unit: invalid 'start' line: {unit.get('start')!r}") from err
+    if raw_start is None:
+        raise ValueError("Malformed unit: missing required 'start' line coordinate")
+    start = max(1, raw_start)
 
     try:
-        end = max(1, min(len(lines), _parse_unit_coord(unit, "end", default=len(lines))))
+        raw_end = _parse_unit_coord(unit, "end", default=None)
     except (ValueError, TypeError) as err:
         raise ValueError(f"Malformed unit: invalid 'end' line: {unit.get('end')!r}") from err
+    if raw_end is None:
+        raise ValueError("Malformed unit: missing required 'end' line coordinate")
+    end = max(1, min(len(lines), raw_end))
 
     if line_char_offsets is None or line_byte_offsets is None:
         line_char_offsets, line_byte_offsets = _compute_line_offsets(lines)

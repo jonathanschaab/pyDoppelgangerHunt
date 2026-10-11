@@ -242,8 +242,8 @@ Refactoring executes in linear-logarithmic time with incremental validation:
 When extracting generator subroutine clones that assign variables, `pyDoppelgangerHunt` conducts
 a pre-unit AST walk within the enclosing scope to detect closures, lambdas, or nested classes
 that capture candidate outputs prior to unit execution. Because such closures may escape into
-callback tables or event loops, strict mode treats these captured names as live, guaranteeing
-soundness.
+callback tables or event loops, strict mode treats these captured names as live to defend against
+escaping callbacks across lexical scopes.
 
 - **Memoization & Cache Invalidation**: Downstream liveness analysis caches AST traversal results
   in a thread-safe LRU cache keyed by SHA-256 source digest (full 256-bit hash), file path,
@@ -252,12 +252,12 @@ soundness.
 - **Precision vs. Soundness Trade-off**: Pre-unit closure scanning can be configured via
   `--closure-strictness {strict,lenient,fail_closed,fast,skip}` (or `--skip-pre-unit-closures`, or setting
   `closure_strictness = "strict"|"lenient"` in `pyproject.toml`):
-  - `strict` (alias: `fail_closed`, default): Soundness-preserving mode that treats pre-unit closures
-    capturing candidate outputs as live escaping callbacks, guarding against callbacks registered in
-    event loops or tables.
-  - `lenient` (aliases: `fast`, `skip`): Precision-oriented mode that skips pre-unit closure scanning,
-    reducing false-positive pair rejections in codebases where pre-unit closures never escape, at the
-    cost of soundness for escaping closures.
+  - `strict` (alias: `fail_closed`, default): Conservative defense mode that treats
+    pre-unit closures capturing candidate outputs as live escaping callbacks, guarding against
+    callbacks registered in event loops or tables.
+  - `lenient` (aliases: `fast`, `skip`): Precision-oriented mode that skips pre-unit closure
+    scanning, reducing false-positive pair rejections in codebases where pre-unit closures never
+    escape, at the cost of potential callback capture hazards for escaping closures.
 
 #### Safety Model & Fail-Closed Refactoring Guarantees
 

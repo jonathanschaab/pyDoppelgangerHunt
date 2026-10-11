@@ -690,6 +690,22 @@ def test_is_subroutine_unit_comprehension_with_source() -> None:
     }
     assert is_subroutine_unit(expr_unit, source_text=src, tree=tree) is False
 
+    class_unit = {
+        "file": "test.py",
+        "kind": "class",
+        "start": 2,
+        "end": 3,
+    }
+    assert is_subroutine_unit(class_unit, source_text=src, tree=tree) is False
+
+    data_table_unit = {
+        "file": "test.py",
+        "kind": "data_table",
+        "start": 2,
+        "end": 2,
+    }
+    assert is_subroutine_unit(data_table_unit, source_text=src, tree=tree) is False
+
 
 def test_slice_unit_token_lines_invalid_or_negative_start_col() -> None:
     """Verifies that _slice_unit_token_lines returns lines untouched on negative

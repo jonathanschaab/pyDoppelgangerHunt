@@ -2632,6 +2632,35 @@ def _resolve_safe_clone_file_path(
     return resolved
 
 
+def _validate_helper_compilation(helper_code: str) -> bool:
+    """Validates that synthesized helper code compiles without syntax or indentation errors.
+
+    Splits top-level import headers from indented method definitions to prevent
+    spurious IndentationError when checking combined helper strings.
+    """
+    try:
+        compile(dedent_source_text(helper_code), "<patch>", "exec")
+        return True
+    except IndentationError:
+        lines = helper_code.splitlines(keepends=True)
+        import_lines = [ln for ln in lines if ln.startswith(("import ", "from "))]
+        other_lines = [ln for ln in lines if not ln.startswith(("import ", "from "))]
+        if import_lines and other_lines:
+            try:
+                compile("".join(import_lines), "<patch_imports>", "exec")
+                compile(
+                    dedent_source_text("".join(other_lines)),
+                    "<patch_helper>",
+                    "exec",
+                )
+                return True
+            except (SyntaxError, ValueError):
+                return False
+        return False
+    except (SyntaxError, ValueError):
+        return False
+
+
 def _determine_unit_receiver_kind(
     fn: Optional[Dict[str, Any]],
     unit: Dict[str, Any],
@@ -3268,9 +3297,7 @@ def generate_refactoring_patch(
             if not helper_code:
                 skip_reasons["shared helper synthesis failed"] += 1
                 continue
-            try:
-                compile(dedent_source_text(helper_code), "<patch>", "exec")
-            except (SyntaxError, ValueError):
+            if not _validate_helper_compilation(helper_code):
                 skip_reasons["shared helper synthesis failed"] += 1
                 continue
 

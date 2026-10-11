@@ -1336,13 +1336,6 @@ def _inspect_unit_scope(
         is_subroutine = is_subroutine_unit(
             unit, source_text=_get_full_source(), tree=file_tree
         )
-    if not is_subroutine and "is_subroutine" not in unit and not unit.get("kind"):
-        if isinstance(tree, ast.Module):
-            if not (
-                len(tree.body) == 1
-                and isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))
-            ):
-                is_subroutine = True
 
     rec_param = unit.get("receiver_param")
     rec_kind = unit.get("receiver_kind")
@@ -1359,13 +1352,10 @@ def _inspect_unit_scope(
     all_receivers = inst_receivers | class_receivers
 
     cand_lines = split_source_lines(cand_text)
-    is_sub = is_subroutine or (
-        cand_text == dedented and isinstance(tree, ast.Module) and len(tree.body) > 1
-    )
     visitor = _ScopeVisitor(
         loop_offset=loop_offset,
         source_lines=cand_lines,
-        is_subroutine=is_sub,
+        is_subroutine=is_subroutine,
         receiver_names=tuple(all_receivers),
     )
     visitor.visit(tree)

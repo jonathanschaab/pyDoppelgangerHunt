@@ -754,6 +754,29 @@ class _VisitorPassMode(str, Enum):
     LOOP_CARRIED = "loop_carried"
 
 
+def _is_ast_node_within_unit_bounds(
+    node: ast.AST,
+    u_start: int,
+    u_end: int,
+    u_end_col: Optional[int],
+) -> bool:
+    """Determines whether an AST node is positioned inside unit line and column bounds."""
+    lineno = getattr(node, "lineno", None)
+    if lineno is None:
+        return False
+    if u_start < lineno < u_end:
+        return True
+    if lineno == u_start == u_end:
+        col = getattr(node, "col_offset", 0)
+        return u_end_col is not None and col < int(u_end_col)
+    if lineno == u_start:
+        return True
+    if lineno == u_end:
+        col = getattr(node, "col_offset", 0)
+        return u_end_col is not None and col < int(u_end_col)
+    return False
+
+
 class _DownstreamReadVisitor(_BaseScopeVisitor):
     """Walks AST statements in a lexical scope tracking direct, nested, and loop-carried reads."""
 
@@ -780,6 +803,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         )
         self.loaded: Set[str] = set()
         self.killed: Set[str] = set()
+        self.loop_killed: Set[str] = set()
         self.has_dynamic_read: bool = False
         self.is_module_scope = is_module_scope
 
@@ -800,20 +824,9 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         return False
 
     def _is_node_inside_unit(self, node: ast.AST) -> bool:
-        lineno = getattr(node, "lineno", None)
-        if lineno is None:
-            return False
-        if self.u_start < lineno < self.u_end:
-            return True
-        if lineno == self.u_start == self.u_end:
-            col = getattr(node, "col_offset", 0)
-            return self.u_end_col is not None and col < int(self.u_end_col)
-        if lineno == self.u_start:
-            return True
-        if lineno == self.u_end:
-            col = getattr(node, "col_offset", 0)
-            return self.u_end_col is not None and col < int(self.u_end_col)
-        return False
+        return _is_ast_node_within_unit_bounds(
+            node, self.u_start, self.u_end, self.u_end_col
+        )
 
     def _is_loop_carried(self, node: ast.AST) -> bool:
         lineno = getattr(node, "lineno", None)
@@ -837,6 +850,8 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
                 for name in _extract_assigned_names(t):
                     if not self._is_in_comp(name):
                         self.killed.add(name)
+                        if self.pass_mode is _VisitorPassMode.LOOP_CARRIED:
+                            self.loop_killed.add(name)
 
     def _record_downstream_read(self, name: str) -> None:
         if self._is_in_comp(name) or name in self.killed:
@@ -860,6 +875,8 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
                 and not (lineno == self.u_end and self.u_end_col is None)
             ):
                 self.killed.add(name_attr)
+                if self.pass_mode is _VisitorPassMode.LOOP_CARRIED:
+                    self.loop_killed.add(name_attr)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self.visit_FunctionDef(node)
@@ -874,6 +891,8 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
                 lineno == self.u_end and self.u_end_col is None
             ):
                 self.killed.add(node.name)
+                if self.pass_mode is _VisitorPassMode.LOOP_CARRIED:
+                    self.loop_killed.add(node.name)
         else:
             n_start = getattr(node, "lineno", 0)
             n_end = getattr(node, "end_lineno", None) or n_start
@@ -899,6 +918,8 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             name_node = getattr(node, "name", None)
             if isinstance(name_node, ast.Name) and not self._is_in_comp(name_node.id):
                 self.killed.add(name_node.id)
+                if self.pass_mode is _VisitorPassMode.LOOP_CARRIED:
+                    self.loop_killed.add(name_node.id)
 
     def visit_Name(self, node: ast.Name) -> None:
         self.generic_visit(node)
@@ -908,6 +929,10 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         if isinstance(node.target, ast.Name) and self._should_inspect_read(node.target):
             self._record_downstream_read(node.target.id)
+            if not self._is_in_comp(node.target.id):
+                self.killed.add(node.target.id)
+                if self.pass_mode is _VisitorPassMode.LOOP_CARRIED:
+                    self.loop_killed.add(node.target.id)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
@@ -1468,6 +1493,110 @@ def clear_dataflow_cache() -> None:
 _clear_downstream_reads_cache = clear_dataflow_cache
 
 
+class _UnitLiveInVisitor(ast.NodeVisitor):
+    """Extracts live-in variable names (loaded before being stored) within a unit's bounds."""
+
+    def __init__(
+        self,
+        u_start: int,
+        u_end: int,
+        u_end_col: Optional[int] = None,
+        candidates: Optional[Set[str]] = None,
+    ) -> None:
+        self.u_start = u_start
+        self.u_end = u_end
+        self.u_end_col = u_end_col
+        self.candidates = candidates
+        self.live_ins: Set[str] = set()
+        self.stored: Set[str] = set()
+
+    def _is_inside(self, node: ast.AST) -> bool:
+        return _is_ast_node_within_unit_bounds(
+            node, self.u_start, self.u_end, self.u_end_col
+        )
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if self._is_inside(node):
+            if isinstance(node.ctx, ast.Load):
+                if (
+                    node.id not in self.stored
+                    and (self.candidates is None or node.id in self.candidates)
+                    and node.id not in _BUILTIN_NAMES
+                ):
+                    self.live_ins.add(node.id)
+            elif isinstance(node.ctx, ast.Store):
+                self.stored.add(node.id)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        if self._is_inside(node):
+            if isinstance(node.target, ast.Name):
+                if (
+                    node.target.id not in self.stored
+                    and (self.candidates is None or node.target.id in self.candidates)
+                    and node.target.id not in _BUILTIN_NAMES
+                ):
+                    self.live_ins.add(node.target.id)
+            self.visit(node.value)
+            if isinstance(node.target, ast.Name):
+                self.stored.add(node.target.id)
+        else:
+            self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        if self._is_inside(node):
+            self.visit(node.value)
+            for t in node.targets:
+                self.visit(t)
+        else:
+            self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if self._is_inside(node):
+            if node.value is not None:
+                self.visit(node.value)
+            if isinstance(node.target, ast.Name):
+                self.stored.add(node.target.id)
+        else:
+            self.generic_visit(node)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        if self._is_inside(node):
+            self.visit(node.value)
+            if isinstance(node.target, ast.Name):
+                self.stored.add(node.target.id)
+        else:
+            self.generic_visit(node)
+
+    def visit_For(self, node: Union[ast.For, ast.AsyncFor]) -> None:
+        if self._is_inside(node):
+            self.visit(node.iter)
+            self.visit(node.target)
+            for s in node.body:
+                self.visit(s)
+            for s in node.orelse:
+                self.visit(s)
+        else:
+            self.generic_visit(node)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self.visit_For(node)
+
+
+def _extract_unit_live_in_names(
+    scope_node: ast.AST,
+    u_start: int,
+    u_end: int,
+    u_end_col: Optional[int] = None,
+    candidates: Optional[Set[str]] = None,
+) -> Set[str]:
+    """Extracts variables read within unit bounds before any store, within the scope."""
+    visitor = _UnitLiveInVisitor(
+        u_start, u_end, u_end_col=u_end_col, candidates=candidates
+    )
+    visitor.visit(scope_node)
+    return visitor.live_ins
+
+
 class _DownstreamCacheKey(NamedTuple):
     """Immutable cache key for downstream AST read analysis."""
 
@@ -1482,6 +1611,7 @@ class _DownstreamCacheKey(NamedTuple):
     is_subroutine: bool
     candidates: Optional[frozenset[str]]
     skip_pre_unit_closures: bool
+    unit_inputs: Optional[frozenset[str]] = None
 
 
 def _build_downstream_cache_key(
@@ -1493,6 +1623,8 @@ def _build_downstream_cache_key(
     skip_pre_unit_closures: bool,
     source_digest: Optional[str] = None,
     resolved_end_col: Optional[int] = None,
+    tree: Optional[ast.AST] = None,
+    unit_inputs: Optional[Set[str]] = None,
 ) -> _DownstreamCacheKey:
     """Forms a persistent cache key for downstream AST read analysis."""
     file_path_str = str(unit.get("file") or "")
@@ -1511,9 +1643,10 @@ def _build_downstream_cache_key(
         else _extract_unit_end_col(unit)
     )
     cands_key = frozenset(candidates) if candidates is not None else None
+    unit_inputs_key = frozenset(unit_inputs) if unit_inputs is not None else None
     unit_kind = unit.get("kind")
     unit_name = unit.get("name")
-    is_sub = is_subroutine_unit(unit, source_text=source_text)
+    is_sub = is_subroutine_unit(unit, source_text=source_text, tree=tree)
     return _DownstreamCacheKey(
         content_digest=content_digest,
         file_path=file_path_str,
@@ -1526,6 +1659,7 @@ def _build_downstream_cache_key(
         is_subroutine=is_sub,
         candidates=cands_key,
         skip_pre_unit_closures=bool(skip_pre_unit_closures),
+        unit_inputs=unit_inputs_key,
     )
 
 
@@ -1876,6 +2010,7 @@ def collect_downstream_read_names(
     tree: Optional[ast.AST] = None,
     skip_pre_unit_closures: bool = False,
     source_digest: Optional[str] = None,
+    unit_inputs: Optional[Set[str]] = None,
 ) -> Optional[Set[str]]:
     """Identifies variable names loaded downstream of a unit within its lexical execution scope.
 
@@ -1924,6 +2059,8 @@ def collect_downstream_read_names(
         skip_pre_unit_closures,
         source_digest=source_digest,
         resolved_end_col=u_end_col,
+        tree=effective_tree,
+        unit_inputs=unit_inputs,
     )
     with _downstream_cache_lock:
         if cache_key in _downstream_reads_cache:
@@ -1988,6 +2125,18 @@ def collect_downstream_read_names(
         for stmt in getattr(scope_node, "body", []):
             loop_visitor.visit(stmt)
         loaded.update(loop_visitor.loaded)
+
+        eff_inputs = unit_inputs
+        if eff_inputs is None and "inputs" in unit and unit["inputs"] is not None:
+            eff_inputs = set(unit["inputs"])
+        if eff_inputs is None:
+            eff_inputs = _extract_unit_live_in_names(
+                scope_node, u_start, u_end, u_end_col, candidates=candidates
+            )
+        cand_inputs = (
+            set(candidates) & eff_inputs if candidates is not None else set(eff_inputs)
+        )
+        loaded.update(cand_inputs - loop_visitor.loop_killed)
 
     has_dynamic = visitor.has_dynamic_read or (
         loop_visitor is not None and loop_visitor.has_dynamic_read
@@ -2261,12 +2410,12 @@ def resolve_clone_generator_subroutine_outputs(
     cands2 = set(outs2)
 
     targets = [
-        (u1, cands1, source_text1, tree1, source_digest1),
-        (u2, cands2, source_text2, tree2, source_digest2),
+        (u1, cands1, source_text1, tree1, source_digest1, scope1),
+        (u2, cands2, source_text2, tree2, source_digest2, scope2),
     ]
     target_srcs: List[Optional[str]] = []
     downstream_reads: List[Optional[Set[str]]] = []
-    for u_item, cands, s_text, tr, s_digest in targets:
+    for u_item, cands, s_text, tr, s_digest, sc in targets:
         src = (
             s_text
             if s_text is not None
@@ -2281,6 +2430,7 @@ def resolve_clone_generator_subroutine_outputs(
                 tree=tr,
                 skip_pre_unit_closures=skip_pre_unit_closures,
                 source_digest=s_digest,
+                unit_inputs=set(sc.get("inputs", [])),
             )
         else:
             reads = None

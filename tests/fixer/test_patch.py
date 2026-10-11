@@ -9221,3 +9221,40 @@ def test_render_file_patch_plan_path_normalization_span_matching() -> None:
         assert "+a = 99" in diff
 
 
+def test_replace_unit_and_refactor_missing_coordinates_raise_value_error() -> None:
+    """Verifies that missing 'start' or 'end' line coordinates raise ValueError in
+    replace_unit_in_source and refactor_module_units."""
+    code = "x = 1\ny = 2\n"
+    # Missing end
+    with pytest.raises(ValueError, match="missing required 'end' line coordinate"):
+        replace_unit_in_source(code, {"start": 1}, "x = 10\n")
+
+    with pytest.raises(ValueError, match="missing required 'end' line coordinate"):
+        refactor_module_units(code, [({"start": 1}, "x = 10\n")])
+
+    # Missing start
+    with pytest.raises(ValueError, match="missing required 'start' line coordinate"):
+        replace_unit_in_source(code, {"end": 1}, "x = 10\n")
+
+    with pytest.raises(ValueError, match="missing required 'start' line coordinate"):
+        refactor_module_units(code, [({"end": 1}, "x = 10\n")])
+
+
+def test_validate_helper_compilation_indented_method_with_imports() -> None:
+    """Verifies that _validate_helper_compilation accepts an indented method helper
+    combined with unindented imports without raising IndentationError."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _validate_helper_compilation,
+    )
+
+    combined_helper = (
+        "from typing import Tuple\n\n\n"
+        "    def _shared_calc(self, x: int) -> Tuple[int, int]:\n"
+        "        return x, x * 2\n"
+    )
+    assert _validate_helper_compilation(combined_helper) is True
+
+    # Truly invalid syntax should return False
+    assert _validate_helper_compilation("def invalid syntax (:") is False
+
+

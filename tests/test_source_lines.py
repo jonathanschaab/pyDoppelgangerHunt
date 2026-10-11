@@ -296,7 +296,7 @@ def test_coordinate_parsing_colon_formatted_lines_across_subsystems() -> None:
     assert is_valid_unit_coordinates({"start": "invalid:foo"}) is False
 
 
-def test_parse_unit_coord_non_integral_floats_rejected() -> None:
+def test_parse_unit_coord_non_integral_floats_truncated_or_rejected() -> None:
     """Verifies that non-integral floats and float strings truncate in default mode
     and are rejected in strict mode."""
     # Integral floats and strings are accepted

@@ -1168,6 +1168,42 @@ def test_collect_downstream_read_names_loop_carried_dependence() -> None:
     assert "total" in reads
 
 
+def test_collect_downstream_read_names_loop_carried_unit_inputs_without_preceding_read() -> None:
+    """Verifies that unit inputs updated in an enclosing loop are captured as live across
+    iterations even when there are no statements preceding the unit in the loop body."""
+    code = (
+        "def process_batches(batches):\n"
+        "    total = 0\n"
+        "    for batch in batches:\n"
+        "        for x in batch:\n"
+        "            total += x\n"
+        "            yield total\n"
+    )
+    # Unit is lines 4 to 6: inner loop where total is updated
+    unit = {"start": 4, "end": 6}
+    reads = collect_downstream_read_names(code, unit, candidates={"total"})
+    assert reads is not None
+    assert "total" in reads
+
+
+def test_collect_downstream_read_names_loop_carried_killed_before_unit() -> None:
+    """Verifies that variables reassigned before the unit inside the enclosing loop
+    are not captured as live across iterations."""
+    code = (
+        "def process_batches(batches):\n"
+        "    for batch in batches:\n"
+        "        total = 0\n"
+        "        for x in batch:\n"
+        "            total += x\n"
+        "            yield total\n"
+    )
+    # Unit is lines 4 to 6: inner loop where total is updated
+    unit = {"start": 4, "end": 6}
+    reads = collect_downstream_read_names(code, unit, candidates={"total"})
+    assert reads is not None
+    assert "total" not in reads
+
+
 def test_collect_downstream_read_names_try_finally_exceptional_path() -> None:
     """Verifies that try body stores do not kill variables in finally block across
     exceptional paths."""
@@ -1888,7 +1924,7 @@ def test_load_unit_file_text_honors_sliced_lines() -> None:
         "end": 12,
         "source_lines": ["    x = 1\n", "    y = 2\n", "    z = 3\n"],
     }
-    assert _load_unit_file_text(unit_fallback) == "    x = 1\n    y = 2\n    z = 3\n"
+    assert _load_unit_file_text(unit_fallback) is None
 
     unit_full = {
         "file": "virtual.py",
@@ -3646,6 +3682,29 @@ def test_subroutine_same_line_semicolon_in_with_without_end_col() -> None:
     res = resolve_clone_generator_subroutine_outputs(
         u1, u2, scope, scope, source_text1=src, source_text2=src
     )
+    assert res is None
+
+
+def test_resolve_clone_generator_subroutine_outputs_unflagged_sliced_lines() -> None:
+    """Verifies that unflagged sliced source_lines fails closed when resolving
+    subroutine outputs.
+    """
+    u1 = {
+        "file": "virtual1.py",
+        "start": 10,
+        "end": 12,
+        "source_lines": ["    x = yield\n", "    total += x\n", "    yield total\n"],
+    }
+    u2 = {
+        "file": "virtual2.py",
+        "start": 10,
+        "end": 12,
+        "source_lines": ["    x = yield\n", "    total += x\n", "    yield total\n"],
+    }
+    scope1 = {"inputs": ["total"], "outputs": ["total"], "definite_stores": ["total"]}
+    scope2 = {"inputs": ["total"], "outputs": ["total"], "definite_stores": ["total"]}
+    # Sliced lines with len(source_lines) < end fail closed because full file text is unavailable
+    res = resolve_clone_generator_subroutine_outputs(u1, u2, scope1, scope2)
     assert res is None
 
 
