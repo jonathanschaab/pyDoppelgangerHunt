@@ -9122,15 +9122,18 @@ def test_generate_refactoring_patch_skips_mismatched_subroutine_kinds(
     with caplog.at_level(logging.DEBUG, logger="pydoppelgangerhunt.fixer.patch"):
         with mock.patch(
             "pydoppelgangerhunt.fixer.patch.synthesize_shared_helper_code"
-        ) as mock_synth:
+        ) as mock_synth, mock.patch(
+            "pydoppelgangerhunt.fixer.patch.inspect_single_unit_scope"
+        ) as mock_scope:
             patch = generate_refactoring_patch(
                 [(1.0, u1, u2)],
                 repo_root=str(tmp_path),
                 replace_clones=True,
             )
             assert patch == ""
-            # Early exit: synthesize_shared_helper_code must not be called
+            # Early exit: hoisted check prevents running scope analysis or synthesis
             mock_synth.assert_not_called()
+            mock_scope.assert_not_called()
 
     assert any(
         "mismatched subroutine kinds (is_sub1=False, is_sub2=True)" in r.message

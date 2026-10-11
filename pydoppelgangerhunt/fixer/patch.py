@@ -2732,6 +2732,19 @@ def _generate_refactoring_patch_impl(
             )
             continue
 
+        is_sub1 = is_subroutine_unit(u1)
+        is_sub2 = is_subroutine_unit(u2)
+        if is_sub1 != is_sub2:
+            logger.debug(
+                "Skipping clone pair (%s, %s): mismatched subroutine kinds "
+                "(is_sub1=%s, is_sub2=%s)",
+                u1.get("name"),
+                u2.get("name"),
+                is_sub1,
+                is_sub2,
+            )
+            continue
+
 
 
         # Performance: Snapshot only plans touched in this pair (f1, f2, and potential shared module)
@@ -2995,19 +3008,6 @@ def _generate_refactoring_patch_impl(
                 inputs = _prune_unshared_receivers(
                     inputs, u1_eff, u2_eff, s1, s2, repo_root=str(root)
                 )
-
-            is_sub1 = is_subroutine_unit(u1_eff)
-            is_sub2 = is_subroutine_unit(u2_eff)
-            if is_sub1 != is_sub2:
-                logger.debug(
-                    "Skipping clone pair (%s, %s): mismatched subroutine kinds "
-                    "(is_sub1=%s, is_sub2=%s)",
-                    u1.get("name"),
-                    u2.get("name"),
-                    is_sub1,
-                    is_sub2,
-                )
-                continue
 
             resolved_outs = resolve_clone_pair_outputs(
                 u1=u1_eff,

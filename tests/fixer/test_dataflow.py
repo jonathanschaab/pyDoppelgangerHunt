@@ -3109,6 +3109,47 @@ def test_clear_downstream_reads_cache_resets_closure_warning_cache() -> None:
     assert len(_warned_closure_strictness_values) == 0
 
 
+def test_outer_expr_visitor_multi_clause_comprehension_scoping() -> None:
+    """Verifies that multi-clause comprehensions evaluate first iter in outer scope
+
+    and subsequent iters with prior comprehension targets in scope.
+    """
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        collect_downstream_read_names,
+    )
+
+    # 1. First iter evaluates in outer scope (matrix), while subsequent clauses
+    # and body read targets from earlier comprehension clauses.
+    code_multi = (
+        "def outer():\n"
+        "    matrix = [[1, 2], [3, 4]]\n"
+        "    row = [9, 9]\n"
+        "    x = 42\n"
+        "    yield 1\n"
+        "    g = (x for row in matrix for x in row)\n"
+    )
+    u_multi = {"start": 5, "end": 5}
+    reads_multi = collect_downstream_read_names(
+        code_multi, u_multi, candidates={"matrix", "row", "x"}
+    )
+    assert reads_multi == {"matrix"}
+
+    # 2. When the first generator's iter reads 'row', it is captured as an outer read.
+    code_first_iter_read = (
+        "def outer():\n"
+        "    row = [[1, 2], [3, 4]]\n"
+        "    x = 42\n"
+        "    yield 1\n"
+        "    g = (x for row in row for x in row)\n"
+    )
+    u_first = {"start": 4, "end": 4}
+    reads_first = collect_downstream_read_names(
+        code_first_iter_read, u_first, candidates={"row", "x"}
+    )
+    assert reads_first == {"row"}
+
+
+
 
 
 
