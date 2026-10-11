@@ -2974,3 +2974,11 @@ def test_synthesize_complex_expr_equality_comparison_not_stripped(tmp_path: Path
     assert "return flag == (a > b)" in helper_compound
     assert_valid_python(helper_compound)
 
+
+def test_normalize_pipe_unions_nested_tuple_dict_pipes() -> None:
+    """Verifies that _normalize_pipe_unions handles complex nested subscripts with pipes."""
+    assert _normalize_pipe_unions("Tuple[int | str, Dict[str, float | None]]") == (
+        "Tuple[Union[int, str], Dict[str, Optional[float]]]"
+    )
+
+

@@ -1130,7 +1130,12 @@ def _extract_single_node_local_names(scope_node: ast.AST) -> Set[str]:
     if isinstance(node_args, ast.arguments):
         names.update(_extract_arg_names(node_args))
 
-    stack: List[ast.AST] = list(getattr(scope_node, "body", []))
+    body = getattr(scope_node, "body", [])
+    stack: List[ast.AST] = (
+        list(body) if isinstance(body, list)
+        else [body] if isinstance(body, ast.AST)
+        else []
+    )
     while stack:
         curr = stack.pop()
         if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -1730,15 +1735,21 @@ def _enclosing_try_reads_outputs(
             if _stmts_enclose_unit(with_body, u_start, u_end):
                 # 1. Check if any statement within with_body following the unit reads outputs
                 post_unit_with_stmts: List[ast.AST] = []
+                same_line_stmts = [
+                    stmt for stmt in with_body if getattr(stmt, "lineno", None) == u_end
+                ]
                 for s in with_body:
                     s_lineno = getattr(s, "lineno", None)
                     if s_lineno is None:
                         continue
                     if s_lineno > u_end:
                         post_unit_with_stmts.append(s)
-                    elif s_lineno == u_end and u_end_col is not None:
-                        s_col = getattr(s, "col_offset", None)
-                        if s_col is not None and s_col >= int(u_end_col):
+                    elif s_lineno == u_end:
+                        if u_end_col is not None:
+                            s_col = getattr(s, "col_offset", None)
+                            if s_col is not None and s_col >= int(u_end_col):
+                                post_unit_with_stmts.append(s)
+                        elif len(same_line_stmts) > 1 and s is not same_line_stmts[0]:
                             post_unit_with_stmts.append(s)
                 if post_unit_with_stmts and _nodes_load_any_name(post_unit_with_stmts, outputs):
                     return True
@@ -2307,6 +2318,8 @@ def resolve_clone_generator_subroutine_outputs(
                 return None
             u_s, u_e = bounds
             u_end_col = _extract_unit_end_col(u_item)
+            if u_end_col is None and scope_node is not None:
+                u_end_col = _resolve_unit_ast_end_col(scope_node, u_item)
             if _enclosing_try_reads_outputs(
                 scope_node, u_s, u_e, set(needed_outs), u_end_col=u_end_col
             ):

@@ -35,6 +35,7 @@ from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-acc
     _extract_effective_unit_outputs,
     _extract_nested_scope_free_reads,
     _extract_scope_local_names,
+    _extract_single_node_local_names,
     _find_enclosing_loops,
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
@@ -3617,4 +3618,34 @@ def test_build_downstream_cache_key_source_text_subroutine_symmetry() -> None:
     )
     # Structural inspection inside enclosing function with source_text resolves is_subroutine=True
     assert key_with_source.is_subroutine is True
+
+
+def test_extract_single_node_local_names_lambda_non_list_body() -> None:
+    """Verifies that _extract_single_node_local_names safely processes non-list scope bodies."""
+    expr = ast.parse("lambda x: (y := x + 1)").body[0].value  # type: ignore[attr-defined]
+    names = _extract_single_node_local_names(expr)
+    assert names == {"x", "y"}
+
+
+def test_subroutine_same_line_semicolon_in_with_without_end_col() -> None:
+    """Verifies resolve_clone_generator_subroutine_outputs when a compound unit is followed
+    by a semicolon statement on the same line inside a with block without explicit end_col."""
+    src = (
+        "def run():\n"
+        "    with mgr: total = yield x; print(total)\n"
+    )
+    u = {"file": "m.py", "start": 2, "end": 2, "kind": "compound_block"}
+    # Must resolve end_col via AST and detect print(total) as downstream read
+    reads = collect_downstream_read_names(src, u, candidates={"total"})
+    assert reads is not None
+    assert "total" in reads
+
+    u1 = dict(u, outputs=["total"])
+    u2 = dict(u, outputs=["total"])
+    scope = {"definite_stores": ["total"], "inputs": []}
+    res = resolve_clone_generator_subroutine_outputs(
+        u1, u2, scope, scope, source_text1=src, source_text2=src
+    )
+    assert res is None
+
 

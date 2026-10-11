@@ -9193,3 +9193,31 @@ def test_generate_refactoring_patch_skips_mismatched_subroutine_kinds(
         for r in caplog.records
     )
 
+
+def test_render_file_patch_plan_path_normalization_span_matching() -> None:
+    """Verifies that _render_file_patch_plan normalizes file paths when cross-checking
+    retained candidate spans, ensuring path drift does not cause replacement drops."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _FilePatchPlan,
+        _render_file_patch_plan,
+    )
+
+    plan = _FilePatchPlan(
+        file_path=Path("test.py"),
+        rel_path="test.py",
+        orig_text="a = 1\nb = 2\n",
+        is_new_file=False,
+    )
+    u = {"file": "./test.py", "start": 1, "end": 1}
+    plan.replacements.append((u, "a = 99\n"))
+
+    # Reconstructed unit copy with canonical path 'test.py'
+    u_norm_copy = {"file": "test.py", "start": 1, "end": 1}
+    with mock.patch(
+        "pydoppelgangerhunt.fixer.patch.filter_overlapping_clone_units",
+        return_value=[u_norm_copy],
+    ):
+        diff = _render_file_patch_plan(plan, replace_clones=True)
+        assert "+a = 99" in diff
+
+

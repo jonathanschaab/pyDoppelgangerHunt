@@ -1269,9 +1269,15 @@ def _render_file_patch_plan(
         s = parse_unit_coord(unit, "start", default=1, strict=True)
         return s, parse_unit_coord(unit, "end", default=s, strict=True)
 
+    def _file_key(unit: Dict[str, Any]) -> str:
+        raw = unit.get("file")
+        if raw is None:
+            return ""
+        return normalize_path_string(str(raw), strip_anchor=False)
+
     retained_ids: Set[int] = {id(r) for r in retained_cands}
-    retained_spans: Set[Tuple[Optional[str], int, int]] = {
-        (r.get("file"), _unit_span(r)[0], _unit_span(r)[1])
+    retained_spans: Set[Tuple[str, int, int]] = {
+        (_file_key(r), _unit_span(r)[0], _unit_span(r)[1])
         for r in retained_cands
     }
 
@@ -1280,7 +1286,7 @@ def _render_file_patch_plan(
         u_span = _unit_span(u)
         if (
             id(u) in retained_ids
-            or (u.get("file"), u_span[0], u_span[1]) in retained_spans
+            or (_file_key(u), u_span[0], u_span[1]) in retained_spans
         ):
             if not any(
                 check_units_overlap(u, prev_u, repo_root=repo_root)

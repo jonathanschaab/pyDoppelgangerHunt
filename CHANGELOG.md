@@ -75,6 +75,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Source-Aware Subroutine Cache Key Derivation**: Passed `source_text=source_text` to
   `is_subroutine_unit` in `_build_downstream_cache_key` (`dataflow.py`), ensuring symmetric
   cache key resolution across structural and module-scoped units.
+- **AST End-Column Resolution in Subroutine Outputs**: Resolved `u_end_col` via
+  `_resolve_unit_ast_end_col` in `resolve_clone_generator_subroutine_outputs` (`dataflow.py`),
+  and handled same-line semicolon statements inside enclosing `with` blocks fail-closed.
+- **Robust AST Scope Body Stack Initialization**: Safely initialized traversal stack in
+  `_extract_single_node_local_names` (`dataflow.py`) for non-list scope bodies
+  (such as `ast.Lambda`), preventing `TypeError` on expression body traversal.
+- **Normalized Path Cross-Checking in Patch Plans**: Canonicalized file paths via
+  `normalize_path_string` in `_render_file_patch_plan` (`patch.py`) when filtering retained
+  candidate spans, preventing false-negative replacement drops under path syntax drift.
+
 
 ### Breaking Changes
 - **Private Line-Splitting Regex (`_PHYSICAL_LINE_RE`)**: Dropped `_PHYSICAL_LINE_RE` from
