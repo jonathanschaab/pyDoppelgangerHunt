@@ -2826,6 +2826,48 @@ def test_cli_closure_strictness_and_skip_closures_precedence_warning(
             )
 
 
+def test_cli_unrecognized_config_closure_strictness_falls_back(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies unrecognized closure_strictness in pyproject.toml warns and falls back."""
+    import logging  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+
+    repo = tmp_path / "fallback_repo"
+    repo.mkdir()
+    patch_out = repo / "refactor.patch"
+    (repo / "f.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "pyproject.toml").write_text(
+        '[tool.pydoppelgangerhunt]\nclosure_strictness = "unrecognized_custom_mode"\n',
+        encoding="utf-8",
+    )
+
+    dummy_clone = (
+        0.95,
+        {"name": "u1", "file": "f.py", "start": 1, "end": 1},
+        {"name": "u2", "file": "f.py", "start": 1, "end": 1},
+    )
+
+    with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[dummy_clone]):
+        with mock.patch(
+            "pydoppelgangerhunt.cli.generate_refactoring_patch", return_value="# patch\n"
+        ) as mock_patch:
+            with caplog.at_level(logging.WARNING):
+                exit_code = main([
+                    str(repo),
+                    "--patch",
+                    str(patch_out),
+                ])
+            assert exit_code == 1
+            mock_patch.assert_called_once()
+            _, kwargs = mock_patch.call_args
+            assert kwargs.get("closure_strictness") == "strict"
+            assert any(
+                "Unrecognized closure_strictness 'unrecognized_custom_mode'" in r.message
+                for r in caplog.records
+            )
+
+
 def test_resolve_closure_strictness_mode_thread_safety() -> None:
     """Verifies that concurrent invocations of resolve_closure_strictness_mode are thread-safe."""
     import concurrent.futures  # pylint: disable=import-outside-toplevel

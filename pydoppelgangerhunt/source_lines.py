@@ -65,7 +65,8 @@ def parse_unit_coord(
     or diagnostics (where the suffix denotes a sub-column or character index), the primary
     leading coordinate prefix before the colon is parsed as the integer value.
     In strict mode (strict=True), colon-formatted coordinates, empty/whitespace strings,
-    and floating point values are strictly rejected with ValueError.
+    signed prefix strings, negative integers, and floating point values are strictly
+    rejected with ValueError.
     If the coordinate value is missing or empty (in non-strict mode), falls back to default.
     Raises ValueError for non-numeric strings or unconvertible/overflow values.
     """
@@ -102,8 +103,17 @@ def parse_unit_coord(
                 f"Invalid coordinate {val!r}: float coordinate not allowed in strict mode"
             )
         if isinstance(val, int):
+            if val < 0:
+                raise ValueError(
+                    f"Invalid coordinate {val!r}: negative integer not allowed in strict mode"
+                )
             return val
-        return _coerce_int_coord(val)
+        res = _coerce_int_coord(val)
+        if res < 0:
+            raise ValueError(
+                f"Invalid coordinate {val!r}: negative integer not allowed in strict mode"
+            )
+        return res
 
     if isinstance(val, str):
         val = val.split(":", 1)[0].strip()

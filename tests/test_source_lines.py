@@ -419,6 +419,21 @@ def test_parse_unit_coord_strict_rejects_signed_prefix() -> None:
     assert is_valid_unit_coordinates({"start": "+1", "end": "5"}, strict=False) is True
 
 
+def test_parse_unit_coord_strict_rejects_negative_integers() -> None:
+    """Verifies that parse_unit_coord with strict=True rejects negative integers."""
+    with pytest.raises(ValueError, match="negative integer not allowed in strict mode"):
+        parse_unit_coord({"start": -1}, "start", strict=True)
+
+    with pytest.raises(ValueError, match="negative integer not allowed in strict mode"):
+        parse_unit_coord({"start": -42}, "start", strict=True)
+
+    # 0 is a valid offset (e.g. col_offset)
+    assert parse_unit_coord({"col": 0}, "col", strict=True) == 0
+
+    # In lenient mode, negative integers pass through
+    assert parse_unit_coord({"start": -1}, "start", strict=False) == -1
+
+
 def test_resolve_safe_unit_file_path_symlinked_ancestor_root(tmp_path: Path) -> None:
     """Verifies resolve_safe_unit_file_path handles symlinked ancestor roots
     (e.g., /var -> /private/var)."""

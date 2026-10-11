@@ -1150,14 +1150,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cli_strictness = cfg_strictness
         cli_skip = cfg_skip
 
-    if cli_strictness is not None and str(cli_strictness).strip().lower() not in (
-        "strict", "lenient", "fail_closed", "fast", "skip"
-    ):
-        parser.error(
-            f"invalid closure_strictness configuration: {cli_strictness!r} "
-            "(choose from 'strict', 'lenient', 'fail_closed', 'fast', 'skip')"
-        )
-
     closure_strictness, skip_pre_unit_closures = resolve_closure_strictness_mode(
         closure_strictness=cli_strictness,
         skip_pre_unit_closures=cli_skip,

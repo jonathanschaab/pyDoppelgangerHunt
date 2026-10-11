@@ -3952,10 +3952,3 @@ def test_pair_clone_outputs_allow_permuted_outputs() -> None:
         ("x", "y"),
         ("y", "x"),
     ]
-
-
-
-
-
-
-

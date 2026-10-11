@@ -1637,6 +1637,11 @@ def _build_downstream_cache_key(
 ) -> _DownstreamCacheKey:
     """Forms a persistent cache key for downstream AST read analysis.
 
+    Note:
+        The `tree` parameter is retained for backwards compatibility. AST nodes
+        are intentionally excluded from cache keys to prevent memory pinning
+        of parsed module trees and cross-thread lifecycle retention.
+
     Args:
         source_text: Full module source code string.
         unit: AST unit dictionary.
@@ -1646,7 +1651,7 @@ def _build_downstream_cache_key(
         skip_pre_unit_closures: Whether pre-unit closure read capture is bypassed.
         source_digest: Optional hex SHA-256 digest of source_text.
         resolved_end_col: Pre-resolved end column offset if available.
-        tree: Optional pre-parsed module AST.
+        tree: Optional pre-parsed module AST (unused; retained for compatibility).
         unit_inputs: Precomputed live unit inputs.
     """
     del tree
