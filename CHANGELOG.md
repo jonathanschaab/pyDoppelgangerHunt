@@ -94,6 +94,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `is_subroutine_unit` to avoid false subroutine classifications.
 
 ### Fixed
+- **Downstream Cache Key Unit Inputs Normalization**: Normalized `effective_unit_inputs` from
+  `unit.get("inputs")` before generating `_build_downstream_cache_key`, ensuring calls with
+  populated vs unpopulated unit inputs produce distinct cache keys in `_downstream_reads_cache`.
+- **Re-entrant Synchronization for Downstream Caching**: Migrated `_downstream_cache_lock` in
+  `dataflow.py` from `threading.Lock` to `threading.RLock`, guaranteeing re-entrancy safety
+  across nested multi-cache lookups without deadlocking.
+- **Alternative Column Offset Validation**: Extended `is_valid_unit_coordinates` in `source.py`
+  to validate both canonical (`start_col`, `end_col`) and offset alias keys (`start_col_offset`,
+  `end_col_offset`), rejecting negative or inverted column bounds across all aliases.
 - **Indented Method Helper Compilation**: Replaced unconditional
   `compile(dedent_source_text(helper_code), ...)` in `patch.py` with
   `_validate_helper_compilation`, splitting top-level import headers from indented method

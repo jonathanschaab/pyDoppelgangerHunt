@@ -8,6 +8,7 @@ import concurrent.futures
 import gc
 import hashlib
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict
 from unittest import mock
@@ -26,6 +27,7 @@ from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-acc
     _MAX_DOWNSTREAM_CACHE_SIZE,
     _MAX_SCOPE_CACHE_SIZE,
     _VisitorPassMode,
+    _build_downstream_cache_key,
     _clear_downstream_reads_cache,
     _collect_pre_unit_closures,
     _collect_scope_closures,
@@ -3706,5 +3708,68 @@ def test_resolve_clone_generator_subroutine_outputs_unflagged_sliced_lines() -> 
     # Sliced lines with len(source_lines) < end fail closed because full file text is unavailable
     res = resolve_clone_generator_subroutine_outputs(u1, u2, scope1, scope2)
     assert res is None
+
+
+def test_downstream_cache_key_differentiation_for_unit_inputs() -> None:
+    """Verifies that unit_inputs are normalized into the downstream cache key."""
+    clear_dataflow_cache()
+    src = (
+        "def process(batches):\n"
+        "    total = 0\n"
+        "    for batch in batches:\n"
+        "        for x in batch:\n"
+        "            total += x\n"
+        "            yield total\n"
+    )
+    u_with_inputs = {
+        "file": "calc.py",
+        "start": 4,
+        "end": 6,
+        "kind": "for",
+        "inputs": ["total"],
+    }
+    u_without_inputs = {
+        "file": "calc.py",
+        "start": 4,
+        "end": 6,
+        "kind": "for",
+    }
+    u_empty_inputs = {
+        "file": "calc.py",
+        "start": 4,
+        "end": 6,
+        "kind": "for",
+        "inputs": [],
+    }
+    key1 = _build_downstream_cache_key(
+        src, u_with_inputs, 4, 6, candidates={"total"}, skip_pre_unit_closures=False
+    )
+    key2 = _build_downstream_cache_key(
+        src, u_without_inputs, 4, 6, candidates={"total"}, skip_pre_unit_closures=False
+    )
+    key3 = _build_downstream_cache_key(
+        src, u_empty_inputs, 4, 6, candidates={"total"}, skip_pre_unit_closures=False
+    )
+    assert key1.unit_inputs == frozenset({"total"})
+    assert key2.unit_inputs is None
+    assert key3.unit_inputs == frozenset()
+    assert key1 != key2
+    assert key1 != key3
+
+    # collect_downstream_read_names differentiates between populated and empty inputs
+    reads1 = collect_downstream_read_names(src, u_with_inputs, candidates={"total"})
+    reads2 = collect_downstream_read_names(src, u_empty_inputs, candidates={"total"})
+    assert reads1 is not None and "total" in reads1
+    assert reads2 is not None and "total" not in reads2
+
+
+def test_downstream_cache_lock_reentrancy() -> None:
+    """Verifies that _downstream_cache_lock is re-entrant to prevent thread deadlocks."""
+    assert isinstance(_downstream_cache_lock, type(threading.RLock()))
+    # Must support nested acquisition on the current thread without blocking
+    with _downstream_cache_lock:
+        with _downstream_cache_lock:
+            pass
+
 
 

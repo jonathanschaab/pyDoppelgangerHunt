@@ -2552,6 +2552,14 @@ def test_normalize_pipe_unions_variants() -> None:
         _normalize_pipe_unions('Annotated[int | None, "a | b"]')
         == 'Annotated[Optional[int], "a | b"]'
     )
+    assert (
+        _normalize_pipe_unions('Annotated[int, Value("x | y")]')
+        == 'Annotated[int, Value("x | y")]'
+    )
+    assert (
+        _normalize_pipe_unions('Annotated[int | str, Value("x | y")]')
+        == 'Annotated[Union[int, str], Value("x | y")]'
+    )
     assert _normalize_pipe_unions("'int | str'") == "'Union[int, str]'"
     assert _normalize_pipe_unions("int") == "int"
     assert _normalize_pipe_unions("") == ""

@@ -361,6 +361,23 @@ def test_is_valid_unit_coordinates_strict_mode() -> None:
     assert is_valid_unit_coordinates({"start": 5, "end": -1}) is False
     # Inverted same-line column coordinates rejected
     assert is_valid_unit_coordinates({"start": 1, "end": 1, "start_col": 10, "end_col": 5}) is False
+    assert is_valid_unit_coordinates(
+        {"start": 1, "end": 1, "start_col_offset": 10, "end_col_offset": 5}
+    ) is False
+    assert is_valid_unit_coordinates(
+        {"start": 1, "end": 1, "start_col": 10, "end_col_offset": 5}
+    ) is False
+    assert is_valid_unit_coordinates({"start": 1, "end": 2, "start_col_offset": -1}) is False
+    assert is_valid_unit_coordinates({"start": 1, "end": 2, "end_col_offset": -1}) is False
+    assert is_valid_unit_coordinates(
+        {"start": 1, "end": 2, "start_col_offset": 0, "end_col_offset": 10}
+    ) is True
+    assert is_valid_unit_coordinates(
+        {"start": 1, "end": 2, "start_col": 0, "end_col_offset": 10}
+    ) is True
+    assert is_valid_unit_coordinates(
+        {"start": 1, "end": 2, "start_col_offset": 0, "end_col": 10}
+    ) is True
     # Float rejected in strict mode, accepted in default/lenient mode
     assert is_valid_unit_coordinates({"start": 12.0}, strict=True) is False
     assert is_valid_unit_coordinates({"start": 12.0}) is True

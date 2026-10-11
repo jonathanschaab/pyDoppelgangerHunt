@@ -67,7 +67,7 @@ __all__ = [
 
 _CacheValT = TypeVar("_CacheValT")
 
-_downstream_cache_lock: threading.Lock = threading.Lock()
+_downstream_cache_lock: threading.RLock = threading.RLock()
 _MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
 _MAX_SCOPE_CACHE_SIZE: int = 1024
 _MAX_PARSED_TREE_CACHE_SIZE: int = 128
@@ -1643,7 +1643,10 @@ def _build_downstream_cache_key(
         else _extract_unit_end_col(unit)
     )
     cands_key = frozenset(candidates) if candidates is not None else None
-    unit_inputs_key = frozenset(unit_inputs) if unit_inputs is not None else None
+    unit_inputs_val = unit_inputs
+    if unit_inputs_val is None and "inputs" in unit and unit["inputs"] is not None:
+        unit_inputs_val = set(unit["inputs"])
+    unit_inputs_key = frozenset(unit_inputs_val) if unit_inputs_val is not None else None
     unit_kind = unit.get("kind")
     unit_name = unit.get("name")
     is_sub = is_subroutine_unit(unit, source_text=source_text, tree=tree)
@@ -2050,6 +2053,10 @@ def collect_downstream_read_names(
             return None
         u_end_col = _resolve_unit_ast_end_col(scope_node, unit)
 
+    effective_unit_inputs = unit_inputs
+    if effective_unit_inputs is None and "inputs" in unit and unit["inputs"] is not None:
+        effective_unit_inputs = set(unit["inputs"])
+
     cache_key = _build_downstream_cache_key(
         source_text,
         unit,
@@ -2060,7 +2067,7 @@ def collect_downstream_read_names(
         source_digest=source_digest,
         resolved_end_col=u_end_col,
         tree=effective_tree,
-        unit_inputs=unit_inputs,
+        unit_inputs=effective_unit_inputs,
     )
     with _downstream_cache_lock:
         if cache_key in _downstream_reads_cache:
@@ -2126,9 +2133,7 @@ def collect_downstream_read_names(
             loop_visitor.visit(stmt)
         loaded.update(loop_visitor.loaded)
 
-        eff_inputs = unit_inputs
-        if eff_inputs is None and "inputs" in unit and unit["inputs"] is not None:
-            eff_inputs = set(unit["inputs"])
+        eff_inputs = effective_unit_inputs
         if eff_inputs is None:
             eff_inputs = _extract_unit_live_in_names(
                 scope_node, u_start, u_end, u_end_col, candidates=candidates

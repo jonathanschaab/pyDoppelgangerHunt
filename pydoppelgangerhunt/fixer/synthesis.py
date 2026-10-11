@@ -228,7 +228,11 @@ def _format_union_or_optional(unique_parts: List[str]) -> str:
 
 
 def _normalize_pipe_unions(type_str: Optional[str]) -> str:
-    """Normalizes PEP 604 pipe unions (A | B) to typing.Union[A, B] syntax."""
+    """Normalizes PEP 604 pipe unions (A | B) to typing.Union[A, B] syntax.
+
+    Recursively converts stringified annotations (PEP 563) while preserving literal
+    contents inside Literal[...] and non-type metadata arguments inside Annotated[...].
+    """
     if not isinstance(type_str, str):
         return "" if type_str is None else str(type_str)
     cleaned = type_str.strip()

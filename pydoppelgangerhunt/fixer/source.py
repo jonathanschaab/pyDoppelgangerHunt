@@ -62,9 +62,9 @@ def is_valid_unit_coordinates(u: Any, strict: bool = False) -> bool:
     (start > 0) is required, and inverted coordinates (end < start) are
     rejected. In strict mode (for code refactoring and patching), both start
     and end are required and must parse strictly to positive integers (rejecting
-    floats, colons, and blank strings) with end >= start. End, start_col, and
-    end_col must also parse strictly if present, with end_col >= start_col if on
-    the same line.
+    floats, colons, and blank strings) with end >= start. End, start_col (or
+    start_col_offset), and end_col (or end_col_offset) must also parse strictly
+    if present, with end_col >= start_col if on the same line.
     """
     if not isinstance(u, dict):
         return False
@@ -85,16 +85,19 @@ def is_valid_unit_coordinates(u: Any, strict: bool = False) -> bool:
         elif strict:
             return False
 
-        start_col: Optional[int] = None
-        end_col: Optional[int] = None
-        if "start_col" in u and u.get("start_col") is not None:
-            start_col = parse_unit_coord(u, "start_col", default=None, strict=strict)
-            if start_col is None or start_col < 0:
-                return False
-        if "end_col" in u and u.get("end_col") is not None:
-            end_col = parse_unit_coord(u, "end_col", default=None, strict=strict)
-            if end_col is None or end_col < 0:
-                return False
+        def _parse_and_validate_cols(keys: Tuple[str, ...]) -> Optional[int]:
+            first_val: Optional[int] = None
+            for key in keys:
+                if u.get(key) is not None:
+                    c_val = parse_unit_coord(u, key, default=None, strict=strict)
+                    if c_val is None or c_val < 0:
+                        raise ValueError
+                    if first_val is None:
+                        first_val = c_val
+            return first_val
+
+        start_col = _parse_and_validate_cols(("start_col", "start_col_offset"))
+        end_col = _parse_and_validate_cols(("end_col", "end_col_offset"))
 
         effective_end = end_val if end_val is not None else start_val
         if (
