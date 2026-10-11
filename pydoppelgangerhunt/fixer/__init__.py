@@ -25,6 +25,7 @@ from pydoppelgangerhunt.fixer.binding import (
 )
 from pydoppelgangerhunt.fixer.dataflow import (
     GeneratorCloneSideData,
+    clear_dataflow_cache,
     collect_downstream_read_names,
     has_async_generator_delegation_hazard,
     is_async_generator_with_return_value,
@@ -131,6 +132,7 @@ __all__ = [
     "analyze_unit_variable_scope",
     "build_module_graph",
     "check_units_overlap",
+    "clear_dataflow_cache",
     "col_offset_to_char_offset",
     "collect_downstream_read_names",
     "compute_line_offsets",

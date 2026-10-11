@@ -26,6 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sliding windows, and clause branches while excluding whole functions and methods.
 - **Closure Warning Cache Lifecycle**: Added `clear_closure_warning_cache` in `config.py`
   (invoked by `_clear_downstream_reads_cache`) for reset in long-running processes.
+- **Public Dataflow Cache Clearing (`clear_dataflow_cache`)**: Added `clear_dataflow_cache()`
+  in `pydoppelgangerhunt.fixer` (aliasing `_clear_downstream_reads_cache`) allowing long-running
+  processes, IDE servers, and batch runners to reset AST and downstream read memoization caches.
+- **Airtight Scope Shadowing for Eager Built-ins**: Added `_extract_scope_local_names` in
+  `dataflow.py` to check whether eager built-in consumers (`sum`, `min`, `max`, `any`, etc.)
+  are shadowed by parameters or local variables/functions in the enclosing scope, preventing
+  shadowed generator expressions from escaping unobserved.
+- **Multi-Type Union Normalization with `None`**: Updated `_format_union_or_optional` in
+  `synthesis.py` so union annotations containing three or more types with `None` (e.g.
+  `int | str | None`) normalize to PEP 484 compliant `Optional[Union[...]]`.
 
 ### Breaking Changes
 - **Breaking Change in Coordinate Validation**: `is_valid_unit_coordinates` (when called with

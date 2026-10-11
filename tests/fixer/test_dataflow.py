@@ -27,12 +27,15 @@ from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-acc
     _enclosing_try_reads_outputs,
     _extract_effective_unit_outputs,
     _extract_nested_scope_free_reads,
+    _extract_scope_local_names,
     _find_enclosing_loops,
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
     _get_scope_stmts_by_end_lineno,
     _get_scope_try_and_with_blocks,
+    _is_eagerly_consumed_genexp,
     _load_unit_file_text,
+    clear_dataflow_cache,
     _pair_clone_outputs,
     _scope_closures_cache,
     _scope_loops_cache,
@@ -3330,3 +3333,148 @@ def test_concurrent_generate_refactoring_patch_calls(tmp_path: Path) -> None:
     assert len(first_patch_text) > 0
     for _, patch_text in results[1:]:
         assert patch_text == first_patch_text
+
+
+def test_clear_dataflow_cache_public_export() -> None:
+    """Verifies that clear_dataflow_cache is publicly exported and resets caches."""
+    import pydoppelgangerhunt.fixer as fixer_mod
+    import pydoppelgangerhunt.fixer.dataflow as dataflow_mod
+
+    assert "clear_dataflow_cache" in fixer_mod.__all__
+    assert "clear_dataflow_cache" in dataflow_mod.__all__
+    assert callable(fixer_mod.clear_dataflow_cache)
+    assert fixer_mod.clear_dataflow_cache is dataflow_mod.clear_dataflow_cache
+
+    # Seed caches
+    with _downstream_cache_lock:
+        _downstream_reads_cache[("dummy",)] = frozenset({"x"})
+        _scope_closures_cache[ast.Pass()] = []
+
+    assert len(_downstream_reads_cache) > 0
+    assert len(_scope_closures_cache) > 0
+
+    clear_dataflow_cache()
+
+    assert len(_downstream_reads_cache) == 0
+    assert len(_scope_closures_cache) == 0
+
+    # Ensure backwards compatibility alias works identically
+    with _downstream_cache_lock:
+        _downstream_reads_cache[("dummy",)] = frozenset({"y"})
+    _clear_downstream_reads_cache()
+    assert len(_downstream_reads_cache) == 0
+
+
+def test_extract_scope_local_names() -> None:
+    """Verifies extraction of parameters and local stores without comprehension leakage."""
+    code = (
+        "def outer(pos_a, /, pos_b, *vargs, kw_a, **kwargs):\n"
+        "    x = 10\n"
+        "    y += 5\n"
+        "    (z := 20)\n"
+        "    for item in [1, 2]:\n"
+        "        pass\n"
+        "    with open('f') as f_obj:\n"
+        "        pass\n"
+        "    try:\n"
+        "        pass\n"
+        "    except ValueError as err:\n"
+        "        pass\n"
+        "    def inner_fn():\n"
+        "        inner_leak = 99\n"
+        "    class InnerClass:\n"
+        "        class_attr = 1\n"
+        "    import math as custom_math\n"
+        "    from os import path as custom_path\n"
+        "    comp_res = [comp_var for comp_var in [1, 2]]\n"
+        "    gen_res = (gen_var for gen_var in [3, 4])\n"
+    )
+    tree = ast.parse(code)
+    func_node = tree.body[0]
+    names = _extract_scope_local_names(func_node)
+
+    # Parameters
+    assert {"pos_a", "pos_b", "vargs", "kw_a", "kwargs"}.issubset(names)
+    # Outer local stores
+    assert {"x", "y", "z", "item", "f_obj", "err", "comp_res", "gen_res"}.issubset(names)
+    # Inner definitions
+    assert "inner_fn" in names
+    assert "InnerClass" in names
+    assert "custom_math" in names
+    assert "custom_path" in names
+    # Function itself
+    assert "outer" in names
+
+    # Comprehension iteration variables and inner function variables MUST NOT leak
+    assert "comp_var" not in names
+    assert "gen_var" not in names
+    assert "inner_leak" not in names
+    assert "class_attr" not in names
+
+
+def test_eager_builtin_scope_shadowing_scenarios() -> None:
+    """Verifies that shadowed built-in eager consumers treat generator
+    expressions as escaping closures."""
+    # 1. Shadowed by local function definition
+    code_fn = (
+        "def compute():\n"
+        "    def sum(gen):\n"
+        "        return lambda: next(gen)\n"
+        "    data = [1, 2, 3]\n"
+        "    total = sum(x * 2 for x in data)\n"
+        "    yield total\n"
+    )
+    tree_fn = ast.parse(code_fn)
+    closures_fn = _collect_scope_closures(tree_fn.body[0])
+    # Expect 2 closures: inner def sum and the escaping genexp passed to sum(...)
+    assert len(closures_fn) == 2
+
+    # 2. Shadowed by function parameter
+    code_param = (
+        "def compute(sum, data):\n"
+        "    total = sum(x * 2 for x in data)\n"
+        "    yield total\n"
+    )
+    tree_param = ast.parse(code_param)
+    closures_param = _collect_scope_closures(tree_param.body[0])
+    assert len(closures_param) == 1
+
+    # 3. Shadowed by local variable assignment
+    code_assign = (
+        "def compute():\n"
+        "    sum = lambda g: list(g)\n"
+        "    data = [1, 2, 3]\n"
+        "    total = sum(x * 2 for x in data)\n"
+        "    yield total\n"
+    )
+    tree_assign = ast.parse(code_assign)
+    closures_assign = _collect_scope_closures(tree_assign.body[0])
+    # Lambda in sum assignment + escaping genexp
+    assert len(closures_assign) == 2
+
+    # 4. Shadowed by import
+    code_import = (
+        "def compute():\n"
+        "    from my_math import sum\n"
+        "    data = [1, 2, 3]\n"
+        "    total = sum(x * 2 for x in data)\n"
+        "    yield total\n"
+    )
+    tree_import = ast.parse(code_import)
+    closures_import = _collect_scope_closures(tree_import.body[0])
+    assert len(closures_import) == 1
+
+    # 5. Comprehension dummy variable does NOT shadow outer built-in call
+    code_no_leak = (
+        "def compute():\n"
+        "    data = [1, 2, 3]\n"
+        "    # min is used inside comprehension, but should not shadow subsequent min()\n"
+        "    dummy = sum(min for min in data)\n"
+        "    total = min(x * 2 for x in data)\n"
+        "    yield total\n"
+    )
+    tree_no_leak = ast.parse(code_no_leak)
+    closures_no_leak = _collect_scope_closures(tree_no_leak.body[0])
+    # Neither sum nor min are shadowed in compute scope -> 0 closures
+    assert len(closures_no_leak) == 0
+

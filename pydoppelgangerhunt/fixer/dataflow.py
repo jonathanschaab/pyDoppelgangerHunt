@@ -38,13 +38,14 @@ from pydoppelgangerhunt.config import (
     clear_closure_warning_cache,
     resolve_closure_strictness_mode,
 )
-from pydoppelgangerhunt.source_lines import parse_unit_coord
+from pydoppelgangerhunt.fixer.scope import _extract_arg_names
 from pydoppelgangerhunt.fixer.source import (
     _find_innermost_enclosing_node,
     _load_unit_file_text,
     is_subroutine_unit,
     resolve_unit_declared_outputs,
 )
+from pydoppelgangerhunt.source_lines import parse_unit_coord
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ _BUILTIN_NAMES: Set[str] = set(dir(builtins))
 __all__ = [
     "GeneratorCloneSideData",
     "clear_closure_warning_cache",
+    "clear_dataflow_cache",
     "collect_downstream_read_names",
     "has_async_generator_delegation_hazard",
     "is_async_generator_with_return_value",
@@ -1085,14 +1087,68 @@ _EAGER_CONSUMER_NAMES: frozenset[str] = frozenset(
 )
 
 
+_INNER_SCOPE_TYPES = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.Lambda,
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+)
+
+
+def _extract_scope_local_names(scope_node: ast.AST) -> Set[str]:
+    """Extracts parameters and locally assigned/imported/defined symbols in scope_node."""
+    names: Set[str] = set()
+    node_name = getattr(scope_node, "name", None)
+    if isinstance(node_name, str):
+        names.add(node_name)
+
+    node_args = getattr(scope_node, "args", None)
+    if isinstance(node_args, ast.arguments):
+        names.update(_extract_arg_names(node_args))
+
+    stack: List[ast.AST] = list(getattr(scope_node, "body", []))
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(curr.name)
+            continue
+        if isinstance(curr, ast.Name) and isinstance(curr.ctx, ast.Store):
+            names.add(curr.id)
+        elif isinstance(curr, (ast.Import, ast.ImportFrom)):
+            for alias in curr.names:
+                names.add(alias.asname or alias.name.split(".", 1)[0])
+        elif isinstance(curr, (ast.Global, ast.Nonlocal)):
+            names.update(curr.names)
+        else:
+            bound_sym = getattr(curr, "name", None) or getattr(curr, "rest", None)
+            if isinstance(bound_sym, str) and not isinstance(curr, ast.Attribute):
+                names.add(bound_sym)
+
+        for child in ast.iter_child_nodes(curr):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(child.name)
+            elif not isinstance(child, _INNER_SCOPE_TYPES):
+                stack.append(child)
+
+    return names
+
+
 def _is_eagerly_consumed_genexp(
-    genexp: ast.GeneratorExp, parent_map: Dict[ast.AST, ast.AST]
+    genexp: ast.GeneratorExp,
+    parent_map: Dict[ast.AST, ast.AST],
+    shadowed_names: Optional[Set[str]] = None,
 ) -> bool:
     """Returns True if the generator expression is directly consumed by an eager built-in."""
     parent = parent_map.get(genexp)
     if isinstance(parent, ast.Call):
         func = parent.func
         if isinstance(func, ast.Name) and func.id in _EAGER_CONSUMER_NAMES:
+            if shadowed_names is not None and func.id in shadowed_names:
+                return False
             return True
         if isinstance(func, ast.Attribute) and func.attr == "join":
             return True
@@ -1104,6 +1160,7 @@ def _collect_scope_closures_uncached(
 ) -> List[Tuple[_ClosurePos, Set[str]]]:
     closures: List[Tuple[_ClosurePos, Set[str]]] = []
     parent_map = _get_scope_parent_map(scope_node)
+    shadowed_names = _extract_scope_local_names(scope_node)
 
     def _resolve_stmt_start_pos(s: ast.stmt) -> Tuple[int, int]:
         s_line = int(getattr(s, "lineno", 0) or 0)
@@ -1132,7 +1189,7 @@ def _collect_scope_closures_uncached(
         for node in nodes:
             for subnode in ast.walk(node):
                 if isinstance(subnode, ast.GeneratorExp) and _is_eagerly_consumed_genexp(
-                    subnode, parent_map
+                    subnode, parent_map, shadowed_names
                 ):
                     continue
                 if isinstance(subnode, (ast.Lambda, ast.GeneratorExp)):
@@ -1274,8 +1331,8 @@ def _collect_pre_unit_closures(
     return captured_reads
 
 
-def _clear_downstream_reads_cache() -> None:
-    """Clears the downstream read memoization cache and AST scope caches."""
+def clear_dataflow_cache() -> None:
+    """Clears all dataflow AST, parent-map, and downstream read memoization caches."""
     with _downstream_cache_lock:
         _downstream_reads_cache.clear()
         _parsed_tree_cache.clear()
@@ -1286,6 +1343,9 @@ def _clear_downstream_reads_cache() -> None:
         _scope_try_with_cache.clear()
         _warned_lenient_closure[0] = False
     clear_closure_warning_cache()
+
+
+_clear_downstream_reads_cache = clear_dataflow_cache
 
 
 def _build_downstream_cache_key(

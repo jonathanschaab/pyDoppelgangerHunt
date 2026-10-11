@@ -209,14 +209,18 @@ def _flatten_union_args(args: Sequence[str]) -> List[str]:
 
 
 def _format_union_or_optional(unique_parts: List[str]) -> str:
-    """Formats unique union arguments, converting X | None to Optional[X]."""
+    """Formats unique union arguments, converting None unions to Optional."""
+    if not unique_parts:
+        return ""
+    if any(p in ("None", "NoneType") for p in unique_parts):
+        non_none = [p for p in unique_parts if p not in ("None", "NoneType")]
+        if not non_none:
+            return unique_parts[0]
+        if len(non_none) == 1:
+            return f"Optional[{non_none[0]}]"
+        return f"Optional[Union[{', '.join(non_none)}]]"
     if len(unique_parts) == 1:
         return unique_parts[0]
-    if len(unique_parts) == 2:
-        if unique_parts[1] in ("None", "NoneType"):
-            return f"Optional[{unique_parts[0]}]"
-        if unique_parts[0] in ("None", "NoneType"):
-            return f"Optional[{unique_parts[1]}]"
     return f"Union[{', '.join(unique_parts)}]"
 
 
