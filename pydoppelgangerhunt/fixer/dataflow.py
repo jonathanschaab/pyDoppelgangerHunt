@@ -95,6 +95,7 @@ _build_downstream_cache_key = getattr(_df_cache, "_build_downstream_cache_key")
 _clear_downstream_reads_cache = getattr(_df_cache, "_clear_downstream_reads_cache")
 
 # Internal visitors and AST inspection symbols
+_record_import_names = getattr(_df_visitors, "_record_import_names")
 _collect_func_args = getattr(_df_visitors, "_collect_func_args")
 _collect_func_params = getattr(_df_visitors, "_collect_func_params")
 _extract_nested_scope_free_reads = getattr(_df_visitors, "_extract_nested_scope_free_reads")

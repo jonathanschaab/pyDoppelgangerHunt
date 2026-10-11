@@ -99,6 +99,9 @@ def _get_or_compute_scope_cached(
     except TypeError:
         return compute_fn()
 
+    # Concurrency Design Note: compute_fn() executes outside _downstream_cache_lock to
+    # eliminate lock contention under multi-threading; transient duplicate computation during
+    # concurrent misses is harmless because compute_fn is deterministic and pure.
     computed = compute_fn()
 
     try:

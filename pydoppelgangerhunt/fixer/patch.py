@@ -2651,6 +2651,10 @@ def _validate_helper_compilation(helper_code: str) -> bool:
     Splits top-level import headers from indented method definitions to prevent
     spurious IndentationError when checking combined helper strings, and wraps
     indented definitions in a compound block to preserve column-0 multiline strings.
+
+    Note:
+        Intentionally preserved for standalone verification, post-synthesis validation
+        assertions, and test harness compatibility.
     """
     if "\n\n\n" in helper_code:
         header, body = helper_code.split("\n\n\n", 1)
@@ -2814,10 +2818,9 @@ def _generate_refactoring_patch_impl(
             )
             continue
 
-
-
-        # Performance: Snapshot only plans touched in this pair (f1, f2, and potential shared module)
-        # to ensure O(touched_plans) = O(1) complexity per pair rather than O(pairs * total_plans).
+        # Performance: Snapshot only plans touched in this pair (f1, f2, and potential shared
+        # module) to ensure O(touched_plans) = O(1) complexity per pair rather than
+        # O(pairs * total_plans).
         initial_plan_keys = set(file_plans.keys())
         plans_snapshot: Dict[Path, _PlanSnapshot] = {}
         graph_snapshot = graph_holder[0].copy() if graph_holder[0] is not None else None

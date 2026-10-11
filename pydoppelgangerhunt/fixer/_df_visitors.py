@@ -18,8 +18,27 @@ from typing import (
 _BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
 
+def _record_import_names(
+    node: Union[ast.Import, ast.ImportFrom], store_set: Set[str]
+) -> None:
+    """Extracts bound symbol names from Import or ImportFrom statements, ignoring '*'."""
+    for alias in node.names:
+        bound = (
+            alias.asname
+            or (
+                alias.name
+                if isinstance(node, ast.ImportFrom)
+                else alias.name.split(".", 1)[0]
+            )
+        )
+        if bound != "*":
+            store_set.add(bound)
+
+
 class _BaseScopeVisitor(ast.NodeVisitor):
     """Shared helpers for scope visitors."""
+
+    _record_import_names = staticmethod(_record_import_names)
 
     def __init__(self) -> None:
         self._comp_targets: List[Set[str]] = []
@@ -90,21 +109,6 @@ class _BaseScopeVisitor(ast.NodeVisitor):
         else:
             self.visit(node.target)
 
-    @staticmethod
-    def _record_import_names(
-        node: Union[ast.Import, ast.ImportFrom], store_set: Set[str]
-    ) -> None:
-        for alias in node.names:
-            bound = (
-                alias.asname
-                or (
-                    alias.name
-                    if isinstance(node, ast.ImportFrom)
-                    else alias.name.split(".", 1)[0]
-                )
-            )
-            if bound != "*":
-                store_set.add(bound)
 
     def _visit_nested_named_scope(
         self,

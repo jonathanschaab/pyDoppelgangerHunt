@@ -3694,6 +3694,20 @@ def test_extract_single_node_local_names_lambda_non_list_body() -> None:
     assert names == {"x", "y"}
 
 
+def test_extract_single_node_local_names_wildcard_import_filtered() -> None:
+    """Verifies that _extract_single_node_local_names ignores '*' from wildcard star imports."""
+    fn_def = ast.parse(
+        "def func():\n"
+        "    from math import *\n"
+        "    import os\n"
+        "    from sys import path as sys_path\n"
+        "    val = 1\n"
+    ).body[0]
+    names = _extract_single_node_local_names(fn_def)
+    assert "*" not in names
+    assert names == {"func", "os", "sys_path", "val"}
+
+
 def test_subroutine_same_line_semicolon_in_with_without_end_col() -> None:
     """Verifies resolve_clone_generator_subroutine_outputs when a compound unit is followed
     by a semicolon statement on the same line inside a with block without explicit end_col."""

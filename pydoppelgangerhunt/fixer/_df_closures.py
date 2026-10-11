@@ -20,7 +20,10 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _get_scope_parent_map,
     _scope_closures_cache,
 )
-from pydoppelgangerhunt.fixer._df_visitors import _extract_nested_scope_free_reads
+from pydoppelgangerhunt.fixer._df_visitors import (
+    _extract_nested_scope_free_reads,
+    _record_import_names,
+)
 from pydoppelgangerhunt.fixer.scope import _extract_arg_names
 
 _BUILTIN_NAMES: Set[str] = set(dir(builtins))
@@ -75,8 +78,7 @@ def _extract_single_node_local_names(scope_node: ast.AST) -> Set[str]:
         if isinstance(curr, ast.Name) and isinstance(curr.ctx, ast.Store):
             names.add(curr.id)
         elif isinstance(curr, (ast.Import, ast.ImportFrom)):
-            for alias in curr.names:
-                names.add(alias.asname or alias.name.split(".", 1)[0])
+            _record_import_names(curr, names)
             continue
         elif isinstance(curr, (ast.Global, ast.Nonlocal)):
             names.update(curr.names)
