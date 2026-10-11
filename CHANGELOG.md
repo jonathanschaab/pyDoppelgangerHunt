@@ -65,6 +65,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Fixture Realism Audit Across Test Suites**: Audited and upgraded synthetic unit test
   fixtures across `tests/fixer/` to eliminate uncompilable source strings (e.g. standalone
   `yield`/`return` at module level, `return` with value inside `async def` generators).
+- **Strict Assignment Operator Regex in Synthesis**: Updated `m_assign` in `synthesis.py`
+  with negative lookbehind and lookahead (`(?<![=<>!:])=(?!=)`) to prevent equality comparisons
+  (`==`, `!=`, `<=`, `>=`) from being mistaken for assignment statements.
+- **Word-Boundary Async and Yield Classification**: Replaced raw substring containment in
+  `binding.py` with word-boundary regular expressions (`\b(yield|yield\s+from)\b` and
+  `\b(await|async\s+for|async\s+with)\b`), eliminating false-positive async classifications on
+  identifiers like `await_timeout` or `yield_step`.
+- **Source-Aware Subroutine Cache Key Derivation**: Passed `source_text=source_text` to
+  `is_subroutine_unit` in `_build_downstream_cache_key` (`dataflow.py`), ensuring symmetric
+  cache key resolution across structural and module-scoped units.
 
 ### Breaking Changes
 - **Private Line-Splitting Regex (`_PHYSICAL_LINE_RE`)**: Dropped `_PHYSICAL_LINE_RE` from

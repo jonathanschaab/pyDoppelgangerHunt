@@ -1508,7 +1508,7 @@ def _build_downstream_cache_key(
     cands_key = frozenset(candidates) if candidates is not None else None
     unit_kind = unit.get("kind")
     unit_name = unit.get("name")
-    is_sub = is_subroutine_unit(unit)
+    is_sub = is_subroutine_unit(unit, source_text=source_text)
     return _DownstreamCacheKey(
         content_digest=content_digest,
         file_path=file_path_str,

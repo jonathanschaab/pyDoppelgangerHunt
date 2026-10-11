@@ -1411,3 +1411,45 @@ def test_populate_unit_receiver_metadata_two_is_async_meanings(tmp_path: Path) -
     assert fn_unit.get("enclosing_is_async") is True
     assert fn_unit.get("is_async") is True
 
+
+def test_populate_unit_receiver_metadata_subroutine_async_word_boundaries(
+    tmp_path: Path,
+) -> None:
+    """Verifies that variable names like await_timeout or yield_step do not trigger is_async."""
+    src = (
+        "async def async_worker(items):\n"
+        "    await_timeout = 10\n"
+        "    yield_step = 1\n"
+        "    return await_timeout + yield_step\n"
+    )
+    p = tmp_path / "worker_vars.py"
+    p.write_text(src, encoding="utf-8")
+
+    sub_unit = {
+        "file": str(p),
+        "kind": "compound_block",
+        "start": 2,
+        "end": 3,
+    }
+    _populate_unit_receiver_metadata(sub_unit, repo_root=str(tmp_path))
+    assert sub_unit.get("enclosing_is_async") is True
+    # Identifiers containing await/yield substrings must NOT flip is_async to True
+    assert sub_unit.get("is_async") is False
+
+    # Actual await expression inside subroutine DOES set is_async to True
+    src_real_await = (
+        "async def async_worker2(items):\n"
+        "    res = await fetch_data()\n"
+        "    return res\n"
+    )
+    p2 = tmp_path / "worker_await.py"
+    p2.write_text(src_real_await, encoding="utf-8")
+    sub_await = {
+        "file": str(p2),
+        "kind": "compound_block",
+        "start": 2,
+        "end": 2,
+    }
+    _populate_unit_receiver_metadata(sub_await, repo_root=str(tmp_path))
+    assert sub_await.get("is_async") is True
+

@@ -2926,3 +2926,51 @@ def test_split_delimited_type_string_mismatched_brackets() -> None:
     # _split_type_args delegates to _split_delimited_type_string with require_balanced=True
     assert _split_type_args("Tuple[int, str)") == []
 
+
+def test_synthesize_complex_expr_equality_comparison_not_stripped(tmp_path: Path) -> None:
+    """Verifies that equality comparison operators (==, !=, <=, >=) are not corrupted."""
+    code = (
+        "def check(x, y):\n"
+        "    return x == y\n"
+    )
+    f1 = tmp_path / "eq1.py"
+    f2 = tmp_path / "eq2.py"
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+
+    u1 = {
+        "file": "eq1.py",
+        "start": 2,
+        "end": 2,
+        "name": "check:eq",
+        "kind": "complex_expr",
+    }
+    u2 = {
+        "file": "eq2.py",
+        "start": 2,
+        "end": 2,
+        "name": "check:eq",
+        "kind": "complex_expr",
+    }
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper != ""
+    assert "return x == y" in helper
+    assert_valid_python(helper)
+
+    # Also verify compound equality check flag == (a > b)
+    code_compound = (
+        "def check_cmp(flag, a, b):\n"
+        "    return flag == (a > b)\n"
+    )
+    f3 = tmp_path / "cmp1.py"
+    f4 = tmp_path / "cmp2.py"
+    f3.write_text(code_compound, encoding="utf-8")
+    f4.write_text(code_compound, encoding="utf-8")
+    u3 = {"file": "cmp1.py", "start": 2, "end": 2, "name": "check_cmp", "kind": "complex_expr"}
+    u4 = {"file": "cmp2.py", "start": 2, "end": 2, "name": "check_cmp", "kind": "complex_expr"}
+    helper_compound = synthesize_shared_helper_code(u3, u4, repo_root=str(tmp_path))
+    assert helper_compound != ""
+    assert "return flag == (a > b)" in helper_compound
+    assert_valid_python(helper_compound)
+

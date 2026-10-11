@@ -1141,7 +1141,8 @@ def synthesize_shared_helper_code(
             if len(common_lines) == 1:
                 first_expr = common_lines[0].strip()
                 m_assign = re.match(
-                    r"^[a-zA-Z_]\w*(?:\s*:\s*[^=]+)?\s*=\s*(.+)$", first_expr
+                    r"^[a-zA-Z_]\w*(?:\s*:\s*[^=]+)?\s*(?<![=<>!:])=(?!=)\s*(.+)$",
+                    first_expr,
                 )
                 if m_assign:
                     first_expr = m_assign.group(1).strip()

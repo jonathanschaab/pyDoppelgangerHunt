@@ -3588,3 +3588,33 @@ def test_load_unit_file_text_synthetic_in_memory_fallback() -> None:
     text = _load_unit_file_text(unit)
     assert text == "def foo():\n    return 42\n"
 
+
+def test_build_downstream_cache_key_source_text_subroutine_symmetry() -> None:
+    """Verifies that _build_downstream_cache_key passes source_text to is_subroutine_unit."""
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        _build_downstream_cache_key,
+    )
+
+    code = (
+        "def enclosing():\n"
+        "    a = 1\n"
+        "    b = 2\n"
+        "    return a + b\n"
+    )
+    # Kind-less unit inside enclosing function
+    unit = {
+        "file": "calc.py",
+        "start": 2,
+        "end": 3,
+    }
+    key_with_source = _build_downstream_cache_key(
+        source_text=code,
+        unit=unit,
+        u_start=2,
+        u_end=3,
+        candidates={"a", "b"},
+        skip_pre_unit_closures=False,
+    )
+    # Structural inspection inside enclosing function with source_text resolves is_subroutine=True
+    assert key_with_source.is_subroutine is True
+

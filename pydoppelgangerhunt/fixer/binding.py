@@ -304,16 +304,22 @@ def _populate_unit_receiver_metadata(
     if "is_async" not in unit:
         is_sub = is_subroutine_unit(unit, source_text=source)
         if is_sub:
+            u_src = str(unit.get("source_text") or "")
             has_yield = (
                 bool(unit.get("has_yield"))
-                or ("yield" in str(unit.get("source_text") or ""))
+                or bool(re.search(r"\b(yield|yield\s+from)\b", u_src))
             )
-            has_await = "await" in str(unit.get("source_text") or "")
+            has_await = (
+                bool(unit.get("has_await"))
+                or bool(re.search(r"\b(await|async\s+for|async\s+with)\b", u_src))
+            )
             if not (has_yield or has_await) and source is not None:
                 u_lines = extract_unit_source_code(unit, repo_root=repo_root)
                 u_text = "".join(u_lines)
-                has_yield = "yield" in u_text
-                has_await = "await" in u_text
+                has_yield = bool(re.search(r"\b(yield|yield\s+from)\b", u_text))
+                has_await = bool(
+                    re.search(r"\b(await|async\s+for|async\s+with)\b", u_text)
+                )
             unit["is_async"] = fn_is_async if (has_yield or has_await) else False
         else:
             unit["is_async"] = fn_is_async
