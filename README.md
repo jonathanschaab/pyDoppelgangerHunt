@@ -253,6 +253,10 @@ escaping callbacks across lexical scopes.
   digests and unit coordinates rather than file paths or unit names, cache entries are cleanly
   shared across clones and files with identical content. All dataflow caches are thread-safely
   cleared in a `finally` block upon completion of refactoring patch generation.
+  Long-running processes (such as IDE language servers, daemon file watchers, or custom analysis
+  pipelines invoking `collect_downstream_read_names` directly) should call `clear_dataflow_cache()`
+  (exported from `pydoppelgangerhunt.fixer`) periodically between scan runs to release memoized
+  AST trees and parent node maps.
 - **Precision vs. Soundness Trade-off**: Pre-unit closure scanning can be configured via
   `--closure-strictness {strict,lenient,fail_closed,fast,skip}` (or `--skip-pre-unit-closures`, or setting
   `closure_strictness = "strict"|"lenient"` in `pyproject.toml`):

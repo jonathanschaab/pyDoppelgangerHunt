@@ -1490,7 +1490,18 @@ def _collect_pre_unit_closures(
 
 
 def clear_dataflow_cache() -> None:
-    """Clears all dataflow AST, parent-map, and downstream read memoization caches."""
+    """Clears all dataflow AST, parent-map, and downstream read memoization caches.
+
+    Memory Lifecycle Recommendation for Long-Running Processes:
+        In batch CLI workflows (`generate_refactoring_patch`), this cleanup is invoked
+        automatically in a `finally` block at the conclusion of patch generation.
+        However, long-running processes—such as IDE language server sidecars, daemon
+        file watchers, or interactive test sessions—that call dataflow inspection functions
+        (`collect_downstream_read_names`, `resolve_clone_pair_outputs`, etc.) directly should
+        invoke `clear_dataflow_cache()` periodically between analysis cycles.
+        This explicitly purges cached module ASTs, parent node maps, and downstream
+        liveness tables, preventing unbounded memory retention across long sessions.
+    """
     with _downstream_cache_lock:
         _downstream_reads_cache.clear()
         _parsed_tree_cache.clear()
