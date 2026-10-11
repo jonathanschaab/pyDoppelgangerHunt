@@ -1190,14 +1190,15 @@ def test_collect_downstream_read_names_try_finally_exceptional_path() -> None:
 def test_downstream_reads_pre_unit_loop_assign_does_not_kill_post_unit() -> None:
     """Verifies that pre-unit assignments in enclosing loops do not kill post-unit reads."""
     src = (
-        "for batch in batches:\n"
-        "    total = 0\n"
-        "    for x in batch:\n"
-        "        total += x\n"
-        "        yield x\n"
-        "    print(total)\n"
+        "def process_batches(batches):\n"
+        "    for batch in batches:\n"
+        "        total = 0\n"
+        "        for x in batch:\n"
+        "            total += x\n"
+        "            yield x\n"
+        "        print(total)\n"
     )
-    unit = {"file": "mod.py", "start": 3, "end": 5, "name": "unit", "kind": "compound_block"}
+    unit = {"file": "mod.py", "start": 4, "end": 6, "name": "unit", "kind": "compound_block"}
     reads = collect_downstream_read_names(src, unit, candidates={"total", "x"})
     assert reads is not None
     assert "total" in reads
@@ -1331,16 +1332,17 @@ def test_downstream_reads_class_method_deferred_read() -> None:
     """Verifies that pre-unit class methods capturing candidate variables have their free
     reads preserved directly under the blanket pre-unit rule."""
     src = (
-        "class K:\n"
-        "    def m(self):\n"
-        "        return total\n"
+        "def f(items):\n"
+        "    class K:\n"
+        "        def m(self):\n"
+        "            return total\n"
         "\n"
-        "for x in items:\n"
-        "    total = x\n"
-        "    yield x\n"
-        "K().m()\n"
+        "    for x in items:\n"
+        "        total = x\n"
+        "        yield x\n"
+        "    K().m()\n"
     )
-    unit = {"file": "mod.py", "start": 5, "end": 7, "name": "unit", "kind": "compound_block"}
+    unit = {"file": "mod.py", "start": 6, "end": 8, "name": "unit", "kind": "compound_block"}
     reads = collect_downstream_read_names(src, unit, candidates={"total"})
     assert reads is not None
     assert "total" in reads
@@ -1350,17 +1352,18 @@ def test_downstream_reads_class_instance_alias_deferred_read() -> None:
     """Verifies that pre-unit class methods capturing candidate variables are preserved
     by the blanket pre-unit rule regardless of instance aliasing (obj = K())."""
     src = (
-        "class K:\n"
-        "    def m(self):\n"
-        "        return total\n"
+        "def f(items):\n"
+        "    class K:\n"
+        "        def m(self):\n"
+        "            return total\n"
         "\n"
-        "obj = K()\n"
-        "for x in items:\n"
-        "    total = x\n"
-        "    yield x\n"
-        "obj.m()\n"
+        "    obj = K()\n"
+        "    for x in items:\n"
+        "        total = x\n"
+        "        yield x\n"
+        "    obj.m()\n"
     )
-    unit = {"file": "mod.py", "start": 6, "end": 8, "name": "unit", "kind": "compound_block"}
+    unit = {"file": "mod.py", "start": 7, "end": 9, "name": "unit", "kind": "compound_block"}
     reads = collect_downstream_read_names(src, unit, candidates={"total"})
     assert reads is not None
     assert "total" in reads
@@ -1369,19 +1372,20 @@ def test_downstream_reads_class_instance_alias_deferred_read() -> None:
 def test_downstream_reads_pre_unit_closure_redefinition_in_branches() -> None:
     """Verifies that closures redefined across conditional branches merge free variable sets."""
     src = (
-        "if flag:\n"
-        "    def h():\n"
-        "        return total\n"
-        "else:\n"
-        "    def h():\n"
-        "        return other\n"
+        "def f(flag, items):\n"
+        "    if flag:\n"
+        "        def h():\n"
+        "            return total\n"
+        "    else:\n"
+        "        def h():\n"
+        "            return other\n"
         "\n"
-        "for x in items:\n"
-        "    total = x\n"
-        "    yield x\n"
-        "h()\n"
+        "    for x in items:\n"
+        "        total = x\n"
+        "        yield x\n"
+        "    h()\n"
     )
-    unit = {"file": "mod.py", "start": 8, "end": 10, "name": "unit", "kind": "compound_block"}
+    unit = {"file": "mod.py", "start": 9, "end": 11, "name": "unit", "kind": "compound_block"}
     reads = collect_downstream_read_names(src, unit, candidates={"total", "other"})
     assert reads is not None
     assert "total" in reads
@@ -1391,16 +1395,17 @@ def test_downstream_reads_escaping_closure_registered_before_unit() -> None:
     """Verifies that pre-unit closures capturing candidate variables are treated as live
     even when invoked indirectly through pre-registered handlers."""
     src = (
-        "def cb():\n"
-        "    return total\n"
+        "def f(items):\n"
+        "    def cb():\n"
+        "        return total\n"
         "\n"
-        "register(cb)\n"
-        "for x in items:\n"
-        "    total = x\n"
-        "    yield x\n"
-        "fire()\n"
+        "    register(cb)\n"
+        "    for x in items:\n"
+        "        total = x\n"
+        "        yield x\n"
+        "    fire()\n"
     )
-    unit = {"file": "mod.py", "start": 5, "end": 7, "name": "unit", "kind": "compound_block"}
+    unit = {"file": "mod.py", "start": 6, "end": 8, "name": "unit", "kind": "compound_block"}
     reads = collect_downstream_read_names(src, unit, candidates={"total"})
     assert reads is not None
     assert "total" in reads
@@ -1410,14 +1415,15 @@ def test_downstream_reads_compound_statement_lambda_after_unit_not_pre_captured(
     """Verifies that lambdas occurring after u_start inside an enclosing compound statement
     are not prematurely captured into pre_unit_captured_reads."""
     src = (
-        "if condition:\n"
-        "    a = 1\n"
-        "    for x in items:\n"
-        "        fn = lambda: total\n"
-        "        total = x * 2\n"
-        "        yield x\n"
+        "def f(condition, items):\n"
+        "    if condition:\n"
+        "        a = 1\n"
+        "        for x in items:\n"
+        "            fn = lambda: total\n"
+        "            total = x * 2\n"
+        "            yield x\n"
     )
-    unit = {"file": "mod.py", "start": 3, "end": 6, "name": "unit", "kind": "compound_block"}
+    unit = {"file": "mod.py", "start": 4, "end": 7, "name": "unit", "kind": "compound_block"}
     reads = collect_downstream_read_names(src, unit, candidates={"total"})
     assert reads is not None
     assert "total" not in reads
@@ -1473,11 +1479,13 @@ def test_extract_nested_scope_free_reads_class_assigned_nonlocal() -> None:
     """Verifies that _extract_nested_scope_free_reads unions assigned nonlocal variables
     in class bodies into escaped free reads for parity with function scopes."""
     code = (
-        "class C:\n"
-        "    nonlocal captured_var\n"
-        "    captured_var = 42\n"
+        "def outer():\n"
+        "    captured_var = 0\n"
+        "    class C:\n"
+        "        nonlocal captured_var\n"
+        "        captured_var = 42\n"
     )
-    class_node = ast.parse(code).body[0]
+    class_node = ast.parse(code).body[0].body[1]  # type: ignore[attr-defined]
     assert isinstance(class_node, ast.ClassDef)
     free_reads = _extract_nested_scope_free_reads(class_node)
     assert "captured_var" in free_reads
@@ -1826,23 +1834,25 @@ def test_resolve_clone_generator_subroutine_outputs_inverted_and_zero_coords() -
     """Verifies that resolve_clone_generator_subroutine_outputs safely clamps inverted
     or zero coordinates when inspecting enclosing try cleanup."""
     code1 = (
-        "try:\n"
-        "    for x in range(10):\n"
-        "        yield x\n"
-        "finally:\n"
-        "    cleanup = total\n"
+        "def gen1():\n"
+        "    try:\n"
+        "        for x in range(10):\n"
+        "            yield x\n"
+        "    finally:\n"
+        "        cleanup = total\n"
     )
     code2 = (
-        "try:\n"
-        "    for y in range(10):\n"
-        "        yield y\n"
-        "finally:\n"
-        "    cleanup = count\n"
+        "def gen2():\n"
+        "    try:\n"
+        "        for y in range(10):\n"
+        "            yield y\n"
+        "    finally:\n"
+        "        cleanup = count\n"
     )
     u1 = {
         "file": "mod1.py",
-        "start": 3,
-        "end": 2,
+        "start": 4,
+        "end": 3,
         "source_text": code1,
         "outputs": ["total"],
     }
@@ -2366,24 +2376,26 @@ def test_resolve_clone_generator_subroutine_outputs_side2_zero_coords_rejected()
     """Verifies that resolve_clone_generator_subroutine_outputs rejects when side 1 has clean
     coordinates but side 2 has (0, 0) coordinates."""
     code1 = (
-        "try:\n"
-        "    for x in range(10):\n"
-        "        yield x\n"
-        "finally:\n"
-        "    cleanup = total\n"
+        "def gen1():\n"
+        "    try:\n"
+        "        for x in range(10):\n"
+        "            yield x\n"
+        "    finally:\n"
+        "        cleanup = total\n"
     )
     code2 = (
-        "try:\n"
-        "    for y in range(10):\n"
-        "        yield y\n"
-        "finally:\n"
-        "    cleanup = count\n"
+        "def gen2():\n"
+        "    try:\n"
+        "        for y in range(10):\n"
+        "            yield y\n"
+        "    finally:\n"
+        "        cleanup = count\n"
     )
-    # Side 1 is clean and valid (lines 2-3)
+    # Side 1 is clean and valid (lines 3-4)
     u1 = {
         "file": "mod1.py",
-        "start": 2,
-        "end": 3,
+        "start": 3,
+        "end": 4,
         "source_text": code1,
         "outputs": ["total"],
     }

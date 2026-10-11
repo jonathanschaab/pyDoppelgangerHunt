@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 import difflib
 import re
-import textwrap
 import typing
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -35,6 +34,7 @@ from pydoppelgangerhunt.fixer.source import (
     _detect_indent_step,
     _extract_unit_body_lines,
     _slice_unit_token_lines,
+    dedent_source_text,
     extract_unit_comments_and_pragmas,
     split_source_lines,
 )
@@ -1111,7 +1111,7 @@ def synthesize_shared_helper_code(
     # Dedent common_lines first so relative block indentation is normalized
     common_lines = [
         ln.rstrip("\r\n")
-        for ln in split_source_lines(textwrap.dedent("\n".join(common_lines)))
+        for ln in split_source_lines(dedent_source_text("\n".join(common_lines)))
     ]
 
     # Prepend scope modifiers and conditional variable initializations to preserve runtime safety
@@ -1137,12 +1137,19 @@ def synthesize_shared_helper_code(
         for ln in common_lines[-3:]
     )
     if u1.get("kind") in ("comprehension", "complex_expr"):
-        if len(common_lines) == 1:
-            common_lines = [f"return {common_lines[0].strip()}"]
-        else:
-            eff_step = step or _detect_indent_step(indent)
-            expr_inner = [f"{eff_step}{ln}" for ln in common_lines]
-            common_lines = ["return ("] + expr_inner + [")"]
+        if not has_trailing_return:
+            if len(common_lines) == 1:
+                first_expr = common_lines[0].strip()
+                m_assign = re.match(
+                    r"^[a-zA-Z_]\w*(?:\s*:\s*[^=]+)?\s*=\s*(.+)$", first_expr
+                )
+                if m_assign:
+                    first_expr = m_assign.group(1).strip()
+                common_lines = [f"return {first_expr}"]
+            else:
+                eff_step = step or _detect_indent_step(indent)
+                expr_inner = [f"{eff_step}{ln}" for ln in common_lines]
+                common_lines = ["return ("] + expr_inner + [")"]
         helper_outputs = []
     elif not has_trailing_return and helper_outputs and not (bool(scope.get("has_yield")) and is_async):
         if len(helper_outputs) >= 2:
@@ -1177,7 +1184,15 @@ def synthesize_shared_helper_code(
         await_prefix=await_prefix,
     )
 
-    indented_body = "\n".join(f"{body_indent}{ln}" if ln.strip() else "" for ln in common_lines)
+    indented_body_parts: List[str] = []
+    for ln in common_lines:
+        if not ln.strip():
+            indented_body_parts.append("")
+        elif ln.startswith("\x0c"):
+            indented_body_parts.append(f"\x0c{body_indent}{ln[1:]}")
+        else:
+            indented_body_parts.append(f"{body_indent}{ln}")
+    indented_body = "\n".join(indented_body_parts)
     if effective_binding == "method":
         if is_class_receiver:
             dec_prefix = f"{indent}@classmethod\n"
@@ -1194,6 +1209,14 @@ def synthesize_shared_helper_code(
         f"{indented_body}\n"
     )
 
+    hazards = scope.get("control_flow_hazards", [])
+    has_naked_ctrl = any(h in ("naked_break", "naked_continue") for h in hazards)
+    if not has_naked_ctrl:
+        try:
+            compile(dedent_source_text(helper_def), "<synthesized_helper>", "exec")
+        except (SyntaxError, ValueError):
+            return ""
+
     if include_imports:
         needed_typing = _extract_required_typing_imports(helper_def)
         import_header_parts: List[str] = []
@@ -1203,6 +1226,14 @@ def synthesize_shared_helper_code(
             if loc_imp not in import_header_parts:
                 import_header_parts.append(loc_imp)
         if import_header_parts:
-            return "\n".join(import_header_parts) + "\n\n\n" + helper_def
+            combined = "\n".join(import_header_parts) + "\n\n\n" + helper_def
+            try:
+                if not indent:
+                    compile(dedent_source_text(combined), "<synthesized_helper>", "exec")
+                else:
+                    compile("\n".join(import_header_parts), "<synthesized_imports>", "exec")
+            except (SyntaxError, ValueError):
+                return ""
+            return combined
 
     return helper_def

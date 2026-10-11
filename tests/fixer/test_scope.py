@@ -252,16 +252,24 @@ def test_global_and_nonlocal_scope_preservation(tmp_path: Path) -> None:
     from pydoppelgangerhunt.fixer import analyze_unit_variable_scope, synthesize_shared_helper_code  # pylint: disable=import-outside-toplevel
 
     code = (
-        "def outer():\n"
-        "    global global_metric\n"
-        "    nonlocal captured_scale\n"
-        "    global_metric += 1\n"
-        "    captured_scale *= 2\n"
+        "def enclosing():\n"
+        "    captured_scale = 1\n"
+        "    def outer():\n"
+        "        global global_metric\n"
+        "        nonlocal captured_scale\n"
+        "        global_metric += 1\n"
+        "        captured_scale *= 2\n"
     )
     src_file = tmp_path / "scope_mod_src.py"
     src_file.write_text(code, encoding="utf-8")
 
-    u_scope = {"file": str(src_file), "start": 2, "end": 5, "name": "outer:compound", "kind": "compound_block"}
+    u_scope = {
+        "file": str(src_file),
+        "start": 4,
+        "end": 7,
+        "name": "outer:compound",
+        "kind": "compound_block",
+    }
     scope = analyze_unit_variable_scope(u_scope, repo_root=str(tmp_path))
     assert "global_metric" in scope["globals"]
     assert "captured_scale" in scope["nonlocals"]
@@ -1150,9 +1158,9 @@ def test_subroutine_with_local_function_scope_isolation(tmp_path: Path) -> None:
 
 def test_with_block_unconditional_termination_and_deletion() -> None:
     """Verifies that terminating with blocks are recognized and deleted names in with blocks are discarded."""
-    term_code = "with lock:\n    return val\nx = 1\n"
+    term_code = "def f():\n    with lock:\n        return val\n    x = 1\n"
     tree_term = ast.parse(term_code)
-    assert _block_terminates(tree_term.body) is True
+    assert _block_terminates(tree_term.body[0].body) is True  # type: ignore[attr-defined]
 
     del_code = "x = 1\nwith lock:\n    del x\n"
     tree_del = ast.parse(del_code)
@@ -1609,13 +1617,28 @@ def test_generator_expression_yield_does_not_set_yield_assignment() -> None:
         _ScopeVisitor,
     )
 
+    # Directly construct synthetic AST node to verify resilience against partial/injected ASTs
+    gen_node = ast.Assign(
+        targets=[ast.Name(id="g", ctx=ast.Store())],
+        value=ast.GeneratorExp(
+            elt=ast.Yield(value=ast.Constant(value=42)),
+            generators=[
+                ast.comprehension(
+                    target=ast.Name(id="i", ctx=ast.Store()),
+                    iter=ast.List(elts=[], ctx=ast.Load()),
+                    ifs=[],
+                    is_async=0,
+                )
+            ],
+        ),
+    )
     visitor = _ScopeVisitor()
-    tree = ast.parse("g = ((yield 42) for i in [])\nx = yield 100\n")
-    visitor.visit(tree.body[0])
+    visitor.visit(gen_node)
     assert visitor.has_yield_assignment is False
 
     visitor_assign = _ScopeVisitor()
-    visitor_assign.visit(tree.body[1])
+    tree_assign = ast.parse("def f():\n    x = yield 100\n")
+    visitor_assign.visit(tree_assign.body[0].body[0])  # type: ignore[attr-defined]
     assert visitor_assign.has_yield_assignment is True
 
 

@@ -8,6 +8,7 @@ import logging
 import shutil
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from unittest import mock
@@ -37,6 +38,26 @@ from pydoppelgangerhunt.fixer.depgraph import build_module_graph
 requires_git = pytest.mark.skipif(
     shutil.which("git") is None, reason="git CLI not available"
 )
+
+
+def assert_valid_python(source: str, mode: str = "exec") -> None:
+    """Verifies that source is both syntactically and semantically valid Python."""
+    cleaned = textwrap.dedent(source)
+    try:
+        compile(cleaned, filename="<synthesized_helper>", mode=mode)
+    except IndentationError:
+        lines = source.splitlines(keepends=True)
+        import_lines = [ln for ln in lines if ln.startswith(("import ", "from "))]
+        other_lines = [ln for ln in lines if not ln.startswith(("import ", "from "))]
+        if import_lines and other_lines:
+            compile("".join(import_lines), filename="<synthesized_imports>", mode=mode)
+            compile(
+                textwrap.dedent("".join(other_lines)),
+                filename="<synthesized_helper>",
+                mode=mode,
+            )
+            return
+        raise
 
 
 def test_audit_tests_parametrize_candidate_detection(tmp_path: Path) -> None:
@@ -731,6 +752,7 @@ def test_build_whole_method_delegation_single_line_function() -> None:
     res = _build_whole_method_delegation(code, unit, "", "_shared_add", "x, y")
     assert "def add(x: int, y: int) -> int:\n" in res
     assert "return _shared_add(x, y)" in res
+    assert_valid_python(res)
     parsed = ast.parse(res)
     assert len(parsed.body) == 1
     assert isinstance(parsed.body[0], ast.FunctionDef)
@@ -743,6 +765,7 @@ def test_build_whole_method_delegation_decorated_single_line() -> None:
     assert "@decorator\n" in res
     assert "def compute(x: int) -> int:\n" in res
     assert "return _shared_compute(x)" in res
+    assert_valid_python(res)
     parsed = ast.parse(res)
     assert len(parsed.body) == 1
     fn_def = parsed.body[0]
@@ -1549,6 +1572,7 @@ def test_batch_83_generator_subunit_terminal_return_syntax() -> None:
     )
 
     assert "return (yield from _shared_gen(items))" in call_code
+    assert_valid_python(f"def wrapper():\n    {call_code}\n")
     parsed = ast.parse(f"def wrapper():\n    {call_code}\n")
     assert isinstance(parsed, ast.Module)
 
@@ -5552,7 +5576,7 @@ def test_refactor_module_units_descending_offset_shuffled_order() -> None:
         "    return 30\n"
     )
     assert result == expected
-    assert ast.parse(result)
+    assert_valid_python(result)
 
 
 def test_refactor_module_units_same_line_multiline_expansion_no_drift() -> None:
@@ -5589,7 +5613,7 @@ def test_refactor_module_units_same_line_multiline_expansion_no_drift() -> None:
         ")\n"
     )
     assert refactored == expected
-    assert ast.parse(refactored)
+    assert_valid_python(refactored)
 
 
 def test_refactor_module_units_touching_line_boundaries_no_drift() -> None:
@@ -5639,7 +5663,7 @@ def test_refactor_module_units_touching_line_boundaries_no_drift() -> None:
         ")\n"
     )
     assert refactored == expected
-    assert ast.parse(refactored)
+    assert_valid_python(refactored)
 
 
 def test_refactor_module_units_unicode_multibyte_source_code() -> None:
@@ -5680,7 +5704,7 @@ def test_refactor_module_units_unicode_multibyte_source_code() -> None:
     assert "process_status(status)" in refactored
     assert "\U0001F680" in refactored
     assert "\U0001F31F" in refactored
-    assert ast.parse(refactored)
+    assert_valid_python(refactored)
 
 
 def test_adjust_line_for_replacements_exact_parity() -> None:
@@ -5885,7 +5909,7 @@ def test_column_bounded_replacement_preserves_suffix_and_pragma() -> None:
     u_call = {"file": "test_mod.py", "start": 1, "end": 1, "start_col": 9, "end_col": 25, "kind": "complex_expr"}
     refactored1 = replace_unit_in_source(source1, u_call, "shared_call()")
     assert refactored1 == "result = shared_call() + other_expression  # type: ignore\n"
-    assert ast.parse(refactored1)
+    assert_valid_python(refactored1)
 
     # Case 2: compute_unit_replacement_span with boundary pragma attached to unit on line with trailing code
     source2 = "val = calculate() + offset  # type: ignore\n"
@@ -5893,14 +5917,14 @@ def test_column_bounded_replacement_preserves_suffix_and_pragma() -> None:
     s_c, e_c, final_rep = compute_unit_replacement_span(source2, u_calc, "new_calc()", preserve_boundary_pragmas=True)
     assembled = source2[:s_c] + final_rep + source2[e_c:]
     assert assembled == "val = new_calc() + offset  # type: ignore\n"
-    assert ast.parse(assembled)
+    assert_valid_python(assembled)
 
     # Case 3: Trailing code without terminal newline at EOF
     source3 = "out = compute_val() + 10  # noqa"
     u_comp = {"file": "test_mod.py", "start": 1, "end": 1, "start_col": 6, "end_col": 19, "kind": "complex_expr"}
     refactored3 = replace_unit_in_source(source3, u_comp, "fast_val()")
     assert refactored3 == "out = fast_val() + 10  # noqa"
-    assert ast.parse(refactored3)
+    assert_valid_python(refactored3)
 
     # Case 4: Attached boundary pragma (# type: ignore) on multi-line unit with different pragma in suffix (# noqa)
     source4 = "res = calculate(  # type: ignore\n    data\n)  # noqa: E501\n"
@@ -5909,7 +5933,7 @@ def test_column_bounded_replacement_preserves_suffix_and_pragma() -> None:
     assert item4.consumes_line_suffix is True
     refactored4 = replace_unit_in_source(source4, u_multi, "fast_calc(data)", preserve_boundary_pragmas=True)
     assert refactored4 == "res = fast_calc(data)  # noqa: E501  # type: ignore\n"
-    assert ast.parse(refactored4)
+    assert_valid_python(refactored4)
 
     # Case 5: Attached boundary pragma on multi-line unit with regular comment in suffix
     source5 = "res = calculate(  # type: ignore\n    data\n)  # compute offset\n"
@@ -5917,7 +5941,7 @@ def test_column_bounded_replacement_preserves_suffix_and_pragma() -> None:
     assert item5.consumes_line_suffix is True
     refactored5 = replace_unit_in_source(source5, u_multi, "fast_calc(data)", preserve_boundary_pragmas=True)
     assert refactored5 == "res = fast_calc(data)  # compute offset  # type: ignore\n"
-    assert ast.parse(refactored5)
+    assert_valid_python(refactored5)
 
 
 def test_refactor_module_units_same_line_emoji_prefix_replacement() -> None:
@@ -5939,7 +5963,7 @@ def test_refactor_module_units_same_line_emoji_prefix_replacement() -> None:
     }
     refactored_emoji = refactor_module_units(emoji_source, [(u_comp, "helper(data)")])
     assert refactored_emoji == "prefix = '🚀'; value = helper(data)\n"
-    assert ast.parse(refactored_emoji)
+    assert_valid_python(refactored_emoji)
 
     # Multiple multi-byte characters and trailing statements
     multi_emoji_source = "tag = '🎉✨🔥'; items = [i * 2 for i in raw_items]; done = True\n"
@@ -5955,7 +5979,7 @@ def test_refactor_module_units_same_line_emoji_prefix_replacement() -> None:
     }
     refactored_multi = refactor_module_units(multi_emoji_source, [(u_comp2, "transform(raw_items)")])
     assert refactored_multi == "tag = '🎉✨🔥'; items = transform(raw_items); done = True\n"
-    assert ast.parse(refactored_multi)
+    assert_valid_python(refactored_multi)
 
 
 def test_dual_tier_overlap_conservative_missing_column_rejection() -> None:
@@ -6884,18 +6908,19 @@ def test_column_bounded_replacement_no_double_newline_on_clean_line_end() -> Non
     from pydoppelgangerhunt.fixer import refactor_module_units
 
     code_buffer = (
-        "# type: ignore\n"
-        "result = [e * 2 for e in elements]\n"
-        "return result\n"
+        "def compute(elements):\n"
+        "    # type: ignore\n"
+        "    result = [e * 2 for e in elements]\n"
+        "    return result\n"
     )
-    # Unit covering line 1 to line 2 with clean line end on line 2
+    # Unit covering line 2 to line 3 with clean line end on line 3
     expr_unit = {
         "file": "calc.py",
         "name": "comp_expr",
-        "start": 1,
-        "end": 2,
-        "start_col": 0,
-        "end_col": 34,
+        "start": 2,
+        "end": 3,
+        "start_col": 4,
+        "end_col": 38,
         "kind": "comprehension",
     }
     # Replacement string ending in newline (e.g. from helper or multi-line expansion)
@@ -6904,7 +6929,12 @@ def test_column_bounded_replacement_no_double_newline_on_clean_line_end() -> Non
 
     # Must contain single newline, not double newline (\n\n) before 'return result'
     assert "\n\n" not in repaired_code
-    assert repaired_code == "transform_elements(elements)  # type: ignore\nreturn result\n"
+    assert repaired_code == (
+        "def compute(elements):\n"
+        "    transform_elements(elements)  # type: ignore\n"
+        "    return result\n"
+    )
+    assert_valid_python(repaired_code)
 
 
 def test_check_units_overlap_inverted_line_ranges_are_disjoint() -> None:
@@ -8184,29 +8214,38 @@ def test_generate_refactoring_patch_sync_generator_unequal_output_counts_rejecte
     assert patch == ""
 
 
-def test_generate_refactoring_patch_async_generator_with_return_rejected(tmp_path: Path) -> None:
-    """Verifies that clone pairs of async generators with return statements are rejected without creating invalid patches."""
+def test_generate_refactoring_patch_async_generator_try_cleanup_rejected(tmp_path: Path) -> None:
+    """Verifies that clone pairs of async generators with cleanup blocks are rejected."""
     src1 = (
         "async def agen1(items: list[int]):\n"
-        "    for x in items:\n"
-        "        yield x\n"
-        "    return 42\n"
+        "    try:\n"
+        "        for x in items:\n"
+        "            yield x\n"
+        "    finally:\n"
+        "        pass\n"
     )
     src2 = (
         "async def agen2(items: list[int]):\n"
-        "    for x in items:\n"
-        "        yield x\n"
-        "    return 42\n"
+        "    try:\n"
+        "        for x in items:\n"
+        "            yield x\n"
+        "    finally:\n"
+        "        pass\n"
     )
     f1 = tmp_path / "as1.py"
     f2 = tmp_path / "as2.py"
     f1.write_text(src1, encoding="utf-8")
     f2.write_text(src2, encoding="utf-8")
 
-    u1 = {"file": str(f1), "start": 1, "end": 4, "name": "agen1", "kind": "function"}
-    u2 = {"file": str(f2), "start": 1, "end": 4, "name": "agen2", "kind": "function"}
+    assert_valid_python(src1)
+    assert_valid_python(src2)
 
-    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    u1 = {"file": str(f1), "start": 1, "end": 6, "name": "agen1", "kind": "function"}
+    u2 = {"file": str(f2), "start": 1, "end": 6, "name": "agen2", "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
     assert patch == ""
 
 
@@ -8324,15 +8363,17 @@ def test_generate_refactoring_patch_sync_generator_classdef_downstream_execution
     assert after_proc.stdout == before_proc.stdout
 
 
-def test_generate_refactoring_patch_async_generator_with_downstream_outputs_rejected(tmp_path: Path) -> None:
-    """Verifies that async generator clones requiring downstream outputs are rejected to prevent lost bindings."""
+def test_generate_refactoring_patch_async_generator_with_downstream_outputs_rejected(
+    tmp_path: Path,
+) -> None:
+    """Verifies that async generator clones requiring downstream outputs are rejected."""
     src1 = (
         "async def af1(items: list[int]):\n"
         "    total = 0\n"
         "    for x in items:\n"
         "        total += x\n"
         "        yield x\n"
-        "    return total\n"
+        "    print(total)\n"
     )
     src2 = (
         "async def af2(items: list[int]):\n"
@@ -8340,17 +8381,28 @@ def test_generate_refactoring_patch_async_generator_with_downstream_outputs_reje
         "    for x in items:\n"
         "        count += x\n"
         "        yield x\n"
-        "    return count\n"
+        "    print(count)\n"
     )
     f1 = tmp_path / "ag_out1.py"
     f2 = tmp_path / "ag_out2.py"
     f1.write_text(src1, encoding="utf-8")
     f2.write_text(src2, encoding="utf-8")
 
-    u1 = {"file": str(f1), "start": 2, "end": 5, "name": "af1:for", "kind": "compound_block", "is_async": True}
-    u2 = {"file": str(f2), "start": 2, "end": 5, "name": "af2:for", "kind": "compound_block", "is_async": True}
+    assert_valid_python(src1)
+    assert_valid_python(src2)
 
-    patch = generate_refactoring_patch([(0.90, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    u1 = {
+        "file": str(f1), "start": 2, "end": 5,
+        "name": "af1:for", "kind": "compound_block", "is_async": True,
+    }
+    u2 = {
+        "file": str(f2), "start": 2, "end": 5,
+        "name": "af2:for", "kind": "compound_block", "is_async": True,
+    }
+
+    patch = generate_refactoring_patch(
+        [(0.90, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
     assert patch == ""
 
 

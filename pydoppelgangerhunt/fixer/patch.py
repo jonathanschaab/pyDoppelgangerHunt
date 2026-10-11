@@ -67,6 +67,7 @@ from pydoppelgangerhunt.fixer.source import (
     _scan_sig_line,
     compute_line_offsets,
     count_physical_newlines,
+    dedent_source_text,
     detect_line_ending,
     is_subroutine_unit,
     is_valid_unit_coordinates,
@@ -3259,6 +3260,11 @@ def generate_refactoring_patch(
                 outputs2=target_outs2,
             )
             if not helper_code:
+                skip_reasons["shared helper synthesis failed"] += 1
+                continue
+            try:
+                compile(dedent_source_text(helper_code), "<patch>", "exec")
+            except (SyntaxError, ValueError):
                 skip_reasons["shared helper synthesis failed"] += 1
                 continue
 

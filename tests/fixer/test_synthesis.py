@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import sys
+import textwrap
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
@@ -32,6 +33,7 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
 from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
     _extract_nested_scope_free_reads,
     collect_downstream_read_names,
+    has_async_generator_delegation_hazard,
 )
 from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=protected-access
     _inspect_unit_scope,
@@ -43,6 +45,26 @@ from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-ac
     _split_type_args,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
+
+
+def assert_valid_python(source: str, mode: str = "exec") -> None:
+    """Verifies that source is both syntactically and semantically valid Python."""
+    cleaned = textwrap.dedent(source)
+    try:
+        compile(cleaned, filename="<synthesized_helper>", mode=mode)
+    except IndentationError:
+        lines = source.splitlines(keepends=True)
+        import_lines = [ln for ln in lines if ln.startswith(("import ", "from "))]
+        other_lines = [ln for ln in lines if not ln.startswith(("import ", "from "))]
+        if import_lines and other_lines:
+            compile("".join(import_lines), filename="<synthesized_imports>", mode=mode)
+            compile(
+                textwrap.dedent("".join(other_lines)),
+                filename="<synthesized_helper>",
+                mode=mode,
+            )
+            return
+        raise
 
 
 def test_generate_clone_diff_and_refactoring_suggestions(tmp_path: Path) -> None:
@@ -617,8 +639,9 @@ def test_format_call_arguments_vararg_kwarg_ordering() -> None:
     ]
     args_str = _format_call_arguments(inputs, param_details, receiver_to_omit="self")
     assert args_str == "extra_pos, *args, **kwargs"
-    # Ensure it parses cleanly without SyntaxError: positional argument follows keyword argument unpacking
-    ast.parse(f"call({args_str})")
+    # Ensure it compiles cleanly without SyntaxError: positional argument follows keyword
+    # argument unpacking
+    assert_valid_python(f"call({args_str})")
 
 
 def test_synthesize_shared_helper_code_body_typing_imports(tmp_path: Path) -> None:
@@ -1354,23 +1377,39 @@ def test_infer_helper_return_type_sync_generator_with_outputs_and_return() -> No
 
 def test_async_generator_with_return_rejected_in_synthesis(tmp_path: Path) -> None:
     """Verifies that synthesize_shared_helper_code rejects async generators with return value but accepts bare return."""
-    # 1. Async generator with return <value> must be rejected
+    # 1. Async generator subroutine with downstream outputs cannot return values from helper
     code_val = (
         "async def agen_returns(items: list[int]):\n"
+        "    total = 0\n"
         "    for x in items:\n"
+        "        total += x\n"
         "        yield x\n"
-        "    return 42\n"
+        "    print(total)\n"
     )
     f1 = tmp_path / "ao1.py"
     f2 = tmp_path / "ao2.py"
     f1.write_text(code_val, encoding="utf-8")
     f2.write_text(code_val, encoding="utf-8")
 
-    u1 = {"file": "ao1.py", "start": 1, "end": 4, "name": "agen_returns", "kind": "function", "is_async": True}
-    u2 = {"file": "ao2.py", "start": 1, "end": 4, "name": "agen_returns", "kind": "function", "is_async": True}
+    u1 = {
+        "file": "ao1.py", "start": 3, "end": 5,
+        "name": "agen_returns:for", "kind": "compound_block",
+    }
+    u2 = {
+        "file": "ao2.py", "start": 3, "end": 5,
+        "name": "agen_returns:for", "kind": "compound_block",
+    }
 
     helper_val = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert helper_val == ""
+
+    # Direct verification that async generators with return value trigger delegation hazard
+    assert (
+        has_async_generator_delegation_hazard(
+            {"is_async": True, "has_yield": True, "has_return_value": True}
+        )
+        is True
+    )
 
     # 2. Async generator with bare return (no value) is valid Python (PEP 525) and should be synthesized
     code_bare = (
@@ -1390,6 +1429,7 @@ def test_async_generator_with_return_rejected_in_synthesis(tmp_path: Path) -> No
 
     helper_bare = synthesize_shared_helper_code(u3, u4, repo_root=str(tmp_path))
     assert helper_bare != ""
+    assert_valid_python(helper_bare)
     assert "async def" in helper_bare
     assert "-> AsyncIterator[" in helper_bare
 
@@ -1426,7 +1466,7 @@ def test_patch_subroutine_is_async_propagation(tmp_path: Path) -> None:
         "    for x in items:\n"
         "        total += x\n"
         "        yield x\n"
-        "    return total\n"
+        "    print(total)\n"
     )
     code2 = (
         "async def process_data_alt(items):\n"
@@ -1434,7 +1474,7 @@ def test_patch_subroutine_is_async_propagation(tmp_path: Path) -> None:
         "    for x in items:\n"
         "        total += x\n"
         "        yield x\n"
-        "    return total\n"
+        "    print(total)\n"
     )
     f1 = tmp_path / "proc1.py"
     f2 = tmp_path / "proc2.py"
@@ -2635,27 +2675,33 @@ def test_node_is_effectively_async_scope_pruning() -> None:
 
     # Direct await inside the block IS async
     code_direct_await = (
-        "if cond:\n"
-        "    await something()\n"
+        "async def wrapper():\n"
+        "    if cond:\n"
+        "        await something()\n"
     )
     tree_direct = ast.parse(code_direct_await)
-    assert _node_is_effectively_async(tree_direct.body[0], enclosing_is_async=False)
+    assert isinstance(tree_direct.body[0], ast.AsyncFunctionDef)
+    assert _node_is_effectively_async(tree_direct.body[0].body[0], enclosing_is_async=False)
 
     # Async list comprehension without explicit await is effectively async
     code_async_comp = (
-        "if cond:\n"
-        "    res = [x async for x in items]\n"
+        "async def wrapper():\n"
+        "    if cond:\n"
+        "        res = [x async for x in items]\n"
     )
     tree_comp = ast.parse(code_async_comp)
-    assert _node_is_effectively_async(tree_comp.body[0], enclosing_is_async=False)
+    assert isinstance(tree_comp.body[0], ast.AsyncFunctionDef)
+    assert _node_is_effectively_async(tree_comp.body[0].body[0], enclosing_is_async=False)
 
     # Async generator comprehension is effectively async
     code_async_gen = (
-        "if cond:\n"
-        "    res = (x async for x in items)\n"
+        "async def wrapper():\n"
+        "    if cond:\n"
+        "        res = (x async for x in items)\n"
     )
     tree_gen = ast.parse(code_async_gen)
-    assert _node_is_effectively_async(tree_gen.body[0], enclosing_is_async=False)
+    assert isinstance(tree_gen.body[0], ast.AsyncFunctionDef)
+    assert _node_is_effectively_async(tree_gen.body[0].body[0], enclosing_is_async=False)
 
 
 def test_parse_candidates_def_precedes_async_def() -> None:

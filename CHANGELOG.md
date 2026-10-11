@@ -52,6 +52,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_scope_reads_outputs_after_line`, and `_enclosing_try_reads_outputs` in `dataflow.py` with column
   offset checks (`u_end_col`), correctly detecting same-line downstream reads in compound or
   semicolon-separated statements (e.g. `with mgr: total = yield x; print(total)`).
+- **Semantic Compilation in Refactoring Pipeline**: Added strict `compile(..., "exec")`
+  semantic validation on synthesized helper bodies within `synthesis.py` and
+  `generate_refactoring_patch` in `patch.py`, failing closed immediately before creating diff
+  hunks if CPython symbol table compilation raises `SyntaxError` or `ValueError`.
+- **Form-Feed Preserving Dedent (`dedent_source_text`)**: Added `dedent_source_text` in
+  `fixer/source.py` ensuring leading form-feed characters (`\x0c`) are preserved without
+  distorting relative block indentation or causing unexpected indentation errors during compilation.
+- **Compiler Validation in Test Assertions (`assert_valid_python`)**: Replaced raw `ast.parse`
+  assertions across fixer test suites with `assert_valid_python`, catching invalid Python
+  constructs deferred by the parser to the bytecode compiler pass.
+- **Fixture Realism Audit Across Test Suites**: Audited and upgraded synthetic unit test
+  fixtures across `tests/fixer/` to eliminate uncompilable source strings (e.g. standalone
+  `yield`/`return` at module level, `return` with value inside `async def` generators).
 
 ### Breaking Changes
 - **Private Line-Splitting Regex (`_PHYSICAL_LINE_RE`)**: Dropped `_PHYSICAL_LINE_RE` from

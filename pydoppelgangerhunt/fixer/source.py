@@ -32,6 +32,7 @@ __all__ = [
     "compute_unit_replacement_span",
     "compute_unit_spans",
     "count_physical_newlines",
+    "dedent_source_text",
     "detect_line_ending",
     "extract_unit_comments_and_pragmas",
     "find_enclosing_function_is_async",
@@ -252,13 +253,24 @@ def _extract_docstring_end_line(tree: ast.AST) -> int:
 _extract_module_docstring_end_line = _extract_docstring_end_line
 
 
+def dedent_source_text(text: str) -> str:
+    """Dedents source text while preserving leading form feed characters."""
+    lines = text.splitlines(keepends=True)
+    if not any(ln.startswith("\x0c") for ln in lines):
+        return textwrap.dedent(text)
+    ff_mask = [ln.startswith("\x0c") for ln in lines]
+    cleaned = "".join(ln[1:] if m else ln for ln, m in zip(lines, ff_mask))
+    dedented_lines = textwrap.dedent(cleaned).splitlines(keepends=True)
+    return "".join("\x0c" + ln if m else ln for ln, m in zip(dedented_lines, ff_mask))
+
+
 def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List[str]:
     """Extracts executable body lines for a unit, stripping function headers and docstrings for whole functions."""
     if unit.get("kind") not in ("function", "closure", "method"):
         return raw_lines
 
     code_block = "\n".join(raw_lines)
-    dedented = textwrap.dedent(code_block)
+    dedented = dedent_source_text(code_block)
     try:
         tree = ast.parse(dedented)
         if len(tree.body) == 1 and isinstance(
@@ -280,7 +292,7 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
                         extracted[0] = extracted[0][b_col:]
                     return [
                         ln.rstrip("\r\n")
-                        for ln in split_source_lines(textwrap.dedent("\n".join(extracted)))
+                        for ln in split_source_lines(dedent_source_text("\n".join(extracted)))
                     ]
     except Exception:
         pass
