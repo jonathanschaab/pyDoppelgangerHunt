@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional, Set, Tuple
 import xml.etree.ElementTree as ET
 
 from pydoppelgangerhunt.config import find_matching_path_value, normalize_path_string
-from pydoppelgangerhunt.source_lines import parse_unit_coord
+from pydoppelgangerhunt.source_lines import resolve_unit_line_bounds
 
 
 def _read_sqlite_coverage(coverage_path: str) -> Dict[str, Set[int]]:
@@ -116,8 +116,7 @@ def compute_unit_coverage(
     if not covered_lines:
         return 0.0
 
-    start = max(1, parse_unit_coord(unit, "start", default=1))
-    end = max(start, parse_unit_coord(unit, "end", default=start))
+    start, end = resolve_unit_line_bounds(unit)
     total_lines = max(1, end - start + 1)
     covered_count = sum(1 for ln in range(start, end + 1) if ln in covered_lines)
     return min(1.0, covered_count / float(total_lines))

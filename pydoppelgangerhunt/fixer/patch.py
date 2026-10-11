@@ -321,8 +321,7 @@ def _format_unit_desc(u: UnitDict) -> Tuple[str, int, int, str]:
     if not isinstance(u, dict):
         raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
     n = str(u.get("name") or "unit")
-    s = max(1, parse_unit_coord(u, "start", default=1))
-    e = max(s, parse_unit_coord(u, "end", default=s))
+    s, e = resolve_unit_line_bounds(u)
     f = normalize_path_string(str(u.get("file") or ""), strip_anchor=False) or "<module>"
     return n, s, e, f
 

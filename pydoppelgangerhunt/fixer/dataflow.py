@@ -1965,7 +1965,12 @@ def _enclosing_try_reads_outputs(
                 target_idx = (
                     same_line_stmts.index(target_stmt)
                     if target_stmt in same_line_stmts
-                    else 0
+                    else -1
+                )
+                post_same_line: Set[ast.AST] = (
+                    set(same_line_stmts[target_idx + 1:])
+                    if target_idx >= 0
+                    else set()
                 )
                 for s in with_body:
                     s_lineno = getattr(s, "lineno", None)
@@ -1978,9 +1983,8 @@ def _enclosing_try_reads_outputs(
                             s_col = getattr(s, "col_offset", None)
                             if s_col is not None and s_col >= int(u_end_col):
                                 post_unit_with_stmts.append(s)
-                        elif len(same_line_stmts) > 1 and s is not target_stmt:
-                            if s in same_line_stmts and same_line_stmts.index(s) > target_idx:
-                                post_unit_with_stmts.append(s)
+                        elif s in post_same_line:
+                            post_unit_with_stmts.append(s)
                 if post_unit_with_stmts and _nodes_load_any_name(post_unit_with_stmts, outputs):
                     return True
 

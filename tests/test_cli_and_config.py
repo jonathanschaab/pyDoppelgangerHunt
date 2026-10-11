@@ -2727,11 +2727,13 @@ def test_cli_closure_strictness_and_skip_closures_flags(tmp_path: Path) -> None:
 
 def test_cli_main_omitted_top_does_not_raise(tmp_path: Path) -> None:
     """Verifies that omitting --top leaves args.top=None without raising TypeError."""
+    from pydoppelgangerhunt.cli import main
+
     repo = tmp_path / "top_test_repo"
     repo.mkdir()
     (repo / "sample.py").write_text("a = 1\n", encoding="utf-8")
     with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[]):
-        exit_code = pydoppelgangerhunt.main([str(repo)])
+        exit_code = main([str(repo)])
         assert exit_code == 0
 
 
