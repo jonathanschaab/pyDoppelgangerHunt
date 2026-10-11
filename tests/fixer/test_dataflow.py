@@ -35,6 +35,7 @@ from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-acc
     _downstream_cache_lock,
     _downstream_reads_cache,
     _enclosing_try_reads_outputs,
+    _execute_read_pass,
     _extract_effective_unit_outputs,
     _extract_nested_scope_free_reads,
     _extract_scope_local_names,
@@ -3952,3 +3953,39 @@ def test_pair_clone_outputs_allow_permuted_outputs() -> None:
         ("x", "y"),
         ("y", "x"),
     ]
+
+
+def test_execute_read_pass_and_collect_closures_scalar_body() -> None:
+    """Verifies that _execute_read_pass and _collect_scope_closures handle expression
+    scopes with scalar bodies defensibly without raising TypeError."""
+    lambda_node = ast.Lambda(
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[ast.arg(arg="x", lineno=1, col_offset=7)],
+            kwonlyargs=[],
+            kw_defaults=[],
+            defaults=[],
+        ),
+        body=ast.Name(id="x", ctx=ast.Load(), lineno=1, col_offset=10),
+        lineno=1,
+        col_offset=0,
+    )
+
+    # 1. _execute_read_pass on lambda node does not raise TypeError
+    reads = _execute_read_pass(
+        lambda_node,
+        _DownstreamReadVisitor,
+        u_start=1,
+        u_end=1,
+        u_end_col=None,
+        candidates={"x"},
+        enclosing_loops=[],
+        pass_mode=_VisitorPassMode.AFTER_UNIT,
+        is_module=False,
+    )
+    assert isinstance(reads, set)
+
+    # 2. _collect_scope_closures on lambda node does not raise TypeError
+    closures = _collect_scope_closures(lambda_node)
+    assert isinstance(closures, list)
+

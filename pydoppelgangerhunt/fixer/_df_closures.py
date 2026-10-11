@@ -174,7 +174,7 @@ def _collect_scope_closures_uncached(
     parent_map = _get_scope_parent_map(scope_node)
     shadowed_names = _extract_scope_local_names(scope_node, module_tree=module_tree)
 
-    def _resolve_stmt_start_pos(s: ast.stmt) -> Tuple[int, int]:
+    def _resolve_stmt_start_pos(s: ast.AST) -> Tuple[int, int]:
         s_line = int(getattr(s, "lineno", 0) or 0)
         s_col = int(getattr(s, "col_offset", 0) or 0)
         decs = getattr(s, "decorator_list", [])
@@ -216,7 +216,7 @@ def _collect_scope_closures_uncached(
                         )
                     )
 
-    def _extract_header_nodes(s: ast.stmt) -> List[ast.AST]:
+    def _extract_header_nodes(s: ast.AST) -> List[ast.AST]:
         if isinstance(s, ast.If):
             return [s.test]
         if isinstance(s, (ast.For, ast.AsyncFor)):
@@ -242,7 +242,7 @@ def _collect_scope_closures_uncached(
             return headers
         return [s]
 
-    def _walk_stmts(stmts: Iterable[ast.stmt]) -> None:
+    def _walk_stmts(stmts: Iterable[ast.AST]) -> None:
         for stmt in stmts:
             stmt_start, stmt_col = _resolve_stmt_start_pos(stmt)
 
@@ -302,7 +302,13 @@ def _collect_scope_closures_uncached(
             for case in getattr(stmt, "cases", []):
                 _walk_stmts(getattr(case, "body", []))
 
-    _walk_stmts(getattr(scope_node, "body", []))
+    raw_scope_body = getattr(scope_node, "body", [])
+    scope_stmts = (
+        raw_scope_body if isinstance(raw_scope_body, list)
+        else [raw_scope_body] if isinstance(raw_scope_body, ast.AST)
+        else []
+    )
+    _walk_stmts(scope_stmts)
     return closures
 
 

@@ -171,6 +171,16 @@ def _get_scope_try_and_with_blocks(
     return _get_or_compute_scope_cached(_scope_try_with_cache, scope_node, _compute)
 
 
+def _extract_scope_stmts(scope_node: ast.AST) -> List[ast.AST]:
+    """Defensively extracts statements or expression nodes from a scope's body attribute."""
+    raw_body = getattr(scope_node, "body", [])
+    if isinstance(raw_body, list):
+        return raw_body
+    if isinstance(raw_body, ast.AST):
+        return [raw_body]
+    return []
+
+
 def _execute_read_pass(
     scope_node: ast.AST,
     visitor_cls: type,
@@ -192,7 +202,7 @@ def _execute_read_pass(
         pass_mode=pass_mode,
         is_module_scope=is_module,
     )
-    for stmt in getattr(scope_node, "body", []):
+    for stmt in _extract_scope_stmts(scope_node):
         visitor.visit(stmt)
     return set(visitor.loaded)
 
@@ -521,7 +531,8 @@ def collect_downstream_read_names(
         pass_mode=_VisitorPassMode.AFTER_UNIT,
         is_module_scope=is_module,
     )
-    for stmt in getattr(scope_node, "body", []):
+    scope_stmts = _extract_scope_stmts(scope_node)
+    for stmt in scope_stmts:
         visitor.visit(stmt)
 
     loaded = set(visitor.loaded)
@@ -536,7 +547,7 @@ def collect_downstream_read_names(
             pass_mode=_VisitorPassMode.LOOP_CARRIED,
             is_module_scope=is_module,
         )
-        for stmt in getattr(scope_node, "body", []):
+        for stmt in scope_stmts:
             loop_visitor.visit(stmt)
         loaded.update(loop_visitor.loaded)
 

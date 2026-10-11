@@ -40,6 +40,7 @@ from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=protected-access
     inspect_single_unit_scope,
 )
 from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access
+    _format_union_or_optional,
     _infer_outputs_return_type,
     _normalize_pipe_unions,
     _split_type_args,
@@ -2971,5 +2972,83 @@ def test_normalize_pipe_unions_nested_tuple_dict_pipes() -> None:
     assert _normalize_pipe_unions("Tuple[int | str, Dict[str, float | None]]") == (
         "Tuple[Union[int, str], Dict[str, Optional[float]]]"
     )
+
+
+def test_normalize_pipe_unions_redundant_optional() -> None:
+    """Verifies that _format_union_or_optional and _normalize_pipe_unions do not produce
+    redundant nested Optionals like Optional[Optional[int]]."""
+    assert _normalize_pipe_unions("Optional[int] | None") == "Optional[int]"
+    assert _normalize_pipe_unions("typing.Optional[str] | None") == "Optional[str]"
+    assert _normalize_pipe_unions("Optional[int] | str | None") == "Optional[Union[int, str]]"
+    assert _format_union_or_optional(["Optional[int]", "None"]) == "Optional[int]"
+    assert _format_union_or_optional(["typing.Optional[str]", "None"]) == "typing.Optional[str]"
+    assert _format_union_or_optional(
+        ["typing_extensions.Optional[float]", "None"]
+    ) == "typing_extensions.Optional[float]"
+
+
+def test_synthesize_complex_expr_tuple_and_multi_target_unpacking(tmp_path: Path) -> None:
+    """Verifies that complex_expr assignments with tuple unpacking or multiple targets
+    strip targets soundly instead of synthesizing invalid Python like return a, b = ..."""
+    code1 = (
+        "def compute_coords(x, y):\n"
+        "    a, b = get_pair(x, y)\n"
+    )
+    code2 = (
+        "def compute_coords(x, y):\n"
+        "    a, b = get_pair(x, y)\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+    u1 = {
+        "file": "mod1.py",
+        "start": 2,
+        "end": 2,
+        "name": "compute_coords",
+        "kind": "complex_expr",
+    }
+    u2 = {
+        "file": "mod2.py",
+        "start": 2,
+        "end": 2,
+        "name": "compute_coords",
+        "kind": "complex_expr",
+    }
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper != ""
+    assert "return get_pair(x, y)" in helper
+    assert_valid_python(helper)
+
+    # Multi-target assignment: x = y = compute(z)
+    code3 = (
+        "def multi_assign(z):\n"
+        "    x = y = compute(z)\n"
+    )
+    f3 = tmp_path / "mod3.py"
+    f4 = tmp_path / "mod4.py"
+    f3.write_text(code3, encoding="utf-8")
+    f4.write_text(code3, encoding="utf-8")
+    u3 = {
+        "file": "mod3.py",
+        "start": 2,
+        "end": 2,
+        "name": "multi_assign",
+        "kind": "complex_expr",
+    }
+    u4 = {
+        "file": "mod4.py",
+        "start": 2,
+        "end": 2,
+        "name": "multi_assign",
+        "kind": "complex_expr",
+    }
+    helper_multi = synthesize_shared_helper_code(u3, u4, repo_root=str(tmp_path))
+    assert helper_multi != ""
+    assert "return compute(z)" in helper_multi
+    assert_valid_python(helper_multi)
+
 
 

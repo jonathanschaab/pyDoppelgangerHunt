@@ -199,13 +199,19 @@ def _split_pipe_union_args(type_str: str) -> List[str]:
 
 
 def _flatten_union_args(args: Sequence[str]) -> List[str]:
-    """Flattens nested Union and typing.Union parameter types into a flat argument list."""
+    """Flattens nested Union, typing.Union, and Optional parameter types into a
+    flat argument list."""
     flattened: List[str] = []
     for a in args:
         if (
             a.startswith(("Union[", "typing.Union[", "typing_extensions.Union["))
         ) and a.endswith("]"):
             flattened.extend(_split_type_args(a))
+        elif (
+            a.startswith(("Optional[", "typing.Optional[", "typing_extensions.Optional["))
+        ) and a.endswith("]"):
+            flattened.extend(_split_type_args(a))
+            flattened.append("None")
         else:
             flattened.append(a)
     return flattened
@@ -220,7 +226,15 @@ def _format_union_or_optional(unique_parts: List[str]) -> str:
         if not non_none:
             return "None"
         if len(non_none) == 1:
-            return f"Optional[{non_none[0]}]"
+            target = non_none[0]
+            if (
+                target.startswith(
+                    ("Optional[", "typing.Optional[", "typing_extensions.Optional[")
+                )
+                and target.endswith("]")
+            ):
+                return target
+            return f"Optional[{target}]"
         return f"Optional[Union[{', '.join(non_none)}]]"
     if len(unique_parts) == 1:
         return unique_parts[0]
@@ -1149,7 +1163,28 @@ def synthesize_shared_helper_code(
     )
     if u1.get("kind") in ("comprehension", "complex_expr"):
         if not has_trailing_return:
-            if len(common_lines) == 1:
+            full_code = "\n".join(common_lines).strip()
+            stripped_expr: Optional[str] = None
+            try:
+                parsed_body = ast.parse(full_code).body
+                if parsed_body:
+                    stmt_node = parsed_body[0]
+                    if isinstance(stmt_node, ast.Assign):
+                        stripped_expr = ast.unparse(stmt_node.value)
+                    elif isinstance(stmt_node, ast.AnnAssign) and stmt_node.value is not None:
+                        stripped_expr = ast.unparse(stmt_node.value)
+            except (SyntaxError, IndexError):
+                pass
+
+            if stripped_expr is not None:
+                stripped_lines = stripped_expr.splitlines()
+                if len(stripped_lines) == 1:
+                    common_lines = [f"return {stripped_lines[0]}"]
+                else:
+                    eff_step = step or _detect_indent_step(indent)
+                    expr_inner = [f"{eff_step}{ln}" for ln in stripped_lines]
+                    common_lines = ["return ("] + expr_inner + [")"]
+            elif len(common_lines) == 1:
                 first_expr = common_lines[0].strip()
                 m_assign = re.match(
                     r"^[a-zA-Z_]\w*(?:\s*:\s*[^=]+)?\s*(?<![=<>!:])=(?!=)\s*(.+)$",
@@ -1163,7 +1198,11 @@ def synthesize_shared_helper_code(
                 expr_inner = [f"{eff_step}{ln}" for ln in common_lines]
                 common_lines = ["return ("] + expr_inner + [")"]
         helper_outputs = []
-    elif not has_trailing_return and helper_outputs and not (bool(scope.get("has_yield")) and is_async):
+    elif (
+        not has_trailing_return
+        and helper_outputs
+        and not (bool(scope.get("has_yield")) and is_async)
+    ):
         if len(helper_outputs) >= 2:
             common_lines = common_lines + [f"return {', '.join(helper_outputs)}"]
         else:
