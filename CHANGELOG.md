@@ -48,6 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in `_is_eagerly_consumed_genexp` before classifying it as consumed by eager built-ins or `.join`.
 - **In-Memory Fallback for Virtual Units**: Added secondary in-memory source line fallback in
   `_load_unit_file_text` for synthetic or test units lacking disk presence.
+- **Column-Aware Semicolon Statement Boundaries**: Extended `_StrictPostLineVisitor`,
+  `_scope_reads_outputs_after_line`, and `_enclosing_try_reads_outputs` in `dataflow.py` with column
+  offset checks (`u_end_col`), correctly detecting same-line downstream reads in compound or
+  semicolon-separated statements (e.g. `with mgr: total = yield x; print(total)`).
 
 ### Breaking Changes
 - **Private Line-Splitting Regex (`_PHYSICAL_LINE_RE`)**: Dropped `_PHYSICAL_LINE_RE` from

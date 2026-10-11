@@ -2220,6 +2220,34 @@ def test_scope_reads_outputs_after_line_boundary_precision() -> None:
     assert _scope_reads_outputs_after_line(func_node_with_post, 4, {"total"})
 
 
+def test_scope_reads_outputs_after_line_same_line_semicolon() -> None:
+    """Verifies that _scope_reads_outputs_after_line flags same-line reads when end_col provided."""
+    code = (
+        "def run():\n"
+        "    with mgr: total = yield x; print(total)\n"
+    )
+    tree = ast.parse(code)
+    func_node = tree.body[0]
+    # Unit 'total = yield x' ends at col 29 on line 2
+    # With end_col=29, print(total) starting at col 31 MUST be detected
+    assert _scope_reads_outputs_after_line(func_node, 2, {"total"}, end_col=29)
+
+    # Without end_col, reads on line 2 itself are not treated as post-line
+    assert not _scope_reads_outputs_after_line(func_node, 2, {"total"})
+
+
+def test_enclosing_try_reads_outputs_same_line_with_semicolon() -> None:
+    """Verifies that _enclosing_try_reads_outputs detects same-line reads in with body."""
+    code = (
+        "def run():\n"
+        "    with mgr: total = yield x; print(total)\n"
+    )
+    tree = ast.parse(code)
+    func_node = tree.body[0]
+    # Unit 'total = yield x' on line 2 with end_col=29
+    assert _enclosing_try_reads_outputs(func_node, 2, 2, {"total"}, u_end_col=29) is True
+
+
 def test_collect_scope_closures_class_compound_blocks() -> None:
     """Verifies that _collect_scope_closures inspects methods inside compound blocks in classes."""
     code = (

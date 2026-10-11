@@ -1652,21 +1652,38 @@ def _get_scope_try_and_with_blocks(
 
 
 class _StrictPostLineVisitor(_DownstreamReadVisitor):
-    """Downstream read visitor that strictly checks nodes starting after a given line."""
+    """Downstream read visitor strictly checking nodes starting after a given line and column."""
 
     def _is_node_after_unit(self, node: ast.AST) -> bool:
         lineno = getattr(node, "lineno", None)
-        return lineno is not None and lineno > self.u_end
+        if lineno is None:
+            return False
+        if lineno > self.u_end:
+            return True
+        if lineno == self.u_end and self.u_end_col is not None:
+            col = getattr(node, "col_offset", None)
+            return col is not None and col >= int(self.u_end_col)
+        return False
 
     def _is_node_inside_unit(self, node: ast.AST) -> bool:
         lineno = getattr(node, "lineno", None)
-        return lineno is not None and lineno == self.u_end
+        if lineno is None:
+            return False
+        if lineno < self.u_end:
+            return True
+        if lineno == self.u_end:
+            if self.u_end_col is not None:
+                col = getattr(node, "col_offset", None)
+                return col is not None and col < int(self.u_end_col)
+            return True
+        return False
 
 
 def _scope_reads_outputs_after_line(
     scope_node: ast.AST,
     line: int,
     outputs: Set[str],
+    end_col: Optional[int] = None,
 ) -> bool:
     """Checks whether any statement in the scope loads outputs after the given line,
     including loop-carried reads if line sits inside an enclosing loop."""
@@ -1674,7 +1691,12 @@ def _scope_reads_outputs_after_line(
 
     def _execute_pass(mode: _VisitorPassMode) -> Set[str]:
         v = _StrictPostLineVisitor(
-            line, line, None, candidates=outputs, enclosing_loops=enclosing_loops, pass_mode=mode
+            line,
+            line,
+            end_col,
+            candidates=outputs,
+            enclosing_loops=enclosing_loops,
+            pass_mode=mode,
         )
         for stmt in getattr(scope_node, "body", []):
             v.visit(stmt)
@@ -1691,6 +1713,7 @@ def _enclosing_try_reads_outputs(
     u_start: int,
     u_end: int,
     outputs: Set[str],
+    u_end_col: Optional[int] = None,
 ) -> bool:
     """Returns True if unit is inside an enclosing try, else, or except block whose
     handlers/finally read outputs, or whose handlers fall through and outputs are read
@@ -1705,7 +1728,24 @@ def _enclosing_try_reads_outputs(
         if isinstance(node, (ast.With, ast.AsyncWith)):
             with_body = getattr(node, "body", [])
             if _stmts_enclose_unit(with_body, u_start, u_end):
+                # 1. Check if any statement within with_body following the unit reads outputs
+                post_unit_with_stmts: List[ast.AST] = []
+                for s in with_body:
+                    s_lineno = getattr(s, "lineno", None)
+                    if s_lineno is None:
+                        continue
+                    if s_lineno > u_end:
+                        post_unit_with_stmts.append(s)
+                    elif s_lineno == u_end and u_end_col is not None:
+                        s_col = getattr(s, "col_offset", None)
+                        if s_col is not None and s_col >= int(u_end_col):
+                            post_unit_with_stmts.append(s)
+                if post_unit_with_stmts and _nodes_load_any_name(post_unit_with_stmts, outputs):
+                    return True
+
+                # 2. Check if outputs are read downstream of the with block
                 w_end_raw = getattr(node, "end_lineno", None)
+                w_end_col_raw = getattr(node, "end_col_offset", None)
                 b_end = max(
                     (
                         int(
@@ -1718,7 +1758,10 @@ def _enclosing_try_reads_outputs(
                     default=0,
                 )
                 w_end = w_end_raw if isinstance(w_end_raw, int) else b_end
-                if _scope_reads_outputs_after_line(scope_node, w_end, outputs):
+                w_end_col = w_end_col_raw if isinstance(w_end_col_raw, int) else None
+                if _scope_reads_outputs_after_line(
+                    scope_node, w_end, outputs, end_col=w_end_col
+                ):
                     return True
             continue
 
@@ -1762,6 +1805,7 @@ def _enclosing_try_reads_outputs(
                     not _block_definitely_terminates(h.body) for h in handlers
                 ):
                     try_end_raw = getattr(node, "end_lineno", None)
+                    try_end_col_raw = getattr(node, "end_col_offset", None)
                     all_try_stmts = (
                         list(body_nodes)
                         + [s for h in handlers for s in getattr(h, "body", [])]
@@ -1780,7 +1824,12 @@ def _enclosing_try_reads_outputs(
                         default=0,
                     )
                     t_end = try_end_raw if isinstance(try_end_raw, int) else b_end
-                    if _scope_reads_outputs_after_line(scope_node, t_end, outputs):
+                    t_end_col = (
+                        try_end_col_raw if isinstance(try_end_col_raw, int) else None
+                    )
+                    if _scope_reads_outputs_after_line(
+                        scope_node, t_end, outputs, end_col=t_end_col
+                    ):
                         return True
     return False
 
@@ -2257,8 +2306,10 @@ def resolve_clone_generator_subroutine_outputs(
                 )
                 return None
             u_s, u_e = bounds
-
-            if _enclosing_try_reads_outputs(scope_node, u_s, u_e, set(needed_outs)):
+            u_end_col = _extract_unit_end_col(u_item)
+            if _enclosing_try_reads_outputs(
+                scope_node, u_s, u_e, set(needed_outs), u_end_col=u_end_col
+            ):
                 logger.debug(
                     "Rejecting generator subroutine pair: needed output(s) read in "
                     "enclosing try cleanup for unit %s",
@@ -2268,7 +2319,6 @@ def resolve_clone_generator_subroutine_outputs(
             u_start_col = _extract_first_unit_coord(
                 u_item, ("start_col", "start_col_offset")
             )
-            u_end_col = _extract_unit_end_col(u_item)
             for c_pos, reads in _collect_scope_closures(scope_node, module_tree=tr):
                 _, is_intra, _ = _classify_closure_position(
                     c_pos, u_s, u_e, u_start_col=u_start_col, u_end_col=u_end_col
