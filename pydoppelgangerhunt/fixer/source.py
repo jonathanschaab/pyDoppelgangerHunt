@@ -14,6 +14,7 @@ from pydoppelgangerhunt.source_lines import (
     count_physical_newlines,
     detect_line_ending,
     is_sliced_unit_source_lines,
+    normalize_unit_coordinates,
     parse_unit_coord,
     resolve_safe_unit_file_path,
     resolve_unit_line_bounds,
@@ -873,8 +874,16 @@ def compute_unit_spans(
 
     first_line = lines[start - 1]
     last_line = lines[end - 1]
-    raw_sc = unit.get("start_col")
-    raw_ec = unit.get("end_col")
+    raw_sc = (
+        unit.get("start_col")
+        if unit.get("start_col") is not None
+        else unit.get("start_col_offset")
+    )
+    raw_ec = (
+        unit.get("end_col")
+        if unit.get("end_col") is not None
+        else unit.get("end_col_offset")
+    )
 
     try:
         start_col = _parse_unit_coord(unit, "start_col", default=None)
@@ -1219,6 +1228,7 @@ def replace_unit_in_source(
     """
     if not isinstance(unit, dict):
         raise TypeError(f"Unit must be a dictionary, got {type(unit).__name__}")
+    unit = normalize_unit_coordinates(unit)
     _validate_and_parse_unit_bound(unit, "start", strict=strict)
     _validate_and_parse_unit_bound(unit, "end", strict=strict)
 

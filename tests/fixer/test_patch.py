@@ -1667,18 +1667,11 @@ def test_generate_refactoring_patch_permuted_outputs_alignment(tmp_path: Path) -
         "kind": "compound_block",
     }
 
-    # Identical name sets pair by name under replace_clones=True
+    # Under default allow_permuted_outputs=False, permuted outputs fail closed
     patch = generate_refactoring_patch(
         [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
     )
-    assert patch != ""
-    assert "x, y = _shared_compute_1_compute_2(a, b)" in patch
-
-    # Under replace_clones=False, helper-only mode emits the shared helper
-    patch_preview = generate_refactoring_patch(
-        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=False
-    )
-    assert "_shared_compute_1" in patch_preview
+    assert patch == ""
 
     # Conflicting / ambiguous orderings with differing variables fail closed
     src3 = (
@@ -9630,6 +9623,61 @@ def test_complex_expr_indented_multiline_assignment_dedents_cleanly(
     )
     assert patch != ""
     assert "total = _shared_" in patch
+
+
+def test_refactor_module_units_honors_offset_aliases() -> None:
+    """Verifies that refactor_module_units respects start_col_offset and end_col_offset
+    aliases when start_col and end_col are absent, preserving same-line neighbours."""
+    from pydoppelgangerhunt.fixer import refactor_module_units
+
+    src = "x = 1; y = 2; z = 3\n"
+    # Unit replacing only 'y = 2' using alias keys
+    unit = {
+        "file": "test.py",
+        "start": 1,
+        "end": 1,
+        "start_col_offset": 7,
+        "end_col_offset": 12,
+    }
+    result = refactor_module_units(src, [(unit, "y = 20")])
+    assert result == "x = 1; y = 20; z = 3\n"
+
+
+def test_generate_refactoring_patch_whole_line_return_complex_expr(tmp_path: Path) -> None:
+    """Verifies that whole-line complex_expr for Return statements retains the return keyword
+    in call site delegation rather than emitting a bare helper call."""
+    code1 = (
+        "def get_val_1(x: int, y: int) -> int:\n"
+        "    return compute_val(x, y)\n"
+    )
+    code2 = (
+        "def get_val_2(x: int, y: int) -> int:\n"
+        "    return compute_val(x, y)\n"
+    )
+    f1 = tmp_path / "ret1.py"
+    f2 = tmp_path / "ret2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+    u1 = {
+        "file": "ret1.py",
+        "start": 2,
+        "end": 2,
+        "name": "get_val_1:ret",
+        "kind": "complex_expr",
+    }
+    u2 = {
+        "file": "ret2.py",
+        "start": 2,
+        "end": 2,
+        "name": "get_val_2:ret",
+        "kind": "complex_expr",
+    }
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch != ""
+    assert "return _shared_get_val_1_get_val_2(compute_val, x, y)" in patch
+
 
 
 

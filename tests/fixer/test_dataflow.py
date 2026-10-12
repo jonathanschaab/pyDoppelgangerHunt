@@ -599,9 +599,13 @@ def test_pair_clone_outputs_positional_alignment() -> None:
     pairs_aligned = _pair_clone_outputs(["a", "b", "c"], ["a", "x", "c"])
     assert pairs_aligned == [("a", "a"), ("b", "x"), ("c", "c")]
 
-    # Swapped variable names with identical name set pair by name
+    # Differing variable orders (permuted outputs) fail closed when allow_permuted_outputs is False
     pairs_swapped = _pair_clone_outputs(["x", "y"], ["y", "x"])
-    assert pairs_swapped == [("x", "x"), ("y", "y")]
+    assert pairs_swapped == []
+    assert _pair_clone_outputs(["x", "y"], ["y", "x"], allow_permuted_outputs=True) == [
+        ("x", "y"),
+        ("y", "x"),
+    ]
 
 
 def test_extract_nested_scope_free_reads_outer_scope_shadowing() -> None:
@@ -1071,9 +1075,13 @@ def test_pair_clone_outputs_swapped_names_and_positional_roles() -> None:
     pairs_pos = _pair_clone_outputs(["x", "y"], ["b", "a"])
     assert pairs_pos == [("x", "b"), ("y", "a")]
 
-    # Identical name sets with conflicting order pair by name
+    # Identical name sets with conflicting order fail closed when allow_permuted_outputs is False
     pairs_ident = _pair_clone_outputs(["x", "y"], ["y", "x"])
-    assert pairs_ident == [("x", "x"), ("y", "y")]
+    assert pairs_ident == []
+    assert _pair_clone_outputs(["x", "y"], ["y", "x"], allow_permuted_outputs=True) == [
+        ("x", "y"),
+        ("y", "x"),
+    ]
 
     # Mismatched arity fails closed
     pairs_mismatched = _pair_clone_outputs(["a", "b"], ["b"])
@@ -2313,15 +2321,26 @@ def test_scope_reads_outputs_after_line_same_line_semicolon() -> None:
 
 
 def test_enclosing_try_reads_outputs_same_line_with_semicolon() -> None:
-    """Verifies that _enclosing_try_reads_outputs detects same-line reads in with body."""
+    """Verifies that _enclosing_try_reads_outputs permits intra-with reads,
+    but detects reads downstream of the with block."""
     code = (
         "def run():\n"
         "    with mgr: total = yield x; print(total)\n"
     )
     tree = ast.parse(code)
     func_node = tree.body[0]
-    # Unit 'total = yield x' on line 2 with end_col=29
-    assert _enclosing_try_reads_outputs(func_node, 2, 2, {"total"}, u_end_col=29) is True
+    # Unit 'total = yield x' on line 2 with end_col=29: intra-with read is permitted
+    assert _enclosing_try_reads_outputs(func_node, 2, 2, {"total"}, u_end_col=29) is False
+
+    code_post = (
+        "def run():\n"
+        "    with mgr: total = yield x\n"
+        "    print(total)\n"
+    )
+    tree_post = ast.parse(code_post)
+    func_post = tree_post.body[0]
+    # Post-with read is detected as a cleanup hazard
+    assert _enclosing_try_reads_outputs(func_post, 2, 2, {"total"}, u_end_col=29) is True
 
 
 def test_collect_scope_closures_class_compound_blocks() -> None:
@@ -2986,8 +3005,8 @@ def test_subroutine_outputs_duplicate_stores_deduplicated_and_paired() -> None:
     assert res == (["total"], ["count"])
 
     # Even if precomputed outputs contain duplicates, it must safely deduplicate and pair
-    u1_dup = {"kind": "compound_block", "outputs": ["total", "total"]}
-    u2_dup = {"kind": "compound_block", "outputs": ["count", "count"]}
+    u1_dup = dict(u1, outputs=["total", "total"])
+    u2_dup = dict(u2, outputs=["count", "count"])
     res_dup = resolve_clone_pair_outputs(u1_dup, u2_dup, s1, s2)
     assert res_dup == (["total"], ["count"])
 
@@ -3797,7 +3816,8 @@ def test_subroutine_same_line_semicolon_in_with_without_end_col() -> None:
     res = resolve_clone_generator_subroutine_outputs(
         u1, u2, scope, scope, source_text1=src, source_text2=src
     )
-    assert res is None
+    # Intra-with reads are permitted; total is safely paired as an output
+    assert res == (["total"], ["total"])
 
 
 def test_resolve_clone_generator_subroutine_outputs_unflagged_sliced_lines() -> None:
@@ -3961,9 +3981,8 @@ def test_classify_closure_position_boundary_at_end_col() -> None:
 
 
 def test_enclosing_try_reads_outputs_same_line_unit_accumulator_in_with() -> None:
-    """Verifies that when multiple statements reside on u_end and u_end_col cannot be
-    resolved, a unit at same_line_stmts[1] updating an accumulator in place does not
-    falsely trigger enclosing with cleanup rejection."""
+    """Verifies that intra-with reads do not trigger enclosing with cleanup rejection,
+    while downstream reads after the with block exit fail closed."""
     src = (
         "with lock:\n"
         "    init_step = 1; acc = acc + 1; cleanup_flag = True\n"
@@ -3975,7 +3994,7 @@ def test_enclosing_try_reads_outputs_same_line_unit_accumulator_in_with() -> Non
     )
     assert result is False
 
-    # If a subsequent statement on line 2 reads 'acc', reject
+    # Intra-with subsequent reads on line 2 do not trigger cleanup rejection
     src_read = (
         "with lock:\n"
         "    init_step = 1; acc = acc + 1; print(acc)\n"
@@ -3984,7 +4003,19 @@ def test_enclosing_try_reads_outputs_same_line_unit_accumulator_in_with() -> Non
     result_read = _enclosing_try_reads_outputs(
         tree_read, u_start=2, u_end=2, outputs={"acc"}, u_end_col=None
     )
-    assert result_read is True
+    assert result_read is False
+
+    # Reads downstream after the with block exit fail closed
+    src_after = (
+        "with lock:\n"
+        "    init_step = 1; acc = acc + 1; cleanup_flag = True\n"
+        "print(acc)\n"
+    )
+    tree_after = ast.parse(src_after)
+    result_after = _enclosing_try_reads_outputs(
+        tree_after, u_start=2, u_end=2, outputs={"acc"}, u_end_col=None
+    )
+    assert result_after is True
 
 
 def test_extract_unit_end_col_precedence() -> None:
@@ -4023,19 +4054,20 @@ def test_enclosing_with_loop_carried_read_at_loop_top_rejected() -> None:
 
 
 def test_pair_clone_outputs_allow_permuted_outputs() -> None:
-    """Verifies that _pair_clone_outputs allows permuted output pairing when flag is enabled."""
+    """Verifies that _pair_clone_outputs rejects permuted outputs when disabled
+    and pairs positionally when enabled."""
     from pydoppelgangerhunt.fixer.dataflow import _pair_clone_outputs
 
     u1_outs = ["x", "y"]
     u2_outs = ["y", "x"]
 
-    # When set(u1) == set(u2), pairs by name regardless of permutation
-    assert _pair_clone_outputs(u1_outs, u2_outs, allow_permuted_outputs=False) == [
+    # When allow_permuted_outputs is False, differing order fails closed
+    assert _pair_clone_outputs(u1_outs, u2_outs, allow_permuted_outputs=False) == []
+
+    # Enabled allows positional 1-to-1 pairing for permuted outputs
+    assert _pair_clone_outputs(u1_outs, u2_outs, allow_permuted_outputs=True) == [
         ("x", "y"),
         ("y", "x"),
-    ] or _pair_clone_outputs(u1_outs, u2_outs, allow_permuted_outputs=False) == [
-        ("x", "x"),
-        ("y", "y"),
     ]
 
     # Partial conflicting names fail closed when allow_permuted_outputs is False
@@ -4156,3 +4188,69 @@ def test_downstream_read_visitor_augassign_unresolved_boundary_does_not_kill() -
     )
     visitor3.visit(tree)
     assert "x" in visitor3.killed
+
+
+def test_unit_live_in_visitor_flow_sensitivity_and_non_name_targets() -> None:
+    """Verifies flow sensitivity for branches, bare AnnAssign, and non-Name AugAssign."""
+    from pydoppelgangerhunt.fixer._df_visitors import _extract_unit_live_in_names
+
+    # 1. Conditional store followed by in-place update: acc is live-in
+    code1 = (
+        "def f(c, x):\n"
+        "    if c:\n"
+        "        acc = 0\n"
+        "    acc += x\n"
+    )
+    tree1 = ast.parse(code1)
+    live_ins1 = _extract_unit_live_in_names(tree1, 2, 4, candidates={"acc", "x", "c"})
+    assert "acc" in live_ins1
+    assert "x" in live_ins1
+    assert "c" in live_ins1
+
+    # 2. Non-Name AugAssign target: counts and i are live-in
+    code2 = (
+        "def g(counts, i):\n"
+        "    counts[i] += 1\n"
+    )
+    tree2 = ast.parse(code2)
+    live_ins2 = _extract_unit_live_in_names(tree2, 2, 2, candidates={"counts", "i"})
+    assert "counts" in live_ins2
+    assert "i" in live_ins2
+
+    # 3. Bare AnnAssign does not mark variable as definitely stored
+    code3 = (
+        "def h():\n"
+        "    val: int\n"
+        "    res = val + 1\n"
+    )
+    tree3 = ast.parse(code3)
+    live_ins3 = _extract_unit_live_in_names(tree3, 2, 3, candidates={"val", "res"})
+    assert "val" in live_ins3
+    assert "res" not in live_ins3
+
+
+def test_pair_clone_outputs_role_swapped_rejection_and_positional_pairing() -> None:
+    """Verifies that role-swapped clones ([x, y] vs [y, x]) are rejected under
+    allow_permuted_outputs=False, but pair positionally when allow_permuted_outputs=True,
+    while alpha-renamed outputs ([x, y] vs [a, b]) pair positionally by default."""
+    from pydoppelgangerhunt.fixer.dataflow import _pair_clone_outputs
+
+    # Role-swapped clones sharing the same variable names in reverse order
+    # Clone 1: x = a * 10; y = b * 20 -> outputs: [x, y]
+    # Clone 2: y = a * 10; x = b * 20 -> outputs: [y, x]
+    # Under allow_permuted_outputs=False, must reject to prevent silent miscompile
+    assert _pair_clone_outputs(["x", "y"], ["y", "x"], allow_permuted_outputs=False) == []
+
+    # When allow_permuted_outputs=True, pairs positionally
+    assert _pair_clone_outputs(["x", "y"], ["y", "x"], allow_permuted_outputs=True) == [
+        ("x", "y"),
+        ("y", "x"),
+    ]
+
+    # Pure alpha-renaming with disjoint names pairs positionally by default
+    assert _pair_clone_outputs(["x", "y"], ["a", "b"], allow_permuted_outputs=False) == [
+        ("x", "a"),
+        ("y", "b"),
+    ]
+
+

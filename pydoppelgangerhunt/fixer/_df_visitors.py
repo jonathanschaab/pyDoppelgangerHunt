@@ -11,6 +11,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Sequence,
     Set,
     Tuple,
     Union,
@@ -889,6 +890,17 @@ class _StrictPostLineVisitor(_DownstreamReadVisitor):
         return False
 
 
+def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
+    """Checks whether a sequence of statements unconditionally returns or raises."""
+    for stmt in statements:
+        if isinstance(stmt, (ast.Return, ast.Raise)):
+            return True
+        if isinstance(stmt, ast.If):
+            if stmt.orelse and _block_terminates(stmt.body) and _block_terminates(stmt.orelse):
+                return True
+    return False
+
+
 class _UnitLiveInVisitor(_BaseScopeVisitor):
     """Extracts live-in variable names (loaded before being stored) within a unit's bounds."""
 
@@ -985,6 +997,8 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         if self._is_inside(node):
             if isinstance(node.target, ast.Name):
                 self._record_live_in(node.target.id)
+            else:
+                self.visit(node.target)
             self.visit(node.value)
             if isinstance(node.target, ast.Name):
                 self.stored.add(node.target.id)
@@ -1000,13 +1014,16 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
             self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        if self._is_inside(node):
-            if node.value is not None:
-                self.visit(node.value)
-            if isinstance(node.target, ast.Name):
-                self.stored.add(node.target.id)
-        else:
+        if not self._is_inside(node):
             self.generic_visit(node)
+            return
+        if node.value is None:
+            return
+        self.visit(node.value)
+        if isinstance(node.target, ast.Name):
+            self.stored.add(node.target.id)
+        else:
+            self.visit(node.target)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         if self._is_inside(node):
@@ -1015,6 +1032,34 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
                 self.stored.add(node.target.id)
         else:
             self.generic_visit(node)
+
+    def _collect_branch_stored(
+        self, stmts: Sequence[ast.stmt], initial: Set[str]
+    ) -> Set[str]:
+        self.stored = set(initial)
+        for s in stmts:
+            self.visit(s)
+        return set(self.stored)
+
+    def visit_If(self, node: ast.If) -> None:
+        self.visit(node.test)
+        stored_before = set(self.stored)
+        stored_then = self._collect_branch_stored(node.body, stored_before)
+        stored_else = self._collect_branch_stored(node.orelse, stored_before)
+
+        if node.orelse:
+            then_term = _block_terminates(node.body)
+            else_term = _block_terminates(node.orelse)
+            if then_term and not else_term:
+                self.stored = stored_else
+            elif else_term and not then_term:
+                self.stored = stored_then
+            elif then_term and else_term:
+                self.stored = stored_before
+            else:
+                self.stored = stored_then & stored_else
+        else:
+            self.stored = stored_before
 
     def visit_For(self, node: Union[ast.For, ast.AsyncFor]) -> None:
         if self._is_inside(node):

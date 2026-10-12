@@ -72,7 +72,10 @@ from pydoppelgangerhunt.fixer.source import (
     resolve_unit_replacement,
     split_source_lines,
 )
-from pydoppelgangerhunt.source_lines import resolve_unit_line_bounds
+from pydoppelgangerhunt.source_lines import (
+    normalize_unit_coordinates,
+    resolve_unit_line_bounds,
+)
 from pydoppelgangerhunt.fixer.synthesis import (
     _extract_required_typing_imports,
     _format_call_arguments,
@@ -196,10 +199,26 @@ def check_units_overlap(
                 f"Malformed unit: invalid column offset '{col_name}'={val!r} in {file_path}"
             ) from err
 
-    sc1 = _parse_col(u1.get("start_col"), "start_col", f1)
-    ec1 = _parse_col(u1.get("end_col"), "end_col", f1)
-    sc2 = _parse_col(u2.get("start_col"), "start_col", f2)
-    ec2 = _parse_col(u2.get("end_col"), "end_col", f2)
+    sc1 = _parse_col(
+        u1.get("start_col") if u1.get("start_col") is not None else u1.get("start_col_offset"),
+        "start_col",
+        f1,
+    )
+    ec1 = _parse_col(
+        u1.get("end_col") if u1.get("end_col") is not None else u1.get("end_col_offset"),
+        "end_col",
+        f1,
+    )
+    sc2 = _parse_col(
+        u2.get("start_col") if u2.get("start_col") is not None else u2.get("start_col_offset"),
+        "start_col",
+        f2,
+    )
+    ec2 = _parse_col(
+        u2.get("end_col") if u2.get("end_col") is not None else u2.get("end_col_offset"),
+        "end_col",
+        f2,
+    )
 
     # -------------------------------------------------------------------------
     # Case -> Expected Behaviour Mapping:
@@ -412,9 +431,10 @@ def refactor_module_units(
     # omitted or incomplete (whole-line / statement replacements inherently conflict
     # with any other edit on the same line), or when column intervals overlap.
     rep_list: List[Tuple[Dict[str, Any], str]] = []
-    for u, rep in replacements:
-        if not isinstance(u, dict):
-            raise TypeError(f"Unit must be a dictionary, got {type(u).__name__}")
+    for u_raw, rep in replacements:
+        if not isinstance(u_raw, dict):
+            raise TypeError(f"Unit must be a dictionary, got {type(u_raw).__name__}")
+        u = normalize_unit_coordinates(u_raw)
         _validate_and_parse_unit_bound(u, "start", strict=strict)
         _validate_and_parse_unit_bound(u, "end", strict=strict)
         if not is_valid_unit_coordinates(u, strict=strict):
@@ -665,6 +685,23 @@ def _has_unconditional_terminal_return(
     return s == "return" or s.startswith("return ") or s.startswith("return(") or s.startswith("return\t")
 
 
+_AUGASSIGN_OPS: Dict[type, str] = {
+    ast.Add: "+=",
+    ast.Sub: "-=",
+    ast.Mult: "*=",
+    ast.MatMult: "@=",
+    ast.Div: "/=",
+    ast.Mod: "%=",
+    ast.Pow: "**=",
+    ast.LShift: "<<=",
+    ast.RShift: ">>=",
+    ast.BitOr: "|=",
+    ast.BitXor: "^=",
+    ast.BitAnd: "&=",
+    ast.FloorDiv: "//=",
+}
+
+
 def _build_unit_delegation_call(
     target_unit: Dict[str, Any],
     orig_text: str,
@@ -768,6 +805,14 @@ def _build_unit_delegation_call(
                     target_str = ast.unparse(parsed_node.target)
                     anno_str = ast.unparse(parsed_node.annotation)
                     assign_prefix = f"{target_str}: {anno_str} = "
+                elif isinstance(parsed_node, ast.AugAssign):
+                    target_str = ast.unparse(parsed_node.target)
+                    op_symbol = _AUGASSIGN_OPS.get(type(parsed_node.op), "+=")
+                    assign_prefix = f"{target_str} {op_symbol} "
+                elif isinstance(parsed_node, ast.Return):
+                    assign_prefix = "return "
+                elif isinstance(parsed_node, ast.Expr):
+                    assign_prefix = ""
             except (SyntaxError, IndexError, ValueError):
                 pass
             return f"{indent}{assign_prefix}{await_prefix}{call_expr}\n"
@@ -2722,7 +2767,13 @@ def _unit_has_no_refactor_pragma(
             full_text, u_start, u_end, include_leading=True
         )
         return any(bool(_NO_REFACTOR_RE.search(c["text"])) for c in comments)
-    except Exception:
+    except Exception as exc:
+        logger.debug(
+            "Structured pragma extraction failed for unit %s-%s: %s; falling back to line scan",
+            u_start,
+            u_end,
+            exc,
+        )
         start_idx = max(0, u_start - 1)
         if start_idx > 0 and file_lines[start_idx - 1].strip().startswith("#"):
             start_idx -= 1
@@ -3358,7 +3409,7 @@ def _generate_refactoring_patch_impl(
                 outputs=outputs,
                 outputs2=target_outs2,
             )
-            if not helper_code or not _validate_helper_compilation(helper_code):
+            if not helper_code:
                 skip_reasons["shared helper synthesis failed"] += 1
                 continue
 

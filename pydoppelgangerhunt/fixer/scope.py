@@ -20,8 +20,11 @@ from typing import (
 
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.fixer.source import (
+    _SUBROUTINE_KINDS,
+    _WHOLE_UNIT_KINDS,
     _load_unit_file_text,
     _slice_unit_token_lines,
+    dedent_source_text,
     find_enclosing_function_is_async,
     is_subroutine_unit,
     parse_unit_coord,
@@ -1246,7 +1249,7 @@ def _inspect_unit_scope(
 
     unit_code_lines = extract_unit_source_code(unit, repo_root=repo_root)
     raw_lines = _slice_unit_token_lines(unit, unit_code_lines)
-    dedented = textwrap.dedent("".join(raw_lines))
+    dedented = dedent_source_text("".join(raw_lines))
     empty_res: Dict[str, Any] = {
         "inputs": [],
         "outputs": [],
@@ -1334,6 +1337,10 @@ def _inspect_unit_scope(
 
     if "is_subroutine" in unit and unit.get("is_subroutine") is not None:
         is_subroutine = bool(unit["is_subroutine"])
+    elif str(unit.get("kind") or "") in _SUBROUTINE_KINDS:
+        is_subroutine = True
+    elif str(unit.get("kind") or "") in _WHOLE_UNIT_KINDS:
+        is_subroutine = False
     else:
         is_subroutine = is_subroutine_unit(
             unit, source_text=_get_full_source(), tree=file_tree

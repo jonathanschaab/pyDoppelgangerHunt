@@ -2070,7 +2070,8 @@ def test_synthesize_shared_helper_code_unpaired_output_fallback_aligned(
     tmp_path: Path,
 ) -> None:
     """Verifies that when clone output name sets match but positional orderings conflict,
-    _pair_clone_outputs pairs identical name sets by name, correctly preserving counterpart types.
+    positional alignment merges counterpart types (int vs str -> Any) rather than unsoundly
+    re-ordering outputs by name.
     """
     src1 = (
         "def f(a: int, b: str):\n"
@@ -2088,7 +2089,7 @@ def test_synthesize_shared_helper_code_unpaired_output_fallback_aligned(
     u2 = {"file": str(f2), "start": 1, "end": 2, "name": "g", "kind": "function"}
     code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert code != ""
-    assert "Tuple[int, str]" in code
+    assert "Tuple[Any, Any]" in code
     assert "return a, b" in code
 
 

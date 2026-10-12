@@ -18,11 +18,31 @@ __all__ = [
     "count_physical_newlines",
     "detect_line_ending",
     "is_sliced_unit_source_lines",
+    "normalize_unit_coordinates",
     "parse_unit_coord",
     "resolve_safe_unit_file_path",
     "resolve_unit_line_bounds",
     "split_source_lines",
 ]
+
+_COORD_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "start_col": ("start_col", "start_col_offset"),
+    "start_col_offset": ("start_col_offset", "start_col"),
+    "end_col": ("end_col", "end_col_offset"),
+    "end_col_offset": ("end_col_offset", "end_col"),
+}
+
+
+def normalize_unit_coordinates(unit: Dict[str, Any]) -> Dict[str, Any]:
+    """Populates canonical 'start_col' and 'end_col' keys from offset aliases if missing."""
+    if not isinstance(unit, dict):
+        return unit
+    res = dict(unit)
+    if res.get("start_col") is None and res.get("start_col_offset") is not None:
+        res["start_col"] = res["start_col_offset"]
+    if res.get("end_col") is None and res.get("end_col_offset") is not None:
+        res["end_col"] = res["end_col_offset"]
+    return res
 
 
 @overload
@@ -71,6 +91,11 @@ def parse_unit_coord(
     Raises ValueError for non-numeric strings or unconvertible/overflow values.
     """
     val = unit.get(key)
+    if val is None and key in _COORD_KEY_ALIASES:
+        for alias in _COORD_KEY_ALIASES[key]:
+            val = unit.get(alias)
+            if val is not None:
+                break
     if val is None:
         return default
     if strict:

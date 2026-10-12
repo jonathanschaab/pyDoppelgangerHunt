@@ -29,9 +29,10 @@ def _inspect_enclosing_node(
     source_text: str,
     unit: Dict[str, Any],
     node_types: Tuple[type, ...],
+    tree: Optional[ast.AST] = None,
 ) -> Optional[Dict[str, Any]]:
     """Locates and extracts metadata for the innermost enclosing AST node of matching types."""
-    res = _find_innermost_enclosing_node(source_text, unit, node_types)
+    res = _find_innermost_enclosing_node(source_text, unit, node_types, tree=tree)
     if not res:
         return None
     matched_node, start, end = res
@@ -64,18 +65,20 @@ def _extract_child_indentation(
 def find_enclosing_class(
     source_text: str,
     unit: Dict[str, Any],
+    tree: Optional[ast.AST] = None,
 ) -> Optional[Dict[str, Any]]:
     """Locates the innermost enclosing ClassDef for an AST code unit.
 
     Args:
         source_text: The complete original Python source code.
         unit: AST unit dictionary with 1-indexed 'start' and 'end' line bounds.
+        tree: Optional pre-parsed AST tree of source_text.
 
     Returns:
         A dictionary with class metadata ('name', 'start', 'end', 'indent', 'method_indent')
         if the unit is enclosed within a ClassDef; None otherwise.
     """
-    meta = _inspect_enclosing_node(source_text, unit, (ast.ClassDef,))
+    meta = _inspect_enclosing_node(source_text, unit, (ast.ClassDef,), tree=tree)
     if not meta:
         return None
 
@@ -123,10 +126,11 @@ def find_enclosing_class(
 def find_enclosing_function(
     source_text: str,
     unit: Dict[str, Any],
+    tree: Optional[ast.AST] = None,
 ) -> Optional[Dict[str, Any]]:
     """Locates the innermost enclosing FunctionDef/AsyncFunctionDef for an AST code unit."""
     meta = _inspect_enclosing_node(
-        source_text, unit, (ast.FunctionDef, ast.AsyncFunctionDef)
+        source_text, unit, (ast.FunctionDef, ast.AsyncFunctionDef), tree=tree
     )
     if not meta:
         return None
@@ -285,6 +289,13 @@ def _unit_ast_has_async_or_yield(
                 has_yield = True
             elif isinstance(node, (ast.Await, ast.AsyncFor, ast.AsyncWith)):
                 has_await = True
+            elif isinstance(
+                node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+            ) and any(
+                bool(getattr(g, "is_async", False))
+                for g in getattr(node, "generators", [])
+            ):
+                has_await = True
             elif (
                 isinstance(node, ast.comprehension)
                 and bool(getattr(node, "is_async", False))
@@ -324,8 +335,8 @@ def _populate_unit_receiver_metadata(
     )
     if source is None:
         return
-    fn_meta = find_enclosing_function(source, unit)
-    cls_meta = find_enclosing_class(source, unit)
+    fn_meta = find_enclosing_function(source, unit, tree=tree)
+    cls_meta = find_enclosing_class(source, unit, tree=tree)
     if cls_meta:
         if "enclosing_class" not in unit:
             unit["enclosing_class"] = cls_meta["name"]

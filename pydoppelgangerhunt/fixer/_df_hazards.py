@@ -36,7 +36,6 @@ from pydoppelgangerhunt.fixer._df_visitors import (
     _StrictPostLineVisitor,
     _VisitorPassMode,
     _extract_unit_live_in_names,
-    _stmt_assigns_to_any_name,
 )
 from pydoppelgangerhunt.fixer.source import _find_innermost_enclosing_node
 
@@ -295,46 +294,8 @@ def _enclosing_try_reads_outputs(
         if isinstance(node, (ast.With, ast.AsyncWith)):
             with_body = getattr(node, "body", [])
             if _stmts_enclose_unit(with_body, u_start, u_end):
-                # 1. Check if any statement within with_body following the unit reads outputs
-                post_unit_with_stmts: List[ast.AST] = []
-                same_line_stmts = [
-                    stmt for stmt in with_body if getattr(stmt, "lineno", None) == u_end
-                ]
-                target_stmt: Optional[ast.AST] = None
-                if same_line_stmts:
-                    for stmt in same_line_stmts:
-                        if _stmt_assigns_to_any_name(stmt, outputs):
-                            target_stmt = stmt
-                            break
-                    if target_stmt is None:
-                        target_stmt = same_line_stmts[0]
-                target_idx = (
-                    same_line_stmts.index(target_stmt)
-                    if target_stmt in same_line_stmts
-                    else -1
-                )
-                post_same_line: Set[ast.AST] = (
-                    set(same_line_stmts[target_idx + 1:])
-                    if target_idx >= 0
-                    else set()
-                )
-                for s in with_body:
-                    s_lineno = getattr(s, "lineno", None)
-                    if s_lineno is None:
-                        continue
-                    if s_lineno > u_end:
-                        post_unit_with_stmts.append(s)
-                    elif s_lineno == u_end:
-                        if u_end_col is not None:
-                            s_col = getattr(s, "col_offset", None)
-                            if s_col is not None and s_col >= int(u_end_col):
-                                post_unit_with_stmts.append(s)
-                        elif s in post_same_line:
-                            post_unit_with_stmts.append(s)
-                if post_unit_with_stmts and _nodes_load_any_name(post_unit_with_stmts, outputs):
-                    return True
-
-                # 2. Check if outputs are read downstream of the with block
+                # Check if outputs are read downstream of the with block
+                # (where an exception-swallowing context manager resumes)
                 if _compound_stmt_reads_outputs_after(
                     scope_node, node, with_body, outputs
                 ):

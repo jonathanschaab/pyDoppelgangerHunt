@@ -309,10 +309,12 @@ strict fail-closed safety invariants:
   paired 1:1 in strict first-store positional order. If clone candidates define matching outputs
   in differing positional orders (permuted outputs) or differing counts, the pair is rejected
   to prevent subtle tuple-unpacking bugs and preserve alpha-equivalent runtime semantics.
-- **Definite Assignment Verification**: Synthesized helper return values and tuple-unpacked
-  subroutine outputs require definite assignments along all incoming and internal execution
-  paths. If an output variable could remain unassigned before helper exit, refactoring is
-  rejected to prevent `UnboundLocalError`.
+- **Definite Assignment Verification & Conditional Output Initialization**: Synthesized
+  generator subroutines strictly require definite assignment along all internal execution paths
+  for their outputs, failing closed if an output could remain unassigned before helper exit.
+  For standard (non-generator) subroutines, conditionally assigned outputs are defensively
+  initialized to `None` at helper entry, ensuring safe tuple-unpacking at call sites without
+  triggering runtime `UnboundLocalError`.
 - **Async Generator Delegation Hazard Prohibition**: In Python, asynchronous generators cannot
   combine `yield` with explicit `return <value>`. Furthermore, PEP 525 delegation via
   `async for ...: yield` loses `athrow()`/`aclose()` exception propagation semantics,
@@ -333,8 +335,8 @@ with `--patch`, check verbose logs (`-v` or logging level `DEBUG`):
   (or `--skip-pre-unit-closures`).
 - **Abnormal Exit Handlers**: If a generator subroutine is enclosed in a `try` block whose `finally`
   or `except` handlers read needed outputs, extraction is rejected to protect cleanup integrity.
-- **Indefinite Stores**: If an output variable lacks definite assignment along every internal
-  path, the extraction is rejected to protect against runtime `UnboundLocalError`.
+- **Indefinite Stores**: If an output variable in a generator subroutine lacks definite assignment
+  along every internal path, extraction is rejected to protect against runtime `UnboundLocalError`.
 - **Unpaired Outputs**: When duplicate variable names or arity mismatches prevent 1-to-1 output
   pairing, the pair fails closed safely.
 

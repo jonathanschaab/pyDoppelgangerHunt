@@ -1179,6 +1179,8 @@ def synthesize_shared_helper_code(
                         stripped_expr = ast.unparse(stmt_node.value)
                     elif isinstance(stmt_node, ast.AnnAssign) and stmt_node.value is not None:
                         stripped_expr = ast.unparse(stmt_node.value)
+                    elif isinstance(stmt_node, ast.AugAssign):
+                        stripped_expr = ast.unparse(stmt_node.value)
             except (SyntaxError, IndexError):
                 pass
 

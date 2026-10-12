@@ -99,13 +99,30 @@ def _validate_try_cleanup_hazard(
     context: str,
 ) -> Optional[CloneOutputResolution]:
     """Validates that needed outputs are not read in enclosing try/except/finally/with blocks."""
+    if not needed_outs:
+        return None
+    hazard = "enclosing try or with cleanup hazard"
+    missing_inputs = source_text is None and tree is None
+    scope_node = (
+        None
+        if missing_inputs
+        else _resolve_downstream_scope_node(source_text or "", unit, tree)
+    )
+    bounds = _get_valid_unit_bounds(unit)
+    if missing_inputs or scope_node is None or bounds is None:
+        logger.debug(
+            "Rejecting %s: missing source, scope AST, or valid bounds for unit %s",
+            context,
+            side_idx + 1,
+        )
+        return CloneOutputResolution(None, hazard)
     if _check_enclosing_try_cleanup_hazard(unit, needed_outs, source_text, tree):
         logger.debug(
             "Rejecting %s: needed output(s) read in enclosing try cleanup for unit %s",
             context,
             side_idx + 1,
         )
-        return CloneOutputResolution(None, "enclosing try or with cleanup hazard")
+        return CloneOutputResolution(None, hazard)
     return None
 
 
@@ -132,7 +149,7 @@ def _pair_clone_outputs(
             u2_dedup,
         )
         return []
-    if set(u1_dedup) == set(u2_dedup):
+    if u1_dedup == u2_dedup:
         return [(name, name) for name in u1_dedup]
 
     common = set(u1_dedup) & set(u2_dedup)
@@ -454,33 +471,19 @@ def resolve_clone_generator_subroutine_outputs(
         (u2, out2, target_srcs[1], target_trees[1]),
     ]):
         if needed_outs:
-            if s_text is None and eff_tr is None:
-                logger.debug(
-                    "Rejecting generator subroutine pair: needed output(s) cannot be "
-                    "verified against enclosing try cleanup without source or AST for unit %s",
-                    side_idx + 1,
-                )
-                return (
-                    CloneOutputResolution(None, "generator output or closure conflict")
-                    if return_details
-                    else None
-                )
             hazard_res = _validate_try_cleanup_hazard(
                 u_item, needed_outs, s_text, eff_tr,
                 side_idx=side_idx, context="generator subroutine pair",
             )
             if hazard_res is not None:
-                return hazard_res if return_details else None
+                return (
+                    CloneOutputResolution(None, "generator output or closure conflict")
+                    if return_details
+                    else None
+                )
             scope_node = _resolve_downstream_scope_node(s_text or "", u_item, eff_tr)
             bounds = _get_valid_unit_bounds(u_item)
             if scope_node is None or bounds is None:
-                logger.debug(
-                    "Rejecting generator subroutine pair: could not resolve scope AST "
-                    "or valid bounds for unit %s (scope=%s, bounds=%s)",
-                    side_idx + 1,
-                    scope_node is not None,
-                    bounds is not None,
-                )
                 return (
                     CloneOutputResolution(None, "generator output or closure conflict")
                     if return_details
@@ -685,12 +688,22 @@ def resolve_clone_pair_outputs(
     )
     if len(pairs) == len(outs1) == len(outs2):
         if is_sub and outs1:
-            for side_idx, (u_item, s_text, tr, outs) in enumerate([
-                (u1, source_text1, tree1, outs1),
-                (u2, source_text2, tree2, outs2),
+            for side_idx, (u_item, s_text, tr, s_digest, outs) in enumerate([
+                (u1, source_text1, tree1, source_digest1, outs1),
+                (u2, source_text2, tree2, source_digest2, outs2),
             ]):
+                eff_src = (
+                    s_text
+                    if s_text is not None
+                    else _load_unit_file_text(u_item, repo_root=repo_root)
+                )
+                eff_tr = tr if tr is not None else (
+                    _get_or_parse_tree(eff_src, source_digest=s_digest)
+                    if eff_src is not None
+                    else None
+                )
                 hazard_res = _validate_try_cleanup_hazard(
-                    u_item, outs, s_text, tr,
+                    u_item, outs, eff_src, eff_tr,
                     side_idx=side_idx, context="clone pair output resolution",
                 )
                 if hazard_res is not None:

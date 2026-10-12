@@ -1453,3 +1453,23 @@ def test_populate_unit_receiver_metadata_subroutine_async_word_boundaries(
     _populate_unit_receiver_metadata(sub_await, repo_root=str(tmp_path))
     assert sub_await.get("is_async") is True
 
+
+def test_populate_unit_receiver_metadata_async_comprehension(tmp_path: Path) -> None:
+    """Verifies that _populate_unit_receiver_metadata identifies async comprehensions."""
+    src = (
+        "async def compute(stream):\n"
+        "    results = [x async for x in stream]\n"
+        "    return results\n"
+    )
+    p = tmp_path / "worker_async_comp.py"
+    p.write_text(src, encoding="utf-8")
+    sub_comp = {
+        "file": str(p),
+        "kind": "compound_block",
+        "start": 2,
+        "end": 2,
+    }
+    _populate_unit_receiver_metadata(sub_comp, repo_root=str(tmp_path))
+    assert sub_comp.get("is_async") is True
+
+

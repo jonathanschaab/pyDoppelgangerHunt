@@ -91,6 +91,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   synthesis and patch generation.
 - **Receiver Metadata Path Restriction**: `_populate_unit_receiver_metadata` confines disk
   inspection strictly to `.py` files inside the repository root or CWD.
+- **Private Line-Splitting Regex Visibility (`_PHYSICAL_LINE_RE`)**: Dropped `_PHYSICAL_LINE_RE`
+  from `source_lines.__all__` in favor of public helper functions `split_source_lines` and
+  `count_physical_newlines`.
 
 ### Deprecated
 - **Private Deprecated Helpers**: Deprecated `_compute_unit_spans` in favor of `compute_unit_spans`.
@@ -98,16 +101,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - **Legacy Scope Dispatcher (`dispatch_analyze_unit_variable_scope`)**: Removed internal
   dispatcher function in favor of direct invocation of `analyze_unit_variable_scope`.
-- **Private Line-Splitting Regex (`_PHYSICAL_LINE_RE`)**: Dropped `_PHYSICAL_LINE_RE` from
-  `source_lines.__all__` in favor of public helper functions `split_source_lines` and
-  `count_physical_newlines`.
 
 ### Fixed
-- **Disk-Prioritized Unit Source Loading and Excerpt Slicing**: Prioritized disk reading in
-  `_load_unit_file_text` (`fixer/source.py`) before falling back to in-memory `source_lines`,
-  eliminated duplicate fallback logic, and removed the `u_start > 1` constraint in
-  `_is_sliced_excerpt_for_file` so line-1 excerpts are correctly identified as sliced excerpts
-  rather than full-file text.
+- **In-Memory Prioritized Unit Source Loading and Excerpt Slicing**: Prioritized in-memory unit
+  source buffers (`source_text`, `file_source`, and non-sliced `source_lines`) before falling
+  back to disk in `_load_unit_file_text` (`fixer/source.py`), eliminated duplicate fallback
+  logic, and removed the `u_start > 1` constraint in `_is_sliced_excerpt_for_file` so line-1
+  excerpts are correctly identified as sliced excerpts rather than full-file text.
 - **End Column Key Precedence Alignment**: Aligned coordinate key lookup in `_extract_unit_end_col`
   (`fixer/dataflow.py`) to `("end_col", "end_col_offset")`, matching the precedence established in
   `start_col` and `fixer/source.py`.
