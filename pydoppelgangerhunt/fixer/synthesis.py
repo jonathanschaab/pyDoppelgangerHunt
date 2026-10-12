@@ -1084,8 +1084,9 @@ def synthesize_shared_helper_code(
         return ""
     is_sub = is_sub1
 
+    eff_outputs: List[str]
     if outputs is not None and outputs2 is not None:
-        outputs, u2_outs = list(outputs), list(outputs2)
+        eff_outputs, u2_outs = list(outputs), list(outputs2)
     else:
         resolved_outs = resolve_clone_pair_outputs(
             u1=u1,
@@ -1103,7 +1104,7 @@ def synthesize_shared_helper_code(
         )
         if resolved_outs is None:
             return ""
-        outputs, u2_outs = resolved_outs
+        eff_outputs, u2_outs = resolved_outs
 
     conditional_outs = set(scope.get("conditional_outputs", []))
     is_async = bool(scope.get("is_async", False))
@@ -1112,7 +1113,7 @@ def synthesize_shared_helper_code(
 
     # Variables altered via global or nonlocal statements must not be captured in the helper's return tuple
     helper_outputs = [
-        v for v in outputs
+        v for v in eff_outputs
         if v not in scope.get("globals", [])
         and v not in scope.get("nonlocals", [])
     ]

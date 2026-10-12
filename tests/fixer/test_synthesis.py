@@ -1720,8 +1720,8 @@ def test_is_subroutine_unit_classification() -> None:
     assert is_subroutine_unit({"is_subroutine": True}) is True
     assert is_subroutine_unit({"is_subroutine": False, "kind": "compound_block"}) is False
 
-    # Name-based heuristic is eliminated; returns False for unknown/unspecified kinds
-    assert is_subroutine_unit({"name": "process_module:10-25"}) is False
+    # Name-based colon heuristic restored for subroutines without explicit kind
+    assert is_subroutine_unit({"name": "process_module:10-25"}) is True
     assert is_subroutine_unit({"name": "plain_function"}) is False
     assert is_subroutine_unit({}) is False
 
@@ -1910,13 +1910,13 @@ def test_inspect_unit_scope_prioritizes_full_source_text_over_sliced_lines() -> 
         "async def async_worker(items):\n"
         "    total = 0\n"
         "    for item in items:\n"
-        "        total += item\n"
+        "        yield item\n"
         "    return total\n"
     )
     unit = {
         "start": 3,
         "end": 4,
-        "source_lines": ["    for item in items:\n", "        total += item\n"],
+        "source_lines": ["    for item in items:\n", "        yield item\n"],
         "source_text": full_text,
     }
     scope = analyze_unit_variable_scope(unit)
@@ -2070,8 +2070,7 @@ def test_synthesize_shared_helper_code_unpaired_output_fallback_aligned(
     tmp_path: Path,
 ) -> None:
     """Verifies that when clone output name sets match but positional orderings conflict,
-    _pair_clone_outputs fails closed, safely falling back to positional type inference
-    (Tuple[Any, Any]) rather than silently miscompiling or swapping return semantics.
+    _pair_clone_outputs pairs identical name sets by name, correctly preserving counterpart types.
     """
     src1 = (
         "def f(a: int, b: str):\n"
@@ -2089,7 +2088,7 @@ def test_synthesize_shared_helper_code_unpaired_output_fallback_aligned(
     u2 = {"file": str(f2), "start": 1, "end": 2, "name": "g", "kind": "function"}
     code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert code != ""
-    assert "Tuple[Any, Any]" in code
+    assert "Tuple[int, str]" in code
     assert "return a, b" in code
 
 

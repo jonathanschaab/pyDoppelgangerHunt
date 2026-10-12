@@ -201,6 +201,9 @@ def is_subroutine_unit(
         except (ValueError, TypeError):
             pass
 
+    if not kind and ":" in str(unit.get("name") or ""):
+        return True
+
     return False
 
 
@@ -225,6 +228,15 @@ def _load_unit_file_text(
     if source_text is not None:
         return str(source_text)
 
+    # In-memory full lines take precedence over disk (vital for IDE/LSP unsaved buffers)
+    unit_lines = unit.get("source_lines")
+    if unit_lines and isinstance(unit_lines, (list, tuple)):
+        if not _is_sliced_excerpt_for_file(unit, unit_lines):
+            return "".join(
+                ln if ln.endswith(("\n", "\r")) else ln + "\n"
+                for ln in unit_lines
+            )
+
     # Disk resolution: strictly only .py files within repo_root or CWD are accepted.
     # Notebooks (.ipynb) and out-of-root files fail closed and return None.
     resolved_file = resolve_safe_unit_file_path(
@@ -236,15 +248,6 @@ def _load_unit_file_text(
                 return fh.read()
         except OSError:
             pass
-
-    # In-memory fallback for virtual/test units lacking disk presence
-    unit_lines = unit.get("source_lines")
-    if unit_lines and isinstance(unit_lines, (list, tuple)):
-        if not _is_sliced_excerpt_for_file(unit, unit_lines):
-            return "".join(
-                ln if ln.endswith(("\n", "\r")) else ln + "\n"
-                for ln in unit_lines
-            )
 
     return None
 
@@ -272,12 +275,12 @@ _extract_module_docstring_end_line = _extract_docstring_end_line
 
 def dedent_source_text(text: str) -> str:
     """Dedents source text while preserving leading form feed characters."""
-    lines = text.splitlines(keepends=True)
+    lines = split_source_lines(text)
     if not any(ln.startswith("\x0c") for ln in lines):
         return textwrap.dedent(text)
     ff_mask = [ln.startswith("\x0c") for ln in lines]
     cleaned = "".join(ln[1:] if m else ln for ln, m in zip(lines, ff_mask))
-    dedented_lines = textwrap.dedent(cleaned).splitlines(keepends=True)
+    dedented_lines = split_source_lines(textwrap.dedent(cleaned))
     return "".join("\x0c" + ln if m else ln for ln, m in zip(dedented_lines, ff_mask))
 
 
@@ -1264,6 +1267,33 @@ def _find_sig_colon(line: str) -> int:
     return line.rfind(":")
 
 
+def _get_tree_scope_intervals(
+    tree: ast.AST,
+) -> List[Tuple[int, int, int, ast.AST]]:
+    """Builds and caches sorted intervals (earliest_start, n_end, span, node) on the tree."""
+    cached = getattr(tree, "_scope_intervals", None)
+    if isinstance(cached, list):
+        return cached
+    intervals: List[Tuple[int, int, int, ast.AST]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            n_start = getattr(node, "lineno", 0) or 0
+            n_end = getattr(node, "end_lineno", None) or n_start
+            decorators = getattr(node, "decorator_list", [])
+            dec_start = (
+                min((getattr(d, "lineno", None) or n_start) for d in decorators)
+                if decorators
+                else n_start
+            )
+            earliest_start = min(dec_start, n_start)
+            intervals.append((earliest_start, n_end, n_end - earliest_start, node))
+    try:
+        setattr(tree, "_scope_intervals", intervals)
+    except (AttributeError, TypeError):
+        pass
+    return intervals
+
+
 def _find_innermost_enclosing_node(
     source_text: str,
     unit: Dict[str, Any],
@@ -1295,19 +1325,30 @@ def _find_innermost_enclosing_node(
             return None
 
     candidates: List[Tuple[int, ast.AST, int, int]] = []
-    for node in ast.walk(tree):
+    intervals = _get_tree_scope_intervals(tree)
+    for earliest_start, n_end, span, node in intervals:
         if isinstance(node, node_types):
-            n_start = getattr(node, "lineno", 0) or 0
-            n_end = getattr(node, "end_lineno", None) or n_start
-            decorators = getattr(node, "decorator_list", [])
-            dec_start = (
-                min((getattr(d, "lineno", None) or n_start) for d in decorators)
-                if decorators
-                else n_start
-            )
-            earliest_start = min(dec_start, n_start)
             if earliest_start <= u_start <= u_end <= n_end:
-                candidates.append((n_end - earliest_start, node, earliest_start, n_end))
+                candidates.append((span, node, earliest_start, n_end))
+
+    if not candidates and not all(
+        issubclass(nt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        for nt in node_types
+        if isinstance(nt, type)
+    ):
+        for node in ast.walk(tree):
+            if isinstance(node, node_types):
+                n_start = getattr(node, "lineno", 0) or 0
+                n_end = getattr(node, "end_lineno", None) or n_start
+                decorators = getattr(node, "decorator_list", [])
+                dec_start = (
+                    min((getattr(d, "lineno", None) or n_start) for d in decorators)
+                    if decorators
+                    else n_start
+                )
+                earliest_start = min(dec_start, n_start)
+                if earliest_start <= u_start <= u_end <= n_end:
+                    candidates.append((n_end - earliest_start, node, earliest_start, n_end))
 
     if not candidates:
         return None

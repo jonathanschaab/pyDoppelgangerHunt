@@ -55,8 +55,10 @@ resolve_clone_pair_outputs = _df_pairing.resolve_clone_pair_outputs
 resolve_generator_subroutine_outputs = (
     _df_pairing.resolve_generator_subroutine_outputs
 )
+CloneOutputResolution = _df_pairing.CloneOutputResolution
 
 __all__ = [
+    "CloneOutputResolution",
     "GeneratorCloneSideData",
     "clear_dataflow_cache",
     "collect_downstream_read_names",

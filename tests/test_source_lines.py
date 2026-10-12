@@ -83,7 +83,9 @@ def test_inspect_unit_scope_coordinate_string_with_column_offset() -> None:
         "source_text": full_text,
     }
     scope = analyze_unit_variable_scope(unit)
-    assert scope["is_async"] is True
+    assert scope["is_async"] is False
+    assert "items" in scope["inputs"]
+    assert "total" in scope["outputs"]
 
 
 def test_resolve_unit_ast_end_col_single_line_semicolon_with_and_without_start_col() -> None:

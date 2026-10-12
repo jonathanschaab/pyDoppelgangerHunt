@@ -9,7 +9,6 @@ from __future__ import annotations
 import ast
 import builtins
 import logging
-import sys
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.fixer._df_cache import (
@@ -483,7 +482,6 @@ def collect_downstream_read_names(
         skip_pre_unit_closures,
         source_digest=source_digest,
         resolved_end_col=u_end_col,
-        tree=effective_tree,
         unit_inputs=effective_unit_inputs,
     )
     with _downstream_cache_lock:
@@ -577,16 +575,11 @@ def collect_downstream_read_names(
 
     _merge_pre_unit_closure_reads(loaded, pre_unit_captured_reads, candidates)
 
-    max_cache_size = getattr(
-        sys.modules.get("pydoppelgangerhunt.fixer.dataflow"),
-        "_MAX_DOWNSTREAM_CACHE_SIZE",
-        _MAX_DOWNSTREAM_CACHE_SIZE,
-    )
     _store_lru_cache_entry(
         _downstream_reads_cache,
         cache_key,
         frozenset(loaded),
-        max_cache_size,
+        _MAX_DOWNSTREAM_CACHE_SIZE,
     )
 
     return loaded
@@ -603,24 +596,21 @@ def has_async_generator_delegation_hazard(
 
     Applies to both subroutine and whole-function async generator refactorings.
     """
-    has_yield = any(bool(s.get("has_yield")) for s in scopes if s is not None)
-    is_async = any(bool(s.get("is_async")) for s in scopes if s is not None)
-    if not (has_yield and is_async):
+    has_async_gen = any(
+        bool(s.get("has_yield")) and bool(s.get("is_async"))
+        for s in scopes
+        if s is not None
+    )
+    if not has_async_gen:
         return False
     has_ret = has_outputs or any(
         bool(s.get("has_return_value")) for s in scopes if s is not None
     )
     if has_ret:
         return True
-    has_yield_assign = any(
-        bool(s.get("has_yield_assignment")) for s in scopes if s is not None
-    )
-    if has_yield_assign:
+    if any(bool(s.get("has_yield_assignment")) for s in scopes if s is not None):
         return True
-    has_try_or_with = any(
-        bool(s.get("has_try_or_with")) for s in scopes if s is not None
-    )
-    if has_try_or_with:
+    if any(bool(s.get("has_try_or_with")) for s in scopes if s is not None):
         return True
     return False
 

@@ -27,12 +27,6 @@ from pydoppelgangerhunt.fixer.binding import (
     find_enclosing_function,
 )
 from pydoppelgangerhunt.fixer.dataflow import (
-    _collect_pre_unit_closures,
-    _extract_effective_unit_outputs,
-    _extract_first_unit_coord,
-    _get_valid_unit_bounds,
-    _resolve_downstream_scope_node,
-    clear_dataflow_cache,
     has_async_generator_delegation_hazard,
     resolve_clone_pair_outputs,
 )
@@ -70,6 +64,7 @@ from pydoppelgangerhunt.fixer.source import (
     compute_line_offsets,
     count_physical_newlines,
     detect_line_ending,
+    extract_unit_comments_and_pragmas,
     is_subroutine_unit,
     is_valid_unit_coordinates,
     parse_unit_coord,
@@ -745,8 +740,35 @@ def _build_unit_delegation_call(
             has_yield=bool(scope.get("has_yield")),
         )
 
-    if target_unit.get("kind") in ("comprehension", "complex_expr"):
+    if target_unit.get("kind") == "comprehension":
         call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
+        return f"{await_prefix}{call_expr}"
+
+    if target_unit.get("kind") == "complex_expr":
+        call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
+        start_col = target_unit.get("start_col")
+        if start_col is None:
+            start_col = target_unit.get("start_col_offset")
+        end_col = target_unit.get("end_col")
+        if end_col is None:
+            end_col = target_unit.get("end_col_offset")
+        is_subline = (start_col is not None or end_col is not None)
+        if not is_subline:
+            u_end = max(u_start, parse_unit_coord(target_unit, "end", default=u_start))
+            unit_code = "".join(orig_lines[u_start - 1 : u_end]).strip()
+            assign_prefix = ""
+            try:
+                parsed_node = ast.parse(unit_code).body[0]
+                if isinstance(parsed_node, ast.Assign) and parsed_node.targets:
+                    targets_str = " = ".join(ast.unparse(t) for t in parsed_node.targets)
+                    assign_prefix = f"{targets_str} = "
+                elif isinstance(parsed_node, ast.AnnAssign) and parsed_node.value is not None:
+                    target_str = ast.unparse(parsed_node.target)
+                    anno_str = ast.unparse(parsed_node.annotation)
+                    assign_prefix = f"{target_str}: {anno_str} = "
+            except (SyntaxError, IndexError, ValueError):
+                pass
+            return f"{indent}{assign_prefix}{await_prefix}{call_expr}\n"
         return f"{await_prefix}{call_expr}"
 
     call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
@@ -2682,6 +2704,9 @@ def _validate_helper_compilation(helper_code: str) -> bool:
         return False
 
 
+_NO_REFACTOR_RE = re.compile(r"#\s*pragma\s*:\s*no[-_]refactor\b", re.IGNORECASE)
+
+
 def _unit_has_no_refactor_pragma(
     unit: Dict[str, Any], file_lines: Optional[Sequence[str]]
 ) -> bool:
@@ -2689,11 +2714,21 @@ def _unit_has_no_refactor_pragma(
     if not file_lines:
         return False
     u_start, u_end = resolve_unit_line_bounds(unit)
-    target_block = "".join(file_lines[max(0, u_start - 2):u_end]).lower()
-    return any(
-        p in target_block
-        for p in ("# pragma: no-refactor", "# pragma:no-refactor", "# pragma: no_refactor")
-    )
+    full_text = "".join(file_lines)
+    try:
+        comments = extract_unit_comments_and_pragmas(
+            full_text, u_start, u_end, include_leading=True
+        )
+        return any(bool(_NO_REFACTOR_RE.search(c["text"])) for c in comments)
+    except Exception:
+        start_idx = max(0, u_start - 1)
+        if start_idx > 0 and file_lines[start_idx - 1].strip().startswith("#"):
+            start_idx -= 1
+        for line in file_lines[start_idx:u_end]:
+            stripped = line.strip()
+            if stripped.startswith("#") and _NO_REFACTOR_RE.search(stripped):
+                return True
+        return False
 
 
 def _determine_unit_receiver_kind(
@@ -3161,50 +3196,19 @@ def _generate_refactoring_patch_impl(
                 source_digest1=digest1,
                 source_digest2=digest2,
                 require_pairing=replace_clones,
+                return_details=True,
             )
-            if resolved_outs is None:
-                o1 = _extract_effective_unit_outputs(u1_eff, s1)
-                o2 = _extract_effective_unit_outputs(u2_eff, s2)
-                common = set(o1) & set(o2)
-                if s1.get("outputs_ambiguous") or s2.get("outputs_ambiguous"):
-                    skip_reasons["ambiguous outputs"] += 1
-                elif len(o1) != len(o2):
-                    skip_reasons["output arity mismatch"] += 1
-                elif any(o1.index(n) != o2.index(n) for n in common):
-                    skip_reasons["permuted outputs"] += 1
-                elif bool(s1.get("has_yield") or s2.get("has_yield")):
-                    has_pre = False
-                    if not effective_skip_closures:
-                        for u_item, s_text, tr in (
-                            (u1_eff, f1_plan.orig_text, tree1),
-                            (u2_eff, f2_text, tree2),
-                        ):
-                            sn = _resolve_downstream_scope_node(s_text or "", u_item, tr)
-                            b = _get_valid_unit_bounds(u_item)
-                            if sn and b:
-                                col = _extract_first_unit_coord(
-                                    u_item, ("start_col", "start_col_offset")
-                                )
-                                pre = _collect_pre_unit_closures(
-                                    sn, b[0], u_start_col=col, module_tree=tr
-                                )
-                                if pre:
-                                    has_pre = True
-                                    break
-                    if has_pre:
-                        skip_reasons["pre-unit closure"] += 1
-                    else:
-                        skip_reasons["generator output or closure conflict"] += 1
-                else:
-                    skip_reasons["unpaired outputs"] += 1
+            if resolved_outs.outputs is None:
+                reason = resolved_outs.skip_reason or "unpaired outputs"
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
                 logger.debug(
-                    "Skipping clone pair (%s, %s): failed to resolve clone pair outputs "
-                    "(necessity, pairing, or definiteness check failed)",
+                    "Skipping clone pair (%s, %s): failed to resolve clone pair outputs (%s)",
                     u1.get("name"),
                     u2.get("name"),
+                    reason,
                 )
                 continue
-            outputs, target_outs2 = resolved_outs
+            outputs, target_outs2 = resolved_outs.outputs
             if has_async_generator_delegation_hazard(
                 s1, s2, has_outputs=bool(outputs or target_outs2)
             ):
@@ -3352,7 +3356,7 @@ def _generate_refactoring_patch_impl(
                 outputs=outputs,
                 outputs2=target_outs2,
             )
-            if not helper_code:
+            if not helper_code or not _validate_helper_compilation(helper_code):
                 skip_reasons["shared helper synthesis failed"] += 1
                 continue
 
@@ -3920,18 +3924,15 @@ def generate_refactoring_patch(
     closure_strictness: Optional[str] = None,
 ) -> str:
     """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
-    try:
-        return _generate_refactoring_patch_impl(
-            clones=clones,
-            repo_root=repo_root,
-            type_merge_strategy=type_merge_strategy,
-            replace_clones=replace_clones,
-            method_binding=method_binding,
-            cross_file_strategy=cross_file_strategy,
-            shared_module_name=shared_module_name,
-            depgraph=depgraph,
-            skip_pre_unit_closures=skip_pre_unit_closures,
-            closure_strictness=closure_strictness,
-        )
-    finally:
-        clear_dataflow_cache()
+    return _generate_refactoring_patch_impl(
+        clones=clones,
+        repo_root=repo_root,
+        type_merge_strategy=type_merge_strategy,
+        replace_clones=replace_clones,
+        method_binding=method_binding,
+        cross_file_strategy=cross_file_strategy,
+        shared_module_name=shared_module_name,
+        depgraph=depgraph,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+        closure_strictness=closure_strictness,
+    )

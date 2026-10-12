@@ -485,7 +485,10 @@ class _ScopeVisitor(ast.NodeVisitor):
             created_outer = True
         inner_vars: Set[str] = set()
         self._scope_stack.append(inner_vars)
-        if any(getattr(g, "is_async", False) for g in node.generators):
+        if (
+            any(getattr(g, "is_async", False) for g in node.generators)
+            and len(self._scope_stack) <= 2
+        ):
             self.is_async = True
         for gen in node.generators:
             self.visit(gen.iter)
@@ -1484,7 +1487,7 @@ def _inspect_unit_scope(
 
     unit_is_async = unit.get("is_async")
     if unit_is_async is None:
-        if unit.get("is_subroutine") and not visitor.has_yield:
+        if is_subroutine and not visitor.has_yield:
             unit_is_async = visitor.is_async
         else:
             s_line = parse_unit_coord(unit, "start", default=1)
@@ -1496,6 +1499,17 @@ def _inspect_unit_scope(
                 )
             else:
                 unit_is_async = None
+
+    if visitor.is_async:
+        effective_is_async = True
+    elif "is_async" in unit and unit.get("is_async") is not None:
+        effective_is_async = bool(unit.get("is_async"))
+    elif visitor.has_yield:
+        effective_is_async = bool(unit_is_async) if unit_is_async is not None else False
+    elif not is_subroutine and unit.get("kind") not in ("function", "method"):
+        effective_is_async = bool(unit_is_async)
+    else:
+        effective_is_async = False
 
     return {
         "inputs": inputs,
@@ -1519,26 +1533,7 @@ def _inspect_unit_scope(
         "has_mangled_names": visitor.has_mangled_names,
         "local_imports": visitor.local_imports,
         "yield_expr_names": visitor.yield_expr_names,
-        "is_async": (
-            True
-            if visitor.is_async
-            else (
-                bool(unit.get("is_async"))
-                if "is_async" in unit and unit.get("is_async") is not None
-                else (
-                    (bool(unit_is_async) if unit_is_async is not None else None)
-                    if visitor.has_yield
-                    else (
-                        bool(unit_is_async)
-                        if (
-                            not unit.get("is_subroutine")
-                            and unit.get("kind") not in ("function", "method")
-                        )
-                        else False
-                    )
-                )
-            )
-        ),
+        "is_async": effective_is_async,
         "conditional_outputs": conditional_outputs,
         "definite_stores": sorted(def_assigned),
         "has_instance_binding": has_instance_binding,

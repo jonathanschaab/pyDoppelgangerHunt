@@ -21,7 +21,14 @@ _BUILTIN_NAMES: Set[str] = set(dir(builtins))
 def _record_import_names(
     node: Union[ast.Import, ast.ImportFrom], store_set: Set[str]
 ) -> None:
-    """Extracts bound symbol names from Import or ImportFrom statements, ignoring '*'."""
+    """Extracts bound symbol names from Import or ImportFrom statements, ignoring '*'.
+
+    Note:
+        Wildcard star imports (e.g., ``from numpy import *``) cannot statically reveal their
+        bound symbols without executing or resolving the module namespace. Dropping ``'*'``
+        avoids polluting symbol sets with invalid identifiers, but makes built-in shadowing
+        detection (such as eager consumer functions shadowed by numpy) optimistic.
+    """
     for alias in node.names:
         bound = (
             alias.asname

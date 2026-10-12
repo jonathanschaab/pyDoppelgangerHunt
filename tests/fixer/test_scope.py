@@ -1642,3 +1642,27 @@ def test_generator_expression_yield_does_not_set_yield_assignment() -> None:
     assert visitor_assign.has_yield_assignment is True
 
 
+def test_sync_outer_containing_nested_async_comprehension(tmp_path: Path) -> None:
+    """Verifies that an async comprehension inside a nested async def does not
+    mark the outer sync function as is_async."""
+    code = (
+        "def outer(y):\n"
+        "    async def inner():\n"
+        "        return [x async for x in y]\n"
+        "    return inner\n"
+    )
+    f = tmp_path / "outer_sync.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {
+        "file": "outer_sync.py",
+        "start": 1,
+        "end": 4,
+        "name": "outer",
+        "kind": "function",
+    }
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert scope["is_async"] is False
+
+
+

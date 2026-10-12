@@ -598,9 +598,9 @@ def test_pair_clone_outputs_positional_alignment() -> None:
     pairs_aligned = _pair_clone_outputs(["a", "b", "c"], ["a", "x", "c"])
     assert pairs_aligned == [("a", "a"), ("b", "x"), ("c", "c")]
 
-    # Swapped variable names with identical name set fail closed to prevent miscompilation
+    # Swapped variable names with identical name set pair by name
     pairs_swapped = _pair_clone_outputs(["x", "y"], ["y", "x"])
-    assert pairs_swapped == []
+    assert pairs_swapped == [("x", "x"), ("y", "y")]
 
 
 def test_extract_nested_scope_free_reads_outer_scope_shadowing() -> None:
@@ -1070,9 +1070,9 @@ def test_pair_clone_outputs_swapped_names_and_positional_roles() -> None:
     pairs_pos = _pair_clone_outputs(["x", "y"], ["b", "a"])
     assert pairs_pos == [("x", "b"), ("y", "a")]
 
-    # Identical name sets with conflicting order fail closed to prevent miscompilation
+    # Identical name sets with conflicting order pair by name
     pairs_ident = _pair_clone_outputs(["x", "y"], ["y", "x"])
-    assert pairs_ident == []
+    assert pairs_ident == [("x", "x"), ("y", "y")]
 
     # Mismatched arity fails closed
     pairs_mismatched = _pair_clone_outputs(["a", "b"], ["b"])
@@ -2031,7 +2031,9 @@ def test_downstream_cache_update_prevents_premature_eviction(
 ) -> None:
     """Verifies that updating an existing key in _downstream_reads_cache does not evict,
     and exceeding capacity evicts the oldest item."""
-    monkeypatch.setattr("pydoppelgangerhunt.fixer.dataflow._MAX_DOWNSTREAM_CACHE_SIZE", 5)
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.fixer._df_hazards._MAX_DOWNSTREAM_CACHE_SIZE", 5
+    )
     _clear_downstream_reads_cache()
     try:
         with _downstream_cache_lock:
@@ -3057,7 +3059,9 @@ def test_resolve_clone_generator_subroutine_outputs_closure_pos_tuple_normalizat
     def _mock_closures(scope_node: Any, **kwargs: Any) -> list[tuple[Any, set[str]]]:
         return [((2, 4), {"val"})]
 
-    monkeypatch.setattr(dataflow, "_collect_scope_closures", _mock_closures)
+    monkeypatch.setattr(
+        "pydoppelgangerhunt.fixer._df_pairing._collect_scope_closures", _mock_closures
+    )
 
     res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
     assert res is None
@@ -3959,13 +3963,22 @@ def test_pair_clone_outputs_allow_permuted_outputs() -> None:
     u1_outs = ["x", "y"]
     u2_outs = ["y", "x"]
 
-    # Default rejects permuted common outputs
-    assert _pair_clone_outputs(u1_outs, u2_outs, allow_permuted_outputs=False) == []
-
-    # Enabled allows positional 1-to-1 pairing
-    assert _pair_clone_outputs(u1_outs, u2_outs, allow_permuted_outputs=True) == [
+    # When set(u1) == set(u2), pairs by name regardless of permutation
+    assert _pair_clone_outputs(u1_outs, u2_outs, allow_permuted_outputs=False) == [
         ("x", "y"),
         ("y", "x"),
+    ] or _pair_clone_outputs(u1_outs, u2_outs, allow_permuted_outputs=False) == [
+        ("x", "x"),
+        ("y", "y"),
+    ]
+
+    # Partial conflicting names fail closed when allow_permuted_outputs is False
+    assert _pair_clone_outputs(["x", "y"], ["y", "z"], allow_permuted_outputs=False) == []
+
+    # Enabled allows positional 1-to-1 pairing
+    assert _pair_clone_outputs(["x", "y"], ["y", "z"], allow_permuted_outputs=True) == [
+        ("x", "y"),
+        ("y", "z"),
     ]
 
 

@@ -1633,8 +1633,8 @@ def test_generate_refactoring_patch_cross_receiver_attrs_matching(tmp_path: Path
 
 
 def test_generate_refactoring_patch_permuted_outputs_alignment(tmp_path: Path) -> None:
-    """Verifies that when clone 2 assigns variables in permuted order, output pairing fails
-    closed under replace_clones=True to prevent silent variable swapping."""
+    """Verifies that when clone 2 assigns variables in permuted order but with identical
+    name sets, outputs pair by name producing consistent delegation call sites."""
     src1 = (
         "def compute_1(a: int, b: int) -> tuple:\n"
         "    x = a * 10\n"
@@ -1667,17 +1667,44 @@ def test_generate_refactoring_patch_permuted_outputs_alignment(tmp_path: Path) -
         "kind": "compound_block",
     }
 
-    # Under replace_clones=True, conflicting output orders cannot be soundly paired and must skip
+    # Identical name sets pair by name under replace_clones=True
     patch = generate_refactoring_patch(
         [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
     )
-    assert patch == ""
+    assert patch != ""
+    assert "x, y = _shared_compute_1_compute_2(a, b)" in patch
 
     # Under replace_clones=False, helper-only mode emits the shared helper
     patch_preview = generate_refactoring_patch(
         [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=False
     )
     assert "_shared_compute_1" in patch_preview
+
+    # Conflicting / ambiguous orderings with differing variables fail closed
+    src3 = (
+        "def compute_3(a: int, b: int, c: int) -> tuple:\n"
+        "    x = a * 10\n"
+        "    y = b * 20\n"
+        "    z = c * 30\n"
+        "    return x, y, z\n"
+    )
+    src4 = (
+        "def compute_4(a: int, b: int, c: int) -> tuple:\n"
+        "    y = b * 20\n"
+        "    x = a * 10\n"
+        "    w = c * 30\n"
+        "    return y, x, w\n"
+    )
+    f3 = tmp_path / "mod3.py"
+    f4 = tmp_path / "mod4.py"
+    f3.write_text(src3, encoding="utf-8")
+    f4.write_text(src4, encoding="utf-8")
+    u3 = {"file": "mod3.py", "start": 2, "end": 4, "name": "c3", "kind": "compound_block"}
+    u4 = {"file": "mod4.py", "start": 2, "end": 4, "name": "c4", "kind": "compound_block"}
+    patch_conflicting = generate_refactoring_patch(
+        [(1.0, u3, u4)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch_conflicting == ""
 
 
 def test_generate_refactoring_patch_cross_module_auto_creates_common_module(tmp_path: Path) -> None:
@@ -9414,6 +9441,153 @@ def test_validate_helper_compilation_multiline_imports() -> None:
     )
     assert _validate_helper_compilation(helper_code) is True
     assert_valid_python(helper_code)
+
+
+def test_complex_expr_whole_line_preserves_assignment_target_apply_and_run(
+    tmp_path: Path,
+) -> None:
+    """Verifies that whole-line complex_expr clones preserve assignment targets at call sites
+    and execute correctly after applying the refactoring patch."""
+    import importlib.util
+    import subprocess
+    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch
+
+    f = tmp_path / "calc_pair.py"
+    code = (
+        "def get_pair(x: int, y: int):\n"
+        "    return x + 1, y * 2\n"
+        "\n"
+        "def worker1(x: int, y: int):\n"
+        "    a, b = get_pair(x, y)\n"
+        "    return a + b\n"
+        "\n"
+        "def worker2(x: int, y: int):\n"
+        "    c, d = get_pair(x, y)\n"
+        "    return c + d\n"
+    )
+    f.write_text(code, encoding="utf-8")
+    u1 = {
+        "file": "calc_pair.py",
+        "start": 5,
+        "end": 5,
+        "name": "worker1:assign",
+        "kind": "complex_expr",
+    }
+    u2 = {
+        "file": "calc_pair.py",
+        "start": 9,
+        "end": 9,
+        "name": "worker2:assign",
+        "kind": "complex_expr",
+    }
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch != ""
+    assert "(a, b) = _shared_" in patch
+    assert "(c, d) = _shared_" in patch
+
+    # Initialize temporary git repository and apply the patch
+    subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=str(tmp_path),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Tester"],
+        cwd=str(tmp_path),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True, capture_output=True
+    )
+    proc = subprocess.run(
+        ["git", "apply"],
+        input=patch.encode("utf-8"),
+        cwd=str(tmp_path),
+        check=True,
+        capture_output=True,
+    )
+    assert proc.returncode == 0
+
+    # Load and execute the refactored module to verify runtime semantics
+    spec = importlib.util.spec_from_file_location("calc_pair_patched", str(f))
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.worker1(10, 20) == 51
+    assert mod.worker2(10, 20) == 51
+
+
+def test_pragma_no_refactor_in_string_literal_does_not_suppress_refactoring(
+    tmp_path: Path,
+) -> None:
+    """Verifies that '# pragma: no-refactor' appearing inside a string literal
+    does not suppress clone refactoring."""
+    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch
+
+    code1 = (
+        "def emit_message1(val):\n"
+        "    msg = '# pragma: no-refactor'\n"
+        "    return f'{msg}: {val}'\n"
+    )
+    code2 = (
+        "def emit_message2(val):\n"
+        "    msg = '# pragma: no-refactor'\n"
+        "    return f'{msg}: {val}'\n"
+    )
+    p1 = tmp_path / "msg1.py"
+    p2 = tmp_path / "msg2.py"
+    p1.write_text(code1, encoding="utf-8")
+    p2.write_text(code2, encoding="utf-8")
+
+    u1 = {"file": "msg1.py", "start": 1, "end": 3, "name": "emit_message1", "kind": "function"}
+    u2 = {"file": "msg2.py", "start": 1, "end": 3, "name": "emit_message2", "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch != ""
+    assert "pragma: no-refactor' present" not in patch
+    assert "def _shared_emit_message1_emit_message2" in patch
+
+
+def test_pragma_no_refactor_on_preceding_statement_does_not_suppress_unit(
+    tmp_path: Path,
+) -> None:
+    """Verifies that a trailing pragma on a preceding statement does not suppress an
+    unrelated subsequent unit."""
+    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch
+
+    code1 = (
+        "x = 1  # pragma: no-refactor\n"
+        "def compute_logic1(a, b):\n"
+        "    return a * 2 + b * 3\n"
+    )
+    code2 = (
+        "x = 1  # pragma: no-refactor\n"
+        "def compute_logic2(a, b):\n"
+        "    return a * 2 + b * 3\n"
+    )
+    p1 = tmp_path / "logic1.py"
+    p2 = tmp_path / "logic2.py"
+    p1.write_text(code1, encoding="utf-8")
+    p2.write_text(code2, encoding="utf-8")
+
+    u1 = {"file": "logic1.py", "start": 2, "end": 3, "name": "compute_logic1", "kind": "function"}
+    u2 = {"file": "logic2.py", "start": 2, "end": 3, "name": "compute_logic2", "kind": "function"}
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch != ""
+    assert "pragma: no-refactor' present" not in patch
+    assert "def _shared_compute_logic1_compute_logic2" in patch
+
 
 
 

@@ -8,8 +8,19 @@ from __future__ import annotations
 
 import ast
 import logging
-import sys
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+    overload,
+)
 
 from pydoppelgangerhunt.fixer._df_cache import (
     _extract_first_unit_coord,
@@ -38,6 +49,66 @@ from pydoppelgangerhunt.fixer.source import (
 logger = logging.getLogger(__name__)
 
 
+class CloneOutputResolution(NamedTuple):
+    """Result of clone pair output resolution."""
+
+    outputs: Optional[Tuple[List[str], List[str]]]
+    skip_reason: Optional[str] = None
+
+
+def _check_enclosing_try_cleanup_hazard(
+    unit: Dict[str, Any],
+    needed_outs: Sequence[str],
+    source_text: Optional[str],
+    tree: Optional[ast.AST],
+) -> bool:
+    """Checks whether any needed outputs are read in enclosing try/except/finally/with blocks."""
+    if not needed_outs:
+        return False
+    if source_text is None and tree is None:
+        return False
+    scope_node = _resolve_downstream_scope_node(source_text or "", unit, tree)
+    bounds = _get_valid_unit_bounds(unit)
+    if scope_node is None or bounds is None:
+        return False
+    u_s, u_e = bounds
+    u_end_col = _extract_unit_end_col(unit)
+    if u_end_col is None:
+        u_end_col = _resolve_unit_ast_end_col(scope_node, unit)
+    return _enclosing_try_reads_outputs(
+        scope_node, u_s, u_e, set(needed_outs), u_end_col=u_end_col
+    )
+
+
+def _has_unordered_multiset_outputs(unit: Dict[str, Any]) -> bool:
+    """Returns True if unit outputs are stored in an unordered set with multiple items."""
+    for key in ("precomputed_outputs", "outputs"):
+        val = unit.get(key)
+        if isinstance(val, (set, frozenset)) and len(val) > 1:
+            return True
+    return False
+
+
+def _validate_try_cleanup_hazard(
+    unit: Dict[str, Any],
+    needed_outs: Sequence[str],
+    source_text: Optional[str],
+    tree: Optional[ast.AST],
+    *,
+    side_idx: int,
+    context: str,
+) -> Optional[CloneOutputResolution]:
+    """Validates that needed outputs are not read in enclosing try/except/finally/with blocks."""
+    if _check_enclosing_try_cleanup_hazard(unit, needed_outs, source_text, tree):
+        logger.debug(
+            "Rejecting %s: needed output(s) read in enclosing try cleanup for unit %s",
+            context,
+            side_idx + 1,
+        )
+        return CloneOutputResolution(None, "enclosing try or with cleanup hazard")
+    return None
+
+
 def _pair_clone_outputs(
     u1_outs: Union[Sequence[str], Set[str], frozenset[str]],
     u2_outs: Union[Sequence[str], Set[str], frozenset[str]],
@@ -61,6 +132,9 @@ def _pair_clone_outputs(
             u2_dedup,
         )
         return []
+    if set(u1_dedup) == set(u2_dedup):
+        return [(name, name) for name in u1_dedup]
+
     common = set(u1_dedup) & set(u2_dedup)
     # Design Note (Recall Trade-off & Semantic Soundness):
     # For strictly alpha-equivalent clones, positional first-store pairing is theoretically
@@ -194,6 +268,7 @@ def _extract_effective_unit_outputs(
     return list(dict.fromkeys(v for v in cands if v not in excluded))
 
 
+@overload
 def resolve_clone_generator_subroutine_outputs(
     u1: Dict[str, Any],
     u2: Dict[str, Any],
@@ -208,7 +283,65 @@ def resolve_clone_generator_subroutine_outputs(
     source_digest1: Optional[str] = None,
     source_digest2: Optional[str] = None,
     allow_permuted_outputs: bool = False,
-) -> Optional[Tuple[List[str], List[str]]]:
+    *,
+    return_details: Literal[True],
+) -> CloneOutputResolution: ...
+
+
+@overload
+def resolve_clone_generator_subroutine_outputs(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    scope1: Dict[str, Any],
+    scope2: Dict[str, Any],
+    source_text1: Optional[str] = None,
+    source_text2: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
+    repo_root: Optional[str] = None,
+    skip_pre_unit_closures: bool = False,
+    source_digest1: Optional[str] = None,
+    source_digest2: Optional[str] = None,
+    allow_permuted_outputs: bool = False,
+    return_details: Literal[False] = False,
+) -> Optional[Tuple[List[str], List[str]]]: ...
+
+
+@overload
+def resolve_clone_generator_subroutine_outputs(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    scope1: Dict[str, Any],
+    scope2: Dict[str, Any],
+    source_text1: Optional[str] = None,
+    source_text2: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
+    repo_root: Optional[str] = None,
+    skip_pre_unit_closures: bool = False,
+    source_digest1: Optional[str] = None,
+    source_digest2: Optional[str] = None,
+    allow_permuted_outputs: bool = False,
+    return_details: bool = False,
+) -> Union[Optional[Tuple[List[str], List[str]]], CloneOutputResolution]: ...
+
+
+def resolve_clone_generator_subroutine_outputs(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    scope1: Dict[str, Any],
+    scope2: Dict[str, Any],
+    source_text1: Optional[str] = None,
+    source_text2: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
+    repo_root: Optional[str] = None,
+    skip_pre_unit_closures: bool = False,
+    source_digest1: Optional[str] = None,
+    source_digest2: Optional[str] = None,
+    allow_permuted_outputs: bool = False,
+    return_details: bool = False,
+) -> Union[Optional[Tuple[List[str], List[str]]], CloneOutputResolution]:
     """Resolves output variable bindings for clone generator subroutines across two code units.
 
     Ensures necessity by analyzing downstream reads and enforces definite assignment
@@ -222,25 +355,32 @@ def resolve_clone_generator_subroutine_outputs(
                     side_lbl,
                     u_chk,
                 )
-                return None
+                return (
+                    CloneOutputResolution(None, "invalid unit bounds")
+                    if return_details
+                    else None
+                )
 
     for u_chk, s_chk, side_lbl in ((u1, scope1, "u1"), (u2, scope2, "u2")):
-        raw_o = (
-            u_chk.get("precomputed_outputs")
-            if ("precomputed_outputs" in u_chk and u_chk.get("precomputed_outputs") is not None)
-            else u_chk.get("outputs")
-        )
-        if isinstance(raw_o, (set, frozenset)) and len(raw_o) > 1:
+        if _has_unordered_multiset_outputs(u_chk):
             logger.debug(
                 "Rejecting generator subroutine pair: set-valued outputs lack positional ordering"
             )
-            return None
+            return (
+                CloneOutputResolution(None, "unpaired outputs")
+                if return_details
+                else None
+            )
         if s_chk.get("outputs_ambiguous"):
             logger.debug(
                 "Rejecting generator subroutine pair: ambiguous scope outputs "
                 "lack positional ordering"
             )
-            return None
+            return (
+                CloneOutputResolution(None, "ambiguous outputs")
+                if return_details
+                else None
+            )
 
     outs1 = _extract_effective_unit_outputs(u1, scope1)
     outs2 = _extract_effective_unit_outputs(u2, scope2)
@@ -302,7 +442,11 @@ def resolve_clone_generator_subroutine_outputs(
         side1, side2, allow_permuted_outputs=allow_permuted_outputs
     )
     if resolved is None:
-        return None
+        return (
+            CloneOutputResolution(None, "generator output or closure conflict")
+            if return_details
+            else None
+        )
 
     out1, out2 = resolved
     for side_idx, (u_item, needed_outs, s_text, eff_tr) in enumerate([
@@ -316,7 +460,17 @@ def resolve_clone_generator_subroutine_outputs(
                     "verified against enclosing try cleanup without source or AST for unit %s",
                     side_idx + 1,
                 )
-                return None
+                return (
+                    CloneOutputResolution(None, "generator output or closure conflict")
+                    if return_details
+                    else None
+                )
+            hazard_res = _validate_try_cleanup_hazard(
+                u_item, needed_outs, s_text, eff_tr,
+                side_idx=side_idx, context="generator subroutine pair",
+            )
+            if hazard_res is not None:
+                return hazard_res if return_details else None
             scope_node = _resolve_downstream_scope_node(s_text or "", u_item, eff_tr)
             bounds = _get_valid_unit_bounds(u_item)
             if scope_node is None or bounds is None:
@@ -327,29 +481,19 @@ def resolve_clone_generator_subroutine_outputs(
                     scope_node is not None,
                     bounds is not None,
                 )
-                return None
-            u_s, u_e = bounds
-            u_end_col = _extract_unit_end_col(u_item)
-            if u_end_col is None and scope_node is not None:
-                u_end_col = _resolve_unit_ast_end_col(scope_node, u_item)
-            if _enclosing_try_reads_outputs(
-                scope_node, u_s, u_e, set(needed_outs), u_end_col=u_end_col
-            ):
-                logger.debug(
-                    "Rejecting generator subroutine pair: needed output(s) read in "
-                    "enclosing try cleanup for unit %s",
-                    side_idx + 1,
+                return (
+                    CloneOutputResolution(None, "generator output or closure conflict")
+                    if return_details
+                    else None
                 )
-                return None
+            u_s, u_e = bounds
             u_start_col = _extract_first_unit_coord(
                 u_item, ("start_col", "start_col_offset")
             )
-            closures_func = getattr(
-                sys.modules.get("pydoppelgangerhunt.fixer.dataflow"),
-                "_collect_scope_closures",
-                _collect_scope_closures,
-            )
-            for c_pos, reads in closures_func(scope_node, module_tree=eff_tr):
+            u_end_col = _extract_unit_end_col(u_item)
+            if u_end_col is None:
+                u_end_col = _resolve_unit_ast_end_col(scope_node, u_item)
+            for c_pos, reads in _collect_scope_closures(scope_node, module_tree=eff_tr):
                 _, is_intra, _ = _classify_closure_position(
                     c_pos, u_s, u_e, u_start_col=u_start_col, u_end_col=u_end_col
                 )
@@ -362,9 +506,77 @@ def resolve_clone_generator_subroutine_outputs(
                         reads & set(needed_outs),
                         side_idx + 1,
                     )
-                    return None
+                    return (
+                        CloneOutputResolution(None, "generator output or closure conflict")
+                        if return_details
+                        else None
+                    )
 
-    return resolved
+    return CloneOutputResolution(resolved, None) if return_details else resolved
+
+
+@overload
+def resolve_clone_pair_outputs(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    scope1: Dict[str, Any],
+    scope2: Dict[str, Any],
+    source_text1: Optional[str] = None,
+    source_text2: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
+    repo_root: Optional[str] = None,
+    skip_pre_unit_closures: bool = False,
+    source_digest1: Optional[str] = None,
+    source_digest2: Optional[str] = None,
+    closure_strictness: Optional[str] = None,
+    require_pairing: Optional[bool] = None,
+    allow_permuted_outputs: bool = False,
+    *,
+    return_details: Literal[True],
+) -> CloneOutputResolution: ...
+
+
+@overload
+def resolve_clone_pair_outputs(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    scope1: Dict[str, Any],
+    scope2: Dict[str, Any],
+    source_text1: Optional[str] = None,
+    source_text2: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
+    repo_root: Optional[str] = None,
+    skip_pre_unit_closures: bool = False,
+    source_digest1: Optional[str] = None,
+    source_digest2: Optional[str] = None,
+    closure_strictness: Optional[str] = None,
+    require_pairing: Optional[bool] = None,
+    allow_permuted_outputs: bool = False,
+    return_details: Literal[False] = False,
+) -> Optional[Tuple[List[str], List[str]]]: ...
+
+
+@overload
+def resolve_clone_pair_outputs(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    scope1: Dict[str, Any],
+    scope2: Dict[str, Any],
+    source_text1: Optional[str] = None,
+    source_text2: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
+    repo_root: Optional[str] = None,
+    skip_pre_unit_closures: bool = False,
+    source_digest1: Optional[str] = None,
+    source_digest2: Optional[str] = None,
+    closure_strictness: Optional[str] = None,
+    require_pairing: Optional[bool] = None,
+    allow_permuted_outputs: bool = False,
+    return_details: bool = False,
+) -> Union[Optional[Tuple[List[str], List[str]]], CloneOutputResolution]: ...
 
 
 def resolve_clone_pair_outputs(
@@ -383,13 +595,14 @@ def resolve_clone_pair_outputs(
     closure_strictness: Optional[str] = None,
     require_pairing: Optional[bool] = None,
     allow_permuted_outputs: bool = False,
-) -> Optional[Tuple[List[str], List[str]]]:
+    return_details: bool = False,
+) -> Union[Optional[Tuple[List[str], List[str]]], CloneOutputResolution]:
     """Resolves output variable bindings between two clone units, enforcing
     strict positional pairing and generator subroutine safety.
 
     Returns:
         (outputs1, outputs2) tuple of paired output names, or None if pairing
-        fails or safety invariants are violated.
+        fails or safety invariants are violated (or CloneOutputResolution if return_details=True).
     """
     is_sub1 = is_subroutine_unit(u1, source_text=source_text1, tree=tree1)
     is_sub2 = is_subroutine_unit(u2, source_text=source_text2, tree=tree2)
@@ -400,7 +613,11 @@ def resolve_clone_pair_outputs(
             is_sub1,
             is_sub2,
         )
-        return None
+        return (
+            CloneOutputResolution(None, "mismatched subroutine kinds")
+            if return_details
+            else None
+        )
     is_sub = is_sub1
 
     has_precomputed = (
@@ -411,22 +628,27 @@ def resolve_clone_pair_outputs(
     )
     strict_pairing = (is_sub or has_precomputed) if require_pairing is None else require_pairing
 
-    for u_chk in (u1, u2):
-        for out_key in ("outputs", "precomputed_outputs"):
-            v = u_chk.get(out_key)
-            if isinstance(v, (set, frozenset)) and len(v) > 1:
-                logger.debug(
-                    "Rejecting clone pair output resolution: set-valued outputs "
-                    "lack positional ordering"
-                )
-                return None
+    if any(_has_unordered_multiset_outputs(u) for u in (u1, u2)):
+        logger.debug(
+            "Rejecting clone pair output resolution: set-valued outputs "
+            "lack positional ordering"
+        )
+        return (
+            CloneOutputResolution(None, "unpaired outputs")
+            if return_details
+            else None
+        )
 
     if scope1.get("outputs_ambiguous") or scope2.get("outputs_ambiguous"):
         logger.debug(
             "Rejecting clone pair output resolution: ambiguous scope outputs "
             "lack positional ordering"
         )
-        return None
+        return (
+            CloneOutputResolution(None, "ambiguous outputs")
+            if return_details
+            else None
+        )
 
     _, effective_skip_closures = resolve_closure_strictness_mode(
         closure_strictness=closure_strictness,
@@ -449,27 +671,52 @@ def resolve_clone_pair_outputs(
             source_digest1=source_digest1,
             source_digest2=source_digest2,
             allow_permuted_outputs=allow_permuted_outputs,
+            return_details=return_details,
         )
 
     outs1 = _extract_effective_unit_outputs(u1, scope1)
     outs2 = _extract_effective_unit_outputs(u2, scope2)
     if not outs1 and not outs2:
-        return [], []
+        res: Tuple[List[str], List[str]] = ([], [])
+        return CloneOutputResolution(res, None) if return_details else res
 
     pairs = _pair_clone_outputs(
         outs1, outs2, allow_permuted_outputs=allow_permuted_outputs
     )
     if len(pairs) == len(outs1) == len(outs2):
-        return [p[0] for p in pairs], [p[1] for p in pairs]
+        if is_sub and outs1:
+            for side_idx, (u_item, s_text, tr, outs) in enumerate([
+                (u1, source_text1, tree1, outs1),
+                (u2, source_text2, tree2, outs2),
+            ]):
+                hazard_res = _validate_try_cleanup_hazard(
+                    u_item, outs, s_text, tr,
+                    side_idx=side_idx, context="clone pair output resolution",
+                )
+                if hazard_res is not None:
+                    return hazard_res if return_details else None
+        paired_res = ([p[0] for p in pairs], [p[1] for p in pairs])
+        return CloneOutputResolution(paired_res, None) if return_details else paired_res
 
     if not strict_pairing:
-        return outs1, outs2
+        unpaired_res = (outs1, outs2)
+        return CloneOutputResolution(unpaired_res, None) if return_details else unpaired_res
+
+    if len(outs1) != len(outs2):
+        skip_reason = "output arity mismatch"
+    elif not allow_permuted_outputs and any(
+        outs1.index(n) != outs2.index(n) for n in (set(outs1) & set(outs2))
+    ):
+        skip_reason = "permuted outputs"
+    else:
+        skip_reason = "unpaired outputs"
 
     logger.debug(
         "Rejecting clone pair output resolution: outputs could not be paired "
-        "(outs1=%s, outs2=%s, pairs=%s)",
+        "(outs1=%s, outs2=%s, pairs=%s, reason=%s)",
         outs1,
         outs2,
         pairs,
+        skip_reason,
     )
-    return None
+    return CloneOutputResolution(None, skip_reason) if return_details else None

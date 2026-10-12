@@ -749,3 +749,32 @@ def test_load_unit_file_text_prioritizes_disk_over_source_lines(tmp_path: Path) 
     assert loaded == full_text
 
 
+def test_dedent_source_text_multiple_form_feeds() -> None:
+    """Verifies that dedent_source_text correctly preserves multiple form feed characters."""
+    from pydoppelgangerhunt.fixer.source import dedent_source_text
+
+    raw = " a\n\x0c b\n\x0c c\n"
+    dedented = dedent_source_text(raw)
+    assert dedented == "a\n\x0cb\n\x0cc\n"
+
+
+def test_load_unit_file_text_prioritizes_unsliced_source_lines_over_disk(tmp_path: Path) -> None:
+    """Verifies that unsliced in-memory source_lines take precedence over disk (IDE buffer)."""
+    from pydoppelgangerhunt.fixer.source import _load_unit_file_text
+
+    disk_text = "x = 1\ny = 2\n"
+    target_file = tmp_path / "module.py"
+    target_file.write_text(disk_text, encoding="utf-8")
+
+    unsaved_lines = ["x = 100\n", "y = 200\n", "z = 300\n"]
+    unit = {
+        "file": str(target_file),
+        "start": 1,
+        "end": 2,
+        "source_lines": unsaved_lines,
+    }
+    loaded = _load_unit_file_text(unit, repo_root=str(tmp_path))
+    assert loaded == "x = 100\ny = 200\nz = 300\n"
+
+
+

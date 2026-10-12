@@ -6,7 +6,6 @@ import ast
 from collections import OrderedDict
 import hashlib
 import logging
-import sys
 import threading
 from typing import (
     Any,
@@ -33,7 +32,7 @@ _MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
 _MAX_SCOPE_CACHE_SIZE: int = 1024
 _MAX_PARSED_TREE_CACHE_SIZE: int = 128
 _downstream_reads_cache: OrderedDict[Tuple[Any, ...], frozenset[str]] = OrderedDict()
-_parsed_tree_cache: OrderedDict[Tuple[str, int], Optional[ast.AST]] = OrderedDict()
+_parsed_tree_cache: OrderedDict[Tuple[str, int, str], Optional[ast.AST]] = OrderedDict()
 
 _scope_parent_maps: OrderedDict[ast.AST, Dict[ast.AST, ast.AST]] = OrderedDict()
 _scope_stmts_by_end: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
@@ -120,11 +119,11 @@ def _get_or_parse_tree(
     if not source_text.strip():
         return None
     content_hash = (
-        source_digest
+        str(source_digest)
         if source_digest is not None
         else hashlib.sha256(source_text.encode("utf-8", errors="replace")).hexdigest()
     )
-    key = (content_hash, len(source_text))
+    key = (content_hash, len(source_text), source_text)
     with _downstream_cache_lock:
         if key in _parsed_tree_cache:
             cached_tree = _parsed_tree_cache[key]
@@ -327,15 +326,9 @@ def _build_downstream_cache_key(
     skip_pre_unit_closures: bool,
     source_digest: Optional[str] = None,
     resolved_end_col: Optional[int] = None,
-    tree: Optional[ast.AST] = None,
     unit_inputs: Optional[Set[str]] = None,
 ) -> _DownstreamCacheKey:
     """Forms a persistent cache key for downstream AST read analysis.
-
-    Note:
-        The `tree` parameter is retained for backwards compatibility. AST nodes
-        are intentionally excluded from cache keys to prevent memory pinning
-        of parsed module trees and cross-thread lifecycle retention.
 
     Args:
         source_text: Full module source code string.
@@ -346,19 +339,12 @@ def _build_downstream_cache_key(
         skip_pre_unit_closures: Whether pre-unit closure read capture is bypassed.
         source_digest: Optional hex SHA-256 digest of source_text.
         resolved_end_col: Pre-resolved end column offset if available.
-        tree: Optional pre-parsed module AST (unused; retained for compatibility).
         unit_inputs: Precomputed live unit inputs.
     """
-    del tree
     if source_digest is not None:
         content_digest = str(source_digest)
     else:
-        sha_module = getattr(
-            sys.modules.get("pydoppelgangerhunt.fixer.dataflow"),
-            "hashlib",
-            hashlib,
-        )
-        content_digest = sha_module.sha256(
+        content_digest = hashlib.sha256(
             source_text.encode("utf-8", errors="replace")
         ).hexdigest()
 
