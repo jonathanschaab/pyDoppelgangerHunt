@@ -871,7 +871,7 @@ class _StrictPostLineVisitor(_DownstreamReadVisitor):
         return False
 
 
-class _UnitLiveInVisitor(ast.NodeVisitor):
+class _UnitLiveInVisitor(_BaseScopeVisitor):
     """Extracts live-in variable names (loaded before being stored) within a unit's bounds."""
 
     def __init__(
@@ -881,6 +881,7 @@ class _UnitLiveInVisitor(ast.NodeVisitor):
         u_end_col: Optional[int] = None,
         candidates: Optional[Set[str]] = None,
     ) -> None:
+        super().__init__()
         self.u_start = u_start
         self.u_end = u_end
         self.u_end_col = u_end_col
@@ -893,27 +894,79 @@ class _UnitLiveInVisitor(ast.NodeVisitor):
             node, self.u_start, self.u_end, self.u_end_col
         )
 
+    def _record_live_in(self, name: str) -> None:
+        """Records a variable name as a live-in if not stored, in comp, or builtin."""
+        if (
+            name not in self.stored
+            and not self._is_in_comp(name)
+            and (self.candidates is None or name in self.candidates)
+            and name not in _BUILTIN_NAMES
+        ):
+            self.live_ins.add(name)
+
+    def _record_nested_free_reads(
+        self,
+        node: Union[
+            ast.FunctionDef,
+            ast.AsyncFunctionDef,
+            ast.Lambda,
+            ast.ClassDef,
+        ],
+    ) -> None:
+        for free in _extract_nested_scope_free_reads(
+            node, candidates=self.candidates
+        ):
+            self._record_live_in(free)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        if self._is_inside(node):
+            self._record_nested_free_reads(node)
+        else:
+            self.generic_visit(node)
+
+    def visit_FunctionDef(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
+    ) -> None:
+        if self._is_inside(node):
+            self.stored.add(node.name)
+            self._record_nested_free_reads(node)
+        else:
+            self.generic_visit(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        if self._is_inside(node):
+            self.stored.add(node.name)
+            self._record_nested_free_reads(node)
+        else:
+            self.generic_visit(node)
+
+    def _visit_import_node(self, node: Union[ast.Import, ast.ImportFrom]) -> None:
+        if self._is_inside(node):
+            self._record_import_names(node, self.stored)
+        else:
+            self.generic_visit(node)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self._visit_import_node(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self._visit_import_node(node)
+
     def visit_Name(self, node: ast.Name) -> None:
         if self._is_inside(node):
             if isinstance(node.ctx, ast.Load):
-                if (
-                    node.id not in self.stored
-                    and (self.candidates is None or node.id in self.candidates)
-                    and node.id not in _BUILTIN_NAMES
-                ):
-                    self.live_ins.add(node.id)
+                self._record_live_in(node.id)
             elif isinstance(node.ctx, ast.Store):
-                self.stored.add(node.id)
+                if not self._is_in_comp(node.id):
+                    self.stored.add(node.id)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         if self._is_inside(node):
             if isinstance(node.target, ast.Name):
-                if (
-                    node.target.id not in self.stored
-                    and (self.candidates is None or node.target.id in self.candidates)
-                    and node.target.id not in _BUILTIN_NAMES
-                ):
-                    self.live_ins.add(node.target.id)
+                self._record_live_in(node.target.id)
             self.visit(node.value)
             if isinstance(node.target, ast.Name):
                 self.stored.add(node.target.id)

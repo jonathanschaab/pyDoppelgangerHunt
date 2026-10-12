@@ -39,6 +39,11 @@ from pydoppelgangerhunt.fixer.source import (
     split_source_lines,
 )
 
+_ASSIGN_STMT_RE = re.compile(
+    r"^[a-zA-Z_]\w*(?:\s*:\s*[^=]+)?\s*(?<![=<>!:])=(?!=)\s*(.+)$"
+)
+
+
 def _format_call_arguments(
     inputs: List[str],
     param_details: List[Dict[str, Any]],
@@ -1186,10 +1191,7 @@ def synthesize_shared_helper_code(
                     common_lines = ["return ("] + expr_inner + [")"]
             elif len(common_lines) == 1:
                 first_expr = common_lines[0].strip()
-                m_assign = re.match(
-                    r"^[a-zA-Z_]\w*(?:\s*:\s*[^=]+)?\s*(?<![=<>!:])=(?!=)\s*(.+)$",
-                    first_expr,
-                )
+                m_assign = _ASSIGN_STMT_RE.match(first_expr)
                 if m_assign:
                     first_expr = m_assign.group(1).strip()
                 common_lines = [f"return {first_expr}"]

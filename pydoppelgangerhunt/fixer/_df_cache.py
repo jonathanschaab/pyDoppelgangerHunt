@@ -152,12 +152,14 @@ def _parse_source_tree(
     return _get_or_parse_tree(source_text, source_digest=source_digest)
 
 
-def _get_valid_unit_bounds(unit: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+def _get_valid_unit_bounds(unit: Any) -> Optional[Tuple[int, int]]:
     """Extracts positive start and end line coordinates from a unit dict."""
+    if not isinstance(unit, dict):
+        return None
     try:
         u_start = parse_unit_coord(unit, "start", default=0)
         u_end = parse_unit_coord(unit, "end", default=u_start)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
         return None
     if u_start <= 0 or u_end <= 0 or u_start > u_end:
         return None
@@ -168,13 +170,15 @@ def _extract_first_unit_coord(
     unit: Dict[str, Any], keys: Sequence[str]
 ) -> Optional[int]:
     """Returns the first successfully parsed coordinate among candidate keys."""
+    if not isinstance(unit, dict):
+        return None
     for key in keys:
         if key in unit and unit.get(key) is not None:
             try:
                 val = parse_unit_coord(unit, key, default=None)
                 if val is not None:
                     return val
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, AttributeError):
                 pass
     return None
 
@@ -218,13 +222,10 @@ def _resolve_unit_ast_end_col(
     scope_node: ast.AST, unit: Dict[str, Any]
 ) -> Optional[int]:
     """Resolves end column offset from statement boundaries within the enclosing scope."""
-    try:
-        u_start = parse_unit_coord(unit, "start", default=0)
-        u_end = parse_unit_coord(unit, "end", default=u_start)
-    except (ValueError, TypeError):
+    bounds = _get_valid_unit_bounds(unit)
+    if bounds is None:
         return None
-    if u_start <= 0 or u_end <= 0 or u_start > u_end:
-        return None
+    u_start, u_end = bounds
 
     parent_map = _get_scope_parent_map(scope_node)
     matching_stmts = list(_get_scope_stmts_by_end_lineno(scope_node).get(u_end, []))

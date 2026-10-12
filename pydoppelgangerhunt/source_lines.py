@@ -324,7 +324,7 @@ def resolve_safe_unit_file_path(
         # target_root is a symlink.
         if file_path.is_symlink():
             return None
-        repo_root_path = Path(repo_root) if repo_root else target_root
+        repo_root_path = Path(repo_root).resolve() if repo_root else target_root
         for parent in file_path.parents:
             if parent in (target_root, repo_root_path):
                 break

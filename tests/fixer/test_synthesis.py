@@ -3051,4 +3051,19 @@ def test_synthesize_complex_expr_tuple_and_multi_target_unpacking(tmp_path: Path
     assert_valid_python(helper_multi)
 
 
+def test_assign_stmt_re_module_constant() -> None:
+    """Verifies that _ASSIGN_STMT_RE correctly parses assignment statements."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _ASSIGN_STMT_RE,
+    )
 
+    m1 = _ASSIGN_STMT_RE.match("res = x + y")
+    assert m1 is not None
+    assert m1.group(1) == "x + y"
+
+    m2 = _ASSIGN_STMT_RE.match("total: int = a + b")
+    assert m2 is not None
+    assert m2.group(1) == "a + b"
+
+    assert _ASSIGN_STMT_RE.match("== not an assign") is None
+    assert _ASSIGN_STMT_RE.match("if a == b:") is None

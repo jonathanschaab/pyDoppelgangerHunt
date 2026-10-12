@@ -474,3 +474,30 @@ def test_resolve_unit_line_bounds_defensive_non_dict() -> None:
     assert resolve_unit_line_bounds("not_a_dict") == (1, 1)  # type: ignore[arg-type]
     assert resolve_unit_line_bounds(123) == (1, 1)  # type: ignore[arg-type]
 
+
+def test_resolve_safe_unit_file_path_relative_repo_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies resolve_safe_unit_file_path handles relative repo_root paths."""
+    from pydoppelgangerhunt.source_lines import (  # pylint: disable=import-outside-toplevel
+        resolve_safe_unit_file_path,
+    )
+
+    repo_dir = tmp_path / "my_project"
+    repo_dir.mkdir()
+    target_py = repo_dir / "main.py"
+    target_py.write_text("print('hello')\n", encoding="utf-8")
+
+    monkeypatch.chdir(tmp_path)
+    resolved = resolve_safe_unit_file_path(
+        {"file": "main.py"}, repo_root="my_project"
+    )
+    assert resolved == target_py.resolve()
+
+
+def test_get_valid_unit_bounds_defensive_non_dict() -> None:
+    """Verifies _get_valid_unit_bounds handles None and non-dict inputs defensively."""
+    assert _get_valid_unit_bounds(None) is None  # type: ignore[arg-type]
+    assert _get_valid_unit_bounds("invalid") is None  # type: ignore[arg-type]
+    assert _get_valid_unit_bounds([1, 2, 3]) is None  # type: ignore[arg-type]
+    assert _get_valid_unit_bounds(123) is None  # type: ignore[arg-type]

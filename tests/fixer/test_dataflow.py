@@ -4003,3 +4003,30 @@ def test_execute_read_pass_and_collect_closures_scalar_body() -> None:
     closures = _collect_scope_closures(lambda_node)
     assert isinstance(closures, list)
 
+
+def test_extract_unit_live_in_names_prunes_nested_scope_params_and_comprehensions() -> None:
+    """Verifies _extract_unit_live_in_names ignores parameters of nested functions and
+    lambdas, as well as comprehension targets, while preserving true live-in variables."""
+    code = (
+        "def outer():\n"
+        "    f = lambda p: p + a\n"
+        "    g = (x for x in items)\n"
+        "    l = [i * 2 for i in numbers]\n"
+        "    s = {k: v for k, v in pairs}\n"
+        "    def inner(q):\n"
+        "        temp = q + 1\n"
+        "        return temp + outer_val\n"
+        "    res = inner(5)\n"
+    )
+    tree = ast.parse(code)
+    # Unit covering the statements inside outer() (lines 2 to 9)
+    live_ins = _extract_unit_live_in_names(tree, 2, 9, candidates=None)
+    assert "p" not in live_ins
+    assert "x" not in live_ins
+    assert "i" not in live_ins
+    assert "k" not in live_ins
+    assert "v" not in live_ins
+    assert "q" not in live_ins
+    assert "temp" not in live_ins
+    assert "inner" not in live_ins
+    assert live_ins == {"a", "items", "numbers", "pairs", "outer_val"}
