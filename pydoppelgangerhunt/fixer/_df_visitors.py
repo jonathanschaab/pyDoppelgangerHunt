@@ -863,9 +863,23 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
 
 
 class _StrictPostLineVisitor(_DownstreamReadVisitor):
-    """Downstream read visitor strictly checking nodes starting after a given line and column."""
+    """Downstream read visitor strictly checking nodes starting after a given line and column.
+
+    Boundary Invariant:
+        When ``u_end_col`` is None, same-line statements on line ``u_end`` return False
+        (not after unit), whereas ``_DownstreamReadVisitor`` returns True (fail-closed).
+        This distinction is deliberate: ``_StrictPostLineVisitor`` evaluates statements
+        strictly occurring downstream of compound constructs (such as ``with`` or ``try``
+        blocks), whereas ``_DownstreamReadVisitor`` enforces fail-closed capture on
+        ambiguous unit boundaries.
+    """
 
     def _is_node_after_unit(self, node: ast.AST) -> bool:
+        """Determines if an AST node strictly occurs downstream of the unit boundary.
+
+        When ``u_end_col`` is None, same-line statements on line ``u_end`` return False
+        as they are not strictly downstream of the compound construct.
+        """
         lineno = getattr(node, "lineno", None)
         if lineno is None:
             return False

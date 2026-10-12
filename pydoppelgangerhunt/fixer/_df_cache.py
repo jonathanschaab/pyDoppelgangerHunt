@@ -317,6 +317,23 @@ class _DownstreamCacheKey(NamedTuple):
     unit_inputs: Optional[frozenset[str]] = None
 
 
+def _coerce_string_frozenset(raw_items: Any) -> Optional[frozenset[str]]:
+    """Safely coerces strings and ints from arbitrary raw inputs into a frozenset."""
+    if raw_items is None:
+        return None
+    iterable = (
+        [raw_items]
+        if isinstance(raw_items, (str, bytes, int))
+        else raw_items
+    )
+    try:
+        return frozenset(
+            str(x) for x in iterable if isinstance(x, (str, int))
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 def _build_downstream_cache_key(
     source_text: str,
     unit: Dict[str, Any],
@@ -354,11 +371,13 @@ def _build_downstream_cache_key(
         if resolved_end_col is not None
         else _extract_unit_end_col(unit)
     )
-    cands_key = frozenset(candidates) if candidates is not None else None
+    cands_key = _coerce_string_frozenset(candidates)
+
     unit_inputs_val = unit_inputs
     if unit_inputs_val is None and "inputs" in unit and unit["inputs"] is not None:
-        unit_inputs_val = set(unit["inputs"])
-    unit_inputs_key = frozenset(unit_inputs_val) if unit_inputs_val is not None else None
+        unit_inputs_val = unit["inputs"]
+    unit_inputs_key = _coerce_string_frozenset(unit_inputs_val)
+
     return _DownstreamCacheKey(
         content_digest=content_digest,
         start=u_start,

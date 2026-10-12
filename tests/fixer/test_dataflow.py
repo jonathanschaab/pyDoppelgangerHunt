@@ -3896,6 +3896,37 @@ def test_downstream_cache_key_differentiation_for_unit_inputs() -> None:
     assert reads2 is not None and "total" not in reads2
 
 
+def test_build_downstream_cache_key_unhashable_and_coercion_guards() -> None:
+    """Verifies that _build_downstream_cache_key safely coerces and filters unhashable inputs."""
+    src = "def f(x):\n    return x\n"
+    u_unhashable = {
+        "file": "test.py",
+        "start": 1,
+        "end": 2,
+        "inputs": [["nested", "list"], {"unhashable": "dict"}, "valid_var", 99],
+    }
+    key = _build_downstream_cache_key(
+        src,
+        u_unhashable,
+        1,
+        2,
+        candidates={"valid_var"},
+        skip_pre_unit_closures=False,
+    )
+    assert key.unit_inputs == frozenset({"valid_var", "99"})
+
+    # Also test unhashable or non-string candidate elements
+    key_cands = _build_downstream_cache_key(
+        src,
+        {"file": "test.py", "start": 1, "end": 2},
+        1,
+        2,
+        candidates=[["bad_cand"], "good_cand", 10],  # type: ignore[arg-type]
+        skip_pre_unit_closures=False,
+    )
+    assert key_cands.candidates == frozenset({"good_cand", "10"})
+
+
 def test_downstream_cache_lock_reentrancy() -> None:
     """Verifies that _downstream_cache_lock is re-entrant to prevent thread deadlocks."""
     assert isinstance(_downstream_cache_lock, type(threading.RLock()))
