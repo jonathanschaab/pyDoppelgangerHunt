@@ -2461,6 +2461,23 @@ def test_subroutine_async_preservation_in_async_func(tmp_path: Path) -> None:
     assert scope_gen.get("has_yield") is True
 
 
+def test_inspect_single_unit_scope_yield_with_unresolved_source_preserves_indeterminate_async(
+) -> None:
+    """Verifies that a yield-containing unit with unresolved enclosing source
+    preserves is_async=None rather than coercing to False."""
+    unit = {
+        "file": "virtual_module.py",
+        "start": 2,
+        "end": 2,
+        "source_lines": ["yield 42\n"],
+        "source_lines_is_sliced": True,
+        "is_subroutine": True,
+    }
+    scope = inspect_single_unit_scope(unit)
+    assert scope.get("has_yield") is True
+    assert scope.get("is_async") is None
+
+
 def test_generator_send_type_preserved_when_return_type_none() -> None:
     """Verifies that a generator with yield assignment but no outputs or return value
     preserves send type as Generator[yield_t, send_t, None] rather than

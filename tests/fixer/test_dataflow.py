@@ -3643,6 +3643,65 @@ def test_is_eagerly_consumed_genexp_call_arg_validation() -> None:
     assert _is_eagerly_consumed_genexp(genexp, parent_map_wrong) is False
 
 
+def test_is_confirmed_str_receiver_shadowed_builtins() -> None:
+    """Verifies that _is_confirmed_str_receiver rejects builtins.str when builtins is shadowed."""
+    from pydoppelgangerhunt.fixer._df_closures import _is_confirmed_str_receiver
+
+    node_builtins = ast.Attribute(
+        value=ast.Name(id="builtins", ctx=ast.Load()),
+        attr="str",
+        ctx=ast.Load(),
+    )
+    assert _is_confirmed_str_receiver(node_builtins, shadowed_names=None) is True
+    assert _is_confirmed_str_receiver(node_builtins, shadowed_names={"builtins"}) is False
+
+    node_dunder = ast.Attribute(
+        value=ast.Name(id="__builtins__", ctx=ast.Load()),
+        attr="str",
+        ctx=ast.Load(),
+    )
+    assert _is_confirmed_str_receiver(node_dunder, shadowed_names=None) is True
+    assert _is_confirmed_str_receiver(node_dunder, shadowed_names={"__builtins__"}) is False
+
+
+def test_eager_consumed_genexp_shadowed_builtins_rejects_join() -> None:
+    """Verifies that when builtins is shadowed by local assignment, builtins.str.join
+    is not treated as an eager consumer."""
+    from pydoppelgangerhunt.fixer._df_closures import _collect_scope_closures
+
+    code = (
+        "def worker():\n"
+        "    builtins = object()\n"
+        "    s = builtins.str.join(', ', (str(y) for y in [3, 4]))\n"
+        "    yield s\n"
+    )
+    tree = ast.parse(code)
+    closures = _collect_scope_closures(tree.body[0])
+    assert len(closures) == 1
+
+
+def test_parsed_tree_cache_key_without_redundant_source_text() -> None:
+    """Verifies that _parsed_tree_cache keys on (content_hash, length) without full source text."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _get_or_parse_tree,
+        _parsed_tree_cache,
+        clear_dataflow_cache,
+    )
+
+    clear_dataflow_cache()
+    src = "def sample():\n    return 1 + 2\n"
+    tree = _get_or_parse_tree(src)
+    assert tree is not None
+    assert len(_parsed_tree_cache) == 1
+    key = next(iter(_parsed_tree_cache.keys()))
+    assert len(key) == 2
+    assert isinstance(key[0], str)
+    assert isinstance(key[1], int)
+    assert key[1] == len(src)
+    clear_dataflow_cache()
+    assert len(_parsed_tree_cache) == 0
+
+
 def test_load_unit_file_text_synthetic_in_memory_fallback() -> None:
     """Verifies that _load_unit_file_text falls back to in-memory lines for virtual units."""
     unit = {

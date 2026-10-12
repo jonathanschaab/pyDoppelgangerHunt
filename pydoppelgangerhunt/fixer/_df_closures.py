@@ -77,7 +77,24 @@ def _extract_single_node_local_names(scope_node: ast.AST) -> Set[str]:
             continue
         if isinstance(curr, ast.Name) and isinstance(curr.ctx, ast.Store):
             names.add(curr.id)
-        elif isinstance(curr, (ast.Import, ast.ImportFrom)):
+        elif isinstance(curr, ast.Import):
+            for alias in curr.names:
+                bound = alias.asname or alias.name.split(".", 1)[0]
+                if (
+                    bound == "builtins"
+                    and alias.name == "builtins"
+                    and alias.asname in (None, "builtins")
+                ):
+                    continue
+                if bound != "*":
+                    names.add(bound)
+            continue
+        elif isinstance(curr, ast.ImportFrom):
+            if curr.module in ("builtins", "__builtins__"):
+                for alias in curr.names:
+                    if alias.asname and alias.asname != alias.name:
+                        names.add(alias.asname)
+                continue
             _record_import_names(curr, names)
             continue
         elif isinstance(curr, (ast.Global, ast.Nonlocal)):
@@ -139,6 +156,8 @@ def _is_confirmed_str_receiver(
         and node.value.id in ("builtins", "__builtins__")
         and node.attr == "str"
     ):
+        if shadowed_names is not None and node.value.id in shadowed_names:
+            return False
         return True
     return False
 

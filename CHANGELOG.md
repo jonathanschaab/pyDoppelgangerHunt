@@ -46,10 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `resolve_clone_generator_subroutine_outputs` to preserve unit inputs that are updated in
   enclosing loops across iterations, preventing accumulator variables from resetting across loop
   batches. Forwarded `tree` and `unit_inputs` into `_build_downstream_cache_key`.
-- **BREAKING** - **Coordinate Failure Policy**: Required explicit `start` and `end` line
-  coordinates in `compute_unit_spans`, `replace_unit_in_source`, and `refactor_module_units`,
-  validating with `is_valid_unit_coordinates(u, strict=strict)` and raising `ValueError` on
-  missing, zero, negative, or inverted coordinates rather than silently defaulting.
+- **BREAKING** - **Coordinate Failure Policy**: Required explicit, parseable `start` and `end`
+  bounds in `compute_unit_spans` (with non-positive line coordinates clamped), while mutation APIs
+  (`replace_unit_in_source`, `refactor_module_units`) strictly validate with
+  `is_valid_unit_coordinates(u, strict=strict)` and raise `ValueError` on missing, zero,
+  negative, or inverted coordinates rather than silently defaulting.
 - **Subroutine Classification Scope**: Extended whole-unit kind classification in
   `is_subroutine_unit` with `class` and `data_table` (and `async_method`), preventing nested
   classes and data tables inside callables from being misclassified as subroutine blocks.

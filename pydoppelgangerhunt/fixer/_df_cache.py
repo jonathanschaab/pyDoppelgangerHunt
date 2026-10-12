@@ -32,7 +32,7 @@ _MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
 _MAX_SCOPE_CACHE_SIZE: int = 1024
 _MAX_PARSED_TREE_CACHE_SIZE: int = 128
 _downstream_reads_cache: OrderedDict[Tuple[Any, ...], frozenset[str]] = OrderedDict()
-_parsed_tree_cache: OrderedDict[Tuple[str, int, str], Optional[ast.AST]] = OrderedDict()
+_parsed_tree_cache: OrderedDict[Tuple[str, int], Optional[ast.AST]] = OrderedDict()
 
 _scope_parent_maps: OrderedDict[ast.AST, Dict[ast.AST, ast.AST]] = OrderedDict()
 _scope_stmts_by_end: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
@@ -123,7 +123,7 @@ def _get_or_parse_tree(
         if source_digest is not None
         else hashlib.sha256(source_text.encode("utf-8", errors="replace")).hexdigest()
     )
-    key = (content_hash, len(source_text), source_text)
+    key = (content_hash, len(source_text))
     with _downstream_cache_lock:
         if key in _parsed_tree_cache:
             cached_tree = _parsed_tree_cache[key]
@@ -280,14 +280,14 @@ def clear_dataflow_cache() -> None:
     """Clears all dataflow AST, parent-map, and downstream read memoization caches.
 
     Memory Lifecycle Recommendation for Long-Running Processes:
-        In batch CLI workflows (`generate_refactoring_patch`), this cleanup is invoked
-        automatically in a `finally` block at the conclusion of patch generation.
-        However, long-running processes—such as IDE language server sidecars, daemon
-        file watchers, or interactive test sessions—that call dataflow inspection functions
-        (`collect_downstream_read_names`, `resolve_clone_pair_outputs`, etc.) directly should
-        invoke `clear_dataflow_cache()` periodically between analysis cycles.
-        This explicitly purges cached module ASTs, parent node maps, and downstream
-        liveness tables, preventing unbounded memory retention across long sessions.
+        To support concurrent patch generation and prevent cache thrashing across
+        multi-pair sessions, `generate_refactoring_patch` leaves memoization intact
+        across runs. Callers in batch CLI runners, IDE language server sidecars,
+        daemon file watchers, or interactive test sessions should invoke
+        `clear_dataflow_cache()` explicitly at batch boundaries or periodically
+        between scan runs. This explicitly purges cached module ASTs, parent node
+        maps, and downstream liveness tables, preventing unbounded memory retention
+        across long sessions.
     """
     with _downstream_cache_lock:
         _downstream_reads_cache.clear()
