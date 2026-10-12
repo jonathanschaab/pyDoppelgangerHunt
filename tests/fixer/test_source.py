@@ -777,4 +777,35 @@ def test_load_unit_file_text_prioritizes_unsliced_source_lines_over_disk(tmp_pat
     assert loaded == "x = 100\ny = 200\nz = 300\n"
 
 
+def test_slice_unit_token_lines_offset_aliases() -> None:
+    """Verifies that _slice_unit_token_lines respects start_col_offset and end_col_offset."""
+    from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
+
+    lines = ["    total = [x * 2 for x in items]\n"]
+    u_aliases = {
+        "kind": "comprehension",
+        "start_col_offset": 12,
+        "end_col_offset": 34,
+    }
+    sliced = _slice_unit_token_lines(u_aliases, list(lines))
+    assert sliced == ["[x * 2 for x in items]"]
+
+    # Multi-line unit with offset aliases
+    multi_lines = [
+        "    result = (\n",
+        "        [x * 2 for x in items]\n",
+        "    )\n",
+    ]
+    u_multi = {
+        "kind": "complex_expr",
+        "start_col_offset": 13,
+        "end_col_offset": 5,
+    }
+    sliced_multi = _slice_unit_token_lines(u_multi, list(multi_lines))
+    assert sliced_multi[0] == "(\n"
+    assert sliced_multi[1] == "        [x * 2 for x in items]\n"
+    assert sliced_multi[2] == "    )"
+
+
+
 

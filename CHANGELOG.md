@@ -35,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compiler stages.
 
 ### Changed
+- **Scoped Subroutine Colon Fallback**: Restricted colon detection in unit names to units with
+  unspecified kind (`not kind`), preventing named functions containing colons from false
+  subroutine classifications while maintaining support for legacy kind-less blocks.
+- **Batch Boundary Dataflow Cache Clearance**: Clarified that `clear_dataflow_cache()` is exposed
+  as a public API for callers to invoke at batch boundaries rather than running automatically
+  within `generate_refactoring_patch`, avoiding cache thrashing during concurrent patch runs
+  while allowing long-running runners to release memoized ASTs.
 - **Loop-Carried Liveness for Unit Inputs**: Updated `collect_downstream_read_names` and
   `resolve_clone_generator_subroutine_outputs` to preserve unit inputs that are updated in
   enclosing loops across iterations, preventing accumulator variables from resetting across loop
@@ -93,8 +100,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Private Line-Splitting Regex (`_PHYSICAL_LINE_RE`)**: Dropped `_PHYSICAL_LINE_RE` from
   `source_lines.__all__` in favor of public helper functions `split_source_lines` and
   `count_physical_newlines`.
-- **Legacy Subroutine Name Colon Fallback**: Removed colon detection in unit names from
-  `is_subroutine_unit` to avoid false subroutine classifications.
 
 ### Fixed
 - **Disk-Prioritized Unit Source Loading and Excerpt Slicing**: Prioritized disk reading in
@@ -167,9 +172,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synthesize_shared_helper_code` (`synthesis.py`) to `_populate_unit_receiver_metadata` and
   `is_subroutine_unit`, ensuring virtual units without disk files accurately receive async and
   receiver metadata.
-- **Transactional Dataflow Cache Clearance**: Wrapped `generate_refactoring_patch` in a
-  `try: ... finally: clear_dataflow_cache()` block to prevent memoized ASTs and downstream read
-  caches from lingering across patch runs.
 - **Strict Coordinate Parameter in Module Replacements**: Added `strict: bool = True` to
   `validate_module_unit_replacements` (`patch.py`), forwarding to `refactor_module_units`.
 - **Missing `end` Single-Line Fallback**: Documented `extract_unit_source_code` safely returning a

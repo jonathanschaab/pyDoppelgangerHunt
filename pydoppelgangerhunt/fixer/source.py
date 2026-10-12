@@ -392,24 +392,29 @@ def _find_module_helper_insertion_index(lines: List[str]) -> int:
 
 
 def _extract_slice_col_offset(
-    unit: Dict[str, Any], key: str, default: Optional[int]
+    unit: Dict[str, Any], keys: Tuple[str, ...], default: Optional[int]
 ) -> Optional[int]:
-    """Safely extracts a non-negative column coordinate, returning -1 on error."""
-    if unit.get(key) is None:
-        return default
-    try:
-        val = _parse_unit_coord(unit, key, default=None, strict=True)
-        return -1 if (val is None or val < 0) else val
-    except (ValueError, TypeError):
-        return -1
+    """Safely extracts a non-negative column coordinate from key aliases, returning -1 on error."""
+    for key in keys:
+        if unit.get(key) is not None:
+            try:
+                val = _parse_unit_coord(unit, key, default=None, strict=True)
+                return -1 if (val is None or val < 0) else val
+            except (ValueError, TypeError):
+                return -1
+    return default
 
 
 def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]:
     """Slices source lines to the exact start_col and end_col offsets of the unit."""
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
         return lines
-    s_col_opt = _extract_slice_col_offset(unit, "start_col", default=0)
-    e_col = _extract_slice_col_offset(unit, "end_col", default=None)
+    s_col_opt = _extract_slice_col_offset(
+        unit, ("start_col", "start_col_offset"), default=0
+    )
+    e_col = _extract_slice_col_offset(
+        unit, ("end_col", "end_col_offset"), default=None
+    )
     if s_col_opt is None or s_col_opt < 0 or e_col == -1:
         return lines
     s_col = s_col_opt

@@ -9589,6 +9589,50 @@ def test_pragma_no_refactor_on_preceding_statement_does_not_suppress_unit(
     assert "def _shared_compute_logic1_compute_logic2" in patch
 
 
+def test_complex_expr_indented_multiline_assignment_dedents_cleanly(
+    tmp_path: Path,
+) -> None:
+    """Verifies that indented multi-line assignments in complex_expr units
+    are cleanly dedented without IndentationError when extracting targets."""
+    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch
+
+    f = tmp_path / "mod_indent.py"
+    code = (
+        "def compute_total(a: int, b: int):\n"
+        "    total = (\n"
+        "        a + b\n"
+        "    )\n"
+        "    return total\n"
+        "\n"
+        "def compute_sum(x: int, y: int):\n"
+        "    total = (\n"
+        "        x + y\n"
+        "    )\n"
+        "    return total\n"
+    )
+    f.write_text(code, encoding="utf-8")
+    u1 = {
+        "file": "mod_indent.py",
+        "start": 2,
+        "end": 4,
+        "name": "compute_total:assign",
+        "kind": "complex_expr",
+    }
+    u2 = {
+        "file": "mod_indent.py",
+        "start": 8,
+        "end": 10,
+        "name": "compute_sum:assign",
+        "kind": "complex_expr",
+    }
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch != ""
+    assert "total = _shared_" in patch
+
+
+
 
 
 

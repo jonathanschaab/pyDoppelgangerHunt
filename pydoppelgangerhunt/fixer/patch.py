@@ -63,6 +63,7 @@ from pydoppelgangerhunt.fixer.source import (
     _validate_and_parse_unit_bound,
     compute_line_offsets,
     count_physical_newlines,
+    dedent_source_text,
     detect_line_ending,
     extract_unit_comments_and_pragmas,
     is_subroutine_unit,
@@ -755,7 +756,8 @@ def _build_unit_delegation_call(
         is_subline = (start_col is not None or end_col is not None)
         if not is_subline:
             u_end = max(u_start, parse_unit_coord(target_unit, "end", default=u_start))
-            unit_code = "".join(orig_lines[u_start - 1 : u_end]).strip()
+            raw_block = "".join(orig_lines[u_start - 1 : u_end])
+            unit_code = dedent_source_text(raw_block).strip()
             assign_prefix = ""
             try:
                 parsed_node = ast.parse(unit_code).body[0]
