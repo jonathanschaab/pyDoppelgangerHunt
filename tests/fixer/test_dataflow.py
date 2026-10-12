@@ -7,6 +7,7 @@ from collections import OrderedDict
 import concurrent.futures
 import gc
 import hashlib
+import logging
 import sys
 import threading
 from pathlib import Path
@@ -3014,7 +3015,9 @@ def test_collect_downstream_read_names_cache_hit_with_and_without_end_col() -> N
 
     # Call with explicit end_col_offset matching AST resolution
     cached_key = next(iter(_downstream_reads_cache.keys()))
-    resolved_end_col = cached_key.end_col if hasattr(cached_key, "end_col") else cached_key[5]
+    resolved_end_col = (
+        cached_key.end_col if hasattr(cached_key, "end_col") else cached_key[4]
+    )
     assert resolved_end_col is not None
 
     unit_with_end_col = {
@@ -3757,18 +3760,22 @@ def test_extract_single_node_local_names_lambda_non_list_body() -> None:
     assert names == {"x", "y"}
 
 
-def test_extract_single_node_local_names_wildcard_import_filtered() -> None:
+def test_extract_single_node_local_names_wildcard_import_filtered(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Verifies that _extract_single_node_local_names ignores '*' from wildcard star imports."""
-    fn_def = ast.parse(
-        "def func():\n"
-        "    from math import *\n"
-        "    import os\n"
-        "    from sys import path as sys_path\n"
-        "    val = 1\n"
-    ).body[0]
-    names = _extract_single_node_local_names(fn_def)
+    with caplog.at_level(logging.DEBUG):
+        fn_def = ast.parse(
+            "def func():\n"
+            "    from math import *\n"
+            "    import os\n"
+            "    from sys import path as sys_path\n"
+            "    val = 1\n"
+        ).body[0]
+        names = _extract_single_node_local_names(fn_def)
     assert "*" not in names
     assert names == {"func", "os", "sys_path", "val"}
+    assert "Wildcard import detected ('from math import *')" in caplog.text
 
 
 def test_subroutine_same_line_semicolon_in_with_without_end_col() -> None:

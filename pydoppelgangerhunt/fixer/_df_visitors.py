@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import builtins
 from enum import Enum
+import logging
 from typing import (
     Any,
     Iterable,
@@ -16,6 +17,7 @@ from typing import (
 )
 
 _BUILTIN_NAMES: Set[str] = set(dir(builtins))
+logger = logging.getLogger(__name__)
 
 
 def _record_import_names(
@@ -40,6 +42,13 @@ def _record_import_names(
         )
         if bound != "*":
             store_set.add(bound)
+        else:
+            mod = getattr(node, "module", None) or "<unknown>"
+            logger.debug(
+                "Wildcard import detected ('from %s import *'); built-in symbol "
+                "shadowing analysis remains optimistic for this scope",
+                mod,
+            )
 
 
 class _BaseScopeVisitor(ast.NodeVisitor):
