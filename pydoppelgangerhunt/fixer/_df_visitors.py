@@ -668,7 +668,9 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         if isinstance(node.target, ast.Name) and self._should_inspect_read(node.target):
             self._record_downstream_read(node.target.id)
             if not self._is_in_comp(node.target.id):
-                self.killed.add(node.target.id)
+                lineno = getattr(node.target, "lineno", None)
+                if not (lineno == self.u_end and self.u_end_col is None):
+                    self.killed.add(node.target.id)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:

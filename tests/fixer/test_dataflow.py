@@ -4102,3 +4102,50 @@ def test_extract_unit_live_in_names_prunes_nested_scope_params_and_comprehension
     assert "temp" not in live_ins
     assert "inner" not in live_ins
     assert live_ins == {"a", "items", "numbers", "pairs", "outer_val"}
+
+
+def test_downstream_read_visitor_augassign_unresolved_boundary_does_not_kill() -> None:
+    """Verifies that an AugAssign on u_end does not kill variable when u_end_col is None."""
+    from pydoppelgangerhunt.fixer._df_visitors import _DownstreamReadVisitor, _VisitorPassMode
+
+    code = "x += 1\ny = x\n"
+    tree = ast.parse(code)
+
+    # 1. Unit ends at line 1 with u_end_col=None (unresolved boundary: x is not killed)
+    visitor1 = _DownstreamReadVisitor(
+        u_start=1,
+        u_end=1,
+        u_end_col=None,
+        candidates={"x"},
+        enclosing_loops=[],
+        pass_mode=_VisitorPassMode.AFTER_UNIT,
+        is_module_scope=True,
+    )
+    visitor1.visit(tree)
+    assert "x" not in visitor1.killed
+
+    # 2. Unit ends before line 1 (x += 1 is clearly post-unit: x is killed)
+    visitor2 = _DownstreamReadVisitor(
+        u_start=0,
+        u_end=0,
+        u_end_col=None,
+        candidates={"x"},
+        enclosing_loops=[],
+        pass_mode=_VisitorPassMode.AFTER_UNIT,
+        is_module_scope=True,
+    )
+    visitor2.visit(tree)
+    assert "x" in visitor2.killed
+
+    # 3. Unit ends at line 1 with resolved u_end_col=0 (x is killed)
+    visitor3 = _DownstreamReadVisitor(
+        u_start=1,
+        u_end=1,
+        u_end_col=0,
+        candidates={"x"},
+        enclosing_loops=[],
+        pass_mode=_VisitorPassMode.AFTER_UNIT,
+        is_module_scope=True,
+    )
+    visitor3.visit(tree)
+    assert "x" in visitor3.killed

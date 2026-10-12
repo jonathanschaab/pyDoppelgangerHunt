@@ -1234,6 +1234,12 @@ def test_compute_priority_score_malformed_string_coordinates() -> None:
     assert _unit_sloc(inv_u) == 1
     assert compute_priority_score(0.9, inv_u, u2) == 0.0
 
+    # None and non-dict inputs defensively return 0.0 without raising AttributeError
+    assert compute_priority_score(0.9, None, u2) == 0.0  # type: ignore[arg-type]
+    assert compute_priority_score(0.9, u2, None) == 0.0  # type: ignore[arg-type]
+    assert compute_priority_score(0.9, "invalid", u2) == 0.0  # type: ignore[arg-type]
+    assert compute_priority_score(0.9, u2, 123) == 0.0  # type: ignore[arg-type]
+
 
 def test_differential_scan_multi_unit_file_and_shingle_dedup(tmp_path: Path) -> None:
     """Verifies differential scanning with multi-unit files and candidate pair monotonic ordering."""
