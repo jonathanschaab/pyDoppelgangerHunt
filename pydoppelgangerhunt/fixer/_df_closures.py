@@ -41,6 +41,13 @@ _EAGER_CONSUMER_NAMES: frozenset[str] = frozenset(
 )
 
 
+_COMPREHENSION_TYPES = (
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+)
+
 _INNER_SCOPE_TYPES = (
     ast.FunctionDef,
     ast.AsyncFunctionDef,
@@ -51,6 +58,22 @@ _INNER_SCOPE_TYPES = (
     ast.DictComp,
     ast.GeneratorExp,
 )
+
+
+def _extract_comprehension_walrus_names(comp_node: ast.AST) -> Set[str]:
+    """Extracts walrus target names that bind to the enclosing scope per PEP 572."""
+    walrus_names: Set[str] = set()
+    node_stack = list(ast.iter_child_nodes(comp_node))
+    while node_stack:
+        curr = node_stack.pop()
+        if isinstance(
+            curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+        ):
+            continue
+        if isinstance(curr, ast.NamedExpr) and isinstance(curr.target, ast.Name):
+            walrus_names.add(curr.target.id)
+        node_stack.extend(ast.iter_child_nodes(curr))
+    return walrus_names
 
 
 def _extract_single_node_local_names(scope_node: ast.AST) -> Set[str]:
@@ -108,6 +131,8 @@ def _extract_single_node_local_names(scope_node: ast.AST) -> Set[str]:
         for child in ast.iter_child_nodes(curr):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 names.add(child.name)
+            elif isinstance(child, _COMPREHENSION_TYPES):
+                names.update(_extract_comprehension_walrus_names(child))
             elif not isinstance(child, _INNER_SCOPE_TYPES):
                 stack.append(child)
 

@@ -9225,6 +9225,32 @@ def test_render_file_patch_plan_path_normalization_span_matching() -> None:
         assert "+a = 99" in diff
 
 
+def test_render_file_patch_plan_non_standard_unit_span_defensive_recovery() -> None:
+    """Verifies that _render_file_patch_plan defends against non-standard or malformed
+    retained candidate dicts without raising ValueError."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _FilePatchPlan,
+        _render_file_patch_plan,
+    )
+
+    plan = _FilePatchPlan(
+        file_path=Path("test.py"),
+        rel_path="test.py",
+        orig_text="a = 1\nb = 2\n",
+        is_new_file=False,
+    )
+    u_valid = {"file": "test.py", "start": 1, "end": 1}
+    plan.replacements.append((u_valid, "a = 99\n"))
+
+    u_malformed = {"file": "test.py", "start": "bad_coord", "end": None}
+    with mock.patch(
+        "pydoppelgangerhunt.fixer.patch.filter_overlapping_clone_units",
+        return_value=[u_malformed],
+    ):
+        diff = _render_file_patch_plan(plan, replace_clones=True)
+        assert isinstance(diff, str)
+
+
 def test_replace_unit_and_refactor_missing_coordinates_raise_value_error() -> None:
     """Verifies that missing 'start' or 'end' line coordinates raise ValueError in
     replace_unit_in_source and refactor_module_units."""

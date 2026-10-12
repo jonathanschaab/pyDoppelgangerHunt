@@ -1348,8 +1348,15 @@ def _render_file_patch_plan(
     )
 
     def _unit_span(unit: Dict[str, Any]) -> Tuple[int, int]:
-        s = parse_unit_coord(unit, "start", default=1, strict=True)
-        return s, parse_unit_coord(unit, "end", default=s, strict=True)
+        try:
+            s = parse_unit_coord(unit, "start", default=1, strict=True)
+            return s, parse_unit_coord(unit, "end", default=s, strict=True)
+        except (ValueError, TypeError, AttributeError):
+            try:
+                s = parse_unit_coord(unit, "start", default=1, strict=False)
+                return s, parse_unit_coord(unit, "end", default=s, strict=False)
+            except (ValueError, TypeError, AttributeError):
+                return 1, 1
 
     def _file_key(unit: Dict[str, Any]) -> str:
         raw = unit.get("file")

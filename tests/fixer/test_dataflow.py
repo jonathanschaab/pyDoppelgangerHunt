@@ -3425,6 +3425,7 @@ def test_extract_scope_local_names() -> None:
         "    from os import path as custom_path\n"
         "    comp_res = [comp_var for comp_var in [1, 2]]\n"
         "    gen_res = (gen_var for gen_var in [3, 4])\n"
+        "    walrus_comp = [(walrus_leak := v) for v in [5, 6]]\n"
     )
     tree = ast.parse(code)
     func_node = tree.body[0]
@@ -3433,7 +3434,7 @@ def test_extract_scope_local_names() -> None:
     # Parameters
     assert {"pos_a", "pos_b", "vargs", "kw_a", "kwargs"}.issubset(names)
     # Outer local stores
-    assert {"x", "y", "z", "item", "f_obj", "err", "comp_res", "gen_res"}.issubset(names)
+    assert {"x", "y", "z", "item", "f_obj", "err", "comp_res", "gen_res", "walrus_comp", "walrus_leak"}.issubset(names)
     # Inner definitions
     assert "inner_fn" in names
     assert "InnerClass" in names
@@ -3445,6 +3446,7 @@ def test_extract_scope_local_names() -> None:
     # Comprehension iteration variables and inner function variables MUST NOT leak
     assert "comp_var" not in names
     assert "gen_var" not in names
+    assert "v" not in names
     assert "inner_leak" not in names
     assert "class_attr" not in names
     assert "math" not in names
@@ -3516,6 +3518,19 @@ def test_eager_builtin_scope_shadowing_scenarios() -> None:
     closures_no_leak = _collect_scope_closures(tree_no_leak.body[0])
     # Neither sum nor min are shadowed in compute scope -> 0 closures
     assert len(closures_no_leak) == 0
+
+    # 6. Shadowed by walrus operator inside comprehension per PEP 572
+    code_walrus_comp = (
+        "def compute():\n"
+        "    data = [1, 2, 3]\n"
+        "    dummy = [(sum := (lambda g: list(g))) for _ in data]\n"
+        "    total = sum(x * 2 for x in data)\n"
+        "    yield total\n"
+    )
+    tree_walrus_comp = ast.parse(code_walrus_comp)
+    closures_walrus = _collect_scope_closures(tree_walrus_comp.body[0])
+    # Lambda in sum assignment + escaping genexp
+    assert len(closures_walrus) == 2
 
 
 def test_module_level_shadowing_of_eager_builtins() -> None:

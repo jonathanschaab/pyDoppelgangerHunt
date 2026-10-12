@@ -2409,6 +2409,41 @@ def test_cli_top_n_interaction_with_baseline_suppression(tmp_path: Path, monkeyp
     assert not (files == {"a.py", "b.py"})
 
 
+def test_cli_top_zero_truncation_emits_empty_clones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that --top 0 truncates clones to empty and exits with code 0."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    import pydoppelgangerhunt.cli as cli_mod  # pylint: disable=import-outside-toplevel
+
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    f1 = pkg / "a.py"
+    f2 = pkg / "b.py"
+    code = "def duplicate():\n    v1 = 1\n    v2 = 2\n    return v1 + v2\n"
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+
+    captured_clones = []
+    orig_render = cli_mod._render_text_violations
+
+    def mock_render(clones: Any, *args: Any, **kwargs: Any) -> Any:
+        captured_clones.extend(clones)
+        return orig_render(clones, *args, **kwargs)
+
+    monkeypatch.setattr(cli_mod, "_render_text_violations", mock_render)
+
+    exit_code = main([
+        str(pkg),
+        "--top", "0",
+        "--min-lines", "3",
+        "--min-tokens", "4",
+        "--threshold", "0.80",
+    ])
+    assert exit_code == 0
+    assert len(captured_clones) == 0
+
+
 def test_cli_main_passes_bag_of_tokens_and_tfidf_to_scan_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
