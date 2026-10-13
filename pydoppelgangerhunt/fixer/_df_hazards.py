@@ -280,7 +280,6 @@ def _enclosing_try_reads_outputs(
     u_start: int,
     u_end: int,
     outputs: Set[str],
-    u_end_col: Optional[int] = None,
 ) -> bool:
     """Returns True if unit is inside an enclosing try, else, or except block whose
     handlers/finally read outputs, or whose handlers fall through and outputs are read

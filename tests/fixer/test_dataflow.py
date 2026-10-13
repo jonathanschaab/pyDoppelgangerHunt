@@ -2329,8 +2329,8 @@ def test_enclosing_try_reads_outputs_same_line_with_semicolon() -> None:
     )
     tree = ast.parse(code)
     func_node = tree.body[0]
-    # Unit 'total = yield x' on line 2 with end_col=29: intra-with read is permitted
-    assert _enclosing_try_reads_outputs(func_node, 2, 2, {"total"}, u_end_col=29) is False
+    # Unit 'total = yield x' on line 2: intra-with read is permitted
+    assert _enclosing_try_reads_outputs(func_node, 2, 2, {"total"}) is False
 
     code_post = (
         "def run():\n"
@@ -2340,7 +2340,7 @@ def test_enclosing_try_reads_outputs_same_line_with_semicolon() -> None:
     tree_post = ast.parse(code_post)
     func_post = tree_post.body[0]
     # Post-with read is detected as a cleanup hazard
-    assert _enclosing_try_reads_outputs(func_post, 2, 2, {"total"}, u_end_col=29) is True
+    assert _enclosing_try_reads_outputs(func_post, 2, 2, {"total"}) is True
 
 
 def test_collect_scope_closures_class_compound_blocks() -> None:
@@ -4112,9 +4112,9 @@ def test_enclosing_try_reads_outputs_same_line_unit_accumulator_in_with() -> Non
         "    init_step = 1; acc = acc + 1; cleanup_flag = True\n"
     )
     tree = ast.parse(src)
-    # Unit is 'acc = acc + 1' on line 2, outputs={'acc'}, u_end_col=None
+    # Unit is 'acc = acc + 1' on line 2, outputs={'acc'}
     result = _enclosing_try_reads_outputs(
-        tree, u_start=2, u_end=2, outputs={"acc"}, u_end_col=None
+        tree, u_start=2, u_end=2, outputs={"acc"}
     )
     assert result is False
 
@@ -4125,7 +4125,7 @@ def test_enclosing_try_reads_outputs_same_line_unit_accumulator_in_with() -> Non
     )
     tree_read = ast.parse(src_read)
     result_read = _enclosing_try_reads_outputs(
-        tree_read, u_start=2, u_end=2, outputs={"acc"}, u_end_col=None
+        tree_read, u_start=2, u_end=2, outputs={"acc"}
     )
     assert result_read is False
 
@@ -4137,7 +4137,7 @@ def test_enclosing_try_reads_outputs_same_line_unit_accumulator_in_with() -> Non
     )
     tree_after = ast.parse(src_after)
     result_after = _enclosing_try_reads_outputs(
-        tree_after, u_start=2, u_end=2, outputs={"acc"}, u_end_col=None
+        tree_after, u_start=2, u_end=2, outputs={"acc"}
     )
     assert result_after is True
 
@@ -4172,7 +4172,7 @@ def test_enclosing_with_loop_carried_read_at_loop_top_rejected() -> None:
     # Print at line 3 is before the with statement but inside the enclosing loop
     fn_node = tree.body[0]
     reads = _enclosing_try_reads_outputs(
-        fn_node, u_start=5, u_end=5, outputs={"total"}, u_end_col=None
+        fn_node, u_start=5, u_end=5, outputs={"total"}
     )
     assert reads is True
 

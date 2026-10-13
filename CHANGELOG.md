@@ -128,10 +128,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dataflow.py` to use `c_col >= u_end_col` rather than strict inequality, properly classifying
   same-line closures beginning at the exclusive end column offset as post-unit rather than
   intra-unit.
-- **Accurate Target Statement Scoping in Enclosing With Blocks**: Added statement target detection
-  (`_stmt_assigns_to_any_name`) and identity checks (`s is not target_stmt`) in
-  `_enclosing_try_reads_outputs` (`dataflow.py`), preventing in-place accumulator updates at
-  index >= 1 from being falsely marked as post-unit output reads when column offsets are unresolved.
+- **Enclosing With Block Downstream Read Analysis**: Enclosing with and async with block safety
+  is evaluated fail-closed via `_compound_stmt_reads_outputs_after` to detect reads occurring
+  downstream of the compound block (where exception-handling context managers resume), superseding
+  obsolete intra-block statement heuristics (`_stmt_assigns_to_any_name`).
 - **Harness Public Cache API**: Migrated test harness fixtures in `conftest.py` from private
   `_clear_downstream_reads_cache` to public `clear_dataflow_cache`.
 - **Single-Line Unit Whole-Line Containment Fallback**: Updated `_is_ast_node_within_unit_bounds`

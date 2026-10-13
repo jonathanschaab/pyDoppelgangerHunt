@@ -102,7 +102,6 @@ _collect_func_args = getattr(_df_visitors, "_collect_func_args")
 _collect_func_params = getattr(_df_visitors, "_collect_func_params")
 _extract_nested_scope_free_reads = getattr(_df_visitors, "_extract_nested_scope_free_reads")
 _extract_assigned_names = getattr(_df_visitors, "_extract_assigned_names")
-_stmt_assigns_to_any_name = getattr(_df_visitors, "_stmt_assigns_to_any_name")
 _is_ast_node_within_unit_bounds = getattr(_df_visitors, "_is_ast_node_within_unit_bounds")
 _extract_unit_live_in_names = getattr(_df_visitors, "_extract_unit_live_in_names")
 

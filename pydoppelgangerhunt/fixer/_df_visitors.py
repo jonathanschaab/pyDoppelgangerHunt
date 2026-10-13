@@ -486,21 +486,6 @@ def _extract_assigned_names(target: ast.AST) -> List[str]:
     return []
 
 
-def _stmt_assigns_to_any_name(stmt: ast.AST, names: Set[str]) -> bool:
-    """Checks whether an AST statement binds any variable in the given names set."""
-    targets: List[ast.AST] = []
-    if isinstance(stmt, ast.Assign):
-        targets.extend(stmt.targets)
-    elif isinstance(stmt, (ast.AugAssign, ast.AnnAssign)):
-        targets.append(stmt.target)
-    elif isinstance(stmt, (ast.For, ast.AsyncFor)):
-        targets.append(stmt.target)
-    for t in targets:
-        if any(name in names for name in _extract_assigned_names(t)):
-            return True
-    return False
-
-
 class _VisitorPassMode(str, Enum):
     """Execution pass mode for downstream AST read analysis."""
 

@@ -77,12 +77,7 @@ def _check_enclosing_try_cleanup_hazard(
     if scope_node is None or bounds is None:
         return False
     u_s, u_e = bounds
-    u_end_col = _extract_unit_end_col(unit)
-    if u_end_col is None:
-        u_end_col = _resolve_unit_ast_end_col(scope_node, unit)
-    return _enclosing_try_reads_outputs(
-        scope_node, u_s, u_e, set(needed_outs), u_end_col=u_end_col
-    )
+    return _enclosing_try_reads_outputs(scope_node, u_s, u_e, set(needed_outs))
 
 
 def _has_unordered_multiset_outputs(unit: Dict[str, Any]) -> bool:
