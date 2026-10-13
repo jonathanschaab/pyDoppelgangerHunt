@@ -4343,3 +4343,61 @@ def test_pair_clone_outputs_role_swapped_rejection_and_positional_pairing() -> N
     ]
 
 
+def test_collect_downstream_reads_wildcard_import_strict_closure_fail_closed() -> None:
+    """Verifies that scopes containing wildcard imports treat candidates as dynamically read
+    in strict closure mode (has_dynamic_read=True), failing closed."""
+    from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
+
+    code = (
+        "def compute():\n"
+        "    from math import *\n"
+        "    x = 10\n"
+        "    y = 20\n"
+        "    return y\n"
+    )
+    unit = {"start": 3, "end": 3, "inputs": []}
+    candidates = {"x"}
+
+    # In strict mode (default), wildcard import in scope triggers dynamic read fail-closed
+    reads_strict = collect_downstream_read_names(
+        code, unit, candidates=candidates, skip_pre_unit_closures=False
+    )
+    assert reads_strict is not None
+    assert "x" in reads_strict
+
+    # In lenient mode, pre-unit closure scanning is skipped
+    reads_lenient = collect_downstream_read_names(
+        code, unit, candidates=candidates, skip_pre_unit_closures=True
+    )
+    assert reads_lenient is not None
+    assert "x" not in reads_lenient
+
+
+def test_downstream_read_visitor_wildcard_import_dynamic_read() -> None:
+    """Verifies that _DownstreamReadVisitor marks has_dynamic_read and records
+    reads for all candidates on encountering a downstream wildcard import."""
+    from pydoppelgangerhunt.fixer._df_visitors import _DownstreamReadVisitor
+
+    code = (
+        "def run():\n"
+        "    x = 1\n"
+        "    from util import *\n"
+    )
+    tree = ast.parse(code)
+    fn_def = tree.body[0]
+    assert isinstance(fn_def, ast.FunctionDef)
+    visitor = _DownstreamReadVisitor(
+        u_start=2,
+        u_end=2,
+        u_end_col=None,
+        candidates={"x", "y"},
+    )
+    for stmt in fn_def.body:
+        visitor.visit(stmt)
+
+    assert visitor.has_dynamic_read is True
+    assert "x" in visitor.loaded
+    assert "y" in visitor.loaded
+
+
+

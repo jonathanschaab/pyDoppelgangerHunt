@@ -62,6 +62,7 @@ from pydoppelgangerhunt.fixer.source import (
     _scan_sig_line,
     _validate_and_parse_unit_bound,
     compute_line_offsets,
+    compute_unit_replacement_span,
     count_physical_newlines,
     dedent_source_text,
     detect_line_ending,
@@ -815,7 +816,18 @@ def _build_unit_delegation_call(
                     assign_prefix = ""
             except (SyntaxError, IndexError, ValueError):
                 pass
-            return f"{indent}{assign_prefix}{await_prefix}{call_expr}\n"
+            rep_call = f"{indent}{assign_prefix}{await_prefix}{call_expr}\n"
+            try:
+                _, _, final_rep = compute_unit_replacement_span(
+                    orig_text,
+                    target_unit,
+                    rep_call,
+                    preserve_boundary_pragmas=True,
+                    lines=orig_lines,
+                )
+                return final_rep
+            except (ValueError, TypeError, KeyError):
+                return rep_call
         return f"{await_prefix}{call_expr}"
 
     call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"

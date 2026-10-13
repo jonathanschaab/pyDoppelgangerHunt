@@ -29,8 +29,9 @@ def _record_import_names(
     Note:
         Wildcard star imports (e.g., ``from numpy import *``) cannot statically reveal their
         bound symbols without executing or resolving the module namespace. Dropping ``'*'``
-        avoids polluting symbol sets with invalid identifiers, but makes built-in shadowing
-        detection (such as eager consumer functions shadowed by numpy) optimistic.
+        avoids polluting symbol sets with invalid identifiers. In strict closure mode,
+        scopes containing wildcard imports are treated as having dynamic scope reflection,
+        failing closed rather than optimistically assuming built-ins are untouched.
     """
     for alias in node.names:
         bound = (
@@ -840,6 +841,11 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         if self._should_inspect_read(node):
             self._record_import_names(node, self.killed)
+            if any(alias.name == "*" for alias in node.names):
+                self.has_dynamic_read = True
+                if self.candidates is not None:
+                    for name in self.candidates:
+                        self._record_downstream_read(name)
 
     def visit_Call(self, node: ast.Call) -> None:
         self.generic_visit(node)

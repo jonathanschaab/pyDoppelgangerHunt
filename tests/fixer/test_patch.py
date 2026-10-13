@@ -9735,6 +9735,127 @@ def test_generate_refactoring_patch_whole_line_return_complex_expr(tmp_path: Pat
     assert "return _shared_get_val_1_get_val_2(compute_val, x, y)" in patch
 
 
+def test_complex_expr_multiline_boundary_pragma_preserved(tmp_path: Path) -> None:
+    """Verifies that boundary pragmas attached to whole-line multi-line complex_expr
+    units are preserved via compute_unit_replacement_span."""
+    f = tmp_path / "mod_pragma.py"
+    code = (
+        "def compute_total(a: int, b: int):\n"
+        "    total: int = (  # type: ignore[assignment]\n"
+        "        a + b\n"
+        "    )\n"
+        "    return total\n"
+        "\n"
+        "def compute_sum(x: int, y: int):\n"
+        "    total: int = (  # type: ignore[assignment]\n"
+        "        x + y\n"
+        "    )\n"
+        "    return total\n"
+    )
+    f.write_text(code, encoding="utf-8")
+    u1 = {
+        "file": "mod_pragma.py",
+        "start": 2,
+        "end": 4,
+        "name": "compute_total:assign",
+        "kind": "complex_expr",
+    }
+    u2 = {
+        "file": "mod_pragma.py",
+        "start": 8,
+        "end": 10,
+        "name": "compute_sum:assign",
+        "kind": "complex_expr",
+    }
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch != ""
+    assert "# type: ignore[assignment]" in patch
+
+
+def test_build_unit_delegation_call_complex_expr_boundary_pragma_preserved() -> None:
+    """Verifies that _build_unit_delegation_call preserves boundary pragmas on
+    whole-line complex_expr units."""
+    from pydoppelgangerhunt.fixer.patch import _build_unit_delegation_call
+
+    code = (
+        "def run(a: int, b: int):\n"
+        "    res = (  # noqa: E501\n"
+        "        a + b\n"
+        "    )\n"
+        "    return res\n"
+    )
+    lines = code.splitlines(keepends=True)
+    unit = {
+        "file": "test.py",
+        "start": 2,
+        "end": 4,
+        "kind": "complex_expr",
+    }
+    call = _build_unit_delegation_call(
+        unit,
+        code,
+        lines,
+        effective_binding="function",
+        helper_name="_shared_add",
+        inputs=["a", "b"],
+        outputs=["res"],
+        scope={"kind": "function"},
+    )
+    assert "# noqa: E501" in call
+    assert "res = _shared_add(a, b)" in call
+
+
+def test_infer_helper_return_type_generator_send_type_strict_strategy() -> None:
+    """Verifies that type_merge_strategy='strict' causes generator send type to
+    fall back to 'object' instead of 'Any' when has_yield_assignment is True."""
+    from pydoppelgangerhunt.fixer.synthesis import _infer_helper_return_type
+
+    scope_with_assign = {
+        "has_yield": True,
+        "has_yield_assignment": True,
+        "yield_expr_names": [("yield", ":literal:int")],
+    }
+    # Default fallback_any should return Any
+    ret_default = _infer_helper_return_type(
+        "Any",
+        [],
+        set(),
+        scope_with_assign,
+        {},
+        {},
+        type_merge_strategy="fallback_any",
+    )
+    assert "Generator[int, Any, None]" in ret_default
+
+    # Strict strategy should return object
+    ret_strict = _infer_helper_return_type(
+        "Any",
+        [],
+        set(),
+        scope_with_assign,
+        {},
+        {},
+        type_merge_strategy="strict",
+    )
+    assert "Generator[int, object, None]" in ret_strict
+
+    # Async generator with strict strategy
+    ret_async_strict = _infer_helper_return_type(
+        "Any",
+        [],
+        set(),
+        scope_with_assign,
+        {},
+        {},
+        type_merge_strategy="strict",
+        is_async=True,
+    )
+    assert "AsyncGenerator[int, object]" in ret_async_strict
+
+
+
 
 
 

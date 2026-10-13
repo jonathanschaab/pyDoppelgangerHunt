@@ -30,6 +30,7 @@ from pydoppelgangerhunt.fixer._df_cache import (
 )
 from pydoppelgangerhunt.fixer._df_closures import (
     _collect_pre_unit_closures,
+    _has_wildcard_star_import,
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
     _DownstreamReadVisitor,
@@ -494,6 +495,9 @@ def collect_downstream_read_names(
     for stmt in scope_stmts:
         visitor.visit(stmt)
 
+    if not skip_pre_unit_closures and _has_wildcard_star_import(scope_node, effective_tree):
+        visitor.has_dynamic_read = True
+
     loaded = set(visitor.loaded)
     loop_visitor: Optional[_DownstreamReadVisitor] = None
     if enclosing_loops:
@@ -528,11 +532,14 @@ def collect_downstream_read_names(
     has_dynamic = visitor.has_dynamic_read or (
         loop_visitor is not None and loop_visitor.has_dynamic_read
     )
-    if has_dynamic and candidates is None:
-        for subnode in ast.walk(scope_node):
-            if isinstance(subnode, ast.Name) and isinstance(subnode.ctx, (ast.Store, ast.Load)):
-                if subnode.id not in _BUILTIN_NAMES and not subnode.id.startswith("__"):
-                    loaded.add(subnode.id)
+    if has_dynamic:
+        if candidates is not None:
+            loaded.update(candidates)
+        else:
+            for subnode in ast.walk(scope_node):
+                if isinstance(subnode, ast.Name) and isinstance(subnode.ctx, (ast.Store, ast.Load)):
+                    if subnode.id not in _BUILTIN_NAMES and not subnode.id.startswith("__"):
+                        loaded.add(subnode.id)
 
     _merge_pre_unit_closure_reads(loaded, pre_unit_captured_reads, candidates)
 

@@ -725,20 +725,22 @@ def _infer_helper_return_type(
                 and scope.get("has_return_value")
                 else ("Any" if (scope.get("has_return_value") or helper_outputs) else None)
             )
+            fallback_send = "object" if type_merge_strategy == "strict" else "Any"
             send_t = (
                 _normalize_pipe_unions(inferred_send_type)
                 if inferred_send_type
-                else ("Any" if scope.get("has_yield_assignment") else "None")
+                else (fallback_send if scope.get("has_yield_assignment") else "None")
             )
             ret_t = outputs_ret or fallback_ret or ("None" if send_t != "None" else None)
             if ret_t is not None:
                 return _normalize_pipe_unions(f"Generator[{yield_t}, {send_t}, {ret_t}]")
             return _normalize_pipe_unions(f"Iterator[{yield_t}]")
 
+        fallback_send = "object" if type_merge_strategy == "strict" else "Any"
         send_t = (
             _normalize_pipe_unions(inferred_send_type)
             if inferred_send_type
-            else ("Any" if scope.get("has_yield_assignment") else "None")
+            else (fallback_send if scope.get("has_yield_assignment") else "None")
         )
         if send_t != "None" or scope.get("has_yield_assignment"):
             return _normalize_pipe_unions(f"AsyncGenerator[{yield_t}, {send_t}]")
