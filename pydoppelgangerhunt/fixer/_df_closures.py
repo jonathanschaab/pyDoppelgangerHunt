@@ -199,17 +199,13 @@ def _has_wildcard_star_import(
         ):
             return True
     if module_tree is not None and module_tree is not scope_node:
-        parent_map = _get_scope_parent_map(module_tree)
-        curr: Optional[ast.AST] = parent_map.get(scope_node)
-        while curr is not None:
-            for stmt in getattr(curr, "body", []):
-                if (
-                    isinstance(stmt, ast.ImportFrom)
-                    and stmt.module not in ("builtins", "__builtins__")
-                    and any(alias.name == "*" for alias in stmt.names)
-                ):
-                    return True
-            curr = parent_map.get(curr)
+        for node in ast.walk(module_tree):
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module not in ("builtins", "__builtins__")
+                and any(alias.name == "*" for alias in node.names)
+            ):
+                return True
     return False
 
 

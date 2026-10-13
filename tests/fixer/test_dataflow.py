@@ -3597,6 +3597,41 @@ def test_module_level_shadowing_of_eager_builtins() -> None:
     closures_mod_star = _collect_scope_closures(fn_star, module_tree=tree_mod_star)
     assert len(closures_mod_star) == 1
 
+    # Module-level wildcard star import nested inside a compound statement (e.g. if/try)
+    code_compound_star = (
+        "if True:\n"
+        "    from numpy import *\n"
+        "\n"
+        "def compute():\n"
+        "    data = [1, 2, 3]\n"
+        "    res = sum(x * 2 for x in data)\n"
+        "    yield res\n"
+    )
+    tree_compound_star = ast.parse(code_compound_star)
+    fn_compound = tree_compound_star.body[1]
+    closures_compound_star = _collect_scope_closures(fn_compound, module_tree=tree_compound_star)
+    assert len(closures_compound_star) == 1
+
+
+def test_has_wildcard_star_import_in_module_compound_stmt() -> None:
+    """Verifies that _has_wildcard_star_import detects wildcard imports nested in
+    module-level compound statements like if, try, etc."""
+    from pydoppelgangerhunt.fixer._df_closures import _has_wildcard_star_import
+
+    code = (
+        "try:\n"
+        "    from fast_math import *\n"
+        "except ImportError:\n"
+        "    from math import *\n"
+        "\n"
+        "def compute():\n"
+        "    pass\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[1]
+    assert _has_wildcard_star_import(fn_node, module_tree=tree) is True
+
+
 
 def test_eager_consumed_genexp_non_str_receiver_join() -> None:
     """Verifies that .join() calls only count as eager consumption when the
