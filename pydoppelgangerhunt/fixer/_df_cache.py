@@ -42,13 +42,27 @@ _scope_try_with_cache: OrderedDict[ast.AST, List[ast.AST]] = OrderedDict()
 _warned_lenient_closure: List[bool] = [False]
 
 
+_SCOPE_ROOT_TYPES: Tuple[type, ...] = (
+    ast.Module,
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.Lambda,
+)
+
+
 def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
     """Purges scope-cache entries belonging to an evicted AST tree."""
-    if tree is None:
+    if tree is None or not isinstance(tree, ast.AST):
         return
-    tree_nodes = set(ast.walk(tree))
+    scope_nodes = {
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, _SCOPE_ROOT_TYPES)
+    }
+    scope_nodes.add(tree)
     with _downstream_cache_lock:
-        for node in tree_nodes:
+        for node in scope_nodes:
             _scope_parent_maps.pop(node, None)
             _scope_stmts_by_end.pop(node, None)
             _scope_closures_cache.pop(node, None)
@@ -59,7 +73,7 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
             for k in _scope_closures_cache
             if isinstance(k, tuple)
             and len(k) == 2
-            and (k[0] in tree_nodes or k[1] in tree_nodes)
+            and (k[0] in scope_nodes or k[1] in scope_nodes)
         ]
         for k in closure_keys_to_remove:
             _scope_closures_cache.pop(k, None)

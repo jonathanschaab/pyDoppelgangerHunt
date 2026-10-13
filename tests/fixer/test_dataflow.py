@@ -4489,5 +4489,75 @@ def test_check_enclosing_try_cleanup_hazard_precomputed_scope_and_bounds() -> No
     assert resolution.skip_reason == "enclosing try or with cleanup hazard"
 
 
+def test_evict_tree_scopes_purges_scope_roots_and_retains_unrelated_entries() -> None:
+    """Verifies that _evict_tree_scopes accurately purges scope roots and leaves unrelated entries intact."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _evict_tree_scopes,
+        _scope_parent_maps,
+        _scope_stmts_by_end,
+        _scope_closures_cache,
+        _scope_loops_cache,
+        _scope_try_with_cache,
+        _get_scope_parent_map,
+        _get_scope_stmts_by_end_lineno,
+        clear_dataflow_cache,
+    )
+
+    clear_dataflow_cache()
+
+    # None and non-AST inputs do not raise
+    _evict_tree_scopes(None)
+    _evict_tree_scopes("not_an_ast")  # type: ignore[arg-type]
+
+    code1 = "def f1(a):\n    return a + 1\n"
+    code2 = "def f2(b):\n    return b + 2\n"
+
+    tree1 = ast.parse(code1)
+    tree2 = ast.parse(code2)
+
+    fn1 = tree1.body[0]
+    fn2 = tree2.body[0]
+
+    # Populate scope metadata for tree1 and tree2
+    _get_scope_parent_map(fn1)
+    _get_scope_stmts_by_end_lineno(fn1)
+    _scope_closures_cache[fn1] = []
+    _scope_closures_cache[(fn1, tree1)] = []
+    _scope_loops_cache[fn1] = []
+    _scope_try_with_cache[fn1] = []
+
+    _get_scope_parent_map(fn2)
+    _get_scope_stmts_by_end_lineno(fn2)
+    _scope_closures_cache[fn2] = []
+    _scope_closures_cache[(fn2, tree2)] = []
+    _scope_loops_cache[fn2] = []
+    _scope_try_with_cache[fn2] = []
+
+    assert fn1 in _scope_parent_maps
+    assert fn2 in _scope_parent_maps
+
+    # Evict tree1
+    _evict_tree_scopes(tree1)
+
+    # tree1 scope entries are purged
+    assert fn1 not in _scope_parent_maps
+    assert fn1 not in _scope_stmts_by_end
+    assert fn1 not in _scope_closures_cache
+    assert (fn1, tree1) not in _scope_closures_cache
+    assert fn1 not in _scope_loops_cache
+    assert fn1 not in _scope_try_with_cache
+
+    # tree2 scope entries remain untouched
+    assert fn2 in _scope_parent_maps
+    assert fn2 in _scope_stmts_by_end
+    assert fn2 in _scope_closures_cache
+    assert (fn2, tree2) in _scope_closures_cache
+    assert fn2 in _scope_loops_cache
+    assert fn2 in _scope_try_with_cache
+
+    clear_dataflow_cache()
+
+
+
 
 
