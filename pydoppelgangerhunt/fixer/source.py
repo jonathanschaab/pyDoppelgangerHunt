@@ -232,7 +232,16 @@ def _load_unit_file_text(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
 ) -> Optional[str]:
-    """Reads full source text from memory or disk for AST inspection and read analysis."""
+    """Reads full source text from memory or disk for AST inspection and read analysis.
+
+    Buffer Resolution Priority:
+    1. Direct in-memory full source text ('source_text' or 'file_source').
+    2. In-memory line sequence ('source_lines') when not recognized as a pre-sliced excerpt.
+       When virtual/in-memory units span lines 1 through N of an N-line file, callers
+       must explicitly set 'source_lines_is_sliced': False (or provide 'source_text')
+       to prevent length ambiguity heuristics from bypassing the buffer.
+    3. Disk-based file resolution within repo_root.
+    """
     source_text = unit.get("source_text")
     if source_text is None:
         source_text = unit.get("file_source")

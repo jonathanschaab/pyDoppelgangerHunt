@@ -4598,6 +4598,43 @@ def test_extract_scope_local_names_module_tree_single_visit(
     assert len(mod_visits) == 1
 
 
+def test_find_enclosing_loops_synthetic_node_none_lineno() -> None:
+    """Verifies that _find_enclosing_loops handles synthetic AST nodes with
+    explicit lineno=None without raising TypeError."""
+    from pydoppelgangerhunt.fixer._df_hazards import (  # pylint: disable=import-outside-toplevel
+        _find_enclosing_loops,
+    )
+
+    tree = ast.parse("for x in items:\n    pass\n")
+    loop_node = tree.body[0]
+    # Simulate a synthetic AST node where lineno/end_lineno are explicitly None
+    loop_node.lineno = None  # type: ignore[assignment]
+    loop_node.end_lineno = None  # type: ignore[assignment]
+
+    loops = _find_enclosing_loops(tree, u_start=1, u_end=2)
+    assert loops == []
+
+
+def test_ast_node_bounds_synthetic_node_none_col_offset() -> None:
+    """Verifies that _is_ast_node_within_unit_bounds and _is_node_after_unit
+    handle synthetic nodes with explicit col_offset=None without raising TypeError."""
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=import-outside-toplevel
+        _DownstreamReadVisitor,
+        _is_ast_node_within_unit_bounds,
+    )
+
+    node = ast.Name(id="x", ctx=ast.Load())
+    node.lineno = 5
+    node.col_offset = None  # type: ignore[assignment]
+
+    # Within bounds on line 5: falls back to True when col_offset is None
+    assert _is_ast_node_within_unit_bounds(node, u_start=1, u_end=5, u_end_col=10)
+
+    # After unit visitor: fails closed and treats same-line node on u_end as downstream
+    visitor = _DownstreamReadVisitor(u_start=1, u_end=5, u_end_col=10)
+    assert visitor._is_node_after_unit(node)
+
+
 
 
 

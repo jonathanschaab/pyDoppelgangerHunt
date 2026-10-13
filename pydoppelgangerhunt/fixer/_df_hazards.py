@@ -69,9 +69,11 @@ def _find_enclosing_loops(
         loops: List[Tuple[int, int]] = []
         for node in ast.walk(scope_node):
             if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
-                l_start = getattr(node, "lineno", 0)
+                l_start = getattr(node, "lineno", None) or 0
                 l_end = getattr(node, "end_lineno", None) or l_start
-                loops.append((l_start, l_end))
+                if l_start <= 0 or l_end <= 0:
+                    continue
+                loops.append((int(l_start), int(l_end)))
         return loops
 
     cached_loops = _get_or_compute_scope_cached(

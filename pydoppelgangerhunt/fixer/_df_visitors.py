@@ -509,8 +509,10 @@ def _is_ast_node_within_unit_bounds(
     if lineno < u_start or lineno > u_end:
         return False
     if lineno == u_end and u_end_col is not None:
-        col = getattr(node, "col_offset", 0)
-        return col < int(u_end_col)
+        col = getattr(node, "col_offset", None)
+        if col is None:
+            return True
+        return bool(int(col) < int(u_end_col))
     return True
 
 
@@ -559,7 +561,10 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             return True
         if lineno == self.u_end:
             if self.u_end_col is not None:
-                return getattr(node, "col_offset", 0) >= int(self.u_end_col)
+                col = getattr(node, "col_offset", None)
+                if col is None:
+                    return True
+                return bool(int(col) >= int(self.u_end_col))
             # When u_end_col cannot be resolved, fail-closed by treating
             # same-line nodes on u_end as downstream.
             return True

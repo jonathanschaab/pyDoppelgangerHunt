@@ -40,7 +40,7 @@ from pydoppelgangerhunt.fixer.source import (
 )
 
 _ASSIGN_STMT_RE = re.compile(
-    r"^[a-zA-Z_]\w*(?:\s*:\s*[^=]+)?\s*(?<![=<>!:])=(?!=)\s*(.+)$"
+    r"^(?:.+?)(?<![=<>!:])=(?!=)\s*(.+)$"
 )
 
 

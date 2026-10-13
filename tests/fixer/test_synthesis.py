@@ -3091,8 +3091,25 @@ def test_assign_stmt_re_module_constant() -> None:
     assert m2 is not None
     assert m2.group(1) == "a + b"
 
+    m3 = _ASSIGN_STMT_RE.match("self.attr = compute_val()")
+    assert m3 is not None
+    assert m3.group(1) == "compute_val()"
+
+    m4 = _ASSIGN_STMT_RE.match("items[0] = fetch_item()")
+    assert m4 is not None
+    assert m4.group(1) == "fetch_item()"
+
+    m5 = _ASSIGN_STMT_RE.match("a, b = get_pair()")
+    assert m5 is not None
+    assert m5.group(1) == "get_pair()"
+
+    # Rejections of non-assignments, comparisons, and walrus
     assert _ASSIGN_STMT_RE.match("== not an assign") is None
     assert _ASSIGN_STMT_RE.match("if a == b:") is None
+    assert _ASSIGN_STMT_RE.match("a <= b") is None
+    assert _ASSIGN_STMT_RE.match("a >= b") is None
+    assert _ASSIGN_STMT_RE.match("a != b") is None
+    assert _ASSIGN_STMT_RE.match("a := 1") is None
 
 
 def test_infer_helper_return_type_symmetric_outputs2_mapping() -> None:
