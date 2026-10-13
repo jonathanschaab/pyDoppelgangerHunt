@@ -3532,6 +3532,19 @@ def test_eager_builtin_scope_shadowing_scenarios() -> None:
     # Lambda in sum assignment + escaping genexp
     assert len(closures_walrus) == 2
 
+    # 7. Wildcard star import dynamically shadows eager built-in
+    code_star = (
+        "def compute():\n"
+        "    from numpy import *\n"
+        "    data = [1, 2, 3]\n"
+        "    total = sum(x * 2 for x in data)\n"
+        "    yield total\n"
+    )
+    tree_star = ast.parse(code_star)
+    closures_star = _collect_scope_closures(tree_star.body[0])
+    # Expect 1 closure because sum is treated as potentially shadowed/escaping
+    assert len(closures_star) == 1
+
 
 def test_module_level_shadowing_of_eager_builtins() -> None:
     """Verifies that module-level symbols shadowing eager built-ins prevent
@@ -3569,6 +3582,20 @@ def test_module_level_shadowing_of_eager_builtins() -> None:
     fn_check = tree_mod_fn.body[1]
     closures_check = _collect_scope_closures(fn_check, module_tree=tree_mod_fn)
     assert len(closures_check) == 1
+
+    # Module-level wildcard star import shadows sum
+    code_mod_star = (
+        "from numpy import *\n"
+        "\n"
+        "def compute():\n"
+        "    data = [1, 2, 3]\n"
+        "    res = sum(x * 2 for x in data)\n"
+        "    yield res\n"
+    )
+    tree_mod_star = ast.parse(code_mod_star)
+    fn_star = tree_mod_star.body[1]
+    closures_mod_star = _collect_scope_closures(fn_star, module_tree=tree_mod_star)
+    assert len(closures_mod_star) == 1
 
 
 def test_eager_consumed_genexp_non_str_receiver_join() -> None:
@@ -3949,6 +3976,22 @@ def test_downstream_cache_lock_reentrancy() -> None:
     with _downstream_cache_lock:
         with _downstream_cache_lock:
             pass
+
+
+def test_store_lru_cache_entry_double_checked_locking() -> None:
+    """Verifies that _store_lru_cache_entry returns previously cached value on race condition."""
+    from collections import OrderedDict
+    from pydoppelgangerhunt.fixer._df_cache import _store_lru_cache_entry
+
+    cache: OrderedDict[str, str] = OrderedDict()
+    res1 = _store_lru_cache_entry(cache, "k1", "val1", 10)
+    assert res1 == "val1"
+    assert cache["k1"] == "val1"
+
+    # Simulate another thread having stored "val1" before our thread stores "val1_duplicate"
+    res2 = _store_lru_cache_entry(cache, "k1", "val1_duplicate", 10)
+    assert res2 == "val1"
+    assert cache["k1"] == "val1"
 
 
 def test_is_ast_node_within_unit_bounds_unresolved_column_fallback() -> None:

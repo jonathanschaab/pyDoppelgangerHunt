@@ -187,12 +187,41 @@ def _is_confirmed_str_receiver(
     return False
 
 
+def _has_wildcard_star_import(
+    scope_node: ast.AST, module_tree: Optional[ast.AST] = None
+) -> bool:
+    """Checks whether scope_node or any enclosing scope contains a wildcard star import."""
+    for child in ast.walk(scope_node):
+        if (
+            isinstance(child, ast.ImportFrom)
+            and child.module not in ("builtins", "__builtins__")
+            and any(alias.name == "*" for alias in child.names)
+        ):
+            return True
+    if module_tree is not None and module_tree is not scope_node:
+        parent_map = _get_scope_parent_map(module_tree)
+        curr: Optional[ast.AST] = parent_map.get(scope_node)
+        while curr is not None:
+            for stmt in getattr(curr, "body", []):
+                if (
+                    isinstance(stmt, ast.ImportFrom)
+                    and stmt.module not in ("builtins", "__builtins__")
+                    and any(alias.name == "*" for alias in stmt.names)
+                ):
+                    return True
+            curr = parent_map.get(curr)
+    return False
+
+
 def _is_eagerly_consumed_genexp(
     genexp: ast.GeneratorExp,
     parent_map: Dict[ast.AST, ast.AST],
     shadowed_names: Optional[Set[str]] = None,
+    has_star_import: bool = False,
 ) -> bool:
     """Returns True if the generator expression is directly consumed by an eager built-in."""
+    if has_star_import or (shadowed_names is not None and "*" in shadowed_names):
+        return False
     parent = parent_map.get(genexp)
     if isinstance(parent, ast.Call):
         is_arg = any(a is genexp for a in parent.args) or any(
@@ -219,6 +248,7 @@ def _collect_scope_closures_uncached(
     closures: List[Tuple[_ClosurePos, Set[str]]] = []
     parent_map = _get_scope_parent_map(scope_node)
     shadowed_names = _extract_scope_local_names(scope_node, module_tree=module_tree)
+    has_star_import = _has_wildcard_star_import(scope_node, module_tree=module_tree)
 
     def _resolve_stmt_start_pos(s: ast.AST) -> Tuple[int, int]:
         s_line = int(getattr(s, "lineno", 0) or 0)
@@ -247,7 +277,7 @@ def _collect_scope_closures_uncached(
         for node in nodes:
             for subnode in ast.walk(node):
                 if isinstance(subnode, ast.GeneratorExp) and _is_eagerly_consumed_genexp(
-                    subnode, parent_map, shadowed_names
+                    subnode, parent_map, shadowed_names, has_star_import=has_star_import
                 ):
                     continue
                 if isinstance(subnode, (ast.Lambda, ast.GeneratorExp)):

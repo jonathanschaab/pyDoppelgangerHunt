@@ -2993,9 +2993,15 @@ def _generate_refactoring_patch_impl(
                             f2_plan = _get_plan(f2_path, rel_f2, loaded_text)
                         except (OSError, UnicodeDecodeError):
                             f2_plan = None
+                    if f2_plan is None and replace_clones:
+                        skip_reasons["unreadable file"] += 1
+                        continue
                     if f2_plan is not None:
                         enc2 = find_enclosing_class(f2_plan.orig_text, u2)
                         fn2 = find_enclosing_function(f2_plan.orig_text, u2)
+                elif replace_clones:
+                    skip_reasons["unreadable file"] += 1
+                    continue
             else:
                 skip_reasons["missing second file"] += 1
                 continue
@@ -3886,6 +3892,9 @@ def _generate_refactoring_patch_impl(
                         replace_clones=replace_clones,
                     )
             else:
+                if replace_clones:
+                    skip_reasons["unreadable file"] += 1
+                    continue
                 mod1 = _derive_module_import_path(f1_path, import_root)
                 is_pkg1 = f1_path.name == "__init__.py"
                 helper_code, maybe_imports = _safely_prepare_helper_and_imports(

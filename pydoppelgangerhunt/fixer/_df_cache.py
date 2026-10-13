@@ -66,15 +66,18 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
 
 
 def _store_lru_cache_entry(
-    cache: OrderedDict[Any, Any],
+    cache: OrderedDict[Any, _CacheValT],
     key: Any,
-    value: Any,
+    value: _CacheValT,
     max_size: int,
-) -> None:
+) -> _CacheValT:
     """Stores key-value pair in an OrderedDict LRU cache with eviction outside lock."""
     evicted_tree: Optional[ast.AST] = None
     with _downstream_cache_lock:
-        if key not in cache and len(cache) >= max_size:
+        if key in cache:
+            cache.move_to_end(key)
+            return cache[key]
+        if len(cache) >= max_size:
             _, evicted_val = cache.popitem(last=False)
             if cache is _parsed_tree_cache and isinstance(evicted_val, ast.AST):
                 evicted_tree = evicted_val
@@ -82,6 +85,7 @@ def _store_lru_cache_entry(
         cache.move_to_end(key)
     if evicted_tree is not None:
         _evict_tree_scopes(evicted_tree)
+    return value
 
 
 def _get_or_compute_scope_cached(
@@ -136,8 +140,10 @@ def _get_or_parse_tree(
     except (SyntaxError, ValueError, UnicodeDecodeError):
         parsed = None
 
-    _store_lru_cache_entry(_parsed_tree_cache, key, parsed, _MAX_PARSED_TREE_CACHE_SIZE)
-    return parsed
+    stored_tree = _store_lru_cache_entry(
+        _parsed_tree_cache, key, parsed, _MAX_PARSED_TREE_CACHE_SIZE
+    )
+    return stored_tree
 
 
 def _parse_source_tree(

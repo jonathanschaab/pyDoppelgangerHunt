@@ -9251,6 +9251,36 @@ def test_render_file_patch_plan_non_standard_unit_span_defensive_recovery() -> N
         assert isinstance(diff, str)
 
 
+def test_generate_refactoring_patch_unreadable_second_file_skips_pair(
+    tmp_path: Path,
+) -> None:
+    """Verifies that an unreadable second file in a cross-file clone pair safely skips
+    the pair and does not perform a partial refactor on the first file."""
+    f1 = tmp_path / "f1.py"
+    f2 = tmp_path / "f2.py"
+    f1.write_text("def f():\n    return 42\n", encoding="utf-8")
+    f2.write_text("def g():\n    return 42\n", encoding="utf-8")
+
+    u1 = {"name": "f", "file": "f1.py", "start": 1, "end": 2, "kind": "function"}
+    u2 = {"name": "g", "file": "f2.py", "start": 1, "end": 2, "kind": "function"}
+
+    orig_read_text = Path.read_text
+
+    def mock_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self.name == "f2.py":
+            raise OSError("Simulated disk read failure")
+        return orig_read_text(self, *args, **kwargs)
+
+    with mock.patch.object(Path, "read_text", autospec=True, side_effect=mock_read_text):
+        patch = generate_refactoring_patch(
+            [(1.0, u1, u2)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+        )
+    # Patch must be empty (pair skipped without refactoring u1)
+    assert patch == ""
+
+
 def test_replace_unit_and_refactor_missing_coordinates_raise_value_error() -> None:
     """Verifies that missing 'start' or 'end' line coordinates raise ValueError in
     replace_unit_in_source and refactor_module_units."""
