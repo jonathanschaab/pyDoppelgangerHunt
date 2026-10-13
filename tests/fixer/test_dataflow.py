@@ -4435,4 +4435,59 @@ def test_downstream_read_visitor_wildcard_import_dynamic_read() -> None:
     assert "y" in visitor.loaded
 
 
+def test_get_or_compute_scope_cached_canonical_instance_return() -> None:
+    """Verifies that _get_or_compute_scope_cached returns the canonical cached instance
+    when another thread populates the cache concurrently during computation."""
+    from collections import OrderedDict
+    from pydoppelgangerhunt.fixer._df_cache import _get_or_compute_scope_cached
+
+    cache: OrderedDict[str, list[str]] = OrderedDict()
+    canonical_list: list[str] = ["canonical"]
+
+    def compute_fn() -> list[str]:
+        # Simulate another thread storing the canonical entry during our compute_fn
+        cache["scope_node"] = canonical_list
+        return ["duplicate_computed"]
+
+    result = _get_or_compute_scope_cached(cache, "scope_node", compute_fn)
+    assert result is canonical_list
+
+
+def test_check_enclosing_try_cleanup_hazard_precomputed_scope_and_bounds() -> None:
+    """Verifies that _check_enclosing_try_cleanup_hazard correctly accepts precomputed
+    scope_node and bounds without redundant lookups."""
+    from pydoppelgangerhunt.fixer._df_pairing import (
+        _check_enclosing_try_cleanup_hazard,
+        _validate_try_cleanup_hazard,
+    )
+    from pydoppelgangerhunt.fixer._df_hazards import _resolve_downstream_scope_node
+    from pydoppelgangerhunt.fixer._df_cache import _get_valid_unit_bounds
+
+    code = (
+        "def run():\n"
+        "    try:\n"
+        "        x = 10\n"
+        "    finally:\n"
+        "        print(x)\n"
+    )
+    tree = ast.parse(code)
+    unit = {"start": 3, "end": 3, "inputs": []}
+    scope_node = _resolve_downstream_scope_node(code, unit, tree)
+    bounds = _get_valid_unit_bounds(unit)
+
+    # Precomputed scope_node and bounds passed directly
+    has_hazard = _check_enclosing_try_cleanup_hazard(
+        unit, ["x"], code, tree, scope_node=scope_node, bounds=bounds
+    )
+    assert has_hazard is True
+
+    # Validate try cleanup hazard returns rejection
+    resolution = _validate_try_cleanup_hazard(
+        unit, ["x"], code, tree, side_idx=0, context="test clone"
+    )
+    assert resolution is not None
+    assert resolution.skip_reason == "enclosing try or with cleanup hazard"
+
+
+
 

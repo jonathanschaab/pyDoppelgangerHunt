@@ -61,14 +61,19 @@ def _check_enclosing_try_cleanup_hazard(
     needed_outs: Sequence[str],
     source_text: Optional[str],
     tree: Optional[ast.AST],
+    *,
+    scope_node: Optional[ast.AST] = None,
+    bounds: Optional[Tuple[int, int]] = None,
 ) -> bool:
     """Checks whether any needed outputs are read in enclosing try/except/finally/with blocks."""
     if not needed_outs:
         return False
-    if source_text is None and tree is None:
-        return False
-    scope_node = _resolve_downstream_scope_node(source_text or "", unit, tree)
-    bounds = _get_valid_unit_bounds(unit)
+    if scope_node is None:
+        if source_text is None and tree is None:
+            return False
+        scope_node = _resolve_downstream_scope_node(source_text or "", unit, tree)
+    if bounds is None:
+        bounds = _get_valid_unit_bounds(unit)
     if scope_node is None or bounds is None:
         return False
     u_s, u_e = bounds
@@ -116,7 +121,9 @@ def _validate_try_cleanup_hazard(
             side_idx + 1,
         )
         return CloneOutputResolution(None, hazard)
-    if _check_enclosing_try_cleanup_hazard(unit, needed_outs, source_text, tree):
+    if _check_enclosing_try_cleanup_hazard(
+        unit, needed_outs, source_text, tree, scope_node=scope_node, bounds=bounds
+    ):
         logger.debug(
             "Rejecting %s: needed output(s) read in enclosing try cleanup for unit %s",
             context,

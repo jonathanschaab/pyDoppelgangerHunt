@@ -108,11 +108,9 @@ def _get_or_compute_scope_cached(
     computed = compute_fn()
 
     try:
-        _store_lru_cache_entry(cache, scope_node, computed, _MAX_SCOPE_CACHE_SIZE)
+        return _store_lru_cache_entry(cache, scope_node, computed, _MAX_SCOPE_CACHE_SIZE)
     except TypeError:
-        pass
-
-    return computed
+        return computed
 
 
 def _get_or_parse_tree(
