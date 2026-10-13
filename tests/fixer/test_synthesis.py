@@ -3162,3 +3162,46 @@ def test_synthesize_shared_helper_code_symmetric_global_filtering_preserves_outp
     assert "global g_var" in helper
     assert "return out1" in helper
 
+
+def test_infer_helper_return_type_generator_yield_assignment_imports() -> None:
+    """Verifies that generator send type defaults and produces Generator[yield_t, send_t, None]
+    when has_yield_assignment is True, and include_imports pulls in Generator."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _extract_required_typing_imports,
+        _infer_helper_return_type,
+    )
+
+    scope_default = {
+        "has_yield": True,
+        "has_yield_assignment": True,
+        "is_control_flow_safe": True,
+    }
+    ret_default = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope=scope_default,
+        meta1={},
+        meta2={},
+        type_merge_strategy="default",
+    )
+    assert ret_default == "Generator[Any, Any, None]"
+
+    ret_strict = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope=scope_default,
+        meta1={},
+        meta2={},
+        type_merge_strategy="strict",
+    )
+    assert ret_strict == "Generator[Any, object, None]"
+
+    # Verify typing imports extraction on synthesized generator signature
+    helper_sig = f"def _gen_helper() -> {ret_default}: pass"
+    typing_imports = _extract_required_typing_imports(helper_sig)
+    assert "Generator" in typing_imports
+    assert "Any" in typing_imports
+
+

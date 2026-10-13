@@ -4558,6 +4558,47 @@ def test_evict_tree_scopes_purges_scope_roots_and_retains_unrelated_entries() ->
     clear_dataflow_cache()
 
 
+def test_extract_scope_local_names_module_tree_single_visit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies that _extract_scope_local_names does not redundantly re-extract
+    module_tree names when traversing up to the module root."""
+    import pydoppelgangerhunt.fixer._df_closures as df_closures
+
+    code = (
+        "GLOBAL_MOD_VAR = 100\n"
+        "def outer_fn():\n"
+        "    outer_var = 1\n"
+        "    def inner_fn():\n"
+        "        inner_var = 2\n"
+        "        return inner_var\n"
+    )
+    tree = ast.parse(code)
+    outer = tree.body[1]
+    assert isinstance(outer, ast.FunctionDef)
+    inner = outer.body[1]
+
+    calls: list[ast.AST] = []
+    orig_fn = df_closures._extract_single_node_local_names
+
+    def _spy_extract(node: ast.AST) -> set[str]:
+        calls.append(node)
+        return orig_fn(node)
+
+    monkeypatch.setattr(df_closures, "_extract_single_node_local_names", _spy_extract)
+
+    names = df_closures._extract_scope_local_names(inner, module_tree=tree)
+
+    assert "inner_var" in names
+    assert "outer_var" in names
+    assert "GLOBAL_MOD_VAR" in names
+
+    # module_tree (tree) must be visited exactly once
+    mod_visits = [n for n in calls if n is tree]
+    assert len(mod_visits) == 1
+
+
+
 
 
 

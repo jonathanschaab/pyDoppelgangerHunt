@@ -149,13 +149,16 @@ def _extract_scope_local_names(
     if module_tree is not None and module_tree is not scope_node:
         parent_map = _get_scope_parent_map(module_tree)
         curr: Optional[ast.AST] = parent_map.get(scope_node)
+        visited_module_tree = False
         while curr is not None:
+            if curr is module_tree:
+                visited_module_tree = True
             if isinstance(
                 curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
             ):
                 names.update(_extract_single_node_local_names(curr))
             curr = parent_map.get(curr)
-        if isinstance(
+        if not visited_module_tree and isinstance(
             module_tree, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
         ):
             names.update(_extract_single_node_local_names(module_tree))

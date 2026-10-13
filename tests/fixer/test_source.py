@@ -807,5 +807,47 @@ def test_slice_unit_token_lines_offset_aliases() -> None:
     assert sliced_multi[2] == "    )"
 
 
+def test_is_sliced_excerpt_for_file_explicit_flag_and_ambiguous_span() -> None:
+    """Verifies that _is_sliced_excerpt_for_file honors source_lines_is_sliced: False
+    for full-file buffers whose line count matches the unit span."""
+    from pydoppelgangerhunt.fixer.source import _is_sliced_excerpt_for_file
+
+    lines = ["x = 1\n", "y = 2\n", "z = 3\n"]
+    unit_base = {"file": "m.py", "start": 1, "end": 3}
+
+    # 1. When source_lines_is_sliced is False, it is recognized as full file text
+    unit_full = dict(unit_base, source_lines_is_sliced=False)
+    assert not _is_sliced_excerpt_for_file(unit_full, lines)
+
+    # 2. When source_lines_is_sliced is omitted, length heuristic fails closed (ambiguous)
+    unit_unspecified = dict(unit_base)
+    assert _is_sliced_excerpt_for_file(unit_unspecified, lines)
+
+    # 3. When source_lines_is_sliced is True, it is recognized as sliced
+    unit_sliced = dict(unit_base, source_lines_is_sliced=True)
+    assert _is_sliced_excerpt_for_file(unit_sliced, lines)
+
+    # 4. Truncated buffer (len(lines) < u_end) is always treated as sliced
+    assert _is_sliced_excerpt_for_file(unit_full, lines[:2])
+
+
+def test_extract_required_typing_imports_generator_types() -> None:
+    """Verifies that Generator and AsyncGenerator are extracted from type annotations."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _extract_required_typing_imports,
+    )
+
+    sync_sig = "def gen() -> Generator[int, Any, None]: pass"
+    extracted_sync = _extract_required_typing_imports(sync_sig)
+    assert "Generator" in extracted_sync
+    assert "Any" in extracted_sync
+
+    async_sig = "def agen() -> AsyncGenerator[str, Any]: pass"
+    extracted_async = _extract_required_typing_imports(async_sig)
+    assert "AsyncGenerator" in extracted_async
+    assert "Any" in extracted_async
+
+
+
 
 

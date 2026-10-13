@@ -118,12 +118,22 @@ def is_valid_unit_coordinates(u: Any, strict: bool = False) -> bool:
 _is_valid_unit_coordinates = is_valid_unit_coordinates
 
 def _is_sliced_excerpt_for_file(unit: Dict[str, Any], lines: Sequence[str]) -> bool:
-    """Returns True if lines represents a sliced excerpt rather than full file text."""
+    """Returns True if lines represents a sliced excerpt rather than full file text.
+
+    Note:
+        When a unit spans lines 1 through N of an N-line file, len(lines) matches the
+        unit line span (e_d - s_d + 1 == N). Callers and upstream parsers supplying
+        complete-file line buffers should explicitly set 'source_lines_is_sliced': False
+        on the unit dictionary to prevent ambiguous buffers from being treated as
+        pre-sliced excerpts.
+    """
     if unit.get("source_lines_is_sliced") is True:
         return True
     _, u_end = resolve_unit_line_bounds(unit)
     if len(lines) < u_end:
         return True
+    if unit.get("source_lines_is_sliced") is False:
+        return False
     if is_sliced_unit_source_lines(unit, lines):
         return True
     return False
