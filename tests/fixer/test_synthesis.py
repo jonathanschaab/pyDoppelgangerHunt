@@ -2712,6 +2712,15 @@ def test_node_is_effectively_async_scope_pruning() -> None:
     assert isinstance(tree_gen.body[0], ast.AsyncFunctionDef)
     assert _node_is_effectively_async(tree_gen.body[0].body[0], enclosing_is_async=False)
 
+    # Generator lambda inside an enclosing async function should not make
+    # the surrounding block async
+    code_lambda_gen = (
+        "if cond:\n"
+        "    cb = lambda: (yield 1)\n"
+    )
+    tree_lambda = ast.parse(code_lambda_gen)
+    assert not _node_is_effectively_async(tree_lambda.body[0], enclosing_is_async=True)
+
 
 def test_parse_candidates_def_precedes_async_def() -> None:
     """Verifies that synchronous def wrapper is attempted before async def wrapper in scope."""
@@ -3084,3 +3093,72 @@ def test_assign_stmt_re_module_constant() -> None:
 
     assert _ASSIGN_STMT_RE.match("== not an assign") is None
     assert _ASSIGN_STMT_RE.match("if a == b:") is None
+
+
+def test_infer_helper_return_type_symmetric_outputs2_mapping() -> None:
+    """Verifies that _infer_helper_return_type uses outputs2 mapping for return type inference."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _infer_helper_return_type,
+    )
+
+    meta1 = {"out1": {"type": "int"}, "flag1": {"type": "bool"}}
+    meta2 = {"out2": {"type": "float"}, "flag2": {"type": "str"}}
+
+    ret_with_outputs2 = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=["out1", "flag1"],
+        conditional_outs=set(),
+        scope={"is_control_flow_safe": True},
+        meta1=meta1,
+        meta2=meta2,
+        type_merge_strategy="union",
+        outputs2=["out2", "flag2"],
+    )
+    assert ret_with_outputs2 == "Tuple[Union[int, float], Union[bool, str]]"
+
+
+def test_synthesize_shared_helper_code_symmetric_global_filtering_preserves_outputs(
+    tmp_path: Path,
+) -> None:
+    """Verifies that global/nonlocal filtering prunes output pairs
+    symmetrically from helper return."""
+    f = tmp_path / "m.py"
+    c = (
+        "def comp1(x: int, out1: int):\n"
+        "    global g_var\n"
+        "    g_var = 1\n"
+        "    out1 = out1 + 1\n"
+        "    return out1\n"
+        "\n"
+        "def comp2(y: int, out2: int):\n"
+        "    global g_var\n"
+        "    g_var = 2\n"
+        "    out2 = out2 + 2\n"
+        "    return out2\n"
+    )
+    f.write_text(c, encoding="utf-8")
+    u1 = {
+        "file": str(f),
+        "start": 2,
+        "end": 5,
+        "name": "comp1",
+        "kind": "compound_block",
+    }
+    u2 = {
+        "file": str(f),
+        "start": 8,
+        "end": 11,
+        "name": "comp2",
+        "kind": "compound_block",
+    }
+    helper = synthesize_shared_helper_code(
+        u1,
+        u2,
+        outputs=["g_var", "out1"],
+        outputs2=["g_var", "out2"],
+        repo_root=str(tmp_path),
+    )
+    assert helper != ""
+    assert "global g_var" in helper
+    assert "return out1" in helper
+

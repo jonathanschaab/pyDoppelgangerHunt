@@ -1376,19 +1376,39 @@ def _render_file_patch_plan(
             return ""
         return normalize_path_string(str(raw), strip_anchor=False)
 
+    def _parse_col_coord(unit: Dict[str, Any], *keys: str) -> Optional[int]:
+        for k in keys:
+            if k in unit and unit[k] is not None:
+                try:
+                    val = parse_unit_coord(unit, k, default=None, strict=False)
+                    if val is not None:
+                        return val
+                except (ValueError, TypeError, AttributeError):
+                    pass
+        return None
+
+    def _unit_exact_key(
+        unit: Dict[str, Any],
+    ) -> Tuple[str, int, int, Optional[int], Optional[int], str, str]:
+        s, e = _unit_span(unit)
+        sc = _parse_col_coord(unit, "start_col", "start_col_offset")
+        ec = _parse_col_coord(unit, "end_col", "end_col_offset")
+        return (
+            _file_key(unit),
+            s,
+            e,
+            sc,
+            ec,
+            str(unit.get("name") or ""),
+            str(unit.get("kind") or ""),
+        )
+
     retained_ids: Set[int] = {id(r) for r in retained_cands}
-    retained_spans: Set[Tuple[str, int, int]] = {
-        (_file_key(r), _unit_span(r)[0], _unit_span(r)[1])
-        for r in retained_cands
-    }
+    retained_exact_keys = {_unit_exact_key(r) for r in retained_cands}
 
     filtered_reps: List[Tuple[Dict[str, Any], str]] = []
     for u, rep in coord_valid_reps:
-        u_span = _unit_span(u)
-        if (
-            id(u) in retained_ids
-            or (_file_key(u), u_span[0], u_span[1]) in retained_spans
-        ):
+        if id(u) in retained_ids or _unit_exact_key(u) in retained_exact_keys:
             if not any(
                 check_units_overlap(u, prev_u, repo_root=repo_root)
                 for prev_u, _ in filtered_reps

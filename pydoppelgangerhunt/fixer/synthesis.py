@@ -1114,11 +1114,26 @@ def synthesize_shared_helper_code(
     await_prefix = "await " if is_async else ""
 
     # Variables altered via global or nonlocal statements must not be captured in the helper's return tuple
-    helper_outputs = [
-        v for v in eff_outputs
-        if v not in scope.get("globals", [])
-        and v not in scope.get("nonlocals", [])
-    ]
+    g1 = set(scope.get("globals", []))
+    nl1 = set(scope.get("nonlocals", []))
+    g2 = set(scope2.get("globals", [])) if scope2 else set()
+    nl2 = set(scope2.get("nonlocals", [])) if scope2 else set()
+    if len(eff_outputs) == len(u2_outs):
+        filtered_pairs = [
+            (v1, v2)
+            for v1, v2 in zip(eff_outputs, u2_outs)
+            if v1 not in g1
+            and v1 not in nl1
+            and v2 not in g1
+            and v2 not in nl1
+            and v2 not in g2
+            and v2 not in nl2
+        ]
+        helper_outputs = [p[0] for p in filtered_pairs]
+        helper_outputs2 = [p[1] for p in filtered_pairs]
+    else:
+        helper_outputs = [v for v in eff_outputs if v not in g1 and v not in nl1]
+        helper_outputs2 = [v for v in u2_outs if v not in g1 and v not in nl1]
 
     if has_async_generator_delegation_hazard(
         scope, scope1, scope2, has_outputs=bool(helper_outputs)
@@ -1136,7 +1151,7 @@ def synthesize_shared_helper_code(
         is_async=is_async,
         is_subroutine=is_sub,
         unit_kind=u1.get("kind"),
-        outputs2=u2_outs if len(u2_outs) == len(helper_outputs) else None,
+        outputs2=helper_outputs2 if len(helper_outputs2) == len(helper_outputs) else None,
     )
 
     params_str = ", ".join(params) if params else "*args: Any, **kwargs: Any"

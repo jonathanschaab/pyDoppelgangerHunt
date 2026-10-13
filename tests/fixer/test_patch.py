@@ -9855,6 +9855,63 @@ def test_infer_helper_return_type_generator_send_type_strict_strategy() -> None:
     assert "AsyncGenerator[int, object]" in ret_async_strict
 
 
+def test_render_file_patch_plan_exact_key_disambiguates_same_line_units() -> None:
+    """Verifies that _render_file_patch_plan disambiguates same-line units using exact keys
+    including column coordinates, preventing dropped candidates from preempting winning units."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _FilePatchPlan,
+        _render_file_patch_plan,
+    )
+    from pathlib import Path
+
+    code = "    x = compute_inner_expr(val)\n"
+    plan = _FilePatchPlan(
+        file_path=Path("test.py"),
+        rel_path="test.py",
+        orig_text=code,
+    )
+
+    # u_outer spans cols 4..32, prioritized by filter_overlapping_clone_units
+    u_outer = {
+        "file": "test.py",
+        "start": 1,
+        "end": 1,
+        "start_col": 4,
+        "end_col": 32,
+        "name": "outer_assign",
+        "kind": "statement",
+    }
+    # u_inner is a sub-expression on the same line (cols 8..32), dropped
+    # by filter_overlapping_clone_units
+    u_inner = {
+        "file": "test.py",
+        "start": 1,
+        "end": 1,
+        "start_col": 8,
+        "end_col": 32,
+        "name": "inner_call",
+        "kind": "call",
+    }
+
+    # Pass a copy of u_outer so its object id differs from the one retained
+    # in filter_overlapping_clone_units
+    u_outer_copy = dict(u_outer)
+    # Place u_inner first in replacements
+    plan.replacements = [
+        (u_inner, "    inner_replacement()\n"),
+        (u_outer_copy, "    outer_replacement()\n"),
+    ]
+
+    patch = _render_file_patch_plan(
+        plan,
+        replace_clones=True,
+    )
+    # The patch must apply u_outer (the winning unit) and NOT preempt it with u_inner
+    assert "outer_replacement()" in patch
+    assert "inner_replacement()" not in patch
+
+
+
 
 
 
