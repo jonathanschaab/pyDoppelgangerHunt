@@ -1665,4 +1665,43 @@ def test_sync_outer_containing_nested_async_comprehension(tmp_path: Path) -> Non
     assert scope["is_async"] is False
 
 
+def test_nested_async_comprehension_detected_as_async(tmp_path: Path) -> None:
+    """Verifies that nested async comprehensions correctly set is_async = True."""
+    code = (
+        "async def process_matrix(matrix):\n"
+        "    return [[x async for x in row] for row in matrix]\n"
+    )
+    f = tmp_path / "nested_async_comp.py"
+    f.write_text(code, encoding="utf-8")
 
+    u = {
+        "file": "nested_async_comp.py",
+        "start": 2,
+        "end": 2,
+        "start_col": 11,
+        "end_col": 53,
+        "name": "nested_comp",
+        "kind": "comprehension",
+    }
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert scope["is_async"] is True
+
+
+def test_nested_async_comprehension_in_subroutine(tmp_path: Path) -> None:
+    """Verifies that nested async comprehensions in a subroutine parse correctly and set is_async."""
+    code = (
+        "res = [[x async for x in row] for row in matrix]\n"
+        "total = len(res)\n"
+    )
+    f = tmp_path / "subroutine_nested_async.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {
+        "file": "subroutine_nested_async.py",
+        "start": 1,
+        "end": 2,
+        "name": "subroutine",
+        "kind": "subroutine",
+    }
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert scope["is_async"] is True

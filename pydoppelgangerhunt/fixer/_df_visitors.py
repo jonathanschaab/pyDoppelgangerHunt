@@ -1098,9 +1098,10 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
             self.visit(target)
         for s in body:
             self.visit(s)
-        self.stored = stored_before
+        self.stored = set(stored_before)
         for s in orelse:
             self.visit(s)
+        self.stored = set(stored_before)
 
     def visit_For(self, node: Union[ast.For, ast.AsyncFor]) -> None:
         if not self._is_inside(node):
@@ -1122,6 +1123,7 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
             stored_before = set(self.stored)
             for s in getattr(node, "body", []):
                 self.visit(s)
+            stored_after_body = set(self.stored)
             for h in getattr(node, "handlers", []):
                 self.stored = set(stored_before)
                 name_val = getattr(h, "name", None)
@@ -1129,11 +1131,13 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
                     self.stored.add(name_val)
                 for s in getattr(h, "body", []):
                     self.visit(s)
+            self.stored = set(stored_after_body)
             for s in getattr(node, "orelse", []):
                 self.visit(s)
             self.stored = set(stored_before)
             for s in getattr(node, "finalbody", []):
                 self.visit(s)
+            self.stored = set(stored_before)
         else:
             self.generic_visit(node)
 

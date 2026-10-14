@@ -490,25 +490,27 @@ class _ScopeVisitor(ast.NodeVisitor):
         self._scope_stack.append(inner_vars)
         if (
             any(getattr(g, "is_async", False) for g in node.generators)
-            and len(self._scope_stack) <= 2
+            and (len(self._scope_stack) - self._comprehension_depth) <= 1
         ):
             self.is_async = True
-        for gen in node.generators:
-            self.visit(gen.iter)
-            for n in ast.walk(gen.target):
-                if isinstance(n, ast.Name):
-                    inner_vars.add(n.id)
-            for if_expr in gen.ifs:
-                self.visit(if_expr)
-        if isinstance(node, ast.DictComp):
-            self.visit(node.key)
-            self.visit(node.value)
-        else:
-            self.visit(node.elt)
-        self._scope_stack.pop()
-        if created_outer:
+        try:
+            for gen in node.generators:
+                self.visit(gen.iter)
+                for n in ast.walk(gen.target):
+                    if isinstance(n, ast.Name):
+                        inner_vars.add(n.id)
+                for if_expr in gen.ifs:
+                    self.visit(if_expr)
+            if isinstance(node, ast.DictComp):
+                self.visit(node.key)
+                self.visit(node.value)
+            else:
+                self.visit(node.elt)
+        finally:
             self._scope_stack.pop()
-        self._comprehension_depth -= 1
+            if created_outer:
+                self._scope_stack.pop()
+            self._comprehension_depth -= 1
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
         self._visit_comprehension(node)

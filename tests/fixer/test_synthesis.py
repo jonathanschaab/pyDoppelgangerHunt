@@ -40,10 +40,12 @@ from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=protected-access
     inspect_single_unit_scope,
 )
 from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access
+    _extract_augassign_unreferenced_target,
     _format_union_or_optional,
     _infer_outputs_return_type,
     _normalize_pipe_unions,
     _split_type_args,
+    _strip_stmt_target_lines,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
 
@@ -3360,4 +3362,64 @@ def test_complex_expr_boundary_pragmas_preserved(tmp_path: Path) -> None:
     assert_valid_python(helper)
 
 
+def test_cross_unit_augassign_target_pruning_independent(tmp_path: Path) -> None:
+    """Verifies that unreferenced AugAssign targets from one clone unit do not
+    prune identically named input parameters from the other unit."""
+    code1 = (
+        "def func1(total, a, b):\n"
+        "    total += a + b\n"
+    )
+    code2 = (
+        "def func2(a, b, c):\n"
+        "    a += b + c\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
 
+    u1 = {
+        "file": "mod1.py",
+        "start": 2,
+        "end": 2,
+        "name": "func1:aug",
+        "kind": "complex_expr",
+    }
+    u2 = {
+        "file": "mod2.py",
+        "start": 2,
+        "end": 2,
+        "name": "func2:aug",
+        "kind": "complex_expr",
+    }
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper != ""
+    assert "a: Any" in helper
+    assert "b: Any" in helper
+    assert_valid_python(helper)
+
+
+def test_extract_augassign_unreferenced_target_indented_multiline() -> None:
+    """Verifies that indented multi-line AugAssign statements are properly dedented and parsed."""
+    lines = [
+        "    total += (",
+        "        x + y",
+        "    )",
+    ]
+    target = _extract_augassign_unreferenced_target(lines)
+    assert target == "total"
+
+    stripped = _strip_stmt_target_lines(lines)
+    assert stripped == ["x + y"]
+
+
+def test_normalize_pipe_unions_optional_pipe_none_flattened() -> None:
+    """Verifies that Optional with pipe unions containing None flattens cleanly."""
+    res1 = _normalize_pipe_unions("Optional[int | None]")
+    assert res1 == "Optional[int]"
+
+    res2 = _normalize_pipe_unions("typing.Optional[str | None]")
+    assert res2 == "Optional[str]"
+
+    res3 = _normalize_pipe_unions("Optional[int | str]")
+    assert res3 == "Optional[Union[int, str]]"

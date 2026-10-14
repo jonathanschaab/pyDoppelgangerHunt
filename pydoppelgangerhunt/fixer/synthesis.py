@@ -72,7 +72,7 @@ def _node_references_name(node: ast.AST, name: str) -> bool:
 
 def _strip_stmt_target_lines(lines: Sequence[str]) -> List[str]:
     """Strips assignment targets from statement lines to yield clean expression lines."""
-    raw = "\n".join(lines).strip()
+    raw = dedent_source_text("\n".join(lines)).strip()
     try:
         parsed = ast.parse(raw).body
         if parsed:
@@ -93,7 +93,7 @@ def _strip_stmt_target_lines(lines: Sequence[str]) -> List[str]:
 
 def _extract_augassign_unreferenced_target(lines: Sequence[str]) -> Optional[str]:
     """Extracts target identifier of an AugAssign statement if not referenced in its RHS value."""
-    raw = "\n".join(lines).strip()
+    raw = dedent_source_text("\n".join(lines)).strip()
     try:
         parsed = ast.parse(raw).body
         if parsed and isinstance(parsed[0], ast.AugAssign):
@@ -370,6 +370,15 @@ def _normalize_pipe_unions(type_str: Optional[str]) -> str:
                 norm_args = [_normalize_pipe_unions(arg) for arg in inner_args]
                 if prefix in ("Union", "typing.Union", "typing_extensions.Union"):
                     unique = list(dict.fromkeys(_flatten_union_args(norm_args)))
+                    return _format_union_or_optional(unique)
+                if prefix in (
+                    "Optional",
+                    "typing.Optional",
+                    "typing_extensions.Optional",
+                ):
+                    unique = list(
+                        dict.fromkeys(_flatten_union_args([*norm_args, "None"]))
+                    )
                     return _format_union_or_optional(unique)
                 return f"{prefix}[{', '.join(norm_args)}]"
 
@@ -1012,7 +1021,13 @@ def synthesize_shared_helper_code(
         scopes.append(s_item)
     scope1, scope2 = scopes[0], scopes[1]
     scope = analyze_unit_variable_scope(
-        u1, u2, repo_root=repo_root, tree1=tree1, tree2=tree2
+        u1,
+        u2,
+        repo_root=repo_root,
+        tree1=tree1,
+        tree2=tree2,
+        scope1=scope1,
+        scope2=scope2,
     )
     if scope1.get("is_async") or scope2.get("is_async"):
         scope["is_async"] = True
@@ -1033,14 +1048,10 @@ def synthesize_shared_helper_code(
 
     inputs = list(scope["inputs"])
     t1_unref: Optional[str] = None
-    t2_unref: Optional[str] = None
     if u1.get("kind") in ("comprehension", "complex_expr"):
         t1_unref = _extract_augassign_unreferenced_target(orig_lines1)
-    if u2.get("kind") in ("comprehension", "complex_expr"):
-        t2_unref = _extract_augassign_unreferenced_target(orig_lines2)
-    unref_targets = {t for t in (t1_unref, t2_unref) if t is not None}
-    if unref_targets:
-        inputs = [x for x in inputs if x not in unref_targets]
+    if t1_unref is not None:
+        inputs = [x for x in inputs if x != t1_unref]
 
     def _unit_receiver_kind(u: Dict[str, Any], u_scope: Dict[str, Any]) -> str:
         if u.get("receiver_kind"):
@@ -1136,8 +1147,11 @@ def synthesize_shared_helper_code(
         indent = "    "
 
     inputs2 = list(scope2.get("inputs", []))
-    if unref_targets:
-        inputs2 = [x for x in inputs2 if x not in unref_targets]
+    t2_unref: Optional[str] = None
+    if u2.get("kind") in ("comprehension", "complex_expr"):
+        t2_unref = _extract_augassign_unreferenced_target(orig_lines2)
+    if t2_unref is not None:
+        inputs2 = [x for x in inputs2 if x != t2_unref]
     if effective_binding == "module":
         inputs2 = _prune_unshared_receivers(inputs2, u2, u1, scope2, scope1, repo_root=repo_root)
 

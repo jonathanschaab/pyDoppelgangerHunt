@@ -4780,8 +4780,77 @@ def test_generator_subroutine_pair_preserves_try_hazard_skip_reason() -> None:
     assert res.skip_reason == "enclosing try or with cleanup hazard"
 
 
+def test_unit_live_in_visitor_try_orelse_no_handler_leak() -> None:
+    """Verifies that variables stored in except handlers do not leak into try-else,
+    correctly capturing live-ins in orelse."""
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=protected-access
+        _extract_unit_live_in_names,
+    )
+
+    code1 = (
+        "def fn():\n"
+        "    try:\n"
+        "        do_something()\n"
+        "    except Exception:\n"
+        "        val = 1\n"
+        "    else:\n"
+        "        use(val)\n"
+    )
+    tree1 = ast.parse(code1)
+    live_ins1 = _extract_unit_live_in_names(
+        tree1.body[0], u_start=2, u_end=7, candidates={"val", "use", "do_something"}
+    )
+    assert "val" in live_ins1
+
+    code2 = (
+        "def fn():\n"
+        "    try:\n"
+        "        val = 1\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    else:\n"
+        "        use(val)\n"
+    )
+    tree2 = ast.parse(code2)
+    live_ins2 = _extract_unit_live_in_names(
+        tree2.body[0], u_start=2, u_end=7, candidates={"val", "use"}
+    )
+    assert "val" not in live_ins2
 
 
+def test_unit_live_in_visitor_loop_orelse_resets_stored() -> None:
+    """Verifies that loop orelse stores do not leak past the loop,
+    and body stores do not falsely kill orelse live-ins."""
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=protected-access
+        _extract_unit_live_in_names,
+    )
 
+    # 1. Body stores do not kill orelse live-ins because loop body might never execute
+    code1 = (
+        "def fn(items):\n"
+        "    for x in items:\n"
+        "        val = 1\n"
+        "    else:\n"
+        "        use(val)\n"
+    )
+    tree1 = ast.parse(code1)
+    live_ins1 = _extract_unit_live_in_names(
+        tree1.body[0], u_start=2, u_end=6, candidates={"val", "use", "items"}
+    )
+    assert "val" in live_ins1
 
-
+    # 2. Orelse stores do not kill subsequent reads because loop might break before orelse
+    code2 = (
+        "def fn(items):\n"
+        "    for x in items:\n"
+        "        if test(x):\n"
+        "            break\n"
+        "    else:\n"
+        "        val = 2\n"
+        "    use(val)\n"
+    )
+    tree2 = ast.parse(code2)
+    live_ins2 = _extract_unit_live_in_names(
+        tree2.body[0], u_start=2, u_end=8, candidates={"val", "use", "items", "test"}
+    )
+    assert "val" in live_ins2
