@@ -264,6 +264,26 @@ def _get_enclosing_receiver_kind(fn_info: Optional[Dict[str, Any]]) -> str:
     return "instance"
 
 
+def _find_innermost_ast_scope(
+    tree: ast.AST, u_start: int, u_end: int
+) -> ast.AST:
+    """Finds the innermost FunctionDef, AsyncFunctionDef, or ClassDef enclosing the unit bounds."""
+    best_node = tree
+    best_span = float("inf")
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            n_start = getattr(node, "lineno", None)
+            if n_start is None:
+                continue
+            n_end = getattr(node, "end_lineno", n_start) or n_start
+            if n_start <= u_start and u_end <= n_end:
+                span = n_end - n_start
+                if span < best_span:
+                    best_span = span
+                    best_node = node
+    return best_node
+
+
 def _unit_ast_has_async_or_yield(
     tree: ast.AST, u_start: int, u_end: int
 ) -> Tuple[bool, bool]:
@@ -271,18 +291,8 @@ def _unit_ast_has_async_or_yield(
     has_yield = False
     has_await = False
 
-    top_level_nodes: Set[int] = set()
-
-    def _collect_top_level(parent: ast.AST) -> None:
-        for child in getattr(parent, "body", []):
-            top_level_nodes.add(id(child))
-            if isinstance(child, ast.ClassDef):
-                _collect_top_level(child)
-
-    if isinstance(tree, (ast.Module, ast.ClassDef)):
-        _collect_top_level(tree)
-
-    stack: List[ast.AST] = [tree]
+    root_node = _find_innermost_ast_scope(tree, u_start, u_end)
+    stack: List[ast.AST] = [root_node]
     while stack:
         node = stack.pop()
         lineno = getattr(node, "lineno", None)
@@ -291,7 +301,7 @@ def _unit_ast_has_async_or_yield(
             lineno is not None
             and end_lineno is not None
             and (end_lineno < u_start or lineno > u_end)
-            and not isinstance(node, (ast.Module, ast.Interactive, ast.Expression))
+            and node is not root_node
         ):
             continue
 
@@ -312,18 +322,11 @@ def _unit_ast_has_async_or_yield(
                 and bool(getattr(node, "is_async", False))
             ):
                 has_await = True
-            if isinstance(node, ast.Lambda):
+
+            if node is not root_node and isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+            ):
                 continue
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if node is not tree:
-                    n_start = lineno
-                    n_end = end_lineno or n_start
-                    is_enclosing = (
-                        (n_start < u_start or n_end > u_end)
-                        or id(node) in top_level_nodes
-                    )
-                    if not is_enclosing:
-                        continue
 
         if has_yield and has_await:
             break

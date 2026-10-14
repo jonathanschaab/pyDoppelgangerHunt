@@ -1786,3 +1786,48 @@ def test_unit_ast_has_async_or_yield_single_line_class_method() -> None:
     assert has_yield is False
 
 
+def test_unit_ast_has_async_or_yield_nested_functions_and_classes() -> None:
+    """Verifies that nested functions or classes within unit bounds do not leak yield/await to outer scope."""
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=protected-access
+        _unit_ast_has_async_or_yield,
+    )
+
+    # 1. Module-level block containing inner generator function
+    code1 = (
+        "total = 0\n"
+        "def inner_gen():\n"
+        "    yield 1\n"
+        "total += 1\n"
+    )
+    tree1 = ast.parse(code1)
+    has_yield1, has_await1 = _unit_ast_has_async_or_yield(tree1, 1, 4)
+    assert has_yield1 is False
+    assert has_await1 is False
+
+    # 2. Function containing nested generator function
+    code2 = (
+        "def process(items):\n"
+        "    def inner_gen():\n"
+        "        for x in items:\n"
+        "            yield x\n"
+        "    return list(inner_gen())\n"
+    )
+    tree2 = ast.parse(code2)
+    has_yield2, has_await2 = _unit_ast_has_async_or_yield(tree2, 1, 5)
+    assert has_yield2 is False
+    assert has_await2 is False
+
+    # 3. Function containing nested class with generator method
+    code3 = (
+        "def factory():\n"
+        "    class Inner:\n"
+        "        def gen(self):\n"
+        "            yield 42\n"
+        "    return Inner()\n"
+    )
+    tree3 = ast.parse(code3)
+    has_yield3, has_await3 = _unit_ast_has_async_or_yield(tree3, 1, 5)
+    assert has_yield3 is False
+    assert has_await3 is False
+
+

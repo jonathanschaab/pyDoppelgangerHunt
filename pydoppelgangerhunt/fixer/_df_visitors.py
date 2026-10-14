@@ -54,6 +54,16 @@ def _record_import_names(
             )
 
 
+def _extract_scope_stmts(scope_node: ast.AST) -> List[ast.AST]:
+    """Defensively extracts statements or expression nodes from a scope's body attribute."""
+    raw_body = getattr(scope_node, "body", [])
+    if isinstance(raw_body, list):
+        return raw_body
+    if isinstance(raw_body, ast.AST):
+        return [raw_body]
+    return []
+
+
 class _BaseScopeVisitor(ast.NodeVisitor):
     """Shared helpers for scope visitors."""
 
@@ -936,6 +946,7 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         u_end_col: Optional[int] = None,
         candidates: Optional[Set[str]] = None,
         u_start_col: Optional[int] = None,
+        scope_node: Optional[ast.AST] = None,
     ) -> None:
         super().__init__()
         self.u_start = u_start
@@ -943,6 +954,7 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         self.u_end_col = u_end_col
         self.u_start_col = u_start_col
         self.candidates = candidates
+        self.scope_node = scope_node
         self.live_ins: Set[str] = set()
         self.stored: Set[str] = set()
         self._conditional_depth: int = 0
@@ -982,24 +994,29 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         else:
             self.generic_visit(node)
 
+    def _visit_named_scope_def(
+        self,
+        node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef],
+    ) -> None:
+        if self.scope_node is not None and node is self.scope_node:
+            self.generic_visit(node)
+            return
+        if self._is_inside(node):
+            self.stored.add(node.name)
+            self._record_nested_free_reads(node)
+        else:
+            self.generic_visit(node)
+
     def visit_FunctionDef(
         self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
     ) -> None:
-        if self._is_inside(node):
-            self.stored.add(node.name)
-            self._record_nested_free_reads(node)
-        else:
-            self.generic_visit(node)
+        self._visit_named_scope_def(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self.visit_FunctionDef(node)
+        self._visit_named_scope_def(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        if self._is_inside(node):
-            self.stored.add(node.name)
-            self._record_nested_free_reads(node)
-        else:
-            self.generic_visit(node)
+        self._visit_named_scope_def(node)
 
     def _visit_import_node(self, node: Union[ast.Import, ast.ImportFrom]) -> None:
         if self._is_inside(node):
@@ -1138,69 +1155,54 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         self.stored = set(stored_before)
 
     def visit_For(self, node: Union[ast.For, ast.AsyncFor]) -> None:
-        if not self._is_inside(node):
-            self.generic_visit(node)
-            return
         self._visit_loop_body(node.iter, node.body, node.orelse, target=node.target)
 
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
         self.visit_For(node)
 
     def visit_While(self, node: ast.While) -> None:
-        if not self._is_inside(node):
-            self.generic_visit(node)
-            return
         self._visit_loop_body(node.test, node.body, node.orelse)
 
     def visit_Try(self, node: Union[ast.Try, ast.AST]) -> None:
-        if self._is_inside(node):
-            stored_before = set(self.stored)
-            for s in getattr(node, "body", []):
-                self.visit(s)
-            stored_after_body = set(self.stored)
-            for h in getattr(node, "handlers", []):
-                self.stored = set(stored_before)
-                h_type = getattr(h, "type", None)
-                if h_type is not None:
-                    self.visit(h_type)
-                name_val = getattr(h, "name", None)
-                if isinstance(name_val, str):
-                    self.stored.add(name_val)
-                for s in getattr(h, "body", []):
-                    self.visit(s)
-            self.stored = set(stored_after_body)
-            for s in getattr(node, "orelse", []):
-                self.visit(s)
+        stored_before = set(self.stored)
+        for s in getattr(node, "body", []):
+            self.visit(s)
+        stored_after_body = set(self.stored)
+        for h in getattr(node, "handlers", []):
             self.stored = set(stored_before)
-            for s in getattr(node, "finalbody", []):
+            h_type = getattr(h, "type", None)
+            if h_type is not None:
+                self.visit(h_type)
+            name_val = getattr(h, "name", None)
+            if isinstance(name_val, str):
+                self.stored.add(name_val)
+            for s in getattr(h, "body", []):
                 self.visit(s)
-            self.stored = set(stored_before)
-        else:
-            self.generic_visit(node)
+        self.stored = set(stored_after_body)
+        for s in getattr(node, "orelse", []):
+            self.visit(s)
+        self.stored = set(stored_before)
+        for s in getattr(node, "finalbody", []):
+            self.visit(s)
+        self.stored = set(stored_before)
 
     def visit_TryStar(self, node: ast.AST) -> None:
         self.visit_Try(node)
 
     def visit_With(self, node: Union[ast.With, ast.AsyncWith]) -> None:
-        if self._is_inside(node):
-            stored_before = set(self.stored)
-            for item in getattr(node, "items", []):
-                self.visit(item.context_expr)
-                if getattr(item, "optional_vars", None) is not None:
-                    self.visit(item.optional_vars)
-            for s in getattr(node, "body", []):
-                self.visit(s)
-            self.stored = set(stored_before)
-        else:
-            self.generic_visit(node)
+        stored_before = set(self.stored)
+        for item in getattr(node, "items", []):
+            self.visit(item.context_expr)
+            if getattr(item, "optional_vars", None) is not None:
+                self.visit(item.optional_vars)
+        for s in getattr(node, "body", []):
+            self.visit(s)
+        self.stored = set(stored_before)
 
     def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
         self.visit_With(node)
 
     def visit_Match(self, node: ast.AST) -> None:
-        if not self._is_inside(node):
-            self.generic_visit(node)
-            return
         self._traverse_isolated_cases(
             node,
             lambda: self.stored,
@@ -1223,6 +1225,12 @@ def _extract_unit_live_in_names(
         u_end_col=u_end_col,
         candidates=candidates,
         u_start_col=u_start_col,
+        scope_node=scope_node,
     )
-    visitor.visit(scope_node)
+    stmts = _extract_scope_stmts(scope_node)
+    if stmts:
+        for stmt in stmts:
+            visitor.visit(stmt)
+    else:
+        visitor.visit(scope_node)
     return visitor.live_ins

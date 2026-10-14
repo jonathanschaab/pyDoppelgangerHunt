@@ -55,12 +55,14 @@ from pydoppelgangerhunt.fixer.source import (
     ReplacementItem,
     UnitDict,
     _detect_indent_step,
+    _extract_unit_body_lines,
     _find_module_helper_insertion_index,
     _find_sig_colon,
     _get_module_imported_names,
     _insert_imports_into_module,
     _is_docstring_node,
     _scan_sig_line,
+    _slice_unit_token_lines,
     _validate_and_parse_unit_bound,
     compute_line_offsets,
     compute_unit_replacement_span,
@@ -83,6 +85,7 @@ from pydoppelgangerhunt.fixer.synthesis import (
     _extract_augassign_unreferenced_target,
     _extract_required_typing_imports,
     _format_call_arguments,
+    _is_subline_unit,
     _node_references_name,
     synthesize_shared_helper_code,
 )
@@ -789,14 +792,7 @@ def _build_unit_delegation_call(
 
     if target_unit.get("kind") == "complex_expr":
         call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
-        start_col = target_unit.get("start_col")
-        if start_col is None:
-            start_col = target_unit.get("start_col_offset")
-        end_col = target_unit.get("end_col")
-        if end_col is None:
-            end_col = target_unit.get("end_col_offset")
-        is_subline = (start_col is not None or end_col is not None)
-        if not is_subline:
+        if not _is_subline_unit(target_unit):
             u_end = max(u_start, parse_unit_coord(target_unit, "end", default=u_start))
             raw_block = "".join(orig_lines[u_start - 1 : u_end])
             unit_code = dedent_source_text(raw_block).strip()
@@ -3346,17 +3342,42 @@ def _generate_refactoring_patch_impl(
             t_inputs2 = list(s2.get("inputs", []))
             t1_unref: Optional[str] = None
             t2_unref: Optional[str] = None
-            if u1.get("kind") in ("comprehension", "complex_expr") and u2.get("kind") in (
-                "comprehension",
-                "complex_expr",
+            if (
+                not _is_subline_unit(u1)
+                and not _is_subline_unit(u2)
+                and u1.get("kind") in ("comprehension", "complex_expr")
+                and u2.get("kind") in ("comprehension", "complex_expr")
             ):
-                t1_unref = _extract_augassign_unreferenced_target(
-                    extract_unit_source_code(u1, repo_root=str(root))
+                lines1 = _slice_unit_token_lines(
+                    u1_eff,
+                    _extract_unit_body_lines(
+                        u1_eff,
+                        [
+                            ln.rstrip("\r\n")
+                            for ln in extract_unit_source_code(u1_eff, repo_root=str(root))
+                        ],
+                    ),
                 )
-                t2_unref = _extract_augassign_unreferenced_target(
-                    extract_unit_source_code(u2, repo_root=str(root))
+                lines2 = _slice_unit_token_lines(
+                    u2_eff,
+                    _extract_unit_body_lines(
+                        u2_eff,
+                        [
+                            ln.rstrip("\r\n")
+                            for ln in extract_unit_source_code(u2_eff, repo_root=str(root))
+                        ],
+                    ),
                 )
-            if t1_unref is not None and t2_unref is not None:
+                t1_unref = _extract_augassign_unreferenced_target(lines1)
+                t2_unref = _extract_augassign_unreferenced_target(lines2)
+            raw_inputs1 = list(s1.get("inputs", []))
+            raw_inputs2 = list(s2.get("inputs", []))
+            if (
+                t1_unref is not None
+                and t2_unref is not None
+                and t1_unref not in raw_inputs2
+                and t2_unref not in raw_inputs1
+            ):
                 t_inputs1 = [x for x in t_inputs1 if x != t1_unref]
                 t_inputs2 = [x for x in t_inputs2 if x != t2_unref]
                 inputs = [x for x in inputs if x != t1_unref]

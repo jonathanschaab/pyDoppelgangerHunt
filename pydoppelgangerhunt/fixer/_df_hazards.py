@@ -33,6 +33,7 @@ from pydoppelgangerhunt.fixer._df_visitors import (
     _DownstreamReadVisitor,
     _StrictPostLineVisitor,
     _VisitorPassMode,
+    _extract_scope_stmts,
     _extract_unit_live_in_names,
 )
 from pydoppelgangerhunt.fixer.source import _find_innermost_enclosing_node
@@ -169,16 +170,6 @@ def _get_scope_try_and_with_blocks(
     return _get_or_compute_scope_cached(_scope_try_with_cache, scope_node, _compute)
 
 
-def _extract_scope_stmts(scope_node: ast.AST) -> List[ast.AST]:
-    """Defensively extracts statements or expression nodes from a scope's body attribute."""
-    raw_body = getattr(scope_node, "body", [])
-    if isinstance(raw_body, list):
-        return raw_body
-    if isinstance(raw_body, ast.AST):
-        return [raw_body]
-    return []
-
-
 def _execute_read_pass(
     scope_node: ast.AST,
     visitor_cls: type,
@@ -236,18 +227,35 @@ def _scope_reads_outputs_after_line(
         return True
 
     if enclosing_loops:
-        loop_reads = _execute_read_pass(
-            scope_node,
-            _DownstreamReadVisitor,
+        loop_visitor = _DownstreamReadVisitor(
             stmt_start,
             stmt_end,
             end_col,
-            outputs,
-            enclosing_loops,
-            _VisitorPassMode.LOOP_CARRIED,
-            is_module,
+            candidates=outputs,
+            enclosing_loops=enclosing_loops,
+            pass_mode=_VisitorPassMode.LOOP_CARRIED,
+            is_module_scope=is_module,
         )
-        return not outputs.isdisjoint(loop_reads)
+        for stmt in _extract_scope_stmts(scope_node):
+            loop_visitor.visit(stmt)
+        if not outputs.isdisjoint(loop_visitor.loaded):
+            return True
+        if loop_visitor.has_dynamic_read:
+            return True
+        live_ins = _extract_unit_live_in_names(
+            scope_node,
+            stmt_start,
+            stmt_end,
+            end_col,
+            candidates=outputs,
+        )
+        loop_killed = (
+            loop_visitor.unit_entry_killed
+            if loop_visitor.unit_entry_killed is not None
+            else set()
+        )
+        if not outputs.isdisjoint(live_ins - loop_killed):
+            return True
 
     return False
 

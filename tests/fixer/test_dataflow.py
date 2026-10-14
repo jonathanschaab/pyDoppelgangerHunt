@@ -4982,3 +4982,103 @@ def test_extract_nested_scope_free_reads_type_alias_preserves_external_reads() -
     assert "T" not in free
 
 
+def test_is_eagerly_consumed_genexp_slot_validation() -> None:
+    """Verifies that generator expressions in non-iterated argument slots are not marked as eager."""
+    from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=protected-access
+        _get_scope_parent_map,
+        _is_eagerly_consumed_genexp,
+    )
+
+    code = (
+        "d = dict(gen=(x for x in items))\n"
+        "m1 = min(items, default=(x for x in data))\n"
+        "m2 = min((x for x in g1), (y for y in g2))\n"
+        "s = sum(items, (x for x in data))\n"
+        "j1 = ', '.join((x for x in words))\n"
+        "j2 = str.join(',', (x for x in words))\n"
+    )
+    tree = ast.parse(code)
+    parent_map = _get_scope_parent_map(tree)
+    genexps = sorted(
+        [n for n in ast.walk(tree) if isinstance(n, ast.GeneratorExp)],
+        key=lambda n: (getattr(n, "lineno", 0), getattr(n, "col_offset", 0)),
+    )
+    assert len(genexps) == 7
+
+    # d = dict(gen=(x for x in items)) -> non-iterated keyword argument
+    assert _is_eagerly_consumed_genexp(genexps[0], parent_map) is False
+
+    # m1 = min(items, default=(x for x in data)) -> default keyword argument
+    assert _is_eagerly_consumed_genexp(genexps[1], parent_map) is False
+
+    # m2 = min(g1, g2) -> multi-argument comparison
+    assert _is_eagerly_consumed_genexp(genexps[2], parent_map) is False
+    assert _is_eagerly_consumed_genexp(genexps[3], parent_map) is False
+
+    # s = sum(items, genexp) -> start argument (2nd positional)
+    assert _is_eagerly_consumed_genexp(genexps[4], parent_map) is False
+
+    # j1 = ', '.join(...) -> 1st positional arg on str literal
+    assert _is_eagerly_consumed_genexp(genexps[5], parent_map) is True
+
+    # j2 = str.join(',', ...) -> 2nd positional arg on str class
+    assert _is_eagerly_consumed_genexp(genexps[6], parent_map) is True
+
+
+def test_scope_reads_outputs_after_line_reentering_compound_with_and_try() -> None:
+    """Verifies that loop-carried re-entry reads inside with/try blocks detect downstream reads."""
+    from pydoppelgangerhunt.fixer._df_hazards import (  # pylint: disable=protected-access
+        _scope_reads_outputs_after_line,
+    )
+
+    code = (
+        "for batch in batches:\n"
+        "    with lock:\n"
+        "        curr = acc\n"
+        "        acc = curr + 1\n"
+    )
+    tree = ast.parse(code)
+    reads_after = _scope_reads_outputs_after_line(
+        tree, line=4, outputs={"acc"}, start_line=2
+    )
+    assert reads_after is True
+
+
+def test_extract_unit_live_in_names_enclosing_compound_branch_isolation() -> None:
+    """Verifies that live-in extraction preserves branch isolation when enclosing compound starts before unit."""
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=protected-access
+        _extract_unit_live_in_names,
+    )
+
+    code = (
+        "def process(items, flag):\n"
+        "    for item in items:\n"
+        "        if flag:\n"
+        "            x = 1\n"
+        "        else:\n"
+        "            y = 2\n"
+        "        total = x + y\n"
+        "        return total\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    live_ins = _extract_unit_live_in_names(fn_node, u_start=3, u_end=7)
+    assert "x" in live_ins
+    assert "y" in live_ins
+    assert "flag" in live_ins
+
+
+def test_extract_unit_live_in_names_scope_node_at_unit_start() -> None:
+    """Verifies that scope_node starting on u_start is not treated as a nested closure."""
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=protected-access
+        _extract_unit_live_in_names,
+    )
+
+    code = "def compute(a, b):\n    return a + b\n"
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    live_ins = _extract_unit_live_in_names(fn_node, u_start=1, u_end=2)
+    assert "a" in live_ins
+    assert "b" in live_ins
+
+

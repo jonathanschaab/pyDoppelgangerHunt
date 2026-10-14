@@ -148,7 +148,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collisions from unit-level snippets or stale IDE entries.
 - **Indented Method Helper Compilation**: Replaced `textwrap.dedent` in
   `_validate_helper_compilation` (`patch.py`), `synthesize_shared_helper_code` (`synthesis.py`),
-  and `assert_valid_python` (`conftest.py`) by wrapping indented method definitions in `if 1:\n`,
+  and `assert_valid_python` (`tests/helpers.py`) by wrapping indented method definitions in `if 1:\n`,
   preventing margin zeroing and spurious `IndentationError` when helpers contain triple-quoted
   strings with lines at column 0.
 - **AST-Based Subroutine Async Detection**: Replaced raw source text regex scanning in
@@ -159,6 +159,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to refactoring patch generation (`patch.py`), ensuring code units with `# pragma: no-refactor`
   remain fully visible in clone detection and reporting while being skipped during automated patch
   synthesis with a diagnostic comment.
+- **Eager Generator Expression Slot Validation**: In `_is_eagerly_consumed_genexp` (`_df_closures.py`),
+  validate exact argument positions for built-in consumers (`parent.args[0]` for `min`, `max`, `dict`,
+  `sum`, `list`, etc.) and `str.join`, preventing non-iterated keyword arguments (`dict(gen=...)`,
+  `min(..., default=...)`) and start arguments (`sum(..., gen)`) from being misclassified as eagerly consumed.
+- **Enclosing With/Try Loop Re-entry Detection**: In `_scope_reads_outputs_after_line` (`_df_hazards.py`),
+  evaluate `live_ins - loop_killed` across the compound block span `[stmt_start, stmt_end]`, ensuring
+  loop-carried accumulator reads that re-enter the compound block on subsequent iterations are detected.
+- **Compound Statement Branch State Isolation in Unit Live-Ins**: In `_UnitLiveInVisitor` and
+  `_extract_unit_live_in_names` (`_df_visitors.py`), iterate scope statements directly and maintain
+  branch store isolation across `for`, `while`, `try`, `with`, and `match` blocks even when the compound
+  statement header begins before `u_start`.
+- **AugAssign Target Pruning Cross-Unit Collision & Sub-Line Slicing**: In `patch.py` and `synthesis.py`,
+  guard AugAssign target pruning against subline units via `_is_subline_unit` and token line slicing,
+  and skip pruning when partner clone inputs collide with target variable names to prevent parameter swapping.
+- **Innermost Scope Traversal for Subroutine Async Detection**: In `_unit_ast_has_async_or_yield`
+  (`binding.py`), resolve the innermost enclosing AST scope via `_find_innermost_ast_scope` and
+  unconditionally prune nested functions, classes, and lambdas, ensuring inner coroutines or generators
+  are not falsely attributed to the unit.
 - **Loop-Carried Liveness in Enclosing Blocks**: Evaluates statement span `[start_line, stmt_end]`
   with base `_DownstreamReadVisitor` in `_scope_reads_outputs_after_line` (`dataflow.py`), correctly
   detecting loop-carried reads at the top of an enclosing loop prior to `with` / `try` blocks.

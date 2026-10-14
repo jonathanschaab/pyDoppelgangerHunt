@@ -223,20 +223,19 @@ def _is_eagerly_consumed_genexp(
         return False
     parent = parent_map.get(genexp)
     if isinstance(parent, ast.Call):
-        is_arg = any(a is genexp for a in parent.args) or any(
-            kw.value is genexp for kw in parent.keywords
-        )
-        if not is_arg:
-            return False
         func = parent.func
         if isinstance(func, ast.Name) and func.id in _EAGER_CONSUMER_NAMES:
             if shadowed_names is not None and func.id in shadowed_names:
                 return False
-            return True
+            if func.id in ("min", "max", "dict"):
+                return len(parent.args) == 1 and parent.args[0] is genexp
+            return len(parent.args) >= 1 and parent.args[0] is genexp
         if isinstance(func, ast.Attribute) and func.attr == "join":
-            return any(a is genexp for a in parent.args) and _is_confirmed_str_receiver(
-                func.value, shadowed_names=shadowed_names
-            )
+            if not _is_confirmed_str_receiver(func.value, shadowed_names=shadowed_names):
+                return False
+            if isinstance(func.value, (ast.Constant, ast.JoinedStr)):
+                return len(parent.args) == 1 and parent.args[0] is genexp
+            return len(parent.args) == 2 and parent.args[1] is genexp
     return False
 
 

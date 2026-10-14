@@ -106,6 +106,13 @@ def _extract_augassign_unreferenced_target(lines: Sequence[str]) -> Optional[str
     return None
 
 
+def _is_subline_unit(unit: Dict[str, Any]) -> bool:
+    """Returns True if the unit represents a sub-line token span rather than a whole statement."""
+    return any(
+        unit.get(k) is not None
+        for k in ("start_col", "end_col", "start_col_offset", "end_col_offset")
+    )
+
 
 def _format_call_arguments(
     inputs: List[str],
@@ -1049,11 +1056,22 @@ def synthesize_shared_helper_code(
     inputs = list(scope["inputs"])
     t1_unref: Optional[str] = None
     t2_unref: Optional[str] = None
-    if u1.get("kind") in ("comprehension", "complex_expr"):
+    if (
+        not _is_subline_unit(u1)
+        and not _is_subline_unit(u2)
+        and u1.get("kind") in ("comprehension", "complex_expr")
+        and u2.get("kind") in ("comprehension", "complex_expr")
+    ):
         t1_unref = _extract_augassign_unreferenced_target(orig_lines1)
-    if u2.get("kind") in ("comprehension", "complex_expr"):
         t2_unref = _extract_augassign_unreferenced_target(orig_lines2)
-    if t1_unref is not None and t2_unref is not None:
+    raw_inputs1 = list(scope1.get("inputs", []))
+    raw_inputs2 = list(scope2.get("inputs", []))
+    if (
+        t1_unref is not None
+        and t2_unref is not None
+        and t1_unref not in raw_inputs2
+        and t2_unref not in raw_inputs1
+    ):
         inputs = [x for x in inputs if x != t1_unref]
 
     def _unit_receiver_kind(u: Dict[str, Any], u_scope: Dict[str, Any]) -> str:

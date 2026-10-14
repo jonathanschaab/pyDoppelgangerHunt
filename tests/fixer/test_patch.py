@@ -10175,6 +10175,62 @@ def test_file_patch_plan_parsed_tree_uses_get_or_parse_tree(tmp_path: Path) -> N
     assert _parsed_tree_cache[key] is tree1
 
 
+def test_augassign_target_pruning_cross_variable_collision(tmp_path: Path) -> None:
+    """Verifies that when an AugAssign target matches an active input in the partner clone,
+    target pruning is skipped to prevent call-site argument permutation."""
+    src1 = (
+        "def func1(a, b, c):\n"
+        "    a += b - c\n"
+        "    return a\n"
+    )
+    src2 = (
+        "def func2(total, a, b):\n"
+        "    total += a - b\n"
+        "    return total\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": "mod1.py", "start": 2, "end": 2, "name": "u1", "kind": "complex_expr"}
+    u2 = {"file": "mod2.py", "start": 2, "end": 2, "name": "u2", "kind": "complex_expr"}
+
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert patch != ""
+    assert "--- a/mod1.py" in patch
+
+
+def test_subline_complex_expr_not_treated_as_augassign_target(tmp_path: Path) -> None:
+    """Verifies that subline complex_expr units with column offsets do not extract line's target."""
+    src = (
+        "def run(a, b):\n"
+        "    total += compute(a, b)\n"
+        "    return total\n"
+    )
+    f = tmp_path / "subline_mod.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {
+        "file": "subline_mod.py",
+        "start": 2,
+        "end": 2,
+        "start_col": 13,
+        "end_col": 26,
+        "name": "u1",
+        "kind": "complex_expr",
+    }
+    u2 = dict(u1)
+    u2["name"] = "u2"
+
+    helper_code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "total" not in helper_code
+
+
 
 
 
