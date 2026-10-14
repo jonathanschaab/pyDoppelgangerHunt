@@ -28,10 +28,7 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _store_lru_cache_entry,
     _warned_lenient_closure,
 )
-from pydoppelgangerhunt.fixer._df_closures import (
-    _collect_pre_unit_closures,
-    _has_wildcard_star_import,
-)
+from pydoppelgangerhunt.fixer._df_closures import _collect_pre_unit_closures
 from pydoppelgangerhunt.fixer._df_visitors import (
     _DownstreamReadVisitor,
     _StrictPostLineVisitor,
@@ -496,8 +493,6 @@ def collect_downstream_read_names(
     for stmt in scope_stmts:
         visitor.visit(stmt)
 
-    if not skip_pre_unit_closures and _has_wildcard_star_import(scope_node, effective_tree):
-        visitor.has_dynamic_read = True
 
     loaded = set(visitor.loaded)
     loop_visitor: Optional[_DownstreamReadVisitor] = None

@@ -40,7 +40,8 @@ from pydoppelgangerhunt.fixer.source import (
 )
 
 _ASSIGN_STMT_RE = re.compile(
-    r"^(?:.+?)(?<![=<>!:])=(?!=)\s*(.+)$"
+    r"^(?:[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*|\[[^\]]+\])*|\w+(?:\s*,\s*\w+)+)"
+    r"(?:\s*:\s*[^=]+)?\s*(?<![=<>!:])=(?!=)\s*(.+)$"
 )
 
 
@@ -1198,6 +1199,8 @@ def synthesize_shared_helper_code(
                         stripped_expr = ast.unparse(stmt_node.value)
                     elif isinstance(stmt_node, ast.AugAssign):
                         stripped_expr = ast.unparse(stmt_node.value)
+                    else:
+                        stripped_expr = full_code
             except (SyntaxError, IndexError):
                 pass
 

@@ -894,6 +894,18 @@ def test_batch_49_matcher_similarity_and_subclones(tmp_path: Path) -> None:
     )
     assert len(clones_bag) == 1
 
+    # top_n <= 0 does not truncate to empty list
+    clones_nonpos = scan_target(
+        str(pkg_scan),
+        threshold=0.8,
+        min_lines=2,
+        min_tokens=3,
+        bag_of_tokens=True,
+        sort_by="priority",
+        top_n=0,
+    )
+    assert len(clones_nonpos) >= 1
+
     # 8. scan_target with workers=2 exercising _worker_harvest_file
     pkg = tmp_path / "parallel_pkg"
     pkg.mkdir()

@@ -1510,8 +1510,8 @@ def scan_target(
     else:
         clones.sort(key=lambda x: x[0], reverse=True)
 
-    if top_n is not None:
-        clones = [] if top_n <= 0 else clones[:top_n]
+    if top_n is not None and top_n > 0:
+        clones = clones[:top_n]
 
     if return_calibration:
         calib_dict = _build_calibration_metadata(

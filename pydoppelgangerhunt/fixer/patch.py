@@ -796,7 +796,7 @@ def _build_unit_delegation_call(
             u_end = max(u_start, parse_unit_coord(target_unit, "end", default=u_start))
             raw_block = "".join(orig_lines[u_start - 1 : u_end])
             unit_code = dedent_source_text(raw_block).strip()
-            assign_prefix = ""
+            assign_prefix: Optional[str] = None
             try:
                 parsed_node = ast.parse(unit_code).body[0]
                 if isinstance(parsed_node, ast.Assign) and parsed_node.targets:
@@ -816,6 +816,8 @@ def _build_unit_delegation_call(
                     assign_prefix = ""
             except (SyntaxError, IndexError, ValueError):
                 pass
+            if assign_prefix is None:
+                return ""
             rep_call = f"{indent}{assign_prefix}{await_prefix}{call_expr}\n"
             try:
                 _, _, final_rep = compute_unit_replacement_span(
@@ -1163,6 +1165,10 @@ def _delegate_unit_in_plan(
         await_prefix=await_prefix,
         step=step,
     )
+    if not rep_stmt:
+        raise ValueError(
+            f"Failed to generate delegation call for unit {unit.get('name', 'unnamed')}"
+        )
     # Tier 1 Semantic Overlap Check against existing plan replacements: O(K)
     for existing_u, _ in plan.replacements:
         if check_units_overlap(existing_u, unit):

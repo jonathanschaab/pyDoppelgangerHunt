@@ -9911,6 +9911,68 @@ def test_render_file_patch_plan_exact_key_disambiguates_same_line_units() -> Non
     assert "inner_replacement()" not in patch
 
 
+def test_whole_line_complex_expr_unmapped_statement_fails_closed(tmp_path: Path) -> None:
+    """Verifies that whole-line complex_expr with unmapped statements (assert, del, raise)
+    fails closed rather than emitting a bare helper call that drops statement semantics."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _build_unit_delegation_call,
+        generate_refactoring_patch,
+    )
+
+    code = (
+        "def check(x):\n"
+        "    assert validate(x)\n"
+        "    return x\n"
+    )
+    lines = code.splitlines(keepends=True)
+    unit_assert = {
+        "file": "test.py",
+        "start": 2,
+        "end": 2,
+        "name": "check",
+        "kind": "complex_expr",
+    }
+    # Direct check of _build_unit_delegation_call returning ""
+    rep = _build_unit_delegation_call(
+        unit_assert,
+        code,
+        lines,
+        effective_binding="module",
+        helper_name="_shared_validate",
+        inputs=["x"],
+        outputs=[],
+        scope={"inputs": ["x"], "outputs": []},
+    )
+    assert rep == ""
+
+    # Check that generate_refactoring_patch rolls back cleanly and does not emit bare call
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+    u1 = {
+        "file": "mod1.py",
+        "start": 2,
+        "end": 2,
+        "name": "check",
+        "kind": "complex_expr",
+        "inputs": ["x"],
+        "outputs": [],
+    }
+    u2 = {
+        "file": "mod2.py",
+        "start": 2,
+        "end": 2,
+        "name": "check",
+        "kind": "complex_expr",
+        "inputs": ["x"],
+        "outputs": [],
+    }
+    patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
+    # The patch must NOT replace 'assert validate(x)' with a bare '_shared_validate(x)'
+    assert "-    assert validate(x)" not in patch
+
+
 
 
 

@@ -3103,13 +3103,46 @@ def test_assign_stmt_re_module_constant() -> None:
     assert m5 is not None
     assert m5.group(1) == "get_pair()"
 
-    # Rejections of non-assignments, comparisons, and walrus
+    # Rejections of non-assignments, comparisons, walrus, and kwarg calls
     assert _ASSIGN_STMT_RE.match("== not an assign") is None
     assert _ASSIGN_STMT_RE.match("if a == b:") is None
     assert _ASSIGN_STMT_RE.match("a <= b") is None
     assert _ASSIGN_STMT_RE.match("a >= b") is None
     assert _ASSIGN_STMT_RE.match("a != b") is None
     assert _ASSIGN_STMT_RE.match("a := 1") is None
+    assert _ASSIGN_STMT_RE.match("compute(a=1, b=2)") is None
+    assert _ASSIGN_STMT_RE.match('foo("a = b")') is None
+    assert _ASSIGN_STMT_RE.match("lambda a=1: a") is None
+
+
+def test_synthesize_complex_expr_kwarg_call_not_mangled(tmp_path: Path) -> None:
+    """Verifies that synthesize_shared_helper_code does not mangle kwarg calls in complex_expr."""
+    code = (
+        "def run(x, y):\n"
+        "    compute(a=x, b=y)\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+    u1 = {
+        "file": "mod1.py",
+        "start": 2,
+        "end": 2,
+        "name": "run",
+        "kind": "complex_expr",
+    }
+    u2 = {
+        "file": "mod2.py",
+        "start": 2,
+        "end": 2,
+        "name": "run",
+        "kind": "complex_expr",
+    }
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper != ""
+    assert "return compute(a=x, b=y)" in helper
+    assert_valid_python(helper)
 
 
 def test_infer_helper_return_type_symmetric_outputs2_mapping() -> None:

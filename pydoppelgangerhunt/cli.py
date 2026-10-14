@@ -1059,6 +1059,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """Main execution CLI entrypoint."""
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if args.top is not None and args.top <= 0:
+        parser.error("--top must be a positive integer (> 0)")
 
     target_arg = args.target
     if args.init:
@@ -1424,11 +1426,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if early_exit is not None:
         return early_exit
 
-    if args.top is not None:
-        if args.top <= 0:
-            clones = []
-        elif args.top < len(clones):
-            clones = clones[:args.top]
+    if args.top is not None and args.top > 0 and args.top < len(clones):
+        clones = clones[:args.top]
 
     families: Optional[List[Dict[str, Any]]] = None
     if args.cluster:

@@ -3534,14 +3534,15 @@ def test_eager_builtin_scope_shadowing_scenarios() -> None:
 
     # 7. Wildcard star import dynamically shadows eager built-in
     code_star = (
+        "from numpy import *\n"
+        "\n"
         "def compute():\n"
-        "    from numpy import *\n"
         "    data = [1, 2, 3]\n"
         "    total = sum(x * 2 for x in data)\n"
         "    yield total\n"
     )
     tree_star = ast.parse(code_star)
-    closures_star = _collect_scope_closures(tree_star.body[0])
+    closures_star = _collect_scope_closures(tree_star.body[1], module_tree=tree_star)
     # Expect 1 closure because sum is treated as potentially shadowed/escaping
     assert len(closures_star) == 1
 
@@ -4378,34 +4379,36 @@ def test_pair_clone_outputs_role_swapped_rejection_and_positional_pairing() -> N
     ]
 
 
-def test_collect_downstream_reads_wildcard_import_strict_closure_fail_closed() -> None:
-    """Verifies that scopes containing wildcard imports treat candidates as dynamically read
-    in strict closure mode (has_dynamic_read=True), failing closed."""
+def test_collect_downstream_reads_wildcard_import_module_scope() -> None:
+    """Verifies that downstream wildcard imports in module scope treat candidates
+    as dynamically read, failing closed."""
     from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
 
     code = (
+        "x = 10\n"
+        "from math import *\n"
+        "y = 20\n"
+    )
+    unit = {"start": 1, "end": 1, "inputs": []}
+    candidates = {"x"}
+
+    reads = collect_downstream_read_names(code, unit, candidates=candidates)
+    assert reads is not None
+    assert "x" in reads
+
+    # A module-level wildcard star import does not treat function-local variables as read
+    code_fn = (
+        "from math import *\n"
+        "\n"
         "def compute():\n"
-        "    from math import *\n"
         "    x = 10\n"
         "    y = 20\n"
         "    return y\n"
     )
-    unit = {"start": 3, "end": 3, "inputs": []}
-    candidates = {"x"}
-
-    # In strict mode (default), wildcard import in scope triggers dynamic read fail-closed
-    reads_strict = collect_downstream_read_names(
-        code, unit, candidates=candidates, skip_pre_unit_closures=False
-    )
-    assert reads_strict is not None
-    assert "x" in reads_strict
-
-    # In lenient mode, pre-unit closure scanning is skipped
-    reads_lenient = collect_downstream_read_names(
-        code, unit, candidates=candidates, skip_pre_unit_closures=True
-    )
-    assert reads_lenient is not None
-    assert "x" not in reads_lenient
+    unit_fn = {"start": 4, "end": 4, "inputs": []}
+    reads_fn = collect_downstream_read_names(code_fn, unit_fn, candidates={"x"})
+    assert reads_fn is not None
+    assert "x" not in reads_fn
 
 
 def test_downstream_read_visitor_wildcard_import_dynamic_read() -> None:
@@ -4414,20 +4417,18 @@ def test_downstream_read_visitor_wildcard_import_dynamic_read() -> None:
     from pydoppelgangerhunt.fixer._df_visitors import _DownstreamReadVisitor
 
     code = (
-        "def run():\n"
-        "    x = 1\n"
-        "    from util import *\n"
+        "x = 1\n"
+        "from util import *\n"
     )
     tree = ast.parse(code)
-    fn_def = tree.body[0]
-    assert isinstance(fn_def, ast.FunctionDef)
     visitor = _DownstreamReadVisitor(
-        u_start=2,
-        u_end=2,
+        u_start=1,
+        u_end=1,
         u_end_col=None,
         candidates={"x", "y"},
+        is_module_scope=True,
     )
-    for stmt in fn_def.body:
+    for stmt in tree.body:
         visitor.visit(stmt)
 
     assert visitor.has_dynamic_read is True
