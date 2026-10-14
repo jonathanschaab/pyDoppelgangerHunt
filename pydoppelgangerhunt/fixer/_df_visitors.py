@@ -153,10 +153,6 @@ class _BaseScopeVisitor(ast.NodeVisitor):
         reads_set: Set[str],
     ) -> None:
         store_set.add(node.name)
-        for tp in getattr(node, "type_params", []):
-            tp_name = getattr(tp, "name", None)
-            if isinstance(tp_name, str):
-                store_set.add(tp_name)
         reads_set.update(_extract_nested_scope_free_reads(node))
 
     def _visit_nested_lambda(
@@ -165,17 +161,6 @@ class _BaseScopeVisitor(ast.NodeVisitor):
         reads_set: Set[str],
     ) -> None:
         reads_set.update(_extract_nested_scope_free_reads(node))
-
-    def _visit_type_alias_stmt(self, node: ast.AST, store_set: Set[str]) -> None:
-        name_node = getattr(node, "name", None)
-        if isinstance(name_node, ast.Name):
-            store_set.add(name_node.id)
-        for tp in getattr(node, "type_params", []):
-            tp_name = getattr(tp, "name", None)
-            if isinstance(tp_name, str):
-                store_set.add(tp_name)
-        if hasattr(node, "value"):
-            self.visit(getattr(node, "value"))
 
     @staticmethod
     def _extract_pattern_bound_name(node: ast.AST) -> Optional[str]:
@@ -251,7 +236,10 @@ class _FuncScopeVisitor(_BaseScopeVisitor):
         self._record_import_names(node, self.local_stores)
 
     def visit_TypeAlias(self, node: ast.AST) -> None:
-        self._visit_type_alias_stmt(node, self.local_stores)
+        name_node = getattr(node, "name", None)
+        if isinstance(name_node, ast.Name):
+            self.local_stores.add(name_node.id)
+        self.nested_free_reads.update(_extract_type_alias_free_reads(node))
 
 
 class _ClassScopeVisitor(_BaseScopeVisitor):
@@ -338,7 +326,11 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
         self._record_import_names(node, self.class_stores)
 
     def visit_TypeAlias(self, node: ast.AST) -> None:
-        self._visit_type_alias_stmt(node, self.class_stores)
+        name_node = getattr(node, "name", None)
+        if isinstance(name_node, ast.Name):
+            self.class_stores.add(name_node.id)
+        for name in _extract_type_alias_free_reads(node):
+            self._record_class_load(name)
 
 
 def _collect_func_args(args: ast.arguments) -> List[ast.arg]:
@@ -388,15 +380,20 @@ class _OuterExprVisitor(_BaseScopeVisitor):
         self._visit_nested_lambda(node, self.names)
 
     def visit_TypeAlias(self, node: ast.AST) -> None:
-        tp_names = {
-            getattr(tp, "name", None)
-            for tp in getattr(node, "type_params", [])
-            if isinstance(getattr(tp, "name", None), str)
-        }
-        sub_visitor = _OuterExprVisitor()
-        if hasattr(node, "value"):
-            sub_visitor.visit(getattr(node, "value"))
-        self.names.update(sub_visitor.names - tp_names)
+        self.names.update(_extract_type_alias_free_reads(node))
+
+
+def _extract_type_alias_free_reads(node: ast.AST) -> Set[str]:
+    """Extracts free variable references escaping a TypeAlias definition."""
+    tp_names = {
+        getattr(tp, "name", None)
+        for tp in getattr(node, "type_params", [])
+        if isinstance(getattr(tp, "name", None), str)
+    }
+    sub_visitor = _OuterExprVisitor()
+    if hasattr(node, "value"):
+        sub_visitor.visit(getattr(node, "value"))
+    return sub_visitor.names - tp_names
 
 
 def _extract_nested_scope_free_reads(
@@ -419,17 +416,6 @@ def _extract_nested_scope_free_reads(
         if isinstance(tp_name, str):
             type_param_names.add(tp_name)
 
-    inner_type_params: Set[str] = set()
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        for sub in ast.walk(node):
-            if sub is not node and hasattr(sub, "type_params"):
-                for tp in getattr(sub, "type_params", []):
-                    tp_name = getattr(tp, "name", None)
-                    if isinstance(tp_name, str):
-                        inner_type_params.add(tp_name)
-
-    all_type_params = type_param_names | inner_type_params
-
     outer_visitor = _OuterExprVisitor()
     for tp in getattr(node, "type_params", []):
         outer_visitor.visit(tp)
@@ -442,16 +428,16 @@ def _extract_nested_scope_free_reads(
         for dec in node.decorator_list:
             outer_visitor.visit(dec)
         class_visitor = _ClassScopeVisitor()
-        for tp_name in all_type_params:
+        for tp_name in type_param_names:
             class_visitor.class_stores.add(tp_name)
         for stmt in node.body:
             class_visitor.visit(stmt)
         class_free = (
             (class_visitor.free_reads | class_visitor.nonlocals)
             - class_visitor.globals
-            - all_type_params
+            - type_param_names
         )
-        class_reads = (outer_visitor.names - all_type_params) | class_free
+        class_reads = (outer_visitor.names - type_param_names) | class_free
         if candidates is not None:
             return class_reads & candidates
         return class_reads
@@ -470,7 +456,7 @@ def _extract_nested_scope_free_reads(
             outer_visitor.visit(node.returns)
 
     func_visitor = _FuncScopeVisitor()
-    for tp_name in all_type_params:
+    for tp_name in type_param_names:
         func_visitor.local_stores.add(tp_name)
     func_visitor.params = _collect_func_params(node.args)
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -484,7 +470,7 @@ def _extract_nested_scope_free_reads(
         - (func_visitor.params | func_visitor.local_stores)
     ) | func_visitor.nonlocals
     escaped -= func_visitor.globals
-    all_free = (outer_visitor.names - all_type_params) | (escaped - inner_type_params)
+    all_free = (outer_visitor.names - type_param_names) | escaped
     if candidates is not None:
         return all_free & candidates
     return all_free

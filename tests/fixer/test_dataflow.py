@@ -4935,3 +4935,50 @@ def test_unit_live_in_visitor_conditional_walrus_does_not_kill_subsequent_reads(
     )
     assert "total" in live_ins2
 
+
+def test_extract_nested_scope_free_reads_inner_generic_does_not_mask_outer_capture() -> None:
+    """Verifies that inner generic definitions do not mask outer captures of the same name."""
+    import sys
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=protected-access
+        _extract_nested_scope_free_reads,
+    )
+
+    if sys.version_info < (3, 12):
+        pytest.skip("PEP 695 type parameter syntax requires Python 3.12+")
+
+    code = (
+        "def outer():\n"
+        "    def inner(default_val=T):\n"
+        "        def helper[T](x: T) -> T:\n"
+        "            return x\n"
+        "        return helper(default_val)\n"
+    )
+    tree = ast.parse(code)
+    inner_fn = tree.body[0].body[0]
+    free = _extract_nested_scope_free_reads(inner_fn)
+    assert "T" in free
+
+
+def test_extract_nested_scope_free_reads_type_alias_preserves_external_reads() -> None:
+    """Verifies that type alias type params do not leak and external type reads are captured."""
+    import sys
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=protected-access
+        _extract_nested_scope_free_reads,
+    )
+
+    if sys.version_info < (3, 12):
+        pytest.skip("PEP 695 type parameter syntax requires Python 3.12+")
+
+    code = (
+        "def outer():\n"
+        "    def inner():\n"
+        "        type MyList[T] = list[T] | ExternalType\n"
+        "        return MyList\n"
+    )
+    tree = ast.parse(code)
+    inner_fn = tree.body[0].body[0]
+    free = _extract_nested_scope_free_reads(inner_fn)
+    assert "ExternalType" in free
+    assert "T" not in free
+
+

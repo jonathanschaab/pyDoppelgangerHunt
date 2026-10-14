@@ -271,6 +271,17 @@ def _unit_ast_has_async_or_yield(
     has_yield = False
     has_await = False
 
+    top_level_nodes: Set[int] = set()
+
+    def _collect_top_level(parent: ast.AST) -> None:
+        for child in getattr(parent, "body", []):
+            top_level_nodes.add(id(child))
+            if isinstance(child, ast.ClassDef):
+                _collect_top_level(child)
+
+    if isinstance(tree, (ast.Module, ast.ClassDef)):
+        _collect_top_level(tree)
+
     stack: List[ast.AST] = [tree]
     while stack:
         node = stack.pop()
@@ -309,7 +320,7 @@ def _unit_ast_has_async_or_yield(
                     n_end = end_lineno or n_start
                     is_enclosing = (
                         (n_start < u_start or n_end > u_end)
-                        or (isinstance(tree, ast.Module) and node in tree.body)
+                        or id(node) in top_level_nodes
                     )
                     if not is_enclosing:
                         continue

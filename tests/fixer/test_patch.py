@@ -10101,6 +10101,80 @@ def test_complex_expr_augassign_asymmetric_rhs_not_pruned(tmp_path: Path) -> Non
         assert "total: Any" in helper or "counter: Any" in helper
 
 
+def test_build_unit_delegation_call_asymmetric_rhs_equal_arity() -> None:
+    """Verifies that _build_unit_delegation_call does not prune target when
+    len(effective_targets) == len(inputs), preventing arity mismatch."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=protected-access
+        _build_unit_delegation_call,
+    )
+
+    unit = {
+        "kind": "complex_expr",
+        "start": 1,
+        "end": 1,
+    }
+    orig_lines = ["total += a + a\n"]
+    call_str = _build_unit_delegation_call(
+        unit,
+        "total += a + a\n",
+        orig_lines,
+        effective_binding="module",
+        helper_name="_shared_helper",
+        inputs=["total", "a"],
+        outputs=[],
+        scope={"inputs": ["total", "a"]},
+        target_inputs=["total", "a"],
+        await_prefix="",
+    )
+    assert "_shared_helper(total, a)" in call_str
+
+
+def test_build_unit_delegation_call_cross_clone_name_collision_no_overprune() -> None:
+    """Verifies that _build_unit_delegation_call does not mutate inputs when target
+    name matches a remaining input variable."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=protected-access
+        _build_unit_delegation_call,
+    )
+
+    unit = {
+        "kind": "complex_expr",
+        "start": 1,
+        "end": 1,
+    }
+    orig_lines = ["a += b + c\n"]
+    call_str = _build_unit_delegation_call(
+        unit,
+        "a += b + c\n",
+        orig_lines,
+        effective_binding="module",
+        helper_name="_shared_helper",
+        inputs=["a", "b", "c"],
+        outputs=[],
+        scope={"inputs": ["a", "b", "c"]},
+        target_inputs=["a", "b", "c"],
+        await_prefix="",
+    )
+    assert "_shared_helper(a, b, c)" in call_str
+
+
+def test_file_patch_plan_parsed_tree_uses_get_or_parse_tree(tmp_path: Path) -> None:
+    """Verifies _FilePatchPlan.parsed_tree delegates to _get_or_parse_tree."""
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=protected-access
+        _parsed_tree_cache,
+    )
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan  # pylint: disable=protected-access
+
+    p = tmp_path / "plan_test.py"
+    text = "def hello(): pass\n"
+    p.write_text(text, encoding="utf-8")
+    plan = _FilePatchPlan(file_path=p, rel_path="plan_test.py", orig_text=text)
+    tree1 = plan.parsed_tree
+    assert tree1 is not None
+    key = (plan.content_digest, len(text))
+    assert key in _parsed_tree_cache
+    assert _parsed_tree_cache[key] is tree1
+
+
 
 
 

@@ -1769,3 +1769,20 @@ def test_unit_ast_has_async_or_yield_lambda_exclusion_and_single_line() -> None:
     assert has_await2 is True
     assert has_yield2 is False
 
+
+def test_unit_ast_has_async_or_yield_single_line_class_method() -> None:
+    """Verifies that single-line methods inside a class are traversed to detect await/yield."""
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=protected-access
+        _unit_ast_has_async_or_yield,
+    )
+
+    code = (
+        "class Worker:\n"
+        "    async def run(self): a = await fetch(); return a\n"
+    )
+    tree = ast.parse(code)
+    has_yield, has_await = _unit_ast_has_async_or_yield(tree, 2, 2)
+    assert has_await is True
+    assert has_yield is False
+
+

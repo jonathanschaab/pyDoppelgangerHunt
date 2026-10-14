@@ -26,6 +26,7 @@ from pydoppelgangerhunt.fixer.binding import (
     find_enclosing_class,
     find_enclosing_function,
 )
+from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
 from pydoppelgangerhunt.fixer.dataflow import (
     has_async_generator_delegation_hazard,
     resolve_clone_pair_outputs,
@@ -816,16 +817,16 @@ def _build_unit_delegation_call(
                     if isinstance(parsed_node.target, ast.Name):
                         t_name = parsed_node.target.id
                         if not _node_references_name(parsed_node.value, t_name):
-                            pruned_inputs = [x for x in inputs if x != t_name]
-                            pruned_eff = [x for x in effective_targets if x != t_name]
-                            if len(pruned_eff) == len(pruned_inputs):
-                                pruned_args = _format_call_arguments(
-                                    pruned_inputs,
-                                    scope.get("param_details", []),
-                                    receiver_to_omit=unit_receiver_omit,
-                                    target_inputs=pruned_eff,
-                                )
-                                call_expr = f"{unit_call_prefix}{helper_name}({pruned_args})"
+                            if len(effective_targets) > len(inputs):
+                                pruned_eff = [x for x in effective_targets if x != t_name]
+                                if len(pruned_eff) == len(inputs):
+                                    pruned_args = _format_call_arguments(
+                                        inputs,
+                                        scope.get("param_details", []),
+                                        receiver_to_omit=unit_receiver_omit,
+                                        target_inputs=pruned_eff,
+                                    )
+                                    call_expr = f"{unit_call_prefix}{helper_name}({pruned_args})"
                 elif isinstance(parsed_node, ast.Return):
                     assign_prefix = "return "
                 elif isinstance(parsed_node, ast.Expr):
@@ -971,10 +972,9 @@ class _FilePatchPlan:
         """Lazily parsed AST of orig_text, cached for reuse across operations."""
         if not self._ast_attempted:
             self._ast_attempted = True
-            try:
-                self._cached_ast = ast.parse(self.orig_text)
-            except (SyntaxError, ValueError, UnicodeDecodeError):
-                self._cached_ast = None
+            self._cached_ast = _get_or_parse_tree(
+                self.orig_text, source_digest=self.content_digest
+            )
         return self._cached_ast
 
     def snapshot(self) -> _PlanSnapshot:
