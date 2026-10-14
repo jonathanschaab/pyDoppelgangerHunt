@@ -4636,6 +4636,151 @@ def test_ast_node_bounds_synthetic_node_none_col_offset() -> None:
     assert visitor._is_node_after_unit(node)
 
 
+def test_u_start_col_loop_carried_read_and_unit_entry_killed() -> None:
+    """Verifies that u_start_col prevents statements preceding the unit start on u_start
+    from being misclassified as inside the unit."""
+    from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
+    from pydoppelgangerhunt.fixer._df_visitors import (
+        _is_ast_node_within_unit_bounds,
+    )
+
+    # 1. Direct boundary check on u_start with col_offset < u_start_col
+    node = ast.Name(id="total", ctx=ast.Load())
+    node.lineno = 2
+    node.col_offset = 4
+    assert not _is_ast_node_within_unit_bounds(
+        node, u_start=2, u_end=2, u_end_col=30, u_start_col=15
+    )
+    node.col_offset = 18
+    assert _is_ast_node_within_unit_bounds(
+        node, u_start=2, u_end=2, u_end_col=30, u_start_col=15
+    )
+
+    # 2. Semicolon line with preceding read in an enclosing loop:
+    code = (
+        "def loop_gen(items):\n"
+        "    for x in items:\n"
+        "        use(total); total = x; yield total\n"
+    )
+    tree = ast.parse(code)
+    unit = {
+        "file": "test.py",
+        "start": 3,
+        "end": 3,
+        "start_col": 20,
+        "end_col": 42,
+        "inputs": ["x"],
+    }
+    reads = collect_downstream_read_names(
+        code, unit, candidates={"total", "x"}, tree=tree
+    )
+    assert reads is not None
+    assert "total" in reads
+
+
+def test_unit_live_in_loop_try_flow_sensitive() -> None:
+    """Verifies that _UnitLiveInVisitor treats loops, try blocks, with blocks,
+    and match statements flow-sensitively, preserving live-in detection for subsequent reads."""
+    from pydoppelgangerhunt.fixer._df_visitors import _extract_unit_live_in_names
+
+    # Inside a unit: a loop stores 'a', and then 'a' is read afterwards.
+    # Since the loop may execute 0 times, 'a' must be marked as a live-in!
+    code = (
+        "def compute(items):\n"
+        "    for x in items:\n"
+        "        a = x\n"
+        "    return a\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    live_ins = _extract_unit_live_in_names(
+        fn_node, u_start=2, u_end=4, candidates={"a", "items"}
+    )
+    assert "a" in live_ins
+    assert "items" in live_ins
+
+    # Try block: 'b' is stored in body, but body may raise; read in finalbody or after
+    code_try = (
+        "def run():\n"
+        "    try:\n"
+        "        b = 10\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    return b\n"
+    )
+    tree_try = ast.parse(code_try)
+    fn_try = tree_try.body[0]
+    live_ins_try = _extract_unit_live_in_names(
+        fn_try, u_start=2, u_end=6, candidates={"b"}
+    )
+    assert "b" in live_ins_try
+
+    # With block: 'c' is stored in with-body, but block may raise; read after
+    code_with = (
+        "def run_with(ctx):\n"
+        "    with ctx:\n"
+        "        c = 42\n"
+        "    return c\n"
+    )
+    tree_with = ast.parse(code_with)
+    fn_with = tree_with.body[0]
+    live_ins_with = _extract_unit_live_in_names(
+        fn_with, u_start=2, u_end=4, candidates={"c", "ctx"}
+    )
+    assert "c" in live_ins_with
+
+
+def test_generator_subroutine_pair_preserves_try_hazard_skip_reason() -> None:
+    """Verifies that resolve_clone_generator_subroutine_outputs returns the exact
+    hazard resolution skip reason instead of a generic message."""
+    from pydoppelgangerhunt.fixer._df_pairing import resolve_clone_generator_subroutine_outputs
+
+    code1 = (
+        "def gen1():\n"
+        "    try:\n"
+        "        x = 1\n"
+        "        yield x\n"
+        "    finally:\n"
+        "        use(x)\n"
+    )
+    code2 = (
+        "def gen2():\n"
+        "    x = 1\n"
+        "    yield x\n"
+    )
+    u1 = {
+        "file": "m1.py",
+        "start": 3,
+        "end": 4,
+        "kind": "generator",
+        "inputs": [],
+        "outputs": ["x"],
+    }
+    u2 = {
+        "file": "m2.py",
+        "start": 2,
+        "end": 3,
+        "kind": "generator",
+        "inputs": [],
+        "outputs": ["x"],
+    }
+    scope1 = {"inputs": [], "outputs": ["x"], "definite_stores": ["x"]}
+    scope2 = {"inputs": [], "outputs": ["x"], "definite_stores": ["x"]}
+    res = resolve_clone_generator_subroutine_outputs(
+        u1,
+        u2,
+        scope1,
+        scope2,
+        source_text1=code1,
+        source_text2=code2,
+        return_details=True,
+    )
+    assert res is not None
+    assert res.outputs is None
+    assert res.skip_reason == "enclosing try or with cleanup hazard"
+
+
+
 
 
 

@@ -503,3 +503,37 @@ def test_get_valid_unit_bounds_defensive_non_dict() -> None:
     assert _get_valid_unit_bounds("invalid") is None  # type: ignore[arg-type]
     assert _get_valid_unit_bounds([1, 2, 3]) is None  # type: ignore[arg-type]
     assert _get_valid_unit_bounds(123) is None  # type: ignore[arg-type]
+
+
+def test_resolve_safe_unit_file_path_symlinked_root_in_repo_symlink(tmp_path: Path) -> None:
+    """Verifies resolve_safe_unit_file_path rejects in-repo symlinks even when
+    accessed via a symlinked root alias."""
+    from pydoppelgangerhunt.source_lines import (  # pylint: disable=import-outside-toplevel
+        resolve_safe_unit_file_path,
+    )
+
+    private_dir = tmp_path / "private"
+    real_var = private_dir / "var"
+    real_var.mkdir(parents=True)
+    real_repo = real_var / "my_project"
+    real_repo.mkdir()
+    sub_dir = real_repo / "sub"
+    sub_dir.mkdir()
+    target_py = sub_dir / "target.py"
+    target_py.write_text("print('target')\n", encoding="utf-8")
+
+    sym_var = tmp_path / "var"
+    try:
+        sym_var.symlink_to(real_var, target_is_directory=True)
+        link_sub = real_repo / "link_sub"
+        link_sub.symlink_to(sub_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("Filesystem does not support directory symlinks or lacks privileges")
+
+    # In-repo symlink accessed via symlink ancestor prefix: must return None
+    aliased_file = sym_var / "my_project" / "link_sub" / "target.py"
+    resolved = resolve_safe_unit_file_path(
+        {"file": str(aliased_file)}, repo_root=str(real_repo)
+    )
+    assert resolved is None
+

@@ -354,11 +354,16 @@ def resolve_safe_unit_file_path(
             if parent in (target_root, repo_root_path):
                 break
             if parent.is_symlink():
-                if target_root in parent.parents or repo_root_path in parent.parents:
-                    return None
+                resolved_parent_dir = parent.parent.resolve()
                 if (
-                    parent.resolve() == target_root
-                    or parent.resolve() in target_root.parents
+                    resolved_parent_dir == target_root
+                    or target_root in resolved_parent_dir.parents
+                ):
+                    return None
+                resolved_self = parent.resolve()
+                if (
+                    resolved_self == target_root
+                    or resolved_self in target_root.parents
                 ):
                     break
                 return None

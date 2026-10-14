@@ -80,6 +80,7 @@ from pydoppelgangerhunt.source_lines import (
 from pydoppelgangerhunt.fixer.synthesis import (
     _extract_required_typing_imports,
     _format_call_arguments,
+    _node_references_name,
     synthesize_shared_helper_code,
 )
 
@@ -810,6 +811,29 @@ def _build_unit_delegation_call(
                     target_str = ast.unparse(parsed_node.target)
                     op_symbol = _AUGASSIGN_OPS.get(type(parsed_node.op), "+=")
                     assign_prefix = f"{target_str} {op_symbol} "
+                    if isinstance(parsed_node.target, ast.Name):
+                        t_name = parsed_node.target.id
+                        if not _node_references_name(parsed_node.value, t_name):
+                            if target_inputs is not None and len(target_inputs) == len(inputs):
+                                try:
+                                    t_idx = target_inputs.index(t_name)
+                                    pruned_inputs = [x for i, x in enumerate(inputs) if i != t_idx]
+                                    pruned_eff = [
+                                        x for i, x in enumerate(target_inputs) if i != t_idx
+                                    ]
+                                except ValueError:
+                                    pruned_inputs = [x for x in inputs if x != t_name]
+                                    pruned_eff = [x for x in effective_targets if x != t_name]
+                            else:
+                                pruned_inputs = [x for x in inputs if x != t_name]
+                                pruned_eff = [x for x in effective_targets if x != t_name]
+                            pruned_args = _format_call_arguments(
+                                pruned_inputs,
+                                scope.get("param_details", []),
+                                receiver_to_omit=unit_receiver_omit,
+                                target_inputs=pruned_eff,
+                            )
+                            call_expr = f"{unit_call_prefix}{helper_name}({pruned_args})"
                 elif isinstance(parsed_node, ast.Return):
                     assign_prefix = "return "
                 elif isinstance(parsed_node, ast.Expr):

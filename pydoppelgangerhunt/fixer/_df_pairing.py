@@ -478,11 +478,7 @@ def resolve_clone_generator_subroutine_outputs(
                 side_idx=side_idx, context="generator subroutine pair",
             )
             if hazard_res is not None:
-                return (
-                    CloneOutputResolution(None, "generator output or closure conflict")
-                    if return_details
-                    else None
-                )
+                return hazard_res if return_details else None
             scope_node = _resolve_downstream_scope_node(s_text or "", u_item, eff_tr)
             bounds = _get_valid_unit_bounds(u_item)
             if scope_node is None or bounds is None:

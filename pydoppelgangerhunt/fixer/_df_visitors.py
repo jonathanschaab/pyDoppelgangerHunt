@@ -8,6 +8,7 @@ from enum import Enum
 import logging
 from typing import (
     Any,
+    Callable,
     Iterable,
     List,
     Optional,
@@ -72,6 +73,23 @@ class _BaseScopeVisitor(ast.NodeVisitor):
 
     def _is_in_comp(self, name: str) -> bool:
         return any(name in targets for targets in self._comp_targets)
+
+    def _traverse_isolated_cases(
+        self,
+        node: ast.AST,
+        save_state: Callable[[], Set[str]],
+        restore_state: Callable[[Set[str]], None],
+    ) -> None:
+        self.visit(getattr(node, "subject"))
+        base_state = save_state()
+        for case in getattr(node, "cases", []):
+            restore_state(set(base_state))
+            self.visit(case.pattern)
+            if case.guard is not None:
+                self.visit(case.guard)
+            for stmt in case.body:
+                self.visit(stmt)
+        restore_state(base_state)
 
     def _visit_comprehension(
         self,
@@ -498,6 +516,7 @@ def _is_ast_node_within_unit_bounds(
     u_start: int,
     u_end: int,
     u_end_col: Optional[int],
+    u_start_col: Optional[int] = None,
 ) -> bool:
     """Determines whether an AST node is positioned inside unit line and column bounds.
 
@@ -508,6 +527,10 @@ def _is_ast_node_within_unit_bounds(
         return False
     if lineno < u_start or lineno > u_end:
         return False
+    if lineno == u_start and u_start_col is not None:
+        col = getattr(node, "col_offset", None)
+        if col is not None and int(col) < int(u_start_col):
+            return False
     if lineno == u_end and u_end_col is not None:
         col = getattr(node, "col_offset", None)
         if col is None:
@@ -528,11 +551,13 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         enclosing_loops: Optional[List[Tuple[int, int]]] = None,
         pass_mode: Union[_VisitorPassMode, str] = _VisitorPassMode.AFTER_UNIT,
         is_module_scope: bool = False,
+        u_start_col: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.u_start = u_start
         self.u_end = u_end
         self.u_end_col = u_end_col
+        self.u_start_col = u_start_col
         self.candidates = candidates
         self.enclosing_loops = enclosing_loops or []
         self.pass_mode = (
@@ -572,7 +597,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
 
     def _is_node_inside_unit(self, node: ast.AST) -> bool:
         return _is_ast_node_within_unit_bounds(
-            node, self.u_start, self.u_end, self.u_end_col
+            node, self.u_start, self.u_end, self.u_end_col, self.u_start_col
         )
 
     def _is_loop_carried(self, node: ast.AST) -> bool:
@@ -806,16 +831,11 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self.visit_With(node)
 
     def visit_Match(self, node: ast.AST) -> None:
-        self.visit(getattr(node, "subject"))
-        killed_before = set(self.killed)
-        for case in getattr(node, "cases", []):
-            self.killed = set(killed_before)
-            self.visit(case.pattern)
-            if case.guard is not None:
-                self.visit(case.guard)
-            for stmt in case.body:
-                self.visit(stmt)
-        self.killed = killed_before
+        self._traverse_isolated_cases(
+            node,
+            lambda: self.killed,
+            lambda s: setattr(self, "killed", s),
+        )
 
     def visit_MatchAs(self, node: ast.AST) -> None:
         bound = self._extract_pattern_bound_name(node)
@@ -887,17 +907,9 @@ class _StrictPostLineVisitor(_DownstreamReadVisitor):
         return False
 
     def _is_node_inside_unit(self, node: ast.AST) -> bool:
-        lineno = getattr(node, "lineno", None)
-        if lineno is None:
-            return False
-        if lineno < self.u_end:
-            return True
-        if lineno == self.u_end:
-            if self.u_end_col is not None:
-                col = getattr(node, "col_offset", None)
-                return col is not None and col < int(self.u_end_col)
-            return True
-        return False
+        return _is_ast_node_within_unit_bounds(
+            node, self.u_start, self.u_end, self.u_end_col, self.u_start_col
+        )
 
 
 def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
@@ -920,18 +932,20 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         u_end: int,
         u_end_col: Optional[int] = None,
         candidates: Optional[Set[str]] = None,
+        u_start_col: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.u_start = u_start
         self.u_end = u_end
         self.u_end_col = u_end_col
+        self.u_start_col = u_start_col
         self.candidates = candidates
         self.live_ins: Set[str] = set()
         self.stored: Set[str] = set()
 
     def _is_inside(self, node: ast.AST) -> bool:
         return _is_ast_node_within_unit_bounds(
-            node, self.u_start, self.u_end, self.u_end_col
+            node, self.u_start, self.u_end, self.u_end_col, self.u_start_col
         )
 
     def _record_live_in(self, name: str) -> None:
@@ -1071,19 +1085,86 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         else:
             self.stored = stored_before
 
+    def _visit_loop_body(
+        self,
+        test_or_iter: ast.AST,
+        body: Sequence[ast.stmt],
+        orelse: Sequence[ast.stmt],
+        target: Optional[ast.AST] = None,
+    ) -> None:
+        self.visit(test_or_iter)
+        stored_before = set(self.stored)
+        if target is not None:
+            self.visit(target)
+        for s in body:
+            self.visit(s)
+        self.stored = stored_before
+        for s in orelse:
+            self.visit(s)
+
     def visit_For(self, node: Union[ast.For, ast.AsyncFor]) -> None:
+        if not self._is_inside(node):
+            self.generic_visit(node)
+            return
+        self._visit_loop_body(node.iter, node.body, node.orelse, target=node.target)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self.visit_For(node)
+
+    def visit_While(self, node: ast.While) -> None:
+        if not self._is_inside(node):
+            self.generic_visit(node)
+            return
+        self._visit_loop_body(node.test, node.body, node.orelse)
+
+    def visit_Try(self, node: Union[ast.Try, ast.AST]) -> None:
         if self._is_inside(node):
-            self.visit(node.iter)
-            self.visit(node.target)
-            for s in node.body:
+            stored_before = set(self.stored)
+            for s in getattr(node, "body", []):
                 self.visit(s)
-            for s in node.orelse:
+            for h in getattr(node, "handlers", []):
+                self.stored = set(stored_before)
+                name_val = getattr(h, "name", None)
+                if isinstance(name_val, str):
+                    self.stored.add(name_val)
+                for s in getattr(h, "body", []):
+                    self.visit(s)
+            for s in getattr(node, "orelse", []):
+                self.visit(s)
+            self.stored = set(stored_before)
+            for s in getattr(node, "finalbody", []):
                 self.visit(s)
         else:
             self.generic_visit(node)
 
-    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
-        self.visit_For(node)
+    def visit_TryStar(self, node: ast.AST) -> None:
+        self.visit_Try(node)
+
+    def visit_With(self, node: Union[ast.With, ast.AsyncWith]) -> None:
+        if self._is_inside(node):
+            stored_before = set(self.stored)
+            for item in getattr(node, "items", []):
+                self.visit(item.context_expr)
+                if getattr(item, "optional_vars", None) is not None:
+                    self.visit(item.optional_vars)
+            for s in getattr(node, "body", []):
+                self.visit(s)
+            self.stored = set(stored_before)
+        else:
+            self.generic_visit(node)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+        self.visit_With(node)
+
+    def visit_Match(self, node: ast.AST) -> None:
+        if not self._is_inside(node):
+            self.generic_visit(node)
+            return
+        self._traverse_isolated_cases(
+            node,
+            lambda: self.stored,
+            lambda s: setattr(self, "stored", s),
+        )
 
 
 def _extract_unit_live_in_names(
@@ -1092,10 +1173,15 @@ def _extract_unit_live_in_names(
     u_end: int,
     u_end_col: Optional[int] = None,
     candidates: Optional[Set[str]] = None,
+    u_start_col: Optional[int] = None,
 ) -> Set[str]:
     """Extracts variables read within unit bounds before any store, within the scope."""
     visitor = _UnitLiveInVisitor(
-        u_start, u_end, u_end_col=u_end_col, candidates=candidates
+        u_start,
+        u_end,
+        u_end_col=u_end_col,
+        candidates=candidates,
+        u_start_col=u_start_col,
     )
     visitor.visit(scope_node)
     return visitor.live_ins

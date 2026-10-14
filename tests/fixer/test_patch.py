@@ -9973,6 +9973,69 @@ def test_whole_line_complex_expr_unmapped_statement_fails_closed(tmp_path: Path)
     assert "-    assert validate(x)" not in patch
 
 
+def test_complex_expr_augassign_delegation_prunes_unused_target(tmp_path: Path) -> None:
+    """Verifies that whole-line complex_expr with AugAssign generates a delegation call
+    that prunes the unreferenced target from call arguments."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _build_unit_delegation_call,
+        generate_refactoring_patch,
+    )
+
+    code1 = (
+        "def run_one(total, a, b):\n"
+        "    total += a + b\n"
+    )
+    code2 = (
+        "def run_two(counter, a, b):\n"
+        "    counter += a + b\n"
+    )
+    lines1 = code1.splitlines(keepends=True)
+    u1 = {
+        "file": "mod1.py",
+        "start": 2,
+        "end": 2,
+        "name": "run_one",
+        "kind": "complex_expr",
+        "inputs": ["total", "a", "b"],
+        "outputs": [],
+    }
+    # Direct test of _build_unit_delegation_call:
+    rep = _build_unit_delegation_call(
+        u1,
+        code1,
+        lines1,
+        effective_binding="module",
+        helper_name="_shared_add",
+        inputs=["a", "b"],
+        outputs=[],
+        scope={"inputs": ["total", "a", "b"], "outputs": []},
+        target_inputs=["total", "a", "b"],
+    )
+    assert "total += _shared_add(a, b)" in rep
+    assert "_shared_add(total" not in rep
+
+    # Full patch generation test
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+    u2 = {
+        "file": "mod2.py",
+        "start": 2,
+        "end": 2,
+        "name": "run_two",
+        "kind": "complex_expr",
+        "inputs": ["counter", "a", "b"],
+        "outputs": [],
+    }
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert "+    total += _shared_run_one_run_two(a, b)" in patch
+    assert "+    counter += _shared_run_one_run_two(a, b)" in patch
+
+
+
 
 
 

@@ -189,6 +189,7 @@ def _execute_read_pass(
     enclosing_loops: Sequence[Tuple[int, int]],
     pass_mode: _VisitorPassMode,
     is_module: bool,
+    u_start_col: Optional[int] = None,
 ) -> Set[str]:
     """Runs a downstream read visitor pass over a scope node and returns loaded names."""
     visitor = visitor_cls(
@@ -199,6 +200,7 @@ def _execute_read_pass(
         enclosing_loops=enclosing_loops,
         pass_mode=pass_mode,
         is_module_scope=is_module,
+        u_start_col=u_start_col,
     )
     for stmt in _extract_scope_stmts(scope_node):
         visitor.visit(stmt)
@@ -488,6 +490,7 @@ def collect_downstream_read_names(
         enclosing_loops=enclosing_loops,
         pass_mode=_VisitorPassMode.AFTER_UNIT,
         is_module_scope=is_module,
+        u_start_col=u_start_col,
     )
     scope_stmts = _extract_scope_stmts(scope_node)
     for stmt in scope_stmts:
@@ -505,16 +508,24 @@ def collect_downstream_read_names(
             enclosing_loops=enclosing_loops,
             pass_mode=_VisitorPassMode.LOOP_CARRIED,
             is_module_scope=is_module,
+            u_start_col=u_start_col,
         )
         for stmt in scope_stmts:
             loop_visitor.visit(stmt)
         loaded.update(loop_visitor.loaded)
 
-        eff_inputs = effective_unit_inputs
-        if eff_inputs is None:
-            eff_inputs = _extract_unit_live_in_names(
-                scope_node, u_start, u_end, u_end_col, candidates=candidates
+        eff_inputs = (
+            effective_unit_inputs
+            if effective_unit_inputs is not None
+            else _extract_unit_live_in_names(
+                scope_node,
+                u_start,
+                u_end,
+                u_end_col,
+                candidates=candidates,
+                u_start_col=u_start_col,
             )
+        )
         cand_inputs = (
             set(candidates) & eff_inputs if candidates is not None else set(eff_inputs)
         )

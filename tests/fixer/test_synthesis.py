@@ -3255,3 +3255,109 @@ def test_infer_helper_return_type_generator_yield_assignment_imports() -> None:
     assert "Any" in typing_imports
 
 
+def test_multiline_complex_expr_differing_targets(tmp_path: Path) -> None:
+    """Verifies that multi-line complex_expr units with differing assignment targets
+    strip targets before SequenceMatcher and synthesize cleanly without orphan parentheses."""
+    c1 = (
+        "def run_one(a, b):\n"
+        "    var_one = (\n"
+        "        compute(a)\n"
+        "        + compute(b)\n"
+        "    )\n"
+    )
+    c2 = (
+        "def run_two(a, b):\n"
+        "    var_two = (\n"
+        "        compute(a)\n"
+        "        + compute(b)\n"
+        "    )\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(c1, encoding="utf-8")
+    f2.write_text(c2, encoding="utf-8")
+    u1 = {"file": "mod1.py", "start": 2, "end": 5, "name": "run_one", "kind": "complex_expr"}
+    u2 = {"file": "mod2.py", "start": 2, "end": 5, "name": "run_two", "kind": "complex_expr"}
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper != ""
+    assert "return compute(a) + compute(b)" in helper or "compute(a) + compute(b)" in helper
+    assert "var_one" not in helper
+    assert "var_two" not in helper
+    assert_valid_python(helper)
+
+
+def test_complex_expr_augassign_prunes_unused_target(tmp_path: Path) -> None:
+    """Verifies that whole-line complex_expr with AugAssign prunes unused target
+    variables from helper parameters and inputs."""
+    c1 = (
+        "def add_first(total, a, b):\n"
+        "    total += a + b\n"
+    )
+    c2 = (
+        "def add_second(counter, a, b):\n"
+        "    counter += a + b\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(c1, encoding="utf-8")
+    f2.write_text(c2, encoding="utf-8")
+    u1 = {"file": "mod1.py", "start": 2, "end": 2, "name": "add_first", "kind": "complex_expr"}
+    u2 = {"file": "mod2.py", "start": 2, "end": 2, "name": "add_second", "kind": "complex_expr"}
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper != ""
+    assert "def _shared" in helper
+    assert "total" not in helper
+    assert "counter" not in helper
+    assert "return a + b" in helper
+    assert_valid_python(helper)
+
+
+def test_multiline_return_complex_expr_not_double_wrapped(tmp_path: Path) -> None:
+    """Verifies that multi-line returns (>3 lines) in complex_expr are not double-wrapped
+    with 'return (return ...)'."""
+    code = (
+        "def build_items(a, b, c, d):\n"
+        "    return (\n"
+        "        a,\n"
+        "        b,\n"
+        "        c,\n"
+        "        d,\n"
+        "    )\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+    u1 = {"file": "mod1.py", "start": 2, "end": 7, "name": "build_items", "kind": "complex_expr"}
+    u2 = {"file": "mod2.py", "start": 2, "end": 7, "name": "build_items", "kind": "complex_expr"}
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper != ""
+    assert "return (return" not in helper
+    assert "return (" in helper
+    assert_valid_python(helper)
+
+
+def test_complex_expr_boundary_pragmas_preserved(tmp_path: Path) -> None:
+    """Verifies that boundary pragmas (# type: ignore, # noqa) are preserved
+    in synthesized helpers for complex_expr after expression unparsing."""
+    code1 = (
+        "def compute(a, b):\n"
+        "    res = a + b  # type: ignore[operator]\n"
+    )
+    code2 = (
+        "def compute(a, b):\n"
+        "    res = a + b\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+    u1 = {"file": "mod1.py", "start": 2, "end": 2, "name": "compute", "kind": "complex_expr"}
+    u2 = {"file": "mod2.py", "start": 2, "end": 2, "name": "compute", "kind": "complex_expr"}
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path), preserve_pragmas=True)
+    assert helper != ""
+    assert "# type: ignore[operator]" in helper
+    assert_valid_python(helper)
+
+
+

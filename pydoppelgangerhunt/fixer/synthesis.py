@@ -45,6 +45,68 @@ _ASSIGN_STMT_RE = re.compile(
 )
 
 
+def _attach_pragmas(
+    lines: List[str],
+    pragmas: Sequence[Dict[str, Any]],
+) -> List[str]:
+    """Attaches extracted boundary pragmas (# type: ignore, # noqa) to lines if not present."""
+    result = list(lines)
+    for p in pragmas:
+        if p.get("is_pragma"):
+            p_text = str(p.get("text", "")).strip()
+            if p_text and not any(p_text in ln for ln in result):
+                for idx, ln in enumerate(result):
+                    if ln.strip() and not ln.strip().startswith("#"):
+                        result[idx] = ln.rstrip() + f"  {p_text}"
+                        break
+    return result
+
+
+def _node_references_name(node: ast.AST, name: str) -> bool:
+    """Checks whether an AST node tree contains any references to the specified identifier."""
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and child.id == name:
+            return True
+    return False
+
+
+def _strip_stmt_target_lines(lines: Sequence[str]) -> List[str]:
+    """Strips assignment targets from statement lines to yield clean expression lines."""
+    raw = "\n".join(lines).strip()
+    try:
+        parsed = ast.parse(raw).body
+        if parsed:
+            stmt = parsed[0]
+            if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                if isinstance(stmt, ast.AnnAssign) and stmt.value is None:
+                    return list(lines)
+                if stmt.value is not None:
+                    return ast.unparse(stmt.value).splitlines()
+    except (SyntaxError, IndexError, ValueError):
+        pass
+    if len(lines) == 1:
+        m = _ASSIGN_STMT_RE.match(lines[0].strip())
+        if m:
+            return [m.group(1).strip()]
+    return list(lines)
+
+
+def _extract_augassign_unreferenced_target(lines: Sequence[str]) -> Optional[str]:
+    """Extracts target identifier of an AugAssign statement if not referenced in its RHS value."""
+    raw = "\n".join(lines).strip()
+    try:
+        parsed = ast.parse(raw).body
+        if parsed and isinstance(parsed[0], ast.AugAssign):
+            if isinstance(parsed[0].target, ast.Name):
+                target_name = parsed[0].target.id
+                if not _node_references_name(parsed[0].value, target_name):
+                    return target_name
+    except (SyntaxError, IndexError, ValueError):
+        pass
+    return None
+
+
+
 def _format_call_arguments(
     inputs: List[str],
     param_details: List[Dict[str, Any]],
@@ -884,6 +946,23 @@ def synthesize_shared_helper_code(
             f"_shared_{base_name1}" if base_name1 == base_name2 else f"_shared_{base_name1}_{base_name2}"
         )
 
+    orig_lines1 = list(lines1)
+    orig_lines2 = list(lines2)
+    pragmas1: List[Dict[str, Any]] = []
+    pragmas2: List[Dict[str, Any]] = []
+    if preserve_pragmas:
+        raw1 = "\n".join(orig_lines1)
+        raw2 = "\n".join(orig_lines2)
+        pragmas1 = extract_unit_comments_and_pragmas(raw1, 1, len(orig_lines1))
+        pragmas2 = extract_unit_comments_and_pragmas(raw2, 1, len(orig_lines2))
+
+    if u1.get("kind") in ("comprehension", "complex_expr") or u2.get("kind") in (
+        "comprehension",
+        "complex_expr",
+    ):
+        lines1 = _strip_stmt_target_lines(lines1)
+        lines2 = _strip_stmt_target_lines(lines2)
+
     # Find common lines using difflib matching
     matcher = difflib.SequenceMatcher(None, lines1, lines2)
     common_lines: List[str] = []
@@ -895,18 +974,7 @@ def synthesize_shared_helper_code(
         common_lines = lines1
 
     if preserve_pragmas:
-        raw1 = "\n".join(lines1)
-        raw2 = "\n".join(lines2)
-        pragmas1 = extract_unit_comments_and_pragmas(raw1, 1, len(lines1))
-        pragmas2 = extract_unit_comments_and_pragmas(raw2, 1, len(lines2))
-        for p in pragmas1 + pragmas2:
-            if p["is_pragma"]:
-                p_text = p["text"].strip()
-                if not any(p_text in ln for ln in common_lines):
-                    for idx, ln in enumerate(common_lines):
-                        if ln.strip() and not ln.strip().startswith("#"):
-                            common_lines[idx] = ln.rstrip() + f"  {p_text}"
-                            break
+        common_lines = _attach_pragmas(common_lines, pragmas1 + pragmas2)
 
     def _resolve_tree(
         given_tree: Optional[ast.AST],
@@ -964,6 +1032,15 @@ def synthesize_shared_helper_code(
     )
 
     inputs = list(scope["inputs"])
+    t1_unref: Optional[str] = None
+    t2_unref: Optional[str] = None
+    if u1.get("kind") in ("comprehension", "complex_expr"):
+        t1_unref = _extract_augassign_unreferenced_target(orig_lines1)
+    if u2.get("kind") in ("comprehension", "complex_expr"):
+        t2_unref = _extract_augassign_unreferenced_target(orig_lines2)
+    unref_targets = {t for t in (t1_unref, t2_unref) if t is not None}
+    if unref_targets:
+        inputs = [x for x in inputs if x not in unref_targets]
 
     def _unit_receiver_kind(u: Dict[str, Any], u_scope: Dict[str, Any]) -> str:
         if u.get("receiver_kind"):
@@ -1059,6 +1136,8 @@ def synthesize_shared_helper_code(
         indent = "    "
 
     inputs2 = list(scope2.get("inputs", []))
+    if unref_targets:
+        inputs2 = [x for x in inputs2 if x not in unref_targets]
     if effective_binding == "module":
         inputs2 = _prune_unshared_receivers(inputs2, u2, u1, scope2, scope1, repo_root=repo_root)
 
@@ -1199,6 +1278,12 @@ def synthesize_shared_helper_code(
                         stripped_expr = ast.unparse(stmt_node.value)
                     elif isinstance(stmt_node, ast.AugAssign):
                         stripped_expr = ast.unparse(stmt_node.value)
+                    elif isinstance(stmt_node, ast.Return):
+                        stripped_expr = (
+                            ast.unparse(stmt_node.value)
+                            if stmt_node.value is not None
+                            else "None"
+                        )
                     else:
                         stripped_expr = full_code
             except (SyntaxError, IndexError):
@@ -1222,6 +1307,8 @@ def synthesize_shared_helper_code(
                 eff_step = step or _detect_indent_step(indent)
                 expr_inner = [f"{eff_step}{ln}" for ln in common_lines]
                 common_lines = ["return ("] + expr_inner + [")"]
+            if preserve_pragmas:
+                common_lines = _attach_pragmas(common_lines, pragmas1 + pragmas2)
         helper_outputs = []
     elif (
         not has_trailing_return
