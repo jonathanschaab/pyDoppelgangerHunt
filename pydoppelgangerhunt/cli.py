@@ -1426,7 +1426,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if early_exit is not None:
         return early_exit
 
-    if args.top is not None and args.top > 0 and args.top < len(clones):
+    if args.top is not None and 0 < args.top < len(clones):
         clones = clones[:args.top]
 
     families: Optional[List[Dict[str, Any]]] = None
