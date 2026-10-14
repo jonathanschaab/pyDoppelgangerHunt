@@ -10035,6 +10035,72 @@ def test_complex_expr_augassign_delegation_prunes_unused_target(tmp_path: Path) 
     assert "+    counter += _shared_run_one_run_two(a, b)" in patch
 
 
+def test_complex_expr_augassign_target_pruning_different_param_orders(tmp_path: Path) -> None:
+    """Verifies that whole-line complex_expr AugAssign units with different parameter
+    orderings do not swap arguments at call sites."""
+    code1 = (
+        "def run_one(total, a, b):\n"
+        "    total += a - b\n"
+        "    return total\n"
+    )
+    code2 = (
+        "def run_two(a, b, counter):\n"
+        "    counter += a - b\n"
+        "    return counter\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+
+    u1 = {
+        "file": "mod1.py",
+        "start": 2,
+        "end": 2,
+        "name": "run_one",
+        "kind": "complex_expr",
+        "inputs": ["total", "a", "b"],
+        "outputs": [],
+    }
+    u2 = {
+        "file": "mod2.py",
+        "start": 2,
+        "end": 2,
+        "name": "run_two",
+        "kind": "complex_expr",
+        "inputs": ["a", "b", "counter"],
+        "outputs": [],
+    }
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert "+    counter += _shared_run_one_run_two(a, b)" in patch
+    assert "(b, a)" not in patch
+
+
+def test_complex_expr_augassign_asymmetric_rhs_not_pruned(tmp_path: Path) -> None:
+    """Verifies that if one unit references its AugAssign target on RHS while the other
+    does not, neither has its parameter pruned to prevent arity mismatch."""
+    code1 = (
+        "def f1(total, a, b):\n"
+        "    total += a + b\n"
+    )
+    code2 = (
+        "def f2(counter, a, b):\n"
+        "    counter += counter + a + b\n"
+    )
+    f1 = tmp_path / "m1.py"
+    f2 = tmp_path / "m2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+
+    u1 = {"file": "m1.py", "start": 2, "end": 2, "name": "f1", "kind": "complex_expr"}
+    u2 = {"file": "m2.py", "start": 2, "end": 2, "name": "f2", "kind": "complex_expr"}
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    if helper:
+        assert "total: Any" in helper or "counter: Any" in helper
+
+
 
 
 

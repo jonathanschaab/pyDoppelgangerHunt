@@ -621,6 +621,7 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
         enclosing_class_starts: Optional[Dict[int, int]] = None,
         func_owners: Optional[Dict[int, str]] = None,
         harvest_closures: bool = True,
+        func_is_async: Optional[Dict[int, bool]] = None,
     ) -> None:
         self.closure_parents: Dict[int, str] = closure_parents if closure_parents is not None else {}
         self.enclosing_classes: Dict[int, str] = enclosing_classes if enclosing_classes is not None else {}
@@ -628,9 +629,18 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
             enclosing_class_starts if enclosing_class_starts is not None else {}
         )
         self.func_owners: Dict[int, str] = func_owners if func_owners is not None else {}
+        self.func_is_async: Dict[int, bool] = (
+            func_is_async if func_is_async is not None else {}
+        )
         self.harvest_closures: bool = harvest_closures
         self.func_stack: List[str] = []
+        self.async_stack: List[bool] = []
         self.class_stack: List[Tuple[str, int]] = []
+
+    def generic_visit(self, node: ast.AST) -> None:
+        if self.async_stack:
+            self.func_is_async[id(node)] = self.async_stack[-1]
+        super().generic_visit(node)
 
     def _record_class_enclosure(self, node: ast.AST) -> None:
         if self.class_stack:
@@ -686,8 +696,10 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
         if self.func_stack:
             self.closure_parents[id(fn)] = ":".join(self.func_stack)
         self.func_stack.append(fn.name)
+        self.async_stack.append(isinstance(fn, ast.AsyncFunctionDef))
         for stmt in fn.body:
             self.visit(stmt)
+        self.async_stack.pop()
         self.func_stack.pop()
 
     def visit_FunctionDef(self, fn: ast.FunctionDef) -> None:
@@ -697,6 +709,8 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
         self._scope_function(fn)
 
     def _scope_comprehension(self, comp: ast.AST) -> None:
+        if self.async_stack:
+            self.func_is_async[id(comp)] = self.async_stack[-1]
         self._record_class_enclosure(comp)
         if self.func_stack:
             if self.harvest_closures or len(self.func_stack) == 1:
@@ -1235,12 +1249,14 @@ def harvest_file_units(
     enclosing_classes: Dict[int, str] = {}
     enclosing_class_starts: Dict[int, int] = {}
     func_owners: Dict[int, str] = {}
+    func_is_async: Dict[int, bool] = {}
     _ScopeHierarchyVisitor(
         closure_parents,
         enclosing_classes,
         enclosing_class_starts,
         func_owners=func_owners,
         harvest_closures=harvest_closures,
+        func_is_async=func_is_async,
     ).visit(tree)
 
     for node in ast.walk(tree):
@@ -1473,6 +1489,9 @@ def harvest_file_units(
                 consistent_renaming=consistent_renaming,
                 abstract_expressions=abstract_expressions,
                 strip_docstrings=strip_docstrings,
+                is_async=_node_is_effectively_async(
+                    expr_node, func_is_async.get(id(expr_node), False)
+                ),
             )
 
     if data_tables:  # pydoppelgangerhunt: ignore
@@ -1527,6 +1546,9 @@ def harvest_file_units(
                     strip_docstrings=strip_docstrings,
                     enclosing_class=enc_cls,
                     enclosing_class_start=enclosing_class_starts.get(id(comp)),
+                    is_async=_node_is_effectively_async(
+                        comp, func_is_async.get(id(comp), False)
+                    ),
                 )
 
     return units

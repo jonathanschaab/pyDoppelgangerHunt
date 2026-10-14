@@ -1705,3 +1705,67 @@ def test_nested_async_comprehension_in_subroutine(tmp_path: Path) -> None:
     }
     scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
     assert scope["is_async"] is True
+
+
+def test_sync_comprehension_inside_async_def_not_is_async(tmp_path: Path) -> None:
+    """Verifies that pure synchronous comprehensions inside async functions
+    are not falsely marked as is_async=True."""
+    code = (
+        "async def fetch_all(items):\n"
+        "    doubled = [x * 2 for x in items]\n"
+        "    return doubled\n"
+    )
+    f = tmp_path / "async_fn.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {
+        "file": "async_fn.py",
+        "start": 2,
+        "end": 2,
+        "name": "fetch_all:doubled",
+        "kind": "comprehension",
+    }
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert scope["is_async"] is False
+
+
+def test_harvest_file_units_sync_and_async_comprehension(tmp_path: Path) -> None:
+    """Verifies harvest_file_units accurately assigns is_async to comprehensions."""
+    code = (
+        "async def run(items, aiter):\n"
+        "    sync_comp = [x * 2 for x in items]\n"
+        "    async_comp = [x async for x in aiter]\n"
+    )
+    f = tmp_path / "comps.py"
+    f.write_text(code, encoding="utf-8")
+    units = harvest_file_units(str(f), repo_root=str(tmp_path), comprehensions=True)
+    comp_units = [u for u in units if u.get("kind") == "comprehension"]
+    sync_units = [u for u in comp_units if u.get("start") == 2]
+    async_units = [u for u in comp_units if u.get("start") == 3]
+    assert len(sync_units) >= 1
+    assert sync_units[0]["is_async"] is False
+    assert len(async_units) >= 1
+    assert async_units[0]["is_async"] is True
+
+
+def test_unit_ast_has_async_or_yield_lambda_exclusion_and_single_line() -> None:
+    """Verifies that lambda generator expressions do not mark enclosing subroutine as generator,
+    and single-line enclosing async functions are not skipped."""
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=protected-access
+        _unit_ast_has_async_or_yield,
+    )
+
+    # 1. Generator lambda inside subroutine
+    code1 = "def f(x):\n    cb = lambda: (yield x)\n    return cb\n"
+    tree1 = ast.parse(code1)
+    has_yield1, has_await1 = _unit_ast_has_async_or_yield(tree1, 2, 3)
+    assert has_yield1 is False
+    assert has_await1 is False
+
+    # 2. Single-line enclosing async def
+    code2 = "async def f(): a = await g(); b = 1\n"
+    tree2 = ast.parse(code2)
+    has_yield2, has_await2 = _unit_ast_has_async_or_yield(tree2, 1, 1)
+    assert has_await2 is True
+    assert has_yield2 is False
+

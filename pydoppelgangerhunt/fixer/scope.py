@@ -1494,9 +1494,15 @@ def _inspect_unit_scope(
         )
     )
 
+    is_sub_or_inner = is_subroutine or unit.get("kind") in (
+        "comprehension",
+        "complex_expr",
+        "class",
+        "data_table",
+    )
     unit_is_async = unit.get("is_async")
     if unit_is_async is None:
-        if is_subroutine and not visitor.has_yield:
+        if is_sub_or_inner and not visitor.has_yield:
             unit_is_async = visitor.is_async
         else:
             s_line = parse_unit_coord(unit, "start", default=1)
@@ -1516,7 +1522,7 @@ def _inspect_unit_scope(
         effective_is_async = bool(unit.get("is_async"))
     elif visitor.has_yield:
         effective_is_async = bool(unit_is_async) if unit_is_async is not None else None
-    elif not is_subroutine and unit.get("kind") not in ("function", "method"):
+    elif not is_sub_or_inner and unit.get("kind") not in ("function", "method"):
         effective_is_async = bool(unit_is_async)
     else:
         effective_is_async = False

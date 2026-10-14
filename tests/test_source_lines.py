@@ -537,3 +537,33 @@ def test_resolve_safe_unit_file_path_symlinked_root_in_repo_symlink(tmp_path: Pa
     )
     assert resolved is None
 
+
+def test_resolve_safe_unit_file_path_hop_back_symlink_rejected(tmp_path: Path) -> None:
+    """Verifies resolve_safe_unit_file_path rejects in-repo symlinks that hop out
+    and back to target_root."""
+    from pydoppelgangerhunt.source_lines import (  # pylint: disable=import-outside-toplevel
+        resolve_safe_unit_file_path,
+    )
+
+    real_repo = tmp_path / "repo"
+    real_repo.mkdir()
+    target_py = real_repo / "target.py"
+    target_py.write_text("print('hello')\n", encoding="utf-8")
+
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    hop_back = outside_dir / "hop_back"
+
+    try:
+        hop_back.symlink_to(real_repo, target_is_directory=True)
+        link_out = real_repo / "link_out"
+        link_out.symlink_to(outside_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("Filesystem does not support directory symlinks or lacks privileges")
+
+    hop_path = real_repo / "link_out" / "hop_back" / "target.py"
+    resolved = resolve_safe_unit_file_path(
+        {"file": str(hop_path)}, repo_root=str(real_repo)
+    )
+    assert resolved is None
+

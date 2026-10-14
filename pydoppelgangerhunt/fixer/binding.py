@@ -301,8 +301,18 @@ def _unit_ast_has_async_or_yield(
                 and bool(getattr(node, "is_async", False))
             ):
                 has_await = True
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if isinstance(node, ast.Lambda):
                 continue
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node is not tree:
+                    n_start = lineno
+                    n_end = end_lineno or n_start
+                    is_enclosing = (
+                        (n_start < u_start or n_end > u_end)
+                        or (isinstance(tree, ast.Module) and node in tree.body)
+                    )
+                    if not is_enclosing:
+                        continue
 
         if has_yield and has_await:
             break
@@ -360,7 +370,12 @@ def _populate_unit_receiver_metadata(
     if "enclosing_is_async" not in unit:
         unit["enclosing_is_async"] = fn_is_async
     if "is_async" not in unit:
-        is_sub = is_subroutine_unit(unit, source_text=source, tree=tree)
+        is_sub = is_subroutine_unit(unit, source_text=source, tree=tree) or unit.get("kind") in (
+            "comprehension",
+            "complex_expr",
+            "class",
+            "data_table",
+        )
         if is_sub:
             has_yield = bool(unit.get("has_yield"))
             has_await = bool(unit.get("has_await"))

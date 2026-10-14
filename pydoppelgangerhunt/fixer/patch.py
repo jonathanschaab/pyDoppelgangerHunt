@@ -73,11 +73,13 @@ from pydoppelgangerhunt.fixer.source import (
     resolve_unit_replacement,
     split_source_lines,
 )
+from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.source_lines import (
     normalize_unit_coordinates,
     resolve_unit_line_bounds,
 )
 from pydoppelgangerhunt.fixer.synthesis import (
+    _extract_augassign_unreferenced_target,
     _extract_required_typing_imports,
     _format_call_arguments,
     _node_references_name,
@@ -814,26 +816,16 @@ def _build_unit_delegation_call(
                     if isinstance(parsed_node.target, ast.Name):
                         t_name = parsed_node.target.id
                         if not _node_references_name(parsed_node.value, t_name):
-                            if target_inputs is not None and len(target_inputs) == len(inputs):
-                                try:
-                                    t_idx = target_inputs.index(t_name)
-                                    pruned_inputs = [x for i, x in enumerate(inputs) if i != t_idx]
-                                    pruned_eff = [
-                                        x for i, x in enumerate(target_inputs) if i != t_idx
-                                    ]
-                                except ValueError:
-                                    pruned_inputs = [x for x in inputs if x != t_name]
-                                    pruned_eff = [x for x in effective_targets if x != t_name]
-                            else:
-                                pruned_inputs = [x for x in inputs if x != t_name]
-                                pruned_eff = [x for x in effective_targets if x != t_name]
-                            pruned_args = _format_call_arguments(
-                                pruned_inputs,
-                                scope.get("param_details", []),
-                                receiver_to_omit=unit_receiver_omit,
-                                target_inputs=pruned_eff,
-                            )
-                            call_expr = f"{unit_call_prefix}{helper_name}({pruned_args})"
+                            pruned_inputs = [x for x in inputs if x != t_name]
+                            pruned_eff = [x for x in effective_targets if x != t_name]
+                            if len(pruned_eff) == len(pruned_inputs):
+                                pruned_args = _format_call_arguments(
+                                    pruned_inputs,
+                                    scope.get("param_details", []),
+                                    receiver_to_omit=unit_receiver_omit,
+                                    target_inputs=pruned_eff,
+                                )
+                                call_expr = f"{unit_call_prefix}{helper_name}({pruned_args})"
                 elif isinstance(parsed_node, ast.Return):
                     assign_prefix = "return "
                 elif isinstance(parsed_node, ast.Expr):
@@ -3352,6 +3344,22 @@ def _generate_refactoring_patch_impl(
             u2_eff["outputs"] = target_outs2
             t_inputs1 = list(s1.get("inputs", []))
             t_inputs2 = list(s2.get("inputs", []))
+            t1_unref: Optional[str] = None
+            t2_unref: Optional[str] = None
+            if u1.get("kind") in ("comprehension", "complex_expr") and u2.get("kind") in (
+                "comprehension",
+                "complex_expr",
+            ):
+                t1_unref = _extract_augassign_unreferenced_target(
+                    extract_unit_source_code(u1, repo_root=str(root))
+                )
+                t2_unref = _extract_augassign_unreferenced_target(
+                    extract_unit_source_code(u2, repo_root=str(root))
+                )
+            if t1_unref is not None and t2_unref is not None:
+                t_inputs1 = [x for x in t_inputs1 if x != t1_unref]
+                t_inputs2 = [x for x in t_inputs2 if x != t2_unref]
+                inputs = [x for x in inputs if x != t1_unref]
             if effective_binding == "module":
                 t_inputs1 = _prune_unshared_receivers(
                     t_inputs1, u1_eff, u2_eff, s1, s2, repo_root=str(root)

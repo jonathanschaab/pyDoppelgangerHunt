@@ -4854,3 +4854,84 @@ def test_unit_live_in_visitor_loop_orelse_resets_stored() -> None:
         tree2.body[0], u_start=2, u_end=8, candidates={"val", "use", "items", "test"}
     )
     assert "val" in live_ins2
+
+
+def test_nested_enclosing_loops_kills_do_not_leak_into_inner_loop() -> None:
+    """Verifies that kills in outer enclosing loops do not prune variables
+    accumulating across iterations of inner enclosing loops."""
+    code = (
+        "def process_groups(groups):\n"
+        "    for group in groups:\n"
+        "        total = 0\n"
+        "        for batch in group:\n"
+        "            for x in batch:\n"
+        "                total += x\n"
+        "                yield total\n"
+    )
+    unit = {
+        "file": "test.py",
+        "start": 5,
+        "end": 7,
+        "name": "unit",
+        "kind": "compound_block",
+    }
+    reads = collect_downstream_read_names(code, unit, candidates={"total"})
+    assert reads is not None
+    assert "total" in reads
+
+
+def test_unit_live_in_visitor_except_handler_type_visited() -> None:
+    """Verifies that dynamically bound exception handler types are captured as live-ins."""
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=protected-access
+        _extract_unit_live_in_names,
+    )
+
+    code = (
+        "def fn():\n"
+        "    try:\n"
+        "        do_work()\n"
+        "    except allowed_exceptions as err:\n"
+        "        handle(err)\n"
+    )
+    tree = ast.parse(code)
+    live_ins = _extract_unit_live_in_names(
+        tree.body[0],
+        u_start=2,
+        u_end=5,
+        candidates={"allowed_exceptions", "do_work", "handle"},
+    )
+    assert "allowed_exceptions" in live_ins
+
+
+def test_unit_live_in_visitor_conditional_walrus_does_not_kill_subsequent_reads() -> None:
+    """Verifies that walrus expressions in short-circuiting or ternary expressions
+    do not kill subsequent live-in reads."""
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=protected-access
+        _extract_unit_live_in_names,
+    )
+
+    # 1. Short-circuiting BoolOp: if flag and (total := 0):
+    code1 = (
+        "def fn(flag):\n"
+        "    if flag and (total := 0):\n"
+        "        pass\n"
+        "    use(total)\n"
+    )
+    tree1 = ast.parse(code1)
+    live_ins1 = _extract_unit_live_in_names(
+        tree1.body[0], u_start=2, u_end=4, candidates={"total", "use", "flag"}
+    )
+    assert "total" in live_ins1
+
+    # 2. Ternary IfExp: x = 1 if cond else (total := 0)
+    code2 = (
+        "def fn(cond):\n"
+        "    x = 1 if cond else (total := 0)\n"
+        "    use(total)\n"
+    )
+    tree2 = ast.parse(code2)
+    live_ins2 = _extract_unit_live_in_names(
+        tree2.body[0], u_start=2, u_end=3, candidates={"total", "use", "cond"}
+    )
+    assert "total" in live_ins2
+

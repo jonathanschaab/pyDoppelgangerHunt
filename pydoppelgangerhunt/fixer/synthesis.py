@@ -1048,9 +1048,12 @@ def synthesize_shared_helper_code(
 
     inputs = list(scope["inputs"])
     t1_unref: Optional[str] = None
+    t2_unref: Optional[str] = None
     if u1.get("kind") in ("comprehension", "complex_expr"):
         t1_unref = _extract_augassign_unreferenced_target(orig_lines1)
-    if t1_unref is not None:
+    if u2.get("kind") in ("comprehension", "complex_expr"):
+        t2_unref = _extract_augassign_unreferenced_target(orig_lines2)
+    if t1_unref is not None and t2_unref is not None:
         inputs = [x for x in inputs if x != t1_unref]
 
     def _unit_receiver_kind(u: Dict[str, Any], u_scope: Dict[str, Any]) -> str:
@@ -1147,10 +1150,7 @@ def synthesize_shared_helper_code(
         indent = "    "
 
     inputs2 = list(scope2.get("inputs", []))
-    t2_unref: Optional[str] = None
-    if u2.get("kind") in ("comprehension", "complex_expr"):
-        t2_unref = _extract_augassign_unreferenced_target(orig_lines2)
-    if t2_unref is not None:
+    if t1_unref is not None and t2_unref is not None:
         inputs2 = [x for x in inputs2 if x != t2_unref]
     if effective_binding == "module":
         inputs2 = _prune_unshared_receivers(inputs2, u2, u1, scope2, scope1, repo_root=repo_root)

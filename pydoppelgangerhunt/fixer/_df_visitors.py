@@ -608,6 +608,19 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             return False
         return any(l_start <= lineno <= l_end for l_start, l_end in self.enclosing_loops)
 
+    def _loop_encloses_unit(self, node: ast.AST) -> bool:
+        n_start = getattr(node, "lineno", 0) or 0
+        n_end = getattr(node, "end_lineno", None) or n_start
+        if not (n_start <= self.u_start and self.u_end <= n_end):
+            return False
+        if n_start < self.u_start or n_end > self.u_end:
+            return True
+        if self.u_start_col is not None:
+            col = getattr(node, "col_offset", None)
+            if col is not None and int(col) < int(self.u_start_col):
+                return True
+        return False
+
     def _should_inspect_read(self, node: ast.AST) -> bool:
         if self.pass_mode is _VisitorPassMode.LOOP_CARRIED:
             return self._is_loop_carried(node)
@@ -748,6 +761,8 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             self.killed = killed_before
 
     def visit_For(self, node: Union[ast.For, ast.AsyncFor]) -> None:
+        if self.pass_mode is _VisitorPassMode.LOOP_CARRIED and self._loop_encloses_unit(node):
+            self.killed = set()
         self.visit(node.iter)
         killed_before = set(self.killed)
         self._record_killed_targets([node.target])
@@ -762,6 +777,8 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self.visit_For(node)
 
     def visit_While(self, node: ast.While) -> None:
+        if self.pass_mode is _VisitorPassMode.LOOP_CARRIED and self._loop_encloses_unit(node):
+            self.killed = set()
         killed_before = set(self.killed)
         self.visit(node.test)
         for stmt in node.body:
@@ -942,6 +959,7 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         self.candidates = candidates
         self.live_ins: Set[str] = set()
         self.stored: Set[str] = set()
+        self._conditional_depth: int = 0
 
     def _is_inside(self, node: ast.AST) -> bool:
         return _is_ast_node_within_unit_bounds(
@@ -1049,10 +1067,40 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         else:
             self.visit(node.target)
 
+    def visit_BoolOp(self, node: ast.BoolOp) -> None:
+        if not self._is_inside(node):
+            self.generic_visit(node)
+            return
+        if not node.values:
+            return
+        self.visit(node.values[0])
+        self._conditional_depth += 1
+        try:
+            for val in node.values[1:]:
+                self.visit(val)
+        finally:
+            self._conditional_depth -= 1
+
+    def visit_IfExp(self, node: ast.IfExp) -> None:
+        if not self._is_inside(node):
+            self.generic_visit(node)
+            return
+        self.visit(node.test)
+        self._conditional_depth += 1
+        try:
+            self.visit(node.body)
+            self.visit(node.orelse)
+        finally:
+            self._conditional_depth -= 1
+
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         if self._is_inside(node):
             self.visit(node.value)
-            if isinstance(node.target, ast.Name):
+            if (
+                isinstance(node.target, ast.Name)
+                and self._conditional_depth == 0
+                and self._in_comp_body == 0
+            ):
                 self.stored.add(node.target.id)
         else:
             self.generic_visit(node)
@@ -1126,6 +1174,9 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
             stored_after_body = set(self.stored)
             for h in getattr(node, "handlers", []):
                 self.stored = set(stored_before)
+                h_type = getattr(h, "type", None)
+                if h_type is not None:
+                    self.visit(h_type)
                 name_val = getattr(h, "name", None)
                 if isinstance(name_val, str):
                     self.stored.add(name_val)

@@ -365,7 +365,7 @@ def resolve_safe_unit_file_path(
                     resolved_self == target_root
                     or resolved_self in target_root.parents
                 ):
-                    break
+                    continue
                 return None
 
         resolved_file = file_path.resolve()
