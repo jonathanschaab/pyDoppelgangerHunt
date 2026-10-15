@@ -10363,3 +10363,97 @@ def test_whole_line_comprehension_preserves_assignment_target_and_indentation(
     assert "+    res = _shared_u1_u2(items)" in patch
     assert "+    out = _shared_u1_u2(items)" in patch
 
+
+def test_whole_line_comprehension_and_complex_expr_subscript_attribute_lhs_pruned(
+    tmp_path: Path,
+) -> None:
+    """Verifies that whole-line comprehension and complex_expr units with subscript or
+    attribute assignment targets prune LHS-only load identifiers and receiver attributes."""
+    src1 = (
+        "def update_slot(arr: list[list[int]], i: int, items: list[int]) -> None:\n"
+        "    arr[i] = [x * 2 for x in items if x > 0]\n"
+    )
+    src2 = (
+        "def compute_list(items: list[int]) -> list[int]:\n"
+        "    res = [x * 2 for x in items if x > 0]\n"
+        "    return res\n"
+    )
+    f1 = tmp_path / "lhs_sub1.py"
+    f2 = tmp_path / "lhs_sub2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": "lhs_sub1.py", "start": 2, "end": 2, "name": "u1", "kind": "comprehension"}
+    u2 = {"file": "lhs_sub2.py", "start": 2, "end": 2, "name": "u2", "kind": "comprehension"}
+
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "def _shared_u1_u2(items: Any) -> Any:" in patch
+    assert "+    arr[i] = _shared_u1_u2(items)" in patch
+    assert "+    res = _shared_u1_u2(items)" in patch
+
+    # Also test self.cache[k] = compute(a, b) paired with res = compute(a, b)
+    src_attr1 = (
+        "class Worker:\n"
+        "    def store(self, k: str, a: int, b: int) -> None:\n"
+        "        self.cache[k] = (a + b) * (a - b)\n"
+    )
+    src_attr2 = (
+        "class Worker2:\n"
+        "    def calc(self, a: int, b: int) -> int:\n"
+        "        res = (a + b) * (a - b)\n"
+        "        return res\n"
+    )
+    fa1 = tmp_path / "lhs_attr1.py"
+    fa2 = tmp_path / "lhs_attr2.py"
+    fa1.write_text(src_attr1, encoding="utf-8")
+    fa2.write_text(src_attr2, encoding="utf-8")
+
+    ua1 = {"file": "lhs_attr1.py", "start": 3, "end": 3, "name": "u1", "kind": "complex_expr"}
+    ua2 = {"file": "lhs_attr2.py", "start": 3, "end": 3, "name": "u2", "kind": "complex_expr"}
+
+    patch_attr = generate_refactoring_patch(
+        [(0.95, ua1, ua2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "def _shared_u1_u2(a: Any, b: Any) -> Any:" in patch_attr
+    assert "+        self.cache[k] = _shared_u1_u2(a, b)" in patch_attr
+    assert "+        res = _shared_u1_u2(a, b)" in patch_attr
+
+
+def test_unit_has_no_refactor_pragma_fallback_inline_and_multiline_leading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies that _unit_has_no_refactor_pragma fallback detects inline trailing
+    # pragma: no-refactor comments and multi-line contiguous leading comment blocks."""
+    from pydoppelgangerhunt.fixer import patch as patch_mod
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=protected-access
+        _unit_has_no_refactor_pragma,
+    )
+
+    def _raise_runtime_error(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("simulated tokenizer failure")
+
+    monkeypatch.setattr(patch_mod, "extract_unit_comments_and_pragmas", _raise_runtime_error)
+
+    # 1. Inline trailing comment on header line
+    lines_inline = [
+        "def foo():  # pragma: no-refactor\n",
+        "    return 42\n",
+    ]
+    u_inline = {"start": 1, "end": 2}
+    assert _unit_has_no_refactor_pragma(u_inline, lines_inline) is True
+
+    # 2. Multi-line contiguous leading comment block above unit
+    lines_multiline = [
+        "# pragma: no-refactor\n",
+        "# Intentional duplicate implementation\n",
+        "def bar():\n",
+        "    return 99\n",
+    ]
+    u_multiline = {"start": 3, "end": 4}
+    assert _unit_has_no_refactor_pragma(u_multiline, lines_multiline) is True

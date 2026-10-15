@@ -267,6 +267,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Symlinked and Aliased Root Safe Path Resolution**: Updated `resolve_safe_unit_file_path`
   to permit parent directories whose canonical paths match or are ancestors of `target_root`,
   supporting symlinked system directories.
+- **Type Annotation, Bare Target, and PEP 695 `TypeAlias` Live-In Analysis**: Updated
+  `_UnitLiveInVisitor` (`_df_visitors.py`) to visit `AnnAssign.annotation`, bare subscript/attribute
+  targets (`arr[idx]: int`), and PEP 695 `TypeAlias` statements (including type parameter bounds
+  and defaults via `_extract_type_alias_free_reads`) while isolating lexical `type_params`.
+- **Whole-Line Subscript and Attribute LHS Load Pruning**: Added `_extract_unreferenced_lhs_loads`
+  and `_prune_unreferenced_lhs_scope` (`synthesis.py`, `patch.py`) to prune LHS-only `ast.Load`
+  identifiers and receiver attributes (`arr[i] = ...`, `self.cache[k] = ...`, `res: MyType = ...`)
+  from whole-line `"comprehension"` and `"complex_expr"` units.
+- **Sync vs. Async Iterator Return Annotation Cross-Check**: Guarded early-return iterator
+  prefixes in `_infer_helper_return_type` (`synthesis.py`) with `is_async` so synchronous
+  `Iterator[...]`/`Generator[...]`/`Iterable[...]` annotations are not emitted for `async def`
+  generators (and vice versa).
+- **Inline and Multi-Line Pragma Fallback Detection**: Updated `_unit_has_no_refactor_pragma`
+  fallback (`patch.py`) to scan contiguous leading `#` comment lines and inspect unit lines
+  directly with `_NO_REFACTOR_RE.search(line)` so inline trailing `# pragma: no-refactor` comments
+  are detected even if tokenization fails.
+- **Sorted AST Scope Intervals Cache**: Sorted `intervals` by `(span, -start, -col_offset)` before
+  caching on `tree._scope_intervals` in `_get_tree_scope_intervals` (`source.py`).
 
 ## [1.0.0] - 2026-09-20
 ### Added

@@ -5188,3 +5188,54 @@ def test_collect_downstream_read_names_single_line_enclosing_loop() -> None:
     assert reads is not None
     assert "total" in reads
 
+
+def test_extract_unit_live_in_names_annassign_annotations_and_bare_subscript() -> None:
+    """Verifies that _UnitLiveInVisitor visits AnnAssign annotations and bare subscript/attribute
+    targets while recording assigned Name targets as stores."""
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=protected-access
+        _extract_unit_live_in_names,
+    )
+
+    code = (
+        "def process(arr, idx, obj):\n"
+        "    x: MyType = 1\n"
+        "    y: BareType\n"
+        "    arr[idx]: SubType\n"
+        "    obj.attr: AttrType\n"
+        "    return x\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    live_ins = _extract_unit_live_in_names(fn_node, u_start=2, u_end=5)
+    assert "MyType" in live_ins
+    assert "BareType" in live_ins
+    assert "SubType" in live_ins
+    assert "AttrType" in live_ins
+    assert "arr" in live_ins
+    assert "idx" in live_ins
+    assert "obj" in live_ins
+    assert "x" not in live_ins
+    assert "y" not in live_ins
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 type alias requires Python 3.12+")
+def test_extract_unit_live_in_names_pep695_type_alias() -> None:
+    """Verifies that _UnitLiveInVisitor isolates PEP 695 TypeAlias type_params from live-ins
+    while recording the alias name as a store and external references in the value as live-ins."""
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=protected-access
+        _extract_unit_live_in_names,
+    )
+
+    code = (
+        "def make_types():\n"
+        "    type MyMap[K, V: BoundType] = OuterContainer[K, V]\n"
+        "    return MyMap\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    live_ins = _extract_unit_live_in_names(fn_node, u_start=2, u_end=3)
+    assert "BoundType" in live_ins
+    assert "OuterContainer" in live_ins
+    assert "MyMap" not in live_ins
+    assert "K" not in live_ins
+    assert "V" not in live_ins

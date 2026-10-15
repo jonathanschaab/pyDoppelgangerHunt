@@ -131,6 +131,75 @@ def _should_prune_augassign_targets(
     return t1_unref not in rhs2 and t2_unref not in rhs1
 
 
+def _extract_unreferenced_lhs_loads(lines: Sequence[str]) -> Set[str]:
+    """Extracts identifiers loaded in an assignment LHS or annotation but not referenced in RHS."""
+    raw = dedent_source_text("\n".join(lines)).strip()
+    try:
+        parsed = ast.parse(raw).body
+        if len(parsed) == 1:
+            stmt = parsed[0]
+            lhs_nodes: List[ast.AST] = []
+            rhs_node: Optional[ast.AST] = None
+            if isinstance(stmt, ast.Assign) and stmt.value is not None:
+                lhs_nodes = list(stmt.targets)
+                rhs_node = stmt.value
+            elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+                lhs_nodes = [stmt.target, stmt.annotation]
+                rhs_node = stmt.value
+            elif isinstance(stmt, ast.AugAssign) and not isinstance(
+                stmt.target, ast.Name
+            ):
+                lhs_nodes = [stmt.target]
+                rhs_node = stmt.value
+            if rhs_node is not None and lhs_nodes:
+                loaded_lhs = {
+                    child.id
+                    for lhs in lhs_nodes
+                    for child in ast.walk(lhs)
+                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+                }
+                return {
+                    name
+                    for name in loaded_lhs
+                    if not _node_references_name(rhs_node, name)
+                }
+    except (SyntaxError, IndexError, ValueError):
+        pass
+    return set()
+
+
+def _prune_unreferenced_lhs_scope(
+    unit: Dict[str, Any],
+    scope_dict: Dict[str, Any],
+    lines: Sequence[str],
+) -> None:
+    """Prunes LHS-only loaded identifiers and receiver attributes for whole-line expr units."""
+    if _is_subline_unit(unit) or unit.get("kind") not in (
+        "comprehension",
+        "complex_expr",
+    ):
+        return
+    unref_loads = _extract_unreferenced_lhs_loads(lines)
+    if not unref_loads:
+        return
+    for key in ("inputs", "free_vars"):
+        if key in scope_dict:
+            scope_dict[key] = [x for x in scope_dict[key] if x not in unref_loads]
+    for rec in unref_loads:
+        prefix = f"{rec}."
+        for attr_key in (
+            "attrs_read",
+            "attrs_written",
+            "instance_attrs",
+            "class_attrs",
+        ):
+            if attr_key in scope_dict:
+                scope_dict[attr_key] = [
+                    a for a in scope_dict[attr_key] if not str(a).startswith(prefix)
+                ]
+
+
+
 def _format_call_arguments(
     inputs: List[str],
     param_details: List[Dict[str, Any]],
@@ -746,15 +815,23 @@ def _infer_helper_return_type(
         has_return_val = bool(helper_outputs or scope.get("has_return_value"))
         has_yield_assign = bool(scope.get("has_yield_assignment"))
         if not has_return_val and resolved_ret not in ("Any", "None"):
-            if resolved_ret.startswith("Generator["):
+            if not is_async and resolved_ret.startswith("Generator["):
                 return resolved_ret
-            if not has_yield_assign and resolved_ret.startswith((
-                "Iterator[", "Iterable[",
-                "AsyncGenerator[", "AsyncIterator[", "AsyncIterable[",
-            )):
-                return resolved_ret
-        if has_return_val and not helper_outputs and resolved_ret.startswith("Generator["):
+            if not has_yield_assign:
+                if not is_async and resolved_ret.startswith(("Iterator[", "Iterable[")):
+                    return resolved_ret
+                if is_async and resolved_ret.startswith((
+                    "AsyncGenerator[", "AsyncIterator[", "AsyncIterable[",
+                )):
+                    return resolved_ret
+        if (
+            not is_async
+            and has_return_val
+            and not helper_outputs
+            and resolved_ret.startswith("Generator[")
+        ):
             return resolved_ret
+
 
         inferred_yield_type = None
         inferred_send_type = None
@@ -1041,6 +1118,8 @@ def synthesize_shared_helper_code(
             u_item["is_async"] = True
         scopes.append(s_item)
     scope1, scope2 = scopes[0], scopes[1]
+    _prune_unreferenced_lhs_scope(u1, scope1, orig_lines1)
+    _prune_unreferenced_lhs_scope(u2, scope2, orig_lines2)
     scope = analyze_unit_variable_scope(
         u1,
         u2,
@@ -1050,6 +1129,7 @@ def synthesize_shared_helper_code(
         scope1=scope1,
         scope2=scope2,
     )
+
     if scope1.get("is_async") or scope2.get("is_async"):
         scope["is_async"] = True
 

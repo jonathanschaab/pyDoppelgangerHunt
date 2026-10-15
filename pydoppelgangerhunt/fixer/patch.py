@@ -84,9 +84,11 @@ from pydoppelgangerhunt.source_lines import (
 from pydoppelgangerhunt.fixer.synthesis import (
     _extract_augassign_unreferenced_target,
     _extract_required_typing_imports,
+    _extract_unreferenced_lhs_loads,
     _format_call_arguments,
     _is_subline_unit,
     _node_references_name,
+    _prune_unreferenced_lhs_scope,
     _should_prune_augassign_targets,
     synthesize_shared_helper_code,
 )
@@ -799,36 +801,42 @@ def _build_unit_delegation_call(
                 if len(parsed_body) != 1:
                     return ""
                 parsed_node = parsed_body[0]
+                unref_lhs: Set[str] = set()
                 if isinstance(parsed_node, ast.Assign) and parsed_node.targets:
                     targets_str = " = ".join(ast.unparse(t) for t in parsed_node.targets)
                     assign_prefix = f"{targets_str} = "
+                    unref_lhs = _extract_unreferenced_lhs_loads([unit_code])
                 elif isinstance(parsed_node, ast.AnnAssign) and parsed_node.value is not None:
                     target_str = ast.unparse(parsed_node.target)
                     anno_str = ast.unparse(parsed_node.annotation)
                     assign_prefix = f"{target_str}: {anno_str} = "
+                    unref_lhs = _extract_unreferenced_lhs_loads([unit_code])
                 elif isinstance(parsed_node, ast.AugAssign):
                     target_str = ast.unparse(parsed_node.target)
                     op_symbol = _AUGASSIGN_OPS.get(type(parsed_node.op), "+=")
                     assign_prefix = f"{target_str} {op_symbol} "
+                    unref_lhs = _extract_unreferenced_lhs_loads([unit_code])
                     if isinstance(parsed_node.target, ast.Name):
                         t_name = parsed_node.target.id
                         if not _node_references_name(parsed_node.value, t_name):
-                            if len(effective_targets) > len(inputs):
-                                pruned_eff = [x for x in effective_targets if x != t_name]
-                                if len(pruned_eff) == len(inputs):
-                                    pruned_args = _format_call_arguments(
-                                        inputs,
-                                        scope.get("param_details", []),
-                                        receiver_to_omit=unit_receiver_omit,
-                                        target_inputs=pruned_eff,
-                                    )
-                                    call_expr = f"{unit_call_prefix}{helper_name}({pruned_args})"
+                            unref_lhs.add(t_name)
                 elif isinstance(parsed_node, ast.Return):
                     assign_prefix = "return "
                 elif isinstance(parsed_node, ast.Expr):
                     assign_prefix = ""
+                if unref_lhs and len(effective_targets) > len(inputs):
+                    pruned_eff = [x for x in effective_targets if x not in unref_lhs]
+                    if len(pruned_eff) == len(inputs):
+                        pruned_args = _format_call_arguments(
+                            inputs,
+                            scope.get("param_details", []),
+                            receiver_to_omit=unit_receiver_omit,
+                            target_inputs=pruned_eff,
+                        )
+                        call_expr = f"{unit_call_prefix}{helper_name}({pruned_args})"
             except (SyntaxError, IndexError, ValueError):
                 pass
+
             if assign_prefix is None:
                 return ""
             rep_call = f"{indent}{assign_prefix}{await_prefix}{call_expr}\n"
@@ -2839,13 +2847,13 @@ def _unit_has_no_refactor_pragma(
             file_lines if file_lines is not None else split_source_lines(full_text)
         )
         start_idx = max(0, u_start - 1)
-        if start_idx > 0 and eff_lines[start_idx - 1].strip().startswith("#"):
+        while start_idx > 0 and eff_lines[start_idx - 1].strip().startswith("#"):
             start_idx -= 1
         for line in eff_lines[start_idx:u_end]:
-            stripped = line.strip()
-            if stripped.startswith("#") and _NO_REFACTOR_RE.search(stripped):
+            if _NO_REFACTOR_RE.search(line):
                 return True
         return False
+
 
 
 def _determine_unit_receiver_kind(
@@ -3199,6 +3207,38 @@ def _generate_refactoring_patch_impl(
 
             s1 = inspect_single_unit_scope(u1_eff, repo_root=str(root), tree=tree1)
             s2 = inspect_single_unit_scope(u2_eff, repo_root=str(root), tree=tree2)
+            t1_unref: Optional[str] = None
+            t2_unref: Optional[str] = None
+            if (
+                not _is_subline_unit(u1)
+                and not _is_subline_unit(u2)
+                and u1.get("kind") in ("comprehension", "complex_expr")
+                and u2.get("kind") in ("comprehension", "complex_expr")
+            ):
+                stmt_lines1 = _slice_unit_token_lines(
+                    u1_eff,
+                    _extract_unit_body_lines(
+                        u1_eff,
+                        [
+                            ln.rstrip("\r\n")
+                            for ln in extract_unit_source_code(u1_eff, repo_root=str(root))
+                        ],
+                    ),
+                )
+                stmt_lines2 = _slice_unit_token_lines(
+                    u2_eff,
+                    _extract_unit_body_lines(
+                        u2_eff,
+                        [
+                            ln.rstrip("\r\n")
+                            for ln in extract_unit_source_code(u2_eff, repo_root=str(root))
+                        ],
+                    ),
+                )
+                _prune_unreferenced_lhs_scope(u1_eff, s1, stmt_lines1)
+                _prune_unreferenced_lhs_scope(u2_eff, s2, stmt_lines2)
+                t1_unref = _extract_augassign_unreferenced_target(stmt_lines1)
+                t2_unref = _extract_augassign_unreferenced_target(stmt_lines2)
             if orig_fn1 and orig_fn1.get("is_async") and s1.get("has_yield"):
                 s1["is_async"] = True
             if orig_fn2 and orig_fn2.get("is_async") and s2.get("has_yield"):
@@ -3356,36 +3396,6 @@ def _generate_refactoring_patch_impl(
             u2_eff["outputs"] = target_outs2
             t_inputs1 = list(s1.get("inputs", []))
             t_inputs2 = list(s2.get("inputs", []))
-            t1_unref: Optional[str] = None
-            t2_unref: Optional[str] = None
-            if (
-                not _is_subline_unit(u1)
-                and not _is_subline_unit(u2)
-                and u1.get("kind") in ("comprehension", "complex_expr")
-                and u2.get("kind") in ("comprehension", "complex_expr")
-            ):
-                lines1 = _slice_unit_token_lines(
-                    u1_eff,
-                    _extract_unit_body_lines(
-                        u1_eff,
-                        [
-                            ln.rstrip("\r\n")
-                            for ln in extract_unit_source_code(u1_eff, repo_root=str(root))
-                        ],
-                    ),
-                )
-                lines2 = _slice_unit_token_lines(
-                    u2_eff,
-                    _extract_unit_body_lines(
-                        u2_eff,
-                        [
-                            ln.rstrip("\r\n")
-                            for ln in extract_unit_source_code(u2_eff, repo_root=str(root))
-                        ],
-                    ),
-                )
-                t1_unref = _extract_augassign_unreferenced_target(lines1)
-                t2_unref = _extract_augassign_unreferenced_target(lines2)
             if _should_prune_augassign_targets(
                 t1_unref, t2_unref, s1.get("inputs", []), s2.get("inputs", [])
             ):

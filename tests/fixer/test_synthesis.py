@@ -3423,3 +3423,41 @@ def test_normalize_pipe_unions_optional_pipe_none_flattened() -> None:
 
     res3 = _normalize_pipe_unions("Optional[int | str]")
     assert res3 == "Optional[Union[int, str]]"
+
+
+def test_infer_helper_return_type_cross_checks_is_async_iterator_prefixes() -> None:
+    """Verifies that _infer_helper_return_type does not return a synchronous Iterator[...]
+    for an async generator or an AsyncIterator[...] for a synchronous generator."""
+    # Async generator with stale sync resolved_ret="Iterator[int]"
+    res_async = _infer_helper_return_type(
+        resolved_ret="Iterator[int]",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={
+            "has_yield": True,
+            "has_yield_assignment": False,
+            "yield_expr_names": [("yield", "x")],
+            "has_return_value": False,
+        },
+        meta1={"x": {"type": "int"}},
+        meta2={"x": {"type": "int"}},
+        is_async=True,
+    )
+    assert res_async == "AsyncIterator[int]"
+
+    # Sync generator with stale async resolved_ret="AsyncIterator[str]"
+    res_sync = _infer_helper_return_type(
+        resolved_ret="AsyncIterator[str]",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={
+            "has_yield": True,
+            "has_yield_assignment": False,
+            "yield_expr_names": [("yield", "s")],
+            "has_return_value": False,
+        },
+        meta1={"s": {"type": "str"}},
+        meta2={"s": {"type": "str"}},
+        is_async=False,
+    )
+    assert res_sync == "Iterator[str]"

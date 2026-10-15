@@ -195,6 +195,18 @@ class _BaseScopeVisitor(ast.NodeVisitor):
     def visit_MatchAs(self, node: ast.AST) -> None:
         self.generic_visit(node)
 
+    @staticmethod
+    def _visit_type_alias_node(
+        node: ast.AST,
+        store_set: Set[str],
+        on_free_read: Callable[[str], None],
+    ) -> None:
+        name_node = getattr(node, "name", None)
+        if isinstance(name_node, ast.Name):
+            store_set.add(name_node.id)
+        for free in _extract_type_alias_free_reads(node):
+            on_free_read(free)
+
 
 class _FuncScopeVisitor(_BaseScopeVisitor):
     """Tracks local bindings and free variable loads escaping a nested function or lambda scope."""
@@ -246,10 +258,9 @@ class _FuncScopeVisitor(_BaseScopeVisitor):
         self._record_import_names(node, self.local_stores)
 
     def visit_TypeAlias(self, node: ast.AST) -> None:
-        name_node = getattr(node, "name", None)
-        if isinstance(name_node, ast.Name):
-            self.local_stores.add(name_node.id)
-        self.nested_free_reads.update(_extract_type_alias_free_reads(node))
+        self._visit_type_alias_node(
+            node, self.local_stores, self.nested_free_reads.add
+        )
 
 
 class _ClassScopeVisitor(_BaseScopeVisitor):
@@ -336,11 +347,9 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
         self._record_import_names(node, self.class_stores)
 
     def visit_TypeAlias(self, node: ast.AST) -> None:
-        name_node = getattr(node, "name", None)
-        if isinstance(name_node, ast.Name):
-            self.class_stores.add(name_node.id)
-        for name in _extract_type_alias_free_reads(node):
-            self._record_class_load(name)
+        self._visit_type_alias_node(
+            node, self.class_stores, self._record_class_load
+        )
 
 
 def _collect_func_args(args: ast.arguments) -> List[ast.arg]:
@@ -401,6 +410,8 @@ def _extract_type_alias_free_reads(node: ast.AST) -> Set[str]:
         if isinstance(getattr(tp, "name", None), str)
     }
     sub_visitor = _OuterExprVisitor()
+    for tp in getattr(node, "type_params", []):
+        sub_visitor.visit(tp)
     if hasattr(node, "value"):
         sub_visitor.visit(getattr(node, "value"))
     return sub_visitor.names - tp_names
@@ -680,16 +691,8 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
 
     def visit_TypeAlias(self, node: ast.AST) -> None:
         if self._should_inspect_read(node):
-            tp_names = {
-                getattr(tp, "name", None)
-                for tp in getattr(node, "type_params", [])
-                if isinstance(getattr(tp, "name", None), str)
-            }
-            if hasattr(node, "value"):
-                sub_visitor = _OuterExprVisitor()
-                sub_visitor.visit(getattr(node, "value"))
-                for name in sub_visitor.names - tp_names:
-                    self._record_downstream_read(name)
+            for name in _extract_type_alias_free_reads(node):
+                self._record_downstream_read(name)
             name_node = getattr(node, "name", None)
             if isinstance(name_node, ast.Name) and not self._is_in_comp(name_node.id):
                 self.killed.add(name_node.id)
@@ -1062,13 +1065,24 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         if not self._is_inside(node):
             self.generic_visit(node)
             return
-        if node.value is None:
-            return
-        self.visit(node.value)
-        if isinstance(node.target, ast.Name):
-            self.stored.add(node.target.id)
-        else:
+        self.visit(node.annotation)
+        if node.value is not None:
+            self.visit(node.value)
+            if isinstance(node.target, ast.Name):
+                self.stored.add(node.target.id)
+            else:
+                self.visit(node.target)
+        elif not isinstance(node.target, ast.Name):
             self.visit(node.target)
+
+    def visit_TypeAlias(self, node: ast.AST) -> None:
+        if not self._is_inside(node):
+            self.generic_visit(node)
+            return
+        self._visit_type_alias_node(
+            node, self.stored, self._record_live_in
+        )
+
 
     def visit_BoolOp(self, node: ast.BoolOp) -> None:
         if not self._is_inside(node):

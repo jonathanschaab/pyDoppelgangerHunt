@@ -1321,11 +1321,15 @@ def _get_tree_scope_intervals(
             )
             earliest_start = min(dec_start, n_start)
             intervals.append((earliest_start, n_end, n_end - earliest_start, node))
+    intervals.sort(
+        key=lambda item: (item[2], -item[0], -getattr(item[3], "col_offset", 0))
+    )
     try:
         setattr(tree, "_scope_intervals", intervals)
     except (AttributeError, TypeError):
         pass
     return intervals
+
 
 
 def _find_innermost_enclosing_node(
