@@ -13,6 +13,7 @@ from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
 from pydoppelgangerhunt.fixer.scope import analyze_unit_variable_scope
 from pydoppelgangerhunt.fixer.source import (
     _find_innermost_enclosing_node,
+    _get_tree_scope_intervals,
     _load_unit_file_text,
     is_subroutine_unit,
     parse_unit_coord,
@@ -266,33 +267,49 @@ def _get_enclosing_receiver_kind(fn_info: Optional[Dict[str, Any]]) -> str:
 
 
 def _find_innermost_ast_scope(
-    tree: ast.AST, u_start: int, u_end: int
+    tree: ast.AST,
+    u_start: int,
+    u_end: int,
+    *,
+    is_subroutine: bool = False,
 ) -> ast.AST:
     """Finds the innermost FunctionDef, AsyncFunctionDef, or ClassDef enclosing the unit bounds."""
-    best_node = tree
-    best_span = float("inf")
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            n_start = getattr(node, "lineno", None)
-            if n_start is None:
-                continue
-            n_end = getattr(node, "end_lineno", n_start) or n_start
-            if n_start <= u_start and u_end <= n_end:
-                span = n_end - n_start
-                if span < best_span:
-                    best_span = span
-                    best_node = node
-    return best_node
+    has_outer_fn = any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and earliest_start <= u_start <= u_end <= n_end
+        and not (
+            u_start in (earliest_start, getattr(node, "lineno", earliest_start))
+            and u_end == n_end
+        )
+        for earliest_start, n_end, _, node in _get_tree_scope_intervals(tree)
+    )
+    res = _find_innermost_enclosing_node(
+        "",
+        {
+            "start": u_start,
+            "end": u_end,
+            "is_subroutine": is_subroutine or has_outer_fn,
+        },
+        (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        tree=tree,
+    )
+    return res[0] if res is not None else tree
 
 
 def _unit_ast_has_async_or_yield(
-    tree: ast.AST, u_start: int, u_end: int
+    tree: ast.AST,
+    u_start: int,
+    u_end: int,
+    *,
+    is_subroutine: bool = False,
 ) -> Tuple[bool, bool]:
     """Detects whether AST statements within unit bounds contain yield or async operations."""
     has_yield = False
     has_await = False
 
-    root_node = _find_innermost_ast_scope(tree, u_start, u_end)
+    root_node = _find_innermost_ast_scope(
+        tree, u_start, u_end, is_subroutine=is_subroutine
+    )
     stack: List[ast.AST] = [root_node]
     while stack:
         node = stack.pop()
@@ -360,8 +377,19 @@ def _populate_unit_receiver_metadata(
     )
     if source is None:
         return
-    fn_meta = find_enclosing_function(source, unit, tree=tree)
-    cls_meta = find_enclosing_class(source, unit, tree=tree)
+    is_sub = is_subroutine_unit(unit, source_text=source, tree=tree) or unit.get("kind") in (
+        "comprehension",
+        "complex_expr",
+        "class",
+        "data_table",
+    )
+    lookup_unit = (
+        dict(unit, is_subroutine=True)
+        if (is_sub and unit.get("kind") != "class")
+        else unit
+    )
+    fn_meta = find_enclosing_function(source, lookup_unit, tree=tree)
+    cls_meta = find_enclosing_class(source, lookup_unit, tree=tree)
     if cls_meta:
         if "enclosing_class" not in unit:
             unit["enclosing_class"] = cls_meta["name"]
@@ -385,12 +413,6 @@ def _populate_unit_receiver_metadata(
     if "enclosing_is_async" not in unit:
         unit["enclosing_is_async"] = fn_is_async
     if "is_async" not in unit:
-        is_sub = is_subroutine_unit(unit, source_text=source, tree=tree) or unit.get("kind") in (
-            "comprehension",
-            "complex_expr",
-            "class",
-            "data_table",
-        )
         if is_sub:
             has_yield = bool(unit.get("has_yield"))
             has_await = bool(unit.get("has_await"))
@@ -400,7 +422,7 @@ def _populate_unit_receiver_metadata(
                     u_start = parse_unit_coord(unit, "start", default=1)
                     u_end = parse_unit_coord(unit, "end", default=u_start)
                     has_yield, has_await = _unit_ast_has_async_or_yield(
-                        parsed_tree, u_start, u_end
+                        parsed_tree, u_start, u_end, is_subroutine=True
                     )
             unit["is_async"] = fn_is_async if (has_yield or has_await) else False
         else:

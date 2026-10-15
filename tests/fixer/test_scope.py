@@ -1831,3 +1831,61 @@ def test_unit_ast_has_async_or_yield_nested_functions_and_classes() -> None:
     assert has_await3 is False
 
 
+def test_unit_ast_has_async_or_yield_coinciding_subroutine_and_same_line_class() -> None:
+    """Verifies that subroutine units coinciding with an inner def do not select the inner def
+    as their enclosing scope, and same-line class+method tie-breaks to the inner method."""
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=protected-access
+        _populate_unit_receiver_metadata,
+        _unit_ast_has_async_or_yield,
+    )
+
+    # 1. Subroutine unit inside async def outer() whose [u_start, u_end] coincides
+    # with a nested synchronous generator def inner_gen():
+    code_sub = (
+        "async def outer(x):\n"
+        "    def inner_gen():\n"
+        "        yield x\n"
+        "    return inner_gen\n"
+    )
+    tree_sub = ast.parse(code_sub)
+    has_yield, has_await = _unit_ast_has_async_or_yield(
+        tree_sub, 2, 3, is_subroutine=True
+    )
+    assert has_yield is False
+    assert has_await is False
+
+    unit_sub: Dict[str, Any] = {
+        "start": 2,
+        "end": 3,
+        "kind": "compound_block",
+        "name": "outer_sub",
+    }
+    _populate_unit_receiver_metadata(unit_sub, source_text=code_sub, tree=tree_sub)
+    assert unit_sub.get("enclosing_is_async") is True
+    assert not unit_sub.get("is_async")
+    assert not unit_sub.get("has_yield")
+
+
+    # 2. Same-span ClassDef and AsyncFunctionDef (e.g. synthetic/transformed AST with span == 0):
+    tree_same_span = ast.parse(
+        "class OneLine:\n    async def run(self): return await fetch()\n"
+    )
+    for n in ast.walk(tree_same_span):
+        if hasattr(n, "lineno"):
+            setattr(n, "lineno", 1)
+            setattr(n, "end_lineno", 1)
+    cls_node = tree_same_span.body[0]
+    assert isinstance(cls_node, ast.ClassDef)
+    fn_node = cls_node.body[0]
+    setattr(cls_node, "col_offset", 0)
+    setattr(fn_node, "col_offset", 15)
+    y_one, a_one = _unit_ast_has_async_or_yield(tree_same_span, 1, 1)
+    assert y_one is False
+    assert a_one is True
+
+
+
+
+
+
+

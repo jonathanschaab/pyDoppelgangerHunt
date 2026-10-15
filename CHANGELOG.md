@@ -179,13 +179,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in whole-line `complex_expr` units.
 - **Cached AST Propagation & Closure Traversal Optimization**: Forwarded `f1_plan.parsed_tree` and
   `f2_plan.parsed_tree` to `find_enclosing_class` and `find_enclosing_function` in `patch.py`, reused
-  `_get_or_parse_tree` in `synthesis.py` and `binding.py`, eliminated duplicate subtree walks in
+  `_get_or_parse_tree` in `synthesis.py` and `binding.py`, pre-checked `_NO_REFACTOR_RE` on
+  pre-materialized text in `_unit_has_no_refactor_pragma`, deduplicated `ClassDef` body traversal
+  in `_collect_scope_closures_uncached`, eliminated duplicate subtree walks in
   `_has_wildcard_star_import`, and isolated PEP 695 `TypeAlias` type parameters in
   `_extract_single_node_local_names` (`_df_closures.py`).
-- **Innermost Scope Traversal for Subroutine Async Detection**: In `_unit_ast_has_async_or_yield`
-  (`binding.py`), resolve the innermost enclosing AST scope via `_find_innermost_ast_scope` and
-  unconditionally prune nested functions, classes, and lambdas, ensuring inner coroutines or generators
-  are not falsely attributed to the unit.
+- **Whole-Line Comprehension Assignment Target & Indentation Preservation**: Unified
+  `target_unit.get("kind") in ("comprehension", "complex_expr")` in `_build_unit_delegation_call`
+  (`patch.py`), ensuring whole-line comprehension units retain their assignment target (`lhs = `),
+  leading indentation, trailing newline, and boundary pragmas while sub-line comprehensions continue
+  to emit inline expressions.
+- **Innermost Scope Selection & Subroutine Coinciding Bounds**: Delegated `_find_innermost_ast_scope`
+  (`binding.py`) to `_find_innermost_enclosing_node` (`source.py`), tie-breaking same-span inner
+  definitions by column offset and excluding nested `def`/`class` nodes whose line bounds coincide
+  with a subroutine body (`is_subroutine=True`) so nested generators do not pollute outer subroutine
+  async/yield metadata.
+- **Single-Line Enclosing Loop Retention for Sub-Line Units**: Updated `_find_enclosing_loops`
+  (`_df_hazards.py`) to retain single-line loops (`(l_start, l_end) == (u_start, u_end)`) when
+  sub-line column offsets (`u_start_col` or `u_end_col`) are present, enabling loop-carried read
+  detection on single-line loops.
 - **Loop-Carried Liveness in Enclosing Blocks**: Evaluates statement span `[start_line, stmt_end]`
   with base `_DownstreamReadVisitor` in `_scope_reads_outputs_after_line` (`dataflow.py`), correctly
   detecting loop-carried reads at the top of an enclosing loop prior to `with` / `try` blocks.

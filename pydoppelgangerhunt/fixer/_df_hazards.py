@@ -61,6 +61,8 @@ def _find_enclosing_loops(
     scope_node: ast.AST,
     u_start: int,
     u_end: int,
+    u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
 ) -> List[Tuple[int, int]]:
     """Detects loops enclosing the unit boundaries for loop-carried dependence analysis."""
     def _compute() -> List[Tuple[int, int]]:
@@ -77,10 +79,13 @@ def _find_enclosing_loops(
     cached_loops = _get_or_compute_scope_cached(
         _scope_loops_cache, scope_node, _compute
     )
+    has_subline_col = u_start_col is not None or u_end_col is not None
     return [
         (l_start, l_end)
         for l_start, l_end in cached_loops
-        if l_start <= u_start and u_end <= l_end and (l_start, l_end) != (u_start, u_end)
+        if l_start <= u_start
+        and u_end <= l_end
+        and ((l_start, l_end) != (u_start, u_end) or has_subline_col)
     ]
 
 
@@ -465,9 +470,14 @@ def collect_downstream_read_names(
         if scope_node is None:
             return None
 
-    enclosing_loops = _find_enclosing_loops(scope_node, u_start, u_end)
-
     u_start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
+    enclosing_loops = _find_enclosing_loops(
+        scope_node,
+        u_start,
+        u_end,
+        u_start_col=u_start_col,
+        u_end_col=_extract_unit_end_col(unit),
+    )
 
     if skip_pre_unit_closures:
         pre_unit_captured_reads: Set[str] = set()

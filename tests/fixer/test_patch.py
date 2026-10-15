@@ -10316,3 +10316,50 @@ def test_synthesize_shared_helper_code_unmapped_stmt_fails_closed(
     u_ann1 = {"file": "unmapped1.py", "start": 3, "end": 3, "name": "u1", "kind": "complex_expr"}
     u_ann2 = {"file": "unmapped2.py", "start": 3, "end": 3, "name": "u2", "kind": "complex_expr"}
     assert synthesize_shared_helper_code(u_ann1, u_ann2, repo_root=str(tmp_path)) == ""
+
+
+def test_whole_line_comprehension_preserves_assignment_target_and_indentation(
+    tmp_path: Path,
+) -> None:
+    """Verifies that whole-line comprehension units preserve their assignment target,
+    leading indentation, and trailing newline when replaced at call sites."""
+    src1 = (
+        "def f1(items: list[int]) -> list[int]:\n"
+        "    res = [x * 2 for x in items if x > 0]\n"
+        "    return res\n"
+    )
+    src2 = (
+        "def f2(items: list[int]) -> list[int]:\n"
+        "    out = [x * 2 for x in items if x > 0]\n"
+        "    return out\n"
+    )
+    f1 = tmp_path / "comp_whole1.py"
+    f2 = tmp_path / "comp_whole2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {
+        "file": "comp_whole1.py",
+        "start": 2,
+        "end": 2,
+        "name": "u1",
+        "kind": "comprehension",
+    }
+    u2 = {
+        "file": "comp_whole2.py",
+        "start": 2,
+        "end": 2,
+        "name": "u2",
+        "kind": "comprehension",
+    }
+
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "def _shared_u1_u2(items: Any) -> Any:" in patch
+    assert "+    return [x * 2 for x in items if x > 0]" in patch
+    assert "+    res = _shared_u1_u2(items)" in patch
+    assert "+    out = _shared_u1_u2(items)" in patch
+

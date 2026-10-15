@@ -1384,10 +1384,47 @@ def _find_innermost_enclosing_node(
                 if earliest_start <= u_start <= u_end <= n_end:
                     candidates.append((n_end - earliest_start, node, earliest_start, n_end))
 
+    is_sub_kind = bool(unit.get("is_subroutine")) or unit.get("kind") in (
+        "compound_block",
+        "sliding_window",
+        "clause_branch",
+        "comprehension",
+        "complex_expr",
+        "data_table",
+    )
+    if is_sub_kind and candidates:
+        u_start_col = _extract_slice_col_offset(
+            unit, ("start_col", "start_col_offset"), default=None
+        )
+        has_outer_fn = any(
+            isinstance(c_node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and not (
+                u_start in (c_earliest, getattr(c_node, "lineno", c_earliest))
+                and u_end == c_end
+            )
+            for _, c_node, c_earliest, c_end in candidates
+        )
+        filtered_cands = []
+        for item in candidates:
+            _, c_node, c_earliest, c_end = item
+            c_lineno = getattr(c_node, "lineno", c_earliest) or c_earliest
+            if u_start in (c_earliest, c_lineno) and u_end == c_end:
+                if c_lineno < c_end or isinstance(c_node, ast.ClassDef):
+                    continue
+                c_col = getattr(c_node, "col_offset", 0) or 0
+                if has_outer_fn and (
+                    u_start_col is None or u_start_col < 0 or u_start_col <= c_col
+                ):
+                    continue
+            filtered_cands.append(item)
+        candidates = filtered_cands
+
     if not candidates:
         return None
 
-    candidates.sort(key=lambda item: (item[0], -item[2]))
+    candidates.sort(
+        key=lambda item: (item[0], -item[2], -getattr(item[1], "col_offset", 0))
+    )
     _, matched_node, n_start, n_end = candidates[0]
     return matched_node, n_start, n_end
 

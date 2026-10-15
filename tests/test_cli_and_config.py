@@ -1263,10 +1263,16 @@ def test_batch_69_modular_decomposition(tmp_path: Path) -> None:
     )
     assert "x = self._shared_calc(a)" in call_inst
 
-    # Comprehension call
-    target_comp = {"kind": "comprehension", "start": 3, "end": 3}
-    call_comp = _build_unit_delegation_call(
-        target_comp,
+    # Comprehension call (sub-line and whole-line)
+    target_comp_sub = {
+        "kind": "comprehension",
+        "start": 3,
+        "end": 3,
+        "start_col": 12,
+        "end_col": 17,
+    }
+    call_comp_sub = _build_unit_delegation_call(
+        target_comp_sub,
         orig_code,
         orig_lines,
         effective_binding="module",
@@ -1275,7 +1281,21 @@ def test_batch_69_modular_decomposition(tmp_path: Path) -> None:
         outputs=[],
         scope=scope_inst,
     )
-    assert call_comp == "_shared_comp(a)"
+    assert call_comp_sub == "_shared_comp(a)"
+
+    target_comp_whole = {"kind": "comprehension", "start": 3, "end": 3}
+    call_comp_whole = _build_unit_delegation_call(
+        target_comp_whole,
+        orig_code,
+        orig_lines,
+        effective_binding="module",
+        helper_name="_shared_comp",
+        inputs=["a"],
+        outputs=[],
+        scope=scope_inst,
+    )
+    assert call_comp_whole == "        x = _shared_comp(a)\n"
+
 
 
 def test_toml_array_value_nested_2d_arrays(tmp_path: Path) -> None:

@@ -345,30 +345,7 @@ def _collect_scope_closures_uncached(
                     + list(getattr(stmt, "type_params", []))
                 )
                 _record_expr_closures(class_exprs, stmt_start, stmt_col)
-                for item in stmt.body:
-                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        i_start, i_col = _resolve_stmt_start_pos(item)
-                        closures.append(
-                            (
-                                _ClosurePos(i_start, i_col),
-                                _extract_nested_scope_free_reads(item),
-                            )
-                        )
-                    elif isinstance(item, ast.ClassDef):
-                        _walk_stmts([item])
-                    elif isinstance(item, ast.stmt):
-                        i_start, i_col = _resolve_stmt_start_pos(item)
-                        _record_expr_closures(
-                            _extract_header_nodes(item), i_start, i_col
-                        )
-                        for attr in ("body", "orelse", "finalbody"):
-                            sub_body = getattr(item, attr, None)
-                            if isinstance(sub_body, list):
-                                _walk_stmts(sub_body)
-                        for handler in getattr(item, "handlers", []):
-                            _walk_stmts(getattr(handler, "body", []))
-                        for case in getattr(item, "cases", []):
-                            _walk_stmts(getattr(case, "body", []))
+                _walk_stmts(stmt.body)
                 continue
 
             _record_expr_closures(_extract_header_nodes(stmt), stmt_start, stmt_col)

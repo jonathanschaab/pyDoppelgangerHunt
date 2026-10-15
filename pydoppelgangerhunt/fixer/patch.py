@@ -787,11 +787,7 @@ def _build_unit_delegation_call(
             has_yield=bool(scope.get("has_yield")),
         )
 
-    if target_unit.get("kind") == "comprehension":
-        call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
-        return f"{await_prefix}{call_expr}"
-
-    if target_unit.get("kind") == "complex_expr":
+    if target_unit.get("kind") in ("comprehension", "complex_expr"):
         call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
         if not _is_subline_unit(target_unit):
             u_end = max(u_start, parse_unit_coord(target_unit, "end", default=u_start))
@@ -2816,13 +2812,17 @@ _NO_REFACTOR_RE = re.compile(r"#\s*pragma\s*:\s*no[-_]refactor\b", re.IGNORECASE
 
 
 def _unit_has_no_refactor_pragma(
-    unit: Dict[str, Any], file_lines: Optional[Sequence[str]]
+    unit: Dict[str, Any],
+    file_lines: Optional[Sequence[str]],
+    orig_text: Optional[str] = None,
 ) -> bool:
     """Checks whether the unit contains a '# pragma: no-refactor' directive."""
-    if not file_lines:
+    if not file_lines and not orig_text:
+        return False
+    full_text = orig_text if orig_text is not None else "".join(file_lines or [])
+    if not _NO_REFACTOR_RE.search(full_text):
         return False
     u_start, u_end = resolve_unit_line_bounds(unit)
-    full_text = "".join(file_lines)
     try:
         comments = extract_unit_comments_and_pragmas(
             full_text, u_start, u_end, include_leading=True
@@ -2835,10 +2835,13 @@ def _unit_has_no_refactor_pragma(
             u_end,
             exc,
         )
+        eff_lines = (
+            file_lines if file_lines is not None else split_source_lines(full_text)
+        )
         start_idx = max(0, u_start - 1)
-        if start_idx > 0 and file_lines[start_idx - 1].strip().startswith("#"):
+        if start_idx > 0 and eff_lines[start_idx - 1].strip().startswith("#"):
             start_idx -= 1
-        for line in file_lines[start_idx:u_end]:
+        for line in eff_lines[start_idx:u_end]:
             stripped = line.strip()
             if stripped.startswith("#") and _NO_REFACTOR_RE.search(stripped):
                 return True
@@ -3076,9 +3079,14 @@ def _generate_refactoring_patch_impl(
             else:
                 u2_eff = dict(u2)
 
-            if _unit_has_no_refactor_pragma(u1, u1_lines) or _unit_has_no_refactor_pragma(
-                u2, u2_lines
-            ):
+            u2_text = (
+                orig_text
+                if is_same_file
+                else (f2_plan.orig_text if f2_plan is not None else None)
+            )
+            if _unit_has_no_refactor_pragma(
+                u1, u1_lines, orig_text=orig_text
+            ) or _unit_has_no_refactor_pragma(u2, u2_lines, orig_text=u2_text):
                 f1_disp = normalize_path_string(
                     str(u1.get("file") or "file1"), strip_anchor=False
                 )

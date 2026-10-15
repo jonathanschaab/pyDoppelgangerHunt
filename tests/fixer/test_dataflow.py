@@ -5165,3 +5165,26 @@ def test_has_wildcard_star_import_detached_vs_attached_scope() -> None:
 
     detached_star = ast.parse("def g():\n    from math import *\n    return 1\n").body[0]
     assert _has_wildcard_star_import(detached_star, mod_clean) is True
+
+
+def test_collect_downstream_read_names_single_line_enclosing_loop() -> None:
+    """Verifies that a single-line loop enclosing a sub-line unit is retained by
+    _find_enclosing_loops and detects loop-carried reads prior to the unit."""
+    _clear_downstream_reads_cache()
+    code = (
+        "def gen(items):\n"
+        "    for x in items: use(total); total = x; yield total\n"
+    )
+    # On line 2, 'total = x; yield total' starts at col 32
+    unit = {
+        "file": "single_line_loop.py",
+        "start": 2,
+        "end": 2,
+        "start_col": 32,
+        "end_col": 54,
+        "kind": "compound_block",
+    }
+    reads = collect_downstream_read_names(code, unit, candidates={"total", "x"})
+    assert reads is not None
+    assert "total" in reads
+
