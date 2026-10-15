@@ -5082,3 +5082,51 @@ def test_extract_unit_live_in_names_scope_node_at_unit_start() -> None:
     assert "b" in live_ins
 
 
+def test_extract_unit_live_in_names_outer_except_handler() -> None:
+    """Verifies that an exception variable bound by an enclosing except header before u_start
+    is recognized as a live-in when read inside the unit."""
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=protected-access
+        _extract_unit_live_in_names,
+    )
+
+    code = (
+        "def handle(action):\n"
+        "    try:\n"
+        "        action()\n"
+        "    except RuntimeError as err:\n"
+        "        msg = str(err)\n"
+        "        return msg\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    live_ins = _extract_unit_live_in_names(fn_node, u_start=5, u_end=6)
+    assert "err" in live_ins
+    assert "msg" not in live_ins
+
+
+@pytest.mark.skipif(sys.version_info < (3, 10), reason="match syntax requires Python 3.10+")
+def test_extract_unit_live_in_names_match_pattern_bindings() -> None:
+    """Verifies that structural pattern bindings inside a unit are recorded as stores
+    and not misclassified as live-in variables."""
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=protected-access
+        _extract_unit_live_in_names,
+    )
+
+    code = (
+        "def parse_event(event, bonus):\n"
+        "    match event:\n"
+        "        case [head, *tail]:\n"
+        "            res = head + len(tail) + bonus\n"
+        "        case {'key': val, **rest}:\n"
+        "            res = val + len(rest) + bonus\n"
+        "    return res\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    live_ins = _extract_unit_live_in_names(fn_node, u_start=2, u_end=7)
+    assert "event" in live_ins
+    assert "bonus" in live_ins
+    assert "head" not in live_ins
+    assert "tail" not in live_ins
+    assert "val" not in live_ins
+    assert "rest" not in live_ins

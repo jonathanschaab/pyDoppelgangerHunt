@@ -75,7 +75,9 @@ def _strip_stmt_target_lines(lines: Sequence[str]) -> List[str]:
     raw = dedent_source_text("\n".join(lines)).strip()
     try:
         parsed = ast.parse(raw).body
-        if parsed:
+        if len(parsed) > 1:
+            return list(lines)
+        if len(parsed) == 1:
             stmt = parsed[0]
             if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
                 if isinstance(stmt, ast.AnnAssign) and stmt.value is None:
@@ -96,7 +98,7 @@ def _extract_augassign_unreferenced_target(lines: Sequence[str]) -> Optional[str
     raw = dedent_source_text("\n".join(lines)).strip()
     try:
         parsed = ast.parse(raw).body
-        if parsed and isinstance(parsed[0], ast.AugAssign):
+        if len(parsed) == 1 and isinstance(parsed[0], ast.AugAssign):
             if isinstance(parsed[0].target, ast.Name):
                 target_name = parsed[0].target.id
                 if not _node_references_name(parsed[0].value, target_name):
@@ -112,6 +114,20 @@ def _is_subline_unit(unit: Dict[str, Any]) -> bool:
         unit.get(k) is not None
         for k in ("start_col", "end_col", "start_col_offset", "end_col_offset")
     )
+
+
+def _should_prune_augassign_targets(
+    t1_unref: Optional[str],
+    t2_unref: Optional[str],
+    raw_inputs1: Sequence[str],
+    raw_inputs2: Sequence[str],
+) -> bool:
+    """Returns True if both clones have unreferenced AugAssign targets without cross-RHS collision."""
+    if t1_unref is None or t2_unref is None:
+        return False
+    rhs1 = [x for x in raw_inputs1 if x != t1_unref]
+    rhs2 = [x for x in raw_inputs2 if x != t2_unref]
+    return t1_unref not in rhs2 and t2_unref not in rhs1
 
 
 def _format_call_arguments(
@@ -1064,14 +1080,10 @@ def synthesize_shared_helper_code(
     ):
         t1_unref = _extract_augassign_unreferenced_target(orig_lines1)
         t2_unref = _extract_augassign_unreferenced_target(orig_lines2)
-    raw_inputs1 = list(scope1.get("inputs", []))
-    raw_inputs2 = list(scope2.get("inputs", []))
-    if (
-        t1_unref is not None
-        and t2_unref is not None
-        and t1_unref not in raw_inputs2
-        and t2_unref not in raw_inputs1
-    ):
+    prune_augassign_target = _should_prune_augassign_targets(
+        t1_unref, t2_unref, scope1.get("inputs", []), scope2.get("inputs", [])
+    )
+    if prune_augassign_target:
         inputs = [x for x in inputs if x != t1_unref]
 
     def _unit_receiver_kind(u: Dict[str, Any], u_scope: Dict[str, Any]) -> str:
@@ -1168,7 +1180,7 @@ def synthesize_shared_helper_code(
         indent = "    "
 
     inputs2 = list(scope2.get("inputs", []))
-    if t1_unref is not None and t2_unref is not None:
+    if prune_augassign_target:
         inputs2 = [x for x in inputs2 if x != t2_unref]
     if effective_binding == "module":
         inputs2 = _prune_unshared_receivers(inputs2, u2, u1, scope2, scope1, repo_root=repo_root)
@@ -1302,7 +1314,9 @@ def synthesize_shared_helper_code(
             stripped_expr: Optional[str] = None
             try:
                 parsed_body = ast.parse(full_code).body
-                if parsed_body:
+                if len(parsed_body) > 1:
+                    return ""
+                if len(parsed_body) == 1:
                     stmt_node = parsed_body[0]
                     if isinstance(stmt_node, ast.Assign):
                         stripped_expr = ast.unparse(stmt_node.value)

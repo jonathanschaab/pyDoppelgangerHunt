@@ -10231,13 +10231,64 @@ def test_subline_complex_expr_not_treated_as_augassign_target(tmp_path: Path) ->
     assert "total" not in helper_code
 
 
+def test_augassign_target_pruning_same_name_across_clones(tmp_path: Path) -> None:
+    """Verifies that when both clones use the same unreferenced AugAssign target name,
+    the target is pruned from both inputs and inputs2 without desynchronization."""
+    src1 = (
+        "def func1(total: int, a: int, b: int) -> int:\n"
+        "    total += a - b\n"
+        "    return total\n"
+    )
+    src2 = (
+        "def func2(total: int, a: int, b: int) -> int:\n"
+        "    total += a - b\n"
+        "    return total\n"
+    )
+    f1 = tmp_path / "same_aug1.py"
+    f2 = tmp_path / "same_aug2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": "same_aug1.py", "start": 2, "end": 2, "name": "u1", "kind": "complex_expr"}
+    u2 = {"file": "same_aug2.py", "start": 2, "end": 2, "name": "u2", "kind": "complex_expr"}
+
+    helper_code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "def _shared_u1_u2(a: Any, b: Any) -> Any:" in helper_code
+    assert "total" not in helper_code
+
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "def _shared_u1_u2(a: Any, b: Any) -> Any:" in patch
+    assert "+    total += _shared_u1_u2(a, b)" in patch
 
 
+def test_whole_line_complex_expr_semicolon_multiple_statements_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Verifies that whole-line complex_expr units containing semicolon-separated statements
+    fail closed rather than silently dropping trailing statements."""
+    src = (
+        "def run(a: int, b: int) -> int:\n"
+        "    x = a + b; side_effect()\n"
+        "    return x\n"
+    )
+    f1 = tmp_path / "semi1.py"
+    f2 = tmp_path / "semi2.py"
+    f1.write_text(src, encoding="utf-8")
+    f2.write_text(src, encoding="utf-8")
 
+    u1 = {"file": "semi1.py", "start": 2, "end": 2, "name": "u1", "kind": "complex_expr"}
+    u2 = {"file": "semi2.py", "start": 2, "end": 2, "name": "u2", "kind": "complex_expr"}
 
-
-
-
-
-
-
+    assert synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path)) == ""
+    assert (
+        generate_refactoring_patch(
+            [(0.95, u1, u2)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+        )
+        == ""
+    )

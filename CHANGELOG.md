@@ -169,10 +169,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Compound Statement Branch State Isolation in Unit Live-Ins**: In `_UnitLiveInVisitor` and
   `_extract_unit_live_in_names` (`_df_visitors.py`), iterate scope statements directly and maintain
   branch store isolation across `for`, `while`, `try`, `with`, and `match` blocks even when the compound
-  statement header begins before `u_start`.
+  statement header begins before `u_start`. Guard `ExceptHandler.name` binding with `_is_inside(h)` and
+  record `MatchAs`/`MatchStar`/`MatchMapping` pattern bindings inside unit bounds via `visit_MatchAs`.
 - **AugAssign Target Pruning Cross-Unit Collision & Sub-Line Slicing**: In `patch.py` and `synthesis.py`,
   guard AugAssign target pruning against subline units via `_is_subline_unit` and token line slicing,
-  and skip pruning when partner clone inputs collide with target variable names to prevent parameter swapping.
+  exclude each unit's own unreferenced target via `_should_prune_augassign_targets` when checking for
+  RHS input collisions across clones (supporting same-name targets without desynchronizing `inputs` vs `inputs2`),
+  and fail closed on multi-statement semicolon lines in whole-line `complex_expr` units.
 - **Innermost Scope Traversal for Subroutine Async Detection**: In `_unit_ast_has_async_or_yield`
   (`binding.py`), resolve the innermost enclosing AST scope via `_find_innermost_ast_scope` and
   unconditionally prune nested functions, classes, and lambdas, ensuring inner coroutines or generators

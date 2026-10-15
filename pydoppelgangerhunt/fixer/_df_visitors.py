@@ -1174,7 +1174,7 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
             if h_type is not None:
                 self.visit(h_type)
             name_val = getattr(h, "name", None)
-            if isinstance(name_val, str):
+            if isinstance(name_val, str) and self._is_inside(h):
                 self.stored.add(name_val)
             for s in getattr(h, "body", []):
                 self.visit(s)
@@ -1208,6 +1208,12 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
             lambda: self.stored,
             lambda s: setattr(self, "stored", s),
         )
+
+    def visit_MatchAs(self, node: ast.AST) -> None:
+        if self._is_inside(node):
+            self._record_pattern_binding(node, self.stored)
+        else:
+            self.generic_visit(node)
 
 
 def _extract_unit_live_in_names(

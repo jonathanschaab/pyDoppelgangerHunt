@@ -87,6 +87,7 @@ from pydoppelgangerhunt.fixer.synthesis import (
     _format_call_arguments,
     _is_subline_unit,
     _node_references_name,
+    _should_prune_augassign_targets,
     synthesize_shared_helper_code,
 )
 
@@ -798,7 +799,10 @@ def _build_unit_delegation_call(
             unit_code = dedent_source_text(raw_block).strip()
             assign_prefix: Optional[str] = None
             try:
-                parsed_node = ast.parse(unit_code).body[0]
+                parsed_body = ast.parse(unit_code).body
+                if len(parsed_body) != 1:
+                    return ""
+                parsed_node = parsed_body[0]
                 if isinstance(parsed_node, ast.Assign) and parsed_node.targets:
                     targets_str = " = ".join(ast.unparse(t) for t in parsed_node.targets)
                     assign_prefix = f"{targets_str} = "
@@ -3370,13 +3374,8 @@ def _generate_refactoring_patch_impl(
                 )
                 t1_unref = _extract_augassign_unreferenced_target(lines1)
                 t2_unref = _extract_augassign_unreferenced_target(lines2)
-            raw_inputs1 = list(s1.get("inputs", []))
-            raw_inputs2 = list(s2.get("inputs", []))
-            if (
-                t1_unref is not None
-                and t2_unref is not None
-                and t1_unref not in raw_inputs2
-                and t2_unref not in raw_inputs1
+            if _should_prune_augassign_targets(
+                t1_unref, t2_unref, s1.get("inputs", []), s2.get("inputs", [])
             ):
                 t_inputs1 = [x for x in t_inputs1 if x != t1_unref]
                 t_inputs2 = [x for x in t_inputs2 if x != t2_unref]
