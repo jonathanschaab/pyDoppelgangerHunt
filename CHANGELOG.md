@@ -271,10 +271,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_UnitLiveInVisitor` (`_df_visitors.py`) to visit `AnnAssign.annotation`, bare subscript/attribute
   targets (`arr[idx]: int`), and PEP 695 `TypeAlias` statements (including type parameter bounds
   and defaults via `_extract_type_alias_free_reads`) while isolating lexical `type_params`.
-- **Whole-Line Subscript and Attribute LHS Load Pruning**: Added `_extract_unreferenced_lhs_loads`
-  and `_prune_unreferenced_lhs_scope` (`synthesis.py`, `patch.py`) to prune LHS-only `ast.Load`
-  identifiers and receiver attributes (`arr[i] = ...`, `self.cache[k] = ...`, `res: MyType = ...`)
-  from whole-line `"comprehension"` and `"complex_expr"` units.
+- **Whole-Line Subscript and Attribute LHS Load Pruning**: Added `_extract_unreferenced_lhs_loads`,
+  `_prune_unreferenced_lhs_scope`, and `_prune_pair_lhs_and_augassign_scopes` (`synthesis.py`,
+  `patch.py`) to prune LHS-only `ast.Load` identifiers and receiver attributes (`arr[i] = ...`,
+  `self.cache[k] = ...`, `res: MyType = ...`), recompute receiver binding flags
+  (`has_instance_binding`, `has_class_binding`, `has_receiver_access`, `binding_kind`), and allow
+  asymmetric `AugAssign` vs. `Assign` target pruning when RHS arities match.
 - **Sync vs. Async Iterator Return Annotation Cross-Check**: Guarded early-return iterator
   prefixes in `_infer_helper_return_type` (`synthesis.py`) with `is_async` so synchronous
   `Iterator[...]`/`Generator[...]`/`Iterable[...]` annotations are not emitted for `async def`
@@ -285,6 +287,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are detected even if tokenization fails.
 - **Sorted AST Scope Intervals Cache**: Sorted `intervals` by `(span, -start, -col_offset)` before
   caching on `tree._scope_intervals` in `_get_tree_scope_intervals` (`source.py`).
+- **Enclosing Scope PEP 695 `type_params` Shadowing**: Updated `_extract_single_node_local_names`
+  (`_df_closures.py`) to record `scope_node.type_params` names so generic function/class type
+  parameters shadowing built-ins (e.g., `def compute[sum](items):`) are included in `shadowed_names`.
+- **Lenient Closure Log Level Alignment**: Downgraded the internal `skip_pre_unit_closures=True`
+  log in `collect_downstream_read_names` (`_df_hazards.py`) from `logger.warning` to `logger.debug`
+  to avoid duplicate/elevated warning messages alongside the CLI `INFO` notice.
 
 ## [1.0.0] - 2026-09-20
 ### Added

@@ -5239,3 +5239,51 @@ def test_extract_unit_live_in_names_pep695_type_alias() -> None:
     assert "MyMap" not in live_ins
     assert "K" not in live_ins
     assert "V" not in live_ins
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 syntax requires Python 3.12+")
+def test_extract_single_node_local_names_includes_own_type_params() -> None:
+    """Verifies that _extract_single_node_local_names includes scope_node's own PEP 695
+    type_params so generic type parameters shadowing built-ins are detected."""
+    from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=protected-access
+        _extract_single_node_local_names,
+    )
+
+    code = (
+        "def compute[sum](items):\n"
+        "    return sum(x for x in items)\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    local_names = _extract_single_node_local_names(fn_node)
+    assert "sum" in local_names
+    assert "items" in local_names
+
+
+def test_collect_downstream_read_names_lenient_closure_logs_at_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies that collect_downstream_read_names with skip_pre_unit_closures=True
+    logs at DEBUG rather than WARNING."""
+    import logging
+
+    _clear_downstream_reads_cache()
+    code = (
+        "def f():\n"
+        "    x = 1\n"
+        "    return x\n"
+    )
+    unit = {"file": "mod.py", "start": 2, "end": 2}
+    with caplog.at_level(logging.DEBUG, logger="pydoppelgangerhunt"):
+        reads = collect_downstream_read_names(
+            code, unit, candidates={"x"}, skip_pre_unit_closures=True
+        )
+    assert reads == {"x"}
+    warning_msgs = [
+        r.message for r in caplog.records if r.levelno >= logging.WARNING
+    ]
+    assert not any("Lenient closure mode active" in m for m in warning_msgs)
+    debug_msgs = [
+        r.message for r in caplog.records if r.levelno == logging.DEBUG
+    ]
+    assert any("Lenient closure mode active" in m for m in debug_msgs)

@@ -10457,3 +10457,77 @@ def test_unit_has_no_refactor_pragma_fallback_inline_and_multiline_leading(
     ]
     u_multiline = {"start": 3, "end": 4}
     assert _unit_has_no_refactor_pragma(u_multiline, lines_multiline) is True
+
+
+def test_whole_line_complex_expr_lhs_receiver_pruned_across_method_and_function(
+    tmp_path: Path,
+) -> None:
+    """Verifies that when self appears only on the LHS of an instance method's whole-line
+    complex_expr, receiver binding flags are recomputed so it pairs cleanly with a
+    top-level function or staticmethod."""
+    src_method = (
+        "class Worker:\n"
+        "    def store(self, k: str, a: int, b: int) -> None:\n"
+        "        self.cache[k] = (a + b) * (a - b)\n"
+    )
+    src_func = (
+        "def standalone_calc(a: int, b: int) -> int:\n"
+        "    res = (a + b) * (a - b)\n"
+        "    return res\n"
+    )
+    f1 = tmp_path / "rec_method.py"
+    f2 = tmp_path / "rec_func.py"
+    f1.write_text(src_method, encoding="utf-8")
+    f2.write_text(src_func, encoding="utf-8")
+
+    u1 = {"file": "rec_method.py", "start": 3, "end": 3, "name": "u1", "kind": "complex_expr"}
+    u2 = {"file": "rec_func.py", "start": 2, "end": 2, "name": "u2", "kind": "complex_expr"}
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "def _shared_u1_u2(a: Any, b: Any) -> Any:" in helper
+
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "def _shared_u1_u2(a: Any, b: Any) -> Any:" in patch
+    assert "+        self.cache[k] = _shared_u1_u2(a, b)" in patch
+    assert "+    res = _shared_u1_u2(a, b)" in patch
+
+
+def test_asymmetric_augassign_vs_assign_whole_line_complex_expr_refactored(
+    tmp_path: Path,
+) -> None:
+    """Verifies that a whole-line complex_expr with AugAssign (total += a + b) paired
+    with a regular Assign (res = a + b) prunes the unreferenced AugAssign target and
+    refactors both call sites."""
+    src1 = (
+        "def accumulate(total: int, a: int, b: int) -> int:\n"
+        "    total += (a + b) * 2\n"
+        "    return total\n"
+    )
+    src2 = (
+        "def compute_once(a: int, b: int) -> int:\n"
+        "    res = (a + b) * 2\n"
+        "    return res\n"
+    )
+    f1 = tmp_path / "asym_aug1.py"
+    f2 = tmp_path / "asym_aug2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": "asym_aug1.py", "start": 2, "end": 2, "name": "u1", "kind": "complex_expr"}
+    u2 = {"file": "asym_aug2.py", "start": 2, "end": 2, "name": "u2", "kind": "complex_expr"}
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "def _shared_u1_u2(a: Any, b: Any) -> Any:" in helper
+
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "def _shared_u1_u2(a: Any, b: Any) -> Any:" in patch
+    assert "+    total += _shared_u1_u2(a, b)" in patch
+    assert "+    res = _shared_u1_u2(a, b)" in patch

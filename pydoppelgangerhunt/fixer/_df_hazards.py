@@ -484,7 +484,7 @@ def collect_downstream_read_names(
         with _downstream_cache_lock:
             if not _warned_lenient_closure[0]:
                 _warned_lenient_closure[0] = True
-                logger.warning(
+                logger.debug(
                     "Lenient closure mode active: suppressed pre-unit "
                     "closure read capture; escaping callback mutations "
                     "may be unobserved"

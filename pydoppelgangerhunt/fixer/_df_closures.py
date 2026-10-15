@@ -83,6 +83,12 @@ def _extract_single_node_local_names(scope_node: ast.AST) -> Set[str]:
     if isinstance(node_name, str):
         names.add(node_name)
 
+    names.update(
+        tp.name
+        for tp in getattr(scope_node, "type_params", [])
+        if isinstance(getattr(tp, "name", None), str)
+    )
+
     node_args = getattr(scope_node, "args", None)
     if isinstance(node_args, ast.arguments):
         names.update(_extract_arg_names(node_args))

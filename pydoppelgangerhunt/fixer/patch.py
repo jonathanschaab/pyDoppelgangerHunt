@@ -82,14 +82,12 @@ from pydoppelgangerhunt.source_lines import (
     resolve_unit_line_bounds,
 )
 from pydoppelgangerhunt.fixer.synthesis import (
-    _extract_augassign_unreferenced_target,
     _extract_required_typing_imports,
     _extract_unreferenced_lhs_loads,
     _format_call_arguments,
     _is_subline_unit,
     _node_references_name,
-    _prune_unreferenced_lhs_scope,
-    _should_prune_augassign_targets,
+    _prune_pair_lhs_and_augassign_scopes,
     synthesize_shared_helper_code,
 )
 
@@ -3207,14 +3205,9 @@ def _generate_refactoring_patch_impl(
 
             s1 = inspect_single_unit_scope(u1_eff, repo_root=str(root), tree=tree1)
             s2 = inspect_single_unit_scope(u2_eff, repo_root=str(root), tree=tree2)
-            t1_unref: Optional[str] = None
-            t2_unref: Optional[str] = None
-            if (
-                not _is_subline_unit(u1)
-                and not _is_subline_unit(u2)
-                and u1.get("kind") in ("comprehension", "complex_expr")
-                and u2.get("kind") in ("comprehension", "complex_expr")
-            ):
+            if u1.get("kind") in ("comprehension", "complex_expr") or u2.get(
+                "kind"
+            ) in ("comprehension", "complex_expr"):
                 stmt_lines1 = _slice_unit_token_lines(
                     u1_eff,
                     _extract_unit_body_lines(
@@ -3235,10 +3228,9 @@ def _generate_refactoring_patch_impl(
                         ],
                     ),
                 )
-                _prune_unreferenced_lhs_scope(u1_eff, s1, stmt_lines1)
-                _prune_unreferenced_lhs_scope(u2_eff, s2, stmt_lines2)
-                t1_unref = _extract_augassign_unreferenced_target(stmt_lines1)
-                t2_unref = _extract_augassign_unreferenced_target(stmt_lines2)
+                _prune_pair_lhs_and_augassign_scopes(
+                    u1_eff, u2_eff, s1, s2, stmt_lines1, stmt_lines2
+                )
             if orig_fn1 and orig_fn1.get("is_async") and s1.get("has_yield"):
                 s1["is_async"] = True
             if orig_fn2 and orig_fn2.get("is_async") and s2.get("has_yield"):
@@ -3396,12 +3388,6 @@ def _generate_refactoring_patch_impl(
             u2_eff["outputs"] = target_outs2
             t_inputs1 = list(s1.get("inputs", []))
             t_inputs2 = list(s2.get("inputs", []))
-            if _should_prune_augassign_targets(
-                t1_unref, t2_unref, s1.get("inputs", []), s2.get("inputs", [])
-            ):
-                t_inputs1 = [x for x in t_inputs1 if x != t1_unref]
-                t_inputs2 = [x for x in t_inputs2 if x != t2_unref]
-                inputs = [x for x in inputs if x != t1_unref]
             if effective_binding == "module":
                 t_inputs1 = _prune_unshared_receivers(
                     t_inputs1, u1_eff, u2_eff, s1, s2, repo_root=str(root)

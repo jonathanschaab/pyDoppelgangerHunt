@@ -123,12 +123,24 @@ def _should_prune_augassign_targets(
     raw_inputs1: Sequence[str],
     raw_inputs2: Sequence[str],
 ) -> bool:
-    """Returns True if both clones have unreferenced AugAssign targets without cross-RHS collision."""
-    if t1_unref is None or t2_unref is None:
+    """Returns True if unreferenced AugAssign targets can be pruned with matching RHS arity."""
+    if t1_unref is None and t2_unref is None:
         return False
-    rhs1 = [x for x in raw_inputs1 if x != t1_unref]
-    rhs2 = [x for x in raw_inputs2 if x != t2_unref]
-    return t1_unref not in rhs2 and t2_unref not in rhs1
+    rhs1 = (
+        [x for x in raw_inputs1 if x != t1_unref]
+        if t1_unref is not None
+        else list(raw_inputs1)
+    )
+    rhs2 = (
+        [x for x in raw_inputs2 if x != t2_unref]
+        if t2_unref is not None
+        else list(raw_inputs2)
+    )
+    if len(rhs1) != len(rhs2):
+        return False
+    return (t1_unref is None or t1_unref not in rhs2) and (
+        t2_unref is None or t2_unref not in rhs1
+    )
 
 
 def _extract_unreferenced_lhs_loads(lines: Sequence[str]) -> Set[str]:
@@ -197,6 +209,50 @@ def _prune_unreferenced_lhs_scope(
                 scope_dict[attr_key] = [
                     a for a in scope_dict[attr_key] if not str(a).startswith(prefix)
                 ]
+    has_inst = bool(scope_dict.get("instance_attrs")) or any(
+        x in ("self", unit.get("receiver_param")) for x in scope_dict.get("inputs", [])
+    )
+    has_cls = bool(scope_dict.get("class_attrs")) or (
+        "cls" in scope_dict.get("inputs", [])
+    )
+    scope_dict["has_instance_binding"] = has_inst
+    scope_dict["has_class_binding"] = has_cls
+    scope_dict["has_receiver_access"] = has_inst or has_cls
+    scope_dict["binding_kind"] = (
+        "instance" if has_inst else ("class" if has_cls else "free")
+    )
+
+
+def _prune_pair_lhs_and_augassign_scopes(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    scope1: Dict[str, Any],
+    scope2: Dict[str, Any],
+    lines1: Sequence[str],
+    lines2: Sequence[str],
+) -> None:
+    """Prunes unreferenced LHS loads and AugAssign targets from clone pair scopes in-place."""
+    _prune_unreferenced_lhs_scope(u1, scope1, lines1)
+    _prune_unreferenced_lhs_scope(u2, scope2, lines2)
+    t1_unref = (
+        _extract_augassign_unreferenced_target(lines1)
+        if not _is_subline_unit(u1)
+        and u1.get("kind") in ("comprehension", "complex_expr")
+        else None
+    )
+    t2_unref = (
+        _extract_augassign_unreferenced_target(lines2)
+        if not _is_subline_unit(u2)
+        and u2.get("kind") in ("comprehension", "complex_expr")
+        else None
+    )
+    if _should_prune_augassign_targets(
+        t1_unref, t2_unref, scope1.get("inputs", []), scope2.get("inputs", [])
+    ):
+        if t1_unref is not None and "inputs" in scope1:
+            scope1["inputs"] = [x for x in scope1["inputs"] if x != t1_unref]
+        if t2_unref is not None and "inputs" in scope2:
+            scope2["inputs"] = [x for x in scope2["inputs"] if x != t2_unref]
 
 
 
@@ -1118,8 +1174,9 @@ def synthesize_shared_helper_code(
             u_item["is_async"] = True
         scopes.append(s_item)
     scope1, scope2 = scopes[0], scopes[1]
-    _prune_unreferenced_lhs_scope(u1, scope1, orig_lines1)
-    _prune_unreferenced_lhs_scope(u2, scope2, orig_lines2)
+    _prune_pair_lhs_and_augassign_scopes(
+        u1, u2, scope1, scope2, orig_lines1, orig_lines2
+    )
     scope = analyze_unit_variable_scope(
         u1,
         u2,
@@ -1148,21 +1205,6 @@ def synthesize_shared_helper_code(
     )
 
     inputs = list(scope["inputs"])
-    t1_unref: Optional[str] = None
-    t2_unref: Optional[str] = None
-    if (
-        not _is_subline_unit(u1)
-        and not _is_subline_unit(u2)
-        and u1.get("kind") in ("comprehension", "complex_expr")
-        and u2.get("kind") in ("comprehension", "complex_expr")
-    ):
-        t1_unref = _extract_augassign_unreferenced_target(orig_lines1)
-        t2_unref = _extract_augassign_unreferenced_target(orig_lines2)
-    prune_augassign_target = _should_prune_augassign_targets(
-        t1_unref, t2_unref, scope1.get("inputs", []), scope2.get("inputs", [])
-    )
-    if prune_augassign_target:
-        inputs = [x for x in inputs if x != t1_unref]
 
     def _unit_receiver_kind(u: Dict[str, Any], u_scope: Dict[str, Any]) -> str:
         if u.get("receiver_kind"):
@@ -1258,8 +1300,6 @@ def synthesize_shared_helper_code(
         indent = "    "
 
     inputs2 = list(scope2.get("inputs", []))
-    if prune_augassign_target:
-        inputs2 = [x for x in inputs2 if x != t2_unref]
     if effective_binding == "module":
         inputs2 = _prune_unshared_receivers(inputs2, u2, u1, scope2, scope1, repo_root=repo_root)
 
