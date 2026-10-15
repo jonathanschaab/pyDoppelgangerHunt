@@ -175,7 +175,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guard AugAssign target pruning against subline units via `_is_subline_unit` and token line slicing,
   exclude each unit's own unreferenced target via `_should_prune_augassign_targets` when checking for
   RHS input collisions across clones (supporting same-name targets without desynchronizing `inputs` vs `inputs2`),
-  and fail closed on multi-statement semicolon lines in whole-line `complex_expr` units.
+  and fail closed on multi-statement semicolon lines and unmapped statement kinds (`ast.Assert`, bare `ast.AnnAssign`)
+  in whole-line `complex_expr` units.
+- **Cached AST Propagation & Closure Traversal Optimization**: Forwarded `f1_plan.parsed_tree` and
+  `f2_plan.parsed_tree` to `find_enclosing_class` and `find_enclosing_function` in `patch.py`, reused
+  `_get_or_parse_tree` in `synthesis.py` and `binding.py`, eliminated duplicate subtree walks in
+  `_has_wildcard_star_import`, and isolated PEP 695 `TypeAlias` type parameters in
+  `_extract_single_node_local_names` (`_df_closures.py`).
 - **Innermost Scope Traversal for Subroutine Async Detection**: In `_unit_ast_has_async_or_yield`
   (`binding.py`), resolve the innermost enclosing AST scope via `_find_innermost_ast_scope` and
   unconditionally prune nested functions, classes, and lambdas, ensuring inner coroutines or generators

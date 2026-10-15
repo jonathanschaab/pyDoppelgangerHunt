@@ -18,6 +18,7 @@ from pydoppelgangerhunt.fixer.binding import (
     _prune_unshared_receivers,
     _resolve_effective_binding,
 )
+from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
 from pydoppelgangerhunt.fixer.dataflow import (
     _load_unit_file_text,
     has_async_generator_delegation_hazard,
@@ -1017,10 +1018,7 @@ def synthesize_shared_helper_code(
             return given_tree
         raw_text = given_src or _load_unit_file_text(unit, repo_root=repo_root)
         if raw_text:
-            try:
-                return ast.parse(raw_text)
-            except (SyntaxError, ValueError):
-                pass
+            return _get_or_parse_tree(raw_text)
         return None
 
     tree1 = _resolve_tree(tree1, source_text1, u1)
@@ -1330,8 +1328,10 @@ def synthesize_shared_helper_code(
                             if stmt_node.value is not None
                             else "None"
                         )
-                    else:
+                    elif isinstance(stmt_node, ast.Expr):
                         stripped_expr = full_code
+                    else:
+                        return ""
             except (SyntaxError, IndexError):
                 pass
 

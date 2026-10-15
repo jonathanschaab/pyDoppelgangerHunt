@@ -3028,15 +3028,15 @@ def _generate_refactoring_patch_impl(
             elif _is_same_file_path(f1_raw, f2_raw, repo_root=str(root)):
                 is_same_file = True
 
-            enc1 = find_enclosing_class(orig_text, u1)
-            fn1 = find_enclosing_function(orig_text, u1)
+            enc1 = find_enclosing_class(orig_text, u1, tree=f1_plan.parsed_tree)
+            fn1 = find_enclosing_function(orig_text, u1, tree=f1_plan.parsed_tree)
 
             enc2 = None
             fn2 = None
             f2_plan: Optional[_FilePatchPlan] = None
             if is_same_file:
-                enc2 = find_enclosing_class(orig_text, u2)
-                fn2 = find_enclosing_function(orig_text, u2)
+                enc2 = find_enclosing_class(orig_text, u2, tree=f1_plan.parsed_tree)
+                fn2 = find_enclosing_function(orig_text, u2, tree=f1_plan.parsed_tree)
             elif f2_raw:
                 if f2_path is not None:
                     rel_f2 = _format_patch_relative_path(f2_path, patch_root, fs_root)
@@ -3051,8 +3051,12 @@ def _generate_refactoring_patch_impl(
                         skip_reasons["unreadable file"] += 1
                         continue
                     if f2_plan is not None:
-                        enc2 = find_enclosing_class(f2_plan.orig_text, u2)
-                        fn2 = find_enclosing_function(f2_plan.orig_text, u2)
+                        enc2 = find_enclosing_class(
+                            f2_plan.orig_text, u2, tree=f2_plan.parsed_tree
+                        )
+                        fn2 = find_enclosing_function(
+                            f2_plan.orig_text, u2, tree=f2_plan.parsed_tree
+                        )
                 elif replace_clones:
                     skip_reasons["unreadable file"] += 1
                     continue
@@ -3528,7 +3532,9 @@ def _generate_refactoring_patch_impl(
 
             earliest_unit = min(candidate_units, key=_unit_start)
             enc_fn_earliest = (
-                find_enclosing_function(orig_text, earliest_unit)
+                find_enclosing_function(
+                    orig_text, earliest_unit, tree=f1_plan.parsed_tree
+                )
                 if effective_binding == "method"
                 else None
             )

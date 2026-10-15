@@ -5130,3 +5130,38 @@ def test_extract_unit_live_in_names_match_pattern_bindings() -> None:
     assert "tail" not in live_ins
     assert "val" not in live_ins
     assert "rest" not in live_ins
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 type alias requires Python 3.12+")
+def test_extract_single_node_local_names_type_alias_excludes_type_params() -> None:
+    """Verifies that PEP 695 TypeAlias statements record the alias name in local names
+    without leaking their lexical type_params into the enclosing scope."""
+    from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=protected-access
+        _extract_single_node_local_names,
+    )
+
+    code = (
+        "def compute(items):\n"
+        "    type MySeq[sum] = list[sum]\n"
+        "    return sum(x for x in items)\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    local_names = _extract_single_node_local_names(fn_node)
+    assert "MySeq" in local_names
+    assert "items" in local_names
+    assert "sum" not in local_names
+
+
+def test_has_wildcard_star_import_detached_vs_attached_scope() -> None:
+    """Verifies _has_wildcard_star_import across attached module trees and detached subtrees."""
+    from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=protected-access
+        _has_wildcard_star_import,
+    )
+
+    mod_clean = ast.parse("def f():\n    return 1\n")
+    fn_clean = mod_clean.body[0]
+    assert _has_wildcard_star_import(fn_clean, mod_clean) is False
+
+    detached_star = ast.parse("def g():\n    from math import *\n    return 1\n").body[0]
+    assert _has_wildcard_star_import(detached_star, mod_clean) is True

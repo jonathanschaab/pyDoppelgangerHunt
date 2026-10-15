@@ -123,6 +123,11 @@ def _extract_single_node_local_names(scope_node: ast.AST) -> Set[str]:
         elif isinstance(curr, (ast.Global, ast.Nonlocal)):
             names.update(curr.names)
             continue
+        elif type(curr).__name__ == "TypeAlias":
+            alias_name = getattr(curr, "name", None)
+            if isinstance(alias_name, ast.Name):
+                names.add(alias_name.id)
+            continue
         else:
             bound_sym = getattr(curr, "name", None) or getattr(curr, "rest", None)
             if isinstance(bound_sym, str) and not isinstance(curr, ast.Attribute):
@@ -190,26 +195,29 @@ def _is_confirmed_str_receiver(
     return False
 
 
+def _node_has_star_import(root: ast.AST) -> bool:
+    """Checks whether an AST subtree contains a non-builtin wildcard star import."""
+    return any(
+        isinstance(node, ast.ImportFrom)
+        and node.module not in ("builtins", "__builtins__")
+        and any(alias.name == "*" for alias in node.names)
+        for node in ast.walk(root)
+    )
+
+
 def _has_wildcard_star_import(
     scope_node: ast.AST, module_tree: Optional[ast.AST] = None
-) -> bool:
+  ) -> bool:
     """Checks whether scope_node or any enclosing scope contains a wildcard star import."""
-    for child in ast.walk(scope_node):
-        if (
-            isinstance(child, ast.ImportFrom)
-            and child.module not in ("builtins", "__builtins__")
-            and any(alias.name == "*" for alias in child.names)
-        ):
+    if module_tree is not None:
+        if _node_has_star_import(module_tree):
             return True
-    if module_tree is not None and module_tree is not scope_node:
-        for node in ast.walk(module_tree):
-            if (
-                isinstance(node, ast.ImportFrom)
-                and node.module not in ("builtins", "__builtins__")
-                and any(alias.name == "*" for alias in node.names)
-            ):
-                return True
-    return False
+        if scope_node is not module_tree and scope_node not in _get_scope_parent_map(
+            module_tree
+        ):
+            return _node_has_star_import(scope_node)
+        return False
+    return _node_has_star_import(scope_node)
 
 
 def _is_eagerly_consumed_genexp(

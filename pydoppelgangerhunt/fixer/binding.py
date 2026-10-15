@@ -9,6 +9,7 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.config import normalize_path_string, paths_match_boundary
+from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
 from pydoppelgangerhunt.fixer.scope import analyze_unit_variable_scope
 from pydoppelgangerhunt.fixer.source import (
     _find_innermost_enclosing_node,
@@ -394,12 +395,7 @@ def _populate_unit_receiver_metadata(
             has_yield = bool(unit.get("has_yield"))
             has_await = bool(unit.get("has_await"))
             if not (has_yield or has_await) and source is not None:
-                parsed_tree = tree
-                if parsed_tree is None:
-                    try:
-                        parsed_tree = ast.parse(source)
-                    except (SyntaxError, ValueError):
-                        parsed_tree = None
+                parsed_tree = tree if tree is not None else _get_or_parse_tree(source)
                 if parsed_tree is not None:
                     u_start = parse_unit_coord(unit, "start", default=1)
                     u_end = parse_unit_coord(unit, "end", default=u_start)

@@ -10292,3 +10292,27 @@ def test_whole_line_complex_expr_semicolon_multiple_statements_fails_closed(
         )
         == ""
     )
+
+
+def test_synthesize_shared_helper_code_unmapped_stmt_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Verifies that synthesize_shared_helper_code fails closed immediately for unmapped
+    statement types (such as ast.Assert or bare ast.AnnAssign) in complex_expr units."""
+    src = (
+        "def verify(a: int, b: int) -> None:\n"
+        "    assert a > b\n"
+        "    val: int\n"
+    )
+    f1 = tmp_path / "unmapped1.py"
+    f2 = tmp_path / "unmapped2.py"
+    f1.write_text(src, encoding="utf-8")
+    f2.write_text(src, encoding="utf-8")
+
+    u_assert1 = {"file": "unmapped1.py", "start": 2, "end": 2, "name": "u1", "kind": "complex_expr"}
+    u_assert2 = {"file": "unmapped2.py", "start": 2, "end": 2, "name": "u2", "kind": "complex_expr"}
+    assert synthesize_shared_helper_code(u_assert1, u_assert2, repo_root=str(tmp_path)) == ""
+
+    u_ann1 = {"file": "unmapped1.py", "start": 3, "end": 3, "name": "u1", "kind": "complex_expr"}
+    u_ann2 = {"file": "unmapped2.py", "start": 3, "end": 3, "name": "u2", "kind": "complex_expr"}
+    assert synthesize_shared_helper_code(u_ann1, u_ann2, repo_root=str(tmp_path)) == ""
