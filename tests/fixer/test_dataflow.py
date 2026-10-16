@@ -5574,4 +5574,23 @@ def test_unit_live_in_visitor_intra_unit_delete() -> None:
     assert "arr" in live_ins
 
 
+def test_pre_unit_closure_except_handler_bound_name() -> None:
+    """Verifies that a lambda inside an except-as handler binding err does not trigger
+    a false-positive pre-unit closure capture on err."""
+    code = (
+        "def handle_op(items):\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except RuntimeError as err:\n"
+        "        cb = lambda: str(err)\n"
+        "    err = len(items)\n"
+        "    return err\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    closures = _collect_scope_closures(fn_node)
+    assert all("err" not in free_reads for _, free_reads in closures)
+
+
+
 

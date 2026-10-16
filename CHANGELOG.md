@@ -334,6 +334,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_UnitLiveInVisitor.visit_Assign`, `visit_AnnAssign`, `visit_BoolOp`, `visit_IfExp`, and
   `visit_NamedExpr` so RHS values and conditional depths are always evaluated accurately across
   multi-line and sub-line unit boundaries.
+- **Same-Class Whole-Line Expression `@staticmethod` & Receiver Guard**: Guarded `@staticmethod`
+  emission in `synthesize_shared_helper_code` (`synthesis.py`) when `fn1_kind` or `fn2_kind` is
+  `"instance"`, aligned `u1_eff`/`u2_eff` expression kinds prior to computing `fn1_kind`/`fn2_kind`
+  and `is_in_method` in `generate_refactoring_patch` (`patch.py`), and delegated `binding_kind`
+  recomputation in `_prune_unreferenced_lhs_scope` to `_determine_binding_kind`.
+- **Quoted Forward Reference PEP 604 Union Normalization**: Added `_is_single_quoted_literal` in
+  `synthesis.py` so `_normalize_pipe_unions` only unwraps outer quotes when the opening quote at
+  index `0` closes at the final character, converting unions of quoted forward references
+  (`'"NodeA" | "NodeB"'`) into `'Union["NodeA", "NodeB"]'`.
+- **PEP 695 `type_params` and `TypeAlias` Scope Isolation in `_ScopeVisitor`**: Bound PEP 695
+  `type_params` on `FunctionDef`, `AsyncFunctionDef`, `ClassDef`, and `TypeAlias` in `_ScopeVisitor`
+  (`scope.py`) via `_type_param_scopes` and excluded `TypeAlias` names (`self.type_aliases`) from
+  subroutine runtime `outputs` and `_analyze_block_assignment`.
+- **Indented Method Body Extraction with Column-0 Multiline Strings**: Wrapped indented dedented
+  source slices in `if 1:\n` before `ast.parse` in `_extract_unit_body_lines` (`source.py`) and
+  `_inspect_unit_scope` (`scope.py`), preventing column-0 multiline string literals or docstrings
+  from defeating `textwrap.dedent` and falling back to un-stripped `def` headers.
+- **`ExceptHandler.name` Binding in Pre-Unit Closure Discovery**: Bound `handler.name` (`except ... as err:`)
+  into the handler body's `bound_names` in `_collect_scope_closures_uncached` (`_df_closures.py`).
 
 ## [1.0.0] - 2026-09-20
 ### Added

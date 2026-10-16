@@ -3461,3 +3461,15 @@ def test_infer_helper_return_type_cross_checks_is_async_iterator_prefixes() -> N
         is_async=False,
     )
     assert res_sync == "Iterator[str]"
+
+
+def test_normalize_pipe_unions_quoted_forward_references() -> None:
+    """Verifies that PEP 604 unions of separately quoted forward references
+    are converted to Union/Optional rather than treated as a single outer-quoted string."""
+    assert _normalize_pipe_unions('"NodeA" | "NodeB"') == 'Union["NodeA", "NodeB"]'
+    assert (
+        _normalize_pipe_unions("'NodeA' | 'NodeB' | None")
+        == "Optional[Union['NodeA', 'NodeB']]"
+    )
+    assert _normalize_pipe_unions('"NodeA | NodeB"') == '"Union[NodeA, NodeB]"'
+

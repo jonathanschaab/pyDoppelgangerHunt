@@ -3158,15 +3158,19 @@ def _generate_refactoring_patch_impl(
             if not _is_method_of_class(fn2, enc2):
                 fn2 = None
 
-            fn1_kind = _determine_unit_receiver_kind(fn1, u1, enc1)
-            fn2_kind = _determine_unit_receiver_kind(fn2, u2, enc2)
+            if not _align_pair_expr_kinds(u1_eff, u2_eff):
+                skip_reasons["mismatched subroutine kinds"] += 1
+                continue
+
+            fn1_kind = _determine_unit_receiver_kind(fn1, u1_eff, enc1)
+            fn2_kind = _determine_unit_receiver_kind(fn2, u2_eff, enc2)
 
             receiver_kinds_differ = bool(fn1_kind != fn2_kind)
             is_in_method = bool(
                 fn1
                 and fn2
-                and u1.get("kind") not in ("comprehension", "complex_expr")
-                and u2.get("kind") not in ("comprehension", "complex_expr")
+                and u1_eff.get("kind") not in ("comprehension", "complex_expr", "closure", "class")
+                and u2_eff.get("kind") not in ("comprehension", "complex_expr", "closure", "class")
                 and (fn1.get("receiver_param") or fn1.get("is_static"))
                 and (fn2.get("receiver_param") or fn2.get("is_static"))
             )
@@ -3193,9 +3197,6 @@ def _generate_refactoring_patch_impl(
                 if f2_plan is not None
                 else (digest1 if is_same_file else None)
             )
-            if not _align_pair_expr_kinds(u1_eff, u2_eff):
-                skip_reasons["mismatched subroutine kinds"] += 1
-                continue
             is_sub1 = is_subroutine_unit(u1_eff, source_text=orig_text, tree=tree1)
             is_sub2 = is_subroutine_unit(u2_eff, source_text=f2_text, tree=tree2)
             u1_eff["is_subroutine"] = is_sub1

@@ -93,6 +93,15 @@ def _extract_arg_names(args: ast.arguments) -> Set[str]:
     return arg_set
 
 
+def _extract_type_param_names(node: ast.AST) -> Set[str]:
+    """Extracts PEP 695 type parameter names from an AST node."""
+    return {
+        tp.name
+        for tp in getattr(node, "type_params", [])
+        if isinstance(getattr(tp, "name", None), str)
+    }
+
+
 def _block_contains_yield(node: ast.AST) -> bool:
     """Returns True if the node contains a Yield or YieldFrom at the current scope level."""
     stack = [node]
@@ -132,7 +141,9 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.attrs_written: List[str] = []
         self.except_vars: Set[str] = set()
         self.deleted_names: Set[str] = set()
+        self.type_aliases: Set[str] = set()
         self._scope_stack: List[Set[str]] = []
+        self._type_param_scopes: List[Set[str]] = []
         self._comprehension_depth: int = 0
         self.class_depth: int = 0
         self.loop_offset: int = loop_offset
@@ -263,6 +274,7 @@ class _ScopeVisitor(ast.NodeVisitor):
                 self.visit(stmt)
             return
 
+        tp_names = _extract_type_param_names(node)
         is_top = (
             len(self._scope_stack) == 0
             and not self.is_subroutine
@@ -271,11 +283,19 @@ class _ScopeVisitor(ast.NodeVisitor):
         created_outer = False
         if is_top:
             self._has_processed_top_func = True
+            if tp_names:
+                self._type_param_scopes.append(tp_names)
+            for tp in getattr(node, "type_params", []):
+                self.visit(tp)
             self._process_args(node)
-            self._scope_stack.append(set(self.params))
+            self._scope_stack.append(set(self.params) | tp_names)
         else:
             for dec in node.decorator_list:
                 self.visit(dec)
+            if tp_names:
+                self._type_param_scopes.append(tp_names)
+            for tp in getattr(node, "type_params", []):
+                self.visit(tp)
             for default in node.args.defaults:
                 self.visit(default)
             for kw_default in node.args.kw_defaults:
@@ -285,13 +305,17 @@ class _ScopeVisitor(ast.NodeVisitor):
             if not self._scope_stack:
                 self._scope_stack.append(set())
                 created_outer = True
-            self._scope_stack.append(self._extract_arg_names(node.args))
+            self._scope_stack.append(self._extract_arg_names(node.args) | tp_names)
 
-        for stmt in node.body:
-            self.visit(stmt)
-        self._scope_stack.pop()
-        if created_outer:
+        try:
+            for stmt in node.body:
+                self.visit(stmt)
+        finally:
             self._scope_stack.pop()
+            if created_outer:
+                self._scope_stack.pop()
+            if tp_names:
+                self._type_param_scopes.pop()
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         for default in node.args.defaults:
@@ -326,22 +350,63 @@ class _ScopeVisitor(ast.NodeVisitor):
         self._record_store_name(node.name)
         for dec in node.decorator_list:
             self.visit(dec)
-        for base in node.bases:
-            self.visit(base)
-        for keyword in node.keywords:
-            self.visit(keyword)
-        created_outer = False
-        if not self._scope_stack:
-            self._scope_stack.append(set())
-            created_outer = True
-        self._scope_stack.append(set())
-        self.class_depth += 1
-        for stmt in node.body:
-            self.visit(stmt)
-        self.class_depth -= 1
-        self._scope_stack.pop()
-        if created_outer:
-            self._scope_stack.pop()
+        tp_names = _extract_type_param_names(node)
+        if tp_names:
+            self._type_param_scopes.append(tp_names)
+        try:
+            for tp in getattr(node, "type_params", []):
+                self.visit(tp)
+            for base in node.bases:
+                self.visit(base)
+            for keyword in node.keywords:
+                self.visit(keyword)
+            created_outer = False
+            if not self._scope_stack:
+                self._scope_stack.append(set())
+                created_outer = True
+            self._scope_stack.append(set(tp_names))
+            self.class_depth += 1
+            try:
+                for stmt in node.body:
+                    self.visit(stmt)
+            finally:
+                self.class_depth -= 1
+                self._scope_stack.pop()
+                if created_outer:
+                    self._scope_stack.pop()
+        finally:
+            if tp_names:
+                self._type_param_scopes.pop()
+
+    def visit_TypeAlias(self, node: ast.AST) -> None:  # pragma: no cover (py312+)
+        name_node = getattr(node, "name", None)
+        alias_name = (
+            name_node.id
+            if isinstance(name_node, ast.Name)
+            else (name_node if isinstance(name_node, str) else None)
+        )
+        tp_names = _extract_type_param_names(node)
+        if tp_names:
+            self._type_param_scopes.append(tp_names)
+        try:
+            for tp in getattr(node, "type_params", []):
+                self.visit(tp)
+            val_node = getattr(node, "value", None)
+            if isinstance(val_node, ast.AST):
+                self.visit(val_node)
+        finally:
+            if tp_names:
+                self._type_param_scopes.pop()
+        if isinstance(alias_name, str):
+            is_nested = (
+                len(self._scope_stack) > 0
+                if self.is_subroutine
+                else len(self._scope_stack) > 1
+            )
+            if not is_nested:
+                self.type_aliases.add(alias_name)
+                self.imported_names.setdefault(alias_name, "")
+            self._record_store_name(alias_name)
 
     def visit_Call(self, node: ast.Call) -> None:
         if self.class_depth == 0:
@@ -378,7 +443,9 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _record_load_name(self, name: str) -> None:
-        is_inner = any(name in s for s in self._scope_stack[1:])
+        is_inner = any(name in s for s in self._scope_stack[1:]) or any(
+            name in s for s in self._type_param_scopes
+        )
         if not is_inner and name not in BUILTIN_NAMES:
             if name not in self.loads:
                 self.loads.append(name)
@@ -1151,6 +1218,10 @@ def _analyze_block_assignment(
             _demote_deletions_to_conditional(case_dels - all_del, definite, conditional)
         elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             definite.add(stmt.name)
+        elif type(stmt).__name__ == "TypeAlias":  # pragma: no cover (py312+)
+            name_node = getattr(stmt, "name", None)
+            if isinstance(name_node, ast.Name):
+                definite.add(name_node.id)
         elif isinstance(stmt, ast.Import):
             for alias in stmt.names:
                 bound_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
@@ -1294,6 +1365,7 @@ def _inspect_unit_scope(
 
     parse_candidates = [
         (dedented, 0),
+        (f"if 1:\n{dedented}", 0),
         (f"def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
         (f"async def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
         (
@@ -1320,6 +1392,20 @@ def _inspect_unit_scope(
                         candidate_stmts = tree.body[0].body
                     else:
                         candidate_stmts = tree.body
+            elif cand_text.startswith("if 1:\n"):
+                if (
+                    isinstance(tree, ast.Module)
+                    and len(tree.body) == 1
+                    and isinstance(tree.body[0], ast.If)
+                ):
+                    inner_body = tree.body[0].body
+                    tree = ast.Module(body=inner_body, type_ignores=[])
+                    if len(inner_body) == 1 and isinstance(
+                        inner_body[0], (ast.FunctionDef, ast.AsyncFunctionDef)
+                    ):
+                        candidate_stmts = inner_body[0].body
+                    else:
+                        candidate_stmts = inner_body
             elif offset == 1:
                 wrapper_fn = tree.body[0]  # type: ignore[attr-defined]
                 if isinstance(wrapper_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1460,6 +1546,7 @@ def _inspect_unit_scope(
                 and v not in visitor.except_vars
                 and v not in visitor.deleted_names
                 and v not in visitor.imported_names
+                and v not in visitor.type_aliases
                 and v not in seen
             ):
                 seen.add(v)
@@ -1474,6 +1561,7 @@ def _inspect_unit_scope(
             and nl not in visitor.except_vars
             and nl not in visitor.deleted_names
             and nl not in visitor.imported_names
+            and nl not in visitor.type_aliases
         ):
             outputs.append(nl)
 

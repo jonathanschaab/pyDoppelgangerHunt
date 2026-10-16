@@ -10974,4 +10974,39 @@ def test_kindless_subline_expr_slicing_and_mixed_assign_return_alignment(
     assert "+    return _shared_m1_expr_m2_expr(a, b, c, d)" in mix_patch
 
 
+def test_same_class_whole_line_expr_lhs_only_self_runtime_safety(
+    tmp_path: Path,
+) -> None:
+    """Verifies that same-class whole-line comprehension/complex_expr clones where self
+    is only referenced on the LHS do not emit mismatched receiver signatures."""
+    cls_src = (
+        "class Processor:\n"
+        "    def m1(self, items):\n"
+        "        self.res1 = [x * 2 for x in items]\n"
+        "        return self.res1\n"
+        "\n"
+        "    def m2(self, items):\n"
+        "        self.res2 = [x * 2 for x in items]\n"
+        "        return self.res2\n"
+    )
+    f_cls = tmp_path / "proc.py"
+    f_cls.write_text(cls_src, encoding="utf-8")
+    u1_c = {"file": "proc.py", "start": 3, "end": 3, "name": "m1_c"}
+    u2_c = {
+        "file": "proc.py",
+        "start": 7,
+        "end": 7,
+        "name": "m2_c",
+        "kind": "comprehension",
+    }
+    patch_str = generate_refactoring_patch(
+        [(0.99, u1_c, u2_c)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert "@staticmethod" not in patch_str
+    assert "+def _shared_m1_c_m2_c(items: Any) -> Any:" in patch_str
+    assert "+        self.res1 = _shared_m1_c_m2_c(items)" in patch_str
+    assert "+        self.res2 = _shared_m1_c_m2_c(items)" in patch_str
+
+
+
 

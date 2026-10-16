@@ -415,7 +415,13 @@ def _collect_scope_closures_uncached(
                     _walk_stmts(sub_stmts, bound_names)
 
             for handler in getattr(stmt, "handlers", []):
-                _walk_stmts(getattr(handler, "body", []), bound_names)
+                h_name = getattr(handler, "name", None)
+                h_bound = (
+                    bound_names | {h_name}
+                    if isinstance(h_name, str)
+                    else bound_names
+                )
+                _walk_stmts(getattr(handler, "body", []), h_bound)
 
             for case in getattr(stmt, "cases", []):
                 pattern = getattr(case, "pattern", None)

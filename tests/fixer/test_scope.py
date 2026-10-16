@@ -1884,8 +1884,48 @@ def test_unit_ast_has_async_or_yield_coinciding_subroutine_and_same_line_class()
     assert a_one is True
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="PEP 695 syntax requires Python 3.12+",
+)
+def test_scope_visitor_pep695_type_params_and_type_alias(tmp_path: Path) -> None:
+    """Verifies that _ScopeVisitor binds PEP 695 type_params and excludes TypeAlias names from outputs."""
+    src = (
+        "def first[T](items: list[T], cast_fn) -> T:\n"
+        "    type Pair[U] = tuple[U, T]\n"
+        "    def wrap[V](val: V) -> tuple[V, T]:\n"
+        "        return (val, items[0])\n"
+        "    class Box[W]:\n"
+        "        kind = W\n"
+        "    out = cast_fn(T, items[0])\n"
+        "    return out\n"
+    )
+    f = tmp_path / "pep695_mod.py"
+    f.write_text(src, encoding="utf-8")
 
+    # 1. Whole generic function unit
+    u_fn = {
+        "file": str(f),
+        "start": 1,
+        "end": 8,
+        "kind": "function",
+        "name": "first",
+    }
+    scope_fn = _inspect_unit_scope(u_fn, repo_root=str(tmp_path))
+    assert scope_fn["inputs"] == ["items", "cast_fn"]
+    assert "T" not in scope_fn["free_vars"]
 
-
-
-
+    # 2. Subroutine inside generic function containing TypeAlias, generic inner def, and generic class
+    u_sub = {
+        "file": str(f),
+        "start": 2,
+        "end": 7,
+        "kind": "subroutine",
+        "name": "first_sub",
+    }
+    scope_sub = _inspect_unit_scope(u_sub, repo_root=str(tmp_path))
+    assert "U" not in scope_sub["inputs"]
+    assert "V" not in scope_sub["inputs"]
+    assert "W" not in scope_sub["inputs"]
+    assert "Pair" not in scope_sub["outputs"]
+    assert "out" in scope_sub["outputs"]

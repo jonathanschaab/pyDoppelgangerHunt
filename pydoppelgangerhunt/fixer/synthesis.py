@@ -26,6 +26,7 @@ from pydoppelgangerhunt.fixer.dataflow import (
     resolve_clone_pair_outputs,
 )
 from pydoppelgangerhunt.fixer.scope import (
+    _determine_binding_kind,
     _normalize_receiver_attrs,
     _rank_param_kind,
     _unfold_receiver_attribute,
@@ -257,9 +258,7 @@ def _prune_unreferenced_lhs_scope(
     scope_dict["has_instance_binding"] = has_inst
     scope_dict["has_class_binding"] = has_cls
     scope_dict["has_receiver_access"] = has_inst or has_cls
-    scope_dict["binding_kind"] = (
-        "instance" if has_inst else ("class" if has_cls else "free")
-    )
+    scope_dict["binding_kind"] = _determine_binding_kind(has_inst, has_cls)
     return unref_loads
 
 
@@ -484,6 +483,19 @@ def _format_union_or_optional(unique_parts: List[str]) -> str:
     return f"Union[{', '.join(unique_parts)}]"
 
 
+def _is_single_quoted_literal(text: str) -> bool:
+    """Returns True if text is wrapped in a single pair of outer quotes closing at the end."""
+    if len(text) < 2 or text[0] not in ("'", '"') or text[-1] != text[0]:
+        return False
+    active_quote: Optional[str] = None
+    escaped = False
+    for idx, ch in enumerate(text):
+        active_quote, escaped = _advance_quote_state(ch, active_quote, escaped)
+        if active_quote is None:
+            return idx == len(text) - 1
+    return False
+
+
 def _normalize_pipe_unions(type_str: Optional[str]) -> str:
     """Normalizes PEP 604 pipe unions (A | B) to typing.Union[A, B] syntax.
 
@@ -496,10 +508,7 @@ def _normalize_pipe_unions(type_str: Optional[str]) -> str:
     if not cleaned:
         return cleaned
 
-    if (
-        (cleaned.startswith("'") and cleaned.endswith("'"))
-        or (cleaned.startswith('"') and cleaned.endswith('"'))
-    ) and len(cleaned) >= 2:
+    if _is_single_quoted_literal(cleaned):
         inner = cleaned[1:-1].strip()
         norm_inner = _normalize_pipe_unions(inner)
         return f"{cleaned[0]}{norm_inner}{cleaned[0]}"

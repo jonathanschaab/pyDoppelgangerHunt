@@ -318,22 +318,32 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
     code_block = "\n".join(raw_lines)
     dedented = dedent_source_text(code_block)
     try:
-        tree = ast.parse(dedented)
-        if len(tree.body) == 1 and isinstance(
-            tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)
+        wrapped = dedented.lstrip("\r\n").startswith((" ", "\t"))
+        tree = ast.parse(f"if 1:\n{dedented}") if wrapped else ast.parse(dedented)
+        top_body = (
+            tree.body[0].body
+            if (wrapped and len(tree.body) == 1 and isinstance(tree.body[0], ast.If))
+            else tree.body
+        )
+        line_offset = 1 if wrapped else 0
+        if len(top_body) == 1 and isinstance(
+            top_body[0], (ast.FunctionDef, ast.AsyncFunctionDef)
         ):
-            fn_node = tree.body[0]
+            fn_node = top_body[0]
             body_nodes = list(fn_node.body)
             if body_nodes and _is_docstring_node(body_nodes[0]):
                 body_nodes = body_nodes[1:]
             if body_nodes:
                 d_lines = [ln.rstrip("\r\n") for ln in split_source_lines(dedented)]
                 first_body = body_nodes[0]
-                start_l = first_body.lineno
-                end_l = getattr(body_nodes[-1], "end_lineno", len(d_lines))
+                start_l = first_body.lineno - line_offset
+                end_l = (
+                    getattr(body_nodes[-1], "end_lineno", len(d_lines) + line_offset)
+                    - line_offset
+                )
                 extracted = d_lines[start_l - 1 : end_l]
                 if extracted:
-                    if start_l == fn_node.lineno:
+                    if start_l == fn_node.lineno - line_offset:
                         b_col = getattr(first_body, "col_offset", 0)
                         extracted[0] = extracted[0][b_col:]
                     return [
