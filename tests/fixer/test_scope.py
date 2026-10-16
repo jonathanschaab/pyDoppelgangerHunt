@@ -1954,6 +1954,24 @@ def test_scope_visitor_pep695_type_params_and_type_alias(tmp_path: Path) -> None
     assert "val" in scope_ds["outputs"]
     assert scope_fn["type_params"] == ["T"]
 
+    src_bound = (
+        "def bounded[T: CustomBound](items: list[T]) -> T:\n"
+        "    return items[0]\n"
+    )
+    f_bound = tmp_path / "pep695_bound.py"
+    f_bound.write_text(src_bound, encoding="utf-8")
+    u_bound = {
+        "file": str(f_bound),
+        "start": 1,
+        "end": 2,
+        "kind": "function",
+        "name": "bounded",
+    }
+    scope_bound = _inspect_unit_scope(u_bound, repo_root=str(tmp_path))
+    assert "CustomBound" not in scope_bound["inputs"]
+    assert "CustomBound" not in scope_bound["free_vars"]
+    assert scope_bound["type_params"] == ["T: CustomBound"]
+
     # 4. Nested generic function default argument evaluated outside type_params
     src_def = (
         "def outer():\n"

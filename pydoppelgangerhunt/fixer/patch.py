@@ -2051,6 +2051,13 @@ def _extract_helper_symbols(
                     defined_names.add(name_str)
                 for d in getattr(node, "decorator_list", []):
                     self.visit(d)
+                fn_args = getattr(node, "args", None)
+                if fn_args is not None:
+                    for default in list(getattr(fn_args, "defaults", [])) + list(
+                        getattr(fn_args, "kw_defaults", [])
+                    ):
+                        if default is not None:
+                            self.visit(default)
             tp_list = getattr(node, "type_params", [])
             tp_names = {
                 tp.name for tp in tp_list if isinstance(getattr(tp, "name", None), str)
@@ -2076,8 +2083,6 @@ def _extract_helper_symbols(
                 + ([node.args.kwarg] if node.args.kwarg else [])
             )
             sig_nodes: List[Optional[ast.AST]] = [a.annotation for a in all_args]
-            sig_nodes.extend(node.args.defaults)
-            sig_nodes.extend(node.args.kw_defaults)
             sig_nodes.append(node.returns)
             tp_names = self._visit_with_type_params(node, sig_nodes, record_def=True)
             fn_scope: Set[str] = _extract_arg_names(node.args) | tp_names

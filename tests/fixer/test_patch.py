@@ -4544,6 +4544,14 @@ def my_helper(param1: ExternalType, default_arg=ExternalDefault) -> ReturnType:
     assert "local_func" in local_imps
     assert "my_helper" in defined
 
+    if sys.version_info >= (3, 12):
+        pep695_tree = ast.parse("def _shared_fn[T: BoundSym](x: T = T, *, k: T = KwSym) -> T:\n    return x\n")
+        p_free, p_def, _ = _extract_helper_symbols(pep695_tree)
+        assert "BoundSym" in p_free
+        assert "T" in p_free
+        assert "KwSym" in p_free
+        assert "_shared_fn" in p_def
+
 
 @pytest.mark.skipif(sys.version_info < (3, 10), reason="Pattern matching requires Python 3.10+")
 def test_extract_helper_symbols_pattern_matching() -> None:

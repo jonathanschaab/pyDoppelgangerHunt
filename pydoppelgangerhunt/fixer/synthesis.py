@@ -619,6 +619,19 @@ def _normalize_pipe_unions(type_str: Optional[str]) -> str:
     return cleaned
 
 
+def _strip_container_module_prefix(type_str: str) -> str:
+    """Strips leading typing/collections module prefixes from a type annotation."""
+    for pfx in (
+        "typing.",
+        "typing_extensions.",
+        "collections.abc.",
+        "collections.",
+    ):
+        if type_str.startswith(pfx):
+            return type_str[len(pfx) :]
+    return type_str
+
+
 def _unwrap_iterable_item_type(type_str: str) -> Optional[str]:
     """Unwraps the yielded element type from an iterable or union-of-iterables type."""
     norm_t = _normalize_pipe_unions(type_str)
@@ -642,11 +655,7 @@ def _unwrap_iterable_item_type(type_str: str) -> Optional[str]:
             return unique_types[0]
         return f"Union[{', '.join(unique_types)}]"
 
-    target_t = norm_t
-    for pfx in ("typing.", "collections.abc.", "collections."):
-        if target_t.startswith(pfx):
-            target_t = target_t[len(pfx) :]
-            break
+    target_t = _strip_container_module_prefix(norm_t)
     prefixes = (
         "Iterator[", "Iterable[", "Generator[", "List[", "Sequence[", "Set[",
         "Tuple[", "Dict[", "Collection[", "Mapping[", "MutableMapping[",
@@ -918,12 +927,13 @@ def _infer_outputs_return_type(
         t2 = m2.get("type")
         out_t = _merge_types(t1, t2, type_merge_strategy)
         fallback = resolved_ret
-        if resolved_ret.startswith((
+        unqualified_ret = _strip_container_module_prefix(resolved_ret)
+        if unqualified_ret.startswith((
             "Generator[", "Iterator[", "Iterable[",
             "AsyncGenerator[", "AsyncIterator[", "AsyncIterable[",
         )):
-            if resolved_ret.startswith("Generator[") and resolved_ret.endswith("]"):
-                parts = _split_type_args(resolved_ret)
+            if unqualified_ret.startswith("Generator[") and unqualified_ret.endswith("]"):
+                parts = _split_type_args(unqualified_ret)
                 fallback = parts[2] if len(parts) >= 3 else "Any"
             else:
                 fallback = "Any"
@@ -973,12 +983,12 @@ def _infer_helper_return_type(
         ):
             return resolved_ret
 
-
+        unqualified_ret = _strip_container_module_prefix(resolved_ret)
         inferred_yield_type = None
         inferred_send_type = None
         inferred_gen_ret_type = None
         if (
-            resolved_ret.startswith((
+            unqualified_ret.startswith((
                 "Iterator[",
                 "Iterable[",
                 "Generator[",
@@ -986,18 +996,18 @@ def _infer_helper_return_type(
                 "AsyncIterable[",
                 "AsyncGenerator[",
             ))
-            and resolved_ret.endswith("]")
+            and unqualified_ret.endswith("]")
         ):
-            inner_parts = _split_type_args(resolved_ret)
+            inner_parts = _split_type_args(unqualified_ret)
             if inner_parts:
                 inferred_yield_type = _normalize_pipe_unions(inner_parts[0])
             if (
-                resolved_ret.startswith(("Generator[", "AsyncGenerator["))
+                unqualified_ret.startswith(("Generator[", "AsyncGenerator["))
                 and len(inner_parts) >= 2
             ):
                 if inner_parts[1] not in ("None", "Any"):
                     inferred_send_type = _normalize_pipe_unions(inner_parts[1])
-            if resolved_ret.startswith("Generator[") and len(inner_parts) >= 3:
+            if unqualified_ret.startswith("Generator[") and len(inner_parts) >= 3:
                 inferred_gen_ret_type = _normalize_pipe_unions(inner_parts[2])
         elif not has_return_val and resolved_ret not in ("Any", "None"):
             inferred_yield_type = _unwrap_iterable_item_type(resolved_ret)
@@ -1029,7 +1039,7 @@ def _infer_helper_return_type(
                 resolved_ret=resolved_ret,
                 outputs2=outputs2,
             )
-            is_iter_annotation = resolved_ret.startswith((
+            is_iter_annotation = unqualified_ret.startswith((
                 "Iterator[", "Iterable[", "Generator["
             ))
             fallback_ret = inferred_gen_ret_type or (

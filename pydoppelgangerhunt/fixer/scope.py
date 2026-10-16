@@ -292,7 +292,6 @@ class _ScopeVisitor(ast.NodeVisitor):
                     self.type_params.append(ast.unparse(tp))
                 except Exception as exc:
                     logger.debug("Failed to unparse type_param %r: %s", tp, exc)
-                self.visit(tp)
             self._process_args(node)
             self._scope_stack.append(set(self.params) | tp_names)
         else:

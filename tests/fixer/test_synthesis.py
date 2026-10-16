@@ -1806,6 +1806,19 @@ def test_infer_helper_return_type_generator_with_outputs_and_iterator() -> None:
     )
     assert res_kept == "Iterator[float]"
 
+    # 4. Qualified typing.Iterator[int] / collections.abc.Iterator[int] with untyped output
+    for qual_ret in ("typing.Iterator[int]", "collections.abc.Iterator[int]"):
+        res_qual = _infer_helper_return_type(
+            resolved_ret=qual_ret,
+            helper_outputs=["untyped_out"],
+            conditional_outs=set(),
+            scope={"has_yield": True, "yield_expr_names": []},
+            meta1={},
+            meta2={},
+            is_async=False,
+        )
+        assert res_qual == "Generator[int, None, Any]"
+
 
 def test_infer_helper_return_type_generator_with_yield_assignment() -> None:
     """Verifies that yield expressions in assignment context infer Any send type instead of None."""

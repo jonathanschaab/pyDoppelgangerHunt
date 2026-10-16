@@ -353,17 +353,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_ScopeVisitor` (`scope.py`) and `_extract_helper_symbols` (`patch.py`); preserved top-level
   generic function `type_params` (`scope["type_params"]`, merged via `_merge_type_params`) onto the
   synthesized helper header (`def _shared_...[T](...)`) in `synthesize_shared_helper_code`
-  (`synthesis.py`) so type parameters referenced in annotations or at runtime remain bound;
+  (`synthesis.py`) without visiting top-level `type_params` bounds as runtime `free_vars`;
   evaluated `decorator_list` and function `defaults`/`kw_defaults` outside `type_params` in
-  `_extract_nested_scope_free_reads` (`_df_visitors.py`) and `_ScopeVisitor._process_func`
-  (`scope.py`); visited `node.generators[0].iter` in `_ExprClosureCollector.visit_GeneratorExp`
-  (`_df_closures.py`) on non-eager generator expressions so nested closures inside the outermost
-  iterator are recorded at their own column offsets; recorded `alias_name` store before visiting
-  `type_params` and `value` so recursive nested `TypeAlias` definitions (`type Tree = list[Tree]`)
-  do not leak into outer `loads`; and restricted `collect_downstream_read_names` in
-  `_inspect_unit_scope` to stored/nonlocal `visitor.type_aliases` (failing closed by retaining
-  `alias_cands` in `outputs` when `full_src` or `ds_reads` is `None`) while unconditionally
-  excluding `visitor.imported_names` from `outputs`.
+  `_extract_nested_scope_free_reads` (`_df_visitors.py`), `_ScopeVisitor._process_func`
+  (`scope.py`), and `_extract_helper_symbols` (`patch.py`); normalized qualified iterator prefixes
+  (`typing.`, `typing_extensions.`, `collections.abc.`) via `_strip_container_module_prefix` in
+  `_infer_outputs_return_type` and `_infer_helper_return_type` (`synthesis.py`); visited
+  `node.generators[0].iter` in `_ExprClosureCollector.visit_GeneratorExp` (`_df_closures.py`) on
+  non-eager generator expressions so nested closures inside the outermost iterator are recorded at
+  their own column offsets; recorded `alias_name` store before visiting `type_params` and `value`
+  so recursive nested `TypeAlias` definitions (`type Tree = list[Tree]`) do not leak into outer
+  `loads`; and restricted `collect_downstream_read_names` in `_inspect_unit_scope` to
+  stored/nonlocal `visitor.type_aliases` (failing closed by retaining `alias_cands` in `outputs`
+  when `full_src` or `ds_reads` is `None`) while unconditionally excluding `visitor.imported_names`
+  from `outputs`.
 - **Multiline String & PEP 701 F-String Continuation Preservation in Dedent & Helper Synthesis**: Added
   `_find_multiline_string_continuation_lines` (tracking both `STRING`/`FSTRING_MIDDLE` tokens and active
   `FSTRING_START`..`FSTRING_END` ranges covering multi-line `{...}` interpolations) and
