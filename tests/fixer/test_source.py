@@ -871,3 +871,12 @@ def test_extract_unit_body_lines_indented_method_col0_multiline_string() -> None
         "clean = title.strip()",
         "return banner + clean",
     ]
+
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
+        _find_multiline_string_continuation_lines,
+        dedent_source_text,
+    )
+
+    cr_text = "    x = '''header\rcol0_line'''\r    y = 1\r"
+    assert _find_multiline_string_continuation_lines(cr_text) == {2}
+    assert dedent_source_text(cr_text) == "x = '''header\rcol0_line'''\ry = 1\r"

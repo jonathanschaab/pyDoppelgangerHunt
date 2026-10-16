@@ -5763,6 +5763,24 @@ def test_extract_nested_scope_free_reads_pep695_decorators_and_defaults() -> Non
     outer_v.visit(ast.parse("map(lambda k: b - k - a, items)").body[0])
     assert outer_v.ordered_names == ["map", "b", "a", "items"]
 
+    homonym_v = _OuterExprVisitor()
+    homonym_v.visit(ast.parse("lambda: ([x for x in items], y, x)").body[0])
+    assert homonym_v.ordered_names == ["items", "y", "x"]
+
+    nonlocal_v = _OuterExprVisitor()
+    nonlocal_v.visit(ast.parse("def _inner():\n    nonlocal z\n    z = y\n").body[0])
+    assert nonlocal_v.ordered_names == ["y", "z"]
+
+    eager_arity_fn = ast.parse(
+        "def check_gen(items, extra):\n"
+        "    a = sum((u for u in items), 0)\n"
+        "    b = list((v for v in items), extra)\n"
+        "    c = sum((w for w in items), *extra)\n"
+        "    d = sum((q for q in items), 0, extra)\n"
+    ).body[0]
+    eager_closures = _collect_scope_closures(eager_arity_fn)
+    assert len(eager_closures) == 3
+
     from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
         _resolve_unit_ast_end_col,
     )
@@ -5776,5 +5794,3 @@ def test_extract_nested_scope_free_reads_pep695_decorators_and_defaults() -> Non
     ml_fn = ml_tree.body[0]
     assert _resolve_unit_ast_end_col(ml_fn, {"start": 3, "end": 4}) is None
     assert _resolve_unit_ast_end_col(ml_fn, {"start": 2, "end": 4, "start_col": 10}) is None
-
-

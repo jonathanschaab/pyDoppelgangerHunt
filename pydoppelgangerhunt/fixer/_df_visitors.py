@@ -84,6 +84,7 @@ class _BaseScopeVisitor(ast.NodeVisitor):
         self.globals: Set[str] = set()
         self.nonlocals: Set[str] = set()
         self.stored: Set[str] = set()
+        self.load_nodes: List[ast.Name] = []
 
     def visit_Global(self, node: ast.Global) -> None:
         self.globals.update(node.names)
@@ -185,18 +186,18 @@ class _BaseScopeVisitor(ast.NodeVisitor):
         reads_set: Set[str],
     ) -> None:
         store_set.add(node.name)
-        reads_set.update(
-            r for r in _extract_nested_scope_free_reads(node) if not self._is_in_comp(r)
-        )
+        free_reads, free_nodes = _extract_nested_scope_free_reads_with_nodes(node)
+        reads_set.update(r for r in free_reads if not self._is_in_comp(r))
+        self.load_nodes.extend(n for n in free_nodes if not self._is_in_comp(n.id))
 
     def _visit_nested_lambda(
         self,
         node: ast.Lambda,
         reads_set: Set[str],
     ) -> None:
-        reads_set.update(
-            r for r in _extract_nested_scope_free_reads(node) if not self._is_in_comp(r)
-        )
+        free_reads, free_nodes = _extract_nested_scope_free_reads_with_nodes(node)
+        reads_set.update(r for r in free_reads if not self._is_in_comp(r))
+        self.load_nodes.extend(n for n in free_nodes if not self._is_in_comp(n.id))
 
     def _record_pattern_binding(self, node: ast.AST, store_set: Set[str]) -> None:
         self.generic_visit(node)
@@ -213,8 +214,8 @@ class _BaseScopeVisitor(ast.NodeVisitor):
     def visit_MatchAs(self, node: ast.AST) -> None:
         self.generic_visit(node)
 
-    @staticmethod
     def _visit_type_alias_node(
+        self,
         node: ast.AST,
         store_set: Set[str],
         on_free_read: Callable[[str], None],
@@ -222,8 +223,10 @@ class _BaseScopeVisitor(ast.NodeVisitor):
         name_node = getattr(node, "name", None)
         if isinstance(name_node, ast.Name):
             store_set.add(name_node.id)
-        for free in _extract_type_alias_free_reads(node):
+        free_reads, free_nodes = _extract_type_alias_free_reads_with_nodes(node)
+        for free in free_reads:
             on_free_read(free)
+        self.load_nodes.extend(n for n in free_nodes if not self._is_in_comp(n.id))
 
 
 class _FuncScopeVisitor(_BaseScopeVisitor):
@@ -268,6 +271,7 @@ class _FuncScopeVisitor(_BaseScopeVisitor):
         elif isinstance(node.ctx, ast.Load):
             if not self._is_in_comp(node.id):
                 self.direct_loads.add(node.id)
+                self.load_nodes.append(node)
 
     def visit_Import(self, node: ast.Import) -> None:
         self._record_import_names(node, self.local_stores)
@@ -289,15 +293,19 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
         self.class_stores: Set[str] = set()
         self.free_reads: Set[str] = set()
 
-    def _record_class_load(self, name: str) -> None:
+    def _record_class_load(self, name: str, node: Optional[ast.Name] = None) -> None:
         if self._is_in_comp(name):
             return
         if self._in_comp_body > 0:
             # Comprehensions in class bodies cannot resolve class attributes (PEP 227)
             if name not in self.globals:
                 self.free_reads.add(name)
+                if node is not None:
+                    self.load_nodes.append(node)
         elif name not in (self.class_stores | self.globals):
             self.free_reads.add(name)
+            if node is not None:
+                self.load_nodes.append(node)
 
     def _record_class_store(self, name: str) -> None:
         if self._can_store_in_class_scope(name):
@@ -329,7 +337,7 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         if isinstance(node.target, ast.Name):
-            self._record_class_load(node.target.id)
+            self._record_class_load(node.target.id, node.target)
             self.visit(node.value)
             self._record_class_store(node.target.id)
         else:
@@ -350,7 +358,7 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
 
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Load):
-            self._record_class_load(node.id)
+            self._record_class_load(node.id, node)
         elif isinstance(node.ctx, ast.Store):
             self._record_class_store(node.id)
 
@@ -399,16 +407,14 @@ class _OuterExprVisitor(_BaseScopeVisitor):
             self.ordered_names.append(name)
         self.names.add(name)
 
-    def _sync_added_names(self, node: ast.AST, before: Set[str]) -> None:
+    def _sync_added_names(self, before: Set[str], before_nodes_len: int) -> None:
         added = self.names - before
         if not added:
             return
         load_nodes = [
             child
-            for child in ast.walk(node)
-            if isinstance(child, ast.Name)
-            and isinstance(child.ctx, ast.Load)
-            and child.id in added
+            for child in self.load_nodes[before_nodes_len:]
+            if child.id in added and not self._is_in_comp(child.id)
         ]
         load_nodes.sort(
             key=lambda n: (getattr(n, "lineno", 0), getattr(n, "col_offset", 0))
@@ -416,18 +422,23 @@ class _OuterExprVisitor(_BaseScopeVisitor):
         for child in load_nodes:
             if child.id not in self.ordered_names:
                 self.ordered_names.append(child.id)
+        for name in sorted(added):
+            if name not in self.ordered_names:
+                self.ordered_names.append(name)
 
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Load) and not self._is_in_comp(node.id):
             self._record_name(node.id)
+            self.load_nodes.append(node)
 
     def visit_FunctionDef(
         self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef]
     ) -> None:
         before = set(self.names)
+        before_nodes_len = len(self.load_nodes)
         dummy_stores: Set[str] = set()
         self._visit_nested_named_scope(node, dummy_stores, self.names)
-        self._sync_added_names(node, before)
+        self._sync_added_names(before, before_nodes_len)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self.visit_FunctionDef(node)
@@ -437,17 +448,26 @@ class _OuterExprVisitor(_BaseScopeVisitor):
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         before = set(self.names)
+        before_nodes_len = len(self.load_nodes)
         self._visit_nested_lambda(node, self.names)
-        self._sync_added_names(node, before)
+        self._sync_added_names(before, before_nodes_len)
 
     def visit_TypeAlias(self, node: ast.AST) -> None:
         before = set(self.names)
-        self.names.update(_extract_type_alias_free_reads(node))
-        self._sync_added_names(node, before)
+        before_nodes_len = len(self.load_nodes)
+        dummy_stores: Set[str] = set()
+        self._visit_type_alias_node(
+            node,
+            dummy_stores,
+            lambda free: self.names.add(free) if not self._is_in_comp(free) else None,
+        )
+        self._sync_added_names(before, before_nodes_len)
 
 
-def _extract_type_alias_free_reads(node: ast.AST) -> Set[str]:
-    """Extracts free variable references escaping a TypeAlias definition."""
+def _extract_type_alias_free_reads_with_nodes(
+    node: ast.AST,
+) -> Tuple[Set[str], List[ast.Name]]:
+    """Extracts free variable references and their AST load nodes from a TypeAlias."""
     tp_names = {
         getattr(tp, "name", None)
         for tp in getattr(node, "type_params", [])
@@ -460,22 +480,31 @@ def _extract_type_alias_free_reads(node: ast.AST) -> Set[str]:
         sub_visitor.visit(tp)
     if hasattr(node, "value"):
         sub_visitor.visit(getattr(node, "value"))
-    return sub_visitor.names - tp_names - own_name
+    allowed = sub_visitor.names - tp_names - own_name
+    return allowed, [n for n in sub_visitor.load_nodes if n.id in allowed]
 
 
-def _extract_nested_scope_free_reads(
+def _extract_type_alias_free_reads(node: ast.AST) -> Set[str]:
+    """Extracts free variable references escaping a TypeAlias definition."""
+    return _extract_type_alias_free_reads_with_nodes(node)[0]
+
+
+def _extract_nested_scope_free_reads_with_nodes(
     node: Union[
         ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.GeneratorExp
     ],
     candidates: Optional[Set[str]] = None,
-) -> Set[str]:
-    """Extracts free variable references escaping a nested function, genexp, or class body."""
+) -> Tuple[Set[str], List[ast.Name]]:
+    """Extracts free variable references and their AST load nodes escaping a nested scope."""
     if isinstance(node, ast.GeneratorExp):
         gen_visitor = _OuterExprVisitor()
         gen_visitor.visit(node)
-        if candidates is not None:
-            return gen_visitor.names & candidates
-        return gen_visitor.names
+        res = (
+            gen_visitor.names & candidates
+            if candidates is not None
+            else gen_visitor.names
+        )
+        return res, [n for n in gen_visitor.load_nodes if n.id in res]
 
     type_param_names: Set[str] = set()
     for tp in getattr(node, "type_params", []):
@@ -510,9 +539,15 @@ def _extract_nested_scope_free_reads(
             | (outer_visitor.names - type_param_names)
             | class_free
         )
-        if candidates is not None:
-            return class_reads & candidates
-        return class_reads
+        res_class = (
+            class_reads & candidates if candidates is not None else class_reads
+        )
+        class_nodes = (
+            unscoped_visitor.load_nodes
+            + [n for n in outer_visitor.load_nodes if n.id not in type_param_names]
+            + [n for n in class_visitor.load_nodes if n.id in class_free]
+        )
+        return res_class, [n for n in class_nodes if n.id in res_class]
 
     defaults = node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]
     for d in defaults:
@@ -537,19 +572,33 @@ def _extract_nested_scope_free_reads(
     elif isinstance(node, ast.Lambda):
         func_visitor.visit(node.body)
 
-    escaped = (
+    body_escaped = (
         (func_visitor.direct_loads | func_visitor.nested_free_reads)
-        - (func_visitor.params | func_visitor.local_stores)
-    ) | func_visitor.nonlocals
-    escaped -= func_visitor.globals
+        - (func_visitor.params | func_visitor.local_stores | func_visitor.globals)
+    )
+    escaped = (body_escaped | func_visitor.nonlocals) - func_visitor.globals
     all_free = (
         unscoped_visitor.names
         | (outer_visitor.names - type_param_names)
         | escaped
     )
-    if candidates is not None:
-        return all_free & candidates
-    return all_free
+    res_func = all_free & candidates if candidates is not None else all_free
+    func_nodes = (
+        unscoped_visitor.load_nodes
+        + [n for n in outer_visitor.load_nodes if n.id not in type_param_names]
+        + [n for n in func_visitor.load_nodes if n.id in body_escaped]
+    )
+    return res_func, [n for n in func_nodes if n.id in res_func]
+
+
+def _extract_nested_scope_free_reads(
+    node: Union[
+        ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.GeneratorExp
+    ],
+    candidates: Optional[Set[str]] = None,
+) -> Set[str]:
+    """Extracts free variable references escaping a nested function, genexp, or class body."""
+    return _extract_nested_scope_free_reads_with_nodes(node, candidates=candidates)[0]
 
 
 def _extract_assigned_names(target: ast.AST) -> List[str]:

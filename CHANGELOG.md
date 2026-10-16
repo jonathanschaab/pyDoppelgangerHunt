@@ -257,7 +257,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Bracket-Stack Type Parsing**: Replaced scalar bracket depth in `_split_delimited_type_string`
   with an explicit bracket stack to reject mismatched bracket pairs (e.g. `Tuple[int, str)`).
 - **Call Argument Validation for Generator Expressions**: Verified that `genexp` is an argument
-  in `_is_eagerly_consumed_genexp` before classifying it as consumed by eager built-ins or `.join`.
+  in `_is_eagerly_consumed_genexp` (`_df_closures.py`) with no starred arguments (`ast.Starred`),
+  `len(parent.args) == 1` for single-iterable consumers (`min`, `max`, `dict`, `list`, `set`,
+  `tuple`, `frozenset`, `any`, `all`, `sorted`), and `1 <= len(parent.args) <= 2` for `sum`.
 - **Priority Score on Inverted Coordinates**: Restored `compute_priority_score` to return `0.0`
   when unit coordinates are inverted or non-positive.
 - **Symlinked and Aliased Root Safe Path Resolution**: Updated `resolve_safe_unit_file_path`
@@ -272,7 +274,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_prune_pair_lhs_and_augassign_scopes` (`synthesis.py`, `_df_visitors.py`, `patch.py`) to prune LHS-only
   `ast.Load` identifiers, unreferenced `AugAssign` targets, and receiver attributes (`arr[i] = ...`,
   `self.cache[k] = ...`, `self.res1 = [x * self.factor ...]`, `res: MyType = ...`, `total += ...`),
-  order surviving inputs by their first free-load appearance on the RHS (`_OuterExprVisitor.ordered_names`),
+  order surviving inputs by their first free-load appearance on the RHS (`_OuterExprVisitor.ordered_names`,
+  excluding shadowed bound homonyms and appending `nonlocal` store-only names),
   recompute receiver binding flags (`has_instance_binding`, `has_class_binding`,
   `has_receiver_access`, `binding_kind`) respecting custom `@classmethod` receiver names, map
   call-site arguments positionally (`dict(zip(inputs, target_inputs))`) in `_format_call_arguments`,
@@ -382,7 +385,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `full_src` or `ds_reads` is `None`) while unconditionally excluding `visitor.imported_names` from
   `outputs`.
 - **Multiline String & PEP 701 F-String Continuation Preservation in Dedent & Helper Synthesis**: Added
-  `_find_multiline_string_continuation_lines` (tracking both `STRING`/`FSTRING_MIDDLE` tokens and active
+  `_find_multiline_string_continuation_lines` (using `io.StringIO(text, newline=None)` for universal
+  newline alignment on lone-`\r` buffers and tracking both `STRING`/`FSTRING_MIDDLE` tokens and active
   `FSTRING_START`..`FSTRING_END` ranges covering multi-line `{...}` interpolations) and
   `_dedent_preserving_multiline_strings` (`source.py`) plus `_indent_code_lines` (`synthesis.py`) so
   continuation lines inside multiline string/f-string literals neither zero out `dedent_source_text` block

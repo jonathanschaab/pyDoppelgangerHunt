@@ -318,7 +318,7 @@ def _find_multiline_string_continuation_lines(text: str) -> Set[int]:
         return cont_lines
     fstring_start_lines: List[int] = []
     try:
-        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+        for tok in tokenize.generate_tokens(io.StringIO(text, newline=None).readline):
             if _FSTRING_START_TOK is not None and tok.type == _FSTRING_START_TOK:
                 fstring_start_lines.append(tok.start[0])
             elif _FSTRING_END_TOK is not None and tok.type == _FSTRING_END_TOK:
@@ -340,12 +340,15 @@ def _dedent_preserving_multiline_strings(text: str) -> str:
         return textwrap.dedent(text)
     raw_lines = split_source_lines(text)
     masked_lines = [
-        "\n" if idx in cont_lines else ln
+        "\n" if idx in cont_lines else ln.rstrip("\r\n") + "\n"
         for idx, ln in enumerate(raw_lines, start=1)
     ]
     dedented_masked = split_source_lines(textwrap.dedent("".join(masked_lines)))
     return "".join(
-        raw_lines[idx - 1] if idx in cont_lines else ded_ln
+        raw_lines[idx - 1]
+        if idx in cont_lines
+        else ded_ln.rstrip("\r\n")
+        + raw_lines[idx - 1][len(raw_lines[idx - 1].rstrip("\r\n")) :]
         for idx, ded_ln in enumerate(dedented_masked, start=1)
     )
 
@@ -745,7 +748,9 @@ def extract_unit_comments_and_pragmas(
 
     results: List[Dict[str, Any]] = []
     try:
-        token_gen = tokenize.generate_tokens(io.StringIO(source_text).readline)
+        token_gen = tokenize.generate_tokens(
+            io.StringIO(source_text, newline=None).readline
+        )
         for tok in token_gen:
             if tok.type == tokenize.COMMENT:
                 tok_line, tok_col = tok.start
