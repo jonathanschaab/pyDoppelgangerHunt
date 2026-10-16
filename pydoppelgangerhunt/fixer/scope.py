@@ -143,6 +143,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.except_vars: Set[str] = set()
         self.deleted_names: Set[str] = set()
         self.type_aliases: Set[str] = set()
+        self.type_params: List[str] = []
         self._scope_stack: List[Set[str]] = []
         self._type_param_scopes: List[Set[str]] = []
         self._comprehension_depth: int = 0
@@ -287,21 +288,25 @@ class _ScopeVisitor(ast.NodeVisitor):
             if tp_names:
                 self._type_param_scopes.append(tp_names)
             for tp in getattr(node, "type_params", []):
+                try:
+                    self.type_params.append(ast.unparse(tp))
+                except Exception as exc:
+                    logger.debug("Failed to unparse type_param %r: %s", tp, exc)
                 self.visit(tp)
             self._process_args(node)
             self._scope_stack.append(set(self.params) | tp_names)
         else:
             for dec in node.decorator_list:
                 self.visit(dec)
-            if tp_names:
-                self._type_param_scopes.append(tp_names)
-            for tp in getattr(node, "type_params", []):
-                self.visit(tp)
             for default in node.args.defaults:
                 self.visit(default)
             for kw_default in node.args.kw_defaults:
                 if kw_default is not None:
                     self.visit(kw_default)
+            if tp_names:
+                self._type_param_scopes.append(tp_names)
+            for tp in getattr(node, "type_params", []):
+                self.visit(tp)
             self._record_store_name(node.name)
             if not self._scope_stack:
                 self._scope_stack.append(set())
@@ -1356,6 +1361,7 @@ def _inspect_unit_scope(
         "instance_attrs": [],
         "class_attrs": [],
         "outputs_ambiguous": False,
+        "type_params": [],
     }
     if not dedented.strip():
         return empty_res
@@ -1522,21 +1528,23 @@ def _inspect_unit_scope(
     pre_outs = resolve_unit_declared_outputs(unit)
 
     outputs_ambiguous = False
-    local_defs = visitor.type_aliases | set(visitor.imported_names)
-    downstream_local_defs: Set[str] = set()
-    if is_subroutine and local_defs:
+    alias_cands = visitor.type_aliases & (set(visitor.stores) | set(visitor.nonlocals))
+    downstream_aliases: Set[str] = set()
+    if is_subroutine and alias_cands:
         full_src = _get_full_source()
         if full_src:
             ds_reads = collect_downstream_read_names(
                 full_src,
                 unit,
-                candidates=local_defs,
+                candidates=alias_cands,
                 tree=file_tree,
                 unit_inputs=set(inputs),
             )
             if ds_reads:
-                downstream_local_defs = ds_reads
-    excluded_local_defs = local_defs - downstream_local_defs
+                downstream_aliases = ds_reads
+    excluded_local_defs = (visitor.type_aliases - downstream_aliases) | set(
+        visitor.imported_names
+    )
 
     if is_subroutine and isinstance(pre_outs, (list, tuple)):
         outputs = list(dict.fromkeys(pre_outs))
@@ -1673,6 +1681,7 @@ def _inspect_unit_scope(
             if any(a.startswith(f"{r}.") for r in class_receivers)
         ],
         "outputs_ambiguous": outputs_ambiguous,
+        "type_params": list(visitor.type_params),
     }
 
 
@@ -1692,6 +1701,26 @@ def _align_symmetric_var_list(list1: List[str], list2: List[str]) -> List[str]:
     if len(list1) == len(list2):
         return common if len(common) == len(list1) else list1
     return common if common else list1
+
+
+def _merge_type_params(tp1: Sequence[str], tp2: Sequence[str]) -> List[str]:
+    """Merges PEP 695 type parameters across two units without duplicate parameter names."""
+    if not tp2:
+        return list(tp1)
+    if not tp1:
+        return list(tp2)
+    seen: Dict[str, str] = {}
+    order: List[str] = []
+    for raw_tp in list(tp1) + list(tp2):
+        head = raw_tp.split(":", 1)[0].split("=", 1)[0].strip()
+        if not head:
+            continue
+        if head not in seen:
+            seen[head] = raw_tp
+            order.append(head)
+        elif seen[head] != raw_tp:
+            seen[head] = head
+    return [seen[h] for h in order]
 
 
 def analyze_unit_variable_scope(
@@ -1756,6 +1785,9 @@ def analyze_unit_variable_scope(
         outputs_ambiguous = bool(
             info1.get("outputs_ambiguous", False) or info2.get("outputs_ambiguous", False)
         )
+        type_params = _merge_type_params(
+            info1.get("type_params", []), info2.get("type_params", [])
+        )
     else:
         inputs = info1["inputs"]
         outputs = info1["outputs"]
@@ -1781,6 +1813,7 @@ def analyze_unit_variable_scope(
         conditional_outputs = info1.get("conditional_outputs", [])
         definite_stores = info1.get("definite_stores", [])
         outputs_ambiguous = bool(info1.get("outputs_ambiguous", False))
+        type_params = list(info1.get("type_params", []))
 
     has_instance_binding = info1.get("has_instance_binding", False) or (
         info2.get("has_instance_binding", False) if u2 is not None else False
@@ -1856,4 +1889,5 @@ def analyze_unit_variable_scope(
             )
         ),
         "outputs_ambiguous": outputs_ambiguous,
+        "type_params": type_params,
     }

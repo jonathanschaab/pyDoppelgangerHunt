@@ -13,6 +13,7 @@ from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
     _has_receiver_reference,
+    _is_pair_in_method,
     _is_same_file_path,
     _populate_unit_receiver_metadata,
     _prune_unshared_receivers,
@@ -1301,6 +1302,8 @@ def synthesize_shared_helper_code(
             return str(u["receiver_kind"])
         if "receiver_kind" in u and u.get("receiver_kind") is None:
             return "none"
+        if receiver_kind:
+            return receiver_kind
         if u.get("kind") in ("closure", "class", "comprehension", "data_table", "complex_expr"):
             return "none"
         if u.get("is_static"):
@@ -1308,8 +1311,6 @@ def synthesize_shared_helper_code(
         bk = u_scope.get("binding_kind")
         if bk in ("static", "class", "instance"):
             return str(bk)
-        if receiver_kind:
-            return receiver_kind
         if is_static:
             return "static"
         if u.get("enclosing_class"):
@@ -1359,11 +1360,15 @@ def synthesize_shared_helper_code(
         or (k1 == "class" and k2 == "class")
     )
 
-    is_in_method = bool(
-        u1.get("kind") not in ("comprehension", "complex_expr", "closure", "class")
-        and u2.get("kind") not in ("comprehension", "complex_expr", "closure", "class")
-        and k1 != "none"
-        and k2 != "none"
+    has_super = bool(scope1.get("has_super") or scope2.get("has_super"))
+    has_mangled = bool(scope1.get("has_mangled_names") or scope2.get("has_mangled_names"))
+    is_in_method = _is_pair_in_method(
+        u1,
+        u2,
+        method_binding=method_binding,
+        has_super=has_super,
+        has_mangled=has_mangled,
+        has_method_context=bool(k1 != "none" and k2 != "none"),
     )
 
     effective_binding = _resolve_effective_binding(
@@ -1375,11 +1380,9 @@ def synthesize_shared_helper_code(
         receiver_kind=k1,
     )
 
-    has_super = bool(scope1.get("has_super") or scope2.get("has_super"))
     if has_super and (effective_binding == "module" or is_static_clone):
         return ""
 
-    has_mangled = bool(scope1.get("has_mangled_names") or scope2.get("has_mangled_names"))
     if has_mangled and (effective_binding != "method" or not is_same_class or is_static_clone):
         return ""
 
@@ -1614,9 +1617,11 @@ def synthesize_shared_helper_code(
             dec_prefix = ""
     else:
         dec_prefix = ""
+    tp_list = scope.get("type_params") or scope1.get("type_params") or []
+    type_params_str = f"[{', '.join(tp_list)}]" if (tp_list and not is_sub) else ""
     helper_def = (
         f"{dec_prefix}"
-        f"{indent}{func_keyword} {helper_name}({params_str}) -> {return_type}:\n"
+        f"{indent}{func_keyword} {helper_name}{type_params_str}({params_str}) -> {return_type}:\n"
         f"{docstring_str}\n"
         f"{indented_body}\n"
     )

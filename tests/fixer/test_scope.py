@@ -1952,6 +1952,68 @@ def test_scope_visitor_pep695_type_params_and_type_alias(tmp_path: Path) -> None
     scope_ds = _inspect_unit_scope(u_ds, repo_root=str(tmp_path))
     assert "DownstreamAlias" in scope_ds["outputs"]
     assert "val" in scope_ds["outputs"]
+    assert scope_fn["type_params"] == ["T"]
+
+    # 4. Nested generic function default argument evaluated outside type_params
+    src_def = (
+        "def outer():\n"
+        "    def inner[V](x: V = V) -> V:\n"
+        "        return x\n"
+        "    return inner\n"
+    )
+    f_def = tmp_path / "pep695_def.py"
+    f_def.write_text(src_def, encoding="utf-8")
+    u_def = {
+        "file": str(f_def),
+        "start": 2,
+        "end": 3,
+        "kind": "compound_block",
+        "is_subroutine": True,
+        "name": "outer_sub",
+    }
+    scope_def = _inspect_unit_scope(u_def, repo_root=str(tmp_path))
+    assert "V" in scope_def["inputs"]
+
+
+def test_subroutine_local_import_skips_downstream_read_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that subroutines with only local imports do not invoke collect_downstream_read_names."""
+    import pydoppelgangerhunt.fixer.scope as scope_mod
+    from pydoppelgangerhunt.fixer.scope import _merge_type_params
+
+    assert _merge_type_params(["T: int"], ["T: int"]) == ["T: int"]
+    assert _merge_type_params(["T: int"], ["T: str"]) == ["T"]
+    assert _merge_type_params(["T"], []) == ["T"]
+    assert _merge_type_params([], ["U"]) == ["U"]
+
+    calls: list[ set[str] ] = []
+
+    def _spy_downstream(*args: Any, **kwargs: Any) -> set[str]:
+        calls.append(set(kwargs.get("candidates") or ()))
+        return set()
+
+    monkeypatch.setattr(scope_mod, "collect_downstream_read_names", _spy_downstream)
+
+    src = (
+        "def compute(x: int) -> float:\n"
+        "    import math\n"
+        "    res = math.sqrt(x)\n"
+        "    return res\n"
+    )
+    f = tmp_path / "local_imp.py"
+    f.write_text(src, encoding="utf-8")
+    u = {
+        "file": str(f),
+        "start": 2,
+        "end": 3,
+        "kind": "subroutine",
+        "name": "compute_sub",
+    }
+    scope = _inspect_unit_scope(u, repo_root=str(tmp_path))
+    assert calls == []
+    assert "math" not in scope["outputs"]
+    assert "res" in scope["outputs"]
 
 
 def test_scope_visitor_comprehension_subscript_target(tmp_path: Path) -> None:

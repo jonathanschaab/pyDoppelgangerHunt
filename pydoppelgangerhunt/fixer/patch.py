@@ -20,6 +20,7 @@ from pydoppelgangerhunt.fixer.binding import (
     _get_enclosing_receiver_kind,
     _has_receiver_reference,
     _is_method_of_class,
+    _is_pair_in_method,
     _is_same_file_path,
     _prune_unshared_receivers,
     _resolve_effective_binding,
@@ -3191,11 +3192,9 @@ def _generate_refactoring_patch_impl(
             fn2_kind = _determine_unit_receiver_kind(fn2, u2_eff, enc2)
 
             receiver_kinds_differ = bool(fn1_kind != fn2_kind)
-            is_in_method = bool(
+            has_method_ctx = bool(
                 fn1
                 and fn2
-                and u1_eff.get("kind") not in ("comprehension", "complex_expr", "closure", "class")
-                and u2_eff.get("kind") not in ("comprehension", "complex_expr", "closure", "class")
                 and (fn1.get("receiver_param") or fn1.get("is_static"))
                 and (fn2.get("receiver_param") or fn2.get("is_static"))
             )
@@ -3332,6 +3331,16 @@ def _generate_refactoring_patch_impl(
                     skip_reasons["unbound receiver reference"] += 1
                     continue
 
+            has_super = bool(s1.get("has_super") or s2.get("has_super"))
+            has_mangled = bool(s1.get("has_mangled_names") or s2.get("has_mangled_names"))
+            is_in_method = _is_pair_in_method(
+                u1_eff,
+                u2_eff,
+                method_binding=method_binding,
+                has_super=has_super,
+                has_mangled=has_mangled,
+                has_method_context=has_method_ctx,
+            )
             effective_binding = _resolve_effective_binding(
                 method_binding,
                 is_same_class,
@@ -3341,12 +3350,10 @@ def _generate_refactoring_patch_impl(
                 receiver_kind=fn1_kind,
             )
 
-            has_super = bool(s1.get("has_super") or s2.get("has_super"))
             if has_super and (effective_binding == "module" or is_static):
                 skip_reasons["super() in non-method helper"] += 1
                 continue
 
-            has_mangled = bool(s1.get("has_mangled_names") or s2.get("has_mangled_names"))
             if has_mangled and (effective_binding != "method" or not is_same_class or is_static):
                 skip_reasons["mangled names in non-method helper"] += 1
                 continue

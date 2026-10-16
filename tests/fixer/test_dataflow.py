@@ -5651,3 +5651,36 @@ def test_scope_hierarchy_visitor_pep695_type_params_traversal() -> None:
     assert func_is_async.get(id(comps[0])) is True
     assert func_is_async.get(id(comps[1])) is False
     assert enclosing_classes.get(id(comps[1])) == "GenericCls"
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="PEP 695 syntax requires Python 3.12+",
+)
+def test_extract_nested_scope_free_reads_pep695_decorators_and_defaults() -> None:
+    """Verifies that _extract_nested_scope_free_reads evaluates decorators and function
+    default arguments in the enclosing scope outside PEP 695 type_params."""
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=import-outside-toplevel
+        _extract_nested_scope_free_reads,
+    )
+
+    fn_code = (
+        "@T\n"
+        "def gen_fn[T, U](x: T = U, *, y: U = W) -> T:\n"
+        "    return x\n"
+    )
+    fn_node = ast.parse(fn_code).body[0]
+    fn_reads = _extract_nested_scope_free_reads(fn_node)  # type: ignore[arg-type]
+    # Decorator @T and defaults = U, = W are evaluated in enclosing scope outside [T, U]
+    assert {"T", "U", "W"} <= fn_reads
+
+    cls_code = (
+        "@T\n"
+        "class GenCls[T](Base[T]):\n"
+        "    pass\n"
+    )
+    cls_node = ast.parse(cls_code).body[0]
+    cls_reads = _extract_nested_scope_free_reads(cls_node)  # type: ignore[arg-type]
+    assert "T" in cls_reads
+    assert "Base" in cls_reads
+

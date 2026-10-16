@@ -3497,3 +3497,64 @@ def test_synthesize_shared_helper_code_rejects_asymmetric_unmapped_expr_stmt(
     u3 = {"file": str(f), "start": 9, "end": 9, "name": "f3_expr", "kind": "complex_expr"}
     assert synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path)) == ""
     assert synthesize_shared_helper_code(u3, u3, repo_root=str(tmp_path)) == ""
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="PEP 695 syntax requires Python 3.12+",
+)
+def test_synthesize_shared_helper_code_preserves_pep695_type_params(
+    tmp_path: Path,
+) -> None:
+    """Verifies that whole generic functions preserve PEP 695 type_params on the synthesized helper header."""
+    f = tmp_path / "generic_fns.py"
+    f.write_text(
+        "def first[T](items: list[T], cast_fn) -> T:\n"
+        "    head = items[0]\n"
+        "    return cast_fn(T, head)\n"
+        "\n"
+        "def second[T](items: list[T], cast_fn) -> T:\n"
+        "    head = items[0]\n"
+        "    return cast_fn(T, head)\n",
+        encoding="utf-8",
+    )
+    u1 = {"file": str(f), "start": 1, "end": 3, "name": "first", "kind": "function"}
+    u2 = {"file": str(f), "start": 5, "end": 7, "name": "second", "kind": "function"}
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "def _shared_first_second[T](" in helper
+    assert "return cast_fn(T, head)" in helper
+
+
+def test_same_class_whole_line_expr_explicit_method_binding(
+    tmp_path: Path,
+) -> None:
+    """Verifies that explicit method_binding='method' on same-class whole-line comprehension
+    units injects self on the helper and delegates via self._shared_...(...)."""
+    f = tmp_path / "same_cls_expr.py"
+    f.write_text(
+        "class Processor:\n"
+        "    def run_a(self, items: list[int]) -> None:\n"
+        "        self.res1 = [x * 2 for x in items]\n"
+        "\n"
+        "    def run_b(self, items: list[int]) -> None:\n"
+        "        self.res2 = [x * 2 for x in items]\n",
+        encoding="utf-8",
+    )
+    u1 = {"file": str(f), "start": 3, "end": 3, "name": "run_a_comp", "kind": "comprehension"}
+    u2 = {"file": str(f), "start": 6, "end": 6, "name": "run_b_comp", "kind": "comprehension"}
+
+    helper = synthesize_shared_helper_code(
+        u1, u2, method_binding="method", repo_root=str(tmp_path)
+    )
+    assert "def _shared_run_a_comp_run_b_comp(self, items: Any) -> Any:" in helper
+
+    patch = generate_refactoring_patch(
+        [(0.98, u1, u2)],
+        repo_root=str(tmp_path),
+        method_binding="method",
+        replace_clones=True,
+    )
+    assert "+    def _shared_run_a_comp_run_b_comp(self, items: Any) -> Any:" in patch
+    assert "+        self.res1 = self._shared_run_a_comp_run_b_comp(items)" in patch
+    assert "+        self.res2 = self._shared_run_a_comp_run_b_comp(items)" in patch
+

@@ -448,6 +448,7 @@ def _extract_nested_scope_free_reads(
         if isinstance(tp_name, str):
             type_param_names.add(tp_name)
 
+    unscoped_visitor = _OuterExprVisitor()
     outer_visitor = _OuterExprVisitor()
     for tp in getattr(node, "type_params", []):
         outer_visitor.visit(tp)
@@ -458,7 +459,7 @@ def _extract_nested_scope_free_reads(
         for kw in node.keywords:
             outer_visitor.visit(kw.value)
         for dec in node.decorator_list:
-            outer_visitor.visit(dec)
+            unscoped_visitor.visit(dec)
         class_visitor = _ClassScopeVisitor()
         for tp_name in type_param_names:
             class_visitor.class_stores.add(tp_name)
@@ -469,21 +470,25 @@ def _extract_nested_scope_free_reads(
             - class_visitor.globals
             - type_param_names
         )
-        class_reads = (outer_visitor.names - type_param_names) | class_free
+        class_reads = (
+            unscoped_visitor.names
+            | (outer_visitor.names - type_param_names)
+            | class_free
+        )
         if candidates is not None:
             return class_reads & candidates
         return class_reads
 
     defaults = node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]
     for d in defaults:
-        outer_visitor.visit(d)
+        unscoped_visitor.visit(d)
     for arg in _collect_func_args(node.args):
         if arg.annotation is not None:
             outer_visitor.visit(arg.annotation)
 
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         for dec in node.decorator_list:
-            outer_visitor.visit(dec)
+            unscoped_visitor.visit(dec)
         if node.returns is not None:
             outer_visitor.visit(node.returns)
 
@@ -502,7 +507,11 @@ def _extract_nested_scope_free_reads(
         - (func_visitor.params | func_visitor.local_stores)
     ) | func_visitor.nonlocals
     escaped -= func_visitor.globals
-    all_free = (outer_visitor.names - type_param_names) | escaped
+    all_free = (
+        unscoped_visitor.names
+        | (outer_visitor.names - type_param_names)
+        | escaped
+    )
     if candidates is not None:
         return all_free & candidates
     return all_free

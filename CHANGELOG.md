@@ -334,21 +334,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_UnitLiveInVisitor.visit_Assign`, `visit_AnnAssign`, `visit_BoolOp`, `visit_IfExp`, and
   `visit_NamedExpr` so RHS values and conditional depths are always evaluated accurately across
   multi-line and sub-line unit boundaries.
-- **Same-Class Whole-Line Expression `@staticmethod` & Receiver Guard**: Guarded `@staticmethod`
-  emission in `synthesize_shared_helper_code` (`synthesis.py`) when `fn1_kind` or `fn2_kind` is
-  `"instance"`, aligned `u1_eff`/`u2_eff` expression kinds prior to computing `fn1_kind`/`fn2_kind`
-  and `is_in_method` in `generate_refactoring_patch` (`patch.py`), and delegated `binding_kind`
-  recomputation in `_prune_unreferenced_lhs_scope` to `_determine_binding_kind`.
+- **Same-Class Whole-Line Expression `@staticmethod`, Receiver & `method_binding="method"` Guard**:
+  Guarded `@staticmethod` emission in `synthesize_shared_helper_code` (`synthesis.py`) when
+  `fn1_kind` or `fn2_kind` is `"instance"`, aligned `u1_eff`/`u2_eff` expression kinds prior to
+  computing `fn1_kind`/`fn2_kind` and `is_in_method` in `generate_refactoring_patch` (`patch.py`),
+  factored `_is_pair_in_method` (`binding.py`) so explicit `method_binding="method"` (as well as
+  `super()` / mangled name references) preserves method binding and injects `self`/`cls` on
+  same-class whole-line `comprehension` and `complex_expr` units inside methods, and delegated
+  `binding_kind` recomputation in `_prune_unreferenced_lhs_scope` to `_determine_binding_kind`.
 - **Quoted Forward Reference PEP 604 Union Normalization**: Added `_is_single_quoted_literal` in
   `synthesis.py` so `_normalize_pipe_unions` only unwraps outer quotes when the opening quote at
   index `0` closes at the final character, converting unions of quoted forward references
   (`'"NodeA" | "NodeB"'`) into `'Union["NodeA", "NodeB"]'`.
-- **PEP 695 `type_params` and `TypeAlias` Scope Isolation & Downstream Output Propagation**: Bound PEP 695
-  `type_params` on `FunctionDef`, `AsyncFunctionDef`, `ClassDef`, and `TypeAlias` in `_ScopeVisitor`
-  (`scope.py`) and `_extract_helper_symbols` (`patch.py`), recorded `alias_name` store before visiting
-  `type_params` and `value` so recursive nested `TypeAlias` definitions (`type Tree = list[Tree]`) do not
-  leak into outer `loads`, and excluded subroutine-local `TypeAlias` / imported names from runtime `outputs`
-  only when not referenced downstream in the enclosing scope (checked via `collect_downstream_read_names`).
+- **PEP 695 `type_params` Header Preservation, Decorator/Default Scoping & Downstream `TypeAlias` Propagation**:
+  Bound PEP 695 `type_params` on `FunctionDef`, `AsyncFunctionDef`, `ClassDef`, and `TypeAlias` in
+  `_ScopeVisitor` (`scope.py`) and `_extract_helper_symbols` (`patch.py`); preserved top-level
+  generic function `type_params` (`scope["type_params"]`, merged via `_merge_type_params`) onto the
+  synthesized helper header (`def _shared_...[T](...)`) in `synthesize_shared_helper_code`
+  (`synthesis.py`) so type parameters referenced in annotations or at runtime remain bound;
+  evaluated `decorator_list` and function `defaults`/`kw_defaults` outside `type_params` in
+  `_extract_nested_scope_free_reads` (`_df_visitors.py`) and `_ScopeVisitor._process_func`
+  (`scope.py`); recorded `alias_name` store before visiting `type_params` and `value` so recursive
+  nested `TypeAlias` definitions (`type Tree = list[Tree]`) do not leak into outer `loads`; and
+  restricted `collect_downstream_read_names` in `_inspect_unit_scope` to stored/nonlocal
+  `visitor.type_aliases` while unconditionally excluding `visitor.imported_names` from `outputs`.
 - **Multiline String & PEP 701 F-String Continuation Preservation in Dedent & Helper Synthesis**: Added
   `_find_multiline_string_continuation_lines` (tracking both `STRING`/`FSTRING_MIDDLE` tokens and active
   `FSTRING_START`..`FSTRING_END` ranges covering multi-line `{...}` interpolations) and

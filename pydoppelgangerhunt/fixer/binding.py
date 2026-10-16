@@ -445,6 +445,28 @@ def _base_unit_name(u: Dict[str, Any]) -> str:
 
 
 
+def _is_pair_in_method(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    *,
+    method_binding: str = "auto",
+    has_super: bool = False,
+    has_mangled: bool = False,
+    has_method_context: bool = True,
+) -> bool:
+    """Returns True if a clone pair resides in a method context eligible for method binding."""
+    disallow_kinds = (
+        ("closure", "class")
+        if (method_binding == "method" or has_super or has_mangled)
+        else ("comprehension", "complex_expr", "closure", "class")
+    )
+    return bool(
+        has_method_context
+        and u1.get("kind") not in disallow_kinds
+        and u2.get("kind") not in disallow_kinds
+    )
+
+
 def _resolve_effective_binding(
     method_binding: str,
     is_same_class: bool,
