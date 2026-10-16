@@ -5618,3 +5618,36 @@ def test_comprehension_subscript_target_and_class_walrus() -> None:
     free_reads = _extract_nested_scope_free_reads(cls_node)  # type: ignore[arg-type]
     assert "seq" in free_reads
     assert "w" in free_reads
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="PEP 695 syntax requires Python 3.12+",
+)
+def test_scope_hierarchy_visitor_pep695_type_params_traversal() -> None:
+    """Verifies that _ScopeHierarchyVisitor traverses PEP 695 type_params on ClassDef and FunctionDef."""
+    from pydoppelgangerhunt.parser import (  # pylint: disable=import-outside-toplevel
+        _ScopeHierarchyVisitor,
+    )
+
+    code = (
+        "async def outer_async():\n"
+        "    class GenericCls[T: [x for x in range(2)]]:\n"
+        "        def generic_m[U: [y for y in range(2)]](self) -> None:\n"
+        "            pass\n"
+    )
+    tree = ast.parse(code)
+    func_is_async: Dict[int, bool] = {}
+    enclosing_classes: Dict[int, str] = {}
+    _ScopeHierarchyVisitor(
+        func_is_async=func_is_async,
+        enclosing_classes=enclosing_classes,
+    ).visit(tree)
+    comps = sorted(
+        [n for n in ast.walk(tree) if isinstance(n, ast.ListComp)],
+        key=lambda n: getattr(n, "lineno", 0),
+    )
+    assert len(comps) == 2
+    assert func_is_async.get(id(comps[0])) is True
+    assert func_is_async.get(id(comps[1])) is False
+    assert enclosing_classes.get(id(comps[1])) == "GenericCls"

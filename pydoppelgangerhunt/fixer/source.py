@@ -293,14 +293,55 @@ def _extract_docstring_end_line(tree: ast.AST) -> int:
 _extract_module_docstring_end_line = _extract_docstring_end_line
 
 
+_MULTILINE_STR_TOKEN_TYPES = tuple(
+    t
+    for t in (
+        tokenize.STRING,
+        getattr(tokenize, "FSTRING_MIDDLE", None),
+    )
+    if t is not None
+)
+
+
+def _find_multiline_string_continuation_lines(text: str) -> Set[int]:
+    """Returns 1-based line numbers that start inside a multiline string literal token."""
+    cont_lines: Set[int] = set()
+    if not ("'''" in text or '"""' in text or "\\\n" in text or "\\\r" in text):
+        return cont_lines
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type in _MULTILINE_STR_TOKEN_TYPES and tok.start[0] < tok.end[0]:
+                cont_lines.update(range(tok.start[0] + 1, tok.end[0] + 1))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        pass
+    return cont_lines
+
+
+def _dedent_preserving_multiline_strings(text: str) -> str:
+    """Dedents source text while leaving multiline string continuation lines untouched."""
+    cont_lines = _find_multiline_string_continuation_lines(text)
+    if not cont_lines:
+        return textwrap.dedent(text)
+    raw_lines = split_source_lines(text)
+    masked_lines = [
+        "\n" if idx in cont_lines else ln
+        for idx, ln in enumerate(raw_lines, start=1)
+    ]
+    dedented_masked = split_source_lines(textwrap.dedent("".join(masked_lines)))
+    return "".join(
+        raw_lines[idx - 1] if idx in cont_lines else ded_ln
+        for idx, ded_ln in enumerate(dedented_masked, start=1)
+    )
+
+
 def dedent_source_text(text: str) -> str:
-    """Dedents source text while preserving leading form feed characters."""
+    """Dedents source text while preserving leading form feed characters and multiline strings."""
     lines = split_source_lines(text)
     if not any(ln.startswith("\x0c") for ln in lines):
-        return textwrap.dedent(text)
+        return _dedent_preserving_multiline_strings(text)
     ff_mask = [ln.startswith("\x0c") for ln in lines]
     cleaned = "".join(ln[1:] if m else ln for ln, m in zip(lines, ff_mask))
-    dedented_lines = split_source_lines(textwrap.dedent(cleaned))
+    dedented_lines = split_source_lines(_dedent_preserving_multiline_strings(cleaned))
     return "".join("\x0c" + ln if m else ln for ln, m in zip(dedented_lines, ff_mask))
 
 

@@ -385,6 +385,16 @@ class _ScopeVisitor(ast.NodeVisitor):
             if isinstance(name_node, ast.Name)
             else (name_node if isinstance(name_node, str) else None)
         )
+        if isinstance(alias_name, str):
+            is_nested = (
+                len(self._scope_stack) > 0
+                if self.is_subroutine
+                else len(self._scope_stack) > 1
+            )
+            if not is_nested:
+                self.type_aliases.add(alias_name)
+                self.imported_names.setdefault(alias_name, "")
+            self._record_store_name(alias_name)
         tp_names = _extract_type_param_names(node)
         if tp_names:
             self._type_param_scopes.append(tp_names)
@@ -397,16 +407,6 @@ class _ScopeVisitor(ast.NodeVisitor):
         finally:
             if tp_names:
                 self._type_param_scopes.pop()
-        if isinstance(alias_name, str):
-            is_nested = (
-                len(self._scope_stack) > 0
-                if self.is_subroutine
-                else len(self._scope_stack) > 1
-            )
-            if not is_nested:
-                self.type_aliases.add(alias_name)
-                self.imported_names.setdefault(alias_name, "")
-            self._record_store_name(alias_name)
 
     def visit_Call(self, node: ast.Call) -> None:
         if self.class_depth == 0:

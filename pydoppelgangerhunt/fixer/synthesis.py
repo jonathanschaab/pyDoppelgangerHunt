@@ -37,6 +37,7 @@ from pydoppelgangerhunt.fixer.scope import (
 from pydoppelgangerhunt.fixer.source import (
     _detect_indent_step,
     _extract_unit_body_lines,
+    _find_multiline_string_continuation_lines,
     _slice_unit_token_lines,
     dedent_source_text,
     extract_unit_comments_and_pragmas,
@@ -147,6 +148,39 @@ def _align_pair_expr_kinds(u1: Dict[str, Any], u2: Dict[str, Any]) -> bool:
         u1.setdefault("kind", eff_expr_kind)
         u2.setdefault("kind", eff_expr_kind)
     return True
+
+
+def _is_valid_expr_unit_lines(unit: Dict[str, Any], lines: Sequence[str]) -> bool:
+    """Checks that a whole-line expression unit parses to a supported single-statement form."""
+    if _is_subline_unit(unit):
+        return True
+    parsed = _parse_dedented_stmts("\n".join(lines))
+    if len(parsed) > 1:
+        return False
+    if len(parsed) == 1:
+        stmt = parsed[0]
+        if isinstance(stmt, (ast.Assign, ast.AugAssign, ast.Expr, ast.Return)):
+            return True
+        if isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            return True
+        return False
+    return True
+
+
+def _indent_code_lines(lines: Sequence[str], prefix: str) -> List[str]:
+    """Indents code lines by prefix while leaving multiline string continuation lines untouched."""
+    cont_lines = _find_multiline_string_continuation_lines("\n".join(lines))
+    out: List[str] = []
+    for idx, ln in enumerate(lines, start=1):
+        if idx in cont_lines:
+            out.append(ln)
+        elif not ln.strip():
+            out.append("")
+        elif ln.startswith("\x0c"):
+            out.append(f"\x0c{prefix}{ln[1:]}")
+        else:
+            out.append(f"{prefix}{ln}")
+    return out
 
 
 def _extract_lhs_and_rhs_nodes(
@@ -1176,6 +1210,11 @@ def synthesize_shared_helper_code(
 
     is_expr_unit = u1.get("kind") in ("comprehension", "complex_expr")
     if is_expr_unit:
+        if not (
+            _is_valid_expr_unit_lines(u1, orig_lines1)
+            and _is_valid_expr_unit_lines(u2, orig_lines2)
+        ):
+            return ""
         lines1 = _strip_stmt_target_lines(lines1)
         lines2 = _strip_stmt_target_lines(lines2)
 
@@ -1512,7 +1551,7 @@ def synthesize_shared_helper_code(
                     common_lines = [f"return {stripped_lines[0]}"]
                 else:
                     eff_step = step or _detect_indent_step(indent)
-                    expr_inner = [f"{eff_step}{ln}" for ln in stripped_lines]
+                    expr_inner = _indent_code_lines(stripped_lines, eff_step)
                     common_lines = ["return ("] + expr_inner + [")"]
             elif len(common_lines) == 1:
                 first_expr = common_lines[0].strip()
@@ -1522,7 +1561,7 @@ def synthesize_shared_helper_code(
                 common_lines = [f"return {first_expr}"]
             else:
                 eff_step = step or _detect_indent_step(indent)
-                expr_inner = [f"{eff_step}{ln}" for ln in common_lines]
+                expr_inner = _indent_code_lines(common_lines, eff_step)
                 common_lines = ["return ("] + expr_inner + [")"]
             if preserve_pragmas:
                 common_lines = _attach_pragmas(common_lines, pragmas1 + pragmas2)
@@ -1564,14 +1603,7 @@ def synthesize_shared_helper_code(
         await_prefix=await_prefix,
     )
 
-    indented_body_parts: List[str] = []
-    for ln in common_lines:
-        if not ln.strip():
-            indented_body_parts.append("")
-        elif ln.startswith("\x0c"):
-            indented_body_parts.append(f"\x0c{body_indent}{ln[1:]}")
-        else:
-            indented_body_parts.append(f"{body_indent}{ln}")
+    indented_body_parts = _indent_code_lines(common_lines, body_indent)
     indented_body = "\n".join(indented_body_parts)
     if effective_binding == "method":
         if is_class_receiver:

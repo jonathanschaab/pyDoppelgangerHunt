@@ -1894,6 +1894,7 @@ def test_scope_visitor_pep695_type_params_and_type_alias(tmp_path: Path) -> None
         "def first[T](items: list[T], cast_fn) -> T:\n"
         "    type Pair[U] = tuple[U, T]\n"
         "    def wrap[V](val: V) -> tuple[V, T]:\n"
+        "        type Tree = list[Tree]\n"
         "        return (val, items[0])\n"
         "    class Box[W]:\n"
         "        kind = W\n"
@@ -1907,19 +1908,20 @@ def test_scope_visitor_pep695_type_params_and_type_alias(tmp_path: Path) -> None
     u_fn = {
         "file": str(f),
         "start": 1,
-        "end": 8,
+        "end": 9,
         "kind": "function",
         "name": "first",
     }
     scope_fn = _inspect_unit_scope(u_fn, repo_root=str(tmp_path))
     assert scope_fn["inputs"] == ["items", "cast_fn"]
     assert "T" not in scope_fn["free_vars"]
+    assert "Tree" not in scope_fn["free_vars"]
 
     # 2. Subroutine inside generic function containing TypeAlias, generic inner def, and generic class
     u_sub = {
         "file": str(f),
         "start": 2,
-        "end": 7,
+        "end": 8,
         "kind": "subroutine",
         "name": "first_sub",
     }
@@ -1927,6 +1929,7 @@ def test_scope_visitor_pep695_type_params_and_type_alias(tmp_path: Path) -> None
     assert "U" not in scope_sub["inputs"]
     assert "V" not in scope_sub["inputs"]
     assert "W" not in scope_sub["inputs"]
+    assert "Tree" not in scope_sub["inputs"]
     assert "Pair" not in scope_sub["outputs"]
     assert "out" in scope_sub["outputs"]
 

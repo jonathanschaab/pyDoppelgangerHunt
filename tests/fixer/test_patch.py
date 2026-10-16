@@ -11042,3 +11042,56 @@ def test_whole_line_complex_expr_leading_comment_and_col0_multiline_string(
     assert "+def _shared_f1_expr_f2_expr(suffix: Any) -> Any:" in patch_str
     assert "+    cache[k] = _shared_f1_expr_f2_expr(suffix)" in patch_str
     assert "+    store[key] = _shared_f1_expr_f2_expr(suffix)" in patch_str
+
+
+def test_out_of_bounds_pragma_and_col0_multiline_string_subroutine_synthesis(
+    tmp_path: Path,
+) -> None:
+    """Verifies that _unit_has_no_refactor_pragma handles out-of-bounds u_start without
+    IndexError and that subroutine synthesis with column-0 multiline strings preserves
+    exact string literal content alongside synthesized preambles and returns."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _unit_has_no_refactor_pragma,
+    )
+
+    pragma_lines = ["# pragma: no-refactor\n", "x = 1\n"]
+    assert (
+        _unit_has_no_refactor_pragma(
+            {"start": 50, "end": 55}, pragma_lines, "".join(pragma_lines)
+        )
+        is False
+    )
+
+    src = (
+        "class Formatter:\n"
+        "    def build_a(self, flag: bool, suffix: str) -> str:\n"
+        "        if flag:\n"
+        "            tag = 'ON'\n"
+        '        banner = """header\n'
+        'col0_body_line"""\n'
+        "        res = f'{banner}:{tag}:{suffix}'\n"
+        "        return res\n"
+        "\n"
+        "    def build_b(self, flag: bool, suffix: str) -> str:\n"
+        "        if flag:\n"
+        "            tag = 'ON'\n"
+        '        banner = """header\n'
+        'col0_body_line"""\n'
+        "        res = f'{banner}:{tag}:{suffix}'\n"
+        "        return res\n"
+    )
+    f_sub = tmp_path / "fmt.py"
+    f_sub.write_text(src, encoding="utf-8")
+    u1 = {"file": "fmt.py", "start": 3, "end": 7, "name": "build_a_sub", "kind": "subroutine"}
+    u2 = {"file": "fmt.py", "start": 11, "end": 15, "name": "build_b_sub", "kind": "subroutine"}
+    helper_code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "\ncol0_body_line\"\"\"\n" in helper_code
+    assert "    col0_body_line" not in helper_code
+    assert "        tag = None\n" in helper_code
+    assert "        return tag, banner, res\n" in helper_code
+    patch_str = generate_refactoring_patch(
+        [(0.99, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert "    col0_body_line" not in patch_str
+    assert "+        return tag, banner, res\n" in patch_str
+

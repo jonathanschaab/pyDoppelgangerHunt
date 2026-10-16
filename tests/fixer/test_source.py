@@ -850,20 +850,22 @@ def test_extract_required_typing_imports_generator_types() -> None:
 
 def test_extract_unit_body_lines_indented_method_col0_multiline_string() -> None:
     """Verifies that _extract_unit_body_lines strips the method signature and docstring
-    when an indented method contains a multiline string or docstring with a line at column 0."""
+    and dedents body statements to column 0 when an indented method contains a multiline
+    string or docstring with continuation lines at column 0."""
     raw_lines = [
         "    def format_banner(self, title: str) -> str:",
         '        """Docstring header',
         "col_0_docstring_line",
         '        """',
+        '        banner = """header',
+        'col_0_body_line"""',
         "        clean = title.strip()",
-        "        return clean",
+        "        return banner + clean",
     ]
     body_lines = _extract_unit_body_lines({"kind": "method"}, raw_lines)
-    assert body_lines == ["clean = title.strip()", "return clean"]
-
-
-
-
-
-
+    assert body_lines == [
+        'banner = """header',
+        'col_0_body_line"""',
+        "clean = title.strip()",
+        "return banner + clean",
+    ]

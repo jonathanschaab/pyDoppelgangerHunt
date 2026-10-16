@@ -3473,3 +3473,22 @@ def test_normalize_pipe_unions_quoted_forward_references() -> None:
     )
     assert _normalize_pipe_unions('"NodeA | NodeB"') == '"Union[NodeA, NodeB]"'
 
+
+def test_synthesize_shared_helper_code_rejects_asymmetric_unmapped_expr_stmt(
+    tmp_path: Path,
+) -> None:
+    """Verifies that standalone synthesize_shared_helper_code fails closed when one
+    whole-line expression unit is a valid assignment and its partner is an unmapped statement."""
+    f = tmp_path / "asym_expr.py"
+    f.write_text(
+        "def f1(a, b):\n"
+        "    res = a + b\n"
+        "    return res\n"
+        "\n"
+        "def f2(a, b):\n"
+        "    assert a + b\n",
+        encoding="utf-8",
+    )
+    u1 = {"file": str(f), "start": 2, "end": 2, "name": "f1_expr", "kind": "complex_expr"}
+    u2 = {"file": str(f), "start": 6, "end": 6, "name": "f2_expr", "kind": "complex_expr"}
+    assert synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path)) == ""
