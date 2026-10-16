@@ -339,9 +339,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_BaseScopeVisitor._visit_comprehension`, across chained `node.values[1:]` operands in
   `visit_BoolOp`, and across intersected `body`/`orelse` branches (`stored_body & stored_else`) in
   `visit_IfExp` while recording `NamedExpr` targets in `self.stored` so intra-comprehension and
-  intra-branch walrus reads do not become spurious live-ins; checked `start_col` in
-  `_resolve_unit_ast_end_col` (`_df_cache.py`) when `u_start == u_end` so sub-line units without
-  `end_col` do not misresolve to full or trailing statements; and removed the `_is_inside` fallback
+  intra-branch walrus reads do not become spurious live-ins; checked `stmt_start < u_start` and
+  `stmt_start == u_start` with `start_col` in `_resolve_unit_ast_end_col` (`_df_cache.py`) so
+  single-line and multi-line sub-expression units without `end_col` do not misresolve to full or
+  trailing statements; and removed the `_is_inside` fallback
   to `generic_visit` in `_UnitLiveInVisitor.visit_Assign`, `visit_AnnAssign`, `visit_BoolOp`,
   `visit_IfExp`, and `visit_NamedExpr` so RHS values and conditional depths are always evaluated
   accurately across multi-line and sub-line unit boundaries.
@@ -352,9 +353,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   factored `_is_pair_in_method` (`binding.py`) so explicit `method_binding="method"` (as well as
   `super()` / mangled name references) preserves method binding and injects `self`/`cls` on
   same-class whole-line `comprehension` and `complex_expr` units inside methods, preserved
-  `unit_receiver_omit` when pruning `unref_lhs` directly in `_build_unit_delegation_call`
-  (`patch.py`), and delegated `binding_kind` recomputation in `_prune_unreferenced_lhs_scope` to
-  `_determine_binding_kind`.
+  `unit_receiver_omit` and custom `receiver_names` when pruning and ordering `unref_lhs` directly in
+  `_build_unit_delegation_call` (`patch.py`), and delegated `binding_kind` recomputation in
+  `_prune_unreferenced_lhs_scope` to `_determine_binding_kind`.
 - **Quoted Forward Reference PEP 604 Union Normalization**: Added `_is_single_quoted_literal` in
   `synthesis.py` so `_normalize_pipe_unions` only unwraps outer quotes when the opening quote at
   index `0` closes at the final character, converting unions of quoted forward references
@@ -400,12 +401,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`scope.py`) so `ast.Load` sub-expressions (`for arr[idx] in items`) are recorded as reads; and
   routed `_visit_named_expr(..., check_comp=True)` through `_can_store_in_class_scope` so walrus
   targets inside class-body comprehensions do not bind to `class_stores`.
-- **Out-of-Bounds `u_start` Guard & Decorator Lookback in `_unit_has_no_refactor_pragma` & Asymmetric Expression Unit Validation**:
-  Clamped `start_idx = min(len(eff_lines), max(0, u_start - 1))` and stepped back over contiguous `#`
-  and `@` decorator lines in `_unit_has_no_refactor_pragma` (`patch.py`), and validated both
-  `orig_lines1` and `orig_lines2` via `_is_valid_expr_unit_lines` in `synthesize_shared_helper_code`
-  (`synthesis.py`) to reject unmapped statement partners (e.g. `assert` or bare `return` with
-  `stmt.value is None`).
+- **Out-of-Bounds `u_start` Guard, Multi-Line AST Decorator Lookback in `_unit_has_no_refactor_pragma` & Asymmetric Expression Unit Validation**:
+  Clamped `start_idx = min(len(eff_lines), max(0, u_start - 1))`, bounded `start_idx` by the earliest
+  AST `decorator_list` line, and stepped back over contiguous `#` and `@` lines in
+  `_unit_has_no_refactor_pragma` (`patch.py`), and validated both `orig_lines1` and `orig_lines2` via
+  `_is_valid_expr_unit_lines` in `synthesize_shared_helper_code` (`synthesis.py`) to reject unmapped
+  statement partners (e.g. `assert` or bare `return` with `stmt.value is None`).
 
 ## [1.0.0] - 2026-09-20
 ### Added

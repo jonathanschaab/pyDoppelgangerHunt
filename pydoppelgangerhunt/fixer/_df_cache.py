@@ -269,14 +269,13 @@ def _resolve_unit_ast_end_col(
         return None
 
     inner_stmts.sort(key=lambda s: getattr(s, "col_offset", 0))
-    start_col = (
-        _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
-        if u_start == u_end
-        else None
-    )
+    start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
     if len(inner_stmts) == 1:
+        stmt_start = getattr(inner_stmts[0], "lineno", 0)
         stmt_col = getattr(inner_stmts[0], "col_offset", 0)
-        if start_col is not None and start_col > stmt_col:
+        if stmt_start < u_start:
+            return None
+        if stmt_start == u_start and start_col is not None and start_col > stmt_col:
             return None
         target_stmt = inner_stmts[0]
     elif u_start == u_end and start_col is not None:

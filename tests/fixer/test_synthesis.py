@@ -3688,3 +3688,26 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
         == "typing.Generator[int, None, str]"
     )
 
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _build_unit_delegation_call,
+    )
+
+    me_src = (
+        "class CustomRec:\n"
+        "    def calc(me, k: str, val: int) -> None:\n"
+        "        me.cache[k] = val + me.offset\n"
+    )
+    me_lines = me_src.splitlines(keepends=True)
+    me_call = _build_unit_delegation_call(
+        {"start": 3, "end": 3, "kind": "complex_expr", "receiver_param": "me"},
+        me_src,
+        me_lines,
+        effective_binding="module",
+        helper_name="_shared_calc",
+        inputs=["self", "x"],
+        outputs=[],
+        scope={"param_details": []},
+        target_inputs=["me", "k", "val"],
+    )
+    assert me_call == "        me.cache[k] = _shared_calc(me, val)\n"
+

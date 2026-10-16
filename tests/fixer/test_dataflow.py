@@ -5763,4 +5763,18 @@ def test_extract_nested_scope_free_reads_pep695_decorators_and_defaults() -> Non
     outer_v.visit(ast.parse("map(lambda k: b - k - a, items)").body[0])
     assert outer_v.ordered_names == ["map", "b", "a", "items"]
 
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
+        _resolve_unit_ast_end_col,
+    )
+
+    ml_tree = ast.parse(
+        "def f(x):\n"
+        "    res = (\n"
+        "        (yield x)\n"
+        "    ) + x\n"
+    )
+    ml_fn = ml_tree.body[0]
+    assert _resolve_unit_ast_end_col(ml_fn, {"start": 3, "end": 4}) is None
+    assert _resolve_unit_ast_end_col(ml_fn, {"start": 2, "end": 4, "start_col": 10}) is None
+
 

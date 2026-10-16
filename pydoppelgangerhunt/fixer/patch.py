@@ -844,7 +844,15 @@ def _build_unit_delegation_call(
                         if unref_lhs and len(effective_targets) > len(inputs)
                         else list(effective_targets)
                     )
-                    pruned_eff = _order_inputs_by_rhs_loads(pruned_eff, rhs_val)
+                    unit_receiver = rec_param or target_unit.get("receiver_param")
+                    rec_names: Tuple[str, ...] = (
+                        (str(unit_receiver), "self", "cls", "this", "klass")
+                        if unit_receiver
+                        else ("self", "cls", "this", "klass")
+                    )
+                    pruned_eff = _order_inputs_by_rhs_loads(
+                        pruned_eff, rhs_val, receiver_names=rec_names
+                    )
                     if len(pruned_eff) == len(inputs):
                         pruned_args = _format_call_arguments(
                             inputs,
@@ -2873,6 +2881,7 @@ def _unit_has_no_refactor_pragma(
     unit: Dict[str, Any],
     file_lines: Optional[Sequence[str]],
     orig_text: Optional[str] = None,
+    tree: Optional[ast.AST] = None,
 ) -> bool:
     """Checks whether the unit contains a '# pragma: no-refactor' directive."""
     if not file_lines and not orig_text:
@@ -2885,6 +2894,15 @@ def _unit_has_no_refactor_pragma(
         file_lines if file_lines is not None else split_source_lines(full_text)
     )
     start_idx = min(len(eff_lines), max(0, u_start - 1))
+    effective_tree = tree if tree is not None else _get_or_parse_tree(full_text)
+    if effective_tree is not None:
+        for node in ast.walk(effective_tree):
+            decs = getattr(node, "decorator_list", None)
+            if decs:
+                dec_start = min(getattr(d, "lineno", u_start) for d in decs)
+                node_lineno = getattr(node, "lineno", 0)
+                if dec_start <= u_start <= node_lineno:
+                    start_idx = min(start_idx, max(0, dec_start - 1))
     while start_idx > 0 and eff_lines[start_idx - 1].strip().startswith(("#", "@")):
         start_idx -= 1
     if not any(_NO_REFACTOR_RE.search(line) for line in eff_lines[start_idx:u_end]):
@@ -3141,9 +3159,16 @@ def _generate_refactoring_patch_impl(
                 if is_same_file
                 else (f2_plan.orig_text if f2_plan is not None else None)
             )
+            u2_tree = (
+                f1_plan.parsed_tree
+                if is_same_file
+                else (f2_plan.parsed_tree if f2_plan is not None else None)
+            )
             if _unit_has_no_refactor_pragma(
-                u1, u1_lines, orig_text=orig_text
-            ) or _unit_has_no_refactor_pragma(u2, u2_lines, orig_text=u2_text):
+                u1, u1_lines, orig_text=orig_text, tree=f1_plan.parsed_tree
+            ) or _unit_has_no_refactor_pragma(
+                u2, u2_lines, orig_text=u2_text, tree=u2_tree
+            ):
                 f1_disp = normalize_path_string(
                     str(u1.get("file") or "file1"), strip_anchor=False
                 )

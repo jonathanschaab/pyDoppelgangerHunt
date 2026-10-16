@@ -11071,13 +11071,15 @@ def test_out_of_bounds_pragma_and_col0_multiline_string_subroutine_synthesis(
     )
     dec_pragma_lines = [
         "# pragma: no-refactor\n",
-        "@my_decorator\n",
+        "@my_decorator(\n",
+        "    arg=True,\n",
+        ")\n",
         "def compute(x):\n",
         "    return x + 1\n",
     ]
     assert (
         _unit_has_no_refactor_pragma(
-            {"start": 3, "end": 4}, dec_pragma_lines, "".join(dec_pragma_lines)
+            {"start": 5, "end": 6}, dec_pragma_lines, "".join(dec_pragma_lines)
         )
         is True
     )
