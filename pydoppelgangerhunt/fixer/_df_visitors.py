@@ -1073,6 +1073,21 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         elif not isinstance(node.target, ast.Name):
             self.visit(node.target)
 
+    def _visit_delete_target(self, target: ast.AST) -> None:
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                self._visit_delete_target(elt)
+        elif isinstance(target, ast.Name) and isinstance(target.ctx, ast.Del):
+            if self._is_inside(target):
+                self._record_live_in(target.id)
+                self.stored.discard(target.id)
+        else:
+            self.visit(target)
+
+    def visit_Delete(self, node: ast.Delete) -> None:
+        for target in node.targets:
+            self._visit_delete_target(target)
+
     def visit_TypeAlias(self, node: ast.AST) -> None:
         if not self._is_inside(node):
             self.generic_visit(node)

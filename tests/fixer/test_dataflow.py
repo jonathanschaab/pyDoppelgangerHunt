@@ -5557,4 +5557,21 @@ def test_scope_hierarchy_visitor_header_expressions_async_context() -> None:
     assert func_is_async.get(id(comps[6])) is False
 
 
+def test_unit_live_in_visitor_intra_unit_delete() -> None:
+    """Verifies that _UnitLiveInVisitor records del targets as live-ins when not yet stored
+    and discards deleted identifiers from self.stored so subsequent reads are captured."""
+    code = (
+        "def process(pre_existing, arr):\n"
+        "    del pre_existing\n"
+        "    local_var = 10\n"
+        "    del (local_var, arr[local_var])\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    live_ins = _extract_unit_live_in_names(fn_node, u_start=2, u_end=4)
+    assert "pre_existing" in live_ins
+    assert "local_var" in live_ins
+    assert "arr" in live_ins
+
+
 

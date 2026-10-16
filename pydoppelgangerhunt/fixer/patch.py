@@ -825,7 +825,7 @@ def _build_unit_delegation_call(
                         t_name = parsed_node.target.id
                         if not _node_references_name(parsed_node.value, t_name):
                             unref_lhs.add(t_name)
-                elif isinstance(parsed_node, ast.Return):
+                elif isinstance(parsed_node, ast.Return) and parsed_node.value is not None:
                     assign_prefix = "return "
                 elif isinstance(parsed_node, ast.Expr):
                     assign_prefix = ""

@@ -81,11 +81,12 @@ def _strip_stmt_target_lines(lines: Sequence[str]) -> List[str]:
             return list(lines)
         if len(parsed) == 1:
             stmt = parsed[0]
-            if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-                if isinstance(stmt, ast.AnnAssign) and stmt.value is None:
-                    return list(lines)
+            if isinstance(
+                stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Return)
+            ):
                 if stmt.value is not None:
                     return ast.unparse(stmt.value).splitlines()
+                return list(lines)
     except (SyntaxError, IndexError, ValueError):
         pass
     if len(lines) == 1:
@@ -178,12 +179,12 @@ def _prune_unreferenced_lhs_scope(
         "complex_expr",
     ):
         return set()
-    lhs_nodes, rhs_node = _extract_lhs_and_rhs_nodes(lines)
-    if rhs_node is None or not lhs_nodes:
-        return set()
     scope_dict["outputs"] = []
     unit.pop("outputs", None)
     unit.pop("precomputed_outputs", None)
+    lhs_nodes, rhs_node = _extract_lhs_and_rhs_nodes(lines)
+    if rhs_node is None or not lhs_nodes:
+        return set()
     rec_param = unit.get("receiver_param")
     rec_kind = unit.get("receiver_kind")
     inst_receivers = {"self", "this"}
@@ -1121,6 +1122,8 @@ def synthesize_shared_helper_code(
     """
     u1 = dict(u1)
     u2 = dict(u2)
+    if not _align_pair_expr_kinds(u1, u2):
+        return ""
     lines1 = _slice_unit_token_lines(
         u1,
         _extract_unit_body_lines(u1, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u1, repo_root=repo_root)]),
@@ -1147,8 +1150,6 @@ def synthesize_shared_helper_code(
         pragmas1 = extract_unit_comments_and_pragmas(raw1, 1, len(orig_lines1))
         pragmas2 = extract_unit_comments_and_pragmas(raw2, 1, len(orig_lines2))
 
-    if not _align_pair_expr_kinds(u1, u2):
-        return ""
     is_expr_unit = u1.get("kind") in ("comprehension", "complex_expr")
     if is_expr_unit:
         lines1 = _strip_stmt_target_lines(lines1)

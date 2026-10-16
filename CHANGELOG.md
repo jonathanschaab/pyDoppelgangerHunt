@@ -318,19 +318,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_COMPREHENSION_TYPES` and `_INNER_SCOPE_TYPES` at the top of `while stack:` in
   `_extract_single_node_local_names` (`_df_closures.py`) so `ast.Lambda` nodes whose immediate
   body is a comprehension or nested lambda do not leak comprehension targets or inner lambda stores.
-- **Expression Unit Kind Parity (`_align_pair_expr_kinds`) and Chained Assignment Output Clearing**:
-  Propagated `comprehension`/`complex_expr` kind across kind-less twins while rejecting conflicting
-  explicit kinds in both `synthesize_shared_helper_code` (`synthesis.py`) and
-  `generate_refactoring_patch` (`patch.py`), and cleared `outputs` / `precomputed_outputs` in
-  `_prune_unreferenced_lhs_scope` so chained assignments (`a = b = expr`) pair cleanly with
-  single-target assignments (`c = expr`).
-- **Downstream `For`/`With`/`Match` Target `Load` Traversal & Sub-Line/Multi-Line Live-In Order**:
+- **Expression Unit Kind Parity (`_align_pair_expr_kinds`), `Return` Target Stripping & Chained Assignment Output Clearing**:
+  Propagated `comprehension`/`complex_expr` kind across kind-less twins prior to `_slice_unit_token_lines`
+  while rejecting conflicting explicit kinds in both `synthesize_shared_helper_code` (`synthesis.py`) and
+  `generate_refactoring_patch` (`patch.py`), unwrapped `ast.Return` alongside assignment statements in
+  `_strip_stmt_target_lines`, and cleared `outputs` / `precomputed_outputs` in
+  `_prune_unreferenced_lhs_scope` so chained assignments (`a = b = expr`) and mixed assignment/return
+  expressions (`res = expr` vs `return expr`) pair cleanly.
+- **Downstream `For`/`With`/`Match` Target `Load` Traversal, Intra-Unit `Delete` & Sub-Line/Multi-Line Live-In Order**:
   Visited `node.target` in `_DownstreamReadVisitor.visit_For`, `item.optional_vars` in
   `visit_With`, and pattern children before binding in `_record_pattern_binding` and
-  `_DownstreamReadVisitor.visit_MatchAs` (`_df_visitors.py`); removed the `_is_inside` fallback to
-  `generic_visit` in `_UnitLiveInVisitor.visit_Assign`, `visit_AnnAssign`, `visit_BoolOp`,
-  `visit_IfExp`, and `visit_NamedExpr` so RHS values and conditional depths are always evaluated
-  accurately across multi-line and sub-line unit boundaries.
+  `_DownstreamReadVisitor.visit_MatchAs` (`_df_visitors.py`); added `visit_Delete` to
+  `_UnitLiveInVisitor` to record `ast.Name(ctx=ast.Del)` targets as live-ins and discard them from
+  `self.stored`; and removed the `_is_inside` fallback to `generic_visit` in
+  `_UnitLiveInVisitor.visit_Assign`, `visit_AnnAssign`, `visit_BoolOp`, `visit_IfExp`, and
+  `visit_NamedExpr` so RHS values and conditional depths are always evaluated accurately across
+  multi-line and sub-line unit boundaries.
 
 ## [1.0.0] - 2026-09-20
 ### Added

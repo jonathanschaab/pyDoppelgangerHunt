@@ -10898,4 +10898,80 @@ def test_top_level_async_comprehension_and_nested_class_lambda_async_scoping() -
     assert scoper.func_is_async[id(lam_body_comp)] is False
 
 
+def test_kindless_subline_expr_slicing_and_mixed_assign_return_alignment(
+    tmp_path: Path,
+) -> None:
+    """Verifies that synthesize_shared_helper_code aligns expression kinds before slicing
+    sub-line token columns and unwraps ast.Return alongside ast.Assign in _strip_stmt_target_lines."""
+    # 1. Kind-less sub-line unit with start_col/end_col paired with explicit complex_expr unit
+    sub_src1 = "def f1(a, b, c):\n    out = (a + b) * (b + c)\n    return out\n"
+    sub_src2 = "def f2(a, b, c):\n    val = (a + b) * (b + c)\n    return val\n"
+    sf1 = tmp_path / "sub1.py"
+    sf2 = tmp_path / "sub2.py"
+    sf1.write_text(sub_src1, encoding="utf-8")
+    sf2.write_text(sub_src2, encoding="utf-8")
+    u_sub1 = {
+        "file": "sub1.py",
+        "start": 2,
+        "end": 2,
+        "start_col": 10,
+        "end_col": 27,
+        "name": "s1",
+    }
+    u_sub2 = {
+        "file": "sub2.py",
+        "start": 2,
+        "end": 2,
+        "start_col": 10,
+        "end_col": 27,
+        "name": "s2",
+        "kind": "complex_expr",
+    }
+    sub_helper = synthesize_shared_helper_code(u_sub1, u_sub2, repo_root=str(tmp_path))
+    assert "return (a + b) * (b + c)" in sub_helper
+    assert "out =" not in sub_helper
+
+    # 2. Mixed whole-line Assign (res = <expr>) and Return (return <expr>) multiline complex_expr
+    mix_src1 = (
+        "def m1(a, b, c, d):\n"
+        "    res = (\n"
+        "        (a + b)\n"
+        "        * (c + d)\n"
+        "    )\n"
+        "    return res\n"
+    )
+    mix_src2 = (
+        "def m2(a, b, c, d):\n"
+        "    return (\n"
+        "        (a + b)\n"
+        "        * (c + d)\n"
+        "    )\n"
+    )
+    mf1 = tmp_path / "mix1.py"
+    mf2 = tmp_path / "mix2.py"
+    mf1.write_text(mix_src1, encoding="utf-8")
+    mf2.write_text(mix_src2, encoding="utf-8")
+    u_mix1 = {
+        "file": "mix1.py",
+        "start": 2,
+        "end": 5,
+        "name": "m1_expr",
+        "kind": "complex_expr",
+    }
+    u_mix2 = {
+        "file": "mix2.py",
+        "start": 2,
+        "end": 5,
+        "name": "m2_expr",
+        "kind": "complex_expr",
+    }
+    mix_helper = synthesize_shared_helper_code(u_mix1, u_mix2, repo_root=str(tmp_path))
+    assert "return (a + b) * (c + d)" in mix_helper
+    mix_patch = generate_refactoring_patch(
+        [(0.95, u_mix1, u_mix2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert "+    res = _shared_m1_expr_m2_expr(a, b, c, d)" in mix_patch
+    assert "+    return _shared_m1_expr_m2_expr(a, b, c, d)" in mix_patch
+
+
 
