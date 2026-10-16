@@ -340,13 +340,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   computing `fn1_kind`/`fn2_kind` and `is_in_method` in `generate_refactoring_patch` (`patch.py`),
   factored `_is_pair_in_method` (`binding.py`) so explicit `method_binding="method"` (as well as
   `super()` / mangled name references) preserves method binding and injects `self`/`cls` on
-  same-class whole-line `comprehension` and `complex_expr` units inside methods, and delegated
-  `binding_kind` recomputation in `_prune_unreferenced_lhs_scope` to `_determine_binding_kind`.
+  same-class whole-line `comprehension` and `complex_expr` units inside methods, preserved
+  `unit_receiver_omit` when pruning `unref_lhs` directly in `_build_unit_delegation_call`
+  (`patch.py`), and delegated `binding_kind` recomputation in `_prune_unreferenced_lhs_scope` to
+  `_determine_binding_kind`.
 - **Quoted Forward Reference PEP 604 Union Normalization**: Added `_is_single_quoted_literal` in
   `synthesis.py` so `_normalize_pipe_unions` only unwraps outer quotes when the opening quote at
   index `0` closes at the final character, converting unions of quoted forward references
   (`'"NodeA" | "NodeB"'`) into `'Union["NodeA", "NodeB"]'`.
-- **PEP 695 `type_params` Header Preservation, Decorator/Default Scoping & Downstream `TypeAlias` Propagation**:
+- **PEP 695 `type_params` Header Preservation, Decorator/Default Scoping & Fail-Closed Downstream `TypeAlias` Propagation**:
   Bound PEP 695 `type_params` on `FunctionDef`, `AsyncFunctionDef`, `ClassDef`, and `TypeAlias` in
   `_ScopeVisitor` (`scope.py`) and `_extract_helper_symbols` (`patch.py`); preserved top-level
   generic function `type_params` (`scope["type_params"]`, merged via `_merge_type_params`) onto the
@@ -354,10 +356,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`synthesis.py`) so type parameters referenced in annotations or at runtime remain bound;
   evaluated `decorator_list` and function `defaults`/`kw_defaults` outside `type_params` in
   `_extract_nested_scope_free_reads` (`_df_visitors.py`) and `_ScopeVisitor._process_func`
-  (`scope.py`); recorded `alias_name` store before visiting `type_params` and `value` so recursive
-  nested `TypeAlias` definitions (`type Tree = list[Tree]`) do not leak into outer `loads`; and
-  restricted `collect_downstream_read_names` in `_inspect_unit_scope` to stored/nonlocal
-  `visitor.type_aliases` while unconditionally excluding `visitor.imported_names` from `outputs`.
+  (`scope.py`); visited `node.generators[0].iter` in `_ExprClosureCollector.visit_GeneratorExp`
+  (`_df_closures.py`) on non-eager generator expressions so nested closures inside the outermost
+  iterator are recorded at their own column offsets; recorded `alias_name` store before visiting
+  `type_params` and `value` so recursive nested `TypeAlias` definitions (`type Tree = list[Tree]`)
+  do not leak into outer `loads`; and restricted `collect_downstream_read_names` in
+  `_inspect_unit_scope` to stored/nonlocal `visitor.type_aliases` (failing closed by retaining
+  `alias_cands` in `outputs` when `full_src` or `ds_reads` is `None`) while unconditionally
+  excluding `visitor.imported_names` from `outputs`.
 - **Multiline String & PEP 701 F-String Continuation Preservation in Dedent & Helper Synthesis**: Added
   `_find_multiline_string_continuation_lines` (tracking both `STRING`/`FSTRING_MIDDLE` tokens and active
   `FSTRING_START`..`FSTRING_END` ranges covering multi-line `{...}` interpolations) and

@@ -339,6 +339,8 @@ def _collect_scope_closures_uncached(
             ):
                 self._visit_comprehension(node)
             else:
+                if node.generators:
+                    self.visit(node.generators[0].iter)
                 self._record_closure_node(node)
 
     def _record_expr_closures(

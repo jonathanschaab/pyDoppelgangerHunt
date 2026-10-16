@@ -2030,3 +2030,16 @@ def test_scope_visitor_comprehension_subscript_target(tmp_path: Path) -> None:
     assert "arr" in scope["inputs"]
     assert "idx" in scope["inputs"]
     assert "items" in scope["inputs"]
+
+    if sys.version_info >= (3, 12):
+        u_inmem = {
+            "start": 2,
+            "end": 3,
+            "kind": "compound_block",
+            "is_subroutine": True,
+            "source_lines": ["    type LocalAlias = int\n", "    val = 1\n"],
+        }
+        scope_inmem = _inspect_unit_scope(u_inmem)
+        assert "LocalAlias" in scope_inmem["outputs"]
+        assert "val" in scope_inmem["outputs"]
+

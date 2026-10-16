@@ -1540,8 +1540,11 @@ def _inspect_unit_scope(
                 tree=file_tree,
                 unit_inputs=set(inputs),
             )
-            if ds_reads:
-                downstream_aliases = ds_reads
+            downstream_aliases = (
+                set(alias_cands) if ds_reads is None else ds_reads
+            )
+        else:
+            downstream_aliases = set(alias_cands)
     excluded_local_defs = (visitor.type_aliases - downstream_aliases) | set(
         visitor.imported_names
     )

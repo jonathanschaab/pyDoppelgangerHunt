@@ -5684,3 +5684,14 @@ def test_extract_nested_scope_free_reads_pep695_decorators_and_defaults() -> Non
     assert "T" in cls_reads
     assert "Base" in cls_reads
 
+    gen_iter_code = (
+        "def make_gen(items):\n"
+        "    g = (x * 2 for x in map(lambda y: y + z, items))\n"
+        "    return g\n"
+    )
+    gen_fn = ast.parse(gen_iter_code).body[0]
+    closures = _collect_scope_closures(gen_fn)
+    lambda_cols = [pos.col for pos, reads in closures if "z" in reads and "items" not in reads]
+    assert lambda_cols == [28]
+
+

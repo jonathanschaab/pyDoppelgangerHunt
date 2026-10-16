@@ -830,7 +830,12 @@ def _build_unit_delegation_call(
                 elif isinstance(parsed_node, ast.Expr):
                     assign_prefix = ""
                 if unref_lhs and len(effective_targets) > len(inputs):
-                    pruned_eff = [x for x in effective_targets if x not in unref_lhs]
+                    pruned_eff = [
+                        x
+                        for x in effective_targets
+                        if x not in unref_lhs
+                        or (x == unit_receiver_omit and x in inputs)
+                    ]
                     if len(pruned_eff) == len(inputs):
                         pruned_args = _format_call_arguments(
                             inputs,

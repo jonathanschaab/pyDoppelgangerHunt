@@ -3558,3 +3558,27 @@ def test_same_class_whole_line_expr_explicit_method_binding(
     assert "+        self.res1 = self._shared_run_a_comp_run_b_comp(items)" in patch
     assert "+        self.res2 = self._shared_run_a_comp_run_b_comp(items)" in patch
 
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _build_unit_delegation_call,
+    )
+
+    sub_src = (
+        "class CacheBox:\n"
+        "    def store(self, k: str, items: list[int]) -> None:\n"
+        "        self.cache[k] = [x * 2 for x in items]\n"
+    )
+    sub_lines = sub_src.splitlines(keepends=True)
+    u_sub = {"start": 3, "end": 3, "kind": "comprehension"}
+    call_str = _build_unit_delegation_call(
+        u_sub,
+        sub_src,
+        sub_lines,
+        effective_binding="method",
+        helper_name="_shared_store",
+        inputs=["self", "items"],
+        outputs=[],
+        scope={"param_details": []},
+        target_inputs=["self", "k", "items"],
+    )
+    assert call_str == "        self.cache[k] = self._shared_store(items)\n"
+
