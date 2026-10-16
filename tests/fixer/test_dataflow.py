@@ -5460,13 +5460,24 @@ def test_unit_live_in_visitor_subline_boolop_ifexp_namedexpr_evaluation_order() 
         "    a = [(w := z) + w for z in items]\n"
         "    if flag and ((b := y) + b > 0):\n"
         "        c = (d := y) + d if flag else 0\n"
+        "    _ = flag and (e := y) and (f := e + 1)\n"
+        "    _ = (g := y) if flag else (g := 0)\n"
+        "    return g\n"
     )
     tree_intra = ast.parse(code_intra)
-    live_intra = _extract_unit_live_in_names(tree_intra.body[0], u_start=2, u_end=4)
-    assert "w" not in live_intra
-    assert "b" not in live_intra
-    assert "d" not in live_intra
+    live_intra = _extract_unit_live_in_names(tree_intra.body[0], u_start=2, u_end=7)
+    assert {"w", "b", "d", "e", "f", "g"}.isdisjoint(live_intra)
     assert {"items", "flag", "y"} <= live_intra
+
+    # Comprehension with inner BoolOp + walrus does not leak walrus store after comprehension
+    code_comp_boolop = (
+        "def k(items, a, b):\n"
+        "    res = [(a and b, (w := x)) for x in items]\n"
+        "    return res, w\n"
+    )
+    tree_cb = ast.parse(code_comp_boolop)
+    live_cb = _extract_unit_live_in_names(tree_cb.body[0], u_start=2, u_end=3)
+    assert "w" in live_cb
 
     # Sub-line start_col without end_col in _resolve_unit_ast_end_col returns None
     from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel

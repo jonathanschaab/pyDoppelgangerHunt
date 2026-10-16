@@ -1705,6 +1705,19 @@ def _align_symmetric_var_list(list1: List[str], list2: List[str]) -> List[str]:
     return common if common else list1
 
 
+def _has_type_param_default(tp_str: str) -> bool:
+    """Checks whether a PEP 695/696 type parameter string has a top-level default."""
+    depth = 0
+    for ch in tp_str:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif ch == "=" and depth == 0:
+            return True
+    return False
+
+
 def _merge_type_params(tp1: Sequence[str], tp2: Sequence[str]) -> List[str]:
     """Merges PEP 695 type parameters across two units without duplicate parameter names."""
     if not tp2:
@@ -1715,14 +1728,18 @@ def _merge_type_params(tp1: Sequence[str], tp2: Sequence[str]) -> List[str]:
     order: List[str] = []
     for raw_tp in list(tp1) + list(tp2):
         head = raw_tp.split(":", 1)[0].split("=", 1)[0].strip()
-        if not head:
+        ident = head.lstrip("*").strip()
+        if not ident:
             continue
-        if head not in seen:
-            seen[head] = raw_tp
-            order.append(head)
-        elif seen[head] != raw_tp:
-            seen[head] = head
-    return [seen[h] for h in order]
+        if ident not in seen:
+            seen[ident] = raw_tp
+            order.append(ident)
+        elif seen[ident] != raw_tp:
+            seen[ident] = ident
+    merged = [seen[ident] for ident in order]
+    return [tp for tp in merged if not _has_type_param_default(tp)] + [
+        tp for tp in merged if _has_type_param_default(tp)
+    ]
 
 
 def analyze_unit_variable_scope(

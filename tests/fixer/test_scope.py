@@ -2002,6 +2002,8 @@ def test_subroutine_local_import_skips_downstream_read_scan(
 
     assert _merge_type_params(["T: int"], ["T: int"]) == ["T: int"]
     assert _merge_type_params(["T: int"], ["T: str"]) == ["T"]
+    assert _merge_type_params(["T"], ["*T"]) == ["T"]
+    assert _merge_type_params(["T = int"], ["U"]) == ["U", "T = int"]
     assert _merge_type_params(["T"], []) == ["T"]
     assert _merge_type_params([], ["U"]) == ["U"]
 

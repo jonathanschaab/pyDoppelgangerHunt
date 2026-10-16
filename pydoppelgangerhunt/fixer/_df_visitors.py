@@ -83,6 +83,7 @@ class _BaseScopeVisitor(ast.NodeVisitor):
         self._in_comp_body: int = 0
         self.globals: Set[str] = set()
         self.nonlocals: Set[str] = set()
+        self.stored: Set[str] = set()
 
     def visit_Global(self, node: ast.Global) -> None:
         self.globals.update(node.names)
@@ -118,8 +119,7 @@ class _BaseScopeVisitor(ast.NodeVisitor):
             return
         # First generator's iter evaluates in enclosing scope (class scope if in class body)
         self.visit(node.generators[0].iter)
-        stored_attr = getattr(self, "stored", None)
-        stored_before = set(stored_attr) if isinstance(stored_attr, set) else None
+        stored_before = set(self.stored)
         comp_set: Set[str] = set()
         self._comp_targets.append(comp_set)
         self._in_comp_body += 1
@@ -143,9 +143,7 @@ class _BaseScopeVisitor(ast.NodeVisitor):
         finally:
             self._in_comp_body -= 1
             self._comp_targets.pop()
-            if isinstance(stored_attr, set) and stored_before is not None:
-                stored_attr.clear()
-                stored_attr.update(stored_before)
+            self.stored = stored_before
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
         self._visit_comprehension(node)
@@ -1122,18 +1120,20 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         if not node.values:
             return
         self.visit(node.values[0])
-        stored_before = set(self.stored)
+        stored_after_first = set(self.stored)
         for val in node.values[1:]:
             self.visit(val)
-            self.stored = set(stored_before)
+        self.stored = stored_after_first
 
     def visit_IfExp(self, node: ast.IfExp) -> None:
         self.visit(node.test)
         stored_before = set(self.stored)
         self.visit(node.body)
+        stored_body = set(self.stored)
         self.stored = set(stored_before)
         self.visit(node.orelse)
-        self.stored = set(stored_before)
+        stored_else = set(self.stored)
+        self.stored = stored_body & stored_else
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)

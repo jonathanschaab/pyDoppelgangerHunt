@@ -11069,6 +11069,18 @@ def test_out_of_bounds_pragma_and_col0_multiline_string_subroutine_synthesis(
         )
         is False
     )
+    dec_pragma_lines = [
+        "# pragma: no-refactor\n",
+        "@my_decorator\n",
+        "def compute(x):\n",
+        "    return x + 1\n",
+    ]
+    assert (
+        _unit_has_no_refactor_pragma(
+            {"start": 3, "end": 4}, dec_pragma_lines, "".join(dec_pragma_lines)
+        )
+        is True
+    )
 
     src = (
         "class Formatter:\n"

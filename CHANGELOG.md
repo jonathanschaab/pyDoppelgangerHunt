@@ -330,14 +330,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `visit_With`, and pattern children before binding in `_record_pattern_binding` and
   `_DownstreamReadVisitor.visit_MatchAs` (`_df_visitors.py`); added `visit_Delete` to
   `_UnitLiveInVisitor` to record `ast.Name(ctx=ast.Del)` targets as live-ins and discard them from
-  `self.stored`; saved and restored `self.stored` around conditional operands/branches in
-  `visit_BoolOp`, `visit_IfExp`, and `_visit_comprehension` while recording `NamedExpr` targets in
-  `self.stored` so intra-comprehension and intra-branch walrus reads do not become spurious live-ins;
-  checked `start_col` in `_resolve_unit_ast_end_col` (`_df_cache.py`) when `u_start == u_end` so
-  sub-line units without `end_col` do not misresolve to full or trailing statements; and removed the
-  `_is_inside` fallback to `generic_visit` in `_UnitLiveInVisitor.visit_Assign`, `visit_AnnAssign`,
-  `visit_BoolOp`, `visit_IfExp`, and `visit_NamedExpr` so RHS values and conditional depths are
-  always evaluated accurately across multi-line and sub-line unit boundaries.
+  `self.stored`; saved and restored `self.stored` around comprehension bodies in
+  `_BaseScopeVisitor._visit_comprehension`, across chained `node.values[1:]` operands in
+  `visit_BoolOp`, and across intersected `body`/`orelse` branches (`stored_body & stored_else`) in
+  `visit_IfExp` while recording `NamedExpr` targets in `self.stored` so intra-comprehension and
+  intra-branch walrus reads do not become spurious live-ins; checked `start_col` in
+  `_resolve_unit_ast_end_col` (`_df_cache.py`) when `u_start == u_end` so sub-line units without
+  `end_col` do not misresolve to full or trailing statements; and removed the `_is_inside` fallback
+  to `generic_visit` in `_UnitLiveInVisitor.visit_Assign`, `visit_AnnAssign`, `visit_BoolOp`,
+  `visit_IfExp`, and `visit_NamedExpr` so RHS values and conditional depths are always evaluated
+  accurately across multi-line and sub-line unit boundaries.
 - **Same-Class Whole-Line Expression `@staticmethod`, Receiver & `method_binding="method"` Guard**:
   Guarded `@staticmethod` emission in `synthesize_shared_helper_code` (`synthesis.py`) when
   `fn1_kind` or `fn2_kind` is `"instance"`, aligned `u1_eff`/`u2_eff` expression kinds prior to
@@ -355,22 +357,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **PEP 695 `type_params` Header Preservation, Decorator/Default Scoping & Fail-Closed Downstream `TypeAlias` Propagation**:
   Bound PEP 695 `type_params` on `FunctionDef`, `AsyncFunctionDef`, `ClassDef`, and `TypeAlias` in
   `_ScopeVisitor` (`scope.py`) and `_extract_helper_symbols` (`patch.py`); preserved top-level
-  generic function `type_params` (`scope["type_params"]`, merged via `_merge_type_params`) onto the
-  synthesized helper header (`def _shared_...[T](...)`) in `synthesize_shared_helper_code`
-  (`synthesis.py`) without visiting top-level `type_params` bounds as runtime `free_vars`;
-  evaluated `decorator_list` and function `defaults`/`kw_defaults` outside `type_params` in
-  `_extract_nested_scope_free_reads` (`_df_visitors.py`), `_ScopeVisitor._process_func`
-  (`scope.py`), and `_extract_helper_symbols` (`patch.py`); normalized qualified iterator prefixes
-  (`typing.`, `typing_extensions.`, `collections.abc.`) via `_strip_container_module_prefix` in
-  `_infer_outputs_return_type` and `_infer_helper_return_type` (`synthesis.py`); visited
-  `node.generators[0].iter` in `_ExprClosureCollector.visit_GeneratorExp` (`_df_closures.py`) on
-  non-eager generator expressions so nested closures inside the outermost iterator are recorded at
-  their own column offsets; recorded `alias_name` store before visiting `type_params` and `value`
-  (and subtracted `own_name` in `_extract_type_alias_free_reads`) so recursive `TypeAlias`
-  definitions (`type Tree = list[Tree]`) do not leak into outer `loads` or downstream reads; and
-  restricted `collect_downstream_read_names` in `_inspect_unit_scope` to stored/nonlocal
-  `visitor.type_aliases` (failing closed by retaining `alias_cands` in `outputs` when `full_src` or
-  `ds_reads` is `None`) while unconditionally excluding `visitor.imported_names` from `outputs`.
+  generic function `type_params` (`scope["type_params"]`, merged via `_merge_type_params` keying on
+  stripped identifier names and ordering non-defaulted parameters before PEP 696 defaulted
+  parameters) onto the synthesized helper header (`def _shared_...[T](...)`) in
+  `synthesize_shared_helper_code` (`synthesis.py`) without visiting top-level `type_params` bounds as
+  runtime `free_vars`; evaluated `decorator_list` and function `defaults`/`kw_defaults` outside
+  `type_params` in `_extract_nested_scope_free_reads` (`_df_visitors.py`),
+  `_ScopeVisitor._process_func` (`scope.py`), and `_extract_helper_symbols` (`patch.py`); normalized
+  qualified iterator prefixes (`typing.`, `typing_extensions.`, `collections.abc.`) via
+  `_strip_container_module_prefix` in `_infer_outputs_return_type` and `_infer_helper_return_type`
+  (`synthesis.py`); visited `node.generators[0].iter` in `_ExprClosureCollector.visit_GeneratorExp`
+  (`_df_closures.py`) on non-eager generator expressions so nested closures inside the outermost
+  iterator are recorded at their own column offsets; recorded `alias_name` store before visiting
+  `type_params` and `value` (and subtracted `own_name` in `_extract_type_alias_free_reads`) so
+  recursive `TypeAlias` definitions (`type Tree = list[Tree]`) do not leak into outer `loads` or
+  downstream reads; and restricted `collect_downstream_read_names` in `_inspect_unit_scope` to
+  stored/nonlocal `visitor.type_aliases` (failing closed by retaining `alias_cands` in `outputs` when
+  `full_src` or `ds_reads` is `None`) while unconditionally excluding `visitor.imported_names` from
+  `outputs`.
 - **Multiline String & PEP 701 F-String Continuation Preservation in Dedent & Helper Synthesis**: Added
   `_find_multiline_string_continuation_lines` (tracking both `STRING`/`FSTRING_MIDDLE` tokens and active
   `FSTRING_START`..`FSTRING_END` ranges covering multi-line `{...}` interpolations) and
@@ -391,11 +395,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`scope.py`) so `ast.Load` sub-expressions (`for arr[idx] in items`) are recorded as reads; and
   routed `_visit_named_expr(..., check_comp=True)` through `_can_store_in_class_scope` so walrus
   targets inside class-body comprehensions do not bind to `class_stores`.
-- **Out-of-Bounds `u_start` Guard in `_unit_has_no_refactor_pragma` & Asymmetric Expression Unit Validation**:
-  Clamped `start_idx = min(len(eff_lines), max(0, u_start - 1))` in `_unit_has_no_refactor_pragma`
-  (`patch.py`) and validated both `orig_lines1` and `orig_lines2` via `_is_valid_expr_unit_lines` in
-  `synthesize_shared_helper_code` (`synthesis.py`) to reject unmapped statement partners (e.g. `assert` or
-  bare `return` with `stmt.value is None`).
+- **Out-of-Bounds `u_start` Guard & Decorator Lookback in `_unit_has_no_refactor_pragma` & Asymmetric Expression Unit Validation**:
+  Clamped `start_idx = min(len(eff_lines), max(0, u_start - 1))` and stepped back over contiguous `#`
+  and `@` decorator lines in `_unit_has_no_refactor_pragma` (`patch.py`), and validated both
+  `orig_lines1` and `orig_lines2` via `_is_valid_expr_unit_lines` in `synthesize_shared_helper_code`
+  (`synthesis.py`) to reject unmapped statement partners (e.g. `assert` or bare `return` with
+  `stmt.value is None`).
 
 ## [1.0.0] - 2026-09-20
 ### Added

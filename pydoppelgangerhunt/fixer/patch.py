@@ -2876,13 +2876,13 @@ def _unit_has_no_refactor_pragma(
         file_lines if file_lines is not None else split_source_lines(full_text)
     )
     start_idx = min(len(eff_lines), max(0, u_start - 1))
-    while start_idx > 0 and eff_lines[start_idx - 1].strip().startswith("#"):
+    while start_idx > 0 and eff_lines[start_idx - 1].strip().startswith(("#", "@")):
         start_idx -= 1
     if not any(_NO_REFACTOR_RE.search(line) for line in eff_lines[start_idx:u_end]):
         return False
     try:
         comments = extract_unit_comments_and_pragmas(
-            full_text, u_start, u_end, include_leading=True
+            full_text, min(u_start, start_idx + 1), u_end, include_leading=True
         )
         return any(bool(_NO_REFACTOR_RE.search(c["text"])) for c in comments)
     except Exception as exc:
