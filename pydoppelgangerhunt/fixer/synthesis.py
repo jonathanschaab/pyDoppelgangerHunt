@@ -118,30 +118,17 @@ def _is_subline_unit(unit: Dict[str, Any]) -> bool:
     )
 
 
-def _should_prune_augassign_targets(
-    t1_unref: Optional[str],
-    t2_unref: Optional[str],
-    raw_inputs1: Sequence[str],
-    raw_inputs2: Sequence[str],
-) -> bool:
-    """Returns True if unreferenced AugAssign targets can be pruned with matching RHS arity."""
-    if t1_unref is None and t2_unref is None:
-        return False
-    rhs1 = (
-        [x for x in raw_inputs1 if x != t1_unref]
-        if t1_unref is not None
-        else list(raw_inputs1)
-    )
-    rhs2 = (
-        [x for x in raw_inputs2 if x != t2_unref]
-        if t2_unref is not None
-        else list(raw_inputs2)
-    )
-    if len(rhs1) != len(rhs2):
-        return False
-    return (t1_unref is None or t1_unref not in rhs2) and (
-        t2_unref is None or t2_unref not in rhs1
-    )
+def _align_pair_expr_kinds(u1: Dict[str, Any], u2: Dict[str, Any]) -> bool:
+    """Aligns missing expression unit kinds across a clone pair or returns False on conflict."""
+    k1_expr = u1.get("kind") in ("comprehension", "complex_expr")
+    k2_expr = u2.get("kind") in ("comprehension", "complex_expr")
+    if k1_expr != k2_expr:
+        if u1.get("kind") and u2.get("kind"):
+            return False
+        eff_expr_kind = u1.get("kind") if k1_expr else u2.get("kind")
+        u1.setdefault("kind", eff_expr_kind)
+        u2.setdefault("kind", eff_expr_kind)
+    return True
 
 
 def _extract_lhs_and_rhs_nodes(
@@ -184,16 +171,16 @@ def _prune_unreferenced_lhs_scope(
     unit: Dict[str, Any],
     scope_dict: Dict[str, Any],
     lines: Sequence[str],
-) -> None:
+) -> Set[str]:
     """Prunes LHS-only loaded identifiers and receiver attributes for whole-line expr units."""
     if _is_subline_unit(unit) or unit.get("kind") not in (
         "comprehension",
         "complex_expr",
     ):
-        return
+        return set()
     lhs_nodes, rhs_node = _extract_lhs_and_rhs_nodes(lines)
     if rhs_node is None or not lhs_nodes:
-        return
+        return set()
     scope_dict["outputs"] = []
     unit.pop("outputs", None)
     unit.pop("precomputed_outputs", None)
@@ -209,6 +196,9 @@ def _prune_unreferenced_lhs_scope(
     all_receivers = tuple(inst_receivers | class_receivers)
 
     unref_loads = _extract_unreferenced_lhs_loads(lines)
+    aug_unref = _extract_augassign_unreferenced_target(lines)
+    if aug_unref is not None:
+        unref_loads.add(aug_unref)
     lhs_attrs = {
         unfolded
         for lhs in lhs_nodes
@@ -220,7 +210,7 @@ def _prune_unreferenced_lhs_scope(
         if unfolded is not None
     }
     if not unref_loads and not lhs_attrs:
-        return
+        return set()
     rhs_attrs = {
         unfolded
         for child in ast.walk(rhs_node)
@@ -236,6 +226,8 @@ def _prune_unreferenced_lhs_scope(
         for key in ("inputs", "free_vars"):
             if key in scope_dict:
                 scope_dict[key] = [x for x in scope_dict[key] if x not in unref_loads]
+        if "inputs" in unit and isinstance(unit["inputs"], list):
+            unit["inputs"] = [x for x in unit["inputs"] if x not in unref_loads]
     if "attrs_written" in scope_dict and lhs_attrs:
         scope_dict["attrs_written"] = [
             a for a in scope_dict["attrs_written"] if a not in lhs_attrs
@@ -267,6 +259,7 @@ def _prune_unreferenced_lhs_scope(
     scope_dict["binding_kind"] = (
         "instance" if has_inst else ("class" if has_cls else "free")
     )
+    return unref_loads
 
 
 def _prune_pair_lhs_and_augassign_scopes(
@@ -276,30 +269,21 @@ def _prune_pair_lhs_and_augassign_scopes(
     scope2: Dict[str, Any],
     lines1: Sequence[str],
     lines2: Sequence[str],
-) -> None:
-    """Prunes unreferenced LHS loads and AugAssign targets from clone pair scopes in-place."""
+) -> bool:
+    """Prunes unreferenced LHS loads and AugAssign targets, returning False on arity mismatch."""
     _prune_unreferenced_lhs_scope(u1, scope1, lines1)
     _prune_unreferenced_lhs_scope(u2, scope2, lines2)
-    t1_unref = (
-        _extract_augassign_unreferenced_target(lines1)
-        if not _is_subline_unit(u1)
-        and u1.get("kind") in ("comprehension", "complex_expr")
-        else None
+    is_whole_expr1 = not _is_subline_unit(u1) and u1.get("kind") in (
+        "comprehension",
+        "complex_expr",
     )
-    t2_unref = (
-        _extract_augassign_unreferenced_target(lines2)
-        if not _is_subline_unit(u2)
-        and u2.get("kind") in ("comprehension", "complex_expr")
-        else None
+    is_whole_expr2 = not _is_subline_unit(u2) and u2.get("kind") in (
+        "comprehension",
+        "complex_expr",
     )
-    if _should_prune_augassign_targets(
-        t1_unref, t2_unref, scope1.get("inputs", []), scope2.get("inputs", [])
-    ):
-        if t1_unref is not None and "inputs" in scope1:
-            scope1["inputs"] = [x for x in scope1["inputs"] if x != t1_unref]
-        if t2_unref is not None and "inputs" in scope2:
-            scope2["inputs"] = [x for x in scope2["inputs"] if x != t2_unref]
-
+    if not (is_whole_expr1 or is_whole_expr2):
+        return True
+    return len(scope1.get("inputs", [])) == len(scope2.get("inputs", []))
 
 
 def _format_call_arguments(
@@ -317,7 +301,9 @@ def _format_call_arguments(
         if set(inputs) == set(target_inputs):
             inp_to_target = {k: k for k in inputs}
         else:
-            common_names = set(inputs) & set(target_inputs)
+            common_names = {
+                k for idx, k in enumerate(inputs) if target_inputs[idx] == k
+            }
             inp_to_target = {k: k for k in common_names}
             rem_inputs = [k for k in inputs if k not in common_names]
             rem_targets = [k for k in target_inputs if k not in common_names]
@@ -1168,15 +1154,9 @@ def synthesize_shared_helper_code(
         pragmas1 = extract_unit_comments_and_pragmas(raw1, 1, len(orig_lines1))
         pragmas2 = extract_unit_comments_and_pragmas(raw2, 1, len(orig_lines2))
 
-    k1_expr = u1.get("kind") in ("comprehension", "complex_expr")
-    k2_expr = u2.get("kind") in ("comprehension", "complex_expr")
-    if k1_expr != k2_expr:
-        if u1.get("kind") and u2.get("kind"):
-            return ""
-        eff_expr_kind = u1.get("kind") if k1_expr else u2.get("kind")
-        u1.setdefault("kind", eff_expr_kind)
-        u2.setdefault("kind", eff_expr_kind)
-    is_expr_unit = k1_expr or k2_expr
+    if not _align_pair_expr_kinds(u1, u2):
+        return ""
+    is_expr_unit = u1.get("kind") in ("comprehension", "complex_expr")
     if is_expr_unit:
         lines1 = _strip_stmt_target_lines(lines1)
         lines2 = _strip_stmt_target_lines(lines2)
@@ -1226,9 +1206,10 @@ def synthesize_shared_helper_code(
             u_item["is_async"] = True
         scopes.append(s_item)
     scope1, scope2 = scopes[0], scopes[1]
-    _prune_pair_lhs_and_augassign_scopes(
+    if not _prune_pair_lhs_and_augassign_scopes(
         u1, u2, scope1, scope2, orig_lines1, orig_lines2
-    )
+    ):
+        return ""
     scope = analyze_unit_variable_scope(
         u1,
         u2,
@@ -1613,10 +1594,6 @@ def synthesize_shared_helper_code(
             combined = "\n".join(import_header_parts) + "\n\n\n" + helper_def
             try:
                 compile("\n".join(import_header_parts), "<synthesized_imports>", "exec")
-                if not indent:
-                    compile(helper_def, "<synthesized_helper>", "exec")
-                else:
-                    compile("if 1:\n" + helper_def, "<synthesized_helper>", "exec")
             except (SyntaxError, ValueError):
                 return ""
             return combined

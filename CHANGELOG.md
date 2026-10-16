@@ -271,26 +271,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_UnitLiveInVisitor` (`_df_visitors.py`) to visit `AnnAssign.annotation`, bare subscript/attribute
   targets (`arr[idx]: int`), and PEP 695 `TypeAlias` statements (including type parameter bounds
   and defaults via `_extract_type_alias_free_reads`) while isolating lexical `type_params`.
-- **Whole-Line Subscript and Attribute LHS Load Pruning**: Added `_extract_unreferenced_lhs_loads`,
-  `_prune_unreferenced_lhs_scope`, and `_prune_pair_lhs_and_augassign_scopes` (`synthesis.py`,
-  `patch.py`) to prune LHS-only `ast.Load` identifiers and receiver attributes (`arr[i] = ...`,
-  `self.cache[k] = ...`, `self.res1 = [x * self.factor ...]`, `res: MyType = ...`), recompute
-  receiver binding flags (`has_instance_binding`, `has_class_binding`, `has_receiver_access`,
-  `binding_kind`) respecting custom `@classmethod` receiver names (`receiver_kind == "class"`), and
-  allow asymmetric `AugAssign` vs. `Assign` target pruning when RHS arities match.
+- **Whole-Line Subscript, Attribute, and `AugAssign` LHS Load Pruning & Collision Guard**:
+  Added `_extract_unreferenced_lhs_loads`, `_prune_unreferenced_lhs_scope`, and
+  `_prune_pair_lhs_and_augassign_scopes` (`synthesis.py`, `patch.py`) to prune LHS-only `ast.Load`
+  identifiers, unreferenced `AugAssign` targets, and receiver attributes (`arr[i] = ...`,
+  `self.cache[k] = ...`, `self.res1 = [x * self.factor ...]`, `res: MyType = ...`, `total += ...`),
+  recompute receiver binding flags (`has_instance_binding`, `has_class_binding`,
+  `has_receiver_access`, `binding_kind`) respecting custom `@classmethod` receiver names, and fail
+  closed when pruned LHS variables collide with partner RHS inputs or shared RHS variables appear at
+  conflicting positional indices.
 - **Sync vs. Async Iterator Return Annotation Cross-Check**: Guarded early-return iterator
   prefixes in `_infer_helper_return_type` (`synthesis.py`) with `is_async` so synchronous
   `Iterator[...]`/`Generator[...]`/`Iterable[...]` annotations are not emitted for `async def`
   generators (and vice versa).
-- **Inline and Multi-Line Pragma Fallback Detection**: Updated `_unit_has_no_refactor_pragma`
-  fallback (`patch.py`) to scan contiguous leading `#` comment lines and inspect unit lines
-  directly with `_NO_REFACTOR_RE.search(line)` so inline trailing `# pragma: no-refactor` comments
-  are detected even if tokenization fails.
+- **Unit-Slice Pre-Check & Inline Pragma Fallback Detection**: Updated `_unit_has_no_refactor_pragma`
+  (`patch.py`) to pre-check contiguous leading `#` comment lines and unit lines with
+  `_NO_REFACTOR_RE.search(line)` before tokenizing `full_text`, avoiding repeated full-file
+  tokenization when the pragma only appears elsewhere in the file.
 - **Sorted AST Scope Intervals Cache**: Sorted `intervals` by `(span, -start, -col_offset)` before
   caching on `tree._scope_intervals` in `_get_tree_scope_intervals` (`source.py`).
-- **Enclosing Scope PEP 695 `type_params` Shadowing**: Updated `_extract_single_node_local_names`
-  (`_df_closures.py`) to record `scope_node.type_params` names so generic function/class type
-  parameters shadowing built-ins (e.g., `def compute[sum](items):`) are included in `shadowed_names`.
+- **Enclosing Scope & Generic Class PEP 695 `type_params` Isolation**: Updated
+  `_extract_single_node_local_names` and `_collect_scope_closures_uncached` (`_df_closures.py`) to
+  record `scope_node.type_params` in `shadowed_names` and subtract enclosing `ClassDef.type_params`
+  from closures inside class bases, keywords, `type_params`, and bodies while preserving free reads
+  in class decorators.
 - **Lenient Closure Log Level Alignment**: Downgraded the internal `skip_pre_unit_closures=True`
   log in `collect_downstream_read_names` (`_df_hazards.py`) from `logger.warning` to `logger.debug`
   to avoid duplicate/elevated warning messages alongside the CLI `INFO` notice.
@@ -300,10 +304,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_visit_nested_lambda` (`_df_visitors.py`), avoiding false-positive free-variable capture on
   nested lambdas (`lambda x: (lambda: x)`) and closures inside comprehensions
   (`[lambda: x for x in items]`).
-- **`async_function` and `async_method` Whole-Unit Extraction and Delegation**: Included
-  `"async_function"` and `"async_method"` alongside `("function", "closure", "method")` in
+- **`async_function`, `async_method`, Top-Level Async Comprehensions & Nested Sync Scope Isolation**:
+  Included `"async_function"` and `"async_method"` alongside `("function", "closure", "method")` in
   `_extract_unit_body_lines` (`source.py`), `_inspect_unit_scope` (`scope.py`), and
-  `_build_unit_delegation_call` (`patch.py`).
+  `_build_unit_delegation_call` (`patch.py`); promoted subroutines with `has_await=True` to
+  `is_async=True` in `_populate_unit_receiver_metadata` (`binding.py`) even at module top-level; and
+  pushed `False` onto `async_stack` for `ClassDef` and `Lambda` bodies in `_ScopeHierarchyVisitor`
+  (`parser.py`).
 - **Whole-Loop Column Offset Guard in `_find_enclosing_loops`**: Cached loop `col_offset` in
   `_scope_loops_cache` (`_df_cache.py`, `_df_hazards.py`) and only classified same-span loops
   (`(l_start, l_end) == (u_start, u_end)`) as enclosing when `u_start_col is not None and l_col < u_start_col`,
@@ -315,17 +322,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_COMPREHENSION_TYPES` and `_INNER_SCOPE_TYPES` at the top of `while stack:` in
   `_extract_single_node_local_names` (`_df_closures.py`) so `ast.Lambda` nodes whose immediate
   body is a comprehension or nested lambda do not leak comprehension targets or inner lambda stores.
-- **Expression Unit Kind Parity and Chained Assignment Output Clearing**: Propagated
-  `comprehension`/`complex_expr` kind across kind-less twins while rejecting conflicting explicit
-  kinds in `synthesize_shared_helper_code` (`synthesis.py`), and cleared `outputs` /
-  `precomputed_outputs` in `_prune_unreferenced_lhs_scope` so chained assignments (`a = b = expr`)
-  pair cleanly with single-target assignments (`c = expr`).
-- **Downstream `For` and `With` Target `Load` Traversal & Multi-Line `Assign` Live-In Order**:
-  Visited `node.target` in `_DownstreamReadVisitor.visit_For` and `item.optional_vars` in
-  `visit_With` (`_df_visitors.py`) to capture subscript/attribute `Load` reads (`for arr[i] in ...`,
-  `with cm() as obj.slot[i]:`), and removed the `_is_inside` fallback to `generic_visit` in
-  `_UnitLiveInVisitor.visit_Assign` and `visit_AnnAssign` so `value` is always evaluated before
-  `targets` on multi-line statements starting before `u_start`.
+- **Expression Unit Kind Parity (`_align_pair_expr_kinds`) and Chained Assignment Output Clearing**:
+  Propagated `comprehension`/`complex_expr` kind across kind-less twins while rejecting conflicting
+  explicit kinds in both `synthesize_shared_helper_code` (`synthesis.py`) and
+  `generate_refactoring_patch` (`patch.py`), and cleared `outputs` / `precomputed_outputs` in
+  `_prune_unreferenced_lhs_scope` so chained assignments (`a = b = expr`) pair cleanly with
+  single-target assignments (`c = expr`).
+- **Downstream `For`/`With`/`Match` Target `Load` Traversal & Sub-Line/Multi-Line Live-In Order**:
+  Visited `node.target` in `_DownstreamReadVisitor.visit_For`, `item.optional_vars` in
+  `visit_With`, and pattern children before binding in `_record_pattern_binding` and
+  `_DownstreamReadVisitor.visit_MatchAs` (`_df_visitors.py`); removed the `_is_inside` fallback to
+  `generic_visit` in `_UnitLiveInVisitor.visit_Assign`, `visit_AnnAssign`, `visit_BoolOp`,
+  `visit_IfExp`, and `visit_NamedExpr` so RHS values and conditional depths are always evaluated
+  accurately across multi-line and sub-line unit boundaries.
 
 ## [1.0.0] - 2026-09-20
 ### Added

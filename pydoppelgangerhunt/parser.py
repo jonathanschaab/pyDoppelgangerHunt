@@ -662,8 +662,10 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
         self.class_stack.append((node.name, c_start))
         saved_func_stack = self.func_stack
         self.func_stack = []
+        self.async_stack.append(False)
         for stmt in node.body:
             self.visit(stmt)
+        self.async_stack.pop()
         self.func_stack = saved_func_stack
         self.class_stack.pop()
 
@@ -707,6 +709,18 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
 
     def visit_AsyncFunctionDef(self, fn: ast.AsyncFunctionDef) -> None:
         self._scope_function(fn)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        if self.async_stack:
+            self.func_is_async[id(node)] = self.async_stack[-1]
+        for default in node.args.defaults:
+            self.visit(default)
+        for kw_default in node.args.kw_defaults:
+            if kw_default is not None:
+                self.visit(kw_default)
+        self.async_stack.append(False)
+        self.visit(node.body)
+        self.async_stack.pop()
 
     def _scope_comprehension(self, comp: ast.AST) -> None:
         if self.async_stack:

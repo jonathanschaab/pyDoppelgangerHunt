@@ -5427,4 +5427,76 @@ def test_unit_live_in_visitor_multiline_assign_starting_before_u_start() -> None
     assert "val" in live_ins
 
 
+def test_unit_live_in_visitor_subline_boolop_ifexp_namedexpr_evaluation_order() -> None:
+    """Verifies that _UnitLiveInVisitor preserves conditional depth and value-before-target
+    order when a sub-line unit starts inside an enclosing BoolOp, IfExp, or NamedExpr."""
+    code_boolop = (
+        "def f(cond, y):\n"
+        "    res = cond and (x := y) or x\n"
+    )
+    tree_b = ast.parse(code_boolop)
+    # Unit starts at '(x := y) or x' (col 19..32), after 'cond and '
+    live_b = _extract_unit_live_in_names(
+        tree_b.body[0], u_start=2, u_end=2, u_start_col=19, u_end_col=32
+    )
+    assert "x" in live_b
+    assert "y" in live_b
+
+    code_walrus = (
+        "def g(x):\n"
+        "    if (x := x + 1) > 0:\n"
+        "        return x\n"
+    )
+    tree_w = ast.parse(code_walrus)
+    # Sub-line unit starts at 'x + 1' inside '(x := x + 1)' (col 13..18)
+    live_w = _extract_unit_live_in_names(
+        tree_w.body[0], u_start=2, u_end=2, u_start_col=13, u_end_col=18
+    )
+    assert "x" in live_w
+
+
+@pytest.mark.skipif(sys.version_info < (3, 10), reason="match/case requires Python 3.10+")
+def test_pattern_binding_visits_value_and_key_loads_before_store() -> None:
+    """Verifies that case x.CONST as x: and case {x.k: 1, **x}: record the attribute load of x
+    before binding/killing x in both _UnitLiveInVisitor and _DownstreamReadVisitor."""
+    _clear_downstream_reads_cache()
+    code = (
+        "def matcher(subj, x):\n"
+        "    y = 1\n"
+        "    match subj:\n"
+        "        case x.CONST as x:\n"
+        "            return x\n"
+        "        case {x.k: 1, **x}:\n"
+        "            return y\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    live_ins = _extract_unit_live_in_names(fn_node, u_start=3, u_end=7)
+    assert "x" in live_ins
+
+    unit = {"file": "match_order.py", "start": 2, "end": 2}
+    reads = collect_downstream_read_names(code, unit, candidates={"x", "y"})
+    assert reads == {"x", "y"}
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 requires Python 3.12+")
+def test_pep695_generic_class_type_params_excluded_from_method_closures() -> None:
+    """Verifies that PEP 695 class type_params (class C[T]:) are excluded from closures
+    inside C's bases, keywords, and body, while decorators on C still capture free reads."""
+    code = (
+        "def make_cls(x, dec):\n"
+        "    @dec(lambda: U)\n"
+        "    class Box[T]:\n"
+        "        def get(self, val: T) -> T:\n"
+        "            return x\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    closures = _collect_scope_closures(fn_node)
+    captured = set().union(*(names for _, names in closures))
+    assert "x" in captured
+    assert "U" in captured
+    assert "T" not in captured
+
+
 

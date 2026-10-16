@@ -82,6 +82,7 @@ from pydoppelgangerhunt.source_lines import (
     resolve_unit_line_bounds,
 )
 from pydoppelgangerhunt.fixer.synthesis import (
+    _align_pair_expr_kinds,
     _extract_required_typing_imports,
     _extract_unreferenced_lhs_loads,
     _format_call_arguments,
@@ -2835,6 +2836,14 @@ def _unit_has_no_refactor_pragma(
     if not _NO_REFACTOR_RE.search(full_text):
         return False
     u_start, u_end = resolve_unit_line_bounds(unit)
+    eff_lines = (
+        file_lines if file_lines is not None else split_source_lines(full_text)
+    )
+    start_idx = max(0, u_start - 1)
+    while start_idx > 0 and eff_lines[start_idx - 1].strip().startswith("#"):
+        start_idx -= 1
+    if not any(_NO_REFACTOR_RE.search(line) for line in eff_lines[start_idx:u_end]):
+        return False
     try:
         comments = extract_unit_comments_and_pragmas(
             full_text, u_start, u_end, include_leading=True
@@ -2847,16 +2856,7 @@ def _unit_has_no_refactor_pragma(
             u_end,
             exc,
         )
-        eff_lines = (
-            file_lines if file_lines is not None else split_source_lines(full_text)
-        )
-        start_idx = max(0, u_start - 1)
-        while start_idx > 0 and eff_lines[start_idx - 1].strip().startswith("#"):
-            start_idx -= 1
-        for line in eff_lines[start_idx:u_end]:
-            if _NO_REFACTOR_RE.search(line):
-                return True
-        return False
+        return True
 
 
 
@@ -3193,6 +3193,9 @@ def _generate_refactoring_patch_impl(
                 if f2_plan is not None
                 else (digest1 if is_same_file else None)
             )
+            if not _align_pair_expr_kinds(u1_eff, u2_eff):
+                skip_reasons["mismatched subroutine kinds"] += 1
+                continue
             is_sub1 = is_subroutine_unit(u1_eff, source_text=orig_text, tree=tree1)
             is_sub2 = is_subroutine_unit(u2_eff, source_text=f2_text, tree=tree2)
             u1_eff["is_subroutine"] = is_sub1
@@ -3211,7 +3214,7 @@ def _generate_refactoring_patch_impl(
 
             s1 = inspect_single_unit_scope(u1_eff, repo_root=str(root), tree=tree1)
             s2 = inspect_single_unit_scope(u2_eff, repo_root=str(root), tree=tree2)
-            if u1.get("kind") in ("comprehension", "complex_expr") or u2.get(
+            if u1_eff.get("kind") in ("comprehension", "complex_expr") or u2_eff.get(
                 "kind"
             ) in ("comprehension", "complex_expr"):
                 stmt_lines1 = _slice_unit_token_lines(
@@ -3234,9 +3237,11 @@ def _generate_refactoring_patch_impl(
                         ],
                     ),
                 )
-                _prune_pair_lhs_and_augassign_scopes(
+                if not _prune_pair_lhs_and_augassign_scopes(
                     u1_eff, u2_eff, s1, s2, stmt_lines1, stmt_lines2
-                )
+                ):
+                    skip_reasons["incompatible inputs or outputs"] += 1
+                    continue
             if orig_fn1 and orig_fn1.get("is_async") and s1.get("has_yield"):
                 s1["is_async"] = True
             if orig_fn2 and orig_fn2.get("is_async") and s2.get("has_yield"):

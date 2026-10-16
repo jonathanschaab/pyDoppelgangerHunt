@@ -424,7 +424,9 @@ def _populate_unit_receiver_metadata(
                     has_yield, has_await = _unit_ast_has_async_or_yield(
                         parsed_tree, u_start, u_end, is_subroutine=True
                     )
-            unit["is_async"] = fn_is_async if (has_yield or has_await) else False
+            unit["is_async"] = (
+                True if has_await else (fn_is_async if has_yield else False)
+            )
         else:
             unit["is_async"] = fn_is_async
 

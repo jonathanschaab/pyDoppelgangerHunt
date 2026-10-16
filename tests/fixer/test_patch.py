@@ -10177,7 +10177,7 @@ def test_file_patch_plan_parsed_tree_uses_get_or_parse_tree(tmp_path: Path) -> N
 
 def test_augassign_target_pruning_cross_variable_collision(tmp_path: Path) -> None:
     """Verifies that when an AugAssign target matches an active input in the partner clone,
-    target pruning is skipped to prevent call-site argument permutation."""
+    both unreferenced targets are pruned and call-site arguments preserve positional order."""
     src1 = (
         "def func1(a, b, c):\n"
         "    a += b - c\n"
@@ -10196,13 +10196,20 @@ def test_augassign_target_pruning_cross_variable_collision(tmp_path: Path) -> No
     u1 = {"file": "mod1.py", "start": 2, "end": 2, "name": "u1", "kind": "complex_expr"}
     u2 = {"file": "mod2.py", "start": 2, "end": 2, "name": "u2", "kind": "complex_expr"}
 
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "def _shared_u1_u2(b: Any, c: Any) -> Any:" in helper
+    assert "return b - c" in helper
+
     patch = generate_refactoring_patch(
         [(0.95, u1, u2)],
         repo_root=str(tmp_path),
         replace_clones=True,
     )
-    assert patch != ""
-    assert "--- a/mod1.py" in patch
+    assert "def _shared_u1_u2(b: Any, c: Any) -> Any:" in patch
+    assert "+    a += _shared_u1_u2(b, c)" in patch
+    assert "+    total += _shared_u1_u2(a, b)" in patch
+    assert "_shared_u1_u2(a, b, total)" not in patch
+    assert "_shared_u1_u2(b, a)" not in patch
 
 
 def test_subline_complex_expr_not_treated_as_augassign_target(tmp_path: Path) -> None:
@@ -10777,6 +10784,118 @@ def test_asymmetric_expr_kind_and_chained_assign_outputs_cleared(
     )
     assert "+    x = y = _shared_u1_u2(a, b)" in patch
     assert "+    z = _shared_u1_u2(a, b)" in patch
+
+    # 4. Kind-less u1 paired with kind='complex_expr' u2 in generate_refactoring_patch
+    patch_kindless = generate_refactoring_patch(
+        [(0.98, dict(u1_no_kind), dict(u2_expr))],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "+    x = y = _shared_u1_u2(a, b)" in patch_kindless
+    assert "+    z = _shared_u1_u2(a, b)" in patch_kindless
+
+
+def test_lhs_load_pruning_cross_clone_collision_and_arity_mismatch(
+    tmp_path: Path,
+) -> None:
+    """Verifies that whole-line complex_expr units whose LHS-only loads collide with the
+    partner clone's RHS inputs preserve positional argument order without permuting operands,
+    and fail closed when pruned RHS arities differ."""
+    src1 = (
+        "def store_one(arr, a, b, c):\n"
+        "    arr[a] = b - c\n"
+    )
+    src2 = (
+        "def store_two(arr, idx, a, b):\n"
+        "    arr[idx] = a - b\n"
+    )
+    f1 = tmp_path / "lhs_col1.py"
+    f2 = tmp_path / "lhs_col2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": "lhs_col1.py", "start": 2, "end": 2, "name": "u1", "kind": "complex_expr"}
+    u2 = {"file": "lhs_col2.py", "start": 2, "end": 2, "name": "u2", "kind": "complex_expr"}
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "def _shared_u1_u2(b: Any, c: Any) -> Any:" in helper
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "+    arr[a] = _shared_u1_u2(b, c)" in patch
+    assert "+    arr[idx] = _shared_u1_u2(a, b)" in patch
+    assert "_shared_u1_u2(b, a)" not in patch
+
+    # Asymmetric RHS arity after LHS pruning fails closed
+    src3 = (
+        "def store_three(arr, a, b):\n"
+        "    arr[a] = a + b + 1\n"
+    )
+    f3 = tmp_path / "lhs_col3.py"
+    f3.write_text(src3, encoding="utf-8")
+    u3 = {"file": "lhs_col3.py", "start": 2, "end": 2, "name": "u3", "kind": "complex_expr"}
+    u1_single = {
+        "file": "lhs_col1.py",
+        "start": 2,
+        "end": 2,
+        "name": "u1",
+        "kind": "complex_expr",
+    }
+    f1.write_text("def store_one(arr, a, b):\n    arr[a] = b + 1\n", encoding="utf-8")
+    assert synthesize_shared_helper_code(u1_single, u3, repo_root=str(tmp_path)) == ""
+    assert (
+        generate_refactoring_patch(
+            [(0.95, u1_single, u3)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+        )
+        == ""
+    )
+
+
+def test_top_level_async_comprehension_and_nested_class_lambda_async_scoping() -> None:
+    """Verifies that top-level async comprehensions set unit['is_async'] = True in
+    _populate_unit_receiver_metadata and that _ScopeHierarchyVisitor resets async_stack
+    to False inside ClassDef and Lambda bodies nested inside async def."""
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=protected-access
+        _populate_unit_receiver_metadata,
+    )
+    from pydoppelgangerhunt.parser import (  # pylint: disable=protected-access
+        _ScopeHierarchyVisitor,
+    )
+
+    top_src = "res = [await fetch(x) for x in items]\n"
+    u_top: dict[str, Any] = {
+        "start": 1,
+        "end": 1,
+        "kind": "comprehension",
+        "is_subroutine": True,
+    }
+    _populate_unit_receiver_metadata(u_top, source_text=top_src)
+    assert u_top["is_async"] is True
+
+    nested_src = (
+        "async def outer(items):\n"
+        "    class Inner:\n"
+        "        vals = [x for x in range(5)]\n"
+        "    fn = lambda seq=[await f(i) for i in items]: [y for y in seq]\n"
+    )
+    tree = ast.parse(nested_src)
+    scoper = _ScopeHierarchyVisitor()
+    scoper.visit(tree)
+
+    outer_fn = tree.body[0]
+    inner_cls = outer_fn.body[0]  # type: ignore[attr-defined]
+    cls_comp = inner_cls.body[0].value
+    lam_node = outer_fn.body[1].value  # type: ignore[attr-defined]
+    lam_default_comp = lam_node.args.defaults[0]
+    lam_body_comp = lam_node.body
+
+    assert scoper.func_is_async[id(cls_comp)] is False
+    assert scoper.func_is_async[id(lam_default_comp)] is True
+    assert scoper.func_is_async[id(lam_body_comp)] is False
 
 
 

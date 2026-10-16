@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import builtins
 from typing import (
+    AbstractSet,
     Any,
     Dict,
     Iterable,
@@ -285,10 +286,16 @@ def _collect_scope_closures_uncached(
         return s_line, s_col
 
     class _ExprClosureCollector(_BaseScopeVisitor):
-        def __init__(self, default_line: int, default_col: int) -> None:
+        def __init__(
+            self,
+            default_line: int,
+            default_col: int,
+            bound_names: AbstractSet[str] = frozenset(),
+        ) -> None:
             super().__init__()
             self.default_line = default_line
             self.default_col = default_col
+            self.bound_names = bound_names
 
         def _record_closure_node(
             self, subnode: Union[ast.Lambda, ast.GeneratorExp]
@@ -303,7 +310,7 @@ def _collect_scope_closures_uncached(
                     {
                         r
                         for r in _extract_nested_scope_free_reads(subnode)
-                        if not self._is_in_comp(r)
+                        if not self._is_in_comp(r) and r not in self.bound_names
                     },
                 )
             )
@@ -329,9 +336,12 @@ def _collect_scope_closures_uncached(
                 self._record_closure_node(node)
 
     def _record_expr_closures(
-        nodes: Iterable[ast.AST], default_line: int, default_col: int
+        nodes: Iterable[ast.AST],
+        default_line: int,
+        default_col: int,
+        bound_names: AbstractSet[str] = frozenset(),
     ) -> None:
-        collector = _ExprClosureCollector(default_line, default_col)
+        collector = _ExprClosureCollector(default_line, default_col, bound_names)
         for node in nodes:
             collector.visit(node)
 
@@ -361,7 +371,10 @@ def _collect_scope_closures_uncached(
             return headers
         return [s]
 
-    def _walk_stmts(stmts: Iterable[ast.AST]) -> None:
+    def _walk_stmts(
+        stmts: Iterable[ast.AST],
+        bound_names: AbstractSet[str] = frozenset(),
+    ) -> None:
         for stmt in stmts:
             stmt_start, stmt_col = _resolve_stmt_start_pos(stmt)
 
@@ -369,34 +382,46 @@ def _collect_scope_closures_uncached(
                 closures.append(
                     (
                         _ClosurePos(stmt_start, stmt_col),
-                        _extract_nested_scope_free_reads(stmt),
+                        _extract_nested_scope_free_reads(stmt) - bound_names,
                     )
                 )
                 continue
 
             if isinstance(stmt, ast.ClassDef):
-                class_exprs = (
-                    list(stmt.decorator_list)
-                    + list(stmt.bases)
+                _record_expr_closures(
+                    stmt.decorator_list, stmt_start, stmt_col, bound_names
+                )
+                cls_tp_names = {
+                    tp.name
+                    for tp in getattr(stmt, "type_params", [])
+                    if isinstance(getattr(tp, "name", None), str)
+                }
+                inner_bound = bound_names | cls_tp_names
+                class_scoped_exprs = (
+                    list(stmt.bases)
                     + [kw.value for kw in stmt.keywords]
                     + list(getattr(stmt, "type_params", []))
                 )
-                _record_expr_closures(class_exprs, stmt_start, stmt_col)
-                _walk_stmts(stmt.body)
+                _record_expr_closures(
+                    class_scoped_exprs, stmt_start, stmt_col, inner_bound
+                )
+                _walk_stmts(stmt.body, inner_bound)
                 continue
 
-            _record_expr_closures(_extract_header_nodes(stmt), stmt_start, stmt_col)
+            _record_expr_closures(
+                _extract_header_nodes(stmt), stmt_start, stmt_col, bound_names
+            )
 
             for attr in ("body", "orelse", "finalbody"):
                 sub_stmts = getattr(stmt, attr, None)
                 if isinstance(sub_stmts, list):
-                    _walk_stmts(sub_stmts)
+                    _walk_stmts(sub_stmts, bound_names)
 
             for handler in getattr(stmt, "handlers", []):
-                _walk_stmts(getattr(handler, "body", []))
+                _walk_stmts(getattr(handler, "body", []), bound_names)
 
             for case in getattr(stmt, "cases", []):
-                _walk_stmts(getattr(case, "body", []))
+                _walk_stmts(getattr(case, "body", []), bound_names)
 
     raw_scope_body = getattr(scope_node, "body", [])
     scope_stmts = (
@@ -404,7 +429,12 @@ def _collect_scope_closures_uncached(
         else [raw_scope_body] if isinstance(raw_scope_body, ast.AST)
         else []
     )
-    _walk_stmts(scope_stmts)
+    root_tp_names = frozenset(
+        tp.name
+        for tp in getattr(scope_node, "type_params", [])
+        if isinstance(getattr(tp, "name", None), str)
+    )
+    _walk_stmts(scope_stmts, root_tp_names)
     return closures
 
 

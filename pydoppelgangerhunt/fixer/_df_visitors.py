@@ -185,10 +185,10 @@ class _BaseScopeVisitor(ast.NodeVisitor):
         return None
 
     def _record_pattern_binding(self, node: ast.AST, store_set: Set[str]) -> None:
+        self.generic_visit(node)
         bound = self._extract_pattern_bound_name(node)
         if bound is not None and not self._is_in_comp(bound):
             store_set.add(bound)
-        self.generic_visit(node)
 
     def visit_MatchStar(self, node: ast.AST) -> None:
         self.visit_MatchAs(node)
@@ -860,11 +860,11 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         )
 
     def visit_MatchAs(self, node: ast.AST) -> None:
+        self.generic_visit(node)
         bound = self._extract_pattern_bound_name(node)
         if bound is not None and self._should_inspect_read(node):
             if not self._is_in_comp(bound):
                 self.killed.add(bound)
-        self.generic_visit(node)
 
     def visit_Import(self, node: ast.Import) -> None:
         if self._should_inspect_read(node):
@@ -1082,9 +1082,6 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
 
 
     def visit_BoolOp(self, node: ast.BoolOp) -> None:
-        if not self._is_inside(node):
-            self.generic_visit(node)
-            return
         if not node.values:
             return
         self.visit(node.values[0])
@@ -1096,9 +1093,6 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
             self._conditional_depth -= 1
 
     def visit_IfExp(self, node: ast.IfExp) -> None:
-        if not self._is_inside(node):
-            self.generic_visit(node)
-            return
         self.visit(node.test)
         self._conditional_depth += 1
         try:
@@ -1108,16 +1102,14 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
             self._conditional_depth -= 1
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
-        if self._is_inside(node):
-            self.visit(node.value)
-            if (
-                isinstance(node.target, ast.Name)
-                and self._conditional_depth == 0
-                and self._in_comp_body == 0
-            ):
-                self.stored.add(node.target.id)
-        else:
-            self.generic_visit(node)
+        self.visit(node.value)
+        if (
+            self._is_inside(node.target)
+            and isinstance(node.target, ast.Name)
+            and self._conditional_depth == 0
+            and self._in_comp_body == 0
+        ):
+            self.stored.add(node.target.id)
 
     def _collect_branch_stored(
         self, stmts: Sequence[ast.stmt], initial: Set[str]
