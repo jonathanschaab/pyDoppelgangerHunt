@@ -647,7 +647,16 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
             self.enclosing_classes[id(node)] = self.class_stack[-1][0]
             self.enclosing_class_starts[id(node)] = self.class_stack[-1][1]
 
+    def _visit_arg_defaults(self, args: ast.arguments) -> None:
+        for default in args.defaults:
+            self.visit(default)
+        for kw_default in args.kw_defaults:
+            if kw_default is not None:
+                self.visit(kw_default)
+
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        if self.async_stack:
+            self.func_is_async[id(node)] = self.async_stack[-1]
         for dec in node.decorator_list:
             self.visit(dec)
         for base in node.bases:
@@ -670,13 +679,11 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
         self.class_stack.pop()
 
     def _scope_function(self, fn: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
+        if self.async_stack:
+            self.func_is_async[id(fn)] = self.async_stack[-1]
         for dec in fn.decorator_list:
             self.visit(dec)
-        for default in fn.args.defaults:
-            self.visit(default)
-        for kw_default in fn.args.kw_defaults:
-            if kw_default is not None:
-                self.visit(kw_default)
+        self._visit_arg_defaults(fn.args)
         all_args = (
             list(getattr(fn.args, "posonlyargs", []))
             + list(fn.args.args)
@@ -713,11 +720,7 @@ class _ScopeHierarchyVisitor(ast.NodeVisitor):
     def visit_Lambda(self, node: ast.Lambda) -> None:
         if self.async_stack:
             self.func_is_async[id(node)] = self.async_stack[-1]
-        for default in node.args.defaults:
-            self.visit(default)
-        for kw_default in node.args.kw_defaults:
-            if kw_default is not None:
-                self.visit(kw_default)
+        self._visit_arg_defaults(node.args)
         self.async_stack.append(False)
         self.visit(node.body)
         self.async_stack.pop()

@@ -25,11 +25,21 @@ from pydoppelgangerhunt.fixer._df_cache import (
 from pydoppelgangerhunt.fixer._df_visitors import (
     _BaseScopeVisitor,
     _extract_nested_scope_free_reads,
+    _extract_pattern_bound_name,
     _record_import_names,
 )
 from pydoppelgangerhunt.fixer.scope import _extract_arg_names
 
 _BUILTIN_NAMES: Set[str] = set(dir(builtins))
+
+
+def _extract_node_type_param_names(node: ast.AST) -> Set[str]:
+    """Extracts PEP 695 type parameter names declared directly on an AST node."""
+    return {
+        tp.name
+        for tp in getattr(node, "type_params", [])
+        if isinstance(getattr(tp, "name", None), str)
+    }
 
 
 class _ClosurePos(NamedTuple):
@@ -86,11 +96,7 @@ def _extract_single_node_local_names(scope_node: ast.AST) -> Set[str]:
     if isinstance(node_name, str):
         names.add(node_name)
 
-    names.update(
-        tp.name
-        for tp in getattr(scope_node, "type_params", [])
-        if isinstance(getattr(tp, "name", None), str)
-    )
+    names.update(_extract_node_type_param_names(scope_node))
 
     node_args = getattr(scope_node, "args", None)
     if isinstance(node_args, ast.arguments):
@@ -363,12 +369,7 @@ def _collect_scope_closures_uncached(
             handlers = getattr(s, "handlers", [])
             return [h.type for h in handlers if getattr(h, "type", None) is not None]
         if type(s).__name__ == "Match":
-            headers = [getattr(s, "subject")]
-            for case in getattr(s, "cases", []):
-                headers.append(getattr(case, "pattern"))
-                if getattr(case, "guard", None) is not None:
-                    headers.append(getattr(case, "guard"))
-            return headers
+            return [getattr(s, "subject")]
         return [s]
 
     def _walk_stmts(
@@ -391,12 +392,7 @@ def _collect_scope_closures_uncached(
                 _record_expr_closures(
                     stmt.decorator_list, stmt_start, stmt_col, bound_names
                 )
-                cls_tp_names = {
-                    tp.name
-                    for tp in getattr(stmt, "type_params", [])
-                    if isinstance(getattr(tp, "name", None), str)
-                }
-                inner_bound = bound_names | cls_tp_names
+                inner_bound = bound_names | _extract_node_type_param_names(stmt)
                 class_scoped_exprs = (
                     list(stmt.bases)
                     + [kw.value for kw in stmt.keywords]
@@ -408,8 +404,9 @@ def _collect_scope_closures_uncached(
                 _walk_stmts(stmt.body, inner_bound)
                 continue
 
+            header_bound = bound_names | _extract_node_type_param_names(stmt)
             _record_expr_closures(
-                _extract_header_nodes(stmt), stmt_start, stmt_col, bound_names
+                _extract_header_nodes(stmt), stmt_start, stmt_col, header_bound
             )
 
             for attr in ("body", "orelse", "finalbody"):
@@ -421,7 +418,22 @@ def _collect_scope_closures_uncached(
                 _walk_stmts(getattr(handler, "body", []), bound_names)
 
             for case in getattr(stmt, "cases", []):
-                _walk_stmts(getattr(case, "body", []), bound_names)
+                pattern = getattr(case, "pattern", None)
+                case_bound = bound_names
+                if isinstance(pattern, ast.AST):
+                    _record_expr_closures([pattern], stmt_start, stmt_col, bound_names)
+                    pattern_names = {
+                        name
+                        for sub in ast.walk(pattern)
+                        for name in (_extract_pattern_bound_name(sub),)
+                        if name is not None
+                    }
+                    if pattern_names:
+                        case_bound = bound_names | pattern_names
+                guard = getattr(case, "guard", None)
+                if isinstance(guard, ast.AST):
+                    _record_expr_closures([guard], stmt_start, stmt_col, case_bound)
+                _walk_stmts(getattr(case, "body", []), case_bound)
 
     raw_scope_body = getattr(scope_node, "body", [])
     scope_stmts = (
@@ -429,11 +441,7 @@ def _collect_scope_closures_uncached(
         else [raw_scope_body] if isinstance(raw_scope_body, ast.AST)
         else []
     )
-    root_tp_names = frozenset(
-        tp.name
-        for tp in getattr(scope_node, "type_params", [])
-        if isinstance(getattr(tp, "name", None), str)
-    )
+    root_tp_names = frozenset(_extract_node_type_param_names(scope_node))
     _walk_stmts(scope_stmts, root_tp_names)
     return closures
 

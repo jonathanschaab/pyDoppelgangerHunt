@@ -5489,6 +5489,7 @@ def test_pep695_generic_class_type_params_excluded_from_method_closures() -> Non
         "    class Box[T]:\n"
         "        def get(self, val: T) -> T:\n"
         "            return x\n"
+        "    type MyAlias[K] = tuple[K, (lambda: (K, V))()]\n"
     )
     tree = ast.parse(code)
     fn_node = tree.body[0]
@@ -5496,7 +5497,64 @@ def test_pep695_generic_class_type_params_excluded_from_method_closures() -> Non
     captured = set().union(*(names for _, names in closures))
     assert "x" in captured
     assert "U" in captured
+    assert "V" in captured
     assert "T" not in captured
+    assert "K" not in captured
+
+
+@pytest.mark.skipif(sys.version_info < (3, 10), reason="match/case requires Python 3.10+")
+def test_collect_scope_closures_match_case_pattern_bindings() -> None:
+    """Verifies that _collect_scope_closures excludes variables bound by a match case
+    pattern from closures in that case's guard and body, while preserving outer reads."""
+    code = (
+        "def handle(val):\n"
+        "    match (lambda: subj_ext)():\n"
+        "        case [x, *rest] if (lambda: x + len(rest) + guard_ext)():\n"
+        "            cb = lambda: (x, rest, body_ext)\n"
+        "        case {'k': v, **kw}:\n"
+        "            cb2 = lambda: (v, kw)\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    closures = _collect_scope_closures(fn_node)
+    captured = set().union(*(names for _, names in closures))
+    assert "subj_ext" in captured
+    assert "guard_ext" in captured
+    assert "body_ext" in captured
+    assert "x" not in captured
+    assert "rest" not in captured
+    assert "v" not in captured
+    assert "kw" not in captured
+
+
+def test_scope_hierarchy_visitor_header_expressions_async_context() -> None:
+    """Verifies that _ScopeHierarchyVisitor records enclosing async context for header
+    expressions (decorators, defaults, bases, keywords) before pushing inner scope."""
+    from pydoppelgangerhunt.parser import _ScopeHierarchyVisitor  # pylint: disable=protected-access
+
+    code = (
+        "async def outer(dec, Base):\n"
+        "    @dec([x for x in range(3)])\n"
+        "    def sync_inner(a=[y for y in range(3)], *, b=[z for z in range(3)]):\n"
+        "        return [w for w in range(3)]\n"
+        "    class Inner([u for u in range(3)], meta=[v for v in range(3)]):\n"
+        "        attr = [q for q in range(3)]\n"
+    )
+    tree = ast.parse(code)
+    func_is_async: Dict[int, bool] = {}
+    _ScopeHierarchyVisitor(func_is_async=func_is_async).visit(tree)
+    comps = sorted(
+        [n for n in ast.walk(tree) if isinstance(n, ast.ListComp)],
+        key=lambda n: (getattr(n, "lineno", 0), getattr(n, "col_offset", 0)),
+    )
+    assert len(comps) == 7
+    # Header comprehensions on sync_inner (decorator, default, kw_default) and Inner (base, keyword)
+    # evaluate in outer's async context (True)
+    for header_comp in comps[:3] + comps[4:6]:
+        assert func_is_async.get(id(header_comp)) is True
+    # Body comprehensions inside sync_inner and Inner evaluate in sync context (False)
+    assert func_is_async.get(id(comps[3])) is False
+    assert func_is_async.get(id(comps[6])) is False
 
 
 

@@ -64,10 +64,19 @@ def _extract_scope_stmts(scope_node: ast.AST) -> List[ast.AST]:
     return []
 
 
+def _extract_pattern_bound_name(node: ast.AST) -> Optional[str]:
+    """Extracts identifier bound by MatchAs, MatchStar, or MatchMapping pattern nodes."""
+    name = getattr(node, "name", None) or getattr(node, "rest", None)
+    if isinstance(name, str) and name and name != "_":
+        return name
+    return None
+
+
 class _BaseScopeVisitor(ast.NodeVisitor):
     """Shared helpers for scope visitors."""
 
     _record_import_names = staticmethod(_record_import_names)
+    _extract_pattern_bound_name = staticmethod(_extract_pattern_bound_name)
 
     def __init__(self) -> None:
         self._comp_targets: List[Set[str]] = []
@@ -175,14 +184,6 @@ class _BaseScopeVisitor(ast.NodeVisitor):
         reads_set.update(
             r for r in _extract_nested_scope_free_reads(node) if not self._is_in_comp(r)
         )
-
-    @staticmethod
-    def _extract_pattern_bound_name(node: ast.AST) -> Optional[str]:
-        """Extracts identifier bound by MatchAs, MatchStar, or MatchMapping pattern nodes."""
-        name = getattr(node, "name", None) or getattr(node, "rest", None)
-        if isinstance(name, str) and name and name != "_":
-            return name
-        return None
 
     def _record_pattern_binding(self, node: ast.AST, store_set: Set[str]) -> None:
         self.generic_visit(node)

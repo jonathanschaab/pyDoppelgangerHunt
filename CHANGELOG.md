@@ -182,8 +182,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_get_or_parse_tree` in `synthesis.py` and `binding.py`, pre-checked `_NO_REFACTOR_RE` on
   pre-materialized text in `_unit_has_no_refactor_pragma`, deduplicated `ClassDef` body traversal
   in `_collect_scope_closures_uncached`, eliminated duplicate subtree walks in
-  `_has_wildcard_star_import`, and isolated PEP 695 `TypeAlias` type parameters in
-  `_extract_single_node_local_names` (`_df_closures.py`).
+  `_has_wildcard_star_import`, isolated PEP 695 `TypeAlias` and `ClassDef` type parameters as well
+  as `match`/`case` pattern bindings in `_collect_scope_closures_uncached` (`_df_closures.py`), and
+  recorded enclosing async context on function/class headers in `_ScopeHierarchyVisitor` (`parser.py`).
 - **Whole-Line Comprehension Assignment Target & Indentation Preservation**: Unified
   `target_unit.get("kind") in ("comprehension", "complex_expr")` in `_build_unit_delegation_call`
   (`patch.py`), ensuring whole-line comprehension units retain their assignment target (`lhs = `),
