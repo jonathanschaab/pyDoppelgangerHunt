@@ -106,6 +106,11 @@ def _extract_single_node_local_names(scope_node: ast.AST) -> Set[str]:
         if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names.add(curr.name)
             continue
+        if isinstance(curr, _COMPREHENSION_TYPES):
+            names.update(_extract_comprehension_walrus_names(curr))
+            continue
+        if isinstance(curr, _INNER_SCOPE_TYPES):
+            continue
         if isinstance(curr, ast.Name) and isinstance(curr.ctx, ast.Store):
             names.add(curr.id)
         elif isinstance(curr, ast.Import):
@@ -141,13 +146,7 @@ def _extract_single_node_local_names(scope_node: ast.AST) -> Set[str]:
             if isinstance(bound_sym, str) and not isinstance(curr, ast.Attribute):
                 names.add(bound_sym)
 
-        for child in ast.iter_child_nodes(curr):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                names.add(child.name)
-            elif isinstance(child, _COMPREHENSION_TYPES):
-                names.update(_extract_comprehension_walrus_names(child))
-            elif not isinstance(child, _INNER_SCOPE_TYPES):
-                stack.append(child)
+        stack.extend(ast.iter_child_nodes(curr))
 
     return names
 

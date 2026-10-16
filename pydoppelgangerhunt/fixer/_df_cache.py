@@ -37,7 +37,7 @@ _parsed_tree_cache: OrderedDict[Tuple[str, int], Optional[ast.AST]] = OrderedDic
 _scope_parent_maps: OrderedDict[ast.AST, Dict[ast.AST, ast.AST]] = OrderedDict()
 _scope_stmts_by_end: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
 _scope_closures_cache: OrderedDict[Any, List[Tuple[Any, Set[str]]]] = OrderedDict()
-_scope_loops_cache: OrderedDict[ast.AST, List[Tuple[int, int]]] = OrderedDict()
+_scope_loops_cache: OrderedDict[ast.AST, List[Tuple[int, int, int]]] = OrderedDict()
 _scope_try_with_cache: OrderedDict[ast.AST, List[ast.AST]] = OrderedDict()
 _warned_lenient_closure: List[bool] = [False]
 

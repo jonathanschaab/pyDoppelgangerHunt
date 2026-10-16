@@ -62,30 +62,32 @@ def _find_enclosing_loops(
     u_start: int,
     u_end: int,
     u_start_col: Optional[int] = None,
-    u_end_col: Optional[int] = None,
 ) -> List[Tuple[int, int]]:
     """Detects loops enclosing the unit boundaries for loop-carried dependence analysis."""
-    def _compute() -> List[Tuple[int, int]]:
-        loops: List[Tuple[int, int]] = []
+    def _compute() -> List[Tuple[int, int, int]]:
+        loops: List[Tuple[int, int, int]] = []
         for node in ast.walk(scope_node):
             if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
                 l_start = getattr(node, "lineno", None) or 0
                 l_end = getattr(node, "end_lineno", None) or l_start
+                l_col = getattr(node, "col_offset", 0) or 0
                 if l_start <= 0 or l_end <= 0:
                     continue
-                loops.append((int(l_start), int(l_end)))
+                loops.append((int(l_start), int(l_end), int(l_col)))
         return loops
 
     cached_loops = _get_or_compute_scope_cached(
         _scope_loops_cache, scope_node, _compute
     )
-    has_subline_col = u_start_col is not None or u_end_col is not None
     return [
         (l_start, l_end)
-        for l_start, l_end in cached_loops
+        for l_start, l_end, l_col in cached_loops
         if l_start <= u_start
         and u_end <= l_end
-        and ((l_start, l_end) != (u_start, u_end) or has_subline_col)
+        and (
+            (l_start, l_end) != (u_start, u_end)
+            or (u_start_col is not None and l_col < u_start_col)
+        )
     ]
 
 
@@ -476,7 +478,6 @@ def collect_downstream_read_names(
         u_start,
         u_end,
         u_start_col=u_start_col,
-        u_end_col=_extract_unit_end_col(unit),
     )
 
     if skip_pre_unit_closures:

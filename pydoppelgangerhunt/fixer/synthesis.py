@@ -19,6 +19,7 @@ from pydoppelgangerhunt.fixer.binding import (
     _resolve_effective_binding,
 )
 from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
+from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor
 from pydoppelgangerhunt.fixer.dataflow import (
     _load_unit_file_text,
     has_async_generator_delegation_hazard,
@@ -65,11 +66,10 @@ def _attach_pragmas(
 
 
 def _node_references_name(node: ast.AST, name: str) -> bool:
-    """Checks whether an AST node tree contains any references to the specified identifier."""
-    for child in ast.walk(node):
-        if isinstance(child, ast.Name) and child.id == name:
-            return True
-    return False
+    """Checks whether an AST node contains any free load references to the identifier."""
+    visitor = _OuterExprVisitor()
+    visitor.visit(node)
+    return name in visitor.names
 
 
 def _strip_stmt_target_lines(lines: Sequence[str]) -> List[str]:

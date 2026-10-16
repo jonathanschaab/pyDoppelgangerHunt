@@ -5332,3 +5332,57 @@ def test_nested_lambda_and_comprehension_closure_no_false_positive_free_reads() 
     assert "ext_val" in free_reads
     assert "items" in free_reads
 
+
+def test_find_enclosing_loops_whole_loop_with_col_metadata_not_self_enclosing() -> None:
+    """Verifies that a whole-loop unit with start_col == loop.col_offset or end_col metadata
+    is not treated as enclosing itself, while sub-line units starting after loop.col_offset are."""
+    _clear_downstream_reads_cache()
+    code = (
+        "def run_loop(items):\n"
+        "    acc = 0\n"
+        "    for x in items:\n"
+        "        acc += x\n"
+        "        yield acc\n"
+        "    return 0\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+
+    # Whole-loop unit spanning lines 3-5 with start_col=4 (matching the 'for' keyword)
+    assert _find_enclosing_loops(fn_node, 3, 5, u_start_col=4) == []
+    assert _find_enclosing_loops(fn_node, 3, 5, u_start_col=None) == []
+
+    unit_whole_loop = {
+        "file": "loop.py",
+        "start": 3,
+        "end": 5,
+        "start_col": 4,
+        "end_col": 17,
+        "kind": "compound_block",
+    }
+    # 'acc' is dead after the loop (line 6 returns 0); must not be marked live via self-enclosure
+    reads = collect_downstream_read_names(code, unit_whole_loop, candidates={"acc"})
+    assert reads == set()
+
+
+def test_extract_single_node_local_names_lambda_root_comprehension_and_nested_lambda() -> None:
+    """Verifies that _extract_single_node_local_names on an ast.Lambda does not leak
+    comprehension loop targets or inner lambda walrus stores when the lambda body is itself
+    a comprehension or nested lambda."""
+    lam_comp = ast.parse("lambda items: [sum for sum in items]").body[0].value  # type: ignore[attr-defined]
+    comp_locals = _extract_single_node_local_names(lam_comp)
+    assert "items" in comp_locals
+    assert "sum" not in comp_locals
+
+    lam_nested = ast.parse("lambda x: (lambda y: (sum := y))").body[0].value  # type: ignore[attr-defined]
+    nested_locals = _extract_single_node_local_names(lam_nested)
+    assert "x" in nested_locals
+    assert "sum" not in nested_locals
+
+    lam_walrus = ast.parse("lambda items: [(w := x) for x in items]").body[0].value  # type: ignore[attr-defined]
+    walrus_locals = _extract_single_node_local_names(lam_walrus)
+    assert "items" in walrus_locals
+    assert "w" in walrus_locals
+    assert "x" not in walrus_locals
+
+

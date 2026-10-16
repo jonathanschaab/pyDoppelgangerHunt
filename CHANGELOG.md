@@ -304,6 +304,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `"async_function"` and `"async_method"` alongside `("function", "closure", "method")` in
   `_extract_unit_body_lines` (`source.py`), `_inspect_unit_scope` (`scope.py`), and
   `_build_unit_delegation_call` (`patch.py`).
+- **Whole-Loop Column Offset Guard in `_find_enclosing_loops`**: Cached loop `col_offset` in
+  `_scope_loops_cache` (`_df_cache.py`, `_df_hazards.py`) and only classified same-span loops
+  (`(l_start, l_end) == (u_start, u_end)`) as enclosing when `u_start_col is not None and l_col < u_start_col`,
+  preventing whole-loop units with column metadata from treating themselves as enclosing loops.
+- **Comprehension-Aware RHS Free-Load Check (`_node_references_name`)**: Replaced flat `ast.walk`
+  in `_node_references_name` (`synthesis.py`) with `_OuterExprVisitor` so bound comprehension loop
+  variables on the RHS do not block LHS subscript/attribute load or `AugAssign` target pruning.
+- **Lambda Root Expression Scope Isolation in `_extract_single_node_local_names`**: Guarded
+  `_COMPREHENSION_TYPES` and `_INNER_SCOPE_TYPES` at the top of `while stack:` in
+  `_extract_single_node_local_names` (`_df_closures.py`) so `ast.Lambda` nodes whose immediate
+  body is a comprehension or nested lambda do not leak comprehension targets or inner lambda stores.
 
 ## [1.0.0] - 2026-09-20
 ### Added

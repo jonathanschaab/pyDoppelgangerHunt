@@ -10664,3 +10664,48 @@ def test_async_function_and_async_method_kinds_whole_body_delegation(
     assert "+async def _shared_fetch_alpha_fetch_beta(" in patch
     assert "+    return await _shared_fetch_alpha_fetch_beta(client, key)" in patch
 
+
+def test_lhs_and_augassign_pruning_ignores_bound_comprehension_target_on_rhs(
+    tmp_path: Path,
+) -> None:
+    """Verifies that _node_references_name ignores bound comprehension targets on the RHS
+    so LHS subscript indices (arr[x] = [x * 2 for x in items]) and AugAssign targets
+    (total += sum(total for total in items)) are properly pruned."""
+    src1 = (
+        "def fill_slot(arr: list, x: int, items: list) -> None:\n"
+        "    arr[x] = [x * 2 + 1 for x in items if x > 0]\n"
+    )
+    src2 = (
+        "def compute_list(items: list) -> list:\n"
+        "    res = [x * 2 + 1 for x in items if x > 0]\n"
+        "    return res\n"
+    )
+    f1 = tmp_path / "comp_lhs1.py"
+    f2 = tmp_path / "comp_lhs2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {"file": "comp_lhs1.py", "start": 2, "end": 2, "name": "u1", "kind": "comprehension"}
+    u2 = {"file": "comp_lhs2.py", "start": 2, "end": 2, "name": "u2", "kind": "comprehension"}
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "def _shared_u1_u2(items: Any) -> Any:" in helper
+
+    patch = generate_refactoring_patch(
+        [(0.98, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "+    arr[x] = _shared_u1_u2(items)" in patch
+    assert "+    res = _shared_u1_u2(items)" in patch
+
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access
+        _extract_augassign_unreferenced_target,
+    )
+
+    assert (
+        _extract_augassign_unreferenced_target(["total += sum(total for total in items)"])
+        == "total"
+    )
+
+
