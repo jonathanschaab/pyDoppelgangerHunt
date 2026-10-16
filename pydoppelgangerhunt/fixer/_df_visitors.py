@@ -143,8 +143,9 @@ class _BaseScopeVisitor(ast.NodeVisitor):
         finally:
             self._in_comp_body -= 1
             self._comp_targets.pop()
-            if stored_before is not None:
-                setattr(self, "stored", stored_before)
+            if isinstance(stored_attr, set) and stored_before is not None:
+                stored_attr.clear()
+                stored_attr.update(stored_before)
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
         self._visit_comprehension(node)
