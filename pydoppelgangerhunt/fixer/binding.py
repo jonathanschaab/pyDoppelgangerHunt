@@ -323,6 +323,11 @@ def _unit_ast_has_async_or_yield(
         ):
             continue
 
+        if node is not root_node and isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+        ):
+            continue
+
         if lineno is not None and u_start <= lineno <= u_end:
             if isinstance(node, (ast.Yield, ast.YieldFrom)):
                 has_yield = True
@@ -340,11 +345,6 @@ def _unit_ast_has_async_or_yield(
                 and bool(getattr(node, "is_async", False))
             ):
                 has_await = True
-
-            if node is not root_node and isinstance(
-                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
-            ):
-                continue
 
         if has_yield and has_await:
             break

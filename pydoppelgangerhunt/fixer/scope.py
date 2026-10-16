@@ -564,8 +564,9 @@ class _ScopeVisitor(ast.NodeVisitor):
             for gen in node.generators:
                 self.visit(gen.iter)
                 for n in ast.walk(gen.target):
-                    if isinstance(n, ast.Name):
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
                         inner_vars.add(n.id)
+                self.visit(gen.target)
                 for if_expr in gen.ifs:
                     self.visit(if_expr)
             if isinstance(node, ast.DictComp):

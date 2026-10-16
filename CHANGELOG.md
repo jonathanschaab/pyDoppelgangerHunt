@@ -347,12 +347,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `type_params` on `FunctionDef`, `AsyncFunctionDef`, `ClassDef`, and `TypeAlias` in `_ScopeVisitor`
   (`scope.py`) via `_type_param_scopes` and excluded `TypeAlias` names (`self.type_aliases`) from
   subroutine runtime `outputs` and `_analyze_block_assignment`.
-- **Indented Method Body Extraction with Column-0 Multiline Strings**: Wrapped indented dedented
-  source slices in `if 1:\n` before `ast.parse` in `_extract_unit_body_lines` (`source.py`) and
-  `_inspect_unit_scope` (`scope.py`), preventing column-0 multiline string literals or docstrings
-  from defeating `textwrap.dedent` and falling back to un-stripped `def` headers.
+- **Indented Method Body Extraction & Whole-Line Expression Parsing with Column-0 Multiline Strings**:
+  Wrapped indented dedented source slices in `if 1:\n` before `ast.parse` in `_extract_unit_body_lines`
+  (`source.py`), `_inspect_unit_scope` (`scope.py`), and `_parse_dedented_stmts` (`synthesis.py`,
+  `patch.py`), preventing column-0 multiline string literals or docstrings (including blocks with
+  leading comment lines) from defeating `textwrap.dedent`.
 - **`ExceptHandler.name` Binding in Pre-Unit Closure Discovery**: Bound `handler.name` (`except ... as err:`)
   into the handler body's `bound_names` in `_collect_scope_closures_uncached` (`_df_closures.py`).
+- **Partially Overlapping Nested Scope Guard in `_unit_ast_has_async_or_yield`**: Moved the nested
+  `FunctionDef`/`AsyncFunctionDef`/`ClassDef`/`Lambda` skip guard ahead of the `u_start <= lineno <= u_end`
+  check in `_unit_ast_has_async_or_yield` (`binding.py`) so nested scopes starting before `u_start`
+  are never traversed.
+- **Comprehension Generator Subscript/Attribute Targets & Class-Body Walrus Isolation**: Filtered
+  comprehension loop target bindings to `isinstance(n.ctx, ast.Store)` and visited `gen.target` in
+  `_BaseScopeVisitor._visit_comprehension` (`_df_visitors.py`) and `_ScopeVisitor._visit_comprehension`
+  (`scope.py`) so `ast.Load` sub-expressions (`for arr[idx] in items`) are recorded as reads; and
+  routed `_visit_named_expr(..., check_comp=True)` through `_can_store_in_class_scope` so walrus
+  targets inside class-body comprehensions do not bind to `class_stores`.
 
 ## [1.0.0] - 2026-09-20
 ### Added

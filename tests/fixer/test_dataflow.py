@@ -5592,5 +5592,29 @@ def test_pre_unit_closure_except_handler_bound_name() -> None:
     assert all("err" not in free_reads for _, free_reads in closures)
 
 
+def test_comprehension_subscript_target_and_class_walrus() -> None:
+    """Verifies that subscript/attribute targets in comprehension generators record Load reads
+    and that walrus targets inside class-body comprehensions do not bind to class_stores."""
+    code = (
+        "def run(items, arr, idx):\n"
+        "    vals = [arr[idx] for arr[idx] in items]\n"
+        "    return vals\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    live_ins = _extract_unit_live_in_names(fn_node, u_start=2, u_end=2)
+    assert {"items", "arr", "idx"} <= live_ins
+    downstream = collect_downstream_read_names(
+        code, {"file": "m.py", "start": 1, "end": 1}, candidates={"arr", "idx"}, tree=tree
+    )
+    assert downstream == {"arr", "idx"}
 
-
+    cls_code = (
+        "class Box:\n"
+        "    items = [(w := y) for y in seq]\n"
+        "    leaked = w\n"
+    )
+    cls_node = ast.parse(cls_code).body[0]
+    free_reads = _extract_nested_scope_free_reads(cls_node)  # type: ignore[arg-type]
+    assert "seq" in free_reads
+    assert "w" in free_reads

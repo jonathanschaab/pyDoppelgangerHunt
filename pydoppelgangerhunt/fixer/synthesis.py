@@ -73,11 +73,28 @@ def _node_references_name(node: ast.AST, name: str) -> bool:
     return name in visitor.names
 
 
+def _parse_dedented_stmts(raw_text: str) -> List[ast.stmt]:
+    """Parses a raw source block into AST statements, handling column-0 multiline strings."""
+    dedented = dedent_source_text(raw_text)
+    stripped = dedented.strip()
+    if not stripped:
+        return []
+    try:
+        return ast.parse(stripped).body
+    except SyntaxError:
+        try:
+            wrapped = ast.parse(f"if 1:\n{dedented}").body
+            if len(wrapped) == 1 and isinstance(wrapped[0], ast.If):
+                return wrapped[0].body
+        except SyntaxError:
+            pass
+    return []
+
+
 def _strip_stmt_target_lines(lines: Sequence[str]) -> List[str]:
     """Strips assignment targets from statement lines to yield clean expression lines."""
-    raw = dedent_source_text("\n".join(lines)).strip()
     try:
-        parsed = ast.parse(raw).body
+        parsed = _parse_dedented_stmts("\n".join(lines))
         if len(parsed) > 1:
             return list(lines)
         if len(parsed) == 1:
@@ -99,9 +116,8 @@ def _strip_stmt_target_lines(lines: Sequence[str]) -> List[str]:
 
 def _extract_augassign_unreferenced_target(lines: Sequence[str]) -> Optional[str]:
     """Extracts target identifier of an AugAssign statement if not referenced in its RHS value."""
-    raw = dedent_source_text("\n".join(lines)).strip()
     try:
-        parsed = ast.parse(raw).body
+        parsed = _parse_dedented_stmts("\n".join(lines))
         if len(parsed) == 1 and isinstance(parsed[0], ast.AugAssign):
             if isinstance(parsed[0].target, ast.Name):
                 target_name = parsed[0].target.id
@@ -137,9 +153,8 @@ def _extract_lhs_and_rhs_nodes(
     lines: Sequence[str],
 ) -> Tuple[List[ast.AST], Optional[ast.AST]]:
     """Extracts LHS target/annotation AST nodes and the RHS value node from an assignment."""
-    raw = dedent_source_text("\n".join(lines)).strip()
     try:
-        parsed = ast.parse(raw).body
+        parsed = _parse_dedented_stmts("\n".join(lines))
         if len(parsed) == 1:
             stmt = parsed[0]
             if isinstance(stmt, ast.Assign) and stmt.value is not None:
@@ -1467,7 +1482,7 @@ def synthesize_shared_helper_code(
             full_code = "\n".join(common_lines).strip()
             stripped_expr: Optional[str] = None
             try:
-                parsed_body = ast.parse(full_code).body
+                parsed_body = _parse_dedented_stmts("\n".join(common_lines))
                 if len(parsed_body) > 1:
                     return ""
                 if len(parsed_body) == 1:

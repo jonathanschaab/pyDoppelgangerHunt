@@ -1473,3 +1473,28 @@ def test_populate_unit_receiver_metadata_async_comprehension(tmp_path: Path) -> 
     assert sub_comp.get("is_async") is True
 
 
+def test_populate_unit_receiver_metadata_partially_overlapping_nested_scope(
+    tmp_path: Path,
+) -> None:
+    """Verifies that a nested function starting before u_start and ending inside [u_start, u_end]
+    does not pollute the outer unit's has_yield or is_async flags."""
+    src = (
+        "def outer(items):\n"
+        "    async def inner_gen():\n"
+        "        await fetch()\n"
+        "        yield 1\n"
+        "    res = len(items)\n"
+        "    return res\n"
+    )
+    p = tmp_path / "partial_nested.py"
+    p.write_text(src, encoding="utf-8")
+    # Unit starts at line 3 (inside inner_gen's body, after inner_gen's def line 2) and ends at line 6
+    sub_unit = {
+        "file": str(p),
+        "kind": "compound_block",
+        "start": 3,
+        "end": 6,
+    }
+    _populate_unit_receiver_metadata(sub_unit, repo_root=str(tmp_path))
+    assert sub_unit.get("is_async") is False
+    assert sub_unit.get("has_yield") is None

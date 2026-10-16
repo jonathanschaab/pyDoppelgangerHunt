@@ -1929,3 +1929,19 @@ def test_scope_visitor_pep695_type_params_and_type_alias(tmp_path: Path) -> None
     assert "W" not in scope_sub["inputs"]
     assert "Pair" not in scope_sub["outputs"]
     assert "out" in scope_sub["outputs"]
+
+
+def test_scope_visitor_comprehension_subscript_target(tmp_path: Path) -> None:
+    """Verifies that _ScopeVisitor records ast.Load identifiers inside comprehension generator targets."""
+    src = (
+        "def populate(items, arr, idx):\n"
+        "    res = [arr[idx] for arr[idx] in items]\n"
+        "    return res\n"
+    )
+    f = tmp_path / "comp_sub.py"
+    f.write_text(src, encoding="utf-8")
+    u = {"file": str(f), "start": 2, "end": 2, "kind": "comprehension", "name": "populate_comp"}
+    scope = _inspect_unit_scope(u, repo_root=str(tmp_path))
+    assert "arr" in scope["inputs"]
+    assert "idx" in scope["inputs"]
+    assert "items" in scope["inputs"]

@@ -67,7 +67,6 @@ from pydoppelgangerhunt.fixer.source import (
     compute_line_offsets,
     compute_unit_replacement_span,
     count_physical_newlines,
-    dedent_source_text,
     detect_line_ending,
     extract_unit_comments_and_pragmas,
     is_subroutine_unit,
@@ -88,6 +87,7 @@ from pydoppelgangerhunt.fixer.synthesis import (
     _format_call_arguments,
     _is_subline_unit,
     _node_references_name,
+    _parse_dedented_stmts,
     _prune_pair_lhs_and_augassign_scopes,
     synthesize_shared_helper_code,
 )
@@ -799,10 +799,9 @@ def _build_unit_delegation_call(
         if not _is_subline_unit(target_unit):
             u_end = max(u_start, parse_unit_coord(target_unit, "end", default=u_start))
             raw_block = "".join(orig_lines[u_start - 1 : u_end])
-            unit_code = dedent_source_text(raw_block).strip()
             assign_prefix: Optional[str] = None
             try:
-                parsed_body = ast.parse(unit_code).body
+                parsed_body = _parse_dedented_stmts(raw_block)
                 if len(parsed_body) != 1:
                     return ""
                 parsed_node = parsed_body[0]
@@ -810,17 +809,17 @@ def _build_unit_delegation_call(
                 if isinstance(parsed_node, ast.Assign) and parsed_node.targets:
                     targets_str = " = ".join(ast.unparse(t) for t in parsed_node.targets)
                     assign_prefix = f"{targets_str} = "
-                    unref_lhs = _extract_unreferenced_lhs_loads([unit_code])
+                    unref_lhs = _extract_unreferenced_lhs_loads([raw_block])
                 elif isinstance(parsed_node, ast.AnnAssign) and parsed_node.value is not None:
                     target_str = ast.unparse(parsed_node.target)
                     anno_str = ast.unparse(parsed_node.annotation)
                     assign_prefix = f"{target_str}: {anno_str} = "
-                    unref_lhs = _extract_unreferenced_lhs_loads([unit_code])
+                    unref_lhs = _extract_unreferenced_lhs_loads([raw_block])
                 elif isinstance(parsed_node, ast.AugAssign):
                     target_str = ast.unparse(parsed_node.target)
                     op_symbol = _AUGASSIGN_OPS.get(type(parsed_node.op), "+=")
                     assign_prefix = f"{target_str} {op_symbol} "
-                    unref_lhs = _extract_unreferenced_lhs_loads([unit_code])
+                    unref_lhs = _extract_unreferenced_lhs_loads([raw_block])
                     if isinstance(parsed_node.target, ast.Name):
                         t_name = parsed_node.target.id
                         if not _node_references_name(parsed_node.value, t_name):

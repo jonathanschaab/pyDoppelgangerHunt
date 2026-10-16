@@ -126,8 +126,11 @@ class _BaseScopeVisitor(ast.NodeVisitor):
                 if idx > 0:
                     self.visit(gen.iter)
                 comp_set.update(
-                    n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name)
+                    n.id
+                    for n in ast.walk(gen.target)
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
                 )
+                self.visit(gen.target)
                 for if_expr in gen.ifs:
                     self.visit(if_expr)
             if isinstance(node, ast.DictComp):
@@ -151,6 +154,13 @@ class _BaseScopeVisitor(ast.NodeVisitor):
     def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
         self._visit_comprehension(node)
 
+    def _can_store_in_class_scope(self, name: str) -> bool:
+        return (
+            not self._is_in_comp(name)
+            and self._in_comp_body == 0
+            and name not in (self.globals | self.nonlocals)
+        )
+
     def _visit_named_expr(
         self,
         node: ast.NamedExpr,
@@ -159,7 +169,7 @@ class _BaseScopeVisitor(ast.NodeVisitor):
     ) -> None:
         self.visit(node.value)
         if isinstance(node.target, ast.Name):
-            if not check_comp or not self._is_in_comp(node.target.id):
+            if not check_comp or self._can_store_in_class_scope(node.target.id):
                 store_set.add(node.target.id)
         else:
             self.visit(node.target)
@@ -287,11 +297,7 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
             self.free_reads.add(name)
 
     def _record_class_store(self, name: str) -> None:
-        if (
-            not self._is_in_comp(name)
-            and self._in_comp_body == 0
-            and name not in (self.globals | self.nonlocals)
-        ):
+        if self._can_store_in_class_scope(name):
             self.class_stores.add(name)
 
     def visit_FunctionDef(

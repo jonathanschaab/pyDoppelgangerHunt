@@ -11008,5 +11008,37 @@ def test_same_class_whole_line_expr_lhs_only_self_runtime_safety(
     assert "+        self.res2 = _shared_m1_c_m2_c(items)" in patch_str
 
 
-
-
+def test_whole_line_complex_expr_leading_comment_and_col0_multiline_string(
+    tmp_path: Path,
+) -> None:
+    """Verifies that whole-line complex_expr units starting with a comment and containing
+    a column-0 multiline string literal parse and refactor cleanly."""
+    src = (
+        "def f1(cache, k, suffix):\n"
+        "    # leading comment 1\n"
+        "    cache[k] = (\n"
+        '        """header\n'
+        "col0_line\n"
+        '""" + suffix\n'
+        "    )\n"
+        "    return cache\n"
+        "\n"
+        "def f2(store, key, suffix):\n"
+        "    # leading comment 2\n"
+        "    store[key] = (\n"
+        '        """header\n'
+        "col0_line\n"
+        '""" + suffix\n'
+        "    )\n"
+        "    return store\n"
+    )
+    p = tmp_path / "col0_expr.py"
+    p.write_text(src, encoding="utf-8")
+    u1 = {"file": "col0_expr.py", "start": 2, "end": 7, "name": "f1_expr", "kind": "complex_expr"}
+    u2 = {"file": "col0_expr.py", "start": 11, "end": 16, "name": "f2_expr", "kind": "complex_expr"}
+    patch_str = generate_refactoring_patch(
+        [(0.99, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert "+def _shared_f1_expr_f2_expr(suffix: Any) -> Any:" in patch_str
+    assert "+    cache[k] = _shared_f1_expr_f2_expr(suffix)" in patch_str
+    assert "+    store[key] = _shared_f1_expr_f2_expr(suffix)" in patch_str
