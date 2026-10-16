@@ -857,15 +857,17 @@ def test_extract_unit_body_lines_indented_method_col0_multiline_string() -> None
         '        """Docstring header',
         "col_0_docstring_line",
         '        """',
-        '        banner = """header',
-        'col_0_body_line"""',
+        '        banner = f"""header {',
+        "title.strip()",
+        '}"""',
         "        clean = title.strip()",
         "        return banner + clean",
     ]
     body_lines = _extract_unit_body_lines({"kind": "method"}, raw_lines)
     assert body_lines == [
-        'banner = """header',
-        'col_0_body_line"""',
+        'banner = f"""header {',
+        "title.strip()",
+        '}"""',
         "clean = title.strip()",
         "return banner + clean",
     ]

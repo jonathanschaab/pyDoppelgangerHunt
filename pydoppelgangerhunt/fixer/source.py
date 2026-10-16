@@ -293,6 +293,8 @@ def _extract_docstring_end_line(tree: ast.AST) -> int:
 _extract_module_docstring_end_line = _extract_docstring_end_line
 
 
+_FSTRING_START_TOK = getattr(tokenize, "FSTRING_START", None)
+_FSTRING_END_TOK = getattr(tokenize, "FSTRING_END", None)
 _MULTILINE_STR_TOKEN_TYPES = tuple(
     t
     for t in (
@@ -304,13 +306,27 @@ _MULTILINE_STR_TOKEN_TYPES = tuple(
 
 
 def _find_multiline_string_continuation_lines(text: str) -> Set[int]:
-    """Returns 1-based line numbers that start inside a multiline string literal token."""
+    """Returns 1-based line numbers that start inside a multiline string or f-string literal."""
     cont_lines: Set[int] = set()
-    if not ("'''" in text or '"""' in text or "\\\n" in text or "\\\r" in text):
+    if ("\n" not in text and "\r" not in text) or not (
+        "'''" in text
+        or '"""' in text
+        or "\\\n" in text
+        or "\\\r" in text
+        or "{" in text
+    ):
         return cont_lines
+    fstring_start_lines: List[int] = []
     try:
         for tok in tokenize.generate_tokens(io.StringIO(text).readline):
-            if tok.type in _MULTILINE_STR_TOKEN_TYPES and tok.start[0] < tok.end[0]:
+            if _FSTRING_START_TOK is not None and tok.type == _FSTRING_START_TOK:
+                fstring_start_lines.append(tok.start[0])
+            elif _FSTRING_END_TOK is not None and tok.type == _FSTRING_END_TOK:
+                if fstring_start_lines:
+                    start_line = fstring_start_lines.pop()
+                    if start_line < tok.end[0]:
+                        cont_lines.update(range(start_line + 1, tok.end[0] + 1))
+            elif tok.type in _MULTILINE_STR_TOKEN_TYPES and tok.start[0] < tok.end[0]:
                 cont_lines.update(range(tok.start[0] + 1, tok.end[0] + 1))
     except (tokenize.TokenError, IndentationError, SyntaxError):
         pass

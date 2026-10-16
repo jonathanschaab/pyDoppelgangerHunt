@@ -18,6 +18,7 @@ from typing import (
     Union,
 )
 
+from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.fixer.source import (
     _SUBROUTINE_KINDS,
@@ -393,7 +394,6 @@ class _ScopeVisitor(ast.NodeVisitor):
             )
             if not is_nested:
                 self.type_aliases.add(alias_name)
-                self.imported_names.setdefault(alias_name, "")
             self._record_store_name(alias_name)
         tp_names = _extract_type_param_names(node)
         if tp_names:
@@ -1522,6 +1522,22 @@ def _inspect_unit_scope(
     pre_outs = resolve_unit_declared_outputs(unit)
 
     outputs_ambiguous = False
+    local_defs = visitor.type_aliases | set(visitor.imported_names)
+    downstream_local_defs: Set[str] = set()
+    if is_subroutine and local_defs:
+        full_src = _get_full_source()
+        if full_src:
+            ds_reads = collect_downstream_read_names(
+                full_src,
+                unit,
+                candidates=local_defs,
+                tree=file_tree,
+                unit_inputs=set(inputs),
+            )
+            if ds_reads:
+                downstream_local_defs = ds_reads
+    excluded_local_defs = local_defs - downstream_local_defs
+
     if is_subroutine and isinstance(pre_outs, (list, tuple)):
         outputs = list(dict.fromkeys(pre_outs))
     elif is_subroutine and isinstance(pre_outs, (set, frozenset)):
@@ -1546,8 +1562,7 @@ def _inspect_unit_scope(
                 and v not in BUILTIN_NAMES
                 and v not in visitor.except_vars
                 and v not in visitor.deleted_names
-                and v not in visitor.imported_names
-                and v not in visitor.type_aliases
+                and v not in excluded_local_defs
                 and v not in seen
             ):
                 seen.add(v)
@@ -1561,8 +1576,7 @@ def _inspect_unit_scope(
             and nl not in outputs
             and nl not in visitor.except_vars
             and nl not in visitor.deleted_names
-            and nl not in visitor.imported_names
-            and nl not in visitor.type_aliases
+            and nl not in excluded_local_defs
         ):
             outputs.append(nl)
 

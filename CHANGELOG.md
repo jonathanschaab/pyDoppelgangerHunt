@@ -343,19 +343,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synthesis.py` so `_normalize_pipe_unions` only unwraps outer quotes when the opening quote at
   index `0` closes at the final character, converting unions of quoted forward references
   (`'"NodeA" | "NodeB"'`) into `'Union["NodeA", "NodeB"]'`.
-- **PEP 695 `type_params` and Recursive `TypeAlias` Scope Isolation in `_ScopeVisitor`**: Bound PEP 695
+- **PEP 695 `type_params` and `TypeAlias` Scope Isolation & Downstream Output Propagation**: Bound PEP 695
   `type_params` on `FunctionDef`, `AsyncFunctionDef`, `ClassDef`, and `TypeAlias` in `_ScopeVisitor`
-  (`scope.py`) via `_type_param_scopes`, recorded `alias_name` store before visiting `type_params` and
-  `value` so recursive nested `TypeAlias` definitions (`type Tree = list[Tree]`) do not leak into outer
-  `loads`, and excluded `TypeAlias` names (`self.type_aliases`) from subroutine runtime `outputs` and
-  `_analyze_block_assignment`.
-- **Multiline String Continuation Preservation in Dedent & Helper Synthesis**: Added
-  `_find_multiline_string_continuation_lines` and `_dedent_preserving_multiline_strings` (`source.py`)
-  and `_indent_code_lines` (`synthesis.py`) so continuation lines inside multiline string literals
-  neither zero out `dedent_source_text` block margins nor receive injected `body_indent` prefixes during
-  helper synthesis; and wrapped indented source slices in `if 1:\n` in `_extract_unit_body_lines`
-  (`source.py`), `_inspect_unit_scope` (`scope.py`), and `_parse_dedented_stmts` (`synthesis.py`,
-  `patch.py`).
+  (`scope.py`) and `_extract_helper_symbols` (`patch.py`), recorded `alias_name` store before visiting
+  `type_params` and `value` so recursive nested `TypeAlias` definitions (`type Tree = list[Tree]`) do not
+  leak into outer `loads`, and excluded subroutine-local `TypeAlias` / imported names from runtime `outputs`
+  only when not referenced downstream in the enclosing scope (checked via `collect_downstream_read_names`).
+- **Multiline String & PEP 701 F-String Continuation Preservation in Dedent & Helper Synthesis**: Added
+  `_find_multiline_string_continuation_lines` (tracking both `STRING`/`FSTRING_MIDDLE` tokens and active
+  `FSTRING_START`..`FSTRING_END` ranges covering multi-line `{...}` interpolations) and
+  `_dedent_preserving_multiline_strings` (`source.py`) plus `_indent_code_lines` (`synthesis.py`) so
+  continuation lines inside multiline string/f-string literals neither zero out `dedent_source_text` block
+  margins nor receive injected `body_indent` prefixes during helper synthesis; and wrapped indented source
+  slices in `if 1:\n` in `_extract_unit_body_lines` (`source.py`), `_inspect_unit_scope` (`scope.py`), and
+  `_parse_dedented_stmts` (`synthesis.py`, `patch.py`).
 - **`ExceptHandler.name` Binding in Pre-Unit Closure Discovery**: Bound `handler.name` (`except ... as err:`)
   into the handler body's `bound_names` in `_collect_scope_closures_uncached` (`_df_closures.py`).
 - **Partially Overlapping Nested Scope Guard in `_unit_ast_has_async_or_yield`**: Moved the nested
@@ -371,7 +372,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Out-of-Bounds `u_start` Guard in `_unit_has_no_refactor_pragma` & Asymmetric Expression Unit Validation**:
   Clamped `start_idx = min(len(eff_lines), max(0, u_start - 1))` in `_unit_has_no_refactor_pragma`
   (`patch.py`) and validated both `orig_lines1` and `orig_lines2` via `_is_valid_expr_unit_lines` in
-  `synthesize_shared_helper_code` (`synthesis.py`) to reject unmapped statement partners (e.g. `assert`).
+  `synthesize_shared_helper_code` (`synthesis.py`) to reject unmapped statement partners (e.g. `assert` or
+  bare `return` with `stmt.value is None`).
 
 ## [1.0.0] - 2026-09-20
 ### Added

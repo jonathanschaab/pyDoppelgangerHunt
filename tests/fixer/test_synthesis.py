@@ -3486,9 +3486,14 @@ def test_synthesize_shared_helper_code_rejects_asymmetric_unmapped_expr_stmt(
         "    return res\n"
         "\n"
         "def f2(a, b):\n"
-        "    assert a + b\n",
+        "    assert a + b\n"
+        "\n"
+        "def f3():\n"
+        "    return\n",
         encoding="utf-8",
     )
     u1 = {"file": str(f), "start": 2, "end": 2, "name": "f1_expr", "kind": "complex_expr"}
     u2 = {"file": str(f), "start": 6, "end": 6, "name": "f2_expr", "kind": "complex_expr"}
+    u3 = {"file": str(f), "start": 9, "end": 9, "name": "f3_expr", "kind": "complex_expr"}
     assert synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path)) == ""
+    assert synthesize_shared_helper_code(u3, u3, repo_root=str(tmp_path)) == ""

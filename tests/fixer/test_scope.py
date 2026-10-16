@@ -1933,6 +1933,26 @@ def test_scope_visitor_pep695_type_params_and_type_alias(tmp_path: Path) -> None
     assert "Pair" not in scope_sub["outputs"]
     assert "out" in scope_sub["outputs"]
 
+    # 3. Subroutine defining a TypeAlias that IS referenced downstream in the enclosing function
+    src_ds = (
+        "def second[T](items: list[T]) -> object:\n"
+        "    type DownstreamAlias = list[T]\n"
+        "    val = items[0]\n"
+        "    return val, DownstreamAlias\n"
+    )
+    f_ds = tmp_path / "pep695_ds.py"
+    f_ds.write_text(src_ds, encoding="utf-8")
+    u_ds = {
+        "file": str(f_ds),
+        "start": 2,
+        "end": 3,
+        "kind": "subroutine",
+        "name": "second_sub",
+    }
+    scope_ds = _inspect_unit_scope(u_ds, repo_root=str(tmp_path))
+    assert "DownstreamAlias" in scope_ds["outputs"]
+    assert "val" in scope_ds["outputs"]
+
 
 def test_scope_visitor_comprehension_subscript_target(tmp_path: Path) -> None:
     """Verifies that _ScopeVisitor records ast.Load identifiers inside comprehension generator targets."""

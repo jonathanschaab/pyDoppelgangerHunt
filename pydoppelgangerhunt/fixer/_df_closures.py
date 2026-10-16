@@ -24,11 +24,11 @@ from pydoppelgangerhunt.fixer._df_cache import (
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
     _BaseScopeVisitor,
+    _collect_func_params as _extract_arg_names,
     _extract_nested_scope_free_reads,
     _extract_pattern_bound_name,
     _record_import_names,
 )
-from pydoppelgangerhunt.fixer.scope import _extract_arg_names
 
 _BUILTIN_NAMES: Set[str] = set(dir(builtins))
 

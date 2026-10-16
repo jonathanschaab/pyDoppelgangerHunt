@@ -159,9 +159,9 @@ def _is_valid_expr_unit_lines(unit: Dict[str, Any], lines: Sequence[str]) -> boo
         return False
     if len(parsed) == 1:
         stmt = parsed[0]
-        if isinstance(stmt, (ast.Assign, ast.AugAssign, ast.Expr, ast.Return)):
+        if isinstance(stmt, (ast.Assign, ast.AugAssign, ast.Expr)):
             return True
-        if isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+        if isinstance(stmt, (ast.AnnAssign, ast.Return)) and stmt.value is not None:
             return True
         return False
     return True

@@ -2020,6 +2020,10 @@ def _extract_helper_symbols(
                             if isinstance(m_name, str):
                                 bound.add(m_name)
                     bound.update(_collect_direct_bindings(case.body))
+            elif type(stmt).__name__ == "TypeAlias":
+                name_node = getattr(stmt, "name", None)
+                if isinstance(name_node, ast.Name):
+                    bound.add(name_node.id)
 
             if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 _collect_helper_named_exprs(stmt)
@@ -2027,33 +2031,52 @@ def _extract_helper_symbols(
 
     class _ScopeVisitor(ast.NodeVisitor):
 
-        def _visit_arg_defaults(self, args: ast.arguments) -> None:
-            for d in args.defaults + [df for df in args.kw_defaults if df]:
-                self.visit(d)
+        def _visit_with_type_params(
+            self,
+            node: ast.AST,
+            inner_nodes: Sequence[Optional[ast.AST]],
+            *,
+            record_def: bool = False,
+        ) -> Set[str]:
+            if record_def:
+                name_str = getattr(node, "name", "")
+                scope_stack[-1].add(name_str)
+                if len(scope_stack) == 1:
+                    defined_names.add(name_str)
+                for d in getattr(node, "decorator_list", []):
+                    self.visit(d)
+            tp_list = getattr(node, "type_params", [])
+            tp_names = {
+                tp.name for tp in tp_list if isinstance(getattr(tp, "name", None), str)
+            }
+            if tp_names:
+                scope_stack.append(tp_names)
+            try:
+                for sub in list(tp_list) + [n for n in inner_nodes if n is not None]:
+                    self.visit(sub)
+            finally:
+                if tp_names:
+                    scope_stack.pop()
+            return tp_names
 
         def _handle_function_def(
             self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
         ) -> None:
-            scope_stack[-1].add(node.name)
-            if len(scope_stack) == 1:
-                defined_names.add(node.name)
-            for d in node.decorator_list:
-                self.visit(d)
-            for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
-                if a.annotation:
-                    self.visit(a.annotation)
-            if node.args.vararg and node.args.vararg.annotation:
-                self.visit(node.args.vararg.annotation)
-            if node.args.kwarg and node.args.kwarg.annotation:
-                self.visit(node.args.kwarg.annotation)
-            self._visit_arg_defaults(node.args)
-            if node.returns:
-                self.visit(node.returns)
-
-            fn_scope: Set[str] = _extract_arg_names(node.args)
+            all_args = (
+                node.args.posonlyargs
+                + node.args.args
+                + node.args.kwonlyargs
+                + ([node.args.vararg] if node.args.vararg else [])
+                + ([node.args.kwarg] if node.args.kwarg else [])
+            )
+            sig_nodes: List[Optional[ast.AST]] = [a.annotation for a in all_args]
+            sig_nodes.extend(node.args.defaults)
+            sig_nodes.extend(node.args.kw_defaults)
+            sig_nodes.append(node.returns)
+            tp_names = self._visit_with_type_params(node, sig_nodes, record_def=True)
+            fn_scope: Set[str] = _extract_arg_names(node.args) | tp_names
             fn_scope.update(_collect_direct_bindings(node.body))
             self._enter_block_scope(fn_scope, node.body)
-
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
             self._handle_function_def(node)
@@ -2062,18 +2085,19 @@ def _extract_helper_symbols(
             self._handle_function_def(node)
 
         def visit_ClassDef(self, node: ast.ClassDef) -> None:
-            scope_stack[-1].add(node.name)
-            if len(scope_stack) == 1:
-                defined_names.add(node.name)
-            for d in node.decorator_list:
-                self.visit(d)
-            for base_expr in node.bases:
-                self.visit(base_expr)
-            for k in node.keywords:
-                self.visit(k)
-
-            cls_scope = _collect_direct_bindings(node.body)
+            tp_names = self._visit_with_type_params(
+                node, list(node.bases) + list(node.keywords), record_def=True
+            )
+            cls_scope = _collect_direct_bindings(node.body) | tp_names
             self._enter_block_scope(cls_scope, node.body)
+
+        def visit_TypeAlias(self, node: ast.AST) -> None:
+            name_node = getattr(node, "name", None)
+            if isinstance(name_node, ast.Name):
+                scope_stack[-1].add(name_node.id)
+                if len(scope_stack) <= max_helper_scope_depth:
+                    defined_names.add(name_node.id)
+            self._visit_with_type_params(node, [getattr(node, "value", None)])
 
         def _enter_block_scope(
             self, child_scope: Set[str], body: Sequence[ast.stmt]
@@ -2116,7 +2140,9 @@ def _extract_helper_symbols(
             self._handle_comprehension([node.key, node.value], node.generators)
 
         def visit_Lambda(self, node: ast.Lambda) -> None:
-            self._visit_arg_defaults(node.args)
+            self._visit_with_type_params(
+                node, list(node.args.defaults) + list(node.args.kw_defaults)
+            )
             scope_stack.append(_extract_arg_names(node.args))
             self.visit(node.body)
             scope_stack.pop()
