@@ -306,7 +306,13 @@ def dedent_source_text(text: str) -> str:
 
 def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List[str]:
     """Extracts executable body lines for a unit, stripping function headers and docstrings for whole functions."""
-    if unit.get("kind") not in ("function", "closure", "method"):
+    if unit.get("kind") not in (
+        "function",
+        "closure",
+        "method",
+        "async_function",
+        "async_method",
+    ):
         return raw_lines
 
     code_block = "\n".join(raw_lines)

@@ -1516,13 +1516,18 @@ def _inspect_unit_scope(
                 unit_is_async = None
 
     effective_is_async: Optional[bool]
-    if visitor.is_async:
+    if visitor.is_async or unit.get("kind") in ("async_function", "async_method"):
         effective_is_async = True
     elif "is_async" in unit and unit.get("is_async") is not None:
         effective_is_async = bool(unit.get("is_async"))
     elif visitor.has_yield:
         effective_is_async = bool(unit_is_async) if unit_is_async is not None else None
-    elif not is_sub_or_inner and unit.get("kind") not in ("function", "method"):
+    elif not is_sub_or_inner and unit.get("kind") not in (
+        "function",
+        "method",
+        "async_function",
+        "async_method",
+    ):
         effective_is_async = bool(unit_is_async)
     else:
         effective_is_async = False

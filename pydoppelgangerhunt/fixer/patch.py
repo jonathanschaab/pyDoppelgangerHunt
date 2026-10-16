@@ -768,7 +768,13 @@ def _build_unit_delegation_call(
         target_inputs=effective_targets,
     )
 
-    is_whole_method = target_unit.get("kind") in ("function", "closure", "method")
+    is_whole_method = target_unit.get("kind") in (
+        "function",
+        "closure",
+        "method",
+        "async_function",
+        "async_method",
+    )
     if is_whole_method:
         is_init = bool(
             target_unit.get("name") == "__init__"

@@ -163,14 +163,18 @@ class _BaseScopeVisitor(ast.NodeVisitor):
         reads_set: Set[str],
     ) -> None:
         store_set.add(node.name)
-        reads_set.update(_extract_nested_scope_free_reads(node))
+        reads_set.update(
+            r for r in _extract_nested_scope_free_reads(node) if not self._is_in_comp(r)
+        )
 
     def _visit_nested_lambda(
         self,
         node: ast.Lambda,
         reads_set: Set[str],
     ) -> None:
-        reads_set.update(_extract_nested_scope_free_reads(node))
+        reads_set.update(
+            r for r in _extract_nested_scope_free_reads(node) if not self._is_in_comp(r)
+        )
 
     @staticmethod
     def _extract_pattern_bound_name(node: ast.AST) -> Optional[str]:

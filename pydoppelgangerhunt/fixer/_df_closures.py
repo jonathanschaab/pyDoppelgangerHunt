@@ -13,6 +13,7 @@ from typing import (
     Optional,
     Set,
     Tuple,
+    Union,
 )
 
 from pydoppelgangerhunt.fixer._df_cache import (
@@ -21,6 +22,7 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _scope_closures_cache,
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
+    _BaseScopeVisitor,
     _extract_nested_scope_free_reads,
     _record_import_names,
 )
@@ -283,26 +285,56 @@ def _collect_scope_closures_uncached(
                     s_line, s_col = min_l, min_c
         return s_line, s_col
 
+    class _ExprClosureCollector(_BaseScopeVisitor):
+        def __init__(self, default_line: int, default_col: int) -> None:
+            super().__init__()
+            self.default_line = default_line
+            self.default_col = default_col
+
+        def _record_closure_node(
+            self, subnode: Union[ast.Lambda, ast.GeneratorExp]
+        ) -> None:
+            sub_l = getattr(subnode, "lineno", None)
+            sub_c = getattr(subnode, "col_offset", None)
+            sub_line = int(sub_l) if sub_l is not None else self.default_line
+            sub_col = int(sub_c) if sub_c is not None else self.default_col
+            closures.append(
+                (
+                    _ClosurePos(sub_line, sub_col),
+                    {
+                        r
+                        for r in _extract_nested_scope_free_reads(subnode)
+                        if not self._is_in_comp(r)
+                    },
+                )
+            )
+
+        def visit_FunctionDef(self, node: ast.AST) -> None:
+            return
+
+        def visit_AsyncFunctionDef(self, node: ast.AST) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.AST) -> None:
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            self._record_closure_node(node)
+
+        def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+            if _is_eagerly_consumed_genexp(
+                node, parent_map, shadowed_names, has_star_import=has_star_import
+            ):
+                self._visit_comprehension(node)
+            else:
+                self._record_closure_node(node)
+
     def _record_expr_closures(
         nodes: Iterable[ast.AST], default_line: int, default_col: int
     ) -> None:
+        collector = _ExprClosureCollector(default_line, default_col)
         for node in nodes:
-            for subnode in ast.walk(node):
-                if isinstance(subnode, ast.GeneratorExp) and _is_eagerly_consumed_genexp(
-                    subnode, parent_map, shadowed_names, has_star_import=has_star_import
-                ):
-                    continue
-                if isinstance(subnode, (ast.Lambda, ast.GeneratorExp)):
-                    sub_l = getattr(subnode, "lineno", None)
-                    sub_c = getattr(subnode, "col_offset", None)
-                    sub_line = int(sub_l) if sub_l is not None else default_line
-                    sub_col = int(sub_c) if sub_c is not None else default_col
-                    closures.append(
-                        (
-                            _ClosurePos(sub_line, sub_col),
-                            _extract_nested_scope_free_reads(subnode),
-                        )
-                    )
+            collector.visit(node)
 
     def _extract_header_nodes(s: ast.AST) -> List[ast.AST]:
         if isinstance(s, ast.If):

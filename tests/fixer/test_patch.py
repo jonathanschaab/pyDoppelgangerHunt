@@ -10531,3 +10531,136 @@ def test_asymmetric_augassign_vs_assign_whole_line_complex_expr_refactored(
     assert "def _shared_u1_u2(a: Any, b: Any) -> Any:" in patch
     assert "+    total += _shared_u1_u2(a, b)" in patch
     assert "+    res = _shared_u1_u2(a, b)" in patch
+
+
+def test_custom_classmethod_receiver_preserved_after_lhs_pruning() -> None:
+    """Verifies that _prune_unreferenced_lhs_scope preserves class binding for a
+    @classmethod with a custom receiver name (e.g., klass) when LHS loads are pruned."""
+    from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access
+        _prune_unreferenced_lhs_scope,
+    )
+
+    lines = ["registry[idx] = klass.create(a, b)"]
+    unit = {
+        "name": "build_entry",
+        "kind": "complex_expr",
+        "start": 1,
+        "end": 1,
+        "receiver_param": "klass",
+        "receiver_kind": "class",
+        "source_text": lines[0],
+    }
+    scope = inspect_single_unit_scope(unit)
+    _prune_unreferenced_lhs_scope(unit, scope, lines)
+
+    assert "registry" not in scope["inputs"]
+    assert "idx" not in scope["inputs"]
+    assert "klass" in scope["inputs"]
+    assert scope["has_class_binding"] is True
+    assert scope["has_instance_binding"] is False
+    assert scope["has_receiver_access"] is True
+    assert scope["binding_kind"] == "class"
+
+
+def test_whole_line_comprehension_distinct_lhs_attrs_with_shared_rhs_attr(
+    tmp_path: Path,
+) -> None:
+    """Verifies that two methods assigning to distinct LHS attributes (self.res1 vs self.res2)
+    while reading a shared attribute on the RHS (self.factor) prune the LHS attribute writes
+    and refactor cleanly."""
+    src = (
+        "class Processor:\n"
+        "    def __init__(self, factor: int) -> None:\n"
+        "        self.factor = factor\n"
+        "        self.res1 = []\n"
+        "        self.res2 = []\n"
+        "\n"
+        "    def run_first(self, items: list) -> None:\n"
+        "        self.res1 = [x * self.factor + 1 for x in items if x > 0]\n"
+        "\n"
+        "    def run_second(self, items: list) -> None:\n"
+        "        self.res2 = [x * self.factor + 1 for x in items if x > 0]\n"
+    )
+    f = tmp_path / "proc.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {
+        "file": "proc.py",
+        "start": 8,
+        "end": 8,
+        "name": "Processor.run_first:<comp>",
+        "kind": "comprehension",
+        "enclosing_class": "Processor",
+        "receiver_param": "self",
+    }
+    u2 = {
+        "file": "proc.py",
+        "start": 11,
+        "end": 11,
+        "name": "Processor.run_second:<comp>",
+        "kind": "comprehension",
+        "enclosing_class": "Processor",
+        "receiver_param": "self",
+    }
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "def _shared_" in helper
+    assert "return [x * self.factor + 1 for x in items if x > 0]" in helper
+
+    patch = generate_refactoring_patch(
+        [(0.98, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "+        self.res1 = _shared_run_first_run_second(self, items)" in patch
+    assert "+        self.res2 = _shared_run_first_run_second(self, items)" in patch
+
+
+def test_async_function_and_async_method_kinds_whole_body_delegation(
+    tmp_path: Path,
+) -> None:
+    """Verifies that units with kind='async_function' or kind='async_method' strip their
+    async def header during body extraction, synthesize a valid async def helper, and emit
+    whole-method delegation calls."""
+    src = (
+        "async def fetch_alpha(client, key: str) -> int:\n"
+        "    raw = await client.get(key)\n"
+        "    val = int(raw.strip())\n"
+        "    return val + 1\n"
+        "\n"
+        "async def fetch_beta(client, key: str) -> int:\n"
+        "    raw = await client.get(key)\n"
+        "    val = int(raw.strip())\n"
+        "    return val + 1\n"
+    )
+    f = tmp_path / "async_mod.py"
+    f.write_text(src, encoding="utf-8")
+
+    u1 = {
+        "file": "async_mod.py",
+        "start": 1,
+        "end": 4,
+        "name": "fetch_alpha",
+        "kind": "async_function",
+    }
+    u2 = {
+        "file": "async_mod.py",
+        "start": 6,
+        "end": 9,
+        "name": "fetch_beta",
+        "kind": "async_function",
+    }
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper.startswith("async def _shared_fetch_alpha_fetch_beta(")
+    assert helper.count("async def ") == 1
+
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "+async def _shared_fetch_alpha_fetch_beta(" in patch
+    assert "+    return await _shared_fetch_alpha_fetch_beta(client, key)" in patch
+

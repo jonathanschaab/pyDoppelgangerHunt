@@ -274,9 +274,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Whole-Line Subscript and Attribute LHS Load Pruning**: Added `_extract_unreferenced_lhs_loads`,
   `_prune_unreferenced_lhs_scope`, and `_prune_pair_lhs_and_augassign_scopes` (`synthesis.py`,
   `patch.py`) to prune LHS-only `ast.Load` identifiers and receiver attributes (`arr[i] = ...`,
-  `self.cache[k] = ...`, `res: MyType = ...`), recompute receiver binding flags
-  (`has_instance_binding`, `has_class_binding`, `has_receiver_access`, `binding_kind`), and allow
-  asymmetric `AugAssign` vs. `Assign` target pruning when RHS arities match.
+  `self.cache[k] = ...`, `self.res1 = [x * self.factor ...]`, `res: MyType = ...`), recompute
+  receiver binding flags (`has_instance_binding`, `has_class_binding`, `has_receiver_access`,
+  `binding_kind`) respecting custom `@classmethod` receiver names (`receiver_kind == "class"`), and
+  allow asymmetric `AugAssign` vs. `Assign` target pruning when RHS arities match.
 - **Sync vs. Async Iterator Return Annotation Cross-Check**: Guarded early-return iterator
   prefixes in `_infer_helper_return_type` (`synthesis.py`) with `is_async` so synchronous
   `Iterator[...]`/`Generator[...]`/`Iterable[...]` annotations are not emitted for `async def`
@@ -293,6 +294,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Lenient Closure Log Level Alignment**: Downgraded the internal `skip_pre_unit_closures=True`
   log in `collect_downstream_read_names` (`_df_hazards.py`) from `logger.warning` to `logger.debug`
   to avoid duplicate/elevated warning messages alongside the CLI `INFO` notice.
+- **Nested Lambda and Comprehension Closure Free-Read Filtering**: Replaced raw `ast.walk` in
+  `_record_expr_closures` (`_df_closures.py`) with `_ExprClosureCollector(_BaseScopeVisitor)` and
+  filtered active comprehension targets in `_BaseScopeVisitor._visit_nested_named_scope` and
+  `_visit_nested_lambda` (`_df_visitors.py`), avoiding false-positive free-variable capture on
+  nested lambdas (`lambda x: (lambda: x)`) and closures inside comprehensions
+  (`[lambda: x for x in items]`).
+- **`async_function` and `async_method` Whole-Unit Extraction and Delegation**: Included
+  `"async_function"` and `"async_method"` alongside `("function", "closure", "method")` in
+  `_extract_unit_body_lines` (`source.py`), `_inspect_unit_scope` (`scope.py`), and
+  `_build_unit_delegation_call` (`patch.py`).
 
 ## [1.0.0] - 2026-09-20
 ### Added

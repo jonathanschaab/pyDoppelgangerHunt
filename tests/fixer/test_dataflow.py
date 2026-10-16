@@ -5287,3 +5287,48 @@ def test_collect_downstream_read_names_lenient_closure_logs_at_debug(
         r.message for r in caplog.records if r.levelno == logging.DEBUG
     ]
     assert any("Lenient closure mode active" in m for m in debug_msgs)
+
+
+def test_nested_lambda_and_comprehension_closure_no_false_positive_free_reads() -> None:
+    """Verifies that nested lambdas (lambda x: (lambda: x)) and lambdas/scopes inside
+    comprehensions ([lambda: x for x in items]) do not falsely record outer lambda
+    parameters or comprehension targets as free reads of the enclosing function scope."""
+    code = (
+        "def process(items):\n"
+        "    fn = lambda x: (lambda: x)\n"
+        "    callbacks = [lambda: x for x in items]\n"
+        "    eager = sum((lambda: x + captured_var)() for x in items)\n"
+        "    x = 42\n"
+        "    captured_var = 99\n"
+        "    return x, captured_var, fn, callbacks, eager\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+
+    # Pre-unit closures before line 5 (where x and captured_var are assigned):
+    # 'x' is bound by the outer lambda on line 2 and by the ListComp/GeneratorExp on lines 3-4,
+    # whereas 'captured_var' is genuinely unbound in line 4's inner lambda.
+    pre_closures = _collect_pre_unit_closures(fn_node, u_start=5)
+    assert "x" not in pre_closures
+    assert "captured_var" in pre_closures
+
+    # Inspect all recorded closures in scope: none should record 'x' as a free read
+    scope_closures = _collect_scope_closures(fn_node)
+    all_reads = set().union(*(reads for _, reads in scope_closures))
+    assert "x" not in all_reads
+    assert "captured_var" in all_reads
+
+    # _BaseScopeVisitor comprehension target filtering on nested lambda inside a nested function
+    nested_code = (
+        "def outer(items):\n"
+        "    def inner():\n"
+        "        return [lambda: x + ext_val for x in items]\n"
+        "    return inner\n"
+    )
+    nested_tree = ast.parse(nested_code)
+    inner_fn = nested_tree.body[0].body[0]  # type: ignore[attr-defined]
+    free_reads = _extract_nested_scope_free_reads(inner_fn)
+    assert "x" not in free_reads
+    assert "ext_val" in free_reads
+    assert "items" in free_reads
+

@@ -27,6 +27,7 @@ from pydoppelgangerhunt.fixer.dataflow import (
 from pydoppelgangerhunt.fixer.scope import (
     _normalize_receiver_attrs,
     _rank_param_kind,
+    _unfold_receiver_attribute,
     analyze_unit_variable_scope,
     inspect_single_unit_scope,
     is_subroutine_unit,
@@ -143,41 +144,40 @@ def _should_prune_augassign_targets(
     )
 
 
-def _extract_unreferenced_lhs_loads(lines: Sequence[str]) -> Set[str]:
-    """Extracts identifiers loaded in an assignment LHS or annotation but not referenced in RHS."""
+def _extract_lhs_and_rhs_nodes(
+    lines: Sequence[str],
+) -> Tuple[List[ast.AST], Optional[ast.AST]]:
+    """Extracts LHS target/annotation AST nodes and the RHS value node from an assignment."""
     raw = dedent_source_text("\n".join(lines)).strip()
     try:
         parsed = ast.parse(raw).body
         if len(parsed) == 1:
             stmt = parsed[0]
-            lhs_nodes: List[ast.AST] = []
-            rhs_node: Optional[ast.AST] = None
             if isinstance(stmt, ast.Assign) and stmt.value is not None:
-                lhs_nodes = list(stmt.targets)
-                rhs_node = stmt.value
-            elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
-                lhs_nodes = [stmt.target, stmt.annotation]
-                rhs_node = stmt.value
-            elif isinstance(stmt, ast.AugAssign) and not isinstance(
-                stmt.target, ast.Name
-            ):
-                lhs_nodes = [stmt.target]
-                rhs_node = stmt.value
-            if rhs_node is not None and lhs_nodes:
-                loaded_lhs = {
-                    child.id
-                    for lhs in lhs_nodes
-                    for child in ast.walk(lhs)
-                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
-                }
-                return {
-                    name
-                    for name in loaded_lhs
-                    if not _node_references_name(rhs_node, name)
-                }
+                return list(stmt.targets), stmt.value
+            if isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+                return [stmt.target, stmt.annotation], stmt.value
+            if isinstance(stmt, ast.AugAssign):
+                return [stmt.target], stmt.value
     except (SyntaxError, IndexError, ValueError):
         pass
-    return set()
+    return [], None
+
+
+def _extract_unreferenced_lhs_loads(lines: Sequence[str]) -> Set[str]:
+    """Extracts identifiers loaded in an assignment LHS or annotation but not referenced in RHS."""
+    lhs_nodes, rhs_node = _extract_lhs_and_rhs_nodes(lines)
+    if rhs_node is None or not lhs_nodes:
+        return set()
+    loaded_lhs = {
+        child.id
+        for lhs in lhs_nodes
+        for child in ast.walk(lhs)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+    }
+    return {
+        name for name in loaded_lhs if not _node_references_name(rhs_node, name)
+    }
 
 
 def _prune_unreferenced_lhs_scope(
@@ -191,29 +191,72 @@ def _prune_unreferenced_lhs_scope(
         "complex_expr",
     ):
         return
-    unref_loads = _extract_unreferenced_lhs_loads(lines)
-    if not unref_loads:
+    lhs_nodes, rhs_node = _extract_lhs_and_rhs_nodes(lines)
+    if rhs_node is None or not lhs_nodes:
         return
-    for key in ("inputs", "free_vars"):
-        if key in scope_dict:
-            scope_dict[key] = [x for x in scope_dict[key] if x not in unref_loads]
-    for rec in unref_loads:
-        prefix = f"{rec}."
-        for attr_key in (
-            "attrs_read",
-            "attrs_written",
-            "instance_attrs",
-            "class_attrs",
-        ):
-            if attr_key in scope_dict:
-                scope_dict[attr_key] = [
-                    a for a in scope_dict[attr_key] if not str(a).startswith(prefix)
-                ]
-    has_inst = bool(scope_dict.get("instance_attrs")) or any(
-        x in ("self", unit.get("receiver_param")) for x in scope_dict.get("inputs", [])
+    rec_param = unit.get("receiver_param")
+    rec_kind = unit.get("receiver_kind")
+    inst_receivers = {"self", "this"}
+    class_receivers = {"cls", "klass"}
+    if rec_param:
+        if rec_kind == "class":
+            class_receivers.add(rec_param)
+        elif rec_kind in ("instance", None):
+            inst_receivers.add(rec_param)
+    all_receivers = tuple(inst_receivers | class_receivers)
+
+    unref_loads = _extract_unreferenced_lhs_loads(lines)
+    lhs_attrs = {
+        unfolded
+        for lhs in lhs_nodes
+        for child in ast.walk(lhs)
+        if isinstance(child, ast.Attribute)
+        for unfolded in (
+            _unfold_receiver_attribute(child, receiver_names=all_receivers),
+        )
+        if unfolded is not None
+    }
+    if not unref_loads and not lhs_attrs:
+        return
+    rhs_attrs = {
+        unfolded
+        for child in ast.walk(rhs_node)
+        if isinstance(child, ast.Attribute)
+        for unfolded in (
+            _unfold_receiver_attribute(child, receiver_names=all_receivers),
+        )
+        if unfolded is not None
+    }
+    unref_attrs = lhs_attrs - rhs_attrs
+
+    if unref_loads:
+        for key in ("inputs", "free_vars"):
+            if key in scope_dict:
+                scope_dict[key] = [x for x in scope_dict[key] if x not in unref_loads]
+    if "attrs_written" in scope_dict and lhs_attrs:
+        scope_dict["attrs_written"] = [
+            a for a in scope_dict["attrs_written"] if a not in lhs_attrs
+        ]
+    for attr_key in (
+        "attrs_read",
+        "attrs_written",
+        "instance_attrs",
+        "class_attrs",
+    ):
+        if attr_key in scope_dict:
+            scope_dict[attr_key] = [
+                a
+                for a in scope_dict[attr_key]
+                if a not in unref_attrs
+                and not any(str(a).startswith(f"{rec}.") for rec in unref_loads)
+            ]
+
+    inputs_set = set(scope_dict.get("inputs", []))
+    has_inst = bool(scope_dict.get("instance_attrs")) or bool(
+        inputs_set & inst_receivers
     )
-    has_cls = bool(scope_dict.get("class_attrs")) or (
-        "cls" in scope_dict.get("inputs", [])
+    has_cls = bool(scope_dict.get("class_attrs")) or bool(
+        inputs_set & class_receivers
     )
     scope_dict["has_instance_binding"] = has_inst
     scope_dict["has_class_binding"] = has_cls
