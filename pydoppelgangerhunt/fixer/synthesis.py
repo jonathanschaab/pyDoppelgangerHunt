@@ -301,14 +301,7 @@ def _format_call_arguments(
         if set(inputs) == set(target_inputs):
             inp_to_target = {k: k for k in inputs}
         else:
-            common_names = {
-                k for idx, k in enumerate(inputs) if target_inputs[idx] == k
-            }
-            inp_to_target = {k: k for k in common_names}
-            rem_inputs = [k for k in inputs if k not in common_names]
-            rem_targets = [k for k in target_inputs if k not in common_names]
-            for h_var, t_var in zip(rem_inputs, rem_targets):
-                inp_to_target[h_var] = t_var
+            inp_to_target = dict(zip(inputs, target_inputs))
         sorted_targets = [inp_to_target.get(k, k) for k in sorted_inputs]
     else:
         sorted_targets = sorted_inputs

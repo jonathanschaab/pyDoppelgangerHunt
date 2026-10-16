@@ -171,12 +171,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   branch store isolation across `for`, `while`, `try`, `with`, and `match` blocks even when the compound
   statement header begins before `u_start`. Guard `ExceptHandler.name` binding with `_is_inside(h)` and
   record `MatchAs`/`MatchStar`/`MatchMapping` pattern bindings inside unit bounds via `visit_MatchAs`.
-- **AugAssign Target Pruning Cross-Unit Collision & Sub-Line Slicing**: In `patch.py` and `synthesis.py`,
-  guard AugAssign target pruning against subline units via `_is_subline_unit` and token line slicing,
-  exclude each unit's own unreferenced target via `_should_prune_augassign_targets` when checking for
-  RHS input collisions across clones (supporting same-name targets without desynchronizing `inputs` vs `inputs2`),
-  and fail closed on multi-statement semicolon lines and unmapped statement kinds (`ast.Assert`, bare `ast.AnnAssign`)
-  in whole-line `complex_expr` units.
+- **Sub-Line Slicing & Unmapped Statement Validation in `complex_expr` Units**: In `patch.py` and
+  `synthesis.py`, guard whole-line target pruning against sub-line units via `_is_subline_unit` and
+  token line slicing, and fail closed on multi-statement semicolon lines and unmapped statement kinds
+  (`ast.Assert`, bare `ast.AnnAssign`) in whole-line `complex_expr` units.
 - **Cached AST Propagation & Closure Traversal Optimization**: Forwarded `f1_plan.parsed_tree` and
   `f2_plan.parsed_tree` to `find_enclosing_class` and `find_enclosing_function` in `patch.py`, reused
   `_get_or_parse_tree` in `synthesis.py` and `binding.py`, pre-checked `_NO_REFACTOR_RE` on
@@ -199,9 +197,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`_df_hazards.py`) to retain single-line loops (`(l_start, l_end) == (u_start, u_end)`) when
   sub-line column offsets (`u_start_col` or `u_end_col`) are present, enabling loop-carried read
   detection on single-line loops.
-- **Loop-Carried Liveness in Enclosing Blocks**: Evaluates statement span `[start_line, stmt_end]`
-  with base `_DownstreamReadVisitor` in `_scope_reads_outputs_after_line` (`dataflow.py`), correctly
-  detecting loop-carried reads at the top of an enclosing loop prior to `with` / `try` blocks.
 - **Tree Resolution Alignment**: Unified `effective_tree` across downstream read analysis and
   closure collection in `resolve_clone_generator_subroutine_outputs` (`dataflow.py`), preventing
   module-level shadowing mismatch.
@@ -272,15 +267,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_UnitLiveInVisitor` (`_df_visitors.py`) to visit `AnnAssign.annotation`, bare subscript/attribute
   targets (`arr[idx]: int`), and PEP 695 `TypeAlias` statements (including type parameter bounds
   and defaults via `_extract_type_alias_free_reads`) while isolating lexical `type_params`.
-- **Whole-Line Subscript, Attribute, and `AugAssign` LHS Load Pruning & Collision Guard**:
+- **Whole-Line Subscript, Attribute, and `AugAssign` LHS Load Pruning & Arity Guard**:
   Added `_extract_unreferenced_lhs_loads`, `_prune_unreferenced_lhs_scope`, and
   `_prune_pair_lhs_and_augassign_scopes` (`synthesis.py`, `patch.py`) to prune LHS-only `ast.Load`
   identifiers, unreferenced `AugAssign` targets, and receiver attributes (`arr[i] = ...`,
   `self.cache[k] = ...`, `self.res1 = [x * self.factor ...]`, `res: MyType = ...`, `total += ...`),
   recompute receiver binding flags (`has_instance_binding`, `has_class_binding`,
-  `has_receiver_access`, `binding_kind`) respecting custom `@classmethod` receiver names, and fail
-  closed when pruned LHS variables collide with partner RHS inputs or shared RHS variables appear at
-  conflicting positional indices.
+  `has_receiver_access`, `binding_kind`) respecting custom `@classmethod` receiver names, map
+  call-site arguments positionally (`dict(zip(inputs, target_inputs))`) in `_format_call_arguments`,
+  and fail closed when pruned RHS input arities differ (`len(scope1["inputs"]) != len(scope2["inputs"])`).
 - **Sync vs. Async Iterator Return Annotation Cross-Check**: Guarded early-return iterator
   prefixes in `_infer_helper_return_type` (`synthesis.py`) with `is_async` so synchronous
   `Iterator[...]`/`Generator[...]`/`Iterable[...]` annotations are not emitted for `async def`

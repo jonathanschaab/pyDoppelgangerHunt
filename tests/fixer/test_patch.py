@@ -1633,8 +1633,8 @@ def test_generate_refactoring_patch_cross_receiver_attrs_matching(tmp_path: Path
 
 
 def test_generate_refactoring_patch_permuted_outputs_alignment(tmp_path: Path) -> None:
-    """Verifies that when clone 2 assigns variables in permuted order but with identical
-    name sets, outputs pair by name producing consistent delegation call sites."""
+    """Verifies that when clone 2 assigns output variables in permuted order relative to
+    clone 1, patch generation fails closed by default to prevent variable swapping."""
     src1 = (
         "def compute_1(a: int, b: int) -> tuple:\n"
         "    x = a * 10\n"
