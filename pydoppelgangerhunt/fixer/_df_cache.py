@@ -269,16 +269,25 @@ def _resolve_unit_ast_end_col(
         return None
 
     inner_stmts.sort(key=lambda s: getattr(s, "col_offset", 0))
+    start_col = (
+        _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
+        if u_start == u_end
+        else None
+    )
     if len(inner_stmts) == 1:
+        stmt_col = getattr(inner_stmts[0], "col_offset", 0)
+        if start_col is not None and start_col > stmt_col:
+            return None
         target_stmt = inner_stmts[0]
-    elif u_start == u_end:
-        start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
-        if start_col is not None:
-            matched = [s for s in inner_stmts if getattr(s, "col_offset", 0) >= start_col]
-            if len(matched) == 1:
-                target_stmt = matched[0]
-            else:
-                return None
+    elif u_start == u_end and start_col is not None:
+        if any(
+            getattr(s, "col_offset", 0) < start_col < (getattr(s, "end_col_offset", 0) or 0)
+            for s in inner_stmts
+        ):
+            return None
+        matched = [s for s in inner_stmts if getattr(s, "col_offset", 0) >= start_col]
+        if len(matched) == 1:
+            target_stmt = matched[0]
         else:
             return None
     else:

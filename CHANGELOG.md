@@ -330,10 +330,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `visit_With`, and pattern children before binding in `_record_pattern_binding` and
   `_DownstreamReadVisitor.visit_MatchAs` (`_df_visitors.py`); added `visit_Delete` to
   `_UnitLiveInVisitor` to record `ast.Name(ctx=ast.Del)` targets as live-ins and discard them from
-  `self.stored`; and removed the `_is_inside` fallback to `generic_visit` in
-  `_UnitLiveInVisitor.visit_Assign`, `visit_AnnAssign`, `visit_BoolOp`, `visit_IfExp`, and
-  `visit_NamedExpr` so RHS values and conditional depths are always evaluated accurately across
-  multi-line and sub-line unit boundaries.
+  `self.stored`; saved and restored `self.stored` around conditional operands/branches in
+  `visit_BoolOp`, `visit_IfExp`, and `_visit_comprehension` while recording `NamedExpr` targets in
+  `self.stored` so intra-comprehension and intra-branch walrus reads do not become spurious live-ins;
+  checked `start_col` in `_resolve_unit_ast_end_col` (`_df_cache.py`) when `u_start == u_end` so
+  sub-line units without `end_col` do not misresolve to full or trailing statements; and removed the
+  `_is_inside` fallback to `generic_visit` in `_UnitLiveInVisitor.visit_Assign`, `visit_AnnAssign`,
+  `visit_BoolOp`, `visit_IfExp`, and `visit_NamedExpr` so RHS values and conditional depths are
+  always evaluated accurately across multi-line and sub-line unit boundaries.
 - **Same-Class Whole-Line Expression `@staticmethod`, Receiver & `method_binding="method"` Guard**:
   Guarded `@staticmethod` emission in `synthesize_shared_helper_code` (`synthesis.py`) when
   `fn1_kind` or `fn2_kind` is `"instance"`, aligned `u1_eff`/`u2_eff` expression kinds prior to
@@ -362,11 +366,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `node.generators[0].iter` in `_ExprClosureCollector.visit_GeneratorExp` (`_df_closures.py`) on
   non-eager generator expressions so nested closures inside the outermost iterator are recorded at
   their own column offsets; recorded `alias_name` store before visiting `type_params` and `value`
-  so recursive nested `TypeAlias` definitions (`type Tree = list[Tree]`) do not leak into outer
-  `loads`; and restricted `collect_downstream_read_names` in `_inspect_unit_scope` to
-  stored/nonlocal `visitor.type_aliases` (failing closed by retaining `alias_cands` in `outputs`
-  when `full_src` or `ds_reads` is `None`) while unconditionally excluding `visitor.imported_names`
-  from `outputs`.
+  (and subtracted `own_name` in `_extract_type_alias_free_reads`) so recursive `TypeAlias`
+  definitions (`type Tree = list[Tree]`) do not leak into outer `loads` or downstream reads; and
+  restricted `collect_downstream_read_names` in `_inspect_unit_scope` to stored/nonlocal
+  `visitor.type_aliases` (failing closed by retaining `alias_cands` in `outputs` when `full_src` or
+  `ds_reads` is `None`) while unconditionally excluding `visitor.imported_names` from `outputs`.
 - **Multiline String & PEP 701 F-String Continuation Preservation in Dedent & Helper Synthesis**: Added
   `_find_multiline_string_continuation_lines` (tracking both `STRING`/`FSTRING_MIDDLE` tokens and active
   `FSTRING_START`..`FSTRING_END` ranges covering multi-line `{...}` interpolations) and

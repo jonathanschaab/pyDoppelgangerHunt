@@ -5454,6 +5454,31 @@ def test_unit_live_in_visitor_subline_boolop_ifexp_namedexpr_evaluation_order() 
     )
     assert "x" in live_w
 
+    # Intra-comprehension, intra-BoolOp, and intra-IfExp walrus reads do not become live-ins
+    code_intra = (
+        "def h(items, flag, y):\n"
+        "    a = [(w := z) + w for z in items]\n"
+        "    if flag and ((b := y) + b > 0):\n"
+        "        c = (d := y) + d if flag else 0\n"
+    )
+    tree_intra = ast.parse(code_intra)
+    live_intra = _extract_unit_live_in_names(tree_intra.body[0], u_start=2, u_end=4)
+    assert "w" not in live_intra
+    assert "b" not in live_intra
+    assert "d" not in live_intra
+    assert {"items", "flag", "y"} <= live_intra
+
+    # Sub-line start_col without end_col in _resolve_unit_ast_end_col returns None
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
+        _resolve_unit_ast_end_col,
+    )
+
+    single_stmt_fn = ast.parse("def f(x):\n    res = (yield x) + x\n").body[0]
+    assert _resolve_unit_ast_end_col(single_stmt_fn, {"start": 2, "end": 2, "start_col": 10}) is None
+
+    semi_stmt_fn = ast.parse("def f(x, y):\n    res = (yield x); print(y)\n").body[0]
+    assert _resolve_unit_ast_end_col(semi_stmt_fn, {"start": 2, "end": 2, "start_col": 10}) is None
+
 
 @pytest.mark.skipif(sys.version_info < (3, 10), reason="match/case requires Python 3.10+")
 def test_pattern_binding_visits_value_and_key_loads_before_store() -> None:
@@ -5693,5 +5718,18 @@ def test_extract_nested_scope_free_reads_pep695_decorators_and_defaults() -> Non
     closures = _collect_scope_closures(gen_fn)
     lambda_cols = [pos.col for pos, reads in closures if "z" in reads and "items" not in reads]
     assert lambda_cols == [28]
+
+    rec_alias_src = (
+        "def build_tree(items):\n"
+        "    Tree = items[0]\n"
+        "    yield Tree\n"
+        "    type Tree = list[Tree]\n"
+    )
+    ds_reads = collect_downstream_read_names(
+        rec_alias_src,
+        {"start": 2, "end": 3},
+        candidates={"Tree"},
+    )
+    assert ds_reads == set()
 
 

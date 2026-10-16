@@ -118,6 +118,8 @@ class _BaseScopeVisitor(ast.NodeVisitor):
             return
         # First generator's iter evaluates in enclosing scope (class scope if in class body)
         self.visit(node.generators[0].iter)
+        stored_attr = getattr(self, "stored", None)
+        stored_before = set(stored_attr) if isinstance(stored_attr, set) else None
         comp_set: Set[str] = set()
         self._comp_targets.append(comp_set)
         self._in_comp_body += 1
@@ -141,6 +143,8 @@ class _BaseScopeVisitor(ast.NodeVisitor):
         finally:
             self._in_comp_body -= 1
             self._comp_targets.pop()
+            if stored_before is not None:
+                setattr(self, "stored", stored_before)
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
         self._visit_comprehension(node)
@@ -420,12 +424,14 @@ def _extract_type_alias_free_reads(node: ast.AST) -> Set[str]:
         for tp in getattr(node, "type_params", [])
         if isinstance(getattr(tp, "name", None), str)
     }
+    alias_name_node = getattr(node, "name", None)
+    own_name = {alias_name_node.id} if isinstance(alias_name_node, ast.Name) else set()
     sub_visitor = _OuterExprVisitor()
     for tp in getattr(node, "type_params", []):
         sub_visitor.visit(tp)
     if hasattr(node, "value"):
         sub_visitor.visit(getattr(node, "value"))
-    return sub_visitor.names - tp_names
+    return sub_visitor.names - tp_names - own_name
 
 
 def _extract_nested_scope_free_reads(
@@ -982,7 +988,6 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         self.scope_node = scope_node
         self.live_ins: Set[str] = set()
         self.stored: Set[str] = set()
-        self._conditional_depth: int = 0
 
     def _is_inside(self, node: ast.AST) -> bool:
         return _is_ast_node_within_unit_bounds(
@@ -1116,30 +1121,22 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         if not node.values:
             return
         self.visit(node.values[0])
-        self._conditional_depth += 1
-        try:
-            for val in node.values[1:]:
-                self.visit(val)
-        finally:
-            self._conditional_depth -= 1
+        stored_before = set(self.stored)
+        for val in node.values[1:]:
+            self.visit(val)
+            self.stored = set(stored_before)
 
     def visit_IfExp(self, node: ast.IfExp) -> None:
         self.visit(node.test)
-        self._conditional_depth += 1
-        try:
-            self.visit(node.body)
-            self.visit(node.orelse)
-        finally:
-            self._conditional_depth -= 1
+        stored_before = set(self.stored)
+        self.visit(node.body)
+        self.stored = set(stored_before)
+        self.visit(node.orelse)
+        self.stored = set(stored_before)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)
-        if (
-            self._is_inside(node.target)
-            and isinstance(node.target, ast.Name)
-            and self._conditional_depth == 0
-            and self._in_comp_body == 0
-        ):
+        if self._is_inside(node.target) and isinstance(node.target, ast.Name):
             self.stored.add(node.target.id)
 
     def _collect_branch_stored(
