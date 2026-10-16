@@ -3595,3 +3595,96 @@ def test_same_class_whole_line_expr_explicit_method_binding(
     )
     assert call_str == "        self.cache[k] = self._shared_store(items)\n"
 
+
+def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
+    tmp_path: Path,
+) -> None:
+    """Verifies that whole-line expressions referencing an LHS variable on the RHS
+    preserve RHS free-load operand order, and _infer_helper_return_type strips
+    module prefixes before early-exit generator return type checks."""
+    f1 = tmp_path / "ord1.py"
+    f2 = tmp_path / "ord2.py"
+    f1.write_text(
+        "def sub_plain(x: int, y: int) -> int:\n"
+        "    res = (x - y) * 2\n"
+        "    return res\n",
+        encoding="utf-8",
+    )
+    f2.write_text(
+        "def sub_slot(arr: list[int], i: int, a: int) -> None:\n"
+        "    arr[i] = (a - i) * 2\n"
+        "\n"
+        "def sub_aug(i: int, a: int) -> int:\n"
+        "    i += (a - i) * 2\n"
+        "    return i\n",
+        encoding="utf-8",
+    )
+    u_plain = {"file": str(f1), "start": 2, "end": 2, "name": "sub_plain", "kind": "complex_expr"}
+    u_slot = {
+        "file": str(f2),
+        "start": 2,
+        "end": 2,
+        "name": "sub_slot",
+        "kind": "complex_expr",
+        "inputs": ["arr", "i", "a"],
+    }
+    u_aug = {"file": str(f2), "start": 5, "end": 5, "name": "sub_aug", "kind": "complex_expr"}
+
+    patch_slot = generate_refactoring_patch(
+        [(0.98, u_plain, u_slot)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert "+    res = _shared_sub_plain_sub_slot(x, y)" in patch_slot
+    assert "+    arr[i] = _shared_sub_plain_sub_slot(a, i)" in patch_slot
+
+    patch_aug = generate_refactoring_patch(
+        [(0.98, u_plain, u_aug)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert "+    res = _shared_sub_plain_sub_aug(x, y)" in patch_aug
+    assert "+    i += _shared_sub_plain_sub_aug(a, i)" in patch_aug
+
+    assert (
+        _infer_helper_return_type(
+            "collections.abc.Iterable[int]",
+            [],
+            set(),
+            {"has_yield": True, "has_return_value": False, "has_yield_assignment": False},
+            {},
+            {},
+        )
+        == "collections.abc.Iterable[int]"
+    )
+    assert (
+        _infer_helper_return_type(
+            "typing.Generator[int, str, None]",
+            [],
+            set(),
+            {"has_yield": True, "has_return_value": False, "has_yield_assignment": False},
+            {},
+            {},
+        )
+        == "typing.Generator[int, str, None]"
+    )
+    assert (
+        _infer_helper_return_type(
+            "collections.abc.AsyncIterable[str]",
+            [],
+            set(),
+            {"has_yield": True, "has_return_value": False, "has_yield_assignment": False},
+            {},
+            {},
+            is_async=True,
+        )
+        == "collections.abc.AsyncIterable[str]"
+    )
+    assert (
+        _infer_helper_return_type(
+            "typing.Generator[int, None, str]",
+            [],
+            set(),
+            {"has_yield": True, "has_return_value": True, "has_yield_assignment": False},
+            {},
+            {},
+        )
+        == "typing.Generator[int, None, str]"
+    )
+

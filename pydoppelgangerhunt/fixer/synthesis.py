@@ -219,6 +219,28 @@ def _extract_unreferenced_lhs_loads(lines: Sequence[str]) -> Set[str]:
     }
 
 
+def _order_inputs_by_rhs_loads(
+    candidates: Sequence[str],
+    rhs_node: ast.AST,
+    receiver_names: Sequence[str] = ("self", "cls", "this", "klass"),
+) -> List[str]:
+    """Orders input identifiers by their first free-load appearance in rhs_node, keeping receivers first."""
+    rhs_visitor = _OuterExprVisitor()
+    rhs_visitor.visit(rhs_node)
+    rhs_order = {name: idx for idx, name in enumerate(rhs_visitor.ordered_names)}
+    fallback_base = len(rhs_order)
+    rec_set = set(receiver_names)
+    indexed = list(enumerate(candidates))
+    indexed.sort(
+        key=lambda pair: (
+            0 if pair[1].lstrip("*") in rec_set else 1,
+            rhs_order.get(pair[1].lstrip("*"), fallback_base + pair[0]),
+            pair[0],
+        )
+    )
+    return [item for _, item in indexed]
+
+
 def _prune_unreferenced_lhs_scope(
     unit: Dict[str, Any],
     scope_dict: Dict[str, Any],
@@ -251,6 +273,17 @@ def _prune_unreferenced_lhs_scope(
     aug_unref = _extract_augassign_unreferenced_target(lines)
     if aug_unref is not None:
         unref_loads.add(aug_unref)
+    for key, rec_names in (("inputs", all_receivers), ("free_vars", ())):
+        if key in scope_dict and isinstance(scope_dict[key], list):
+            filtered = [x for x in scope_dict[key] if x not in unref_loads]
+            scope_dict[key] = _order_inputs_by_rhs_loads(
+                filtered, rhs_node, receiver_names=rec_names
+            )
+    if "inputs" in unit and isinstance(unit["inputs"], list):
+        filtered_u = [x for x in unit["inputs"] if x not in unref_loads]
+        unit["inputs"] = _order_inputs_by_rhs_loads(
+            filtered_u, rhs_node, receiver_names=all_receivers
+        )
     lhs_attrs = {
         unfolded
         for lhs in lhs_nodes
@@ -273,13 +306,6 @@ def _prune_unreferenced_lhs_scope(
         if unfolded is not None
     }
     unref_attrs = lhs_attrs - rhs_attrs
-
-    if unref_loads:
-        for key in ("inputs", "free_vars"):
-            if key in scope_dict:
-                scope_dict[key] = [x for x in scope_dict[key] if x not in unref_loads]
-        if "inputs" in unit and isinstance(unit["inputs"], list):
-            unit["inputs"] = [x for x in unit["inputs"] if x not in unref_loads]
     if "attrs_written" in scope_dict and lhs_attrs:
         scope_dict["attrs_written"] = [
             a for a in scope_dict["attrs_written"] if a not in lhs_attrs
@@ -963,15 +989,16 @@ def _infer_helper_return_type(
     """Infers the return type annotation for a synthesized shared helper function."""
     resolved_ret = _normalize_pipe_unions(resolved_ret)
     if scope.get("has_yield"):
+        unqualified_ret = _strip_container_module_prefix(resolved_ret)
         has_return_val = bool(helper_outputs or scope.get("has_return_value"))
         has_yield_assign = bool(scope.get("has_yield_assignment"))
         if not has_return_val and resolved_ret not in ("Any", "None"):
-            if not is_async and resolved_ret.startswith("Generator["):
+            if not is_async and unqualified_ret.startswith("Generator["):
                 return resolved_ret
             if not has_yield_assign:
-                if not is_async and resolved_ret.startswith(("Iterator[", "Iterable[")):
+                if not is_async and unqualified_ret.startswith(("Iterator[", "Iterable[")):
                     return resolved_ret
-                if is_async and resolved_ret.startswith((
+                if is_async and unqualified_ret.startswith((
                     "AsyncGenerator[", "AsyncIterator[", "AsyncIterable[",
                 )):
                     return resolved_ret
@@ -979,11 +1006,10 @@ def _infer_helper_return_type(
             not is_async
             and has_return_val
             and not helper_outputs
-            and resolved_ret.startswith("Generator[")
+            and unqualified_ret.startswith("Generator[")
         ):
             return resolved_ret
 
-        unqualified_ret = _strip_container_module_prefix(resolved_ret)
         inferred_yield_type = None
         inferred_send_type = None
         inferred_gen_ret_type = None

@@ -5743,4 +5743,24 @@ def test_extract_nested_scope_free_reads_pep695_decorators_and_defaults() -> Non
     )
     assert ds_reads == set()
 
+    loop_src = (
+        "def loop_fn(seq):\n"
+        "    for item in seq:\n"
+        "        x = x + item\n"
+    )
+    unhashable_reads = collect_downstream_read_names(
+        loop_src,
+        {"start": 3, "end": 3, "inputs": [{"bad": 1}, "x", [1, 2]]},
+        candidates={"x"},
+    )
+    assert unhashable_reads == {"x"}
+
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=import-outside-toplevel
+        _OuterExprVisitor,
+    )
+
+    outer_v = _OuterExprVisitor()
+    outer_v.visit(ast.parse("map(lambda k: b - k - a, items)").body[0])
+    assert outer_v.ordered_names == ["map", "b", "a", "items"]
+
 

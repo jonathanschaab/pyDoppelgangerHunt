@@ -88,6 +88,7 @@ from pydoppelgangerhunt.fixer.synthesis import (
     _format_call_arguments,
     _is_subline_unit,
     _node_references_name,
+    _order_inputs_by_rhs_loads,
     _parse_dedented_stmts,
     _prune_pair_lhs_and_augassign_scopes,
     synthesize_shared_helper_code,
@@ -829,13 +830,21 @@ def _build_unit_delegation_call(
                     assign_prefix = "return "
                 elif isinstance(parsed_node, ast.Expr):
                     assign_prefix = ""
-                if unref_lhs and len(effective_targets) > len(inputs):
-                    pruned_eff = [
-                        x
-                        for x in effective_targets
-                        if x not in unref_lhs
-                        or (x == unit_receiver_omit and x in inputs)
-                    ]
+                rhs_val = getattr(parsed_node, "value", None)
+                if isinstance(
+                    parsed_node, (ast.Assign, ast.AnnAssign, ast.AugAssign)
+                ) and isinstance(rhs_val, ast.AST):
+                    pruned_eff = (
+                        [
+                            x
+                            for x in effective_targets
+                            if x not in unref_lhs
+                            or (x == unit_receiver_omit and x in inputs)
+                        ]
+                        if unref_lhs and len(effective_targets) > len(inputs)
+                        else list(effective_targets)
+                    )
+                    pruned_eff = _order_inputs_by_rhs_loads(pruned_eff, rhs_val)
                     if len(pruned_eff) == len(inputs):
                         pruned_args = _format_call_arguments(
                             inputs,

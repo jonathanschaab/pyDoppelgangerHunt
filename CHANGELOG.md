@@ -267,19 +267,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_UnitLiveInVisitor` (`_df_visitors.py`) to visit `AnnAssign.annotation`, bare subscript/attribute
   targets (`arr[idx]: int`), and PEP 695 `TypeAlias` statements (including type parameter bounds
   and defaults via `_extract_type_alias_free_reads`) while isolating lexical `type_params`.
-- **Whole-Line Subscript, Attribute, and `AugAssign` LHS Load Pruning & Arity Guard**:
-  Added `_extract_unreferenced_lhs_loads`, `_prune_unreferenced_lhs_scope`, and
-  `_prune_pair_lhs_and_augassign_scopes` (`synthesis.py`, `patch.py`) to prune LHS-only `ast.Load`
-  identifiers, unreferenced `AugAssign` targets, and receiver attributes (`arr[i] = ...`,
+- **Whole-Line Subscript, Attribute, and `AugAssign` LHS Load Pruning, RHS Operand Ordering & Arity Guard**:
+  Added `_extract_unreferenced_lhs_loads`, `_order_inputs_by_rhs_loads`, `_prune_unreferenced_lhs_scope`, and
+  `_prune_pair_lhs_and_augassign_scopes` (`synthesis.py`, `_df_visitors.py`, `patch.py`) to prune LHS-only
+  `ast.Load` identifiers, unreferenced `AugAssign` targets, and receiver attributes (`arr[i] = ...`,
   `self.cache[k] = ...`, `self.res1 = [x * self.factor ...]`, `res: MyType = ...`, `total += ...`),
+  order surviving inputs by their first free-load appearance on the RHS (`_OuterExprVisitor.ordered_names`),
   recompute receiver binding flags (`has_instance_binding`, `has_class_binding`,
   `has_receiver_access`, `binding_kind`) respecting custom `@classmethod` receiver names, map
   call-site arguments positionally (`dict(zip(inputs, target_inputs))`) in `_format_call_arguments`,
   and fail closed when pruned RHS input arities differ (`len(scope1["inputs"]) != len(scope2["inputs"])`).
-- **Sync vs. Async Iterator Return Annotation Cross-Check**: Guarded early-return iterator
-  prefixes in `_infer_helper_return_type` (`synthesis.py`) with `is_async` so synchronous
-  `Iterator[...]`/`Generator[...]`/`Iterable[...]` annotations are not emitted for `async def`
-  generators (and vice versa).
+- **Sync vs. Async Iterator Return Annotation Cross-Check & Qualified Container Prefix Stripping**:
+  Guarded early-return iterator prefixes in `_infer_helper_return_type` (`synthesis.py`) with `is_async`
+  and `_strip_container_module_prefix(resolved_ret)` so synchronous `Iterator[...]`/`Generator[...]`/`Iterable[...]`
+  annotations (including `typing.` / `collections.abc.` qualified prefixes) are preserved and not emitted
+  for `async def` generators (and vice versa).
+- **Safe `unit["inputs"]` Coercion in `collect_downstream_read_names`**: Coerced `unit["inputs"]` via
+  `_coerce_string_frozenset` in `collect_downstream_read_names` (`_df_hazards.py`) before constructing
+  the set or cache key so malformed or unhashable elements do not raise `TypeError`.
 - **Unit-Slice Pre-Check & Inline Pragma Fallback Detection**: Updated `_unit_has_no_refactor_pragma`
   (`patch.py`) to pre-check contiguous leading `#` comment lines and unit lines with
   `_NO_REFACTOR_RE.search(line)` before tokenizing `full_text`, avoiding repeated full-file

@@ -14,6 +14,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from pydoppelgangerhunt.fixer._df_cache import (
     _MAX_DOWNSTREAM_CACHE_SIZE,
     _build_downstream_cache_key,
+    _coerce_string_frozenset,
     _downstream_cache_lock,
     _downstream_reads_cache,
     _extract_first_unit_coord,
@@ -448,7 +449,10 @@ def collect_downstream_read_names(
 
     effective_unit_inputs = unit_inputs
     if effective_unit_inputs is None and "inputs" in unit and unit["inputs"] is not None:
-        effective_unit_inputs = set(unit["inputs"])
+        coerced_inputs = _coerce_string_frozenset(unit["inputs"])
+        effective_unit_inputs = (
+            set(coerced_inputs) if coerced_inputs is not None else None
+        )
 
     cache_key = _build_downstream_cache_key(
         source_text,

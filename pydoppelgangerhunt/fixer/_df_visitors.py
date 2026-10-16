@@ -392,16 +392,42 @@ class _OuterExprVisitor(_BaseScopeVisitor):
     def __init__(self) -> None:
         super().__init__()
         self.names: Set[str] = set()
+        self.ordered_names: List[str] = []
+
+    def _record_name(self, name: str) -> None:
+        if name not in self.names:
+            self.ordered_names.append(name)
+        self.names.add(name)
+
+    def _sync_added_names(self, node: ast.AST, before: Set[str]) -> None:
+        added = self.names - before
+        if not added:
+            return
+        load_nodes = [
+            child
+            for child in ast.walk(node)
+            if isinstance(child, ast.Name)
+            and isinstance(child.ctx, ast.Load)
+            and child.id in added
+        ]
+        load_nodes.sort(
+            key=lambda n: (getattr(n, "lineno", 0), getattr(n, "col_offset", 0))
+        )
+        for child in load_nodes:
+            if child.id not in self.ordered_names:
+                self.ordered_names.append(child.id)
 
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Load) and not self._is_in_comp(node.id):
-            self.names.add(node.id)
+            self._record_name(node.id)
 
     def visit_FunctionDef(
         self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef]
     ) -> None:
+        before = set(self.names)
         dummy_stores: Set[str] = set()
         self._visit_nested_named_scope(node, dummy_stores, self.names)
+        self._sync_added_names(node, before)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self.visit_FunctionDef(node)
@@ -410,10 +436,14 @@ class _OuterExprVisitor(_BaseScopeVisitor):
         self.visit_FunctionDef(node)
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
+        before = set(self.names)
         self._visit_nested_lambda(node, self.names)
+        self._sync_added_names(node, before)
 
     def visit_TypeAlias(self, node: ast.AST) -> None:
+        before = set(self.names)
         self.names.update(_extract_type_alias_free_reads(node))
+        self._sync_added_names(node, before)
 
 
 def _extract_type_alias_free_reads(node: ast.AST) -> Set[str]:
