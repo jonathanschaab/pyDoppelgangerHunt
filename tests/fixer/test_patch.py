@@ -10709,3 +10709,74 @@ def test_lhs_and_augassign_pruning_ignores_bound_comprehension_target_on_rhs(
     )
 
 
+def test_asymmetric_expr_kind_and_chained_assign_outputs_cleared(
+    tmp_path: Path,
+) -> None:
+    """Verifies that synthesize_shared_helper_code handles kind-less u1 paired with
+    kind='complex_expr' u2 (emitting return ... and -> Any), rejects conflicting explicit
+    kinds, and clears outputs on chained whole-line assignments (a = b = expr)."""
+    src1 = (
+        "def calc_one(a: int, b: int) -> int:\n"
+        "    x = y = (a + b) * (a - b)\n"
+        "    return x + y\n"
+    )
+    src2 = (
+        "def calc_two(a: int, b: int) -> int:\n"
+        "    z = (a + b) * (a - b)\n"
+        "    return z\n"
+    )
+    f1 = tmp_path / "chain1.py"
+    f2 = tmp_path / "chain2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    # 1. u1 missing 'kind' while u2 has kind='complex_expr'
+    u1_no_kind = {"file": "chain1.py", "start": 2, "end": 2, "name": "u1"}
+    u2_expr = {
+        "file": "chain2.py",
+        "start": 2,
+        "end": 2,
+        "name": "u2",
+        "kind": "complex_expr",
+    }
+    helper = synthesize_shared_helper_code(u1_no_kind, u2_expr, repo_root=str(tmp_path))
+    assert "def _shared_u1_u2(a: Any, b: Any) -> Any:" in helper
+    assert "return (a + b) * (a - b)" in helper
+
+    # 2. Conflicting explicit kinds ('function' vs 'complex_expr') fail closed
+    u1_conflict = {
+        "file": "chain1.py",
+        "start": 2,
+        "end": 2,
+        "name": "u1",
+        "kind": "function",
+    }
+    assert synthesize_shared_helper_code(u1_conflict, u2_expr, repo_root=str(tmp_path)) == ""
+
+    # 3. Chained assignment with pre-populated outputs on u1 (['x', 'y']) vs u2 (['z'])
+    u1_chained = {
+        "file": "chain1.py",
+        "start": 2,
+        "end": 2,
+        "name": "u1",
+        "kind": "complex_expr",
+        "outputs": ["x", "y"],
+    }
+    u2_single = {
+        "file": "chain2.py",
+        "start": 2,
+        "end": 2,
+        "name": "u2",
+        "kind": "complex_expr",
+        "outputs": ["z"],
+    }
+    patch = generate_refactoring_patch(
+        [(0.98, u1_chained, u2_single)],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "+    x = y = _shared_u1_u2(a, b)" in patch
+    assert "+    z = _shared_u1_u2(a, b)" in patch
+
+
+

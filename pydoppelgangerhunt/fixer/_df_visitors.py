@@ -768,6 +768,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             self.killed = set()
         self.visit(node.iter)
         killed_before = set(self.killed)
+        self.visit(node.target)
         self._record_killed_targets([node.target])
         for stmt in node.body:
             self.visit(stmt)
@@ -841,6 +842,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         for item in node.items:
             self.visit(item.context_expr)
             if item.optional_vars is not None:
+                self.visit(item.optional_vars)
                 self._record_killed_targets([item.optional_vars])
         for stmt in node.body:
             self.visit(stmt)
@@ -1058,24 +1060,15 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
             self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
-        if self._is_inside(node):
-            self.visit(node.value)
-            for t in node.targets:
-                self.visit(t)
-        else:
-            self.generic_visit(node)
+        self.visit(node.value)
+        for t in node.targets:
+            self.visit(t)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        if not self._is_inside(node):
-            self.generic_visit(node)
-            return
         self.visit(node.annotation)
         if node.value is not None:
             self.visit(node.value)
-            if isinstance(node.target, ast.Name):
-                self.stored.add(node.target.id)
-            else:
-                self.visit(node.target)
+            self.visit(node.target)
         elif not isinstance(node.target, ast.Name):
             self.visit(node.target)
 

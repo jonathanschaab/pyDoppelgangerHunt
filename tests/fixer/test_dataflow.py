@@ -5386,3 +5386,45 @@ def test_extract_single_node_local_names_lambda_root_comprehension_and_nested_la
     assert "x" not in walrus_locals
 
 
+def test_downstream_read_visitor_for_and_with_subscript_attribute_targets() -> None:
+    """Verifies that _DownstreamReadVisitor visits Load sub-expressions inside For.target
+    and With.items[*].optional_vars (e.g. for arr[idx] in items:, with cm() as obj.slot[k]:)."""
+    _clear_downstream_reads_cache()
+    code = (
+        "def process(items, cm):\n"
+        "    arr = [0, 0]\n"
+        "    idx = 0\n"
+        "    obj = make_holder()\n"
+        "    k = 1\n"
+        "    for arr[idx] in items:\n"
+        "        pass\n"
+        "    with cm() as obj.slot[k]:\n"
+        "        pass\n"
+    )
+    unit = {"file": "for_with_targets.py", "start": 2, "end": 5}
+    reads = collect_downstream_read_names(
+        code, unit, candidates={"arr", "idx", "obj", "k"}
+    )
+    assert reads == {"arr", "idx", "obj", "k"}
+
+
+def test_unit_live_in_visitor_multiline_assign_starting_before_u_start() -> None:
+    """Verifies that _UnitLiveInVisitor visits Assign.value before Assign.targets even when
+    the multi-line Assign node starts on u_start - 1."""
+    code = (
+        "def compute(val):\n"
+        "    (\n"
+        "        val,\n"
+        "    ) = (\n"
+        "        val + 1,\n"
+        "    )\n"
+        "    return val\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    # Assign starts on line 2; unit starts on line 3 (covering target on line 3 and value on line 5)
+    live_ins = _extract_unit_live_in_names(fn_node, u_start=3, u_end=6)
+    assert "val" in live_ins
+
+
+

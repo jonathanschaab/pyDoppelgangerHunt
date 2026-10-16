@@ -194,6 +194,9 @@ def _prune_unreferenced_lhs_scope(
     lhs_nodes, rhs_node = _extract_lhs_and_rhs_nodes(lines)
     if rhs_node is None or not lhs_nodes:
         return
+    scope_dict["outputs"] = []
+    unit.pop("outputs", None)
+    unit.pop("precomputed_outputs", None)
     rec_param = unit.get("receiver_param")
     rec_kind = unit.get("receiver_kind")
     inst_receivers = {"self", "this"}
@@ -1165,10 +1168,16 @@ def synthesize_shared_helper_code(
         pragmas1 = extract_unit_comments_and_pragmas(raw1, 1, len(orig_lines1))
         pragmas2 = extract_unit_comments_and_pragmas(raw2, 1, len(orig_lines2))
 
-    if u1.get("kind") in ("comprehension", "complex_expr") or u2.get("kind") in (
-        "comprehension",
-        "complex_expr",
-    ):
+    k1_expr = u1.get("kind") in ("comprehension", "complex_expr")
+    k2_expr = u2.get("kind") in ("comprehension", "complex_expr")
+    if k1_expr != k2_expr:
+        if u1.get("kind") and u2.get("kind"):
+            return ""
+        eff_expr_kind = u1.get("kind") if k1_expr else u2.get("kind")
+        u1.setdefault("kind", eff_expr_kind)
+        u2.setdefault("kind", eff_expr_kind)
+    is_expr_unit = k1_expr or k2_expr
+    if is_expr_unit:
         lines1 = _strip_stmt_target_lines(lines1)
         lines2 = _strip_stmt_target_lines(lines2)
 

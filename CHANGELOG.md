@@ -315,6 +315,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_COMPREHENSION_TYPES` and `_INNER_SCOPE_TYPES` at the top of `while stack:` in
   `_extract_single_node_local_names` (`_df_closures.py`) so `ast.Lambda` nodes whose immediate
   body is a comprehension or nested lambda do not leak comprehension targets or inner lambda stores.
+- **Expression Unit Kind Parity and Chained Assignment Output Clearing**: Propagated
+  `comprehension`/`complex_expr` kind across kind-less twins while rejecting conflicting explicit
+  kinds in `synthesize_shared_helper_code` (`synthesis.py`), and cleared `outputs` /
+  `precomputed_outputs` in `_prune_unreferenced_lhs_scope` so chained assignments (`a = b = expr`)
+  pair cleanly with single-target assignments (`c = expr`).
+- **Downstream `For` and `With` Target `Load` Traversal & Multi-Line `Assign` Live-In Order**:
+  Visited `node.target` in `_DownstreamReadVisitor.visit_For` and `item.optional_vars` in
+  `visit_With` (`_df_visitors.py`) to capture subscript/attribute `Load` reads (`for arr[i] in ...`,
+  `with cm() as obj.slot[i]:`), and removed the `_is_inside` fallback to `generic_visit` in
+  `_UnitLiveInVisitor.visit_Assign` and `visit_AnnAssign` so `value` is always evaluated before
+  `targets` on multi-line statements starting before `u_start`.
 
 ## [1.0.0] - 2026-09-20
 ### Added
