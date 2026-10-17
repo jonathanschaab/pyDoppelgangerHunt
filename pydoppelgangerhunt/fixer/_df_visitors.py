@@ -496,6 +496,7 @@ def _extract_nested_scope_free_reads_with_nodes(
     candidates: Optional[Set[str]] = None,
     *,
     include_header: bool = True,
+    include_body: bool = True,
 ) -> Tuple[Set[str], List[ast.Name]]:
     """Extracts free variable references and their AST load nodes escaping a nested scope."""
     if isinstance(node, ast.GeneratorExp):
@@ -516,88 +517,93 @@ def _extract_nested_scope_free_reads_with_nodes(
 
     unscoped_visitor = _OuterExprVisitor()
     outer_visitor = _OuterExprVisitor()
-    for tp in getattr(node, "type_params", []):
-        outer_visitor.visit(tp)
+    if include_header:
+        for tp in getattr(node, "type_params", []):
+            outer_visitor.visit(tp)
 
+    body_free: Set[str] = set()
+    body_nodes: List[ast.Name] = []
     if isinstance(node, ast.ClassDef):
-        for b in node.bases:
-            outer_visitor.visit(b)
-        for kw in node.keywords:
-            outer_visitor.visit(kw.value)
-        for dec in node.decorator_list:
-            unscoped_visitor.visit(dec)
-        class_visitor = _ClassScopeVisitor()
-        for tp_name in type_param_names:
-            class_visitor.class_stores.add(tp_name)
-        for stmt in node.body:
-            class_visitor.visit(stmt)
-        class_free = (
-            (class_visitor.free_reads | class_visitor.nonlocals)
-            - class_visitor.globals
-            - type_param_names
-        )
-        class_reads = (
-            unscoped_visitor.names
-            | (outer_visitor.names - type_param_names)
-            | class_free
-        )
-        res_class = (
-            class_reads & candidates if candidates is not None else class_reads
-        )
-        class_nodes = (
-            unscoped_visitor.load_nodes
-            + [n for n in outer_visitor.load_nodes if n.id not in type_param_names]
-            + [n for n in class_visitor.load_nodes if n.id in class_free]
-        )
-        return res_class, [n for n in class_nodes if n.id in res_class]
+        if include_header:
+            for b in node.bases:
+                outer_visitor.visit(b)
+            for kw in node.keywords:
+                outer_visitor.visit(kw.value)
+            for dec in node.decorator_list:
+                unscoped_visitor.visit(dec)
+        if include_body:
+            class_visitor = _ClassScopeVisitor()
+            for tp_name in type_param_names:
+                class_visitor.class_stores.add(tp_name)
+            for stmt in node.body:
+                class_visitor.visit(stmt)
+            body_free = (
+                (class_visitor.free_reads | class_visitor.nonlocals)
+                - class_visitor.globals
+                - type_param_names
+            )
+            body_nodes = [
+                n for n in class_visitor.load_nodes if n.id in body_free
+            ]
+    else:
+        if include_header:
+            defaults = node.args.defaults + [
+                kw for kw in node.args.kw_defaults if kw is not None
+            ]
+            for d in defaults:
+                unscoped_visitor.visit(d)
+            for arg in _collect_func_args(node.args):
+                if arg.annotation is not None:
+                    outer_visitor.visit(arg.annotation)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for dec in node.decorator_list:
+                    unscoped_visitor.visit(dec)
+                if node.returns is not None:
+                    outer_visitor.visit(node.returns)
+        if include_body:
+            func_visitor = _FuncScopeVisitor()
+            for tp_name in type_param_names:
+                func_visitor.local_stores.add(tp_name)
+            func_visitor.params = _collect_func_params(node.args)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for stmt in node.body:
+                    func_visitor.visit(stmt)
+            elif isinstance(node, ast.Lambda):
+                func_visitor.visit(node.body)
+            body_escaped = (
+                (func_visitor.direct_loads | func_visitor.nested_free_reads)
+                - (
+                    func_visitor.params
+                    | func_visitor.local_stores
+                    | func_visitor.globals
+                )
+            )
+            body_free = (
+                body_escaped | func_visitor.nonlocals
+            ) - func_visitor.globals
+            body_nodes = [
+                n for n in func_visitor.load_nodes if n.id in body_escaped
+            ]
 
-    defaults = node.args.defaults + [kw for kw in node.args.kw_defaults if kw is not None]
-    for d in defaults:
-        unscoped_visitor.visit(d)
-    for arg in _collect_func_args(node.args):
-        if arg.annotation is not None:
-            outer_visitor.visit(arg.annotation)
-
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        for dec in node.decorator_list:
-            unscoped_visitor.visit(dec)
-        if node.returns is not None:
-            outer_visitor.visit(node.returns)
-
-    func_visitor = _FuncScopeVisitor()
-    for tp_name in type_param_names:
-        func_visitor.local_stores.add(tp_name)
-    func_visitor.params = _collect_func_params(node.args)
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        for stmt in node.body:
-            func_visitor.visit(stmt)
-    elif isinstance(node, ast.Lambda):
-        func_visitor.visit(node.body)
-
-    body_escaped = (
-        (func_visitor.direct_loads | func_visitor.nested_free_reads)
-        - (func_visitor.params | func_visitor.local_stores | func_visitor.globals)
-    )
-    escaped = (body_escaped | func_visitor.nonlocals) - func_visitor.globals
     all_free = (
         (
             unscoped_visitor.names
             | (outer_visitor.names - type_param_names)
-            | escaped
+            | body_free
         )
         if include_header
-        else escaped
+        else body_free
     )
-    res_func = all_free & candidates if candidates is not None else all_free
-    func_nodes = (
+    res_free = all_free & candidates if candidates is not None else all_free
+    all_nodes = (
         (
             unscoped_visitor.load_nodes
             + [n for n in outer_visitor.load_nodes if n.id not in type_param_names]
         )
         if include_header
         else []
-    ) + [n for n in func_visitor.load_nodes if n.id in body_escaped]
-    return res_func, [n for n in func_nodes if n.id in res_func]
+    ) + body_nodes
+    return res_free, [n for n in all_nodes if n.id in res_free]
 
 
 def _extract_nested_scope_free_reads(
@@ -607,10 +613,14 @@ def _extract_nested_scope_free_reads(
     candidates: Optional[Set[str]] = None,
     *,
     include_header: bool = True,
+    include_body: bool = True,
 ) -> Set[str]:
     """Extracts free variable references escaping a nested function, genexp, or class body."""
     return _extract_nested_scope_free_reads_with_nodes(
-        node, candidates=candidates, include_header=include_header
+        node,
+        candidates=candidates,
+        include_header=include_header,
+        include_body=include_body,
     )[0]
 
 
@@ -1104,9 +1114,15 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
             ast.Lambda,
             ast.ClassDef,
         ],
+        *,
+        include_header: bool = True,
+        include_body: bool = True,
     ) -> None:
         for free in _extract_nested_scope_free_reads(
-            node, candidates=self.candidates
+            node,
+            candidates=self.candidates,
+            include_header=include_header,
+            include_body=include_body,
         ):
             self._record_live_in(free)
 
@@ -1124,8 +1140,9 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
             self.generic_visit(node)
             return
         if self._is_inside(node):
+            self._record_nested_free_reads(node, include_body=False)
             self.stored.add(node.name)
-            self._record_nested_free_reads(node)
+            self._record_nested_free_reads(node, include_header=False)
         else:
             self.generic_visit(node)
 

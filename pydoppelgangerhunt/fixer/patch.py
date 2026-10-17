@@ -3124,15 +3124,9 @@ def _generate_refactoring_patch_impl(
             elif _is_same_file_path(f1_raw, f2_raw, repo_root=str(root)):
                 is_same_file = True
 
-            enc1 = find_enclosing_class(orig_text, u1, tree=f1_plan.parsed_tree)
-            fn1 = find_enclosing_function(orig_text, u1, tree=f1_plan.parsed_tree)
-
-            enc2 = None
-            fn2 = None
             f2_plan: Optional[_FilePatchPlan] = None
             if is_same_file:
-                enc2 = find_enclosing_class(orig_text, u2, tree=f1_plan.parsed_tree)
-                fn2 = find_enclosing_function(orig_text, u2, tree=f1_plan.parsed_tree)
+                pass
             elif f2_raw:
                 if f2_path is not None:
                     rel_f2 = _format_patch_relative_path(f2_path, patch_root, fs_root)
@@ -3146,13 +3140,6 @@ def _generate_refactoring_patch_impl(
                     if f2_plan is None and replace_clones:
                         skip_reasons["unreadable file"] += 1
                         continue
-                    if f2_plan is not None:
-                        enc2 = find_enclosing_class(
-                            f2_plan.orig_text, u2, tree=f2_plan.parsed_tree
-                        )
-                        fn2 = find_enclosing_function(
-                            f2_plan.orig_text, u2, tree=f2_plan.parsed_tree
-                        )
                 elif replace_clones:
                     skip_reasons["unreadable file"] += 1
                     continue
@@ -3172,20 +3159,21 @@ def _generate_refactoring_patch_impl(
             else:
                 u2_eff = dict(u2)
 
-            u2_text = (
-                orig_text
-                if is_same_file
-                else (f2_plan.orig_text if f2_plan is not None else None)
+            f2_text: Optional[str] = (
+                f2_plan.orig_text
+                if f2_plan is not None
+                else (f1_plan.orig_text if is_same_file else None)
             )
-            u2_tree = (
-                f1_plan.parsed_tree
-                if is_same_file
-                else (f2_plan.parsed_tree if f2_plan is not None else None)
+            tree1 = f1_plan.parsed_tree
+            tree2 = (
+                f2_plan.parsed_tree
+                if f2_plan is not None
+                else (tree1 if is_same_file else None)
             )
             if _unit_has_no_refactor_pragma(
-                u1, u1_lines, orig_text=orig_text, tree=f1_plan.parsed_tree
+                u1, u1_lines, orig_text=orig_text, tree=tree1
             ) or _unit_has_no_refactor_pragma(
-                u2, u2_lines, orig_text=u2_text, tree=u2_tree
+                u2, u2_lines, orig_text=f2_text, tree=tree2
             ):
                 f1_disp = normalize_path_string(
                     str(u1.get("file") or "file1"), strip_anchor=False
@@ -3226,57 +3214,10 @@ def _generate_refactoring_patch_impl(
                     skip_reasons["overlapping claimed unit"] += 1
                     continue
 
-            is_same_class = bool(
-                is_same_file
-                and enc1
-                and enc2
-                and enc1["name"] == enc2["name"]
-                and enc1["start"] == enc2["start"]
-            )
-            f2_text: Optional[str] = (
-                f2_plan.orig_text
-                if f2_plan is not None
-                else (f1_plan.orig_text if is_same_file else None)
-            )
-
-            orig_fn1 = fn1
-            orig_fn2 = fn2
-            if not _is_method_of_class(fn1, enc1):
-                fn1 = None
-            if not _is_method_of_class(fn2, enc2):
-                fn2 = None
-
             if not _align_pair_expr_kinds(u1_eff, u2_eff):
                 skip_reasons["mismatched subroutine kinds"] += 1
                 continue
 
-            fn1_kind = _determine_unit_receiver_kind(fn1, u1_eff, enc1)
-            fn2_kind = _determine_unit_receiver_kind(fn2, u2_eff, enc2)
-
-            receiver_kinds_differ = bool(fn1_kind != fn2_kind)
-            has_method_ctx = bool(
-                fn1
-                and fn2
-                and (fn1.get("receiver_param") or fn1.get("is_static"))
-                and (fn2.get("receiver_param") or fn2.get("is_static"))
-            )
-            if fn1 and "receiver_param" not in u1_eff:
-                u1_eff["receiver_param"] = fn1.get("receiver_param")
-            if fn2 and "receiver_param" not in u2_eff:
-                u2_eff["receiver_param"] = fn2.get("receiver_param")
-            if fn1 and fn2:
-                is_static = bool(fn1.get("is_static") and fn2.get("is_static"))
-            else:
-                is_static = bool(
-                    (fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static"))
-                )
-
-            tree1 = f1_plan.parsed_tree
-            tree2 = (
-                f2_plan.parsed_tree
-                if f2_plan is not None
-                else (tree1 if is_same_file else None)
-            )
             digest1 = f1_plan.content_digest
             digest2 = (
                 f2_plan.content_digest
@@ -3298,6 +3239,54 @@ def _generate_refactoring_patch_impl(
                     is_sub2,
                 )
                 continue
+
+            enc1 = find_enclosing_class(orig_text, u1_eff, tree=tree1)
+            fn1 = find_enclosing_function(orig_text, u1_eff, tree=tree1)
+            enc2 = (
+                find_enclosing_class(f2_text, u2_eff, tree=tree2)
+                if f2_text is not None
+                else None
+            )
+            fn2 = (
+                find_enclosing_function(f2_text, u2_eff, tree=tree2)
+                if f2_text is not None
+                else None
+            )
+            is_same_class = bool(
+                is_same_file
+                and enc1
+                and enc2
+                and enc1["name"] == enc2["name"]
+                and enc1["start"] == enc2["start"]
+            )
+
+            orig_fn1 = fn1
+            orig_fn2 = fn2
+            if not _is_method_of_class(fn1, enc1):
+                fn1 = None
+            if not _is_method_of_class(fn2, enc2):
+                fn2 = None
+
+            fn1_kind = _determine_unit_receiver_kind(fn1, u1_eff, enc1)
+            fn2_kind = _determine_unit_receiver_kind(fn2, u2_eff, enc2)
+
+            receiver_kinds_differ = bool(fn1_kind != fn2_kind)
+            has_method_ctx = bool(
+                fn1
+                and fn2
+                and (fn1.get("receiver_param") or fn1.get("is_static"))
+                and (fn2.get("receiver_param") or fn2.get("is_static"))
+            )
+            if fn1 and "receiver_param" not in u1_eff:
+                u1_eff["receiver_param"] = fn1.get("receiver_param")
+            if fn2 and "receiver_param" not in u2_eff:
+                u2_eff["receiver_param"] = fn2.get("receiver_param")
+            if fn1 and fn2:
+                is_static = bool(fn1.get("is_static") and fn2.get("is_static"))
+            else:
+                is_static = bool(
+                    (fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static"))
+                )
 
             s1 = inspect_single_unit_scope(u1_eff, repo_root=str(root), tree=tree1)
             s2 = inspect_single_unit_scope(u2_eff, repo_root=str(root), tree=tree2)

@@ -380,7 +380,6 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        self._record_store_name(node.name)
         for dec in node.decorator_list:
             self.visit(dec)
         tp_names = _extract_type_param_names(node)
@@ -393,6 +392,7 @@ class _ScopeVisitor(ast.NodeVisitor):
                 self.visit(base)
             for keyword in node.keywords:
                 self.visit(keyword)
+            self._record_store_name(node.name)
             created_outer = False
             if not self._scope_stack:
                 self._scope_stack.append(set())

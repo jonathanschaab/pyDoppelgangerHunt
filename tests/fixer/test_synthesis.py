@@ -4478,3 +4478,36 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
         )
         == 5
     )
+
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=import-outside-toplevel
+        _UnitLiveInVisitor,
+    )
+
+    cls_self_header_scope = _inspect_scope_fn(
+        {
+            "start": 1,
+            "end": 5,
+            "kind": "function",
+            "is_subroutine": False,
+            "source_text": (
+                "def outer(C):\n"
+                "    @C\n"
+                "    class C(C):\n"
+                "        pass\n"
+                "    return C\n"
+            ),
+        }
+    )
+    assert "C" in cls_self_header_scope["inputs"]
+
+    live_in_tree = ast.parse(
+        "@f\n"
+        "def f(x=f):\n"
+        "    return f(x)\n"
+        "def rec_only(n):\n"
+        "    return rec_only(n - 1)\n"
+    )
+    live_in_vis = _UnitLiveInVisitor(u_start=1, u_end=5)
+    live_in_vis.visit(live_in_tree)
+    assert "f" in live_in_vis.live_ins
+    assert "rec_only" not in live_in_vis.live_ins
