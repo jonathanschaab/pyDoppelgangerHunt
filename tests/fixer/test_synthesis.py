@@ -3690,6 +3690,7 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
 
     from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
         _build_unit_delegation_call,
+        _unit_has_no_refactor_pragma,
     )
 
     me_src = (
@@ -3710,6 +3711,35 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
         target_inputs=["me", "k", "val"],
     )
     assert me_call == "        me.cache[k] = _shared_calc(me, val)\n"
+
+    me_method_src = (
+        "class CustomRec:\n"
+        "    def store(me, k: str, val: int) -> None:\n"
+        "        me.cache[k] = val * 2\n"
+    )
+    me_method_lines = me_method_src.splitlines(keepends=True)
+    me_method_call = _build_unit_delegation_call(
+        {"start": 3, "end": 3, "kind": "complex_expr", "receiver_param": "me"},
+        me_method_src,
+        me_method_lines,
+        effective_binding="method",
+        helper_name="_shared_store",
+        inputs=["self", "x"],
+        outputs=[],
+        scope={"param_details": []},
+        target_inputs=["me", "k", "val"],
+    )
+    assert me_method_call == "        me.cache[k] = me._shared_store(val)\n"
+
+    pragma_src = "# pragma: no-refactor\n@dec\ndef f():\n    return 1\n"
+    pragma_tree = ast.parse(pragma_src)
+    pragma_tree.body[0].decorator_list[0].lineno = None  # type: ignore[attr-defined]
+    assert _unit_has_no_refactor_pragma(
+        {"start": 3, "end": 4},
+        pragma_src.splitlines(keepends=True),
+        tree=pragma_tree,
+        orig_text=pragma_src,
+    ) is True
 
     ret_src = (
         "def compute(x: int, y: int) -> int:\n"

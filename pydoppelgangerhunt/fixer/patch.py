@@ -837,21 +837,24 @@ def _build_unit_delegation_call(
                     parsed_node,
                     (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Return, ast.Expr),
                 ) and isinstance(rhs_val, ast.AST):
-                    pruned_eff = (
-                        [
-                            x
-                            for x in effective_targets
-                            if x not in unref_lhs
-                            or (x == unit_receiver_omit and x in inputs)
-                        ]
-                        if unref_lhs and len(effective_targets) > len(inputs)
-                        else list(effective_targets)
-                    )
                     unit_receiver = rec_param or target_unit.get("receiver_param")
                     rec_names: Tuple[str, ...] = (
                         (str(unit_receiver), "self", "cls", "this", "klass")
                         if unit_receiver
                         else ("self", "cls", "this", "klass")
+                    )
+                    pruned_eff = (
+                        [
+                            x
+                            for x in effective_targets
+                            if x not in unref_lhs
+                            or (
+                                x == unit_receiver_omit
+                                and (x in inputs or any(r in inputs for r in rec_names))
+                            )
+                        ]
+                        if unref_lhs and len(effective_targets) > len(inputs)
+                        else list(effective_targets)
                     )
                     if not any(
                         x in unref_lhs and x != unit_receiver_omit for x in pruned_eff
@@ -2907,8 +2910,8 @@ def _unit_has_no_refactor_pragma(
         for node in ast.walk(effective_tree):
             decs = getattr(node, "decorator_list", None)
             if decs:
-                dec_start = min(getattr(d, "lineno", u_start) for d in decs)
-                node_lineno = getattr(node, "lineno", 0)
+                dec_start = min((getattr(d, "lineno", None) or u_start) for d in decs)
+                node_lineno = getattr(node, "lineno", None) or 0
                 if dec_start <= u_start <= node_lineno:
                     start_idx = min(start_idx, max(0, dec_start - 1))
     while start_idx > 0 and eff_lines[start_idx - 1].strip().startswith(("#", "@")):
