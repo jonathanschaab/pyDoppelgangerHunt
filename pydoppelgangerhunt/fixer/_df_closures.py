@@ -95,7 +95,7 @@ def _extract_single_node_local_names(scope_node: ast.AST) -> Set[str]:
     """Extracts parameters and locally assigned/imported/defined symbols in scope_node."""
     names: Set[str] = set()
     node_name = getattr(scope_node, "name", None)
-    if isinstance(node_name, str):
+    if isinstance(node_name, str) and not isinstance(scope_node, ast.ClassDef):
         names.add(node_name)
 
     names.update(_extract_node_type_param_names(scope_node))

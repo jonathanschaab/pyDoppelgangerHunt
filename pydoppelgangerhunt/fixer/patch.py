@@ -2851,14 +2851,28 @@ def _resolve_safe_clone_file_path(
 def _validate_helper_compilation(helper_code: str) -> bool:
     """Validates that synthesized helper code compiles without syntax or indentation errors.
 
-    Splits top-level import headers from indented method definitions to prevent
-    spurious IndentationError when checking combined helper strings, and wraps
-    indented definitions in a compound block to preserve column-0 multiline strings.
+    Attempts direct or compound-wrapped compilation first so multiline string literals
+    containing triple newlines are never split, falling back to splitting top-level
+    import headers from indented method definitions when combined strings are passed.
 
     Note:
         Intentionally preserved for standalone verification, post-synthesis validation
         assertions, and test harness compatibility.
     """
+    try:
+        compile(helper_code, "<patch_helper>", "exec")
+        return True
+    except IndentationError:
+        try:
+            compile("if 1:\n" + helper_code, "<patch_helper>", "exec")
+            return True
+        except IndentationError:
+            pass
+        except (SyntaxError, ValueError):
+            return False
+    except (SyntaxError, ValueError):
+        return False
+
     sep = "\r\n\r\n\r\n" if "\r\n\r\n\r\n" in helper_code else "\n\n\n"
     if sep in helper_code:
         header, body = helper_code.split(sep, 1)
@@ -2873,17 +2887,7 @@ def _validate_helper_compilation(helper_code: str) -> bool:
             return True
         except (SyntaxError, ValueError):
             return False
-    try:
-        compile(helper_code, "<patch_helper>", "exec")
-        return True
-    except IndentationError:
-        try:
-            compile("if 1:\n" + helper_code, "<patch_helper>", "exec")
-            return True
-        except (SyntaxError, ValueError):
-            return False
-    except (SyntaxError, ValueError):
-        return False
+    return False
 
 
 _NO_REFACTOR_RE = re.compile(r"#\s*pragma\s*:\s*no[-_]refactor\b", re.IGNORECASE)

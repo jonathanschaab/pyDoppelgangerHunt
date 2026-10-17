@@ -1526,6 +1526,7 @@ def _inspect_unit_scope(
         has_enclosing_fn = False
         has_enclosing_cls = False
         if parsed_tree is not None:
+            matched_self = False
             for earliest_start, n_end, _span, scope_node in _get_tree_scope_intervals(
                 parsed_tree
             ):
@@ -1536,24 +1537,36 @@ def _inspect_unit_scope(
                     enclosing_cls_locals.update(
                         _extract_single_node_local_names(scope_node)
                     )
-                elif isinstance(
-                    scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)
-                ) and (
-                    earliest_start < s_line
-                    or n_end > e_line
-                    or (
-                        u_col is not None
-                        and getattr(scope_node, "col_offset", 0) < u_col
-                    )
-                    or (
-                        top_fn_name is not None
-                        and getattr(scope_node, "name", None) != top_fn_name
-                    )
-                ):
-                    has_enclosing_fn = True
-                    enclosing_fn_locals.update(
-                        _extract_single_node_local_names(scope_node)
-                    )
+                elif isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if (
+                        not matched_self
+                        and s_line
+                        in (
+                            earliest_start,
+                            getattr(scope_node, "lineno", earliest_start),
+                        )
+                        and e_line == n_end
+                        and (
+                            u_col is None
+                            or getattr(scope_node, "col_offset", 0) == u_col
+                        )
+                        and (
+                            top_fn_name is None
+                            or getattr(scope_node, "name", None) == top_fn_name
+                        )
+                    ):
+                        matched_self = True
+                        continue
+                    if (
+                        earliest_start < s_line
+                        or n_end > e_line
+                        or u_col is None
+                        or getattr(scope_node, "col_offset", 0) < u_col
+                    ):
+                        has_enclosing_fn = True
+                        enclosing_fn_locals.update(
+                            _extract_single_node_local_names(scope_node)
+                        )
         if has_enclosing_fn and any(
             fv in enclosing_fn_locals for fv in visitor.type_param_free_vars
         ):
@@ -1570,7 +1583,7 @@ def _inspect_unit_scope(
             has_class_scoped_type_params = True
             if (
                 has_enclosing_fn
-                or unit.get("kind") in ("closure", "function", "async_function")
+                or unit.get("kind") == "closure"
             ) and "type_param_closure_capture" not in hazards:
                 hazards.append("type_param_closure_capture")
 

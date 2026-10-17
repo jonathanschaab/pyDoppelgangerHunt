@@ -9,19 +9,26 @@ def assert_valid_python(source: str, mode: str = "exec") -> None:
     Handles import headers separated by triple newlines, indented definitions,
     and multiline parenthesized imports without line-splitting corruption.
     """
-    if "\n\n\n" in source:
-        header, body = source.split("\n\n\n", 1)
+    try:
+        compile(source, filename="<test_source>", mode=mode)
+        return
+    except IndentationError:
+        try:
+            compile("if 1:\n" + source, filename="<test_source>", mode=mode)
+            return
+        except IndentationError:
+            pass
+
+    sep = "\r\n\r\n\r\n" if "\r\n\r\n\r\n" in source else "\n\n\n"
+    if sep in source:
+        header, body = source.split(sep, 1)
         if header.strip():
             compile(header, filename="<synthesized_imports>", mode=mode)
         if body.strip():
-            first_line = next((ln for ln in body.splitlines() if ln.strip()), "")
-            if first_line.startswith((" ", "\t")):
+            if body.lstrip("\r\n").startswith((" ", "\t")):
                 compile("if 1:\n" + body, filename="<synthesized_helper>", mode=mode)
             else:
                 compile(body, filename="<synthesized_helper>", mode=mode)
         return
 
-    try:
-        compile(source, filename="<test_source>", mode=mode)
-    except IndentationError:
-        compile("if 1:\n" + source, filename="<test_source>", mode=mode)
+    compile("if 1:\n" + source, filename="<test_source>", mode=mode)

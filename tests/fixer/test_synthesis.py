@@ -4003,22 +4003,31 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
             "file": str(cls_bound_file),
             "start": 3,
             "end": 5,
-            "name": "ServiceA.run_a",
-            "kind": "method",
+            "name": "run_a",
+            "kind": "function",
+            "enclosing_class": "ServiceA",
+            "enclosing_class_start": 1,
+            "receiver_kind": "instance",
         }
         u_cls_a2 = {
             "file": str(cls_bound_file),
             "start": 6,
             "end": 8,
-            "name": "ServiceA.run_a2",
-            "kind": "method",
+            "name": "run_a2",
+            "kind": "function",
+            "enclosing_class": "ServiceA",
+            "enclosing_class_start": 1,
+            "receiver_kind": "instance",
         }
         u_cls_b = {
             "file": str(cls_bound_file),
             "start": 12,
             "end": 14,
-            "name": "ServiceB.run_b",
-            "kind": "method",
+            "name": "run_b",
+            "kind": "function",
+            "enclosing_class": "ServiceB",
+            "enclosing_class_start": 10,
+            "receiver_kind": "instance",
         }
         assert (
             synthesize_shared_helper_code(
@@ -4047,6 +4056,49 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
             u_cls_a1, u_cls_a2, repo_root=str(tmp_path)
         )
         assert "[T: Bound]" in same_cls_helper
+        same_cls_patch = generate_refactoring_patch(
+            [(0.99, u_cls_a1, u_cls_a2)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+        )
+        assert "def _shared_run_a_run_a2[T: Bound]" in same_cls_patch
+
+        self_cls_file = tmp_path / "self_cls_type_param.py"
+        self_cls_file.write_text(
+            "class Service:\n"
+            "    def copy_a[T: Service](self, other: T) -> T:\n"
+            "        return other\n"
+            "    def copy_b[T: Service](self, other: T) -> T:\n"
+            "        return other\n",
+            encoding="utf-8",
+        )
+        u_self_a = {
+            "file": str(self_cls_file),
+            "start": 2,
+            "end": 3,
+            "name": "copy_a",
+            "kind": "function",
+            "enclosing_class": "Service",
+            "enclosing_class_start": 1,
+            "receiver_kind": "instance",
+        }
+        u_self_b = {
+            "file": str(self_cls_file),
+            "start": 4,
+            "end": 5,
+            "name": "copy_b",
+            "kind": "function",
+            "enclosing_class": "Service",
+            "enclosing_class_start": 1,
+            "receiver_kind": "instance",
+        }
+        mod_self_helper = synthesize_shared_helper_code(
+            u_self_a,
+            u_self_b,
+            method_binding="module",
+            repo_root=str(tmp_path),
+        )
+        assert "[T: Service]" in mod_self_helper
 
         from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
             _inspect_unit_scope,
@@ -4108,5 +4160,21 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     assert _unit_ast_has_async_or_yield(
         multiline_acomp_tree, 4, 4, is_subroutine=True
     ) == (False, True)
+
+    multiline_str_helper = (
+        'def _shared_doc() -> str:\n'
+        '    msg = """para1\n\n\npara2"""\n'
+        '    return msg\n'
+    )
+    indented_multiline_str_helper = (
+        '    def _shared_doc(self) -> str:\n'
+        '        msg = """para1\n\n\npara2"""\n'
+        '        return msg\n'
+    )
+    assert _validate_helper_compilation(multiline_str_helper) is True
+    assert _validate_helper_compilation(indented_multiline_str_helper) is True
+    assert_valid_python(multiline_str_helper)
+    assert_valid_python(indented_multiline_str_helper)
+
 
 
