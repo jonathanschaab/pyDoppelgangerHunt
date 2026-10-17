@@ -275,7 +275,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ast.Load` identifiers, unreferenced `AugAssign` targets, and receiver attributes (`arr[i] = ...`,
   `self.cache[k] = ...`, `self.res1 = [x * self.factor ...]`, `res: MyType = ...`, `total += ...`),
   order surviving inputs by their first free-load appearance on the RHS (`_OuterExprVisitor.ordered_names`,
-  excluding shadowed bound homonyms and appending `nonlocal` store-only names),
+  excluding shadowed bound homonyms and appending `nonlocal` store-only names) across `Assign`, `AnnAssign`,
+  `AugAssign`, `Return`, and `Expr` whole-line expression units,
   recompute receiver binding flags (`has_instance_binding`, `has_class_binding`,
   `has_receiver_access`, `binding_kind`) respecting custom `@classmethod` receiver names, map
   call-site arguments positionally (`dict(zip(inputs, target_inputs))`) in `_format_call_arguments`,
@@ -333,10 +334,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_strip_stmt_target_lines`, and cleared `outputs` / `precomputed_outputs` in
   `_prune_unreferenced_lhs_scope` so chained assignments (`a = b = expr`) and mixed assignment/return
   expressions (`res = expr` vs `return expr`) pair cleanly.
-- **Downstream `For`/`With`/`Match` Target `Load` Traversal, Intra-Unit `Delete` & Sub-Line/Multi-Line Live-In Order**:
+- **Downstream `For`/`With`/`Match` Target `Load` Traversal, Enclosing `ClassDef` Loop-Carried Traversal, Intra-Unit `Delete` & Sub-Line/Multi-Line Live-In Order**:
   Visited `node.target` in `_DownstreamReadVisitor.visit_For`, `item.optional_vars` in
   `visit_With`, and pattern children before binding in `_record_pattern_binding` and
-  `_DownstreamReadVisitor.visit_MatchAs` (`_df_visitors.py`); added `visit_Delete` to
+  `_DownstreamReadVisitor.visit_MatchAs` (`_df_visitors.py`); traversed `node.body` in
+  `_DownstreamReadVisitor.visit_ClassDef` whenever `n_start <= self.u_end <= n_end and not self._is_node_after_unit(node)`
+  (including in `LOOP_CARRIED` mode); added `visit_Delete` to
   `_UnitLiveInVisitor` to record `ast.Name(ctx=ast.Del)` targets as live-ins and discard them from
   `self.stored`; saved and restored `self.stored` around comprehension bodies in
   `_BaseScopeVisitor._visit_comprehension`, across chained `node.values[1:]` operands in

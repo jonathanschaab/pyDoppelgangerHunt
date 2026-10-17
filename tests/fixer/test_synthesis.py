@@ -3711,3 +3711,21 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     )
     assert me_call == "        me.cache[k] = _shared_calc(me, val)\n"
 
+    ret_src = (
+        "def compute(x: int, y: int) -> int:\n"
+        "    return y - x\n"
+    )
+    ret_lines = ret_src.splitlines(keepends=True)
+    ret_call = _build_unit_delegation_call(
+        {"start": 2, "end": 2, "kind": "complex_expr", "inputs": ["x", "y"]},
+        ret_src,
+        ret_lines,
+        effective_binding="module",
+        helper_name="_shared_diff",
+        inputs=["b", "a"],
+        outputs=[],
+        scope={"param_details": []},
+        target_inputs=["x", "y"],
+    )
+    assert ret_call == "    return _shared_diff(y, x)\n"
+

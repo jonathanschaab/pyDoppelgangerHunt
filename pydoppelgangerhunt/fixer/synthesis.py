@@ -187,7 +187,7 @@ def _indent_code_lines(lines: Sequence[str], prefix: str) -> List[str]:
 def _extract_lhs_and_rhs_nodes(
     lines: Sequence[str],
 ) -> Tuple[List[ast.AST], Optional[ast.AST]]:
-    """Extracts LHS target/annotation AST nodes and the RHS value node from an assignment."""
+    """Extracts LHS target/annotation AST nodes and the RHS value node from an assignment or expression."""
     try:
         parsed = _parse_dedented_stmts("\n".join(lines))
         if len(parsed) == 1:
@@ -198,6 +198,10 @@ def _extract_lhs_and_rhs_nodes(
                 return [stmt.target, stmt.annotation], stmt.value
             if isinstance(stmt, ast.AugAssign):
                 return [stmt.target], stmt.value
+            if isinstance(stmt, ast.Return) and stmt.value is not None:
+                return [], stmt.value
+            if isinstance(stmt, ast.Expr):
+                return [], stmt.value
     except (SyntaxError, IndexError, ValueError):
         pass
     return [], None
@@ -256,7 +260,7 @@ def _prune_unreferenced_lhs_scope(
     unit.pop("outputs", None)
     unit.pop("precomputed_outputs", None)
     lhs_nodes, rhs_node = _extract_lhs_and_rhs_nodes(lines)
-    if rhs_node is None or not lhs_nodes:
+    if rhs_node is None:
         return set()
     rec_param = unit.get("receiver_param")
     rec_kind = unit.get("receiver_kind")

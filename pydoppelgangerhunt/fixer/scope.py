@@ -287,8 +287,6 @@ class _ScopeVisitor(ast.NodeVisitor):
         created_outer = False
         if is_top:
             self._has_processed_top_func = True
-            if tp_names:
-                self._type_param_scopes.append(tp_names)
             for tp in getattr(node, "type_params", []):
                 try:
                     self.type_params.append(ast.unparse(tp))
@@ -304,7 +302,6 @@ class _ScopeVisitor(ast.NodeVisitor):
                     ):
                         self.type_param_free_vars.append(name)
             self._process_args(node)
-            self._scope_stack.append(set(self.params) | tp_names)
         else:
             for dec in node.decorator_list:
                 self.visit(dec)
@@ -313,23 +310,28 @@ class _ScopeVisitor(ast.NodeVisitor):
             for kw_default in node.args.kw_defaults:
                 if kw_default is not None:
                     self.visit(kw_default)
-            if tp_names:
-                self._type_param_scopes.append(tp_names)
-            for tp in getattr(node, "type_params", []):
-                self.visit(tp)
-            self._record_store_name(node.name)
-            if not self._scope_stack:
-                self._scope_stack.append(set())
-                created_outer = True
-            self._scope_stack.append(self._extract_arg_names(node.args) | tp_names)
 
+        if tp_names:
+            self._type_param_scopes.append(tp_names)
         try:
-            for stmt in node.body:
-                self.visit(stmt)
-        finally:
-            self._scope_stack.pop()
-            if created_outer:
+            if is_top:
+                self._scope_stack.append(set(self.params) | tp_names)
+            else:
+                for tp in getattr(node, "type_params", []):
+                    self.visit(tp)
+                self._record_store_name(node.name)
+                if not self._scope_stack:
+                    self._scope_stack.append(set())
+                    created_outer = True
+                self._scope_stack.append(self._extract_arg_names(node.args) | tp_names)
+            try:
+                for stmt in node.body:
+                    self.visit(stmt)
+            finally:
                 self._scope_stack.pop()
+                if created_outer:
+                    self._scope_stack.pop()
+        finally:
             if tp_names:
                 self._type_param_scopes.pop()
 

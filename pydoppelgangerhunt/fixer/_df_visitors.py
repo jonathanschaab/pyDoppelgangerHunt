@@ -774,21 +774,13 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self.visit_FunctionDef(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        if self._should_inspect_read(node):
-            free_reads = _extract_nested_scope_free_reads(node, candidates=self.candidates)
-            for name in free_reads:
-                self._record_downstream_read(name)
-            lineno = getattr(node, "lineno", None)
-            if not self._is_in_comp(node.name) and not (
-                lineno == self.u_end and self.u_end_col is None
-            ):
-                self.killed.add(node.name)
-        else:
-            n_start = getattr(node, "lineno", 0)
-            n_end = getattr(node, "end_lineno", None) or n_start
-            if n_start <= self.u_end <= n_end:
-                for stmt in node.body:
-                    self.visit(stmt)
+        n_start = getattr(node, "lineno", 0)
+        n_end = getattr(node, "end_lineno", None) or n_start
+        if n_start <= self.u_end <= n_end and not self._is_node_after_unit(node):
+            for stmt in node.body:
+                self.visit(stmt)
+            return
+        self.visit_FunctionDef(node)
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         self.visit_FunctionDef(node)

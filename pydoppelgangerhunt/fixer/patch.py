@@ -832,7 +832,8 @@ def _build_unit_delegation_call(
                     assign_prefix = ""
                 rhs_val = getattr(parsed_node, "value", None)
                 if isinstance(
-                    parsed_node, (ast.Assign, ast.AnnAssign, ast.AugAssign)
+                    parsed_node,
+                    (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Return, ast.Expr),
                 ) and isinstance(rhs_val, ast.AST):
                     pruned_eff = (
                         [

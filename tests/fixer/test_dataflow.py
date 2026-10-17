@@ -5794,3 +5794,20 @@ def test_extract_nested_scope_free_reads_pep695_decorators_and_defaults() -> Non
     ml_fn = ml_tree.body[0]
     assert _resolve_unit_ast_end_col(ml_fn, {"start": 3, "end": 4}) is None
     assert _resolve_unit_ast_end_col(ml_fn, {"start": 2, "end": 4, "start_col": 10}) is None
+
+    loop_cls_src = (
+        "def loop_with_class(items):\n"
+        "    for _ in items:\n"
+        "        class Inner:\n"
+        "            x = 0\n"
+        "            vals = [x for _ in range(1)]\n"
+        "            x = 1\n"
+    )
+    assert (
+        collect_downstream_read_names(
+            loop_cls_src,
+            {"start": 6, "end": 6},
+            candidates={"x"},
+        )
+        == set()
+    )
