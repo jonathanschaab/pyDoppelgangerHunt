@@ -274,17 +274,9 @@ def _resolve_unit_ast_end_col(
     if start_col is not None and unit.get("kind") in ("comprehension", "complex_expr"):
         return None
     if len(inner_stmts) == 1:
-        stmt_start = getattr(inner_stmts[0], "lineno", 0)
-        stmt_col = getattr(inner_stmts[0], "col_offset", 0)
-        if stmt_start < u_start:
-            return None
-        if start_col is not None and (
-            stmt_start != u_start
-            or start_col != stmt_col
-            or isinstance(inner_stmts[0], ast.Expr)
-        ):
-            return None
         target_stmt = inner_stmts[0]
+        if getattr(target_stmt, "lineno", 0) < u_start:
+            return None
     elif u_start == u_end and start_col is not None:
         if any(
             getattr(s, "col_offset", 0) < start_col < (getattr(s, "end_col_offset", 0) or 0)
@@ -297,6 +289,13 @@ def _resolve_unit_ast_end_col(
         else:
             return None
     else:
+        return None
+
+    if start_col is not None and (
+        getattr(target_stmt, "lineno", 0) != u_start
+        or start_col != getattr(target_stmt, "col_offset", 0)
+        or isinstance(target_stmt, ast.Expr)
+    ):
         return None
 
     end_col = getattr(target_stmt, "end_col_offset", None)

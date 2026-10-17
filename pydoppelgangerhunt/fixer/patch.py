@@ -813,17 +813,17 @@ def _build_unit_delegation_call(
                 if isinstance(parsed_node, ast.Assign) and parsed_node.targets:
                     targets_str = " = ".join(ast.unparse(t) for t in parsed_node.targets)
                     assign_prefix = f"{targets_str} = "
-                    unref_lhs = _extract_unreferenced_lhs_loads([raw_block])
+                    unref_lhs = _extract_unreferenced_lhs_loads(parsed_node)
                 elif isinstance(parsed_node, ast.AnnAssign) and parsed_node.value is not None:
                     target_str = ast.unparse(parsed_node.target)
                     anno_str = ast.unparse(parsed_node.annotation)
                     assign_prefix = f"{target_str}: {anno_str} = "
-                    unref_lhs = _extract_unreferenced_lhs_loads([raw_block])
+                    unref_lhs = _extract_unreferenced_lhs_loads(parsed_node)
                 elif isinstance(parsed_node, ast.AugAssign):
                     target_str = ast.unparse(parsed_node.target)
                     op_symbol = _AUGASSIGN_OPS.get(type(parsed_node.op), "+=")
                     assign_prefix = f"{target_str} {op_symbol} "
-                    unref_lhs = _extract_unreferenced_lhs_loads([raw_block])
+                    unref_lhs = _extract_unreferenced_lhs_loads(parsed_node)
                     if isinstance(parsed_node.target, ast.Name):
                         t_name = parsed_node.target.id
                         if not _node_references_name(parsed_node.value, t_name):

@@ -790,7 +790,11 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             for name in _extract_type_alias_free_reads(node):
                 self._record_downstream_read(name)
             name_node = getattr(node, "name", None)
-            if isinstance(name_node, ast.Name) and not self._is_in_comp(name_node.id):
+            if (
+                isinstance(name_node, ast.Name)
+                and not self._is_in_comp(name_node.id)
+                and not (getattr(node, "lineno", None) == self.u_end and self.u_end_col is None)
+            ):
                 self.killed.add(name_node.id)
 
     def visit_Name(self, node: ast.Name) -> None:
@@ -955,16 +959,21 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self.generic_visit(node)
         bound = self._extract_pattern_bound_name(node)
         if bound is not None and self._should_inspect_read(node):
-            if not self._is_in_comp(bound):
+            if not self._is_in_comp(bound) and not (
+                getattr(node, "lineno", None) == self.u_end and self.u_end_col is None
+            ):
                 self.killed.add(bound)
 
     def visit_Import(self, node: ast.Import) -> None:
-        if self._should_inspect_read(node):
+        if self._should_inspect_read(node) and not (
+            getattr(node, "lineno", None) == self.u_end and self.u_end_col is None
+        ):
             self._record_import_names(node, self.killed)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         if self._should_inspect_read(node):
-            self._record_import_names(node, self.killed)
+            if not (getattr(node, "lineno", None) == self.u_end and self.u_end_col is None):
+                self._record_import_names(node, self.killed)
             if any(alias.name == "*" for alias in node.names):
                 self.has_dynamic_read = True
                 if self.candidates is not None:

@@ -5807,6 +5807,9 @@ def test_extract_nested_scope_free_reads_pep695_decorators_and_defaults() -> Non
     semi_ml_fn = ast.parse("def f(a):\n    x = 0\n    a = 1; b = (\n        a + 1\n    )\n").body[0]
     assert _resolve_unit_ast_end_col(semi_ml_fn, {"start": 2, "end": 3}) is None
 
+    semi_expr_fn = ast.parse("def f(x):\n    a = 1; (yield x) + x\n").body[0]
+    assert _resolve_unit_ast_end_col(semi_expr_fn, {"start": 2, "end": 2, "start_col": 11}) is None
+
     walrus_hdr_fn = ast.parse(
         "def outer(custom_sum, items):\n"
         "    def inner(x=(sum := custom_sum)):\n"
@@ -5835,3 +5838,40 @@ def test_extract_nested_scope_free_reads_pep695_decorators_and_defaults() -> Non
         == set()
     )
 
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=import-outside-toplevel
+        _DownstreamReadVisitor,
+    )
+
+    unres_src = (
+        "def f(subj):\n"
+        "    import math as m\n"
+        "    from os import path as p\n"
+        "    match subj:\n"
+        "        case int() as k:\n"
+        "            pass\n"
+        "    return m, p, k\n"
+    )
+    unres_fn = ast.parse(unres_src).body[0]
+    assert isinstance(unres_fn, ast.FunctionDef)
+    v_imp = _DownstreamReadVisitor(2, 2, None, candidates={"m"})
+    for s in unres_fn.body:
+        v_imp.visit(s)
+    assert "m" in v_imp.loaded
+
+    v_imp_from = _DownstreamReadVisitor(3, 3, None, candidates={"p"})
+    for s in unres_fn.body:
+        v_imp_from.visit(s)
+    assert "p" in v_imp_from.loaded
+
+    v_match = _DownstreamReadVisitor(4, 5, None, candidates={"k"})
+    for s in unres_fn.body:
+        v_match.visit(s)
+    assert "k" in v_match.loaded
+
+    if sys.version_info >= (3, 12):
+        ta_unres_fn = ast.parse("def f():\n    type T = int\n    return T\n").body[0]
+        assert isinstance(ta_unres_fn, ast.FunctionDef)
+        v_ta = _DownstreamReadVisitor(2, 2, None, candidates={"T"})
+        for s in ta_unres_fn.body:
+            v_ta.visit(s)
+        assert "T" in v_ta.loaded

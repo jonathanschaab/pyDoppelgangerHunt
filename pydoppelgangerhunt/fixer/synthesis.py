@@ -6,7 +6,7 @@ import ast
 import difflib
 import re
 import typing
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.config import normalize_path_string
 from pydoppelgangerhunt.reporters import extract_unit_source_code
@@ -184,6 +184,23 @@ def _indent_code_lines(lines: Sequence[str], prefix: str) -> List[str]:
     return out
 
 
+def _extract_stmt_lhs_and_rhs_nodes(
+    stmt: ast.AST,
+) -> Tuple[List[ast.AST], Optional[ast.AST]]:
+    """Extracts LHS target/annotation AST nodes and the RHS value node from a parsed AST statement."""
+    if isinstance(stmt, ast.Assign) and stmt.value is not None:
+        return list(stmt.targets), stmt.value
+    if isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+        return [stmt.target, stmt.annotation], stmt.value
+    if isinstance(stmt, ast.AugAssign):
+        return [stmt.target], stmt.value
+    if isinstance(stmt, ast.Return) and stmt.value is not None:
+        return [], stmt.value
+    if isinstance(stmt, ast.Expr):
+        return [], stmt.value
+    return [], None
+
+
 def _extract_lhs_and_rhs_nodes(
     lines: Sequence[str],
 ) -> Tuple[List[ast.AST], Optional[ast.AST]]:
@@ -191,25 +208,20 @@ def _extract_lhs_and_rhs_nodes(
     try:
         parsed = _parse_dedented_stmts("\n".join(lines))
         if len(parsed) == 1:
-            stmt = parsed[0]
-            if isinstance(stmt, ast.Assign) and stmt.value is not None:
-                return list(stmt.targets), stmt.value
-            if isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
-                return [stmt.target, stmt.annotation], stmt.value
-            if isinstance(stmt, ast.AugAssign):
-                return [stmt.target], stmt.value
-            if isinstance(stmt, ast.Return) and stmt.value is not None:
-                return [], stmt.value
-            if isinstance(stmt, ast.Expr):
-                return [], stmt.value
+            return _extract_stmt_lhs_and_rhs_nodes(parsed[0])
     except (SyntaxError, IndexError, ValueError):
         pass
     return [], None
 
 
-def _extract_unreferenced_lhs_loads(lines: Sequence[str]) -> Set[str]:
+def _extract_unreferenced_lhs_loads(
+    lines_or_stmt: Union[Sequence[str], ast.AST],
+) -> Set[str]:
     """Extracts identifiers loaded in an assignment LHS or annotation but not referenced in RHS."""
-    lhs_nodes, rhs_node = _extract_lhs_and_rhs_nodes(lines)
+    if isinstance(lines_or_stmt, ast.AST):
+        lhs_nodes, rhs_node = _extract_stmt_lhs_and_rhs_nodes(lines_or_stmt)
+    else:
+        lhs_nodes, rhs_node = _extract_lhs_and_rhs_nodes(lines_or_stmt)
     if rhs_node is None or not lhs_nodes:
         return set()
     loaded_lhs = {
