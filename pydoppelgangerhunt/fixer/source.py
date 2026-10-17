@@ -330,8 +330,27 @@ def _find_multiline_string_continuation_lines(text: str) -> Set[int]:
                         cont_lines.update(range(start_line + 1, tok.end[0] + 1))
             elif tok.type in _MULTILINE_STR_TOKEN_TYPES and tok.start[0] < tok.end[0]:
                 cont_lines.update(range(tok.start[0] + 1, tok.end[0] + 1))
-    except (tokenize.TokenError, IndentationError, SyntaxError):
-        pass
+    except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
+        err_start = (
+            fstring_start_lines[0]
+            if fstring_start_lines
+            else (
+                exc.args[1][0]
+                if (
+                    isinstance(exc, tokenize.TokenError)
+                    and len(exc.args) >= 2
+                    and "string" in str(exc.args[0]).lower()
+                    and isinstance(exc.args[1], tuple)
+                    and len(exc.args[1]) >= 1
+                    and isinstance(exc.args[1][0], int)
+                )
+                else None
+            )
+        )
+        if err_start is not None:
+            total_lines = len(split_source_lines(text))
+            if err_start < total_lines:
+                cont_lines.update(range(err_start + 1, total_lines + 1))
     return cont_lines
 
 

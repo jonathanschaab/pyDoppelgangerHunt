@@ -1709,31 +1709,38 @@ def synthesize_shared_helper_code(
             if (tp1_idents and tp2_idents)
             else (tp1_idents | tp2_idents)
         )
-        ref_text = f"{params_str}\n{return_type}\n{indented_body}"
-        kept_tps = [
-            tp
-            for tp in tp_list
-            if (
-                (ident := tp.split(":", 1)[0].split("=", 1)[0].lstrip("*").strip())
-                in common_tp_idents
-                or bool(re.search(rf"\b{re.escape(ident)}\b", ref_text))
+        probe_src = (
+            f"{func_keyword} _probe({params_str}) -> {return_type}:\n"
+            f"{indented_body}\n"
+        )
+        try:
+            active_idents = common_tp_idents | {
+                node.id
+                for node in ast.walk(ast.parse(probe_src))
+                if isinstance(node, ast.Name)
+            }
+        except SyntaxError:
+            active_idents = common_tp_idents | set(
+                re.findall(
+                    r"\b[A-Za-z_]\w*\b",
+                    f"{params_str}\n{return_type}\n{indented_body}",
+                )
             )
-        ]
+        kept_tps: List[str] = []
         while True:
-            kept_tp_text = "\n".join([ref_text, *kept_tps])
             next_tps = [
                 tp
                 for tp in tp_list
-                if (
-                    (ident := tp.split(":", 1)[0].split("=", 1)[0].lstrip("*").strip())
-                    in common_tp_idents
-                    or bool(re.search(rf"\b{re.escape(ident)}\b", kept_tp_text))
-                )
+                if tp.split(":", 1)[0].split("=", 1)[0].lstrip("*").strip()
+                in active_idents
             ]
             if len(next_tps) == len(kept_tps):
                 tp_list = next_tps
                 break
             kept_tps = next_tps
+            for tp in kept_tps:
+                head_len = len(tp.split(":", 1)[0].split("=", 1)[0])
+                active_idents.update(re.findall(r"\b[A-Za-z_]\w*\b", tp[head_len:]))
     type_params_str = f"[{', '.join(tp_list)}]" if (tp_list and not is_sub) else ""
     helper_def = (
         f"{dec_prefix}"

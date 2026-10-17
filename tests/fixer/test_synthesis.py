@@ -3539,16 +3539,20 @@ def test_synthesize_shared_helper_code_preserves_pep695_type_params(
     f_alpha = tmp_path / "generic_alpha.py"
     f_alpha.write_text(
         "def alpha1[T](items: list[T], cast_fn) -> T:\n"
+        "    # Note: U in comment and literal 'U' should not retain U\n"
+        "    tag = 'U'\n"
         "    head = items[0]\n"
         "    return cast_fn(T, head)\n"
         "\n"
         "def alpha2[U](items: list[U], cast_fn) -> U:\n"
+        "    # Note: U in comment and literal 'U' should not retain U\n"
+        "    tag = 'U'\n"
         "    head = items[0]\n"
         "    return cast_fn(U, head)\n",
         encoding="utf-8",
     )
-    ua1 = {"file": str(f_alpha), "start": 1, "end": 3, "name": "alpha1", "kind": "function"}
-    ua2 = {"file": str(f_alpha), "start": 5, "end": 7, "name": "alpha2", "kind": "function"}
+    ua1 = {"file": str(f_alpha), "start": 1, "end": 5, "name": "alpha1", "kind": "function"}
+    ua2 = {"file": str(f_alpha), "start": 7, "end": 11, "name": "alpha2", "kind": "function"}
     helper_any = synthesize_shared_helper_code(ua1, ua2, repo_root=str(tmp_path))
     assert "def _shared_alpha1_alpha2[T](" in helper_any
     assert "[T, U]" not in helper_any
@@ -4202,6 +4206,50 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
         )
         assert "[T: Bound]" in inner_mod_helper
 
+        nested_self_ref_file = tmp_path / "nested_self_ref.py"
+        nested_self_ref_file.write_text(
+            "class Outer:\n"
+            "    class Inner:\n"
+            "        def m1[T: Inner](self, x: T) -> T:\n"
+            "            y = x\n"
+            "            return y\n"
+            "\n"
+            "        def m2[T: Inner](self, x: T) -> T:\n"
+            "            y = x\n"
+            "            return y\n",
+            encoding="utf-8",
+        )
+        u_ns1 = {
+            "file": str(nested_self_ref_file),
+            "start": 3,
+            "end": 5,
+            "name": "m1",
+            "kind": "function",
+            "enclosing_class": "Inner",
+            "receiver_kind": "self",
+        }
+        u_ns2 = {
+            "file": str(nested_self_ref_file),
+            "start": 7,
+            "end": 9,
+            "name": "m2",
+            "kind": "function",
+            "enclosing_class": "Inner",
+            "receiver_kind": "self",
+        }
+        assert not synthesize_shared_helper_code(
+            u_ns1,
+            u_ns2,
+            method_binding="module",
+            repo_root=str(tmp_path),
+        )
+        assert "[T: Inner]" in synthesize_shared_helper_code(
+            u_ns1,
+            u_ns2,
+            method_binding="method",
+            repo_root=str(tmp_path),
+        )
+
         from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
             _inspect_unit_scope,
         )
@@ -4277,6 +4325,19 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     assert _validate_helper_compilation(indented_multiline_str_helper) is True
     assert_valid_python(multiline_str_helper)
     assert_valid_python(indented_multiline_str_helper)
+
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
+        _dedent_preserving_multiline_strings,
+    )
+
+    unclosed_fstr = '    x = f"""line1 {a}\nline2\nline3'
+    assert _dedent_preserving_multiline_strings(unclosed_fstr) == (
+        'x = f"""line1 {a}\nline2\nline3'
+    )
+    unclosed_str = '    x = """line1\nline2\nline3'
+    assert _dedent_preserving_multiline_strings(unclosed_str) == (
+        'x = """line1\nline2\nline3'
+    )
 
 
 
