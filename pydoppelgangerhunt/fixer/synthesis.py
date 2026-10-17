@@ -1709,22 +1709,28 @@ def synthesize_shared_helper_code(
             if (tp1_idents and tp2_idents)
             else (tp1_idents | tp2_idents)
         )
+        sig_idents = set(
+            re.findall(r"\b[A-Za-z_]\w*\b", f"{params_str}\n{return_type}")
+        )
         probe_src = (
             f"{func_keyword} _probe({params_str}) -> {return_type}:\n"
             f"{indented_body}\n"
         )
         try:
-            active_idents = common_tp_idents | {
-                node.id
-                for node in ast.walk(ast.parse(probe_src))
-                if isinstance(node, ast.Name)
-            }
+            active_idents = (
+                common_tp_idents
+                | sig_idents
+                | {
+                    node.id
+                    for node in ast.walk(ast.parse(probe_src))
+                    if isinstance(node, ast.Name)
+                }
+            )
         except SyntaxError:
-            active_idents = common_tp_idents | set(
-                re.findall(
-                    r"\b[A-Za-z_]\w*\b",
-                    f"{params_str}\n{return_type}\n{indented_body}",
-                )
+            active_idents = (
+                common_tp_idents
+                | sig_idents
+                | set(re.findall(r"\b[A-Za-z_]\w*\b", indented_body))
             )
         kept_tps: List[str] = []
         while True:

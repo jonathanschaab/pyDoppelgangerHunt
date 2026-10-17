@@ -1525,7 +1525,7 @@ def _inspect_unit_scope(
         enclosing_cls_locals: Set[str] = set()
         has_enclosing_fn = False
         has_enclosing_cls = False
-        innermost_cls_name: Optional[str] = None
+        prev_enclosed_cls_name: Optional[str] = None
         if parsed_tree is not None:
             matched_self = False
             for earliest_start, n_end, _span, scope_node in _get_tree_scope_intervals(
@@ -1536,14 +1536,14 @@ def _inspect_unit_scope(
                 if isinstance(scope_node, ast.ClassDef):
                     if not has_enclosing_cls:
                         has_enclosing_cls = True
-                        innermost_cls_name = getattr(scope_node, "name", None)
+                        prev_enclosed_cls_name = getattr(scope_node, "name", None)
                         enclosing_cls_locals.update(
                             _extract_single_node_local_names(scope_node)
                         )
                     else:
-                        if isinstance(innermost_cls_name, str):
-                            enclosing_cls_locals.add(innermost_cls_name)
-                        innermost_cls_name = getattr(scope_node, "name", None)
+                        if isinstance(prev_enclosed_cls_name, str):
+                            enclosing_cls_locals.add(prev_enclosed_cls_name)
+                        prev_enclosed_cls_name = getattr(scope_node, "name", None)
                         enclosing_cls_locals.update(
                             _extract_type_param_names(scope_node)
                         )
@@ -1555,7 +1555,11 @@ def _inspect_unit_scope(
                             earliest_start,
                             getattr(scope_node, "lineno", earliest_start),
                         )
-                        and e_line == n_end
+                        and (
+                            e_line == n_end
+                            or top_fn_name is not None
+                            or u_col is not None
+                        )
                         and (
                             u_col is None
                             or getattr(scope_node, "col_offset", 0) == u_col

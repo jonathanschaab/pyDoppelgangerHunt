@@ -3583,6 +3583,22 @@ def test_synthesize_shared_helper_code_preserves_pep695_type_params(
     plain_rev = synthesize_shared_helper_code(up, ud1, repo_root=str(tmp_path))
     assert "def _shared_plain_dep1[T, U: list[T]](" in plain_rev
 
+    f_fwd = tmp_path / "generic_fwd.py"
+    f_fwd.write_text(
+        "def fwd1[T](x: 'list[T]') -> 'T':\n"
+        "    return x[0]\n"
+        "\n"
+        "def fwd2[U](x: 'list[U]') -> 'U':\n"
+        "    return x[0]\n",
+        encoding="utf-8",
+    )
+    uf1 = {"file": str(f_fwd), "start": 1, "end": 2, "name": "fwd1", "kind": "function"}
+    uf2 = {"file": str(f_fwd), "start": 4, "end": 5, "name": "fwd2", "kind": "function"}
+    fwd_union = synthesize_shared_helper_code(
+        uf1, uf2, type_merge_strategy="union", repo_root=str(tmp_path)
+    )
+    assert "def _shared_fwd1_fwd2[T, U](" in fwd_union
+
     if sys.version_info >= (3, 13):
         f_pep696 = tmp_path / "generic_pep696.py"
         f_pep696.write_text(
@@ -4278,6 +4294,26 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
             file_tree=same_line_tree,
         )
         assert "type_param_closure_capture" in same_line_scope["control_flow_hazards"]
+
+        trunc_tree = ast.parse(
+            "def self_fn[T: LocalAlias](x: T) -> T:\n"
+            "    LocalAlias = int\n"
+            "    return x\n"
+        )
+        trunc_scope = _inspect_unit_scope(
+            {
+                "start": 1,
+                "end": 2,
+                "kind": "function",
+                "source_text": (
+                    "def self_fn[T: LocalAlias](x: T) -> T:\n"
+                    "    LocalAlias = int\n"
+                    "    return x\n"
+                ),
+            },
+            file_tree=trunc_tree,
+        )
+        assert "type_param_closure_capture" not in trunc_scope["control_flow_hazards"]
 
     from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
         _inspect_unit_scope as _inspect_scope_fn,
