@@ -1451,6 +1451,12 @@ def synthesize_shared_helper_code(
     if has_mangled and (effective_binding != "method" or not is_same_class or is_static_clone):
         return ""
 
+    if (
+        scope1.get("has_class_scoped_type_params")
+        or scope2.get("has_class_scoped_type_params")
+    ) and (effective_binding != "method" or not is_same_class):
+        return ""
+
     if effective_binding == "module":
         inputs = _prune_unshared_receivers(inputs, u1, u2, scope1, scope2, repo_root=repo_root)
 

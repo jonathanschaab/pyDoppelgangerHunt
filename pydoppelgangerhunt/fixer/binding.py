@@ -350,8 +350,9 @@ def _unit_ast_has_async_or_yield(
             stack.extend(iter_nested_scope_header_nodes(node))
             continue
 
+        bound_node = node.target if isinstance(node, ast.comprehension) else node
         if _is_ast_node_within_unit_bounds(
-            node, u_start, u_end, u_end_col=u_end_col, u_start_col=u_start_col
+            bound_node, u_start, u_end, u_end_col=u_end_col, u_start_col=u_start_col
         ):
             if isinstance(node, (ast.Yield, ast.YieldFrom)):
                 has_yield = True

@@ -3421,6 +3421,15 @@ def _generate_refactoring_patch_impl(
                 skip_reasons["mangled names in non-method helper"] += 1
                 continue
 
+            if (
+                s1.get("has_class_scoped_type_params")
+                or s2.get("has_class_scoped_type_params")
+            ) and (effective_binding != "method" or not is_same_class):
+                skip_reasons["type_param closure capture"] = (
+                    skip_reasons.get("type_param closure capture", 0) + 1
+                )
+                continue
+
             helper_indent = (
                 enc1["method_indent"]
                 if (effective_binding == "method" and enc1)

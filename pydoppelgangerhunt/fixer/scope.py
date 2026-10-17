@@ -322,6 +322,17 @@ class _ScopeVisitor(ast.NodeVisitor):
             else:
                 for tp in getattr(node, "type_params", []):
                     self.visit(tp)
+                for arg in (
+                    list(getattr(node.args, "posonlyargs", []))
+                    + list(node.args.args)
+                    + list(node.args.kwonlyargs)
+                    + ([node.args.vararg] if node.args.vararg else [])
+                    + ([node.args.kwarg] if node.args.kwarg else [])
+                ):
+                    if arg.annotation is not None:
+                        self.visit(arg.annotation)
+                if node.returns is not None:
+                    self.visit(node.returns)
                 self._record_store_name(node.name)
                 if not self._scope_stack:
                     self._scope_stack.append(set())
@@ -1378,6 +1389,7 @@ def _inspect_unit_scope(
         "outputs_ambiguous": False,
         "type_params": [],
         "type_param_free_vars": [],
+        "has_class_scoped_type_params": False,
     }
     if not dedented.strip():
         return empty_res
@@ -1490,34 +1502,77 @@ def _inspect_unit_scope(
     if is_subroutine and visitor.has_return:
         hazards.append("embedded_return")
 
+    has_class_scoped_type_params = False
     if visitor.type_param_free_vars and not is_subroutine:
         s_line = parse_unit_coord(unit, "start", default=1)
         e_line = parse_unit_coord(unit, "end", default=s_line)
+        u_col = parse_unit_coord(unit, "start_col", default=None)
+        if u_col is None:
+            u_col = parse_unit_coord(unit, "col_offset", default=None)
+        top_fn_name = (
+            getattr(tree.body[0], "name", None)
+            if isinstance(tree, ast.Module)
+            and len(tree.body) == 1
+            and isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))
+            else None
+        )
         parsed_tree = file_tree
         if parsed_tree is None:
             full_src = _get_full_source()
             if full_src:
                 parsed_tree = _get_or_parse_tree(full_src)
         enclosing_fn_locals: Set[str] = set()
+        enclosing_cls_locals: Set[str] = set()
         has_enclosing_fn = False
+        has_enclosing_cls = False
         if parsed_tree is not None:
             for earliest_start, n_end, _span, scope_node in _get_tree_scope_intervals(
                 parsed_tree
             ):
-                if (
-                    isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and earliest_start <= s_line <= e_line <= n_end
-                    and (earliest_start < s_line or n_end > e_line)
+                if earliest_start > s_line or e_line > n_end:
+                    continue
+                if isinstance(scope_node, ast.ClassDef):
+                    has_enclosing_cls = True
+                    enclosing_cls_locals.update(
+                        _extract_single_node_local_names(scope_node)
+                    )
+                elif isinstance(
+                    scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)
+                ) and (
+                    earliest_start < s_line
+                    or n_end > e_line
+                    or (
+                        u_col is not None
+                        and getattr(scope_node, "col_offset", 0) < u_col
+                    )
+                    or (
+                        top_fn_name is not None
+                        and getattr(scope_node, "name", None) != top_fn_name
+                    )
                 ):
                     has_enclosing_fn = True
                     enclosing_fn_locals.update(
                         _extract_single_node_local_names(scope_node)
                     )
-        if has_enclosing_fn:
-            if any(fv in enclosing_fn_locals for fv in visitor.type_param_free_vars):
-                hazards.append("type_param_closure_capture")
-        elif unit.get("kind") == "closure":
+        if has_enclosing_fn and any(
+            fv in enclosing_fn_locals for fv in visitor.type_param_free_vars
+        ):
             hazards.append("type_param_closure_capture")
+        elif (
+            not has_enclosing_fn
+            and not has_enclosing_cls
+            and unit.get("kind") == "closure"
+        ):
+            hazards.append("type_param_closure_capture")
+        if has_enclosing_cls and any(
+            fv in enclosing_cls_locals for fv in visitor.type_param_free_vars
+        ):
+            has_class_scoped_type_params = True
+            if (
+                has_enclosing_fn
+                or unit.get("kind") in ("closure", "function", "async_function")
+            ) and "type_param_closure_capture" not in hazards:
+                hazards.append("type_param_closure_capture")
 
     is_control_flow_safe = not any(
         h
@@ -1738,6 +1793,7 @@ def _inspect_unit_scope(
         "outputs_ambiguous": outputs_ambiguous,
         "type_params": list(visitor.type_params),
         "type_param_free_vars": list(visitor.type_param_free_vars),
+        "has_class_scoped_type_params": has_class_scoped_type_params,
     }
 
 
@@ -1968,6 +2024,14 @@ def analyze_unit_variable_scope(
             dict.fromkeys(
                 info1.get("type_param_free_vars", [])
                 + (info2.get("type_param_free_vars", []) if u2 is not None else [])
+            )
+        ),
+        "has_class_scoped_type_params": bool(
+            info1.get("has_class_scoped_type_params", False)
+            or (
+                info2.get("has_class_scoped_type_params", False)
+                if u2 is not None
+                else False
             )
         ),
     }

@@ -3982,3 +3982,131 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
         )
         assert "[T: ModuleBound]" in mod_helper
 
+        cls_bound_file = tmp_path / "cls_type_param_capture.py"
+        cls_bound_file.write_text(
+            "class ServiceA:\n"
+            "    Bound = int\n"
+            "    def run_a[T: Bound](self, x: T) -> T:\n"
+            "        self.last = x\n"
+            "        return x\n"
+            "    def run_a2[T: Bound](self, x: T) -> T:\n"
+            "        self.last = x\n"
+            "        return x\n\n"
+            "class ServiceB:\n"
+            "    Bound = int\n"
+            "    def run_b[T: Bound](self, x: T) -> T:\n"
+            "        self.last = x\n"
+            "        return x\n",
+            encoding="utf-8",
+        )
+        u_cls_a1 = {
+            "file": str(cls_bound_file),
+            "start": 3,
+            "end": 5,
+            "name": "ServiceA.run_a",
+            "kind": "method",
+        }
+        u_cls_a2 = {
+            "file": str(cls_bound_file),
+            "start": 6,
+            "end": 8,
+            "name": "ServiceA.run_a2",
+            "kind": "method",
+        }
+        u_cls_b = {
+            "file": str(cls_bound_file),
+            "start": 12,
+            "end": 14,
+            "name": "ServiceB.run_b",
+            "kind": "method",
+        }
+        assert (
+            synthesize_shared_helper_code(
+                u_cls_a1, u_cls_b, repo_root=str(tmp_path)
+            )
+            == ""
+        )
+        assert (
+            synthesize_shared_helper_code(
+                u_cls_a1,
+                u_cls_a2,
+                method_binding="module",
+                repo_root=str(tmp_path),
+            )
+            == ""
+        )
+        assert (
+            generate_refactoring_patch(
+                [(0.99, u_cls_a1, u_cls_b)],
+                repo_root=str(tmp_path),
+                replace_clones=True,
+            )
+            == ""
+        )
+        same_cls_helper = synthesize_shared_helper_code(
+            u_cls_a1, u_cls_a2, repo_root=str(tmp_path)
+        )
+        assert "[T: Bound]" in same_cls_helper
+
+        from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+            _inspect_unit_scope,
+        )
+
+        same_line_tree = ast.parse(
+            "def outer(b: type):\n"
+            "    def inner[T: b](x: T) -> T:\n"
+            "        return x\n"
+        )
+        outer_fn = same_line_tree.body[0]
+        inner_fn = outer_fn.body[0]  # type: ignore[attr-defined]
+        outer_fn.lineno = 1
+        outer_fn.end_lineno = 1
+        outer_fn.col_offset = 0
+        inner_fn.lineno = 1
+        inner_fn.end_lineno = 1
+        inner_fn.col_offset = 14
+        same_line_scope = _inspect_unit_scope(
+            {
+                "start": 1,
+                "end": 1,
+                "start_col": 14,
+                "kind": "closure",
+                "source_text": "              def inner[T: b](x: T) -> T: return x\n",
+            },
+            file_tree=same_line_tree,
+        )
+        assert "type_param_closure_capture" in same_line_scope["control_flow_hazards"]
+
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        _inspect_unit_scope as _inspect_scope_fn,
+    )
+
+    nested_ann_scope = _inspect_scope_fn(
+        {
+            "start": 1,
+            "end": 3,
+            "kind": "compound_block",
+            "is_subroutine": True,
+            "source_text": (
+                "def inner(x: LocalType, *args: VarType, **kwargs: KwType) -> ReturnType:\n"
+                "    return x\n"
+                "res = inner(val)\n"
+            ),
+        }
+    )
+    for expected_ann_sym in ("LocalType", "VarType", "KwType", "ReturnType", "val"):
+        assert expected_ann_sym in nested_ann_scope["inputs"]
+
+    multiline_acomp_tree = ast.parse(
+        "async def run(aiter):\n"
+        "    res = [\n"
+        "        x\n"
+        "        async for x in aiter\n"
+        "    ]\n"
+        "    return res\n"
+    )
+    assert _unit_ast_has_async_or_yield(
+        multiline_acomp_tree, 4, 4, is_subroutine=True
+    ) == (False, True)
+
+

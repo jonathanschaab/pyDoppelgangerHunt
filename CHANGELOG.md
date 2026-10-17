@@ -426,12 +426,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_unit_has_no_refactor_pragma` (`patch.py`), and validated both `orig_lines1` and `orig_lines2` via
   `_is_valid_expr_unit_lines` in `synthesize_shared_helper_code` (`synthesis.py`) to reject unmapped
   statement partners (e.g. `assert` or bare `return` with `stmt.value is None`).
-- **Nested Generic Closure `type_params` Capture Guard, In-Place AST `_scope_intervals` Validation & CRLF Helper Compilation Check**:
-  Detected PEP 695 `type_params` bounds/defaults referencing enclosing function local bindings (`type_param_closure_capture` hazard)
+- **Nested Generic Closure & Class-Scoped `type_params` Capture Guard, Nested Function Annotation Scoping, Multi-Line Async Comprehension Clauses, In-Place AST `_scope_intervals` Validation & CRLF Helper Compilation Check**:
+  Detected PEP 695 `type_params` bounds/defaults referencing enclosing function local bindings or class-scoped bindings hoisted outside the class
+  (`type_param_closure_capture` / `has_class_scoped_type_params`, including same-line outer functions via `col_offset` and function name disambiguation)
   in `_inspect_unit_scope` (`scope.py`) so `synthesize_shared_helper_code` (`synthesis.py`) and `generate_refactoring_patch` (`patch.py`)
-  fail closed rather than hoisting undefined local bounds to module scope; validated cached node bounds via `_node_scope_bounds` in
-  `_get_tree_scope_intervals` (`source.py`) against in-place `lineno`/`end_lineno` AST mutations; and stripped CR/LF line endings
-  (`body.lstrip("\r\n")`) in `_validate_helper_compilation` (`patch.py`).
+  fail closed rather than hoisting undefined local/class bounds to module scope; visited nested function parameter and return annotations inside
+  `_ScopeVisitor._process_func` (`scope.py`) when `is_top` is `False`; checked `node.target` bounds for `ast.comprehension` clauses in
+  `_unit_ast_has_async_or_yield` (`binding.py`); validated cached node bounds via `_node_scope_bounds` in `_get_tree_scope_intervals` (`source.py`)
+  against in-place `lineno`/`end_lineno` AST mutations; and stripped CR/LF line endings (`body.lstrip("\r\n")`) in `_validate_helper_compilation` (`patch.py`).
 
 ## [1.0.0] - 2026-09-20
 ### Added
