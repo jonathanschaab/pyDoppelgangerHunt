@@ -2033,14 +2033,14 @@ def _extract_helper_symbols(
                             if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
                         )
                 bound.update(_collect_direct_bindings(stmt.body))
-            elif isinstance(stmt, ast.Try):
-                bound.update(_collect_direct_bindings(stmt.body))
-                for handler in stmt.handlers:
-                    if isinstance(handler.name, str):
+            elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
+                bound.update(_collect_direct_bindings(getattr(stmt, "body", [])))
+                for handler in getattr(stmt, "handlers", []):
+                    if isinstance(getattr(handler, "name", None), str):
                         bound.add(handler.name)
-                    bound.update(_collect_direct_bindings(handler.body))
-                bound.update(_collect_direct_bindings(stmt.orelse))
-                bound.update(_collect_direct_bindings(stmt.finalbody))
+                    bound.update(_collect_direct_bindings(getattr(handler, "body", [])))
+                bound.update(_collect_direct_bindings(getattr(stmt, "orelse", [])))
+                bound.update(_collect_direct_bindings(getattr(stmt, "finalbody", [])))
             elif type(stmt).__name__ == "Match":
                 for case in getattr(stmt, "cases", []):
                     pattern = getattr(case, "pattern", None)
@@ -2069,10 +2069,6 @@ def _extract_helper_symbols(
             record_def: bool = False,
         ) -> Set[str]:
             if record_def:
-                name_str = getattr(node, "name", "")
-                scope_stack[-1].add(name_str)
-                if len(scope_stack) == 1:
-                    defined_names.add(name_str)
                 for d in getattr(node, "decorator_list", []):
                     self.visit(d)
                 fn_args = getattr(node, "args", None)
@@ -2094,6 +2090,11 @@ def _extract_helper_symbols(
             finally:
                 if tp_names:
                     scope_stack.pop()
+            if record_def:
+                name_str = getattr(node, "name", "")
+                scope_stack[-1].add(name_str)
+                if len(scope_stack) == 1:
+                    defined_names.add(name_str)
             return tp_names
 
         def _handle_function_def(

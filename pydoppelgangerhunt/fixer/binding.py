@@ -9,7 +9,12 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.config import normalize_path_string, paths_match_boundary
-from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
+from pydoppelgangerhunt.fixer._df_cache import (
+    _extract_first_unit_coord,
+    _extract_unit_end_col,
+    _get_or_parse_tree,
+)
+from pydoppelgangerhunt.fixer._df_visitors import _is_ast_node_within_unit_bounds
 from pydoppelgangerhunt.fixer.scope import analyze_unit_variable_scope
 from pydoppelgangerhunt.fixer.source import (
     _find_innermost_enclosing_node,
@@ -305,6 +310,8 @@ def _unit_ast_has_async_or_yield(
     u_end: int,
     *,
     is_subroutine: bool = False,
+    u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
 ) -> Tuple[bool, bool]:
     """Detects whether AST statements within unit bounds contain yield or async operations."""
     has_yield = False
@@ -343,7 +350,9 @@ def _unit_ast_has_async_or_yield(
             stack.extend(iter_nested_scope_header_nodes(node))
             continue
 
-        if lineno is not None and u_start <= lineno <= u_end:
+        if _is_ast_node_within_unit_bounds(
+            node, u_start, u_end, u_end_col=u_end_col, u_start_col=u_start_col
+        ):
             if isinstance(node, (ast.Yield, ast.YieldFrom)):
                 has_yield = True
             elif isinstance(node, (ast.Await, ast.AsyncFor, ast.AsyncWith)):
@@ -436,8 +445,17 @@ def _populate_unit_receiver_metadata(
                 if parsed_tree is not None:
                     u_start = parse_unit_coord(unit, "start", default=1)
                     u_end = parse_unit_coord(unit, "end", default=u_start)
+                    u_start_col = _extract_first_unit_coord(
+                        unit, ("start_col", "start_col_offset")
+                    )
+                    u_end_col = _extract_unit_end_col(unit)
                     has_yield, has_await = _unit_ast_has_async_or_yield(
-                        parsed_tree, u_start, u_end, is_subroutine=True
+                        parsed_tree,
+                        u_start,
+                        u_end,
+                        is_subroutine=True,
+                        u_start_col=u_start_col,
+                        u_end_col=u_end_col,
                     )
             unit["is_async"] = (
                 True if has_await else (fn_is_async if has_yield else False)

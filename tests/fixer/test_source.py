@@ -776,6 +776,15 @@ def test_load_unit_file_text_prioritizes_unsliced_source_lines_over_disk(tmp_pat
     loaded = _load_unit_file_text(unit, repo_root=str(tmp_path))
     assert loaded == "x = 100\ny = 200\nz = 300\n"
 
+    empty_unsaved = {
+        "file": str(target_file),
+        "start": 1,
+        "end": 2,
+        "source_lines": [],
+        "source_lines_is_sliced": False,
+    }
+    assert _load_unit_file_text(empty_unsaved, repo_root=str(tmp_path)) == ""
+
 
 def test_slice_unit_token_lines_offset_aliases() -> None:
     """Verifies that _slice_unit_token_lines respects start_col_offset and end_col_offset."""

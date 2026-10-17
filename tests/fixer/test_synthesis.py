@@ -3754,6 +3754,7 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     assert "arr[x] = _shared_sub_plain_sub_slot(y, x)" in swap_patch
 
     from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
+        _populate_unit_receiver_metadata,
         _unit_ast_has_async_or_yield,
     )
     from pydoppelgangerhunt.parser import (  # pylint: disable=import-outside-toplevel
@@ -3777,4 +3778,56 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
         nested_hdr_tree, 2, 4, is_subroutine=True
     ) == (False, True)
 
+    subline_await_src = (
+        "async def send_items(client, items):\n"
+        "    res = await client.send([x * 2 for x in items])\n"
+        "    return res\n"
+    )
+    subline_await_tree = ast.parse(subline_await_src)
+    assert _unit_ast_has_async_or_yield(
+        subline_await_tree,
+        2,
+        2,
+        is_subroutine=True,
+        u_start_col=28,
+        u_end_col=50,
+    ) == (False, False)
+    subline_u = {
+        "kind": "comprehension",
+        "start": 2,
+        "end": 2,
+        "start_col": 28,
+        "end_col": 50,
+        "source_text": subline_await_src,
+    }
+    _populate_unit_receiver_metadata(subline_u, source_text=subline_await_src, tree=subline_await_tree)
+    assert subline_u["is_async"] is False
 
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _extract_helper_symbols,
+    )
+
+    same_name_hdr_tree = ast.parse(
+        "@item\n"
+        "def item(x=item):\n"
+        "    return x\n"
+    )
+    free_syms, def_syms, _ = _extract_helper_symbols(same_name_hdr_tree)
+    assert "item" in free_syms
+    assert "item" in def_syms
+
+    if sys.version_info >= (3, 11):
+        trystar_tree = ast.parse(
+            "def _shared_trystar():\n"
+            "    def reader():\n"
+            "        return (handled_val, err_group)\n"
+            "    try:\n"
+            "        pass\n"
+            "    except* ValueError as err_group:\n"
+            "        handled_val = 1\n"
+            "    return reader\n"
+        )
+        ts_free, ts_defs, _ = _extract_helper_symbols(trystar_tree)
+        assert "handled_val" not in ts_free
+        assert "err_group" not in ts_free
+        assert "handled_val" in ts_defs

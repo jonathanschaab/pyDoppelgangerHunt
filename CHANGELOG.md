@@ -311,11 +311,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_visit_nested_lambda` (`_df_visitors.py`), avoiding false-positive free-variable capture on
   nested lambdas (`lambda x: (lambda: x)`) and closures inside comprehensions
   (`[lambda: x for x in items]`).
-- **`async_function`, `async_method`, Top-Level Async Comprehensions & Nested Sync Scope Isolation**:
+- **`async_function`, `async_method`, Top-Level Async Comprehensions, Sub-Line Async/Yield Column Bounds & Nested Sync Scope Isolation**:
   Included `"async_function"` and `"async_method"` alongside `("function", "closure", "method")` in
   `_extract_unit_body_lines` (`source.py`), `_inspect_unit_scope` (`scope.py`), and
   `_build_unit_delegation_call` (`patch.py`); promoted subroutines with `has_await=True` to
-  `is_async=True` in `_populate_unit_receiver_metadata` (`binding.py`) even at module top-level;
+  `is_async=True` in `_populate_unit_receiver_metadata` (`binding.py`) even at module top-level while
+  constraining `_unit_ast_has_async_or_yield` with sub-line column offsets (`u_start_col`, `u_end_col`
+  via `_is_ast_node_within_unit_bounds`);
   inspected outer-evaluated header expressions (`decorator_list`, `args.defaults`, `args.kw_defaults`,
   `bases`, `keywords` via `iter_nested_scope_header_nodes`) before skipping nested `FunctionDef`,
   `AsyncFunctionDef`, `ClassDef`, and `Lambda` bodies in `_node_is_effectively_async` (`parser.py`),

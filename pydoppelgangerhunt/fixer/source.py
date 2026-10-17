@@ -129,6 +129,8 @@ def _is_sliced_excerpt_for_file(unit: Dict[str, Any], lines: Sequence[str]) -> b
     """
     if unit.get("source_lines_is_sliced") is True:
         return True
+    if not lines:
+        return unit.get("source_lines_is_sliced") is not False
     _, u_end = resolve_unit_line_bounds(unit)
     if len(lines) < u_end:
         return True
@@ -250,7 +252,7 @@ def _load_unit_file_text(
 
     # In-memory full lines take precedence over disk (vital for IDE/LSP unsaved buffers)
     unit_lines = unit.get("source_lines")
-    if unit_lines and isinstance(unit_lines, (list, tuple)):
+    if unit_lines is not None and isinstance(unit_lines, (list, tuple)):
         if not _is_sliced_excerpt_for_file(unit, unit_lines):
             return "".join(
                 ln if ln.endswith(("\n", "\r")) else ln + "\n"
