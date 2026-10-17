@@ -3639,9 +3639,9 @@ def _generate_refactoring_patch_impl(
             f2_disp = normalize_path_string(str(u2.get("file") or "file2"), strip_anchor=False)
             pair_comment = f"# Clone Pair ({sim:.1%}): {f1_disp} <===> {f2_disp}\n"
 
-            candidate_units = [u1]
-            if is_same_file and not check_units_overlap(u1, u2, repo_root=str(root)):
-                candidate_units.append(u2)
+            candidate_units = [u1_eff]
+            if is_same_file and not check_units_overlap(u1_eff, u2_eff, repo_root=str(root)):
+                candidate_units.append(u2_eff)
 
             earliest_unit = min(candidate_units, key=_unit_start)
             enc_fn_earliest = (
