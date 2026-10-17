@@ -5,16 +5,45 @@ from __future__ import annotations
 import ast
 import builtins
 import logging
-import sys
+import re
 import textwrap
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
+from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
+from pydoppelgangerhunt.fixer._df_closures import _extract_single_node_local_names
+from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
+from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor
 from pydoppelgangerhunt.reporters import extract_unit_source_code
-from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines, split_source_lines
+from pydoppelgangerhunt.fixer.source import (
+    _SUBROUTINE_KINDS,
+    _WHOLE_UNIT_KINDS,
+    _get_tree_scope_intervals,
+    _load_unit_file_text,
+    _slice_unit_token_lines,
+    dedent_source_text,
+    find_enclosing_function_is_async,
+    is_subroutine_unit,
+    parse_unit_coord,
+    resolve_unit_declared_outputs,
+    split_source_lines,
+)
 
 logger = logging.getLogger(__name__)
 
 BUILTIN_NAMES: Set[str] = set(dir(builtins))
+
+
+_SYNTHETIC_WRAPPER_NAME: str = "__pdh_wrapper__"
 
 
 def _is_mangled_name(name: str) -> bool:
@@ -70,9 +99,33 @@ def _extract_arg_names(args: ast.arguments) -> Set[str]:
     return arg_set
 
 
+def _extract_type_param_names(node: ast.AST) -> Set[str]:
+    """Extracts PEP 695 type parameter names from an AST node."""
+    return {
+        tp.name
+        for tp in getattr(node, "type_params", [])
+        if isinstance(getattr(tp, "name", None), str)
+    }
+
+
+def _block_contains_yield(node: ast.AST) -> bool:
+    """Returns True if the node contains a Yield or YieldFrom at the current scope level."""
+    stack = [node]
+    while stack:
+        curr = stack.pop()
+        for child in ast.iter_child_nodes(curr):
+            if isinstance(child, (ast.Yield, ast.YieldFrom)):
+                return True
+            if not isinstance(
+                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+            ):
+                stack.append(child)
+    return False
+
+
 class _ScopeVisitor(ast.NodeVisitor):
 
-    """Inspects AST loads, stores, function parameters, returns, nonlocals, globals, and attributes."""
+    """Inspects AST loads, stores, parameters, returns, nonlocals, globals, and attrs."""
 
     def __init__(
         self,
@@ -94,13 +147,21 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.attrs_written: List[str] = []
         self.except_vars: Set[str] = set()
         self.deleted_names: Set[str] = set()
+        self.type_aliases: Set[str] = set()
+        self.type_params: List[str] = []
+        self.type_param_free_vars: List[str] = []
         self._scope_stack: List[Set[str]] = []
+        self._type_param_scopes: List[Set[str]] = []
         self._comprehension_depth: int = 0
         self.class_depth: int = 0
         self.loop_offset: int = loop_offset
         self.loop_depth: int = 0
         self.has_return: bool = False
+        self.has_return_value: bool = False
         self.has_yield: bool = False
+        self.has_yield_assignment: bool = False
+        self.has_try_or_with: bool = False
+        self._ancestors: List[ast.AST] = []
         self.has_super: bool = False
         self.has_mangled_names: bool = False
         self.naked_breaks: int = 0
@@ -117,6 +178,13 @@ class _ScopeVisitor(ast.NodeVisitor):
             if receiver_names is not None
             else ("self", "cls")
         )
+
+    def visit(self, node: ast.AST) -> Any:
+        self._ancestors.append(node)
+        try:
+            return super().visit(node)
+        finally:
+            self._ancestors.pop()
 
     def _record_arg(
         self,
@@ -195,6 +263,26 @@ class _ScopeVisitor(ast.NodeVisitor):
             self.stores.append(name)
 
     def _process_func(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
+        if (
+            self.is_subroutine
+            and len(self._scope_stack) == 0
+            and node.name == _SYNTHETIC_WRAPPER_NAME
+        ):
+            body = node.body
+            if (
+                self.loop_offset > 0
+                and len(body) == 1
+                and isinstance(body[0], (ast.For, ast.AsyncFor, ast.While))
+            ):
+                body = body[0].body
+                self.loop_offset = 0
+            if isinstance(node, ast.AsyncFunctionDef):
+                self.is_async = True
+            for stmt in body:
+                self.visit(stmt)
+            return
+
+        tp_names = _extract_type_param_names(node)
         is_top = (
             len(self._scope_stack) == 0
             and not self.is_subroutine
@@ -203,8 +291,21 @@ class _ScopeVisitor(ast.NodeVisitor):
         created_outer = False
         if is_top:
             self._has_processed_top_func = True
+            for tp in getattr(node, "type_params", []):
+                try:
+                    self.type_params.append(ast.unparse(tp))
+                except Exception as exc:
+                    logger.debug("Failed to unparse type_param %r: %s", tp, exc)
+                tp_visitor = _OuterExprVisitor()
+                tp_visitor.visit(tp)
+                for name in tp_visitor.ordered_names:
+                    if (
+                        name not in tp_names
+                        and name not in BUILTIN_NAMES
+                        and name not in self.type_param_free_vars
+                    ):
+                        self.type_param_free_vars.append(name)
             self._process_args(node)
-            self._scope_stack.append(set(self.params))
         else:
             for dec in node.decorator_list:
                 self.visit(dec)
@@ -213,17 +314,41 @@ class _ScopeVisitor(ast.NodeVisitor):
             for kw_default in node.args.kw_defaults:
                 if kw_default is not None:
                     self.visit(kw_default)
-            self._record_store_name(node.name)
-            if not self._scope_stack:
-                self._scope_stack.append(set())
-                created_outer = True
-            self._scope_stack.append(self._extract_arg_names(node.args))
 
-        for stmt in node.body:
-            self.visit(stmt)
-        self._scope_stack.pop()
-        if created_outer:
-            self._scope_stack.pop()
+        if tp_names:
+            self._type_param_scopes.append(tp_names)
+        try:
+            if is_top:
+                self._scope_stack.append(set(self.params) | tp_names)
+            else:
+                for tp in getattr(node, "type_params", []):
+                    self.visit(tp)
+                for arg in (
+                    list(getattr(node.args, "posonlyargs", []))
+                    + list(node.args.args)
+                    + list(node.args.kwonlyargs)
+                    + ([node.args.vararg] if node.args.vararg else [])
+                    + ([node.args.kwarg] if node.args.kwarg else [])
+                ):
+                    if arg.annotation is not None:
+                        self.visit(arg.annotation)
+                if node.returns is not None:
+                    self.visit(node.returns)
+                self._record_store_name(node.name)
+                if not self._scope_stack:
+                    self._scope_stack.append(set())
+                    created_outer = True
+                self._scope_stack.append(self._extract_arg_names(node.args) | tp_names)
+            try:
+                for stmt in node.body:
+                    self.visit(stmt)
+            finally:
+                self._scope_stack.pop()
+                if created_outer:
+                    self._scope_stack.pop()
+        finally:
+            if tp_names:
+                self._type_param_scopes.pop()
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         for default in node.args.defaults:
@@ -258,22 +383,62 @@ class _ScopeVisitor(ast.NodeVisitor):
         self._record_store_name(node.name)
         for dec in node.decorator_list:
             self.visit(dec)
-        for base in node.bases:
-            self.visit(base)
-        for keyword in node.keywords:
-            self.visit(keyword)
-        created_outer = False
-        if not self._scope_stack:
-            self._scope_stack.append(set())
-            created_outer = True
-        self._scope_stack.append(set())
-        self.class_depth += 1
-        for stmt in node.body:
-            self.visit(stmt)
-        self.class_depth -= 1
-        self._scope_stack.pop()
-        if created_outer:
-            self._scope_stack.pop()
+        tp_names = _extract_type_param_names(node)
+        if tp_names:
+            self._type_param_scopes.append(tp_names)
+        try:
+            for tp in getattr(node, "type_params", []):
+                self.visit(tp)
+            for base in node.bases:
+                self.visit(base)
+            for keyword in node.keywords:
+                self.visit(keyword)
+            created_outer = False
+            if not self._scope_stack:
+                self._scope_stack.append(set())
+                created_outer = True
+            self._scope_stack.append(set(tp_names))
+            self.class_depth += 1
+            try:
+                for stmt in node.body:
+                    self.visit(stmt)
+            finally:
+                self.class_depth -= 1
+                self._scope_stack.pop()
+                if created_outer:
+                    self._scope_stack.pop()
+        finally:
+            if tp_names:
+                self._type_param_scopes.pop()
+
+    def visit_TypeAlias(self, node: ast.AST) -> None:  # pragma: no cover (py312+)
+        name_node = getattr(node, "name", None)
+        alias_name = (
+            name_node.id
+            if isinstance(name_node, ast.Name)
+            else (name_node if isinstance(name_node, str) else None)
+        )
+        if isinstance(alias_name, str):
+            is_nested = (
+                len(self._scope_stack) > 0
+                if self.is_subroutine
+                else len(self._scope_stack) > 1
+            )
+            if not is_nested:
+                self.type_aliases.add(alias_name)
+            self._record_store_name(alias_name)
+        tp_names = _extract_type_param_names(node)
+        if tp_names:
+            self._type_param_scopes.append(tp_names)
+        try:
+            for tp in getattr(node, "type_params", []):
+                self.visit(tp)
+            val_node = getattr(node, "value", None)
+            if isinstance(val_node, ast.AST):
+                self.visit(val_node)
+        finally:
+            if tp_names:
+                self._type_param_scopes.pop()
 
     def visit_Call(self, node: ast.Call) -> None:
         if self.class_depth == 0:
@@ -310,7 +475,9 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _record_load_name(self, name: str) -> None:
-        is_inner = any(name in s for s in self._scope_stack[1:])
+        is_inner = any(name in s for s in self._scope_stack[1:]) or any(
+            name in s for s in self._type_param_scopes
+        )
         if not is_inner and name not in BUILTIN_NAMES:
             if name not in self.loads:
                 self.loads.append(name)
@@ -420,25 +587,30 @@ class _ScopeVisitor(ast.NodeVisitor):
             created_outer = True
         inner_vars: Set[str] = set()
         self._scope_stack.append(inner_vars)
-        if any(getattr(g, "is_async", False) for g in node.generators):
-            if len(self._scope_stack) <= 2:
-                self.is_async = True
-        for gen in node.generators:
-            self.visit(gen.iter)
-            for n in ast.walk(gen.target):
-                if isinstance(n, ast.Name):
-                    inner_vars.add(n.id)
-            for if_expr in gen.ifs:
-                self.visit(if_expr)
-        if isinstance(node, ast.DictComp):
-            self.visit(node.key)
-            self.visit(node.value)
-        else:
-            self.visit(node.elt)
-        self._scope_stack.pop()
-        if created_outer:
+        if (
+            any(getattr(g, "is_async", False) for g in node.generators)
+            and (len(self._scope_stack) - self._comprehension_depth) <= 1
+        ):
+            self.is_async = True
+        try:
+            for gen in node.generators:
+                self.visit(gen.iter)
+                for n in ast.walk(gen.target):
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                        inner_vars.add(n.id)
+                self.visit(gen.target)
+                for if_expr in gen.ifs:
+                    self.visit(if_expr)
+            if isinstance(node, ast.DictComp):
+                self.visit(node.key)
+                self.visit(node.value)
+            else:
+                self.visit(node.elt)
+        finally:
             self._scope_stack.pop()
-        self._comprehension_depth -= 1
+            if created_outer:
+                self._scope_stack.pop()
+            self._comprehension_depth -= 1
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
         self._visit_comprehension(node)
@@ -485,9 +657,26 @@ class _ScopeVisitor(ast.NodeVisitor):
             self.is_async = True
         self._visit_loop(node)
 
+    def visit_With(self, node: ast.With) -> None:
+        if len(self._scope_stack) <= 1 and _block_contains_yield(node):
+            self.has_try_or_with = True
+        self.generic_visit(node)
+
     def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
         if len(self._scope_stack) <= 1:
             self.is_async = True
+            if _block_contains_yield(node):
+                self.has_try_or_with = True
+        self.generic_visit(node)
+
+    def visit_Try(self, node: ast.Try) -> None:
+        if len(self._scope_stack) <= 1 and _block_contains_yield(node):
+            self.has_try_or_with = True
+        self.generic_visit(node)
+
+    def visit_TryStar(self, node: ast.AST) -> None:
+        if len(self._scope_stack) <= 1 and _block_contains_yield(node):
+            self.has_try_or_with = True
         self.generic_visit(node)
 
     def visit_While(self, node: ast.While) -> None:
@@ -532,18 +721,28 @@ class _ScopeVisitor(ast.NodeVisitor):
                         ):
                             self.yield_expr_names.append((kind, f":literal:{t_name}"))
 
+    def _inspect_yield_assignment(self) -> None:
+        if len(self._scope_stack) <= 1 and len(self._ancestors) >= 2:
+            immediate_parent = self._ancestors[-2]
+            if not isinstance(immediate_parent, ast.Expr):
+                self.has_yield_assignment = True
+
     def visit_Yield(self, node: ast.Yield) -> None:
         self._record_yield_expr("yield", node)
+        if len(self._scope_stack) <= 1:
+            self._inspect_yield_assignment()
         self.generic_visit(node)
 
     def visit_YieldFrom(self, node: ast.YieldFrom) -> None:
         self._record_yield_expr("yield_from", node)
         self.generic_visit(node)
 
+
     def visit_Return(self, node: ast.Return) -> None:
         if len(self._scope_stack) <= 1:
             self.has_return = True
             if node.value is not None:
+                self.has_return_value = True
                 if isinstance(node.value, ast.Name):
                     if node.value.id not in self.returns:
                         self.returns.append(node.value.id)
@@ -688,12 +887,10 @@ def _is_irrefutable_pattern(pattern: Optional[ast.AST]) -> bool:  # pragma: no c
     """Recursively determines if a pattern matching AST node unconditionally matches any subject."""
     if pattern is None:
         return True
-    match_as = getattr(ast, "MatchAs", ())
-    if isinstance(pattern, match_as):
+    if type(pattern).__name__ == "MatchAs":
         sub_pat = getattr(pattern, "pattern", None)
         return sub_pat is None or _is_irrefutable_pattern(sub_pat)
-    match_or = getattr(ast, "MatchOr", ())
-    if isinstance(pattern, match_or):
+    if type(pattern).__name__ == "MatchOr":
         patterns = getattr(pattern, "patterns", [])
         return any(_is_irrefutable_pattern(p) for p in patterns)
     return False
@@ -723,12 +920,12 @@ def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
         elif isinstance(stmt, (ast.With, ast.AsyncWith)):
             if _block_terminates(stmt.body):
                 return True
-        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
+        elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
             cases = getattr(stmt, "cases", [])
             has_irrefutable = any(_is_irrefutable_case(c) for c in cases)
             if has_irrefutable and cases and all(_block_terminates(c.body) for c in cases):
                 return True
-        elif isinstance(stmt, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+        elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
             f_body = getattr(stmt, "finalbody", [])
             if f_body and _block_terminates(f_body):
                 return True
@@ -759,7 +956,7 @@ def _extract_deleted_names(statements: Sequence[ast.AST]) -> Set[str]:
             continue
         elif isinstance(stmt, ast.ExceptHandler):
             deleted.update(_extract_deleted_names(stmt.body))
-        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
+        elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
             for case in getattr(stmt, "cases", []):
                 deleted.update(_extract_deleted_names(getattr(case, "body", [])))
         else:
@@ -914,7 +1111,7 @@ def _analyze_block_assignment(
                         if isinstance(p_node, ast.Name) and isinstance(p_node.ctx, ast.Store):
                             definite.add(p_node.id)
             _analyze_block_assignment(stmt.body, definite, conditional)
-        elif isinstance(stmt, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+        elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
             t_body = list(getattr(stmt, "body", []))
             t_def, t_cond = _analyze_block_assignment(t_body)
             t_term = _block_terminates(t_body)
@@ -995,7 +1192,7 @@ def _analyze_block_assignment(
             f_body = list(getattr(stmt, "finalbody", []))
             if f_body:
                 _analyze_block_assignment(f_body, definite, conditional)
-        elif hasattr(ast, "Match") and isinstance(stmt, getattr(ast, "Match")):  # pragma: no cover (py310+)
+        elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
             d_sub, c_sub = _walrus_assignment_in_expr(getattr(stmt, "subject", None))
             definite.update(d_sub)
             conditional.update(c_sub)
@@ -1054,6 +1251,10 @@ def _analyze_block_assignment(
             _demote_deletions_to_conditional(case_dels - all_del, definite, conditional)
         elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             definite.add(stmt.name)
+        elif type(stmt).__name__ == "TypeAlias":  # pragma: no cover (py312+)
+            name_node = getattr(stmt, "name", None)
+            if isinstance(name_node, ast.Name):
+                definite.add(name_node.id)
         elif isinstance(stmt, ast.Import):
             for alias in stmt.names:
                 bound_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
@@ -1141,10 +1342,20 @@ def _rank_param_kind(
 def _inspect_unit_scope(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
+    file_tree: Optional[ast.AST] = None,
 ) -> Dict[str, Any]:
-    """Extracts lexical and AST scope metadata for a single unit."""
-    raw_lines = _slice_unit_token_lines(unit, extract_unit_source_code(unit, repo_root=repo_root))
-    dedented = textwrap.dedent("".join(raw_lines))
+    cached_full_source: List[Optional[str]] = [None]
+    full_source_loaded: List[bool] = [False]
+
+    def _get_full_source() -> Optional[str]:
+        if not full_source_loaded[0]:
+            cached_full_source[0] = _load_unit_file_text(unit, repo_root=repo_root)
+            full_source_loaded[0] = True
+        return cached_full_source[0]
+
+    unit_code_lines = extract_unit_source_code(unit, repo_root=repo_root)
+    raw_lines = _slice_unit_token_lines(unit, unit_code_lines)
+    dedented = dedent_source_text("".join(raw_lines))
     empty_res: Dict[str, Any] = {
         "inputs": [],
         "outputs": [],
@@ -1159,7 +1370,10 @@ def _inspect_unit_scope(
         "control_flow_hazards": [],
         "is_control_flow_safe": True,
         "has_yield": False,
+        "has_yield_assignment": False,
+        "has_try_or_with": False,
         "has_return": False,
+        "has_return_value": False,
         "has_super": False,
         "has_mangled_names": False,
         "local_imports": [],
@@ -1173,6 +1387,10 @@ def _inspect_unit_scope(
         "has_receiver_access": False,
         "instance_attrs": [],
         "class_attrs": [],
+        "outputs_ambiguous": False,
+        "type_params": [],
+        "type_param_free_vars": [],
+        "has_class_scoped_type_params": False,
     }
     if not dedented.strip():
         return empty_res
@@ -1183,10 +1401,19 @@ def _inspect_unit_scope(
 
     parse_candidates = [
         (dedented, 0),
-        (f"async def _wrapper():\n{textwrap.indent(dedented, '    ')}", 0),
-        (f"def _wrapper():\n{textwrap.indent(dedented, '    ')}", 0),
-        (f"async def _wrapper():\n    for _ in (0,):\n{textwrap.indent(dedented, '        ')}", 1),
-        (f"def _wrapper():\n    for _ in (0,):\n{textwrap.indent(dedented, '        ')}", 1),
+        (f"if 1:\n{dedented}", 0),
+        (f"def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
+        (f"async def {_SYNTHETIC_WRAPPER_NAME}():\n{textwrap.indent(dedented, '    ')}", 0),
+        (
+            f"def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
+            f"{textwrap.indent(dedented, '        ')}",
+            1,
+        ),
+        (
+            f"async def {_SYNTHETIC_WRAPPER_NAME}():\n    for _ in (0,):\n"
+            f"{textwrap.indent(dedented, '        ')}",
+            1,
+        ),
     ]
 
     for cand_text, offset in parse_candidates:
@@ -1201,6 +1428,20 @@ def _inspect_unit_scope(
                         candidate_stmts = tree.body[0].body
                     else:
                         candidate_stmts = tree.body
+            elif cand_text.startswith("if 1:\n"):
+                if (
+                    isinstance(tree, ast.Module)
+                    and len(tree.body) == 1
+                    and isinstance(tree.body[0], ast.If)
+                ):
+                    inner_body = tree.body[0].body
+                    tree = ast.Module(body=inner_body, type_ignores=[])
+                    if len(inner_body) == 1 and isinstance(
+                        inner_body[0], (ast.FunctionDef, ast.AsyncFunctionDef)
+                    ):
+                        candidate_stmts = inner_body[0].body
+                    else:
+                        candidate_stmts = inner_body
             elif offset == 1:
                 wrapper_fn = tree.body[0]  # type: ignore[attr-defined]
                 if isinstance(wrapper_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1218,11 +1459,16 @@ def _inspect_unit_scope(
     if tree is None:
         return empty_res
 
-    unit_name = str(unit.get("name") or "")
-    unit_kind = str(unit.get("kind") or "")
-    is_subroutine = unit_kind in ("compound_block", "sliding_window", "clause_branch") or (
-        unit_kind not in ("function", "closure", "method", "comprehension", "complex_expr") and ":" in unit_name
-    )
+    if "is_subroutine" in unit and unit.get("is_subroutine") is not None:
+        is_subroutine = bool(unit["is_subroutine"])
+    elif str(unit.get("kind") or "") in _SUBROUTINE_KINDS:
+        is_subroutine = True
+    elif str(unit.get("kind") or "") in _WHOLE_UNIT_KINDS:
+        is_subroutine = False
+    else:
+        is_subroutine = is_subroutine_unit(
+            unit, source_text=_get_full_source(), tree=file_tree
+        )
 
     rec_param = unit.get("receiver_param")
     rec_kind = unit.get("receiver_kind")
@@ -1239,13 +1485,10 @@ def _inspect_unit_scope(
     all_receivers = inst_receivers | class_receivers
 
     cand_lines = split_source_lines(cand_text)
-    is_sub = is_subroutine or (
-        cand_text == dedented and isinstance(tree, ast.Module) and len(tree.body) > 1
-    )
     visitor = _ScopeVisitor(
         loop_offset=loop_offset,
         source_lines=cand_lines,
-        is_subroutine=is_sub,
+        is_subroutine=is_subroutine,
         receiver_names=tuple(all_receivers),
     )
     visitor.visit(tree)
@@ -1260,8 +1503,117 @@ def _inspect_unit_scope(
     if is_subroutine and visitor.has_return:
         hazards.append("embedded_return")
 
+    has_class_scoped_type_params = False
+    if visitor.type_param_free_vars and not is_subroutine:
+        s_line = parse_unit_coord(unit, "start", default=1)
+        e_line = parse_unit_coord(unit, "end", default=s_line)
+        u_col = parse_unit_coord(unit, "start_col", default=None)
+        if u_col is None:
+            u_col = parse_unit_coord(unit, "col_offset", default=None)
+        top_fn_name = (
+            getattr(tree.body[0], "name", None)
+            if isinstance(tree, ast.Module)
+            and len(tree.body) == 1
+            and isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))
+            else None
+        )
+        parsed_tree = file_tree
+        if parsed_tree is None:
+            full_src = _get_full_source()
+            if full_src:
+                parsed_tree = _get_or_parse_tree(full_src)
+        enclosing_fn_locals: Set[str] = set()
+        enclosing_cls_locals: Set[str] = set()
+        has_enclosing_fn = False
+        has_enclosing_cls = False
+        prev_enclosed_cls_name: Optional[str] = None
+        if parsed_tree is not None:
+            matched_self = False
+            for earliest_start, n_end, _span, scope_node in _get_tree_scope_intervals(
+                parsed_tree
+            ):
+                if earliest_start > s_line or e_line > n_end:
+                    continue
+                if isinstance(scope_node, ast.ClassDef):
+                    if not has_enclosing_cls:
+                        has_enclosing_cls = True
+                        prev_enclosed_cls_name = getattr(scope_node, "name", None)
+                        enclosing_cls_locals.update(
+                            _extract_single_node_local_names(scope_node)
+                        )
+                    else:
+                        if isinstance(prev_enclosed_cls_name, str):
+                            enclosing_cls_locals.add(prev_enclosed_cls_name)
+                        prev_enclosed_cls_name = getattr(scope_node, "name", None)
+                        enclosing_cls_locals.update(
+                            _extract_type_param_names(scope_node)
+                        )
+                elif isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if (
+                        not matched_self
+                        and s_line
+                        in (
+                            earliest_start,
+                            getattr(scope_node, "lineno", earliest_start),
+                        )
+                        and (
+                            e_line == n_end
+                            or top_fn_name is not None
+                            or u_col is not None
+                        )
+                        and (
+                            u_col is None
+                            or getattr(scope_node, "col_offset", 0) == u_col
+                        )
+                        and (
+                            top_fn_name is None
+                            or getattr(scope_node, "name", None) == top_fn_name
+                        )
+                    ):
+                        matched_self = True
+                        continue
+                    if (
+                        earliest_start < s_line
+                        or n_end > e_line
+                        or (u_col is None and matched_self)
+                        or (
+                            u_col is not None
+                            and getattr(scope_node, "col_offset", 0) < u_col
+                        )
+                    ):
+                        has_enclosing_fn = True
+                        enclosing_fn_locals.update(
+                            _extract_single_node_local_names(scope_node)
+                        )
+        if has_enclosing_fn and any(
+            fv in enclosing_fn_locals for fv in visitor.type_param_free_vars
+        ):
+            hazards.append("type_param_closure_capture")
+        elif (
+            not has_enclosing_fn
+            and not has_enclosing_cls
+            and unit.get("kind") == "closure"
+        ):
+            hazards.append("type_param_closure_capture")
+        if has_enclosing_cls and any(
+            fv in enclosing_cls_locals for fv in visitor.type_param_free_vars
+        ):
+            has_class_scoped_type_params = True
+            if (
+                has_enclosing_fn
+                or unit.get("kind") == "closure"
+            ) and "type_param_closure_capture" not in hazards:
+                hazards.append("type_param_closure_capture")
+
     is_control_flow_safe = not any(
-        h in ("naked_break", "naked_continue", "embedded_return") for h in hazards
+        h
+        in (
+            "naked_break",
+            "naked_continue",
+            "embedded_return",
+            "type_param_closure_capture",
+        )
+        for h in hazards
     )
 
     free_vars = [
@@ -1311,17 +1663,59 @@ def _inspect_unit_scope(
 
     # Unit outputs: explicit returns if present; for subroutines without explicit
     # returns, all local variable stores act as unit outputs to preserve caller mutations.
-    if visitor.returns:
+    pre_outs = resolve_unit_declared_outputs(unit)
+
+    outputs_ambiguous = False
+    alias_cands = visitor.type_aliases & (set(visitor.stores) | set(visitor.nonlocals))
+    downstream_aliases: Set[str] = set()
+    if is_subroutine and alias_cands:
+        full_src = _get_full_source()
+        if full_src:
+            ds_reads = collect_downstream_read_names(
+                full_src,
+                unit,
+                candidates=alias_cands,
+                tree=file_tree,
+                unit_inputs=set(inputs),
+            )
+            downstream_aliases = (
+                set(alias_cands) if ds_reads is None else ds_reads
+            )
+        else:
+            downstream_aliases = set(alias_cands)
+    excluded_local_defs = (visitor.type_aliases - downstream_aliases) | set(
+        visitor.imported_names
+    )
+
+    if is_subroutine and isinstance(pre_outs, (list, tuple)):
+        outputs = list(dict.fromkeys(pre_outs))
+    elif is_subroutine and isinstance(pre_outs, (set, frozenset)):
+        if len(pre_outs) > 1:
+            logger.debug(
+                "Rejecting set-valued outputs (%s): unordered set cannot establish "
+                "positional order",
+                pre_outs,
+            )
+            outputs = []
+            outputs_ambiguous = True
+        else:
+            outputs = list(pre_outs)
+    elif visitor.returns:
         outputs = list(visitor.returns)
     elif is_subroutine:
-        outputs = [
-            v for v in visitor.stores
-            if v not in visitor.globals
-            and v not in BUILTIN_NAMES
-            and v not in visitor.except_vars
-            and v not in visitor.deleted_names
-            and v not in visitor.imported_names
-        ]
+        seen: Set[str] = set()
+        outputs = []
+        for v in visitor.stores:
+            if (
+                v not in visitor.globals
+                and v not in BUILTIN_NAMES
+                and v not in visitor.except_vars
+                and v not in visitor.deleted_names
+                and v not in excluded_local_defs
+                and v not in seen
+            ):
+                seen.add(v)
+                outputs.append(v)
     else:
         outputs = []
 
@@ -1331,7 +1725,7 @@ def _inspect_unit_scope(
             and nl not in outputs
             and nl not in visitor.except_vars
             and nl not in visitor.deleted_names
-            and nl not in visitor.imported_names
+            and nl not in excluded_local_defs
         ):
             outputs.append(nl)
 
@@ -1352,6 +1746,44 @@ def _inspect_unit_scope(
         )
     )
 
+    is_sub_or_inner = is_subroutine or unit.get("kind") in (
+        "comprehension",
+        "complex_expr",
+        "class",
+        "data_table",
+    )
+    unit_is_async = unit.get("is_async")
+    if unit_is_async is None:
+        if is_sub_or_inner and not visitor.has_yield:
+            unit_is_async = visitor.is_async
+        else:
+            s_line = parse_unit_coord(unit, "start", default=1)
+            e_line = parse_unit_coord(unit, "end", default=s_line)
+            full_src = _get_full_source()
+            if full_src:
+                unit_is_async = find_enclosing_function_is_async(
+                    full_src, s_line, e_line, tree=file_tree
+                )
+            else:
+                unit_is_async = None
+
+    effective_is_async: Optional[bool]
+    if visitor.is_async or unit.get("kind") in ("async_function", "async_method"):
+        effective_is_async = True
+    elif "is_async" in unit and unit.get("is_async") is not None:
+        effective_is_async = bool(unit.get("is_async"))
+    elif visitor.has_yield:
+        effective_is_async = bool(unit_is_async) if unit_is_async is not None else None
+    elif not is_sub_or_inner and unit.get("kind") not in (
+        "function",
+        "method",
+        "async_function",
+        "async_method",
+    ):
+        effective_is_async = bool(unit_is_async)
+    else:
+        effective_is_async = False
+
     return {
         "inputs": inputs,
         "outputs": outputs,
@@ -1366,12 +1798,15 @@ def _inspect_unit_scope(
         "control_flow_hazards": hazards,
         "is_control_flow_safe": is_control_flow_safe,
         "has_yield": visitor.has_yield,
+        "has_yield_assignment": visitor.has_yield_assignment,
+        "has_try_or_with": visitor.has_try_or_with,
         "has_return": visitor.has_return,
+        "has_return_value": visitor.has_return_value,
         "has_super": visitor.has_super,
         "has_mangled_names": visitor.has_mangled_names,
         "local_imports": visitor.local_imports,
         "yield_expr_names": visitor.yield_expr_names,
-        "is_async": visitor.is_async,
+        "is_async": effective_is_async,
         "conditional_outputs": conditional_outputs,
         "definite_stores": sorted(def_assigned),
         "has_instance_binding": has_instance_binding,
@@ -1386,29 +1821,89 @@ def _inspect_unit_scope(
             a for a in visitor.attrs_read + visitor.attrs_written
             if any(a.startswith(f"{r}.") for r in class_receivers)
         ],
+        "outputs_ambiguous": outputs_ambiguous,
+        "type_params": list(visitor.type_params),
+        "type_param_free_vars": list(visitor.type_param_free_vars),
+        "has_class_scoped_type_params": has_class_scoped_type_params,
     }
 
+
+
+def inspect_single_unit_scope(
+    unit: Dict[str, Any],
+    repo_root: Optional[str] = None,
+    tree: Optional[ast.AST] = None,
+) -> Dict[str, Any]:
+    """Analyzes AST variable scoping for an individual code unit."""
+    return _inspect_unit_scope(unit, repo_root=repo_root, file_tree=tree)
+
+
+def _align_symmetric_var_list(list1: List[str], list2: List[str]) -> List[str]:
+    """Aligns shared variables between two units, preserving side 1 order if equal length."""
+    common = [var for var in list1 if var in list2]
+    if len(list1) == len(list2):
+        return common if len(common) == len(list1) else list1
+    return common if common else list1
+
+
+def _has_type_param_default(tp_str: str) -> bool:
+    """Checks whether a PEP 695/696 type parameter string has a top-level default."""
+    cleaned = re.sub(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"", '""', tp_str)
+    depth = 0
+    for ch in cleaned:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif ch == "=" and depth == 0:
+            return True
+    return False
+
+
+def _merge_type_params(tp1: Sequence[str], tp2: Sequence[str]) -> List[str]:
+    """Merges PEP 695 type parameters across two units without duplicate parameter names."""
+    if not tp2:
+        return list(tp1)
+    if not tp1:
+        return list(tp2)
+    seen: Dict[str, str] = {}
+    order: List[str] = []
+    for raw_tp in list(tp1) + list(tp2):
+        head = raw_tp.split(":", 1)[0].split("=", 1)[0].strip()
+        ident = head.lstrip("*").strip()
+        if not ident:
+            continue
+        if ident not in seen:
+            seen[ident] = raw_tp
+            order.append(ident)
+        elif seen[ident] != raw_tp:
+            prev_head = seen[ident].split(":", 1)[0].split("=", 1)[0].strip()
+            seen[ident] = head if prev_head == head else ident
+    merged = [seen[ident] for ident in order]
+    return [tp for tp in merged if not _has_type_param_default(tp)] + [
+        tp for tp in merged if _has_type_param_default(tp)
+    ]
 
 
 def analyze_unit_variable_scope(
     u1: Dict[str, Any],
     u2: Optional[Dict[str, Any]] = None,
     repo_root: Optional[str] = None,
+    tree1: Optional[ast.AST] = None,
+    tree2: Optional[ast.AST] = None,
+    scope1: Optional[Dict[str, Any]] = None,
+    scope2: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
-    info1 = _inspect_unit_scope(u1, repo_root=repo_root)
+    info1 = scope1 if scope1 is not None else inspect_single_unit_scope(
+        u1, repo_root=repo_root, tree=tree1
+    )
     if u2 is not None:
-        info2 = _inspect_unit_scope(u2, repo_root=repo_root)
-        common_inputs = [var for var in info1["inputs"] if var in info2["inputs"]]
-        if len(info1["inputs"]) == len(info2["inputs"]):
-            inputs = common_inputs if len(common_inputs) == len(info1["inputs"]) else info1["inputs"]
-        else:
-            inputs = common_inputs if common_inputs else info1["inputs"]
-        common_outputs = [var for var in info1["outputs"] if var in info2["outputs"]]
-        if len(info1["outputs"]) == len(info2["outputs"]):
-            outputs = common_outputs if len(common_outputs) == len(info1["outputs"]) else info1["outputs"]
-        else:
-            outputs = common_outputs if common_outputs else info1["outputs"]
+        info2 = scope2 if scope2 is not None else inspect_single_unit_scope(
+            u2, repo_root=repo_root, tree=tree2
+        )
+        inputs = _align_symmetric_var_list(info1["inputs"], info2["inputs"])
+        outputs = _align_symmetric_var_list(info1["outputs"], info2["outputs"])
         free_vars = list(dict.fromkeys(info1["free_vars"] + info2["free_vars"]))
         nonlocals = list(dict.fromkeys(info1["nonlocals"] + info2["nonlocals"]))
         globals_ = list(dict.fromkeys(info1["globals"] + info2["globals"]))
@@ -1425,9 +1920,20 @@ def analyze_unit_variable_scope(
         hazards = list(dict.fromkeys(info1["control_flow_hazards"] + info2["control_flow_hazards"]))
         is_safe = info1["is_control_flow_safe"] and info2["is_control_flow_safe"]
         has_yield = info1["has_yield"] or info2["has_yield"]
+        has_yield_assignment = bool(
+            info1.get("has_yield_assignment", False)
+            or info2.get("has_yield_assignment", False)
+        )
+        has_try_or_with = bool(
+            info1.get("has_try_or_with", False)
+            or info2.get("has_try_or_with", False)
+        )
         has_return = info1["has_return"] or info2["has_return"]
+        has_return_value = bool(info1.get("has_return_value") or info2.get("has_return_value"))
         has_super = bool(info1.get("has_super", False) or info2.get("has_super", False))
-        has_mangled = bool(info1.get("has_mangled_names", False) or info2.get("has_mangled_names", False))
+        has_mangled = bool(
+            info1.get("has_mangled_names", False) or info2.get("has_mangled_names", False)
+        )
         local_imports = list(dict.fromkeys(info1["local_imports"] + info2["local_imports"]))
         local_imports_by_unit = [info1["local_imports"], info2["local_imports"]]
         yield_expr_names = info1["yield_expr_names"] + info2["yield_expr_names"]
@@ -1437,6 +1943,12 @@ def analyze_unit_variable_scope(
         ))
         definite_stores = sorted(
             set(info1.get("definite_stores", [])) & set(info2.get("definite_stores", []))
+        )
+        outputs_ambiguous = bool(
+            info1.get("outputs_ambiguous", False) or info2.get("outputs_ambiguous", False)
+        )
+        type_params = _merge_type_params(
+            info1.get("type_params", []), info2.get("type_params", [])
         )
     else:
         inputs = info1["inputs"]
@@ -1450,7 +1962,10 @@ def analyze_unit_variable_scope(
         hazards = info1["control_flow_hazards"]
         is_safe = info1["is_control_flow_safe"]
         has_yield = info1["has_yield"]
+        has_yield_assignment = bool(info1.get("has_yield_assignment", False))
+        has_try_or_with = bool(info1.get("has_try_or_with", False))
         has_return = info1["has_return"]
+        has_return_value = bool(info1.get("has_return_value"))
         has_super = bool(info1.get("has_super", False))
         has_mangled = bool(info1.get("has_mangled_names", False))
         local_imports = info1["local_imports"]
@@ -1459,6 +1974,8 @@ def analyze_unit_variable_scope(
         is_async = info1.get("is_async", False)
         conditional_outputs = info1.get("conditional_outputs", [])
         definite_stores = info1.get("definite_stores", [])
+        outputs_ambiguous = bool(info1.get("outputs_ambiguous", False))
+        type_params = list(info1.get("type_params", []))
 
     has_instance_binding = info1.get("has_instance_binding", False) or (
         info2.get("has_instance_binding", False) if u2 is not None else False
@@ -1471,10 +1988,24 @@ def analyze_unit_variable_scope(
     )
     binding_kind = _determine_binding_kind(has_instance_binding, has_class_binding)
 
-    primary_rec = u1.get("receiver_param") or (u2.get("receiver_param") if u2 else None) or (
-        "cls" if (u1.get("receiver_kind") == "class" or (u2 and u2.get("receiver_kind") == "class")) else None
+    primary_rec = (
+        u1.get("receiver_param")
+        or (u2.get("receiver_param") if u2 else None)
+        or (
+            "cls"
+            if (
+                u1.get("receiver_kind") == "class"
+                or (u2 and u2.get("receiver_kind") == "class")
+            )
+            else None
+        )
     )
-    _normalize_receiver_order(inputs, has_instance_binding, has_class_binding, primary_receiver=primary_rec)
+    _normalize_receiver_order(
+        inputs,
+        has_instance_binding,
+        has_class_binding,
+        primary_receiver=primary_rec,
+    )
 
     locals_ = [var for var in info1["stores"] if var not in inputs]
     return {
@@ -1491,7 +2022,10 @@ def analyze_unit_variable_scope(
         "control_flow_hazards": hazards,
         "is_control_flow_safe": is_safe,
         "has_yield": has_yield,
+        "has_yield_assignment": has_yield_assignment,
+        "has_try_or_with": has_try_or_with,
         "has_return": has_return,
+        "has_return_value": has_return_value,
         "has_super": has_super,
         "has_mangled_names": has_mangled,
         "local_imports": local_imports,
@@ -1504,22 +2038,32 @@ def analyze_unit_variable_scope(
         "has_class_binding": has_class_binding,
         "binding_kind": binding_kind,
         "has_receiver_access": has_receiver_access,
-        "instance_attrs": list(dict.fromkeys(
-            info1.get("instance_attrs", []) + (info2.get("instance_attrs", []) if u2 is not None else [])
-        )),
-        "class_attrs": list(dict.fromkeys(
-            info1.get("class_attrs", []) + (info2.get("class_attrs", []) if u2 is not None else [])
-        )),
+        "instance_attrs": list(
+            dict.fromkeys(
+                info1.get("instance_attrs", [])
+                + (info2.get("instance_attrs", []) if u2 is not None else [])
+            )
+        ),
+        "class_attrs": list(
+            dict.fromkeys(
+                info1.get("class_attrs", [])
+                + (info2.get("class_attrs", []) if u2 is not None else [])
+            )
+        ),
+        "outputs_ambiguous": outputs_ambiguous,
+        "type_params": type_params,
+        "type_param_free_vars": list(
+            dict.fromkeys(
+                info1.get("type_param_free_vars", [])
+                + (info2.get("type_param_free_vars", []) if u2 is not None else [])
+            )
+        ),
+        "has_class_scoped_type_params": bool(
+            info1.get("has_class_scoped_type_params", False)
+            or (
+                info2.get("has_class_scoped_type_params", False)
+                if u2 is not None
+                else False
+            )
+        ),
     }
-
-
-
-def dispatch_analyze_unit_variable_scope(
-    u1: Dict[str, Any],
-    u2: Optional[Dict[str, Any]] = None,
-    repo_root: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Dispatches analyze_unit_variable_scope, honoring active mock patches on pydoppelgangerhunt.fixer."""
-    pkg = sys.modules.get("pydoppelgangerhunt.fixer")
-    target = getattr(pkg, "analyze_unit_variable_scope", analyze_unit_variable_scope)
-    return target(u1, u2=u2, repo_root=repo_root)

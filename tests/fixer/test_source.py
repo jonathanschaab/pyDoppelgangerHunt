@@ -21,6 +21,7 @@ from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
     _get_module_imported_names,
     _insert_imports_into_module,
 )
+from pydoppelgangerhunt.fixer.source import find_enclosing_function_is_async
 
 
 def test_fixer_feedback_and_advanced_robustness(tmp_path: Path) -> None:
@@ -286,6 +287,65 @@ def test_extract_unit_source_code_empty_and_directory_path(tmp_path: Path) -> No
     u_dir = {"file": str(tmp_path), "name": "dir_unit", "start": 1, "end": 3}
     assert extract_unit_source_code(u_dir) == ["# Source for dir_unit lines 1-3\n"]
 
+
+def test_resolve_safe_unit_file_path_symlinked_root_prefix(tmp_path: Path) -> None:
+    """Verifies that _resolve_safe_unit_file_path handles absolute paths with symlink roots."""
+    from pydoppelgangerhunt.fixer.source import _resolve_safe_unit_file_path
+
+    real_repo = tmp_path / "real_repo"
+    real_repo.mkdir()
+    target_py = real_repo / "main.py"
+    target_py.write_text("print('hello')\n", encoding="utf-8")
+
+    # Direct resolution under real root
+    resolved = _resolve_safe_unit_file_path({"file": str(target_py)}, repo_root=str(real_repo))
+    assert resolved == target_py.resolve()
+
+    # Outside root should return None
+    outside_py = tmp_path / "outside.py"
+    outside_py.write_text("print('outside')\n", encoding="utf-8")
+    assert _resolve_safe_unit_file_path({"file": str(outside_py)}, repo_root=str(real_repo)) is None
+
+    # Platform symlinked root alias test (if symlinks supported on OS/privilege)
+    sym_repo = tmp_path / "sym_repo"
+    try:
+        sym_repo.symlink_to(real_repo, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks not supported on this platform/privilege")
+
+    # When file path uses sym_repo prefix and repo_root uses real_repo (or vice versa)
+    res1 = _resolve_safe_unit_file_path(
+        {"file": str(sym_repo / "main.py")}, repo_root=str(real_repo)
+    )
+    assert res1 == target_py.resolve()
+
+    res2 = _resolve_safe_unit_file_path(
+        {"file": str(target_py)}, repo_root=str(sym_repo)
+    )
+    assert res2 == target_py.resolve()
+
+    # Symlinked file inside the repository must be rejected
+    sym_file = real_repo / "sym_link.py"
+    try:
+        sym_file.symlink_to(target_py)
+    except (OSError, NotImplementedError):
+        pass
+    else:
+        assert _resolve_safe_unit_file_path(
+            {"file": str(sym_file)}, repo_root=str(real_repo)
+        ) is None
+
+    # Symlinked directory inside the repository must also be rejected
+    sym_dir = real_repo / "sym_subdir"
+    try:
+        sym_dir.symlink_to(real_repo, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pass
+    else:
+        assert _resolve_safe_unit_file_path(
+            {"file": str(sym_dir / "main.py")}, repo_root=str(real_repo)
+        ) is None
+
 def test_expression_unit_midline_pragma_placement() -> None:
     """Verifies that boundary pragmas are appended to the line end when trailing code is present."""
     source = "call([x for x in data], extra_arg)  # type: ignore\n"
@@ -538,3 +598,294 @@ def test_find_module_helper_insertion_index_with_suppress() -> None:
     src = "".join(lines)
     names = _get_module_imported_names(src, include_conditional=True)
     assert "optional_dep" in names
+
+
+def test_find_enclosing_function_is_async_decorated() -> None:
+    """Verifies that find_enclosing_function_is_async recognizes decorated async functions
+    when the unit start line begins on or after the decorator."""
+    src = (
+        "@deco1\n"
+        "@deco2(arg=True)\n"
+        "async def async_worker(x):\n"
+        "    res = x * 2\n"
+        "    return res\n"
+    )
+    # Unit starting on the decorator itself
+    assert find_enclosing_function_is_async(src, start_line=1, end_line=5) is True
+    # Unit starting on second decorator
+    assert find_enclosing_function_is_async(src, start_line=2, end_line=4) is True
+    # Unit inside function body
+    assert find_enclosing_function_is_async(src, start_line=4, end_line=4) is True
+    # Out of range
+    assert find_enclosing_function_is_async(src, start_line=6, end_line=7) is False
+
+    # Sync decorated function should return False
+    sync_src = (
+        "@deco\n"
+        "def sync_worker(x):\n"
+        "    return x * 2\n"
+    )
+    assert find_enclosing_function_is_async(sync_src, start_line=1, end_line=3) is False
+
+
+def test_find_enclosing_function_is_async_nested_tiebreaker() -> None:
+    """Verifies that when multiple candidate functions enclose a unit, candidates are
+    sorted primarily by span and tie-broken by -earliest_start to select the innermost function."""
+    # Outer sync function enclosing inner async function
+    src_sync_outer = (
+        "def outer():\n"
+        "    async def inner():\n"
+        "        yield 1\n"
+        "    return inner\n"
+    )
+    # Unit inside inner (line 3) -> should resolve to inner's async status (True)
+    assert find_enclosing_function_is_async(src_sync_outer, start_line=3, end_line=3) is True
+
+    # Outer async function enclosing inner sync function
+    src_async_outer = (
+        "async def outer():\n"
+        "    def inner():\n"
+        "        return 1\n"
+        "    return inner()\n"
+    )
+    # Unit inside inner (line 3) -> should resolve to inner's sync status (False)
+    assert find_enclosing_function_is_async(src_async_outer, start_line=3, end_line=3) is False
+
+
+def test_is_subroutine_unit_comprehension_with_source() -> None:
+    """Verifies that comprehension, closure, and complex_expr units return False
+    from is_subroutine_unit even when full source text is provided."""
+    from pydoppelgangerhunt.fixer.source import is_subroutine_unit
+
+    src = (
+        "def compute(data):\n"
+        "    res = [x * 2 for x in data]\n"
+        "    return res\n"
+    )
+    tree = ast.parse(src)
+    comp_unit = {
+        "file": "test.py",
+        "kind": "comprehension",
+        "start": 2,
+        "end": 2,
+        "start_col": 10,
+        "end_col": 31,
+    }
+    # With source and tree provided, comprehension must NOT fall through to structural check
+    assert is_subroutine_unit(comp_unit, source_text=src, tree=tree) is False
+
+    closure_unit = {
+        "file": "test.py",
+        "kind": "closure",
+        "start": 2,
+        "end": 2,
+    }
+    assert is_subroutine_unit(closure_unit, source_text=src, tree=tree) is False
+
+    expr_unit = {
+        "file": "test.py",
+        "kind": "complex_expr",
+        "start": 2,
+        "end": 2,
+    }
+    assert is_subroutine_unit(expr_unit, source_text=src, tree=tree) is False
+
+    class_unit = {
+        "file": "test.py",
+        "kind": "class",
+        "start": 2,
+        "end": 3,
+    }
+    assert is_subroutine_unit(class_unit, source_text=src, tree=tree) is False
+
+    data_table_unit = {
+        "file": "test.py",
+        "kind": "data_table",
+        "start": 2,
+        "end": 2,
+    }
+    assert is_subroutine_unit(data_table_unit, source_text=src, tree=tree) is False
+
+
+def test_slice_unit_token_lines_invalid_or_negative_start_col() -> None:
+    """Verifies that _slice_unit_token_lines returns lines untouched on negative
+    or non-numeric start_col offsets."""
+    from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
+
+    lines = ["    res = [x for x in data]\n"]
+    # Negative start_col
+    u_neg = {"kind": "comprehension", "start_col": -5, "end_col": 10}
+    assert _slice_unit_token_lines(u_neg, lines) == lines
+
+    # Non-int start_col
+    u_bad = {"kind": "comprehension", "start_col": "invalid", "end_col": 10}
+    assert _slice_unit_token_lines(u_bad, lines) == lines
+
+
+def test_is_sliced_excerpt_for_file_starts_at_line_one() -> None:
+    """Verifies that _is_sliced_excerpt_for_file identifies an excerpt starting at line 1."""
+    from pydoppelgangerhunt.fixer.source import _is_sliced_excerpt_for_file
+
+    u = {"start": 1, "end": 3}
+    lines = ["a = 1\n", "b = 2\n", "c = 3\n"]
+    assert _is_sliced_excerpt_for_file(u, lines) is True
+
+
+def test_load_unit_file_text_prioritizes_disk_over_source_lines(tmp_path: Path) -> None:
+    """Verifies that _load_unit_file_text prioritizes disk file over in-memory source_lines."""
+    from pydoppelgangerhunt.fixer.source import _load_unit_file_text
+
+    full_text = "x = 1\ny = 2\nz = 3\nw = 4\nv = 5\n"
+    target_file = tmp_path / "module.py"
+    target_file.write_text(full_text, encoding="utf-8")
+
+    unit = {
+        "file": str(target_file),
+        "start": 1,
+        "end": 2,
+        "source_lines": ["x = 1\n", "y = 2\n"],
+    }
+    loaded = _load_unit_file_text(unit, repo_root=str(tmp_path))
+    assert loaded == full_text
+
+
+def test_dedent_source_text_multiple_form_feeds() -> None:
+    """Verifies that dedent_source_text correctly preserves multiple form feed characters."""
+    from pydoppelgangerhunt.fixer.source import dedent_source_text
+
+    raw = " a\n\x0c b\n\x0c c\n"
+    dedented = dedent_source_text(raw)
+    assert dedented == "a\n\x0cb\n\x0cc\n"
+
+
+def test_load_unit_file_text_prioritizes_unsliced_source_lines_over_disk(tmp_path: Path) -> None:
+    """Verifies that unsliced in-memory source_lines take precedence over disk (IDE buffer)."""
+    from pydoppelgangerhunt.fixer.source import _load_unit_file_text
+
+    disk_text = "x = 1\ny = 2\n"
+    target_file = tmp_path / "module.py"
+    target_file.write_text(disk_text, encoding="utf-8")
+
+    unsaved_lines = ["x = 100\n", "y = 200\n", "z = 300\n"]
+    unit = {
+        "file": str(target_file),
+        "start": 1,
+        "end": 2,
+        "source_lines": unsaved_lines,
+    }
+    loaded = _load_unit_file_text(unit, repo_root=str(tmp_path))
+    assert loaded == "x = 100\ny = 200\nz = 300\n"
+
+    empty_unsaved = {
+        "file": str(target_file),
+        "start": 1,
+        "end": 2,
+        "source_lines": [],
+        "source_lines_is_sliced": False,
+    }
+    assert _load_unit_file_text(empty_unsaved, repo_root=str(tmp_path)) == ""
+
+
+def test_slice_unit_token_lines_offset_aliases() -> None:
+    """Verifies that _slice_unit_token_lines respects start_col_offset and end_col_offset."""
+    from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
+
+    lines = ["    total = [x * 2 for x in items]\n"]
+    u_aliases = {
+        "kind": "comprehension",
+        "start_col_offset": 12,
+        "end_col_offset": 34,
+    }
+    sliced = _slice_unit_token_lines(u_aliases, list(lines))
+    assert sliced == ["[x * 2 for x in items]"]
+
+    # Multi-line unit with offset aliases
+    multi_lines = [
+        "    result = (\n",
+        "        [x * 2 for x in items]\n",
+        "    )\n",
+    ]
+    u_multi = {
+        "kind": "complex_expr",
+        "start_col_offset": 13,
+        "end_col_offset": 5,
+    }
+    sliced_multi = _slice_unit_token_lines(u_multi, list(multi_lines))
+    assert sliced_multi[0] == "(\n"
+    assert sliced_multi[1] == "        [x * 2 for x in items]\n"
+    assert sliced_multi[2] == "    )"
+
+
+def test_is_sliced_excerpt_for_file_explicit_flag_and_ambiguous_span() -> None:
+    """Verifies that _is_sliced_excerpt_for_file honors source_lines_is_sliced: False
+    for full-file buffers whose line count matches the unit span."""
+    from pydoppelgangerhunt.fixer.source import _is_sliced_excerpt_for_file
+
+    lines = ["x = 1\n", "y = 2\n", "z = 3\n"]
+    unit_base = {"file": "m.py", "start": 1, "end": 3}
+
+    # 1. When source_lines_is_sliced is False, it is recognized as full file text
+    unit_full = dict(unit_base, source_lines_is_sliced=False)
+    assert not _is_sliced_excerpt_for_file(unit_full, lines)
+
+    # 2. When source_lines_is_sliced is omitted, length heuristic fails closed (ambiguous)
+    unit_unspecified = dict(unit_base)
+    assert _is_sliced_excerpt_for_file(unit_unspecified, lines)
+
+    # 3. When source_lines_is_sliced is True, it is recognized as sliced
+    unit_sliced = dict(unit_base, source_lines_is_sliced=True)
+    assert _is_sliced_excerpt_for_file(unit_sliced, lines)
+
+    # 4. Truncated buffer (len(lines) < u_end) is always treated as sliced
+    assert _is_sliced_excerpt_for_file(unit_full, lines[:2])
+
+
+def test_extract_required_typing_imports_generator_types() -> None:
+    """Verifies that Generator and AsyncGenerator are extracted from type annotations."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _extract_required_typing_imports,
+    )
+
+    sync_sig = "def gen() -> Generator[int, Any, None]: pass"
+    extracted_sync = _extract_required_typing_imports(sync_sig)
+    assert "Generator" in extracted_sync
+    assert "Any" in extracted_sync
+
+    async_sig = "def agen() -> AsyncGenerator[str, Any]: pass"
+    extracted_async = _extract_required_typing_imports(async_sig)
+    assert "AsyncGenerator" in extracted_async
+    assert "Any" in extracted_async
+
+
+def test_extract_unit_body_lines_indented_method_col0_multiline_string() -> None:
+    """Verifies that _extract_unit_body_lines strips the method signature and docstring
+    and dedents body statements to column 0 when an indented method contains a multiline
+    string or docstring with continuation lines at column 0."""
+    raw_lines = [
+        "    def format_banner(self, title: str) -> str:",
+        '        """Docstring header',
+        "col_0_docstring_line",
+        '        """',
+        '        banner = f"""header {',
+        "title.strip()",
+        '}"""',
+        "        clean = title.strip()",
+        "        return banner + clean",
+    ]
+    body_lines = _extract_unit_body_lines({"kind": "method"}, raw_lines)
+    assert body_lines == [
+        'banner = f"""header {',
+        "title.strip()",
+        '}"""',
+        "clean = title.strip()",
+        "return banner + clean",
+    ]
+
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
+        _find_multiline_string_continuation_lines,
+        dedent_source_text,
+    )
+
+    cr_text = "    x = '''header\rcol0_line'''\r    y = 1\r"
+    assert _find_multiline_string_continuation_lines(cr_text) == {2}
+    assert dedent_source_text(cr_text) == "x = '''header\rcol0_line'''\ry = 1\r"

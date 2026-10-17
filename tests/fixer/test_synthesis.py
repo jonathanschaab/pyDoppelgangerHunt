@@ -3,25 +3,53 @@
 from __future__ import annotations
 
 import ast
-import subprocess
+import hashlib
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Set
 
 import pytest
 
 from pydoppelgangerhunt import (
     check_units_overlap,
     extract_unit_source_code,
+    filter_overlapping_clone_units,
     generate_clone_diff,
     generate_refactoring_patch,
     synthesize_refactoring_suggestion,
     synthesize_shared_helper_code,
 )
 from pydoppelgangerhunt.fixer import (  # pylint: disable=protected-access
+    _base_unit_name,
+    _extract_required_typing_imports,
     _format_call_arguments,
+    _infer_helper_return_type,
+    _is_same_file_path,
+    _normalize_file_path,
+    analyze_unit_variable_scope,
+    is_subroutine_unit,
+)
+from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access
+    _extract_nested_scope_free_reads,
+    collect_downstream_read_names,
+    has_async_generator_delegation_hazard,
+)
+from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=protected-access
+    _inspect_unit_scope,
+    inspect_single_unit_scope,
+)
+from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access
+    _extract_augassign_unreferenced_target,
+    _format_union_or_optional,
+    _infer_outputs_return_type,
+    _normalize_pipe_unions,
+    _split_type_args,
+    _strip_stmt_target_lines,
 )
 from pydoppelgangerhunt.parser import harvest_file_units
+
+
+from tests.helpers import assert_valid_python
 
 
 def test_generate_clone_diff_and_refactoring_suggestions(tmp_path: Path) -> None:
@@ -73,6 +101,7 @@ def test_generate_clone_diff_and_refactoring_suggestions(tmp_path: Path) -> None
     test_suggestion = synthesize_refactoring_suggestion(u_t1, u_t2)
     assert "@pytest.mark.parametrize" in test_suggestion
 
+
 def test_fixer_synthesis_and_patch(tmp_path: Path) -> None:
     """Test refactoring helper synthesis and unified patch generation."""
     code_a = (
@@ -117,6 +146,7 @@ def test_fixer_synthesis_and_patch(tmp_path: Path) -> None:
     assert "--- a/" in patch
     assert "+++ b/" in patch
     assert "def _shared_process_alpha" in patch
+
 
 def test_synthesize_shared_helper_code_same_class_and_class_binding(tmp_path: Path) -> None:
     """Verifies synthesizing private instance and class methods with appropriate indentation."""
@@ -191,6 +221,7 @@ def test_synthesize_shared_helper_code_same_class_and_class_binding(tmp_path: Pa
     mod_helper = synthesize_shared_helper_code(u1, u2, method_binding="module", repo_root=str(tmp_path))
     assert "def _shared_add_tax_a_add_tax_b(self: Any, amount: float) -> float:" in mod_helper
 
+
 def test_same_named_whole_method_helper_synthesis(tmp_path: Path) -> None:
     """Verifies that whole-method clones with identical names do not nest def inside helper."""
     f1 = tmp_path / "mod1.py"
@@ -205,6 +236,7 @@ def test_same_named_whole_method_helper_synthesis(tmp_path: Path) -> None:
     assert "def compute(" not in code
     assert "ans = n * 10" in code
     assert "return ans" in code
+
 
 def test_module_helper_placed_after_docstring_and_future_imports(tmp_path: Path) -> None:
     """Verifies that cross-class module helpers are inserted after docstrings and future imports."""
@@ -230,6 +262,7 @@ def test_module_helper_placed_after_docstring_and_future_imports(tmp_path: Path)
     assert 'from __future__ import annotations' in patch
     assert "+def _shared_handle(self: Any, num: int) -> int:" in patch
 
+
 def test_static_methods_avoid_self_injection(tmp_path: Path) -> None:
     """Verifies static method clones don't inject self and delegate cleanly."""
     f = tmp_path / "math_util.py"
@@ -251,6 +284,7 @@ def test_static_methods_avoid_self_injection(tmp_path: Path) -> None:
     assert "+def _shared_add_sq1_add_sq2(x: int, y: int) -> int:" in patch
     assert "+        return _shared_add_sq1_add_sq2(x, y)" in patch
     assert "self." not in patch
+
 
 def test_parameter_kinds_forwarding_in_calls(tmp_path: Path) -> None:
     """Verifies that keyword-only, vararg, and kwarg parameters are forwarded with correct syntax."""
@@ -274,6 +308,7 @@ def test_parameter_kinds_forwarding_in_calls(tmp_path: Path) -> None:
     assert "*args" in patch
     assert "**kwargs" in patch
 
+
 def test_helper_inserted_before_decorators(tmp_path: Path) -> None:
     """Verifies helper is inserted before decorators on earliest method."""
     f = tmp_path / "repo.py"
@@ -294,6 +329,7 @@ def test_helper_inserted_before_decorators(tmp_path: Path) -> None:
     assert patch
     assert "_shared_get_first_get_second(cls, name: str) -> str:" in patch
     assert "return cls._shared_get_first_get_second(name)" in patch
+
 
 def test_static_methods_propagation_in_synthesis_and_patch(tmp_path: Path) -> None:
     """Verifies is_static propagates into synthesize_shared_helper_code and method_binding='method'."""
@@ -348,6 +384,7 @@ def test_static_methods_propagation_in_synthesis_and_patch(tmp_path: Path) -> No
     assert "@staticmethod" in patch
     assert "__class__._shared" in patch
 
+
 def test_classmethod_compound_block_injects_cls(tmp_path: Path) -> None:
     """Verifies that compound blocks inside @classmethod that don't reference cls still inject cls and @classmethod."""
     f = tmp_path / "factory.py"
@@ -393,6 +430,7 @@ def test_classmethod_compound_block_injects_cls(tmp_path: Path) -> None:
     assert "cls._shared_make_a_make_b" in patch
     assert "self." not in patch
 
+
 def test_synthesize_shared_helper_harvested_units_declines_mixed_receiver(tmp_path: Path) -> None:
     """Verifies that synthesize_shared_helper_code on real harvested units declines receiver-bound mixed-kind pairs."""
     code = (
@@ -416,6 +454,7 @@ def test_synthesize_shared_helper_harvested_units_declines_mixed_receiver(tmp_pa
         by_name["inst_worker"], by_name["cls_worker"], repo_root=str(tmp_path)
     )
     assert helper == ""
+
 
 def test_closure_whole_function_refactoring_and_body_extraction(tmp_path: Path) -> None:
     """Verifies that whole closure units strip their header in synthesis and delegate properly in patches."""
@@ -464,6 +503,7 @@ def test_closure_whole_function_refactoring_and_body_extraction(tmp_path: Path) 
     assert "def inner_a(x: int) -> int:" in patch
     assert "return _shared_inner_a_inner_b(x)" in patch
 
+
 def test_synthesize_shared_helper_independent_receiver_kinds(tmp_path: Path) -> None:
     """Verifies that units with differing is_static flags are not cross-contaminated into identical receiver kinds."""
     code_stat = (
@@ -485,6 +525,7 @@ def test_synthesize_shared_helper_independent_receiver_kinds(tmp_path: Path) -> 
     # Should detect differing receiver kinds and decline helper replacement due to self.value reference
     helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert helper == ""
+
 
 def test_mixed_async_and_sync_pair_declined(tmp_path: Path) -> None:
     """Verifies that clone pairs with mixed async and sync execution models are declined."""
@@ -508,6 +549,7 @@ def test_mixed_async_and_sync_pair_declined(tmp_path: Path) -> None:
     patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
     assert patch == ""
 
+
 def test_mixed_generator_and_function_pair_declined(tmp_path: Path) -> None:
     """Verifies that clone pairs with mixed generator (yield) and normal function models are declined."""
     code = (
@@ -529,6 +571,7 @@ def test_mixed_generator_and_function_pair_declined(tmp_path: Path) -> None:
 
     patch = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path), replace_clones=True)
     assert patch == ""
+
 
 def test_closures_in_classes_synthesize_module_helper_auto_mode(tmp_path: Path) -> None:
     """Verifies that closures inside classes synthesize module-level helpers in auto mode."""
@@ -560,15 +603,15 @@ def test_closures_in_classes_synthesize_module_helper_auto_mode(tmp_path: Path) 
     assert helper.startswith("def _shared_transform(")
     assert "self" not in helper
 
+
 def test_base_unit_name_fallback_for_underscore_or_empty_name() -> None:
     """Verifies that _base_unit_name falls back to 'helper' when unit name has only underscores."""
-    from pydoppelgangerhunt.fixer import _base_unit_name  # pylint: disable=protected-access
-
     assert _base_unit_name({"name": "_", "kind": "function"}) == "helper"
     assert _base_unit_name({"name": "___", "kind": "function"}) == "helper"
     assert _base_unit_name({"name": "", "kind": "function"}) == "helper"
     assert _base_unit_name({"name": "outer:_", "kind": "closure"}) == "helper"
     assert _base_unit_name({"name": "calculate", "kind": "function"}) == "calculate"
+
 
 def test_format_call_arguments_vararg_kwarg_ordering() -> None:
     """Verifies that _format_call_arguments orders positional arguments and free variables before varargs/kwargs."""
@@ -581,8 +624,10 @@ def test_format_call_arguments_vararg_kwarg_ordering() -> None:
     ]
     args_str = _format_call_arguments(inputs, param_details, receiver_to_omit="self")
     assert args_str == "extra_pos, *args, **kwargs"
-    # Ensure it parses cleanly without SyntaxError: positional argument follows keyword argument unpacking
-    ast.parse(f"call({args_str})")
+    # Ensure it compiles cleanly without SyntaxError: positional argument follows keyword
+    # argument unpacking
+    assert_valid_python(f"call({args_str})")
+
 
 def test_synthesize_shared_helper_code_body_typing_imports(tmp_path: Path) -> None:
     """Verifies that synthesize_shared_helper_code captures typing constructs inside the helper body."""
@@ -603,10 +648,9 @@ def test_synthesize_shared_helper_code_body_typing_imports(tmp_path: Path) -> No
     assert "List" in helper
     assert "Any" in helper
 
+
 def test_defensive_unit_file_and_name_none_handling() -> None:
     """Verifies that units with None or missing file/name attributes are handled without exceptions."""
-    from pydoppelgangerhunt.fixer import filter_overlapping_clone_units  # pylint: disable=import-outside-toplevel
-
     u_none_file: Dict[str, Any] = {"file": None, "start": 1, "end": 5, "name": "test"}
     assert filter_overlapping_clone_units([u_none_file]) == [u_none_file]
     assert not check_units_overlap(u_none_file, {"file": "a.py", "start": 1, "end": 5})
@@ -615,16 +659,9 @@ def test_defensive_unit_file_and_name_none_handling() -> None:
     suggestion = synthesize_refactoring_suggestion(u_none_name, u_none_name)
     assert "[REFACTOR SUGGESTION]" in suggestion
 
+
 def test_batch_36_path_resolution_and_same_file_matching(tmp_path: Any) -> None:
     """Tests Batch 36: robust path normalization and resolution across duplicate units."""
-    from pydoppelgangerhunt.fixer import (
-        _is_same_file_path,
-        _normalize_file_path,
-        check_units_overlap,
-        filter_overlapping_clone_units,
-        generate_refactoring_patch,
-        synthesize_shared_helper_code,
-    )
 
     # 1. Base string equivalence and anchor handling
     assert not _is_same_file_path("", "foo.py")
@@ -711,12 +748,9 @@ def test_batch_36_path_resolution_and_same_file_matching(tmp_path: Any) -> None:
     assert "def _shared_task_a_task_b(self, x: Any) -> Any:" in patch
     assert "self._shared_task_a_task_b(x)" in patch
 
+
 def test_batch_58_parenthesized_return_and_relative_path_resolution(tmp_path: Path) -> None:
     """Batch 58: Test parenthesized/tabbed return detection and relative path resolution in patch/harvest."""
-    # pylint: disable=import-outside-toplevel
-    from pydoppelgangerhunt.fixer import generate_refactoring_patch, synthesize_shared_helper_code
-    from pydoppelgangerhunt.parser import harvest_file_units
-
     # 1. Test parenthesized return 'return(res)' in synthesize_shared_helper_code
     code_paren = (
         "def compute_paren(val: int) -> int:\n"
@@ -777,10 +811,9 @@ def test_batch_58_parenthesized_return_and_relative_path_resolution(tmp_path: Pa
     assert len(units) >= 1
     assert units[0]["file"] == "nested_subpkg/logic.py"
 
+
 def test_batch_60_generator_docstring_call_site_and_overlap(tmp_path: Path) -> None:
     """Test generator call site docstring synthesis and check_units_overlap column boundary validation."""
-    from pydoppelgangerhunt.fixer import check_units_overlap, synthesize_shared_helper_code
-
     # 1. Sync generator without return value
     gen_file = tmp_path / "gen_logic.py"
     gen_file.write_text(
@@ -838,6 +871,7 @@ def test_batch_60_generator_docstring_call_site_and_overlap(tmp_path: Path) -> N
         dict(u_base, start_col=25, end_col=10),
         dict(u_base, start_col=15, end_col=30),
     ) is False
+
 
 def test_batch_71_type2_clone_parameter_renaming_and_body_retention(tmp_path: Path) -> None:
     """Verifies that Type-2 clones with renamed parameters preserve full helper body and map arguments at call sites."""
@@ -898,6 +932,7 @@ def test_batch_71_type2_clone_parameter_renaming_and_body_retention(tmp_path: Pa
     patch_block = generate_refactoring_patch([(0.90, u_b1, u_b2)], repo_root=str(tmp_path), replace_clones=True)
     assert "v, out1 = _shared_b1_b2(p)" in patch_block
     assert "v, out2 = _shared_b1_b2(q)" in patch_block
+
 
 def test_multiline_comprehension_helper_synthesis_and_apply(tmp_path: Path) -> None:
     """Verifies that multiline comprehensions with comments are wrapped in return (...) and run cleanly."""
@@ -975,6 +1010,7 @@ def test_multiline_comprehension_helper_synthesis_and_apply(tmp_path: Path) -> N
     assert run_proc.returncode == 0
     assert run_proc.stdout.strip() == "[2, 6] [4, 8]"
 
+
 def test_type_merge_positional_alignment_renamed_parameters(tmp_path: Path) -> None:
     """Verifies that type annotations merge positionally across renamed parameter names in Type-2 clones."""
     code1 = (
@@ -998,10 +1034,9 @@ def test_type_merge_positional_alignment_renamed_parameters(tmp_path: Path) -> N
     )
     assert "def _shared_process_val_process_val_v2(x: Union[int, str], y: int, timeout: float = 1.0) -> int:" in helper
 
+
 def test_infer_helper_return_type_generator_literal_and_explicit_types() -> None:
     """Verifies that _infer_helper_return_type infers literal yield types and preserves explicit annotations."""
-    from pydoppelgangerhunt.fixer import _infer_helper_return_type  # pylint: disable=import-outside-toplevel
-
     # 1. Sync generator with literal integer yield
     scope_int = {"has_yield": True, "yield_expr_names": [("yield", ":literal:int")]}
     res_int = _infer_helper_return_type(
@@ -1040,6 +1075,39 @@ def test_infer_helper_return_type_generator_literal_and_explicit_types() -> None
     )
     assert res_explicit == "AsyncIterator[float]"
 
+    # 4. Async generator with yield assignment infers AsyncGenerator[YieldT, SendT]
+    res_async_gen = _infer_helper_return_type(
+        "Any",
+        [],
+        set(),
+        scope={
+            "has_yield": True,
+            "has_yield_assignment": True,
+            "yield_expr_names": [("yield", "x")],
+        },
+        meta1={"x": {"type": "int"}},
+        meta2={},
+        is_async=True,
+    )
+    assert res_async_gen == "AsyncGenerator[int, Any]"
+
+    # 5. Async generator with explicit AsyncGenerator return annotation
+    res_async_gen_explicit = _infer_helper_return_type(
+        "AsyncGenerator[int, str]",
+        [],
+        set(),
+        scope={
+            "has_yield": True,
+            "has_yield_assignment": True,
+            "yield_expr_names": [],
+        },
+        meta1={},
+        meta2={},
+        is_async=True,
+    )
+    assert res_async_gen_explicit == "AsyncGenerator[int, str]"
+
+
 def test_generator_helper_synthesis_literal_yields(tmp_path: Path) -> None:
     """Verifies that synthesizing helpers from generator units infers Iterator types and executes cleanly."""
     code1 = (
@@ -1063,13 +1131,9 @@ def test_generator_helper_synthesis_literal_yields(tmp_path: Path) -> None:
     helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
     assert "-> Iterator[int]:" in helper
 
+
 def test_batch_82_generator_container_literal_and_pep585_return_type_inference(tmp_path: Path) -> None:
     """Verifies that container literals and PEP 585 lowercase types in yield from are properly inferred."""
-    from pydoppelgangerhunt.fixer import (  # pylint: disable=import-outside-toplevel
-        _infer_helper_return_type,
-        synthesize_shared_helper_code,
-    )
-
     # 1. PEP 585 lowercase list[int] and tuple[str, ...]
     assert _infer_helper_return_type(
         "Any", [], set(),
@@ -1115,8 +1179,6 @@ def test_batch_82_generator_container_literal_and_pep585_return_type_inference(t
 
 def test_format_call_arguments_order_preservation_and_custom_receivers() -> None:
     """Verifies that call argument formatting preserves name identity across load permutations and omits custom receivers."""
-    from pydoppelgangerhunt.fixer.synthesis import _format_call_arguments  # pylint: disable=import-outside-toplevel
-
     # 1. Identical input names in permuted target_inputs must not be swapped
     inputs = ["alpha", "beta", "gamma"]
     target_inputs = ["gamma", "alpha", "beta"]
@@ -1147,3 +1209,3272 @@ def test_format_call_arguments_order_preservation_and_custom_receivers() -> None
         receiver_to_omit="receivers",
     )
     assert args_rec == "data"
+
+
+def test_sync_generator_helper_synthesis_with_outputs_emits_return_and_generator_type(tmp_path: Path) -> None:
+    """Verifies that synthesizing helpers from sync generators with outputs emits return and Generator type."""
+    # 1. With downstream return: helper returns count, prunes loop variable x, and has Generator type
+    code1 = (
+        "def count_and_yield1(items: list[int]):\n"
+        "    count = 0\n"
+        "    for x in items:\n"
+        "        count += 1\n"
+        "        yield x\n"
+        "    return count\n"
+    )
+    code2 = (
+        "def count_and_yield2(items: list[int]):\n"
+        "    count = 0\n"
+        "    for x in items:\n"
+        "        count += 1\n"
+        "        yield x\n"
+        "    return count\n"
+    )
+    f1 = tmp_path / "cy1.py"
+    f2 = tmp_path / "cy2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+
+    u1 = {"file": "cy1.py", "start": 2, "end": 5, "name": "count_and_yield1:for", "kind": "compound_block"}
+    u2 = {"file": "cy2.py", "start": 2, "end": 5, "name": "count_and_yield2:for", "kind": "compound_block"}
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "-> Generator[" in helper
+    assert "return count" in helper
+    assert "return count, x" not in helper
+
+    # 2. Without downstream return: loop variable is not needed downstream, so return is omitted and Iterator type used
+    code_no_ret1 = (
+        "def pure_yield1(items: list[int]):\n"
+        "    count = 0\n"
+        "    for x in items:\n"
+        "        count += 1\n"
+        "        yield x\n"
+    )
+    code_no_ret2 = (
+        "def pure_yield2(items: list[int]):\n"
+        "    count = 0\n"
+        "    for x in items:\n"
+        "        count += 1\n"
+        "        yield x\n"
+    )
+    f3 = tmp_path / "py1.py"
+    f4 = tmp_path / "py2.py"
+    f3.write_text(code_no_ret1, encoding="utf-8")
+    f4.write_text(code_no_ret2, encoding="utf-8")
+
+    u3 = {"file": "py1.py", "start": 2, "end": 5, "name": "pure_yield1:for", "kind": "compound_block"}
+    u4 = {"file": "py2.py", "start": 2, "end": 5, "name": "pure_yield2:for", "kind": "compound_block"}
+
+    helper_no_ret = synthesize_shared_helper_code(u3, u4, repo_root=str(tmp_path))
+    assert "-> Iterator[" in helper_no_ret
+    assert "return " not in helper_no_ret
+
+
+def test_infer_helper_return_type_sync_generator_with_outputs_and_return() -> None:
+    """Verifies return type inference for sync generators with single/multiple outputs and return statements."""
+    # 1. Single output
+    scope_single = {"has_yield": True, "yield_expr_names": [("yield", ":literal:int")]}
+    res_single = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=["total"],
+        conditional_outs=set(),
+        scope=scope_single,
+        meta1={"total": {"type": "int"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_single == "Generator[int, None, int]"
+
+    # 2. Multiple outputs (Tuple return)
+    scope_multi = {"has_yield": True, "yield_expr_names": [("yield", ":literal:str")]}
+    res_multi = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=["total", "status"],
+        conditional_outs=set(),
+        scope=scope_multi,
+        meta1={"total": {"type": "int"}, "status": {"type": "str"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_multi == "Generator[str, None, Tuple[int, str]]"
+
+    # 3. Explicit generator return preserved
+    res_explicit = _infer_helper_return_type(
+        resolved_ret="Generator[int, None, float]",
+        helper_outputs=["total"],
+        conditional_outs=set(),
+        scope={"has_yield": True, "yield_expr_names": []},
+        meta1={},
+        meta2={},
+        is_async=False,
+    )
+    assert res_explicit == "Generator[int, None, float]"
+
+    # 4. Explicit return type with has_return_value
+    res_explicit_int = _infer_helper_return_type(
+        resolved_ret="int",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={"has_yield": True, "yield_expr_names": [], "has_return_value": True},
+        meta1={},
+        meta2={},
+        is_async=False,
+    )
+    assert res_explicit_int == "Generator[Any, None, int]"
+
+    # 5. Conditional outputs
+    res_cond = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=["total"],
+        conditional_outs={"total"},
+        scope={"has_yield": True, "yield_expr_names": [("yield", ":literal:int")]},
+        meta1={"total": {"type": "int"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_cond == "Generator[int, None, Optional[int]]"
+
+    # 6. Bare return with no value -> Iterator
+    res_bare = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={"has_yield": True, "yield_expr_names": [], "has_return": True, "has_return_value": False},
+        meta1={},
+        meta2={},
+        is_async=False,
+    )
+    assert res_bare == "Iterator[Any]"
+
+    # 7. No return at all -> Iterator
+    res_no_ret = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={"has_yield": True, "yield_expr_names": [], "has_return": False, "has_return_value": False},
+        meta1={},
+        meta2={},
+        is_async=False,
+    )
+    assert res_no_ret == "Iterator[Any]"
+
+
+def test_async_generator_with_return_rejected_in_synthesis(tmp_path: Path) -> None:
+    """Verifies that synthesize_shared_helper_code rejects async generators with return value but accepts bare return."""
+    # 1. Async generator subroutine with downstream outputs cannot return values from helper
+    code_val = (
+        "async def agen_returns(items: list[int]):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    print(total)\n"
+    )
+    f1 = tmp_path / "ao1.py"
+    f2 = tmp_path / "ao2.py"
+    f1.write_text(code_val, encoding="utf-8")
+    f2.write_text(code_val, encoding="utf-8")
+
+    u1 = {
+        "file": "ao1.py", "start": 3, "end": 5,
+        "name": "agen_returns:for", "kind": "compound_block",
+    }
+    u2 = {
+        "file": "ao2.py", "start": 3, "end": 5,
+        "name": "agen_returns:for", "kind": "compound_block",
+    }
+
+    helper_val = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper_val == ""
+
+    # Direct verification that async generators with return value trigger delegation hazard
+    assert (
+        has_async_generator_delegation_hazard(
+            {"is_async": True, "has_yield": True, "has_return_value": True}
+        )
+        is True
+    )
+
+    # 2. Async generator with bare return (no value) is valid Python (PEP 525) and should be synthesized
+    code_bare = (
+        "async def agen_bare(items: list[int]):\n"
+        "    for x in items:\n"
+        "        if x < 0:\n"
+        "            return\n"
+        "        yield x\n"
+    )
+    f3 = tmp_path / "ab1.py"
+    f4 = tmp_path / "ab2.py"
+    f3.write_text(code_bare, encoding="utf-8")
+    f4.write_text(code_bare, encoding="utf-8")
+
+    u3 = {"file": "ab1.py", "start": 1, "end": 5, "name": "agen_bare", "kind": "function", "is_async": True}
+    u4 = {"file": "ab2.py", "start": 1, "end": 5, "name": "agen_bare", "kind": "function", "is_async": True}
+
+    helper_bare = synthesize_shared_helper_code(u3, u4, repo_root=str(tmp_path))
+    assert helper_bare != ""
+    assert_valid_python(helper_bare)
+    assert "async def" in helper_bare
+    assert "-> AsyncIterator[" in helper_bare
+
+    # 3. Whole-function async generator with try/finally or with block is rejected
+    # because delegation via async for ...: yield loses athrow()/aclose() propagation.
+    code_try = (
+        "async def agen_try(items: list[int]):\n"
+        "    try:\n"
+        "        for x in items:\n"
+        "            yield x\n"
+        "    finally:\n"
+        "        pass\n"
+    )
+    f5 = tmp_path / "at1.py"
+    f6 = tmp_path / "at2.py"
+    f5.write_text(code_try, encoding="utf-8")
+    f6.write_text(code_try, encoding="utf-8")
+    u5 = {
+        "file": "at1.py", "start": 1, "end": 6,
+        "name": "agen_try", "kind": "function", "is_async": True,
+    }
+    u6 = {
+        "file": "at2.py", "start": 1, "end": 6,
+        "name": "agen_try", "kind": "function", "is_async": True,
+    }
+    assert synthesize_shared_helper_code(u5, u6, repo_root=str(tmp_path)) == ""
+
+
+def test_patch_subroutine_is_async_propagation(tmp_path: Path) -> None:
+    """Verifies that is_async from enclosing functions propagates to s1/s2 and rejects illegal returns."""
+    code1 = (
+        "async def process_data(items):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    print(total)\n"
+    )
+    code2 = (
+        "async def process_data_alt(items):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    print(total)\n"
+    )
+    f1 = tmp_path / "proc1.py"
+    f2 = tmp_path / "proc2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+
+    # compound_block without is_async explicitly set in unit dictionary
+    u1 = {"file": str(f1), "start": 3, "end": 5, "name": "process_data", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 3, "end": 5, "name": "process_data_alt", "kind": "compound_block"}
+
+    # Because total is needed downstream and the enclosing function is async def (async generator),
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch == ""
+    assert synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path)) == ""
+
+
+def test_infer_outputs_return_type_counterpart_lookup() -> None:
+    """Verifies that counterpart variable types from outputs2 take precedence over name collisions."""
+    meta1 = {"a": {"type": "int"}, "c": {"type": "float"}}
+    meta2 = {
+        "a": {"type": "str"},  # Unrelated variable in clone 2 scope
+        "b": {"type": "int"},  # True counterpart to 'a'
+        "c": {"type": "bool"},  # Unrelated variable in clone 2 scope
+        "d": {"type": "float"},  # True counterpart to 'c'
+    }
+
+    # Multiple outputs
+    ret_multi = _infer_outputs_return_type(
+        ["a", "c"],
+        set(),
+        meta1,
+        meta2,
+        outputs2=["b", "d"],
+    )
+    assert ret_multi == "Tuple[int, float]"
+
+    # Single output
+    ret_single = _infer_outputs_return_type(
+        ["a"],
+        set(),
+        meta1,
+        meta2,
+        outputs2=["b"],
+    )
+    assert ret_single == "int"
+
+
+def test_caller_unit_dicts_immutable_during_patch(tmp_path: Path) -> None:
+    """Verifies that generate_refactoring_patch does not mutate caller unit dictionaries in-place."""
+    code1 = (
+        "async def fn1():\n"
+        "    x = 1\n"
+        "    y = 2\n"
+        "    return x + y\n"
+    )
+    code2 = (
+        "async def fn2():\n"
+        "    x = 1\n"
+        "    y = 2\n"
+        "    return x + y\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+
+    u1 = {"file": str(f1), "start": 2, "end": 3, "name": "fn1", "kind": "compound_block"}
+    u2 = {"file": str(f2), "start": 2, "end": 3, "name": "fn2", "kind": "compound_block"}
+
+    u1_copy = dict(u1)
+    u2_copy = dict(u2)
+
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch != ""
+
+    assert u1 == u1_copy
+    assert u2 == u2_copy
+    assert "is_async" not in u1
+    assert "is_async" not in u2
+    assert "receiver_param" not in u1
+    assert "receiver_param" not in u2
+
+
+def test_caller_unit_dicts_immutable_during_synthesis(tmp_path: Path) -> None:
+    """Verifies that synthesize_shared_helper_code does not mutate caller dicts in-place."""
+    code = (
+        "class Worker:\n"
+        "    def run1(self):\n"
+        "        x = 1\n"
+        "        return x\n"
+        "    def run2(self):\n"
+        "        x = 1\n"
+        "        return x\n"
+    )
+    src_f = tmp_path / "worker.py"
+    src_f.write_text(code, encoding="utf-8")
+
+    u1 = {"file": str(src_f), "start": 2, "end": 4, "name": "run1", "kind": "function"}
+    u2 = {"file": str(src_f), "start": 5, "end": 7, "name": "run2", "kind": "function"}
+    u1_copy = dict(u1)
+    u2_copy = dict(u2)
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper != ""
+    assert u1 == u1_copy
+    assert u2 == u2_copy
+    assert "is_async" not in u1
+    assert "receiver_kind" not in u1
+    assert "is_async" not in u2
+    assert "receiver_kind" not in u2
+
+
+def test_synthesize_shared_helper_code_symmetric_global_filtering(tmp_path: Path) -> None:
+    """Verifies that synthesize_shared_helper_code filters globals/nonlocals from both u1 and u2 outputs."""
+    code = (
+        "global_var = 0\n"
+        "def fn1():\n"
+        "    global global_var\n"
+        "    global_var = 100\n"
+        "    common_calc = 10\n"
+        "    local_var = common_calc + 1\n"
+        "def fn2():\n"
+        "    global global_var\n"
+        "    global_var = 200\n"
+        "    common_calc = 10\n"
+        "    local_var = common_calc + 1\n"
+    )
+    f = tmp_path / "mod.py"
+    f.write_text(code, encoding="utf-8")
+
+    u1 = {
+        "file": str(f),
+        "start": 2,
+        "end": 6,
+        "name": "fn1",
+        "kind": "function",
+        "outputs": ["local_var", "global_var"],
+    }
+    u2 = {
+        "file": str(f),
+        "start": 7,
+        "end": 11,
+        "name": "fn2",
+        "kind": "function",
+        "outputs": ["local_var", "global_var"],
+    }
+
+    helper = synthesize_shared_helper_code(
+        u1,
+        u2,
+        repo_root=str(tmp_path),
+        helper_name="_shared_helper",
+    )
+    assert "return local_var" in helper
+    assert "return local_var, global_var" not in helper
+
+
+def test_infer_helper_return_type_untyped_generator_return_value() -> None:
+    """Verifies that a generator with explicit return value and untyped return emits Generator[yield_t, None, Any]."""
+    scope = {
+        "has_yield": True,
+        "is_async": False,
+        "has_return_value": True,
+        "yield_expr_names": [("yield", ":literal:int")],
+        "return_type": None,
+    }
+    ret_t = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope=scope,
+        meta1={},
+        meta2={},
+    )
+    assert ret_t == "Generator[int, None, Any]"
+
+
+@pytest.mark.skipif(sys.version_info < (3, 10), reason="Pattern matching requires Python 3.10+")
+def test_pattern_match_variable_bindings_scope() -> None:
+    """Verifies that Python 3.10+ pattern match bindings are recognized as local stores, not escaping reads."""
+    code = (
+        "def process(val):\n"
+        "    match val:\n"
+        "        case int(x):\n"
+        "            return x\n"
+        "        case [first, *rest]:\n"
+        "            return (first, rest)\n"
+        "        case {'data': item, **extra}:\n"
+        "            return (item, extra)\n"
+    )
+    tree = ast.parse(code)
+    fn_node = tree.body[0]
+    escaped = _extract_nested_scope_free_reads(fn_node)  # type: ignore[arg-type]
+    # val is a param; x, first, rest, item, extra are bound by pattern matching and should NOT escape
+    assert "x" not in escaped
+    assert "first" not in escaped
+    assert "rest" not in escaped
+    assert "item" not in escaped
+    assert "extra" not in escaped
+
+    # In downstream read visitor, pattern match binding kills prior reaching definition
+    downstream_code = (
+        "def worker():\n"
+        "    x = 1\n"
+        "    match val:\n"
+        "        case int(x):\n"
+        "            print(x)\n"
+    )
+    unit = {"start": 2, "end": 2}
+    reads = collect_downstream_read_names(downstream_code, unit, candidates={"x"})
+    assert reads is not None
+    assert "x" not in reads
+
+
+def test_infer_outputs_return_type_single_output_precedence() -> None:
+    """Verifies that explicit single-output type takes precedence over enclosing resolved_ret unless Any."""
+    # Known output type "str" should override enclosing resolved_ret "int"
+    ret = _infer_outputs_return_type(
+        helper_outputs=["res"],
+        conditional_outs=set(),
+        meta1={"res": {"type": "str"}},
+        meta2={"res": {"type": "str"}},
+        type_merge_strategy="prefer_first",
+        resolved_ret="int",
+    )
+    assert ret == "str"
+
+    # When output type is "Any", fall back to enclosing resolved_ret "int"
+    ret_fallback = _infer_outputs_return_type(
+        helper_outputs=["res"],
+        conditional_outs=set(),
+        meta1={"res": {"type": "Any"}},
+        meta2={"res": {"type": "Any"}},
+        type_merge_strategy="prefer_first",
+        resolved_ret="int",
+    )
+    assert ret_fallback == "int"
+
+
+def test_is_subroutine_unit_classification() -> None:
+    """Verifies that is_subroutine_unit classifies subroutines vs functions and expressions."""
+    # True for compound blocks, sliding windows, and clause branches
+    assert is_subroutine_unit({"kind": "compound_block"}) is True
+    assert is_subroutine_unit({"kind": "sliding_window"}) is True
+    assert is_subroutine_unit({"kind": "clause_branch"}) is True
+
+    # False for top-level functions, closures, methods, comprehensions, and expressions
+    assert is_subroutine_unit({"kind": "function"}) is False
+    assert is_subroutine_unit({"kind": "method"}) is False
+    assert is_subroutine_unit({"kind": "closure"}) is False
+    assert is_subroutine_unit({"kind": "comprehension"}) is False
+    assert is_subroutine_unit({"kind": "complex_expr"}) is False
+
+    # Explicit is_subroutine flag takes precedence
+    assert is_subroutine_unit({"is_subroutine": True}) is True
+    assert is_subroutine_unit({"is_subroutine": False, "kind": "compound_block"}) is False
+
+    # Name-based colon heuristic restored for subroutines without explicit kind
+    assert is_subroutine_unit({"name": "process_module:10-25"}) is True
+    assert is_subroutine_unit({"name": "plain_function"}) is False
+    assert is_subroutine_unit({}) is False
+
+    # Defensive handling of non-dict types (public API guard)
+    assert is_subroutine_unit(None) is False
+    assert is_subroutine_unit("invalid") is False
+    assert is_subroutine_unit(123) is False
+    assert is_subroutine_unit([]) is False
+
+
+def test_harvested_subroutine_inherits_async_status_and_rejection(
+    tmp_path: Path,
+) -> None:
+    """Verifies harvested compound block in async def inherits is_async and rejects return."""
+    source = (
+        "async def process_stream(data):\n"
+        "    total = 0\n"
+        "    for item in data:\n"
+        "        total += item\n"
+        "        yield total\n"
+        "    print(total)\n"
+    )
+    f = tmp_path / "stream.py"
+    f.write_text(source, encoding="utf-8")
+
+    units = harvest_file_units(str(f), str(tmp_path), min_lines=2, min_tokens=5)
+    compound_units = [u for u in units if u.get("kind") == "compound_block"]
+    assert len(compound_units) >= 1
+    assert compound_units[0].get("is_async") is True
+
+    # Scope analysis inherits async status
+    scope_info = analyze_unit_variable_scope(compound_units[0], repo_root=str(tmp_path))
+    assert scope_info.get("is_async") is True
+
+    # Refactoring patch rejects async generator subroutine with outputs
+    u2 = dict(compound_units[0])
+    u2["start"] = 3
+    u2["end"] = 5
+    patch = generate_refactoring_patch(
+        [(0.95, compound_units[0], u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch == ""
+
+
+def test_infer_helper_return_type_generator_with_outputs_and_iterator() -> None:
+    """Verifies Iterator annotations are converted to Generator when outputs are returned."""
+    # 1. Iterator[int] with helper output of type str becomes Generator[int, None, str]
+    res_replaced = _infer_helper_return_type(
+        resolved_ret="Iterator[int]",
+        helper_outputs=["total"],
+        conditional_outs=set(),
+        scope={"has_yield": True, "yield_expr_names": []},
+        meta1={"total": {"type": "str"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_replaced == "Generator[int, None, str]"
+
+    # 2. Iterable[int] with explicit return value becomes Generator[int, None, Any]
+    res_ret_val = _infer_helper_return_type(
+        resolved_ret="Iterable[int]",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={"has_yield": True, "yield_expr_names": [], "has_return_value": True},
+        meta1={},
+        meta2={},
+        is_async=False,
+    )
+    assert res_ret_val == "Generator[int, None, Any]"
+
+    # 3. Iterator[float] without return values remains Iterator[float]
+    res_kept = _infer_helper_return_type(
+        resolved_ret="Iterator[float]",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={"has_yield": True, "yield_expr_names": []},
+        meta1={},
+        meta2={},
+        is_async=False,
+    )
+    assert res_kept == "Iterator[float]"
+
+    # 4. Qualified typing.Iterator[int] / collections.abc.Iterator[int] with untyped output
+    for qual_ret in ("typing.Iterator[int]", "collections.abc.Iterator[int]"):
+        res_qual = _infer_helper_return_type(
+            resolved_ret=qual_ret,
+            helper_outputs=["untyped_out"],
+            conditional_outs=set(),
+            scope={"has_yield": True, "yield_expr_names": []},
+            meta1={},
+            meta2={},
+            is_async=False,
+        )
+        assert res_qual == "Generator[int, None, Any]"
+
+
+def test_infer_helper_return_type_generator_with_yield_assignment() -> None:
+    """Verifies that yield expressions in assignment context infer Any send type instead of None."""
+    # When scope has_yield_assignment is True, send type defaults to Any
+    res = _infer_helper_return_type(
+        resolved_ret="Iterator[int]",
+        helper_outputs=["total"],
+        conditional_outs=set(),
+        scope={"has_yield": True, "has_yield_assignment": True, "yield_expr_names": []},
+        meta1={"total": {"type": "str"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res == "Generator[int, Any, str]"
+
+    # Existing explicit send type in resolved_ret is preserved
+    res_explicit = _infer_helper_return_type(
+        resolved_ret="Generator[int, str, None]",
+        helper_outputs=["total"],
+        conditional_outs=set(),
+        scope={"has_yield": True, "has_yield_assignment": True, "yield_expr_names": []},
+        meta1={"total": {"type": "str"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_explicit == "Generator[int, str, str]"
+
+
+def test_split_type_args_nested_bracket_depth() -> None:
+    """Verifies bracket-depth aware splitting of nested generic type arguments."""
+    # Empty or non-generic strings
+    assert not _split_type_args("int")
+    assert not _split_type_args("")
+
+    # Multi-argument nested generic
+    t1 = "Generator[Tuple[int, str], None, Dict[str, Any]]"
+    assert _split_type_args(t1) == ["Tuple[int, str]", "None", "Dict[str, Any]"]
+
+    # Stray leading and trailing whitespace immunity
+    t1_ws = "  Generator[Tuple[int, str], None, Dict[str, Any]] \n "
+    assert _split_type_args(t1_ws) == ["Tuple[int, str]", "None", "Dict[str, Any]"]
+
+    # Deeply nested generics
+    t2 = "Union[Dict[str, List[int]], Optional[Tuple[float, bool]]]"
+    assert _split_type_args(t2) == [
+        "Dict[str, List[int]]",
+        "Optional[Tuple[float, bool]]",
+    ]
+
+    # Forward references and string literals containing commas
+    t3 = "Tuple['Literal, Value', int]"
+    assert _split_type_args(t3) == ["'Literal, Value'", "int"]
+
+    t4 = 'Union[Literal["a, b", "c"], Dict[str, "X, Y"]]'
+    assert _split_type_args(t4) == [
+        'Literal["a, b", "c"]',
+        'Dict[str, "X, Y"]',
+    ]
+
+    t5 = r'Tuple["a\"b, c", int]'
+    assert _split_type_args(t5) == [r'"a\"b, c"', "int"]
+
+    # Mismatched bracket depth and unclosed quotes fail closed to empty list
+    assert not _split_type_args("Generator[int, Tuple[str, int]")
+    assert not _split_type_args("Dict[str, List[int]")
+    assert not _split_type_args("Tuple['unclosed, int]")
+    assert not _split_type_args('Tuple["unclosed, int]')
+
+    # Inference in _infer_helper_return_type preserving nested tuple yield type
+    scope = {
+        "has_yield": True,
+        "yield_expr_names": [("yield_from", "stream")],
+        "has_return_value": False,
+    }
+    res = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope=scope,
+        meta1={"stream": {"type": "Iterator[Tuple[int, str]]"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res == "Iterator[Tuple[int, str]]"
+
+
+def test_analyze_unit_variable_scope_does_not_mutate_caller_unit() -> None:
+    """Verifies analyze_unit_variable_scope does not mutate the passed unit dictionary in-place."""
+    unit = {
+        "start": 2,
+        "end": 3,
+        "source_lines": ["def sample():\n", "    x = 1\n", "    return x\n"],
+    }
+    original_keys = set(unit.keys())
+    res = analyze_unit_variable_scope(unit)
+    assert "is_async" in res
+    assert set(unit.keys()) == original_keys
+    assert "is_async" not in unit
+
+
+def test_inspect_unit_scope_prioritizes_full_source_text_over_sliced_lines() -> None:
+    """Verifies full source text is prioritized over sliced unit lines to resolve async status."""
+    full_text = (
+        "async def async_worker(items):\n"
+        "    total = 0\n"
+        "    for item in items:\n"
+        "        yield item\n"
+        "    return total\n"
+    )
+    unit = {
+        "start": 3,
+        "end": 4,
+        "source_lines": ["    for item in items:\n", "        yield item\n"],
+        "source_text": full_text,
+    }
+    scope = analyze_unit_variable_scope(unit)
+    assert scope["is_async"] is True
+
+
+def test_infer_helper_return_type_yield_from_tuples() -> None:
+    """Verifies that yield_from on Tuple types infers Union or homogeneous element types."""
+    scope = {
+        "has_yield": True,
+        "yield_expr_names": [("yield_from", "stream")],
+        "has_return_value": False,
+    }
+    # Heterogeneous tuple: Tuple[int, str] yields Union[int, str]
+    res_hetero = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope=scope,
+        meta1={"stream": {"type": "Tuple[int, str]"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_hetero == "Iterator[Union[int, str]]"
+
+    # Homogeneous variadic tuple: Tuple[int, ...] yields int
+    res_homo = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope=scope,
+        meta1={"stream": {"type": "Tuple[int, ...]"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_homo == "Iterator[int]"
+
+
+def test_return_type_precedence_whole_function_vs_subroutine() -> None:
+    """Verifies that whole-function units preserve declared return type over inferred
+    local store."""
+    scope = {
+        "has_yield": False,
+        "has_return": True,
+        "has_return_value": True,
+    }
+    meta1 = {"val": {"type": "int"}}
+    meta2 = {"val": {"type": "int"}}
+
+    # Whole-function unit (unit_kind="function"): declared -> Optional[int] preserved over int
+    res_func = _infer_helper_return_type(
+        resolved_ret="Optional[int]",
+        helper_outputs=["val"],
+        conditional_outs=set(),
+        scope=scope,
+        meta1=meta1,
+        meta2=meta2,
+        unit_kind="function",
+    )
+    assert res_func == "Optional[int]"
+
+    # Subroutine unit (unit_kind="compound_block"): outputs_ret takes precedence over enclosing ret
+    res_sub = _infer_helper_return_type(
+        resolved_ret="Optional[int]",
+        helper_outputs=["val"],
+        conditional_outs=set(),
+        scope=scope,
+        meta1=meta1,
+        meta2=meta2,
+        unit_kind="compound_block",
+    )
+    assert res_sub == "int"
+
+
+def test_synthesize_shared_helper_union_yield_type_imports() -> None:
+    """Verifies that Union is injected into typing imports when a helper has a union yield type."""
+    helper_code = (
+        "def _shared_helper() -> Iterator[Union[int, str]]:\n"
+        "    yield 1\n"
+    )
+    needed = _extract_required_typing_imports(helper_code)
+    assert "Iterator" in needed
+    assert "Union" in needed
+
+
+def test_synthesize_shared_helper_code_comprehension_unit_return_type_any(
+    tmp_path: Path,
+) -> None:
+    """Verifies that comprehension units with no explicit return type synthesize -> Any."""
+    src = (
+        "def f(items):\n"
+        "    return [x * 2 for x in items]\n"
+        "\n"
+        "def g(items):\n"
+        "    return [x * 2 for x in items]\n"
+    )
+    f_path = tmp_path / "comp_mod.py"
+    f_path.write_text(src, encoding="utf-8")
+    u1 = {
+        "name": "f:listcomp",
+        "file": str(f_path),
+        "start": 2,
+        "end": 2,
+        "kind": "comprehension",
+    }
+    u2 = {
+        "name": "g:listcomp",
+        "file": str(f_path),
+        "start": 5,
+        "end": 5,
+        "kind": "comprehension",
+    }
+    code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "-> Any:" in code
+    assert "-> None:" not in code
+
+
+def test_infer_helper_return_type_yield_from_dict_keys() -> None:
+    """Verifies that yield from on a Dict/dict mapping type infers Iterator[KeyType]."""
+    scope = {"has_yield": True, "yield_expr_names": [("yield_from", "mapping")]}
+    meta1 = {"mapping": {"type": "Dict[str, int]"}}
+    meta2 = {"mapping": {"type": "dict[str, int]"}}
+    ret = _infer_helper_return_type(
+        "Any",
+        [],
+        set(),
+        scope,
+        meta1,
+        meta2,
+    )
+    assert ret == "Iterator[str]"
+
+
+def test_infer_helper_return_type_yield_from_mapping_keys() -> None:
+    """Verifies that yield from on a Mapping/mapping type infers Iterator[KeyType]."""
+    scope = {"has_yield": True, "yield_expr_names": [("yield_from", "mapping")]}
+    meta1 = {"mapping": {"type": "mapping[str, int]"}}
+    meta2 = {"mapping": {"type": "mapping[str, int]"}}
+    ret = _infer_helper_return_type(
+        "Any",
+        [],
+        set(),
+        scope,
+        meta1,
+        meta2,
+    )
+    assert ret == "Iterator[str]"
+
+
+def test_synthesize_shared_helper_code_unpaired_output_fallback_aligned(
+    tmp_path: Path,
+) -> None:
+    """Verifies that when clone output name sets match but positional orderings conflict,
+    positional alignment merges counterpart types (int vs str -> Any) rather than unsoundly
+    re-ordering outputs by name.
+    """
+    src1 = (
+        "def f(a: int, b: str):\n"
+        "    return a, b\n"
+    )
+    src2 = (
+        "def g(b: str, a: int):\n"
+        "    return b, a\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+    u1 = {"file": str(f1), "start": 1, "end": 2, "name": "f", "kind": "function"}
+    u2 = {"file": str(f2), "start": 1, "end": 2, "name": "g", "kind": "function"}
+    code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert code != ""
+    assert "Tuple[Any, Any]" in code
+    assert "return a, b" in code
+
+
+def test_synthesize_shared_helper_code_unpaired_output_positional_aligned(
+    tmp_path: Path,
+) -> None:
+    """Verifies that when clone output names differ across units, positional pairing
+    correctly aligns counterpart types."""
+    src1 = (
+        "def f(x: int, y: str):\n"
+        "    return x, y\n"
+    )
+    src2 = (
+        "def g(a: int, b: str):\n"
+        "    return a, b\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+    u1 = {"file": str(f1), "start": 1, "end": 2, "name": "f", "kind": "function"}
+    u2 = {"file": str(f2), "start": 1, "end": 2, "name": "g", "kind": "function"}
+    code = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert code != ""
+    assert "Tuple[int, str]" in code
+    assert "return x, y" in code
+
+
+def test_patch_subroutine_effective_units_with_precomputed_outputs(
+    tmp_path: Path,
+) -> None:
+    """Verifies that generate_refactoring_patch uses effective units with precomputed outputs
+    when resolving generator subroutine outputs."""
+    src1 = (
+        "def process1(items):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "        yield x\n"
+        "    return total\n"
+    )
+    src2 = (
+        "def process2(items):\n"
+        "    count = 0\n"
+        "    for y in items:\n"
+        "        count += y\n"
+        "        yield y\n"
+        "    return count\n"
+    )
+    f1 = tmp_path / "p1.py"
+    f2 = tmp_path / "p2.py"
+    f1.write_text(src1, encoding="utf-8")
+    f2.write_text(src2, encoding="utf-8")
+
+    u1 = {
+        "file": str(f1),
+        "start": 3,
+        "end": 5,
+        "name": "process1:for",
+        "kind": "compound_block",
+        "outputs": ["total", "x"],
+    }
+    u2 = {
+        "file": str(f2),
+        "start": 3,
+        "end": 5,
+        "name": "process2:for",
+        "kind": "compound_block",
+        "outputs": ["count", "y"],
+    }
+    patch = generate_refactoring_patch(
+        [(0.95, u1, u2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch != ""
+    assert "yield from _shared" in patch
+    assert "total = (yield from _shared" in patch
+    assert "count = (yield from _shared" in patch
+    assert "total, x" not in patch
+    assert "count, y" not in patch
+
+
+def test_file_patch_plan_content_digest_caching() -> None:
+    """Verifies that _FilePatchPlan lazily computes and caches content_digest."""
+    from pydoppelgangerhunt.fixer.patch import _FilePatchPlan
+
+    plan = _FilePatchPlan(
+        file_path=Path("test.py"),
+        rel_path="test.py",
+        orig_text="a = 1\nb = 2\n",
+        is_new_file=False,
+    )
+    digest1 = plan.content_digest
+    assert len(digest1) == 64
+    assert digest1 == hashlib.sha256("a = 1\nb = 2\n".encode("utf-8")).hexdigest()
+    digest2 = plan.content_digest
+    assert digest1 == digest2
+    assert plan._content_digest is not None
+
+
+@pytest.mark.parametrize(
+    ("helper_outs", "outs2", "cond_outs", "meta1", "meta2", "expected"),
+    [
+        (
+            ["total"],
+            ["count"],
+            {"count"},
+            {"total": {"type": "int"}},
+            {"count": {"type": "int"}},
+            "Optional[int]",
+        ),
+        (
+            ["total"],
+            ["count"],
+            {"total"},
+            {"total": {"type": "int"}},
+            {"count": {"type": "int"}},
+            "Optional[int]",
+        ),
+        (
+            ["total"],
+            ["count"],
+            set(),
+            {"total": {"type": "int"}},
+            {"count": {"type": "int"}},
+            "int",
+        ),
+        (
+            ["a", "b"],
+            ["x", "y"],
+            {"y"},
+            {"a": {"type": "int"}, "b": {"type": "str"}},
+            {"x": {"type": "int"}, "y": {"type": "str"}},
+            "Tuple[int, Optional[str]]",
+        ),
+        (
+            ["a", "b"],
+            ["x", "y"],
+            {"a"},
+            {"a": {"type": "int"}, "b": {"type": "str"}},
+            {"x": {"type": "int"}, "y": {"type": "str"}},
+            "Tuple[Optional[int], str]",
+        ),
+    ],
+)
+def test_infer_outputs_return_type_symmetric_conditional_outs(
+    helper_outs: List[str],
+    outs2: List[str],
+    cond_outs: Set[str],
+    meta1: Dict[str, Any],
+    meta2: Dict[str, Any],
+    expected: str,
+) -> None:
+    """Verifies that conditional_outs checks both primary and paired clone variables."""
+    res = _infer_outputs_return_type(
+        helper_outputs=helper_outs,
+        conditional_outs=cond_outs,
+        meta1=meta1,
+        meta2=meta2,
+        type_merge_strategy="fallback_any",
+        outputs2=outs2,
+    )
+    assert res == expected
+
+
+def test_synthesize_shared_helper_code_strictness_propagation(tmp_path: Path) -> None:
+    """Verifies that closure strictness parameters configure generator output synthesis."""
+    code = (
+        "def outer(items):\n"
+        "    cb = lambda: total\n"
+        "    for x in items:\n"
+        "        total = x\n"
+        "        yield x\n"
+        "    return 0\n"
+    )
+    f = tmp_path / "strictness_mod.py"
+    f.write_text(code, encoding="utf-8")
+    u = {
+        "file": str(f),
+        "start": 3,
+        "end": 5,
+        "kind": "sliding_window",
+        "name": "outer:stmts",
+    }
+    # Strict mode: fails closed due to pre-unit closure capturing 'total'
+    res_strict = synthesize_shared_helper_code(
+        u, u, repo_root=str(tmp_path), closure_strictness="strict"
+    )
+    assert res_strict == ""
+
+    # Lenient mode: bypasses pre-unit closure check and synthesizes helper
+    res_lenient = synthesize_shared_helper_code(
+        u, u, repo_root=str(tmp_path), closure_strictness="lenient"
+    )
+    assert "def _shared_outer" in res_lenient
+    assert "yield" in res_lenient
+
+    # Direct skip_pre_unit_closures=True flag behaves identically
+    res_skip = synthesize_shared_helper_code(
+        u, u, repo_root=str(tmp_path), skip_pre_unit_closures=True
+    )
+    assert "def _shared_outer" in res_skip
+
+
+def test_inspect_unit_scope_synthetic_wrapper_explicit_return_and_hazards(
+    tmp_path: Path,
+) -> None:
+    """Verifies that explicit returns and hazards inside wrapped subroutines are detected."""
+    # A subroutine unit with an indented yield and return inside a compound block
+    code = (
+        "def outer(items):\n"
+        "    for x in items:\n"
+        "        yield x\n"
+        "        return x\n"
+    )
+    mod_file = tmp_path / "sub_wrapped.py"
+    mod_file.write_text(code, encoding="utf-8")
+    u = {
+        "file": str(mod_file),
+        "start": 3,
+        "end": 4,
+        "kind": "compound_block",
+        "name": "outer:for",
+    }
+    scope = _inspect_unit_scope(u, repo_root=str(tmp_path))
+    assert scope["has_yield"] is True
+    assert scope["has_return"] is True
+    assert scope["has_return_value"] is True
+    assert "x" in scope["outputs"]
+    # Embedded return hazard is correctly identified on the subroutine block
+    assert "embedded_return" in scope["control_flow_hazards"]
+    assert scope["is_control_flow_safe"] is False
+
+    # Nested helper function inside subroutine should not leak return out to the subroutine
+    code_nested = (
+        "def outer(items):\n"
+        "    for x in items:\n"
+        "        def helper():\n"
+        "            return 99\n"
+        "        yield helper()\n"
+    )
+    mod_file2 = tmp_path / "sub_nested.py"
+    mod_file2.write_text(code_nested, encoding="utf-8")
+    u2 = {
+        "file": str(mod_file2),
+        "start": 3,
+        "end": 5,
+        "kind": "compound_block",
+        "name": "outer:for",
+    }
+    scope2 = _inspect_unit_scope(u2, repo_root=str(tmp_path))
+    assert scope2["has_yield"] is True
+    assert scope2["has_return"] is False
+    assert scope2["has_return_value"] is False
+    assert "embedded_return" not in scope2["control_flow_hazards"]
+
+
+def test_process_func_does_not_flatten_user_inner_wrapper(tmp_path: Path) -> None:
+    """Verifies that an inner function named _wrapper in a whole-function unit is not flattened."""
+    code = (
+        "def my_decorator(fn):\n"
+        "    inner_var = 1\n"
+        "    def _wrapper(*args, **kwargs):\n"
+        "        wrapper_local = 2\n"
+        "        return fn(*args, **kwargs)\n"
+        "    return _wrapper\n"
+    )
+    f = tmp_path / "dec.py"
+    f.write_text(code, encoding="utf-8")
+    unit = {
+        "file": str(f),
+        "start": 1,
+        "end": 6,
+        "name": "my_decorator",
+        "kind": "function",
+    }
+    scope_info = analyze_unit_variable_scope(unit, repo_root=str(tmp_path))
+    assert "wrapper_local" not in scope_info.get("stores", set())
+    assert "wrapper_local" not in scope_info.get("outputs", [])
+    assert "_wrapper" in scope_info.get("outputs", [])
+
+
+def test_infer_helper_return_type_subroutine_no_outputs_ignores_resolved_ret() -> None:
+    """Verifies subroutine with no outputs and no return returns None, ignoring enclosing return."""
+    # pylint: disable=protected-access
+    ret = _infer_helper_return_type(
+        helper_outputs=[],
+        conditional_outs=set(),
+        meta1={},
+        meta2={},
+        scope={"has_return": False, "has_return_value": False},
+        resolved_ret="int",
+        is_subroutine=True,
+    )
+    assert ret == "None"
+
+
+def test_inspect_single_unit_scope_interface() -> None:
+    """Verifies that inspect_single_unit_scope analyzes an individual unit with a single tree."""
+    code = "def f():\n    a = 1\n    return a + 2\n"
+    tree = ast.parse(code)
+    unit = {"file": "mod.py", "start": 2, "end": 3, "source_text": code}
+    info = inspect_single_unit_scope(unit, tree=tree)
+    assert "inputs" in info
+    assert "outputs" in info
+    assert "definite_stores" in info
+
+
+def test_yield_send_type_non_expr_contexts() -> None:
+    """Verifies that yield expressions in non-ast.Expr parent contexts (return, call, if, assign)
+    set has_yield_assignment=True to preserve send-type analysis."""
+    # Context 1: return (yield x)
+    code_ret = "def g():\n    return (yield 42)\n"
+    u_ret = {"file": "m.py", "start": 2, "end": 2, "source_text": code_ret}
+    info_ret = inspect_single_unit_scope(u_ret)
+    assert info_ret.get("has_yield_assignment") is True
+
+    # Context 2: f((yield x))
+    code_call = "def g():\n    func((yield 1))\n"
+    u_call = {"file": "m.py", "start": 2, "end": 2, "source_text": code_call}
+    info_call = inspect_single_unit_scope(u_call)
+    assert info_call.get("has_yield_assignment") is True
+
+    # Context 3: if (yield x):
+    code_if = "def g():\n    if (yield 1):\n        pass\n"
+    u_if = {"file": "m.py", "start": 2, "end": 3, "source_text": code_if}
+    info_if = inspect_single_unit_scope(u_if)
+    assert info_if.get("has_yield_assignment") is True
+
+    # Context 4: bare statement yield (parent is ast.Expr)
+    code_expr = "def g():\n    yield 1\n"
+    u_expr = {"file": "m.py", "start": 2, "end": 2, "source_text": code_expr}
+    info_expr = inspect_single_unit_scope(u_expr)
+    assert info_expr.get("has_yield_assignment") is False
+
+
+def test_subroutine_async_preservation_in_async_func(tmp_path: Path) -> None:
+    """Verifies that a pure synchronous subroutine block inside an async def does not
+    inherit is_async=True and can be successfully refactored with a sync clone."""
+    file1 = tmp_path / "mod1.py"
+    file2 = tmp_path / "mod2.py"
+    file1.write_text(
+        "async def handle_request(req):\n"
+        "    a = 1\n"
+        "    b = 2\n"
+        "    res = a + b\n"
+        "    await req.send(res)\n",
+        encoding="utf-8",
+    )
+    file2.write_text(
+        "def process_data():\n"
+        "    a = 1\n"
+        "    b = 2\n"
+        "    res = a + b\n"
+        "    return res\n",
+        encoding="utf-8",
+    )
+    u1 = {"file": str(file1), "start": 2, "end": 4, "is_subroutine": True}
+    scope1 = inspect_single_unit_scope(u1, repo_root=str(tmp_path))
+    assert scope1.get("is_async") is False
+    assert scope1.get("has_yield") is False
+
+    file_gen = tmp_path / "gen.py"
+    file_gen.write_text(
+        "async def gen_items():\n"
+        "    yield 1\n",
+        encoding="utf-8",
+    )
+    u_gen = {"file": str(file_gen), "start": 2, "end": 2, "is_subroutine": True}
+    scope_gen = inspect_single_unit_scope(u_gen, repo_root=str(tmp_path))
+    assert scope_gen.get("has_yield") is True
+
+
+def test_inspect_single_unit_scope_yield_with_unresolved_source_preserves_indeterminate_async(
+) -> None:
+    """Verifies that a yield-containing unit with unresolved enclosing source
+    preserves is_async=None rather than coercing to False."""
+    unit = {
+        "file": "virtual_module.py",
+        "start": 2,
+        "end": 2,
+        "source_lines": ["yield 42\n"],
+        "source_lines_is_sliced": True,
+        "is_subroutine": True,
+    }
+    scope = inspect_single_unit_scope(unit)
+    assert scope.get("has_yield") is True
+    assert scope.get("is_async") is None
+
+
+def test_generator_send_type_preserved_when_return_type_none() -> None:
+    """Verifies that a generator with yield assignment but no outputs or return value
+    preserves send type as Generator[yield_t, send_t, None] rather than
+    falling back to Iterator."""
+    res = _infer_helper_return_type(
+        resolved_ret="Iterator[int]",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={
+            "has_yield": True,
+            "has_yield_assignment": True,
+            "yield_expr_names": [],
+            "has_return_value": False,
+        },
+        meta1={},
+        meta2={},
+        is_async=False,
+    )
+    assert res == "Generator[int, Any, None]"
+
+    res_inferred = _infer_helper_return_type(
+        resolved_ret="Generator[str, bytes, None]",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={
+            "has_yield": True,
+            "has_yield_assignment": True,
+            "yield_expr_names": [],
+            "has_return_value": False,
+        },
+        meta1={},
+        meta2={},
+        is_async=False,
+    )
+    assert res_inferred == "Generator[str, bytes, None]"
+
+
+def test_normalize_pipe_unions_variants() -> None:
+    """Verifies PEP 604 pipe union normalization across simple, nested, and quoted types."""
+    assert _normalize_pipe_unions("int | str") == "Union[int, str]"
+    assert _normalize_pipe_unions("int | str | float") == "Union[int, str, float]"
+    assert _normalize_pipe_unions("int | int") == "int"
+    assert _normalize_pipe_unions("list[int | str]") == "list[Union[int, str]]"
+    assert _normalize_pipe_unions("int | None") == "Optional[int]"
+    assert _normalize_pipe_unions("None | int") == "Optional[int]"
+    assert _normalize_pipe_unions("Union[int, None]") == "Optional[int]"
+    assert _normalize_pipe_unions("int | str | None") == "Optional[Union[int, str]]"
+    assert _normalize_pipe_unions("None | int | str") == "Optional[Union[int, str]]"
+    assert _normalize_pipe_unions("int | None | str") == "Optional[Union[int, str]]"
+    assert _normalize_pipe_unions("Union[int, str, None]") == "Optional[Union[int, str]]"
+    assert _normalize_pipe_unions("Union[None, int, str]") == "Optional[Union[int, str]]"
+    assert _normalize_pipe_unions("int | str | float | None") == "Optional[Union[int, str, float]]"
+    assert _normalize_pipe_unions("None | None") == "None"
+    assert _normalize_pipe_unions("None | NoneType") == "None"
+    assert _normalize_pipe_unions("Iterator[int | None]") == "Iterator[Optional[int]]"
+    assert _normalize_pipe_unions("tuple[int | str, ...]") == "tuple[Union[int, str], ...]"
+    assert _normalize_pipe_unions("Tuple[int | str, float]") == "Tuple[Union[int, str], float]"
+    assert _normalize_pipe_unions("Union[int | str, float]") == "Union[int, str, float]"
+    assert _normalize_pipe_unions("typing.Union[int | str, float]") == "Union[int, str, float]"
+    assert _normalize_pipe_unions("int | typing.Union[str, float]") == "Union[int, str, float]"
+    assert _normalize_pipe_unions("typing.Union[int]") == "int"
+    assert (
+        _normalize_pipe_unions("list[typing.Union[int | str, float]]")
+        == "list[Union[int, str, float]]"
+    )
+    assert (
+        _normalize_pipe_unions("Dict[str, list[int | None]]")
+        == "Dict[str, list[Optional[int]]]"
+    )
+    assert _normalize_pipe_unions('Annotated[int, "a | b"]') == 'Annotated[int, "a | b"]'
+    assert (
+        _normalize_pipe_unions('Annotated[int | None, "a | b"]')
+        == 'Annotated[Optional[int], "a | b"]'
+    )
+    assert (
+        _normalize_pipe_unions('Annotated[int, Value("x | y")]')
+        == 'Annotated[int, Value("x | y")]'
+    )
+    assert (
+        _normalize_pipe_unions('Annotated[int | str, Value("x | y")]')
+        == 'Annotated[Union[int, str], Value("x | y")]'
+    )
+    assert _normalize_pipe_unions("'int | str'") == "'Union[int, str]'"
+    assert _normalize_pipe_unions("int") == "int"
+    assert _normalize_pipe_unions("") == ""
+    assert _normalize_pipe_unions(None) == ""
+    assert _normalize_pipe_unions(123) == "123"  # type: ignore[arg-type]
+
+
+def test_infer_helper_return_type_pep604_pipe_union_in_container_yields() -> None:
+    """Verifies that _infer_helper_return_type normalizes pipe unions in container yields."""
+    # Container yield_from with list[int | str]
+    res_list = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={
+            "has_yield": True,
+            "has_yield_assignment": False,
+            "yield_expr_names": [("yield_from", "items")],
+            "has_return_value": False,
+        },
+        meta1={"items": {"type": "list[int | str]"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_list == "Iterator[Union[int, str]]"
+
+    # Container yield_from with tuple[int | str, ...]
+    res_tuple = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={
+            "has_yield": True,
+            "has_yield_assignment": False,
+            "yield_expr_names": [("yield_from", "items")],
+            "has_return_value": False,
+        },
+        meta1={"items": {"type": "tuple[int | str, ...]"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_tuple == "Iterator[Union[int, str]]"
+
+    # Direct yield with int | None
+    res_yield = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={
+            "has_yield": True,
+            "has_yield_assignment": False,
+            "yield_expr_names": [("yield", "item")],
+            "has_return_value": False,
+        },
+        meta1={"item": {"type": "int | None"}},
+        meta2={},
+        is_async=False,
+    )
+    assert res_yield == "Iterator[Optional[int]]"
+
+
+def test_split_type_args_trailing_comma() -> None:
+    """Verifies that _split_type_args ignores trailing commas and trailing whitespace."""
+    assert _split_type_args("Tuple[int,]") == ["int"]
+    assert _split_type_args("Tuple[int, ]") == ["int"]
+    assert _split_type_args("Tuple[int, str, ]") == ["int", "str"]
+    assert _split_type_args("Tuple[]") == []
+    assert _normalize_pipe_unions("Tuple[int | str, ]") == "Tuple[Union[int, str]]"
+
+
+def test_find_innermost_enclosing_node_none_end_lineno() -> None:
+    """Verifies _find_innermost_enclosing_node handles AST nodes with end_lineno=None."""
+    from pydoppelgangerhunt.fixer.source import _find_innermost_enclosing_node
+
+    fn = ast.FunctionDef(
+        name="foo",
+        args=ast.arguments(
+            posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]
+        ),
+        body=[ast.Pass(lineno=2, end_lineno=None)],
+        decorator_list=[],
+        lineno=1,
+    )
+    fn.end_lineno = None  # Explicitly None
+    mod = ast.Module(body=[fn], type_ignores=[])
+
+    matched_res = _find_innermost_enclosing_node(
+        source_text="",
+        unit={"start": 1, "end": 1},
+        node_types=(ast.FunctionDef,),
+        tree=mod,
+    )
+    assert matched_res is not None
+    matched, start, end = matched_res
+    assert matched is fn
+    assert start == 1
+    assert end == 1
+
+
+def test_node_is_effectively_async_scope_pruning() -> None:
+    """Verifies _node_is_effectively_async prunes nested callable and class definitions."""
+    from pydoppelgangerhunt.parser import _node_is_effectively_async
+
+    # Inner sync generator inside an async def should not make a sync block effectively async
+    code_sync_gen = (
+        "if cond:\n"
+        "    def sync_helper():\n"
+        "        yield 1\n"
+    )
+    tree_sync = ast.parse(code_sync_gen)
+    assert not _node_is_effectively_async(tree_sync.body[0], enclosing_is_async=True)
+
+    # Inner async function inside a sync block should not make the outer sync block async
+    code_async_func = (
+        "if cond:\n"
+        "    async def async_helper():\n"
+        "        await something()\n"
+    )
+    tree_async = ast.parse(code_async_func)
+    assert not _node_is_effectively_async(tree_async.body[0], enclosing_is_async=False)
+
+    # Direct await inside the block IS async
+    code_direct_await = (
+        "async def wrapper():\n"
+        "    if cond:\n"
+        "        await something()\n"
+    )
+    tree_direct = ast.parse(code_direct_await)
+    assert isinstance(tree_direct.body[0], ast.AsyncFunctionDef)
+    assert _node_is_effectively_async(tree_direct.body[0].body[0], enclosing_is_async=False)
+
+    # Async list comprehension without explicit await is effectively async
+    code_async_comp = (
+        "async def wrapper():\n"
+        "    if cond:\n"
+        "        res = [x async for x in items]\n"
+    )
+    tree_comp = ast.parse(code_async_comp)
+    assert isinstance(tree_comp.body[0], ast.AsyncFunctionDef)
+    assert _node_is_effectively_async(tree_comp.body[0].body[0], enclosing_is_async=False)
+
+    # Async generator comprehension is effectively async
+    code_async_gen = (
+        "async def wrapper():\n"
+        "    if cond:\n"
+        "        res = (x async for x in items)\n"
+    )
+    tree_gen = ast.parse(code_async_gen)
+    assert isinstance(tree_gen.body[0], ast.AsyncFunctionDef)
+    assert _node_is_effectively_async(tree_gen.body[0].body[0], enclosing_is_async=False)
+
+    # Generator lambda inside an enclosing async function should not make
+    # the surrounding block async
+    code_lambda_gen = (
+        "if cond:\n"
+        "    cb = lambda: (yield 1)\n"
+    )
+    tree_lambda = ast.parse(code_lambda_gen)
+    assert not _node_is_effectively_async(tree_lambda.body[0], enclosing_is_async=True)
+
+
+def test_parse_candidates_def_precedes_async_def() -> None:
+    """Verifies that synchronous def wrapper is attempted before async def wrapper in scope."""
+    from pydoppelgangerhunt.fixer.scope import _inspect_unit_scope
+
+    unit = {
+        "source_text": "return 42\n",
+        "file": "test.py",
+        "start": 1,
+        "end": 1,
+    }
+    res = _inspect_unit_scope(unit)
+    assert res is not None
+    assert res["is_async"] is False
+    assert res["has_return_value"] is True
+
+
+def test_unwrap_iterable_item_type_unions_and_iterables() -> None:
+    """Verifies _unwrap_iterable_item_type handles top-level unions and iterables."""
+    from pydoppelgangerhunt.fixer.synthesis import _unwrap_iterable_item_type
+
+    assert _unwrap_iterable_item_type("List[int] | List[str]") == "Union[int, str]"
+    assert _unwrap_iterable_item_type("Union[List[int], List[str]]") == "Union[int, str]"
+    assert _unwrap_iterable_item_type("typing.List[int] | typing.Set[str]") == "Union[int, str]"
+    assert _unwrap_iterable_item_type("Tuple[int, ...] | List[int]") == "int"
+    assert _unwrap_iterable_item_type("Tuple[int, str]") == "Union[int, str]"
+    assert _unwrap_iterable_item_type("Dict[str, int]") == "str"
+    assert _unwrap_iterable_item_type("Generator[int, None, None]") == "int"
+    assert _unwrap_iterable_item_type("mapping[str, int]") == "str"
+    assert _unwrap_iterable_item_type("mutablemapping[str, int]") == "str"
+    assert _unwrap_iterable_item_type("sequence[int]") == "int"
+    assert _unwrap_iterable_item_type("iterable[str]") == "str"
+    assert _unwrap_iterable_item_type("iterator[float]") == "float"
+    assert _unwrap_iterable_item_type("collection[bytes]") == "bytes"
+    assert _unwrap_iterable_item_type("int") is None
+    assert _unwrap_iterable_item_type("Union[List[int], int]") is None
+
+
+def test_infer_helper_return_type_yield_from_unsplit_pipe_union() -> None:
+    """Verifies _infer_helper_return_type unwraps pipe union iterables in yield from."""
+    from pydoppelgangerhunt.fixer.synthesis import _infer_helper_return_type
+
+    scope: Dict[str, Any] = {
+        "has_yield": True,
+        "yield_expr_names": [("yield_from", "items")],
+    }
+    meta1: Dict[str, Any] = {"items": {"type": "List[int] | List[str]"}}
+    meta2: Dict[str, Any] = {}
+    res = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope=scope,
+        meta1=meta1,
+        meta2=meta2,
+    )
+    assert res == "Iterator[Union[int, str]]"
+
+
+def test_subroutine_with_inner_wrapper_func_namespace_collision(tmp_path: Path) -> None:
+    """Verifies subroutine containing inner def _wrapper() is not flattened."""
+    code = (
+        "def _wrapper():\n"
+        "    hidden_var = 10\n"
+        "    return hidden_var\n"
+        "res = _wrapper()\n"
+    )
+    f = tmp_path / "sub.py"
+    f.write_text(code, encoding="utf-8")
+    unit = {
+        "file": str(f),
+        "start": 1,
+        "end": 4,
+        "name": "compound_block",
+        "kind": "compound_block",
+    }
+    scope_info = analyze_unit_variable_scope(unit, repo_root=str(tmp_path))
+    # hidden_var inside _wrapper must NOT be flattened into the subroutine's outer scope
+    assert "hidden_var" not in scope_info.get("stores", set())
+    assert "hidden_var" not in scope_info.get("outputs", [])
+    stores = scope_info.get("stores", set())
+    outputs = scope_info.get("outputs", [])
+    assert "_wrapper" in stores or "_wrapper" in outputs
+
+
+def test_normalize_pipe_unions_preserves_string_literal_pipes() -> None:
+    """Verifies that _normalize_pipe_unions does not transform pipe characters inside
+    Literal string arguments into Union types."""
+    assert _normalize_pipe_unions('Literal["r | w"]') == 'Literal["r | w"]'
+    assert _normalize_pipe_unions("typing.Literal['a | b']") == "typing.Literal['a | b']"
+    assert (
+        _normalize_pipe_unions('Literal["r | w", "x | y"]')
+        == 'Literal["r | w", "x | y"]'
+    )
+    assert (
+        _normalize_pipe_unions('int | Literal["r | w"]')
+        == 'Union[int, Literal["r | w"]]'
+    )
+    assert (
+        _normalize_pipe_unions("typing_extensions.Literal['a | b']")
+        == "typing_extensions.Literal['a | b']"
+    )
+    assert (
+        _normalize_pipe_unions("typing_extensions.Union[int | str, float]")
+        == "Union[int, str, float]"
+    )
+
+
+def test_split_delimited_type_string_unmatched_closing_bracket() -> None:
+    """Verifies that _split_delimited_type_string handles unmatched closing brackets safely."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _split_delimited_type_string,
+        _split_pipe_union_args,
+    )
+
+    # With require_balanced=True, unmatched closing bracket returns []
+    assert _split_delimited_type_string("int] | str", "|", require_balanced=True) == []
+    assert _split_delimited_type_string("int) | str", "|", require_balanced=True) == []
+    assert _split_delimited_type_string("int} | str", "|", require_balanced=True) == []
+
+    # With require_balanced=False, fallback to unsplit string rather than partial split
+    assert (
+        _split_delimited_type_string("int] | str", "|", require_balanced=False)
+        == ["int] | str"]
+    )
+    assert _split_pipe_union_args("int] | str") == ["int] | str"]
+
+
+def test_split_type_args_and_delimited_string_malformed_inputs() -> None:
+    """Verifies that _split_type_args and _split_delimited_type_string strictly reject
+    malformed, unbalanced, or compound disjoint bracket inputs."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _split_delimited_type_string,
+        _split_type_args,
+    )
+
+    # 1. Excess closing bracket at the end
+    assert _split_type_args("Tuple[int]]") == []
+
+    # 2. Compound types with disjoint brackets
+    assert _split_type_args("Tuple[int] | List[str]") == []
+
+    # 3. Delimited type string with premature closing bracket
+    assert _split_delimited_type_string("a | b]", "|") == []
+
+    # 4. Missing opening bracket or unclosed bracket
+    assert _split_type_args("int]") == []
+    assert _split_type_args("[int") == []
+    assert _split_type_args("Tuple[[int]") == []
+
+    # 5. String literal containing brackets inside generic
+    assert _split_type_args('Literal["]"]') == ['"]"']
+    assert _split_type_args('Literal["["]') == ['"["']
+
+
+def test_flatten_union_args_typing_extensions() -> None:
+    """Verifies that _flatten_union_args unnests typing_extensions.Union parameters."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _flatten_union_args,
+        _normalize_pipe_unions,
+    )
+
+    assert _flatten_union_args(["typing_extensions.Union[int, str]"]) == ["int", "str"]
+    assert _flatten_union_args(["Union[int, str]"]) == ["int", "str"]
+    assert _flatten_union_args(["typing.Union[int, str]"]) == ["int", "str"]
+    assert (
+        _normalize_pipe_unions("int | typing_extensions.Union[str, float]")
+        == "Union[int, str, float]"
+    )
+
+
+def test_format_union_or_optional_nonetype_and_none() -> None:
+    """Verifies that _format_union_or_optional returns 'None' when all elements
+    are 'None' or 'NoneType'."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _format_union_or_optional,
+        _normalize_pipe_unions,
+    )
+
+    assert _format_union_or_optional(["NoneType", "None"]) == "None"
+    assert _format_union_or_optional(["None", "NoneType"]) == "None"
+    assert _format_union_or_optional(["NoneType"]) == "None"
+    assert _format_union_or_optional(["None"]) == "None"
+    assert _normalize_pipe_unions("NoneType | None") == "None"
+    assert _normalize_pipe_unions("None | NoneType") == "None"
+
+
+def test_wrap_conditional_optional_qualified_prefixes() -> None:
+    """Verifies that _wrap_conditional_optional does not double-wrap qualified Optional types."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _wrap_conditional_optional,
+    )
+
+    assert _wrap_conditional_optional("typing.Optional[int]", True) == "typing.Optional[int]"
+    assert (
+        _wrap_conditional_optional("typing_extensions.Optional[int]", True)
+        == "typing_extensions.Optional[int]"
+    )
+    assert _wrap_conditional_optional("Optional[int]", True) == "Optional[int]"
+    assert _wrap_conditional_optional("int", True) == "Optional[int]"
+    assert _wrap_conditional_optional("int", False) == "int"
+    assert _wrap_conditional_optional("Union[int, None]", True) == "Union[int, None]"
+
+
+def test_split_delimited_type_string_mismatched_brackets() -> None:
+    """Verifies that bracket mismatches are detected and rejected under require_balanced."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _split_delimited_type_string,
+        _split_type_args,
+    )
+
+    # Mismatched bracket types
+    assert _split_delimited_type_string("Tuple[int, str)", ",", require_balanced=True) == []
+    assert _split_delimited_type_string("Tuple(int, str]", ",", require_balanced=True) == []
+    assert _split_delimited_type_string("Dict{str: int]", ",", require_balanced=True) == []
+
+    # Valid balanced brackets
+    res = _split_delimited_type_string("Tuple[int, str], float", ",", require_balanced=True)
+    assert res == ["Tuple[int, str]", "float"]
+
+    # _split_type_args delegates to _split_delimited_type_string with require_balanced=True
+    assert _split_type_args("Tuple[int, str)") == []
+
+
+def test_synthesize_complex_expr_equality_comparison_not_stripped(tmp_path: Path) -> None:
+    """Verifies that equality comparison operators (==, !=, <=, >=) are not corrupted."""
+    code = (
+        "def check(x, y):\n"
+        "    return x == y\n"
+    )
+    f1 = tmp_path / "eq1.py"
+    f2 = tmp_path / "eq2.py"
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+
+    u1 = {
+        "file": "eq1.py",
+        "start": 2,
+        "end": 2,
+        "name": "check:eq",
+        "kind": "complex_expr",
+    }
+    u2 = {
+        "file": "eq2.py",
+        "start": 2,
+        "end": 2,
+        "name": "check:eq",
+        "kind": "complex_expr",
+    }
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper != ""
+    assert "return x == y" in helper
+    assert_valid_python(helper)
+
+    # Also verify compound equality check flag == (a > b)
+    code_compound = (
+        "def check_cmp(flag, a, b):\n"
+        "    return flag == (a > b)\n"
+    )
+    f3 = tmp_path / "cmp1.py"
+    f4 = tmp_path / "cmp2.py"
+    f3.write_text(code_compound, encoding="utf-8")
+    f4.write_text(code_compound, encoding="utf-8")
+    u3 = {"file": "cmp1.py", "start": 2, "end": 2, "name": "check_cmp", "kind": "complex_expr"}
+    u4 = {"file": "cmp2.py", "start": 2, "end": 2, "name": "check_cmp", "kind": "complex_expr"}
+    helper_compound = synthesize_shared_helper_code(u3, u4, repo_root=str(tmp_path))
+    assert helper_compound != ""
+    assert "return flag == (a > b)" in helper_compound
+    assert_valid_python(helper_compound)
+
+
+def test_normalize_pipe_unions_nested_tuple_dict_pipes() -> None:
+    """Verifies that _normalize_pipe_unions handles complex nested subscripts with pipes."""
+    assert _normalize_pipe_unions("Tuple[int | str, Dict[str, float | None]]") == (
+        "Tuple[Union[int, str], Dict[str, Optional[float]]]"
+    )
+
+
+def test_normalize_pipe_unions_redundant_optional() -> None:
+    """Verifies that _format_union_or_optional and _normalize_pipe_unions do not produce
+    redundant nested Optionals like Optional[Optional[int]]."""
+    assert _normalize_pipe_unions("Optional[int] | None") == "Optional[int]"
+    assert _normalize_pipe_unions("typing.Optional[str] | None") == "Optional[str]"
+    assert _normalize_pipe_unions("Optional[int] | str | None") == "Optional[Union[int, str]]"
+    assert _format_union_or_optional(["Optional[int]", "None"]) == "Optional[int]"
+    assert _format_union_or_optional(["typing.Optional[str]", "None"]) == "typing.Optional[str]"
+    assert _format_union_or_optional(
+        ["typing_extensions.Optional[float]", "None"]
+    ) == "typing_extensions.Optional[float]"
+
+
+def test_synthesize_complex_expr_tuple_and_multi_target_unpacking(tmp_path: Path) -> None:
+    """Verifies that complex_expr assignments with tuple unpacking or multiple targets
+    strip targets soundly instead of synthesizing invalid Python like return a, b = ..."""
+    code1 = (
+        "def compute_coords(x, y):\n"
+        "    a, b = get_pair(x, y)\n"
+    )
+    code2 = (
+        "def compute_coords(x, y):\n"
+        "    a, b = get_pair(x, y)\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+    u1 = {
+        "file": "mod1.py",
+        "start": 2,
+        "end": 2,
+        "name": "compute_coords",
+        "kind": "complex_expr",
+    }
+    u2 = {
+        "file": "mod2.py",
+        "start": 2,
+        "end": 2,
+        "name": "compute_coords",
+        "kind": "complex_expr",
+    }
+
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper != ""
+    assert "return get_pair(x, y)" in helper
+    assert_valid_python(helper)
+
+    # Multi-target assignment: x = y = compute(z)
+    code3 = (
+        "def multi_assign(z):\n"
+        "    x = y = compute(z)\n"
+    )
+    f3 = tmp_path / "mod3.py"
+    f4 = tmp_path / "mod4.py"
+    f3.write_text(code3, encoding="utf-8")
+    f4.write_text(code3, encoding="utf-8")
+    u3 = {
+        "file": "mod3.py",
+        "start": 2,
+        "end": 2,
+        "name": "multi_assign",
+        "kind": "complex_expr",
+    }
+    u4 = {
+        "file": "mod4.py",
+        "start": 2,
+        "end": 2,
+        "name": "multi_assign",
+        "kind": "complex_expr",
+    }
+    helper_multi = synthesize_shared_helper_code(u3, u4, repo_root=str(tmp_path))
+    assert helper_multi != ""
+    assert "return compute(z)" in helper_multi
+    assert_valid_python(helper_multi)
+
+
+def test_assign_stmt_re_module_constant() -> None:
+    """Verifies that _ASSIGN_STMT_RE correctly parses assignment statements."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _ASSIGN_STMT_RE,
+    )
+
+    m1 = _ASSIGN_STMT_RE.match("res = x + y")
+    assert m1 is not None
+    assert m1.group(1) == "x + y"
+
+    m2 = _ASSIGN_STMT_RE.match("total: int = a + b")
+    assert m2 is not None
+    assert m2.group(1) == "a + b"
+
+    m3 = _ASSIGN_STMT_RE.match("self.attr = compute_val()")
+    assert m3 is not None
+    assert m3.group(1) == "compute_val()"
+
+    m4 = _ASSIGN_STMT_RE.match("items[0] = fetch_item()")
+    assert m4 is not None
+    assert m4.group(1) == "fetch_item()"
+
+    m5 = _ASSIGN_STMT_RE.match("a, b = get_pair()")
+    assert m5 is not None
+    assert m5.group(1) == "get_pair()"
+
+    # Rejections of non-assignments, comparisons, walrus, and kwarg calls
+    assert _ASSIGN_STMT_RE.match("== not an assign") is None
+    assert _ASSIGN_STMT_RE.match("if a == b:") is None
+    assert _ASSIGN_STMT_RE.match("a <= b") is None
+    assert _ASSIGN_STMT_RE.match("a >= b") is None
+    assert _ASSIGN_STMT_RE.match("a != b") is None
+    assert _ASSIGN_STMT_RE.match("a := 1") is None
+    assert _ASSIGN_STMT_RE.match("compute(a=1, b=2)") is None
+    assert _ASSIGN_STMT_RE.match('foo("a = b")') is None
+    assert _ASSIGN_STMT_RE.match("lambda a=1: a") is None
+
+
+def test_synthesize_complex_expr_kwarg_call_not_mangled(tmp_path: Path) -> None:
+    """Verifies that synthesize_shared_helper_code does not mangle kwarg calls in complex_expr."""
+    code = (
+        "def run(x, y):\n"
+        "    compute(a=x, b=y)\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+    u1 = {
+        "file": "mod1.py",
+        "start": 2,
+        "end": 2,
+        "name": "run",
+        "kind": "complex_expr",
+    }
+    u2 = {
+        "file": "mod2.py",
+        "start": 2,
+        "end": 2,
+        "name": "run",
+        "kind": "complex_expr",
+    }
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper != ""
+    assert "return compute(a=x, b=y)" in helper
+    assert_valid_python(helper)
+
+
+def test_infer_helper_return_type_symmetric_outputs2_mapping() -> None:
+    """Verifies that _infer_helper_return_type uses outputs2 mapping for return type inference."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _infer_helper_return_type,
+    )
+
+    meta1 = {"out1": {"type": "int"}, "flag1": {"type": "bool"}}
+    meta2 = {"out2": {"type": "float"}, "flag2": {"type": "str"}}
+
+    ret_with_outputs2 = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=["out1", "flag1"],
+        conditional_outs=set(),
+        scope={"is_control_flow_safe": True},
+        meta1=meta1,
+        meta2=meta2,
+        type_merge_strategy="union",
+        outputs2=["out2", "flag2"],
+    )
+    assert ret_with_outputs2 == "Tuple[Union[int, float], Union[bool, str]]"
+
+
+def test_synthesize_shared_helper_code_symmetric_global_filtering_preserves_outputs(
+    tmp_path: Path,
+) -> None:
+    """Verifies that global/nonlocal filtering prunes output pairs
+    symmetrically from helper return."""
+    f = tmp_path / "m.py"
+    c = (
+        "def comp1(x: int, out1: int):\n"
+        "    global g_var\n"
+        "    g_var = 1\n"
+        "    out1 = out1 + 1\n"
+        "    return out1\n"
+        "\n"
+        "def comp2(y: int, out2: int):\n"
+        "    global g_var\n"
+        "    g_var = 2\n"
+        "    out2 = out2 + 2\n"
+        "    return out2\n"
+    )
+    f.write_text(c, encoding="utf-8")
+    u1 = {
+        "file": str(f),
+        "start": 2,
+        "end": 5,
+        "name": "comp1",
+        "kind": "compound_block",
+    }
+    u2 = {
+        "file": str(f),
+        "start": 8,
+        "end": 11,
+        "name": "comp2",
+        "kind": "compound_block",
+    }
+    helper = synthesize_shared_helper_code(
+        u1,
+        u2,
+        outputs=["g_var", "out1"],
+        outputs2=["g_var", "out2"],
+        repo_root=str(tmp_path),
+    )
+    assert helper != ""
+    assert "global g_var" in helper
+    assert "return out1" in helper
+
+
+def test_infer_helper_return_type_generator_yield_assignment_imports() -> None:
+    """Verifies that generator send type defaults and produces Generator[yield_t, send_t, None]
+    when has_yield_assignment is True, and include_imports pulls in Generator."""
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _extract_required_typing_imports,
+        _infer_helper_return_type,
+    )
+
+    scope_default = {
+        "has_yield": True,
+        "has_yield_assignment": True,
+        "is_control_flow_safe": True,
+    }
+    ret_default = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope=scope_default,
+        meta1={},
+        meta2={},
+        type_merge_strategy="default",
+    )
+    assert ret_default == "Generator[Any, Any, None]"
+
+    ret_strict = _infer_helper_return_type(
+        resolved_ret="Any",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope=scope_default,
+        meta1={},
+        meta2={},
+        type_merge_strategy="strict",
+    )
+    assert ret_strict == "Generator[Any, object, None]"
+
+    # Verify typing imports extraction on synthesized generator signature
+    helper_sig = f"def _gen_helper() -> {ret_default}: pass"
+    typing_imports = _extract_required_typing_imports(helper_sig)
+    assert "Generator" in typing_imports
+    assert "Any" in typing_imports
+
+
+def test_multiline_complex_expr_differing_targets(tmp_path: Path) -> None:
+    """Verifies that multi-line complex_expr units with differing assignment targets
+    strip targets before SequenceMatcher and synthesize cleanly without orphan parentheses."""
+    c1 = (
+        "def run_one(a, b):\n"
+        "    var_one = (\n"
+        "        compute(a)\n"
+        "        + compute(b)\n"
+        "    )\n"
+    )
+    c2 = (
+        "def run_two(a, b):\n"
+        "    var_two = (\n"
+        "        compute(a)\n"
+        "        + compute(b)\n"
+        "    )\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(c1, encoding="utf-8")
+    f2.write_text(c2, encoding="utf-8")
+    u1 = {"file": "mod1.py", "start": 2, "end": 5, "name": "run_one", "kind": "complex_expr"}
+    u2 = {"file": "mod2.py", "start": 2, "end": 5, "name": "run_two", "kind": "complex_expr"}
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper != ""
+    assert "return compute(a) + compute(b)" in helper or "compute(a) + compute(b)" in helper
+    assert "var_one" not in helper
+    assert "var_two" not in helper
+    assert_valid_python(helper)
+
+
+def test_complex_expr_augassign_prunes_unused_target(tmp_path: Path) -> None:
+    """Verifies that whole-line complex_expr with AugAssign prunes unused target
+    variables from helper parameters and inputs."""
+    c1 = (
+        "def add_first(total, a, b):\n"
+        "    total += a + b\n"
+    )
+    c2 = (
+        "def add_second(counter, a, b):\n"
+        "    counter += a + b\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(c1, encoding="utf-8")
+    f2.write_text(c2, encoding="utf-8")
+    u1 = {"file": "mod1.py", "start": 2, "end": 2, "name": "add_first", "kind": "complex_expr"}
+    u2 = {"file": "mod2.py", "start": 2, "end": 2, "name": "add_second", "kind": "complex_expr"}
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper != ""
+    assert "def _shared" in helper
+    assert "total" not in helper
+    assert "counter" not in helper
+    assert "return a + b" in helper
+    assert_valid_python(helper)
+
+
+def test_multiline_return_complex_expr_not_double_wrapped(tmp_path: Path) -> None:
+    """Verifies that multi-line returns (>3 lines) in complex_expr are not double-wrapped
+    with 'return (return ...)'."""
+    code = (
+        "def build_items(a, b, c, d):\n"
+        "    return (\n"
+        "        a,\n"
+        "        b,\n"
+        "        c,\n"
+        "        d,\n"
+        "    )\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(code, encoding="utf-8")
+    f2.write_text(code, encoding="utf-8")
+    u1 = {"file": "mod1.py", "start": 2, "end": 7, "name": "build_items", "kind": "complex_expr"}
+    u2 = {"file": "mod2.py", "start": 2, "end": 7, "name": "build_items", "kind": "complex_expr"}
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper != ""
+    assert "return (return" not in helper
+    assert "return (" in helper
+    assert_valid_python(helper)
+
+
+def test_complex_expr_boundary_pragmas_preserved(tmp_path: Path) -> None:
+    """Verifies that boundary pragmas (# type: ignore, # noqa) are preserved
+    in synthesized helpers for complex_expr after expression unparsing."""
+    code1 = (
+        "def compute(a, b):\n"
+        "    res = a + b  # type: ignore[operator]\n"
+    )
+    code2 = (
+        "def compute(a, b):\n"
+        "    res = a + b\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+    u1 = {"file": "mod1.py", "start": 2, "end": 2, "name": "compute", "kind": "complex_expr"}
+    u2 = {"file": "mod2.py", "start": 2, "end": 2, "name": "compute", "kind": "complex_expr"}
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path), preserve_pragmas=True)
+    assert helper != ""
+    assert "# type: ignore[operator]" in helper
+    assert_valid_python(helper)
+
+
+def test_cross_unit_augassign_target_pruning_independent(tmp_path: Path) -> None:
+    """Verifies that unreferenced AugAssign targets from one clone unit do not
+    prune identically named input parameters from the other unit."""
+    code1 = (
+        "def func1(total, a, b):\n"
+        "    total += a + b\n"
+    )
+    code2 = (
+        "def func2(a, b, c):\n"
+        "    a += b + c\n"
+    )
+    f1 = tmp_path / "mod1.py"
+    f2 = tmp_path / "mod2.py"
+    f1.write_text(code1, encoding="utf-8")
+    f2.write_text(code2, encoding="utf-8")
+
+    u1 = {
+        "file": "mod1.py",
+        "start": 2,
+        "end": 2,
+        "name": "func1:aug",
+        "kind": "complex_expr",
+    }
+    u2 = {
+        "file": "mod2.py",
+        "start": 2,
+        "end": 2,
+        "name": "func2:aug",
+        "kind": "complex_expr",
+    }
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert helper != ""
+    assert "a: Any" in helper
+    assert "b: Any" in helper
+    assert_valid_python(helper)
+
+
+def test_extract_augassign_unreferenced_target_indented_multiline() -> None:
+    """Verifies that indented multi-line AugAssign statements are properly dedented and parsed."""
+    lines = [
+        "    total += (",
+        "        x + y",
+        "    )",
+    ]
+    target = _extract_augassign_unreferenced_target(lines)
+    assert target == "total"
+
+    stripped = _strip_stmt_target_lines(lines)
+    assert stripped == ["x + y"]
+
+
+def test_normalize_pipe_unions_optional_pipe_none_flattened() -> None:
+    """Verifies that Optional with pipe unions containing None flattens cleanly."""
+    res1 = _normalize_pipe_unions("Optional[int | None]")
+    assert res1 == "Optional[int]"
+
+    res2 = _normalize_pipe_unions("typing.Optional[str | None]")
+    assert res2 == "Optional[str]"
+
+    res3 = _normalize_pipe_unions("Optional[int | str]")
+    assert res3 == "Optional[Union[int, str]]"
+
+
+def test_infer_helper_return_type_cross_checks_is_async_iterator_prefixes() -> None:
+    """Verifies that _infer_helper_return_type does not return a synchronous Iterator[...]
+    for an async generator or an AsyncIterator[...] for a synchronous generator."""
+    # Async generator with stale sync resolved_ret="Iterator[int]"
+    res_async = _infer_helper_return_type(
+        resolved_ret="Iterator[int]",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={
+            "has_yield": True,
+            "has_yield_assignment": False,
+            "yield_expr_names": [("yield", "x")],
+            "has_return_value": False,
+        },
+        meta1={"x": {"type": "int"}},
+        meta2={"x": {"type": "int"}},
+        is_async=True,
+    )
+    assert res_async == "AsyncIterator[int]"
+
+    # Sync generator with stale async resolved_ret="AsyncIterator[str]"
+    res_sync = _infer_helper_return_type(
+        resolved_ret="AsyncIterator[str]",
+        helper_outputs=[],
+        conditional_outs=set(),
+        scope={
+            "has_yield": True,
+            "has_yield_assignment": False,
+            "yield_expr_names": [("yield", "s")],
+            "has_return_value": False,
+        },
+        meta1={"s": {"type": "str"}},
+        meta2={"s": {"type": "str"}},
+        is_async=False,
+    )
+    assert res_sync == "Iterator[str]"
+
+
+def test_normalize_pipe_unions_quoted_forward_references() -> None:
+    """Verifies that PEP 604 unions of separately quoted forward references
+    are converted to Union/Optional rather than treated as a single outer-quoted string."""
+    assert _normalize_pipe_unions('"NodeA" | "NodeB"') == 'Union["NodeA", "NodeB"]'
+    assert (
+        _normalize_pipe_unions("'NodeA' | 'NodeB' | None")
+        == "Optional[Union['NodeA', 'NodeB']]"
+    )
+    assert _normalize_pipe_unions('"NodeA | NodeB"') == '"Union[NodeA, NodeB]"'
+
+
+def test_synthesize_shared_helper_code_rejects_asymmetric_unmapped_expr_stmt(
+    tmp_path: Path,
+) -> None:
+    """Verifies that standalone synthesize_shared_helper_code fails closed when one
+    whole-line expression unit is a valid assignment and its partner is an unmapped statement."""
+    f = tmp_path / "asym_expr.py"
+    f.write_text(
+        "def f1(a, b):\n"
+        "    res = a + b\n"
+        "    return res\n"
+        "\n"
+        "def f2(a, b):\n"
+        "    assert a + b\n"
+        "\n"
+        "def f3():\n"
+        "    return\n",
+        encoding="utf-8",
+    )
+    u1 = {"file": str(f), "start": 2, "end": 2, "name": "f1_expr", "kind": "complex_expr"}
+    u2 = {"file": str(f), "start": 6, "end": 6, "name": "f2_expr", "kind": "complex_expr"}
+    u3 = {"file": str(f), "start": 9, "end": 9, "name": "f3_expr", "kind": "complex_expr"}
+    assert synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path)) == ""
+    assert synthesize_shared_helper_code(u3, u3, repo_root=str(tmp_path)) == ""
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="PEP 695 syntax requires Python 3.12+",
+)
+def test_synthesize_shared_helper_code_preserves_pep695_type_params(
+    tmp_path: Path,
+) -> None:
+    """Verifies that whole generic functions preserve PEP 695 type_params on the synthesized helper header."""
+    f = tmp_path / "generic_fns.py"
+    f.write_text(
+        "def first[T](items: list[T], cast_fn) -> T:\n"
+        "    head = items[0]\n"
+        "    return cast_fn(T, head)\n"
+        "\n"
+        "def second[T](items: list[T], cast_fn) -> T:\n"
+        "    head = items[0]\n"
+        "    return cast_fn(T, head)\n",
+        encoding="utf-8",
+    )
+    u1 = {"file": str(f), "start": 1, "end": 3, "name": "first", "kind": "function"}
+    u2 = {"file": str(f), "start": 5, "end": 7, "name": "second", "kind": "function"}
+    helper = synthesize_shared_helper_code(u1, u2, repo_root=str(tmp_path))
+    assert "def _shared_first_second[T](" in helper
+    assert "return cast_fn(T, head)" in helper
+
+    f_alpha = tmp_path / "generic_alpha.py"
+    f_alpha.write_text(
+        "def alpha1[T](items: list[T], cast_fn, mode: str = 'U') -> T:\n"
+        "    # Note: U in comment and literal 'U' should not retain U\n"
+        "    tag = mode\n"
+        "    head = items[0]\n"
+        "    return cast_fn(T, head)\n"
+        "\n"
+        "def alpha2[U](items: list[U], cast_fn, mode: str = 'U') -> U:\n"
+        "    # Note: U in comment and literal 'U' should not retain U\n"
+        "    tag = mode\n"
+        "    head = items[0]\n"
+        "    return cast_fn(U, head)\n",
+        encoding="utf-8",
+    )
+    ua1 = {"file": str(f_alpha), "start": 1, "end": 5, "name": "alpha1", "kind": "function"}
+    ua2 = {"file": str(f_alpha), "start": 7, "end": 11, "name": "alpha2", "kind": "function"}
+    helper_any = synthesize_shared_helper_code(ua1, ua2, repo_root=str(tmp_path))
+    assert "def _shared_alpha1_alpha2[T](" in helper_any
+    assert "[T, U]" not in helper_any
+    helper_union = synthesize_shared_helper_code(
+        ua1, ua2, type_merge_strategy="union", repo_root=str(tmp_path)
+    )
+    assert "def _shared_alpha1_alpha2[T, U](" in helper_union
+
+    f_dep = tmp_path / "generic_dep.py"
+    f_dep.write_text(
+        "def dep1[T, U: list[T]](x: U) -> U:\n"
+        "    return x\n"
+        "\n"
+        "def dep2[V, W: list[V]](x: W) -> W:\n"
+        "    return x\n"
+        "\n"
+        "def plain(x):\n"
+        "    return x\n",
+        encoding="utf-8",
+    )
+    ud1 = {"file": str(f_dep), "start": 1, "end": 2, "name": "dep1", "kind": "function"}
+    ud2 = {"file": str(f_dep), "start": 4, "end": 5, "name": "dep2", "kind": "function"}
+    up = {"file": str(f_dep), "start": 7, "end": 8, "name": "plain", "kind": "function"}
+    dep_union = synthesize_shared_helper_code(
+        ud1, ud2, type_merge_strategy="union", repo_root=str(tmp_path)
+    )
+    assert "def _shared_dep1_dep2[T, U: list[T], V, W: list[V]](" in dep_union
+    plain_rev = synthesize_shared_helper_code(up, ud1, repo_root=str(tmp_path))
+    assert "def _shared_plain_dep1[T, U: list[T]](" in plain_rev
+
+    f_fwd = tmp_path / "generic_fwd.py"
+    f_fwd.write_text(
+        "def fwd1[T](x: 'list[T]') -> 'T':\n"
+        "    return x[0]\n"
+        "\n"
+        "def fwd2[U](x: 'list[U]') -> 'U':\n"
+        "    return x[0]\n",
+        encoding="utf-8",
+    )
+    uf1 = {"file": str(f_fwd), "start": 1, "end": 2, "name": "fwd1", "kind": "function"}
+    uf2 = {"file": str(f_fwd), "start": 4, "end": 5, "name": "fwd2", "kind": "function"}
+    fwd_union = synthesize_shared_helper_code(
+        uf1, uf2, type_merge_strategy="union", repo_root=str(tmp_path)
+    )
+    assert "def _shared_fwd1_fwd2[T, U](" in fwd_union
+
+    if sys.version_info >= (3, 13):
+        f_pep696 = tmp_path / "generic_pep696.py"
+        f_pep696.write_text(
+            "def d1[T, U = list[T]](x: U) -> U:\n"
+            "    return x\n"
+            "\n"
+            "def d2[V, W = list[V]](x: W) -> W:\n"
+            "    return x\n",
+            encoding="utf-8",
+        )
+        u696_1 = {"file": str(f_pep696), "start": 1, "end": 2, "name": "d1", "kind": "function"}
+        u696_2 = {"file": str(f_pep696), "start": 4, "end": 5, "name": "d2", "kind": "function"}
+        dep_696 = synthesize_shared_helper_code(
+            u696_1, u696_2, type_merge_strategy="union", repo_root=str(tmp_path)
+        )
+        assert "def _shared_d1_d2[T, V, U = list[T], W = list[V]](" in dep_696
+
+
+def test_same_class_whole_line_expr_explicit_method_binding(
+    tmp_path: Path,
+) -> None:
+    """Verifies that explicit method_binding='method' on same-class whole-line comprehension
+    units injects self on the helper and delegates via self._shared_...(...)."""
+    f = tmp_path / "same_cls_expr.py"
+    f.write_text(
+        "class Processor:\n"
+        "    def run_a(self, items: list[int]) -> None:\n"
+        "        self.res1 = [x * 2 for x in items]\n"
+        "\n"
+        "    def run_b(self, items: list[int]) -> None:\n"
+        "        self.res2 = [x * 2 for x in items]\n",
+        encoding="utf-8",
+    )
+    u1 = {"file": str(f), "start": 3, "end": 3, "name": "run_a_comp", "kind": "comprehension"}
+    u2 = {"file": str(f), "start": 6, "end": 6, "name": "run_b_comp", "kind": "comprehension"}
+
+    helper = synthesize_shared_helper_code(
+        u1, u2, method_binding="method", repo_root=str(tmp_path)
+    )
+    assert "def _shared_run_a_comp_run_b_comp(self, items: Any) -> Any:" in helper
+
+    patch = generate_refactoring_patch(
+        [(0.98, u1, u2)],
+        repo_root=str(tmp_path),
+        method_binding="method",
+        replace_clones=True,
+    )
+    assert "+    def _shared_run_a_comp_run_b_comp(self, items: Any) -> Any:" in patch
+    assert "+        self.res1 = self._shared_run_a_comp_run_b_comp(items)" in patch
+    assert "+        self.res2 = self._shared_run_a_comp_run_b_comp(items)" in patch
+
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _build_unit_delegation_call,
+    )
+
+    sub_src = (
+        "class CacheBox:\n"
+        "    def store(self, k: str, items: list[int]) -> None:\n"
+        "        self.cache[k] = [x * 2 for x in items]\n"
+    )
+    sub_lines = sub_src.splitlines(keepends=True)
+    u_sub = {"start": 3, "end": 3, "kind": "comprehension"}
+    call_str = _build_unit_delegation_call(
+        u_sub,
+        sub_src,
+        sub_lines,
+        effective_binding="method",
+        helper_name="_shared_store",
+        inputs=["self", "items"],
+        outputs=[],
+        scope={"param_details": []},
+        target_inputs=["self", "k", "items"],
+    )
+    assert call_str == "        self.cache[k] = self._shared_store(items)\n"
+
+
+def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
+    tmp_path: Path,
+) -> None:
+    """Verifies that whole-line expressions referencing an LHS variable on the RHS
+    preserve RHS free-load operand order, and _infer_helper_return_type strips
+    module prefixes before early-exit generator return type checks."""
+    f1 = tmp_path / "ord1.py"
+    f2 = tmp_path / "ord2.py"
+    f1.write_text(
+        "def sub_plain(x: int, y: int) -> int:\n"
+        "    res = (x - y) * 2\n"
+        "    return res\n",
+        encoding="utf-8",
+    )
+    f2.write_text(
+        "def sub_slot(arr: list[int], i: int, a: int) -> None:\n"
+        "    arr[i] = (a - i) * 2\n"
+        "\n"
+        "def sub_aug(i: int, a: int) -> int:\n"
+        "    i += (a - i) * 2\n"
+        "    return i\n",
+        encoding="utf-8",
+    )
+    u_plain = {"file": str(f1), "start": 2, "end": 2, "name": "sub_plain", "kind": "complex_expr"}
+    u_slot = {
+        "file": str(f2),
+        "start": 2,
+        "end": 2,
+        "name": "sub_slot",
+        "kind": "complex_expr",
+        "inputs": ["arr", "i", "a"],
+    }
+    u_aug = {"file": str(f2), "start": 5, "end": 5, "name": "sub_aug", "kind": "complex_expr"}
+
+    patch_slot = generate_refactoring_patch(
+        [(0.98, u_plain, u_slot)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert "+    res = _shared_sub_plain_sub_slot(x, y)" in patch_slot
+    assert "+    arr[i] = _shared_sub_plain_sub_slot(a, i)" in patch_slot
+
+    patch_aug = generate_refactoring_patch(
+        [(0.98, u_plain, u_aug)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert "+    res = _shared_sub_plain_sub_aug(x, y)" in patch_aug
+    assert "+    i += _shared_sub_plain_sub_aug(a, i)" in patch_aug
+
+    assert (
+        _infer_helper_return_type(
+            "collections.abc.Iterable[int]",
+            [],
+            set(),
+            {"has_yield": True, "has_return_value": False, "has_yield_assignment": False},
+            {},
+            {},
+        )
+        == "collections.abc.Iterable[int]"
+    )
+    assert (
+        _infer_helper_return_type(
+            "typing.Generator[int, str, None]",
+            [],
+            set(),
+            {"has_yield": True, "has_return_value": False, "has_yield_assignment": False},
+            {},
+            {},
+        )
+        == "typing.Generator[int, str, None]"
+    )
+    assert (
+        _infer_helper_return_type(
+            "collections.abc.AsyncIterable[str]",
+            [],
+            set(),
+            {"has_yield": True, "has_return_value": False, "has_yield_assignment": False},
+            {},
+            {},
+            is_async=True,
+        )
+        == "collections.abc.AsyncIterable[str]"
+    )
+    assert (
+        _infer_helper_return_type(
+            "typing.Generator[int, None, str]",
+            [],
+            set(),
+            {"has_yield": True, "has_return_value": True, "has_yield_assignment": False},
+            {},
+            {},
+        )
+        == "typing.Generator[int, None, str]"
+    )
+
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _build_unit_delegation_call,
+        _unit_has_no_refactor_pragma,
+    )
+
+    me_src = (
+        "class CustomRec:\n"
+        "    def calc(me, k: str, val: int) -> None:\n"
+        "        me.cache[k] = val + me.offset\n"
+    )
+    me_lines = me_src.splitlines(keepends=True)
+    me_call = _build_unit_delegation_call(
+        {"start": 3, "end": 3, "kind": "complex_expr", "receiver_param": "me"},
+        me_src,
+        me_lines,
+        effective_binding="module",
+        helper_name="_shared_calc",
+        inputs=["self", "x"],
+        outputs=[],
+        scope={"param_details": []},
+        target_inputs=["me", "k", "val"],
+    )
+    assert me_call == "        me.cache[k] = _shared_calc(me, val)\n"
+
+    me_method_src = (
+        "class CustomRec:\n"
+        "    def store(me, k: str, val: int) -> None:\n"
+        "        me.cache[k] = val * 2\n"
+    )
+    me_method_lines = me_method_src.splitlines(keepends=True)
+    me_method_call = _build_unit_delegation_call(
+        {"start": 3, "end": 3, "kind": "complex_expr", "receiver_param": "me"},
+        me_method_src,
+        me_method_lines,
+        effective_binding="method",
+        helper_name="_shared_store",
+        inputs=["self", "x"],
+        outputs=[],
+        scope={"param_details": []},
+        target_inputs=["me", "k", "val"],
+    )
+    assert me_method_call == "        me.cache[k] = me._shared_store(val)\n"
+
+    pragma_src = "# pragma: no-refactor\n@dec\ndef f():\n    return 1\n"
+    pragma_tree = ast.parse(pragma_src)
+    pragma_tree.body[0].decorator_list[0].lineno = None  # type: ignore[attr-defined]
+    assert _unit_has_no_refactor_pragma(
+        {"start": 3, "end": 4},
+        pragma_src.splitlines(keepends=True),
+        tree=pragma_tree,
+        orig_text=pragma_src,
+    ) is True
+
+    ret_src = (
+        "def compute(x: int, y: int) -> int:\n"
+        "    return y - x\n"
+    )
+    ret_lines = ret_src.splitlines(keepends=True)
+    ret_call = _build_unit_delegation_call(
+        {"start": 2, "end": 2, "kind": "complex_expr", "inputs": ["x", "y"]},
+        ret_src,
+        ret_lines,
+        effective_binding="module",
+        helper_name="_shared_diff",
+        inputs=["b", "a"],
+        outputs=[],
+        scope={"param_details": []},
+        target_inputs=["x", "y"],
+    )
+    assert ret_call == "    return _shared_diff(y, x)\n"
+
+    swap_src = (
+        "def sub_plain(x: int, y: int) -> int:\n"
+        "    res = (x - y) * 2\n"
+        "    return res\n"
+        "\n"
+        "def sub_slot(arr: list[int], x: int, y: int) -> None:\n"
+        "    arr[x] = (y - x) * 2\n"
+    )
+    swap_file = tmp_path / "swap_expr.py"
+    swap_file.write_text(swap_src, encoding="utf-8")
+    swap_patch = generate_refactoring_patch(
+        [
+            (
+                1.0,
+                {"file": str(swap_file), "start": 2, "end": 2, "kind": "complex_expr", "name": "sub_plain:expr"},
+                {"file": str(swap_file), "start": 6, "end": 6, "kind": "complex_expr", "name": "sub_slot:expr"},
+            )
+        ],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "res = _shared_sub_plain_sub_slot(x, y)" in swap_patch
+    assert "arr[x] = _shared_sub_plain_sub_slot(y, x)" in swap_patch
+
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
+        _populate_unit_receiver_metadata,
+        _unit_ast_has_async_or_yield,
+    )
+    from pydoppelgangerhunt.parser import (  # pylint: disable=import-outside-toplevel
+        _node_is_effectively_async,
+    )
+
+    nested_hdr_src = (
+        "async def outer():\n"
+        "    @register(await get_hook())\n"
+        "    def inner():\n"
+        "        return 1\n"
+        "    cb = lambda x=await fetch(): x\n"
+        "    return inner, cb\n"
+    )
+    nested_hdr_tree = ast.parse(nested_hdr_src)
+    inner_fn_node = nested_hdr_tree.body[0].body[0]  # type: ignore[attr-defined]
+    lambda_stmt_node = nested_hdr_tree.body[0].body[1]  # type: ignore[attr-defined]
+    assert _node_is_effectively_async(inner_fn_node, enclosing_is_async=True)
+    assert _node_is_effectively_async(lambda_stmt_node, enclosing_is_async=True)
+    assert _unit_ast_has_async_or_yield(
+        nested_hdr_tree, 2, 4, is_subroutine=True
+    ) == (False, True)
+
+    subline_await_src = (
+        "async def send_items(client, items):\n"
+        "    res = await client.send([x * 2 for x in items])\n"
+        "    return res\n"
+    )
+    subline_await_tree = ast.parse(subline_await_src)
+    assert _unit_ast_has_async_or_yield(
+        subline_await_tree,
+        2,
+        2,
+        is_subroutine=True,
+        u_start_col=28,
+        u_end_col=50,
+    ) == (False, False)
+    subline_u = {
+        "kind": "comprehension",
+        "start": 2,
+        "end": 2,
+        "start_col": 28,
+        "end_col": 50,
+        "source_text": subline_await_src,
+    }
+    _populate_unit_receiver_metadata(subline_u, source_text=subline_await_src, tree=subline_await_tree)
+    assert subline_u["is_async"] is False
+
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _extract_helper_symbols,
+    )
+
+    same_name_hdr_tree = ast.parse(
+        "@item\n"
+        "def item(x=item):\n"
+        "    return x\n"
+    )
+    free_syms, def_syms, _ = _extract_helper_symbols(same_name_hdr_tree)
+    assert "item" in free_syms
+    assert "item" in def_syms
+
+    if sys.version_info >= (3, 11):
+        trystar_tree = ast.parse(
+            "def _shared_trystar():\n"
+            "    def reader():\n"
+            "        return (handled_val, err_group)\n"
+            "    try:\n"
+            "        pass\n"
+            "    except* ValueError as err_group:\n"
+            "        handled_val = 1\n"
+            "    return reader\n"
+        )
+        ts_free, ts_defs, _ = _extract_helper_symbols(trystar_tree)
+        assert "handled_val" not in ts_free
+        assert "err_group" not in ts_free
+        assert "handled_val" in ts_defs
+
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _unit_has_no_refactor_pragma,
+        _validate_helper_compilation,
+    )
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
+        _get_tree_scope_intervals,
+    )
+
+    eof_pragma_src = "def normal_fn(x: int) -> int:\n    return x + 1\n# pragma: no-refactor\n"
+    eof_lines = eof_pragma_src.splitlines(keepends=True)
+    assert not _unit_has_no_refactor_pragma(
+        {"start": 10, "end": 12}, eof_lines, orig_text=eof_pragma_src
+    )
+
+    mut_tree = ast.parse("def alpha():\n    return 1\n")
+    intervals_initial = _get_tree_scope_intervals(mut_tree)
+    assert intervals_initial[0][:2] == (1, 2)
+    mut_tree.body[0].lineno = 5  # type: ignore[attr-defined]
+    mut_tree.body[0].end_lineno = 8  # type: ignore[attr-defined]
+    intervals_updated = _get_tree_scope_intervals(mut_tree)
+    assert intervals_updated[0][:2] == (5, 8)
+    extra_fn = ast.parse("def beta():\n    return 2\n").body[0]
+    mut_tree.body.append(extra_fn)
+    assert len(_get_tree_scope_intervals(mut_tree)) == 2
+
+    crlf_helper = (
+        "from typing import Any\r\n\r\n\r\n"
+        "    def _shared_crlf(self, x: Any) -> Any:\r\n"
+        "        return x + 1\r\n"
+    )
+    assert _validate_helper_compilation(crlf_helper)
+    mixed_cr_helper = (
+        "from typing import Any\n\n\n\r\n"
+        "    def _shared_cr(self, x: Any) -> Any:\n"
+        "        return x + 1\n"
+    )
+    assert _validate_helper_compilation(mixed_cr_helper)
+
+    if sys.version_info >= (3, 12):
+        local_bound_file = tmp_path / "closure_type_param_capture.py"
+        local_bound_file.write_text(
+            "class ModuleBound:\n"
+            "    pass\n\n"
+            "def outer_a(local_bound: type):\n"
+            "    def inner_a[T: local_bound](x: T) -> T:\n"
+            "        step = 1\n"
+            "        return x\n"
+            "    return inner_a\n\n"
+            "def outer_b(local_bound: type):\n"
+            "    def inner_b[T: local_bound](x: T) -> T:\n"
+            "        step = 1\n"
+            "        return x\n"
+            "    return inner_b\n\n"
+            "def mod_outer_a():\n"
+            "    def mod_inner_a[T: ModuleBound](x: T) -> T:\n"
+            "        step = 1\n"
+            "        return x\n"
+            "    return mod_inner_a\n\n"
+            "def mod_outer_b():\n"
+            "    def mod_inner_b[T: ModuleBound](x: T) -> T:\n"
+            "        step = 1\n"
+            "        return x\n"
+            "    return mod_inner_b\n",
+            encoding="utf-8",
+        )
+        u_cap1 = {
+            "file": str(local_bound_file),
+            "start": 5,
+            "end": 7,
+            "name": "outer_a:inner_a",
+            "kind": "closure",
+        }
+        u_cap2 = {
+            "file": str(local_bound_file),
+            "start": 11,
+            "end": 13,
+            "name": "outer_b:inner_b",
+            "kind": "closure",
+        }
+        assert (
+            synthesize_shared_helper_code(u_cap1, u_cap2, repo_root=str(tmp_path))
+            == ""
+        )
+        assert (
+            generate_refactoring_patch(
+                [(0.99, u_cap1, u_cap2)],
+                repo_root=str(tmp_path),
+                replace_clones=True,
+            )
+            == ""
+        )
+        sliced_cap = {
+            "start": 1,
+            "end": 3,
+            "name": "inner_sliced",
+            "kind": "closure",
+            "source_text": (
+                "def inner_sliced[T: local_bound](x: T) -> T:\n"
+                "    step = 1\n"
+                "    return x\n"
+            ),
+        }
+        assert synthesize_shared_helper_code(sliced_cap, sliced_cap) == ""
+
+        u_mod1 = {
+            "file": str(local_bound_file),
+            "start": 17,
+            "end": 19,
+            "name": "mod_outer_a:mod_inner_a",
+            "kind": "closure",
+        }
+        u_mod2 = {
+            "file": str(local_bound_file),
+            "start": 23,
+            "end": 25,
+            "name": "mod_outer_b:mod_inner_b",
+            "kind": "closure",
+        }
+        mod_helper = synthesize_shared_helper_code(
+            u_mod1, u_mod2, repo_root=str(tmp_path)
+        )
+        assert "[T: ModuleBound]" in mod_helper
+
+        cls_bound_file = tmp_path / "cls_type_param_capture.py"
+        cls_bound_file.write_text(
+            "class ServiceA:\n"
+            "    Bound = int\n"
+            "    def run_a[T: Bound](self, x: T) -> T:\n"
+            "        self.last = x\n"
+            "        return x\n"
+            "    def run_a2[T: Bound](self, x: T) -> T:\n"
+            "        self.last = x\n"
+            "        return x\n\n"
+            "class ServiceB:\n"
+            "    Bound = int\n"
+            "    def run_b[T: Bound](self, x: T) -> T:\n"
+            "        self.last = x\n"
+            "        return x\n",
+            encoding="utf-8",
+        )
+        u_cls_a1 = {
+            "file": str(cls_bound_file),
+            "start": 3,
+            "end": 5,
+            "name": "run_a",
+            "kind": "function",
+            "enclosing_class": "ServiceA",
+            "enclosing_class_start": 1,
+            "receiver_kind": "instance",
+        }
+        u_cls_a2 = {
+            "file": str(cls_bound_file),
+            "start": 6,
+            "end": 8,
+            "name": "run_a2",
+            "kind": "function",
+            "enclosing_class": "ServiceA",
+            "enclosing_class_start": 1,
+            "receiver_kind": "instance",
+        }
+        u_cls_b = {
+            "file": str(cls_bound_file),
+            "start": 12,
+            "end": 14,
+            "name": "run_b",
+            "kind": "function",
+            "enclosing_class": "ServiceB",
+            "enclosing_class_start": 10,
+            "receiver_kind": "instance",
+        }
+        assert (
+            synthesize_shared_helper_code(
+                u_cls_a1, u_cls_b, repo_root=str(tmp_path)
+            )
+            == ""
+        )
+        assert (
+            synthesize_shared_helper_code(
+                u_cls_a1,
+                u_cls_a2,
+                method_binding="module",
+                repo_root=str(tmp_path),
+            )
+            == ""
+        )
+        assert (
+            generate_refactoring_patch(
+                [(0.99, u_cls_a1, u_cls_b)],
+                repo_root=str(tmp_path),
+                replace_clones=True,
+            )
+            == ""
+        )
+        same_cls_helper = synthesize_shared_helper_code(
+            u_cls_a1, u_cls_a2, repo_root=str(tmp_path)
+        )
+        assert "[T: Bound]" in same_cls_helper
+        same_cls_patch = generate_refactoring_patch(
+            [(0.99, u_cls_a1, u_cls_a2)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+        )
+        assert "def _shared_run_a_run_a2[T: Bound]" in same_cls_patch
+
+        self_cls_file = tmp_path / "self_cls_type_param.py"
+        self_cls_file.write_text(
+            "class Service:\n"
+            "    def copy_a[T: Service](self, other: T) -> T:\n"
+            "        return other\n"
+            "    def copy_b[T: Service](self, other: T) -> T:\n"
+            "        return other\n",
+            encoding="utf-8",
+        )
+        u_self_a = {
+            "file": str(self_cls_file),
+            "start": 2,
+            "end": 3,
+            "name": "copy_a",
+            "kind": "function",
+            "enclosing_class": "Service",
+            "enclosing_class_start": 1,
+            "receiver_kind": "instance",
+        }
+        u_self_b = {
+            "file": str(self_cls_file),
+            "start": 4,
+            "end": 5,
+            "name": "copy_b",
+            "kind": "function",
+            "enclosing_class": "Service",
+            "enclosing_class_start": 1,
+            "receiver_kind": "instance",
+        }
+        mod_self_helper = synthesize_shared_helper_code(
+            u_self_a,
+            u_self_b,
+            method_binding="module",
+            repo_root=str(tmp_path),
+        )
+        assert "[T: Service]" in mod_self_helper
+
+        outer_shadow_file = tmp_path / "outer_shadow_type_param.py"
+        outer_shadow_file.write_text(
+            "Bound = str\n"
+            "class Outer:\n"
+            "    Bound = int\n"
+            "    class Inner:\n"
+            "        def m1[T: Bound](self, x: T) -> T:\n"
+            "            return x\n"
+            "        def m2[T: Bound](self, x: T) -> T:\n"
+            "            return x\n",
+            encoding="utf-8",
+        )
+        u_inner1 = {
+            "file": str(outer_shadow_file),
+            "start": 5,
+            "end": 6,
+            "name": "m1",
+            "kind": "function",
+            "enclosing_class": "Inner",
+            "enclosing_class_start": 4,
+            "receiver_kind": "instance",
+        }
+        u_inner2 = {
+            "file": str(outer_shadow_file),
+            "start": 7,
+            "end": 8,
+            "name": "m2",
+            "kind": "function",
+            "enclosing_class": "Inner",
+            "enclosing_class_start": 4,
+            "receiver_kind": "instance",
+        }
+        inner_mod_helper = synthesize_shared_helper_code(
+            u_inner1,
+            u_inner2,
+            method_binding="module",
+            repo_root=str(tmp_path),
+        )
+        assert "[T: Bound]" in inner_mod_helper
+
+        nested_self_ref_file = tmp_path / "nested_self_ref.py"
+        nested_self_ref_file.write_text(
+            "class Outer:\n"
+            "    class Inner:\n"
+            "        def m1[T: Inner](self, x: T) -> T:\n"
+            "            y = x\n"
+            "            return y\n"
+            "\n"
+            "        def m2[T: Inner](self, x: T) -> T:\n"
+            "            y = x\n"
+            "            return y\n",
+            encoding="utf-8",
+        )
+        u_ns1 = {
+            "file": str(nested_self_ref_file),
+            "start": 3,
+            "end": 5,
+            "name": "m1",
+            "kind": "function",
+            "enclosing_class": "Inner",
+            "receiver_kind": "self",
+        }
+        u_ns2 = {
+            "file": str(nested_self_ref_file),
+            "start": 7,
+            "end": 9,
+            "name": "m2",
+            "kind": "function",
+            "enclosing_class": "Inner",
+            "receiver_kind": "self",
+        }
+        assert not synthesize_shared_helper_code(
+            u_ns1,
+            u_ns2,
+            method_binding="module",
+            repo_root=str(tmp_path),
+        )
+        assert "[T: Inner]" in synthesize_shared_helper_code(
+            u_ns1,
+            u_ns2,
+            method_binding="method",
+            repo_root=str(tmp_path),
+        )
+
+        from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+            _inspect_unit_scope,
+        )
+
+        same_line_tree = ast.parse(
+            "def outer(b: type):\n"
+            "    def inner[T: b](x: T) -> T:\n"
+            "        return x\n"
+        )
+        outer_fn = same_line_tree.body[0]
+        inner_fn = outer_fn.body[0]  # type: ignore[attr-defined]
+        outer_fn.lineno = 1
+        outer_fn.end_lineno = 1
+        outer_fn.col_offset = 0
+        inner_fn.lineno = 1
+        inner_fn.end_lineno = 1
+        inner_fn.col_offset = 14
+        same_line_scope = _inspect_unit_scope(
+            {
+                "start": 1,
+                "end": 1,
+                "start_col": 14,
+                "kind": "closure",
+                "source_text": "              def inner[T: b](x: T) -> T: return x\n",
+            },
+            file_tree=same_line_tree,
+        )
+        assert "type_param_closure_capture" in same_line_scope["control_flow_hazards"]
+
+        outer_same_line_tree = ast.parse(
+            "def outer_gen[T: Bound](x: T) -> T:\n"
+            "    def inner_child(Bound: int = 1) -> int:\n"
+            "        return Bound\n"
+            "    return x\n"
+        )
+        o_fn = outer_same_line_tree.body[0]
+        i_fn = o_fn.body[0]  # type: ignore[attr-defined]
+        o_fn.lineno = 1
+        o_fn.end_lineno = 1
+        o_fn.col_offset = 0
+        i_fn.lineno = 1
+        i_fn.end_lineno = 1
+        i_fn.col_offset = 20
+        outer_same_line_scope = _inspect_unit_scope(
+            {
+                "start": 1,
+                "end": 1,
+                "kind": "function",
+                "source_text": (
+                    "def outer_gen[T: Bound](x: T) -> T:\n"
+                    "    def inner_child(Bound: int = 1) -> int:\n"
+                    "        return Bound\n"
+                    "    return x\n"
+                ),
+            },
+            file_tree=outer_same_line_tree,
+        )
+        assert "type_param_closure_capture" not in outer_same_line_scope["control_flow_hazards"]
+
+        trunc_tree = ast.parse(
+            "def self_fn[T: LocalAlias](x: T) -> T:\n"
+            "    LocalAlias = int\n"
+            "    return x\n"
+        )
+        trunc_scope = _inspect_unit_scope(
+            {
+                "start": 1,
+                "end": 2,
+                "kind": "function",
+                "source_text": (
+                    "def self_fn[T: LocalAlias](x: T) -> T:\n"
+                    "    LocalAlias = int\n"
+                    "    return x\n"
+                ),
+            },
+            file_tree=trunc_tree,
+        )
+        assert "type_param_closure_capture" not in trunc_scope["control_flow_hazards"]
+
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        _inspect_unit_scope as _inspect_scope_fn,
+    )
+
+    nested_ann_scope = _inspect_scope_fn(
+        {
+            "start": 1,
+            "end": 3,
+            "kind": "compound_block",
+            "is_subroutine": True,
+            "source_text": (
+                "def inner(x: LocalType, *args: VarType, **kwargs: KwType) -> ReturnType:\n"
+                "    return x\n"
+                "res = inner(val)\n"
+            ),
+        }
+    )
+    for expected_ann_sym in ("LocalType", "VarType", "KwType", "ReturnType", "val"):
+        assert expected_ann_sym in nested_ann_scope["inputs"]
+
+    multiline_acomp_tree = ast.parse(
+        "async def run(aiter):\n"
+        "    res = [\n"
+        "        x\n"
+        "        async for x in aiter\n"
+        "    ]\n"
+        "    return res\n"
+    )
+    assert _unit_ast_has_async_or_yield(
+        multiline_acomp_tree, 4, 4, is_subroutine=True
+    ) == (False, True)
+
+    multiline_str_helper = (
+        'def _shared_doc() -> str:\n'
+        '    msg = """para1\n\n\npara2"""\n'
+        '    return msg\n'
+    )
+    indented_multiline_str_helper = (
+        '    def _shared_doc(self) -> str:\n'
+        '        msg = """para1\n\n\npara2"""\n'
+        '        return msg\n'
+    )
+    assert _validate_helper_compilation(multiline_str_helper) is True
+    assert _validate_helper_compilation(indented_multiline_str_helper) is True
+    assert_valid_python(multiline_str_helper)
+    assert_valid_python(indented_multiline_str_helper)
+
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
+        _dedent_preserving_multiline_strings,
+        _extract_unit_body_lines,
+    )
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        _has_type_param_default,
+    )
+
+    unclosed_fstr = '    x = f"""line1 {a}\nline2\nline3'
+    assert _dedent_preserving_multiline_strings(unclosed_fstr) == (
+        'x = f"""line1 {a}\nline2\nline3'
+    )
+    unclosed_str = '    x = """line1\nline2\nline3'
+    assert _dedent_preserving_multiline_strings(unclosed_str) == (
+        'x = """line1\nline2\nline3'
+    )
+
+    dec_first_lines = [
+        "def outer(x: int) -> int:",
+        '    """Docstring."""',
+        "    @my_dec",
+        "    def inner(y: int) -> int:",
+        "        return y + 1",
+        "    return inner(x)",
+    ]
+    extracted_dec_body = _extract_unit_body_lines(
+        {"kind": "function"}, dec_first_lines
+    )
+    assert extracted_dec_body[0] == "@my_dec"
+    assert _has_type_param_default('T: "MyBound = 1"') is False
+    assert _has_type_param_default('T: "MyBound = 1" = int') is True
+
+    from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=import-outside-toplevel
+        _collect_scope_closures_uncached,
+    )
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
+        _resolve_unit_ast_end_col,
+    )
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _is_valid_expr_unit_lines,
+        _prune_unreferenced_lhs_scope,
+    )
+
+    eager_fn_tree = ast.parse(
+        "def outer(total, cap_dec, cap_def, body_var):\n"
+        "    def eager_helper(default_val=total):\n"
+        "        return default_val\n"
+        "    @dec(lambda: cap_dec)\n"
+        "    def closure_helper(cb=lambda: cap_def):\n"
+        "        return body_var\n"
+    )
+    outer_fn = eager_fn_tree.body[0]
+    assert isinstance(outer_fn, ast.FunctionDef)
+    fn_closures = _collect_scope_closures_uncached(outer_fn)
+    all_captured = set().union(*(reads for _, reads in fn_closures))
+    assert "total" not in all_captured
+    assert {"cap_dec", "cap_def", "body_var"} <= all_captured
+
+    assert _is_valid_expr_unit_lines({"kind": "complex_expr"}, []) is False
+    assert (
+        _is_valid_expr_unit_lines({"kind": "complex_expr"}, ["   # only comment"])
+        is False
+    )
+
+    comp_attr_unit = {"kind": "comprehension", "start": 1, "end": 1}
+    comp_attr_scope = {
+        "inputs": ["self", "items"],
+        "outputs": [],
+        "attrs_read": ["self.tmp"],
+        "attrs_written": ["self.tmp"],
+        "instance_attrs": ["self.tmp"],
+    }
+    _prune_unreferenced_lhs_scope(
+        comp_attr_unit,
+        comp_attr_scope,
+        ["self.tmp = [self.tmp for self.tmp in items]"],
+    )
+    assert "self.tmp" in comp_attr_scope["attrs_written"]
+
+    multi_trail_tree = ast.parse("x = 1; y = (\n    2\n)\n")
+    assert (
+        _resolve_unit_ast_end_col(
+            multi_trail_tree, {"start": 1, "end": 1, "start_col": 0}
+        )
+        == 5
+    )

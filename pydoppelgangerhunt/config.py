@@ -2,12 +2,76 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional, Union
+import threading
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from pydoppelgangerhunt.canonical_path import normalize_lexical_posix, parse_notebook_cell_anchor
+
+logger = logging.getLogger(__name__)
+
+_warned_closure_lock: threading.Lock = threading.Lock()
+_warned_closure_strictness_values: Set[str] = set()
+
+_CONFIG_KEY_NAMES: Tuple[str, ...] = (
+    "threshold",
+    "min_lines",
+    "exemptions",
+    "exclude",
+    "closure_strictness",
+    "skip_pre_unit_closures",
+)
+
+
+def resolve_closure_strictness_mode(
+    closure_strictness: Optional[str] = None,
+    skip_pre_unit_closures: bool = False,
+) -> Tuple[str, bool]:
+    """Resolves canonical closure strictness mode ('strict' or 'lenient') and boolean skip flag.
+
+    Precision vs Soundness Trade-off:
+    'strict' (default; alias 'fail_closed') preserves soundness by inspecting escaping closures
+    and callbacks that might execute after the unit.
+    'lenient' (aliases 'fast', 'skip') reduces false-positive rejections by bypassing pre-unit
+    closure scanning, at the cost of soundness for escaping closures.
+    """
+    if closure_strictness is not None:
+        c_mode = str(closure_strictness).strip().lower()
+        if c_mode in ("lenient", "fast", "skip"):
+            return "lenient", True
+        if c_mode in ("strict", "fail_closed"):
+            if skip_pre_unit_closures:
+                logger.warning(
+                    "Conflicting configuration: closure_strictness '%s' takes precedence over "
+                    "skip_pre_unit_closures=True",
+                    closure_strictness,
+                )
+            return "strict", False
+        fallback = "lenient" if skip_pre_unit_closures else "strict"
+        raw_key = str(closure_strictness)
+        with _warned_closure_lock:
+            should_warn = raw_key not in _warned_closure_strictness_values
+            if should_warn:
+                _warned_closure_strictness_values.add(raw_key)
+        if should_warn:
+            logger.warning(
+                "Unrecognized closure_strictness '%s'; falling back to %s mode",
+                closure_strictness,
+                fallback,
+            )
+        return fallback, bool(skip_pre_unit_closures)
+    is_lenient = bool(skip_pre_unit_closures)
+    return ("lenient" if is_lenient else "strict"), is_lenient
+
+
+def clear_closure_warning_cache() -> None:
+    """Clears the set of warned closure strictness values for multi-run lifecycle."""
+    with _warned_closure_lock:
+        _warned_closure_strictness_values.clear()
+
 
 DEFAULT_EXCLUDES: List[str] = [
     "checks/encapsulated",
@@ -41,6 +105,7 @@ exclude = [
 ]
 call_sequences = true
 idioms = true
+# closure_strictness = "strict"  # Options: "strict", "lenient"
 """
 
 
@@ -296,7 +361,7 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
         tool_sec = data.get("tool", {}) if isinstance(data, dict) else {}
         if isinstance(tool_sec, dict) and isinstance(tool_sec.get(section_name), dict):
             return dict(tool_sec[section_name])
-        if isinstance(data, dict) and any(k in data for k in ("threshold", "min_lines", "exemptions", "exclude")):
+        if isinstance(data, dict) and any(k in data for k in _CONFIG_KEY_NAMES):
             return dict(data)
     except (ImportError, OSError, ValueError, TypeError):
         pass
@@ -359,7 +424,7 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
                     except ValueError:
                         pass
         if not any(line.strip().startswith("[") for line in lines):
-            if any(k in config for k in ("threshold", "min_lines", "exemptions", "exclude")):
+            if any(k in config for k in _CONFIG_KEY_NAMES):
                 return config
             return {}
         return config

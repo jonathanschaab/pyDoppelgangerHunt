@@ -4,67 +4,45 @@ from __future__ import annotations
 
 import ast
 import os
-import re
 from pathlib import Path
+import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from pydoppelgangerhunt.config import normalize_path_string, paths_match_boundary
-from pydoppelgangerhunt.parser import is_decorator_named
-from pydoppelgangerhunt.fixer.scope import (
-    dispatch_analyze_unit_variable_scope as analyze_unit_variable_scope,
+from pydoppelgangerhunt.fixer._df_cache import (
+    _extract_first_unit_coord,
+    _extract_unit_end_col,
+    _get_or_parse_tree,
 )
-from pydoppelgangerhunt.fixer.source import parse_unit_coord, split_source_lines
+from pydoppelgangerhunt.fixer._df_visitors import _is_ast_node_within_unit_bounds
+from pydoppelgangerhunt.fixer.scope import analyze_unit_variable_scope
+from pydoppelgangerhunt.fixer.source import (
+    _find_innermost_enclosing_node,
+    _get_tree_scope_intervals,
+    _load_unit_file_text,
+    is_subroutine_unit,
+    parse_unit_coord,
+    split_source_lines,
+)
+from pydoppelgangerhunt.parser import (
+    is_decorator_named,
+    iter_nested_scope_header_nodes,
+)
 
-
-def _find_innermost_enclosing_node(
-    source_text: str,
-    unit: Dict[str, Any],
-    node_types: Tuple[type, ...],
-) -> Optional[Tuple[ast.AST, int, int]]:
-    """Locates the innermost AST node of matching types enclosing the given unit."""
-    if not source_text.strip():
-        return None
-
-    try:
-        tree = ast.parse(source_text)
-    except (SyntaxError, ValueError, UnicodeDecodeError):
-        return None
-
-    u_start = parse_unit_coord(unit, "start", default=0)
-    u_end = parse_unit_coord(unit, "end", default=u_start)
-    if u_start <= 0:
-        return None
-
-    candidates: List[Tuple[int, ast.AST, int, int]] = []
-    for node in ast.walk(tree):
-        if isinstance(node, node_types):
-            n_start = getattr(node, "lineno", 0)
-            n_end = getattr(node, "end_lineno", n_start)
-            decorators = getattr(node, "decorator_list", [])
-            dec_start = (
-                min(getattr(d, "lineno", n_start) for d in decorators)
-                if decorators
-                else n_start
-            )
-            earliest_start = min(dec_start, n_start)
-            if earliest_start <= u_start <= u_end <= n_end:
-                candidates.append((n_end - earliest_start, node, earliest_start, n_end))
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda item: (item[0], -item[2]))
-    _, matched_node, n_start, n_end = candidates[0]
-    return matched_node, n_start, n_end
+__all__ = [
+    "find_enclosing_class",
+    "find_enclosing_function",
+]
 
 
 def _inspect_enclosing_node(
     source_text: str,
     unit: Dict[str, Any],
     node_types: Tuple[type, ...],
+    tree: Optional[ast.AST] = None,
 ) -> Optional[Dict[str, Any]]:
     """Locates and extracts metadata for the innermost enclosing AST node of matching types."""
-    res = _find_innermost_enclosing_node(source_text, unit, node_types)
+    res = _find_innermost_enclosing_node(source_text, unit, node_types, tree=tree)
     if not res:
         return None
     matched_node, start, end = res
@@ -97,18 +75,20 @@ def _extract_child_indentation(
 def find_enclosing_class(
     source_text: str,
     unit: Dict[str, Any],
+    tree: Optional[ast.AST] = None,
 ) -> Optional[Dict[str, Any]]:
     """Locates the innermost enclosing ClassDef for an AST code unit.
 
     Args:
         source_text: The complete original Python source code.
         unit: AST unit dictionary with 1-indexed 'start' and 'end' line bounds.
+        tree: Optional pre-parsed AST tree of source_text.
 
     Returns:
         A dictionary with class metadata ('name', 'start', 'end', 'indent', 'method_indent')
         if the unit is enclosed within a ClassDef; None otherwise.
     """
-    meta = _inspect_enclosing_node(source_text, unit, (ast.ClassDef,))
+    meta = _inspect_enclosing_node(source_text, unit, (ast.ClassDef,), tree=tree)
     if not meta:
         return None
 
@@ -129,14 +109,18 @@ def find_enclosing_class(
             earliest_line = stmt_lineno
             decorators = getattr(stmt, "decorator_list", [])
             if decorators:
-                dec_lines = [int(getattr(d, "lineno", stmt_lineno)) for d in decorators]
+                dec_lines = [
+                    int(getattr(d, "lineno", None) or stmt_lineno) for d in decorators
+                ]
                 if dec_lines:
                     dec_start = min(dec_lines)
-                    earliest_line = min(dec_start, earliest_line) if earliest_line > 0 else dec_start
+                    earliest_line = (
+                        min(dec_start, earliest_line) if earliest_line > 0 else dec_start
+                    )
             if earliest_line > def_start:
                 cand_lines.append(earliest_line)
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                end_l = int(getattr(stmt, "end_lineno", stmt_lineno))
+                end_l = int(getattr(stmt, "end_lineno", None) or stmt_lineno)
                 direct_methods.add((earliest_line, end_l))
                 direct_methods.add((stmt_lineno, end_l))
         suite_indent = _extract_child_indentation(lines, cand_lines, indent)
@@ -152,16 +136,19 @@ def find_enclosing_class(
 def find_enclosing_function(
     source_text: str,
     unit: Dict[str, Any],
+    tree: Optional[ast.AST] = None,
 ) -> Optional[Dict[str, Any]]:
     """Locates the innermost enclosing FunctionDef/AsyncFunctionDef for an AST code unit."""
     meta = _inspect_enclosing_node(
-        source_text, unit, (ast.FunctionDef, ast.AsyncFunctionDef)
+        source_text, unit, (ast.FunctionDef, ast.AsyncFunctionDef), tree=tree
     )
     if not meta:
         return None
 
     decs = meta.pop("decorators", [])
     node = meta.pop("node", None)
+    meta["is_async"] = isinstance(node, ast.AsyncFunctionDef)
+    meta["enclosing_is_async"] = meta["is_async"]
     meta["is_static"] = any(is_decorator_named(d, "staticmethod") for d in decs)
     meta["is_class_method"] = any(is_decorator_named(d, "classmethod") for d in decs)
     receiver_param = None
@@ -287,50 +274,195 @@ def _get_enclosing_receiver_kind(fn_info: Optional[Dict[str, Any]]) -> str:
     return "instance"
 
 
+def _find_innermost_ast_scope(
+    tree: ast.AST,
+    u_start: int,
+    u_end: int,
+    *,
+    is_subroutine: bool = False,
+) -> ast.AST:
+    """Finds the innermost FunctionDef, AsyncFunctionDef, or ClassDef enclosing the unit bounds."""
+    has_outer_fn = any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and earliest_start <= u_start <= u_end <= n_end
+        and not (
+            u_start in (earliest_start, getattr(node, "lineno", earliest_start))
+            and u_end == n_end
+        )
+        for earliest_start, n_end, _, node in _get_tree_scope_intervals(tree)
+    )
+    res = _find_innermost_enclosing_node(
+        "",
+        {
+            "start": u_start,
+            "end": u_end,
+            "is_subroutine": is_subroutine or has_outer_fn,
+        },
+        (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        tree=tree,
+    )
+    return res[0] if res is not None else tree
+
+
+def _unit_ast_has_async_or_yield(
+    tree: ast.AST,
+    u_start: int,
+    u_end: int,
+    *,
+    is_subroutine: bool = False,
+    u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
+) -> Tuple[bool, bool]:
+    """Detects whether AST statements within unit bounds contain yield or async operations."""
+    has_yield = False
+    has_await = False
+
+    root_node = _find_innermost_ast_scope(
+        tree, u_start, u_end, is_subroutine=is_subroutine
+    )
+    stack: List[ast.AST] = [root_node]
+    while stack:
+        node = stack.pop()
+        lineno = getattr(node, "lineno", None)
+        end_lineno = getattr(node, "end_lineno", lineno)
+        eff_start = (
+            min(
+                [lineno]
+                + [
+                    getattr(d, "lineno", lineno) or lineno
+                    for d in getattr(node, "decorator_list", ())
+                ]
+            )
+            if lineno is not None
+            else None
+        )
+        if (
+            eff_start is not None
+            and end_lineno is not None
+            and (end_lineno < u_start or eff_start > u_end)
+            and node is not root_node
+        ):
+            continue
+
+        if node is not root_node and isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+        ):
+            stack.extend(iter_nested_scope_header_nodes(node))
+            continue
+
+        bound_node = node.target if isinstance(node, ast.comprehension) else node
+        if _is_ast_node_within_unit_bounds(
+            bound_node, u_start, u_end, u_end_col=u_end_col, u_start_col=u_start_col
+        ):
+            if isinstance(node, (ast.Yield, ast.YieldFrom)):
+                has_yield = True
+            elif isinstance(node, (ast.Await, ast.AsyncFor, ast.AsyncWith)):
+                has_await = True
+            elif isinstance(
+                node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+            ) and any(
+                bool(getattr(g, "is_async", False))
+                for g in getattr(node, "generators", [])
+            ):
+                has_await = True
+            elif (
+                isinstance(node, ast.comprehension)
+                and bool(getattr(node, "is_async", False))
+            ):
+                has_await = True
+
+        if has_yield and has_await:
+            break
+
+        stack.extend(ast.iter_child_nodes(node))
+
+    return has_yield, has_await
+
+
 def _populate_unit_receiver_metadata(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
+    source_text: Optional[str] = None,
+    tree: Optional[ast.AST] = None,
 ) -> None:
-    """Populates receiver_kind, enclosing_class, and is_static on a unit from enclosing AST nodes if absent."""
+    """Populates receiver_kind, enclosing_class, and is_static on a unit from AST if absent."""
     if (
         "receiver_kind" in unit
         and "enclosing_class" in unit
         and "enclosing_class_start" in unit
         and "receiver_param" in unit
+        and "is_async" in unit
+        and "enclosing_is_async" in unit
     ):
         return
-    f_raw = normalize_path_string(str(unit.get("file") or ""), strip_anchor=True)
-    if not f_raw:
+    source = (
+        source_text
+        if source_text is not None
+        else _load_unit_file_text(unit, repo_root=repo_root)
+    )
+    if source is None:
         return
-    p = Path(f_raw)
-    f_path = p if p.is_file() or p.is_absolute() else (Path(repo_root or os.getcwd()) / p)
-    if not f_path.is_file():
-        return
-    try:
-        source = f_path.read_text(encoding="utf-8")
-        fn_meta = find_enclosing_function(source, unit)
-        cls_meta = find_enclosing_class(source, unit)
-        if cls_meta:
-            if "enclosing_class" not in unit:
-                unit["enclosing_class"] = cls_meta["name"]
-            if "enclosing_class_start" not in unit:
-                unit["enclosing_class_start"] = cls_meta["start"]
-        is_method = _is_method_of_class(fn_meta, cls_meta)
-        if "receiver_kind" not in unit:
-            if is_method:
-                rec_k = _get_enclosing_receiver_kind(fn_meta)
-                unit["receiver_kind"] = rec_k
-                if rec_k == "static":
-                    unit["is_static"] = True
-            else:
-                unit["receiver_kind"] = None
-        if "receiver_param" not in unit:
-            if is_method and unit.get("receiver_kind") in ("instance", "class"):
-                unit["receiver_param"] = fn_meta.get("receiver_param") if fn_meta else None
-            else:
-                unit["receiver_param"] = None
-    except (OSError, UnicodeDecodeError):
-        pass
+    is_sub = is_subroutine_unit(unit, source_text=source, tree=tree) or unit.get("kind") in (
+        "comprehension",
+        "complex_expr",
+        "class",
+        "data_table",
+    )
+    lookup_unit = (
+        dict(unit, is_subroutine=True)
+        if (is_sub and unit.get("kind") != "class")
+        else unit
+    )
+    fn_meta = find_enclosing_function(source, lookup_unit, tree=tree)
+    cls_meta = find_enclosing_class(source, lookup_unit, tree=tree)
+    if cls_meta:
+        if "enclosing_class" not in unit:
+            unit["enclosing_class"] = cls_meta["name"]
+        if "enclosing_class_start" not in unit:
+            unit["enclosing_class_start"] = cls_meta["start"]
+    is_method = _is_method_of_class(fn_meta, cls_meta)
+    if "receiver_kind" not in unit:
+        if is_method:
+            rec_k = _get_enclosing_receiver_kind(fn_meta)
+            unit["receiver_kind"] = rec_k
+            if rec_k == "static":
+                unit["is_static"] = True
+        else:
+            unit["receiver_kind"] = None
+    if "receiver_param" not in unit:
+        if is_method and unit.get("receiver_kind") in ("instance", "class"):
+            unit["receiver_param"] = fn_meta.get("receiver_param") if fn_meta else None
+        else:
+            unit["receiver_param"] = None
+    fn_is_async = bool(fn_meta.get("is_async")) if fn_meta else False
+    if "enclosing_is_async" not in unit:
+        unit["enclosing_is_async"] = fn_is_async
+    if "is_async" not in unit:
+        if is_sub:
+            has_yield = bool(unit.get("has_yield"))
+            has_await = bool(unit.get("has_await"))
+            if not (has_yield or has_await) and source is not None:
+                parsed_tree = tree if tree is not None else _get_or_parse_tree(source)
+                if parsed_tree is not None:
+                    u_start = parse_unit_coord(unit, "start", default=1)
+                    u_end = parse_unit_coord(unit, "end", default=u_start)
+                    u_start_col = _extract_first_unit_coord(
+                        unit, ("start_col", "start_col_offset")
+                    )
+                    u_end_col = _extract_unit_end_col(unit)
+                    has_yield, has_await = _unit_ast_has_async_or_yield(
+                        parsed_tree,
+                        u_start,
+                        u_end,
+                        is_subroutine=True,
+                        u_start_col=u_start_col,
+                        u_end_col=u_end_col,
+                    )
+            unit["is_async"] = (
+                True if has_await else (fn_is_async if has_yield else False)
+            )
+        else:
+            unit["is_async"] = fn_is_async
 
 
 def _base_unit_name(u: Dict[str, Any]) -> str:
@@ -345,6 +477,28 @@ def _base_unit_name(u: Dict[str, Any]) -> str:
     base = re.sub(r"[^a-zA-Z0-9_]", "_", base).strip("_")
     return base or "helper"
 
+
+
+def _is_pair_in_method(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    *,
+    method_binding: str = "auto",
+    has_super: bool = False,
+    has_mangled: bool = False,
+    has_method_context: bool = True,
+) -> bool:
+    """Returns True if a clone pair resides in a method context eligible for method binding."""
+    disallow_kinds = (
+        ("closure", "class")
+        if (method_binding == "method" or has_super or has_mangled)
+        else ("comprehension", "complex_expr", "closure", "class")
+    )
+    return bool(
+        has_method_context
+        and u1.get("kind") not in disallow_kinds
+        and u2.get("kind") not in disallow_kinds
+    )
 
 
 def _resolve_effective_binding(
