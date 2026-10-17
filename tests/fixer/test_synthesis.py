@@ -4511,3 +4511,35 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     live_in_vis.visit(live_in_tree)
     assert "f" in live_in_vis.live_ins
     assert "rec_only" not in live_in_vis.live_ins
+
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _extract_unreferenced_lhs_loads,
+    )
+
+    assert _extract_unreferenced_lhs_loads(
+        ["arr[[k for k in keys][0]] = rhs"]
+    ) == {"arr", "keys"}
+
+    if sys.version_info >= (3, 12):
+        same_line_same_name_src = (
+            "def f[T: Bound](x: T):\n    def f(Bound=1): return Bound\n"
+        )
+        synth_tree = ast.parse(same_line_same_name_src)
+        for node in ast.walk(synth_tree):
+            if hasattr(node, "lineno"):
+                setattr(node, "lineno", 1)
+                setattr(node, "end_lineno", 1)
+        same_line_same_name_scope = _inspect_scope_fn(
+            {
+                "start": 1,
+                "end": 1,
+                "kind": "function",
+                "is_subroutine": False,
+                "source_text": same_line_same_name_src,
+            },
+            file_tree=synth_tree,
+        )
+        assert (
+            "type_param_closure_capture"
+            not in same_line_same_name_scope["control_flow_hazards"]
+        )

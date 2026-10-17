@@ -1510,11 +1510,21 @@ def _inspect_unit_scope(
         u_col = parse_unit_coord(unit, "start_col", default=None)
         if u_col is None:
             u_col = parse_unit_coord(unit, "col_offset", default=None)
-        top_fn_name = (
-            getattr(tree.body[0], "name", None)
+        top_fn = (
+            tree.body[0]
             if isinstance(tree, ast.Module)
             and len(tree.body) == 1
             and isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))
+            else None
+        )
+        top_fn_name = getattr(top_fn, "name", None) if top_fn is not None else None
+        top_fn_count = (
+            sum(
+                1
+                for n in ast.walk(top_fn)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            )
+            if top_fn is not None
             else None
         )
         parsed_tree = file_tree
@@ -1568,6 +1578,15 @@ def _inspect_unit_scope(
                         and (
                             top_fn_name is None
                             or getattr(scope_node, "name", None) == top_fn_name
+                        )
+                        and (
+                            top_fn_count is None
+                            or sum(
+                                1
+                                for n in ast.walk(scope_node)
+                                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                            )
+                            == top_fn_count
                         )
                     ):
                         matched_self = True

@@ -222,14 +222,11 @@ def _extract_unreferenced_lhs_loads(
         lhs_nodes, rhs_node = _extract_lhs_and_rhs_nodes(lines_or_stmt)
     if rhs_node is None or not lhs_nodes:
         return set()
-    loaded_lhs = {
-        child.id
-        for lhs in lhs_nodes
-        for child in ast.walk(lhs)
-        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
-    }
+    lhs_visitor = _OuterExprVisitor()
+    for lhs in lhs_nodes:
+        lhs_visitor.visit(lhs)
     return {
-        name for name in loaded_lhs if not _node_references_name(rhs_node, name)
+        name for name in lhs_visitor.names if not _node_references_name(rhs_node, name)
     }
 
 
