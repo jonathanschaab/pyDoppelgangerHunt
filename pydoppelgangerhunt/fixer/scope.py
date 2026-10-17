@@ -19,6 +19,7 @@ from typing import (
 )
 
 from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
+from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.fixer.source import (
     _SUBROUTINE_KINDS,
@@ -144,6 +145,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.deleted_names: Set[str] = set()
         self.type_aliases: Set[str] = set()
         self.type_params: List[str] = []
+        self.type_param_free_vars: List[str] = []
         self._scope_stack: List[Set[str]] = []
         self._type_param_scopes: List[Set[str]] = []
         self._comprehension_depth: int = 0
@@ -292,6 +294,15 @@ class _ScopeVisitor(ast.NodeVisitor):
                     self.type_params.append(ast.unparse(tp))
                 except Exception as exc:
                     logger.debug("Failed to unparse type_param %r: %s", tp, exc)
+                tp_visitor = _OuterExprVisitor()
+                tp_visitor.visit(tp)
+                for name in tp_visitor.ordered_names:
+                    if (
+                        name not in tp_names
+                        and name not in BUILTIN_NAMES
+                        and name not in self.type_param_free_vars
+                    ):
+                        self.type_param_free_vars.append(name)
             self._process_args(node)
             self._scope_stack.append(set(self.params) | tp_names)
         else:
@@ -1361,6 +1372,7 @@ def _inspect_unit_scope(
         "class_attrs": [],
         "outputs_ambiguous": False,
         "type_params": [],
+        "type_param_free_vars": [],
     }
     if not dedented.strip():
         return empty_res
@@ -1684,6 +1696,7 @@ def _inspect_unit_scope(
         ],
         "outputs_ambiguous": outputs_ambiguous,
         "type_params": list(visitor.type_params),
+        "type_param_free_vars": list(visitor.type_param_free_vars),
     }
 
 
@@ -1735,7 +1748,8 @@ def _merge_type_params(tp1: Sequence[str], tp2: Sequence[str]) -> List[str]:
             seen[ident] = raw_tp
             order.append(ident)
         elif seen[ident] != raw_tp:
-            seen[ident] = ident
+            prev_head = seen[ident].split(":", 1)[0].split("=", 1)[0].strip()
+            seen[ident] = head if prev_head == head else ident
     merged = [seen[ident] for ident in order]
     return [tp for tp in merged if not _has_type_param_default(tp)] + [
         tp for tp in merged if _has_type_param_default(tp)
@@ -1909,4 +1923,10 @@ def analyze_unit_variable_scope(
         ),
         "outputs_ambiguous": outputs_ambiguous,
         "type_params": type_params,
+        "type_param_free_vars": list(
+            dict.fromkeys(
+                info1.get("type_param_free_vars", [])
+                + (info2.get("type_param_free_vars", []) if u2 is not None else [])
+            )
+        ),
     }

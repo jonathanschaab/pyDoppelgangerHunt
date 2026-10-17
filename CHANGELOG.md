@@ -367,10 +367,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Bound PEP 695 `type_params` on `FunctionDef`, `AsyncFunctionDef`, `ClassDef`, and `TypeAlias` in
   `_ScopeVisitor` (`scope.py`) and `_extract_helper_symbols` (`patch.py`); preserved top-level
   generic function `type_params` (`scope["type_params"]`, merged via `_merge_type_params` keying on
-  stripped identifier names and ordering non-defaulted parameters before PEP 696 defaulted
+  stripped identifier names, preserving shared `*`/`**` `TypeVarTuple`/`ParamSpec` prefixes when
+  bounds/defaults conflict, and ordering non-defaulted parameters before PEP 696 defaulted
   parameters) onto the synthesized helper header (`def _shared_...[T](...)`) in
-  `synthesize_shared_helper_code` (`synthesis.py`) without visiting top-level `type_params` bounds as
-  runtime `free_vars`; evaluated `decorator_list` and function `defaults`/`kw_defaults` outside
+  `synthesize_shared_helper_code` (`synthesis.py`) while recording top-level `type_params`
+  bound/default symbol reads into `scope["type_param_free_vars"]` without polluting runtime
+  `free_vars` or `inputs`; evaluated `decorator_list` and function `defaults`/`kw_defaults` outside
   `type_params` in `_extract_nested_scope_free_reads` (`_df_visitors.py`),
   `_ScopeVisitor._process_func` (`scope.py`), and `_extract_helper_symbols` (`patch.py`); normalized
   qualified iterator prefixes (`typing.`, `typing_extensions.`, `collections.abc.`) via

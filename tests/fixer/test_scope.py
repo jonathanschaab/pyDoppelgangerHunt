@@ -1971,6 +1971,9 @@ def test_scope_visitor_pep695_type_params_and_type_alias(tmp_path: Path) -> None
     assert "CustomBound" not in scope_bound["inputs"]
     assert "CustomBound" not in scope_bound["free_vars"]
     assert scope_bound["type_params"] == ["T: CustomBound"]
+    assert scope_bound["type_param_free_vars"] == ["CustomBound"]
+    combined_bound = analyze_unit_variable_scope(u_bound, repo_root=str(tmp_path))
+    assert combined_bound["type_param_free_vars"] == ["CustomBound"]
 
     # 4. Nested generic function default argument evaluated outside type_params
     src_def = (
@@ -2002,6 +2005,8 @@ def test_subroutine_local_import_skips_downstream_read_scan(
 
     assert _merge_type_params(["T: int"], ["T: int"]) == ["T: int"]
     assert _merge_type_params(["T: int"], ["T: str"]) == ["T"]
+    assert _merge_type_params(["*Ts = *tuple[int, ...]"], ["*Ts = *tuple[str, ...]"]) == ["*Ts"]
+    assert _merge_type_params(["**P = [int]"], ["**P"]) == ["**P"]
     assert _merge_type_params(["T"], ["*T"]) == ["T"]
     assert _merge_type_params(["T = int"], ["U"]) == ["U", "T = int"]
     assert _merge_type_params(["T"], []) == ["T"]

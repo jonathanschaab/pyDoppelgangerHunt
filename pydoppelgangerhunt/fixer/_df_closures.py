@@ -418,6 +418,9 @@ def _collect_scope_closures_uncached(
                 if isinstance(sub_stmts, list):
                     _walk_stmts(sub_stmts, bound_names)
 
+            # Intentional precision trade-off: treat ExceptHandler.name and match_case
+            # pattern bindings as locally bound inside their respective blocks so closures
+            # referencing them are not misreported as capturing prior outer variables.
             for handler in getattr(stmt, "handlers", []):
                 h_name = getattr(handler, "name", None)
                 h_bound = (
