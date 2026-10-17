@@ -3538,15 +3538,15 @@ def test_synthesize_shared_helper_code_preserves_pep695_type_params(
 
     f_alpha = tmp_path / "generic_alpha.py"
     f_alpha.write_text(
-        "def alpha1[T](items: list[T], cast_fn) -> T:\n"
+        "def alpha1[T](items: list[T], cast_fn, mode: str = 'U') -> T:\n"
         "    # Note: U in comment and literal 'U' should not retain U\n"
-        "    tag = 'U'\n"
+        "    tag = mode\n"
         "    head = items[0]\n"
         "    return cast_fn(T, head)\n"
         "\n"
-        "def alpha2[U](items: list[U], cast_fn) -> U:\n"
+        "def alpha2[U](items: list[U], cast_fn, mode: str = 'U') -> U:\n"
         "    # Note: U in comment and literal 'U' should not retain U\n"
-        "    tag = 'U'\n"
+        "    tag = mode\n"
         "    head = items[0]\n"
         "    return cast_fn(U, head)\n",
         encoding="utf-8",
@@ -4294,6 +4294,36 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
             file_tree=same_line_tree,
         )
         assert "type_param_closure_capture" in same_line_scope["control_flow_hazards"]
+
+        outer_same_line_tree = ast.parse(
+            "def outer_gen[T: Bound](x: T) -> T:\n"
+            "    def inner_child(Bound: int = 1) -> int:\n"
+            "        return Bound\n"
+            "    return x\n"
+        )
+        o_fn = outer_same_line_tree.body[0]
+        i_fn = o_fn.body[0]  # type: ignore[attr-defined]
+        o_fn.lineno = 1
+        o_fn.end_lineno = 1
+        o_fn.col_offset = 0
+        i_fn.lineno = 1
+        i_fn.end_lineno = 1
+        i_fn.col_offset = 20
+        outer_same_line_scope = _inspect_unit_scope(
+            {
+                "start": 1,
+                "end": 1,
+                "kind": "function",
+                "source_text": (
+                    "def outer_gen[T: Bound](x: T) -> T:\n"
+                    "    def inner_child(Bound: int = 1) -> int:\n"
+                    "        return Bound\n"
+                    "    return x\n"
+                ),
+            },
+            file_tree=outer_same_line_tree,
+        )
+        assert "type_param_closure_capture" not in outer_same_line_scope["control_flow_hazards"]
 
         trunc_tree = ast.parse(
             "def self_fn[T: LocalAlias](x: T) -> T:\n"

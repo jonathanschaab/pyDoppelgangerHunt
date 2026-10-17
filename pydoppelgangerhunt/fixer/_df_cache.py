@@ -149,6 +149,7 @@ def _get_or_parse_tree(
     parsed: Optional[ast.AST] = None
     try:
         parsed = ast.parse(source_text)
+        setattr(parsed, "_immutable_cached", True)
     except (SyntaxError, ValueError, UnicodeDecodeError):
         parsed = None
 

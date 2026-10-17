@@ -1194,6 +1194,33 @@ def _format_helper_docstring(
     return "\n".join(docstring_lines)
 
 
+def _extract_probe_active_idents(probe_src: str, return_type: str) -> Set[str]:
+    """Extracts referenced AST Name identifiers and annotation string-constant identifiers."""
+    try:
+        probe_tree = ast.parse(probe_src)
+    except SyntaxError:
+        return set(re.findall(r"\b[A-Za-z_]\w*\b", f"{probe_src}\n{return_type}"))
+    all_nodes = list(ast.walk(probe_tree))
+    ann_roots = [
+        ann
+        for n in all_nodes
+        for ann in (
+            getattr(n, "annotation", None),
+            getattr(n, "returns", None),
+        )
+        if isinstance(ann, ast.AST)
+    ]
+    str_ann_text = "\n".join(
+        sub.value
+        for root in ann_roots
+        for sub in ast.walk(root)
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+    )
+    return {
+        n.id for n in all_nodes if isinstance(n, ast.Name)
+    } | set(re.findall(r"\b[A-Za-z_]\w*\b", f"{return_type}\n{str_ann_text}"))
+
+
 def synthesize_shared_helper_code(
     u1: Dict[str, Any],
     u2: Dict[str, Any],
@@ -1709,29 +1736,13 @@ def synthesize_shared_helper_code(
             if (tp1_idents and tp2_idents)
             else (tp1_idents | tp2_idents)
         )
-        sig_idents = set(
-            re.findall(r"\b[A-Za-z_]\w*\b", f"{params_str}\n{return_type}")
-        )
         probe_src = (
             f"{func_keyword} _probe({params_str}) -> {return_type}:\n"
             f"{indented_body}\n"
         )
-        try:
-            active_idents = (
-                common_tp_idents
-                | sig_idents
-                | {
-                    node.id
-                    for node in ast.walk(ast.parse(probe_src))
-                    if isinstance(node, ast.Name)
-                }
-            )
-        except SyntaxError:
-            active_idents = (
-                common_tp_idents
-                | sig_idents
-                | set(re.findall(r"\b[A-Za-z_]\w*\b", indented_body))
-            )
+        active_idents = common_tp_idents | _extract_probe_active_idents(
+            probe_src, return_type
+        )
         kept_tps: List[str] = []
         while True:
             next_tps = [

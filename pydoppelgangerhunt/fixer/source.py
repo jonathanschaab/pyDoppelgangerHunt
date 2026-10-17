@@ -1413,35 +1413,49 @@ def _node_scope_bounds(node: ast.AST) -> Tuple[int, int]:
     return min(dec_start, n_start), n_end
 
 
+def _compute_scope_intervals_sig(
+    tree: ast.AST, intervals: Sequence[Tuple[int, int, int, ast.AST]]
+) -> Tuple[Any, ...]:
+    """Computes a lightweight O(K) structural signature for scope interval cache validation."""
+    return (
+        tuple(id(s) for s in getattr(tree, "body", ())),
+        *(
+            (
+                id(node),
+                _node_scope_bounds(node),
+                tuple(id(s) for s in getattr(node, "body", ())),
+            )
+            for _, _, _, node in intervals
+        ),
+    )
+
+
 def _get_tree_scope_intervals(
     tree: ast.AST,
 ) -> List[Tuple[int, int, int, ast.AST]]:
     """Builds and caches sorted intervals (earliest_start, n_end, span, node) on the tree."""
-    scope_nodes = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    ]
     cached = getattr(tree, "_scope_intervals", None)
-    if (
-        isinstance(cached, list)
-        and len(cached) == len(scope_nodes)
-        and {id(item[3]) for item in cached} == {id(node) for node in scope_nodes}
-        and all(
-            _node_scope_bounds(node) == (earliest_start, n_end)
-            for earliest_start, n_end, _, node in cached
-        )
+    if isinstance(cached, list) and (
+        getattr(tree, "_immutable_cached", False)
+        or getattr(tree, "_scope_intervals_sig", None)
+        == _compute_scope_intervals_sig(tree, cached)
     ):
         return cached
     intervals: List[Tuple[int, int, int, ast.AST]] = []
-    for node in scope_nodes:
-        earliest_start, n_end = _node_scope_bounds(node)
-        intervals.append((earliest_start, n_end, n_end - earliest_start, node))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            earliest_start, n_end = _node_scope_bounds(node)
+            intervals.append((earliest_start, n_end, n_end - earliest_start, node))
     intervals.sort(
         key=lambda item: (item[2], -item[0], -getattr(item[3], "col_offset", 0))
     )
     try:
         setattr(tree, "_scope_intervals", intervals)
+        setattr(
+            tree,
+            "_scope_intervals_sig",
+            _compute_scope_intervals_sig(tree, intervals),
+        )
     except (AttributeError, TypeError):
         pass
     return intervals

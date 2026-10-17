@@ -1574,8 +1574,11 @@ def _inspect_unit_scope(
                     if (
                         earliest_start < s_line
                         or n_end > e_line
-                        or u_col is None
-                        or getattr(scope_node, "col_offset", 0) < u_col
+                        or (u_col is None and matched_self)
+                        or (
+                            u_col is not None
+                            and getattr(scope_node, "col_offset", 0) < u_col
+                        )
                     ):
                         has_enclosing_fn = True
                         enclosing_fn_locals.update(
