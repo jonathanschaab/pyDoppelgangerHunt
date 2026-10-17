@@ -18,12 +18,15 @@ from typing import (
     Union,
 )
 
+from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
+from pydoppelgangerhunt.fixer._df_closures import _extract_single_node_local_names
 from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
 from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.fixer.source import (
     _SUBROUTINE_KINDS,
     _WHOLE_UNIT_KINDS,
+    _get_tree_scope_intervals,
     _load_unit_file_text,
     _slice_unit_token_lines,
     dedent_source_text,
@@ -1487,8 +1490,44 @@ def _inspect_unit_scope(
     if is_subroutine and visitor.has_return:
         hazards.append("embedded_return")
 
+    if visitor.type_param_free_vars and not is_subroutine:
+        s_line = parse_unit_coord(unit, "start", default=1)
+        e_line = parse_unit_coord(unit, "end", default=s_line)
+        parsed_tree = file_tree
+        if parsed_tree is None:
+            full_src = _get_full_source()
+            if full_src:
+                parsed_tree = _get_or_parse_tree(full_src)
+        enclosing_fn_locals: Set[str] = set()
+        has_enclosing_fn = False
+        if parsed_tree is not None:
+            for earliest_start, n_end, _span, scope_node in _get_tree_scope_intervals(
+                parsed_tree
+            ):
+                if (
+                    isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and earliest_start <= s_line <= e_line <= n_end
+                    and (earliest_start < s_line or n_end > e_line)
+                ):
+                    has_enclosing_fn = True
+                    enclosing_fn_locals.update(
+                        _extract_single_node_local_names(scope_node)
+                    )
+        if has_enclosing_fn:
+            if any(fv in enclosing_fn_locals for fv in visitor.type_param_free_vars):
+                hazards.append("type_param_closure_capture")
+        elif unit.get("kind") == "closure":
+            hazards.append("type_param_closure_capture")
+
     is_control_flow_safe = not any(
-        h in ("naked_break", "naked_continue", "embedded_return") for h in hazards
+        h
+        in (
+            "naked_break",
+            "naked_continue",
+            "embedded_return",
+            "type_param_closure_capture",
+        )
+        for h in hazards
     )
 
     free_vars = [

@@ -1381,25 +1381,33 @@ def _find_sig_colon(line: str) -> int:
     return line.rfind(":")
 
 
+def _node_scope_bounds(node: ast.AST) -> Tuple[int, int]:
+    """Computes (earliest_start, n_end) line bounds for a scope AST node."""
+    n_start = getattr(node, "lineno", 0) or 0
+    n_end = getattr(node, "end_lineno", None) or n_start
+    decorators = getattr(node, "decorator_list", [])
+    dec_start = (
+        min((getattr(d, "lineno", None) or n_start) for d in decorators)
+        if decorators
+        else n_start
+    )
+    return min(dec_start, n_start), n_end
+
+
 def _get_tree_scope_intervals(
     tree: ast.AST,
 ) -> List[Tuple[int, int, int, ast.AST]]:
     """Builds and caches sorted intervals (earliest_start, n_end, span, node) on the tree."""
     cached = getattr(tree, "_scope_intervals", None)
-    if isinstance(cached, list):
+    if isinstance(cached, list) and all(
+        _node_scope_bounds(node) == (earliest_start, n_end)
+        for earliest_start, n_end, _, node in cached
+    ):
         return cached
     intervals: List[Tuple[int, int, int, ast.AST]] = []
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            n_start = getattr(node, "lineno", 0) or 0
-            n_end = getattr(node, "end_lineno", None) or n_start
-            decorators = getattr(node, "decorator_list", [])
-            dec_start = (
-                min((getattr(d, "lineno", None) or n_start) for d in decorators)
-                if decorators
-                else n_start
-            )
-            earliest_start = min(dec_start, n_start)
+            earliest_start, n_end = _node_scope_bounds(node)
             intervals.append((earliest_start, n_end, n_end - earliest_start, node))
     intervals.sort(
         key=lambda item: (item[2], -item[0], -getattr(item[3], "col_offset", 0))

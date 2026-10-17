@@ -1399,6 +1399,8 @@ def synthesize_shared_helper_code(
         return ""
     if scope1.get("nonlocals") or scope2.get("nonlocals") or scope.get("nonlocals"):
         return ""
+    if "type_param_closure_capture" in scope.get("control_flow_hazards", []):
+        return ""
     if not is_same_class and not _is_same_file_path(f1, f2, repo_root=repo_root) and (
         scope1.get("globals") or scope2.get("globals") or scope.get("globals")
     ):

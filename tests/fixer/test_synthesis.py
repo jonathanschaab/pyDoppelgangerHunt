@@ -3861,3 +3861,124 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
         assert "handled_val" not in ts_free
         assert "err_group" not in ts_free
         assert "handled_val" in ts_defs
+
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _unit_has_no_refactor_pragma,
+        _validate_helper_compilation,
+    )
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
+        _get_tree_scope_intervals,
+    )
+
+    eof_pragma_src = "def normal_fn(x: int) -> int:\n    return x + 1\n# pragma: no-refactor\n"
+    eof_lines = eof_pragma_src.splitlines(keepends=True)
+    assert not _unit_has_no_refactor_pragma(
+        {"start": 10, "end": 12}, eof_lines, orig_text=eof_pragma_src
+    )
+
+    mut_tree = ast.parse("def alpha():\n    return 1\n")
+    intervals_initial = _get_tree_scope_intervals(mut_tree)
+    assert intervals_initial[0][:2] == (1, 2)
+    mut_tree.body[0].lineno = 5  # type: ignore[attr-defined]
+    mut_tree.body[0].end_lineno = 8  # type: ignore[attr-defined]
+    intervals_updated = _get_tree_scope_intervals(mut_tree)
+    assert intervals_updated[0][:2] == (5, 8)
+
+    crlf_helper = (
+        "from typing import Any\r\n\r\n\r\n"
+        "    def _shared_crlf(self, x: Any) -> Any:\r\n"
+        "        return x + 1\r\n"
+    )
+    assert _validate_helper_compilation(crlf_helper)
+    mixed_cr_helper = (
+        "from typing import Any\n\n\n\r\n"
+        "    def _shared_cr(self, x: Any) -> Any:\n"
+        "        return x + 1\n"
+    )
+    assert _validate_helper_compilation(mixed_cr_helper)
+
+    if sys.version_info >= (3, 12):
+        local_bound_file = tmp_path / "closure_type_param_capture.py"
+        local_bound_file.write_text(
+            "class ModuleBound:\n"
+            "    pass\n\n"
+            "def outer_a(local_bound: type):\n"
+            "    def inner_a[T: local_bound](x: T) -> T:\n"
+            "        step = 1\n"
+            "        return x\n"
+            "    return inner_a\n\n"
+            "def outer_b(local_bound: type):\n"
+            "    def inner_b[T: local_bound](x: T) -> T:\n"
+            "        step = 1\n"
+            "        return x\n"
+            "    return inner_b\n\n"
+            "def mod_outer_a():\n"
+            "    def mod_inner_a[T: ModuleBound](x: T) -> T:\n"
+            "        step = 1\n"
+            "        return x\n"
+            "    return mod_inner_a\n\n"
+            "def mod_outer_b():\n"
+            "    def mod_inner_b[T: ModuleBound](x: T) -> T:\n"
+            "        step = 1\n"
+            "        return x\n"
+            "    return mod_inner_b\n",
+            encoding="utf-8",
+        )
+        u_cap1 = {
+            "file": str(local_bound_file),
+            "start": 5,
+            "end": 7,
+            "name": "outer_a:inner_a",
+            "kind": "closure",
+        }
+        u_cap2 = {
+            "file": str(local_bound_file),
+            "start": 11,
+            "end": 13,
+            "name": "outer_b:inner_b",
+            "kind": "closure",
+        }
+        assert (
+            synthesize_shared_helper_code(u_cap1, u_cap2, repo_root=str(tmp_path))
+            == ""
+        )
+        assert (
+            generate_refactoring_patch(
+                [(0.99, u_cap1, u_cap2)],
+                repo_root=str(tmp_path),
+                replace_clones=True,
+            )
+            == ""
+        )
+        sliced_cap = {
+            "start": 1,
+            "end": 3,
+            "name": "inner_sliced",
+            "kind": "closure",
+            "source_text": (
+                "def inner_sliced[T: local_bound](x: T) -> T:\n"
+                "    step = 1\n"
+                "    return x\n"
+            ),
+        }
+        assert synthesize_shared_helper_code(sliced_cap, sliced_cap) == ""
+
+        u_mod1 = {
+            "file": str(local_bound_file),
+            "start": 17,
+            "end": 19,
+            "name": "mod_outer_a:mod_inner_a",
+            "kind": "closure",
+        }
+        u_mod2 = {
+            "file": str(local_bound_file),
+            "start": 23,
+            "end": 25,
+            "name": "mod_outer_b:mod_inner_b",
+            "kind": "closure",
+        }
+        mod_helper = synthesize_shared_helper_code(
+            u_mod1, u_mod2, repo_root=str(tmp_path)
+        )
+        assert "[T: ModuleBound]" in mod_helper
+

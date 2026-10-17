@@ -2859,13 +2859,14 @@ def _validate_helper_compilation(helper_code: str) -> bool:
         Intentionally preserved for standalone verification, post-synthesis validation
         assertions, and test harness compatibility.
     """
-    if "\n\n\n" in helper_code:
-        header, body = helper_code.split("\n\n\n", 1)
+    sep = "\r\n\r\n\r\n" if "\r\n\r\n\r\n" in helper_code else "\n\n\n"
+    if sep in helper_code:
+        header, body = helper_code.split(sep, 1)
         try:
             if header.strip():
                 compile(header, "<patch_imports>", "exec")
             if body.strip():
-                if body.lstrip("\n").startswith((" ", "\t")):
+                if body.lstrip("\r\n").startswith((" ", "\t")):
                     compile("if 1:\n" + body, "<patch_helper>", "exec")
                 else:
                     compile(body, "<patch_helper>", "exec")
@@ -2904,6 +2905,8 @@ def _unit_has_no_refactor_pragma(
     eff_lines = (
         file_lines if file_lines is not None else split_source_lines(full_text)
     )
+    if u_start > len(eff_lines):
+        return False
     start_idx = min(len(eff_lines), max(0, u_start - 1))
     effective_tree = tree if tree is not None else _get_or_parse_tree(full_text)
     if effective_tree is not None:
@@ -3362,6 +3365,11 @@ def _generate_refactoring_patch_impl(
 
             hazards1 = set(s1.get("control_flow_hazards", []))
             hazards2 = set(s2.get("control_flow_hazards", []))
+            if "type_param_closure_capture" in hazards1 | hazards2:
+                skip_reasons["type_param closure capture"] = (
+                    skip_reasons.get("type_param closure capture", 0) + 1
+                )
+                continue
             if any(h in ("naked_break", "naked_continue") for h in hazards1 | hazards2):
                 skip_reasons["naked break or continue"] += 1
                 continue

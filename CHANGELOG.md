@@ -421,11 +421,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routed `_visit_named_expr(..., check_comp=True)` through `_can_store_in_class_scope` so walrus
   targets inside class-body comprehensions do not bind to `class_stores`.
 - **Out-of-Bounds `u_start` Guard, Multi-Line AST Decorator Lookback in `_unit_has_no_refactor_pragma` & Asymmetric Expression Unit Validation**:
-  Clamped `start_idx = min(len(eff_lines), max(0, u_start - 1))`, bounded `start_idx` by the earliest
-  AST `decorator_list` line, and stepped back over contiguous `#` and `@` lines in
+  Returned `False` early when `u_start > len(eff_lines)`, clamped `start_idx = min(len(eff_lines), max(0, u_start - 1))`,
+  bounded `start_idx` by the earliest AST `decorator_list` line, and stepped back over contiguous `#` and `@` lines in
   `_unit_has_no_refactor_pragma` (`patch.py`), and validated both `orig_lines1` and `orig_lines2` via
   `_is_valid_expr_unit_lines` in `synthesize_shared_helper_code` (`synthesis.py`) to reject unmapped
   statement partners (e.g. `assert` or bare `return` with `stmt.value is None`).
+- **Nested Generic Closure `type_params` Capture Guard, In-Place AST `_scope_intervals` Validation & CRLF Helper Compilation Check**:
+  Detected PEP 695 `type_params` bounds/defaults referencing enclosing function local bindings (`type_param_closure_capture` hazard)
+  in `_inspect_unit_scope` (`scope.py`) so `synthesize_shared_helper_code` (`synthesis.py`) and `generate_refactoring_patch` (`patch.py`)
+  fail closed rather than hoisting undefined local bounds to module scope; validated cached node bounds via `_node_scope_bounds` in
+  `_get_tree_scope_intervals` (`source.py`) against in-place `lineno`/`end_lineno` AST mutations; and stripped CR/LF line endings
+  (`body.lstrip("\r\n")`) in `_validate_helper_compilation` (`patch.py`).
 
 ## [1.0.0] - 2026-09-20
 ### Added
