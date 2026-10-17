@@ -2136,18 +2136,18 @@ def _extract_helper_symbols(
             self, elts: Sequence[ast.expr], generators: Sequence[ast.comprehension]
         ) -> None:
             comp_scope: Set[str] = set()
-            for gen in generators:
-                self.visit(gen.iter)
-                comp_scope.update(_extract_assigned_names(gen.target))
-                scope_stack.append(comp_scope)
-                self.visit(gen.target)
-                for if_clause in gen.ifs:
-                    self.visit(if_clause)
-                scope_stack.pop()
             scope_stack.append(comp_scope)
-            for e in elts:
-                self.visit(e)
-            scope_stack.pop()
+            try:
+                for gen in generators:
+                    self.visit(gen.iter)
+                    comp_scope.update(_extract_assigned_names(gen.target))
+                    self.visit(gen.target)
+                    for if_clause in gen.ifs:
+                        self.visit(if_clause)
+                for e in elts:
+                    self.visit(e)
+            finally:
+                scope_stack.pop()
 
         def visit_ListComp(self, node: ast.ListComp) -> None:
             self._handle_comprehension([node.elt], node.generators)
@@ -2162,12 +2162,14 @@ def _extract_helper_symbols(
             self._handle_comprehension([node.key, node.value], node.generators)
 
         def visit_Lambda(self, node: ast.Lambda) -> None:
-            self._visit_with_type_params(
-                node, list(node.args.defaults) + list(node.args.kw_defaults)
-            )
+            for d in list(node.args.defaults) + list(node.args.kw_defaults):
+                if d is not None:
+                    self.visit(d)
             scope_stack.append(_extract_arg_names(node.args))
-            self.visit(node.body)
-            scope_stack.pop()
+            try:
+                self.visit(node.body)
+            finally:
+                scope_stack.pop()
 
 
         def visit_Import(self, node: ast.Import) -> None:

@@ -381,7 +381,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self._process_func(node)
 
     def visit_Await(self, node: ast.Await) -> None:
-        if len(self._scope_stack) <= 1:
+        if (len(self._scope_stack) - self._comprehension_depth) <= 1:
             self.is_async = True
         self.generic_visit(node)
 

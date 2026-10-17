@@ -4564,3 +4564,31 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     nested_comp_vis.visit(ast.parse(nested_comp_target_src))
     assert "k" in nested_comp_vis.live_ins
     assert "w" in nested_comp_vis.live_ins
+
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        _extract_helper_symbols,
+    )
+
+    await_comp_src = (
+        "async def run(items, fetch):\n"
+        "    res = [await fetch(x) for x in items]\n"
+        "    return res\n"
+    )
+    await_comp_scope = _inspect_scope_fn(
+        {
+            "start": 2,
+            "end": 2,
+            "kind": "comprehension",
+            "is_subroutine": False,
+            "source_text": await_comp_src,
+            "source_lines": await_comp_src.splitlines(keepends=True),
+        },
+        file_tree=ast.parse(await_comp_src),
+    )
+    assert await_comp_scope["is_async"] is True
+
+    free_syms, _, _ = _extract_helper_symbols(
+        ast.parse("def _shared(rows):\n    return [y for x in rows for y in x]\n")
+    )
+    assert "x" not in free_syms
+    assert "y" not in free_syms
