@@ -5795,6 +5795,29 @@ def test_extract_nested_scope_free_reads_pep695_decorators_and_defaults() -> Non
     assert _resolve_unit_ast_end_col(ml_fn, {"start": 3, "end": 4}) is None
     assert _resolve_unit_ast_end_col(ml_fn, {"start": 2, "end": 4, "start_col": 10}) is None
 
+    expr_stmt_fn = ast.parse("def f(x):\n    (yield x) + x\n").body[0]
+    assert _resolve_unit_ast_end_col(expr_stmt_fn, {"start": 2, "end": 2, "start_col": 4}) is None
+    assert (
+        _resolve_unit_ast_end_col(
+            expr_stmt_fn, {"start": 2, "end": 2, "start_col": 4, "kind": "complex_expr"}
+        )
+        is None
+    )
+
+    semi_ml_fn = ast.parse("def f(a):\n    x = 0\n    a = 1; b = (\n        a + 1\n    )\n").body[0]
+    assert _resolve_unit_ast_end_col(semi_ml_fn, {"start": 2, "end": 3}) is None
+
+    walrus_hdr_fn = ast.parse(
+        "def outer(custom_sum, items):\n"
+        "    def inner(x=(sum := custom_sum)):\n"
+        "        return x\n"
+        "    vals = [f(i) for i in items if (cb := lambda y=(min := custom_sum): y)]\n"
+        "    return inner, vals\n"
+    ).body[0]
+    local_hdr_names = _extract_single_node_local_names(walrus_hdr_fn)
+    assert "sum" in local_hdr_names
+    assert "min" in local_hdr_names
+
     loop_cls_src = (
         "def loop_with_class(items):\n"
         "    for _ in items:\n"
@@ -5811,3 +5834,4 @@ def test_extract_nested_scope_free_reads_pep695_decorators_and_defaults() -> Non
         )
         == set()
     )
+

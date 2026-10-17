@@ -245,7 +245,8 @@ def _resolve_unit_ast_end_col(
     u_start, u_end = bounds
 
     parent_map = _get_scope_parent_map(scope_node)
-    matching_stmts = list(_get_scope_stmts_by_end_lineno(scope_node).get(u_end, []))
+    stmts_by_end = _get_scope_stmts_by_end_lineno(scope_node)
+    matching_stmts = list(stmts_by_end.get(u_end, []))
 
     inner_stmts: List[ast.stmt] = []
     if matching_stmts:
@@ -270,12 +271,18 @@ def _resolve_unit_ast_end_col(
 
     inner_stmts.sort(key=lambda s: getattr(s, "col_offset", 0))
     start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
+    if start_col is not None and unit.get("kind") in ("comprehension", "complex_expr"):
+        return None
     if len(inner_stmts) == 1:
         stmt_start = getattr(inner_stmts[0], "lineno", 0)
         stmt_col = getattr(inner_stmts[0], "col_offset", 0)
         if stmt_start < u_start:
             return None
-        if stmt_start == u_start and start_col is not None and start_col > stmt_col:
+        if start_col is not None and (
+            stmt_start != u_start
+            or start_col != stmt_col
+            or isinstance(inner_stmts[0], ast.Expr)
+        ):
             return None
         target_stmt = inner_stmts[0]
     elif u_start == u_end and start_col is not None:
@@ -298,6 +305,14 @@ def _resolve_unit_ast_end_col(
             "Statement ending at line %d has no end_col_offset; falling back to whole-line",
             u_end,
         )
+        return None
+    if any(
+        s is not target_stmt
+        and getattr(s, "lineno", 0) == u_end
+        and getattr(s, "col_offset", 0) >= int(end_col)
+        for stmt_list in stmts_by_end.values()
+        for s in stmt_list
+    ):
         return None
     return int(end_col)
 

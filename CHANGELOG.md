@@ -279,7 +279,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AugAssign`, `Return`, and `Expr` whole-line expression units,
   recompute receiver binding flags (`has_instance_binding`, `has_class_binding`,
   `has_receiver_access`, `binding_kind`) respecting custom `@classmethod` receiver names, map
-  call-site arguments positionally (`dict(zip(inputs, target_inputs))`) in `_format_call_arguments`,
+  call-site arguments and helper parameter metadata positionally (`positional_target_map=True`,
+  `dict(zip(inputs, target_inputs))`) in `_format_call_arguments` and `_format_helper_parameters`
+  even when expression clones share the same variable names in swapped RHS positions,
   and fail closed when pruned RHS input arities differ (`len(scope1["inputs"]) != len(scope2["inputs"])`).
 - **Sync vs. Async Iterator Return Annotation Cross-Check & Qualified Container Prefix Stripping**:
   Guarded early-return iterator prefixes in `_infer_helper_return_type` (`synthesis.py`) with `is_async`
@@ -313,7 +315,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Included `"async_function"` and `"async_method"` alongside `("function", "closure", "method")` in
   `_extract_unit_body_lines` (`source.py`), `_inspect_unit_scope` (`scope.py`), and
   `_build_unit_delegation_call` (`patch.py`); promoted subroutines with `has_await=True` to
-  `is_async=True` in `_populate_unit_receiver_metadata` (`binding.py`) even at module top-level; and
+  `is_async=True` in `_populate_unit_receiver_metadata` (`binding.py`) even at module top-level;
+  inspected outer-evaluated header expressions (`decorator_list`, `args.defaults`, `args.kw_defaults`,
+  `bases`, `keywords` via `iter_nested_scope_header_nodes`) before skipping nested `FunctionDef`,
+  `AsyncFunctionDef`, `ClassDef`, and `Lambda` bodies in `_node_is_effectively_async` (`parser.py`),
+  `_unit_ast_has_async_or_yield` (`binding.py`), and `_extract_single_node_local_names` /
+  `_extract_comprehension_walrus_names` (`_df_closures.py`); and
   pushed `False` onto `async_stack` for `ClassDef` and `Lambda` bodies in `_ScopeHierarchyVisitor`
   (`parser.py`).
 - **Whole-Loop Column Offset Guard in `_find_enclosing_loops`**: Cached loop `col_offset` in
@@ -345,10 +352,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_BaseScopeVisitor._visit_comprehension`, across chained `node.values[1:]` operands in
   `visit_BoolOp`, and across intersected `body`/`orelse` branches (`stored_body & stored_else`) in
   `visit_IfExp` while recording `NamedExpr` targets in `self.stored` so intra-comprehension and
-  intra-branch walrus reads do not become spurious live-ins; checked `stmt_start < u_start` and
-  `stmt_start == u_start` with `start_col` in `_resolve_unit_ast_end_col` (`_df_cache.py`) so
-  single-line and multi-line sub-expression units without `end_col` do not misresolve to full or
-  trailing statements; and removed the `_is_inside` fallback
+  intra-branch walrus reads do not become spurious live-ins; checked `stmt_start < u_start`,
+  `start_col` with `comprehension`/`complex_expr`/`ast.Expr` or `stmt_start != u_start or start_col != stmt_col`,
+  and trailing statements starting on line `u_end` (`col_offset >= end_col`) in `_resolve_unit_ast_end_col` (`_df_cache.py`) so
+  single-line and multi-line sub-expression units without `end_col` or semicolon lines spanning beyond `u_end`
+  do not misresolve to full or partial statements; and removed the `_is_inside` fallback
   to `generic_visit` in `_UnitLiveInVisitor.visit_Assign`, `visit_AnnAssign`, `visit_BoolOp`,
   `visit_IfExp`, and `visit_NamedExpr` so RHS values and conditional depths are always evaluated
   accurately across multi-line and sub-line unit boundaries.

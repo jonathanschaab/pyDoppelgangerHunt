@@ -998,28 +998,33 @@ def _record_clause_branch(
     )
 
 
+def iter_nested_scope_header_nodes(node: ast.AST) -> List[ast.AST]:
+    """Returns outer-evaluated header expressions (decorators, defaults, bases, keywords) for a nested scope node."""
+    header_nodes: List[ast.AST] = list(getattr(node, "decorator_list", ()))
+    node_args = getattr(node, "args", None)
+    if isinstance(node_args, ast.arguments):
+        header_nodes.extend(node_args.defaults)
+        header_nodes.extend(d for d in node_args.kw_defaults if d is not None)
+    header_nodes.extend(getattr(node, "bases", ()))
+    header_nodes.extend(getattr(node, "keywords", ()))
+    return header_nodes
+
+
 def _node_is_effectively_async(
     node: Union[ast.AST, Sequence[ast.AST]], enclosing_is_async: bool
 ) -> bool:
     """Checks whether an AST node or stmt sequence has async syntax or acts as an async generator."""
-    if isinstance(node, (list, tuple)):
-        nodes = list(node)
-    else:
-        nodes = [node]
+    nodes = list(node) if isinstance(node, (list, tuple)) else [node]
     for n in nodes:
         if not isinstance(n, ast.AST):
             continue
-        if isinstance(
-            n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
-        ):
-            continue
-
         queue: deque[ast.AST] = deque([n])
         while queue:
             curr = queue.popleft()
-            if curr is not n and isinstance(
+            if isinstance(
                 curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
             ):
+                queue.extend(iter_nested_scope_header_nodes(curr))
                 continue
             if isinstance(curr, (ast.Await, ast.AsyncFor, ast.AsyncWith)):
                 return True

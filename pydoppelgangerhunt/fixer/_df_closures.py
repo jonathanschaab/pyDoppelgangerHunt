@@ -29,6 +29,7 @@ from pydoppelgangerhunt.fixer._df_visitors import (
     _extract_pattern_bound_name,
     _record_import_names,
 )
+from pydoppelgangerhunt.parser import iter_nested_scope_header_nodes
 
 _BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
@@ -82,6 +83,7 @@ def _extract_comprehension_walrus_names(comp_node: ast.AST) -> Set[str]:
         if isinstance(
             curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
         ):
+            node_stack.extend(iter_nested_scope_header_nodes(curr))
             continue
         if isinstance(curr, ast.NamedExpr) and isinstance(curr.target, ast.Name):
             walrus_names.add(curr.target.id)
@@ -112,11 +114,13 @@ def _extract_single_node_local_names(scope_node: ast.AST) -> Set[str]:
         curr = stack.pop()
         if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names.add(curr.name)
+            stack.extend(iter_nested_scope_header_nodes(curr))
             continue
         if isinstance(curr, _COMPREHENSION_TYPES):
             names.update(_extract_comprehension_walrus_names(curr))
             continue
         if isinstance(curr, _INNER_SCOPE_TYPES):
+            stack.extend(iter_nested_scope_header_nodes(curr))
             continue
         if isinstance(curr, ast.Name) and isinstance(curr.ctx, ast.Store):
             names.add(curr.id)

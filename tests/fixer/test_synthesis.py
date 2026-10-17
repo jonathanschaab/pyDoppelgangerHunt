@@ -3729,3 +3729,52 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     )
     assert ret_call == "    return _shared_diff(y, x)\n"
 
+    swap_src = (
+        "def sub_plain(x: int, y: int) -> int:\n"
+        "    res = (x - y) * 2\n"
+        "    return res\n"
+        "\n"
+        "def sub_slot(arr: list[int], x: int, y: int) -> None:\n"
+        "    arr[x] = (y - x) * 2\n"
+    )
+    swap_file = tmp_path / "swap_expr.py"
+    swap_file.write_text(swap_src, encoding="utf-8")
+    swap_patch = generate_refactoring_patch(
+        [
+            (
+                1.0,
+                {"file": str(swap_file), "start": 2, "end": 2, "kind": "complex_expr", "name": "sub_plain:expr"},
+                {"file": str(swap_file), "start": 6, "end": 6, "kind": "complex_expr", "name": "sub_slot:expr"},
+            )
+        ],
+        repo_root=str(tmp_path),
+        replace_clones=True,
+    )
+    assert "res = _shared_sub_plain_sub_slot(x, y)" in swap_patch
+    assert "arr[x] = _shared_sub_plain_sub_slot(y, x)" in swap_patch
+
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
+        _unit_ast_has_async_or_yield,
+    )
+    from pydoppelgangerhunt.parser import (  # pylint: disable=import-outside-toplevel
+        _node_is_effectively_async,
+    )
+
+    nested_hdr_src = (
+        "async def outer():\n"
+        "    @register(await get_hook())\n"
+        "    def inner():\n"
+        "        return 1\n"
+        "    cb = lambda x=await fetch(): x\n"
+        "    return inner, cb\n"
+    )
+    nested_hdr_tree = ast.parse(nested_hdr_src)
+    inner_fn_node = nested_hdr_tree.body[0].body[0]  # type: ignore[attr-defined]
+    lambda_stmt_node = nested_hdr_tree.body[0].body[1]  # type: ignore[attr-defined]
+    assert _node_is_effectively_async(inner_fn_node, enclosing_is_async=True)
+    assert _node_is_effectively_async(lambda_stmt_node, enclosing_is_async=True)
+    assert _unit_ast_has_async_or_yield(
+        nested_hdr_tree, 2, 4, is_subroutine=True
+    ) == (False, True)
+
+

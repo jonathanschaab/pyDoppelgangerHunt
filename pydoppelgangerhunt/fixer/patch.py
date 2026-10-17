@@ -764,11 +764,13 @@ def _build_unit_delegation_call(
     effective_targets = target_inputs if target_inputs is not None else inputs
     effective_outputs = target_outputs if target_outputs is not None else outputs
 
+    is_expr_unit = target_unit.get("kind") in ("comprehension", "complex_expr")
     unit_args_str = _format_call_arguments(
         inputs,
         scope.get("param_details", []),
         receiver_to_omit=unit_receiver_omit,
         target_inputs=effective_targets,
+        positional_target_map=is_expr_unit,
     )
 
     is_whole_method = target_unit.get("kind") in (
@@ -796,7 +798,7 @@ def _build_unit_delegation_call(
             has_yield=bool(scope.get("has_yield")),
         )
 
-    if target_unit.get("kind") in ("comprehension", "complex_expr"):
+    if is_expr_unit:
         call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
         if not _is_subline_unit(target_unit):
             u_end = max(u_start, parse_unit_coord(target_unit, "end", default=u_start))
@@ -851,15 +853,19 @@ def _build_unit_delegation_call(
                         if unit_receiver
                         else ("self", "cls", "this", "klass")
                     )
-                    pruned_eff = _order_inputs_by_rhs_loads(
-                        pruned_eff, rhs_val, receiver_names=rec_names
-                    )
+                    if not any(
+                        x in unref_lhs and x != unit_receiver_omit for x in pruned_eff
+                    ):
+                        pruned_eff = _order_inputs_by_rhs_loads(
+                            pruned_eff, rhs_val, receiver_names=rec_names
+                        )
                     if len(pruned_eff) == len(inputs):
                         pruned_args = _format_call_arguments(
                             inputs,
                             scope.get("param_details", []),
                             receiver_to_omit=unit_receiver_omit,
                             target_inputs=pruned_eff,
+                            positional_target_map=True,
                         )
                         call_expr = f"{unit_call_prefix}{helper_name}({pruned_args})"
             except (SyntaxError, IndexError, ValueError):

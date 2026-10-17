@@ -371,6 +371,8 @@ def _format_call_arguments(
     param_details: List[Dict[str, Any]],
     receiver_to_omit: Optional[str] = None,
     target_inputs: Optional[List[str]] = None,
+    *,
+    positional_target_map: bool = False,
 ) -> str:
     """Formats argument strings for helper call sites, preserving keyword-only, vararg, and kwarg syntax."""
     param_map: Dict[str, str] = {
@@ -378,7 +380,7 @@ def _format_call_arguments(
     }
     sorted_inputs = sorted(inputs, key=lambda v: _rank_param_kind(v, param_map))
     if target_inputs is not None and len(target_inputs) == len(inputs):
-        if set(inputs) == set(target_inputs):
+        if not positional_target_map and set(inputs) == set(target_inputs):
             inp_to_target = {k: k for k in inputs}
         else:
             inp_to_target = dict(zip(inputs, target_inputs))
@@ -801,6 +803,7 @@ def _format_helper_parameters(
     type_merge_strategy: str,
     inputs2: Optional[Sequence[str]] = None,
     receiver_param: Optional[str] = None,
+    positional_target_map: bool = False,
 ) -> List[str]:
     """Formats helper function parameters with type annotations and default values."""
     params: List[str] = []
@@ -808,11 +811,19 @@ def _format_helper_parameters(
 
     # Extract parameter descriptors
     descriptors: List[Dict[str, Any]] = []
+    use_positional_meta2 = bool(
+        inputs2 is not None
+        and len(inputs2) == len(inputs)
+        and (positional_target_map or set(inputs) != set(inputs2))
+    )
     for idx, var in enumerate(inputs):
         m1 = meta1.get(var, {})
-        m2 = meta2.get(var, {})
-        if not m2 and inputs2 and idx < len(inputs2):
-            m2 = meta2.get(inputs2[idx], {})
+        if use_positional_meta2 and inputs2 is not None:
+            m2 = meta2.get(inputs2[idx], {}) or meta2.get(var, {})
+        else:
+            m2 = meta2.get(var, {})
+            if not m2 and inputs2 and idx < len(inputs2):
+                m2 = meta2.get(inputs2[idx], {})
 
         t1 = m1.get("type")
         t2 = m2.get("type")
@@ -1450,6 +1461,7 @@ def synthesize_shared_helper_code(
         type_merge_strategy=type_merge_strategy,
         inputs2=inputs2 if len(inputs2) == len(inputs) else None,
         receiver_param=rec_param,
+        positional_target_map=is_expr_unit,
     )
 
     r1 = scope1.get("return_type")

@@ -19,7 +19,10 @@ from pydoppelgangerhunt.fixer.source import (
     parse_unit_coord,
     split_source_lines,
 )
-from pydoppelgangerhunt.parser import is_decorator_named
+from pydoppelgangerhunt.parser import (
+    is_decorator_named,
+    iter_nested_scope_header_nodes,
+)
 
 __all__ = [
     "find_enclosing_class",
@@ -315,10 +318,21 @@ def _unit_ast_has_async_or_yield(
         node = stack.pop()
         lineno = getattr(node, "lineno", None)
         end_lineno = getattr(node, "end_lineno", lineno)
+        eff_start = (
+            min(
+                [lineno]
+                + [
+                    getattr(d, "lineno", lineno) or lineno
+                    for d in getattr(node, "decorator_list", ())
+                ]
+            )
+            if lineno is not None
+            else None
+        )
         if (
-            lineno is not None
+            eff_start is not None
             and end_lineno is not None
-            and (end_lineno < u_start or lineno > u_end)
+            and (end_lineno < u_start or eff_start > u_end)
             and node is not root_node
         ):
             continue
@@ -326,6 +340,7 @@ def _unit_ast_has_async_or_yield(
         if node is not root_node and isinstance(
             node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
         ):
+            stack.extend(iter_nested_scope_header_nodes(node))
             continue
 
         if lineno is not None and u_start <= lineno <= u_end:
