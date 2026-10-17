@@ -1533,10 +1533,15 @@ def _inspect_unit_scope(
                 if earliest_start > s_line or e_line > n_end:
                     continue
                 if isinstance(scope_node, ast.ClassDef):
-                    has_enclosing_cls = True
-                    enclosing_cls_locals.update(
-                        _extract_single_node_local_names(scope_node)
-                    )
+                    if not has_enclosing_cls:
+                        has_enclosing_cls = True
+                        enclosing_cls_locals.update(
+                            _extract_single_node_local_names(scope_node)
+                        )
+                    else:
+                        enclosing_cls_locals.update(
+                            _extract_type_param_names(scope_node)
+                        )
                 elif isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if (
                         not matched_self

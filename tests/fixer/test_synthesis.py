@@ -3557,6 +3557,28 @@ def test_synthesize_shared_helper_code_preserves_pep695_type_params(
     )
     assert "def _shared_alpha1_alpha2[T, U](" in helper_union
 
+    f_dep = tmp_path / "generic_dep.py"
+    f_dep.write_text(
+        "def dep1[T, U = list[T]](x: U) -> U:\n"
+        "    return x\n"
+        "\n"
+        "def dep2[V, W = list[V]](x: W) -> W:\n"
+        "    return x\n"
+        "\n"
+        "def plain(x):\n"
+        "    return x\n",
+        encoding="utf-8",
+    )
+    ud1 = {"file": str(f_dep), "start": 1, "end": 2, "name": "dep1", "kind": "function"}
+    ud2 = {"file": str(f_dep), "start": 4, "end": 5, "name": "dep2", "kind": "function"}
+    up = {"file": str(f_dep), "start": 7, "end": 8, "name": "plain", "kind": "function"}
+    dep_union = synthesize_shared_helper_code(
+        ud1, ud2, type_merge_strategy="union", repo_root=str(tmp_path)
+    )
+    assert "def _shared_dep1_dep2[T, V, U = list[T], W = list[V]](" in dep_union
+    plain_rev = synthesize_shared_helper_code(up, ud1, repo_root=str(tmp_path))
+    assert "def _shared_plain_dep1[T, U = list[T]](" in plain_rev
+
 
 def test_same_class_whole_line_expr_explicit_method_binding(
     tmp_path: Path,
@@ -4122,6 +4144,46 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
             repo_root=str(tmp_path),
         )
         assert "[T: Service]" in mod_self_helper
+
+        outer_shadow_file = tmp_path / "outer_shadow_type_param.py"
+        outer_shadow_file.write_text(
+            "Bound = str\n"
+            "class Outer:\n"
+            "    Bound = int\n"
+            "    class Inner:\n"
+            "        def m1[T: Bound](self, x: T) -> T:\n"
+            "            return x\n"
+            "        def m2[T: Bound](self, x: T) -> T:\n"
+            "            return x\n",
+            encoding="utf-8",
+        )
+        u_inner1 = {
+            "file": str(outer_shadow_file),
+            "start": 5,
+            "end": 6,
+            "name": "m1",
+            "kind": "function",
+            "enclosing_class": "Inner",
+            "enclosing_class_start": 4,
+            "receiver_kind": "instance",
+        }
+        u_inner2 = {
+            "file": str(outer_shadow_file),
+            "start": 7,
+            "end": 8,
+            "name": "m2",
+            "kind": "function",
+            "enclosing_class": "Inner",
+            "enclosing_class_start": 4,
+            "receiver_kind": "instance",
+        }
+        inner_mod_helper = synthesize_shared_helper_code(
+            u_inner1,
+            u_inner2,
+            method_binding="module",
+            repo_root=str(tmp_path),
+        )
+        assert "[T: Bound]" in inner_mod_helper
 
         from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
             _inspect_unit_scope,

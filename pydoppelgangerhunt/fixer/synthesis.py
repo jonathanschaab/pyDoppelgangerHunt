@@ -1689,7 +1689,12 @@ def synthesize_shared_helper_code(
             dec_prefix = ""
     else:
         dec_prefix = ""
-    tp_list = list(scope.get("type_params") or scope1.get("type_params") or [])
+    tp_list = list(
+        scope.get("type_params")
+        or scope1.get("type_params")
+        or scope2.get("type_params")
+        or []
+    )
     if tp_list and not is_sub:
         tp1_idents = {
             tp.split(":", 1)[0].split("=", 1)[0].lstrip("*").strip()
@@ -1699,9 +1704,13 @@ def synthesize_shared_helper_code(
             tp.split(":", 1)[0].split("=", 1)[0].lstrip("*").strip()
             for tp in (scope2.get("type_params") or [])
         }
-        common_tp_idents = tp1_idents & tp2_idents if tp2_idents else tp1_idents
+        common_tp_idents = (
+            (tp1_idents & tp2_idents)
+            if (tp1_idents and tp2_idents)
+            else (tp1_idents | tp2_idents)
+        )
         ref_text = f"{params_str}\n{return_type}\n{indented_body}"
-        tp_list = [
+        kept_tps = [
             tp
             for tp in tp_list
             if (
@@ -1710,6 +1719,21 @@ def synthesize_shared_helper_code(
                 or bool(re.search(rf"\b{re.escape(ident)}\b", ref_text))
             )
         ]
+        while True:
+            kept_tp_text = "\n".join([ref_text, *kept_tps])
+            next_tps = [
+                tp
+                for tp in tp_list
+                if (
+                    (ident := tp.split(":", 1)[0].split("=", 1)[0].lstrip("*").strip())
+                    in common_tp_idents
+                    or bool(re.search(rf"\b{re.escape(ident)}\b", kept_tp_text))
+                )
+            ]
+            if len(next_tps) == len(kept_tps):
+                tp_list = next_tps
+                break
+            kept_tps = next_tps
     type_params_str = f"[{', '.join(tp_list)}]" if (tp_list and not is_sub) else ""
     helper_def = (
         f"{dec_prefix}"
