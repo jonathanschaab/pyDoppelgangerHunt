@@ -3559,10 +3559,10 @@ def test_synthesize_shared_helper_code_preserves_pep695_type_params(
 
     f_dep = tmp_path / "generic_dep.py"
     f_dep.write_text(
-        "def dep1[T, U = list[T]](x: U) -> U:\n"
+        "def dep1[T, U: list[T]](x: U) -> U:\n"
         "    return x\n"
         "\n"
-        "def dep2[V, W = list[V]](x: W) -> W:\n"
+        "def dep2[V, W: list[V]](x: W) -> W:\n"
         "    return x\n"
         "\n"
         "def plain(x):\n"
@@ -3575,9 +3575,26 @@ def test_synthesize_shared_helper_code_preserves_pep695_type_params(
     dep_union = synthesize_shared_helper_code(
         ud1, ud2, type_merge_strategy="union", repo_root=str(tmp_path)
     )
-    assert "def _shared_dep1_dep2[T, V, U = list[T], W = list[V]](" in dep_union
+    assert "def _shared_dep1_dep2[T, U: list[T], V, W: list[V]](" in dep_union
     plain_rev = synthesize_shared_helper_code(up, ud1, repo_root=str(tmp_path))
-    assert "def _shared_plain_dep1[T, U = list[T]](" in plain_rev
+    assert "def _shared_plain_dep1[T, U: list[T]](" in plain_rev
+
+    if sys.version_info >= (3, 13):
+        f_pep696 = tmp_path / "generic_pep696.py"
+        f_pep696.write_text(
+            "def d1[T, U = list[T]](x: U) -> U:\n"
+            "    return x\n"
+            "\n"
+            "def d2[V, W = list[V]](x: W) -> W:\n"
+            "    return x\n",
+            encoding="utf-8",
+        )
+        u696_1 = {"file": str(f_pep696), "start": 1, "end": 2, "name": "d1", "kind": "function"}
+        u696_2 = {"file": str(f_pep696), "start": 4, "end": 5, "name": "d2", "kind": "function"}
+        dep_696 = synthesize_shared_helper_code(
+            u696_1, u696_2, type_merge_strategy="union", repo_root=str(tmp_path)
+        )
+        assert "def _shared_d1_d2[T, V, U = list[T], W = list[V]](" in dep_696
 
 
 def test_same_class_whole_line_expr_explicit_method_binding(
