@@ -128,11 +128,7 @@ class _BaseScopeVisitor(ast.NodeVisitor):
             for idx, gen in enumerate(node.generators):
                 if idx > 0:
                     self.visit(gen.iter)
-                comp_set.update(
-                    n.id
-                    for n in ast.walk(gen.target)
-                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
-                )
+                comp_set.update(_extract_assigned_names(gen.target))
                 self.visit(gen.target)
                 for if_expr in gen.ifs:
                     self.visit(if_expr)

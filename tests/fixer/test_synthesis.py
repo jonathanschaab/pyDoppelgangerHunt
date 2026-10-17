@@ -4543,3 +4543,24 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
             "type_param_closure_capture"
             not in same_line_same_name_scope["control_flow_hazards"]
         )
+
+    nested_comp_target_src = (
+        "res = [k for arr[[k for k in keys][0]] in items]\n"
+        "used = [w + x for x in items]\n"
+        "w = 0\n"
+    )
+    nested_comp_scope = _inspect_scope_fn(
+        {
+            "start": 1,
+            "end": 3,
+            "kind": "compound_block",
+            "is_subroutine": True,
+            "source_text": nested_comp_target_src,
+        }
+    )
+    assert "k" in nested_comp_scope["inputs"]
+    assert "w" in nested_comp_scope["inputs"]
+    nested_comp_vis = _UnitLiveInVisitor(u_start=1, u_end=3)
+    nested_comp_vis.visit(ast.parse(nested_comp_target_src))
+    assert "k" in nested_comp_vis.live_ins
+    assert "w" in nested_comp_vis.live_ins

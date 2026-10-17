@@ -28,6 +28,7 @@ from pydoppelgangerhunt.fixer.binding import (
     find_enclosing_function,
 )
 from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
+from pydoppelgangerhunt.fixer._df_visitors import _extract_assigned_names
 from pydoppelgangerhunt.fixer.dataflow import (
     has_async_generator_delegation_hazard,
     resolve_clone_pair_outputs,
@@ -2004,24 +2005,11 @@ def _extract_helper_symbols(
                     bound.add(alias.asname or alias.name.split(".", 1)[0])
             elif isinstance(stmt, ast.Assign):
                 for t in stmt.targets:
-                    bound.update(
-                        n.id
-                        for n in ast.walk(t)
-                        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
-                    )
+                    bound.update(_extract_assigned_names(t))
             elif isinstance(stmt, (ast.AugAssign, ast.AnnAssign)):
-                target = stmt.target
-                bound.update(
-                    n.id
-                    for n in ast.walk(target)
-                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
-                )
+                bound.update(_extract_assigned_names(stmt.target))
             elif isinstance(stmt, (ast.For, ast.AsyncFor)):
-                bound.update(
-                    n.id
-                    for n in ast.walk(stmt.target)
-                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
-                )
+                bound.update(_extract_assigned_names(stmt.target))
                 bound.update(_collect_direct_bindings(stmt.body))
                 bound.update(_collect_direct_bindings(stmt.orelse))
             elif isinstance(stmt, (ast.While, ast.If)):
@@ -2030,11 +2018,7 @@ def _extract_helper_symbols(
             elif isinstance(stmt, (ast.With, ast.AsyncWith)):
                 for item in stmt.items:
                     if item.optional_vars:
-                        bound.update(
-                            n.id
-                            for n in ast.walk(item.optional_vars)
-                            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
-                        )
+                        bound.update(_extract_assigned_names(item.optional_vars))
                 bound.update(_collect_direct_bindings(stmt.body))
             elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
                 bound.update(_collect_direct_bindings(getattr(stmt, "body", [])))
@@ -2154,13 +2138,12 @@ def _extract_helper_symbols(
             comp_scope: Set[str] = set()
             for gen in generators:
                 self.visit(gen.iter)
-                for t in ast.walk(gen.target):
-                    if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store):
-                        comp_scope.add(t.id)
+                comp_scope.update(_extract_assigned_names(gen.target))
+                scope_stack.append(comp_scope)
+                self.visit(gen.target)
                 for if_clause in gen.ifs:
-                    scope_stack.append(comp_scope)
                     self.visit(if_clause)
-                    scope_stack.pop()
+                scope_stack.pop()
             scope_stack.append(comp_scope)
             for e in elts:
                 self.visit(e)

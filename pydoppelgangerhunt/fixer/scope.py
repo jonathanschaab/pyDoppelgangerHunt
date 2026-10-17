@@ -22,7 +22,10 @@ from typing import (
 from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
 from pydoppelgangerhunt.fixer._df_closures import _extract_single_node_local_names
 from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
-from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor
+from pydoppelgangerhunt.fixer._df_visitors import (
+    _OuterExprVisitor,
+    _extract_assigned_names,
+)
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.fixer.source import (
     _SUBROUTINE_KINDS,
@@ -249,16 +252,17 @@ class _ScopeVisitor(ast.NodeVisitor):
     _extract_arg_names = staticmethod(_extract_arg_names)
 
 
-    def _record_store_name(self, name: str) -> None:
-        if len(self._scope_stack) <= 1 or name in self.nonlocals:
+    def _record_store_name(self, name: str, comp_depth: int = 0) -> None:
+        eff_len = len(self._scope_stack) - comp_depth
+        if eff_len <= 1 or name in self.nonlocals:
             self.deleted_names.discard(name)
         if name in self.nonlocals:
             if name not in BUILTIN_NAMES and name not in self.stores:
                 self.stores.append(name)
         elif name in self.globals:
             pass
-        elif len(self._scope_stack) > 1:
-            self._scope_stack[-1].add(name)
+        elif eff_len > 1:
+            self._scope_stack[-1 - comp_depth].add(name)
         elif name not in BUILTIN_NAMES and name not in self.stores:
             self.stores.append(name)
 
@@ -361,10 +365,12 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._scope_stack.append(set())
             created_outer = True
         self._scope_stack.append(self._extract_arg_names(node.args))
-        self.visit(node.body)
-        self._scope_stack.pop()
-        if created_outer:
+        try:
+            self.visit(node.body)
+        finally:
             self._scope_stack.pop()
+            if created_outer:
+                self._scope_stack.pop()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._process_func(node)
@@ -482,7 +488,7 @@ class _ScopeVisitor(ast.NodeVisitor):
             if name not in self.loads:
                 self.loads.append(name)
             if (
-                len(self._scope_stack) <= 1
+                (len(self._scope_stack) - self._comprehension_depth) <= 1
                 and name not in self.params
                 and name not in self.stores
                 and name not in self.read_before_write
@@ -558,23 +564,9 @@ class _ScopeVisitor(ast.NodeVisitor):
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)
         if isinstance(node.target, ast.Name):
-            target_id = node.target.id
-            if len(self._scope_stack) <= 1 + self._comprehension_depth or target_id in self.nonlocals:
-                self.deleted_names.discard(target_id)
-            if self._comprehension_depth > 0:
-                target_idx = -1 - self._comprehension_depth
-                stack_len = len(self._scope_stack)
-                if stack_len >= abs(target_idx):
-                    self._scope_stack[target_idx].add(target_id)
-                if stack_len <= abs(target_idx):
-                    if (
-                        target_id not in BUILTIN_NAMES
-                        and target_id not in self.globals
-                        and target_id not in self.stores
-                    ):
-                        self.stores.append(target_id)
-            else:
-                self._record_store_name(target_id)
+            self._record_store_name(
+                node.target.id, comp_depth=self._comprehension_depth
+            )
 
     def _visit_comprehension(
         self,
@@ -595,9 +587,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         try:
             for gen in node.generators:
                 self.visit(gen.iter)
-                for n in ast.walk(gen.target):
-                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
-                        inner_vars.add(n.id)
+                inner_vars.update(_extract_assigned_names(gen.target))
                 self.visit(gen.target)
                 for if_expr in gen.ifs:
                     self.visit(if_expr)
