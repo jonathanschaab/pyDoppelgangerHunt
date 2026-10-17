@@ -417,7 +417,7 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
             if body_nodes:
                 d_lines = [ln.rstrip("\r\n") for ln in split_source_lines(dedented)]
                 first_body = body_nodes[0]
-                start_l = first_body.lineno - line_offset
+                start_l = _node_scope_bounds(first_body)[0] - line_offset
                 end_l = (
                     getattr(body_nodes[-1], "end_lineno", len(d_lines) + line_offset)
                     - line_offset

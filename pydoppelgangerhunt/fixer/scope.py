@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import builtins
 import logging
+import re
 import textwrap
 from typing import (
     Any,
@@ -1847,8 +1848,9 @@ def _align_symmetric_var_list(list1: List[str], list2: List[str]) -> List[str]:
 
 def _has_type_param_default(tp_str: str) -> bool:
     """Checks whether a PEP 695/696 type parameter string has a top-level default."""
+    cleaned = re.sub(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"", '""', tp_str)
     depth = 0
-    for ch in tp_str:
+    for ch in cleaned:
         if ch in "([{":
             depth += 1
         elif ch in ")]}":

@@ -4394,6 +4394,10 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
 
     from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
         _dedent_preserving_multiline_strings,
+        _extract_unit_body_lines,
+    )
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        _has_type_param_default,
     )
 
     unclosed_fstr = '    x = f"""line1 {a}\nline2\nline3'
@@ -4404,6 +4408,21 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     assert _dedent_preserving_multiline_strings(unclosed_str) == (
         'x = """line1\nline2\nline3'
     )
+
+    dec_first_lines = [
+        "def outer(x: int) -> int:",
+        '    """Docstring."""',
+        "    @my_dec",
+        "    def inner(y: int) -> int:",
+        "        return y + 1",
+        "    return inner(x)",
+    ]
+    extracted_dec_body = _extract_unit_body_lines(
+        {"kind": "function"}, dec_first_lines
+    )
+    assert extracted_dec_body[0] == "@my_dec"
+    assert _has_type_param_default('T: "MyBound = 1"') is False
+    assert _has_type_param_default('T: "MyBound = 1" = int') is True
 
 
 
