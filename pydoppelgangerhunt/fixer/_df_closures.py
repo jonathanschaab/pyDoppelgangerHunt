@@ -311,7 +311,10 @@ def _collect_scope_closures_uncached(
             self.bound_names = bound_names
 
         def _record_closure_node(
-            self, subnode: Union[ast.Lambda, ast.GeneratorExp]
+            self,
+            subnode: Union[ast.Lambda, ast.GeneratorExp],
+            *,
+            include_header: bool = True,
         ) -> None:
             sub_l = getattr(subnode, "lineno", None)
             sub_c = getattr(subnode, "col_offset", None)
@@ -322,7 +325,9 @@ def _collect_scope_closures_uncached(
                     _ClosurePos(sub_line, sub_col),
                     {
                         r
-                        for r in _extract_nested_scope_free_reads(subnode)
+                        for r in _extract_nested_scope_free_reads(
+                            subnode, include_header=include_header
+                        )
                         if not self._is_in_comp(r) and r not in self.bound_names
                     },
                 )
@@ -338,7 +343,12 @@ def _collect_scope_closures_uncached(
             return
 
         def visit_Lambda(self, node: ast.Lambda) -> None:
-            self._record_closure_node(node)
+            for default in node.args.defaults:
+                self.visit(default)
+            for kw_default in node.args.kw_defaults:
+                if kw_default is not None:
+                    self.visit(kw_default)
+            self._record_closure_node(node, include_header=False)
 
         def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
             if _is_eagerly_consumed_genexp(
@@ -391,7 +401,7 @@ def _collect_scope_closures_uncached(
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 before_len = len(closures)
                 _record_expr_closures(
-                    iter_nested_scope_header_nodes(stmt),
+                    iter_nested_scope_header_nodes(stmt, include_annotations=False),
                     stmt_start,
                     stmt_col,
                     bound_names,

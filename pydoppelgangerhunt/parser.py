@@ -998,13 +998,29 @@ def _record_clause_branch(
     )
 
 
-def iter_nested_scope_header_nodes(node: ast.AST) -> List[ast.AST]:
-    """Returns outer-evaluated header expressions (decorators, defaults, bases, keywords) for a nested scope node."""
+def iter_nested_scope_header_nodes(
+    node: ast.AST, *, include_annotations: bool = True
+) -> List[ast.AST]:
+    """Returns outer-evaluated header expressions (decorators, defaults, annotations, bases, keywords) for a nested scope node."""
     header_nodes: List[ast.AST] = list(getattr(node, "decorator_list", ()))
     node_args = getattr(node, "args", None)
     if isinstance(node_args, ast.arguments):
         header_nodes.extend(node_args.defaults)
         header_nodes.extend(d for d in node_args.kw_defaults if d is not None)
+        if include_annotations:
+            for arg in (
+                list(getattr(node_args, "posonlyargs", ()))
+                + list(node_args.args)
+                + ([node_args.vararg] if node_args.vararg is not None else [])
+                + list(node_args.kwonlyargs)
+                + ([node_args.kwarg] if node_args.kwarg is not None else [])
+            ):
+                if arg.annotation is not None:
+                    header_nodes.append(arg.annotation)
+    if include_annotations:
+        returns = getattr(node, "returns", None)
+        if isinstance(returns, ast.AST):
+            header_nodes.append(returns)
     header_nodes.extend(getattr(node, "bases", ()))
     header_nodes.extend(getattr(node, "keywords", ()))
     return header_nodes

@@ -4592,3 +4592,55 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     )
     assert "x" not in free_syms
     assert "y" not in free_syms
+
+    comp_nonlocal_src = (
+        "nonlocal x, y\n"
+        "y = 1\n"
+        "del y\n"
+        "res = [x + y for x in items for y in items]\n"
+        "fn = [(lambda a: (b := a))(z) for z in items]\n"
+    )
+    comp_nonlocal_scope = _inspect_scope_fn(
+        {
+            "start": 1,
+            "end": 5,
+            "kind": "compound_block",
+            "is_subroutine": True,
+            "source_text": comp_nonlocal_src,
+        }
+    )
+    assert "x" not in comp_nonlocal_scope["outputs"]
+    assert "y" not in comp_nonlocal_scope["outputs"]
+    assert "b" not in comp_nonlocal_scope["outputs"]
+
+    lambda_def_closures = _collect_scope_closures_uncached(
+        ast.parse(
+            "def f(total, cap):\n"
+            "    cb = lambda x=total, y=(lambda: cap): x\n"
+            "    return cb\n"
+        ).body[0]
+    )
+    all_lambda_captured = set().union(*(reads for _, reads in lambda_def_closures))
+    assert "total" not in all_lambda_captured
+    assert "cap" in all_lambda_captured
+
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=import-outside-toplevel
+        _unit_ast_has_async_or_yield,
+    )
+    from pydoppelgangerhunt.parser import (  # pylint: disable=import-outside-toplevel
+        _node_is_effectively_async,
+    )
+
+    ann_async_tree = ast.parse(
+        "async def outer(get_t):\n"
+        "    def inner(x: await get_t()) -> int:\n"
+        "        return 1\n"
+    )
+    outer_async_fn = ann_async_tree.body[0]
+    assert isinstance(outer_async_fn, ast.AsyncFunctionDef)
+    assert _node_is_effectively_async(outer_async_fn.body, False) is True
+    _, has_async_ann = _unit_ast_has_async_or_yield(
+        ann_async_tree, 2, 3, is_subroutine=True
+    )
+    assert has_async_ann is True
+

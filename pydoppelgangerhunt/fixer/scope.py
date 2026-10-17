@@ -253,6 +253,9 @@ class _ScopeVisitor(ast.NodeVisitor):
 
 
     def _record_store_name(self, name: str, comp_depth: int = 0) -> None:
+        if self._comprehension_depth > 0 and comp_depth == 0:
+            self._scope_stack[-1].add(name)
+            return
         eff_len = len(self._scope_stack) - comp_depth
         if eff_len <= 1 or name in self.nonlocals:
             self.deleted_names.discard(name)
@@ -365,9 +368,12 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._scope_stack.append(set())
             created_outer = True
         self._scope_stack.append(self._extract_arg_names(node.args))
+        saved_comp_depth = self._comprehension_depth
+        self._comprehension_depth = 0
         try:
             self.visit(node.body)
         finally:
+            self._comprehension_depth = saved_comp_depth
             self._scope_stack.pop()
             if created_outer:
                 self._scope_stack.pop()
