@@ -24,6 +24,7 @@ from pydoppelgangerhunt.fixer._df_cache import (
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
     _BaseScopeVisitor,
+    _collect_func_args,
     _collect_func_params as _extract_arg_names,
     _extract_nested_scope_free_reads,
     _extract_pattern_bound_name,
@@ -388,12 +389,34 @@ def _collect_scope_closures_uncached(
             stmt_start, stmt_col = _resolve_stmt_start_pos(stmt)
 
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                closures.append(
-                    (
-                        _ClosurePos(stmt_start, stmt_col),
-                        _extract_nested_scope_free_reads(stmt) - bound_names,
-                    )
+                before_len = len(closures)
+                _record_expr_closures(
+                    iter_nested_scope_header_nodes(stmt),
+                    stmt_start,
+                    stmt_col,
+                    bound_names,
                 )
+                inner_bound = bound_names | _extract_node_type_param_names(stmt)
+                fn_scoped_exprs = (
+                    [
+                        arg.annotation
+                        for arg in _collect_func_args(stmt.args)
+                        if arg.annotation is not None
+                    ]
+                    + ([stmt.returns] if stmt.returns is not None else [])
+                    + list(getattr(stmt, "type_params", []))
+                )
+                _record_expr_closures(
+                    fn_scoped_exprs, stmt_start, stmt_col, inner_bound
+                )
+                body_reads = (
+                    _extract_nested_scope_free_reads(stmt, include_header=False)
+                    - bound_names
+                )
+                if body_reads or len(closures) == before_len:
+                    closures.append(
+                        (_ClosurePos(stmt_start, stmt_col), body_reads)
+                    )
                 continue
 
             if isinstance(stmt, ast.ClassDef):

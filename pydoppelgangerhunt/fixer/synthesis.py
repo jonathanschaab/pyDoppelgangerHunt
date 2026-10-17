@@ -156,16 +156,14 @@ def _is_valid_expr_unit_lines(unit: Dict[str, Any], lines: Sequence[str]) -> boo
     if _is_subline_unit(unit):
         return True
     parsed = _parse_dedented_stmts("\n".join(lines))
-    if len(parsed) > 1:
+    if len(parsed) != 1:
         return False
-    if len(parsed) == 1:
-        stmt = parsed[0]
-        if isinstance(stmt, (ast.Assign, ast.AugAssign, ast.Expr)):
-            return True
-        if isinstance(stmt, (ast.AnnAssign, ast.Return)) and stmt.value is not None:
-            return True
-        return False
-    return True
+    stmt = parsed[0]
+    if isinstance(stmt, (ast.Assign, ast.AugAssign, ast.Expr)):
+        return True
+    if isinstance(stmt, (ast.AnnAssign, ast.Return)) and stmt.value is not None:
+        return True
+    return False
 
 
 def _indent_code_lines(lines: Sequence[str], prefix: str) -> List[str]:
@@ -312,19 +310,24 @@ def _prune_unreferenced_lhs_scope(
     }
     if not unref_loads and not lhs_attrs:
         return set()
-    rhs_attrs = {
-        unfolded
+    rhs_attr_pairs = [
+        (unfolded, isinstance(child.ctx, (ast.Store, ast.Del)))
         for child in ast.walk(rhs_node)
         if isinstance(child, ast.Attribute)
         for unfolded in (
             _unfold_receiver_attribute(child, receiver_names=all_receivers),
         )
         if unfolded is not None
+    ]
+    rhs_attrs = {unfolded for unfolded, _ in rhs_attr_pairs}
+    rhs_written_attrs = {
+        unfolded for unfolded, is_write in rhs_attr_pairs if is_write
     }
     unref_attrs = lhs_attrs - rhs_attrs
-    if "attrs_written" in scope_dict and lhs_attrs:
+    lhs_only_written = lhs_attrs - rhs_written_attrs
+    if "attrs_written" in scope_dict and lhs_only_written:
         scope_dict["attrs_written"] = [
-            a for a in scope_dict["attrs_written"] if a not in lhs_attrs
+            a for a in scope_dict["attrs_written"] if a not in lhs_only_written
         ]
     for attr_key in (
         "attrs_read",

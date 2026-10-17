@@ -494,6 +494,8 @@ def _extract_nested_scope_free_reads_with_nodes(
         ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.GeneratorExp
     ],
     candidates: Optional[Set[str]] = None,
+    *,
+    include_header: bool = True,
 ) -> Tuple[Set[str], List[ast.Name]]:
     """Extracts free variable references and their AST load nodes escaping a nested scope."""
     if isinstance(node, ast.GeneratorExp):
@@ -578,16 +580,23 @@ def _extract_nested_scope_free_reads_with_nodes(
     )
     escaped = (body_escaped | func_visitor.nonlocals) - func_visitor.globals
     all_free = (
-        unscoped_visitor.names
-        | (outer_visitor.names - type_param_names)
-        | escaped
+        (
+            unscoped_visitor.names
+            | (outer_visitor.names - type_param_names)
+            | escaped
+        )
+        if include_header
+        else escaped
     )
     res_func = all_free & candidates if candidates is not None else all_free
     func_nodes = (
-        unscoped_visitor.load_nodes
-        + [n for n in outer_visitor.load_nodes if n.id not in type_param_names]
-        + [n for n in func_visitor.load_nodes if n.id in body_escaped]
-    )
+        (
+            unscoped_visitor.load_nodes
+            + [n for n in outer_visitor.load_nodes if n.id not in type_param_names]
+        )
+        if include_header
+        else []
+    ) + [n for n in func_visitor.load_nodes if n.id in body_escaped]
     return res_func, [n for n in func_nodes if n.id in res_func]
 
 
@@ -596,9 +605,13 @@ def _extract_nested_scope_free_reads(
         ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.GeneratorExp
     ],
     candidates: Optional[Set[str]] = None,
+    *,
+    include_header: bool = True,
 ) -> Set[str]:
     """Extracts free variable references escaping a nested function, genexp, or class body."""
-    return _extract_nested_scope_free_reads_with_nodes(node, candidates=candidates)[0]
+    return _extract_nested_scope_free_reads_with_nodes(
+        node, candidates=candidates, include_header=include_header
+    )[0]
 
 
 def _extract_assigned_names(target: ast.AST) -> List[str]:

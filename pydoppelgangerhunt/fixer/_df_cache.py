@@ -306,7 +306,7 @@ def _resolve_unit_ast_end_col(
             u_end,
         )
         return None
-    if any(
+    if (u_start < u_end or start_col is None) and any(
         s is not target_stmt
         and getattr(s, "lineno", 0) == u_end
         and getattr(s, "col_offset", 0) >= int(end_col)

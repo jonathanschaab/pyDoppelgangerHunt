@@ -4424,5 +4424,57 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     assert _has_type_param_default('T: "MyBound = 1"') is False
     assert _has_type_param_default('T: "MyBound = 1" = int') is True
 
+    from pydoppelgangerhunt.fixer._df_closures import (  # pylint: disable=import-outside-toplevel
+        _collect_scope_closures_uncached,
+    )
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=import-outside-toplevel
+        _resolve_unit_ast_end_col,
+    )
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        _is_valid_expr_unit_lines,
+        _prune_unreferenced_lhs_scope,
+    )
 
+    eager_fn_tree = ast.parse(
+        "def outer(total, cap_dec, cap_def, body_var):\n"
+        "    def eager_helper(default_val=total):\n"
+        "        return default_val\n"
+        "    @dec(lambda: cap_dec)\n"
+        "    def closure_helper(cb=lambda: cap_def):\n"
+        "        return body_var\n"
+    )
+    outer_fn = eager_fn_tree.body[0]
+    assert isinstance(outer_fn, ast.FunctionDef)
+    fn_closures = _collect_scope_closures_uncached(outer_fn)
+    all_captured = set().union(*(reads for _, reads in fn_closures))
+    assert "total" not in all_captured
+    assert {"cap_dec", "cap_def", "body_var"} <= all_captured
 
+    assert _is_valid_expr_unit_lines({"kind": "complex_expr"}, []) is False
+    assert (
+        _is_valid_expr_unit_lines({"kind": "complex_expr"}, ["   # only comment"])
+        is False
+    )
+
+    comp_attr_unit = {"kind": "comprehension", "start": 1, "end": 1}
+    comp_attr_scope = {
+        "inputs": ["self", "items"],
+        "outputs": [],
+        "attrs_read": ["self.tmp"],
+        "attrs_written": ["self.tmp"],
+        "instance_attrs": ["self.tmp"],
+    }
+    _prune_unreferenced_lhs_scope(
+        comp_attr_unit,
+        comp_attr_scope,
+        ["self.tmp = [self.tmp for self.tmp in items]"],
+    )
+    assert "self.tmp" in comp_attr_scope["attrs_written"]
+
+    multi_trail_tree = ast.parse("x = 1; y = (\n    2\n)\n")
+    assert (
+        _resolve_unit_ast_end_col(
+            multi_trail_tree, {"start": 1, "end": 1, "start_col": 0}
+        )
+        == 5
+    )
