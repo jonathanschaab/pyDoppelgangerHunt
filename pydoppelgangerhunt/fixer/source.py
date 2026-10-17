@@ -1398,17 +1398,26 @@ def _get_tree_scope_intervals(
     tree: ast.AST,
 ) -> List[Tuple[int, int, int, ast.AST]]:
     """Builds and caches sorted intervals (earliest_start, n_end, span, node) on the tree."""
+    scope_nodes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    ]
     cached = getattr(tree, "_scope_intervals", None)
-    if isinstance(cached, list) and all(
-        _node_scope_bounds(node) == (earliest_start, n_end)
-        for earliest_start, n_end, _, node in cached
+    if (
+        isinstance(cached, list)
+        and len(cached) == len(scope_nodes)
+        and {id(item[3]) for item in cached} == {id(node) for node in scope_nodes}
+        and all(
+            _node_scope_bounds(node) == (earliest_start, n_end)
+            for earliest_start, n_end, _, node in cached
+        )
     ):
         return cached
     intervals: List[Tuple[int, int, int, ast.AST]] = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            earliest_start, n_end = _node_scope_bounds(node)
-            intervals.append((earliest_start, n_end, n_end - earliest_start, node))
+    for node in scope_nodes:
+        earliest_start, n_end = _node_scope_bounds(node)
+        intervals.append((earliest_start, n_end, n_end - earliest_start, node))
     intervals.sort(
         key=lambda item: (item[2], -item[0], -getattr(item[3], "col_offset", 0))
     )

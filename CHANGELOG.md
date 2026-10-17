@@ -429,11 +429,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Nested Generic Closure & Class-Scoped `type_params` Capture Guard, Nested Function Annotation Scoping, Multi-Line Async Comprehension Clauses, In-Place AST `_scope_intervals` Validation & CRLF Helper Compilation Check**:
   Detected PEP 695 `type_params` bounds/defaults referencing enclosing function local bindings or class-scoped bindings hoisted outside the class
   (`type_param_closure_capture` / `has_class_scoped_type_params`, skipping only the unit's own innermost `FunctionDef` in `_get_tree_scope_intervals` and preserving harvested `kind="function"` same-class methods)
-  in `_inspect_unit_scope` (`scope.py`) and excluded `ast.ClassDef.name` from `_extract_single_node_local_names` (`_df_closures.py`) so `synthesize_shared_helper_code` (`synthesis.py`) and `generate_refactoring_patch` (`patch.py`)
+  in `_inspect_unit_scope` (`scope.py`), excluded `ast.ClassDef.name` from `_extract_single_node_local_names` (`_df_closures.py`), and pruned unreferenced non-common alpha-renamed `type_params` in `synthesize_shared_helper_code` (`synthesis.py`) so `synthesize_shared_helper_code` and `generate_refactoring_patch` (`patch.py`)
   fail closed when hoisting local/class bounds to module scope while allowing same-class method helpers and top-level self-referential class bounds; visited nested function parameter and return annotations inside
   `_ScopeVisitor._process_func` (`scope.py`) when `is_top` is `False`; checked `node.target` bounds for `ast.comprehension` clauses in
-  `_unit_ast_has_async_or_yield` (`binding.py`); validated cached node bounds via `_node_scope_bounds` in `_get_tree_scope_intervals` (`source.py`)
-  against in-place `lineno`/`end_lineno` AST mutations; and attempted direct and compound-wrapped compilation prior to triple-newline header/body splitting with CR/LF stripping (`body.lstrip("\r\n")`) in `_validate_helper_compilation` (`patch.py`).
+  `_unit_ast_has_async_or_yield` (`binding.py`); validated cached scope node set identity and node bounds via `_node_scope_bounds` in `_get_tree_scope_intervals` (`source.py`)
+  against in-place `lineno`/`end_lineno` and structural AST mutations; and attempted direct and compound-wrapped compilation prior to triple-newline header/body splitting with CR/LF stripping (`body.lstrip("\r\n")`) in `_validate_helper_compilation` (`patch.py`).
 
 ## [1.0.0] - 2026-09-20
 ### Added

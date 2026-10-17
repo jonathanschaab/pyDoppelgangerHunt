@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 import hashlib
 import sys
-import textwrap
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
@@ -3537,6 +3536,27 @@ def test_synthesize_shared_helper_code_preserves_pep695_type_params(
     assert "def _shared_first_second[T](" in helper
     assert "return cast_fn(T, head)" in helper
 
+    f_alpha = tmp_path / "generic_alpha.py"
+    f_alpha.write_text(
+        "def alpha1[T](items: list[T], cast_fn) -> T:\n"
+        "    head = items[0]\n"
+        "    return cast_fn(T, head)\n"
+        "\n"
+        "def alpha2[U](items: list[U], cast_fn) -> U:\n"
+        "    head = items[0]\n"
+        "    return cast_fn(U, head)\n",
+        encoding="utf-8",
+    )
+    ua1 = {"file": str(f_alpha), "start": 1, "end": 3, "name": "alpha1", "kind": "function"}
+    ua2 = {"file": str(f_alpha), "start": 5, "end": 7, "name": "alpha2", "kind": "function"}
+    helper_any = synthesize_shared_helper_code(ua1, ua2, repo_root=str(tmp_path))
+    assert "def _shared_alpha1_alpha2[T](" in helper_any
+    assert "[T, U]" not in helper_any
+    helper_union = synthesize_shared_helper_code(
+        ua1, ua2, type_merge_strategy="union", repo_root=str(tmp_path)
+    )
+    assert "def _shared_alpha1_alpha2[T, U](" in helper_union
+
 
 def test_same_class_whole_line_expr_explicit_method_binding(
     tmp_path: Path,
@@ -3883,6 +3903,9 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     mut_tree.body[0].end_lineno = 8  # type: ignore[attr-defined]
     intervals_updated = _get_tree_scope_intervals(mut_tree)
     assert intervals_updated[0][:2] == (5, 8)
+    extra_fn = ast.parse("def beta():\n    return 2\n").body[0]
+    mut_tree.body.append(extra_fn)
+    assert len(_get_tree_scope_intervals(mut_tree)) == 2
 
     crlf_helper = (
         "from typing import Any\r\n\r\n\r\n"

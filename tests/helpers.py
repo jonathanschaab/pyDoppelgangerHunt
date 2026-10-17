@@ -1,7 +1,5 @@
 """Shared test assertion and verification helpers."""
 
-from typing import Optional
-
 
 def assert_valid_python(source: str, mode: str = "exec") -> None:
     """Verifies that source is both syntactically and semantically valid Python.
