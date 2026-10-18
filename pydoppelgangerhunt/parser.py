@@ -607,7 +607,10 @@ def _harvest_complex_expressions(
         for child in ast.iter_child_nodes(node):
             _walk_outer(child)
 
-    _walk_outer(root)
+    try:
+        _walk_outer(root)
+    except (RecursionError, MemoryError):
+        pass
     return results
 
 
@@ -885,38 +888,44 @@ def _record_unit(
         effective_min_tokens = min_tokens
 
     if lines >= effective_min_lines:
-        tokens = get_ast_tokens(
-            ast_target,
-            blind_indexing=blind_indexing,
-            strip_annotations=strip_annotations,
-            blind_literals=blind_literals,
-            filter_boilerplate=filter_boilerplate,
-            consistent_renaming=consistent_renaming,
-            abstract_expressions=abstract_expressions,
-            strip_docstrings=strip_docstrings,
-        )
-        token_count = len(tokens)
+        try:
+            tokens = get_ast_tokens(
+                ast_target,
+                blind_indexing=blind_indexing,
+                strip_annotations=strip_annotations,
+                blind_literals=blind_literals,
+                filter_boilerplate=filter_boilerplate,
+                consistent_renaming=consistent_renaming,
+                abstract_expressions=abstract_expressions,
+                strip_docstrings=strip_docstrings,
+            )
+            token_count = len(tokens)
+            if token_count >= effective_min_tokens:
+                shingles, _ = get_ast_shingles(
+                    ast_target,
+                    blind_indexing=blind_indexing,
+                    strip_annotations=strip_annotations,
+                    blind_literals=blind_literals,
+                    filter_boilerplate=filter_boilerplate,
+                    consistent_renaming=consistent_renaming,
+                    abstract_expressions=abstract_expressions,
+                    strip_docstrings=strip_docstrings,
+                )
+                char_vector = get_ast_characteristic_vector(
+                    ast_target,
+                    blind_indexing=blind_indexing,
+                    strip_annotations=strip_annotations,
+                    blind_literals=blind_literals,
+                    filter_boilerplate=filter_boilerplate,
+                    consistent_renaming=consistent_renaming,
+                    abstract_expressions=abstract_expressions,
+                    strip_docstrings=strip_docstrings,
+                )
+                calls = extract_call_sequence(ast_target)
+                complexity = compute_cyclomatic_complexity(ast_target)
+        except (RecursionError, MemoryError):
+            return
         if token_count >= effective_min_tokens:
-            shingles, _ = get_ast_shingles(
-                ast_target,
-                blind_indexing=blind_indexing,
-                strip_annotations=strip_annotations,
-                blind_literals=blind_literals,
-                filter_boilerplate=filter_boilerplate,
-                consistent_renaming=consistent_renaming,
-                abstract_expressions=abstract_expressions,
-                strip_docstrings=strip_docstrings,
-            )
-            char_vector = get_ast_characteristic_vector(
-                ast_target,
-                blind_indexing=blind_indexing,
-                strip_annotations=strip_annotations,
-                blind_literals=blind_literals,
-                filter_boilerplate=filter_boilerplate,
-                consistent_renaming=consistent_renaming,
-                abstract_expressions=abstract_expressions,
-                strip_docstrings=strip_docstrings,
-            )
             # 16 hex chars = 64 bits of entropy (2^64 keyspace). Collision probability for N=100k
             # units is P ≈ N^2 / (2 * 2^64) ≈ 2.7e-10 (< 1 in 3.7B), rendering collisions negligible.
             structural_hash = hashlib.sha256(" ".join(tokens).encode("utf-8")).hexdigest()[:16]
@@ -933,8 +942,8 @@ def _record_unit(
                 "token_count": token_count,
                 "vector": char_vector,
                 "kind": kind,
-                "calls": extract_call_sequence(ast_target),
-                "complexity": compute_cyclomatic_complexity(ast_target),
+                "calls": calls,
+                "complexity": complexity,
                 "structural_hash": structural_hash,
                 "enclosing_class": enclosing_class,
                 "enclosing_class_start": enclosing_class_start,
@@ -1146,19 +1155,19 @@ def harvest_notebook_units(
         cell_label = f"{rel_file}#cell_{idx + 1}"
         try:
             tree = ast.parse(cell_code, filename=cell_label)
-        except SyntaxError:
+            if idioms:
+                tree = _IdiomCanonicalizer().visit(tree)
+                ast.fix_missing_locations(tree)
+            if commutative:
+                tree = _CommutativeCanonicalizer().visit(tree)
+                ast.fix_missing_locations(tree)
+        except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
             continue
 
         file_lines = [
             ln.rstrip("\r\n")
             for ln in split_source_lines(cell_code)
         ]
-        if idioms:
-            tree = _IdiomCanonicalizer().visit(tree)
-            ast.fix_missing_locations(tree)
-        if commutative:
-            tree = _CommutativeCanonicalizer().visit(tree)
-            ast.fix_missing_locations(tree)
 
         _record_node_unit(
             units,
@@ -1268,15 +1277,14 @@ def harvest_file_units(
             for ln in split_source_lines(source)
         ]
         tree = ast.parse(source, filename=str(p))
-    except (SyntaxError, UnicodeDecodeError, OSError):
+        if idioms:
+            tree = _IdiomCanonicalizer().visit(tree)
+            ast.fix_missing_locations(tree)
+        if commutative:
+            tree = _CommutativeCanonicalizer().visit(tree)
+            ast.fix_missing_locations(tree)
+    except (SyntaxError, ValueError, UnicodeDecodeError, OSError, RecursionError, MemoryError):
         return units
-
-    if idioms:
-        tree = _IdiomCanonicalizer().visit(tree)
-        ast.fix_missing_locations(tree)
-    if commutative:
-        tree = _CommutativeCanonicalizer().visit(tree)
-        ast.fix_missing_locations(tree)
 
     try:
         rel_file = str(p.resolve().relative_to(Path(repo_root).resolve())).replace("\\", "/")
@@ -1288,14 +1296,17 @@ def harvest_file_units(
     enclosing_class_starts: Dict[int, int] = {}
     func_owners: Dict[int, str] = {}
     func_is_async: Dict[int, bool] = {}
-    _ScopeHierarchyVisitor(
-        closure_parents,
-        enclosing_classes,
-        enclosing_class_starts,
-        func_owners=func_owners,
-        harvest_closures=harvest_closures,
-        func_is_async=func_is_async,
-    ).visit(tree)
+    try:
+        _ScopeHierarchyVisitor(
+            closure_parents,
+            enclosing_classes,
+            enclosing_class_starts,
+            func_owners=func_owners,
+            harvest_closures=harvest_closures,
+            func_is_async=func_is_async,
+        ).visit(tree)
+    except (RecursionError, MemoryError):
+        return units
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1534,7 +1545,10 @@ def harvest_file_units(
 
     if data_tables:  # pydoppelgangerhunt: ignore
         dt_visitor = _DataTableVisitor()
-        dt_visitor.visit(tree)
+        try:
+            dt_visitor.visit(tree)
+        except (RecursionError, MemoryError):
+            dt_visitor.tables.clear()
         for tbl_name, tbl_node, tbl_start, tbl_end in dt_visitor.tables:
             _record_unit(
                 units,

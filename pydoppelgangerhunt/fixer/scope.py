@@ -1412,6 +1412,7 @@ def _inspect_unit_scope(
         ),
     ]
 
+    had_resource_error = False
     for cand_text, offset in parse_candidates:
         try:
             tree = ast.parse(cand_text)
@@ -1449,398 +1450,415 @@ def _inspect_unit_scope(
                 if isinstance(wrapper_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     candidate_stmts = wrapper_fn.body
             break
+        except (RecursionError, MemoryError):
+            had_resource_error = True
+            break
         except (SyntaxError, ValueError, UnicodeDecodeError):
             continue
 
     if tree is None:
+        if had_resource_error:
+            return {
+                **empty_res,
+                "control_flow_hazards": ["pathological_ast"],
+                "is_control_flow_safe": False,
+            }
         return empty_res
 
-    if "is_subroutine" in unit and unit.get("is_subroutine") is not None:
-        is_subroutine = bool(unit["is_subroutine"])
-    elif str(unit.get("kind") or "") in _SUBROUTINE_KINDS:
-        is_subroutine = True
-    elif str(unit.get("kind") or "") in _WHOLE_UNIT_KINDS:
-        is_subroutine = False
-    else:
-        is_subroutine = is_subroutine_unit(
-            unit, source_text=_get_full_source(), tree=file_tree
-        )
-
-    rec_param = unit.get("receiver_param")
-    rec_kind = unit.get("receiver_kind")
-    is_class_rec = rec_kind == "class"
-
-    inst_receivers: Set[str] = {"self", "this"}
-    class_receivers: Set[str] = {"cls", "klass"}
-    if rec_param:
-        if is_class_rec:
-            class_receivers.add(rec_param)
+    try:
+        if "is_subroutine" in unit and unit.get("is_subroutine") is not None:
+            is_subroutine = bool(unit["is_subroutine"])
+        elif str(unit.get("kind") or "") in _SUBROUTINE_KINDS:
+            is_subroutine = True
+        elif str(unit.get("kind") or "") in _WHOLE_UNIT_KINDS:
+            is_subroutine = False
         else:
-            inst_receivers.add(rec_param)
-
-    all_receivers = inst_receivers | class_receivers
-
-    cand_lines = split_source_lines(cand_text)
-    visitor = _ScopeVisitor(
-        loop_offset=loop_offset,
-        source_lines=cand_lines,
-        is_subroutine=is_subroutine,
-        receiver_names=tuple(all_receivers),
-    )
-    visitor.visit(tree)
-
-    hazards: List[str] = []
-    if visitor.naked_breaks > 0:
-        hazards.append("naked_break")
-    if visitor.naked_continues > 0:
-        hazards.append("naked_continue")
-    if visitor.has_yield:
-        hazards.append("generator_yield")
-    if is_subroutine and visitor.has_return:
-        hazards.append("embedded_return")
-
-    has_class_scoped_type_params = False
-    if visitor.type_param_free_vars and not is_subroutine:
-        s_line = parse_unit_coord(unit, "start", default=1)
-        e_line = parse_unit_coord(unit, "end", default=s_line)
-        u_col = parse_unit_coord(unit, "start_col", default=None)
-        if u_col is None:
-            u_col = parse_unit_coord(unit, "col_offset", default=None)
-        top_fn = (
-            tree.body[0]
-            if isinstance(tree, ast.Module)
-            and len(tree.body) == 1
-            and isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))
-            else None
-        )
-        top_fn_name = getattr(top_fn, "name", None) if top_fn is not None else None
-        top_fn_count = (
-            sum(
-                1
-                for n in ast.walk(top_fn)
-                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            is_subroutine = is_subroutine_unit(
+                unit, source_text=_get_full_source(), tree=file_tree
             )
-            if top_fn is not None
-            else None
+
+        rec_param = unit.get("receiver_param")
+        rec_kind = unit.get("receiver_kind")
+        is_class_rec = rec_kind == "class"
+
+        inst_receivers: Set[str] = {"self", "this"}
+        class_receivers: Set[str] = {"cls", "klass"}
+        if rec_param:
+            if is_class_rec:
+                class_receivers.add(rec_param)
+            else:
+                inst_receivers.add(rec_param)
+
+        all_receivers = inst_receivers | class_receivers
+
+        cand_lines = split_source_lines(cand_text)
+        visitor = _ScopeVisitor(
+            loop_offset=loop_offset,
+            source_lines=cand_lines,
+            is_subroutine=is_subroutine,
+            receiver_names=tuple(all_receivers),
         )
-        parsed_tree = file_tree
-        if parsed_tree is None:
-            full_src = _get_full_source()
-            if full_src:
-                parsed_tree = _get_or_parse_tree(full_src)
-        enclosing_fn_locals: Set[str] = set()
-        enclosing_cls_locals: Set[str] = set()
-        has_enclosing_fn = False
-        has_enclosing_cls = False
-        prev_enclosed_cls_name: Optional[str] = None
-        if parsed_tree is not None:
-            matched_self = False
-            for earliest_start, n_end, _span, scope_node in _get_tree_scope_intervals(
-                parsed_tree
-            ):
-                if earliest_start > s_line or e_line > n_end:
-                    continue
-                if isinstance(scope_node, ast.ClassDef):
-                    if not has_enclosing_cls:
-                        has_enclosing_cls = True
-                        prev_enclosed_cls_name = getattr(scope_node, "name", None)
-                        enclosing_cls_locals.update(
-                            _extract_single_node_local_names(scope_node)
-                        )
-                    else:
-                        if isinstance(prev_enclosed_cls_name, str):
-                            enclosing_cls_locals.add(prev_enclosed_cls_name)
-                        prev_enclosed_cls_name = getattr(scope_node, "name", None)
-                        enclosing_cls_locals.update(
-                            _extract_type_param_names(scope_node)
-                        )
-                elif isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    if (
-                        not matched_self
-                        and s_line
-                        in (
-                            earliest_start,
-                            getattr(scope_node, "lineno", earliest_start),
-                        )
-                        and (
-                            e_line == n_end
-                            or top_fn_name is not None
-                            or u_col is not None
-                        )
-                        and (
-                            u_col is None
-                            or getattr(scope_node, "col_offset", 0) == u_col
-                        )
-                        and (
-                            top_fn_name is None
-                            or getattr(scope_node, "name", None) == top_fn_name
-                        )
-                        and (
-                            top_fn_count is None
-                            or sum(
-                                1
-                                for n in ast.walk(scope_node)
-                                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                            )
-                            == top_fn_count
-                        )
-                    ):
-                        matched_self = True
-                        continue
-                    if (
-                        earliest_start < s_line
-                        or n_end > e_line
-                        or (u_col is None and matched_self)
-                        or (
-                            u_col is not None
-                            and getattr(scope_node, "col_offset", 0) < u_col
-                        )
-                    ):
-                        has_enclosing_fn = True
-                        enclosing_fn_locals.update(
-                            _extract_single_node_local_names(scope_node)
-                        )
-        if has_enclosing_fn and any(
-            fv in enclosing_fn_locals for fv in visitor.type_param_free_vars
-        ):
-            hazards.append("type_param_closure_capture")
-        elif (
-            not has_enclosing_fn
-            and not has_enclosing_cls
-            and unit.get("kind") == "closure"
-        ):
-            hazards.append("type_param_closure_capture")
-        if has_enclosing_cls and any(
-            fv in enclosing_cls_locals for fv in visitor.type_param_free_vars
-        ):
-            has_class_scoped_type_params = True
-            if (
-                has_enclosing_fn
-                or unit.get("kind") == "closure"
-            ) and "type_param_closure_capture" not in hazards:
-                hazards.append("type_param_closure_capture")
+        visitor.visit(tree)
 
-    is_control_flow_safe = not any(
-        h
-        in (
-            "naked_break",
-            "naked_continue",
-            "embedded_return",
-            "type_param_closure_capture",
-        )
-        for h in hazards
-    )
+        hazards: List[str] = []
+        if visitor.naked_breaks > 0:
+            hazards.append("naked_break")
+        if visitor.naked_continues > 0:
+            hazards.append("naked_continue")
+        if visitor.has_yield:
+            hazards.append("generator_yield")
+        if is_subroutine and visitor.has_return:
+            hazards.append("embedded_return")
 
-    free_vars = [
-        name for name in visitor.loads
-        if name not in visitor.params
-        and (name not in visitor.stores or name in visitor.read_before_write)
-        and name not in visitor.globals
-        and name not in BUILTIN_NAMES
-    ]
-
-    inputs: List[str] = list(visitor.params)
-    for fv in free_vars:
-        if fv not in inputs:
-            inputs.append(fv)
-    for nl in visitor.nonlocals:
-        if nl not in inputs:
-            inputs.append(nl)
-
-    param_map = {p["name"].lstrip("*"): p.get("kind", "pos") for p in visitor.param_details}
-    inputs.sort(key=lambda v: _rank_param_kind(v, param_map, receiver_names=tuple(all_receivers)))
-
-    has_instance_binding = any(
-        r in visitor.loads
-        or r in visitor.params
-        or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
-        for r in inst_receivers
-        if r in ("self", "this")
-        or (rec_param and r == rec_param and rec_kind == "instance")
-        or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
-    )
-    has_class_binding = any(
-        r in visitor.loads
-        or r in visitor.params
-        or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
-        for r in class_receivers
-        if r in ("cls", "klass")
-        or (rec_param and r == rec_param and is_class_rec)
-        or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
-    )
-    binding_kind = _determine_binding_kind(has_instance_binding, has_class_binding)
-
-    primary_rec = rec_param or ("cls" if is_class_rec else None)
-    _normalize_receiver_order(inputs, has_instance_binding, has_class_binding, primary_receiver=primary_rec)
-
-    # Definite and conditional assignment analysis across candidate statements
-    def_assigned, _ = _analyze_block_assignment(candidate_stmts)
-
-    # Unit outputs: explicit returns if present; for subroutines without explicit
-    # returns, all local variable stores act as unit outputs to preserve caller mutations.
-    pre_outs = resolve_unit_declared_outputs(unit)
-
-    outputs_ambiguous = False
-    alias_cands = visitor.type_aliases & (set(visitor.stores) | set(visitor.nonlocals))
-    downstream_aliases: Set[str] = set()
-    if is_subroutine and alias_cands:
-        full_src = _get_full_source()
-        if full_src:
-            ds_reads = collect_downstream_read_names(
-                full_src,
-                unit,
-                candidates=alias_cands,
-                tree=file_tree,
-                unit_inputs=set(inputs),
-            )
-            downstream_aliases = (
-                set(alias_cands) if ds_reads is None else ds_reads
-            )
-        else:
-            downstream_aliases = set(alias_cands)
-    excluded_local_defs = (visitor.type_aliases - downstream_aliases) | set(
-        visitor.imported_names
-    )
-
-    if is_subroutine and isinstance(pre_outs, (list, tuple)):
-        outputs = list(dict.fromkeys(pre_outs))
-    elif is_subroutine and isinstance(pre_outs, (set, frozenset)):
-        if len(pre_outs) > 1:
-            logger.debug(
-                "Rejecting set-valued outputs (%s): unordered set cannot establish "
-                "positional order",
-                pre_outs,
-            )
-            outputs = []
-            outputs_ambiguous = True
-        else:
-            outputs = list(pre_outs)
-    elif visitor.returns:
-        outputs = list(visitor.returns)
-    elif is_subroutine:
-        seen: Set[str] = set()
-        outputs = []
-        for v in visitor.stores:
-            if (
-                v not in visitor.globals
-                and v not in BUILTIN_NAMES
-                and v not in visitor.except_vars
-                and v not in visitor.deleted_names
-                and v not in excluded_local_defs
-                and v not in seen
-            ):
-                seen.add(v)
-                outputs.append(v)
-    else:
-        outputs = []
-
-    for nl in visitor.nonlocals:
-        if (
-            nl in visitor.stores
-            and nl not in outputs
-            and nl not in visitor.except_vars
-            and nl not in visitor.deleted_names
-            and nl not in excluded_local_defs
-        ):
-            outputs.append(nl)
-
-    # Detect conditional variable escapes (outputs assigned conditionally without prior
-    # unconditional assignment in this block, and not provided as input arguments).
-    conditional_outputs = [
-        v for v in outputs
-        if v not in inputs and v not in def_assigned
-    ]
-
-    has_receiver_access = bool(
-        any(
-            r in visitor.loads
-            or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
-            for r in all_receivers
-            if r in ("self", "cls", "this", "klass")
-            or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
-        )
-    )
-
-    is_sub_or_inner = is_subroutine or unit.get("kind") in (
-        "comprehension",
-        "complex_expr",
-        "class",
-        "data_table",
-    )
-    unit_is_async = unit.get("is_async")
-    if unit_is_async is None:
-        if is_sub_or_inner and not visitor.has_yield:
-            unit_is_async = visitor.is_async
-        else:
+        has_class_scoped_type_params = False
+        if visitor.type_param_free_vars and not is_subroutine:
             s_line = parse_unit_coord(unit, "start", default=1)
             e_line = parse_unit_coord(unit, "end", default=s_line)
+            u_col = parse_unit_coord(unit, "start_col", default=None)
+            if u_col is None:
+                u_col = parse_unit_coord(unit, "col_offset", default=None)
+            top_fn = (
+                tree.body[0]
+                if isinstance(tree, ast.Module)
+                and len(tree.body) == 1
+                and isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))
+                else None
+            )
+            top_fn_name = getattr(top_fn, "name", None) if top_fn is not None else None
+            top_fn_count = (
+                sum(
+                    1
+                    for n in ast.walk(top_fn)
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                )
+                if top_fn is not None
+                else None
+            )
+            parsed_tree = file_tree
+            if parsed_tree is None:
+                full_src = _get_full_source()
+                if full_src:
+                    parsed_tree = _get_or_parse_tree(full_src)
+            enclosing_fn_locals: Set[str] = set()
+            enclosing_cls_locals: Set[str] = set()
+            has_enclosing_fn = False
+            has_enclosing_cls = False
+            prev_enclosed_cls_name: Optional[str] = None
+            if parsed_tree is not None:
+                matched_self = False
+                for earliest_start, n_end, _span, scope_node in _get_tree_scope_intervals(
+                    parsed_tree
+                ):
+                    if earliest_start > s_line or e_line > n_end:
+                        continue
+                    if isinstance(scope_node, ast.ClassDef):
+                        if not has_enclosing_cls:
+                            has_enclosing_cls = True
+                            prev_enclosed_cls_name = getattr(scope_node, "name", None)
+                            enclosing_cls_locals.update(
+                                _extract_single_node_local_names(scope_node)
+                            )
+                        else:
+                            if isinstance(prev_enclosed_cls_name, str):
+                                enclosing_cls_locals.add(prev_enclosed_cls_name)
+                            prev_enclosed_cls_name = getattr(scope_node, "name", None)
+                            enclosing_cls_locals.update(
+                                _extract_type_param_names(scope_node)
+                            )
+                    elif isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if (
+                            not matched_self
+                            and s_line
+                            in (
+                                earliest_start,
+                                getattr(scope_node, "lineno", earliest_start),
+                            )
+                            and (
+                                e_line == n_end
+                                or top_fn_name is not None
+                                or u_col is not None
+                            )
+                            and (
+                                u_col is None
+                                or getattr(scope_node, "col_offset", 0) == u_col
+                            )
+                            and (
+                                top_fn_name is None
+                                or getattr(scope_node, "name", None) == top_fn_name
+                            )
+                            and (
+                                top_fn_count is None
+                                or sum(
+                                    1
+                                    for n in ast.walk(scope_node)
+                                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                )
+                                == top_fn_count
+                            )
+                        ):
+                            matched_self = True
+                            continue
+                        if (
+                            earliest_start < s_line
+                            or n_end > e_line
+                            or (u_col is None and matched_self)
+                            or (
+                                u_col is not None
+                                and getattr(scope_node, "col_offset", 0) < u_col
+                            )
+                        ):
+                            has_enclosing_fn = True
+                            enclosing_fn_locals.update(
+                                _extract_single_node_local_names(scope_node)
+                            )
+            if has_enclosing_fn and any(
+                fv in enclosing_fn_locals for fv in visitor.type_param_free_vars
+            ):
+                hazards.append("type_param_closure_capture")
+            elif (
+                not has_enclosing_fn
+                and not has_enclosing_cls
+                and unit.get("kind") == "closure"
+            ):
+                hazards.append("type_param_closure_capture")
+            if has_enclosing_cls and any(
+                fv in enclosing_cls_locals for fv in visitor.type_param_free_vars
+            ):
+                has_class_scoped_type_params = True
+                if (
+                    has_enclosing_fn
+                    or unit.get("kind") == "closure"
+                ) and "type_param_closure_capture" not in hazards:
+                    hazards.append("type_param_closure_capture")
+
+        is_control_flow_safe = not any(
+            h
+            in (
+                "naked_break",
+                "naked_continue",
+                "embedded_return",
+                "type_param_closure_capture",
+                "pathological_ast",
+            )
+            for h in hazards
+        )
+
+        free_vars = [
+            name for name in visitor.loads
+            if name not in visitor.params
+            and (name not in visitor.stores or name in visitor.read_before_write)
+            and name not in visitor.globals
+            and name not in BUILTIN_NAMES
+        ]
+
+        inputs: List[str] = list(visitor.params)
+        for fv in free_vars:
+            if fv not in inputs:
+                inputs.append(fv)
+        for nl in visitor.nonlocals:
+            if nl not in inputs:
+                inputs.append(nl)
+
+        param_map = {p["name"].lstrip("*"): p.get("kind", "pos") for p in visitor.param_details}
+        inputs.sort(key=lambda v: _rank_param_kind(v, param_map, receiver_names=tuple(all_receivers)))
+
+        has_instance_binding = any(
+            r in visitor.loads
+            or r in visitor.params
+            or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
+            for r in inst_receivers
+            if r in ("self", "this")
+            or (rec_param and r == rec_param and rec_kind == "instance")
+            or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
+        )
+        has_class_binding = any(
+            r in visitor.loads
+            or r in visitor.params
+            or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
+            for r in class_receivers
+            if r in ("cls", "klass")
+            or (rec_param and r == rec_param and is_class_rec)
+            or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
+        )
+        binding_kind = _determine_binding_kind(has_instance_binding, has_class_binding)
+
+        primary_rec = rec_param or ("cls" if is_class_rec else None)
+        _normalize_receiver_order(inputs, has_instance_binding, has_class_binding, primary_receiver=primary_rec)
+
+        # Definite and conditional assignment analysis across candidate statements
+        def_assigned, _ = _analyze_block_assignment(candidate_stmts)
+
+        # Unit outputs: explicit returns if present; for subroutines without explicit
+        # returns, all local variable stores act as unit outputs to preserve caller mutations.
+        pre_outs = resolve_unit_declared_outputs(unit)
+
+        outputs_ambiguous = False
+        alias_cands = visitor.type_aliases & (set(visitor.stores) | set(visitor.nonlocals))
+        downstream_aliases: Set[str] = set()
+        if is_subroutine and alias_cands:
             full_src = _get_full_source()
             if full_src:
-                unit_is_async = find_enclosing_function_is_async(
-                    full_src, s_line, e_line, tree=file_tree
+                ds_reads = collect_downstream_read_names(
+                    full_src,
+                    unit,
+                    candidates=alias_cands,
+                    tree=file_tree,
+                    unit_inputs=set(inputs),
+                )
+                downstream_aliases = (
+                    set(alias_cands) if ds_reads is None else ds_reads
                 )
             else:
-                unit_is_async = None
+                downstream_aliases = set(alias_cands)
+        excluded_local_defs = (visitor.type_aliases - downstream_aliases) | set(
+            visitor.imported_names
+        )
 
-    effective_is_async: Optional[bool]
-    if visitor.is_async or unit.get("kind") in ("async_function", "async_method"):
-        effective_is_async = True
-    elif "is_async" in unit and unit.get("is_async") is not None:
-        effective_is_async = bool(unit.get("is_async"))
-    elif visitor.has_yield:
-        effective_is_async = bool(unit_is_async) if unit_is_async is not None else None
-    elif not is_sub_or_inner and unit.get("kind") not in (
-        "function",
-        "method",
-        "async_function",
-        "async_method",
-    ):
-        effective_is_async = bool(unit_is_async)
-    else:
-        effective_is_async = False
+        if is_subroutine and isinstance(pre_outs, (list, tuple)):
+            outputs = list(dict.fromkeys(pre_outs))
+        elif is_subroutine and isinstance(pre_outs, (set, frozenset)):
+            if len(pre_outs) > 1:
+                logger.debug(
+                    "Rejecting set-valued outputs (%s): unordered set cannot establish "
+                    "positional order",
+                    pre_outs,
+                )
+                outputs = []
+                outputs_ambiguous = True
+            else:
+                outputs = list(pre_outs)
+        elif visitor.returns:
+            outputs = list(visitor.returns)
+        elif is_subroutine:
+            seen: Set[str] = set()
+            outputs = []
+            for v in visitor.stores:
+                if (
+                    v not in visitor.globals
+                    and v not in BUILTIN_NAMES
+                    and v not in visitor.except_vars
+                    and v not in visitor.deleted_names
+                    and v not in excluded_local_defs
+                    and v not in seen
+                ):
+                    seen.add(v)
+                    outputs.append(v)
+        else:
+            outputs = []
 
-    return {
-        "inputs": inputs,
-        "outputs": outputs,
-        "stores": visitor.stores,
-        "free_vars": free_vars,
-        "nonlocals": visitor.nonlocals,
-        "globals": visitor.globals,
-        "attrs_read": visitor.attrs_read,
-        "attrs_written": visitor.attrs_written,
-        "param_details": visitor.param_details,
-        "return_type": visitor.return_type,
-        "control_flow_hazards": hazards,
-        "is_control_flow_safe": is_control_flow_safe,
-        "has_yield": visitor.has_yield,
-        "has_yield_assignment": visitor.has_yield_assignment,
-        "has_try_or_with": visitor.has_try_or_with,
-        "has_return": visitor.has_return,
-        "has_return_value": visitor.has_return_value,
-        "has_super": visitor.has_super,
-        "has_mangled_names": visitor.has_mangled_names,
-        "local_imports": visitor.local_imports,
-        "yield_expr_names": visitor.yield_expr_names,
-        "is_async": effective_is_async,
-        "conditional_outputs": conditional_outputs,
-        "definite_stores": sorted(def_assigned),
-        "has_instance_binding": has_instance_binding,
-        "has_class_binding": has_class_binding,
-        "binding_kind": binding_kind,
-        "has_receiver_access": has_receiver_access,
-        "instance_attrs": [
-            a for a in visitor.attrs_read + visitor.attrs_written
-            if any(a.startswith(f"{r}.") for r in inst_receivers)
-        ],
-        "class_attrs": [
-            a for a in visitor.attrs_read + visitor.attrs_written
-            if any(a.startswith(f"{r}.") for r in class_receivers)
-        ],
-        "outputs_ambiguous": outputs_ambiguous,
-        "type_params": list(visitor.type_params),
-        "type_param_free_vars": list(visitor.type_param_free_vars),
-        "has_class_scoped_type_params": has_class_scoped_type_params,
-    }
+        for nl in visitor.nonlocals:
+            if (
+                nl in visitor.stores
+                and nl not in outputs
+                and nl not in visitor.except_vars
+                and nl not in visitor.deleted_names
+                and nl not in excluded_local_defs
+            ):
+                outputs.append(nl)
+
+        # Detect conditional variable escapes (outputs assigned conditionally without prior
+        # unconditional assignment in this block, and not provided as input arguments).
+        conditional_outputs = [
+            v for v in outputs
+            if v not in inputs and v not in def_assigned
+        ]
+
+        has_receiver_access = bool(
+            any(
+                r in visitor.loads
+                or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
+                for r in all_receivers
+                if r in ("self", "cls", "this", "klass")
+                or any(a.startswith(f"{r}.") for a in visitor.attrs_read + visitor.attrs_written)
+            )
+        )
+
+        is_sub_or_inner = is_subroutine or unit.get("kind") in (
+            "comprehension",
+            "complex_expr",
+            "class",
+            "data_table",
+        )
+        unit_is_async = unit.get("is_async")
+        if unit_is_async is None:
+            if is_sub_or_inner and not visitor.has_yield:
+                unit_is_async = visitor.is_async
+            else:
+                s_line = parse_unit_coord(unit, "start", default=1)
+                e_line = parse_unit_coord(unit, "end", default=s_line)
+                full_src = _get_full_source()
+                if full_src:
+                    unit_is_async = find_enclosing_function_is_async(
+                        full_src, s_line, e_line, tree=file_tree
+                    )
+                else:
+                    unit_is_async = None
+
+        effective_is_async: Optional[bool]
+        if visitor.is_async or unit.get("kind") in ("async_function", "async_method"):
+            effective_is_async = True
+        elif "is_async" in unit and unit.get("is_async") is not None:
+            effective_is_async = bool(unit.get("is_async"))
+        elif visitor.has_yield:
+            effective_is_async = bool(unit_is_async) if unit_is_async is not None else None
+        elif not is_sub_or_inner and unit.get("kind") not in (
+            "function",
+            "method",
+            "async_function",
+            "async_method",
+        ):
+            effective_is_async = bool(unit_is_async)
+        else:
+            effective_is_async = False
+
+        return {
+            "inputs": inputs,
+            "outputs": outputs,
+            "stores": visitor.stores,
+            "free_vars": free_vars,
+            "nonlocals": visitor.nonlocals,
+            "globals": visitor.globals,
+            "attrs_read": visitor.attrs_read,
+            "attrs_written": visitor.attrs_written,
+            "param_details": visitor.param_details,
+            "return_type": visitor.return_type,
+            "control_flow_hazards": hazards,
+            "is_control_flow_safe": is_control_flow_safe,
+            "has_yield": visitor.has_yield,
+            "has_yield_assignment": visitor.has_yield_assignment,
+            "has_try_or_with": visitor.has_try_or_with,
+            "has_return": visitor.has_return,
+            "has_return_value": visitor.has_return_value,
+            "has_super": visitor.has_super,
+            "has_mangled_names": visitor.has_mangled_names,
+            "local_imports": visitor.local_imports,
+            "yield_expr_names": visitor.yield_expr_names,
+            "is_async": effective_is_async,
+            "conditional_outputs": conditional_outputs,
+            "definite_stores": sorted(def_assigned),
+            "has_instance_binding": has_instance_binding,
+            "has_class_binding": has_class_binding,
+            "binding_kind": binding_kind,
+            "has_receiver_access": has_receiver_access,
+            "instance_attrs": [
+                a for a in visitor.attrs_read + visitor.attrs_written
+                if any(a.startswith(f"{r}.") for r in inst_receivers)
+            ],
+            "class_attrs": [
+                a for a in visitor.attrs_read + visitor.attrs_written
+                if any(a.startswith(f"{r}.") for r in class_receivers)
+            ],
+            "outputs_ambiguous": outputs_ambiguous,
+            "type_params": list(visitor.type_params),
+            "type_param_free_vars": list(visitor.type_param_free_vars),
+            "has_class_scoped_type_params": has_class_scoped_type_params,
+        }
+    except (RecursionError, MemoryError):
+        return {
+            **empty_res,
+            "control_flow_hazards": ["pathological_ast"],
+            "is_control_flow_safe": False,
+        }
 
 
 

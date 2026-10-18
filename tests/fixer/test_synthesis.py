@@ -4644,3 +4644,188 @@ def test_lhs_rhs_shared_variable_operand_order_and_qualified_generator_returns(
     )
     assert has_async_ann is True
 
+
+def test_fail_closed_on_recursion_and_memory_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies AST parsing and visitors fail closed on RecursionError and MemoryError."""
+    from pydoppelgangerhunt.fixer._df_hazards import (  # pylint: disable=import-outside-toplevel
+        _enclosing_try_reads_outputs,
+    )
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access,import-outside-toplevel
+        _get_or_parse_tree,
+        clear_dataflow_cache,
+        collect_downstream_read_names,
+        resolve_clone_generator_subroutine_outputs,
+    )
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        generate_refactoring_patch,
+    )
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=protected-access,import-outside-toplevel
+        _find_innermost_enclosing_node,
+    )
+    from pydoppelgangerhunt.parser import (  # pylint: disable=import-outside-toplevel
+        harvest_file_units,
+        harvest_notebook_units,
+    )
+
+    clear_dataflow_cache()
+    deep_parse_expr = "+" * 12000 + "x"
+    deep_parse_src = f"def f(x):\n    y = {deep_parse_expr}\n    return y\n"
+
+    # 1. _get_or_parse_tree and _find_innermost_enclosing_node fail closed on parser RecursionError/MemoryError
+    assert _get_or_parse_tree(deep_parse_src) is None
+    assert (
+        _find_innermost_enclosing_node(
+            deep_parse_src,
+            {"start": 2, "end": 2},
+            (ast.FunctionDef,),
+        )
+        is None
+    )
+    with monkeypatch.context() as m:
+        m.setattr(
+            "ast.parse",
+            lambda *_a, **_kw: (_ for _ in ()).throw(RecursionError("simulated parse recursion")),
+        )
+        assert _get_or_parse_tree("x = 1\n") is None
+        assert (
+            _find_innermost_enclosing_node(
+                "def f():\n    return 1\n",
+                {"start": 2, "end": 2},
+                (ast.FunctionDef,),
+            )
+            is None
+        )
+
+    # 2. inspect_single_unit_scope fails closed with pathological_ast hazard (both parse and visitor recursion)
+    deep_parse_unit = {
+        "file": "deep.py",
+        "start": 2,
+        "end": 2,
+        "is_subroutine": True,
+        "source_text": deep_parse_src,
+        "source_lines": [f"    y = {deep_parse_expr}\n"],
+    }
+    scope_info = inspect_single_unit_scope(deep_parse_unit)
+    assert scope_info["is_control_flow_safe"] is False
+    assert "pathological_ast" in scope_info["control_flow_hazards"]
+
+    # Also test when ast.parse succeeds (~600 unary ops) but _ScopeVisitor.visit hits Python recursion limit
+    deep_expr = "+" * 600 + "x"
+    deep_src = f"def f(x):\n    y = {deep_expr}\n    return y\n"
+    deep_unit = {
+        "file": "binop.py",
+        "start": 2,
+        "end": 2,
+        "is_subroutine": True,
+        "source_text": deep_src,
+        "source_lines": [f"    y = {deep_expr}\n"],
+    }
+    binop_scope = inspect_single_unit_scope(deep_unit)
+    assert binop_scope["is_control_flow_safe"] is False
+    assert "pathological_ast" in binop_scope["control_flow_hazards"]
+
+    # 3. Visitor-level RecursionError / MemoryError after ast.parse succeeds
+    valid_src = (
+        "def f(x):\n"
+        "    try:\n"
+        "        y = x + 1\n"
+        "        yield y\n"
+        "    finally:\n"
+        "        use(y)\n"
+        "    return y\n"
+    )
+    valid_tree = ast.parse(valid_src)
+    fn_node = valid_tree.body[0]
+
+    def _raise_recursion(*_args: Any, **_kwargs: Any) -> Any:
+        raise RecursionError("simulated visitor recursion limit")
+
+    with monkeypatch.context() as m:
+        m.setattr(
+            "pydoppelgangerhunt.fixer._df_hazards._DownstreamReadVisitor.visit",
+            _raise_recursion,
+        )
+        assert (
+            collect_downstream_read_names(
+                valid_src,
+                {"start": 3, "end": 4},
+                candidates={"y"},
+                tree=valid_tree,
+            )
+            is None
+        )
+
+    with monkeypatch.context() as m:
+        m.setattr(
+            "pydoppelgangerhunt.fixer._df_hazards._nodes_load_any_name",
+            _raise_recursion,
+        )
+        assert _enclosing_try_reads_outputs(fn_node, 3, 4, {"y"}) is True
+
+    with monkeypatch.context() as m:
+        m.setattr(
+            "pydoppelgangerhunt.fixer._df_pairing._collect_scope_closures",
+            _raise_recursion,
+        )
+        u_gen = {
+            "file": "g.py",
+            "start": 3,
+            "end": 4,
+            "is_subroutine": True,
+            "source_text": valid_src,
+        }
+        s_gen = inspect_single_unit_scope(u_gen, tree=valid_tree)
+        assert (
+            resolve_clone_generator_subroutine_outputs(
+                u_gen,
+                u_gen,
+                s_gen,
+                s_gen,
+                source_text1=valid_src,
+                source_text2=valid_src,
+                tree1=valid_tree,
+                tree2=valid_tree,
+            )
+            is None
+        )
+
+    # 4. synthesize_shared_helper_code and generate_refactoring_patch skip pathological units cleanly
+    assert synthesize_shared_helper_code(deep_unit, deep_unit) == ""
+
+    f1 = tmp_path / "deep1.py"
+    f2 = tmp_path / "deep2.py"
+    f1.write_text(deep_src, encoding="utf-8")
+    f2.write_text(deep_src, encoding="utf-8")
+    u1_patch = {
+        "file": str(f1),
+        "name": "f",
+        "start": 1,
+        "end": 3,
+        "kind": "function",
+    }
+    u2_patch = {
+        "file": str(f2),
+        "name": "f",
+        "start": 1,
+        "end": 3,
+        "kind": "function",
+    }
+    patch_out = generate_refactoring_patch(
+        [(1.0, u1_patch, u2_patch)], repo_root=str(tmp_path)
+    )
+    assert patch_out == ""
+
+    # 5. harvest_file_units and harvest_notebook_units fail closed on deeply nested code
+    assert harvest_file_units(str(f1), str(tmp_path)) == []
+    nb_file = tmp_path / "deep.ipynb"
+    nb_file.write_text(
+        '{"cells": [{"cell_type": "code", "source": ['
+        + repr(deep_src).replace("'", '"')
+        + "]}]}",
+        encoding="utf-8",
+    )
+    assert harvest_notebook_units(str(nb_file), str(tmp_path)) == []
+
+

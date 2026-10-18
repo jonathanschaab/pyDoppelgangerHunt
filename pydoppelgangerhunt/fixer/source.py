@@ -131,6 +131,8 @@ def _is_sliced_excerpt_for_file(unit: Dict[str, Any], lines: Sequence[str]) -> b
         return True
     if not lines:
         return unit.get("source_lines_is_sliced") is not False
+    if not is_valid_unit_coordinates(unit):
+        return True
     _, u_end = resolve_unit_line_bounds(unit)
     if len(lines) < u_end:
         return True
@@ -472,7 +474,7 @@ def _find_module_helper_insertion_index(lines: List[str]) -> int:
 
     try:
         tree = ast.parse("".join(lines))
-    except (SyntaxError, ValueError, UnicodeDecodeError):
+    except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
         return min_insert_idx
 
     last_import_line = 0
@@ -551,7 +553,7 @@ def _get_module_imported_names(
     """Extracts top-level imported module and symbol names from source code."""
     try:
         tree = ast.parse(source)
-    except (SyntaxError, ValueError, UnicodeDecodeError):
+    except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
         return set()
     imported: Set[str] = set()
     for stmt in tree.body:
@@ -631,7 +633,7 @@ def _insert_imports_into_module(
         while insert_idx < len(orig_lines) and not orig_lines[insert_idx].strip():
             insert_idx += 1
         parsed_with_ast = True
-    except (SyntaxError, ValueError, UnicodeDecodeError):
+    except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
         pass
 
     if not parsed_with_ast:
@@ -1489,7 +1491,7 @@ def _find_innermost_enclosing_node(
             return None
         try:
             tree = ast.parse(source_text)
-        except (SyntaxError, ValueError, UnicodeDecodeError):
+        except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
             return None
 
     candidates: List[Tuple[int, ast.AST, int, int]] = []

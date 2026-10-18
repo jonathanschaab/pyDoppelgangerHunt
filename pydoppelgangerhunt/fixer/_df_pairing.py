@@ -468,50 +468,57 @@ def resolve_clone_generator_subroutine_outputs(
         )
 
     out1, out2 = resolved
-    for side_idx, (u_item, needed_outs, s_text, eff_tr) in enumerate([
-        (u1, out1, target_srcs[0], target_trees[0]),
-        (u2, out2, target_srcs[1], target_trees[1]),
-    ]):
-        if needed_outs:
-            hazard_res = _validate_try_cleanup_hazard(
-                u_item, needed_outs, s_text, eff_tr,
-                side_idx=side_idx, context="generator subroutine pair",
-            )
-            if hazard_res is not None:
-                return hazard_res if return_details else None
-            scope_node = _resolve_downstream_scope_node(s_text or "", u_item, eff_tr)
-            bounds = _get_valid_unit_bounds(u_item)
-            if scope_node is None or bounds is None:
-                return (
-                    CloneOutputResolution(None, "generator output or closure conflict")
-                    if return_details
-                    else None
+    try:
+        for side_idx, (u_item, needed_outs, s_text, eff_tr) in enumerate([
+            (u1, out1, target_srcs[0], target_trees[0]),
+            (u2, out2, target_srcs[1], target_trees[1]),
+        ]):
+            if needed_outs:
+                hazard_res = _validate_try_cleanup_hazard(
+                    u_item, needed_outs, s_text, eff_tr,
+                    side_idx=side_idx, context="generator subroutine pair",
                 )
-            u_s, u_e = bounds
-            u_start_col = _extract_first_unit_coord(
-                u_item, ("start_col", "start_col_offset")
-            )
-            u_end_col = _extract_unit_end_col(u_item)
-            if u_end_col is None:
-                u_end_col = _resolve_unit_ast_end_col(scope_node, u_item)
-            for c_pos, reads in _collect_scope_closures(scope_node, module_tree=eff_tr):
-                _, is_intra, _ = _classify_closure_position(
-                    c_pos, u_s, u_e, u_start_col=u_start_col, u_end_col=u_end_col
-                )
-                if is_intra and bool(reads & set(needed_outs)):
-                    c_line, _ = _normalize_closure_position(c_pos)
-                    logger.debug(
-                        "Rejecting generator subroutine pair: intra-unit closure at line %d "
-                        "captures needed output(s) %r for unit %s",
-                        c_line,
-                        reads & set(needed_outs),
-                        side_idx + 1,
-                    )
+                if hazard_res is not None:
+                    return hazard_res if return_details else None
+                scope_node = _resolve_downstream_scope_node(s_text or "", u_item, eff_tr)
+                bounds = _get_valid_unit_bounds(u_item)
+                if scope_node is None or bounds is None:
                     return (
                         CloneOutputResolution(None, "generator output or closure conflict")
                         if return_details
                         else None
                     )
+                u_s, u_e = bounds
+                u_start_col = _extract_first_unit_coord(
+                    u_item, ("start_col", "start_col_offset")
+                )
+                u_end_col = _extract_unit_end_col(u_item)
+                if u_end_col is None:
+                    u_end_col = _resolve_unit_ast_end_col(scope_node, u_item)
+                for c_pos, reads in _collect_scope_closures(scope_node, module_tree=eff_tr):
+                    _, is_intra, _ = _classify_closure_position(
+                        c_pos, u_s, u_e, u_start_col=u_start_col, u_end_col=u_end_col
+                    )
+                    if is_intra and bool(reads & set(needed_outs)):
+                        c_line, _ = _normalize_closure_position(c_pos)
+                        logger.debug(
+                            "Rejecting generator subroutine pair: intra-unit closure at line %d "
+                            "captures needed output(s) %r for unit %s",
+                            c_line,
+                            reads & set(needed_outs),
+                            side_idx + 1,
+                        )
+                        return (
+                            CloneOutputResolution(None, "generator output or closure conflict")
+                            if return_details
+                            else None
+                        )
+    except (RecursionError, MemoryError):
+        return (
+            CloneOutputResolution(None, "generator output or closure conflict")
+            if return_details
+            else None
+        )
 
     return CloneOutputResolution(resolved, None) if return_details else resolved
 

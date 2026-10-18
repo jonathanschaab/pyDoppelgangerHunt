@@ -36,6 +36,7 @@ _parsed_tree_cache: OrderedDict[Tuple[str, int], Optional[ast.AST]] = OrderedDic
 
 _scope_parent_maps: OrderedDict[ast.AST, Dict[ast.AST, ast.AST]] = OrderedDict()
 _scope_stmts_by_end: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
+_scope_stmts_by_start: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
 _scope_closures_cache: OrderedDict[Any, List[Tuple[Any, Set[str]]]] = OrderedDict()
 _scope_loops_cache: OrderedDict[ast.AST, List[Tuple[int, int, int]]] = OrderedDict()
 _scope_try_with_cache: OrderedDict[ast.AST, List[ast.AST]] = OrderedDict()
@@ -65,6 +66,7 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
         for node in scope_nodes:
             _scope_parent_maps.pop(node, None)
             _scope_stmts_by_end.pop(node, None)
+            _scope_stmts_by_start.pop(node, None)
             _scope_closures_cache.pop(node, None)
             _scope_loops_cache.pop(node, None)
             _scope_try_with_cache.pop(node, None)
@@ -150,7 +152,7 @@ def _get_or_parse_tree(
     try:
         parsed = ast.parse(source_text)
         setattr(parsed, "_immutable_cached", True)
-    except (SyntaxError, ValueError, UnicodeDecodeError):
+    except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
         parsed = None
 
     stored_tree = _store_lru_cache_entry(
@@ -218,22 +220,45 @@ def _get_scope_parent_map(scope_node: ast.AST) -> Dict[ast.AST, ast.AST]:
     return _get_or_compute_scope_cached(_scope_parent_maps, scope_node, _compute)
 
 
+def _index_scope_stmts(
+    scope_node: ast.AST, *, use_end_lineno: bool
+) -> Dict[int, List[ast.stmt]]:
+    """Indexes statement nodes within a scope by start or end line number."""
+    m: Dict[int, List[ast.stmt]] = {}
+    for node in ast.walk(scope_node):
+        if node is scope_node or not isinstance(node, ast.stmt):
+            continue
+        lineno = getattr(node, "lineno", 0) or 0
+        line_key = (
+            (getattr(node, "end_lineno", None) or lineno)
+            if use_end_lineno
+            else lineno
+        )
+        if line_key > 0:
+            m.setdefault(line_key, []).append(node)
+    return m
+
+
 def _get_scope_stmts_by_end_lineno(
     scope_node: ast.AST,
 ) -> Dict[int, List[ast.stmt]]:
     """Retrieves or builds cached map of statement end line numbers to statement nodes."""
-    def _compute() -> Dict[int, List[ast.stmt]]:
-        m: Dict[int, List[ast.stmt]] = {}
-        for node in ast.walk(scope_node):
-            if node is scope_node:
-                continue
-            if isinstance(node, ast.stmt):
-                e = getattr(node, "end_lineno", None) or getattr(node, "lineno", 0) or 0
-                if e > 0:
-                    m.setdefault(e, []).append(node)
-        return m
+    return _get_or_compute_scope_cached(
+        _scope_stmts_by_end,
+        scope_node,
+        lambda: _index_scope_stmts(scope_node, use_end_lineno=True),
+    )
 
-    return _get_or_compute_scope_cached(_scope_stmts_by_end, scope_node, _compute)
+
+def _get_scope_stmts_by_start_lineno(
+    scope_node: ast.AST,
+) -> Dict[int, List[ast.stmt]]:
+    """Retrieves or builds cached map of statement start line numbers to statement nodes."""
+    return _get_or_compute_scope_cached(
+        _scope_stmts_by_start,
+        scope_node,
+        lambda: _index_scope_stmts(scope_node, use_end_lineno=False),
+    )
 
 
 def _resolve_unit_ast_end_col(
@@ -307,11 +332,8 @@ def _resolve_unit_ast_end_col(
         )
         return None
     if (u_start < u_end or start_col is None) and any(
-        s is not target_stmt
-        and getattr(s, "lineno", 0) == u_end
-        and getattr(s, "col_offset", 0) >= int(end_col)
-        for stmt_list in stmts_by_end.values()
-        for s in stmt_list
+        s is not target_stmt and getattr(s, "col_offset", 0) >= int(end_col)
+        for s in _get_scope_stmts_by_start_lineno(scope_node).get(u_end, ())
     ):
         return None
     return int(end_col)
@@ -335,6 +357,7 @@ def clear_dataflow_cache() -> None:
         _parsed_tree_cache.clear()
         _scope_parent_maps.clear()
         _scope_stmts_by_end.clear()
+        _scope_stmts_by_start.clear()
         _scope_closures_cache.clear()
         _scope_loops_cache.clear()
         _scope_try_with_cache.clear()

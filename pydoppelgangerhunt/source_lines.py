@@ -178,26 +178,55 @@ def is_sliced_unit_source_lines(
     source_lines: Optional[Sequence[str]] = None,
 ) -> bool:
     """Determines whether a unit's source_lines collection represents a pre-sliced excerpt."""
+    if not isinstance(unit, dict):
+        return False
     is_sliced = unit.get("source_lines_is_sliced")
     if is_sliced is not None:
         return bool(is_sliced)
     lines = source_lines if source_lines is not None else unit.get("source_lines")
     if not lines or not isinstance(lines, (list, tuple)):
         return False
-    s_d, e_d = resolve_unit_line_bounds(unit)
-    expected_len = max(0, e_d - s_d + 1)
-    if len(lines) == expected_len:
-        return True
-    return False
+    try:
+        raw_s = parse_unit_coord(unit, "start", default=None)
+        if raw_s is None or raw_s < 1:
+            return False
+        raw_e = parse_unit_coord(unit, "end", default=raw_s)
+    except (ValueError, TypeError, AttributeError):
+        return False
+    if raw_e is None or raw_e < raw_s:
+        return False
+    expected_len = raw_e - raw_s + 1
+    return len(lines) == expected_len
 
 
-def resolve_unit_line_bounds(unit: Dict[str, Any]) -> Tuple[int, int]:
-    """Extracts clamped, positive (start, end) line coordinates from a unit dictionary.
+def resolve_unit_line_bounds(
+    unit: Dict[str, Any], *, strict: bool = False
+) -> Tuple[int, int]:
+    """Extracts (start, end) line coordinates from a unit dictionary.
 
-    Logs a DEBUG diagnostic whenever start is clamped to >= 1 or end is clamped to >= start.
+    When strict=True, raises ValueError if unit is not a dictionary, if start or end
+    is missing, non-positive, or malformed, or if end < start.
+    When strict=False, clamps start to >= 1 and end to >= start, logging a DEBUG
+    diagnostic whenever clamping occurs.
     """
     if not isinstance(unit, dict):
+        if strict:
+            raise ValueError("Invalid unit: expected dictionary")
         return 1, 1
+    if strict:
+        if "start" not in unit or unit.get("start") is None:
+            raise ValueError("Missing unit start coordinate")
+        if "end" not in unit or unit.get("end") is None:
+            raise ValueError("Missing unit end coordinate")
+        raw_s = parse_unit_coord(unit, "start", default=None, strict=True)
+        if raw_s is None or raw_s < 1:
+            raise ValueError(f"Invalid unit start coordinate: {unit.get('start')!r}")
+        raw_e = parse_unit_coord(unit, "end", default=None, strict=True)
+        if raw_e is None or raw_e < raw_s:
+            raise ValueError(
+                f"Invalid unit line bounds: start={raw_s!r}, end={unit.get('end')!r}"
+            )
+        return raw_s, raw_e
     try:
         raw_s = parse_unit_coord(unit, "start", default=1)
     except (ValueError, TypeError, AttributeError):

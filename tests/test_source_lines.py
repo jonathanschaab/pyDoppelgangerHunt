@@ -567,3 +567,102 @@ def test_resolve_safe_unit_file_path_hop_back_symlink_rejected(tmp_path: Path) -
     )
     assert resolved is None
 
+
+def test_resolve_unit_line_bounds_strict_mode() -> None:
+    """Verifies resolve_unit_line_bounds raises ValueError on malformed or inverted coordinates when strict=True."""
+    from pydoppelgangerhunt.source_lines import (  # pylint: disable=import-outside-toplevel
+        resolve_unit_line_bounds,
+    )
+
+    assert resolve_unit_line_bounds({"start": 2, "end": 5}, strict=True) == (2, 5)
+    assert resolve_unit_line_bounds({"start": 3, "end": 3}, strict=True) == (3, 3)
+
+    for bad_unit in (
+        None,
+        "not_a_dict",
+        {},
+        {"start": 3},
+        {"start": None, "end": 2},
+        {"start": 0, "end": 2},
+        {"start": -1, "end": 2},
+        {"start": 2, "end": 0},
+        {"start": 2, "end": -3},
+        {"start": 5, "end": 2},
+        {"start": "2:0", "end": 5},
+        {"start": 2.0, "end": 5},
+        {"start": "invalid", "end": 5},
+    ):
+        with pytest.raises(ValueError):
+            resolve_unit_line_bounds(bad_unit, strict=True)  # type: ignore[arg-type]
+
+
+def test_is_sliced_unit_source_lines_rejects_malformed_and_inverted_coordinates() -> None:
+    """Verifies is_sliced_unit_source_lines returns False instead of clamping to (1, 1) on invalid bounds."""
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=import-outside-toplevel
+        _is_sliced_excerpt_for_file,
+    )
+    from pydoppelgangerhunt.source_lines import (  # pylint: disable=import-outside-toplevel
+        is_sliced_unit_source_lines,
+    )
+
+    one_line = ["x = 1\n"]
+    # Previously, clamping to (1, 1) caused 1-line source_lines to falsely match span == 1
+    assert is_sliced_unit_source_lines({}, one_line) is False
+    assert is_sliced_unit_source_lines({"start": None, "end": None}, one_line) is False
+    assert is_sliced_unit_source_lines({"start": 0, "end": 0}, one_line) is False
+    assert is_sliced_unit_source_lines({"start": -3, "end": -1}, one_line) is False
+    assert is_sliced_unit_source_lines({"start": 10, "end": 5}, one_line) is False
+    assert is_sliced_unit_source_lines({"start": "invalid", "end": 1}, one_line) is False
+    assert is_sliced_unit_source_lines({"start": 1, "end": "invalid"}, one_line) is False
+    assert is_sliced_unit_source_lines({"start": 1, "end": 1}, one_line) is True
+    assert is_sliced_unit_source_lines({"start": 4, "end": 5}, ["a = 1\n", "b = 2\n"]) is True
+
+    # _is_sliced_excerpt_for_file fails closed (treats malformed coordinates as a sliced excerpt)
+    assert (
+        _is_sliced_excerpt_for_file(
+            {"start": 10, "end": 5, "source_lines": one_line},
+            one_line,
+        )
+        is True
+    )
+
+
+def test_resolve_unit_ast_end_col_caches_stmts_by_start_lineno() -> None:
+    """Verifies _get_scope_stmts_by_start_lineno indexes statements by start line and evicts cleanly."""
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=protected-access,import-outside-toplevel
+        _evict_tree_scopes,
+        _get_scope_stmts_by_start_lineno,
+        _scope_stmts_by_end,
+        _scope_stmts_by_start,
+        clear_dataflow_cache,
+    )
+
+    clear_dataflow_cache()
+    code = (
+        "def big_scope():\n"
+        "    a = 1\n"
+        "    b = 2; c = 3\n"
+        "    d = (\n"
+        "        4\n"
+        "    )\n"
+    )
+    tree = ast.parse(code)
+    fn_scope = tree.body[0]
+
+    by_start = _get_scope_stmts_by_start_lineno(fn_scope)
+    assert fn_scope in _scope_stmts_by_start
+    assert len(by_start[2]) == 1
+    assert len(by_start[3]) == 2
+    assert len(by_start[4]) == 1
+
+    # Single-statement line 2 resolves end_col; multi-statement line 3 without start_col fails closed
+    assert _resolve_unit_ast_end_col(fn_scope, {"start": 2, "end": 2}) == len("    a = 1")
+    assert fn_scope in _scope_stmts_by_end
+    assert _resolve_unit_ast_end_col(fn_scope, {"start": 2, "end": 3}) is None
+    assert _resolve_unit_ast_end_col(fn_scope, {"start": 2, "end": 6}) == len("    )")
+
+    _evict_tree_scopes(tree)
+    assert fn_scope not in _scope_stmts_by_start
+    assert fn_scope not in _scope_stmts_by_end
+
+

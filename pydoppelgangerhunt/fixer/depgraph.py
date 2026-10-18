@@ -684,10 +684,11 @@ def _parse_source_imports(
     imports: Set[str] = set()
     try:
         tree = ast.parse(source_text)
-    except (SyntaxError, UnicodeDecodeError, ValueError):
+        import_nodes = _collect_top_level_import_nodes(tree.body)
+    except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         return imports
 
-    for node in _collect_top_level_import_nodes(tree.body):
+    for node in import_nodes:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 imports.add(alias.name)

@@ -624,7 +624,7 @@ def _build_whole_method_delegation(
                             getattr(first_body, "end_lineno", None)
                             or getattr(first_body, "lineno", 0)
                         )
-    except (SyntaxError, ValueError, UnicodeDecodeError):
+    except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
         pass
 
     if not header:
@@ -1592,7 +1592,7 @@ def _has_future_annotations(source_text: str) -> bool:
         return False
     try:
         tree = ast.parse(source_text)
-    except (SyntaxError, UnicodeDecodeError, ValueError):
+    except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         return False
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "__future__":
@@ -1608,7 +1608,7 @@ def _helper_requires_future_annotations(helper_code: str) -> bool:
         return False
     try:
         tree = ast.parse(helper_code)
-    except (SyntaxError, UnicodeDecodeError, ValueError):
+    except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         return False
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1729,35 +1729,34 @@ def _extract_module_import_statements(
         return _ModuleImportsResult(stmts, wildcards)
     try:
         tree = ast.parse(source_text)
-    except (SyntaxError, UnicodeDecodeError, ValueError):
-        return _ModuleImportsResult(stmts, wildcards)
-
-    for stmt in tree.body:
-        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-            name_stmts, wilds = _parse_import_node_statements(
-                stmt, source_mod=source_mod, is_package=is_package
-            )
-            wildcards.extend(wilds)
-            for name, stmt_str in name_stmts:
-                if name in unconditional_names and stmts.get(name) != stmt_str:
-                    rebound_conflicts.add(name)
-                stmts[name] = stmt_str
-                unconditional_names.add(name)
-        else:
-            guarded_nodes = _collect_top_level_import_nodes(
-                [stmt], include_classes=False
-            )
-            for g_node in guarded_nodes:
+        for stmt in tree.body:
+            if isinstance(stmt, (ast.Import, ast.ImportFrom)):
                 name_stmts, wilds = _parse_import_node_statements(
-                    g_node, source_mod=source_mod, is_package=is_package
+                    stmt, source_mod=source_mod, is_package=is_package
                 )
                 wildcards.extend(wilds)
                 for name, stmt_str in name_stmts:
-                    guarded_names.add(name)
                     if name in unconditional_names and stmts.get(name) != stmt_str:
                         rebound_conflicts.add(name)
-                    elif name not in stmts:
-                        stmts[name] = stmt_str
+                    stmts[name] = stmt_str
+                    unconditional_names.add(name)
+            else:
+                guarded_nodes = _collect_top_level_import_nodes(
+                    [stmt], include_classes=False
+                )
+                for g_node in guarded_nodes:
+                    name_stmts, wilds = _parse_import_node_statements(
+                        g_node, source_mod=source_mod, is_package=is_package
+                    )
+                    wildcards.extend(wilds)
+                    for name, stmt_str in name_stmts:
+                        guarded_names.add(name)
+                        if name in unconditional_names and stmts.get(name) != stmt_str:
+                            rebound_conflicts.add(name)
+                        elif name not in stmts:
+                            stmts[name] = stmt_str
+    except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
+        return _ModuleImportsResult({}, [])
 
     return _ModuleImportsResult(
         stmts=stmts,
@@ -1788,7 +1787,7 @@ def _canonicalize_helper_relative_imports(
         return helper_code
     try:
         tree = ast.parse(helper_code)
-    except (SyntaxError, UnicodeDecodeError, ValueError):
+    except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         return helper_code
 
     import_nodes: List[ast.ImportFrom] = []
@@ -1883,7 +1882,7 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
         return set()
     try:
         tree = ast.parse(source_text)
-    except (SyntaxError, UnicodeDecodeError, ValueError):
+    except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         return set()
     names: Set[str] = set()
 
@@ -1954,8 +1953,11 @@ def _extract_module_defined_names(source_text: str) -> Set[str]:
                     names.add(tgt.id)
             _collect_top_named_exprs(child)
 
-    _collect_top_defs(tree.body)
-    _collect_top_named_exprs(tree)
+    try:
+        _collect_top_defs(tree.body)
+        _collect_top_named_exprs(tree)
+    except (RecursionError, MemoryError):
+        return set()
     return names
 
 
@@ -2189,7 +2191,10 @@ def _extract_helper_symbols(
                 if not any(node.id in s for s in reversed(scope_stack)):
                     free_names.add(node.id)
 
-    _ScopeVisitor().visit(helper_tree)
+    try:
+        _ScopeVisitor().visit(helper_tree)
+    except (RecursionError, MemoryError):
+        return set(), set(), set()
     return free_names, defined_names, local_imported_names
 
 
@@ -2218,7 +2223,7 @@ def _parse_local_import_statements(
             continue
         try:
             loc_tree = ast.parse(s_loc)
-        except (SyntaxError, UnicodeDecodeError, ValueError):
+        except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
             continue
 
         for node in loc_tree.body:
@@ -2370,7 +2375,7 @@ def _collect_host_missing_imports(
     # 3. Source dependencies referenced in helper_code
     try:
         helper_tree = ast.parse(helper_code)
-    except (SyntaxError, UnicodeDecodeError, ValueError):
+    except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
         helper_tree = None
 
     if helper_tree is not None and source_texts:
@@ -2890,6 +2895,8 @@ def _unit_has_no_refactor_pragma(
     full_text = orig_text if orig_text is not None else "".join(file_lines or [])
     if not _NO_REFACTOR_RE.search(full_text):
         return False
+    if not is_valid_unit_coordinates(unit):
+        return False
     u_start, u_end = resolve_unit_line_bounds(unit)
     eff_lines = (
         file_lines if file_lines is not None else split_source_lines(full_text)
@@ -3343,6 +3350,11 @@ def _generate_refactoring_patch_impl(
 
             hazards1 = set(s1.get("control_flow_hazards", []))
             hazards2 = set(s2.get("control_flow_hazards", []))
+            if "pathological_ast" in hazards1 | hazards2:
+                skip_reasons["pathological ast"] = (
+                    skip_reasons.get("pathological ast", 0) + 1
+                )
+                continue
             if "type_param_closure_capture" in hazards1 | hazards2:
                 skip_reasons["type_param closure capture"] = (
                     skip_reasons.get("type_param closure capture", 0) + 1
@@ -4132,7 +4144,7 @@ def _generate_refactoring_patch_impl(
             raise
         except Exception as exc:
             skip_reasons["processing exception"] += 1
-            if isinstance(exc, (ValueError, TypeError, SyntaxError)):
+            if isinstance(exc, (ValueError, TypeError, SyntaxError, MemoryError)):
                 logger.debug(
                     "Skipping clone pair due to coordinate, syntax, or processing error: %s",
                     exc,

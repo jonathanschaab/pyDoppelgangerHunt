@@ -70,9 +70,12 @@ def _attach_pragmas(
 
 def _node_references_name(node: ast.AST, name: str) -> bool:
     """Checks whether an AST node contains any free load references to the identifier."""
-    visitor = _OuterExprVisitor()
-    visitor.visit(node)
-    return name in visitor.names
+    try:
+        visitor = _OuterExprVisitor()
+        visitor.visit(node)
+        return name in visitor.names
+    except (RecursionError, MemoryError):
+        return True
 
 
 def _parse_dedented_stmts(raw_text: str) -> List[ast.stmt]:
@@ -83,12 +86,14 @@ def _parse_dedented_stmts(raw_text: str) -> List[ast.stmt]:
         return []
     try:
         return ast.parse(stripped).body
-    except SyntaxError:
+    except (RecursionError, MemoryError):
+        return []
+    except (SyntaxError, ValueError, UnicodeDecodeError):
         try:
             wrapped = ast.parse(f"if 1:\n{dedented}").body
             if len(wrapped) == 1 and isinstance(wrapped[0], ast.If):
                 return wrapped[0].body
-        except SyntaxError:
+        except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
             pass
     return []
 
@@ -107,7 +112,7 @@ def _strip_stmt_target_lines(lines: Sequence[str]) -> List[str]:
                 if stmt.value is not None:
                     return ast.unparse(stmt.value).splitlines()
                 return list(lines)
-    except (SyntaxError, IndexError, ValueError):
+    except (SyntaxError, IndexError, ValueError, RecursionError, MemoryError):
         pass
     if len(lines) == 1:
         m = _ASSIGN_STMT_RE.match(lines[0].strip())
@@ -125,7 +130,7 @@ def _extract_augassign_unreferenced_target(lines: Sequence[str]) -> Optional[str
                 target_name = parsed[0].target.id
                 if not _node_references_name(parsed[0].value, target_name):
                     return target_name
-    except (SyntaxError, IndexError, ValueError):
+    except (SyntaxError, IndexError, ValueError, RecursionError, MemoryError):
         pass
     return None
 
@@ -207,7 +212,7 @@ def _extract_lhs_and_rhs_nodes(
         parsed = _parse_dedented_stmts("\n".join(lines))
         if len(parsed) == 1:
             return _extract_stmt_lhs_and_rhs_nodes(parsed[0])
-    except (SyntaxError, IndexError, ValueError):
+    except (SyntaxError, IndexError, ValueError, RecursionError, MemoryError):
         pass
     return [], None
 
@@ -222,12 +227,15 @@ def _extract_unreferenced_lhs_loads(
         lhs_nodes, rhs_node = _extract_lhs_and_rhs_nodes(lines_or_stmt)
     if rhs_node is None or not lhs_nodes:
         return set()
-    lhs_visitor = _OuterExprVisitor()
-    for lhs in lhs_nodes:
-        lhs_visitor.visit(lhs)
-    return {
-        name for name in lhs_visitor.names if not _node_references_name(rhs_node, name)
-    }
+    try:
+        lhs_visitor = _OuterExprVisitor()
+        for lhs in lhs_nodes:
+            lhs_visitor.visit(lhs)
+        return {
+            name for name in lhs_visitor.names if not _node_references_name(rhs_node, name)
+        }
+    except (RecursionError, MemoryError):
+        return set()
 
 
 def _order_inputs_by_rhs_loads(
@@ -236,9 +244,13 @@ def _order_inputs_by_rhs_loads(
     receiver_names: Sequence[str] = ("self", "cls", "this", "klass"),
 ) -> List[str]:
     """Orders input identifiers by their first free-load appearance in rhs_node, keeping receivers first."""
-    rhs_visitor = _OuterExprVisitor()
-    rhs_visitor.visit(rhs_node)
-    rhs_order = {name: idx for idx, name in enumerate(rhs_visitor.ordered_names)}
+    try:
+        rhs_visitor = _OuterExprVisitor()
+        rhs_visitor.visit(rhs_node)
+        ordered = rhs_visitor.ordered_names
+    except (RecursionError, MemoryError):
+        ordered = []
+    rhs_order = {name: idx for idx, name in enumerate(ordered)}
     fallback_base = len(rhs_order)
     rec_set = set(receiver_names)
     indexed = list(enumerate(candidates))
@@ -749,7 +761,7 @@ def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
     tree: Optional[ast.AST] = None
     try:
         tree = ast.parse(text)
-    except (SyntaxError, ValueError, UnicodeDecodeError):
+    except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
         pass
 
     if tree is None and "->" in text:
@@ -760,13 +772,13 @@ def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
         ret_part = parts[1].strip()
         try:
             tree = ast.parse(f"def _sig_wrapper({params_part}) -> {ret_part}: pass")
-        except (SyntaxError, ValueError, UnicodeDecodeError):
+        except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
             pass
 
     if tree is None:
         try:
             tree = ast.parse(f"def _sig_wrapper({text}): pass")
-        except (SyntaxError, ValueError, UnicodeDecodeError):
+        except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
             pass
 
     if tree is None:
@@ -1198,7 +1210,7 @@ def _extract_probe_active_idents(probe_src: str, return_type: str) -> Set[str]:
     """Extracts referenced AST Name identifiers and annotation string-constant identifiers."""
     try:
         probe_tree = ast.parse(probe_src)
-    except SyntaxError:
+    except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
         return set(re.findall(r"\b[A-Za-z_]\w*\b", f"{probe_src}\n{return_type}"))
     all_nodes = list(ast.walk(probe_tree))
     ann_roots = [
@@ -1426,7 +1438,10 @@ def synthesize_shared_helper_code(
         return ""
     if scope1.get("nonlocals") or scope2.get("nonlocals") or scope.get("nonlocals"):
         return ""
-    if "type_param_closure_capture" in scope.get("control_flow_hazards", []):
+    if any(
+        h in scope.get("control_flow_hazards", [])
+        for h in ("type_param_closure_capture", "pathological_ast")
+    ):
         return ""
     if not is_same_class and not _is_same_file_path(f1, f2, repo_root=repo_root) and (
         scope1.get("globals") or scope2.get("globals") or scope.get("globals")
@@ -1644,7 +1659,7 @@ def synthesize_shared_helper_code(
                         stripped_expr = full_code
                     else:
                         return ""
-            except (SyntaxError, IndexError):
+            except (SyntaxError, IndexError, ValueError, RecursionError, MemoryError):
                 pass
 
             if stripped_expr is not None:
@@ -1774,7 +1789,7 @@ def synthesize_shared_helper_code(
                 compile("if 1:\n" + helper_def, "<synthesized_helper>", "exec")
             else:
                 compile(helper_def, "<synthesized_helper>", "exec")
-        except (SyntaxError, ValueError):
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
             return ""
 
     if include_imports:
@@ -1789,7 +1804,7 @@ def synthesize_shared_helper_code(
             combined = "\n".join(import_header_parts) + "\n\n\n" + helper_def
             try:
                 compile("\n".join(import_header_parts), "<synthesized_imports>", "exec")
-            except (SyntaxError, ValueError):
+            except (SyntaxError, ValueError, RecursionError, MemoryError):
                 return ""
             return combined
 
