@@ -905,7 +905,7 @@ def _build_unit_delegation_call(
                 dict.fromkeys(p for p in attached_pragmas if p not in rep_call)
             )
             if dedup_pragmas:
-                return f"{rep_call.rstrip('\r\n')}  {'  '.join(dedup_pragmas)}\n"
+                return rep_call.rstrip("\r\n") + "  " + "  ".join(dedup_pragmas) + "\n"
             return rep_call
         return f"{await_prefix}{call_expr}"
 
