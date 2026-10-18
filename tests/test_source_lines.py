@@ -980,16 +980,15 @@ def test_lhs_receiver_pruning_and_precomputed_scope_pruning() -> None:
         synthesize_shared_helper_code,
     )
 
-    # 1.1: _order_inputs_by_rhs_loads only pins receivers to index 0 when accessed via attribute
+    # 1.2: _order_inputs_by_rhs_loads pins receivers to index 0 when receiver_names is provided
     rhs_tree = ast.parse("fn(self)").body[0].value  # type: ignore[attr-defined]
     assert _order_inputs_by_rhs_loads(["fn", "self"], rhs_tree, ("self",)) == [
-        "fn",
         "self",
+        "fn",
     ]
-    rhs_attr_tree = ast.parse("fn(self.x)").body[0].value  # type: ignore[attr-defined]
-    assert _order_inputs_by_rhs_loads(["fn", "self"], rhs_attr_tree, ("self",)) == [
-        "self",
+    assert _order_inputs_by_rhs_loads(["fn", "self"], rhs_tree, ()) == [
         "fn",
+        "self",
     ]
 
     # 1.1: Asymmetrical receiver binding after LHS pruning rejected in patch generation
@@ -1025,6 +1024,21 @@ def test_lhs_receiver_pruning_and_precomputed_scope_pruning() -> None:
         generate_refactoring_patch([(0.95, u1, u2)], method_binding="method") == ""
     )
 
+    # 1.2: Symmetrical non-attribute RHS receiver argument does not swap or drop arguments
+    sym_src = (
+        "class Box:\n"
+        "    def m1(self, fn):\n"
+        "        self.res1 = [fn(self) for _ in range(3)]\n"
+        "    def m2(self, fn):\n"
+        "        self.res2 = [fn(self) for _ in range(3)]\n"
+    )
+    su1 = dict(u1, file="box.py", name="m1_comp", source_text=sym_src)
+    su2 = dict(u2, file="box.py", name="m2_comp", source_text=sym_src)
+    sym_helper_mod = synthesize_shared_helper_code(su1, su2, method_binding="module")
+    assert "def _shared_m1_comp_m2_comp(self: Any, fn: Any) -> Any:" in sym_helper_mod
+    sym_helper_meth = synthesize_shared_helper_code(su1, su2, method_binding="method")
+    assert "def _shared_m1_comp_m2_comp(self, fn: Any) -> Any:" in sym_helper_meth
+
     # 2.3: Precomputed unpruned scopes passed directly to synthesize_shared_helper_code
     comp_src1 = "def f1(d1, items):\n    d1[0] = [x * 2 for x in items]\n"
     comp_src2 = "def f2(d2, items):\n    d2[0] = [x * 2 for x in items]\n"
@@ -1052,6 +1066,10 @@ def test_lhs_receiver_pruning_and_precomputed_scope_pruning() -> None:
 
 def test_class_scope_headers_comprehensions_helper_symbols_and_global_depth() -> None:
     """Verifies class scope header defaults, comprehension iterators, helper symbol resolution, and nested globals."""
+    import sys  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=protected-access,import-outside-toplevel
+        _resolve_unit_ast_end_col,
+    )
     from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=protected-access,import-outside-toplevel
         _ClassScopeVisitor,
     )
@@ -1103,6 +1121,18 @@ def test_class_scope_headers_comprehensions_helper_symbols_and_global_depth() ->
     free_names, _, _ = _extract_helper_symbols(ast.parse(helper_code))
     assert "foo" in free_names
 
+    if sys.version_info >= (3, 12):
+        ta_code = (
+            "type TopAlias[T] = list[T]\n"
+            "def _shared_ta():\n"
+            "    type InnerAlias[U] = dict[str, ExtType]\n"
+            "    return InnerAlias\n"
+        )
+        ta_free, ta_defined, _ = _extract_helper_symbols(ast.parse(ta_code))
+        assert "ExtType" in ta_free
+        assert "TopAlias" in ta_defined
+        assert "InnerAlias" in ta_defined
+
     # 2.2: Nested global declaration does not leak to outer unit or nested function
     nested_global_unit = {
         "start": 1,
@@ -1135,6 +1165,20 @@ def test_class_scope_headers_comprehensions_helper_symbols_and_global_depth() ->
     parsed_fn = ast.parse("def f():\n    x = 1\n")
     assert is_subroutine_unit({"start": 2, "end": 2}, tree=parsed_fn) is True
 
-    # 3.1: Single-line f-string with multi-line interpolation expression
+    # _resolve_unit_ast_end_col handles preceding multi-line statement ending on u_start
+    ml_tree = ast.parse("x = 0; a = (\n    1\n); b = 2\n")
+    assert (
+        _resolve_unit_ast_end_col(ml_tree, {"start": 3, "end": 3, "start_col": 3})
+        == 8
+    )
+    assert (
+        _resolve_unit_ast_end_col(ml_tree, {"start": 3, "end": 3, "start_col": 0})
+        is None
+    )
+
+    # 3.1: Single-line f-string with multi-line or unclosed interpolation expression
     fstr_src = 'msg = f"val: {\n    compute(x)\n}"\n'
     assert _find_multiline_string_continuation_lines(fstr_src) == set()
+    unclosed_single_fstr = 'msg = f"val: {x\ny = 1\n'
+    assert _find_multiline_string_continuation_lines(unclosed_single_fstr) == set()
+

@@ -246,7 +246,7 @@ def _order_inputs_by_rhs_loads(
     rhs_node: ast.AST,
     receiver_names: Sequence[str] = ("self", "cls", "this", "klass"),
 ) -> List[str]:
-    """Orders input identifiers by their first free-load appearance in rhs_node, keeping attribute receivers first."""
+    """Orders input identifiers by their first free-load appearance in rhs_node, keeping receivers first."""
     try:
         rhs_visitor = _OuterExprVisitor()
         rhs_visitor.visit(rhs_node)
@@ -255,25 +255,11 @@ def _order_inputs_by_rhs_loads(
         ordered = []
     rhs_order = {name: idx for idx, name in enumerate(ordered)}
     fallback_base = len(rhs_order)
-    rec_tuple = tuple(receiver_names)
-    attr_receivers = (
-        {
-            unfolded.split(".", 1)[0]
-            for child in ast.walk(rhs_node)
-            if isinstance(child, ast.Attribute)
-            for unfolded in (
-                _unfold_receiver_attribute(child, receiver_names=rec_tuple),
-            )
-            if unfolded is not None
-        }
-        if rec_tuple
-        else set()
-    )
-    pinned_receivers = attr_receivers | (set(rec_tuple) - rhs_order.keys())
+    rec_set = set(receiver_names)
     indexed = list(enumerate(candidates))
     indexed.sort(
         key=lambda pair: (
-            0 if pair[1].lstrip("*") in pinned_receivers else 1,
+            0 if pair[1].lstrip("*") in rec_set else 1,
             rhs_order.get(pair[1].lstrip("*"), fallback_base + pair[0]),
             pair[0],
         )

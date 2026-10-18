@@ -325,15 +325,17 @@ def _find_multiline_string_continuation_lines(
         or "{" in text
     ):
         return cont_lines
-    fstring_start_lines: List[int] = []
+    fstring_start_lines: List[Tuple[int, bool]] = []
     try:
         for tok in tokenize.generate_tokens(io.StringIO(text, newline=None).readline):
             if _FSTRING_START_TOK is not None and tok.type == _FSTRING_START_TOK:
-                fstring_start_lines.append(tok.start[0])
+                fstring_start_lines.append(
+                    (tok.start[0], tok.string.endswith(('"""', "'''")))
+                )
             elif _FSTRING_END_TOK is not None and tok.type == _FSTRING_END_TOK:
                 if fstring_start_lines:
-                    start_line = fstring_start_lines.pop()
-                    if start_line < tok.end[0] and tok.string in ('"""', "'''"):
+                    start_line, is_triple = fstring_start_lines.pop()
+                    if is_triple and start_line < tok.end[0]:
                         cont_lines.update(range(start_line + 1, tok.end[0] + 1))
             elif tok.type in _MULTILINE_STR_TOKEN_TYPES and tok.start[0] < tok.end[0]:
                 cont_lines.update(range(tok.start[0] + 1, tok.end[0] + 1))
@@ -349,9 +351,12 @@ def _find_multiline_string_continuation_lines(
                 )
             )
     except (tokenize.TokenError, SyntaxError) as exc:
+        triple_fstr_start = next(
+            (ln for ln, is_triple in fstring_start_lines if is_triple), None
+        )
         err_start = (
-            fstring_start_lines[0]
-            if fstring_start_lines
+            triple_fstr_start
+            if triple_fstr_start is not None
             else (
                 exc.args[1][0]
                 if (

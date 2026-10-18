@@ -307,11 +307,18 @@ def _resolve_unit_ast_end_col(
             return None
     elif u_start == u_end and start_col is not None:
         if any(
-            getattr(s, "col_offset", 0) < start_col < (getattr(s, "end_col_offset", 0) or 0)
+            (0 if getattr(s, "lineno", 0) < u_start else getattr(s, "col_offset", 0))
+            < start_col
+            < (getattr(s, "end_col_offset", 0) or 0)
             for s in inner_stmts
         ):
             return None
-        matched = [s for s in inner_stmts if getattr(s, "col_offset", 0) >= start_col]
+        matched = [
+            s
+            for s in inner_stmts
+            if getattr(s, "lineno", 0) == u_start
+            and getattr(s, "col_offset", 0) >= start_col
+        ]
         if len(matched) == 1:
             target_stmt = matched[0]
         else:

@@ -2132,7 +2132,7 @@ def _extract_helper_symbols(
             name_node = getattr(node, "name", None)
             if isinstance(name_node, ast.Name):
                 scope_stack[-1].add(name_node.id)
-                if len(scope_stack) <= max_helper_scope_depth:
+                if len(scope_stack) == 1:
                     defined_names.add(name_node.id)
             self._visit_with_type_params(node, [getattr(node, "value", None)])
 
@@ -2952,7 +2952,7 @@ def _unit_has_no_refactor_pragma(
             full_text,
             min(u_start, start_idx + 1),
             u_end,
-            include_leading=start_idx + 1 >= u_start,
+            include_leading=False,
         )
         return any(bool(_NO_REFACTOR_RE.search(c["text"])) for c in comments)
     except Exception as exc:
