@@ -182,8 +182,9 @@ from pydoppelgangerhunt import (
   determine if a clone unit represents an inner compound block, sliding window, or clause branch
   rather than an entire callable. Explicit `is_subroutine` boolean takes precedence; returns `True`
   for known subroutine kinds (`compound_block`, `sliding_window`, `clause_branch`), and `False`
-  for whole callables and expressions (`function`, `method`, `async_function`, `closure`,
-  `comprehension`, `complex_expr`). When `source_text` is available, structural AST inspection
+  for whole callables, classes, and expressions (`function`, `method`, `async_function`,
+  `async_method`, `closure`, `comprehension`, `complex_expr`, `class`, `data_table`). When
+  `source_text` or `tree` is available, structural AST inspection
   determines whether the unit's line bounds strictly reside inside an enclosing function (`True`)
   or span the entire function definition (`False`), with kind-less units at module scope falling
   back to `True`.

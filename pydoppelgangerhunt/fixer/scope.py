@@ -643,8 +643,17 @@ class _ScopeVisitor(ast.NodeVisitor):
 
     def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
         eff_len = len(self._scope_stack) - self._comprehension_depth
+        enclosing_frames = self._scope_stack[: -1 - self._comprehension_depth]
         for name in node.names:
-            if name not in self.nonlocals:
+            is_unit_bound = (
+                any(
+                    name in s and ":class_scope:" not in s
+                    for s in enclosing_frames
+                )
+                or name in self.stores
+                or name in self.params
+            )
+            if (eff_len <= 1 or not is_unit_bound) and name not in self.nonlocals:
                 self.nonlocals.append(name)
             if eff_len > 1:
                 self._scope_stack[-1 - self._comprehension_depth].add(
@@ -1590,7 +1599,9 @@ def _inspect_unit_scope(
                             has_enclosing_cls = True
                             prev_enclosed_cls_name = getattr(scope_node, "name", None)
                             enclosing_cls_locals.update(
-                                _extract_single_node_local_names(scope_node)
+                                _extract_single_node_local_names(
+                                    scope_node, include_globals=False
+                                )
                             )
                         else:
                             if isinstance(prev_enclosed_cls_name, str):
@@ -1643,7 +1654,9 @@ def _inspect_unit_scope(
                         ):
                             has_enclosing_fn = True
                             enclosing_fn_locals.update(
-                                _extract_single_node_local_names(scope_node)
+                                _extract_single_node_local_names(
+                                    scope_node, include_globals=False
+                                )
                             )
             if has_enclosing_fn and any(
                 fv in enclosing_fn_locals for fv in visitor.type_param_free_vars

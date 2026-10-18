@@ -369,7 +369,6 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
     # Built-in zero-dependency line parser fallback
     try:
         config: Dict[str, Any] = {}
-        in_section = False
         in_multiline_key: Optional[str] = None
         multiline_tokens: List[str] = []
         multiline_depth = 0
@@ -377,8 +376,8 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
         with open(target_path, "r", encoding="utf-8", errors="replace") as fh:
             lines = fh.readlines()
 
-        if not any(line.strip().startswith("[") for line in lines):
-            in_section = True
+        is_headerless = not any(line.strip().startswith("[") for line in lines)
+        in_section = is_headerless
 
         for line in lines:
             stripped = _strip_toml_inline_comment(line)
@@ -423,7 +422,7 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
                         config[k] = float(v) if "." in v else int(v)
                     except ValueError:
                         pass
-        if not any(line.strip().startswith("[") for line in lines):
+        if is_headerless:
             if any(k in config for k in _CONFIG_KEY_NAMES):
                 return config
             return {}

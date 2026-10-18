@@ -1463,9 +1463,9 @@ def _get_tree_scope_intervals(
 ) -> List[Tuple[int, int, int, ast.AST]]:
     """Builds and caches sorted intervals (earliest_start, n_end, span, node) on the tree."""
     cached = getattr(tree, "_scope_intervals", None)
-    if isinstance(cached, list) and (
-        getattr(tree, "_immutable_cached", False)
-        or getattr(tree, "_scope_intervals_sig", None)
+    if (
+        isinstance(cached, list)
+        and getattr(tree, "_scope_intervals_sig", None)
         == _compute_scope_intervals_sig(tree, cached)
     ):
         return cached

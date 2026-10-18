@@ -92,9 +92,12 @@ def _extract_comprehension_walrus_names(comp_node: ast.AST) -> Set[str]:
     return walrus_names
 
 
-def _extract_single_node_local_names(scope_node: ast.AST) -> Set[str]:
+def _extract_single_node_local_names(
+    scope_node: ast.AST, include_globals: bool = True
+) -> Set[str]:
     """Extracts parameters and locally assigned/imported/defined symbols in scope_node."""
     names: Set[str] = set()
+    global_names: Set[str] = set()
     node_name = getattr(scope_node, "name", None)
     if isinstance(node_name, str) and not isinstance(scope_node, ast.ClassDef):
         names.add(node_name)
@@ -145,7 +148,13 @@ def _extract_single_node_local_names(scope_node: ast.AST) -> Set[str]:
                 continue
             _record_import_names(curr, names)
             continue
-        elif isinstance(curr, (ast.Global, ast.Nonlocal)):
+        elif isinstance(curr, ast.Global):
+            if include_globals:
+                names.update(curr.names)
+            else:
+                global_names.update(curr.names)
+            continue
+        elif isinstance(curr, ast.Nonlocal):
             names.update(curr.names)
             continue
         elif type(curr).__name__ == "TypeAlias":
@@ -160,7 +169,7 @@ def _extract_single_node_local_names(scope_node: ast.AST) -> Set[str]:
 
         stack.extend(ast.iter_child_nodes(curr))
 
-    return names
+    return names - global_names
 
 
 def _extract_scope_local_names(

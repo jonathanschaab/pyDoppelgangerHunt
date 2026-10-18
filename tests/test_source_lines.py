@@ -1182,3 +1182,95 @@ def test_class_scope_headers_comprehensions_helper_symbols_and_global_depth() ->
     unclosed_single_fstr = 'msg = f"val: {x\ny = 1\n'
     assert _find_multiline_string_continuation_lines(unclosed_single_fstr) == set()
 
+
+def test_positional_meta2_internal_nonlocal_and_global_type_param_bounds() -> None:
+    """Verifies positional meta2 lookup, internal nonlocal scoping, enclosing global PEP 695 bounds, and multiline end_col."""
+    import sys  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=protected-access,import-outside-toplevel
+        _get_or_parse_tree,
+        _resolve_unit_ast_end_col,
+    )
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        inspect_single_unit_scope,
+    )
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=protected-access,import-outside-toplevel
+        _get_tree_scope_intervals,
+    )
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access,import-outside-toplevel
+        _format_helper_parameters,
+    )
+
+    # 1.1: Positional parameter metadata does not fall back to meta2[var] when inputs2[idx] != var
+    params = _format_helper_parameters(
+        inputs=["a", "b"],
+        meta1={"a": {"type": "int", "kind": "pos"}, "b": {"type": "int", "kind": "pos"}},
+        meta2={"a": {"type": "list[int]", "kind": "pos"}, "b": {"type": "int", "kind": "pos"}},
+        effective_binding="module",
+        is_static_clone=False,
+        is_class_receiver=False,
+        type_merge_strategy="union",
+        inputs2=["ext_val", "b"],
+        positional_target_map=True,
+    )
+    assert params == ["a: int", "b: int"]
+
+    # 1.2: Nested nonlocal referencing outer local in unit does not escape as unit nonlocal
+    fn_unit = {
+        "kind": "function",
+        "start": 1,
+        "end": 7,
+        "source_text": (
+            "def compute(a: int) -> int:\n"
+            "    acc = a\n"
+            "    def step(d: int) -> None:\n"
+            "        nonlocal acc\n"
+            "        acc += d\n"
+            "    step(5)\n"
+            "    return acc\n"
+        ),
+    }
+    fn_scope = inspect_single_unit_scope(fn_unit)
+    assert fn_scope["nonlocals"] == []
+    assert fn_scope["inputs"] == ["a"]
+
+    # 1.3: Enclosing function global declaration does not trigger PEP 695 type_param_closure_capture
+    if sys.version_info >= (3, 12):
+        tp_src = (
+            "BoundType = object\n"
+            "def outer():\n"
+            "    global BoundType\n"
+            "    BoundType = int\n"
+            "    def inner[T: BoundType](x: T) -> T:\n"
+            "        return x\n"
+            "    return inner\n"
+        )
+        tp_unit = {
+            "kind": "closure",
+            "start": 5,
+            "end": 6,
+            "source_text": tp_src,
+        }
+        tp_scope = inspect_single_unit_scope(tp_unit)
+        assert "type_param_closure_capture" not in tp_scope["control_flow_hazards"]
+
+    # 2.1 & 2.2: _get_tree_scope_intervals invalidation and multi-line statement _resolve_unit_ast_end_col
+    cached_tree = _get_or_parse_tree("def f1(): pass\ndef f2(): pass\n")
+    assert cached_tree is not None
+    intervals1 = _get_tree_scope_intervals(cached_tree)
+    orig_col = cached_tree.body[0].col_offset  # type: ignore[attr-defined]
+    try:
+        cached_tree.body[0].col_offset = 99  # type: ignore[attr-defined]
+        intervals2 = _get_tree_scope_intervals(cached_tree)
+        assert intervals2 is not intervals1
+    finally:
+        cached_tree.body[0].col_offset = orig_col  # type: ignore[attr-defined]
+
+    multi_stmt_tree = ast.parse("if True:\n    x = (\n        1 + 2\n    )\n")
+    assert (
+        _resolve_unit_ast_end_col(
+            multi_stmt_tree, {"start": 2, "end": 4, "start_col": 4}
+        )
+        == 5
+    )
+
+

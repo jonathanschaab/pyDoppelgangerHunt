@@ -297,8 +297,9 @@ def _resolve_unit_ast_end_col(
 
     inner_stmts.sort(key=lambda s: getattr(s, "col_offset", 0))
     start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
-    if start_col is not None and (
-        u_start < u_end or unit.get("kind") in ("comprehension", "complex_expr")
+    if start_col is not None and unit.get("kind") in (
+        "comprehension",
+        "complex_expr",
     ):
         return None
     if len(inner_stmts) == 1:

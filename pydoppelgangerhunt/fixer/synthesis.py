@@ -869,7 +869,7 @@ def _format_helper_parameters(
     for idx, var in enumerate(inputs):
         m1 = meta1.get(var, {})
         if use_positional_meta2 and inputs2 is not None:
-            m2 = meta2.get(inputs2[idx], {}) or meta2.get(var, {})
+            m2 = meta2.get(inputs2[idx], {})
         else:
             m2 = meta2.get(var, {})
             if not m2 and inputs2 and idx < len(inputs2):
