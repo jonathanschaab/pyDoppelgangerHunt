@@ -197,13 +197,16 @@ def is_subroutine_unit(
             src = "".join(u_lines)
     if isinstance(src, (list, tuple)):
         src = "".join(src)
-    if src and isinstance(src, str):
+    if (src and isinstance(src, str)) or tree is not None:
         try:
             u_start = _parse_unit_coord(unit, "start", default=0)
             u_end = _parse_unit_coord(unit, "end", default=u_start)
             if 0 < u_start <= u_end:
                 res = _find_innermost_enclosing_node(
-                    src, unit, (ast.FunctionDef, ast.AsyncFunctionDef), tree=tree
+                    src if isinstance(src, str) else "",
+                    unit,
+                    (ast.FunctionDef, ast.AsyncFunctionDef),
+                    tree=tree,
                 )
                 if res is not None:
                     matched_node, f_start, f_end = res
@@ -330,7 +333,7 @@ def _find_multiline_string_continuation_lines(
             elif _FSTRING_END_TOK is not None and tok.type == _FSTRING_END_TOK:
                 if fstring_start_lines:
                     start_line = fstring_start_lines.pop()
-                    if start_line < tok.end[0]:
+                    if start_line < tok.end[0] and tok.string in ('"""', "'''"):
                         cont_lines.update(range(start_line + 1, tok.end[0] + 1))
             elif tok.type in _MULTILINE_STR_TOKEN_TYPES and tok.start[0] < tok.end[0]:
                 cont_lines.update(range(tok.start[0] + 1, tok.end[0] + 1))

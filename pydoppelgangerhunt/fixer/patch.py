@@ -2117,8 +2117,16 @@ def _extract_helper_symbols(
             tp_names = self._visit_with_type_params(
                 node, list(node.bases) + list(node.keywords), record_def=True
             )
-            cls_scope = _collect_direct_bindings(node.body) | tp_names
-            self._enter_block_scope(cls_scope, node.body)
+            cls_bindings = _collect_direct_bindings(node.body)
+            if tp_names:
+                scope_stack.append(tp_names)
+            try:
+                self._enter_block_scope(
+                    {":class_scope:", *cls_bindings}, node.body
+                )
+            finally:
+                if tp_names:
+                    scope_stack.pop()
 
         def visit_TypeAlias(self, node: ast.AST) -> None:
             name_node = getattr(node, "name", None)
@@ -2132,7 +2140,7 @@ def _extract_helper_symbols(
             self, child_scope: Set[str], body: Sequence[ast.stmt]
         ) -> None:
             if len(scope_stack) == 1:
-                defined_names.update(child_scope)
+                defined_names.update(child_scope - {":class_scope:"})
             scope_stack.append(child_scope)
             for body_stmt in body:
                 self.visit(body_stmt)
@@ -2141,11 +2149,14 @@ def _extract_helper_symbols(
         def _handle_comprehension(
             self, elts: Sequence[ast.expr], generators: Sequence[ast.comprehension]
         ) -> None:
+            if generators:
+                self.visit(generators[0].iter)
             comp_scope: Set[str] = set()
             scope_stack.append(comp_scope)
             try:
                 for gen in generators:
-                    self.visit(gen.iter)
+                    if gen is not generators[0]:
+                        self.visit(gen.iter)
                     target_stack: List[ast.AST] = [gen.target]
                     while target_stack:
                         curr_t = target_stack.pop()
@@ -2203,7 +2214,11 @@ def _extract_helper_symbols(
 
         def visit_Name(self, node: ast.Name) -> None:
             if isinstance(node.ctx, ast.Load):
-                if not any(node.id in s for s in reversed(scope_stack)):
+                if not any(
+                    node.id in s
+                    for s in reversed(scope_stack)
+                    if ":class_scope:" not in s or s is scope_stack[-1]
+                ):
                     free_names.add(node.id)
 
     try:
@@ -3373,14 +3388,10 @@ def _generate_refactoring_patch_impl(
             hazards1 = set(s1.get("control_flow_hazards", []))
             hazards2 = set(s2.get("control_flow_hazards", []))
             if "pathological_ast" in hazards1 | hazards2:
-                skip_reasons["pathological ast"] = (
-                    skip_reasons.get("pathological ast", 0) + 1
-                )
+                skip_reasons["pathological ast"] += 1
                 continue
             if "type_param_closure_capture" in hazards1 | hazards2:
-                skip_reasons["type_param closure capture"] = (
-                    skip_reasons.get("type_param closure capture", 0) + 1
-                )
+                skip_reasons["type_param closure capture"] += 1
                 continue
             if any(h in ("naked_break", "naked_continue") for h in hazards1 | hazards2):
                 skip_reasons["naked break or continue"] += 1
@@ -3437,9 +3448,7 @@ def _generate_refactoring_patch_impl(
                 s1.get("has_class_scoped_type_params")
                 or s2.get("has_class_scoped_type_params")
             ) and (effective_binding != "method" or not is_same_class):
-                skip_reasons["type_param closure capture"] = (
-                    skip_reasons.get("type_param closure capture", 0) + 1
-                )
+                skip_reasons["type_param closure capture"] += 1
                 continue
 
             helper_indent = (
@@ -3492,7 +3501,7 @@ def _generate_refactoring_patch_impl(
             )
             if resolved_outs.outputs is None:
                 reason = resolved_outs.skip_reason or "unpaired outputs"
-                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                skip_reasons[reason] += 1
                 logger.debug(
                     "Skipping clone pair (%s, %s): failed to resolve clone pair outputs (%s)",
                     u1.get("name"),

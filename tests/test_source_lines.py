@@ -966,3 +966,175 @@ def test_pep695_typing_imports_class_scope_isolation_and_multiline_indent_error(
     assert _find_multiline_string_continuation_lines(unaligned) == {4, 5}
 
 
+def test_lhs_receiver_pruning_and_precomputed_scope_pruning() -> None:
+    """Verifies whole-line expression LHS receiver pruning and precomputed scope LHS pruning."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        generate_refactoring_patch,
+    )
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        analyze_unit_variable_scope,
+        inspect_single_unit_scope,
+    )
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access,import-outside-toplevel
+        _order_inputs_by_rhs_loads,
+        synthesize_shared_helper_code,
+    )
+
+    # 1.1: _order_inputs_by_rhs_loads only pins receivers to index 0 when accessed via attribute
+    rhs_tree = ast.parse("fn(self)").body[0].value  # type: ignore[attr-defined]
+    assert _order_inputs_by_rhs_loads(["fn", "self"], rhs_tree, ("self",)) == [
+        "fn",
+        "self",
+    ]
+    rhs_attr_tree = ast.parse("fn(self.x)").body[0].value  # type: ignore[attr-defined]
+    assert _order_inputs_by_rhs_loads(["fn", "self"], rhs_attr_tree, ("self",)) == [
+        "self",
+        "fn",
+    ]
+
+    # 1.1: Asymmetrical receiver binding after LHS pruning rejected in patch generation
+    src = (
+        "class Box:\n"
+        "    def m1(self, fn):\n"
+        "        self.res1 = [fn(self) for _ in range(3)]\n"
+        "    def m2(self, fn, other):\n"
+        "        self.res2 = [fn(other) for _ in range(3)]\n"
+    )
+    u1 = {
+        "kind": "comprehension",
+        "start": 3,
+        "end": 3,
+        "enclosing_class": "Box",
+        "receiver_param": "self",
+        "receiver_kind": "instance",
+        "source_text": src,
+    }
+    u2 = {
+        "kind": "comprehension",
+        "start": 5,
+        "end": 5,
+        "enclosing_class": "Box",
+        "receiver_param": "self",
+        "receiver_kind": "instance",
+        "source_text": src,
+    }
+    assert (
+        generate_refactoring_patch([(0.95, u1, u2)], method_binding="auto") == ""
+    )
+    assert (
+        generate_refactoring_patch([(0.95, u1, u2)], method_binding="method") == ""
+    )
+
+    # 2.3: Precomputed unpruned scopes passed directly to synthesize_shared_helper_code
+    comp_src1 = "def f1(d1, items):\n    d1[0] = [x * 2 for x in items]\n"
+    comp_src2 = "def f2(d2, items):\n    d2[0] = [x * 2 for x in items]\n"
+    cu1 = {
+        "kind": "comprehension",
+        "start": 2,
+        "end": 2,
+        "source_text": comp_src1,
+    }
+    cu2 = {
+        "kind": "comprehension",
+        "start": 2,
+        "end": 2,
+        "source_text": comp_src2,
+    }
+    s1 = inspect_single_unit_scope(cu1)
+    s2 = inspect_single_unit_scope(cu2)
+    merged = analyze_unit_variable_scope(cu1, cu2)
+    helper = synthesize_shared_helper_code(
+        cu1, cu2, scope1=s1, scope2=s2, scope=merged
+    )
+    assert "def _shared_helper(items: Any) -> Any:" in helper
+    assert "d1" not in helper and "d2" not in helper
+
+
+def test_class_scope_headers_comprehensions_helper_symbols_and_global_depth() -> None:
+    """Verifies class scope header defaults, comprehension iterators, helper symbol resolution, and nested globals."""
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=protected-access,import-outside-toplevel
+        _ClassScopeVisitor,
+    )
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=protected-access,import-outside-toplevel
+        _extract_helper_symbols,
+    )
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        inspect_single_unit_scope,
+    )
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=protected-access,import-outside-toplevel
+        _find_multiline_string_continuation_lines,
+        is_subroutine_unit,
+    )
+
+    # 1.2: Class attribute used in method default is not an escaping free read
+    cls_tree = ast.parse(
+        "class Counter:\n"
+        "    total = 0\n"
+        "    def reset(self, val=total):\n"
+        "        return val\n"
+    )
+    cls_vis = _ClassScopeVisitor()
+    cls_vis.visit(cls_tree.body[0])
+    assert "total" not in cls_vis.free_reads
+
+    # 1.3: Class body comprehension outermost iter sees class attributes
+    cls_comp_unit = {
+        "start": 1,
+        "end": 3,
+        "source_text": (
+            "class Config:\n"
+            "    ITEMS = [1, 2, 3]\n"
+            "    DOUBLED = [x * 2 for x in ITEMS]\n"
+        ),
+    }
+    comp_scope = inspect_single_unit_scope(cls_comp_unit)
+    assert "ITEMS" not in comp_scope["inputs"]
+
+    # 2.1: _extract_helper_symbols does not shadow method calls with class attributes
+    helper_code = (
+        "def _shared_fn():\n"
+        "    class Box:\n"
+        "        foo = 1\n"
+        "        bar = foo + 1\n"
+        "        def m(self):\n"
+        "            return foo()\n"
+        "    return Box()\n"
+    )
+    free_names, _, _ = _extract_helper_symbols(ast.parse(helper_code))
+    assert "foo" in free_names
+
+    # 2.2: Nested global declaration does not leak to outer unit or nested function
+    nested_global_unit = {
+        "start": 1,
+        "end": 4,
+        "source_text": (
+            "def inner():\n"
+            "    global x\n"
+            "    x = 1\n"
+            "x = 2\n"
+        ),
+    }
+    ng_scope = inspect_single_unit_scope(nested_global_unit)
+    assert "x" in ng_scope["outputs"]
+
+    outer_global_unit = {
+        "start": 1,
+        "end": 5,
+        "source_text": (
+            "global y\n"
+            "def inner():\n"
+            "    y = 2\n"
+            "    return y\n"
+            "z = inner()\n"
+        ),
+    }
+    og_scope = inspect_single_unit_scope(outer_global_unit)
+    assert "y" not in og_scope["inputs"]
+
+    # 2.4: is_subroutine_unit honors pre-parsed tree without source_text
+    parsed_fn = ast.parse("def f():\n    x = 1\n")
+    assert is_subroutine_unit({"start": 2, "end": 2}, tree=parsed_fn) is True
+
+    # 3.1: Single-line f-string with multi-line interpolation expression
+    fstr_src = 'msg = f"val: {\n    compute(x)\n}"\n'
+    assert _find_multiline_string_continuation_lines(fstr_src) == set()

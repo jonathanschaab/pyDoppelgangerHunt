@@ -317,19 +317,44 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
         if self._can_store_in_class_scope(name):
             self.class_stores.add(name)
 
+    def _visit_class_nested_scope(
+        self,
+        node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda],
+    ) -> None:
+        hdr_reads, hdr_nodes = _extract_nested_scope_free_reads_with_nodes(
+            node, include_header=True, include_body=False
+        )
+        seen_hdr: Set[str] = set()
+        for n in hdr_nodes:
+            self._record_class_load(n.id, n)
+            seen_hdr.add(n.id)
+        for r in hdr_reads - seen_hdr:
+            self._record_class_load(r)
+        if not isinstance(node, ast.Lambda):
+            self._record_class_store(node.name)
+        body_reads, body_nodes = _extract_nested_scope_free_reads_with_nodes(
+            node, include_header=False, include_body=True
+        )
+        self.free_reads.update(
+            r for r in body_reads if not self._is_in_comp(r) and r not in self.globals
+        )
+        self.load_nodes.extend(
+            n for n in body_nodes if not self._is_in_comp(n.id) and n.id not in self.globals
+        )
+
     def visit_FunctionDef(
         self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
     ) -> None:
-        self._visit_nested_named_scope(node, self.class_stores, self.free_reads)
+        self._visit_class_nested_scope(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self.visit_FunctionDef(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        self._visit_nested_named_scope(node, self.class_stores, self.free_reads)
+        self._visit_class_nested_scope(node)
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
-        self._visit_nested_lambda(node, self.free_reads)
+        self._visit_class_nested_scope(node)
 
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
         if node.name:

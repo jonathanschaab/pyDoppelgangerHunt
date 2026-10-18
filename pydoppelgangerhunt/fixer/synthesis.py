@@ -246,7 +246,7 @@ def _order_inputs_by_rhs_loads(
     rhs_node: ast.AST,
     receiver_names: Sequence[str] = ("self", "cls", "this", "klass"),
 ) -> List[str]:
-    """Orders input identifiers by their first free-load appearance in rhs_node, keeping receivers first."""
+    """Orders input identifiers by their first free-load appearance in rhs_node, keeping attribute receivers first."""
     try:
         rhs_visitor = _OuterExprVisitor()
         rhs_visitor.visit(rhs_node)
@@ -255,11 +255,25 @@ def _order_inputs_by_rhs_loads(
         ordered = []
     rhs_order = {name: idx for idx, name in enumerate(ordered)}
     fallback_base = len(rhs_order)
-    rec_set = set(receiver_names)
+    rec_tuple = tuple(receiver_names)
+    attr_receivers = (
+        {
+            unfolded.split(".", 1)[0]
+            for child in ast.walk(rhs_node)
+            if isinstance(child, ast.Attribute)
+            for unfolded in (
+                _unfold_receiver_attribute(child, receiver_names=rec_tuple),
+            )
+            if unfolded is not None
+        }
+        if rec_tuple
+        else set()
+    )
+    pinned_receivers = attr_receivers | (set(rec_tuple) - rhs_order.keys())
     indexed = list(enumerate(candidates))
     indexed.sort(
         key=lambda pair: (
-            0 if pair[1].lstrip("*") in rec_set else 1,
+            0 if pair[1].lstrip("*") in pinned_receivers else 1,
             rhs_order.get(pair[1].lstrip("*"), fallback_base + pair[0]),
             pair[0],
         )
@@ -377,9 +391,11 @@ def _prune_pair_lhs_and_augassign_scopes(
     lines1: Sequence[str],
     lines2: Sequence[str],
 ) -> bool:
-    """Prunes unreferenced LHS loads and AugAssign targets, returning False on arity mismatch."""
+    """Prunes unreferenced LHS loads and AugAssign targets, returning False on arity or receiver mismatch."""
     _prune_unreferenced_lhs_scope(u1, scope1, lines1)
     _prune_unreferenced_lhs_scope(u2, scope2, lines2)
+    scope1["_lhs_pruned"] = True
+    scope2["_lhs_pruned"] = True
     is_whole_expr1 = not _is_subline_unit(u1) and u1.get("kind") in (
         "comprehension",
         "complex_expr",
@@ -390,6 +406,13 @@ def _prune_pair_lhs_and_augassign_scopes(
     )
     if not (is_whole_expr1 or is_whole_expr2):
         return True
+    if (
+        bool(scope1.get("has_instance_binding"))
+        != bool(scope2.get("has_instance_binding"))
+        or bool(scope1.get("has_class_binding"))
+        != bool(scope2.get("has_class_binding"))
+    ):
+        return False
     return len(scope1.get("inputs", [])) == len(scope2.get("inputs", []))
 
 
@@ -1393,7 +1416,14 @@ def synthesize_shared_helper_code(
             u_item["is_async"] = True
         scopes.append(s_item)
     scope1, scope2 = scopes[0], scopes[1]
-    if has_precomputed_scopes and scope is not None:
+    if (
+        has_precomputed_scopes
+        and scope is not None
+        and (
+            not is_expr_unit
+            or (scope1.get("_lhs_pruned") and scope2.get("_lhs_pruned"))
+        )
+    ):
         if is_expr_unit and (outputs is None or outputs2 is None):
             u1.pop("outputs", None)
             u2.pop("outputs", None)

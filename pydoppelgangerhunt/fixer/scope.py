@@ -259,12 +259,17 @@ class _ScopeVisitor(ast.NodeVisitor):
             if eff_len <= 1
             else f"nonlocal:{name}" in self._scope_stack[-1 - comp_depth]
         )
+        is_active_global = (
+            name in self.globals
+            if eff_len <= 1
+            else f"global:{name}" in self._scope_stack[-1 - comp_depth]
+        )
         if eff_len <= 1 or is_active_nonlocal:
             self.deleted_names.discard(name)
         if is_active_nonlocal:
             if name not in BUILTIN_NAMES and name not in self.stores:
                 self.stores.append(name)
-        elif name in self.globals:
+        elif is_active_global:
             pass
         elif eff_len > 1:
             self._scope_stack[-1 - comp_depth].add(name)
@@ -593,6 +598,8 @@ class _ScopeVisitor(ast.NodeVisitor):
         self,
         node: Union[ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp],
     ) -> None:
+        if node.generators:
+            self.visit(node.generators[0].iter)
         self._comprehension_depth += 1
         created_outer = False
         if not self._scope_stack:
@@ -607,10 +614,10 @@ class _ScopeVisitor(ast.NodeVisitor):
             self.is_async = True
         try:
             for gen in node.generators:
-                self.visit(gen.iter)
-                self.visit(gen.target)
-                for if_expr in gen.ifs:
-                    self.visit(if_expr)
+                if gen is not node.generators[0]:
+                    self.visit(gen.iter)
+                for sub in (gen.target, *gen.ifs):
+                    self.visit(sub)
             if isinstance(node, ast.DictComp):
                 self.visit(node.key)
                 self.visit(node.value)
@@ -646,9 +653,15 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Global(self, node: ast.Global) -> None:
+        eff_len = len(self._scope_stack) - self._comprehension_depth
         for name in node.names:
-            if name not in self.globals:
-                self.globals.append(name)
+            if eff_len <= 1:
+                if name not in self.globals:
+                    self.globals.append(name)
+            else:
+                self._scope_stack[-1 - self._comprehension_depth].add(
+                    f"global:{name}"
+                )
         self.generic_visit(node)
 
     def _visit_loop(self, node: Union[ast.For, ast.AsyncFor, ast.While]) -> None:
