@@ -749,3 +749,47 @@ def test_scope_intervals_col_offset_sig_and_lru_shrink_and_decorated_pragma() ->
         "    return 1\n"
     )
     assert _unit_has_no_refactor_pragma({"start": 3, "end": 4}, None, orig_text=decorated_pragma_src) is True
+
+
+def test_comp_tuple_target_left_to_right_and_patch_receiver_kind(tmp_path: Any) -> None:
+    """Verifies left-to-right comprehension tuple target unpacking and receiver_kind in generate_refactoring_patch."""
+    from pydoppelgangerhunt.fixer._df_visitors import (  # pylint: disable=protected-access,import-outside-toplevel
+        _extract_unit_live_in_names,
+    )
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=import-outside-toplevel
+        generate_refactoring_patch,
+    )
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        inspect_single_unit_scope,
+    )
+
+    fn1_tree = ast.parse("def f(items, arr):\n    return [1 for (arr[x], x) in items]\n")
+    fn2_tree = ast.parse("def f(items, arr):\n    return [1 for (x, arr[x]) in items]\n")
+    assert "x" in _extract_unit_live_in_names(fn1_tree.body[0], 2, 2)
+    assert "x" not in _extract_unit_live_in_names(fn2_tree.body[0], 2, 2)
+
+    s_before = inspect_single_unit_scope({"start": 1, "end": 1, "source_text": "[1 for (arr[x], x) in items]\n"})
+    s_after = inspect_single_unit_scope({"start": 1, "end": 1, "source_text": "[1 for (x, arr[x]) in items]\n"})
+    assert "x" in s_before["inputs"]
+    assert "x" not in s_after["inputs"]
+
+    cls_src = (
+        "class Service:\n"
+        "    @classmethod\n"
+        "    def first(mcls, val: int) -> int:\n"
+        "        base = mcls.DEFAULT_BASE + val\n"
+        "        scaled = base * 2\n"
+        "        return scaled + 1\n"
+        "\n"
+        "    @classmethod\n"
+        "    def second(mcls, val: int) -> int:\n"
+        "        base = mcls.DEFAULT_BASE + val\n"
+        "        scaled = base * 2\n"
+        "        return scaled + 1\n"
+    )
+    f_path = tmp_path / "svc.py"
+    f_path.write_text(cls_src, encoding="utf-8")
+    u1 = {"file": "svc.py", "start": 3, "end": 6, "name": "Service.first", "kind": "method"}
+    u2 = {"file": "svc.py", "start": 9, "end": 12, "name": "Service.second", "kind": "method"}
+    patch_text = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path))
+    assert "@classmethod" in patch_text

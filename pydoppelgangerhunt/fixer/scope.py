@@ -22,10 +22,7 @@ from typing import (
 from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
 from pydoppelgangerhunt.fixer._df_closures import _extract_single_node_local_names
 from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
-from pydoppelgangerhunt.fixer._df_visitors import (
-    _OuterExprVisitor,
-    _extract_assigned_names,
-)
+from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.fixer.source import (
     _SUBROUTINE_KINDS,
@@ -593,7 +590,6 @@ class _ScopeVisitor(ast.NodeVisitor):
         try:
             for gen in node.generators:
                 self.visit(gen.iter)
-                inner_vars.update(_extract_assigned_names(gen.target))
                 self.visit(gen.target)
                 for if_expr in gen.ifs:
                     self.visit(if_expr)
@@ -1203,12 +1199,14 @@ def _analyze_block_assignment(
                 pattern = getattr(case, "pattern", None)
                 if pattern is not None:
                     for p_node in ast.walk(pattern):
-                        p_name = getattr(p_node, "name", None)
-                        if p_name and isinstance(p_name, str):
-                            pattern_stores.add(p_name)
-                        p_rest = getattr(p_node, "rest", None)
-                        if p_rest and isinstance(p_rest, str):
-                            pattern_stores.add(p_rest)
+                        if type(p_node).__name__ in ("MatchAs", "MatchStar"):
+                            p_name = getattr(p_node, "name", None)
+                            if p_name and isinstance(p_name, str):
+                                pattern_stores.add(p_name)
+                        elif type(p_node).__name__ == "MatchMapping":
+                            p_rest = getattr(p_node, "rest", None)
+                            if p_rest and isinstance(p_rest, str):
+                                pattern_stores.add(p_rest)
                 guard = getattr(case, "guard", None)
                 d_g: Set[str] = set()
                 c_g: Set[str] = set()

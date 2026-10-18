@@ -112,6 +112,17 @@ class _BaseScopeVisitor(ast.NodeVisitor):
                 self.visit(stmt)
         restore_state(base_state)
 
+    def _visit_comp_target(self, target: ast.AST, comp_set: Set[str]) -> None:
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                self._visit_comp_target(elt, comp_set)
+        elif isinstance(target, ast.Starred):
+            self._visit_comp_target(target.value, comp_set)
+        else:
+            if isinstance(target, ast.Name):
+                comp_set.add(target.id)
+            self.visit(target)
+
     def _visit_comprehension(
         self,
         node: Union[ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp],
@@ -128,8 +139,7 @@ class _BaseScopeVisitor(ast.NodeVisitor):
             for idx, gen in enumerate(node.generators):
                 if idx > 0:
                     self.visit(gen.iter)
-                comp_set.update(_extract_assigned_names(gen.target))
-                self.visit(gen.target)
+                self._visit_comp_target(gen.target, comp_set)
                 for if_expr in gen.ifs:
                     self.visit(if_expr)
             if isinstance(node, ast.DictComp):

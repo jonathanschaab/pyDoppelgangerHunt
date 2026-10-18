@@ -3276,6 +3276,10 @@ def _generate_refactoring_patch_impl(
                 u1_eff["receiver_param"] = fn1.get("receiver_param")
             if fn2 and "receiver_param" not in u2_eff:
                 u2_eff["receiver_param"] = fn2.get("receiver_param")
+            if fn1_kind != "none" and "receiver_kind" not in u1_eff:
+                u1_eff["receiver_kind"] = fn1_kind
+            if fn2_kind != "none" and "receiver_kind" not in u2_eff:
+                u2_eff["receiver_kind"] = fn2_kind
             if fn1 and fn2:
                 is_static = bool(fn1.get("is_static") and fn2.get("is_static"))
             else:
