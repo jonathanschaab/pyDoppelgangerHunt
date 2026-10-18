@@ -1412,6 +1412,7 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
 ) -> None:
     """Verify multi-line start_col end_col resolution, class walrus scope, and config top validation."""
     import ast
+    import sys
     from pydoppelgangerhunt.cli import main as cli_main
     from pydoppelgangerhunt.config import load_tool_config
     from pydoppelgangerhunt.fixer._df_cache import _resolve_unit_ast_end_col
@@ -1444,16 +1445,37 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     assert "vals" in fn_locals
     assert "w" in fn_locals
 
-    # 3. 'top' in _CONFIG_KEY_NAMES and validated in main() when loaded from config
+    # 3. 'top' in _CONFIG_KEY_NAMES and validated in main() when loaded from config (including float rejection)
     cfg_file = tmp_path / "custom.toml"
     cfg_file.write_text("top = 5\n", encoding="utf-8")
     loaded = load_tool_config(config_path=str(cfg_file))
     assert loaded.get("top") == 5
 
-    bad_cfg = tmp_path / "bad_top.toml"
-    bad_cfg.write_text("[tool.pydoppelgangerhunt]\ntop = 0\n", encoding="utf-8")
-    with pytest.raises(SystemExit):
-        cli_main([str(tmp_path), "--config", str(bad_cfg)])
+    for invalid_top in ("0", "2.5"):
+        bad_cfg = tmp_path / "bad_top.toml"
+        bad_cfg.write_text(
+            f"[tool.pydoppelgangerhunt]\ntop = {invalid_top}\n", encoding="utf-8"
+        )
+        with pytest.raises(SystemExit):
+            cli_main([str(tmp_path), "--config", str(bad_cfg)])
 
+    # 4. Class-scoped annotations on PEP 695 generic methods in _extract_helper_symbols
+    if sys.version_info >= (3, 12):
+        from pydoppelgangerhunt.fixer.patch import _extract_helper_symbols
 
+        generic_cls_code = (
+            "class _Helper:\n"
+            "    Attr = int\n"
+            "    def m[T: Attr](self, x: Attr) -> T:\n"
+            "        return x\n"
+        )
+        free_syms, _, _ = _extract_helper_symbols(ast.parse(generic_cls_code))
+        assert "Attr" not in free_syms
+        assert "T" not in free_syms
 
+    # 5. _OuterExprVisitor.visit_NamedExpr visits value without recording store target
+    from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor
+
+    outer_vis = _OuterExprVisitor()
+    outer_vis.visit(ast.parse("(w := val + 1)", mode="eval"))
+    assert outer_vis.ordered_names == ["val"]

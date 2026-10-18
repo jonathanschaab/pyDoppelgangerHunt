@@ -462,6 +462,9 @@ class _OuterExprVisitor(_BaseScopeVisitor):
             self._record_name(node.id)
             self.load_nodes.append(node)
 
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.visit(node.value)
+
     def visit_FunctionDef(
         self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef]
     ) -> None:

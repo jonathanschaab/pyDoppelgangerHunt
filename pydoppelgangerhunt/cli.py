@@ -1088,7 +1088,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             tool_cfg = load_tool_config()
     if args.top is None and tool_cfg.get("top") is not None:
         raw_top = tool_cfg["top"]
-        if isinstance(raw_top, bool):
+        if isinstance(raw_top, (bool, float)):
             parser.error("--top must be a positive integer (> 0)")
         try:
             args.top = int(raw_top)

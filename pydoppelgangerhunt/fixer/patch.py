@@ -1994,6 +1994,7 @@ def _extract_helper_symbols(
     defined_names: Set[str] = set()
     local_imported_names: Set[str] = set()
     scope_stack: List[Set[str]] = [set()]
+    type_param_scopes: List[Set[str]] = []
 
     def _collect_direct_bindings(stmts: Sequence[ast.stmt]) -> Set[str]:
         bound: Set[str] = set()
@@ -2083,13 +2084,13 @@ def _extract_helper_symbols(
                 tp.name for tp in tp_list if isinstance(getattr(tp, "name", None), str)
             }
             if tp_names:
-                scope_stack.append(tp_names)
+                type_param_scopes.append(tp_names)
             try:
                 for sub in list(tp_list) + [n for n in inner_nodes if n is not None]:
                     self.visit(sub)
             finally:
                 if tp_names:
-                    scope_stack.pop()
+                    type_param_scopes.pop()
             if record_def:
                 name_str = getattr(node, "name", "")
                 scope_stack[-1].add(name_str)
@@ -2126,14 +2127,14 @@ def _extract_helper_symbols(
             )
             cls_bindings = _collect_direct_bindings(node.body)
             if tp_names:
-                scope_stack.append(tp_names)
+                type_param_scopes.append(tp_names)
             try:
                 self._enter_block_scope(
                     {":class_scope:", *cls_bindings}, node.body
                 )
             finally:
                 if tp_names:
-                    scope_stack.pop()
+                    type_param_scopes.pop()
 
         def visit_TypeAlias(self, node: ast.AST) -> None:
             name_node = getattr(node, "name", None)
@@ -2221,7 +2222,7 @@ def _extract_helper_symbols(
 
         def visit_Name(self, node: ast.Name) -> None:
             if isinstance(node.ctx, ast.Load):
-                if not any(
+                if not any(node.id in tp for tp in type_param_scopes) and not any(
                     node.id in s
                     for s in reversed(scope_stack)
                     if ":class_scope:" not in s or s is scope_stack[-1]
