@@ -28,6 +28,10 @@ from pydoppelgangerhunt.fixer.binding import (
     find_enclosing_function,
 )
 from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
+from pydoppelgangerhunt.fixer._df_closures import (
+    _extract_comprehension_walrus_names,
+    iter_nested_scope_header_nodes,
+)
 from pydoppelgangerhunt.fixer._df_visitors import _extract_assigned_names
 from pydoppelgangerhunt.fixer.dataflow import (
     has_async_generator_delegation_hazard,
@@ -67,7 +71,6 @@ from pydoppelgangerhunt.fixer.source import (
     _slice_unit_token_lines,
     _validate_and_parse_unit_bound,
     compute_line_offsets,
-    compute_unit_replacement_span,
     count_physical_newlines,
     detect_line_ending,
     extract_unit_comments_and_pragmas,
@@ -888,17 +891,22 @@ def _build_unit_delegation_call(
             rep_call = f"{indent}{assign_prefix}{await_prefix}{call_expr}\n"
             if not preserve_boundary_pragmas:
                 return rep_call
-            try:
-                _, _, final_rep = compute_unit_replacement_span(
+            attached_pragmas = [
+                c["text"].strip()
+                for c in extract_unit_comments_and_pragmas(
                     orig_text,
-                    target_unit,
-                    rep_call,
-                    preserve_boundary_pragmas=True,
-                    lines=orig_lines,
+                    start_line=u_start,
+                    end_line=u_end,
+                    include_leading=False,
                 )
-                return final_rep
-            except (ValueError, TypeError, KeyError):
-                return rep_call
+                if c["is_pragma"] and c["line"] in (u_start, u_end)
+            ]
+            dedup_pragmas = list(
+                dict.fromkeys(p for p in attached_pragmas if p not in rep_call)
+            )
+            if dedup_pragmas:
+                return f"{rep_call.rstrip('\r\n')}  {'  '.join(dedup_pragmas)}\n"
+            return rep_call
         return f"{await_prefix}{call_expr}"
 
     call_expr = f"{unit_call_prefix}{helper_name}({unit_args_str})"
@@ -2000,10 +2008,19 @@ def _extract_helper_symbols(
         bound: Set[str] = set()
 
         def _collect_helper_named_exprs(curr: ast.AST) -> None:
-            if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-                return
             for child in ast.iter_child_nodes(curr):
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                if isinstance(
+                    child,
+                    (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+                ):
+                    for hdr in iter_nested_scope_header_nodes(child):
+                        _collect_helper_named_exprs(hdr)
+                    continue
+                if isinstance(
+                    child,
+                    (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+                ):
+                    bound.update(_extract_comprehension_walrus_names(child))
                     continue
                 if type(child).__name__ == "NamedExpr":
                     target_node = getattr(child, "target", None)
@@ -2014,6 +2031,8 @@ def _extract_helper_symbols(
         for stmt in stmts:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 bound.add(stmt.name)
+                for hdr in iter_nested_scope_header_nodes(stmt):
+                    _collect_helper_named_exprs(hdr)
             elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
                 for alias in stmt.names:
                     bound.add(alias.asname or alias.name.split(".", 1)[0])
@@ -2062,6 +2081,33 @@ def _extract_helper_symbols(
 
     class _ScopeVisitor(ast.NodeVisitor):
 
+        def _bind_names(
+            self, names: Union[Set[str], Sequence[str]], *, is_walrus: bool = False
+        ) -> None:
+            if is_walrus:
+                for frame in reversed(scope_stack):
+                    if ":comp_scope:" not in frame:
+                        if not (
+                            ":class_scope:" in frame
+                            and ":comp_scope:" in scope_stack[-1]
+                        ):
+                            frame.update(names)
+                            if frame is scope_stack[0]:
+                                defined_names.update(names)
+                        break
+                return
+            scope_stack[-1].update(names)
+            if len(scope_stack) == 1:
+                defined_names.update(names)
+
+        def _check_load_name(self, name: str) -> None:
+            if not any(name in tp for tp in type_param_scopes) and not any(
+                name in s
+                for s in reversed(scope_stack)
+                if ":class_scope:" not in s or s is scope_stack[-1]
+            ):
+                free_names.add(name)
+
         def _visit_with_type_params(
             self,
             node: ast.AST,
@@ -2093,9 +2139,7 @@ def _extract_helper_symbols(
                     type_param_scopes.pop()
             if record_def:
                 name_str = getattr(node, "name", "")
-                scope_stack[-1].add(name_str)
-                if len(scope_stack) == 1:
-                    defined_names.add(name_str)
+                self._bind_names({name_str})
             return tp_names
 
         def _handle_function_def(
@@ -2125,13 +2169,10 @@ def _extract_helper_symbols(
             tp_names = self._visit_with_type_params(
                 node, list(node.bases) + list(node.keywords), record_def=True
             )
-            cls_bindings = _collect_direct_bindings(node.body)
             if tp_names:
                 type_param_scopes.append(tp_names)
             try:
-                self._enter_block_scope(
-                    {":class_scope:", *cls_bindings}, node.body
-                )
+                self._enter_block_scope({":class_scope:"}, node.body)
             finally:
                 if tp_names:
                     type_param_scopes.pop()
@@ -2139,27 +2180,84 @@ def _extract_helper_symbols(
         def visit_TypeAlias(self, node: ast.AST) -> None:
             name_node = getattr(node, "name", None)
             if isinstance(name_node, ast.Name):
-                scope_stack[-1].add(name_node.id)
-                if len(scope_stack) == 1:
-                    defined_names.add(name_node.id)
+                self._bind_names({name_node.id})
             self._visit_with_type_params(node, [getattr(node, "value", None)])
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            self.visit(node.value)
+            for t in node.targets:
+                self.visit(t)
+                self._bind_names(_extract_assigned_names(t))
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            self.visit(node.annotation)
+            if node.value is not None:
+                self.visit(node.value)
+            self.visit(node.target)
+            self._bind_names(_extract_assigned_names(node.target))
+
+        def visit_AugAssign(self, node: ast.AugAssign) -> None:
+            if isinstance(node.target, ast.Name):
+                self._check_load_name(node.target.id)
+            self.visit(node.target)
+            self.visit(node.value)
+            self._bind_names(_extract_assigned_names(node.target))
+
+        def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+            self.visit(node.value)
+            self.visit(node.target)
+            if isinstance(node.target, ast.Name):
+                self._bind_names({node.target.id}, is_walrus=True)
+
+        def visit_For(self, node: Union[ast.For, ast.AsyncFor]) -> None:
+            self.visit(node.iter)
+            self.visit(node.target)
+            self._bind_names(_extract_assigned_names(node.target))
+            for s in list(node.body) + list(node.orelse):
+                self.visit(s)
+
+        def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+            self.visit_For(node)
+
+        def visit_With(self, node: Union[ast.With, ast.AsyncWith]) -> None:
+            for item in node.items:
+                self.visit(item.context_expr)
+                if item.optional_vars is not None:
+                    self.visit(item.optional_vars)
+                    self._bind_names(_extract_assigned_names(item.optional_vars))
+            for s in node.body:
+                self.visit(s)
+
+        def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+            self.visit_With(node)
+
+        def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+            if node.type is not None:
+                self.visit(node.type)
+            if isinstance(node.name, str):
+                self._bind_names({node.name})
+            for s in node.body:
+                self.visit(s)
 
         def _enter_block_scope(
             self, child_scope: Set[str], body: Sequence[ast.stmt]
         ) -> None:
-            if len(scope_stack) == 1:
-                defined_names.update(child_scope - {":class_scope:"})
+            is_top_block = len(scope_stack) == 1
             scope_stack.append(child_scope)
-            for body_stmt in body:
-                self.visit(body_stmt)
-            scope_stack.pop()
+            try:
+                for body_stmt in body:
+                    self.visit(body_stmt)
+            finally:
+                scope_stack.pop()
+            if is_top_block:
+                defined_names.update(child_scope - {":class_scope:", ":comp_scope:"})
 
         def _handle_comprehension(
             self, elts: Sequence[ast.expr], generators: Sequence[ast.comprehension]
         ) -> None:
             if generators:
                 self.visit(generators[0].iter)
-            comp_scope: Set[str] = set()
+            comp_scope: Set[str] = {":comp_scope:"}
             scope_stack.append(comp_scope)
             try:
                 for gen in generators:
@@ -2207,27 +2305,23 @@ def _extract_helper_symbols(
             finally:
                 scope_stack.pop()
 
-
         def visit_Import(self, node: ast.Import) -> None:
-            if len(scope_stack) <= max_helper_scope_depth:
-                for alias in node.names:
-                    name = alias.asname or alias.name.split(".", 1)[0]
+            for alias in node.names:
+                name = alias.asname or alias.name.split(".", 1)[0]
+                self._bind_names({name})
+                if len(scope_stack) <= max_helper_scope_depth:
                     local_imported_names.add(name)
 
         def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-            if len(scope_stack) <= max_helper_scope_depth:
-                for alias in node.names:
-                    name = alias.asname or alias.name
+            for alias in node.names:
+                name = alias.asname or alias.name
+                self._bind_names({name})
+                if len(scope_stack) <= max_helper_scope_depth:
                     local_imported_names.add(name)
 
         def visit_Name(self, node: ast.Name) -> None:
             if isinstance(node.ctx, ast.Load):
-                if not any(node.id in tp for tp in type_param_scopes) and not any(
-                    node.id in s
-                    for s in reversed(scope_stack)
-                    if ":class_scope:" not in s or s is scope_stack[-1]
-                ):
-                    free_names.add(node.id)
+                self._check_load_name(node.id)
 
     try:
         _ScopeVisitor().visit(helper_tree)

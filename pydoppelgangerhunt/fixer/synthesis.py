@@ -1248,6 +1248,16 @@ def _extract_probe_active_idents(probe_src: str, return_type: str) -> Set[str]:
         )
         if isinstance(ann, ast.AST)
     ]
+    for n in all_nodes:
+        if isinstance(n, ast.Call) and n.args:
+            func = n.func
+            func_name = (
+                func.id
+                if isinstance(func, ast.Name)
+                else (func.attr if isinstance(func, ast.Attribute) else "")
+            )
+            if func_name == "cast":
+                ann_roots.append(n.args[0])
     str_ann_text = "\n".join(
         sub.value
         for root in ann_roots

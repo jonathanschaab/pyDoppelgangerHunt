@@ -735,6 +735,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         )
         self.loaded: Set[str] = set()
         self.killed: Set[str] = set()
+        self._nonclass_killed: Optional[Set[str]] = None
         self.unit_entry_killed: Optional[Set[str]] = None
         self.has_dynamic_read: bool = False
         self.is_module_scope = is_module_scope
@@ -804,8 +805,15 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
                     if not self._is_in_comp(name):
                         self.killed.add(name)
 
-    def _record_downstream_read(self, name: str) -> None:
-        if self._is_in_comp(name) or name in self.killed:
+    def _record_downstream_read(
+        self, name: str, *, ignore_class_kills: bool = False
+    ) -> None:
+        active_killed = (
+            self._nonclass_killed
+            if ignore_class_kills and self._nonclass_killed is not None
+            else self.killed
+        )
+        if self._is_in_comp(name) or name in active_killed:
             return
         if self.candidates is None or name in self.candidates:
             self.loaded.add(name)
@@ -815,9 +823,27 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef],
     ) -> None:
         if self._should_inspect_read(node):
-            free_reads = _extract_nested_scope_free_reads(node, candidates=self.candidates)
-            for name in free_reads:
-                self._record_downstream_read(name)
+            if self._nonclass_killed is not None:
+                for name in _extract_nested_scope_free_reads(
+                    node,
+                    candidates=self.candidates,
+                    include_header=True,
+                    include_body=False,
+                ):
+                    self._record_downstream_read(name)
+                for name in _extract_nested_scope_free_reads(
+                    node,
+                    candidates=self.candidates,
+                    include_header=False,
+                    include_body=True,
+                ):
+                    self._record_downstream_read(name, ignore_class_kills=True)
+            else:
+                free_reads = _extract_nested_scope_free_reads(
+                    node, candidates=self.candidates
+                )
+                for name in free_reads:
+                    self._record_downstream_read(name)
             name_attr = getattr(node, "name", None)
             lineno = getattr(node, "lineno", None)
             if (
@@ -834,8 +860,24 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         n_start = getattr(node, "lineno", 0)
         n_end = getattr(node, "end_lineno", None) or n_start
         if n_start <= self.u_end <= n_end and not self._is_node_after_unit(node):
-            for stmt in node.body:
-                self.visit(stmt)
+            for dec in node.decorator_list:
+                self.visit(dec)
+            for tp in getattr(node, "type_params", []):
+                self.visit(tp)
+            for base in node.bases:
+                self.visit(base)
+            for kw in node.keywords:
+                self.visit(kw)
+            prev_nonclass = self._nonclass_killed
+            killed_before_class = set(self.killed)
+            if self._nonclass_killed is None:
+                self._nonclass_killed = set(killed_before_class)
+            try:
+                for stmt in node.body:
+                    self.visit(stmt)
+            finally:
+                self._nonclass_killed = prev_nonclass
+                self.killed = killed_before_class
             return
         self.visit_FunctionDef(node)
 

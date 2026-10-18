@@ -1479,3 +1479,88 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     outer_vis = _OuterExprVisitor()
     outer_vis.visit(ast.parse("(w := val + 1)", mode="eval"))
     assert outer_vis.ordered_names == ["val"]
+
+    # 6. Finding 1: Incremental class scope binding & comprehension walrus in _extract_helper_symbols
+    from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
+    from pydoppelgangerhunt.fixer.patch import (
+        _build_unit_delegation_call,
+        _extract_helper_symbols,
+    )
+
+    cls_shadow_code = (
+        "class _H:\n"
+        "    x = outer_sym\n"
+        "    outer_sym = 1\n"
+        "    @deco\n"
+        "    def deco(self, a: outer_sym) -> None:\n"
+        "        pass\n"
+    )
+    free_cls, def_cls, _ = _extract_helper_symbols(ast.parse(cls_shadow_code))
+    assert "outer_sym" in free_cls
+    assert "deco" in free_cls
+    assert {"x", "outer_sym", "deco"} <= def_cls
+
+    comp_walrus_code = (
+        "def _h(items):\n"
+        "    vals = [w := v + 1 for v in items]\n"
+        "    return w, vals\n"
+    )
+    free_cw, _, _ = _extract_helper_symbols(ast.parse(comp_walrus_code))
+    assert "w" not in free_cw
+
+    # 7. Finding 2: _DownstreamReadVisitor isolates class-attribute kills from method reads
+    cls_downstream_src = (
+        "def outer():\n"
+        "    x = 1\n"
+        "    class C:\n"
+        "        a = x + 1\n"
+        "        x = 99\n"
+        "        def m(self):\n"
+        "            return x\n"
+        "    return C\n"
+    )
+    ds_reads = collect_downstream_read_names(
+        cls_downstream_src, {"kind": "compound_block", "start": 4, "end": 4}, {"x", "a"}
+    )
+    assert ds_reads is not None and "x" in ds_reads
+
+    # 8. Finding 3: _extract_probe_active_idents retains cast("T", ...) type parameter
+    from pydoppelgangerhunt.fixer.synthesis import _extract_probe_active_idents
+
+    cast_idents = _extract_probe_active_idents(
+        'def _probe(x: Any) -> Any:\n    return typing.cast("T", x)\n', "Any"
+    )
+    assert "T" in cast_idents
+
+    # 9. Finding 4: _build_unit_delegation_call on whole-line expr preserves inline pragma without duplicating leading comments
+    expr_src = "# leading note\nres = [x + 1 for x in items]  # type: ignore\n"
+    expr_call = _build_unit_delegation_call(
+        {"kind": "comprehension", "start": 2, "end": 2},
+        expr_src,
+        expr_src.splitlines(keepends=True),
+        effective_binding="module",
+        helper_name="_shared_comp",
+        inputs=["items"],
+        outputs=[],
+        scope={"param_details": []},
+        preserve_boundary_pragmas=True,
+    )
+    assert expr_call == "res = _shared_comp(items)  # type: ignore\n"
+
+    # 10. Finding 5: Class-body comprehension walrus target does not mask subsequent class-body loads in _ScopeVisitor
+    from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope
+
+    cls_unit_src = (
+        "class Box:\n"
+        "    vals = [w := v for v in items]\n"
+        "    after = w\n"
+    )
+    box_file = tmp_path / "box.py"
+    box_file.write_text(cls_unit_src, encoding="utf-8")
+    cls_scope = inspect_single_unit_scope(
+        {"kind": "class", "start": 1, "end": 3, "file": str(box_file)},
+        repo_root=str(tmp_path),
+        tree=ast.parse(cls_unit_src),
+    )
+    assert "w" in cls_scope["inputs"]
+

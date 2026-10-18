@@ -280,8 +280,12 @@ class _ScopeVisitor(ast.NodeVisitor):
         elif is_active_global:
             pass
         elif eff_len > 1:
-            if f"nonlocal:{name}" not in self._scope_stack[-1 - comp_depth]:
-                self._scope_stack[-1 - comp_depth].add(name)
+            target_frame = self._scope_stack[-1 - comp_depth]
+            if (
+                f"nonlocal:{name}" not in target_frame
+                and not (comp_depth > 0 and ":class_scope:" in target_frame)
+            ):
+                target_frame.add(name)
         elif name not in BUILTIN_NAMES and name not in self.stores:
             self.stores.append(name)
 
