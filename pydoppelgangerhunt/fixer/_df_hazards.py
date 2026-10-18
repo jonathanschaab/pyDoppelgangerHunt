@@ -29,7 +29,10 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _store_lru_cache_entry,
     _warned_lenient_closure,
 )
-from pydoppelgangerhunt.fixer._df_closures import _collect_pre_unit_closures
+from pydoppelgangerhunt.fixer._df_closures import (
+    _collect_pre_unit_closures,
+    _extract_single_node_local_names,
+)
 from pydoppelgangerhunt.fixer._df_visitors import (
     _DownstreamReadVisitor,
     _StrictPostLineVisitor,
@@ -201,6 +204,9 @@ def _execute_read_pass(
         is_module_scope=is_module,
         u_start_col=u_start_col,
     )
+    visitor.outer_bound.update(
+        _extract_single_node_local_names(scope_node, include_self_name=False)
+    )
     for stmt in _extract_scope_stmts(scope_node):
         visitor.visit(stmt)
     return set(visitor.loaded)
@@ -243,6 +249,9 @@ def _scope_reads_outputs_after_line(
             enclosing_loops=enclosing_loops,
             pass_mode=_VisitorPassMode.LOOP_CARRIED,
             is_module_scope=is_module,
+        )
+        loop_visitor.outer_bound.update(
+            _extract_single_node_local_names(scope_node, include_self_name=False)
         )
         for stmt in _extract_scope_stmts(scope_node):
             loop_visitor.visit(stmt)

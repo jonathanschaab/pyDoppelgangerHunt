@@ -736,6 +736,7 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self.loaded: Set[str] = set()
         self.killed: Set[str] = set()
         self._nonclass_killed: Optional[Set[str]] = None
+        self.outer_bound: Set[str] = set()
         self.unit_entry_killed: Optional[Set[str]] = None
         self.has_dynamic_read: bool = False
         self.is_module_scope = is_module_scope
@@ -797,20 +798,26 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
 
     def _record_killed_targets(self, targets: Iterable[ast.AST]) -> None:
         for t in targets:
+            extracted = _extract_assigned_names(t)
+            if self._nonclass_killed is None:
+                self.outer_bound.update(extracted)
             if self._should_inspect_read(t):
                 lineno = getattr(t, "lineno", None)
                 if lineno == self.u_end and self.u_end_col is None:
                     continue
-                for name in _extract_assigned_names(t):
+                for name in extracted:
                     if not self._is_in_comp(name):
                         self.killed.add(name)
 
     def _record_downstream_read(
         self, name: str, *, ignore_class_kills: bool = False
     ) -> None:
+        bypass_class_kills = ignore_class_kills or (
+            self._in_comp_body > 0 and name in self.outer_bound
+        )
         active_killed = (
             self._nonclass_killed
-            if ignore_class_kills and self._nonclass_killed is not None
+            if bypass_class_kills and self._nonclass_killed is not None
             else self.killed
         )
         if self._is_in_comp(name) or name in active_killed:

@@ -365,7 +365,15 @@ class _ScopeVisitor(ast.NodeVisitor):
                 if not self._scope_stack:
                     self._scope_stack.append(set())
                     created_outer = True
-                self._scope_stack.append(self._extract_arg_names(node.args) | tp_names)
+                nested_locals = _extract_single_node_local_names(
+                    node,
+                    include_globals=False,
+                    include_nonlocals=False,
+                    include_self_name=False,
+                )
+                self._scope_stack.append(
+                    self._extract_arg_names(node.args) | tp_names | nested_locals
+                )
             try:
                 for stmt in node.body:
                     self.visit(stmt)

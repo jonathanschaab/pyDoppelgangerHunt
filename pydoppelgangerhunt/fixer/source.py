@@ -362,7 +362,7 @@ def _find_multiline_string_continuation_lines(
                 if (
                     isinstance(exc, tokenize.TokenError)
                     and len(exc.args) >= 2
-                    and "string" in str(exc.args[0]).lower()
+                    and "multi-line string" in str(exc.args[0]).lower()
                     and isinstance(exc.args[1], tuple)
                     and len(exc.args[1]) >= 1
                     and isinstance(exc.args[1][0], int)

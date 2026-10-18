@@ -1564,3 +1564,71 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     )
     assert "w" in cls_scope["inputs"]
 
+    # 11. Class-body comprehension reads outer local after same-named class attribute store
+    cls_comp_src = (
+        "def outer():\n"
+        "    x = 1\n"
+        "    class C:\n"
+        "        a = x + 1\n"
+        "        x = 99\n"
+        "        vals = [x for _ in range(1)]\n"
+        "    return C\n"
+    )
+    ds_comp_reads = collect_downstream_read_names(
+        cls_comp_src, {"kind": "compound_block", "start": 4, "end": 4}, {"x", "a"}
+    )
+    assert ds_comp_reads is not None and "x" in ds_comp_reads
+
+    # 12. Nested nonlocal declared before assignment in intermediate nested function
+    nested_nl_src = (
+        "def f1():\n"
+        "    def inner():\n"
+        "        def deep():\n"
+        "            nonlocal x\n"
+        "            x = 2\n"
+        "        x = 1\n"
+        "        deep()\n"
+        "        return x\n"
+        "    return inner()\n"
+    )
+    nl_file = tmp_path / "nested_nl.py"
+    nl_file.write_text(nested_nl_src, encoding="utf-8")
+    nl_scope = inspect_single_unit_scope(
+        {"kind": "function", "start": 1, "end": 9, "file": str(nl_file)},
+        repo_root=str(tmp_path),
+        tree=ast.parse(nested_nl_src),
+    )
+    assert "x" not in nl_scope["nonlocals"]
+
+    # 13. Single-line unclosed string does not mark remaining lines as multiline continuations
+    from pydoppelgangerhunt.fixer.source import _find_multiline_string_continuation_lines
+
+    unclosed_single = 'x = "unclosed\ny = 1\nz = 2\n'
+    assert _find_multiline_string_continuation_lines(unclosed_single) == set()
+    unclosed_triple = 'x = """unclosed\ny = 1\nz = 2\n'
+    assert _find_multiline_string_continuation_lines(unclosed_triple) == {2, 3}
+
+    # 14. Headerless TOML fallback with multiline array element starting with '['
+    from pydoppelgangerhunt.config import load_toml_section
+
+    hdrless_toml = tmp_path / "headerless_arr.toml"
+    hdrless_toml.write_text(
+        'exclude = [\n  ["a", "b"]\n]\nthreshold = 0.85\n', encoding="utf-8"
+    )
+    orig_tomllib = sys.modules.get("tomllib")
+    orig_tomli = sys.modules.get("tomli")
+    try:
+        sys.modules["tomllib"] = None  # type: ignore[assignment]
+        sys.modules["tomli"] = None  # type: ignore[assignment]
+        parsed_hdrless = load_toml_section(str(hdrless_toml), "pydoppelgangerhunt")
+    finally:
+        if orig_tomllib is not None:
+            sys.modules["tomllib"] = orig_tomllib
+        else:
+            sys.modules.pop("tomllib", None)
+        if orig_tomli is not None:
+            sys.modules["tomli"] = orig_tomli
+        else:
+            sys.modules.pop("tomli", None)
+    assert parsed_hdrless.get("threshold") == 0.85
+

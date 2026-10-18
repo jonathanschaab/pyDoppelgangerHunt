@@ -377,7 +377,14 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
         with open(target_path, "r", encoding="utf-8", errors="replace") as fh:
             lines = fh.readlines()
 
-        is_headerless = not any(line.strip().startswith("[") for line in lines)
+        is_headerless = True
+        hdr_depth = 0
+        for line in lines:
+            s_ln = _strip_toml_inline_comment(line)
+            if hdr_depth == 0 and s_ln.startswith("[") and s_ln.endswith("]"):
+                is_headerless = False
+                break
+            hdr_depth = _count_bracket_depth(s_ln, hdr_depth)
         in_section = is_headerless
 
         for line in lines:

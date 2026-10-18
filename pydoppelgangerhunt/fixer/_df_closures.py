@@ -93,13 +93,21 @@ def _extract_comprehension_walrus_names(comp_node: ast.AST) -> Set[str]:
 
 
 def _extract_single_node_local_names(
-    scope_node: ast.AST, include_globals: bool = True
+    scope_node: ast.AST,
+    include_globals: bool = True,
+    *,
+    include_nonlocals: bool = True,
+    include_self_name: bool = True,
 ) -> Set[str]:
     """Extracts parameters and locally assigned/imported/defined symbols in scope_node."""
     names: Set[str] = set()
     global_names: Set[str] = set()
     node_name = getattr(scope_node, "name", None)
-    if isinstance(node_name, str) and not isinstance(scope_node, ast.ClassDef):
+    if (
+        include_self_name
+        and isinstance(node_name, str)
+        and not isinstance(scope_node, ast.ClassDef)
+    ):
         names.add(node_name)
 
     names.update(_extract_node_type_param_names(scope_node))
@@ -156,7 +164,10 @@ def _extract_single_node_local_names(
                 global_names.update(curr.names)
             continue
         elif isinstance(curr, ast.Nonlocal):
-            names.update(curr.names)
+            if include_nonlocals:
+                names.update(curr.names)
+            else:
+                global_names.update(curr.names)
             continue
         elif type(curr).__name__ == "TypeAlias":
             alias_name = getattr(curr, "name", None)
