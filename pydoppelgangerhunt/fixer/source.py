@@ -1429,6 +1429,7 @@ def _compute_scope_intervals_sig(
             (
                 id(node),
                 _node_scope_bounds(node),
+                getattr(node, "col_offset", 0),
                 tuple(id(s) for s in getattr(node, "body", ())),
             )
             for _, _, _, node in intervals

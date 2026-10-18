@@ -704,3 +704,48 @@ def test_resolve_unit_ast_end_col_multistatement_with_start_col_and_comp_target_
     comp_tree = ast.parse("def _shared(items, a):\n    return [x for (x, a[x]) in items]\n")
     free_names, _, _ = _extract_helper_symbols(comp_tree)
     assert "x" in free_names
+
+
+def test_scope_intervals_col_offset_sig_and_lru_shrink_and_decorated_pragma() -> None:
+    """Verifies col_offset signature invalidation, dynamic LRU shrinkage, and decorated pragma leading scan."""
+    from collections import OrderedDict  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer._df_cache import (  # pylint: disable=protected-access,import-outside-toplevel
+        _store_lru_cache_entry,
+    )
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=protected-access,import-outside-toplevel
+        _unit_has_no_refactor_pragma,
+    )
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=protected-access,import-outside-toplevel
+        _get_tree_scope_intervals,
+    )
+
+    tree = ast.parse("def f1(): pass\ndef f2(): pass\n")
+    tree.body[0].lineno = tree.body[1].lineno = 1
+    tree.body[0].end_lineno = tree.body[1].end_lineno = 1
+    tree.body[0].col_offset = 0
+    tree.body[1].col_offset = 15
+    intervals1 = _get_tree_scope_intervals(tree)
+    assert intervals1[0][3] is tree.body[1]
+    tree.body[0].col_offset = 30
+    intervals2 = _get_tree_scope_intervals(tree)
+    assert intervals2[0][3] is tree.body[0]
+
+    cache: OrderedDict[str, int] = OrderedDict([("a", 1), ("b", 2), ("c", 3)])
+    _store_lru_cache_entry(cache, "d", 4, max_size=2)
+    assert list(cache.keys()) == ["c", "d"]
+
+    decorated_src = (
+        "# pragma: no-refactor\n"
+        "\n"
+        "@dec\n"
+        "def fn():\n"
+        "    return '# pragma: no-refactor'\n"
+    )
+    assert _unit_has_no_refactor_pragma({"start": 4, "end": 5}, None, orig_text=decorated_src) is False
+    decorated_pragma_src = (
+        "# pragma: no-refactor\n"
+        "@dec\n"
+        "def fn():\n"
+        "    return 1\n"
+    )
+    assert _unit_has_no_refactor_pragma({"start": 3, "end": 4}, None, orig_text=decorated_pragma_src) is True

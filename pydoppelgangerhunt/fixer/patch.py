@@ -2919,7 +2919,10 @@ def _unit_has_no_refactor_pragma(
         return False
     try:
         comments = extract_unit_comments_and_pragmas(
-            full_text, min(u_start, start_idx + 1), u_end, include_leading=True
+            full_text,
+            min(u_start, start_idx + 1),
+            u_end,
+            include_leading=start_idx + 1 >= u_start,
         )
         return any(bool(_NO_REFACTOR_RE.search(c["text"])) for c in comments)
     except Exception as exc:

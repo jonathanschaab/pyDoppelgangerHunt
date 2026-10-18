@@ -88,18 +88,18 @@ def _store_lru_cache_entry(
     max_size: int,
 ) -> _CacheValT:
     """Stores key-value pair in an OrderedDict LRU cache with eviction outside lock."""
-    evicted_tree: Optional[ast.AST] = None
+    evicted_trees: List[ast.AST] = []
     with _downstream_cache_lock:
         if key in cache:
             cache.move_to_end(key)
             return cache[key]
-        if len(cache) >= max_size:
+        while len(cache) >= max_size and cache:
             _, evicted_val = cache.popitem(last=False)
             if cache is _parsed_tree_cache and isinstance(evicted_val, ast.AST):
-                evicted_tree = evicted_val
+                evicted_trees.append(evicted_val)
         cache[key] = value
         cache.move_to_end(key)
-    if evicted_tree is not None:
+    for evicted_tree in evicted_trees:
         _evict_tree_scopes(evicted_tree)
     return value
 
