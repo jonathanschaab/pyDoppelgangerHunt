@@ -793,3 +793,43 @@ def test_comp_tuple_target_left_to_right_and_patch_receiver_kind(tmp_path: Any) 
     u2 = {"file": "svc.py", "start": 9, "end": 12, "name": "Service.second", "kind": "method"}
     patch_text = generate_refactoring_patch([(1.0, u1, u2)], repo_root=str(tmp_path))
     assert "@classmethod" in patch_text
+
+
+def test_sliced_method_type_params_and_toml_fallback(tmp_path: Any, monkeypatch: Any) -> None:
+    """Verifies sliced method has_class_scoped_type_params, _strip_stmt_target_lines, and TOML fallback."""
+    import sys  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        load_toml_section,
+    )
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        inspect_single_unit_scope,
+    )
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access,import-outside-toplevel
+        _strip_stmt_target_lines,
+    )
+
+    if sys.version_info >= (3, 12):
+        sliced_method = {
+            "start": 10,
+            "end": 11,
+            "kind": "method",
+            "source_lines": [
+                "    def compute[U: BoundT](self, x: U) -> U:\n",
+                "        return x\n",
+            ],
+        }
+        scope = inspect_single_unit_scope(sliced_method)
+        assert scope["has_class_scoped_type_params"] is True
+
+    assert _strip_stmt_target_lines(["res = a + b"]) == ["a + b"]
+
+    toml_file = tmp_path / "cfg.toml"
+    toml_file.write_text(
+        '[tool.pydoppelgangerhunt]\n"closure_strictness" = "lenient"\nskip_pre_unit_closures = true\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(sys.modules, "tomllib", None)
+    monkeypatch.setitem(sys.modules, "tomli", None)
+    parsed = load_toml_section(toml_file, "pydoppelgangerhunt")
+    assert parsed["closure_strictness"] == "lenient"
+    assert parsed["skip_pre_unit_closures"] is True

@@ -1628,6 +1628,11 @@ def _inspect_unit_scope(
                     or unit.get("kind") == "closure"
                 ) and "type_param_closure_capture" not in hazards:
                     hazards.append("type_param_closure_capture")
+            elif not has_enclosing_cls and (
+                unit.get("enclosing_class")
+                or unit.get("kind") in ("method", "async_method")
+            ):
+                has_class_scoped_type_params = True
 
         is_control_flow_safe = not any(
             h

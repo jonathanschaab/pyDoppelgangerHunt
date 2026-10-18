@@ -110,7 +110,10 @@ def _strip_stmt_target_lines(lines: Sequence[str]) -> List[str]:
                 stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Return)
             ):
                 if stmt.value is not None:
-                    return ast.unparse(stmt.value).splitlines()
+                    return [
+                        ln.rstrip("\r\n")
+                        for ln in split_source_lines(ast.unparse(stmt.value))
+                    ]
                 return list(lines)
     except (SyntaxError, IndexError, ValueError, RecursionError, MemoryError):
         pass
@@ -1663,7 +1666,9 @@ def synthesize_shared_helper_code(
                 pass
 
             if stripped_expr is not None:
-                stripped_lines = stripped_expr.splitlines()
+                stripped_lines = [
+                    ln.rstrip("\r\n") for ln in split_source_lines(stripped_expr)
+                ]
                 if len(stripped_lines) == 1:
                     common_lines = [f"return {stripped_lines[0]}"]
                 else:

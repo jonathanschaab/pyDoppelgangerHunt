@@ -400,7 +400,7 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
                 continue
             if in_section and "=" in stripped:
                 k, v = stripped.split("=", 1)
-                k = k.strip()
+                k = k.strip().strip("\"'")
                 v = v.strip()
                 if (v.startswith('"') and v.endswith('"')) or (
                     v.startswith("'") and v.endswith("'")
