@@ -838,6 +838,9 @@ def test_sliced_method_type_params_and_toml_fallback(tmp_path: Any, monkeypatch:
 
 def test_precomputed_scope_in_synthesize_and_nested_nonlocal_shadowing() -> None:
     """Verifies precomputed scope reuse in synthesize_shared_helper_code and nested nonlocal store scoping."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=protected-access,import-outside-toplevel
+        _build_unit_delegation_call,
+    )
     from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
         analyze_unit_variable_scope,
         inspect_single_unit_scope,
@@ -882,3 +885,31 @@ def test_precomputed_scope_in_synthesize_and_nested_nonlocal_shadowing() -> None
     merged = analyze_unit_variable_scope(u1, u2, scope1=s1, scope2=s2)
     res = synthesize_shared_helper_code(u1, u2, scope1=s1, scope2=s2, scope=merged)
     assert "def " in res
+
+    expr_src = "out = [x + 1 for x in items]  # type: ignore\n"
+    expr_unit = {"start": 1, "end": 1, "kind": "comprehension"}
+    rep_without = _build_unit_delegation_call(
+        expr_unit,
+        expr_src,
+        [expr_src],
+        effective_binding="module",
+        helper_name="_shared_comp",
+        inputs=["items"],
+        outputs=[],
+        scope={"param_details": []},
+        preserve_boundary_pragmas=False,
+    )
+    rep_with = _build_unit_delegation_call(
+        expr_unit,
+        expr_src,
+        [expr_src],
+        effective_binding="module",
+        helper_name="_shared_comp",
+        inputs=["items"],
+        outputs=[],
+        scope={"param_details": []},
+        preserve_boundary_pragmas=True,
+    )
+    assert "# type: ignore" not in rep_without
+    assert "# type: ignore" in rep_with
+

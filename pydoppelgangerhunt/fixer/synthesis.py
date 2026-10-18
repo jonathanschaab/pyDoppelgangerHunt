@@ -1380,7 +1380,7 @@ def synthesize_shared_helper_code(
         scopes.append(s_item)
     scope1, scope2 = scopes[0], scopes[1]
     if has_precomputed_scopes and scope is not None:
-        if is_expr_unit:
+        if is_expr_unit and (outputs is None or outputs2 is None):
             u1.pop("outputs", None)
             u2.pop("outputs", None)
             u1.pop("precomputed_outputs", None)

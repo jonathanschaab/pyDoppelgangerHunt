@@ -729,6 +729,7 @@ def _build_unit_delegation_call(
     target_outputs: Optional[List[str]] = None,
     await_prefix: str = "",
     step: Optional[str] = None,
+    preserve_boundary_pragmas: bool = True,
 ) -> str:
     """Constructs replacement delegation call statement for a clone unit in refactoring patches."""
     u_start = max(1, parse_unit_coord(target_unit, "start", default=1))
@@ -878,6 +879,8 @@ def _build_unit_delegation_call(
             if assign_prefix is None:
                 return ""
             rep_call = f"{indent}{assign_prefix}{await_prefix}{call_expr}\n"
+            if not preserve_boundary_pragmas:
+                return rep_call
             try:
                 _, _, final_rep = compute_unit_replacement_span(
                     orig_text,
@@ -1222,6 +1225,7 @@ def _delegate_unit_in_plan(
         target_outputs=target_outputs,
         await_prefix=await_prefix,
         step=step,
+        preserve_boundary_pragmas=False,
     )
     if not rep_stmt:
         raise ValueError(
