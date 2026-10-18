@@ -401,8 +401,12 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
     code_block = "\n".join(raw_lines)
     dedented = dedent_source_text(code_block)
     try:
-        wrapped = dedented.lstrip("\r\n").startswith((" ", "\t"))
-        tree = ast.parse(f"if 1:\n{dedented}") if wrapped else ast.parse(dedented)
+        wrapped = False
+        try:
+            tree = ast.parse(dedented)
+        except IndentationError:
+            tree = ast.parse(f"if 1:\n{dedented}")
+            wrapped = True
         top_body = (
             tree.body[0].body
             if (wrapped and len(tree.body) == 1 and isinstance(tree.body[0], ast.If))

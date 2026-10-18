@@ -317,12 +317,17 @@ def _resolve_unit_ast_end_col(
     else:
         return None
 
-    if start_col is not None and (
-        getattr(target_stmt, "lineno", 0) != u_start
-        or start_col != getattr(target_stmt, "col_offset", 0)
-        or isinstance(target_stmt, ast.Expr)
-    ):
-        return None
+    if start_col is not None:
+        if getattr(target_stmt, "lineno", 0) == u_start:
+            if start_col != getattr(target_stmt, "col_offset", 0) or isinstance(
+                target_stmt, ast.Expr
+            ):
+                return None
+        elif not any(
+            getattr(s, "col_offset", 0) == start_col
+            for s in _get_scope_stmts_by_start_lineno(scope_node).get(u_start, ())
+        ):
+            return None
 
     end_col = getattr(target_stmt, "end_col_offset", None)
     if end_col is None:

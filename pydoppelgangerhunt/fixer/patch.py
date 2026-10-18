@@ -2142,8 +2142,8 @@ def _extract_helper_symbols(
             try:
                 for gen in generators:
                     self.visit(gen.iter)
-                    comp_scope.update(_extract_assigned_names(gen.target))
                     self.visit(gen.target)
+                    comp_scope.update(_extract_assigned_names(gen.target))
                     for if_clause in gen.ifs:
                         self.visit(if_clause)
                 for e in elts:

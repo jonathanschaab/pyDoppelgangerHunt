@@ -666,3 +666,41 @@ def test_resolve_unit_ast_end_col_caches_stmts_by_start_lineno() -> None:
     assert fn_scope not in _scope_stmts_by_end
 
 
+def test_extract_unit_body_lines_col0_comment_and_multiline_string() -> None:
+    """Verifies _extract_unit_body_lines wraps in 'if 1:' when leading col-0 comment precedes indented def."""
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=protected-access,import-outside-toplevel
+        _extract_unit_body_lines,
+    )
+
+    raw_lines = [
+        "# leading comment at col 0",
+        "    def method(self):",
+        '        """Docstring."""',
+        '        msg = """line1',
+        'col0_continuation"""',
+        "        return msg",
+    ]
+    extracted = _extract_unit_body_lines({"kind": "method"}, raw_lines)
+    assert not any("def method" in ln for ln in extracted)
+    assert not any("Docstring" in ln for ln in extracted)
+    assert any("return msg" in ln for ln in extracted)
+
+
+def test_resolve_unit_ast_end_col_multistatement_with_start_col_and_comp_target_order() -> None:
+    """Verifies multi-statement start_col resolution and comprehension tuple target free-name extraction."""
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=protected-access,import-outside-toplevel
+        _extract_helper_symbols,
+    )
+
+    code = (
+        "def f():\n"
+        "    x = 1\n"
+        "    y = 2\n"
+    )
+    fn_scope = ast.parse(code).body[0]
+    assert _resolve_unit_ast_end_col(fn_scope, {"start": 2, "end": 3, "start_col": 4}) == len("    y = 2")
+    assert _resolve_unit_ast_end_col(fn_scope, {"start": 2, "end": 3, "start_col": 8}) is None
+
+    comp_tree = ast.parse("def _shared(items, a):\n    return [x for (x, a[x]) in items]\n")
+    free_names, _, _ = _extract_helper_symbols(comp_tree)
+    assert "x" in free_names
