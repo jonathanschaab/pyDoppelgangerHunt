@@ -1407,4 +1407,53 @@ def test_multilevel_nonlocal_harvested_expr_receiver_and_delegation_indent(
     assert call_str.startswith("    y = _shared_run(x)")
 
 
+def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
+    tmp_path: Any,
+) -> None:
+    """Verify multi-line start_col end_col resolution, class walrus scope, and config top validation."""
+    import ast
+    from pydoppelgangerhunt.cli import main as cli_main
+    from pydoppelgangerhunt.config import load_tool_config
+    from pydoppelgangerhunt.fixer._df_cache import _resolve_unit_ast_end_col
+    from pydoppelgangerhunt.fixer._df_closures import _extract_single_node_local_names
+
+    # 1. Multi-line compound statement with start_col resolves leaf end_col_offset
+    compound_src = "if cond:\n    x = 1\n    y = 2\n"
+    compound_tree = ast.parse(compound_src)
+    assert (
+        _resolve_unit_ast_end_col(
+            compound_tree, {"start": 1, "end": 3, "start_col": 0}
+        )
+        == 9
+    )
+    assert (
+        _resolve_unit_ast_end_col(
+            compound_tree, {"start": 1, "end": 3, "start_col": 4}
+        )
+        is None
+    )
+
+    # 2. Class-body comprehension walrus target does not leak into ClassDef local bindings
+    cls_tree = ast.parse("class C:\n    vals = [w := v for v in items]\n")
+    cls_locals = _extract_single_node_local_names(cls_tree.body[0])
+    assert "vals" in cls_locals
+    assert "w" not in cls_locals
+
+    fn_tree = ast.parse("def f(items):\n    vals = [w := v for v in items]\n")
+    fn_locals = _extract_single_node_local_names(fn_tree.body[0])
+    assert "vals" in fn_locals
+    assert "w" in fn_locals
+
+    # 3. 'top' in _CONFIG_KEY_NAMES and validated in main() when loaded from config
+    cfg_file = tmp_path / "custom.toml"
+    cfg_file.write_text("top = 5\n", encoding="utf-8")
+    loaded = load_tool_config(config_path=str(cfg_file))
+    assert loaded.get("top") == 5
+
+    bad_cfg = tmp_path / "bad_top.toml"
+    bad_cfg.write_text("[tool.pydoppelgangerhunt]\ntop = 0\n", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        cli_main([str(tmp_path), "--config", str(bad_cfg)])
+
+
 

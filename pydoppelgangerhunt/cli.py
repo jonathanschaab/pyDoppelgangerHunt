@@ -1086,6 +1086,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 tool_cfg = load_tool_config(repo_root=target_dir)
         if not tool_cfg:
             tool_cfg = load_tool_config()
+    if args.top is None and tool_cfg.get("top") is not None:
+        raw_top = tool_cfg["top"]
+        if isinstance(raw_top, bool):
+            parser.error("--top must be a positive integer (> 0)")
+        try:
+            args.top = int(raw_top)
+        except (ValueError, TypeError):
+            parser.error("--top must be a positive integer (> 0)")
+        if args.top <= 0:
+            parser.error("--top must be a positive integer (> 0)")
     cfg_target = str(tool_cfg.get("target") or "")
     default_dir = (
         cfg_target

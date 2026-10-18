@@ -121,7 +121,8 @@ def _extract_single_node_local_names(
             stack.extend(iter_nested_scope_header_nodes(curr))
             continue
         if isinstance(curr, _COMPREHENSION_TYPES):
-            names.update(_extract_comprehension_walrus_names(curr))
+            if not isinstance(scope_node, ast.ClassDef):
+                names.update(_extract_comprehension_walrus_names(curr))
             continue
         if isinstance(curr, _INNER_SCOPE_TYPES):
             stack.extend(iter_nested_scope_header_nodes(curr))

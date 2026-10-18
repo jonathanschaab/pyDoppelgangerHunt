@@ -23,6 +23,7 @@ _CONFIG_KEY_NAMES: Tuple[str, ...] = (
     "exclude",
     "closure_strictness",
     "skip_pre_unit_closures",
+    "top",
 )
 
 

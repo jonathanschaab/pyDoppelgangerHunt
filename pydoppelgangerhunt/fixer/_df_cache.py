@@ -328,9 +328,22 @@ def _resolve_unit_ast_end_col(
         return None
 
     if start_col is not None and (
-        getattr(target_stmt, "lineno", 0) != u_start
-        or start_col != getattr(target_stmt, "col_offset", 0)
-        or isinstance(target_stmt, ast.Expr)
+        isinstance(target_stmt, ast.Expr)
+        or not (
+            (
+                getattr(target_stmt, "lineno", 0) == u_start
+                and start_col == getattr(target_stmt, "col_offset", 0)
+            )
+            or (
+                u_start < u_end
+                and any(
+                    not isinstance(s, ast.Expr)
+                    and getattr(s, "lineno", 0) == u_start
+                    and getattr(s, "col_offset", 0) == start_col
+                    for s in matching_stmts
+                )
+            )
+        )
     ):
         return None
 
