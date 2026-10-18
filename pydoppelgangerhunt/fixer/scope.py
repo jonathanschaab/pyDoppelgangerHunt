@@ -411,7 +411,7 @@ class _ScopeVisitor(ast.NodeVisitor):
             if not self._scope_stack:
                 self._scope_stack.append(set())
                 created_outer = True
-            self._scope_stack.append(set(tp_names))
+            self._scope_stack.append({":class_scope:", *tp_names})
             self.class_depth += 1
             try:
                 for stmt in node.body:
@@ -489,9 +489,11 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _record_load_name(self, name: str) -> None:
-        is_inner = any(name in s for s in self._scope_stack[1:]) or any(
-            name in s for s in self._type_param_scopes
-        )
+        is_inner = any(
+            name in s
+            for s in self._scope_stack[1:]
+            if ":class_scope:" not in s or s is self._scope_stack[-1]
+        ) or any(name in s for s in self._type_param_scopes)
         if not is_inner and name not in BUILTIN_NAMES:
             if name not in self.loads:
                 self.loads.append(name)
@@ -523,7 +525,11 @@ class _ScopeVisitor(ast.NodeVisitor):
         attr_name = _unfold_receiver_attribute(node, receiver_names=self.receiver_names)
         if attr_name is not None:
             receiver_id = attr_name.split(".", 1)[0]
-            is_inner = any(receiver_id in s for s in self._scope_stack[1:])
+            is_inner = any(
+                receiver_id in s
+                for s in self._scope_stack[1:]
+                if ":class_scope:" not in s or s is self._scope_stack[-1]
+            )
             if not is_inner and self.class_depth == 0:
                 if isinstance(node.ctx, ast.Load):
                     if attr_name not in self.attrs_read:
@@ -556,7 +562,11 @@ class _ScopeVisitor(ast.NodeVisitor):
             attr_name = _unfold_receiver_attribute(node.target, receiver_names=self.receiver_names)
             if attr_name is not None:
                 receiver_id = attr_name.split(".", 1)[0]
-                is_inner = any(receiver_id in s for s in self._scope_stack[1:])
+                is_inner = any(
+                    receiver_id in s
+                    for s in self._scope_stack[1:]
+                    if ":class_scope:" not in s or s is self._scope_stack[-1]
+                )
                 if not is_inner and self.class_depth == 0:
                     if attr_name not in self.attrs_read:
                         self.attrs_read.append(attr_name)

@@ -790,11 +790,21 @@ def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
 
     has_defs = any(
         isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.AnnAssign))
+        or type(n).__name__ == "TypeAlias"
         for n in ast.walk(tree)
     )
     needed: Set[str] = set()
+    tp_names: Set[str] = set()
     for node in ast.walk(tree):
         annotations: List[ast.AST] = []
+        for tp in getattr(node, "type_params", ()):
+            tp_name = getattr(tp, "name", None)
+            if isinstance(tp_name, str):
+                tp_names.add(tp_name)
+            for attr in ("bound", "default_value"):
+                tp_expr = getattr(tp, attr, None)
+                if isinstance(tp_expr, ast.AST):
+                    annotations.append(tp_expr)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if node.returns is not None:
                 annotations.append(node.returns)
@@ -809,6 +819,10 @@ def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
         elif isinstance(node, ast.AnnAssign):
             if node.annotation is not None:
                 annotations.append(node.annotation)
+        elif type(node).__name__ == "TypeAlias":
+            alias_val = getattr(node, "value", None)
+            if isinstance(alias_val, ast.AST):
+                annotations.append(alias_val)
         elif not has_defs and isinstance(node, ast.Expr):
             annotations.append(node.value)
 
@@ -816,7 +830,7 @@ def _extract_required_typing_imports(signature_or_func_text: str) -> List[str]:
             for sub in ast.walk(ann):
                 if isinstance(sub, ast.Name) and sub.id in TYPING_SYMBOLS:
                     needed.add(sub.id)
-    return sorted(needed)
+    return sorted(needed - tp_names)
 
 
 def _format_helper_parameters(

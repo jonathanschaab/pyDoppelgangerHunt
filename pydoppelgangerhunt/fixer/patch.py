@@ -2146,8 +2146,19 @@ def _extract_helper_symbols(
             try:
                 for gen in generators:
                     self.visit(gen.iter)
-                    self.visit(gen.target)
-                    comp_scope.update(_extract_assigned_names(gen.target))
+                    target_stack: List[ast.AST] = [gen.target]
+                    while target_stack:
+                        curr_t = target_stack.pop()
+                        if isinstance(curr_t, (ast.Tuple, ast.List)):
+                            target_stack.extend(reversed(curr_t.elts))
+                        elif isinstance(curr_t, ast.Starred):
+                            target_stack.append(curr_t.value)
+                        elif isinstance(curr_t, ast.Name) and isinstance(
+                            curr_t.ctx, ast.Store
+                        ):
+                            comp_scope.add(curr_t.id)
+                        else:
+                            self.visit(curr_t)
                     for if_clause in gen.ifs:
                         self.visit(if_clause)
                 for e in elts:

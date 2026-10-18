@@ -702,9 +702,13 @@ def test_resolve_unit_ast_end_col_multistatement_with_start_col_and_comp_target_
     assert _resolve_unit_ast_end_col(fn_scope, {"start": 2, "end": 3, "start_col": 4}) is None
     assert _resolve_unit_ast_end_col(fn_scope, {"start": 2, "end": 3, "start_col": 8}) is None
 
-    comp_tree = ast.parse("def _shared(items, a):\n    return [x for (x, a[x]) in items]\n")
-    free_names, _, _ = _extract_helper_symbols(comp_tree)
-    assert "x" in free_names
+    comp_bound = ast.parse("def _shared(items, a):\n    return [x for (x, a[x]) in items]\n")
+    free_bound, _, _ = _extract_helper_symbols(comp_bound)
+    assert "x" not in free_bound
+
+    comp_free = ast.parse("def _shared(items, a):\n    return [x for (a[x], x) in items]\n")
+    free_unbound, _, _ = _extract_helper_symbols(comp_free)
+    assert "x" in free_unbound
 
 
 def test_scope_intervals_col_offset_sig_and_lru_shrink_and_decorated_pragma() -> None:
@@ -912,4 +916,53 @@ def test_precomputed_scope_in_synthesize_and_nested_nonlocal_shadowing() -> None
     )
     assert "# type: ignore" not in rep_without
     assert "# type: ignore" in rep_with
+
+
+def test_pep695_typing_imports_class_scope_isolation_and_multiline_indent_error() -> None:
+    """Verifies PEP 695 typing imports, class body lexical scope isolation, and multiline string IndentationError retry."""
+    import sys  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        inspect_single_unit_scope,
+    )
+    from pydoppelgangerhunt.fixer.source import (  # pylint: disable=protected-access,import-outside-toplevel
+        _find_multiline_string_continuation_lines,
+    )
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=protected-access,import-outside-toplevel
+        _extract_required_typing_imports,
+    )
+
+    if sys.version_info >= (3, 12):
+        imports = _extract_required_typing_imports(
+            "def _shared_fn[T: Sequence[int], Sequence: int](x: T) -> T:\n    return x\n"
+        )
+        assert imports == []
+        imports2 = _extract_required_typing_imports(
+            "def _shared_fn[T: Sequence[int]](x: T) -> T:\n    return x\n"
+        )
+        assert imports2 == ["Sequence"]
+
+    cls_unit = {
+        "start": 1,
+        "end": 6,
+        "source_text": (
+            "class HelperBox:\n"
+            "    ext_fn = 1\n"
+            "    direct_use = ext_fn + 1\n"
+            "    def run(self):\n"
+            "        return ext_fn(self)\n"
+        ),
+    }
+    cls_scope = inspect_single_unit_scope(cls_unit)
+    assert "ext_fn" in cls_scope["inputs"]
+    assert "direct_use" not in cls_scope["inputs"]
+
+    unaligned = (
+        "    if cond:\n"
+        "        x = 1\n"
+        '  y = """first\n'
+        "    second\n"
+        'third"""\n'
+    )
+    assert _find_multiline_string_continuation_lines(unaligned) == {4, 5}
+
 

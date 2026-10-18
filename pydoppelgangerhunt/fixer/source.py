@@ -309,7 +309,9 @@ _MULTILINE_STR_TOKEN_TYPES = tuple(
 )
 
 
-def _find_multiline_string_continuation_lines(text: str) -> Set[int]:
+def _find_multiline_string_continuation_lines(
+    text: str, _retry_unindented: bool = True
+) -> Set[int]:
     """Returns 1-based line numbers that start inside a multiline string or f-string literal."""
     cont_lines: Set[int] = set()
     if ("\n" not in text and "\r" not in text) or not (
@@ -332,7 +334,18 @@ def _find_multiline_string_continuation_lines(text: str) -> Set[int]:
                         cont_lines.update(range(start_line + 1, tok.end[0] + 1))
             elif tok.type in _MULTILINE_STR_TOKEN_TYPES and tok.start[0] < tok.end[0]:
                 cont_lines.update(range(tok.start[0] + 1, tok.end[0] + 1))
-    except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
+    except IndentationError:
+        if _retry_unindented:
+            stripped_text = "".join(
+                ln if idx in cont_lines else ln.lstrip(" \t")
+                for idx, ln in enumerate(split_source_lines(text), start=1)
+            )
+            cont_lines.update(
+                _find_multiline_string_continuation_lines(
+                    stripped_text, _retry_unindented=False
+                )
+            )
+    except (tokenize.TokenError, SyntaxError) as exc:
         err_start = (
             fstring_start_lines[0]
             if fstring_start_lines
