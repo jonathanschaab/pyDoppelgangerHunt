@@ -254,9 +254,14 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._scope_stack[-1].add(name)
             return
         eff_len = len(self._scope_stack) - comp_depth
-        if eff_len <= 1 or name in self.nonlocals:
+        is_active_nonlocal = (
+            name in self.nonlocals
+            if eff_len <= 1
+            else f"nonlocal:{name}" in self._scope_stack[-1 - comp_depth]
+        )
+        if eff_len <= 1 or is_active_nonlocal:
             self.deleted_names.discard(name)
-        if name in self.nonlocals:
+        if is_active_nonlocal:
             if name not in BUILTIN_NAMES and name not in self.stores:
                 self.stores.append(name)
         elif name in self.globals:
@@ -506,7 +511,10 @@ class _ScopeVisitor(ast.NodeVisitor):
         elif isinstance(node.ctx, ast.Store):
             self._record_store_name(node.id)
         elif isinstance(node.ctx, ast.Del):
-            if len(self._scope_stack) <= 1 or node.id in self.nonlocals:
+            if (
+                len(self._scope_stack) <= 1
+                or f"nonlocal:{node.id}" in self._scope_stack[-1]
+            ):
                 self.deleted_names.add(node.id)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
@@ -617,9 +625,14 @@ class _ScopeVisitor(ast.NodeVisitor):
         self._visit_comprehension(node)
 
     def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+        eff_len = len(self._scope_stack) - self._comprehension_depth
         for name in node.names:
             if name not in self.nonlocals:
                 self.nonlocals.append(name)
+            if eff_len > 1:
+                self._scope_stack[-1 - self._comprehension_depth].add(
+                    f"nonlocal:{name}"
+                )
         self.generic_visit(node)
 
     def visit_Global(self, node: ast.Global) -> None:

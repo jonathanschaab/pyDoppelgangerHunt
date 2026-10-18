@@ -1257,6 +1257,9 @@ def synthesize_shared_helper_code(
     closure_strictness: Optional[str] = None,
     outputs: Optional[List[str]] = None,
     outputs2: Optional[List[str]] = None,
+    scope1: Optional[Dict[str, Any]] = None,
+    scope2: Optional[Dict[str, Any]] = None,
+    scope: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Synthesizes a proposed shared helper function stub from two clone units.
 
@@ -1353,35 +1356,50 @@ def synthesize_shared_helper_code(
     tree2 = _resolve_tree(tree2, source_text2, u2)
 
     # Variable scope analysis for concrete parameter signatures.
+    has_precomputed_scopes = (
+        scope1 is not None and scope2 is not None and scope is not None
+    )
     scopes: List[Dict[str, Any]] = []
-    for u_item, s_text, t_item in (
-        (u1, source_text1, tree1),
-        (u2, source_text2, tree2),
+    for u_item, s_text, t_item, pre_s in (
+        (u1, source_text1, tree1, scope1),
+        (u2, source_text2, tree2, scope2),
     ):
         if s_text is not None:
             u_item.setdefault("source_text", s_text)
         _populate_unit_receiver_metadata(
             u_item, repo_root=repo_root, source_text=s_text, tree=t_item
         )
-        s_item = inspect_single_unit_scope(u_item, repo_root=repo_root, tree=t_item)
+        s_item = (
+            dict(pre_s)
+            if pre_s is not None
+            else inspect_single_unit_scope(u_item, repo_root=repo_root, tree=t_item)
+        )
         if u_item.get("enclosing_is_async") and s_item.get("has_yield"):
             s_item["is_async"] = True
             u_item["is_async"] = True
         scopes.append(s_item)
     scope1, scope2 = scopes[0], scopes[1]
-    if not _prune_pair_lhs_and_augassign_scopes(
-        u1, u2, scope1, scope2, orig_lines1, orig_lines2
-    ):
-        return ""
-    scope = analyze_unit_variable_scope(
-        u1,
-        u2,
-        repo_root=repo_root,
-        tree1=tree1,
-        tree2=tree2,
-        scope1=scope1,
-        scope2=scope2,
-    )
+    if has_precomputed_scopes and scope is not None:
+        if is_expr_unit:
+            u1.pop("outputs", None)
+            u2.pop("outputs", None)
+            u1.pop("precomputed_outputs", None)
+            u2.pop("precomputed_outputs", None)
+        scope = dict(scope)
+    else:
+        if not _prune_pair_lhs_and_augassign_scopes(
+            u1, u2, scope1, scope2, orig_lines1, orig_lines2
+        ):
+            return ""
+        scope = analyze_unit_variable_scope(
+            u1,
+            u2,
+            repo_root=repo_root,
+            tree1=tree1,
+            tree2=tree2,
+            scope1=scope1,
+            scope2=scope2,
+        )
 
     if scope1.get("is_async") or scope2.get("is_async"):
         scope["is_async"] = True

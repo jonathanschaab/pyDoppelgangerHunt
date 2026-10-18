@@ -297,7 +297,9 @@ def _resolve_unit_ast_end_col(
 
     inner_stmts.sort(key=lambda s: getattr(s, "col_offset", 0))
     start_col = _extract_first_unit_coord(unit, ("start_col", "start_col_offset"))
-    if start_col is not None and unit.get("kind") in ("comprehension", "complex_expr"):
+    if start_col is not None and (
+        u_start < u_end or unit.get("kind") in ("comprehension", "complex_expr")
+    ):
         return None
     if len(inner_stmts) == 1:
         target_stmt = inner_stmts[0]
@@ -317,17 +319,12 @@ def _resolve_unit_ast_end_col(
     else:
         return None
 
-    if start_col is not None:
-        if getattr(target_stmt, "lineno", 0) == u_start:
-            if start_col != getattr(target_stmt, "col_offset", 0) or isinstance(
-                target_stmt, ast.Expr
-            ):
-                return None
-        elif not any(
-            getattr(s, "col_offset", 0) == start_col
-            for s in _get_scope_stmts_by_start_lineno(scope_node).get(u_start, ())
-        ):
-            return None
+    if start_col is not None and (
+        getattr(target_stmt, "lineno", 0) != u_start
+        or start_col != getattr(target_stmt, "col_offset", 0)
+        or isinstance(target_stmt, ast.Expr)
+    ):
+        return None
 
     end_col = getattr(target_stmt, "end_col_offset", None)
     if end_col is None:

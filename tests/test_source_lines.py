@@ -698,7 +698,8 @@ def test_resolve_unit_ast_end_col_multistatement_with_start_col_and_comp_target_
         "    y = 2\n"
     )
     fn_scope = ast.parse(code).body[0]
-    assert _resolve_unit_ast_end_col(fn_scope, {"start": 2, "end": 3, "start_col": 4}) == len("    y = 2")
+    assert _resolve_unit_ast_end_col(fn_scope, {"start": 2, "end": 2, "start_col": 4}) == len("    x = 1")
+    assert _resolve_unit_ast_end_col(fn_scope, {"start": 2, "end": 3, "start_col": 4}) is None
     assert _resolve_unit_ast_end_col(fn_scope, {"start": 2, "end": 3, "start_col": 8}) is None
 
     comp_tree = ast.parse("def _shared(items, a):\n    return [x for (x, a[x]) in items]\n")
@@ -833,3 +834,51 @@ def test_sliced_method_type_params_and_toml_fallback(tmp_path: Any, monkeypatch:
     parsed = load_toml_section(toml_file, "pydoppelgangerhunt")
     assert parsed["closure_strictness"] == "lenient"
     assert parsed["skip_pre_unit_closures"] is True
+
+
+def test_precomputed_scope_in_synthesize_and_nested_nonlocal_shadowing() -> None:
+    """Verifies precomputed scope reuse in synthesize_shared_helper_code and nested nonlocal store scoping."""
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        analyze_unit_variable_scope,
+        inspect_single_unit_scope,
+    )
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        synthesize_shared_helper_code,
+    )
+
+    shadowed = inspect_single_unit_scope(
+        {
+            "start": 1,
+            "end": 4,
+            "source_text": (
+                "nonlocal x\n"
+                "def inner():\n"
+                "    x = 1\n"
+                "    return x\n"
+            ),
+        }
+    )
+    assert "x" not in shadowed["outputs"]
+
+    bound_inner = inspect_single_unit_scope(
+        {
+            "start": 1,
+            "end": 5,
+            "source_text": (
+                "def inner():\n"
+                "    nonlocal x\n"
+                "    x = 1\n"
+                "    return x\n"
+                "inner()\n"
+            ),
+        }
+    )
+    assert "x" in bound_inner["outputs"]
+
+    u1 = {"start": 1, "end": 2, "source_text": "def f1(a):\n    return a + 1\n"}
+    u2 = {"start": 1, "end": 2, "source_text": "def f2(a):\n    return a + 1\n"}
+    s1 = inspect_single_unit_scope(u1)
+    s2 = inspect_single_unit_scope(u2)
+    merged = analyze_unit_variable_scope(u1, u2, scope1=s1, scope2=s2)
+    res = synthesize_shared_helper_code(u1, u2, scope1=s1, scope2=s2, scope=merged)
+    assert "def " in res

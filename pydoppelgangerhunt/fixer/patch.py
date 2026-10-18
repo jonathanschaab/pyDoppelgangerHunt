@@ -3632,6 +3632,9 @@ def _generate_refactoring_patch_impl(
                 closure_strictness=closure_strictness,
                 outputs=outputs,
                 outputs2=target_outs2,
+                scope1=s1,
+                scope2=s2,
+                scope=scope,
             )
             if not helper_code:
                 skip_reasons["shared helper synthesis failed"] += 1
