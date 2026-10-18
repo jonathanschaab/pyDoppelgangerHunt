@@ -733,7 +733,14 @@ def _build_unit_delegation_call(
 ) -> str:
     """Constructs replacement delegation call statement for a clone unit in refactoring patches."""
     u_start = max(1, parse_unit_coord(target_unit, "start", default=1))
+    u_end_coord = max(u_start, parse_unit_coord(target_unit, "end", default=u_start))
     lead = orig_lines[u_start - 1] if 1 <= u_start <= len(orig_lines) else ""
+    if not lead.strip() or lead.lstrip().startswith("#"):
+        for cand_ln in orig_lines[u_start - 1 : min(len(orig_lines), u_end_coord)]:
+            cand_s = cand_ln.lstrip()
+            if cand_s and not cand_s.startswith("#"):
+                lead = cand_ln
+                break
     indent = lead[: len(lead) - len(lead.lstrip())]
 
     t_fn = find_enclosing_function(orig_text, target_unit)
@@ -3302,14 +3309,18 @@ def _generate_refactoring_patch_impl(
                 and (fn1.get("receiver_param") or fn1.get("is_static"))
                 and (fn2.get("receiver_param") or fn2.get("is_static"))
             )
-            if fn1 and "receiver_param" not in u1_eff:
+            if fn1 and u1_eff.get("receiver_param") is None:
                 u1_eff["receiver_param"] = fn1.get("receiver_param")
-            if fn2 and "receiver_param" not in u2_eff:
+            if fn2 and u2_eff.get("receiver_param") is None:
                 u2_eff["receiver_param"] = fn2.get("receiver_param")
-            if fn1_kind != "none" and "receiver_kind" not in u1_eff:
+            if fn1_kind != "none" and u1_eff.get("receiver_kind") is None:
                 u1_eff["receiver_kind"] = fn1_kind
-            if fn2_kind != "none" and "receiver_kind" not in u2_eff:
+                if fn1_kind == "static":
+                    u1_eff["is_static"] = True
+            if fn2_kind != "none" and u2_eff.get("receiver_kind") is None:
                 u2_eff["receiver_kind"] = fn2_kind
+                if fn2_kind == "static":
+                    u2_eff["is_static"] = True
             if fn1 and fn2:
                 is_static = bool(fn1.get("is_static") and fn2.get("is_static"))
             else:

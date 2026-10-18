@@ -389,6 +389,7 @@ class _DownstreamCacheKey(NamedTuple):
     candidates: Optional[frozenset[str]]
     skip_pre_unit_closures: bool
     unit_inputs: Optional[frozenset[str]] = None
+    is_subroutine: bool = False
 
 
 def _coerce_string_frozenset(raw_items: Any) -> Optional[frozenset[str]]:
@@ -451,6 +452,14 @@ def _build_downstream_cache_key(
     if unit_inputs_val is None and "inputs" in unit and unit["inputs"] is not None:
         unit_inputs_val = unit["inputs"]
     unit_inputs_key = _coerce_string_frozenset(unit_inputs_val)
+    is_sub_key = bool(unit.get("is_subroutine")) or unit.get("kind") in (
+        "compound_block",
+        "sliding_window",
+        "clause_branch",
+        "comprehension",
+        "complex_expr",
+        "data_table",
+    )
 
     return _DownstreamCacheKey(
         content_digest=content_digest,
@@ -461,4 +470,5 @@ def _build_downstream_cache_key(
         candidates=cands_key,
         skip_pre_unit_closures=bool(skip_pre_unit_closures),
         unit_inputs=unit_inputs_key,
+        is_subroutine=is_sub_key,
     )

@@ -386,11 +386,12 @@ def _populate_unit_receiver_metadata(
     tree: Optional[ast.AST] = None,
 ) -> None:
     """Populates receiver_kind, enclosing_class, and is_static on a unit from AST if absent."""
+    is_expr_unit = unit.get("kind") in ("comprehension", "complex_expr")
     if (
-        "receiver_kind" in unit
+        ("receiver_kind" in unit and (unit.get("receiver_kind") is not None or not is_expr_unit))
         and "enclosing_class" in unit
         and "enclosing_class_start" in unit
-        and "receiver_param" in unit
+        and ("receiver_param" in unit and (unit.get("receiver_param") is not None or not is_expr_unit))
         and "is_async" in unit
         and "enclosing_is_async" in unit
     ):
@@ -421,7 +422,7 @@ def _populate_unit_receiver_metadata(
         if "enclosing_class_start" not in unit:
             unit["enclosing_class_start"] = cls_meta["start"]
     is_method = _is_method_of_class(fn_meta, cls_meta)
-    if "receiver_kind" not in unit:
+    if "receiver_kind" not in unit or (is_expr_unit and unit.get("receiver_kind") is None):
         if is_method:
             rec_k = _get_enclosing_receiver_kind(fn_meta)
             unit["receiver_kind"] = rec_k
@@ -429,7 +430,7 @@ def _populate_unit_receiver_metadata(
                 unit["is_static"] = True
         else:
             unit["receiver_kind"] = None
-    if "receiver_param" not in unit:
+    if "receiver_param" not in unit or (is_expr_unit and unit.get("receiver_param") is None):
         if is_method and unit.get("receiver_kind") in ("instance", "class"):
             unit["receiver_param"] = fn_meta.get("receiver_param") if fn_meta else None
         else:

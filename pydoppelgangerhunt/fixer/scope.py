@@ -254,10 +254,18 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._scope_stack[-1].add(name)
             return
         eff_len = len(self._scope_stack) - comp_depth
+        bound_in_intermediate_fn = eff_len > 2 and any(
+            name in s
+            for s in self._scope_stack[1 : -1 - comp_depth]
+            if ":class_scope:" not in s
+        )
         is_active_nonlocal = (
             name in self.nonlocals
             if eff_len <= 1
-            else f"nonlocal:{name}" in self._scope_stack[-1 - comp_depth]
+            else (
+                f"nonlocal:{name}" in self._scope_stack[-1 - comp_depth]
+                and not bound_in_intermediate_fn
+            )
         )
         is_active_global = (
             name in self.globals
@@ -272,7 +280,8 @@ class _ScopeVisitor(ast.NodeVisitor):
         elif is_active_global:
             pass
         elif eff_len > 1:
-            self._scope_stack[-1 - comp_depth].add(name)
+            if f"nonlocal:{name}" not in self._scope_stack[-1 - comp_depth]:
+                self._scope_stack[-1 - comp_depth].add(name)
         elif name not in BUILTIN_NAMES and name not in self.stores:
             self.stores.append(name)
 
@@ -518,9 +527,13 @@ class _ScopeVisitor(ast.NodeVisitor):
         elif isinstance(node.ctx, ast.Store):
             self._record_store_name(node.id)
         elif isinstance(node.ctx, ast.Del):
-            if (
-                len(self._scope_stack) <= 1
-                or f"nonlocal:{node.id}" in self._scope_stack[-1]
+            if len(self._scope_stack) <= 1 or (
+                f"nonlocal:{node.id}" in self._scope_stack[-1]
+                and not any(
+                    node.id in s
+                    for s in self._scope_stack[1:-1]
+                    if ":class_scope:" not in s
+                )
             ):
                 self.deleted_names.add(node.id)
 

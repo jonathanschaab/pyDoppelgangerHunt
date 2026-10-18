@@ -1274,3 +1274,137 @@ def test_positional_meta2_internal_nonlocal_and_global_type_param_bounds() -> No
     )
 
 
+def test_multilevel_nonlocal_harvested_expr_receiver_and_delegation_indent(
+    tmp_path: Path,
+) -> None:
+    """Verifies multi-level nested nonlocals, harvested expr receiver_kind=None, downstream cache key, and delegation indent."""
+    from pydoppelgangerhunt.fixer.dataflow import (  # pylint: disable=import-outside-toplevel
+        collect_downstream_read_names,
+    )
+    from pydoppelgangerhunt.fixer.patch import (  # pylint: disable=protected-access,import-outside-toplevel
+        _build_unit_delegation_call,
+        generate_refactoring_patch,
+    )
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        inspect_single_unit_scope,
+    )
+    from pydoppelgangerhunt.fixer.synthesis import (  # pylint: disable=import-outside-toplevel
+        synthesize_shared_helper_code,
+    )
+
+    # 1.1: Multi-level nested nonlocal does not leak intermediate function local into outer unit stores/deleted_names
+    ml_nonlocal_unit = {
+        "kind": "compound_block",
+        "start": 1,
+        "end": 9,
+        "source_text": (
+            "def level1():\n"
+            "    acc = 0\n"
+            "    def level2():\n"
+            "        nonlocal acc\n"
+            "        acc += 1\n"
+            "        del acc\n"
+            "    level2()\n"
+            "    return 1\n"
+            "res = level1()\n"
+        ),
+    }
+    ml_scope = inspect_single_unit_scope(ml_nonlocal_unit)
+    assert ml_scope["outputs"] == ["level1", "res"]
+    ml_del_unit = {
+        "kind": "compound_block",
+        "start": 1,
+        "end": 9,
+        "source_text": (
+            "acc = 5\n"
+            "def level1():\n"
+            "    acc = 0\n"
+            "    def level2():\n"
+            "        nonlocal acc\n"
+            "        del acc\n"
+            "    level2()\n"
+            "    return 1\n"
+            "res = level1()\n"
+        ),
+    }
+    assert "acc" in inspect_single_unit_scope(ml_del_unit)["outputs"]
+
+    # 1.2: Harvested comprehension units with receiver_kind=None inside same class with method_binding="method"
+    f = tmp_path / "harvested_comp.py"
+    f.write_text(
+        "class Worker:\n"
+        "    def a(self, items: list[int]) -> None:\n"
+        "        self.r1 = [x * 2 for x in items]\n"
+        "    def b(self, items: list[int]) -> None:\n"
+        "        self.r2 = [x * 2 for x in items]\n",
+        encoding="utf-8",
+    )
+    hu1 = {
+        "file": str(f),
+        "start": 3,
+        "end": 3,
+        "name": "a_comp",
+        "kind": "comprehension",
+        "receiver_kind": None,
+        "receiver_param": None,
+    }
+    hu2 = {
+        "file": str(f),
+        "start": 5,
+        "end": 5,
+        "name": "b_comp",
+        "kind": "comprehension",
+        "receiver_kind": None,
+        "receiver_param": None,
+    }
+    h_code = synthesize_shared_helper_code(
+        hu1, hu2, method_binding="method", repo_root=str(tmp_path)
+    )
+    assert "def _shared_a_comp_b_comp(self, items: Any) -> Any:" in h_code
+    patch = generate_refactoring_patch(
+        [(0.98, hu1, hu2)],
+        repo_root=str(tmp_path),
+        method_binding="method",
+        replace_clones=True,
+    )
+    assert "+    def _shared_a_comp_b_comp(self, items: Any) -> Any:" in patch
+    assert "+        self.r1 = self._shared_a_comp_b_comp(items)" in patch
+
+    # 2.1: collect_downstream_read_names distinguishes closure vs coinciding subroutine block
+    coincide_src = (
+        "def outer():\n"
+        "    def inner():\n"
+        "        val = 1\n"
+        "        return val\n"
+        "    return inner()\n"
+    )
+    closure_reads = collect_downstream_read_names(
+        coincide_src, {"kind": "closure", "start": 2, "end": 4}, {"inner"}
+    )
+    sub_reads = collect_downstream_read_names(
+        coincide_src, {"kind": "compound_block", "start": 2, "end": 4}, {"inner"}
+    )
+    assert closure_reads == set()
+    assert sub_reads == {"inner"}
+
+    # 2.2: Leading col-0 comment on multi-line unit preserves statement indentation in _build_unit_delegation_call
+    comment_src = (
+        "def run(x):\n"
+        "# col-0 note\n"
+        "    y = x + 1\n"
+        "    return y\n"
+    )
+    call_str = _build_unit_delegation_call(
+        {"kind": "compound_block", "start": 2, "end": 3},
+        comment_src,
+        comment_src.splitlines(keepends=True),
+        effective_binding="module",
+        helper_name="_shared_run",
+        inputs=["x"],
+        outputs=["y"],
+        scope={"param_details": []},
+    )
+    assert call_str.startswith("    y = _shared_run(x)")
+
+
+
