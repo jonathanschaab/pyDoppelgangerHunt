@@ -379,7 +379,20 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
         self.visit(node.annotation)
         if node.value is not None:
             self.visit(node.value)
+            self.visit(node.target)
+        elif not isinstance(node.target, ast.Name):
+            self.visit(node.target)
+
+    def visit_For(self, node: Union[ast.For, ast.AsyncFor]) -> None:
+        self.visit(node.iter)
         self.visit(node.target)
+        for stmt in node.body:
+            self.visit(stmt)
+        for stmt in node.orelse:
+            self.visit(stmt)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self.visit_For(node)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self._visit_named_expr(node, self.class_stores, check_comp=True)
@@ -1174,6 +1187,8 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         candidates: Optional[Set[str]] = None,
         u_start_col: Optional[int] = None,
         scope_node: Optional[ast.AST] = None,
+        *,
+        include_annotations: bool = True,
     ) -> None:
         super().__init__()
         self.u_start = u_start
@@ -1182,6 +1197,7 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         self.u_start_col = u_start_col
         self.candidates = candidates
         self.scope_node = scope_node
+        self.include_annotations = include_annotations
         self.live_ins: Set[str] = set()
         self.stored: Set[str] = set()
 
@@ -1289,7 +1305,8 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
             self.visit(t)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        self.visit(node.annotation)
+        if self.include_annotations:
+            self.visit(node.annotation)
         if node.value is not None:
             self.visit(node.value)
             self.visit(node.target)

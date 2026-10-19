@@ -2074,12 +2074,36 @@ def _extract_helper_symbols(
                 name_node = getattr(stmt, "name", None)
                 if isinstance(name_node, ast.Name):
                     bound.add(name_node.id)
+            elif isinstance(stmt, ast.Global):
+                for g_name in stmt.names:
+                    bound.add(f":global:{g_name}")
+            elif isinstance(stmt, ast.Nonlocal):
+                for nl_name in stmt.names:
+                    bound.add(f":nonlocal:{nl_name}")
 
             if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 _collect_helper_named_exprs(stmt)
-        return bound
+        rebound_elsewhere = {
+            s.split(":", 2)[2]
+            for s in bound
+            if s.startswith((":global:", ":nonlocal:"))
+        }
+        return bound - rebound_elsewhere
 
     class _ScopeVisitor(ast.NodeVisitor):
+
+        def _bind_to_frame(
+            self, frame: Set[str], names: Union[Set[str], Sequence[str]]
+        ) -> None:
+            for n in names:
+                if f":global:{n}" in frame:
+                    free_names.add(n)
+                elif f":nonlocal:{n}" in frame:
+                    self._check_load_name(n)
+                else:
+                    frame.add(n)
+                    if frame is scope_stack[0]:
+                        defined_names.add(n)
 
         def _bind_names(
             self, names: Union[Set[str], Sequence[str]], *, is_walrus: bool = False
@@ -2091,14 +2115,10 @@ def _extract_helper_symbols(
                             ":class_scope:" in frame
                             and ":comp_scope:" in scope_stack[-1]
                         ):
-                            frame.update(names)
-                            if frame is scope_stack[0]:
-                                defined_names.update(names)
+                            self._bind_to_frame(frame, names)
                         break
                 return
-            scope_stack[-1].update(names)
-            if len(scope_stack) == 1:
-                defined_names.update(names)
+            self._bind_to_frame(scope_stack[-1], names)
 
         def _check_load_name(self, name: str) -> None:
             if not any(name in tp for tp in type_param_scopes) and not any(
@@ -2268,7 +2288,9 @@ def _extract_helper_symbols(
             finally:
                 scope_stack.pop()
             if is_top_block:
-                defined_names.update(child_scope - {":class_scope:", ":comp_scope:"})
+                defined_names.update(
+                    s for s in child_scope if not s.startswith(":")
+                )
 
         def _handle_comprehension(
             self, elts: Sequence[ast.expr], generators: Sequence[ast.comprehension]
@@ -2336,6 +2358,16 @@ def _extract_helper_symbols(
                 self._bind_names({name})
                 if len(scope_stack) <= max_helper_scope_depth:
                     local_imported_names.add(name)
+
+        def visit_Global(self, node: ast.Global) -> None:
+            for name in node.names:
+                scope_stack[-1].add(f":global:{name}")
+                free_names.add(name)
+
+        def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+            for name in node.names:
+                scope_stack[-1].add(f":nonlocal:{name}")
+                self._check_load_name(name)
 
         def visit_Name(self, node: ast.Name) -> None:
             if isinstance(node.ctx, ast.Load):
@@ -3008,9 +3040,9 @@ def _validate_helper_compilation(helper_code: str) -> bool:
             return True
         except IndentationError:
             pass
-        except (SyntaxError, ValueError):
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
             return False
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False
 
     sep = "\r\n\r\n\r\n" if "\r\n\r\n\r\n" in helper_code else "\n\n\n"
@@ -3025,7 +3057,7 @@ def _validate_helper_compilation(helper_code: str) -> bool:
                 else:
                     compile(body, "<patch_helper>", "exec")
             return True
-        except (SyntaxError, ValueError):
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
             return False
     return False
 

@@ -135,6 +135,18 @@ def _extract_single_node_local_names(
         if isinstance(curr, _INNER_SCOPE_TYPES):
             stack.extend(iter_nested_scope_header_nodes(curr))
             continue
+        if isinstance(curr, ast.AnnAssign):
+            stack.append(curr.annotation)
+            if curr.value is not None:
+                stack.append(curr.value)
+                stack.append(curr.target)
+            elif not isinstance(scope_node, (ast.ClassDef, ast.Module)) and isinstance(
+                curr.target, ast.Name
+            ):
+                names.add(curr.target.id)
+            elif not isinstance(curr.target, ast.Name):
+                stack.append(curr.target)
+            continue
         if isinstance(curr, ast.Name) and isinstance(curr.ctx, ast.Store):
             names.add(curr.id)
         elif isinstance(curr, ast.Import):

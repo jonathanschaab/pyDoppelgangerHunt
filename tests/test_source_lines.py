@@ -1794,3 +1794,143 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
         expr_pragma_src, [(expr_unit_col, "_shared_comp(items)")]
     )
     assert "# type: ignore[operator]" in refactored_expr
+
+    # 19. Finding 1.1: ast.For / ast.AsyncFor visits iter before target in _ScopeVisitor and _ClassScopeVisitor
+    for_self_ref_src = (
+        "def walk(node):\n"
+        "    for node in node.children:\n"
+        "        process(node)\n"
+    )
+    for_scope = inspect_single_unit_scope(
+        {
+            "kind": "loop_body",
+            "start": 2,
+            "end": 3,
+            "source_text": for_self_ref_src,
+            "source_code": "for node in node.children:\n    process(node)\n",
+        },
+        tree=ast.parse(for_self_ref_src),
+    )
+    assert "node" in for_scope["inputs"]
+
+    cls_for_src = (
+        "def outer(x):\n"
+        "    x = x + 1\n"
+        "    class C:\n"
+        "        for x in x:\n"
+        "            pass\n"
+        "    return C\n"
+    )
+    cls_for_reads = collect_downstream_read_names(
+        cls_for_src, {"start": 2, "end": 2}, {"x"}, tree=ast.parse(cls_for_src)
+    )
+    assert cls_for_reads is not None and "x" in cls_for_reads
+
+    # 20. Finding 1.2: Live-in reads after conditional stores in _inspect_unit_scope and collect_downstream_read_names
+    cond_reset_src = (
+        "def gen(acc, reset_batch, step):\n"
+        "    if reset_batch:\n"
+        "        acc = 0\n"
+        "    acc += step\n"
+        "    yield acc\n"
+    )
+    cond_reset_scope = inspect_single_unit_scope(
+        {
+            "kind": "compound_block",
+            "start": 2,
+            "end": 5,
+            "source_text": cond_reset_src,
+            "source_code": "if reset_batch:\n    acc = 0\nacc += step\nyield acc\n",
+        },
+        tree=ast.parse(cond_reset_src),
+    )
+    assert "acc" in cond_reset_scope["inputs"]
+
+    loop_cond_src = (
+        "def run_steps(steps, acc):\n"
+        "    for reset_batch, step in steps:\n"
+        "        if reset_batch:\n"
+        "            acc = 0\n"
+        "        acc = acc + step\n"
+        "    return 0\n"
+    )
+    loop_cond_scope = inspect_single_unit_scope(
+        {
+            "kind": "compound_block",
+            "start": 3,
+            "end": 5,
+            "source_text": loop_cond_src,
+            "source_code": "if reset_batch:\n    acc = 0\nacc = acc + step\n",
+        },
+        tree=ast.parse(loop_cond_src),
+    )
+    assert "acc" in loop_cond_scope["inputs"]
+    loop_cond_reads = collect_downstream_read_names(
+        loop_cond_src,
+        {"start": 3, "end": 5},
+        {"acc"},
+        tree=ast.parse(loop_cond_src),
+        unit_inputs=set(loop_cond_scope["inputs"]),
+    )
+    assert loop_cond_reads is not None and "acc" in loop_cond_reads
+
+    # 21. Finding 1.3: Bare ast.AnnAssign in ClassDef not treated as runtime store
+    from pydoppelgangerhunt.fixer._df_closures import _extract_single_node_local_names
+
+    cls_ann_tree = ast.parse("class C:\n    bare_x: int\n    assigned_y: int = 1\n")
+    cls_node = cls_ann_tree.body[0]
+    cls_locals = _extract_single_node_local_names(cls_node)
+    assert "bare_x" not in cls_locals
+    assert "assigned_y" in cls_locals
+
+    cls_ann_ds_src = (
+        "def outer(x):\n"
+        "    x = x + 1\n"
+        "    class C:\n"
+        "        x: int\n"
+        "        z = x\n"
+        "    return C\n"
+    )
+    cls_ann_ds_reads = collect_downstream_read_names(
+        cls_ann_ds_src, {"start": 2, "end": 2}, {"x"}, tree=ast.parse(cls_ann_ds_src)
+    )
+    assert cls_ann_ds_reads is not None and "x" in cls_ann_ds_reads
+
+    # 22. Finding 1.4: Bare non-Name AnnAssign targets visited in _ScopeVisitor
+    bare_attr_sub_src = "self.value: int\narr[idx]: str\n"
+    bare_attr_scope = inspect_single_unit_scope(
+        {
+            "kind": "compound_block",
+            "start": 1,
+            "end": 2,
+            "source_text": bare_attr_sub_src,
+            "source_code": bare_attr_sub_src,
+        },
+        tree=ast.parse(bare_attr_sub_src),
+    )
+    assert "self" in bare_attr_scope["inputs"]
+    assert "arr" in bare_attr_scope["inputs"]
+    assert "idx" in bare_attr_scope["inputs"]
+    assert bare_attr_scope["binding_kind"] == "instance"
+
+    # 23. Finding 1.5: _extract_helper_symbols respects global/nonlocal in _collect_direct_bindings
+    global_helper_src = (
+        "def _shared_helper():\n"
+        "    def inner():\n"
+        "        return X\n"
+        "    global X\n"
+        "    X = 1\n"
+        "    return inner()\n"
+    )
+    g_free, g_def, _ = _extract_helper_symbols(ast.parse(global_helper_src))
+    assert "X" in g_free
+    assert "X" not in g_def
+
+    # 24. Finding 1.6: _validate_helper_compilation catches RecursionError
+    from pydoppelgangerhunt.fixer.patch import _validate_helper_compilation
+
+    deep_expr = "(" * 5000 + "1" + ")" * 5000
+    assert _validate_helper_compilation(deep_expr) is False
+    assert _validate_helper_compilation("    " + deep_expr) is False
+    assert _validate_helper_compilation("import os\n\n\n" + deep_expr) is False
+

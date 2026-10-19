@@ -22,7 +22,7 @@ from typing import (
 from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
 from pydoppelgangerhunt.fixer._df_closures import _extract_single_node_local_names
 from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
-from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor
+from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor, _UnitLiveInVisitor
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.fixer.source import (
     _SUBROUTINE_KINDS,
@@ -616,6 +616,8 @@ class _ScopeVisitor(ast.NodeVisitor):
                 self._record_store_name(node.target.id)
             else:
                 self.visit(node.target)
+        elif not isinstance(node.target, ast.Name):
+            self.visit(node.target)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)
@@ -705,16 +707,18 @@ class _ScopeVisitor(ast.NodeVisitor):
 
     def _visit_loop(self, node: Union[ast.For, ast.AsyncFor, ast.While]) -> None:
         self.loop_depth += 1
-        if isinstance(node, (ast.For, ast.AsyncFor)):
-            self.visit(node.iter)
-            self.visit(node.target)
+        try:
+            if isinstance(node, (ast.For, ast.AsyncFor)):
+                self.visit(node.iter)
+                self.visit(node.target)
+            else:
+                self.visit(node.test)
             for stmt in node.body:
                 self.visit(stmt)
             for stmt in node.orelse:
                 self.visit(stmt)
-        else:
-            self.generic_visit(node)
-        self.loop_depth -= 1
+        finally:
+            self.loop_depth -= 1
 
     def visit_For(self, node: ast.For) -> None:
         self._visit_loop(node)
@@ -1530,6 +1534,77 @@ def _rank_param_kind(
         return 2
     return 1
 
+
+def _find_enclosing_pre_bound_names(
+    mod_tree: ast.AST, s_line: int, e_line: int
+) -> Tuple[Set[str], bool]:
+    """Finds names bound before s_line in scopes enclosing [s_line, e_line] and loop containment."""
+    bound_before: Set[str] = set()
+    in_loop = False
+    stack: List[ast.AST] = [mod_tree]
+    while stack:
+        curr = stack.pop()
+        for child in ast.iter_child_nodes(curr):
+            c_start = getattr(child, "lineno", None)
+            c_end = getattr(child, "end_lineno", c_start)
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                decs = getattr(child, "decorator_list", [])
+                earliest = min(
+                    [c_start] + [getattr(d, "lineno", c_start) for d in decs]
+                    if c_start is not None
+                    else [0]
+                )
+                if isinstance(c_start, int) and c_start < s_line:
+                    bound_before.add(child.name)
+                if (
+                    isinstance(earliest, int)
+                    and isinstance(c_end, int)
+                    and earliest <= s_line
+                    and e_line <= c_end
+                ):
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        for arg in (
+                            child.args.posonlyargs
+                            + child.args.args
+                            + child.args.kwonlyargs
+                            + ([child.args.vararg] if child.args.vararg else [])
+                            + ([child.args.kwarg] if child.args.kwarg else [])
+                        ):
+                            bound_before.add(arg.arg)
+                    stack.append(child)
+                continue
+            if (
+                isinstance(child, ast.AnnAssign)
+                and child.value is None
+                and isinstance(child.target, ast.Name)
+            ):
+                stack.append(child.annotation)
+                continue
+            if isinstance(child, (ast.For, ast.AsyncFor, ast.While)):
+                if (
+                    isinstance(c_start, int)
+                    and isinstance(c_end, int)
+                    and c_start <= s_line
+                    and e_line <= c_end
+                    and (c_start < s_line or c_end > e_line)
+                ):
+                    in_loop = True
+            if isinstance(c_start, int) and c_start < s_line:
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                    bound_before.add(child.id)
+                elif isinstance(child, (ast.Import, ast.ImportFrom)):
+                    for alias in child.names:
+                        bound_before.add(alias.asname or alias.name.split(".", 1)[0])
+                elif isinstance(child, ast.ExceptHandler) and isinstance(child.name, str):
+                    bound_before.add(child.name)
+                elif type(child).__name__ in ("MatchAs", "MatchStar", "MatchMapping"):
+                    m_name = getattr(child, "name", None) or getattr(child, "rest", None)
+                    if isinstance(m_name, str):
+                        bound_before.add(m_name)
+            stack.append(child)
+    return bound_before, in_loop
+
+
 def _inspect_unit_scope(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
@@ -1854,6 +1929,38 @@ def _inspect_unit_scope(
                     visitor.loads.append(del_name)
                 if del_name not in visitor.read_before_write:
                     visitor.read_before_write.append(del_name)
+
+        if is_subroutine:
+            live_in_visitor = _UnitLiveInVisitor(1, 10**9, include_annotations=False)
+            for stmt in candidate_stmts:
+                live_in_visitor.visit(stmt)
+            cond_live_ins = [
+                v
+                for v in sorted(live_in_visitor.live_ins)
+                if v in visitor.loads
+                and v not in visitor.params
+                and v not in visitor.globals
+                and v not in BUILTIN_NAMES
+                and v not in visitor.read_before_write
+            ]
+            if cond_live_ins:
+                pre_bound: Set[str] = set()
+                in_enclosing_loop = False
+                if any(v not in def_assigned for v in cond_live_ins):
+                    u_start = parse_unit_coord(unit, "start", default=0)
+                    u_end = parse_unit_coord(unit, "end", default=u_start)
+                    mod_tree = file_tree
+                    if mod_tree is None and u_start > 0:
+                        full_src = _get_full_source()
+                        if full_src:
+                            mod_tree = _get_or_parse_tree(full_src)
+                    if mod_tree is not None and u_start > 0:
+                        pre_bound, in_enclosing_loop = _find_enclosing_pre_bound_names(
+                            mod_tree, u_start, u_end
+                        )
+                for v in cond_live_ins:
+                    if v in def_assigned or in_enclosing_loop or v in pre_bound:
+                        visitor.read_before_write.append(v)
 
         free_vars = [
             name for name in visitor.loads
