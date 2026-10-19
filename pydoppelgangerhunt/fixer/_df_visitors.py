@@ -445,6 +445,7 @@ class _OuterExprVisitor(_BaseScopeVisitor):
         super().__init__()
         self.names: Set[str] = set()
         self.ordered_names: List[str] = []
+        self.stored: Set[str] = set()
 
     def _record_name(self, name: str) -> None:
         if name not in self.names:
@@ -452,6 +453,7 @@ class _OuterExprVisitor(_BaseScopeVisitor):
         self.names.add(name)
 
     def _sync_added_names(self, before: Set[str], before_nodes_len: int) -> None:
+        self.names -= self.stored - before
         added = self.names - before
         if not added:
             return
@@ -471,12 +473,18 @@ class _OuterExprVisitor(_BaseScopeVisitor):
                 self.ordered_names.append(name)
 
     def visit_Name(self, node: ast.Name) -> None:
-        if isinstance(node.ctx, ast.Load) and not self._is_in_comp(node.id):
+        if (
+            isinstance(node.ctx, ast.Load)
+            and not self._is_in_comp(node.id)
+            and node.id not in self.stored
+        ):
             self._record_name(node.id)
             self.load_nodes.append(node)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)
+        if isinstance(node.target, ast.Name):
+            self.stored.add(node.target.id)
 
     def visit_FunctionDef(
         self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef]
@@ -1252,7 +1260,8 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         if self._is_inside(node):
             self._record_nested_free_reads(node, include_body=False)
             self.stored.add(node.name)
-            self._record_nested_free_reads(node, include_header=False)
+            if self.include_annotations or isinstance(node, ast.ClassDef):
+                self._record_nested_free_reads(node, include_header=False)
         else:
             self.generic_visit(node)
 

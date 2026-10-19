@@ -182,6 +182,32 @@ class _ScopeVisitor(ast.NodeVisitor):
             if receiver_names is not None
             else ("self", "cls")
         )
+        self._unit_top_locals: Set[str] = set()
+
+    def visit_Module(self, node: ast.Module) -> None:
+        if self.is_subroutine and not self._unit_top_locals:
+            if (
+                len(node.body) == 1
+                and isinstance(node.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.body[0].name == _SYNTHETIC_WRAPPER_NAME
+            ):
+                wrapper_body = node.body[0].body
+                if (
+                    self.loop_offset > 0
+                    and len(wrapper_body) == 1
+                    and isinstance(wrapper_body[0], (ast.For, ast.AsyncFor, ast.While))
+                ):
+                    wrapper_body = wrapper_body[0].body
+                target_mod = ast.Module(body=wrapper_body, type_ignores=[])
+            else:
+                target_mod = node
+            self._unit_top_locals = _extract_single_node_local_names(
+                target_mod,
+                include_globals=False,
+                include_nonlocals=False,
+                include_self_name=False,
+            )
+        self.generic_visit(node)
 
     def visit(self, node: ast.AST) -> Any:
         self._ancestors.append(node)
@@ -279,7 +305,11 @@ class _ScopeVisitor(ast.NodeVisitor):
         if eff_len <= 1 or is_active_nonlocal:
             self.deleted_names.discard(name)
         if is_active_nonlocal:
-            if name not in BUILTIN_NAMES and name not in self.stores:
+            if (
+                name not in BUILTIN_NAMES
+                and name not in self.stores
+                and name not in self._unit_top_locals
+            ):
                 self.stores.append(name)
         elif is_active_global:
             pass
@@ -307,6 +337,13 @@ class _ScopeVisitor(ast.NodeVisitor):
             ):
                 body = body[0].body
                 self.loop_offset = 0
+            if not self._unit_top_locals:
+                self._unit_top_locals = _extract_single_node_local_names(
+                    ast.Module(body=body, type_ignores=[]),
+                    include_globals=False,
+                    include_nonlocals=False,
+                    include_self_name=False,
+                )
             if isinstance(node, ast.AsyncFunctionDef):
                 self.is_async = True
             for stmt in body:
@@ -350,7 +387,15 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._type_param_scopes.append(tp_names)
         try:
             if is_top:
-                self._scope_stack.append(set(self.params) | tp_names)
+                self._unit_top_locals = _extract_single_node_local_names(
+                    node,
+                    include_globals=False,
+                    include_nonlocals=False,
+                    include_self_name=False,
+                )
+                self._scope_stack.append(
+                    set(self.params) | tp_names | self._unit_top_locals
+                )
             else:
                 for tp in getattr(node, "type_params", []):
                     self.visit(tp)
@@ -367,7 +412,7 @@ class _ScopeVisitor(ast.NodeVisitor):
                     self.visit(node.returns)
                 self._record_store_name(node.name)
                 if not self._scope_stack:
-                    self._scope_stack.append(set())
+                    self._scope_stack.append(set(self._unit_top_locals))
                     created_outer = True
                 nested_locals = _extract_single_node_local_names(
                     node,
@@ -397,7 +442,7 @@ class _ScopeVisitor(ast.NodeVisitor):
                 self.visit(kw_default)
         created_outer = False
         if not self._scope_stack:
-            self._scope_stack.append(set())
+            self._scope_stack.append(set(self._unit_top_locals))
             created_outer = True
         self._scope_stack.append(self._extract_arg_names(node.args))
         saved_comp_depth = self._comprehension_depth
@@ -439,7 +484,7 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._record_store_name(node.name)
             created_outer = False
             if not self._scope_stack:
-                self._scope_stack.append(set())
+                self._scope_stack.append(set(self._unit_top_locals))
                 created_outer = True
             self._scope_stack.append({":class_scope:", *tp_names})
             self.class_depth += 1
@@ -518,6 +563,12 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._record_store_name(rest)
         self.generic_visit(node)
 
+    def _deferred_scope_depth(self) -> int:
+        return (
+            sum(1 for s in self._scope_stack if ":class_scope:" not in s)
+            - self._comprehension_depth
+        )
+
     def _record_load_name(self, name: str) -> None:
         is_inner = any(
             name in s
@@ -528,7 +579,7 @@ class _ScopeVisitor(ast.NodeVisitor):
             if name not in self.loads:
                 self.loads.append(name)
             if (
-                (len(self._scope_stack) - self._comprehension_depth) <= 1
+                self._deferred_scope_depth() <= 1
                 and name not in self.params
                 and name not in self.stores
                 and name not in self.read_before_write
@@ -544,7 +595,7 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._record_store_name(node.id)
         elif isinstance(node.ctx, ast.Del):
             if (
-                (len(self._scope_stack) - self._comprehension_depth) <= 1
+                self._deferred_scope_depth() <= 1
                 and self.class_depth == 0
             ):
                 self._record_load_name(node.id)
@@ -639,7 +690,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self._comprehension_depth += 1
         created_outer = False
         if not self._scope_stack:
-            self._scope_stack.append(set())
+            self._scope_stack.append(set(self._unit_top_locals))
             created_outer = True
         inner_vars: Set[str] = set()
         self._scope_stack.append(inner_vars)
@@ -688,6 +739,7 @@ class _ScopeVisitor(ast.NodeVisitor):
                 )
                 or name in self.stores
                 or name in self.params
+                or name in self._unit_top_locals
             )
             if (eff_len <= 1 or not is_unit_bound) and name not in self.nonlocals:
                 self.nonlocals.append(name)

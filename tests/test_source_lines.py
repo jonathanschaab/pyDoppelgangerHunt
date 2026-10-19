@@ -699,7 +699,7 @@ def test_resolve_unit_ast_end_col_multistatement_with_start_col_and_comp_target_
     )
     fn_scope = ast.parse(code).body[0]
     assert _resolve_unit_ast_end_col(fn_scope, {"start": 2, "end": 2, "start_col": 4}) == len("    x = 1")
-    assert _resolve_unit_ast_end_col(fn_scope, {"start": 2, "end": 3, "start_col": 4}) is None
+    assert _resolve_unit_ast_end_col(fn_scope, {"start": 2, "end": 3, "start_col": 4}) == len("    y = 2")
     assert _resolve_unit_ast_end_col(fn_scope, {"start": 2, "end": 3, "start_col": 8}) is None
 
     comp_bound = ast.parse("def _shared(items, a):\n    return [x for (x, a[x]) in items]\n")
@@ -1997,5 +1997,88 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
             sys.modules.pop("tomli", None)
     assert parsed_sec.get("exclude") == [["x", "y"]]
     assert parsed_sec.get("threshold") == 0.91
+
+    # 27. Finding 1: Forward-referenced nonlocal bindings in whole functions and subroutines
+    fwd_nl_fn_src = (
+        "def compute(a: int) -> int:\n"
+        "    def step(d: int) -> None:\n"
+        "        nonlocal acc\n"
+        "        acc += d\n"
+        "    acc = a\n"
+        "    step(5)\n"
+        "    return acc\n"
+    )
+    fwd_nl_fn_scope = inspect_single_unit_scope(
+        {
+            "kind": "function",
+            "start": 1,
+            "end": 7,
+            "source_text": fwd_nl_fn_src,
+            "source_code": fwd_nl_fn_src,
+        },
+        tree=ast.parse(fwd_nl_fn_src),
+    )
+    assert fwd_nl_fn_scope["nonlocals"] == []
+    assert fwd_nl_fn_scope["inputs"] == ["a"]
+
+    fwd_nl_sub_code = (
+        "def step(d: int) -> None:\n"
+        "    nonlocal acc\n"
+        "    acc += d\n"
+        "acc = a\n"
+        "step(5)\n"
+    )
+    fwd_nl_sub_scope = inspect_single_unit_scope(
+        {
+            "kind": "compound_block",
+            "start": 2,
+            "end": 6,
+            "source_text": fwd_nl_fn_src,
+            "source_code": fwd_nl_sub_code,
+        },
+        tree=ast.parse(fwd_nl_fn_src),
+    )
+    assert fwd_nl_sub_scope["nonlocals"] == []
+    assert fwd_nl_sub_scope["inputs"] == ["a"]
+
+    # 28. Finding 2: Immediate ClassDef body execution records read_before_write before outer store
+    cls_rbw_src = (
+        "def build() -> type:\n"
+        "    class C:\n"
+        "        val = x + 1\n"
+        "    x = 0\n"
+        "    return C\n"
+    )
+    cls_rbw_scope = inspect_single_unit_scope(
+        {
+            "kind": "closure",
+            "start": 1,
+            "end": 5,
+            "source_text": cls_rbw_src,
+            "source_code": cls_rbw_src,
+        },
+        tree=ast.parse(cls_rbw_src),
+    )
+    assert "x" in cls_rbw_scope["inputs"]
+
+    # 29. Finding 3: Intra-expression walrus target reads in _OuterExprVisitor
+    from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor
+
+    walrus_expr_v = _OuterExprVisitor()
+    walrus_expr_v.visit(ast.parse("((w := transform(x)) + w for x in items)").body[0])
+    assert "w" not in walrus_expr_v.names
+    assert walrus_expr_v.ordered_names == ["items", "transform"]
+
+    # 30. Finding 4: Multi-statement multi-line units with start_col in _resolve_unit_ast_end_col
+    from pydoppelgangerhunt.fixer._df_cache import _resolve_unit_ast_end_col
+
+    ms_tree = ast.parse("def f(x):\n    a = x + 1\n    b = a * 2\n")
+    assert (
+        _resolve_unit_ast_end_col(
+            ms_tree.body[0], {"start": 2, "end": 3, "start_col": 4}
+        )
+        == 13
+    )
+
 
 
