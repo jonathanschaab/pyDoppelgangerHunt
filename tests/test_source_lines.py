@@ -1934,3 +1934,68 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     assert _validate_helper_compilation("    " + deep_expr) is False
     assert _validate_helper_compilation("import os\n\n\n" + deep_expr) is False
 
+    # 25. Finding 1.1: Comprehension targets, lambda locals, closed ExceptHandlers, and enclosing class attrs
+    # do not leak into _find_enclosing_pre_bound_names.
+    leak_src = (
+        "class Box:\n"
+        "    CLASS_CONST = 1\n"
+        "    def process(self, items, flag):\n"
+        "        squares = [k * k for k in items]\n"
+        "        fn = lambda l_arg: l_arg + 1\n"
+        "        try:\n"
+        "            risky()\n"
+        "        except Exception as err:\n"
+        "            pass\n"
+        "        if flag:\n"
+        "            k = 10\n"
+        "            err = 20\n"
+        "            CLASS_CONST = 30\n"
+        "        res = (k, err, CLASS_CONST)\n"
+        "        return res\n"
+    )
+    leak_scope = inspect_single_unit_scope(
+        {
+            "kind": "compound_block",
+            "start": 10,
+            "end": 14,
+            "source_text": leak_src,
+            "source_code": (
+                "if flag:\n"
+                "    k = 10\n"
+                "    err = 20\n"
+                "    CLASS_CONST = 30\n"
+                "res = (k, err, CLASS_CONST)\n"
+            ),
+        },
+        tree=ast.parse(leak_src),
+    )
+    assert "k" not in leak_scope["inputs"]
+    assert "err" not in leak_scope["inputs"]
+    assert "CLASS_CONST" not in leak_scope["inputs"]
+    assert {"k", "err", "CLASS_CONST"} <= set(leak_scope["conditional_outputs"])
+
+    # 26. Finding 1.2: Zero-dependency TOML fallback tracks multiline arrays across non-target sections
+    assert parsed_hdrless.get("exclude") == [["a", "b"]]
+    sec_toml = tmp_path / "sec_multiline.toml"
+    sec_toml.write_text(
+        '[tool.other]\nmatrix = [\n  "[tool.pydoppelgangerhunt]"\n]\n'
+        '[tool.pydoppelgangerhunt]\nexclude = [\n  ["x", "y"]\n]\nthreshold = 0.91\n',
+        encoding="utf-8",
+    )
+    try:
+        sys.modules["tomllib"] = None  # type: ignore[assignment]
+        sys.modules["tomli"] = None  # type: ignore[assignment]
+        parsed_sec = load_toml_section(str(sec_toml), "pydoppelgangerhunt")
+    finally:
+        if orig_tomllib is not None:
+            sys.modules["tomllib"] = orig_tomllib
+        else:
+            sys.modules.pop("tomllib", None)
+        if orig_tomli is not None:
+            sys.modules["tomli"] = orig_tomli
+        else:
+            sys.modules.pop("tomli", None)
+    assert parsed_sec.get("exclude") == [["x", "y"]]
+    assert parsed_sec.get("threshold") == 0.91
+
+

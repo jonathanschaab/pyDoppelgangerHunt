@@ -20,7 +20,11 @@ from typing import (
 )
 
 from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
-from pydoppelgangerhunt.fixer._df_closures import _extract_single_node_local_names
+from pydoppelgangerhunt.fixer._df_closures import (
+    _extract_comprehension_walrus_names,
+    _extract_single_node_local_names,
+    iter_nested_scope_header_nodes,
+)
 from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
 from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor, _UnitLiveInVisitor
 from pydoppelgangerhunt.reporters import extract_unit_source_code
@@ -1541,67 +1545,95 @@ def _find_enclosing_pre_bound_names(
     """Finds names bound before s_line in scopes enclosing [s_line, e_line] and loop containment."""
     bound_before: Set[str] = set()
     in_loop = False
-    stack: List[ast.AST] = [mod_tree]
-    while stack:
-        curr = stack.pop()
-        for child in ast.iter_child_nodes(curr):
-            c_start = getattr(child, "lineno", None)
-            c_end = getattr(child, "end_lineno", c_start)
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                decs = getattr(child, "decorator_list", [])
-                earliest = min(
-                    [c_start] + [getattr(d, "lineno", c_start) for d in decs]
-                    if c_start is not None
-                    else [0]
-                )
-                if isinstance(c_start, int) and c_start < s_line:
-                    bound_before.add(child.name)
-                if (
-                    isinstance(earliest, int)
-                    and isinstance(c_end, int)
-                    and earliest <= s_line
-                    and e_line <= c_end
-                ):
-                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        for arg in (
-                            child.args.posonlyargs
-                            + child.args.args
-                            + child.args.kwonlyargs
-                            + ([child.args.vararg] if child.args.vararg else [])
-                            + ([child.args.kwarg] if child.args.kwarg else [])
-                        ):
-                            bound_before.add(arg.arg)
-                    stack.append(child)
-                continue
-            if (
-                isinstance(child, ast.AnnAssign)
-                and child.value is None
-                and isinstance(child.target, ast.Name)
+    intervals = [
+        (earliest_start, n_end, span, node)
+        for earliest_start, n_end, span, node in _get_tree_scope_intervals(mod_tree)
+        if earliest_start <= s_line and e_line <= n_end
+    ]
+    intervals.sort(key=lambda item: (item[0], -item[1], -item[2]))
+    innermost_scope = intervals[-1][3] if intervals else mod_tree
+    active_scopes: List[ast.AST] = []
+    if isinstance(mod_tree, ast.Module):
+        active_scopes.append(mod_tree)
+    for _estart, _nend, _span, s_node in intervals:
+        if isinstance(s_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            active_scopes.append(s_node)
+        elif isinstance(s_node, ast.ClassDef) and s_node is innermost_scope:
+            active_scopes.append(s_node)
+
+    for scope_node in active_scopes:
+        is_class_scope = isinstance(scope_node, ast.ClassDef)
+        if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for arg in (
+                scope_node.args.posonlyargs
+                + scope_node.args.args
+                + scope_node.args.kwonlyargs
+                + ([scope_node.args.vararg] if scope_node.args.vararg else [])
+                + ([scope_node.args.kwarg] if scope_node.args.kwarg else [])
             ):
-                stack.append(child.annotation)
-                continue
-            if isinstance(child, (ast.For, ast.AsyncFor, ast.While)):
-                if (
-                    isinstance(c_start, int)
-                    and isinstance(c_end, int)
-                    and c_start <= s_line
-                    and e_line <= c_end
-                    and (c_start < s_line or c_end > e_line)
+                bound_before.add(arg.arg)
+        stack: List[ast.AST] = [scope_node]
+        while stack:
+            curr = stack.pop()
+            children = (
+                getattr(curr, "body", [])
+                if curr is scope_node
+                else ast.iter_child_nodes(curr)
+            )
+            for child in children:
+                c_start = getattr(child, "lineno", None)
+                c_end = getattr(child, "end_lineno", c_start)
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    if isinstance(c_start, int) and c_start < s_line:
+                        bound_before.add(child.name)
+                    if not is_class_scope:
+                        stack.extend(iter_nested_scope_header_nodes(child))
+                    continue
+                if isinstance(child, ast.Lambda):
+                    if not is_class_scope:
+                        stack.extend(iter_nested_scope_header_nodes(child))
+                    continue
+                if isinstance(
+                    child, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
                 ):
-                    in_loop = True
-            if isinstance(c_start, int) and c_start < s_line:
-                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
-                    bound_before.add(child.id)
-                elif isinstance(child, (ast.Import, ast.ImportFrom)):
-                    for alias in child.names:
-                        bound_before.add(alias.asname or alias.name.split(".", 1)[0])
-                elif isinstance(child, ast.ExceptHandler) and isinstance(child.name, str):
-                    bound_before.add(child.name)
-                elif type(child).__name__ in ("MatchAs", "MatchStar", "MatchMapping"):
-                    m_name = getattr(child, "name", None) or getattr(child, "rest", None)
-                    if isinstance(m_name, str):
-                        bound_before.add(m_name)
-            stack.append(child)
+                    if isinstance(c_start, int) and c_start < s_line and not is_class_scope:
+                        bound_before.update(_extract_comprehension_walrus_names(child))
+                    continue
+                if (
+                    isinstance(child, ast.AnnAssign)
+                    and child.value is None
+                    and isinstance(child.target, ast.Name)
+                ):
+                    stack.append(child.annotation)
+                    continue
+                if isinstance(child, (ast.For, ast.AsyncFor, ast.While)):
+                    if (
+                        isinstance(c_start, int)
+                        and isinstance(c_end, int)
+                        and c_start <= s_line
+                        and e_line <= c_end
+                        and (c_start < s_line or c_end > e_line)
+                    ):
+                        in_loop = True
+                if isinstance(c_start, int) and c_start < s_line:
+                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                        bound_before.add(child.id)
+                    elif isinstance(child, (ast.Import, ast.ImportFrom)):
+                        for alias in child.names:
+                            bound_before.add(alias.asname or alias.name.split(".", 1)[0])
+                    elif (
+                        isinstance(child, ast.ExceptHandler)
+                        and isinstance(child.name, str)
+                        and isinstance(c_end, int)
+                        and c_start <= s_line
+                        and e_line <= c_end
+                    ):
+                        bound_before.add(child.name)
+                    elif type(child).__name__ in ("MatchAs", "MatchStar", "MatchMapping"):
+                        m_name = getattr(child, "name", None) or getattr(child, "rest", None)
+                        if isinstance(m_name, str):
+                            bound_before.add(m_name)
+                stack.append(child)
     return bound_before, in_loop
 
 

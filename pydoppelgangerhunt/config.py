@@ -399,13 +399,22 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
                     in_multiline_key = None
                     multiline_tokens = []
                 continue
+            if multiline_depth > 0:
+                multiline_depth = _count_bracket_depth(stripped, multiline_depth)
+                continue
             if stripped == target_section:
                 in_section = True
                 continue
-            if stripped.startswith("[") and in_section:
+            if stripped.startswith("[") and stripped.endswith("]") and in_section:
                 in_section = False
                 continue
-            if in_section and "=" in stripped:
+            if "=" in stripped:
+                if not in_section:
+                    _, v_raw = stripped.split("=", 1)
+                    v_str = v_raw.strip()
+                    if v_str.startswith("["):
+                        multiline_depth = _count_bracket_depth(v_str, 0)
+                    continue
                 k, v = stripped.split("=", 1)
                 k = k.strip().strip("\"'")
                 v = v.strip()

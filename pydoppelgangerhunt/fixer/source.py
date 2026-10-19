@@ -10,6 +10,7 @@ import tokenize
 import warnings
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
+from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
 from pydoppelgangerhunt.source_lines import (
     count_physical_newlines,
     detect_line_ending,
@@ -1522,9 +1523,8 @@ def _find_innermost_enclosing_node(
     if tree is None:
         if not source_text.strip():
             return None
-        try:
-            tree = ast.parse(source_text)
-        except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
+        tree = _get_or_parse_tree(source_text)
+        if tree is None:
             return None
 
     candidates: List[Tuple[int, ast.AST, int, int]] = []
