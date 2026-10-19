@@ -187,10 +187,22 @@ def _extract_single_node_local_names(
 def _extract_scope_local_names(
     scope_node: ast.AST,
     module_tree: Optional[ast.AST] = None,
+    *,
+    include_classes: bool = True,
+    include_self_name: bool = True,
 ) -> Set[str]:
     """Extracts parameters and locally assigned/imported/defined symbols in scope_node
     and all enclosing scopes up to module level."""
-    names = _extract_single_node_local_names(scope_node)
+    names = (
+        _extract_single_node_local_names(scope_node)
+        if include_self_name
+        else _extract_single_node_local_names(scope_node, include_self_name=False)
+    )
+    allowed_types = (
+        (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
+        if include_classes
+        else (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)
+    )
     if module_tree is not None and module_tree is not scope_node:
         parent_map = _get_scope_parent_map(module_tree)
         curr: Optional[ast.AST] = parent_map.get(scope_node)
@@ -198,14 +210,10 @@ def _extract_scope_local_names(
         while curr is not None:
             if curr is module_tree:
                 visited_module_tree = True
-            if isinstance(
-                curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
-            ):
+            if isinstance(curr, allowed_types):
                 names.update(_extract_single_node_local_names(curr))
             curr = parent_map.get(curr)
-        if not visited_module_tree and isinstance(
-            module_tree, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-        ):
+        if not visited_module_tree and isinstance(module_tree, allowed_types):
             names.update(_extract_single_node_local_names(module_tree))
     return names
 

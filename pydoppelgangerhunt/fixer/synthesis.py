@@ -1501,7 +1501,7 @@ def synthesize_shared_helper_code(
         return ""
     if any(
         h in scope.get("control_flow_hazards", [])
-        for h in ("type_param_closure_capture", "pathological_ast")
+        for h in ("type_param_closure_capture", "pathological_ast", "deleted_output")
     ):
         return ""
     if not is_same_class and not _is_same_file_path(f1, f2, repo_root=repo_root) and (

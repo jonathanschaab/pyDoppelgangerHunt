@@ -31,6 +31,7 @@ from pydoppelgangerhunt.fixer._df_cache import (
 )
 from pydoppelgangerhunt.fixer._df_closures import (
     _collect_pre_unit_closures,
+    _extract_scope_local_names,
     _extract_single_node_local_names,
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
@@ -517,6 +518,12 @@ def collect_downstream_read_names(
             )
 
         is_module = isinstance(scope_node, ast.Module)
+        outer_locals = _extract_scope_local_names(
+            scope_node,
+            effective_tree,
+            include_classes=False,
+            include_self_name=False,
+        )
 
         visitor = _DownstreamReadVisitor(
             u_start,
@@ -528,6 +535,7 @@ def collect_downstream_read_names(
             is_module_scope=is_module,
             u_start_col=u_start_col,
         )
+        visitor.outer_bound.update(outer_locals)
         scope_stmts = _extract_scope_stmts(scope_node)
         for stmt in scope_stmts:
             visitor.visit(stmt)
@@ -545,6 +553,7 @@ def collect_downstream_read_names(
                 is_module_scope=is_module,
                 u_start_col=u_start_col,
             )
+            loop_visitor.outer_bound.update(outer_locals)
             for stmt in scope_stmts:
                 loop_visitor.visit(stmt)
             loaded.update(loop_visitor.loaded)

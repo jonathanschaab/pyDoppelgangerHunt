@@ -1229,8 +1229,15 @@ def resolve_unit_replacement(
             start_col=unit_span.start_col_char,
             end_col=unit_span.end_col_char,
         )
+        is_expr_rep = is_column_bounded or unit.get("kind") in (
+            "comprehension",
+            "complex_expr",
+        )
         for c in boundary_comments:
-            if c["is_pragma"] and c["line"] in (start, end):
+            if c["is_pragma"] and (
+                c["line"] in (start, end)
+                or (is_expr_rep and start <= c["line"] <= end)
+            ):
                 p_text = c["text"].strip()
                 if p_text not in replacement_text and p_text not in attached_pragmas:
                     attached_pragmas.append(p_text)

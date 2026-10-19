@@ -1632,3 +1632,165 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
             sys.modules.pop("tomli", None)
     assert parsed_hdrless.get("threshold") == 0.85
 
+    # 15. Finding 1.1: collect_downstream_read_names initializes outer_bound across outer parameters,
+    # enclosing functions, and loop-carried passes.
+    outer_param_cls_src = (
+        "def outer(x):\n"
+        "    for _ in range(2):\n"
+        "        class C:\n"
+        "            x += 1\n"
+        "            x = 99\n"
+        "            vals = [x for _ in range(1)]\n"
+        "    return None\n"
+    )
+    ds_outer_param = collect_downstream_read_names(
+        outer_param_cls_src, {"kind": "compound_block", "start": 4, "end": 4}, {"x"}
+    )
+    assert ds_outer_param is not None and "x" in ds_outer_param
+
+    loop_carried_cls_src = (
+        "def outer(x):\n"
+        "    for _ in range(2):\n"
+        "        class C:\n"
+        "            vals = [x for _ in range(1)]\n"
+        "            x = 99\n"
+        "        x += 1\n"
+    )
+    ds_loop_carried = collect_downstream_read_names(
+        loop_carried_cls_src, {"kind": "compound_block", "start": 6, "end": 6}, {"x"}
+    )
+    assert ds_loop_carried is not None and "x" in ds_loop_carried
+
+    # 16. Finding 1.2: Branch-aware deleted_names symmetry and deleted_output hazard
+    from pydoppelgangerhunt.fixer._df_pairing import resolve_clone_pair_outputs
+
+    del_branch_a = (
+        "def f(cond):\n"
+        "    if cond:\n"
+        "        x = 1\n"
+        "        del x\n"
+        "    else:\n"
+        "        x = 2\n"
+        "    return 0\n"
+    )
+    del_branch_b = (
+        "def f(cond):\n"
+        "    if not cond:\n"
+        "        x = 2\n"
+        "    else:\n"
+        "        x = 1\n"
+        "        del x\n"
+        "    return 0\n"
+    )
+    del_file_a = tmp_path / "del_a.py"
+    del_file_b = tmp_path / "del_b.py"
+    del_file_a.write_text(del_branch_a, encoding="utf-8")
+    del_file_b.write_text(del_branch_b, encoding="utf-8")
+    u_del_a = {"kind": "if_block", "start": 2, "end": 6, "file": str(del_file_a)}
+    u_del_b = {"kind": "if_block", "start": 2, "end": 6, "file": str(del_file_b)}
+    sc_del_a = inspect_single_unit_scope(
+        u_del_a, repo_root=str(tmp_path), tree=ast.parse(del_branch_a)
+    )
+    sc_del_b = inspect_single_unit_scope(
+        u_del_b, repo_root=str(tmp_path), tree=ast.parse(del_branch_b)
+    )
+    assert sc_del_a["outputs"] == sc_del_b["outputs"] == ["x"]
+    assert sc_del_a["conditional_outputs"] == sc_del_b["conditional_outputs"] == ["x"]
+    assert "deleted_output" in sc_del_a["control_flow_hazards"]
+    assert "deleted_output" in sc_del_b["control_flow_hazards"]
+    assert not sc_del_a["is_control_flow_safe"]
+    assert not sc_del_b["is_control_flow_safe"]
+    assert (
+        resolve_clone_pair_outputs(
+            u_del_a, u_del_b, sc_del_a, sc_del_b, del_branch_a, del_branch_b
+        )
+        is None
+    )
+
+    del_input_a = (
+        "def g(x, cond):\n"
+        "    if cond:\n"
+        "        del x\n"
+        "    else:\n"
+        "        x = 2\n"
+    )
+    del_input_b = (
+        "def g(x, cond):\n"
+        "    if not cond:\n"
+        "        x = 2\n"
+        "    else:\n"
+        "        del x\n"
+    )
+    del_in_fa = tmp_path / "del_in_a.py"
+    del_in_fb = tmp_path / "del_in_b.py"
+    del_in_fa.write_text(del_input_a, encoding="utf-8")
+    del_in_fb.write_text(del_input_b, encoding="utf-8")
+    u_in_a = {"kind": "if_block", "start": 2, "end": 5, "file": str(del_in_fa)}
+    u_in_b = {"kind": "if_block", "start": 2, "end": 5, "file": str(del_in_fb)}
+    sc_in_a = inspect_single_unit_scope(
+        u_in_a, repo_root=str(tmp_path), tree=ast.parse(del_input_a)
+    )
+    sc_in_b = inspect_single_unit_scope(
+        u_in_b, repo_root=str(tmp_path), tree=ast.parse(del_input_b)
+    )
+    assert "x" in sc_in_a["inputs"] and "x" in sc_in_b["inputs"]
+    assert "x" in sc_in_a["conditional_outputs"] and "x" in sc_in_b["conditional_outputs"]
+    assert not sc_in_a["is_control_flow_safe"] and not sc_in_b["is_control_flow_safe"]
+
+    # 17. Finding 1.3: _extract_helper_symbols handles match/case bindings and bare AnnAssign
+    if sys.version_info >= (3, 10):
+        match_helper_src = (
+            "class C:\n"
+            "    bare_attr: OuterType\n"
+            "    val = bare_attr\n"
+            "    match cmd:\n"
+            "        case [first, *rest]:\n"
+            "            out = first + len(rest)\n"
+            "        case {'k': mapped, **extra}:\n"
+            "            out = mapped + len(extra)\n"
+        )
+        m_free, _, _ = _extract_helper_symbols(ast.parse(match_helper_src))
+        assert "first" not in m_free
+        assert "rest" not in m_free
+        assert "mapped" not in m_free
+        assert "extra" not in m_free
+        assert "bare_attr" in m_free
+        assert "OuterType" in m_free
+
+    # 18. Finding 1.4: Interior line pragmas preserved on multi-line expression units
+    from pydoppelgangerhunt.fixer.patch import (
+        _build_unit_delegation_call,
+        refactor_module_units,
+    )
+
+    expr_pragma_src = (
+        "def compute(items):\n"
+        "    res = [\n"
+        "        x + 1  # type: ignore[operator]\n"
+        "        for x in items\n"
+        "    ]\n"
+        "    return res\n"
+    )
+    expr_unit_full = {"kind": "comprehension", "start": 2, "end": 5}
+    deleg_call = _build_unit_delegation_call(
+        expr_unit_full,
+        expr_pragma_src,
+        expr_pragma_src.splitlines(keepends=True),
+        effective_binding="module",
+        helper_name="_shared_comp",
+        inputs=["items"],
+        outputs=[],
+        scope={"param_details": []},
+    )
+    assert "# type: ignore[operator]" in deleg_call
+    expr_unit_col = {
+        "kind": "comprehension",
+        "start": 2,
+        "end": 5,
+        "start_col": 10,
+        "end_col": 5,
+    }
+    refactored_expr = refactor_module_units(
+        expr_pragma_src, [(expr_unit_col, "_shared_comp(items)")]
+    )
+    assert "# type: ignore[operator]" in refactored_expr

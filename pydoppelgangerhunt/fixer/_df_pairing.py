@@ -400,17 +400,35 @@ def resolve_clone_generator_subroutine_outputs(
                 if return_details
                 else None
             )
+        if "deleted_output" in s_chk.get("control_flow_hazards", ()):
+            logger.debug(
+                "Rejecting generator subroutine pair: deleted output hazard on %s",
+                side_lbl,
+            )
+            return (
+                CloneOutputResolution(None, "deleted output hazard")
+                if return_details
+                else None
+            )
 
     outs1 = _extract_effective_unit_outputs(u1, scope1)
     outs2 = _extract_effective_unit_outputs(u2, scope2)
 
+    u1_cond = set(scope1.get("conditional_outputs", [])) | set(
+        scope1.get("deleted_names", [])
+    )
+    u2_cond = set(scope2.get("conditional_outputs", [])) | set(
+        scope2.get("deleted_names", [])
+    )
     u1_def = (
-        set(scope1.get("definite_stores", [])) | set(scope1.get("inputs", []))
+        set(scope1.get("definite_stores", []))
+        | (set(scope1.get("inputs", [])) - u1_cond)
         if ("definite_stores" in scope1 or "inputs" in scope1)
         else set()
     )
     u2_def = (
-        set(scope2.get("definite_stores", [])) | set(scope2.get("inputs", []))
+        set(scope2.get("definite_stores", []))
+        | (set(scope2.get("inputs", [])) - u2_cond)
         if ("definite_stores" in scope2 or "inputs" in scope2)
         else set()
     )
@@ -684,6 +702,20 @@ def resolve_clone_pair_outputs(
 
     outs1 = _extract_effective_unit_outputs(u1, scope1)
     outs2 = _extract_effective_unit_outputs(u2, scope2)
+    if is_sub and (
+        "deleted_output" in scope1.get("control_flow_hazards", ())
+        or "deleted_output" in scope2.get("control_flow_hazards", ())
+        or bool(set(outs1) & set(scope1.get("deleted_names", [])))
+        or bool(set(outs2) & set(scope2.get("deleted_names", [])))
+    ):
+        logger.debug(
+            "Rejecting clone pair output resolution: deleted output hazard"
+        )
+        return (
+            CloneOutputResolution(None, "deleted output hazard")
+            if return_details
+            else None
+        )
     if not outs1 and not outs2:
         res: Tuple[List[str], List[str]] = ([], [])
         return CloneOutputResolution(res, None) if return_details else res

@@ -852,6 +852,8 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
                 for name in free_reads:
                     self._record_downstream_read(name)
             name_attr = getattr(node, "name", None)
+            if isinstance(name_attr, str) and self._nonclass_killed is None:
+                self.outer_bound.add(name_attr)
             lineno = getattr(node, "lineno", None)
             if (
                 name_attr
@@ -864,6 +866,8 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self.visit_FunctionDef(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        if self._nonclass_killed is None:
+            self.outer_bound.add(node.name)
         n_start = getattr(node, "lineno", 0)
         n_end = getattr(node, "end_lineno", None) or n_start
         if n_start <= self.u_end <= n_end and not self._is_node_after_unit(node):
@@ -892,10 +896,12 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
         self.visit_FunctionDef(node)
 
     def visit_TypeAlias(self, node: ast.AST) -> None:
+        name_node = getattr(node, "name", None)
+        if isinstance(name_node, ast.Name) and self._nonclass_killed is None:
+            self.outer_bound.add(name_node.id)
         if self._should_inspect_read(node):
             for name in _extract_type_alias_free_reads(node):
                 self._record_downstream_read(name)
-            name_node = getattr(node, "name", None)
             if (
                 isinstance(name_node, ast.Name)
                 and not self._is_in_comp(name_node.id)
@@ -909,12 +915,15 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             self._record_downstream_read(node.id)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
-        if isinstance(node.target, ast.Name) and self._should_inspect_read(node.target):
-            self._record_downstream_read(node.target.id)
-            if not self._is_in_comp(node.target.id):
-                lineno = getattr(node.target, "lineno", None)
-                if not (lineno == self.u_end and self.u_end_col is None):
-                    self.killed.add(node.target.id)
+        if isinstance(node.target, ast.Name):
+            if self._nonclass_killed is None:
+                self.outer_bound.add(node.target.id)
+            if self._should_inspect_read(node.target):
+                self._record_downstream_read(node.target.id)
+                if not self._is_in_comp(node.target.id):
+                    lineno = getattr(node.target, "lineno", None)
+                    if not (lineno == self.u_end and self.u_end_col is None):
+                        self.killed.add(node.target.id)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
@@ -946,6 +955,8 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
             self.visit(t)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        if isinstance(node.target, ast.Name) and self._nonclass_killed is None:
+            self.outer_bound.add(node.target.id)
         self.visit(node.value)
 
     def visit_If(self, node: ast.If) -> None:

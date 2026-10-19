@@ -899,7 +899,7 @@ def _build_unit_delegation_call(
                     end_line=u_end,
                     include_leading=False,
                 )
-                if c["is_pragma"] and c["line"] in (u_start, u_end)
+                if c["is_pragma"]
             ]
             dedup_pragmas = list(
                 dict.fromkeys(p for p in attached_pragmas if p not in rep_call)
@@ -2194,7 +2194,10 @@ def _extract_helper_symbols(
             if node.value is not None:
                 self.visit(node.value)
             self.visit(node.target)
-            self._bind_names(_extract_assigned_names(node.target))
+            if node.value is not None or (
+                len(scope_stack) > 1 and ":class_scope:" not in scope_stack[-1]
+            ):
+                self._bind_names(_extract_assigned_names(node.target))
 
         def visit_AugAssign(self, node: ast.AugAssign) -> None:
             if isinstance(node.target, ast.Name):
@@ -2238,6 +2241,21 @@ def _extract_helper_symbols(
                 self._bind_names({node.name})
             for s in node.body:
                 self.visit(s)
+
+        def visit_MatchAs(self, node: ast.AST) -> None:
+            self.generic_visit(node)
+            m_name = getattr(node, "name", None)
+            if isinstance(m_name, str):
+                self._bind_names({m_name})
+
+        def visit_MatchStar(self, node: ast.AST) -> None:
+            self.visit_MatchAs(node)
+
+        def visit_MatchMapping(self, node: ast.AST) -> None:
+            self.generic_visit(node)
+            m_rest = getattr(node, "rest", None)
+            if isinstance(m_rest, str):
+                self._bind_names({m_rest})
 
         def _enter_block_scope(
             self, child_scope: Set[str], body: Sequence[ast.stmt]
@@ -3501,6 +3519,9 @@ def _generate_refactoring_patch_impl(
                 continue
             if any(h in ("naked_break", "naked_continue") for h in hazards1 | hazards2):
                 skip_reasons["naked break or continue"] += 1
+                continue
+            if "deleted_output" in hazards1 | hazards2:
+                skip_reasons["deleted output hazard"] += 1
                 continue
             if "embedded_return" in hazards1 | hazards2:
                 lines1 = u1_lines

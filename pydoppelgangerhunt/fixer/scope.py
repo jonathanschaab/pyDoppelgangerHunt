@@ -539,6 +539,11 @@ class _ScopeVisitor(ast.NodeVisitor):
         elif isinstance(node.ctx, ast.Store):
             self._record_store_name(node.id)
         elif isinstance(node.ctx, ast.Del):
+            if (
+                (len(self._scope_stack) - self._comprehension_depth) <= 1
+                and self.class_depth == 0
+            ):
+                self._record_load_name(node.id)
             if len(self._scope_stack) <= 1 or (
                 f"nonlocal:{node.id}" in self._scope_stack[-1]
                 and not any(
@@ -1044,6 +1049,9 @@ def _analyze_block_assignment(
     statements: Sequence[ast.stmt],
     definite: Optional[Set[str]] = None,
     conditional: Optional[Set[str]] = None,
+    *,
+    may_deleted: Optional[Set[str]] = None,
+    live_in_deleted: Optional[Set[str]] = None,
 ) -> Tuple[Set[str], Set[str]]:
     """Analyzes a sequence of statements to determine unconditionally and conditionally assigned variables.
 
@@ -1054,81 +1062,120 @@ def _analyze_block_assignment(
         definite = set()
     if conditional is None:
         conditional = set()
+    may_del = may_deleted if may_deleted is not None else set()
+    live_in_del = live_in_deleted if live_in_deleted is not None else set()
 
     for stmt in statements:
+        before_def = set(definite)
         if isinstance(stmt, ast.Assign):
             for target in stmt.targets:
                 for node in ast.walk(target):
                     if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
                         definite.add(node.id)
+                        may_del.discard(node.id)
                 d_t, c_t = _walrus_assignment_in_expr(target)
                 definite.update(d_t)
+                may_del.difference_update(d_t)
                 conditional.update(c_t)
             d_val, c_val = _walrus_assignment_in_expr(stmt.value)
             definite.update(d_val)
+            may_del.difference_update(d_val)
             conditional.update(c_val)
         elif isinstance(stmt, ast.AnnAssign):
             if stmt.value is not None:
                 if isinstance(stmt.target, ast.Name):
                     definite.add(stmt.target.id)
+                    may_del.discard(stmt.target.id)
                 d_val, c_val = _walrus_assignment_in_expr(stmt.value)
                 definite.update(d_val)
+                may_del.difference_update(d_val)
                 conditional.update(c_val)
         elif isinstance(stmt, ast.AugAssign):
             if isinstance(stmt.target, ast.Name):
                 definite.add(stmt.target.id)
+                may_del.discard(stmt.target.id)
             d_t, c_t = _walrus_assignment_in_expr(stmt.target)
             definite.update(d_t)
+            may_del.difference_update(d_t)
             conditional.update(c_t)
             d_val, c_val = _walrus_assignment_in_expr(stmt.value)
             definite.update(d_val)
+            may_del.difference_update(d_val)
             conditional.update(c_val)
         elif isinstance(stmt, ast.Expr):
             d_val, c_val = _walrus_assignment_in_expr(stmt.value)
             definite.update(d_val)
+            may_del.difference_update(d_val)
             conditional.update(c_val)
         elif isinstance(stmt, ast.Delete):
             for target in stmt.targets:
                 d_del, c_del = _walrus_assignment_in_expr(target)
                 definite.update(d_del)
+                may_del.difference_update(d_del)
                 conditional.update(c_del)
                 for node in ast.walk(target):
                     if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del):
+                        if node.id not in definite:
+                            live_in_del.add(node.id)
                         definite.discard(node.id)
                         conditional.discard(node.id)
+                        may_del.add(node.id)
         elif isinstance(stmt, ast.Raise):
             if stmt.exc is not None:
                 d_exc, c_exc = _walrus_assignment_in_expr(stmt.exc)
                 definite.update(d_exc)
+                may_del.difference_update(d_exc)
                 conditional.update(c_exc)
             if stmt.cause is not None:
                 d_cause, c_cause = _walrus_assignment_in_expr(stmt.cause)
                 definite.update(d_cause)
+                may_del.difference_update(d_cause)
                 conditional.update(c_cause)
         elif isinstance(stmt, ast.Return):
             if stmt.value is not None:
                 d_val, c_val = _walrus_assignment_in_expr(stmt.value)
                 definite.update(d_val)
+                may_del.difference_update(d_val)
                 conditional.update(c_val)
         elif isinstance(stmt, ast.If):
             d_test, c_test = _walrus_assignment_in_expr(stmt.test)
             definite.update(d_test)
+            may_del.difference_update(d_test)
             conditional.update(c_test)
-            b_def, b_cond = _analyze_block_assignment(stmt.body)
-            o_def, o_cond = _analyze_block_assignment(stmt.orelse) if stmt.orelse else (set(), set())
+            b_may: Set[str] = set()
+            b_live: Set[str] = set()
+            o_may: Set[str] = set()
+            o_live: Set[str] = set()
+            b_def, b_cond = _analyze_block_assignment(
+                stmt.body, may_deleted=b_may, live_in_deleted=b_live
+            )
+            o_def, o_cond = (
+                _analyze_block_assignment(
+                    stmt.orelse, may_deleted=o_may, live_in_deleted=o_live
+                )
+                if stmt.orelse
+                else (set(), set())
+            )
+            live_in_del.update((b_live | o_live) - definite)
             b_term = _block_terminates(stmt.body)
             o_term = _block_terminates(stmt.orelse) if stmt.orelse else False
             if stmt.orelse:
                 if o_term and not b_term:
                     definite.update(b_def)
                     conditional.update((b_def | b_cond) - definite)
+                    may_del.difference_update(b_def)
+                    may_del.update(b_may)
                 elif b_term and not o_term:
                     definite.update(o_def)
                     conditional.update((o_def | o_cond) - definite)
+                    may_del.difference_update(o_def)
+                    may_del.update(o_may)
                 elif not b_term and not o_term:
                     both = b_def & o_def
                     definite.update(both)
                     conditional.update((b_def | b_cond | o_def | o_cond) - definite)
+                    may_del.difference_update(both)
+                    may_del.update(b_may | o_may)
                 eff_b_del = _extract_deleted_names(stmt.body) - b_def
                 eff_o_del = _extract_deleted_names(stmt.orelse) - o_def
                 for v_del in eff_b_del & eff_o_del:
@@ -1138,63 +1185,104 @@ def _analyze_block_assignment(
             else:
                 if not b_term:
                     conditional.update((b_def | b_cond) - definite)
+                    may_del.update(b_may)
                     eff_b_del = _extract_deleted_names(stmt.body) - b_def
                     _demote_deletions_to_conditional(eff_b_del, definite, conditional)
         elif isinstance(stmt, ast.While):
             d_test, c_test = _walrus_assignment_in_expr(stmt.test)
             definite.update(d_test)
+            may_del.difference_update(d_test)
             conditional.update(c_test)
             sub_stmts = list(stmt.body)
             if hasattr(stmt, "orelse") and stmt.orelse:
                 sub_stmts.extend(stmt.orelse)
-            sub_def, sub_cond = _analyze_block_assignment(sub_stmts)
+            sub_may: Set[str] = set()
+            sub_live: Set[str] = set()
+            sub_def, sub_cond = _analyze_block_assignment(
+                sub_stmts, may_deleted=sub_may, live_in_deleted=sub_live
+            )
+            live_in_del.update(sub_live - definite)
+            may_del.update(sub_may)
             conditional.update((sub_def | sub_cond) - definite)
             _demote_deletions_to_conditional(_extract_deleted_names(sub_stmts), definite, conditional)
         elif isinstance(stmt, (ast.For, ast.AsyncFor)):
             d_iter, c_iter = _walrus_assignment_in_expr(stmt.iter)
             definite.update(d_iter)
+            may_del.difference_update(d_iter)
             conditional.update(c_iter)
+            t_names: Set[str] = set()
             for p_node in ast.walk(stmt.target):
                 if isinstance(p_node, ast.Name):
                     conditional.add(p_node.id)
+                    if isinstance(p_node.ctx, ast.Store):
+                        t_names.add(p_node.id)
             sub_stmts = list(stmt.body)
             if hasattr(stmt, "orelse") and stmt.orelse:
                 sub_stmts.extend(stmt.orelse)
-            sub_def, sub_cond = _analyze_block_assignment(sub_stmts)
+            for_may: Set[str] = set()
+            for_live: Set[str] = set()
+            sub_def, sub_cond = _analyze_block_assignment(
+                sub_stmts, may_deleted=for_may, live_in_deleted=for_live
+            )
+            live_in_del.update((for_live - t_names) - definite)
+            may_del.update(for_may)
             conditional.update((sub_def | sub_cond) - definite)
             _demote_deletions_to_conditional(_extract_deleted_names(sub_stmts), definite, conditional)
         elif isinstance(stmt, (ast.With, ast.AsyncWith)):
             for item in stmt.items:
                 d_ctx, c_ctx = _walrus_assignment_in_expr(item.context_expr)
                 definite.update(d_ctx)
+                may_del.difference_update(d_ctx)
                 conditional.update(c_ctx)
                 if item.optional_vars is not None:
                     for p_node in ast.walk(item.optional_vars):
                         if isinstance(p_node, ast.Name) and isinstance(p_node.ctx, ast.Store):
                             definite.add(p_node.id)
-            _analyze_block_assignment(stmt.body, definite, conditional)
+                            may_del.discard(p_node.id)
+            _analyze_block_assignment(
+                stmt.body,
+                definite,
+                conditional,
+                may_deleted=may_del,
+                live_in_deleted=live_in_del,
+            )
         elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
             t_body = list(getattr(stmt, "body", []))
-            t_def, t_cond = _analyze_block_assignment(t_body)
+            t_may: Set[str] = set()
+            t_live: Set[str] = set()
+            t_def, t_cond = _analyze_block_assignment(
+                t_body, may_deleted=t_may, live_in_deleted=t_live
+            )
+            live_in_del.update(t_live - definite)
             t_term = _block_terminates(t_body)
             o_stmts = list(getattr(stmt, "orelse", []))
+            o_try_may: Set[str] = set()
             if o_stmts:
-                o_def, o_cond = _analyze_block_assignment(o_stmts)
+                o_try_live: Set[str] = set()
+                o_def, o_cond = _analyze_block_assignment(
+                    o_stmts, may_deleted=o_try_may, live_in_deleted=o_try_live
+                )
+                if not t_term:
+                    live_in_del.update(o_try_live - (definite | t_def))
                 o_term = _block_terminates(o_stmts)
                 if not o_term:
                     try_def = t_def | o_def
                     try_cond = (t_cond | o_cond) - try_def
+                    succ_may = (t_may - o_def) | o_try_may
                 else:
                     try_def = set()
                     try_cond = set()
+                    succ_may = set()
                     t_term = True
             else:
                 try_def = t_def
                 try_cond = t_cond
+                succ_may = t_may
 
             handlers = list(getattr(stmt, "handlers", []))
             h_defs: List[Set[str]] = []
             h_dels: List[Tuple[Set[str], bool]] = []
+            h_mays: List[Set[str]] = []
             all_handlers_terminate = bool(
                 handlers and all(_block_terminates(getattr(h, "body", [])) for h in handlers)
             )
@@ -1204,29 +1292,48 @@ def _analyze_block_assignment(
                 if getattr(h, "type", None) is not None:
                     d_ht, c_ht = _walrus_assignment_in_expr(h.type, is_conditional=True)
                     conditional.update(d_ht | c_ht)
-                h_d, h_c = _analyze_block_assignment(h_body)
+                h_may: Set[str] = set()
+                h_live: Set[str] = set()
+                h_d, h_c = _analyze_block_assignment(
+                    h_body, may_deleted=h_may, live_in_deleted=h_live
+                )
+                h_bound = {h.name} if isinstance(getattr(h, "name", None), str) else set()
+                h_may.difference_update(h_bound)
+                live_in_del.update((h_live - h_bound) - definite)
                 h_term = _block_terminates(h_body)
                 eff_h_del = _extract_deleted_names(h_body) - h_d
                 h_dels.append((eff_h_del, h_term))
                 if not h_term:
                     h_defs.append(h_d)
+                    h_mays.append(h_may)
                 conditional.update((h_d | h_c) - definite)
 
             if not t_term:
                 if all_handlers_terminate:
                     definite.update(try_def)
                     conditional.update(try_cond - definite)
+                    may_del.difference_update(try_def)
+                    may_del.update(succ_may)
                 elif handlers and h_defs:
                     common = try_def.intersection(*h_defs)
                     definite.update(common)
                     conditional.update((try_def | try_cond) - definite)
+                    may_del.difference_update(common)
+                    may_del.update(succ_may)
+                    for hm in h_mays:
+                        may_del.update(hm)
                 elif not handlers:
                     definite.update(try_def)
                     conditional.update(try_cond - definite)
+                    may_del.difference_update(try_def)
+                    may_del.update(succ_may)
             elif h_defs:
                 common = set.intersection(*h_defs)
                 definite.update(common)
                 conditional.update(try_cond - definite)
+                may_del.difference_update(common)
+                for hm in h_mays:
+                    may_del.update(hm)
 
             eff_try_del = _extract_deleted_names(t_body) - t_def
             eff_o_del = _extract_deleted_names(o_stmts) - o_def if o_stmts else set()
@@ -1253,10 +1360,17 @@ def _analyze_block_assignment(
 
             f_body = list(getattr(stmt, "finalbody", []))
             if f_body:
-                _analyze_block_assignment(f_body, definite, conditional)
+                _analyze_block_assignment(
+                    f_body,
+                    definite,
+                    conditional,
+                    may_deleted=may_del,
+                    live_in_deleted=live_in_del,
+                )
         elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
             d_sub, c_sub = _walrus_assignment_in_expr(getattr(stmt, "subject", None))
             definite.update(d_sub)
+            may_del.difference_update(d_sub)
             conditional.update(c_sub)
             case_defs: List[Set[str]] = []
             non_term_case_defs: List[Set[str]] = []
@@ -1283,11 +1397,16 @@ def _analyze_block_assignment(
                 if guard is not None:
                     d_g, c_g = _walrus_assignment_in_expr(guard, is_conditional=False)
                 case_init_def = pattern_stores | d_g
+                c_may: Set[str] = set()
+                c_live: Set[str] = set()
                 c_def, c_cond = _analyze_block_assignment(
                     case.body,
                     definite=case_init_def.copy(),
                     conditional=c_g.copy() if c_g else None,
+                    may_deleted=c_may,
+                    live_in_deleted=c_live,
                 )
+                live_in_del.update((c_live - case_init_def) - definite)
                 case_defs.append(c_def)
                 case_conds.update(c_def | c_cond)
                 c_del = _extract_deleted_names(case.body) - c_def
@@ -1295,12 +1414,14 @@ def _analyze_block_assignment(
                 if not _block_terminates(case.body):
                     non_term_case_defs.append(c_def)
                     non_term_case_dels.append(c_del)
+                    may_del.update(c_may - pattern_stores)
                 if _is_irrefutable_case(case):
                     has_irrefutable_default = True
             if case_defs and has_irrefutable_default:
                 if non_term_case_defs:
                     common = set.intersection(*non_term_case_defs)
                     definite.update(common)
+                    may_del.difference_update(common)
                 conditional.update(case_conds - definite)
             else:
                 conditional.update(case_conds - definite)
@@ -1315,27 +1436,33 @@ def _analyze_block_assignment(
             _demote_deletions_to_conditional(case_dels - all_del, definite, conditional)
         elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             definite.add(stmt.name)
+            may_del.discard(stmt.name)
         elif type(stmt).__name__ == "TypeAlias":  # pragma: no cover (py312+)
             name_node = getattr(stmt, "name", None)
             if isinstance(name_node, ast.Name):
                 definite.add(name_node.id)
+                may_del.discard(name_node.id)
         elif isinstance(stmt, ast.Import):
             for alias in stmt.names:
                 bound_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
                 definite.add(bound_name)
+                may_del.discard(bound_name)
         elif isinstance(stmt, ast.ImportFrom):
             for alias in stmt.names:
                 if alias.name != "*":
                     bound_name = alias.asname or alias.name
                     definite.add(bound_name)
+                    may_del.discard(bound_name)
         elif isinstance(stmt, ast.Assert):
             d_ast, c_ast = _walrus_assignment_in_expr(stmt.test)
             definite.update(d_ast)
+            may_del.difference_update(d_ast)
             conditional.update(c_ast)
             if stmt.msg is not None:
                 d_m, c_m = _walrus_assignment_in_expr(stmt.msg, is_conditional=True)
                 conditional.update(d_m | c_m)
 
+        may_del.difference_update(definite - before_def)
         if _block_terminates([stmt]):
             break
 
@@ -1455,6 +1582,7 @@ def _inspect_unit_scope(
         "type_params": [],
         "type_param_free_vars": [],
         "has_class_scoped_type_params": False,
+        "deleted_names": [],
     }
     if not dedented.strip():
         return empty_res
@@ -1708,17 +1836,24 @@ def _inspect_unit_scope(
             ):
                 has_class_scoped_type_params = True
 
-        is_control_flow_safe = not any(
-            h
-            in (
-                "naked_break",
-                "naked_continue",
-                "embedded_return",
-                "type_param_closure_capture",
-                "pathological_ast",
-            )
-            for h in hazards
+        # Definite, conditional, and branch-aware deletion analysis across candidate statements
+        may_deleted: Set[str] = set()
+        live_in_deleted: Set[str] = set()
+        def_assigned, cond_assigned = _analyze_block_assignment(
+            candidate_stmts,
+            may_deleted=may_deleted,
+            live_in_deleted=live_in_deleted,
         )
+        for del_name in sorted(live_in_deleted):
+            if (
+                del_name not in visitor.params
+                and del_name not in visitor.globals
+                and del_name not in BUILTIN_NAMES
+            ):
+                if del_name not in visitor.loads:
+                    visitor.loads.append(del_name)
+                if del_name not in visitor.read_before_write:
+                    visitor.read_before_write.append(del_name)
 
         free_vars = [
             name for name in visitor.loads
@@ -1762,9 +1897,6 @@ def _inspect_unit_scope(
         primary_rec = rec_param or ("cls" if is_class_rec else None)
         _normalize_receiver_order(inputs, has_instance_binding, has_class_binding, primary_receiver=primary_rec)
 
-        # Definite and conditional assignment analysis across candidate statements
-        def_assigned, _ = _analyze_block_assignment(candidate_stmts)
-
         # Unit outputs: explicit returns if present; for subroutines without explicit
         # returns, all local variable stores act as unit outputs to preserve caller mutations.
         pre_outs = resolve_unit_declared_outputs(unit)
@@ -1790,6 +1922,8 @@ def _inspect_unit_scope(
         excluded_local_defs = (visitor.type_aliases - downstream_aliases) | set(
             visitor.imported_names
         )
+        all_deleted = _extract_deleted_names(candidate_stmts) | visitor.deleted_names
+        uncond_deleted = all_deleted - (def_assigned | cond_assigned)
 
         if is_subroutine and isinstance(pre_outs, (list, tuple)):
             outputs = list(dict.fromkeys(pre_outs))
@@ -1814,7 +1948,7 @@ def _inspect_unit_scope(
                     v not in visitor.globals
                     and v not in BUILTIN_NAMES
                     and v not in visitor.except_vars
-                    and v not in visitor.deleted_names
+                    and v not in uncond_deleted
                     and v not in excluded_local_defs
                     and v not in seen
                 ):
@@ -1828,17 +1962,37 @@ def _inspect_unit_scope(
                 nl in visitor.stores
                 and nl not in outputs
                 and nl not in visitor.except_vars
-                and nl not in visitor.deleted_names
+                and nl not in uncond_deleted
                 and nl not in excluded_local_defs
             ):
                 outputs.append(nl)
 
         # Detect conditional variable escapes (outputs assigned conditionally without prior
-        # unconditional assignment in this block, and not provided as input arguments).
+        # unconditional assignment in this block, or potentially deleted along a path).
         conditional_outputs = [
             v for v in outputs
-            if v not in inputs and v not in def_assigned
+            if (v not in inputs or v in may_deleted) and v not in def_assigned
         ]
+
+        if (
+            is_subroutine
+            and bool((set(outputs) | set(inputs)) & may_deleted)
+            and "deleted_output" not in hazards
+        ):
+            hazards.append("deleted_output")
+
+        is_control_flow_safe = not any(
+            h
+            in (
+                "naked_break",
+                "naked_continue",
+                "embedded_return",
+                "type_param_closure_capture",
+                "pathological_ast",
+                "deleted_output",
+            )
+            for h in hazards
+        )
 
         has_receiver_access = bool(
             any(
@@ -1929,6 +2083,7 @@ def _inspect_unit_scope(
             "type_params": list(visitor.type_params),
             "type_param_free_vars": list(visitor.type_param_free_vars),
             "has_class_scoped_type_params": has_class_scoped_type_params,
+            "deleted_names": sorted(may_deleted),
         }
     except (RecursionError, MemoryError):
         return {
@@ -2060,6 +2215,11 @@ def analyze_unit_variable_scope(
         type_params = _merge_type_params(
             info1.get("type_params", []), info2.get("type_params", [])
         )
+        deleted_names = list(
+            dict.fromkeys(
+                info1.get("deleted_names", []) + info2.get("deleted_names", [])
+            )
+        )
     else:
         inputs = info1["inputs"]
         outputs = info1["outputs"]
@@ -2086,6 +2246,7 @@ def analyze_unit_variable_scope(
         definite_stores = info1.get("definite_stores", [])
         outputs_ambiguous = bool(info1.get("outputs_ambiguous", False))
         type_params = list(info1.get("type_params", []))
+        deleted_names = list(info1.get("deleted_names", []))
 
     has_instance_binding = info1.get("has_instance_binding", False) or (
         info2.get("has_instance_binding", False) if u2 is not None else False
@@ -2176,4 +2337,5 @@ def analyze_unit_variable_scope(
                 else False
             )
         ),
+        "deleted_names": deleted_names,
     }
