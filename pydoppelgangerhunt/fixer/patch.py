@@ -2374,7 +2374,7 @@ def _extract_helper_symbols(
                 self._check_load_name(name)
 
         def visit_Name(self, node: ast.Name) -> None:
-            if isinstance(node.ctx, ast.Load):
+            if isinstance(node.ctx, (ast.Load, ast.Del)):
                 self._check_load_name(node.id)
 
     try:

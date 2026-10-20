@@ -2242,6 +2242,51 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
         assert "_" in wc_free
         assert "_" not in wc_def
 
+    # 38. Finding 1: ast.For target traversal in _analyze_block_assignment only records Store names
+    from pydoppelgangerhunt.fixer.scope import _analyze_block_assignment
+
+    for_sub_stmts = ast.parse("for arr[idx] in items:\n    pass\n").body
+    for_def, for_cond = _analyze_block_assignment(for_sub_stmts)
+    assert "arr" not in for_cond
+    assert "idx" not in for_cond
+    assert "arr" not in for_def
+
+    # 39. Finding 2: Branch-nested del in _find_enclosing_pre_bound_names keeps pre-bound name
+    branch_del_src = (
+        "def f(flag, cond):\n"
+        "    x = 1\n"
+        "    if cond:\n"
+        "        del x\n"
+        "    if flag:\n"
+        "        x = 2\n"
+        "    y = x if flag else 0\n"
+        "    return y\n"
+    )
+    pre_bound_branch_del, _ = _find_enclosing_pre_bound_names(
+        ast.parse(branch_del_src), 5, 7
+    )
+    assert "x" in pre_bound_branch_del
+
+    # 40. Finding 3: PEP 695 TypeAlias binding in _find_enclosing_pre_bound_names isolates lazy walrus
+    if sys.version_info >= (3, 12):
+        ta_pre_src = (
+            "def f(flag):\n"
+            "    type MyAlias[T: (lazy_w := int)] = list[T]\n"
+            "    if flag:\n"
+            "        lazy_w = 1\n"
+            "    return lazy_w\n"
+        )
+        pre_bound_ta, _ = _find_enclosing_pre_bound_names(ast.parse(ta_pre_src), 3, 5)
+        assert "MyAlias" in pre_bound_ta
+        assert "lazy_w" not in pre_bound_ta
+
+    # 41. Finding 4: _extract_helper_symbols records ast.Del target reads for unbound del
+    del_free, _, _ = _extract_helper_symbols(
+        ast.parse("def _shared_del():\n    del ExternalSym\n")
+    )
+    assert "ExternalSym" in del_free
+
+
 
 
 

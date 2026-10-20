@@ -1272,10 +1272,9 @@ def _analyze_block_assignment(
             conditional.update(c_iter)
             t_names: Set[str] = set()
             for p_node in ast.walk(stmt.target):
-                if isinstance(p_node, ast.Name):
+                if isinstance(p_node, ast.Name) and isinstance(p_node.ctx, ast.Store):
                     conditional.add(p_node.id)
-                    if isinstance(p_node.ctx, ast.Store):
-                        t_names.add(p_node.id)
+                    t_names.add(p_node.id)
             sub_stmts = list(stmt.body)
             if hasattr(stmt, "orelse") and stmt.orelse:
                 sub_stmts.extend(stmt.orelse)
@@ -1624,20 +1623,28 @@ def _find_enclosing_pre_bound_names(
                 + ([scope_node.args.kwarg] if scope_node.args.kwarg else [])
             ):
                 bound_before.add(arg.arg)
-        stack: List[ast.AST] = list(reversed(getattr(scope_node, "body", [])))
+        stack: List[Tuple[ast.AST, bool]] = [
+            (stmt, False) for stmt in reversed(getattr(scope_node, "body", []))
+        ]
         while stack:
-            curr = stack.pop()
+            curr, is_branched = stack.pop()
             c_start = getattr(curr, "lineno", None)
             c_end = getattr(curr, "end_lineno", c_start)
             if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 if isinstance(c_start, int) and c_start < s_line:
                     bound_before.add(curr.name)
                 if not is_class_scope:
-                    stack.extend(reversed(list(iter_nested_scope_header_nodes(curr))))
+                    stack.extend(
+                        (hdr, is_branched)
+                        for hdr in reversed(list(iter_nested_scope_header_nodes(curr)))
+                    )
                 continue
             if isinstance(curr, ast.Lambda):
                 if not is_class_scope:
-                    stack.extend(reversed(list(iter_nested_scope_header_nodes(curr))))
+                    stack.extend(
+                        (hdr, is_branched)
+                        for hdr in reversed(list(iter_nested_scope_header_nodes(curr)))
+                    )
                 continue
             if isinstance(
                 curr, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
@@ -1645,12 +1652,18 @@ def _find_enclosing_pre_bound_names(
                 if isinstance(c_start, int) and c_start < s_line and not is_class_scope:
                     bound_before.update(_extract_comprehension_walrus_names(curr))
                 continue
+            if type(curr).__name__ == "TypeAlias":
+                if isinstance(c_start, int) and c_start < s_line:
+                    alias_name = getattr(curr, "name", None)
+                    if isinstance(alias_name, ast.Name):
+                        bound_before.add(alias_name.id)
+                continue
             if (
                 isinstance(curr, ast.AnnAssign)
                 and curr.value is None
                 and isinstance(curr.target, ast.Name)
             ):
-                stack.append(curr.annotation)
+                stack.append((curr.annotation, is_branched))
                 continue
             if isinstance(curr, (ast.For, ast.AsyncFor, ast.While)):
                 if (
@@ -1664,7 +1677,11 @@ def _find_enclosing_pre_bound_names(
             if isinstance(c_start, int) and c_start < s_line:
                 if isinstance(curr, ast.Name) and isinstance(curr.ctx, ast.Store):
                     bound_before.add(curr.id)
-                elif isinstance(curr, ast.Name) and isinstance(curr.ctx, ast.Del):
+                elif (
+                    isinstance(curr, ast.Name)
+                    and isinstance(curr.ctx, ast.Del)
+                    and not is_branched
+                ):
                     bound_before.discard(curr.id)
                 elif isinstance(curr, (ast.Import, ast.ImportFrom)):
                     for alias in curr.names:
@@ -1683,7 +1700,24 @@ def _find_enclosing_pre_bound_names(
                     m_name = getattr(curr, "name", None) or getattr(curr, "rest", None)
                     if isinstance(m_name, str) and m_name != "_":
                         bound_before.add(m_name)
-            stack.extend(reversed(list(ast.iter_child_nodes(curr))))
+            child_branched = is_branched or (
+                isinstance(
+                    curr,
+                    (
+                        ast.If,
+                        ast.For,
+                        ast.AsyncFor,
+                        ast.While,
+                        ast.Try,
+                        ast.ExceptHandler,
+                    ),
+                )
+                or type(curr).__name__ in ("TryStar", "Match")
+            )
+            stack.extend(
+                (ch, child_branched)
+                for ch in reversed(list(ast.iter_child_nodes(curr)))
+            )
     return bound_before, in_loop
 
 
