@@ -9,6 +9,7 @@ import logging
 from typing import (
     Any,
     Callable,
+    Dict,
     Iterable,
     List,
     Optional,
@@ -552,6 +553,7 @@ def _extract_nested_scope_free_reads_with_nodes(
     *,
     include_header: bool = True,
     include_body: bool = True,
+    include_annotations: bool = True,
 ) -> Tuple[Set[str], List[ast.Name]]:
     """Extracts free variable references and their AST load nodes escaping a nested scope."""
     if isinstance(node, ast.GeneratorExp):
@@ -572,7 +574,7 @@ def _extract_nested_scope_free_reads_with_nodes(
 
     unscoped_visitor = _OuterExprVisitor()
     outer_visitor = _OuterExprVisitor()
-    if include_header:
+    if include_header and include_annotations:
         for tp in getattr(node, "type_params", []):
             outer_visitor.visit(tp)
 
@@ -607,13 +609,14 @@ def _extract_nested_scope_free_reads_with_nodes(
             ]
             for d in defaults:
                 unscoped_visitor.visit(d)
-            for arg in _collect_func_args(node.args):
-                if arg.annotation is not None:
-                    outer_visitor.visit(arg.annotation)
+            if include_annotations:
+                for arg in _collect_func_args(node.args):
+                    if arg.annotation is not None:
+                        outer_visitor.visit(arg.annotation)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for dec in node.decorator_list:
                     unscoped_visitor.visit(dec)
-                if node.returns is not None:
+                if include_annotations and node.returns is not None:
                     outer_visitor.visit(node.returns)
         if include_body:
             func_visitor = _FuncScopeVisitor()
@@ -669,6 +672,7 @@ def _extract_nested_scope_free_reads(
     *,
     include_header: bool = True,
     include_body: bool = True,
+    include_annotations: bool = True,
 ) -> Set[str]:
     """Extracts free variable references escaping a nested function, genexp, or class body."""
     return _extract_nested_scope_free_reads_with_nodes(
@@ -676,6 +680,7 @@ def _extract_nested_scope_free_reads(
         candidates=candidates,
         include_header=include_header,
         include_body=include_body,
+        include_annotations=include_annotations,
     )[0]
 
 
@@ -1208,21 +1213,51 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         self.include_annotations = include_annotations
         self.live_ins: Set[str] = set()
         self.stored: Set[str] = set()
+        self._branch_depth: int = 0
+        self._deferred_live_ins: Dict[str, Set[str]] = {}
 
     def _is_inside(self, node: ast.AST) -> bool:
         return _is_ast_node_within_unit_bounds(
             node, self.u_start, self.u_end, self.u_end_col, self.u_start_col
         )
 
-    def _record_live_in(self, name: str) -> None:
+    def _commit_unconditional_store(self, name: str) -> None:
+        self.stored.add(name)
+        if (
+            self._branch_depth == 0
+            and self._in_comp_body == 0
+            and name in self._deferred_live_ins
+        ):
+            self._deferred_live_ins.pop(name, None)
+            self.live_ins.discard(name)
+
+    def _record_live_in(
+        self, name: str, *, deferred_fn: Optional[str] = None
+    ) -> None:
         """Records a variable name as a live-in if not stored, in comp, or builtin."""
+        if deferred_fn is None:
+            for var_name, fn_names in list(self._deferred_live_ins.items()):
+                if name in fn_names and var_name not in self.stored:
+                    self._deferred_live_ins.pop(var_name, None)
+        else:
+            for fn_names in self._deferred_live_ins.values():
+                if name in fn_names:
+                    fn_names.add(deferred_fn)
         if (
             name not in self.stored
             and not self._is_in_comp(name)
             and (self.candidates is None or name in self.candidates)
             and name not in _BUILTIN_NAMES
         ):
-            self.live_ins.add(name)
+            if deferred_fn is not None:
+                if name not in self.live_ins:
+                    self.live_ins.add(name)
+                    self._deferred_live_ins[name] = {deferred_fn}
+                elif name in self._deferred_live_ins:
+                    self._deferred_live_ins[name].add(deferred_fn)
+            else:
+                self.live_ins.add(name)
+                self._deferred_live_ins.pop(name, None)
 
     def _record_nested_free_reads(
         self,
@@ -1235,14 +1270,16 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         *,
         include_header: bool = True,
         include_body: bool = True,
+        deferred_fn: Optional[str] = None,
     ) -> None:
         for free in _extract_nested_scope_free_reads(
             node,
             candidates=self.candidates,
             include_header=include_header,
             include_body=include_body,
+            include_annotations=self.include_annotations,
         ):
-            self._record_live_in(free)
+            self._record_live_in(free, deferred_fn=deferred_fn)
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         if self._is_inside(node):
@@ -1259,9 +1296,18 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
             return
         if self._is_inside(node):
             self._record_nested_free_reads(node, include_body=False)
-            self.stored.add(node.name)
-            if self.include_annotations or isinstance(node, ast.ClassDef):
-                self._record_nested_free_reads(node, include_header=False)
+            self._commit_unconditional_store(node.name)
+            deferred_fn = (
+                node.name
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and not node.decorator_list
+                and self._branch_depth == 0
+                and self._in_comp_body == 0
+                else None
+            )
+            self._record_nested_free_reads(
+                node, include_header=False, deferred_fn=deferred_fn
+            )
         else:
             self.generic_visit(node)
 
@@ -1278,7 +1324,10 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
 
     def _visit_import_node(self, node: Union[ast.Import, ast.ImportFrom]) -> None:
         if self._is_inside(node):
+            before = set(self.stored)
             self._record_import_names(node, self.stored)
+            for name in self.stored - before:
+                self._commit_unconditional_store(name)
         else:
             self.generic_visit(node)
 
@@ -1294,7 +1343,7 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
                 self._record_live_in(node.id)
             elif isinstance(node.ctx, ast.Store):
                 if not self._is_in_comp(node.id):
-                    self.stored.add(node.id)
+                    self._commit_unconditional_store(node.id)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         if self._is_inside(node):
@@ -1304,7 +1353,7 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
                 self.visit(node.target)
             self.visit(node.value)
             if isinstance(node.target, ast.Name):
-                self.stored.add(node.target.id)
+                self._commit_unconditional_store(node.target.id)
         else:
             self.generic_visit(node)
 
@@ -1341,41 +1390,57 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         if not self._is_inside(node):
             self.generic_visit(node)
             return
+        before = set(self.stored)
         self._visit_type_alias_node(
             node, self.stored, self._record_live_in
         )
-
+        for name in self.stored - before:
+            self._commit_unconditional_store(name)
 
     def visit_BoolOp(self, node: ast.BoolOp) -> None:
         if not node.values:
             return
         self.visit(node.values[0])
         stored_after_first = set(self.stored)
-        for val in node.values[1:]:
-            self.visit(val)
+        self._branch_depth += 1
+        try:
+            for val in node.values[1:]:
+                self.visit(val)
+        finally:
+            self._branch_depth -= 1
         self.stored = stored_after_first
 
     def visit_IfExp(self, node: ast.IfExp) -> None:
         self.visit(node.test)
         stored_before = set(self.stored)
-        self.visit(node.body)
-        stored_body = set(self.stored)
-        self.stored = set(stored_before)
-        self.visit(node.orelse)
-        stored_else = set(self.stored)
+        self._branch_depth += 1
+        try:
+            self.visit(node.body)
+            stored_body = set(self.stored)
+            self.stored = set(stored_before)
+            self.visit(node.orelse)
+            stored_else = set(self.stored)
+        finally:
+            self._branch_depth -= 1
         self.stored = stored_body & stored_else
+        for name in list(self.stored - stored_before):
+            self._commit_unconditional_store(name)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)
         if self._is_inside(node.target) and isinstance(node.target, ast.Name):
-            self.stored.add(node.target.id)
+            self._commit_unconditional_store(node.target.id)
 
     def _collect_branch_stored(
         self, stmts: Sequence[ast.stmt], initial: Set[str]
     ) -> Set[str]:
         self.stored = set(initial)
-        for s in stmts:
-            self.visit(s)
+        self._branch_depth += 1
+        try:
+            for s in stmts:
+                self.visit(s)
+        finally:
+            self._branch_depth -= 1
         return set(self.stored)
 
     def visit_If(self, node: ast.If) -> None:
@@ -1397,6 +1462,8 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
                 self.stored = stored_then & stored_else
         else:
             self.stored = stored_before
+        for name in list(self.stored - stored_before):
+            self._commit_unconditional_store(name)
 
     def _visit_loop_body(
         self,
@@ -1407,13 +1474,17 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
     ) -> None:
         self.visit(test_or_iter)
         stored_before = set(self.stored)
-        if target is not None:
-            self.visit(target)
-        for s in body:
-            self.visit(s)
-        self.stored = set(stored_before)
-        for s in orelse:
-            self.visit(s)
+        self._branch_depth += 1
+        try:
+            if target is not None:
+                self.visit(target)
+            for s in body:
+                self.visit(s)
+            self.stored = set(stored_before)
+            for s in orelse:
+                self.visit(s)
+        finally:
+            self._branch_depth -= 1
         self.stored = set(stored_before)
 
     def visit_For(self, node: Union[ast.For, ast.AsyncFor]) -> None:
@@ -1427,25 +1498,29 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
 
     def visit_Try(self, node: Union[ast.Try, ast.AST]) -> None:
         stored_before = set(self.stored)
-        for s in getattr(node, "body", []):
-            self.visit(s)
-        stored_after_body = set(self.stored)
-        for h in getattr(node, "handlers", []):
-            self.stored = set(stored_before)
-            h_type = getattr(h, "type", None)
-            if h_type is not None:
-                self.visit(h_type)
-            name_val = getattr(h, "name", None)
-            if isinstance(name_val, str) and self._is_inside(h):
-                self.stored.add(name_val)
-            for s in getattr(h, "body", []):
+        self._branch_depth += 1
+        try:
+            for s in getattr(node, "body", []):
                 self.visit(s)
-        self.stored = set(stored_after_body)
-        for s in getattr(node, "orelse", []):
-            self.visit(s)
-        self.stored = set(stored_before)
-        for s in getattr(node, "finalbody", []):
-            self.visit(s)
+            stored_after_body = set(self.stored)
+            for h in getattr(node, "handlers", []):
+                self.stored = set(stored_before)
+                h_type = getattr(h, "type", None)
+                if h_type is not None:
+                    self.visit(h_type)
+                name_val = getattr(h, "name", None)
+                if isinstance(name_val, str) and self._is_inside(h):
+                    self.stored.add(name_val)
+                for s in getattr(h, "body", []):
+                    self.visit(s)
+            self.stored = set(stored_after_body)
+            for s in getattr(node, "orelse", []):
+                self.visit(s)
+            self.stored = set(stored_before)
+            for s in getattr(node, "finalbody", []):
+                self.visit(s)
+        finally:
+            self._branch_depth -= 1
         self.stored = set(stored_before)
 
     def visit_TryStar(self, node: ast.AST) -> None:
@@ -1453,23 +1528,31 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
 
     def visit_With(self, node: Union[ast.With, ast.AsyncWith]) -> None:
         stored_before = set(self.stored)
-        for item in getattr(node, "items", []):
-            self.visit(item.context_expr)
-            if getattr(item, "optional_vars", None) is not None:
-                self.visit(item.optional_vars)
-        for s in getattr(node, "body", []):
-            self.visit(s)
+        self._branch_depth += 1
+        try:
+            for item in getattr(node, "items", []):
+                self.visit(item.context_expr)
+                if getattr(item, "optional_vars", None) is not None:
+                    self.visit(item.optional_vars)
+            for s in getattr(node, "body", []):
+                self.visit(s)
+        finally:
+            self._branch_depth -= 1
         self.stored = set(stored_before)
 
     def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
         self.visit_With(node)
 
     def visit_Match(self, node: ast.AST) -> None:
-        self._traverse_isolated_cases(
-            node,
-            lambda: self.stored,
-            lambda s: setattr(self, "stored", s),
-        )
+        self._branch_depth += 1
+        try:
+            self._traverse_isolated_cases(
+                node,
+                lambda: self.stored,
+                lambda s: setattr(self, "stored", s),
+            )
+        finally:
+            self._branch_depth -= 1
 
     def visit_MatchAs(self, node: ast.AST) -> None:
         if self._is_inside(node):

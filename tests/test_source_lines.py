@@ -2080,5 +2080,33 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
         == 13
     )
 
+    # 31. Issue 2.1: Nested function body free reads after conditional store in subroutine
+    nested_cond_full = (
+        "def outer(x: int, flag: bool) -> int:\n"
+        "    if flag:\n"
+        "        x = 0\n"
+        "    def helper(y: int) -> int:\n"
+        "        return x + y\n"
+        "    return helper(1)\n"
+    )
+    nested_cond_sub = (
+        "if flag:\n"
+        "    x = 0\n"
+        "def helper(y: int) -> int:\n"
+        "    return x + y\n"
+        "return helper(1)\n"
+    )
+    nested_cond_scope = inspect_single_unit_scope(
+        {
+            "kind": "compound_block",
+            "start": 2,
+            "end": 6,
+            "source_text": nested_cond_full,
+            "source_code": nested_cond_sub,
+        },
+        tree=ast.parse(nested_cond_full),
+    )
+    assert "x" in nested_cond_scope["inputs"]
+
 
 
