@@ -2376,6 +2376,340 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     assert super_scope["binding_kind"] == "instance"
 
 
+def test_closure_cell_binding_and_severed_cell_hazards(tmp_path: Path) -> None:
+    """Verifies closure cell binding preservation and severed_closure_cell hazard detection."""
+    from pydoppelgangerhunt.fixer import (
+        collect_downstream_read_names,
+        generate_refactoring_patch,
+        inspect_single_unit_scope,
+        resolve_clone_pair_outputs,
+        synthesize_shared_helper_code,
+    )
+
+    # 1. Generator subroutine inside nested closure with outer nonlocal declaration
+    gen_nl_src = (
+        "def outer_a(items):\n"
+        "    total = 0\n"
+        "    def gen_a():\n"
+        "        nonlocal total\n"
+        "        for x in items:\n"
+        "            total += x * 2\n"
+        "            yield x\n"
+        "    return gen_a, lambda: total\n"
+        "\n"
+        "def outer_b(items):\n"
+        "    total = 10\n"
+        "    def gen_b():\n"
+        "        nonlocal total\n"
+        "        for x in items:\n"
+        "            total += x * 2\n"
+        "            yield x\n"
+        "    return gen_b, lambda: total\n"
+    )
+    f_gen_nl = tmp_path / "gen_nl.py"
+    f_gen_nl.write_text(gen_nl_src, encoding="utf-8")
+    u_gen1 = {
+        "file": str(f_gen_nl),
+        "start": 5,
+        "end": 7,
+        "name": "gen_a:For",
+        "kind": "compound_block",
+    }
+    u_gen2 = {
+        "file": str(f_gen_nl),
+        "start": 14,
+        "end": 16,
+        "name": "gen_b:For",
+        "kind": "compound_block",
+    }
+    ds_nl = collect_downstream_read_names(gen_nl_src, u_gen1, candidates={"total", "x"})
+    assert ds_nl == {"total"}
+    patch_gen_nl = generate_refactoring_patch(
+        [(1.0, u_gen1, u_gen2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert "total = (yield from _shared_" in patch_gen_nl
+
+    # 2. Conditional store to enclosing nonlocal promotes variable to input instead of None
+    cond_nl_src = (
+        "def run_a(items):\n"
+        "    total = 5\n"
+        "    def worker():\n"
+        "        nonlocal total\n"
+        "        for x in items:\n"
+        "            if x > 0:\n"
+        "                total = x * 2\n"
+        "    worker()\n"
+        "    return total\n"
+    )
+    u_cond_nl = {
+        "start": 5,
+        "end": 7,
+        "kind": "compound_block",
+        "source_text": cond_nl_src,
+        "source_code": "for x in items:\n    if x > 0:\n        total = x * 2\n",
+    }
+    sc_cond_nl = inspect_single_unit_scope(u_cond_nl, tree=ast.parse(cond_nl_src))
+    assert "total" in sc_cond_nl["inputs"]
+    assert "total" in sc_cond_nl["outputs"]
+    assert "total" not in sc_cond_nl["conditional_outputs"]
+
+    # 3. Late-bound / unbound closure cell captured by intra-unit closure
+    late_cell_src = (
+        "def build_a(items):\n"
+        "    callbacks = []\n"
+        "    for item in items:\n"
+        "        def cb(x, item=item):\n"
+        "            return x * scale + item\n"
+        "        callbacks.append(cb)\n"
+        "    scale = 10\n"
+        "    return [f(2) for f in callbacks]\n"
+        "\n"
+        "def build_b(items):\n"
+        "    callbacks = []\n"
+        "    for item in items:\n"
+        "        def cb(x, item=item):\n"
+        "            return x * scale + item\n"
+        "        callbacks.append(cb)\n"
+        "    scale = 20\n"
+        "    return [f(3) for f in callbacks]\n"
+    )
+    f_late = tmp_path / "late_cell.py"
+    f_late.write_text(late_cell_src, encoding="utf-8")
+    u_late1 = {
+        "file": str(f_late),
+        "start": 3,
+        "end": 6,
+        "name": "build_a:For",
+        "kind": "compound_block",
+    }
+    u_late2 = {
+        "file": str(f_late),
+        "start": 12,
+        "end": 15,
+        "name": "build_b:For",
+        "kind": "compound_block",
+    }
+    sc_late1 = inspect_single_unit_scope(u_late1, repo_root=str(tmp_path))
+    sc_late2 = inspect_single_unit_scope(u_late2, repo_root=str(tmp_path))
+    assert "severed_closure_cell" in sc_late1["control_flow_hazards"]
+    assert sc_late1["is_control_flow_safe"] is False
+    assert synthesize_shared_helper_code(u_late1, u_late2, repo_root=str(tmp_path)) == ""
+    res_late = resolve_clone_pair_outputs(
+        u_late1, u_late2, sc_late1, sc_late2, repo_root=str(tmp_path), return_details=True
+    )
+    assert res_late.outputs is None
+    assert res_late.skip_reason == "severed closure cell"
+    assert (
+        generate_refactoring_patch(
+            [(1.0, u_late1, u_late2)], repo_root=str(tmp_path), replace_clones=True
+        )
+        == ""
+    )
+
+    # 4. Post-unit mutated closure cell, loop-mutated cell, and sibling nonlocal-mutated cell
+    post_mut_src = (
+        "def build_post(items):\n"
+        "    scale = 1\n"
+        "    callbacks = []\n"
+        "    for item in items:\n"
+        "        callbacks.append(lambda x, item=item: x * scale + item)\n"
+        "    scale = 10\n"
+        "    return callbacks\n"
+    )
+    sc_post_mut = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 5,
+            "kind": "compound_block",
+            "source_text": post_mut_src,
+            "source_code": "for item in items:\n    callbacks.append(lambda x, item=item: x * scale + item)\n",
+        },
+        tree=ast.parse(post_mut_src),
+    )
+    assert "severed_closure_cell" in sc_post_mut["control_flow_hazards"]
+
+    loop_mut_src = (
+        "def build_loop(items):\n"
+        "    callbacks = []\n"
+        "    for item in items:\n"
+        "        def cb(x):\n"
+        "            return x + item\n"
+        "        callbacks.append(cb)\n"
+        "    return callbacks\n"
+    )
+    sc_loop_mut = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 6,
+            "kind": "compound_block",
+            "source_text": loop_mut_src,
+            "source_code": "def cb(x):\n    return x + item\ncallbacks.append(cb)\n",
+        },
+        tree=ast.parse(loop_mut_src),
+    )
+    assert "severed_closure_cell" in sc_loop_mut["control_flow_hazards"]
+
+    # 5. Intra-unit closure mutating subroutine top-level variable via nonlocal when both escape
+    intra_nl_src = (
+        "def outer_inc():\n"
+        "    count = 0\n"
+        "    def inc():\n"
+        "        nonlocal count\n"
+        "        count += 1\n"
+        "    inc()\n"
+        "    return count\n"
+    )
+    sc_intra_nl = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 5,
+            "kind": "compound_block",
+            "source_text": intra_nl_src,
+            "source_code": "count = 0\ndef inc():\n    nonlocal count\n    count += 1\n",
+        },
+        tree=ast.parse(intra_nl_src),
+    )
+    assert "severed_closure_cell" in sc_intra_nl["control_flow_hazards"]
+
+    # 6. Pre-unit sibling closure passed into subroutine sharing a mutated cell variable
+    sib_cell_src = (
+        "def outer_sib(items):\n"
+        "    acc = 0\n"
+        "    def get_acc():\n"
+        "        return acc\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        acc += x\n"
+        "        out.append(get_acc())\n"
+        "    return acc, out\n"
+    )
+    sc_sib_cell = inspect_single_unit_scope(
+        {
+            "start": 6,
+            "end": 8,
+            "kind": "compound_block",
+            "source_text": sib_cell_src,
+            "source_code": "for x in items:\n    acc += x\n    out.append(get_acc())\n",
+        },
+        tree=ast.parse(sib_cell_src),
+    )
+    assert "severed_closure_cell" in sc_sib_cell["control_flow_hazards"]
+
+    # 7. Safe constant closure cell (bound before subroutine and never mutated afterwards)
+    safe_cell_src = (
+        "def build_safe(items, scale):\n"
+        "    callbacks = []\n"
+        "    for item in items:\n"
+        "        callbacks.append(lambda x, item=item: x * scale + item)\n"
+        "    return callbacks\n"
+    )
+    sc_safe_cell = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 4,
+            "kind": "compound_block",
+            "source_text": safe_cell_src,
+            "source_code": "for item in items:\n    callbacks.append(lambda x, item=item: x * scale + item)\n",
+        },
+        tree=ast.parse(safe_cell_src),
+    )
+    assert "severed_closure_cell" not in sc_safe_cell["control_flow_hazards"]
+    assert sc_safe_cell["is_control_flow_safe"] is True
+
+    # 8. Outer global escaping bindings, candidates=None, with-cleanup, and outer chain
+    ds_nl_all = collect_downstream_read_names(gen_nl_src, u_gen1, candidates=None)
+    assert ds_nl_all is not None and "total" in ds_nl_all
+
+    global_with_src = (
+        "def run_glob(ctx, items):\n"
+        "    global shared_total\n"
+        "    with ctx:\n"
+        "        for x in items:\n"
+        "            shared_total += x\n"
+    )
+    u_glob_with = {
+        "start": 4,
+        "end": 5,
+        "kind": "compound_block",
+        "source_text": global_with_src,
+        "source_code": "for x in items:\n    shared_total += x\n",
+    }
+    sc_glob = inspect_single_unit_scope(u_glob_with, tree=ast.parse(global_with_src))
+    res_glob = resolve_clone_pair_outputs(
+        u_glob_with,
+        u_glob_with,
+        sc_glob,
+        sc_glob,
+        source_text1=global_with_src,
+        source_text2=global_with_src,
+        return_details=True,
+    )
+    assert res_glob.outputs is None
+    assert res_glob.skip_reason == "enclosing try or with cleanup hazard"
+
+    # 9. Pre-unit closure mutating nonlocal cell passed into subroutine, and multi-level chain
+    sib_nl_mut_src = (
+        "def outer_nl_sib(items):\n"
+        "    acc = 0\n"
+        "    def bump():\n"
+        "        nonlocal acc\n"
+        "        acc += 1\n"
+        "    for x in items:\n"
+        "        bump()\n"
+        "        use(acc + x)\n"
+        "    return acc\n"
+    )
+    sc_sib_nl = inspect_single_unit_scope(
+        {
+            "start": 6,
+            "end": 8,
+            "kind": "compound_block",
+            "source_text": sib_nl_mut_src,
+            "source_code": "for x in items:\n    bump()\n    use(acc + x)\n",
+        },
+        tree=ast.parse(sib_nl_mut_src),
+    )
+    assert "severed_closure_cell" in sc_sib_nl["control_flow_hazards"]
+
+    multilevel_cell_src = (
+        "def outer_chain(items):\n"
+        "    scale = 1\n"
+        "    def inner_chain():\n"
+        "        cbs = []\n"
+        "        for item in items:\n"
+        "            cbs.append(lambda x, item=item: x * scale + item)\n"
+        "            yield item\n"
+        "    scale = 20\n"
+        "    return inner_chain\n"
+    )
+    u_ml = {
+        "start": 5,
+        "end": 7,
+        "kind": "compound_block",
+        "source_text": multilevel_cell_src,
+        "source_code": (
+            "for item in items:\n"
+            "    cbs.append(lambda x, item=item: x * scale + item)\n"
+            "    yield item\n"
+        ),
+    }
+    sc_ml = inspect_single_unit_scope(u_ml, tree=ast.parse(multilevel_cell_src))
+    assert "severed_closure_cell" in sc_ml["control_flow_hazards"]
+    res_ml_gen = resolve_clone_pair_outputs(
+        u_ml,
+        u_ml,
+        sc_ml,
+        sc_ml,
+        source_text1=multilevel_cell_src,
+        source_text2=multilevel_cell_src,
+        return_details=True,
+    )
+    assert res_ml_gen.outputs is None
+    assert res_ml_gen.skip_reason == "severed closure cell"
+
+
+
+
 
 
 

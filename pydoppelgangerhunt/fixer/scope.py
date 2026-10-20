@@ -21,8 +21,12 @@ from typing import (
 
 from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
 from pydoppelgangerhunt.fixer._df_closures import (
+    _UnitClosureHazardContext,
     _extract_comprehension_walrus_names,
+    _extract_scope_escaping_bindings,
     _extract_single_node_local_names,
+    _find_enclosing_function_chain,
+    _has_severed_closure_cell_hazard,
     iter_nested_scope_header_nodes,
 )
 from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
@@ -182,11 +186,11 @@ class _ScopeVisitor(ast.NodeVisitor):
             if receiver_names is not None
             else ("self", "cls")
         )
-        self._unit_top_locals: Set[str] = set()
+        self.unit_top_locals: Set[str] = set()
         self._unit_top_stored_locals: Set[str] = set()
 
-    def _init_unit_top_locals(self, target_node: ast.AST) -> None:
-        self._unit_top_locals = _extract_single_node_local_names(
+    def _initunit_top_locals(self, target_node: ast.AST) -> None:
+        self.unit_top_locals = _extract_single_node_local_names(
             target_node,
             include_globals=False,
             include_nonlocals=False,
@@ -202,7 +206,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         )
 
     def visit_Module(self, node: ast.Module) -> None:
-        if self.is_subroutine and not self._unit_top_locals:
+        if self.is_subroutine and not self.unit_top_locals:
             if (
                 len(node.body) == 1
                 and isinstance(node.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -218,7 +222,7 @@ class _ScopeVisitor(ast.NodeVisitor):
                 target_mod = ast.Module(body=wrapper_body, type_ignores=[])
             else:
                 target_mod = node
-            self._init_unit_top_locals(target_mod)
+            self._initunit_top_locals(target_mod)
         self.generic_visit(node)
 
     def visit(self, node: ast.AST) -> Any:
@@ -349,8 +353,8 @@ class _ScopeVisitor(ast.NodeVisitor):
             ):
                 body = body[0].body
                 self.loop_offset = 0
-            if not self._unit_top_locals:
-                self._init_unit_top_locals(ast.Module(body=body, type_ignores=[]))
+            if not self.unit_top_locals:
+                self._initunit_top_locals(ast.Module(body=body, type_ignores=[]))
             if isinstance(node, ast.AsyncFunctionDef):
                 self.is_async = True
             for stmt in body:
@@ -394,9 +398,9 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._type_param_scopes.append(tp_names)
         try:
             if is_top:
-                self._init_unit_top_locals(node)
+                self._initunit_top_locals(node)
                 self._scope_stack.append(
-                    set(self.params) | tp_names | self._unit_top_locals
+                    set(self.params) | tp_names | self.unit_top_locals
                 )
             else:
                 for tp in getattr(node, "type_params", []):
@@ -414,7 +418,7 @@ class _ScopeVisitor(ast.NodeVisitor):
                     self.visit(node.returns)
                 self._record_store_name(node.name)
                 if not self._scope_stack:
-                    self._scope_stack.append(set(self._unit_top_locals))
+                    self._scope_stack.append(set(self.unit_top_locals))
                     created_outer = True
                 nested_locals = _extract_single_node_local_names(
                     node,
@@ -444,7 +448,7 @@ class _ScopeVisitor(ast.NodeVisitor):
                 self.visit(kw_default)
         created_outer = False
         if not self._scope_stack:
-            self._scope_stack.append(set(self._unit_top_locals))
+            self._scope_stack.append(set(self.unit_top_locals))
             created_outer = True
         self._scope_stack.append(self._extract_arg_names(node.args))
         saved_comp_depth = self._comprehension_depth
@@ -486,7 +490,7 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._record_store_name(node.name)
             created_outer = False
             if not self._scope_stack:
-                self._scope_stack.append(set(self._unit_top_locals))
+                self._scope_stack.append(set(self.unit_top_locals))
                 created_outer = True
             self._scope_stack.append({":class_scope:", *tp_names})
             self.class_depth += 1
@@ -692,7 +696,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self._comprehension_depth += 1
         created_outer = False
         if not self._scope_stack:
-            self._scope_stack.append(set(self._unit_top_locals))
+            self._scope_stack.append(set(self.unit_top_locals))
             created_outer = True
         inner_vars: Set[str] = set()
         self._scope_stack.append(inner_vars)
@@ -741,7 +745,7 @@ class _ScopeVisitor(ast.NodeVisitor):
                 )
                 or name in self.stores
                 or name in self.params
-                or name in self._unit_top_locals
+                or name in self.unit_top_locals
             )
             if (eff_len <= 1 or not is_unit_bound) and name not in self.nonlocals:
                 self.nonlocals.append(name)
@@ -1690,6 +1694,8 @@ def _find_enclosing_pre_bound_names(
                         b_name = alias.asname or alias.name.split(".", 1)[0]
                         if b_name != "*":
                             bound_before.add(b_name)
+                elif isinstance(curr, ast.Nonlocal):
+                    bound_before.update(curr.names)
                 elif (
                     isinstance(curr, ast.ExceptHandler)
                     and isinstance(curr.name, str)
@@ -2061,7 +2067,15 @@ def _inspect_unit_scope(
                 and v not in BUILTIN_NAMES
                 and v not in visitor.read_before_write
             ]
-            if cond_live_ins:
+            cond_escaping_cands = [
+                v
+                for v in sorted(cond_assigned - def_assigned)
+                if v not in visitor.params
+                and v not in visitor.globals
+                and v not in BUILTIN_NAMES
+                and v not in visitor.read_before_write
+            ]
+            if cond_live_ins or cond_escaping_cands:
                 pre_bound: Set[str] = set()
                 u_start = parse_unit_coord(unit, "start", default=0)
                 u_end = parse_unit_coord(unit, "end", default=u_start)
@@ -2071,14 +2085,32 @@ def _inspect_unit_scope(
                     if full_src:
                         mod_tree = _get_or_parse_tree(full_src)
                 if mod_tree is not None and u_start > 0:
-                    pre_bound, _ = _find_enclosing_pre_bound_names(
-                        mod_tree, u_start, u_end
-                    )
+                    if cond_live_ins:
+                        pre_bound, _ = _find_enclosing_pre_bound_names(
+                            mod_tree, u_start, u_end
+                        )
+                    if cond_escaping_cands:
+                        enc_chain = _find_enclosing_function_chain(
+                            mod_tree, u_start, u_end, None, True
+                        )
+                        if enc_chain:
+                            enc_escaping = _extract_scope_escaping_bindings(
+                                enc_chain[-1][2], u_start, u_end
+                            )
+                            for v in cond_escaping_cands:
+                                if v in enc_escaping:
+                                    if v not in visitor.loads:
+                                        visitor.loads.append(v)
+                                    if v not in visitor.read_before_write:
+                                        visitor.read_before_write.append(v)
                 has_enclosing_context = mod_tree is not None and (
                     u_start > 1 or bool(_get_tree_scope_intervals(mod_tree))
                 )
                 for v in cond_live_ins:
-                    if v in pre_bound or (not has_enclosing_context and v in def_assigned):
+                    if (
+                        v in pre_bound
+                        or (not has_enclosing_context and v in def_assigned)
+                    ) and v not in visitor.read_before_write:
                         visitor.read_before_write.append(v)
 
         free_vars = [
@@ -2207,6 +2239,41 @@ def _inspect_unit_scope(
         ):
             hazards.append("deleted_output")
 
+        if is_subroutine or unit.get("kind") == "closure":
+            c_u_start = parse_unit_coord(unit, "start", default=0)
+            c_u_end = parse_unit_coord(unit, "end", default=c_u_start)
+            if c_u_start > 0:
+                c_mod_tree = file_tree
+                if c_mod_tree is None:
+                    full_src = _get_full_source()
+                    if full_src:
+                        c_mod_tree = _get_or_parse_tree(full_src)
+                if c_mod_tree is not None:
+                    c_start_col = parse_unit_coord(unit, "start_col", default=None)
+                    if c_start_col is None:
+                        c_start_col = parse_unit_coord(unit, "col_offset", default=None)
+                    c_end_col = parse_unit_coord(unit, "end_col", default=None)
+                    if c_end_col is None:
+                        c_end_col = parse_unit_coord(unit, "end_col_offset", default=None)
+                    if _has_severed_closure_cell_hazard(
+                        _UnitClosureHazardContext(
+                            candidate_stmts=candidate_stmts,
+                            mod_tree=c_mod_tree,
+                            u_start=c_u_start,
+                            u_end=c_u_end,
+                            u_start_col=c_start_col,
+                            u_end_col=c_end_col,
+                            is_subroutine=is_subroutine,
+                            unit_kind=str(unit.get("kind") or ""),
+                            inputs=inputs,
+                            outputs=outputs,
+                            stores=visitor.stores,
+                            deleted_names=all_deleted,
+                            unit_top_locals=visitor.unit_top_locals,
+                        )
+                    ):
+                        hazards.append("severed_closure_cell")
+
         is_control_flow_safe = not any(
             h
             in (
@@ -2216,6 +2283,7 @@ def _inspect_unit_scope(
                 "type_param_closure_capture",
                 "pathological_ast",
                 "deleted_output",
+                "severed_closure_cell",
             )
             for h in hazards
         )

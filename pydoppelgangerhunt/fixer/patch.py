@@ -3559,6 +3559,9 @@ def _generate_refactoring_patch_impl(
             if "deleted_output" in hazards1 | hazards2:
                 skip_reasons["deleted output hazard"] += 1
                 continue
+            if "severed_closure_cell" in hazards1 | hazards2:
+                skip_reasons["severed closure cell"] += 1
+                continue
             if "embedded_return" in hazards1 | hazards2:
                 lines1 = u1_lines
                 lines2 = u2_lines
