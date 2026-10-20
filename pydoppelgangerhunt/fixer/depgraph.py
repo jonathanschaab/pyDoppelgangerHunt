@@ -1067,7 +1067,8 @@ class ModuleDependencyGraph:
                     if d not in EXCLUDED_GRAPH_DIRS
                     and not (dir_p / d).is_symlink()
                 ]
-                for filename in filenames:
+                dirnames.sort()
+                for filename in sorted(filenames):
                     file_p = dir_p / filename
                     safe_file = _is_safe_repo_python_file(file_p, root)
                     if safe_file is not None and safe_file not in seen_files:

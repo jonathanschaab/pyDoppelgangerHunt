@@ -216,12 +216,13 @@ def find_python_files(
 
     found_files: List[Path] = []
     target_str = str(target_path)
-    for root, _, files in os.walk(target_str):
+    for root, dirs, files in os.walk(target_str):
+        dirs.sort()
         rel_root = os.path.relpath(root, target_str).replace("\\", "/")
         norm_root = root.replace("\\", "/")
         if _is_excluded(norm_root, rel_root):
             continue
-        for file in files:
+        for file in sorted(files):
             file_lower = file.lower()
             if not any(file_lower.endswith(sfx) for sfx in valid_suffixes):
                 continue
