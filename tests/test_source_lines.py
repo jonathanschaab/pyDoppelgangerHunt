@@ -2108,5 +2108,117 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     )
     assert "x" in nested_cond_scope["inputs"]
 
+    # 32. Finding 1: Conditional live-in promotion requires prior binding (no false promotion from def_assigned or loop)
+    uninit_def_src = (
+        "def compute(flag: bool) -> tuple[int, int]:\n"
+        "    if flag:\n"
+        "        x = 10\n"
+        "    y = x if flag else 0\n"
+        "    x = 20\n"
+        "    return y, x\n"
+    )
+    uninit_def_scope = inspect_single_unit_scope(
+        {
+            "kind": "compound_block",
+            "start": 2,
+            "end": 5,
+            "source_text": uninit_def_src,
+            "source_code": "if flag:\n    x = 10\ny = x if flag else 0\nx = 20\n",
+        },
+        tree=ast.parse(uninit_def_src),
+    )
+    assert "x" not in uninit_def_scope["inputs"]
+    assert "x" in uninit_def_scope["outputs"]
+
+    uninit_loop_src = (
+        "def process(items: list[int], flag: bool) -> int:\n"
+        "    total = 0\n"
+        "    for item in items:\n"
+        "        if flag:\n"
+        "            k = item * 2\n"
+        "        total += k if flag else 1\n"
+        "    return total\n"
+    )
+    uninit_loop_scope = inspect_single_unit_scope(
+        {
+            "kind": "compound_block",
+            "start": 4,
+            "end": 6,
+            "source_text": uninit_loop_src,
+            "source_code": "if flag:\n    k = item * 2\ntotal += k if flag else 1\n",
+        },
+        tree=ast.parse(uninit_loop_src),
+    )
+    assert "k" not in uninit_loop_scope["inputs"]
+    assert "k" in uninit_loop_scope["conditional_outputs"]
+
+    # 33. Finding 2: Transitive deferred live-in tracking for caller-before-callee nested functions
+    caller_callee_src = (
+        "def outer(x):\n"
+        "    def caller():\n"
+        "        return callee()\n"
+        "    def callee():\n"
+        "        return x\n"
+        "    res = caller()\n"
+        "    x = 10\n"
+        "    return res, x\n"
+    )
+    caller_callee_sub = (
+        "def caller():\n"
+        "    return callee()\n"
+        "def callee():\n"
+        "    return x\n"
+        "res = caller()\n"
+        "x = 10\n"
+    )
+    caller_callee_scope = inspect_single_unit_scope(
+        {
+            "kind": "compound_block",
+            "start": 2,
+            "end": 7,
+            "source_text": caller_callee_src,
+            "source_code": caller_callee_sub,
+        },
+        tree=ast.parse(caller_callee_src),
+    )
+    assert "x" in caller_callee_scope["inputs"]
+
+    # 34. Finding 3: _find_enclosing_pre_bound_names discards prior del and skips wildcard "*" imports
+    from pydoppelgangerhunt.fixer.scope import _find_enclosing_pre_bound_names
+
+    del_star_src = (
+        "from math import *\n"
+        "def f(flag):\n"
+        "    x = 1\n"
+        "    del x\n"
+        "    if flag:\n"
+        "        x = 2\n"
+        "    y = x if flag else 0\n"
+        "    return y\n"
+    )
+    pre_bound_del, _ = _find_enclosing_pre_bound_names(ast.parse(del_star_src), 5, 7)
+    assert "*" not in pre_bound_del
+    assert "x" not in pre_bound_del
+    del_star_scope = inspect_single_unit_scope(
+        {
+            "kind": "compound_block",
+            "start": 5,
+            "end": 7,
+            "source_text": del_star_src,
+            "source_code": "if flag:\n    x = 2\ny = x if flag else 0\n",
+        },
+        tree=ast.parse(del_star_src),
+    )
+    assert "x" not in del_star_scope["inputs"]
+    assert "x" in del_star_scope["conditional_outputs"]
+
+    # 35. Finding 4: _extract_helper_symbols ignores "*" on wildcard imports
+    star_helper_tree = ast.parse("def _shared_fn():\n    from math import *\n    return 1\n")
+    star_free, star_def, star_imp = _extract_helper_symbols(star_helper_tree)
+    assert "*" not in star_free
+    assert "*" not in star_def
+    assert "*" not in star_imp
+
+
 
 

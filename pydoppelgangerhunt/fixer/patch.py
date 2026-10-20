@@ -2035,7 +2035,9 @@ def _extract_helper_symbols(
                     _collect_helper_named_exprs(hdr)
             elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
                 for alias in stmt.names:
-                    bound.add(alias.asname or alias.name.split(".", 1)[0])
+                    b_name = alias.asname or alias.name.split(".", 1)[0]
+                    if b_name != "*":
+                        bound.add(b_name)
             elif isinstance(stmt, ast.Assign):
                 for t in stmt.targets:
                     bound.update(_extract_assigned_names(t))
@@ -2348,16 +2350,18 @@ def _extract_helper_symbols(
         def visit_Import(self, node: ast.Import) -> None:
             for alias in node.names:
                 name = alias.asname or alias.name.split(".", 1)[0]
-                self._bind_names({name})
-                if len(scope_stack) <= max_helper_scope_depth:
-                    local_imported_names.add(name)
+                if name != "*":
+                    self._bind_names({name})
+                    if len(scope_stack) <= max_helper_scope_depth:
+                        local_imported_names.add(name)
 
         def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
             for alias in node.names:
                 name = alias.asname or alias.name
-                self._bind_names({name})
-                if len(scope_stack) <= max_helper_scope_depth:
-                    local_imported_names.add(name)
+                if name != "*":
+                    self._bind_names({name})
+                    if len(scope_stack) <= max_helper_scope_depth:
+                        local_imported_names.add(name)
 
         def visit_Global(self, node: ast.Global) -> None:
             for name in node.names:

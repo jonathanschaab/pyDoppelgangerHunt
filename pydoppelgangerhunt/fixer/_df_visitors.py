@@ -1215,11 +1215,23 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         self.stored: Set[str] = set()
         self._branch_depth: int = 0
         self._deferred_live_ins: Dict[str, Set[str]] = {}
+        self._fn_callers: Dict[str, Set[str]] = {}
 
     def _is_inside(self, node: ast.AST) -> bool:
         return _is_ast_node_within_unit_bounds(
             node, self.u_start, self.u_end, self.u_end_col, self.u_start_col
         )
+
+    def _expand_deferred_callers(self, fn_name: str) -> Set[str]:
+        expanded: Set[str] = {fn_name}
+        queue: List[str] = [fn_name]
+        while queue:
+            curr = queue.pop()
+            for caller in self._fn_callers.get(curr, ()):
+                if caller not in expanded:
+                    expanded.add(caller)
+                    queue.append(caller)
+        return expanded
 
     def _commit_unconditional_store(self, name: str) -> None:
         self.stored.add(name)
@@ -1235,14 +1247,17 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
         self, name: str, *, deferred_fn: Optional[str] = None
     ) -> None:
         """Records a variable name as a live-in if not stored, in comp, or builtin."""
+        callers: Set[str] = set()
         if deferred_fn is None:
             for var_name, fn_names in list(self._deferred_live_ins.items()):
                 if name in fn_names and var_name not in self.stored:
                     self._deferred_live_ins.pop(var_name, None)
         else:
+            self._fn_callers.setdefault(name, set()).add(deferred_fn)
+            callers = self._expand_deferred_callers(deferred_fn)
             for fn_names in self._deferred_live_ins.values():
                 if name in fn_names:
-                    fn_names.add(deferred_fn)
+                    fn_names.update(callers)
         if (
             name not in self.stored
             and not self._is_in_comp(name)
@@ -1252,9 +1267,9 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
             if deferred_fn is not None:
                 if name not in self.live_ins:
                     self.live_ins.add(name)
-                    self._deferred_live_ins[name] = {deferred_fn}
+                    self._deferred_live_ins[name] = set(callers)
                 elif name in self._deferred_live_ins:
-                    self._deferred_live_ins[name].add(deferred_fn)
+                    self._deferred_live_ins[name].update(callers)
             else:
                 self.live_ins.add(name)
                 self._deferred_live_ins.pop(name, None)

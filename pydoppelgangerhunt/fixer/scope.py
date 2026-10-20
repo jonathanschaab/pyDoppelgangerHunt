@@ -1624,68 +1624,66 @@ def _find_enclosing_pre_bound_names(
                 + ([scope_node.args.kwarg] if scope_node.args.kwarg else [])
             ):
                 bound_before.add(arg.arg)
-        stack: List[ast.AST] = [scope_node]
+        stack: List[ast.AST] = list(reversed(getattr(scope_node, "body", [])))
         while stack:
             curr = stack.pop()
-            children = (
-                getattr(curr, "body", [])
-                if curr is scope_node
-                else ast.iter_child_nodes(curr)
-            )
-            for child in children:
-                c_start = getattr(child, "lineno", None)
-                c_end = getattr(child, "end_lineno", c_start)
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    if isinstance(c_start, int) and c_start < s_line:
-                        bound_before.add(child.name)
-                    if not is_class_scope:
-                        stack.extend(iter_nested_scope_header_nodes(child))
-                    continue
-                if isinstance(child, ast.Lambda):
-                    if not is_class_scope:
-                        stack.extend(iter_nested_scope_header_nodes(child))
-                    continue
-                if isinstance(
-                    child, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-                ):
-                    if isinstance(c_start, int) and c_start < s_line and not is_class_scope:
-                        bound_before.update(_extract_comprehension_walrus_names(child))
-                    continue
-                if (
-                    isinstance(child, ast.AnnAssign)
-                    and child.value is None
-                    and isinstance(child.target, ast.Name)
-                ):
-                    stack.append(child.annotation)
-                    continue
-                if isinstance(child, (ast.For, ast.AsyncFor, ast.While)):
-                    if (
-                        isinstance(c_start, int)
-                        and isinstance(c_end, int)
-                        and c_start <= s_line
-                        and e_line <= c_end
-                        and (c_start < s_line or c_end > e_line)
-                    ):
-                        in_loop = True
+            c_start = getattr(curr, "lineno", None)
+            c_end = getattr(curr, "end_lineno", c_start)
+            if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 if isinstance(c_start, int) and c_start < s_line:
-                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
-                        bound_before.add(child.id)
-                    elif isinstance(child, (ast.Import, ast.ImportFrom)):
-                        for alias in child.names:
-                            bound_before.add(alias.asname or alias.name.split(".", 1)[0])
-                    elif (
-                        isinstance(child, ast.ExceptHandler)
-                        and isinstance(child.name, str)
-                        and isinstance(c_end, int)
-                        and c_start <= s_line
-                        and e_line <= c_end
-                    ):
-                        bound_before.add(child.name)
-                    elif type(child).__name__ in ("MatchAs", "MatchStar", "MatchMapping"):
-                        m_name = getattr(child, "name", None) or getattr(child, "rest", None)
-                        if isinstance(m_name, str):
-                            bound_before.add(m_name)
-                stack.append(child)
+                    bound_before.add(curr.name)
+                if not is_class_scope:
+                    stack.extend(reversed(list(iter_nested_scope_header_nodes(curr))))
+                continue
+            if isinstance(curr, ast.Lambda):
+                if not is_class_scope:
+                    stack.extend(reversed(list(iter_nested_scope_header_nodes(curr))))
+                continue
+            if isinstance(
+                curr, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+            ):
+                if isinstance(c_start, int) and c_start < s_line and not is_class_scope:
+                    bound_before.update(_extract_comprehension_walrus_names(curr))
+                continue
+            if (
+                isinstance(curr, ast.AnnAssign)
+                and curr.value is None
+                and isinstance(curr.target, ast.Name)
+            ):
+                stack.append(curr.annotation)
+                continue
+            if isinstance(curr, (ast.For, ast.AsyncFor, ast.While)):
+                if (
+                    isinstance(c_start, int)
+                    and isinstance(c_end, int)
+                    and c_start <= s_line
+                    and e_line <= c_end
+                    and (c_start < s_line or c_end > e_line)
+                ):
+                    in_loop = True
+            if isinstance(c_start, int) and c_start < s_line:
+                if isinstance(curr, ast.Name) and isinstance(curr.ctx, ast.Store):
+                    bound_before.add(curr.id)
+                elif isinstance(curr, ast.Name) and isinstance(curr.ctx, ast.Del):
+                    bound_before.discard(curr.id)
+                elif isinstance(curr, (ast.Import, ast.ImportFrom)):
+                    for alias in curr.names:
+                        b_name = alias.asname or alias.name.split(".", 1)[0]
+                        if b_name != "*":
+                            bound_before.add(b_name)
+                elif (
+                    isinstance(curr, ast.ExceptHandler)
+                    and isinstance(curr.name, str)
+                    and isinstance(c_end, int)
+                    and c_start <= s_line
+                    and e_line <= c_end
+                ):
+                    bound_before.add(curr.name)
+                elif type(curr).__name__ in ("MatchAs", "MatchStar", "MatchMapping"):
+                    m_name = getattr(curr, "name", None) or getattr(curr, "rest", None)
+                    if isinstance(m_name, str):
+                        bound_before.add(m_name)
+            stack.extend(reversed(list(ast.iter_child_nodes(curr))))
     return bound_before, in_loop
 
 
@@ -2029,21 +2027,22 @@ def _inspect_unit_scope(
             ]
             if cond_live_ins:
                 pre_bound: Set[str] = set()
-                in_enclosing_loop = False
-                if any(v not in def_assigned for v in cond_live_ins):
-                    u_start = parse_unit_coord(unit, "start", default=0)
-                    u_end = parse_unit_coord(unit, "end", default=u_start)
-                    mod_tree = file_tree
-                    if mod_tree is None and u_start > 0:
-                        full_src = _get_full_source()
-                        if full_src:
-                            mod_tree = _get_or_parse_tree(full_src)
-                    if mod_tree is not None and u_start > 0:
-                        pre_bound, in_enclosing_loop = _find_enclosing_pre_bound_names(
-                            mod_tree, u_start, u_end
-                        )
+                u_start = parse_unit_coord(unit, "start", default=0)
+                u_end = parse_unit_coord(unit, "end", default=u_start)
+                mod_tree = file_tree
+                if mod_tree is None and u_start > 0:
+                    full_src = _get_full_source()
+                    if full_src:
+                        mod_tree = _get_or_parse_tree(full_src)
+                if mod_tree is not None and u_start > 0:
+                    pre_bound, _ = _find_enclosing_pre_bound_names(
+                        mod_tree, u_start, u_end
+                    )
+                has_enclosing_context = mod_tree is not None and (
+                    u_start > 1 or bool(_get_tree_scope_intervals(mod_tree))
+                )
                 for v in cond_live_ins:
-                    if v in def_assigned or in_enclosing_loop or v in pre_bound:
+                    if v in pre_bound or (not has_enclosing_context and v in def_assigned):
                         visitor.read_before_write.append(v)
 
         free_vars = [
