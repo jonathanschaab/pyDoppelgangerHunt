@@ -12,7 +12,21 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydoppelgangerhunt.canonical_path import parse_notebook_cell_anchor
 from pydoppelgangerhunt.config import normalize_path_string
-from pydoppelgangerhunt.source_lines import split_source_lines
+from pydoppelgangerhunt.source_lines import (
+    is_sliced_unit_source_lines,
+    parse_unit_coord,
+    resolve_safe_unit_file_path,
+    resolve_unit_line_bounds,
+    split_source_lines,
+)
+
+
+def _safe_unit_coord(unit: Dict[str, Any], key: str) -> Optional[int]:
+    """Safely extracts and parses an integer coordinate, returning None on failure."""
+    try:
+        return parse_unit_coord(unit, key, default=None)
+    except (ValueError, TypeError):
+        return None
 
 
 # ANSI Color Codes
@@ -44,68 +58,63 @@ def colorize(text: str, color_code: str, enabled: bool) -> str:
     return f"{color_code}{text}{COLOR_RESET}"
 
 
+def _unit_line_bounds(unit: Dict[str, Any]) -> Tuple[int, int]:
+    """Extracts parsed (start, end) line coordinates from a unit dictionary."""
+    return resolve_unit_line_bounds(unit)
+
+
 def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:
-    """Reads raw source code lines for a given unit from provided lines or disk."""
-    s_d = int(unit.get("start") or 1)
-    e_d = int(unit.get("end") or s_d)
+    """Reads raw source code lines for a given unit from provided lines or disk.
+
+    Supports pre-sliced unit lines, full-file line lists, in-memory source_text,
+    or disk-based source reading. Callers can explicitly specify
+    'source_lines_is_sliced': True (or False) to disambiguate whether 'source_lines'
+    represents a pre-sliced excerpt or the complete file.
+
+    Note:
+        When the 'end' coordinate is omitted in the unit dictionary, it defaults
+        to end = start (a single line), consistent with resolve_unit_line_bounds,
+        rather than extending to end-of-file.
+    """
+    s_d, e_d = _unit_line_bounds(unit)
     n_d = str(unit.get("name") or "unit")
     placeholder = [f"# Source for {n_d} lines {s_d}-{e_d}\n"]
 
     source_lines = unit.get("source_lines")
+    from_source_text = False
+    if source_lines is None and unit.get("source_text") is not None:
+        source_lines = split_source_lines(str(unit["source_text"]))
+        from_source_text = True
+
     if source_lines is not None and isinstance(source_lines, (list, tuple)):
         if not source_lines:
             return placeholder
+        # Sliced lines fast-path:
+        # If 'source_lines_is_sliced' is explicitly set, honor caller intent.
+        # Otherwise, heuristic: if len(source_lines) == (e_d - s_d + 1),
+        # the list is treated as already sliced to unit boundaries (unless from full source_text).
+        if not from_source_text and is_sliced_unit_source_lines(unit, source_lines):
+            return [
+                ln if ln.endswith("\n") else ln + "\n"
+                for ln in source_lines
+            ]
         start = max(1, s_d)
-        end = min(len(source_lines), int(unit.get("end") or len(source_lines)))
+        end = min(len(source_lines), e_d)
         return [
             ln if ln.endswith("\n") else ln + "\n"
             for ln in source_lines[start - 1 : end]
         ]
 
-    raw_file = str(unit.get("file") or "")
-    f_raw = normalize_path_string(raw_file, strip_anchor=True)
-    if not f_raw:
-        return placeholder
-
-    file_path = Path(f_raw)
-    if file_path.suffix.lower() not in (".py", ".ipynb"):
-        return placeholder
-
-    if repo_root:
-        effective_root = Path(repo_root).resolve()
-        if effective_root.is_file():
-            effective_root = effective_root.parent
-        target_root = effective_root
-        if not file_path.is_absolute():
-            file_path = effective_root / file_path
-    else:
-        target_root = Path.cwd().resolve()
-        if not file_path.is_absolute():
-            file_path = target_root / file_path
-
-
-    try:
-        if not file_path.is_file() or file_path.is_symlink():
-            return placeholder
-        for parent in file_path.parents:
-            if parent.is_symlink():
-                return placeholder
-            if parent == target_root:
-                break
-
-
-        resolved_file = file_path.resolve()
-        if resolved_file.is_symlink() or not resolved_file.is_file():
-            return placeholder
-        resolved_file.relative_to(target_root)
-    except (OSError, RuntimeError, ValueError):
+    resolved_file = resolve_safe_unit_file_path(unit, repo_root=repo_root)
+    if resolved_file is None:
         return placeholder
 
     try:
         is_cell_anchor = False
         cell_idx = -1
-        if resolved_file.suffix.lower() == ".ipynb" and "#" in raw_file:
-            parsed_nb = parse_notebook_cell_anchor(raw_file)
+        u_file = str(unit.get("file") or "")
+        if resolved_file.suffix.lower() == ".ipynb" and "#" in u_file:
+            parsed_nb = parse_notebook_cell_anchor(u_file)
             if parsed_nb is not None:
                 cell_idx = parsed_nb[1]
                 is_cell_anchor = True
@@ -131,7 +140,7 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
             with open(resolved_file, "r", encoding="utf-8", errors="replace") as fh:
                 all_lines = fh.readlines()
         start = max(1, s_d)
-        end = min(len(all_lines), int(unit.get("end") or len(all_lines)))
+        end = min(len(all_lines), e_d)
         return all_lines[start - 1 : end]
     except OSError:
         return [f"# Unable to read {str(unit.get('file') or '')}\n"]
@@ -148,10 +157,8 @@ def generate_clone_diff(
     lines2 = extract_unit_source_code(u2, repo_root)
     f1_norm = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
     f2_norm = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
-    s1 = int(u1.get("start") or 1)
-    e1 = int(u1.get("end") or s1)
-    s2 = int(u2.get("start") or 1)
-    e2 = int(u2.get("end") or s2)
+    s1, e1 = _unit_line_bounds(u1)
+    s2, e2 = _unit_line_bounds(u2)
     n1 = str(u1.get("name") or "unit1")
     n2 = str(u2.get("name") or "unit2")
     from_label = f"{f1_norm}:{s1}-{e1} ({n1})"
@@ -232,10 +239,8 @@ def format_sarif_report(
     for idx, (sim, u1, u2) in enumerate(clones):
         f1_norm = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
         f2_norm = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
-        s1 = int(u1.get("start") or 1)
-        e1 = int(u1.get("end") or s1)
-        s2 = int(u2.get("start") or 1)
-        e2 = int(u2.get("end") or s2)
+        s1, e1 = _unit_line_bounds(u1)
+        s2, e2 = _unit_line_bounds(u2)
         n1 = str(u1.get("name") or "unit1")
         n2 = str(u2.get("name") or "unit2")
         rule_id = "PYDOPPEL001"
@@ -248,19 +253,23 @@ def format_sarif_report(
             "startLine": s1,
             "endLine": e1,
         }
-        if u1.get("start_col") is not None:
-            r1["startColumn"] = max(1, int(u1["start_col"]) + 1)
-        if u1.get("end_col") is not None:
-            r1["endColumn"] = max(1, int(u1["end_col"]) + 1)
+        sc1 = _safe_unit_coord(u1, "start_col")
+        if sc1 is not None:
+            r1["startColumn"] = max(1, sc1 + 1)
+        ec1 = _safe_unit_coord(u1, "end_col")
+        if ec1 is not None:
+            r1["endColumn"] = max(1, ec1 + 1)
 
         r2: Dict[str, Any] = {
             "startLine": s2,
             "endLine": e2,
         }
-        if u2.get("start_col") is not None:
-            r2["startColumn"] = max(1, int(u2["start_col"]) + 1)
-        if u2.get("end_col") is not None:
-            r2["endColumn"] = max(1, int(u2["end_col"]) + 1)
+        sc2 = _safe_unit_coord(u2, "start_col")
+        if sc2 is not None:
+            r2["startColumn"] = max(1, sc2 + 1)
+        ec2 = _safe_unit_coord(u2, "end_col")
+        if ec2 is not None:
+            r2["endColumn"] = max(1, ec2 + 1)
 
         result_item: Dict[str, Any] = {
             "ruleId": rule_id,
@@ -335,6 +344,23 @@ def format_sarif_report(
     }
 
 
+def _format_unit_json(
+    unit: Dict[str, Any], default_name: str, include_tokens: bool = False
+) -> Dict[str, Any]:
+    """Formats an AST unit into a structured JSON dictionary."""
+    s, e = _unit_line_bounds(unit)
+    data: Dict[str, Any] = {
+        "name": str(unit.get("name") or default_name),
+        "file": normalize_path_string(str(unit.get("file") or ""), strip_anchor=False),
+        "start": s,
+        "end": e,
+        "kind": unit.get("kind"),
+    }
+    if include_tokens:
+        data["tokens"] = unit.get("token_count", 0)
+    return data
+
+
 def format_json_report(
     clones: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     target: str,
@@ -352,22 +378,8 @@ def format_json_report(
         "clones": [
             {
                 "similarity": round(sim, 4),
-                "unit_a": {
-                    "name": str(u1.get("name") or "unit1"),
-                    "file": normalize_path_string(str(u1.get("file") or ""), strip_anchor=False),
-                    "start": int(u1.get("start") or 1),
-                    "end": int(u1.get("end") or int(u1.get("start") or 1)),
-                    "kind": u1.get("kind"),
-                    "tokens": u1.get("token_count", 0),
-                },
-                "unit_b": {
-                    "name": str(u2.get("name") or "unit2"),
-                    "file": normalize_path_string(str(u2.get("file") or ""), strip_anchor=False),
-                    "start": int(u2.get("start") or 1),
-                    "end": int(u2.get("end") or int(u2.get("start") or 1)),
-                    "kind": u2.get("kind"),
-                    "tokens": u2.get("token_count", 0),
-                },
+                "unit_a": _format_unit_json(u1, "unit1", include_tokens=True),
+                "unit_b": _format_unit_json(u2, "unit2", include_tokens=True),
             }
             for sim, u1, u2 in clones
         ],
@@ -384,24 +396,12 @@ def format_json_report(
                 "coherence": round(f.get("coherence", 1.0), 4),
                 "total_lines": f["total_lines"],
                 "medoid": (
-                    {
-                        "name": str(f["medoid"].get("name") or "medoid"),
-                        "file": normalize_path_string(str(f["medoid"].get("file") or ""), strip_anchor=False),
-                        "start": int(f["medoid"].get("start") or 1),
-                        "end": int(f["medoid"].get("end") or int(f["medoid"].get("start") or 1)),
-                        "kind": f["medoid"].get("kind"),
-                    }
+                    _format_unit_json(f["medoid"], "medoid")
                     if "medoid" in f and f["medoid"]
                     else None
                 ),
                 "members": [
-                    {
-                        "name": str(m.get("name") or "member"),
-                        "file": normalize_path_string(str(m.get("file") or ""), strip_anchor=False),
-                        "start": int(m.get("start") or 1),
-                        "end": int(m.get("end") or int(m.get("start") or 1)),
-                        "kind": m.get("kind"),
-                    }
+                    _format_unit_json(m, "member")
                     for m in f["members"]
                 ],
             }
@@ -472,31 +472,37 @@ def format_github_annotations(
     annotations: List[str] = []
     for sim, u1, u2 in clones:
         f1 = normalize_path_string(str(u1.get("file") or ""), strip_anchor=True)
-        s1 = int(u1.get("start") or 1)
-        e1 = int(u1.get("end") or s1)
+        s1, e1 = _unit_line_bounds(u1)
         f2 = normalize_path_string(str(u2.get("file") or ""), strip_anchor=True)
-        s2 = int(u2.get("start") or 1)
-        e2 = int(u2.get("end") or s2)
+        s2, e2 = _unit_line_bounds(u2)
         n1 = str(u1.get("name") or "unit1")
         n2 = str(u2.get("name") or "unit2")
         msg1 = f"Structural clone ({sim:.1%}) matching {f2}:{s2}-{e2} ({n2})"
         col_part1 = ""
-        if u1.get("start_col") is not None:
-            col_part1 += f",col={max(1, int(u1['start_col']) + 1)}"
-            if u1.get("end_col") is not None:
-                col_part1 += f",endColumn={max(1, int(u1['end_col']) + 1)}"
-        annotations.append(
-            f"::warning file={f1},line={s1},endLine={e1}{col_part1},title=pyDoppelgangerHunt Duplicate Code::{msg1}"
+        sc1 = _safe_unit_coord(u1, "start_col")
+        if sc1 is not None:
+            col_part1 += f",col={max(1, sc1 + 1)}"
+            ec1 = _safe_unit_coord(u1, "end_col")
+            if ec1 is not None:
+                col_part1 += f",endColumn={max(1, ec1 + 1)}"
+        ann1 = (
+            f"::warning file={f1},line={s1},endLine={e1}{col_part1},"
+            f"title=pyDoppelgangerHunt Duplicate Code::{msg1}"
         )
+        annotations.append(ann1)
         msg2 = f"Structural clone ({sim:.1%}) matching {f1}:{s1}-{e1} ({n1})"
         col_part2 = ""
-        if u2.get("start_col") is not None:
-            col_part2 += f",col={max(1, int(u2['start_col']) + 1)}"
-            if u2.get("end_col") is not None:
-                col_part2 += f",endColumn={max(1, int(u2['end_col']) + 1)}"
-        annotations.append(
-            f"::warning file={f2},line={s2},endLine={e2}{col_part2},title=pyDoppelgangerHunt Duplicate Code::{msg2}"
+        sc2 = _safe_unit_coord(u2, "start_col")
+        if sc2 is not None:
+            col_part2 += f",col={max(1, sc2 + 1)}"
+            ec2 = _safe_unit_coord(u2, "end_col")
+            if ec2 is not None:
+                col_part2 += f",endColumn={max(1, ec2 + 1)}"
+        ann2 = (
+            f"::warning file={f2},line={s2},endLine={e2}{col_part2},"
+            f"title=pyDoppelgangerHunt Duplicate Code::{msg2}"
         )
+        annotations.append(ann2)
     return annotations
 
 
@@ -539,10 +545,8 @@ def generate_html_report(
 
         f1_norm = normalize_path_string(str(u1.get("file") or ""), strip_anchor=False)
         f2_norm = normalize_path_string(str(u2.get("file") or ""), strip_anchor=False)
-        s1 = int(u1.get("start") or 1)
-        e1 = int(u1.get("end") or s1)
-        s2 = int(u2.get("start") or 1)
-        e2 = int(u2.get("end") or s2)
+        s1, e1 = _unit_line_bounds(u1)
+        s2, e2 = _unit_line_bounds(u2)
         n1 = str(u1.get("name") or "unit1")
         n2 = str(u2.get("name") or "unit2")
 
@@ -591,8 +595,7 @@ def generate_html_report(
                 m_file = html.escape(
                     normalize_path_string(str(m.get("file") or ""), strip_anchor=False)
                 )
-                m_start = int(m.get("start") or 1)
-                m_end = int(m.get("end") or m_start)
+                m_start, m_end = _unit_line_bounds(m)
                 raw_m_name = str(m.get("name") or "member")
                 m_name = html.escape(raw_m_name)
                 is_medoid = bool(medoid_name and raw_m_name == medoid_name)

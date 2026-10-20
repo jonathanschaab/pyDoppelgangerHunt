@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -893,6 +894,18 @@ def test_batch_49_matcher_similarity_and_subclones(tmp_path: Path) -> None:
     )
     assert len(clones_bag) == 1
 
+    # top_n <= 0 does not truncate to empty list
+    clones_nonpos = scan_target(
+        str(pkg_scan),
+        threshold=0.8,
+        min_lines=2,
+        min_tokens=3,
+        bag_of_tokens=True,
+        sort_by="priority",
+        top_n=0,
+    )
+    assert len(clones_nonpos) >= 1
+
     # 8. scan_target with workers=2 exercising _worker_harvest_file
     pkg = tmp_path / "parallel_pkg"
     pkg.mkdir()
@@ -914,7 +927,6 @@ def test_batch_49_matcher_similarity_and_subclones(tmp_path: Path) -> None:
 def test_batch_51_matcher_defensive_bounds_and_raw_set_baseline(tmp_path: Path) -> None:
     """Batch 51: Test defensive bounds in matcher merging/subclones, and raw set baseline filtering."""
     # pylint: disable=import-outside-toplevel
-    import json
     from pydoppelgangerhunt.baseline import (
         clone_pair_structural_fingerprint,
         filter_clones_by_baseline,
@@ -1083,7 +1095,6 @@ def test_batch_59_scan_target_repo_root_and_diff_hunk_prefixes(tmp_path: Path) -
 def test_batch_70_review_fixes(tmp_path: Path) -> None:
     """Batch 70: Test TRY_NODE_TYPES compatibility, path-specific exemption isolation, and absolute path normalization."""
     # pylint: disable=import-outside-toplevel
-    import ast
     from pydoppelgangerhunt.matcher import (
         _normalize_exemption_endpoint,
         scan_target,
@@ -1210,6 +1221,36 @@ def test_batch_82_matcher_sloc_and_priority_score_bounds() -> None:
         reverse=True,
     )
     assert len(clone_pairs) == 2
+
+
+def test_compute_priority_score_malformed_string_coordinates() -> None:
+    """Verifies that compute_priority_score defensively returns 0.0 on malformed coordinates."""
+    from pydoppelgangerhunt.matcher import (  # pylint: disable=import-outside-toplevel
+        _unit_sloc,
+        compute_priority_score,
+    )
+
+    u1 = {"start": "not_an_int", "end": "5", "complexity": "high"}
+    u2 = {"start": 1, "end": 10, "complexity": 2}
+    assert compute_priority_score(0.9, u1, u2) == 0.0
+
+    # Bad complexity safely falls back to 1 rather than silencing the entire score to 0.0
+    u3 = {"start": 1, "end": 10, "complexity": "invalid"}
+    assert compute_priority_score(0.9, u2, u3) > 0.0
+
+    u4 = {"start": None, "end": None, "complexity": None}
+    assert compute_priority_score(0.9, u2, u4) >= 0.0
+
+    # _unit_sloc and compute_priority_score agree on inverted/invalid coordinates
+    inv_u = {"start": 20, "end": 10}
+    assert _unit_sloc(inv_u) == 1
+    assert compute_priority_score(0.9, inv_u, u2) == 0.0
+
+    # None and non-dict inputs defensively return 0.0 without raising AttributeError
+    assert compute_priority_score(0.9, None, u2) == 0.0  # type: ignore[arg-type]
+    assert compute_priority_score(0.9, u2, None) == 0.0  # type: ignore[arg-type]
+    assert compute_priority_score(0.9, "invalid", u2) == 0.0  # type: ignore[arg-type]
+    assert compute_priority_score(0.9, u2, 123) == 0.0  # type: ignore[arg-type]
 
 
 def test_differential_scan_multi_unit_file_and_shingle_dedup(tmp_path: Path) -> None:

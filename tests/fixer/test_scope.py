@@ -176,11 +176,19 @@ def test_fixer_control_flow_and_side_effect_safety(tmp_path: Path) -> None:
     file_target.write_text(
         '"""Target module docstring."""\n\n'
         'from __future__ import annotations\n\n'
-        'def run_step(a: int, b: int) -> int:\n'
-        '    return a + b\n',
+        'def run_step(a: int, b: int) -> tuple[int, int]:\n'
+        '    a += b\n'
+        '    b += 1\n'
+        '    return a, b\n',
         encoding="utf-8",
     )
-    u_patch1 = {"file": str(file_target), "start": 5, "end": 6, "name": "run_step"}
+    u_patch1 = {
+        "file": str(file_target),
+        "start": 6,
+        "end": 7,
+        "name": "run_step:stmts",
+        "kind": "sliding_window",
+    }
     patch = generate_refactoring_patch([(0.95, u_mut, u_patch1)], repo_root=str(tmp_path))
     assert "+from typing import" in patch
     assert "Tuple" in patch
@@ -244,16 +252,24 @@ def test_global_and_nonlocal_scope_preservation(tmp_path: Path) -> None:
     from pydoppelgangerhunt.fixer import analyze_unit_variable_scope, synthesize_shared_helper_code  # pylint: disable=import-outside-toplevel
 
     code = (
-        "def outer():\n"
-        "    global global_metric\n"
-        "    nonlocal captured_scale\n"
-        "    global_metric += 1\n"
-        "    captured_scale *= 2\n"
+        "def enclosing():\n"
+        "    captured_scale = 1\n"
+        "    def outer():\n"
+        "        global global_metric\n"
+        "        nonlocal captured_scale\n"
+        "        global_metric += 1\n"
+        "        captured_scale *= 2\n"
     )
     src_file = tmp_path / "scope_mod_src.py"
     src_file.write_text(code, encoding="utf-8")
 
-    u_scope = {"file": str(src_file), "start": 2, "end": 5, "name": "outer:compound", "kind": "compound_block"}
+    u_scope = {
+        "file": str(src_file),
+        "start": 4,
+        "end": 7,
+        "name": "outer:compound",
+        "kind": "compound_block",
+    }
     scope = analyze_unit_variable_scope(u_scope, repo_root=str(tmp_path))
     assert "global_metric" in scope["globals"]
     assert "captured_scale" in scope["nonlocals"]
@@ -1142,9 +1158,9 @@ def test_subroutine_with_local_function_scope_isolation(tmp_path: Path) -> None:
 
 def test_with_block_unconditional_termination_and_deletion() -> None:
     """Verifies that terminating with blocks are recognized and deleted names in with blocks are discarded."""
-    term_code = "with lock:\n    return val\nx = 1\n"
+    term_code = "def f():\n    with lock:\n        return val\n    x = 1\n"
     tree_term = ast.parse(term_code)
-    assert _block_terminates(tree_term.body) is True
+    assert _block_terminates(tree_term.body[0].body) is True  # type: ignore[attr-defined]
 
     del_code = "x = 1\nwith lock:\n    del x\n"
     tree_del = ast.parse(del_code)
@@ -1501,3 +1517,554 @@ def test_scope_inspection_custom_receiver_attributes(tmp_path: Path) -> None:
     assert "klass.count" in s_cls["attrs_read"]
     assert "klass.count" in s_cls["class_attrs"]
     assert s_cls["inputs"][0] == "klass"
+
+
+def test_inspect_unit_scope_deterministic_set_outputs() -> None:
+    """Verifies that analyze_unit_variable_scope rejects multi-item sets to prevent
+    unpositional output pairing, while single-item sets are supported."""
+    code = (
+        "def worker():\n"
+        "    for i in range(10):\n"
+        "        z = i\n"
+        "        a = i * 2\n"
+        "        yield a\n"
+    )
+    tree = ast.parse(code)
+    u_sub = {
+        "file": "test_mod.py",
+        "start": 2,
+        "end": 5,
+        "kind": "compound_block",
+        "outputs": {"z", "a", "m", "b"},
+        "source_text": code,
+    }
+    scope = analyze_unit_variable_scope(u_sub, tree1=tree)
+    # Multi-item set outputs fail closed to empty list and mark outputs_ambiguous
+    assert scope["outputs"] == []
+    assert scope.get("outputs_ambiguous") is True
+
+    u_sub2 = {
+        "file": "test_mod.py",
+        "start": 2,
+        "end": 5,
+        "kind": "compound_block",
+        "precomputed_outputs": {"z", "a", "m", "b"},
+        "source_text": code,
+    }
+    scope2 = analyze_unit_variable_scope(u_sub2, tree1=tree)
+    assert scope2["outputs"] == []
+    assert scope2.get("outputs_ambiguous") is True
+
+    u_sub_single = {
+        "file": "test_mod.py",
+        "start": 2,
+        "end": 5,
+        "kind": "compound_block",
+        "outputs": {"single_var"},
+        "source_text": code,
+    }
+    scope_single = analyze_unit_variable_scope(u_sub_single, tree1=tree)
+    assert scope_single["outputs"] == ["single_var"]
+    assert scope_single.get("outputs_ambiguous") is False
+
+
+def test_nested_generator_yield_assignment_does_not_mark_outer_unit() -> None:
+    """Verifies that an inner/nested generator containing 'x = yield' does not mark
+    has_yield_assignment on the outer unit."""
+    code = (
+        "def outer():\n"
+        "    def inner():\n"
+        "        val = yield 42\n"
+        "        return val\n"
+        "    return inner\n"
+    )
+    tree = ast.parse(code)
+    unit = {
+        "file": "test_mod.py",
+        "start": 1,
+        "end": 5,
+        "kind": "function",
+        "name": "outer",
+        "source_text": code,
+    }
+    scope = analyze_unit_variable_scope(unit, tree1=tree)
+    assert scope.get("has_yield_assignment") is False
+    assert scope.get("has_yield") is False
+
+    # Also test that 'yield from' return assignment does not trigger has_yield_assignment
+    code_sub = (
+        "def run():\n"
+        "    def sub_gen():\n"
+        "        received = yield 10\n"
+        "        return received\n"
+        "    y = yield from sub_gen()\n"
+    )
+    tree_sub = ast.parse(code_sub)
+    u_sub = {
+        "file": "test_mod.py",
+        "start": 2,
+        "end": 5,
+        "kind": "compound_block",
+        "source_text": code_sub,
+    }
+    scope_sub = analyze_unit_variable_scope(u_sub, tree1=tree_sub)
+    assert scope_sub.get("has_yield_assignment") is False
+
+
+def test_generator_expression_yield_does_not_set_yield_assignment() -> None:
+    """Verifies that yields inside GeneratorExp do not trigger has_yield_assignment."""
+    from pydoppelgangerhunt.fixer.scope import (  # pylint: disable=import-outside-toplevel
+        _ScopeVisitor,
+    )
+
+    # Directly construct synthetic AST node to verify resilience against partial/injected ASTs
+    gen_node = ast.Assign(
+        targets=[ast.Name(id="g", ctx=ast.Store())],
+        value=ast.GeneratorExp(
+            elt=ast.Yield(value=ast.Constant(value=42)),
+            generators=[
+                ast.comprehension(
+                    target=ast.Name(id="i", ctx=ast.Store()),
+                    iter=ast.List(elts=[], ctx=ast.Load()),
+                    ifs=[],
+                    is_async=0,
+                )
+            ],
+        ),
+    )
+    visitor = _ScopeVisitor()
+    visitor.visit(gen_node)
+    assert visitor.has_yield_assignment is False
+
+    visitor_assign = _ScopeVisitor()
+    tree_assign = ast.parse("def f():\n    x = yield 100\n")
+    visitor_assign.visit(tree_assign.body[0].body[0])  # type: ignore[attr-defined]
+    assert visitor_assign.has_yield_assignment is True
+
+
+def test_sync_outer_containing_nested_async_comprehension(tmp_path: Path) -> None:
+    """Verifies that an async comprehension inside a nested async def does not
+    mark the outer sync function as is_async."""
+    code = (
+        "def outer(y):\n"
+        "    async def inner():\n"
+        "        return [x async for x in y]\n"
+        "    return inner\n"
+    )
+    f = tmp_path / "outer_sync.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {
+        "file": "outer_sync.py",
+        "start": 1,
+        "end": 4,
+        "name": "outer",
+        "kind": "function",
+    }
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert scope["is_async"] is False
+
+
+def test_nested_async_comprehension_detected_as_async(tmp_path: Path) -> None:
+    """Verifies that nested async comprehensions correctly set is_async = True."""
+    code = (
+        "async def process_matrix(matrix):\n"
+        "    return [[x async for x in row] for row in matrix]\n"
+    )
+    f = tmp_path / "nested_async_comp.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {
+        "file": "nested_async_comp.py",
+        "start": 2,
+        "end": 2,
+        "start_col": 11,
+        "end_col": 53,
+        "name": "nested_comp",
+        "kind": "comprehension",
+    }
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert scope["is_async"] is True
+
+
+def test_nested_async_comprehension_in_subroutine(tmp_path: Path) -> None:
+    """Verifies that nested async comprehensions in a subroutine parse correctly and set is_async."""
+    code = (
+        "res = [[x async for x in row] for row in matrix]\n"
+        "total = len(res)\n"
+    )
+    f = tmp_path / "subroutine_nested_async.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {
+        "file": "subroutine_nested_async.py",
+        "start": 1,
+        "end": 2,
+        "name": "subroutine",
+        "kind": "subroutine",
+    }
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert scope["is_async"] is True
+
+
+def test_sync_comprehension_inside_async_def_not_is_async(tmp_path: Path) -> None:
+    """Verifies that pure synchronous comprehensions inside async functions
+    are not falsely marked as is_async=True."""
+    code = (
+        "async def fetch_all(items):\n"
+        "    doubled = [x * 2 for x in items]\n"
+        "    return doubled\n"
+    )
+    f = tmp_path / "async_fn.py"
+    f.write_text(code, encoding="utf-8")
+
+    u = {
+        "file": "async_fn.py",
+        "start": 2,
+        "end": 2,
+        "name": "fetch_all:doubled",
+        "kind": "comprehension",
+    }
+    scope = analyze_unit_variable_scope(u, repo_root=str(tmp_path))
+    assert scope["is_async"] is False
+
+
+def test_harvest_file_units_sync_and_async_comprehension(tmp_path: Path) -> None:
+    """Verifies harvest_file_units accurately assigns is_async to comprehensions."""
+    code = (
+        "async def run(items, aiter):\n"
+        "    sync_comp = [x * 2 for x in items]\n"
+        "    async_comp = [x async for x in aiter]\n"
+    )
+    f = tmp_path / "comps.py"
+    f.write_text(code, encoding="utf-8")
+    units = harvest_file_units(str(f), repo_root=str(tmp_path), comprehensions=True)
+    comp_units = [u for u in units if u.get("kind") == "comprehension"]
+    sync_units = [u for u in comp_units if u.get("start") == 2]
+    async_units = [u for u in comp_units if u.get("start") == 3]
+    assert len(sync_units) >= 1
+    assert sync_units[0]["is_async"] is False
+    assert len(async_units) >= 1
+    assert async_units[0]["is_async"] is True
+
+
+def test_unit_ast_has_async_or_yield_lambda_exclusion_and_single_line() -> None:
+    """Verifies that lambda generator expressions do not mark enclosing subroutine as generator,
+    and single-line enclosing async functions are not skipped."""
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=protected-access
+        _unit_ast_has_async_or_yield,
+    )
+
+    # 1. Generator lambda inside subroutine
+    code1 = "def f(x):\n    cb = lambda: (yield x)\n    return cb\n"
+    tree1 = ast.parse(code1)
+    has_yield1, has_await1 = _unit_ast_has_async_or_yield(tree1, 2, 3)
+    assert has_yield1 is False
+    assert has_await1 is False
+
+    # 2. Single-line enclosing async def
+    code2 = "async def f(): a = await g(); b = 1\n"
+    tree2 = ast.parse(code2)
+    has_yield2, has_await2 = _unit_ast_has_async_or_yield(tree2, 1, 1)
+    assert has_await2 is True
+    assert has_yield2 is False
+
+
+def test_unit_ast_has_async_or_yield_single_line_class_method() -> None:
+    """Verifies that single-line methods inside a class are traversed to detect await/yield."""
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=protected-access
+        _unit_ast_has_async_or_yield,
+    )
+
+    code = (
+        "class Worker:\n"
+        "    async def run(self): a = await fetch(); return a\n"
+    )
+    tree = ast.parse(code)
+    has_yield, has_await = _unit_ast_has_async_or_yield(tree, 2, 2)
+    assert has_await is True
+    assert has_yield is False
+
+
+def test_unit_ast_has_async_or_yield_nested_functions_and_classes() -> None:
+    """Verifies that nested functions or classes within unit bounds do not leak yield/await to outer scope."""
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=protected-access
+        _unit_ast_has_async_or_yield,
+    )
+
+    # 1. Module-level block containing inner generator function
+    code1 = (
+        "total = 0\n"
+        "def inner_gen():\n"
+        "    yield 1\n"
+        "total += 1\n"
+    )
+    tree1 = ast.parse(code1)
+    has_yield1, has_await1 = _unit_ast_has_async_or_yield(tree1, 1, 4)
+    assert has_yield1 is False
+    assert has_await1 is False
+
+    # 2. Function containing nested generator function
+    code2 = (
+        "def process(items):\n"
+        "    def inner_gen():\n"
+        "        for x in items:\n"
+        "            yield x\n"
+        "    return list(inner_gen())\n"
+    )
+    tree2 = ast.parse(code2)
+    has_yield2, has_await2 = _unit_ast_has_async_or_yield(tree2, 1, 5)
+    assert has_yield2 is False
+    assert has_await2 is False
+
+    # 3. Function containing nested class with generator method
+    code3 = (
+        "def factory():\n"
+        "    class Inner:\n"
+        "        def gen(self):\n"
+        "            yield 42\n"
+        "    return Inner()\n"
+    )
+    tree3 = ast.parse(code3)
+    has_yield3, has_await3 = _unit_ast_has_async_or_yield(tree3, 1, 5)
+    assert has_yield3 is False
+    assert has_await3 is False
+
+
+def test_unit_ast_has_async_or_yield_coinciding_subroutine_and_same_line_class() -> None:
+    """Verifies that subroutine units coinciding with an inner def do not select the inner def
+    as their enclosing scope, and same-line class+method tie-breaks to the inner method."""
+    from pydoppelgangerhunt.fixer.binding import (  # pylint: disable=protected-access
+        _populate_unit_receiver_metadata,
+        _unit_ast_has_async_or_yield,
+    )
+
+    # 1. Subroutine unit inside async def outer() whose [u_start, u_end] coincides
+    # with a nested synchronous generator def inner_gen():
+    code_sub = (
+        "async def outer(x):\n"
+        "    def inner_gen():\n"
+        "        yield x\n"
+        "    return inner_gen\n"
+    )
+    tree_sub = ast.parse(code_sub)
+    has_yield, has_await = _unit_ast_has_async_or_yield(
+        tree_sub, 2, 3, is_subroutine=True
+    )
+    assert has_yield is False
+    assert has_await is False
+
+    unit_sub: Dict[str, Any] = {
+        "start": 2,
+        "end": 3,
+        "kind": "compound_block",
+        "name": "outer_sub",
+    }
+    _populate_unit_receiver_metadata(unit_sub, source_text=code_sub, tree=tree_sub)
+    assert unit_sub.get("enclosing_is_async") is True
+    assert not unit_sub.get("is_async")
+    assert not unit_sub.get("has_yield")
+
+
+    # 2. Same-span ClassDef and AsyncFunctionDef (e.g. synthetic/transformed AST with span == 0):
+    tree_same_span = ast.parse(
+        "class OneLine:\n    async def run(self): return await fetch()\n"
+    )
+    for n in ast.walk(tree_same_span):
+        if hasattr(n, "lineno"):
+            setattr(n, "lineno", 1)
+            setattr(n, "end_lineno", 1)
+    cls_node = tree_same_span.body[0]
+    assert isinstance(cls_node, ast.ClassDef)
+    fn_node = cls_node.body[0]
+    setattr(cls_node, "col_offset", 0)
+    setattr(fn_node, "col_offset", 15)
+    y_one, a_one = _unit_ast_has_async_or_yield(tree_same_span, 1, 1)
+    assert y_one is False
+    assert a_one is True
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="PEP 695 syntax requires Python 3.12+",
+)
+def test_scope_visitor_pep695_type_params_and_type_alias(tmp_path: Path) -> None:
+    """Verifies that _ScopeVisitor binds PEP 695 type_params and excludes TypeAlias names from outputs."""
+    src = (
+        "def first[T](items: list[T], cast_fn) -> T:\n"
+        "    type Pair[U] = tuple[U, T]\n"
+        "    def wrap[V](val: V) -> tuple[V, T]:\n"
+        "        type Tree = list[Tree]\n"
+        "        return (val, items[0])\n"
+        "    class Box[W]:\n"
+        "        kind = W\n"
+        "    out = cast_fn(T, items[0])\n"
+        "    return out\n"
+    )
+    f = tmp_path / "pep695_mod.py"
+    f.write_text(src, encoding="utf-8")
+
+    # 1. Whole generic function unit
+    u_fn = {
+        "file": str(f),
+        "start": 1,
+        "end": 9,
+        "kind": "function",
+        "name": "first",
+    }
+    scope_fn = _inspect_unit_scope(u_fn, repo_root=str(tmp_path))
+    assert scope_fn["inputs"] == ["items", "cast_fn"]
+    assert "T" not in scope_fn["free_vars"]
+    assert "Tree" not in scope_fn["free_vars"]
+
+    # 2. Subroutine inside generic function containing TypeAlias, generic inner def, and generic class
+    u_sub = {
+        "file": str(f),
+        "start": 2,
+        "end": 8,
+        "kind": "subroutine",
+        "name": "first_sub",
+    }
+    scope_sub = _inspect_unit_scope(u_sub, repo_root=str(tmp_path))
+    assert "U" not in scope_sub["inputs"]
+    assert "V" not in scope_sub["inputs"]
+    assert "W" not in scope_sub["inputs"]
+    assert "Tree" not in scope_sub["inputs"]
+    assert "Pair" not in scope_sub["outputs"]
+    assert "out" in scope_sub["outputs"]
+
+    # 3. Subroutine defining a TypeAlias that IS referenced downstream in the enclosing function
+    src_ds = (
+        "def second[T](items: list[T]) -> object:\n"
+        "    type DownstreamAlias = list[T]\n"
+        "    val = items[0]\n"
+        "    return val, DownstreamAlias\n"
+    )
+    f_ds = tmp_path / "pep695_ds.py"
+    f_ds.write_text(src_ds, encoding="utf-8")
+    u_ds = {
+        "file": str(f_ds),
+        "start": 2,
+        "end": 3,
+        "kind": "subroutine",
+        "name": "second_sub",
+    }
+    scope_ds = _inspect_unit_scope(u_ds, repo_root=str(tmp_path))
+    assert "DownstreamAlias" in scope_ds["outputs"]
+    assert "val" in scope_ds["outputs"]
+    assert scope_fn["type_params"] == ["T"]
+
+    src_bound = (
+        "def bounded[T: CustomBound](items: list[T]) -> T:\n"
+        "    return items[0]\n"
+    )
+    f_bound = tmp_path / "pep695_bound.py"
+    f_bound.write_text(src_bound, encoding="utf-8")
+    u_bound = {
+        "file": str(f_bound),
+        "start": 1,
+        "end": 2,
+        "kind": "function",
+        "name": "bounded",
+    }
+    scope_bound = _inspect_unit_scope(u_bound, repo_root=str(tmp_path))
+    assert "CustomBound" not in scope_bound["inputs"]
+    assert "CustomBound" not in scope_bound["free_vars"]
+    assert scope_bound["type_params"] == ["T: CustomBound"]
+    assert scope_bound["type_param_free_vars"] == ["CustomBound"]
+    combined_bound = analyze_unit_variable_scope(u_bound, repo_root=str(tmp_path))
+    assert combined_bound["type_param_free_vars"] == ["CustomBound"]
+
+    # 4. Nested generic function default argument evaluated outside type_params
+    src_def = (
+        "def outer():\n"
+        "    def inner[V](x: V = V) -> V:\n"
+        "        return x\n"
+        "    return inner\n"
+    )
+    f_def = tmp_path / "pep695_def.py"
+    f_def.write_text(src_def, encoding="utf-8")
+    u_def = {
+        "file": str(f_def),
+        "start": 2,
+        "end": 3,
+        "kind": "compound_block",
+        "is_subroutine": True,
+        "name": "outer_sub",
+    }
+    scope_def = _inspect_unit_scope(u_def, repo_root=str(tmp_path))
+    assert "V" in scope_def["inputs"]
+
+
+def test_subroutine_local_import_skips_downstream_read_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that subroutines with only local imports do not invoke collect_downstream_read_names."""
+    import pydoppelgangerhunt.fixer.scope as scope_mod
+    from pydoppelgangerhunt.fixer.scope import _merge_type_params
+
+    assert _merge_type_params(["T: int"], ["T: int"]) == ["T: int"]
+    assert _merge_type_params(["T: int"], ["T: str"]) == ["T"]
+    assert _merge_type_params(["*Ts = *tuple[int, ...]"], ["*Ts = *tuple[str, ...]"]) == ["*Ts"]
+    assert _merge_type_params(["**P = [int]"], ["**P"]) == ["**P"]
+    assert _merge_type_params(["T"], ["*T"]) == ["T"]
+    assert _merge_type_params(["T = int"], ["U"]) == ["U", "T = int"]
+    assert _merge_type_params(["T"], []) == ["T"]
+    assert _merge_type_params([], ["U"]) == ["U"]
+
+    calls: list[ set[str] ] = []
+
+    def _spy_downstream(*args: Any, **kwargs: Any) -> set[str]:
+        calls.append(set(kwargs.get("candidates") or ()))
+        return set()
+
+    monkeypatch.setattr(scope_mod, "collect_downstream_read_names", _spy_downstream)
+
+    src = (
+        "def compute(x: int) -> float:\n"
+        "    import math\n"
+        "    res = math.sqrt(x)\n"
+        "    return res\n"
+    )
+    f = tmp_path / "local_imp.py"
+    f.write_text(src, encoding="utf-8")
+    u = {
+        "file": str(f),
+        "start": 2,
+        "end": 3,
+        "kind": "subroutine",
+        "name": "compute_sub",
+    }
+    scope = _inspect_unit_scope(u, repo_root=str(tmp_path))
+    assert calls == []
+    assert "math" not in scope["outputs"]
+    assert "res" in scope["outputs"]
+
+
+def test_scope_visitor_comprehension_subscript_target(tmp_path: Path) -> None:
+    """Verifies that _ScopeVisitor records ast.Load identifiers inside comprehension generator targets."""
+    src = (
+        "def populate(items, arr, idx):\n"
+        "    res = [arr[idx] for arr[idx] in items]\n"
+        "    return res\n"
+    )
+    f = tmp_path / "comp_sub.py"
+    f.write_text(src, encoding="utf-8")
+    u = {"file": str(f), "start": 2, "end": 2, "kind": "comprehension", "name": "populate_comp"}
+    scope = _inspect_unit_scope(u, repo_root=str(tmp_path))
+    assert "arr" in scope["inputs"]
+    assert "idx" in scope["inputs"]
+    assert "items" in scope["inputs"]
+
+    if sys.version_info >= (3, 12):
+        u_inmem = {
+            "start": 2,
+            "end": 3,
+            "kind": "compound_block",
+            "is_subroutine": True,
+            "source_lines": ["    type LocalAlias = int\n", "    val = 1\n"],
+        }
+        scope_inmem = _inspect_unit_scope(u_inmem)
+        assert "LocalAlias" in scope_inmem["outputs"]
+        assert "val" in scope_inmem["outputs"]
+

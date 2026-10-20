@@ -2,12 +2,77 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional, Union
+import threading
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from pydoppelgangerhunt.canonical_path import normalize_lexical_posix, parse_notebook_cell_anchor
+
+logger = logging.getLogger(__name__)
+
+_warned_closure_lock: threading.Lock = threading.Lock()
+_warned_closure_strictness_values: Set[str] = set()
+
+_CONFIG_KEY_NAMES: Tuple[str, ...] = (
+    "threshold",
+    "min_lines",
+    "exemptions",
+    "exclude",
+    "closure_strictness",
+    "skip_pre_unit_closures",
+    "top",
+)
+
+
+def resolve_closure_strictness_mode(
+    closure_strictness: Optional[str] = None,
+    skip_pre_unit_closures: bool = False,
+) -> Tuple[str, bool]:
+    """Resolves canonical closure strictness mode ('strict' or 'lenient') and boolean skip flag.
+
+    Precision vs Soundness Trade-off:
+    'strict' (default; alias 'fail_closed') preserves soundness by inspecting escaping closures
+    and callbacks that might execute after the unit.
+    'lenient' (aliases 'fast', 'skip') reduces false-positive rejections by bypassing pre-unit
+    closure scanning, at the cost of soundness for escaping closures.
+    """
+    if closure_strictness is not None:
+        c_mode = str(closure_strictness).strip().lower()
+        if c_mode in ("lenient", "fast", "skip"):
+            return "lenient", True
+        if c_mode in ("strict", "fail_closed"):
+            if skip_pre_unit_closures:
+                logger.warning(
+                    "Conflicting configuration: closure_strictness '%s' takes precedence over "
+                    "skip_pre_unit_closures=True",
+                    closure_strictness,
+                )
+            return "strict", False
+        fallback = "lenient" if skip_pre_unit_closures else "strict"
+        raw_key = str(closure_strictness)
+        with _warned_closure_lock:
+            should_warn = raw_key not in _warned_closure_strictness_values
+            if should_warn:
+                _warned_closure_strictness_values.add(raw_key)
+        if should_warn:
+            logger.warning(
+                "Unrecognized closure_strictness '%s'; falling back to %s mode",
+                closure_strictness,
+                fallback,
+            )
+        return fallback, bool(skip_pre_unit_closures)
+    is_lenient = bool(skip_pre_unit_closures)
+    return ("lenient" if is_lenient else "strict"), is_lenient
+
+
+def clear_closure_warning_cache() -> None:
+    """Clears the set of warned closure strictness values for multi-run lifecycle."""
+    with _warned_closure_lock:
+        _warned_closure_strictness_values.clear()
+
 
 DEFAULT_EXCLUDES: List[str] = [
     "checks/encapsulated",
@@ -41,6 +106,7 @@ exclude = [
 ]
 call_sequences = true
 idioms = true
+# closure_strictness = "strict"  # Options: "strict", "lenient"
 """
 
 
@@ -150,12 +216,13 @@ def find_python_files(
 
     found_files: List[Path] = []
     target_str = str(target_path)
-    for root, _, files in os.walk(target_str):
+    for root, dirs, files in os.walk(target_str):
+        dirs.sort()
         rel_root = os.path.relpath(root, target_str).replace("\\", "/")
         norm_root = root.replace("\\", "/")
         if _is_excluded(norm_root, rel_root):
             continue
-        for file in files:
+        for file in sorted(files):
             file_lower = file.lower()
             if not any(file_lower.endswith(sfx) for sfx in valid_suffixes):
                 continue
@@ -296,7 +363,7 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
         tool_sec = data.get("tool", {}) if isinstance(data, dict) else {}
         if isinstance(tool_sec, dict) and isinstance(tool_sec.get(section_name), dict):
             return dict(tool_sec[section_name])
-        if isinstance(data, dict) and any(k in data for k in ("threshold", "min_lines", "exemptions", "exclude")):
+        if isinstance(data, dict) and any(k in data for k in _CONFIG_KEY_NAMES):
             return dict(data)
     except (ImportError, OSError, ValueError, TypeError):
         pass
@@ -304,7 +371,6 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
     # Built-in zero-dependency line parser fallback
     try:
         config: Dict[str, Any] = {}
-        in_section = False
         in_multiline_key: Optional[str] = None
         multiline_tokens: List[str] = []
         multiline_depth = 0
@@ -312,8 +378,15 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
         with open(target_path, "r", encoding="utf-8", errors="replace") as fh:
             lines = fh.readlines()
 
-        if not any(line.strip().startswith("[") for line in lines):
-            in_section = True
+        is_headerless = True
+        hdr_depth = 0
+        for line in lines:
+            s_ln = _strip_toml_inline_comment(line)
+            if hdr_depth == 0 and s_ln.startswith("[") and s_ln.endswith("]"):
+                is_headerless = False
+                break
+            hdr_depth = _count_bracket_depth(s_ln, hdr_depth)
+        in_section = is_headerless
 
         for line in lines:
             stripped = _strip_toml_inline_comment(line)
@@ -327,15 +400,24 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
                     in_multiline_key = None
                     multiline_tokens = []
                 continue
+            if multiline_depth > 0:
+                multiline_depth = _count_bracket_depth(stripped, multiline_depth)
+                continue
             if stripped == target_section:
                 in_section = True
                 continue
-            if stripped.startswith("[") and in_section:
+            if stripped.startswith("[") and stripped.endswith("]") and in_section:
                 in_section = False
                 continue
-            if in_section and "=" in stripped:
+            if "=" in stripped:
+                if not in_section:
+                    _, v_raw = stripped.split("=", 1)
+                    v_str = v_raw.strip()
+                    if v_str.startswith("["):
+                        multiline_depth = _count_bracket_depth(v_str, 0)
+                    continue
                 k, v = stripped.split("=", 1)
-                k = k.strip()
+                k = k.strip().strip("\"'")
                 v = v.strip()
                 if (v.startswith('"') and v.endswith('"')) or (
                     v.startswith("'") and v.endswith("'")
@@ -358,8 +440,8 @@ def load_toml_section(target_file: Union[str, Path], section_name: str) -> Dict[
                         config[k] = float(v) if "." in v else int(v)
                     except ValueError:
                         pass
-        if not any(line.strip().startswith("[") for line in lines):
-            if any(k in config for k in ("threshold", "min_lines", "exemptions", "exclude")):
+        if is_headerless:
+            if any(k in config for k in _CONFIG_KEY_NAMES):
                 return config
             return {}
         return config

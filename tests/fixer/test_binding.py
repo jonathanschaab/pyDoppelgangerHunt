@@ -1373,3 +1373,128 @@ def test_prune_unshared_receivers_custom_receiver() -> None:
     scope1_ref: Dict[str, Any] = {"inputs": ["this", "val"], "has_receiver_access": True, "instance_attrs": ["this.x"], "class_attrs": []}
     unpruned = _prune_unshared_receivers(inputs, u1, u2, scope1_ref, scope2)
     assert unpruned == ["this", "val"]
+
+
+def test_populate_unit_receiver_metadata_two_is_async_meanings(tmp_path: Path) -> None:
+    """Verifies that pure-sync subroutines inside async functions get enclosing_is_async=True
+    while retaining is_async=False."""
+    src = (
+        "async def async_worker(items):\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "    return total\n"
+    )
+    p = tmp_path / "worker.py"
+    p.write_text(src, encoding="utf-8")
+
+    # 1. Subroutine unit (compound block: for loop) inside async def
+    sub_unit = {
+        "file": str(p),
+        "kind": "compound_block",
+        "start": 3,
+        "end": 4,
+    }
+    _populate_unit_receiver_metadata(sub_unit, repo_root=str(tmp_path))
+    assert sub_unit.get("enclosing_is_async") is True
+    assert sub_unit.get("is_async") is False
+
+    # 2. Whole function unit for async def
+    fn_unit = {
+        "file": str(p),
+        "kind": "function",
+        "start": 1,
+        "end": 5,
+        "name": "async_worker",
+    }
+    _populate_unit_receiver_metadata(fn_unit, repo_root=str(tmp_path))
+    assert fn_unit.get("enclosing_is_async") is True
+    assert fn_unit.get("is_async") is True
+
+
+def test_populate_unit_receiver_metadata_subroutine_async_word_boundaries(
+    tmp_path: Path,
+) -> None:
+    """Verifies that variable names like await_timeout or yield_step do not trigger is_async."""
+    src = (
+        "async def async_worker(items):\n"
+        "    await_timeout = 10\n"
+        "    yield_step = 1\n"
+        "    return await_timeout + yield_step\n"
+    )
+    p = tmp_path / "worker_vars.py"
+    p.write_text(src, encoding="utf-8")
+
+    sub_unit = {
+        "file": str(p),
+        "kind": "compound_block",
+        "start": 2,
+        "end": 3,
+    }
+    _populate_unit_receiver_metadata(sub_unit, repo_root=str(tmp_path))
+    assert sub_unit.get("enclosing_is_async") is True
+    # Identifiers containing await/yield substrings must NOT flip is_async to True
+    assert sub_unit.get("is_async") is False
+
+    # Actual await expression inside subroutine DOES set is_async to True
+    src_real_await = (
+        "async def async_worker2(items):\n"
+        "    res = await fetch_data()\n"
+        "    return res\n"
+    )
+    p2 = tmp_path / "worker_await.py"
+    p2.write_text(src_real_await, encoding="utf-8")
+    sub_await = {
+        "file": str(p2),
+        "kind": "compound_block",
+        "start": 2,
+        "end": 2,
+    }
+    _populate_unit_receiver_metadata(sub_await, repo_root=str(tmp_path))
+    assert sub_await.get("is_async") is True
+
+
+def test_populate_unit_receiver_metadata_async_comprehension(tmp_path: Path) -> None:
+    """Verifies that _populate_unit_receiver_metadata identifies async comprehensions."""
+    src = (
+        "async def compute(stream):\n"
+        "    results = [x async for x in stream]\n"
+        "    return results\n"
+    )
+    p = tmp_path / "worker_async_comp.py"
+    p.write_text(src, encoding="utf-8")
+    sub_comp = {
+        "file": str(p),
+        "kind": "compound_block",
+        "start": 2,
+        "end": 2,
+    }
+    _populate_unit_receiver_metadata(sub_comp, repo_root=str(tmp_path))
+    assert sub_comp.get("is_async") is True
+
+
+def test_populate_unit_receiver_metadata_partially_overlapping_nested_scope(
+    tmp_path: Path,
+) -> None:
+    """Verifies that a nested function starting before u_start and ending inside [u_start, u_end]
+    does not pollute the outer unit's has_yield or is_async flags."""
+    src = (
+        "def outer(items):\n"
+        "    async def inner_gen():\n"
+        "        await fetch()\n"
+        "        yield 1\n"
+        "    res = len(items)\n"
+        "    return res\n"
+    )
+    p = tmp_path / "partial_nested.py"
+    p.write_text(src, encoding="utf-8")
+    # Unit starts at line 3 (inside inner_gen's body, after inner_gen's def line 2) and ends at line 6
+    sub_unit = {
+        "file": str(p),
+        "kind": "compound_block",
+        "start": 3,
+        "end": 6,
+    }
+    _populate_unit_receiver_metadata(sub_unit, repo_root=str(tmp_path))
+    assert sub_unit.get("is_async") is False
+    assert sub_unit.get("has_yield") is None
