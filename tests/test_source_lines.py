@@ -2286,6 +2286,96 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     )
     assert "ExternalSym" in del_free
 
+    # 42. Finding 1: Bare ast.AnnAssign initialized via nested nonlocal in whole functions and subroutines
+    bare_nl_fn_src = (
+        "def compute(a: int) -> int:\n"
+        "    acc: int\n"
+        "    def init() -> None:\n"
+        "        nonlocal acc\n"
+        "        acc = a\n"
+        "    init()\n"
+        "    return acc\n"
+    )
+    bare_nl_fn_scope = inspect_single_unit_scope(
+        {
+            "kind": "function",
+            "start": 1,
+            "end": 7,
+            "source_text": bare_nl_fn_src,
+            "source_code": bare_nl_fn_src,
+        },
+        tree=ast.parse(bare_nl_fn_src),
+    )
+    assert bare_nl_fn_scope["nonlocals"] == []
+    assert bare_nl_fn_scope["inputs"] == ["a"]
+
+    bare_nl_sub_code = (
+        "acc: int\n"
+        "def init() -> None:\n"
+        "    nonlocal acc\n"
+        "    acc = a\n"
+        "init()\n"
+    )
+    bare_nl_sub_scope = inspect_single_unit_scope(
+        {
+            "kind": "compound_block",
+            "start": 2,
+            "end": 6,
+            "source_text": bare_nl_fn_src,
+            "source_code": bare_nl_sub_code,
+        },
+        tree=ast.parse(bare_nl_fn_src),
+    )
+    assert bare_nl_sub_scope["nonlocals"] == []
+    assert bare_nl_sub_scope["inputs"] == ["a"]
+    assert "acc" in bare_nl_sub_scope["outputs"]
+
+    # 43. Finding 2: _FuncScopeVisitor.visit_AugAssign records nonlocal target load_nodes in source order
+    from pydoppelgangerhunt.fixer._df_visitors import (
+        _extract_nested_scope_free_reads_with_nodes,
+    )
+
+    nl_aug_fn = ast.parse(
+        "def inner():\n"
+        "    nonlocal z_val, a_val\n"
+        "    z_val += 1\n"
+        "    a_val += 2\n"
+    ).body[0]
+    assert isinstance(nl_aug_fn, ast.FunctionDef)
+    nl_aug_reads, nl_aug_nodes = _extract_nested_scope_free_reads_with_nodes(nl_aug_fn)
+    assert nl_aug_reads == {"z_val", "a_val"}
+    assert [n.id for n in nl_aug_nodes] == ["z_val", "a_val"]
+
+    # 44. Finding 3: _prune_unreferenced_lhs_scope preserves receiver binding when RHS uses super()
+    from pydoppelgangerhunt.fixer.synthesis import _prune_unreferenced_lhs_scope
+
+    super_rhs_lines = ["self.res = [super().transform(x) for x in items]\n"]
+    super_unit: Dict[str, Any] = {
+        "kind": "comprehension",
+        "inputs": ["self", "items"],
+        "receiver_param": "self",
+        "receiver_kind": "instance",
+    }
+    super_scope: Dict[str, Any] = {
+        "inputs": ["self", "items"],
+        "free_vars": ["self", "items"],
+        "attrs_read": [],
+        "attrs_written": ["self.res"],
+        "instance_attrs": ["self.res"],
+        "class_attrs": [],
+        "has_super": True,
+        "has_mangled_names": False,
+        "has_instance_binding": True,
+        "has_class_binding": False,
+        "has_receiver_access": True,
+        "binding_kind": "instance",
+    }
+    _prune_unreferenced_lhs_scope(super_unit, super_scope, super_rhs_lines)
+    assert "self" in super_scope["inputs"]
+    assert super_scope["has_instance_binding"] is True
+    assert super_scope["binding_kind"] == "instance"
+
+
 
 
 

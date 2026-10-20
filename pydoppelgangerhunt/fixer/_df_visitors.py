@@ -271,6 +271,16 @@ class _FuncScopeVisitor(_BaseScopeVisitor):
             self.local_stores.add(node.name)
         self.generic_visit(node)
 
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self.visit(node.value)
+        if isinstance(node.target, ast.Name):
+            if not self._is_in_comp(node.target.id):
+                self.direct_loads.add(node.target.id)
+                self.load_nodes.append(node.target)
+                self.local_stores.add(node.target.id)
+        else:
+            self.visit(node.target)
+
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Store):
             if not self._is_in_comp(node.id):
@@ -640,7 +650,7 @@ def _extract_nested_scope_free_reads_with_nodes(
                 body_escaped | func_visitor.nonlocals
             ) - func_visitor.globals
             body_nodes = [
-                n for n in func_visitor.load_nodes if n.id in body_escaped
+                n for n in func_visitor.load_nodes if n.id in body_free
             ]
 
     all_free = (

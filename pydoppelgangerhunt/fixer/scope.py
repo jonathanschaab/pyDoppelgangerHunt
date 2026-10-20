@@ -183,6 +183,23 @@ class _ScopeVisitor(ast.NodeVisitor):
             else ("self", "cls")
         )
         self._unit_top_locals: Set[str] = set()
+        self._unit_top_stored_locals: Set[str] = set()
+
+    def _init_unit_top_locals(self, target_node: ast.AST) -> None:
+        self._unit_top_locals = _extract_single_node_local_names(
+            target_node,
+            include_globals=False,
+            include_nonlocals=False,
+            include_self_name=False,
+            include_bare_annotations=True,
+        )
+        self._unit_top_stored_locals = _extract_single_node_local_names(
+            target_node,
+            include_globals=False,
+            include_nonlocals=False,
+            include_self_name=False,
+            include_bare_annotations=False,
+        )
 
     def visit_Module(self, node: ast.Module) -> None:
         if self.is_subroutine and not self._unit_top_locals:
@@ -201,12 +218,7 @@ class _ScopeVisitor(ast.NodeVisitor):
                 target_mod = ast.Module(body=wrapper_body, type_ignores=[])
             else:
                 target_mod = node
-            self._unit_top_locals = _extract_single_node_local_names(
-                target_mod,
-                include_globals=False,
-                include_nonlocals=False,
-                include_self_name=False,
-            )
+            self._init_unit_top_locals(target_mod)
         self.generic_visit(node)
 
     def visit(self, node: ast.AST) -> Any:
@@ -308,7 +320,7 @@ class _ScopeVisitor(ast.NodeVisitor):
             if (
                 name not in BUILTIN_NAMES
                 and name not in self.stores
-                and name not in self._unit_top_locals
+                and name not in self._unit_top_stored_locals
             ):
                 self.stores.append(name)
         elif is_active_global:
@@ -338,12 +350,7 @@ class _ScopeVisitor(ast.NodeVisitor):
                 body = body[0].body
                 self.loop_offset = 0
             if not self._unit_top_locals:
-                self._unit_top_locals = _extract_single_node_local_names(
-                    ast.Module(body=body, type_ignores=[]),
-                    include_globals=False,
-                    include_nonlocals=False,
-                    include_self_name=False,
-                )
+                self._init_unit_top_locals(ast.Module(body=body, type_ignores=[]))
             if isinstance(node, ast.AsyncFunctionDef):
                 self.is_async = True
             for stmt in body:
@@ -387,12 +394,7 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._type_param_scopes.append(tp_names)
         try:
             if is_top:
-                self._unit_top_locals = _extract_single_node_local_names(
-                    node,
-                    include_globals=False,
-                    include_nonlocals=False,
-                    include_self_name=False,
-                )
+                self._init_unit_top_locals(node)
                 self._scope_stack.append(
                     set(self.params) | tp_names | self._unit_top_locals
                 )

@@ -98,6 +98,7 @@ def _extract_single_node_local_names(
     *,
     include_nonlocals: bool = True,
     include_self_name: bool = True,
+    include_bare_annotations: Optional[bool] = None,
 ) -> Set[str]:
     """Extracts parameters and locally assigned/imported/defined symbols in scope_node."""
     names: Set[str] = set()
@@ -140,9 +141,11 @@ def _extract_single_node_local_names(
             if curr.value is not None:
                 stack.append(curr.value)
                 stack.append(curr.target)
-            elif not isinstance(scope_node, (ast.ClassDef, ast.Module)) and isinstance(
-                curr.target, ast.Name
-            ):
+            elif (
+                include_bare_annotations
+                if include_bare_annotations is not None
+                else not isinstance(scope_node, (ast.ClassDef, ast.Module))
+            ) and isinstance(curr.target, ast.Name):
                 names.add(curr.target.id)
             elif not isinstance(curr.target, ast.Name):
                 stack.append(curr.target)

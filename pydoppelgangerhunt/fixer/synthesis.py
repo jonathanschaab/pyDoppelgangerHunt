@@ -299,6 +299,11 @@ def _prune_unreferenced_lhs_scope(
     aug_unref = _extract_augassign_unreferenced_target(lines)
     if aug_unref is not None:
         unref_loads.add(aug_unref)
+    has_implicit_receiver = bool(scope_dict.get("has_super")) or bool(
+        scope_dict.get("has_mangled_names")
+    )
+    if has_implicit_receiver:
+        unref_loads -= set(all_receivers)
     for key, rec_names in (("inputs", all_receivers), ("free_vars", ())):
         if key in scope_dict and isinstance(scope_dict[key], list):
             filtered = [x for x in scope_dict[key] if x not in unref_loads]
@@ -356,11 +361,15 @@ def _prune_unreferenced_lhs_scope(
             ]
 
     inputs_set = set(scope_dict.get("inputs", []))
-    has_inst = bool(scope_dict.get("instance_attrs")) or bool(
-        inputs_set & inst_receivers
+    has_inst = (
+        bool(scope_dict.get("instance_attrs"))
+        or bool(inputs_set & inst_receivers)
+        or (has_implicit_receiver and bool(scope_dict.get("has_instance_binding")))
     )
-    has_cls = bool(scope_dict.get("class_attrs")) or bool(
-        inputs_set & class_receivers
+    has_cls = (
+        bool(scope_dict.get("class_attrs"))
+        or bool(inputs_set & class_receivers)
+        or (has_implicit_receiver and bool(scope_dict.get("has_class_binding")))
     )
     scope_dict["has_instance_binding"] = has_inst
     scope_dict["has_class_binding"] = has_cls
