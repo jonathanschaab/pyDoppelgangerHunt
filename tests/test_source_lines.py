@@ -2707,6 +2707,197 @@ def test_closure_cell_binding_and_severed_cell_hazards(tmp_path: Path) -> None:
     assert res_ml_gen.outputs is None
     assert res_ml_gen.skip_reason == "severed closure cell"
 
+    # 10. Multi-level intermediate nonlocal mutation (Finding 1.1)
+    ml_inter_nl_src = (
+        "def outer_inter(items):\n"
+        "    scale = 1\n"
+        "    def inner_inter():\n"
+        "        nonlocal scale\n"
+        "        cbs = []\n"
+        "        for item in items:\n"
+        "            cbs.append(lambda x, item=item: x * scale + item)\n"
+        "        scale = 20\n"
+        "        return cbs\n"
+        "    return inner_inter\n"
+    )
+    sc_ml_inter = inspect_single_unit_scope(
+        {
+            "start": 6,
+            "end": 7,
+            "kind": "compound_block",
+            "source_text": ml_inter_nl_src,
+            "source_code": (
+                "for item in items:\n"
+                "    cbs.append(lambda x, item=item: x * scale + item)\n"
+            ),
+        },
+        tree=ast.parse(ml_inter_nl_src),
+    )
+    assert "severed_closure_cell" in sc_ml_inter["control_flow_hazards"]
+
+    # 11. Whole-closure unit (is_subroutine=False, kind='closure') hazards (Finding 1.2)
+    whole_closure_post_src = (
+        "def make_handlers(items):\n"
+        "    scale = 1\n"
+        "    def handle(x):\n"
+        "        total = 0\n"
+        "        for item in items:\n"
+        "            total += (x + item) * scale\n"
+        "        return total\n"
+        "    scale = 10\n"
+        "    return handle\n"
+    )
+    sc_whole_closure_post = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 7,
+            "kind": "closure",
+            "is_subroutine": False,
+            "source_text": whole_closure_post_src,
+            "source_code": (
+                "def handle(x):\n"
+                "    total = 0\n"
+                "    for item in items:\n"
+                "        total += (x + item) * scale\n"
+                "    return total\n"
+            ),
+        },
+        tree=ast.parse(whole_closure_post_src),
+    )
+    assert "severed_closure_cell" in sc_whole_closure_post["control_flow_hazards"]
+
+    whole_closure_nl_store_src = (
+        "def make_counter():\n"
+        "    count = 0\n"
+        "    def step(delta):\n"
+        "        nonlocal count\n"
+        "        count += delta\n"
+        "        return count\n"
+        "    return step\n"
+    )
+    sc_whole_closure_nl = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 6,
+            "kind": "closure",
+            "is_subroutine": False,
+            "source_text": whole_closure_nl_store_src,
+            "source_code": (
+                "def step(delta):\n"
+                "    nonlocal count\n"
+                "    count += delta\n"
+                "    return count\n"
+            ),
+        },
+        tree=ast.parse(whole_closure_nl_store_src),
+    )
+    assert "severed_closure_cell" in sc_whole_closure_nl["control_flow_hazards"]
+
+    # 12. Assigned Lambda and GeneratorExp sibling closures in Check #4 (Finding 2.1)
+    sib_lambda_src = (
+        "def outer_lam(items):\n"
+        "    bias = 0\n"
+        "    get_bias = lambda: bias\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        bias += x\n"
+        "        out.append(get_bias())\n"
+        "    return bias, out\n"
+    )
+    sc_sib_lam = inspect_single_unit_scope(
+        {
+            "start": 5,
+            "end": 7,
+            "kind": "compound_block",
+            "source_text": sib_lambda_src,
+            "source_code": "for x in items:\n    bias += x\n    out.append(get_bias())\n",
+        },
+        tree=ast.parse(sib_lambda_src),
+    )
+    assert "severed_closure_cell" in sc_sib_lam["control_flow_hazards"]
+
+    # 13. Intra-unit nonlocal mutator escaping via container or pre-unit reader (Finding 2.2)
+    escape_container_src = (
+        "def outer_escape(callbacks):\n"
+        "    def get_count():\n"
+        "        return count\n"
+        "    count = 0\n"
+        "    def inc():\n"
+        "        nonlocal count\n"
+        "        count += 1\n"
+        "    callbacks.append(inc)\n"
+        "    return get_count\n"
+    )
+    sc_escape_cont = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 8,
+            "kind": "compound_block",
+            "source_text": escape_container_src,
+            "source_code": (
+                "count = 0\n"
+                "def inc():\n"
+                "    nonlocal count\n"
+                "    count += 1\n"
+                "callbacks.append(inc)\n"
+            ),
+        },
+        tree=ast.parse(escape_container_src),
+    )
+    assert "severed_closure_cell" in sc_escape_cont["control_flow_hazards"]
+
+    # 14. ClassDef namespace isolation & inside-span statement guard (Finding 2.3)
+    cls_shadow_src = (
+        "def outer_cls(items):\n"
+        "    class C:\n"
+        "        scale = 1\n"
+        "        def m(self):\n"
+        "            cbs = []\n"
+        "            for item in items:\n"
+        "                cbs.append(lambda x, item=item: x * scale + item)\n"
+        "            return cbs\n"
+        "    scale = 10\n"
+        "    return C\n"
+    )
+    sc_cls_shadow = inspect_single_unit_scope(
+        {
+            "start": 6,
+            "end": 7,
+            "kind": "compound_block",
+            "source_text": cls_shadow_src,
+            "source_code": (
+                "for item in items:\n"
+                "    cbs.append(lambda x, item=item: x * scale + item)\n"
+            ),
+        },
+        tree=ast.parse(cls_shadow_src),
+    )
+    assert "severed_closure_cell" in sc_cls_shadow["control_flow_hazards"]
+
+    # 15. Unbound nonlocal not treated as pre_bound or promoted to input (Finding 2.4)
+    unbound_nl_src = (
+        "def outer_unb():\n"
+        "    def inner_unb(items):\n"
+        "        nonlocal total\n"
+        "        for x in items:\n"
+        "            if x > 0:\n"
+        "                total = x * 2\n"
+        "    total = 0\n"
+        "    return inner_unb\n"
+    )
+    sc_unbound_nl = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 6,
+            "kind": "compound_block",
+            "source_text": unbound_nl_src,
+            "source_code": "for x in items:\n    if x > 0:\n        total = x * 2\n",
+        },
+        tree=ast.parse(unbound_nl_src),
+    )
+    assert "total" not in sc_unbound_nl["inputs"]
+    assert "total" in sc_unbound_nl["conditional_outputs"]
+
 
 
 

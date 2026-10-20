@@ -189,7 +189,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.unit_top_locals: Set[str] = set()
         self._unit_top_stored_locals: Set[str] = set()
 
-    def _initunit_top_locals(self, target_node: ast.AST) -> None:
+    def _init_unit_top_locals(self, target_node: ast.AST) -> None:
         self.unit_top_locals = _extract_single_node_local_names(
             target_node,
             include_globals=False,
@@ -222,7 +222,7 @@ class _ScopeVisitor(ast.NodeVisitor):
                 target_mod = ast.Module(body=wrapper_body, type_ignores=[])
             else:
                 target_mod = node
-            self._initunit_top_locals(target_mod)
+            self._init_unit_top_locals(target_mod)
         self.generic_visit(node)
 
     def visit(self, node: ast.AST) -> Any:
@@ -354,7 +354,7 @@ class _ScopeVisitor(ast.NodeVisitor):
                 body = body[0].body
                 self.loop_offset = 0
             if not self.unit_top_locals:
-                self._initunit_top_locals(ast.Module(body=body, type_ignores=[]))
+                self._init_unit_top_locals(ast.Module(body=body, type_ignores=[]))
             if isinstance(node, ast.AsyncFunctionDef):
                 self.is_async = True
             for stmt in body:
@@ -398,7 +398,7 @@ class _ScopeVisitor(ast.NodeVisitor):
             self._type_param_scopes.append(tp_names)
         try:
             if is_top:
-                self._initunit_top_locals(node)
+                self._init_unit_top_locals(node)
                 self._scope_stack.append(
                     set(self.params) | tp_names | self.unit_top_locals
                 )
@@ -1694,8 +1694,6 @@ def _find_enclosing_pre_bound_names(
                         b_name = alias.asname or alias.name.split(".", 1)[0]
                         if b_name != "*":
                             bound_before.add(b_name)
-                elif isinstance(curr, ast.Nonlocal):
-                    bound_before.update(curr.names)
                 elif (
                     isinstance(curr, ast.ExceptHandler)
                     and isinstance(curr.name, str)
@@ -2079,26 +2077,35 @@ def _inspect_unit_scope(
                 pre_bound: Set[str] = set()
                 u_start = parse_unit_coord(unit, "start", default=0)
                 u_end = parse_unit_coord(unit, "end", default=u_start)
+                u_start_col = parse_unit_coord(unit, "start_col", default=None)
+                if u_start_col is None:
+                    u_start_col = parse_unit_coord(unit, "col_offset", default=None)
+                u_end_col = parse_unit_coord(unit, "end_col", default=None)
+                if u_end_col is None:
+                    u_end_col = parse_unit_coord(unit, "end_col_offset", default=None)
                 mod_tree = file_tree
                 if mod_tree is None and u_start > 0:
                     full_src = _get_full_source()
                     if full_src:
                         mod_tree = _get_or_parse_tree(full_src)
                 if mod_tree is not None and u_start > 0:
-                    if cond_live_ins:
-                        pre_bound, _ = _find_enclosing_pre_bound_names(
-                            mod_tree, u_start, u_end
-                        )
+                    pre_bound, _ = _find_enclosing_pre_bound_names(
+                        mod_tree, u_start, u_end
+                    )
                     if cond_escaping_cands:
                         enc_chain = _find_enclosing_function_chain(
-                            mod_tree, u_start, u_end, None, True
+                            mod_tree, u_start, u_end, u_start_col, True
                         )
                         if enc_chain:
                             enc_escaping = _extract_scope_escaping_bindings(
-                                enc_chain[-1][2], u_start, u_end
+                                enc_chain[-1][2],
+                                u_start,
+                                u_end,
+                                u_end_col=u_end_col,
+                                u_start_col=u_start_col,
                             )
                             for v in cond_escaping_cands:
-                                if v in enc_escaping:
+                                if v in enc_escaping and v in pre_bound:
                                     if v not in visitor.loads:
                                         visitor.loads.append(v)
                                     if v not in visitor.read_before_write:
@@ -2270,6 +2277,8 @@ def _inspect_unit_scope(
                             stores=visitor.stores,
                             deleted_names=all_deleted,
                             unit_top_locals=visitor.unit_top_locals,
+                            free_vars=free_vars,
+                            nonlocals=visitor.nonlocals,
                         )
                     ):
                         hazards.append("severed_closure_cell")
