@@ -340,10 +340,8 @@ def _resolve_unit_ast_end_col(
                     not isinstance(s, ast.Expr)
                     and getattr(s, "lineno", 0) == u_start
                     and getattr(s, "col_offset", 0) == start_col
-                    for s in (
-                        matching_stmts
-                        if getattr(target_stmt, "lineno", 0) <= u_start
-                        else _get_scope_stmts_by_start_lineno(scope_node).get(u_start, [])
+                    for s in _get_scope_stmts_by_start_lineno(scope_node).get(
+                        u_start, []
                     )
                 )
             )

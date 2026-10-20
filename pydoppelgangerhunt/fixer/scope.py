@@ -547,19 +547,19 @@ class _ScopeVisitor(ast.NodeVisitor):
 
     def visit_MatchAs(self, node: ast.AST) -> None:  # pragma: no cover (py310+)
         name = getattr(node, "name", None)
-        if name and isinstance(name, str):
+        if name and isinstance(name, str) and name != "_":
             self._record_store_name(name)
         self.generic_visit(node)
 
     def visit_MatchStar(self, node: ast.AST) -> None:  # pragma: no cover (py310+)
         name = getattr(node, "name", None)
-        if name and isinstance(name, str):
+        if name and isinstance(name, str) and name != "_":
             self._record_store_name(name)
         self.generic_visit(node)
 
     def visit_MatchMapping(self, node: ast.AST) -> None:  # pragma: no cover (py310+)
         rest = getattr(node, "rest", None)
-        if rest and isinstance(rest, str):
+        if rest and isinstance(rest, str) and rest != "_":
             self._record_store_name(rest)
         self.generic_visit(node)
 
@@ -1445,11 +1445,11 @@ def _analyze_block_assignment(
                     for p_node in ast.walk(pattern):
                         if type(p_node).__name__ in ("MatchAs", "MatchStar"):
                             p_name = getattr(p_node, "name", None)
-                            if p_name and isinstance(p_name, str):
+                            if p_name and isinstance(p_name, str) and p_name != "_":
                                 pattern_stores.add(p_name)
                         elif type(p_node).__name__ == "MatchMapping":
                             p_rest = getattr(p_node, "rest", None)
-                            if p_rest and isinstance(p_rest, str):
+                            if p_rest and isinstance(p_rest, str) and p_rest != "_":
                                 pattern_stores.add(p_rest)
                 guard = getattr(case, "guard", None)
                 d_g: Set[str] = set()
@@ -1681,7 +1681,7 @@ def _find_enclosing_pre_bound_names(
                     bound_before.add(curr.name)
                 elif type(curr).__name__ in ("MatchAs", "MatchStar", "MatchMapping"):
                     m_name = getattr(curr, "name", None) or getattr(curr, "rest", None)
-                    if isinstance(m_name, str):
+                    if isinstance(m_name, str) and m_name != "_":
                         bound_before.add(m_name)
             stack.extend(reversed(list(ast.iter_child_nodes(curr))))
     return bound_before, in_loop

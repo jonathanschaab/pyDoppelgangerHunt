@@ -2219,6 +2219,30 @@ def test_review_edge_cases_multiline_end_col_class_walrus_and_top_config(
     assert "*" not in star_def
     assert "*" not in star_imp
 
+    # 36. Multi-statement semicolon line ending in a multi-line statement in _resolve_unit_ast_end_col
+    semi_ml_tree = ast.parse("def f():\n    a = 1; b = (\n        2\n    )\n")
+    assert (
+        _resolve_unit_ast_end_col(
+            semi_ml_tree.body[0], {"start": 2, "end": 4, "start_col": 4}
+        )
+        == 5
+    )
+
+    # 37. Wildcard "_" pattern target ignored in _extract_helper_symbols
+    if sys.version_info >= (3, 10):
+        match_wc_tree = ast.parse(
+            "def _shared_match(val):\n"
+            "    match val:\n"
+            "        case {'k': x, **rest}:\n"
+            "            return _\n"
+        )
+        match_node = match_wc_tree.body[0].body[0]  # type: ignore[attr-defined]
+        match_node.cases[0].pattern.rest = "_"
+        wc_free, wc_def, _ = _extract_helper_symbols(match_wc_tree)
+        assert "_" in wc_free
+        assert "_" not in wc_def
+
+
 
 
 

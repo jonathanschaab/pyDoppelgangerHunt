@@ -2069,7 +2069,7 @@ def _extract_helper_symbols(
                     if pattern is not None:
                         for n in ast.walk(pattern):
                             m_name = getattr(n, "name", None) or getattr(n, "rest", None)
-                            if isinstance(m_name, str):
+                            if isinstance(m_name, str) and m_name != "_":
                                 bound.add(m_name)
                     bound.update(_collect_direct_bindings(case.body))
             elif type(stmt).__name__ == "TypeAlias":
@@ -2267,7 +2267,7 @@ def _extract_helper_symbols(
         def visit_MatchAs(self, node: ast.AST) -> None:
             self.generic_visit(node)
             m_name = getattr(node, "name", None)
-            if isinstance(m_name, str):
+            if isinstance(m_name, str) and m_name != "_":
                 self._bind_names({m_name})
 
         def visit_MatchStar(self, node: ast.AST) -> None:
@@ -2276,7 +2276,7 @@ def _extract_helper_symbols(
         def visit_MatchMapping(self, node: ast.AST) -> None:
             self.generic_visit(node)
             m_rest = getattr(node, "rest", None)
-            if isinstance(m_rest, str):
+            if isinstance(m_rest, str) and m_rest != "_":
                 self._bind_names({m_rest})
 
         def _enter_block_scope(
