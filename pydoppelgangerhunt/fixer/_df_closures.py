@@ -1047,12 +1047,12 @@ def _analyze_enclosing_fn_cells(
             )
             or type(curr).__name__ in ("TryStar", "Match")
         )
-        child_nodes = (
-            [curr.annotation]
+        child_nodes: Sequence[ast.AST] = (
+            (curr.annotation,)
             if isinstance(curr, ast.AnnAssign)
             and curr.value is None
             and isinstance(curr.target, ast.Name)
-            else list(ast.iter_child_nodes(curr))
+            else tuple(ast.iter_child_nodes(curr))
         )
         stack.extend(
             (ch, child_branched, curr_in_loop)
