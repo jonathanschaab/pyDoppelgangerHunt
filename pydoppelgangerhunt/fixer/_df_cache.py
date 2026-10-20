@@ -343,7 +343,7 @@ def _resolve_unit_ast_end_col(
                     for s in (
                         matching_stmts
                         if getattr(target_stmt, "lineno", 0) <= u_start
-                        else _get_scope_stmts_by_start_lineno(scope_node).get(u_start, ())
+                        else _get_scope_stmts_by_start_lineno(scope_node).get(u_start, [])
                     )
                 )
             )
