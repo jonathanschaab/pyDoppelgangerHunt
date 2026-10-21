@@ -2105,11 +2105,14 @@ def _inspect_unit_scope(
                                 u_start_col=u_start_col,
                             )
                             for v in cond_escaping_cands:
-                                if v in enc_escaping and v in pre_bound:
-                                    if v not in visitor.loads:
-                                        visitor.loads.append(v)
-                                    if v not in visitor.read_before_write:
-                                        visitor.read_before_write.append(v)
+                                if v in enc_escaping:
+                                    if v in pre_bound:
+                                        if v not in visitor.loads:
+                                            visitor.loads.append(v)
+                                        if v not in visitor.read_before_write:
+                                            visitor.read_before_write.append(v)
+                                    elif "severed_closure_cell" not in hazards:
+                                        hazards.append("severed_closure_cell")
                 has_enclosing_context = mod_tree is not None and (
                     u_start > 1 or bool(_get_tree_scope_intervals(mod_tree))
                 )
@@ -2262,23 +2265,27 @@ def _inspect_unit_scope(
                     c_end_col = parse_unit_coord(unit, "end_col", default=None)
                     if c_end_col is None:
                         c_end_col = parse_unit_coord(unit, "end_col_offset", default=None)
-                    if _has_severed_closure_cell_hazard(
-                        _UnitClosureHazardContext(
-                            candidate_stmts=candidate_stmts,
-                            mod_tree=c_mod_tree,
-                            u_start=c_u_start,
-                            u_end=c_u_end,
-                            u_start_col=c_start_col,
-                            u_end_col=c_end_col,
-                            is_subroutine=is_subroutine,
-                            unit_kind=str(unit.get("kind") or ""),
-                            inputs=inputs,
-                            outputs=outputs,
-                            stores=visitor.stores,
-                            deleted_names=all_deleted,
-                            unit_top_locals=visitor.unit_top_locals,
-                            free_vars=free_vars,
-                            nonlocals=visitor.nonlocals,
+                    if (
+                        "severed_closure_cell" not in hazards
+                        and _has_severed_closure_cell_hazard(
+                            _UnitClosureHazardContext(
+                                candidate_stmts=candidate_stmts,
+                                mod_tree=c_mod_tree,
+                                u_start=c_u_start,
+                                u_end=c_u_end,
+                                u_start_col=c_start_col,
+                                u_end_col=c_end_col,
+                                is_subroutine=is_subroutine,
+                                unit_kind=str(unit.get("kind") or ""),
+                                inputs=inputs,
+                                outputs=outputs,
+                                stores=visitor.stores,
+                                deleted_names=all_deleted,
+                                unit_top_locals=visitor.unit_top_locals,
+                                free_vars=free_vars,
+                                nonlocals=visitor.nonlocals,
+                                has_yield=visitor.has_yield,
+                            )
                         )
                     ):
                         hazards.append("severed_closure_cell")

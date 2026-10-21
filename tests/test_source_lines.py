@@ -2424,10 +2424,52 @@ def test_closure_cell_binding_and_severed_cell_hazards(tmp_path: Path) -> None:
     }
     ds_nl = collect_downstream_read_names(gen_nl_src, u_gen1, candidates={"total", "x"})
     assert ds_nl == {"total"}
+    sc_gen_nl = inspect_single_unit_scope(u_gen1, repo_root=str(tmp_path))
+    assert "severed_closure_cell" in sc_gen_nl["control_flow_hazards"]
     patch_gen_nl = generate_refactoring_patch(
         [(1.0, u_gen1, u_gen2)], repo_root=str(tmp_path), replace_clones=True
     )
-    assert "total = (yield from _shared_" in patch_gen_nl
+    assert patch_gen_nl == ""
+
+    sync_nl_src = (
+        "def outer_a(items):\n"
+        "    total = 0\n"
+        "    def worker_a():\n"
+        "        nonlocal total\n"
+        "        for x in items:\n"
+        "            total += x * 2\n"
+        "            log(x)\n"
+        "    return worker_a, lambda: total\n"
+        "\n"
+        "def outer_b(items):\n"
+        "    total = 10\n"
+        "    def worker_b():\n"
+        "        nonlocal total\n"
+        "        for x in items:\n"
+        "            total += x * 2\n"
+        "            log(x)\n"
+        "    return worker_b, lambda: total\n"
+    )
+    f_sync_nl = tmp_path / "sync_nl.py"
+    f_sync_nl.write_text(sync_nl_src, encoding="utf-8")
+    u_sync1 = {
+        "file": str(f_sync_nl),
+        "start": 5,
+        "end": 7,
+        "name": "worker_a:For",
+        "kind": "compound_block",
+    }
+    u_sync2 = {
+        "file": str(f_sync_nl),
+        "start": 14,
+        "end": 16,
+        "name": "worker_b:For",
+        "kind": "compound_block",
+    }
+    patch_sync_nl = generate_refactoring_patch(
+        [(1.0, u_sync1, u_sync2)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert "total = _shared_" in patch_sync_nl
 
     # 2. Conditional store to enclosing nonlocal promotes variable to input instead of None
     cond_nl_src = (
@@ -2897,12 +2939,156 @@ def test_closure_cell_binding_and_severed_cell_hazards(tmp_path: Path) -> None:
     )
     assert "total" not in sc_unbound_nl["inputs"]
     assert "total" in sc_unbound_nl["conditional_outputs"]
+    assert "severed_closure_cell" in sc_unbound_nl["control_flow_hazards"]
+    assert sc_unbound_nl["is_control_flow_safe"] is False
 
+    # 16. Intra-unit closure mutating pre-bound outer variable & nested closure unit (Finding 1.1)
+    pre_bound_nl_mut_src = (
+        "def outer_inc():\n"
+        "    count = 0\n"
+        "    def inc():\n"
+        "        nonlocal count\n"
+        "        count += 1\n"
+        "    inc()\n"
+        "    return count\n"
+    )
+    sc_pre_nl_mut = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 6,
+            "kind": "compound_block",
+            "source_text": pre_bound_nl_mut_src,
+            "source_code": "def inc():\n    nonlocal count\n    count += 1\ninc()\n",
+        },
+        tree=ast.parse(pre_bound_nl_mut_src),
+    )
+    assert "severed_closure_cell" in sc_pre_nl_mut["control_flow_hazards"]
 
+    nested_closure_nl_src = (
+        "def outer_mid():\n"
+        "    count = 0\n"
+        "    def middle():\n"
+        "        def inner():\n"
+        "            nonlocal count\n"
+        "            count += 1\n"
+        "        inner()\n"
+        "    return middle, count\n"
+    )
+    sc_nested_closure_nl = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 7,
+            "kind": "closure",
+            "is_subroutine": False,
+            "source_text": nested_closure_nl_src,
+            "source_code": (
+                "def middle():\n"
+                "    def inner():\n"
+                "        nonlocal count\n"
+                "        count += 1\n"
+                "    inner()\n"
+            ),
+        },
+        tree=ast.parse(nested_closure_nl_src),
+    )
+    assert "severed_closure_cell" in sc_nested_closure_nl["control_flow_hazards"]
 
+    # 17. Pre-unit anonymous lambda, comprehension-nested lambda, and decorator escape (Finding 1.4)
+    anon_escape_src = (
+        "def outer_anon(callbacks, readers):\n"
+        "    readers.append(lambda: count)\n"
+        "    count = 0\n"
+        "    @callbacks.append\n"
+        "    def inc():\n"
+        "        nonlocal count\n"
+        "        count += 1\n"
+    )
+    sc_anon_escape = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 7,
+            "kind": "compound_block",
+            "source_text": anon_escape_src,
+            "source_code": (
+                "count = 0\n"
+                "@callbacks.append\n"
+                "def inc():\n"
+                "    nonlocal count\n"
+                "    count += 1\n"
+            ),
+        },
+        tree=ast.parse(anon_escape_src),
+    )
+    assert "severed_closure_cell" in sc_anon_escape["control_flow_hazards"]
 
+    # 18. Conditional delete, enclosing-if delete, and conditional store before span (Finding 2.1)
+    cond_del_src = (
+        "def build_cdel(items, cond):\n"
+        "    scale = 1\n"
+        "    if cond:\n"
+        "        del scale\n"
+        "        for item in items:\n"
+        "            cbs.append(lambda x, item=item: x * scale + item)\n"
+    )
+    sc_cond_del = inspect_single_unit_scope(
+        {
+            "start": 5,
+            "end": 6,
+            "kind": "compound_block",
+            "source_text": cond_del_src,
+            "source_code": (
+                "for item in items:\n"
+                "    cbs.append(lambda x, item=item: x * scale + item)\n"
+            ),
+        },
+        tree=ast.parse(cond_del_src),
+    )
+    assert "severed_closure_cell" in sc_cond_del["control_flow_hazards"]
 
+    cond_store_before_src = (
+        "def build_cstore(items, cond):\n"
+        "    if cond:\n"
+        "        scale = 1\n"
+        "    for item in items:\n"
+        "        cbs.append(lambda x, item=item: x * scale + item)\n"
+    )
+    sc_cond_store = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 5,
+            "kind": "compound_block",
+            "source_text": cond_store_before_src,
+            "source_code": (
+                "for item in items:\n"
+                "    cbs.append(lambda x, item=item: x * scale + item)\n"
+            ),
+        },
+        tree=ast.parse(cond_store_before_src),
+    )
+    assert "severed_closure_cell" in sc_cond_store["control_flow_hazards"]
 
-
-
-
+    # 19. Transitive sibling closure calls & intermediate header expressions (Findings 2.3 & 2.5)
+    trans_sib_src = (
+        "def outer_trans(items):\n"
+        "    acc = 0\n"
+        "    def get_acc():\n"
+        "        return acc\n"
+        "    def step():\n"
+        "        return get_acc() * 2\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        acc += x\n"
+        "        out.append(step())\n"
+        "    return acc, out\n"
+    )
+    sc_trans_sib = inspect_single_unit_scope(
+        {
+            "start": 8,
+            "end": 10,
+            "kind": "compound_block",
+            "source_text": trans_sib_src,
+            "source_code": "for x in items:\n    acc += x\n    out.append(step())\n",
+        },
+        tree=ast.parse(trans_sib_src),
+    )
+    assert "severed_closure_cell" in sc_trans_sib["control_flow_hazards"]

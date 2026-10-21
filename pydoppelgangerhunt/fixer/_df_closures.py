@@ -673,9 +673,10 @@ def _find_enclosing_function_chain(
     u_start: int,
     u_end: int,
     u_start_col: Optional[int],
-    is_subroutine: bool,
+    is_subroutine: bool = False,
 ) -> List[Tuple[int, int, ast.AST]]:
     """Finds enclosing FunctionDef/AsyncFunctionDef nodes ordered outermost to innermost."""
+    _ = is_subroutine
     chain: List[Tuple[int, int, int, ast.AST]] = []
     for node in ast.walk(mod_tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -686,8 +687,7 @@ def _find_enclosing_function_chain(
             continue
         n_col = int(getattr(node, "col_offset", 0) or 0)
         if (
-            not is_subroutine
-            and u_start in (estart, int(getattr(node, "lineno", estart) or estart))
+            u_start in (estart, int(getattr(node, "lineno", estart) or estart))
             and u_end == n_end
             and (u_start_col is None or n_col == u_start_col)
         ):
@@ -697,36 +697,50 @@ def _find_enclosing_function_chain(
     return [(estart, n_end, node) for estart, n_end, _col, node in chain]
 
 
-def _extract_closure_nonlocal_mutations(fn_node: ast.AST) -> Set[str]:
-    """Extracts outer-scope variables mutated or deleted via nonlocal inside fn_node."""
-    if not isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+def _extract_direct_nonlocals(scope_node: ast.AST) -> Set[str]:
+    """Extracts variable names declared nonlocal directly in scope_node."""
+    names: Set[str] = set()
+    stack: List[ast.AST] = list(getattr(scope_node, "body", []))
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, _INNER_SCOPE_TYPES):
+            continue
+        if isinstance(curr, ast.Nonlocal):
+            names.update(curr.names)
+            continue
+        stack.extend(ast.iter_child_nodes(curr))
+    return names
+
+
+def _extract_closure_nonlocal_mutations(scope_node: ast.AST) -> Set[str]:
+    """Extracts outer-scope variables mutated or deleted via nonlocal inside scope_node."""
+    if not isinstance(
+        scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    ):
         return set()
-    own_locals = _extract_single_node_local_names(
-        fn_node,
-        include_globals=False,
-        include_nonlocals=False,
-        include_self_name=False,
-        include_bare_annotations=True,
+    is_cls = isinstance(scope_node, ast.ClassDef)
+    own_locals = (
+        set()
+        if is_cls
+        else _extract_single_node_local_names(
+            scope_node,
+            include_globals=False,
+            include_nonlocals=False,
+            include_self_name=False,
+            include_bare_annotations=True,
+        )
     )
     direct_nonlocals: Set[str] = set()
     direct_mutated: Set[str] = set()
     nested_mutated: Set[str] = set()
-    stack: List[ast.AST] = list(getattr(fn_node, "body", []))
+    stack: List[ast.AST] = list(getattr(scope_node, "body", []))
     while stack:
         curr = stack.pop()
-        if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             direct_mutated.add(curr.name)
             nested_mutated.update(
                 _extract_closure_nonlocal_mutations(curr) - own_locals
             )
-            continue
-        if isinstance(curr, ast.ClassDef):
-            direct_mutated.add(curr.name)
-            for sub in curr.body:
-                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    nested_mutated.update(
-                        _extract_closure_nonlocal_mutations(sub) - own_locals
-                    )
             continue
         if isinstance(curr, _COMPREHENSION_TYPES):
             direct_mutated.update(_extract_comprehension_walrus_names(curr))
@@ -756,19 +770,19 @@ def _extract_closure_nonlocal_mutations(fn_node: ast.AST) -> Set[str]:
 
 def _collect_unit_nonlocal_mutators(
     candidate_stmts: Sequence[ast.stmt],
-    unit_top_locals: AbstractSet[str],
-) -> List[Tuple[str, Set[str]]]:
-    """Collects intra-unit nested functions that mutate unit_top_locals via nonlocal."""
-    if not unit_top_locals:
-        return []
-    mutators: List[Tuple[str, Set[str]]] = []
+) -> List[Tuple[str, Set[str], bool]]:
+    """Collects intra-unit nested functions/classes that mutate variables via nonlocal."""
+    mutators: List[Tuple[str, Set[str], bool]] = []
     stack: List[ast.AST] = list(candidate_stmts)
     while stack:
         curr = stack.pop()
-        if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            mutated = _extract_closure_nonlocal_mutations(curr) & set(unit_top_locals)
+        if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            mutated = _extract_closure_nonlocal_mutations(curr)
             if mutated:
-                mutators.append((curr.name, mutated))
+                is_escaped_def = isinstance(curr, ast.ClassDef) or bool(
+                    getattr(curr, "decorator_list", None)
+                )
+                mutators.append((curr.name, mutated, is_escaped_def))
             continue
         if isinstance(curr, _INNER_SCOPE_TYPES):
             continue
@@ -790,6 +804,7 @@ class _EnclosingFnCellInfo(NamedTuple):
 
     fn_locals: Set[str]
     pre_bound: Set[str]
+    pre_mutated: Set[str]
     post_mutated: Set[str]
     post_reads: Set[str]
     loop_mutated: Set[str]
@@ -832,12 +847,10 @@ def _is_pos_after_span(line: Optional[int], col: Optional[int], span: _SpanBound
 
 
 def _is_node_inside_span(node: ast.AST, span: _SpanBounds) -> bool:
-    """Checks whether an AST node (including decorators and end position) lies within span."""
+    """Checks whether an AST node's start and end positions lie within span."""
     if not _is_ast_node_within_unit_bounds(
         node, span.start, span.end, span.end_col, span.start_col
     ):
-        return False
-    if _node_earliest_start_lineno(node) < span.start:
         return False
     c_end = getattr(node, "end_lineno", None)
     if isinstance(c_end, int):
@@ -880,6 +893,19 @@ def _strictly_encloses_span(node: ast.AST, span: _SpanBounds) -> bool:
     return False
 
 
+def _block_contains_span(stmts: Sequence[ast.AST], span: _SpanBounds) -> bool:
+    """Checks whether any statement in stmts lies inside or strictly encloses span."""
+    return any(
+        _is_node_inside_span(s, span) or _strictly_encloses_span(s, span)
+        for s in stmts
+    )
+
+
+def _can_bind_in_fn_scope(name: str, active_nonlocals: Optional[Set[str]]) -> bool:
+    """Checks whether a binding in the current AST frame targets the enclosing function scope."""
+    return active_nonlocals is None or name in active_nonlocals
+
+
 def _extract_assigned_closure_binding(
     node: ast.AST,
 ) -> Optional[Tuple[str, Union[ast.Lambda, ast.GeneratorExp]]]:
@@ -900,23 +926,47 @@ def _extract_assigned_closure_binding(
     return None
 
 
+class _CellBindingState(NamedTuple):
+    """Mutable sets tracking cell bindings during enclosing function AST traversal."""
+
+    pre_bound: Set[str]
+    pre_mutated: Set[str]
+    post_mutated: Set[str]
+    post_reads: Set[str]
+    loop_mutated: Set[str]
+
+
+class _StackFrame(NamedTuple):
+    """Traversal frame for _analyze_enclosing_fn_cells."""
+
+    node: ast.AST
+    is_branched: bool
+    in_loop: bool
+    active_nonlocals: Optional[Set[str]]
+
+
 def _record_binding_at_pos(
     names: Iterable[str],
     line: Optional[int],
     col: Optional[int],
     span: _SpanBounds,
-    in_loop: bool,
-    pre_bound: Set[str],
-    post_mutated: Set[str],
-    loop_mutated: Set[str],
+    frame: _StackFrame,
+    state: _CellBindingState,
 ) -> None:
-    """Records bound variable names into pre_bound, post_mutated, and loop_mutated sets."""
+    """Records bound variable names into pre_bound, pre_mutated, post_mutated, and loop_mutated."""
+    filtered = [
+        n for n in names if _can_bind_in_fn_scope(n, frame.active_nonlocals)
+    ]
+    if not filtered:
+        return
     if _is_pos_before_span(line, col, span):
-        pre_bound.update(names)
+        state.pre_mutated.update(filtered)
+        if not frame.is_branched:
+            state.pre_bound.update(filtered)
     if _is_pos_after_span(line, col, span):
-        post_mutated.update(names)
-    if in_loop:
-        loop_mutated.update(names)
+        state.post_mutated.update(filtered)
+    if frame.in_loop:
+        state.loop_mutated.update(filtered)
 
 
 def _extract_store_names_in_node(node: ast.AST) -> Set[str]:
@@ -950,11 +1000,231 @@ def _find_non_call_loaded_names(stmts: Sequence[ast.stmt]) -> Set[str]:
     return loaded
 
 
+def _propagate_sibling_closures(
+    closures: Sequence[Tuple[Optional[str], Set[str], Set[str]]],
+    post_reads: Optional[Set[str]] = None,
+) -> List[Tuple[Optional[str], Set[str], Set[str]]]:
+    """Propagates free reads and nonlocal mutations transitively across named sibling closures."""
+    result: List[Tuple[Optional[str], Set[str], Set[str]]] = [
+        (name, set(reads), set(muts)) for name, reads, muts in closures
+    ]
+    by_name: Dict[str, Tuple[Set[str], Set[str]]] = {}
+    for name, reads, muts in result:
+        if name is not None:
+            if name not in by_name:
+                by_name[name] = (set(reads), set(muts))
+            else:
+                by_name[name][0].update(reads)
+                by_name[name][1].update(muts)
+    changed = True
+    while changed:
+        changed = False
+        for name, reads, muts in result:
+            for ref in list(reads):
+                target = by_name.get(ref)
+                if target is None:
+                    continue
+                t_reads, t_muts = target
+                if not t_reads.issubset(reads):
+                    reads.update(t_reads)
+                    changed = True
+                if not t_muts.issubset(muts):
+                    muts.update(t_muts)
+                    changed = True
+            if name is not None:
+                by_name[name][0].update(reads)
+                by_name[name][1].update(muts)
+    if post_reads is not None:
+        for ref in list(post_reads):
+            target = by_name.get(ref)
+            if target is not None:
+                post_reads.update(target[0])
+    return result
+
+
+def _push_seq(
+    stack: List[_StackFrame],
+    nodes: Sequence[ast.AST],
+    is_branched: bool,
+    in_loop: bool,
+    active_nonlocals: Optional[Set[str]],
+) -> None:
+    """Pushes a sequence of AST nodes in reverse order onto the traversal stack."""
+    for node in reversed(nodes):
+        stack.append(_StackFrame(node, is_branched, in_loop, active_nonlocals))
+
+
+def _push_compound_children(
+    curr: ast.AST,
+    span: _SpanBounds,
+    frame: _StackFrame,
+    unit_mutations: AbstractSet[str],
+    state: _CellBindingState,
+    stack: List[_StackFrame],
+) -> bool:
+    """Pushes child nodes of compound control-flow statements with branch and loop state."""
+    is_br = frame.is_branched
+    in_lp = frame.in_loop
+    act_nl = frame.active_nonlocals
+    encloses = _strictly_encloses_span(curr, span)
+
+    if isinstance(curr, ast.If):
+        body_span = encloses and _block_contains_span(curr.body, span)
+        else_span = encloses and _block_contains_span(curr.orelse, span)
+        _push_seq(stack, curr.orelse, is_br if else_span else True, in_lp, act_nl)
+        _push_seq(stack, curr.body, is_br if body_span else True, in_lp, act_nl)
+        stack.append(_StackFrame(curr.test, is_br, in_lp, act_nl))
+        return True
+
+    if isinstance(curr, (ast.For, ast.AsyncFor)):
+        body_span = encloses and _block_contains_span(curr.body, span)
+        else_span = encloses and _block_contains_span(curr.orelse, span)
+        if body_span:
+            state.loop_mutated.update(unit_mutations)
+            t_stores = [
+                n
+                for n in _extract_store_names_in_node(curr.target)
+                if _can_bind_in_fn_scope(n, act_nl)
+            ]
+            state.pre_mutated.update(t_stores)
+            if not is_br:
+                state.pre_bound.update(t_stores)
+            state.loop_mutated.update(t_stores)
+        _push_seq(stack, curr.orelse, is_br if else_span else True, in_lp, act_nl)
+        _push_seq(
+            stack,
+            curr.body,
+            is_br if body_span else True,
+            True if body_span else in_lp,
+            act_nl,
+        )
+        stack.append(
+            _StackFrame(
+                curr.target,
+                is_br if body_span else True,
+                True if body_span else in_lp,
+                act_nl,
+            )
+        )
+        stack.append(_StackFrame(curr.iter, is_br, in_lp, act_nl))
+        return True
+
+    if isinstance(curr, ast.While):
+        body_span = encloses and (
+            _block_contains_span(curr.body, span)
+            or _is_node_inside_span(curr.test, span)
+        )
+        else_span = encloses and _block_contains_span(curr.orelse, span)
+        if body_span:
+            state.loop_mutated.update(unit_mutations)
+        _push_seq(stack, curr.orelse, is_br if else_span else True, in_lp, act_nl)
+        _push_seq(
+            stack,
+            curr.body,
+            is_br if body_span else True,
+            True if body_span else in_lp,
+            act_nl,
+        )
+        stack.append(
+            _StackFrame(curr.test, is_br, True if body_span else in_lp, act_nl)
+        )
+        return True
+
+    if isinstance(curr, (ast.With, ast.AsyncWith)):
+        if encloses:
+            for item in curr.items:
+                if item.optional_vars is not None:
+                    w_stores = [
+                        n
+                        for n in _extract_store_names_in_node(item.optional_vars)
+                        if _can_bind_in_fn_scope(n, act_nl)
+                    ]
+                    state.pre_mutated.update(w_stores)
+                    if not is_br:
+                        state.pre_bound.update(w_stores)
+        _push_seq(stack, curr.body, is_br, in_lp, act_nl)
+        _push_seq(stack, curr.items, is_br, in_lp, act_nl)
+        return True
+
+    if isinstance(curr, ast.Try) or type(curr).__name__ == "TryStar":
+        body_l = getattr(curr, "body", [])
+        else_l = getattr(curr, "orelse", [])
+        final_l = getattr(curr, "finalbody", [])
+        handlers_l = getattr(curr, "handlers", [])
+        else_span = encloses and _block_contains_span(else_l, span)
+        body_span = encloses and (
+            _block_contains_span(body_l, span) or else_span
+        )
+        final_span = encloses and _block_contains_span(final_l, span)
+        _push_seq(
+            stack,
+            final_l,
+            is_br if (not encloses or final_span) else True,
+            in_lp,
+            act_nl,
+        )
+        _push_seq(stack, else_l, is_br if else_span else True, in_lp, act_nl)
+        _push_seq(stack, handlers_l, is_br if encloses else True, in_lp, act_nl)
+        _push_seq(stack, body_l, is_br if body_span else True, in_lp, act_nl)
+        return True
+
+    if isinstance(curr, ast.ExceptHandler):
+        c_line = getattr(curr, "lineno", None)
+        c_col = getattr(curr, "col_offset", None)
+        h_br = is_br if encloses else True
+        if isinstance(curr.name, str) and _can_bind_in_fn_scope(curr.name, act_nl):
+            if encloses:
+                state.pre_mutated.add(curr.name)
+                if not h_br:
+                    state.pre_bound.add(curr.name)
+            elif _is_pos_before_span(c_line, c_col, span):
+                state.pre_bound.discard(curr.name)
+                state.pre_mutated.add(curr.name)
+            if _is_pos_after_span(c_line, c_col, span):
+                state.post_mutated.add(curr.name)
+            if in_lp:
+                state.loop_mutated.add(curr.name)
+        _push_seq(stack, curr.body, h_br, in_lp, act_nl)
+        if curr.type is not None:
+            stack.append(_StackFrame(curr.type, True, in_lp, act_nl))
+        return True
+
+    if type(curr).__name__ == "Match":
+        for case in reversed(getattr(curr, "cases", [])):
+            case_body = getattr(case, "body", [])
+            c_br = is_br if (encloses and _block_contains_span(case_body, span)) else True
+            _push_seq(stack, case_body, c_br, in_lp, act_nl)
+            guard = getattr(case, "guard", None)
+            if isinstance(guard, ast.AST):
+                stack.append(_StackFrame(guard, c_br, in_lp, act_nl))
+            pattern = getattr(case, "pattern", None)
+            if isinstance(pattern, ast.AST):
+                stack.append(_StackFrame(pattern, c_br, in_lp, act_nl))
+        subject = getattr(curr, "subject", None)
+        if isinstance(subject, ast.AST):
+            stack.append(_StackFrame(subject, is_br, in_lp, act_nl))
+        return True
+
+    if isinstance(curr, ast.BoolOp) and curr.values:
+        _push_seq(stack, curr.values[1:], True, in_lp, act_nl)
+        stack.append(_StackFrame(curr.values[0], is_br, in_lp, act_nl))
+        return True
+
+    if isinstance(curr, ast.IfExp):
+        stack.append(_StackFrame(curr.orelse, True, in_lp, act_nl))
+        stack.append(_StackFrame(curr.body, True, in_lp, act_nl))
+        stack.append(_StackFrame(curr.test, is_br, in_lp, act_nl))
+        return True
+
+    return False
+
+
 def _analyze_enclosing_fn_cells(
     fn_node: ast.AST,
     span: _SpanBounds,
     *,
     unit_mutations: AbstractSet[str] = frozenset(),
+    enclosed_fn: Optional[ast.AST] = None,
 ) -> _EnclosingFnCellInfo:
     """Analyzes variable bindings, post-span mutations, loop mutations, and sibling closures."""
     fn_locals = _extract_single_node_local_names(
@@ -972,199 +1242,204 @@ def _analyze_enclosing_fn_cells(
     if isinstance(fn_args, ast.arguments):
         pre_bound.update(_extract_arg_names(fn_args))
 
-    post_mutated: Set[str] = set()
-    post_reads: Set[str] = set()
-    loop_mutated: Set[str] = set()
+    state = _CellBindingState(
+        pre_bound=pre_bound,
+        pre_mutated=set(pre_bound),
+        post_mutated=set(),
+        post_reads=set(),
+        loop_mutated=set(),
+    )
     sibling_closures: List[Tuple[Optional[str], Set[str], Set[str]]] = []
 
-    stack: List[Tuple[ast.AST, bool, bool]] = [
-        (stmt, False, False) for stmt in reversed(getattr(fn_node, "body", []))
+    stack: List[_StackFrame] = [
+        _StackFrame(stmt, False, False, None)
+        for stmt in reversed(getattr(fn_node, "body", []))
     ]
     while stack:
-        curr, is_branched, in_loop = stack.pop()
-        if _is_node_inside_span(curr, span):
-            continue
+        frame = stack.pop()
+        curr = frame.node
         c_line = getattr(curr, "lineno", None)
         c_col = getattr(curr, "col_offset", None)
 
-        if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if curr is enclosed_fn and isinstance(
+            curr, (ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
             estart = _node_earliest_start_lineno(curr)
             _record_binding_at_pos(
-                (curr.name,), estart, c_col, span, in_loop,
-                pre_bound, post_mutated, loop_mutated,
+                (curr.name,), estart, c_col, span, frame, state
             )
-            free_r = _extract_nested_scope_free_reads(curr)
-            nl_mut = _extract_closure_nonlocal_mutations(curr)
-            sibling_closures.append((curr.name, free_r, nl_mut))
-            if _is_pos_after_span(estart, c_col, span):
-                post_reads.update(free_r)
-            stack.extend(
-                (hdr, is_branched, in_loop)
-                for hdr in reversed(list(iter_nested_scope_header_nodes(curr)))
+            _push_seq(
+                stack,
+                list(iter_nested_scope_header_nodes(curr)),
+                frame.is_branched,
+                frame.in_loop,
+                frame.active_nonlocals,
             )
             continue
 
-        if isinstance(curr, ast.ClassDef):
+        if _is_node_inside_span(curr, span):
+            if isinstance(
+                curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                pre_hdrs = [
+                    hdr
+                    for hdr in iter_nested_scope_header_nodes(curr)
+                    if _is_pos_before_span(
+                        getattr(hdr, "lineno", None),
+                        getattr(hdr, "col_offset", None),
+                        span,
+                    )
+                ]
+                _push_seq(
+                    stack,
+                    pre_hdrs,
+                    frame.is_branched,
+                    frame.in_loop,
+                    frame.active_nonlocals,
+                )
+            continue
+
+        if isinstance(
+            curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
             estart = _node_earliest_start_lineno(curr)
             _record_binding_at_pos(
-                (curr.name,), estart, c_col, span, in_loop,
-                pre_bound, post_mutated, loop_mutated,
+                (curr.name,), estart, c_col, span, frame, state
             )
             free_r = _extract_nested_scope_free_reads(curr)
+            nl_mut = _extract_closure_nonlocal_mutations(curr)
+            sib_name = (
+                curr.name
+                if _can_bind_in_fn_scope(curr.name, frame.active_nonlocals)
+                else None
+            )
+            sibling_closures.append((sib_name, free_r, nl_mut))
             if _is_pos_after_span(estart, c_col, span):
-                post_reads.update(free_r)
-            for sub in curr.body:
-                if isinstance(
-                    sub, (ast.FunctionDef, ast.AsyncFunctionDef)
-                ) and not _is_node_inside_span(sub, span):
-                    sub_reads = _extract_nested_scope_free_reads(sub)
-                    sibling_closures.append(
-                        (
-                            None,
-                            sub_reads,
-                            _extract_closure_nonlocal_mutations(sub),
-                        )
-                    )
-                    if _is_pos_after_span(
-                        _node_earliest_start_lineno(sub),
-                        getattr(sub, "col_offset", None),
-                        span,
-                    ):
-                        post_reads.update(sub_reads)
-            stack.extend(
-                (hdr, is_branched, in_loop)
-                for hdr in reversed(list(iter_nested_scope_header_nodes(curr)))
+                state.post_reads.update(free_r)
+            if isinstance(curr, ast.ClassDef):
+                _push_seq(
+                    stack,
+                    curr.body,
+                    frame.is_branched,
+                    frame.in_loop,
+                    _extract_direct_nonlocals(curr),
+                )
+            _push_seq(
+                stack,
+                list(iter_nested_scope_header_nodes(curr)),
+                frame.is_branched,
+                frame.in_loop,
+                frame.active_nonlocals,
             )
             continue
 
         if isinstance(curr, ast.Lambda):
+            free_r = _extract_nested_scope_free_reads(curr)
+            sibling_closures.append((None, free_r, set()))
             if _is_pos_after_span(c_line, c_col, span):
-                post_reads.update(_extract_nested_scope_free_reads(curr))
-            stack.extend(
-                (hdr, is_branched, in_loop)
-                for hdr in reversed(list(iter_nested_scope_header_nodes(curr)))
+                state.post_reads.update(free_r)
+            _push_seq(
+                stack,
+                list(iter_nested_scope_header_nodes(curr)),
+                frame.is_branched,
+                frame.in_loop,
+                frame.active_nonlocals,
             )
             continue
 
         if isinstance(curr, _COMPREHENSION_TYPES):
             w_names = _extract_comprehension_walrus_names(curr)
-            _record_binding_at_pos(
-                w_names, c_line, c_col, span, in_loop,
-                pre_bound, post_mutated, loop_mutated,
-            )
-            if _is_pos_after_span(c_line, c_col, span):
-                free_r = _extract_nested_scope_free_reads(
-                    ast.Lambda(
-                        args=ast.arguments(
-                            posonlyargs=[],
-                            args=[],
-                            kwonlyargs=[],
-                            kw_defaults=[],
-                            defaults=[],
-                        ),
-                        body=curr,
-                    )
+            _record_binding_at_pos(w_names, c_line, c_col, span, frame, state)
+            free_r = _extract_nested_scope_free_reads(
+                ast.Lambda(
+                    args=ast.arguments(
+                        posonlyargs=[],
+                        args=[],
+                        kwonlyargs=[],
+                        kw_defaults=[],
+                        defaults=[],
+                    ),
+                    body=curr,
                 )
-                post_reads.update(free_r)
+            )
+            if isinstance(curr, ast.GeneratorExp) or any(
+                isinstance(sub, (ast.Lambda, ast.GeneratorExp))
+                for sub in ast.walk(curr)
+            ):
+                sibling_closures.append((None, free_r, set()))
+            if _is_pos_after_span(c_line, c_col, span):
+                state.post_reads.update(free_r)
             continue
 
         assigned_closure = _extract_assigned_closure_binding(curr)
         if assigned_closure is not None:
             sib_target, sib_expr = assigned_closure
-            sib_reads = (
-                _extract_nested_scope_free_reads(sib_expr)
-                if isinstance(sib_expr, ast.Lambda)
-                else _extract_nested_scope_free_reads(
-                    ast.Lambda(
-                        args=ast.arguments(
-                            posonlyargs=[],
-                            args=[],
-                            kwonlyargs=[],
-                            kw_defaults=[],
-                            defaults=[],
-                        ),
-                        body=sib_expr,
+            if _can_bind_in_fn_scope(sib_target, frame.active_nonlocals):
+                sib_reads = (
+                    _extract_nested_scope_free_reads(sib_expr)
+                    if isinstance(sib_expr, ast.Lambda)
+                    else _extract_nested_scope_free_reads(
+                        ast.Lambda(
+                            args=ast.arguments(
+                                posonlyargs=[],
+                                args=[],
+                                kwonlyargs=[],
+                                kw_defaults=[],
+                                defaults=[],
+                            ),
+                            body=sib_expr,
+                        )
                     )
                 )
-            )
-            sibling_closures.append((sib_target, sib_reads, set()))
+                sibling_closures.append((sib_target, sib_reads, set()))
 
-        curr_in_loop = in_loop
-        if isinstance(
-            curr, (ast.For, ast.AsyncFor, ast.While)
-        ) and _strictly_encloses_span(curr, span):
-            curr_in_loop = True
-            loop_mutated.update(unit_mutations)
-            if isinstance(curr, (ast.For, ast.AsyncFor)):
-                t_stores = _extract_store_names_in_node(curr.target)
-                pre_bound.update(t_stores)
-                loop_mutated.update(t_stores)
-
-        if isinstance(curr, (ast.With, ast.AsyncWith)) and _strictly_encloses_span(
-            curr, span
+        if _push_compound_children(
+            curr, span, frame, unit_mutations, state, stack
         ):
-            for item in curr.items:
-                if item.optional_vars is not None:
-                    pre_bound.update(_extract_store_names_in_node(item.optional_vars))
+            continue
+
+        if isinstance(curr, ast.AugAssign) and isinstance(curr.target, ast.Name):
+            if _is_pos_after_span(c_line, c_col, span):
+                state.post_reads.add(curr.target.id)
 
         if isinstance(curr, ast.Name):
             if isinstance(curr.ctx, ast.Store):
                 _record_binding_at_pos(
-                    (curr.id,), c_line, c_col, span, curr_in_loop,
-                    pre_bound, post_mutated, loop_mutated,
+                    (curr.id,), c_line, c_col, span, frame, state
                 )
-            elif isinstance(curr.ctx, ast.Del):
-                if _is_pos_before_span(c_line, c_col, span) and not is_branched:
-                    pre_bound.discard(curr.id)
+            elif isinstance(curr.ctx, ast.Del) and _can_bind_in_fn_scope(
+                curr.id, frame.active_nonlocals
+            ):
+                if _is_pos_before_span(c_line, c_col, span):
+                    state.pre_bound.discard(curr.id)
+                    state.pre_mutated.add(curr.id)
                 if _is_pos_after_span(c_line, c_col, span):
-                    post_mutated.add(curr.id)
-                if curr_in_loop:
-                    loop_mutated.add(curr.id)
-            elif isinstance(curr.ctx, ast.Load) and _is_pos_after_span(c_line, c_col, span):
-                post_reads.add(curr.id)
+                    state.post_mutated.add(curr.id)
+                if frame.in_loop:
+                    state.loop_mutated.add(curr.id)
+            elif isinstance(curr.ctx, ast.Load) and _is_pos_after_span(
+                c_line, c_col, span
+            ):
+                state.post_reads.add(curr.id)
         elif isinstance(curr, (ast.Import, ast.ImportFrom)):
             imp_names: Set[str] = set()
             _record_import_names(curr, imp_names)
             _record_binding_at_pos(
-                imp_names, c_line, c_col, span, curr_in_loop,
-                pre_bound, post_mutated, loop_mutated,
+                imp_names, c_line, c_col, span, frame, state
             )
-        elif isinstance(curr, ast.ExceptHandler) and isinstance(curr.name, str):
-            if _strictly_encloses_span(curr, span):
-                pre_bound.add(curr.name)
-            if _is_pos_after_span(c_line, c_col, span):
-                post_mutated.add(curr.name)
-            if curr_in_loop:
-                loop_mutated.add(curr.name)
         elif type(curr).__name__ == "TypeAlias":
             alias_name = getattr(curr, "name", None)
             if isinstance(alias_name, ast.Name):
                 _record_binding_at_pos(
-                    (alias_name.id,), c_line, c_col, span, curr_in_loop,
-                    pre_bound, post_mutated, loop_mutated,
+                    (alias_name.id,), c_line, c_col, span, frame, state
                 )
         elif type(curr).__name__ in ("MatchAs", "MatchStar", "MatchMapping"):
             m_name = _extract_pattern_bound_name(curr)
             if m_name is not None:
                 _record_binding_at_pos(
-                    (m_name,), c_line, c_col, span, curr_in_loop,
-                    pre_bound, post_mutated, loop_mutated,
+                    (m_name,), c_line, c_col, span, frame, state
                 )
 
-        child_branched = is_branched or (
-            isinstance(
-                curr,
-                (
-                    ast.If,
-                    ast.For,
-                    ast.AsyncFor,
-                    ast.While,
-                    ast.Try,
-                    ast.ExceptHandler,
-                ),
-            )
-            or type(curr).__name__ in ("TryStar", "Match")
-        )
         child_nodes: Sequence[ast.AST] = (
             (curr.annotation,)
             if isinstance(curr, ast.AnnAssign)
@@ -1172,11 +1447,17 @@ def _analyze_enclosing_fn_cells(
             and isinstance(curr.target, ast.Name)
             else tuple(ast.iter_child_nodes(curr))
         )
-        stack.extend(
-            (ch, child_branched, curr_in_loop)
-            for ch in reversed(child_nodes)
+        _push_seq(
+            stack,
+            child_nodes,
+            frame.is_branched,
+            frame.in_loop,
+            frame.active_nonlocals,
         )
 
+    sibling_closures = _propagate_sibling_closures(
+        sibling_closures, post_reads=state.post_reads
+    )
     all_sib_nl = (
         set().union(*(nl for _, _, nl in sibling_closures))
         if sibling_closures
@@ -1184,10 +1465,11 @@ def _analyze_enclosing_fn_cells(
     )
     return _EnclosingFnCellInfo(
         fn_locals=fn_locals,
-        pre_bound=pre_bound,
-        post_mutated=post_mutated,
-        post_reads=post_reads,
-        loop_mutated=loop_mutated,
+        pre_bound=state.pre_bound,
+        pre_mutated=state.pre_mutated,
+        post_mutated=state.post_mutated,
+        post_reads=state.post_reads,
+        loop_mutated=state.loop_mutated,
         sibling_closures=sibling_closures,
         all_sibling_nonlocal_mutations=all_sib_nl,
     )
@@ -1211,6 +1493,7 @@ class _UnitClosureHazardContext(NamedTuple):
     unit_top_locals: AbstractSet[str]
     free_vars: Sequence[str] = ()
     nonlocals: Sequence[str] = ()
+    has_yield: bool = False
 
 
 def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
@@ -1229,8 +1512,23 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     store_set = set(ctx.stores)
     output_set = set(ctx.outputs)
     nonlocal_set = set(ctx.nonlocals)
-    if not ctx.is_subroutine and bool(nonlocal_set & (store_set | set(ctx.deleted_names))):
+    unit_mutated_names = store_set | set(ctx.deleted_names)
+    if not ctx.is_subroutine and bool(nonlocal_set & unit_mutated_names):
         return True
+
+    enc_escaping = _extract_scope_escaping_bindings(
+        enclosing_chain[-1][2],
+        ctx.u_start,
+        ctx.u_end,
+        u_end_col=ctx.u_end_col,
+        u_start_col=ctx.u_start_col,
+    )
+    intra_nl_mutators = _collect_unit_nonlocal_mutators(ctx.candidate_stmts)
+    if ctx.is_subroutine and ctx.has_yield:
+        if bool(unit_mutated_names & (enc_escaping | nonlocal_set)) or bool(
+            intra_nl_mutators
+        ):
+            return True
 
     unit_mod = ast.Module(body=list(ctx.candidate_stmts), type_ignores=[])
     unit_closures = _collect_scope_closures_uncached(unit_mod)
@@ -1239,17 +1537,14 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         if unit_closures
         else set()
     )
-    if not ctx.is_subroutine:
+    intra_closure_reads.update(nonlocal_set)
+    if ctx.is_subroutine:
+        intra_closure_reads.update(enc_escaping & unit_mutated_names)
+    else:
         intra_closure_reads.update(ctx.free_vars)
-        intra_closure_reads.update(nonlocal_set)
 
-    intra_nl_mutators = (
-        _collect_unit_nonlocal_mutators(ctx.candidate_stmts, ctx.unit_top_locals)
-        if ctx.is_subroutine
-        else []
-    )
     eff_input_set = set(ctx.inputs) | set(ctx.free_vars) | nonlocal_set
-    unit_mutations = (store_set | set(ctx.deleted_names)) if ctx.is_subroutine else set()
+    unit_mutations = unit_mutated_names if ctx.is_subroutine else set()
 
     if not intra_closure_reads and not intra_nl_mutators and not ctx.is_subroutine:
         return False
@@ -1259,18 +1554,36 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         if idx == len(enclosing_chain) - 1:
             span = _SpanBounds(ctx.u_start, ctx.u_end, ctx.u_start_col, ctx.u_end_col)
             u_mut = unit_mutations
+            enc_child: Optional[ast.AST] = None
         else:
             next_start, next_end, next_fn = enclosing_chain[idx + 1]
+            next_body = getattr(next_fn, "body", [])
+            first_stmt = next_body[0] if next_body else next_fn
             span = _SpanBounds(
-                next_start,
+                int(getattr(first_stmt, "lineno", next_start) or next_start),
                 next_end,
-                getattr(next_fn, "col_offset", None),
+                getattr(first_stmt, "col_offset", None),
                 getattr(next_fn, "end_col_offset", None),
             )
             u_mut = set()
+            enc_child = next_fn
         chain_infos.append(
-            _analyze_enclosing_fn_cells(fn_node, span, unit_mutations=u_mut)
+            _analyze_enclosing_fn_cells(
+                fn_node, span, unit_mutations=u_mut, enclosed_fn=enc_child
+            )
         )
+
+    all_chain_locals: Set[str] = (
+        set().union(*(info.fn_locals for info in chain_infos))
+        if chain_infos
+        else set()
+    )
+    for _mut_name, mutated_vars, _escaped_def in intra_nl_mutators:
+        escaping_nl_muts = (
+            mutated_vars - set(ctx.unit_top_locals)
+        ) | (mutated_vars & nonlocal_set)
+        if bool(escaping_nl_muts & all_chain_locals):
+            return True
 
     # 1 & 2: Intra-unit closure (or closure unit) captures an enclosing cell variable that is
     # unbound before the unit, mutated/deleted after the unit, mutated in an enclosing loop,
@@ -1299,14 +1612,14 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
 
     # 3: Subroutine intra-unit closure mutates a subroutine top-level variable via nonlocal
     # that is also bound/mutated/read in the enclosing function outside the subroutine.
-    if intra_nl_mutators:
+    if ctx.is_subroutine and intra_nl_mutators:
         non_call_loads = _find_non_call_loaded_names(ctx.candidate_stmts)
         outer_touched: Set[str] = set()
         all_post_reads: Set[str] = set()
         all_sib_reads: Set[str] = set()
         for info in chain_infos:
             outer_touched.update(
-                info.pre_bound
+                info.pre_mutated
                 | info.post_mutated
                 | info.loop_mutated
                 | info.all_sibling_nonlocal_mutations
@@ -1314,14 +1627,15 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
             all_post_reads.update(info.post_reads)
             for _, sib_r, _ in info.sibling_closures:
                 all_sib_reads.update(sib_r)
-        for mut_fn_name, mutated_vars in intra_nl_mutators:
+        for mut_fn_name, mutated_vars, is_escaped_def in intra_nl_mutators:
             mut_fn_escapes = (
-                mut_fn_name in all_post_reads
+                is_escaped_def
+                or mut_fn_name in all_post_reads
                 or mut_fn_name in all_sib_reads
                 or mut_fn_name in intra_closure_reads
                 or mut_fn_name in non_call_loads
             )
-            for var in mutated_vars:
+            for var in mutated_vars & set(ctx.unit_top_locals):
                 if var in outer_touched or (
                     mut_fn_escapes
                     and (var in all_post_reads or var in all_sib_reads)
@@ -1330,24 +1644,25 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
 
     # 4: Sibling closure in an enclosing function is passed into or referenced by the unit
     # and shares a mutated cell variable with the unit.
-    all_chain_locals: Set[str] = (
-        set().union(*(info.fn_locals for info in chain_infos))
-        if chain_infos
-        else set()
+    all_sib_closures = _propagate_sibling_closures(
+        [
+            sib
+            for info in chain_infos
+            for sib in info.sibling_closures
+        ]
     )
     sub_mutated = (
-        (store_set | set(ctx.deleted_names))
+        unit_mutated_names
         if ctx.is_subroutine
-        else (nonlocal_set & (store_set | set(ctx.deleted_names)))
+        else (nonlocal_set & unit_mutated_names)
     )
     sub_touched = eff_input_set | sub_mutated
-    for info in chain_infos:
-        for sib_name, sib_reads, sib_nl_muts in info.sibling_closures:
-            if sib_name is None or sib_name not in eff_input_set:
-                continue
-            if bool(sib_reads & all_chain_locals & sub_mutated):
-                return True
-            if bool(sib_nl_muts & all_chain_locals & sub_touched):
-                return True
+    for sib_name, sib_reads, sib_nl_muts in all_sib_closures:
+        if sib_name is None or sib_name not in eff_input_set:
+            continue
+        if bool(sib_reads & all_chain_locals & sub_mutated):
+            return True
+        if bool(sib_nl_muts & all_chain_locals & sub_touched):
+            return True
 
     return False
