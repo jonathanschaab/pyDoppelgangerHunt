@@ -869,7 +869,7 @@ class _EnclosingFnCellInfo(NamedTuple):
     loop_mutated: Set[str]
     sibling_closures: List[Tuple[Optional[str], Set[str], Set[str]]]
     all_sibling_nonlocal_mutations: Set[str]
-    alias_edges: List[Tuple[str, Set[str]]] = []
+    alias_edges: Sequence[Tuple[str, Set[str]]] = ()
 
 
 def _is_pos_before_span(line: Optional[int], col: Optional[int], span: _SpanBounds) -> bool:
