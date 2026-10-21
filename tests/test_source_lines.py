@@ -2677,6 +2677,7 @@ def test_closure_cell_binding_and_severed_cell_hazards(tmp_path: Path) -> None:
         "source_code": "for x in items:\n    shared_total += x\n",
     }
     sc_glob = inspect_single_unit_scope(u_glob_with, tree=ast.parse(global_with_src))
+    assert "severed_closure_cell" in sc_glob["control_flow_hazards"]
     res_glob = resolve_clone_pair_outputs(
         u_glob_with,
         u_glob_with,
@@ -2687,7 +2688,37 @@ def test_closure_cell_binding_and_severed_cell_hazards(tmp_path: Path) -> None:
         return_details=True,
     )
     assert res_glob.outputs is None
-    assert res_glob.skip_reason == "enclosing try or with cleanup hazard"
+    assert res_glob.skip_reason == "severed closure cell"
+
+    nl_with_src = (
+        "def outer_with(ctx, items):\n"
+        "    shared_total = 0\n"
+        "    def run_nl():\n"
+        "        nonlocal shared_total\n"
+        "        with ctx:\n"
+        "            for x in items:\n"
+        "                shared_total += x\n"
+        "    return run_nl\n"
+    )
+    u_nl_with = {
+        "start": 6,
+        "end": 7,
+        "kind": "compound_block",
+        "source_text": nl_with_src,
+        "source_code": "for x in items:\n    shared_total += x\n",
+    }
+    sc_nl_with = inspect_single_unit_scope(u_nl_with, tree=ast.parse(nl_with_src))
+    res_nl_with = resolve_clone_pair_outputs(
+        u_nl_with,
+        u_nl_with,
+        sc_nl_with,
+        sc_nl_with,
+        source_text1=nl_with_src,
+        source_text2=nl_with_src,
+        return_details=True,
+    )
+    assert res_nl_with.outputs is None
+    assert res_nl_with.skip_reason == "enclosing try or with cleanup hazard"
 
     # 9. Pre-unit closure mutating nonlocal cell passed into subroutine, and multi-level chain
     sib_nl_mut_src = (
@@ -3092,3 +3123,161 @@ def test_closure_cell_binding_and_severed_cell_hazards(tmp_path: Path) -> None:
         tree=ast.parse(trans_sib_src),
     )
     assert "severed_closure_cell" in sc_trans_sib["control_flow_hazards"]
+
+    # 20. PR Review Regressions: lazy genexp walrus, except-as exit deletion, self-name rebinding,
+    # async await suspension, read-only generator mutable cell, and aliased/container callbacks.
+    genexp_walrus_src = (
+        "def run_genexp_walrus(items):\n"
+        "    acc = 0\n"
+        "    if items:\n"
+        "        gen = ((acc := acc + x) for x in items)\n"
+        "    else:\n"
+        "        gen = iter(())\n"
+        "    list(gen)\n"
+        "    return acc\n"
+    )
+    sc_genexp_walrus = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 6,
+            "kind": "compound_block",
+            "source_text": genexp_walrus_src,
+            "source_code": (
+                "if items:\n"
+                "    gen = ((acc := acc + x) for x in items)\n"
+                "else:\n"
+                "    gen = iter(())\n"
+            ),
+        },
+        tree=ast.parse(genexp_walrus_src),
+    )
+    assert "severed_closure_cell" in sc_genexp_walrus["control_flow_hazards"]
+
+    except_as_src = (
+        "def run_except_as(items, fn):\n"
+        "    cbs = []\n"
+        "    try:\n"
+        "        fn()\n"
+        "    except ValueError as exc:\n"
+        "        for x in items:\n"
+        "            cbs.append(lambda x=x: (x, exc))\n"
+        "    return cbs\n"
+    )
+    sc_except_as = inspect_single_unit_scope(
+        {
+            "start": 6,
+            "end": 7,
+            "kind": "compound_block",
+            "source_text": except_as_src,
+            "source_code": "for x in items:\n    cbs.append(lambda x=x: (x, exc))\n",
+        },
+        tree=ast.parse(except_as_src),
+    )
+    assert "severed_closure_cell" in sc_except_as["control_flow_hazards"]
+
+    self_name_rebind_src = (
+        "def outer_rebind_fn(items):\n"
+        "    def scale():\n"
+        "        cbs = []\n"
+        "        for x in items:\n"
+        "            cbs.append(lambda x=x: (x, scale))\n"
+        "        return cbs\n"
+        "    res = scale()\n"
+        "    scale = 10\n"
+        "    return res\n"
+    )
+    sc_self_name = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 5,
+            "kind": "compound_block",
+            "source_text": self_name_rebind_src,
+            "source_code": "for x in items:\n    cbs.append(lambda x=x: (x, scale))\n",
+        },
+        tree=ast.parse(self_name_rebind_src),
+    )
+    assert "severed_closure_cell" in sc_self_name["control_flow_hazards"]
+
+    async_nl_src = (
+        "def outer_async(items, checkpoint):\n"
+        "    total = 0\n"
+        "    async def worker():\n"
+        "        nonlocal total\n"
+        "        for x in items:\n"
+        "            total += x\n"
+        "            await checkpoint()\n"
+        "    return worker, lambda: total\n"
+    )
+    sc_async_nl = inspect_single_unit_scope(
+        {
+            "start": 5,
+            "end": 7,
+            "kind": "compound_block",
+            "source_text": async_nl_src,
+            "source_code": "for x in items:\n    total += x\n    await checkpoint()\n",
+        },
+        tree=ast.parse(async_nl_src),
+    )
+    assert "severed_closure_cell" in sc_async_nl["control_flow_hazards"]
+
+    ro_gen_src = (
+        "def outer_ro_gen(items):\n"
+        "    scale = 2\n"
+        "    def set_scale(v):\n"
+        "        nonlocal scale\n"
+        "        scale = v\n"
+        "    def gen():\n"
+        "        for x in items:\n"
+        "            yield scale * x\n"
+        "    return gen, set_scale\n"
+    )
+    sc_ro_gen = inspect_single_unit_scope(
+        {
+            "start": 7,
+            "end": 8,
+            "kind": "compound_block",
+            "source_text": ro_gen_src,
+            "source_code": "for x in items:\n    yield scale * x\n",
+        },
+        tree=ast.parse(ro_gen_src),
+    )
+    assert "severed_closure_cell" in sc_ro_gen["control_flow_hazards"]
+
+    alias_container_src = (
+        "def outer_alias_container(items):\n"
+        "    acc = 0\n"
+        "    def get_acc():\n"
+        "        return acc\n"
+        "    reader = get_acc\n"
+        "    readers = [lambda: acc]\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        acc += x\n"
+        "        out.append(reader())\n"
+        "    for y in items:\n"
+        "        acc += y\n"
+        "        out.append(readers[0]())\n"
+        "    return acc, out\n"
+    )
+    sc_alias_cb = inspect_single_unit_scope(
+        {
+            "start": 8,
+            "end": 10,
+            "kind": "compound_block",
+            "source_text": alias_container_src,
+            "source_code": "for x in items:\n    acc += x\n    out.append(reader())\n",
+        },
+        tree=ast.parse(alias_container_src),
+    )
+    assert "severed_closure_cell" in sc_alias_cb["control_flow_hazards"]
+    sc_container_cb = inspect_single_unit_scope(
+        {
+            "start": 11,
+            "end": 13,
+            "kind": "compound_block",
+            "source_text": alias_container_src,
+            "source_code": "for y in items:\n    acc += y\n    out.append(readers[0]())\n",
+        },
+        tree=ast.parse(alias_container_src),
+    )
+    assert "severed_closure_cell" in sc_container_cb["control_flow_hazards"]

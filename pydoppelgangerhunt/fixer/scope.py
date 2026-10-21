@@ -2285,6 +2285,7 @@ def _inspect_unit_scope(
                                 free_vars=free_vars,
                                 nonlocals=visitor.nonlocals,
                                 has_yield=visitor.has_yield,
+                                is_async=visitor.is_async,
                             )
                         )
                     ):
