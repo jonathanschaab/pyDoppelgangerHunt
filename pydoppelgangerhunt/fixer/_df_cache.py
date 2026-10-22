@@ -85,8 +85,7 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
             k
             for k in _scope_cell_info_cache
             if isinstance(k, tuple)
-            and bool(k)
-            and (k[0] in scope_nodes or k[-1] in scope_nodes)
+            and any(isinstance(elem, ast.AST) and elem in scope_nodes for elem in k)
         ]
         for k in cell_keys_to_remove:
             _scope_cell_info_cache.pop(k, None)
@@ -219,7 +218,9 @@ def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
     return _extract_first_unit_coord(unit, ("end_col", "end_col_offset"))
 
 
-def _get_scope_parent_map(scope_node: ast.AST) -> Dict[ast.AST, ast.AST]:
+def _get_scope_parent_map(
+    scope_node: ast.AST, *, use_cache: bool = True
+) -> Dict[ast.AST, ast.AST]:
     """Retrieves or builds cached parent map for AST nodes within the scope."""
     def _compute() -> Dict[ast.AST, ast.AST]:
         parent_map: Dict[ast.AST, ast.AST] = {}
@@ -228,6 +229,8 @@ def _get_scope_parent_map(scope_node: ast.AST) -> Dict[ast.AST, ast.AST]:
                 parent_map[child] = parent
         return parent_map
 
+    if not use_cache:
+        return _compute()
     return _get_or_compute_scope_cached(_scope_parent_maps, scope_node, _compute)
 
 

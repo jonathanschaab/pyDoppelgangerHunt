@@ -318,9 +318,15 @@ def _collect_scope_closures_uncached(
     module_tree: Optional[ast.AST] = None,
     *,
     genexp_include_header: bool = True,
+    cache_parent_map: bool = True,
 ) -> List[Tuple[_ClosurePos, Set[str]]]:
     closures: List[Tuple[_ClosurePos, Set[str]]] = []
-    parent_map = _get_scope_parent_map(scope_node)
+    use_parent_cache = cache_parent_map and not (
+        isinstance(scope_node, ast.Module)
+        and module_tree is not None
+        and scope_node is not module_tree
+    )
+    parent_map = _get_scope_parent_map(scope_node, use_cache=use_parent_cache)
     shadowed_names = _extract_scope_local_names(scope_node, module_tree=module_tree)
     has_star_import = _has_wildcard_star_import(scope_node, module_tree=module_tree)
 

@@ -3620,3 +3620,27 @@ def test_df_cell_hazards_numbered_checks_unit() -> None:
     assert _extract_expr_scope_free_reads(gen_expr, include_header=False) == {"scale"}
     assert _extract_expr_scope_free_reads(gen_expr, include_header=True) == {"scale", "seq"}
 
+    # Ephemeral unit modules in _collect_unit_nonlocal_mutators do not pollute caches
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _evict_tree_scopes,
+        _scope_cell_info_cache,
+        _scope_parent_maps,
+        clear_dataflow_cache,
+    )
+
+    clear_dataflow_cache()
+    _collect_unit_nonlocal_mutators(ast.parse("x = 1\n").body, mod_tree=None)
+    assert not any(
+        isinstance(k, tuple) and any(isinstance(el, ast.Module) for el in k)
+        for k in _scope_cell_info_cache
+    )
+    assert not any(isinstance(k, ast.Module) for k in _scope_parent_maps)
+
+    # _evict_tree_scopes removes tuple keys when an AST node sits at an interior index (e.g. index 3)
+    subtree_fn = ast.parse("def sub_fn():\n    return 1\n").body[0]
+    sentinel_key: tuple[object, ...] = ("prefix", 1, frozenset({"x"}), subtree_fn, "suffix")
+    _scope_cell_info_cache[sentinel_key] = "cached_val"
+    _evict_tree_scopes(subtree_fn)
+    assert sentinel_key not in _scope_cell_info_cache
+
+

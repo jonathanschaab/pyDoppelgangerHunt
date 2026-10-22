@@ -58,43 +58,49 @@ class _FnScopeContext(NamedTuple):
     has_star_import: bool
 
 
-def _get_fn_scope_context(
+def _get_fn_scope_context_uncached(
     scope_node: ast.AST,
     mod_tree: Optional[ast.AST] = None,
+    *,
+    cache_parent_map: bool = True,
 ) -> _FnScopeContext:
-    """Computes and caches lexical scope metadata for a function or unit module."""
-    cache_key: Any = (
-        (scope_node, "fn_scope_ctx")
-        if mod_tree is None
-        else (scope_node, "fn_scope_ctx", mod_tree)
-    )
-
-    def _compute() -> _FnScopeContext:
-        fn_locals = _extract_single_node_local_names(
+    """Computes lexical scope metadata for a function or ephemeral unit module without caching."""
+    return _FnScopeContext(
+        fn_locals=_extract_single_node_local_names(
             scope_node,
             include_globals=False,
             include_nonlocals=False,
             include_self_name=False,
             include_bare_annotations=True,
-        )
-        parent_map = _get_scope_parent_map(scope_node)
-        shadowed_names = _extract_scope_local_names(
+        ),
+        parent_map=_get_scope_parent_map(scope_node, use_cache=cache_parent_map),
+        shadowed_names=_extract_scope_local_names(
             scope_node, module_tree=mod_tree
-        )
-        has_star_import = _has_wildcard_star_import(
+        ),
+        has_star_import=_has_wildcard_star_import(
             scope_node, module_tree=mod_tree
-        )
-        return _FnScopeContext(
-            fn_locals=fn_locals,
-            parent_map=parent_map,
-            shadowed_names=shadowed_names,
-            has_star_import=has_star_import,
-        )
+        ),
+    )
 
+
+def _get_fn_scope_context(
+    scope_node: ast.AST,
+    mod_tree: Optional[ast.AST] = None,
+) -> _FnScopeContext:
+    """Computes and caches lexical scope metadata for an AST scope node."""
+    cache_key: Any = (
+        (scope_node, "fn_scope_ctx")
+        if mod_tree is None
+        else (scope_node, "fn_scope_ctx", mod_tree)
+    )
     return cast(
         _FnScopeContext,
         _get_or_compute_scope_cached(
-            _scope_cell_info_cache, cache_key, _compute
+            _scope_cell_info_cache,
+            cache_key,
+            lambda: _get_fn_scope_context_uncached(
+                scope_node, mod_tree=mod_tree
+            ),
         ),
     )
 
@@ -207,10 +213,10 @@ def _extract_closure_nonlocal_mutations_uncached(scope_node: ast.AST) -> Set[str
             _record_import_names(curr, direct_mutated)
         elif isinstance(curr, ast.ExceptHandler) and isinstance(curr.name, str):
             direct_mutated.add(curr.name)
-        elif type(curr).__name__ == "TypeAlias" and isinstance(
-            getattr(curr, "name", None), ast.Name
-        ):
-            direct_mutated.add(curr.name.id)  # type: ignore[attr-defined]
+        elif type(curr).__name__ == "TypeAlias":
+            target_name = getattr(curr, "name", None)
+            if isinstance(target_name, ast.Name):
+                direct_mutated.add(target_name.id)
         elif type(curr).__name__ in ("MatchAs", "MatchStar", "MatchMapping"):
             m_name = _extract_pattern_bound_name(curr)
             if m_name is not None:
@@ -341,7 +347,9 @@ def _collect_unit_nonlocal_mutators(
 ) -> List[Tuple[str, Set[str], bool]]:
     """Collects intra-unit nested functions/classes and lazy genexps that mutate outer cells."""
     unit_mod = ast.Module(body=list(candidate_stmts), type_ignores=[])
-    scope_ctx = _get_fn_scope_context(unit_mod, mod_tree=mod_tree)
+    scope_ctx = _get_fn_scope_context_uncached(
+        unit_mod, mod_tree=mod_tree, cache_parent_map=False
+    )
     mutators: List[Tuple[str, Set[str], bool]] = []
     stack: List[ast.AST] = list(candidate_stmts)
     while stack:
@@ -436,7 +444,11 @@ def _is_pos_after_span(
 def _is_node_inside_span(node: ast.AST, span: _SpanBounds) -> bool:
     """Checks whether an AST node's start and end positions lie within span."""
     if not _is_ast_node_within_unit_bounds(
-        node, span.start, span.end, span.end_col, span.start_col
+        node,
+        span.start,
+        span.end,
+        u_end_col=span.end_col,
+        u_start_col=span.start_col,
     ):
         return False
     c_end = getattr(node, "end_lineno", None)
@@ -1447,7 +1459,10 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
 
     unit_mod = ast.Module(body=list(ctx.candidate_stmts), type_ignores=[])
     unit_closures = _collect_scope_closures_uncached(
-        unit_mod, module_tree=ctx.mod_tree, genexp_include_header=False
+        unit_mod,
+        module_tree=ctx.mod_tree,
+        genexp_include_header=False,
+        cache_parent_map=False,
     )
     intra_closure_reads: Set[str] = (
         set().union(*(reads for _, reads in unit_closures))
