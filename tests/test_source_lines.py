@@ -3179,7 +3179,6 @@ def test_severed_closure_cell_scenarios(
 def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> None:
     """Verifies end-to-end refactoring, skip reasons, and nonlocal promotion."""
     from pydoppelgangerhunt.fixer import (
-        collect_downstream_read_names,
         generate_refactoring_patch,
         inspect_single_unit_scope,
         resolve_clone_pair_outputs,
@@ -3642,5 +3641,3 @@ def test_df_cell_hazards_numbered_checks_unit() -> None:
     _scope_cell_info_cache[sentinel_key] = "cached_val"
     _evict_tree_scopes(subtree_fn)
     assert sentinel_key not in _scope_cell_info_cache
-
-

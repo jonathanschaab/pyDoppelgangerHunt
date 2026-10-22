@@ -167,6 +167,17 @@ def _extract_direct_nonlocals(scope_node: ast.AST) -> Set[str]:
     return names
 
 
+def _extract_type_alias_or_pattern_name(node: ast.AST) -> Optional[str]:
+    """Extracts the bound identifier from a TypeAlias or match pattern AST node."""
+    cls_name = type(node).__name__
+    if cls_name == "TypeAlias":
+        target_name = getattr(node, "name", None)
+        return target_name.id if isinstance(target_name, ast.Name) else None
+    if cls_name in ("MatchAs", "MatchStar", "MatchMapping"):
+        return _extract_pattern_bound_name(node)
+    return None
+
+
 def _extract_closure_nonlocal_mutations_uncached(scope_node: ast.AST) -> Set[str]:
     """Computes outer-scope variables mutated or deleted via nonlocal inside scope_node."""
     if not isinstance(
@@ -213,14 +224,10 @@ def _extract_closure_nonlocal_mutations_uncached(scope_node: ast.AST) -> Set[str
             _record_import_names(curr, direct_mutated)
         elif isinstance(curr, ast.ExceptHandler) and isinstance(curr.name, str):
             direct_mutated.add(curr.name)
-        elif type(curr).__name__ == "TypeAlias":
-            target_name = getattr(curr, "name", None)
-            if isinstance(target_name, ast.Name):
-                direct_mutated.add(target_name.id)
-        elif type(curr).__name__ in ("MatchAs", "MatchStar", "MatchMapping"):
-            m_name = _extract_pattern_bound_name(curr)
-            if m_name is not None:
-                direct_mutated.add(m_name)
+        else:
+            bound_name = _extract_type_alias_or_pattern_name(curr)
+            if bound_name is not None:
+                direct_mutated.add(bound_name)
         stack.extend(ast.iter_child_nodes(curr))
     return (direct_nonlocals & direct_mutated) | nested_mutated
 
@@ -1056,17 +1063,11 @@ def _record_simple_node_bindings_and_reads(
         imp_names: Set[str] = set()
         _record_import_names(curr, imp_names)
         _record_binding_at_pos(imp_names, c_line, c_col, span, frame, state)
-    elif type(curr).__name__ == "TypeAlias":
-        alias_name = getattr(curr, "name", None)
-        if isinstance(alias_name, ast.Name):
+    else:
+        bound_name = _extract_type_alias_or_pattern_name(curr)
+        if bound_name is not None:
             _record_binding_at_pos(
-                (alias_name.id,), c_line, c_col, span, frame, state
-            )
-    elif type(curr).__name__ in ("MatchAs", "MatchStar", "MatchMapping"):
-        m_name = _extract_pattern_bound_name(curr)
-        if m_name is not None:
-            _record_binding_at_pos(
-                (m_name,), c_line, c_col, span, frame, state
+                (bound_name,), c_line, c_col, span, frame, state
             )
 
 
