@@ -532,6 +532,8 @@ def _extract_root_target_names(target: ast.AST) -> Set[str]:
 def _extract_expr_closure_and_load_info(
     nodes: Sequence[ast.AST],
     scope_ctx: Optional[_FnScopeContext] = None,
+    *,
+    called_names_out: Optional[Set[str]] = None,
 ) -> Tuple[Set[str], Set[str], Set[str]]:
     """Extracts (inline_closure_reads, inline_closure_muts, loaded_names) from expressions."""
     inline_reads: Set[str] = set()
@@ -559,7 +561,10 @@ def _extract_expr_closure_and_load_info(
             if isinstance(curr.func, ast.Attribute):
                 if not isinstance(curr.func.value, ast.Name):
                     stack.append(curr.func.value)
-            elif not isinstance(curr.func, ast.Name):
+            elif isinstance(curr.func, ast.Name):
+                if called_names_out is not None:
+                    called_names_out.add(curr.func.id)
+            else:
                 stack.append(curr.func)
             stack.extend(curr.args)
             stack.extend(
@@ -747,6 +752,76 @@ def _push_seq(
         stack.append(_StackFrame(node, is_branched, in_loop, active_nonlocals))
 
 
+def _extract_definite_target_names(target: ast.AST) -> Set[str]:
+    """Extracts variable names unconditionally bound by an assignment target."""
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: Set[str] = set()
+        for elt in target.elts:
+            names.update(_extract_definite_target_names(elt))
+        return names
+    if isinstance(target, ast.Starred):
+        return _extract_definite_target_names(target.value)
+    return set()
+
+
+def _extract_block_definite_bindings(
+    stmts: Sequence[ast.AST],
+    active_nonlocals: Optional[Set[str]],
+) -> Set[str]:
+    """Extracts variable names unconditionally bound across a statement sequence."""
+    bound: Set[str] = set()
+    for stmt in stmts:
+        if isinstance(stmt, ast.Assign) and stmt.value is not None:
+            for tgt in stmt.targets:
+                bound.update(
+                    n
+                    for n in _extract_definite_target_names(tgt)
+                    if _can_bind_in_fn_scope(n, active_nonlocals)
+                )
+        elif (
+            isinstance(stmt, (ast.AnnAssign, ast.AugAssign))
+            and stmt.value is not None
+        ):
+            bound.update(
+                n
+                for n in _extract_definite_target_names(stmt.target)
+                if _can_bind_in_fn_scope(n, active_nonlocals)
+            )
+        elif isinstance(
+            stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            if _can_bind_in_fn_scope(stmt.name, active_nonlocals):
+                bound.add(stmt.name)
+        elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            imp_names: Set[str] = set()
+            _record_import_names(stmt, imp_names)
+            bound.update(
+                n
+                for n in imp_names
+                if _can_bind_in_fn_scope(n, active_nonlocals)
+            )
+        elif isinstance(stmt, ast.If) and stmt.body and stmt.orelse:
+            bound.update(_extract_if_exhaustive_bindings(stmt, active_nonlocals))
+        for sub in ast.walk(stmt):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Del):
+                bound.discard(sub.id)
+    return bound
+
+
+def _extract_if_exhaustive_bindings(
+    if_node: ast.If,
+    active_nonlocals: Optional[Set[str]],
+) -> Set[str]:
+    """Extracts variable names unconditionally bound across both branches of an If statement."""
+    if not if_node.body or not if_node.orelse:
+        return set()
+    return _extract_block_definite_bindings(
+        if_node.body, active_nonlocals
+    ) & _extract_block_definite_bindings(if_node.orelse, active_nonlocals)
+
+
 def _push_compound_children(
     curr: ast.AST,
     span: _SpanBounds,
@@ -764,6 +839,20 @@ def _push_compound_children(
     if isinstance(curr, ast.If):
         body_span = encloses and _block_contains_span(curr.body, span)
         else_span = encloses and _block_contains_span(curr.orelse, span)
+        if (
+            not encloses
+            and not is_br
+            and curr.body
+            and curr.orelse
+            and _is_pos_before_span(
+                getattr(curr, "end_lineno", getattr(curr, "lineno", None)),
+                getattr(curr, "end_col_offset", getattr(curr, "col_offset", None)),
+                span,
+            )
+        ):
+            state.pre_bound.update(
+                _extract_if_exhaustive_bindings(curr, act_nl)
+            )
         _push_seq(stack, curr.orelse, is_br if else_span else True, in_lp, act_nl)
         _push_seq(stack, curr.body, is_br if body_span else True, in_lp, act_nl)
         stack.append(_StackFrame(curr.test, is_br, in_lp, act_nl))
@@ -918,6 +1007,26 @@ def _push_compound_children(
     return False
 
 
+def _is_closure_factory_scope(scope_node: ast.AST) -> bool:
+    """Checks whether a nested function or class can return a closure when called."""
+    if isinstance(scope_node, ast.ClassDef):
+        return True
+    for sub in ast.iter_child_nodes(scope_node):
+        for desc in ast.walk(sub):
+            if isinstance(
+                desc,
+                (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.ClassDef,
+                    ast.Lambda,
+                    ast.GeneratorExp,
+                ),
+            ):
+                return True
+    return False
+
+
 def _handle_nested_scope_node(
     curr: ast.AST,
     c_line: Optional[int],
@@ -928,6 +1037,7 @@ def _handle_nested_scope_node(
     sibling_closures: List[Tuple[Optional[str], Set[str], Set[str]]],
     stack: List[_StackFrame],
     scope_ctx: Optional[_FnScopeContext] = None,
+    factory_names: Optional[Set[str]] = None,
 ) -> bool:
     """Processes nested function, class, lambda, or comprehension scopes during cell analysis."""
     if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -942,6 +1052,12 @@ def _handle_nested_scope_node(
             if _can_bind_in_fn_scope(curr.name, frame.active_nonlocals)
             else None
         )
+        if (
+            sib_name is not None
+            and factory_names is not None
+            and _is_closure_factory_scope(curr)
+        ):
+            factory_names.add(sib_name)
         sibling_closures.append((sib_name, free_r, nl_mut))
         if _is_pos_after_span(estart, c_col, span):
             state.post_reads.update(free_r)
@@ -1004,6 +1120,7 @@ def _record_carrier_closures_and_aliases(
     sibling_closures: List[Tuple[Optional[str], Set[str], Set[str]]],
     alias_edges: List[Tuple[str, Set[str]]],
     scope_ctx: Optional[_FnScopeContext] = None,
+    call_edges: Optional[List[Tuple[str, Set[str]]]] = None,
 ) -> None:
     """Extracts inline closures and alias edges from assignment or mutating call nodes."""
     carrier = _extract_closure_carrier_targets_and_values(curr)
@@ -1017,14 +1134,17 @@ def _record_carrier_closures_and_aliases(
     ]
     if not valid_targets:
         return
+    c_calls: Set[str] = set()
     c_reads, c_muts, c_loads = _extract_expr_closure_and_load_info(
-        c_values, scope_ctx
+        c_values, scope_ctx, called_names_out=c_calls
     )
     for t_name in valid_targets:
         if c_reads or c_muts:
             sibling_closures.append((t_name, set(c_reads), set(c_muts)))
         if c_loads:
             alias_edges.append((t_name, set(c_loads)))
+        if c_calls and call_edges is not None:
+            call_edges.append((t_name, set(c_calls)))
 
 
 def _record_simple_node_bindings_and_reads(
@@ -1096,6 +1216,8 @@ def _analyze_enclosing_fn_cells_uncached(
     )
     sibling_closures: List[Tuple[Optional[str], Set[str], Set[str]]] = []
     alias_edges: List[Tuple[str, Set[str]]] = []
+    call_edges: List[Tuple[str, Set[str]]] = []
+    factory_names: Set[str] = set()
 
     stack: List[_StackFrame] = [
         _StackFrame(stmt, False, False, None)
@@ -1155,11 +1277,17 @@ def _analyze_enclosing_fn_cells_uncached(
             sibling_closures,
             stack,
             scope_ctx,
+            factory_names,
         ):
             continue
 
         _record_carrier_closures_and_aliases(
-            curr, frame, sibling_closures, alias_edges, scope_ctx
+            curr,
+            frame,
+            sibling_closures,
+            alias_edges,
+            scope_ctx,
+            call_edges,
         )
 
         if _push_compound_children(
@@ -1185,6 +1313,11 @@ def _analyze_enclosing_fn_cells_uncached(
             frame.in_loop,
             frame.active_nonlocals,
         )
+
+    for t_name, called_set in call_edges:
+        factory_targets = called_set & factory_names
+        if factory_targets:
+            alias_edges.append((t_name, factory_targets))
 
     sibling_closures = _propagate_sibling_closures(
         sibling_closures,
@@ -1286,8 +1419,15 @@ def _check_captured_cell_mutations(
     captured_candidates: AbstractSet[str],
     eff_input_set: AbstractSet[str],
     chain_infos: Sequence[_EnclosingFnCellInfo],
+    *,
+    unit_closure_reads: Optional[AbstractSet[str]] = None,
 ) -> bool:
     """Checks 1 & 2: captured cell variable is unbound before unit or mutated outside unit."""
+    actual_closure_reads = (
+        captured_candidates
+        if unit_closure_reads is None
+        else unit_closure_reads
+    )
     for var in captured_candidates:
         acc_ext_muts: Set[str] = set()
         acc_pre_bound: Set[str] = set()
@@ -1300,6 +1440,8 @@ def _check_captured_cell_mutations(
             )
             acc_pre_bound.update(info.pre_bound)
             if var not in info.fn_locals:
+                if var in actual_closure_reads:
+                    acc_ext_muts.update(info.pre_mutated)
                 continue
             if (
                 var in eff_input_set and var not in acc_pre_bound
@@ -1465,18 +1607,20 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         genexp_include_header=False,
         cache_parent_map=False,
     )
-    intra_closure_reads: Set[str] = (
+    unit_closure_reads: Set[str] = (
         set().union(*(reads for _, reads in unit_closures))
         if unit_closures
         else set()
     )
-    intra_closure_reads.update(nonlocal_set)
+    if ctx.is_subroutine:
+        if ctx.has_yield or ctx.is_async:
+            unit_closure_reads.update(ctx.inputs)
+    else:
+        unit_closure_reads.update(ctx.free_vars)
+
+    intra_closure_reads: Set[str] = set(unit_closure_reads) | nonlocal_set
     if ctx.is_subroutine:
         intra_closure_reads.update(enc_escaping & unit_mutated_names)
-        if ctx.has_yield or ctx.is_async:
-            intra_closure_reads.update(ctx.inputs)
-    else:
-        intra_closure_reads.update(ctx.free_vars)
 
     eff_input_set = set(ctx.inputs) | set(ctx.free_vars) | nonlocal_set
     unit_mutations = unit_mutated_names if ctx.is_subroutine else set()
@@ -1509,7 +1653,10 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         eff_input_set | ((store_set | output_set) if ctx.is_subroutine else set())
     )
     if _check_captured_cell_mutations(
-        captured_candidates, eff_input_set, chain_infos
+        captured_candidates,
+        eff_input_set,
+        chain_infos,
+        unit_closure_reads=unit_closure_reads,
     ):
         return True
 

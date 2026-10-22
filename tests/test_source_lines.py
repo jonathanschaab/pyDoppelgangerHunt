@@ -3147,6 +3147,83 @@ _CLOSURE_CELL_SCENARIOS = [
         },
         False,
     ),
+    (
+        "multilevel_intermediate_pre_unit_nonlocal_mutation",
+        (
+            "def outer_inter_pre(items):\n"
+            "    scale = 1\n"
+            "    def inner_inter():\n"
+            "        nonlocal scale\n"
+            "        scale += 1\n"
+            "        cbs = []\n"
+            "        for item in items:\n"
+            "            cbs.append(lambda x, item=item: x * scale + item)\n"
+            "        return cbs\n"
+            "    return inner_inter\n"
+        ),
+        {
+            "start": 7,
+            "end": 8,
+            "kind": "compound_block",
+            "source_code": (
+                "for item in items:\n"
+                "    cbs.append(lambda x, item=item: x * scale + item)\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "pre_unit_closure_factory_assigned_to_variable",
+        (
+            "def outer_factory(items):\n"
+            "    acc = 0\n"
+            "    def make_closure():\n"
+            "        def read_acc():\n"
+            "            return acc\n"
+            "        return read_acc\n"
+            "    fn = make_closure()\n"
+            "    out = []\n"
+            "    for x in items:\n"
+            "        acc += x\n"
+            "        out.append(fn() + x)\n"
+            "    return acc, out\n"
+        ),
+        {
+            "start": 9,
+            "end": 11,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    acc += x\n"
+                "    out.append(fn() + x)\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "neg_exhaustive_if_else_branch_initialization_before_unit",
+        (
+            "def build_if_else_init(items, cond):\n"
+            "    cbs = []\n"
+            "    if cond:\n"
+            "        scale = 1\n"
+            "    else:\n"
+            "        scale = 2\n"
+            "    for item in items:\n"
+            "        cbs.append(lambda x, item=item: x * scale + item)\n"
+            "    return cbs\n"
+        ),
+        {
+            "start": 7,
+            "end": 8,
+            "kind": "compound_block",
+            "source_code": (
+                "for item in items:\n"
+                "    cbs.append(lambda x, item=item: x * scale + item)\n"
+            ),
+        },
+        False,
+    ),
 ]
 
 
