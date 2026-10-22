@@ -20,13 +20,15 @@ from typing import (
 )
 
 from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
-from pydoppelgangerhunt.fixer._df_closures import (
+from pydoppelgangerhunt.fixer._df_cell_hazards import (
     _UnitClosureHazardContext,
+    _find_enclosing_function_chain,
+    _has_severed_closure_cell_hazard,
+)
+from pydoppelgangerhunt.fixer._df_closures import (
     _extract_comprehension_walrus_names,
     _extract_scope_escaping_bindings,
     _extract_single_node_local_names,
-    _find_enclosing_function_chain,
-    _has_severed_closure_cell_hazard,
     iter_nested_scope_header_nodes,
 )
 from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
@@ -1727,6 +1729,17 @@ def _find_enclosing_pre_bound_names(
     return bound_before, in_loop
 
 
+def _unit_cols(unit: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    """Extracts (start_col, end_col) coordinates from a unit dictionary."""
+    s_col = parse_unit_coord(unit, "start_col", default=None)
+    if s_col is None:
+        s_col = parse_unit_coord(unit, "col_offset", default=None)
+    e_col = parse_unit_coord(unit, "end_col", default=None)
+    if e_col is None:
+        e_col = parse_unit_coord(unit, "end_col_offset", default=None)
+    return s_col, e_col
+
+
 def _inspect_unit_scope(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
@@ -1907,9 +1920,7 @@ def _inspect_unit_scope(
         if visitor.type_param_free_vars and not is_subroutine:
             s_line = parse_unit_coord(unit, "start", default=1)
             e_line = parse_unit_coord(unit, "end", default=s_line)
-            u_col = parse_unit_coord(unit, "start_col", default=None)
-            if u_col is None:
-                u_col = parse_unit_coord(unit, "col_offset", default=None)
+            u_col, _ = _unit_cols(unit)
             top_fn = (
                 tree.body[0]
                 if isinstance(tree, ast.Module)
@@ -2077,12 +2088,7 @@ def _inspect_unit_scope(
                 pre_bound: Set[str] = set()
                 u_start = parse_unit_coord(unit, "start", default=0)
                 u_end = parse_unit_coord(unit, "end", default=u_start)
-                u_start_col = parse_unit_coord(unit, "start_col", default=None)
-                if u_start_col is None:
-                    u_start_col = parse_unit_coord(unit, "col_offset", default=None)
-                u_end_col = parse_unit_coord(unit, "end_col", default=None)
-                if u_end_col is None:
-                    u_end_col = parse_unit_coord(unit, "end_col_offset", default=None)
+                u_start_col, u_end_col = _unit_cols(unit)
                 mod_tree = file_tree
                 if mod_tree is None and u_start > 0:
                     full_src = _get_full_source()
@@ -2094,7 +2100,7 @@ def _inspect_unit_scope(
                     )
                     if cond_escaping_cands:
                         enc_chain = _find_enclosing_function_chain(
-                            mod_tree, u_start, u_end, u_start_col, True
+                            mod_tree, u_start, u_end, u_start_col
                         )
                         if enc_chain:
                             enc_escaping = _extract_scope_escaping_bindings(
@@ -2259,12 +2265,7 @@ def _inspect_unit_scope(
                     if full_src:
                         c_mod_tree = _get_or_parse_tree(full_src)
                 if c_mod_tree is not None:
-                    c_start_col = parse_unit_coord(unit, "start_col", default=None)
-                    if c_start_col is None:
-                        c_start_col = parse_unit_coord(unit, "col_offset", default=None)
-                    c_end_col = parse_unit_coord(unit, "end_col", default=None)
-                    if c_end_col is None:
-                        c_end_col = parse_unit_coord(unit, "end_col_offset", default=None)
+                    c_start_col, c_end_col = _unit_cols(unit)
                     if (
                         "severed_closure_cell" not in hazards
                         and _has_severed_closure_cell_hazard(
