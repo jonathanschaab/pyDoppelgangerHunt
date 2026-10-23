@@ -178,12 +178,14 @@ def _extract_type_alias_or_pattern_name(node: ast.AST) -> Optional[str]:
     return None
 
 
-def _extract_closure_nonlocal_mutations_uncached(scope_node: ast.AST) -> Set[str]:
-    """Computes outer-scope variables mutated or deleted via nonlocal inside scope_node."""
+def _extract_closure_nonlocal_mutations_and_deletions_uncached(
+    scope_node: ast.AST,
+) -> Tuple[Set[str], Set[str]]:
+    """Computes (mutated_or_deleted, deleted) outer-scope variables via nonlocal in scope_node."""
     if not isinstance(
         scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
     ):
-        return set()
+        return set(), set()
     is_cls = isinstance(scope_node, ast.ClassDef)
     own_locals = (
         set()
@@ -198,15 +200,19 @@ def _extract_closure_nonlocal_mutations_uncached(scope_node: ast.AST) -> Set[str
     )
     direct_nonlocals: Set[str] = set()
     direct_mutated: Set[str] = set()
+    direct_deleted: Set[str] = set()
     nested_mutated: Set[str] = set()
+    nested_deleted: Set[str] = set()
     stack: List[ast.AST] = list(getattr(scope_node, "body", []))
     while stack:
         curr = stack.pop()
         if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             direct_mutated.add(curr.name)
-            nested_mutated.update(
-                _extract_closure_nonlocal_mutations(curr) - own_locals
+            sub_mut, sub_del = _extract_closure_nonlocal_mutations_and_deletions(
+                curr
             )
+            nested_mutated.update(sub_mut - own_locals)
+            nested_deleted.update(sub_del - own_locals)
             stack.extend(iter_nested_scope_header_nodes(curr))
             continue
         if isinstance(curr, _COMPREHENSION_TYPES):
@@ -220,31 +226,48 @@ def _extract_closure_nonlocal_mutations_uncached(scope_node: ast.AST) -> Set[str
             continue
         if isinstance(curr, ast.Name) and isinstance(curr.ctx, (ast.Store, ast.Del)):
             direct_mutated.add(curr.id)
+            if isinstance(curr.ctx, ast.Del):
+                direct_deleted.add(curr.id)
         elif isinstance(curr, (ast.Import, ast.ImportFrom)):
             _record_import_names(curr, direct_mutated)
         elif isinstance(curr, ast.ExceptHandler) and isinstance(curr.name, str):
             direct_mutated.add(curr.name)
+            direct_deleted.add(curr.name)
         else:
             bound_name = _extract_type_alias_or_pattern_name(curr)
             if bound_name is not None:
                 direct_mutated.add(bound_name)
         stack.extend(ast.iter_child_nodes(curr))
-    return (direct_nonlocals & direct_mutated) | nested_mutated
+    return (
+        (direct_nonlocals & direct_mutated) | nested_mutated,
+        (direct_nonlocals & direct_deleted) | nested_deleted,
+    )
+
+
+def _extract_closure_nonlocal_mutations_and_deletions(
+    scope_node: ast.AST,
+) -> Tuple[Set[str], Set[str]]:
+    """Extracts and caches (mutated_or_deleted, deleted) nonlocal variables in scope_node."""
+    if not isinstance(
+        scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    ):
+        return set(), set()
+    muts, dels = cast(
+        Tuple[Set[str], Set[str]],
+        _get_or_compute_scope_cached(
+            _scope_cell_info_cache,
+            (scope_node, "nl_muts_dels"),
+            lambda: _extract_closure_nonlocal_mutations_and_deletions_uncached(
+                scope_node
+            ),
+        ),
+    )
+    return set(muts), set(dels)
 
 
 def _extract_closure_nonlocal_mutations(scope_node: ast.AST) -> Set[str]:
     """Extracts outer-scope variables mutated or deleted via nonlocal inside scope_node."""
-    if not isinstance(
-        scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-    ):
-        return set()
-    return set(
-        _get_or_compute_scope_cached(
-            _scope_cell_info_cache,
-            (scope_node, "nl_muts"),
-            lambda: _extract_closure_nonlocal_mutations_uncached(scope_node),
-        )
-    )
+    return _extract_closure_nonlocal_mutations_and_deletions(scope_node)[0]
 
 
 def _extract_cached_scope_free_reads(
@@ -271,20 +294,27 @@ def _extract_expr_scope_free_reads(
     return _extract_nested_scope_free_reads(expr, include_header=include_header)
 
 
+def _extract_comprehension_body_walrus_names(comp_node: ast.AST) -> Set[str]:
+    """Extracts walrus target names inside a comprehension excluding generators[0].iter."""
+    return _extract_comprehension_walrus_names(
+        comp_node, include_first_iter=False
+    )
+
+
 def _extract_lazy_genexp_walrus_names(
     node: ast.AST,
     scope_ctx: Optional[_FnScopeContext] = None,
 ) -> Set[str]:
     """Extracts walrus target names inside lazy GeneratorExp subtrees of node."""
-    if _is_lazy_genexp(node, scope_ctx):
-        return _extract_comprehension_walrus_names(node)
     names: Set[str] = set()
-    stack: List[ast.AST] = list(ast.iter_child_nodes(node))
+    stack: List[ast.AST] = [node]
     while stack:
         curr = stack.pop()
         if isinstance(curr, ast.GeneratorExp):
             if _is_lazy_genexp(curr, scope_ctx):
-                names.update(_extract_comprehension_walrus_names(curr))
+                names.update(_extract_comprehension_body_walrus_names(curr))
+                if curr.generators:
+                    stack.append(curr.generators[0].iter)
                 continue
             stack.extend(ast.iter_child_nodes(curr))
             continue
@@ -364,15 +394,18 @@ def _collect_unit_nonlocal_mutators(
         if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             mutated = _extract_closure_nonlocal_mutations(curr)
             if mutated:
-                is_escaped_def = isinstance(curr, ast.ClassDef) or bool(
-                    getattr(curr, "decorator_list", None)
+                is_escaped_def = (
+                    isinstance(curr, ast.ClassDef)
+                    or bool(getattr(curr, "decorator_list", None))
+                    or _is_closure_factory_scope(curr)
                 )
                 mutators.append((curr.name, mutated, is_escaped_def))
+            stack.extend(getattr(curr, "body", []))
             stack.extend(iter_nested_scope_header_nodes(curr))
             continue
         if isinstance(curr, ast.GeneratorExp):
             if _is_lazy_genexp(curr, scope_ctx):
-                w_names = _extract_comprehension_walrus_names(curr)
+                w_names = _extract_comprehension_body_walrus_names(curr)
                 if w_names:
                     mutators.append(("", w_names, True))
                 if curr.generators:
@@ -409,6 +442,7 @@ class _EnclosingFnCellInfo(NamedTuple):
     all_sibling_nonlocal_mutations: Set[str]
     alias_edges: Sequence[Tuple[str, Set[str]]] = ()
     pre_unbound: AbstractSet[str] = frozenset()
+    concurrent_sibling_vars: AbstractSet[str] = frozenset()
 
 
 def _is_pos_before_span(
@@ -539,6 +573,45 @@ def _extract_store_names_in_node(node: ast.AST) -> Set[str]:
     }
 
 
+_NON_CLOSURE_RETURN_BUILTINS: frozenset[str] = frozenset(
+    {
+        "abs",
+        "all",
+        "any",
+        "ascii",
+        "bin",
+        "bool",
+        "bytearray",
+        "bytes",
+        "callable",
+        "chr",
+        "complex",
+        "divmod",
+        "enumerate",
+        "float",
+        "format",
+        "hash",
+        "hex",
+        "id",
+        "input",
+        "int",
+        "isinstance",
+        "issubclass",
+        "len",
+        "oct",
+        "open",
+        "ord",
+        "pow",
+        "print",
+        "range",
+        "repr",
+        "round",
+        "str",
+        "sum",
+    }
+)
+
+
 def _extract_expr_closure_and_load_info(
     nodes: Sequence[ast.AST],
     scope_ctx: Optional[_FnScopeContext] = None,
@@ -549,16 +622,18 @@ def _extract_expr_closure_and_load_info(
     inline_reads: Set[str] = set()
     inline_muts: Set[str] = set()
     loaded_names: Set[str] = set()
-    stack: List[ast.AST] = list(nodes)
+    stack: List[Tuple[ast.AST, bool]] = [(n, True) for n in nodes]
     while stack:
-        curr = stack.pop()
+        curr, allow_load = stack.pop()
         if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
         if isinstance(curr, ast.Lambda):
             inline_reads.update(
                 _extract_expr_scope_free_reads(curr, include_header=False)
             )
-            stack.extend(iter_nested_scope_header_nodes(curr))
+            stack.extend(
+                (hdr, False) for hdr in iter_nested_scope_header_nodes(curr)
+            )
             continue
         if isinstance(curr, _COMPREHENSION_TYPES):
             c_reads, c_muts = _extract_comprehension_deferred_closure_info(
@@ -566,9 +641,12 @@ def _extract_expr_closure_and_load_info(
             )
             inline_reads.update(c_reads)
             inline_muts.update(c_muts)
+            is_lazy = _is_lazy_genexp(curr, scope_ctx)
             if curr.generators:
-                stack.append(curr.generators[0].iter)
-            if not _is_lazy_genexp(curr, scope_ctx):
+                stack.append(
+                    (curr.generators[0].iter, allow_load and not is_lazy)
+                )
+            if allow_load and not is_lazy:
                 comp_targets = {
                     n
                     for gen in curr.generators
@@ -591,24 +669,47 @@ def _extract_expr_closure_and_load_info(
                 if called_names_out is not None:
                     called_names_out.update(sub_calls - comp_targets)
             continue
+        if isinstance(curr, (ast.Compare, ast.UnaryOp, ast.JoinedStr)):
+            stack.extend((ch, False) for ch in ast.iter_child_nodes(curr))
+            continue
+        if isinstance(curr, ast.IfExp):
+            stack.append((curr.orelse, allow_load))
+            stack.append((curr.body, allow_load))
+            stack.append((curr.test, False))
+            continue
+        if isinstance(curr, ast.Subscript):
+            stack.append((curr.value, allow_load))
+            stack.append((curr.slice, False))
+            continue
         if isinstance(curr, ast.Call):
+            is_non_closure_builtin = (
+                isinstance(curr.func, ast.Name)
+                and curr.func.id in _NON_CLOSURE_RETURN_BUILTINS
+                and (
+                    scope_ctx is None
+                    or curr.func.id not in scope_ctx.shadowed_names
+                )
+            )
+            arg_allow = False if is_non_closure_builtin else allow_load
             if isinstance(curr.func, ast.Attribute):
-                if not isinstance(curr.func.value, ast.Name):
-                    stack.append(curr.func.value)
+                stack.append((curr.func.value, arg_allow))
             elif isinstance(curr.func, ast.Name):
-                if called_names_out is not None:
+                if arg_allow and called_names_out is not None:
                     called_names_out.add(curr.func.id)
             else:
-                stack.append(curr.func)
-            stack.extend(curr.args)
+                stack.append((curr.func, arg_allow))
+            stack.extend((arg, arg_allow) for arg in curr.args)
             stack.extend(
-                kw.value for kw in curr.keywords if kw.value is not None
+                (kw.value, arg_allow)
+                for kw in curr.keywords
+                if kw.value is not None
             )
             continue
         if isinstance(curr, ast.Name) and isinstance(curr.ctx, ast.Load):
-            loaded_names.add(curr.id)
+            if allow_load:
+                loaded_names.add(curr.id)
             continue
-        stack.extend(ast.iter_child_nodes(curr))
+        stack.extend((ch, allow_load) for ch in ast.iter_child_nodes(curr))
     return inline_reads, inline_muts, loaded_names
 
 
@@ -654,6 +755,7 @@ class _StackFrame(NamedTuple):
     is_branched: bool
     in_loop: bool
     active_nonlocals: Optional[Set[str]]
+    post_pre_bound: Optional[AbstractSet[str]] = None
 
 
 def _record_binding_at_pos(
@@ -681,15 +783,35 @@ def _record_binding_at_pos(
         state.loop_mutated.update(filtered)
 
 
+def _record_deletion_at_pos(
+    name: str,
+    line: Optional[int],
+    col: Optional[int],
+    span: _SpanBounds,
+    frame: _StackFrame,
+    state: _CellBindingState,
+    *,
+    unconditional_post_del: bool = False,
+) -> None:
+    """Records a variable deletion or ExceptHandler unbinding relative to span."""
+    if _is_pos_before_span(line, col, span) or (
+        unconditional_post_del and _is_pos_after_span(line, col, span)
+    ):
+        state.pre_bound.discard(name)
+        state.pre_unbound.add(name)
+        state.pre_mutated.add(name)
+    if _is_pos_after_span(line, col, span):
+        state.post_mutated.add(name)
+    if frame.in_loop:
+        state.loop_mutated.add(name)
+
+
 def _find_non_call_loaded_names(stmts: Sequence[ast.stmt]) -> Set[str]:
-    """Finds variable names loaded outside direct Call.func positions at unit top level."""
+    """Finds variable names loaded outside direct Call.func positions in stmts."""
     loaded: Set[str] = set()
     stack: List[ast.AST] = list(stmts)
     while stack:
         curr = stack.pop()
-        if isinstance(curr, _INNER_SCOPE_TYPES):
-            stack.extend(iter_nested_scope_header_nodes(curr))
-            continue
         if isinstance(curr, ast.Call):
             if not isinstance(curr.func, ast.Name):
                 stack.append(curr.func)
@@ -793,13 +915,51 @@ def _extract_definite_target_names(target: ast.AST) -> Set[str]:
     return set()
 
 
+def _extract_shallow_deleted_names(node: ast.AST) -> Set[str]:
+    """Extracts variable names deleted or unbound by ExceptHandler in node outside inner scopes."""
+    deleted: Set[str] = set()
+    stack: List[ast.AST] = [node]
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, _INNER_SCOPE_TYPES):
+            stack.extend(iter_nested_scope_header_nodes(curr))
+            continue
+        if isinstance(curr, ast.Name) and isinstance(curr.ctx, ast.Del):
+            deleted.add(curr.id)
+        elif isinstance(curr, ast.ExceptHandler) and isinstance(curr.name, str):
+            deleted.add(curr.name)
+        stack.extend(ast.iter_child_nodes(curr))
+    return deleted
+
+
 def _extract_block_definite_bindings(
     stmts: Sequence[ast.AST],
     active_nonlocals: Optional[Set[str]],
+    initial_bound: AbstractSet[str] = frozenset(),
 ) -> Set[str]:
     """Extracts variable names unconditionally bound across a statement sequence."""
-    bound: Set[str] = set()
+    bound: Set[str] = set(initial_bound)
     for stmt in stmts:
+        if isinstance(
+            stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            for hdr in iter_nested_scope_header_nodes(stmt):
+                bound.difference_update(_extract_shallow_deleted_names(hdr))
+            if _can_bind_in_fn_scope(stmt.name, active_nonlocals):
+                bound.add(stmt.name)
+            continue
+        if isinstance(stmt, ast.If):
+            bound.difference_update(_extract_shallow_deleted_names(stmt.test))
+            if stmt.body and stmt.orelse:
+                bound = _extract_block_definite_bindings(
+                    stmt.body, active_nonlocals, bound
+                ) & _extract_block_definite_bindings(
+                    stmt.orelse, active_nonlocals, bound
+                )
+            else:
+                bound.difference_update(_extract_shallow_deleted_names(stmt))
+            continue
+        bound.difference_update(_extract_shallow_deleted_names(stmt))
         if isinstance(stmt, ast.Assign) and stmt.value is not None:
             for tgt in stmt.targets:
                 bound.update(
@@ -816,11 +976,6 @@ def _extract_block_definite_bindings(
                 for n in _extract_definite_target_names(stmt.target)
                 if _can_bind_in_fn_scope(n, active_nonlocals)
             )
-        elif isinstance(
-            stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-        ):
-            if _can_bind_in_fn_scope(stmt.name, active_nonlocals):
-                bound.add(stmt.name)
         elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
             imp_names: Set[str] = set()
             _record_import_names(stmt, imp_names)
@@ -829,11 +984,6 @@ def _extract_block_definite_bindings(
                 for n in imp_names
                 if _can_bind_in_fn_scope(n, active_nonlocals)
             )
-        elif isinstance(stmt, ast.If) and stmt.body and stmt.orelse:
-            bound.update(_extract_if_exhaustive_bindings(stmt, active_nonlocals))
-        for sub in ast.walk(stmt):
-            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Del):
-                bound.discard(sub.id)
     return bound
 
 
@@ -856,6 +1006,8 @@ def _push_compound_children(
     unit_mutations: AbstractSet[str],
     state: _CellBindingState,
     stack: List[_StackFrame],
+    *,
+    unconditional_post_del: bool = False,
 ) -> bool:
     """Pushes child nodes of compound control-flow statements with branch and loop state."""
     is_br = frame.is_branched
@@ -878,8 +1030,12 @@ def _push_compound_children(
             )
         ):
             exh_bound = _extract_if_exhaustive_bindings(curr, act_nl)
-            state.pre_bound.update(exh_bound)
-            state.pre_unbound.difference_update(exh_bound)
+            if exh_bound:
+                stack.append(
+                    _StackFrame(
+                        curr, is_br, in_lp, act_nl, post_pre_bound=exh_bound
+                    )
+                )
         _push_seq(stack, curr.orelse, is_br if else_span else True, in_lp, act_nl)
         _push_seq(stack, curr.body, is_br if body_span else True, in_lp, act_nl)
         stack.append(_StackFrame(curr.test, is_br, in_lp, act_nl))
@@ -991,14 +1147,18 @@ def _push_compound_children(
                 if not h_br:
                     state.pre_bound.add(curr.name)
                     state.pre_unbound.discard(curr.name)
-            elif _is_pos_before_span(c_line, c_col, span):
-                state.pre_bound.discard(curr.name)
-                state.pre_unbound.add(curr.name)
-                state.pre_mutated.add(curr.name)
-            if _is_pos_after_span(c_line, c_col, span):
-                state.post_mutated.add(curr.name)
-            if in_lp:
-                state.loop_mutated.add(curr.name)
+                if in_lp:
+                    state.loop_mutated.add(curr.name)
+            else:
+                _record_deletion_at_pos(
+                    curr.name,
+                    c_line,
+                    c_col,
+                    span,
+                    frame,
+                    state,
+                    unconditional_post_del=unconditional_post_del,
+                )
         _push_seq(stack, curr.body, h_br, in_lp, act_nl)
         if curr.type is not None:
             stack.append(_StackFrame(curr.type, True, in_lp, act_nl))
@@ -1039,8 +1199,8 @@ def _push_compound_children(
 
 
 def _is_closure_factory_scope(scope_node: ast.AST) -> bool:
-    """Checks whether a nested function or class can return a closure when called."""
-    if isinstance(scope_node, ast.ClassDef):
+    """Checks whether a nested function or class can return a closure or generator/coroutine."""
+    if isinstance(scope_node, (ast.ClassDef, ast.AsyncFunctionDef)):
         return True
     for sub in ast.iter_child_nodes(scope_node):
         for desc in ast.walk(sub):
@@ -1052,10 +1212,44 @@ def _is_closure_factory_scope(scope_node: ast.AST) -> bool:
                     ast.ClassDef,
                     ast.Lambda,
                     ast.GeneratorExp,
+                    ast.Yield,
+                    ast.YieldFrom,
                 ),
             ):
                 return True
     return False
+
+
+def _extract_fn_returned_closure_refs(
+    fn_node: ast.AST,
+    scope_ctx: Optional[_FnScopeContext] = None,
+) -> Set[str]:
+    """Extracts non-local variable/callable names returned by a nested function."""
+    if not isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return set()
+    own_locals = _extract_single_node_local_names(
+        fn_node,
+        include_globals=False,
+        include_nonlocals=False,
+        include_self_name=False,
+    )
+    ret_exprs: List[ast.AST] = []
+    stack: List[ast.AST] = list(fn_node.body)
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, _INNER_SCOPE_TYPES):
+            continue
+        if isinstance(curr, ast.Return) and curr.value is not None:
+            ret_exprs.append(curr.value)
+            continue
+        stack.extend(ast.iter_child_nodes(curr))
+    if not ret_exprs:
+        return set()
+    ret_calls: Set[str] = set()
+    _, _, ret_loads = _extract_expr_closure_and_load_info(
+        ret_exprs, scope_ctx, called_names_out=ret_calls
+    )
+    return (ret_loads | ret_calls) - own_locals
 
 
 def _handle_nested_scope_node(
@@ -1069,6 +1263,10 @@ def _handle_nested_scope_node(
     stack: List[_StackFrame],
     scope_ctx: Optional[_FnScopeContext] = None,
     factory_names: Optional[Set[str]] = None,
+    fn_return_refs: Optional[Dict[str, Set[str]]] = None,
+    alias_edges: Optional[List[Tuple[str, Set[str]]]] = None,
+    call_edges: Optional[List[Tuple[str, Set[str]]]] = None,
+    sibling_nl_deletions: Optional[Set[str]] = None,
 ) -> bool:
     """Processes nested function, class, lambda, or comprehension scopes during cell analysis."""
     if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -1081,18 +1279,27 @@ def _handle_nested_scope_node(
         ) and _strictly_encloses_span(curr, span)
         if not enclosing_cls:
             free_r = _extract_cached_scope_free_reads(curr)
-            nl_mut = _extract_closure_nonlocal_mutations(curr)
+            nl_mut, nl_del = _extract_closure_nonlocal_mutations_and_deletions(
+                curr
+            )
+            if sibling_nl_deletions is not None and nl_del:
+                sibling_nl_deletions.update(nl_del)
             sib_name = (
                 curr.name
                 if _can_bind_in_fn_scope(curr.name, frame.active_nonlocals)
                 else None
             )
-            if (
-                sib_name is not None
-                and factory_names is not None
-                and _is_closure_factory_scope(curr)
-            ):
-                factory_names.add(sib_name)
+            if sib_name is not None:
+                if factory_names is not None and _is_closure_factory_scope(curr):
+                    factory_names.add(sib_name)
+                if fn_return_refs is not None and isinstance(
+                    curr, (ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
+                    ret_refs = _extract_fn_returned_closure_refs(curr, scope_ctx)
+                    if ret_refs:
+                        fn_return_refs.setdefault(sib_name, set()).update(
+                            ret_refs
+                        )
             sibling_closures.append((sib_name, free_r, nl_mut))
             if _is_pos_after_span(estart, c_col, span):
                 state.post_reads.update(free_r)
@@ -1128,18 +1335,60 @@ def _handle_nested_scope_node(
         return True
 
     if isinstance(curr, _COMPREHENSION_TYPES):
-        w_names = _extract_comprehension_walrus_names(curr)
-        comp_frame = (
-            frame._replace(is_branched=True)
-            if _is_lazy_genexp(curr, scope_ctx)
-            else frame
-        )
-        _record_binding_at_pos(w_names, c_line, c_col, span, comp_frame, state)
+        if curr.generators:
+            hdr_w = _extract_comprehension_walrus_names(curr.generators[0].iter)
+            if hdr_w:
+                _record_binding_at_pos(
+                    hdr_w, c_line, c_col, span, frame, state
+                )
+        body_w = _extract_comprehension_body_walrus_names(curr)
+        if body_w:
+            _record_binding_at_pos(
+                body_w,
+                c_line,
+                c_col,
+                span,
+                frame._replace(is_branched=True),
+                state,
+            )
         c_reads, c_muts = _extract_comprehension_deferred_closure_info(
             curr, scope_ctx
         )
         if c_reads or c_muts:
             sibling_closures.append((None, c_reads, c_muts))
+        if alias_edges is not None:
+            comp_targets: Set[str] = set()
+            comp_carriers: List[ast.AST] = []
+            comp_sub_stack: List[ast.AST] = list(ast.iter_child_nodes(curr))
+            while comp_sub_stack:
+                sub = comp_sub_stack.pop()
+                if isinstance(sub, ast.comprehension):
+                    comp_targets.update(_extract_store_names_in_node(sub.target))
+                elif isinstance(sub, (ast.NamedExpr, ast.Call)):
+                    comp_carriers.append(sub)
+                comp_sub_stack.extend(
+                    iter_nested_scope_header_nodes(sub)
+                    if isinstance(
+                        sub,
+                        (
+                            ast.FunctionDef,
+                            ast.AsyncFunctionDef,
+                            ast.ClassDef,
+                            ast.Lambda,
+                        ),
+                    )
+                    else ast.iter_child_nodes(sub)
+                )
+            for c_node in comp_carriers:
+                _record_carrier_closures_and_aliases(
+                    c_node,
+                    frame,
+                    sibling_closures,
+                    alias_edges,
+                    scope_ctx,
+                    call_edges,
+                    excluded_names=comp_targets,
+                )
         if _is_pos_after_span(c_line, c_col, span):
             state.post_reads.update(
                 _extract_expr_scope_free_reads(curr, include_header=True)
@@ -1156,6 +1405,8 @@ def _record_carrier_closures_and_aliases(
     alias_edges: List[Tuple[str, Set[str]]],
     scope_ctx: Optional[_FnScopeContext] = None,
     call_edges: Optional[List[Tuple[str, Set[str]]]] = None,
+    *,
+    excluded_names: AbstractSet[str] = frozenset(),
 ) -> None:
     """Extracts inline closures and alias edges from assignment or mutating call nodes."""
     carrier = _extract_closure_carrier_targets_and_values(curr)
@@ -1165,7 +1416,8 @@ def _record_carrier_closures_and_aliases(
     valid_targets = [
         t
         for t in c_targets
-        if _can_bind_in_fn_scope(t, frame.active_nonlocals)
+        if t not in excluded_names
+        and _can_bind_in_fn_scope(t, frame.active_nonlocals)
     ]
     if not valid_targets:
         return
@@ -1173,6 +1425,10 @@ def _record_carrier_closures_and_aliases(
     c_reads, c_muts, c_loads = _extract_expr_closure_and_load_info(
         c_values, scope_ctx, called_names_out=c_calls
     )
+    if excluded_names:
+        c_reads -= set(excluded_names)
+        c_loads -= set(excluded_names)
+        c_calls -= set(excluded_names)
     for t_name in valid_targets:
         if c_reads or c_muts:
             sibling_closures.append((t_name, set(c_reads), set(c_muts)))
@@ -1189,6 +1445,8 @@ def _record_simple_node_bindings_and_reads(
     span: _SpanBounds,
     frame: _StackFrame,
     state: _CellBindingState,
+    *,
+    unconditional_post_del: bool = False,
 ) -> None:
     """Records bindings, deletions, and post-span reads for leaf/simple AST nodes."""
     if isinstance(curr, ast.AugAssign) and isinstance(curr.target, ast.Name):
@@ -1203,14 +1461,15 @@ def _record_simple_node_bindings_and_reads(
         elif isinstance(curr.ctx, ast.Del) and _can_bind_in_fn_scope(
             curr.id, frame.active_nonlocals
         ):
-            if _is_pos_before_span(c_line, c_col, span):
-                state.pre_bound.discard(curr.id)
-                state.pre_unbound.add(curr.id)
-                state.pre_mutated.add(curr.id)
-            if _is_pos_after_span(c_line, c_col, span):
-                state.post_mutated.add(curr.id)
-            if frame.in_loop:
-                state.loop_mutated.add(curr.id)
+            _record_deletion_at_pos(
+                curr.id,
+                c_line,
+                c_col,
+                span,
+                frame,
+                state,
+                unconditional_post_del=unconditional_post_del,
+            )
         elif isinstance(curr.ctx, ast.Load) and _is_pos_after_span(
             c_line, c_col, span
         ):
@@ -1252,9 +1511,19 @@ def _analyze_enclosing_fn_cells_uncached(
         pre_unbound=set(),
     )
     sibling_closures: List[Tuple[Optional[str], Set[str], Set[str]]] = []
+    concurrent_sib_indices: Set[int] = set()
     alias_edges: List[Tuple[str, Set[str]]] = []
     call_edges: List[Tuple[str, Set[str]]] = []
     factory_names: Set[str] = set()
+    fn_return_refs: Dict[str, Set[str]] = {}
+    sibling_nl_deletions: Set[str] = set()
+    enclosed_fn_name: Optional[str] = (
+        enclosed_fn.name
+        if isinstance(enclosed_fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        else None
+    )
+    enclosed_fn_call_count = 0
+    enclosed_fn_multi_invoked = False
 
     stack: List[_StackFrame] = [
         _StackFrame(stmt, False, False, None)
@@ -1262,6 +1531,10 @@ def _analyze_enclosing_fn_cells_uncached(
     ]
     while stack:
         frame = stack.pop()
+        if frame.post_pre_bound is not None:
+            state.pre_bound.update(frame.post_pre_bound)
+            state.pre_unbound.difference_update(frame.post_pre_bound)
+            continue
         curr = frame.node
         c_line = getattr(curr, "lineno", None)
         c_col = getattr(curr, "col_offset", None)
@@ -1273,6 +1546,8 @@ def _analyze_enclosing_fn_cells_uncached(
             _record_binding_at_pos(
                 (curr.name,), estart, c_col, span, frame, state
             )
+            if frame.in_loop:
+                enclosed_fn_multi_invoked = True
             _push_seq(
                 stack,
                 list(iter_nested_scope_header_nodes(curr)),
@@ -1304,6 +1579,19 @@ def _analyze_enclosing_fn_cells_uncached(
                 )
             continue
 
+        prev_sib_len = len(sibling_closures)
+        eff_line = (
+            _node_earliest_start_lineno(curr)
+            if isinstance(
+                curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            )
+            else c_line
+        )
+        is_conc_pos = (
+            enclosed_fn is not None
+            or frame.in_loop
+            or not _is_pos_after_span(eff_line, c_col, span)
+        )
         if _handle_nested_scope_node(
             curr,
             c_line,
@@ -1315,8 +1603,25 @@ def _analyze_enclosing_fn_cells_uncached(
             stack,
             scope_ctx,
             factory_names,
+            fn_return_refs,
+            alias_edges,
+            call_edges,
+            sibling_nl_deletions,
         ):
+            if is_conc_pos:
+                concurrent_sib_indices.update(
+                    range(prev_sib_len, len(sibling_closures))
+                )
             continue
+
+        if enclosed_fn_name is not None and isinstance(curr, ast.Call):
+            if (
+                isinstance(curr.func, ast.Name)
+                and curr.func.id == enclosed_fn_name
+            ):
+                enclosed_fn_call_count += 1
+                if frame.in_loop or enclosed_fn_call_count >= 2:
+                    enclosed_fn_multi_invoked = True
 
         _record_carrier_closures_and_aliases(
             curr,
@@ -1326,14 +1631,30 @@ def _analyze_enclosing_fn_cells_uncached(
             scope_ctx,
             call_edges,
         )
+        if is_conc_pos:
+            concurrent_sib_indices.update(
+                range(prev_sib_len, len(sibling_closures))
+            )
 
         if _push_compound_children(
-            curr, span, frame, unit_mutations, state, stack
+            curr,
+            span,
+            frame,
+            unit_mutations,
+            state,
+            stack,
+            unconditional_post_del=enclosed_fn is not None,
         ):
             continue
 
         _record_simple_node_bindings_and_reads(
-            curr, c_line, c_col, span, frame, state
+            curr,
+            c_line,
+            c_col,
+            span,
+            frame,
+            state,
+            unconditional_post_del=enclosed_fn is not None,
         )
 
         child_nodes: Sequence[ast.AST] = (
@@ -1351,16 +1672,43 @@ def _analyze_enclosing_fn_cells_uncached(
             frame.active_nonlocals,
         )
 
+    if enclosed_fn is not None and enclosed_fn_multi_invoked:
+        state.loop_mutated.update(unit_mutations)
+        state.loop_mutated.update(_extract_closure_nonlocal_mutations(enclosed_fn))
+
+    if sibling_nl_deletions:
+        del_locals = sibling_nl_deletions & fn_locals
+        state.pre_bound.difference_update(del_locals)
+        state.pre_unbound.update(del_locals)
+
     for t_name, called_set in call_edges:
-        factory_targets = called_set & factory_names
-        if factory_targets:
-            alias_edges.append((t_name, factory_targets))
+        alias_targets: Set[str] = set(called_set & factory_names)
+        visited_fn_refs: Set[str] = set()
+        pending_fn_refs = list(called_set)
+        while pending_fn_refs:
+            fn_ref = pending_fn_refs.pop()
+            if fn_ref in visited_fn_refs:
+                continue
+            visited_fn_refs.add(fn_ref)
+            if fn_ref in factory_names:
+                alias_targets.add(fn_ref)
+            for ret_ref in fn_return_refs.get(fn_ref, ()):
+                alias_targets.add(ret_ref)
+                if ret_ref in fn_return_refs or ret_ref in factory_names:
+                    pending_fn_refs.append(ret_ref)
+        if alias_targets:
+            alias_edges.append((t_name, alias_targets))
 
     sibling_closures = _propagate_sibling_closures(
         sibling_closures,
         post_reads=state.post_reads,
         alias_edges=alias_edges,
     )
+    concurrent_sib_vars: Set[str] = set()
+    for s_idx in concurrent_sib_indices:
+        _, s_reads, s_muts = sibling_closures[s_idx]
+        concurrent_sib_vars.update(s_reads)
+        concurrent_sib_vars.update(s_muts)
     all_sib_nl = (
         set().union(*(nl for _, _, nl in sibling_closures))
         if sibling_closures
@@ -1377,6 +1725,7 @@ def _analyze_enclosing_fn_cells_uncached(
         all_sibling_nonlocal_mutations=all_sib_nl,
         alias_edges=alias_edges,
         pre_unbound=state.pre_unbound,
+        concurrent_sibling_vars=concurrent_sib_vars,
     )
 
 
@@ -1583,6 +1932,9 @@ def _check_sibling_closure_sharing(
     eff_input_set: AbstractSet[str],
     sub_mutated: AbstractSet[str],
     chain_infos: Sequence[_EnclosingFnCellInfo],
+    *,
+    is_suspended: bool = False,
+    is_async: bool = False,
 ) -> bool:
     """Check 4: sibling closure referenced by unit shares a mutated cell with the unit."""
     if not chain_infos:
@@ -1590,6 +1942,27 @@ def _check_sibling_closure_sharing(
     all_chain_locals: Set[str] = set().union(
         *(info.fn_locals for info in chain_infos)
     )
+    if is_suspended:
+        last_info = chain_infos[-1]
+        susp_cands = (
+            set(sub_mutated)
+            if is_async
+            else (
+                set(sub_mutated)
+                & (
+                    set(eff_input_set)
+                    | last_info.pre_bound
+                    | last_info.pre_mutated
+                    | last_info.all_sibling_nonlocal_mutations
+                )
+            )
+        )
+        if bool(
+            susp_cands
+            & last_info.fn_locals
+            & set(last_info.concurrent_sibling_vars)
+        ):
+            return True
     all_sib_closures = _propagate_sibling_closures(
         [sib for info in chain_infos for sib in info.sibling_closures],
         alias_edges=[
@@ -1662,7 +2035,8 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     intra_nl_mutators = _collect_unit_nonlocal_mutators(
         ctx.candidate_stmts, mod_tree=ctx.mod_tree
     )
-    if ctx.is_subroutine and (ctx.has_yield or ctx.is_async):
+    is_suspended = ctx.is_subroutine and (ctx.has_yield or ctx.is_async)
+    if is_suspended:
         if bool(unit_mutated_names & (enc_escaping | nonlocal_set)) or bool(
             intra_nl_mutators
         ):
@@ -1681,18 +2055,24 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         else set()
     )
     if ctx.is_subroutine:
-        if ctx.has_yield or ctx.is_async:
+        if is_suspended:
             unit_closure_reads.update(ctx.inputs)
     else:
         unit_closure_reads.update(ctx.free_vars)
 
-    intra_closure_reads: Set[str] = set(unit_closure_reads) | nonlocal_set
-    if ctx.is_subroutine:
-        intra_closure_reads.update(enc_escaping & unit_mutated_names)
+    intra_closure_reads: Set[str] = (
+        set(unit_closure_reads)
+        if ctx.is_subroutine
+        else (set(unit_closure_reads) | nonlocal_set)
+    )
 
     eff_input_set = set(ctx.inputs) | set(ctx.free_vars) | nonlocal_set
     if ctx.is_subroutine and bool(
-        unit_closure_reads & enc_outer_globals & eff_input_set
+        unit_closure_reads
+        & (
+            (unit_mutated_names & (enc_escaping | nonlocal_set))
+            | (enc_outer_globals & eff_input_set)
+        )
     ):
         return True
     unit_mutations = unit_mutated_names if ctx.is_subroutine else set()
@@ -1710,36 +2090,35 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         mod_tree=ctx.mod_tree,
     )
 
-    if _check_intra_unit_nonlocal_mutators(
-        ctx.candidate_stmts,
-        intra_nl_mutators,
-        ctx.unit_top_locals,
-        nonlocal_set,
-        intra_closure_reads,
-        chain_infos,
-        is_subroutine=ctx.is_subroutine,
-    ):
-        return True
-
     captured_candidates = intra_closure_reads & (
         eff_input_set | ((store_set | output_set) if ctx.is_subroutine else set())
     )
-    if _check_captured_cell_mutations(
-        captured_candidates,
-        eff_input_set,
-        chain_infos,
-        unit_closure_reads=unit_closure_reads,
-    ):
-        return True
-
     sub_mutated = (
         unit_mutated_names
         if ctx.is_subroutine
         else (nonlocal_set & unit_mutated_names)
     )
-    if _check_sibling_closure_sharing(
-        eff_input_set, sub_mutated, chain_infos
-    ):
-        return True
-
-    return False
+    return (
+        _check_intra_unit_nonlocal_mutators(
+            ctx.candidate_stmts,
+            intra_nl_mutators,
+            ctx.unit_top_locals,
+            nonlocal_set,
+            intra_closure_reads,
+            chain_infos,
+            is_subroutine=ctx.is_subroutine,
+        )
+        or _check_captured_cell_mutations(
+            captured_candidates,
+            eff_input_set,
+            chain_infos,
+            unit_closure_reads=unit_closure_reads,
+        )
+        or _check_sibling_closure_sharing(
+            eff_input_set,
+            sub_mutated,
+            chain_infos,
+            is_suspended=is_suspended,
+            is_async=ctx.is_async,
+        )
+    )

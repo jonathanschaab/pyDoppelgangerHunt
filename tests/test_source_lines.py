@@ -3351,6 +3351,367 @@ _CLOSURE_CELL_SCENARIOS = [
         },
         True,
     ),
+    (
+        "generator_mutating_local_cell_captured_by_sibling_closure",
+        (
+            "def outer_gen_sib(items, callbacks):\n"
+            "    acc = 0\n"
+            "    callbacks.append(lambda: acc)\n"
+            "    for x in items:\n"
+            "        acc += x\n"
+            "        yield x\n"
+        ),
+        {
+            "start": 4,
+            "end": 6,
+            "kind": "compound_block",
+            "source_code": "for x in items:\n    acc += x\n    yield x\n",
+        },
+        True,
+    ),
+    (
+        "multicall_nested_fn_mutating_and_capturing_nonlocal_cell",
+        (
+            "def outer_mc():\n"
+            "    total = 0\n"
+            "    cbs = []\n"
+            "    def inner_step(items):\n"
+            "        nonlocal total\n"
+            "        for x in items:\n"
+            "            total += x\n"
+            "            cbs.append(lambda y, x=x: y + total + x)\n"
+            "    inner_step([1])\n"
+            "    inner_step([2])\n"
+            "    return cbs\n"
+        ),
+        {
+            "start": 6,
+            "end": 8,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    total += x\n"
+                "    cbs.append(lambda y, x=x: y + total + x)\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "neg_exhaustive_if_else_after_del_rebinds_before_unit",
+        (
+            "def build_del_rebind(items, cond):\n"
+            "    scale = 0\n"
+            "    cbs = []\n"
+            "    if cond:\n"
+            "        del scale\n"
+            "        scale = 1\n"
+            "    else:\n"
+            "        scale = 2\n"
+            "    for item in items:\n"
+            "        cbs.append(lambda x, item=item: x * scale + item)\n"
+            "    return cbs\n"
+        ),
+        {
+            "start": 9,
+            "end": 10,
+            "kind": "compound_block",
+            "source_code": (
+                "for item in items:\n"
+                "    cbs.append(lambda x, item=item: x * scale + item)\n"
+            ),
+        },
+        False,
+    ),
+    (
+        "exhaustive_if_else_with_nested_single_branch_del_not_definite",
+        (
+            "def build_nested_del(items, cond, sub):\n"
+            "    cbs = []\n"
+            "    if cond:\n"
+            "        scale = 1\n"
+            "        if sub:\n"
+            "            del scale\n"
+            "    else:\n"
+            "        scale = 2\n"
+            "    for item in items:\n"
+            "        cbs.append(lambda x, item=item: x * scale + item)\n"
+            "    return cbs\n"
+        ),
+        {
+            "start": 9,
+            "end": 10,
+            "kind": "compound_block",
+            "source_code": (
+                "for item in items:\n"
+                "    cbs.append(lambda x, item=item: x * scale + item)\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "closure_factory_returning_sibling_closure_and_pop",
+        (
+            "def outer_ret_sib(items):\n"
+            "    acc = 0\n"
+            "    def read_acc():\n"
+            "        return acc\n"
+            "    def get_reader():\n"
+            "        return read_acc\n"
+            "    cbs = [get_reader()]\n"
+            "    fn = cbs.pop()\n"
+            "    out = []\n"
+            "    for x in items:\n"
+            "        acc += x\n"
+            "        out.append(fn() + x)\n"
+            "    return acc, out\n"
+        ),
+        {
+            "start": 10,
+            "end": 12,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    acc += x\n"
+                "    out.append(fn() + x)\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "generator_factory_assigned_to_variable",
+        (
+            "def outer_gen_fac(items):\n"
+            "    acc = 0\n"
+            "    def make_gen():\n"
+            "        yield acc\n"
+            "    g = make_gen()\n"
+            "    out = []\n"
+            "    for x in items:\n"
+            "        acc += x\n"
+            "        out.append(next(g) + x)\n"
+            "    return acc, out\n"
+        ),
+        {
+            "start": 7,
+            "end": 9,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    acc += x\n"
+                "    out.append(next(g) + x)\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "intra_unit_mutator_self_registering_in_body",
+        (
+            "def outer_self_reg(callbacks):\n"
+            "    def get_count():\n"
+            "        return count\n"
+            "    count = 0\n"
+            "    def inc():\n"
+            "        nonlocal count\n"
+            "        count += 1\n"
+            "        callbacks.append(inc)\n"
+            "    inc()\n"
+            "    return get_count\n"
+        ),
+        {
+            "start": 4,
+            "end": 9,
+            "kind": "compound_block",
+            "source_code": (
+                "count = 0\n"
+                "def inc():\n"
+                "    nonlocal count\n"
+                "    count += 1\n"
+                "    callbacks.append(inc)\n"
+                "inc()\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "intra_unit_nested_factory_returning_mutator",
+        (
+            "def outer_nested_fac(callbacks):\n"
+            "    def get_count():\n"
+            "        return count\n"
+            "    count = 0\n"
+            "    def make_inc():\n"
+            "        def inc():\n"
+            "            nonlocal count\n"
+            "            count += 1\n"
+            "        return inc\n"
+            "    callbacks.append(make_inc())\n"
+            "    return get_count\n"
+        ),
+        {
+            "start": 4,
+            "end": 10,
+            "kind": "compound_block",
+            "source_code": (
+                "count = 0\n"
+                "def make_inc():\n"
+                "    def inc():\n"
+                "        nonlocal count\n"
+                "        count += 1\n"
+                "    return inc\n"
+                "callbacks.append(make_inc())\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "neg_sync_subroutine_nonlocal_mut_with_post_def_outer_binding",
+        (
+            "def outer_post_def(log):\n"
+            "    def worker(items):\n"
+            "        nonlocal total\n"
+            "        for x in items:\n"
+            "            total += x * 2\n"
+            "            log(x)\n"
+            "    total = 0\n"
+            "    worker([1, 2])\n"
+            "    return total\n"
+        ),
+        {
+            "start": 4,
+            "end": 6,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    total += x * 2\n"
+                "    log(x)\n"
+            ),
+        },
+        False,
+    ),
+    (
+        "neg_len_of_closure_container_is_not_closure_alias",
+        (
+            "def outer_len_cbs(items):\n"
+            "    acc = 0\n"
+            "    callbacks = [lambda: acc]\n"
+            "    n = len(callbacks)\n"
+            "    out = []\n"
+            "    for x in items:\n"
+            "        acc += x\n"
+            "        out.append(n + x)\n"
+            "    return acc, out\n"
+        ),
+        {
+            "start": 6,
+            "end": 8,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    acc += x\n"
+                "    out.append(n + x)\n"
+            ),
+        },
+        False,
+    ),
+    (
+        "neg_method_inside_class_does_not_inherit_class_body_nonlocal",
+        (
+            "def outer_cls_method_iso(items, log):\n"
+            "    total = 0\n"
+            "    class Box:\n"
+            "        nonlocal total\n"
+            "        total = 1\n"
+            "        def run(self):\n"
+            "            total = 0\n"
+            "            for x in items:\n"
+            "                total += x\n"
+            "                log(x)\n"
+            "            return total\n"
+            "    return Box, total\n"
+        ),
+        {
+            "start": 8,
+            "end": 10,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    total += x\n"
+                "    log(x)\n"
+            ),
+        },
+        False,
+    ),
+    (
+        "eager_listcomp_walrus_body_is_conditional_not_pre_bound",
+        (
+            "def build_comp_walrus(items, empty_seq):\n"
+            "    cbs = []\n"
+            "    _ = [(scale := v) for v in empty_seq]\n"
+            "    for item in items:\n"
+            "        cbs.append(lambda x, item=item: x * scale + item)\n"
+            "    return cbs\n"
+        ),
+        {
+            "start": 4,
+            "end": 5,
+            "kind": "compound_block",
+            "source_code": (
+                "for item in items:\n"
+                "    cbs.append(lambda x, item=item: x * scale + item)\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "neg_lazy_genexp_first_iterable_walrus_is_eager_not_lazy_mutator",
+        (
+            "def build_gen_hdr_walrus(items):\n"
+            "    if items:\n"
+            "        gen = (x * 2 for x in (seq := list(items)))\n"
+            "    else:\n"
+            "        seq = []\n"
+            "        gen = iter(())\n"
+            "    return list(gen), seq\n"
+        ),
+        {
+            "start": 2,
+            "end": 6,
+            "kind": "compound_block",
+            "source_code": (
+                "if items:\n"
+                "    gen = (x * 2 for x in (seq := list(items)))\n"
+                "else:\n"
+                "    seq = []\n"
+                "    gen = iter(())\n"
+            ),
+        },
+        False,
+    ),
+    (
+        "comprehension_append_sibling_closure_carrier",
+        (
+            "def outer_comp_append(items):\n"
+            "    acc = 0\n"
+            "    readers = []\n"
+            "    _ = [readers.append(lambda: acc) for _ in range(2)]\n"
+            "    out = []\n"
+            "    for x in items:\n"
+            "        acc += x\n"
+            "        out.append(readers[0]() + x)\n"
+            "    return acc, out\n"
+        ),
+        {
+            "start": 6,
+            "end": 8,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    acc += x\n"
+                "    out.append(readers[0]() + x)\n"
+            ),
+        },
+        True,
+    ),
 ]
 
 
@@ -3532,8 +3893,16 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
     assert "total" in sc_unbound_nl["conditional_outputs"]
     assert "severed_closure_cell" in sc_unbound_nl["control_flow_hazards"]
 
-    # Branch-only or deleted pre-unit nonlocal is not promoted to input
-    for bad_init_stmt in ("if flag:\n        total = 5", "total = 5\n    del total"):
+    # Branch-only or deleted pre-unit nonlocal (including post-def del or sibling del) is not promoted to input
+    for bad_init_stmt, post_stmt in (
+        ("if flag:\n        total = 5", "return inner_bd"),
+        ("total = 5\n    del total", "return inner_bd"),
+        ("total = 5", "del total\n    return inner_bd"),
+        (
+            "total = 5\n    def clear():\n        nonlocal total\n        del total",
+            "return inner_bd, clear",
+        ),
+    ):
         branch_or_del_nl_src = (
             "def outer_bd(items, flag):\n"
             f"    {bad_init_stmt}\n"
@@ -3542,7 +3911,7 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
             "        for x in items:\n"
             "            if x > 0:\n"
             "                total = x * 2\n"
-            "    return inner_bd\n"
+            f"    {post_stmt}\n"
         )
         bd_tree = ast.parse(branch_or_del_nl_src)
         for_node = next(n for n in ast.walk(bd_tree) if isinstance(n, ast.For))
