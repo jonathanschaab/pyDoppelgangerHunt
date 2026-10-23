@@ -2068,22 +2068,20 @@ def _inspect_unit_scope(
             live_in_visitor = _UnitLiveInVisitor(1, 10**9, include_annotations=False)
             for stmt in candidate_stmts:
                 live_in_visitor.visit(stmt)
+            excluded_cond_vars = (
+                set(visitor.params) | set(visitor.globals) | BUILTIN_NAMES
+            )
             cond_live_ins = [
                 v
                 for v in sorted(live_in_visitor.live_ins)
                 if v in visitor.loads
-                and v not in visitor.params
-                and v not in visitor.globals
-                and v not in BUILTIN_NAMES
+                and v not in excluded_cond_vars
                 and v not in visitor.read_before_write
             ]
             cond_escaping_cands = [
                 v
                 for v in sorted(cond_assigned - def_assigned)
-                if v not in visitor.params
-                and v not in visitor.globals
-                and v not in BUILTIN_NAMES
-                and v not in visitor.read_before_write
+                if v not in excluded_cond_vars
             ]
             if cond_live_ins or cond_escaping_cands:
                 pre_bound: Set[str] = set()
@@ -2305,6 +2303,9 @@ def _inspect_unit_scope(
                                 nonlocals=visitor.nonlocals,
                                 has_yield=visitor.has_yield,
                                 is_async=visitor.is_async,
+                                skip_pre_unit_closures=bool(
+                                    unit.get("skip_pre_unit_closures")
+                                ),
                             )
                         )
                     ):

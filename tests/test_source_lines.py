@@ -3567,18 +3567,19 @@ _CLOSURE_CELL_SCENARIOS = [
         "neg_sync_subroutine_nonlocal_mut_with_post_def_outer_binding",
         (
             "def outer_post_def(log):\n"
+            "    total = 0\n"
             "    def worker(items):\n"
             "        nonlocal total\n"
             "        for x in items:\n"
             "            total += x * 2\n"
             "            log(x)\n"
-            "    total = 0\n"
             "    worker([1, 2])\n"
+            "    total += 1\n"
             "    return total\n"
         ),
         {
-            "start": 4,
-            "end": 6,
+            "start": 5,
+            "end": 7,
             "kind": "compound_block",
             "source_code": (
                 "for x in items:\n"
@@ -3709,6 +3710,100 @@ _CLOSURE_CELL_SCENARIOS = [
                 "    acc += x\n"
                 "    out.append(readers[0]() + x)\n"
             ),
+        },
+        True,
+    ),
+    (
+        "multilevel_sibling_closure_nonlocal_deletion_in_inner_scope",
+        (
+            "def outer_ml_del(items):\n"
+            "    total = 5\n"
+            "    def inner():\n"
+            "        def clear():\n"
+            "            nonlocal total\n"
+            "            del total\n"
+            "        clear()\n"
+            "        nonlocal total\n"
+            "        for x in items:\n"
+            "            if x > 0:\n"
+            "                total = x * 2\n"
+            "    return inner\n"
+        ),
+        {
+            "start": 9,
+            "end": 11,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    if x > 0:\n"
+                "        total = x * 2\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "conditional_augassign_on_unbound_nonlocal_cell",
+        (
+            "def outer_unb_aug():\n"
+            "    def inner_unb(items):\n"
+            "        nonlocal total\n"
+            "        for x in items:\n"
+            "            if x > 0:\n"
+            "                total += x * 2\n"
+            "    inner_unb([-1, -2])\n"
+            "    total = 0\n"
+            "    return inner_unb\n"
+        ),
+        {
+            "start": 4,
+            "end": 6,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    if x > 0:\n"
+                "        total += x * 2\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "neg_len_of_inline_lambda_comprehension_is_not_closure_alias",
+        (
+            "def outer_len_inline_comp(items):\n"
+            "    acc = 0\n"
+            "    n = len([lambda: acc for _ in range(3)])\n"
+            "    out = []\n"
+            "    for x in items:\n"
+            "        acc += x\n"
+            "        out.append(n + x)\n"
+            "    return acc, out\n"
+        ),
+        {
+            "start": 5,
+            "end": 7,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    acc += x\n"
+                "    out.append(n + x)\n"
+            ),
+        },
+        False,
+    ),
+    (
+        "generator_loop_initialized_cell_captured_by_pre_unit_sibling_closure",
+        (
+            "def outer_gen_loop_init(items, callbacks):\n"
+            "    callbacks.append(lambda: acc)\n"
+            "    for x in items:\n"
+            "        acc = x * 2\n"
+            "        yield x\n"
+        ),
+        {
+            "start": 3,
+            "end": 5,
+            "kind": "compound_block",
+            "source_code": "for x in items:\n    acc = x * 2\n    yield x\n",
         },
         True,
     ),

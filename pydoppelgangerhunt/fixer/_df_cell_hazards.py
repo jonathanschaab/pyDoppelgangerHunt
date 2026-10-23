@@ -625,6 +625,8 @@ def _extract_expr_closure_and_load_info(
     stack: List[Tuple[ast.AST, bool]] = [(n, True) for n in nodes]
     while stack:
         curr, allow_load = stack.pop()
+        if not allow_load:
+            continue
         if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
         if isinstance(curr, ast.Lambda):
@@ -643,10 +645,8 @@ def _extract_expr_closure_and_load_info(
             inline_muts.update(c_muts)
             is_lazy = _is_lazy_genexp(curr, scope_ctx)
             if curr.generators:
-                stack.append(
-                    (curr.generators[0].iter, allow_load and not is_lazy)
-                )
-            if allow_load and not is_lazy:
+                stack.append((curr.generators[0].iter, not is_lazy))
+            if not is_lazy:
                 comp_targets = {
                     n
                     for gen in curr.generators
@@ -673,12 +673,12 @@ def _extract_expr_closure_and_load_info(
             stack.extend((ch, False) for ch in ast.iter_child_nodes(curr))
             continue
         if isinstance(curr, ast.IfExp):
-            stack.append((curr.orelse, allow_load))
-            stack.append((curr.body, allow_load))
+            stack.append((curr.orelse, True))
+            stack.append((curr.body, True))
             stack.append((curr.test, False))
             continue
         if isinstance(curr, ast.Subscript):
-            stack.append((curr.value, allow_load))
+            stack.append((curr.value, True))
             stack.append((curr.slice, False))
             continue
         if isinstance(curr, ast.Call):
@@ -690,7 +690,7 @@ def _extract_expr_closure_and_load_info(
                     or curr.func.id not in scope_ctx.shadowed_names
                 )
             )
-            arg_allow = False if is_non_closure_builtin else allow_load
+            arg_allow = not is_non_closure_builtin
             if isinstance(curr.func, ast.Attribute):
                 stack.append((curr.func.value, arg_allow))
             elif isinstance(curr.func, ast.Name):
@@ -706,10 +706,9 @@ def _extract_expr_closure_and_load_info(
             )
             continue
         if isinstance(curr, ast.Name) and isinstance(curr.ctx, ast.Load):
-            if allow_load:
-                loaded_names.add(curr.id)
+            loaded_names.add(curr.id)
             continue
-        stack.extend((ch, allow_load) for ch in ast.iter_child_nodes(curr))
+        stack.extend((ch, True) for ch in ast.iter_child_nodes(curr))
     return inline_reads, inline_muts, loaded_names
 
 
@@ -1677,9 +1676,8 @@ def _analyze_enclosing_fn_cells_uncached(
         state.loop_mutated.update(_extract_closure_nonlocal_mutations(enclosed_fn))
 
     if sibling_nl_deletions:
-        del_locals = sibling_nl_deletions & fn_locals
-        state.pre_bound.difference_update(del_locals)
-        state.pre_unbound.update(del_locals)
+        state.pre_bound.difference_update(sibling_nl_deletions)
+        state.pre_unbound.update(sibling_nl_deletions)
 
     for t_name, called_set in call_edges:
         alias_targets: Set[str] = set(called_set & factory_names)
@@ -1934,7 +1932,6 @@ def _check_sibling_closure_sharing(
     chain_infos: Sequence[_EnclosingFnCellInfo],
     *,
     is_suspended: bool = False,
-    is_async: bool = False,
 ) -> bool:
     """Check 4: sibling closure referenced by unit shares a mutated cell with the unit."""
     if not chain_infos:
@@ -1942,27 +1939,12 @@ def _check_sibling_closure_sharing(
     all_chain_locals: Set[str] = set().union(
         *(info.fn_locals for info in chain_infos)
     )
-    if is_suspended:
-        last_info = chain_infos[-1]
-        susp_cands = (
-            set(sub_mutated)
-            if is_async
-            else (
-                set(sub_mutated)
-                & (
-                    set(eff_input_set)
-                    | last_info.pre_bound
-                    | last_info.pre_mutated
-                    | last_info.all_sibling_nonlocal_mutations
-                )
-            )
-        )
-        if bool(
-            susp_cands
-            & last_info.fn_locals
-            & set(last_info.concurrent_sibling_vars)
-        ):
-            return True
+    if is_suspended and bool(
+        set(sub_mutated)
+        & chain_infos[-1].fn_locals
+        & set(chain_infos[-1].concurrent_sibling_vars)
+    ):
+        return True
     all_sib_closures = _propagate_sibling_closures(
         [sib for info in chain_infos for sib in info.sibling_closures],
         alias_edges=[
@@ -2000,6 +1982,7 @@ class _UnitClosureHazardContext(NamedTuple):
     nonlocals: Sequence[str] = ()
     has_yield: bool = False
     is_async: bool = False
+    skip_pre_unit_closures: bool = False
 
 
 def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
@@ -2118,7 +2101,6 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
             eff_input_set,
             sub_mutated,
             chain_infos,
-            is_suspended=is_suspended,
-            is_async=ctx.is_async,
+            is_suspended=is_suspended and not ctx.skip_pre_unit_closures,
         )
     )

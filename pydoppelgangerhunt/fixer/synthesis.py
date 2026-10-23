@@ -8,7 +8,10 @@ import re
 import typing
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
-from pydoppelgangerhunt.config import normalize_path_string
+from pydoppelgangerhunt.config import (
+    normalize_path_string,
+    resolve_closure_strictness_mode,
+)
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
@@ -1401,6 +1404,10 @@ def synthesize_shared_helper_code(
     has_precomputed_scopes = (
         scope1 is not None and scope2 is not None and scope is not None
     )
+    _, effective_skip_closures = resolve_closure_strictness_mode(
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+    )
     scopes: List[Dict[str, Any]] = []
     for u_item, s_text, t_item, pre_s in (
         (u1, source_text1, tree1, scope1),
@@ -1408,6 +1415,8 @@ def synthesize_shared_helper_code(
     ):
         if s_text is not None:
             u_item.setdefault("source_text", s_text)
+        if effective_skip_closures:
+            u_item["skip_pre_unit_closures"] = True
         _populate_unit_receiver_metadata(
             u_item, repo_root=repo_root, source_text=s_text, tree=t_item
         )

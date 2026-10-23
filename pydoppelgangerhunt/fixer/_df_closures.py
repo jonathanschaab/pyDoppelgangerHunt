@@ -659,12 +659,18 @@ def _resolve_immediate_scope_in_fn(
             c_start = int(getattr(curr, "lineno", 0) or 0)
             c_end = int(getattr(curr, "end_lineno", c_start) or c_start)
             c_col = int(getattr(curr, "col_offset", 0) or 0)
+            c_end_col = getattr(curr, "end_col_offset", None)
             strictly_inside = (
                 c_start <= u_start
                 and u_end <= c_end
                 and (
                     (c_start, c_end) != (u_start, u_end)
                     or (u_start_col is not None and c_col < u_start_col)
+                    or (
+                        u_end_col is not None
+                        and isinstance(c_end_col, int)
+                        and c_end_col > u_end_col
+                    )
                 )
             )
             if strictly_inside:
