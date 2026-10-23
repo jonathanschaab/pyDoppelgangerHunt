@@ -3807,6 +3807,152 @@ _CLOSURE_CELL_SCENARIOS = [
         },
         True,
     ),
+    (
+        "multicall_enclosed_fn_invoked_in_comprehension",
+        (
+            "def outer_comp_call(groups):\n"
+            "    total = 0\n"
+            "    cbs = []\n"
+            "    def inner_step(items):\n"
+            "        nonlocal total\n"
+            "        total += 1\n"
+            "        for x in items:\n"
+            "            cbs.append(lambda y, x=x: y + total + x)\n"
+            "    _ = [inner_step(g) for g in groups]\n"
+            "    return cbs\n"
+        ),
+        {
+            "start": 7,
+            "end": 8,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    cbs.append(lambda y, x=x: y + total + x)\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "multicall_enclosed_fn_escaping_via_return",
+        (
+            "def outer_ret_fn():\n"
+            "    total = 0\n"
+            "    cbs = []\n"
+            "    def inner_step(items):\n"
+            "        nonlocal total\n"
+            "        total += 1\n"
+            "        for x in items:\n"
+            "            cbs.append(lambda y, x=x: y + total + x)\n"
+            "    return inner_step, cbs\n"
+        ),
+        {
+            "start": 7,
+            "end": 8,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    cbs.append(lambda y, x=x: y + total + x)\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "lazy_genexp_first_iterable_closure_carrier_alias",
+        (
+            "def outer_lazy_hdr_carrier(items):\n"
+            "    acc = 0\n"
+            "    def get_acc():\n"
+            "        return acc\n"
+            "    gen = (f() for f in [get_acc])\n"
+            "    out = []\n"
+            "    for x in items:\n"
+            "        acc += x\n"
+            "        out.append(next(gen) + x)\n"
+            "    return acc, out\n"
+        ),
+        {
+            "start": 7,
+            "end": 9,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    acc += x\n"
+                "    out.append(next(gen) + x)\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "neg_helper_with_eager_sum_genexp_is_not_closure_factory",
+        (
+            "def outer_sum_gen(items):\n"
+            "    acc = 0\n"
+            "    def compute_initial():\n"
+            "        return sum(x * acc for x in items)\n"
+            "    init_val = compute_initial()\n"
+            "    out = []\n"
+            "    for x in items:\n"
+            "        acc += x\n"
+            "        out.append(init_val + x)\n"
+            "    return acc, out\n"
+        ),
+        {
+            "start": 7,
+            "end": 9,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    acc += x\n"
+                "    out.append(init_val + x)\n"
+            ),
+        },
+        False,
+    ),
+    (
+        "conditional_walrus_in_comprehension_first_iterable_not_pre_bound",
+        (
+            "def build_nested_hdr_walrus(items, empty_seq):\n"
+            "    cbs = []\n"
+            "    _ = [x for x in [(scale := v) for v in empty_seq]]\n"
+            "    for item in items:\n"
+            "        cbs.append(lambda x, item=item: x * scale + item)\n"
+            "    return cbs\n"
+        ),
+        {
+            "start": 4,
+            "end": 5,
+            "kind": "compound_block",
+            "source_code": (
+                "for item in items:\n"
+                "    cbs.append(lambda x, item=item: x * scale + item)\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "neg_comprehension_target_shadowing_outer_cell_in_lambda",
+        (
+            "def outer_shadow_target(items):\n"
+            "    acc = [1, 2]\n"
+            "    cbs = [lambda: acc for acc in acc]\n"
+            "    out = []\n"
+            "    for x in items:\n"
+            "        acc = [x]\n"
+            "        out.append(cbs[0]() + x)\n"
+            "    return acc, out\n"
+        ),
+        {
+            "start": 5,
+            "end": 7,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    acc = [x]\n"
+                "    out.append(cbs[0]() + x)\n"
+            ),
+        },
+        False,
+    ),
 ]
 
 
