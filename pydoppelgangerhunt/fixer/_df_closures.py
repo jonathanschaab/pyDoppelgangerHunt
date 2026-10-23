@@ -648,6 +648,12 @@ def _extract_scope_nonlocals_and_outer_globals(
     )
     while stack:
         curr = stack.pop()
+        if isinstance(curr, ast.ClassDef):
+            c_start = int(getattr(curr, "lineno", 0) or 0)
+            c_end = int(getattr(curr, "end_lineno", c_start) or c_start)
+            if u_start <= 0 or (c_start <= u_start and u_end <= c_end):
+                stack.extend(curr.body)
+            continue
         if isinstance(curr, _INNER_SCOPE_TYPES):
             continue
         if isinstance(curr, ast.Nonlocal):

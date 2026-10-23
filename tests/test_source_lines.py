@@ -3224,6 +3224,133 @@ _CLOSURE_CELL_SCENARIOS = [
         },
         False,
     ),
+    (
+        "neg_enclosing_local_class_method_synchronous_nonlocal_mutation",
+        (
+            "def outer_cls_method(log):\n"
+            "    total = 0\n"
+            "    class Worker:\n"
+            "        def run(self, items):\n"
+            "            nonlocal total\n"
+            "            for x in items:\n"
+            "                total += x * 2\n"
+            "                log(x)\n"
+            "    return Worker\n"
+        ),
+        {
+            "start": 6,
+            "end": 8,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    total += x * 2\n"
+                "    log(x)\n"
+            ),
+        },
+        False,
+    ),
+    (
+        "outer_global_captured_by_intra_unit_closure",
+        (
+            "def outer_glob_cap(items):\n"
+            "    global shared_g\n"
+            "    shared_g = 1\n"
+            "    out = []\n"
+            "    for x in items:\n"
+            "        out.append(lambda y, x=x: y + shared_g + x)\n"
+            "    shared_g = 2\n"
+            "    return out\n"
+        ),
+        {
+            "start": 5,
+            "end": 6,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    out.append(lambda y, x=x: y + shared_g + x)\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "multilevel_outer_loop_escaping_nonlocal_unit_mutation",
+        (
+            "def outer_loop_nl(groups):\n"
+            "    total = 0\n"
+            "    cbs = []\n"
+            "    for grp in groups:\n"
+            "        def inner_step(x):\n"
+            "            nonlocal total\n"
+            "            if x > 0:\n"
+            "                total += x\n"
+            "                cbs.append(lambda y: y + total + x)\n"
+            "        inner_step(grp)\n"
+            "    return cbs\n"
+        ),
+        {
+            "start": 7,
+            "end": 9,
+            "kind": "compound_block",
+            "source_code": (
+                "if x > 0:\n"
+                "    total += x\n"
+                "    cbs.append(lambda y: y + total + x)\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "eager_comprehension_aliased_sibling_closure",
+        (
+            "def outer_comp_alias(items):\n"
+            "    acc = 0\n"
+            "    def get_acc():\n"
+            "        return acc\n"
+            "    readers = [get_acc for _ in range(3)]\n"
+            "    out = []\n"
+            "    for x in items:\n"
+            "        acc += x\n"
+            "        out.append(readers[0]() + x)\n"
+            "    return acc, out\n"
+        ),
+        {
+            "start": 7,
+            "end": 9,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    acc += x\n"
+                "    out.append(readers[0]() + x)\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "nested_class_body_nonlocal_unbound_conditional_mutation",
+        (
+            "def outer_cls_nl(items):\n"
+            "    def mid():\n"
+            "        class Box:\n"
+            "            nonlocal total\n"
+            "            for x in items:\n"
+            "                if x > 0:\n"
+            "                    total = x * 2\n"
+            "        return Box\n"
+            "    total = 0\n"
+            "    return mid\n"
+        ),
+        {
+            "start": 5,
+            "end": 7,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    if x > 0:\n"
+                "        total = x * 2\n"
+            ),
+        },
+        True,
+    ),
 ]
 
 
@@ -3404,6 +3531,34 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
     assert "total" not in sc_unbound_nl["inputs"]
     assert "total" in sc_unbound_nl["conditional_outputs"]
     assert "severed_closure_cell" in sc_unbound_nl["control_flow_hazards"]
+
+    # Branch-only or deleted pre-unit nonlocal is not promoted to input
+    for bad_init_stmt in ("if flag:\n        total = 5", "total = 5\n    del total"):
+        branch_or_del_nl_src = (
+            "def outer_bd(items, flag):\n"
+            f"    {bad_init_stmt}\n"
+            "    def inner_bd():\n"
+            "        nonlocal total\n"
+            "        for x in items:\n"
+            "            if x > 0:\n"
+            "                total = x * 2\n"
+            "    return inner_bd\n"
+        )
+        bd_tree = ast.parse(branch_or_del_nl_src)
+        for_node = next(n for n in ast.walk(bd_tree) if isinstance(n, ast.For))
+        sc_bd_nl = inspect_single_unit_scope(
+            {
+                "start": for_node.lineno,
+                "end": for_node.end_lineno,
+                "kind": "compound_block",
+                "source_text": branch_or_del_nl_src,
+                "source_code": "for x in items:\n    if x > 0:\n        total = x * 2\n",
+            },
+            tree=bd_tree,
+        )
+        assert "total" not in sc_bd_nl["inputs"]
+        assert "total" in sc_bd_nl["conditional_outputs"]
+        assert "severed_closure_cell" in sc_bd_nl["control_flow_hazards"]
 
     # 3. Late-bound closure cell end-to-end skip reason and helper synthesis block
     late_cell_src = (
@@ -3718,3 +3873,15 @@ def test_df_cell_hazards_numbered_checks_unit() -> None:
     _scope_cell_info_cache[sentinel_key] = "cached_val"
     _evict_tree_scopes(subtree_fn)
     assert sentinel_key not in _scope_cell_info_cache
+
+    # _find_enclosing_function_chain excludes inner functions at greater col_offset on u_start
+    same_line_tree = ast.parse(
+        "def outer(cond):\n"
+        "    if cond:\n"
+        "        def inner():\n"
+        "            return 1\n"
+    )
+    chain_same_line = _find_enclosing_function_chain(
+        same_line_tree, 3, 4, u_start_col=4
+    )
+    assert [getattr(fn, "name", None) for _, _, fn in chain_same_line] == ["outer"]

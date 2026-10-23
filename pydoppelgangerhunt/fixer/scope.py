@@ -22,12 +22,13 @@ from typing import (
 from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
 from pydoppelgangerhunt.fixer._df_cell_hazards import (
     _UnitClosureHazardContext,
+    _find_enclosing_chain_definite_pre_bound,
     _find_enclosing_function_chain,
     _has_severed_closure_cell_hazard,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
     _extract_comprehension_walrus_names,
-    _extract_scope_escaping_bindings,
+    _extract_scope_nonlocals_and_outer_globals,
     _extract_single_node_local_names,
     iter_nested_scope_header_nodes,
 )
@@ -2103,16 +2104,33 @@ def _inspect_unit_scope(
                             mod_tree, u_start, u_end, u_start_col
                         )
                         if enc_chain:
-                            enc_escaping = _extract_scope_escaping_bindings(
-                                enc_chain[-1][2],
-                                u_start,
-                                u_end,
-                                u_end_col=u_end_col,
-                                u_start_col=u_start_col,
+                            enc_nonlocals, enc_outer_globals = (
+                                _extract_scope_nonlocals_and_outer_globals(
+                                    enc_chain[-1][2],
+                                    u_start,
+                                    u_end,
+                                    u_end_col=u_end_col,
+                                    u_start_col=u_start_col,
+                                )
+                            )
+                            enc_escaping = enc_nonlocals | enc_outer_globals
+                            def_pre_bound = (
+                                _find_enclosing_chain_definite_pre_bound(
+                                    enc_chain,
+                                    u_start,
+                                    u_end,
+                                    u_start_col=u_start_col,
+                                    u_end_col=u_end_col,
+                                    mod_tree=mod_tree,
+                                )
                             )
                             for v in cond_escaping_cands:
                                 if v in enc_escaping:
-                                    if v in pre_bound:
+                                    if (
+                                        v in enc_nonlocals
+                                        and v in pre_bound
+                                        and v in def_pre_bound
+                                    ):
                                         if v not in visitor.loads:
                                             visitor.loads.append(v)
                                         if v not in visitor.read_before_write:

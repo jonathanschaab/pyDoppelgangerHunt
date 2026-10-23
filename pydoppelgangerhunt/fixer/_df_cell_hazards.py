@@ -141,12 +141,12 @@ def _find_enclosing_function_chain(
         if estart <= 0 or estart > u_start or u_end > n_end:
             continue
         n_col = int(getattr(node, "col_offset", 0) or 0)
-        if (
-            u_start in (estart, int(getattr(node, "lineno", estart) or estart))
-            and u_end == n_end
-            and (u_start_col is None or n_col == u_start_col)
-        ):
-            continue
+        n_lineno = int(getattr(node, "lineno", estart) or estart)
+        if u_start in (estart, n_lineno):
+            if u_start_col is not None and n_col > u_start_col:
+                continue
+            if u_end == n_end and (u_start_col is None or n_col == u_start_col):
+                continue
         chain.append((estart, n_end, n_col, node))
     chain.sort(key=lambda item: (item[0], -item[1], item[2]))
     return [(estart, n_end, node) for estart, n_end, _col, node in chain]
@@ -408,6 +408,7 @@ class _EnclosingFnCellInfo(NamedTuple):
     sibling_closures: List[Tuple[Optional[str], Set[str], Set[str]]]
     all_sibling_nonlocal_mutations: Set[str]
     alias_edges: Sequence[Tuple[str, Set[str]]] = ()
+    pre_unbound: AbstractSet[str] = frozenset()
 
 
 def _is_pos_before_span(
@@ -529,6 +530,15 @@ def _extract_root_target_names(target: ast.AST) -> Set[str]:
     return names
 
 
+def _extract_store_names_in_node(node: ast.AST) -> Set[str]:
+    """Extracts all ast.Name store identifiers inside an AST target subtree."""
+    return {
+        sub.id
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store)
+    }
+
+
 def _extract_expr_closure_and_load_info(
     nodes: Sequence[ast.AST],
     scope_ctx: Optional[_FnScopeContext] = None,
@@ -556,6 +566,30 @@ def _extract_expr_closure_and_load_info(
             )
             inline_reads.update(c_reads)
             inline_muts.update(c_muts)
+            if curr.generators:
+                stack.append(curr.generators[0].iter)
+            if not _is_lazy_genexp(curr, scope_ctx):
+                comp_targets = {
+                    n
+                    for gen in curr.generators
+                    for n in _extract_store_names_in_node(gen.target)
+                }
+                comp_exprs: List[ast.AST] = [
+                    ch
+                    for ch in ast.iter_child_nodes(curr)
+                    if not isinstance(ch, ast.comprehension)
+                ]
+                for idx, gen in enumerate(curr.generators):
+                    if idx > 0:
+                        comp_exprs.append(gen.iter)
+                    comp_exprs.extend(gen.ifs)
+                sub_calls: Set[str] = set()
+                _, _, sub_loads = _extract_expr_closure_and_load_info(
+                    comp_exprs, scope_ctx, called_names_out=sub_calls
+                )
+                loaded_names.update(sub_loads - comp_targets)
+                if called_names_out is not None:
+                    called_names_out.update(sub_calls - comp_targets)
             continue
         if isinstance(curr, ast.Call):
             if isinstance(curr.func, ast.Attribute):
@@ -610,6 +644,7 @@ class _CellBindingState(NamedTuple):
     post_mutated: Set[str]
     post_reads: Set[str]
     loop_mutated: Set[str]
+    pre_unbound: Set[str]
 
 
 class _StackFrame(NamedTuple):
@@ -639,19 +674,11 @@ def _record_binding_at_pos(
         state.pre_mutated.update(filtered)
         if not frame.is_branched:
             state.pre_bound.update(filtered)
+            state.pre_unbound.difference_update(filtered)
     if _is_pos_after_span(line, col, span):
         state.post_mutated.update(filtered)
     if frame.in_loop:
         state.loop_mutated.update(filtered)
-
-
-def _extract_store_names_in_node(node: ast.AST) -> Set[str]:
-    """Extracts all ast.Name store identifiers inside an AST target subtree."""
-    return {
-        sub.id
-        for sub in ast.walk(node)
-        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store)
-    }
 
 
 def _find_non_call_loaded_names(stmts: Sequence[ast.stmt]) -> Set[str]:
@@ -850,9 +877,9 @@ def _push_compound_children(
                 span,
             )
         ):
-            state.pre_bound.update(
-                _extract_if_exhaustive_bindings(curr, act_nl)
-            )
+            exh_bound = _extract_if_exhaustive_bindings(curr, act_nl)
+            state.pre_bound.update(exh_bound)
+            state.pre_unbound.difference_update(exh_bound)
         _push_seq(stack, curr.orelse, is_br if else_span else True, in_lp, act_nl)
         _push_seq(stack, curr.body, is_br if body_span else True, in_lp, act_nl)
         stack.append(_StackFrame(curr.test, is_br, in_lp, act_nl))
@@ -871,6 +898,7 @@ def _push_compound_children(
             state.pre_mutated.update(t_stores)
             if not is_br:
                 state.pre_bound.update(t_stores)
+                state.pre_unbound.difference_update(t_stores)
             state.loop_mutated.update(t_stores)
         _push_seq(stack, curr.orelse, is_br if else_span else True, in_lp, act_nl)
         _push_seq(
@@ -925,6 +953,7 @@ def _push_compound_children(
                     state.pre_mutated.update(w_stores)
                     if not is_br:
                         state.pre_bound.update(w_stores)
+                        state.pre_unbound.difference_update(w_stores)
         _push_seq(stack, curr.body, is_br if body_span else True, in_lp, act_nl)
         _push_seq(stack, curr.items, is_br if body_span else True, in_lp, act_nl)
         return True
@@ -961,8 +990,10 @@ def _push_compound_children(
                 state.post_mutated.add(curr.name)
                 if not h_br:
                     state.pre_bound.add(curr.name)
+                    state.pre_unbound.discard(curr.name)
             elif _is_pos_before_span(c_line, c_col, span):
                 state.pre_bound.discard(curr.name)
+                state.pre_unbound.add(curr.name)
                 state.pre_mutated.add(curr.name)
             if _is_pos_after_span(c_line, c_col, span):
                 state.post_mutated.add(curr.name)
@@ -1045,22 +1076,26 @@ def _handle_nested_scope_node(
         _record_binding_at_pos(
             (curr.name,), estart, c_col, span, frame, state
         )
-        free_r = _extract_cached_scope_free_reads(curr)
-        nl_mut = _extract_closure_nonlocal_mutations(curr)
-        sib_name = (
-            curr.name
-            if _can_bind_in_fn_scope(curr.name, frame.active_nonlocals)
-            else None
-        )
-        if (
-            sib_name is not None
-            and factory_names is not None
-            and _is_closure_factory_scope(curr)
-        ):
-            factory_names.add(sib_name)
-        sibling_closures.append((sib_name, free_r, nl_mut))
-        if _is_pos_after_span(estart, c_col, span):
-            state.post_reads.update(free_r)
+        enclosing_cls = isinstance(
+            curr, ast.ClassDef
+        ) and _strictly_encloses_span(curr, span)
+        if not enclosing_cls:
+            free_r = _extract_cached_scope_free_reads(curr)
+            nl_mut = _extract_closure_nonlocal_mutations(curr)
+            sib_name = (
+                curr.name
+                if _can_bind_in_fn_scope(curr.name, frame.active_nonlocals)
+                else None
+            )
+            if (
+                sib_name is not None
+                and factory_names is not None
+                and _is_closure_factory_scope(curr)
+            ):
+                factory_names.add(sib_name)
+            sibling_closures.append((sib_name, free_r, nl_mut))
+            if _is_pos_after_span(estart, c_col, span):
+                state.post_reads.update(free_r)
         if isinstance(curr, ast.ClassDef):
             _push_seq(
                 stack,
@@ -1170,6 +1205,7 @@ def _record_simple_node_bindings_and_reads(
         ):
             if _is_pos_before_span(c_line, c_col, span):
                 state.pre_bound.discard(curr.id)
+                state.pre_unbound.add(curr.id)
                 state.pre_mutated.add(curr.id)
             if _is_pos_after_span(c_line, c_col, span):
                 state.post_mutated.add(curr.id)
@@ -1213,6 +1249,7 @@ def _analyze_enclosing_fn_cells_uncached(
         post_mutated=set(),
         post_reads=set(),
         loop_mutated=set(),
+        pre_unbound=set(),
     )
     sibling_closures: List[Tuple[Optional[str], Set[str], Set[str]]] = []
     alias_edges: List[Tuple[str, Set[str]]] = []
@@ -1339,6 +1376,7 @@ def _analyze_enclosing_fn_cells_uncached(
         sibling_closures=sibling_closures,
         all_sibling_nonlocal_mutations=all_sib_nl,
         alias_edges=alias_edges,
+        pre_unbound=state.pre_unbound,
     )
 
 
@@ -1385,11 +1423,12 @@ def _build_enclosing_chain_cell_infos(
     mod_tree: Optional[ast.AST] = None,
 ) -> List[_EnclosingFnCellInfo]:
     """Builds _EnclosingFnCellInfo summaries for each function in enclosing_chain."""
-    chain_infos: List[_EnclosingFnCellInfo] = []
-    for idx, (_estart, _nend, fn_node) in enumerate(enclosing_chain):
+    rev_infos: List[_EnclosingFnCellInfo] = []
+    escaping_muts: Set[str] = set(unit_mutations)
+    for idx in range(len(enclosing_chain) - 1, -1, -1):
+        _estart, _nend, fn_node = enclosing_chain[idx]
         if idx == len(enclosing_chain) - 1:
             span = _SpanBounds(u_start, u_end, u_start_col, u_end_col)
-            u_mut: AbstractSet[str] = unit_mutations
             enc_child: Optional[ast.AST] = None
         else:
             next_start, next_end, next_fn = enclosing_chain[idx + 1]
@@ -1401,18 +1440,45 @@ def _build_enclosing_chain_cell_infos(
                 getattr(first_stmt, "col_offset", None),
                 getattr(next_fn, "end_col_offset", None),
             )
-            u_mut = frozenset()
             enc_child = next_fn
-        chain_infos.append(
-            _analyze_enclosing_fn_cells(
-                fn_node,
-                span,
-                unit_mutations=u_mut,
-                enclosed_fn=enc_child,
-                mod_tree=mod_tree,
-            )
+        info = _analyze_enclosing_fn_cells(
+            fn_node,
+            span,
+            unit_mutations=escaping_muts,
+            enclosed_fn=enc_child,
+            mod_tree=mod_tree,
         )
-    return chain_infos
+        rev_infos.append(info)
+        escaping_muts = escaping_muts - info.fn_locals
+    rev_infos.reverse()
+    return rev_infos
+
+
+def _find_enclosing_chain_definite_pre_bound(
+    enclosing_chain: Sequence[Tuple[int, int, ast.AST]],
+    u_start: int,
+    u_end: int,
+    u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
+    mod_tree: Optional[ast.AST] = None,
+) -> Set[str]:
+    """Computes variables definitely bound prior to the unit across enclosing functions."""
+    chain_infos = _build_enclosing_chain_cell_infos(
+        enclosing_chain,
+        u_start,
+        u_end,
+        u_start_col,
+        u_end_col,
+        frozenset(),
+        mod_tree=mod_tree,
+    )
+    acc_pre_bound: Set[str] = set()
+    acc_pre_unbound: Set[str] = set()
+    for idx in range(len(chain_infos) - 1, -1, -1):
+        info = chain_infos[idx]
+        acc_pre_bound.update(info.pre_bound - acc_pre_unbound)
+        acc_pre_unbound.update(set(info.pre_unbound) - info.pre_bound)
+    return acc_pre_bound
 
 
 def _check_captured_cell_mutations(
@@ -1431,6 +1497,7 @@ def _check_captured_cell_mutations(
     for var in captured_candidates:
         acc_ext_muts: Set[str] = set()
         acc_pre_bound: Set[str] = set()
+        acc_pre_unbound: Set[str] = set()
         for idx in range(len(chain_infos) - 1, -1, -1):
             info = chain_infos[idx]
             acc_ext_muts.update(
@@ -1438,7 +1505,8 @@ def _check_captured_cell_mutations(
                 | info.loop_mutated
                 | info.all_sibling_nonlocal_mutations
             )
-            acc_pre_bound.update(info.pre_bound)
+            acc_pre_bound.update(info.pre_bound - acc_pre_unbound)
+            acc_pre_unbound.update(set(info.pre_unbound) - info.pre_bound)
             if var not in info.fn_locals:
                 if var in actual_closure_reads:
                     acc_ext_muts.update(info.pre_mutated)
@@ -1623,6 +1691,10 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         intra_closure_reads.update(enc_escaping & unit_mutated_names)
 
     eff_input_set = set(ctx.inputs) | set(ctx.free_vars) | nonlocal_set
+    if ctx.is_subroutine and bool(
+        unit_closure_reads & enc_outer_globals & eff_input_set
+    ):
+        return True
     unit_mutations = unit_mutated_names if ctx.is_subroutine else set()
 
     if not intra_closure_reads and not intra_nl_mutators and not ctx.is_subroutine:
