@@ -694,7 +694,9 @@ def _extract_scope_nonlocals_and_outer_globals(
     u_start_col: Optional[int] = None,
 ) -> Tuple[Set[str], Set[str]]:
     """Extracts (nonlocal_names, outer_only_globals) declared in the unit's immediate scope."""
-    if not isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    if not isinstance(
+        scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    ):
         return set(), set()
     target_scope = _resolve_immediate_scope_in_fn(
         scope_node, u_start, u_end, u_end_col=u_end_col, u_start_col=u_start_col

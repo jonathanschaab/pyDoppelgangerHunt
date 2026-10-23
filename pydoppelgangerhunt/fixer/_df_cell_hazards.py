@@ -152,15 +152,20 @@ def _find_enclosing_function_chain(
     return [(estart, n_end, node) for estart, n_end, _col, node in chain]
 
 
-def _extract_direct_nonlocals(scope_node: ast.AST) -> Set[str]:
-    """Extracts variable names declared nonlocal directly in scope_node."""
+def _extract_direct_nonlocals(
+    scope_node: ast.AST,
+    *,
+    is_global: bool = False,
+) -> Set[str]:
+    """Extracts variable names declared nonlocal (or global) directly in scope_node."""
+    target_cls = ast.Global if is_global else ast.Nonlocal
     names: Set[str] = set()
     stack: List[ast.AST] = list(getattr(scope_node, "body", []))
     while stack:
         curr = stack.pop()
         if isinstance(curr, _INNER_SCOPE_TYPES):
             continue
-        if isinstance(curr, ast.Nonlocal):
+        if isinstance(curr, target_cls):
             names.update(curr.names)
             continue
         stack.extend(ast.iter_child_nodes(curr))
@@ -182,14 +187,9 @@ def _extract_closure_nonlocal_mutations_and_deletions_uncached(
     scope_node: ast.AST,
 ) -> Tuple[Set[str], Set[str]]:
     """Computes (mutated_or_deleted, deleted) outer-scope variables via nonlocal in scope_node."""
-    if not isinstance(
-        scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-    ):
-        return set(), set()
-    is_cls = isinstance(scope_node, ast.ClassDef)
     own_locals = (
         set()
-        if is_cls
+        if isinstance(scope_node, ast.ClassDef)
         else _extract_single_node_local_names(
             scope_node,
             include_globals=False,
@@ -588,9 +588,15 @@ def _block_contains_span(stmts: Sequence[ast.AST], span: _SpanBounds) -> bool:
     )
 
 
-def _can_bind_in_fn_scope(name: str, active_nonlocals: Optional[Set[str]]) -> bool:
+def _can_bind_in_fn_scope(
+    name: str,
+    active_nonlocals: Optional[Set[str]],
+    fn_globals: AbstractSet[str] = frozenset(),
+) -> bool:
     """Checks whether a binding in the current AST frame targets the enclosing function scope."""
-    return active_nonlocals is None or name in active_nonlocals
+    if active_nonlocals is not None:
+        return name in active_nonlocals
+    return name not in fn_globals
 
 
 def _extract_root_target_names(target: ast.AST) -> Set[str]:
@@ -778,6 +784,7 @@ class _CellBindingState(NamedTuple):
     post_reads: Set[str]
     loop_mutated: Set[str]
     pre_unbound: Set[str]
+    fn_globals: AbstractSet[str] = frozenset()
 
 
 class _StackFrame(NamedTuple):
@@ -800,7 +807,9 @@ def _record_binding_at_pos(
 ) -> None:
     """Records bound variable names into pre_bound, pre_mutated, post_mutated, and loop_mutated."""
     filtered = [
-        n for n in names if _can_bind_in_fn_scope(n, frame.active_nonlocals)
+        n
+        for n in names
+        if _can_bind_in_fn_scope(n, frame.active_nonlocals, state.fn_globals)
     ]
     if not filtered:
         return
@@ -826,6 +835,10 @@ def _record_deletion_at_pos(
     unconditional_post_del: bool = False,
 ) -> None:
     """Records a variable deletion or ExceptHandler unbinding relative to span."""
+    if not _can_bind_in_fn_scope(
+        name, frame.active_nonlocals, state.fn_globals
+    ):
+        return
     if _is_pos_before_span(line, col, span) or (
         unconditional_post_del and _is_pos_after_span(line, col, span)
     ):
@@ -968,6 +981,7 @@ def _extract_block_definite_bindings(
     stmts: Sequence[ast.AST],
     active_nonlocals: Optional[Set[str]],
     initial_bound: AbstractSet[str] = frozenset(),
+    fn_globals: AbstractSet[str] = frozenset(),
 ) -> Set[str]:
     """Extracts variable names unconditionally bound across a statement sequence."""
     bound: Set[str] = set(initial_bound)
@@ -977,27 +991,29 @@ def _extract_block_definite_bindings(
         ):
             for hdr in iter_nested_scope_header_nodes(stmt):
                 bound.difference_update(_extract_shallow_deleted_names(hdr))
-            if _can_bind_in_fn_scope(stmt.name, active_nonlocals):
+            if _can_bind_in_fn_scope(stmt.name, active_nonlocals, fn_globals):
                 bound.add(stmt.name)
             continue
         if isinstance(stmt, ast.If):
             bound.difference_update(_extract_shallow_deleted_names(stmt.test))
             if stmt.body and stmt.orelse:
                 bound = _extract_block_definite_bindings(
-                    stmt.body, active_nonlocals, bound
+                    stmt.body, active_nonlocals, bound, fn_globals
                 ) & _extract_block_definite_bindings(
-                    stmt.orelse, active_nonlocals, bound
+                    stmt.orelse, active_nonlocals, bound, fn_globals
                 )
             else:
                 bound.difference_update(_extract_shallow_deleted_names(stmt))
             continue
         bound.difference_update(_extract_shallow_deleted_names(stmt))
+        if isinstance(stmt, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
+            break
         if isinstance(stmt, ast.Assign) and stmt.value is not None:
             for tgt in stmt.targets:
                 bound.update(
                     n
                     for n in _extract_definite_target_names(tgt)
-                    if _can_bind_in_fn_scope(n, active_nonlocals)
+                    if _can_bind_in_fn_scope(n, active_nonlocals, fn_globals)
                 )
         elif (
             isinstance(stmt, (ast.AnnAssign, ast.AugAssign))
@@ -1006,7 +1022,7 @@ def _extract_block_definite_bindings(
             bound.update(
                 n
                 for n in _extract_definite_target_names(stmt.target)
-                if _can_bind_in_fn_scope(n, active_nonlocals)
+                if _can_bind_in_fn_scope(n, active_nonlocals, fn_globals)
             )
         elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
             imp_names: Set[str] = set()
@@ -1014,7 +1030,7 @@ def _extract_block_definite_bindings(
             bound.update(
                 n
                 for n in imp_names
-                if _can_bind_in_fn_scope(n, active_nonlocals)
+                if _can_bind_in_fn_scope(n, active_nonlocals, fn_globals)
             )
     return bound
 
@@ -1022,13 +1038,20 @@ def _extract_block_definite_bindings(
 def _extract_if_exhaustive_bindings(
     if_node: ast.If,
     active_nonlocals: Optional[Set[str]],
+    initial_bound: AbstractSet[str] = frozenset(),
+    fn_globals: AbstractSet[str] = frozenset(),
 ) -> Set[str]:
     """Extracts variable names unconditionally bound across both branches of an If statement."""
     if not if_node.body or not if_node.orelse:
         return set()
+    post_test_bound = set(initial_bound) - _extract_shallow_deleted_names(
+        if_node.test
+    )
     return _extract_block_definite_bindings(
-        if_node.body, active_nonlocals
-    ) & _extract_block_definite_bindings(if_node.orelse, active_nonlocals)
+        if_node.body, active_nonlocals, post_test_bound, fn_globals
+    ) & _extract_block_definite_bindings(
+        if_node.orelse, active_nonlocals, post_test_bound, fn_globals
+    )
 
 
 def _push_compound_children(
@@ -1061,7 +1084,9 @@ def _push_compound_children(
                 span,
             )
         ):
-            exh_bound = _extract_if_exhaustive_bindings(curr, act_nl)
+            exh_bound = _extract_if_exhaustive_bindings(
+                curr, act_nl, state.pre_bound, state.fn_globals
+            )
             if exh_bound:
                 stack.append(
                     _StackFrame(
@@ -1081,7 +1106,7 @@ def _push_compound_children(
             t_stores = [
                 n
                 for n in _extract_store_names_in_node(curr.target)
-                if _can_bind_in_fn_scope(n, act_nl)
+                if _can_bind_in_fn_scope(n, act_nl, state.fn_globals)
             ]
             state.pre_mutated.update(t_stores)
             if not is_br:
@@ -1136,7 +1161,7 @@ def _push_compound_children(
                     w_stores = [
                         n
                         for n in _extract_store_names_in_node(item.optional_vars)
-                        if _can_bind_in_fn_scope(n, act_nl)
+                        if _can_bind_in_fn_scope(n, act_nl, state.fn_globals)
                     ]
                     state.pre_mutated.update(w_stores)
                     if not is_br:
@@ -1172,7 +1197,9 @@ def _push_compound_children(
         c_line = getattr(curr, "lineno", None)
         c_col = getattr(curr, "col_offset", None)
         h_br = is_br if encloses else True
-        if isinstance(curr.name, str) and _can_bind_in_fn_scope(curr.name, act_nl):
+        if isinstance(curr.name, str) and _can_bind_in_fn_scope(
+            curr.name, act_nl, state.fn_globals
+        ):
             if encloses:
                 state.pre_mutated.add(curr.name)
                 state.post_mutated.add(curr.name)
@@ -1359,7 +1386,9 @@ def _handle_nested_scope_node(
                 sibling_nl_deletions.update(nl_del)
             sib_name = (
                 curr.name
-                if _can_bind_in_fn_scope(curr.name, frame.active_nonlocals)
+                if _can_bind_in_fn_scope(
+                    curr.name, frame.active_nonlocals, state.fn_globals
+                )
                 else None
             )
             if sib_name is not None:
@@ -1535,9 +1564,7 @@ def _record_simple_node_bindings_and_reads(
             _record_binding_at_pos(
                 (curr.id,), c_line, c_col, span, frame, state
             )
-        elif isinstance(curr.ctx, ast.Del) and _can_bind_in_fn_scope(
-            curr.id, frame.active_nonlocals
-        ):
+        elif isinstance(curr.ctx, ast.Del):
             _record_deletion_at_pos(
                 curr.id,
                 c_line,
@@ -1574,10 +1601,13 @@ def _analyze_enclosing_fn_cells_uncached(
     """Computes variable bindings, post-span mutations, loop mutations, and sibling closures."""
     scope_ctx = _get_fn_scope_context(fn_node, mod_tree=mod_tree)
     fn_locals = set(scope_ctx.fn_locals)
-    pre_bound: Set[str] = set(_extract_node_type_param_names(fn_node))
+    fn_globals = _extract_direct_nonlocals(fn_node, is_global=True)
+    pre_bound: Set[str] = (
+        set(_extract_node_type_param_names(fn_node)) - fn_globals
+    )
     fn_args = getattr(fn_node, "args", None)
     if isinstance(fn_args, ast.arguments):
-        pre_bound.update(_extract_arg_names(fn_args))
+        pre_bound.update(_extract_arg_names(fn_args) - fn_globals)
 
     state = _CellBindingState(
         pre_bound=pre_bound,
@@ -1586,6 +1616,7 @@ def _analyze_enclosing_fn_cells_uncached(
         post_reads=set(),
         loop_mutated=set(),
         pre_unbound=set(),
+        fn_globals=fn_globals,
     )
     sibling_closures: List[Tuple[Optional[str], Set[str], Set[str]]] = []
     concurrent_sib_indices: Set[int] = set()
@@ -1624,7 +1655,11 @@ def _analyze_enclosing_fn_cells_uncached(
             _record_binding_at_pos(
                 (curr.name,), estart, c_col, span, frame, state
             )
-            if frame.in_loop or bool(getattr(curr, "decorator_list", None)):
+            if (
+                frame.in_loop
+                or frame.active_nonlocals is not None
+                or bool(getattr(curr, "decorator_list", None))
+            ):
                 enclosed_fn_multi_invoked = True
             _push_seq(
                 stack,
@@ -1928,7 +1963,9 @@ def _find_enclosing_chain_definite_pre_bound(
     for idx in range(len(chain_infos) - 1, -1, -1):
         info = chain_infos[idx]
         acc_pre_bound.update(info.pre_bound - acc_pre_unbound)
-        acc_pre_unbound.update(set(info.pre_unbound) - info.pre_bound)
+        acc_pre_unbound.update(
+            (set(info.pre_unbound) | info.fn_locals) - info.pre_bound
+        )
     return acc_pre_bound
 
 
@@ -2049,11 +2086,32 @@ def _check_sibling_closure_sharing(
         & set(chain_infos[-1].concurrent_sibling_vars)
     ):
         return True
+    unshadowed_sibs: List[Tuple[Optional[str], Set[str], Set[str]]] = []
+    unshadowed_edges: List[Tuple[str, Set[str]]] = []
+    for idx, info in enumerate(chain_infos):
+        inner_shadowed: Set[str] = (
+            set().union(
+                *(
+                    chain_infos[j].fn_locals
+                    for j in range(idx + 1, len(chain_infos))
+                )
+            )
+            if idx + 1 < len(chain_infos)
+            else set()
+        )
+        for s_name, s_reads, s_muts in info.sibling_closures:
+            if s_name is not None and s_name in inner_shadowed:
+                continue
+            unshadowed_sibs.append(
+                (s_name, s_reads - inner_shadowed, s_muts - inner_shadowed)
+            )
+        for t_name, src_names in info.alias_edges:
+            if t_name in inner_shadowed:
+                continue
+            unshadowed_edges.append((t_name, src_names - inner_shadowed))
     all_sib_closures = _propagate_sibling_closures(
-        [sib for info in chain_infos for sib in info.sibling_closures],
-        alias_edges=[
-            edge for info in chain_infos for edge in info.alias_edges
-        ],
+        unshadowed_sibs,
+        alias_edges=unshadowed_edges,
     )
     sub_touched = set(eff_input_set) | set(sub_mutated)
     for sib_name, sib_reads, sib_nl_muts in all_sib_closures:

@@ -3953,6 +3953,85 @@ _CLOSURE_CELL_SCENARIOS = [
         },
         False,
     ),
+    (
+        "neg_pre_bound_var_deleted_and_rebound_in_one_if_branch",
+        (
+            "def build_del_rebind_branch(items, cond):\n"
+            "    scale = 1\n"
+            "    if cond:\n"
+            "        del scale\n"
+            "        scale = 2\n"
+            "    else:\n"
+            "        pass\n"
+            "    cbs = []\n"
+            "    for item in items:\n"
+            "        cbs.append(lambda x, item=item: x * scale + item)\n"
+            "    return cbs\n"
+        ),
+        {
+            "start": 9,
+            "end": 10,
+            "kind": "compound_block",
+            "source_code": (
+                "for item in items:\n"
+                "    cbs.append(lambda x, item=item: x * scale + item)\n"
+            ),
+        },
+        False,
+    ),
+    (
+        "neg_multilevel_shadowed_sibling_closure_cell_no_sharing",
+        (
+            "def outer_shadow_sib(items):\n"
+            "    acc = 100\n"
+            "    def get_acc():\n"
+            "        return acc\n"
+            "    def inner():\n"
+            "        acc = 0\n"
+            "        out = []\n"
+            "        for x in items:\n"
+            "            acc += x\n"
+            "            out.append(get_acc() + acc)\n"
+            "        return acc, out\n"
+            "    return inner\n"
+        ),
+        {
+            "start": 8,
+            "end": 10,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    acc += x\n"
+                "    out.append(get_acc() + acc)\n"
+            ),
+        },
+        False,
+    ),
+    (
+        "multicall_enclosed_fn_defined_in_local_class",
+        (
+            "def outer_cls_method(groups):\n"
+            "    total = 0\n"
+            "    cbs = []\n"
+            "    class Runner:\n"
+            "        def step(self, items):\n"
+            "            nonlocal total\n"
+            "            total += 1\n"
+            "            for x in items:\n"
+            "                cbs.append(lambda y, x=x: y + total + x)\n"
+            "    return Runner, cbs\n"
+        ),
+        {
+            "start": 8,
+            "end": 9,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    cbs.append(lambda y, x=x: y + total + x)\n"
+            ),
+        },
+        True,
+    ),
 ]
 
 
@@ -4169,6 +4248,67 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
         assert "total" not in sc_bd_nl["inputs"]
         assert "total" in sc_bd_nl["conditional_outputs"]
         assert "severed_closure_cell" in sc_bd_nl["control_flow_hazards"]
+
+    # Lexical shadowing (mid local unbound at inner) and global in mid do not promote outer cell
+    for shadow_or_glob_src in (
+        (
+            "def outer_sg():\n"
+            "    total = 5\n"
+            "    def mid():\n"
+            "        def inner(items):\n"
+            "            nonlocal total\n"
+            "            for x in items:\n"
+            "                if x > 0:\n"
+            "                    total = x * 2\n"
+            "        total = 0\n"
+            "        return inner\n"
+            "    return mid\n"
+        ),
+        (
+            "def outer_sg():\n"
+            "    def mid():\n"
+            "        global total\n"
+            "        total = 10\n"
+            "        def inner(items):\n"
+            "            nonlocal total\n"
+            "            for x in items:\n"
+            "                if x > 0:\n"
+            "                    total = x * 2\n"
+            "        return inner\n"
+            "    total = 5\n"
+            "    return mid\n"
+        ),
+    ):
+        sg_tree = ast.parse(shadow_or_glob_src)
+        sg_for = next(n for n in ast.walk(sg_tree) if isinstance(n, ast.For))
+        sc_sg = inspect_single_unit_scope(
+            {
+                "start": sg_for.lineno,
+                "end": sg_for.end_lineno,
+                "kind": "compound_block",
+                "source_text": shadow_or_glob_src,
+                "source_code": "for x in items:\n    if x > 0:\n        total = x * 2\n",
+            },
+            tree=sg_tree,
+        )
+        assert "total" not in sc_sg["inputs"]
+        assert "severed_closure_cell" in sc_sg["control_flow_hazards"]
+
+    # ClassDef immediate scope with nonlocal declaration in collect_downstream_read_names
+    cls_nl_src = (
+        "def outer_cls_nl(items):\n"
+        "    total = 0\n"
+        "    class Box:\n"
+        "        nonlocal total\n"
+        "        for x in items:\n"
+        "            total = x * 2\n"
+        "    return Box, total\n"
+    )
+    assert collect_downstream_read_names(
+        cls_nl_src,
+        {"start": 5, "end": 6},
+        candidates={"total", "x"},
+    ) == {"total"}
 
     # 3. Late-bound closure cell end-to-end skip reason and helper synthesis block
     late_cell_src = (
