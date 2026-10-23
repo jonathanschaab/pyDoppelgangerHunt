@@ -158,15 +158,15 @@ def _extract_direct_nonlocals(
     is_global: bool = False,
 ) -> Set[str]:
     """Extracts variable names declared nonlocal (or global) directly in scope_node."""
-    target_cls = ast.Global if is_global else ast.Nonlocal
     names: Set[str] = set()
     stack: List[ast.AST] = list(getattr(scope_node, "body", []))
     while stack:
         curr = stack.pop()
         if isinstance(curr, _INNER_SCOPE_TYPES):
             continue
-        if isinstance(curr, target_cls):
-            names.update(curr.names)
+        if isinstance(curr, (ast.Global, ast.Nonlocal)):
+            if is_global == isinstance(curr, ast.Global):
+                names.update(curr.names)
             continue
         stack.extend(ast.iter_child_nodes(curr))
     return names
