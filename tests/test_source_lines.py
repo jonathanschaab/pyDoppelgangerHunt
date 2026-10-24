@@ -4609,6 +4609,203 @@ _CLOSURE_CELL_SCENARIOS = [
         },
         True,
     ),
+    (
+        "unit_in_multiline_class_base_header_not_treated_as_class_body",
+        (
+            "def outer(items, make_base):\n"
+            "    scale = 1\n"
+            "    class Box(\n"
+            "        make_base([lambda x, item=item: x * scale + item for item in items]),\n"
+            "    ):\n"
+            "        nonlocal scale\n"
+            "        v = Box\n"
+            "    return Box\n"
+        ),
+        {
+            "start": 4,
+            "end": 4,
+            "start_col": 18,
+            "end_col": 75,
+            "kind": "comprehension",
+            "source_code": "[lambda x, item=item: x * scale + item for item in items]",
+        },
+        False,
+    ),
+    (
+        "unit_in_multiline_class_base_header_captures_class_name_bound_after_header",
+        (
+            "def outer(items, make_base):\n"
+            "    class Box(\n"
+            "        make_base([lambda x, item=item: (Box, x, item) for item in items]),\n"
+            "    ):\n"
+            "        pass\n"
+            "    return Box\n"
+        ),
+        {
+            "start": 3,
+            "end": 3,
+            "start_col": 18,
+            "end_col": 73,
+            "kind": "comprehension",
+            "source_code": "[lambda x, item=item: (Box, x, item) for item in items]",
+        },
+        True,
+    ),
+    (
+        "comprehension_walrus_mutates_sibling_captured_cell",
+        (
+            "def outer(items):\n"
+            "    acc = 0\n"
+            "    cb = lambda: acc\n"
+            "    res = [(acc := acc + x) for x in items]\n"
+            "    return res, cb\n"
+        ),
+        {
+            "start": 4,
+            "end": 4,
+            "start_col": 10,
+            "end_col": 43,
+            "kind": "comprehension",
+            "source_code": "[(acc := acc + x) for x in items]",
+        },
+        True,
+    ),
+    (
+        "comprehension_walrus_mutates_enclosing_nonlocal_cell",
+        (
+            "def outer(items):\n"
+            "    acc = 0\n"
+            "    def inner():\n"
+            "        nonlocal acc\n"
+            "        return [(acc := acc + x) for x in items]\n"
+            "    return inner, acc\n"
+        ),
+        {
+            "start": 5,
+            "end": 5,
+            "start_col": 15,
+            "end_col": 48,
+            "kind": "comprehension",
+            "source_code": "[(acc := acc + x) for x in items]",
+        },
+        True,
+    ),
+    (
+        "neg_local_class_staticmethod_first_param_not_aliased_as_self",
+        (
+            "def outer(log):\n"
+            "    total = 0\n"
+            "    class Worker:\n"
+            "        def peek(self):\n"
+            "            return total\n"
+            "        @staticmethod\n"
+            "        def run(items):\n"
+            "            nonlocal total\n"
+            "            for x in items:\n"
+            "                total += x * 2\n"
+            "                log(x)\n"
+            "    return Worker\n"
+        ),
+        {
+            "start": 9,
+            "end": 11,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    total += x * 2\n"
+                "    log(x)\n"
+            ),
+        },
+        False,
+    ),
+    (
+        "if_branch_with_suppress_body_store_not_definite",
+        (
+            "def outer(cond, suppress, d, items):\n"
+            "    if cond:\n"
+            "        with suppress(KeyError):\n"
+            "            scale = d['x']\n"
+            "    else:\n"
+            "        scale = 2\n"
+            "    cbs = []\n"
+            "    for x in items:\n"
+            "        cbs.append(lambda v, x=x: v * scale + x)\n"
+            "    return cbs\n"
+        ),
+        {
+            "start": 8,
+            "end": 9,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    cbs.append(lambda v, x=x: v * scale + x)\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "neg_single_branch_if_del_and_return_preserves_fallthrough_binding",
+        (
+            "def outer(cond, items):\n"
+            "    scale = 2\n"
+            "    if cond:\n"
+            "        del scale\n"
+            "        return []\n"
+            "    cbs = []\n"
+            "    for x in items:\n"
+            "        cbs.append(lambda v, x=x: v * scale + x)\n"
+            "    return cbs\n"
+        ),
+        {
+            "start": 7,
+            "end": 8,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    cbs.append(lambda v, x=x: v * scale + x)\n"
+            ),
+        },
+        False,
+    ),
+    (
+        "neg_try_finally_without_handlers_definitely_binds_on_fallthrough",
+        (
+            "def outer(cleanup, items):\n"
+            "    try:\n"
+            "        scale = 2\n"
+            "    finally:\n"
+            "        cleanup()\n"
+            "    cbs = []\n"
+            "    for x in items:\n"
+            "        cbs.append(lambda v, x=x: v * scale + x)\n"
+            "    return cbs\n"
+        ),
+        {
+            "start": 7,
+            "end": 8,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    cbs.append(lambda v, x=x: v * scale + x)\n"
+            ),
+        },
+        False,
+    ),
+    (
+        "neg_same_line_identifier_boundary_in_unit_cols_fallback",
+        (
+            "def outer(items):\n"
+            "    prefix_cbs = [lambda x: x * scale for _ in items]; scale = 10; cbs = [lambda x: x * scale for _ in items]\n"
+            "    return cbs\n"
+        ),
+        {
+            "start": 2,
+            "end": 2,
+            "kind": "basic_block",
+            "source_code": "cbs = [lambda x: x * scale for _ in items]",
+        },
+        False,
+    ),
 ]
 
 
@@ -5071,6 +5268,21 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
             repo_root=str(tmp_path),
             scope1=lenient_sc1,
             scope2=lenient_sc2,
+            closure_strictness="strict",
+        )
+        == ""
+    )
+    assert (
+        generate_refactoring_patch(
+            [
+                (
+                    1.0,
+                    {**u_pre_g1, "skip_pre_unit_closures": True},
+                    {**u_pre_g2, "skip_pre_unit_closures": True},
+                )
+            ],
+            repo_root=str(tmp_path),
+            replace_clones=True,
             closure_strictness="strict",
         )
         == ""

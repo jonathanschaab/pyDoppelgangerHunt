@@ -651,8 +651,34 @@ def _resolve_immediate_scope_in_fn(
             c_end = int(getattr(curr, "end_lineno", c_start) or c_start)
             c_col = int(getattr(curr, "col_offset", 0) or 0)
             c_end_col = getattr(curr, "end_col_offset", None)
+            in_hdr = any(
+                (getattr(hdr, "lineno", 0) or 0)
+                <= u_start
+                <= (getattr(hdr, "end_lineno", 0) or 0)
+                for hdr in iter_nested_scope_header_nodes(curr)
+            )
+            if curr.body:
+                b0 = curr.body[0]
+                b_start = min(
+                    [
+                        int(getattr(b0, "lineno", c_start) or c_start),
+                        *(
+                            int(getattr(d, "lineno", c_start) or c_start)
+                            for d in getattr(b0, "decorator_list", ())
+                        ),
+                    ]
+                )
+                b_col = getattr(b0, "col_offset", None)
+                if u_end < b_start or (
+                    u_start == b_start
+                    and u_start_col is not None
+                    and isinstance(b_col, int)
+                    and u_start_col < b_col
+                ):
+                    in_hdr = True
             strictly_inside = (
-                c_start <= u_start
+                not in_hdr
+                and c_start <= u_start
                 and u_end <= c_end
                 and (
                     (c_start, c_end) != (u_start, u_end)

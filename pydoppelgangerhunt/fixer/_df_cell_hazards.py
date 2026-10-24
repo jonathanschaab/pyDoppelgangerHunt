@@ -1126,6 +1126,19 @@ def _extract_shallow_deleted_names(node: ast.AST) -> Set[str]:
     return deleted
 
 
+def _block_has_abnormal_exit(stmts: Sequence[ast.AST]) -> bool:
+    """Checks whether a statement block contains Return, Break, or Continue outside inner scopes."""
+    stack: List[ast.AST] = list(stmts)
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, _INNER_SCOPE_TYPES):
+            continue
+        if isinstance(curr, (ast.Return, ast.Break, ast.Continue)):
+            return True
+        stack.extend(ast.iter_child_nodes(curr))
+    return False
+
+
 def _extract_block_definite_bindings_and_term(
     stmts: Sequence[ast.AST],
     active_nonlocals: Optional[Set[str]],
@@ -1181,11 +1194,31 @@ def _extract_block_definite_bindings_and_term(
                             n, active_nonlocals, fn_globals
                         )
                     )
-            bound, w_term = _extract_block_definite_bindings_and_term(
-                stmt.body, active_nonlocals, bound, fn_globals
-            )
-            if w_term:
-                return bound, True
+            for b_stmt in stmt.body:
+                bound.difference_update(_extract_shallow_deleted_names(b_stmt))
+            continue
+        if isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
+            handlers_l = getattr(stmt, "handlers", [])
+            final_l = getattr(stmt, "finalbody", [])
+            if not handlers_l and not _block_has_abnormal_exit(final_l):
+                for sub_seq in (
+                    getattr(stmt, "body", ()),
+                    getattr(stmt, "orelse", ()),
+                    final_l,
+                ):
+                    bound, t_term = _extract_block_definite_bindings_and_term(
+                        sub_seq, active_nonlocals, bound, fn_globals
+                    )
+                    if t_term:
+                        return bound, True
+                continue
+            bound.difference_update(_extract_shallow_deleted_names(stmt))
+            if final_l and not _block_has_abnormal_exit(final_l):
+                bound, f_term = _extract_block_definite_bindings_and_term(
+                    final_l, active_nonlocals, bound, fn_globals
+                )
+                if f_term:
+                    return bound, True
             continue
         bound.difference_update(_extract_shallow_deleted_names(stmt))
         if isinstance(stmt, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
@@ -1236,7 +1269,7 @@ def _extract_if_exhaustive_bindings(
     fn_globals: AbstractSet[str] = frozenset(),
 ) -> Set[str]:
     """Extracts variable names unconditionally bound across fallthrough paths of an If statement."""
-    if not if_node.body or not if_node.orelse:
+    if not if_node.body:
         return set()
     return _extract_block_definite_bindings_and_term(
         (if_node,), active_nonlocals, initial_bound, fn_globals
@@ -1266,7 +1299,6 @@ def _push_compound_children(
             not encloses
             and not is_br
             and curr.body
-            and curr.orelse
             and _is_pos_before_span(
                 getattr(curr, "end_lineno", getattr(curr, "lineno", None)),
                 getattr(curr, "end_col_offset", getattr(curr, "col_offset", None)),
@@ -1370,6 +1402,11 @@ def _push_compound_children(
             _block_contains_span(body_l, span) or else_span
         )
         final_span = encloses and _block_contains_span(final_l, span)
+        no_handler_fallthrough = (
+            not encloses
+            and not handlers_l
+            and not _block_has_abnormal_exit(final_l)
+        )
         _push_seq(
             stack,
             final_l,
@@ -1377,7 +1414,13 @@ def _push_compound_children(
             in_lp,
             act_nl,
         )
-        _push_seq(stack, else_l, is_br if else_span else True, in_lp, act_nl)
+        _push_seq(
+            stack,
+            else_l,
+            is_br if (else_span or no_handler_fallthrough) else True,
+            in_lp,
+            act_nl,
+        )
         for h_node in reversed(handlers_l):
             h_span = encloses and _block_contains_span(
                 getattr(h_node, "body", ()), span
@@ -1387,7 +1430,13 @@ def _push_compound_children(
                     h_node, is_br if h_span else True, in_lp, act_nl
                 )
             )
-        _push_seq(stack, body_l, is_br if body_span else True, in_lp, act_nl)
+        _push_seq(
+            stack,
+            body_l,
+            is_br if (body_span or no_handler_fallthrough) else True,
+            in_lp,
+            act_nl,
+        )
         return True
 
     if isinstance(curr, ast.ExceptHandler):
@@ -1685,9 +1734,11 @@ def _handle_nested_scope_node(
             _record_binding_at_pos(
                 (curr.name,), estart, ecol, span, frame, state
             )
-        enclosing_cls = isinstance(
-            curr, ast.ClassDef
-        ) and _strictly_encloses_span(curr, span)
+        enclosing_cls = (
+            isinstance(curr, ast.ClassDef)
+            and not span_in_hdr
+            and _strictly_encloses_span(curr, span)
+        )
         if enclosing_cls and isinstance(curr, ast.ClassDef):
             for stmt in curr.body:
                 if isinstance(
@@ -2291,7 +2342,12 @@ def _build_enclosing_chain_cell_infos(
             enclosed_fn=enc_child,
             mod_tree=mod_tree,
         )
-        if enc_child is not None and rev_infos:
+        is_static_enc = any(
+            (isinstance(d, ast.Name) and d.id == "staticmethod")
+            or (isinstance(d, ast.Attribute) and d.attr == "staticmethod")
+            for d in getattr(enc_child, "decorator_list", ())
+        )
+        if enc_child is not None and not is_static_enc and rev_infos:
             enc_args = getattr(enc_child, "args", None)
             pos_args = (
                 (enc_args.posonlyargs + enc_args.args)
@@ -2462,6 +2518,8 @@ def _check_sibling_closure_sharing(
     chain_infos: Sequence[_EnclosingFnCellInfo],
     *,
     is_suspended: bool = False,
+    unreturned_mutations: bool = False,
+    skip_pre_unit_closures: bool = False,
 ) -> bool:
     """Check 4: sibling closure referenced by unit (or concurrent with suspended unit) shares a mutated cell."""
     if not chain_infos:
@@ -2504,11 +2562,18 @@ def _check_sibling_closure_sharing(
     )
     sub_touched = set(eff_input_set) | set(sub_mutated)
     for sib_name, sib_reads, sib_nl_muts in all_sib_closures:
-        if sib_name is None or sib_name not in eff_input_set:
+        is_ref_sib = sib_name is not None and sib_name in eff_input_set
+        if not is_ref_sib and (
+            not unreturned_mutations or skip_pre_unit_closures
+        ):
             continue
         if bool(sib_reads & all_chain_locals & set(sub_mutated)):
             return True
-        if bool(sib_nl_muts & all_chain_locals & sub_touched):
+        if bool(
+            sib_nl_muts
+            & all_chain_locals
+            & (sub_touched if is_ref_sib else set(sub_mutated))
+        ):
             return True
     return False
 
@@ -2568,11 +2633,13 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     if not enclosing_chain:
         return False
 
+    is_expr_unit = ctx.unit_kind in ("comprehension", "complex_expr")
+    expr_unit_stores_escape = ctx.is_subroutine or is_expr_unit
     store_set = set(ctx.stores)
     output_set = set(ctx.outputs)
     nonlocal_set = set(ctx.nonlocals)
     unit_mutated_names = store_set | set(ctx.deleted_names)
-    if not ctx.is_subroutine and bool(nonlocal_set & unit_mutated_names):
+    if not expr_unit_stores_escape and bool(nonlocal_set & unit_mutated_names):
         return True
 
     enc_nonlocals, enc_outer_globals = _extract_scope_nonlocals_and_outer_globals(
@@ -2583,7 +2650,10 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         u_start_col=u_start_col,
     )
     enc_escaping = enc_nonlocals | enc_outer_globals
-    if ctx.is_subroutine and bool(unit_mutated_names & enc_outer_globals):
+    if expr_unit_stores_escape and bool(
+        unit_mutated_names
+        & (enc_outer_globals if ctx.is_subroutine else enc_escaping)
+    ):
         return True
     intra_nl_mutators = _collect_unit_nonlocal_mutators(
         ctx.candidate_stmts, mod_tree=ctx.mod_tree
@@ -2622,7 +2692,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     )
 
     eff_input_set = set(ctx.inputs) | set(ctx.free_vars) | nonlocal_set
-    if ctx.is_subroutine and bool(
+    if expr_unit_stores_escape and bool(
         unit_closure_reads
         & (
             (unit_mutated_names & (enc_escaping | nonlocal_set))
@@ -2630,9 +2700,14 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         )
     ):
         return True
-    unit_mutations = unit_mutated_names if ctx.is_subroutine else set()
+    unit_mutations = unit_mutated_names if expr_unit_stores_escape else set()
 
-    if not intra_closure_reads and not intra_nl_mutators and not ctx.is_subroutine:
+    if (
+        not intra_closure_reads
+        and not intra_nl_mutators
+        and not ctx.is_subroutine
+        and not unit_mutations
+    ):
         return False
 
     chain_infos = _build_enclosing_chain_cell_infos(
@@ -2646,11 +2721,12 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     )
 
     captured_candidates = intra_closure_reads & (
-        eff_input_set | ((store_set | output_set) if ctx.is_subroutine else set())
+        eff_input_set
+        | ((store_set | output_set) if expr_unit_stores_escape else set())
     )
     sub_mutated = (
         unit_mutated_names
-        if ctx.is_subroutine
+        if expr_unit_stores_escape
         else (nonlocal_set & unit_mutated_names)
     )
     return (
@@ -2673,6 +2749,9 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
             eff_input_set,
             sub_mutated,
             chain_infos,
-            is_suspended=is_suspended and not ctx.skip_pre_unit_closures,
+            is_suspended=(is_suspended or is_expr_unit)
+            and not ctx.skip_pre_unit_closures,
+            unreturned_mutations=is_expr_unit,
+            skip_pre_unit_closures=ctx.skip_pre_unit_closures,
         )
     )

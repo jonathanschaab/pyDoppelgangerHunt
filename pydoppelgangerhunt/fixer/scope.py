@@ -1782,10 +1782,26 @@ def _unit_cols(
         snippet = unit["source_code"].strip()
         if snippet and "\n" not in snippet:
             line0 = unit_code_lines[0]
-            pos = line0.find(snippet)
-            if pos >= 0 and snippet != line0.strip():
-                s_col = len(line0[:pos].encode("utf-8"))
-                e_col = len(line0[: pos + len(snippet)].encode("utf-8"))
+            if snippet != line0.strip():
+                start_id = snippet[0].isalnum() or snippet[0] == "_"
+                end_id = snippet[-1].isalnum() or snippet[-1] == "_"
+                search_idx = 0
+                while True:
+                    pos = line0.find(snippet, search_idx)
+                    if pos < 0:
+                        break
+                    end_pos = pos + len(snippet)
+                    left_ok = not start_id or pos == 0 or not (
+                        line0[pos - 1].isalnum() or line0[pos - 1] == "_"
+                    )
+                    right_ok = not end_id or end_pos >= len(line0) or not (
+                        line0[end_pos].isalnum() or line0[end_pos] == "_"
+                    )
+                    if left_ok and right_ok:
+                        s_col = len(line0[:pos].encode("utf-8"))
+                        e_col = len(line0[:end_pos].encode("utf-8"))
+                        break
+                    search_idx = pos + 1
     return s_col, e_col
 
 
