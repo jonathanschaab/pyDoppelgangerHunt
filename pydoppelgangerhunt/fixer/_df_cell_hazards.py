@@ -141,6 +141,11 @@ def _find_enclosing_function_chain(
         n_lineno = int(getattr(node, "lineno", estart) or estart)
         if n_lineno <= 0 or u_start < n_lineno or u_end > n_end:
             continue
+        body = getattr(node, "body", None)
+        if body:
+            body_start = _node_earliest_start_lineno(body[0])
+            if u_start < body_start:
+                continue
         n_col = int(getattr(node, "col_offset", 0) or 0)
         if u_start == n_lineno:
             if u_start_col is not None and n_col > u_start_col:
@@ -1677,6 +1682,7 @@ def _analyze_enclosing_fn_cells_uncached(
                 frame.in_loop
                 or frame.active_nonlocals is not None
                 or bool(getattr(curr, "decorator_list", None))
+                or curr.name in _extract_cached_scope_free_reads(curr)
             ):
                 enclosed_fn_multi_invoked = True
             _push_seq(
@@ -2213,6 +2219,8 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
             return True
 
     unit_mod = ast.Module(body=list(ctx.candidate_stmts), type_ignores=[])
+    if ctx.is_subroutine and _extract_direct_nonlocals(unit_mod):
+        return True
     unit_closures = _collect_scope_closures_uncached(
         unit_mod,
         module_tree=ctx.mod_tree,

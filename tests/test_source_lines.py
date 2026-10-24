@@ -4088,6 +4088,55 @@ _CLOSURE_CELL_SCENARIOS = [
         },
         False,
     ),
+    (
+        "multicall_enclosed_fn_self_escaping_in_own_body",
+        (
+            "def outer_self_rec(callbacks):\n"
+            "    total = 0\n"
+            "    cbs = []\n"
+            "    def inner_step(items):\n"
+            "        nonlocal total\n"
+            "        total += 1\n"
+            "        for x in items:\n"
+            "            cbs.append(lambda y, x=x: y + total + x)\n"
+            "        callbacks.append(inner_step)\n"
+            "    inner_step([1])\n"
+            "    return cbs\n"
+        ),
+        {
+            "start": 7,
+            "end": 8,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    cbs.append(lambda y, x=x: y + total + x)\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "subroutine_unit_containing_direct_nonlocal_statement",
+        (
+            "def outer_direct_nl(items):\n"
+            "    total = 0\n"
+            "    def inner():\n"
+            "        nonlocal total\n"
+            "        for x in items:\n"
+            "            total += x\n"
+            "    return inner, total\n"
+        ),
+        {
+            "start": 4,
+            "end": 6,
+            "kind": "compound_block",
+            "source_code": (
+                "nonlocal total\n"
+                "for x in items:\n"
+                "    total += x\n"
+            ),
+        },
+        True,
+    ),
 ]
 
 
@@ -4375,6 +4424,50 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
     )
     assert "total" not in sc_lpd["inputs"]
     assert "severed_closure_cell" in sc_lpd["control_flow_hazards"]
+
+    # Conditional live-in read/AugAssign followed by unconditional write or branch-only pre_bound
+    for cond_live_nl_src, u_s, u_e, u_code in (
+        (
+            "def outer_late_nl():\n"
+            "    def inner(items):\n"
+            "        nonlocal total\n"
+            "        for x in items:\n"
+            "            if x > 0:\n"
+            "                total += x * 2\n"
+            "        total = 0\n"
+            "    total = 10\n"
+            "    return inner\n",
+            4,
+            7,
+            "for x in items:\n    if x > 0:\n        total += x * 2\ntotal = 0\n",
+        ),
+        (
+            "def outer_branch_aug(items, flag):\n"
+            "    if flag:\n"
+            "        total = 5\n"
+            "    def inner():\n"
+            "        nonlocal total\n"
+            "        for x in items:\n"
+            "            if x > 0:\n"
+            "                total += x * 2\n"
+            "    return inner\n",
+            6,
+            8,
+            "for x in items:\n    if x > 0:\n        total += x * 2\n",
+        ),
+    ):
+        sc_cl = inspect_single_unit_scope(
+            {
+                "start": u_s,
+                "end": u_e,
+                "kind": "compound_block",
+                "source_text": cond_live_nl_src,
+                "source_code": u_code,
+            },
+            tree=ast.parse(cond_live_nl_src),
+        )
+        assert "total" not in sc_cl["inputs"]
+        assert "severed_closure_cell" in sc_cl["control_flow_hazards"]
 
     # synthesize_shared_helper_code(closure_strictness='lenient') does not mutate caller unit dicts
     lenient_u1 = dict(u_sync1)
@@ -4739,6 +4832,19 @@ def test_df_cell_hazards_numbered_checks_unit() -> None:
     )
     chain_dec = _find_enclosing_function_chain(dec_tree, 2, 2)
     assert [getattr(fn, "name", None) for _, _, fn in chain_dec] == ["outer"]
+
+    # _find_enclosing_function_chain excludes inner function when unit lies inside its multi-line header
+    hdr_tree = ast.parse(
+        "def outer(items):\n"
+        "    scale = 1\n"
+        "    def inner(\n"
+        "        default_cbs=[lambda x, item=item: x * scale + item for item in items],\n"
+        "    ):\n"
+        "        scale = 2\n"
+        "        return default_cbs\n"
+    )
+    chain_hdr = _find_enclosing_function_chain(hdr_tree, 4, 4)
+    assert [getattr(fn, "name", None) for _, _, fn in chain_hdr] == ["outer"]
 
     # PEP 695 type_params on inner function are included in info.fn_locals
     import sys  # pylint: disable=import-outside-toplevel

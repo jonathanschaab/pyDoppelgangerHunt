@@ -2080,11 +2080,16 @@ def _inspect_unit_scope(
             ]
             cond_escaping_cands = [
                 v
-                for v in sorted(cond_assigned - def_assigned)
+                for v in sorted(
+                    (cond_assigned - def_assigned)
+                    | set(cond_live_ins)
+                    | (live_in_visitor.live_ins & set(visitor.stores))
+                )
                 if v not in excluded_cond_vars
             ]
             if cond_live_ins or cond_escaping_cands:
                 pre_bound: Set[str] = set()
+                rejected_escaping_vars: Set[str] = set()
                 u_start = parse_unit_coord(unit, "start", default=0)
                 u_end = parse_unit_coord(unit, "end", default=u_start)
                 u_start_col, u_end_col = _unit_cols(unit)
@@ -2133,16 +2138,27 @@ def _inspect_unit_scope(
                                             visitor.loads.append(v)
                                         if v not in visitor.read_before_write:
                                             visitor.read_before_write.append(v)
-                                    elif "severed_closure_cell" not in hazards:
-                                        hazards.append("severed_closure_cell")
+                                    else:
+                                        rejected_escaping_vars.add(v)
+                                        if (
+                                            v in visitor.read_before_write
+                                            and v not in def_pre_bound
+                                        ):
+                                            visitor.read_before_write.remove(v)
+                                        if "severed_closure_cell" not in hazards:
+                                            hazards.append("severed_closure_cell")
                 has_enclosing_context = mod_tree is not None and (
                     u_start > 1 or bool(_get_tree_scope_intervals(mod_tree))
                 )
                 for v in cond_live_ins:
                     if (
-                        v in pre_bound
-                        or (not has_enclosing_context and v in def_assigned)
-                    ) and v not in visitor.read_before_write:
+                        v not in rejected_escaping_vars
+                        and (
+                            v in pre_bound
+                            or (not has_enclosing_context and v in def_assigned)
+                        )
+                        and v not in visitor.read_before_write
+                    ):
                         visitor.read_before_write.append(v)
 
         free_vars = [
