@@ -33,6 +33,7 @@ from pydoppelgangerhunt.fixer.scope import (
     _determine_binding_kind,
     _normalize_receiver_attrs,
     _rank_param_kind,
+    _scope_matches_closure_mode,
     _unfold_receiver_attribute,
     analyze_unit_variable_scope,
     inspect_single_unit_scope,
@@ -1406,15 +1407,9 @@ def synthesize_shared_helper_code(
         skip_pre_unit_closures=skip_pre_unit_closures,
     )
     has_precomputed_scopes = (
-        scope1 is not None
-        and scope2 is not None
-        and scope is not None
-        and bool(scope1.get("_skip_pre_unit_closures", False))
-        == effective_skip_closures
-        and bool(scope2.get("_skip_pre_unit_closures", False))
-        == effective_skip_closures
-        and bool(scope.get("_skip_pre_unit_closures", False))
-        == effective_skip_closures
+        _scope_matches_closure_mode(scope1, effective_skip_closures)
+        and _scope_matches_closure_mode(scope2, effective_skip_closures)
+        and _scope_matches_closure_mode(scope, effective_skip_closures)
     )
     scopes: List[Dict[str, Any]] = []
     for u_item, s_text, t_item, pre_s in (
@@ -1430,8 +1425,7 @@ def synthesize_shared_helper_code(
             dict(pre_s)
             if (
                 pre_s is not None
-                and bool(pre_s.get("_skip_pre_unit_closures", False))
-                == effective_skip_closures
+                and _scope_matches_closure_mode(pre_s, effective_skip_closures)
             )
             else inspect_single_unit_scope(
                 {**u_item, "skip_pre_unit_closures": effective_skip_closures},
@@ -1464,8 +1458,8 @@ def synthesize_shared_helper_code(
         ):
             return ""
         scope = analyze_unit_variable_scope(
-            u1,
-            u2,
+            {**u1, "skip_pre_unit_closures": effective_skip_closures},
+            {**u2, "skip_pre_unit_closures": effective_skip_closures},
             repo_root=repo_root,
             tree1=tree1,
             tree2=tree2,

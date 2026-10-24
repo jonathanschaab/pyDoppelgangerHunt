@@ -40,7 +40,10 @@ from pydoppelgangerhunt.fixer._df_hazards import (
     collect_downstream_read_names,
 )
 from pydoppelgangerhunt.config import resolve_closure_strictness_mode
-from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope
+from pydoppelgangerhunt.fixer.scope import (
+    _scope_matches_closure_mode,
+    inspect_single_unit_scope,
+)
 from pydoppelgangerhunt.fixer.source import (
     _load_unit_file_text,
     is_subroutine_unit,
@@ -272,11 +275,7 @@ def _ensure_scope_closure_mode(
     repo_root: Optional[str],
 ) -> Dict[str, Any]:
     """Recomputes unit scope when a precomputed scope was built with a different closure mode."""
-    if (
-        "_skip_pre_unit_closures" not in scope
-        or bool(scope.get("_skip_pre_unit_closures"))
-        == bool(skip_pre_unit_closures)
-    ):
+    if _scope_matches_closure_mode(scope, bool(skip_pre_unit_closures)):
         return scope
     u_copy = dict(unit)
     u_copy["skip_pre_unit_closures"] = bool(skip_pre_unit_closures)

@@ -350,20 +350,11 @@ def _collect_scope_closures_uncached(
         s_col = int(getattr(s, "col_offset", 0) or 0)
         decs = getattr(s, "decorator_list", [])
         if decs:
-            dec_pos = []
-            for d in decs:
-                d_l = getattr(d, "lineno", None)
-                d_c = getattr(d, "col_offset", None)
-                dec_pos.append(
-                    (
-                        int(d_l) if d_l is not None else s_line,
-                        int(d_c) if d_c is not None else s_col,
-                    )
-                )
-            if dec_pos:
-                min_l, min_c = min(dec_pos, key=lambda p: (p[0], p[1]))
-                if min_l < s_line or (min_l == s_line and min_c < s_col):
-                    s_line, s_col = min_l, min_c
+            min_l = min(
+                (int(getattr(d, "lineno", None) or s_line) for d in decs),
+                default=s_line,
+            )
+            s_line = min(s_line, min_l)
         return s_line, s_col
 
     class _ExprClosureCollector(_BaseScopeVisitor):

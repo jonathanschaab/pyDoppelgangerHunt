@@ -4382,6 +4382,233 @@ _CLOSURE_CELL_SCENARIOS = [
         },
         True,
     ),
+    (
+        "decorated_first_stmt_closure_unit_captures_late_bound_var",
+        (
+            "def o(d):\n"
+            "    @d\n"
+            "    def i():\n"
+            "        return scale\n"
+            "    scale = 1\n"
+            "    return i\n"
+        ),
+        {
+            "start": 2,
+            "end": 4,
+            "start_col": 4,
+            "kind": "closure",
+            "source_code": (
+                "@d\n"
+                "def i():\n"
+                "    return scale\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "enumerate_carrier_closure_reads_unit_mutated_var",
+        (
+            "def outer(items):\n"
+            "    acc = 0\n"
+            "    pairs = enumerate([lambda: acc])\n"
+            "    out = []\n"
+            "    for x in items:\n"
+            "        acc += x\n"
+            "        out.append(next(pairs)[1]())\n"
+            "    return acc, out\n"
+        ),
+        {
+            "start": 5,
+            "end": 7,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    acc += x\n"
+                "    out.append(next(pairs)[1]())\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "enclosing_local_class_method_calls_sibling_peek_reading_nonlocal",
+        (
+            "def outer(items, log):\n"
+            "    total = 0\n"
+            "    class Worker:\n"
+            "        def peek(self):\n"
+            "            return total\n"
+            "        def run(self, items):\n"
+            "            nonlocal total\n"
+            "            for x in items:\n"
+            "                total += x * 2\n"
+            "                log(self.peek())\n"
+            "    return Worker\n"
+        ),
+        {
+            "start": 8,
+            "end": 10,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    total += x * 2\n"
+                "    log(self.peek())\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "neg_with_as_target_definitely_pre_bound_before_unit",
+        (
+            "def outer(ctx, items):\n"
+            "    with ctx() as fh:\n"
+            "        pass\n"
+            "    cbs = []\n"
+            "    for x in items:\n"
+            "        cbs.append(lambda x=x: (fh, x))\n"
+            "    return cbs\n"
+        ),
+        {
+            "start": 5,
+            "end": 6,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    cbs.append(lambda x=x: (fh, x))\n"
+            ),
+        },
+        False,
+    ),
+    (
+        "neg_if_return_else_fallthrough_binding_before_unit",
+        (
+            "def outer(cond, items):\n"
+            "    if cond:\n"
+            "        y = 1\n"
+            "        return []\n"
+            "    else:\n"
+            "        scale = 2\n"
+            "    cbs = []\n"
+            "    for x in items:\n"
+            "        cbs.append(lambda v, x=x: v * scale + x)\n"
+            "    return cbs\n"
+        ),
+        {
+            "start": 8,
+            "end": 9,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    cbs.append(lambda v, x=x: v * scale + x)\n"
+            ),
+        },
+        False,
+    ),
+    (
+        "neg_inner_fn_mutating_own_local_container_not_outer_carrier",
+        (
+            "def outer(items):\n"
+            "    acc = 0\n"
+            "    holder = []\n"
+            "    def helper():\n"
+            "        holder = []\n"
+            "        holder.append(lambda: acc)\n"
+            "        return len(holder)\n"
+            "    for x in items:\n"
+            "        acc += x\n"
+            "        holder.append(acc)\n"
+            "    return acc, holder\n"
+        ),
+        {
+            "start": 8,
+            "end": 10,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    acc += x\n"
+                "    holder.append(acc)\n"
+            ),
+        },
+        False,
+    ),
+    (
+        "neg_factory_with_bare_annotation_shadows_outer_closure_name",
+        (
+            "def outer(items):\n"
+            "    acc = 0\n"
+            "    cb = lambda: acc\n"
+            "    def get_val():\n"
+            "        cb: object\n"
+            "        return 1\n"
+            "    out = []\n"
+            "    for x in items:\n"
+            "        acc += x\n"
+            "        out.append(get_val())\n"
+            "    return acc, out, cb\n"
+        ),
+        {
+            "start": 8,
+            "end": 10,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    acc += x\n"
+                "    out.append(get_val())\n"
+            ),
+        },
+        False,
+    ),
+    (
+        "neg_same_line_pre_bound_with_none_start_col_inferred",
+        (
+            "def outer(items):\n"
+            "    scale = 10; cbs = [lambda x: x * scale for _ in items]\n"
+            "    return cbs\n"
+        ),
+        {
+            "start": 2,
+            "end": 2,
+            "kind": "comprehension",
+            "source_code": "[lambda x: x * scale for _ in items]",
+        },
+        False,
+    ),
+    (
+        "same_line_post_mutated_with_none_start_col_inferred",
+        (
+            "def outer(items):\n"
+            "    cbs = [lambda x: x * scale for _ in items]; scale = 20\n"
+            "    return cbs\n"
+        ),
+        {
+            "start": 2,
+            "end": 2,
+            "kind": "comprehension",
+            "source_code": "[lambda x: x * scale for _ in items]",
+        },
+        True,
+    ),
+    (
+        "unit_starting_on_comment_line_before_first_body_stmt",
+        (
+            "def outer(items):\n"
+            "    # leading comment before first body statement\n"
+            "    for x in items:\n"
+            "        cb = lambda: scale\n"
+            "    scale = 10\n"
+            "    return cb\n"
+        ),
+        {
+            "start": 2,
+            "end": 4,
+            "kind": "compound_block",
+            "source_code": (
+                "# leading comment before first body statement\n"
+                "for x in items:\n"
+                "    cb = lambda: scale\n"
+            ),
+        },
+        True,
+    ),
 ]
 
 
@@ -4727,8 +4954,6 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
     assert "skip_pre_unit_closures" not in lenient_u2
 
     # Precomputed scopes respect changed closure_strictness and skip_pre_unit_closures
-    from pydoppelgangerhunt.fixer import analyze_unit_variable_scope
-
     pre_clos_gen_src = (
         "def gen_pre_a(items):\n"
         "    step = 1\n"
@@ -4819,6 +5044,15 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
     assert res_lenient_with_strict_pre == res_lenient_matching_pre
 
     # Strict resolution and synthesis with lenient precomputed scopes matches uncached strict
+    strict_combined_from_lenient = analyze_unit_variable_scope(
+        u_pre_g1,
+        u_pre_g2,
+        repo_root=str(tmp_path),
+        scope1=lenient_sc1,
+        scope2=lenient_sc2,
+    )
+    assert strict_combined_from_lenient["_skip_pre_unit_closures"] is False
+    assert "severed_closure_cell" in strict_combined_from_lenient["control_flow_hazards"]
     res_strict_with_lenient_pre = resolve_clone_pair_outputs(
         u_pre_g1,
         u_pre_g2,
@@ -5220,11 +5454,24 @@ def test_df_cell_hazards_numbered_checks_unit() -> None:
     )
     outer_fn = mdec_tree.body[0]
     inner_fn = outer_fn.body[0]  # type: ignore[attr-defined]
-    assert _node_earliest_start_pos(inner_fn) == (2, 5)
+    assert _node_earliest_start_pos(inner_fn) == (2, 4)
     info_mdec = _analyze_enclosing_fn_cells(outer_fn, (3, 3, 8, 26))
     assert "inner" not in info_mdec.pre_bound
     assert "inner" in info_mdec.post_mutated
     assert "post_var" in info_mdec.post_reads
+
+    # Decorated def as first statement of enclosing function starts at @ column
+    first_dec_tree = ast.parse(
+        "def o():\n"
+        "    @d\n"
+        "    def i():\n"
+        "        return 1\n"
+        "    return i\n"
+    )
+    chain_first_dec = _find_enclosing_function_chain(
+        first_dec_tree, 2, 4, u_start_col=4
+    )
+    assert [getattr(fn, "name", None) for _, _, fn in chain_first_dec] == ["o"]
 
     # PEP 695 type_params on inner function are included in info.fn_locals
     import sys  # pylint: disable=import-outside-toplevel

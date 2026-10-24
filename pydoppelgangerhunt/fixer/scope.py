@@ -25,6 +25,7 @@ from pydoppelgangerhunt.fixer._df_cell_hazards import (
     _find_enclosing_chain_definite_pre_bound,
     _find_enclosing_function_chain,
     _has_severed_closure_cell_hazard,
+    _resolve_unit_col_bounds,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
     _extract_comprehension_walrus_names,
@@ -1600,11 +1601,27 @@ def _rank_param_kind(
 
 
 def _find_enclosing_pre_bound_names(
-    mod_tree: ast.AST, s_line: int, e_line: int
+    mod_tree: ast.AST,
+    s_line: int,
+    e_line: int,
+    u_start_col: Optional[int] = None,
 ) -> Tuple[Set[str], bool]:
     """Finds names bound before s_line in scopes enclosing [s_line, e_line] and loop containment."""
     bound_before: Set[str] = set()
     in_loop = False
+
+    def _is_before_unit(c_line: Optional[int], c_col: Optional[int]) -> bool:
+        if not isinstance(c_line, int):
+            return False
+        if c_line < s_line:
+            return True
+        return (
+            c_line == s_line
+            and u_start_col is not None
+            and isinstance(c_col, int)
+            and c_col < u_start_col
+        )
+
     intervals = [
         (earliest_start, n_end, span, node)
         for earliest_start, n_end, span, node in _get_tree_scope_intervals(mod_tree)
@@ -1638,11 +1655,13 @@ def _find_enclosing_pre_bound_names(
         while stack:
             curr, is_branched = stack.pop()
             c_start = getattr(curr, "lineno", None)
+            c_col = getattr(curr, "col_offset", None)
             c_end = getattr(curr, "end_lineno", c_start)
+            c_end_col = getattr(curr, "end_col_offset", c_col)
             if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if isinstance(c_start, int) and c_start < s_line and (
+                if _is_before_unit(c_start, c_col) and (
                     curr in active_scopes
-                    or (isinstance(c_end, int) and c_end < s_line)
+                    or _is_before_unit(c_end, c_end_col)
                 ):
                     bound_before.add(curr.name)
                 if not is_class_scope:
@@ -1661,11 +1680,11 @@ def _find_enclosing_pre_bound_names(
             if isinstance(
                 curr, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
             ):
-                if isinstance(c_start, int) and c_start < s_line and not is_class_scope:
+                if _is_before_unit(c_start, c_col) and not is_class_scope:
                     bound_before.update(_extract_comprehension_walrus_names(curr))
                 continue
             if type(curr).__name__ == "TypeAlias":
-                if isinstance(c_start, int) and c_start < s_line:
+                if _is_before_unit(c_start, c_col):
                     alias_name = getattr(curr, "name", None)
                     if isinstance(alias_name, ast.Name):
                         bound_before.add(alias_name.id)
@@ -1683,10 +1702,18 @@ def _find_enclosing_pre_bound_names(
                     and isinstance(c_end, int)
                     and c_start <= s_line
                     and e_line <= c_end
-                    and (c_start < s_line or c_end > e_line)
+                    and (
+                        c_start < s_line
+                        or c_end > e_line
+                        or (
+                            u_start_col is not None
+                            and isinstance(c_col, int)
+                            and c_col < u_start_col
+                        )
+                    )
                 ):
                     in_loop = True
-            if isinstance(c_start, int) and c_start < s_line:
+            if _is_before_unit(c_start, c_col):
                 if isinstance(curr, ast.Name) and isinstance(curr.ctx, ast.Store):
                     bound_before.add(curr.id)
                 elif (
@@ -1703,6 +1730,7 @@ def _find_enclosing_pre_bound_names(
                 elif (
                     isinstance(curr, ast.ExceptHandler)
                     and isinstance(curr.name, str)
+                    and isinstance(c_start, int)
                     and isinstance(c_end, int)
                     and c_start <= s_line
                     and e_line <= c_end
@@ -1733,7 +1761,10 @@ def _find_enclosing_pre_bound_names(
     return bound_before, in_loop
 
 
-def _unit_cols(unit: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+def _unit_cols(
+    unit: Dict[str, Any],
+    unit_code_lines: Optional[Sequence[str]] = None,
+) -> Tuple[Optional[int], Optional[int]]:
     """Extracts (start_col, end_col) coordinates from a unit dictionary."""
     s_col = parse_unit_coord(unit, "start_col", default=None)
     if s_col is None:
@@ -1741,6 +1772,20 @@ def _unit_cols(unit: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
     e_col = parse_unit_coord(unit, "end_col", default=None)
     if e_col is None:
         e_col = parse_unit_coord(unit, "end_col_offset", default=None)
+    if (
+        s_col is None
+        and e_col is None
+        and unit_code_lines
+        and len(unit_code_lines) == 1
+        and isinstance(unit.get("source_code"), str)
+    ):
+        snippet = unit["source_code"].strip()
+        if snippet and "\n" not in snippet:
+            line0 = unit_code_lines[0]
+            pos = line0.find(snippet)
+            if pos >= 0 and snippet != line0.strip():
+                s_col = len(line0[:pos].encode("utf-8"))
+                e_col = len(line0[: pos + len(snippet)].encode("utf-8"))
     return s_col, e_col
 
 
@@ -1759,7 +1804,18 @@ def _inspect_unit_scope(
         return cached_full_source[0]
 
     unit_code_lines = extract_unit_source_code(unit, repo_root=repo_root)
-    raw_lines = _slice_unit_token_lines(unit, unit_code_lines)
+    inferred_s_col, inferred_e_col = _unit_cols(unit, unit_code_lines)
+    slice_unit = (
+        {**unit, "start_col": inferred_s_col, "end_col": inferred_e_col}
+        if (
+            inferred_s_col is not None
+            and inferred_e_col is not None
+            and parse_unit_coord(unit, "start_col", default=None) is None
+            and parse_unit_coord(unit, "end_col", default=None) is None
+        )
+        else unit
+    )
+    raw_lines = _slice_unit_token_lines(slice_unit, unit_code_lines)
     dedented = dedent_source_text("".join(raw_lines))
     empty_res: Dict[str, Any] = {
         "inputs": [],
@@ -2096,15 +2152,23 @@ def _inspect_unit_scope(
                 rejected_escaping_vars: Set[str] = set()
                 u_start = parse_unit_coord(unit, "start", default=0)
                 u_end = parse_unit_coord(unit, "end", default=u_start)
-                u_start_col, u_end_col = _unit_cols(unit)
+                u_start_col, u_end_col = inferred_s_col, inferred_e_col
                 mod_tree = file_tree
                 if mod_tree is None and u_start > 0:
                     full_src = _get_full_source()
                     if full_src:
                         mod_tree = _get_or_parse_tree(full_src)
                 if mod_tree is not None and u_start > 0:
+                    u_start_col, u_end_col = _resolve_unit_col_bounds(
+                        candidate_stmts,
+                        mod_tree,
+                        u_start,
+                        u_end,
+                        u_start_col,
+                        u_end_col,
+                    )
                     pre_bound, _ = _find_enclosing_pre_bound_names(
-                        mod_tree, u_start, u_end
+                        mod_tree, u_start, u_end, u_start_col=u_start_col
                     )
                     if cond_escaping_cands:
                         enc_chain = _find_enclosing_function_chain(
@@ -2305,7 +2369,7 @@ def _inspect_unit_scope(
                     if full_src:
                         c_mod_tree = _get_or_parse_tree(full_src)
                 if c_mod_tree is not None:
-                    c_start_col, c_end_col = _unit_cols(unit)
+                    c_start_col, c_end_col = inferred_s_col, inferred_e_col
                     if (
                         "severed_closure_cell" not in hazards
                         and _has_severed_closure_cell_hazard(
@@ -2506,6 +2570,16 @@ def _merge_type_params(tp1: Sequence[str], tp2: Sequence[str]) -> List[str]:
     ]
 
 
+def _scope_matches_closure_mode(
+    scope: Optional[Dict[str, Any]], expected_skip: bool
+) -> bool:
+    """Checks whether a precomputed scope dictionary matches expected_skip."""
+    if scope is None:
+        return False
+    raw_flag = scope.get("_skip_pre_unit_closures", False)
+    return isinstance(raw_flag, bool) and raw_flag is bool(expected_skip)
+
+
 def analyze_unit_variable_scope(
     u1: Dict[str, Any],
     u2: Optional[Dict[str, Any]] = None,
@@ -2516,28 +2590,22 @@ def analyze_unit_variable_scope(
     scope2: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
+    expected_skip1 = bool(u1.get("skip_pre_unit_closures", False))
     info1 = (
         scope1
         if (
             scope1 is not None
-            and (
-                "skip_pre_unit_closures" not in u1
-                or bool(scope1.get("_skip_pre_unit_closures", False))
-                == bool(u1.get("skip_pre_unit_closures"))
-            )
+            and _scope_matches_closure_mode(scope1, expected_skip1)
         )
         else inspect_single_unit_scope(u1, repo_root=repo_root, tree=tree1)
     )
     if u2 is not None:
+        expected_skip2 = bool(u2.get("skip_pre_unit_closures", False))
         info2 = (
             scope2
             if (
                 scope2 is not None
-                and (
-                    "skip_pre_unit_closures" not in u2
-                    or bool(scope2.get("_skip_pre_unit_closures", False))
-                    == bool(u2.get("skip_pre_unit_closures"))
-                )
+                and _scope_matches_closure_mode(scope2, expected_skip2)
             )
             else inspect_single_unit_scope(u2, repo_root=repo_root, tree=tree2)
         )
@@ -2713,11 +2781,12 @@ def analyze_unit_variable_scope(
         ),
         "deleted_names": deleted_names,
         "_skip_pre_unit_closures": (
-            info1.get("_skip_pre_unit_closures")
+            bool(info1.get("_skip_pre_unit_closures", False))
             if (
                 u2 is None
-                or info1.get("_skip_pre_unit_closures")
-                == info2.get("_skip_pre_unit_closures")
+                or _scope_matches_closure_mode(
+                    info2, bool(info1.get("_skip_pre_unit_closures", False))
+                )
             )
             else None
         ),

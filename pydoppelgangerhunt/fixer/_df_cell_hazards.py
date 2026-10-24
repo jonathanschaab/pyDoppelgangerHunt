@@ -137,21 +137,8 @@ def _node_earliest_start_pos(
     best_col: Optional[int] = n_col if isinstance(n_col, int) else None
     for dec in getattr(node, "decorator_list", ()):
         d_line = getattr(dec, "lineno", None)
-        if not isinstance(d_line, int):
-            continue
-        d_col = getattr(dec, "col_offset", None)
-        eff_col = d_col if isinstance(d_col, int) else best_col
-        if (
-            best_line is None
-            or d_line < best_line
-            or (
-                d_line == best_line
-                and isinstance(eff_col, int)
-                and (best_col is None or eff_col < best_col)
-            )
-        ):
+        if isinstance(d_line, int) and (best_line is None or d_line < best_line):
             best_line = d_line
-            best_col = eff_col
     return best_line, best_col
 
 
@@ -173,7 +160,34 @@ def _find_enclosing_function_chain(
         if body:
             body_start, body_col = _node_earliest_start_pos(body[0])
             if body_start is not None and (
-                u_start < body_start
+                u_end < body_start
+                or (
+                    u_start < body_start
+                    and (
+                        u_start <= n_lineno
+                        or any(
+                            (getattr(h, "lineno", 0) or 0)
+                            <= u_start
+                            <= (getattr(h, "end_lineno", 0) or 0)
+                            for h in (
+                                *iter_nested_scope_header_nodes(node),
+                                *getattr(
+                                    getattr(node, "args", None),
+                                    "posonlyargs",
+                                    (),
+                                ),
+                                *getattr(
+                                    getattr(node, "args", None), "args", ()
+                                ),
+                                *getattr(
+                                    getattr(node, "args", None),
+                                    "kwonlyargs",
+                                    (),
+                                ),
+                            )
+                        )
+                    )
+                )
                 or (
                     u_start == body_start
                     and u_start_col is not None
@@ -183,7 +197,7 @@ def _find_enclosing_function_chain(
             ):
                 continue
         n_col = int(getattr(node, "col_offset", 0) or 0)
-        if u_start == n_lineno:
+        if u_start in (estart, n_lineno):
             if u_start_col is not None and n_col > u_start_col:
                 continue
             if u_end == n_end and (u_start_col is None or n_col == u_start_col):
@@ -191,6 +205,85 @@ def _find_enclosing_function_chain(
         chain.append((estart, n_end, n_col, node))
     chain.sort(key=lambda item: (item[0], -item[1], item[2]))
     return [(estart, n_end, node) for estart, n_end, _col, node in chain]
+
+
+def _stmt_dump_set(stmts: Sequence[ast.AST], idx: int) -> Set[str]:
+    """Builds the set of AST dumps for a boundary statement (and inner Expr value)."""
+    if not stmts:
+        return set()
+    target = stmts[idx]
+    dumps = {ast.dump(target)}
+    if isinstance(target, ast.Expr):
+        dumps.add(ast.dump(target.value))
+    return dumps
+
+
+def _pick_inferred_col(
+    explicit_col: Optional[int],
+    matches: Sequence[Tuple[int, int]],
+    span_stmts: Sequence[Tuple[int, int]],
+    stmt_idx: int,
+) -> Optional[int]:
+    """Selects explicit_col, best dump match column, or unique statement column."""
+    if explicit_col is not None:
+        return explicit_col
+    if matches:
+        return min(matches)[1]
+    if len(span_stmts) == 1:
+        return span_stmts[0][stmt_idx]
+    return None
+
+
+def _resolve_unit_col_bounds(
+    candidate_stmts: Sequence[ast.AST],
+    mod_tree: Optional[ast.AST],
+    u_start: int,
+    u_end: int,
+    u_start_col: Optional[int],
+    u_end_col: Optional[int],
+) -> Tuple[Optional[int], Optional[int]]:
+    """Infers missing (u_start_col, u_end_col) from candidate_stmts and mod_tree."""
+    if (u_start_col is not None and u_end_col is not None) or mod_tree is None:
+        return u_start_col, u_end_col
+    first_dumps = _stmt_dump_set(candidate_stmts, 0)
+    last_dumps = _stmt_dump_set(candidate_stmts, -1)
+    start_matches: List[Tuple[int, int]] = []
+    end_matches: List[Tuple[int, int]] = []
+    span_stmts: List[Tuple[int, int]] = []
+    for node in ast.walk(mod_tree):
+        n_start, n_col = _node_earliest_start_pos(node)
+        n_end = getattr(node, "end_lineno", n_start)
+        n_end_col = getattr(node, "end_col_offset", None)
+        if not (isinstance(n_start, int) and isinstance(n_end, int)):
+            continue
+        if (
+            isinstance(node, ast.stmt)
+            and n_start == u_start
+            and n_end == u_end
+            and isinstance(n_col, int)
+            and isinstance(n_end_col, int)
+        ):
+            span_stmts.append((n_col, n_end_col))
+        if not (u_start <= n_start and n_end <= u_end):
+            continue
+        if first_dumps or last_dumps:
+            dumped = ast.dump(node)
+            rank = 1 if isinstance(node, ast.Expr) else 0
+            for t_line, n_line, col_val, dumps, bucket in (
+                (u_start, n_start, n_col, first_dumps, start_matches),
+                (u_end, n_end, n_end_col, last_dumps, end_matches),
+            ):
+                if (
+                    n_line == t_line
+                    and isinstance(col_val, int)
+                    and dumped in dumps
+                ):
+                    bucket.append((rank, col_val))
+
+    return (
+        _pick_inferred_col(u_start_col, start_matches, span_stmts, 0),
+        _pick_inferred_col(u_end_col, end_matches, span_stmts, 1),
+    )
 
 
 def _extract_direct_nonlocals(
@@ -680,7 +773,6 @@ _NON_CLOSURE_RETURN_BUILTINS: frozenset[str] = frozenset(
         "chr",
         "complex",
         "divmod",
-        "enumerate",
         "float",
         "format",
         "hash",
@@ -1034,13 +1126,13 @@ def _extract_shallow_deleted_names(node: ast.AST) -> Set[str]:
     return deleted
 
 
-def _extract_block_definite_bindings(
+def _extract_block_definite_bindings_and_term(
     stmts: Sequence[ast.AST],
     active_nonlocals: Optional[Set[str]],
     initial_bound: AbstractSet[str] = frozenset(),
     fn_globals: AbstractSet[str] = frozenset(),
-) -> Set[str]:
-    """Extracts variable names unconditionally bound across a statement sequence."""
+) -> Tuple[Set[str], bool]:
+    """Extracts (unconditionally_bound_names, block_terminates) across a statement sequence."""
     bound: Set[str] = set(initial_bound)
     for stmt in stmts:
         if isinstance(
@@ -1053,18 +1145,51 @@ def _extract_block_definite_bindings(
             continue
         if isinstance(stmt, ast.If):
             bound.difference_update(_extract_shallow_deleted_names(stmt.test))
-            if stmt.body and stmt.orelse:
-                bound = _extract_block_definite_bindings(
-                    stmt.body, active_nonlocals, bound, fn_globals
-                ) & _extract_block_definite_bindings(
+            b_bound, b_term = _extract_block_definite_bindings_and_term(
+                stmt.body, active_nonlocals, bound, fn_globals
+            )
+            if stmt.orelse:
+                o_bound, o_term = _extract_block_definite_bindings_and_term(
                     stmt.orelse, active_nonlocals, bound, fn_globals
                 )
-            else:
-                bound.difference_update(_extract_shallow_deleted_names(stmt))
+                if b_term and o_term:
+                    return b_bound & o_bound, True
+                if b_term:
+                    bound = o_bound
+                elif o_term:
+                    bound = b_bound
+                else:
+                    bound = b_bound & o_bound
+            elif not b_term:
+                for b_stmt in stmt.body:
+                    bound.difference_update(
+                        _extract_shallow_deleted_names(b_stmt)
+                    )
+            continue
+        if isinstance(stmt, (ast.With, ast.AsyncWith)):
+            for item in stmt.items:
+                bound.difference_update(
+                    _extract_shallow_deleted_names(item.context_expr)
+                )
+                if item.optional_vars is not None:
+                    bound.update(
+                        n
+                        for n in _extract_definite_target_names(
+                            item.optional_vars
+                        )
+                        if _can_bind_in_fn_scope(
+                            n, active_nonlocals, fn_globals
+                        )
+                    )
+            bound, w_term = _extract_block_definite_bindings_and_term(
+                stmt.body, active_nonlocals, bound, fn_globals
+            )
+            if w_term:
+                return bound, True
             continue
         bound.difference_update(_extract_shallow_deleted_names(stmt))
         if isinstance(stmt, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
-            break
+            return bound, True
         if isinstance(stmt, ast.Assign) and stmt.value is not None:
             for tgt in stmt.targets:
                 bound.update(
@@ -1089,7 +1214,19 @@ def _extract_block_definite_bindings(
                 for n in imp_names
                 if _can_bind_in_fn_scope(n, active_nonlocals, fn_globals)
             )
-    return bound
+    return bound, False
+
+
+def _extract_block_definite_bindings(
+    stmts: Sequence[ast.AST],
+    active_nonlocals: Optional[Set[str]],
+    initial_bound: AbstractSet[str] = frozenset(),
+    fn_globals: AbstractSet[str] = frozenset(),
+) -> Set[str]:
+    """Extracts variable names unconditionally bound across a statement sequence."""
+    return _extract_block_definite_bindings_and_term(
+        stmts, active_nonlocals, initial_bound, fn_globals
+    )[0]
 
 
 def _extract_if_exhaustive_bindings(
@@ -1098,17 +1235,12 @@ def _extract_if_exhaustive_bindings(
     initial_bound: AbstractSet[str] = frozenset(),
     fn_globals: AbstractSet[str] = frozenset(),
 ) -> Set[str]:
-    """Extracts variable names unconditionally bound across both branches of an If statement."""
+    """Extracts variable names unconditionally bound across fallthrough paths of an If statement."""
     if not if_node.body or not if_node.orelse:
         return set()
-    post_test_bound = set(initial_bound) - _extract_shallow_deleted_names(
-        if_node.test
-    )
-    return _extract_block_definite_bindings(
-        if_node.body, active_nonlocals, post_test_bound, fn_globals
-    ) & _extract_block_definite_bindings(
-        if_node.orelse, active_nonlocals, post_test_bound, fn_globals
-    )
+    return _extract_block_definite_bindings_and_term(
+        (if_node,), active_nonlocals, initial_bound, fn_globals
+    )[0]
 
 
 def _push_compound_children(
@@ -1225,7 +1357,7 @@ def _push_compound_children(
                         state.pre_bound.update(w_stores)
                         state.pre_unbound.difference_update(w_stores)
         _push_seq(stack, curr.body, is_br if body_span else True, in_lp, act_nl)
-        _push_seq(stack, curr.items, is_br if body_span else True, in_lp, act_nl)
+        _push_seq(stack, curr.items, is_br, in_lp, act_nl)
         return True
 
     if isinstance(curr, ast.Try) or type(curr).__name__ == "TryStar":
@@ -1337,6 +1469,7 @@ def _is_closure_factory_scope(
         include_globals=False,
         include_nonlocals=False,
         include_self_name=False,
+        include_bare_annotations=True,
     )
     parent_map = (
         scope_ctx.parent_map
@@ -1398,6 +1531,7 @@ def _extract_fn_returned_closure_refs(
         include_globals=False,
         include_nonlocals=False,
         include_self_name=False,
+        include_bare_annotations=True,
     )
     ret_exprs: List[ast.AST] = []
     stack: List[ast.AST] = list(fn_node.body)
@@ -1451,26 +1585,68 @@ def _extract_fn_outer_carrier_targets(
     direct_nl = _extract_direct_nonlocals(fn_node)
     fn_g = set(fn_globals) | _extract_direct_nonlocals(fn_node, is_global=True)
     targets: Set[str] = set()
-    for sub in ast.walk(fn_node):
-        if sub is fn_node:
+    stack: List[Tuple[ast.AST, Set[str], Set[str], Set[str]]] = [
+        (stmt, own_locals, direct_nl, fn_g) for stmt in fn_node.body
+    ]
+    while stack:
+        sub, cur_locals, cur_nl, cur_g = stack.pop()
+        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            for hdr in iter_nested_scope_header_nodes(sub):
+                stack.append((hdr, cur_locals, cur_nl, cur_g))
+            sub_nl = (
+                (_extract_direct_nonlocals(sub) & cur_nl)
+                | (_extract_direct_nonlocals(sub) - cur_locals)
+            )
+            sub_g = cur_g | _extract_direct_nonlocals(sub, is_global=True)
+            sub_own = (
+                set()
+                if isinstance(sub, ast.ClassDef)
+                else _extract_single_node_local_names(
+                    sub,
+                    include_globals=False,
+                    include_nonlocals=False,
+                    include_self_name=False,
+                    include_bare_annotations=True,
+                )
+            )
+            next_locals = (cur_locals | sub_own) - sub_g
+            for ch in sub.body:
+                stack.append((ch, next_locals, sub_nl, sub_g))
+            continue
+        if isinstance(sub, ast.Lambda):
+            for hdr in iter_nested_scope_header_nodes(sub):
+                stack.append((hdr, cur_locals, cur_nl, cur_g))
+            lam_locals = cur_locals | _extract_arg_names(sub.args)
+            stack.append((sub.body, lam_locals, cur_nl, cur_g))
+            continue
+        if isinstance(sub, _COMPREHENSION_TYPES):
+            comp_exprs, comp_targets = _iter_comprehension_body_exprs_and_targets(
+                sub
+            )
+            if sub.generators:
+                stack.append((sub.generators[0].iter, cur_locals, cur_nl, cur_g))
+            comp_locals = cur_locals | comp_targets
+            for expr in comp_exprs:
+                stack.append((expr, comp_locals, cur_nl, cur_g))
             continue
         carrier = _extract_closure_carrier_targets_and_values(sub)
-        if carrier is None:
-            continue
-        c_targets, _ = carrier
-        store_names = (
-            set()
-            if isinstance(sub, ast.Call)
-            else _extract_store_names_in_node(sub)
-        )
-        for t_name in c_targets:
-            if t_name in fn_g:
-                continue
-            if t_name in store_names:
-                if t_name in direct_nl:
+        if carrier is not None:
+            c_targets, _ = carrier
+            store_names = (
+                set()
+                if isinstance(sub, ast.Call)
+                else _extract_store_names_in_node(sub)
+            )
+            for t_name in c_targets:
+                if t_name in cur_g:
+                    continue
+                if t_name in store_names:
+                    if t_name in cur_nl:
+                        targets.add(t_name)
+                elif t_name not in cur_locals or t_name in cur_nl:
                     targets.add(t_name)
-            elif t_name not in own_locals or t_name in direct_nl:
-                targets.add(t_name)
+        for child_node in ast.iter_child_nodes(sub):
+            stack.append((child_node, cur_locals, cur_nl, cur_g))
     return targets
 
 
@@ -1498,19 +1674,37 @@ def _handle_nested_scope_node(
             _is_node_inside_span(hdr, span) or _strictly_encloses_span(hdr, span)
             for hdr in hdr_nodes
         )
-        bind_line = (
-            getattr(curr, "end_lineno", c_line) if span_in_hdr else estart
-        )
-        bind_col = (
-            getattr(curr, "end_col_offset", c_col) if span_in_hdr else ecol
-        )
-        _record_binding_at_pos(
-            (curr.name,), bind_line, bind_col, span, frame, state
-        )
+        if span_in_hdr:
+            if _can_bind_in_fn_scope(
+                curr.name, frame.active_nonlocals, state.fn_globals
+            ):
+                state.post_mutated.add(curr.name)
+                if frame.in_loop:
+                    state.loop_mutated.add(curr.name)
+        else:
+            _record_binding_at_pos(
+                (curr.name,), estart, ecol, span, frame, state
+            )
         enclosing_cls = isinstance(
             curr, ast.ClassDef
         ) and _strictly_encloses_span(curr, span)
-        if not enclosing_cls:
+        if enclosing_cls and isinstance(curr, ast.ClassDef):
+            for stmt in curr.body:
+                if isinstance(
+                    stmt, (ast.FunctionDef, ast.AsyncFunctionDef)
+                ) and not (
+                    _is_node_inside_span(stmt, span)
+                    or _strictly_encloses_span(stmt, span)
+                ):
+                    s_reads = _extract_cached_scope_free_reads(stmt)
+                    s_muts, _ = (
+                        _extract_closure_nonlocal_mutations_and_deletions(stmt)
+                    )
+                    if s_reads or s_muts:
+                        sibling_closures.append(
+                            (curr.name, set(s_reads), set(s_muts))
+                        )
+        elif not enclosing_cls:
             free_r = (
                 _extract_nested_scope_free_reads(curr, include_header=False)
                 if span_in_hdr
@@ -1533,7 +1727,8 @@ def _handle_nested_scope_node(
             )
             if sib_name is not None:
                 if factory_names is not None and (
-                    outer_carriers or _is_closure_factory_scope(curr, scope_ctx)
+                    outer_carriers
+                    or _is_closure_factory_scope(curr, scope_ctx)
                 ):
                     factory_names.add(sib_name)
                 if fn_return_refs is not None and isinstance(
@@ -2096,6 +2291,38 @@ def _build_enclosing_chain_cell_infos(
             enclosed_fn=enc_child,
             mod_tree=mod_tree,
         )
+        if enc_child is not None and rev_infos:
+            enc_args = getattr(enc_child, "args", None)
+            pos_args = (
+                (enc_args.posonlyargs + enc_args.args)
+                if isinstance(enc_args, ast.arguments)
+                else []
+            )
+            if pos_args:
+                rec_param = pos_args[0].arg
+                enclosing_cls_names = {
+                    sub.name
+                    for sub in ast.walk(fn_node)
+                    if isinstance(sub, ast.ClassDef) and enc_child in sub.body
+                }
+                if enclosing_cls_names:
+                    extra_sibs = [
+                        (rec_param, set(s_reads), set(s_muts))
+                        for s_name, s_reads, s_muts in info.sibling_closures
+                        if s_name in enclosing_cls_names
+                    ]
+                    if extra_sibs:
+                        prev_info = rev_infos[-1]
+                        rev_infos[-1] = prev_info._replace(
+                            sibling_closures=[
+                                *prev_info.sibling_closures,
+                                *extra_sibs,
+                            ],
+                            all_sibling_nonlocal_mutations=(
+                                set(prev_info.all_sibling_nonlocal_mutations)
+                                | set().union(*(m for _, _, m in extra_sibs))
+                            ),
+                        )
         rev_infos.append(info)
         escaping_muts = escaping_muts - info.fn_locals
     rev_infos.reverse()
@@ -2236,7 +2463,7 @@ def _check_sibling_closure_sharing(
     *,
     is_suspended: bool = False,
 ) -> bool:
-    """Check 4: sibling closure referenced by unit shares a mutated cell with the unit."""
+    """Check 4: sibling closure referenced by unit (or concurrent with suspended unit) shares a mutated cell."""
     if not chain_infos:
         return False
     all_chain_locals: Set[str] = set().union(
@@ -2310,7 +2537,14 @@ class _UnitClosureHazardContext(NamedTuple):
 
 
 def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
-    """Detects whether extracting a unit to module scope would sever closure cell bindings."""
+    """Detects whether extracting a unit to module scope would sever closure cell bindings.
+
+    Note:
+        When ``ctx.skip_pre_unit_closures`` is True (lenient mode), only the speculative
+        ``is_suspended`` check for unreferenced concurrent pre-unit closures in Check 4 is
+        relaxed; Checks 1/2 (unbound or externally mutated captured cells) and Check 4 for
+        sibling closures explicitly referenced via ``eff_input_set`` remain enforced.
+    """
     if ctx.mod_tree is None or ctx.u_start <= 0:
         return False
     if not ctx.is_subroutine and ctx.unit_kind not in (
@@ -2320,8 +2554,16 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     ):
         return False
 
+    u_start_col, u_end_col = _resolve_unit_col_bounds(
+        ctx.candidate_stmts,
+        ctx.mod_tree,
+        ctx.u_start,
+        ctx.u_end,
+        ctx.u_start_col,
+        ctx.u_end_col,
+    )
     enclosing_chain = _find_enclosing_function_chain(
-        ctx.mod_tree, ctx.u_start, ctx.u_end, ctx.u_start_col
+        ctx.mod_tree, ctx.u_start, ctx.u_end, u_start_col
     )
     if not enclosing_chain:
         return False
@@ -2337,8 +2579,8 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         enclosing_chain[-1][2],
         ctx.u_start,
         ctx.u_end,
-        u_end_col=ctx.u_end_col,
-        u_start_col=ctx.u_start_col,
+        u_end_col=u_end_col,
+        u_start_col=u_start_col,
     )
     enc_escaping = enc_nonlocals | enc_outer_globals
     if ctx.is_subroutine and bool(unit_mutated_names & enc_outer_globals):
@@ -2397,8 +2639,8 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         enclosing_chain,
         ctx.u_start,
         ctx.u_end,
-        ctx.u_start_col,
-        ctx.u_end_col,
+        u_start_col,
+        u_end_col,
         unit_mutations,
         mod_tree=ctx.mod_tree,
     )
