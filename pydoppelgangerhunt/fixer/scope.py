@@ -1783,9 +1783,9 @@ def _infer_missing_col_from_line_ast(
             continue
         abs_s = pad + nc
         abs_e = pad + nec
-        if s_col is not None and e_col is None and abs_s == s_col and abs_e > s_col:
+        if s_col is not None and e_col is None and abs_s == s_col < abs_e:
             return s_col, abs_e
-        if e_col is not None and s_col is None and abs_e == e_col and abs_s < e_col:
+        if e_col is not None and s_col is None and abs_s < e_col == abs_e:
             return abs_s, e_col
     return s_col, e_col
 
