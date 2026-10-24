@@ -38,6 +38,7 @@ _scope_parent_maps: OrderedDict[ast.AST, Dict[ast.AST, ast.AST]] = OrderedDict()
 _scope_stmts_by_end: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
 _scope_stmts_by_start: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
 _scope_closures_cache: OrderedDict[Any, List[Tuple[Any, Set[str]]]] = OrderedDict()
+_scope_cell_info_cache: OrderedDict[Any, Any] = OrderedDict()
 _scope_loops_cache: OrderedDict[ast.AST, List[Tuple[int, int, int]]] = OrderedDict()
 _scope_try_with_cache: OrderedDict[ast.AST, List[ast.AST]] = OrderedDict()
 _warned_lenient_closure: List[bool] = [False]
@@ -68,6 +69,7 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
             _scope_stmts_by_end.pop(node, None)
             _scope_stmts_by_start.pop(node, None)
             _scope_closures_cache.pop(node, None)
+            _scope_cell_info_cache.pop(node, None)
             _scope_loops_cache.pop(node, None)
             _scope_try_with_cache.pop(node, None)
         closure_keys_to_remove = [
@@ -79,6 +81,14 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
         ]
         for k in closure_keys_to_remove:
             _scope_closures_cache.pop(k, None)
+        cell_keys_to_remove = [
+            k
+            for k in _scope_cell_info_cache
+            if isinstance(k, tuple)
+            and any(isinstance(elem, ast.AST) and elem in scope_nodes for elem in k)
+        ]
+        for k in cell_keys_to_remove:
+            _scope_cell_info_cache.pop(k, None)
 
 
 def _store_lru_cache_entry(
@@ -208,7 +218,9 @@ def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
     return _extract_first_unit_coord(unit, ("end_col", "end_col_offset"))
 
 
-def _get_scope_parent_map(scope_node: ast.AST) -> Dict[ast.AST, ast.AST]:
+def _get_scope_parent_map(
+    scope_node: ast.AST, *, use_cache: bool = True
+) -> Dict[ast.AST, ast.AST]:
     """Retrieves or builds cached parent map for AST nodes within the scope."""
     def _compute() -> Dict[ast.AST, ast.AST]:
         parent_map: Dict[ast.AST, ast.AST] = {}
@@ -217,6 +229,8 @@ def _get_scope_parent_map(scope_node: ast.AST) -> Dict[ast.AST, ast.AST]:
                 parent_map[child] = parent
         return parent_map
 
+    if not use_cache:
+        return _compute()
     return _get_or_compute_scope_cached(_scope_parent_maps, scope_node, _compute)
 
 
@@ -384,6 +398,7 @@ def clear_dataflow_cache() -> None:
         _scope_stmts_by_end.clear()
         _scope_stmts_by_start.clear()
         _scope_closures_cache.clear()
+        _scope_cell_info_cache.clear()
         _scope_loops_cache.clear()
         _scope_try_with_cache.clear()
         _warned_lenient_closure[0] = False

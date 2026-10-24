@@ -31,6 +31,7 @@ from pydoppelgangerhunt.fixer._df_cache import (
 )
 from pydoppelgangerhunt.fixer._df_closures import (
     _collect_pre_unit_closures,
+    _extract_scope_escaping_bindings,
     _extract_scope_local_names,
     _extract_single_node_local_names,
 )
@@ -224,6 +225,11 @@ def _scope_reads_outputs_after_line(
     including loop-carried reads if the statement sits inside an enclosing loop."""
     stmt_start = start_line if start_line is not None else line
     stmt_end = line
+    escaping_bindings = _extract_scope_escaping_bindings(
+        scope_node, stmt_start, stmt_end, u_end_col=end_col
+    )
+    if not outputs.isdisjoint(escaping_bindings):
+        return True
     enclosing_loops = _find_enclosing_loops(scope_node, stmt_start, stmt_end)
     is_module = isinstance(scope_node, ast.Module)
 
@@ -595,6 +601,18 @@ def collect_downstream_read_names(
                             loaded.add(subnode.id)
 
         _merge_pre_unit_closure_reads(loaded, pre_unit_captured_reads, candidates)
+        escaping_bindings = _extract_scope_escaping_bindings(
+            scope_node,
+            u_start,
+            u_end,
+            u_end_col=u_end_col,
+            u_start_col=u_start_col,
+        )
+        if escaping_bindings:
+            if candidates is not None:
+                loaded.update(escaping_bindings & candidates)
+            else:
+                loaded.update(escaping_bindings - _BUILTIN_NAMES)
 
         _store_lru_cache_entry(
             _downstream_reads_cache,

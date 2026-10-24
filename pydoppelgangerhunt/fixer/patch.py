@@ -3477,6 +3477,9 @@ def _generate_refactoring_patch_impl(
                     (fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static"))
                 )
 
+            if effective_skip_closures:
+                u1_eff["skip_pre_unit_closures"] = True
+                u2_eff["skip_pre_unit_closures"] = True
             s1 = inspect_single_unit_scope(u1_eff, repo_root=str(root), tree=tree1)
             s2 = inspect_single_unit_scope(u2_eff, repo_root=str(root), tree=tree2)
             if u1_eff.get("kind") in ("comprehension", "complex_expr") or u2_eff.get(
@@ -3558,6 +3561,9 @@ def _generate_refactoring_patch_impl(
                 continue
             if "deleted_output" in hazards1 | hazards2:
                 skip_reasons["deleted output hazard"] += 1
+                continue
+            if "severed_closure_cell" in hazards1 | hazards2:
+                skip_reasons["severed closure cell"] += 1
                 continue
             if "embedded_return" in hazards1 | hazards2:
                 lines1 = u1_lines

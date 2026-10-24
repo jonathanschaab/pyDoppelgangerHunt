@@ -8,7 +8,10 @@ import re
 import typing
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
-from pydoppelgangerhunt.config import normalize_path_string
+from pydoppelgangerhunt.config import (
+    normalize_path_string,
+    resolve_closure_strictness_mode,
+)
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
@@ -1401,6 +1404,10 @@ def synthesize_shared_helper_code(
     has_precomputed_scopes = (
         scope1 is not None and scope2 is not None and scope is not None
     )
+    _, effective_skip_closures = resolve_closure_strictness_mode(
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+    )
     scopes: List[Dict[str, Any]] = []
     for u_item, s_text, t_item, pre_s in (
         (u1, source_text1, tree1, scope1),
@@ -1414,7 +1421,13 @@ def synthesize_shared_helper_code(
         s_item = (
             dict(pre_s)
             if pre_s is not None
-            else inspect_single_unit_scope(u_item, repo_root=repo_root, tree=t_item)
+            else inspect_single_unit_scope(
+                {**u_item, "skip_pre_unit_closures": True}
+                if effective_skip_closures
+                else u_item,
+                repo_root=repo_root,
+                tree=t_item,
+            )
         )
         if u_item.get("enclosing_is_async") and s_item.get("has_yield"):
             s_item["is_async"] = True
@@ -1510,7 +1523,12 @@ def synthesize_shared_helper_code(
         return ""
     if any(
         h in scope.get("control_flow_hazards", [])
-        for h in ("type_param_closure_capture", "pathological_ast", "deleted_output")
+        for h in (
+            "type_param_closure_capture",
+            "pathological_ast",
+            "deleted_output",
+            "severed_closure_cell",
+        )
     ):
         return ""
     if not is_same_class and not _is_same_file_path(f1, f2, repo_root=repo_root) and (

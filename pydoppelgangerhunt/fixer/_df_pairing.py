@@ -400,16 +400,21 @@ def resolve_clone_generator_subroutine_outputs(
                 if return_details
                 else None
             )
-        if "deleted_output" in s_chk.get("control_flow_hazards", ()):
-            logger.debug(
-                "Rejecting generator subroutine pair: deleted output hazard on %s",
-                side_lbl,
-            )
-            return (
-                CloneOutputResolution(None, "deleted output hazard")
-                if return_details
-                else None
-            )
+        for hazard_key, reason_str in (
+            ("deleted_output", "deleted output hazard"),
+            ("severed_closure_cell", "severed closure cell"),
+        ):
+            if hazard_key in s_chk.get("control_flow_hazards", ()):
+                logger.debug(
+                    "Rejecting generator subroutine pair: %s on %s",
+                    reason_str,
+                    side_lbl,
+                )
+                return (
+                    CloneOutputResolution(None, reason_str)
+                    if return_details
+                    else None
+                )
 
     outs1 = _extract_effective_unit_outputs(u1, scope1)
     outs2 = _extract_effective_unit_outputs(u2, scope2)
@@ -702,6 +707,18 @@ def resolve_clone_pair_outputs(
 
     outs1 = _extract_effective_unit_outputs(u1, scope1)
     outs2 = _extract_effective_unit_outputs(u2, scope2)
+    if (
+        "severed_closure_cell" in scope1.get("control_flow_hazards", ())
+        or "severed_closure_cell" in scope2.get("control_flow_hazards", ())
+    ):
+        logger.debug(
+            "Rejecting clone pair output resolution: severed closure cell"
+        )
+        return (
+            CloneOutputResolution(None, "severed closure cell")
+            if return_details
+            else None
+        )
     if is_sub and (
         "deleted_output" in scope1.get("control_flow_hazards", ())
         or "deleted_output" in scope2.get("control_flow_hazards", ())
