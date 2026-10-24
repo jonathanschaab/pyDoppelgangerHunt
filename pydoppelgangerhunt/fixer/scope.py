@@ -42,6 +42,7 @@ from pydoppelgangerhunt.fixer.source import (
     _get_tree_scope_intervals,
     _load_unit_file_text,
     _slice_unit_token_lines,
+    _slice_utf8_line,
     dedent_source_text,
     find_enclosing_function_is_async,
     is_subroutine_unit,
@@ -1761,6 +1762,34 @@ def _find_enclosing_pre_bound_names(
     return bound_before, in_loop
 
 
+def _infer_missing_col_from_line_ast(
+    line0: str,
+    s_col: Optional[int],
+    e_col: Optional[int],
+) -> Tuple[Optional[int], Optional[int]]:
+    """Infers a missing start_col or end_col from single-line AST nodes."""
+    stripped = line0.lstrip()
+    if not stripped:
+        return s_col, e_col
+    pad = len(line0[: len(line0) - len(stripped)].encode("utf-8"))
+    try:
+        mod = ast.parse(stripped)
+    except SyntaxError:
+        return s_col, e_col
+    for node in ast.walk(mod):
+        nc = getattr(node, "col_offset", None)
+        nec = getattr(node, "end_col_offset", None)
+        if not isinstance(nc, int) or not isinstance(nec, int):
+            continue
+        abs_s = pad + nc
+        abs_e = pad + nec
+        if s_col is not None and e_col is None and abs_s == s_col and abs_e > s_col:
+            return s_col, abs_e
+        if e_col is not None and s_col is None and abs_e == e_col and abs_s < e_col:
+            return abs_s, e_col
+    return s_col, e_col
+
+
 def _unit_cols(
     unit: Dict[str, Any],
     unit_code_lines: Optional[Sequence[str]] = None,
@@ -1773,8 +1802,7 @@ def _unit_cols(
     if e_col is None:
         e_col = parse_unit_coord(unit, "end_col_offset", default=None)
     if (
-        s_col is None
-        and e_col is None
+        (s_col is None or e_col is None)
         and unit_code_lines
         and len(unit_code_lines) == 1
         and isinstance(unit.get("source_code"), str)
@@ -1782,10 +1810,15 @@ def _unit_cols(
         snippet = unit["source_code"].strip()
         if snippet and "\n" not in snippet:
             line0 = unit_code_lines[0]
-            if snippet != line0.strip():
+            if (
+                snippet != line0.strip()
+                or s_col is not None
+                or e_col is not None
+            ):
                 start_id = snippet[0].isalnum() or snippet[0] == "_"
                 end_id = snippet[-1].isalnum() or snippet[-1] == "_"
                 search_idx = 0
+                best_pair: Optional[Tuple[int, int]] = None
                 while True:
                     pos = line0.find(snippet, search_idx)
                     if pos < 0:
@@ -1798,10 +1831,33 @@ def _unit_cols(
                         line0[end_pos].isalnum() or line0[end_pos] == "_"
                     )
                     if left_ok and right_ok:
-                        s_col = len(line0[:pos].encode("utf-8"))
-                        e_col = len(line0[:end_pos].encode("utf-8"))
-                        break
+                        cand_s = len(line0[:pos].encode("utf-8"))
+                        cand_e = len(line0[:end_pos].encode("utf-8"))
+                        if (s_col is None or cand_s == s_col) and (
+                            e_col is None or cand_e == e_col
+                        ):
+                            best_pair = (cand_s, cand_e)
+                            break
+                        if (
+                            best_pair is None
+                            and (s_col is None or cand_e > s_col)
+                            and (e_col is None or cand_s < e_col)
+                        ):
+                            best_pair = (cand_s, cand_e)
                     search_idx = pos + 1
+                if best_pair is not None:
+                    if s_col is None:
+                        s_col = best_pair[0]
+                    if e_col is None:
+                        e_col = best_pair[1]
+    if (
+        (s_col is None) != (e_col is None)
+        and unit_code_lines
+        and len(unit_code_lines) == 1
+    ):
+        s_col, e_col = _infer_missing_col_from_line_ast(
+            unit_code_lines[0], s_col, e_col
+        )
     return s_col, e_col
 
 
@@ -1823,15 +1879,23 @@ def _inspect_unit_scope(
     inferred_s_col, inferred_e_col = _unit_cols(unit, unit_code_lines)
     slice_unit = (
         {**unit, "start_col": inferred_s_col, "end_col": inferred_e_col}
-        if (
-            inferred_s_col is not None
-            and inferred_e_col is not None
-            and parse_unit_coord(unit, "start_col", default=None) is None
-            and parse_unit_coord(unit, "end_col", default=None) is None
-        )
+        if inferred_s_col is not None or inferred_e_col is not None
         else unit
     )
     raw_lines = _slice_unit_token_lines(slice_unit, unit_code_lines)
+    if (
+        len(raw_lines) == 1
+        and ";" in raw_lines[0]
+        and unit.get("kind") not in ("comprehension", "complex_expr")
+        and inferred_s_col is not None
+        and inferred_e_col is not None
+        and 0 <= inferred_s_col < inferred_e_col
+    ):
+        sliced_stmt = _slice_utf8_line(
+            raw_lines[0], inferred_s_col, inferred_e_col
+        )
+        if sliced_stmt.strip():
+            raw_lines = [sliced_stmt]
     dedented = dedent_source_text("".join(raw_lines))
     empty_res: Dict[str, Any] = {
         "inputs": [],
@@ -2231,6 +2295,15 @@ def _inspect_unit_scope(
                                             visitor.read_before_write.remove(v)
                                         if "severed_closure_cell" not in hazards:
                                             hazards.append("severed_closure_cell")
+                                elif (
+                                    not visitor.has_yield
+                                    and v in pre_bound
+                                    and v in def_pre_bound
+                                ):
+                                    if v not in visitor.loads:
+                                        visitor.loads.append(v)
+                                    if v not in visitor.read_before_write:
+                                        visitor.read_before_write.append(v)
                 has_enclosing_context = mod_tree is not None and (
                     u_start > 1 or bool(_get_tree_scope_intervals(mod_tree))
                 )
@@ -2410,6 +2483,7 @@ def _inspect_unit_scope(
                                 skip_pre_unit_closures=bool(
                                     unit.get("skip_pre_unit_closures")
                                 ),
+                                definite_stores=def_assigned,
                             )
                         )
                     ):

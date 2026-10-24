@@ -5704,3 +5704,712 @@ def test_df_cell_hazards_numbered_checks_unit() -> None:
             tp_chain[-1][2], (4, 5, None, None)
         )
         assert "T" in tp_inner_info.fn_locals
+
+
+def test_expr_traversal_subscript_compare_unary_fstring_and_ifexp() -> None:
+    """Verifies _extract_expr_closure_and_load_info and hazard checks across nested expressions."""
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _extract_expr_closure_and_load_info,
+    )
+
+    expr_cases = [
+        ("callbacks[index_cb()]", {"callbacks"}, {"index_cb"}),
+        ("items[index]", {"items", "index"}, set()),
+        ("left_cb < right_cb()", {"left_cb"}, {"right_cb"}),
+        ("not unary_cb(arg_cb)", {"arg_cb"}, {"unary_cb"}),
+        ("f'{fmt_cb(val_cb):{spec_cb}}'", {"val_cb", "spec_cb"}, {"fmt_cb"}),
+        ("body_cb if cond_cb() else alt_cb", {"body_cb", "alt_cb"}, {"cond_cb"}),
+    ]
+    for expr_src, expected_loads, expected_calls in expr_cases:
+        expr_node = ast.parse(expr_src, mode="eval").body
+        called: set[str] = set()
+        _, _, loaded = _extract_expr_closure_and_load_info(
+            [expr_node], called_names_out=called
+        )
+        assert expected_loads <= loaded, expr_src
+        assert expected_calls <= called, expr_src
+
+    # Closure references and calls nested inside Subscript slice, Compare, UnaryOp, and JoinedStr
+    nested_hazard_cases = [
+        (
+            "def outer(items, callbacks):\n"
+            "    idx = 0\n"
+            "    def get_idx():\n"
+            "        return idx\n"
+            "    def pick():\n"
+            "        return callbacks[get_idx()]\n"
+            "    out = []\n"
+            "    for x in items:\n"
+            "        idx += x\n"
+            "        out.append(pick())\n"
+            "    return out\n",
+            8,
+            10,
+            "for x in items:\n    idx += x\n    out.append(pick())\n",
+        ),
+        (
+            "def outer(items):\n"
+            "    limit = 0\n"
+            "    def get_limit():\n"
+            "        return limit\n"
+            "    def check(v):\n"
+            "        return v < get_limit()\n"
+            "    out = []\n"
+            "    for x in items:\n"
+            "        limit += x\n"
+            "        out.append(check(x))\n"
+            "    return out\n",
+            8,
+            10,
+            "for x in items:\n    limit += x\n    out.append(check(x))\n",
+        ),
+        (
+            "def outer(items):\n"
+            "    flag = False\n"
+            "    def get_flag():\n"
+            "        return flag\n"
+            "    def inverted():\n"
+            "        return not get_flag()\n"
+            "    out = []\n"
+            "    for x in items:\n"
+            "        flag = bool(x)\n"
+            "        out.append(inverted())\n"
+            "    return out\n",
+            8,
+            10,
+            "for x in items:\n    flag = bool(x)\n    out.append(inverted())\n",
+        ),
+        (
+            "def outer(items):\n"
+            "    tag = 'a'\n"
+            "    def get_tag():\n"
+            "        return tag\n"
+            "    def render():\n"
+            "        return f'[{get_tag()}]'\n"
+            "    out = []\n"
+            "    for x in items:\n"
+            "        tag = str(x)\n"
+            "        out.append(render())\n"
+            "    return out\n",
+            8,
+            10,
+            "for x in items:\n    tag = str(x)\n    out.append(render())\n",
+        ),
+    ]
+    for src, s_line, e_line, u_code in nested_hazard_cases:
+        unit = {
+            "start": s_line,
+            "end": e_line,
+            "kind": "compound_block",
+            "source_text": src,
+            "source_code": u_code,
+        }
+        scope = inspect_single_unit_scope(unit, tree=ast.parse(src))
+        assert "severed_closure_cell" in scope["control_flow_hazards"]
+
+
+def _apply_unified_diff_to_single_file(orig_text: str, patch_text: str) -> str:
+    """Applies a unified diff patch (supporting multiple hunks) to orig_text."""
+    import re  # pylint: disable=import-outside-toplevel
+
+    orig_lines = orig_text.splitlines(keepends=True)
+    out_lines: list[str] = []
+    orig_idx = 0
+    patch_lines = patch_text.splitlines(keepends=True)
+    i = 0
+    while i < len(patch_lines):
+        line = patch_lines[i]
+        m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+        if not m:
+            i += 1
+            continue
+        old_start = int(m.group(1)) - 1
+        out_lines.extend(orig_lines[orig_idx:old_start])
+        orig_idx = old_start
+        i += 1
+        while i < len(patch_lines) and not patch_lines[i].startswith(
+            ("@@", "--- ", "+++ ", "# ")
+        ):
+            pline = patch_lines[i]
+            if pline.startswith(" "):
+                out_lines.append(pline[1:])
+                orig_idx += 1
+            elif pline.startswith("+"):
+                out_lines.append(pline[1:])
+            elif pline.startswith("-"):
+                orig_idx += 1
+            i += 1
+    out_lines.extend(orig_lines[orig_idx:])
+    return "".join(out_lines)
+
+
+def _run_differential_refactoring_case(
+    tmp_path: Path,
+    case_name: str,
+    fn_src: str,
+    u1_bounds: tuple[int, int],
+    expect_patch: bool,
+    call_args_list: list[tuple[object, ...]],
+) -> None:
+    """Executes original and refactored modules and verifies identical return values and side effects."""
+    from pydoppelgangerhunt.fixer import generate_refactoring_patch
+
+    case_dir = tmp_path / case_name
+    case_dir.mkdir(parents=True, exist_ok=True)
+    fn_b_src = fn_src.replace("def entry(", "def entry_b(", 1)
+    line_offset = len(fn_src.splitlines()) + 1
+    combined_src = f"{fn_src}\n{fn_b_src}"
+    mod_file = case_dir / "mod.py"
+    mod_file.write_text(combined_src, encoding="utf-8")
+
+    u1 = {
+        "file": str(mod_file),
+        "start": u1_bounds[0],
+        "end": u1_bounds[1],
+        "name": "entry:block",
+        "kind": "compound_block",
+    }
+    u2 = {
+        "file": str(mod_file),
+        "start": u1_bounds[0] + line_offset,
+        "end": u1_bounds[1] + line_offset,
+        "name": "entry_b:block",
+        "kind": "compound_block",
+    }
+    patch = generate_refactoring_patch(
+        [(1.0, u1, u2)], repo_root=str(case_dir), replace_clones=True
+    )
+    if expect_patch:
+        assert patch != "", f"Expected refactoring patch for {case_name}"
+        refactored_src = _apply_unified_diff_to_single_file(combined_src, patch)
+        assert "_shared_" in refactored_src
+    else:
+        assert patch == "", f"Expected hazard to block patch for {case_name}"
+        refactored_src = combined_src
+
+    for args in call_args_list:
+        ns_orig: dict[str, Any] = {}
+        ns_ref: dict[str, Any] = {}
+        exec(compile(combined_src, "<orig>", "exec"), ns_orig)  # pylint: disable=exec-used
+        exec(compile(refactored_src, "<ref>", "exec"), ns_ref)  # pylint: disable=exec-used
+        res_orig = ns_orig["entry"](*args)
+        res_ref = ns_ref["entry"](*args)
+        res_ref_b = ns_ref["entry_b"](*args)
+        assert res_orig == res_ref, f"Mismatch in {case_name} for args={args}"
+        assert res_orig == res_ref_b, f"Mismatch in {case_name} (entry_b) for args={args}"
+
+
+def test_differential_cell_mutations_vs_ordinary_bindings(tmp_path: Path) -> None:
+    """Differential execution tests distinguishing cell mutations, object mutation, locals, branches, and deletion."""
+    # 1a. Rebinding a variable captured by a nested function (post/loop rebinding blocked)
+    rebind_hazard_a = (
+        "def entry(items):\n"
+        "    scale = 1\n"
+        "    cbs = []\n"
+        "    for x in items:\n"
+        "        cbs.append(lambda v: v + scale)\n"
+        "        z = x * 2\n"
+        "    scale = 10\n"
+        "    return [cb(5) for cb in cbs], z\n"
+    )
+    _run_differential_refactoring_case(
+        tmp_path,
+        "rebind_captured_blocked",
+        rebind_hazard_a,
+        (4, 6),
+        expect_patch=False,
+        call_args_list=[([1, 2, 3],)],
+    )
+
+    # 1b. Pre-bound unchanging variable captured by nested function (refactors and matches)
+    rebind_safe_a = (
+        "def entry(items):\n"
+        "    scale = 10\n"
+        "    cbs = []\n"
+        "    for x in items:\n"
+        "        step = x * scale\n"
+        "        cbs.append(lambda v, s=step: v + scale + s)\n"
+        "    return [cb(1) for cb in cbs]\n"
+    )
+    _run_differential_refactoring_case(
+        tmp_path,
+        "prebound_captured_safe",
+        rebind_safe_a,
+        (4, 6),
+        expect_patch=True,
+        call_args_list=[([1, 2, 3],), ([],)],
+    )
+
+    # 2. Mutating an object referenced by a captured variable without rebinding the variable
+    obj_mut_a = (
+        "def entry(items):\n"
+        "    history = []\n"
+        "    snap = lambda: list(history)\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        history.append(x * 2)\n"
+        "        total += x\n"
+        "    return total, snap(), history\n"
+    )
+    _run_differential_refactoring_case(
+        tmp_path,
+        "object_mutation_without_rebinding",
+        obj_mut_a,
+        (5, 7),
+        expect_patch=True,
+        call_args_list=[([2, 4, 6],), ([],)],
+    )
+
+    # 3. Rebinding a name local to a nested function rather than to the enclosing function
+    inner_local_a = (
+        "def entry(items):\n"
+        "    scale = 5\n"
+        "    def helper_local(v):\n"
+        "        scale = v * 10\n"
+        "        return scale + 1\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        cb = lambda y, x=x: y + scale + x\n"
+        "        out.append(cb(2))\n"
+        "    return out, helper_local(3), scale\n"
+    )
+    _run_differential_refactoring_case(
+        tmp_path,
+        "inner_function_local_rebinding",
+        inner_local_a,
+        (7, 9),
+        expect_patch=True,
+        call_args_list=[([1, 2],)],
+    )
+
+    # 4. Conditional assignment inside try/except that may raise before completing
+    cond_try_a = (
+        "def entry(should_fail):\n"
+        "    def risky():\n"
+        "        if should_fail:\n"
+        "            raise ValueError('boom')\n"
+        "        return 99\n"
+        "    value = 1\n"
+        "    try:\n"
+        "        value = risky()\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    getter = lambda: value\n"
+        "    return getter(), value\n"
+    )
+    _run_differential_refactoring_case(
+        tmp_path,
+        "conditional_try_preserve_prebound",
+        cond_try_a,
+        (7, 10),
+        expect_patch=True,
+        call_args_list=[(True,), (False,)],
+    )
+
+    # 5. Deleting a binding, including exception-handler targets cleared by Python
+    exc_clear_a = (
+        "def entry(items):\n"
+        "    err = 'initial'\n"
+        "    try:\n"
+        "        raise RuntimeError('fail')\n"
+        "    except RuntimeError as err:\n"
+        "        pass\n"
+        "    err = 'recovered'\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        cb = lambda v, x=x: f'{err}:{v + x}'\n"
+        "        out.append(cb(1))\n"
+        "    return out\n"
+    )
+    _run_differential_refactoring_case(
+        tmp_path,
+        "except_handler_target_rebound",
+        exc_clear_a,
+        (9, 11),
+        expect_patch=True,
+        call_args_list=[([10, 20],)],
+    )
+
+
+def test_nested_scope_reads_do_not_falsely_escape_mutator() -> None:
+    """Verifies unexecuted or synchronous intra-unit references to a nonlocal mutator do not count as escaping."""
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _find_non_call_loaded_names,
+    )
+
+    # 1. Reviewer's exact scenario: unused nested function calling increment()
+    unused_caller_src = (
+        "def outer(items):\n"
+        "    if items:\n"
+        "        count = 0\n"
+        "        def increment():\n"
+        "            nonlocal count\n"
+        "            count += 1\n"
+        "        def unused():\n"
+        "            increment()\n"
+        "    return len(items)\n"
+    )
+    u_unused = {
+        "start": 2,
+        "end": 8,
+        "kind": "compound_block",
+        "source_text": unused_caller_src,
+        "source_code": (
+            "if items:\n"
+            "    count = 0\n"
+            "    def increment():\n"
+            "        nonlocal count\n"
+            "        count += 1\n"
+            "    def unused():\n"
+            "        increment()\n"
+        ),
+    }
+    sc_unused = inspect_single_unit_scope(
+        u_unused, tree=ast.parse(unused_caller_src)
+    )
+    assert "severed_closure_cell" not in sc_unused["control_flow_hazards"]
+
+    # 2. Synchronous nested caller invoked inside unit, where neither count nor increment escapes
+    sync_caller_src = (
+        "def outer(items):\n"
+        "    if items:\n"
+        "        count = 0\n"
+        "        def increment():\n"
+        "            nonlocal count\n"
+        "            count += 1\n"
+        "        def run_once():\n"
+        "            increment()\n"
+        "        run_once()\n"
+        "    return len(items)\n"
+    )
+    u_sync = {
+        "start": 2,
+        "end": 9,
+        "kind": "compound_block",
+        "source_text": sync_caller_src,
+        "source_code": (
+            "if items:\n"
+            "    count = 0\n"
+            "    def increment():\n"
+            "        nonlocal count\n"
+            "        count += 1\n"
+            "    def run_once():\n"
+            "        increment()\n"
+            "    run_once()\n"
+        ),
+    }
+    sc_sync = inspect_single_unit_scope(u_sync, tree=ast.parse(sync_caller_src))
+    assert "severed_closure_cell" not in sc_sync["control_flow_hazards"]
+
+    # 3. Escaping nested caller (run_once returned/used after unit while count is also read) -> hazard
+    escaped_caller_src = (
+        "def outer(items):\n"
+        "    if items:\n"
+        "        count = 0\n"
+        "        def increment():\n"
+        "            nonlocal count\n"
+        "            count += 1\n"
+        "        def run_once():\n"
+        "            increment()\n"
+        "    return run_once, count\n"
+    )
+    u_escaped = {
+        "start": 2,
+        "end": 8,
+        "kind": "compound_block",
+        "source_text": escaped_caller_src,
+        "source_code": (
+            "if items:\n"
+            "    count = 0\n"
+            "    def increment():\n"
+            "        nonlocal count\n"
+            "        count += 1\n"
+            "    def run_once():\n"
+            "        increment()\n"
+        ),
+    }
+    sc_escaped = inspect_single_unit_scope(
+        u_escaped, tree=ast.parse(escaped_caller_src)
+    )
+    assert "severed_closure_cell" in sc_escaped["control_flow_hazards"]
+
+    # 4. _find_non_call_loaded_names stops at nested def body but inspects default/decorator headers
+    stmts = ast.parse(
+        "def inner(cb=header_ref):\n"
+        "    body_ref()\n"
+        "    return body_val\n"
+    ).body
+    non_call = _find_non_call_loaded_names(stmts)
+    assert "header_ref" in non_call
+    assert "body_ref" not in non_call
+    assert "body_val" not in non_call
+
+
+def test_partial_column_inference_all_four_combinations_and_utf8() -> None:
+    """Verifies _unit_cols and _resolve_unit_col_bounds across all 4 (start_col, end_col) combinations and UTF-8."""
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _resolve_unit_col_bounds,
+    )
+    from pydoppelgangerhunt.fixer.scope import _unit_cols
+
+    # 1. Multiple statements on a single ASCII line
+    ascii_line = "    x = 1; y = x + 2; z = y * 3\n"
+    target_snippet = "y = x + 2"
+    exp_s = len("    x = 1; ".encode("utf-8"))
+    exp_e = len("    x = 1; y = x + 2".encode("utf-8"))
+
+    for s_in, e_in in [
+        (None, None),
+        (None, exp_e),
+        (exp_s, None),
+        (exp_s, exp_e),
+    ]:
+        unit_dict: dict[str, Any] = {"source_code": target_snippet}
+        if s_in is not None:
+            unit_dict["start_col"] = s_in
+        if e_in is not None:
+            unit_dict["end_col"] = e_in
+        got_s, got_e = _unit_cols(unit_dict, [ascii_line])
+        assert (got_s, got_e) == (exp_s, exp_e), (s_in, e_in)
+
+    # 2. _resolve_unit_col_bounds with identical AST statements on the same line
+    dup_src = "def f(a):\n    a = a + 1; a = a + 1\n    return a\n"
+    dup_tree = ast.parse(dup_src)
+    cand_stmt = ast.parse("a = a + 1\n").body
+    # First statement is cols 4..13, second statement is cols 15..24
+    assert _resolve_unit_col_bounds(cand_stmt, dup_tree, 2, 2, None, None) == (
+        4,
+        13,
+    )
+    assert _resolve_unit_col_bounds(cand_stmt, dup_tree, 2, 2, 15, None) == (
+        15,
+        24,
+    )
+    assert _resolve_unit_col_bounds(cand_stmt, dup_tree, 2, 2, None, 24) == (
+        15,
+        24,
+    )
+    assert _resolve_unit_col_bounds(cand_stmt, dup_tree, 2, 2, 4, 13) == (
+        4,
+        13,
+    )
+
+    # 3. Non-ASCII UTF-8 multi-statement line across all 4 coordinate combinations
+    utf8_src = (
+        "def calc():\n"
+        "    café = '☕'; résumé = café + '!'; return lambda: résumé\n"
+    )
+    utf8_line = "    café = '☕'; résumé = café + '!'; return lambda: résumé\n"
+    utf8_snippet = "résumé = café + '!'"
+    pos = utf8_line.index(utf8_snippet)
+    u8_s = len(utf8_line[:pos].encode("utf-8"))
+    u8_e = len(utf8_line[: pos + len(utf8_snippet)].encode("utf-8"))
+
+    for s_in, e_in in [
+        (None, None),
+        (None, u8_e),
+        (u8_s, None),
+        (u8_s, u8_e),
+    ]:
+        u_utf8: dict[str, Any] = {
+            "start": 2,
+            "end": 2,
+            "kind": "sliding_window",
+            "source_text": utf8_src,
+            "source_code": utf8_snippet,
+        }
+        if s_in is not None:
+            u_utf8["start_col"] = s_in
+        if e_in is not None:
+            u_utf8["end_col"] = e_in
+        sc = inspect_single_unit_scope(u_utf8, tree=ast.parse(utf8_src))
+        assert sc["inputs"] == ["café"]
+        assert sc["outputs"] == ["résumé"]
+
+
+@pytest.mark.parametrize(
+    "case_id,stmts_src,initial_bound,expected_bound,expected_term",
+    [
+        (
+            "raise_in_try_preserves_initial_bound",
+            (
+                "try:\n"
+                "    value = risky_operation()\n"
+                "except Exception:\n"
+                "    pass\n"
+            ),
+            frozenset({"value"}),
+            {"value"},
+            False,
+        ),
+        (
+            "raise_in_try_without_initial_bound_not_definite",
+            (
+                "try:\n"
+                "    value = risky_operation()\n"
+                "except Exception:\n"
+                "    pass\n"
+            ),
+            frozenset(),
+            set(),
+            False,
+        ),
+        (
+            "try_and_all_handlers_bind_same_var",
+            (
+                "try:\n"
+                "    value = risky_operation()\n"
+                "except ValueError:\n"
+                "    value = 10\n"
+                "except Exception:\n"
+                "    value = 20\n"
+            ),
+            frozenset(),
+            {"value"},
+            False,
+        ),
+        (
+            "try_else_and_all_handlers_bind_var",
+            (
+                "try:\n"
+                "    step = risky_operation()\n"
+                "except Exception:\n"
+                "    value = -1\n"
+                "else:\n"
+                "    value = 1\n"
+            ),
+            frozenset(),
+            {"value"},
+            False,
+        ),
+        (
+            "try_handler_raises_so_try_else_binding_survives_fallthrough",
+            (
+                "try:\n"
+                "    value = risky_operation()\n"
+                "except Exception:\n"
+                "    raise\n"
+            ),
+            frozenset(),
+            {"value"},
+            False,
+        ),
+        (
+            "try_finally_overrides_and_binds_unconditionally",
+            (
+                "try:\n"
+                "    value = risky_operation()\n"
+                "except Exception:\n"
+                "    pass\n"
+                "finally:\n"
+                "    final_val = 42\n"
+            ),
+            frozenset(),
+            {"final_val"},
+            False,
+        ),
+        (
+            "if_return_in_one_branch_binds_via_fallthrough_branch",
+            (
+                "if cond:\n"
+                "    return 0\n"
+                "else:\n"
+                "    value = 7\n"
+            ),
+            frozenset(),
+            {"value"},
+            False,
+        ),
+        (
+            "if_raise_in_both_branches_terminates_block",
+            (
+                "if cond:\n"
+                "    raise ValueError('a')\n"
+                "else:\n"
+                "    return 1\n"
+            ),
+            frozenset(),
+            set(),
+            True,
+        ),
+        (
+            "del_in_one_non_terminating_branch_removes_initial_binding",
+            (
+                "if cond:\n"
+                "    del value\n"
+            ),
+            frozenset({"value"}),
+            set(),
+            False,
+        ),
+        (
+            "del_followed_by_rebind_in_same_branch_preserves_binding",
+            (
+                "if cond:\n"
+                "    del value\n"
+                "    value = 2\n"
+            ),
+            frozenset({"value"}),
+            {"value"},
+            False,
+        ),
+        (
+            "except_handler_target_implicitly_deleted_on_exit",
+            (
+                "try:\n"
+                "    risky_operation()\n"
+                "except Exception as value:\n"
+                "    pass\n"
+            ),
+            frozenset({"value"}),
+            set(),
+            False,
+        ),
+    ],
+)
+def test_definite_bindings_exceptional_control_flow_table(
+    case_id: str,
+    stmts_src: str,
+    initial_bound: frozenset[str],
+    expected_bound: set[str],
+    expected_term: bool,
+) -> None:
+    """Table-driven verification of _extract_block_definite_bindings_and_term across exceptional paths."""
+    import textwrap  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _analyze_enclosing_fn_cells,
+        _extract_block_definite_bindings_and_term,
+    )
+
+    _ = case_id
+    mod = ast.parse(f"def _wrap():\n{textwrap.indent(stmts_src, '    ')}\n")
+    fn_node = mod.body[0]
+    assert isinstance(fn_node, ast.FunctionDef)
+    bound, term = _extract_block_definite_bindings_and_term(
+        fn_node.body,
+        active_nonlocals=None,
+        initial_bound=initial_bound,
+        fn_globals=frozenset(),
+    )
+    assert bound == expected_bound
+    assert term is expected_term
+
+    # Also verify pre-unit try/except exhaustive bindings in _analyze_enclosing_fn_cells
+    if not initial_bound and not expected_term:
+        outer_src = (
+            "def outer(cond, risky_operation):\n"
+            f"{textwrap.indent(stmts_src, '    ')}"
+            "    return lambda: 1\n"
+        )
+        outer_mod = ast.parse(outer_src)
+        outer_fn = outer_mod.body[0]
+        last_line = len(outer_src.splitlines())
+        info = _analyze_enclosing_fn_cells(
+            outer_fn, (last_line, last_line, None, None)
+        )
+        for v_name in expected_bound:
+            assert v_name in info.pre_bound
+

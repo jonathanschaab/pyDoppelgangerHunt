@@ -550,6 +550,25 @@ def _extract_slice_col_offset(
     return default
 
 
+def _slice_utf8_line(
+    line: str, s_col: int, e_col: Optional[int] = None
+) -> str:
+    """Slices a single line by UTF-8 byte column offsets."""
+    if line.isascii():
+        return (
+            line[s_col:e_col]
+            if (e_col is not None and e_col >= s_col)
+            else line[s_col:]
+        )
+    raw = line.encode("utf-8")
+    sliced = (
+        raw[s_col:e_col]
+        if (e_col is not None and e_col >= s_col)
+        else raw[s_col:]
+    )
+    return sliced.decode("utf-8", errors="replace")
+
+
 def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]:
     """Slices source lines to the exact start_col and end_col offsets of the unit."""
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
@@ -565,11 +584,11 @@ def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]
     s_col = s_col_opt
     res = list(lines)
     if len(res) == 1:
-        res[0] = res[0][s_col:e_col] if (e_col is not None and e_col >= s_col) else res[0][s_col:]
+        res[0] = _slice_utf8_line(res[0], s_col, e_col)
     else:
-        res[0] = res[0][s_col:]
+        res[0] = _slice_utf8_line(res[0], s_col, None)
         if e_col is not None:
-            res[-1] = res[-1][:e_col]
+            res[-1] = _slice_utf8_line(res[-1], 0, e_col)
     return res
 
 

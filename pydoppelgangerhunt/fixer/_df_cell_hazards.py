@@ -223,12 +223,20 @@ def _pick_inferred_col(
     matches: Sequence[Tuple[int, int]],
     span_stmts: Sequence[Tuple[int, int]],
     stmt_idx: int,
+    opposite_col: Optional[int] = None,
 ) -> Optional[int]:
     """Selects explicit_col, best dump match column, or unique statement column."""
     if explicit_col is not None:
         return explicit_col
     if matches:
         return min(matches)[1]
+    if opposite_col is not None:
+        opp_idx = 1 - stmt_idx
+        matched_stmts = [
+            s[stmt_idx] for s in span_stmts if s[opp_idx] == opposite_col
+        ]
+        if len(matched_stmts) == 1:
+            return matched_stmts[0]
     if len(span_stmts) == 1:
         return span_stmts[0][stmt_idx]
     return None
@@ -250,6 +258,7 @@ def _resolve_unit_col_bounds(
     start_matches: List[Tuple[int, int]] = []
     end_matches: List[Tuple[int, int]] = []
     span_stmts: List[Tuple[int, int]] = []
+    single_stmt = len(candidate_stmts) == 1
     for node in ast.walk(mod_tree):
         n_start, n_col = _node_earliest_start_pos(node)
         n_end = getattr(node, "end_lineno", n_start)
@@ -266,23 +275,81 @@ def _resolve_unit_col_bounds(
             span_stmts.append((n_col, n_end_col))
         if not (u_start <= n_start and n_end <= u_end):
             continue
+        if (
+            u_start_col is not None
+            and n_start == u_start
+            and isinstance(n_col, int)
+            and n_col < u_start_col
+        ):
+            continue
+        if (
+            u_end_col is not None
+            and n_end == u_end
+            and isinstance(n_end_col, int)
+            and n_end_col > u_end_col
+        ):
+            continue
         if first_dumps or last_dumps:
             dumped = ast.dump(node)
-            rank = 1 if isinstance(node, ast.Expr) else 0
-            for t_line, n_line, col_val, dumps, bucket in (
-                (u_start, n_start, n_col, first_dumps, start_matches),
-                (u_end, n_end, n_end_col, last_dumps, end_matches),
+            base_rank = 1 if isinstance(node, ast.Expr) else 0
+            for (
+                n_ln,
+                u_ln,
+                col_val,
+                dumps,
+                opp_col,
+                opp_n_ln,
+                opp_u_ln,
+                opp_n_col,
+                matches_out,
+            ) in (
+                (
+                    n_start,
+                    u_start,
+                    n_col,
+                    first_dumps,
+                    u_end_col,
+                    n_end,
+                    u_end,
+                    n_end_col,
+                    start_matches,
+                ),
+                (
+                    n_end,
+                    u_end,
+                    n_end_col,
+                    last_dumps,
+                    u_start_col,
+                    n_start,
+                    u_start,
+                    n_col,
+                    end_matches,
+                ),
             ):
                 if (
-                    n_line == t_line
+                    n_ln == u_ln
                     and isinstance(col_val, int)
                     and dumped in dumps
                 ):
-                    bucket.append((rank, col_val))
+                    rank = (
+                        base_rank - 2
+                        if (
+                            single_stmt
+                            and opp_col is not None
+                            and opp_n_ln == opp_u_ln
+                            and opp_n_col == opp_col
+                        )
+                        else base_rank
+                    )
+                    matches_out.append((rank, col_val))
 
     return (
-        _pick_inferred_col(u_start_col, start_matches, span_stmts, 0),
-        _pick_inferred_col(u_end_col, end_matches, span_stmts, 1),
+        _pick_inferred_col(
+            u_start_col, start_matches, span_stmts, 0, opposite_col=u_end_col
+        ),
+        _pick_inferred_col(
+            u_end_col, end_matches, span_stmts, 1, opposite_col=u_start_col
+        ),
     )
 
 
@@ -816,11 +883,22 @@ def _extract_expr_closure_and_load_info(
                 ast.FunctionDef,
                 ast.AsyncFunctionDef,
                 ast.ClassDef,
-                ast.Compare,
-                ast.UnaryOp,
-                ast.JoinedStr,
             ),
         ):
+            continue
+        if isinstance(curr, ast.Compare):
+            stack.append(curr.left)
+            stack.extend(curr.comparators)
+            continue
+        if isinstance(curr, ast.UnaryOp):
+            stack.append(curr.operand)
+            continue
+        if isinstance(curr, ast.JoinedStr):
+            for val in curr.values:
+                if isinstance(val, ast.FormattedValue):
+                    stack.append(val.value)
+                    if val.format_spec is not None:
+                        stack.append(val.format_spec)
             continue
         if isinstance(curr, ast.Lambda):
             inline_reads.update(
@@ -849,10 +927,12 @@ def _extract_expr_closure_and_load_info(
                     called_names_out.update(sub_calls - comp_targets)
             continue
         if isinstance(curr, ast.IfExp):
+            stack.append(curr.test)
             stack.append(curr.orelse)
             stack.append(curr.body)
             continue
         if isinstance(curr, ast.Subscript):
+            stack.append(curr.slice)
             stack.append(curr.value)
             continue
         if isinstance(curr, ast.Call):
@@ -1000,14 +1080,30 @@ def _record_deletion_at_pos(
         state.loop_mutated.add(name)
 
 
-def _find_non_call_loaded_names(stmts: Sequence[ast.stmt]) -> Set[str]:
-    """Finds variable names loaded outside direct Call.func positions in stmts."""
+def _extract_shallow_loads_and_calls(
+    stmts: Sequence[ast.AST],
+) -> Tuple[Set[str], Set[str]]:
+    """Extracts (non_call_loaded_names, direct_called_names) stopping at nested def/class bodies."""
     loaded: Set[str] = set()
+    called: Set[str] = set()
     stack: List[ast.AST] = list(stmts)
     while stack:
         curr = stack.pop()
+        if isinstance(
+            curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            stack.extend(iter_nested_scope_header_nodes(curr))
+            continue
+        if isinstance(curr, ast.Lambda):
+            loaded.update(
+                _extract_expr_scope_free_reads(curr, include_header=False)
+            )
+            stack.extend(iter_nested_scope_header_nodes(curr))
+            continue
         if isinstance(curr, ast.Call):
-            if not isinstance(curr.func, ast.Name):
+            if isinstance(curr.func, ast.Name):
+                called.add(curr.func.id)
+            else:
                 stack.append(curr.func)
             stack.extend(curr.args)
             stack.extend(curr.keywords)
@@ -1016,7 +1112,61 @@ def _find_non_call_loaded_names(stmts: Sequence[ast.stmt]) -> Set[str]:
             loaded.add(curr.id)
             continue
         stack.extend(ast.iter_child_nodes(curr))
-    return loaded
+    return loaded, called
+
+
+def _find_non_call_loaded_names(stmts: Sequence[ast.AST]) -> Set[str]:
+    """Finds variable names loaded outside direct Call.func positions, stopping at nested scopes."""
+    return _extract_shallow_loads_and_calls(stmts)[0]
+
+
+def _collect_escaped_intra_unit_names(
+    candidate_stmts: Sequence[ast.stmt],
+    initial_escaped: AbstractSet[str],
+) -> Set[str]:
+    """Computes function/variable names that escape candidate_stmts via loads or escaped closures."""
+    top_loads, top_calls = _extract_shallow_loads_and_calls(candidate_stmts)
+    escaped: Set[str] = set(initial_escaped) | top_loads
+    executed: Set[str] = set(top_calls) | escaped
+    nested_defs: Dict[str, List[ast.AST]] = {}
+    walk_stack: List[ast.AST] = list(candidate_stmts)
+    while walk_stack:
+        node = walk_stack.pop()
+        if isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            nested_defs.setdefault(node.name, []).append(node)
+            if isinstance(node, ast.ClassDef) or getattr(
+                node, "decorator_list", None
+            ):
+                executed.add(node.name)
+        walk_stack.extend(ast.iter_child_nodes(node))
+
+    body_info: Dict[int, Tuple[Set[str], Set[str]]] = {}
+    changed = True
+    while changed:
+        changed = False
+        for name, nodes in nested_defs.items():
+            is_esc = name in escaped
+            is_exec = is_esc or name in executed
+            if not is_exec:
+                continue
+            for d_node in nodes:
+                nid = id(d_node)
+                if nid not in body_info:
+                    body_info[nid] = _extract_shallow_loads_and_calls(
+                        getattr(d_node, "body", ())
+                    )
+                b_loads, b_calls = body_info[nid]
+                new_esc = (b_loads | b_calls) if is_esc else b_loads
+                if not new_esc.issubset(escaped):
+                    escaped.update(new_esc)
+                    executed.update(new_esc)
+                    changed = True
+                if not b_calls.issubset(executed):
+                    executed.update(b_calls)
+                    changed = True
+    return escaped
 
 
 def _propagate_sibling_closures(
@@ -1139,6 +1289,91 @@ def _block_has_abnormal_exit(stmts: Sequence[ast.AST]) -> bool:
     return False
 
 
+def _eval_try_definite_bindings(
+    stmt: ast.AST,
+    active_nonlocals: Optional[Set[str]],
+    bound: Set[str],
+    fn_globals: AbstractSet[str],
+) -> Tuple[Set[str], bool]:
+    """Computes definite bindings and termination across a Try/TryStar statement."""
+    body_l = getattr(stmt, "body", ())
+    orelse_l = getattr(stmt, "orelse", ())
+    handlers_l = getattr(stmt, "handlers", ())
+    final_l = getattr(stmt, "finalbody", ())
+    if not handlers_l and not _block_has_abnormal_exit(final_l):
+        for sub_seq in (body_l, orelse_l, final_l):
+            bound, t_term = _extract_block_definite_bindings_and_term(
+                sub_seq, active_nonlocals, bound, fn_globals
+            )
+            if t_term:
+                return bound, True
+        return bound, False
+
+    if type(stmt).__name__ == "TryStar":
+        bound.difference_update(_extract_shallow_deleted_names(stmt))
+        if final_l and not _block_has_abnormal_exit(final_l):
+            return _extract_block_definite_bindings_and_term(
+                final_l, active_nonlocals, bound, fn_globals
+            )
+        return bound, False
+
+    pre_try_surviving = set(bound)
+    for b_stmt in body_l:
+        pre_try_surviving.difference_update(
+            _extract_shallow_deleted_names(b_stmt)
+        )
+    for h_node in handlers_l:
+        h_name = getattr(h_node, "name", None)
+        if isinstance(h_name, str):
+            pre_try_surviving.discard(h_name)
+
+    normal_bound, normal_term = _extract_block_definite_bindings_and_term(
+        body_l, active_nonlocals, bound, fn_globals
+    )
+    if not normal_term and orelse_l:
+        normal_bound, normal_term = _extract_block_definite_bindings_and_term(
+            orelse_l, active_nonlocals, normal_bound, fn_globals
+        )
+
+    fallthrough_sets: List[Set[str]] = []
+    if not normal_term:
+        fallthrough_sets.append(normal_bound)
+
+    for h_node in handlers_l:
+        h_body = getattr(h_node, "body", ())
+        h_bound, h_term = _extract_block_definite_bindings_and_term(
+            h_body, active_nonlocals, pre_try_surviving, fn_globals
+        )
+        h_name = getattr(h_node, "name", None)
+        if isinstance(h_name, str):
+            h_bound.discard(h_name)
+        if not h_term:
+            fallthrough_sets.append(h_bound)
+
+    if not fallthrough_sets:
+        if final_l and not _block_has_abnormal_exit(final_l):
+            f_bound, _ = _extract_block_definite_bindings_and_term(
+                final_l, active_nonlocals, pre_try_surviving, fn_globals
+            )
+            return f_bound, True
+        return set(), True
+
+    out_bound = set.intersection(*fallthrough_sets)
+    if final_l:
+        if _block_has_abnormal_exit(final_l):
+            for f_stmt in final_l:
+                out_bound.difference_update(
+                    _extract_shallow_deleted_names(f_stmt)
+                )
+        else:
+            out_bound, f_term = _extract_block_definite_bindings_and_term(
+                final_l, active_nonlocals, out_bound, fn_globals
+            )
+            if f_term:
+                return out_bound, True
+    return out_bound, False
+
+
 def _extract_block_definite_bindings_and_term(
     stmts: Sequence[ast.AST],
     active_nonlocals: Optional[Set[str]],
@@ -1174,10 +1409,7 @@ def _extract_block_definite_bindings_and_term(
                 else:
                     bound = b_bound & o_bound
             elif not b_term:
-                for b_stmt in stmt.body:
-                    bound.difference_update(
-                        _extract_shallow_deleted_names(b_stmt)
-                    )
+                bound = bound & b_bound
             continue
         if isinstance(stmt, (ast.With, ast.AsyncWith)):
             for item in stmt.items:
@@ -1198,27 +1430,11 @@ def _extract_block_definite_bindings_and_term(
                 bound.difference_update(_extract_shallow_deleted_names(b_stmt))
             continue
         if isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
-            handlers_l = getattr(stmt, "handlers", [])
-            final_l = getattr(stmt, "finalbody", [])
-            if not handlers_l and not _block_has_abnormal_exit(final_l):
-                for sub_seq in (
-                    getattr(stmt, "body", ()),
-                    getattr(stmt, "orelse", ()),
-                    final_l,
-                ):
-                    bound, t_term = _extract_block_definite_bindings_and_term(
-                        sub_seq, active_nonlocals, bound, fn_globals
-                    )
-                    if t_term:
-                        return bound, True
-                continue
-            bound.difference_update(_extract_shallow_deleted_names(stmt))
-            if final_l and not _block_has_abnormal_exit(final_l):
-                bound, f_term = _extract_block_definite_bindings_and_term(
-                    final_l, active_nonlocals, bound, fn_globals
-                )
-                if f_term:
-                    return bound, True
+            bound, t_term = _eval_try_definite_bindings(
+                stmt, active_nonlocals, bound, fn_globals
+            )
+            if t_term:
+                return bound, True
             continue
         bound.difference_update(_extract_shallow_deleted_names(stmt))
         if isinstance(stmt, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
@@ -1276,6 +1492,41 @@ def _extract_if_exhaustive_bindings(
     )[0]
 
 
+def _maybe_push_pre_span_exhaustive_frame(
+    curr: ast.AST,
+    encloses: bool,
+    has_clauses: bool,
+    frame: _StackFrame,
+    span: _SpanBounds,
+    state: _CellBindingState,
+    stack: List[_StackFrame],
+) -> None:
+    """Pushes a post_pre_bound frame when a non-enclosing compound statement precedes span."""
+    if (
+        not encloses
+        and not frame.is_branched
+        and has_clauses
+        and _is_pos_before_span(
+            getattr(curr, "end_lineno", getattr(curr, "lineno", None)),
+            getattr(curr, "end_col_offset", getattr(curr, "col_offset", None)),
+            span,
+        )
+    ):
+        exh_bound = _extract_block_definite_bindings(
+            (curr,), frame.active_nonlocals, state.pre_bound, state.fn_globals
+        )
+        if exh_bound:
+            stack.append(
+                _StackFrame(
+                    curr,
+                    frame.is_branched,
+                    frame.in_loop,
+                    frame.active_nonlocals,
+                    post_pre_bound=exh_bound,
+                )
+            )
+
+
 def _push_compound_children(
     curr: ast.AST,
     span: _SpanBounds,
@@ -1295,25 +1546,9 @@ def _push_compound_children(
     if isinstance(curr, ast.If):
         body_span = encloses and _block_contains_span(curr.body, span)
         else_span = encloses and _block_contains_span(curr.orelse, span)
-        if (
-            not encloses
-            and not is_br
-            and curr.body
-            and _is_pos_before_span(
-                getattr(curr, "end_lineno", getattr(curr, "lineno", None)),
-                getattr(curr, "end_col_offset", getattr(curr, "col_offset", None)),
-                span,
-            )
-        ):
-            exh_bound = _extract_if_exhaustive_bindings(
-                curr, act_nl, state.pre_bound, state.fn_globals
-            )
-            if exh_bound:
-                stack.append(
-                    _StackFrame(
-                        curr, is_br, in_lp, act_nl, post_pre_bound=exh_bound
-                    )
-                )
+        _maybe_push_pre_span_exhaustive_frame(
+            curr, encloses, bool(curr.body), frame, span, state, stack
+        )
         _push_seq(stack, curr.orelse, is_br if else_span else True, in_lp, act_nl)
         _push_seq(stack, curr.body, is_br if body_span else True, in_lp, act_nl)
         stack.append(_StackFrame(curr.test, is_br, in_lp, act_nl))
@@ -1406,6 +1641,9 @@ def _push_compound_children(
             not encloses
             and not handlers_l
             and not _block_has_abnormal_exit(final_l)
+        )
+        _maybe_push_pre_span_exhaustive_frame(
+            curr, encloses, bool(handlers_l), frame, span, state, stack
         )
         _push_seq(
             stack,
@@ -2481,7 +2719,7 @@ def _check_intra_unit_nonlocal_mutators(
     if not is_subroutine:
         return False
 
-    non_call_loads = _find_non_call_loaded_names(candidate_stmts)
+    _ = intra_closure_reads
     outer_touched: Set[str] = set()
     all_post_reads: Set[str] = set()
     all_sib_reads: Set[str] = set()
@@ -2495,14 +2733,11 @@ def _check_intra_unit_nonlocal_mutators(
         all_post_reads.update(info.post_reads)
         for _, sib_r, _ in info.sibling_closures:
             all_sib_reads.update(sib_r)
+    escaped_unit_names = _collect_escaped_intra_unit_names(
+        candidate_stmts, all_post_reads | all_sib_reads
+    )
     for mut_fn_name, mutated_vars, is_escaped_def in intra_nl_mutators:
-        mut_fn_escapes = (
-            is_escaped_def
-            or mut_fn_name in all_post_reads
-            or mut_fn_name in all_sib_reads
-            or mut_fn_name in intra_closure_reads
-            or mut_fn_name in non_call_loads
-        )
+        mut_fn_escapes = is_escaped_def or mut_fn_name in escaped_unit_names
         for var in mutated_vars & top_locals_set:
             if var in outer_touched or (
                 mut_fn_escapes
@@ -2599,6 +2834,7 @@ class _UnitClosureHazardContext(NamedTuple):
     has_yield: bool = False
     is_async: bool = False
     skip_pre_unit_closures: bool = False
+    definite_stores: Optional[AbstractSet[str]] = None
 
 
 def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
@@ -2719,6 +2955,36 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         unit_mutations,
         mod_tree=ctx.mod_tree,
     )
+    if (
+        ctx.definite_stores is not None
+        and ctx.is_subroutine
+        and not ctx.has_yield
+        and chain_infos
+    ):
+        unseeded_cond_stores = (
+            store_set - set(ctx.definite_stores)
+        ) - set(ctx.inputs)
+        if unseeded_cond_stores:
+            imm_info = chain_infos[-1]
+            imm_sib_reads: Set[str] = (
+                set().union(*(s_r for _, s_r, _ in imm_info.sibling_closures))
+                if imm_info.sibling_closures
+                else set()
+            )
+            eff_sib_reads = (
+                imm_sib_reads & imm_info.post_reads
+                if ctx.skip_pre_unit_closures
+                else imm_sib_reads
+            )
+            cond_pre_post = (
+                imm_info.pre_mutated - imm_info.pre_bound
+            ) & imm_info.post_reads
+            if bool(
+                unseeded_cond_stores
+                & imm_info.fn_locals
+                & (eff_sib_reads | cond_pre_post)
+            ):
+                return True
 
     captured_candidates = intra_closure_reads & (
         eff_input_set
