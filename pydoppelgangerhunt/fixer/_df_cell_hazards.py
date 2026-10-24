@@ -138,11 +138,11 @@ def _find_enclosing_function_chain(
     for estart, n_end, _span, node in _get_tree_scope_intervals(mod_tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        if estart <= 0 or estart > u_start or u_end > n_end:
+        n_lineno = int(getattr(node, "lineno", estart) or estart)
+        if n_lineno <= 0 or u_start < n_lineno or u_end > n_end:
             continue
         n_col = int(getattr(node, "col_offset", 0) or 0)
-        n_lineno = int(getattr(node, "lineno", estart) or estart)
-        if u_start in (estart, n_lineno):
+        if u_start == n_lineno:
             if u_start_col is not None and n_col > u_start_col:
                 continue
             if u_end == n_end and (u_start_col is None or n_col == u_start_col):
@@ -839,8 +839,10 @@ def _record_deletion_at_pos(
         name, frame.active_nonlocals, state.fn_globals
     ):
         return
-    if _is_pos_before_span(line, col, span) or (
-        unconditional_post_del and _is_pos_after_span(line, col, span)
+    if (
+        _is_pos_before_span(line, col, span)
+        or frame.in_loop
+        or (unconditional_post_del and _is_pos_after_span(line, col, span))
     ):
         state.pre_bound.discard(name)
         state.pre_unbound.add(name)
@@ -1408,13 +1410,19 @@ def _handle_nested_scope_node(
             if _is_pos_after_span(estart, c_col, span):
                 state.post_reads.update(free_r)
         if isinstance(curr, ast.ClassDef):
-            _push_seq(
-                stack,
-                curr.body,
-                frame.is_branched,
-                frame.in_loop,
-                _extract_direct_nonlocals(curr),
-            )
+            cls_nonlocals = _extract_direct_nonlocals(curr)
+            if (
+                enclosing_cls
+                or cls_nonlocals
+                or not _is_pos_after_span(estart, c_col, span)
+            ):
+                _push_seq(
+                    stack,
+                    curr.body,
+                    frame.is_branched,
+                    frame.in_loop,
+                    cls_nonlocals,
+                )
         _push_seq(
             stack,
             list(iter_nested_scope_header_nodes(curr)),
@@ -1485,6 +1493,7 @@ def _handle_nested_scope_node(
                     scope_ctx,
                     call_edges,
                     excluded_names=comp_targets,
+                    fn_globals=state.fn_globals,
                 )
         if _is_pos_after_span(c_line, c_col, span):
             state.post_reads.update(
@@ -1513,17 +1522,27 @@ def _record_carrier_closures_and_aliases(
     call_edges: Optional[List[Tuple[str, Set[str]]]] = None,
     *,
     excluded_names: AbstractSet[str] = frozenset(),
+    fn_globals: AbstractSet[str] = frozenset(),
 ) -> None:
     """Extracts inline closures and alias edges from assignment or mutating call nodes."""
     carrier = _extract_closure_carrier_targets_and_values(curr)
     if carrier is None:
         return
     c_targets, c_values = carrier
+    store_names = (
+        set()
+        if isinstance(curr, ast.Call)
+        else _extract_store_names_in_node(curr)
+    )
     valid_targets = [
         t
         for t in c_targets
         if t not in excluded_names
-        and _can_bind_in_fn_scope(t, frame.active_nonlocals)
+        and (
+            _can_bind_in_fn_scope(t, frame.active_nonlocals, fn_globals)
+            if t in store_names
+            else t not in fn_globals
+        )
     ]
     if not valid_targets:
         return
@@ -1600,11 +1619,10 @@ def _analyze_enclosing_fn_cells_uncached(
 ) -> _EnclosingFnCellInfo:
     """Computes variable bindings, post-span mutations, loop mutations, and sibling closures."""
     scope_ctx = _get_fn_scope_context(fn_node, mod_tree=mod_tree)
-    fn_locals = set(scope_ctx.fn_locals)
     fn_globals = _extract_direct_nonlocals(fn_node, is_global=True)
-    pre_bound: Set[str] = (
-        set(_extract_node_type_param_names(fn_node)) - fn_globals
-    )
+    tp_names = set(_extract_node_type_param_names(fn_node)) - fn_globals
+    fn_locals = set(scope_ctx.fn_locals) | tp_names
+    pre_bound: Set[str] = set(tp_names)
     fn_args = getattr(fn_node, "args", None)
     if isinstance(fn_args, ast.arguments):
         pre_bound.update(_extract_arg_names(fn_args) - fn_globals)
@@ -1768,6 +1786,7 @@ def _analyze_enclosing_fn_cells_uncached(
             alias_edges,
             scope_ctx,
             call_edges,
+            fn_globals=state.fn_globals,
         )
         if is_conc_pos:
             concurrent_sib_indices.update(
@@ -1811,8 +1830,14 @@ def _analyze_enclosing_fn_cells_uncached(
         )
 
     if enclosed_fn is not None and enclosed_fn_multi_invoked:
+        enc_muts, enc_dels = _extract_closure_nonlocal_mutations_and_deletions(
+            enclosed_fn
+        )
         state.loop_mutated.update(unit_mutations)
-        state.loop_mutated.update(_extract_closure_nonlocal_mutations(enclosed_fn))
+        state.loop_mutated.update(enc_muts)
+        if enc_dels:
+            state.pre_bound.difference_update(enc_dels)
+            state.pre_unbound.update(enc_dels)
 
     if sibling_nl_deletions:
         state.pre_bound.difference_update(sibling_nl_deletions)

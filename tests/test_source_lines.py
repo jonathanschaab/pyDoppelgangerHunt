@@ -4032,6 +4032,62 @@ _CLOSURE_CELL_SCENARIOS = [
         },
         True,
     ),
+    (
+        "class_body_mutating_carrier_call_captures_shared_cell",
+        (
+            "def outer_cls_carrier(items):\n"
+            "    acc = 0\n"
+            "    cbs = []\n"
+            "    class Box:\n"
+            "        cbs.append(lambda: acc)\n"
+            "        out = []\n"
+            "        for x in items:\n"
+            "            acc += x\n"
+            "            out.append(cbs[0]() + x)\n"
+            "    return Box, acc\n"
+        ),
+        {
+            "start": 7,
+            "end": 9,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    acc += x\n"
+                "    out.append(cbs[0]() + x)\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "neg_sibling_class_shadowed_attribute_not_post_read",
+        (
+            "def outer_sib_cls_attr(items):\n"
+            "    count = 0\n"
+            "    def inc():\n"
+            "        nonlocal count\n"
+            "        count += 1\n"
+            "    for x in items:\n"
+            "        inc()\n"
+            "    class Sibling:\n"
+            "        count = 10\n"
+            "        doubled = count * 2\n"
+            "    return Sibling\n"
+        ),
+        {
+            "start": 2,
+            "end": 7,
+            "kind": "compound_block",
+            "source_code": (
+                "count = 0\n"
+                "def inc():\n"
+                "    nonlocal count\n"
+                "    count += 1\n"
+                "for x in items:\n"
+                "    inc()\n"
+            ),
+        },
+        False,
+    ),
 ]
 
 
@@ -4293,6 +4349,44 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
         )
         assert "total" not in sc_sg["inputs"]
         assert "severed_closure_cell" in sc_sg["control_flow_hazards"]
+
+    # Post-span del inside enclosing loop unbinds nonlocal for subsequent iterations
+    loop_post_del_src = (
+        "def outer_loop_del():\n"
+        "    total = 5\n"
+        "    def inner(groups):\n"
+        "        nonlocal total\n"
+        "        for items in groups:\n"
+        "            for x in items:\n"
+        "                if x > 0:\n"
+        "                    total = x * 2\n"
+        "            del total\n"
+        "    return inner\n"
+    )
+    sc_lpd = inspect_single_unit_scope(
+        {
+            "start": 6,
+            "end": 8,
+            "kind": "compound_block",
+            "source_text": loop_post_del_src,
+            "source_code": "for x in items:\n    if x > 0:\n        total = x * 2\n",
+        },
+        tree=ast.parse(loop_post_del_src),
+    )
+    assert "total" not in sc_lpd["inputs"]
+    assert "severed_closure_cell" in sc_lpd["control_flow_hazards"]
+
+    # synthesize_shared_helper_code(closure_strictness='lenient') does not mutate caller unit dicts
+    lenient_u1 = dict(u_sync1)
+    lenient_u2 = dict(u_sync2)
+    _ = synthesize_shared_helper_code(
+        lenient_u1,
+        lenient_u2,
+        repo_root=str(tmp_path),
+        closure_strictness="lenient",
+    )
+    assert "skip_pre_unit_closures" not in lenient_u1
+    assert "skip_pre_unit_closures" not in lenient_u2
 
     # ClassDef immediate scope with nonlocal declaration in collect_downstream_read_names
     cls_nl_src = (
@@ -4635,3 +4729,33 @@ def test_df_cell_hazards_numbered_checks_unit() -> None:
         same_line_tree, 3, 4, u_start_col=4
     )
     assert [getattr(fn, "name", None) for _, _, fn in chain_same_line] == ["outer"]
+
+    # _find_enclosing_function_chain excludes decorated inner function when unit is inside decorator
+    dec_tree = ast.parse(
+        "def outer(items):\n"
+        "    @dec([x * 2 for x in items])\n"
+        "    def inner():\n"
+        "        return 1\n"
+    )
+    chain_dec = _find_enclosing_function_chain(dec_tree, 2, 2)
+    assert [getattr(fn, "name", None) for _, _, fn in chain_dec] == ["outer"]
+
+    # PEP 695 type_params on inner function are included in info.fn_locals
+    import sys  # pylint: disable=import-outside-toplevel
+
+    if sys.version_info >= (3, 12):
+        tp_src = (
+            "def outer(items):\n"
+            "    T = 1\n"
+            "    def inner[T]():\n"
+            "        for x in items:\n"
+            "            f = lambda: T\n"
+            "        return f\n"
+            "    return inner, T\n"
+        )
+        tp_tree = ast.parse(tp_src)
+        tp_chain = _find_enclosing_function_chain(tp_tree, 4, 5)
+        tp_inner_info = _analyze_enclosing_fn_cells(
+            tp_chain[-1][2], (4, 5, None, None)
+        )
+        assert "T" in tp_inner_info.fn_locals

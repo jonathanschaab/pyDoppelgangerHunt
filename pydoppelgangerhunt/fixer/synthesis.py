@@ -1415,15 +1415,19 @@ def synthesize_shared_helper_code(
     ):
         if s_text is not None:
             u_item.setdefault("source_text", s_text)
-        if effective_skip_closures:
-            u_item["skip_pre_unit_closures"] = True
         _populate_unit_receiver_metadata(
             u_item, repo_root=repo_root, source_text=s_text, tree=t_item
         )
         s_item = (
             dict(pre_s)
             if pre_s is not None
-            else inspect_single_unit_scope(u_item, repo_root=repo_root, tree=t_item)
+            else inspect_single_unit_scope(
+                {**u_item, "skip_pre_unit_closures": True}
+                if effective_skip_closures
+                else u_item,
+                repo_root=repo_root,
+                tree=t_item,
+            )
         )
         if u_item.get("enclosing_is_async") and s_item.get("has_yield"):
             s_item["is_async"] = True
