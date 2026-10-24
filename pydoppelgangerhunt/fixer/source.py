@@ -554,19 +554,10 @@ def _slice_utf8_line(
     line: str, s_col: int, e_col: Optional[int] = None
 ) -> str:
     """Slices a single line by UTF-8 byte column offsets."""
-    if line.isascii():
-        return (
-            line[s_col:e_col]
-            if (e_col is not None and e_col >= s_col)
-            else line[s_col:]
-        )
-    raw = line.encode("utf-8")
-    sliced = (
-        raw[s_col:e_col]
-        if (e_col is not None and e_col >= s_col)
-        else raw[s_col:]
-    )
-    return sliced.decode("utf-8", errors="replace")
+    s_char = col_offset_to_char_offset(line, s_col)
+    if e_col is not None and e_col >= s_col:
+        return line[s_char : col_offset_to_char_offset(line, e_col)]
+    return line[s_char:]
 
 
 def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]:

@@ -1701,7 +1701,11 @@ def _find_enclosing_pre_bound_names(
                 continue
             if isinstance(curr, (ast.For, ast.AsyncFor, ast.While)):
                 if _node_strictly_encloses_bounds(
-                    curr, s_line, e_line, u_start_col, u_end_col
+                    curr,
+                    s_line,
+                    e_line,
+                    u_start_col=u_start_col,
+                    u_end_col=u_end_col,
                 ):
                     in_loop = True
             if _is_before_unit(c_start, c_col):
@@ -1722,7 +1726,11 @@ def _find_enclosing_pre_bound_names(
                     isinstance(curr, ast.ExceptHandler)
                     and isinstance(curr.name, str)
                     and _node_strictly_encloses_bounds(
-                        curr, s_line, e_line, u_start_col, u_end_col
+                        curr,
+                        s_line,
+                        e_line,
+                        u_start_col=u_start_col,
+                        u_end_col=u_end_col,
                     )
                 ):
                     bound_before.add(curr.name)
@@ -1807,7 +1815,8 @@ def _unit_cols(
                 start_id = snippet[0].isalnum() or snippet[0] == "_"
                 end_id = snippet[-1].isalnum() or snippet[-1] == "_"
                 search_idx = 0
-                best_pair: Optional[Tuple[int, int]] = None
+                exact_matches: List[Tuple[int, int]] = []
+                compat_matches: List[Tuple[int, int]] = []
                 while True:
                     pos = line0.find(snippet, search_idx)
                     if pos < 0:
@@ -1825,15 +1834,17 @@ def _unit_cols(
                         if (s_col is None or cand_s == s_col) and (
                             e_col is None or cand_e == e_col
                         ):
-                            best_pair = (cand_s, cand_e)
-                            break
-                        if (
-                            best_pair is None
-                            and (s_col is None or cand_e > s_col)
-                            and (e_col is None or cand_s < e_col)
+                            exact_matches.append((cand_s, cand_e))
+                        elif (s_col is None or cand_e > s_col) and (
+                            e_col is None or cand_s < e_col
                         ):
-                            best_pair = (cand_s, cand_e)
+                            compat_matches.append((cand_s, cand_e))
                     search_idx = pos + 1
+                best_pair: Optional[Tuple[int, int]] = None
+                if len(exact_matches) == 1:
+                    best_pair = exact_matches[0]
+                elif not exact_matches and len(compat_matches) == 1:
+                    best_pair = compat_matches[0]
                 if best_pair is not None:
                     if s_col is None:
                         s_col = best_pair[0]
@@ -2193,6 +2204,8 @@ def _inspect_unit_scope(
                 if del_name not in visitor.read_before_write:
                     visitor.read_before_write.append(del_name)
 
+        resolved_s_col, resolved_e_col = inferred_s_col, inferred_e_col
+        cols_resolved = False
         if is_subroutine:
             live_in_visitor = _UnitLiveInVisitor(1, 10**9, include_annotations=False)
             for stmt in candidate_stmts:
@@ -2221,21 +2234,22 @@ def _inspect_unit_scope(
                 rejected_escaping_vars: Set[str] = set()
                 u_start = parse_unit_coord(unit, "start", default=0)
                 u_end = parse_unit_coord(unit, "end", default=u_start)
-                u_start_col, u_end_col = inferred_s_col, inferred_e_col
                 mod_tree = file_tree
                 if mod_tree is None and u_start > 0:
                     full_src = _get_full_source()
                     if full_src:
                         mod_tree = _get_or_parse_tree(full_src)
                 if mod_tree is not None and u_start > 0:
-                    u_start_col, u_end_col = _resolve_unit_col_bounds(
+                    resolved_s_col, resolved_e_col = _resolve_unit_col_bounds(
                         candidate_stmts,
                         mod_tree,
                         u_start,
                         u_end,
-                        u_start_col,
-                        u_end_col,
+                        resolved_s_col,
+                        resolved_e_col,
                     )
+                    cols_resolved = True
+                    u_start_col, u_end_col = resolved_s_col, resolved_e_col
                     pre_bound, _ = _find_enclosing_pre_bound_names(
                         mod_tree,
                         u_start,
@@ -2253,8 +2267,8 @@ def _inspect_unit_scope(
                                     enc_chain[-1][2],
                                     u_start,
                                     u_end,
-                                    u_end_col=u_end_col,
                                     u_start_col=u_start_col,
+                                    u_end_col=u_end_col,
                                 )
                             )
                             enc_escaping = enc_nonlocals | enc_outer_globals
@@ -2451,7 +2465,6 @@ def _inspect_unit_scope(
                     if full_src:
                         c_mod_tree = _get_or_parse_tree(full_src)
                 if c_mod_tree is not None:
-                    c_start_col, c_end_col = inferred_s_col, inferred_e_col
                     if (
                         "severed_closure_cell" not in hazards
                         and _has_severed_closure_cell_hazard(
@@ -2460,8 +2473,8 @@ def _inspect_unit_scope(
                                 mod_tree=c_mod_tree,
                                 u_start=c_u_start,
                                 u_end=c_u_end,
-                                u_start_col=c_start_col,
-                                u_end_col=c_end_col,
+                                u_start_col=resolved_s_col,
+                                u_end_col=resolved_e_col,
                                 is_subroutine=is_subroutine,
                                 unit_kind=str(unit.get("kind") or ""),
                                 inputs=inputs,
@@ -2477,6 +2490,7 @@ def _inspect_unit_scope(
                                     unit.get("skip_pre_unit_closures")
                                 ),
                                 definite_stores=def_assigned,
+                                cols_resolved=cols_resolved,
                             )
                         )
                     ):
@@ -2653,7 +2667,7 @@ def _merge_type_params(tp1: Sequence[str], tp2: Sequence[str]) -> List[str]:
     ]
 
 
-def _scope_matches_closure_mode(
+def scope_matches_closure_mode(
     scope: Optional[Dict[str, Any]], expected_skip: bool
 ) -> bool:
     """Checks whether a precomputed scope dictionary matches expected_skip."""
@@ -2661,6 +2675,30 @@ def _scope_matches_closure_mode(
         return False
     raw_flag = scope.get("_skip_pre_unit_closures", False)
     return isinstance(raw_flag, bool) and raw_flag is bool(expected_skip)
+
+
+_scope_matches_closure_mode = scope_matches_closure_mode
+
+
+def ensure_unit_scope_closure_mode(
+    unit: Dict[str, Any],
+    scope: Optional[Dict[str, Any]],
+    skip_pre_unit_closures: bool,
+    *,
+    source_text: Optional[str] = None,
+    tree: Optional[ast.AST] = None,
+    repo_root: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Returns scope if its closure strictness mode matches, else recomputes it."""
+    if scope is not None and scope_matches_closure_mode(
+        scope, bool(skip_pre_unit_closures)
+    ):
+        return scope
+    u_copy = dict(unit)
+    u_copy["skip_pre_unit_closures"] = bool(skip_pre_unit_closures)
+    if source_text is not None:
+        u_copy.setdefault("source_text", source_text)
+    return inspect_single_unit_scope(u_copy, repo_root=repo_root, tree=tree)
 
 
 def analyze_unit_variable_scope(
@@ -2674,23 +2712,13 @@ def analyze_unit_variable_scope(
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
     expected_skip1 = bool(u1.get("skip_pre_unit_closures", False))
-    info1 = (
-        scope1
-        if (
-            scope1 is not None
-            and _scope_matches_closure_mode(scope1, expected_skip1)
-        )
-        else inspect_single_unit_scope(u1, repo_root=repo_root, tree=tree1)
+    info1 = ensure_unit_scope_closure_mode(
+        u1, scope1, expected_skip1, repo_root=repo_root, tree=tree1
     )
     if u2 is not None:
         expected_skip2 = bool(u2.get("skip_pre_unit_closures", False))
-        info2 = (
-            scope2
-            if (
-                scope2 is not None
-                and _scope_matches_closure_mode(scope2, expected_skip2)
-            )
-            else inspect_single_unit_scope(u2, repo_root=repo_root, tree=tree2)
+        info2 = ensure_unit_scope_closure_mode(
+            u2, scope2, expected_skip2, repo_root=repo_root, tree=tree2
         )
         inputs = _align_symmetric_var_list(info1["inputs"], info2["inputs"])
         outputs = _align_symmetric_var_list(info1["outputs"], info2["outputs"])
@@ -2867,7 +2895,7 @@ def analyze_unit_variable_scope(
             bool(info1.get("_skip_pre_unit_closures", False))
             if (
                 u2 is None
-                or _scope_matches_closure_mode(
+                or scope_matches_closure_mode(
                     info2, bool(info1.get("_skip_pre_unit_closures", False))
                 )
             )

@@ -5515,7 +5515,6 @@ def test_df_cell_hazards_numbered_checks_unit() -> None:
             mutators_c3,
             {"count", "inc"},
             set(),
-            {"count"},
             [info_c3],
             is_subroutine=True,
         )
@@ -5539,7 +5538,6 @@ def test_df_cell_hazards_numbered_checks_unit() -> None:
             mutators_c3,
             {"count", "inc"},
             set(),
-            {"count"},
             [info_c3_safe],
             is_subroutine=True,
         )
@@ -6036,7 +6034,7 @@ def test_nested_scope_reads_do_not_falsely_escape_mutator() -> None:
     """Verifies unexecuted or synchronous intra-unit references to a nonlocal mutator do not count as escaping."""
     from pydoppelgangerhunt.fixer import inspect_single_unit_scope
     from pydoppelgangerhunt.fixer._df_cell_hazards import (
-        _find_non_call_loaded_names,
+        _extract_shallow_loads_and_calls,
     )
 
     # 1. Reviewer's exact scenario: unused nested function calling increment()
@@ -6135,13 +6133,13 @@ def test_nested_scope_reads_do_not_falsely_escape_mutator() -> None:
     )
     assert "severed_closure_cell" in sc_escaped["control_flow_hazards"]
 
-    # 4. _find_non_call_loaded_names stops at nested def body but inspects default/decorator headers
+    # 4. _extract_shallow_loads_and_calls stops at nested def body but inspects default/decorator headers
     stmts = ast.parse(
         "def inner(cb=header_ref):\n"
         "    body_ref()\n"
         "    return body_val\n"
     ).body
-    non_call = _find_non_call_loaded_names(stmts)
+    non_call, _ = _extract_shallow_loads_and_calls(stmts)
     assert "header_ref" in non_call
     assert "body_ref" not in non_call
     assert "body_val" not in non_call
@@ -6179,8 +6177,12 @@ def test_partial_column_inference_all_four_combinations_and_utf8() -> None:
     dup_src = "def f(a):\n    a = a + 1; a = a + 1\n    return a\n"
     dup_tree = ast.parse(dup_src)
     cand_stmt = ast.parse("a = a + 1\n").body
-    # First statement is cols 4..13, second statement is cols 15..24
+    # First statement is cols 4..13, second statement is cols 15..24; ambiguous when both cols are None
     assert _resolve_unit_col_bounds(cand_stmt, dup_tree, 2, 2, None, None) == (
+        None,
+        None,
+    )
+    assert _resolve_unit_col_bounds(cand_stmt, dup_tree, 2, 2, 4, None) == (
         4,
         13,
     )
@@ -6523,7 +6525,7 @@ def test_2d_coordinate_enclosure_and_decorator_start_pos() -> None:
     )
     assert in_loop_right is False
 
-    # 7. Decorator line/col tracking uses decorator's '@' column rather than def's col_offset
+    # 7. Decorator line/col tracking uses decorator's '@' column and handles loose forms
     dec_fn = ast.FunctionDef(
         name="inner",
         args=ast.arguments(
@@ -6540,8 +6542,8 @@ def test_2d_coordinate_enclosure_and_decorator_start_pos() -> None:
                 ctx=ast.Load(),
                 lineno=2,
                 end_lineno=2,
-                col_offset=9,
-                end_col_offset=12,
+                col_offset=3,
+                end_col_offset=6,
             )
         ],
         lineno=3,
@@ -6549,9 +6551,146 @@ def test_2d_coordinate_enclosure_and_decorator_start_pos() -> None:
         col_offset=4,
         end_col_offset=12,
     )
-    assert _node_earliest_start_pos(dec_fn) == (2, 8)
+    assert _node_earliest_start_pos(dec_fn) == (2, 2)
     wrap_mod = ast.Module(body=[dec_fn], type_ignores=[])
     closures = _collect_scope_closures(wrap_mod)
-    assert closures[0][0] == (2, 8)
+    assert closures[0][0] == (2, 2)
+
+
+def test_pr38_review_fixes_duplicate_cols_shadowing_and_immutability() -> None:
+    """Covers PR #38 review items: duplicate _unit_cols, loose decorators, nonlocal shadowing, and immutable cache."""
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _analyze_enclosing_fn_cells,
+        _extract_fn_outer_carrier_targets,
+    )
+    from pydoppelgangerhunt.fixer._df_closures import (
+        _collect_scope_closures,
+        _node_earliest_start_pos,
+    )
+    from pydoppelgangerhunt.fixer._df_pairing import (
+        resolve_clone_generator_subroutine_outputs,
+    )
+    from pydoppelgangerhunt.fixer.scope import (
+        _unit_cols,
+        ensure_unit_scope_closure_mode,
+        inspect_single_unit_scope,
+        scope_matches_closure_mode,
+    )
+
+    # 1. _unit_cols returns (None, None) when duplicate snippets on a line are ambiguous
+    dup_line = "    a = f(); a = f()\n"
+    assert _unit_cols({"source_code": "a = f()"}, [dup_line]) == (None, None)
+    assert _unit_cols(
+        {"source_code": "a = f()", "start_col": 4}, [dup_line]
+    ) == (4, 11)
+    assert _unit_cols(
+        {"source_code": "a = f()", "start_col": 13}, [dup_line]
+    ) == (13, 20)
+    assert _unit_cols(
+        {"source_code": "a = f()", "end_col": 20}, [dup_line]
+    ) == (13, 20)
+
+    # 2. Loose decorator forms (@dec, @ dec, @(dec)) at top-level and indented
+    for dec_text in ("@dec", "@ dec", "@(dec)"):
+        top_mod = ast.parse(f"{dec_text}\ndef fn():\n    return x\n")
+        assert _node_earliest_start_pos(top_mod.body[0]) == (1, 0)
+        assert _collect_scope_closures(top_mod)[0][0] == (1, 0)
+
+        ind_mod = ast.parse(
+            f"def outer(x):\n    {dec_text}\n    def fn():\n        return x\n"
+        )
+        inner_fn = ind_mod.body[0].body[0]  # type: ignore[attr-defined]
+        assert _node_earliest_start_pos(inner_fn) == (2, 4)
+
+    # 3. _extract_fn_outer_carrier_targets does not report shadowed nonlocal in lambda or comprehension
+    shadow_mod = ast.parse(
+        "def outer():\n"
+        "    x = []\n"
+        "    y = 1\n"
+        "    def mid():\n"
+        "        nonlocal x\n"
+        "        f = lambda x: x.append(lambda: y)\n"
+        "        g = [x.append(lambda: y) for x in ([],)]\n"
+        "        return f, g\n"
+    )
+    mid_fn = shadow_mod.body[0].body[2]  # type: ignore[attr-defined]
+    assert _extract_fn_outer_carrier_targets(mid_fn) == set()
+
+    unshadowed_mod = ast.parse(
+        "def outer():\n"
+        "    x = []\n"
+        "    y = 1\n"
+        "    def mid():\n"
+        "        nonlocal x\n"
+        "        f = lambda z: x.append(lambda: y)\n"
+        "        return f\n"
+    )
+    mid_unshadowed = unshadowed_mod.body[0].body[2]  # type: ignore[attr-defined]
+    assert _extract_fn_outer_carrier_targets(mid_unshadowed) == {"x"}
+
+    # 4. _analyze_enclosing_fn_cells returns immutable containers and reuses cached statement deltas
+    multi_unit_mod = ast.parse(
+        "def big_fn(a):\n"
+        "    b = a + 1\n"
+        "    def helper():\n"
+        "        return b\n"
+        "    u1 = b + 2\n"
+        "    u2 = u1 + 3\n"
+        "    return helper(), u2\n"
+    )
+    big_fn = multi_unit_mod.body[0]
+    info1 = _analyze_enclosing_fn_cells(
+        big_fn, (5, 5, 4, 14), mod_tree=multi_unit_mod
+    )
+    info2 = _analyze_enclosing_fn_cells(
+        big_fn, (6, 6, 4, 15), mod_tree=multi_unit_mod
+    )
+    assert isinstance(info1.fn_locals, frozenset)
+    assert isinstance(info1.pre_bound, frozenset)
+    assert isinstance(info1.sibling_closures, tuple)
+    assert isinstance(info1.alias_edges, tuple)
+    assert "b" in info1.pre_bound
+    assert "u1" in info2.pre_bound
+
+    # 5. Centralized closure mode helpers and generator subroutine strictness normalization
+    gen_src = (
+        "def gen(items):\n"
+        "    cb = lambda: acc\n"
+        "    acc = 0\n"
+        "    for x in items:\n"
+        "        acc += x\n"
+        "        yield acc\n"
+        "    return acc, cb\n"
+    )
+    gen_tree = ast.parse(gen_src)
+    u_gen = {
+        "start": 3,
+        "end": 6,
+        "kind": "compound_block",
+        "source_text": gen_src,
+        "source_code": "acc = 0\nfor x in items:\n    acc += x\n    yield acc\n",
+    }
+    strict_sc = inspect_single_unit_scope(u_gen, tree=gen_tree)
+    assert scope_matches_closure_mode(strict_sc, False) is True
+    assert scope_matches_closure_mode(strict_sc, True) is False
+    lenient_sc = ensure_unit_scope_closure_mode(
+        u_gen, strict_sc, True, source_text=gen_src, tree=gen_tree
+    )
+    assert scope_matches_closure_mode(lenient_sc, True) is True
+    assert (
+        resolve_clone_generator_subroutine_outputs(
+            u_gen,
+            dict(u_gen),
+            strict_sc,
+            dict(strict_sc),
+            source_text1=gen_src,
+            source_text2=gen_src,
+            tree1=gen_tree,
+            tree2=gen_tree,
+            closure_strictness="lenient",
+        )
+        == (["acc"], ["acc"])
+    )
+
 
 

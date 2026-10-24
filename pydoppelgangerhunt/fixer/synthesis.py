@@ -33,11 +33,11 @@ from pydoppelgangerhunt.fixer.scope import (
     _determine_binding_kind,
     _normalize_receiver_attrs,
     _rank_param_kind,
-    _scope_matches_closure_mode,
     _unfold_receiver_attribute,
     analyze_unit_variable_scope,
-    inspect_single_unit_scope,
+    ensure_unit_scope_closure_mode,
     is_subroutine_unit,
+    scope_matches_closure_mode,
 )
 from pydoppelgangerhunt.fixer.source import (
     _detect_indent_step,
@@ -1407,9 +1407,9 @@ def synthesize_shared_helper_code(
         skip_pre_unit_closures=skip_pre_unit_closures,
     )
     has_precomputed_scopes = (
-        _scope_matches_closure_mode(scope1, effective_skip_closures)
-        and _scope_matches_closure_mode(scope2, effective_skip_closures)
-        and _scope_matches_closure_mode(scope, effective_skip_closures)
+        scope_matches_closure_mode(scope1, effective_skip_closures)
+        and scope_matches_closure_mode(scope2, effective_skip_closures)
+        and scope_matches_closure_mode(scope, effective_skip_closures)
     )
     scopes: List[Dict[str, Any]] = []
     for u_item, s_text, t_item, pre_s in (
@@ -1421,16 +1421,14 @@ def synthesize_shared_helper_code(
         _populate_unit_receiver_metadata(
             u_item, repo_root=repo_root, source_text=s_text, tree=t_item
         )
-        s_item = (
-            dict(pre_s)
-            if (
-                pre_s is not None
-                and _scope_matches_closure_mode(pre_s, effective_skip_closures)
-            )
-            else inspect_single_unit_scope(
-                {**u_item, "skip_pre_unit_closures": effective_skip_closures},
-                repo_root=repo_root,
+        s_item = dict(
+            ensure_unit_scope_closure_mode(
+                u_item,
+                pre_s,
+                effective_skip_closures,
+                source_text=s_text,
                 tree=t_item,
+                repo_root=repo_root,
             )
         )
         if u_item.get("enclosing_is_async") and s_item.get("has_yield"):

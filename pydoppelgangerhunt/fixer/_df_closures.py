@@ -48,9 +48,15 @@ def _node_earliest_start_pos(
         d_line = getattr(dec, "lineno", None)
         d_col = getattr(dec, "col_offset", None)
         if isinstance(d_line, int):
-            at_col = (
-                max(0, d_col - 1) if isinstance(d_col, int) else best_col
-            )
+            if isinstance(d_col, int):
+                raw_at_col = max(0, d_col - 1)
+                at_col: Optional[int] = (
+                    min(n_col, raw_at_col)
+                    if isinstance(n_col, int)
+                    else raw_at_col
+                )
+            else:
+                at_col = best_col
             if best_line is None or d_line < best_line:
                 best_line = d_line
                 best_col = at_col
@@ -704,8 +710,8 @@ def _resolve_immediate_scope_in_fn(
     scope_node: ast.AST,
     u_start: int,
     u_end: int,
-    u_end_col: Optional[int] = None,
     u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
 ) -> ast.AST:
     """Finds the innermost ClassDef in scope_node strictly enclosing the unit, or scope_node."""
     if u_start <= 0:
@@ -721,10 +727,18 @@ def _resolve_immediate_scope_in_fn(
             c_col = int(getattr(curr, "col_offset", 0) or 0)
             in_hdr = any(
                 _is_ast_node_within_unit_bounds(
-                    hdr, u_start, u_end, u_end_col, u_start_col
+                    hdr,
+                    u_start,
+                    u_end,
+                    u_end_col=u_end_col,
+                    u_start_col=u_start_col,
                 )
                 or _node_strictly_encloses_bounds(
-                    hdr, u_start, u_end, u_start_col, u_end_col
+                    hdr,
+                    u_start,
+                    u_end,
+                    u_start_col=u_start_col,
+                    u_end_col=u_end_col,
                 )
                 for hdr in iter_nested_scope_header_nodes(curr)
             )
@@ -741,7 +755,11 @@ def _resolve_immediate_scope_in_fn(
                 ):
                     in_hdr = True
             strictly_inside = not in_hdr and _node_strictly_encloses_bounds(
-                curr, u_start, u_end, u_start_col, u_end_col
+                curr,
+                u_start,
+                u_end,
+                u_start_col=u_start_col,
+                u_end_col=u_end_col,
             )
             if strictly_inside:
                 cand_span = (c_start, -c_end, c_col)
@@ -760,8 +778,8 @@ def _extract_scope_nonlocals_and_outer_globals(
     scope_node: ast.AST,
     u_start: int,
     u_end: int,
-    u_end_col: Optional[int] = None,
     u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
 ) -> Tuple[Set[str], Set[str]]:
     """Extracts (nonlocal_names, outer_only_globals) declared in the unit's immediate scope."""
     if not isinstance(
@@ -769,19 +787,17 @@ def _extract_scope_nonlocals_and_outer_globals(
     ):
         return set(), set()
     target_scope = _resolve_immediate_scope_in_fn(
-        scope_node, u_start, u_end, u_end_col=u_end_col, u_start_col=u_start_col
+        scope_node,
+        u_start,
+        u_end,
+        u_start_col=u_start_col,
+        u_end_col=u_end_col,
     )
     nonlocal_names: Set[str] = set()
     outer_globals: Set[str] = set()
     intra_globals: Set[str] = set()
     body = getattr(target_scope, "body", [])
-    stack: List[ast.AST] = (
-        list(body)
-        if isinstance(body, list)
-        else [body]
-        if isinstance(body, ast.AST)
-        else []
-    )
+    stack: List[ast.AST] = list(body) if isinstance(body, list) else []
     while stack:
         curr = stack.pop()
         if isinstance(curr, _INNER_SCOPE_TYPES):
@@ -791,7 +807,11 @@ def _extract_scope_nonlocals_and_outer_globals(
             continue
         if isinstance(curr, ast.Global):
             if _is_ast_node_within_unit_bounds(
-                curr, u_start, u_end, u_end_col, u_start_col
+                curr,
+                u_start,
+                u_end,
+                u_end_col=u_end_col,
+                u_start_col=u_start_col,
             ):
                 intra_globals.update(curr.names)
             else:
@@ -805,11 +825,15 @@ def _extract_scope_escaping_bindings(
     scope_node: ast.AST,
     u_start: int,
     u_end: int,
-    u_end_col: Optional[int] = None,
     u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
 ) -> Set[str]:
     """Extracts nonlocal and outer global names declared in a function scope."""
     nonlocal_names, outer_globals = _extract_scope_nonlocals_and_outer_globals(
-        scope_node, u_start, u_end, u_end_col=u_end_col, u_start_col=u_start_col
+        scope_node,
+        u_start,
+        u_end,
+        u_start_col=u_start_col,
+        u_end_col=u_end_col,
     )
     return nonlocal_names | outer_globals
