@@ -1401,12 +1401,20 @@ def synthesize_shared_helper_code(
     tree2 = _resolve_tree(tree2, source_text2, u2)
 
     # Variable scope analysis for concrete parameter signatures.
-    has_precomputed_scopes = (
-        scope1 is not None and scope2 is not None and scope is not None
-    )
     _, effective_skip_closures = resolve_closure_strictness_mode(
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
+    )
+    has_precomputed_scopes = (
+        scope1 is not None
+        and scope2 is not None
+        and scope is not None
+        and bool(scope1.get("_skip_pre_unit_closures", False))
+        == effective_skip_closures
+        and bool(scope2.get("_skip_pre_unit_closures", False))
+        == effective_skip_closures
+        and bool(scope.get("_skip_pre_unit_closures", False))
+        == effective_skip_closures
     )
     scopes: List[Dict[str, Any]] = []
     for u_item, s_text, t_item, pre_s in (
@@ -1420,11 +1428,13 @@ def synthesize_shared_helper_code(
         )
         s_item = (
             dict(pre_s)
-            if pre_s is not None
+            if (
+                pre_s is not None
+                and bool(pre_s.get("_skip_pre_unit_closures", False))
+                == effective_skip_closures
+            )
             else inspect_single_unit_scope(
-                {**u_item, "skip_pre_unit_closures": True}
-                if effective_skip_closures
-                else u_item,
+                {**u_item, "skip_pre_unit_closures": effective_skip_closures},
                 repo_root=repo_root,
                 tree=t_item,
             )

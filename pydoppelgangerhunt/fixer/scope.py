@@ -1640,7 +1640,10 @@ def _find_enclosing_pre_bound_names(
             c_start = getattr(curr, "lineno", None)
             c_end = getattr(curr, "end_lineno", c_start)
             if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if isinstance(c_start, int) and c_start < s_line:
+                if isinstance(c_start, int) and c_start < s_line and (
+                    curr in active_scopes
+                    or (isinstance(c_end, int) and c_end < s_line)
+                ):
                     bound_before.add(curr.name)
                 if not is_class_scope:
                     stack.extend(
@@ -1794,6 +1797,7 @@ def _inspect_unit_scope(
         "type_param_free_vars": [],
         "has_class_scoped_type_params": False,
         "deleted_names": [],
+        "_skip_pre_unit_closures": bool(unit.get("skip_pre_unit_closures")),
     }
     if not dedented.strip():
         return empty_res
@@ -2287,7 +2291,11 @@ def _inspect_unit_scope(
         ):
             hazards.append("deleted_output")
 
-        if is_subroutine or unit.get("kind") == "closure":
+        if is_subroutine or unit.get("kind") in (
+            "closure",
+            "comprehension",
+            "complex_expr",
+        ):
             c_u_start = parse_unit_coord(unit, "start", default=0)
             c_u_end = parse_unit_coord(unit, "end", default=c_u_start)
             if c_u_start > 0:
@@ -2431,6 +2439,7 @@ def _inspect_unit_scope(
             "type_param_free_vars": list(visitor.type_param_free_vars),
             "has_class_scoped_type_params": has_class_scoped_type_params,
             "deleted_names": sorted(may_deleted),
+            "_skip_pre_unit_closures": bool(unit.get("skip_pre_unit_closures")),
         }
     except (RecursionError, MemoryError):
         return {
@@ -2507,12 +2516,30 @@ def analyze_unit_variable_scope(
     scope2: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
-    info1 = scope1 if scope1 is not None else inspect_single_unit_scope(
-        u1, repo_root=repo_root, tree=tree1
+    info1 = (
+        scope1
+        if (
+            scope1 is not None
+            and (
+                "skip_pre_unit_closures" not in u1
+                or bool(scope1.get("_skip_pre_unit_closures", False))
+                == bool(u1.get("skip_pre_unit_closures"))
+            )
+        )
+        else inspect_single_unit_scope(u1, repo_root=repo_root, tree=tree1)
     )
     if u2 is not None:
-        info2 = scope2 if scope2 is not None else inspect_single_unit_scope(
-            u2, repo_root=repo_root, tree=tree2
+        info2 = (
+            scope2
+            if (
+                scope2 is not None
+                and (
+                    "skip_pre_unit_closures" not in u2
+                    or bool(scope2.get("_skip_pre_unit_closures", False))
+                    == bool(u2.get("skip_pre_unit_closures"))
+                )
+            )
+            else inspect_single_unit_scope(u2, repo_root=repo_root, tree=tree2)
         )
         inputs = _align_symmetric_var_list(info1["inputs"], info2["inputs"])
         outputs = _align_symmetric_var_list(info1["outputs"], info2["outputs"])
@@ -2685,4 +2712,13 @@ def analyze_unit_variable_scope(
             )
         ),
         "deleted_names": deleted_names,
+        "_skip_pre_unit_closures": (
+            info1.get("_skip_pre_unit_closures")
+            if (
+                u2 is None
+                or info1.get("_skip_pre_unit_closures")
+                == info2.get("_skip_pre_unit_closures")
+            )
+            else None
+        ),
     }

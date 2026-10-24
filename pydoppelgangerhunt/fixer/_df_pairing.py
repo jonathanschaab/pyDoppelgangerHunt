@@ -40,6 +40,7 @@ from pydoppelgangerhunt.fixer._df_hazards import (
     collect_downstream_read_names,
 )
 from pydoppelgangerhunt.config import resolve_closure_strictness_mode
+from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope
 from pydoppelgangerhunt.fixer.source import (
     _load_unit_file_text,
     is_subroutine_unit,
@@ -262,6 +263,28 @@ def resolve_generator_subroutine_outputs(
     )
 
 
+def _ensure_scope_closure_mode(
+    unit: Dict[str, Any],
+    scope: Dict[str, Any],
+    skip_pre_unit_closures: bool,
+    source_text: Optional[str],
+    tree: Optional[ast.AST],
+    repo_root: Optional[str],
+) -> Dict[str, Any]:
+    """Recomputes unit scope when a precomputed scope was built with a different closure mode."""
+    if (
+        "_skip_pre_unit_closures" not in scope
+        or bool(scope.get("_skip_pre_unit_closures"))
+        == bool(skip_pre_unit_closures)
+    ):
+        return scope
+    u_copy = dict(unit)
+    u_copy["skip_pre_unit_closures"] = bool(skip_pre_unit_closures)
+    if source_text is not None:
+        u_copy.setdefault("source_text", source_text)
+    return inspect_single_unit_scope(u_copy, repo_root=repo_root, tree=tree)
+
+
 def _extract_effective_unit_outputs(
     unit: Dict[str, Any], scope: Dict[str, Any]
 ) -> List[str]:
@@ -379,6 +402,13 @@ def resolve_clone_generator_subroutine_outputs(
                     if return_details
                     else None
                 )
+
+    scope1 = _ensure_scope_closure_mode(
+        u1, scope1, skip_pre_unit_closures, source_text1, tree1, repo_root
+    )
+    scope2 = _ensure_scope_closure_mode(
+        u2, scope2, skip_pre_unit_closures, source_text2, tree2, repo_root
+    )
 
     for u_chk, s_chk, side_lbl in ((u1, scope1, "u1"), (u2, scope2, "u2")):
         if _has_unordered_multiset_outputs(u_chk):
@@ -684,6 +714,12 @@ def resolve_clone_pair_outputs(
     _, effective_skip_closures = resolve_closure_strictness_mode(
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
+    )
+    scope1 = _ensure_scope_closure_mode(
+        u1, scope1, effective_skip_closures, source_text1, tree1, repo_root
+    )
+    scope2 = _ensure_scope_closure_mode(
+        u2, scope2, effective_skip_closures, source_text2, tree2, repo_root
     )
 
     has_yield = bool(scope1.get("has_yield") or scope2.get("has_yield"))

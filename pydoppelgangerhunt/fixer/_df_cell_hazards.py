@@ -127,6 +127,34 @@ def _node_earliest_start_lineno(node: ast.AST) -> int:
     return _node_scope_bounds(node)[0]
 
 
+def _node_earliest_start_pos(
+    node: ast.AST,
+) -> Tuple[Optional[int], Optional[int]]:
+    """Computes the earliest (lineno, col_offset) of an AST node including decorators."""
+    n_line = getattr(node, "lineno", None)
+    n_col = getattr(node, "col_offset", None)
+    best_line: Optional[int] = n_line if isinstance(n_line, int) else None
+    best_col: Optional[int] = n_col if isinstance(n_col, int) else None
+    for dec in getattr(node, "decorator_list", ()):
+        d_line = getattr(dec, "lineno", None)
+        if not isinstance(d_line, int):
+            continue
+        d_col = getattr(dec, "col_offset", None)
+        eff_col = d_col if isinstance(d_col, int) else best_col
+        if (
+            best_line is None
+            or d_line < best_line
+            or (
+                d_line == best_line
+                and isinstance(eff_col, int)
+                and (best_col is None or eff_col < best_col)
+            )
+        ):
+            best_line = d_line
+            best_col = eff_col
+    return best_line, best_col
+
+
 def _find_enclosing_function_chain(
     mod_tree: ast.AST,
     u_start: int,
@@ -143,8 +171,16 @@ def _find_enclosing_function_chain(
             continue
         body = getattr(node, "body", None)
         if body:
-            body_start = _node_earliest_start_lineno(body[0])
-            if u_start < body_start:
+            body_start, body_col = _node_earliest_start_pos(body[0])
+            if body_start is not None and (
+                u_start < body_start
+                or (
+                    u_start == body_start
+                    and u_start_col is not None
+                    and body_col is not None
+                    and u_start_col < body_col
+                )
+            ):
                 continue
         n_col = int(getattr(node, "col_offset", 0) or 0)
         if u_start == n_lineno:
@@ -736,18 +772,32 @@ def _extract_expr_closure_and_load_info(
                     or curr.func.id not in scope_ctx.shadowed_names
                 )
             )
-            if not is_non_closure_builtin:
-                if isinstance(curr.func, ast.Attribute):
-                    stack.append(curr.func.value)
-                elif isinstance(curr.func, ast.Name):
-                    if called_names_out is not None:
-                        called_names_out.add(curr.func.id)
-                else:
-                    stack.append(curr.func)
-                stack.extend(curr.args)
-                stack.extend(
-                    kw.value for kw in curr.keywords if kw.value is not None
+            if is_non_closure_builtin:
+                _, sub_muts, _ = _extract_expr_closure_and_load_info(
+                    [
+                        *curr.args,
+                        *(
+                            kw.value
+                            for kw in curr.keywords
+                            if kw.value is not None
+                        ),
+                    ],
+                    scope_ctx,
+                    called_names_out=called_names_out,
                 )
+                inline_muts.update(sub_muts)
+                continue
+            if isinstance(curr.func, ast.Attribute):
+                stack.append(curr.func.value)
+            elif isinstance(curr.func, ast.Name):
+                if called_names_out is not None:
+                    called_names_out.add(curr.func.id)
+            else:
+                stack.append(curr.func)
+            stack.extend(curr.args)
+            stack.extend(
+                kw.value for kw in curr.keywords if kw.value is not None
+            )
             continue
         if isinstance(curr, ast.Name) and isinstance(curr.ctx, ast.Load):
             loaded_names.add(curr.id)
@@ -1196,18 +1246,27 @@ def _push_compound_children(
             act_nl,
         )
         _push_seq(stack, else_l, is_br if else_span else True, in_lp, act_nl)
-        _push_seq(stack, handlers_l, is_br if encloses else True, in_lp, act_nl)
+        for h_node in reversed(handlers_l):
+            h_span = encloses and _block_contains_span(
+                getattr(h_node, "body", ()), span
+            )
+            stack.append(
+                _StackFrame(
+                    h_node, is_br if h_span else True, in_lp, act_nl
+                )
+            )
         _push_seq(stack, body_l, is_br if body_span else True, in_lp, act_nl)
         return True
 
     if isinstance(curr, ast.ExceptHandler):
         c_line = getattr(curr, "lineno", None)
         c_col = getattr(curr, "col_offset", None)
-        h_br = is_br if encloses else True
+        h_span = encloses and _block_contains_span(curr.body, span)
+        h_br = is_br if h_span else True
         if isinstance(curr.name, str) and _can_bind_in_fn_scope(
             curr.name, act_nl, state.fn_globals
         ):
-            if encloses:
+            if h_span:
                 state.pre_mutated.add(curr.name)
                 state.post_mutated.add(curr.name)
                 if not h_br:
@@ -1359,6 +1418,62 @@ def _extract_fn_returned_closure_refs(
     return (ret_loads | ret_calls) - own_locals
 
 
+def _extract_fn_outer_carrier_targets(
+    fn_node: ast.AST,
+    fn_globals: AbstractSet[str] = frozenset(),
+) -> Set[str]:
+    """Extracts outer-scope container/variable names mutated by carrier operations in fn_node."""
+    if not isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return set()
+    has_closure = any(
+        isinstance(
+            sub,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.ClassDef,
+                ast.Lambda,
+                ast.GeneratorExp,
+            ),
+        )
+        and sub is not fn_node
+        for sub in ast.walk(fn_node)
+    )
+    if not has_closure:
+        return set()
+    own_locals = _extract_single_node_local_names(
+        fn_node,
+        include_globals=False,
+        include_nonlocals=False,
+        include_self_name=False,
+        include_bare_annotations=True,
+    )
+    direct_nl = _extract_direct_nonlocals(fn_node)
+    fn_g = set(fn_globals) | _extract_direct_nonlocals(fn_node, is_global=True)
+    targets: Set[str] = set()
+    for sub in ast.walk(fn_node):
+        if sub is fn_node:
+            continue
+        carrier = _extract_closure_carrier_targets_and_values(sub)
+        if carrier is None:
+            continue
+        c_targets, _ = carrier
+        store_names = (
+            set()
+            if isinstance(sub, ast.Call)
+            else _extract_store_names_in_node(sub)
+        )
+        for t_name in c_targets:
+            if t_name in fn_g:
+                continue
+            if t_name in store_names:
+                if t_name in direct_nl:
+                    targets.add(t_name)
+            elif t_name not in own_locals or t_name in direct_nl:
+                targets.add(t_name)
+    return targets
+
+
 def _handle_nested_scope_node(
     curr: ast.AST,
     c_line: Optional[int],
@@ -1377,15 +1492,30 @@ def _handle_nested_scope_node(
 ) -> bool:
     """Processes nested function, class, lambda, or comprehension scopes during cell analysis."""
     if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        estart = _node_earliest_start_lineno(curr)
+        estart, ecol = _node_earliest_start_pos(curr)
+        hdr_nodes = list(iter_nested_scope_header_nodes(curr))
+        span_in_hdr = any(
+            _is_node_inside_span(hdr, span) or _strictly_encloses_span(hdr, span)
+            for hdr in hdr_nodes
+        )
+        bind_line = (
+            getattr(curr, "end_lineno", c_line) if span_in_hdr else estart
+        )
+        bind_col = (
+            getattr(curr, "end_col_offset", c_col) if span_in_hdr else ecol
+        )
         _record_binding_at_pos(
-            (curr.name,), estart, c_col, span, frame, state
+            (curr.name,), bind_line, bind_col, span, frame, state
         )
         enclosing_cls = isinstance(
             curr, ast.ClassDef
         ) and _strictly_encloses_span(curr, span)
         if not enclosing_cls:
-            free_r = _extract_cached_scope_free_reads(curr)
+            free_r = (
+                _extract_nested_scope_free_reads(curr, include_header=False)
+                if span_in_hdr
+                else _extract_cached_scope_free_reads(curr)
+            )
             nl_mut, nl_del = _extract_closure_nonlocal_mutations_and_deletions(
                 curr
             )
@@ -1398,9 +1528,12 @@ def _handle_nested_scope_node(
                 )
                 else None
             )
+            outer_carriers = _extract_fn_outer_carrier_targets(
+                curr, state.fn_globals
+            )
             if sib_name is not None:
-                if factory_names is not None and _is_closure_factory_scope(
-                    curr, scope_ctx
+                if factory_names is not None and (
+                    outer_carriers or _is_closure_factory_scope(curr, scope_ctx)
                 ):
                     factory_names.add(sib_name)
                 if fn_return_refs is not None and isinstance(
@@ -1412,14 +1545,16 @@ def _handle_nested_scope_node(
                             ret_refs
                         )
             sibling_closures.append((sib_name, free_r, nl_mut))
-            if _is_pos_after_span(estart, c_col, span):
+            for oc_name in outer_carriers:
+                sibling_closures.append((oc_name, set(free_r), set(nl_mut)))
+            if span_in_hdr or _is_pos_after_span(estart, ecol, span):
                 state.post_reads.update(free_r)
         if isinstance(curr, ast.ClassDef):
             cls_nonlocals = _extract_direct_nonlocals(curr)
             if (
                 enclosing_cls
                 or cls_nonlocals
-                or not _is_pos_after_span(estart, c_col, span)
+                or not _is_pos_after_span(estart, ecol, span)
             ):
                 _push_seq(
                     stack,
@@ -1430,7 +1565,7 @@ def _handle_nested_scope_node(
                 )
         _push_seq(
             stack,
-            list(iter_nested_scope_header_nodes(curr)),
+            hdr_nodes,
             frame.is_branched,
             frame.in_loop,
             frame.active_nonlocals,
@@ -1674,9 +1809,9 @@ def _analyze_enclosing_fn_cells_uncached(
         if curr is enclosed_fn and isinstance(
             curr, (ast.FunctionDef, ast.AsyncFunctionDef)
         ):
-            estart = _node_earliest_start_lineno(curr)
+            estart, ecol = _node_earliest_start_pos(curr)
             _record_binding_at_pos(
-                (curr.name,), estart, c_col, span, frame, state
+                (curr.name,), estart, ecol, span, frame, state
             )
             if (
                 frame.in_loop
@@ -1701,11 +1836,7 @@ def _analyze_enclosing_fn_cells_uncached(
                 pre_hdrs = [
                     hdr
                     for hdr in iter_nested_scope_header_nodes(curr)
-                    if _is_pos_before_span(
-                        getattr(hdr, "lineno", None),
-                        getattr(hdr, "col_offset", None),
-                        span,
-                    )
+                    if not _is_node_inside_span(hdr, span)
                 ]
                 _push_seq(
                     stack,
@@ -1717,17 +1848,16 @@ def _analyze_enclosing_fn_cells_uncached(
             continue
 
         prev_sib_len = len(sibling_closures)
-        eff_line = (
-            _node_earliest_start_lineno(curr)
-            if isinstance(
-                curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-            )
-            else c_line
-        )
+        if isinstance(
+            curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            eff_line, eff_col = _node_earliest_start_pos(curr)
+        else:
+            eff_line, eff_col = c_line, c_col
         is_conc_pos = (
             enclosed_fn is not None
             or frame.in_loop
-            or not _is_pos_after_span(eff_line, c_col, span)
+            or not _is_pos_after_span(eff_line, eff_col, span)
         )
         if _handle_nested_scope_node(
             curr,
@@ -1951,10 +2081,11 @@ def _build_enclosing_chain_cell_infos(
             next_start, next_end, next_fn = enclosing_chain[idx + 1]
             next_body = getattr(next_fn, "body", [])
             first_stmt = next_body[0] if next_body else next_fn
+            f_line, f_col = _node_earliest_start_pos(first_stmt)
             span = _SpanBounds(
-                int(getattr(first_stmt, "lineno", next_start) or next_start),
+                int(f_line or next_start),
                 next_end,
-                getattr(first_stmt, "col_offset", None),
+                f_col,
                 getattr(next_fn, "end_col_offset", None),
             )
             enc_child = next_fn
@@ -2182,7 +2313,11 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     """Detects whether extracting a unit to module scope would sever closure cell bindings."""
     if ctx.mod_tree is None or ctx.u_start <= 0:
         return False
-    if not ctx.is_subroutine and ctx.unit_kind != "closure":
+    if not ctx.is_subroutine and ctx.unit_kind not in (
+        "closure",
+        "comprehension",
+        "complex_expr",
+    ):
         return False
 
     enclosing_chain = _find_enclosing_function_chain(
@@ -2235,7 +2370,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     if ctx.is_subroutine:
         if is_suspended:
             unit_closure_reads.update(ctx.inputs)
-    else:
+    elif ctx.unit_kind == "closure":
         unit_closure_reads.update(ctx.free_vars)
 
     intra_closure_reads: Set[str] = (

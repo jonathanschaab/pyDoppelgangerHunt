@@ -4137,6 +4137,251 @@ _CLOSURE_CELL_SCENARIOS = [
         },
         True,
     ),
+    (
+        "try_except_earlier_handler_binding_not_definite_in_later_handler",
+        (
+            "def outer(items):\n"
+            "    try:\n"
+            "        perform_operation()\n"
+            "    except ValueError:\n"
+            "        scale = 10\n"
+            "    except TypeError:\n"
+            "        for x in items:\n"
+            "            callback = lambda: scale\n"
+            "        return callback\n"
+        ),
+        {
+            "start": 7,
+            "end": 8,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    callback = lambda: scale\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "try_except_in_loop_earlier_handler_binding_captured_in_later_handler",
+        (
+            "def outer(batches, items):\n"
+            "    for batch in batches:\n"
+            "        try:\n"
+            "            perform_operation(batch)\n"
+            "        except ValueError:\n"
+            "            scale = 10\n"
+            "        except TypeError:\n"
+            "            for x in items:\n"
+            "                callback = lambda: scale\n"
+            "            return callback\n"
+        ),
+        {
+            "start": 8,
+            "end": 9,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    callback = lambda: scale\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "try_except_handler_binding_not_definite_in_else_block",
+        (
+            "def outer(items):\n"
+            "    try:\n"
+            "        perform_operation()\n"
+            "    except ValueError:\n"
+            "        scale = 10\n"
+            "    else:\n"
+            "        for x in items:\n"
+            "            callback = lambda: scale\n"
+            "        return callback\n"
+        ),
+        {
+            "start": 7,
+            "end": 8,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    callback = lambda: scale\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "try_except_handler_and_else_binding_not_definite_in_finally_block",
+        (
+            "def outer(items):\n"
+            "    try:\n"
+            "        perform_operation()\n"
+            "    except ValueError:\n"
+            "        scale = 10\n"
+            "    else:\n"
+            "        scale = 20\n"
+            "    finally:\n"
+            "        for x in items:\n"
+            "            callback = lambda: scale\n"
+        ),
+        {
+            "start": 9,
+            "end": 10,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    callback = lambda: scale\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "neg_try_except_own_handler_target_and_prior_stmt_definitely_bound",
+        (
+            "def outer(items):\n"
+            "    try:\n"
+            "        perform_operation()\n"
+            "    except ValueError:\n"
+            "        other = 1\n"
+            "    except TypeError as err:\n"
+            "        scale = 10\n"
+            "        for x in items:\n"
+            "            msg = str(err)\n"
+            "            callback = lambda: scale\n"
+            "        return callback, msg\n"
+        ),
+        {
+            "start": 8,
+            "end": 10,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    msg = str(err)\n"
+                "    callback = lambda: scale\n"
+            ),
+        },
+        False,
+    ),
+    (
+        "builtin_call_arg_invoking_closure_factory_and_mutating_outer_container",
+        (
+            "def outer(items):\n"
+            "    value = 1\n"
+            "    saved = []\n"
+            "    def make_callback():\n"
+            "        callback = lambda: value\n"
+            "        saved.append(callback)\n"
+            "        return callback\n"
+            "    result = len([make_callback()])\n"
+            "    for x in items:\n"
+            "        value = x + result\n"
+            "    return saved, value\n"
+        ),
+        {
+            "start": 9,
+            "end": 10,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    value = x + result\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "builtin_call_arg_outer_container_read_by_unit",
+        (
+            "def outer(items):\n"
+            "    value = 1\n"
+            "    saved = []\n"
+            "    def make_callback():\n"
+            "        callback = lambda: value\n"
+            "        saved.append(callback)\n"
+            "        return callback\n"
+            "    result = len([make_callback()])\n"
+            "    for x in items:\n"
+            "        value = x + len(saved)\n"
+            "    return result, value\n"
+        ),
+        {
+            "start": 9,
+            "end": 10,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    value = x + len(saved)\n"
+            ),
+        },
+        True,
+    ),
+    (
+        "multiline_decorator_unit_capturing_uninitialized_decorated_fn",
+        (
+            "def outer(items, register):\n"
+            "    @register(\n"
+            "        items,\n"
+            "        [lambda x: x * inner() for _ in items],\n"
+            "    )\n"
+            "    def inner():\n"
+            "        return 2\n"
+            "    return inner\n"
+        ),
+        {
+            "start": 4,
+            "end": 4,
+            "start_col": 8,
+            "end_col": 46,
+            "kind": "comprehension",
+            "source_code": "[lambda x: x * inner() for _ in items]",
+        },
+        True,
+    ),
+    (
+        "same_line_decorator_unit_capturing_late_bound_variable",
+        (
+            "def outer(items, dec):\n"
+            "    @dec([lambda x: x * scale for _ in items])\n"
+            "    def inner():\n"
+            "        return scale\n"
+            "    scale = 10\n"
+            "    return inner\n"
+        ),
+        {
+            "start": 2,
+            "end": 2,
+            "start_col": 9,
+            "end_col": 45,
+            "kind": "comprehension",
+            "source_code": "[lambda x: x * scale for _ in items]",
+        },
+        True,
+    ),
+    (
+        "nested_decorated_defs_unit_inside_inner_body_captures_outer_late_var",
+        (
+            "def outer(items, dec1, dec2):\n"
+            "    @dec1(\n"
+            "        1,\n"
+            "    )\n"
+            "    @dec2\n"
+            "    def mid():\n"
+            "        for x in items:\n"
+            "            cb = lambda: scale\n"
+            "        return cb\n"
+            "    scale = 10\n"
+            "    return mid\n"
+        ),
+        {
+            "start": 7,
+            "end": 8,
+            "kind": "compound_block",
+            "source_code": (
+                "for x in items:\n"
+                "    cb = lambda: scale\n"
+            ),
+        },
+        True,
+    ),
 ]
 
 
@@ -4480,6 +4725,122 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
     )
     assert "skip_pre_unit_closures" not in lenient_u1
     assert "skip_pre_unit_closures" not in lenient_u2
+
+    # Precomputed scopes respect changed closure_strictness and skip_pre_unit_closures
+    from pydoppelgangerhunt.fixer import analyze_unit_variable_scope
+
+    pre_clos_gen_src = (
+        "def gen_pre_a(items):\n"
+        "    step = 1\n"
+        "    cb = lambda: step\n"
+        "    for x in items:\n"
+        "        step = x + 1\n"
+        "        yield step\n"
+        "    return cb\n"
+        "\n"
+        "def gen_pre_b(items):\n"
+        "    step = 2\n"
+        "    cb = lambda: step\n"
+        "    for x in items:\n"
+        "        step = x + 1\n"
+        "        yield step\n"
+        "    return cb\n"
+    )
+    f_pre_clos = tmp_path / "pre_clos_gen.py"
+    f_pre_clos.write_text(pre_clos_gen_src, encoding="utf-8")
+    u_pre_g1 = {
+        "file": str(f_pre_clos),
+        "start": 4,
+        "end": 6,
+        "name": "gen_pre_a:For",
+        "kind": "compound_block",
+        "source_code": "for x in items:\n    step = x + 1\n    yield step\n",
+    }
+    u_pre_g2 = {
+        "file": str(f_pre_clos),
+        "start": 12,
+        "end": 14,
+        "name": "gen_pre_b:For",
+        "kind": "compound_block",
+        "source_code": "for x in items:\n    step = x + 1\n    yield step\n",
+    }
+    strict_sc1 = inspect_single_unit_scope(u_pre_g1, repo_root=str(tmp_path))
+    strict_sc2 = inspect_single_unit_scope(u_pre_g2, repo_root=str(tmp_path))
+    strict_combined = analyze_unit_variable_scope(
+        u_pre_g1, u_pre_g2, repo_root=str(tmp_path), scope1=strict_sc1, scope2=strict_sc2
+    )
+    assert strict_sc1["_skip_pre_unit_closures"] is False
+    assert "severed_closure_cell" in strict_sc1["control_flow_hazards"]
+
+    # Lenient synthesis and output resolution with strict precomputed scopes matches uncached lenient
+    synth_lenient_no_pre = synthesize_shared_helper_code(
+        u_pre_g1, u_pre_g2, repo_root=str(tmp_path), closure_strictness="lenient"
+    )
+    synth_lenient_with_pre = synthesize_shared_helper_code(
+        u_pre_g1,
+        u_pre_g2,
+        repo_root=str(tmp_path),
+        scope1=strict_sc1,
+        scope2=strict_sc2,
+        scope=strict_combined,
+        closure_strictness="lenient",
+    )
+    assert synth_lenient_no_pre != ""
+    assert synth_lenient_with_pre == synth_lenient_no_pre
+
+    lenient_sc1 = inspect_single_unit_scope(
+        {**u_pre_g1, "skip_pre_unit_closures": True}, repo_root=str(tmp_path)
+    )
+    lenient_sc2 = inspect_single_unit_scope(
+        {**u_pre_g2, "skip_pre_unit_closures": True}, repo_root=str(tmp_path)
+    )
+    assert lenient_sc1["_skip_pre_unit_closures"] is True
+    assert "severed_closure_cell" not in lenient_sc1["control_flow_hazards"]
+
+    res_lenient_matching_pre = resolve_clone_pair_outputs(
+        u_pre_g1,
+        u_pre_g2,
+        lenient_sc1,
+        lenient_sc2,
+        repo_root=str(tmp_path),
+        skip_pre_unit_closures=True,
+        return_details=True,
+    )
+    res_lenient_with_strict_pre = resolve_clone_pair_outputs(
+        u_pre_g1,
+        u_pre_g2,
+        strict_sc1,
+        strict_sc2,
+        repo_root=str(tmp_path),
+        skip_pre_unit_closures=True,
+        return_details=True,
+    )
+    assert res_lenient_matching_pre.outputs is not None
+    assert res_lenient_with_strict_pre == res_lenient_matching_pre
+
+    # Strict resolution and synthesis with lenient precomputed scopes matches uncached strict
+    res_strict_with_lenient_pre = resolve_clone_pair_outputs(
+        u_pre_g1,
+        u_pre_g2,
+        lenient_sc1,
+        lenient_sc2,
+        repo_root=str(tmp_path),
+        skip_pre_unit_closures=False,
+        return_details=True,
+    )
+    assert res_strict_with_lenient_pre.outputs is None
+    assert res_strict_with_lenient_pre.skip_reason == "severed closure cell"
+    assert (
+        synthesize_shared_helper_code(
+            u_pre_g1,
+            u_pre_g2,
+            repo_root=str(tmp_path),
+            scope1=lenient_sc1,
+            scope2=lenient_sc2,
+            closure_strictness="strict",
+        )
+        == ""
+    )
 
     # ClassDef immediate scope with nonlocal declaration in collect_downstream_read_names
     cls_nl_src = (
@@ -4845,6 +5206,25 @@ def test_df_cell_hazards_numbered_checks_unit() -> None:
     )
     chain_hdr = _find_enclosing_function_chain(hdr_tree, 4, 4)
     assert [getattr(fn, "name", None) for _, _, fn in chain_hdr] == ["outer"]
+
+    # _node_earliest_start_pos and multiline decorator span_in_hdr tracking
+    from pydoppelgangerhunt.fixer._df_cell_hazards import _node_earliest_start_pos
+
+    mdec_tree = ast.parse(
+        "def outer(items, reg):\n"
+        "    @reg(\n"
+        "        [x for x in items],\n"
+        "    )\n"
+        "    def inner():\n"
+        "        return post_var\n"
+    )
+    outer_fn = mdec_tree.body[0]
+    inner_fn = outer_fn.body[0]  # type: ignore[attr-defined]
+    assert _node_earliest_start_pos(inner_fn) == (2, 5)
+    info_mdec = _analyze_enclosing_fn_cells(outer_fn, (3, 3, 8, 26))
+    assert "inner" not in info_mdec.pre_bound
+    assert "inner" in info_mdec.post_mutated
+    assert "post_var" in info_mdec.post_reads
 
     # PEP 695 type_params on inner function are included in info.fn_locals
     import sys  # pylint: disable=import-outside-toplevel
