@@ -36,6 +36,83 @@ from pydoppelgangerhunt.parser import iter_nested_scope_header_nodes
 _BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
 
+def _node_earliest_start_pos(
+    node: ast.AST,
+) -> Tuple[Optional[int], Optional[int]]:
+    """Computes the earliest (lineno, col_offset) of an AST node including decorators."""
+    n_line = getattr(node, "lineno", None)
+    n_col = getattr(node, "col_offset", None)
+    best_line: Optional[int] = n_line if isinstance(n_line, int) else None
+    best_col: Optional[int] = n_col if isinstance(n_col, int) else None
+    for dec in getattr(node, "decorator_list", ()):
+        d_line = getattr(dec, "lineno", None)
+        d_col = getattr(dec, "col_offset", None)
+        if isinstance(d_line, int):
+            at_col = (
+                max(0, d_col - 1) if isinstance(d_col, int) else best_col
+            )
+            if best_line is None or d_line < best_line:
+                best_line = d_line
+                best_col = at_col
+            elif (
+                d_line == best_line
+                and at_col is not None
+                and (best_col is None or at_col < best_col)
+            ):
+                best_col = at_col
+    return best_line, best_col
+
+
+def _node_strictly_encloses_bounds(
+    node: ast.AST,
+    u_start: int,
+    u_end: int,
+    u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
+) -> bool:
+    """Checks whether an AST node strictly encloses the 2D span [u_start, u_end]."""
+    c_line = getattr(node, "lineno", None)
+    c_end = getattr(node, "end_lineno", c_line)
+    if not (
+        isinstance(c_line, int)
+        and isinstance(c_end, int)
+        and c_line <= u_start
+        and u_end <= c_end
+    ):
+        return False
+
+    c_col = getattr(node, "col_offset", None)
+    c_end_col = getattr(node, "end_col_offset", None)
+
+    if c_line == u_start and u_start_col is not None:
+        if not isinstance(c_col, int) or c_col > u_start_col:
+            return False
+    if c_line == u_end and u_end_col is not None:
+        if not isinstance(c_col, int) or c_col >= u_end_col:
+            return False
+
+    if c_end == u_end and u_end_col is not None:
+        if not isinstance(c_end_col, int) or c_end_col < u_end_col:
+            return False
+    if c_end == u_start and u_start_col is not None:
+        if not isinstance(c_end_col, int) or c_end_col <= u_start_col:
+            return False
+
+    is_strictly_larger_start = (c_line < u_start) or (
+        c_line == u_start
+        and u_start_col is not None
+        and isinstance(c_col, int)
+        and c_col < u_start_col
+    )
+    is_strictly_larger_end = (c_end > u_end) or (
+        c_end == u_end
+        and u_end_col is not None
+        and isinstance(c_end_col, int)
+        and c_end_col > u_end_col
+    )
+    return is_strictly_larger_start or is_strictly_larger_end
+
+
 def _extract_node_type_param_names(node: ast.AST) -> Set[str]:
     """Extracts PEP 695 type parameter names declared directly on an AST node."""
     return {
@@ -346,16 +423,8 @@ def _collect_scope_closures_uncached(
     has_star_import = _has_wildcard_star_import(scope_node, module_tree=module_tree)
 
     def _resolve_stmt_start_pos(s: ast.AST) -> Tuple[int, int]:
-        s_line = int(getattr(s, "lineno", 0) or 0)
-        s_col = int(getattr(s, "col_offset", 0) or 0)
-        decs = getattr(s, "decorator_list", [])
-        if decs:
-            min_l = min(
-                (int(getattr(d, "lineno", None) or s_line) for d in decs),
-                default=s_line,
-            )
-            s_line = min(s_line, min_l)
-        return s_line, s_col
+        estart, ecol = _node_earliest_start_pos(s)
+        return int(estart or 0), int(ecol or 0)
 
     class _ExprClosureCollector(_BaseScopeVisitor):
         def __init__(
@@ -650,45 +719,29 @@ def _resolve_immediate_scope_in_fn(
             c_start = int(getattr(curr, "lineno", 0) or 0)
             c_end = int(getattr(curr, "end_lineno", c_start) or c_start)
             c_col = int(getattr(curr, "col_offset", 0) or 0)
-            c_end_col = getattr(curr, "end_col_offset", None)
             in_hdr = any(
-                (getattr(hdr, "lineno", 0) or 0)
-                <= u_start
-                <= (getattr(hdr, "end_lineno", 0) or 0)
+                _is_ast_node_within_unit_bounds(
+                    hdr, u_start, u_end, u_end_col, u_start_col
+                )
+                or _node_strictly_encloses_bounds(
+                    hdr, u_start, u_end, u_start_col, u_end_col
+                )
                 for hdr in iter_nested_scope_header_nodes(curr)
             )
             if curr.body:
-                b0 = curr.body[0]
-                b_start = min(
-                    [
-                        int(getattr(b0, "lineno", c_start) or c_start),
-                        *(
-                            int(getattr(d, "lineno", c_start) or c_start)
-                            for d in getattr(b0, "decorator_list", ())
-                        ),
-                    ]
-                )
-                b_col = getattr(b0, "col_offset", None)
-                if u_end < b_start or (
-                    u_start == b_start
-                    and u_start_col is not None
-                    and isinstance(b_col, int)
-                    and u_start_col < b_col
+                b_start, b_col = _node_earliest_start_pos(curr.body[0])
+                if b_start is not None and (
+                    u_end < b_start
+                    or (
+                        u_start == b_start
+                        and u_start_col is not None
+                        and isinstance(b_col, int)
+                        and u_start_col < b_col
+                    )
                 ):
                     in_hdr = True
-            strictly_inside = (
-                not in_hdr
-                and c_start <= u_start
-                and u_end <= c_end
-                and (
-                    (c_start, c_end) != (u_start, u_end)
-                    or (u_start_col is not None and c_col < u_start_col)
-                    or (
-                        u_end_col is not None
-                        and isinstance(c_end_col, int)
-                        and c_end_col > u_end_col
-                    )
-                )
+            strictly_inside = not in_hdr and _node_strictly_encloses_bounds(
+                curr, u_start, u_end, u_start_col, u_end_col
             )
             if strictly_inside:
                 cand_span = (c_start, -c_end, c_col)

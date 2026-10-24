@@ -34,6 +34,8 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _extract_single_node_local_names,
     _has_wildcard_star_import,
     _is_eagerly_consumed_genexp,
+    _node_earliest_start_pos,
+    _node_strictly_encloses_bounds,
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
     _collect_func_params as _extract_arg_names,
@@ -127,21 +129,6 @@ def _node_earliest_start_lineno(node: ast.AST) -> int:
     return _node_scope_bounds(node)[0]
 
 
-def _node_earliest_start_pos(
-    node: ast.AST,
-) -> Tuple[Optional[int], Optional[int]]:
-    """Computes the earliest (lineno, col_offset) of an AST node including decorators."""
-    n_line = getattr(node, "lineno", None)
-    n_col = getattr(node, "col_offset", None)
-    best_line: Optional[int] = n_line if isinstance(n_line, int) else None
-    best_col: Optional[int] = n_col if isinstance(n_col, int) else None
-    for dec in getattr(node, "decorator_list", ()):
-        d_line = getattr(dec, "lineno", None)
-        if isinstance(d_line, int) and (best_line is None or d_line < best_line):
-            best_line = d_line
-    return best_line, best_col
-
-
 def _find_enclosing_function_chain(
     mod_tree: ast.AST,
     u_start: int,
@@ -198,9 +185,17 @@ def _find_enclosing_function_chain(
                 continue
         n_col = int(getattr(node, "col_offset", 0) or 0)
         if u_start in (estart, n_lineno):
-            if u_start_col is not None and n_col > u_start_col:
+            _, e_col = _node_earliest_start_pos(node)
+            bound_col = (
+                e_col
+                if (u_start == estart and e_col is not None)
+                else n_col
+            )
+            if u_start_col is not None and bound_col > u_start_col:
                 continue
-            if u_end == n_end and (u_start_col is None or n_col == u_start_col):
+            if u_end == n_end and (
+                u_start_col is None or bound_col == u_start_col
+            ):
                 continue
         chain.append((estart, n_end, n_col, node))
     chain.sort(key=lambda item: (item[0], -item[1], item[2]))
@@ -753,32 +748,9 @@ def _is_node_inside_span(node: ast.AST, span: _SpanBounds) -> bool:
 
 def _strictly_encloses_span(node: ast.AST, span: _SpanBounds) -> bool:
     """Checks whether an AST compound node strictly encloses span."""
-    c_line = getattr(node, "lineno", None)
-    c_end = getattr(node, "end_lineno", c_line)
-    if not (
-        isinstance(c_line, int)
-        and isinstance(c_end, int)
-        and c_line <= span.start
-        and span.end <= c_end
-    ):
-        return False
-    if (c_line, c_end) != (span.start, span.end):
-        return True
-    c_col = getattr(node, "col_offset", None)
-    if (
-        span.start_col is not None
-        and isinstance(c_col, int)
-        and c_col < span.start_col
-    ):
-        return True
-    c_end_col = getattr(node, "end_col_offset", None)
-    if (
-        span.end_col is not None
-        and isinstance(c_end_col, int)
-        and c_end_col > span.end_col
-    ):
-        return True
-    return False
+    return _node_strictly_encloses_bounds(
+        node, span.start, span.end, span.start_col, span.end_col
+    )
 
 
 def _block_contains_span(stmts: Sequence[ast.AST], span: _SpanBounds) -> bool:

@@ -31,6 +31,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _extract_comprehension_walrus_names,
     _extract_scope_nonlocals_and_outer_globals,
     _extract_single_node_local_names,
+    _node_strictly_encloses_bounds,
     iter_nested_scope_header_nodes,
 )
 from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
@@ -1606,6 +1607,7 @@ def _find_enclosing_pre_bound_names(
     s_line: int,
     e_line: int,
     u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
 ) -> Tuple[Set[str], bool]:
     """Finds names bound before s_line in scopes enclosing [s_line, e_line] and loop containment."""
     bound_before: Set[str] = set()
@@ -1698,20 +1700,8 @@ def _find_enclosing_pre_bound_names(
                 stack.append((curr.annotation, is_branched))
                 continue
             if isinstance(curr, (ast.For, ast.AsyncFor, ast.While)):
-                if (
-                    isinstance(c_start, int)
-                    and isinstance(c_end, int)
-                    and c_start <= s_line
-                    and e_line <= c_end
-                    and (
-                        c_start < s_line
-                        or c_end > e_line
-                        or (
-                            u_start_col is not None
-                            and isinstance(c_col, int)
-                            and c_col < u_start_col
-                        )
-                    )
+                if _node_strictly_encloses_bounds(
+                    curr, s_line, e_line, u_start_col, u_end_col
                 ):
                     in_loop = True
             if _is_before_unit(c_start, c_col):
@@ -1731,10 +1721,9 @@ def _find_enclosing_pre_bound_names(
                 elif (
                     isinstance(curr, ast.ExceptHandler)
                     and isinstance(curr.name, str)
-                    and isinstance(c_start, int)
-                    and isinstance(c_end, int)
-                    and c_start <= s_line
-                    and e_line <= c_end
+                    and _node_strictly_encloses_bounds(
+                        curr, s_line, e_line, u_start_col, u_end_col
+                    )
                 ):
                     bound_before.add(curr.name)
                 elif type(curr).__name__ in ("MatchAs", "MatchStar", "MatchMapping"):
@@ -2248,7 +2237,11 @@ def _inspect_unit_scope(
                         u_end_col,
                     )
                     pre_bound, _ = _find_enclosing_pre_bound_names(
-                        mod_tree, u_start, u_end, u_start_col=u_start_col
+                        mod_tree,
+                        u_start,
+                        u_end,
+                        u_start_col=u_start_col,
+                        u_end_col=u_end_col,
                     )
                     if cond_escaping_cands:
                         enc_chain = _find_enclosing_function_chain(

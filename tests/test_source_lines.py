@@ -6413,3 +6413,145 @@ def test_definite_bindings_exceptional_control_flow_table(
         for v_name in expected_bound:
             assert v_name in info.pre_bound
 
+
+def test_2d_coordinate_enclosure_and_decorator_start_pos() -> None:
+    """Verifies 2D coordinate enclosure and decorator (line, col) coupling."""
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _SpanBounds,
+        _node_earliest_start_pos,
+        _strictly_encloses_span,
+    )
+    from pydoppelgangerhunt.fixer._df_closures import (
+        _collect_scope_closures,
+        _resolve_immediate_scope_in_fn,
+    )
+    from pydoppelgangerhunt.fixer.scope import _find_enclosing_pre_bound_names
+
+    # 1. Disjoint node to the left on the same line does not enclose span
+    if_left = ast.AnnAssign(
+        target=ast.Name(id="x", ctx=ast.Store()),
+        annotation=ast.Name(id="int", ctx=ast.Load()),
+        simple=1,
+        lineno=2,
+        end_lineno=2,
+        col_offset=0,
+        end_col_offset=15,
+    )
+    assert not _strictly_encloses_span(if_left, _SpanBounds(2, 2, 20, 35))
+    assert not _strictly_encloses_span(if_left, _SpanBounds(2, 2, 20, None))
+
+    # 2. Disjoint node to the right on the same line does not enclose span
+    if_right = ast.AnnAssign(
+        target=ast.Name(id="x", ctx=ast.Store()),
+        annotation=ast.Name(id="int", ctx=ast.Load()),
+        simple=1,
+        lineno=2,
+        end_lineno=2,
+        col_offset=20,
+        end_col_offset=35,
+    )
+    assert not _strictly_encloses_span(if_right, _SpanBounds(2, 2, 0, 15))
+    assert not _strictly_encloses_span(if_right, _SpanBounds(2, 2, None, 15))
+
+    # 3. Multi-line node ending on line 2 at col 10 does not enclose unit at [15, 25] on line 2
+    multiline_prior = ast.AnnAssign(
+        target=ast.Name(id="x", ctx=ast.Store()),
+        annotation=ast.Name(id="int", ctx=ast.Load()),
+        simple=1,
+        lineno=1,
+        end_lineno=2,
+        col_offset=0,
+        end_col_offset=10,
+    )
+    assert not _strictly_encloses_span(
+        multiline_prior, _SpanBounds(2, 2, 15, 25)
+    )
+    assert not _strictly_encloses_span(
+        multiline_prior, _SpanBounds(2, 2, 15, None)
+    )
+
+    # 4. True single-line compound enclosure: `if cond: target_unit()`
+    single_if_mod = ast.parse("if cond: target_unit()\n")
+    single_if = single_if_mod.body[0]
+    assert _strictly_encloses_span(single_if, _SpanBounds(1, 1, 9, 22))
+    assert not _strictly_encloses_span(single_if, _SpanBounds(1, 1, 0, 22))
+
+    # 5. _resolve_immediate_scope_in_fn ignores disjoint class ending before or starting after unit on same line
+    cls_tree = ast.parse(
+        "def outer():\n"
+        "    class Box(\n"
+        "        Base\n"
+        "    ): pass\n"
+    )
+    outer_fn = cls_tree.body[0]
+    box_cls = outer_fn.body[0]  # type: ignore[attr-defined]
+    box_cls.end_col_offset = 11
+    assert (
+        _resolve_immediate_scope_in_fn(
+            outer_fn, 4, 4, u_start_col=13, u_end_col=18
+        )
+        is outer_fn
+    )
+    box_cls.lineno = 4
+    box_cls.col_offset = 20
+    box_cls.end_col_offset = 35
+    assert (
+        _resolve_immediate_scope_in_fn(
+            outer_fn, 4, 4, u_start_col=4, u_end_col=15
+        )
+        is outer_fn
+    )
+
+    # 6. _find_enclosing_pre_bound_names sets in_loop=False when loop is disjoint on boundary line
+    loop_tree = ast.parse(
+        "def outer(items):\n"
+        "    for a in (\n"
+        "        items\n"
+        "    ): pass\n"
+    )
+    for_stmt = loop_tree.body[0].body[0]  # type: ignore[attr-defined]
+    for_stmt.end_col_offset = 11
+    _, in_loop = _find_enclosing_pre_bound_names(
+        loop_tree, 4, 4, u_start_col=13, u_end_col=18
+    )
+    assert in_loop is False
+    for_stmt.lineno = 4
+    for_stmt.col_offset = 20
+    for_stmt.end_col_offset = 35
+    _, in_loop_right = _find_enclosing_pre_bound_names(
+        loop_tree, 4, 4, u_start_col=4, u_end_col=15
+    )
+    assert in_loop_right is False
+
+    # 7. Decorator line/col tracking uses decorator's '@' column rather than def's col_offset
+    dec_fn = ast.FunctionDef(
+        name="inner",
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[],
+            kwonlyargs=[],
+            kw_defaults=[],
+            defaults=[],
+        ),
+        body=[ast.Pass(lineno=4, end_lineno=4, col_offset=8, end_col_offset=12)],
+        decorator_list=[
+            ast.Name(
+                id="dec",
+                ctx=ast.Load(),
+                lineno=2,
+                end_lineno=2,
+                col_offset=9,
+                end_col_offset=12,
+            )
+        ],
+        lineno=3,
+        end_lineno=4,
+        col_offset=4,
+        end_col_offset=12,
+    )
+    assert _node_earliest_start_pos(dec_fn) == (2, 8)
+    wrap_mod = ast.Module(body=[dec_fn], type_ignores=[])
+    closures = _collect_scope_closures(wrap_mod)
+    assert closures[0][0] == (2, 8)
+
+
