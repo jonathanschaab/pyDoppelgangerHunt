@@ -28,10 +28,12 @@ from pydoppelgangerhunt.fixer._df_cell_hazards import (
     _resolve_unit_col_bounds,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
+    _COMPREHENSION_TYPES,
     _extract_comprehension_walrus_names,
     _extract_scope_nonlocals_and_outer_globals,
     _extract_single_node_local_names,
     _node_strictly_encloses_bounds,
+    _resolve_immediate_scope_in_fn,
     iter_nested_scope_header_nodes,
 )
 from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
@@ -1644,6 +1646,15 @@ def _find_enclosing_pre_bound_names(
     for scope_node in active_scopes:
         is_class_scope = isinstance(scope_node, ast.ClassDef)
         if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bound_before.difference_update(
+                _extract_single_node_local_names(
+                    scope_node,
+                    include_globals=False,
+                    include_nonlocals=False,
+                    include_self_name=False,
+                    include_bare_annotations=True,
+                )
+            )
             for arg in (
                 scope_node.args.posonlyargs
                 + scope_node.args.args
@@ -1663,7 +1674,10 @@ def _find_enclosing_pre_bound_names(
             c_end_col = getattr(curr, "end_col_offset", c_col)
             if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 if _is_before_unit(c_start, c_col) and (
-                    curr in active_scopes
+                    (
+                        curr in active_scopes
+                        and not isinstance(curr, ast.ClassDef)
+                    )
                     or _is_before_unit(c_end, c_end_col)
                 ):
                     bound_before.add(curr.name)
@@ -1763,6 +1777,7 @@ def _infer_missing_col_from_line_ast(
     line0: str,
     s_col: Optional[int],
     e_col: Optional[int],
+    unit_kind: Optional[str] = None,
 ) -> Tuple[Optional[int], Optional[int]]:
     """Infers a missing start_col or end_col from single-line AST nodes."""
     stripped = line0.lstrip()
@@ -1773,17 +1788,26 @@ def _infer_missing_col_from_line_ast(
         mod = ast.parse(stripped)
     except SyntaxError:
         return s_col, e_col
-    for node in ast.walk(mod):
-        nc = getattr(node, "col_offset", None)
-        nec = getattr(node, "end_col_offset", None)
-        if not isinstance(nc, int) or not isinstance(nec, int):
-            continue
-        abs_s = pad + nc
-        abs_e = pad + nec
-        if s_col is not None and e_col is None and abs_s == s_col < abs_e:
-            return s_col, abs_e
-        if e_col is not None and s_col is None and abs_s < e_col == abs_e:
-            return abs_s, e_col
+    if unit_kind == "comprehension":
+        candidate_groups: Tuple[Tuple[type, ...], ...] = (_COMPREHENSION_TYPES,)
+    elif unit_kind == "complex_expr":
+        candidate_groups = ((ast.expr,),)
+    else:
+        candidate_groups = ((ast.stmt,), (ast.expr,))
+    for target_types in candidate_groups:
+        for node in ast.walk(mod):
+            if not isinstance(node, target_types):
+                continue
+            nc = getattr(node, "col_offset", None)
+            nec = getattr(node, "end_col_offset", None)
+            if not isinstance(nc, int) or not isinstance(nec, int):
+                continue
+            abs_s = pad + nc
+            abs_e = pad + nec
+            if s_col is not None and e_col is None and abs_s == s_col < abs_e:
+                return s_col, abs_e
+            if e_col is not None and s_col is None and abs_s < e_col == abs_e:
+                return abs_s, e_col
     return s_col, e_col
 
 
@@ -1856,7 +1880,10 @@ def _unit_cols(
         and len(unit_code_lines) == 1
     ):
         s_col, e_col = _infer_missing_col_from_line_ast(
-            unit_code_lines[0], s_col, e_col
+            unit_code_lines[0],
+            s_col,
+            e_col,
+            unit_kind=str(unit.get("kind") or ""),
         )
     return s_col, e_col
 
@@ -2257,11 +2284,21 @@ def _inspect_unit_scope(
                         u_start_col=u_start_col,
                         u_end_col=u_end_col,
                     )
-                    if cond_escaping_cands:
+                    if cond_escaping_cands or cond_live_ins:
                         enc_chain = _find_enclosing_function_chain(
                             mod_tree, u_start, u_end, u_start_col
                         )
                         if enc_chain:
+                            in_enclosing_class_body = isinstance(
+                                _resolve_immediate_scope_in_fn(
+                                    enc_chain[-1][2],
+                                    u_start,
+                                    u_end,
+                                    u_start_col=u_start_col,
+                                    u_end_col=u_end_col,
+                                ),
+                                ast.ClassDef,
+                            )
                             enc_nonlocals, enc_outer_globals = (
                                 _extract_scope_nonlocals_and_outer_globals(
                                     enc_chain[-1][2],
@@ -2303,7 +2340,8 @@ def _inspect_unit_scope(
                                         if "severed_closure_cell" not in hazards:
                                             hazards.append("severed_closure_cell")
                                 elif (
-                                    not visitor.has_yield
+                                    not in_enclosing_class_body
+                                    and not visitor.has_yield
                                     and v in pre_bound
                                     and v in def_pre_bound
                                 ):
@@ -2311,6 +2349,17 @@ def _inspect_unit_scope(
                                         visitor.loads.append(v)
                                     if v not in visitor.read_before_write:
                                         visitor.read_before_write.append(v)
+                                elif (
+                                    in_enclosing_class_body
+                                    or v not in def_pre_bound
+                                ):
+                                    rejected_escaping_vars.add(v)
+                            for v in cond_live_ins:
+                                if v not in def_pre_bound or (
+                                    in_enclosing_class_body
+                                    and v not in enc_escaping
+                                ):
+                                    rejected_escaping_vars.add(v)
                 has_enclosing_context = mod_tree is not None and (
                     u_start > 1 or bool(_get_tree_scope_intervals(mod_tree))
                 )

@@ -1745,8 +1745,12 @@ def _is_closure_factory_scope_uncached(
         (scope_ctx.shadowed_names if scope_ctx is not None else frozenset())
         | own_locals
     )
+    all_fn_locals = (
+        (scope_ctx.fn_locals if scope_ctx is not None else frozenset())
+        | own_locals
+    )
     local_ctx = _FnScopeContext(
-        fn_locals=own_locals,
+        fn_locals=all_fn_locals,
         shadowed_names=shadowed,
         parent_map=parent_map,
         has_star_import=(
@@ -1754,6 +1758,8 @@ def _is_closure_factory_scope_uncached(
         ),
     )
     has_nested_closure = False
+    local_closure_syms: Set[str] = set()
+    local_edges: List[Tuple[str, Set[str]]] = []
     ret_exprs: List[ast.AST] = []
     stack: List[ast.AST] = list(scope_node.body)
     while stack:
@@ -1761,9 +1767,12 @@ def _is_closure_factory_scope_uncached(
         if isinstance(curr, (ast.Yield, ast.YieldFrom)):
             return True
         if isinstance(
-            curr,
-            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+            curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
         ):
+            has_nested_closure = True
+            local_closure_syms.add(curr.name)
+            continue
+        if isinstance(curr, ast.Lambda):
             has_nested_closure = True
             continue
         if isinstance(curr, ast.GeneratorExp):
@@ -1772,16 +1781,47 @@ def _is_closure_factory_scope_uncached(
                 if curr.generators:
                     stack.append(curr.generators[0].iter)
                 continue
+        carrier = _extract_closure_carrier_targets_and_values(curr)
+        if carrier is not None:
+            c_targets, c_values = carrier
+            local_tgts = c_targets & own_locals
+            if local_tgts:
+                c_calls: Set[str] = set()
+                c_reads, c_muts, c_loads = (
+                    _extract_expr_closure_and_load_info(
+                        c_values, local_ctx, called_names_out=c_calls
+                    )
+                )
+                if c_reads or c_muts:
+                    local_closure_syms.update(local_tgts)
+                local_refs = (c_loads | c_calls) & own_locals
+                if local_refs:
+                    for t_name in local_tgts:
+                        local_edges.append((t_name, local_refs))
         if isinstance(curr, ast.Return) and curr.value is not None:
             ret_exprs.append(curr.value)
         stack.extend(ast.iter_child_nodes(curr))
     if not has_nested_closure or not ret_exprs:
         return False
+    if local_closure_syms and local_edges:
+        changed = True
+        while changed:
+            changed = False
+            for t_name, refs in local_edges:
+                if t_name not in local_closure_syms and (
+                    refs & local_closure_syms
+                ):
+                    local_closure_syms.add(t_name)
+                    changed = True
     ret_calls: Set[str] = set()
     r_reads, r_muts, r_loads = _extract_expr_closure_and_load_info(
         ret_exprs, local_ctx, called_names_out=ret_calls
     )
-    return bool(r_reads or r_muts or r_loads or ret_calls)
+    return bool(
+        r_reads
+        or r_muts
+        or ((r_loads | ret_calls) & local_closure_syms)
+    )
 
 
 def _is_closure_factory_scope(
@@ -1811,8 +1851,8 @@ def _is_closure_factory_scope(
 def _extract_fn_returned_closure_refs_uncached(
     fn_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
     scope_ctx: Optional[_FnScopeContext] = None,
-) -> frozenset[str]:
-    """Computes non-local variable/callable names returned by fn_node without caching."""
+) -> Tuple[frozenset[str], frozenset[str]]:
+    """Computes (returned_loaded_names, returned_called_names) for fn_node without caching."""
     own_locals = _extract_single_node_local_names(
         fn_node,
         include_globals=False,
@@ -1831,36 +1871,38 @@ def _extract_fn_returned_closure_refs_uncached(
             continue
         stack.extend(ast.iter_child_nodes(curr))
     if not ret_exprs:
-        return frozenset()
+        return frozenset(), frozenset()
     ret_calls: Set[str] = set()
     _, _, ret_loads = _extract_expr_closure_and_load_info(
         ret_exprs, scope_ctx, called_names_out=ret_calls
     )
-    return frozenset((ret_loads | ret_calls) - own_locals)
+    return frozenset(ret_loads - own_locals), frozenset(ret_calls - own_locals)
 
 
 def _extract_fn_returned_closure_refs(
     fn_node: ast.AST,
     scope_ctx: Optional[_FnScopeContext] = None,
-) -> Set[str]:
-    """Extracts non-local variable/callable names returned by a nested function."""
+) -> Tuple[Set[str], Set[str]]:
+    """Extracts non-local (returned_loaded_names, returned_called_names) for a nested function."""
     if not isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        return set()
+        return set(), set()
     cache_key: Any = (
         fn_node,
         "ret_closure_refs",
         scope_ctx.shadowed_names if scope_ctx is not None else None,
         scope_ctx.has_star_import if scope_ctx is not None else False,
     )
-    return set(
+    cached_loads, cached_calls = cast(
+        Tuple[frozenset[str], frozenset[str]],
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
             cache_key,
             lambda: _extract_fn_returned_closure_refs_uncached(
                 fn_node, scope_ctx
             ),
-        )
+        ),
     )
+    return set(cached_loads), set(cached_calls)
 
 
 def _extract_fn_outer_carrier_targets_uncached(
@@ -1995,10 +2037,11 @@ def _handle_nested_scope_node(
     stack: List[_StackFrame],
     scope_ctx: Optional[_FnScopeContext] = None,
     factory_names: Optional[Set[str]] = None,
-    fn_return_refs: Optional[Dict[str, Set[str]]] = None,
+    fn_return_refs: Optional[Dict[str, Tuple[Set[str], Set[str]]]] = None,
     alias_edges: Optional[List[Tuple[str, Set[str]]]] = None,
     call_edges: Optional[List[Tuple[str, Set[str]]]] = None,
     sibling_nl_deletions: Optional[Set[str]] = None,
+    is_direct_span: bool = True,
 ) -> bool:
     """Processes nested function, class, lambda, or comprehension scopes during cell analysis."""
     if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -2008,7 +2051,12 @@ def _handle_nested_scope_node(
             _is_node_inside_span(hdr, span) or _strictly_encloses_span(hdr, span)
             for hdr in hdr_nodes
         )
-        if span_in_hdr:
+        enclosing_cls = (
+            isinstance(curr, ast.ClassDef)
+            and not span_in_hdr
+            and _strictly_encloses_span(curr, span)
+        )
+        if span_in_hdr or (enclosing_cls and is_direct_span):
             if _can_bind_in_fn_scope(
                 curr.name, frame.active_nonlocals, state.fn_globals
             ):
@@ -2019,11 +2067,6 @@ def _handle_nested_scope_node(
             _record_binding_at_pos(
                 (curr.name,), estart, ecol, span, frame, state
             )
-        enclosing_cls = (
-            isinstance(curr, ast.ClassDef)
-            and not span_in_hdr
-            and _strictly_encloses_span(curr, span)
-        )
         if enclosing_cls and isinstance(curr, ast.ClassDef):
             for stmt in curr.body:
                 if isinstance(
@@ -2070,11 +2113,15 @@ def _handle_nested_scope_node(
                 if fn_return_refs is not None and isinstance(
                     curr, (ast.FunctionDef, ast.AsyncFunctionDef)
                 ):
-                    ret_refs = _extract_fn_returned_closure_refs(curr, scope_ctx)
-                    if ret_refs:
-                        fn_return_refs.setdefault(sib_name, set()).update(
-                            ret_refs
+                    ret_loads, ret_calls = _extract_fn_returned_closure_refs(
+                        curr, scope_ctx
+                    )
+                    if ret_loads or ret_calls:
+                        entry = fn_return_refs.setdefault(
+                            sib_name, (set(), set())
                         )
+                        entry[0].update(ret_loads)
+                        entry[1].update(ret_calls)
             sibling_closures.append((sib_name, free_r, nl_mut))
             for oc_name in outer_carriers:
                 sibling_closures.append((oc_name, set(free_r), set(nl_mut)))
@@ -2295,7 +2342,7 @@ class _StmtCellDelta(NamedTuple):
     alias_edges: Tuple[Tuple[str, frozenset[str]], ...]
     call_edges: Tuple[Tuple[str, frozenset[str]], ...]
     factory_names: frozenset[str]
-    fn_return_refs: Tuple[Tuple[str, frozenset[str]], ...]
+    fn_return_refs: Tuple[Tuple[str, frozenset[str], frozenset[str]], ...]
     sibling_nl_deletions: frozenset[str]
 
 
@@ -2308,7 +2355,7 @@ class _CellTraversalBuffers(NamedTuple):
     alias_edges: List[Tuple[str, Set[str]]]
     call_edges: List[Tuple[str, Set[str]]]
     factory_names: Set[str]
-    fn_return_refs: Dict[str, Set[str]]
+    fn_return_refs: Dict[str, Tuple[Set[str], Set[str]]]
     sibling_nl_deletions: Set[str]
     scope_ctx: _FnScopeContext
     unit_mutations: AbstractSet[str] = frozenset()
@@ -2365,8 +2412,10 @@ def _apply_stmt_cell_delta(
     for t_name, calls in delta.call_edges:
         bufs.call_edges.append((t_name, set(calls)))
     bufs.factory_names.update(delta.factory_names)
-    for fn_name, refs in delta.fn_return_refs:
-        bufs.fn_return_refs.setdefault(fn_name, set()).update(refs)
+    for fn_name, ret_loads, ret_calls in delta.fn_return_refs:
+        entry = bufs.fn_return_refs.setdefault(fn_name, (set(), set()))
+        entry[0].update(ret_loads)
+        entry[1].update(ret_calls)
     bufs.sibling_nl_deletions.update(delta.sibling_nl_deletions)
 
 
@@ -2426,8 +2475,11 @@ def _try_apply_cached_stmt_delta(
             ),
             factory_names=frozenset(sub_bufs.factory_names),
             fn_return_refs=tuple(
-                (fn_name, frozenset(refs))
-                for fn_name, refs in sub_bufs.fn_return_refs.items()
+                (fn_name, frozenset(r_loads), frozenset(r_calls))
+                for fn_name, (
+                    r_loads,
+                    r_calls,
+                ) in sub_bufs.fn_return_refs.items()
             ),
             sibling_nl_deletions=frozenset(sub_bufs.sibling_nl_deletions),
         )
@@ -2546,6 +2598,7 @@ def _traverse_fn_cell_frames(
             bufs.alias_edges,
             bufs.call_edges,
             bufs.sibling_nl_deletions,
+            is_direct_span=enclosed_fn is None,
         ):
             if is_conc_pos:
                 bufs.concurrent_sib_indices.update(
@@ -2696,6 +2749,12 @@ def _analyze_enclosing_fn_cells_uncached(
         bufs.state.pre_bound.difference_update(bufs.sibling_nl_deletions)
         bufs.state.pre_unbound.update(bufs.sibling_nl_deletions)
 
+    closure_carrier_names: Set[str] = (
+        {name for name, _, _ in bufs.sibling_closures if name is not None}
+        | bufs.factory_names
+        | {t for t, _ in bufs.alias_edges}
+        | {t for t, _ in bufs.call_edges}
+    )
     for t_name, called_set in bufs.call_edges:
         alias_targets: Set[str] = set(called_set & bufs.factory_names)
         visited_fn_refs: Set[str] = set()
@@ -2707,13 +2766,20 @@ def _analyze_enclosing_fn_cells_uncached(
             visited_fn_refs.add(fn_ref)
             if fn_ref in bufs.factory_names:
                 alias_targets.add(fn_ref)
-            for ret_ref in bufs.fn_return_refs.get(fn_ref, ()):
-                alias_targets.add(ret_ref)
+            ret_loads_set, ret_calls_set = bufs.fn_return_refs.get(
+                fn_ref, (set(), set())
+            )
+            for ret_ref in ret_loads_set:
+                if ret_ref in closure_carrier_names:
+                    alias_targets.add(ret_ref)
+            for call_ref in ret_calls_set:
+                if call_ref in bufs.factory_names:
+                    alias_targets.add(call_ref)
                 if (
-                    ret_ref in bufs.fn_return_refs
-                    or ret_ref in bufs.factory_names
+                    call_ref in bufs.fn_return_refs
+                    or call_ref in bufs.factory_names
                 ):
-                    pending_fn_refs.append(ret_ref)
+                    pending_fn_refs.append(call_ref)
         if alias_targets:
             bufs.alias_edges.append((t_name, alias_targets))
 
@@ -3005,6 +3071,15 @@ def _check_sibling_closure_sharing(
         set(sub_mutated)
         & chain_infos[-1].fn_locals
         & set(chain_infos[-1].concurrent_sibling_vars)
+    ):
+        return True
+    if (
+        unreturned_mutations
+        and skip_pre_unit_closures
+        and any(
+            bool(set(sub_mutated) & all_chain_locals & set(info.post_reads))
+            for info in chain_infos
+        )
     ):
         return True
     unshadowed_sibs: List[

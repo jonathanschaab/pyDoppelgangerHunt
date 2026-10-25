@@ -6693,4 +6693,208 @@ def test_pr38_review_fixes_duplicate_cols_shadowing_and_immutability() -> None:
     )
 
 
+def test_pr38_followup_review_six_items() -> None:
+    """Verifies all 6 follow-up review items for closure factories, return refs, class-body units, shadowing, col inference, and post-unit lenient expression hazards."""
+    import ast
+    from pydoppelgangerhunt.fixer.scope import (
+        _unit_cols,
+        inspect_single_unit_scope,
+    )
+
+    # 1. Local non-escaping lambda inside helper does not taint plain return value as closure factory
+    src_item1 = (
+        "def outer(items):\n"
+        "    acc = 0\n"
+        "    def compute_initial(seq):\n"
+        "        s = sorted(seq, key=lambda v: v)\n"
+        "        return sum(s) + acc\n"
+        "    init_val = compute_initial(items)\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        acc += x\n"
+        "        out.append(init_val + x)\n"
+        "    return acc, out\n"
+    )
+    tree_item1 = ast.parse(src_item1)
+    unit_item1 = {
+        "start": 8,
+        "end": 10,
+        "kind": "compound_block",
+        "source_text": src_item1,
+        "source_code": (
+            "for x in items:\n"
+            "    acc += x\n"
+            "    out.append(init_val + x)\n"
+        ),
+    }
+    scope_item1 = inspect_single_unit_scope(unit_item1, tree=tree_item1)
+    assert "severed_closure_cell" not in scope_item1["control_flow_hazards"]
+    assert scope_item1["is_control_flow_safe"] is True
+
+    # 2. Helper calling a sibling closure in return (ret_calls) is not conflated with returning callable (ret_loads)
+    src_item2 = (
+        "def outer(items):\n"
+        "    acc = 0\n"
+        "    def get_acc():\n"
+        "        return acc\n"
+        "    def compute_initial():\n"
+        "        return get_acc() + 1\n"
+        "    init_val = compute_initial()\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        acc += x\n"
+        "        out.append(init_val + x)\n"
+        "    return acc, out\n"
+    )
+    tree_item2 = ast.parse(src_item2)
+    unit_item2 = {
+        "start": 9,
+        "end": 11,
+        "kind": "compound_block",
+        "source_text": src_item2,
+        "source_code": (
+            "for x in items:\n"
+            "    acc += x\n"
+            "    out.append(init_val + x)\n"
+        ),
+    }
+    scope_item2 = inspect_single_unit_scope(unit_item2, tree=tree_item2)
+    assert "severed_closure_cell" not in scope_item2["control_flow_hazards"]
+    assert scope_item2["is_control_flow_safe"] is True
+
+    # Verify helper actually returning get_acc (ret_loads) or transitive call to factory STILL triggers hazard
+    src_item2_pos = (
+        "def outer(items):\n"
+        "    acc = 0\n"
+        "    def get_acc():\n"
+        "        return acc\n"
+        "    def get_reader():\n"
+        "        return get_acc\n"
+        "    def get_reader_2():\n"
+        "        return get_reader()\n"
+        "    reader = get_reader_2()\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        acc += x\n"
+        "        out.append(reader() + x)\n"
+        "    return acc, out\n"
+    )
+    tree_item2_pos = ast.parse(src_item2_pos)
+    unit_item2_pos = {
+        "start": 11,
+        "end": 13,
+        "kind": "compound_block",
+        "source_text": src_item2_pos,
+        "source_code": (
+            "for x in items:\n"
+            "    acc += x\n"
+            "    out.append(reader() + x)\n"
+        ),
+    }
+    scope_item2_pos = inspect_single_unit_scope(
+        unit_item2_pos, tree=tree_item2_pos
+    )
+    assert "severed_closure_cell" in scope_item2_pos["control_flow_hazards"]
+
+    # 3A. Class-body unit capturing enclosing class name Box before class body finishes
+    src_item3a = (
+        "def outer(items):\n"
+        "    cbs = []\n"
+        "    class Box:\n"
+        "        for x in items:\n"
+        "            cbs.append(lambda x=x: (Box, x))\n"
+        "    return Box, cbs\n"
+    )
+    tree_item3a = ast.parse(src_item3a)
+    unit_item3a = {
+        "start": 4,
+        "end": 5,
+        "kind": "compound_block",
+        "source_text": src_item3a,
+        "source_code": (
+            "for x in items:\n"
+            "    cbs.append(lambda x=x: (Box, x))\n"
+        ),
+    }
+    scope_item3a = inspect_single_unit_scope(unit_item3a, tree=tree_item3a)
+    assert "severed_closure_cell" in scope_item3a["control_flow_hazards"]
+
+    # 3B. Class-body unit conditionally assigning v without nonlocal does not promote outer local v
+    src_item3b = (
+        "def outer(flag):\n"
+        "    v = 10\n"
+        "    class Box:\n"
+        "        if flag:\n"
+        "            v = 20\n"
+        "        w = 30\n"
+        "    return Box, v\n"
+    )
+    tree_item3b = ast.parse(src_item3b)
+    unit_item3b = {
+        "start": 4,
+        "end": 6,
+        "kind": "compound_block",
+        "source_text": src_item3b,
+        "source_code": "if flag:\n    v = 20\nw = 30\n",
+    }
+    scope_item3b = inspect_single_unit_scope(unit_item3b, tree=tree_item3b)
+    assert "v" not in scope_item3b["inputs"]
+    assert "v" in scope_item3b["conditional_outputs"]
+
+    # 4. Lexical shadowing of outer local in inner function does not leak into pre_bound / cond_live_ins
+    src_item4 = (
+        "def outer(flag):\n"
+        "    v = 10\n"
+        "    def inner():\n"
+        "        if flag:\n"
+        "            v = 20\n"
+        "        res = v if flag else 0\n"
+        "        return res, v\n"
+        "    return inner()\n"
+    )
+    tree_item4 = ast.parse(src_item4)
+    unit_item4 = {
+        "start": 4,
+        "end": 6,
+        "kind": "compound_block",
+        "source_text": src_item4,
+        "source_code": "if flag:\n    v = 20\nres = v if flag else 0\n",
+    }
+    scope_item4 = inspect_single_unit_scope(unit_item4, tree=tree_item4)
+    assert "v" not in scope_item4["inputs"]
+
+    # 5. _unit_cols / _infer_missing_col_from_line_ast disambiguates comprehension vs parent Assign/BinOp
+    comp_assign_line = ["    res = [x * 2 for x in items]"]
+    assert _unit_cols(
+        {"kind": "comprehension", "end_col": 32}, comp_assign_line
+    ) == (10, 32)
+    comp_binop_line = ["    [x * 2 for x in items] + [1]"]
+    assert _unit_cols(
+        {"kind": "comprehension", "start_col": 4}, comp_binop_line
+    ) == (4, 26)
+
+    # 6. Post-unit sibling closure capturing walrus-mutated var in expression unit caught in lenient mode
+    src_item6 = (
+        "def outer(items):\n"
+        "    acc = 0\n"
+        "    vals = [(acc := acc + x) for x in items]\n"
+        "    cb = lambda: acc\n"
+        "    return vals, cb\n"
+    )
+    tree_item6 = ast.parse(src_item6)
+    unit_item6 = {
+        "start": 3,
+        "end": 3,
+        "start_col": 11,
+        "end_col": 44,
+        "kind": "comprehension",
+        "skip_pre_unit_closures": True,
+        "source_text": src_item6,
+        "source_code": "[(acc := acc + x) for x in items]",
+    }
+    scope_item6 = inspect_single_unit_scope(unit_item6, tree=tree_item6)
+    assert "severed_closure_cell" in scope_item6["control_flow_hazards"]
+
+
+
 
