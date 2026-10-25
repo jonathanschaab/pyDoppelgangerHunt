@@ -574,46 +574,54 @@ def _extract_comprehension_deferred_closure_info(
     """Extracts (deferred_free_reads, lazy_walrus_mutations) from a comprehension node."""
     is_lazy = _is_lazy_genexp(comp_node, scope_ctx)
     first_iter = comp_node.generators[0].iter if comp_node.generators else None
-    nested_lazy_nodes: List[Tuple[Union[ast.Lambda, ast.GeneratorExp], bool]] = []
-    sub_stack: List[Tuple[ast.AST, bool]] = (
-        [(first_iter, True)]
-        if (is_lazy and first_iter is not None)
-        else [
-            (ch, ch is first_iter)
-            for ch in ast.iter_child_nodes(comp_node)
-        ]
+    init_exprs, init_targets = _iter_comprehension_body_exprs_and_targets(
+        comp_node
     )
+    base_targets = frozenset(init_targets)
+    nested_lazy_nodes: List[
+        Tuple[Union[ast.Lambda, ast.GeneratorExp], frozenset[str]]
+    ] = []
+    if is_lazy:
+        sub_stack: List[Tuple[ast.AST, frozenset[str]]] = (
+            [(first_iter, frozenset())] if first_iter is not None else []
+        )
+    else:
+        sub_stack = [(expr, base_targets) for expr in init_exprs]
+        if first_iter is not None:
+            sub_stack.append((first_iter, frozenset()))
     while sub_stack:
-        sub, in_hdr = sub_stack.pop()
+        sub, shadowed_targets = sub_stack.pop()
         if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             sub_stack.extend(
-                (hdr, in_hdr) for hdr in iter_nested_scope_header_nodes(sub)
+                (hdr, shadowed_targets)
+                for hdr in iter_nested_scope_header_nodes(sub)
             )
             continue
         if isinstance(sub, ast.Lambda):
-            nested_lazy_nodes.append((sub, in_hdr))
+            nested_lazy_nodes.append((sub, shadowed_targets))
             sub_stack.extend(
-                (hdr, in_hdr) for hdr in iter_nested_scope_header_nodes(sub)
+                (hdr, shadowed_targets)
+                for hdr in iter_nested_scope_header_nodes(sub)
             )
             continue
-        if isinstance(sub, ast.GeneratorExp):
-            if _is_lazy_genexp(sub, scope_ctx):
-                nested_lazy_nodes.append((sub, in_hdr))
+        if isinstance(sub, _COMPREHENSION_TYPES):
+            if isinstance(sub, ast.GeneratorExp) and _is_lazy_genexp(
+                sub, scope_ctx
+            ):
+                nested_lazy_nodes.append((sub, shadowed_targets))
                 if sub.generators:
-                    sub_stack.append((sub.generators[0].iter, in_hdr))
+                    sub_stack.append((sub.generators[0].iter, shadowed_targets))
                 continue
-        sub_stack.extend(
-            (
-                ch,
-                in_hdr
-                or (
-                    isinstance(sub, ast.comprehension)
-                    and bool(comp_node.generators)
-                    and sub is comp_node.generators[0]
-                    and ch is first_iter
-                ),
+            sub_exprs, sub_targets = _iter_comprehension_body_exprs_and_targets(
+                sub
             )
-            for ch in ast.iter_child_nodes(sub)
+            if sub.generators:
+                sub_stack.append((sub.generators[0].iter, shadowed_targets))
+            inner_shadowed = shadowed_targets | frozenset(sub_targets)
+            sub_stack.extend((expr, inner_shadowed) for expr in sub_exprs)
+            continue
+        sub_stack.extend(
+            (ch, shadowed_targets) for ch in ast.iter_child_nodes(sub)
         )
 
     if not is_lazy and not nested_lazy_nodes:
@@ -628,13 +636,11 @@ def _extract_comprehension_deferred_closure_info(
         comp_all_free = _extract_expr_scope_free_reads(
             comp_node, include_header=True
         )
-        _, comp_targets = _iter_comprehension_body_exprs_and_targets(comp_node)
-        for lazy_sub, in_hdr in nested_lazy_nodes:
-            sub_reads = _extract_expr_scope_free_reads(
-                lazy_sub, include_header=False
+        for lazy_sub, shadowed_targets in nested_lazy_nodes:
+            sub_reads = (
+                _extract_expr_scope_free_reads(lazy_sub, include_header=False)
+                - shadowed_targets
             )
-            if not in_hdr:
-                sub_reads -= comp_targets
             deferred_reads.update(sub_reads & comp_all_free)
 
     lazy_muts = _extract_lazy_genexp_walrus_names(comp_node, scope_ctx)
@@ -651,11 +657,13 @@ def _collect_unit_nonlocal_mutators(
         unit_mod, mod_tree=mod_tree, cache_parent_map=False
     )
     mutators: List[Tuple[str, Set[str], bool]] = []
-    stack: List[ast.AST] = list(candidate_stmts)
+    stack: List[Tuple[ast.AST, frozenset[str]]] = [
+        (stmt, frozenset()) for stmt in candidate_stmts
+    ]
     while stack:
-        curr = stack.pop()
+        curr, shadowed = stack.pop()
         if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            mutated = _extract_closure_nonlocal_mutations(curr)
+            mutated = _extract_closure_nonlocal_mutations(curr) - shadowed
             if mutated:
                 is_escaped_def = (
                     isinstance(curr, ast.ClassDef)
@@ -663,23 +671,49 @@ def _collect_unit_nonlocal_mutators(
                     or _is_closure_factory_scope(curr, scope_ctx)
                 )
                 mutators.append((curr.name, mutated, is_escaped_def))
-            stack.extend(getattr(curr, "body", []))
-            stack.extend(iter_nested_scope_header_nodes(curr))
+            own_locals = (
+                frozenset()
+                if isinstance(curr, ast.ClassDef)
+                else frozenset(
+                    _extract_single_node_local_names(
+                        curr,
+                        include_globals=False,
+                        include_nonlocals=False,
+                        include_self_name=False,
+                        include_bare_annotations=True,
+                    )
+                )
+            )
+            body_shadowed = (
+                shadowed
+                | own_locals
+                | frozenset(_extract_direct_nonlocals(curr, is_global=True))
+            )
+            stack.extend(
+                (ch, body_shadowed) for ch in getattr(curr, "body", [])
+            )
+            stack.extend(
+                (hdr, shadowed) for hdr in iter_nested_scope_header_nodes(curr)
+            )
             continue
         if isinstance(curr, ast.GeneratorExp):
             if _is_lazy_genexp(curr, scope_ctx):
-                w_names = _extract_comprehension_body_walrus_names(curr)
+                w_names = (
+                    _extract_comprehension_body_walrus_names(curr) - shadowed
+                )
                 if w_names:
                     mutators.append(("", w_names, True))
                 if curr.generators:
-                    stack.append(curr.generators[0].iter)
+                    stack.append((curr.generators[0].iter, shadowed))
                 continue
-            stack.extend(ast.iter_child_nodes(curr))
+            stack.extend((ch, shadowed) for ch in ast.iter_child_nodes(curr))
             continue
         if isinstance(curr, ast.Lambda):
-            stack.extend(iter_nested_scope_header_nodes(curr))
+            stack.extend(
+                (hdr, shadowed) for hdr in iter_nested_scope_header_nodes(curr)
+            )
             continue
-        stack.extend(ast.iter_child_nodes(curr))
+        stack.extend((ch, shadowed) for ch in ast.iter_child_nodes(curr))
     return mutators
 
 
@@ -903,6 +937,7 @@ def _extract_expr_closure_and_load_info(
             inline_reads.update(
                 _extract_expr_scope_free_reads(curr, include_header=False)
             )
+            stack.extend(iter_nested_scope_header_nodes(curr))
             continue
         if isinstance(curr, _COMPREHENSION_TYPES):
             c_reads, c_muts = _extract_comprehension_deferred_closure_info(
@@ -1089,14 +1124,13 @@ def _extract_shallow_loads_and_calls(
     while stack:
         curr = stack.pop()
         if isinstance(
-            curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            curr,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
         ):
-            stack.extend(iter_nested_scope_header_nodes(curr))
-            continue
-        if isinstance(curr, ast.Lambda):
-            loaded.update(
-                _extract_expr_scope_free_reads(curr, include_header=False)
-            )
+            if isinstance(curr, ast.Lambda):
+                loaded.update(
+                    _extract_expr_scope_free_reads(curr, include_header=False)
+                )
             stack.extend(iter_nested_scope_header_nodes(curr))
             continue
         if isinstance(curr, ast.Call):
@@ -1722,6 +1756,50 @@ def _push_compound_children(
     return False
 
 
+def _make_nested_fn_scope_context(
+    fn_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+    own_locals: frozenset[str],
+    scope_ctx: Optional[_FnScopeContext] = None,
+) -> _FnScopeContext:
+    """Builds a _FnScopeContext for analyzing expressions inside a nested function."""
+    return _FnScopeContext(
+        fn_locals=(
+            (scope_ctx.fn_locals if scope_ctx is not None else frozenset())
+            | own_locals
+        ),
+        shadowed_names=(
+            (scope_ctx.shadowed_names if scope_ctx is not None else frozenset())
+            | own_locals
+        ),
+        parent_map=(
+            scope_ctx.parent_map
+            if scope_ctx is not None
+            else _get_scope_parent_map(fn_node)
+        ),
+        has_star_import=(
+            scope_ctx.has_star_import if scope_ctx is not None else False
+        ),
+    )
+
+
+def _propagate_local_closure_syms(
+    local_closure_syms: Set[str],
+    local_edges: Sequence[Tuple[str, Set[str]]],
+) -> Set[str]:
+    """Propagates local closure symbol reachability across local assignment/call edges."""
+    if local_closure_syms and local_edges:
+        changed = True
+        while changed:
+            changed = False
+            for t_name, refs in local_edges:
+                if t_name not in local_closure_syms and (
+                    refs & local_closure_syms
+                ):
+                    local_closure_syms.add(t_name)
+                    changed = True
+    return local_closure_syms
+
+
 def _is_closure_factory_scope_uncached(
     scope_node: ast.FunctionDef,
     scope_ctx: Optional[_FnScopeContext] = None,
@@ -1736,27 +1814,7 @@ def _is_closure_factory_scope_uncached(
             include_bare_annotations=True,
         )
     )
-    parent_map = (
-        scope_ctx.parent_map
-        if scope_ctx is not None
-        else _get_scope_parent_map(scope_node)
-    )
-    shadowed = (
-        (scope_ctx.shadowed_names if scope_ctx is not None else frozenset())
-        | own_locals
-    )
-    all_fn_locals = (
-        (scope_ctx.fn_locals if scope_ctx is not None else frozenset())
-        | own_locals
-    )
-    local_ctx = _FnScopeContext(
-        fn_locals=all_fn_locals,
-        shadowed_names=shadowed,
-        parent_map=parent_map,
-        has_star_import=(
-            scope_ctx.has_star_import if scope_ctx is not None else False
-        ),
-    )
+    local_ctx = _make_nested_fn_scope_context(scope_node, own_locals, scope_ctx)
     has_nested_closure = False
     local_closure_syms: Set[str] = set()
     local_edges: List[Tuple[str, Set[str]]] = []
@@ -1803,16 +1861,7 @@ def _is_closure_factory_scope_uncached(
         stack.extend(ast.iter_child_nodes(curr))
     if not has_nested_closure or not ret_exprs:
         return False
-    if local_closure_syms and local_edges:
-        changed = True
-        while changed:
-            changed = False
-            for t_name, refs in local_edges:
-                if t_name not in local_closure_syms and (
-                    refs & local_closure_syms
-                ):
-                    local_closure_syms.add(t_name)
-                    changed = True
+    _propagate_local_closure_syms(local_closure_syms, local_edges)
     ret_calls: Set[str] = set()
     r_reads, r_muts, r_loads = _extract_expr_closure_and_load_info(
         ret_exprs, local_ctx, called_names_out=ret_calls
@@ -1908,6 +1957,7 @@ def _extract_fn_returned_closure_refs(
 def _extract_fn_outer_carrier_targets_uncached(
     fn_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
     fn_globals: AbstractSet[str] = frozenset(),
+    scope_ctx: Optional[_FnScopeContext] = None,
 ) -> frozenset[str]:
     """Computes outer-scope container/variable names mutated by carrier operations in fn_node."""
     has_closure = any(
@@ -1933,15 +1983,22 @@ def _extract_fn_outer_carrier_targets_uncached(
         include_self_name=False,
         include_bare_annotations=True,
     )
+    local_ctx = _make_nested_fn_scope_context(
+        fn_node, frozenset(own_locals), scope_ctx
+    )
     direct_nl = _extract_direct_nonlocals(fn_node)
     fn_g = set(fn_globals) | _extract_direct_nonlocals(fn_node, is_global=True)
     targets: Set[str] = set()
+    local_closure_syms: Set[str] = set()
+    local_edges: List[Tuple[str, Set[str]]] = []
+    outer_candidates: List[Tuple[str, Set[str]]] = []
     stack: List[Tuple[ast.AST, Set[str], Set[str], Set[str]]] = [
         (stmt, own_locals, direct_nl, fn_g) for stmt in fn_node.body
     ]
     while stack:
         sub, cur_locals, cur_nl, cur_g = stack.pop()
         if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            local_closure_syms.add(sub.name)
             for hdr in iter_nested_scope_header_nodes(sub):
                 stack.append((hdr, cur_locals, cur_nl, cur_g))
             sub_direct_nl = _extract_direct_nonlocals(sub)
@@ -1989,7 +2046,13 @@ def _extract_fn_outer_carrier_targets_uncached(
             continue
         carrier = _extract_closure_carrier_targets_and_values(sub)
         if carrier is not None:
-            c_targets, _ = carrier
+            c_targets, c_values = carrier
+            c_calls: Set[str] = set()
+            c_reads, c_muts, c_loads = _extract_expr_closure_and_load_info(
+                c_values, local_ctx, called_names_out=c_calls
+            )
+            has_inline = bool(c_reads or c_muts)
+            val_refs = c_loads | c_calls
             store_names = (
                 set()
                 if isinstance(sub, ast.Call)
@@ -1998,19 +2061,35 @@ def _extract_fn_outer_carrier_targets_uncached(
             for t_name in c_targets:
                 if t_name in cur_g:
                     continue
-                if t_name in store_names:
-                    if t_name in cur_nl:
+                is_outer_target = (
+                    (t_name in cur_nl)
+                    if t_name in store_names
+                    else (t_name not in cur_locals or t_name in cur_nl)
+                )
+                if is_outer_target:
+                    if has_inline:
                         targets.add(t_name)
-                elif t_name not in cur_locals or t_name in cur_nl:
-                    targets.add(t_name)
+                    elif val_refs:
+                        outer_candidates.append((t_name, val_refs))
+                else:
+                    if has_inline:
+                        local_closure_syms.add(t_name)
+                    elif val_refs & cur_locals:
+                        local_edges.append((t_name, val_refs & cur_locals))
         for child_node in ast.iter_child_nodes(sub):
             stack.append((child_node, cur_locals, cur_nl, cur_g))
+    if outer_candidates:
+        _propagate_local_closure_syms(local_closure_syms, local_edges)
+        for t_name, val_refs in outer_candidates:
+            if val_refs & local_closure_syms:
+                targets.add(t_name)
     return frozenset(targets)
 
 
 def _extract_fn_outer_carrier_targets(
     fn_node: ast.AST,
     fn_globals: AbstractSet[str] = frozenset(),
+    scope_ctx: Optional[_FnScopeContext] = None,
 ) -> Set[str]:
     """Extracts outer-scope container/variable names mutated by carrier operations in fn_node."""
     if not isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -2018,9 +2097,15 @@ def _extract_fn_outer_carrier_targets(
     return set(
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
-            (fn_node, "outer_carriers", frozenset(fn_globals)),
+            (
+                fn_node,
+                "outer_carriers",
+                frozenset(fn_globals),
+                scope_ctx.shadowed_names if scope_ctx is not None else None,
+                scope_ctx.has_star_import if scope_ctx is not None else False,
+            ),
             lambda: _extract_fn_outer_carrier_targets_uncached(
-                fn_node, fn_globals
+                fn_node, fn_globals, scope_ctx
             ),
         )
     )
@@ -2076,9 +2161,11 @@ def _handle_nested_scope_node(
                     or _strictly_encloses_span(stmt, span)
                 ):
                     s_reads = _extract_cached_scope_free_reads(stmt)
-                    s_muts, _ = (
+                    s_muts, s_dels = (
                         _extract_closure_nonlocal_mutations_and_deletions(stmt)
                     )
+                    if sibling_nl_deletions is not None and s_dels:
+                        sibling_nl_deletions.update(s_dels)
                     if s_reads or s_muts:
                         sibling_closures.append(
                             (curr.name, set(s_reads), set(s_muts))
@@ -2102,7 +2189,7 @@ def _handle_nested_scope_node(
                 else None
             )
             outer_carriers = _extract_fn_outer_carrier_targets(
-                curr, state.fn_globals
+                curr, state.fn_globals, scope_ctx
             )
             if sib_name is not None:
                 if factory_names is not None and (
@@ -2181,28 +2268,48 @@ def _handle_nested_scope_node(
         if c_reads or c_muts:
             sibling_closures.append((None, c_reads, c_muts))
         if alias_edges is not None:
-            comp_sub_stack, comp_targets = (
+            init_exprs, init_targets = (
                 _iter_comprehension_body_exprs_and_targets(curr)
             )
-            comp_carriers: List[ast.AST] = []
+            base_targets = frozenset(init_targets)
+            comp_sub_stack: List[Tuple[ast.AST, frozenset[str]]] = [
+                (expr, base_targets) for expr in init_exprs
+            ]
+            comp_carriers: List[Tuple[ast.AST, frozenset[str]]] = []
             while comp_sub_stack:
-                sub = comp_sub_stack.pop()
+                sub, active_targets = comp_sub_stack.pop()
                 if isinstance(sub, (ast.NamedExpr, ast.Call)):
-                    comp_carriers.append(sub)
-                comp_sub_stack.extend(
-                    iter_nested_scope_header_nodes(sub)
-                    if isinstance(
-                        sub,
-                        (
-                            ast.FunctionDef,
-                            ast.AsyncFunctionDef,
-                            ast.ClassDef,
-                            ast.Lambda,
-                        ),
+                    comp_carriers.append((sub, active_targets))
+                if isinstance(sub, _COMPREHENSION_TYPES):
+                    sub_exprs, sub_targets = (
+                        _iter_comprehension_body_exprs_and_targets(sub)
                     )
-                    else ast.iter_child_nodes(sub)
+                    if sub.generators:
+                        comp_sub_stack.append(
+                            (sub.generators[0].iter, active_targets)
+                        )
+                    next_targets = active_targets | frozenset(sub_targets)
+                    comp_sub_stack.extend(
+                        (expr, next_targets) for expr in sub_exprs
+                    )
+                    continue
+                comp_sub_stack.extend(
+                    (hdr, active_targets)
+                    for hdr in (
+                        iter_nested_scope_header_nodes(sub)
+                        if isinstance(
+                            sub,
+                            (
+                                ast.FunctionDef,
+                                ast.AsyncFunctionDef,
+                                ast.ClassDef,
+                                ast.Lambda,
+                            ),
+                        )
+                        else ast.iter_child_nodes(sub)
+                    )
                 )
-            for c_node in comp_carriers:
+            for c_node, c_excluded in comp_carriers:
                 _record_carrier_closures_and_aliases(
                     c_node,
                     frame,
@@ -2210,7 +2317,7 @@ def _handle_nested_scope_node(
                     alias_edges,
                     scope_ctx,
                     call_edges,
-                    excluded_names=comp_targets,
+                    excluded_names=c_excluded,
                     fn_globals=state.fn_globals,
                 )
         if _is_pos_after_span(c_line, c_col, span):
@@ -3299,7 +3406,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
             )
             cond_pre_post = (
                 imm_info.pre_mutated - imm_info.pre_bound
-            ) & imm_info.post_reads
+            ) & (imm_info.post_reads | unit_closure_reads)
             if bool(
                 unseeded_cond_stores
                 & imm_info.fn_locals

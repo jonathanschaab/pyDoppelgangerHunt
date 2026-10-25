@@ -6896,5 +6896,197 @@ def test_pr38_followup_review_six_items() -> None:
     assert "severed_closure_cell" in scope_item6["control_flow_hazards"]
 
 
+def test_pr38_followup_round2_six_items() -> None:
+    """Verifies round 2 review items: unseeded cond store in unit closure, nested fn shadowing in mutators, outer carrier value filtering, nested comp target shadowing, lambda default args, and class method nonlocal del."""
+    import ast
+    from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope
+
+    # 1. Unseeded conditional store captured by an intra-unit closure with pre-unit conditional binding
+    src_r1 = (
+        "def outer(items, init_flag):\n"
+        "    if init_flag:\n"
+        "        y = 10\n"
+        "    cbs = []\n"
+        "    for x in items:\n"
+        "        if x > 0:\n"
+        "            y = x * 2\n"
+        "        cbs.append(lambda: y)\n"
+        "    return cbs\n"
+    )
+    tree_r1 = ast.parse(src_r1)
+    unit_r1 = {
+        "start": 5,
+        "end": 8,
+        "kind": "compound_block",
+        "source_text": src_r1,
+        "source_code": (
+            "for x in items:\n"
+            "    if x > 0:\n"
+            "        y = x * 2\n"
+            "    cbs.append(lambda: y)\n"
+        ),
+    }
+    scope_r1 = inspect_single_unit_scope(unit_r1, tree=tree_r1)
+    assert "severed_closure_cell" in scope_r1["control_flow_hazards"]
+
+    # 2. Intra-unit nested function locals shadowed in _collect_unit_nonlocal_mutators
+    src_r2 = (
+        "def outer(items):\n"
+        "    count = 100\n"
+        "    if items:\n"
+        "        def middle():\n"
+        "            count = 0\n"
+        "            def inner():\n"
+        "                nonlocal count\n"
+        "                count += 1\n"
+        "            inner()\n"
+        "            gen = ((count := count + x) for x in items)\n"
+        "            return count + sum(gen)\n"
+        "        res = middle()\n"
+        "    else:\n"
+        "        res = 0\n"
+        "    return count + res\n"
+    )
+    tree_r2 = ast.parse(src_r2)
+    unit_r2 = {
+        "start": 3,
+        "end": 14,
+        "kind": "compound_block",
+        "source_text": src_r2,
+        "source_code": (
+            "if items:\n"
+            "    def middle():\n"
+            "        count = 0\n"
+            "        def inner():\n"
+            "            nonlocal count\n"
+            "            count += 1\n"
+            "        inner()\n"
+            "        gen = ((count := count + x) for x in items)\n"
+            "        return count + sum(gen)\n"
+            "    res = middle()\n"
+            "else:\n"
+            "    res = 0\n"
+        ),
+    }
+    scope_r2 = inspect_single_unit_scope(unit_r2, tree=tree_r2)
+    assert "severed_closure_cell" not in scope_r2["control_flow_hazards"]
+    assert scope_r2["is_control_flow_safe"] is True
+
+    # 3. _extract_fn_outer_carrier_targets_uncached ignores non-closure outer attribute calls
+    src_r3 = (
+        "def outer(items):\n"
+        "    acc = 0\n"
+        "    saved = []\n"
+        "    def helper(seq):\n"
+        "        s = sorted(seq, key=lambda v: v)\n"
+        "        saved.append(len(s) + acc)\n"
+        "    helper(items)\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        acc += x\n"
+        "        out.append(len(saved) + x)\n"
+        "    return acc, out\n"
+    )
+    tree_r3 = ast.parse(src_r3)
+    unit_r3 = {
+        "start": 9,
+        "end": 11,
+        "kind": "compound_block",
+        "source_text": src_r3,
+        "source_code": (
+            "for x in items:\n"
+            "    acc += x\n"
+            "    out.append(len(saved) + x)\n"
+        ),
+    }
+    scope_r3 = inspect_single_unit_scope(unit_r3, tree=tree_r3)
+    assert "severed_closure_cell" not in scope_r3["control_flow_hazards"]
+    assert scope_r3["is_control_flow_safe"] is True
+
+    # 4. Comprehension target shadowing accumulated across nested comprehensions
+    src_r4 = (
+        "def outer(items):\n"
+        "    acc = [1, 2]\n"
+        "    cbs = [[lambda: acc for acc in acc] for _ in range(2)]\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        acc = [x]\n"
+        "        out.append(len(cbs) + x)\n"
+        "    return acc, out\n"
+    )
+    tree_r4 = ast.parse(src_r4)
+    unit_r4 = {
+        "start": 5,
+        "end": 7,
+        "kind": "compound_block",
+        "source_text": src_r4,
+        "source_code": (
+            "for x in items:\n"
+            "    acc = [x]\n"
+            "    out.append(len(cbs) + x)\n"
+        ),
+    }
+    scope_r4 = inspect_single_unit_scope(unit_r4, tree=tree_r4)
+    assert "severed_closure_cell" not in scope_r4["control_flow_hazards"]
+    assert scope_r4["is_control_flow_safe"] is True
+
+    # 5. Lambda default arguments inspected in _extract_expr_closure_and_load_info
+    src_r5 = (
+        "def outer(items):\n"
+        "    acc = 0\n"
+        "    def get_acc():\n"
+        "        return acc\n"
+        "    reader = lambda cb=get_acc: cb()\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        acc += x\n"
+        "        out.append(reader() + x)\n"
+        "    return acc, out\n"
+    )
+    tree_r5 = ast.parse(src_r5)
+    unit_r5 = {
+        "start": 7,
+        "end": 9,
+        "kind": "compound_block",
+        "source_text": src_r5,
+        "source_code": (
+            "for x in items:\n"
+            "    acc += x\n"
+            "    out.append(reader() + x)\n"
+        ),
+    }
+    scope_r5 = inspect_single_unit_scope(unit_r5, tree=tree_r5)
+    assert "severed_closure_cell" in scope_r5["control_flow_hazards"]
+
+    # 6. Sibling method nonlocal deletion inside an enclosing ClassDef marks variable pre_unbound
+    src_r6 = (
+        "def outer(items):\n"
+        "    total = 10\n"
+        "    cbs = []\n"
+        "    class Box:\n"
+        "        def clear(self):\n"
+        "            nonlocal total\n"
+        "            del total\n"
+        "        def build(self):\n"
+        "            for x in items:\n"
+        "                cbs.append(lambda x=x: total + x)\n"
+        "    return Box, cbs\n"
+    )
+    tree_r6 = ast.parse(src_r6)
+    unit_r6 = {
+        "start": 9,
+        "end": 10,
+        "kind": "compound_block",
+        "source_text": src_r6,
+        "source_code": (
+            "for x in items:\n"
+            "    cbs.append(lambda x=x: total + x)\n"
+        ),
+    }
+    scope_r6 = inspect_single_unit_scope(unit_r6, tree=tree_r6)
+    assert "severed_closure_cell" in scope_r6["control_flow_hazards"]
+
+
+
 
 
