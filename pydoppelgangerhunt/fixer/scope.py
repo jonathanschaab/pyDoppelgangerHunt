@@ -1780,18 +1780,41 @@ def _find_enclosing_pre_bound_names(
 
 
 def _infer_missing_col_from_line_ast(
-    line0: str,
+    lines: Union[str, Sequence[str]],
     s_col: Optional[int],
     e_col: Optional[int],
     unit_kind: Optional[str] = None,
 ) -> Tuple[Optional[int], Optional[int]]:
-    """Infers a missing start_col or end_col from single-line AST nodes."""
-    stripped = line0.lstrip()
-    if not stripped:
+    """Infers a missing start_col or end_col from single-line or multiline AST nodes."""
+    line_seq: Sequence[str] = (lines,) if isinstance(lines, str) else lines
+    if not line_seq:
         return s_col, e_col
-    pad = len(line0[: len(line0) - len(stripped)].encode("utf-8"))
+    n_lines = len(line_seq)
+    if n_lines == 1:
+        line0 = line_seq[0]
+        stripped = line0.lstrip()
+        if not stripped:
+            return s_col, e_col
+        pad_first = len(line0[: len(line0) - len(stripped)].encode("utf-8"))
+        pad_last = pad_first
+        parse_src = stripped
+    else:
+        raw_block = "".join(
+            ln if ln.endswith("\n") else ln + "\n" for ln in line_seq
+        )
+        dedented = dedent_source_text(raw_block)
+        d_lines = split_source_lines(dedented)
+        if len(d_lines) != n_lines:
+            return s_col, e_col
+        pad_first = len(line_seq[0].rstrip("\r\n").encode("utf-8")) - len(
+            d_lines[0].rstrip("\r\n").encode("utf-8")
+        )
+        pad_last = len(line_seq[-1].rstrip("\r\n").encode("utf-8")) - len(
+            d_lines[-1].rstrip("\r\n").encode("utf-8")
+        )
+        parse_src = dedented
     try:
-        mod = ast.parse(stripped)
+        mod = ast.parse(parse_src)
     except SyntaxError:
         return s_col, e_col
     if unit_kind == "comprehension":
@@ -1804,16 +1827,22 @@ def _infer_missing_col_from_line_ast(
         for node in ast.walk(mod):
             if not isinstance(node, target_types):
                 continue
+            if (
+                getattr(node, "lineno", None) != 1
+                or getattr(node, "end_lineno", None) != n_lines
+            ):
+                continue
             nc = getattr(node, "col_offset", None)
             nec = getattr(node, "end_col_offset", None)
             if not isinstance(nc, int) or not isinstance(nec, int):
                 continue
-            abs_s = pad + nc
-            abs_e = pad + nec
-            if s_col is not None and e_col is None and abs_s == s_col < abs_e:
-                return s_col, abs_e
-            if e_col is not None and s_col is None and abs_s < e_col == abs_e:
-                return abs_s, e_col
+            abs_s = pad_first + nc
+            abs_e = pad_last + nec
+            if (n_lines > 1 or abs_s < abs_e) and (
+                (s_col is not None and abs_s == s_col)
+                or (e_col is not None and abs_e == e_col)
+            ):
+                return abs_s, abs_e
     return s_col, e_col
 
 
@@ -1831,11 +1860,10 @@ def _unit_cols(
     if (
         (s_col is None or e_col is None)
         and unit_code_lines
-        and len(unit_code_lines) == 1
         and isinstance(unit.get("source_code"), str)
     ):
         snippet = unit["source_code"].strip()
-        if snippet and "\n" not in snippet:
+        if len(unit_code_lines) == 1 and snippet and "\n" not in snippet:
             line0 = unit_code_lines[0]
             if (
                 snippet != line0.strip()
@@ -1880,13 +1908,59 @@ def _unit_cols(
                         s_col = best_pair[0]
                     if e_col is None:
                         e_col = best_pair[1]
-    if (
-        (s_col is None) != (e_col is None)
-        and unit_code_lines
-        and len(unit_code_lines) == 1
-    ):
+        elif len(unit_code_lines) > 1 and snippet and "\n" in snippet:
+            snip_lines = [
+                ln.rstrip("\r\n") for ln in split_source_lines(snippet)
+            ]
+            if (
+                len(snip_lines) == len(unit_code_lines)
+                and snip_lines[0]
+                and snip_lines[-1]
+            ):
+                line_first = unit_code_lines[0].rstrip("\r\n")
+                snip_first = snip_lines[0]
+                if s_col is None:
+                    start_id = snip_first[0].isalnum() or snip_first[0] == "_"
+                    s_matches: List[int] = []
+                    idx = 0
+                    while True:
+                        pos = line_first.find(snip_first, idx)
+                        if pos < 0:
+                            break
+                        tail = line_first[pos + len(snip_first) :].strip()
+                        left_ok = not start_id or pos == 0 or not (
+                            line_first[pos - 1].isalnum()
+                            or line_first[pos - 1] == "_"
+                        )
+                        if left_ok and (not tail or tail.startswith("#")):
+                            s_matches.append(
+                                len(line_first[:pos].encode("utf-8"))
+                            )
+                        idx = pos + 1
+                    if len(s_matches) == 1:
+                        s_col = s_matches[0]
+                line_last = unit_code_lines[-1].rstrip("\r\n")
+                snip_last = snip_lines[-1].lstrip()
+                if e_col is None and snip_last:
+                    end_id = snip_last[-1].isalnum() or snip_last[-1] == "_"
+                    l_stripped = line_last.lstrip()
+                    if l_stripped.startswith(snip_last):
+                        end_pos = (
+                            len(line_last) - len(l_stripped) + len(snip_last)
+                        )
+                        right_ok = (
+                            not end_id
+                            or end_pos >= len(line_last)
+                            or not (
+                                line_last[end_pos].isalnum()
+                                or line_last[end_pos] == "_"
+                            )
+                        )
+                        if right_ok:
+                            e_col = len(line_last[:end_pos].encode("utf-8"))
+    if (s_col is None) != (e_col is None) and unit_code_lines:
         s_col, e_col = _infer_missing_col_from_line_ast(
-            unit_code_lines[0],
+            unit_code_lines,
             s_col,
             e_col,
             unit_kind=str(unit.get("kind") or ""),
@@ -1916,19 +1990,53 @@ def _inspect_unit_scope(
         else unit
     )
     raw_lines = _slice_unit_token_lines(slice_unit, unit_code_lines)
+    src_code_str = (
+        unit["source_code"].strip()
+        if isinstance(unit.get("source_code"), str)
+        else ""
+    )
     if (
-        len(raw_lines) == 1
-        and ";" in raw_lines[0]
+        raw_lines
         and unit.get("kind") not in ("comprehension", "complex_expr")
-        and inferred_s_col is not None
-        and inferred_e_col is not None
-        and 0 <= inferred_s_col < inferred_e_col
+        and (not src_code_str or "".join(raw_lines).strip() != src_code_str)
     ):
-        sliced_stmt = _slice_utf8_line(
-            raw_lines[0], inferred_s_col, inferred_e_col
-        )
-        if sliced_stmt.strip():
-            raw_lines = [sliced_stmt]
+        if (
+            len(raw_lines) == 1
+            and ";" in raw_lines[0]
+            and inferred_s_col is not None
+            and inferred_e_col is not None
+            and 0 <= inferred_s_col < inferred_e_col
+            <= len(raw_lines[0].rstrip("\r\n").encode("utf-8"))
+        ):
+            sliced_stmt = _slice_utf8_line(
+                raw_lines[0], inferred_s_col, inferred_e_col
+            )
+            if sliced_stmt.strip():
+                raw_lines = [sliced_stmt]
+        elif len(raw_lines) > 1 and (
+            ";" in raw_lines[0] or ";" in raw_lines[-1]
+        ):
+            raw_lines = list(raw_lines)
+            if (
+                inferred_s_col is not None
+                and 0
+                < inferred_s_col
+                < len(raw_lines[0].rstrip("\r\n").encode("utf-8"))
+                and ";" in raw_lines[0]
+            ):
+                raw_lines[0] = _slice_utf8_line(
+                    raw_lines[0], inferred_s_col, None
+                )
+            if (
+                inferred_e_col is not None
+                and 0
+                < inferred_e_col
+                <= len(raw_lines[-1].rstrip("\r\n").encode("utf-8"))
+                and ";" in raw_lines[-1]
+            ):
+                raw_lines[-1] = _slice_utf8_line(
+                    raw_lines[-1], 0, inferred_e_col
+                )
     dedented = dedent_source_text("".join(raw_lines))
     empty_res: Dict[str, Any] = {
         "inputs": [],
@@ -2094,7 +2202,7 @@ def _inspect_unit_scope(
         if visitor.type_param_free_vars and not is_subroutine:
             s_line = parse_unit_coord(unit, "start", default=1)
             e_line = parse_unit_coord(unit, "end", default=s_line)
-            u_col, _ = _unit_cols(unit)
+            u_col = inferred_s_col
             top_fn = (
                 tree.body[0]
                 if isinstance(tree, ast.Module)

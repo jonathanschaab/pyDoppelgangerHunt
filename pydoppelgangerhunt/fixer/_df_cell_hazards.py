@@ -1270,17 +1270,34 @@ def _extract_shallow_deleted_names(node: ast.AST) -> Set[str]:
     return deleted
 
 
-def _block_has_abnormal_exit(stmts: Sequence[ast.AST]) -> bool:
-    """Checks whether a statement block contains Return, Break, or Continue outside inner scopes."""
-    stack: List[ast.AST] = list(stmts)
+def _extract_unconditional_walrus_names(node: ast.AST) -> Set[str]:
+    """Extracts NamedExpr target names unconditionally evaluated in an AST node."""
+    names: Set[str] = set()
+    stack: List[ast.AST] = [node]
     while stack:
         curr = stack.pop()
         if isinstance(curr, _INNER_SCOPE_TYPES):
+            stack.extend(iter_nested_scope_header_nodes(curr))
             continue
-        if isinstance(curr, (ast.Return, ast.Break, ast.Continue)):
-            return True
+        if isinstance(curr, _COMPREHENSION_TYPES):
+            if curr.generators:
+                stack.append(curr.generators[0].iter)
+            continue
+        if isinstance(curr, ast.BoolOp):
+            if curr.values:
+                stack.append(curr.values[0])
+            continue
+        if isinstance(curr, ast.IfExp):
+            stack.append(curr.test)
+            names.update(
+                _extract_unconditional_walrus_names(curr.body)
+                & _extract_unconditional_walrus_names(curr.orelse)
+            )
+            continue
+        if isinstance(curr, ast.NamedExpr) and isinstance(curr.target, ast.Name):
+            names.add(curr.target.id)
         stack.extend(ast.iter_child_nodes(curr))
-    return False
+    return names
 
 
 def _eval_try_definite_bindings(
@@ -1294,18 +1311,23 @@ def _eval_try_definite_bindings(
     orelse_l = getattr(stmt, "orelse", ())
     handlers_l = getattr(stmt, "handlers", ())
     final_l = getattr(stmt, "finalbody", ())
-    if not handlers_l and not _block_has_abnormal_exit(final_l):
+    if not handlers_l:
         for sub_seq in (body_l, orelse_l, final_l):
             bound, t_term = _extract_block_definite_bindings_and_term(
                 sub_seq, active_nonlocals, bound, fn_globals
             )
             if t_term:
+                if sub_seq is not final_l and final_l:
+                    f_bound, _ = _extract_block_definite_bindings_and_term(
+                        final_l, active_nonlocals, bound, fn_globals
+                    )
+                    return f_bound, True
                 return bound, True
         return bound, False
 
     if type(stmt).__name__ == "TryStar":
         bound.difference_update(_extract_shallow_deleted_names(stmt))
-        if final_l and not _block_has_abnormal_exit(final_l):
+        if final_l:
             return _extract_block_definite_bindings_and_term(
                 final_l, active_nonlocals, bound, fn_globals
             )
@@ -1335,17 +1357,22 @@ def _eval_try_definite_bindings(
 
     for h_node in handlers_l:
         h_body = getattr(h_node, "body", ())
-        h_bound, h_term = _extract_block_definite_bindings_and_term(
-            h_body, active_nonlocals, pre_try_surviving, fn_globals
-        )
+        h_init = set(pre_try_surviving)
         h_name = getattr(h_node, "name", None)
+        if isinstance(h_name, str) and _can_bind_in_fn_scope(
+            h_name, active_nonlocals, fn_globals
+        ):
+            h_init.add(h_name)
+        h_bound, h_term = _extract_block_definite_bindings_and_term(
+            h_body, active_nonlocals, h_init, fn_globals
+        )
         if isinstance(h_name, str):
             h_bound.discard(h_name)
         if not h_term:
             fallthrough_sets.append(h_bound)
 
     if not fallthrough_sets:
-        if final_l and not _block_has_abnormal_exit(final_l):
+        if final_l:
             f_bound, _ = _extract_block_definite_bindings_and_term(
                 final_l, active_nonlocals, pre_try_surviving, fn_globals
             )
@@ -1354,18 +1381,29 @@ def _eval_try_definite_bindings(
 
     out_bound = set.intersection(*fallthrough_sets)
     if final_l:
-        if _block_has_abnormal_exit(final_l):
-            for f_stmt in final_l:
-                out_bound.difference_update(
-                    _extract_shallow_deleted_names(f_stmt)
-                )
-        else:
-            out_bound, f_term = _extract_block_definite_bindings_and_term(
-                final_l, active_nonlocals, out_bound, fn_globals
-            )
-            if f_term:
-                return out_bound, True
+        out_bound, f_term = _extract_block_definite_bindings_and_term(
+            final_l, active_nonlocals, out_bound, fn_globals
+        )
+        if f_term:
+            return out_bound, True
     return out_bound, False
+
+
+def _apply_expr_definite_effects(
+    target_bound: Set[str],
+    expr_node: Any,
+    active_nonlocals: Optional[Set[str]],
+    fn_globals: AbstractSet[str],
+) -> None:
+    """Applies shallow deletions and unconditional walrus bindings from an AST node."""
+    if not isinstance(expr_node, ast.AST):
+        return
+    target_bound.difference_update(_extract_shallow_deleted_names(expr_node))
+    target_bound.update(
+        n
+        for n in _extract_unconditional_walrus_names(expr_node)
+        if _can_bind_in_fn_scope(n, active_nonlocals, fn_globals)
+    )
 
 
 def _eval_match_definite_bindings(
@@ -1375,9 +1413,9 @@ def _eval_match_definite_bindings(
     fn_globals: AbstractSet[str],
 ) -> Tuple[Set[str], bool]:
     """Computes definite bindings and termination across a Match statement."""
-    subject = getattr(stmt, "subject", None)
-    if isinstance(subject, ast.AST):
-        bound.difference_update(_extract_shallow_deleted_names(subject))
+    _apply_expr_definite_effects(
+        bound, getattr(stmt, "subject", None), active_nonlocals, fn_globals
+    )
     cases = getattr(stmt, "cases", ())
     if not cases:
         return bound, False
@@ -1393,9 +1431,9 @@ def _eval_match_definite_bindings(
                     p_name, active_nonlocals, fn_globals
                 ):
                     case_init.add(p_name)
-        guard = getattr(case, "guard", None)
-        if isinstance(guard, ast.AST):
-            case_init.difference_update(_extract_shallow_deleted_names(guard))
+        _apply_expr_definite_effects(
+            case_init, getattr(case, "guard", None), active_nonlocals, fn_globals
+        )
         c_bound, c_term = _extract_block_definite_bindings_and_term(
             getattr(case, "body", ()),
             active_nonlocals,
@@ -1428,12 +1466,16 @@ def _extract_block_definite_bindings_and_term(
             stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
         ):
             for hdr in iter_nested_scope_header_nodes(stmt):
-                bound.difference_update(_extract_shallow_deleted_names(hdr))
+                _apply_expr_definite_effects(
+                    bound, hdr, active_nonlocals, fn_globals
+                )
             if _can_bind_in_fn_scope(stmt.name, active_nonlocals, fn_globals):
                 bound.add(stmt.name)
             continue
         if isinstance(stmt, ast.If):
-            bound.difference_update(_extract_shallow_deleted_names(stmt.test))
+            _apply_expr_definite_effects(
+                bound, stmt.test, active_nonlocals, fn_globals
+            )
             b_bound, b_term = _extract_block_definite_bindings_and_term(
                 stmt.body, active_nonlocals, bound, fn_globals
             )
@@ -1454,8 +1496,8 @@ def _extract_block_definite_bindings_and_term(
             continue
         if isinstance(stmt, (ast.With, ast.AsyncWith)):
             for item in stmt.items:
-                bound.difference_update(
-                    _extract_shallow_deleted_names(item.context_expr)
+                _apply_expr_definite_effects(
+                    bound, item.context_expr, active_nonlocals, fn_globals
                 )
                 if item.optional_vars is not None:
                     bound.update(
@@ -1469,6 +1511,22 @@ def _extract_block_definite_bindings_and_term(
                     )
             for b_stmt in stmt.body:
                 bound.difference_update(_extract_shallow_deleted_names(b_stmt))
+            continue
+        if isinstance(stmt, (ast.For, ast.AsyncFor)):
+            bound.difference_update(_extract_shallow_deleted_names(stmt))
+            bound.update(
+                n
+                for n in _extract_unconditional_walrus_names(stmt.iter)
+                if _can_bind_in_fn_scope(n, active_nonlocals, fn_globals)
+            )
+            continue
+        if isinstance(stmt, ast.While):
+            bound.difference_update(_extract_shallow_deleted_names(stmt))
+            bound.update(
+                n
+                for n in _extract_unconditional_walrus_names(stmt.test)
+                if _can_bind_in_fn_scope(n, active_nonlocals, fn_globals)
+            )
             continue
         if isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
             bound, t_term = _eval_try_definite_bindings(
@@ -1484,7 +1542,7 @@ def _extract_block_definite_bindings_and_term(
             if m_term:
                 return bound, True
             continue
-        bound.difference_update(_extract_shallow_deleted_names(stmt))
+        _apply_expr_definite_effects(bound, stmt, active_nonlocals, fn_globals)
         if isinstance(stmt, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
             return bound, True
         if isinstance(stmt, ast.Assign) and stmt.value is not None:
@@ -1511,6 +1569,12 @@ def _extract_block_definite_bindings_and_term(
                 for n in imp_names
                 if _can_bind_in_fn_scope(n, active_nonlocals, fn_globals)
             )
+        elif type(stmt).__name__ == "TypeAlias":
+            ta_name = _extract_type_alias_or_pattern_name(stmt)
+            if ta_name is not None and _can_bind_in_fn_scope(
+                ta_name, active_nonlocals, fn_globals
+            ):
+                bound.add(ta_name)
     return bound, False
 
 
@@ -1671,25 +1735,26 @@ def _push_compound_children(
             _block_contains_span(body_l, span) or else_span
         )
         final_span = encloses and _block_contains_span(final_l, span)
-        no_handler_fallthrough = (
-            not encloses
-            and not handlers_l
-            and not _block_has_abnormal_exit(final_l)
-        )
         _maybe_push_pre_span_exhaustive_frame(
-            curr, encloses, bool(handlers_l), frame, span, state, stack
+            curr,
+            encloses,
+            bool(body_l or final_l),
+            frame,
+            span,
+            state,
+            stack,
         )
         _push_seq(
             stack,
             final_l,
-            is_br if (not encloses or final_span) else True,
+            is_br if final_span else True,
             in_lp,
             act_nl,
         )
         _push_seq(
             stack,
             else_l,
-            is_br if (else_span or no_handler_fallthrough) else True,
+            is_br if else_span else True,
             in_lp,
             act_nl,
         )
@@ -1705,7 +1770,7 @@ def _push_compound_children(
         _push_seq(
             stack,
             body_l,
-            is_br if (body_span or no_handler_fallthrough) else True,
+            is_br if body_span else True,
             in_lp,
             act_nl,
         )

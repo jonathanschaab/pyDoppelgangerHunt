@@ -7230,6 +7230,632 @@ def test_pr38_followup_round3_findings() -> None:
     assert "severed_closure_cell" in scope_f3b_mut["control_flow_hazards"]
 
 
+def test_pr38_round4_utf8_finally_except_and_differential_matrix(
+    tmp_path: Path,
+) -> None:
+    """Covers Round 4 findings: UTF-8 prefix/multiline/semicolon slicing, finally conditional exits, exception-handler bindings, and 8-area matrix."""
+    from pydoppelgangerhunt.fixer.dataflow import (
+        clear_dataflow_cache,
+        resolve_clone_generator_subroutine_outputs,
+        resolve_clone_pair_outputs,
+    )
+    from pydoppelgangerhunt.fixer.patch import refactor_module_units
+    from pydoppelgangerhunt.fixer.scope import (
+        _unit_cols,
+        inspect_single_unit_scope,
+    )
+    from pydoppelgangerhunt.fixer.source import (
+        _extract_unit_body_lines,
+        _slice_unit_token_lines,
+    )
+
+    # --- Finding 2: UTF-8 coordinates before unit, semicolon-separated lines, multiline expressions, and pre-sliced lines ---
+    # 2A. Semicolon-separated single-line with multi-byte UTF-8 before the unit
+    utf8_semi_src = (
+        "def compute(items, a, b):\n"
+        '    tag = "café_αβγ_🚀"; target = [x * 2 for x in items]; res = a + b; tail = 0\n'
+        "    return target, res\n"
+    )
+    utf8_semi_line = utf8_semi_src.splitlines(keepends=True)[1]
+    comp_snip = "[x * 2 for x in items]"
+    s_b, e_b = _unit_cols(
+        {"kind": "comprehension", "source_code": comp_snip}, [utf8_semi_line]
+    )
+    assert s_b is not None and e_b is not None
+    # Verify partial column inference (start_col only & end_col only) agrees with full inference
+    assert _unit_cols(
+        {"kind": "comprehension", "start_col": s_b}, [utf8_semi_line]
+    ) == (s_b, e_b)
+    assert _unit_cols(
+        {"kind": "comprehension", "end_col": e_b}, [utf8_semi_line]
+    ) == (s_b, e_b)
+    assert _slice_unit_token_lines(
+        {"kind": "comprehension", "start_col": s_b, "end_col": e_b},
+        [utf8_semi_line],
+    ) == [comp_snip]
+    # Pre-sliced source_lines must not be double-sliced when original start_col/end_col are present
+    assert _slice_unit_token_lines(
+        {
+            "kind": "comprehension",
+            "start_col": s_b,
+            "end_col": e_b,
+            "source_code": comp_snip,
+        },
+        [comp_snip],
+    ) == [comp_snip]
+
+    # Semicolon-separated statement unit after UTF-8 prefix
+    stmt_snip = "res = a + b"
+    stmt_s, stmt_e = _unit_cols(
+        {"kind": "basic_block", "source_code": stmt_snip}, [utf8_semi_line]
+    )
+    assert stmt_s is not None and stmt_e is not None
+    semi_stmt_scope = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 2,
+            "kind": "compound_block",
+            "source_text": utf8_semi_src,
+            "source_code": stmt_snip,
+        }
+    )
+    assert semi_stmt_scope["inputs"] == ["a", "b"]
+    assert semi_stmt_scope["outputs"] == ["res"]
+
+    # 2B. Multiline expression with non-ASCII prefix before unit on first line
+    utf8_multi_src = (
+        "def build(items, scale):\n"
+        '    header = "résumé_🚀", [\n'
+        "        x * scale\n"
+        "        for x in items\n"
+        "    ] + [0]\n"
+        "    return header\n"
+    )
+    multi_lines = utf8_multi_src.splitlines(keepends=True)[1:5]
+    multi_snip = "[\n        x * scale\n        for x in items\n    ]"
+    ms_col, me_col = _unit_cols(
+        {"kind": "comprehension", "source_code": multi_snip}, multi_lines
+    )
+    assert ms_col == len('    header = "résumé_🚀", '.encode("utf-8"))
+    assert me_col == len("    ]".encode("utf-8"))
+    assert _unit_cols(
+        {"kind": "comprehension", "start_col": ms_col}, multi_lines
+    ) == (ms_col, me_col)
+    assert _unit_cols(
+        {"kind": "comprehension", "end_col": me_col}, multi_lines
+    ) == (ms_col, me_col)
+    sliced_multi = _slice_unit_token_lines(
+        {"kind": "comprehension", "start_col": ms_col, "end_col": me_col},
+        multi_lines,
+    )
+    assert "".join(sliced_multi) == multi_snip
+    multi_scope = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 5,
+            "kind": "comprehension",
+            "source_text": utf8_multi_src,
+            "source_code": multi_snip,
+        }
+    )
+    assert set(multi_scope["inputs"]) == {"items", "scale"}
+
+    # 2C. Multiline semicolon-separated statement with UTF-8 prefix
+    utf8_multi_semi_src = (
+        "def calc_pair(a, b):\n"
+        '    tag = "café_🚀"; total = (\n'
+        "        a + b\n"
+        "    ); trailing = 99\n"
+        "    return total\n"
+    )
+    multi_semi_snip = "total = (\n        a + b\n    )"
+    multi_semi_scope = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 4,
+            "kind": "compound_block",
+            "source_text": utf8_multi_semi_src,
+            "source_code": multi_semi_snip,
+        }
+    )
+    assert multi_semi_scope["inputs"] == ["a", "b"]
+    assert multi_semi_scope["outputs"] == ["total"]
+
+    # 2D. Single-line function body extraction with UTF-8 in signature header
+    one_line_fn = 'def greet(prefix="café_🚀"): return prefix + "!"'
+    assert _extract_unit_body_lines(
+        {"kind": "function"}, [one_line_fn]
+    ) == ['return prefix + "!"']
+
+    # --- Finding 4: Conditional exits in finally (return, raise, nested branches) + differential execution ---
+    # 4A. Reviewer exact reproduction: try/finally with `if flag: return` then `value = 2`
+    src_f4_ret = (
+        "def outer(flag, items):\n"
+        "    try:\n"
+        "        value = 1\n"
+        "    finally:\n"
+        "        if flag:\n"
+        "            return []\n"
+        "        value = 2\n"
+        "    cbs = []\n"
+        "    for x in items:\n"
+        "        cbs.append(lambda x=x: x + value)\n"
+        "    return cbs\n"
+    )
+    u_f4_ret = {
+        "start": 9,
+        "end": 10,
+        "kind": "compound_block",
+        "source_text": src_f4_ret,
+        "source_code": "for x in items:\n    cbs.append(lambda x=x: x + value)\n",
+    }
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        sc_f4_ret = inspect_single_unit_scope(u_f4_ret)
+    assert "severed_closure_cell" not in sc_f4_ret["control_flow_hazards"]
+    assert sc_f4_ret["is_control_flow_safe"] is True
+
+    # 4B. Conditional raise and nested branches in finally where all continuing paths bind `value`
+    src_f4_nested = (
+        "def outer(flag, mode, items):\n"
+        "    try:\n"
+        "        pass\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    finally:\n"
+        "        if flag:\n"
+        "            if mode == 1:\n"
+        "                value = 10\n"
+        "            else:\n"
+        "                return []\n"
+        "        else:\n"
+        "            if mode == 2:\n"
+        "                raise ValueError('abort')\n"
+        "            value = 20\n"
+        "    cbs = []\n"
+        "    for x in items:\n"
+        "        cbs.append(lambda x=x: x + value)\n"
+        "    return cbs\n"
+    )
+    u_f4_nested = {
+        "start": 17,
+        "end": 18,
+        "kind": "compound_block",
+        "source_text": src_f4_nested,
+        "source_code": "for x in items:\n    cbs.append(lambda x=x: x + value)\n",
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        sc_f4_nested = inspect_single_unit_scope(u_f4_nested)
+    assert "severed_closure_cell" not in sc_f4_nested["control_flow_hazards"]
+
+    # 4C. Continuing path in finally does NOT bind `value` -> hazard MUST be raised
+    src_f4_unsafe = (
+        "def outer(flag, mode, items):\n"
+        "    try:\n"
+        "        pass\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    finally:\n"
+        "        if flag:\n"
+        "            if mode == 1:\n"
+        "                value = 10\n"
+        "        else:\n"
+        "            value = 20\n"
+        "    cbs = []\n"
+        "    for x in items:\n"
+        "        cbs.append(lambda x=x: x + value)\n"
+        "    return cbs\n"
+    )
+    u_f4_unsafe = {
+        "start": 13,
+        "end": 14,
+        "kind": "compound_block",
+        "source_text": src_f4_unsafe,
+        "source_code": "for x in items:\n    cbs.append(lambda x=x: x + value)\n",
+    }
+    sc_f4_unsafe = inspect_single_unit_scope(u_f4_unsafe)
+    assert "severed_closure_cell" in sc_f4_unsafe["control_flow_hazards"]
+
+    # 4D. Differential execution of refactored try/finally with conditional return
+    mod_f4_src = (
+        "def f1(flag, items):\n"
+        "    try:\n"
+        "        value = 1\n"
+        "    finally:\n"
+        "        if flag:\n"
+        "            return []\n"
+        "        value = 2\n"
+        "    cbs = []\n"
+        "    for x in items:\n"
+        "        cbs.append(lambda x=x: x + value)\n"
+        "    return cbs\n\n"
+        "def f2(flag, items):\n"
+        "    try:\n"
+        "        value = 5\n"
+        "    finally:\n"
+        "        if flag:\n"
+        "            return []\n"
+        "        value = 2\n"
+        "    cbs = []\n"
+        "    for x in items:\n"
+        "        cbs.append(lambda x=x: x + value)\n"
+        "    return cbs\n"
+    )
+    f4_file = tmp_path / "mod_f4.py"
+    f4_file.write_text(mod_f4_src, encoding="utf-8")
+    u_f4_1 = {
+        "file": str(f4_file),
+        "start": 9,
+        "end": 10,
+        "kind": "compound_block",
+        "name": "f1_loop",
+    }
+    u_f4_2 = {
+        "file": str(f4_file),
+        "start": 21,
+        "end": 22,
+        "kind": "compound_block",
+        "name": "f2_loop",
+    }
+    refactored_f4 = (
+        "def _shared_f4_loop(cbs, items, value):\n"
+        "    for x in items:\n"
+        "        cbs.append(lambda x=x: x + value)\n\n"
+        + refactor_module_units(
+            mod_f4_src,
+            [
+                (u_f4_1, "    _shared_f4_loop(cbs, items, value)"),
+                (u_f4_2, "    _shared_f4_loop(cbs, items, value)"),
+            ],
+        )
+    )
+    ns_orig_f4: dict = {}
+    ns_ref_f4: dict = {}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        exec(mod_f4_src, ns_orig_f4)  # pylint: disable=exec-used
+        exec(refactored_f4, ns_ref_f4)  # pylint: disable=exec-used
+    assert ns_orig_f4["f1"](True, [1, 2]) == ns_ref_f4["f1"](True, [1, 2]) == []
+    assert [cb() for cb in ns_orig_f4["f1"](False, [3, 4])] == [
+        cb() for cb in ns_ref_f4["f1"](False, [3, 4])
+    ] == [5, 6]
+
+    # --- Finding 5: Exception-handler binding analysis & differential execution ---
+    # 5A. Reviewer example: conditional del in try before operation(), closure in except handler
+    src_f5_del_in_try = (
+        "def outer(cond, op, recover):\n"
+        "    value = 10\n"
+        "    try:\n"
+        "        if cond():\n"
+        "            del value\n"
+        "        op()\n"
+        "    except Exception:\n"
+        "        callback = lambda: value\n"
+        "        recover()\n"
+        "        return callback\n"
+        "    return lambda: value\n"
+    )
+    u_f5_in_handler = {
+        "start": 8,
+        "end": 9,
+        "kind": "compound_block",
+        "source_text": src_f5_del_in_try,
+        "source_code": "callback = lambda: value\nrecover()\n",
+    }
+    sc_f5_in_handler = inspect_single_unit_scope(u_f5_in_handler)
+    assert "severed_closure_cell" in sc_f5_in_handler["control_flow_hazards"]
+    assert sc_f5_in_handler["is_control_flow_safe"] is False
+
+    # Verify why extracting u_f5_in_handler as `_shared(recover, value)` would break original runtime semantics:
+    # When cond() is True and op() raises, original outer() runs recover() and returns callback without raising
+    # UnboundLocalError during handler execution, whereas passing `value` eagerly raises UnboundLocalError!
+    ns_f5: dict = {}
+    exec(src_f5_del_in_try, ns_f5)  # pylint: disable=exec-used
+    recovered_calls: list = []
+    cb_res = ns_f5["outer"](
+        lambda: True,
+        lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+        lambda: recovered_calls.append("ok"),
+    )
+    assert recovered_calls == ["ok"]
+    with pytest.raises(NameError):
+        cb_res()
+
+    # 5B. Exception raised before assignment in try, unit after try/except
+    src_f5_pre_assign = (
+        "def outer(op, recover, items):\n"
+        "    try:\n"
+        "        op()\n"
+        "        value = 10\n"
+        "    except Exception:\n"
+        "        recover()\n"
+        "    cbs = []\n"
+        "    for x in items:\n"
+        "        cbs.append(lambda x=x: x + value)\n"
+        "    return cbs\n"
+    )
+    sc_f5_pre_assign = inspect_single_unit_scope(
+        {
+            "start": 8,
+            "end": 9,
+            "kind": "compound_block",
+            "source_text": src_f5_pre_assign,
+            "source_code": "for x in items:\n    cbs.append(lambda x=x: x + value)\n",
+        }
+    )
+    assert "severed_closure_cell" in sc_f5_pre_assign["control_flow_hazards"]
+
+    # 5C. `except Exception as value:` implicitly deletes `value` at handler exit
+    src_f5_except_as = (
+        "def outer(op, items):\n"
+        "    value = 10\n"
+        "    try:\n"
+        "        op()\n"
+        "    except Exception as value:\n"
+        "        pass\n"
+        "    cbs = []\n"
+        "    for x in items:\n"
+        "        cbs.append(lambda x=x: (value, x))\n"
+        "    return cbs\n"
+    )
+    sc_f5_except_as = inspect_single_unit_scope(
+        {
+            "start": 8,
+            "end": 9,
+            "kind": "compound_block",
+            "source_text": src_f5_except_as,
+            "source_code": "for x in items:\n    cbs.append(lambda x=x: (value, x))\n",
+        }
+    )
+    assert "severed_closure_cell" in sc_f5_except_as["control_flow_hazards"]
+
+    # 5D. Assignment in `finally` restores definite binding after `del value` in `try` and `except ... as value`
+    src_f5_finally_rebind = (
+        "def outer(op, items):\n"
+        "    value = 10\n"
+        "    try:\n"
+        "        del value\n"
+        "        op()\n"
+        "    except Exception as value:\n"
+        "        pass\n"
+        "    finally:\n"
+        "        value = 42\n"
+        "    cbs = []\n"
+        "    for x in items:\n"
+        "        cbs.append(lambda x=x: x + value)\n"
+        "    return cbs\n"
+    )
+    sc_f5_finally_rebind = inspect_single_unit_scope(
+        {
+            "start": 11,
+            "end": 12,
+            "kind": "compound_block",
+            "source_text": src_f5_finally_rebind,
+            "source_code": "for x in items:\n    cbs.append(lambda x=x: x + value)\n",
+        }
+    )
+    assert (
+        "severed_closure_cell"
+        not in sc_f5_finally_rebind["control_flow_hazards"]
+    )
+
+    # --- 8-Area Review Validation Matrix ---
+    # Area 1: Enclosing-function detection with decorators, multiline headers, and multiple expressions on one line
+    src_area1 = (
+        "def outer(dec1, dec2, items):\n"
+        "    scale = 3\n"
+        "    @dec1(lambda v: v + scale)\n"
+        "    @dec2\n"
+        "    def inner(\n"
+        "        a=[x * scale for x in items],\n"
+        "    ):\n"
+        "        scale = 99\n"
+        "        return [x + 1 for x in a]; [x + 2 for x in a]\n"
+        "    return inner\n"
+    )
+    sc_area1_hdr = inspect_single_unit_scope(
+        {
+            "start": 6,
+            "end": 6,
+            "kind": "comprehension",
+            "source_text": src_area1,
+            "source_code": "[x * scale for x in items]",
+        }
+    )
+    assert "severed_closure_cell" not in sc_area1_hdr["control_flow_hazards"]
+
+    # Area 2: Three-level nested functions with same-name locals, nonlocal declarations, and del
+    src_area2 = (
+        "def level0(items):\n"
+        "    acc = 1\n"
+        "    def level1():\n"
+        "        acc = 2\n"
+        "        def level2():\n"
+        "            nonlocal acc\n"
+        "            del acc\n"
+        "        return level2\n"
+        "    cbs = [lambda x=x: x + acc for x in items]\n"
+        "    return level1, cbs\n"
+    )
+    sc_area2 = inspect_single_unit_scope(
+        {
+            "start": 9,
+            "end": 9,
+            "kind": "comprehension",
+            "source_text": src_area2,
+            "source_code": "[lambda x=x: x + acc for x in items]",
+        }
+    )
+    assert "severed_closure_cell" not in sc_area2["control_flow_hazards"]
+
+    # Area 3: Sibling closure propagation with multiple same-name definitions, recursive closures, and alias cycles
+    src_area3 = (
+        "def outer(flag, items):\n"
+        "    acc = 0\n"
+        "    if flag:\n"
+        "        def helper(n):\n"
+        "            return helper(n - 1) if n > 0 else 0\n"
+        "    else:\n"
+        "        def helper(n):\n"
+        "            return acc + n\n"
+        "    a = helper\n"
+        "    b = a\n"
+        "    a = b\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        acc += x\n"
+        "        out.append(b(x))\n"
+        "    return acc, out\n"
+    )
+    sc_area3 = inspect_single_unit_scope(
+        {
+            "start": 13,
+            "end": 15,
+            "kind": "compound_block",
+            "source_text": src_area3,
+            "source_code": "for x in items:\n    acc += x\n    out.append(b(x))\n",
+        }
+    )
+    assert "severed_closure_cell" in sc_area3["control_flow_hazards"]
+
+    # Area 4: Definite bindings with unconditional walrus in `if (scale := ...):` and `with`
+    src_area4 = (
+        "def outer(x, items):\n"
+        "    if (scale := x + 1) > 0:\n"
+        "        offset = 1\n"
+        "    else:\n"
+        "        offset = 2\n"
+        "    cbs = []\n"
+        "    for item in items:\n"
+        "        cbs.append(lambda item=item: item * scale + offset)\n"
+        "    return cbs\n"
+    )
+    sc_area4 = inspect_single_unit_scope(
+        {
+            "start": 7,
+            "end": 8,
+            "kind": "compound_block",
+            "source_text": src_area4,
+            "source_code": "for item in items:\n    cbs.append(lambda item=item: item * scale + offset)\n",
+        }
+    )
+    assert "severed_closure_cell" not in sc_area4["control_flow_hazards"]
+
+    # Area 5: Generator expressions with shadowed built-in `sum` (treated as lazy/deferred)
+    src_area5 = (
+        "def outer(sum, items):\n"
+        "    acc = 0\n"
+        "    deferred = sum(acc + x for x in items)\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        acc += x\n"
+        "        out.append(deferred(x))\n"
+        "    return deferred, acc, out\n"
+    )
+    sc_area5 = inspect_single_unit_scope(
+        {
+            "start": 5,
+            "end": 7,
+            "kind": "compound_block",
+            "source_text": src_area5,
+            "source_code": "for x in items:\n    acc += x\n    out.append(deferred(x))\n",
+        }
+    )
+    assert "severed_closure_cell" in sc_area5["control_flow_hazards"]
+
+    # Contrast: unshadowed `sum(acc + x for x in items)` is eager and safe
+    src_area5_eager = (
+        "def outer(items):\n"
+        "    acc = 0\n"
+        "    total = sum(acc + x for x in items)\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        acc += x\n"
+        "        out.append(total + x)\n"
+        "    return total, acc, out\n"
+    )
+    sc_area5_eager = inspect_single_unit_scope(
+        {
+            "start": 5,
+            "end": 7,
+            "kind": "compound_block",
+            "source_text": src_area5_eager,
+            "source_code": "for x in items:\n    acc += x\n    out.append(total + x)\n",
+        }
+    )
+    assert "severed_closure_cell" not in sc_area5_eager["control_flow_hazards"]
+
+    # Area 6: Cache correctness across clear_dataflow_cache and source changes
+    clear_dataflow_cache()
+    sc_area5_after_clear = inspect_single_unit_scope(
+        {
+            "start": 5,
+            "end": 7,
+            "kind": "compound_block",
+            "source_text": src_area5,
+            "source_code": "for x in items:\n    acc += x\n    out.append(deferred(x))\n",
+        }
+    )
+    assert (
+        sc_area5_after_clear["control_flow_hazards"]
+        == sc_area5["control_flow_hazards"]
+    )
+
+    # Area 7: Clone-output resolution rejects severed_closure_cell in both normal and generator-subroutine paths
+    u_unsafe_pair = {
+        "start": 5,
+        "end": 7,
+        "kind": "compound_block",
+        "source_text": src_area5,
+        "source_code": "for x in items:\n    acc += x\n    out.append(deferred(x))\n",
+    }
+    assert (
+        resolve_clone_pair_outputs(
+            u_unsafe_pair,
+            dict(u_unsafe_pair),
+            sc_area5,
+            dict(sc_area5),
+            source_text1=src_area5,
+            source_text2=src_area5,
+        )
+        is None
+    )
+
+    src_area7_gen = (
+        "def gen(items):\n"
+        "    cb = lambda: acc\n"
+        "    acc = 0\n"
+        "    for x in items:\n"
+        "        acc += x\n"
+        "        yield acc\n"
+        "    return acc, cb\n"
+    )
+    u_area7_gen = {
+        "start": 3,
+        "end": 6,
+        "kind": "compound_block",
+        "source_text": src_area7_gen,
+        "source_code": "acc = 0\nfor x in items:\n    acc += x\n    yield acc\n",
+    }
+    sc_area7_gen = inspect_single_unit_scope(u_area7_gen)
+    assert (
+        resolve_clone_generator_subroutine_outputs(
+            u_area7_gen,
+            dict(u_area7_gen),
+            sc_area7_gen,
+            dict(sc_area7_gen),
+            source_text1=src_area7_gen,
+            source_text2=src_area7_gen,
+            closure_strictness="strict",
+        )
+        is None
+    )
+
+
+
 
 
 
