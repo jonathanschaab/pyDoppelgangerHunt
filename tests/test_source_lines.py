@@ -7090,6 +7090,7 @@ def test_pr38_followup_round2_six_items() -> None:
 def test_pr38_followup_round3_findings() -> None:
     """Verifies round 3 findings: unseeded cond store exported and captured, header exclusion in _find_enclosing_pre_bound_names, exhaustive match definite bindings, and conditional class methods."""
     import ast
+    import sys
     from pydoppelgangerhunt.fixer.scope import (
         _find_enclosing_pre_bound_names,
         inspect_single_unit_scope,
@@ -7135,32 +7136,33 @@ def test_pr38_followup_round3_findings() -> None:
     assert "a" not in pre_bound_hdr
 
     # Finding 3A: Exhaustive match/case before unit marks variable definitely pre_bound
-    src_f3a = (
-        "def outer(cmd, items):\n"
-        "    match cmd:\n"
-        "        case 'add':\n"
-        "            scale = 2\n"
-        "        case _:\n"
-        "            scale = 1\n"
-        "    cbs = []\n"
-        "    for x in items:\n"
-        "        cbs.append(lambda x=x: x * scale)\n"
-        "    return cbs\n"
-    )
-    tree_f3a = ast.parse(src_f3a)
-    unit_f3a = {
-        "start": 8,
-        "end": 9,
-        "kind": "compound_block",
-        "source_text": src_f3a,
-        "source_code": (
-            "for x in items:\n"
-            "    cbs.append(lambda x=x: x * scale)\n"
-        ),
-    }
-    scope_f3a = inspect_single_unit_scope(unit_f3a, tree=tree_f3a)
-    assert "severed_closure_cell" not in scope_f3a["control_flow_hazards"]
-    assert scope_f3a["is_control_flow_safe"] is True
+    if sys.version_info >= (3, 10):
+        src_f3a = (
+            "def outer(cmd, items):\n"
+            "    match cmd:\n"
+            "        case 'add':\n"
+            "            scale = 2\n"
+            "        case _:\n"
+            "            scale = 1\n"
+            "    cbs = []\n"
+            "    for x in items:\n"
+            "        cbs.append(lambda x=x: x * scale)\n"
+            "    return cbs\n"
+        )
+        tree_f3a = ast.parse(src_f3a)
+        unit_f3a = {
+            "start": 8,
+            "end": 9,
+            "kind": "compound_block",
+            "source_text": src_f3a,
+            "source_code": (
+                "for x in items:\n"
+                "    cbs.append(lambda x=x: x * scale)\n"
+            ),
+        }
+        scope_f3a = inspect_single_unit_scope(unit_f3a, tree=tree_f3a)
+        assert "severed_closure_cell" not in scope_f3a["control_flow_hazards"]
+        assert scope_f3a["is_control_flow_safe"] is True
 
     # Finding 3B: Conditionally defined class method aliases self to sibling method closures
     src_f3b = (
