@@ -706,6 +706,100 @@ def _collect_pre_unit_closures(
     return captured_reads
 
 
+def _is_irrefutable_pattern(
+    pattern: Optional[ast.AST],
+) -> bool:  # pragma: no cover (py310+)
+    """Recursively determines if a pattern matching AST node unconditionally matches any subject."""
+    if pattern is None:
+        return True
+    if type(pattern).__name__ == "MatchAs":
+        sub_pat = getattr(pattern, "pattern", None)
+        return sub_pat is None or _is_irrefutable_pattern(sub_pat)
+    if type(pattern).__name__ == "MatchOr":
+        patterns = getattr(pattern, "patterns", [])
+        return any(_is_irrefutable_pattern(p) for p in patterns)
+    return False
+
+
+def _is_irrefutable_case(case: ast.AST) -> bool:  # pragma: no cover (py310+)
+    """Returns True if the match case has no guard and an irrefutable pattern."""
+    guard = getattr(case, "guard", None)
+    pattern = getattr(case, "pattern", None)
+    if guard is not None or pattern is None:
+        return False
+    return _is_irrefutable_pattern(pattern)
+
+
+def _is_span_in_scope_header(
+    node: ast.AST,
+    u_start: int,
+    u_end: int,
+    u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
+) -> bool:
+    """Checks whether [u_start, u_end] precedes node.body[0] or lies inside node's header expressions."""
+    if any(
+        _is_ast_node_within_unit_bounds(
+            hdr,
+            u_start,
+            u_end,
+            u_end_col=u_end_col,
+            u_start_col=u_start_col,
+        )
+        or _node_strictly_encloses_bounds(
+            hdr,
+            u_start,
+            u_end,
+            u_start_col=u_start_col,
+            u_end_col=u_end_col,
+        )
+        for hdr in iter_nested_scope_header_nodes(node)
+    ):
+        return True
+    body = getattr(node, "body", None)
+    if body:
+        b_start, b_col = _node_earliest_start_pos(body[0])
+        n_lineno = int(getattr(node, "lineno", 0) or 0)
+        if b_start is not None and (
+            u_end < b_start
+            or (
+                u_start < b_start
+                and (
+                    u_start <= n_lineno
+                    or any(
+                        (getattr(h, "lineno", 0) or 0)
+                        <= u_start
+                        <= (getattr(h, "end_lineno", 0) or 0)
+                        for h in (
+                            *iter_nested_scope_header_nodes(node),
+                            *getattr(
+                                getattr(node, "args", None),
+                                "posonlyargs",
+                                (),
+                            ),
+                            *getattr(
+                                getattr(node, "args", None), "args", ()
+                            ),
+                            *getattr(
+                                getattr(node, "args", None),
+                                "kwonlyargs",
+                                (),
+                            ),
+                        )
+                    )
+                )
+            )
+            or (
+                u_start == b_start
+                and u_start_col is not None
+                and isinstance(b_col, int)
+                and u_start_col < b_col
+            )
+        ):
+            return True
+    return False
+
+
 def _resolve_immediate_scope_in_fn(
     scope_node: ast.AST,
     u_start: int,
@@ -725,35 +819,13 @@ def _resolve_immediate_scope_in_fn(
             c_start = int(getattr(curr, "lineno", 0) or 0)
             c_end = int(getattr(curr, "end_lineno", c_start) or c_start)
             c_col = int(getattr(curr, "col_offset", 0) or 0)
-            in_hdr = any(
-                _is_ast_node_within_unit_bounds(
-                    hdr,
-                    u_start,
-                    u_end,
-                    u_end_col=u_end_col,
-                    u_start_col=u_start_col,
-                )
-                or _node_strictly_encloses_bounds(
-                    hdr,
-                    u_start,
-                    u_end,
-                    u_start_col=u_start_col,
-                    u_end_col=u_end_col,
-                )
-                for hdr in iter_nested_scope_header_nodes(curr)
+            in_hdr = _is_span_in_scope_header(
+                curr,
+                u_start,
+                u_end,
+                u_start_col=u_start_col,
+                u_end_col=u_end_col,
             )
-            if curr.body:
-                b_start, b_col = _node_earliest_start_pos(curr.body[0])
-                if b_start is not None and (
-                    u_end < b_start
-                    or (
-                        u_start == b_start
-                        and u_start_col is not None
-                        and isinstance(b_col, int)
-                        and u_start_col < b_col
-                    )
-                ):
-                    in_hdr = True
             strictly_inside = not in_hdr and _node_strictly_encloses_bounds(
                 curr,
                 u_start,

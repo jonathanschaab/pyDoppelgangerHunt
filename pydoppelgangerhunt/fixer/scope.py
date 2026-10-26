@@ -32,6 +32,9 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _extract_comprehension_walrus_names,
     _extract_scope_nonlocals_and_outer_globals,
     _extract_single_node_local_names,
+    _is_irrefutable_case,
+    _is_span_in_scope_header,
+    _node_earliest_start_pos,
     _node_strictly_encloses_bounds,
     _resolve_immediate_scope_in_fn,
     iter_nested_scope_header_nodes,
@@ -1024,28 +1027,6 @@ def _walrus_assignment_in_expr(
     return definite, conditional - definite
 
 
-def _is_irrefutable_pattern(pattern: Optional[ast.AST]) -> bool:  # pragma: no cover (py310+)
-    """Recursively determines if a pattern matching AST node unconditionally matches any subject."""
-    if pattern is None:
-        return True
-    if type(pattern).__name__ == "MatchAs":
-        sub_pat = getattr(pattern, "pattern", None)
-        return sub_pat is None or _is_irrefutable_pattern(sub_pat)
-    if type(pattern).__name__ == "MatchOr":
-        patterns = getattr(pattern, "patterns", [])
-        return any(_is_irrefutable_pattern(p) for p in patterns)
-    return False
-
-
-def _is_irrefutable_case(case: ast.AST) -> bool:  # pragma: no cover (py310+)
-    """Returns True if the match case has no guard and an irrefutable pattern."""
-    guard = getattr(case, "guard", None)
-    pattern = getattr(case, "pattern", None)
-    if guard is not None or pattern is None:
-        return False
-    return _is_irrefutable_pattern(pattern)
-
-
 def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
     """Returns True if the statement sequence unconditionally terminates via return or raise."""
     for stmt in statements:
@@ -1630,7 +1611,31 @@ def _find_enclosing_pre_bound_names(
     intervals = [
         (earliest_start, n_end, span, node)
         for earliest_start, n_end, span, node in _get_tree_scope_intervals(mod_tree)
-        if earliest_start <= s_line and e_line <= n_end
+        if earliest_start <= s_line
+        and e_line <= n_end
+        and (
+            earliest_start < s_line
+            or n_end > e_line
+            or (
+                u_start_col is None
+                and u_end_col is None
+                and earliest_start == n_end
+            )
+            or _node_strictly_encloses_bounds(
+                node,
+                s_line,
+                e_line,
+                u_start_col=u_start_col,
+                u_end_col=u_end_col,
+            )
+        )
+        and not _is_span_in_scope_header(
+            node,
+            s_line,
+            e_line,
+            u_start_col=u_start_col,
+            u_end_col=u_end_col,
+        )
     ]
     intervals.sort(key=lambda item: (item[0], -item[1], -item[2]))
     innermost_scope = intervals[-1][3] if intervals else mod_tree
@@ -1673,7 +1678,8 @@ def _find_enclosing_pre_bound_names(
             c_end = getattr(curr, "end_lineno", c_start)
             c_end_col = getattr(curr, "end_col_offset", c_col)
             if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if _is_before_unit(c_start, c_col) and (
+                estart, ecol = _node_earliest_start_pos(curr)
+                if _is_before_unit(estart, ecol) and (
                     (
                         curr in active_scopes
                         and not isinstance(curr, ast.ClassDef)

@@ -34,6 +34,8 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _extract_single_node_local_names,
     _has_wildcard_star_import,
     _is_eagerly_consumed_genexp,
+    _is_irrefutable_case,
+    _is_span_in_scope_header,
     _node_earliest_start_pos,
     _node_strictly_encloses_bounds,
 )
@@ -139,46 +141,10 @@ def _find_enclosing_function_chain(
         n_lineno = int(getattr(node, "lineno", estart) or estart)
         if n_lineno <= 0 or u_start < n_lineno or u_end > n_end:
             continue
-        body = getattr(node, "body", None)
-        if body:
-            body_start, body_col = _node_earliest_start_pos(body[0])
-            if body_start is not None and (
-                u_end < body_start
-                or (
-                    u_start < body_start
-                    and (
-                        u_start <= n_lineno
-                        or any(
-                            (getattr(h, "lineno", 0) or 0)
-                            <= u_start
-                            <= (getattr(h, "end_lineno", 0) or 0)
-                            for h in (
-                                *iter_nested_scope_header_nodes(node),
-                                *getattr(
-                                    getattr(node, "args", None),
-                                    "posonlyargs",
-                                    (),
-                                ),
-                                *getattr(
-                                    getattr(node, "args", None), "args", ()
-                                ),
-                                *getattr(
-                                    getattr(node, "args", None),
-                                    "kwonlyargs",
-                                    (),
-                                ),
-                            )
-                        )
-                    )
-                )
-                or (
-                    u_start == body_start
-                    and u_start_col is not None
-                    and body_col is not None
-                    and u_start_col < body_col
-                )
-            ):
-                continue
+        if _is_span_in_scope_header(
+            node, u_start, u_end, u_start_col=u_start_col
+        ):
+            continue
         n_col = int(getattr(node, "col_offset", 0) or 0)
         if u_start in (estart, n_lineno):
             _, e_col = _node_earliest_start_pos(node)
@@ -1402,6 +1368,53 @@ def _eval_try_definite_bindings(
     return out_bound, False
 
 
+def _eval_match_definite_bindings(
+    stmt: ast.AST,
+    active_nonlocals: Optional[Set[str]],
+    bound: Set[str],
+    fn_globals: AbstractSet[str],
+) -> Tuple[Set[str], bool]:
+    """Computes definite bindings and termination across a Match statement."""
+    subject = getattr(stmt, "subject", None)
+    if isinstance(subject, ast.AST):
+        bound.difference_update(_extract_shallow_deleted_names(subject))
+    cases = getattr(stmt, "cases", ())
+    if not cases:
+        return bound, False
+    fallthrough_sets: List[Set[str]] = []
+    has_irrefutable = False
+    for case in cases:
+        case_init = set(bound)
+        pattern = getattr(case, "pattern", None)
+        if isinstance(pattern, ast.AST):
+            for p_node in ast.walk(pattern):
+                p_name = _extract_pattern_bound_name(p_node)
+                if p_name is not None and _can_bind_in_fn_scope(
+                    p_name, active_nonlocals, fn_globals
+                ):
+                    case_init.add(p_name)
+        guard = getattr(case, "guard", None)
+        if isinstance(guard, ast.AST):
+            case_init.difference_update(_extract_shallow_deleted_names(guard))
+        c_bound, c_term = _extract_block_definite_bindings_and_term(
+            getattr(case, "body", ()),
+            active_nonlocals,
+            case_init,
+            fn_globals,
+        )
+        if not c_term:
+            fallthrough_sets.append(c_bound)
+        if _is_irrefutable_case(case):
+            has_irrefutable = True
+            break
+    if not has_irrefutable:
+        fallthrough_sets.append(bound)
+        return set.intersection(*fallthrough_sets), False
+    if not fallthrough_sets:
+        return set(), True
+    return set.intersection(*fallthrough_sets), False
+
+
 def _extract_block_definite_bindings_and_term(
     stmts: Sequence[ast.AST],
     active_nonlocals: Optional[Set[str]],
@@ -1462,6 +1475,13 @@ def _extract_block_definite_bindings_and_term(
                 stmt, active_nonlocals, bound, fn_globals
             )
             if t_term:
+                return bound, True
+            continue
+        if type(stmt).__name__ == "Match":
+            bound, m_term = _eval_match_definite_bindings(
+                stmt, active_nonlocals, bound, fn_globals
+            )
+            if m_term:
                 return bound, True
             continue
         bound.difference_update(_extract_shallow_deleted_names(stmt))
@@ -1723,7 +1743,11 @@ def _push_compound_children(
         return True
 
     if type(curr).__name__ == "Match":
-        for case in reversed(getattr(curr, "cases", [])):
+        cases_l = getattr(curr, "cases", [])
+        _maybe_push_pre_span_exhaustive_frame(
+            curr, encloses, bool(cases_l), frame, span, state, stack
+        )
+        for case in reversed(cases_l):
             case_body = getattr(case, "body", [])
             c_br = (
                 is_br
@@ -2111,6 +2135,23 @@ def _extract_fn_outer_carrier_targets(
     )
 
 
+def _iter_class_body_methods(
+    cls_node: ast.ClassDef,
+) -> List[Union[ast.FunctionDef, ast.AsyncFunctionDef]]:
+    """Collects method definitions in cls_node.body without descending into nested scopes."""
+    methods: List[Union[ast.FunctionDef, ast.AsyncFunctionDef]] = []
+    stack: List[ast.AST] = list(reversed(cls_node.body))
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            methods.append(curr)
+            continue
+        if isinstance(curr, _INNER_SCOPE_TYPES):
+            continue
+        stack.extend(reversed(list(ast.iter_child_nodes(curr))))
+    return methods
+
+
 def _handle_nested_scope_node(
     curr: ast.AST,
     c_line: Optional[int],
@@ -2153,10 +2194,8 @@ def _handle_nested_scope_node(
                 (curr.name,), estart, ecol, span, frame, state
             )
         if enclosing_cls and isinstance(curr, ast.ClassDef):
-            for stmt in curr.body:
-                if isinstance(
-                    stmt, (ast.FunctionDef, ast.AsyncFunctionDef)
-                ) and not (
+            for stmt in _iter_class_body_methods(curr):
+                if not (
                     _is_node_inside_span(stmt, span)
                     or _strictly_encloses_span(stmt, span)
                 ):
@@ -3011,7 +3050,8 @@ def _build_enclosing_chain_cell_infos(
                 enclosing_cls_names = {
                     sub.name
                     for sub in ast.walk(fn_node)
-                    if isinstance(sub, ast.ClassDef) and enc_child in sub.body
+                    if isinstance(sub, ast.ClassDef)
+                    and enc_child in _iter_class_body_methods(sub)
                 }
                 if enclosing_cls_names:
                     extra_sibs = tuple(
@@ -3407,10 +3447,17 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
             cond_pre_post = (
                 imm_info.pre_mutated - imm_info.pre_bound
             ) & (imm_info.post_reads | unit_closure_reads)
+            cond_exported_closure_capture = (
+                output_set & set(imm_info.post_reads) & unit_closure_reads
+            )
             if bool(
                 unseeded_cond_stores
                 & imm_info.fn_locals
-                & (eff_sib_reads | cond_pre_post)
+                & (
+                    eff_sib_reads
+                    | cond_pre_post
+                    | cond_exported_closure_capture
+                )
             ):
                 return True
 

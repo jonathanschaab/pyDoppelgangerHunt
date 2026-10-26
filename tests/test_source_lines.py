@@ -7087,6 +7087,148 @@ def test_pr38_followup_round2_six_items() -> None:
     assert "severed_closure_cell" in scope_r6["control_flow_hazards"]
 
 
+def test_pr38_followup_round3_findings() -> None:
+    """Verifies round 3 findings: unseeded cond store exported and captured, header exclusion in _find_enclosing_pre_bound_names, exhaustive match definite bindings, and conditional class methods."""
+    import ast
+    from pydoppelgangerhunt.fixer.scope import (
+        _find_enclosing_pre_bound_names,
+        inspect_single_unit_scope,
+    )
+
+    # Finding 1: Unseeded conditional store with no pre-unit binding captured by intra-unit closure and exported
+    src_f1 = (
+        "def outer(x):\n"
+        "    cbs = []\n"
+        "    if x > 0:\n"
+        "        y = x * 2\n"
+        "    cbs.append(lambda: y)\n"
+        "    return cbs, (y if x > 0 else 0)\n"
+    )
+    tree_f1 = ast.parse(src_f1)
+    unit_f1 = {
+        "start": 3,
+        "end": 5,
+        "kind": "compound_block",
+        "source_text": src_f1,
+        "source_code": "if x > 0:\n    y = x * 2\ncbs.append(lambda: y)\n",
+    }
+    scope_f1 = inspect_single_unit_scope(unit_f1, tree=tree_f1)
+    assert "severed_closure_cell" in scope_f1["control_flow_hazards"]
+
+    # Finding 2: _find_enclosing_pre_bound_names excludes inner scope when unit span is in inner scope's header
+    src_f2 = (
+        "def outer():\n"
+        "    x = 1\n"
+        "    def inner(\n"
+        "        a=x,\n"
+        "    ):\n"
+        "        x = 2\n"
+        "        return a + x\n"
+        "    return inner\n"
+    )
+    tree_f2 = ast.parse(src_f2)
+    pre_bound_hdr, _ = _find_enclosing_pre_bound_names(
+        tree_f2, 4, 4, u_start_col=8, u_end_col=11
+    )
+    assert "x" in pre_bound_hdr
+    assert "inner" not in pre_bound_hdr
+    assert "a" not in pre_bound_hdr
+
+    # Finding 3A: Exhaustive match/case before unit marks variable definitely pre_bound
+    src_f3a = (
+        "def outer(cmd, items):\n"
+        "    match cmd:\n"
+        "        case 'add':\n"
+        "            scale = 2\n"
+        "        case _:\n"
+        "            scale = 1\n"
+        "    cbs = []\n"
+        "    for x in items:\n"
+        "        cbs.append(lambda x=x: x * scale)\n"
+        "    return cbs\n"
+    )
+    tree_f3a = ast.parse(src_f3a)
+    unit_f3a = {
+        "start": 8,
+        "end": 9,
+        "kind": "compound_block",
+        "source_text": src_f3a,
+        "source_code": (
+            "for x in items:\n"
+            "    cbs.append(lambda x=x: x * scale)\n"
+        ),
+    }
+    scope_f3a = inspect_single_unit_scope(unit_f3a, tree=tree_f3a)
+    assert "severed_closure_cell" not in scope_f3a["control_flow_hazards"]
+    assert scope_f3a["is_control_flow_safe"] is True
+
+    # Finding 3B: Conditionally defined class method aliases self to sibling method closures
+    src_f3b = (
+        "def outer(items, fast):\n"
+        "    acc = 0\n"
+        "    class Worker:\n"
+        "        if fast:\n"
+        "            def get_acc(self):\n"
+        "                return acc\n"
+        "            def run(self):\n"
+        "                out = []\n"
+        "                for x in items:\n"
+        "                    acc_local = self.get_acc() + x\n"
+        "                    out.append(acc_local)\n"
+        "                return out\n"
+        "    acc += 1\n"
+        "    return Worker, acc\n"
+    )
+    tree_f3b = ast.parse(src_f3b)
+    unit_f3b = {
+        "start": 9,
+        "end": 11,
+        "kind": "compound_block",
+        "source_text": src_f3b,
+        "source_code": (
+            "for x in items:\n"
+            "    acc_local = self.get_acc() + x\n"
+            "    out.append(acc_local)\n"
+        ),
+    }
+    scope_f3b = inspect_single_unit_scope(unit_f3b, tree=tree_f3b)
+    assert "self" in scope_f3b["inputs"]
+
+    src_f3b_mut = (
+        "def outer(items, fast):\n"
+        "    acc = 0\n"
+        "    class Worker:\n"
+        "        if fast:\n"
+        "            def get_acc(self):\n"
+        "                return acc\n"
+        "            def run(self):\n"
+        "                nonlocal acc\n"
+        "                out = []\n"
+        "                for x in items:\n"
+        "                    acc += x\n"
+        "                    out.append(self.get_acc())\n"
+        "                return out\n"
+        "    return Worker\n"
+    )
+    tree_f3b_mut = ast.parse(src_f3b_mut)
+    unit_f3b_mut = {
+        "start": 10,
+        "end": 12,
+        "kind": "compound_block",
+        "source_text": src_f3b_mut,
+        "source_code": (
+            "for x in items:\n"
+            "    acc += x\n"
+            "    out.append(self.get_acc())\n"
+        ),
+    }
+    scope_f3b_mut = inspect_single_unit_scope(
+        unit_f3b_mut, tree=tree_f3b_mut
+    )
+    assert "severed_closure_cell" in scope_f3b_mut["control_flow_hazards"]
+
+
+
 
 
 
