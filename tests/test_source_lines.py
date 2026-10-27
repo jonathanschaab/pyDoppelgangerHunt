@@ -7855,6 +7855,247 @@ def test_pr38_round4_utf8_finally_except_and_differential_matrix(
     )
 
 
+def test_pr38_followup_round5_findings() -> None:
+    """Verifies Round 5 review fixes: same-stmt RHS->LHS order (A), multiline ';' indent (B), comp walrus deferred reads (C), non-escaping nonlocal mutator (D), and decorator column snapping (E)."""
+    import ast
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _analyze_enclosing_fn_cells,
+        _extract_comprehension_deferred_closure_info,
+    )
+    from pydoppelgangerhunt.fixer._df_closures import _node_earliest_start_pos
+    from pydoppelgangerhunt.fixer.scope import (
+        _find_enclosing_pre_bound_names,
+        inspect_single_unit_scope,
+    )
+
+    # Finding A1: Same-statement Assign LHS target is post-mutated (not pre-bound) when unit is on RHS
+    src_a1 = (
+        "def outer(items):\n"
+        "    cbs = [lambda y, x=x: (cbs, x, y) for x in items]\n"
+        "    return cbs\n"
+    )
+    tree_a1 = ast.parse(src_a1)
+    bound_a1, in_loop_a1 = _find_enclosing_pre_bound_names(
+        tree_a1, 2, 2, u_start_col=10, u_end_col=53
+    )
+    assert "cbs" not in bound_a1
+    assert not in_loop_a1
+    info_a1 = _analyze_enclosing_fn_cells(
+        tree_a1.body[0], (2, 2, 10, 53), mod_tree=tree_a1
+    )
+    assert "cbs" not in info_a1.pre_bound
+    assert "cbs" in info_a1.post_mutated
+    sc_a1 = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 2,
+            "start_col": 10,
+            "end_col": 53,
+            "kind": "comprehension",
+            "source_text": src_a1,
+            "source_code": "[lambda y, x=x: (cbs, x, y) for x in items]",
+        },
+        tree=tree_a1,
+    )
+    assert "severed_closure_cell" in sc_a1["control_flow_hazards"]
+
+    # Finding A2: Same-statement Assign with prior binding of LHS variable still records LHS as post_mutated
+    src_a2 = (
+        "def outer(items):\n"
+        "    cbs = None\n"
+        "    cbs = [lambda y, x=x: (cbs, x, y) for x in items]\n"
+        "    return cbs\n"
+    )
+    tree_a2 = ast.parse(src_a2)
+    sc_a2 = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 3,
+            "start_col": 10,
+            "end_col": 53,
+            "kind": "comprehension",
+            "source_text": src_a2,
+            "source_code": "[lambda y, x=x: (cbs, x, y) for x in items]",
+        },
+        tree=tree_a2,
+    )
+    assert "severed_closure_cell" in sc_a2["control_flow_hazards"]
+
+    # Finding A3: For-loop iter expression unit treats loop target as post_mutated + loop_mutated (not pre_bound)
+    src_a3 = (
+        "def outer(items):\n"
+        "    out = []\n"
+        "    for x in [lambda y=i: (x, y) for i in items]:\n"
+        "        out.append(x)\n"
+        "    return out\n"
+    )
+    tree_a3 = ast.parse(src_a3)
+    bound_a3, in_loop_a3 = _find_enclosing_pre_bound_names(
+        tree_a3, 3, 3, u_start_col=13, u_end_col=48
+    )
+    assert "x" not in bound_a3
+    assert not in_loop_a3
+    info_a3 = _analyze_enclosing_fn_cells(
+        tree_a3.body[0], (3, 3, 13, 48), mod_tree=tree_a3
+    )
+    assert "x" not in info_a3.pre_bound
+    assert "x" in info_a3.post_mutated
+    assert "x" in info_a3.loop_mutated
+    sc_a3 = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 3,
+            "start_col": 13,
+            "end_col": 48,
+            "kind": "comprehension",
+            "source_text": src_a3,
+            "source_code": "[lambda y=i: (x, y) for i in items]",
+        },
+        tree=tree_a3,
+    )
+    assert "severed_closure_cell" in sc_a3["control_flow_hazards"]
+
+    # Finding B: Multiline semicolon-prefixed multi-statement unit preserves line-0 base indentation
+    src_b = (
+        "def compute(x):\n"
+        "    prefix = 1; a = (\n"
+        "        x + 1\n"
+        "    )\n"
+        "    b = a * 2; suffix = 3\n"
+        "    return b + prefix + suffix\n"
+    )
+    sc_b = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 5,
+            "start_col": 16,
+            "end_col": 13,
+            "kind": "compound_block",
+            "source_text": src_b,
+            "source_code": "a = (\n    x + 1\n)\nb = a * 2\n",
+        },
+        tree=ast.parse(src_b),
+    )
+    assert sc_b["inputs"] == ["x"]
+    assert sc_b["outputs"] == ["a", "b"]
+    assert sc_b["is_control_flow_safe"] is True
+
+    # Finding C: Comprehension walrus target captured by escaping closure inside comprehension is kept in deferred_reads
+    comp_c = ast.parse("[(w := v, lambda: w) for v in items]", mode="eval").body
+    c_reads, _ = _extract_comprehension_deferred_closure_info(comp_c)  # type: ignore[arg-type]
+    assert "w" in c_reads
+
+    comp_c_gen = ast.parse(
+        "[(w := v, (w for _ in range(1))) for v in items]", mode="eval"
+    ).body
+    c_gen_reads, _ = _extract_comprehension_deferred_closure_info(comp_c_gen)  # type: ignore[arg-type]
+    assert "w" in c_gen_reads
+
+    src_c = (
+        "def outer(items):\n"
+        "    pairs = [(w := v, lambda: w) for v in items]\n"
+        "    w = 99\n"
+        "    res = pairs[0][1]() + w\n"
+        "    return res\n"
+    )
+    sc_c = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 4,
+            "kind": "compound_block",
+            "source_text": src_c,
+            "source_code": "w = 99\nres = pairs[0][1]() + w\n",
+        },
+        tree=ast.parse(src_c),
+    )
+    assert "severed_closure_cell" in sc_c["control_flow_hazards"]
+
+    sc_c_comp = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 2,
+            "start_col": 12,
+            "end_col": 48,
+            "kind": "comprehension",
+            "source_text": src_c,
+            "source_code": "[(w := v, lambda: w) for v in items]",
+        },
+        tree=ast.parse(src_c),
+    )
+    assert "severed_closure_cell" in sc_c_comp["control_flow_hazards"]
+
+    # Finding D: Non-escaping intra-unit nonlocal mutator on top-level unit local is safe unless outer closure shares cell
+    src_d_safe = (
+        "def outer(a):\n"
+        "    x = a + 1\n"
+        "    x = x * 2\n"
+        "    def bump():\n"
+        "        nonlocal x\n"
+        "        x += 10\n"
+        "    bump()\n"
+        "    return x\n"
+    )
+    sc_d_safe = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 7,
+            "kind": "compound_block",
+            "source_text": src_d_safe,
+            "source_code": (
+                "x = x * 2\n"
+                "def bump():\n"
+                "    nonlocal x\n"
+                "    x += 10\n"
+                "bump()\n"
+            ),
+        },
+        tree=ast.parse(src_d_safe),
+    )
+    assert "severed_closure_cell" not in sc_d_safe["control_flow_hazards"]
+
+    src_d_unsafe_sib = (
+        "def outer(a):\n"
+        "    x = a + 1\n"
+        "    obs = lambda: x\n"
+        "    x = x * 2\n"
+        "    def bump():\n"
+        "        nonlocal x\n"
+        "        x += 10\n"
+        "    bump()\n"
+        "    return x, obs\n"
+    )
+    sc_d_unsafe_sib = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 8,
+            "kind": "compound_block",
+            "source_text": src_d_unsafe_sib,
+            "source_code": (
+                "x = x * 2\n"
+                "def bump():\n"
+                "    nonlocal x\n"
+                "    x += 10\n"
+                "bump()\n"
+            ),
+        },
+        tree=ast.parse(src_d_unsafe_sib),
+    )
+    assert "severed_closure_cell" in sc_d_unsafe_sib["control_flow_hazards"]
+
+    # Finding E: _node_earliest_start_pos preserves raw @ column when decorator col is not aligned with def
+    tree_e_aligned = ast.parse(
+        "def outer():\n"
+        "    @dec\n"
+        "    def inner():\n"
+        "        return 1\n"
+    )
+    inner_aligned = tree_e_aligned.body[0].body[0]  # type: ignore[attr-defined]
+    assert _node_earliest_start_pos(inner_aligned) == (2, 4)
+    inner_aligned.decorator_list[0].col_offset = 9
+    assert _node_earliest_start_pos(inner_aligned) == (2, 8)
+
+
+
 
 
 

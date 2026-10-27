@@ -51,8 +51,11 @@ def _node_earliest_start_pos(
             if isinstance(d_col, int):
                 raw_at_col = max(0, d_col - 1)
                 at_col: Optional[int] = (
-                    min(n_col, raw_at_col)
-                    if isinstance(n_col, int)
+                    n_col
+                    if (
+                        isinstance(n_col, int)
+                        and n_col <= raw_at_col <= n_col + 1
+                    )
                     else raw_at_col
                 )
             else:

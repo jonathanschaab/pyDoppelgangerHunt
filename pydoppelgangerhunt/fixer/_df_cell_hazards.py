@@ -599,15 +599,12 @@ def _extract_comprehension_deferred_closure_info(
             _extract_expr_scope_free_reads(comp_node, include_header=False)
         )
     if nested_lazy_nodes:
-        comp_all_free = _extract_expr_scope_free_reads(
-            comp_node, include_header=True
-        )
         for lazy_sub, shadowed_targets in nested_lazy_nodes:
             sub_reads = (
                 _extract_expr_scope_free_reads(lazy_sub, include_header=False)
                 - shadowed_targets
             )
-            deferred_reads.update(sub_reads & comp_all_free)
+            deferred_reads.update(sub_reads)
 
     lazy_muts = _extract_lazy_genexp_walrus_names(comp_node, scope_ctx)
     return deferred_reads, lazy_muts
@@ -780,12 +777,18 @@ def _strictly_encloses_span(node: ast.AST, span: _SpanBounds) -> bool:
     )
 
 
+def _node_contains_or_encloses_span(
+    node: Optional[ast.AST], span: _SpanBounds
+) -> bool:
+    """Checks whether node lies inside or strictly encloses span."""
+    return node is not None and (
+        _is_node_inside_span(node, span) or _strictly_encloses_span(node, span)
+    )
+
+
 def _block_contains_span(stmts: Sequence[ast.AST], span: _SpanBounds) -> bool:
     """Checks whether any statement in stmts lies inside or strictly encloses span."""
-    return any(
-        _is_node_inside_span(s, span) or _strictly_encloses_span(s, span)
-        for s in stmts
-    )
+    return any(_node_contains_or_encloses_span(s, span) for s in stmts)
 
 
 def _can_bind_in_fn_scope(
@@ -1022,6 +1025,27 @@ class _StackFrame(NamedTuple):
     in_loop: bool
     active_nonlocals: Optional[Set[str]]
     post_pre_bound: Optional[AbstractSet[str]] = None
+    force_after_span: bool = False
+
+
+def _is_frame_before_span(
+    line: Optional[int],
+    col: Optional[int],
+    span: _SpanBounds,
+    frame: _StackFrame,
+) -> bool:
+    """Checks whether a frame position precedes span when not forced after span."""
+    return not frame.force_after_span and _is_pos_before_span(line, col, span)
+
+
+def _is_frame_after_span(
+    line: Optional[int],
+    col: Optional[int],
+    span: _SpanBounds,
+    frame: _StackFrame,
+) -> bool:
+    """Checks whether a frame position follows span or is forced after span."""
+    return frame.force_after_span or _is_pos_after_span(line, col, span)
 
 
 def _record_binding_at_pos(
@@ -1040,12 +1064,12 @@ def _record_binding_at_pos(
     ]
     if not filtered:
         return
-    if _is_pos_before_span(line, col, span):
+    if _is_frame_before_span(line, col, span, frame):
         state.pre_mutated.update(filtered)
         if not frame.is_branched:
             state.pre_bound.update(filtered)
             state.pre_unbound.difference_update(filtered)
-    if _is_pos_after_span(line, col, span):
+    if _is_frame_after_span(line, col, span, frame):
         state.post_mutated.update(filtered)
     if frame.in_loop:
         state.loop_mutated.update(filtered)
@@ -1066,15 +1090,16 @@ def _record_deletion_at_pos(
         name, frame.active_nonlocals, state.fn_globals
     ):
         return
+    is_after = _is_frame_after_span(line, col, span, frame)
     if (
-        _is_pos_before_span(line, col, span)
+        _is_frame_before_span(line, col, span, frame)
         or frame.in_loop
-        or (unconditional_post_del and _is_pos_after_span(line, col, span))
+        or (unconditional_post_del and is_after)
     ):
         state.pre_bound.discard(name)
         state.pre_unbound.add(name)
         state.pre_mutated.add(name)
-    if _is_pos_after_span(line, col, span):
+    if is_after:
         state.post_mutated.add(name)
     if frame.in_loop:
         state.loop_mutated.add(name)
@@ -1233,10 +1258,20 @@ def _push_seq(
     is_branched: bool,
     in_loop: bool,
     active_nonlocals: Optional[Set[str]],
+    *,
+    force_after_span: bool = False,
 ) -> None:
     """Pushes a sequence of AST nodes in reverse order onto the traversal stack."""
     for node in reversed(nodes):
-        stack.append(_StackFrame(node, is_branched, in_loop, active_nonlocals))
+        stack.append(
+            _StackFrame(
+                node,
+                is_branched,
+                in_loop,
+                active_nonlocals,
+                force_after_span=force_after_span,
+            )
+        )
 
 
 def _extract_definite_target_names(target: ast.AST) -> Set[str]:
@@ -1604,10 +1639,11 @@ def _maybe_push_pre_span_exhaustive_frame(
         not encloses
         and not frame.is_branched
         and has_clauses
-        and _is_pos_before_span(
+        and _is_frame_before_span(
             getattr(curr, "end_lineno", getattr(curr, "lineno", None)),
             getattr(curr, "end_col_offset", getattr(curr, "col_offset", None)),
             span,
+            frame,
         )
     ):
         exh_bound = _extract_block_definite_bindings(
@@ -1639,6 +1675,7 @@ def _push_compound_children(
     is_br = frame.is_branched
     in_lp = frame.in_loop
     act_nl = frame.active_nonlocals
+    f_after = frame.force_after_span
     encloses = _strictly_encloses_span(curr, span)
 
     if isinstance(curr, ast.If):
@@ -1647,14 +1684,33 @@ def _push_compound_children(
         _maybe_push_pre_span_exhaustive_frame(
             curr, encloses, bool(curr.body), frame, span, state, stack
         )
-        _push_seq(stack, curr.orelse, is_br if else_span else True, in_lp, act_nl)
-        _push_seq(stack, curr.body, is_br if body_span else True, in_lp, act_nl)
-        stack.append(_StackFrame(curr.test, is_br, in_lp, act_nl))
+        _push_seq(
+            stack,
+            curr.orelse,
+            is_br if else_span else True,
+            in_lp,
+            act_nl,
+            force_after_span=f_after,
+        )
+        _push_seq(
+            stack,
+            curr.body,
+            is_br if body_span else True,
+            in_lp,
+            act_nl,
+            force_after_span=f_after,
+        )
+        stack.append(
+            _StackFrame(
+                curr.test, is_br, in_lp, act_nl, force_after_span=f_after
+            )
+        )
         return True
 
     if isinstance(curr, (ast.For, ast.AsyncFor)):
         body_span = encloses and _block_contains_span(curr.body, span)
         else_span = encloses and _block_contains_span(curr.orelse, span)
+        iter_span = _node_contains_or_encloses_span(curr.iter, span)
         if body_span:
             state.loop_mutated.update(unit_mutations)
             t_stores = [
@@ -1667,23 +1723,37 @@ def _push_compound_children(
                 state.pre_bound.update(t_stores)
                 state.pre_unbound.difference_update(t_stores)
             state.loop_mutated.update(t_stores)
-        _push_seq(stack, curr.orelse, is_br if else_span else True, in_lp, act_nl)
+        after_iter = f_after or iter_span
+        _push_seq(
+            stack,
+            curr.orelse,
+            is_br if else_span else True,
+            in_lp,
+            act_nl,
+            force_after_span=after_iter,
+        )
         _push_seq(
             stack,
             curr.body,
             is_br if body_span else True,
-            True if body_span else in_lp,
+            True if (body_span or iter_span) else in_lp,
             act_nl,
+            force_after_span=after_iter,
         )
         stack.append(
             _StackFrame(
                 curr.target,
                 is_br if body_span else True,
-                True if body_span else in_lp,
+                True if (body_span or iter_span) else in_lp,
                 act_nl,
+                force_after_span=after_iter,
             )
         )
-        stack.append(_StackFrame(curr.iter, is_br, in_lp, act_nl))
+        stack.append(
+            _StackFrame(
+                curr.iter, is_br, in_lp, act_nl, force_after_span=f_after
+            )
+        )
         return True
 
     if isinstance(curr, ast.While):
@@ -1694,16 +1764,30 @@ def _push_compound_children(
         else_span = encloses and _block_contains_span(curr.orelse, span)
         if body_span:
             state.loop_mutated.update(unit_mutations)
-        _push_seq(stack, curr.orelse, is_br if else_span else True, in_lp, act_nl)
+        _push_seq(
+            stack,
+            curr.orelse,
+            is_br if else_span else True,
+            in_lp,
+            act_nl,
+            force_after_span=f_after,
+        )
         _push_seq(
             stack,
             curr.body,
             is_br if body_span else True,
             True if body_span else in_lp,
             act_nl,
+            force_after_span=f_after,
         )
         stack.append(
-            _StackFrame(curr.test, is_br, True if body_span else in_lp, act_nl)
+            _StackFrame(
+                curr.test,
+                is_br,
+                True if body_span else in_lp,
+                act_nl,
+                force_after_span=f_after,
+            )
         )
         return True
 
@@ -1721,8 +1805,17 @@ def _push_compound_children(
                     if not is_br:
                         state.pre_bound.update(w_stores)
                         state.pre_unbound.difference_update(w_stores)
-        _push_seq(stack, curr.body, is_br if body_span else True, in_lp, act_nl)
-        _push_seq(stack, curr.items, is_br, in_lp, act_nl)
+        _push_seq(
+            stack,
+            curr.body,
+            is_br if body_span else True,
+            in_lp,
+            act_nl,
+            force_after_span=f_after,
+        )
+        _push_seq(
+            stack, curr.items, is_br, in_lp, act_nl, force_after_span=f_after
+        )
         return True
 
     if isinstance(curr, ast.Try) or type(curr).__name__ == "TryStar":
@@ -1750,6 +1843,7 @@ def _push_compound_children(
             is_br if final_span else True,
             in_lp,
             act_nl,
+            force_after_span=f_after,
         )
         _push_seq(
             stack,
@@ -1757,6 +1851,7 @@ def _push_compound_children(
             is_br if else_span else True,
             in_lp,
             act_nl,
+            force_after_span=f_after,
         )
         for h_node in reversed(handlers_l):
             h_span = encloses and _block_contains_span(
@@ -1764,7 +1859,11 @@ def _push_compound_children(
             )
             stack.append(
                 _StackFrame(
-                    h_node, is_br if h_span else True, in_lp, act_nl
+                    h_node,
+                    is_br if h_span else True,
+                    in_lp,
+                    act_nl,
+                    force_after_span=f_after,
                 )
             )
         _push_seq(
@@ -1773,6 +1872,7 @@ def _push_compound_children(
             is_br if body_span else True,
             in_lp,
             act_nl,
+            force_after_span=f_after,
         )
         return True
 
@@ -1802,9 +1902,15 @@ def _push_compound_children(
                     state,
                     unconditional_post_del=unconditional_post_del,
                 )
-        _push_seq(stack, curr.body, h_br, in_lp, act_nl)
+        _push_seq(
+            stack, curr.body, h_br, in_lp, act_nl, force_after_span=f_after
+        )
         if curr.type is not None:
-            stack.append(_StackFrame(curr.type, True, in_lp, act_nl))
+            stack.append(
+                _StackFrame(
+                    curr.type, True, in_lp, act_nl, force_after_span=f_after
+                )
+            )
         return True
 
     if type(curr).__name__ == "Match":
@@ -1819,27 +1925,66 @@ def _push_compound_children(
                 if (encloses and _block_contains_span(case_body, span))
                 else True
             )
-            _push_seq(stack, case_body, c_br, in_lp, act_nl)
-            guard = getattr(case, "guard", None)
-            if isinstance(guard, ast.AST):
-                stack.append(_StackFrame(guard, c_br, in_lp, act_nl))
-            pattern = getattr(case, "pattern", None)
-            if isinstance(pattern, ast.AST):
-                stack.append(_StackFrame(pattern, c_br, in_lp, act_nl))
-        subject = getattr(curr, "subject", None)
-        if isinstance(subject, ast.AST):
-            stack.append(_StackFrame(subject, is_br, in_lp, act_nl))
+            _push_seq(
+                stack,
+                case_body,
+                c_br,
+                in_lp,
+                act_nl,
+                force_after_span=f_after,
+            )
+            _push_seq(
+                stack,
+                [
+                    sub
+                    for attr in ("pattern", "guard")
+                    if isinstance(sub := getattr(case, attr, None), ast.AST)
+                ],
+                c_br,
+                in_lp,
+                act_nl,
+                force_after_span=f_after,
+            )
+        if isinstance(subject := getattr(curr, "subject", None), ast.AST):
+            stack.append(
+                _StackFrame(
+                    subject, is_br, in_lp, act_nl, force_after_span=f_after
+                )
+            )
         return True
 
     if isinstance(curr, ast.BoolOp) and curr.values:
-        _push_seq(stack, curr.values[1:], True, in_lp, act_nl)
-        stack.append(_StackFrame(curr.values[0], is_br, in_lp, act_nl))
+        _push_seq(
+            stack,
+            curr.values[1:],
+            True,
+            in_lp,
+            act_nl,
+            force_after_span=f_after,
+        )
+        stack.append(
+            _StackFrame(
+                curr.values[0], is_br, in_lp, act_nl, force_after_span=f_after
+            )
+        )
         return True
 
     if isinstance(curr, ast.IfExp):
-        stack.append(_StackFrame(curr.orelse, True, in_lp, act_nl))
-        stack.append(_StackFrame(curr.body, True, in_lp, act_nl))
-        stack.append(_StackFrame(curr.test, is_br, in_lp, act_nl))
+        stack.append(
+            _StackFrame(
+                curr.orelse, True, in_lp, act_nl, force_after_span=f_after
+            )
+        )
+        stack.append(
+            _StackFrame(
+                curr.body, True, in_lp, act_nl, force_after_span=f_after
+            )
+        )
+        stack.append(
+            _StackFrame(
+                curr.test, is_br, in_lp, act_nl, force_after_span=f_after
+            )
+        )
         return True
 
     return False
@@ -2316,14 +2461,14 @@ def _handle_nested_scope_node(
             sibling_closures.append((sib_name, free_r, nl_mut))
             for oc_name in outer_carriers:
                 sibling_closures.append((oc_name, set(free_r), set(nl_mut)))
-            if span_in_hdr or _is_pos_after_span(estart, ecol, span):
+            if span_in_hdr or _is_frame_after_span(estart, ecol, span, frame):
                 state.post_reads.update(free_r)
         if isinstance(curr, ast.ClassDef):
             cls_nonlocals = _extract_direct_nonlocals(curr)
             if (
                 enclosing_cls
                 or cls_nonlocals
-                or not _is_pos_after_span(estart, ecol, span)
+                or not _is_frame_after_span(estart, ecol, span, frame)
             ):
                 _push_seq(
                     stack,
@@ -2331,6 +2476,7 @@ def _handle_nested_scope_node(
                     frame.is_branched,
                     frame.in_loop,
                     cls_nonlocals,
+                    force_after_span=frame.force_after_span,
                 )
         _push_seq(
             stack,
@@ -2338,13 +2484,14 @@ def _handle_nested_scope_node(
             frame.is_branched,
             frame.in_loop,
             frame.active_nonlocals,
+            force_after_span=frame.force_after_span,
         )
         return True
 
     if isinstance(curr, ast.Lambda):
         free_r = _extract_expr_scope_free_reads(curr, include_header=False)
         sibling_closures.append((None, free_r, set()))
-        if _is_pos_after_span(c_line, c_col, span):
+        if _is_frame_after_span(c_line, c_col, span, frame):
             state.post_reads.update(free_r)
         _push_seq(
             stack,
@@ -2352,6 +2499,7 @@ def _handle_nested_scope_node(
             frame.is_branched,
             frame.in_loop,
             frame.active_nonlocals,
+            force_after_span=frame.force_after_span,
         )
         return True
 
@@ -2424,7 +2572,7 @@ def _handle_nested_scope_node(
                     excluded_names=c_excluded,
                     fn_globals=state.fn_globals,
                 )
-        if _is_pos_after_span(c_line, c_col, span):
+        if _is_frame_after_span(c_line, c_col, span, frame):
             state.post_reads.update(
                 _extract_expr_scope_free_reads(curr, include_header=False)
             )
@@ -2435,6 +2583,7 @@ def _handle_nested_scope_node(
                     frame.is_branched,
                     frame.in_loop,
                     frame.active_nonlocals,
+                    force_after_span=frame.force_after_span,
                 )
             )
         return True
@@ -2504,7 +2653,7 @@ def _record_simple_node_bindings_and_reads(
 ) -> None:
     """Records bindings, deletions, and post-span reads for leaf/simple AST nodes."""
     if isinstance(curr, ast.AugAssign) and isinstance(curr.target, ast.Name):
-        if _is_pos_after_span(c_line, c_col, span):
+        if _is_frame_after_span(c_line, c_col, span, frame):
             state.post_reads.add(curr.target.id)
 
     if isinstance(curr, ast.Name):
@@ -2522,8 +2671,8 @@ def _record_simple_node_bindings_and_reads(
                 state,
                 unconditional_post_del=unconditional_post_del,
             )
-        elif isinstance(curr.ctx, ast.Load) and _is_pos_after_span(
-            c_line, c_col, span
+        elif isinstance(curr.ctx, ast.Load) and _is_frame_after_span(
+            c_line, c_col, span, frame
         ):
             state.post_reads.add(curr.id)
     elif isinstance(curr, (ast.Import, ast.ImportFrom)):
@@ -2792,7 +2941,7 @@ def _traverse_fn_cell_frames(
         is_conc_pos = (
             enclosed_fn is not None
             or frame.in_loop
-            or not _is_pos_after_span(eff_line, eff_col, span)
+            or not _is_frame_after_span(eff_line, eff_col, span, frame)
         )
         if _handle_nested_scope_node(
             curr,
@@ -2886,6 +3035,46 @@ def _traverse_fn_cell_frames(
             unconditional_post_del=enclosed_fn is not None,
         )
 
+        if (
+            isinstance(
+                curr, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)
+            )
+            and getattr(curr, "value", None) is not None
+            and _node_contains_or_encloses_span(curr.value, span)  # type: ignore[arg-type]
+        ):
+            rhs_val: ast.AST = curr.value  # type: ignore[assignment]
+            lhs_targets: Sequence[ast.AST] = (
+                curr.targets
+                if isinstance(curr, ast.Assign)
+                else (curr.target,)
+            )
+            target_after = not (
+                isinstance(curr, ast.AugAssign)
+                and not isinstance(curr.target, ast.Name)
+            )
+            _push_seq(
+                stack,
+                lhs_targets,
+                frame.is_branched,
+                frame.in_loop,
+                frame.active_nonlocals,
+                force_after_span=frame.force_after_span or target_after,
+            )
+            rhs_seq: Sequence[ast.AST] = (
+                (curr.annotation, rhs_val)
+                if isinstance(curr, ast.AnnAssign)
+                else (rhs_val,)
+            )
+            _push_seq(
+                stack,
+                rhs_seq,
+                frame.is_branched,
+                frame.in_loop,
+                frame.active_nonlocals,
+                force_after_span=frame.force_after_span,
+            )
+            continue
+
         child_nodes: Sequence[ast.AST] = (
             (curr.annotation,)
             if isinstance(curr, ast.AnnAssign)
@@ -2899,6 +3088,7 @@ def _traverse_fn_cell_frames(
             frame.is_branched,
             frame.in_loop,
             frame.active_nonlocals,
+            force_after_span=frame.force_after_span,
         )
     return enclosed_fn_multi_invoked
 
@@ -3240,6 +3430,7 @@ def _check_intra_unit_nonlocal_mutators(
     outer_touched: Set[str] = set()
     all_post_reads: Set[str] = set()
     all_sib_reads: Set[str] = set()
+    outer_sib_cells: Set[str] = set()
     for info in chain_infos:
         outer_touched.update(
             info.pre_mutated
@@ -3248,17 +3439,19 @@ def _check_intra_unit_nonlocal_mutators(
             | info.all_sibling_nonlocal_mutations
         )
         all_post_reads.update(info.post_reads)
+        outer_sib_cells.update(info.all_sibling_nonlocal_mutations)
         for _, sib_r, _ in info.sibling_closures:
             all_sib_reads.update(sib_r)
+            outer_sib_cells.update(sib_r)
     escaped_unit_names = _collect_escaped_intra_unit_names(
         candidate_stmts, all_post_reads | all_sib_reads
     )
     for mut_fn_name, mutated_vars, is_escaped_def in intra_nl_mutators:
         mut_fn_escapes = is_escaped_def or mut_fn_name in escaped_unit_names
         for var in mutated_vars & top_locals_set:
-            if var in outer_touched or (
+            if var in outer_sib_cells or (
                 mut_fn_escapes
-                and (var in all_post_reads or var in all_sib_reads)
+                and (var in outer_touched or var in all_post_reads)
             ):
                 return True
     return False

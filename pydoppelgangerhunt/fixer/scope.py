@@ -40,7 +40,11 @@ from pydoppelgangerhunt.fixer._df_closures import (
     iter_nested_scope_header_nodes,
 )
 from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
-from pydoppelgangerhunt.fixer._df_visitors import _OuterExprVisitor, _UnitLiveInVisitor
+from pydoppelgangerhunt.fixer._df_visitors import (
+    _OuterExprVisitor,
+    _UnitLiveInVisitor,
+    _is_ast_node_within_unit_bounds,
+)
 from pydoppelgangerhunt.reporters import extract_unit_source_code
 from pydoppelgangerhunt.fixer.source import (
     _SUBROUTINE_KINDS,
@@ -1608,6 +1612,17 @@ def _find_enclosing_pre_bound_names(
             and c_col < u_start_col
         )
 
+    def _node_contains_or_encloses_unit(node: ast.AST) -> bool:
+        return _is_ast_node_within_unit_bounds(
+            node, s_line, e_line, u_end_col, u_start_col
+        ) or _node_strictly_encloses_bounds(
+            node,
+            s_line,
+            e_line,
+            u_start_col=u_start_col,
+            u_end_col=u_end_col,
+        )
+
     intervals = [
         (earliest_start, n_end, span, node)
         for earliest_start, n_end, span, node in _get_tree_scope_intervals(mod_tree)
@@ -1719,7 +1734,29 @@ def _find_enclosing_pre_bound_names(
             ):
                 stack.append((curr.annotation, is_branched))
                 continue
+            if (
+                isinstance(
+                    curr,
+                    (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr),
+                )
+                and getattr(curr, "value", None) is not None
+                and _node_contains_or_encloses_unit(curr.value)  # type: ignore[arg-type]
+            ):
+                rhs_val: ast.AST = curr.value  # type: ignore[assignment]
+                stack.append((rhs_val, is_branched))
+                if isinstance(curr, ast.AnnAssign):
+                    stack.append((curr.annotation, is_branched))
+                elif isinstance(curr, ast.AugAssign) and not isinstance(
+                    curr.target, ast.Name
+                ):
+                    stack.append((curr.target, is_branched))
+                continue
             if isinstance(curr, (ast.For, ast.AsyncFor, ast.While)):
+                if isinstance(
+                    curr, (ast.For, ast.AsyncFor)
+                ) and _node_contains_or_encloses_unit(curr.iter):
+                    stack.append((curr.iter, is_branched))
+                    continue
                 if _node_strictly_encloses_bounds(
                     curr,
                     s_line,
@@ -2024,9 +2061,12 @@ def _inspect_unit_scope(
                 < len(raw_lines[0].rstrip("\r\n").encode("utf-8"))
                 and ";" in raw_lines[0]
             ):
-                raw_lines[0] = _slice_utf8_line(
+                lead_ws = raw_lines[0][
+                    : len(raw_lines[0]) - len(raw_lines[0].lstrip(" \t"))
+                ]
+                raw_lines[0] = lead_ws + _slice_utf8_line(
                     raw_lines[0], inferred_s_col, None
-                )
+                ).lstrip(" \t")
             if (
                 inferred_e_col is not None
                 and 0
