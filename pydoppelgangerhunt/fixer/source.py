@@ -553,11 +553,13 @@ def _extract_slice_col_offset(
 def _slice_utf8_line(
     line: str, s_col: int, e_col: Optional[int] = None
 ) -> str:
-    """Slices a single line by UTF-8 byte column offsets."""
+    """Slices a single line by UTF-8 byte column offsets.
+
+    When e_col < s_col (inverted column bounds), intentionally falls back to
+    line[s_char:] rather than collapsing the line to empty.
+    """
     s_char = col_offset_to_char_offset(line, s_col)
-    if e_col is not None:
-        if e_col < s_col:
-            return ""
+    if e_col is not None and e_col >= s_col:
         return line[s_char : col_offset_to_char_offset(line, e_col)]
     return line[s_char:]
 

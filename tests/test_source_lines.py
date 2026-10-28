@@ -8826,7 +8826,7 @@ def test_chained_walrus_augassign_trystar_and_slice_edge_cases(
 
     # 5. _slice_utf8_line and _slice_unit_token_lines edge cases
     assert _slice_utf8_line("é = foo(1)\n", 4, 4) == ""
-    assert _slice_utf8_line("é = foo(1)\n", 6, 2) == ""
+    assert _slice_utf8_line("é = foo(1)\n", 5, 2) == "foo(1)\n"
     assert _slice_unit_token_lines(
         {"kind": "comprehension", "start_col": 4, "end_col": 4},
         ["    [x for x in y]\n"],
