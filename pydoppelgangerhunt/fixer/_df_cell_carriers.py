@@ -661,7 +661,7 @@ def _collect_unit_nonlocal_mutators(
             if mutated:
                 is_escaped_def = (
                     isinstance(curr, ast.ClassDef)
-                    or bool(getattr(curr, "decorator_list", None))
+                    or bool(curr.decorator_list)
                     or _is_closure_factory_scope(curr, scope_ctx)
                 )
                 mutators.append(
@@ -679,9 +679,7 @@ def _collect_unit_nonlocal_mutators(
                     | frozenset(_extract_strict_fn_local_names(curr))
                     | frozenset(_extract_direct_nonlocals(curr, is_global=True))
                 )
-            stack.extend(
-                (ch, body_shadowed) for ch in getattr(curr, "body", [])
-            )
+            stack.extend((ch, body_shadowed) for ch in curr.body)
             stack.extend(
                 (hdr, shadowed) for hdr in iter_nested_scope_header_nodes(curr)
             )
@@ -1036,11 +1034,14 @@ def _extract_shallow_loads_and_calls(
     return loaded, called
 
 
+_NamedScopeNode = Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef]
+
+
 def _extract_shallow_defs(
     stmts: Sequence[ast.AST],
-) -> Dict[str, List[ast.AST]]:
+) -> Dict[str, List[_NamedScopeNode]]:
     """Extracts direct FunctionDef, AsyncFunctionDef, and ClassDef nodes in stmts."""
-    defs: Dict[str, List[ast.AST]] = {}
+    defs: Dict[str, List[_NamedScopeNode]] = {}
     stack: List[ast.AST] = list(stmts)
     while stack:
         curr = stack.pop()
@@ -1063,17 +1064,21 @@ def _collect_escaped_intra_unit_defs(
 ) -> Tuple[Set[str], Set[int]]:
     """Computes (escaped_names, escaped_def_node_ids) with lexical-scope definition tracking."""
     root_defs = _extract_shallow_defs(candidate_stmts)
-    root_env: Dict[str, Tuple[ast.AST, ...]] = {
+    root_env: Dict[str, Tuple[_NamedScopeNode, ...]] = {
         name: tuple(nodes) for name, nodes in root_defs.items()
     }
-    all_def_nodes: List[ast.AST] = []
-    defs_by_name: Dict[str, List[ast.AST]] = {}
-    direct_children: Dict[int, List[ast.AST]] = {}
-    body_env: Dict[int, Dict[str, Tuple[ast.AST, ...]]] = {}
+    all_def_nodes: List[_NamedScopeNode] = []
+    defs_by_name: Dict[str, List[_NamedScopeNode]] = {}
+    direct_children: Dict[int, List[_NamedScopeNode]] = {}
+    body_env: Dict[int, Dict[str, Tuple[_NamedScopeNode, ...]]] = {}
     shadowed_map: Dict[int, frozenset[str]] = {}
 
     scope_stack: List[
-        Tuple[ast.AST, Dict[str, Tuple[ast.AST, ...]], frozenset[str]]
+        Tuple[
+            _NamedScopeNode,
+            Dict[str, Tuple[_NamedScopeNode, ...]],
+            frozenset[str],
+        ]
     ] = [
         (d_node, root_env, frozenset())
         for nodes in root_defs.values()
@@ -1083,10 +1088,10 @@ def _collect_escaped_intra_unit_defs(
         d_node, parent_env, shadowed_from_root = scope_stack.pop()
         nid = id(d_node)
         all_def_nodes.append(d_node)
-        d_name = getattr(d_node, "name", "")
+        d_name = d_node.name
         if d_name:
             defs_by_name.setdefault(d_name, []).append(d_node)
-        c_defs = _extract_shallow_defs(getattr(d_node, "body", ()))
+        c_defs = _extract_shallow_defs(d_node.body)
         c_list = [n for nodes in c_defs.values() for n in nodes]
         direct_children[nid] = c_list
         if isinstance(d_node, ast.ClassDef):
@@ -1104,7 +1109,7 @@ def _collect_escaped_intra_unit_defs(
             fn_shadowed = shadowed_from_root | frozenset(
                 (own_locals | own_globals) - own_nonlocals
             )
-            cur_env: Dict[str, Tuple[ast.AST, ...]] = {
+            cur_env: Dict[str, Tuple[_NamedScopeNode, ...]] = {
                 k: v
                 for k, v in parent_env.items()
                 if k not in own_locals and k not in own_globals
@@ -1140,9 +1145,7 @@ def _collect_escaped_intra_unit_defs(
             executed_def_ids.add(id(d_node))
     for nodes in root_defs.values():
         for d_node in nodes:
-            if isinstance(d_node, ast.ClassDef) or getattr(
-                d_node, "decorator_list", None
-            ):
+            if isinstance(d_node, ast.ClassDef) or d_node.decorator_list:
                 executed_def_ids.add(id(d_node))
 
     body_info: Dict[int, Tuple[Set[str], Set[str]]] = {}
@@ -1162,16 +1165,12 @@ def _collect_escaped_intra_unit_defs(
                         escaped_def_ids.add(cid)
                         executed_def_ids.add(cid)
                         changed = True
-                elif isinstance(c_node, ast.ClassDef) or getattr(
-                    c_node, "decorator_list", None
-                ):
+                elif isinstance(c_node, ast.ClassDef) or c_node.decorator_list:
                     if cid not in executed_def_ids:
                         executed_def_ids.add(cid)
                         changed = True
             if nid not in body_info:
-                body_info[nid] = _extract_shallow_loads_and_calls(
-                    getattr(d_node, "body", ())
-                )
+                body_info[nid] = _extract_shallow_loads_and_calls(d_node.body)
             b_loads, b_calls = body_info[nid]
             env = body_env[nid]
             shadowed_here = shadowed_map[nid]

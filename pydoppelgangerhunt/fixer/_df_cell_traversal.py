@@ -281,6 +281,9 @@ def _eval_try_definite_bindings(
         return bound, False
 
     if type(stmt).__name__ == "TryStar":
+        # PEP 654 exception groups: multiple except* clauses can execute sequentially
+        # for different sub-exceptions in a single ExceptionGroup, so conservatively
+        # clear shallow deletions across the TryStar subtree and evaluate finalbody.
         bound.difference_update(_extract_shallow_deleted_names(stmt))
         if final_l:
             return _extract_block_definite_bindings_and_term(
@@ -1476,7 +1479,7 @@ def _traverse_fn_cell_frames(
             if (
                 frame.in_loop
                 or frame.active_nonlocals is not None
-                or bool(getattr(curr, "decorator_list", None))
+                or bool(curr.decorator_list)
                 or curr.name in _extract_cached_scope_free_reads(curr)
             ):
                 enclosed_fn_multi_invoked = True
@@ -1611,45 +1614,44 @@ def _traverse_fn_cell_frames(
             unconditional_post_del=enclosed_fn is not None,
         )
 
-        if (
-            isinstance(
-                curr, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)
-            )
-            and getattr(curr, "value", None) is not None
-            and _node_contains_or_encloses_span(curr.value, span)  # type: ignore[arg-type]
+        if isinstance(
+            curr, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)
         ):
-            rhs_val: ast.AST = curr.value  # type: ignore[assignment]
-            lhs_targets: Sequence[ast.AST] = (
-                curr.targets
-                if isinstance(curr, ast.Assign)
-                else (curr.target,)
-            )
-            target_after = not (
-                isinstance(curr, ast.AugAssign)
-                and not isinstance(curr.target, ast.Name)
-            )
-            _push_seq(
-                stack,
-                lhs_targets,
-                frame.is_branched,
-                frame.in_loop,
-                frame.active_nonlocals,
-                force_after_span=frame.force_after_span or target_after,
-            )
-            rhs_seq: Sequence[ast.AST] = (
-                (curr.annotation, rhs_val)
-                if isinstance(curr, ast.AnnAssign)
-                else (rhs_val,)
-            )
-            _push_seq(
-                stack,
-                rhs_seq,
-                frame.is_branched,
-                frame.in_loop,
-                frame.active_nonlocals,
-                force_after_span=frame.force_after_span,
-            )
-            continue
+            rhs_val = curr.value
+            if rhs_val is not None and _node_contains_or_encloses_span(
+                rhs_val, span
+            ):
+                lhs_targets: Sequence[ast.AST] = (
+                    curr.targets
+                    if isinstance(curr, ast.Assign)
+                    else (curr.target,)
+                )
+                target_after = not (
+                    isinstance(curr, ast.AugAssign)
+                    and not isinstance(curr.target, ast.Name)
+                )
+                _push_seq(
+                    stack,
+                    lhs_targets,
+                    frame.is_branched,
+                    frame.in_loop,
+                    frame.active_nonlocals,
+                    force_after_span=frame.force_after_span or target_after,
+                )
+                rhs_seq: Sequence[ast.AST] = (
+                    (curr.annotation, rhs_val)
+                    if isinstance(curr, ast.AnnAssign)
+                    else (rhs_val,)
+                )
+                _push_seq(
+                    stack,
+                    rhs_seq,
+                    frame.is_branched,
+                    frame.in_loop,
+                    frame.active_nonlocals,
+                    force_after_span=frame.force_after_span,
+                )
+                continue
 
         child_nodes: Sequence[ast.AST] = (
             (curr.annotation,)

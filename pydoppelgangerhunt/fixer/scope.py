@@ -1729,23 +1729,22 @@ def _find_enclosing_pre_bound_names(
             ):
                 stack.append((curr.annotation, is_branched))
                 continue
-            if (
-                isinstance(
-                    curr,
-                    (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr),
-                )
-                and getattr(curr, "value", None) is not None
-                and _node_contains_or_encloses_unit(curr.value)  # type: ignore[arg-type]
+            if isinstance(
+                curr,
+                (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr),
             ):
-                rhs_val: ast.AST = curr.value  # type: ignore[assignment]
-                stack.append((rhs_val, is_branched))
-                if isinstance(curr, ast.AnnAssign):
-                    stack.append((curr.annotation, is_branched))
-                elif isinstance(curr, ast.AugAssign) and not isinstance(
-                    curr.target, ast.Name
+                rhs_val = curr.value
+                if rhs_val is not None and _node_contains_or_encloses_unit(
+                    rhs_val
                 ):
-                    stack.append((curr.target, is_branched))
-                continue
+                    stack.append((rhs_val, is_branched))
+                    if isinstance(curr, ast.AnnAssign):
+                        stack.append((curr.annotation, is_branched))
+                    elif isinstance(curr, ast.AugAssign) and not isinstance(
+                        curr.target, ast.Name
+                    ):
+                        stack.append((curr.target, is_branched))
+                    continue
             if isinstance(curr, (ast.For, ast.AsyncFor, ast.While)):
                 if isinstance(
                     curr, (ast.For, ast.AsyncFor)
@@ -2167,14 +2166,14 @@ def _inspect_unit_scope(
                         candidate_stmts = inner_body[0].body
                     else:
                         candidate_stmts = inner_body
-            elif offset == 1:
-                wrapper_fn = tree.body[0]  # type: ignore[attr-defined]
+            elif offset == 1 and isinstance(tree, ast.Module):
+                wrapper_fn = tree.body[0]
                 if isinstance(wrapper_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     for_loop = wrapper_fn.body[0]
                     if isinstance(for_loop, (ast.For, ast.AsyncFor, ast.While)):
                         candidate_stmts = for_loop.body
-            else:
-                wrapper_fn = tree.body[0]  # type: ignore[attr-defined]
+            elif isinstance(tree, ast.Module):
+                wrapper_fn = tree.body[0]
                 if isinstance(wrapper_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     candidate_stmts = wrapper_fn.body
             break
