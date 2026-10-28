@@ -8095,9 +8095,515 @@ def test_pr38_followup_round5_findings() -> None:
     assert _node_earliest_start_pos(inner_aligned) == (2, 8)
 
 
+def test_pr38_followup_round6_risk_items() -> None:
+    """Covers Round 6 risk items 1-6: lexical def escape identity, column-aware shortcuts, mod_tree cache isolation, genexp matrix, runtime definite-binding validation, and UTF-8 single-boundary ambiguity."""
+    import sys
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _evict_tree_scopes,
+        _scope_cell_info_cache,
+        clear_dataflow_cache,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _SpanBounds,
+        _analyze_enclosing_fn_cells,
+        _collect_escaped_intra_unit_defs,
+        _collect_escaped_intra_unit_names,
+        _extract_block_definite_bindings_and_term,
+        _find_enclosing_function_chain,
+        _get_fn_scope_context,
+        _make_empty_traversal_buffers,
+        _try_apply_cached_stmt_delta,
+    )
+    from pydoppelgangerhunt.fixer._df_pairing import resolve_clone_pair_outputs
+    from pydoppelgangerhunt.fixer.scope import (
+        _find_enclosing_pre_bound_names,
+        _unit_cols,
+        inspect_single_unit_scope,
+    )
+    from pydoppelgangerhunt.fixer.source import (
+        _slice_unit_token_lines,
+        _slice_utf8_line,
+    )
 
+    # 1. Item 1: Lexical-scope definition identity in _collect_escaped_intra_unit_defs
+    src_item1_safe = (
+        "def entry(a):\n"
+        "    value = a + 10\n"
+        "    value = value * 2\n"
+        "    def helper():\n"
+        "        def callback():\n"
+        "            nonlocal value\n"
+        "            value += 5\n"
+        "        callback()\n"
+        "        return 0\n"
+        "    helper()\n"
+        "    def other():\n"
+        "        def callback():\n"
+        "            return 1\n"
+        "        return callback\n"
+        "    escaped_cb = other()\n"
+        "    return value, escaped_cb\n"
+    )
+    tree_item1_safe = ast.parse(src_item1_safe)
+    unit_code_item1 = (
+        "value = value * 2\n"
+        "def helper():\n"
+        "    def callback():\n"
+        "        nonlocal value\n"
+        "        value += 5\n"
+        "    callback()\n"
+        "    return 0\n"
+        "helper()\n"
+        "def other():\n"
+        "    def callback():\n"
+        "        return 1\n"
+        "    return callback\n"
+        "escaped_cb = other()\n"
+    )
+    cand_item1 = ast.parse(unit_code_item1).body
+    helper_cb_node = cand_item1[1].body[0]  # type: ignore[attr-defined]
+    other_cb_node = cand_item1[3].body[0]  # type: ignore[attr-defined]
+    esc_names_1, esc_ids_1 = _collect_escaped_intra_unit_defs(
+        cand_item1, {"value", "escaped_cb", "callback"}
+    )
+    assert "escaped_cb" in esc_names_1
+    assert id(helper_cb_node) not in esc_ids_1
+    assert id(other_cb_node) in esc_ids_1
+    assert "callback" not in _collect_escaped_intra_unit_names(
+        cand_item1, {"value", "escaped_cb"}
+    )
+    sc_item1_safe = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 15,
+            "kind": "compound_block",
+            "source_text": src_item1_safe,
+            "source_code": unit_code_item1,
+        },
+        tree=tree_item1_safe,
+    )
+    assert "severed_closure_cell" not in sc_item1_safe["control_flow_hazards"]
 
+    # Ambiguous same-scope branch definitions with same name conservatively mark both as escaping
+    src_item1_ambig = (
+        "def entry(a, flag):\n"
+        "    value = a + 10\n"
+        "    value = value * 2\n"
+        "    if flag:\n"
+        "        def callback():\n"
+        "            nonlocal value\n"
+        "            value += 5\n"
+        "    else:\n"
+        "        def callback():\n"
+        "            return 1\n"
+        "    return value, callback\n"
+    )
+    sc_item1_ambig = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 10,
+            "kind": "compound_block",
+            "source_text": src_item1_ambig,
+            "source_code": (
+                "value = value * 2\n"
+                "if flag:\n"
+                "    def callback():\n"
+                "        nonlocal value\n"
+                "        value += 5\n"
+                "else:\n"
+                "    def callback():\n"
+                "        return 1\n"
+            ),
+        },
+        tree=ast.parse(src_item1_ambig),
+    )
+    assert "severed_closure_cell" in sc_item1_ambig["control_flow_hazards"]
 
+    # 2. Item 2: Column-aware _try_apply_cached_stmt_delta and same-line scope boundaries
+    same_line_src = (
+        "def f(items):\n"
+        "    a = 1; b = [lambda: a for _ in items]; a = 2\n"
+        "    return b, a\n"
+    )
+    same_line_tree = ast.parse(same_line_src)
+    fn_same_line = same_line_tree.body[0]
+    assert isinstance(fn_same_line, ast.FunctionDef)
+    ctx_sl = _get_fn_scope_context(fn_same_line, mod_tree=same_line_tree)
+    bufs_sl = _make_empty_traversal_buffers(frozenset(), ctx_sl)
+    deltas_sl: dict = {}
+    span_sl = _SpanBounds(2, 2, 11, 41)
+    assert (
+        _try_apply_cached_stmt_delta(
+            fn_same_line.body[0], span_sl, bufs_sl, deltas_sl
+        )
+        is True
+    )
+    assert "a" in bufs_sl.state.pre_bound
+    assert (
+        _try_apply_cached_stmt_delta(
+            fn_same_line.body[2], span_sl, bufs_sl, deltas_sl
+        )
+        is True
+    )
+    assert "a" in bufs_sl.state.post_mutated
 
+    # _find_enclosing_function_chain and _find_enclosing_pre_bound_names with end_col in header vs body
+    hdr_body_src = (
+        "def outer(items):\n"
+        "    x = 1\n"
+        "    def inner(d=[i + x for i in items]): return d\n"
+        "    return inner\n"
+    )
+    hdr_body_tree = ast.parse(hdr_body_src)
+    chain_hdr = _find_enclosing_function_chain(
+        hdr_body_tree, 3, 3, u_start_col=16, u_end_col=38
+    )
+    assert [n.name for _, _, n in chain_hdr] == ["outer"]  # type: ignore[attr-defined]
+    chain_body = _find_enclosing_function_chain(
+        hdr_body_tree, 3, 3, u_start_col=41, u_end_col=49
+    )
+    assert [n.name for _, _, n in chain_body] == ["outer", "inner"]  # type: ignore[attr-defined]
+    pre_hdr, _ = _find_enclosing_pre_bound_names(
+        hdr_body_tree, 3, 3, u_start_col=16, u_end_col=38
+    )
+    assert "x" in pre_hdr and "d" not in pre_hdr
+    pre_body, _ = _find_enclosing_pre_bound_names(
+        hdr_body_tree, 3, 3, u_start_col=41, u_end_col=49
+    )
+    assert "d" in pre_body
 
+    # 3. Item 3: Closure analysis cache isolation across distinct mod_tree contexts and eviction
+    shared_fn_src = (
+        "def worker(items):\n"
+        "    v = 1\n"
+        "    seq = list(v + x for x in items)\n"
+        "    v = 99\n"
+        "    res = v + 1\n"
+        "    return seq, res\n"
+    )
+    mod_clean = ast.parse("SCALE = 1\n" + shared_fn_src)
+    mod_shadow = ast.parse("list = custom_list\n" + shared_fn_src)
+    shared_fn_node = mod_clean.body[1]
+    ctx_clean = _get_fn_scope_context(shared_fn_node, mod_tree=mod_clean)
+    ctx_shadow = _get_fn_scope_context(shared_fn_node, mod_tree=mod_shadow)
+    assert isinstance(ctx_clean.fn_locals, frozenset)
+    assert isinstance(ctx_clean.shadowed_names, frozenset)
+    assert "list" not in ctx_clean.shadowed_names
+    assert "list" in ctx_shadow.shadowed_names
+    info_clean = _analyze_enclosing_fn_cells(
+        shared_fn_node, (5, 6, None, None), mod_tree=mod_clean
+    )
+    info_shadow = _analyze_enclosing_fn_cells(
+        shared_fn_node, (5, 6, None, None), mod_tree=mod_shadow
+    )
+    assert not any("v" in r for _, r, _ in info_clean.sibling_closures)
+    assert any("v" in r for _, r, _ in info_shadow.sibling_closures)
+    _evict_tree_scopes(mod_shadow)
+    assert not any(
+        isinstance(k, tuple) and mod_shadow in k for k in _scope_cell_info_cache
+    )
+    clear_dataflow_cache()
+    assert len(_scope_cell_info_cache) == 0
+
+    # 4. Item 4: Generator-expression 6-path interaction matrix
+    # 4.1 Lazy genexp consumed AFTER rebinding vs BEFORE rebinding
+    src_gen_after = (
+        "def outer(items):\n"
+        "    value = 1\n"
+        "    gen = (value + x for x in items)\n"
+        "    value = 10\n"
+        "    return list(gen)\n"
+    )
+    sc_gen_after = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 3,
+            "start_col": 10,
+            "end_col": 36,
+            "kind": "comprehension",
+            "source_text": src_gen_after,
+            "source_code": "(value + x for x in items)",
+        },
+        tree=ast.parse(src_gen_after),
+    )
+    assert "severed_closure_cell" in sc_gen_after["control_flow_hazards"]
+
+    src_gen_before = (
+        "def outer(items):\n"
+        "    value = 1\n"
+        "    gen = (value + x for x in items)\n"
+        "    out = list(gen)\n"
+        "    value = 10\n"
+        "    res = value + 1\n"
+        "    return out, res\n"
+    )
+    sc_gen_before = inspect_single_unit_scope(
+        {
+            "start": 5,
+            "end": 6,
+            "kind": "compound_block",
+            "source_text": src_gen_before,
+            "source_code": "value = 10\nres = value + 1\n",
+        },
+        tree=ast.parse(src_gen_before),
+    )
+    assert "severed_closure_cell" not in sc_gen_before["control_flow_hazards"]
+
+    # 4.2 Generator expression returned from unit to caller before outer rebinding
+    src_gen_ret = (
+        "def outer(items):\n"
+        "    value = 1\n"
+        "    gen = (value + x for x in items)\n"
+        "    res = value + 2\n"
+        "    value = 10\n"
+        "    return gen, res\n"
+    )
+    sc_gen_ret = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 4,
+            "kind": "compound_block",
+            "source_text": src_gen_ret,
+            "source_code": "gen = (value + x for x in items)\nres = value + 2\n",
+        },
+        tree=ast.parse(src_gen_ret),
+    )
+    assert "severed_closure_cell" in sc_gen_ret["control_flow_hazards"]
+
+    # 4.3 Shadowed sum/tuple consumer treated as lazy
+    src_gen_shadow_sum = (
+        "def outer(items, sum):\n"
+        "    value = 1\n"
+        "    total = sum(value + x for x in items)\n"
+        "    value = 10\n"
+        "    return total\n"
+    )
+    sc_gen_shadow_sum = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 3,
+            "start_col": 15,
+            "end_col": 41,
+            "kind": "comprehension",
+            "source_text": src_gen_shadow_sum,
+            "source_code": "(value + x for x in items)",
+        },
+        tree=ast.parse(src_gen_shadow_sum),
+    )
+    assert "severed_closure_cell" in sc_gen_shadow_sum["control_flow_hazards"]
+
+    # 4.4 Generator expression nested in list comprehension
+    src_gen_in_listcomp = (
+        "def outer(matrix):\n"
+        "    value = 1\n"
+        "    gens = [(value + x for x in row) for row in matrix]\n"
+        "    value = 10\n"
+        "    return [list(g) for g in gens]\n"
+    )
+    sc_gen_in_listcomp = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 3,
+            "start_col": 11,
+            "end_col": 55,
+            "kind": "comprehension",
+            "source_text": src_gen_in_listcomp,
+            "source_code": "[(value + x for x in row) for row in matrix]",
+        },
+        tree=ast.parse(src_gen_in_listcomp),
+    )
+    assert "severed_closure_cell" in sc_gen_in_listcomp["control_flow_hazards"]
+
+    # 4.5 Walrus in first iterable (eager) vs in body (lazy)
+    src_walrus_iter = (
+        "def outer(items):\n"
+        "    w = 0\n"
+        "    gen = (x + 1 for x in (w := items))\n"
+        "    y = w\n"
+        "    z = len(y)\n"
+        "    return list(gen), z\n"
+    )
+    sc_walrus_iter = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 5,
+            "kind": "compound_block",
+            "source_text": src_walrus_iter,
+            "source_code": "y = w\nz = len(y)\n",
+        },
+        tree=ast.parse(src_walrus_iter),
+    )
+    assert "severed_closure_cell" not in sc_walrus_iter["control_flow_hazards"]
+
+    src_walrus_body = (
+        "def outer(items):\n"
+        "    w = 0\n"
+        "    gen = ((w := x) for x in items)\n"
+        "    w = 10\n"
+        "    res = list(gen) + [w]\n"
+        "    return res\n"
+    )
+    sc_walrus_body = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 5,
+            "kind": "compound_block",
+            "source_text": src_walrus_body,
+            "source_code": "w = 10\nres = list(gen) + [w]\n",
+        },
+        tree=ast.parse(src_walrus_body),
+    )
+    assert "severed_closure_cell" in sc_walrus_body["control_flow_hazards"]
+
+    # 4.6 Nested generator expressions where inner target shadows outer variable
+    src_gen_shadow_target = (
+        "def outer(matrix):\n"
+        "    value = 1\n"
+        "    gen = (sum(value + 1 for value in row) for row in matrix)\n"
+        "    value = 10\n"
+        "    return list(gen), value\n"
+    )
+    sc_gen_shadow_target = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 3,
+            "start_col": 10,
+            "end_col": 61,
+            "kind": "comprehension",
+            "source_text": src_gen_shadow_target,
+            "source_code": "(sum(value + 1 for value in row) for row in matrix)",
+        },
+        tree=ast.parse(src_gen_shadow_target),
+    )
+    assert "value" not in sc_gen_shadow_target["inputs"]
+    assert "severed_closure_cell" not in sc_gen_shadow_target["control_flow_hazards"]
+
+    # 5. Item 5: Definite-binding validation against Python runtime execution & refactoring decision
+    prog_try_finally = (
+        "def run_case(flag):\n"
+        "    try:\n"
+        "        if flag:\n"
+        "            a = 1\n"
+        "        else:\n"
+        "            a = 2\n"
+        "    finally:\n"
+        "        if flag == 'abort':\n"
+        "            raise RuntimeError('stop')\n"
+        "        b = a + 10\n"
+        "    return a, b\n"
+    )
+    tree_tf = ast.parse(prog_try_finally)
+    fn_tf = tree_tf.body[0]
+    assert isinstance(fn_tf, ast.FunctionDef)
+    def_bound_tf, all_term_tf = _extract_block_definite_bindings_and_term(
+        fn_tf.body[:1], None
+    )
+    assert def_bound_tf == {"a", "b"}
+    assert all_term_tf is False
+    ns_tf: dict = {}
+    exec(prog_try_finally, ns_tf)  # nosec B102
+    assert ns_tf["run_case"](True) == (1, 11)
+    assert ns_tf["run_case"](False) == (2, 12)
+
+    # Validate unseeded conditional store with sibling closure: both scope fields & resolve_clone_pair_outputs
+    src_unseeded = (
+        "def outer(flag):\n"
+        "    if flag:\n"
+        "        value = 10\n"
+        "    def read():\n"
+        "        return value\n"
+        "    if not flag:\n"
+        "        value = 20\n"
+        "    return read()\n"
+    )
+    u_unseeded = {
+        "start": 2,
+        "end": 3,
+        "kind": "if_block",
+        "source_text": src_unseeded,
+        "source_code": "if flag:\n    value = 10\n",
+    }
+    sc_unseeded = inspect_single_unit_scope(
+        u_unseeded, tree=ast.parse(src_unseeded)
+    )
+    assert sc_unseeded["definite_stores"] == []
+    assert sc_unseeded["outputs"] == ["value"]
+    assert sc_unseeded["conditional_outputs"] == ["value"]
+    assert "severed_closure_cell" in sc_unseeded["control_flow_hazards"]
+    assert (
+        resolve_clone_pair_outputs(
+            u_unseeded,
+            dict(u_unseeded),
+            sc_unseeded,
+            dict(sc_unseeded),
+            source_text1=src_unseeded,
+            source_text2=src_unseeded,
+        )
+        is None
+    )
+
+    if sys.version_info >= (3, 10):
+        prog_match = (
+            "def eval_match(x):\n"
+            "    match x:\n"
+            "        case 1 if x > 0:\n"
+            "            m = 10\n"
+            "        case _:\n"
+            "            m = 20\n"
+            "    return m\n"
+        )
+        tree_m = ast.parse(prog_match)
+        def_m, term_m = _extract_block_definite_bindings_and_term(
+            tree_m.body[0].body[:1], None  # type: ignore[attr-defined]
+        )
+        assert def_m == {"m"} and not term_m
+        ns_m: dict = {}
+        exec(prog_match, ns_m)  # nosec B102
+        assert ns_m["eval_match"](1) == 10
+        assert ns_m["eval_match"](2) == 20
+
+    # 6. Item 6: UTF-8 single-boundary ambiguity preservation and round-trip verification
+    ambig_expr_line = ['    tag = "αβγ_🚀"; res = a + b + c\n']
+    res_s_col = len('    tag = "αβγ_🚀"; res = '.encode("utf-8"))
+    # Starting at `a` in `a + b + c`, both `a + b` and `a + b + c` are compound ast.expr nodes -> ambiguous!
+    assert _unit_cols(
+        {"kind": "complex_expr", "start_col": res_s_col}, ambig_expr_line
+    ) == (res_s_col, None)
+    # Ending at `c` in `a + b + c`, only `(a + b) + c` is a non-leaf ast.expr ending there -> unambiguous!
+    res_e_col = len('    tag = "αβγ_🚀"; res = a + b + c'.encode("utf-8"))
+    assert _unit_cols(
+        {"kind": "complex_expr", "end_col": res_e_col}, ambig_expr_line
+    ) == (res_s_col, res_e_col)
+
+    # Single-line compound statement `if flag: a = 1; b = 2` with only end_col has both If and Assign ending at end_col -> ambiguous!
+    ambig_stmt_line = ['    if flag: a = "café"; b = "🚀"\n']
+    stmt_end_col = len(ambig_stmt_line[0].rstrip("\r\n").encode("utf-8"))
+    assert _unit_cols(
+        {"kind": "basic_block", "end_col": stmt_end_col}, ambig_stmt_line
+    ) == (None, stmt_end_col)
+
+    # Round-trip check across multibyte prefixes and unique expressions
+    for prefix in ('    p = "αβγ"; ', '    p = "日本語_🚀_✨"; ', "    "):
+        for expr_str, kind_str in (
+            ("[x * 2 for x in items]", "comprehension"),
+            ("a + b", "complex_expr"),
+            ("{k: v for k, v in pairs}", "comprehension"),
+        ):
+            full_ln = f"{prefix}target = {expr_str}; tail = 1 # comment 🚀\n"
+            exp_s = len(f"{prefix}target = ".encode("utf-8"))
+            exp_e = exp_s + len(expr_str.encode("utf-8"))
+            assert _unit_cols(
+                {"kind": kind_str, "source_code": expr_str}, [full_ln]
+            ) == (exp_s, exp_e)
+            assert _unit_cols(
+                {"kind": kind_str, "start_col": exp_s}, [full_ln]
+            ) == (exp_s, exp_e)
+            assert _unit_cols(
+                {"kind": kind_str, "end_col": exp_e}, [full_ln]
+            ) == (exp_s, exp_e)
+            assert _slice_utf8_line(full_ln, exp_s, exp_e) == expr_str
+            assert _slice_unit_token_lines(
+                {"kind": kind_str, "start_col": exp_s, "end_col": exp_e},
+                [full_ln],
+            ) == [expr_str]
 

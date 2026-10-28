@@ -1629,19 +1629,21 @@ def _find_enclosing_pre_bound_names(
         if earliest_start <= s_line
         and e_line <= n_end
         and (
-            earliest_start < s_line
-            or n_end > e_line
-            or (
-                u_start_col is None
-                and u_end_col is None
-                and earliest_start == n_end
-            )
-            or _node_strictly_encloses_bounds(
+            _node_strictly_encloses_bounds(
                 node,
                 s_line,
                 e_line,
                 u_start_col=u_start_col,
                 u_end_col=u_end_col,
+            )
+            or (
+                u_start_col is None
+                and u_end_col is None
+                and (
+                    earliest_start < s_line
+                    or n_end > e_line
+                    or earliest_start == n_end
+                )
             )
         )
         and not _is_span_in_scope_header(
@@ -1861,8 +1863,11 @@ def _infer_missing_col_from_line_ast(
     else:
         candidate_groups = ((ast.stmt,), (ast.expr,))
     for target_types in candidate_groups:
+        matched_spans: Set[Tuple[int, int]] = set()
         for node in ast.walk(mod):
-            if not isinstance(node, target_types):
+            if not isinstance(node, target_types) or isinstance(
+                node, (ast.Name, ast.Constant)
+            ):
                 continue
             if (
                 getattr(node, "lineno", None) != 1
@@ -1879,7 +1884,9 @@ def _infer_missing_col_from_line_ast(
                 (s_col is not None and abs_s == s_col)
                 or (e_col is not None and abs_e == e_col)
             ):
-                return abs_s, abs_e
+                matched_spans.add((abs_s, abs_e))
+        if len(matched_spans) == 1:
+            return next(iter(matched_spans))
     return s_col, e_col
 
 
@@ -2440,7 +2447,7 @@ def _inspect_unit_scope(
                     )
                     if cond_escaping_cands or cond_live_ins:
                         enc_chain = _find_enclosing_function_chain(
-                            mod_tree, u_start, u_end, u_start_col
+                            mod_tree, u_start, u_end, u_start_col, u_end_col
                         )
                         if enc_chain:
                             in_enclosing_class_body = isinstance(

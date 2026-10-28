@@ -132,6 +132,7 @@ def _find_enclosing_function_chain(
     u_start: int,
     u_end: int,
     u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
 ) -> List[Tuple[int, int, ast.AST]]:
     """Finds enclosing FunctionDef/AsyncFunctionDef nodes ordered outermost to innermost."""
     chain: List[Tuple[int, int, int, ast.AST]] = []
@@ -142,10 +143,22 @@ def _find_enclosing_function_chain(
         if n_lineno <= 0 or u_start < n_lineno or u_end > n_end:
             continue
         if _is_span_in_scope_header(
-            node, u_start, u_end, u_start_col=u_start_col
+            node,
+            u_start,
+            u_end,
+            u_start_col=u_start_col,
+            u_end_col=u_end_col,
         ):
             continue
         n_col = int(getattr(node, "col_offset", 0) or 0)
+        n_end_col = getattr(node, "end_col_offset", None)
+        if (
+            u_end == n_end
+            and u_end_col is not None
+            and isinstance(n_end_col, int)
+            and u_end_col > n_end_col
+        ):
+            continue
         if u_start in (estart, n_lineno):
             _, e_col = _node_earliest_start_pos(node)
             bound_col = (
@@ -156,7 +169,15 @@ def _find_enclosing_function_chain(
             if u_start_col is not None and bound_col > u_start_col:
                 continue
             if u_end == n_end and (
-                u_start_col is None or bound_col == u_start_col
+                u_start_col is None
+                or (
+                    bound_col == u_start_col
+                    and (
+                        u_end_col is None
+                        or not isinstance(n_end_col, int)
+                        or u_end_col == n_end_col
+                    )
+                )
             ):
                 continue
         chain.append((estart, n_end, n_col, node))
@@ -610,6 +631,23 @@ def _extract_comprehension_deferred_closure_info(
     return deferred_reads, lazy_muts
 
 
+class _IntraUnitMutator(tuple):  # type: ignore[type-arg]
+    """3-tuple (name, mutated_vars, is_escaped_def) carrying optional AST definition node."""
+
+    node: Optional[ast.AST]
+
+    def __new__(
+        cls,
+        name: str,
+        mutated_vars: Set[str],
+        is_escaped_def: bool,
+        node: Optional[ast.AST] = None,
+    ) -> _IntraUnitMutator:
+        inst = super().__new__(cls, (name, mutated_vars, is_escaped_def))
+        inst.node = node
+        return inst
+
+
 def _collect_unit_nonlocal_mutators(
     candidate_stmts: Sequence[ast.stmt],
     mod_tree: Optional[ast.AST] = None,
@@ -633,7 +671,11 @@ def _collect_unit_nonlocal_mutators(
                     or bool(getattr(curr, "decorator_list", None))
                     or _is_closure_factory_scope(curr, scope_ctx)
                 )
-                mutators.append((curr.name, mutated, is_escaped_def))
+                mutators.append(
+                    _IntraUnitMutator(
+                        curr.name, mutated, is_escaped_def, node=curr
+                    )
+                )
             own_locals = (
                 frozenset()
                 if isinstance(curr, ast.ClassDef)
@@ -1139,53 +1181,188 @@ def _extract_shallow_loads_and_calls(
     return loaded, called
 
 
-def _collect_escaped_intra_unit_names(
+def _extract_shallow_defs(
+    stmts: Sequence[ast.AST],
+) -> Dict[str, List[ast.AST]]:
+    """Extracts direct FunctionDef, AsyncFunctionDef, and ClassDef nodes in stmts."""
+    defs: Dict[str, List[ast.AST]] = {}
+    stack: List[ast.AST] = list(stmts)
+    while stack:
+        curr = stack.pop()
+        if isinstance(
+            curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            defs.setdefault(curr.name, []).append(curr)
+            stack.extend(iter_nested_scope_header_nodes(curr))
+            continue
+        if isinstance(curr, ast.Lambda):
+            stack.extend(iter_nested_scope_header_nodes(curr))
+            continue
+        stack.extend(ast.iter_child_nodes(curr))
+    return defs
+
+
+def _collect_escaped_intra_unit_defs(
     candidate_stmts: Sequence[ast.stmt],
     initial_escaped: AbstractSet[str],
-) -> Set[str]:
-    """Computes function/variable names that escape candidate_stmts via loads or escaped closures."""
+) -> Tuple[Set[str], Set[int]]:
+    """Computes (escaped_names, escaped_def_node_ids) with lexical-scope definition tracking."""
+    root_defs = _extract_shallow_defs(candidate_stmts)
+    root_env: Dict[str, Tuple[ast.AST, ...]] = {
+        name: tuple(nodes) for name, nodes in root_defs.items()
+    }
+    all_def_nodes: List[ast.AST] = []
+    defs_by_name: Dict[str, List[ast.AST]] = {}
+    direct_children: Dict[int, List[ast.AST]] = {}
+    body_env: Dict[int, Dict[str, Tuple[ast.AST, ...]]] = {}
+    shadowed_map: Dict[int, frozenset[str]] = {}
+
+    scope_stack: List[
+        Tuple[ast.AST, Dict[str, Tuple[ast.AST, ...]], frozenset[str]]
+    ] = [
+        (d_node, root_env, frozenset())
+        for nodes in root_defs.values()
+        for d_node in nodes
+    ]
+    while scope_stack:
+        d_node, parent_env, shadowed_from_root = scope_stack.pop()
+        nid = id(d_node)
+        all_def_nodes.append(d_node)
+        d_name = getattr(d_node, "name", "")
+        if d_name:
+            defs_by_name.setdefault(d_name, []).append(d_node)
+        c_defs = _extract_shallow_defs(getattr(d_node, "body", ()))
+        c_list = [n for nodes in c_defs.values() for n in nodes]
+        direct_children[nid] = c_list
+        if isinstance(d_node, ast.ClassDef):
+            body_env[nid] = {
+                **parent_env,
+                **{k: tuple(v) for k, v in c_defs.items()},
+            }
+            shadowed_map[nid] = shadowed_from_root | frozenset(c_defs.keys())
+            for c_node in c_list:
+                scope_stack.append((c_node, parent_env, shadowed_from_root))
+        else:
+            own_locals = _extract_single_node_local_names(
+                d_node,
+                include_globals=False,
+                include_nonlocals=False,
+                include_self_name=False,
+                include_bare_annotations=True,
+            )
+            own_globals = _extract_direct_nonlocals(d_node, is_global=True)
+            own_nonlocals = _extract_direct_nonlocals(d_node, is_global=False)
+            fn_shadowed = shadowed_from_root | frozenset(
+                (own_locals | own_globals) - own_nonlocals
+            )
+            cur_env: Dict[str, Tuple[ast.AST, ...]] = {
+                k: v
+                for k, v in parent_env.items()
+                if k not in own_locals and k not in own_globals
+            }
+            for c_name, c_nodes in c_defs.items():
+                if c_name in own_nonlocals:
+                    cur_env[c_name] = parent_env.get(c_name, ()) + tuple(
+                        c_nodes
+                    )
+                    if c_name not in shadowed_from_root:
+                        root_env[c_name] = root_env.get(c_name, ()) + tuple(
+                            c_nodes
+                        )
+                else:
+                    cur_env[c_name] = tuple(c_nodes)
+            body_env[nid] = cur_env
+            shadowed_map[nid] = fn_shadowed
+            for c_node in c_list:
+                scope_stack.append((c_node, cur_env, fn_shadowed))
+
     top_loads, top_calls = _extract_shallow_loads_and_calls(candidate_stmts)
-    escaped: Set[str] = set(initial_escaped) | top_loads
-    executed: Set[str] = set(top_calls) | escaped
-    nested_defs: Dict[str, List[ast.AST]] = {}
-    walk_stack: List[ast.AST] = list(candidate_stmts)
-    while walk_stack:
-        node = walk_stack.pop()
-        if isinstance(
-            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-        ):
-            nested_defs.setdefault(node.name, []).append(node)
-            if isinstance(node, ast.ClassDef) or getattr(
-                node, "decorator_list", None
+    escaped_top_names: Set[str] = set(initial_escaped) | top_loads
+    executed_top_names: Set[str] = set(top_calls) | escaped_top_names
+    escaped_def_ids: Set[int] = set()
+    executed_def_ids: Set[int] = set()
+
+    for name in escaped_top_names:
+        for d_node in root_env.get(name, ()):
+            escaped_def_ids.add(id(d_node))
+            executed_def_ids.add(id(d_node))
+    for name in executed_top_names:
+        for d_node in root_env.get(name, ()):
+            executed_def_ids.add(id(d_node))
+    for nodes in root_defs.values():
+        for d_node in nodes:
+            if isinstance(d_node, ast.ClassDef) or getattr(
+                d_node, "decorator_list", None
             ):
-                executed.add(node.name)
-        walk_stack.extend(ast.iter_child_nodes(node))
+                executed_def_ids.add(id(d_node))
 
     body_info: Dict[int, Tuple[Set[str], Set[str]]] = {}
     changed = True
     while changed:
         changed = False
-        for name, nodes in nested_defs.items():
-            is_esc = name in escaped
-            is_exec = is_esc or name in executed
+        for d_node in all_def_nodes:
+            nid = id(d_node)
+            is_esc = nid in escaped_def_ids
+            is_exec = is_esc or (nid in executed_def_ids)
             if not is_exec:
                 continue
-            for d_node in nodes:
-                nid = id(d_node)
-                if nid not in body_info:
-                    body_info[nid] = _extract_shallow_loads_and_calls(
-                        getattr(d_node, "body", ())
-                    )
-                b_loads, b_calls = body_info[nid]
-                new_esc = (b_loads | b_calls) if is_esc else b_loads
-                if not new_esc.issubset(escaped):
-                    escaped.update(new_esc)
-                    executed.update(new_esc)
+            for c_node in direct_children.get(nid, ()):
+                cid = id(c_node)
+                if isinstance(d_node, ast.ClassDef) and is_esc:
+                    if cid not in escaped_def_ids:
+                        escaped_def_ids.add(cid)
+                        executed_def_ids.add(cid)
+                        changed = True
+                elif isinstance(c_node, ast.ClassDef) or getattr(
+                    c_node, "decorator_list", None
+                ):
+                    if cid not in executed_def_ids:
+                        executed_def_ids.add(cid)
+                        changed = True
+            if nid not in body_info:
+                body_info[nid] = _extract_shallow_loads_and_calls(
+                    getattr(d_node, "body", ())
+                )
+            b_loads, b_calls = body_info[nid]
+            env = body_env[nid]
+            shadowed_here = shadowed_map[nid]
+            for ref_name in b_loads | b_calls:
+                if (
+                    (is_esc or ref_name in b_loads)
+                    and ref_name not in shadowed_here
+                    and ref_name not in escaped_top_names
+                ):
+                    escaped_top_names.add(ref_name)
                     changed = True
-                if not b_calls.issubset(executed):
-                    executed.update(b_calls)
-                    changed = True
-    return escaped
+                for target_node in env.get(ref_name, ()) + (
+                    root_env.get(ref_name, ())
+                    if ref_name not in shadowed_here
+                    else ()
+                ):
+                    tid = id(target_node)
+                    if (
+                        is_esc or ref_name in b_loads
+                    ) and tid not in escaped_def_ids:
+                        escaped_def_ids.add(tid)
+                        changed = True
+                    if tid not in executed_def_ids:
+                        executed_def_ids.add(tid)
+                        changed = True
+
+    unambiguous_escaped_def_names = {
+        name
+        for name, nodes in defs_by_name.items()
+        if name and all(id(n) in escaped_def_ids for n in nodes)
+    }
+    return escaped_top_names | unambiguous_escaped_def_names, escaped_def_ids
+
+
+def _collect_escaped_intra_unit_names(
+    candidate_stmts: Sequence[ast.stmt],
+    initial_escaped: AbstractSet[str],
+) -> Set[str]:
+    """Computes function/variable names that escape candidate_stmts via loads or escaped closures."""
+    return _collect_escaped_intra_unit_defs(candidate_stmts, initial_escaped)[0]
 
 
 def _propagate_sibling_closures(
@@ -2786,12 +2963,23 @@ def _try_apply_cached_stmt_delta(
     stmt_deltas: Dict[Tuple[ast.AST, bool], Optional[_StmtCellDelta]],
 ) -> bool:
     """Computes or applies a cached _StmtCellDelta for a disjoint top-level statement."""
-    estart, _ = _node_earliest_start_pos(stmt)
+    estart, ecol = _node_earliest_start_pos(stmt)
     c_end = getattr(stmt, "end_lineno", None)
+    c_end_col = getattr(stmt, "end_col_offset", None)
     if not (isinstance(estart, int) and estart > 0 and isinstance(c_end, int)):
         return False
-    is_before = c_end < span.start
-    is_after = estart > span.end
+    is_before = c_end < span.start or (
+        c_end == span.start
+        and span.start_col is not None
+        and isinstance(c_end_col, int)
+        and c_end_col <= span.start_col
+    )
+    is_after = estart > span.end or (
+        estart == span.end
+        and span.end_col is not None
+        and isinstance(ecol, int)
+        and ecol >= span.end_col
+    )
     if not (is_before or is_after):
         return False
     key = (stmt, is_before)
@@ -3443,11 +3631,17 @@ def _check_intra_unit_nonlocal_mutators(
         for _, sib_r, _ in info.sibling_closures:
             all_sib_reads.update(sib_r)
             outer_sib_cells.update(sib_r)
-    escaped_unit_names = _collect_escaped_intra_unit_names(
+    escaped_unit_names, escaped_def_ids = _collect_escaped_intra_unit_defs(
         candidate_stmts, all_post_reads | all_sib_reads
     )
-    for mut_fn_name, mutated_vars, is_escaped_def in intra_nl_mutators:
-        mut_fn_escapes = is_escaped_def or mut_fn_name in escaped_unit_names
+    for mut_entry in intra_nl_mutators:
+        mut_fn_name, mutated_vars, is_escaped_def = mut_entry
+        mut_node = getattr(mut_entry, "node", None)
+        mut_fn_escapes = is_escaped_def or (
+            id(mut_node) in escaped_def_ids
+            if isinstance(mut_node, ast.AST)
+            else mut_fn_name in escaped_unit_names
+        )
         for var in mutated_vars & top_locals_set:
             if var in outer_sib_cells or (
                 mut_fn_escapes
@@ -3590,7 +3784,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         )
     )
     enclosing_chain = _find_enclosing_function_chain(
-        ctx.mod_tree, ctx.u_start, ctx.u_end, u_start_col
+        ctx.mod_tree, ctx.u_start, ctx.u_end, u_start_col, u_end_col
     )
     if not enclosing_chain:
         return False
