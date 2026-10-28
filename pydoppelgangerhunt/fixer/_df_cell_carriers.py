@@ -381,7 +381,14 @@ def _extract_type_alias_or_pattern_name(node: ast.AST) -> Optional[str]:
 def _extract_closure_nonlocal_mutations_and_deletions_uncached(
     scope_node: ast.AST,
 ) -> Tuple[frozenset[str], frozenset[str]]:
-    """Computes (mutated_or_deleted, deleted) outer-scope variables via nonlocal in scope_node."""
+    """Computes (mutated_or_deleted, deleted) outer-scope variables via nonlocal in scope_node.
+
+    Per PEP 227, class body scopes are not visible to nested methods and do not create
+    an intermediate lexical barrier for nonlocal declarations in nested functions; thus
+    own_locals is empty when scope_node is an ast.ClassDef.
+    """
+    # PEP 227 class scope isolation: class attributes do not intercept nonlocal bindings
+    # in nested methods, allowing nested nonlocal mutations to pass through to enclosing functions.
     own_locals = (
         set()
         if isinstance(scope_node, ast.ClassDef)
@@ -662,16 +669,16 @@ def _collect_unit_nonlocal_mutators(
                         curr.name, mutated, is_escaped_def, node=curr
                     )
                 )
-            own_locals = (
-                frozenset()
-                if isinstance(curr, ast.ClassDef)
-                else frozenset(_extract_strict_fn_local_names(curr))
-            )
-            body_shadowed = (
-                shadowed
-                | own_locals
-                | frozenset(_extract_direct_nonlocals(curr, is_global=True))
-            )
+            if isinstance(curr, ast.ClassDef):
+                # PEP 227: class body bindings and class-level global declarations do not
+                # create a lexical barrier for nonlocal declarations in nested methods.
+                body_shadowed = shadowed
+            else:
+                body_shadowed = (
+                    shadowed
+                    | frozenset(_extract_strict_fn_local_names(curr))
+                    | frozenset(_extract_direct_nonlocals(curr, is_global=True))
+                )
             stack.extend(
                 (ch, body_shadowed) for ch in getattr(curr, "body", [])
             )

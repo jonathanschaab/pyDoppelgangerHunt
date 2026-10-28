@@ -8826,6 +8826,7 @@ def test_chained_walrus_augassign_trystar_and_slice_edge_cases(
 
     # 5. _slice_utf8_line and _slice_unit_token_lines edge cases
     assert _slice_utf8_line("é = foo(1)\n", 4, 4) == ""
+    assert _slice_utf8_line("é = foo(1)\n", 6, 2) == ""
     assert _slice_unit_token_lines(
         {"kind": "comprehension", "start_col": 4, "end_col": 4},
         ["    [x for x in y]\n"],
@@ -8953,5 +8954,39 @@ def test_chained_walrus_augassign_trystar_and_slice_edge_cases(
         )
         is True
     )
+
+    # 9. PEP 227 class scope isolation and nested tuple cache eviction
+    pep227_tree = ast.parse(
+        "def outer():\n"
+        "    def inner():\n"
+        "        x = 1\n"
+        "        class C:\n"
+        "            global x\n"
+        "            x = 99\n"
+        "            def m(self):\n"
+        "                nonlocal x\n"
+        "                x = 2\n"
+        "        return C\n"
+        "    return inner\n"
+    )
+    outer_fn = pep227_tree.body[0]
+    assert isinstance(outer_fn, ast.FunctionDef)
+    inner_fn = outer_fn.body[0]
+    assert isinstance(inner_fn, ast.FunctionDef)
+    cls_c = inner_fn.body[1]
+    assert isinstance(cls_c, ast.ClassDef)
+    cls_muts = _collect_unit_nonlocal_mutators([cls_c], mod_tree=pep227_tree)
+    assert any(m.name == "C" and "x" in m.mutated_vars for m in cls_muts)
+    assert any(m.name == "m" and "x" in m.mutated_vars for m in cls_muts)
+    inner_muts = _collect_unit_nonlocal_mutators([inner_fn], mod_tree=pep227_tree)
+    assert not any("x" in m.mutated_vars for m in inner_muts)
+
+    from pydoppelgangerhunt.fixer._df_cache import _evict_tree_scopes
+
+    nested_key = (("deep", (pep227_tree, "nested_tag")), 42)
+    _scope_cell_info_cache[nested_key] = "sentinel"
+    _evict_tree_scopes(pep227_tree)
+    assert nested_key not in _scope_cell_info_cache
+
 
 

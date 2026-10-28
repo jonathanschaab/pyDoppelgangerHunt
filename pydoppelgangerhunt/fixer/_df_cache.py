@@ -53,6 +53,21 @@ _SCOPE_ROOT_TYPES: Tuple[type, ...] = (
 )
 
 
+def _key_references_scope_nodes(key: Any, scope_nodes: Set[ast.AST]) -> bool:
+    """Returns True if a tuple cache key (including nested tuples) references scope_nodes."""
+    if not isinstance(key, tuple):
+        return False
+    stack: List[Tuple[Any, ...]] = [key]
+    while stack:
+        curr = stack.pop()
+        for elem in curr:
+            if isinstance(elem, ast.AST) and elem in scope_nodes:
+                return True
+            if isinstance(elem, tuple):
+                stack.append(elem)
+    return False
+
+
 def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
     """Purges scope-cache entries belonging to an evicted AST tree."""
     if tree is None or not isinstance(tree, ast.AST):
@@ -75,17 +90,14 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
         closure_keys_to_remove = [
             k
             for k in _scope_closures_cache
-            if isinstance(k, tuple)
-            and len(k) == 2
-            and (k[0] in scope_nodes or k[1] in scope_nodes)
+            if _key_references_scope_nodes(k, scope_nodes)
         ]
         for k in closure_keys_to_remove:
             _scope_closures_cache.pop(k, None)
         cell_keys_to_remove = [
             k
             for k in _scope_cell_info_cache
-            if isinstance(k, tuple)
-            and any(isinstance(elem, ast.AST) and elem in scope_nodes for elem in k)
+            if _key_references_scope_nodes(k, scope_nodes)
         ]
         for k in cell_keys_to_remove:
             _scope_cell_info_cache.pop(k, None)

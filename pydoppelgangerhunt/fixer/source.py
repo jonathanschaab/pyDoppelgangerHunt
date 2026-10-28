@@ -555,7 +555,9 @@ def _slice_utf8_line(
 ) -> str:
     """Slices a single line by UTF-8 byte column offsets."""
     s_char = col_offset_to_char_offset(line, s_col)
-    if e_col is not None and e_col >= s_col:
+    if e_col is not None:
+        if e_col < s_col:
+            return ""
         return line[s_char : col_offset_to_char_offset(line, e_col)]
     return line[s_char:]
 
