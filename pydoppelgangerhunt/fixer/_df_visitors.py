@@ -836,7 +836,11 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
 
     def _is_node_inside_unit(self, node: ast.AST) -> bool:
         return _is_ast_node_within_unit_bounds(
-            node, self.u_start, self.u_end, self.u_end_col, self.u_start_col
+            node,
+            self.u_start,
+            self.u_end,
+            u_end_col=self.u_end_col,
+            u_start_col=self.u_start_col,
         )
 
     def _is_loop_carried(self, node: ast.AST) -> bool:
@@ -1217,7 +1221,11 @@ class _StrictPostLineVisitor(_DownstreamReadVisitor):
 
     def _is_node_inside_unit(self, node: ast.AST) -> bool:
         return _is_ast_node_within_unit_bounds(
-            node, self.u_start, self.u_end, self.u_end_col, self.u_start_col
+            node,
+            self.u_start,
+            self.u_end,
+            u_end_col=self.u_end_col,
+            u_start_col=self.u_start_col,
         )
 
 
@@ -1262,7 +1270,11 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
 
     def _is_inside(self, node: ast.AST) -> bool:
         return _is_ast_node_within_unit_bounds(
-            node, self.u_start, self.u_end, self.u_end_col, self.u_start_col
+            node,
+            self.u_start,
+            self.u_end,
+            u_end_col=self.u_end_col,
+            u_start_col=self.u_start_col,
         )
 
     def _expand_deferred_callers(self, fn_name: str) -> Set[str]:

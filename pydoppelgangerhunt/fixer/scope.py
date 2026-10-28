@@ -32,6 +32,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _extract_comprehension_walrus_names,
     _extract_scope_nonlocals_and_outer_globals,
     _extract_single_node_local_names,
+    _extract_strict_fn_local_names,
     _is_irrefutable_case,
     _is_span_in_scope_header,
     _node_earliest_start_pos,
@@ -205,13 +206,7 @@ class _ScopeVisitor(ast.NodeVisitor):
         self._unit_top_stored_locals: Set[str] = set()
 
     def _init_unit_top_locals(self, target_node: ast.AST) -> None:
-        self.unit_top_locals = _extract_single_node_local_names(
-            target_node,
-            include_globals=False,
-            include_nonlocals=False,
-            include_self_name=False,
-            include_bare_annotations=True,
-        )
+        self.unit_top_locals = _extract_strict_fn_local_names(target_node)
         self._unit_top_stored_locals = _extract_single_node_local_names(
             target_node,
             include_globals=False,
@@ -1614,7 +1609,11 @@ def _find_enclosing_pre_bound_names(
 
     def _node_contains_or_encloses_unit(node: ast.AST) -> bool:
         return _is_ast_node_within_unit_bounds(
-            node, s_line, e_line, u_end_col, u_start_col
+            node,
+            s_line,
+            e_line,
+            u_end_col=u_end_col,
+            u_start_col=u_start_col,
         ) or _node_strictly_encloses_bounds(
             node,
             s_line,
@@ -1669,13 +1668,7 @@ def _find_enclosing_pre_bound_names(
         is_class_scope = isinstance(scope_node, ast.ClassDef)
         if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             bound_before.difference_update(
-                _extract_single_node_local_names(
-                    scope_node,
-                    include_globals=False,
-                    include_nonlocals=False,
-                    include_self_name=False,
-                    include_bare_annotations=True,
-                )
+                _extract_strict_fn_local_names(scope_node)
             )
             for arg in (
                 scope_node.args.posonlyargs
@@ -2521,6 +2514,11 @@ def _inspect_unit_scope(
                                     and v not in enc_escaping
                                 ):
                                     rejected_escaping_vars.add(v)
+                                    if (
+                                        v in pre_bound
+                                        and "severed_closure_cell" not in hazards
+                                    ):
+                                        hazards.append("severed_closure_cell")
                 has_enclosing_context = mod_tree is not None and (
                     u_start > 1 or bool(_get_tree_scope_intervals(mod_tree))
                 )
@@ -2592,6 +2590,9 @@ def _inspect_unit_scope(
                     unit,
                     candidates=alias_cands,
                     tree=file_tree,
+                    skip_pre_unit_closures=bool(
+                        unit.get("skip_pre_unit_closures")
+                    ),
                     unit_inputs=set(inputs),
                 )
                 downstream_aliases = (
@@ -2885,9 +2886,6 @@ def scope_matches_closure_mode(
         return False
     raw_flag = scope.get("_skip_pre_unit_closures", False)
     return isinstance(raw_flag, bool) and raw_flag is bool(expected_skip)
-
-
-_scope_matches_closure_mode = scope_matches_closure_mode
 
 
 def ensure_unit_scope_closure_mode(

@@ -5807,41 +5807,6 @@ def test_expr_traversal_subscript_compare_unary_fstring_and_ifexp() -> None:
         assert "severed_closure_cell" in scope["control_flow_hazards"]
 
 
-def _apply_unified_diff_to_single_file(orig_text: str, patch_text: str) -> str:
-    """Applies a unified diff patch (supporting multiple hunks) to orig_text."""
-    import re  # pylint: disable=import-outside-toplevel
-
-    orig_lines = orig_text.splitlines(keepends=True)
-    out_lines: list[str] = []
-    orig_idx = 0
-    patch_lines = patch_text.splitlines(keepends=True)
-    i = 0
-    while i < len(patch_lines):
-        line = patch_lines[i]
-        m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
-        if not m:
-            i += 1
-            continue
-        old_start = int(m.group(1)) - 1
-        out_lines.extend(orig_lines[orig_idx:old_start])
-        orig_idx = old_start
-        i += 1
-        while i < len(patch_lines) and not patch_lines[i].startswith(
-            ("@@", "--- ", "+++ ", "# ")
-        ):
-            pline = patch_lines[i]
-            if pline.startswith(" "):
-                out_lines.append(pline[1:])
-                orig_idx += 1
-            elif pline.startswith("+"):
-                out_lines.append(pline[1:])
-            elif pline.startswith("-"):
-                orig_idx += 1
-            i += 1
-    out_lines.extend(orig_lines[orig_idx:])
-    return "".join(out_lines)
-
-
 def _run_differential_refactoring_case(
     tmp_path: Path,
     case_name: str,
@@ -5851,10 +5816,12 @@ def _run_differential_refactoring_case(
     call_args_list: list[tuple[object, ...]],
 ) -> None:
     """Executes original and refactored modules and verifies identical return values and side effects."""
+    import subprocess  # pylint: disable=import-outside-toplevel
     from pydoppelgangerhunt.fixer import generate_refactoring_patch
 
     case_dir = tmp_path / case_name
     case_dir.mkdir(parents=True, exist_ok=True)
+    (case_dir / ".git").mkdir(exist_ok=True)
     fn_b_src = fn_src.replace("def entry(", "def entry_b(", 1)
     line_offset = len(fn_src.splitlines()) + 1
     combined_src = f"{fn_src}\n{fn_b_src}"
@@ -5876,11 +5843,19 @@ def _run_differential_refactoring_case(
         "kind": "compound_block",
     }
     patch = generate_refactoring_patch(
-        [(1.0, u1, u2)], repo_root=str(case_dir), replace_clones=True
+        [(1.0, u1, u2)], repo_root=str(case_dir), replace_clones=False
     )
     if expect_patch:
         assert patch != "", f"Expected refactoring patch for {case_name}"
-        refactored_src = _apply_unified_diff_to_single_file(combined_src, patch)
+        subprocess.run(
+            ["git", "apply", "--whitespace=nowarn"],
+            input=patch,
+            text=True,
+            cwd=str(case_dir),
+            check=True,
+            capture_output=True,
+        )
+        refactored_src = mod_file.read_text(encoding="utf-8")
         assert "_shared_" in refactored_src
     else:
         assert patch == "", f"Expected hazard to block patch for {case_name}"
@@ -6557,8 +6532,8 @@ def test_2d_coordinate_enclosure_and_decorator_start_pos() -> None:
     assert closures[0][0] == (2, 2)
 
 
-def test_pr38_review_fixes_duplicate_cols_shadowing_and_immutability() -> None:
-    """Covers PR #38 review items: duplicate _unit_cols, loose decorators, nonlocal shadowing, and immutable cache."""
+def test_duplicate_cols_decorator_snapping_and_cell_info_immutability() -> None:
+    """Covers duplicate _unit_cols disambiguation, loose decorators, nonlocal shadowing, and immutable cache."""
     from pydoppelgangerhunt.fixer._df_cell_hazards import (
         _analyze_enclosing_fn_cells,
         _extract_fn_outer_carrier_targets,
@@ -6693,8 +6668,8 @@ def test_pr38_review_fixes_duplicate_cols_shadowing_and_immutability() -> None:
     )
 
 
-def test_pr38_followup_review_six_items() -> None:
-    """Verifies all 6 follow-up review items for closure factories, return refs, class-body units, shadowing, col inference, and post-unit lenient expression hazards."""
+def test_closure_factories_return_refs_and_class_body_units() -> None:
+    """Verifies closure factories, return refs, class-body units, shadowing, col inference, and post-unit lenient expression hazards."""
     import ast
     from pydoppelgangerhunt.fixer.scope import (
         _unit_cols,
@@ -6896,8 +6871,8 @@ def test_pr38_followup_review_six_items() -> None:
     assert "severed_closure_cell" in scope_item6["control_flow_hazards"]
 
 
-def test_pr38_followup_round2_six_items() -> None:
-    """Verifies round 2 review items: unseeded cond store in unit closure, nested fn shadowing in mutators, outer carrier value filtering, nested comp target shadowing, lambda default args, and class method nonlocal del."""
+def test_unseeded_conditional_stores_and_nested_mutator_shadowing() -> None:
+    """Verifies unseeded cond store in unit closure, nested fn shadowing in mutators, outer carrier value filtering, nested comp target shadowing, lambda default args, and class method nonlocal del."""
     import ast
     from pydoppelgangerhunt.fixer.scope import inspect_single_unit_scope
 
@@ -7087,8 +7062,8 @@ def test_pr38_followup_round2_six_items() -> None:
     assert "severed_closure_cell" in scope_r6["control_flow_hazards"]
 
 
-def test_pr38_followup_round3_findings() -> None:
-    """Verifies round 3 findings: unseeded cond store exported and captured, header exclusion in _find_enclosing_pre_bound_names, exhaustive match definite bindings, and conditional class methods."""
+def test_exported_conditional_stores_scope_headers_and_exhaustive_match() -> None:
+    """Verifies unseeded cond store exported and captured, header exclusion in _find_enclosing_pre_bound_names, exhaustive match definite bindings, and conditional class methods."""
     import ast
     import sys
     from pydoppelgangerhunt.fixer.scope import (
@@ -7230,10 +7205,10 @@ def test_pr38_followup_round3_findings() -> None:
     assert "severed_closure_cell" in scope_f3b_mut["control_flow_hazards"]
 
 
-def test_pr38_round4_utf8_finally_except_and_differential_matrix(
+def test_utf8_column_slicing_finally_exits_and_except_handler_bindings(
     tmp_path: Path,
 ) -> None:
-    """Covers Round 4 findings: UTF-8 prefix/multiline/semicolon slicing, finally conditional exits, exception-handler bindings, and 8-area matrix."""
+    """Covers UTF-8 prefix/multiline/semicolon slicing, finally conditional exits, exception-handler bindings, and 8-area matrix."""
     from pydoppelgangerhunt.fixer.dataflow import (
         clear_dataflow_cache,
         resolve_clone_generator_subroutine_outputs,
@@ -7855,8 +7830,8 @@ def test_pr38_round4_utf8_finally_except_and_differential_matrix(
     )
 
 
-def test_pr38_followup_round5_findings() -> None:
-    """Verifies Round 5 review fixes: same-stmt RHS->LHS order (A), multiline ';' indent (B), comp walrus deferred reads (C), non-escaping nonlocal mutator (D), and decorator column snapping (E)."""
+def test_same_stmt_evaluation_order_comp_walrus_and_decorator_alignment() -> None:
+    """Verifies same-stmt RHS->LHS order (A), multiline ';' indent (B), comp walrus deferred reads (C), non-escaping nonlocal mutator (D), and decorator column snapping (E)."""
     import ast
     from pydoppelgangerhunt.fixer._df_cell_hazards import (
         _analyze_enclosing_fn_cells,
@@ -8082,21 +8057,23 @@ def test_pr38_followup_round5_findings() -> None:
     )
     assert "severed_closure_cell" in sc_d_unsafe_sib["control_flow_hazards"]
 
-    # Finding E: _node_earliest_start_pos preserves raw @ column when decorator col is not aligned with def
+    # Finding E: _node_earliest_start_pos snaps @foo, @ foo, and @  foo to def col and preserves unaligned earlier col
     tree_e_aligned = ast.parse(
         "def outer():\n"
-        "    @dec\n"
+        "    @  dec\n"
         "    def inner():\n"
         "        return 1\n"
     )
     inner_aligned = tree_e_aligned.body[0].body[0]  # type: ignore[attr-defined]
     assert _node_earliest_start_pos(inner_aligned) == (2, 4)
     inner_aligned.decorator_list[0].col_offset = 9
-    assert _node_earliest_start_pos(inner_aligned) == (2, 8)
+    assert _node_earliest_start_pos(inner_aligned) == (2, 4)
+    inner_aligned.decorator_list[0].col_offset = 2
+    assert _node_earliest_start_pos(inner_aligned) == (2, 1)
 
 
-def test_pr38_followup_round6_risk_items() -> None:
-    """Covers Round 6 risk items 1-6: lexical def escape identity, column-aware shortcuts, mod_tree cache isolation, genexp matrix, runtime definite-binding validation, and UTF-8 single-boundary ambiguity."""
+def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
+    """Covers lexical def escape identity, column-aware shortcuts, mod_tree cache isolation, genexp matrix, runtime definite-binding validation, and UTF-8 single-boundary ambiguity."""
     import sys
     from pydoppelgangerhunt.fixer._df_cache import (
         _evict_tree_scopes,
@@ -8606,4 +8583,375 @@ def test_pr38_followup_round6_risk_items() -> None:
                 {"kind": kind_str, "start_col": exp_s, "end_col": exp_e},
                 [full_ln],
             ) == [expr_str]
+
+
+def test_chained_walrus_augassign_trystar_and_slice_edge_cases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Covers chained-comparison walrus short-circuiting, conditional live-in hazards, x += unit post-reads, TryStar definite bindings, UTF-8 slice edge cases, NamedTuple mutators, and star-import caching."""
+    import copy
+    import pickle
+    import sys
+    from pydoppelgangerhunt.fixer import (
+        _is_irrefutable_case,
+        _is_irrefutable_pattern,
+        generate_refactoring_patch,
+    )
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _scope_cell_info_cache,
+        clear_dataflow_cache,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _IntraUnitMutator,
+        _collect_unit_nonlocal_mutators,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _analyze_enclosing_fn_cells,
+        _extract_block_definite_bindings_and_term,
+        _extract_unconditional_walrus_names,
+    )
+    import pydoppelgangerhunt.fixer._df_closures as df_closures_mod
+    from pydoppelgangerhunt.fixer._df_hazards import (
+        _scope_reads_outputs_after_line,
+    )
+    from pydoppelgangerhunt.fixer.scope import (
+        ensure_unit_scope_closure_mode,
+        inspect_single_unit_scope,
+    )
+    from pydoppelgangerhunt.fixer.source import (
+        _slice_unit_token_lines,
+        _slice_utf8_line,
+    )
+
+    # 1. Chained comparison short-circuiting in _extract_unconditional_walrus_names and cell traversal
+    chain_cmp_expr = ast.parse("a < b < (y := f())", mode="eval").body
+    assert _extract_unconditional_walrus_names(chain_cmp_expr) == set()
+    first_cmp_expr = ast.parse(
+        "(x := g()) < (y := f()) < (z := h())", mode="eval"
+    ).body
+    assert _extract_unconditional_walrus_names(first_cmp_expr) == {"x", "y"}
+
+    src_chain_short = (
+        "def outer(a, b, f, items):\n"
+        "    ok = a < b < (y := f())\n"
+        "    cbs = [lambda x=x: x + y for x in items]\n"
+        "    return ok, cbs\n"
+    )
+    tree_chain_short = ast.parse(src_chain_short)
+    info_chain_short = _analyze_enclosing_fn_cells(
+        tree_chain_short.body[0], (3, 3, 10, 44), mod_tree=tree_chain_short
+    )
+    assert "y" not in info_chain_short.pre_bound
+    assert "y" in info_chain_short.pre_mutated
+    sc_chain_short = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 3,
+            "start_col": 10,
+            "end_col": 44,
+            "kind": "comprehension",
+            "source_text": src_chain_short,
+            "source_code": "[lambda x=x: x + y for x in items]",
+        },
+        tree=tree_chain_short,
+    )
+    assert "severed_closure_cell" in sc_chain_short["control_flow_hazards"]
+
+    src_chain_first = (
+        "def outer(a, c, f, items):\n"
+        "    ok = a < (y := f()) < c\n"
+        "    cbs = [lambda x=x: x + y for x in items]\n"
+        "    return ok, cbs\n"
+    )
+    tree_chain_first = ast.parse(src_chain_first)
+    sc_chain_first = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 3,
+            "start_col": 10,
+            "end_col": 44,
+            "kind": "comprehension",
+            "source_text": src_chain_first,
+            "source_code": "[lambda x=x: x + y for x in items]",
+        },
+        tree=tree_chain_first,
+    )
+    assert "severed_closure_cell" not in sc_chain_first["control_flow_hazards"]
+
+    # 2. Dropped inputs for conditional live-ins (v in pre_bound raises hazard; purely intra-unit stays safe)
+    src_cond_live_in_pre = (
+        "def entry(flag1, flag2):\n"
+        "    if flag1:\n"
+        "        x = 10\n"
+        "    if flag2:\n"
+        "        x = 20\n"
+        "        y = x + 1\n"
+        "    else:\n"
+        "        y = x + 2\n"
+        "    return y\n"
+    )
+    sc_cond_pre = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 8,
+            "kind": "compound_block",
+            "source_text": src_cond_live_in_pre,
+            "source_code": (
+                "if flag2:\n"
+                "    x = 20\n"
+                "    y = x + 1\n"
+                "else:\n"
+                "    y = x + 2\n"
+            ),
+        },
+        tree=ast.parse(src_cond_live_in_pre),
+    )
+    assert "x" not in sc_cond_pre["inputs"]
+    assert "severed_closure_cell" in sc_cond_pre["control_flow_hazards"]
+    assert sc_cond_pre["is_control_flow_safe"] is False
+    _run_differential_refactoring_case(
+        tmp_path,
+        "cond_live_in_pre_bound_hazard",
+        src_cond_live_in_pre,
+        (4, 8),
+        expect_patch=False,
+        call_args_list=[(True, False), (False, True), (True, True)],
+    )
+
+    src_cond_intra_only = (
+        "def entry(flag):\n"
+        "    if flag:\n"
+        "        x = 10\n"
+        "    y = x + 1 if flag else 0\n"
+        "    return y\n"
+    )
+    sc_cond_intra = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 4,
+            "kind": "compound_block",
+            "source_text": src_cond_intra_only,
+            "source_code": "if flag:\n    x = 10\ny = x + 1 if flag else 0\n",
+        },
+        tree=ast.parse(src_cond_intra_only),
+    )
+    assert "x" not in sc_cond_intra["inputs"]
+    assert "severed_closure_cell" not in sc_cond_intra["control_flow_hazards"]
+
+    # 3. Scope closure mode recomputation and non-mutation of caller u1/u2 dicts in patch.py
+    src_patch_mode = (
+        "def f1(a):\n"
+        "    b = a + 1\n"
+        "    c = b * 2\n"
+        "    return c\n\n"
+        "def f2(a):\n"
+        "    b = a + 1\n"
+        "    c = b * 2\n"
+        "    return c\n"
+    )
+    patch_file = tmp_path / "mode_mod.py"
+    patch_file.write_text(src_patch_mode, encoding="utf-8")
+    u1_orig: dict[str, Any] = {
+        "file": str(patch_file),
+        "start": 2,
+        "end": 3,
+        "name": "f1:blk",
+        "kind": "compound_block",
+    }
+    u2_orig: dict[str, Any] = {
+        "file": str(patch_file),
+        "start": 7,
+        "end": 8,
+        "name": "f2:blk",
+        "kind": "compound_block",
+    }
+    _ = generate_refactoring_patch(
+        [(1.0, u1_orig, u2_orig)],
+        repo_root=str(tmp_path),
+        replace_clones=False,
+        closure_strictness="lenient",
+    )
+    assert "skip_pre_unit_closures" not in u1_orig
+    assert "skip_pre_unit_closures" not in u2_orig
+    recomputed_sc = ensure_unit_scope_closure_mode(
+        u1_orig,
+        {"_skip_pre_unit_closures": False, "inputs": ["a"]},
+        True,
+        source_text=src_patch_mode,
+    )
+    assert recomputed_sc["_skip_pre_unit_closures"] is True
+    assert "skip_pre_unit_closures" not in u1_orig
+
+    # 4. Performance: module star-import and single-node-locals caching across many units
+    clear_dataflow_cache()
+    star_walk_calls = 0
+    orig_uncached_star = df_closures_mod._node_has_star_import_uncached
+
+    def _counting_star_import(root: ast.AST) -> bool:
+        nonlocal star_walk_calls
+        if isinstance(root, ast.Module) and len(root.body) > 50:
+            star_walk_calls += 1
+        return orig_uncached_star(root)
+
+    monkeypatch.setattr(
+        df_closures_mod, "_node_has_star_import_uncached", _counting_star_import
+    )
+    large_lines = [f"CONST_{i} = {i}\n" for i in range(200)]
+    for i in range(30):
+        large_lines.append(
+            f"def fn_{i}(items):\n"
+            f"    scale = {i}\n"
+            f"    tot = sum(x + scale for x in items)\n"
+            f"    res = tot + scale\n"
+            f"    return res\n"
+        )
+    large_src = "".join(large_lines)
+    large_tree = ast.parse(large_src)
+    for i in range(30):
+        base_ln = 200 + i * 5 + 1
+        sc_unit = inspect_single_unit_scope(
+            {
+                "start": base_ln + 2,
+                "end": base_ln + 3,
+                "kind": "compound_block",
+                "source_text": large_src,
+                "source_code": "tot = sum(x + scale for x in items)\nres = tot + scale\n",
+            },
+            tree=large_tree,
+        )
+        assert sc_unit["is_control_flow_safe"] is True
+    assert star_walk_calls == 1
+    assert (large_tree, "has_star_import") in _scope_cell_info_cache
+    assert (large_tree, "single_node_locals") in _scope_cell_info_cache
+
+    # 5. _slice_utf8_line and _slice_unit_token_lines edge cases
+    assert _slice_utf8_line("é = foo(1)\n", 4, 4) == ""
+    assert _slice_unit_token_lines(
+        {"kind": "comprehension", "start_col": 4, "end_col": 4},
+        ["    [x for x in y]\n"],
+    ) == [""]
+    assert _slice_unit_token_lines(
+        {"kind": "comprehension", "start_col": 4, "end_col": 0},
+        ["    [\n", "        x for x in y\n", "    ]\n"],
+    ) == ["[\n", "        x for x in y\n", ""]
+    assert _slice_unit_token_lines(
+        {"kind": "comprehension", "start_col": 50, "end_col": 70},
+        ["[x for x in y]"],
+    ) == ["[x for x in y]"]
+
+    # 6. `x += <unit>` records post-read and post-mutation of `x`
+    src_aug = (
+        "def outer(items):\n"
+        "    x = 1\n"
+        "    x += sum([lambda: x for _ in items][0]() for _ in (1,))\n"
+        "    return x\n"
+    )
+    tree_aug = ast.parse(src_aug)
+    info_aug = _analyze_enclosing_fn_cells(
+        tree_aug.body[0], (3, 3, 13, 39), mod_tree=tree_aug
+    )
+    assert "x" in info_aug.post_reads
+    assert "x" in info_aug.post_mutated
+    sc_aug = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 3,
+            "start_col": 13,
+            "end_col": 39,
+            "kind": "comprehension",
+            "source_text": src_aug,
+            "source_code": "[lambda: x for _ in items]",
+        },
+        tree=tree_aug,
+    )
+    assert "severed_closure_cell" in sc_aug["control_flow_hazards"]
+
+    # 7. TryStar / except* definite-binding and closure-cell hazard analysis (Python 3.11+)
+    if sys.version_info >= (3, 11):
+        src_trystar = (
+            "def outer(op, items):\n"
+            "    keep = 1\n"
+            "    victim = 2\n"
+            "    eg = 3\n"
+            "    try:\n"
+            "        del victim\n"
+            "        op()\n"
+            "    except* ValueError as eg:\n"
+            "        pass\n"
+            "    finally:\n"
+            "        final_var = 4\n"
+            "    cbs = [lambda x=x: (keep, final_var, x) for x in items]\n"
+            "    return cbs\n"
+        )
+        tree_ts = ast.parse(src_trystar)
+        fn_ts = tree_ts.body[0]
+        assert isinstance(fn_ts, ast.FunctionDef)
+        ts_bound, ts_term = _extract_block_definite_bindings_and_term(
+            fn_ts.body[:4], None
+        )
+        assert ts_bound == {"keep", "final_var"}
+        assert ts_term is False
+        sc_ts_safe = inspect_single_unit_scope(
+            {
+                "start": 12,
+                "end": 12,
+                "start_col": 10,
+                "end_col": 59,
+                "kind": "comprehension",
+                "source_text": src_trystar,
+                "source_code": "[lambda x=x: (keep, final_var, x) for x in items]",
+            },
+            tree=tree_ts,
+        )
+        assert "severed_closure_cell" not in sc_ts_safe["control_flow_hazards"]
+
+        src_trystar_unsafe = src_trystar.replace(
+            "(keep, final_var, x)", "(eg, x)"
+        )
+        sc_ts_unsafe = inspect_single_unit_scope(
+            {
+                "start": 12,
+                "end": 12,
+                "start_col": 10,
+                "end_col": 46,
+                "kind": "comprehension",
+                "source_text": src_trystar_unsafe,
+                "source_code": "[lambda x=x: (eg, x) for x in items]",
+            },
+            tree=ast.parse(src_trystar_unsafe),
+        )
+        assert "severed_closure_cell" in sc_ts_unsafe["control_flow_hazards"]
+
+    # 8. _is_irrefutable_pattern(None), _IntraUnitMutator(NamedTuple), and _scope_reads_outputs_after_line list outputs
+    assert _is_irrefutable_pattern(None) is False
+    assert _is_irrefutable_case(ast.AST()) is False
+
+    gen_muts = _collect_unit_nonlocal_mutators(
+        ast.parse("g = ((w := x) for x in items)\n").body
+    )
+    assert len(gen_muts) == 1
+    assert isinstance(gen_muts[0], _IntraUnitMutator)
+    assert isinstance(gen_muts[0].node, ast.GeneratorExp)
+    copied_mut = copy.copy(gen_muts[0])
+    pickled_mut = pickle.loads(pickle.dumps(gen_muts[0]))
+    assert copied_mut.node is gen_muts[0].node
+    assert isinstance(pickled_mut.node, ast.GeneratorExp)
+
+    scope_fn_tree = ast.parse(
+        "def f():\n"
+        "    nonlocal shared\n"
+        "    shared = 1\n"
+    ).body[0]
+    assert (
+        _scope_reads_outputs_after_line(
+            scope_fn_tree,
+            3,
+            ["shared"],  # type: ignore[arg-type]
+            end_col=14,
+            start_line=3,
+            start_col=4,
+        )
+        is True
+    )
+
 

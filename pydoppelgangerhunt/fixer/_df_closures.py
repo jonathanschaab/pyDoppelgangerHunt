@@ -15,11 +15,13 @@ from typing import (
     Set,
     Tuple,
     Union,
+    cast,
 )
 
 from pydoppelgangerhunt.fixer._df_cache import (
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
+    _scope_cell_info_cache,
     _scope_closures_cache,
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
@@ -52,10 +54,7 @@ def _node_earliest_start_pos(
                 raw_at_col = max(0, d_col - 1)
                 at_col: Optional[int] = (
                     n_col
-                    if (
-                        isinstance(n_col, int)
-                        and n_col <= raw_at_col <= n_col + 1
-                    )
+                    if isinstance(n_col, int) and n_col <= raw_at_col
                     else raw_at_col
                 )
             else:
@@ -301,20 +300,49 @@ def _extract_single_node_local_names(
     return names - global_names
 
 
+def _extract_strict_fn_local_names(scope_node: ast.AST) -> Set[str]:
+    """Extracts strict function-local bindings excluding globals, nonlocals, and self-name."""
+    return _extract_single_node_local_names(
+        scope_node,
+        include_globals=False,
+        include_nonlocals=False,
+        include_self_name=False,
+        include_bare_annotations=True,
+    )
+
+
+def _get_cached_single_node_local_names(scope_node: ast.AST) -> frozenset[str]:
+    """Returns cached default single-node local names for persistent AST scope nodes."""
+    return cast(
+        frozenset[str],
+        _get_or_compute_scope_cached(
+            _scope_cell_info_cache,
+            (scope_node, "single_node_locals"),
+            lambda: frozenset(_extract_single_node_local_names(scope_node)),
+        ),
+    )
+
+
 def _extract_scope_local_names(
     scope_node: ast.AST,
     module_tree: Optional[ast.AST] = None,
     *,
     include_classes: bool = True,
     include_self_name: bool = True,
+    cache_scope_node: bool = True,
 ) -> Set[str]:
     """Extracts parameters and locally assigned/imported/defined symbols in scope_node
     and all enclosing scopes up to module level."""
-    names = (
-        _extract_single_node_local_names(scope_node)
-        if include_self_name
-        else _extract_single_node_local_names(scope_node, include_self_name=False)
-    )
+    if include_self_name and cache_scope_node:
+        names = set(_get_cached_single_node_local_names(scope_node))
+    else:
+        names = (
+            _extract_single_node_local_names(scope_node)
+            if include_self_name
+            else _extract_single_node_local_names(
+                scope_node, include_self_name=False
+            )
+        )
     allowed_types = (
         (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
         if include_classes
@@ -328,10 +356,10 @@ def _extract_scope_local_names(
             if curr is module_tree:
                 visited_module_tree = True
             if isinstance(curr, allowed_types):
-                names.update(_extract_single_node_local_names(curr))
+                names.update(_get_cached_single_node_local_names(curr))
             curr = parent_map.get(curr)
         if not visited_module_tree and isinstance(module_tree, allowed_types):
-            names.update(_extract_single_node_local_names(module_tree))
+            names.update(_get_cached_single_node_local_names(module_tree))
     return names
 
 
@@ -360,7 +388,7 @@ def _is_confirmed_str_receiver(
     return False
 
 
-def _node_has_star_import(root: ast.AST) -> bool:
+def _node_has_star_import_uncached(root: ast.AST) -> bool:
     """Checks whether an AST subtree contains a non-builtin wildcard star import."""
     return any(
         isinstance(node, ast.ImportFrom)
@@ -370,19 +398,35 @@ def _node_has_star_import(root: ast.AST) -> bool:
     )
 
 
+def _node_has_star_import(root: ast.AST, *, use_cache: bool = True) -> bool:
+    """Checks (with optional scope-cache memoization) whether root has a star import."""
+    if not use_cache:
+        return _node_has_star_import_uncached(root)
+    return bool(
+        _get_or_compute_scope_cached(
+            _scope_cell_info_cache,
+            (root, "has_star_import"),
+            lambda: _node_has_star_import_uncached(root),
+        )
+    )
+
+
 def _has_wildcard_star_import(
-    scope_node: ast.AST, module_tree: Optional[ast.AST] = None
+    scope_node: ast.AST,
+    module_tree: Optional[ast.AST] = None,
+    *,
+    cache_scope_node: bool = True,
 ) -> bool:
     """Checks whether scope_node or any enclosing scope contains a wildcard star import."""
     if module_tree is not None:
-        if _node_has_star_import(module_tree):
+        if _node_has_star_import(module_tree, use_cache=True):
             return True
         if scope_node is not module_tree and scope_node not in _get_scope_parent_map(
             module_tree
         ):
-            return _node_has_star_import(scope_node)
+            return _node_has_star_import(scope_node, use_cache=cache_scope_node)
         return False
-    return _node_has_star_import(scope_node)
+    return _node_has_star_import(scope_node, use_cache=cache_scope_node)
 
 
 def _is_eagerly_consumed_genexp(
@@ -428,8 +472,16 @@ def _collect_scope_closures_uncached(
         and scope_node is not module_tree
     )
     parent_map = _get_scope_parent_map(scope_node, use_cache=use_parent_cache)
-    shadowed_names = _extract_scope_local_names(scope_node, module_tree=module_tree)
-    has_star_import = _has_wildcard_star_import(scope_node, module_tree=module_tree)
+    shadowed_names = _extract_scope_local_names(
+        scope_node,
+        module_tree=module_tree,
+        cache_scope_node=use_parent_cache,
+    )
+    has_star_import = _has_wildcard_star_import(
+        scope_node,
+        module_tree=module_tree,
+        cache_scope_node=use_parent_cache,
+    )
 
     def _resolve_stmt_start_pos(s: ast.AST) -> Tuple[int, int]:
         estart, ecol = _node_earliest_start_pos(s)
@@ -714,7 +766,7 @@ def _is_irrefutable_pattern(
 ) -> bool:  # pragma: no cover (py310+)
     """Recursively determines if a pattern matching AST node unconditionally matches any subject."""
     if pattern is None:
-        return True
+        return False
     if type(pattern).__name__ == "MatchAs":
         sub_pat = getattr(pattern, "pattern", None)
         return sub_pat is None or _is_irrefutable_pattern(sub_pat)
@@ -726,11 +778,9 @@ def _is_irrefutable_pattern(
 
 def _is_irrefutable_case(case: ast.AST) -> bool:  # pragma: no cover (py310+)
     """Returns True if the match case has no guard and an irrefutable pattern."""
-    guard = getattr(case, "guard", None)
-    pattern = getattr(case, "pattern", None)
-    if guard is not None or pattern is None:
+    if getattr(case, "guard", None) is not None:
         return False
-    return _is_irrefutable_pattern(pattern)
+    return _is_irrefutable_pattern(getattr(case, "pattern", None))
 
 
 def _is_span_in_scope_header(

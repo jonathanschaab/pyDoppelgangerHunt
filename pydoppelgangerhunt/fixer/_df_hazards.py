@@ -220,15 +220,23 @@ def _scope_reads_outputs_after_line(
     outputs: Set[str],
     end_col: Optional[int] = None,
     start_line: Optional[int] = None,
+    start_col: Optional[int] = None,
 ) -> bool:
     """Checks whether any statement in the scope loads outputs after the given line,
     including loop-carried reads if the statement sits inside an enclosing loop."""
+    output_set = (
+        outputs if isinstance(outputs, (set, frozenset)) else set(outputs)
+    )
     stmt_start = start_line if start_line is not None else line
     stmt_end = line
     escaping_bindings = _extract_scope_escaping_bindings(
-        scope_node, stmt_start, stmt_end, u_end_col=end_col
+        scope_node,
+        stmt_start,
+        stmt_end,
+        u_start_col=start_col,
+        u_end_col=end_col,
     )
-    if not outputs.isdisjoint(escaping_bindings):
+    if not output_set.isdisjoint(escaping_bindings):
         return True
     enclosing_loops = _find_enclosing_loops(scope_node, stmt_start, stmt_end)
     is_module = isinstance(scope_node, ast.Module)
@@ -239,12 +247,12 @@ def _scope_reads_outputs_after_line(
         stmt_end,
         stmt_end,
         end_col,
-        outputs,
+        output_set,
         enclosing_loops,
         _VisitorPassMode.AFTER_UNIT,
         is_module,
     )
-    if not outputs.isdisjoint(after_reads):
+    if not output_set.isdisjoint(after_reads):
         return True
 
     if enclosing_loops:
@@ -252,7 +260,7 @@ def _scope_reads_outputs_after_line(
             stmt_start,
             stmt_end,
             end_col,
-            candidates=outputs,
+            candidates=output_set,
             enclosing_loops=enclosing_loops,
             pass_mode=_VisitorPassMode.LOOP_CARRIED,
             is_module_scope=is_module,
@@ -262,7 +270,7 @@ def _scope_reads_outputs_after_line(
         )
         for stmt in _extract_scope_stmts(scope_node):
             loop_visitor.visit(stmt)
-        if not outputs.isdisjoint(loop_visitor.loaded):
+        if not output_set.isdisjoint(loop_visitor.loaded):
             return True
         if loop_visitor.has_dynamic_read:
             return True
@@ -271,14 +279,14 @@ def _scope_reads_outputs_after_line(
             stmt_start,
             stmt_end,
             end_col,
-            candidates=outputs,
+            candidates=output_set,
         )
         loop_killed = (
             loop_visitor.unit_entry_killed
             if loop_visitor.unit_entry_killed is not None
             else set()
         )
-        if not outputs.isdisjoint(live_ins - loop_killed):
+        if not output_set.isdisjoint(live_ins - loop_killed):
             return True
 
     return False
@@ -293,6 +301,7 @@ def _compound_stmt_reads_outputs_after(
     """Checks whether outputs are read downstream of an enclosing compound statement."""
     end_raw = getattr(node, "end_lineno", None)
     end_col_raw = getattr(node, "end_col_offset", None)
+    start_col_raw = getattr(node, "col_offset", None)
     b_end = max(
         (
             int(getattr(s, "end_lineno", None) or getattr(s, "lineno", 0) or 0)
@@ -303,8 +312,14 @@ def _compound_stmt_reads_outputs_after(
     s_start = getattr(node, "lineno", None) or 1
     s_end = end_raw if isinstance(end_raw, int) else b_end
     s_end_col = end_col_raw if isinstance(end_col_raw, int) else None
+    s_start_col = start_col_raw if isinstance(start_col_raw, int) else None
     return _scope_reads_outputs_after_line(
-        scope_node, s_end, outputs, end_col=s_end_col, start_line=s_start
+        scope_node,
+        s_end,
+        outputs,
+        end_col=s_end_col,
+        start_line=s_start,
+        start_col=s_start_col,
     )
 
 

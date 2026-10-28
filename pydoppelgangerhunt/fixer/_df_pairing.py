@@ -263,25 +263,6 @@ def resolve_generator_subroutine_outputs(
     )
 
 
-def _ensure_scope_closure_mode(
-    unit: Dict[str, Any],
-    scope: Dict[str, Any],
-    skip_pre_unit_closures: bool,
-    source_text: Optional[str],
-    tree: Optional[ast.AST],
-    repo_root: Optional[str],
-) -> Dict[str, Any]:
-    """Recomputes unit scope when a precomputed scope was built with a different closure mode."""
-    return ensure_unit_scope_closure_mode(
-        unit,
-        scope,
-        skip_pre_unit_closures,
-        source_text=source_text,
-        tree=tree,
-        repo_root=repo_root,
-    )
-
-
 def _extract_effective_unit_outputs(
     unit: Dict[str, Any], scope: Dict[str, Any]
 ) -> List[str]:
@@ -408,11 +389,21 @@ def resolve_clone_generator_subroutine_outputs(
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
     )
-    scope1 = _ensure_scope_closure_mode(
-        u1, scope1, effective_skip_closures, source_text1, tree1, repo_root
+    scope1 = ensure_unit_scope_closure_mode(
+        u1,
+        scope1,
+        effective_skip_closures,
+        source_text=source_text1,
+        tree=tree1,
+        repo_root=repo_root,
     )
-    scope2 = _ensure_scope_closure_mode(
-        u2, scope2, effective_skip_closures, source_text2, tree2, repo_root
+    scope2 = ensure_unit_scope_closure_mode(
+        u2,
+        scope2,
+        effective_skip_closures,
+        source_text=source_text2,
+        tree=tree2,
+        repo_root=repo_root,
     )
 
     for u_chk, s_chk, side_lbl in ((u1, scope1, "u1"), (u2, scope2, "u2")):
@@ -720,11 +711,21 @@ def resolve_clone_pair_outputs(
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
     )
-    scope1 = _ensure_scope_closure_mode(
-        u1, scope1, effective_skip_closures, source_text1, tree1, repo_root
+    scope1 = ensure_unit_scope_closure_mode(
+        u1,
+        scope1,
+        effective_skip_closures,
+        source_text=source_text1,
+        tree=tree1,
+        repo_root=repo_root,
     )
-    scope2 = _ensure_scope_closure_mode(
-        u2, scope2, effective_skip_closures, source_text2, tree2, repo_root
+    scope2 = ensure_unit_scope_closure_mode(
+        u2,
+        scope2,
+        effective_skip_closures,
+        source_text=source_text2,
+        tree=tree2,
+        repo_root=repo_root,
     )
 
     has_yield = bool(scope1.get("has_yield") or scope2.get("has_yield"))
