@@ -8989,4 +8989,473 @@ def test_chained_walrus_augassign_trystar_and_slice_edge_cases(
     assert nested_key not in _scope_cell_info_cache
 
 
+def test_builtin_call_loads_target_rebinding_vs_mutation_and_hazard_matrix(
+    tmp_path: Path,
+) -> None:
+    """Covers built-in call load/closure preservation, rebound vs mutated targets, and review matrix."""
+    import subprocess
+
+    from pydoppelgangerhunt.fixer import (
+        _slice_unit_token_lines,
+        clear_dataflow_cache,
+        generate_refactoring_patch,
+        inspect_single_unit_scope,
+        resolve_clone_generator_subroutine_outputs,
+        resolve_clone_pair_outputs,
+    )
+    from pydoppelgangerhunt.fixer.scope import (
+        ensure_unit_scope_closure_mode,
+        scope_matches_closure_mode,
+    )
+    from pydoppelgangerhunt.fixer.source import _slice_utf8_line
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _evict_tree_scopes,
+        _scope_cell_info_cache,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _FnScopeContext,
+        _SpanBounds,
+        _analyze_enclosing_fn_cells,
+        _extract_cached_scope_free_reads,
+        _extract_closure_carrier_mutation_targets_and_values,
+        _extract_closure_carrier_targets_and_values,
+        _extract_closure_nonlocal_mutations_and_deletions,
+        _extract_expr_closure_and_load_info,
+        _extract_fn_outer_carrier_targets,
+        _extract_fn_returned_closure_refs,
+        _extract_mutated_target_names,
+        _extract_root_target_names,
+        _find_enclosing_function_chain,
+        _resolve_unit_col_bounds,
+    )
+
+    # 1. Built-in call handling preserves loaded_names, inline_reads, inline_muts, and called_names_out
+    len_expr = ast.parse("len(items)", mode="eval").body
+    called_unshadowed: set[str] = set()
+    r_len, m_len, l_len = _extract_expr_closure_and_load_info(
+        [len_expr], called_names_out=called_unshadowed
+    )
+    assert r_len == set()
+    assert m_len == set()
+    assert l_len == {"items"}
+    assert called_unshadowed == set()
+
+    nested_builtin_expr = ast.parse(
+        "any((lambda: captured)() for _ in seq) or sum([len(other)], start=init_cb())",
+        mode="eval",
+    ).body
+    called_nested: set[str] = set()
+    r_nb, m_nb, l_nb = _extract_expr_closure_and_load_info(
+        [nested_builtin_expr], called_names_out=called_nested
+    )
+    assert "captured" in r_nb
+    assert m_nb == set()
+    assert {"seq", "other"} <= l_nb
+    assert called_nested == {"init_cb"}
+
+    shadowed_ctx = _FnScopeContext(
+        fn_locals=frozenset({"len"}),
+        parent_map={},
+        shadowed_names=frozenset({"len"}),
+        has_star_import=False,
+    )
+    called_shadowed: set[str] = set()
+    _, _, l_shad = _extract_expr_closure_and_load_info(
+        [len_expr], shadowed_ctx, called_names_out=called_shadowed
+    )
+    assert l_shad == {"items"}
+    assert called_shadowed == {"len"}
+
+    # 2. Rebound target names vs mutated attribute/subscript target names
+    stmt_rebind = ast.parse("cb = make_callback()\n").body[0]
+    stmt_destruct = ast.parse("first, (second, *rest) = make_callbacks()\n").body[0]
+    stmt_attr = ast.parse("obj.callback = make_callback()\n").body[0]
+    stmt_sub = ast.parse("mapping[key] = make_callback()\n").body[0]
+    stmt_mixed = ast.parse("bound_var, obj.callback = f1, f2\n").body[0]
+    assert isinstance(stmt_rebind, ast.Assign)
+    assert isinstance(stmt_destruct, ast.Assign)
+    assert isinstance(stmt_attr, ast.Assign)
+    assert isinstance(stmt_sub, ast.Assign)
+    assert isinstance(stmt_mixed, ast.Assign)
+
+    assert _extract_root_target_names(stmt_rebind.targets[0]) == {"cb"}
+    assert _extract_mutated_target_names(stmt_rebind.targets[0]) == set()
+    assert _extract_root_target_names(stmt_destruct.targets[0]) == {
+        "first",
+        "second",
+        "rest",
+    }
+    assert _extract_mutated_target_names(stmt_destruct.targets[0]) == set()
+    assert _extract_root_target_names(stmt_attr.targets[0]) == set()
+    assert _extract_mutated_target_names(stmt_attr.targets[0]) == {"obj"}
+    assert _extract_root_target_names(stmt_sub.targets[0]) == set()
+    assert _extract_mutated_target_names(stmt_sub.targets[0]) == {"mapping"}
+    assert _extract_root_target_names(stmt_mixed.targets[0]) == {"bound_var"}
+    assert _extract_mutated_target_names(stmt_mixed.targets[0]) == {"obj"}
+
+    assert _extract_closure_carrier_targets_and_values(stmt_attr) is None
+    assert _extract_closure_carrier_targets_and_values(stmt_sub) is None
+    attr_mut_carrier = _extract_closure_carrier_mutation_targets_and_values(
+        stmt_attr
+    )
+    sub_mut_carrier = _extract_closure_carrier_mutation_targets_and_values(
+        stmt_sub
+    )
+    assert attr_mut_carrier is not None and attr_mut_carrier[0] == {"obj"}
+    assert sub_mut_carrier is not None and sub_mut_carrier[0] == {"mapping"}
+
+    alias_src = (
+        "def outer(obj, mapping, key, source_cb):\n"
+        "    obj.callback = source_cb\n"
+        "    mapping[key] = source_cb\n"
+        "    direct_alias = source_cb\n"
+        "    left_a, *right_b = source_cb, source_cb\n"
+        "    return direct_alias, left_a, right_b\n"
+    )
+    alias_tree = ast.parse(alias_src)
+    alias_info = _analyze_enclosing_fn_cells(
+        alias_tree.body[0], (6, 6, None, None), mod_tree=alias_tree
+    )
+    alias_dict = dict(alias_info.alias_edges)
+    assert "obj" not in alias_dict
+    assert "mapping" not in alias_dict
+    assert alias_dict.get("direct_alias") == frozenset({"source_cb"})
+    assert alias_dict.get("left_a") == frozenset({"source_cb"})
+    assert alias_dict.get("right_b") == frozenset({"source_cb"})
+
+    # 3. Paired positive (rebind captured cell) vs negative (mutate referenced object) hazard checks
+    src_rebind_captured = (
+        "def outer(items):\n"
+        "    value = 1\n"
+        "    cbs = []\n"
+        "    for x in items:\n"
+        "        cbs.append(lambda x=x: x + value)\n"
+        "    value = 2\n"
+        "    return cbs\n"
+    )
+    sc_rebind = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 5,
+            "kind": "compound_block",
+            "source_text": src_rebind_captured,
+            "source_code": "for x in items:\n    cbs.append(lambda x=x: x + value)\n",
+        }
+    )
+    assert "severed_closure_cell" in sc_rebind["control_flow_hazards"]
+
+    src_mutate_captured_obj = (
+        "def outer(items):\n"
+        "    value = []\n"
+        "    cbs = []\n"
+        "    for x in items:\n"
+        "        cbs.append(lambda x=x: len(value) + x)\n"
+        "    value.append(2)\n"
+        "    return cbs\n"
+    )
+    sc_mutate_obj = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 5,
+            "kind": "compound_block",
+            "source_text": src_mutate_captured_obj,
+            "source_code": "for x in items:\n    cbs.append(lambda x=x: len(value) + x)\n",
+        }
+    )
+    assert "severed_closure_cell" not in sc_mutate_obj["control_flow_hazards"]
+    assert sc_mutate_obj["is_control_flow_safe"] is True
+
+    # 4. Cache eviction across NamedTuple/frozenset keys, statement nodes, and defensive copy immutability
+    cache_tree = ast.parse(
+        "def outer(x):\n"
+        "    def inner():\n"
+        "        nonlocal x\n"
+        "        x += 1\n"
+        "        return x\n"
+        "    return inner\n"
+    )
+    outer_node = cache_tree.body[0]
+    assert isinstance(outer_node, ast.FunctionDef)
+    inner_node = outer_node.body[0]
+    assert isinstance(inner_node, ast.FunctionDef)
+
+    mut_s, del_s = _extract_closure_nonlocal_mutations_and_deletions(inner_node)
+    mut_s.add("corrupted")
+    del_s.add("corrupted")
+    mut_s2, del_s2 = _extract_closure_nonlocal_mutations_and_deletions(inner_node)
+    assert "corrupted" not in mut_s2
+    assert "corrupted" not in del_s2
+
+    free_s = _extract_cached_scope_free_reads(inner_node)
+    free_s.add("corrupted")
+    assert "corrupted" not in _extract_cached_scope_free_reads(inner_node)
+
+    ret_l, ret_c = _extract_fn_returned_closure_refs(outer_node)
+    ret_l.add("corrupted")
+    ret_c.add("corrupted")
+    ret_l2, ret_c2 = _extract_fn_returned_closure_refs(outer_node)
+    assert "corrupted" not in ret_l2
+    assert "corrupted" not in ret_c2
+
+    carriers_s = _extract_fn_outer_carrier_targets(outer_node)
+    carriers_s.add("corrupted")
+    assert "corrupted" not in _extract_fn_outer_carrier_targets(outer_node)
+
+    nt_key = (_SpanBounds(1, 2), frozenset({inner_node.body[0]}))
+    _scope_cell_info_cache[nt_key] = "nt_val"
+    _evict_tree_scopes(cache_tree)
+    assert nt_key not in _scope_cell_info_cache
+
+    # 5. Column bounds resolution: two statements on one line, Unicode prefix, and ambiguous fail-closed
+    two_stmt_src = (
+        "def f(xs, ys):\n"
+        "    a = [x + 1 for x in xs]; b = [y + 2 for y in ys]\n"
+        "    return a, b\n"
+    )
+    two_stmt_tree = ast.parse(two_stmt_src)
+    cand_b = ast.parse("[y + 2 for y in ys]\n").body
+    s_col_b, e_col_b = _resolve_unit_col_bounds(
+        cand_b, two_stmt_tree, 2, 2, None, None
+    )
+    assert s_col_b == 33
+    assert e_col_b == 52
+
+    ambig_src = (
+        "def f(xs):\n"
+        "    return ([x for x in xs], [x for x in xs])\n"
+    )
+    ambig_tree = ast.parse(ambig_src)
+    cand_ambig = ast.parse("[x for x in xs]\n").body
+    s_ambig, e_ambig = _resolve_unit_col_bounds(
+        cand_ambig, ambig_tree, 2, 2, None, None
+    )
+    assert s_ambig is None
+    assert e_ambig is None
+
+    dec_src = (
+        "@dec1(\n"
+        "    arg1\n"
+        ")\n"
+        "def f(xs):\n"
+        "    return [x for x in xs]\n"
+    )
+    dec_tree = ast.parse(dec_src)
+    assert _find_enclosing_function_chain(dec_tree, 2, 2) == []
+    assert len(_find_enclosing_function_chain(dec_tree, 5, 5)) == 1
+
+    # 6. Lexical scope: intermediate function declaring `global x` blocks nested `nonlocal x`
+    global_barrier_tree = ast.parse(
+        "def outer():\n"
+        "    x = 1\n"
+        "    def mid():\n"
+        "        global x\n"
+        "        x = 2\n"
+        "    return mid\n"
+    )
+    outer_gb = global_barrier_tree.body[0]
+    assert isinstance(outer_gb, ast.FunctionDef)
+    mid_gb = outer_gb.body[1]
+    assert isinstance(mid_gb, ast.FunctionDef)
+    # Synthetically attach a child function mutating nonlocal x inside `mid` (which has `global x`)
+    synth_inner = ast.parse(
+        "def inner():\n    nonlocal x\n    x = 3\n"
+    ).body[0]
+    mid_gb.body.append(synth_inner)
+    clear_dataflow_cache()
+    mid_muts, _ = _extract_closure_nonlocal_mutations_and_deletions(mid_gb)
+    assert "x" not in mid_muts
+
+    # 7. UTF-8 byte offsets and _slice_unit_token_lines with accented and CJK characters and CRLF
+    line_accent = '    result = "é" + value\r\n'
+    line_cjk = '    result = "界" + value\r\n'
+    tree_accent = ast.parse(line_accent.strip())
+    rhs_accent = tree_accent.body[0].value  # type: ignore[attr-defined]
+    tree_cjk = ast.parse(line_cjk.strip())
+    rhs_cjk = tree_cjk.body[0].value  # type: ignore[attr-defined]
+    assert (
+        _slice_utf8_line(
+            line_accent,
+            4 + rhs_accent.col_offset,
+            4 + rhs_accent.end_col_offset,
+        )
+        == '"é" + value'
+    )
+    assert (
+        _slice_utf8_line(
+            line_cjk,
+            4 + rhs_cjk.col_offset,
+            4 + rhs_cjk.end_col_offset,
+        )
+        == '"界" + value'
+    )
+    multiline_utf8 = [
+        'prefix = "é界" + (\r\n',
+        "    value_a + value_b\r\n",
+        ') + "é界"\r\n',
+    ]
+    start_b = len('prefix = "é界" + '.encode("utf-8"))
+    end_b = len(")".encode("utf-8"))
+    sliced_multi = _slice_unit_token_lines(
+        {"kind": "complex_expr", "start_col": start_b, "end_col": end_b},
+        multiline_utf8,
+    )
+    assert sliced_multi == ["(\r\n", "    value_a + value_b\r\n", ")"]
+
+    # 8 & 9. Closure-strictness mode transitions and hazard propagation across refactoring entry points
+    lenient_src = (
+        "def outer(items):\n"
+        "    cbs = [lambda: acc]\n"
+        "    for x in items:\n"
+        "        acc = x * 2\n"
+        "    return items\n"
+    )
+    unit_base = {
+        "start": 3,
+        "end": 4,
+        "kind": "compound_block",
+        "source_text": lenient_src,
+        "source_code": "for x in items:\n    acc = x * 2\n",
+    }
+    sc_strict = ensure_unit_scope_closure_mode(
+        unit_base,
+        None,
+        skip_pre_unit_closures=False,
+        source_text=lenient_src,
+    )
+    assert scope_matches_closure_mode(sc_strict, False) is True
+    assert scope_matches_closure_mode(sc_strict, True) is False
+    assert "severed_closure_cell" in sc_strict["control_flow_hazards"]
+
+    sc_lenient = ensure_unit_scope_closure_mode(
+        unit_base,
+        sc_strict,
+        skip_pre_unit_closures=True,
+        source_text=lenient_src,
+    )
+    assert scope_matches_closure_mode(sc_lenient, True) is True
+    assert "severed_closure_cell" not in sc_lenient["control_flow_hazards"]
+
+    sc_back_to_strict = ensure_unit_scope_closure_mode(
+        unit_base,
+        sc_lenient,
+        skip_pre_unit_closures=False,
+        source_text=lenient_src,
+    )
+    assert scope_matches_closure_mode(sc_back_to_strict, False) is True
+    assert "severed_closure_cell" in sc_back_to_strict["control_flow_hazards"]
+
+    # Returned closure hazard cannot be bypassed even when skip_pre_unit_closures=True
+    ret_hazard_src = (
+        "def outer1(items):\n"
+        "    cbs = [lambda: acc]\n"
+        "    for x in items:\n"
+        "        acc = x * 2\n"
+        "        acc += 1\n"
+        "    return cbs\n\n"
+        "def outer2(items):\n"
+        "    cbs = [lambda: acc]\n"
+        "    for x in items:\n"
+        "        acc = x * 2\n"
+        "        acc += 1\n"
+        "    return cbs\n"
+    )
+    ret_file = tmp_path / "ret_hazard.py"
+    ret_file.write_text(ret_hazard_src, encoding="utf-8")
+    u1_ret = {
+        "file": str(ret_file),
+        "start": 3,
+        "end": 5,
+        "kind": "compound_block",
+        "source_text": ret_hazard_src,
+        "source_code": "for x in items:\n    acc = x * 2\n    acc += 1\n",
+        "skip_pre_unit_closures": True,
+    }
+    u2_ret = {
+        "file": str(ret_file),
+        "start": 10,
+        "end": 12,
+        "kind": "compound_block",
+        "source_text": ret_hazard_src,
+        "source_code": "for x in items:\n    acc = x * 2\n    acc += 1\n",
+        "skip_pre_unit_closures": True,
+    }
+    sc_u1_ret = inspect_single_unit_scope(u1_ret, repo_root=str(tmp_path))
+    sc_u2_ret = inspect_single_unit_scope(u2_ret, repo_root=str(tmp_path))
+    assert resolve_clone_pair_outputs(u1_ret, u2_ret, sc_u1_ret, sc_u2_ret) is None
+    assert (
+        resolve_clone_generator_subroutine_outputs(
+            u1_ret, u2_ret, sc_u1_ret, sc_u2_ret
+        )
+        is None
+    )
+    patch_res = generate_refactoring_patch(
+        [(1.0, u1_ret, u2_ret)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert patch_res == ""
+
+    # 10. Differential execution verifying captured mutable side effects and pre/post callback observations
+    safe_mut_src = (
+        "def run_first(items):\n"
+        "    history = []\n"
+        "    snap = lambda: list(history)\n"
+        "    before = snap()\n"
+        "    for x in items:\n"
+        "        if x > 0:\n"
+        "            history.append(x * 3)\n"
+        "    after = snap()\n"
+        "    return before, after, snap\n\n"
+        "def run_second(items):\n"
+        "    history = []\n"
+        "    snap = lambda: list(history)\n"
+        "    before = snap()\n"
+        "    for x in items:\n"
+        "        if x > 0:\n"
+        "            history.append(x * 3)\n"
+        "    after = snap()\n"
+        "    return before, after, snap\n"
+    )
+    safe_file = tmp_path / "safe_mut.py"
+    safe_file.write_text(safe_mut_src, encoding="utf-8")
+    (tmp_path / ".git").mkdir(exist_ok=True)
+    u1_safe = {
+        "file": str(safe_file),
+        "start": 5,
+        "end": 7,
+        "kind": "compound_block",
+        "source_text": safe_mut_src,
+        "source_code": "for x in items:\n    if x > 0:\n        history.append(x * 3)\n",
+    }
+    u2_safe = {
+        "file": str(safe_file),
+        "start": 15,
+        "end": 17,
+        "kind": "compound_block",
+        "source_text": safe_mut_src,
+        "source_code": "for x in items:\n    if x > 0:\n        history.append(x * 3)\n",
+    }
+    safe_patch = generate_refactoring_patch(
+        [(1.0, u1_safe, u2_safe)], repo_root=str(tmp_path), replace_clones=True
+    )
+    assert safe_patch != ""
+    subprocess.run(
+        ["git", "apply", "--whitespace=nowarn"],
+        input=safe_patch,
+        text=True,
+        cwd=str(tmp_path),
+        check=True,
+        capture_output=True,
+    )
+    patched_src = safe_file.read_text(encoding="utf-8")
+    ns_orig: dict[str, Any] = {}
+    ns_ref: dict[str, Any] = {}
+    exec(  # pylint: disable=exec-used
+        compile(safe_mut_src, "<orig>", "exec"), ns_orig
+    )  # nosec B102
+    exec(  # pylint: disable=exec-used
+        compile(patched_src, "<ref>", "exec"), ns_ref
+    )  # nosec B102
+    b_o, a_o, snap_o = ns_orig["run_first"]([-1, 2, 4])
+    b_r, a_r, snap_r = ns_ref["run_first"]([-1, 2, 4])
+    assert (b_o, a_o, snap_o(), snap_o()) == (b_r, a_r, snap_r(), snap_r())
+    assert a_r == [6, 12]
 

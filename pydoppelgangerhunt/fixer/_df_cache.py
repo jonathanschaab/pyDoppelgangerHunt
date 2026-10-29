@@ -54,16 +54,25 @@ _SCOPE_ROOT_TYPES: Tuple[type, ...] = (
 
 
 def _key_references_scope_nodes(key: Any, scope_nodes: Set[ast.AST]) -> bool:
-    """Returns True if a tuple cache key (including nested tuples) references scope_nodes."""
-    if not isinstance(key, tuple):
+    """Returns True if a cache key (including nested tuples/NamedTuples/frozensets) references scope_nodes.
+
+    Cache Key & Value Policy:
+    All composite keys in _scope_closures_cache and _scope_cell_info_cache must store
+    any AST node references either directly at the top level or inside nested tuple,
+    NamedTuple, or frozenset containers. Cached values must be immutable (e.g.,
+    frozenset, tuple, NamedTuple, bool) or defensive copies must be returned to callers.
+    """
+    if isinstance(key, ast.AST):
+        return key in scope_nodes
+    if not isinstance(key, (tuple, frozenset)):
         return False
-    stack: List[Tuple[Any, ...]] = [key]
+    stack: List[Any] = [key]
     while stack:
         curr = stack.pop()
         for elem in curr:
             if isinstance(elem, ast.AST) and elem in scope_nodes:
                 return True
-            if isinstance(elem, tuple):
+            if isinstance(elem, (tuple, frozenset)):
                 stack.append(elem)
     return False
 
@@ -72,10 +81,10 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
     """Purges scope-cache entries belonging to an evicted AST tree."""
     if tree is None or not isinstance(tree, ast.AST):
         return
+    tree_nodes = set(ast.walk(tree))
+    tree_nodes.add(tree)
     scope_nodes = {
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, _SCOPE_ROOT_TYPES)
+        node for node in tree_nodes if isinstance(node, _SCOPE_ROOT_TYPES)
     }
     scope_nodes.add(tree)
     with _downstream_cache_lock:
@@ -90,14 +99,14 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
         closure_keys_to_remove = [
             k
             for k in _scope_closures_cache
-            if _key_references_scope_nodes(k, scope_nodes)
+            if _key_references_scope_nodes(k, tree_nodes)
         ]
         for k in closure_keys_to_remove:
             _scope_closures_cache.pop(k, None)
         cell_keys_to_remove = [
             k
             for k in _scope_cell_info_cache
-            if _key_references_scope_nodes(k, scope_nodes)
+            if _key_references_scope_nodes(k, tree_nodes)
         ]
         for k in cell_keys_to_remove:
             _scope_cell_info_cache.pop(k, None)

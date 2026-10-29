@@ -389,10 +389,15 @@ def _extract_closure_nonlocal_mutations_and_deletions_uncached(
     """
     # PEP 227 class scope isolation: class attributes do not intercept nonlocal bindings
     # in nested methods, allowing nested nonlocal mutations to pass through to enclosing functions.
+    # For function scopes, both local bindings and explicit global declarations act as a
+    # lexical barrier for nested nonlocal declarations.
     own_locals = (
         set()
         if isinstance(scope_node, ast.ClassDef)
-        else _extract_strict_fn_local_names(scope_node)
+        else (
+            _extract_strict_fn_local_names(scope_node)
+            | _extract_direct_nonlocals(scope_node, is_global=True)
+        )
     )
     direct_nonlocals: Set[str] = set()
     direct_mutated: Set[str] = set()
@@ -829,21 +834,37 @@ def _can_bind_in_fn_scope(
     return name not in fn_globals
 
 
-def _extract_root_target_names(target: ast.AST) -> Set[str]:
-    """Extracts root variable names written or mutated by an assignment target."""
+def _collect_target_names(target: ast.AST, *, mode: str) -> Set[str]:
+    """Collects target variable names for 'rebound', 'receiver', or 'mutated' mode."""
     names: Set[str] = set()
-    stack: List[ast.AST] = [target]
+    stack: List[Tuple[ast.AST, bool]] = [(target, mode == "receiver")]
     while stack:
-        curr = stack.pop()
+        curr, in_receiver = stack.pop()
         if isinstance(curr, ast.Name):
-            names.add(curr.id)
+            if in_receiver or mode == "rebound":
+                names.add(curr.id)
         elif isinstance(curr, (ast.Tuple, ast.List)):
-            stack.extend(curr.elts)
+            stack.extend((elt, in_receiver) for elt in curr.elts)
         elif isinstance(curr, ast.Starred):
-            stack.append(curr.value)
-        elif isinstance(curr, (ast.Attribute, ast.Subscript)):
-            stack.append(curr.value)
+            stack.append((curr.value, in_receiver))
+        elif isinstance(curr, (ast.Attribute, ast.Subscript)) and mode != "rebound":
+            stack.append((curr.value, True))
     return names
+
+
+def _extract_root_target_names(target: ast.AST) -> Set[str]:
+    """Extracts variable names actually bound or rebound by an assignment target."""
+    return _collect_target_names(target, mode="rebound")
+
+
+def _extract_receiver_root_names(node: ast.AST) -> Set[str]:
+    """Extracts root variable names from an attribute or subscript receiver chain."""
+    return _collect_target_names(node, mode="receiver")
+
+
+def _extract_mutated_target_names(target: ast.AST) -> Set[str]:
+    """Extracts variable names whose referenced objects are mutated by an assignment target."""
+    return _collect_target_names(target, mode="mutated")
 
 
 _NON_CLOSURE_RETURN_BUILTINS: frozenset[str] = frozenset(
@@ -882,6 +903,47 @@ _NON_CLOSURE_RETURN_BUILTINS: frozenset[str] = frozenset(
         "sum",
     }
 )
+
+
+def _is_non_closure_builtin_call(
+    node: ast.AST,
+    scope_ctx: Optional[_FnScopeContext] = None,
+) -> bool:
+    """Returns True if node is a Call to an unshadowed scalar/non-closure built-in."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in _NON_CLOSURE_RETURN_BUILTINS
+        and (
+            scope_ctx is None or node.func.id not in scope_ctx.shadowed_names
+        )
+    )
+
+
+def _is_non_closure_scalar_expr(
+    node: ast.AST,
+    scope_ctx: Optional[_FnScopeContext] = None,
+) -> bool:
+    """Returns True if node evaluates to a primitive scalar that cannot carry a closure."""
+    if isinstance(node, (ast.Constant, ast.JoinedStr, ast.Compare)):
+        return True
+    if _is_non_closure_builtin_call(node, scope_ctx):
+        return True
+    if isinstance(node, ast.UnaryOp):
+        return isinstance(node.op, ast.Not) or _is_non_closure_scalar_expr(
+            node.operand, scope_ctx
+        )
+    if isinstance(node, ast.BinOp):
+        left_scalar = _is_non_closure_scalar_expr(node.left, scope_ctx)
+        right_scalar = _is_non_closure_scalar_expr(node.right, scope_ctx)
+        if left_scalar and right_scalar:
+            return True
+        if not isinstance(node.op, ast.Mult) and (
+            _is_non_closure_builtin_call(node.left, scope_ctx)
+            or _is_non_closure_builtin_call(node.right, scope_ctx)
+        ):
+            return True
+    return False
 
 
 def _extract_expr_closure_and_load_info(
@@ -934,28 +996,24 @@ def _extract_expr_closure_and_load_info(
                     called_names_out.update(sub_calls - comp_targets)
             continue
         if isinstance(curr, ast.Call):
-            is_non_closure_builtin = (
-                isinstance(curr.func, ast.Name)
-                and curr.func.id in _NON_CLOSURE_RETURN_BUILTINS
-                and (
-                    scope_ctx is None
-                    or curr.func.id not in scope_ctx.shadowed_names
+            if _is_non_closure_builtin_call(curr, scope_ctx):
+                sub_reads, sub_muts, sub_loads = (
+                    _extract_expr_closure_and_load_info(
+                        [
+                            *curr.args,
+                            *(
+                                kw.value
+                                for kw in curr.keywords
+                                if kw.value is not None
+                            ),
+                        ],
+                        scope_ctx,
+                        called_names_out=called_names_out,
+                    )
                 )
-            )
-            if is_non_closure_builtin:
-                _, sub_muts, _ = _extract_expr_closure_and_load_info(
-                    [
-                        *curr.args,
-                        *(
-                            kw.value
-                            for kw in curr.keywords
-                            if kw.value is not None
-                        ),
-                    ],
-                    scope_ctx,
-                    called_names_out=called_names_out,
-                )
+                inline_reads.update(sub_reads)
                 inline_muts.update(sub_muts)
+                loaded_names.update(sub_loads)
                 continue
             if isinstance(curr.func, ast.Attribute):
                 stack.append(curr.func.value)
@@ -976,28 +1034,93 @@ def _extract_expr_closure_and_load_info(
     return inline_reads, inline_muts, loaded_names
 
 
-def _extract_closure_carrier_targets_and_values(
+def _extract_carrier_value_closure_and_load_info(
+    nodes: Sequence[ast.AST],
+    scope_ctx: Optional[_FnScopeContext] = None,
+    *,
+    called_names_out: Optional[Set[str]] = None,
+) -> Tuple[Set[str], Set[str], Set[str]]:
+    """Extracts closure reads, mutations, and loads for carrier value expressions."""
+    carrier_nodes: List[ast.AST] = []
+    scalar_nodes: List[ast.AST] = []
+    for node in nodes:
+        if _is_non_closure_scalar_expr(node, scope_ctx):
+            scalar_nodes.append(node)
+        else:
+            carrier_nodes.append(node)
+    c_reads, c_muts, c_loads = (
+        _extract_expr_closure_and_load_info(
+            carrier_nodes, scope_ctx, called_names_out=called_names_out
+        )
+        if carrier_nodes
+        else (set(), set(), set())
+    )
+    if scalar_nodes:
+        _, s_muts, _ = _extract_expr_closure_and_load_info(
+            scalar_nodes,
+            scope_ctx,
+            called_names_out=called_names_out,
+        )
+        c_muts.update(s_muts)
+    return c_reads, c_muts, c_loads
+
+
+def _extract_assignment_targets_and_value(
     node: ast.AST,
+    mode: str,
 ) -> Optional[Tuple[Set[str], Sequence[ast.AST]]]:
-    """Extracts (target_root_names, value_nodes) from assignments or mutating method calls."""
+    """Extracts (target_names, (value,)) from assignment nodes using the specified target mode."""
     if isinstance(node, ast.Assign) and node.value is not None:
         targets: Set[str] = set()
         for tgt in node.targets:
-            targets.update(_extract_root_target_names(tgt))
-        return targets, (node.value,)
+            targets.update(_collect_target_names(tgt, mode=mode))
+        return (targets, (node.value,)) if targets else None
     if (
         isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr))
         and node.value is not None
     ):
-        return _extract_root_target_names(node.target), (node.value,)
+        targets = _collect_target_names(node.target, mode=mode)
+        return (targets, (node.value,)) if targets else None
+    return None
+
+
+def _extract_closure_carrier_targets_and_values(
+    node: ast.AST,
+) -> Optional[Tuple[Set[str], Sequence[ast.AST]]]:
+    """Extracts (rebound_target_names, value_nodes) from variable-binding assignments."""
+    return _extract_assignment_targets_and_value(node, mode="rebound")
+
+
+def _extract_closure_carrier_mutation_targets_and_values(
+    node: ast.AST,
+) -> Optional[Tuple[Set[str], Sequence[ast.AST]]]:
+    """Extracts (mutated_object_root_names, value_nodes) from attribute/subscript/method mutations."""
+    assign_res = _extract_assignment_targets_and_value(node, mode="mutated")
+    if assign_res is not None:
+        return assign_res
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         val_nodes: Sequence[ast.AST] = [
             *node.args,
             *(kw.value for kw in node.keywords if kw.value is not None),
         ]
         if val_nodes:
-            return _extract_root_target_names(node.func.value), val_nodes
+            targets = _extract_receiver_root_names(node.func.value)
+            return (targets, val_nodes) if targets else None
     return None
+
+
+def _iter_carrier_target_entries(
+    node: ast.AST,
+) -> List[Tuple[bool, Set[str], Sequence[ast.AST]]]:
+    """Returns (is_rebound, target_names, value_nodes) entries for a carrier AST node."""
+    entries: List[Tuple[bool, Set[str], Sequence[ast.AST]]] = []
+    rebound = _extract_closure_carrier_targets_and_values(node)
+    if rebound is not None:
+        entries.append((True, rebound[0], rebound[1]))
+    mutated = _extract_closure_carrier_mutation_targets_and_values(node)
+    if mutated is not None:
+        entries.append((False, mutated[0], mutated[1]))
+    return entries
 
 
 def _extract_shallow_loads_and_calls(
@@ -1352,14 +1475,12 @@ def _is_closure_factory_scope_uncached(
                 if curr.generators:
                     stack.append(curr.generators[0].iter)
                 continue
-        carrier = _extract_closure_carrier_targets_and_values(curr)
-        if carrier is not None:
-            c_targets, c_values = carrier
+        for _is_reb, c_targets, c_values in _iter_carrier_target_entries(curr):
             local_tgts = c_targets & own_locals
             if local_tgts:
                 c_calls: Set[str] = set()
                 c_reads, c_muts, c_loads = (
-                    _extract_expr_closure_and_load_info(
+                    _extract_carrier_value_closure_and_load_info(
                         c_values, local_ctx, called_names_out=c_calls
                     )
                 )
@@ -1376,7 +1497,7 @@ def _is_closure_factory_scope_uncached(
         return False
     _propagate_local_closure_syms(local_closure_syms, local_edges)
     ret_calls: Set[str] = set()
-    r_reads, r_muts, r_loads = _extract_expr_closure_and_load_info(
+    r_reads, r_muts, r_loads = _extract_carrier_value_closure_and_load_info(
         ret_exprs, local_ctx, called_names_out=ret_calls
     )
     return bool(
@@ -1429,7 +1550,7 @@ def _extract_fn_returned_closure_refs_uncached(
     if not ret_exprs:
         return frozenset(), frozenset()
     ret_calls: Set[str] = set()
-    _, _, ret_loads = _extract_expr_closure_and_load_info(
+    _, _, ret_loads = _extract_carrier_value_closure_and_load_info(
         ret_exprs, scope_ctx, called_names_out=ret_calls
     )
     return frozenset(ret_loads - own_locals), frozenset(ret_calls - own_locals)
@@ -1539,26 +1660,21 @@ def _extract_fn_outer_carrier_targets_uncached(
             for expr in comp_exprs:
                 stack.append((expr, comp_locals, comp_nl, comp_g))
             continue
-        carrier = _extract_closure_carrier_targets_and_values(sub)
-        if carrier is not None:
-            c_targets, c_values = carrier
+        for is_rebound, c_targets, c_values in _iter_carrier_target_entries(sub):
             c_calls: Set[str] = set()
-            c_reads, c_muts, c_loads = _extract_expr_closure_and_load_info(
-                c_values, local_ctx, called_names_out=c_calls
+            c_reads, c_muts, c_loads = (
+                _extract_carrier_value_closure_and_load_info(
+                    c_values, local_ctx, called_names_out=c_calls
+                )
             )
             has_inline = bool(c_reads or c_muts)
             val_refs = c_loads | c_calls
-            store_names = (
-                set()
-                if isinstance(sub, ast.Call)
-                else _extract_store_names_in_node(sub)
-            )
             for t_name in c_targets:
                 if t_name in cur_g:
                     continue
                 is_outer_target = (
                     (t_name in cur_nl)
-                    if t_name in store_names
+                    if is_rebound
                     else (t_name not in cur_locals or t_name in cur_nl)
                 )
                 if is_outer_target:

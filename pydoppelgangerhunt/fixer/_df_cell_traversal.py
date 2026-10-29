@@ -29,12 +29,11 @@ from pydoppelgangerhunt.fixer._df_cell_carriers import (
     _block_contains_span,
     _can_bind_in_fn_scope,
     _extract_cached_scope_free_reads,
-    _extract_closure_carrier_targets_and_values,
+    _extract_carrier_value_closure_and_load_info,
     _extract_closure_nonlocal_mutations_and_deletions,
     _extract_comprehension_body_walrus_names,
     _extract_comprehension_deferred_closure_info,
     _extract_direct_nonlocals,
-    _extract_expr_closure_and_load_info,
     _extract_expr_scope_free_reads,
     _extract_fn_outer_carrier_targets,
     _extract_fn_returned_closure_refs,
@@ -45,6 +44,7 @@ from pydoppelgangerhunt.fixer._df_cell_carriers import (
     _is_node_inside_span,
     _is_pos_after_span,
     _is_pos_before_span,
+    _iter_carrier_target_entries,
     _iter_class_body_methods,
     _iter_comprehension_body_exprs_and_targets,
     _node_contains_or_encloses_span,
@@ -1166,43 +1166,41 @@ def _record_carrier_closures_and_aliases(
     excluded_names: AbstractSet[str] = frozenset(),
     fn_globals: AbstractSet[str] = frozenset(),
 ) -> None:
-    """Extracts inline closures and alias edges from assignment or mutating call nodes."""
-    carrier = _extract_closure_carrier_targets_and_values(curr)
-    if carrier is None:
-        return
-    c_targets, c_values = carrier
-    store_names = (
-        set()
-        if isinstance(curr, ast.Call)
-        else _extract_store_names_in_node(curr)
-    )
-    valid_targets = [
-        t
-        for t in c_targets
-        if t not in excluded_names
-        and (
-            _can_bind_in_fn_scope(t, frame.active_nonlocals, fn_globals)
-            if t in store_names
-            else t not in fn_globals
+    """Extracts inline closures and variable-rebinding alias edges from curr."""
+    for is_rebound, c_targets, c_values in _iter_carrier_target_entries(curr):
+        valid_targets = [
+            t
+            for t in c_targets
+            if t not in excluded_names
+            and (
+                _can_bind_in_fn_scope(t, frame.active_nonlocals, fn_globals)
+                if is_rebound
+                else t not in fn_globals
+            )
+        ]
+        if not valid_targets:
+            continue
+        c_calls: Set[str] = set()
+        c_reads, c_muts, c_loads = (
+            _extract_carrier_value_closure_and_load_info(
+                c_values, scope_ctx, called_names_out=c_calls
+            )
         )
-    ]
-    if not valid_targets:
-        return
-    c_calls: Set[str] = set()
-    c_reads, c_muts, c_loads = _extract_expr_closure_and_load_info(
-        c_values, scope_ctx, called_names_out=c_calls
-    )
-    if excluded_names:
-        c_reads -= set(excluded_names)
-        c_loads -= set(excluded_names)
-        c_calls -= set(excluded_names)
-    for t_name in valid_targets:
-        if c_reads or c_muts:
-            sibling_closures.append((t_name, set(c_reads), set(c_muts)))
-        if c_loads:
-            alias_edges.append((t_name, set(c_loads)))
-        if c_calls and call_edges is not None:
-            call_edges.append((t_name, set(c_calls)))
+        if excluded_names:
+            c_reads -= set(excluded_names)
+            c_loads -= set(excluded_names)
+            c_calls -= set(excluded_names)
+        edge_prefix = "" if is_rebound else "*"
+        record_edges = is_rebound or isinstance(curr, ast.Call)
+        for t_name in valid_targets:
+            if c_reads or c_muts:
+                sibling_closures.append((t_name, set(c_reads), set(c_muts)))
+            if record_edges:
+                edge_tgt = f"{edge_prefix}{t_name}"
+                if c_loads:
+                    alias_edges.append((edge_tgt, set(c_loads)))
+                if c_calls and call_edges is not None:
+                    call_edges.append((edge_tgt, set(c_calls)))
 
 
 def _record_simple_node_bindings_and_reads(
@@ -1731,8 +1729,8 @@ def _analyze_enclosing_fn_cells_uncached(
     closure_carrier_names: Set[str] = (
         {name for name, _, _ in bufs.sibling_closures if name is not None}
         | bufs.factory_names
-        | {t for t, _ in bufs.alias_edges}
-        | {t for t, _ in bufs.call_edges}
+        | {t.lstrip("*") for t, _ in bufs.alias_edges}
+        | {t.lstrip("*") for t, _ in bufs.call_edges}
     )
     for t_name, called_set in bufs.call_edges:
         alias_targets: Set[str] = set(called_set & bufs.factory_names)
@@ -1762,10 +1760,19 @@ def _analyze_enclosing_fn_cells_uncached(
         if alias_targets:
             bufs.alias_edges.append((t_name, alias_targets))
 
+    propagation_edges: List[Tuple[str, Set[str]]] = [
+        (t_name[1:] if t_name.startswith("*") else t_name, srcs)
+        for t_name, srcs in bufs.alias_edges
+    ]
+    rebound_alias_edges: List[Tuple[str, Set[str]]] = [
+        (t_name, srcs)
+        for t_name, srcs in bufs.alias_edges
+        if not t_name.startswith("*")
+    ]
     propagated_closures = _propagate_sibling_closures(
         bufs.sibling_closures,
         post_reads=bufs.state.post_reads,
-        alias_edges=bufs.alias_edges,
+        alias_edges=propagation_edges,
     )
     concurrent_sib_vars: Set[str] = set()
     for s_idx in bufs.concurrent_sib_indices:
@@ -1790,7 +1797,7 @@ def _analyze_enclosing_fn_cells_uncached(
         ),
         all_sibling_nonlocal_mutations=frozenset(all_sib_nl),
         alias_edges=tuple(
-            (t_name, frozenset(srcs)) for t_name, srcs in bufs.alias_edges
+            (t_name, frozenset(srcs)) for t_name, srcs in rebound_alias_edges
         ),
         pre_unbound=frozenset(bufs.state.pre_unbound),
         concurrent_sibling_vars=frozenset(concurrent_sib_vars),
