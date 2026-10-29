@@ -7,19 +7,21 @@ import builtins
 from typing import (
     AbstractSet,
     Any,
-    Dict,
     Iterable,
     List,
+    Mapping,
     NamedTuple,
     Optional,
     Set,
     Tuple,
     Union,
+    cast,
 )
 
 from pydoppelgangerhunt.fixer._df_cache import (
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
+    _scope_cell_info_cache,
     _scope_closures_cache,
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
@@ -28,11 +30,95 @@ from pydoppelgangerhunt.fixer._df_visitors import (
     _collect_func_params as _extract_arg_names,
     _extract_nested_scope_free_reads,
     _extract_pattern_bound_name,
+    _is_ast_node_within_unit_bounds,
     _record_import_names,
 )
 from pydoppelgangerhunt.parser import iter_nested_scope_header_nodes
 
 _BUILTIN_NAMES: Set[str] = set(dir(builtins))
+
+
+def _node_earliest_start_pos(
+    node: ast.AST,
+) -> Tuple[Optional[int], Optional[int]]:
+    """Computes the earliest (lineno, col_offset) of an AST node including decorators."""
+    n_line = getattr(node, "lineno", None)
+    n_col = getattr(node, "col_offset", None)
+    best_line: Optional[int] = n_line if isinstance(n_line, int) else None
+    best_col: Optional[int] = n_col if isinstance(n_col, int) else None
+    for dec in getattr(node, "decorator_list", ()):
+        d_line = getattr(dec, "lineno", None)
+        d_col = getattr(dec, "col_offset", None)
+        if isinstance(d_line, int):
+            if isinstance(d_col, int):
+                raw_at_col = max(0, d_col - 1)
+                at_col: Optional[int] = (
+                    n_col
+                    if isinstance(n_col, int) and n_col <= raw_at_col
+                    else raw_at_col
+                )
+            else:
+                at_col = best_col
+            if best_line is None or d_line < best_line:
+                best_line = d_line
+                best_col = at_col
+            elif (
+                d_line == best_line
+                and at_col is not None
+                and (best_col is None or at_col < best_col)
+            ):
+                best_col = at_col
+    return best_line, best_col
+
+
+def _node_strictly_encloses_bounds(
+    node: ast.AST,
+    u_start: int,
+    u_end: int,
+    u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
+) -> bool:
+    """Checks whether an AST node strictly encloses the 2D span [u_start, u_end]."""
+    c_line = getattr(node, "lineno", None)
+    c_end = getattr(node, "end_lineno", c_line)
+    if not (
+        isinstance(c_line, int)
+        and isinstance(c_end, int)
+        and c_line <= u_start
+        and u_end <= c_end
+    ):
+        return False
+
+    c_col = getattr(node, "col_offset", None)
+    c_end_col = getattr(node, "end_col_offset", None)
+
+    if c_line == u_start and u_start_col is not None:
+        if not isinstance(c_col, int) or c_col > u_start_col:
+            return False
+    if c_line == u_end and u_end_col is not None:
+        if not isinstance(c_col, int) or c_col >= u_end_col:
+            return False
+
+    if c_end == u_end and u_end_col is not None:
+        if not isinstance(c_end_col, int) or c_end_col < u_end_col:
+            return False
+    if c_end == u_start and u_start_col is not None:
+        if not isinstance(c_end_col, int) or c_end_col <= u_start_col:
+            return False
+
+    is_strictly_larger_start = (c_line < u_start) or (
+        c_line == u_start
+        and u_start_col is not None
+        and isinstance(c_col, int)
+        and c_col < u_start_col
+    )
+    is_strictly_larger_end = (c_end > u_end) or (
+        c_end == u_end
+        and u_end_col is not None
+        and isinstance(c_end_col, int)
+        and c_end_col > u_end_col
+    )
+    return is_strictly_larger_start or is_strictly_larger_end
 
 
 def _extract_node_type_param_names(node: ast.AST) -> Set[str]:
@@ -75,12 +161,27 @@ _INNER_SCOPE_TYPES = (
 )
 
 
-def _extract_comprehension_walrus_names(comp_node: ast.AST) -> Set[str]:
+def _extract_comprehension_walrus_names(
+    comp_node: ast.AST,
+    *,
+    include_first_iter: bool = True,
+) -> Set[str]:
     """Extracts walrus target names that bind to the enclosing scope per PEP 572."""
     walrus_names: Set[str] = set()
+    first_iter = (
+        comp_node.generators[0].iter
+        if (
+            not include_first_iter
+            and isinstance(comp_node, _COMPREHENSION_TYPES)
+            and comp_node.generators
+        )
+        else None
+    )
     node_stack = list(ast.iter_child_nodes(comp_node))
     while node_stack:
         curr = node_stack.pop()
+        if curr is first_iter:
+            continue
         if isinstance(
             curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
         ):
@@ -199,20 +300,49 @@ def _extract_single_node_local_names(
     return names - global_names
 
 
+def _extract_strict_fn_local_names(scope_node: ast.AST) -> Set[str]:
+    """Extracts strict function-local bindings excluding globals, nonlocals, and self-name."""
+    return _extract_single_node_local_names(
+        scope_node,
+        include_globals=False,
+        include_nonlocals=False,
+        include_self_name=False,
+        include_bare_annotations=True,
+    )
+
+
+def _get_cached_single_node_local_names(scope_node: ast.AST) -> frozenset[str]:
+    """Returns cached default single-node local names for persistent AST scope nodes."""
+    return cast(
+        frozenset[str],
+        _get_or_compute_scope_cached(
+            _scope_cell_info_cache,
+            (scope_node, "single_node_locals"),
+            lambda: frozenset(_extract_single_node_local_names(scope_node)),
+        ),
+    )
+
+
 def _extract_scope_local_names(
     scope_node: ast.AST,
     module_tree: Optional[ast.AST] = None,
     *,
     include_classes: bool = True,
     include_self_name: bool = True,
+    cache_scope_node: bool = True,
 ) -> Set[str]:
     """Extracts parameters and locally assigned/imported/defined symbols in scope_node
     and all enclosing scopes up to module level."""
-    names = (
-        _extract_single_node_local_names(scope_node)
-        if include_self_name
-        else _extract_single_node_local_names(scope_node, include_self_name=False)
-    )
+    if include_self_name and cache_scope_node:
+        names = set(_get_cached_single_node_local_names(scope_node))
+    else:
+        names = (
+            _extract_single_node_local_names(scope_node)
+            if include_self_name
+            else _extract_single_node_local_names(
+                scope_node, include_self_name=False
+            )
+        )
     allowed_types = (
         (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
         if include_classes
@@ -226,10 +356,10 @@ def _extract_scope_local_names(
             if curr is module_tree:
                 visited_module_tree = True
             if isinstance(curr, allowed_types):
-                names.update(_extract_single_node_local_names(curr))
+                names.update(_get_cached_single_node_local_names(curr))
             curr = parent_map.get(curr)
         if not visited_module_tree and isinstance(module_tree, allowed_types):
-            names.update(_extract_single_node_local_names(module_tree))
+            names.update(_get_cached_single_node_local_names(module_tree))
     return names
 
 
@@ -258,7 +388,7 @@ def _is_confirmed_str_receiver(
     return False
 
 
-def _node_has_star_import(root: ast.AST) -> bool:
+def _node_has_star_import_uncached(root: ast.AST) -> bool:
     """Checks whether an AST subtree contains a non-builtin wildcard star import."""
     return any(
         isinstance(node, ast.ImportFrom)
@@ -268,24 +398,40 @@ def _node_has_star_import(root: ast.AST) -> bool:
     )
 
 
+def _node_has_star_import(root: ast.AST, *, use_cache: bool = True) -> bool:
+    """Checks (with optional scope-cache memoization) whether root has a star import."""
+    if not use_cache:
+        return _node_has_star_import_uncached(root)
+    return bool(
+        _get_or_compute_scope_cached(
+            _scope_cell_info_cache,
+            (root, "has_star_import"),
+            lambda: _node_has_star_import_uncached(root),
+        )
+    )
+
+
 def _has_wildcard_star_import(
-    scope_node: ast.AST, module_tree: Optional[ast.AST] = None
-  ) -> bool:
+    scope_node: ast.AST,
+    module_tree: Optional[ast.AST] = None,
+    *,
+    cache_scope_node: bool = True,
+) -> bool:
     """Checks whether scope_node or any enclosing scope contains a wildcard star import."""
     if module_tree is not None:
-        if _node_has_star_import(module_tree):
+        if _node_has_star_import(module_tree, use_cache=True):
             return True
         if scope_node is not module_tree and scope_node not in _get_scope_parent_map(
             module_tree
         ):
-            return _node_has_star_import(scope_node)
+            return _node_has_star_import(scope_node, use_cache=cache_scope_node)
         return False
-    return _node_has_star_import(scope_node)
+    return _node_has_star_import(scope_node, use_cache=cache_scope_node)
 
 
 def _is_eagerly_consumed_genexp(
     genexp: ast.GeneratorExp,
-    parent_map: Dict[ast.AST, ast.AST],
+    parent_map: Mapping[ast.AST, ast.AST],
     shadowed_names: Optional[Set[str]] = None,
     has_star_import: bool = False,
 ) -> bool:
@@ -315,32 +461,31 @@ def _is_eagerly_consumed_genexp(
 def _collect_scope_closures_uncached(
     scope_node: ast.AST,
     module_tree: Optional[ast.AST] = None,
+    *,
+    genexp_include_header: bool = True,
+    cache_parent_map: bool = True,
 ) -> List[Tuple[_ClosurePos, Set[str]]]:
     closures: List[Tuple[_ClosurePos, Set[str]]] = []
-    parent_map = _get_scope_parent_map(scope_node)
-    shadowed_names = _extract_scope_local_names(scope_node, module_tree=module_tree)
-    has_star_import = _has_wildcard_star_import(scope_node, module_tree=module_tree)
+    use_parent_cache = cache_parent_map and not (
+        isinstance(scope_node, ast.Module)
+        and module_tree is not None
+        and scope_node is not module_tree
+    )
+    parent_map = _get_scope_parent_map(scope_node, use_cache=use_parent_cache)
+    shadowed_names = _extract_scope_local_names(
+        scope_node,
+        module_tree=module_tree,
+        cache_scope_node=use_parent_cache,
+    )
+    has_star_import = _has_wildcard_star_import(
+        scope_node,
+        module_tree=module_tree,
+        cache_scope_node=use_parent_cache,
+    )
 
     def _resolve_stmt_start_pos(s: ast.AST) -> Tuple[int, int]:
-        s_line = int(getattr(s, "lineno", 0) or 0)
-        s_col = int(getattr(s, "col_offset", 0) or 0)
-        decs = getattr(s, "decorator_list", [])
-        if decs:
-            dec_pos = []
-            for d in decs:
-                d_l = getattr(d, "lineno", None)
-                d_c = getattr(d, "col_offset", None)
-                dec_pos.append(
-                    (
-                        int(d_l) if d_l is not None else s_line,
-                        int(d_c) if d_c is not None else s_col,
-                    )
-                )
-            if dec_pos:
-                min_l, min_c = min(dec_pos, key=lambda p: (p[0], p[1]))
-                if min_l < s_line or (min_l == s_line and min_c < s_col):
-                    s_line, s_col = min_l, min_c
-        return s_line, s_col
+        estart, ecol = _node_earliest_start_pos(s)
+        return int(estart or 0), int(ecol or 0)
 
     class _ExprClosureCollector(_BaseScopeVisitor):
         def __init__(
@@ -402,7 +547,7 @@ def _collect_scope_closures_uncached(
             else:
                 if node.generators:
                     self.visit(node.generators[0].iter)
-                self._record_closure_node(node)
+                self._record_closure_node(node, include_header=genexp_include_header)
 
     def _record_expr_closures(
         nodes: Iterable[ast.AST],
@@ -614,3 +759,206 @@ def _collect_pre_unit_closures(
             else:
                 captured_reads.update(reads - _BUILTIN_NAMES)
     return captured_reads
+
+
+def _is_irrefutable_pattern(
+    pattern: Optional[ast.AST],
+) -> bool:  # pragma: no cover (py310+)
+    """Recursively determines if a pattern matching AST node unconditionally matches any subject."""
+    if pattern is None:
+        return False
+    if type(pattern).__name__ == "MatchAs":
+        sub_pat = getattr(pattern, "pattern", None)
+        return sub_pat is None or _is_irrefutable_pattern(sub_pat)
+    if type(pattern).__name__ == "MatchOr":
+        patterns = getattr(pattern, "patterns", [])
+        return any(_is_irrefutable_pattern(p) for p in patterns)
+    return False
+
+
+def _is_irrefutable_case(case: ast.AST) -> bool:  # pragma: no cover (py310+)
+    """Returns True if the match case has no guard and an irrefutable pattern."""
+    if getattr(case, "guard", None) is not None:
+        return False
+    return _is_irrefutable_pattern(getattr(case, "pattern", None))
+
+
+def _is_span_in_scope_header(
+    node: ast.AST,
+    u_start: int,
+    u_end: int,
+    u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
+) -> bool:
+    """Checks whether [u_start, u_end] precedes node.body[0] or lies inside node's header expressions."""
+    if any(
+        _is_ast_node_within_unit_bounds(
+            hdr,
+            u_start,
+            u_end,
+            u_end_col=u_end_col,
+            u_start_col=u_start_col,
+        )
+        or _node_strictly_encloses_bounds(
+            hdr,
+            u_start,
+            u_end,
+            u_start_col=u_start_col,
+            u_end_col=u_end_col,
+        )
+        for hdr in iter_nested_scope_header_nodes(node)
+    ):
+        return True
+    body = getattr(node, "body", None)
+    if body:
+        b_start, b_col = _node_earliest_start_pos(body[0])
+        n_lineno = int(getattr(node, "lineno", 0) or 0)
+        if b_start is not None and (
+            u_end < b_start
+            or (
+                u_start < b_start
+                and (
+                    u_start <= n_lineno
+                    or any(
+                        (getattr(h, "lineno", 0) or 0)
+                        <= u_start
+                        <= (getattr(h, "end_lineno", 0) or 0)
+                        for h in (
+                            *iter_nested_scope_header_nodes(node),
+                            *getattr(
+                                getattr(node, "args", None),
+                                "posonlyargs",
+                                (),
+                            ),
+                            *getattr(
+                                getattr(node, "args", None), "args", ()
+                            ),
+                            *getattr(
+                                getattr(node, "args", None),
+                                "kwonlyargs",
+                                (),
+                            ),
+                        )
+                    )
+                )
+            )
+            or (
+                u_start == b_start
+                and u_start_col is not None
+                and isinstance(b_col, int)
+                and u_start_col < b_col
+            )
+        ):
+            return True
+    return False
+
+
+def _resolve_immediate_scope_in_fn(
+    scope_node: ast.AST,
+    u_start: int,
+    u_end: int,
+    u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
+) -> ast.AST:
+    """Finds the innermost ClassDef in scope_node strictly enclosing the unit, or scope_node."""
+    if u_start <= 0:
+        return scope_node
+    best: ast.AST = scope_node
+    best_span: Optional[Tuple[int, int, int]] = None
+    stack: List[ast.AST] = list(getattr(scope_node, "body", []))
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, ast.ClassDef):
+            c_start = int(getattr(curr, "lineno", 0) or 0)
+            c_end = int(getattr(curr, "end_lineno", c_start) or c_start)
+            c_col = int(getattr(curr, "col_offset", 0) or 0)
+            in_hdr = _is_span_in_scope_header(
+                curr,
+                u_start,
+                u_end,
+                u_start_col=u_start_col,
+                u_end_col=u_end_col,
+            )
+            strictly_inside = not in_hdr and _node_strictly_encloses_bounds(
+                curr,
+                u_start,
+                u_end,
+                u_start_col=u_start_col,
+                u_end_col=u_end_col,
+            )
+            if strictly_inside:
+                cand_span = (c_start, -c_end, c_col)
+                if best_span is None or cand_span > best_span:
+                    best = curr
+                    best_span = cand_span
+                stack.extend(curr.body)
+            continue
+        if isinstance(curr, _INNER_SCOPE_TYPES):
+            continue
+        stack.extend(ast.iter_child_nodes(curr))
+    return best
+
+
+def _extract_scope_nonlocals_and_outer_globals(
+    scope_node: ast.AST,
+    u_start: int,
+    u_end: int,
+    u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
+) -> Tuple[Set[str], Set[str]]:
+    """Extracts (nonlocal_names, outer_only_globals) declared in the unit's immediate scope."""
+    if not isinstance(
+        scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    ):
+        return set(), set()
+    target_scope = _resolve_immediate_scope_in_fn(
+        scope_node,
+        u_start,
+        u_end,
+        u_start_col=u_start_col,
+        u_end_col=u_end_col,
+    )
+    nonlocal_names: Set[str] = set()
+    outer_globals: Set[str] = set()
+    intra_globals: Set[str] = set()
+    body = getattr(target_scope, "body", [])
+    stack: List[ast.AST] = list(body) if isinstance(body, list) else []
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, _INNER_SCOPE_TYPES):
+            continue
+        if isinstance(curr, ast.Nonlocal):
+            nonlocal_names.update(curr.names)
+            continue
+        if isinstance(curr, ast.Global):
+            if _is_ast_node_within_unit_bounds(
+                curr,
+                u_start,
+                u_end,
+                u_end_col=u_end_col,
+                u_start_col=u_start_col,
+            ):
+                intra_globals.update(curr.names)
+            else:
+                outer_globals.update(curr.names)
+            continue
+        stack.extend(ast.iter_child_nodes(curr))
+    return nonlocal_names, outer_globals - intra_globals
+
+
+def _extract_scope_escaping_bindings(
+    scope_node: ast.AST,
+    u_start: int,
+    u_end: int,
+    u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
+) -> Set[str]:
+    """Extracts nonlocal and outer global names declared in a function scope."""
+    nonlocal_names, outer_globals = _extract_scope_nonlocals_and_outer_globals(
+        scope_node,
+        u_start,
+        u_end,
+        u_start_col=u_start_col,
+        u_end_col=u_end_col,
+    )
+    return nonlocal_names | outer_globals

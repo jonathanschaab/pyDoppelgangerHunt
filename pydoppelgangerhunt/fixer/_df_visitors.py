@@ -127,11 +127,14 @@ class _BaseScopeVisitor(ast.NodeVisitor):
     def _visit_comprehension(
         self,
         node: Union[ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp],
+        *,
+        include_first_iter: bool = True,
     ) -> None:
         if not node.generators:
             return
         # First generator's iter evaluates in enclosing scope (class scope if in class body)
-        self.visit(node.generators[0].iter)
+        if include_first_iter:
+            self.visit(node.generators[0].iter)
         stored_before = set(self.stored)
         comp_set: Set[str] = set()
         self._comp_targets.append(comp_set)
@@ -152,6 +155,14 @@ class _BaseScopeVisitor(ast.NodeVisitor):
             self._in_comp_body -= 1
             self._comp_targets.pop()
             self.stored = stored_before
+
+    def visit_comp_expr(
+        self,
+        node: Union[ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp],
+        *,
+        include_first_iter: bool = True,
+    ) -> None:
+        self._visit_comprehension(node, include_first_iter=include_first_iter)
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
         self._visit_comprehension(node)
@@ -557,7 +568,14 @@ def _extract_type_alias_free_reads(node: ast.AST) -> Set[str]:
 
 def _extract_nested_scope_free_reads_with_nodes(
     node: Union[
-        ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.GeneratorExp
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.Lambda,
+        ast.ClassDef,
+        ast.ListComp,
+        ast.SetComp,
+        ast.DictComp,
+        ast.GeneratorExp,
     ],
     candidates: Optional[Set[str]] = None,
     *,
@@ -566,9 +584,17 @@ def _extract_nested_scope_free_reads_with_nodes(
     include_annotations: bool = True,
 ) -> Tuple[Set[str], List[ast.Name]]:
     """Extracts free variable references and their AST load nodes escaping a nested scope."""
-    if isinstance(node, ast.GeneratorExp):
+    if isinstance(
+        node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+    ):
         gen_visitor = _OuterExprVisitor()
-        gen_visitor.visit(node)
+        if include_header and not include_body:
+            if node.generators:
+                gen_visitor.visit(node.generators[0].iter)
+        elif include_body:
+            gen_visitor.visit_comp_expr(
+                node, include_first_iter=include_header
+            )
         res = (
             gen_visitor.names & candidates
             if candidates is not None
@@ -676,7 +702,14 @@ def _extract_nested_scope_free_reads_with_nodes(
 
 def _extract_nested_scope_free_reads(
     node: Union[
-        ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.GeneratorExp
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.Lambda,
+        ast.ClassDef,
+        ast.ListComp,
+        ast.SetComp,
+        ast.DictComp,
+        ast.GeneratorExp,
     ],
     candidates: Optional[Set[str]] = None,
     *,
@@ -719,12 +752,16 @@ def _is_ast_node_within_unit_bounds(
     node: ast.AST,
     u_start: int,
     u_end: int,
-    u_end_col: Optional[int],
+    u_end_col: Optional[int] = None,
     u_start_col: Optional[int] = None,
 ) -> bool:
     """Determines whether an AST node is positioned inside unit line and column bounds.
 
-    When u_end_col is None, falls back to whole-line containment on u_end.
+    Note:
+        Parameter order places ``u_end_col`` before ``u_start_col`` for historical
+        positional compatibility with ``_DownstreamReadVisitor(u_start, u_end, u_end_col)``.
+        Callers should pass ``u_end_col`` and ``u_start_col`` as keyword arguments.
+        When ``u_end_col`` is None, falls back to whole-line containment on ``u_end``.
     """
     lineno = getattr(node, "lineno", None)
     if lineno is None:
@@ -803,7 +840,11 @@ class _DownstreamReadVisitor(_BaseScopeVisitor):
 
     def _is_node_inside_unit(self, node: ast.AST) -> bool:
         return _is_ast_node_within_unit_bounds(
-            node, self.u_start, self.u_end, self.u_end_col, self.u_start_col
+            node,
+            self.u_start,
+            self.u_end,
+            u_end_col=self.u_end_col,
+            u_start_col=self.u_start_col,
         )
 
     def _is_loop_carried(self, node: ast.AST) -> bool:
@@ -1184,7 +1225,11 @@ class _StrictPostLineVisitor(_DownstreamReadVisitor):
 
     def _is_node_inside_unit(self, node: ast.AST) -> bool:
         return _is_ast_node_within_unit_bounds(
-            node, self.u_start, self.u_end, self.u_end_col, self.u_start_col
+            node,
+            self.u_start,
+            self.u_end,
+            u_end_col=self.u_end_col,
+            u_start_col=self.u_start_col,
         )
 
 
@@ -1229,7 +1274,11 @@ class _UnitLiveInVisitor(_BaseScopeVisitor):
 
     def _is_inside(self, node: ast.AST) -> bool:
         return _is_ast_node_within_unit_bounds(
-            node, self.u_start, self.u_end, self.u_end_col, self.u_start_col
+            node,
+            self.u_start,
+            self.u_end,
+            u_end_col=self.u_end_col,
+            u_start_col=self.u_start_col,
         )
 
     def _expand_deferred_callers(self, fn_name: str) -> Set[str]:

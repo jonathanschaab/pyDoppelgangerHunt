@@ -454,7 +454,7 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
                 if extracted:
                     if start_l == fn_node.lineno - line_offset:
                         b_col = getattr(first_body, "col_offset", 0)
-                        extracted[0] = extracted[0][b_col:]
+                        extracted[0] = _slice_utf8_line(extracted[0], b_col)
                     return [
                         ln.rstrip("\r\n")
                         for ln in split_source_lines(dedent_source_text("\n".join(extracted)))
@@ -550,6 +550,20 @@ def _extract_slice_col_offset(
     return default
 
 
+def _slice_utf8_line(
+    line: str, s_col: int, e_col: Optional[int] = None
+) -> str:
+    """Slices a single line by UTF-8 byte column offsets.
+
+    When e_col < s_col (inverted column bounds), intentionally falls back to
+    line[s_char:] rather than collapsing the line to empty.
+    """
+    s_char = col_offset_to_char_offset(line, s_col)
+    if e_col is not None and e_col >= s_col:
+        return line[s_char : col_offset_to_char_offset(line, e_col)]
+    return line[s_char:]
+
+
 def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]:
     """Slices source lines to the exact start_col and end_col offsets of the unit."""
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
@@ -564,12 +578,25 @@ def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]
         return lines
     s_col = s_col_opt
     res = list(lines)
+    # Guard against pre-sliced token lines whose length is already shorter than
+    # the original line's starting byte column offset.
+    first_byte_len = len(res[0].rstrip("\r\n").encode("utf-8"))
+    if s_col >= first_byte_len:
+        return res
+    src_code = unit.get("source_code")
+    if (
+        s_col > 0
+        and isinstance(src_code, str)
+        and src_code.strip()
+        and "".join(res).strip() == src_code.strip()
+    ):
+        return res
     if len(res) == 1:
-        res[0] = res[0][s_col:e_col] if (e_col is not None and e_col >= s_col) else res[0][s_col:]
+        res[0] = _slice_utf8_line(res[0], s_col, e_col)
     else:
-        res[0] = res[0][s_col:]
+        res[0] = _slice_utf8_line(res[0], s_col, None)
         if e_col is not None:
-            res[-1] = res[-1][:e_col]
+            res[-1] = _slice_utf8_line(res[-1], 0, e_col)
     return res
 
 

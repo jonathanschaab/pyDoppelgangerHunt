@@ -38,6 +38,7 @@ _scope_parent_maps: OrderedDict[ast.AST, Dict[ast.AST, ast.AST]] = OrderedDict()
 _scope_stmts_by_end: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
 _scope_stmts_by_start: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
 _scope_closures_cache: OrderedDict[Any, List[Tuple[Any, Set[str]]]] = OrderedDict()
+_scope_cell_info_cache: OrderedDict[Any, Any] = OrderedDict()
 _scope_loops_cache: OrderedDict[ast.AST, List[Tuple[int, int, int]]] = OrderedDict()
 _scope_try_with_cache: OrderedDict[ast.AST, List[ast.AST]] = OrderedDict()
 _warned_lenient_closure: List[bool] = [False]
@@ -52,14 +53,44 @@ _SCOPE_ROOT_TYPES: Tuple[type, ...] = (
 )
 
 
+def _key_references_scope_nodes(key: Any, tree_nodes: Set[ast.AST]) -> bool:
+    """Returns True if a cache key (including nested tuples/NamedTuples/frozensets) references tree_nodes.
+
+    Cache Key & Value Policy:
+    All composite keys in _scope_closures_cache and _scope_cell_info_cache must store
+    any AST node references either directly at the top level or inside nested tuple,
+    NamedTuple, or frozenset[ast.AST] containers (homogeneous frozensets of strings
+    such as shadowed_names or fn_globals are skipped in O(1)). Cached values must be
+    immutable (e.g., frozenset, tuple, NamedTuple, MappingProxyType, bool), protected
+    by _downstream_cache_lock on inner mutation (e.g., stmt_deltas), or returned via
+    defensive copies to callers.
+    """
+    if isinstance(key, ast.AST):
+        return key in tree_nodes
+    if not isinstance(key, (tuple, frozenset)):
+        return False
+    stack: List[Any] = [key]
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, frozenset):
+            first = next(iter(curr), None)
+            if not isinstance(first, (ast.AST, tuple, frozenset)):
+                continue
+        for elem in curr:
+            if isinstance(elem, ast.AST) and elem in tree_nodes:
+                return True
+            if isinstance(elem, (tuple, frozenset)):
+                stack.append(elem)
+    return False
+
+
 def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
     """Purges scope-cache entries belonging to an evicted AST tree."""
     if tree is None or not isinstance(tree, ast.AST):
         return
+    tree_nodes = set(ast.walk(tree))
     scope_nodes = {
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, _SCOPE_ROOT_TYPES)
+        node for node in tree_nodes if isinstance(node, _SCOPE_ROOT_TYPES)
     }
     scope_nodes.add(tree)
     with _downstream_cache_lock:
@@ -68,17 +99,23 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
             _scope_stmts_by_end.pop(node, None)
             _scope_stmts_by_start.pop(node, None)
             _scope_closures_cache.pop(node, None)
+            _scope_cell_info_cache.pop(node, None)
             _scope_loops_cache.pop(node, None)
             _scope_try_with_cache.pop(node, None)
         closure_keys_to_remove = [
             k
             for k in _scope_closures_cache
-            if isinstance(k, tuple)
-            and len(k) == 2
-            and (k[0] in scope_nodes or k[1] in scope_nodes)
+            if _key_references_scope_nodes(k, tree_nodes)
         ]
         for k in closure_keys_to_remove:
             _scope_closures_cache.pop(k, None)
+        cell_keys_to_remove = [
+            k
+            for k in _scope_cell_info_cache
+            if _key_references_scope_nodes(k, tree_nodes)
+        ]
+        for k in cell_keys_to_remove:
+            _scope_cell_info_cache.pop(k, None)
 
 
 def _store_lru_cache_entry(
@@ -208,7 +245,9 @@ def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
     return _extract_first_unit_coord(unit, ("end_col", "end_col_offset"))
 
 
-def _get_scope_parent_map(scope_node: ast.AST) -> Dict[ast.AST, ast.AST]:
+def _get_scope_parent_map(
+    scope_node: ast.AST, *, use_cache: bool = True
+) -> Dict[ast.AST, ast.AST]:
     """Retrieves or builds cached parent map for AST nodes within the scope."""
     def _compute() -> Dict[ast.AST, ast.AST]:
         parent_map: Dict[ast.AST, ast.AST] = {}
@@ -217,6 +256,8 @@ def _get_scope_parent_map(scope_node: ast.AST) -> Dict[ast.AST, ast.AST]:
                 parent_map[child] = parent
         return parent_map
 
+    if not use_cache:
+        return _compute()
     return _get_or_compute_scope_cached(_scope_parent_maps, scope_node, _compute)
 
 
@@ -384,6 +425,7 @@ def clear_dataflow_cache() -> None:
         _scope_stmts_by_end.clear()
         _scope_stmts_by_start.clear()
         _scope_closures_cache.clear()
+        _scope_cell_info_cache.clear()
         _scope_loops_cache.clear()
         _scope_try_with_cache.clear()
         _warned_lenient_closure[0] = False
