@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import ast
+from types import MappingProxyType
 from typing import (
     AbstractSet,
     Any,
     Dict,
     List,
+    Mapping,
     NamedTuple,
     Optional,
     Sequence,
@@ -35,7 +37,6 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _node_strictly_encloses_bounds,
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
-    _collect_func_params as _extract_arg_names,
     _extract_nested_scope_free_reads,
     _extract_pattern_bound_name,
     _is_ast_node_within_unit_bounds,
@@ -49,7 +50,7 @@ class _FnScopeContext(NamedTuple):
     """Cached per-function lexical scope metadata for eager generator expression checks."""
 
     fn_locals: frozenset[str]
-    parent_map: Dict[ast.AST, ast.AST]
+    parent_map: Mapping[ast.AST, ast.AST]
     shadowed_names: frozenset[str]
     has_star_import: bool
 
@@ -61,9 +62,12 @@ def _get_fn_scope_context_uncached(
     cache_parent_map: bool = True,
 ) -> _FnScopeContext:
     """Computes lexical scope metadata for a function or ephemeral unit module without caching."""
+    raw_parent_map = _get_scope_parent_map(
+        scope_node, use_cache=cache_parent_map
+    )
     return _FnScopeContext(
         fn_locals=frozenset(_extract_strict_fn_local_names(scope_node)),
-        parent_map=_get_scope_parent_map(scope_node, use_cache=cache_parent_map),
+        parent_map=MappingProxyType(raw_parent_map),
         shadowed_names=frozenset(
             _extract_scope_local_names(
                 scope_node,
@@ -867,6 +871,11 @@ def _extract_mutated_target_names(target: ast.AST) -> Set[str]:
     return _collect_target_names(target, mode="mutated")
 
 
+# Deliberate static-analysis heuristic: unshadowed calls to these built-in functions
+# are treated as returning primitive/non-closure values (even though custom user types
+# could theoretically override dunders such as __round__, __abs__, or __int__ to return
+# callables). Inline mutations inside their arguments are still tracked by
+# _extract_carrier_value_closure_and_load_info.
 _NON_CLOSURE_RETURN_BUILTINS: frozenset[str] = frozenset(
     {
         "abs",
@@ -924,7 +933,16 @@ def _is_non_closure_scalar_expr(
     node: ast.AST,
     scope_ctx: Optional[_FnScopeContext] = None,
 ) -> bool:
-    """Returns True if node evaluates to a primitive scalar that cannot carry a closure."""
+    """Returns True if node evaluates to a primitive scalar that cannot carry a closure.
+
+    Note:
+        This is a deliberate static-analysis heuristic: comparisons (``ast.Compare``),
+        unary operations, non-multiplying binary operations on scalar built-ins, and calls
+        to unshadowed ``_NON_CLOSURE_RETURN_BUILTINS`` are assumed not to return closures
+        (disregarding custom dunder overrides like ``__eq__`` or ``__add__`` that return
+        callables). Inline mutations inside scalar sub-expressions are still extracted by
+        ``_extract_carrier_value_closure_and_load_info``.
+    """
     if isinstance(node, (ast.Constant, ast.JoinedStr, ast.Compare)):
         return True
     if _is_non_closure_builtin_call(node, scope_ctx):
@@ -952,7 +970,14 @@ def _extract_expr_closure_and_load_info(
     *,
     called_names_out: Optional[Set[str]] = None,
 ) -> Tuple[Set[str], Set[str], Set[str]]:
-    """Extracts (inline_closure_reads, inline_closure_muts, loaded_names) from expressions."""
+    """Extracts (inline_closure_reads, inline_closure_muts, loaded_names) from expressions.
+
+    Note:
+        Direct ``ast.Name`` call targets (``curr.func`` when ``isinstance(curr.func, ast.Name)``
+        and ``curr`` is not an unshadowed scalar built-in call) are routed to
+        ``called_names_out`` (when provided) rather than ``loaded_names`` so callers can
+        distinguish direct function/factory invocations from closure value references.
+    """
     inline_reads: Set[str] = set()
     inline_muts: Set[str] = set()
     loaded_names: Set[str] = set()
@@ -1187,28 +1212,31 @@ def _collect_escaped_intra_unit_defs(
 ) -> Tuple[Set[str], Set[int]]:
     """Computes (escaped_names, escaped_def_node_ids) with lexical-scope definition tracking."""
     root_defs = _extract_shallow_defs(candidate_stmts)
-    root_env: Dict[str, Tuple[_NamedScopeNode, ...]] = {
-        name: tuple(nodes) for name, nodes in root_defs.items()
+    scope_cell_defs: Dict[Tuple[int, str], List[_NamedScopeNode]] = {
+        (0, name): list(nodes) for name, nodes in root_defs.items()
     }
+    root_origins: Dict[str, int] = {name: 0 for name in root_defs}
     all_def_nodes: List[_NamedScopeNode] = []
     defs_by_name: Dict[str, List[_NamedScopeNode]] = {}
     direct_children: Dict[int, List[_NamedScopeNode]] = {}
-    body_env: Dict[int, Dict[str, Tuple[_NamedScopeNode, ...]]] = {}
+    body_origins: Dict[int, Dict[str, int]] = {}
+    class_local_defs: Dict[int, Dict[str, Tuple[_NamedScopeNode, ...]]] = {}
+    global_defs_by_fn: Dict[int, List[Tuple[str, _NamedScopeNode]]] = {}
     shadowed_map: Dict[int, frozenset[str]] = {}
 
     scope_stack: List[
         Tuple[
             _NamedScopeNode,
-            Dict[str, Tuple[_NamedScopeNode, ...]],
+            Dict[str, int],
             frozenset[str],
         ]
     ] = [
-        (d_node, root_env, frozenset())
+        (d_node, root_origins, frozenset())
         for nodes in root_defs.values()
         for d_node in nodes
     ]
     while scope_stack:
-        d_node, parent_env, shadowed_from_root = scope_stack.pop()
+        d_node, parent_origins, shadowed_from_root = scope_stack.pop()
         nid = id(d_node)
         all_def_nodes.append(d_node)
         d_name = d_node.name
@@ -1218,13 +1246,15 @@ def _collect_escaped_intra_unit_defs(
         c_list = [n for nodes in c_defs.values() for n in nodes]
         direct_children[nid] = c_list
         if isinstance(d_node, ast.ClassDef):
-            body_env[nid] = {
-                **parent_env,
-                **{k: tuple(v) for k, v in c_defs.items()},
+            body_origins[nid] = dict(parent_origins)
+            class_local_defs[nid] = {
+                k: tuple(v) for k, v in c_defs.items()
             }
             shadowed_map[nid] = shadowed_from_root | frozenset(c_defs.keys())
             for c_node in c_list:
-                scope_stack.append((c_node, parent_env, shadowed_from_root))
+                scope_stack.append(
+                    (c_node, parent_origins, shadowed_from_root)
+                )
         else:
             own_locals = _extract_strict_fn_local_names(d_node)
             own_globals = _extract_direct_nonlocals(d_node, is_global=True)
@@ -1232,26 +1262,38 @@ def _collect_escaped_intra_unit_defs(
             fn_shadowed = shadowed_from_root | frozenset(
                 (own_locals | own_globals) - own_nonlocals
             )
-            cur_env: Dict[str, Tuple[_NamedScopeNode, ...]] = {
+            cur_origins: Dict[str, int] = {
                 k: v
-                for k, v in parent_env.items()
+                for k, v in parent_origins.items()
                 if k not in own_locals and k not in own_globals
             }
+            for loc_name in (own_locals - set(c_defs.keys())) - own_nonlocals - own_globals:
+                cur_origins[loc_name] = nid
+            for g_name in own_globals:
+                cur_origins[g_name] = 0
             for c_name, c_nodes in c_defs.items():
-                if c_name in own_nonlocals:
-                    cur_env[c_name] = parent_env.get(c_name, ()) + tuple(
+                if c_name in own_globals:
+                    cur_origins[c_name] = 0
+                    scope_cell_defs.setdefault((0, c_name), []).extend(c_nodes)
+                    for c_node in c_nodes:
+                        global_defs_by_fn.setdefault(nid, []).append(
+                            (c_name, c_node)
+                        )
+                elif c_name in own_nonlocals:
+                    target_origin = parent_origins.get(c_name, 0)
+                    cur_origins[c_name] = target_origin
+                    scope_cell_defs.setdefault(
+                        (target_origin, c_name), []
+                    ).extend(c_nodes)
+                else:
+                    cur_origins[c_name] = nid
+                    scope_cell_defs.setdefault((nid, c_name), []).extend(
                         c_nodes
                     )
-                    if c_name not in shadowed_from_root:
-                        root_env[c_name] = root_env.get(c_name, ()) + tuple(
-                            c_nodes
-                        )
-                else:
-                    cur_env[c_name] = tuple(c_nodes)
-            body_env[nid] = cur_env
+            body_origins[nid] = cur_origins
             shadowed_map[nid] = fn_shadowed
             for c_node in c_list:
-                scope_stack.append((c_node, cur_env, fn_shadowed))
+                scope_stack.append((c_node, cur_origins, fn_shadowed))
 
     top_loads, top_calls = _extract_shallow_loads_and_calls(candidate_stmts)
     escaped_top_names: Set[str] = set(initial_escaped) | top_loads
@@ -1260,11 +1302,11 @@ def _collect_escaped_intra_unit_defs(
     executed_def_ids: Set[int] = set()
 
     for name in escaped_top_names:
-        for d_node in root_env.get(name, ()):
+        for d_node in scope_cell_defs.get((0, name), ()):
             escaped_def_ids.add(id(d_node))
             executed_def_ids.add(id(d_node))
     for name in executed_top_names:
-        for d_node in root_env.get(name, ()):
+        for d_node in scope_cell_defs.get((0, name), ()):
             executed_def_ids.add(id(d_node))
     for nodes in root_defs.values():
         for d_node in nodes:
@@ -1281,6 +1323,17 @@ def _collect_escaped_intra_unit_defs(
             is_exec = is_esc or (nid in executed_def_ids)
             if not is_exec:
                 continue
+            for g_name, g_node in global_defs_by_fn.get(nid, ()):
+                gid = id(g_node)
+                if gid not in escaped_def_ids:
+                    escaped_def_ids.add(gid)
+                    changed = True
+                if gid not in executed_def_ids:
+                    executed_def_ids.add(gid)
+                    changed = True
+                if g_name not in escaped_top_names:
+                    escaped_top_names.add(g_name)
+                    changed = True
             for c_node in direct_children.get(nid, ()):
                 cid = id(c_node)
                 if isinstance(d_node, ast.ClassDef) and is_esc:
@@ -1295,7 +1348,8 @@ def _collect_escaped_intra_unit_defs(
             if nid not in body_info:
                 body_info[nid] = _extract_shallow_loads_and_calls(d_node.body)
             b_loads, b_calls = body_info[nid]
-            env = body_env[nid]
+            origins_here = body_origins[nid]
+            cls_defs_here = class_local_defs.get(nid, {})
             shadowed_here = shadowed_map[nid]
             for ref_name in b_loads | b_calls:
                 if (
@@ -1305,11 +1359,19 @@ def _collect_escaped_intra_unit_defs(
                 ):
                     escaped_top_names.add(ref_name)
                     changed = True
-                for target_node in env.get(ref_name, ()) + (
-                    root_env.get(ref_name, ())
-                    if ref_name not in shadowed_here
-                    else ()
-                ):
+                if ref_name in cls_defs_here:
+                    target_nodes: Sequence[_NamedScopeNode] = cls_defs_here[
+                        ref_name
+                    ]
+                else:
+                    origin_scope = origins_here.get(
+                        ref_name,
+                        0 if ref_name not in shadowed_here else -1,
+                    )
+                    target_nodes = scope_cell_defs.get(
+                        (origin_scope, ref_name), ()
+                    )
+                for target_node in target_nodes:
                     tid = id(target_node)
                     if (
                         is_esc or ref_name in b_loads
@@ -1406,6 +1468,11 @@ def _make_nested_fn_scope_context(
     scope_ctx: Optional[_FnScopeContext] = None,
 ) -> _FnScopeContext:
     """Builds a _FnScopeContext for analyzing expressions inside a nested function."""
+    parent_map: Mapping[ast.AST, ast.AST] = (
+        scope_ctx.parent_map
+        if scope_ctx is not None
+        else MappingProxyType(_get_scope_parent_map(fn_node))
+    )
     return _FnScopeContext(
         fn_locals=(
             (scope_ctx.fn_locals if scope_ctx is not None else frozenset())
@@ -1415,11 +1482,7 @@ def _make_nested_fn_scope_context(
             (scope_ctx.shadowed_names if scope_ctx is not None else frozenset())
             | own_locals
         ),
-        parent_map=(
-            scope_ctx.parent_map
-            if scope_ctx is not None
-            else _get_scope_parent_map(fn_node)
-        ),
+        parent_map=parent_map,
         has_star_import=(
             scope_ctx.has_star_import if scope_ctx is not None else False
         ),
@@ -1537,6 +1600,9 @@ def _extract_fn_returned_closure_refs_uncached(
 ) -> Tuple[frozenset[str], frozenset[str]]:
     """Computes (returned_loaded_names, returned_called_names) for fn_node without caching."""
     own_locals = _extract_strict_fn_local_names(fn_node)
+    local_ctx = _make_nested_fn_scope_context(
+        fn_node, frozenset(own_locals), scope_ctx
+    )
     ret_exprs: List[ast.AST] = []
     stack: List[ast.AST] = list(fn_node.body)
     while stack:
@@ -1551,7 +1617,7 @@ def _extract_fn_returned_closure_refs_uncached(
         return frozenset(), frozenset()
     ret_calls: Set[str] = set()
     _, _, ret_loads = _extract_carrier_value_closure_and_load_info(
-        ret_exprs, scope_ctx, called_names_out=ret_calls
+        ret_exprs, local_ctx, called_names_out=ret_calls
     )
     return frozenset(ret_loads - own_locals), frozenset(ret_calls - own_locals)
 
@@ -1631,10 +1697,8 @@ def _extract_fn_outer_carrier_targets_uncached(
                 else _extract_strict_fn_local_names(sub)
             )
             sub_nl = (
-                (sub_direct_nl & cur_nl)
-                | (sub_direct_nl - cur_locals)
-                | (cur_nl - (sub_own - sub_direct_nl) - sub_g)
-            )
+                (sub_direct_nl & cur_nl) | (sub_direct_nl - cur_locals)
+            ) - sub_g
             next_locals = (cur_locals | sub_own) - sub_g
             for ch in sub.body:
                 stack.append((ch, next_locals, sub_nl, sub_g))
@@ -1642,10 +1706,10 @@ def _extract_fn_outer_carrier_targets_uncached(
         if isinstance(sub, ast.Lambda):
             for hdr in iter_nested_scope_header_nodes(sub):
                 stack.append((hdr, cur_locals, cur_nl, cur_g))
-            lam_args = _extract_arg_names(sub.args)
-            lam_locals = cur_locals | lam_args
+            lam_bound = _extract_strict_fn_local_names(sub)
+            lam_locals = cur_locals | lam_bound
             stack.append(
-                (sub.body, lam_locals, cur_nl - lam_args, cur_g - lam_args)
+                (sub.body, lam_locals, cur_nl - lam_bound, cur_g - lam_bound)
             )
             continue
         if isinstance(sub, _COMPREHENSION_TYPES):

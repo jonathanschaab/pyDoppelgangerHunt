@@ -53,24 +53,31 @@ _SCOPE_ROOT_TYPES: Tuple[type, ...] = (
 )
 
 
-def _key_references_scope_nodes(key: Any, scope_nodes: Set[ast.AST]) -> bool:
-    """Returns True if a cache key (including nested tuples/NamedTuples/frozensets) references scope_nodes.
+def _key_references_scope_nodes(key: Any, tree_nodes: Set[ast.AST]) -> bool:
+    """Returns True if a cache key (including nested tuples/NamedTuples/frozensets) references tree_nodes.
 
     Cache Key & Value Policy:
     All composite keys in _scope_closures_cache and _scope_cell_info_cache must store
     any AST node references either directly at the top level or inside nested tuple,
-    NamedTuple, or frozenset containers. Cached values must be immutable (e.g.,
-    frozenset, tuple, NamedTuple, bool) or defensive copies must be returned to callers.
+    NamedTuple, or frozenset[ast.AST] containers (homogeneous frozensets of strings
+    such as shadowed_names or fn_globals are skipped in O(1)). Cached values must be
+    immutable (e.g., frozenset, tuple, NamedTuple, MappingProxyType, bool), protected
+    by _downstream_cache_lock on inner mutation (e.g., stmt_deltas), or returned via
+    defensive copies to callers.
     """
     if isinstance(key, ast.AST):
-        return key in scope_nodes
+        return key in tree_nodes
     if not isinstance(key, (tuple, frozenset)):
         return False
     stack: List[Any] = [key]
     while stack:
         curr = stack.pop()
+        if isinstance(curr, frozenset):
+            first = next(iter(curr), None)
+            if not isinstance(first, (ast.AST, tuple, frozenset)):
+                continue
         for elem in curr:
-            if isinstance(elem, ast.AST) and elem in scope_nodes:
+            if isinstance(elem, ast.AST) and elem in tree_nodes:
                 return True
             if isinstance(elem, (tuple, frozenset)):
                 stack.append(elem)
@@ -82,7 +89,6 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
     if tree is None or not isinstance(tree, ast.AST):
         return
     tree_nodes = set(ast.walk(tree))
-    tree_nodes.add(tree)
     scope_nodes = {
         node for node in tree_nodes if isinstance(node, _SCOPE_ROOT_TYPES)
     }

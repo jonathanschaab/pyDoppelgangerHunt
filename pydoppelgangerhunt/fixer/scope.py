@@ -1910,7 +1910,6 @@ def _unit_cols(
                 end_id = snippet[-1].isalnum() or snippet[-1] == "_"
                 search_idx = 0
                 exact_matches: List[Tuple[int, int]] = []
-                compat_matches: List[Tuple[int, int]] = []
                 while True:
                     pos = line0.find(snippet, search_idx)
                     if pos < 0:
@@ -1929,17 +1928,9 @@ def _unit_cols(
                             e_col is None or cand_e == e_col
                         ):
                             exact_matches.append((cand_s, cand_e))
-                        elif (s_col is None or cand_e > s_col) and (
-                            e_col is None or cand_s < e_col
-                        ):
-                            compat_matches.append((cand_s, cand_e))
                     search_idx = pos + 1
-                best_pair: Optional[Tuple[int, int]] = None
                 if len(exact_matches) == 1:
                     best_pair = exact_matches[0]
-                elif not exact_matches and len(compat_matches) == 1:
-                    best_pair = compat_matches[0]
-                if best_pair is not None:
                     if s_col is None:
                         s_col = best_pair[0]
                     if e_col is None:
@@ -2896,9 +2887,11 @@ def ensure_unit_scope_closure_mode(
     tree: Optional[ast.AST] = None,
     repo_root: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Returns scope if its closure strictness mode matches, else recomputes it."""
-    if scope is not None and scope_matches_closure_mode(
-        scope, bool(skip_pre_unit_closures)
+    """Returns scope if its closure strictness mode matches or is caller-supplied, else recomputes it."""
+    if scope is not None and (
+        scope_matches_closure_mode(scope, bool(skip_pre_unit_closures))
+        or "_skip_pre_unit_closures" not in scope
+        or "pathological_ast" in scope.get("control_flow_hazards", ())
     ):
         return scope
     u_copy = dict(unit)
@@ -3098,14 +3091,11 @@ def analyze_unit_variable_scope(
             )
         ),
         "deleted_names": deleted_names,
-        "_skip_pre_unit_closures": (
-            bool(info1.get("_skip_pre_unit_closures", False))
-            if (
-                u2 is None
-                or scope_matches_closure_mode(
-                    info2, bool(info1.get("_skip_pre_unit_closures", False))
-                )
-            )
-            else None
+        "_skip_pre_unit_closures": bool(
+            info1.get("_skip_pre_unit_closures", False)
+        )
+        and (
+            u2 is None
+            or bool(info2.get("_skip_pre_unit_closures", False))
         ),
     }

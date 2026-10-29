@@ -4806,6 +4806,42 @@ _CLOSURE_CELL_SCENARIOS = [
         },
         False,
     ),
+    (
+        "pos_complex_expr_walrus_mutating_outer_local_read_after_unit",
+        (
+            "def outer(a, b):\n"
+            "    acc = 0\n"
+            "    res = (acc := a + b) * 2\n"
+            "    return res + acc\n"
+        ),
+        {
+            "start": 3,
+            "end": 3,
+            "start_col": 10,
+            "end_col": 28,
+            "kind": "complex_expr",
+            "source_code": "(acc := a + b) * 2",
+        },
+        True,
+    ),
+    (
+        "neg_complex_expr_capturing_stable_outer_local",
+        (
+            "def outer(a, b):\n"
+            "    scale = 10\n"
+            "    fn_pair = (lambda x: x * scale, a + b)\n"
+            "    return fn_pair\n"
+        ),
+        {
+            "start": 3,
+            "end": 3,
+            "start_col": 14,
+            "end_col": 42,
+            "kind": "complex_expr",
+            "source_code": "(lambda x: x * scale, a + b)",
+        },
+        False,
+    ),
 ]
 
 
@@ -4820,19 +4856,24 @@ def test_severed_closure_cell_scenarios(
     unit_spec: dict[str, object],
     expect_hazard: bool,
 ) -> None:
-    """Verifies positive and negative severed_closure_cell scenarios individually."""
+    """Verifies positive/negative severed_closure_cell scenarios and lenient->strict monotonicity."""
     from pydoppelgangerhunt.fixer import inspect_single_unit_scope
 
     _ = scenario_id
+    parsed_tree = ast.parse(src)
     unit = dict(unit_spec)
     unit["source_text"] = src
-    scope = inspect_single_unit_scope(unit, tree=ast.parse(src))
+    scope = inspect_single_unit_scope(unit, tree=parsed_tree)
     if expect_hazard:
         assert "severed_closure_cell" in scope["control_flow_hazards"]
         assert scope["is_control_flow_safe"] is False
     else:
         assert "severed_closure_cell" not in scope["control_flow_hazards"]
-        assert scope["is_control_flow_safe"] is True
+
+    unit_lenient = dict(unit, skip_pre_unit_closures=True)
+    scope_lenient = inspect_single_unit_scope(unit_lenient, tree=parsed_tree)
+    if "severed_closure_cell" in scope_lenient["control_flow_hazards"]:
+        assert "severed_closure_cell" in scope["control_flow_hazards"]
 
 
 def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> None:
@@ -5450,15 +5491,19 @@ def test_closure_cell_binding_and_refactoring_integration(tmp_path: Path) -> Non
 
 def test_df_cell_hazards_numbered_checks_unit() -> None:
     """Directly tests each numbered check function (1&2, 3, 4) in _df_cell_hazards."""
-    from pydoppelgangerhunt.fixer._df_cell_hazards import (
-        _analyze_enclosing_fn_cells,
-        _check_captured_cell_mutations,
-        _check_intra_unit_nonlocal_mutators,
-        _check_sibling_closure_sharing,
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
         _collect_unit_nonlocal_mutators,
         _extract_closure_nonlocal_mutations,
         _extract_expr_scope_free_reads,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _check_captured_cell_mutations,
+        _check_intra_unit_nonlocal_mutators,
+        _check_sibling_closure_sharing,
         _find_enclosing_function_chain,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _analyze_enclosing_fn_cells,
     )
 
     # Check 1 & 2: _check_captured_cell_mutations
@@ -5652,7 +5697,7 @@ def test_df_cell_hazards_numbered_checks_unit() -> None:
     assert [getattr(fn, "name", None) for _, _, fn in chain_hdr] == ["outer"]
 
     # _node_earliest_start_pos and multiline decorator span_in_hdr tracking
-    from pydoppelgangerhunt.fixer._df_cell_hazards import _node_earliest_start_pos
+    from pydoppelgangerhunt.fixer._df_closures import _node_earliest_start_pos
 
     mdec_tree = ast.parse(
         "def outer(items, reg):\n"
@@ -5707,7 +5752,7 @@ def test_df_cell_hazards_numbered_checks_unit() -> None:
 def test_expr_traversal_subscript_compare_unary_fstring_and_ifexp() -> None:
     """Verifies _extract_expr_closure_and_load_info and hazard checks across nested expressions."""
     from pydoppelgangerhunt.fixer import inspect_single_unit_scope
-    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
         _extract_expr_closure_and_load_info,
     )
 
@@ -6008,7 +6053,7 @@ def test_differential_cell_mutations_vs_ordinary_bindings(tmp_path: Path) -> Non
 def test_nested_scope_reads_do_not_falsely_escape_mutator() -> None:
     """Verifies unexecuted or synchronous intra-unit references to a nonlocal mutator do not count as escaping."""
     from pydoppelgangerhunt.fixer import inspect_single_unit_scope
-    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
         _extract_shallow_loads_and_calls,
     )
 
@@ -6356,7 +6401,7 @@ def test_definite_bindings_exceptional_control_flow_table(
 ) -> None:
     """Table-driven verification of _extract_block_definite_bindings_and_term across exceptional paths."""
     import textwrap  # pylint: disable=import-outside-toplevel
-    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
         _analyze_enclosing_fn_cells,
         _extract_block_definite_bindings_and_term,
     )
@@ -6393,13 +6438,13 @@ def test_definite_bindings_exceptional_control_flow_table(
 
 def test_2d_coordinate_enclosure_and_decorator_start_pos() -> None:
     """Verifies 2D coordinate enclosure and decorator (line, col) coupling."""
-    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
         _SpanBounds,
-        _node_earliest_start_pos,
         _strictly_encloses_span,
     )
     from pydoppelgangerhunt.fixer._df_closures import (
         _collect_scope_closures,
+        _node_earliest_start_pos,
         _resolve_immediate_scope_in_fn,
     )
     from pydoppelgangerhunt.fixer.scope import _find_enclosing_pre_bound_names
@@ -6534,9 +6579,11 @@ def test_2d_coordinate_enclosure_and_decorator_start_pos() -> None:
 
 def test_duplicate_cols_decorator_snapping_and_cell_info_immutability() -> None:
     """Covers duplicate _unit_cols disambiguation, loose decorators, nonlocal shadowing, and immutable cache."""
-    from pydoppelgangerhunt.fixer._df_cell_hazards import (
-        _analyze_enclosing_fn_cells,
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
         _extract_fn_outer_carrier_targets,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _analyze_enclosing_fn_cells,
     )
     from pydoppelgangerhunt.fixer._df_closures import (
         _collect_scope_closures,
@@ -7832,10 +7879,11 @@ def test_utf8_column_slicing_finally_exits_and_except_handler_bindings(
 
 def test_same_stmt_evaluation_order_comp_walrus_and_decorator_alignment() -> None:
     """Verifies same-stmt RHS->LHS order (A), multiline ';' indent (B), comp walrus deferred reads (C), non-escaping nonlocal mutator (D), and decorator column snapping (E)."""
-    import ast
-    from pydoppelgangerhunt.fixer._df_cell_hazards import (
-        _analyze_enclosing_fn_cells,
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
         _extract_comprehension_deferred_closure_info,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _analyze_enclosing_fn_cells,
     )
     from pydoppelgangerhunt.fixer._df_closures import _node_earliest_start_pos
     from pydoppelgangerhunt.fixer.scope import (
@@ -8080,14 +8128,18 @@ def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
         _scope_cell_info_cache,
         clear_dataflow_cache,
     )
-    from pydoppelgangerhunt.fixer._df_cell_hazards import (
-        _SpanBounds,
-        _analyze_enclosing_fn_cells,
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
         _collect_escaped_intra_unit_defs,
         _collect_escaped_intra_unit_names,
-        _extract_block_definite_bindings_and_term,
-        _find_enclosing_function_chain,
         _get_fn_scope_context,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _find_enclosing_function_chain,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _SpanBounds,
+        _analyze_enclosing_fn_cells,
+        _extract_block_definite_bindings_and_term,
         _make_empty_traversal_buffers,
         _try_apply_cached_stmt_delta,
     )
@@ -9012,10 +9064,9 @@ def test_builtin_call_loads_target_rebinding_vs_mutation_and_hazard_matrix(
         _evict_tree_scopes,
         _scope_cell_info_cache,
     )
-    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
         _FnScopeContext,
         _SpanBounds,
-        _analyze_enclosing_fn_cells,
         _extract_cached_scope_free_reads,
         _extract_closure_carrier_mutation_targets_and_values,
         _extract_closure_carrier_targets_and_values,
@@ -9027,6 +9078,9 @@ def test_builtin_call_loads_target_rebinding_vs_mutation_and_hazard_matrix(
         _extract_root_target_names,
         _find_enclosing_function_chain,
         _resolve_unit_col_bounds,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _analyze_enclosing_fn_cells,
     )
 
     # 1. Built-in call handling preserves loaded_names, inline_reads, inline_muts, and called_names_out
@@ -9458,4 +9512,308 @@ def test_builtin_call_loads_target_rebinding_vs_mutation_and_hazard_matrix(
     b_r, a_r, snap_r = ns_ref["run_first"]([-1, 2, 4])
     assert (b_o, a_o, snap_o(), snap_o()) == (b_r, a_r, snap_r(), snap_r())
     assert a_r == [6, 12]
+
+
+@pytest.mark.parametrize(
+    "u_start_col,u_end_col,expected_in_bounds",
+    [
+        (None, None, [True, True, True]),
+        (4, 9, [True, False, False]),
+        (11, 20, [False, True, False]),
+        (22, 31, [False, False, True]),
+    ],
+)
+def test_is_ast_node_within_unit_bounds_and_visitors_column_filtering(
+    u_start_col: Optional[int],
+    u_end_col: Optional[int],
+    expected_in_bounds: list[bool],
+) -> None:
+    """Verifies _is_ast_node_within_unit_bounds, _UnitLiveInVisitor, and _DownstreamReadVisitor column bounds."""
+    from pydoppelgangerhunt.fixer._df_visitors import (
+        _DownstreamReadVisitor,
+        _UnitLiveInVisitor,
+        _is_ast_node_within_unit_bounds,
+    )
+
+    src = "def f(a, b, c):\n    x = a; y = x + b; z = y + c\n"
+    fn_node = ast.parse(src).body[0]
+    assert isinstance(fn_node, ast.FunctionDef)
+    stmts = fn_node.body
+    assert len(stmts) == 3
+
+    actual = [
+        _is_ast_node_within_unit_bounds(
+            s, 2, 2, u_end_col=u_end_col, u_start_col=u_start_col
+        )
+        for s in stmts
+    ]
+    assert actual == expected_in_bounds
+    assert _is_ast_node_within_unit_bounds(stmts[0], 2, 2) is True
+
+    # Middle statement on line 2: `y = x + b` (col 11..20)
+    s_mid = stmts[1]
+    mid_start = s_mid.col_offset
+    mid_end = s_mid.end_col_offset
+    live_in_vis = _UnitLiveInVisitor(
+        2, 2, u_end_col=mid_end, u_start_col=mid_start, scope_node=fn_node
+    )
+    live_in_vis.visit(fn_node)
+    assert live_in_vis.live_ins == {"x", "b"}
+
+    ds_vis = _DownstreamReadVisitor(
+        2, 2, u_end_col=mid_end, u_start_col=mid_start
+    )
+    for s in stmts:
+        ds_vis.visit(s)
+    assert "y" in ds_vis.loaded
+    assert "c" in ds_vis.loaded
+    assert "a" not in ds_vis.loaded
+
+
+def test_review_fixes_scope_preservation_carrier_shadowing_and_concurrency() -> None:
+    """Covers hand-built scope preservation, returned closure shadowing, escaped defs, and cache concurrency."""
+    import threading
+    import time
+    from types import MappingProxyType
+
+    from pydoppelgangerhunt.fixer import clear_dataflow_cache
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _evict_tree_scopes,
+        _scope_cell_info_cache,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _collect_escaped_intra_unit_defs,
+        _extract_fn_outer_carrier_targets,
+        _extract_fn_returned_closure_refs,
+        _get_fn_scope_context,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _analyze_enclosing_fn_cells,
+        _build_enclosing_chain_cell_infos,
+    )
+    from pydoppelgangerhunt.fixer.scope import (
+        _unit_cols,
+        ensure_unit_scope_closure_mode,
+    )
+
+    # 1. Hand-built scopes and pathological_ast fallback scopes are preserved by ensure_unit_scope_closure_mode
+    hand_built: dict[str, Any] = {
+        "inputs": ["custom_in"],
+        "outputs": ["custom_out"],
+        "stores": ["custom_out"],
+        "free_vars": ["custom_in"],
+        "nonlocals": [],
+        "globals": [],
+        "attrs_read": [],
+        "attrs_written": [],
+        "param_details": [],
+        "return_type": None,
+        "control_flow_hazards": [],
+        "is_control_flow_safe": True,
+        "has_yield": False,
+        "has_return": False,
+        "local_imports": [],
+        "yield_expr_names": [],
+    }
+    assert (
+        ensure_unit_scope_closure_mode({"start": 1, "end": 1}, hand_built, True)
+        is hand_built
+    )
+    pathological_scope: dict[str, Any] = {
+        **hand_built,
+        "_skip_pre_unit_closures": False,
+        "control_flow_hazards": ["pathological_ast"],
+        "is_control_flow_safe": False,
+    }
+    assert (
+        ensure_unit_scope_closure_mode(
+            {"start": 1, "end": 1}, pathological_scope, True
+        )
+        is pathological_scope
+    )
+    combined_scope = analyze_unit_variable_scope(
+        {"start": 1, "end": 1, "skip_pre_unit_closures": True},
+        {"start": 2, "end": 2, "skip_pre_unit_closures": False},
+        scope1={**hand_built, "_skip_pre_unit_closures": True},
+        scope2={**hand_built, "_skip_pre_unit_closures": False},
+    )
+    assert isinstance(combined_scope["_skip_pre_unit_closures"], bool)
+    assert combined_scope["_skip_pre_unit_closures"] is False
+
+    # 2. _FnScopeContext.parent_map is wrapped in immutable MappingProxyType
+    ctx_tree = ast.parse("def f(x):\n    return x + 1\n")
+    fn_ctx = _get_fn_scope_context(ctx_tree.body[0], mod_tree=ctx_tree)
+    assert isinstance(fn_ctx.parent_map, MappingProxyType)
+    with pytest.raises(TypeError):
+        fn_ctx.parent_map[ctx_tree] = ctx_tree  # type: ignore[index]
+
+    # 3. _extract_fn_returned_closure_refs respects local parameter shadowing built-in `len`
+    shad_ret_tree = ast.parse(
+        "def outer(cb):\n"
+        "    def helper(len):\n"
+        "        return len(cb)\n"
+        "    return helper\n"
+    )
+    outer_fn = shad_ret_tree.body[0]
+    assert isinstance(outer_fn, ast.FunctionDef)
+    helper_fn = outer_fn.body[0]
+    assert isinstance(helper_fn, ast.FunctionDef)
+    outer_ctx = _get_fn_scope_context(outer_fn, mod_tree=shad_ret_tree)
+    ret_loads, _ = _extract_fn_returned_closure_refs(helper_fn, outer_ctx)
+    assert "cb" in ret_loads
+
+    # 4. _collect_escaped_intra_unit_defs: sibling nonlocal rebind order-independence and global nested defs
+    order_a = ast.parse(
+        "def target():\n"
+        "    return 1\n"
+        "def caller():\n"
+        "    return target()\n"
+        "def rebinder():\n"
+        "    nonlocal target\n"
+        "    def target():\n"
+        "        return 2\n"
+        "    return target\n"
+        "caller()\n"
+        "rebinder()\n"
+    ).body
+    order_b = ast.parse(
+        "def target():\n"
+        "    return 1\n"
+        "def rebinder():\n"
+        "    nonlocal target\n"
+        "    def target():\n"
+        "        return 2\n"
+        "    return target\n"
+        "def caller():\n"
+        "    return target()\n"
+        "caller()\n"
+        "rebinder()\n"
+    ).body
+    names_a, ids_a = _collect_escaped_intra_unit_defs(order_a, frozenset())
+    names_b, ids_b = _collect_escaped_intra_unit_defs(order_b, frozenset())
+    assert names_a == names_b
+    assert "target" in names_a
+    assert len(ids_a) == len(ids_b) == 2
+
+    global_def_stmts = ast.parse(
+        "def builder():\n"
+        "    global exported_fn\n"
+        "    def exported_fn():\n"
+        "        return 42\n"
+        "builder()\n"
+    ).body
+    g_names, g_ids = _collect_escaped_intra_unit_defs(
+        global_def_stmts, frozenset()
+    )
+    assert "exported_fn" in g_names
+    assert len(g_ids) == 1
+
+    # 5. _extract_fn_outer_carrier_targets: class body attribute vs nonlocal & lambda walrus local
+    cls_carrier_tree = ast.parse(
+        "def outer():\n"
+        "    slot = None\n"
+        "    lam_slot = None\n"
+        "    def worker(y):\n"
+        "        nonlocal slot, lam_slot\n"
+        "        class LocalAttrOnly:\n"
+        "            slot = lambda: y\n"
+        "        f = lambda: (lam_slot := (lambda: y))\n"
+        "        return LocalAttrOnly, f\n"
+    )
+    worker_fn = cls_carrier_tree.body[0].body[2]  # type: ignore[attr-defined]
+    assert isinstance(worker_fn, ast.FunctionDef)
+    assert _extract_fn_outer_carrier_targets(worker_fn) == set()
+
+    cls_nl_tree = ast.parse(
+        "def outer():\n"
+        "    slot = None\n"
+        "    def worker(y):\n"
+        "        nonlocal slot\n"
+        "        class WithMethodNonlocal:\n"
+        "            def set_slot(self):\n"
+        "                nonlocal slot\n"
+        "                slot = lambda: y\n"
+        "        return WithMethodNonlocal\n"
+    )
+    worker_nl_fn = cls_nl_tree.body[0].body[1]  # type: ignore[attr-defined]
+    assert isinstance(worker_nl_fn, ast.FunctionDef)
+    assert _extract_fn_outer_carrier_targets(worker_nl_fn) == {"slot"}
+
+    # 6. _unit_cols requires exact match when one endpoint is already provided
+    line_dup = ["    x = foo(1); y = foo(1)\n"]
+    s_exact, e_exact = _unit_cols(
+        {"source_code": "foo(1)", "start_col": 8}, line_dup
+    )
+    assert (s_exact, e_exact) == (8, 14)
+
+    # 7. Eviction benchmark on 5,000 composite keys with 300-name frozensets
+    clear_dataflow_cache()
+    evict_tree = ast.parse("def target_fn(x):\n    return x + 1\n")
+    other_tree = ast.parse("def keep_fn(x):\n    return x + 2\n")
+    big_names = frozenset(f"var_name_{i}" for i in range(300))
+    for i in range(2500):
+        _scope_cell_info_cache[
+            (evict_tree.body[0], "outer_carriers", big_names, i)
+        ] = frozenset()
+        _scope_cell_info_cache[
+            (other_tree.body[0], "outer_carriers", big_names, i)
+        ] = frozenset()
+    t0 = time.perf_counter()
+    _evict_tree_scopes(evict_tree)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    assert elapsed_ms < 100.0
+    assert len(_scope_cell_info_cache) == 2500
+
+    # 8. Multi-threaded concurrency across _analyze_enclosing_fn_cells, _build_enclosing_chain_cell_infos, and eviction
+    clear_dataflow_cache()
+    conc_src = (
+        "def outer(items):\n"
+        "    scale = 2\n"
+        "    class Box:\n"
+        "        def compute(self, val):\n"
+        "            cb = lambda x: (x + scale + val)\n"
+        "            return [cb(i) for i in items]\n"
+        "    for k in items:\n"
+        "        tmp = k * scale\n"
+        "    return Box, tmp\n"
+    )
+    conc_tree = ast.parse(conc_src)
+    outer_c = conc_tree.body[0]
+    assert isinstance(outer_c, ast.FunctionDef)
+    box_c = outer_c.body[1]
+    assert isinstance(box_c, ast.ClassDef)
+    comp_c = box_c.body[0]
+    assert isinstance(comp_c, ast.FunctionDef)
+    chain = [(1, 9, outer_c), (4, 6, comp_c)]
+
+    def _worker(tid: int) -> bool:
+        for step in range(25):
+            infos = _build_enclosing_chain_cell_infos(
+                chain,
+                6,
+                6,
+                19,
+                41,
+                frozenset(),
+                mod_tree=conc_tree,
+            )
+            info_loop = _analyze_enclosing_fn_cells(
+                outer_c, (8, 8, 8, 23), mod_tree=conc_tree
+            )
+            if tid == 0 and step % 10 == 0:
+                _evict_tree_scopes(ast.parse("def ephemeral(): pass\n"))
+            if "scale" not in infos[0].pre_bound or "scale" not in info_loop.pre_bound:
+                return False
+        return True
+
+    results: list[bool] = [False] * 6
+    threads = [
+        threading.Thread(target=lambda idx=i: results.__setitem__(idx, _worker(idx)))
+        for i in range(6)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert all(results)
 

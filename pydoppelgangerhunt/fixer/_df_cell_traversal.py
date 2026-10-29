@@ -19,7 +19,9 @@ from typing import (
 )
 
 from pydoppelgangerhunt.fixer._df_cache import (
+    _downstream_cache_lock,
     _get_or_compute_scope_cached,
+    _get_scope_parent_map,
     _scope_cell_info_cache,
 )
 from pydoppelgangerhunt.fixer._df_cell_carriers import (
@@ -932,18 +934,20 @@ def _handle_nested_scope_node(
     c_col: Optional[int],
     span: _SpanBounds,
     frame: _StackFrame,
-    state: _CellBindingState,
-    sibling_closures: List[Tuple[Optional[str], Set[str], Set[str]]],
+    bufs: _CellTraversalBuffers,
     stack: List[_StackFrame],
-    scope_ctx: Optional[_FnScopeContext] = None,
-    factory_names: Optional[Set[str]] = None,
-    fn_return_refs: Optional[Dict[str, Tuple[Set[str], Set[str]]]] = None,
-    alias_edges: Optional[List[Tuple[str, Set[str]]]] = None,
-    call_edges: Optional[List[Tuple[str, Set[str]]]] = None,
-    sibling_nl_deletions: Optional[Set[str]] = None,
+    *,
     is_direct_span: bool = True,
 ) -> bool:
     """Processes nested function, class, lambda, or comprehension scopes during cell analysis."""
+    state = bufs.state
+    sibling_closures = bufs.sibling_closures
+    scope_ctx = bufs.scope_ctx
+    factory_names = bufs.factory_names
+    fn_return_refs = bufs.fn_return_refs
+    alias_edges = bufs.alias_edges
+    call_edges = bufs.call_edges
+    sibling_nl_deletions = bufs.sibling_nl_deletions
     if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         estart, ecol = _node_earliest_start_pos(curr)
         hdr_nodes = list(iter_nested_scope_header_nodes(curr))
@@ -1319,19 +1323,31 @@ def _make_empty_traversal_buffers(
 def _apply_stmt_cell_delta(
     bufs: _CellTraversalBuffers,
     delta: _StmtCellDelta,
+    *,
+    is_branched: bool = False,
+    in_loop: bool = False,
 ) -> None:
     """Applies a cached disjoint statement cell delta to traversal buffers."""
-    bufs.state.pre_bound.update(delta.pre_bound)
-    bufs.state.pre_unbound.difference_update(delta.pre_bound)
+    if not is_branched:
+        bufs.state.pre_bound.update(delta.pre_bound)
+        bufs.state.pre_unbound.difference_update(delta.pre_bound)
     bufs.state.pre_mutated.update(delta.pre_mutated)
     bufs.state.post_mutated.update(delta.post_mutated)
     bufs.state.post_reads.update(delta.post_reads)
     bufs.state.loop_mutated.update(delta.loop_mutated)
+    if in_loop:
+        bufs.state.loop_mutated.update(delta.pre_mutated)
+        bufs.state.loop_mutated.update(delta.post_mutated)
     base_sib_len = len(bufs.sibling_closures)
     for name, reads, muts in delta.sibling_closures:
         bufs.sibling_closures.append((name, set(reads), set(muts)))
-    for rel_idx in delta.concurrent_sib_offsets:
-        bufs.concurrent_sib_indices.add(base_sib_len + rel_idx)
+    if in_loop:
+        bufs.concurrent_sib_indices.update(
+            range(base_sib_len, len(bufs.sibling_closures))
+        )
+    else:
+        for rel_idx in delta.concurrent_sib_offsets:
+            bufs.concurrent_sib_indices.add(base_sib_len + rel_idx)
     for t_name, srcs in delta.alias_edges:
         bufs.alias_edges.append((t_name, set(srcs)))
     for t_name, calls in delta.call_edges:
@@ -1349,8 +1365,11 @@ def _try_apply_cached_stmt_delta(
     span: _SpanBounds,
     bufs: _CellTraversalBuffers,
     stmt_deltas: Dict[Tuple[ast.AST, bool], Optional[_StmtCellDelta]],
+    *,
+    is_branched: bool = False,
+    in_loop: bool = False,
 ) -> bool:
-    """Computes or applies a cached _StmtCellDelta for a disjoint top-level statement."""
+    """Computes or applies a cached _StmtCellDelta for a disjoint statement."""
     estart, ecol = _node_earliest_start_pos(stmt)
     c_end = getattr(stmt, "end_lineno", None)
     c_end_col = getattr(stmt, "end_col_offset", None)
@@ -1371,9 +1390,13 @@ def _try_apply_cached_stmt_delta(
     if not (is_before or is_after):
         return False
     key = (stmt, is_before)
-    if key not in stmt_deltas:
+    with _downstream_cache_lock:
+        has_key = key in stmt_deltas
+        delta = stmt_deltas.get(key) if has_key else None
+    if not has_key:
         if _extract_shallow_deleted_names(stmt):
-            stmt_deltas[key] = None
+            with _downstream_cache_lock:
+                stmt_deltas.setdefault(key, None)
             return False
         dummy_span = (
             _SpanBounds(c_end + 1, c_end + 1)
@@ -1388,7 +1411,7 @@ def _try_apply_cached_stmt_delta(
             dummy_span,
             sub_bufs,
         )
-        stmt_deltas[key] = _StmtCellDelta(
+        computed_delta = _StmtCellDelta(
             pre_bound=frozenset(sub_bufs.state.pre_bound),
             pre_mutated=frozenset(sub_bufs.state.pre_mutated),
             post_mutated=frozenset(sub_bufs.state.post_mutated),
@@ -1419,10 +1442,13 @@ def _try_apply_cached_stmt_delta(
             ),
             sibling_nl_deletions=frozenset(sub_bufs.sibling_nl_deletions),
         )
-    delta = stmt_deltas[key]
+        with _downstream_cache_lock:
+            delta = stmt_deltas.setdefault(key, computed_delta)
     if delta is None:
         return False
-    _apply_stmt_cell_delta(bufs, delta)
+    _apply_stmt_cell_delta(
+        bufs, delta, is_branched=is_branched, in_loop=in_loop
+    )
     return True
 
 
@@ -1455,12 +1481,17 @@ def _traverse_fn_cell_frames(
         if (
             stmt_deltas is not None
             and enclosed_fn is None
-            and not frame.is_branched
-            and not frame.in_loop
             and not frame.force_after_span
             and frame.active_nonlocals is None
             and isinstance(curr, ast.stmt)
-            and _try_apply_cached_stmt_delta(curr, span, bufs, stmt_deltas)
+            and _try_apply_cached_stmt_delta(
+                curr,
+                span,
+                bufs,
+                stmt_deltas,
+                is_branched=frame.is_branched,
+                in_loop=frame.in_loop,
+            )
         ):
             continue
 
@@ -1526,15 +1557,8 @@ def _traverse_fn_cell_frames(
             c_col,
             span,
             frame,
-            bufs.state,
-            bufs.sibling_closures,
+            bufs,
             stack,
-            bufs.scope_ctx,
-            bufs.factory_names,
-            bufs.fn_return_refs,
-            bufs.alias_edges,
-            bufs.call_edges,
-            bufs.sibling_nl_deletions,
             is_direct_span=enclosed_fn is None,
         ):
             if is_conc_pos:
@@ -1837,6 +1861,35 @@ def _analyze_enclosing_fn_cells(
     )
 
 
+def _find_enclosing_method_class_names(
+    fn_node: ast.AST,
+    enc_child: ast.AST,
+) -> frozenset[str]:
+    """Finds and caches class names in fn_node that directly define method enc_child."""
+    def _compute() -> frozenset[str]:
+        parent_map = _get_scope_parent_map(fn_node)
+        curr_p = parent_map.get(enc_child)
+        cls_names: Set[str] = set()
+        while curr_p is not None and curr_p is not fn_node:
+            if isinstance(curr_p, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                break
+            if isinstance(curr_p, ast.ClassDef):
+                if enc_child in _iter_class_body_methods(curr_p):
+                    cls_names.add(curr_p.name)
+                break
+            curr_p = parent_map.get(curr_p)
+        return frozenset(cls_names)
+
+    return cast(
+        frozenset[str],
+        _get_or_compute_scope_cached(
+            _scope_cell_info_cache,
+            (fn_node, "method_cls_names", enc_child),
+            _compute,
+        ),
+    )
+
+
 def _build_enclosing_chain_cell_infos(
     enclosing_chain: Sequence[Tuple[int, int, ast.AST]],
     u_start: int,
@@ -1887,12 +1940,9 @@ def _build_enclosing_chain_cell_infos(
             )
             if pos_args:
                 rec_param = pos_args[0].arg
-                enclosing_cls_names = {
-                    sub.name
-                    for sub in ast.walk(fn_node)
-                    if isinstance(sub, ast.ClassDef)
-                    and enc_child in _iter_class_body_methods(sub)
-                }
+                enclosing_cls_names = _find_enclosing_method_class_names(
+                    fn_node, enc_child
+                )
                 if enclosing_cls_names:
                     extra_sibs = tuple(
                         (rec_param, frozenset(s_reads), frozenset(s_muts))

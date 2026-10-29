@@ -752,12 +752,16 @@ def _is_ast_node_within_unit_bounds(
     node: ast.AST,
     u_start: int,
     u_end: int,
-    u_end_col: Optional[int],
+    u_end_col: Optional[int] = None,
     u_start_col: Optional[int] = None,
 ) -> bool:
     """Determines whether an AST node is positioned inside unit line and column bounds.
 
-    When u_end_col is None, falls back to whole-line containment on u_end.
+    Note:
+        Parameter order places ``u_end_col`` before ``u_start_col`` for historical
+        positional compatibility with ``_DownstreamReadVisitor(u_start, u_end, u_end_col)``.
+        Callers should pass ``u_end_col`` and ``u_start_col`` as keyword arguments.
+        When ``u_end_col`` is None, falls back to whole-line containment on ``u_end``.
     """
     lineno = getattr(node, "lineno", None)
     if lineno is None:

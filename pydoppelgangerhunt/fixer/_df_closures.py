@@ -7,9 +7,9 @@ import builtins
 from typing import (
     AbstractSet,
     Any,
-    Dict,
     Iterable,
     List,
+    Mapping,
     NamedTuple,
     Optional,
     Set,
@@ -431,7 +431,7 @@ def _has_wildcard_star_import(
 
 def _is_eagerly_consumed_genexp(
     genexp: ast.GeneratorExp,
-    parent_map: Dict[ast.AST, ast.AST],
+    parent_map: Mapping[ast.AST, ast.AST],
     shadowed_names: Optional[Set[str]] = None,
     has_star_import: bool = False,
 ) -> bool:

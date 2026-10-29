@@ -90,188 +90,34 @@ from typing import (
 )
 
 from pydoppelgangerhunt.fixer._df_cell_carriers import (
-    _NON_CLOSURE_RETURN_BUILTINS,
     _EnclosingFnCellInfo,
-    _FnScopeContext,
     _IntraUnitMutator,
-    _SpanBounds,
-    _block_contains_span,
-    _can_bind_in_fn_scope,
     _collect_escaped_intra_unit_defs,
-    _collect_escaped_intra_unit_names,
     _collect_unit_nonlocal_mutators,
-    _extract_cached_scope_free_reads,
-    _extract_carrier_value_closure_and_load_info,
-    _extract_closure_carrier_mutation_targets_and_values,
-    _extract_closure_carrier_targets_and_values,
-    _extract_closure_nonlocal_mutations,
-    _extract_closure_nonlocal_mutations_and_deletions,
-    _extract_closure_nonlocal_mutations_and_deletions_uncached,
-    _extract_comprehension_body_walrus_names,
-    _extract_comprehension_deferred_closure_info,
     _extract_direct_nonlocals,
-    _extract_expr_closure_and_load_info,
-    _extract_expr_scope_free_reads,
-    _extract_fn_outer_carrier_targets,
-    _extract_fn_outer_carrier_targets_uncached,
-    _extract_fn_returned_closure_refs,
-    _extract_fn_returned_closure_refs_uncached,
-    _extract_lazy_genexp_walrus_names,
-    _extract_mutated_target_names,
-    _extract_receiver_root_names,
-    _extract_root_target_names,
-    _extract_shallow_defs,
-    _extract_shallow_loads_and_calls,
-    _extract_store_names_in_node,
-    _extract_type_alias_or_pattern_name,
     _find_enclosing_function_chain,
-    _get_fn_scope_context,
-    _get_fn_scope_context_uncached,
-    _is_closure_factory_scope,
-    _is_closure_factory_scope_uncached,
-    _is_lazy_genexp,
-    _is_node_inside_span,
-    _is_pos_after_span,
-    _is_pos_before_span,
-    _iter_class_body_methods,
-    _iter_comprehension_body_exprs_and_targets,
-    _make_nested_fn_scope_context,
-    _node_contains_or_encloses_span,
-    _pick_inferred_col,
-    _propagate_local_closure_syms,
     _propagate_sibling_closures,
     _resolve_unit_col_bounds,
-    _stmt_dump_set,
-    _strictly_encloses_span,
 )
 from pydoppelgangerhunt.fixer._df_cell_traversal import (
-    _CellBindingState,
-    _CellTraversalBuffers,
-    _StackFrame,
-    _StmtCellDelta,
-    _analyze_enclosing_fn_cells,
-    _analyze_enclosing_fn_cells_uncached,
-    _apply_expr_definite_effects,
-    _apply_stmt_cell_delta,
     _build_enclosing_chain_cell_infos,
-    _eval_match_definite_bindings,
-    _eval_try_definite_bindings,
-    _extract_block_definite_bindings,
-    _extract_block_definite_bindings_and_term,
-    _extract_definite_target_names,
-    _extract_shallow_deleted_names,
-    _extract_unconditional_walrus_names,
     _find_enclosing_chain_definite_pre_bound,
-    _handle_nested_scope_node,
-    _is_frame_after_span,
-    _is_frame_before_span,
-    _make_empty_traversal_buffers,
-    _maybe_push_pre_span_exhaustive_frame,
-    _push_compound_children,
-    _push_seq,
-    _record_binding_at_pos,
-    _record_carrier_closures_and_aliases,
-    _record_deletion_at_pos,
-    _record_simple_node_bindings_and_reads,
-    _traverse_fn_cell_frames,
-    _try_apply_cached_stmt_delta,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
     _collect_scope_closures_uncached,
+    _extract_comprehension_walrus_names,
     _extract_scope_nonlocals_and_outer_globals,
-    _node_earliest_start_pos,
 )
 
 __all__ = [
-    "_CellBindingState",
-    "_CellTraversalBuffers",
-    "_EnclosingFnCellInfo",
-    "_FnScopeContext",
-    "_IntraUnitMutator",
-    "_NON_CLOSURE_RETURN_BUILTINS",
-    "_SpanBounds",
-    "_StackFrame",
-    "_StmtCellDelta",
     "_UnitClosureHazardContext",
-    "_analyze_enclosing_fn_cells",
-    "_analyze_enclosing_fn_cells_uncached",
-    "_apply_expr_definite_effects",
-    "_apply_stmt_cell_delta",
-    "_block_contains_span",
-    "_build_enclosing_chain_cell_infos",
-    "_can_bind_in_fn_scope",
     "_check_captured_cell_mutations",
     "_check_intra_unit_nonlocal_mutators",
     "_check_sibling_closure_sharing",
-    "_collect_escaped_intra_unit_defs",
-    "_collect_escaped_intra_unit_names",
-    "_collect_unit_nonlocal_mutators",
-    "_eval_match_definite_bindings",
-    "_eval_try_definite_bindings",
-    "_extract_block_definite_bindings",
-    "_extract_block_definite_bindings_and_term",
-    "_extract_cached_scope_free_reads",
-    "_extract_carrier_value_closure_and_load_info",
-    "_extract_closure_carrier_mutation_targets_and_values",
-    "_extract_closure_carrier_targets_and_values",
-    "_extract_closure_nonlocal_mutations",
-    "_extract_closure_nonlocal_mutations_and_deletions",
-    "_extract_closure_nonlocal_mutations_and_deletions_uncached",
-    "_extract_comprehension_body_walrus_names",
-    "_extract_comprehension_deferred_closure_info",
-    "_extract_definite_target_names",
-    "_extract_direct_nonlocals",
-    "_extract_expr_closure_and_load_info",
-    "_extract_expr_scope_free_reads",
-    "_extract_fn_outer_carrier_targets",
-    "_extract_fn_outer_carrier_targets_uncached",
-    "_extract_fn_returned_closure_refs",
-    "_extract_fn_returned_closure_refs_uncached",
-    "_extract_lazy_genexp_walrus_names",
-    "_extract_mutated_target_names",
-    "_extract_receiver_root_names",
-    "_extract_root_target_names",
-    "_extract_shallow_deleted_names",
-    "_extract_shallow_defs",
-    "_extract_shallow_loads_and_calls",
-    "_extract_store_names_in_node",
-    "_extract_type_alias_or_pattern_name",
-    "_extract_unconditional_walrus_names",
     "_find_enclosing_chain_definite_pre_bound",
     "_find_enclosing_function_chain",
-    "_get_fn_scope_context",
-    "_get_fn_scope_context_uncached",
-    "_handle_nested_scope_node",
     "_has_severed_closure_cell_hazard",
-    "_is_closure_factory_scope",
-    "_is_closure_factory_scope_uncached",
-    "_is_frame_after_span",
-    "_is_frame_before_span",
-    "_is_lazy_genexp",
-    "_is_node_inside_span",
-    "_is_pos_after_span",
-    "_is_pos_before_span",
-    "_iter_class_body_methods",
-    "_iter_comprehension_body_exprs_and_targets",
-    "_make_empty_traversal_buffers",
-    "_make_nested_fn_scope_context",
-    "_maybe_push_pre_span_exhaustive_frame",
-    "_node_contains_or_encloses_span",
-    "_node_earliest_start_pos",
-    "_pick_inferred_col",
-    "_propagate_local_closure_syms",
-    "_propagate_sibling_closures",
-    "_push_compound_children",
-    "_push_seq",
-    "_record_binding_at_pos",
-    "_record_carrier_closures_and_aliases",
-    "_record_deletion_at_pos",
-    "_record_simple_node_bindings_and_reads",
     "_resolve_unit_col_bounds",
-    "_stmt_dump_set",
-    "_strictly_encloses_span",
-    "_traverse_fn_cell_frames",
-    "_try_apply_cached_stmt_delta",
 ]
 
 
@@ -405,13 +251,9 @@ def _check_sibling_closure_sharing(
         & set(chain_infos[-1].concurrent_sibling_vars)
     ):
         return True
-    if (
-        unreturned_mutations
-        and skip_pre_unit_closures
-        and any(
-            bool(set(sub_mutated) & all_chain_locals & set(info.post_reads))
-            for info in chain_infos
-        )
+    if unreturned_mutations and any(
+        bool(set(sub_mutated) & all_chain_locals & set(info.post_reads))
+        for info in chain_infos
     ):
         return True
     unshadowed_sibs: List[
@@ -490,10 +332,17 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     """Detects whether extracting a unit to module scope would sever closure cell bindings.
 
     Note:
-        When ``ctx.skip_pre_unit_closures`` is True (lenient mode), only the speculative
-        ``is_suspended`` check for unreferenced concurrent pre-unit closures in Check 4 is
-        relaxed; Checks 1/2 (unbound or externally mutated captured cells) and Check 4 for
-        sibling closures explicitly referenced via ``eff_input_set`` remain enforced.
+        When ``ctx.skip_pre_unit_closures`` is True (lenient mode), speculative checks for
+        unreferenced sibling closures are relaxed in three places:
+        1. Unseeded conditional stores only check ``imm_sib_reads & imm_info.post_reads``
+           rather than all ``imm_sib_reads``.
+        2. The ``is_suspended`` check against ``concurrent_sibling_vars`` in Check 4 is
+           disabled.
+        3. Unreferenced sibling closures (``not is_ref_sib``) are skipped in Check 4 even
+           when ``unreturned_mutations`` is True.
+        Checks 1, 2, 3, post-unit reads of ``unreturned_mutations``, and Check 4 for
+        sibling closures explicitly referenced via ``eff_input_set`` remain enforced in
+        both modes, guaranteeing monotonicity (lenient hazard implies strict hazard).
     """
     if ctx.mod_tree is None or ctx.u_start <= 0:
         return False
@@ -522,12 +371,24 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     if not enclosing_chain:
         return False
 
-    is_expr_unit = ctx.unit_kind in ("comprehension", "complex_expr")
+    unit_mod = ast.Module(body=list(ctx.candidate_stmts), type_ignores=[])
+    is_expr_unit = (
+        ctx.unit_kind in ("comprehension", "complex_expr")
+        and not ctx.is_subroutine
+    )
     expr_unit_stores_escape = ctx.is_subroutine or is_expr_unit
     store_set = set(ctx.stores)
     output_set = set(ctx.outputs)
     nonlocal_set = set(ctx.nonlocals)
     unit_mutated_names = store_set | set(ctx.deleted_names)
+    expr_escaped_mutations = (
+        (
+            _extract_comprehension_walrus_names(unit_mod)
+            | (nonlocal_set & unit_mutated_names)
+        )
+        if is_expr_unit
+        else unit_mutated_names
+    )
     if not expr_unit_stores_escape and bool(nonlocal_set & unit_mutated_names):
         return True
 
@@ -540,7 +401,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     )
     enc_escaping = enc_nonlocals | enc_outer_globals
     if expr_unit_stores_escape and bool(
-        unit_mutated_names
+        expr_escaped_mutations
         & (enc_outer_globals if ctx.is_subroutine else enc_escaping)
     ):
         return True
@@ -554,7 +415,6 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         ):
             return True
 
-    unit_mod = ast.Module(body=list(ctx.candidate_stmts), type_ignores=[])
     if ctx.is_subroutine and _extract_direct_nonlocals(unit_mod):
         return True
     unit_closures = _collect_scope_closures_uncached(
@@ -589,7 +449,11 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         )
     ):
         return True
-    unit_mutations = unit_mutated_names if expr_unit_stores_escape else set()
+    unit_mutations = (
+        (expr_escaped_mutations | (unit_mutated_names & unit_closure_reads))
+        if expr_unit_stores_escape
+        else set()
+    )
 
     if (
         not intra_closure_reads
@@ -651,7 +515,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         | ((store_set | output_set) if expr_unit_stores_escape else set())
     )
     sub_mutated = (
-        unit_mutated_names
+        expr_escaped_mutations
         if expr_unit_stores_escape
         else (nonlocal_set & unit_mutated_names)
     )
