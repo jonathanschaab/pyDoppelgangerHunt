@@ -39,7 +39,7 @@ _scope_stmts_by_end: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDi
 _scope_stmts_by_start: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
 _scope_closures_cache: OrderedDict[Any, List[Tuple[Any, Set[str]]]] = OrderedDict()
 _scope_cell_info_cache: OrderedDict[Any, Any] = OrderedDict()
-_scope_loops_cache: OrderedDict[ast.AST, Tuple[Tuple[int, int, int], ...]] = OrderedDict()
+_scope_loops_cache: OrderedDict[ast.AST, List[Tuple[int, int, int]]] = OrderedDict()
 _scope_try_with_cache: OrderedDict[ast.AST, List[ast.AST]] = OrderedDict()
 _warned_lenient_closure: List[bool] = [False]
 
