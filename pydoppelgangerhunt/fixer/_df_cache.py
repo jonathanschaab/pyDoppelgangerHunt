@@ -62,7 +62,11 @@ class _ScopeCacheKey(NamedTuple):
     aux_ast_nodes: Tuple[ast.AST, ...] = ()
 
 
-def _key_references_scope_nodes(key: Any, tree_nodes: Set[ast.AST]) -> bool:
+def _key_references_scope_nodes(
+    key: Any,
+    tree_nodes: Set[ast.AST],
+    safe_containers: Optional[Set[int]] = None,
+) -> bool:
     """Returns True if a cache key references any AST node in tree_nodes.
 
     Cache Key & Value Policy:
@@ -83,7 +87,10 @@ def _key_references_scope_nodes(key: Any, tree_nodes: Set[ast.AST]) -> bool:
         return key in tree_nodes
     if not isinstance(key, (tuple, frozenset)):
         return False
+    if safe_containers is not None and id(key) in safe_containers:
+        return False
     stack: List[Any] = [key]
+    checked_ids: List[int] = [id(key)]
     while stack:
         curr = stack.pop()
         if isinstance(curr, _ScopeCacheKey):
@@ -92,11 +99,18 @@ def _key_references_scope_nodes(key: Any, tree_nodes: Set[ast.AST]) -> bool:
             ):
                 return True
             continue
+        if isinstance(curr, frozenset) and not curr.isdisjoint(tree_nodes):
+            return True
         for elem in curr:
             if isinstance(elem, ast.AST) and elem in tree_nodes:
                 return True
             if isinstance(elem, (tuple, frozenset)):
-                stack.append(elem)
+                elem_id = id(elem)
+                if safe_containers is None or elem_id not in safe_containers:
+                    checked_ids.append(elem_id)
+                    stack.append(elem)
+    if safe_containers is not None:
+        safe_containers.update(checked_ids)
     return False
 
 
@@ -109,6 +123,7 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
         node for node in tree_nodes if isinstance(node, _SCOPE_ROOT_TYPES)
     }
     scope_nodes.add(tree)
+    safe_containers: Set[int] = set()
     with _downstream_cache_lock:
         for node in scope_nodes:
             _scope_parent_maps.pop(node, None)
@@ -121,14 +136,14 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
         closure_keys_to_remove = [
             k
             for k in _scope_closures_cache
-            if _key_references_scope_nodes(k, tree_nodes)
+            if _key_references_scope_nodes(k, tree_nodes, safe_containers)
         ]
         for k in closure_keys_to_remove:
             _scope_closures_cache.pop(k, None)
         cell_keys_to_remove = [
             k
             for k in _scope_cell_info_cache
-            if _key_references_scope_nodes(k, tree_nodes)
+            if _key_references_scope_nodes(k, tree_nodes, safe_containers)
         ]
         for k in cell_keys_to_remove:
             _scope_cell_info_cache.pop(k, None)
