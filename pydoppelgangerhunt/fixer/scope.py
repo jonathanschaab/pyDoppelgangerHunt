@@ -24,6 +24,7 @@ from pydoppelgangerhunt.fixer._df_cell_hazards import (
     _UnitClosureHazardContext,
     _find_enclosing_chain_definite_pre_bound,
     _find_enclosing_function_chain,
+    _has_invalid_lexical_scope_declarations,
     _has_severed_closure_cell_hazard,
     _resolve_unit_col_bounds,
 )
@@ -2067,6 +2068,14 @@ def _inspect_unit_scope(
                 raw_lines[-1] = _slice_utf8_line(
                     raw_lines[-1], 0, inferred_e_col
                 )
+    if (
+        src_code_str
+        and inferred_s_col is None
+        and inferred_e_col is None
+        and dedent_source_text("".join(raw_lines)).strip()
+        != dedent_source_text(str(unit["source_code"])).strip()
+    ):
+        raw_lines = split_source_lines(str(unit["source_code"]))
     dedented = dedent_source_text("".join(raw_lines))
     empty_res: Dict[str, Any] = {
         "inputs": [],
@@ -2652,50 +2661,80 @@ def _inspect_unit_scope(
         ):
             hazards.append("deleted_output")
 
+        lex_stmts: Sequence[ast.stmt] = (
+            tree.body
+            if isinstance(tree, ast.Module)
+            and len(tree.body) == 1
+            and isinstance(
+                tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)
+            )
+            and getattr(tree.body[0], "name", None) != _SYNTHETIC_WRAPPER_NAME
+            else candidate_stmts
+        )
+        c_u_start = parse_unit_coord(unit, "start", default=0)
+        c_u_end = parse_unit_coord(unit, "end", default=c_u_start)
+        c_mod_tree = file_tree
+        if c_mod_tree is None and c_u_start > 0:
+            full_src = _get_full_source()
+            if full_src:
+                c_mod_tree = _get_or_parse_tree(full_src)
+        lex_enc_chain = (
+            _find_enclosing_function_chain(
+                c_mod_tree,
+                c_u_start,
+                c_u_end,
+                resolved_s_col,
+                resolved_e_col,
+            )
+            if c_mod_tree is not None and c_u_start > 0
+            else ()
+        )
+        if (
+            "severed_closure_cell" not in hazards
+            and _has_invalid_lexical_scope_declarations(
+                lex_stmts,
+                enclosing_chain=lex_enc_chain,
+                mod_tree=c_mod_tree,
+            )
+        ):
+            hazards.append("severed_closure_cell")
+
         if is_subroutine or unit.get("kind") in (
             "closure",
             "comprehension",
             "complex_expr",
         ):
-            c_u_start = parse_unit_coord(unit, "start", default=0)
-            c_u_end = parse_unit_coord(unit, "end", default=c_u_start)
-            if c_u_start > 0:
-                c_mod_tree = file_tree
-                if c_mod_tree is None:
-                    full_src = _get_full_source()
-                    if full_src:
-                        c_mod_tree = _get_or_parse_tree(full_src)
-                if c_mod_tree is not None:
-                    if (
-                        "severed_closure_cell" not in hazards
-                        and _has_severed_closure_cell_hazard(
-                            _UnitClosureHazardContext(
-                                candidate_stmts=candidate_stmts,
-                                mod_tree=c_mod_tree,
-                                u_start=c_u_start,
-                                u_end=c_u_end,
-                                u_start_col=resolved_s_col,
-                                u_end_col=resolved_e_col,
-                                is_subroutine=is_subroutine,
-                                unit_kind=str(unit.get("kind") or ""),
-                                inputs=inputs,
-                                outputs=outputs,
-                                stores=visitor.stores,
-                                deleted_names=all_deleted,
-                                unit_top_locals=visitor.unit_top_locals,
-                                free_vars=free_vars,
-                                nonlocals=visitor.nonlocals,
-                                has_yield=visitor.has_yield,
-                                is_async=visitor.is_async,
-                                skip_pre_unit_closures=bool(
-                                    unit.get("skip_pre_unit_closures")
-                                ),
-                                definite_stores=def_assigned,
-                                cols_resolved=cols_resolved,
-                            )
+            if c_u_start > 0 and c_mod_tree is not None:
+                if (
+                    "severed_closure_cell" not in hazards
+                    and _has_severed_closure_cell_hazard(
+                        _UnitClosureHazardContext(
+                            candidate_stmts=candidate_stmts,
+                            mod_tree=c_mod_tree,
+                            u_start=c_u_start,
+                            u_end=c_u_end,
+                            u_start_col=resolved_s_col,
+                            u_end_col=resolved_e_col,
+                            is_subroutine=is_subroutine,
+                            unit_kind=str(unit.get("kind") or ""),
+                            inputs=inputs,
+                            outputs=outputs,
+                            stores=visitor.stores,
+                            deleted_names=all_deleted,
+                            unit_top_locals=visitor.unit_top_locals,
+                            free_vars=free_vars,
+                            nonlocals=visitor.nonlocals,
+                            has_yield=visitor.has_yield,
+                            is_async=visitor.is_async,
+                            skip_pre_unit_closures=bool(
+                                unit.get("skip_pre_unit_closures")
+                            ),
+                            definite_stores=def_assigned,
+                            cols_resolved=cols_resolved,
                         )
-                    ):
-                        hazards.append("severed_closure_cell")
+                    )
+                ):
+                    hazards.append("severed_closure_cell")
 
         is_control_flow_safe = not any(
             h

@@ -444,6 +444,17 @@ def resolve_clone_generator_subroutine_outputs(
 
     outs1 = _extract_effective_unit_outputs(u1, scope1)
     outs2 = _extract_effective_unit_outputs(u2, scope2)
+    if bool(set(outs1) & set(scope1.get("deleted_names", []))) or bool(
+        set(outs2) & set(scope2.get("deleted_names", []))
+    ):
+        logger.debug(
+            "Rejecting generator subroutine pair: deleted output hazard"
+        )
+        return (
+            CloneOutputResolution(None, "deleted output hazard")
+            if return_details
+            else None
+        )
 
     u1_cond = set(scope1.get("conditional_outputs", [])) | set(
         scope1.get("deleted_names", [])
@@ -696,17 +707,6 @@ def resolve_clone_pair_outputs(
             else None
         )
 
-    if scope1.get("outputs_ambiguous") or scope2.get("outputs_ambiguous"):
-        logger.debug(
-            "Rejecting clone pair output resolution: ambiguous scope outputs "
-            "lack positional ordering"
-        )
-        return (
-            CloneOutputResolution(None, "ambiguous outputs")
-            if return_details
-            else None
-        )
-
     _, effective_skip_closures = resolve_closure_strictness_mode(
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
@@ -727,6 +727,17 @@ def resolve_clone_pair_outputs(
         tree=tree2,
         repo_root=repo_root,
     )
+
+    if scope1.get("outputs_ambiguous") or scope2.get("outputs_ambiguous"):
+        logger.debug(
+            "Rejecting clone pair output resolution: ambiguous scope outputs "
+            "lack positional ordering"
+        )
+        return (
+            CloneOutputResolution(None, "ambiguous outputs")
+            if return_details
+            else None
+        )
 
     has_yield = bool(scope1.get("has_yield") or scope2.get("has_yield"))
     if is_sub and has_yield:

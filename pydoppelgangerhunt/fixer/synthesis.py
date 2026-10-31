@@ -1523,8 +1523,13 @@ def synthesize_shared_helper_code(
         return ""
     if scope1.get("nonlocals") or scope2.get("nonlocals") or scope.get("nonlocals"):
         return ""
+    combined_hazards = (
+        list(scope1.get("control_flow_hazards", ()))
+        + list(scope2.get("control_flow_hazards", ()))
+        + list(scope.get("control_flow_hazards", ()))
+    )
     if any(
-        h in scope.get("control_flow_hazards", [])
+        h in combined_hazards
         for h in (
             "type_param_closure_capture",
             "pathological_ast",

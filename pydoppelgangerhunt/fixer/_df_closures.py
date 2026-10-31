@@ -19,6 +19,7 @@ from typing import (
 )
 
 from pydoppelgangerhunt.fixer._df_cache import (
+    _ScopeCacheKey,
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
     _scope_cell_info_cache,
@@ -317,7 +318,7 @@ def _get_cached_single_node_local_names(scope_node: ast.AST) -> frozenset[str]:
         frozenset[str],
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
-            (scope_node, "single_node_locals"),
+            _ScopeCacheKey(scope_node, "single_node_locals"),
             lambda: frozenset(_extract_single_node_local_names(scope_node)),
         ),
     )
@@ -405,7 +406,7 @@ def _node_has_star_import(root: ast.AST, *, use_cache: bool = True) -> bool:
     return bool(
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
-            (root, "has_star_import"),
+            _ScopeCacheKey(root, "has_star_import"),
             lambda: _node_has_star_import_uncached(root),
         )
     )
@@ -690,7 +691,13 @@ def _collect_scope_closures(
     module_tree: Optional[ast.AST] = None,
 ) -> List[Tuple[_ClosurePos, Set[str]]]:
     """Discovers all closures defined in a scope, recorded with their starting line."""
-    cache_key: Any = scope_node if module_tree is None else (scope_node, module_tree)
+    cache_key: Any = (
+        scope_node
+        if module_tree is None
+        else _ScopeCacheKey(
+            scope_node, "scope_closures", aux_ast_nodes=(module_tree,)
+        )
+    )
     return _get_or_compute_scope_cached(
         _scope_closures_cache,
         cache_key,

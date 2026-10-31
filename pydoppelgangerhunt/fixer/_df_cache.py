@@ -53,18 +53,32 @@ _SCOPE_ROOT_TYPES: Tuple[type, ...] = (
 )
 
 
+class _ScopeCacheKey(NamedTuple):
+    """Uniform cache key with explicit AST owner(s) for O(1) tree eviction."""
+
+    owner: ast.AST
+    kind: str
+    params: Tuple[Any, ...] = ()
+    aux_ast_nodes: Tuple[ast.AST, ...] = ()
+
+
 def _key_references_scope_nodes(key: Any, tree_nodes: Set[ast.AST]) -> bool:
-    """Returns True if a cache key (including nested tuples/NamedTuples/frozensets) references tree_nodes.
+    """Returns True if a cache key references any AST node in tree_nodes.
 
     Cache Key & Value Policy:
-    All composite keys in _scope_closures_cache and _scope_cell_info_cache must store
-    any AST node references either directly at the top level or inside nested tuple,
-    NamedTuple, or frozenset[ast.AST] containers (homogeneous frozensets of strings
-    such as shadowed_names or fn_globals are skipped in O(1)). Cached values must be
-    immutable (e.g., frozenset, tuple, NamedTuple, MappingProxyType, bool), protected
-    by _downstream_cache_lock on inner mutation (e.g., stmt_deltas), or returned via
-    defensive copies to callers.
+    Production entries in _scope_closures_cache and _scope_cell_info_cache use
+    _ScopeCacheKey(owner, kind, params, aux_ast_nodes), enabling O(1) eviction
+    via explicit AST owner fields without scanning non-AST parameter sets.
+    For arbitrary tuple, NamedTuple, or frozenset keys (including heterogeneous
+    frozensets), every element is inspected recursively. Cached values must be
+    immutable (frozenset, tuple, NamedTuple, MappingProxyType, bool), protected
+    by _downstream_cache_lock on inner mutation (e.g., stmt_deltas), or returned
+    via defensive copies to callers.
     """
+    if isinstance(key, _ScopeCacheKey):
+        return key.owner in tree_nodes or any(
+            n in tree_nodes for n in key.aux_ast_nodes
+        )
     if isinstance(key, ast.AST):
         return key in tree_nodes
     if not isinstance(key, (tuple, frozenset)):
@@ -72,10 +86,12 @@ def _key_references_scope_nodes(key: Any, tree_nodes: Set[ast.AST]) -> bool:
     stack: List[Any] = [key]
     while stack:
         curr = stack.pop()
-        if isinstance(curr, frozenset):
-            first = next(iter(curr), None)
-            if not isinstance(first, (ast.AST, tuple, frozenset)):
-                continue
+        if isinstance(curr, _ScopeCacheKey):
+            if curr.owner in tree_nodes or any(
+                n in tree_nodes for n in curr.aux_ast_nodes
+            ):
+                return True
+            continue
         for elem in curr:
             if isinstance(elem, ast.AST) and elem in tree_nodes:
                 return True

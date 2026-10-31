@@ -6,7 +6,6 @@ import ast
 from types import MappingProxyType
 from typing import (
     AbstractSet,
-    Any,
     Dict,
     List,
     Mapping,
@@ -20,6 +19,7 @@ from typing import (
 )
 
 from pydoppelgangerhunt.fixer._df_cache import (
+    _ScopeCacheKey,
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
     _scope_cell_info_cache,
@@ -28,6 +28,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _COMPREHENSION_TYPES,
     _INNER_SCOPE_TYPES,
     _extract_comprehension_walrus_names,
+    _extract_node_type_param_names,
     _extract_scope_local_names,
     _extract_strict_fn_local_names,
     _has_wildcard_star_import,
@@ -37,6 +38,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _node_strictly_encloses_bounds,
 )
 from pydoppelgangerhunt.fixer._df_visitors import (
+    _collect_func_params as _extract_arg_names,
     _extract_nested_scope_free_reads,
     _extract_pattern_bound_name,
     _is_ast_node_within_unit_bounds,
@@ -88,10 +90,10 @@ def _get_fn_scope_context(
     mod_tree: Optional[ast.AST] = None,
 ) -> _FnScopeContext:
     """Computes and caches lexical scope metadata for an AST scope node."""
-    cache_key: Any = (
-        (scope_node, "fn_scope_ctx")
-        if mod_tree is None
-        else (scope_node, "fn_scope_ctx", mod_tree)
+    cache_key = _ScopeCacheKey(
+        scope_node,
+        "fn_scope_ctx",
+        aux_ast_nodes=() if mod_tree is None else (mod_tree,),
     )
     return cast(
         _FnScopeContext,
@@ -109,7 +111,17 @@ def _is_lazy_genexp(
     node: ast.AST,
     scope_ctx: Optional[_FnScopeContext] = None,
 ) -> bool:
-    """Returns True if node is a GeneratorExp that is not eagerly consumed."""
+    """Returns True if node is a GeneratorExp that is not eagerly consumed.
+
+    Note:
+        When ``scope_ctx`` is None on a detached ``ast.GeneratorExp`` (so no parent
+        call context is available), this function deliberately defaults to ``True``
+        (fail-closed conservative treatment as a lazy generator). Higher-level helpers
+        such as ``_extract_comprehension_deferred_closure_info`` and
+        ``_extract_lazy_genexp_walrus_names`` automatically synthesize a subtree
+        ``_FnScopeContext`` when ``scope_ctx`` is omitted so nested eager consumers
+        (e.g., ``sum(x for x in row)``) are still classified accurately.
+    """
     if not isinstance(node, ast.GeneratorExp):
         return False
     if scope_ctx is None:
@@ -260,6 +272,11 @@ def _resolve_unit_col_bounds(
                 and n_end == u_end
                 and isinstance(n_col, int)
                 and isinstance(n_end_col, int)
+                and not (
+                    single_stmt
+                    and isinstance(candidate_stmts[0], ast.Expr)
+                    and not isinstance(node, ast.Expr)
+                )
             ):
                 span_stmts.append((n_col, n_end_col))
             if not (u_start <= n_start and n_end <= u_end):
@@ -351,6 +368,145 @@ def _resolve_unit_col_bounds(
     )
 
 
+def _has_unresolved_span_bounds(
+    scope_node: ast.AST,
+    u_start: int,
+    u_end: int,
+    u_start_col: Optional[int],
+    u_end_col: Optional[int],
+    candidate_stmts: Sequence[ast.AST] = (),
+) -> bool:
+    """Returns True if boundary columns on multi-statement/sub-expression lines are unresolved or AST end coords are missing."""
+    start_line_stmts: List[ast.stmt] = []
+    end_line_stmts: List[ast.stmt] = []
+    for node in ast.walk(scope_node):
+        if not isinstance(node, (ast.stmt, ast.expr)):
+            continue
+        n_start, n_col = _node_earliest_start_pos(node)
+        if not isinstance(n_start, int):
+            continue
+        n_end = getattr(node, "end_lineno", None)
+        n_end_col = getattr(node, "end_col_offset", None)
+        if not isinstance(n_end, int):
+            if n_start <= u_end:
+                return True
+            continue
+        if n_end < u_start or n_start > u_end:
+            continue
+        if not isinstance(n_col, int) or not isinstance(n_end_col, int):
+            return True
+        if isinstance(node, ast.stmt):
+            if n_start == u_start:
+                start_line_stmts.append(node)
+            if n_end == u_end:
+                end_line_stmts.append(node)
+    is_expr_cand = len(candidate_stmts) == 1 and isinstance(
+        candidate_stmts[0], ast.Expr
+    )
+    cand_dump = ast.dump(candidate_stmts[0]) if is_expr_cand else ""
+    return any(
+        col_bound is None
+        and (
+            len(line_stmts) > 1
+            or (
+                is_expr_cand
+                and any(ast.dump(s) != cand_dump for s in line_stmts)
+            )
+        )
+        for col_bound, line_stmts in (
+            (u_start_col, start_line_stmts),
+            (u_end_col, end_line_stmts),
+        )
+    )
+
+
+def _has_invalid_lexical_scope_declarations(
+    candidate_stmts: Sequence[ast.AST],
+    enclosing_chain: Sequence[Tuple[int, int, ast.AST]] = (),
+    mod_tree: Optional[ast.AST] = None,
+) -> bool:
+    """Returns True if any scope in enclosing_chain or candidate_stmts violates PEP 3104 nonlocal/global rules."""
+    is_module_rooted = isinstance(mod_tree, ast.Module)
+    bound_in_fns: frozenset[str] = frozenset()
+    blocked_globals: frozenset[str] = frozenset()
+    for _, _, enc_fn in enclosing_chain:
+        d_nl = _extract_direct_nonlocals(enc_fn, is_global=False)
+        d_g = _extract_direct_nonlocals(enc_fn, is_global=True)
+        if d_nl & d_g:
+            return True
+        if isinstance(enc_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            params = _extract_arg_names(enc_fn.args) | _extract_node_type_param_names(
+                enc_fn
+            )
+            if params & (d_nl | d_g):
+                return True
+        if d_nl & blocked_globals:
+            return True
+        if is_module_rooted and (d_nl - bound_in_fns):
+            return True
+        own_locals = frozenset(_extract_strict_fn_local_names(enc_fn))
+        bound_in_fns = (bound_in_fns - d_g) | own_locals
+        blocked_globals = (blocked_globals - own_locals) | d_g
+
+    unit_mod = ast.Module(
+        body=[s for s in candidate_stmts if isinstance(s, ast.stmt)],
+        type_ignores=[],
+    )
+    top_nl = _extract_direct_nonlocals(unit_mod, is_global=False)
+    top_g = _extract_direct_nonlocals(unit_mod, is_global=True)
+    if top_nl & top_g:
+        return True
+    if enclosing_chain and (top_nl & blocked_globals):
+        return True
+    if is_module_rooted and (top_nl - bound_in_fns):
+        return True
+
+    stack: List[Tuple[ast.AST, frozenset[str], frozenset[str], bool]] = [
+        (stmt, bound_in_fns, blocked_globals, is_module_rooted)
+        for stmt in candidate_stmts
+    ]
+    if enclosing_chain:
+        stack.append(
+            (
+                enclosing_chain[0][2],
+                frozenset(),
+                frozenset(),
+                is_module_rooted,
+            )
+        )
+    while stack:
+        curr, cur_bound, cur_blocked, cur_rooted = stack.pop()
+        if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            for hdr in iter_nested_scope_header_nodes(curr):
+                stack.append((hdr, cur_bound, cur_blocked, cur_rooted))
+            d_nl = _extract_direct_nonlocals(curr, is_global=False)
+            d_g = _extract_direct_nonlocals(curr, is_global=True)
+            if d_nl & d_g:
+                return True
+            if d_nl & cur_blocked:
+                return True
+            if cur_rooted and (d_nl - cur_bound):
+                return True
+            if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                params = _extract_arg_names(
+                    curr.args
+                ) | _extract_node_type_param_names(curr)
+                if params & (d_nl | d_g):
+                    return True
+                own_locals = frozenset(_extract_strict_fn_local_names(curr))
+                next_bound = (cur_bound - d_g) | own_locals
+                next_blocked = (cur_blocked - own_locals) | d_g
+            else:
+                next_bound = cur_bound
+                next_blocked = cur_blocked
+            for ch in curr.body:
+                stack.append((ch, next_bound, next_blocked, cur_rooted))
+            continue
+        for child in ast.iter_child_nodes(curr):
+            stack.append((child, cur_bound, cur_blocked, cur_rooted))
+    return False
+
+
 def _extract_direct_nonlocals(
     scope_node: ast.AST,
     *,
@@ -393,15 +549,13 @@ def _extract_closure_nonlocal_mutations_and_deletions_uncached(
     """
     # PEP 227 class scope isolation: class attributes do not intercept nonlocal bindings
     # in nested methods, allowing nested nonlocal mutations to pass through to enclosing functions.
-    # For function scopes, both local bindings and explicit global declarations act as a
-    # lexical barrier for nested nonlocal declarations.
+    # For function scopes, only genuine local bindings act as a valid lexical cell target
+    # for nested nonlocal declarations (explicit global declarations block nonlocal per PEP 3104
+    # and are validated by _has_invalid_lexical_scope_declarations).
     own_locals = (
         set()
         if isinstance(scope_node, ast.ClassDef)
-        else (
-            _extract_strict_fn_local_names(scope_node)
-            | _extract_direct_nonlocals(scope_node, is_global=True)
-        )
+        else _extract_strict_fn_local_names(scope_node)
     )
     direct_nonlocals: Set[str] = set()
     direct_mutated: Set[str] = set()
@@ -461,7 +615,7 @@ def _extract_closure_nonlocal_mutations_and_deletions(
         Tuple[frozenset[str], frozenset[str]],
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
-            (scope_node, "nl_muts_dels"),
+            _ScopeCacheKey(scope_node, "nl_muts_dels"),
             lambda: _extract_closure_nonlocal_mutations_and_deletions_uncached(
                 scope_node
             ),
@@ -482,7 +636,7 @@ def _extract_cached_scope_free_reads(
     return set(
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
-            (node, "free_reads"),
+            _ScopeCacheKey(node, "free_reads"),
             lambda: frozenset(_extract_nested_scope_free_reads(node)),
         )
     )
@@ -506,17 +660,36 @@ def _extract_comprehension_body_walrus_names(comp_node: ast.AST) -> Set[str]:
     )
 
 
+def _ensure_subtree_scope_ctx(
+    node: ast.AST,
+    scope_ctx: Optional[_FnScopeContext],
+) -> Optional[_FnScopeContext]:
+    """Synthesizes a subtree _FnScopeContext when scope_ctx is None and node is not a bare GeneratorExp."""
+    if scope_ctx is not None or isinstance(node, ast.GeneratorExp):
+        return scope_ctx
+    wrap: ast.AST = (
+        node
+        if isinstance(node, ast.Module)
+        else ast.Module(
+            body=[node if isinstance(node, ast.stmt) else ast.Expr(value=cast(ast.expr, node))],
+            type_ignores=[],
+        )
+    )
+    return _get_fn_scope_context_uncached(wrap, cache_parent_map=False)
+
+
 def _extract_lazy_genexp_walrus_names(
     node: ast.AST,
     scope_ctx: Optional[_FnScopeContext] = None,
 ) -> Set[str]:
     """Extracts walrus target names inside lazy GeneratorExp subtrees of node."""
+    eff_ctx = _ensure_subtree_scope_ctx(node, scope_ctx)
     names: Set[str] = set()
     stack: List[ast.AST] = [node]
     while stack:
         curr = stack.pop()
         if isinstance(curr, ast.GeneratorExp):
-            if _is_lazy_genexp(curr, scope_ctx):
+            if _is_lazy_genexp(curr, eff_ctx):
                 names.update(_extract_comprehension_body_walrus_names(curr))
                 if curr.generators:
                     stack.append(curr.generators[0].iter)
@@ -569,7 +742,8 @@ def _extract_comprehension_deferred_closure_info(
     scope_ctx: Optional[_FnScopeContext] = None,
 ) -> Tuple[Set[str], Set[str]]:
     """Extracts (deferred_free_reads, lazy_walrus_mutations) from a comprehension node."""
-    is_lazy = _is_lazy_genexp(comp_node, scope_ctx)
+    eff_ctx = _ensure_subtree_scope_ctx(comp_node, scope_ctx)
+    is_lazy = _is_lazy_genexp(comp_node, eff_ctx)
     first_iter = comp_node.generators[0].iter if comp_node.generators else None
     init_exprs, init_targets = _iter_comprehension_body_exprs_and_targets(
         comp_node
@@ -603,7 +777,7 @@ def _extract_comprehension_deferred_closure_info(
             continue
         if isinstance(sub, _COMPREHENSION_TYPES):
             if isinstance(sub, ast.GeneratorExp) and _is_lazy_genexp(
-                sub, scope_ctx
+                sub, eff_ctx
             ):
                 nested_lazy_nodes.append((sub, shadowed_targets))
                 if sub.generators:
@@ -637,7 +811,7 @@ def _extract_comprehension_deferred_closure_info(
             )
             deferred_reads.update(sub_reads)
 
-    lazy_muts = _extract_lazy_genexp_walrus_names(comp_node, scope_ctx)
+    lazy_muts = _extract_lazy_genexp_walrus_names(comp_node, eff_ctx)
     return deferred_reads, lazy_muts
 
 
@@ -655,7 +829,10 @@ def _collect_unit_nonlocal_mutators(
     mod_tree: Optional[ast.AST] = None,
 ) -> List[_IntraUnitMutator]:
     """Collects intra-unit nested functions/classes and lazy genexps that mutate outer cells."""
-    unit_mod = ast.Module(body=list(candidate_stmts), type_ignores=[])
+    unit_mod = ast.Module(
+        body=[s for s in candidate_stmts if isinstance(s, ast.stmt)],
+        type_ignores=[],
+    )
     scope_ctx = _get_fn_scope_context_uncached(
         unit_mod, mod_tree=mod_tree, cache_parent_map=False
     )
@@ -683,10 +860,8 @@ def _collect_unit_nonlocal_mutators(
                 # create a lexical barrier for nonlocal declarations in nested methods.
                 body_shadowed = shadowed
             else:
-                body_shadowed = (
-                    shadowed
-                    | frozenset(_extract_strict_fn_local_names(curr))
-                    | frozenset(_extract_direct_nonlocals(curr, is_global=True))
+                body_shadowed = shadowed | frozenset(
+                    _extract_strict_fn_local_names(curr)
                 )
             stack.extend((ch, body_shadowed) for ch in curr.body)
             stack.extend(
@@ -782,7 +957,17 @@ def _is_pos_after_span(
 
 
 def _is_node_inside_span(node: ast.AST, span: _SpanBounds) -> bool:
-    """Checks whether an AST node's start and end positions lie within span."""
+    """Checks whether an AST node's start and end positions lie within span.
+
+    Fails closed (returns False) if node lacks end_lineno, or lacks col_offset /
+    end_col_offset when span specifies column bounds on the corresponding boundary line.
+    """
+    estart, ecol = _node_earliest_start_pos(node)
+    if not isinstance(estart, int) or estart < span.start or estart > span.end:
+        return False
+    if estart == span.start and span.start_col is not None:
+        if not isinstance(ecol, int) or ecol < span.start_col:
+            return False
     if not _is_ast_node_within_unit_bounds(
         node,
         span.start,
@@ -792,13 +977,12 @@ def _is_node_inside_span(node: ast.AST, span: _SpanBounds) -> bool:
     ):
         return False
     c_end = getattr(node, "end_lineno", None)
-    if isinstance(c_end, int):
-        if c_end > span.end:
+    if not isinstance(c_end, int) or c_end > span.end:
+        return False
+    if c_end == span.end and span.end_col is not None:
+        end_col = getattr(node, "end_col_offset", None)
+        if not isinstance(end_col, int) or end_col > span.end_col:
             return False
-        if c_end == span.end and span.end_col is not None:
-            end_col = getattr(node, "end_col_offset", None)
-            if isinstance(end_col, int) and end_col > span.end_col:
-                return False
     return True
 
 
@@ -871,14 +1055,15 @@ def _extract_mutated_target_names(target: ast.AST) -> Set[str]:
     return _collect_target_names(target, mode="mutated")
 
 
-# Deliberate static-analysis heuristic: unshadowed calls to these built-in functions
-# are treated as returning primitive/non-closure values (even though custom user types
-# could theoretically override dunders such as __round__, __abs__, or __int__ to return
-# callables). Inline mutations inside their arguments are still tracked by
-# _extract_carrier_value_closure_and_load_info.
+# Built-in functions whose return types are strictly enforced by the CPython runtime
+# to be primitive scalars, booleans, strings, byte sequences, ranges, file streams, or None
+# (e.g., TypeError is raised in C if __int__, __index__, __len__, __bool__, __str__,
+# __repr__, __format__, __float__, __complex__, or __hash__ returns a non-primitive).
+# Built-ins that delegate to unconstrained user dunders (abs -> __abs__, round -> __round__,
+# divmod -> __divmod__, pow -> __pow__, sum -> __add__) are intentionally excluded so custom
+# objects whose dunders return closures are never misclassified as non-closure scalars.
 _NON_CLOSURE_RETURN_BUILTINS: frozenset[str] = frozenset(
     {
-        "abs",
         "all",
         "any",
         "ascii",
@@ -889,7 +1074,6 @@ _NON_CLOSURE_RETURN_BUILTINS: frozenset[str] = frozenset(
         "callable",
         "chr",
         "complex",
-        "divmod",
         "float",
         "format",
         "hash",
@@ -903,13 +1087,10 @@ _NON_CLOSURE_RETURN_BUILTINS: frozenset[str] = frozenset(
         "oct",
         "open",
         "ord",
-        "pow",
         "print",
         "range",
         "repr",
-        "round",
         "str",
-        "sum",
     }
 )
 
@@ -933,17 +1114,19 @@ def _is_non_closure_scalar_expr(
     node: ast.AST,
     scope_ctx: Optional[_FnScopeContext] = None,
 ) -> bool:
-    """Returns True if node evaluates to a primitive scalar that cannot carry a closure.
+    """Returns True if node is guaranteed to evaluate to a non-closure scalar value.
 
     Note:
-        This is a deliberate static-analysis heuristic: comparisons (``ast.Compare``),
-        unary operations, non-multiplying binary operations on scalar built-ins, and calls
-        to unshadowed ``_NON_CLOSURE_RETURN_BUILTINS`` are assumed not to return closures
-        (disregarding custom dunder overrides like ``__eq__`` or ``__add__`` that return
-        callables). Inline mutations inside scalar sub-expressions are still extracted by
-        ``_extract_carrier_value_closure_and_load_info``.
+        Only literals (``ast.Constant``, ``ast.JoinedStr``), boolean negation
+        (``not x``), calls to unshadowed C-enforced ``_NON_CLOSURE_RETURN_BUILTINS``,
+        and unary/binary/comparison operations whose operands are all recursively
+        non-closure scalars are classified as scalar. Binary, unary, or comparison
+        operations involving arbitrary variables or custom objects are NOT assumed
+        to be scalar because custom dunders (``__add__``, ``__abs__``, ``__eq__``,
+        etc.) can return closures. Inline mutations inside scalar sub-expressions
+        are still extracted by ``_extract_carrier_value_closure_and_load_info``.
     """
-    if isinstance(node, (ast.Constant, ast.JoinedStr, ast.Compare)):
+    if isinstance(node, (ast.Constant, ast.JoinedStr)):
         return True
     if _is_non_closure_builtin_call(node, scope_ctx):
         return True
@@ -952,15 +1135,14 @@ def _is_non_closure_scalar_expr(
             node.operand, scope_ctx
         )
     if isinstance(node, ast.BinOp):
-        left_scalar = _is_non_closure_scalar_expr(node.left, scope_ctx)
-        right_scalar = _is_non_closure_scalar_expr(node.right, scope_ctx)
-        if left_scalar and right_scalar:
-            return True
-        if not isinstance(node.op, ast.Mult) and (
-            _is_non_closure_builtin_call(node.left, scope_ctx)
-            or _is_non_closure_builtin_call(node.right, scope_ctx)
-        ):
-            return True
+        return _is_non_closure_scalar_expr(
+            node.left, scope_ctx
+        ) and _is_non_closure_scalar_expr(node.right, scope_ctx)
+    if isinstance(node, ast.Compare):
+        return _is_non_closure_scalar_expr(node.left, scope_ctx) and all(
+            _is_non_closure_scalar_expr(comp, scope_ctx)
+            for comp in node.comparators
+        )
     return False
 
 
@@ -1579,11 +1761,13 @@ def _is_closure_factory_scope(
         return True
     if not isinstance(scope_node, ast.FunctionDef):
         return False
-    cache_key: Any = (
+    cache_key = _ScopeCacheKey(
         scope_node,
         "is_closure_factory",
-        scope_ctx.shadowed_names if scope_ctx is not None else None,
-        scope_ctx.has_star_import if scope_ctx is not None else False,
+        params=(
+            scope_ctx.shadowed_names if scope_ctx is not None else None,
+            scope_ctx.has_star_import if scope_ctx is not None else False,
+        ),
     )
     return bool(
         _get_or_compute_scope_cached(
@@ -1629,11 +1813,13 @@ def _extract_fn_returned_closure_refs(
     """Extracts non-local (returned_loaded_names, returned_called_names) for a nested function."""
     if not isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return set(), set()
-    cache_key: Any = (
+    cache_key = _ScopeCacheKey(
         fn_node,
         "ret_closure_refs",
-        scope_ctx.shadowed_names if scope_ctx is not None else None,
-        scope_ctx.has_star_import if scope_ctx is not None else False,
+        params=(
+            scope_ctx.shadowed_names if scope_ctx is not None else None,
+            scope_ctx.has_star_import if scope_ctx is not None else False,
+        ),
     )
     cached_loads, cached_calls = cast(
         Tuple[frozenset[str], frozenset[str]],
@@ -1690,7 +1876,11 @@ def _extract_fn_outer_carrier_targets_uncached(
             for hdr in iter_nested_scope_header_nodes(sub):
                 stack.append((hdr, cur_locals, cur_nl, cur_g))
             sub_direct_nl = _extract_direct_nonlocals(sub)
-            sub_g = cur_g | _extract_direct_nonlocals(sub, is_global=True)
+            sub_g = cur_g | (
+                set()
+                if isinstance(sub, ast.ClassDef)
+                else _extract_direct_nonlocals(sub, is_global=True)
+            )
             sub_own = (
                 set()
                 if isinstance(sub, ast.ClassDef)
@@ -1772,12 +1962,16 @@ def _extract_fn_outer_carrier_targets(
     return set(
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
-            (
+            _ScopeCacheKey(
                 fn_node,
                 "outer_carriers",
-                frozenset(fn_globals),
-                scope_ctx.shadowed_names if scope_ctx is not None else None,
-                scope_ctx.has_star_import if scope_ctx is not None else False,
+                params=(
+                    frozenset(fn_globals),
+                    scope_ctx.shadowed_names if scope_ctx is not None else None,
+                    scope_ctx.has_star_import
+                    if scope_ctx is not None
+                    else False,
+                ),
             ),
             lambda: _extract_fn_outer_carrier_targets_uncached(
                 fn_node, fn_globals, scope_ctx

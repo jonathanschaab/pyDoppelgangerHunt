@@ -96,6 +96,8 @@ from pydoppelgangerhunt.fixer._df_cell_carriers import (
     _collect_unit_nonlocal_mutators,
     _extract_direct_nonlocals,
     _find_enclosing_function_chain,
+    _has_invalid_lexical_scope_declarations,
+    _has_unresolved_span_bounds,
     _propagate_sibling_closures,
     _resolve_unit_col_bounds,
 )
@@ -116,6 +118,7 @@ __all__ = [
     "_check_sibling_closure_sharing",
     "_find_enclosing_chain_definite_pre_bound",
     "_find_enclosing_function_chain",
+    "_has_invalid_lexical_scope_declarations",
     "_has_severed_closure_cell_hazard",
     "_resolve_unit_col_bounds",
 ]
@@ -368,8 +371,29 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     enclosing_chain = _find_enclosing_function_chain(
         ctx.mod_tree, ctx.u_start, ctx.u_end, u_start_col, u_end_col
     )
+    if _has_invalid_lexical_scope_declarations(
+        ctx.candidate_stmts,
+        enclosing_chain=enclosing_chain,
+        mod_tree=ctx.mod_tree,
+    ):
+        return True
     if not enclosing_chain:
-        return False
+        return any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and isinstance(getattr(node, "lineno", None), int)
+            and getattr(node, "lineno", 0) <= ctx.u_end
+            and not isinstance(getattr(node, "end_lineno", None), int)
+            for node in ast.walk(ctx.mod_tree)
+        )
+    if _has_unresolved_span_bounds(
+        enclosing_chain[-1][2],
+        ctx.u_start,
+        ctx.u_end,
+        u_start_col,
+        u_end_col,
+        ctx.candidate_stmts,
+    ):
+        return True
 
     unit_mod = ast.Module(body=list(ctx.candidate_stmts), type_ignores=[])
     is_expr_unit = (

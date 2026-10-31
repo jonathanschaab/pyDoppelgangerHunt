@@ -19,6 +19,7 @@ from typing import (
 )
 
 from pydoppelgangerhunt.fixer._df_cache import (
+    _ScopeCacheKey,
     _downstream_cache_lock,
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
@@ -1721,7 +1722,11 @@ def _analyze_enclosing_fn_cells_uncached(
             Dict[Tuple[ast.AST, bool], Optional[_StmtCellDelta]],
             _get_or_compute_scope_cached(
                 _scope_cell_info_cache,
-                (fn_node, "stmt_deltas", mod_tree),
+                _ScopeCacheKey(
+                    owner=fn_node,
+                    kind="stmt_deltas",
+                    aux_ast_nodes=(mod_tree,) if mod_tree is not None else (),
+                ),
                 dict,
             ),
         )
@@ -1838,12 +1843,14 @@ def _analyze_enclosing_fn_cells(
 ) -> _EnclosingFnCellInfo:
     """Analyzes and caches cell bindings, post-span mutations, loop mutations, and closures."""
     norm_span = span if isinstance(span, _SpanBounds) else _SpanBounds(*span)
-    cache_key: Any = (
-        fn_node,
-        norm_span,
-        frozenset(unit_mutations),
-        enclosed_fn,
-        mod_tree,
+    aux_nodes: Tuple[ast.AST, ...] = tuple(
+        n for n in (enclosed_fn, mod_tree) if n is not None
+    )
+    cache_key = _ScopeCacheKey(
+        owner=fn_node,
+        kind="enclosing_fn_cells",
+        params=(norm_span, frozenset(unit_mutations), enclosed_fn is not None),
+        aux_ast_nodes=aux_nodes,
     )
     return cast(
         _EnclosingFnCellInfo,
@@ -1884,7 +1891,11 @@ def _find_enclosing_method_class_names(
         frozenset[str],
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
-            (fn_node, "method_cls_names", enc_child),
+            _ScopeCacheKey(
+                owner=fn_node,
+                kind="method_cls_names",
+                aux_ast_nodes=(enc_child,),
+            ),
             _compute,
         ),
     )
