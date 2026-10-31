@@ -10478,3 +10478,522 @@ def test_p1_p2_and_deep_correctness_review_matrix(tmp_path: Path) -> None:
     )
 
 
+def test_unmarked_scope_recomputation_slice_truncation_and_sections_2_1_to_2_6(
+    tmp_path: Any,
+) -> None:
+    """Covers unmarked precomputed scopes, multiline slice end_col truncation, and review sections 2.1-2.6."""
+    import sys  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.fixer import (
+        _is_irrefutable_case,
+        _is_irrefutable_pattern,
+        clear_dataflow_cache,
+        inspect_single_unit_scope,
+        resolve_clone_generator_subroutine_outputs,
+        synthesize_shared_helper_code,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _SpanBounds,
+        _extract_closure_nonlocal_mutations_and_deletions,
+        _extract_fn_outer_carrier_targets,
+        _get_fn_scope_context,
+        _is_closure_factory_scope,
+        _propagate_sibling_closures,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _analyze_enclosing_fn_cells,
+    )
+    from pydoppelgangerhunt.fixer._df_closures import (
+        _is_eagerly_consumed_genexp,
+    )
+    from pydoppelgangerhunt.fixer.scope import (
+        ensure_unit_scope_closure_mode,
+        scope_matches_closure_mode,
+    )
+    from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
+
+    clear_dataflow_cache()
+
+    # [P1] Unmarked scopes never match strict or lenient mode and are recomputed when unit has source
+    gen_src = (
+        "def gen_a(items):\n"
+        "    pre_cb = lambda: step\n"
+        "    for x in items:\n"
+        "        step = x + 1\n"
+        "        yield step\n"
+        "    return len(items)\n\n"
+        "def gen_b(items):\n"
+        "    pre_cb = lambda: step\n"
+        "    for x in items:\n"
+        "        step = x + 1\n"
+        "        yield step\n"
+        "    return len(items)\n"
+    )
+    gen_file = tmp_path / "unmarked_modes.py"
+    gen_file.write_text(gen_src, encoding="utf-8")
+    u_g1 = {
+        "file": str(gen_file),
+        "start": 3,
+        "end": 5,
+        "name": "gen_a:For",
+        "kind": "compound_block",
+        "source_text": gen_src,
+        "source_code": "for x in items:\n    step = x + 1\n    yield step\n",
+    }
+    u_g2 = {
+        "file": str(gen_file),
+        "start": 10,
+        "end": 12,
+        "name": "gen_b:For",
+        "kind": "compound_block",
+        "source_text": gen_src,
+        "source_code": "for x in items:\n    step = x + 1\n    yield step\n",
+    }
+
+    strict_sc1 = inspect_single_unit_scope(u_g1, repo_root=str(tmp_path))
+    strict_sc2 = inspect_single_unit_scope(u_g2, repo_root=str(tmp_path))
+    assert scope_matches_closure_mode(strict_sc1, False) is True
+    assert scope_matches_closure_mode(strict_sc1, True) is False
+
+    unmarked_strict1 = dict(strict_sc1)
+    unmarked_strict2 = dict(strict_sc2)
+    unmarked_strict1.pop("_skip_pre_unit_closures", None)
+    unmarked_strict2.pop("_skip_pre_unit_closures", None)
+    assert scope_matches_closure_mode(unmarked_strict1, False) is False
+    assert scope_matches_closure_mode(unmarked_strict1, True) is False
+    assert scope_matches_closure_mode(
+        {**unmarked_strict1, "_skip_pre_unit_closures": None}, False
+    ) is False
+
+    # Passing unmarked strict scopes into lenient mode recomputes to lenient
+    recomputed_lenient = ensure_unit_scope_closure_mode(
+        u_g1, unmarked_strict1, True, repo_root=str(tmp_path)
+    )
+    assert recomputed_lenient["_skip_pre_unit_closures"] is True
+    assert "severed_closure_cell" not in recomputed_lenient["control_flow_hazards"]
+    res_gen_lenient = resolve_clone_generator_subroutine_outputs(
+        u_g1,
+        u_g2,
+        unmarked_strict1,
+        unmarked_strict2,
+        repo_root=str(tmp_path),
+        closure_strictness="lenient",
+        return_details=True,
+    )
+    assert res_gen_lenient.outputs is not None
+    unmarked_comb_strict = analyze_unit_variable_scope(
+        u_g1, u_g2, repo_root=str(tmp_path)
+    )
+    unmarked_comb_strict.pop("_skip_pre_unit_closures", None)
+    synth_from_unmarked_strict = synthesize_shared_helper_code(
+        u_g1,
+        u_g2,
+        repo_root=str(tmp_path),
+        scope1=unmarked_strict1,
+        scope2=unmarked_strict2,
+        scope=unmarked_comb_strict,
+        closure_strictness="lenient",
+    )
+    assert "def " in synth_from_unmarked_strict
+
+    # Passing unmarked lenient scopes into strict mode recomputes to strict
+    lenient_sc1 = inspect_single_unit_scope(
+        {**u_g1, "skip_pre_unit_closures": True}, repo_root=str(tmp_path)
+    )
+    lenient_sc2 = inspect_single_unit_scope(
+        {**u_g2, "skip_pre_unit_closures": True}, repo_root=str(tmp_path)
+    )
+    unmarked_lenient1 = dict(lenient_sc1)
+    unmarked_lenient2 = dict(lenient_sc2)
+    unmarked_lenient1.pop("_skip_pre_unit_closures", None)
+    unmarked_lenient2.pop("_skip_pre_unit_closures", None)
+    recomputed_strict = ensure_unit_scope_closure_mode(
+        u_g1, unmarked_lenient1, False, repo_root=str(tmp_path)
+    )
+    assert recomputed_strict["_skip_pre_unit_closures"] is False
+    assert "severed_closure_cell" in recomputed_strict["control_flow_hazards"]
+    res_gen_strict = resolve_clone_generator_subroutine_outputs(
+        u_g1,
+        u_g2,
+        unmarked_lenient1,
+        unmarked_lenient2,
+        repo_root=str(tmp_path),
+        closure_strictness="strict",
+        return_details=True,
+    )
+    assert res_gen_strict.outputs is None
+    assert res_gen_strict.skip_reason == "severed closure cell"
+    unmarked_comb_lenient = analyze_unit_variable_scope(
+        {**u_g1, "skip_pre_unit_closures": True},
+        {**u_g2, "skip_pre_unit_closures": True},
+        repo_root=str(tmp_path),
+    )
+    unmarked_comb_lenient.pop("_skip_pre_unit_closures", None)
+    assert (
+        synthesize_shared_helper_code(
+            u_g1,
+            u_g2,
+            repo_root=str(tmp_path),
+            scope1=unmarked_lenient1,
+            scope2=unmarked_lenient2,
+            scope=unmarked_comb_lenient,
+            closure_strictness="strict",
+        )
+        == ""
+    )
+
+    # [P2] _slice_unit_token_lines truncates end_col even when line 0 is pre-sliced or empty
+    assert _slice_unit_token_lines(
+        {"kind": "comprehension", "start_col": 24, "end_col": 5},
+        ["[\n", "        x * 2 for x in items\n", "    ] + [99]\n"],
+    ) == ["[\n", "        x * 2 for x in items\n", "    ]"]
+    assert _slice_unit_token_lines(
+        {"kind": "comprehension", "start_col": 12, "end_col": 5},
+        ["\n", "        x * 2 for x in items\n", "    ] + [99]\n"],
+    ) == ["\n", "        x * 2 for x in items\n", "    ]"]
+    utf8_last = '    ] + "é界🚀"\n'
+    assert _slice_unit_token_lines(
+        {"kind": "comprehension", "start_col": 30, "end_col": 5},
+        ["[\n", "    x for x in items\n", utf8_last],
+    ) == ["[\n", "    x for x in items\n", "    ]"]
+    utf8_empty_slice = "é = "
+    utf8_len = len(utf8_empty_slice.encode("utf-8"))
+    assert _slice_unit_token_lines(
+        {"kind": "complex_expr", "start_col": utf8_len, "end_col": utf8_len},
+        [utf8_empty_slice],
+    ) == [""]
+
+    # Section 2.1: Closure mutation propagation through classes
+    cls_prop_tree = ast.parse(
+        "def outer():\n"
+        "    x = 1\n"
+        "    y = 2\n"
+        "    z = 3\n"
+        "    w = 4\n"
+        "    class OuterCls:\n"
+        "        x = 99\n"
+        "        nonlocal z\n"
+        "        z = 30\n"
+        "        global g_var\n"
+        "        g_var = 100\n"
+        "        if True:\n"
+        "            def branch_m(self):\n"
+        "                nonlocal y\n"
+        "                y += 1\n"
+        "        class InnerCls:\n"
+        "            def deep_m(self):\n"
+        "                class MethodCls:\n"
+        "                    def leaf(self):\n"
+        "                        nonlocal x, w\n"
+        "                        x += 1\n"
+        "                        del w\n"
+        "                return MethodCls\n"
+    )
+    outer_cls_node = cls_prop_tree.body[0].body[4]  # type: ignore[attr-defined]
+    muts_2_1, dels_2_1 = _extract_closure_nonlocal_mutations_and_deletions(
+        outer_cls_node
+    )
+    assert muts_2_1 == {"x", "y", "z", "w"}
+    assert dels_2_1 == {"w"}
+    assert "g_var" not in muts_2_1
+
+    # Class attribute assignment without nonlocal does not report nonlocal mutation
+    cls_shadow_only = ast.parse(
+        "def outer():\n"
+        "    x = 1\n"
+        "    class ShadowOnly:\n"
+        "        x = 2\n"
+        "        def read_attr(self):\n"
+        "            return self.x\n"
+    )
+    assert _extract_closure_nonlocal_mutations_and_deletions(
+        cls_shadow_only.body[0].body[1]  # type: ignore[attr-defined]
+    ) == (set(), set())
+
+    # Section 2.2: Comprehension and generator-expression evaluation timing
+    lazy_walrus_src = (
+        "def f1(items):\n"
+        "    x = 0\n"
+        "    gen = ((x := x + item) for item in items)\n"
+        "    x = 100\n"
+        "    return list(gen)\n"
+    )
+    sc_lazy_walrus = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 3,
+            "kind": "compound_block",
+            "source_text": lazy_walrus_src,
+            "source_code": "gen = ((x := x + item) for item in items)\n",
+        }
+    )
+    assert "severed_closure_cell" in sc_lazy_walrus["control_flow_hazards"]
+    ns_lazy: dict[str, Any] = {}
+    exec(lazy_walrus_src, ns_lazy)  # pylint: disable=exec-used
+    assert ns_lazy["f1"]([1, 2, 3]) == [101, 103, 106]
+
+    comp_target_shadow_src = (
+        "def f1(items):\n"
+        "    x = 0\n"
+        "    for step in items:\n"
+        "        x += step\n"
+        "    funcs = [(lambda: x) for x in items]\n"
+        "    return x, [fn() for fn in funcs]\n\n"
+        "def f2(items):\n"
+        "    x = 0\n"
+        "    for step in items:\n"
+        "        x += step\n"
+        "    funcs = [(lambda: x) for x in items]\n"
+        "    return x, [fn() for fn in funcs]\n"
+    )
+    u_cts1 = {
+        "start": 2,
+        "end": 4,
+        "kind": "compound_block",
+        "source_text": comp_target_shadow_src,
+        "source_code": "x = 0\nfor step in items:\n    x += step\n",
+    }
+    sc_cts1 = inspect_single_unit_scope(u_cts1)
+    assert "severed_closure_cell" not in sc_cts1["control_flow_hazards"]
+
+    shadowed_sum_tree = ast.parse(
+        "def outer(items, custom_sum):\n"
+        "    sum = custom_sum\n"
+        "    return sum(x for x in items)\n"
+    )
+    sum_fn_node = shadowed_sum_tree.body[0]
+    sum_ctx = _get_fn_scope_context(sum_fn_node, mod_tree=shadowed_sum_tree)
+    genexp_node = sum_fn_node.body[1].value.args[0]  # type: ignore[attr-defined]
+    assert (
+        _is_eagerly_consumed_genexp(
+            genexp_node,
+            sum_ctx.parent_map,
+            set(sum_ctx.shadowed_names),
+            sum_ctx.has_star_import,
+        )
+        is False
+    )
+
+    # Section 2.3: Precision of _is_closure_factory_scope for ClassDef and AsyncFunctionDef
+    factory_prec_tree = ast.parse(
+        "def outer(x):\n"
+        "    class PureRecord:\n"
+        "        a = 1\n"
+        "    class PureService:\n"
+        "        def compute(self, v):\n"
+        "            return v * 2\n"
+        "    class CapturingCls:\n"
+        "        def get(self):\n"
+        "            return x\n"
+        "    class MutatingCls:\n"
+        "        def inc(self):\n"
+        "            nonlocal x\n"
+        "            x += 1\n"
+        "    class FactoryCls:\n"
+        "        def make(self, a):\n"
+        "            return lambda: a\n"
+        "    class CarrierCls:\n"
+        "        def __init__(self):\n"
+        "            reg.append(lambda: x)\n"
+        "    async def pure_async(a, b):\n"
+        "        return a + b\n"
+        "    async def capturing_async():\n"
+        "        return x\n"
+        "    async def mutating_async():\n"
+        "        nonlocal x\n"
+        "        x += 1\n"
+        "    async def async_gen():\n"
+        "        yield 1\n"
+    )
+    f_prec_fn = factory_prec_tree.body[0]
+    f_prec_ctx = _get_fn_scope_context(f_prec_fn, mod_tree=factory_prec_tree)
+    body_nodes = {
+        getattr(n, "name", ""): n for n in f_prec_fn.body  # type: ignore[attr-defined]
+    }
+    assert _is_closure_factory_scope(body_nodes["PureRecord"], f_prec_ctx) is False
+    assert _is_closure_factory_scope(body_nodes["PureService"], f_prec_ctx) is False
+    assert _is_closure_factory_scope(body_nodes["CapturingCls"], f_prec_ctx) is True
+    assert _is_closure_factory_scope(body_nodes["MutatingCls"], f_prec_ctx) is True
+    assert _is_closure_factory_scope(body_nodes["FactoryCls"], f_prec_ctx) is True
+    assert _extract_fn_outer_carrier_targets(
+        body_nodes["CarrierCls"], frozenset(), f_prec_ctx
+    ) == {"reg"}
+    assert _is_closure_factory_scope(body_nodes["pure_async"], f_prec_ctx) is False
+    assert _is_closure_factory_scope(body_nodes["capturing_async"], f_prec_ctx) is True
+    assert _is_closure_factory_scope(body_nodes["mutating_async"], f_prec_ctx) is True
+    assert _is_closure_factory_scope(body_nodes["async_gen"], f_prec_ctx) is True
+
+    # Section 2.4: Transitive sibling-closure propagation (cyclic aliases, rebound aliases, factory chains)
+    cyclic_closures: list[tuple[str | None, set[str], set[str]]] = [
+        ("seed_cb", {"x"}, {"y"}),
+    ]
+    cyclic_edges: list[tuple[str, set[str]]] = [
+        ("alias_a", {"seed_cb", "alias_b"}),
+        ("alias_b", {"alias_a"}),
+        ("alias_c", {"alias_b"}),
+    ]
+    post_reads_cyc: set[str] = {"alias_c"}
+    prop_cyc = _propagate_sibling_closures(
+        cyclic_closures, post_reads=post_reads_cyc, alias_edges=cyclic_edges
+    )
+    by_name = {name: (r, m) for name, r, m in prop_cyc if name is not None}
+    assert by_name["alias_a"] == ({"x"}, {"y"})
+    assert by_name["alias_b"] == ({"x"}, {"y"})
+    assert by_name["alias_c"] == ({"x"}, {"y"})
+    assert "x" in post_reads_cyc
+
+    chain_factory_tree = ast.parse(
+        "def outer(flag):\n"
+        "    x = 1\n"
+        "    def raw_cb():\n"
+        "        return x\n"
+        "    def f1():\n"
+        "        return raw_cb\n"
+        "    def f2():\n"
+        "        return f1()\n"
+        "    picked = f2() if flag else raw_cb\n"
+        "    x = 2\n"
+        "    return picked()\n"
+    )
+    cf_info_2_4 = _analyze_enclosing_fn_cells(
+        chain_factory_tree.body[0],
+        _SpanBounds(10, 10),
+        unit_mutations=frozenset({"x"}),
+        mod_tree=chain_factory_tree,
+    )
+    assert "x" in cf_info_2_4.post_reads
+
+    # Section 2.5: Exception-handler implicit deletion and pattern-binding analysis
+    assert _is_irrefutable_pattern(None) is False
+    if sys.version_info >= (3, 10):
+        match_tree_2_5 = ast.parse(
+            "match subj:\n"
+            "    case _ if cond:\n"
+            "        a = 1\n"
+            "    case [only]:\n"
+            "        a = 2\n"
+            "    case 1 | _:\n"
+            "        a = 3\n"
+        )
+        m_cases = match_tree_2_5.body[0].cases  # type: ignore[attr-defined]
+        assert _is_irrefutable_case(m_cases[0]) is False
+        assert _is_irrefutable_case(m_cases[1]) is False
+        assert _is_irrefutable_case(m_cases[2]) is True
+
+    except_del_input_src = (
+        "def f(err):\n"
+        "    try:\n"
+        "        x = err + 1\n"
+        "    except Exception as err:\n"
+        "        x = 0\n"
+        "    return x\n"
+    )
+    sc_except_in = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 5,
+            "kind": "compound_block",
+            "source_text": except_del_input_src,
+            "source_code": "try:\n    x = err + 1\nexcept Exception as err:\n    x = 0\n",
+        }
+    )
+    assert "err" in sc_except_in["inputs"]
+    assert "deleted_output" in sc_except_in["control_flow_hazards"]
+    assert sc_except_in["is_control_flow_safe"] is False
+
+    try_finally_del_tree = ast.parse(
+        "def outer():\n"
+        "    surviving = 1\n"
+        "    deleted_in_handler = 2\n"
+        "    rebound_in_finally = 3\n"
+        "    try:\n"
+        "        risky()\n"
+        "        only_in_try = 4\n"
+        "        raise RuntimeError()\n"
+        "    except Exception as rebound_in_finally:\n"
+        "        del deleted_in_handler\n"
+        "        raise\n"
+        "    finally:\n"
+        "        rebound_in_finally = 30\n"
+        "    target = 0\n"
+    )
+    tf_info = _analyze_enclosing_fn_cells(
+        try_finally_del_tree.body[0],
+        _SpanBounds(14, 14),
+        mod_tree=try_finally_del_tree,
+    )
+    assert "surviving" in tf_info.pre_bound
+    assert "rebound_in_finally" in tf_info.pre_bound
+    assert "deleted_in_handler" not in tf_info.pre_bound
+    assert "only_in_try" not in tf_info.pre_bound
+
+    # Section 2.6: Concurrent closure and suspension analysis (generators and async coroutines)
+    async_coro_src = (
+        "async def run_task(items):\n"
+        "    x = 1\n"
+        "    async def async_reader():\n"
+        "        return x\n"
+        "    coro = async_reader()\n"
+        "    for item in items:\n"
+        "        x = x + item\n"
+        "        res = await coro\n"
+        "    return res\n"
+    )
+    sc_async_coro = inspect_single_unit_scope(
+        {
+            "start": 6,
+            "end": 8,
+            "kind": "compound_block",
+            "source_text": async_coro_src,
+            "source_code": "for item in items:\n    x = x + item\n    res = await coro\n",
+        }
+    )
+    assert "severed_closure_cell" in sc_async_coro["control_flow_hazards"]
+
+    pure_async_src = (
+        "async def run_pure(items):\n"
+        "    x = 1\n"
+        "    async def pure_helper(v):\n"
+        "        return v + 1\n"
+        "    coro = pure_helper(10)\n"
+        "    for item in items:\n"
+        "        x = x + item\n"
+        "        res = await coro\n"
+        "    return x + res\n"
+    )
+    sc_pure_async = inspect_single_unit_scope(
+        {
+            "start": 6,
+            "end": 8,
+            "kind": "compound_block",
+            "source_text": pure_async_src,
+            "source_code": "for item in items:\n    x = x + item\n    res = await coro\n",
+        }
+    )
+    assert "severed_closure_cell" not in sc_pure_async["control_flow_hazards"]
+
+    multi_gen_src = (
+        "def dual_generators(items):\n"
+        "    shared = 0\n"
+        "    def gen_peer():\n"
+        "        nonlocal shared\n"
+        "        shared += 10\n"
+        "        yield shared\n"
+        "    peer = gen_peer()\n"
+        "    for item in items:\n"
+        "        shared += item\n"
+        "        yield shared\n"
+        "    return next(peer)\n"
+    )
+    sc_multi_gen = inspect_single_unit_scope(
+        {
+            "start": 8,
+            "end": 10,
+            "kind": "compound_block",
+            "source_text": multi_gen_src,
+            "source_code": "for item in items:\n    shared += item\n    yield shared\n",
+        }
+    )
+    assert "severed_closure_cell" in sc_multi_gen["control_flow_hazards"]
+
+
+

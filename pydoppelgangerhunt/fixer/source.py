@@ -578,11 +578,6 @@ def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]
         return lines
     s_col = s_col_opt
     res = list(lines)
-    # Guard against pre-sliced token lines whose length is already shorter than
-    # the original line's starting byte column offset.
-    first_byte_len = len(res[0].rstrip("\r\n").encode("utf-8"))
-    if s_col >= first_byte_len:
-        return res
     src_code = unit.get("source_code")
     if (
         s_col > 0
@@ -591,12 +586,23 @@ def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]
         and "".join(res).strip() == src_code.strip()
     ):
         return res
+    # Guard against pre-sliced token lines whose length is already shorter than
+    # the original line's starting or ending byte column offset.
+    first_byte_len = len(res[0].rstrip("\r\n").encode("utf-8"))
     if len(res) == 1:
+        if s_col > first_byte_len or (
+            s_col == first_byte_len
+            and (e_col is None or e_col > first_byte_len)
+        ):
+            return res
         res[0] = _slice_utf8_line(res[0], s_col, e_col)
     else:
-        res[0] = _slice_utf8_line(res[0], s_col, None)
+        if 0 < s_col < first_byte_len:
+            res[0] = _slice_utf8_line(res[0], s_col, None)
         if e_col is not None:
-            res[-1] = _slice_utf8_line(res[-1], 0, e_col)
+            last_byte_len = len(res[-1].rstrip("\r\n").encode("utf-8"))
+            if e_col <= last_byte_len:
+                res[-1] = _slice_utf8_line(res[-1], 0, e_col)
     return res
 
 

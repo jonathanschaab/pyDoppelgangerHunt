@@ -1352,15 +1352,16 @@ def _analyze_block_assignment(
                     h_body, may_deleted=h_may, live_in_deleted=h_live
                 )
                 h_bound = {h.name} if isinstance(getattr(h, "name", None), str) else set()
-                h_may.difference_update(h_bound)
+                h_d.difference_update(h_bound)
+                h_may.update(h_bound)
                 live_in_del.update((h_live - h_bound) - definite)
                 h_term = _block_terminates(h_body)
-                eff_h_del = _extract_deleted_names(h_body) - h_d
+                eff_h_del = (_extract_deleted_names(h_body) - h_d) | h_bound
                 h_dels.append((eff_h_del, h_term))
                 if not h_term:
                     h_defs.append(h_d)
                     h_mays.append(h_may)
-                conditional.update((h_d | h_c) - definite)
+                conditional.update(((h_d | h_c) - h_bound) - definite)
 
             if not t_term:
                 if all_handlers_terminate:
@@ -2910,10 +2911,10 @@ def _merge_type_params(tp1: Sequence[str], tp2: Sequence[str]) -> List[str]:
 def scope_matches_closure_mode(
     scope: Optional[Dict[str, Any]], expected_skip: bool
 ) -> bool:
-    """Checks whether a precomputed scope dictionary matches expected_skip."""
-    if scope is None:
+    """Checks whether a precomputed scope dictionary explicitly matches expected_skip."""
+    if scope is None or "_skip_pre_unit_closures" not in scope:
         return False
-    raw_flag = scope.get("_skip_pre_unit_closures", False)
+    raw_flag = scope.get("_skip_pre_unit_closures")
     return isinstance(raw_flag, bool) and raw_flag is bool(expected_skip)
 
 
@@ -2926,10 +2927,9 @@ def ensure_unit_scope_closure_mode(
     tree: Optional[ast.AST] = None,
     repo_root: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Returns scope if its closure strictness mode matches or is caller-supplied, else recomputes it."""
+    """Returns scope if its closure strictness mode matches, else recomputes it."""
     if scope is not None and (
         scope_matches_closure_mode(scope, bool(skip_pre_unit_closures))
-        or "_skip_pre_unit_closures" not in scope
         or "pathological_ast" in scope.get("control_flow_hazards", ())
     ):
         return scope
@@ -2937,6 +2937,18 @@ def ensure_unit_scope_closure_mode(
     u_copy["skip_pre_unit_closures"] = bool(skip_pre_unit_closures)
     if source_text is not None:
         u_copy.setdefault("source_text", source_text)
+    if (
+        scope is not None
+        and "_skip_pre_unit_closures" not in scope
+        and (
+            "control_flow_hazards" not in scope
+            or (
+                tree is None
+                and not _load_unit_file_text(u_copy, repo_root=repo_root)
+            )
+        )
+    ):
+        return scope
     return inspect_single_unit_scope(u_copy, repo_root=repo_root, tree=tree)
 
 

@@ -25,6 +25,7 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _scope_cell_info_cache,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
+    _BUILTIN_NAMES,
     _COMPREHENSION_TYPES,
     _INNER_SCOPE_TYPES,
     _extract_comprehension_walrus_names,
@@ -1645,7 +1646,7 @@ def _propagate_sibling_closures(
 
 
 def _make_nested_fn_scope_context(
-    fn_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+    fn_node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef],
     own_locals: frozenset[str],
     scope_ctx: Optional[_FnScopeContext] = None,
 ) -> _FnScopeContext:
@@ -1690,10 +1691,50 @@ def _propagate_local_closure_syms(
 
 
 def _is_closure_factory_scope_uncached(
-    scope_node: ast.FunctionDef,
+    scope_node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef],
     scope_ctx: Optional[_FnScopeContext] = None,
 ) -> bool:
-    """Computes whether a FunctionDef can return a closure or generator without caching."""
+    """Computes whether a nested function or class can return a closure or carrier."""
+    if isinstance(scope_node, (ast.ClassDef, ast.AsyncFunctionDef)):
+        unshadowed_builtins = _BUILTIN_NAMES - (
+            set(scope_ctx.shadowed_names) if scope_ctx is not None else set()
+        )
+        has_free_or_nl = bool(
+            _extract_cached_scope_free_reads(scope_node) - unshadowed_builtins
+        ) or bool(
+            _extract_closure_nonlocal_mutations_and_deletions(scope_node)[0]
+        )
+        if isinstance(scope_node, ast.ClassDef):
+            has_deferred_member = any(
+                isinstance(
+                    sub,
+                    (
+                        ast.FunctionDef,
+                        ast.AsyncFunctionDef,
+                        ast.Lambda,
+                        ast.GeneratorExp,
+                    ),
+                )
+                and sub is not scope_node
+                for sub in ast.walk(scope_node)
+            )
+            if not has_deferred_member:
+                return False
+            if has_free_or_nl:
+                return True
+            return any(
+                isinstance(sub, (ast.Lambda, ast.GeneratorExp))
+                or (
+                    isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and _is_closure_factory_scope_uncached(sub, scope_ctx)
+                )
+                for sub in ast.walk(scope_node)
+                if sub is not scope_node
+            )
+        if has_free_or_nl or any(
+            _extract_fn_returned_closure_refs(scope_node, scope_ctx)
+        ):
+            return True
     own_locals = frozenset(_extract_strict_fn_local_names(scope_node))
     local_ctx = _make_nested_fn_scope_context(scope_node, own_locals, scope_ctx)
     has_nested_closure = False
@@ -1757,9 +1798,9 @@ def _is_closure_factory_scope(
     scope_ctx: Optional[_FnScopeContext] = None,
 ) -> bool:
     """Checks whether a nested function or class can return a closure or generator/coroutine."""
-    if isinstance(scope_node, (ast.ClassDef, ast.AsyncFunctionDef)):
-        return True
-    if not isinstance(scope_node, ast.FunctionDef):
+    if not isinstance(
+        scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    ):
         return False
     cache_key = _ScopeCacheKey(
         scope_node,
@@ -1835,7 +1876,7 @@ def _extract_fn_returned_closure_refs(
 
 
 def _extract_fn_outer_carrier_targets_uncached(
-    fn_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+    fn_node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef],
     fn_globals: AbstractSet[str] = frozenset(),
     scope_ctx: Optional[_FnScopeContext] = None,
 ) -> frozenset[str]:
@@ -1856,7 +1897,11 @@ def _extract_fn_outer_carrier_targets_uncached(
     )
     if not has_closure:
         return frozenset()
-    own_locals = _extract_strict_fn_local_names(fn_node)
+    own_locals = (
+        set()
+        if isinstance(fn_node, ast.ClassDef)
+        else _extract_strict_fn_local_names(fn_node)
+    )
     local_ctx = _make_nested_fn_scope_context(
         fn_node, frozenset(own_locals), scope_ctx
     )
@@ -1957,7 +2002,9 @@ def _extract_fn_outer_carrier_targets(
     scope_ctx: Optional[_FnScopeContext] = None,
 ) -> Set[str]:
     """Extracts outer-scope container/variable names mutated by carrier operations in fn_node."""
-    if not isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    if not isinstance(
+        fn_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    ):
         return set()
     return set(
         _get_or_compute_scope_cached(

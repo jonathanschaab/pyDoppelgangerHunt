@@ -334,8 +334,13 @@ def _eval_try_definite_bindings(
 
     if not fallthrough_sets:
         if final_l:
+            final_surviving = set(pre_try_surviving)
+            for sub_stmt in (*orelse_l, *handlers_l):
+                final_surviving.difference_update(
+                    _extract_shallow_deleted_names(sub_stmt)
+                )
             f_bound, _ = _extract_block_definite_bindings_and_term(
-                final_l, active_nonlocals, pre_try_surviving, fn_globals
+                final_l, active_nonlocals, final_surviving, fn_globals
             )
             return f_bound, True
         return set(), True
