@@ -70,7 +70,7 @@ def _find_enclosing_loops(
     u_start_col: Optional[int] = None,
 ) -> List[Tuple[int, int]]:
     """Detects loops enclosing the unit boundaries for loop-carried dependence analysis."""
-    def _compute() -> List[Tuple[int, int, int]]:
+    def _compute() -> Tuple[Tuple[int, int, int], ...]:
         loops: List[Tuple[int, int, int]] = []
         for node in ast.walk(scope_node):
             if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
@@ -80,7 +80,7 @@ def _find_enclosing_loops(
                 if l_start <= 0 or l_end <= 0:
                     continue
                 loops.append((int(l_start), int(l_end), int(l_col)))
-        return loops
+        return tuple(loops)
 
     cached_loops = _get_or_compute_scope_cached(
         _scope_loops_cache, scope_node, _compute

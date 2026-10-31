@@ -12,6 +12,7 @@ from typing import (
     Mapping,
     NamedTuple,
     Optional,
+    Sequence,
     Set,
     Tuple,
     Union,
@@ -324,13 +325,111 @@ def _get_cached_single_node_local_names(scope_node: ast.AST) -> frozenset[str]:
     )
 
 
+def _collect_ancestors_from_parent_map(
+    start_node: ast.AST,
+    parent_map: Mapping[ast.AST, ast.AST],
+    module_tree: ast.AST,
+    *,
+    include_classes: bool = False,
+) -> List[ast.AST]:
+    """Walks parent_map from start_node, keeping immediate ClassDef and enclosing functions/module."""
+    ancestors: List[ast.AST] = []
+    curr: Optional[ast.AST] = parent_map.get(start_node)
+    first_scope = True
+    visited_mod = False
+    while curr is not None:
+        if curr is module_tree:
+            visited_mod = True
+        if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+            ancestors.append(curr)
+            first_scope = False
+        elif isinstance(curr, ast.ClassDef):
+            if include_classes or first_scope:
+                ancestors.append(curr)
+            first_scope = False
+        curr = parent_map.get(curr)
+    if not visited_mod and isinstance(
+        module_tree, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
+    ):
+        ancestors.append(module_tree)
+    return ancestors
+
+
+def _resolve_detached_enclosing_scopes(
+    scope_node: ast.AST,
+    module_tree: ast.AST,
+    *,
+    include_classes: bool = False,
+) -> List[ast.AST]:
+    """Resolves enclosing lexical scope AST nodes in module_tree for a detached unit ast.Module."""
+    parent_map = _get_scope_parent_map(module_tree)
+    body = getattr(scope_node, "body", ())
+    stmts = [s for s in body if isinstance(s, ast.AST)] if isinstance(body, (list, tuple)) else []
+    if not stmts:
+        return [module_tree] if isinstance(module_tree, ast.Module) else []
+    first_stmt = stmts[0]
+    if first_stmt in parent_map:
+        return _collect_ancestors_from_parent_map(
+            first_stmt, parent_map, module_tree, include_classes=include_classes
+        )
+    s_line = getattr(first_stmt, "lineno", None)
+    e_line = getattr(stmts[-1], "end_lineno", getattr(stmts[-1], "lineno", None))
+    if isinstance(s_line, int) and s_line > 1 and isinstance(e_line, int):
+        s_col = getattr(first_stmt, "col_offset", None)
+        e_col = getattr(stmts[-1], "end_col_offset", None)
+        matched_fns: List[ast.AST] = []
+        for node in ast.walk(module_tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                n_start = getattr(node, "lineno", 0) or 0
+                n_end = getattr(node, "end_lineno", n_start) or n_start
+                if n_start <= s_line and e_line <= n_end and not _is_span_in_scope_header(
+                    node, s_line, e_line, u_start_col=s_col, u_end_col=e_col
+                ):
+                    matched_fns.append(node)
+        if matched_fns:
+            matched_fns.sort(
+                key=lambda n: (
+                    int(getattr(n, "lineno", 0) or 0),
+                    -int(getattr(n, "end_lineno", 0) or 0),
+                    int(getattr(n, "col_offset", 0) or 0),
+                )
+            )
+            imm = _resolve_immediate_scope_in_fn(
+                matched_fns[-1], s_line, e_line, u_start_col=s_col, u_end_col=e_col
+            )
+            res = list(matched_fns)
+            if isinstance(imm, ast.ClassDef):
+                res.append(imm)
+            if isinstance(module_tree, ast.Module):
+                res.append(module_tree)
+            return res
+    target_dump = ast.dump(first_stmt)
+    inner_dump = (
+        ast.dump(first_stmt.value) if isinstance(first_stmt, ast.Expr) else None
+    )
+    for cand in ast.walk(module_tree):
+        if isinstance(cand, (ast.stmt, ast.expr)) and cand in parent_map:
+            c_dump = ast.dump(cand)
+            if c_dump == target_dump or (
+                inner_dump is not None and c_dump == inner_dump
+            ):
+                return _collect_ancestors_from_parent_map(
+                    cand,
+                    parent_map,
+                    module_tree,
+                    include_classes=include_classes,
+                )
+    return [module_tree] if isinstance(module_tree, ast.Module) else []
+
+
 def _extract_scope_local_names(
     scope_node: ast.AST,
     module_tree: Optional[ast.AST] = None,
     *,
-    include_classes: bool = True,
+    include_classes: bool = False,
     include_self_name: bool = True,
     cache_scope_node: bool = True,
+    enclosing_scopes: Sequence[ast.AST] = (),
 ) -> Set[str]:
     """Extracts parameters and locally assigned/imported/defined symbols in scope_node
     and all enclosing scopes up to module level."""
@@ -344,6 +443,8 @@ def _extract_scope_local_names(
                 scope_node, include_self_name=False
             )
         )
+    for enc in enclosing_scopes:
+        names.update(_get_cached_single_node_local_names(enc))
     allowed_types = (
         (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
         if include_classes
@@ -352,6 +453,12 @@ def _extract_scope_local_names(
     if module_tree is not None and module_tree is not scope_node:
         parent_map = _get_scope_parent_map(module_tree)
         curr: Optional[ast.AST] = parent_map.get(scope_node)
+        if curr is None and not enclosing_scopes:
+            for enc in _resolve_detached_enclosing_scopes(
+                scope_node, module_tree, include_classes=include_classes
+            ):
+                names.update(_get_cached_single_node_local_names(enc))
+            return names
         visited_module_tree = False
         while curr is not None:
             if curr is module_tree:
@@ -417,15 +524,26 @@ def _has_wildcard_star_import(
     module_tree: Optional[ast.AST] = None,
     *,
     cache_scope_node: bool = True,
+    enclosing_scopes: Sequence[ast.AST] = (),
 ) -> bool:
     """Checks whether scope_node or any enclosing scope contains a wildcard star import."""
+    if any(_node_has_star_import(enc, use_cache=True) for enc in enclosing_scopes):
+        return True
     if module_tree is not None:
         if _node_has_star_import(module_tree, use_cache=True):
             return True
         if scope_node is not module_tree and scope_node not in _get_scope_parent_map(
             module_tree
         ):
-            return _node_has_star_import(scope_node, use_cache=cache_scope_node)
+            if _node_has_star_import(scope_node, use_cache=cache_scope_node):
+                return True
+            if not enclosing_scopes:
+                return any(
+                    _node_has_star_import(enc, use_cache=True)
+                    for enc in _resolve_detached_enclosing_scopes(
+                        scope_node, module_tree
+                    )
+                )
         return False
     return _node_has_star_import(scope_node, use_cache=cache_scope_node)
 
@@ -465,6 +583,7 @@ def _collect_scope_closures_uncached(
     *,
     genexp_include_header: bool = True,
     cache_parent_map: bool = True,
+    enclosing_scopes: Sequence[ast.AST] = (),
 ) -> List[Tuple[_ClosurePos, Set[str]]]:
     closures: List[Tuple[_ClosurePos, Set[str]]] = []
     use_parent_cache = cache_parent_map and not (
@@ -477,11 +596,13 @@ def _collect_scope_closures_uncached(
         scope_node,
         module_tree=module_tree,
         cache_scope_node=use_parent_cache,
+        enclosing_scopes=enclosing_scopes,
     )
     has_star_import = _has_wildcard_star_import(
         scope_node,
         module_tree=module_tree,
         cache_scope_node=use_parent_cache,
+        enclosing_scopes=enclosing_scopes,
     )
 
     def _resolve_stmt_start_pos(s: ast.AST) -> Tuple[int, int]:
@@ -494,11 +615,15 @@ def _collect_scope_closures_uncached(
             default_line: int,
             default_col: int,
             bound_names: AbstractSet[str] = frozenset(),
+            active_shadowed: Optional[Set[str]] = None,
         ) -> None:
             super().__init__()
             self.default_line = default_line
             self.default_col = default_col
             self.bound_names = bound_names
+            self.active_shadowed = (
+                shadowed_names if active_shadowed is None else active_shadowed
+            )
 
         def _record_closure_node(
             self,
@@ -542,7 +667,10 @@ def _collect_scope_closures_uncached(
 
         def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
             if _is_eagerly_consumed_genexp(
-                node, parent_map, shadowed_names, has_star_import=has_star_import
+                node,
+                parent_map,
+                self.active_shadowed,
+                has_star_import=has_star_import,
             ):
                 self._visit_comprehension(node)
             else:
@@ -555,8 +683,11 @@ def _collect_scope_closures_uncached(
         default_line: int,
         default_col: int,
         bound_names: AbstractSet[str] = frozenset(),
+        active_shadowed: Optional[Set[str]] = None,
     ) -> None:
-        collector = _ExprClosureCollector(default_line, default_col, bound_names)
+        collector = _ExprClosureCollector(
+            default_line, default_col, bound_names, active_shadowed
+        )
         for node in nodes:
             collector.visit(node)
 
@@ -584,7 +715,13 @@ def _collect_scope_closures_uncached(
     def _walk_stmts(
         stmts: Iterable[ast.AST],
         bound_names: AbstractSet[str] = frozenset(),
+        cls_shadowed: AbstractSet[str] = frozenset(),
     ) -> None:
+        eff_shadowed = (
+            shadowed_names | set(cls_shadowed)
+            if cls_shadowed
+            else shadowed_names
+        )
         for stmt in stmts:
             stmt_start, stmt_col = _resolve_stmt_start_pos(stmt)
 
@@ -595,6 +732,7 @@ def _collect_scope_closures_uncached(
                     stmt_start,
                     stmt_col,
                     bound_names,
+                    eff_shadowed,
                 )
                 inner_bound = bound_names | _extract_node_type_param_names(stmt)
                 fn_scoped_exprs = (
@@ -607,7 +745,11 @@ def _collect_scope_closures_uncached(
                     + list(getattr(stmt, "type_params", []))
                 )
                 _record_expr_closures(
-                    fn_scoped_exprs, stmt_start, stmt_col, inner_bound
+                    fn_scoped_exprs,
+                    stmt_start,
+                    stmt_col,
+                    inner_bound,
+                    eff_shadowed,
                 )
                 body_reads = (
                     _extract_nested_scope_free_reads(stmt, include_header=False)
@@ -621,7 +763,11 @@ def _collect_scope_closures_uncached(
 
             if isinstance(stmt, ast.ClassDef):
                 _record_expr_closures(
-                    stmt.decorator_list, stmt_start, stmt_col, bound_names
+                    stmt.decorator_list,
+                    stmt_start,
+                    stmt_col,
+                    bound_names,
+                    eff_shadowed,
                 )
                 inner_bound = bound_names | _extract_node_type_param_names(stmt)
                 class_scoped_exprs = (
@@ -630,20 +776,31 @@ def _collect_scope_closures_uncached(
                     + list(getattr(stmt, "type_params", []))
                 )
                 _record_expr_closures(
-                    class_scoped_exprs, stmt_start, stmt_col, inner_bound
+                    class_scoped_exprs,
+                    stmt_start,
+                    stmt_col,
+                    inner_bound,
+                    eff_shadowed,
                 )
-                _walk_stmts(stmt.body, inner_bound)
+                inner_cls_shadowed = frozenset(
+                    _extract_single_node_local_names(stmt)
+                )
+                _walk_stmts(stmt.body, inner_bound, inner_cls_shadowed)
                 continue
 
             header_bound = bound_names | _extract_node_type_param_names(stmt)
             _record_expr_closures(
-                _extract_header_nodes(stmt), stmt_start, stmt_col, header_bound
+                _extract_header_nodes(stmt),
+                stmt_start,
+                stmt_col,
+                header_bound,
+                eff_shadowed,
             )
 
             for attr in ("body", "orelse", "finalbody"):
                 sub_stmts = getattr(stmt, attr, None)
                 if isinstance(sub_stmts, list):
-                    _walk_stmts(sub_stmts, bound_names)
+                    _walk_stmts(sub_stmts, bound_names, cls_shadowed)
 
             # Intentional precision trade-off: treat ExceptHandler.name and match_case
             # pattern bindings as locally bound inside their respective blocks so closures
@@ -655,13 +812,15 @@ def _collect_scope_closures_uncached(
                     if isinstance(h_name, str)
                     else bound_names
                 )
-                _walk_stmts(getattr(handler, "body", []), h_bound)
+                _walk_stmts(getattr(handler, "body", []), h_bound, cls_shadowed)
 
             for case in getattr(stmt, "cases", []):
                 pattern = getattr(case, "pattern", None)
                 case_bound = bound_names
                 if isinstance(pattern, ast.AST):
-                    _record_expr_closures([pattern], stmt_start, stmt_col, bound_names)
+                    _record_expr_closures(
+                        [pattern], stmt_start, stmt_col, bound_names, eff_shadowed
+                    )
                     pattern_names = {
                         name
                         for sub in ast.walk(pattern)
@@ -672,8 +831,10 @@ def _collect_scope_closures_uncached(
                         case_bound = bound_names | pattern_names
                 guard = getattr(case, "guard", None)
                 if isinstance(guard, ast.AST):
-                    _record_expr_closures([guard], stmt_start, stmt_col, case_bound)
-                _walk_stmts(getattr(case, "body", []), case_bound)
+                    _record_expr_closures(
+                        [guard], stmt_start, stmt_col, case_bound, eff_shadowed
+                    )
+                _walk_stmts(getattr(case, "body", []), case_bound, cls_shadowed)
 
     raw_scope_body = getattr(scope_node, "body", [])
     scope_stmts = (
@@ -701,7 +862,9 @@ def _collect_scope_closures(
     return _get_or_compute_scope_cached(
         _scope_closures_cache,
         cache_key,
-        lambda: _collect_scope_closures_uncached(scope_node, module_tree=module_tree),
+        lambda: _collect_scope_closures_uncached(
+            scope_node, module_tree=module_tree
+        ),
     )
 
 
@@ -906,18 +1069,18 @@ def _resolve_immediate_scope_in_fn(
     return best
 
 
-def _extract_scope_nonlocals_and_outer_globals(
+def _extract_scope_nonlocals_and_globals_sets(
     scope_node: ast.AST,
     u_start: int,
     u_end: int,
     u_start_col: Optional[int] = None,
     u_end_col: Optional[int] = None,
-) -> Tuple[Set[str], Set[str]]:
-    """Extracts (nonlocal_names, outer_only_globals) declared in the unit's immediate scope."""
+) -> Tuple[ast.AST, Set[str], Set[str], Set[str]]:
+    """Extracts (target_scope, nonlocal_names, outer_globals, intra_globals) in immediate scope."""
     if not isinstance(
         scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
     ):
-        return set(), set()
+        return scope_node, set(), set(), set()
     target_scope = _resolve_immediate_scope_in_fn(
         scope_node,
         u_start,
@@ -950,7 +1113,121 @@ def _extract_scope_nonlocals_and_outer_globals(
                 outer_globals.update(curr.names)
             continue
         stack.extend(ast.iter_child_nodes(curr))
+    return target_scope, nonlocal_names, outer_globals, intra_globals
+
+
+def _extract_scope_nonlocals_and_outer_globals(
+    scope_node: ast.AST,
+    u_start: int,
+    u_end: int,
+    u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
+) -> Tuple[Set[str], Set[str]]:
+    """Extracts (nonlocal_names, outer_only_globals) declared in the unit's immediate scope."""
+    _, nonlocal_names, outer_globals, intra_globals = (
+        _extract_scope_nonlocals_and_globals_sets(
+            scope_node,
+            u_start,
+            u_end,
+            u_start_col=u_start_col,
+            u_end_col=u_end_col,
+        )
+    )
     return nonlocal_names, outer_globals - intra_globals
+
+
+def _has_escaped_intra_unit_global_declarations(
+    scope_node: ast.AST,
+    u_start: int,
+    u_end: int,
+    u_start_col: Optional[int] = None,
+    u_end_col: Optional[int] = None,
+    *,
+    is_subroutine: bool = True,
+) -> bool:
+    """Checks if an in-unit global declaration affects symbol bindings outside the unit."""
+    target_scope, _, outer_globals, intra_globals = (
+        _extract_scope_nonlocals_and_globals_sets(
+            scope_node,
+            u_start,
+            u_end,
+            u_start_col=u_start_col,
+            u_end_col=u_end_col,
+        )
+    )
+    if not intra_globals:
+        return False
+    if not is_subroutine:
+        return True
+    intra_only_globals = intra_globals - outer_globals
+    if not intra_only_globals:
+        return False
+    body = getattr(target_scope, "body", [])
+    stack: List[ast.AST] = list(body) if isinstance(body, list) else []
+    while stack:
+        curr = stack.pop()
+        if isinstance(
+            curr, (ast.Global, ast.Nonlocal)
+        ) or _is_ast_node_within_unit_bounds(
+            curr, u_start, u_end, u_end_col=u_end_col, u_start_col=u_start_col
+        ):
+            continue
+        if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if curr.name in intra_only_globals:
+                return True
+            if _extract_nested_scope_free_reads(curr) & intra_only_globals:
+                return True
+            stack.extend(iter_nested_scope_header_nodes(curr))
+            continue
+        if isinstance(curr, (ast.Lambda, *_COMPREHENSION_TYPES)):
+            if not _node_strictly_encloses_bounds(
+                curr,
+                u_start,
+                u_end,
+                u_start_col=u_start_col,
+                u_end_col=u_end_col,
+            ):
+                if (
+                    _extract_nested_scope_free_reads(curr, include_header=True)
+                    & intra_only_globals
+                ):
+                    return True
+                if (
+                    isinstance(curr, _COMPREHENSION_TYPES)
+                    and not isinstance(target_scope, ast.ClassDef)
+                    and (
+                        _extract_comprehension_walrus_names(curr)
+                        & intra_only_globals
+                    )
+                ):
+                    return True
+                continue
+        if isinstance(curr, ast.Name) and curr.id in intra_only_globals:
+            return True
+        if isinstance(curr, (ast.Import, ast.ImportFrom)):
+            imp_names: Set[str] = set()
+            _record_import_names(curr, imp_names)
+            if imp_names & intra_only_globals:
+                return True
+        elif (
+            isinstance(curr, ast.ExceptHandler)
+            and isinstance(curr.name, str)
+            and curr.name in intra_only_globals
+        ):
+            return True
+        elif type(curr).__name__ == "TypeAlias":
+            alias_name = getattr(curr, "name", None)
+            if (
+                isinstance(alias_name, ast.Name)
+                and alias_name.id in intra_only_globals
+            ):
+                return True
+        else:
+            pat_name = _extract_pattern_bound_name(curr)
+            if pat_name is not None and pat_name in intra_only_globals:
+                return True
+        stack.extend(ast.iter_child_nodes(curr))
+    return False
 
 
 def _extract_scope_escaping_bindings(

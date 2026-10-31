@@ -109,6 +109,8 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _collect_scope_closures_uncached,
     _extract_comprehension_walrus_names,
     _extract_scope_nonlocals_and_outer_globals,
+    _has_escaped_intra_unit_global_declarations,
+    _resolve_immediate_scope_in_fn,
 )
 
 __all__ = [
@@ -172,6 +174,9 @@ def _check_intra_unit_nonlocal_mutators(
     chain_infos: Sequence[_EnclosingFnCellInfo],
     *,
     is_subroutine: bool = True,
+    is_suspended: bool = False,
+    eff_input_set: AbstractSet[str] = frozenset(),
+    enc_escaping: AbstractSet[str] = frozenset(),
 ) -> bool:
     """Check 3: intra-unit closure mutates an outer cell or escaping top-level variable."""
     if not intra_nl_mutators:
@@ -182,12 +187,15 @@ def _check_intra_unit_nonlocal_mutators(
         else set()
     )
     top_locals_set = set(unit_top_locals)
+    outer_escape_targets = (
+        all_chain_locals | set(enc_escaping) | set(nonlocal_set)
+    )
     for mut_entry in intra_nl_mutators:
         mutated_vars = mut_entry[1]
         escaping_nl_muts = (mutated_vars - top_locals_set) | (
-            mutated_vars & set(nonlocal_set)
+            mutated_vars & (set(nonlocal_set) | set(enc_escaping))
         )
-        if bool(escaping_nl_muts & all_chain_locals):
+        if bool(escaping_nl_muts & outer_escape_targets):
             return True
 
     if not is_subroutine:
@@ -226,8 +234,12 @@ def _check_intra_unit_nonlocal_mutators(
         )
         for var in mutated_vars & top_locals_set:
             if var in outer_sib_cells or (
-                mut_fn_escapes
-                and (var in outer_touched or var in all_post_reads)
+                (mut_fn_escapes or is_suspended)
+                and (
+                    var in outer_touched
+                    or var in all_post_reads
+                    or var in eff_input_set
+                )
             ):
                 return True
     return False
@@ -416,6 +428,15 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     if not expr_unit_stores_escape and bool(nonlocal_set & unit_mutated_names):
         return True
 
+    if _has_escaped_intra_unit_global_declarations(
+        enclosing_chain[-1][2],
+        ctx.u_start,
+        ctx.u_end,
+        u_start_col=u_start_col,
+        u_end_col=u_end_col,
+        is_subroutine=ctx.is_subroutine,
+    ):
+        return True
     enc_nonlocals, enc_outer_globals = _extract_scope_nonlocals_and_outer_globals(
         enclosing_chain[-1][2],
         ctx.u_start,
@@ -429,15 +450,24 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         & (enc_outer_globals if ctx.is_subroutine else enc_escaping)
     ):
         return True
+    imm_scope = _resolve_immediate_scope_in_fn(
+        enclosing_chain[-1][2],
+        ctx.u_start,
+        ctx.u_end,
+        u_start_col=u_start_col,
+        u_end_col=u_end_col,
+    )
+    unit_enclosing_scopes: List[ast.AST] = [
+        enc_fn for _, _, enc_fn in enclosing_chain
+    ] + ([imm_scope] if isinstance(imm_scope, ast.ClassDef) else [])
     intra_nl_mutators = _collect_unit_nonlocal_mutators(
-        ctx.candidate_stmts, mod_tree=ctx.mod_tree
+        ctx.candidate_stmts,
+        mod_tree=ctx.mod_tree,
+        enclosing_scopes=unit_enclosing_scopes,
     )
     is_suspended = ctx.is_subroutine and (ctx.has_yield or ctx.is_async)
-    if is_suspended:
-        if bool(unit_mutated_names & (enc_escaping | nonlocal_set)) or bool(
-            intra_nl_mutators
-        ):
-            return True
+    if is_suspended and bool(unit_mutated_names & (enc_escaping | nonlocal_set)):
+        return True
 
     if ctx.is_subroutine and _extract_direct_nonlocals(unit_mod):
         return True
@@ -446,6 +476,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         module_tree=ctx.mod_tree,
         genexp_include_header=False,
         cache_parent_map=False,
+        enclosing_scopes=unit_enclosing_scopes,
     )
     unit_closure_reads: Set[str] = (
         set().union(*(reads for _, reads in unit_closures))
@@ -523,6 +554,9 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
             cond_exported_closure_capture = (
                 output_set & set(imm_info.post_reads) & unit_closure_reads
             )
+            unexported_pre_post = (
+                (imm_info.pre_mutated & imm_info.post_reads) - output_set
+            )
             if bool(
                 unseeded_cond_stores
                 & imm_info.fn_locals
@@ -530,6 +564,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
                     eff_sib_reads
                     | cond_pre_post
                     | cond_exported_closure_capture
+                    | unexported_pre_post
                 )
             ):
                 return True
@@ -551,6 +586,9 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
             nonlocal_set,
             chain_infos,
             is_subroutine=ctx.is_subroutine,
+            is_suspended=is_suspended,
+            eff_input_set=eff_input_set,
+            enc_escaping=enc_escaping,
         )
         or _check_captured_cell_mutations(
             captured_candidates,

@@ -31,6 +31,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _extract_comprehension_walrus_names,
     _extract_node_type_param_names,
     _extract_scope_local_names,
+    _extract_single_node_local_names,
     _extract_strict_fn_local_names,
     _has_wildcard_star_import,
     _is_eagerly_consumed_genexp,
@@ -63,6 +64,7 @@ def _get_fn_scope_context_uncached(
     mod_tree: Optional[ast.AST] = None,
     *,
     cache_parent_map: bool = True,
+    enclosing_scopes: Sequence[ast.AST] = (),
 ) -> _FnScopeContext:
     """Computes lexical scope metadata for a function or ephemeral unit module without caching."""
     raw_parent_map = _get_scope_parent_map(
@@ -76,12 +78,14 @@ def _get_fn_scope_context_uncached(
                 scope_node,
                 module_tree=mod_tree,
                 cache_scope_node=cache_parent_map,
+                enclosing_scopes=enclosing_scopes,
             )
         ),
         has_star_import=_has_wildcard_star_import(
             scope_node,
             module_tree=mod_tree,
             cache_scope_node=cache_parent_map,
+            enclosing_scopes=enclosing_scopes,
         ),
     )
 
@@ -828,28 +832,48 @@ class _IntraUnitMutator(NamedTuple):
 def _collect_unit_nonlocal_mutators(
     candidate_stmts: Sequence[ast.stmt],
     mod_tree: Optional[ast.AST] = None,
+    *,
+    enclosing_scopes: Sequence[ast.AST] = (),
 ) -> List[_IntraUnitMutator]:
     """Collects intra-unit nested functions/classes and lazy genexps that mutate outer cells."""
     unit_mod = ast.Module(
         body=[s for s in candidate_stmts if isinstance(s, ast.stmt)],
         type_ignores=[],
     )
-    scope_ctx = _get_fn_scope_context_uncached(
-        unit_mod, mod_tree=mod_tree, cache_parent_map=False
+    fn_enclosing = [
+        s for s in enclosing_scopes if not isinstance(s, ast.ClassDef)
+    ]
+    base_fn_ctx = _get_fn_scope_context_uncached(
+        unit_mod,
+        mod_tree=mod_tree,
+        cache_parent_map=False,
+        enclosing_scopes=fn_enclosing,
+    )
+    top_ctx = (
+        _get_fn_scope_context_uncached(
+            unit_mod,
+            mod_tree=mod_tree,
+            cache_parent_map=False,
+            enclosing_scopes=enclosing_scopes,
+        )
+        if len(fn_enclosing) != len(enclosing_scopes)
+        else base_fn_ctx
     )
     mutators: List[_IntraUnitMutator] = []
-    stack: List[Tuple[ast.AST, frozenset[str]]] = [
-        (stmt, frozenset()) for stmt in candidate_stmts
+    stack: List[
+        Tuple[ast.AST, frozenset[str], _FnScopeContext, _FnScopeContext]
+    ] = [
+        (stmt, frozenset(), base_fn_ctx, top_ctx) for stmt in candidate_stmts
     ]
     while stack:
-        curr, shadowed = stack.pop()
+        curr, shadowed, fn_ctx, active_ctx = stack.pop()
         if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             mutated = _extract_closure_nonlocal_mutations(curr) - shadowed
             if mutated:
                 is_escaped_def = (
                     isinstance(curr, ast.ClassDef)
                     or bool(curr.decorator_list)
-                    or _is_closure_factory_scope(curr, scope_ctx)
+                    or _is_closure_factory_scope(curr, active_ctx)
                 )
                 mutators.append(
                     _IntraUnitMutator(
@@ -860,17 +884,30 @@ def _collect_unit_nonlocal_mutators(
                 # PEP 227: class body bindings and class-level global declarations do not
                 # create a lexical barrier for nonlocal declarations in nested methods.
                 body_shadowed = shadowed
-            else:
-                body_shadowed = shadowed | frozenset(
-                    _extract_strict_fn_local_names(curr)
+                body_fn_ctx = fn_ctx
+                body_active_ctx = _make_nested_fn_scope_context(
+                    curr,
+                    frozenset(_extract_single_node_local_names(curr)),
+                    fn_ctx,
                 )
-            stack.extend((ch, body_shadowed) for ch in curr.body)
+            else:
+                fn_own = frozenset(_extract_strict_fn_local_names(curr))
+                body_shadowed = shadowed | fn_own
+                body_fn_ctx = _make_nested_fn_scope_context(
+                    curr, fn_own, fn_ctx
+                )
+                body_active_ctx = body_fn_ctx
             stack.extend(
-                (hdr, shadowed) for hdr in iter_nested_scope_header_nodes(curr)
+                (ch, body_shadowed, body_fn_ctx, body_active_ctx)
+                for ch in curr.body
+            )
+            stack.extend(
+                (hdr, shadowed, fn_ctx, active_ctx)
+                for hdr in iter_nested_scope_header_nodes(curr)
             )
             continue
         if isinstance(curr, ast.GeneratorExp):
-            if _is_lazy_genexp(curr, scope_ctx):
+            if _is_lazy_genexp(curr, active_ctx):
                 w_names = (
                     _extract_comprehension_body_walrus_names(curr) - shadowed
                 )
@@ -879,16 +916,25 @@ def _collect_unit_nonlocal_mutators(
                         _IntraUnitMutator("", w_names, True, node=curr)
                     )
                 if curr.generators:
-                    stack.append((curr.generators[0].iter, shadowed))
+                    stack.append(
+                        (curr.generators[0].iter, shadowed, fn_ctx, active_ctx)
+                    )
                 continue
-            stack.extend((ch, shadowed) for ch in ast.iter_child_nodes(curr))
+            stack.extend(
+                (ch, shadowed, fn_ctx, active_ctx)
+                for ch in ast.iter_child_nodes(curr)
+            )
             continue
         if isinstance(curr, ast.Lambda):
             stack.extend(
-                (hdr, shadowed) for hdr in iter_nested_scope_header_nodes(curr)
+                (hdr, shadowed, fn_ctx, active_ctx)
+                for hdr in iter_nested_scope_header_nodes(curr)
             )
             continue
-        stack.extend((ch, shadowed) for ch in ast.iter_child_nodes(curr))
+        stack.extend(
+            (ch, shadowed, fn_ctx, active_ctx)
+            for ch in ast.iter_child_nodes(curr)
+        )
     return mutators
 
 

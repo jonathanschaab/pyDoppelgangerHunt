@@ -39,7 +39,7 @@ _scope_stmts_by_end: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDi
 _scope_stmts_by_start: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
 _scope_closures_cache: OrderedDict[Any, List[Tuple[Any, Set[str]]]] = OrderedDict()
 _scope_cell_info_cache: OrderedDict[Any, Any] = OrderedDict()
-_scope_loops_cache: OrderedDict[ast.AST, List[Tuple[int, int, int]]] = OrderedDict()
+_scope_loops_cache: OrderedDict[ast.AST, Tuple[Tuple[int, int, int], ...]] = OrderedDict()
 _scope_try_with_cache: OrderedDict[ast.AST, List[ast.AST]] = OrderedDict()
 _warned_lenient_closure: List[bool] = [False]
 
@@ -53,13 +53,44 @@ _SCOPE_ROOT_TYPES: Tuple[type, ...] = (
 )
 
 
-class _ScopeCacheKey(NamedTuple):
-    """Uniform cache key with explicit AST owner(s) for O(1) tree eviction."""
+def _params_contain_ast(params: Tuple[Any, ...]) -> bool:
+    """Checks whether any element or nested tuple/frozenset in params is an ast.AST node."""
+    stack: List[Any] = list(params)
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, ast.AST):
+            return True
+        if isinstance(curr, (tuple, frozenset)):
+            stack.extend(curr)
+    return False
+
+
+class _BaseScopeCacheKey(NamedTuple):
+    """Base NamedTuple layout for _ScopeCacheKey."""
 
     owner: ast.AST
     kind: str
     params: Tuple[Any, ...] = ()
     aux_ast_nodes: Tuple[ast.AST, ...] = ()
+
+
+class _ScopeCacheKey(_BaseScopeCacheKey):
+    """Uniform cache key with explicit AST owner(s) for O(1) tree eviction."""
+
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        owner: ast.AST,
+        kind: str,
+        params: Tuple[Any, ...] = (),
+        aux_ast_nodes: Tuple[ast.AST, ...] = (),
+    ) -> _ScopeCacheKey:
+        if params and _params_contain_ast(params):
+            raise ValueError(
+                "_ScopeCacheKey.params must not contain ast.AST nodes; use owner or aux_ast_nodes"
+            )
+        return super().__new__(cls, owner, kind, params, aux_ast_nodes)
 
 
 def _key_references_scope_nodes(

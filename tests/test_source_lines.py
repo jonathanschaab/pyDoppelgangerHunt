@@ -8124,7 +8124,9 @@ def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
     """Covers lexical def escape identity, column-aware shortcuts, mod_tree cache isolation, genexp matrix, runtime definite-binding validation, and UTF-8 single-boundary ambiguity."""
     import sys
     from pydoppelgangerhunt.fixer._df_cache import (
+        _ScopeCacheKey,
         _evict_tree_scopes,
+        _key_references_scope_nodes,
         _scope_cell_info_cache,
         clear_dataflow_cache,
     )
@@ -8327,10 +8329,28 @@ def test_lexical_def_escape_identity_genexp_matrix_and_utf8_ambiguity() -> None:
     )
     assert not any("v" in r for _, r, _ in info_clean.sibling_closures)
     assert any("v" in r for _, r, _ in info_shadow.sibling_closures)
+    shadow_nodes = set(ast.walk(mod_shadow))
+    assert any(
+        isinstance(k, _ScopeCacheKey)
+        and (k.owner in shadow_nodes or mod_shadow in k.aux_ast_nodes)
+        for k in _scope_cell_info_cache
+    )
+    assert any(
+        _key_references_scope_nodes(k, shadow_nodes)
+        for k in _scope_cell_info_cache
+    )
     _evict_tree_scopes(mod_shadow)
     assert not any(
-        isinstance(k, tuple) and mod_shadow in k for k in _scope_cell_info_cache
+        isinstance(k, _ScopeCacheKey)
+        and (k.owner in shadow_nodes or mod_shadow in k.aux_ast_nodes)
+        for k in _scope_cell_info_cache
     )
+    assert not any(
+        _key_references_scope_nodes(k, shadow_nodes)
+        for k in _scope_cell_info_cache
+    )
+    with pytest.raises(ValueError, match="aux_ast_nodes"):
+        _ScopeCacheKey(shared_fn_node, "bad_params", params=(mod_shadow,))
     clear_dataflow_cache()
     assert len(_scope_cell_info_cache) == 0
 
@@ -10994,6 +11014,479 @@ def test_unmarked_scope_recomputation_slice_truncation_and_sections_2_1_to_2_6(
         }
     )
     assert "severed_closure_cell" in sc_multi_gen["control_flow_hazards"]
+
+
+def test_intra_unit_global_escapes_detached_shadowing_suspended_local_closures_and_review_areas(
+    tmp_path: Any,
+) -> None:
+    """Covers [P1] intra-unit global escapes, [P1] detached unit enclosing local shadowing,
+    [P2] suspended units with local closures, [P2] unmarked minimal precomputed scopes,
+    and review areas A-E.
+    """
+    from pydoppelgangerhunt.fixer import (
+        analyze_unit_variable_scope,
+        clear_dataflow_cache,
+        generate_refactoring_patch,
+        inspect_single_unit_scope,
+        resolve_clone_generator_subroutine_outputs,
+        resolve_clone_pair_outputs,
+    )
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _ScopeCacheKey,
+        _evict_tree_scopes,
+        _key_references_scope_nodes,
+        _scope_cell_info_cache,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _collect_unit_nonlocal_mutators,
+    )
+    from pydoppelgangerhunt.fixer._df_closures import (
+        _collect_scope_closures_uncached,
+        _extract_scope_local_names,
+        _has_escaped_intra_unit_global_declarations,
+    )
+    from pydoppelgangerhunt.fixer.scope import (
+        _analyze_block_assignment,
+        ensure_unit_scope_closure_mode,
+    )
+    from pydoppelgangerhunt.fixer.source import (
+        _slice_unit_token_lines,
+        _slice_utf8_line,
+    )
+
+    clear_dataflow_cache()
+
+    # --- [P1] #1: Global declarations inside extracted unit escaping to outer statements ---
+    global_escape_assign_src = (
+        "x = 0\n"
+        "def process():\n"
+        "    global x\n"
+        "    x = 1\n"
+        "    x = 2\n"
+        "    return x\n"
+    )
+    ge_tree = ast.parse(global_escape_assign_src)
+    assert (
+        _has_escaped_intra_unit_global_declarations(
+            ge_tree.body[1], 3, 4
+        )
+        is True
+    )
+    sc_global_escape = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 4,
+            "kind": "basic_block",
+            "source_text": global_escape_assign_src,
+            "source_code": "global x\nx = 1\n",
+        },
+        tree=ge_tree,
+    )
+    assert "severed_closure_cell" in sc_global_escape["control_flow_hazards"]
+    assert sc_global_escape["is_control_flow_safe"] is False
+
+    # Pre-unit local assignment + in-unit global + post-unit read -> escaping global hazard
+    global_escape_pre_local_src = (
+        "x = 0\n"
+        "def process():\n"
+        "    x = 1\n"
+        "    global x\n"
+        "    y = x + 10\n"
+        "    return x, y\n"
+    )
+    sc_global_pre = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 5,
+            "kind": "basic_block",
+            "source_text": global_escape_pre_local_src,
+            "source_code": "global x\ny = x + 10\n",
+        }
+    )
+    assert "severed_closure_cell" in sc_global_pre["control_flow_hazards"]
+
+    # Enclosing local `x = 0` shadowed if `def middle` loses `global x` when `return x` remains outside unit
+    global_escape_enclosing_cell_src = (
+        "x = 100\n"
+        "def outer():\n"
+        "    x = 5\n"
+        "    def middle():\n"
+        "        global x\n"
+        "        y = 1\n"
+        "        return x + y\n"
+        "    return middle\n"
+    )
+    sc_global_enc_cell = inspect_single_unit_scope(
+        {
+            "start": 5,
+            "end": 6,
+            "kind": "basic_block",
+            "source_text": global_escape_enclosing_cell_src,
+            "source_code": "global x\ny = 1\n",
+        }
+    )
+    assert "severed_closure_cell" in sc_global_enc_cell["control_flow_hazards"]
+
+    # Safe case 1: `global x` is ONLY used inside the extracted unit, never touched/read outside
+    global_self_contained_src = (
+        "x = 0\n"
+        "def process(a):\n"
+        "    global x\n"
+        "    x = a + 1\n"
+        "    res = a * 2\n"
+        "    return res\n"
+    )
+    sc_global_self = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 4,
+            "kind": "basic_block",
+            "source_text": global_self_contained_src,
+            "source_code": "global x\nx = a + 1\n",
+        }
+    )
+    assert "severed_closure_cell" not in sc_global_self["control_flow_hazards"]
+
+    # Safe case 2: `global x` is also declared outside the unit (`outer_globals`), and unit only reads `x`
+    global_redundant_read_src = (
+        "x = 10\n"
+        "def process(a):\n"
+        "    global x\n"
+        "    global x\n"
+        "    y = x + a\n"
+        "    x = 20\n"
+        "    return y\n"
+    )
+    sc_global_redundant = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 5,
+            "kind": "basic_block",
+            "source_text": global_redundant_read_src,
+            "source_code": "global x\ny = x + a\n",
+        }
+    )
+    assert "severed_closure_cell" not in sc_global_redundant["control_flow_hazards"]
+
+    # --- [P1] #2: Detached unit modules retain enclosing function locals for shadowed builtins ---
+    detached_shadow_src = (
+        "def outer(items, custom_list):\n"
+        "    list = custom_list\n"
+        "    value = 1\n"
+        "    seq = list(value + item for item in items)\n"
+        "    value = 2\n"
+        "    return seq\n"
+    )
+    ds_tree = ast.parse(detached_shadow_src)
+    ds_outer = ds_tree.body[0]
+    assert isinstance(ds_outer, ast.FunctionDef)
+    detached_mod = ast.Module(body=[ds_outer.body[2]], type_ignores=[])
+    assert "list" in _extract_scope_local_names(
+        detached_mod, module_tree=ds_tree
+    )
+    detached_closures = _collect_scope_closures_uncached(
+        detached_mod,
+        module_tree=ds_tree,
+        genexp_include_header=False,
+        cache_parent_map=False,
+    )
+    assert any("value" in reads for _, reads in detached_closures)
+    sc_detached_shadow = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 4,
+            "kind": "basic_block",
+            "source_text": detached_shadow_src,
+            "source_code": "seq = list(value + item for item in items)\n",
+        },
+        tree=ds_tree,
+    )
+    assert "severed_closure_cell" in sc_detached_shadow["control_flow_hazards"]
+
+    # Detached unit with walrus inside genexp passed to shadowed `list`
+    detached_walrus_shadow_src = (
+        "def outer(items, custom_list):\n"
+        "    list = custom_list\n"
+        "    w = 0\n"
+        "    seq = list((w := item) for item in items)\n"
+        "    return seq, w\n"
+    )
+    dw_tree = ast.parse(detached_walrus_shadow_src)
+    dw_outer = dw_tree.body[0]
+    assert isinstance(dw_outer, ast.FunctionDef)
+    dw_muts = _collect_unit_nonlocal_mutators(
+        [dw_outer.body[2]], mod_tree=dw_tree
+    )
+    assert any("w" in m.mutated_vars for m in dw_muts)
+    sc_detached_walrus = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 4,
+            "kind": "basic_block",
+            "source_text": detached_walrus_shadow_src,
+            "source_code": "seq = list((w := item) for item in items)\n",
+        },
+        tree=dw_tree,
+    )
+    assert "severed_closure_cell" in sc_detached_walrus["control_flow_hazards"]
+
+    # PEP 227 class scope isolation: class-body `list = custom_list` applies directly inside ClassDef body,
+    # NOT inside a method `def m(self, items)`!
+    cls_isolation_src = (
+        "def outer(custom_list):\n"
+        "    class Holder:\n"
+        "        list = custom_list\n"
+        "        def compute(self, items):\n"
+        "            value = 1\n"
+        "            seq = list(value + item for item in items)\n"
+        "            value = 2\n"
+        "            return seq, value\n"
+        "    return Holder\n"
+    )
+    ci_tree = ast.parse(cls_isolation_src)
+    sc_cls_method_safe = inspect_single_unit_scope(
+        {
+            "start": 6,
+            "end": 6,
+            "kind": "basic_block",
+            "source_text": cls_isolation_src,
+            "source_code": "seq = list(value + item for item in items)\n",
+        },
+        tree=ci_tree,
+    )
+    assert "severed_closure_cell" not in sc_cls_method_safe["control_flow_hazards"]
+
+    # Directly inside ClassDef body (not inside a method), `list = custom_list` DOES shadow `list`
+    cls_body_shadow_src = (
+        "def outer(items, custom_list):\n"
+        "    value = 1\n"
+        "    class Holder:\n"
+        "        list = custom_list\n"
+        "        seq = list(value + item for item in items)\n"
+        "    value = 2\n"
+        "    return Holder\n"
+    )
+    cbs_tree = ast.parse(cls_body_shadow_src)
+    sc_cls_body_shadow = inspect_single_unit_scope(
+        {
+            "start": 5,
+            "end": 5,
+            "kind": "basic_block",
+            "source_text": cls_body_shadow_src,
+            "source_code": "seq = list(value + item for item in items)\n",
+        },
+        tree=cbs_tree,
+    )
+    assert "severed_closure_cell" in sc_cls_body_shadow["control_flow_hazards"]
+
+    # --- [P2] #3: Suspended units allow purely unit-local nonlocal mutators while rejecting escaping ones ---
+    suspended_local_closure_src = (
+        "def worker_a(items):\n"
+        "    for item in items:\n"
+        "        value = item\n"
+        "        def increment():\n"
+        "            nonlocal value\n"
+        "            value += 1\n"
+        "        increment()\n"
+        "        yield value\n\n"
+        "def worker_b(items):\n"
+        "    for item in items:\n"
+        "        value = item\n"
+        "        def increment():\n"
+        "            nonlocal value\n"
+        "            value += 1\n"
+        "        increment()\n"
+        "        yield value\n"
+    )
+    slc_tree = ast.parse(suspended_local_closure_src)
+    u_slc1 = {
+        "start": 2,
+        "end": 8,
+        "kind": "compound_block",
+        "source_text": suspended_local_closure_src,
+        "source_code": (
+            "for item in items:\n"
+            "    value = item\n"
+            "    def increment():\n"
+            "        nonlocal value\n"
+            "        value += 1\n"
+            "    increment()\n"
+            "    yield value\n"
+        ),
+    }
+    sc_slc1 = inspect_single_unit_scope(u_slc1, tree=slc_tree)
+    assert "severed_closure_cell" not in sc_slc1["control_flow_hazards"]
+    assert sc_slc1["is_control_flow_safe"] is True
+
+    # Suspended unit where inner closure mutates a variable read after the unit IS rejected
+    suspended_escaping_var_src = (
+        "def worker(items):\n"
+        "    for item in items:\n"
+        "        value = item\n"
+        "        def increment():\n"
+        "            nonlocal value\n"
+        "            value += 1\n"
+        "        increment()\n"
+        "        yield value\n"
+        "    return value\n"
+    )
+    sc_susp_escape = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 8,
+            "kind": "compound_block",
+            "source_text": suspended_escaping_var_src,
+            "source_code": u_slc1["source_code"],
+        }
+    )
+    assert "severed_closure_cell" in sc_susp_escape["control_flow_hazards"]
+
+    # Suspended unit where inner closure mutates an outer-scope variable IS rejected
+    suspended_outer_var_src = (
+        "def worker(items):\n"
+        "    total = 0\n"
+        "    for item in items:\n"
+        "        def add_item():\n"
+        "            nonlocal total\n"
+        "            total += item\n"
+        "        add_item()\n"
+        "        yield item\n"
+    )
+    sc_susp_outer = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 8,
+            "kind": "compound_block",
+            "source_text": suspended_outer_var_src,
+            "source_code": (
+                "for item in items:\n"
+                "    def add_item():\n"
+                "        nonlocal total\n"
+                "        total += item\n"
+                "    add_item()\n"
+                "    yield item\n"
+            ),
+        }
+    )
+    assert "severed_closure_cell" in sc_susp_outer["control_flow_hazards"]
+
+    # --- [P2] #4: Minimal unmarked precomputed scopes are recomputed when tree/source is available ---
+    min_src = (
+        "def outer(items):\n"
+        "    cb = lambda: y\n"
+        "    for x in items:\n"
+        "        y = x + 1\n"
+        "    return cb()\n"
+    )
+    min_tree = ast.parse(min_src)
+    min_unit = {
+        "start": 3,
+        "end": 4,
+        "kind": "compound_block",
+        "source_text": min_src,
+        "source_code": "for x in items:\n    y = x + 1\n",
+    }
+    minimal_unmarked_scope = {"inputs": ["items"], "outputs": ["y"]}
+    recomputed_min = ensure_unit_scope_closure_mode(
+        min_unit, minimal_unmarked_scope, False, tree=min_tree
+    )
+    assert "_skip_pre_unit_closures" in recomputed_min
+    assert recomputed_min["_skip_pre_unit_closures"] is False
+    assert "severed_closure_cell" in recomputed_min["control_flow_hazards"]
+
+    # --- Review Area E: Exception-handler termination & unexported conditional rebinding ---
+    # 1. Terminating handler (`except Exception as e: return 0`) does NOT demote pre-try definite binding `e = 1`
+    term_handler_stmts = ast.parse(
+        "e = 1\n"
+        "try:\n"
+        "    x = 2\n"
+        "except Exception as e:\n"
+        "    return 0\n"
+    ).body
+    def_th: set[str] = set()
+    cond_th: set[str] = set()
+    _analyze_block_assignment(term_handler_stmts, def_th, cond_th)
+    assert "e" in def_th
+    assert "e" not in cond_th
+
+    # 2. Non-terminating handler (`except Exception as e: x = 0`) DOES demote pre-try `e = 1` to conditional
+    nonterm_handler_stmts = ast.parse(
+        "e = 1\n"
+        "try:\n"
+        "    x = 2\n"
+        "except Exception as e:\n"
+        "    x = 0\n"
+    ).body
+    def_nth: set[str] = set()
+    cond_nth: set[str] = set()
+    _analyze_block_assignment(nonterm_handler_stmts, def_nth, cond_nth)
+    assert "e" not in def_nth
+    assert "e" in cond_nth
+
+    # 3. Handler that deletes and rebinds `v` inside handler body (or rebinds `e` in finally) preserves definite binding,
+    # whereas `e = 99` inside `except Exception as e:` is still cleared by Python's implicit handler-exit `del e`.
+    rebind_handler_stmts = ast.parse(
+        "v = 1\n"
+        "e = 1\n"
+        "rebound_e = 1\n"
+        "try:\n"
+        "    x = 2\n"
+        "except Exception as e:\n"
+        "    del v\n"
+        "    v = 99\n"
+        "    e = 99\n"
+        "except RuntimeError as rebound_e:\n"
+        "    x = 3\n"
+        "finally:\n"
+        "    rebound_e = 100\n"
+    ).body
+    def_rh: set[str] = set()
+    cond_rh: set[str] = set()
+    _analyze_block_assignment(rebind_handler_stmts, def_rh, cond_rh)
+    assert "v" in def_rh
+    assert "v" not in cond_rh
+    assert "rebound_e" in def_rh
+    assert "e" not in def_rh
+    assert "e" in cond_rh
+
+    # 4. In-unit `except Exception as e:` where `e` was pre-bound before unit and read after unit -> hazard
+    except_clobber_prebound_src = (
+        "def f(a):\n"
+        "    e = a + 1\n"
+        "    try:\n"
+        "        res = a * 2\n"
+        "    except Exception as e:\n"
+        "        res = 0\n"
+        "    return res + e\n"
+    )
+    sc_except_clobber = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 6,
+            "kind": "compound_block",
+            "source_text": except_clobber_prebound_src,
+            "source_code": (
+                "try:\n"
+                "    res = a * 2\n"
+                "except Exception as e:\n"
+                "    res = 0\n"
+            ),
+        }
+    )
+    assert "severed_closure_cell" in sc_except_clobber["control_flow_hazards"]
+    assert sc_except_clobber["is_control_flow_safe"] is False
+
+    # --- Review Area D: UTF-8 slicing edge cases (CRLF, astral emoji, CJK, accented) ---
+    astral_line = '    msg = "🚀✨café日本語"; val = (a + b) * c\r\n'
+    val_expr = "(a + b) * c"
+    s_utf8 = len('    msg = "🚀✨café日本語"; val = '.encode("utf-8"))
+    e_utf8 = s_utf8 + len(val_expr.encode("utf-8"))
+    assert _slice_utf8_line(astral_line, s_utf8, e_utf8) == val_expr
+    assert _slice_unit_token_lines(
+        {"kind": "complex_expr", "start_col": s_utf8, "end_col": e_utf8},
+        [astral_line],
+    ) == [val_expr]
+
 
 
 

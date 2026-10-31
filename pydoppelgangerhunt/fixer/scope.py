@@ -1404,16 +1404,21 @@ def _analyze_block_assignment(
                 if not h_term:
                     surviving_dels.append(eff_h_del)
 
+            f_body = list(getattr(stmt, "finalbody", []))
+            reach_dels: Set[str] = (
+                all_try_dels
+                if (f_body or type(stmt).__name__ == "TryStar" or not surviving_dels)
+                else set().union(*surviving_dels)
+            )
             if surviving_dels:
                 uncond_dels = set.intersection(*surviving_dels)
                 for v_del in uncond_dels:
                     definite.discard(v_del)
                     conditional.discard(v_del)
-                _demote_deletions_to_conditional(all_try_dels - uncond_dels, definite, conditional)
+                _demote_deletions_to_conditional(reach_dels - uncond_dels, definite, conditional)
             else:
                 _demote_deletions_to_conditional(all_try_dels, definite, conditional)
 
-            f_body = list(getattr(stmt, "finalbody", []))
             if f_body:
                 _analyze_block_assignment(
                     f_body,
@@ -2940,13 +2945,8 @@ def ensure_unit_scope_closure_mode(
     if (
         scope is not None
         and "_skip_pre_unit_closures" not in scope
-        and (
-            "control_flow_hazards" not in scope
-            or (
-                tree is None
-                and not _load_unit_file_text(u_copy, repo_root=repo_root)
-            )
-        )
+        and tree is None
+        and not _load_unit_file_text(u_copy, repo_root=repo_root)
     ):
         return scope
     return inspect_single_unit_scope(u_copy, repo_root=repo_root, tree=tree)
