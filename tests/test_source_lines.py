@@ -11488,5 +11488,614 @@ def test_intra_unit_global_escapes_detached_shadowing_suspended_local_closures_a
     ) == [val_expr]
 
 
+def test_multilevel_concurrent_sibling_with_definite_bindings_and_class_escape() -> None:
+    """Covers P1 (multi-level concurrent sibling), P2 (with definite bindings, class escape, context cache), and Areas A-E."""
+    from types import MappingProxyType
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _get_scope_parent_map,
+        clear_dataflow_cache,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _FnScopeContext,
+        _collect_escaped_and_executed_intra_unit_defs,
+        _collect_unit_nonlocal_mutators,
+        _extract_closure_nonlocal_mutations_and_deletions_uncached,
+        _extract_fn_outer_carrier_targets,
+        _extract_fn_outer_carrier_targets_uncached,
+        _extract_fn_returned_closure_refs,
+        _find_enclosing_function_chain,
+        _has_invalid_lexical_scope_declarations,
+        _is_closure_factory_scope,
+        _propagate_sibling_closures,
+        _resolve_unit_col_bounds,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _check_sibling_closure_sharing,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _build_enclosing_chain_cell_infos,
+        _extract_block_definite_bindings_and_term,
+        _find_enclosing_chain_definite_pre_bound,
+    )
+
+    # =========================================================================
+    # 1. [P1] Multi-level concurrent sibling detection (outer -> middle -> inner -> generator)
+    # =========================================================================
+    p1_src = (
+        "def outer():\n"
+        "    value = 0\n"
+        "    def sibling():\n"
+        "        return value\n"
+        "    def middle():\n"
+        "        def inner():\n"
+        "            def generator():\n"
+        "                nonlocal value\n"
+        "                value += 1\n"
+        "                yield value\n"
+        "            return generator()\n"
+        "        return inner()\n"
+        "    return middle(), sibling()\n"
+    )
+    p1_tree = ast.parse(p1_src)
+    p1_unit = {
+        "start": 9,
+        "end": 10,
+        "kind": "linear_block",
+        "source_text": p1_src,
+        "source_code": "value += 1\nyield value\n",
+    }
+    p1_scope = inspect_single_unit_scope(p1_unit, tree=p1_tree)
+    assert "severed_closure_cell" in p1_scope["control_flow_hazards"]
+    assert p1_scope["is_control_flow_safe"] is False
+    p1_chain = _find_enclosing_function_chain(p1_tree, 9, 10)
+    assert len(p1_chain) == 4  # outer -> middle -> inner -> generator
+    p1_chain_infos = _build_enclosing_chain_cell_infos(
+        p1_chain, 9, 10, None, None, frozenset({"value"}), mod_tree=p1_tree
+    )
+    assert (
+        _check_sibling_closure_sharing(
+            frozenset(),
+            frozenset({"value"}),
+            p1_chain_infos,
+            is_suspended=True,
+        )
+        is True
+    )
+
+    # Shadowed case: middle defines its own local `value = 10` without any sibling closure in middle/inner
+    p1_shadowed_src = (
+        "def outer():\n"
+        "    value = 0\n"
+        "    def sibling():\n"
+        "        return value\n"
+        "    def middle():\n"
+        "        value = 10\n"
+        "        for step in (1, 2):\n"
+        "            value += step\n"
+        "            yield value\n"
+        "    return list(middle()), sibling()\n"
+    )
+    p1_shadowed_tree = ast.parse(p1_shadowed_src)
+    p1_shadowed_unit = {
+        "start": 7,
+        "end": 9,
+        "kind": "compound_block",
+        "source_text": p1_shadowed_src,
+        "source_code": (
+            "for step in (1, 2):\n"
+            "    value += step\n"
+            "    yield value\n"
+        ),
+    }
+    p1_shadowed_scope = inspect_single_unit_scope(
+        p1_shadowed_unit, tree=p1_shadowed_tree
+    )
+    assert "severed_closure_cell" not in p1_shadowed_scope["control_flow_hazards"]
+    p1_sh_chain = _find_enclosing_function_chain(p1_shadowed_tree, 7, 9)
+    p1_sh_infos = _build_enclosing_chain_cell_infos(
+        p1_sh_chain, 7, 9, None, None, frozenset({"value"}), mod_tree=p1_shadowed_tree
+    )
+    assert (
+        _check_sibling_closure_sharing(
+            frozenset(),
+            frozenset({"value"}),
+            p1_sh_infos,
+            is_suspended=True,
+        )
+        is False
+    )
+
+    # =========================================================================
+    # 2. [P2] Definite-binding analysis inside `with` and `async with` bodies
+    # =========================================================================
+    # 2a. Unconditional assignment in pre-unit `with` populates definite pre_bound
+    with_definite_src = (
+        "def process(cm, items):\n"
+        "    with cm() as resource:\n"
+        "        scale = resource.factor\n"
+        "    out = [x * scale for x in items]\n"
+        "    return out\n"
+    )
+    with_def_tree = ast.parse(with_definite_src)
+    with_def_chain = _find_enclosing_function_chain(with_def_tree, 4, 4)
+    pre_bound_with = _find_enclosing_chain_definite_pre_bound(
+        with_def_chain, 4, 4, mod_tree=with_def_tree
+    )
+    assert {"cm", "items", "resource", "scale"} <= pre_bound_with
+    sc_with_def = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 4,
+            "kind": "linear_block",
+            "source_text": with_definite_src,
+            "source_code": "out = [x * scale for x in items]\n",
+        },
+        tree=with_def_tree,
+    )
+    assert "severed_closure_cell" not in sc_with_def["control_flow_hazards"]
+
+    # 2b. Conditional assignment inside `with`, multiple items, return/break/continue, delete, async with
+    with_cases: list[tuple[str, set[str], bool]] = [
+        (
+            "with cm1() as a, cm2() as b:\n    c = a + b\n",
+            {"a", "b", "c"},
+            False,
+        ),
+        (
+            "with cm():\n    if cond:\n        c = 1\n",
+            set(),
+            False,
+        ),
+        (
+            "with cm():\n    if cond:\n        c = 1\n    else:\n        c = 2\n",
+            {"c"},
+            False,
+        ),
+        (
+            "with cm():\n    if cond:\n        return 0\n    c = 1\n",
+            {"c"},
+            False,
+        ),
+        (
+            "with cm():\n    c = 1\n    return c\n    dead = 2\n",
+            {"c"},
+            True,
+        ),
+        (
+            "with cm():\n    c = 1\n    break\n    dead = 2\n",
+            {"c"},
+            True,
+        ),
+        (
+            "with cm():\n    c = 1\n    continue\n    dead = 2\n",
+            {"c"},
+            True,
+        ),
+        (
+            "with cm():\n    c = 1\n    del c\n",
+            set(),
+            False,
+        ),
+        (
+            "c = 1\nwith cm():\n    del c\n",
+            set(),
+            False,
+        ),
+        (
+            "async def _af():\n    async with acm() as a:\n        b = a + 1\n",
+            {"a", "b"},
+            False,
+        ),
+        (
+            "with suppress(KeyError):\n    c = 1\n",
+            set(),
+            False,
+        ),
+        (
+            "with contextlib.suppress(KeyError) as sup:\n    c = 1\n",
+            {"sup"},
+            False,
+        ),
+    ]
+    for code_str, expected_bound, expected_term in with_cases:
+        parsed = ast.parse(code_str)
+        stmts = (
+            parsed.body[0].body
+            if isinstance(parsed.body[0], ast.AsyncFunctionDef)
+            else parsed.body
+        )
+        got_bound, got_term = _extract_block_definite_bindings_and_term(
+            stmts, None
+        )
+        assert got_bound == expected_bound, f"Mismatch for:\n{code_str}"
+        assert got_term is expected_term, f"Term mismatch for:\n{code_str}"
+
+    # =========================================================================
+    # 3. [P2] Class definitions escape classification (Cases 1-5)
+    # =========================================================================
+    # Case 1: Unreferenced local class with uncalled method mutating unit-local `count`
+    cls_unreferenced_src = (
+        "def outer(items):\n"
+        "    def reader():\n"
+        "        return count\n"
+        "    count = 0\n"
+        "    class LocalHelper:\n"
+        "        def mutate(self):\n"
+        "            nonlocal count\n"
+        "            count += 1\n"
+        "    res = count + len(items)\n"
+        "    return count, res, reader()\n"
+    )
+    cls_unref_tree = ast.parse(cls_unreferenced_src)
+    cls_unref_unit = {
+        "start": 4,
+        "end": 9,
+        "kind": "linear_block",
+        "source_text": cls_unreferenced_src,
+        "source_code": (
+            "count = 0\n"
+            "class LocalHelper:\n"
+            "    def mutate(self):\n"
+            "        nonlocal count\n"
+            "        count += 1\n"
+            "res = count + len(items)\n"
+        ),
+    }
+    muts_unref = _collect_unit_nonlocal_mutators(
+        ast.parse(str(cls_unref_unit["source_code"])).body
+    )
+    assert any(
+        m.name == "LocalHelper" and m.is_escaped_def is False
+        for m in muts_unref
+    )
+    sc_cls_unref = inspect_single_unit_scope(
+        cls_unref_unit, tree=cls_unref_tree
+    )
+    assert "severed_closure_cell" not in sc_cls_unref["control_flow_hazards"]
+
+    # Cases 2-5: Escaping/executed class definitions MUST be classified as escaped mutators
+    escaping_cls_tails = [
+        # Case 2: Assigned to an escaping binding read after the unit
+        ("escaped = LocalHelper\n", "    return count, escaped\n"),
+        # Case 3a: Passed to an unknown function call
+        ("register(LocalHelper)\n", "    return count\n"),
+        # Case 3b: Instantiated inside the unit
+        ("inst = LocalHelper()\n", "    return count\n"),
+        # Case 4: Referenced by an escaping closure
+        ("cb = lambda: LocalHelper\n", "    return count, cb\n"),
+    ]
+    for extra_stmt, ret_line in escaping_cls_tails:
+        esc_src = (
+            "def outer(items, register):\n"
+            "    count = 0\n"
+            "    class LocalHelper:\n"
+            "        def mutate(self):\n"
+            "            nonlocal count\n"
+            "            count += 1\n"
+            f"    {extra_stmt}"
+            f"{ret_line}"
+        )
+        esc_unit_code = (
+            "count = 0\n"
+            "class LocalHelper:\n"
+            "    def mutate(self):\n"
+            "        nonlocal count\n"
+            "        count += 1\n"
+            f"{extra_stmt}"
+        )
+        sc_esc = inspect_single_unit_scope(
+            {
+                "start": 2,
+                "end": 7,
+                "kind": "linear_block",
+                "source_text": esc_src,
+                "source_code": esc_unit_code,
+            },
+            tree=ast.parse(esc_src),
+        )
+        assert "severed_closure_cell" in sc_esc["control_flow_hazards"], (
+            f"Expected hazard for: {extra_stmt}"
+        )
+
+    # Case 5: Decorated class, base class, keyword metaclass, or direct class-body nonlocal mutation
+    for cls_header_or_body in [
+        "@dec\nclass LocalHelper:\n    def mutate(self):\n        nonlocal count\n        count += 1\n",
+        "class LocalHelper(Base):\n    def mutate(self):\n        nonlocal count\n        count += 1\n",
+        "class LocalHelper(metaclass=Meta):\n    def mutate(self):\n        nonlocal count\n        count += 1\n",
+        "class LocalHelper:\n    nonlocal count\n    count += 1\n",
+    ]:
+        c5_stmts = ast.parse("count = 0\n" + cls_header_or_body).body
+        c5_muts = _collect_unit_nonlocal_mutators(c5_stmts)
+        assert any(
+            m.name == "LocalHelper" and m.is_escaped_def is True
+            for m in c5_muts
+        )
+        _, c5_esc_ids, _ = _collect_escaped_and_executed_intra_unit_defs(
+            c5_stmts, frozenset()
+        )
+        assert any(
+            isinstance(s, ast.ClassDef) and id(s) in c5_esc_ids
+            for s in c5_stmts
+        )
+
+    # =========================================================================
+    # 4. [P2] Cached closure metadata context validation on shared AST nodes
+    # =========================================================================
+    clear_dataflow_cache()
+    shared_fn_tree = ast.parse(
+        "def factory(items):\n"
+        "    res = any(x + outer_val for x in items)\n"
+        "    box.append(any(x + outer_val for x in items))\n"
+        "    return any(cb_ref for x in items)\n"
+    )
+    shared_fn = shared_fn_tree.body[0]
+    assert isinstance(shared_fn, ast.FunctionDef)
+    parent_map_shared = MappingProxyType(_get_scope_parent_map(shared_fn_tree))
+    owner_a = ast.Module(body=[], type_ignores=[])
+    owner_b = ast.Module(body=[], type_ignores=[])
+    # Context A: `any` is unshadowed -> `any(...)` is eagerly consumed and scalar
+    ctx_a = _FnScopeContext(
+        fn_locals=frozenset({"items"}),
+        parent_map=parent_map_shared,
+        shadowed_names=frozenset({"items"}),
+        has_star_import=False,
+        scope_owner=owner_a,
+    )
+    # Context B: `any` is shadowed -> `any(...)` is an unknown call with a lazy genexp carrier!
+    ctx_b = _FnScopeContext(
+        fn_locals=frozenset({"items", "any"}),
+        parent_map=parent_map_shared,
+        shadowed_names=frozenset({"items", "any"}),
+        has_star_import=False,
+        scope_owner=owner_b,
+    )
+    # Context C: same shadowed_names as A, but has_star_import=True -> genexp is lazy!
+    ctx_c = _FnScopeContext(
+        fn_locals=frozenset({"items"}),
+        parent_map=parent_map_shared,
+        shadowed_names=frozenset({"items"}),
+        has_star_import=True,
+        scope_owner=owner_a,
+    )
+    assert _is_closure_factory_scope(shared_fn, ctx_a) is False
+    assert _is_closure_factory_scope(shared_fn, ctx_b) is True
+    assert _is_closure_factory_scope(shared_fn, ctx_c) is False
+    ctx_detached = _FnScopeContext(
+        fn_locals=frozenset({"items"}),
+        parent_map=MappingProxyType({}),
+        shadowed_names=frozenset({"items"}),
+        has_star_import=False,
+        scope_owner=owner_a,
+    )
+    assert _is_closure_factory_scope(shared_fn, ctx_detached) is False
+    assert _extract_fn_outer_carrier_targets(shared_fn, frozenset(), ctx_a) == set()
+    assert _extract_fn_outer_carrier_targets(shared_fn, frozenset(), ctx_b) == {"box"}
+    assert _extract_fn_returned_closure_refs(shared_fn, ctx_a) == (set(), set())
+    assert _extract_fn_returned_closure_refs(shared_fn, ctx_b) == (
+        set(),
+        {"any"},
+    )
+
+    # =========================================================================
+    # 5. [P2] Table-driven definite-binding runtime oracle comparison & Areas A-E
+    # =========================================================================
+    oracle_cases: list[tuple[str, dict[str, object], set[str]]] = [
+        (
+            "if flag:\n    a = 1\n    b = 2\nelse:\n    a = 3\n    c = 4\n",
+            {"flag": True},
+            {"a"},
+        ),
+        (
+            "try:\n    a = 1\nexcept ValueError:\n    a = 2\nfinally:\n    f = 3\n",
+            {},
+            {"a", "f"},
+        ),
+        (
+            "try:\n    a = 1\nexcept* ValueError:\n    a = 2\nfinally:\n    f = 3\n",
+            {},
+            {"f"},
+        ),
+        (
+            "match val:\n    case 1:\n        m = 10\n    case _:\n        m = 20\n",
+            {"val": 5},
+            {"m"},
+        ),
+        (
+            "if (w := val) and (u := w + 1):\n    z = 1\nelse:\n    z = 2\n",
+            {"val": 0},
+            {"w", "z"},
+        ),
+        (
+            "for i in (it := [1, 2]):\n    loop_v = i\n",
+            {},
+            {"it"},
+        ),
+    ]
+    for code_str, env_init, expected_def in oracle_cases:
+        stmts = ast.parse(code_str).body
+        static_bound, _ = _extract_block_definite_bindings_and_term(stmts, None)
+        assert static_bound == expected_def
+        ns: dict[str, object] = dict(env_init)
+        exec(compile(code_str, "<oracle>", "exec"), {}, ns)  # noqa: S102
+        assert static_bound <= set(ns.keys())
+
+    # --- Area A: _has_invalid_lexical_scope_declarations & class scopes ---
+    area_a_cases: list[tuple[str, bool]] = [
+        # Valid: class attribute `value = 2` is bypassed by nested method's `nonlocal value`
+        (
+            "def outer():\n"
+            "    value = 1\n"
+            "    class Example:\n"
+            "        value = 2\n"
+            "        def mutate(self):\n"
+            "            nonlocal value\n"
+            "            value = 3\n",
+            False,
+        ),
+        # Valid: class-level `global value` does not block method `nonlocal value` when `outer` binds `value`
+        (
+            "def outer():\n"
+            "    value = 1\n"
+            "    class Example:\n"
+            "        global value\n"
+            "        def mutate(self):\n"
+            "            nonlocal value\n"
+            "            value = 3\n",
+            False,
+        ),
+        # Invalid: `outer` declares `global value`, so method `nonlocal value` has no lexical cell
+        (
+            "def outer():\n"
+            "    global value\n"
+            "    class Example:\n"
+            "        def mutate(self):\n"
+            "            nonlocal value\n"
+            "            value = 3\n",
+            True,
+        ),
+        # Valid: nested classes `OuterCls -> InnerCls -> mutate` resolving `nonlocal value` to `outer`
+        (
+            "def outer():\n"
+            "    value = 1\n"
+            "    class OuterCls:\n"
+            "        class InnerCls:\n"
+            "            def mutate(self):\n"
+            "                nonlocal value\n"
+            "                value = 4\n",
+            False,
+        ),
+        # Invalid: intervening function `mid` inside class declares `global value`
+        (
+            "def outer():\n"
+            "    value = 1\n"
+            "    class Cls:\n"
+            "        def mid(self):\n"
+            "            global value\n"
+            "            def inner():\n"
+            "                nonlocal value\n"
+            "                value = 5\n",
+            True,
+        ),
+    ]
+    for src_a, expected_invalid in area_a_cases:
+        tree_a = ast.parse(src_a)
+        got_invalid = _has_invalid_lexical_scope_declarations(
+            tree_a.body, mod_tree=tree_a
+        )
+        assert got_invalid is expected_invalid
+        try:
+            compile(src_a, "<area_a>", "exec")
+            compiled_ok = True
+        except SyntaxError:
+            compiled_ok = False
+        assert compiled_ok is (not expected_invalid)
+
+    # --- Area B: _extract_closure_nonlocal_mutations_and_deletions_uncached rebinding matrix ---
+    area_b_fn = ast.parse(
+        "def holder():\n"
+        "    nonlocal a, b, c, d, e, f, g, h\n"
+        "    a = 1\n"
+        "    del b\n"
+        "    _ = [x := 1 for c in (1, 2) if (d := c)]\n"
+        "    try:\n"
+        "        pass\n"
+        "    except Exception as e:\n"
+        "        pass\n"
+        "    match a:\n"
+        "        case f:\n"
+        "            pass\n"
+        "    type g = int\n"
+        "    class Sub:\n"
+        "        h = 99\n"
+        "        def sub_m(self):\n"
+        "            nonlocal h\n"
+        "            h = 100\n"
+    ).body[0]
+    b_muts, b_dels = _extract_closure_nonlocal_mutations_and_deletions_uncached(
+        area_b_fn
+    )
+    assert b_muts == frozenset({"a", "b", "d", "e", "f", "g", "h"})
+    assert b_dels == frozenset({"b", "e"})
+
+    # --- Area C: _propagate_sibling_closures edge cases ---
+    prop_res = _propagate_sibling_closures(
+        [
+            ("self_fn", frozenset({"self_fn", "x"}), frozenset({"m1"})),
+            ("mut_a", frozenset({"mut_b", "y"}), frozenset()),
+            ("mut_b", frozenset({"mut_a", "z"}), frozenset({"m2"})),
+            ("dup", frozenset({"d1"}), frozenset()),
+            ("dup", frozenset({"d2"}), frozenset({"dm"})),
+        ],
+        alias_edges=[
+            ("alias1", frozenset({"mut_a"})),
+            ("alias2", frozenset({"alias1"})),
+            ("alias1", frozenset({"alias2"})),
+        ],
+    )
+    prop_dict = {name: (r, m) for name, r, m in prop_res if name is not None}
+    assert prop_dict["self_fn"] == ({"self_fn", "x"}, {"m1"})
+    assert prop_dict["mut_a"] == ({"mut_a", "mut_b", "y", "z"}, {"m2"})
+    assert prop_dict["alias2"] == ({"mut_a", "mut_b", "y", "z"}, {"m2"})
+    assert prop_dict["dup"] == ({"d1", "d2"}, {"dm"})
+
+    # --- Area D: _find_enclosing_function_chain and _resolve_unit_col_bounds ---
+    area_d_src = (
+        "@dec\n"
+        "def outer(a=lambda: 1):\n"
+        "    def single_line(): x = 1; y = 2; return x + y\n"
+        "    return single_line()\n"
+    )
+    area_d_tree = ast.parse(area_d_src)
+    # Span inside decorator/header (line 1 or line 2 default arg) is NOT enclosed by outer body
+    assert _find_enclosing_function_chain(area_d_tree, 1, 1) == []
+    # Span on line 3 inside single_line body
+    chain_d = _find_enclosing_function_chain(
+        area_d_tree, 3, 3, u_start_col=23, u_end_col=35
+    )
+    assert [getattr(n, "name", "") for _, _, n in chain_d] == [
+        "outer",
+        "single_line",
+    ]
+    outer_fn_d = area_d_tree.body[0]
+    assert isinstance(outer_fn_d, ast.FunctionDef)
+    single_fn_d = outer_fn_d.body[0]
+    assert isinstance(single_fn_d, ast.FunctionDef)
+    cand_d = [single_fn_d.body[0]]
+    assert _resolve_unit_col_bounds(cand_d, area_d_tree, 3, 3, None, None) == (
+        23,
+        28,
+    )
+
+    # --- Area E: _extract_fn_outer_carrier_targets_uncached ---
+    area_e_fn = ast.parse(
+        "def carrier_fn():\n"
+        "    global glob_box\n"
+        "    nonlocal nl_var\n"
+        "    local_list = []\n"
+        "    local_list.append(lambda: captured)\n"
+        "    glob_box.append(lambda: captured)\n"
+        "    outer_Attr.cb = lambda: captured\n"
+        "    outer_sub[0] = lambda: captured\n"
+        "    outer_nested.items[0].append(lambda: captured)\n"
+        "    fn_ref = lambda: captured\n"
+        "    fn_alias = fn_ref\n"
+        "    outer_via_alias.register(fn_alias)\n"
+        "    nl_var = fn_alias\n"
+    ).body[0]
+    assert isinstance(area_e_fn, ast.FunctionDef)
+    e_targets = _extract_fn_outer_carrier_targets_uncached(area_e_fn)
+    assert e_targets == frozenset(
+        {
+            "outer_Attr",
+            "outer_sub",
+            "outer_nested",
+            "outer_via_alias",
+            "nl_var",
+        }
+    )
+
+
+
 
 

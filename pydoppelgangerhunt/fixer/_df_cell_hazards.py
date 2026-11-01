@@ -92,7 +92,7 @@ from typing import (
 from pydoppelgangerhunt.fixer._df_cell_carriers import (
     _EnclosingFnCellInfo,
     _IntraUnitMutator,
-    _collect_escaped_intra_unit_defs,
+    _collect_escaped_and_executed_intra_unit_defs,
     _collect_unit_nonlocal_mutators,
     _extract_direct_nonlocals,
     _find_enclosing_function_chain,
@@ -217,8 +217,10 @@ def _check_intra_unit_nonlocal_mutators(
         for _, sib_r, _ in info.sibling_closures:
             all_sib_reads.update(sib_r)
             outer_sib_cells.update(sib_r)
-    escaped_unit_names, escaped_def_ids = _collect_escaped_intra_unit_defs(
-        candidate_stmts, all_post_reads | all_sib_reads
+    escaped_unit_names, escaped_def_ids, executed_def_ids = (
+        _collect_escaped_and_executed_intra_unit_defs(
+            candidate_stmts, all_post_reads | all_sib_reads
+        )
     )
     for mut_entry in intra_nl_mutators:
         mut_fn_name, mutated_vars, is_escaped_def = (
@@ -232,8 +234,14 @@ def _check_intra_unit_nonlocal_mutators(
             if isinstance(mut_node, ast.AST)
             else mut_fn_name in escaped_unit_names
         )
+        mut_fn_executed = mut_fn_escapes or (
+            id(mut_node) in executed_def_ids
+            and not isinstance(mut_node, ast.ClassDef)
+            if isinstance(mut_node, ast.AST)
+            else True
+        )
         for var in mutated_vars & top_locals_set:
-            if var in outer_sib_cells or (
+            if (mut_fn_executed and var in outer_sib_cells) or (
                 (mut_fn_escapes or is_suspended)
                 and (
                     var in outer_touched
@@ -245,32 +253,22 @@ def _check_intra_unit_nonlocal_mutators(
     return False
 
 
-def _check_sibling_closure_sharing(
-    eff_input_set: AbstractSet[str],
-    sub_mutated: AbstractSet[str],
+class _UnshadowedChainClosureInfo(NamedTuple):
+    """Unshadowed enclosing locals, concurrent sibling vars, post-reads, and closures."""
+
+    chain_locals: Set[str]
+    concurrent_vars: Set[str]
+    post_reads: Set[str]
+    sib_closures: List[Tuple[Optional[str], Set[str], Set[str]]]
+
+
+def _collect_unshadowed_chain_closure_info(
     chain_infos: Sequence[_EnclosingFnCellInfo],
-    *,
-    is_suspended: bool = False,
-    unreturned_mutations: bool = False,
-    skip_pre_unit_closures: bool = False,
-) -> bool:
-    """Check 4: sibling closure referenced by unit (or concurrent with suspended unit) shares a mutated cell."""
-    if not chain_infos:
-        return False
-    all_chain_locals: Set[str] = set().union(
-        *(info.fn_locals for info in chain_infos)
-    )
-    if is_suspended and bool(
-        set(sub_mutated)
-        & chain_infos[-1].fn_locals
-        & set(chain_infos[-1].concurrent_sibling_vars)
-    ):
-        return True
-    if unreturned_mutations and any(
-        bool(set(sub_mutated) & all_chain_locals & set(info.post_reads))
-        for info in chain_infos
-    ):
-        return True
+) -> _UnshadowedChainClosureInfo:
+    """Aggregates unshadowed locals, concurrent sibling vars, post-reads, and closures across chain_infos."""
+    chain_locals: Set[str] = set()
+    concurrent_vars: Set[str] = set()
+    post_reads: Set[str] = set()
     unshadowed_sibs: List[
         Tuple[Optional[str], AbstractSet[str], AbstractSet[str]]
     ] = []
@@ -286,6 +284,15 @@ def _check_sibling_closure_sharing(
             if idx + 1 < len(chain_infos)
             else set()
         )
+        unshadowed_fn_locals = set(info.fn_locals) - inner_shadowed
+        chain_locals.update(unshadowed_fn_locals)
+        concurrent_vars.update(
+            unshadowed_fn_locals
+            & (set(info.concurrent_sibling_vars) - inner_shadowed)
+        )
+        post_reads.update(
+            unshadowed_fn_locals & (set(info.post_reads) - inner_shadowed)
+        )
         for s_name, s_reads, s_muts in info.sibling_closures:
             if s_name is not None and s_name in inner_shadowed:
                 continue
@@ -296,23 +303,49 @@ def _check_sibling_closure_sharing(
             if t_name in inner_shadowed:
                 continue
             unshadowed_edges.append((t_name, src_names - inner_shadowed))
-    all_sib_closures = _propagate_sibling_closures(
+    sib_closures = _propagate_sibling_closures(
         unshadowed_sibs,
         alias_edges=unshadowed_edges,
     )
-    sub_touched = set(eff_input_set) | set(sub_mutated)
-    for sib_name, sib_reads, sib_nl_muts in all_sib_closures:
+    return _UnshadowedChainClosureInfo(
+        chain_locals=chain_locals,
+        concurrent_vars=concurrent_vars,
+        post_reads=post_reads,
+        sib_closures=sib_closures,
+    )
+
+
+def _check_sibling_closure_sharing(
+    eff_input_set: AbstractSet[str],
+    sub_mutated: AbstractSet[str],
+    chain_infos: Sequence[_EnclosingFnCellInfo],
+    *,
+    is_suspended: bool = False,
+    unreturned_mutations: bool = False,
+    skip_pre_unit_closures: bool = False,
+) -> bool:
+    """Check 4: sibling closure referenced by unit (or concurrent with suspended unit) shares a mutated cell."""
+    if not chain_infos:
+        return False
+    unshadowed = _collect_unshadowed_chain_closure_info(chain_infos)
+    mutated_set = set(sub_mutated)
+    if is_suspended and bool(mutated_set & unshadowed.concurrent_vars):
+        return True
+    if unreturned_mutations and bool(mutated_set & unshadowed.post_reads):
+        return True
+    sub_touched = set(eff_input_set) | mutated_set
+    for sib_name, sib_reads, sib_nl_muts in unshadowed.sib_closures:
         is_ref_sib = sib_name is not None and sib_name in eff_input_set
         if not is_ref_sib and (
             not unreturned_mutations or skip_pre_unit_closures
         ):
             continue
-        if bool(sib_reads & all_chain_locals & set(sub_mutated)):
+        if bool(sib_reads & unshadowed.chain_locals & mutated_set):
             return True
         if bool(
             sib_nl_muts
-            & all_chain_locals
-            & (sub_touched if is_ref_sib else set(sub_mutated))
+            & unshadowed.chain_locals
+            & (sub_touched if is_ref_sib else mutated_set)
         ):
             return True
     return False

@@ -419,6 +419,30 @@ def _eval_match_definite_bindings(
     return set.intersection(*fallthrough_sets), False
 
 
+_SUPPRESSING_CTX_MANAGER_NAMES: frozenset[str] = frozenset(
+    {"suppress", "raises", "assertRaises", "assertRaisesRegex", "ignored"}
+)
+
+
+def _is_exception_suppressing_with(
+    stmt: Union[ast.With, ast.AsyncWith],
+) -> bool:
+    """Checks whether a with/async with statement uses a known exception-suppressing manager."""
+    for item in stmt.items:
+        ctx = item.context_expr
+        if isinstance(ctx, ast.Call):
+            func = ctx.func
+            if (
+                isinstance(func, ast.Name)
+                and func.id in _SUPPRESSING_CTX_MANAGER_NAMES
+            ) or (
+                isinstance(func, ast.Attribute)
+                and func.attr in _SUPPRESSING_CTX_MANAGER_NAMES
+            ):
+                return True
+    return False
+
+
 def _extract_block_definite_bindings_and_term(
     stmts: Sequence[ast.AST],
     active_nonlocals: Optional[Set[str]],
@@ -475,8 +499,17 @@ def _extract_block_definite_bindings_and_term(
                             n, active_nonlocals, fn_globals
                         )
                     )
-            for b_stmt in stmt.body:
-                bound.difference_update(_extract_shallow_deleted_names(b_stmt))
+            if _is_exception_suppressing_with(stmt):
+                for b_stmt in stmt.body:
+                    bound.difference_update(
+                        _extract_shallow_deleted_names(b_stmt)
+                    )
+            else:
+                bound, w_term = _extract_block_definite_bindings_and_term(
+                    stmt.body, active_nonlocals, bound, fn_globals
+                )
+                if w_term:
+                    return bound, True
             continue
         if isinstance(stmt, (ast.For, ast.AsyncFor)):
             bound.difference_update(_extract_shallow_deleted_names(stmt))
@@ -724,6 +757,15 @@ def _push_compound_children(
 
     if isinstance(curr, (ast.With, ast.AsyncWith)):
         body_span = encloses and _block_contains_span(curr.body, span)
+        _maybe_push_pre_span_exhaustive_frame(
+            curr,
+            encloses,
+            bool(curr.body or curr.items),
+            frame,
+            span,
+            state,
+            stack,
+        )
         if body_span:
             for item in curr.items:
                 if item.optional_vars is not None:
