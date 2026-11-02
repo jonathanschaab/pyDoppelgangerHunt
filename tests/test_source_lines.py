@@ -11490,6 +11490,7 @@ def test_intra_unit_global_escapes_detached_shadowing_suspended_local_closures_a
 
 def test_multilevel_concurrent_sibling_with_definite_bindings_and_class_escape() -> None:
     """Covers P1 (multi-level concurrent sibling), P2 (with definite bindings, class escape, context cache), and Areas A-E."""
+    import sys
     from types import MappingProxyType
     from pydoppelgangerhunt.fixer import inspect_single_unit_scope
     from pydoppelgangerhunt.fixer._df_cache import (
@@ -11892,16 +11893,6 @@ def test_multilevel_concurrent_sibling_with_definite_bindings_and_class_escape()
             {"a", "f"},
         ),
         (
-            "try:\n    a = 1\nexcept* ValueError:\n    a = 2\nfinally:\n    f = 3\n",
-            {},
-            {"f"},
-        ),
-        (
-            "match val:\n    case 1:\n        m = 10\n    case _:\n        m = 20\n",
-            {"val": 5},
-            {"m"},
-        ),
-        (
             "if (w := val) and (u := w + 1):\n    z = 1\nelse:\n    z = 2\n",
             {"val": 0},
             {"w", "z"},
@@ -11912,6 +11903,22 @@ def test_multilevel_concurrent_sibling_with_definite_bindings_and_class_escape()
             {"it"},
         ),
     ]
+    if sys.version_info >= (3, 10):
+        oracle_cases.append(
+            (
+                "match val:\n    case 1:\n        m = 10\n    case _:\n        m = 20\n",
+                {"val": 5},
+                {"m"},
+            )
+        )
+    if sys.version_info >= (3, 11):
+        oracle_cases.append(
+            (
+                "try:\n    a = 1\nexcept* ValueError:\n    a = 2\nfinally:\n    f = 3\n",
+                {},
+                {"f"},
+            )
+        )
     for code_str, env_init, expected_def in oracle_cases:
         stmts = ast.parse(code_str).body
         static_bound, _ = _extract_block_definite_bindings_and_term(stmts, None)
@@ -12002,16 +12009,37 @@ def test_multilevel_concurrent_sibling_with_definite_bindings_and_class_escape()
         "        pass\n"
         "    except Exception as e:\n"
         "        pass\n"
-        "    match a:\n"
-        "        case f:\n"
-        "            pass\n"
-        "    type g = int\n"
         "    class Sub:\n"
         "        h = 99\n"
         "        def sub_m(self):\n"
         "            nonlocal h\n"
         "            h = 100\n"
     ).body[0]
+    assert isinstance(area_b_fn, ast.FunctionDef)
+    if sys.version_info >= (3, 10):
+        area_b_fn.body.append(
+            ast.parse("match a:\n    case f:\n        pass\n").body[0]
+        )
+    else:
+        synth_match_as_cls = type(
+            "MatchAs", (ast.stmt,), {"_fields": ("pattern", "name")}
+        )
+        area_b_fn.body.append(synth_match_as_cls(pattern=None, name="f"))
+    if sys.version_info >= (3, 12):
+        area_b_fn.body.append(ast.parse("type g = int\n").body[0])
+    else:
+        synth_ta_cls = type(
+            "TypeAlias",
+            (ast.stmt,),
+            {"_fields": ("name", "type_params", "value")},
+        )
+        area_b_fn.body.append(
+            synth_ta_cls(
+                name=ast.Name(id="g", ctx=ast.Store()),
+                type_params=[],
+                value=ast.Name(id="int", ctx=ast.Load()),
+            )
+        )
     b_muts, b_dels = _extract_closure_nonlocal_mutations_and_deletions_uncached(
         area_b_fn
     )
