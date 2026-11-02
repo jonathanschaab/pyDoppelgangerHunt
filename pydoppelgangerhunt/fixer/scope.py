@@ -28,6 +28,9 @@ from pydoppelgangerhunt.fixer._df_cell_hazards import (
     _has_severed_closure_cell_hazard,
     _resolve_unit_col_bounds,
 )
+from pydoppelgangerhunt.fixer._df_cell_traversal import (
+    _is_exception_suppressing_with,
+)
 from pydoppelgangerhunt.fixer._df_closures import (
     _COMPREHENSION_TYPES,
     _extract_comprehension_walrus_names,
@@ -1040,7 +1043,7 @@ def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
             ):
                 return True
         elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-            if _block_terminates(stmt.body):
+            if not _is_exception_suppressing_with(stmt) and _block_terminates(stmt.body):
                 return True
         elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
             cases = getattr(stmt, "cases", [])
@@ -1056,8 +1059,11 @@ def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
             body_terminates = _block_terminates(getattr(stmt, "body", [])) or (
                 bool(o_stmts) and _block_terminates(o_stmts)
             )
+            if not handlers and body_terminates:
+                return True
             if (
                 handlers
+                and type(stmt).__name__ != "TryStar"
                 and body_terminates
                 and all(_block_terminates(getattr(h, "body", [])) for h in handlers)
             ):
@@ -1293,15 +1299,32 @@ def _analyze_block_assignment(
                         if isinstance(p_node, ast.Name) and isinstance(p_node.ctx, ast.Store):
                             definite.add(p_node.id)
                             may_del.discard(p_node.id)
-            _analyze_block_assignment(
-                stmt.body,
-                definite,
-                conditional,
-                may_deleted=may_del,
-                live_in_deleted=live_in_del,
-            )
+            if _is_exception_suppressing_with(stmt):
+                w_may: Set[str] = set()
+                w_live: Set[str] = set()
+                w_def, w_cond = _analyze_block_assignment(
+                    stmt.body,
+                    may_deleted=w_may,
+                    live_in_deleted=w_live,
+                )
+                live_in_del.update(w_live - definite)
+                may_del.update(w_may)
+                conditional.update((w_def | w_cond) - definite)
+                _demote_deletions_to_conditional(
+                    _extract_deleted_names(stmt.body), definite, conditional
+                )
+            else:
+                _analyze_block_assignment(
+                    stmt.body,
+                    definite,
+                    conditional,
+                    may_deleted=may_del,
+                    live_in_deleted=live_in_del,
+                )
         elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
             t_body = list(getattr(stmt, "body", []))
+            raw_try_del = _extract_deleted_names(t_body)
+            is_trystar = type(stmt).__name__ == "TryStar"
             t_may: Set[str] = set()
             t_live: Set[str] = set()
             t_def, t_cond = _analyze_block_assignment(
@@ -1335,10 +1358,12 @@ def _analyze_block_assignment(
 
             handlers = list(getattr(stmt, "handlers", []))
             h_defs: List[Set[str]] = []
-            h_dels: List[Tuple[Set[str], bool]] = []
+            h_dels: List[Tuple[Set[str], Set[str], bool]] = []
             h_mays: List[Set[str]] = []
             all_handlers_terminate = bool(
-                handlers and all(_block_terminates(getattr(h, "body", [])) for h in handlers)
+                handlers
+                and not is_trystar
+                and all(_block_terminates(getattr(h, "body", [])) for h in handlers)
             )
 
             for h in handlers:
@@ -1355,15 +1380,21 @@ def _analyze_block_assignment(
                 h_d.difference_update(h_bound)
                 h_may.update(h_bound)
                 live_in_del.update((h_live - h_bound) - definite)
-                h_term = _block_terminates(h_body)
+                h_term = not is_trystar and _block_terminates(h_body)
                 eff_h_del = (_extract_deleted_names(h_body) - h_d) | h_bound
-                h_dels.append((eff_h_del, h_term))
+                reach_h_del = eff_h_del | (raw_try_del - h_d)
+                h_dels.append((eff_h_del, reach_h_del, h_term))
                 if not h_term:
                     h_defs.append(h_d)
-                    h_mays.append(h_may)
+                    h_mays.append(h_may | ((raw_try_del | t_may) - h_d))
                 conditional.update(((h_d | h_c) - h_bound) - definite)
 
-            if not t_term:
+            if is_trystar and handlers:
+                conditional.update((t_def | t_cond | try_def | try_cond) - definite)
+                may_del.update(t_may | o_try_may | raw_try_del)
+                for hm in h_mays:
+                    may_del.update(hm)
+            elif not t_term:
                 if all_handlers_terminate:
                     definite.update(try_def)
                     conditional.update(try_cond - definite)
@@ -1390,28 +1421,31 @@ def _analyze_block_assignment(
                 for hm in h_mays:
                     may_del.update(hm)
 
-            eff_try_del = _extract_deleted_names(t_body) - t_def
+            eff_try_del = raw_try_del - t_def
             eff_o_del = _extract_deleted_names(o_stmts) - o_def if o_stmts else set()
             succ_del = eff_try_del | eff_o_del
 
-            surviving_dels: List[Set[str]] = []
-            all_try_dels = succ_del.copy()
-            if not t_term:
-                surviving_dels.append(succ_del)
+            surviving_uncond_dels: List[Set[str]] = []
+            surviving_reach_dels: List[Set[str]] = []
+            all_try_dels = succ_del | raw_try_del
+            if not t_term and not (is_trystar and handlers):
+                surviving_uncond_dels.append(succ_del)
+                surviving_reach_dels.append(succ_del)
 
-            for eff_h_del, h_term in h_dels:
-                all_try_dels.update(eff_h_del)
-                if not h_term:
-                    surviving_dels.append(eff_h_del)
+            for eff_h_del, reach_h_del, h_term in h_dels:
+                all_try_dels.update(reach_h_del)
+                if not h_term and not is_trystar:
+                    surviving_uncond_dels.append(eff_h_del)
+                    surviving_reach_dels.append(reach_h_del)
 
             f_body = list(getattr(stmt, "finalbody", []))
             reach_dels: Set[str] = (
                 all_try_dels
-                if (f_body or type(stmt).__name__ == "TryStar" or not surviving_dels)
-                else set().union(*surviving_dels)
+                if (f_body or is_trystar or not surviving_reach_dels)
+                else set().union(*surviving_reach_dels)
             )
-            if surviving_dels:
-                uncond_dels = set.intersection(*surviving_dels)
+            if surviving_uncond_dels and not is_trystar:
+                uncond_dels = set.intersection(*surviving_uncond_dels)
                 for v_del in uncond_dels:
                     definite.discard(v_del)
                     conditional.discard(v_del)
@@ -2074,6 +2108,7 @@ def _inspect_unit_scope(
                 raw_lines[-1] = _slice_utf8_line(
                     raw_lines[-1], 0, inferred_e_col
                 )
+    stale_source_code_mismatch = False
     if (
         src_code_str
         and inferred_s_col is None
@@ -2081,7 +2116,20 @@ def _inspect_unit_scope(
         and dedent_source_text("".join(raw_lines)).strip()
         != dedent_source_text(str(unit["source_code"])).strip()
     ):
-        raw_lines = split_source_lines(str(unit["source_code"]))
+        raw_joined = "".join(raw_lines)
+        src_code_lines = [
+            ln.strip()
+            for ln in split_source_lines(str(unit["source_code"]))
+            if ln.strip()
+        ]
+        if (
+            (file_tree is not None or _get_full_source() is not None)
+            and src_code_lines
+            and any(ln not in raw_joined for ln in src_code_lines)
+        ):
+            stale_source_code_mismatch = True
+        else:
+            raw_lines = split_source_lines(str(unit["source_code"]))
     dedented = dedent_source_text("".join(raw_lines))
     empty_res: Dict[str, Any] = {
         "inputs": [],
@@ -2121,6 +2169,12 @@ def _inspect_unit_scope(
         "deleted_names": [],
         "_skip_pre_unit_closures": bool(unit.get("skip_pre_unit_closures")),
     }
+    if stale_source_code_mismatch:
+        return {
+            **empty_res,
+            "control_flow_hazards": ["pathological_ast"],
+            "is_control_flow_safe": False,
+        }
     if not dedented.strip():
         return empty_res
 
@@ -2944,11 +2998,18 @@ def ensure_unit_scope_closure_mode(
         u_copy.setdefault("source_text", source_text)
     if (
         scope is not None
-        and "_skip_pre_unit_closures" not in scope
         and tree is None
         and not _load_unit_file_text(u_copy, repo_root=repo_root)
     ):
-        return scope
+        hazards = list(scope.get("control_flow_hazards", ()))
+        if "severed_closure_cell" not in hazards:
+            hazards.append("severed_closure_cell")
+        return {
+            **scope,
+            "control_flow_hazards": hazards,
+            "is_control_flow_safe": False,
+            "_skip_pre_unit_closures": bool(skip_pre_unit_closures),
+        }
     return inspect_single_unit_scope(u_copy, repo_root=repo_root, tree=tree)
 
 
@@ -2960,14 +3021,24 @@ def analyze_unit_variable_scope(
     tree2: Optional[ast.AST] = None,
     scope1: Optional[Dict[str, Any]] = None,
     scope2: Optional[Dict[str, Any]] = None,
+    *,
+    skip_pre_unit_closures: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
-    expected_skip1 = bool(u1.get("skip_pre_unit_closures", False))
+    expected_skip1 = (
+        bool(skip_pre_unit_closures)
+        if skip_pre_unit_closures is not None
+        else bool(u1.get("skip_pre_unit_closures", False))
+    )
     info1 = ensure_unit_scope_closure_mode(
         u1, scope1, expected_skip1, repo_root=repo_root, tree=tree1
     )
     if u2 is not None:
-        expected_skip2 = bool(u2.get("skip_pre_unit_closures", False))
+        expected_skip2 = (
+            bool(skip_pre_unit_closures)
+            if skip_pre_unit_closures is not None
+            else bool(u2.get("skip_pre_unit_closures", False))
+        )
         info2 = ensure_unit_scope_closure_mode(
             u2, scope2, expected_skip2, repo_root=repo_root, tree=tree2
         )

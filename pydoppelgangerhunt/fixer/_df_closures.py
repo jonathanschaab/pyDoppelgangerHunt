@@ -43,7 +43,13 @@ _BUILTIN_NAMES: Set[str] = set(dir(builtins))
 def _node_earliest_start_pos(
     node: ast.AST,
 ) -> Tuple[Optional[int], Optional[int]]:
-    """Computes the earliest (lineno, col_offset) of an AST node including decorators."""
+    """Computes the earliest (lineno, col_offset) of an AST node including decorators.
+
+    Note:
+        Python's AST records decorator positions on the decorator expression node
+        rather than the ``@`` token, so parenthesized multi-line decorators such as
+        ``@(\\n dec\\n)`` report the first line of ``dec``.
+    """
     n_line = getattr(node, "lineno", None)
     n_col = getattr(node, "col_offset", None)
     best_line: Optional[int] = n_line if isinstance(n_line, int) else None
@@ -80,7 +86,11 @@ def _node_strictly_encloses_bounds(
     u_start_col: Optional[int] = None,
     u_end_col: Optional[int] = None,
 ) -> bool:
-    """Checks whether an AST node strictly encloses the 2D span [u_start, u_end]."""
+    """Checks whether an AST node strictly encloses the 2D span [u_start, u_end].
+
+    Returns False when line or required same-line column bounds are unavailable,
+    so callers treating non-enclosing nodes as inside/overlapping the unit fail closed.
+    """
     c_line = getattr(node, "lineno", None)
     c_end = getattr(node, "end_lineno", c_line)
     if not (
@@ -403,22 +413,15 @@ def _resolve_detached_enclosing_scopes(
             if isinstance(module_tree, ast.Module):
                 res.append(module_tree)
             return res
-    target_dump = ast.dump(first_stmt)
-    inner_dump = (
-        ast.dump(first_stmt.value) if isinstance(first_stmt, ast.Expr) else None
-    )
-    for cand in ast.walk(module_tree):
-        if isinstance(cand, (ast.stmt, ast.expr)) and cand in parent_map:
-            c_dump = ast.dump(cand)
-            if c_dump == target_dump or (
-                inner_dump is not None and c_dump == inner_dump
-            ):
-                return _collect_ancestors_from_parent_map(
-                    cand,
-                    parent_map,
-                    module_tree,
-                    include_classes=include_classes,
-                )
+        if include_classes:
+            imm_mod = _resolve_immediate_scope_in_fn(
+                module_tree, s_line, e_line, u_start_col=s_col, u_end_col=e_col
+            )
+            if isinstance(imm_mod, ast.ClassDef):
+                res_cls: List[ast.AST] = [imm_mod]
+                if isinstance(module_tree, ast.Module):
+                    res_cls.append(module_tree)
+                return res_cls
     return [module_tree] if isinstance(module_tree, ast.Module) else []
 
 

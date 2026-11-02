@@ -427,7 +427,17 @@ _SUPPRESSING_CTX_MANAGER_NAMES: frozenset[str] = frozenset(
 def _is_exception_suppressing_with(
     stmt: Union[ast.With, ast.AsyncWith],
 ) -> bool:
-    """Checks whether a with/async with statement uses a known exception-suppressing manager."""
+    """Checks whether a with/async with statement uses a known exception-suppressing manager.
+
+    Note:
+        This is an intentional name-based heuristic matching known suppressing
+        context managers (``suppress``, ``raises``, ``assertRaises``,
+        ``assertRaisesRegex``, ``ignored``) by function or attribute name.
+        Custom or aliased context managers whose ``__exit__`` returns truthy
+        cannot be statically resolved without interprocedural type inference
+        and are treated as non-suppressing, trading a narrow false-negative
+        edge on custom swallowers to avoid rejecting every standard ``with`` block.
+    """
     for item in stmt.items:
         ctx = item.context_expr
         if isinstance(ctx, ast.Call):
@@ -1031,10 +1041,17 @@ def _handle_nested_scope_node(
                     )
                     if sibling_nl_deletions is not None and s_dels:
                         sibling_nl_deletions.update(s_dels)
+                    s_carriers = _extract_fn_outer_carrier_targets(
+                        stmt, state.fn_globals, scope_ctx
+                    )
                     if s_reads or s_muts:
                         sibling_closures.append(
                             (curr.name, set(s_reads), set(s_muts))
                         )
+                        for oc_name in s_carriers:
+                            sibling_closures.append(
+                                (oc_name, set(s_reads), set(s_muts))
+                            )
         elif not enclosing_cls:
             free_r = (
                 _extract_nested_scope_free_reads(curr, include_header=False)
@@ -1748,6 +1765,7 @@ def _analyze_enclosing_fn_cells_uncached(
     unit_mutations: AbstractSet[str] = frozenset(),
     enclosed_fn: Optional[ast.AST] = None,
     mod_tree: Optional[ast.AST] = None,
+    use_stmt_deltas: bool = True,
 ) -> _EnclosingFnCellInfo:
     """Computes variable bindings, post-span mutations, loop mutations, and sibling closures."""
     scope_ctx = _get_fn_scope_context(fn_node, mod_tree=mod_tree)
@@ -1777,7 +1795,7 @@ def _analyze_enclosing_fn_cells_uncached(
                 dict,
             ),
         )
-        if enclosed_fn is None
+        if enclosed_fn is None and use_stmt_deltas
         else None
     )
     stack: List[_StackFrame] = [

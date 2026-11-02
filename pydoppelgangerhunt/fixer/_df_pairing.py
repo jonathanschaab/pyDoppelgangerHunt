@@ -389,22 +389,6 @@ def resolve_clone_generator_subroutine_outputs(
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
     )
-    orig_def1 = (
-        set(scope1["definite_stores"])
-        if isinstance(scope1, dict)
-        and "definite_stores" in scope1
-        and "outputs" not in scope1
-        and "control_flow_hazards" not in scope1
-        else None
-    )
-    orig_def2 = (
-        set(scope2["definite_stores"])
-        if isinstance(scope2, dict)
-        and "definite_stores" in scope2
-        and "outputs" not in scope2
-        and "control_flow_hazards" not in scope2
-        else None
-    )
     scope1 = ensure_unit_scope_closure_mode(
         u1,
         scope1,
@@ -479,31 +463,15 @@ def resolve_clone_generator_subroutine_outputs(
         scope2.get("deleted_names", [])
     )
     u1_def = (
-        (
-            orig_def1
-            if orig_def1 is not None
-            else set(scope1.get("definite_stores", []))
-        )
+        set(scope1.get("definite_stores", []))
         | (set(scope1.get("inputs", [])) - u1_cond)
-        if (
-            "definite_stores" in scope1
-            or "inputs" in scope1
-            or orig_def1 is not None
-        )
+        if "definite_stores" in scope1 or "inputs" in scope1
         else set()
     )
     u2_def = (
-        (
-            orig_def2
-            if orig_def2 is not None
-            else set(scope2.get("definite_stores", []))
-        )
+        set(scope2.get("definite_stores", []))
         | (set(scope2.get("inputs", [])) - u2_cond)
-        if (
-            "definite_stores" in scope2
-            or "inputs" in scope2
-            or orig_def2 is not None
-        )
+        if "definite_stores" in scope2 or "inputs" in scope2
         else set()
     )
 

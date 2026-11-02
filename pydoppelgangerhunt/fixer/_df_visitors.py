@@ -320,16 +320,18 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
         super().__init__()
         self.class_stores: Set[str] = set()
         self.free_reads: Set[str] = set()
+        self.nested_free_reads: Set[str] = set()
+        self.nested_load_nodes: List[ast.Name] = []
 
     def _record_class_load(self, name: str, node: Optional[ast.Name] = None) -> None:
         if self._is_in_comp(name):
             return
         if self._in_comp_body > 0:
-            # Comprehensions in class bodies cannot resolve class attributes (PEP 227)
-            if name not in self.globals:
-                self.free_reads.add(name)
-                if node is not None:
-                    self.load_nodes.append(node)
+            # Comprehensions in class bodies execute in their own nested scope and
+            # do not resolve class attributes or class-body globals (PEP 227).
+            self.nested_free_reads.add(name)
+            if node is not None:
+                self.nested_load_nodes.append(node)
         elif name not in (self.class_stores | self.globals):
             self.free_reads.add(name)
             if node is not None:
@@ -357,11 +359,11 @@ class _ClassScopeVisitor(_BaseScopeVisitor):
         body_reads, body_nodes = _extract_nested_scope_free_reads_with_nodes(
             node, include_header=False, include_body=True
         )
-        self.free_reads.update(
-            r for r in body_reads if not self._is_in_comp(r) and r not in self.globals
+        self.nested_free_reads.update(
+            r for r in body_reads if not self._is_in_comp(r)
         )
-        self.load_nodes.extend(
-            n for n in body_nodes if not self._is_in_comp(n.id) and n.id not in self.globals
+        self.nested_load_nodes.extend(
+            n for n in body_nodes if not self._is_in_comp(n.id)
         )
 
     def visit_FunctionDef(
@@ -630,13 +632,17 @@ def _extract_nested_scope_free_reads_with_nodes(
                 class_visitor.class_stores.add(tp_name)
             for stmt in node.body:
                 class_visitor.visit(stmt)
-            body_free = (
+            direct_free = (
                 (class_visitor.free_reads | class_visitor.nonlocals)
                 - class_visitor.globals
                 - type_param_names
             )
+            nested_free = class_visitor.nested_free_reads - type_param_names
+            body_free = direct_free | nested_free
             body_nodes = [
-                n for n in class_visitor.load_nodes if n.id in body_free
+                n for n in class_visitor.load_nodes if n.id in direct_free
+            ] + [
+                n for n in class_visitor.nested_load_nodes if n.id in nested_free
             ]
     else:
         if include_header:

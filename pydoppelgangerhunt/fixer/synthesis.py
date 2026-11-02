@@ -1456,13 +1456,14 @@ def synthesize_shared_helper_code(
         ):
             return ""
         scope = analyze_unit_variable_scope(
-            {**u1, "skip_pre_unit_closures": effective_skip_closures},
-            {**u2, "skip_pre_unit_closures": effective_skip_closures},
+            u1,
+            u2,
             repo_root=repo_root,
             tree1=tree1,
             tree2=tree2,
             scope1=scope1,
             scope2=scope2,
+            skip_pre_unit_closures=effective_skip_closures,
         )
 
     if scope1.get("is_async") or scope2.get("is_async"):

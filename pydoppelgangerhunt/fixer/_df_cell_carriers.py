@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import ast
+from collections import ChainMap
 from types import MappingProxyType
 from typing import (
     AbstractSet,
     Any,
+    Callable,
     Dict,
     List,
     Mapping,
@@ -23,6 +25,7 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _ScopeCacheKey,
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
+    _params_contain_ast,
     _scope_cell_info_cache,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
@@ -62,6 +65,26 @@ class _FnScopeContext(NamedTuple):
     mod_tree: Optional[ast.AST] = None
     enclosing_scopes: Tuple[ast.AST, ...] = ()
 
+    def cache_fingerprint(self) -> Tuple[Any, ...]:
+        """Returns the non-AST semantic fingerprint of this scope context."""
+        return (
+            self.fn_locals,
+            self.shadowed_names,
+            self.has_star_import,
+        )
+
+    def cache_aux_nodes(self) -> Tuple[ast.AST, ...]:
+        """Returns all AST owner and enclosing scope nodes referenced by this context."""
+        aux_nodes: List[ast.AST] = []
+        if isinstance(self.scope_owner, ast.AST):
+            aux_nodes.append(self.scope_owner)
+        if isinstance(self.mod_tree, ast.AST):
+            aux_nodes.append(self.mod_tree)
+        for enc in self.enclosing_scopes:
+            if isinstance(enc, ast.AST):
+                aux_nodes.append(enc)
+        return tuple(aux_nodes)
+
 
 def _make_scope_ctx_cache_key(
     owner: ast.AST,
@@ -70,27 +93,19 @@ def _make_scope_ctx_cache_key(
     extra_params: Tuple[Any, ...] = (),
 ) -> _ScopeCacheKey:
     """Builds a _ScopeCacheKey incorporating full _FnScopeContext identity and AST owners."""
+    if extra_params and _params_contain_ast(extra_params):
+        raise ValueError(
+            "_ScopeCacheKey.params must not contain ast.AST nodes; use owner or aux_ast_nodes"
+        )
     if scope_ctx is None:
-        return _ScopeCacheKey(owner, kind, params=(*extra_params, None))
-    aux_nodes: List[ast.AST] = []
-    if isinstance(scope_ctx.scope_owner, ast.AST):
-        aux_nodes.append(scope_ctx.scope_owner)
-    if isinstance(scope_ctx.mod_tree, ast.AST):
-        aux_nodes.append(scope_ctx.mod_tree)
-    for enc in scope_ctx.enclosing_scopes:
-        if isinstance(enc, ast.AST):
-            aux_nodes.append(enc)
-    return _ScopeCacheKey(
+        return _ScopeCacheKey.make_trusted(
+            owner, kind, params=(*extra_params, None)
+        )
+    return _ScopeCacheKey.make_trusted(
         owner,
         kind,
-        params=(
-            *extra_params,
-            scope_ctx.fn_locals,
-            scope_ctx.shadowed_names,
-            scope_ctx.has_star_import,
-            id(scope_ctx.parent_map),
-        ),
-        aux_ast_nodes=tuple(aux_nodes),
+        params=(*extra_params, *scope_ctx.cache_fingerprint()),
+        aux_ast_nodes=scope_ctx.cache_aux_nodes(),
     )
 
 
@@ -438,10 +453,19 @@ def _has_unresolved_span_bounds(
             continue
         if not isinstance(n_col, int) or not isinstance(n_end_col, int):
             return True
-        if isinstance(node, ast.stmt):
+        if isinstance(node, ast.stmt) and not _node_strictly_encloses_bounds(
+            node, u_start, u_end, u_start_col=u_start_col, u_end_col=u_end_col
+        ):
             if n_start == u_start:
                 start_line_stmts.append(node)
-            if n_end == u_end:
+            if n_end == u_end and not (
+                n_start < u_end
+                and any(
+                    isinstance(ch, ast.stmt)
+                    or type(ch).__name__ in ("ExceptHandler", "match_case")
+                    for ch in ast.iter_child_nodes(node)
+                )
+            ):
                 end_line_stmts.append(node)
     is_expr_cand = len(candidate_stmts) == 1 and isinstance(
         candidate_stmts[0], ast.Expr
@@ -463,6 +487,62 @@ def _has_unresolved_span_bounds(
     )
 
 
+def _walk_invalid_lexical_scope_declarations(
+    initial_stack: List[Tuple[ast.AST, frozenset[str], frozenset[str], bool]],
+) -> bool:
+    """Walks initial_stack checking for PEP 3104 nonlocal/global declaration violations."""
+    stack = initial_stack
+    while stack:
+        curr, cur_bound, cur_blocked, cur_rooted = stack.pop()
+        if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            for hdr in iter_nested_scope_header_nodes(curr):
+                stack.append((hdr, cur_bound, cur_blocked, cur_rooted))
+            d_nl = _extract_direct_nonlocals(curr, is_global=False)
+            d_g = _extract_direct_nonlocals(curr, is_global=True)
+            if d_nl & d_g:
+                return True
+            if d_nl & cur_blocked:
+                return True
+            if cur_rooted and (d_nl - cur_bound):
+                return True
+            if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                params = _extract_arg_names(
+                    curr.args
+                ) | _extract_node_type_param_names(curr)
+                if params & (d_nl | d_g):
+                    return True
+                own_locals = frozenset(_extract_strict_fn_local_names(curr))
+                next_bound = (cur_bound - d_g) | own_locals
+                next_blocked = (cur_blocked - own_locals) | d_g
+            else:
+                next_bound = cur_bound
+                next_blocked = cur_blocked
+            for ch in curr.body:
+                stack.append((ch, next_bound, next_blocked, cur_rooted))
+            continue
+        for child in ast.iter_child_nodes(curr):
+            stack.append((child, cur_bound, cur_blocked, cur_rooted))
+    return False
+
+
+def _scope_has_invalid_lexical_declarations(
+    root_scope: ast.AST,
+    is_module_rooted: bool,
+) -> bool:
+    """Checks (and caches per AST root scope) whether root_scope has invalid lexical declarations."""
+    return bool(
+        _get_or_compute_scope_cached(
+            _scope_cell_info_cache,
+            _ScopeCacheKey.make_trusted(
+                root_scope, "invalid_lex_decls", params=(is_module_rooted,)
+            ),
+            lambda: _walk_invalid_lexical_scope_declarations(
+                [(root_scope, frozenset(), frozenset(), is_module_rooted)]
+            ),
+        )
+    )
+
+
 def _has_invalid_lexical_scope_declarations(
     candidate_stmts: Sequence[ast.AST],
     enclosing_chain: Sequence[Tuple[int, int, ast.AST]] = (),
@@ -470,6 +550,10 @@ def _has_invalid_lexical_scope_declarations(
 ) -> bool:
     """Returns True if any scope in enclosing_chain or candidate_stmts violates PEP 3104 nonlocal/global rules."""
     is_module_rooted = isinstance(mod_tree, ast.Module)
+    if enclosing_chain and _scope_has_invalid_lexical_declarations(
+        enclosing_chain[0][2], is_module_rooted
+    ):
+        return True
     bound_in_fns: frozenset[str] = frozenset()
     blocked_globals: frozenset[str] = frozenset()
     for _, _, enc_fn in enclosing_chain:
@@ -504,50 +588,12 @@ def _has_invalid_lexical_scope_declarations(
     if is_module_rooted and (top_nl - bound_in_fns):
         return True
 
-    stack: List[Tuple[ast.AST, frozenset[str], frozenset[str], bool]] = [
-        (stmt, bound_in_fns, blocked_globals, is_module_rooted)
-        for stmt in candidate_stmts
-    ]
-    if enclosing_chain:
-        stack.append(
-            (
-                enclosing_chain[0][2],
-                frozenset(),
-                frozenset(),
-                is_module_rooted,
-            )
-        )
-    while stack:
-        curr, cur_bound, cur_blocked, cur_rooted = stack.pop()
-        if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            for hdr in iter_nested_scope_header_nodes(curr):
-                stack.append((hdr, cur_bound, cur_blocked, cur_rooted))
-            d_nl = _extract_direct_nonlocals(curr, is_global=False)
-            d_g = _extract_direct_nonlocals(curr, is_global=True)
-            if d_nl & d_g:
-                return True
-            if d_nl & cur_blocked:
-                return True
-            if cur_rooted and (d_nl - cur_bound):
-                return True
-            if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                params = _extract_arg_names(
-                    curr.args
-                ) | _extract_node_type_param_names(curr)
-                if params & (d_nl | d_g):
-                    return True
-                own_locals = frozenset(_extract_strict_fn_local_names(curr))
-                next_bound = (cur_bound - d_g) | own_locals
-                next_blocked = (cur_blocked - own_locals) | d_g
-            else:
-                next_bound = cur_bound
-                next_blocked = cur_blocked
-            for ch in curr.body:
-                stack.append((ch, next_bound, next_blocked, cur_rooted))
-            continue
-        for child in ast.iter_child_nodes(curr):
-            stack.append((child, cur_bound, cur_blocked, cur_rooted))
-    return False
+    return _walk_invalid_lexical_scope_declarations(
+        [
+            (stmt, bound_in_fns, blocked_globals, is_module_rooted)
+            for stmt in candidate_stmts
+        ]
+    )
 
 
 def _extract_direct_nonlocals(
@@ -585,6 +631,7 @@ def _scan_scope_nonlocal_mutations_and_deletions(
     scope_node: ast.AST,
     *,
     include_nested: bool = True,
+    use_cache: bool = True,
 ) -> Tuple[Set[str], Set[str]]:
     """Scans scope_node for (mutated_or_deleted, deleted) nonlocal variables."""
     own_locals = (
@@ -604,7 +651,7 @@ def _scan_scope_nonlocal_mutations_and_deletions(
             direct_mutated.add(curr.name)
             if include_nested:
                 sub_mut, sub_del = _extract_closure_nonlocal_mutations_and_deletions(
-                    curr
+                    curr, use_cache=use_cache
                 )
                 nested_mutated.update(sub_mut - own_locals)
                 nested_deleted.update(sub_del - own_locals)
@@ -644,12 +691,14 @@ def _extract_direct_scope_nonlocal_mutations_and_deletions(
 ) -> Tuple[Set[str], Set[str]]:
     """Extracts (mutated_or_deleted, deleted) nonlocal variables directly in scope_node.body."""
     return _scan_scope_nonlocal_mutations_and_deletions(
-        scope_node, include_nested=False
+        scope_node, include_nested=False, use_cache=False
     )
 
 
 def _extract_closure_nonlocal_mutations_and_deletions_uncached(
     scope_node: ast.AST,
+    *,
+    use_cache: bool = True,
 ) -> Tuple[frozenset[str], frozenset[str]]:
     """Computes (mutated_or_deleted, deleted) outer-scope variables via nonlocal in scope_node.
 
@@ -658,48 +707,75 @@ def _extract_closure_nonlocal_mutations_and_deletions_uncached(
     own_locals is empty when scope_node is an ast.ClassDef.
     """
     muts, dels = _scan_scope_nonlocal_mutations_and_deletions(
-        scope_node, include_nested=True
+        scope_node, include_nested=True, use_cache=use_cache
     )
     return frozenset(muts), frozenset(dels)
 
 
+def _resolve_cached_str_set_pair(
+    node: ast.AST,
+    allowed_types: Tuple[ type[ast.AST], ...],
+    cache_key: _ScopeCacheKey,
+    compute_fn: Callable[[bool], Tuple[frozenset[str], frozenset[str]]],
+    *,
+    use_cache: bool = True,
+) -> Tuple[Set[str], Set[str]]:
+    """Evaluates (or fetches from _scope_cell_info_cache) a pair of frozenset[str] and returns mutable sets."""
+    if not isinstance(node, allowed_types):
+        return set(), set()
+    first, second = (
+        cast(
+            Tuple[frozenset[str], frozenset[str]],
+            _get_or_compute_scope_cached(
+                _scope_cell_info_cache, cache_key, lambda: compute_fn(True)
+            ),
+        )
+        if use_cache
+        else compute_fn(False)
+    )
+    return set(first), set(second)
+
+
 def _extract_closure_nonlocal_mutations_and_deletions(
-    scope_node: ast.AST,
+    scope_node: ast.AST, *, use_cache: bool = True
 ) -> Tuple[Set[str], Set[str]]:
     """Extracts and caches (mutated_or_deleted, deleted) nonlocal variables in scope_node."""
-    if not isinstance(
-        scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-    ):
-        return set(), set()
-    muts, dels = cast(
-        Tuple[frozenset[str], frozenset[str]],
-        _get_or_compute_scope_cached(
-            _scope_cell_info_cache,
-            _ScopeCacheKey(scope_node, "nl_muts_dels"),
-            lambda: _extract_closure_nonlocal_mutations_and_deletions_uncached(
-                scope_node
-            ),
-        ),
+    return _resolve_cached_str_set_pair(
+        scope_node,
+        (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        _ScopeCacheKey(scope_node, "nl_muts_dels"),
+        lambda c: _extract_closure_nonlocal_mutations_and_deletions_uncached(scope_node, use_cache=c),
+        use_cache=use_cache,
     )
-    return set(muts), set(dels)
 
 
-def _extract_closure_nonlocal_mutations(scope_node: ast.AST) -> Set[str]:
+def _extract_closure_nonlocal_mutations(
+    scope_node: ast.AST,
+    *,
+    use_cache: bool = True,
+) -> Set[str]:
     """Extracts outer-scope variables mutated or deleted via nonlocal inside scope_node."""
-    return _extract_closure_nonlocal_mutations_and_deletions(scope_node)[0]
+    return _extract_closure_nonlocal_mutations_and_deletions(
+        scope_node, use_cache=use_cache
+    )[0]
 
 
 def _extract_cached_scope_free_reads(
     node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef],
+    *,
+    use_cache: bool = True,
 ) -> Set[str]:
     """Extracts and caches free variable reads escaping a nested function or class."""
-    return set(
+    raw = (
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
             _ScopeCacheKey(node, "free_reads"),
             lambda: frozenset(_extract_nested_scope_free_reads(node)),
         )
+        if use_cache
+        else _extract_nested_scope_free_reads(node)
     )
+    return set(raw)
 
 
 def _extract_expr_scope_free_reads(
@@ -886,6 +962,8 @@ class _IntraUnitMutator(NamedTuple):
 
 def _is_self_escaping_def_node(
     d_node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef],
+    *,
+    use_cache: bool = True,
 ) -> bool:
     """Checks whether a function or class definition escapes or mutates on definition."""
     if d_node.decorator_list:
@@ -897,7 +975,7 @@ def _is_self_escaping_def_node(
             return True
         if _extract_direct_nonlocals(
             d_node, is_global=True
-        ) & _extract_closure_nonlocal_mutations(d_node):
+        ) & _extract_closure_nonlocal_mutations(d_node, use_cache=use_cache):
             return True
     return False
 
@@ -912,6 +990,11 @@ def _collect_unit_nonlocal_mutators(
     unit_mod = ast.Module(
         body=[s for s in candidate_stmts if isinstance(s, ast.stmt)],
         type_ignores=[],
+    )
+    use_node_cache = bool(
+        mod_tree is not None
+        and candidate_stmts
+        and candidate_stmts[0] in _get_scope_parent_map(mod_tree)
     )
     fn_enclosing = [
         s for s in enclosing_scopes if not isinstance(s, ast.ClassDef)
@@ -934,7 +1017,7 @@ def _collect_unit_nonlocal_mutators(
     )
     _esc_names, escaped_def_ids, _exec_ids = (
         _collect_escaped_and_executed_intra_unit_defs(
-            candidate_stmts, frozenset()
+            candidate_stmts, frozenset(), use_cache=use_node_cache
         )
     )
     mutators: List[_IntraUnitMutator] = []
@@ -947,8 +1030,15 @@ def _collect_unit_nonlocal_mutators(
     while stack:
         curr, shadowed, fn_ctx, active_ctx, in_unescaped_cls = stack.pop()
         if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            mutated = _extract_closure_nonlocal_mutations(curr) - shadowed
-            is_self_esc = _is_self_escaping_def_node(curr)
+            mutated = (
+                _extract_closure_nonlocal_mutations(
+                    curr, use_cache=use_node_cache
+                )
+                - shadowed
+            )
+            is_self_esc = _is_self_escaping_def_node(
+                curr, use_cache=use_node_cache
+            )
             if isinstance(curr, ast.ClassDef):
                 is_escaped_def = (id(curr) in escaped_def_ids) or is_self_esc
             else:
@@ -957,7 +1047,9 @@ def _collect_unit_nonlocal_mutators(
                     or is_self_esc
                     or (
                         not in_unescaped_cls
-                        and _is_closure_factory_scope(curr, active_ctx)
+                        and _is_closure_factory_scope(
+                            curr, active_ctx, use_cache=use_node_cache
+                        )
                     )
                 )
             if mutated:
@@ -975,13 +1067,14 @@ def _collect_unit_nonlocal_mutators(
                     curr,
                     frozenset(_extract_single_node_local_names(curr)),
                     fn_ctx,
+                    use_cache=use_node_cache,
                 )
                 body_unesc_cls = not is_escaped_def
             else:
                 fn_own = frozenset(_extract_strict_fn_local_names(curr))
                 body_shadowed = shadowed | fn_own
                 body_fn_ctx = _make_nested_fn_scope_context(
-                    curr, fn_own, fn_ctx
+                    curr, fn_own, fn_ctx, use_cache=use_node_cache
                 )
                 body_active_ctx = body_fn_ctx
                 body_unesc_cls = False
@@ -1240,13 +1333,22 @@ def _is_non_closure_builtin_call(
     node: ast.AST,
     scope_ctx: Optional[_FnScopeContext] = None,
 ) -> bool:
-    """Returns True if node is a Call to an unshadowed scalar/non-closure built-in."""
+    """Returns True if node is a Call to an unshadowed scalar/non-closure built-in.
+
+    When ``scope_ctx`` is provided, both ``scope_ctx.has_star_import`` and
+    ``scope_ctx.shadowed_names`` must confirm the built-in is not shadowed.
+    """
     return (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id in _NON_CLOSURE_RETURN_BUILTINS
         and (
-            scope_ctx is None or node.func.id not in scope_ctx.shadowed_names
+            scope_ctx is None
+            or (
+                not scope_ctx.has_star_import
+                and "*" not in scope_ctx.shadowed_names
+                and node.func.id not in scope_ctx.shadowed_names
+            )
         )
     )
 
@@ -1532,6 +1634,8 @@ def _extract_shallow_defs(
 def _collect_escaped_and_executed_intra_unit_defs(
     candidate_stmts: Sequence[ast.stmt],
     initial_escaped: AbstractSet[str],
+    *,
+    use_cache: bool = False,
 ) -> Tuple[Set[str], Set[int], Set[int]]:
     """Computes (escaped_names, escaped_def_node_ids, executed_def_node_ids)."""
     root_defs = _extract_shallow_defs(candidate_stmts)
@@ -1635,7 +1739,7 @@ def _collect_escaped_and_executed_intra_unit_defs(
                 escaped_def_ids.add(id(d_node))
     for nodes in root_defs.values():
         for d_node in nodes:
-            if _is_self_escaping_def_node(d_node):
+            if _is_self_escaping_def_node(d_node, use_cache=use_cache):
                 escaped_def_ids.add(id(d_node))
                 executed_def_ids.add(id(d_node))
             elif isinstance(d_node, ast.ClassDef):
@@ -1666,7 +1770,7 @@ def _collect_escaped_and_executed_intra_unit_defs(
                 cid = id(c_node)
                 if (
                     isinstance(d_node, ast.ClassDef) and is_esc
-                ) or _is_self_escaping_def_node(c_node):
+                ) or _is_self_escaping_def_node(c_node, use_cache=use_cache):
                     if cid not in escaped_def_ids:
                         escaped_def_ids.add(cid)
                         executed_def_ids.add(cid)
@@ -1813,16 +1917,21 @@ def _make_nested_fn_scope_context(
     fn_node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef],
     own_locals: frozenset[str],
     scope_ctx: Optional[_FnScopeContext] = None,
+    *,
+    use_cache: bool = True,
 ) -> _FnScopeContext:
     """Builds a _FnScopeContext for analyzing expressions inside a nested function."""
     if scope_ctx is None:
         parent_map: Mapping[ast.AST, ast.AST] = MappingProxyType(
-            _get_scope_parent_map(fn_node)
+            _get_scope_parent_map(fn_node, use_cache=use_cache)
         )
     elif fn_node.body and fn_node.body[0] not in scope_ctx.parent_map:
-        merged_parents = dict(scope_ctx.parent_map)
-        merged_parents.update(_get_scope_parent_map(fn_node))
-        parent_map = MappingProxyType(merged_parents)
+        parent_map = MappingProxyType(
+            ChainMap(
+                _get_scope_parent_map(fn_node, use_cache=use_cache),
+                cast(Dict[ast.AST, ast.AST], scope_ctx.parent_map),
+            )
+        )
     else:
         parent_map = scope_ctx.parent_map
     enc_scopes: Tuple[ast.AST, ...] = (
@@ -1870,6 +1979,8 @@ def _propagate_local_closure_syms(
 def _is_closure_factory_scope_uncached(
     scope_node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef],
     scope_ctx: Optional[_FnScopeContext] = None,
+    *,
+    use_cache: bool = True,
 ) -> bool:
     """Computes whether a nested function or class can return a closure or carrier."""
     if isinstance(scope_node, (ast.ClassDef, ast.AsyncFunctionDef)):
@@ -1877,9 +1988,12 @@ def _is_closure_factory_scope_uncached(
             set(scope_ctx.shadowed_names) if scope_ctx is not None else set()
         )
         has_free_or_nl = bool(
-            _extract_cached_scope_free_reads(scope_node) - unshadowed_builtins
+            _extract_cached_scope_free_reads(scope_node, use_cache=use_cache)
+            - unshadowed_builtins
         ) or bool(
-            _extract_closure_nonlocal_mutations_and_deletions(scope_node)[0]
+            _extract_closure_nonlocal_mutations_and_deletions(
+                scope_node, use_cache=use_cache
+            )[0]
         )
         if isinstance(scope_node, ast.ClassDef):
             has_deferred_member = any(
@@ -1903,17 +2017,23 @@ def _is_closure_factory_scope_uncached(
                 isinstance(sub, (ast.Lambda, ast.GeneratorExp))
                 or (
                     isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and _is_closure_factory_scope_uncached(sub, scope_ctx)
+                    and _is_closure_factory_scope_uncached(
+                        sub, scope_ctx, use_cache=use_cache
+                    )
                 )
                 for sub in ast.walk(scope_node)
                 if sub is not scope_node
             )
         if has_free_or_nl or any(
-            _extract_fn_returned_closure_refs(scope_node, scope_ctx)
+            _extract_fn_returned_closure_refs(
+                scope_node, scope_ctx, use_cache=use_cache
+            )
         ):
             return True
     own_locals = frozenset(_extract_strict_fn_local_names(scope_node))
-    local_ctx = _make_nested_fn_scope_context(scope_node, own_locals, scope_ctx)
+    local_ctx = _make_nested_fn_scope_context(
+        scope_node, own_locals, scope_ctx, use_cache=use_cache
+    )
     has_nested_closure = False
     local_closure_syms: Set[str] = set()
     local_edges: List[Tuple[str, Set[str]]] = []
@@ -1973,12 +2093,18 @@ def _is_closure_factory_scope_uncached(
 def _is_closure_factory_scope(
     scope_node: ast.AST,
     scope_ctx: Optional[_FnScopeContext] = None,
+    *,
+    use_cache: bool = True,
 ) -> bool:
     """Checks whether a nested function or class can return a closure or generator/coroutine."""
     if not isinstance(
         scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
     ):
         return False
+    if not use_cache:
+        return _is_closure_factory_scope_uncached(
+            scope_node, scope_ctx, use_cache=False
+        )
     cache_key = _make_scope_ctx_cache_key(
         scope_node, "is_closure_factory", scope_ctx
     )
@@ -1986,19 +2112,25 @@ def _is_closure_factory_scope(
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
             cache_key,
-            lambda: _is_closure_factory_scope_uncached(scope_node, scope_ctx),
+            lambda: _is_closure_factory_scope_uncached(
+                scope_node, scope_ctx, use_cache=True
+            ),
         )
     )
 
 
 def _extract_fn_returned_closure_refs_uncached(
-    fn_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+    fn_node: ast.AST,
     scope_ctx: Optional[_FnScopeContext] = None,
+    *,
+    use_cache: bool = True,
 ) -> Tuple[frozenset[str], frozenset[str]]:
     """Computes (returned_loaded_names, returned_called_names) for fn_node without caching."""
+    if not isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return frozenset(), frozenset()
     own_locals = _extract_strict_fn_local_names(fn_node)
     local_ctx = _make_nested_fn_scope_context(
-        fn_node, frozenset(own_locals), scope_ctx
+        fn_node, frozenset(own_locals), scope_ctx, use_cache=use_cache
     )
     ret_exprs: List[ast.AST] = []
     stack: List[ast.AST] = list(fn_node.body)
@@ -2020,34 +2152,31 @@ def _extract_fn_returned_closure_refs_uncached(
 
 
 def _extract_fn_returned_closure_refs(
-    fn_node: ast.AST,
-    scope_ctx: Optional[_FnScopeContext] = None,
+    fn_node: ast.AST, scope_ctx: Optional[_FnScopeContext] = None, *, use_cache: bool = True
 ) -> Tuple[Set[str], Set[str]]:
     """Extracts non-local (returned_loaded_names, returned_called_names) for a nested function."""
-    if not isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        return set(), set()
-    cache_key = _make_scope_ctx_cache_key(
-        fn_node, "ret_closure_refs", scope_ctx
+    return _resolve_cached_str_set_pair(
+        fn_node,
+        (ast.FunctionDef, ast.AsyncFunctionDef),
+        _make_scope_ctx_cache_key(fn_node, "ret_closure_refs", scope_ctx),
+        lambda c: _extract_fn_returned_closure_refs_uncached(fn_node, scope_ctx, use_cache=c),
+        use_cache=use_cache,
     )
-    cached_loads, cached_calls = cast(
-        Tuple[frozenset[str], frozenset[str]],
-        _get_or_compute_scope_cached(
-            _scope_cell_info_cache,
-            cache_key,
-            lambda: _extract_fn_returned_closure_refs_uncached(
-                fn_node, scope_ctx
-            ),
-        ),
-    )
-    return set(cached_loads), set(cached_calls)
 
 
 def _extract_fn_outer_carrier_targets_uncached(
     fn_node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef],
     fn_globals: AbstractSet[str] = frozenset(),
     scope_ctx: Optional[_FnScopeContext] = None,
+    *,
+    use_cache: bool = True,
 ) -> frozenset[str]:
-    """Computes outer-scope container/variable names mutated by carrier operations in fn_node."""
+    """Computes outer-scope container/variable names mutated by carrier operations in fn_node.
+
+    Per PEP 227, ``global`` declarations inside a ``ClassDef`` body only govern name
+    resolution in that immediate class body and do not propagate into nested methods,
+    lambdas, comprehensions, or nested classes.
+    """
     has_closure = any(
         isinstance(
             sub,
@@ -2064,67 +2193,87 @@ def _extract_fn_outer_carrier_targets_uncached(
     )
     if not has_closure:
         return frozenset()
+    is_root_cls = isinstance(fn_node, ast.ClassDef)
     own_locals = (
         set()
-        if isinstance(fn_node, ast.ClassDef)
+        if is_root_cls
         else _extract_strict_fn_local_names(fn_node)
     )
     local_ctx = _make_nested_fn_scope_context(
-        fn_node, frozenset(own_locals), scope_ctx
+        fn_node, frozenset(own_locals), scope_ctx, use_cache=use_cache
     )
     direct_nl = _extract_direct_nonlocals(fn_node)
-    fn_g = set(fn_globals) | _extract_direct_nonlocals(fn_node, is_global=True)
+    direct_g = _extract_direct_nonlocals(fn_node, is_global=True)
+    fn_g = set(fn_globals) if is_root_cls else (set(fn_globals) | direct_g)
+    cls_g = direct_g if is_root_cls else set()
     targets: Set[str] = set()
     local_closure_syms: Set[str] = set()
     local_edges: List[Tuple[str, Set[str]]] = []
     outer_candidates: List[Tuple[str, Set[str]]] = []
-    stack: List[Tuple[ast.AST, Set[str], Set[str], Set[str]]] = [
-        (stmt, own_locals, direct_nl, fn_g) for stmt in fn_node.body
+    stack: List[Tuple[ast.AST, Set[str], Set[str], Set[str], Set[str]]] = [
+        (stmt, own_locals, direct_nl, fn_g, cls_g) for stmt in fn_node.body
     ]
     while stack:
-        sub, cur_locals, cur_nl, cur_g = stack.pop()
+        sub, cur_locals, cur_nl, cur_fn_g, cur_cls_g = stack.pop()
         if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             local_closure_syms.add(sub.name)
             for hdr in iter_nested_scope_header_nodes(sub):
-                stack.append((hdr, cur_locals, cur_nl, cur_g))
+                stack.append((hdr, cur_locals, cur_nl, cur_fn_g, cur_cls_g))
             sub_direct_nl = _extract_direct_nonlocals(sub)
-            sub_g = cur_g | (
-                set()
-                if isinstance(sub, ast.ClassDef)
-                else _extract_direct_nonlocals(sub, is_global=True)
-            )
-            sub_own = (
-                set()
-                if isinstance(sub, ast.ClassDef)
-                else _extract_strict_fn_local_names(sub)
-            )
+            sub_direct_g = _extract_direct_nonlocals(sub, is_global=True)
+            if isinstance(sub, ast.ClassDef):
+                sub_fn_g = cur_fn_g - sub_direct_nl
+                sub_cls_g = sub_direct_g
+                sub_own: Set[str] = set()
+            else:
+                sub_own = _extract_strict_fn_local_names(sub)
+                sub_fn_g = (
+                    (cur_fn_g - sub_own) - sub_direct_nl
+                ) | sub_direct_g
+                sub_cls_g = set()
             sub_nl = (
-                (sub_direct_nl & cur_nl) | (sub_direct_nl - cur_locals)
-            ) - sub_g
-            next_locals = (cur_locals | sub_own) - sub_g
+                (
+                    (sub_direct_nl & cur_nl) | (sub_direct_nl - cur_locals)
+                )
+                - sub_fn_g
+                - sub_cls_g
+            )
+            next_locals = (cur_locals | sub_own) - sub_fn_g - sub_cls_g
             for ch in sub.body:
-                stack.append((ch, next_locals, sub_nl, sub_g))
+                stack.append((ch, next_locals, sub_nl, sub_fn_g, sub_cls_g))
             continue
         if isinstance(sub, ast.Lambda):
             for hdr in iter_nested_scope_header_nodes(sub):
-                stack.append((hdr, cur_locals, cur_nl, cur_g))
+                stack.append((hdr, cur_locals, cur_nl, cur_fn_g, cur_cls_g))
             lam_bound = _extract_strict_fn_local_names(sub)
             lam_locals = cur_locals | lam_bound
             stack.append(
-                (sub.body, lam_locals, cur_nl - lam_bound, cur_g - lam_bound)
+                (
+                    sub.body,
+                    lam_locals,
+                    cur_nl - lam_bound,
+                    cur_fn_g - lam_bound,
+                    set(),
+                )
             )
             continue
         if isinstance(sub, _COMPREHENSION_TYPES):
             comp_exprs, comp_targets = _iter_comprehension_body_exprs_and_targets(
                 sub
             )
-            if sub.generators:
-                stack.append((sub.generators[0].iter, cur_locals, cur_nl, cur_g))
             comp_locals = cur_locals | comp_targets
             comp_nl = cur_nl - comp_targets
-            comp_g = cur_g - comp_targets
-            for expr in comp_exprs:
-                stack.append((expr, comp_locals, comp_nl, comp_g))
+            comp_fn_g = cur_fn_g - comp_targets
+            stack.extend(
+                [
+                    *(
+                        [(sub.generators[0].iter, cur_locals, cur_nl, cur_fn_g, cur_cls_g)]
+                        if sub.generators
+                        else []
+                    ),
+                    *((expr, comp_locals, comp_nl, comp_fn_g, set()) for expr in comp_exprs),
+                ]
+            )
             continue
         for is_rebound, c_targets, c_values in _iter_carrier_target_entries(sub):
             c_calls: Set[str] = set()
@@ -2136,7 +2285,7 @@ def _extract_fn_outer_carrier_targets_uncached(
             has_inline = bool(c_reads or c_muts)
             val_refs = c_loads | c_calls
             for t_name in c_targets:
-                if t_name in cur_g:
+                if t_name in cur_fn_g or t_name in cur_cls_g:
                     continue
                 is_outer_target = (
                     (t_name in cur_nl)
@@ -2154,7 +2303,7 @@ def _extract_fn_outer_carrier_targets_uncached(
                     elif val_refs & cur_locals:
                         local_edges.append((t_name, val_refs & cur_locals))
         for child_node in ast.iter_child_nodes(sub):
-            stack.append((child_node, cur_locals, cur_nl, cur_g))
+            stack.append((child_node, cur_locals, cur_nl, cur_fn_g, cur_cls_g))
     if outer_candidates:
         _propagate_local_closure_syms(local_closure_syms, local_edges)
         for t_name, val_refs in outer_candidates:
@@ -2167,12 +2316,20 @@ def _extract_fn_outer_carrier_targets(
     fn_node: ast.AST,
     fn_globals: AbstractSet[str] = frozenset(),
     scope_ctx: Optional[_FnScopeContext] = None,
+    *,
+    use_cache: bool = True,
 ) -> Set[str]:
     """Extracts outer-scope container/variable names mutated by carrier operations in fn_node."""
     if not isinstance(
         fn_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
     ):
         return set()
+    if not use_cache:
+        return set(
+            _extract_fn_outer_carrier_targets_uncached(
+                fn_node, fn_globals, scope_ctx, use_cache=False
+            )
+        )
     return set(
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
@@ -2183,7 +2340,7 @@ def _extract_fn_outer_carrier_targets(
                 extra_params=(frozenset(fn_globals),),
             ),
             lambda: _extract_fn_outer_carrier_targets_uncached(
-                fn_node, fn_globals, scope_ctx
+                fn_node, fn_globals, scope_ctx, use_cache=True
             ),
         )
     )

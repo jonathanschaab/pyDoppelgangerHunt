@@ -61,7 +61,11 @@ def _params_contain_ast(params: Tuple[Any, ...]) -> bool:
         if isinstance(curr, ast.AST):
             return True
         if isinstance(curr, (tuple, frozenset)):
-            stack.extend(curr)
+            for elem in curr:
+                if isinstance(elem, ast.AST):
+                    return True
+                if isinstance(elem, (tuple, frozenset)):
+                    stack.append(elem)
     return False
 
 
@@ -90,6 +94,17 @@ class _ScopeCacheKey(_BaseScopeCacheKey):
             raise ValueError(
                 "_ScopeCacheKey.params must not contain ast.AST nodes; use owner or aux_ast_nodes"
             )
+        return super().__new__(cls, owner, kind, params, aux_ast_nodes)
+
+    @classmethod
+    def make_trusted(
+        cls,
+        owner: ast.AST,
+        kind: str,
+        params: Tuple[Any, ...] = (),
+        aux_ast_nodes: Tuple[ast.AST, ...] = (),
+    ) -> _ScopeCacheKey:
+        """Constructs a key when params have already been verified AST-free."""
         return super().__new__(cls, owner, kind, params, aux_ast_nodes)
 
 
