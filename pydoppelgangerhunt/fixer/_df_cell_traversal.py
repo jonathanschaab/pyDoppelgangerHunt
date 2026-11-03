@@ -423,44 +423,191 @@ _SUPPRESSING_CTX_MANAGER_NAMES: frozenset[str] = frozenset(
     {"suppress", "raises", "assertRaises", "assertRaisesRegex", "ignored"}
 )
 
+_NON_SUPPRESSING_CTX_MANAGER_NAMES: frozenset[str] = frozenset(
+    {
+        "open",
+        "nullcontext",
+        "closing",
+        "aclosing",
+        "redirect_stdout",
+        "redirect_stderr",
+        "chdir",
+        "TemporaryDirectory",
+        "NamedTemporaryFile",
+        "SpooledTemporaryFile",
+        "TemporaryFile",
+    }
+)
+
+_SAFE_EXCEPTION_TYPE_NAMES: frozenset[str] = frozenset(
+    {
+        "ArithmeticError",
+        "AssertionError",
+        "AttributeError",
+        "BaseException",
+        "BufferError",
+        "EOFError",
+        "Exception",
+        "FileExistsError",
+        "FileNotFoundError",
+        "FloatingPointError",
+        "GeneratorExit",
+        "IOError",
+        "ImportError",
+        "IndentationError",
+        "IndexError",
+        "KeyError",
+        "KeyboardInterrupt",
+        "LookupError",
+        "MemoryError",
+        "ModuleNotFoundError",
+        "NameError",
+        "NotImplementedError",
+        "OSError",
+        "OverflowError",
+        "PermissionError",
+        "RecursionError",
+        "ReferenceError",
+        "RuntimeError",
+        "StopAsyncIteration",
+        "StopIteration",
+        "SyntaxError",
+        "SystemError",
+        "SystemExit",
+        "TabError",
+        "TypeError",
+        "UnboundLocalError",
+        "UnicodeDecodeError",
+        "UnicodeEncodeError",
+        "UnicodeError",
+        "UnicodeTranslateError",
+        "ValueError",
+        "ZeroDivisionError",
+    }
+)
+
+
+def _extract_ctx_manager_call_name(expr: ast.AST) -> Optional[str]:
+    """Returns the target function or attribute name of a context manager Call node."""
+    if isinstance(expr, ast.Call):
+        if isinstance(expr.func, ast.Name):
+            return expr.func.id
+        if isinstance(expr.func, ast.Attribute):
+            return expr.func.attr
+    return None
+
+
+def _is_suppress_alias_target_expr(
+    expr: Optional[ast.AST],
+    suppress_aliases: AbstractSet[str] = frozenset(),
+) -> bool:
+    """Returns True if expr references a known suppressing context manager or alias."""
+    if isinstance(expr, ast.Name):
+        return (
+            expr.id in _SUPPRESSING_CTX_MANAGER_NAMES
+            or expr.id in suppress_aliases
+        )
+    if isinstance(expr, ast.Attribute):
+        return expr.attr in _SUPPRESSING_CTX_MANAGER_NAMES
+    return False
+
+
+def _class_def_may_suppress_in_exit(cls_node: ast.ClassDef) -> bool:
+    """Returns True if a ClassDef defines an __exit__/__aexit__ method that can return truthy."""
+    for item in cls_node.body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+            item.name in ("__exit__", "__aexit__")
+        ):
+            for sub in ast.walk(item):
+                if isinstance(sub, ast.Return) and sub.value is not None:
+                    if not (
+                        isinstance(sub.value, ast.Constant)
+                        and not bool(sub.value.value)
+                    ):
+                        return True
+    return False
+
+
+def _update_suppress_aliases_from_stmt(
+    stmt: ast.AST,
+    suppress_aliases: Set[str],
+) -> None:
+    """Updates suppress_aliases in-place from import, assignment, or class definition statements."""
+    if isinstance(stmt, ast.ImportFrom):
+        for alias in stmt.names:
+            if alias.name in _SUPPRESSING_CTX_MANAGER_NAMES:
+                suppress_aliases.add(alias.asname or alias.name)
+    elif isinstance(stmt, ast.Assign):
+        is_sup = _is_suppress_alias_target_expr(stmt.value, suppress_aliases)
+        for tgt in stmt.targets:
+            if isinstance(tgt, ast.Name):
+                if is_sup:
+                    suppress_aliases.add(tgt.id)
+                else:
+                    suppress_aliases.discard(tgt.id)
+    elif isinstance(stmt, ast.ClassDef):
+        if _class_def_may_suppress_in_exit(stmt):
+            suppress_aliases.add(stmt.name)
+        else:
+            suppress_aliases.discard(stmt.name)
+
+
+def _classify_with_suppression(
+    stmt: Union[ast.With, ast.AsyncWith],
+    suppress_aliases: AbstractSet[str] = frozenset(),
+) -> str:
+    """Classifies a with/async with statement as 'suppressing', 'non_suppressing', or 'unknown'."""
+    if not stmt.items:
+        return "non_suppressing"
+    all_non_suppressing = True
+    for item in stmt.items:
+        call_name = _extract_ctx_manager_call_name(item.context_expr)
+        if call_name is not None and (
+            call_name in _SUPPRESSING_CTX_MANAGER_NAMES
+            or call_name in suppress_aliases
+        ):
+            return "suppressing"
+        if isinstance(item.context_expr, ast.Name) and (
+            item.context_expr.id in suppress_aliases
+        ):
+            return "suppressing"
+        if call_name not in _NON_SUPPRESSING_CTX_MANAGER_NAMES:
+            all_non_suppressing = False
+    return "non_suppressing" if all_non_suppressing else "unknown"
+
 
 def _is_exception_suppressing_with(
     stmt: Union[ast.With, ast.AsyncWith],
+    suppress_aliases: AbstractSet[str] = frozenset(),
 ) -> bool:
-    """Checks whether a with/async with statement uses a known exception-suppressing manager.
+    """Checks whether a with/async with statement uses a known exception-suppressing manager."""
+    return _classify_with_suppression(stmt, suppress_aliases) == "suppressing"
 
-    Note:
-        This is an intentional name-based heuristic matching known suppressing
-        context managers (``suppress``, ``raises``, ``assertRaises``,
-        ``assertRaisesRegex``, ``ignored``) by function or attribute name.
-        Custom or aliased context managers whose ``__exit__`` returns truthy
-        cannot be statically resolved without interprocedural type inference
-        and are treated as non-suppressing, trading a narrow false-negative
-        edge on custom swallowers to avoid rejecting every standard ``with`` block.
-    """
-    for item in stmt.items:
-        ctx = item.context_expr
-        if isinstance(ctx, ast.Call):
-            func = ctx.func
-            if (
-                isinstance(func, ast.Name)
-                and func.id in _SUPPRESSING_CTX_MANAGER_NAMES
-            ) or (
-                isinstance(func, ast.Attribute)
-                and func.attr in _SUPPRESSING_CTX_MANAGER_NAMES
-            ):
-                return True
-    return False
+
+def _may_suppress_exceptions_with(
+    stmt: Union[ast.With, ast.AsyncWith],
+    suppress_aliases: AbstractSet[str] = frozenset(),
+) -> bool:
+    """Returns True unless all context managers in stmt are known non-suppressing."""
+    return (
+        _classify_with_suppression(stmt, suppress_aliases) != "non_suppressing"
+    )
 
 
 def _is_non_raising_bool_expr(
     expr: Optional[ast.AST],
     safe_names: AbstractSet[str] = frozenset(),
     safe_bool_names: AbstractSet[str] = frozenset(),
+    *,
+    strict_names: bool = True,
 ) -> bool:
     """Returns True if evaluating bool(expr) cannot raise an exception."""
     return _is_non_raising_expr(
-        expr, safe_names, safe_bool_names, require_bool_safe=True
+        expr,
+        safe_names,
+        safe_bool_names,
+        require_bool_safe=True,
+        strict_names=strict_names,
     )
 
 
@@ -470,15 +617,20 @@ def _is_non_raising_expr(
     safe_bool_names: AbstractSet[str] = frozenset(),
     *,
     require_bool_safe: bool = False,
+    strict_names: bool = True,
 ) -> bool:
-    """Returns True if evaluating expr cannot raise an exception caught by suppress(...)."""
+    """Returns True if evaluating expr cannot raise an exception caught by a with block."""
     if expr is None or isinstance(expr, ast.Constant):
         return True
     if isinstance(expr, ast.Name):
-        return expr.id in (safe_bool_names if require_bool_safe else safe_names)
+        if require_bool_safe:
+            return expr.id in safe_bool_names
+        return (not strict_names) or (expr.id in safe_names)
     if isinstance(expr, ast.Lambda):
         return all(
-            _is_non_raising_expr(d, safe_names, safe_bool_names)
+            _is_non_raising_expr(
+                d, safe_names, safe_bool_names, strict_names=strict_names
+            )
             for d in (
                 *expr.args.defaults,
                 *(d for d in expr.args.kw_defaults if d is not None),
@@ -486,13 +638,18 @@ def _is_non_raising_expr(
         )
     if isinstance(expr, (ast.Tuple, ast.List)):
         return not any(isinstance(e, ast.Starred) for e in expr.elts) and all(
-            _is_non_raising_expr(e, safe_names, safe_bool_names)
+            _is_non_raising_expr(
+                e, safe_names, safe_bool_names, strict_names=strict_names
+            )
             for e in expr.elts
         )
     if isinstance(expr, ast.UnaryOp):
         if isinstance(expr.op, ast.Not):
             return _is_non_raising_bool_expr(
-                expr.operand, safe_names, safe_bool_names
+                expr.operand,
+                safe_names,
+                safe_bool_names,
+                strict_names=strict_names,
             )
         if isinstance(expr.op, ast.Invert):
             return isinstance(expr.operand, ast.Constant) and isinstance(
@@ -506,7 +663,9 @@ def _is_non_raising_expr(
     if isinstance(expr, ast.BoolOp):
         return bool(expr.values) and (
             all(
-                _is_non_raising_bool_expr(v, safe_names, safe_bool_names)
+                _is_non_raising_bool_expr(
+                    v, safe_names, safe_bool_names, strict_names=strict_names
+                )
                 for v in expr.values[:-1]
             )
             and _is_non_raising_expr(
@@ -514,26 +673,35 @@ def _is_non_raising_expr(
                 safe_names,
                 safe_bool_names,
                 require_bool_safe=require_bool_safe,
+                strict_names=strict_names,
             )
         )
     if isinstance(expr, ast.IfExp):
         return _is_non_raising_bool_expr(
-            expr.test, safe_names, safe_bool_names
+            expr.test, safe_names, safe_bool_names, strict_names=strict_names
         ) and all(
             _is_non_raising_expr(
                 b,
                 safe_names,
                 safe_bool_names,
                 require_bool_safe=require_bool_safe,
+                strict_names=strict_names,
             )
             for b in (expr.body, expr.orelse)
         )
     if isinstance(expr, ast.Compare):
         return (
             all(isinstance(op, (ast.Is, ast.IsNot)) for op in expr.ops)
-            and _is_non_raising_expr(expr.left, safe_names, safe_bool_names)
+            and _is_non_raising_expr(
+                expr.left,
+                safe_names,
+                safe_bool_names,
+                strict_names=strict_names,
+            )
             and all(
-                _is_non_raising_expr(c, safe_names, safe_bool_names)
+                _is_non_raising_expr(
+                    c, safe_names, safe_bool_names, strict_names=strict_names
+                )
                 for c in expr.comparators
             )
         )
@@ -543,6 +711,7 @@ def _is_non_raising_expr(
             safe_names,
             safe_bool_names,
             require_bool_safe=require_bool_safe,
+            strict_names=strict_names,
         )
     return False
 
@@ -573,20 +742,32 @@ def _stmt_cannot_raise_in_suppress(
     stmt: ast.AST,
     safe_names: AbstractSet[str] = frozenset(),
     safe_bool_names: AbstractSet[str] = frozenset(),
+    *,
+    strict_names: bool = True,
 ) -> bool:
     """Returns True if stmt executes and completes without raising a catchable exception."""
     if isinstance(
         stmt, (ast.Pass, ast.Global, ast.Nonlocal, ast.Break, ast.Continue)
     ):
         return True
-    if isinstance(stmt, ast.Return):
-        return _is_non_raising_expr(stmt.value, safe_names, safe_bool_names)
-    if isinstance(stmt, ast.Expr):
-        return _is_non_raising_expr(stmt.value, safe_names, safe_bool_names)
+    if isinstance(stmt, ast.Delete):
+        return bool(stmt.targets) and all(
+            isinstance(t, ast.Name) and t.id in safe_names
+            for t in stmt.targets
+        )
+    if isinstance(stmt, (ast.Return, ast.Expr)):
+        return _is_non_raising_expr(
+            stmt.value, safe_names, safe_bool_names, strict_names=strict_names
+        )
     if isinstance(stmt, ast.Assign):
         return (
             stmt.value is not None
-            and _is_non_raising_expr(stmt.value, safe_names, safe_bool_names)
+            and _is_non_raising_expr(
+                stmt.value,
+                safe_names,
+                safe_bool_names,
+                strict_names=strict_names,
+            )
             and all(
                 _is_non_raising_store_target(t, stmt.value)
                 for t in stmt.targets
@@ -594,39 +775,85 @@ def _stmt_cannot_raise_in_suppress(
         )
     if isinstance(stmt, ast.AnnAssign):
         return _is_non_raising_expr(
-            stmt.annotation, safe_names, safe_bool_names
+            stmt.annotation,
+            safe_names,
+            safe_bool_names,
+            strict_names=strict_names,
         ) and (
             stmt.value is None
             or (
-                _is_non_raising_expr(stmt.value, safe_names, safe_bool_names)
+                _is_non_raising_expr(
+                    stmt.value,
+                    safe_names,
+                    safe_bool_names,
+                    strict_names=strict_names,
+                )
                 and _is_non_raising_store_target(stmt.target, stmt.value)
             )
         )
     if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return not stmt.decorator_list and all(
-            _is_non_raising_expr(h, safe_names, safe_bool_names)
+            _is_non_raising_expr(
+                h, safe_names, safe_bool_names, strict_names=strict_names
+            )
             for h in iter_nested_scope_header_nodes(stmt)
         )
     if isinstance(stmt, ast.If):
         return (
-            _is_non_raising_bool_expr(stmt.test, safe_names, safe_bool_names)
+            _is_non_raising_bool_expr(
+                stmt.test,
+                safe_names,
+                safe_bool_names,
+                strict_names=strict_names,
+            )
             and not _split_suppress_with_body(
                 stmt.body,
                 safe_names=safe_names,
                 safe_bool_names=safe_bool_names,
+                strict_names=strict_names,
             )[1]
             and not _split_suppress_with_body(
                 stmt.orelse,
                 safe_names=safe_names,
                 safe_bool_names=safe_bool_names,
+                strict_names=strict_names,
             )[1]
         )
     if isinstance(stmt, (ast.With, ast.AsyncWith)):
-        return _is_exception_suppressing_with(stmt) and all(
-            item.optional_vars is None
-            or isinstance(item.optional_vars, ast.Name)
+        if _is_exception_suppressing_with(stmt) and all(
+            (
+                item.optional_vars is None
+                or isinstance(item.optional_vars, ast.Name)
+            )
+            and isinstance(item.context_expr, ast.Call)
+            and not any(
+                isinstance(a, ast.Starred) or getattr(a, "arg", "k") is None
+                for a in (
+                    *item.context_expr.args,
+                    *item.context_expr.keywords,
+                )
+            )
+            and all(
+                _is_non_raising_expr(
+                    a.value if isinstance(a, ast.keyword) else a,
+                    safe_names | _SAFE_EXCEPTION_TYPE_NAMES,
+                    safe_bool_names,
+                    strict_names=strict_names,
+                )
+                for a in (
+                    *item.context_expr.args,
+                    *item.context_expr.keywords,
+                )
+            )
             for item in stmt.items
-        )
+        ):
+            return not _split_suppress_with_body(
+                stmt.body,
+                safe_names=safe_names,
+                safe_bool_names=safe_bool_names,
+                strict_names=strict_names,
+            )[1]
+        return False
     return False
 
 
@@ -635,17 +862,27 @@ def _split_suppress_with_body(
     *,
     safe_names: AbstractSet[str] = frozenset(),
     safe_bool_names: AbstractSet[str] = frozenset(),
+    strict_names: bool = True,
 ) -> Tuple[List[ast.stmt], List[ast.stmt]]:
-    """Splits a suppressing with-block body into (non_raising_prefix, potentially_raising_suffix)."""
+    """Splits a potentially suppressing with-block body into (non_raising_prefix, potentially_raising_suffix)."""
     safe_prefix: List[ast.stmt] = []
     cur_safe: Set[str] = set(safe_names)
     cur_bool: Set[str] = set(safe_bool_names)
     for idx, b_stmt in enumerate(body):
-        if _stmt_cannot_raise_in_suppress(b_stmt, cur_safe, cur_bool):
+        if _stmt_cannot_raise_in_suppress(
+            b_stmt, cur_safe, cur_bool, strict_names=strict_names
+        ):
             safe_prefix.append(b_stmt)
-            if isinstance(b_stmt, ast.Assign):
+            if isinstance(b_stmt, (ast.Return, ast.Break, ast.Continue)):
+                return safe_prefix, []
+            if isinstance(b_stmt, ast.Delete):
+                for tgt in b_stmt.targets:
+                    if isinstance(tgt, ast.Name):
+                        cur_safe.discard(tgt.id)
+                        cur_bool.discard(tgt.id)
+            elif isinstance(b_stmt, ast.Assign):
                 val_bool = _is_non_raising_bool_expr(
-                    b_stmt.value, cur_safe, cur_bool
+                    b_stmt.value, cur_safe, cur_bool, strict_names=strict_names
                 )
                 for tgt in b_stmt.targets:
                     t_names = _extract_definite_target_names(tgt)
@@ -657,7 +894,9 @@ def _split_suppress_with_body(
             elif isinstance(b_stmt, ast.AnnAssign) and b_stmt.value is not None:
                 t_names = _extract_definite_target_names(b_stmt.target)
                 cur_safe.update(t_names)
-                if _is_non_raising_bool_expr(b_stmt.value, cur_safe, cur_bool):
+                if _is_non_raising_bool_expr(
+                    b_stmt.value, cur_safe, cur_bool, strict_names=strict_names
+                ):
                     cur_bool.update(t_names)
                 else:
                     cur_bool.difference_update(t_names)
@@ -669,15 +908,64 @@ def _split_suppress_with_body(
     return safe_prefix, []
 
 
+def _stmt_contains_direct_raise(stmt: ast.AST) -> bool:
+    """Returns True if stmt or any nested control-flow block (excluding nested defs/classes) contains ast.Raise."""
+    stack: List[ast.AST] = [stmt]
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, ast.Raise):
+            return True
+        if isinstance(
+            curr,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+        ):
+            continue
+        stack.extend(ast.iter_child_nodes(curr))
+    return False
+
+
+def _split_unknown_with_body(
+    body: Sequence[ast.stmt],
+) -> Tuple[List[ast.stmt], List[ast.stmt]]:
+    """Splits an unknown context manager's body before the first statement containing a direct raise."""
+    safe_prefix: List[ast.stmt] = []
+    for idx, b_stmt in enumerate(body):
+        if _stmt_contains_direct_raise(b_stmt):
+            return safe_prefix, list(body[idx:])
+        safe_prefix.append(b_stmt)
+        if isinstance(b_stmt, (ast.Return, ast.Break, ast.Continue)):
+            return safe_prefix, []
+    return safe_prefix, []
+
+
+def _split_with_body_by_mode(
+    stmt: Union[ast.With, ast.AsyncWith],
+    suppress_aliases: AbstractSet[str] = frozenset(),
+    *,
+    safe_names: AbstractSet[str] = frozenset(),
+) -> Tuple[List[ast.stmt], List[ast.stmt]]:
+    """Splits a with-block body into (guaranteed_prefix, potentially_suppressed_suffix) across 3 suppression states."""
+    w_mode = _classify_with_suppression(stmt, suppress_aliases)
+    if w_mode == "suppressing":
+        return _split_suppress_with_body(stmt.body, safe_names=safe_names)
+    if w_mode == "unknown":
+        return _split_unknown_with_body(stmt.body)
+    return list(stmt.body), []
+
+
 def _extract_block_definite_bindings_and_term(
     stmts: Sequence[ast.AST],
     active_nonlocals: Optional[Set[str]],
     initial_bound: AbstractSet[str] = frozenset(),
     fn_globals: AbstractSet[str] = frozenset(),
+    *,
+    suppress_aliases: AbstractSet[str] = frozenset(),
 ) -> Tuple[Set[str], bool]:
     """Extracts (unconditionally_bound_names, block_terminates) across a statement sequence."""
     bound: Set[str] = set(initial_bound)
+    local_sup_aliases: Set[str] = set(suppress_aliases)
     for stmt in stmts:
+        _update_suppress_aliases_from_stmt(stmt, local_sup_aliases)
         if isinstance(
             stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
         ):
@@ -693,11 +981,19 @@ def _extract_block_definite_bindings_and_term(
                 bound, stmt.test, active_nonlocals, fn_globals
             )
             b_bound, b_term = _extract_block_definite_bindings_and_term(
-                stmt.body, active_nonlocals, bound, fn_globals
+                stmt.body,
+                active_nonlocals,
+                bound,
+                fn_globals,
+                suppress_aliases=local_sup_aliases,
             )
             if stmt.orelse:
                 o_bound, o_term = _extract_block_definite_bindings_and_term(
-                    stmt.orelse, active_nonlocals, bound, fn_globals
+                    stmt.orelse,
+                    active_nonlocals,
+                    bound,
+                    fn_globals,
+                    suppress_aliases=local_sup_aliases,
                 )
                 if b_term and o_term:
                     return b_bound & o_bound, True
@@ -725,13 +1021,15 @@ def _extract_block_definite_bindings_and_term(
                             n, active_nonlocals, fn_globals
                         )
                     )
-            safe_prefix, risky_suffix = (
-                _split_suppress_with_body(stmt.body)
-                if _is_exception_suppressing_with(stmt)
-                else (list(stmt.body), [])
+            safe_prefix, risky_suffix = _split_with_body_by_mode(
+                stmt, local_sup_aliases, safe_names=bound
             )
             bound, w_term = _extract_block_definite_bindings_and_term(
-                safe_prefix, active_nonlocals, bound, fn_globals
+                safe_prefix,
+                active_nonlocals,
+                bound,
+                fn_globals,
+                suppress_aliases=local_sup_aliases,
             )
             if w_term:
                 return bound, True

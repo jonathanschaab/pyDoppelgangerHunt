@@ -56,7 +56,13 @@ from pydoppelgangerhunt.parser import iter_nested_scope_header_nodes
 
 
 class _FnScopeContext(NamedTuple):
-    """Cached per-function lexical scope metadata for eager generator expression checks."""
+    """Cached per-function lexical scope metadata for eager generator expression checks.
+
+    Note:
+        ``parent_map`` is a read-only ``MappingProxyType`` view over a dictionary
+        that is also shared across nested scope contexts; the underlying dictionary
+        must never be mutated after construction.
+    """
 
     fn_locals: frozenset[str]
     parent_map: Mapping[ast.AST, ast.AST]

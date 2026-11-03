@@ -49,6 +49,13 @@ _SCOPE_ROOT_TYPES: Tuple[type, ...] = (
     ast.ClassDef,
     ast.Lambda,
 )
+_SINGLETON_AST_TYPES: Tuple[type, ...] = (
+    ast.expr_context,
+    ast.boolop,
+    ast.operator,
+    ast.unaryop,
+    ast.cmpop,
+)
 
 
 _PERMITTED_PARAM_SCALAR_TYPES: Tuple[type, ...] = (
@@ -146,45 +153,53 @@ class _BaseScopeCacheKey(NamedTuple):
     aux_ast_nodes: Tuple[ast.AST, ...] = ()
 
 
+def _validate_scope_cache_key_header(
+    owner: Any,
+    kind: Any,
+    params: Any,
+    aux_ast_nodes: Any,
+    *,
+    check_params_ast: bool,
+) -> None:
+    """Validates owner, kind, params, and aux_ast_nodes for _ScopeCacheKey construction."""
+    if not isinstance(owner, ast.AST):
+        raise TypeError("_ScopeCacheKey.owner must be an ast.AST node")
+    if not isinstance(kind, str):
+        raise TypeError("_ScopeCacheKey.kind must be a string")
+    if not kind:
+        raise ValueError("_ScopeCacheKey.kind must be a non-empty string")
+    if check_params_ast and params:
+        _validate_scope_cache_params(params)
+    elif not isinstance(params, tuple):
+        raise TypeError(
+            f"_ScopeCacheKey.params must be a tuple; got {type(params).__name__}"
+        )
+    if not isinstance(aux_ast_nodes, tuple) or not all(
+        isinstance(n, ast.AST) for n in aux_ast_nodes
+    ):
+        raise TypeError(
+            "_ScopeCacheKey.aux_ast_nodes must be a tuple of ast.AST nodes"
+        )
+
+
 class _ScopeCacheKey(_BaseScopeCacheKey):
     """Uniform cache key with explicit AST owner(s) for O(1) owner extraction and indexed tree eviction."""
 
     __slots__ = ()
 
     def __new__(
-        cls,
-        owner: ast.AST,
-        kind: str,
-        params: Tuple[Any, ...] = (),
-        aux_ast_nodes: Tuple[ast.AST, ...] = (),
+        cls, owner: ast.AST, kind: str, params: Tuple[Any, ...] = (), aux_ast_nodes: Tuple[ast.AST, ...] = ()
     ) -> _ScopeCacheKey:
-        if not isinstance(owner, ast.AST):
-            raise TypeError("_ScopeCacheKey.owner must be an ast.AST node")
-        if params:
-            _validate_scope_cache_params(params)
-        elif not isinstance(params, tuple):
-            raise TypeError(
-                f"_ScopeCacheKey.params must be a tuple; got {type(params).__name__}"
-            )
-        if not isinstance(aux_ast_nodes, tuple) or not all(
-            isinstance(n, ast.AST) for n in aux_ast_nodes
-        ):
-            raise TypeError(
-                "_ScopeCacheKey.aux_ast_nodes must be a tuple of ast.AST nodes"
-            )
+        _validate_scope_cache_key_header(owner, kind, params, aux_ast_nodes, check_params_ast=True)
         return super().__new__(cls, owner, kind, params, aux_ast_nodes)
 
 
 def _make_trusted_scope_cache_key(
-    owner: ast.AST,
-    kind: str,
-    params: Tuple[Any, ...] = (),
-    aux_ast_nodes: Tuple[ast.AST, ...] = (),
+    owner: ast.AST, kind: str, params: Tuple[Any, ...] = (), aux_ast_nodes: Tuple[ast.AST, ...] = ()
 ) -> _ScopeCacheKey:
     """Internal constructor for _ScopeCacheKey when params are pre-validated AST-free."""
-    return _BaseScopeCacheKey.__new__(
-        _ScopeCacheKey, owner, kind, params, aux_ast_nodes
-    )
+    _validate_scope_cache_key_header(owner, kind, params, aux_ast_nodes, check_params_ast=False)
+    return _BaseScopeCacheKey.__new__(_ScopeCacheKey, owner, kind, params, aux_ast_nodes)
 
 
 def _extract_key_ast_nodes(key: Any) -> Tuple[ast.AST, ...]:
@@ -215,58 +230,131 @@ def _extract_key_ast_nodes(key: Any) -> Tuple[ast.AST, ...]:
     return tuple(found)
 
 
+def _extract_value_ast_nodes(value: Any) -> Tuple[ast.AST, ...]:
+    """Extracts ast.AST nodes held inside a cached value (parent maps, span indices, mutators, closures)."""
+    if value is None or isinstance(
+        value, (bool, int, str, float, bytes, *_SINGLETON_AST_TYPES)
+    ):
+        return ()
+    if isinstance(value, ast.AST):
+        return (value,)
+    if isinstance(value, (frozenset, set)) and all(
+        isinstance(x, (str, int, bool, float)) for x in value
+    ):
+        return ()
+    found: List[ast.AST] = []
+    seen: Set[int] = {id(value)}
+    stack: List[Any] = [value]
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, ast.AST):
+            if not isinstance(curr, _SINGLETON_AST_TYPES):
+                found.append(curr)
+            continue
+        node_attr = getattr(curr, "node", None)
+        if isinstance(node_attr, ast.AST) and not isinstance(
+            node_attr, _SINGLETON_AST_TYPES
+        ):
+            found.append(node_attr)
+        pmap_attr = getattr(curr, "parent_map", None)
+        if pmap_attr is not None and hasattr(pmap_attr, "items"):
+            for pk, pv in pmap_attr.items():
+                if isinstance(pk, ast.AST) and not isinstance(
+                    pk, _SINGLETON_AST_TYPES
+                ):
+                    found.append(pk)
+                if isinstance(pv, ast.AST) and not isinstance(
+                    pv, _SINGLETON_AST_TYPES
+                ):
+                    found.append(pv)
+        by_start_attr = getattr(curr, "by_start", None)
+        if isinstance(by_start_attr, dict):
+            for entries in by_start_attr.values():
+                for entry in entries:
+                    enode = getattr(entry, "node", None)
+                    if isinstance(enode, ast.AST) and not isinstance(
+                        enode, _SINGLETON_AST_TYPES
+                    ):
+                        found.append(enode)
+            continue
+        children: Sequence[Any] = ()
+        if isinstance(curr, (tuple, list, set, frozenset)):
+            children = tuple(curr)
+        elif hasattr(curr, "items") and callable(curr.items):
+            children = tuple(part for kv in curr.items() for part in kv)
+        for elem in children:
+            if isinstance(elem, ast.AST):
+                if not isinstance(elem, _SINGLETON_AST_TYPES):
+                    found.append(elem)
+            elif not isinstance(
+                elem, (bool, int, str, float, bytes, type(None))
+            ):
+                elem_id = id(elem)
+                if elem_id not in seen:
+                    seen.add(elem_id)
+                    stack.append(elem)
+    return tuple(found)
+
+
 _scope_owner_keys_index: Dict[ast.AST, Set[Any]] = {}
 
 
 class _TrackedScopeCache(OrderedDict[Any, _CacheValT]):
-    """OrderedDict cache that maintains _scope_owner_keys_index for indexed AST tree eviction."""
+    """OrderedDict cache that maintains _scope_owner_keys_index for keys and cached values."""
 
-    def _index_key(self, key: Any) -> None:
-        for node in _extract_key_ast_nodes(key):
-            _scope_owner_keys_index.setdefault(node, set()).add(key)
+    def _active_nodes_for_key(self, key: Any) -> Set[ast.AST]:
+        nodes: Set[ast.AST] = set()
+        in_any = False
+        for cache in (_scope_closures_cache, _scope_cell_info_cache):
+            if key in cache:
+                in_any = True
+                nodes.update(_extract_value_ast_nodes(dict.__getitem__(cache, key)))
+        if in_any:
+            nodes.update(_extract_key_ast_nodes(key))
+        return nodes
 
-    def _unindex_key(self, key: Any) -> None:
-        other = (
-            _scope_cell_info_cache
-            if self is _scope_closures_cache
-            else _scope_closures_cache
-        )
-        if key in other:
-            return
-        for node in _extract_key_ast_nodes(key):
+    def _sync_key_index(self, key: Any, old_nodes: Set[ast.AST]) -> None:
+        new_nodes = self._active_nodes_for_key(key)
+        for node in old_nodes - new_nodes:
             kset = _scope_owner_keys_index.get(node)
             if kset is not None:
                 kset.discard(key)
                 if not kset:
                     _scope_owner_keys_index.pop(node, None)
+        for node in new_nodes - old_nodes:
+            _scope_owner_keys_index.setdefault(node, set()).add(key)
 
     def __setitem__(self, key: Any, value: _CacheValT) -> None:
-        is_new = key not in self
+        old_nodes = self._active_nodes_for_key(key) if key in self else set()
         super().__setitem__(key, value)
-        if is_new:
-            self._index_key(key)
+        self._sync_key_index(key, old_nodes)
 
     def __delitem__(self, key: Any) -> None:
+        old_nodes = self._active_nodes_for_key(key)
         super().__delitem__(key)
-        self._unindex_key(key)
+        self._sync_key_index(key, old_nodes)
 
     def pop(self, key: Any, *args: Any) -> Any:
-        had_key = key in self
+        old_nodes = self._active_nodes_for_key(key) if key in self else set()
         res = super().pop(key, *args)
-        if had_key:
-            self._unindex_key(key)
+        if old_nodes:
+            self._sync_key_index(key, old_nodes)
         return res
 
     def popitem(self, last: bool = True) -> Tuple[Any, _CacheValT]:
+        if not self:
+            return super().popitem(last=last)
+        target_key = next(reversed(self) if last else iter(self))
+        old_nodes = self._active_nodes_for_key(target_key)
         k, v = super().popitem(last=last)
-        self._unindex_key(k)
+        self._sync_key_index(k, old_nodes)
         return k, v
 
     def clear(self) -> None:
-        keys = list(self.keys())
+        old_map = {k: self._active_nodes_for_key(k) for k in self}
         super().clear()
-        for k in keys:
-            self._unindex_key(k)
+        for k, old_nodes in old_map.items():
+            self._sync_key_index(k, old_nodes)
 
 
 _scope_closures_cache: _TrackedScopeCache[List[Tuple[Any, Set[str]]]] = (
@@ -312,15 +400,38 @@ def _key_references_scope_nodes(
 
 
 def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
-    """Purges scope-cache entries belonging to an evicted AST tree in O(|tree| + |evicted|) time."""
+    """Purges scope-cache entries belonging to an evicted AST tree or detached subtree.
+
+    Note:
+        Because _TrackedScopeCache indexes AST nodes referenced by both cache keys
+        and cached values (including _FnScopeContext.parent_map, _SpanLineIndex,
+        closures, and statement deltas), and _evict_tree_scopes also checks
+        _scope_parent_maps for enclosing scopes referencing nodes in tree_nodes,
+        evicting either a whole AST tree or an independently detached AST subtree
+        invalidates all cached contexts and entries holding references to it.
+    """
     if tree is None or not isinstance(tree, ast.AST):
         return
-    tree_nodes = set(ast.walk(tree))
+    tree_nodes = {
+        n for n in ast.walk(tree) if not isinstance(n, _SINGLETON_AST_TYPES)
+    }
     scope_nodes = {
         node for node in tree_nodes if isinstance(node, _SCOPE_ROOT_TYPES)
     }
     scope_nodes.add(tree)
     with _downstream_cache_lock:
+        for root_node, pmap in list(_scope_parent_maps.items()):
+            if root_node not in scope_nodes and (
+                tree in pmap or any(n in pmap for n in tree_nodes)
+            ):
+                scope_nodes.add(root_node)
+                tree_nodes.add(root_node)
+                curr_anc = pmap.get(tree)
+                while isinstance(curr_anc, ast.AST) and curr_anc not in tree_nodes:
+                    tree_nodes.add(curr_anc)
+                    if isinstance(curr_anc, _SCOPE_ROOT_TYPES):
+                        scope_nodes.add(curr_anc)
+                    curr_anc = pmap.get(curr_anc)
         for node in scope_nodes:
             _scope_parent_maps.pop(node, None)
             _scope_stmts_by_end.pop(node, None)
@@ -467,12 +578,20 @@ def _extract_unit_end_col(unit: Dict[str, Any]) -> Optional[int]:
 def _get_scope_parent_map(
     scope_node: ast.AST, *, use_cache: bool = True
 ) -> Dict[ast.AST, ast.AST]:
-    """Retrieves or builds cached parent map for AST nodes within the scope."""
+    """Retrieves or builds cached parent map for AST nodes within the scope.
+
+    Note:
+        The returned dictionary is stored in ``_scope_parent_maps`` and wrapped in
+        ``MappingProxyType`` by ``_FnScopeContext`` (and shared across nested scope
+        contexts). Callers must treat the underlying dictionary as strictly
+        read-only and never mutate it after construction.
+    """
     def _compute() -> Dict[ast.AST, ast.AST]:
         parent_map: Dict[ast.AST, ast.AST] = {}
         for parent in ast.walk(scope_node):
             for child in ast.iter_child_nodes(parent):
-                parent_map[child] = parent
+                if not isinstance(child, _SINGLETON_AST_TYPES):
+                    parent_map[child] = parent
         return parent_map
 
     if not use_cache:

@@ -14091,6 +14091,631 @@ def test_indexed_cache_eviction_multi_owner_node_reuse_and_central_invariant() -
             assert k in _scope_closures_cache
 
 
+def test_unknown_and_aliased_and_nested_suppressing_context_managers() -> None:
+    """Covers Section 1 & 12: 3-state context manager classification, custom/unknown/aliased suppressors, and nested suppressors."""
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _classify_with_suppression,
+        _extract_block_definite_bindings_and_term,
+    )
+    from pydoppelgangerhunt.fixer.scope import (
+        _analyze_block_assignment,
+        _block_terminates,
+    )
+
+    # 1. Three-state classification: non_suppressing, suppressing, unknown
+    w_non_sup = ast.parse("with open('data.txt') as f:\n    pass\n").body[0]
+    w_sup = ast.parse("with suppress(ValueError):\n    pass\n").body[0]
+    w_unk = ast.parse("with ExternalIgnoreValueError():\n    pass\n").body[0]
+    assert isinstance(w_non_sup, ast.With)
+    assert isinstance(w_sup, ast.With)
+    assert isinstance(w_unk, ast.With)
+    assert _classify_with_suppression(w_non_sup) == "non_suppressing"
+    assert _classify_with_suppression(w_sup) == "suppressing"
+    assert _classify_with_suppression(w_unk) == "unknown"
+
+    # Known non-suppressing with + raise DOES terminate
+    non_sup_raise = ast.parse(
+        "with open('data.txt') as f:\n    raise ValueError()\nx = 1\n"
+    ).body
+    assert _block_terminates([non_sup_raise[0]]) is True
+    assert (
+        _extract_block_definite_bindings_and_term(non_sup_raise, None)[1]
+        is True
+    )
+
+    # 2. Custom / unknown context manager containing raise must NOT be treated as terminating
+    custom_cm_src = (
+        "class IgnoreValueError:\n"
+        "    def __enter__(self):\n"
+        "        return self\n"
+        "    def __exit__(self, exc_type, exc_value, traceback):\n"
+        "        return exc_type is ValueError\n"
+        "\n"
+        "def example(cond):\n"
+        "    if cond:\n"
+        "        with IgnoreValueError():\n"
+        "            raise ValueError()\n"
+        "    else:\n"
+        "        x = 10\n"
+        "    cb = lambda: x\n"
+        "    return cb\n"
+    )
+    custom_tree = ast.parse(custom_cm_src)
+    example_fn = custom_tree.body[1]
+    assert isinstance(example_fn, ast.FunctionDef)
+    assert _block_terminates(example_fn.body) is True
+    assert _block_terminates([example_fn.body[0]]) is False
+    bound_custom, term_custom = _extract_block_definite_bindings_and_term(
+        [example_fn.body[0]], None
+    )
+    assert "x" not in bound_custom
+    assert term_custom is False
+
+    # Because `with IgnoreValueError(): raise ValueError()` can fall through with `x` unbound,
+    # extracting `cb = lambda: x` at line 13 must be flagged as an unbound captured cell hazard!
+    sc_custom = inspect_single_unit_scope(
+        {
+            "start": 13,
+            "end": 13,
+            "kind": "linear_block",
+            "source_text": custom_cm_src,
+            "source_code": "cb = lambda: x\n",
+        },
+        tree=custom_tree,
+    )
+    assert "severed_closure_cell" in sc_custom["control_flow_hazards"]
+    assert sc_custom["is_control_flow_safe"] is False
+
+    # Same check when the context manager class is imported/external ("unknown" state)
+    ext_cm_src = (
+        "def example(cond):\n"
+        "    if cond:\n"
+        "        with ExternalIgnoreValueError():\n"
+        "            raise ValueError()\n"
+        "    else:\n"
+        "        x = 10\n"
+        "    cb = lambda: x\n"
+        "    return cb\n"
+    )
+    ext_tree = ast.parse(ext_cm_src)
+    sc_ext = inspect_single_unit_scope(
+        {
+            "start": 7,
+            "end": 7,
+            "kind": "linear_block",
+            "source_text": ext_cm_src,
+            "source_code": "cb = lambda: x\n",
+        },
+        tree=ext_tree,
+    )
+    assert "severed_closure_cell" in sc_ext["control_flow_hazards"]
+
+    # 3. Aliased contextlib.suppress (via assignment and via import ... as ...)
+    aliased_assign_src = (
+        "my_suppress = contextlib.suppress\n"
+        "with my_suppress(KeyError):\n"
+        "    before = 1\n"
+        "    risky = d['missing']\n"
+        "    after = 2\n"
+        "    raise KeyError()\n"
+        "tail = 3\n"
+    )
+    aliased_stmts = ast.parse(aliased_assign_src).body
+    assert _block_terminates(aliased_stmts[:-1]) is False
+    def_al, cond_al = _analyze_block_assignment(aliased_stmts)
+    bound_al, term_al = _extract_block_definite_bindings_and_term(
+        aliased_stmts, None
+    )
+    assert def_al == {"my_suppress", "before", "tail"}
+    assert {"risky", "after"} <= cond_al
+    assert bound_al == {"my_suppress", "before", "tail"}
+    assert term_al is False
+
+    aliased_import_src = (
+        "from contextlib import suppress as sup\n"
+        "with sup(ValueError):\n"
+        "    risky = int('bad')\n"
+        "    after = 2\n"
+        "tail = 3\n"
+    )
+    imp_stmts = ast.parse(aliased_import_src).body
+    def_imp, cond_imp = _analyze_block_assignment(imp_stmts)
+    bound_imp, term_imp = _extract_block_definite_bindings_and_term(
+        imp_stmts, None
+    )
+    assert def_imp == {"sup", "tail"}
+    assert {"risky", "after"} <= cond_imp
+    assert bound_imp == {"sup", "tail"}
+    assert term_imp is False
+
+    # 4. Nested suppressing context managers: termination propagation
+    nested_non_term_src = (
+        "with suppress(ValueError):\n"
+        "    with suppress(KeyError):\n"
+        "        raise ValueError()\n"
+        "    return 1\n"
+        "after = 2\n"
+    )
+    nested_non_term_stmts = ast.parse(nested_non_term_src).body
+    assert _block_terminates([nested_non_term_stmts[0]]) is False
+    bound_nnt, term_nnt = _extract_block_definite_bindings_and_term(
+        nested_non_term_stmts, None
+    )
+    assert bound_nnt == {"after"}
+    assert term_nnt is False
+
+    nested_term_src = (
+        "with suppress(ValueError):\n"
+        "    with suppress(KeyError):\n"
+        "        x = 10\n"
+        "        return x\n"
+        "after = 2\n"
+    )
+    nested_term_stmts = ast.parse(nested_term_src).body
+    assert _block_terminates([nested_term_stmts[0]]) is True
+    bound_nt, term_nt = _extract_block_definite_bindings_and_term(
+        nested_term_stmts, None
+    )
+    assert bound_nt == {"x"}
+    assert term_nt is True
+
+
+def test_scope_cache_key_kind_validation_cross_cache_eviction_and_detached_subtree() -> None:
+    """Covers Sections 2, 3, and 12: kind validation, cross-cache removal orders, central invariant, and detached subtree eviction."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _ScopeCacheKey,
+        _evict_tree_scopes,
+        _extract_key_ast_nodes,
+        _extract_value_ast_nodes,
+        _make_trusted_scope_cache_key,
+        _scope_cell_info_cache,
+        _scope_closures_cache,
+        _scope_owner_keys_index,
+        _scope_parent_maps,
+        clear_dataflow_cache,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context
+    from pydoppelgangerhunt.fixer._df_closures import _collect_scope_closures
+
+    def _assert_central_index_invariant() -> None:
+        all_cached_keys = set(_scope_closures_cache.keys()) | set(
+            _scope_cell_info_cache.keys()
+        )
+        for cache in (_scope_closures_cache, _scope_cell_info_cache):
+            for k, val in cache.items():
+                for node in (
+                    *_extract_key_ast_nodes(k),
+                    *_extract_value_ast_nodes(val),
+                ):
+                    assert k in _scope_owner_keys_index.get(node, set())
+        for node, keys in _scope_owner_keys_index.items():
+            assert isinstance(node, ast.AST)
+            assert keys, "Empty key set must be popped from _scope_owner_keys_index"
+            for k in keys:
+                assert k in all_cached_keys
+
+    # 1. Section 2: _ScopeCacheKey.kind validation (both public and trusted constructors)
+    mod = ast.parse("def f():\n    return 1\n")
+    other_node = mod.body[0]
+    with pytest.raises(TypeError, match="kind must be a string"):
+        _ScopeCacheKey(owner=mod, kind=other_node)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="kind must be a string"):
+        _make_trusted_scope_cache_key(owner=mod, kind=other_node)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="non-empty string"):
+        _ScopeCacheKey(owner=mod, kind="")
+    with pytest.raises(ValueError, match="non-empty string"):
+        _make_trusted_scope_cache_key(owner=mod, kind="")
+
+    # 2. Section 3.1: All 5 cross-cache removal orders for shared keys
+    clear_dataflow_cache()
+    shared_tree = ast.parse("def shared_fn():\n    return 42\n")
+    shared_fn = shared_tree.body[0]
+    shared_key = _ScopeCacheKey(owner=shared_fn, kind="shared_entry")
+
+    # Order A: remove from _scope_closures_cache first, then _scope_cell_info_cache
+    _scope_closures_cache[shared_key] = [(None, {"a"})]
+    _scope_cell_info_cache[shared_key] = frozenset({"a"})
+    _assert_central_index_invariant()
+    del _scope_closures_cache[shared_key]
+    assert shared_key in _scope_owner_keys_index[shared_fn]
+    _assert_central_index_invariant()
+    del _scope_cell_info_cache[shared_key]
+    assert shared_fn not in _scope_owner_keys_index
+    _assert_central_index_invariant()
+
+    # Order B: remove from _scope_cell_info_cache first, then _scope_closures_cache
+    _scope_closures_cache[shared_key] = [(None, {"a"})]
+    _scope_cell_info_cache[shared_key] = frozenset({"a"})
+    _scope_cell_info_cache.pop(shared_key)
+    assert shared_key in _scope_owner_keys_index[shared_fn]
+    _assert_central_index_invariant()
+    _scope_closures_cache.pop(shared_key)
+    assert shared_fn not in _scope_owner_keys_index
+    _assert_central_index_invariant()
+
+    # Order C: clear _scope_closures_cache first, then _scope_cell_info_cache
+    _scope_closures_cache[shared_key] = [(None, {"a"})]
+    _scope_cell_info_cache[shared_key] = frozenset({"a"})
+    _scope_closures_cache.clear()
+    assert shared_key in _scope_owner_keys_index[shared_fn]
+    _assert_central_index_invariant()
+    _scope_cell_info_cache.clear()
+    assert not _scope_owner_keys_index
+    _assert_central_index_invariant()
+
+    # Order D: clear _scope_cell_info_cache first, then _scope_closures_cache
+    _scope_closures_cache[shared_key] = [(None, {"a"})]
+    _scope_cell_info_cache[shared_key] = frozenset({"a"})
+    _scope_cell_info_cache.clear()
+    assert shared_key in _scope_owner_keys_index[shared_fn]
+    _assert_central_index_invariant()
+    _scope_closures_cache.clear()
+    assert not _scope_owner_keys_index
+    _assert_central_index_invariant()
+
+    # Order E: evict a tree containing a shared key present in both caches
+    _scope_closures_cache[shared_key] = [(None, {"a"})]
+    _scope_cell_info_cache[shared_key] = frozenset({"a"})
+    _evict_tree_scopes(shared_tree)
+    assert shared_key not in _scope_closures_cache
+    assert shared_key not in _scope_cell_info_cache
+    assert not _scope_owner_keys_index
+    _assert_central_index_invariant()
+
+    # 3. Section 3.3 & 12: Eviction of a detached AST subtree invalidates ancestor cached values
+    clear_dataflow_cache()
+    nested_tree = ast.parse(
+        "def outer():\n"
+        "    x = 1\n"
+        "    def inner():\n"
+        "        return x\n"
+        "    return inner\n"
+    )
+    outer_fn = nested_tree.body[0]
+    assert isinstance(outer_fn, ast.FunctionDef)
+    inner_fn = outer_fn.body[1]
+    assert isinstance(inner_fn, ast.FunctionDef)
+
+    ctx_outer = _get_fn_scope_context(outer_fn, mod_tree=nested_tree)
+    closures_outer = _collect_scope_closures(outer_fn, module_tree=nested_tree)
+    assert inner_fn in ctx_outer.parent_map
+    assert len(closures_outer) == 1
+    assert outer_fn in _scope_parent_maps
+    _assert_central_index_invariant()
+
+    # Detach inner_fn from outer_fn.body and evict ONLY the detached subtree inner_fn
+    outer_fn.body.remove(inner_fn)
+    _evict_tree_scopes(inner_fn)
+    _assert_central_index_invariant()
+    assert outer_fn not in _scope_parent_maps
+    assert not any(
+        inner_fn in _extract_value_ast_nodes(v)
+        for v in (
+            *_scope_cell_info_cache.values(),
+            *_scope_closures_cache.values(),
+        )
+    )
+
+
+def test_fn_scope_context_parent_map_immutability_and_enclosing_scope_key_isolation() -> None:
+    """Covers Section 4: MappingProxyType parent_map immutability and non-collision of enclosing_scopes in _make_scope_ctx_cache_key."""
+    from pydoppelgangerhunt.fixer._df_cache import clear_dataflow_cache
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _get_fn_scope_context,
+        _make_nested_fn_scope_context,
+        _make_scope_ctx_cache_key,
+    )
+
+    clear_dataflow_cache()
+    src = (
+        "def enc_a():\n"
+        "    x = 1\n"
+        "    def target():\n"
+        "        return x\n"
+        "    return target\n"
+        "\n"
+        "def enc_b():\n"
+        "    x = 1\n"
+        "    def target():\n"
+        "        return x\n"
+        "    return target\n"
+    )
+    tree = ast.parse(src)
+    enc_a = tree.body[0]
+    enc_b = tree.body[1]
+    assert isinstance(enc_a, ast.FunctionDef)
+    assert isinstance(enc_b, ast.FunctionDef)
+    target_a = enc_a.body[1]
+    target_b = enc_b.body[1]
+    assert isinstance(target_a, ast.FunctionDef)
+    assert isinstance(target_b, ast.FunctionDef)
+
+    ctx_a = _get_fn_scope_context(enc_a, mod_tree=tree)
+    ctx_b = _get_fn_scope_context(enc_b, mod_tree=tree)
+
+    # 1. Direct and nested parent_map must reject mutation
+    with pytest.raises(TypeError):
+        ctx_a.parent_map[target_a] = enc_b  # type: ignore[index]
+    nested_ctx_a = _make_nested_fn_scope_context(
+        target_a, frozenset(), scope_ctx=ctx_a
+    )
+    nested_ctx_b = _make_nested_fn_scope_context(
+        target_b, frozenset(), scope_ctx=ctx_b
+    )
+    with pytest.raises(TypeError):
+        nested_ctx_a.parent_map[target_a] = enc_b  # type: ignore[index]
+
+    # 2. Even when cache_fingerprint() is identical, different enclosing_scopes produce distinct keys
+    assert nested_ctx_a.cache_fingerprint() == nested_ctx_b.cache_fingerprint()
+    assert nested_ctx_a.enclosing_scopes != nested_ctx_b.enclosing_scopes
+    shared_expr = target_a.body[0]
+    key_a = _make_scope_ctx_cache_key(
+        shared_expr, "expr_free_reads", nested_ctx_a
+    )
+    key_b = _make_scope_ctx_cache_key(
+        shared_expr, "expr_free_reads", nested_ctx_b
+    )
+    assert key_a != key_b
+    assert hash(key_a) != hash(key_b) or key_a.aux_ast_nodes != key_b.aux_ast_nodes
+
+
+def test_span_line_index_missing_end_positions_and_duplicate_boundary_statements() -> None:
+    """Covers Section 5 & 12: missing end_lineno before unit, same-line boundary deduplication, and ambiguous identical boundary statements."""
+    from pydoppelgangerhunt.fixer._df_cache import clear_dataflow_cache
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _get_span_line_index,
+        _has_unresolved_span_bounds,
+        _resolve_unit_col_bounds,
+    )
+
+    clear_dataflow_cache()
+
+    # 1. Section 5.1: Synthetic AST node with missing end_lineno well before extracted unit
+    tree_missing = ast.parse(
+        "def outer():\n"
+        "    early = 1\n"
+        "    mid = 2\n"
+        "    unit_var = 3\n"
+        "    return unit_var\n"
+    )
+    outer_fn = tree_missing.body[0]
+    assert isinstance(outer_fn, ast.FunctionDef)
+    early_stmt = outer_fn.body[0]
+    early_stmt.end_lineno = None
+    assert (
+        _has_unresolved_span_bounds(
+            outer_fn, 4, 4, 4, 16, [outer_fn.body[2]]
+        )
+        is True
+    )
+
+    # 2. Section 5.2: iter_boundary_entries deduplicates by node identity when u_start == u_end
+    clear_dataflow_cache()
+    same_line_tree = ast.parse("def f():\n    a = 1; b = a + 2\n")
+    idx = _get_span_line_index(same_line_tree)
+    entries = idx.iter_boundary_entries(2, 2)
+    node_ids = [id(e.node) for e in entries]
+    assert len(node_ids) == len(set(node_ids))
+
+    # 3. Section 5.3 & 12: Multiple identical boundary statements on the same line reject ambiguous column inference
+    ambig_src = "def f():\n    x = 1; x = 1\n    return x\n"
+    ambig_tree = ast.parse(ambig_src)
+    ambig_fn = ambig_tree.body[0]
+    assert isinstance(ambig_fn, ast.FunctionDef)
+    cand_stmt = [ast.parse("x = 1\n").body[0]]
+    s_col, e_col = _resolve_unit_col_bounds(
+        cand_stmt, ambig_tree, 2, 2, None, None
+    )
+    assert (s_col, e_col) == (None, None)
+    assert (
+        _has_unresolved_span_bounds(
+            ambig_fn, 2, 2, s_col, e_col, cand_stmt
+        )
+        is True
+    )
+
+
+def test_pep227_pep3104_class_body_vs_method_lexical_declarations_and_differential(
+    tmp_path: Path,
+) -> None:
+    """Covers Sections 6, 7, and 12: PEP 227 / PEP 3104 class-body vs method nonlocals/globals and differential execution."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _extract_closure_nonlocal_mutations_and_deletions,
+        _extract_fn_outer_carrier_targets,
+        _find_enclosing_function_chain,
+        _has_invalid_lexical_scope_declarations,
+    )
+
+    # Section 6 Case 1: method nonlocal x binding to outer's x across class C
+    case1_src = (
+        "def outer():\n"
+        "    x = 1\n"
+        "    class C:\n"
+        "        def method(self):\n"
+        "            nonlocal x\n"
+        "            x += 1\n"
+        "    return C\n"
+    )
+    case1_tree = ast.parse(case1_src)
+    case1_chain = _find_enclosing_function_chain(case1_tree, 3, 6)
+    case1_cls = case1_tree.body[0].body[1]  # type: ignore[attr-defined]
+    assert (
+        _has_invalid_lexical_scope_declarations(
+            [case1_cls], enclosing_chain=case1_chain, mod_tree=case1_tree
+        )
+        is False
+    )
+
+    # Section 6 Case 2: class C defines x = 2, method declares nonlocal x (binds to outer's x, valid PEP 3104)
+    case2_src = (
+        "def outer():\n"
+        "    x = 1\n"
+        "    class C:\n"
+        "        x = 2\n"
+        "        def method(self):\n"
+        "            nonlocal x\n"
+        "            x += 1\n"
+        "    return C\n"
+    )
+    case2_tree = ast.parse(case2_src)
+    case2_chain = _find_enclosing_function_chain(case2_tree, 3, 7)
+    case2_cls = case2_tree.body[0].body[1]  # type: ignore[attr-defined]
+    assert (
+        _has_invalid_lexical_scope_declarations(
+            [case2_cls], enclosing_chain=case2_chain, mod_tree=case2_tree
+        )
+        is False
+    )
+
+    # Section 6 Case 3: class C declares global x, method declares nonlocal x (class global does not propagate into method)
+    case3_src = (
+        "def outer():\n"
+        "    x = 1\n"
+        "    class C:\n"
+        "        global x\n"
+        "        def method(self):\n"
+        "            nonlocal x\n"
+        "            x += 1\n"
+        "        def method_global(self):\n"
+        "            global x\n"
+        "            x = 99\n"
+        "    return C\n"
+    )
+    case3_tree = ast.parse(case3_src)
+    case3_chain = _find_enclosing_function_chain(case3_tree, 3, 10)
+    case3_cls = case3_tree.body[0].body[1]  # type: ignore[attr-defined]
+    assert (
+        _has_invalid_lexical_scope_declarations(
+            [case3_cls], enclosing_chain=case3_chain, mod_tree=case3_tree
+        )
+        is False
+    )
+    muts_c3, _ = _extract_closure_nonlocal_mutations_and_deletions(case3_cls)
+    assert "x" in muts_c3
+
+    # Verify carrier target propagation when class body declares `global items` but method mutates outer cell `items`
+    carrier_cls_src = (
+        "def outer():\n"
+        "    items = []\n"
+        "    val = 1\n"
+        "    class C:\n"
+        "        global items\n"
+        "        def mutate(self):\n"
+        "            items.append(lambda: val)\n"
+        "    return C\n"
+    )
+    carrier_cls_tree = ast.parse(carrier_cls_src)
+    c_node = carrier_cls_tree.body[0].body[2]  # type: ignore[attr-defined]
+    assert "items" in _extract_fn_outer_carrier_targets(c_node)
+
+    # Section 7: Differential execution tests for class-body nonlocal, method nonlocal,
+    # nested method closures, and class-local shadowing
+    diff_class_nonlocal_src = (
+        "def entry(step: int) -> tuple[int, int]:\n"
+        "    value = 10\n"
+        "    class Worker:\n"
+        "        nonlocal value\n"
+        "        value += step\n"
+        "        def bump(self) -> object:\n"
+        "            nonlocal value\n"
+        "            value += step * 2\n"
+        "            return lambda: value\n"
+        "    if step > 0:\n"
+        "        w = Worker()\n"
+        "        getter = w.bump()\n"
+        "        res = getter()\n"
+        "    else:\n"
+        "        res = value\n"
+        "    return res, value\n"
+    )
+    _run_differential_refactoring_case(
+        tmp_path,
+        "class_body_and_method_nonlocal_hazard",
+        diff_class_nonlocal_src,
+        u1_bounds=(3, 9),
+        expect_patch=False,
+        call_args_list=[(3,), (5,)],
+    )
+
+
+def test_async_subroutine_without_await_suspension_precision_and_monotonicity() -> None:
+    """Covers Section 10 & 12: distinguishes sync/async generators and awaiting coroutines from async functions without suspension points."""
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _UnitClosureHazardContext,
+        _has_severed_closure_cell_hazard,
+    )
+
+    base_enclosing_src = (
+        "async def outer():\n"
+        "    shared = 0\n"
+        "    def concurrent_reader():\n"
+        "        return shared\n"
+        "    r = concurrent_reader\n"
+        "    # unit at lines 6-7\n"
+        "    shared = 1\n"
+        "    out = shared + 1\n"
+        "    return r(), out\n"
+    )
+    mod_tree = ast.parse(base_enclosing_src)
+    sync_stmts = ast.parse("shared = 1\nout = shared + 1\n").body
+    await_stmts = ast.parse("shared = await fetch()\nout = shared + 1\n").body
+    yield_stmts = ast.parse("shared = 1\nyield shared\n").body
+
+    # 1. Async subroutine WITHOUT suspension points (no await/yield/async for/async with) -> NOT suspended
+    ctx_async_no_await = _UnitClosureHazardContext(
+        candidate_stmts=sync_stmts,
+        mod_tree=mod_tree,
+        u_start=6,
+        u_end=7,
+        u_start_col=4,
+        u_end_col=20,
+        is_subroutine=True,
+        unit_kind="linear_block",
+        inputs=(),
+        outputs=("shared", "out"),
+        stores=("shared", "out"),
+        deleted_names=frozenset(),
+        unit_top_locals=frozenset({"shared", "out"}),
+        has_yield=False,
+        is_async=True,
+        skip_pre_unit_closures=False,
+    )
+    assert _has_severed_closure_cell_hazard(ctx_async_no_await) is False
+
+    # 2. Coroutine WITH await -> suspended -> flags concurrent sibling hazard in strict mode
+    ctx_async_with_await = ctx_async_no_await._replace(
+        candidate_stmts=await_stmts
+    )
+    assert _has_severed_closure_cell_hazard(ctx_async_with_await) is True
+
+    # 3. Sync generator (has_yield=True, is_async=False) -> suspended -> flags hazard
+    ctx_sync_gen = ctx_async_no_await._replace(
+        candidate_stmts=yield_stmts, has_yield=True, is_async=False
+    )
+    assert _has_severed_closure_cell_hazard(ctx_sync_gen) is True
+
+    # 4. Async generator (has_yield=True, is_async=True) -> suspended -> flags hazard
+    ctx_async_gen = ctx_async_no_await._replace(
+        candidate_stmts=yield_stmts, has_yield=True, is_async=True
+    )
+    assert _has_severed_closure_cell_hazard(ctx_async_gen) is True
+
+    # 5. Monotonicity invariant (lenient_hazard => strict_hazard) across all 4 suspension categories
+    for strict_ctx in (
+        ctx_async_no_await,
+        ctx_async_with_await,
+        ctx_sync_gen,
+        ctx_async_gen,
+    ):
+        lenient_ctx = strict_ctx._replace(skip_pre_unit_closures=True)
+        strict_res = _has_severed_closure_cell_hazard(strict_ctx)
+        lenient_res = _has_severed_closure_cell_hazard(lenient_ctx)
+        if lenient_res:
+            assert strict_res is True
+
+
+
 
 
 

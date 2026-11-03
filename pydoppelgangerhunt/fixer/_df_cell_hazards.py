@@ -112,6 +112,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _has_escaped_intra_unit_global_declarations,
     _resolve_immediate_scope_in_fn,
 )
+from pydoppelgangerhunt.parser import _node_is_effectively_async
 
 __all__ = [
     "_UnitClosureHazardContext",
@@ -508,7 +509,22 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         mod_tree=ctx.mod_tree,
         enclosing_scopes=unit_enclosing_scopes,
     )
-    is_suspended = ctx.is_subroutine and (ctx.has_yield or ctx.is_async)
+    is_suspended = ctx.is_subroutine and (
+        ctx.has_yield
+        or (
+            ctx.is_async
+            and _node_is_effectively_async(
+                ctx.candidate_stmts[0].body
+                if len(ctx.candidate_stmts) == 1
+                and isinstance(
+                    ctx.candidate_stmts[0],
+                    (ast.FunctionDef, ast.AsyncFunctionDef),
+                )
+                else ctx.candidate_stmts,
+                True,
+            )
+        )
+    )
     if is_suspended and bool(unit_mutated_names & (enc_escaping | nonlocal_set)):
         return True
 

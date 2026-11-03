@@ -8,6 +8,7 @@ import logging
 import re
 import textwrap
 from typing import (
+    AbstractSet,
     Any,
     Dict,
     Iterable,
@@ -29,8 +30,8 @@ from pydoppelgangerhunt.fixer._df_cell_hazards import (
     _resolve_unit_col_bounds,
 )
 from pydoppelgangerhunt.fixer._df_cell_traversal import (
-    _is_exception_suppressing_with,
-    _split_suppress_with_body,
+    _split_with_body_by_mode,
+    _update_suppress_aliases_from_stmt,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
     _COMPREHENSION_TYPES,
@@ -1031,39 +1032,62 @@ def _walrus_assignment_in_expr(
     return definite, conditional - definite
 
 
-def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
+def _block_terminates(
+    statements: Sequence[ast.stmt],
+    *,
+    suppress_aliases: AbstractSet[str] = frozenset(),
+) -> bool:
     """Returns True if the statement sequence unconditionally terminates via return or raise."""
+    local_sup_aliases: Set[str] = set(suppress_aliases)
     for stmt in statements:
+        _update_suppress_aliases_from_stmt(stmt, local_sup_aliases)
         if isinstance(stmt, (ast.Return, ast.Raise)):
             return True
         if isinstance(stmt, ast.If):
             if (
                 stmt.orelse
-                and _block_terminates(stmt.body)
-                and _block_terminates(stmt.orelse)
+                and _block_terminates(
+                    stmt.body, suppress_aliases=local_sup_aliases
+                )
+                and _block_terminates(
+                    stmt.orelse, suppress_aliases=local_sup_aliases
+                )
             ):
                 return True
         elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-            w_body = (
-                _split_suppress_with_body(stmt.body)[0]
-                if _is_exception_suppressing_with(stmt)
-                else stmt.body
-            )
-            if _block_terminates(w_body):
+            w_body = _split_with_body_by_mode(stmt, local_sup_aliases)[0]
+            if _block_terminates(w_body, suppress_aliases=local_sup_aliases):
                 return True
         elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
             cases = getattr(stmt, "cases", [])
             has_irrefutable = any(_is_irrefutable_case(c) for c in cases)
-            if has_irrefutable and cases and all(_block_terminates(c.body) for c in cases):
+            if (
+                has_irrefutable
+                and cases
+                and all(
+                    _block_terminates(
+                        c.body, suppress_aliases=local_sup_aliases
+                    )
+                    for c in cases
+                )
+            ):
                 return True
         elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
             f_body = getattr(stmt, "finalbody", [])
-            if f_body and _block_terminates(f_body):
+            if f_body and _block_terminates(
+                f_body, suppress_aliases=local_sup_aliases
+            ):
                 return True
             handlers = getattr(stmt, "handlers", [])
             o_stmts = getattr(stmt, "orelse", [])
-            body_terminates = _block_terminates(getattr(stmt, "body", [])) or (
-                bool(o_stmts) and _block_terminates(o_stmts)
+            body_terminates = _block_terminates(
+                getattr(stmt, "body", []),
+                suppress_aliases=local_sup_aliases,
+            ) or (
+                bool(o_stmts)
+                and _block_terminates(
+                    o_stmts, suppress_aliases=local_sup_aliases
+                )
             )
             if not handlers and body_terminates:
                 return True
@@ -1071,7 +1095,13 @@ def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
                 handlers
                 and type(stmt).__name__ != "TryStar"
                 and body_terminates
-                and all(_block_terminates(getattr(h, "body", [])) for h in handlers)
+                and all(
+                    _block_terminates(
+                        getattr(h, "body", []),
+                        suppress_aliases=local_sup_aliases,
+                    )
+                    for h in handlers
+                )
             ):
                 return True
     return False
@@ -1119,6 +1149,7 @@ def _analyze_block_assignment(
     *,
     may_deleted: Optional[Set[str]] = None,
     live_in_deleted: Optional[Set[str]] = None,
+    suppress_aliases: AbstractSet[str] = frozenset(),
 ) -> Tuple[Set[str], Set[str]]:
     """Analyzes a sequence of statements to determine unconditionally and conditionally assigned variables.
 
@@ -1131,8 +1162,10 @@ def _analyze_block_assignment(
         conditional = set()
     may_del = may_deleted if may_deleted is not None else set()
     live_in_del = live_in_deleted if live_in_deleted is not None else set()
+    local_sup_aliases: Set[str] = set(suppress_aliases)
 
     for stmt in statements:
+        _update_suppress_aliases_from_stmt(stmt, local_sup_aliases)
         before_def = set(definite)
         if isinstance(stmt, ast.Assign):
             for target in stmt.targets:
@@ -1214,18 +1247,32 @@ def _analyze_block_assignment(
             o_may: Set[str] = set()
             o_live: Set[str] = set()
             b_def, b_cond = _analyze_block_assignment(
-                stmt.body, may_deleted=b_may, live_in_deleted=b_live
+                stmt.body,
+                may_deleted=b_may,
+                live_in_deleted=b_live,
+                suppress_aliases=local_sup_aliases,
             )
             o_def, o_cond = (
                 _analyze_block_assignment(
-                    stmt.orelse, may_deleted=o_may, live_in_deleted=o_live
+                    stmt.orelse,
+                    may_deleted=o_may,
+                    live_in_deleted=o_live,
+                    suppress_aliases=local_sup_aliases,
                 )
                 if stmt.orelse
                 else (set(), set())
             )
             live_in_del.update((b_live | o_live) - definite)
-            b_term = _block_terminates(stmt.body)
-            o_term = _block_terminates(stmt.orelse) if stmt.orelse else False
+            b_term = _block_terminates(
+                stmt.body, suppress_aliases=local_sup_aliases
+            )
+            o_term = (
+                _block_terminates(
+                    stmt.orelse, suppress_aliases=local_sup_aliases
+                )
+                if stmt.orelse
+                else False
+            )
             if stmt.orelse:
                 if o_term and not b_term:
                     definite.update(b_def)
@@ -1305,10 +1352,8 @@ def _analyze_block_assignment(
                         if isinstance(p_node, ast.Name) and isinstance(p_node.ctx, ast.Store):
                             definite.add(p_node.id)
                             may_del.discard(p_node.id)
-            safe_prefix, risky_suffix = (
-                _split_suppress_with_body(stmt.body)
-                if _is_exception_suppressing_with(stmt)
-                else (list(stmt.body), [])
+            safe_prefix, risky_suffix = _split_with_body_by_mode(
+                stmt, local_sup_aliases, safe_names=definite
             )
             _analyze_block_assignment(
                 safe_prefix,
@@ -1316,8 +1361,11 @@ def _analyze_block_assignment(
                 conditional,
                 may_deleted=may_del,
                 live_in_deleted=live_in_del,
+                suppress_aliases=local_sup_aliases,
             )
-            if risky_suffix and not _block_terminates(safe_prefix):
+            if risky_suffix and not _block_terminates(
+                safe_prefix, suppress_aliases=local_sup_aliases
+            ):
                 w_may: Set[str] = set()
                 w_live: Set[str] = set()
                 w_def, w_cond = _analyze_block_assignment(
@@ -1569,7 +1617,7 @@ def _analyze_block_assignment(
                 conditional.update(d_m | c_m)
 
         may_del.difference_update(definite - before_def)
-        if _block_terminates([stmt]):
+        if _block_terminates([stmt], suppress_aliases=local_sup_aliases):
             break
 
     return definite, conditional - definite
