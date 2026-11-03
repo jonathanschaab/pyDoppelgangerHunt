@@ -37,8 +37,6 @@ _parsed_tree_cache: OrderedDict[Tuple[str, int], Optional[ast.AST]] = OrderedDic
 _scope_parent_maps: OrderedDict[ast.AST, Dict[ast.AST, ast.AST]] = OrderedDict()
 _scope_stmts_by_end: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
 _scope_stmts_by_start: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
-_scope_closures_cache: OrderedDict[Any, List[Tuple[Any, Set[str]]]] = OrderedDict()
-_scope_cell_info_cache: OrderedDict[Any, Any] = OrderedDict()
 _scope_loops_cache: OrderedDict[ast.AST, List[Tuple[int, int, int]]] = OrderedDict()
 _scope_try_with_cache: OrderedDict[ast.AST, List[ast.AST]] = OrderedDict()
 _warned_lenient_closure: List[bool] = [False]
@@ -73,10 +71,16 @@ _INSPECTED_CONTAINER_TYPES: Tuple[type, ...] = (
 def _params_contain_ast(params: Tuple[Any, ...]) -> bool:
     """Checks recursively whether any element or nested container in params is an ast.AST node."""
     stack: List[Any] = list(params)
+    seen: Set[int] = set()
     while stack:
         curr = stack.pop()
         if isinstance(curr, ast.AST):
             return True
+        if isinstance(curr, _INSPECTED_CONTAINER_TYPES):
+            curr_id = id(curr)
+            if curr_id in seen:
+                continue
+            seen.add(curr_id)
         if isinstance(curr, dict):
             for k, v in curr.items():
                 if isinstance(k, ast.AST) or isinstance(v, ast.AST):
@@ -101,6 +105,7 @@ def _validate_scope_cache_params(params: Any) -> None:
             f"_ScopeCacheKey.params must be a tuple; got {type(params).__name__}"
         )
     stack: List[Any] = list(params)
+    seen: Set[int] = set()
     while stack:
         curr = stack.pop()
         if isinstance(curr, ast.AST):
@@ -110,6 +115,10 @@ def _validate_scope_cache_params(params: Any) -> None:
         if isinstance(curr, _PERMITTED_PARAM_SCALAR_TYPES):
             continue
         if isinstance(curr, (tuple, frozenset)):
+            curr_id = id(curr)
+            if curr_id in seen:
+                continue
+            seen.add(curr_id)
             for elem in curr:
                 if isinstance(elem, ast.AST):
                     raise ValueError(
@@ -138,7 +147,7 @@ class _BaseScopeCacheKey(NamedTuple):
 
 
 class _ScopeCacheKey(_BaseScopeCacheKey):
-    """Uniform cache key with explicit AST owner(s) for O(1) tree eviction."""
+    """Uniform cache key with explicit AST owner(s) for O(1) owner extraction and indexed tree eviction."""
 
     __slots__ = ()
 
@@ -178,6 +187,94 @@ def _make_trusted_scope_cache_key(
     )
 
 
+def _extract_key_ast_nodes(key: Any) -> Tuple[ast.AST, ...]:
+    """Extracts all ast.AST nodes referenced by a cache key (O(1) for _ScopeCacheKey and ast.AST)."""
+    if isinstance(key, _ScopeCacheKey):
+        return (key.owner, *key.aux_ast_nodes) if key.aux_ast_nodes else (key.owner,)
+    if isinstance(key, ast.AST):
+        return (key,)
+    if not isinstance(key, (tuple, frozenset)):
+        return ()
+    found: List[ast.AST] = []
+    seen: Set[int] = {id(key)}
+    stack: List[Any] = [key]
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, _ScopeCacheKey):
+            found.append(curr.owner)
+            found.extend(curr.aux_ast_nodes)
+            continue
+        for elem in curr:
+            if isinstance(elem, ast.AST):
+                found.append(elem)
+            elif isinstance(elem, (tuple, frozenset)):
+                elem_id = id(elem)
+                if elem_id not in seen:
+                    seen.add(elem_id)
+                    stack.append(elem)
+    return tuple(found)
+
+
+_scope_owner_keys_index: Dict[ast.AST, Set[Any]] = {}
+
+
+class _TrackedScopeCache(OrderedDict[Any, _CacheValT]):
+    """OrderedDict cache that maintains _scope_owner_keys_index for indexed AST tree eviction."""
+
+    def _index_key(self, key: Any) -> None:
+        for node in _extract_key_ast_nodes(key):
+            _scope_owner_keys_index.setdefault(node, set()).add(key)
+
+    def _unindex_key(self, key: Any) -> None:
+        other = (
+            _scope_cell_info_cache
+            if self is _scope_closures_cache
+            else _scope_closures_cache
+        )
+        if key in other:
+            return
+        for node in _extract_key_ast_nodes(key):
+            kset = _scope_owner_keys_index.get(node)
+            if kset is not None:
+                kset.discard(key)
+                if not kset:
+                    _scope_owner_keys_index.pop(node, None)
+
+    def __setitem__(self, key: Any, value: _CacheValT) -> None:
+        is_new = key not in self
+        super().__setitem__(key, value)
+        if is_new:
+            self._index_key(key)
+
+    def __delitem__(self, key: Any) -> None:
+        super().__delitem__(key)
+        self._unindex_key(key)
+
+    def pop(self, key: Any, *args: Any) -> Any:
+        had_key = key in self
+        res = super().pop(key, *args)
+        if had_key:
+            self._unindex_key(key)
+        return res
+
+    def popitem(self, last: bool = True) -> Tuple[Any, _CacheValT]:
+        k, v = super().popitem(last=last)
+        self._unindex_key(k)
+        return k, v
+
+    def clear(self) -> None:
+        keys = list(self.keys())
+        super().clear()
+        for k in keys:
+            self._unindex_key(k)
+
+
+_scope_closures_cache: _TrackedScopeCache[List[Tuple[Any, Set[str]]]] = (
+    _TrackedScopeCache()
+)
+_scope_cell_info_cache: _TrackedScopeCache[Any] = _TrackedScopeCache()
+
+
 def _key_references_scope_nodes(
     key: Any,
     tree_nodes: Set[ast.AST],
@@ -187,8 +284,9 @@ def _key_references_scope_nodes(
 
     Cache Key & Value Policy:
     Production entries in _scope_closures_cache and _scope_cell_info_cache use
-    _ScopeCacheKey(owner, kind, params, aux_ast_nodes), enabling O(1) eviction
-    via explicit AST owner fields without scanning non-AST parameter sets.
+    _ScopeCacheKey(owner, kind, params, aux_ast_nodes), enabling O(1) owner
+    extraction via explicit AST owner fields and indexed tree eviction via
+    _scope_owner_keys_index without scanning unrelated cache entries.
     For arbitrary tuple, NamedTuple, or frozenset keys (including heterogeneous
     frozensets), every element is inspected recursively. Cached values must be
     immutable (frozenset, tuple, NamedTuple, MappingProxyType, bool), protected
@@ -205,33 +303,16 @@ def _key_references_scope_nodes(
         return False
     if safe_containers is not None and id(key) in safe_containers:
         return False
-    stack: List[Any] = [key]
-    checked_ids: List[int] = [id(key)]
-    while stack:
-        curr = stack.pop()
-        if isinstance(curr, _ScopeCacheKey):
-            if curr.owner in tree_nodes or any(
-                n in tree_nodes for n in curr.aux_ast_nodes
-            ):
-                return True
-            continue
-        if isinstance(curr, frozenset) and not curr.isdisjoint(tree_nodes):
-            return True
-        for elem in curr:
-            if isinstance(elem, ast.AST) and elem in tree_nodes:
-                return True
-            if isinstance(elem, (tuple, frozenset)):
-                elem_id = id(elem)
-                if safe_containers is None or elem_id not in safe_containers:
-                    checked_ids.append(elem_id)
-                    stack.append(elem)
-    if safe_containers is not None:
-        safe_containers.update(checked_ids)
+    ast_nodes = _extract_key_ast_nodes(key)
+    if any(n in tree_nodes for n in ast_nodes):
+        return True
+    if safe_containers is not None and not ast_nodes:
+        safe_containers.add(id(key))
     return False
 
 
 def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
-    """Purges scope-cache entries belonging to an evicted AST tree."""
+    """Purges scope-cache entries belonging to an evicted AST tree in O(|tree| + |evicted|) time."""
     if tree is None or not isinstance(tree, ast.AST):
         return
     tree_nodes = set(ast.walk(tree))
@@ -239,29 +320,20 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
         node for node in tree_nodes if isinstance(node, _SCOPE_ROOT_TYPES)
     }
     scope_nodes.add(tree)
-    safe_containers: Set[int] = set()
     with _downstream_cache_lock:
         for node in scope_nodes:
             _scope_parent_maps.pop(node, None)
             _scope_stmts_by_end.pop(node, None)
             _scope_stmts_by_start.pop(node, None)
-            _scope_closures_cache.pop(node, None)
-            _scope_cell_info_cache.pop(node, None)
             _scope_loops_cache.pop(node, None)
             _scope_try_with_cache.pop(node, None)
-        closure_keys_to_remove = [
-            k
-            for k in _scope_closures_cache
-            if _key_references_scope_nodes(k, tree_nodes, safe_containers)
-        ]
-        for k in closure_keys_to_remove:
+        keys_to_remove: Set[Any] = set()
+        for node in tree_nodes:
+            node_keys = _scope_owner_keys_index.pop(node, None)
+            if node_keys:
+                keys_to_remove.update(node_keys)
+        for k in keys_to_remove:
             _scope_closures_cache.pop(k, None)
-        cell_keys_to_remove = [
-            k
-            for k in _scope_cell_info_cache
-            if _key_references_scope_nodes(k, tree_nodes, safe_containers)
-        ]
-        for k in cell_keys_to_remove:
             _scope_cell_info_cache.pop(k, None)
 
 
@@ -573,6 +645,7 @@ def clear_dataflow_cache() -> None:
         _scope_stmts_by_start.clear()
         _scope_closures_cache.clear()
         _scope_cell_info_cache.clear()
+        _scope_owner_keys_index.clear()
         _scope_loops_cache.clear()
         _scope_try_with_cache.clear()
         _warned_lenient_closure[0] = False

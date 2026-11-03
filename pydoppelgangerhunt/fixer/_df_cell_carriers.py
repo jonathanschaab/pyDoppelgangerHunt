@@ -1735,6 +1735,9 @@ def _iter_carrier_target_entries(
 
 def _extract_shallow_loads_and_calls(
     stmts: Sequence[ast.AST],
+    *,
+    deletions_out: Optional[Set[str]] = None,
+    pep227_loads_out: Optional[Set[str]] = None,
 ) -> Tuple[Set[str], Set[str]]:
     """Extracts (non_call_loaded_names, direct_called_names) stopping at nested def/class bodies."""
     loaded: Set[str] = set()
@@ -1747,11 +1750,30 @@ def _extract_shallow_loads_and_calls(
             (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
         ):
             if isinstance(curr, ast.Lambda):
-                loaded.update(
-                    _extract_expr_scope_free_reads(curr, include_header=False)
+                lam_reads = _extract_expr_scope_free_reads(
+                    curr, include_header=False
                 )
+                loaded.update(lam_reads)
+                if pep227_loads_out is not None:
+                    pep227_loads_out.update(lam_reads)
             stack.extend(iter_nested_scope_header_nodes(curr))
             continue
+        if pep227_loads_out is not None and isinstance(
+            curr, _COMPREHENSION_TYPES
+        ):
+            pep227_loads_out.update(
+                _extract_expr_scope_free_reads(curr, include_header=False)
+            )
+        if deletions_out is not None and isinstance(curr, ast.Delete):
+            for d_tgt in curr.targets:
+                if isinstance(d_tgt, ast.Name):
+                    deletions_out.add(d_tgt.id)
+                elif isinstance(d_tgt, (ast.Tuple, ast.List)):
+                    deletions_out.update(
+                        elt.id
+                        for elt in ast.walk(d_tgt)
+                        if isinstance(elt, ast.Name)
+                    )
         if isinstance(curr, ast.Call):
             if isinstance(curr.func, ast.Name):
                 called.add(curr.func.id)
@@ -1794,26 +1816,38 @@ def _extract_shallow_defs(
 def _extract_class_body_unconditional_def_names(
     cls_node: ast.ClassDef,
 ) -> frozenset[str]:
-    """Returns class-level def/class names unconditionally bound before any load/call/del in cls_node.body."""
-    bound_before_use: Set[str] = set()
-    used_before_bind: Set[str] = set()
-    deleted_in_body: Set[str] = set()
+    """Returns class-level def/class names unconditionally bound for all class-body uses."""
+    currently_bound: Set[str] = set()
+    used_when_unbound: Set[str] = set()
     for stmt in cls_node.body:
-        s_loads, s_calls = _extract_shallow_loads_and_calls([stmt])
+        shallow_dels: Set[str] = set()
+        pep227_loads: Set[str] = set()
+        s_loads, s_calls = _extract_shallow_loads_and_calls(
+            [stmt],
+            deletions_out=shallow_dels,
+            pep227_loads_out=pep227_loads,
+        )
         for ref in s_loads | s_calls:
-            if ref not in bound_before_use:
-                used_before_bind.add(ref)
-        for sub in ast.walk(stmt):
-            if isinstance(sub, ast.Delete):
-                for tgt in sub.targets:
-                    if isinstance(tgt, ast.Name):
-                        deleted_in_body.add(tgt.id)
+            if ref not in currently_bound:
+                used_when_unbound.add(ref)
+        used_when_unbound.update(pep227_loads)
+        if shallow_dels:
+            currently_bound.difference_update(shallow_dels)
         if isinstance(
             stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
         ):
-            if stmt.name not in used_before_bind:
-                bound_before_use.add(stmt.name)
-    return frozenset(bound_before_use - deleted_in_body)
+            currently_bound.add(stmt.name)
+        elif isinstance(stmt, ast.Assign):
+            for tgt in stmt.targets:
+                if isinstance(tgt, ast.Name):
+                    currently_bound.add(tgt.id)
+        elif (
+            isinstance(stmt, ast.AnnAssign)
+            and stmt.value is not None
+            and isinstance(stmt.target, ast.Name)
+        ):
+            currently_bound.add(stmt.target.id)
+    return frozenset(currently_bound - used_when_unbound)
 
 
 def _propagate_top_cell_defs(

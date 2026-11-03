@@ -12929,9 +12929,10 @@ def test_suppress_with_termination_and_definite_bindings() -> None:
     assert bound_rret == {"x"}
     assert term_rret is False
 
-    # If/else inside with suppress(...) where both branches return constants terminates
+    # If/else inside with suppress(...) where test is safe and both branches return constants terminates
     if_ret_suppress_src = (
         "with suppress(Exception):\n"
+        "    flag = True\n"
         "    if flag:\n"
         "        return 1\n"
         "    else:\n"
@@ -12942,7 +12943,7 @@ def test_suppress_with_termination_and_definite_bindings() -> None:
     assert _block_terminates([if_ret_stmts[0]]) is True
     assert (
         _extract_block_definite_bindings_and_term(if_ret_stmts, None)
-        == (set(), True)
+        == ({"flag"}, True)
     )
 
     # Item 3: Non-raising prefix statements inside with suppress(...) bind definitely
@@ -13696,6 +13697,399 @@ def test_property_invariants_cache_isolation_monotonicity_equivalence() -> None:
         except SyntaxError:
             symtable_rejected = True
         assert got_invalid is expected_invalid is symtable_rejected
+
+
+def test_sibling_closure_ordinary_store_followed_by_call_or_mutation() -> None:
+    """Verifies Finding 1: ordinary stores in extracted subroutines are checked against sibling closures."""
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
+
+    # 1. Ordinary store followed by sibling closure invocation reading the rebound local
+    store_then_call_src = (
+        "def outer():\n"
+        "    x = 0\n"
+        "    def callback():\n"
+        "        return x\n"
+        "    x = 1\n"
+        "    result = callback()\n"
+        "    return result\n"
+    )
+    tree1 = ast.parse(store_then_call_src)
+    for skip_pre in (False, True):
+        sc1 = inspect_single_unit_scope(
+            {
+                "start": 5,
+                "end": 7,
+                "kind": "basic_block",
+                "is_subroutine": True,
+                "skip_pre_unit_closures": skip_pre,
+                "source_text": store_then_call_src,
+                "source_code": "x = 1\nresult = callback()\nreturn result\n",
+            },
+            tree=tree1,
+        )
+        assert "severed_closure_cell" in sc1["control_flow_hazards"]
+        assert sc1["is_control_flow_safe"] is False
+
+    # 2. Ordinary store followed by sibling closure mutation (both returning and output-unpacking)
+    store_then_mutate_src = (
+        "def outer():\n"
+        "    x = 0\n"
+        "    def mutate():\n"
+        "        nonlocal x\n"
+        "        x = 2\n"
+        "    x = 1\n"
+        "    mutate()\n"
+        "    y = 3\n"
+        "    return x, y\n"
+    )
+    tree2 = ast.parse(store_then_mutate_src)
+    for skip_pre in (False, True):
+        sc2 = inspect_single_unit_scope(
+            {
+                "start": 6,
+                "end": 8,
+                "kind": "basic_block",
+                "is_subroutine": True,
+                "skip_pre_unit_closures": skip_pre,
+                "source_text": store_then_mutate_src,
+                "source_code": "x = 1\nmutate()\ny = 3\n",
+            },
+            tree=tree2,
+        )
+        assert "severed_closure_cell" in sc2["control_flow_hazards"]
+        assert sc2["is_control_flow_safe"] is False
+
+    # 3. Contrast: closure unit with its own local `x = 1` (not nonlocal) does not mutate outer `x`
+    closure_own_local_src = (
+        "def outer():\n"
+        "    x = 0\n"
+        "    def callback():\n"
+        "        return x\n"
+        "    def inner():\n"
+        "        x = 1\n"
+        "        return callback() + x\n"
+        "    return inner()\n"
+    )
+    sc_clos = inspect_single_unit_scope(
+        {
+            "start": 5,
+            "end": 7,
+            "kind": "closure",
+            "is_subroutine": False,
+            "source_text": closure_own_local_src,
+            "source_code": "def inner():\n    x = 1\n    return callback() + x\n",
+        },
+        tree=ast.parse(closure_own_local_src),
+    )
+    assert "severed_closure_cell" not in sc_clos["control_flow_hazards"]
+
+
+def test_suppress_with_name_errors_and_custom_bool_dunder() -> None:
+    """Verifies Finding 2: ast.Name and truthiness checks inside suppress(...) are not assumed non-raising."""
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _extract_block_definite_bindings_and_term,
+        _find_enclosing_chain_definite_pre_bound,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_hazards import (
+        _find_enclosing_function_chain,
+    )
+    from pydoppelgangerhunt.fixer.scope import (
+        _analyze_block_assignment,
+        _block_terminates,
+    )
+
+    # 1. Assignment from unbound local inside suppress(NameError)
+    unbound_local_src = (
+        "from contextlib import suppress\n"
+        "def example(flag):\n"
+        "    with suppress(NameError):\n"
+        "        x = missing_local\n"
+        "    cb = lambda: x\n"
+        "    if flag:\n"
+        "        missing_local = 1\n"
+        "    return cb()\n"
+    )
+    t_ul = ast.parse(unbound_local_src)
+    chain_ul = _find_enclosing_function_chain(t_ul, 5, 5)
+    pre_ul = _find_enclosing_chain_definite_pre_bound(chain_ul, 5, 5, mod_tree=t_ul)
+    assert "x" not in pre_ul
+    sc_ul = inspect_single_unit_scope(
+        {
+            "start": 5,
+            "end": 5,
+            "kind": "closure",
+            "source_text": unbound_local_src,
+            "source_code": "cb = lambda: x\n",
+        },
+        tree=t_ul,
+    )
+    assert "severed_closure_cell" in sc_ul["control_flow_hazards"]
+
+    # 2. Assignment from undefined global inside suppress(NameError)
+    undef_global_src = (
+        "from contextlib import suppress\n"
+        "def example():\n"
+        "    with suppress(NameError):\n"
+        "        x = missing_global\n"
+        "    cb = lambda: x\n"
+        "    return cb()\n"
+    )
+    t_ug = ast.parse(undef_global_src)
+    chain_ug = _find_enclosing_function_chain(t_ug, 5, 5)
+    pre_ug = _find_enclosing_chain_definite_pre_bound(chain_ug, 5, 5, mod_tree=t_ug)
+    assert "x" not in pre_ug
+
+    # 3. Return of undefined name inside suppress(NameError) does not terminate
+    ret_undef_stmts = ast.parse(
+        "with suppress(NameError):\n"
+        "    return missing_name\n"
+    ).body
+    assert _block_terminates(ret_undef_stmts) is False
+    _, term_undef = _extract_block_definite_bindings_and_term(ret_undef_stmts, None)
+    assert term_undef is False
+
+    # 4. `not x` where `x` can have a user-defined __bool__ that raises
+    not_x_stmts = ast.parse(
+        "with suppress(RuntimeError):\n"
+        "    y = not x\n"
+        "    return y\n"
+    ).body
+    assert _block_terminates(not_x_stmts) is False
+    b_not_x, term_not_x = _extract_block_definite_bindings_and_term(
+        not_x_stmts, None, initial_bound=frozenset({"x"})
+    )
+    assert "y" not in b_not_x
+    assert term_not_x is False
+    def_not_x, cond_not_x = _analyze_block_assignment(not_x_stmts)
+    assert "y" not in def_not_x
+    assert "y" in cond_not_x
+
+    # Contrast: `a = 0; y = not a; return y` (known built-in constant `a`) is non-raising
+    safe_bool_stmts = ast.parse(
+        "with suppress(RuntimeError):\n"
+        "    a = 0\n"
+        "    y = not a\n"
+        "    return y\n"
+    ).body
+    assert _block_terminates(safe_bool_stmts) is True
+    b_safe_bool, term_safe_bool = _extract_block_definite_bindings_and_term(
+        safe_bool_stmts, None
+    )
+    assert {"a", "y"}.issubset(b_safe_bool)
+    assert term_safe_bool is True
+
+
+def test_class_namespace_nested_deletions_and_ordered_redefinitions() -> None:
+    """Verifies Finding 3: class-body definition analysis ignores nested deletions and respects statement order."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _collect_escaped_and_executed_intra_unit_defs,
+        _extract_class_body_unconditional_def_names,
+    )
+
+    # 1. Nested method deleting another class method's name does not affect class-level availability
+    nested_del_stmts = ast.parse(
+        "def callback():\n"
+        "    nonlocal state\n"
+        "    state += 1\n"
+        "class Example:\n"
+        "    def callback():\n"
+        "        return 42\n"
+        "    def another():\n"
+        "        del callback\n"
+        "    result = callback()\n"
+    ).body
+    outer_cb_1 = nested_del_stmts[0]
+    cls_1 = nested_del_stmts[1]
+    assert isinstance(cls_1, ast.ClassDef)
+    uncond_1 = _extract_class_body_unconditional_def_names(cls_1)
+    assert "callback" in uncond_1
+    _, esc_ids_1, exec_ids_1 = _collect_escaped_and_executed_intra_unit_defs(
+        nested_del_stmts, frozenset()
+    )
+    assert id(outer_cb_1) not in esc_ids_1
+    assert id(outer_cb_1) not in exec_ids_1
+
+    # 2. Class-body deletion followed by a later definition restores class-level availability
+    del_then_def_stmts = ast.parse(
+        "def callback():\n"
+        "    nonlocal state\n"
+        "    state += 1\n"
+        "class Example:\n"
+        "    del callback\n"
+        "    def callback():\n"
+        "        return 42\n"
+        "    result = callback()\n"
+    ).body
+    outer_cb_2 = del_then_def_stmts[0]
+    cls_2 = del_then_def_stmts[1]
+    assert isinstance(cls_2, ast.ClassDef)
+    uncond_2 = _extract_class_body_unconditional_def_names(cls_2)
+    assert "callback" in uncond_2
+    _, esc_ids_2, exec_ids_2 = _collect_escaped_and_executed_intra_unit_defs(
+        del_then_def_stmts, frozenset()
+    )
+    assert id(outer_cb_2) not in esc_ids_2
+    assert id(outer_cb_2) not in exec_ids_2
+
+    # 3. Class-body definition followed by deletion before use falls back to outer scope
+    def_then_del_stmts = ast.parse(
+        "def callback():\n"
+        "    nonlocal state\n"
+        "    state += 1\n"
+        "class Example:\n"
+        "    def callback():\n"
+        "        return 42\n"
+        "    del callback\n"
+        "    result = callback()\n"
+    ).body
+    outer_cb_3 = def_then_del_stmts[0]
+    cls_3 = def_then_del_stmts[1]
+    assert isinstance(cls_3, ast.ClassDef)
+    uncond_3 = _extract_class_body_unconditional_def_names(cls_3)
+    assert "callback" not in uncond_3
+    _, _, exec_ids_3 = _collect_escaped_and_executed_intra_unit_defs(
+        def_then_del_stmts, frozenset()
+    )
+    assert id(outer_cb_3) in exec_ids_3
+
+
+def test_cyclic_mutable_containers_in_scope_cache_key() -> None:
+    """Verifies Finding 4: self-referential and mutually recursive containers do not hang validation."""
+    from pydoppelgangerhunt.fixer._df_cache import _ScopeCacheKey
+
+    owner = ast.parse("x = 1")
+
+    # 1. Self-referential list
+    cyclic_list: list[Any] = []
+    cyclic_list.append(cyclic_list)
+    with pytest.raises(TypeError, match="only permits immutable"):
+        _ScopeCacheKey(owner, "test", params=(cyclic_list,))
+
+    # 2. Self-referential dict
+    cyclic_dict: dict[str, Any] = {}
+    cyclic_dict["self"] = cyclic_dict
+    with pytest.raises(TypeError, match="only permits immutable"):
+        _ScopeCacheKey(owner, "test", params=(cyclic_dict,))
+
+    # 3. Mutually recursive containers
+    mut_a: list[Any] = []
+    mut_b: dict[str, Any] = {"a": mut_a}
+    mut_a.append(mut_b)
+    with pytest.raises(TypeError, match="only permits immutable"):
+        _ScopeCacheKey(owner, "test", params=((mut_a, mut_b),))
+
+    # 4. Cyclic container that also contains an AST node still raises ValueError
+    cyclic_with_ast: list[Any] = []
+    cyclic_with_ast.append(cyclic_with_ast)
+    cyclic_with_ast.append(owner.body[0])
+    with pytest.raises(ValueError, match="must not contain ast.AST"):
+        _ScopeCacheKey(owner, "test", params=(cyclic_with_ast,))
+
+
+def test_indexed_cache_eviction_multi_owner_node_reuse_and_central_invariant() -> None:
+    """Verifies Finding 5: indexed eviction, multi-owner keys, AST node reuse, and the central cache invariant."""
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _ScopeCacheKey,
+        _evict_tree_scopes,
+        _key_references_scope_nodes,
+        _scope_cell_info_cache,
+        _scope_closures_cache,
+        _scope_owner_keys_index,
+        _scope_parent_maps,
+        clear_dataflow_cache,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context
+
+    clear_dataflow_cache()
+
+    # 1. Eviction of entries with multiple auxiliary AST owners
+    tree_a = ast.parse("def fa():\n    return 1\n")
+    tree_b = ast.parse("def fb():\n    return 2\n")
+    tree_c = ast.parse("def fc():\n    return 3\n")
+    multi_key = _ScopeCacheKey(
+        owner=tree_a.body[0],
+        kind="multi_aux",
+        params=("tag", 1),
+        aux_ast_nodes=(tree_b.body[0], tree_c),
+    )
+    _scope_cell_info_cache[multi_key] = ("cached_val",)
+    assert multi_key in _scope_owner_keys_index.get(tree_a.body[0], set())
+    assert multi_key in _scope_owner_keys_index.get(tree_b.body[0], set())
+    assert multi_key in _scope_owner_keys_index.get(tree_c, set())
+
+    # Evicting tree_b (an auxiliary owner) must evict multi_key and clean up its index entries
+    _evict_tree_scopes(tree_b)
+    assert multi_key not in _scope_cell_info_cache
+    assert multi_key not in _scope_owner_keys_index.get(tree_a.body[0], set())
+    assert multi_key not in _scope_owner_keys_index.get(tree_c, set())
+
+    # 2. Reuse of an AST node after its enclosing tree is evicted
+    reused_fn = tree_a.body[0]
+    assert isinstance(reused_fn, ast.FunctionDef)
+    ctx_before = _get_fn_scope_context(reused_fn, mod_tree=tree_a)
+    assert ctx_before.mod_tree is tree_a
+    _evict_tree_scopes(tree_a)
+    assert not any(
+        _key_references_scope_nodes(k, {reused_fn, tree_a})
+        for k in _scope_cell_info_cache
+    )
+    new_wrapper_tree = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="math", names=[ast.alias(name="*")], level=0
+            ),
+            reused_fn,
+        ],
+        type_ignores=[],
+    )
+    ctx_after = _get_fn_scope_context(reused_fn, mod_tree=new_wrapper_tree)
+    assert ctx_after.mod_tree is new_wrapper_tree
+    assert ctx_after.has_star_import is True
+
+    # 3. Central cache invariant across all supported cache key shapes
+    clear_dataflow_cache()
+    trees = [
+        ast.parse(f"def fn_{i}(x):\n    y = x + {i}\n    return y\n")
+        for i in range(4)
+    ]
+    tree_node_sets = [set(ast.walk(t)) for t in trees]
+    all_supported_keys: list[Any] = []
+    for idx, t in enumerate(trees):
+        fn_node = t.body[0]
+        assert isinstance(fn_node, ast.FunctionDef)
+        stmt_node = fn_node.body[0]
+        next_t = trees[(idx + 1) % len(trees)]
+        k_ast = fn_node
+        k_sck_single = _ScopeCacheKey(
+            owner=fn_node, kind="single", params=(idx, ("nested", True))
+        )
+        k_sck_multi = _ScopeCacheKey(
+            owner=stmt_node,
+            kind="multi",
+            params=(frozenset({"a", "b"}),),
+            aux_ast_nodes=(t, next_t.body[0]),
+        )
+        k_tuple = ("custom_tuple", (fn_node, idx), frozenset({"meta"}))
+        k_frozenset = frozenset({"heterogeneous_label", stmt_node, idx})
+        for k in (k_ast, k_sck_single, k_sck_multi, k_tuple, k_frozenset):
+            _scope_cell_info_cache[k] = (idx, "cell")
+            _scope_closures_cache[k] = [(None, {f"v_{idx}"})]
+            all_supported_keys.append(k)
+
+    # Evict trees[1] and verify the exact invariant for every key
+    evicted_nodes = tree_node_sets[1]
+    _evict_tree_scopes(trees[1])
+    for k in all_supported_keys:
+        refs_evicted = _key_references_scope_nodes(k, evicted_nodes)
+        if refs_evicted:
+            assert k not in _scope_cell_info_cache
+            assert k not in _scope_closures_cache
+        else:
+            assert k in _scope_cell_info_cache
+            assert k in _scope_closures_cache
+
 
 
 

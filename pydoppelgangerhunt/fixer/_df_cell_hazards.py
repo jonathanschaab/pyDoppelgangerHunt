@@ -320,6 +320,7 @@ def _check_sibling_closure_sharing(
     sub_mutated: AbstractSet[str],
     chain_infos: Sequence[_EnclosingFnCellInfo],
     *,
+    helper_rebound_vars: AbstractSet[str] = frozenset(),
     is_suspended: bool = False,
     unreturned_mutations: bool = False,
     skip_pre_unit_closures: bool = False,
@@ -328,7 +329,7 @@ def _check_sibling_closure_sharing(
     if not chain_infos:
         return False
     unshadowed = _collect_unshadowed_chain_closure_info(chain_infos)
-    mutated_set = set(sub_mutated)
+    mutated_set = set(sub_mutated) | set(helper_rebound_vars)
     if is_suspended and bool(mutated_set & unshadowed.concurrent_vars):
         return True
     if unreturned_mutations and bool(mutated_set & unshadowed.post_reads):
@@ -445,20 +446,29 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         ctx.unit_kind in ("comprehension", "complex_expr")
         and not ctx.is_subroutine
     )
-    expr_unit_stores_escape = ctx.is_subroutine or is_expr_unit
+    unit_stores_affect_enclosing = ctx.is_subroutine or is_expr_unit
     store_set = set(ctx.stores)
     output_set = set(ctx.outputs)
     nonlocal_set = set(ctx.nonlocals)
     unit_mutated_names = store_set | set(ctx.deleted_names)
-    expr_escaped_mutations = (
+    explicit_nonlocal_mutations: Set[str] = nonlocal_set & unit_mutated_names
+    helper_rebound_vars: Set[str] = (
+        (unit_mutated_names - explicit_nonlocal_mutations)
+        if ctx.is_subroutine
+        else set()
+    )
+    immediate_cell_mutations: Set[str] = (
         (
             _extract_comprehension_walrus_names(unit_mod)
-            | (nonlocal_set & unit_mutated_names)
+            | explicit_nonlocal_mutations
         )
         if is_expr_unit
-        else unit_mutated_names
+        else explicit_nonlocal_mutations
     )
-    if not expr_unit_stores_escape and bool(nonlocal_set & unit_mutated_names):
+    escaping_unit_mutations: Set[str] = (
+        helper_rebound_vars | immediate_cell_mutations
+    )
+    if not unit_stores_affect_enclosing and bool(explicit_nonlocal_mutations):
         return True
 
     if _has_escaped_intra_unit_global_declarations(
@@ -478,8 +488,8 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         u_end_col=u_end_col,
     )
     enc_escaping = enc_nonlocals | enc_outer_globals
-    if expr_unit_stores_escape and bool(
-        expr_escaped_mutations
+    if unit_stores_affect_enclosing and bool(
+        escaping_unit_mutations
         & (enc_outer_globals if ctx.is_subroutine else enc_escaping)
     ):
         return True
@@ -529,7 +539,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     )
 
     eff_input_set = set(ctx.inputs) | set(ctx.free_vars) | nonlocal_set
-    if expr_unit_stores_escape and bool(
+    if unit_stores_affect_enclosing and bool(
         unit_closure_reads
         & (
             (unit_mutated_names & (enc_escaping | nonlocal_set))
@@ -538,8 +548,8 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     ):
         return True
     unit_mutations = (
-        (expr_escaped_mutations | (unit_mutated_names & unit_closure_reads))
-        if expr_unit_stores_escape
+        (escaping_unit_mutations | (unit_mutated_names & unit_closure_reads))
+        if unit_stores_affect_enclosing
         else set()
     )
 
@@ -604,13 +614,9 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
 
     captured_candidates = intra_closure_reads & (
         eff_input_set
-        | ((store_set | output_set) if expr_unit_stores_escape else set())
+        | ((store_set | output_set) if unit_stores_affect_enclosing else set())
     )
-    sub_mutated = (
-        expr_escaped_mutations
-        if expr_unit_stores_escape
-        else (nonlocal_set & unit_mutated_names)
-    )
+    sub_mutated = helper_rebound_vars | immediate_cell_mutations
     return (
         _check_intra_unit_nonlocal_mutators(
             ctx.candidate_stmts,
@@ -633,6 +639,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
             eff_input_set,
             sub_mutated,
             chain_infos,
+            helper_rebound_vars=helper_rebound_vars,
             is_suspended=(is_suspended or is_expr_unit)
             and not ctx.skip_pre_unit_closures,
             unreturned_mutations=is_expr_unit,

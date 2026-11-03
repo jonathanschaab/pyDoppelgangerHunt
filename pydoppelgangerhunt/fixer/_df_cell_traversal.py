@@ -453,44 +453,96 @@ def _is_exception_suppressing_with(
     return False
 
 
-def _is_non_raising_expr(expr: Optional[ast.AST]) -> bool:
+def _is_non_raising_bool_expr(
+    expr: Optional[ast.AST],
+    safe_names: AbstractSet[str] = frozenset(),
+    safe_bool_names: AbstractSet[str] = frozenset(),
+) -> bool:
+    """Returns True if evaluating bool(expr) cannot raise an exception."""
+    return _is_non_raising_expr(
+        expr, safe_names, safe_bool_names, require_bool_safe=True
+    )
+
+
+def _is_non_raising_expr(
+    expr: Optional[ast.AST],
+    safe_names: AbstractSet[str] = frozenset(),
+    safe_bool_names: AbstractSet[str] = frozenset(),
+    *,
+    require_bool_safe: bool = False,
+) -> bool:
     """Returns True if evaluating expr cannot raise an exception caught by suppress(...)."""
-    if expr is None or isinstance(expr, (ast.Constant, ast.Name)):
+    if expr is None or isinstance(expr, ast.Constant):
         return True
+    if isinstance(expr, ast.Name):
+        return expr.id in (safe_bool_names if require_bool_safe else safe_names)
     if isinstance(expr, ast.Lambda):
         return all(
-            _is_non_raising_expr(d)
+            _is_non_raising_expr(d, safe_names, safe_bool_names)
             for d in (
                 *expr.args.defaults,
                 *(d for d in expr.args.kw_defaults if d is not None),
             )
         )
     if isinstance(expr, (ast.Tuple, ast.List)):
-        return all(_is_non_raising_expr(e) for e in expr.elts)
+        return not any(isinstance(e, ast.Starred) for e in expr.elts) and all(
+            _is_non_raising_expr(e, safe_names, safe_bool_names)
+            for e in expr.elts
+        )
     if isinstance(expr, ast.UnaryOp):
         if isinstance(expr.op, ast.Not):
-            return _is_non_raising_expr(expr.operand)
+            return _is_non_raising_bool_expr(
+                expr.operand, safe_names, safe_bool_names
+            )
+        if isinstance(expr.op, ast.Invert):
+            return isinstance(expr.operand, ast.Constant) and isinstance(
+                expr.operand.value, (int, bool)
+            )
         return (
-            isinstance(expr.op, (ast.UAdd, ast.USub, ast.Invert))
+            isinstance(expr.op, (ast.UAdd, ast.USub))
             and isinstance(expr.operand, ast.Constant)
             and isinstance(expr.operand.value, (int, float, bool))
         )
     if isinstance(expr, ast.BoolOp):
-        return all(_is_non_raising_expr(v) for v in expr.values)
+        return bool(expr.values) and (
+            all(
+                _is_non_raising_bool_expr(v, safe_names, safe_bool_names)
+                for v in expr.values[:-1]
+            )
+            and _is_non_raising_expr(
+                expr.values[-1],
+                safe_names,
+                safe_bool_names,
+                require_bool_safe=require_bool_safe,
+            )
+        )
     if isinstance(expr, ast.IfExp):
-        return all(
-            _is_non_raising_expr(sub)
-            for sub in (expr.test, expr.body, expr.orelse)
+        return _is_non_raising_bool_expr(
+            expr.test, safe_names, safe_bool_names
+        ) and all(
+            _is_non_raising_expr(
+                b,
+                safe_names,
+                safe_bool_names,
+                require_bool_safe=require_bool_safe,
+            )
+            for b in (expr.body, expr.orelse)
         )
     if isinstance(expr, ast.Compare):
         return (
             all(isinstance(op, (ast.Is, ast.IsNot)) for op in expr.ops)
-            and _is_non_raising_expr(expr.left)
-            and all(_is_non_raising_expr(c) for c in expr.comparators)
+            and _is_non_raising_expr(expr.left, safe_names, safe_bool_names)
+            and all(
+                _is_non_raising_expr(c, safe_names, safe_bool_names)
+                for c in expr.comparators
+            )
         )
     if isinstance(expr, ast.NamedExpr):
         return isinstance(expr.target, ast.Name) and _is_non_raising_expr(
-            expr.value
+            expr.value,
+            safe_names,
+            safe_bool_names,
+            require_bool_safe=require_bool_safe,
         )
     return False
 
@@ -517,43 +569,57 @@ def _is_non_raising_store_target(
     return False
 
 
-def _stmt_cannot_raise_in_suppress(stmt: ast.AST) -> bool:
+def _stmt_cannot_raise_in_suppress(
+    stmt: ast.AST,
+    safe_names: AbstractSet[str] = frozenset(),
+    safe_bool_names: AbstractSet[str] = frozenset(),
+) -> bool:
     """Returns True if stmt executes and completes without raising a catchable exception."""
     if isinstance(
         stmt, (ast.Pass, ast.Global, ast.Nonlocal, ast.Break, ast.Continue)
     ):
         return True
     if isinstance(stmt, ast.Return):
-        return _is_non_raising_expr(stmt.value)
+        return _is_non_raising_expr(stmt.value, safe_names, safe_bool_names)
     if isinstance(stmt, ast.Expr):
-        return _is_non_raising_expr(stmt.value)
+        return _is_non_raising_expr(stmt.value, safe_names, safe_bool_names)
     if isinstance(stmt, ast.Assign):
         return (
             stmt.value is not None
-            and _is_non_raising_expr(stmt.value)
+            and _is_non_raising_expr(stmt.value, safe_names, safe_bool_names)
             and all(
                 _is_non_raising_store_target(t, stmt.value)
                 for t in stmt.targets
             )
         )
     if isinstance(stmt, ast.AnnAssign):
-        return _is_non_raising_expr(stmt.annotation) and (
+        return _is_non_raising_expr(
+            stmt.annotation, safe_names, safe_bool_names
+        ) and (
             stmt.value is None
             or (
-                _is_non_raising_expr(stmt.value)
+                _is_non_raising_expr(stmt.value, safe_names, safe_bool_names)
                 and _is_non_raising_store_target(stmt.target, stmt.value)
             )
         )
     if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return not stmt.decorator_list and all(
-            _is_non_raising_expr(h)
+            _is_non_raising_expr(h, safe_names, safe_bool_names)
             for h in iter_nested_scope_header_nodes(stmt)
         )
     if isinstance(stmt, ast.If):
         return (
-            _is_non_raising_expr(stmt.test)
-            and all(_stmt_cannot_raise_in_suppress(s) for s in stmt.body)
-            and all(_stmt_cannot_raise_in_suppress(s) for s in stmt.orelse)
+            _is_non_raising_bool_expr(stmt.test, safe_names, safe_bool_names)
+            and not _split_suppress_with_body(
+                stmt.body,
+                safe_names=safe_names,
+                safe_bool_names=safe_bool_names,
+            )[1]
+            and not _split_suppress_with_body(
+                stmt.orelse,
+                safe_names=safe_names,
+                safe_bool_names=safe_bool_names,
+            )[1]
         )
     if isinstance(stmt, (ast.With, ast.AsyncWith)):
         return _is_exception_suppressing_with(stmt) and all(
@@ -566,12 +632,38 @@ def _stmt_cannot_raise_in_suppress(stmt: ast.AST) -> bool:
 
 def _split_suppress_with_body(
     body: Sequence[ast.stmt],
+    *,
+    safe_names: AbstractSet[str] = frozenset(),
+    safe_bool_names: AbstractSet[str] = frozenset(),
 ) -> Tuple[List[ast.stmt], List[ast.stmt]]:
     """Splits a suppressing with-block body into (non_raising_prefix, potentially_raising_suffix)."""
     safe_prefix: List[ast.stmt] = []
+    cur_safe: Set[str] = set(safe_names)
+    cur_bool: Set[str] = set(safe_bool_names)
     for idx, b_stmt in enumerate(body):
-        if _stmt_cannot_raise_in_suppress(b_stmt):
+        if _stmt_cannot_raise_in_suppress(b_stmt, cur_safe, cur_bool):
             safe_prefix.append(b_stmt)
+            if isinstance(b_stmt, ast.Assign):
+                val_bool = _is_non_raising_bool_expr(
+                    b_stmt.value, cur_safe, cur_bool
+                )
+                for tgt in b_stmt.targets:
+                    t_names = _extract_definite_target_names(tgt)
+                    cur_safe.update(t_names)
+                    if val_bool:
+                        cur_bool.update(t_names)
+                    else:
+                        cur_bool.difference_update(t_names)
+            elif isinstance(b_stmt, ast.AnnAssign) and b_stmt.value is not None:
+                t_names = _extract_definite_target_names(b_stmt.target)
+                cur_safe.update(t_names)
+                if _is_non_raising_bool_expr(b_stmt.value, cur_safe, cur_bool):
+                    cur_bool.update(t_names)
+                else:
+                    cur_bool.difference_update(t_names)
+            elif isinstance(b_stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                cur_safe.add(b_stmt.name)
+                cur_bool.add(b_stmt.name)
         else:
             return safe_prefix, list(body[idx:])
     return safe_prefix, []
