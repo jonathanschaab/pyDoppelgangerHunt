@@ -53,20 +53,79 @@ _SCOPE_ROOT_TYPES: Tuple[type, ...] = (
 )
 
 
+_PERMITTED_PARAM_SCALAR_TYPES: Tuple[type, ...] = (
+    str,
+    int,
+    float,
+    bool,
+    bytes,
+    type(None),
+)
+_INSPECTED_CONTAINER_TYPES: Tuple[type, ...] = (
+    tuple,
+    frozenset,
+    list,
+    set,
+    dict,
+)
+
+
 def _params_contain_ast(params: Tuple[Any, ...]) -> bool:
-    """Checks whether any element or nested tuple/frozenset in params is an ast.AST node."""
+    """Checks recursively whether any element or nested container in params is an ast.AST node."""
     stack: List[Any] = list(params)
     while stack:
         curr = stack.pop()
         if isinstance(curr, ast.AST):
             return True
-        if isinstance(curr, (tuple, frozenset)):
+        if isinstance(curr, dict):
+            for k, v in curr.items():
+                if isinstance(k, ast.AST) or isinstance(v, ast.AST):
+                    return True
+                if isinstance(k, _INSPECTED_CONTAINER_TYPES):
+                    stack.append(k)
+                if isinstance(v, _INSPECTED_CONTAINER_TYPES):
+                    stack.append(v)
+        elif isinstance(curr, (tuple, frozenset, list, set)):
             for elem in curr:
                 if isinstance(elem, ast.AST):
                     return True
-                if isinstance(elem, (tuple, frozenset)):
+                if isinstance(elem, _INSPECTED_CONTAINER_TYPES):
                     stack.append(elem)
     return False
+
+
+def _validate_scope_cache_params(params: Any) -> None:
+    """Enforces that _ScopeCacheKey.params recursively contains only AST-free immutable values."""
+    if not isinstance(params, tuple):
+        raise TypeError(
+            f"_ScopeCacheKey.params must be a tuple; got {type(params).__name__}"
+        )
+    stack: List[Any] = list(params)
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, ast.AST):
+            raise ValueError(
+                "_ScopeCacheKey.params must not contain ast.AST nodes; use owner or aux_ast_nodes"
+            )
+        if isinstance(curr, _PERMITTED_PARAM_SCALAR_TYPES):
+            continue
+        if isinstance(curr, (tuple, frozenset)):
+            for elem in curr:
+                if isinstance(elem, ast.AST):
+                    raise ValueError(
+                        "_ScopeCacheKey.params must not contain ast.AST nodes; use owner or aux_ast_nodes"
+                    )
+                if not isinstance(elem, _PERMITTED_PARAM_SCALAR_TYPES):
+                    stack.append(elem)
+            continue
+        if isinstance(curr, (list, set, dict)) and _params_contain_ast((curr,)):
+            raise ValueError(
+                "_ScopeCacheKey.params must not contain ast.AST nodes; use owner or aux_ast_nodes"
+            )
+        raise TypeError(
+            "_ScopeCacheKey.params only permits immutable scalars, tuples, and frozensets; "
+            f"got {type(curr).__name__}"
+        )
 
 
 class _BaseScopeCacheKey(NamedTuple):
@@ -90,22 +149,33 @@ class _ScopeCacheKey(_BaseScopeCacheKey):
         params: Tuple[Any, ...] = (),
         aux_ast_nodes: Tuple[ast.AST, ...] = (),
     ) -> _ScopeCacheKey:
-        if params and _params_contain_ast(params):
-            raise ValueError(
-                "_ScopeCacheKey.params must not contain ast.AST nodes; use owner or aux_ast_nodes"
+        if not isinstance(owner, ast.AST):
+            raise TypeError("_ScopeCacheKey.owner must be an ast.AST node")
+        if params:
+            _validate_scope_cache_params(params)
+        elif not isinstance(params, tuple):
+            raise TypeError(
+                f"_ScopeCacheKey.params must be a tuple; got {type(params).__name__}"
+            )
+        if not isinstance(aux_ast_nodes, tuple) or not all(
+            isinstance(n, ast.AST) for n in aux_ast_nodes
+        ):
+            raise TypeError(
+                "_ScopeCacheKey.aux_ast_nodes must be a tuple of ast.AST nodes"
             )
         return super().__new__(cls, owner, kind, params, aux_ast_nodes)
 
-    @classmethod
-    def make_trusted(
-        cls,
-        owner: ast.AST,
-        kind: str,
-        params: Tuple[Any, ...] = (),
-        aux_ast_nodes: Tuple[ast.AST, ...] = (),
-    ) -> _ScopeCacheKey:
-        """Constructs a key when params have already been verified AST-free."""
-        return super().__new__(cls, owner, kind, params, aux_ast_nodes)
+
+def _make_trusted_scope_cache_key(
+    owner: ast.AST,
+    kind: str,
+    params: Tuple[Any, ...] = (),
+    aux_ast_nodes: Tuple[ast.AST, ...] = (),
+) -> _ScopeCacheKey:
+    """Internal constructor for _ScopeCacheKey when params are pre-validated AST-free."""
+    return _BaseScopeCacheKey.__new__(
+        _ScopeCacheKey, owner, kind, params, aux_ast_nodes
+    )
 
 
 def _key_references_scope_nodes(

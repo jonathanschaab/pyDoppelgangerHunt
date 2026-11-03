@@ -25,6 +25,7 @@ from pydoppelgangerhunt.fixer._df_cache import (
     _ScopeCacheKey,
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
+    _make_trusted_scope_cache_key,
     _params_contain_ast,
     _scope_cell_info_cache,
 )
@@ -98,10 +99,10 @@ def _make_scope_ctx_cache_key(
             "_ScopeCacheKey.params must not contain ast.AST nodes; use owner or aux_ast_nodes"
         )
     if scope_ctx is None:
-        return _ScopeCacheKey.make_trusted(
+        return _make_trusted_scope_cache_key(
             owner, kind, params=(*extra_params, None)
         )
-    return _ScopeCacheKey.make_trusted(
+    return _make_trusted_scope_cache_key(
         owner,
         kind,
         params=(*extra_params, *scope_ctx.cache_fingerprint()),
@@ -261,6 +262,155 @@ def _stmt_dump_set(stmts: Sequence[ast.AST], idx: int) -> Set[str]:
     return dumps
 
 
+class _IndexedSpanNode(NamedTuple):
+    """Pre-indexed AST node entry for fast line/column span resolution."""
+
+    node: ast.AST
+    n_start: int
+    n_end: int
+    n_col: Optional[int]
+    n_end_col: Optional[int]
+    req_u_start_le: int
+    req_u_end_ge: int
+
+
+class _SpanLineIndex:
+    """Cached per-tree line index and lazy AST dump cache for O(1) boundary lookups."""
+
+    __slots__ = (
+        "by_start_line",
+        "by_end_line",
+        "stmts_by_start_line",
+        "stmts_by_end_line",
+        "missing_end_lineno_starts",
+        "missing_col_spans",
+        "_dump_cache",
+    )
+
+    def __init__(self, root_node: ast.AST) -> None:
+        self.by_start_line: Dict[int, List[_IndexedSpanNode]] = {}
+        self.by_end_line: Dict[int, List[_IndexedSpanNode]] = {}
+        self.stmts_by_start_line: Dict[int, List[ast.stmt]] = {}
+        self.stmts_by_end_line: Dict[int, List[Tuple[ast.stmt, int, bool]]] = {}
+        missing_end_starts: List[int] = []
+        missing_cols: List[Tuple[int, int]] = []
+        self._dump_cache: Dict[int, str] = {}
+
+        stack: List[Tuple[ast.AST, int, int]] = [(root_node, 0, 10**9)]
+        while stack:
+            node, anc_max_start, anc_min_end = stack.pop()
+            n_start, n_col = _node_earliest_start_pos(node)
+            raw_end = getattr(node, "end_lineno", None)
+            n_end_col = getattr(node, "end_col_offset", None)
+            is_stmt_or_expr = isinstance(node, (ast.stmt, ast.expr))
+            if is_stmt_or_expr and isinstance(n_start, int):
+                if not isinstance(raw_end, int):
+                    missing_end_starts.append(n_start)
+                elif not isinstance(n_col, int) or not isinstance(
+                    n_end_col, int
+                ):
+                    missing_cols.append((n_start, raw_end))
+
+            n_end = raw_end if isinstance(raw_end, int) else n_start
+            if isinstance(n_start, int) and isinstance(n_end, int):
+                req_start_le = (
+                    n_start if n_start < anc_min_end else anc_min_end
+                )
+                req_end_ge = (
+                    n_end if n_end > anc_max_start else anc_max_start
+                )
+                entry = _IndexedSpanNode(
+                    node=node,
+                    n_start=n_start,
+                    n_end=n_end,
+                    n_col=n_col if isinstance(n_col, int) else None,
+                    n_end_col=n_end_col if isinstance(n_end_col, int) else None,
+                    req_u_start_le=req_start_le,
+                    req_u_end_ge=req_end_ge,
+                )
+                self.by_start_line.setdefault(n_start, []).append(entry)
+                if n_end != n_start:
+                    self.by_end_line.setdefault(n_end, []).append(entry)
+                if (
+                    isinstance(node, ast.stmt)
+                    and isinstance(raw_end, int)
+                    and isinstance(n_col, int)
+                    and isinstance(n_end_col, int)
+                ):
+                    self.stmts_by_start_line.setdefault(n_start, []).append(
+                        node
+                    )
+                    has_compound_child = n_start < raw_end and any(
+                        isinstance(ch, ast.stmt)
+                        or type(ch).__name__ in ("ExceptHandler", "match_case")
+                        for ch in ast.iter_child_nodes(node)
+                    )
+                    self.stmts_by_end_line.setdefault(raw_end, []).append(
+                        (node, n_start, has_compound_child)
+                    )
+                next_max_start = (
+                    n_start if n_start > anc_max_start else anc_max_start
+                )
+                next_min_end = n_end if n_end < anc_min_end else anc_min_end
+            else:
+                next_max_start = anc_max_start
+                next_min_end = anc_min_end
+
+            children = list(ast.iter_child_nodes(node))
+            for ch in reversed(children):
+                stack.append((ch, next_max_start, next_min_end))
+
+        self.missing_end_lineno_starts: Tuple[int, ...] = tuple(
+            missing_end_starts
+        )
+        self.missing_col_spans: Tuple[Tuple[int, int], ...] = tuple(
+            missing_cols
+        )
+
+    def get_dump(self, node: ast.AST) -> str:
+        """Returns the cached ast.dump(node) string."""
+        nid = id(node)
+        cached = self._dump_cache.get(nid)
+        if cached is None:
+            cached = ast.dump(node)
+            self._dump_cache[nid] = cached
+        return cached
+
+    def iter_boundary_entries(
+        self, u_start: int, u_end: int
+    ) -> Sequence[_IndexedSpanNode]:
+        """Returns indexed AST entries starting at u_start or ending at u_end."""
+        start_entries = self.by_start_line.get(u_start, ())
+        if u_start == u_end:
+            extra_end = self.by_end_line.get(u_end, ())
+            if not extra_end:
+                return start_entries
+            return [*start_entries, *extra_end]
+        end_entries = self.by_end_line.get(u_end, ())
+        end_same_line = self.by_start_line.get(u_end, ())
+        if not end_entries and not end_same_line:
+            return start_entries
+        seen_ids = {id(e.node) for e in start_entries}
+        combined = list(start_entries)
+        for entry in (*end_entries, *end_same_line):
+            if entry.n_end == u_end and id(entry.node) not in seen_ids:
+                seen_ids.add(id(entry.node))
+                combined.append(entry)
+        return combined
+
+
+def _get_span_line_index(root_node: ast.AST) -> _SpanLineIndex:
+    """Returns or builds the cached _SpanLineIndex for root_node."""
+    return cast(
+        _SpanLineIndex,
+        _get_or_compute_scope_cached(
+            _scope_cell_info_cache,
+            _make_trusted_scope_cache_key(root_node, "span_line_index"),
+            lambda: _SpanLineIndex(root_node),
+        ),
+    )
+
+
 def _pick_inferred_col(
     explicit_col: Optional[int],
     matches: Sequence[Tuple[int, int]],
@@ -304,117 +454,120 @@ def _resolve_unit_col_bounds(
         or not candidate_stmts
     ):
         return u_start_col, u_end_col
+    single_stmt = len(candidate_stmts) == 1
     first_dumps = (
         _stmt_dump_set(candidate_stmts, 0) if u_start_col is None else set()
     )
-    last_dumps = (
-        _stmt_dump_set(candidate_stmts, -1) if u_end_col is None else set()
-    )
+    if u_end_col is not None:
+        last_dumps: Set[str] = set()
+    elif single_stmt and u_start_col is None:
+        last_dumps = first_dumps
+    else:
+        last_dumps = _stmt_dump_set(candidate_stmts, -1)
+
+    line_index = _get_span_line_index(mod_tree)
     start_matches: List[Tuple[int, int]] = []
     end_matches: List[Tuple[int, int]] = []
     span_stmts: List[Tuple[int, int]] = []
-    single_stmt = len(candidate_stmts) == 1
-    walk_stack: List[ast.AST] = [mod_tree]
-    while walk_stack:
-        node = walk_stack.pop()
-        n_start, n_col = _node_earliest_start_pos(node)
-        n_end = getattr(node, "end_lineno", n_start)
-        n_end_col = getattr(node, "end_col_offset", None)
-        if isinstance(n_start, int) and isinstance(n_end, int):
-            if n_end < u_start or n_start > u_end:
-                continue
-            walk_stack.extend(reversed(list(ast.iter_child_nodes(node))))
-            if (
-                isinstance(node, ast.stmt)
-                and n_start == u_start
-                and n_end == u_end
-                and isinstance(n_col, int)
-                and isinstance(n_end_col, int)
-                and not (
-                    single_stmt
-                    and isinstance(candidate_stmts[0], ast.Expr)
-                    and not isinstance(node, ast.Expr)
-                )
-            ):
-                span_stmts.append((n_col, n_end_col))
-            if not (u_start <= n_start and n_end <= u_end):
-                continue
-            if (
-                u_start_col is not None
-                and n_start == u_start
-                and isinstance(n_col, int)
-                and n_col < u_start_col
-            ):
-                continue
-            if (
-                u_end_col is not None
-                and n_end == u_end
-                and isinstance(n_end_col, int)
-                and n_end_col > u_end_col
-            ):
-                continue
-            need_start = (
-                bool(first_dumps)
-                and n_start == u_start
-                and isinstance(n_col, int)
+    for entry in line_index.iter_boundary_entries(u_start, u_end):
+        if not (
+            u_start <= entry.req_u_start_le and entry.req_u_end_ge <= u_end
+        ):
+            continue
+        node = entry.node
+        n_start = entry.n_start
+        n_end = entry.n_end
+        n_col = entry.n_col
+        n_end_col = entry.n_end_col
+        if (
+            isinstance(node, ast.stmt)
+            and n_start == u_start
+            and n_end == u_end
+            and isinstance(n_col, int)
+            and isinstance(n_end_col, int)
+            and not (
+                single_stmt
+                and isinstance(candidate_stmts[0], ast.Expr)
+                and not isinstance(node, ast.Expr)
             )
-            need_end = (
-                bool(last_dumps)
-                and n_end == u_end
-                and isinstance(n_end_col, int)
-            )
-            if need_start or need_end:
-                dumped = ast.dump(node)
-                base_rank = 1 if isinstance(node, ast.Expr) else 0
-                for (
-                    need_flag,
-                    col_val,
-                    dumps,
-                    opp_col,
-                    opp_n_ln,
-                    opp_u_ln,
-                    opp_n_col,
-                    matches_out,
-                ) in (
-                    (
-                        need_start,
-                        n_col,
-                        first_dumps,
-                        u_end_col,
-                        n_end,
-                        u_end,
-                        n_end_col,
-                        start_matches,
-                    ),
-                    (
-                        need_end,
-                        n_end_col,
-                        last_dumps,
-                        u_start_col,
-                        n_start,
-                        u_start,
-                        n_col,
-                        end_matches,
-                    ),
+        ):
+            span_stmts.append((n_col, n_end_col))
+        if not (u_start <= n_start and n_end <= u_end):
+            continue
+        if (
+            u_start_col is not None
+            and n_start == u_start
+            and isinstance(n_col, int)
+            and n_col < u_start_col
+        ):
+            continue
+        if (
+            u_end_col is not None
+            and n_end == u_end
+            and isinstance(n_end_col, int)
+            and n_end_col > u_end_col
+        ):
+            continue
+        need_start = (
+            bool(first_dumps)
+            and n_start == u_start
+            and isinstance(n_col, int)
+        )
+        need_end = (
+            bool(last_dumps)
+            and n_end == u_end
+            and isinstance(n_end_col, int)
+        )
+        if need_start or need_end:
+            dumped = line_index.get_dump(node)
+            base_rank = 1 if isinstance(node, ast.Expr) else 0
+            for (
+                need_flag,
+                col_val,
+                dumps,
+                opp_col,
+                opp_n_ln,
+                opp_u_ln,
+                opp_n_col,
+                matches_out,
+            ) in (
+                (
+                    need_start,
+                    n_col,
+                    first_dumps,
+                    u_end_col,
+                    n_end,
+                    u_end,
+                    n_end_col,
+                    start_matches,
+                ),
+                (
+                    need_end,
+                    n_end_col,
+                    last_dumps,
+                    u_start_col,
+                    n_start,
+                    u_start,
+                    n_col,
+                    end_matches,
+                ),
+            ):
+                if (
+                    need_flag
+                    and isinstance(col_val, int)
+                    and dumped in dumps
                 ):
-                    if (
-                        need_flag
-                        and isinstance(col_val, int)
-                        and dumped in dumps
-                    ):
-                        rank = (
-                            base_rank - 2
-                            if (
-                                single_stmt
-                                and opp_col is not None
-                                and opp_n_ln == opp_u_ln
-                                and opp_n_col == opp_col
-                            )
-                            else base_rank
+                    rank = (
+                        base_rank - 2
+                        if (
+                            single_stmt
+                            and opp_col is not None
+                            and opp_n_ln == opp_u_ln
+                            and opp_n_col == opp_col
                         )
-                        matches_out.append((rank, col_val))
-        else:
-            walk_stack.extend(reversed(list(ast.iter_child_nodes(node))))
+                        else base_rank
+                    )
+                    matches_out.append((rank, col_val))
 
     return (
         _pick_inferred_col(
@@ -435,38 +588,45 @@ def _has_unresolved_span_bounds(
     candidate_stmts: Sequence[ast.AST] = (),
 ) -> bool:
     """Returns True if boundary columns on multi-statement/sub-expression lines are unresolved or AST end coords are missing."""
-    start_line_stmts: List[ast.stmt] = []
-    end_line_stmts: List[ast.stmt] = []
-    for node in ast.walk(scope_node):
+    line_index = _get_span_line_index(scope_node)
+    if any(ln <= u_end for ln in line_index.missing_end_lineno_starts):
+        return True
+    if any(
+        not (n_end < u_start or n_start > u_end)
+        for n_start, n_end in line_index.missing_col_spans
+    ):
+        return True
+    for entry in line_index.iter_boundary_entries(u_start, u_end):
+        node = entry.node
         if not isinstance(node, (ast.stmt, ast.expr)):
             continue
-        n_start, n_col = _node_earliest_start_pos(node)
-        if not isinstance(n_start, int):
-            continue
-        n_end = getattr(node, "end_lineno", None)
-        n_end_col = getattr(node, "end_col_offset", None)
-        if not isinstance(n_end, int):
-            if n_start <= u_end:
-                return True
-            continue
-        if n_end < u_start or n_start > u_end:
-            continue
-        if not isinstance(n_col, int) or not isinstance(n_end_col, int):
+        live_end = getattr(node, "end_lineno", None)
+        live_end_col = getattr(node, "end_col_offset", None)
+        if not isinstance(live_end, int) or not isinstance(live_end_col, int):
             return True
-        if isinstance(node, ast.stmt) and not _node_strictly_encloses_bounds(
-            node, u_start, u_end, u_start_col=u_start_col, u_end_col=u_end_col
-        ):
-            if n_start == u_start:
-                start_line_stmts.append(node)
-            if n_end == u_end and not (
-                n_start < u_end
-                and any(
-                    isinstance(ch, ast.stmt)
-                    or type(ch).__name__ in ("ExceptHandler", "match_case")
-                    for ch in ast.iter_child_nodes(node)
-                )
-            ):
-                end_line_stmts.append(node)
+    if u_start_col is not None and u_end_col is not None:
+        return False
+
+    start_line_stmts: List[ast.stmt] = [
+        stmt
+        for stmt in line_index.stmts_by_start_line.get(u_start, ())
+        if isinstance(getattr(stmt, "end_lineno", None), int)
+        and getattr(stmt, "end_lineno", 0) >= u_start
+        and not _node_strictly_encloses_bounds(
+            stmt, u_start, u_end, u_start_col=u_start_col, u_end_col=u_end_col
+        )
+    ]
+    end_line_stmts: List[ast.stmt] = [
+        stmt
+        for stmt, n_start, has_compound_child in line_index.stmts_by_end_line.get(
+            u_end, ()
+        )
+        if n_start <= u_end
+        and not has_compound_child
+        and not _node_strictly_encloses_bounds(
+            stmt, u_start, u_end, u_start_col=u_start_col, u_end_col=u_end_col
+        )
+    ]
     is_expr_cand = len(candidate_stmts) == 1 and isinstance(
         candidate_stmts[0], ast.Expr
     )
@@ -477,7 +637,7 @@ def _has_unresolved_span_bounds(
             len(line_stmts) > 1
             or (
                 is_expr_cand
-                and any(ast.dump(s) != cand_dump for s in line_stmts)
+                and any(line_index.get_dump(s) != cand_dump for s in line_stmts)
             )
         )
         for col_bound, line_stmts in (
@@ -533,7 +693,7 @@ def _scope_has_invalid_lexical_declarations(
     return bool(
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
-            _ScopeCacheKey.make_trusted(
+            _make_trusted_scope_cache_key(
                 root_scope, "invalid_lex_decls", params=(is_module_rooted,)
             ),
             lambda: _walk_invalid_lexical_scope_declarations(
@@ -1631,6 +1791,103 @@ def _extract_shallow_defs(
     return defs
 
 
+def _extract_class_body_unconditional_def_names(
+    cls_node: ast.ClassDef,
+) -> frozenset[str]:
+    """Returns class-level def/class names unconditionally bound before any load/call/del in cls_node.body."""
+    bound_before_use: Set[str] = set()
+    used_before_bind: Set[str] = set()
+    deleted_in_body: Set[str] = set()
+    for stmt in cls_node.body:
+        s_loads, s_calls = _extract_shallow_loads_and_calls([stmt])
+        for ref in s_loads | s_calls:
+            if ref not in bound_before_use:
+                used_before_bind.add(ref)
+        for sub in ast.walk(stmt):
+            if isinstance(sub, ast.Delete):
+                for tgt in sub.targets:
+                    if isinstance(tgt, ast.Name):
+                        deleted_in_body.add(tgt.id)
+        if isinstance(
+            stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            if stmt.name not in used_before_bind:
+                bound_before_use.add(stmt.name)
+    return frozenset(bound_before_use - deleted_in_body)
+
+
+def _propagate_top_cell_defs(
+    escaped_top_names: Set[str],
+    executed_top_names: Set[str],
+    scope_cell_defs: Mapping[Tuple[int, str], Sequence[_NamedScopeNode]],
+    escaped_def_ids: Set[int],
+    executed_def_ids: Set[int],
+) -> bool:
+    """Propagates escaped_top_names and executed_top_names into root scope_cell_defs."""
+    changed = False
+    for name in executed_top_names | escaped_top_names:
+        mark_esc = name in escaped_top_names
+        for d_node in scope_cell_defs.get((0, name), ()):
+            did = id(d_node)
+            if did not in executed_def_ids:
+                executed_def_ids.add(did)
+                changed = True
+            if (
+                mark_esc or isinstance(d_node, ast.ClassDef)
+            ) and did not in escaped_def_ids:
+                escaped_def_ids.add(did)
+                changed = True
+    return changed
+
+
+def _activate_fn_global_and_nonlocal_defs(
+    nid: int,
+    global_defs_by_fn: Mapping[int, Sequence[Tuple[str, _NamedScopeNode]]],
+    nonlocal_defs_by_fn: Mapping[
+        int, Sequence[Tuple[int, str, _NamedScopeNode]]
+    ],
+    scope_cell_defs: Dict[Tuple[int, str], List[_NamedScopeNode]],
+    escaped_top_names: Set[str],
+    escaped_def_ids: Set[int],
+    executed_def_ids: Set[int],
+) -> bool:
+    """Activates global and nonlocal nested definitions inside an executed function nid."""
+    changed = False
+    for g_name, g_node in global_defs_by_fn.get(nid, ()):
+        gid = id(g_node)
+        cell_list = scope_cell_defs.setdefault((0, g_name), [])
+        if g_node not in cell_list:
+            cell_list.append(g_node)
+            changed = True
+        if gid not in escaped_def_ids:
+            escaped_def_ids.add(gid)
+            changed = True
+        if gid not in executed_def_ids:
+            executed_def_ids.add(gid)
+            changed = True
+        if g_name not in escaped_top_names:
+            escaped_top_names.add(g_name)
+            changed = True
+    for target_origin, nl_name, nl_node in nonlocal_defs_by_fn.get(nid, ()):
+        nl_id = id(nl_node)
+        eff_origin = 0 if target_origin < 0 else target_origin
+        cell_list = scope_cell_defs.setdefault((eff_origin, nl_name), [])
+        if nl_node not in cell_list:
+            cell_list.append(nl_node)
+            changed = True
+        if target_origin < 0 or target_origin in escaped_def_ids:
+            if nl_id not in escaped_def_ids:
+                escaped_def_ids.add(nl_id)
+                changed = True
+            if nl_id not in executed_def_ids:
+                executed_def_ids.add(nl_id)
+                changed = True
+            if target_origin < 0 and nl_name not in escaped_top_names:
+                escaped_top_names.add(nl_name)
+                changed = True
+    return changed
+
+
 def _collect_escaped_and_executed_intra_unit_defs(
     candidate_stmts: Sequence[ast.stmt],
     initial_escaped: AbstractSet[str],
@@ -1642,13 +1899,21 @@ def _collect_escaped_and_executed_intra_unit_defs(
     scope_cell_defs: Dict[Tuple[int, str], List[_NamedScopeNode]] = {
         (0, name): list(nodes) for name, nodes in root_defs.items()
     }
-    root_origins: Dict[str, int] = {name: 0 for name in root_defs}
+    unit_mod = ast.Module(body=list(candidate_stmts), type_ignores=[])
+    top_bound_names = (
+        _extract_single_node_local_names(unit_mod)
+        - _extract_direct_nonlocals(unit_mod, is_global=False)
+        - _extract_direct_nonlocals(unit_mod, is_global=True)
+    ) | set(root_defs.keys())
+    root_origins: Dict[str, int] = {name: 0 for name in top_bound_names}
     all_def_nodes: List[_NamedScopeNode] = []
     defs_by_name: Dict[str, List[_NamedScopeNode]] = {}
     direct_children: Dict[int, List[_NamedScopeNode]] = {}
     body_origins: Dict[int, Dict[str, int]] = {}
     class_local_defs: Dict[int, Dict[str, Tuple[_NamedScopeNode, ...]]] = {}
+    class_uncond_defs: Dict[int, frozenset[str]] = {}
     global_defs_by_fn: Dict[int, List[Tuple[str, _NamedScopeNode]]] = {}
+    nonlocal_defs_by_fn: Dict[int, List[Tuple[int, str, _NamedScopeNode]]] = {}
     shadowed_map: Dict[int, frozenset[str]] = {}
 
     scope_stack: List[
@@ -1677,7 +1942,9 @@ def _collect_escaped_and_executed_intra_unit_defs(
             class_local_defs[nid] = {
                 k: tuple(v) for k, v in c_defs.items()
             }
-            shadowed_map[nid] = shadowed_from_root | frozenset(c_defs.keys())
+            uncond_cls = _extract_class_body_unconditional_def_names(d_node)
+            class_uncond_defs[nid] = uncond_cls
+            shadowed_map[nid] = shadowed_from_root | uncond_cls
             for c_node in c_list:
                 scope_stack.append(
                     (c_node, parent_origins, shadowed_from_root)
@@ -1700,18 +1967,26 @@ def _collect_escaped_and_executed_intra_unit_defs(
                 cur_origins[g_name] = 0
             for c_name, c_nodes in c_defs.items():
                 if c_name in own_globals:
-                    cur_origins[c_name] = 0
-                    scope_cell_defs.setdefault((0, c_name), []).extend(c_nodes)
+                    cur_origins[c_name] = nid
+                    scope_cell_defs.setdefault((nid, c_name), []).extend(
+                        c_nodes
+                    )
                     for c_node in c_nodes:
                         global_defs_by_fn.setdefault(nid, []).append(
                             (c_name, c_node)
                         )
                 elif c_name in own_nonlocals:
-                    target_origin = parent_origins.get(c_name, 0)
-                    cur_origins[c_name] = target_origin
-                    scope_cell_defs.setdefault(
-                        (target_origin, c_name), []
-                    ).extend(c_nodes)
+                    target_origin = parent_origins.get(c_name, -1)
+                    cur_origins[c_name] = (
+                        0 if target_origin < 0 else target_origin
+                    )
+                    scope_cell_defs.setdefault((nid, c_name), []).extend(
+                        c_nodes
+                    )
+                    for c_node in c_nodes:
+                        nonlocal_defs_by_fn.setdefault(nid, []).append(
+                            (target_origin, c_name, c_node)
+                        )
                 else:
                     cur_origins[c_name] = nid
                     scope_cell_defs.setdefault((nid, c_name), []).extend(
@@ -1728,15 +2003,13 @@ def _collect_escaped_and_executed_intra_unit_defs(
     escaped_def_ids: Set[int] = set()
     executed_def_ids: Set[int] = set()
 
-    for name in escaped_top_names:
-        for d_node in scope_cell_defs.get((0, name), ()):
-            escaped_def_ids.add(id(d_node))
-            executed_def_ids.add(id(d_node))
-    for name in executed_top_names:
-        for d_node in scope_cell_defs.get((0, name), ()):
-            executed_def_ids.add(id(d_node))
-            if isinstance(d_node, ast.ClassDef):
-                escaped_def_ids.add(id(d_node))
+    _propagate_top_cell_defs(
+        escaped_top_names,
+        executed_top_names,
+        scope_cell_defs,
+        escaped_def_ids,
+        executed_def_ids,
+    )
     for nodes in root_defs.values():
         for d_node in nodes:
             if _is_self_escaping_def_node(d_node, use_cache=use_cache):
@@ -1748,24 +2021,28 @@ def _collect_escaped_and_executed_intra_unit_defs(
     body_info: Dict[int, Tuple[Set[str], Set[str]]] = {}
     changed = True
     while changed:
-        changed = False
+        changed = _propagate_top_cell_defs(
+            escaped_top_names,
+            executed_top_names,
+            scope_cell_defs,
+            escaped_def_ids,
+            executed_def_ids,
+        )
         for d_node in all_def_nodes:
             nid = id(d_node)
             is_esc = nid in escaped_def_ids
             is_exec = is_esc or (nid in executed_def_ids)
             if not is_exec:
                 continue
-            for g_name, g_node in global_defs_by_fn.get(nid, ()):
-                gid = id(g_node)
-                if gid not in escaped_def_ids:
-                    escaped_def_ids.add(gid)
-                    changed = True
-                if gid not in executed_def_ids:
-                    executed_def_ids.add(gid)
-                    changed = True
-                if g_name not in escaped_top_names:
-                    escaped_top_names.add(g_name)
-                    changed = True
+            changed |= _activate_fn_global_and_nonlocal_defs(
+                nid,
+                global_defs_by_fn,
+                nonlocal_defs_by_fn,
+                scope_cell_defs,
+                escaped_top_names,
+                escaped_def_ids,
+                executed_def_ids,
+            )
             for c_node in direct_children.get(nid, ()):
                 cid = id(c_node)
                 if (
@@ -1784,6 +2061,7 @@ def _collect_escaped_and_executed_intra_unit_defs(
             b_loads, b_calls = body_info[nid]
             origins_here = body_origins[nid]
             cls_defs_here = class_local_defs.get(nid, {})
+            uncond_cls_here = class_uncond_defs.get(nid, frozenset())
             shadowed_here = shadowed_map[nid]
             for ref_name in b_loads | b_calls:
                 if (
@@ -1793,7 +2071,7 @@ def _collect_escaped_and_executed_intra_unit_defs(
                 ):
                     escaped_top_names.add(ref_name)
                     changed = True
-                if ref_name in cls_defs_here:
+                if ref_name in cls_defs_here and ref_name in uncond_cls_here:
                     target_nodes: Sequence[_NamedScopeNode] = cls_defs_here[
                         ref_name
                     ]
@@ -1802,9 +2080,11 @@ def _collect_escaped_and_executed_intra_unit_defs(
                         ref_name,
                         0 if ref_name not in shadowed_here else -1,
                     )
-                    target_nodes = scope_cell_defs.get(
-                        (origin_scope, ref_name), ()
-                    )
+                    target_nodes = [
+                        *cls_defs_here.get(ref_name, ()),
+                        *scope_cell_defs.get((origin_scope, ref_name), ()),
+                        *scope_cell_defs.get((nid, ref_name), ()),
+                    ]
                 for target_node in target_nodes:
                     tid = id(target_node)
                     if (

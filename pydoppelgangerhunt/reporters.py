@@ -82,8 +82,11 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
 
     source_lines = unit.get("source_lines")
     from_source_text = False
-    if source_lines is None and unit.get("source_text") is not None:
-        source_lines = split_source_lines(str(unit["source_text"]))
+    raw_src_text = unit.get("source_text")
+    if raw_src_text is None:
+        raw_src_text = unit.get("file_source")
+    if not source_lines and raw_src_text is not None:
+        source_lines = split_source_lines(str(raw_src_text))
         from_source_text = True
 
     if source_lines is not None and isinstance(source_lines, (list, tuple)):

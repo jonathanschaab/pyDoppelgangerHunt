@@ -11709,12 +11709,17 @@ def test_multilevel_concurrent_sibling_with_definite_bindings_and_class_escape()
         ),
         (
             "with suppress(KeyError):\n    c = 1\n",
-            set(),
+            {"c"},
             False,
         ),
         (
             "with contextlib.suppress(KeyError) as sup:\n    c = 1\n",
-            {"sup"},
+            {"sup", "c"},
+            False,
+        ),
+        (
+            "with suppress(KeyError):\n    c = d['k']\n",
+            set(),
             False,
         ),
     ]
@@ -12585,6 +12590,10 @@ def test_review_round_pep227_trydel_definite_equivalence_and_cache_regressions()
         ),
         (
             "with suppress(ValueError):\n    a = 1\n",
+            {"a"},
+        ),
+        (
+            "with suppress(ValueError):\n    a = d['k']\n",
             set(),
         ),
         (
@@ -12855,6 +12864,838 @@ def test_review_round_pep227_trydel_definite_equivalence_and_cache_regressions()
     )
     assert comb_lenient["_skip_pre_unit_closures"] is True
     assert "severed_closure_cell" not in comb_lenient["control_flow_hazards"]
+
+
+def test_suppress_with_termination_and_definite_bindings() -> None:
+    """Verifies Items 2 and 3: control-flow termination vs exception suppression and non-raising definite bindings in with suppress(...)."""
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _extract_block_definite_bindings_and_term,
+    )
+    from pydoppelgangerhunt.fixer.scope import (
+        _analyze_block_assignment,
+        _block_terminates,
+    )
+
+    # Item 2: return inside with suppress(Exception) CANNOT be suppressed by __exit__
+    ret_in_suppress_src = (
+        "with suppress(Exception):\n"
+        "    return 42\n"
+        "x = 1\n"
+    )
+    ret_stmts = ast.parse(ret_in_suppress_src).body
+    assert _block_terminates([ret_stmts[0]]) is True
+    assert _block_terminates(ret_stmts) is True
+    def_ret, cond_ret = _analyze_block_assignment(ret_stmts)
+    bound_ret, term_ret = _extract_block_definite_bindings_and_term(
+        ret_stmts, None
+    )
+    assert def_ret == set()
+    assert "x" not in cond_ret
+    assert bound_ret == set()
+    assert term_ret is True
+
+    # Conversely, raise inside with suppress(Exception) CAN be suppressed by __exit__
+    raise_in_suppress_src = (
+        "with suppress(Exception):\n"
+        "    raise ValueError('boom')\n"
+        "x = 1\n"
+    )
+    raise_stmts = ast.parse(raise_in_suppress_src).body
+    assert _block_terminates([raise_stmts[0]]) is False
+    assert _block_terminates(raise_stmts) is False
+    def_raise, _ = _analyze_block_assignment(raise_stmts)
+    bound_raise, term_raise = _extract_block_definite_bindings_and_term(
+        raise_stmts, None
+    )
+    assert def_raise == {"x"}
+    assert bound_raise == {"x"}
+    assert term_raise is False
+
+    # Return after a potentially-raising statement inside with suppress(...) does NOT guarantee termination
+    risky_before_ret_src = (
+        "with suppress(KeyError):\n"
+        "    scale = d['x']\n"
+        "    return 42\n"
+        "x = 1\n"
+    )
+    risky_ret_stmts = ast.parse(risky_before_ret_src).body
+    assert _block_terminates([risky_ret_stmts[0]]) is False
+    def_rret, cond_rret = _analyze_block_assignment(risky_ret_stmts)
+    bound_rret, term_rret = _extract_block_definite_bindings_and_term(
+        risky_ret_stmts, None
+    )
+    assert def_rret == {"x"}
+    assert "scale" in cond_rret
+    assert bound_rret == {"x"}
+    assert term_rret is False
+
+    # If/else inside with suppress(...) where both branches return constants terminates
+    if_ret_suppress_src = (
+        "with suppress(Exception):\n"
+        "    if flag:\n"
+        "        return 1\n"
+        "    else:\n"
+        "        return 2\n"
+        "x = 1\n"
+    )
+    if_ret_stmts = ast.parse(if_ret_suppress_src).body
+    assert _block_terminates([if_ret_stmts[0]]) is True
+    assert (
+        _extract_block_definite_bindings_and_term(if_ret_stmts, None)
+        == (set(), True)
+    )
+
+    # Item 3: Non-raising prefix statements inside with suppress(...) bind definitely
+    mixed_suppress_src = (
+        "with suppress(KeyError):\n"
+        "    value = 42\n"
+        "    pair_a, pair_b = 1, 2\n"
+        "    scale = d['x']\n"
+        "    after_risky = 99\n"
+    )
+    mixed_stmts = ast.parse(mixed_suppress_src).body
+    def_mix, cond_mix = _analyze_block_assignment(mixed_stmts)
+    bound_mix, term_mix = _extract_block_definite_bindings_and_term(
+        mixed_stmts, None
+    )
+    assert def_mix == {"value", "pair_a", "pair_b"}
+    assert bound_mix == {"value", "pair_a", "pair_b"}
+    assert {"scale", "after_risky"} <= cond_mix
+    assert term_mix is False
+
+
+def test_scope_cache_key_permitted_parameter_types() -> None:
+    """Verifies Item 4: _ScopeCacheKey enforces permitted immutable AST-free parameter schema."""
+    import pytest
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _ScopeCacheKey,
+        _make_trusted_scope_cache_key,
+    )
+
+    mod = ast.parse("x = 1\n")
+    stmt = mod.body[0]
+
+    # Permitted scalar and immutable container types succeed
+    valid_key = _ScopeCacheKey(
+        mod,
+        "test_kind",
+        params=(
+            "str_val",
+            42,
+            3.14,
+            True,
+            b"bytes",
+            None,
+            ("nested_tuple", frozenset({"a", "b", 1})),
+        ),
+        aux_ast_nodes=(stmt,),
+    )
+    assert valid_key.owner is mod
+    assert valid_key.aux_ast_nodes == (stmt,)
+
+    # Public make_trusted is not exposed on _ScopeCacheKey; _make_trusted_scope_cache_key is private
+    assert not hasattr(_ScopeCacheKey, "make_trusted")
+    trusted_key = _make_trusted_scope_cache_key(
+        mod, "trusted_kind", params=("ok", 1)
+    )
+    assert trusted_key.kind == "trusted_kind"
+
+    # AST nodes anywhere in params (including inside list/dict/set/tuple/frozenset) raise ValueError
+    for bad_ast_params in (
+        (stmt,),
+        ((stmt,),),
+        (frozenset({stmt}),),
+        ([stmt],),
+        ({stmt},),
+        ({"k": stmt},),
+        ({stmt: "v"},),
+    ):
+        with pytest.raises(ValueError, match="must not contain ast.AST"):
+            _ScopeCacheKey(mod, "bad_ast", params=bad_ast_params)
+
+    # Mutable containers or arbitrary objects in params raise TypeError
+    for bad_type_params in (
+        (["a", "b"],),
+        ({"k": "v"},),
+        ({"a", "b"},),
+        (object(),),
+    ):
+        with pytest.raises(
+            TypeError, match="only permits immutable"
+        ):
+            _ScopeCacheKey(mod, "bad_type", params=bad_type_params)
+
+
+def test_closure_escape_analysis_edge_cases_5_1_to_5_3() -> None:
+    """Verifies Item 5 (5.1, 5.2, 5.3): name collisions, class vs lexical namespaces, and definition vs invocation execution."""
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _collect_escaped_and_executed_intra_unit_defs,
+    )
+
+    # 5.1(a): Multiple definitions sharing a name in mutually exclusive branches
+    branch_defs_src = (
+        "if cond:\n"
+        "    def f():\n"
+        "        return a\n"
+        "else:\n"
+        "    def f():\n"
+        "        return b\n"
+        "res = f()\n"
+    )
+    branch_stmts = ast.parse(branch_defs_src).body
+    if_node = branch_stmts[0]
+    assert isinstance(if_node, ast.If)
+    f_then = if_node.body[0]
+    f_else = if_node.orelse[0]
+    _, esc_ids_br, exec_ids_br = _collect_escaped_and_executed_intra_unit_defs(
+        branch_stmts, set()
+    )
+    assert id(f_then) in exec_ids_br and id(f_else) in exec_ids_br
+    assert id(f_then) not in esc_ids_br and id(f_else) not in esc_ids_br
+
+    # 5.1(b): Definition followed by ordinary assignment (rebound after alias vs rebound without escape)
+    rebound_alias_stmts = ast.parse(
+        "def f():\n    return a\nsaved = f\nf = 123\n"
+    ).body
+    _, esc_ids_ra, exec_ids_ra = _collect_escaped_and_executed_intra_unit_defs(
+        rebound_alias_stmts, {"saved"}
+    )
+    assert id(rebound_alias_stmts[0]) in esc_ids_ra
+    assert id(rebound_alias_stmts[0]) in exec_ids_ra
+
+    # 5.1(c): Definitions inside nested classes
+    nested_cls_stmts = ast.parse(
+        "class Outer:\n"
+        "    class Inner:\n"
+        "        def method(self):\n"
+        "            return x\n"
+    ).body
+    outer_cls = nested_cls_stmts[0]
+    assert isinstance(outer_cls, ast.ClassDef)
+    inner_cls = outer_cls.body[0]
+    assert isinstance(inner_cls, ast.ClassDef)
+    inner_method = inner_cls.body[0]
+    # Unescaped Outer: Outer and Inner bodies execute at definition time, but method does not
+    _, esc_unesc, exec_unesc = _collect_escaped_and_executed_intra_unit_defs(
+        nested_cls_stmts, set()
+    )
+    assert id(outer_cls) in exec_unesc
+    assert id(inner_cls) in exec_unesc
+    assert id(inner_method) not in exec_unesc
+    # Escaped Outer: Outer, Inner, and method all escape
+    _, esc_esc, exec_esc = _collect_escaped_and_executed_intra_unit_defs(
+        nested_cls_stmts, {"Outer"}
+    )
+    assert {id(outer_cls), id(inner_cls), id(inner_method)} <= esc_esc
+    assert {id(outer_cls), id(inner_cls), id(inner_method)} <= exec_esc
+
+    # 5.1(d) & 5.3: Functions declaring a nested definition global or nonlocal (executed vs unexecuted)
+    nl_rebind_stmts = ast.parse(
+        "def dead_binder():\n"
+        "    nonlocal outer_cb\n"
+        "    def outer_cb():\n"
+        "        return x\n"
+        "def live_binder():\n"
+        "    nonlocal live_cb\n"
+        "    def live_cb():\n"
+        "        return y\n"
+        "live_binder()\n"
+    ).body
+    dead_fn = nl_rebind_stmts[0]
+    live_fn = nl_rebind_stmts[1]
+    assert isinstance(dead_fn, ast.FunctionDef) and isinstance(
+        live_fn, ast.FunctionDef
+    )
+    dead_cb = dead_fn.body[1]
+    live_cb = live_fn.body[1]
+    esc_names_nl, esc_ids_nl, exec_ids_nl = (
+        _collect_escaped_and_executed_intra_unit_defs(nl_rebind_stmts, set())
+    )
+    assert id(dead_cb) not in esc_ids_nl
+    assert id(dead_cb) not in exec_ids_nl
+    assert id(live_cb) in esc_ids_nl
+    assert id(live_cb) in exec_ids_nl
+    assert "live_cb" in esc_names_nl
+
+    # 5.2: Class body referencing an outer function before defining a same-named method
+    cls_shadow_order_stmts = ast.parse(
+        "def helper():\n"
+        "    return x\n"
+        "class C:\n"
+        "    val = helper()\n"
+        "    def helper(self):\n"
+        "        return 1\n"
+    ).body
+    outer_helper = cls_shadow_order_stmts[0]
+    _, _, exec_cls_order = _collect_escaped_and_executed_intra_unit_defs(
+        cls_shadow_order_stmts, set()
+    )
+    assert id(outer_helper) in exec_cls_order
+
+    # 5.2: Nested class inside class and method referencing outer cell vs self.attr / ClassName.attr
+    pep227_src = (
+        "def outer(items):\n"
+        "    shared = 10\n"
+        "    class Container:\n"
+        "        shared = 99\n"
+        "        class Inner:\n"
+        "            def read_outer(self):\n"
+        "                return shared + self.shared + Container.shared\n"
+        "    inst = Container.Inner()\n"
+        "    shared = 20\n"
+        "    return inst.read_outer()\n"
+    )
+    sc_pep227 = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 8,
+            "kind": "compound_block",
+            "source_text": pep227_src,
+            "source_code": (
+                "class Container:\n"
+                "    shared = 99\n"
+                "    class Inner:\n"
+                "        def read_outer(self):\n"
+                "            return shared + self.shared + Container.shared\n"
+                "inst = Container.Inner()\n"
+            ),
+        },
+        tree=ast.parse(pep227_src),
+    )
+    assert "severed_closure_cell" in sc_pep227["control_flow_hazards"]
+
+    # 5.3: Decorator on uncalled function executes at definition time
+    dec_exec_stmts = ast.parse(
+        "def my_dec(fn):\n"
+        "    return fn\n"
+        "@my_dec\n"
+        "def uncalled():\n"
+        "    return 1\n"
+    ).body
+    dec_fn = dec_exec_stmts[0]
+    uncalled_fn = dec_exec_stmts[1]
+    _, esc_dec, exec_dec = _collect_escaped_and_executed_intra_unit_defs(
+        dec_exec_stmts, set()
+    )
+    assert id(dec_fn) in exec_dec
+    assert id(uncalled_fn) in esc_dec
+
+
+def test_generator_expression_eager_vs_lazy_table_and_nested_walrus() -> None:
+    """Verifies Item 6: all 10 eager vs lazy generator expression cases and nested walrus generators."""
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _extract_comprehension_deferred_closure_info,
+        _extract_lazy_genexp_walrus_names,
+        _get_fn_scope_context,
+        _is_lazy_genexp,
+    )
+
+    # All 10 cases from the review table:
+    # (func_code_body, expected_is_lazy)
+    table_cases: list[tuple[str, bool]] = [
+        ("return sum(x for x in values)", False),
+        ("return list(x for x in values)", False),
+        ("return tuple(x for x in values)", False),
+        ("return sorted(x for x in values)", False),
+        ("return any(x for x in values)", False),
+        ("return all(x for x in values)", False),
+        ("return custom(x for x in values)", True),
+        ("list = custom_fn\n    return list(x for x in values)", True),
+        ("return list((x for x in values))", False),
+        ("return iter(x for x in values)", True),
+    ]
+    for body_line, expected_lazy in table_cases:
+        fn_src = f"def f(values, custom, custom_fn):\n    {body_line}\n"
+        mod = ast.parse(fn_src)
+        fn_node = mod.body[0]
+        assert isinstance(fn_node, ast.FunctionDef)
+        ctx = _get_fn_scope_context(fn_node, mod_tree=mod)
+        genexp_nodes = [
+            n for n in ast.walk(fn_node) if isinstance(n, ast.GeneratorExp)
+        ]
+        assert len(genexp_nodes) == 1
+        assert _is_lazy_genexp(genexp_nodes[0], ctx) is expected_lazy, body_line
+
+    # Walrus case 1: gen = ((count := count + x) for x in values)
+    walrus_gen1_src = (
+        "def f(values):\n"
+        "    count = 0\n"
+        "    gen = ((count := count + x) for x in values)\n"
+        "    res = list(gen)\n"
+        "    return res, count\n"
+    )
+    mod1 = ast.parse(walrus_gen1_src)
+    fn1 = mod1.body[0]
+    assert isinstance(fn1, ast.FunctionDef)
+    ctx1 = _get_fn_scope_context(fn1, mod_tree=mod1)
+    assign1 = fn1.body[1]
+    assert isinstance(assign1, ast.Assign) and isinstance(
+        assign1.value, ast.GeneratorExp
+    )
+    assert _extract_lazy_genexp_walrus_names(assign1, ctx1) == {"count"}
+    _, def_muts1 = _extract_comprehension_deferred_closure_info(
+        assign1.value, ctx1
+    )
+    assert "count" in def_muts1
+    sc_w1 = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 3,
+            "kind": "basic_block",
+            "source_text": walrus_gen1_src,
+            "source_code": (
+                "count = 0\n"
+                "gen = ((count := count + x) for x in values)\n"
+            ),
+        },
+        tree=mod1,
+    )
+    assert "severed_closure_cell" in sc_w1["control_flow_hazards"]
+
+    # Walrus case 2: gen = (sum((count := count + x) for x in values) for _ in range(1))
+    # Outer generator is lazy; inner generator is eagerly consumed WHEN outer generator is advanced!
+    walrus_gen2_src = (
+        "def f(values):\n"
+        "    count = 0\n"
+        "    gen = (sum((count := count + x) for x in values) for _ in range(1))\n"
+        "    res = list(gen)\n"
+        "    return res, count\n"
+    )
+    mod2 = ast.parse(walrus_gen2_src)
+    fn2 = mod2.body[0]
+    assert isinstance(fn2, ast.FunctionDef)
+    ctx2 = _get_fn_scope_context(fn2, mod_tree=mod2)
+    assign2 = fn2.body[1]
+    assert isinstance(assign2, ast.Assign)
+    outer_gen = assign2.value
+    assert isinstance(outer_gen, ast.GeneratorExp)
+    assert isinstance(outer_gen.elt, ast.Call)
+    inner_gen = outer_gen.elt.args[0]
+    assert isinstance(inner_gen, ast.GeneratorExp)
+    assert _is_lazy_genexp(outer_gen, ctx2) is True
+    assert _is_lazy_genexp(inner_gen, ctx2) is False
+    assert _extract_lazy_genexp_walrus_names(assign2, ctx2) == {"count"}
+    _, def_muts2 = _extract_comprehension_deferred_closure_info(
+        outer_gen, ctx2
+    )
+    assert "count" in def_muts2
+    sc_w2 = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 3,
+            "kind": "basic_block",
+            "source_text": walrus_gen2_src,
+            "source_code": (
+                "count = 0\n"
+                "gen = (sum((count := count + x) for x in values) for _ in range(1))\n"
+            ),
+        },
+        tree=mod2,
+    )
+    assert "severed_closure_cell" in sc_w2["control_flow_hazards"]
+
+
+def test_span_line_index_performance_and_scale() -> None:
+    """Verifies Item 7: _SpanLineIndex scales cleanly across 10,000-statement modules, deep nesting, and multi-unit lines."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _evict_tree_scopes,
+        _scope_cell_info_cache,
+        clear_dataflow_cache,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _has_unresolved_span_bounds,
+        _resolve_unit_col_bounds,
+    )
+
+    clear_dataflow_cache()
+
+    # 1. Module with 10,000 statements
+    large_mod_lines = [f"v_{i} = {i}\n" for i in range(10000)]
+    large_mod_tree = ast.parse("".join(large_mod_lines))
+    cand_5000 = ast.parse("v_5000 = 5000\n").body
+    cand_9999 = ast.parse("v_9999 = 9999\n").body
+    assert _resolve_unit_col_bounds(
+        cand_5000, large_mod_tree, 5001, 5001, None, None
+    ) == (0, len("v_5000 = 5000"))
+    assert _resolve_unit_col_bounds(
+        cand_9999, large_mod_tree, 10000, 10000, None, None
+    ) == (0, len("v_9999 = 9999"))
+    assert (
+        _has_unresolved_span_bounds(
+            large_mod_tree, 5001, 5001, 0, len("v_5000 = 5000"), cand_5000
+        )
+        is False
+    )
+
+    # 2. Deeply nested functions (15 levels deep)
+    deep_lines = ["def f_0(x):\n"]
+    for depth in range(1, 15):
+        indent = "    " * depth
+        deep_lines.append(f"{indent}def f_{depth}(x):\n")
+    leaf_indent = "    " * 15
+    deep_lines.append(f"{leaf_indent}target = x + 1\n")
+    deep_lines.append(f"{leaf_indent}return target\n")
+    for depth in range(14, 0, -1):
+        indent = "    " * depth
+        deep_lines.append(f"{indent}return f_{depth}(x)\n")
+    deep_tree = ast.parse("".join(deep_lines))
+    cand_leaf = ast.parse("target = x + 1\n").body
+    expected_s_col = len(leaf_indent)
+    expected_e_col = len(leaf_indent) + len("target = x + 1")
+    assert _resolve_unit_col_bounds(
+        cand_leaf, deep_tree, 16, 16, None, None
+    ) == (expected_s_col, expected_e_col)
+
+    # 3. Many candidate units on the same source line (20 semicolon-separated statements)
+    semi_parts = [f"s_{i} = {i}" for i in range(20)]
+    semi_line = "    " + "; ".join(semi_parts) + "\n"
+    semi_tree = ast.parse(f"def multi():\n{semi_line}")
+    for i in (0, 7, 19):
+        part_cand = ast.parse(f"s_{i} = {i}\n").body
+        pos = semi_line.index(f"s_{i} = {i}")
+        assert _resolve_unit_col_bounds(
+            part_cand, semi_tree, 2, 2, None, None
+        ) == (pos, pos + len(f"s_{i} = {i}"))
+    assert (
+        _has_unresolved_span_bounds(semi_tree.body[0], 2, 2, None, None)
+        is True
+    )
+
+    # 4. Hundreds of candidate units within one large function + repeated inspection of same AST tree
+    big_fn_lines = ["def big_fn(x):\n"] + [
+        f"    step_{i} = x + {i}\n" for i in range(300)
+    ]
+    big_fn_tree = ast.parse("".join(big_fn_lines))
+    for i in range(0, 300, 3):
+        c_stmt = [big_fn_tree.body[0].body[i]]  # type: ignore[attr-defined]
+        ln = i + 2
+        s_c, e_c = _resolve_unit_col_bounds(
+            c_stmt, big_fn_tree, ln, ln, None, None
+        )
+        assert (s_c, e_c) == (4, 4 + len(f"step_{i} = x + {i}"))
+        assert (
+            _has_unresolved_span_bounds(
+                big_fn_tree.body[0], ln, ln, s_c, e_c, c_stmt
+            )
+            is False
+        )
+
+    assert any(
+        k.owner is big_fn_tree and k.kind == "span_line_index"
+        for k in _scope_cell_info_cache
+    )
+    _evict_tree_scopes(big_fn_tree)
+    assert not any(
+        k.owner is big_fn_tree
+        for k in _scope_cell_info_cache
+    )
+
+
+def test_ensure_unit_scope_closure_mode_all_six_cases() -> None:
+    """Verifies Item 8: all 6 scope-mode and missing-file / source_text fallback cases."""
+    from pydoppelgangerhunt.fixer import (
+        inspect_single_unit_scope,
+        synthesize_shared_helper_code,
+    )
+    from pydoppelgangerhunt.fixer.scope import ensure_unit_scope_closure_mode
+
+    src_with_pre_closure = (
+        "def proc(items):\n"
+        "    cb = lambda: acc\n"
+        "    for x in items:\n"
+        "        acc = x + 1\n"
+        "    return 1\n"
+    )
+    base_unit = {
+        "file": "missing_virtual_file_12345.py",
+        "start": 3,
+        "end": 4,
+        "kind": "compound_block",
+        "source_text": src_with_pre_closure,
+        "source_code": "for x in items:\n    acc = x + 1\n",
+    }
+    strict_scope = inspect_single_unit_scope(
+        {**base_unit, "skip_pre_unit_closures": False}
+    )
+    lenient_scope = inspect_single_unit_scope(
+        {**base_unit, "skip_pre_unit_closures": True}
+    )
+    assert strict_scope["_skip_pre_unit_closures"] is False
+    assert "severed_closure_cell" in strict_scope["control_flow_hazards"]
+    assert lenient_scope["_skip_pre_unit_closures"] is True
+    assert "severed_closure_cell" not in lenient_scope["control_flow_hazards"]
+
+    # 1. Strict scope reused in lenient mode -> recomputes to lenient
+    res_1 = ensure_unit_scope_closure_mode(base_unit, strict_scope, True)
+    assert res_1["_skip_pre_unit_closures"] is True
+    assert "severed_closure_cell" not in res_1["control_flow_hazards"]
+
+    # 2. Lenient scope reused in strict mode -> recomputes to strict
+    res_2 = ensure_unit_scope_closure_mode(base_unit, lenient_scope, False)
+    assert res_2["_skip_pre_unit_closures"] is False
+    assert "severed_closure_cell" in res_2["control_flow_hazards"]
+
+    # 3. Scope missing _skip_pre_unit_closures -> recomputes and attaches flag
+    unmarked = {
+        k: v for k, v in lenient_scope.items() if k != "_skip_pre_unit_closures"
+    }
+    res_3 = ensure_unit_scope_closure_mode(base_unit, unmarked, False)
+    assert res_3["_skip_pre_unit_closures"] is False
+    assert "severed_closure_cell" in res_3["control_flow_hazards"]
+
+    # 4. Pathological AST scope reused in either mode without recomputing
+    pathological_scope = {
+        **strict_scope,
+        "control_flow_hazards": ["pathological_ast"],
+        "is_control_flow_safe": False,
+    }
+    assert (
+        ensure_unit_scope_closure_mode(base_unit, pathological_scope, True)
+        is pathological_scope
+    )
+    assert (
+        ensure_unit_scope_closure_mode(base_unit, pathological_scope, False)
+        is pathological_scope
+    )
+
+    # 5. Missing source file with precomputed scope and no source_text -> fails closed
+    no_src_unit = {
+        "file": "nonexistent_on_disk_98765.py",
+        "start": 3,
+        "end": 4,
+        "kind": "compound_block",
+    }
+    res_5 = ensure_unit_scope_closure_mode(no_src_unit, lenient_scope, False)
+    assert res_5["is_control_flow_safe"] is False
+    assert "severed_closure_cell" in res_5["control_flow_hazards"]
+    assert res_5["_skip_pre_unit_closures"] is False
+
+    # 6. Valid source_text supplied alongside a missing file (even if unit has source_text: None or source_lines: [])
+    unit_with_none_src = {
+        "file": "nonexistent_on_disk_98765.py",
+        "start": 3,
+        "end": 4,
+        "kind": "compound_block",
+        "source_text": None,
+        "source_lines": [],
+    }
+    res_6 = ensure_unit_scope_closure_mode(
+        unit_with_none_src,
+        lenient_scope,
+        True,
+        source_text=src_with_pre_closure,
+    )
+    assert res_6["_skip_pre_unit_closures"] is True
+    assert "severed_closure_cell" not in res_6["control_flow_hazards"]
+    helper_code = synthesize_shared_helper_code(
+        unit_with_none_src,
+        dict(unit_with_none_src),
+        source_text1=src_with_pre_closure,
+        source_text2=src_with_pre_closure,
+        scope1=lenient_scope,
+        scope2=dict(lenient_scope),
+        skip_pre_unit_closures=True,
+    )
+    assert "def " in helper_code and "acc = x + 1" in helper_code
+
+
+def test_utf8_source_slicing_multibyte_and_idempotence() -> None:
+    """Verifies Item 9: UTF-8 byte-offset slicing across multibyte identifiers/literals and pre-sliced idempotence."""
+    from pydoppelgangerhunt.fixer.source import (
+        _slice_unit_token_lines,
+        _slice_utf8_line,
+    )
+
+    # 1. café = "hello"; result = café + "world"
+    line1 = 'café = "hello"; result = café + "world"\n'
+    expr1 = 'café + "world"'
+    s1 = len('café = "hello"; result = '.encode("utf-8"))
+    e1 = s1 + len(expr1.encode("utf-8"))
+    assert _slice_utf8_line(line1, s1, e1) == expr1
+    unit1 = {"kind": "complex_expr", "start_col": s1, "end_col": e1}
+    sliced1 = _slice_unit_token_lines(unit1, [line1])
+    assert sliced1 == [expr1]
+    # Idempotence on already-sliced lines
+    assert _slice_unit_token_lines(unit1, sliced1) == [expr1]
+
+    # 2. result = "é"; another = "世界"; final = 42
+    line2 = 'result = "é"; another = "世界"; final = 42\n'
+    for target in ('"é"', '"世界"', "42"):
+        char_idx = line2.index(target)
+        s_b = len(line2[:char_idx].encode("utf-8"))
+        e_b = len(line2[: char_idx + len(target)].encode("utf-8"))
+        assert _slice_utf8_line(line2, s_b, e_b) == target
+        u_t = {"kind": "complex_expr", "start_col": s_b, "end_col": e_b}
+        out_t = _slice_unit_token_lines(u_t, [line2])
+        assert out_t == [target]
+        assert _slice_unit_token_lines(u_t, out_t) == [target]
+
+    # 3. Pre-sliced single-line expression where s_col < len(sliced) and source_code is omitted
+    line3 = "x = [i + 1 for i in items]\n"
+    expr3 = "[i + 1 for i in items]"
+    u3 = {"kind": "comprehension", "start_col": 4, "end_col": 4 + len(expr3)}
+    sliced3 = _slice_unit_token_lines(u3, [line3])
+    assert sliced3 == [expr3]
+    assert _slice_unit_token_lines(u3, sliced3) == [expr3]
+
+    # 4. Multiline UTF-8 expression slicing and pre-sliced idempotence
+    ml_utf8 = [
+        '    résultat = (\n',
+        '        café + "世界"\n',
+        '    )\n',
+    ]
+    s_ml = len("    résultat = ".encode("utf-8"))
+    e_ml = len("    )".encode("utf-8"))
+    u_ml = {"kind": "complex_expr", "start_col": s_ml, "end_col": e_ml}
+    sliced_ml = _slice_unit_token_lines(u_ml, ml_utf8)
+    assert sliced_ml == ['(\n', '        café + "世界"\n', '    )']
+    assert _slice_unit_token_lines(u_ml, sliced_ml) == sliced_ml
+
+
+def test_property_invariants_cache_isolation_monotonicity_equivalence() -> None:
+    """Verifies Item 10: all 7 property-oriented invariants across a diverse AST corpus."""
+    import symtable
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _evict_tree_scopes,
+        _key_references_scope_nodes,
+        _scope_cell_info_cache,
+        _scope_parent_maps,
+        clear_dataflow_cache,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _has_invalid_lexical_scope_declarations,
+    )
+
+    corpus_programs = [
+        (
+            "def f1(xs):\n"
+            "    a = 1\n"
+            "    res = [x + a for x in xs]\n"
+            "    return res\n",
+            3,
+            3,
+            "comprehension",
+            "res = [x + a for x in xs]\n",
+        ),
+        (
+            "def f2(xs):\n"
+            "    a = 1\n"
+            "    cb = lambda: a\n"
+            "    for x in xs:\n"
+            "        a = x + 2\n"
+            "    return cb(), a\n",
+            4,
+            5,
+            "compound_block",
+            "for x in xs:\n    a = x + 2\n",
+        ),
+        (
+            "def f3(d):\n"
+            "    with suppress(KeyError):\n"
+            "        v = 10\n"
+            "    out = v + 1\n"
+            "    return out\n",
+            4,
+            4,
+            "basic_block",
+            "out = v + 1\n",
+        ),
+    ]
+
+    for src, u_s, u_e, kind, snippet in corpus_programs:
+        tree = ast.parse(src)
+        tree_nodes = set(ast.walk(tree))
+        line_text = src.splitlines()[u_s - 1]
+        s_col = len(line_text) - len(line_text.lstrip())
+        end_line_text = src.splitlines()[u_e - 1]
+        e_col = len(end_line_text.encode("utf-8"))
+
+        unit_inferred = {
+            "start": u_s,
+            "end": u_e,
+            "kind": kind,
+            "source_text": src,
+            "source_code": snippet,
+        }
+        unit_explicit = {
+            **unit_inferred,
+            "start_col": s_col,
+            "end_col": e_col,
+        }
+
+        # 1. Cache equivalence (uncached fresh vs cached warm)
+        clear_dataflow_cache()
+        res_cold = inspect_single_unit_scope(dict(unit_explicit), tree=tree)
+        res_warm = inspect_single_unit_scope(dict(unit_explicit), tree=tree)
+        assert res_cold == res_warm
+
+        # 3. Defensive copies (mutating returned dict/lists does not corrupt cache)
+        res_warm["inputs"].append("__mutated_input__")
+        res_warm["control_flow_hazards"].append("__mutated_hazard__")
+        res_after_mut = inspect_single_unit_scope(
+            dict(unit_explicit), tree=tree
+        )
+        assert "__mutated_input__" not in res_after_mut["inputs"]
+        assert (
+            "__mutated_hazard__" not in res_after_mut["control_flow_hazards"]
+        )
+
+        # 4. AST isolation (only nodes belonging to `tree` are retained in caches)
+        for p_node in _scope_parent_maps:
+            assert p_node in tree_nodes
+        for c_key in _scope_cell_info_cache:
+            for ast_n in (c_key.owner, *c_key.aux_ast_nodes):
+                assert ast_n in tree_nodes
+
+        # 5. Strictness monotonicity (safe in strict -> safe in lenient)
+        sc_strict = inspect_single_unit_scope(
+            {**unit_explicit, "skip_pre_unit_closures": False}, tree=tree
+        )
+        sc_lenient = inspect_single_unit_scope(
+            {**unit_explicit, "skip_pre_unit_closures": True}, tree=tree
+        )
+        if sc_strict["is_control_flow_safe"]:
+            assert sc_lenient["is_control_flow_safe"] is True
+        assert set(sc_lenient["control_flow_hazards"]).issubset(
+            set(sc_strict["control_flow_hazards"])
+        )
+
+        # 6. Span equivalence (explicit column bounds vs inferred column bounds)
+        sc_inferred = inspect_single_unit_scope(
+            {**unit_inferred, "skip_pre_unit_closures": False}, tree=tree
+        )
+        assert sc_inferred == sc_strict
+
+        # 2. Cache eviction (evicting tree removes all entries referencing tree_nodes)
+        _evict_tree_scopes(tree)
+        assert not any(p in tree_nodes for p in _scope_parent_maps)
+        assert not any(
+            _key_references_scope_nodes(k, tree_nodes)
+            for k in _scope_cell_info_cache
+        )
+
+    # 7. Lexical equivalence against Python's symtable/compile
+    lexical_samples = [
+        ("def f():\n    x = 1\n    def g():\n        nonlocal x\n        x = 2\n", False),
+        ("def f():\n    global x\n    def g():\n        nonlocal x\n        x = 2\n", True),
+        ("def f(x):\n    nonlocal x\n", True),
+        ("def f():\n    class C:\n        global x\n        def m(self):\n            return x\n", False),
+    ]
+    for lex_src, expected_invalid in lexical_samples:
+        lex_tree = ast.parse(lex_src)
+        got_invalid = _has_invalid_lexical_scope_declarations(
+            lex_tree.body, mod_tree=lex_tree
+        )
+        symtable_rejected = False
+        try:
+            symtable.symtable(lex_src, "<lex_test>", "exec")
+            compile(lex_src, "<lex_test>", "exec")
+        except SyntaxError:
+            symtable_rejected = True
+        assert got_invalid is expected_invalid is symtable_rejected
 
 
 

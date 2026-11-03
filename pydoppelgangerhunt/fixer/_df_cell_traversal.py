@@ -453,6 +453,130 @@ def _is_exception_suppressing_with(
     return False
 
 
+def _is_non_raising_expr(expr: Optional[ast.AST]) -> bool:
+    """Returns True if evaluating expr cannot raise an exception caught by suppress(...)."""
+    if expr is None or isinstance(expr, (ast.Constant, ast.Name)):
+        return True
+    if isinstance(expr, ast.Lambda):
+        return all(
+            _is_non_raising_expr(d)
+            for d in (
+                *expr.args.defaults,
+                *(d for d in expr.args.kw_defaults if d is not None),
+            )
+        )
+    if isinstance(expr, (ast.Tuple, ast.List)):
+        return all(_is_non_raising_expr(e) for e in expr.elts)
+    if isinstance(expr, ast.UnaryOp):
+        if isinstance(expr.op, ast.Not):
+            return _is_non_raising_expr(expr.operand)
+        return (
+            isinstance(expr.op, (ast.UAdd, ast.USub, ast.Invert))
+            and isinstance(expr.operand, ast.Constant)
+            and isinstance(expr.operand.value, (int, float, bool))
+        )
+    if isinstance(expr, ast.BoolOp):
+        return all(_is_non_raising_expr(v) for v in expr.values)
+    if isinstance(expr, ast.IfExp):
+        return all(
+            _is_non_raising_expr(sub)
+            for sub in (expr.test, expr.body, expr.orelse)
+        )
+    if isinstance(expr, ast.Compare):
+        return (
+            all(isinstance(op, (ast.Is, ast.IsNot)) for op in expr.ops)
+            and _is_non_raising_expr(expr.left)
+            and all(_is_non_raising_expr(c) for c in expr.comparators)
+        )
+    if isinstance(expr, ast.NamedExpr):
+        return isinstance(expr.target, ast.Name) and _is_non_raising_expr(
+            expr.value
+        )
+    return False
+
+
+def _is_non_raising_store_target(
+    target: ast.AST,
+    value: Optional[ast.AST] = None,
+) -> bool:
+    """Returns True if storing value into target cannot raise a runtime unpacking/target error."""
+    if isinstance(target, ast.Name):
+        return True
+    if (
+        isinstance(target, (ast.Tuple, ast.List))
+        and isinstance(value, (ast.Tuple, ast.List))
+        and len(target.elts) == len(value.elts)
+        and not any(
+            isinstance(e, ast.Starred) for e in (*target.elts, *value.elts)
+        )
+    ):
+        return all(
+            _is_non_raising_store_target(t, v)
+            for t, v in zip(target.elts, value.elts)
+        )
+    return False
+
+
+def _stmt_cannot_raise_in_suppress(stmt: ast.AST) -> bool:
+    """Returns True if stmt executes and completes without raising a catchable exception."""
+    if isinstance(
+        stmt, (ast.Pass, ast.Global, ast.Nonlocal, ast.Break, ast.Continue)
+    ):
+        return True
+    if isinstance(stmt, ast.Return):
+        return _is_non_raising_expr(stmt.value)
+    if isinstance(stmt, ast.Expr):
+        return _is_non_raising_expr(stmt.value)
+    if isinstance(stmt, ast.Assign):
+        return (
+            stmt.value is not None
+            and _is_non_raising_expr(stmt.value)
+            and all(
+                _is_non_raising_store_target(t, stmt.value)
+                for t in stmt.targets
+            )
+        )
+    if isinstance(stmt, ast.AnnAssign):
+        return _is_non_raising_expr(stmt.annotation) and (
+            stmt.value is None
+            or (
+                _is_non_raising_expr(stmt.value)
+                and _is_non_raising_store_target(stmt.target, stmt.value)
+            )
+        )
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return not stmt.decorator_list and all(
+            _is_non_raising_expr(h)
+            for h in iter_nested_scope_header_nodes(stmt)
+        )
+    if isinstance(stmt, ast.If):
+        return (
+            _is_non_raising_expr(stmt.test)
+            and all(_stmt_cannot_raise_in_suppress(s) for s in stmt.body)
+            and all(_stmt_cannot_raise_in_suppress(s) for s in stmt.orelse)
+        )
+    if isinstance(stmt, (ast.With, ast.AsyncWith)):
+        return _is_exception_suppressing_with(stmt) and all(
+            item.optional_vars is None
+            or isinstance(item.optional_vars, ast.Name)
+            for item in stmt.items
+        )
+    return False
+
+
+def _split_suppress_with_body(
+    body: Sequence[ast.stmt],
+) -> Tuple[List[ast.stmt], List[ast.stmt]]:
+    """Splits a suppressing with-block body into (non_raising_prefix, potentially_raising_suffix)."""
+    safe_prefix: List[ast.stmt] = []
+    for idx, b_stmt in enumerate(body):
+        if _stmt_cannot_raise_in_suppress(b_stmt):
+            safe_prefix.append(b_stmt)
+        else:
+            return safe_prefix, list(body[idx:])
+    return safe_prefix, []
+
+
 def _extract_block_definite_bindings_and_term(
     stmts: Sequence[ast.AST],
     active_nonlocals: Optional[Set[str]],
@@ -509,17 +633,20 @@ def _extract_block_definite_bindings_and_term(
                             n, active_nonlocals, fn_globals
                         )
                     )
-            if _is_exception_suppressing_with(stmt):
-                for b_stmt in stmt.body:
-                    bound.difference_update(
-                        _extract_shallow_deleted_names(b_stmt)
-                    )
-            else:
-                bound, w_term = _extract_block_definite_bindings_and_term(
-                    stmt.body, active_nonlocals, bound, fn_globals
+            safe_prefix, risky_suffix = (
+                _split_suppress_with_body(stmt.body)
+                if _is_exception_suppressing_with(stmt)
+                else (list(stmt.body), [])
+            )
+            bound, w_term = _extract_block_definite_bindings_and_term(
+                safe_prefix, active_nonlocals, bound, fn_globals
+            )
+            if w_term:
+                return bound, True
+            for b_stmt in risky_suffix:
+                bound.difference_update(
+                    _extract_shallow_deleted_names(b_stmt)
                 )
-                if w_term:
-                    return bound, True
             continue
         if isinstance(stmt, (ast.For, ast.AsyncFor)):
             bound.difference_update(_extract_shallow_deleted_names(stmt))

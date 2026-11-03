@@ -564,6 +564,18 @@ def _slice_utf8_line(
     return line[s_char:]
 
 
+def _is_valid_eval_expr(text: str) -> bool:
+    """Returns True if text parses as a standalone Python expression in eval mode."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    try:
+        ast.parse(stripped, mode="eval")
+        return True
+    except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+        return False
+
+
 def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]:
     """Slices source lines to the exact start_col and end_col offsets of the unit."""
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
@@ -590,19 +602,41 @@ def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]
     # the original line's starting or ending byte column offset.
     first_byte_len = len(res[0].rstrip("\r\n").encode("utf-8"))
     if len(res) == 1:
-        if s_col > first_byte_len or (
-            s_col == first_byte_len
-            and (e_col is None or e_col > first_byte_len)
+        if (
+            s_col > first_byte_len
+            or (e_col is not None and e_col > first_byte_len)
+            or (
+                s_col == first_byte_len
+                and (e_col is None or e_col > first_byte_len)
+            )
         ):
             return res
-        res[0] = _slice_utf8_line(res[0], s_col, e_col)
+        candidate = _slice_utf8_line(res[0], s_col, e_col)
+        if (
+            s_col > 0
+            and e_col is None
+            and not res[0].startswith((" ", "\t"))
+            and _is_valid_eval_expr(res[0])
+            and not _is_valid_eval_expr(candidate)
+        ):
+            return res
+        res[0] = candidate
     else:
+        cand_res = list(res)
         if 0 < s_col < first_byte_len:
-            res[0] = _slice_utf8_line(res[0], s_col, None)
+            cand_res[0] = _slice_utf8_line(cand_res[0], s_col, None)
         if e_col is not None:
-            last_byte_len = len(res[-1].rstrip("\r\n").encode("utf-8"))
+            last_byte_len = len(cand_res[-1].rstrip("\r\n").encode("utf-8"))
             if e_col <= last_byte_len:
-                res[-1] = _slice_utf8_line(res[-1], 0, e_col)
+                cand_res[-1] = _slice_utf8_line(cand_res[-1], 0, e_col)
+        if (
+            (s_col > 0 or e_col is not None)
+            and not res[0].startswith((" ", "\t"))
+            and _is_valid_eval_expr("\n".join(res))
+            and not _is_valid_eval_expr("\n".join(cand_res))
+        ):
+            return res
+        res = cand_res
     return res
 
 

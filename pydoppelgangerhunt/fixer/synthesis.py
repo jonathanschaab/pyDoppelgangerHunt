@@ -1335,6 +1335,10 @@ def synthesize_shared_helper_code(
     """
     u1 = dict(u1)
     u2 = dict(u2)
+    if source_text1 is not None and not u1.get("source_text"):
+        u1["source_text"] = source_text1
+    if source_text2 is not None and not u2.get("source_text"):
+        u2["source_text"] = source_text2
     if not _align_pair_expr_kinds(u1, u2):
         return ""
     lines1 = _slice_unit_token_lines(

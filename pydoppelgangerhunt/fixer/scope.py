@@ -30,6 +30,7 @@ from pydoppelgangerhunt.fixer._df_cell_hazards import (
 )
 from pydoppelgangerhunt.fixer._df_cell_traversal import (
     _is_exception_suppressing_with,
+    _split_suppress_with_body,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
     _COMPREHENSION_TYPES,
@@ -1043,7 +1044,12 @@ def _block_terminates(statements: Sequence[ast.stmt]) -> bool:
             ):
                 return True
         elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-            if not _is_exception_suppressing_with(stmt) and _block_terminates(stmt.body):
+            w_body = (
+                _split_suppress_with_body(stmt.body)[0]
+                if _is_exception_suppressing_with(stmt)
+                else stmt.body
+            )
+            if _block_terminates(w_body):
                 return True
         elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
             cases = getattr(stmt, "cases", [])
@@ -1299,11 +1305,23 @@ def _analyze_block_assignment(
                         if isinstance(p_node, ast.Name) and isinstance(p_node.ctx, ast.Store):
                             definite.add(p_node.id)
                             may_del.discard(p_node.id)
-            if _is_exception_suppressing_with(stmt):
+            safe_prefix, risky_suffix = (
+                _split_suppress_with_body(stmt.body)
+                if _is_exception_suppressing_with(stmt)
+                else (list(stmt.body), [])
+            )
+            _analyze_block_assignment(
+                safe_prefix,
+                definite,
+                conditional,
+                may_deleted=may_del,
+                live_in_deleted=live_in_del,
+            )
+            if risky_suffix and not _block_terminates(safe_prefix):
                 w_may: Set[str] = set()
                 w_live: Set[str] = set()
                 w_def, w_cond = _analyze_block_assignment(
-                    stmt.body,
+                    risky_suffix,
                     may_deleted=w_may,
                     live_in_deleted=w_live,
                 )
@@ -1311,15 +1329,9 @@ def _analyze_block_assignment(
                 may_del.update(w_may)
                 conditional.update((w_def | w_cond) - definite)
                 _demote_deletions_to_conditional(
-                    _extract_deleted_names(stmt.body), definite, conditional
-                )
-            else:
-                _analyze_block_assignment(
-                    stmt.body,
+                    _extract_deleted_names(risky_suffix),
                     definite,
                     conditional,
-                    may_deleted=may_del,
-                    live_in_deleted=live_in_del,
                 )
         elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
             t_body = list(getattr(stmt, "body", []))
@@ -2994,8 +3006,8 @@ def ensure_unit_scope_closure_mode(
         return scope
     u_copy = dict(unit)
     u_copy["skip_pre_unit_closures"] = bool(skip_pre_unit_closures)
-    if source_text is not None:
-        u_copy.setdefault("source_text", source_text)
+    if source_text is not None and not u_copy.get("source_text"):
+        u_copy["source_text"] = source_text
     if (
         scope is not None
         and tree is None
