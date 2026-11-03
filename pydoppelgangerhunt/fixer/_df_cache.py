@@ -17,6 +17,7 @@ from typing import (
     Sequence,
     Set,
     Tuple,
+    Type,
     TypeVar,
 )
 
@@ -42,14 +43,14 @@ _scope_try_with_cache: OrderedDict[ast.AST, List[ast.AST]] = OrderedDict()
 _warned_lenient_closure: List[bool] = [False]
 
 
-_SCOPE_ROOT_TYPES: Tuple[type, ...] = (
+_SCOPE_ROOT_TYPES: Tuple[Type[ast.AST], ...] = (
     ast.Module,
     ast.FunctionDef,
     ast.AsyncFunctionDef,
     ast.ClassDef,
     ast.Lambda,
 )
-_SINGLETON_AST_TYPES: Tuple[type, ...] = (
+_SINGLETON_AST_TYPES: Tuple[Type[ast.AST], ...] = (
     ast.expr_context,
     ast.boolop,
     ast.operator,
@@ -412,10 +413,10 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
     """
     if tree is None or not isinstance(tree, ast.AST):
         return
-    tree_nodes = {
+    tree_nodes: Set[ast.AST] = {
         n for n in ast.walk(tree) if not isinstance(n, _SINGLETON_AST_TYPES)
     }
-    scope_nodes = {
+    scope_nodes: Set[ast.AST] = {
         node for node in tree_nodes if isinstance(node, _SCOPE_ROOT_TYPES)
     }
     scope_nodes.add(tree)
@@ -426,8 +427,8 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
             ):
                 scope_nodes.add(root_node)
                 tree_nodes.add(root_node)
-                curr_anc = pmap.get(tree)
-                while isinstance(curr_anc, ast.AST) and curr_anc not in tree_nodes:
+                curr_anc: Optional[ast.AST] = pmap.get(tree)
+                while curr_anc is not None and curr_anc not in tree_nodes:
                     tree_nodes.add(curr_anc)
                     if isinstance(curr_anc, _SCOPE_ROOT_TYPES):
                         scope_nodes.add(curr_anc)
