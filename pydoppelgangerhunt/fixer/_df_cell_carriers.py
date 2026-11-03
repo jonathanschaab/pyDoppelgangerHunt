@@ -92,6 +92,16 @@ class _FnScopeContext(NamedTuple):
                 aux_nodes.append(enc)
         return tuple(aux_nodes)
 
+    def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
+        """Returns all AST nodes retained by this context for cache index ownership."""
+        nodes: List[ast.AST] = list(self.cache_aux_nodes())
+        for pk, pv in self.parent_map.items():
+            if isinstance(pk, ast.AST):
+                nodes.append(pk)
+            if isinstance(pv, ast.AST):
+                nodes.append(pv)
+        return tuple(nodes)
+
 
 def _make_scope_ctx_cache_key(
     owner: ast.AST,
@@ -279,6 +289,10 @@ class _IndexedSpanNode(NamedTuple):
     req_u_start_le: int
     req_u_end_ge: int
 
+    def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
+        """Returns the AST node retained by this span index entry."""
+        return (self.node,) if isinstance(self.node, ast.AST) else ()
+
 
 class _SpanLineIndex:
     """Cached per-tree line index and lazy AST dump cache for O(1) boundary lookups."""
@@ -403,6 +417,31 @@ class _SpanLineIndex:
                 seen_ids.add(id(entry.node))
                 combined.append(entry)
         return combined
+
+    def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
+        """Returns all AST nodes retained across the four span-line index maps."""
+        nodes: List[ast.AST] = []
+        seen_ids: Set[int] = set()
+        for entry_map in (self.by_start_line, self.by_end_line):
+            for entries in entry_map.values():
+                for entry in entries:
+                    if (
+                        isinstance(entry.node, ast.AST)
+                        and id(entry.node) not in seen_ids
+                    ):
+                        seen_ids.add(id(entry.node))
+                        nodes.append(entry.node)
+        for stmts in self.stmts_by_start_line.values():
+            for stmt in stmts:
+                if isinstance(stmt, ast.AST) and id(stmt) not in seen_ids:
+                    seen_ids.add(id(stmt))
+                    nodes.append(stmt)
+        for end_tuples in self.stmts_by_end_line.values():
+            for stmt, _, _ in end_tuples:
+                if isinstance(stmt, ast.AST) and id(stmt) not in seen_ids:
+                    seen_ids.add(id(stmt))
+                    nodes.append(stmt)
+        return tuple(nodes)
 
 
 def _get_span_line_index(root_node: ast.AST) -> _SpanLineIndex:

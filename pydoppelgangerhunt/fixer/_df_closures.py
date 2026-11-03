@@ -365,16 +365,61 @@ def _collect_ancestors_from_parent_map(
     return ancestors
 
 
+def _find_detached_structural_matches(
+    stmts: Sequence[ast.AST],
+    module_tree: ast.AST,
+) -> List[ast.AST]:
+    """Finds statement slice heads (or expression nodes) in module_tree structurally matching stmts."""
+    if not stmts:
+        return []
+    k = len(stmts)
+    target_dumps = tuple(ast.dump(s) for s in stmts)
+    matches: List[ast.AST] = []
+    for node in ast.walk(module_tree):
+        for attr in ("body", "orelse", "finalbody"):
+            seq = getattr(node, attr, None)
+            if not isinstance(seq, list) or len(seq) < k:
+                continue
+            for idx in range(len(seq) - k + 1):
+                if all(
+                    isinstance(seq[idx + j], ast.AST)
+                    and ast.dump(seq[idx + j]) == target_dumps[j]
+                    for j in range(k)
+                ):
+                    matches.append(seq[idx])
+    if matches or k != 1:
+        return matches
+    single = stmts[0]
+    expr_target = single.value if isinstance(single, ast.Expr) else single
+    expr_dump = ast.dump(expr_target)
+    return [
+        node
+        for node in ast.walk(module_tree)
+        if node is not module_tree and ast.dump(node) == expr_dump
+    ]
+
+
 def _resolve_detached_enclosing_scopes(
     scope_node: ast.AST,
     module_tree: ast.AST,
     *,
     include_classes: bool = False,
 ) -> List[ast.AST]:
-    """Resolves enclosing lexical scope AST nodes in module_tree for a detached unit ast.Module."""
+    """Resolves enclosing lexical scope AST nodes in module_tree for a detached unit AST."""
     parent_map = _get_scope_parent_map(module_tree)
-    body = getattr(scope_node, "body", ())
-    stmts = [s for s in body if isinstance(s, ast.AST)] if isinstance(body, (list, tuple)) else []
+    if scope_node in parent_map:
+        return _collect_ancestors_from_parent_map(
+            scope_node, parent_map, module_tree, include_classes=include_classes
+        )
+    body = getattr(scope_node, "body", None)
+    if isinstance(body, (list, tuple)):
+        stmts = [s for s in body if isinstance(s, ast.AST)]
+    elif isinstance(scope_node, ast.AST) and not isinstance(
+        scope_node, ast.Module
+    ):
+        stmts = [scope_node]
+    else:
+        stmts = []
     if not stmts:
         return [module_tree] if isinstance(module_tree, ast.Module) else []
     first_stmt = stmts[0]
@@ -384,16 +429,66 @@ def _resolve_detached_enclosing_scopes(
         )
     s_line = getattr(first_stmt, "lineno", None)
     e_line = getattr(stmts[-1], "end_lineno", getattr(stmts[-1], "lineno", None))
-    if isinstance(s_line, int) and s_line > 1 and isinstance(e_line, int):
-        s_col = getattr(first_stmt, "col_offset", None)
-        e_col = getattr(stmts[-1], "end_col_offset", None)
+    s_col = getattr(first_stmt, "col_offset", None)
+    e_col = getattr(stmts[-1], "end_col_offset", None)
+    has_valid_lines = (
+        isinstance(s_line, int)
+        and isinstance(e_line, int)
+        and 1 <= s_line <= e_line
+    )
+    struct_matches = _find_detached_structural_matches(stmts, module_tree)
+    if struct_matches:
+        coord_filtered = (
+            [
+                m
+                for m in struct_matches
+                if getattr(m, "lineno", None) == s_line
+                and (s_col is None or getattr(m, "col_offset", None) == s_col)
+            ]
+            if has_valid_lines
+            else []
+        )
+        active_matches = coord_filtered if coord_filtered else struct_matches
+        merged_ancs: List[ast.AST] = []
+        seen_ids: Set[int] = set()
+        for m in active_matches:
+            for anc in _collect_ancestors_from_parent_map(
+                m, parent_map, module_tree, include_classes=include_classes
+            ):
+                if id(anc) not in seen_ids:
+                    seen_ids.add(id(anc))
+                    merged_ancs.append(anc)
+        if merged_ancs:
+            return merged_ancs
+
+    all_sub_scopes = [
+        node
+        for node in ast.walk(module_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    ]
+    is_ambiguous_rel_coords = (
+        not has_valid_lines
+        or (
+            s_line == 1
+            and s_col in (None, 0)
+            and any(
+                (getattr(n, "lineno", 0) or 0) > 1
+                or (getattr(n, "end_lineno", 0) or 0) > 1
+                for n in all_sub_scopes
+            )
+        )
+    )
+    if has_valid_lines and not is_ambiguous_rel_coords:
+        assert isinstance(s_line, int) and isinstance(e_line, int)
+        eff_s_col = None if (s_line == 1 and s_col == 0) else s_col
+        eff_e_col = None if (s_line == 1 and s_col == 0) else e_col
         matched_fns: List[ast.AST] = []
-        for node in ast.walk(module_tree):
+        for node in all_sub_scopes:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 n_start = getattr(node, "lineno", 0) or 0
                 n_end = getattr(node, "end_lineno", n_start) or n_start
                 if n_start <= s_line and e_line <= n_end and not _is_span_in_scope_header(
-                    node, s_line, e_line, u_start_col=s_col, u_end_col=e_col
+                    node, s_line, e_line, u_start_col=eff_s_col, u_end_col=eff_e_col
                 ):
                     matched_fns.append(node)
         if matched_fns:
@@ -405,7 +500,11 @@ def _resolve_detached_enclosing_scopes(
                 )
             )
             imm = _resolve_immediate_scope_in_fn(
-                matched_fns[-1], s_line, e_line, u_start_col=s_col, u_end_col=e_col
+                matched_fns[-1],
+                s_line,
+                e_line,
+                u_start_col=eff_s_col,
+                u_end_col=eff_e_col,
             )
             res = list(matched_fns)
             if isinstance(imm, ast.ClassDef):
@@ -413,16 +512,20 @@ def _resolve_detached_enclosing_scopes(
             if isinstance(module_tree, ast.Module):
                 res.append(module_tree)
             return res
-        if include_classes:
-            imm_mod = _resolve_immediate_scope_in_fn(
-                module_tree, s_line, e_line, u_start_col=s_col, u_end_col=e_col
-            )
-            if isinstance(imm_mod, ast.ClassDef):
-                res_cls: List[ast.AST] = [imm_mod]
-                if isinstance(module_tree, ast.Module):
-                    res_cls.append(module_tree)
-                return res_cls
-    return [module_tree] if isinstance(module_tree, ast.Module) else []
+        imm_mod = _resolve_immediate_scope_in_fn(
+            module_tree, s_line, e_line, u_start_col=eff_s_col, u_end_col=eff_e_col
+        )
+        if isinstance(imm_mod, ast.ClassDef):
+            res_cls: List[ast.AST] = [imm_mod]
+            if isinstance(module_tree, ast.Module):
+                res_cls.append(module_tree)
+            return res_cls
+        return [module_tree] if isinstance(module_tree, ast.Module) else []
+
+    fallback_res: List[ast.AST] = list(all_sub_scopes)
+    if isinstance(module_tree, ast.Module):
+        fallback_res.append(module_tree)
+    return fallback_res
 
 
 def _extract_scope_local_names(
@@ -463,11 +566,19 @@ def _extract_scope_local_names(
                 names.update(_get_cached_single_node_local_names(enc))
             return names
         visited_module_tree = False
+        first_anc = True
         while curr is not None:
             if curr is module_tree:
                 visited_module_tree = True
-            if isinstance(curr, allowed_types):
+            if isinstance(curr, allowed_types) or (
+                first_anc and isinstance(curr, ast.ClassDef)
+            ):
                 names.update(_get_cached_single_node_local_names(curr))
+            if isinstance(
+                curr,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module),
+            ):
+                first_anc = False
             curr = parent_map.get(curr)
         if not visited_module_tree and isinstance(module_tree, allowed_types):
             names.update(_get_cached_single_node_local_names(module_tree))

@@ -1390,21 +1390,6 @@ def synthesize_shared_helper_code(
     if preserve_pragmas:
         common_lines = _attach_pragmas(common_lines, pragmas1 + pragmas2)
 
-    def _resolve_tree(
-        given_tree: Optional[ast.AST],
-        given_src: Optional[str],
-        unit: Dict[str, Any],
-    ) -> Optional[ast.AST]:
-        if given_tree is not None:
-            return given_tree
-        raw_text = given_src or _load_unit_file_text(unit, repo_root=repo_root)
-        if raw_text:
-            return _get_or_parse_tree(raw_text)
-        return None
-
-    tree1 = _resolve_tree(tree1, source_text1, u1)
-    tree2 = _resolve_tree(tree2, source_text2, u2)
-
     # Variable scope analysis for concrete parameter signatures.
     _, effective_skip_closures = resolve_closure_strictness_mode(
         closure_strictness=closure_strictness,
@@ -1415,6 +1400,50 @@ def synthesize_shared_helper_code(
         and scope_matches_closure_mode(scope2, effective_skip_closures)
         and scope_matches_closure_mode(scope, effective_skip_closures)
     )
+    can_skip_tree_parse = (
+        has_precomputed_scopes
+        and (
+            not is_expr_unit
+            or (
+                bool(scope1 and scope1.get("_lhs_pruned"))
+                and bool(scope2 and scope2.get("_lhs_pruned"))
+            )
+        )
+        and outputs is not None
+        and outputs2 is not None
+    )
+
+    def _resolve_tree(
+        given_tree: Optional[ast.AST],
+        given_src: Optional[str],
+        unit: Dict[str, Any],
+    ) -> Optional[ast.AST]:
+        if given_tree is not None:
+            return given_tree
+        if (
+            can_skip_tree_parse
+            and (
+                not unit.get("enclosing_class")
+                or unit.get("receiver_kind") is not None
+            )
+            and unit.get("kind")
+            in (
+                "function",
+                "method",
+                "async_function",
+                "compound_block",
+                "sliding_window",
+                "clause_branch",
+            )
+        ):
+            return None
+        raw_text = given_src or _load_unit_file_text(unit, repo_root=repo_root)
+        if raw_text:
+            return _get_or_parse_tree(raw_text)
+        return None
+
+    tree1 = _resolve_tree(tree1, source_text1, u1)
+    tree2 = _resolve_tree(tree2, source_text2, u2)
     scopes: List[Dict[str, Any]] = []
     for u_item, s_text, t_item, pre_s in (
         (u1, source_text1, tree1, scope1),

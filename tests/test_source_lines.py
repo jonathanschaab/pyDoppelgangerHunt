@@ -14715,6 +14715,807 @@ def test_async_subroutine_without_await_suspension_precision_and_monotonicity() 
             assert strict_res is True
 
 
+def test_span_line_index_detached_subtree_eviction_and_recomputation() -> None:
+    """Verifies _SpanLineIndex AST node indexing across all 4 maps, detached subtree eviction, and fresh rebuild."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _ScopeCacheKey,
+        _evict_tree_scopes,
+        _scope_cell_info_cache,
+        _scope_owner_keys_index,
+        clear_dataflow_cache,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _get_span_line_index,
+        _resolve_unit_col_bounds,
+    )
+
+    clear_dataflow_cache()
+    try:
+        src = (
+            "def keep_fn(x):\n"
+            "    return x + 1\n"
+            "\n"
+            "def detach_fn(y):\n"
+            "    if y > 0:\n"
+            "        z = y * 2\n"
+            "    return y\n"
+        )
+        tree = ast.parse(src)
+        keep_fn = tree.body[0]
+        detach_fn = tree.body[1]
+        assert isinstance(detach_fn, ast.FunctionDef)
+        inner_if = detach_fn.body[0]
+        assert isinstance(inner_if, ast.If)
+        inner_assign = inner_if.body[0]
+
+        idx1 = _get_span_line_index(tree)
+        span_key = _ScopeCacheKey(tree, "span_line_index")
+        assert span_key in _scope_cell_info_cache
+
+        # Verify cached_ast_nodes() covers by_start_line, by_end_line, stmts_by_start_line, stmts_by_end_line
+        cached_nodes = set(idx1.cached_ast_nodes())
+        assert keep_fn in cached_nodes
+        assert detach_fn in cached_nodes
+        assert inner_if in cached_nodes
+        assert inner_assign in cached_nodes
+        for node in (keep_fn, detach_fn, inner_if, inner_assign):
+            assert span_key in _scope_owner_keys_index.get(node, set())
+
+        # Detach detach_fn from tree and evict the detached subtree
+        tree.body.pop(1)
+        _evict_tree_scopes(detach_fn)
+
+        # 1. Stale _SpanLineIndex entry is evicted
+        assert span_key not in _scope_cell_info_cache
+        assert detach_fn not in _scope_owner_keys_index
+        assert inner_if not in _scope_owner_keys_index
+        assert inner_assign not in _scope_owner_keys_index
+
+        # 2. Subsequent lookup constructs a fresh index containing only the current tree
+        idx2 = _get_span_line_index(tree)
+        assert idx2 is not idx1
+        rebuilt_nodes = set(idx2.cached_ast_nodes())
+        assert keep_fn in rebuilt_nodes
+        assert detach_fn not in rebuilt_nodes
+        assert inner_if not in rebuilt_nodes
+        assert inner_assign not in rebuilt_nodes
+        assert 4 not in idx2.by_start_line
+        assert 7 not in idx2.by_end_line
+        assert 6 not in idx2.stmts_by_start_line
+        assert 6 not in idx2.stmts_by_end_line
+
+        assert isinstance(keep_fn, ast.FunctionDef)
+        cols = _resolve_unit_col_bounds([keep_fn.body[0]], tree, 2, 2, None, None)
+        assert cols == (4, 16)
+    finally:
+        clear_dataflow_cache()
+
+
+def test_detached_ast_line1_enclosing_scope_recovery_and_builtin_shadowing() -> None:
+    """Verifies detached AST enclosing-scope recovery for line-1 nodes across sync/async/class/shadowed scopes."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context_uncached
+    from pydoppelgangerhunt.fixer._df_closures import (
+        _collect_scope_closures_uncached,
+        _extract_scope_local_names,
+        _resolve_detached_enclosing_scopes,
+    )
+
+    # 1. One-line function on line 1 with shadowed builtin sum
+    mod_one_line = ast.parse(
+        "def outer(items): sum = custom_sum; return sum(x for x in items)\n"
+    )
+    detached_ret = ast.parse("return sum(x for x in items)\n")
+    enc_one_line = _resolve_detached_enclosing_scopes(detached_ret, mod_one_line)
+    assert mod_one_line.body[0] in enc_one_line
+    locals_one_line = _extract_scope_local_names(detached_ret, module_tree=mod_one_line)
+    assert "sum" in locals_one_line
+    closures_one_line = _collect_scope_closures_uncached(
+        detached_ret, module_tree=mod_one_line
+    )
+    assert any("items" in reads for _, reads in closures_one_line)
+
+    # 2. One-line async function on line 1 with shadowed builtin sum
+    mod_async_one_line = ast.parse(
+        "async def outer(items): sum = custom_sum; return sum(x for x in items)\n"
+    )
+    detached_async_ret = ast.parse("return sum(x for x in items)\n")
+    enc_async = _resolve_detached_enclosing_scopes(
+        detached_async_ret, mod_async_one_line
+    )
+    assert mod_async_one_line.body[0] in enc_async
+    locals_async = _extract_scope_local_names(
+        detached_async_ret, module_tree=mod_async_one_line
+    )
+    assert "sum" in locals_async
+    closures_async = _collect_scope_closures_uncached(
+        detached_async_ret, module_tree=mod_async_one_line
+    )
+    assert any("items" in reads for _, reads in closures_async)
+
+    # 3. Multi-line function whose local variable shadows a builtin, detached unit reset to line 1
+    mod_multiline = ast.parse(
+        "def outer(items, custom_sum):\n"
+        "    sum = custom_sum\n"
+        "    result = sum(x for x in items)\n"
+        "    return result\n"
+    )
+    detached_stmt = ast.parse("result = sum(x for x in items)\n")
+    assert detached_stmt.body[0].lineno == 1
+    locals_multi = _extract_scope_local_names(detached_stmt, module_tree=mod_multiline)
+    assert "sum" in locals_multi
+    ctx_multi = _get_fn_scope_context_uncached(detached_stmt, mod_tree=mod_multiline)
+    assert "sum" in ctx_multi.shadowed_names
+    closures_multi = _collect_scope_closures_uncached(
+        detached_stmt, module_tree=mod_multiline
+    )
+    assert any("items" in reads for _, reads in closures_multi)
+
+    # 4. Class body nested inside a function (both outer local shadowing and class-body shadowing)
+    mod_nested_cls = ast.parse(
+        "def outer(items, custom_sum, custom_max):\n"
+        "    sum = custom_sum\n"
+        "    class Inner:\n"
+        "        max = custom_max\n"
+        "        r1 = sum(x for x in items)\n"
+        "        r2 = max(y for y in items)\n"
+        "    return Inner\n"
+    )
+    detached_cls_unit = ast.parse(
+        "r1 = sum(x for x in items)\nr2 = max(y for y in items)\n"
+    )
+    locals_cls = _extract_scope_local_names(
+        detached_cls_unit, module_tree=mod_nested_cls
+    )
+    assert "sum" in locals_cls
+    assert "max" in locals_cls
+    closures_cls = _collect_scope_closures_uncached(
+        detached_cls_unit, module_tree=mod_nested_cls
+    )
+    assert len(closures_cls) == 2
+
+    # 5. Ambiguous / modified detached fragment at line 1 preserves enclosing-scope uncertainty
+    detached_modified = ast.parse("other = sum(z for z in items)\n")
+    locals_ambig = _extract_scope_local_names(
+        detached_modified, module_tree=mod_multiline
+    )
+    assert "sum" in locals_ambig
+
+    # 6. Unambiguous module-level statement is not polluted by unrelated function locals
+    mod_with_top = ast.parse(
+        "def helper(custom_sum):\n"
+        "    sum = custom_sum\n"
+        "    return sum\n"
+        "top_res = sum(x for x in top_items)\n"
+    )
+    detached_top = ast.parse("top_res = sum(x for x in top_items)\n")
+    locals_top = _extract_scope_local_names(detached_top, module_tree=mod_with_top)
+    assert "sum" not in locals_top
+
+
+def test_tracked_scope_cache_stmt_deltas_incremental_mutation_indexing() -> None:
+    """Verifies that incremental mutations to cached stmt_deltas dictionaries update _scope_owner_keys_index."""
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _ScopeCacheKey,
+        _TrackedCachedDict,
+        _evict_tree_scopes,
+        _get_or_compute_scope_cached,
+        _scope_cell_info_cache,
+        _scope_owner_keys_index,
+        clear_dataflow_cache,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import _analyze_enclosing_fn_cells
+
+    clear_dataflow_cache()
+    try:
+        # 1. Production _analyze_enclosing_fn_cells populates stmt_deltas incrementally
+        src = (
+            "def outer(a):\n"
+            "    x = a + 1\n"
+            "    y = x + 2\n"
+            "    def sub():\n"
+            "        return x + y\n"
+            "    return sub()\n"
+        )
+        tree = ast.parse(src)
+        outer_fn = tree.body[0]
+        assert isinstance(outer_fn, ast.FunctionDef)
+        stmt_x = outer_fn.body[0]
+        stmt_y = outer_fn.body[1]
+
+        _analyze_enclosing_fn_cells(
+            outer_fn, (4, 5, 4, 16), mod_tree=tree
+        )
+        deltas_key = _ScopeCacheKey(
+            owner=outer_fn, kind="stmt_deltas", aux_ast_nodes=(tree,)
+        )
+        assert deltas_key in _scope_cell_info_cache
+        cached_deltas = _scope_cell_info_cache[deltas_key]
+        assert isinstance(cached_deltas, _TrackedCachedDict)
+        assert (stmt_x, True) in cached_deltas
+        assert (stmt_y, True) in cached_deltas
+
+        # Both statement AST keys are indexed in _scope_owner_keys_index
+        assert deltas_key in _scope_owner_keys_index[stmt_x]
+        assert deltas_key in _scope_owner_keys_index[stmt_y]
+
+        # Removing one entry updates _scope_owner_keys_index immediately
+        cached_deltas.pop((stmt_x, True))
+        assert deltas_key not in _scope_owner_keys_index.get(stmt_x, set())
+        assert deltas_key in _scope_owner_keys_index[stmt_y]
+
+        # 2. Populate a stmt_deltas dictionary via _get_or_compute_scope_cached(..., dict) after insertion
+        tree2 = ast.parse("def f(z):\n    s1 = z + 1\n    s2 = s1 + 1\n")
+        fn2 = tree2.body[0]
+        assert isinstance(fn2, ast.FunctionDef)
+        s1, s2 = fn2.body[0], fn2.body[1]
+        manual_key = _ScopeCacheKey(owner=fn2, kind="stmt_deltas")
+        manual_deltas: dict[tuple[ast.AST, bool], Any] = _get_or_compute_scope_cached(
+            _scope_cell_info_cache, manual_key, dict
+        )
+        assert s1 not in _scope_owner_keys_index
+        manual_deltas.setdefault((s1, False), None)
+        assert manual_key in _scope_owner_keys_index[s1]
+        manual_deltas[(s2, True)] = None
+        assert manual_key in _scope_owner_keys_index[s2]
+
+        # 3. Plain dict inserted directly via __setitem__ and mutated in-place is also synced
+        tree3 = ast.parse("def g(w):\n    st = w * 2\n")
+        fn3 = tree3.body[0]
+        assert isinstance(fn3, ast.FunctionDef)
+        st = fn3.body[0]
+        plain_key = _ScopeCacheKey(owner=fn3, kind="stmt_deltas")
+        plain_dict: dict[tuple[ast.AST, bool], Any] = {}
+        _scope_cell_info_cache[plain_key] = plain_dict
+        plain_dict[(st, False)] = None
+        assert plain_key in _scope_owner_keys_index[st]
+
+        # Evicting the statement node evicts the owning stmt_deltas cache entry
+        _evict_tree_scopes(st)
+        assert plain_key not in _scope_cell_info_cache
+    finally:
+        clear_dataflow_cache()
+
+
+def test_extract_unit_source_code_empty_and_whitespace_source_text_fallback(
+    tmp_path: Path,
+) -> None:
+    """Verifies that extract_unit_source_code falls back to file_source when source_text is empty/whitespace."""
+    from pydoppelgangerhunt.reporters import extract_unit_source_code
+
+    unit_empty_src = {
+        "name": "example",
+        "start": 1,
+        "end": 2,
+        "source_text": "",
+        "file_source": "def example():\n    return 42\n",
+    }
+    assert extract_unit_source_code(unit_empty_src) == [
+        "def example():\n",
+        "    return 42\n",
+    ]
+
+    unit_ws_src = {
+        "name": "example",
+        "start": 1,
+        "end": 2,
+        "source_text": "   \n\t  ",
+        "file_source": "def example():\n    return 42\n",
+    }
+    assert extract_unit_source_code(unit_ws_src) == [
+        "def example():\n",
+        "    return 42\n",
+    ]
+
+    # Legitimately empty source_text without file_source returns placeholder without reading disk
+    disk_file = tmp_path / "disk_mod.py"
+    disk_file.write_text("def on_disk():\n    return 99\n", encoding="utf-8")
+    unit_explicit_empty = {
+        "name": "on_disk",
+        "file": str(disk_file),
+        "start": 1,
+        "end": 2,
+        "source_text": "",
+    }
+    assert extract_unit_source_code(unit_explicit_empty, repo_root=str(tmp_path)) == [
+        "# Source for on_disk lines 1-2\n"
+    ]
+
+
+def test_trusted_scope_cache_key_immutability_and_enclosing_chain_and_modes() -> None:
+    """Verifies trusted key validation, same-line/multiline-header enclosing chains, and mode propagation."""
+    from pydoppelgangerhunt.fixer._df_cache import _make_trusted_scope_cache_key
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _find_enclosing_function_chain,
+        _make_scope_ctx_cache_key,
+    )
+    from pydoppelgangerhunt.fixer.dataflow import (
+        resolve_clone_generator_subroutine_outputs,
+        resolve_clone_pair_outputs,
+    )
+    from pydoppelgangerhunt.fixer.scope import (
+        analyze_unit_variable_scope,
+        ensure_unit_scope_closure_mode,
+        inspect_single_unit_scope,
+    )
+    from pydoppelgangerhunt.fixer.synthesis import synthesize_shared_helper_code
+
+    dummy = ast.parse("x = 1").body[0]
+
+    # 1. _make_trusted_scope_cache_key and _make_scope_ctx_cache_key enforce parameter immutability
+    with pytest.raises(TypeError, match="immutable"):
+        _make_trusted_scope_cache_key(dummy, "kind", params=([1, 2],))
+    with pytest.raises(TypeError, match="immutable"):
+        _make_scope_ctx_cache_key(dummy, "kind", None, extra_params=({"a": 1},))
+    with pytest.raises(ValueError, match="must not contain ast.AST"):
+        _make_trusted_scope_cache_key(dummy, "kind", params=(dummy,))
+
+    # 2. _find_enclosing_function_chain with shared end lines and multiline decorated headers
+    chain_src = (
+        "@(\n"
+        "    dec\n"
+        ")\n"
+        "def outer(\n"
+        "    a: int,\n"
+        "    b: int,\n"
+        ") -> int:\n"
+        "    def mid(c: int) -> int:\n"
+        "        def inner(d: int) -> int: return a + b + c + d\n"
+        "        return inner(c)\n"
+        "    return mid(a)\n"
+    )
+    chain_tree = ast.parse(chain_src)
+    # The return statement inside inner on line 9: "return a + b + c + d"
+    chain = _find_enclosing_function_chain(
+        chain_tree, 9, 9, u_start_col=34, u_end_col=54
+    )
+    assert [getattr(n, "name", "") for _, _, n in chain] == [
+        "outer",
+        "mid",
+        "inner",
+    ]
+    # Header span of outer (lines 4-7) must not be enclosed by outer
+    hdr_chain = _find_enclosing_function_chain(chain_tree, 5, 6)
+    assert hdr_chain == []
+
+    # 3. Strictness mode propagation across all 6 scope/output/synthesis entry points
+    mode_src = (
+        "def f1(n):\n"
+        "    x = 1\n"
+        "    cb = lambda: x\n"
+        "    x = n + 1\n"
+        "    yield x\n"
+        "    return x\n"
+        "\n"
+        "def f2(n):\n"
+        "    x = 1\n"
+        "    cb = lambda: x\n"
+        "    x = n + 1\n"
+        "    yield x\n"
+        "    return x\n"
+    )
+    u1 = {
+        "name": "u1",
+        "kind": "compound_block",
+        "start": 4,
+        "end": 5,
+        "source_text": mode_src,
+    }
+    u2 = {
+        "name": "u2",
+        "kind": "compound_block",
+        "start": 12,
+        "end": 13,
+        "source_text": mode_src,
+    }
+
+    s1_strict = inspect_single_unit_scope({**u1, "skip_pre_unit_closures": False})
+    s2_strict = inspect_single_unit_scope({**u2, "skip_pre_unit_closures": False})
+    s1_lenient = ensure_unit_scope_closure_mode(u1, s1_strict, True)
+    assert s1_strict["_skip_pre_unit_closures"] is False
+    assert s1_lenient["_skip_pre_unit_closures"] is True
+    assert "severed_closure_cell" in s1_strict["control_flow_hazards"]
+    assert "severed_closure_cell" not in s1_lenient["control_flow_hazards"]
+
+    # Passing lenient scopes into strict analyze_unit_variable_scope recomputes strict mode
+    s2_lenient = inspect_single_unit_scope({**u2, "skip_pre_unit_closures": True})
+    pair_strict = analyze_unit_variable_scope(
+        u1, u2, scope1=s1_lenient, scope2=s2_lenient, skip_pre_unit_closures=False
+    )
+    assert pair_strict["_skip_pre_unit_closures"] is False
+    assert "severed_closure_cell" in pair_strict["control_flow_hazards"]
+
+    # resolve_clone_pair_outputs and synthesize_shared_helper_code honor strict vs lenient
+    assert (
+        resolve_clone_pair_outputs(
+            u1, u2, scope1=s1_lenient, scope2=s2_lenient, closure_strictness="strict"
+        )
+        is None
+    )
+    outs_lenient = resolve_clone_pair_outputs(
+        u1, u2, scope1=s1_strict, scope2=s2_strict, closure_strictness="lenient"
+    )
+    assert outs_lenient == (["x"], ["x"])
+
+    helper_strict = synthesize_shared_helper_code(
+        u1,
+        u2,
+        helper_name="_helper",
+        scope1=s1_lenient,
+        scope2=s2_lenient,
+        closure_strictness="strict",
+    )
+    assert helper_strict == ""
+
+    pair_lenient = analyze_unit_variable_scope(
+        u1, u2, scope1=s1_lenient, scope2=s2_lenient, skip_pre_unit_closures=True
+    )
+    helper_lenient = synthesize_shared_helper_code(
+        u1,
+        u2,
+        helper_name="_helper",
+        scope=pair_lenient,
+        scope1=s1_lenient,
+        scope2=s2_lenient,
+        outputs=["x"],
+        outputs2=["x"],
+        closure_strictness="lenient",
+    )
+    assert "def _helper(" in helper_lenient
+
+    # Generator subroutine output resolution also enforces closure strictness mode
+    assert (
+        resolve_clone_generator_subroutine_outputs(
+            u1,
+            u2,
+            s1_lenient,
+            s2_lenient,
+            source_text1=mode_src,
+            source_text2=mode_src,
+            closure_strictness="strict",
+        )
+        is None
+    )
+    gen_outs_lenient = resolve_clone_generator_subroutine_outputs(
+        u1,
+        u2,
+        s1_strict,
+        s2_strict,
+        source_text1=mode_src,
+        source_text2=mode_src,
+        closure_strictness="lenient",
+    )
+    assert gen_outs_lenient == (["x"], ["x"])
+
+
+def test_differential_global_and_nonlocal_declarations_before_inside_after() -> None:
+    """Differential test for global/nonlocal declarations before, inside, and after the extracted unit."""
+    from pydoppelgangerhunt.fixer.dataflow import resolve_clone_pair_outputs
+    from pydoppelgangerhunt.fixer.patch import _build_unit_delegation_call
+    from pydoppelgangerhunt.fixer.scope import (
+        analyze_unit_variable_scope,
+        inspect_single_unit_scope,
+    )
+    from pydoppelgangerhunt.fixer.synthesis import synthesize_shared_helper_code
+
+    def _run_differential_case(
+        src: str,
+        u1_lines: tuple[int, int],
+        u2_lines: tuple[int, int],
+        eval_expr: str,
+        *,
+        expect_permitted: bool,
+    ) -> None:
+        u1 = {
+            "name": "u1",
+            "file": "sample.py",
+            "kind": "compound_block",
+            "start": u1_lines[0],
+            "end": u1_lines[1],
+            "source_text": src,
+        }
+        u2 = {
+            "name": "u2",
+            "file": "sample.py",
+            "kind": "compound_block",
+            "start": u2_lines[0],
+            "end": u2_lines[1],
+            "source_text": src,
+        }
+        s1 = inspect_single_unit_scope(u1)
+        s2 = inspect_single_unit_scope(u2)
+        pair_outs = resolve_clone_pair_outputs(u1, u2, scope1=s1, scope2=s2)
+        if not expect_permitted:
+            assert pair_outs is None
+            return
+        assert pair_outs is not None
+        outs1, outs2 = pair_outs
+        pair_scope = analyze_unit_variable_scope(u1, u2, scope1=s1, scope2=s2)
+        helper_code = synthesize_shared_helper_code(
+            u1,
+            u2,
+            helper_name="_extracted_helper",
+            scope=pair_scope,
+            scope1=s1,
+            scope2=s2,
+            outputs=outs1,
+            outputs2=outs2,
+        )
+        assert "def _extracted_helper(" in helper_code
+        orig_lines = src.splitlines(keepends=True)
+        inputs = list(pair_scope["inputs"])
+        rep1 = _build_unit_delegation_call(
+            u1,
+            src,
+            orig_lines,
+            effective_binding="none",
+            helper_name="_extracted_helper",
+            inputs=inputs,
+            outputs=outs1,
+            scope=pair_scope,
+            target_inputs=list(s1["inputs"]),
+            target_outputs=outs1,
+        )
+        rep2 = _build_unit_delegation_call(
+            u2,
+            src,
+            orig_lines,
+            effective_binding="none",
+            helper_name="_extracted_helper",
+            inputs=inputs,
+            outputs=outs1,
+            scope=pair_scope,
+            target_inputs=list(s2["inputs"]),
+            target_outputs=outs2,
+        )
+        refactored_lines = (
+            [helper_code + "\n"]
+            + orig_lines[: u1_lines[0] - 1]
+            + [rep1]
+            + orig_lines[u1_lines[1] : u2_lines[0] - 1]
+            + [rep2]
+            + orig_lines[u2_lines[1] :]
+        )
+        refactored_src = "".join(refactored_lines)
+        ns_orig: dict[str, Any] = {}
+        ns_ref: dict[str, Any] = {}
+        exec(src, ns_orig)
+        orig_val = eval(eval_expr, ns_orig)
+        exec(refactored_src, ns_ref)
+        ref_val = eval(eval_expr, ns_ref)
+        assert ref_val == orig_val
+
+    # 1. global declaration BEFORE the extracted unit (permitted when unit does not mutate global;
+    #    rejected when unit mutates global without its own declaration)
+    src_global_before_ok = (
+        "G = 10\n"
+        "def f1(n):\n"
+        "    global G\n"
+        "    G = G + 1\n"
+        "    a = n + G\n"
+        "    b = a * 2\n"
+        "    return b\n"
+        "def f2(n):\n"
+        "    global G\n"
+        "    G = G + 2\n"
+        "    a = n + G\n"
+        "    b = a * 2\n"
+        "    return b\n"
+    )
+    _run_differential_case(
+        src_global_before_ok,
+        (5, 6),
+        (11, 12),
+        "(f1(3), f2(4), G)",
+        expect_permitted=True,
+    )
+
+    src_global_before_mutated = (
+        "G = 10\n"
+        "def f1(n):\n"
+        "    global G\n"
+        "    G = n + 1\n"
+        "    b = G * 2\n"
+        "    return b\n"
+        "def f2(n):\n"
+        "    global G\n"
+        "    G = n + 1\n"
+        "    b = G * 2\n"
+        "    return b\n"
+    )
+    _run_differential_case(
+        src_global_before_mutated,
+        (4, 5),
+        (10, 11),
+        "(f1(3), f2(4), G)",
+        expect_permitted=False,
+    )
+
+    # 2. global declaration INSIDE the extracted unit (permitted when global is not touched outside unit;
+    #    rejected when enclosing function also mutates global outside unit)
+    src_global_inside_ok = (
+        "G = 10\n"
+        "def f1(n):\n"
+        "    global G\n"
+        "    G = n + 5\n"
+        "    b = G * 2\n"
+        "    return b\n"
+        "def f2(n):\n"
+        "    global G\n"
+        "    G = n + 5\n"
+        "    b = G * 2\n"
+        "    return b\n"
+    )
+    _run_differential_case(
+        src_global_inside_ok,
+        (3, 5),
+        (8, 10),
+        "(f1(3), G, f2(4), G)",
+        expect_permitted=True,
+    )
+
+    src_global_inside_escaped = (
+        "G = 10\n"
+        "def f1(n):\n"
+        "    global G\n"
+        "    G = n + 5\n"
+        "    G = G + 1\n"
+        "    return G\n"
+        "def f2(n):\n"
+        "    global G\n"
+        "    G = n + 5\n"
+        "    G = G + 1\n"
+        "    return G\n"
+    )
+    _run_differential_case(
+        src_global_inside_escaped,
+        (3, 4),
+        (8, 9),
+        "(f1(3), f2(4), G)",
+        expect_permitted=False,
+    )
+
+    # 3. global declaration AFTER the extracted unit
+    src_global_after_ok = (
+        "G = 10\n"
+        "def f1(n):\n"
+        "    a = n + 5\n"
+        "    b = a * 2\n"
+        "    global G\n"
+        "    G = b + 1\n"
+        "    return G\n"
+        "def f2(n):\n"
+        "    a = n + 5\n"
+        "    b = a * 2\n"
+        "    global G\n"
+        "    G = b + 2\n"
+        "    return G\n"
+    )
+    _run_differential_case(
+        src_global_after_ok,
+        (3, 4),
+        (9, 10),
+        "(f1(3), G, f2(4), G)",
+        expect_permitted=True,
+    )
+
+    src_global_after_mutated = (
+        "G = 10\n"
+        "def f1(n):\n"
+        "    G = n + 5\n"
+        "    b = G * 2\n"
+        "    global G\n"
+        "    return b\n"
+        "def f2(n):\n"
+        "    G = n + 5\n"
+        "    b = G * 2\n"
+        "    global G\n"
+        "    return b\n"
+    )
+    _run_differential_case(
+        src_global_after_mutated,
+        (3, 4),
+        (8, 9),
+        "(f1(3), f2(4), G)",
+        expect_permitted=False,
+    )
+
+    # 4. nonlocal declaration BEFORE, INSIDE, and AFTER the extracted unit
+    src_nonlocal_before_ok = (
+        "def run(n):\n"
+        "    cell = 5\n"
+        "    def f1(x):\n"
+        "        nonlocal cell\n"
+        "        cell = cell + 1\n"
+        "        a = x + cell\n"
+        "        b = a * 3\n"
+        "        return b\n"
+        "    def f2(x):\n"
+        "        nonlocal cell\n"
+        "        cell = cell + 2\n"
+        "        a = x + cell\n"
+        "        b = a * 3\n"
+        "        return b\n"
+        "    return f1(n), f2(n), cell\n"
+    )
+    _run_differential_case(
+        src_nonlocal_before_ok,
+        (6, 7),
+        (12, 13),
+        "run(4)",
+        expect_permitted=True,
+    )
+
+    src_nonlocal_inside_rejected = (
+        "def run(n):\n"
+        "    cell = 5\n"
+        "    def f1(x):\n"
+        "        nonlocal cell\n"
+        "        cell = x + 1\n"
+        "        return cell\n"
+        "    def f2(x):\n"
+        "        nonlocal cell\n"
+        "        cell = x + 1\n"
+        "        return cell\n"
+        "    return f1(n), f2(n), cell\n"
+    )
+    _run_differential_case(
+        src_nonlocal_inside_rejected,
+        (4, 5),
+        (8, 9),
+        "run(4)",
+        expect_permitted=False,
+    )
+
+    src_nonlocal_after_ok = (
+        "def run(n):\n"
+        "    cell = 5\n"
+        "    def f1(x):\n"
+        "        a = x + 2\n"
+        "        b = a * 3\n"
+        "        nonlocal cell\n"
+        "        cell = b + 1\n"
+        "        return cell\n"
+        "    def f2(x):\n"
+        "        a = x + 2\n"
+        "        b = a * 3\n"
+        "        nonlocal cell\n"
+        "        cell = b + 2\n"
+        "        return cell\n"
+        "    return f1(n), f2(n), cell\n"
+    )
+    _run_differential_case(
+        src_nonlocal_after_ok,
+        (4, 5),
+        (10, 11),
+        "run(4)",
+        expect_permitted=True,
+    )
+
+    src_nonlocal_before_mutated = (
+        "def run(n):\n"
+        "    cell = 5\n"
+        "    def f1(x):\n"
+        "        nonlocal cell\n"
+        "        cell = x + 2\n"
+        "        b = cell * 3\n"
+        "        return b\n"
+        "    def f2(x):\n"
+        "        nonlocal cell\n"
+        "        cell = x + 2\n"
+        "        b = cell * 3\n"
+        "        return b\n"
+        "    return f1(n), f2(n), cell\n"
+    )
+    _run_differential_case(
+        src_nonlocal_before_mutated,
+        (5, 6),
+        (10, 11),
+        "run(4)",
+        expect_permitted=True,
+    )
+
+
+
 
 
 
