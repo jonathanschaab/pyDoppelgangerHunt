@@ -15785,32 +15785,46 @@ def test_context_manager_provenance_definite_bindings_and_termination() -> None:
     assert "y" not in def_try and "y" in cond_try
     assert "z" not in def_try and "z" in cond_try
 
-    match_loop_alias_stmts = ast.parse(
+    loop_alias_stmts = ast.parse(
         "from contextlib import suppress\n"
-        "match flag:\n"
-        "    case 1 as m_var:\n"
-        "        cm_m = suppress\n"
-        "    case _:\n"
-        "        cm_m = open\n"
         "while cond:\n"
         "    cm_w = suppress\n"
         "    break\n"
         "for item in seq:\n"
         "    cm_f = suppress\n"
-        "with cm_m(ValueError):\n"
-        "    a = int('bad')\n"
         "with cm_w(ValueError):\n"
         "    b = int('bad')\n"
         "with cm_f(ValueError):\n"
         "    c = int('bad')\n"
     ).body
-    b_ml, _ = _extract_block_definite_bindings_and_term(
-        match_loop_alias_stmts, None
+    b_loop, _ = _extract_block_definite_bindings_and_term(
+        loop_alias_stmts, None
     )
-    assert not ({"a", "b", "c"} & b_ml)
-    def_ml, cond_ml = _analyze_block_assignment(match_loop_alias_stmts)
-    assert not ({"a", "b", "c"} & def_ml)
-    assert {"a", "b", "c"} <= cond_ml
+    assert not ({"b", "c"} & b_loop)
+    def_loop, cond_loop = _analyze_block_assignment(loop_alias_stmts)
+    assert not ({"b", "c"} & def_loop)
+    assert {"b", "c"} <= cond_loop
+
+    import sys
+
+    if sys.version_info >= (3, 10):
+        match_alias_stmts = ast.parse(
+            "from contextlib import suppress\n"
+            "match flag:\n"
+            "    case 1 as m_var:\n"
+            "        cm_m = suppress\n"
+            "    case _:\n"
+            "        cm_m = open\n"
+            "with cm_m(ValueError):\n"
+            "    a = int('bad')\n"
+        ).body
+        b_match, _ = _extract_block_definite_bindings_and_term(
+            match_alias_stmts, None
+        )
+        assert "a" not in b_match
+        def_match, cond_match = _analyze_block_assignment(match_alias_stmts)
+        assert "a" not in def_match
+        assert "a" in cond_match
 
 
 def test_lexical_closure_semantics_lambda_comprehension_and_class_attributes() -> None:
