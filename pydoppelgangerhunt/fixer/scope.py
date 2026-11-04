@@ -30,6 +30,8 @@ from pydoppelgangerhunt.fixer._df_cell_hazards import (
     _resolve_unit_col_bounds,
 )
 from pydoppelgangerhunt.fixer._df_cell_traversal import (
+    _clear_name_provenance,
+    _seed_scope_suppress_aliases,
     _split_with_body_by_mode,
     _update_suppress_aliases_from_stmt,
 )
@@ -466,7 +468,13 @@ class _ScopeVisitor(ast.NodeVisitor):
         if not self._scope_stack:
             self._scope_stack.append(set(self.unit_top_locals))
             created_outer = True
-        self._scope_stack.append(self._extract_arg_names(node.args))
+        lambda_locals = _extract_single_node_local_names(
+            node,
+            include_globals=False,
+            include_nonlocals=False,
+            include_self_name=False,
+        )
+        self._scope_stack.append(self._extract_arg_names(node.args) | lambda_locals)
         saved_comp_depth = self._comprehension_depth
         self._comprehension_depth = 0
         try:
@@ -1055,7 +1063,9 @@ def _block_terminates(
             ):
                 return True
         elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-            w_body = _split_with_body_by_mode(stmt, local_sup_aliases)[0]
+            w_body = _split_with_body_by_mode(
+                stmt, local_sup_aliases, strict_names=False
+            )[0]
             if _block_terminates(w_body, suppress_aliases=local_sup_aliases):
                 return True
         elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
@@ -1073,20 +1083,29 @@ def _block_terminates(
             ):
                 return True
         elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
+            t_body_seq = getattr(stmt, "body", [])
+            try_sup = set(local_sup_aliases)
+            for b_stmt in t_body_seq:
+                _update_suppress_aliases_from_stmt(b_stmt, try_sup)
+            handler_sup = set(local_sup_aliases) | {
+                tok
+                for tok in (try_sup - local_sup_aliases)
+                if not tok.startswith("!nonsup:") and not tok.startswith("!mod:")
+            }
             f_body = getattr(stmt, "finalbody", [])
             if f_body and _block_terminates(
-                f_body, suppress_aliases=local_sup_aliases
+                f_body, suppress_aliases=handler_sup
             ):
                 return True
             handlers = getattr(stmt, "handlers", [])
             o_stmts = getattr(stmt, "orelse", [])
             body_terminates = _block_terminates(
-                getattr(stmt, "body", []),
+                t_body_seq,
                 suppress_aliases=local_sup_aliases,
             ) or (
                 bool(o_stmts)
                 and _block_terminates(
-                    o_stmts, suppress_aliases=local_sup_aliases
+                    o_stmts, suppress_aliases=try_sup
                 )
             )
             if not handlers and body_terminates:
@@ -1098,7 +1117,7 @@ def _block_terminates(
                 and all(
                     _block_terminates(
                         getattr(h, "body", []),
-                        suppress_aliases=local_sup_aliases,
+                        suppress_aliases=handler_sup,
                     )
                     for h in handlers
                 )
@@ -1313,7 +1332,10 @@ def _analyze_block_assignment(
             sub_may: Set[str] = set()
             sub_live: Set[str] = set()
             sub_def, sub_cond = _analyze_block_assignment(
-                sub_stmts, may_deleted=sub_may, live_in_deleted=sub_live
+                sub_stmts,
+                may_deleted=sub_may,
+                live_in_deleted=sub_live,
+                suppress_aliases=local_sup_aliases,
             )
             live_in_del.update(sub_live - definite)
             may_del.update(sub_may)
@@ -1335,7 +1357,10 @@ def _analyze_block_assignment(
             for_may: Set[str] = set()
             for_live: Set[str] = set()
             sub_def, sub_cond = _analyze_block_assignment(
-                sub_stmts, may_deleted=for_may, live_in_deleted=for_live
+                sub_stmts,
+                may_deleted=for_may,
+                live_in_deleted=for_live,
+                suppress_aliases=local_sup_aliases,
             )
             live_in_del.update((for_live - t_names) - definite)
             may_del.update(for_may)
@@ -1372,6 +1397,7 @@ def _analyze_block_assignment(
                     risky_suffix,
                     may_deleted=w_may,
                     live_in_deleted=w_live,
+                    suppress_aliases=local_sup_aliases,
                 )
                 live_in_del.update(w_live - definite)
                 may_del.update(w_may)
@@ -1385,23 +1411,43 @@ def _analyze_block_assignment(
             t_body = list(getattr(stmt, "body", []))
             raw_try_del = _extract_deleted_names(t_body)
             is_trystar = type(stmt).__name__ == "TryStar"
+            try_body_sup = set(local_sup_aliases)
+            for b_stmt in t_body:
+                _update_suppress_aliases_from_stmt(b_stmt, try_body_sup)
+            handler_base_sup = set(local_sup_aliases) | {
+                tok
+                for tok in (try_body_sup - local_sup_aliases)
+                if not tok.startswith("!nonsup:") and not tok.startswith("!mod:")
+            }
             t_may: Set[str] = set()
             t_live: Set[str] = set()
             t_def, t_cond = _analyze_block_assignment(
-                t_body, may_deleted=t_may, live_in_deleted=t_live
+                t_body,
+                may_deleted=t_may,
+                live_in_deleted=t_live,
+                suppress_aliases=local_sup_aliases,
             )
             live_in_del.update(t_live - definite)
-            t_term = _block_terminates(t_body)
+            t_term = _block_terminates(
+                t_body, suppress_aliases=local_sup_aliases
+            )
             o_stmts = list(getattr(stmt, "orelse", []))
             o_try_may: Set[str] = set()
             if o_stmts:
                 o_try_live: Set[str] = set()
                 o_def, o_cond = _analyze_block_assignment(
-                    o_stmts, may_deleted=o_try_may, live_in_deleted=o_try_live
+                    o_stmts,
+                    may_deleted=o_try_may,
+                    live_in_deleted=o_try_live,
+                    suppress_aliases=try_body_sup,
                 )
+                for o_stmt in o_stmts:
+                    _update_suppress_aliases_from_stmt(o_stmt, try_body_sup)
                 if not t_term:
                     live_in_del.update(o_try_live - (definite | t_def))
-                o_term = _block_terminates(o_stmts)
+                o_term = _block_terminates(
+                    o_stmts, suppress_aliases=try_body_sup
+                )
                 if not o_term:
                     try_def = t_def | o_def
                     try_cond = (t_cond | o_cond) - try_def
@@ -1423,24 +1469,51 @@ def _analyze_block_assignment(
             all_handlers_terminate = bool(
                 handlers
                 and not is_trystar
-                and all(_block_terminates(getattr(h, "body", [])) for h in handlers)
+                and all(
+                    _block_terminates(
+                        getattr(h, "body", []),
+                        suppress_aliases=handler_base_sup,
+                    )
+                    for h in handlers
+                )
             )
+            final_sup = set(handler_base_sup) | {
+                tok
+                for tok in (try_body_sup - local_sup_aliases)
+                if not tok.startswith("!nonsup:") and not tok.startswith("!mod:")
+            }
 
             for h in handlers:
                 h_body = list(getattr(h, "body", []))
                 if getattr(h, "type", None) is not None:
                     d_ht, c_ht = _walrus_assignment_in_expr(h.type, is_conditional=True)
                     conditional.update(d_ht | c_ht)
+                h_sup = set(handler_base_sup)
+                if isinstance(getattr(h, "name", None), str):
+                    _clear_name_provenance(h.name, h_sup)
                 h_may: Set[str] = set()
                 h_live: Set[str] = set()
                 h_d, h_c = _analyze_block_assignment(
-                    h_body, may_deleted=h_may, live_in_deleted=h_live
+                    h_body,
+                    may_deleted=h_may,
+                    live_in_deleted=h_live,
+                    suppress_aliases=h_sup,
+                )
+                for h_stmt in h_body:
+                    _update_suppress_aliases_from_stmt(h_stmt, h_sup)
+                final_sup.update(
+                    tok
+                    for tok in (h_sup - handler_base_sup)
+                    if not tok.startswith("!nonsup:")
+                    and not tok.startswith("!mod:")
                 )
                 h_bound = {h.name} if isinstance(getattr(h, "name", None), str) else set()
                 h_d.difference_update(h_bound)
                 h_may.update(h_bound)
                 live_in_del.update((h_live - h_bound) - definite)
-                h_term = not is_trystar and _block_terminates(h_body)
+                h_term = not is_trystar and _block_terminates(
+                    h_body, suppress_aliases=h_sup
+                )
                 eff_h_del = (_extract_deleted_names(h_body) - h_d) | h_bound
                 reach_h_del = eff_h_del | (raw_try_del - h_d)
                 h_dels.append((eff_h_del, reach_h_del, h_term))
@@ -1520,6 +1593,13 @@ def _analyze_block_assignment(
                     conditional,
                     may_deleted=may_del,
                     live_in_deleted=live_in_del,
+                    suppress_aliases=final_sup,
+                )
+                local_sup_aliases.update(
+                    tok
+                    for tok in (final_sup - local_sup_aliases)
+                    if not tok.startswith("!nonsup:")
+                    and not tok.startswith("!mod:")
                 )
         elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
             d_sub, c_sub = _walrus_assignment_in_expr(getattr(stmt, "subject", None))
@@ -1551,6 +1631,9 @@ def _analyze_block_assignment(
                 if guard is not None:
                     d_g, c_g = _walrus_assignment_in_expr(guard, is_conditional=False)
                 case_init_def = pattern_stores | d_g
+                case_sup = set(local_sup_aliases)
+                for p_s in pattern_stores:
+                    _clear_name_provenance(p_s, case_sup)
                 c_may: Set[str] = set()
                 c_live: Set[str] = set()
                 c_def, c_cond = _analyze_block_assignment(
@@ -1559,13 +1642,16 @@ def _analyze_block_assignment(
                     conditional=c_g.copy() if c_g else None,
                     may_deleted=c_may,
                     live_in_deleted=c_live,
+                    suppress_aliases=case_sup,
                 )
                 live_in_del.update((c_live - case_init_def) - definite)
                 case_defs.append(c_def)
                 case_conds.update(c_def | c_cond)
                 c_del = _extract_deleted_names(case.body) - c_def
                 case_dels.update(c_del)
-                if not _block_terminates(case.body):
+                if not _block_terminates(
+                    case.body, suppress_aliases=case_sup
+                ):
                     non_term_case_defs.append(c_def)
                     non_term_case_dels.append(c_del)
                     may_del.update(c_may - pattern_stores)
@@ -2044,10 +2130,17 @@ def _unit_cols(
                 len(snip_lines) == len(unit_code_lines)
                 and snip_lines[0]
                 and snip_lines[-1]
+                and all(
+                    snip_lines[i].strip() == unit_code_lines[i].strip()
+                    for i in range(1, len(snip_lines) - 1)
+                )
             ):
+                had_explicit_col = s_col is not None or e_col is not None
+                ml_cand_s: Optional[int] = s_col
+                ml_cand_e: Optional[int] = e_col
                 line_first = unit_code_lines[0].rstrip("\r\n")
                 snip_first = snip_lines[0]
-                if s_col is None:
+                if ml_cand_s is None:
                     start_id = snip_first[0].isalnum() or snip_first[0] == "_"
                     s_matches: List[int] = []
                     idx = 0
@@ -2066,10 +2159,10 @@ def _unit_cols(
                             )
                         idx = pos + 1
                     if len(s_matches) == 1:
-                        s_col = s_matches[0]
+                        ml_cand_s = s_matches[0]
                 line_last = unit_code_lines[-1].rstrip("\r\n")
                 snip_last = snip_lines[-1].lstrip()
-                if e_col is None and snip_last:
+                if ml_cand_e is None and snip_last:
                     end_id = snip_last[-1].isalnum() or snip_last[-1] == "_"
                     l_stripped = line_last.lstrip()
                     if l_stripped.startswith(snip_last):
@@ -2085,7 +2178,11 @@ def _unit_cols(
                             )
                         )
                         if right_ok:
-                            e_col = len(line_last[:end_pos].encode("utf-8"))
+                            ml_cand_e = len(line_last[:end_pos].encode("utf-8"))
+                if had_explicit_col or (
+                    ml_cand_s is not None and ml_cand_e is not None
+                ):
+                    s_col, e_col = ml_cand_s, ml_cand_e
     if (s_col is None) != (e_col is None) and unit_code_lines:
         s_col, e_col = _infer_missing_col_from_line_ast(
             unit_code_lines,
@@ -2094,6 +2191,38 @@ def _unit_cols(
             unit_kind=str(unit.get("kind") or ""),
         )
     return s_col, e_col
+
+
+def _is_ordered_contiguous_source_match(
+    src_code_lines: Sequence[str],
+    raw_lines: Sequence[str],
+) -> bool:
+    """Checks whether src_code_lines matches an ordered contiguous window in raw_lines."""
+    raw_nonempty = [ln.strip() for ln in raw_lines if ln.strip()]
+    k = len(src_code_lines)
+    if k == 0 or k > len(raw_nonempty):
+        return False
+    if k == 1:
+        target = src_code_lines[0]
+        return any(target in r_ln for r_ln in raw_nonempty)
+    max_start = len(raw_nonempty) - k
+    for start_idx in range(max_start + 1):
+        first_raw = raw_nonempty[start_idx]
+        if first_raw != src_code_lines[0] and not first_raw.endswith(
+            src_code_lines[0]
+        ):
+            continue
+        last_raw = raw_nonempty[start_idx + k - 1]
+        if last_raw != src_code_lines[-1] and not last_raw.startswith(
+            src_code_lines[-1]
+        ):
+            continue
+        if all(
+            raw_nonempty[start_idx + i] == src_code_lines[i]
+            for i in range(1, k - 1)
+        ):
+            return True
+    return False
 
 
 def _inspect_unit_scope(
@@ -2130,7 +2259,7 @@ def _inspect_unit_scope(
     ):
         if (
             len(raw_lines) == 1
-            and ";" in raw_lines[0]
+            and (";" in raw_lines[0] or unit.get("kind") == "closure")
             and inferred_s_col is not None
             and inferred_e_col is not None
             and 0 <= inferred_s_col < inferred_e_col
@@ -2139,7 +2268,10 @@ def _inspect_unit_scope(
             sliced_stmt = _slice_utf8_line(
                 raw_lines[0], inferred_s_col, inferred_e_col
             )
-            if sliced_stmt.strip():
+            if sliced_stmt.strip() and (
+                ";" in raw_lines[0]
+                or sliced_stmt.lstrip().startswith(("lambda", "(lambda"))
+            ):
                 raw_lines = [sliced_stmt]
         elif len(raw_lines) > 1 and (
             ";" in raw_lines[0] or ";" in raw_lines[-1]
@@ -2176,7 +2308,6 @@ def _inspect_unit_scope(
         and dedent_source_text("".join(raw_lines)).strip()
         != dedent_source_text(str(unit["source_code"])).strip()
     ):
-        raw_joined = "".join(raw_lines)
         src_code_lines = [
             ln.strip()
             for ln in split_source_lines(str(unit["source_code"]))
@@ -2185,7 +2316,9 @@ def _inspect_unit_scope(
         if (
             (file_tree is not None or _get_full_source() is not None)
             and src_code_lines
-            and any(ln not in raw_joined for ln in src_code_lines)
+            and not _is_ordered_contiguous_source_match(
+                src_code_lines, raw_lines
+            )
         ):
             stale_source_code_mismatch = True
         else:
@@ -2488,10 +2621,46 @@ def _inspect_unit_scope(
         # Definite, conditional, and branch-aware deletion analysis across candidate statements
         may_deleted: Set[str] = set()
         live_in_deleted: Set[str] = set()
+        initial_sup_aliases: Set[str] = set()
+        if "open" in visitor.params:
+            initial_sup_aliases.add("!shadow:open")
+        if any(
+            isinstance(n, (ast.With, ast.AsyncWith))
+            for st in candidate_stmts
+            for n in ast.walk(st)
+        ):
+            sup_tree = file_tree
+            if sup_tree is None:
+                full_src_for_sup = _get_full_source()
+                if full_src_for_sup:
+                    sup_tree = _get_or_parse_tree(full_src_for_sup)
+            if sup_tree is not None:
+                sup_u_start = parse_unit_coord(unit, "start", default=0)
+                sup_u_end = parse_unit_coord(unit, "end", default=sup_u_start)
+                sup_chain = (
+                    _find_enclosing_function_chain(
+                        sup_tree,
+                        sup_u_start,
+                        sup_u_end,
+                        inferred_s_col,
+                        inferred_e_col,
+                    )
+                    if sup_u_start > 0
+                    else []
+                )
+                sup_fn = sup_chain[-1][2] if sup_chain else sup_tree
+                initial_sup_aliases.update(
+                    _seed_scope_suppress_aliases(
+                        sup_fn,
+                        mod_tree=sup_tree,
+                        u_start=sup_u_start,
+                    )
+                )
         def_assigned, cond_assigned = _analyze_block_assignment(
             candidate_stmts,
             may_deleted=may_deleted,
             live_in_deleted=live_in_deleted,
+            suppress_aliases=initial_sup_aliases,
         )
         for del_name in sorted(live_in_deleted):
             if (
@@ -3054,7 +3223,10 @@ def ensure_unit_scope_closure_mode(
         return scope
     u_copy = dict(unit)
     u_copy["skip_pre_unit_closures"] = bool(skip_pre_unit_closures)
-    if source_text is not None and not u_copy.get("source_text"):
+    if source_text is not None and (
+        not isinstance(u_copy.get("source_text"), str)
+        or not u_copy["source_text"].strip()
+    ):
         u_copy["source_text"] = source_text
     if (
         scope is not None
@@ -3070,7 +3242,20 @@ def ensure_unit_scope_closure_mode(
             "is_control_flow_safe": False,
             "_skip_pre_unit_closures": bool(skip_pre_unit_closures),
         }
-    return inspect_single_unit_scope(u_copy, repo_root=repo_root, tree=tree)
+    fresh_scope = inspect_single_unit_scope(
+        u_copy, repo_root=repo_root, tree=tree
+    )
+    if scope is not None and "control_flow_hazards" not in scope:
+        return {
+            **fresh_scope,
+            **scope,
+            "control_flow_hazards": fresh_scope.get("control_flow_hazards", []),
+            "is_control_flow_safe": fresh_scope.get(
+                "is_control_flow_safe", True
+            ),
+            "_skip_pre_unit_closures": bool(skip_pre_unit_closures),
+        }
+    return fresh_scope
 
 
 def analyze_unit_variable_scope(

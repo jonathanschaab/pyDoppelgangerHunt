@@ -1335,9 +1335,15 @@ def synthesize_shared_helper_code(
     """
     u1 = dict(u1)
     u2 = dict(u2)
-    if source_text1 is not None and not u1.get("source_text"):
+    if source_text1 is not None and (
+        not isinstance(u1.get("source_text"), str)
+        or not u1["source_text"].strip()
+    ):
         u1["source_text"] = source_text1
-    if source_text2 is not None and not u2.get("source_text"):
+    if source_text2 is not None and (
+        not isinstance(u2.get("source_text"), str)
+        or not u2["source_text"].strip()
+    ):
         u2["source_text"] = source_text2
     if not _align_pair_expr_kinds(u1, u2):
         return ""
@@ -1449,8 +1455,11 @@ def synthesize_shared_helper_code(
         (u1, source_text1, tree1, scope1),
         (u2, source_text2, tree2, scope2),
     ):
-        if s_text is not None:
-            u_item.setdefault("source_text", s_text)
+        if s_text is not None and (
+            not isinstance(u_item.get("source_text"), str)
+            or not u_item["source_text"].strip()
+        ):
+            u_item["source_text"] = s_text
         _populate_unit_receiver_metadata(
             u_item, repo_root=repo_root, source_text=s_text, tree=t_item
         )

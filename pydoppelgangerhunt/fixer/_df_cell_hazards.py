@@ -106,6 +106,7 @@ from pydoppelgangerhunt.fixer._df_cell_traversal import (
     _find_enclosing_chain_definite_pre_bound,
 )
 from pydoppelgangerhunt.fixer._df_closures import (
+    _COMPREHENSION_TYPES,
     _collect_scope_closures_uncached,
     _extract_comprehension_walrus_names,
     _extract_scope_nonlocals_and_outer_globals,
@@ -426,10 +427,33 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         return True
     if not enclosing_chain:
         return any(
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            isinstance(
+                node,
+                (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.Lambda,
+                    *_COMPREHENSION_TYPES,
+                ),
+            )
             and isinstance(getattr(node, "lineno", None), int)
             and getattr(node, "lineno", 0) <= ctx.u_end
-            and not isinstance(getattr(node, "end_lineno", None), int)
+            and (
+                not isinstance(getattr(node, "end_lineno", None), int)
+                or (
+                    isinstance(node, (ast.Lambda, *_COMPREHENSION_TYPES))
+                    and getattr(node, "end_lineno", 0) >= ctx.u_start
+                    and (u_start_col is None or u_end_col is None)
+                    and _has_unresolved_span_bounds(
+                        ctx.mod_tree,
+                        ctx.u_start,
+                        ctx.u_end,
+                        u_start_col,
+                        u_end_col,
+                        ctx.candidate_stmts,
+                    )
+                )
+            )
             for node in ast.walk(ctx.mod_tree)
         )
     if _has_unresolved_span_bounds(
@@ -472,8 +496,16 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     if not unit_stores_affect_enclosing and bool(explicit_nonlocal_mutations):
         return True
 
-    if _has_escaped_intra_unit_global_declarations(
+    innermost_stmt_fn: ast.AST = next(
+        (
+            fn_n
+            for _, _, fn_n in reversed(enclosing_chain)
+            if isinstance(fn_n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ),
         enclosing_chain[-1][2],
+    )
+    if _has_escaped_intra_unit_global_declarations(
+        innermost_stmt_fn,
         ctx.u_start,
         ctx.u_end,
         u_start_col=u_start_col,
@@ -482,7 +514,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     ):
         return True
     enc_nonlocals, enc_outer_globals = _extract_scope_nonlocals_and_outer_globals(
-        enclosing_chain[-1][2],
+        innermost_stmt_fn,
         ctx.u_start,
         ctx.u_end,
         u_start_col=u_start_col,
@@ -495,7 +527,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     ):
         return True
     imm_scope = _resolve_immediate_scope_in_fn(
-        enclosing_chain[-1][2],
+        innermost_stmt_fn,
         ctx.u_start,
         ctx.u_end,
         u_start_col=u_start_col,

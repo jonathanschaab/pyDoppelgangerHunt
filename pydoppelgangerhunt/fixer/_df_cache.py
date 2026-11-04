@@ -371,6 +371,13 @@ class _TrackedCachedDict(Dict[Any, Any]):
     def update(self, *args: Any, **kwargs: Any) -> None:
         self._run_mutating(lambda: dict.update(self, *args, **kwargs))
 
+    def __or__(self, other: Any) -> Dict[Any, Any]:
+        return dict.__or__(self, other)
+
+    def __ior__(self, other: Any) -> _TrackedCachedDict:
+        self._run_mutating(lambda: dict.__ior__(self, other))
+        return self
+
     def clear(self) -> None:
         self._run_mutating(lambda: dict.clear(self))
 

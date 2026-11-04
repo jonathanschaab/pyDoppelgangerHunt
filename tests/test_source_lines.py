@@ -11631,22 +11631,23 @@ def test_multilevel_concurrent_sibling_with_definite_bindings_and_class_escape()
     # =========================================================================
     # 2a. Unconditional assignment in pre-unit `with` populates definite pre_bound
     with_definite_src = (
+        "import contextlib\n"
         "def process(cm, items):\n"
-        "    with cm() as resource:\n"
+        "    with contextlib.nullcontext(cm) as resource:\n"
         "        scale = resource.factor\n"
         "    out = [x * scale for x in items]\n"
         "    return out\n"
     )
     with_def_tree = ast.parse(with_definite_src)
-    with_def_chain = _find_enclosing_function_chain(with_def_tree, 4, 4)
+    with_def_chain = _find_enclosing_function_chain(with_def_tree, 5, 5)
     pre_bound_with = _find_enclosing_chain_definite_pre_bound(
-        with_def_chain, 4, 4, mod_tree=with_def_tree
+        with_def_chain, 5, 5, mod_tree=with_def_tree
     )
     assert {"cm", "items", "resource", "scale"} <= pre_bound_with
     sc_with_def = inspect_single_unit_scope(
         {
-            "start": 4,
-            "end": 4,
+            "start": 5,
+            "end": 5,
             "kind": "linear_block",
             "source_text": with_definite_src,
             "source_code": "out = [x * scale for x in items]\n",
@@ -11658,8 +11659,13 @@ def test_multilevel_concurrent_sibling_with_definite_bindings_and_class_escape()
     # 2b. Conditional assignment inside `with`, multiple items, return/break/continue, delete, async with
     with_cases: list[tuple[str, set[str], bool]] = [
         (
-            "with cm1() as a, cm2() as b:\n    c = a + b\n",
+            "with cm1() as a, cm2() as b:\n    c = 1\n",
             {"a", "b", "c"},
+            False,
+        ),
+        (
+            "with cm1() as a, cm2() as b:\n    c = a + b\n",
+            {"a", "b"},
             False,
         ),
         (
@@ -11668,13 +11674,13 @@ def test_multilevel_concurrent_sibling_with_definite_bindings_and_class_escape()
             False,
         ),
         (
-            "with cm():\n    if cond:\n        c = 1\n    else:\n        c = 2\n",
-            {"c"},
+            "cond = True\nwith cm():\n    if cond is not None:\n        c = 1\n    else:\n        c = 2\n",
+            {"cond", "c"},
             False,
         ),
         (
-            "with cm():\n    if cond:\n        return 0\n    c = 1\n",
-            {"c"},
+            "cond = False\nwith cm():\n    if cond is None:\n        return 0\n    c = 1\n",
+            {"cond", "c"},
             False,
         ),
         (
@@ -11703,7 +11709,7 @@ def test_multilevel_concurrent_sibling_with_definite_bindings_and_class_escape()
             False,
         ),
         (
-            "async def _af():\n    async with acm() as a:\n        b = a + 1\n",
+            "async def _af():\n    async with acm() as a:\n        b = 1\n",
             {"a", "b"},
             False,
         ),
@@ -15513,6 +15519,772 @@ def test_differential_global_and_nonlocal_declarations_before_inside_after() -> 
         "run(4)",
         expect_permitted=True,
     )
+
+
+def test_context_manager_provenance_definite_bindings_and_termination() -> None:
+    """Covers Findings 1, 2, 3, and 12: context-manager definite bindings, termination, provenance, and branch aliases."""
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _find_enclosing_function_chain,
+        _get_fn_scope_context,
+    )
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _classify_with_suppression,
+        _clear_name_provenance,
+        _extract_block_definite_bindings_and_term,
+        _find_enclosing_chain_definite_pre_bound,
+        _is_proven_non_suppressing_call,
+        _is_proven_non_suppressing_target_expr,
+        _seed_scope_suppress_aliases,
+        _split_unknown_with_body,
+    )
+    from pydoppelgangerhunt.fixer.scope import (
+        _analyze_block_assignment,
+        _block_terminates,
+    )
+
+    # Finding 1: Unknown context managers do not establish definite bindings on implicit raises
+    unknown_attr_src = (
+        "def example(obj, condition):\n"
+        "    with MaybeSuppress():\n"
+        "        value = obj.attribute\n"
+        "    if condition:\n"
+        "        value = 1\n"
+        "    result = value + 1\n"
+        "    return result\n"
+    )
+    unknown_attr_tree = ast.parse(unknown_attr_src)
+    chain = _find_enclosing_function_chain(unknown_attr_tree, 4, 6)
+    pre_bound = _find_enclosing_chain_definite_pre_bound(
+        chain, 4, 6, mod_tree=unknown_attr_tree
+    )
+    assert "obj" in pre_bound
+    assert "value" not in pre_bound
+    sc_unknown_attr = inspect_single_unit_scope(
+        {
+            "start": 4,
+            "end": 6,
+            "kind": "compound_block",
+            "source_text": unknown_attr_src,
+            "source_code": (
+                "if condition:\n"
+                "    value = 1\n"
+                "result = value + 1\n"
+            ),
+        },
+        tree=unknown_attr_tree,
+    )
+    assert "severed_closure_cell" in sc_unknown_attr["control_flow_hazards"]
+
+    # _split_unknown_with_body delegates to _split_suppress_with_body
+    with_body_stmts = ast.parse("a = 1\nb = obj.attr\nc = 2\n").body
+    safe_pre, risky_suf = _split_unknown_with_body(with_body_stmts)
+    assert len(safe_pre) == 1
+    assert len(risky_suf) == 2
+
+    # Finding 2: Unknown context manager with explicit raise or raising return does not terminate
+    term_raise_stmts = ast.parse(
+        "with MaybeSuppress():\n    raise RuntimeError()\n"
+    ).body
+    bound_r, term_r = _extract_block_definite_bindings_and_term(
+        term_raise_stmts, None
+    )
+    assert bound_r == set()
+    assert term_r is False
+    assert _block_terminates(term_raise_stmts) is False
+
+    term_calc_ret_stmts = ast.parse(
+        "with MaybeSuppress():\n    return calculate()\n"
+    ).body
+    _, term_calc = _extract_block_definite_bindings_and_term(
+        term_calc_ret_stmts, None
+    )
+    assert term_calc is False
+    assert _block_terminates(term_calc_ret_stmts) is False
+
+    # Return of a literal inside unknown context manager DOES terminate
+    term_const_ret_stmts = ast.parse(
+        "with MaybeSuppress():\n    return 1\n"
+    ).body
+    _, term_const = _extract_block_definite_bindings_and_term(
+        term_const_ret_stmts, None
+    )
+    assert term_const is True
+    assert _block_terminates(term_const_ret_stmts) is True
+
+    # Non-suppressing context manager with raising return DOES terminate
+    nonsup_ret_stmts = ast.parse(
+        "import contextlib\nwith contextlib.nullcontext():\n    return calculate()\n"
+    ).body
+    _, term_nonsup = _extract_block_definite_bindings_and_term(
+        nonsup_ret_stmts, None
+    )
+    assert term_nonsup is True
+    assert _block_terminates(nonsup_ret_stmts) is True
+
+    # Finding 3: Shadowed `open` and arbitrary `obj.open()` / `obj.nullcontext()` are not trusted as "none"
+    shadow_open_src = (
+        "class SuppressAll:\n"
+        "    def __enter__(self):\n"
+        "        return self\n"
+        "    def __exit__(self, exc_type, exc, tb):\n"
+        "        return True\n"
+        "def open():\n"
+        "    return SuppressAll()\n"
+        "def example():\n"
+        "    with open():\n"
+        "        raise RuntimeError()\n"
+        "    del x\n"
+        "    return 1\n"
+    )
+    shadow_open_tree = ast.parse(shadow_open_src)
+    sc_shadow_open = inspect_single_unit_scope(
+        {
+            "start": 9,
+            "end": 11,
+            "kind": "compound_block",
+            "source_text": shadow_open_src,
+            "source_code": "with open():\n    raise RuntimeError()\ndel x\n",
+        },
+        tree=shadow_open_tree,
+    )
+    assert "x" in sc_shadow_open["inputs"]
+    assert "x" in sc_shadow_open["deleted_names"]
+
+    # Parameter shadowing `open` in scope.py and _df_cell_traversal.py
+    param_shadow_src = (
+        "def example(open):\n"
+        "    with open():\n"
+        "        x = may_fail()\n"
+        "    return x\n"
+    )
+    param_shadow_sc = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 3,
+            "kind": "compound_block",
+            "source_text": param_shadow_src,
+            "source_code": "with open():\n    x = may_fail()\n",
+        },
+        tree=ast.parse(param_shadow_src),
+    )
+    assert "x" not in param_shadow_sc["definite_stores"]
+    assert "x" in param_shadow_sc["conditional_outputs"]
+
+    # Arbitrary method calls `obj.open()` and `obj.nullcontext()` classify as "unknown"
+    with_obj_open = ast.parse("with obj.open():\n    pass\n").body[0]
+    with_obj_null = ast.parse("with obj.nullcontext():\n    pass\n").body[0]
+    assert isinstance(with_obj_open, ast.With)
+    assert isinstance(with_obj_null, ast.With)
+    assert _classify_with_suppression(with_obj_open) == "unknown"
+    assert _classify_with_suppression(with_obj_null) == "unknown"
+
+    # Proven stdlib module alias / from-import / alias assignment for non-suppressing factories
+    stdlib_proven_stmts = ast.parse(
+        "import contextlib as cl\n"
+        "from tempfile import TemporaryDirectory as TD\n"
+        "nc = cl.nullcontext\n"
+        "td = TD\n"
+        "with cl.nullcontext(), td(), nc(), open('f'):\n"
+        "    val = compute()\n"
+    ).body
+    bound_proven, _ = _extract_block_definite_bindings_and_term(
+        stdlib_proven_stmts, None
+    )
+    assert "val" in bound_proven
+
+    # Star import invalidates unshadowed builtin `open` assumption
+    star_imp_stmts = ast.parse(
+        "from custom_io import *\n"
+        "with open('f'):\n"
+        "    val = compute()\n"
+    ).body
+    bound_star, _ = _extract_block_definite_bindings_and_term(
+        star_imp_stmts, None
+    )
+    assert "val" not in bound_star
+
+    # Helper edge cases for _clear_name_provenance, _is_proven_non_suppressing_target_expr, _is_proven_non_suppressing_call
+    sup_set: set[str] = {"!nonsup:nc", "!mod:cl:contextlib"}
+    _clear_name_provenance("", sup_set)
+    _clear_name_provenance("!internal", sup_set)
+    assert "!nonsup:nc" in sup_set
+    _clear_name_provenance("nc", sup_set)
+    assert "!nonsup:nc" not in sup_set
+    assert (
+        _is_proven_non_suppressing_target_expr(ast.Constant(value=1), sup_set)
+        is False
+    )
+    assert (
+        _is_proven_non_suppressing_call(ast.Name(id="nc", ctx=ast.Load()), sup_set)
+        is False
+    )
+    assert (
+        _is_proven_non_suppressing_call(
+            ast.parse("(1)()").body[0].value,  # type: ignore[attr-defined]
+            sup_set,
+        )
+        is False
+    )
+
+    # Enclosing scope seeding of suppress aliases (including star import, walrus, class def, TypeAlias, Delete, For)
+    seed_src = (
+        "import contextlib as cl\n"
+        "from contextlib import suppress as sup_mod\n"
+        "def outer(open):\n"
+        "    from pkg import *\n"
+        "    class LocalSup:\n"
+        "        def __exit__(self, *a):\n"
+        "            return True\n"
+        "    if (w_sup := sup_mod) and (w_nc := cl.nullcontext):\n"
+        "        pass\n"
+        "    ann_var: int = 1\n"
+        "    for loop_v in (1,):\n"
+        "        del loop_v\n"
+        "    def inner():\n"
+        "        return 1\n"
+        "    return inner\n"
+    )
+    seed_tree = ast.parse(seed_src)
+    outer_fn = seed_tree.body[2]
+    assert isinstance(outer_fn, ast.FunctionDef)
+    inner_fn = outer_fn.body[-2]
+    ctx = _get_fn_scope_context(inner_fn, seed_tree)
+    seeded = _seed_scope_suppress_aliases(inner_fn, seed_tree, ctx)
+    assert "!shadow:open" in seeded
+    assert "!star_import" in seeded
+    assert "LocalSup" in seeded
+    assert "sup_mod" in seeded
+
+    # Finding 12: Suppression aliases propagated through try/except/else/finally/match/while/for
+    branch_alias_stmts = ast.parse(
+        "from contextlib import suppress\n"
+        "try:\n"
+        "    cm = suppress\n"
+        "except Exception as cm_exc:\n"
+        "    cm = suppress\n"
+        "else:\n"
+        "    cm_else = suppress\n"
+        "finally:\n"
+        "    cm_fin = suppress\n"
+        "with cm(ValueError):\n"
+        "    x = int('bad')\n"
+        "with cm_else(ValueError):\n"
+        "    y = int('bad')\n"
+        "with cm_fin(ValueError):\n"
+        "    z = int('bad')\n"
+    ).body
+    b_try, _ = _extract_block_definite_bindings_and_term(
+        branch_alias_stmts, None
+    )
+    assert "x" not in b_try
+    assert "y" not in b_try
+    assert "z" not in b_try
+    def_try, cond_try = _analyze_block_assignment(branch_alias_stmts)
+    assert "x" not in def_try and "x" in cond_try
+    assert "y" not in def_try and "y" in cond_try
+    assert "z" not in def_try and "z" in cond_try
+
+    match_loop_alias_stmts = ast.parse(
+        "from contextlib import suppress\n"
+        "match flag:\n"
+        "    case 1 as m_var:\n"
+        "        cm_m = suppress\n"
+        "    case _:\n"
+        "        cm_m = open\n"
+        "while cond:\n"
+        "    cm_w = suppress\n"
+        "    break\n"
+        "for item in seq:\n"
+        "    cm_f = suppress\n"
+        "with cm_m(ValueError):\n"
+        "    a = int('bad')\n"
+        "with cm_w(ValueError):\n"
+        "    b = int('bad')\n"
+        "with cm_f(ValueError):\n"
+        "    c = int('bad')\n"
+    ).body
+    b_ml, _ = _extract_block_definite_bindings_and_term(
+        match_loop_alias_stmts, None
+    )
+    assert not ({"a", "b", "c"} & b_ml)
+    def_ml, cond_ml = _analyze_block_assignment(match_loop_alias_stmts)
+    assert not ({"a", "b", "c"} & def_ml)
+    assert {"a", "b", "c"} <= cond_ml
+
+
+def test_lexical_closure_semantics_lambda_comprehension_and_class_attributes() -> None:
+    """Covers Findings 4, 5, 6, and 11: enclosing lambda/comprehension cell analysis and class attribute non-shadowing."""
+    from pydoppelgangerhunt.fixer import inspect_single_unit_scope
+    from pydoppelgangerhunt.fixer._df_cell_carriers import (
+        _find_enclosing_function_chain,
+        _has_unresolved_span_bounds,
+    )
+    from pydoppelgangerhunt.fixer._df_closures import (
+        _extract_nested_scope_free_reads,
+        _extract_scope_local_names,
+        _is_span_in_scope_header,
+    )
+
+    # Finding 5: Enclosing lambda scope captures and mutates x via walrus
+    lambda_src = (
+        "callback = lambda x: (\n"
+        "    (lambda: x),\n"
+        "    (x := 2),\n"
+        ")[0]\n"
+    )
+    lambda_tree = ast.parse(lambda_src)
+    chain_lam = _find_enclosing_function_chain(lambda_tree, 2, 2)
+    assert any(isinstance(n, ast.Lambda) for _, _, n in chain_lam)
+    sc_inner_lam = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 2,
+            "kind": "closure",
+            "source_text": lambda_src,
+            "source_code": "(lambda: x)",
+        },
+        tree=lambda_tree,
+    )
+    assert "severed_closure_cell" in sc_inner_lam["control_flow_hazards"]
+    assert sc_inner_lam["is_control_flow_safe"] is False
+
+    sc_walrus_in_lam = inspect_single_unit_scope(
+        {
+            "start": 3,
+            "end": 3,
+            "kind": "complex_expr",
+            "source_text": lambda_src,
+            "source_code": "(x := 2)",
+        },
+        tree=lambda_tree,
+    )
+    assert "severed_closure_cell" in sc_walrus_in_lam["control_flow_hazards"]
+
+    # Finding 11: Enclosing comprehension scopes (ListComp, SetComp, DictComp, GeneratorExp)
+    comp_src = "callbacks = [(lambda: x) for x in range(3)]\n"
+    comp_tree = ast.parse(comp_src)
+    chain_comp = _find_enclosing_function_chain(
+        comp_tree, 1, 1, u_start_col=13, u_end_col=24
+    )
+    assert any(isinstance(n, ast.ListComp) for _, _, n in chain_comp)
+    sc_comp_lam = inspect_single_unit_scope(
+        {
+            "start": 1,
+            "end": 1,
+            "kind": "closure",
+            "source_text": comp_src,
+            "source_code": "(lambda: x)",
+        },
+        tree=comp_tree,
+    )
+    assert "severed_closure_cell" in sc_comp_lam["control_flow_hazards"]
+    assert sc_comp_lam["is_control_flow_safe"] is False
+
+    # DictComp and nested comprehension with walrus in filter
+    dict_comp_src = (
+        "d_callbacks = {\n"
+        "    k: (lambda: k + w)\n"
+        "    for k in range(3)\n"
+        "    if (w := k + 1)\n"
+        "}\n"
+    )
+    dict_comp_tree = ast.parse(dict_comp_src)
+    sc_dict_comp = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 2,
+            "kind": "closure",
+            "source_text": dict_comp_src,
+            "source_code": "(lambda: k + w)",
+        },
+        tree=dict_comp_tree,
+    )
+    assert "severed_closure_cell" in sc_dict_comp["control_flow_hazards"]
+
+    # _is_span_in_scope_header and _has_unresolved_span_bounds for Lambda and Comprehension
+    list_comp_node = comp_tree.body[0].value  # type: ignore[attr-defined]
+    assert isinstance(list_comp_node, ast.ListComp)
+    assert _is_span_in_scope_header(list_comp_node, 1, 1, 29, 37) is True
+    assert _is_span_in_scope_header(list_comp_node, 1, 1, 13, 24) is False
+    assert (
+        _has_unresolved_span_bounds(list_comp_node, 1, 1, None, None) is True
+    )
+    lam_with_default = ast.parse("f = lambda x=y + 1: x\n").body[0].value.args.defaults[0]  # type: ignore[attr-defined]
+    lam_node = ast.parse("f = lambda x=y + 1: x\n").body[0].value  # type: ignore[attr-defined]
+    assert (
+        _is_span_in_scope_header(
+            lam_node,
+            1,
+            1,
+            lam_with_default.col_offset,
+            lam_with_default.end_col_offset,
+        )
+        is True
+    )
+
+    # Findings 4 & 6: Class attributes do NOT shadow names inside methods (attached and detached)
+    cls_shadow_src = (
+        "def outer(sum):\n"
+        "    class Calculator:\n"
+        "        sum = 123\n"
+        "        def total(self, values):\n"
+        "            return sum(x for x in values)\n"
+        "    return Calculator\n"
+    )
+    cls_shadow_tree = ast.parse(cls_shadow_src)
+    outer_fn = cls_shadow_tree.body[0]
+    assert isinstance(outer_fn, ast.FunctionDef)
+    calc_cls = outer_fn.body[0]
+    assert isinstance(calc_cls, ast.ClassDef)
+    total_method = calc_cls.body[1]
+    assert isinstance(total_method, ast.FunctionDef)
+    genexp_node = total_method.body[0].value.args[0]  # type: ignore[attr-defined]
+
+    # Attached mode (with module_tree)
+    method_locals_attached = _extract_scope_local_names(
+        total_method, module_tree=cls_shadow_tree
+    )
+    assert "sum" in method_locals_attached
+    # If outer did NOT bind `sum`, `Calculator.sum = 123` alone must NOT put `sum` in method locals
+    cls_only_src = (
+        "class Calculator:\n"
+        "    sum = 123\n"
+        "    def total(self, values):\n"
+        "        return sum(x for x in values)\n"
+    )
+    cls_only_tree = ast.parse(cls_only_src)
+    cls_only_node = cls_only_tree.body[0]
+    assert isinstance(cls_only_node, ast.ClassDef)
+    total_only_method = cls_only_node.body[1]
+    assert isinstance(total_only_method, ast.FunctionDef)
+    genexp_only = total_only_method.body[0].value.args[0]  # type: ignore[attr-defined]
+
+    assert "sum" not in _extract_scope_local_names(
+        total_only_method, module_tree=cls_only_tree
+    )
+    assert "sum" not in _extract_scope_local_names(
+        genexp_only, module_tree=cls_only_tree
+    )
+
+    # Detached mode (module_tree=None, after clearing caches)
+    from pydoppelgangerhunt.fixer._df_cache import clear_dataflow_cache
+
+    clear_dataflow_cache()
+    assert "sum" not in _extract_scope_local_names(
+        total_only_method, module_tree=None
+    )
+    assert "sum" not in _extract_scope_local_names(
+        genexp_only, module_tree=None
+    )
+
+    # Outer function defines `items`, class defines `items = None`, method reads `items` inside unit
+    outer_cls_method_src = (
+        "def outer():\n"
+        "    items = [1, 2]\n"
+        "    class Holder:\n"
+        "        items = None\n"
+        "        def get_items(self):\n"
+        "            return [x for x in items]\n"
+        "    items = [3, 4]\n"
+        "    res = Holder().get_items()\n"
+        "    return res\n"
+    )
+    outer_cls_tree = ast.parse(outer_cls_method_src)
+    outer_cls_fn = outer_cls_tree.body[0]
+    assert "items" in _extract_nested_scope_free_reads(outer_cls_fn.body[1])  # type: ignore[attr-defined]
+    sc_rebind_items = inspect_single_unit_scope(
+        {
+            "start": 7,
+            "end": 8,
+            "kind": "linear_block",
+            "source_text": outer_cls_method_src,
+            "source_code": "items = [3, 4]\nres = Holder().get_items()\n",
+        },
+        tree=outer_cls_tree,
+    )
+    assert "severed_closure_cell" in sc_rebind_items["control_flow_hazards"]
+
+
+def test_tracked_cached_dict_ior_and_stale_source_and_whitespace_source_text() -> None:
+    """Covers Findings 7, 13, and 14: _TrackedCachedDict.__ior__, ordered contiguous source matching, and whitespace source_text."""
+    from pydoppelgangerhunt.fixer import (
+        inspect_single_unit_scope,
+        synthesize_shared_helper_code,
+    )
+    from pydoppelgangerhunt.fixer._df_cache import (
+        _ScopeCacheKey,
+        _TrackedCachedDict,
+        _evict_tree_scopes,
+        _get_or_compute_scope_cached,
+        _scope_cell_info_cache,
+        _scope_owner_keys_index,
+        clear_dataflow_cache,
+    )
+    from pydoppelgangerhunt.fixer.scope import (
+        _is_ordered_contiguous_source_match,
+        ensure_unit_scope_closure_mode,
+    )
+
+    # Finding 7: _TrackedCachedDict.__ior__ (|=) registers AST nodes for eviction
+    clear_dataflow_cache()
+    mod_node = ast.parse("x = 1\ny = 2\n")
+    stmt_node = mod_node.body[1]
+    cache_key = _ScopeCacheKey(owner=mod_node, kind="test_ior")
+    tracked_d = _get_or_compute_scope_cached(
+        _scope_cell_info_cache, cache_key, dict
+    )
+    assert isinstance(tracked_d, _TrackedCachedDict)
+    assert (tracked_d | {stmt_node: "preview"}) == {stmt_node: "preview"}
+    tracked_d |= {stmt_node: "payload"}
+    assert stmt_node in _scope_owner_keys_index
+    _evict_tree_scopes(stmt_node)
+    assert cache_key not in _scope_cell_info_cache
+
+    # Finding 13: Reordered, duplicate, and non-contiguous source_code lines rejected
+    real_src = (
+        "def f(x):\n"
+        "    x = 1\n"
+        "    del x\n"
+        "    return 0\n"
+    )
+    real_tree = ast.parse(real_src)
+    reordered_unit = {
+        "start": 2,
+        "end": 3,
+        "kind": "linear_block",
+        "source_text": real_src,
+        "source_code": "del x\nx = 1\n",
+    }
+    sc_reordered = inspect_single_unit_scope(reordered_unit, tree=real_tree)
+    assert "pathological_ast" in sc_reordered["control_flow_hazards"]
+    assert sc_reordered["is_control_flow_safe"] is False
+
+    dup_src = (
+        "def f(x):\n"
+        "    x += 1\n"
+        "    y = 2\n"
+    )
+    dup_unit = {
+        "start": 2,
+        "end": 3,
+        "kind": "linear_block",
+        "source_text": dup_src,
+        "source_code": "x += 1\nx += 1\n",
+    }
+    sc_dup = inspect_single_unit_scope(dup_unit, tree=ast.parse(dup_src))
+    assert "pathological_ast" in sc_dup["control_flow_hazards"]
+    assert sc_dup["is_control_flow_safe"] is False
+
+    noncontig_src = (
+        "def f(a):\n"
+        "    b = a + 1\n"
+        "    c = b * 2\n"
+        "    d = c - 1\n"
+    )
+    noncontig_unit = {
+        "start": 2,
+        "end": 4,
+        "kind": "linear_block",
+        "source_text": noncontig_src,
+        "source_code": "b = a + 1\nd = c - 1\n",
+    }
+    sc_noncontig = inspect_single_unit_scope(
+        noncontig_unit, tree=ast.parse(noncontig_src)
+    )
+    assert "pathological_ast" in sc_noncontig["control_flow_hazards"]
+    assert sc_noncontig["is_control_flow_safe"] is False
+
+    assert _is_ordered_contiguous_source_match([], ["a = 1"]) is False
+    assert (
+        _is_ordered_contiguous_source_match(
+            ["a = 1", "b = 2"], ["x = 0; a = 1", "b = 2; y = 3"]
+        )
+        is True
+    )
+    assert (
+        _is_ordered_contiguous_source_match(
+            ["a = 1", "b = 2"], ["a = 1", "other = 9"]
+        )
+        is False
+    )
+
+    # Finding 14: Whitespace-only unit["source_text"] falls back to explicit source_text
+    ws_src = (
+        "def f1(a):\n"
+        "    r = a + 10\n"
+        "    s = r * 2\n"
+        "    return s\n"
+        "def f2(a):\n"
+        "    r = a + 10\n"
+        "    s = r * 2\n"
+        "    return s\n"
+    )
+    u1_ws = {
+        "name": "f1",
+        "start": 2,
+        "end": 3,
+        "kind": "linear_block",
+        "source_text": "   \n\t  ",
+        "source_code": "    r = a + 10\n    s = r * 2\n",
+    }
+    u2_ws = {
+        "name": "f2",
+        "start": 6,
+        "end": 7,
+        "kind": "linear_block",
+        "source_text": "   \n  ",
+        "source_code": "    r = a + 10\n    s = r * 2\n",
+    }
+    sc_ensured = ensure_unit_scope_closure_mode(
+        u1_ws, None, False, source_text=ws_src
+    )
+    assert sc_ensured["is_control_flow_safe"] is True
+    assert "a" in sc_ensured["inputs"]
+    helper_ws = synthesize_shared_helper_code(
+        u1_ws,
+        u2_ws,
+        helper_name="_ws_helper",
+        source_text1=ws_src,
+        source_text2=ws_src,
+    )
+    assert "def _ws_helper(" in helper_ws
+
+
+def test_differential_execution_review_round_findings() -> None:
+    """Differential execution suite verifying runtime equivalence or fail-closed rejection across Findings 1-14."""
+    from pydoppelgangerhunt.fixer import (
+        analyze_unit_variable_scope,
+        inspect_single_unit_scope,
+        synthesize_shared_helper_code,
+    )
+
+    # 1. Unknown context manager suppressing implicit AttributeError before conditional assignment
+    src_unknown_cm = (
+        "class MaybeSuppress:\n"
+        "    def __enter__(self):\n"
+        "        return self\n"
+        "    def __exit__(self, exc_type, exc, tb):\n"
+        "        return exc_type is AttributeError\n"
+        "def run(obj, cond):\n"
+        "    with MaybeSuppress():\n"
+        "        value = obj.missing_attr\n"
+        "    if cond:\n"
+        "        value = 41\n"
+        "    res = value + 1\n"
+        "    return res\n"
+    )
+    ns_cm: dict[str, object] = {}
+    exec(src_unknown_cm, ns_cm)  # nosec B102
+    orig_cm_fn = ns_cm["run"]
+    assert callable(orig_cm_fn)
+    assert orig_cm_fn(object(), True) == 42
+    sc_cm = inspect_single_unit_scope(
+        {
+            "start": 9,
+            "end": 11,
+            "kind": "compound_block",
+            "source_text": src_unknown_cm,
+            "source_code": "if cond:\n    value = 41\nres = value + 1\n",
+        },
+        tree=ast.parse(src_unknown_cm),
+    )
+    assert "severed_closure_cell" in sc_cm["control_flow_hazards"]
+
+    # 2. Enclosing lambda with walrus mutation vs inner lambda closure
+    src_lambda_cell = (
+        "def run():\n"
+        "    callback = lambda x: ((lambda: x), (x := x + 10))[0]\n"
+        "    fn = callback(5)\n"
+        "    return fn()\n"
+    )
+    ns_lam: dict[str, object] = {}
+    exec(src_lambda_cell, ns_lam)  # nosec B102
+    assert ns_lam["run"]() == 15  # type: ignore[operator]
+    sc_lam = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 2,
+            "kind": "closure",
+            "source_text": src_lambda_cell,
+            "source_code": "(lambda: x)",
+        },
+        tree=ast.parse(src_lambda_cell),
+    )
+    assert "severed_closure_cell" in sc_lam["control_flow_hazards"]
+
+    # 3. Enclosing comprehension capturing loop variable in lambda
+    src_comp_cell = (
+        "def run():\n"
+        "    cbs = [(lambda: x) for x in range(3)]\n"
+        "    return [cb() for cb in cbs]\n"
+    )
+    ns_comp: dict[str, object] = {}
+    exec(src_comp_cell, ns_comp)  # nosec B102
+    assert ns_comp["run"]() == [2, 2, 2]  # type: ignore[operator]
+    sc_comp = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 2,
+            "kind": "closure",
+            "source_text": src_comp_cell,
+            "source_code": "(lambda: x)",
+        },
+        tree=ast.parse(src_comp_cell),
+    )
+    assert "severed_closure_cell" in sc_comp["control_flow_hazards"]
+
+    # 4. Class attribute with same name as builtin `sum` used in method generator expression
+    src_cls_sum = (
+        "class Calculator:\n"
+        "    sum = 123\n"
+        "    def total1(self, values):\n"
+        "        scaled = [v * 2 for v in values]\n"
+        "        res = sum(x for x in scaled)\n"
+        "        return res\n"
+        "    def total2(self, values):\n"
+        "        scaled = [v * 2 for v in values]\n"
+        "        res = sum(x for x in scaled)\n"
+        "        return res\n"
+    )
+    cls_tree = ast.parse(src_cls_sum)
+    u_c1 = {
+        "name": "total1",
+        "start": 4,
+        "end": 5,
+        "kind": "linear_block",
+        "source_text": src_cls_sum,
+        "source_code": "        scaled = [v * 2 for v in values]\n        res = sum(x for x in scaled)\n",
+    }
+    u_c2 = {
+        "name": "total2",
+        "start": 8,
+        "end": 9,
+        "kind": "linear_block",
+        "source_text": src_cls_sum,
+        "source_code": "        scaled = [v * 2 for v in values]\n        res = sum(x for x in scaled)\n",
+    }
+    comb_cls = analyze_unit_variable_scope(u_c1, u_c2, tree1=cls_tree, tree2=cls_tree)
+    assert "sum" not in comb_cls["inputs"]
+    helper_cls = synthesize_shared_helper_code(
+        u_c1,
+        u_c2,
+        helper_name="_calc_helper",
+        scope=comb_cls,
+        outputs=["res"],
+        outputs2=["res"],
+        source_text1=src_cls_sum,
+        source_text2=src_cls_sum,
+        tree1=cls_tree,
+        tree2=cls_tree,
+    )
+    assert "def _calc_helper(values" in helper_cls
+    ns_cls: dict[str, object] = {}
+    exec(src_cls_sum + "\n" + helper_cls, ns_cls)  # nosec B102
+    calc_inst = ns_cls["Calculator"]()  # type: ignore[operator]
+    helper_fn = ns_cls["_calc_helper"]
+    assert callable(helper_fn)
+    assert calc_inst.total1([1, 2, 3]) == helper_fn([1, 2, 3]) == 12
 
 
 

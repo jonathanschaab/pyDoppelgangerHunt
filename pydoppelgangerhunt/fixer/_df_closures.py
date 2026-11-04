@@ -230,6 +230,15 @@ def _extract_single_node_local_names(
     if isinstance(node_args, ast.arguments):
         names.update(_extract_arg_names(node_args))
 
+    if isinstance(scope_node, _COMPREHENSION_TYPES):
+        for gen in scope_node.generators:
+            for t_node in ast.walk(gen.target):
+                if isinstance(t_node, ast.Name) and isinstance(
+                    t_node.ctx, ast.Store
+                ):
+                    names.add(t_node.id)
+        return names - global_names
+
     body = getattr(scope_node, "body", [])
     stack: List[ast.AST] = (
         list(body) if isinstance(body, list)
@@ -335,6 +344,26 @@ def _get_cached_single_node_local_names(scope_node: ast.AST) -> frozenset[str]:
     )
 
 
+def _is_function_like_scope_node(node: ast.AST) -> bool:
+    """Returns True if node is a function, lambda, or comprehension scope (or a single-item Module wrapper)."""
+    target = (
+        node.body[0]
+        if isinstance(node, ast.Module) and len(node.body) == 1
+        else node
+    )
+    if isinstance(target, ast.Expr):
+        target = target.value
+    return isinstance(
+        target,
+        (
+            ast.FunctionDef,
+            ast.AsyncFunctionDef,
+            ast.Lambda,
+            *_COMPREHENSION_TYPES,
+        ),
+    )
+
+
 def _collect_ancestors_from_parent_map(
     start_node: ast.AST,
     parent_map: Mapping[ast.AST, ast.AST],
@@ -345,12 +374,21 @@ def _collect_ancestors_from_parent_map(
     """Walks parent_map from start_node, keeping immediate ClassDef and enclosing functions/module."""
     ancestors: List[ast.AST] = []
     curr: Optional[ast.AST] = parent_map.get(start_node)
-    first_scope = True
+    first_scope = not _is_function_like_scope_node(start_node)
     visited_mod = False
     while curr is not None:
         if curr is module_tree:
             visited_mod = True
-        if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+        if isinstance(
+            curr,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.Lambda,
+                *_COMPREHENSION_TYPES,
+                ast.Module,
+            ),
+        ):
             ancestors.append(curr)
             first_scope = False
         elif isinstance(curr, ast.ClassDef):
@@ -358,8 +396,21 @@ def _collect_ancestors_from_parent_map(
                 ancestors.append(curr)
             first_scope = False
         curr = parent_map.get(curr)
-    if not visited_mod and isinstance(
-        module_tree, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
+    if not visited_mod and (
+        isinstance(
+            module_tree,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.Lambda,
+                *_COMPREHENSION_TYPES,
+                ast.Module,
+            ),
+        )
+        or (
+            isinstance(module_tree, ast.ClassDef)
+            and (include_classes or first_scope)
+        )
     ):
         ancestors.append(module_tree)
     return ancestors
@@ -411,15 +462,40 @@ def _resolve_detached_enclosing_scopes(
         return _collect_ancestors_from_parent_map(
             scope_node, parent_map, module_tree, include_classes=include_classes
         )
+    is_fn_like = _is_function_like_scope_node(scope_node)
     body = getattr(scope_node, "body", None)
-    if isinstance(body, (list, tuple)):
-        stmts = [s for s in body if isinstance(s, ast.AST)]
-    elif isinstance(scope_node, ast.AST) and not isinstance(
-        scope_node, ast.Module
+    if isinstance(
+        scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
     ):
-        stmts = [scope_node]
+        self_matches = _find_detached_structural_matches(
+            [scope_node], module_tree
+        )
+        if self_matches:
+            stmts: List[ast.AST] = [scope_node]
+            struct_matches = self_matches
+        else:
+            stmts = (
+                [s for s in body if isinstance(s, ast.AST)]
+                if isinstance(body, (list, tuple))
+                else [scope_node]
+            )
+            struct_matches = _find_detached_structural_matches(
+                stmts, module_tree
+            )
     else:
-        stmts = []
+        if isinstance(body, (list, tuple)):
+            stmts = [s for s in body if isinstance(s, ast.AST)]
+        elif isinstance(scope_node, ast.AST) and not isinstance(
+            scope_node, ast.Module
+        ):
+            stmts = [scope_node]
+        else:
+            stmts = []
+        struct_matches = (
+            _find_detached_structural_matches(stmts, module_tree)
+            if stmts
+            else []
+        )
     if not stmts:
         return [module_tree] if isinstance(module_tree, ast.Module) else []
     first_stmt = stmts[0]
@@ -436,7 +512,6 @@ def _resolve_detached_enclosing_scopes(
         and isinstance(e_line, int)
         and 1 <= s_line <= e_line
     )
-    struct_matches = _find_detached_structural_matches(stmts, module_tree)
     if struct_matches:
         coord_filtered = (
             [
@@ -455,6 +530,12 @@ def _resolve_detached_enclosing_scopes(
             for anc in _collect_ancestors_from_parent_map(
                 m, parent_map, module_tree, include_classes=include_classes
             ):
+                if (
+                    not include_classes
+                    and is_fn_like
+                    and isinstance(anc, ast.ClassDef)
+                ):
+                    continue
                 if id(anc) not in seen_ids:
                     seen_ids.add(id(anc))
                     merged_ancs.append(anc)
@@ -464,7 +545,16 @@ def _resolve_detached_enclosing_scopes(
     all_sub_scopes = [
         node
         for node in ast.walk(module_tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        if isinstance(
+            node,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.Lambda,
+                *_COMPREHENSION_TYPES,
+                ast.ClassDef,
+            ),
+        )
     ]
     is_ambiguous_rel_coords = (
         not has_valid_lines
@@ -484,7 +574,15 @@ def _resolve_detached_enclosing_scopes(
         eff_e_col = None if (s_line == 1 and s_col == 0) else e_col
         matched_fns: List[ast.AST] = []
         for node in all_sub_scopes:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if isinstance(
+                node,
+                (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.Lambda,
+                    *_COMPREHENSION_TYPES,
+                ),
+            ):
                 n_start = getattr(node, "lineno", 0) or 0
                 n_end = getattr(node, "end_lineno", n_start) or n_start
                 if n_start <= s_line and e_line <= n_end and not _is_span_in_scope_header(
@@ -507,7 +605,9 @@ def _resolve_detached_enclosing_scopes(
                 u_end_col=eff_e_col,
             )
             res = list(matched_fns)
-            if isinstance(imm, ast.ClassDef):
+            if isinstance(imm, ast.ClassDef) and (
+                include_classes or not is_fn_like
+            ):
                 res.append(imm)
             if isinstance(module_tree, ast.Module):
                 res.append(module_tree)
@@ -515,14 +615,20 @@ def _resolve_detached_enclosing_scopes(
         imm_mod = _resolve_immediate_scope_in_fn(
             module_tree, s_line, e_line, u_start_col=eff_s_col, u_end_col=eff_e_col
         )
-        if isinstance(imm_mod, ast.ClassDef):
+        if isinstance(imm_mod, ast.ClassDef) and (
+            include_classes or not is_fn_like
+        ):
             res_cls: List[ast.AST] = [imm_mod]
             if isinstance(module_tree, ast.Module):
                 res_cls.append(module_tree)
             return res_cls
         return [module_tree] if isinstance(module_tree, ast.Module) else []
 
-    fallback_res: List[ast.AST] = list(all_sub_scopes)
+    fallback_res: List[ast.AST] = [
+        n
+        for n in all_sub_scopes
+        if include_classes or not isinstance(n, ast.ClassDef)
+    ]
     if isinstance(module_tree, ast.Module):
         fallback_res.append(module_tree)
     return fallback_res
@@ -552,9 +658,22 @@ def _extract_scope_local_names(
     for enc in enclosing_scopes:
         names.update(_get_cached_single_node_local_names(enc))
     allowed_types = (
-        (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
+        (
+            ast.FunctionDef,
+            ast.AsyncFunctionDef,
+            ast.Lambda,
+            *_COMPREHENSION_TYPES,
+            ast.ClassDef,
+            ast.Module,
+        )
         if include_classes
-        else (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)
+        else (
+            ast.FunctionDef,
+            ast.AsyncFunctionDef,
+            ast.Lambda,
+            *_COMPREHENSION_TYPES,
+            ast.Module,
+        )
     )
     if module_tree is not None and module_tree is not scope_node:
         parent_map = _get_scope_parent_map(module_tree)
@@ -566,7 +685,7 @@ def _extract_scope_local_names(
                 names.update(_get_cached_single_node_local_names(enc))
             return names
         visited_module_tree = False
-        first_anc = True
+        first_anc = not _is_function_like_scope_node(scope_node)
         while curr is not None:
             if curr is module_tree:
                 visited_module_tree = True
@@ -576,11 +695,21 @@ def _extract_scope_local_names(
                 names.update(_get_cached_single_node_local_names(curr))
             if isinstance(
                 curr,
-                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module),
+                (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.Lambda,
+                    *_COMPREHENSION_TYPES,
+                    ast.ClassDef,
+                    ast.Module,
+                ),
             ):
                 first_anc = False
             curr = parent_map.get(curr)
-        if not visited_module_tree and isinstance(module_tree, allowed_types):
+        if not visited_module_tree and (
+            isinstance(module_tree, allowed_types)
+            or (first_anc and isinstance(module_tree, ast.ClassDef))
+        ):
             names.update(_get_cached_single_node_local_names(module_tree))
     return names
 
@@ -1075,6 +1204,23 @@ def _is_span_in_scope_header(
     u_end_col: Optional[int] = None,
 ) -> bool:
     """Checks whether [u_start, u_end] precedes node.body[0] or lies inside node's header expressions."""
+    if isinstance(node, _COMPREHENSION_TYPES):
+        if not node.generators:
+            return False
+        iter0 = node.generators[0].iter
+        return _is_ast_node_within_unit_bounds(
+            iter0,
+            u_start,
+            u_end,
+            u_end_col=u_end_col,
+            u_start_col=u_start_col,
+        ) or _node_strictly_encloses_bounds(
+            iter0,
+            u_start,
+            u_end,
+            u_start_col=u_start_col,
+            u_end_col=u_end_col,
+        )
     if any(
         _is_ast_node_within_unit_bounds(
             hdr,
@@ -1094,8 +1240,15 @@ def _is_span_in_scope_header(
     ):
         return True
     body = getattr(node, "body", None)
-    if body:
-        b_start, b_col = _node_earliest_start_pos(body[0])
+    first_body: Optional[ast.AST] = (
+        body[0]
+        if isinstance(body, (list, tuple)) and body
+        else body
+        if isinstance(body, ast.AST)
+        else None
+    )
+    if first_body is not None:
+        b_start, b_col = _node_earliest_start_pos(first_body)
         n_lineno = int(getattr(node, "lineno", 0) or 0)
         if b_start is not None and (
             u_end < b_start
@@ -1149,7 +1302,10 @@ def _resolve_immediate_scope_in_fn(
         return scope_node
     best: ast.AST = scope_node
     best_span: Optional[Tuple[int, int, int]] = None
-    stack: List[ast.AST] = list(getattr(scope_node, "body", []))
+    raw_body = getattr(scope_node, "body", None)
+    if not isinstance(raw_body, (list, tuple)):
+        return scope_node
+    stack: List[ast.AST] = list(raw_body)
     while stack:
         curr = stack.pop()
         if isinstance(curr, ast.ClassDef):

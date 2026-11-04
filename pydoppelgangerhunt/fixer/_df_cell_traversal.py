@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import ast
+from types import MappingProxyType
 from typing import (
     AbstractSet,
     Any,
     Dict,
     Iterable,
     List,
+    Mapping,
     NamedTuple,
     Optional,
     Sequence,
@@ -42,6 +44,7 @@ from pydoppelgangerhunt.fixer._df_cell_carriers import (
     _extract_fn_returned_closure_refs,
     _extract_store_names_in_node,
     _extract_type_alias_or_pattern_name,
+    _find_enclosing_function_chain,
     _get_fn_scope_context,
     _is_closure_factory_scope,
     _is_node_inside_span,
@@ -58,6 +61,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _COMPREHENSION_TYPES,
     _INNER_SCOPE_TYPES,
     _extract_node_type_param_names,
+    _extract_single_node_local_names,
     _is_irrefutable_case,
     _node_earliest_start_pos,
 )
@@ -80,6 +84,7 @@ class _CellBindingState(NamedTuple):
     loop_mutated: Set[str]
     pre_unbound: Set[str]
     fn_globals: AbstractSet[str] = frozenset()
+    suppress_aliases: Optional[Set[str]] = None
 
 
 class _StackFrame(NamedTuple):
@@ -263,21 +268,34 @@ def _eval_try_definite_bindings(
     active_nonlocals: Optional[Set[str]],
     bound: Set[str],
     fn_globals: AbstractSet[str],
+    *,
+    suppress_aliases: AbstractSet[str] = frozenset(),
 ) -> Tuple[Set[str], bool]:
     """Computes definite bindings and termination across a Try/TryStar statement."""
     body_l = getattr(stmt, "body", ())
     orelse_l = getattr(stmt, "orelse", ())
     handlers_l = getattr(stmt, "handlers", ())
     final_l = getattr(stmt, "finalbody", ())
+    local_sup: Set[str] = set(suppress_aliases)
     if not handlers_l:
         for sub_seq in (body_l, orelse_l, final_l):
             bound, t_term = _extract_block_definite_bindings_and_term(
-                sub_seq, active_nonlocals, bound, fn_globals
+                sub_seq,
+                active_nonlocals,
+                bound,
+                fn_globals,
+                suppress_aliases=local_sup,
             )
+            for s_item in sub_seq:
+                _update_suppress_aliases_from_stmt(s_item, local_sup)
             if t_term:
                 if sub_seq is not final_l and final_l:
                     f_bound, _ = _extract_block_definite_bindings_and_term(
-                        final_l, active_nonlocals, bound, fn_globals
+                        final_l,
+                        active_nonlocals,
+                        bound,
+                        fn_globals,
+                        suppress_aliases=local_sup,
                     )
                     return f_bound, True
                 return bound, True
@@ -289,43 +307,83 @@ def _eval_try_definite_bindings(
         # clear shallow deletions across the TryStar subtree and evaluate finalbody.
         bound.difference_update(_extract_shallow_deleted_names(stmt))
         if final_l:
+            for b_stmt in body_l:
+                _update_suppress_aliases_from_stmt(b_stmt, local_sup)
             return _extract_block_definite_bindings_and_term(
-                final_l, active_nonlocals, bound, fn_globals
+                final_l,
+                active_nonlocals,
+                bound,
+                fn_globals,
+                suppress_aliases=local_sup,
             )
         return bound, False
 
     pre_try_surviving = set(bound)
+    body_sup = set(local_sup)
     for b_stmt in body_l:
         pre_try_surviving.difference_update(
             _extract_shallow_deleted_names(b_stmt)
         )
+        _update_suppress_aliases_from_stmt(b_stmt, body_sup)
+    handler_base_sup = set(local_sup) | {
+        tok
+        for tok in (body_sup - local_sup)
+        if not tok.startswith("!nonsup:") and not tok.startswith("!mod:")
+    }
     for h_node in handlers_l:
         h_name = getattr(h_node, "name", None)
         if isinstance(h_name, str):
             pre_try_surviving.discard(h_name)
 
     normal_bound, normal_term = _extract_block_definite_bindings_and_term(
-        body_l, active_nonlocals, bound, fn_globals
+        body_l,
+        active_nonlocals,
+        bound,
+        fn_globals,
+        suppress_aliases=local_sup,
     )
     if not normal_term and orelse_l:
         normal_bound, normal_term = _extract_block_definite_bindings_and_term(
-            orelse_l, active_nonlocals, normal_bound, fn_globals
+            orelse_l,
+            active_nonlocals,
+            normal_bound,
+            fn_globals,
+            suppress_aliases=body_sup,
         )
+        for o_stmt in orelse_l:
+            _update_suppress_aliases_from_stmt(o_stmt, body_sup)
 
     fallthrough_sets: List[Set[str]] = []
     if not normal_term:
         fallthrough_sets.append(normal_bound)
 
+    final_sup = set(handler_base_sup) | {
+        tok
+        for tok in (body_sup - local_sup)
+        if not tok.startswith("!nonsup:") and not tok.startswith("!mod:")
+    }
     for h_node in handlers_l:
         h_body = getattr(h_node, "body", ())
         h_init = set(pre_try_surviving)
+        h_sup = set(handler_base_sup)
         h_name = getattr(h_node, "name", None)
-        if isinstance(h_name, str) and _can_bind_in_fn_scope(
-            h_name, active_nonlocals, fn_globals
-        ):
-            h_init.add(h_name)
+        if isinstance(h_name, str):
+            _clear_name_provenance(h_name, h_sup)
+            if _can_bind_in_fn_scope(h_name, active_nonlocals, fn_globals):
+                h_init.add(h_name)
         h_bound, h_term = _extract_block_definite_bindings_and_term(
-            h_body, active_nonlocals, h_init, fn_globals
+            h_body,
+            active_nonlocals,
+            h_init,
+            fn_globals,
+            suppress_aliases=h_sup,
+        )
+        for h_stmt in h_body:
+            _update_suppress_aliases_from_stmt(h_stmt, h_sup)
+        final_sup.update(
+            tok
+            for tok in (h_sup - handler_base_sup)
+            if not tok.startswith("!nonsup:") and not tok.startswith("!mod:")
         )
         if isinstance(h_name, str):
             h_bound.discard(h_name)
@@ -340,7 +398,11 @@ def _eval_try_definite_bindings(
                     _extract_shallow_deleted_names(sub_stmt)
                 )
             f_bound, _ = _extract_block_definite_bindings_and_term(
-                final_l, active_nonlocals, final_surviving, fn_globals
+                final_l,
+                active_nonlocals,
+                final_surviving,
+                fn_globals,
+                suppress_aliases=final_sup,
             )
             return f_bound, True
         return set(), True
@@ -348,7 +410,11 @@ def _eval_try_definite_bindings(
     out_bound = set.intersection(*fallthrough_sets)
     if final_l:
         out_bound, f_term = _extract_block_definite_bindings_and_term(
-            final_l, active_nonlocals, out_bound, fn_globals
+            final_l,
+            active_nonlocals,
+            out_bound,
+            fn_globals,
+            suppress_aliases=final_sup,
         )
         if f_term:
             return out_bound, True
@@ -377,6 +443,8 @@ def _eval_match_definite_bindings(
     active_nonlocals: Optional[Set[str]],
     bound: Set[str],
     fn_globals: AbstractSet[str],
+    *,
+    suppress_aliases: AbstractSet[str] = frozenset(),
 ) -> Tuple[Set[str], bool]:
     """Computes definite bindings and termination across a Match statement."""
     _apply_expr_definite_effects(
@@ -389,14 +457,17 @@ def _eval_match_definite_bindings(
     has_irrefutable = False
     for case in cases:
         case_init = set(bound)
+        case_sup = set(suppress_aliases)
         pattern = getattr(case, "pattern", None)
         if isinstance(pattern, ast.AST):
             for p_node in ast.walk(pattern):
                 p_name = _extract_pattern_bound_name(p_node)
-                if p_name is not None and _can_bind_in_fn_scope(
-                    p_name, active_nonlocals, fn_globals
-                ):
-                    case_init.add(p_name)
+                if p_name is not None:
+                    _clear_name_provenance(p_name, case_sup)
+                    if _can_bind_in_fn_scope(
+                        p_name, active_nonlocals, fn_globals
+                    ):
+                        case_init.add(p_name)
         _apply_expr_definite_effects(
             case_init, getattr(case, "guard", None), active_nonlocals, fn_globals
         )
@@ -405,6 +476,7 @@ def _eval_match_definite_bindings(
             active_nonlocals,
             case_init,
             fn_globals,
+            suppress_aliases=case_sup,
         )
         if not c_term:
             fallthrough_sets.append(c_bound)
@@ -436,6 +508,32 @@ _NON_SUPPRESSING_CTX_MANAGER_NAMES: frozenset[str] = frozenset(
         "NamedTemporaryFile",
         "SpooledTemporaryFile",
         "TemporaryFile",
+    }
+)
+
+_STDLIB_NON_SUPPRESSING_MODULES: Mapping[str, frozenset[str]] = MappingProxyType(
+    {
+        "builtins": frozenset({"open"}),
+        "__builtins__": frozenset({"open"}),
+        "io": frozenset({"open"}),
+        "contextlib": frozenset(
+            {
+                "nullcontext",
+                "closing",
+                "aclosing",
+                "redirect_stdout",
+                "redirect_stderr",
+                "chdir",
+            }
+        ),
+        "tempfile": frozenset(
+            {
+                "TemporaryDirectory",
+                "NamedTemporaryFile",
+                "SpooledTemporaryFile",
+                "TemporaryFile",
+            }
+        ),
     }
 )
 
@@ -497,19 +595,81 @@ def _extract_ctx_manager_call_name(expr: ast.AST) -> Optional[str]:
     return None
 
 
+def _clear_name_provenance(
+    name: str,
+    suppress_aliases: Set[str],
+    *,
+    mark_shadow: bool = True,
+) -> None:
+    """Clears suppressor and non-suppressing stdlib provenance for a rebound name."""
+    if not name or name.startswith("!"):
+        return
+    suppress_aliases.discard(name)
+    suppress_aliases.discard(f"!nonsup:{name}")
+    for mod_name in _STDLIB_NON_SUPPRESSING_MODULES:
+        suppress_aliases.discard(f"!mod:{name}:{mod_name}")
+    if mark_shadow and name == "open":
+        suppress_aliases.add("!shadow:open")
+
+
 def _is_suppress_alias_target_expr(
     expr: Optional[ast.AST],
     suppress_aliases: AbstractSet[str] = frozenset(),
 ) -> bool:
     """Returns True if expr references a known suppressing context manager or alias."""
     if isinstance(expr, ast.Name):
-        return (
+        return not expr.id.startswith("!") and (
             expr.id in _SUPPRESSING_CTX_MANAGER_NAMES
             or expr.id in suppress_aliases
         )
     if isinstance(expr, ast.Attribute):
         return expr.attr in _SUPPRESSING_CTX_MANAGER_NAMES
     return False
+
+
+def _is_proven_non_suppressing_target_expr(
+    expr: Optional[ast.AST],
+    suppress_aliases: AbstractSet[str] = frozenset(),
+) -> bool:
+    """Returns True if expr is a proven unshadowed non-suppressing stdlib context manager factory."""
+    if isinstance(expr, ast.Name):
+        fn_id = expr.id
+        if fn_id.startswith("!") or fn_id in suppress_aliases:
+            return False
+        if f"!nonsup:{fn_id}" in suppress_aliases:
+            return True
+        return (
+            fn_id == "open"
+            and "!shadow:open" not in suppress_aliases
+            and "!star_import" not in suppress_aliases
+        )
+    if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name):
+        base_id = expr.value.id
+        attr_name = expr.attr
+        if (
+            base_id in ("builtins", "__builtins__")
+            and attr_name == "open"
+            and f"!shadow:{base_id}" not in suppress_aliases
+            and "!star_import" not in suppress_aliases
+        ):
+            return True
+        for mod_name, allowed_attrs in _STDLIB_NON_SUPPRESSING_MODULES.items():
+            if (
+                f"!mod:{base_id}:{mod_name}" in suppress_aliases
+                and attr_name in allowed_attrs
+            ):
+                return True
+    return False
+
+
+def _is_proven_non_suppressing_call(
+    expr: ast.AST,
+    suppress_aliases: AbstractSet[str] = frozenset(),
+) -> bool:
+    """Returns True if expr is a Call to a proven non-suppressing stdlib context manager."""
+    return isinstance(expr, ast.Call) and _is_proven_non_suppressing_target_expr(
+        expr.func, suppress_aliases
+    )
 
 
 def _class_def_may_suppress_in_exit(cls_node: ast.ClassDef) -> bool:
@@ -532,24 +692,164 @@ def _update_suppress_aliases_from_stmt(
     stmt: ast.AST,
     suppress_aliases: Set[str],
 ) -> None:
-    """Updates suppress_aliases in-place from import, assignment, or class definition statements."""
-    if isinstance(stmt, ast.ImportFrom):
+    """Updates suppress_aliases in-place from import, assignment, or definition statements."""
+    if isinstance(stmt, ast.Import):
         for alias in stmt.names:
+            bound = alias.asname or alias.name.split(".", 1)[0]
+            if bound == "*":
+                suppress_aliases.add("!star_import")
+                continue
+            _clear_name_provenance(bound, suppress_aliases)
+            if alias.name in _STDLIB_NON_SUPPRESSING_MODULES and (
+                alias.asname is not None or "." not in alias.name
+            ):
+                suppress_aliases.add(f"!mod:{bound}:{alias.name}")
+    elif isinstance(stmt, ast.ImportFrom):
+        mod_name = stmt.module or ""
+        allowed_nonsup = (
+            _STDLIB_NON_SUPPRESSING_MODULES.get(mod_name, frozenset())
+            if getattr(stmt, "level", 0) == 0
+            else frozenset()
+        )
+        for alias in stmt.names:
+            if alias.name == "*":
+                suppress_aliases.add("!star_import")
+                continue
+            bound = alias.asname or alias.name
+            _clear_name_provenance(bound, suppress_aliases)
             if alias.name in _SUPPRESSING_CTX_MANAGER_NAMES:
-                suppress_aliases.add(alias.asname or alias.name)
+                suppress_aliases.add(bound)
+            elif alias.name in allowed_nonsup:
+                suppress_aliases.add(f"!nonsup:{bound}")
     elif isinstance(stmt, ast.Assign):
         is_sup = _is_suppress_alias_target_expr(stmt.value, suppress_aliases)
+        is_nonsup = _is_proven_non_suppressing_target_expr(
+            stmt.value, suppress_aliases
+        )
         for tgt in stmt.targets:
-            if isinstance(tgt, ast.Name):
-                if is_sup:
-                    suppress_aliases.add(tgt.id)
-                else:
-                    suppress_aliases.discard(tgt.id)
+            for t_name in _extract_store_names_in_node(tgt):
+                _clear_name_provenance(t_name, suppress_aliases)
+                if isinstance(tgt, ast.Name):
+                    if is_sup:
+                        suppress_aliases.add(t_name)
+                    elif is_nonsup:
+                        suppress_aliases.add(f"!nonsup:{t_name}")
+    elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+        if stmt.value is not None:
+            for t_name in _extract_store_names_in_node(stmt.target):
+                _clear_name_provenance(t_name, suppress_aliases)
+    elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        _clear_name_provenance(stmt.name, suppress_aliases)
     elif isinstance(stmt, ast.ClassDef):
+        _clear_name_provenance(stmt.name, suppress_aliases)
         if _class_def_may_suppress_in_exit(stmt):
             suppress_aliases.add(stmt.name)
-        else:
-            suppress_aliases.discard(stmt.name)
+    elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+        for t_name in _extract_store_names_in_node(stmt.target):
+            _clear_name_provenance(t_name, suppress_aliases)
+    elif isinstance(stmt, ast.Delete):
+        for d_name in _extract_shallow_deleted_names(stmt):
+            _clear_name_provenance(d_name, suppress_aliases)
+    elif type(stmt).__name__ == "TypeAlias":
+        ta_name = _extract_type_alias_or_pattern_name(stmt)
+        if ta_name is not None:
+            _clear_name_provenance(ta_name, suppress_aliases)
+    if not isinstance(stmt, _INNER_SCOPE_TYPES):
+        w_stack: List[ast.AST] = list(ast.iter_child_nodes(stmt))
+        while w_stack:
+            w_curr = w_stack.pop()
+            if isinstance(w_curr, _INNER_SCOPE_TYPES):
+                continue
+            if isinstance(w_curr, ast.NamedExpr) and isinstance(
+                w_curr.target, ast.Name
+            ):
+                w_name = w_curr.target.id
+                is_w_sup = _is_suppress_alias_target_expr(
+                    w_curr.value, suppress_aliases
+                )
+                is_w_nonsup = _is_proven_non_suppressing_target_expr(
+                    w_curr.value, suppress_aliases
+                )
+                _clear_name_provenance(w_name, suppress_aliases)
+                if is_w_sup:
+                    suppress_aliases.add(w_name)
+                elif is_w_nonsup:
+                    suppress_aliases.add(f"!nonsup:{w_name}")
+            w_stack.extend(ast.iter_child_nodes(w_curr))
+
+
+def _seed_scope_suppress_aliases(
+    fn_node: ast.AST,
+    mod_tree: Optional[ast.AST] = None,
+    scope_ctx: Optional[_FnScopeContext] = None,
+    *,
+    u_start: int = 0,
+) -> Set[str]:
+    """Seeds initial context-manager suppression and shadowing provenance for fn_node."""
+    aliases: Set[str] = set()
+    eff_mod = (
+        mod_tree
+        if isinstance(mod_tree, ast.Module)
+        else (fn_node if isinstance(fn_node, ast.Module) else None)
+    )
+    if eff_mod is not None:
+        for m_stmt in eff_mod.body:
+            if m_stmt is fn_node:
+                continue
+            if (
+                fn_node is eff_mod
+                and 0 < u_start <= (getattr(m_stmt, "lineno", 0) or 0)
+            ):
+                break
+            _update_suppress_aliases_from_stmt(m_stmt, aliases)
+    enclosing_nodes: Sequence[ast.AST] = (
+        scope_ctx.enclosing_scopes
+        if scope_ctx is not None and scope_ctx.enclosing_scopes
+        else tuple(
+            enc_n
+            for _, _, enc_n in _find_enclosing_function_chain(
+                eff_mod,
+                int(getattr(fn_node, "lineno", 0) or 0),
+                int(getattr(fn_node, "end_lineno", 0) or 0),
+                getattr(fn_node, "col_offset", None),
+                getattr(fn_node, "end_col_offset", None),
+            )
+            if enc_n is not fn_node
+        )
+        if eff_mod is not None and fn_node is not eff_mod
+        else ()
+    )
+    for enc in enclosing_nodes:
+        enc_body = getattr(enc, "body", None)
+        if isinstance(enc_body, (list, tuple)):
+            for e_stmt in enc_body:
+                if e_stmt is fn_node:
+                    break
+                _update_suppress_aliases_from_stmt(e_stmt, aliases)
+        enc_args = getattr(enc, "args", None)
+        if isinstance(enc_args, ast.arguments):
+            for p_name in _extract_arg_names(enc_args):
+                _clear_name_provenance(p_name, aliases)
+    if scope_ctx is not None:
+        if scope_ctx.has_star_import:
+            aliases.add("!star_import")
+        for b_name in ("open", "builtins", "__builtins__"):
+            if b_name in scope_ctx.shadowed_names:
+                aliases.add(f"!shadow:{b_name}")
+    fn_args = getattr(fn_node, "args", None)
+    if isinstance(fn_args, ast.arguments):
+        for p_name in _extract_arg_names(fn_args):
+            _clear_name_provenance(p_name, aliases)
+    for tp_name in _extract_node_type_param_names(fn_node):
+        _clear_name_provenance(tp_name, aliases)
+    if u_start > 0 and fn_node is not eff_mod:
+        fn_body = getattr(fn_node, "body", None)
+        if isinstance(fn_body, (list, tuple)):
+            for f_stmt in fn_body:
+                if (getattr(f_stmt, "lineno", 0) or 0) >= u_start:
+                    break
+                _update_suppress_aliases_from_stmt(f_stmt, aliases)
+    return aliases
 
 
 def _classify_with_suppression(
@@ -562,16 +862,24 @@ def _classify_with_suppression(
     all_non_suppressing = True
     for item in stmt.items:
         call_name = _extract_ctx_manager_call_name(item.context_expr)
-        if call_name is not None and (
-            call_name in _SUPPRESSING_CTX_MANAGER_NAMES
-            or call_name in suppress_aliases
+        if (
+            call_name is not None
+            and not call_name.startswith("!")
+            and (
+                call_name in _SUPPRESSING_CTX_MANAGER_NAMES
+                or call_name in suppress_aliases
+            )
         ):
             return "suppressing"
-        if isinstance(item.context_expr, ast.Name) and (
-            item.context_expr.id in suppress_aliases
+        if (
+            isinstance(item.context_expr, ast.Name)
+            and not item.context_expr.id.startswith("!")
+            and item.context_expr.id in suppress_aliases
         ):
             return "suppressing"
-        if call_name not in _NON_SUPPRESSING_CTX_MANAGER_NAMES:
+        if not _is_proven_non_suppressing_call(
+            item.context_expr, suppress_aliases
+        ):
             all_non_suppressing = False
     return "non_suppressing" if all_non_suppressing else "unknown"
 
@@ -926,16 +1234,14 @@ def _stmt_contains_direct_raise(stmt: ast.AST) -> bool:
 
 def _split_unknown_with_body(
     body: Sequence[ast.stmt],
+    *,
+    safe_names: AbstractSet[str] = frozenset(),
+    strict_names: bool = True,
 ) -> Tuple[List[ast.stmt], List[ast.stmt]]:
-    """Splits an unknown context manager's body before the first statement containing a direct raise."""
-    safe_prefix: List[ast.stmt] = []
-    for idx, b_stmt in enumerate(body):
-        if _stmt_contains_direct_raise(b_stmt):
-            return safe_prefix, list(body[idx:])
-        safe_prefix.append(b_stmt)
-        if isinstance(b_stmt, (ast.Return, ast.Break, ast.Continue)):
-            return safe_prefix, []
-    return safe_prefix, []
+    """Splits an unknown context manager's body into (guaranteed_non_raising_prefix, potentially_raising_suffix)."""
+    return _split_suppress_with_body(
+        body, safe_names=safe_names, strict_names=strict_names
+    )
 
 
 def _split_with_body_by_mode(
@@ -943,13 +1249,16 @@ def _split_with_body_by_mode(
     suppress_aliases: AbstractSet[str] = frozenset(),
     *,
     safe_names: AbstractSet[str] = frozenset(),
+    strict_names: bool = True,
 ) -> Tuple[List[ast.stmt], List[ast.stmt]]:
     """Splits a with-block body into (guaranteed_prefix, potentially_suppressed_suffix) across 3 suppression states."""
     w_mode = _classify_with_suppression(stmt, suppress_aliases)
     if w_mode == "suppressing":
         return _split_suppress_with_body(stmt.body, safe_names=safe_names)
     if w_mode == "unknown":
-        return _split_unknown_with_body(stmt.body)
+        return _split_unknown_with_body(
+            stmt.body, safe_names=safe_names, strict_names=strict_names
+        )
     return list(stmt.body), []
 
 
@@ -1056,14 +1365,22 @@ def _extract_block_definite_bindings_and_term(
             continue
         if isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
             bound, t_term = _eval_try_definite_bindings(
-                stmt, active_nonlocals, bound, fn_globals
+                stmt,
+                active_nonlocals,
+                bound,
+                fn_globals,
+                suppress_aliases=local_sup_aliases,
             )
             if t_term:
                 return bound, True
             continue
         if type(stmt).__name__ == "Match":
             bound, m_term = _eval_match_definite_bindings(
-                stmt, active_nonlocals, bound, fn_globals
+                stmt,
+                active_nonlocals,
+                bound,
+                fn_globals,
+                suppress_aliases=local_sup_aliases,
             )
             if m_term:
                 return bound, True
@@ -1109,10 +1426,16 @@ def _extract_block_definite_bindings(
     active_nonlocals: Optional[Set[str]],
     initial_bound: AbstractSet[str] = frozenset(),
     fn_globals: AbstractSet[str] = frozenset(),
+    *,
+    suppress_aliases: AbstractSet[str] = frozenset(),
 ) -> Set[str]:
     """Extracts variable names unconditionally bound across a statement sequence."""
     return _extract_block_definite_bindings_and_term(
-        stmts, active_nonlocals, initial_bound, fn_globals
+        stmts,
+        active_nonlocals,
+        initial_bound,
+        fn_globals,
+        suppress_aliases=suppress_aliases,
     )[0]
 
 
@@ -1138,7 +1461,11 @@ def _maybe_push_pre_span_exhaustive_frame(
         )
     ):
         exh_bound = _extract_block_definite_bindings(
-            (curr,), frame.active_nonlocals, state.pre_bound, state.fn_globals
+            (curr,),
+            frame.active_nonlocals,
+            state.pre_bound,
+            state.fn_globals,
+            suppress_aliases=state.suppress_aliases or frozenset(),
         )
         if exh_bound:
             stack.append(
@@ -1726,16 +2053,14 @@ def _handle_nested_scope_node(
             state.post_reads.update(
                 _extract_expr_scope_free_reads(curr, include_header=False)
             )
-        if curr.generators:
-            stack.append(
-                _StackFrame(
-                    curr.generators[0].iter,
-                    frame.is_branched,
-                    frame.in_loop,
-                    frame.active_nonlocals,
-                    force_after_span=frame.force_after_span,
-                )
-            )
+        _push_seq(
+            stack,
+            [curr.generators[0].iter] if curr.generators else (),
+            frame.is_branched,
+            frame.in_loop,
+            frame.active_nonlocals,
+            force_after_span=frame.force_after_span,
+        )
         return True
 
     return False
@@ -1877,6 +2202,7 @@ def _make_empty_traversal_buffers(
     scope_ctx: _FnScopeContext,
     pre_bound: Optional[Set[str]] = None,
     unit_mutations: AbstractSet[str] = frozenset(),
+    initial_suppress_aliases: Optional[AbstractSet[str]] = None,
 ) -> _CellTraversalBuffers:
     """Creates fresh mutable traversal buffers for enclosing function cell analysis."""
     bound_set: Set[str] = set(pre_bound) if pre_bound is not None else set()
@@ -1889,6 +2215,11 @@ def _make_empty_traversal_buffers(
             loop_mutated=set(),
             pre_unbound=set(),
             fn_globals=fn_globals,
+            suppress_aliases=(
+                set(initial_suppress_aliases)
+                if initial_suppress_aliases is not None
+                else set()
+            ),
         ),
         sibling_closures=[],
         concurrent_sib_indices=set(),
@@ -1946,7 +2277,7 @@ def _try_apply_cached_stmt_delta(
     stmt: ast.stmt,
     span: _SpanBounds,
     bufs: _CellTraversalBuffers,
-    stmt_deltas: Dict[Tuple[ast.AST, bool], Optional[_StmtCellDelta]],
+    stmt_deltas: Dict[Tuple[Any, ...], Optional[_StmtCellDelta]],
     *,
     is_branched: bool = False,
     in_loop: bool = False,
@@ -1971,7 +2302,16 @@ def _try_apply_cached_stmt_delta(
     )
     if not (is_before or is_after):
         return False
-    key = (stmt, is_before)
+    active_sup = frozenset(bufs.state.suppress_aliases or ())
+    if (
+        is_before
+        and not is_branched
+        and bufs.state.suppress_aliases is not None
+    ):
+        _update_suppress_aliases_from_stmt(stmt, bufs.state.suppress_aliases)
+    key: Tuple[Any, ...] = (
+        (stmt, is_before, active_sup) if active_sup else (stmt, is_before)
+    )
     with _downstream_cache_lock:
         has_key = key in stmt_deltas
         delta = stmt_deltas.get(key) if has_key else None
@@ -1986,7 +2326,9 @@ def _try_apply_cached_stmt_delta(
             else _SpanBounds(0, 0)
         )
         sub_bufs = _make_empty_traversal_buffers(
-            bufs.state.fn_globals, bufs.scope_ctx
+            bufs.state.fn_globals,
+            bufs.scope_ctx,
+            initial_suppress_aliases=active_sup,
         )
         _traverse_fn_cell_frames(
             [_StackFrame(stmt, False, False, None)],
@@ -2040,7 +2382,7 @@ def _traverse_fn_cell_frames(
     bufs: _CellTraversalBuffers,
     enclosed_fn: Optional[ast.AST] = None,
     stmt_deltas: Optional[
-        Dict[Tuple[ast.AST, bool], Optional[_StmtCellDelta]]
+        Dict[Tuple[Any, ...], Optional[_StmtCellDelta]]
     ] = None,
 ) -> bool:
     """Traverses AST frames to populate cell bindings, closures, and multi-invocation state."""
@@ -2079,33 +2421,78 @@ def _traverse_fn_cell_frames(
 
         c_line = getattr(curr, "lineno", None)
         c_col = getattr(curr, "col_offset", None)
-
-        if curr is enclosed_fn and isinstance(
-            curr, (ast.FunctionDef, ast.AsyncFunctionDef)
+        if (
+            isinstance(curr, ast.stmt)
+            and not frame.is_branched
+            and bufs.state.suppress_aliases is not None
+            and _is_frame_before_span(c_line, c_col, span, frame)
         ):
-            estart, ecol = _node_earliest_start_pos(curr)
-            _record_binding_at_pos(
-                (curr.name,), estart, ecol, span, frame, bufs.state
+            _update_suppress_aliases_from_stmt(
+                curr, bufs.state.suppress_aliases
             )
-            if (
-                frame.in_loop
-                or frame.active_nonlocals is not None
-                or bool(curr.decorator_list)
-                or curr.name in _extract_cached_scope_free_reads(curr)
-            ):
+
+        if curr is enclosed_fn:
+            if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                estart, ecol = _node_earliest_start_pos(curr)
+                _record_binding_at_pos(
+                    (curr.name,), estart, ecol, span, frame, bufs.state
+                )
+                if (
+                    frame.in_loop
+                    or frame.active_nonlocals is not None
+                    or bool(curr.decorator_list)
+                    or curr.name in _extract_cached_scope_free_reads(curr)
+                ):
+                    enclosed_fn_multi_invoked = True
+                _push_seq(
+                    stack,
+                    list(iter_nested_scope_header_nodes(curr)),
+                    frame.is_branched,
+                    frame.in_loop,
+                    frame.active_nonlocals,
+                )
+                continue
+            if isinstance(curr, ast.Lambda):
                 enclosed_fn_multi_invoked = True
-            _push_seq(
-                stack,
-                list(iter_nested_scope_header_nodes(curr)),
-                frame.is_branched,
-                frame.in_loop,
-                frame.active_nonlocals,
-            )
-            continue
+                _push_seq(
+                    stack,
+                    list(iter_nested_scope_header_nodes(curr)),
+                    frame.is_branched,
+                    frame.in_loop,
+                    frame.active_nonlocals,
+                )
+                continue
+            if isinstance(curr, _COMPREHENSION_TYPES):
+                enclosed_fn_multi_invoked = True
+                body_w = _extract_comprehension_body_walrus_names(curr)
+                if body_w:
+                    _record_binding_at_pos(
+                        body_w,
+                        c_line,
+                        c_col,
+                        span,
+                        frame._replace(is_branched=True, in_loop=True),
+                        bufs.state,
+                    )
+                _push_seq(
+                    stack,
+                    [curr.generators[0].iter] if curr.generators else (),
+                    frame.is_branched,
+                    frame.in_loop,
+                    frame.active_nonlocals,
+                    force_after_span=frame.force_after_span,
+                )
+                continue
 
         if _is_node_inside_span(curr, span):
             if isinstance(
-                curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                curr,
+                (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.ClassDef,
+                    ast.Lambda,
+                ),
             ):
                 pre_hdrs = [
                     hdr
@@ -2294,14 +2681,39 @@ def _analyze_enclosing_fn_cells_uncached(
     if isinstance(fn_args, ast.arguments):
         pre_bound.update(_extract_arg_names(fn_args) - fn_globals)
 
+    comp_targets: Set[str] = set()
+    comp_walrus: Set[str] = set()
+    if isinstance(fn_node, _COMPREHENSION_TYPES):
+        for gen in fn_node.generators:
+            t_names = _extract_store_names_in_node(gen.target) - fn_globals
+            comp_targets.update(t_names)
+            t_line, t_col = _node_earliest_start_pos(gen.target)
+            if _is_pos_before_span(
+                t_line, t_col, span
+            ) or _node_contains_or_encloses_span(gen.target, span):
+                pre_bound.update(t_names)
+        comp_walrus = (
+            _extract_comprehension_body_walrus_names(fn_node) - fn_globals
+        )
+        fn_locals |= comp_targets | comp_walrus
+
+    initial_sup = _seed_scope_suppress_aliases(fn_node, mod_tree, scope_ctx)
     bufs = _make_empty_traversal_buffers(
-        fn_globals, scope_ctx, pre_bound=pre_bound, unit_mutations=unit_mutations
+        fn_globals,
+        scope_ctx,
+        pre_bound=pre_bound,
+        unit_mutations=unit_mutations,
+        initial_suppress_aliases=initial_sup,
     )
+    if isinstance(fn_node, _COMPREHENSION_TYPES):
+        bufs.state.loop_mutated.update(
+            comp_targets | comp_walrus | set(unit_mutations)
+        )
     stmt_deltas: Optional[
-        Dict[Tuple[ast.AST, bool], Optional[_StmtCellDelta]]
+        Dict[Tuple[Any, ...], Optional[_StmtCellDelta]]
     ] = (
         cast(
-            Dict[Tuple[ast.AST, bool], Optional[_StmtCellDelta]],
+            Dict[Tuple[Any, ...], Optional[_StmtCellDelta]],
             _get_or_compute_scope_cached(
                 _scope_cell_info_cache,
                 _ScopeCacheKey(
@@ -2312,13 +2724,44 @@ def _analyze_enclosing_fn_cells_uncached(
                 dict,
             ),
         )
-        if enclosed_fn is None and use_stmt_deltas
+        if enclosed_fn is None
+        and use_stmt_deltas
+        and isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef))
         else None
     )
-    stack: List[_StackFrame] = [
-        _StackFrame(stmt, False, False, None)
-        for stmt in reversed(getattr(fn_node, "body", []))
-    ]
+    if isinstance(fn_node, ast.Lambda):
+        stack: List[_StackFrame] = (
+            [_StackFrame(fn_node.body, False, False, None)]
+            if isinstance(fn_node.body, ast.AST)
+            else []
+        )
+    elif isinstance(fn_node, _COMPREHENSION_TYPES):
+        comp_frames: List[Tuple[ast.AST, bool]] = []
+        has_ifs = False
+        for gen_idx, gen in enumerate(fn_node.generators):
+            if gen_idx > 0:
+                comp_frames.append((gen.iter, has_ifs))
+            comp_frames.append((gen.target, has_ifs))
+            for if_expr in gen.ifs:
+                comp_frames.append((if_expr, True))
+                has_ifs = True
+        if isinstance(fn_node, ast.DictComp):
+            comp_frames.append((fn_node.key, has_ifs))
+            comp_frames.append((fn_node.value, has_ifs))
+        else:
+            comp_frames.append((fn_node.elt, has_ifs))
+        stack = [
+            _StackFrame(expr_node, is_br, True, None)
+            for expr_node, is_br in reversed(comp_frames)
+        ]
+    else:
+        body_seq = getattr(fn_node, "body", ())
+        stack = [
+            _StackFrame(stmt, False, False, None)
+            for stmt in reversed(
+                body_seq if isinstance(body_seq, (list, tuple)) else ()
+            )
+        ]
     enclosed_fn_multi_invoked = _traverse_fn_cell_frames(
         stack, span, bufs, enclosed_fn=enclosed_fn, stmt_deltas=stmt_deltas
     )
@@ -2502,8 +2945,14 @@ def _build_enclosing_chain_cell_infos(
             enc_child: Optional[ast.AST] = None
         else:
             next_start, next_end, next_fn = enclosing_chain[idx + 1]
-            next_body = getattr(next_fn, "body", [])
-            first_stmt = next_body[0] if next_body else next_fn
+            next_body = getattr(next_fn, "body", None)
+            first_stmt: ast.AST = (
+                next_body[0]
+                if isinstance(next_body, (list, tuple)) and next_body
+                else next_body
+                if isinstance(next_body, ast.AST)
+                else next_fn
+            )
             f_line, f_col = _node_earliest_start_pos(first_stmt)
             span = _SpanBounds(
                 int(f_line or next_start),
@@ -2555,7 +3004,12 @@ def _build_enclosing_chain_cell_infos(
                             ),
                         )
         rev_infos.append(info)
-        escaping_muts = escaping_muts - info.fn_locals
+        own_bound_locals = (
+            _extract_single_node_local_names(fn_node)
+            if isinstance(fn_node, _COMPREHENSION_TYPES)
+            else info.fn_locals
+        )
+        escaping_muts = escaping_muts - own_bound_locals
     rev_infos.reverse()
     return rev_infos
 

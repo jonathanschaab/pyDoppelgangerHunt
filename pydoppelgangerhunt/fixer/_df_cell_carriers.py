@@ -209,6 +209,32 @@ def _is_lazy_genexp(
     )
 
 
+def _get_tree_expr_scope_intervals(
+    tree: ast.AST,
+) -> Tuple[Tuple[int, int, int, ast.AST], ...]:
+    """Returns cached (start, end, col_offset, node) tuples for Lambda and comprehension scopes."""
+
+    def _compute() -> Tuple[Tuple[int, int, int, ast.AST], ...]:
+        out: List[Tuple[int, int, int, ast.AST]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Lambda, *_COMPREHENSION_TYPES)):
+                n_start = int(getattr(node, "lineno", 0) or 0)
+                n_end = int(getattr(node, "end_lineno", n_start) or n_start)
+                n_col = int(getattr(node, "col_offset", 0) or 0)
+                if n_start > 0:
+                    out.append((n_start, n_end, n_col, node))
+        return tuple(out)
+
+    return cast(
+        Tuple[Tuple[int, int, int, ast.AST], ...],
+        _get_or_compute_scope_cached(
+            _scope_cell_info_cache,
+            _make_trusted_scope_cache_key(tree, "expr_scope_intervals"),
+            _compute,
+        ),
+    )
+
+
 def _find_enclosing_function_chain(
     mod_tree: ast.AST,
     u_start: int,
@@ -216,20 +242,23 @@ def _find_enclosing_function_chain(
     u_start_col: Optional[int] = None,
     u_end_col: Optional[int] = None,
 ) -> List[Tuple[int, int, ast.AST]]:
-    """Finds enclosing FunctionDef/AsyncFunctionDef nodes ordered outermost to innermost."""
-    chain: List[Tuple[int, int, int, ast.AST]] = []
+    """Finds enclosing function, lambda, and comprehension scopes ordered outermost to innermost."""
+    chain: List[Tuple[int, int, int, int, ast.AST]] = []
     for estart, n_end, _span, node in _get_tree_scope_intervals(mod_tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         n_lineno = int(getattr(node, "lineno", estart) or estart)
-        if n_lineno <= 0 or u_start < n_lineno or u_end > n_end:
-            continue
-        if _is_span_in_scope_header(
-            node,
-            u_start,
-            u_end,
-            u_start_col=u_start_col,
-            u_end_col=u_end_col,
+        if (
+            n_lineno <= 0
+            or u_start < n_lineno
+            or u_end > n_end
+            or _is_span_in_scope_header(
+                node,
+                u_start,
+                u_end,
+                u_start_col=u_start_col,
+                u_end_col=u_end_col,
+            )
         ):
             continue
         n_col = int(getattr(node, "col_offset", 0) or 0)
@@ -262,9 +291,48 @@ def _find_enclosing_function_chain(
                 )
             ):
                 continue
-        chain.append((estart, n_end, n_col, node))
-    chain.sort(key=lambda item: (item[0], -item[1], item[2]))
-    return [(estart, n_end, node) for estart, n_end, _col, node in chain]
+        chain.append(
+            (
+                estart,
+                n_end,
+                n_col,
+                -(n_end_col if isinstance(n_end_col, int) else 0),
+                node,
+            )
+        )
+    for n_start, n_end, n_col, node in _get_tree_expr_scope_intervals(mod_tree):
+        if (
+            n_start <= 0
+            or u_start < n_start
+            or u_end > n_end
+            or not _node_strictly_encloses_bounds(
+                node,
+                u_start,
+                u_end,
+                u_start_col=u_start_col,
+                u_end_col=u_end_col,
+            )
+            or _is_span_in_scope_header(
+                node,
+                u_start,
+                u_end,
+                u_start_col=u_start_col,
+                u_end_col=u_end_col,
+            )
+        ):
+            continue
+        expr_end_col = getattr(node, "end_col_offset", None)
+        chain.append(
+            (
+                n_start,
+                n_end,
+                n_col,
+                -(expr_end_col if isinstance(expr_end_col, int) else 0),
+                node,
+            )
+        )
+    chain.sort(key=lambda item: (item[0], -item[1], item[2], item[3]))
+    return [(estart, n_end, node) for estart, n_end, _col, _ecol, node in chain]
 
 
 def _stmt_dump_set(stmts: Sequence[ast.AST], idx: int) -> Set[str]:
@@ -651,6 +719,17 @@ def _has_unresolved_span_bounds(
             return True
     if u_start_col is not None and u_end_col is not None:
         return False
+    if isinstance(scope_node, (ast.Lambda, *_COMPREHENSION_TYPES)) and (
+        (
+            u_start == getattr(scope_node, "lineno", None)
+            and u_start_col is None
+        )
+        or (
+            u_end == getattr(scope_node, "end_lineno", None)
+            and u_end_col is None
+        )
+    ):
+        return True
 
     start_line_stmts: List[ast.stmt] = [
         stmt
@@ -808,7 +887,10 @@ def _extract_direct_nonlocals(
 ) -> Set[str]:
     """Extracts variable names declared nonlocal (or global) directly in scope_node."""
     names: Set[str] = set()
-    stack: List[ast.AST] = list(getattr(scope_node, "body", []))
+    raw_body = getattr(scope_node, "body", None)
+    if not isinstance(raw_body, (list, tuple)):
+        return names
+    stack: List[ast.AST] = list(raw_body)
     while stack:
         curr = stack.pop()
         if isinstance(curr, _INNER_SCOPE_TYPES):
@@ -849,7 +931,14 @@ def _scan_scope_nonlocal_mutations_and_deletions(
     direct_deleted: Set[str] = set()
     nested_mutated: Set[str] = set()
     nested_deleted: Set[str] = set()
-    stack: List[ast.AST] = list(getattr(scope_node, "body", []))
+    raw_body = getattr(scope_node, "body", None)
+    stack: List[ast.AST] = (
+        list(raw_body)
+        if isinstance(raw_body, (list, tuple))
+        else [raw_body]
+        if isinstance(raw_body, ast.AST)
+        else []
+    )
     while stack:
         curr = stack.pop()
         if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
