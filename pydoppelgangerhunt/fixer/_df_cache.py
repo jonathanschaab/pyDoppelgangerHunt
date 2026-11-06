@@ -11,7 +11,6 @@ from typing import (
     Any,
     Callable,
     Dict,
-    Iterator,
     List,
     NamedTuple,
     Optional,
@@ -31,15 +30,22 @@ logger = logging.getLogger(__name__)
 _CacheValT = TypeVar("_CacheValT")
 
 _downstream_cache_lock: threading.RLock = threading.RLock()
+
+
+def _is_reentrant_cache_lock(lock: Any) -> bool:
+    """Verifies that lock supports re-entrant acquisition on the same thread."""
+    return hasattr(lock, "_is_owned") or type(lock).__name__ == "RLock"
+
+
+if not _is_reentrant_cache_lock(_downstream_cache_lock):
+    raise RuntimeError("_downstream_cache_lock must be a threading.RLock")
+
 _MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
 _MAX_SCOPE_CACHE_SIZE: int = 1024
 _MAX_PARSED_TREE_CACHE_SIZE: int = 128
 _downstream_reads_cache: OrderedDict[Tuple[Any, ...], frozenset[str]] = OrderedDict()
 _parsed_tree_cache: OrderedDict[Tuple[str, int], Optional[ast.AST]] = OrderedDict()
 
-_scope_parent_maps: OrderedDict[ast.AST, Dict[ast.AST, ast.AST]] = OrderedDict()
-_scope_stmts_by_end: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
-_scope_stmts_by_start: OrderedDict[ast.AST, Dict[int, List[ast.stmt]]] = OrderedDict()
 _scope_loops_cache: OrderedDict[ast.AST, List[Tuple[int, int, int]]] = OrderedDict()
 _scope_try_with_cache: OrderedDict[ast.AST, List[ast.AST]] = OrderedDict()
 _warned_lenient_closure: List[bool] = [False]
@@ -69,43 +75,6 @@ _PERMITTED_PARAM_SCALAR_TYPES: Tuple[type, ...] = (
     bytes,
     type(None),
 )
-_INSPECTED_CONTAINER_TYPES: Tuple[type, ...] = (
-    tuple,
-    frozenset,
-    list,
-    set,
-    dict,
-)
-
-
-def _params_contain_ast(params: Tuple[Any, ...]) -> bool:
-    """Checks recursively whether any element or nested container in params is an ast.AST node."""
-    stack: List[Any] = list(params)
-    seen: Set[int] = set()
-    while stack:
-        curr = stack.pop()
-        if isinstance(curr, ast.AST):
-            return True
-        if isinstance(curr, _INSPECTED_CONTAINER_TYPES):
-            curr_id = id(curr)
-            if curr_id in seen:
-                continue
-            seen.add(curr_id)
-        if isinstance(curr, dict):
-            for k, v in curr.items():
-                if isinstance(k, ast.AST) or isinstance(v, ast.AST):
-                    return True
-                if isinstance(k, _INSPECTED_CONTAINER_TYPES):
-                    stack.append(k)
-                if isinstance(v, _INSPECTED_CONTAINER_TYPES):
-                    stack.append(v)
-        elif isinstance(curr, (tuple, frozenset, list, set)):
-            for elem in curr:
-                if isinstance(elem, ast.AST):
-                    return True
-                if isinstance(elem, _INSPECTED_CONTAINER_TYPES):
-                    stack.append(elem)
-    return False
 
 
 def _validate_scope_cache_params(params: Any) -> None:
@@ -116,6 +85,7 @@ def _validate_scope_cache_params(params: Any) -> None:
         )
     stack: List[Any] = list(params)
     seen: Set[int] = set()
+    invalid_mutable_type: Optional[str] = None
     while stack:
         curr = stack.pop()
         if isinstance(curr, ast.AST):
@@ -124,27 +94,47 @@ def _validate_scope_cache_params(params: Any) -> None:
             )
         if isinstance(curr, _PERMITTED_PARAM_SCALAR_TYPES):
             continue
-        if isinstance(curr, (tuple, frozenset)):
+        if isinstance(curr, (tuple, list, set, frozenset, dict)):
+            if not isinstance(curr, (tuple, frozenset)) and invalid_mutable_type is None:
+                invalid_mutable_type = type(curr).__name__
             curr_id = id(curr)
             if curr_id in seen:
                 continue
             seen.add(curr_id)
-            for elem in curr:
+            children: Sequence[Any] = (
+                tuple(part for kv in curr.items() for part in kv)
+                if isinstance(curr, dict)
+                else tuple(curr)
+            )
+            for elem in children:
                 if isinstance(elem, ast.AST):
                     raise ValueError(
-                        "_ScopeCacheKey.params must not contain ast.AST nodes; use owner or aux_ast_nodes"
+                        "_ScopeCacheKey.params must not contain ast.AST nodes; "
+                        "use owner or aux_ast_nodes"
                     )
                 if not isinstance(elem, _PERMITTED_PARAM_SCALAR_TYPES):
                     stack.append(elem)
             continue
-        if isinstance(curr, (list, set, dict)) and _params_contain_ast((curr,)):
-            raise ValueError(
-                "_ScopeCacheKey.params must not contain ast.AST nodes; use owner or aux_ast_nodes"
-            )
         raise TypeError(
             "_ScopeCacheKey.params only permits immutable scalars, tuples, and frozensets; "
             f"got {type(curr).__name__}"
         )
+    if invalid_mutable_type is not None:
+        raise TypeError(
+            "_ScopeCacheKey.params only permits immutable scalars, tuples, and frozensets; "
+            f"got {invalid_mutable_type}"
+        )
+
+
+def _params_contain_ast(params: Tuple[Any, ...]) -> bool:
+    """Checks recursively whether any element or nested container in params is an ast.AST node."""
+    try:
+        _validate_scope_cache_params(params)
+        return False
+    except ValueError:
+        return True
+    except TypeError:
+        return False
 
 
 class _BaseScopeCacheKey(NamedTuple):
@@ -184,23 +174,44 @@ def _validate_scope_cache_key_header(
 
 
 class _ScopeCacheKey(_BaseScopeCacheKey):
-    """Uniform cache key with explicit AST owner(s) for O(1) owner extraction and indexed tree eviction."""
+    """Uniform cache key with explicit AST owner(s) for O(1) owner extraction and indexed tree eviction.
+
+    Cache Key & Value Policy:
+        Production entries in ``_scope_closures_cache`` and ``_scope_cell_info_cache`` use
+        ``_ScopeCacheKey(owner, kind, params, aux_ast_nodes)``, enabling O(1) owner
+        extraction via explicit AST owner fields and indexed tree eviction via
+        ``_scope_owner_keys_index`` without scanning unrelated cache entries.
+        ``params`` must contain only AST-free immutable scalars, tuples, and frozensets;
+        any additional AST dependencies must be placed in ``aux_ast_nodes``.
+        Cached values must be immutable (frozenset, tuple, NamedTuple, MappingProxyType,
+        bool), wrapped in ``_TrackedCachedDict`` (protected by ``_downstream_cache_lock``
+        with O(1) incremental node registration on insert), or returned via defensive
+        copies to callers.
+    """
 
     __slots__ = ()
 
     def __new__(
-        cls, owner: ast.AST, kind: str, params: Tuple[Any, ...] = (), aux_ast_nodes: Tuple[ast.AST, ...] = ()
+        cls,
+        owner: ast.AST,
+        kind: str,
+        params: Tuple[Any, ...] = (),
+        aux_ast_nodes: Tuple[ast.AST, ...] = (),
     ) -> _ScopeCacheKey:
         _validate_scope_cache_key_header(owner, kind, params, aux_ast_nodes)
         return super().__new__(cls, owner, kind, params, aux_ast_nodes)
 
 
 def _make_trusted_scope_cache_key(
-    owner: ast.AST, kind: str, params: Tuple[Any, ...] = (), aux_ast_nodes: Tuple[ast.AST, ...] = ()
+    owner: ast.AST,
+    kind: str,
+    params: Tuple[Any, ...] = (),
+    aux_ast_nodes: Tuple[ast.AST, ...] = (),
 ) -> _ScopeCacheKey:
-    """Internal constructor for _ScopeCacheKey that validates header and parameter immutability."""
-    _validate_scope_cache_key_header(owner, kind, params, aux_ast_nodes)
-    return _BaseScopeCacheKey.__new__(_ScopeCacheKey, owner, kind, params, aux_ast_nodes)
+    """Constructs a validated _ScopeCacheKey instance."""
+    return _ScopeCacheKey(
+        owner=owner, kind=kind, params=params, aux_ast_nodes=aux_ast_nodes
+    )
 
 
 def _extract_key_ast_nodes(key: Any) -> Tuple[ast.AST, ...]:
@@ -319,178 +330,145 @@ def _extract_value_ast_nodes(value: Any) -> Tuple[ast.AST, ...]:
     return tuple(found)
 
 
+_scope_owner_keys_index: Dict[ast.AST, Set[Any]] = {}
+_scope_key_nodes_index: Dict[Any, Set[ast.AST]] = {}
+
+
+def _index_entry_ast_nodes(
+    entry: Any,
+    nodes: Sequence[ast.AST],
+    forward_index: Dict[Any, Set[ast.AST]],
+    reverse_index: Dict[ast.AST, Set[Any]],
+) -> None:
+    """Registers AST nodes for entry in forward_index and reverse_index."""
+    entry_nodes = forward_index.setdefault(entry, set())
+    for node in nodes:
+        if isinstance(node, ast.AST) and not isinstance(
+            node, _SINGLETON_AST_TYPES
+        ):
+            entry_nodes.add(node)
+            reverse_index.setdefault(node, set()).add(entry)
+
+
+def _prune_reverse_index_buckets(
+    entry: Any,
+    forward_index: Dict[Any, Set[ast.AST]],
+    reverse_index: Dict[ast.AST, Set[Any]],
+) -> None:
+    """Removes entry from forward_index and prunes empty reverse_index buckets."""
+    for node in forward_index.pop(entry, ()):
+        bucket = reverse_index.get(node)
+        if bucket is not None:
+            bucket.discard(entry)
+            if not bucket:
+                reverse_index.pop(node, None)
+
+
+def _register_key_ast_nodes(key: Any, nodes: Sequence[ast.AST]) -> None:
+    """Incrementally registers AST nodes for key in _scope_owner_keys_index in O(|nodes|)."""
+    if nodes:
+        _index_entry_ast_nodes(
+            key, nodes, _scope_key_nodes_index, _scope_owner_keys_index
+        )
+
+
+def _unregister_key_if_absent(key: Any) -> None:
+    """Removes key from _scope_owner_keys_index when no longer held in any scope cache."""
+    if key not in _scope_closures_cache and key not in _scope_cell_info_cache:
+        _prune_reverse_index_buckets(
+            key, _scope_key_nodes_index, _scope_owner_keys_index
+        )
+
+
 class _TrackedCachedDict(Dict[Any, Any]):
-    """Dictionary value stored in _TrackedScopeCache that synchronizes _scope_owner_keys_index on mutation."""
+    """Dictionary value stored in _TrackedScopeCache that registers new AST nodes in O(1) on insert."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._bound_owners: Dict[Tuple[int, Any], Tuple[Any, Any]] = {}
 
+    def _ensure_bound_owners(self) -> Dict[Tuple[int, Any], Tuple[Any, Any]]:
+        owners = getattr(self, "_bound_owners", None)
+        if owners is None:
+            owners = {}
+            self._bound_owners = owners
+        return owners
+
     def bind_owner(self, cache: Any, cache_key: Any) -> None:
-        """Registers an owning (_TrackedScopeCache, key) pair for index synchronization."""
-        self._bound_owners[(id(cache), cache_key)] = (cache, cache_key)
+        """Registers an owning (_TrackedScopeCache, key) pair for incremental node registration."""
+        self._ensure_bound_owners()[(id(cache), cache_key)] = (cache, cache_key)
 
     def unbind_owner(self, cache: Any, cache_key: Any) -> None:
         """Unregisters an owning (_TrackedScopeCache, key) pair."""
-        self._bound_owners.pop((id(cache), cache_key), None)
+        self._ensure_bound_owners().pop((id(cache), cache_key), None)
 
-    def _run_mutating(self, fn: Callable[[], Any]) -> Any:
-        with _downstream_cache_lock:
-            if not self._bound_owners:
-                return fn()
-            snapshots = [
-                (c, ck, c.active_nodes_for_key(ck))
-                for c, ck in list(self._bound_owners.values())
-                if ck in c
-            ]
-            res = fn()
-            for c, ck, old_nodes in snapshots:
-                c.sync_key_index(ck, old_nodes)
-            return res
+    def _register_inserted_pair(self, k: Any, v: Any) -> None:
+        owners = getattr(self, "_bound_owners", None)
+        if not owners:
+            return
+        k_nodes = _extract_value_ast_nodes(k)
+        v_nodes = _extract_value_ast_nodes(v)
+        if not k_nodes and not v_nodes:
+            return
+        combined = (*k_nodes, *v_nodes)
+        for cache, ck in list(owners.values()):
+            if ck in cache:
+                _register_key_ast_nodes(ck, combined)
 
     def __setitem__(self, k: Any, v: Any) -> None:
-        self._run_mutating(lambda: dict.__setitem__(self, k, v))
+        with _downstream_cache_lock:
+            super().__setitem__(k, v)
+            self._register_inserted_pair(k, v)
 
     def __delitem__(self, k: Any) -> None:
-        self._run_mutating(lambda: dict.__delitem__(self, k))
+        with _downstream_cache_lock:
+            super().__delitem__(k)
 
     def setdefault(self, k: Any, default: Any = None) -> Any:
-        if k in self:
-            return self[k]
-        return self._run_mutating(lambda: dict.setdefault(self, k, default))
+        with _downstream_cache_lock:
+            if k in self:
+                return self[k]
+            super().__setitem__(k, default)
+            self._register_inserted_pair(k, default)
+            return default
 
     def pop(self, k: Any, *args: Any) -> Any:
-        return self._run_mutating(lambda: dict.pop(self, k, *args))
+        with _downstream_cache_lock:
+            return super().pop(k, *args)
 
     def popitem(self) -> Tuple[Any, Any]:
-        return cast(
-            Tuple[Any, Any],
-            self._run_mutating(lambda: dict.popitem(self)),
-        )
+        with _downstream_cache_lock:
+            return super().popitem()
 
     def update(self, *args: Any, **kwargs: Any) -> None:
-        self._run_mutating(lambda: dict.update(self, *args, **kwargs))
+        with _downstream_cache_lock:
+            temp = dict(*args, **kwargs)
+            super().update(temp)
+            for k, v in temp.items():
+                self._register_inserted_pair(k, v)
 
     def __or__(self, other: Any) -> Dict[Any, Any]:
         return dict.__or__(self, other)
 
     def __ior__(self, other: Any) -> _TrackedCachedDict:
-        self._run_mutating(lambda: dict.__ior__(self, other))
-        return self
+        with _downstream_cache_lock:
+            temp = dict(other)
+            super().update(temp)
+            for k, v in temp.items():
+                self._register_inserted_pair(k, v)
+            return self
 
     def clear(self) -> None:
-        self._run_mutating(lambda: dict.clear(self))
-
-
-class _OwnerKeysIndex(Dict[ast.AST, Set[Any]]):
-    """Reverse index from AST nodes to active cache keys, syncing any untracked plain dicts on access."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._untracked_keys: Dict[Any, Set[ast.AST]] = {}
-
-    def track_plain_dict_key(self, key: Any, nodes: Set[ast.AST]) -> None:
-        """Records a cache key whose stored value is a plain mutable dict."""
-        self._untracked_keys[key] = set(nodes)
-
-    def untrack_plain_dict_key(self, key: Any) -> None:
-        """Removes a cache key from plain-dict tracking."""
-        self._untracked_keys.pop(key, None)
-
-    def sync_pending(self) -> None:
-        """Synchronizes AST node references for any plain dicts mutated in-place."""
-        if not self._untracked_keys:
-            return
-        for key, prev_nodes in list(self._untracked_keys.items()):
-            in_any = False
-            for cache in (_scope_closures_cache, _scope_cell_info_cache):
-                if key in cache:
-                    in_any = True
-                    cache.sync_key_index(key, prev_nodes)
-                    self._untracked_keys[key] = cache.active_nodes_for_key(key)
-                    break
-            if not in_any:
-                self._untracked_keys.pop(key, None)
-
-    def __getitem__(self, k: ast.AST) -> Set[Any]:
-        self.sync_pending()
-        return super().__getitem__(k)
-
-    def get(self, k: ast.AST, default: Any = None) -> Any:
-        self.sync_pending()
-        return super().get(k, default)
-
-    def __contains__(self, o: object) -> bool:
-        self.sync_pending()
-        return super().__contains__(o)
-
-    def __iter__(self) -> Iterator[ast.AST]:
-        self.sync_pending()
-        return super().__iter__()
-
-    def __len__(self) -> int:
-        self.sync_pending()
-        return super().__len__()
-
-    def keys(self) -> Any:
-        self.sync_pending()
-        return super().keys()
-
-    def values(self) -> Any:
-        self.sync_pending()
-        return super().values()
-
-    def items(self) -> Any:
-        self.sync_pending()
-        return super().items()
-
-    def clear(self) -> None:
-        self._untracked_keys.clear()
-        super().clear()
-
-
-_scope_owner_keys_index: _OwnerKeysIndex = _OwnerKeysIndex()
+        with _downstream_cache_lock:
+            super().clear()
 
 
 class _TrackedScopeCache(OrderedDict[Any, _CacheValT]):
-    """OrderedDict cache that maintains _scope_owner_keys_index for keys and cached values."""
-
-    def active_nodes_for_key(self, key: Any) -> Set[ast.AST]:
-        """Returns all AST nodes referenced by key and its currently cached values."""
-        nodes: Set[ast.AST] = set()
-        in_any = False
-        for cache in (_scope_closures_cache, _scope_cell_info_cache):
-            if key in cache:
-                in_any = True
-                nodes.update(_extract_value_ast_nodes(dict.__getitem__(cache, key)))
-        if in_any:
-            nodes.update(_extract_key_ast_nodes(key))
-        return nodes
-
-    def sync_key_index(self, key: Any, old_nodes: Set[ast.AST]) -> None:
-        """Synchronizes _scope_owner_keys_index for key given its previous AST node set."""
-        new_nodes = self.active_nodes_for_key(key)
-        for node in old_nodes - new_nodes:
-            kset = dict.get(_scope_owner_keys_index, node)
-            if kset is not None:
-                kset.discard(key)
-                if not kset:
-                    dict.pop(_scope_owner_keys_index, node, None)
-        for node in new_nodes - old_nodes:
-            dict.setdefault(_scope_owner_keys_index, node, set()).add(key)
-        has_plain_dict = any(
-            key in c
-            and isinstance(dict.__getitem__(c, key), dict)
-            and not isinstance(dict.__getitem__(c, key), _TrackedCachedDict)
-            for c in (_scope_closures_cache, _scope_cell_info_cache)
-        )
-        if has_plain_dict:
-            _scope_owner_keys_index.track_plain_dict_key(key, new_nodes)
-        else:
-            _scope_owner_keys_index.untrack_plain_dict_key(key)
+    """OrderedDict cache that incrementally registers AST nodes on insert and prunes on eviction."""
 
     def __setitem__(self, key: Any, value: _CacheValT) -> None:
-        old_nodes = self.active_nodes_for_key(key) if key in self else set()
+        if isinstance(value, dict) and not isinstance(value, _TrackedCachedDict):
+            value = cast(_CacheValT, _TrackedCachedDict(cast(Dict[Any, Any], value)))
         if key in self:
             prev_val = dict.__getitem__(self, key)
             if isinstance(prev_val, _TrackedCachedDict) and prev_val is not value:
@@ -498,48 +476,54 @@ class _TrackedScopeCache(OrderedDict[Any, _CacheValT]):
         if isinstance(value, _TrackedCachedDict):
             value.bind_owner(self, key)
         super().__setitem__(key, value)
-        self.sync_key_index(key, old_nodes)
+        _register_key_ast_nodes(
+            key,
+            (*_extract_key_ast_nodes(key), *_extract_value_ast_nodes(value)),
+        )
 
     def __delitem__(self, key: Any) -> None:
-        old_nodes = self.active_nodes_for_key(key)
         if key in self:
             prev_val = dict.__getitem__(self, key)
             if isinstance(prev_val, _TrackedCachedDict):
                 prev_val.unbind_owner(self, key)
         super().__delitem__(key)
-        self.sync_key_index(key, old_nodes)
+        _unregister_key_if_absent(key)
 
     def pop(self, key: Any, *args: Any) -> Any:
-        old_nodes = self.active_nodes_for_key(key) if key in self else set()
-        if key in self:
+        in_self = key in self
+        if in_self:
             prev_val = dict.__getitem__(self, key)
             if isinstance(prev_val, _TrackedCachedDict):
                 prev_val.unbind_owner(self, key)
         res = super().pop(key, *args)
-        if old_nodes:
-            self.sync_key_index(key, old_nodes)
+        if in_self:
+            _unregister_key_if_absent(key)
         return res
 
     def popitem(self, last: bool = True) -> Tuple[Any, _CacheValT]:
-        if not self:
-            return super().popitem(last=last)
-        target_key = next(reversed(self) if last else iter(self))
-        old_nodes = self.active_nodes_for_key(target_key)
         k, v = super().popitem(last=last)
         if isinstance(v, _TrackedCachedDict):
             v.unbind_owner(self, k)
-        self.sync_key_index(k, old_nodes)
+        _unregister_key_if_absent(k)
         return k, v
 
     def clear(self) -> None:
-        old_map = {k: self.active_nodes_for_key(k) for k in self}
         for k in list(self.keys()):
             prev_val = dict.__getitem__(self, k)
             if isinstance(prev_val, _TrackedCachedDict):
                 prev_val.unbind_owner(self, k)
         super().clear()
-        for k, old_nodes in old_map.items():
-            self.sync_key_index(k, old_nodes)
+        other = (
+            _scope_cell_info_cache
+            if self is _scope_closures_cache
+            else _scope_closures_cache
+        )
+        if not other:
+            _scope_owner_keys_index.clear()
+            _scope_key_nodes_index.clear()
+        else:
+            for k in list(_scope_key_nodes_index.keys()):
+                _unregister_key_if_absent(k)
 
 
 _scope_closures_cache: _TrackedScopeCache[List[Tuple[Any, Set[str]]]] = (
@@ -547,25 +531,107 @@ _scope_closures_cache: _TrackedScopeCache[List[Tuple[Any, Set[str]]]] = (
 )
 _scope_cell_info_cache: _TrackedScopeCache[Any] = _TrackedScopeCache()
 
+_aux_node_to_scope_owners: Dict[ast.AST, Set[ast.AST]] = {}
+_aux_scope_owner_to_nodes: Dict[ast.AST, Set[ast.AST]] = {}
+
+
+def _extract_aux_cache_ast_nodes(value: Any) -> List[ast.AST]:
+    """Extracts AST nodes from a parent-map or line-to-statements cache entry."""
+    nodes: List[ast.AST] = []
+    if not isinstance(value, dict):
+        return nodes
+    for k, v in value.items():
+        if isinstance(k, ast.AST) and not isinstance(k, _SINGLETON_AST_TYPES):
+            nodes.append(k)
+        if isinstance(v, ast.AST) and not isinstance(v, _SINGLETON_AST_TYPES):
+            nodes.append(v)
+        elif isinstance(v, list):
+            for item in v:
+                if isinstance(item, ast.AST) and not isinstance(
+                    item, _SINGLETON_AST_TYPES
+                ):
+                    nodes.append(item)
+    return nodes
+
+
+def _register_aux_scope_nodes(
+    scope_node: ast.AST, nodes: Sequence[ast.AST]
+) -> None:
+    """Indexes AST nodes belonging to scope_node across auxiliary scope caches."""
+    _index_entry_ast_nodes(
+        scope_node,
+        (scope_node, *nodes),
+        _aux_scope_owner_to_nodes,
+        _aux_node_to_scope_owners,
+    )
+
+
+def _unregister_aux_scope_owner_if_absent(scope_node: ast.AST) -> None:
+    """Removes scope_node from the auxiliary AST node index when absent from all aux caches."""
+    if (
+        scope_node not in _scope_parent_maps
+        and scope_node not in _scope_stmts_by_start
+        and scope_node not in _scope_stmts_by_end
+    ):
+        _prune_reverse_index_buckets(
+            scope_node, _aux_scope_owner_to_nodes, _aux_node_to_scope_owners
+        )
+
+
+class _TrackedAuxScopeCache(OrderedDict[ast.AST, _CacheValT]):
+    """OrderedDict for auxiliary AST caches (_scope_parent_maps, _scope_stmts_by_start/end) with indexed eviction."""
+
+    def __setitem__(self, key: ast.AST, value: _CacheValT) -> None:
+        super().__setitem__(key, value)
+        _register_aux_scope_nodes(key, _extract_aux_cache_ast_nodes(value))
+
+    def __delitem__(self, key: ast.AST) -> None:
+        super().__delitem__(key)
+        _unregister_aux_scope_owner_if_absent(key)
+
+    def pop(self, key: ast.AST, *args: Any) -> Any:
+        in_self = key in self
+        res = super().pop(key, *args)
+        if in_self:
+            _unregister_aux_scope_owner_if_absent(key)
+        return res
+
+    def popitem(self, last: bool = True) -> Tuple[ast.AST, _CacheValT]:
+        k, v = super().popitem(last=last)
+        _unregister_aux_scope_owner_if_absent(k)
+        return k, v
+
+    def clear(self) -> None:
+        super().clear()
+        if (
+            not _scope_parent_maps
+            and not _scope_stmts_by_start
+            and not _scope_stmts_by_end
+        ):
+            _aux_node_to_scope_owners.clear()
+            _aux_scope_owner_to_nodes.clear()
+        else:
+            for owner in list(_aux_scope_owner_to_nodes.keys()):
+                _unregister_aux_scope_owner_if_absent(owner)
+
+
+_scope_parent_maps: _TrackedAuxScopeCache[Dict[ast.AST, ast.AST]] = (
+    _TrackedAuxScopeCache()
+)
+_scope_stmts_by_end: _TrackedAuxScopeCache[Dict[int, List[ast.stmt]]] = (
+    _TrackedAuxScopeCache()
+)
+_scope_stmts_by_start: _TrackedAuxScopeCache[Dict[int, List[ast.stmt]]] = (
+    _TrackedAuxScopeCache()
+)
+
 
 def _key_references_scope_nodes(
     key: Any,
     tree_nodes: Set[ast.AST],
     safe_containers: Optional[Set[int]] = None,
 ) -> bool:
-    """Returns True if a cache key references any AST node in tree_nodes.
-
-    Cache Key & Value Policy:
-    Production entries in _scope_closures_cache and _scope_cell_info_cache use
-    _ScopeCacheKey(owner, kind, params, aux_ast_nodes), enabling O(1) owner
-    extraction via explicit AST owner fields and indexed tree eviction via
-    _scope_owner_keys_index without scanning unrelated cache entries.
-    For arbitrary tuple, NamedTuple, or frozenset keys (including heterogeneous
-    frozensets), every element is inspected recursively. Cached values must be
-    immutable (frozenset, tuple, NamedTuple, MappingProxyType, bool), protected
-    by _downstream_cache_lock on inner mutation (e.g., stmt_deltas), or returned
-    via defensive copies to callers.
-    """
+    """Returns True if a cache key references any AST node in tree_nodes."""
     if isinstance(key, _ScopeCacheKey):
         return key.owner in tree_nodes or any(
             n in tree_nodes for n in key.aux_ast_nodes
@@ -588,12 +654,9 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
     """Purges scope-cache entries belonging to an evicted AST tree or detached subtree.
 
     Note:
-        Because _TrackedScopeCache indexes AST nodes referenced by both cache keys
-        and cached values (including _FnScopeContext.parent_map, _SpanLineIndex,
-        closures, and statement deltas), and _evict_tree_scopes also checks
-        _scope_parent_maps for enclosing scopes referencing nodes in tree_nodes,
-        evicting either a whole AST tree or an independently detached AST subtree
-        invalidates all cached contexts and entries holding references to it.
+        Uses indexed lookups via ``_scope_owner_keys_index`` and
+        ``_aux_node_to_scope_owners`` to locate affected cache keys and enclosing
+        scope owners directly from ``tree_nodes`` without scanning unrelated entries.
     """
     if tree is None or not isinstance(tree, ast.AST):
         return
@@ -605,31 +668,25 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
     }
     scope_nodes.add(tree)
     with _downstream_cache_lock:
-        _scope_owner_keys_index.sync_pending()
-        for root_node, pmap in list(_scope_parent_maps.items()):
-            if root_node not in scope_nodes and (
-                tree in pmap or any(n in pmap for n in tree_nodes)
-            ):
-                scope_nodes.add(root_node)
-                tree_nodes.add(root_node)
+        affected_aux_owners: Set[ast.AST] = set()
+        for node in tree_nodes:
+            owners = _aux_node_to_scope_owners.get(node)
+            if owners:
+                affected_aux_owners.update(owners)
+        for root_node in affected_aux_owners:
+            scope_nodes.add(root_node)
+            tree_nodes.add(root_node)
+            pmap = _scope_parent_maps.get(root_node)
+            if pmap is not None:
                 curr_anc: Optional[ast.AST] = pmap.get(tree)
                 while curr_anc is not None and curr_anc not in tree_nodes:
                     tree_nodes.add(curr_anc)
                     if isinstance(curr_anc, _SCOPE_ROOT_TYPES):
                         scope_nodes.add(curr_anc)
                     curr_anc = pmap.get(curr_anc)
-        for stmt_cache in (_scope_stmts_by_start, _scope_stmts_by_end):
-            for root_node, line_map in list(stmt_cache.items()):
-                if root_node not in scope_nodes and any(
-                    s in tree_nodes
-                    for stmts in line_map.values()
-                    for s in stmts
-                ):
-                    scope_nodes.add(root_node)
-                    tree_nodes.add(root_node)
         keys_to_remove: Set[Any] = set()
         for node in tree_nodes:
-            node_keys = dict.get(_scope_owner_keys_index, node)
+            node_keys = _scope_owner_keys_index.get(node)
             if node_keys:
                 keys_to_remove.update(node_keys)
         for k in keys_to_remove:
@@ -638,6 +695,7 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
                     scope_nodes.add(knode)
             _scope_closures_cache.pop(k, None)
             _scope_cell_info_cache.pop(k, None)
+            _unregister_key_if_absent(k)
         for node in tree_nodes:
             _scope_owner_keys_index.pop(node, None)
         for node in scope_nodes:
@@ -970,6 +1028,9 @@ def clear_dataflow_cache() -> None:
         _scope_closures_cache.clear()
         _scope_cell_info_cache.clear()
         _scope_owner_keys_index.clear()
+        _scope_key_nodes_index.clear()
+        _aux_node_to_scope_owners.clear()
+        _aux_scope_owner_to_nodes.clear()
         _scope_loops_cache.clear()
         _scope_try_with_cache.clear()
         _warned_lenient_closure[0] = False
@@ -991,6 +1052,7 @@ class _DownstreamCacheKey(NamedTuple):
     skip_pre_unit_closures: bool
     unit_inputs: Optional[frozenset[str]] = None
     is_subroutine: bool = False
+    unit_source_hash: Optional[str] = None
 
 
 def _coerce_string_frozenset(raw_items: Any) -> Optional[frozenset[str]]:
@@ -1061,6 +1123,12 @@ def _build_downstream_cache_key(
         "complex_expr",
         "data_table",
     )
+    raw_src_code = unit.get("source_code")
+    unit_source_hash: Optional[str] = None
+    if (start_col is None or end_col is None) and isinstance(raw_src_code, str) and raw_src_code.strip():
+        unit_source_hash = hashlib.sha256(
+            raw_src_code.strip().encode("utf-8", errors="replace")
+        ).hexdigest()[:16]
 
     return _DownstreamCacheKey(
         content_digest=content_digest,
@@ -1072,4 +1140,5 @@ def _build_downstream_cache_key(
         skip_pre_unit_closures=bool(skip_pre_unit_closures),
         unit_inputs=unit_inputs_key,
         is_subroutine=is_sub_key,
+        unit_source_hash=unit_source_hash,
     )

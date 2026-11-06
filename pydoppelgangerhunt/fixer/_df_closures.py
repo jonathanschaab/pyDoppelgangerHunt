@@ -7,6 +7,7 @@ import builtins
 from typing import (
     AbstractSet,
     Any,
+    Dict,
     Iterable,
     List,
     Mapping,
@@ -42,13 +43,17 @@ _BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
 def _node_earliest_start_pos(
     node: ast.AST,
+    source_lines: Optional[Sequence[str]] = None,
 ) -> Tuple[Optional[int], Optional[int]]:
     """Computes the earliest (lineno, col_offset) of an AST node including decorators.
 
     Note:
         Python's AST records decorator positions on the decorator expression node
-        rather than the ``@`` token, so parenthesized multi-line decorators such as
-        ``@(\\n dec\\n)`` report the first line of ``dec``.
+        rather than the ``@`` token. When ``source_lines`` is provided, this helper
+        scans upward from each decorator expression to locate the ``@`` line; otherwise
+        it uses ``max(0, dec.col_offset - 1)`` (clamped by ``node.col_offset``).
+        Because Python's grammar forbids any statement from preceding ``@`` on the same
+        line, no valid statement unit can fall strictly between ``@`` and ``dec.lineno``.
     """
     n_line = getattr(node, "lineno", None)
     n_col = getattr(node, "col_offset", None)
@@ -58,6 +63,7 @@ def _node_earliest_start_pos(
         d_line = getattr(dec, "lineno", None)
         d_col = getattr(dec, "col_offset", None)
         if isinstance(d_line, int):
+            eff_d_line = d_line
             if isinstance(d_col, int):
                 raw_at_col = max(0, d_col - 1)
                 at_col: Optional[int] = (
@@ -67,11 +73,27 @@ def _node_earliest_start_pos(
                 )
             else:
                 at_col = best_col
-            if best_line is None or d_line < best_line:
-                best_line = d_line
+            if source_lines is not None and 1 <= d_line <= len(source_lines):
+                scan_ln = d_line
+                while scan_ln >= 1:
+                    line_txt = source_lines[scan_ln - 1]
+                    stripped = line_txt.lstrip()
+                    if stripped.startswith("@"):
+                        eff_d_line = scan_ln
+                        at_col = len(line_txt) - len(stripped)
+                        break
+                    if (
+                        scan_ln < d_line
+                        and stripped
+                        and not stripped.startswith(("#", "("))
+                    ):
+                        break
+                    scan_ln -= 1
+            if best_line is None or eff_d_line < best_line:
+                best_line = eff_d_line
                 best_col = at_col
             elif (
-                d_line == best_line
+                eff_d_line == best_line
                 and at_col is not None
                 and (best_col is None or at_col < best_col)
             ):
@@ -416,6 +438,55 @@ def _collect_ancestors_from_parent_map(
     return ancestors
 
 
+class _DetachedDumpIndex:
+    """Cached per-tree structural dump index for O(1) detached unit resolution."""
+
+    __slots__ = ("stmt_blocks", "expr_by_dump", "_retained_nodes")
+
+    def __init__(self, module_tree: ast.AST) -> None:
+        blocks: List[Tuple[Tuple[str, ...], Tuple[ast.AST, ...]]] = []
+        expr_map: Dict[str, List[ast.AST]] = {}
+        retained: List[ast.AST] = []
+        seen_ids: Set[int] = set()
+        for node in ast.walk(module_tree):
+            if isinstance(node, ast.AST) and id(node) not in seen_ids:
+                seen_ids.add(id(node))
+                retained.append(node)
+            if node is not module_tree:
+                expr_map.setdefault(ast.dump(node), []).append(node)
+            for attr in ("body", "orelse", "finalbody"):
+                seq = getattr(node, attr, None)
+                if isinstance(seq, list) and seq:
+                    ast_seq = tuple(s for s in seq if isinstance(s, ast.AST))
+                    if ast_seq:
+                        blocks.append(
+                            (tuple(ast.dump(s) for s in ast_seq), ast_seq)
+                        )
+        self.stmt_blocks: Tuple[
+            Tuple[Tuple[str, ...], Tuple[ast.AST, ...]], ...
+        ] = tuple(blocks)
+        self.expr_by_dump: Dict[str, Tuple[ast.AST, ...]] = {
+            k: tuple(v) for k, v in expr_map.items()
+        }
+        self._retained_nodes: Tuple[ast.AST, ...] = tuple(retained)
+
+    def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
+        """Returns all AST nodes retained by this structural dump index."""
+        return self._retained_nodes
+
+
+def _get_detached_dump_index(module_tree: ast.AST) -> _DetachedDumpIndex:
+    """Returns or builds the cached _DetachedDumpIndex for module_tree."""
+    return cast(
+        _DetachedDumpIndex,
+        _get_or_compute_scope_cached(
+            _scope_cell_info_cache,
+            _ScopeCacheKey(module_tree, "detached_dump_index"),
+            lambda: _DetachedDumpIndex(module_tree),
+        ),
+    )
+
+
 def _find_detached_structural_matches(
     stmts: Sequence[ast.AST],
     module_tree: ast.AST,
@@ -425,29 +496,21 @@ def _find_detached_structural_matches(
         return []
     k = len(stmts)
     target_dumps = tuple(ast.dump(s) for s in stmts)
+    dump_index = _get_detached_dump_index(module_tree)
     matches: List[ast.AST] = []
-    for node in ast.walk(module_tree):
-        for attr in ("body", "orelse", "finalbody"):
-            seq = getattr(node, attr, None)
-            if not isinstance(seq, list) or len(seq) < k:
-                continue
-            for idx in range(len(seq) - k + 1):
-                if all(
-                    isinstance(seq[idx + j], ast.AST)
-                    and ast.dump(seq[idx + j]) == target_dumps[j]
-                    for j in range(k)
-                ):
-                    matches.append(seq[idx])
+    for dump_seq, ast_seq in dump_index.stmt_blocks:
+        seq_len = len(dump_seq)
+        if seq_len < k:
+            continue
+        for idx in range(seq_len - k + 1):
+            if dump_seq[idx : idx + k] == target_dumps:
+                matches.append(ast_seq[idx])
     if matches or k != 1:
         return matches
     single = stmts[0]
     expr_target = single.value if isinstance(single, ast.Expr) else single
     expr_dump = ast.dump(expr_target)
-    return [
-        node
-        for node in ast.walk(module_tree)
-        if node is not module_tree and ast.dump(node) == expr_dump
-    ]
+    return list(dump_index.expr_by_dump.get(expr_dump, ()))
 
 
 def _resolve_detached_enclosing_scopes(
@@ -1093,20 +1156,32 @@ def _collect_scope_closures_uncached(
 def _collect_scope_closures(
     scope_node: ast.AST,
     module_tree: Optional[ast.AST] = None,
+    *,
+    enclosing_scopes: Sequence[ast.AST] = (),
 ) -> List[Tuple[_ClosurePos, Set[str]]]:
     """Discovers all closures defined in a scope, recorded with their starting line."""
+    aux_nodes: Tuple[ast.AST, ...] = (
+        *(
+            (module_tree,)
+            if isinstance(module_tree, ast.AST)
+            else ()
+        ),
+        *(s for s in enclosing_scopes if isinstance(s, ast.AST)),
+    )
     cache_key: Any = (
         scope_node
-        if module_tree is None
+        if not aux_nodes
         else _ScopeCacheKey(
-            scope_node, "scope_closures", aux_ast_nodes=(module_tree,)
+            scope_node, "scope_closures", aux_ast_nodes=aux_nodes
         )
     )
     return _get_or_compute_scope_cached(
         _scope_closures_cache,
         cache_key,
         lambda: _collect_scope_closures_uncached(
-            scope_node, module_tree=module_tree
+            scope_node,
+            module_tree=module_tree,
+            enclosing_scopes=enclosing_scopes,
         ),
     )
 
@@ -1158,11 +1233,17 @@ def _collect_pre_unit_closures(
     candidates: Optional[Set[str]] = None,
     u_start_col: Optional[int] = None,
     module_tree: Optional[ast.AST] = None,
+    *,
+    enclosing_scopes: Sequence[ast.AST] = (),
 ) -> Set[str]:
     """Discovers free variables captured by functions, class methods, and lambdas defined prior
     to the unit in the same lexical scope."""
     captured_reads: Set[str] = set()
-    for c_pos, reads in _collect_scope_closures(scope_node, module_tree=module_tree):
+    for c_pos, reads in _collect_scope_closures(
+        scope_node,
+        module_tree=module_tree,
+        enclosing_scopes=enclosing_scopes,
+    ):
         is_pre, _, _ = _classify_closure_position(
             c_pos, u_start, u_start, u_start_col=u_start_col
         )

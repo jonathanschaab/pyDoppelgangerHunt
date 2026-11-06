@@ -754,6 +754,7 @@ def resolve_clone_pair_outputs(
             skip_pre_unit_closures=effective_skip_closures,
             source_digest1=source_digest1,
             source_digest2=source_digest2,
+            closure_strictness=closure_strictness,
             allow_permuted_outputs=allow_permuted_outputs,
             return_details=return_details,
         )

@@ -8,10 +8,8 @@ import logging
 import re
 import textwrap
 from typing import (
-    AbstractSet,
     Any,
     Dict,
-    Iterable,
     List,
     Optional,
     Sequence,
@@ -21,6 +19,7 @@ from typing import (
 )
 
 from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
+from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context
 from pydoppelgangerhunt.fixer._df_cell_hazards import (
     _UnitClosureHazardContext,
     _find_enclosing_chain_definite_pre_bound,
@@ -29,24 +28,29 @@ from pydoppelgangerhunt.fixer._df_cell_hazards import (
     _has_severed_closure_cell_hazard,
     _resolve_unit_col_bounds,
 )
-from pydoppelgangerhunt.fixer._df_cell_traversal import (
-    _clear_name_provenance,
-    _seed_scope_suppress_aliases,
-    _split_with_body_by_mode,
-    _update_suppress_aliases_from_stmt,
-)
 from pydoppelgangerhunt.fixer._df_closures import (
     _COMPREHENSION_TYPES,
     _extract_comprehension_walrus_names,
     _extract_scope_nonlocals_and_outer_globals,
     _extract_single_node_local_names,
     _extract_strict_fn_local_names,
-    _is_irrefutable_case,
     _is_span_in_scope_header,
     _node_earliest_start_pos,
     _node_strictly_encloses_bounds,
     _resolve_immediate_scope_in_fn,
     iter_nested_scope_header_nodes,
+)
+from pydoppelgangerhunt.fixer._df_with_provenance import (
+    _analyze_block_assignment,
+    _block_terminates,
+    _clear_name_provenance,
+    _demote_deletions_to_conditional,
+    _extract_deleted_names,
+    _seed_scope_suppress_aliases,
+    _split_with_body_by_mode,
+    _update_suppress_aliases_from_stmt,
+    _walrus_assignment_in_expr,
+    _walrus_in_sequence,
 )
 from pydoppelgangerhunt.fixer._df_hazards import collect_downstream_read_names
 from pydoppelgangerhunt.fixer._df_visitors import (
@@ -69,6 +73,34 @@ from pydoppelgangerhunt.fixer.source import (
     resolve_unit_declared_outputs,
     split_source_lines,
 )
+
+__all__ = [
+    "BUILTIN_NAMES",
+    "_ScopeVisitor",
+    "_analyze_block_assignment",
+    "_block_terminates",
+    "_clear_name_provenance",
+    "_demote_deletions_to_conditional",
+    "_determine_binding_kind",
+    "_extract_deleted_names",
+    "_inspect_unit_scope",
+    "_is_mangled_name",
+    "_normalize_receiver_attr_name",
+    "_normalize_receiver_attrs",
+    "_normalize_receiver_order",
+    "_rank_param_kind",
+    "_seed_scope_suppress_aliases",
+    "_split_with_body_by_mode",
+    "_unfold_receiver_attribute",
+    "_update_suppress_aliases_from_stmt",
+    "_walrus_assignment_in_expr",
+    "_walrus_in_sequence",
+    "analyze_unit_variable_scope",
+    "ensure_unit_scope_closure_mode",
+    "inspect_single_unit_scope",
+    "is_subroutine_unit",
+    "scope_matches_closure_mode",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -954,761 +986,6 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def _walrus_in_sequence(
-    items: Sequence[Optional[ast.AST]],
-    is_conditional: bool = False,
-) -> Tuple[Set[str], Set[str]]:
-    """Evaluates walrus assignments sequentially across expressions with short-circuiting tail conditions."""
-    definite: Set[str] = set()
-    conditional: Set[str] = set()
-    for idx, item in enumerate(items):
-        if item is not None:
-            d, c = _walrus_assignment_in_expr(item, is_conditional if idx == 0 else True)
-            definite.update(d)
-            conditional.update(c)
-    return definite, conditional
-
-
-def _walrus_assignment_in_expr(
-    expr: Optional[ast.AST],
-    is_conditional: bool = False,
-) -> Tuple[Set[str], Set[str]]:
-    """Analyzes walrus assignments in an expression to distinguish definite from conditional stores."""
-    definite: Set[str] = set()
-    conditional: Set[str] = set()
-    if expr is None:
-        return definite, conditional
-
-    if isinstance(expr, ast.NamedExpr) and isinstance(expr.target, ast.Name):
-        if is_conditional:
-            conditional.add(expr.target.id)
-        else:
-            definite.add(expr.target.id)
-
-    if isinstance(expr, ast.BoolOp):
-        d_seq, c_seq = _walrus_in_sequence(expr.values, is_conditional)
-        definite.update(d_seq)
-        conditional.update(c_seq)
-        return definite, conditional - definite
-
-    if isinstance(expr, ast.IfExp):
-        d_t, c_t = _walrus_assignment_in_expr(expr.test, is_conditional)
-        d_b, c_b = _walrus_assignment_in_expr(expr.body, True)
-        d_o, c_o = _walrus_assignment_in_expr(expr.orelse, True)
-        definite.update(d_t)
-        conditional.update(c_t | d_b | c_b | d_o | c_o)
-        return definite, conditional - definite
-
-    if isinstance(expr, ast.Compare):
-        d_l, c_l = _walrus_assignment_in_expr(expr.left, is_conditional)
-        definite.update(d_l)
-        conditional.update(c_l)
-        d_seq, c_seq = _walrus_in_sequence(expr.comparators, is_conditional)
-        definite.update(d_seq)
-        conditional.update(c_seq)
-        return definite, conditional - definite
-
-    if isinstance(expr, ast.Lambda):
-        d_l, c_l = _walrus_assignment_in_expr(expr.body, True)
-        conditional.update(d_l | c_l)
-        return definite, conditional - definite
-
-    if isinstance(expr, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
-        d_seq, c_seq = _walrus_in_sequence([g.iter for g in expr.generators], is_conditional)
-        definite.update(d_seq)
-        conditional.update(c_seq)
-        for child in ast.iter_child_nodes(expr):
-            if isinstance(expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp)) and child is expr.elt:
-                d_c, c_c = _walrus_assignment_in_expr(child, True)
-                conditional.update(d_c | c_c)
-            elif isinstance(expr, ast.DictComp) and child in (expr.key, expr.value):
-                d_c, c_c = _walrus_assignment_in_expr(child, True)
-                conditional.update(d_c | c_c)
-            elif isinstance(child, ast.comprehension):
-                for if_expr in child.ifs:
-                    d_c, c_c = _walrus_assignment_in_expr(if_expr, True)
-                    conditional.update(d_c | c_c)
-        return definite, conditional - definite
-
-    for child in ast.iter_child_nodes(expr):
-        target_child = child.value if isinstance(child, ast.keyword) else child
-        if isinstance(target_child, ast.AST):
-            d_ch, c_ch = _walrus_assignment_in_expr(target_child, is_conditional)
-            definite.update(d_ch)
-            conditional.update(c_ch)
-
-    return definite, conditional - definite
-
-
-def _block_terminates(
-    statements: Sequence[ast.stmt],
-    *,
-    suppress_aliases: AbstractSet[str] = frozenset(),
-) -> bool:
-    """Returns True if the statement sequence unconditionally terminates via return or raise."""
-    local_sup_aliases: Set[str] = set(suppress_aliases)
-    for stmt in statements:
-        _update_suppress_aliases_from_stmt(stmt, local_sup_aliases)
-        if isinstance(stmt, (ast.Return, ast.Raise)):
-            return True
-        if isinstance(stmt, ast.If):
-            if (
-                stmt.orelse
-                and _block_terminates(
-                    stmt.body, suppress_aliases=local_sup_aliases
-                )
-                and _block_terminates(
-                    stmt.orelse, suppress_aliases=local_sup_aliases
-                )
-            ):
-                return True
-        elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-            w_body = _split_with_body_by_mode(
-                stmt, local_sup_aliases, strict_names=False
-            )[0]
-            if _block_terminates(w_body, suppress_aliases=local_sup_aliases):
-                return True
-        elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
-            cases = getattr(stmt, "cases", [])
-            has_irrefutable = any(_is_irrefutable_case(c) for c in cases)
-            if (
-                has_irrefutable
-                and cases
-                and all(
-                    _block_terminates(
-                        c.body, suppress_aliases=local_sup_aliases
-                    )
-                    for c in cases
-                )
-            ):
-                return True
-        elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
-            t_body_seq = getattr(stmt, "body", [])
-            try_sup = set(local_sup_aliases)
-            for b_stmt in t_body_seq:
-                _update_suppress_aliases_from_stmt(b_stmt, try_sup)
-            handler_sup = set(local_sup_aliases) | {
-                tok
-                for tok in (try_sup - local_sup_aliases)
-                if not tok.startswith("!nonsup:") and not tok.startswith("!mod:")
-            }
-            f_body = getattr(stmt, "finalbody", [])
-            if f_body and _block_terminates(
-                f_body, suppress_aliases=handler_sup
-            ):
-                return True
-            handlers = getattr(stmt, "handlers", [])
-            o_stmts = getattr(stmt, "orelse", [])
-            body_terminates = _block_terminates(
-                t_body_seq,
-                suppress_aliases=local_sup_aliases,
-            ) or (
-                bool(o_stmts)
-                and _block_terminates(
-                    o_stmts, suppress_aliases=try_sup
-                )
-            )
-            if not handlers and body_terminates:
-                return True
-            if (
-                handlers
-                and type(stmt).__name__ != "TryStar"
-                and body_terminates
-                and all(
-                    _block_terminates(
-                        getattr(h, "body", []),
-                        suppress_aliases=handler_sup,
-                    )
-                    for h in handlers
-                )
-            ):
-                return True
-    return False
-
-
-def _extract_deleted_names(statements: Sequence[ast.AST]) -> Set[str]:
-    """Finds all variable names deleted within a statement sequence without recursing into nested functions."""
-    deleted: Set[str] = set()
-    for stmt in statements:
-        if isinstance(stmt, ast.Delete):
-            for target in stmt.targets:
-                for node in ast.walk(target):
-                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del):
-                        deleted.add(node.id)
-        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            continue
-        elif isinstance(stmt, ast.ExceptHandler):
-            deleted.update(_extract_deleted_names(stmt.body))
-        elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
-            for case in getattr(stmt, "cases", []):
-                deleted.update(_extract_deleted_names(getattr(case, "body", [])))
-        else:
-            for child in ast.iter_child_nodes(stmt):
-                if isinstance(child, (ast.stmt, ast.ExceptHandler)):
-                    deleted.update(_extract_deleted_names([child]))
-    return deleted
-
-
-def _demote_deletions_to_conditional(
-    deleted_names: Iterable[str],
-    definite: Set[str],
-    conditional: Set[str],
-) -> None:
-    """Discards deleted variables from definite and promotes previously definite variables to conditional."""
-    for v_del in deleted_names:
-        if v_del in definite:
-            definite.discard(v_del)
-            conditional.add(v_del)
-
-
-def _analyze_block_assignment(
-    statements: Sequence[ast.stmt],
-    definite: Optional[Set[str]] = None,
-    conditional: Optional[Set[str]] = None,
-    *,
-    may_deleted: Optional[Set[str]] = None,
-    live_in_deleted: Optional[Set[str]] = None,
-    suppress_aliases: AbstractSet[str] = frozenset(),
-) -> Tuple[Set[str], Set[str]]:
-    """Analyzes a sequence of statements to determine unconditionally and conditionally assigned variables.
-
-    Returns:
-        A tuple of (definitely_assigned, conditionally_assigned) variable name sets.
-    """
-    if definite is None:
-        definite = set()
-    if conditional is None:
-        conditional = set()
-    may_del = may_deleted if may_deleted is not None else set()
-    live_in_del = live_in_deleted if live_in_deleted is not None else set()
-    local_sup_aliases: Set[str] = set(suppress_aliases)
-
-    for stmt in statements:
-        _update_suppress_aliases_from_stmt(stmt, local_sup_aliases)
-        before_def = set(definite)
-        if isinstance(stmt, ast.Assign):
-            for target in stmt.targets:
-                for node in ast.walk(target):
-                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-                        definite.add(node.id)
-                        may_del.discard(node.id)
-                d_t, c_t = _walrus_assignment_in_expr(target)
-                definite.update(d_t)
-                may_del.difference_update(d_t)
-                conditional.update(c_t)
-            d_val, c_val = _walrus_assignment_in_expr(stmt.value)
-            definite.update(d_val)
-            may_del.difference_update(d_val)
-            conditional.update(c_val)
-        elif isinstance(stmt, ast.AnnAssign):
-            if stmt.value is not None:
-                if isinstance(stmt.target, ast.Name):
-                    definite.add(stmt.target.id)
-                    may_del.discard(stmt.target.id)
-                d_val, c_val = _walrus_assignment_in_expr(stmt.value)
-                definite.update(d_val)
-                may_del.difference_update(d_val)
-                conditional.update(c_val)
-        elif isinstance(stmt, ast.AugAssign):
-            if isinstance(stmt.target, ast.Name):
-                definite.add(stmt.target.id)
-                may_del.discard(stmt.target.id)
-            d_t, c_t = _walrus_assignment_in_expr(stmt.target)
-            definite.update(d_t)
-            may_del.difference_update(d_t)
-            conditional.update(c_t)
-            d_val, c_val = _walrus_assignment_in_expr(stmt.value)
-            definite.update(d_val)
-            may_del.difference_update(d_val)
-            conditional.update(c_val)
-        elif isinstance(stmt, ast.Expr):
-            d_val, c_val = _walrus_assignment_in_expr(stmt.value)
-            definite.update(d_val)
-            may_del.difference_update(d_val)
-            conditional.update(c_val)
-        elif isinstance(stmt, ast.Delete):
-            for target in stmt.targets:
-                d_del, c_del = _walrus_assignment_in_expr(target)
-                definite.update(d_del)
-                may_del.difference_update(d_del)
-                conditional.update(c_del)
-                for node in ast.walk(target):
-                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del):
-                        if node.id not in definite:
-                            live_in_del.add(node.id)
-                        definite.discard(node.id)
-                        conditional.discard(node.id)
-                        may_del.add(node.id)
-        elif isinstance(stmt, ast.Raise):
-            if stmt.exc is not None:
-                d_exc, c_exc = _walrus_assignment_in_expr(stmt.exc)
-                definite.update(d_exc)
-                may_del.difference_update(d_exc)
-                conditional.update(c_exc)
-            if stmt.cause is not None:
-                d_cause, c_cause = _walrus_assignment_in_expr(stmt.cause)
-                definite.update(d_cause)
-                may_del.difference_update(d_cause)
-                conditional.update(c_cause)
-        elif isinstance(stmt, ast.Return):
-            if stmt.value is not None:
-                d_val, c_val = _walrus_assignment_in_expr(stmt.value)
-                definite.update(d_val)
-                may_del.difference_update(d_val)
-                conditional.update(c_val)
-        elif isinstance(stmt, ast.If):
-            d_test, c_test = _walrus_assignment_in_expr(stmt.test)
-            definite.update(d_test)
-            may_del.difference_update(d_test)
-            conditional.update(c_test)
-            b_may: Set[str] = set()
-            b_live: Set[str] = set()
-            o_may: Set[str] = set()
-            o_live: Set[str] = set()
-            b_def, b_cond = _analyze_block_assignment(
-                stmt.body,
-                may_deleted=b_may,
-                live_in_deleted=b_live,
-                suppress_aliases=local_sup_aliases,
-            )
-            o_def, o_cond = (
-                _analyze_block_assignment(
-                    stmt.orelse,
-                    may_deleted=o_may,
-                    live_in_deleted=o_live,
-                    suppress_aliases=local_sup_aliases,
-                )
-                if stmt.orelse
-                else (set(), set())
-            )
-            live_in_del.update((b_live | o_live) - definite)
-            b_term = _block_terminates(
-                stmt.body, suppress_aliases=local_sup_aliases
-            )
-            o_term = (
-                _block_terminates(
-                    stmt.orelse, suppress_aliases=local_sup_aliases
-                )
-                if stmt.orelse
-                else False
-            )
-            if stmt.orelse:
-                if o_term and not b_term:
-                    definite.update(b_def)
-                    conditional.update((b_def | b_cond) - definite)
-                    may_del.difference_update(b_def)
-                    may_del.update(b_may)
-                elif b_term and not o_term:
-                    definite.update(o_def)
-                    conditional.update((o_def | o_cond) - definite)
-                    may_del.difference_update(o_def)
-                    may_del.update(o_may)
-                elif not b_term and not o_term:
-                    both = b_def & o_def
-                    definite.update(both)
-                    conditional.update((b_def | b_cond | o_def | o_cond) - definite)
-                    may_del.difference_update(both)
-                    may_del.update(b_may | o_may)
-                eff_b_del = _extract_deleted_names(stmt.body) - b_def
-                eff_o_del = _extract_deleted_names(stmt.orelse) - o_def
-                for v_del in eff_b_del & eff_o_del:
-                    definite.discard(v_del)
-                    conditional.discard(v_del)
-                _demote_deletions_to_conditional(eff_b_del ^ eff_o_del, definite, conditional)
-            else:
-                if not b_term:
-                    conditional.update((b_def | b_cond) - definite)
-                    may_del.update(b_may)
-                    eff_b_del = _extract_deleted_names(stmt.body) - b_def
-                    _demote_deletions_to_conditional(eff_b_del, definite, conditional)
-        elif isinstance(stmt, ast.While):
-            d_test, c_test = _walrus_assignment_in_expr(stmt.test)
-            definite.update(d_test)
-            may_del.difference_update(d_test)
-            conditional.update(c_test)
-            sub_stmts = list(stmt.body)
-            if hasattr(stmt, "orelse") and stmt.orelse:
-                sub_stmts.extend(stmt.orelse)
-            sub_may: Set[str] = set()
-            sub_live: Set[str] = set()
-            sub_def, sub_cond = _analyze_block_assignment(
-                sub_stmts,
-                may_deleted=sub_may,
-                live_in_deleted=sub_live,
-                suppress_aliases=local_sup_aliases,
-            )
-            live_in_del.update(sub_live - definite)
-            may_del.update(sub_may)
-            conditional.update((sub_def | sub_cond) - definite)
-            _demote_deletions_to_conditional(_extract_deleted_names(sub_stmts), definite, conditional)
-        elif isinstance(stmt, (ast.For, ast.AsyncFor)):
-            d_iter, c_iter = _walrus_assignment_in_expr(stmt.iter)
-            definite.update(d_iter)
-            may_del.difference_update(d_iter)
-            conditional.update(c_iter)
-            t_names: Set[str] = set()
-            for p_node in ast.walk(stmt.target):
-                if isinstance(p_node, ast.Name) and isinstance(p_node.ctx, ast.Store):
-                    conditional.add(p_node.id)
-                    t_names.add(p_node.id)
-            sub_stmts = list(stmt.body)
-            if hasattr(stmt, "orelse") and stmt.orelse:
-                sub_stmts.extend(stmt.orelse)
-            for_may: Set[str] = set()
-            for_live: Set[str] = set()
-            sub_def, sub_cond = _analyze_block_assignment(
-                sub_stmts,
-                may_deleted=for_may,
-                live_in_deleted=for_live,
-                suppress_aliases=local_sup_aliases,
-            )
-            live_in_del.update((for_live - t_names) - definite)
-            may_del.update(for_may)
-            conditional.update((sub_def | sub_cond) - definite)
-            _demote_deletions_to_conditional(_extract_deleted_names(sub_stmts), definite, conditional)
-        elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-            for item in stmt.items:
-                d_ctx, c_ctx = _walrus_assignment_in_expr(item.context_expr)
-                definite.update(d_ctx)
-                may_del.difference_update(d_ctx)
-                conditional.update(c_ctx)
-                if item.optional_vars is not None:
-                    for p_node in ast.walk(item.optional_vars):
-                        if isinstance(p_node, ast.Name) and isinstance(p_node.ctx, ast.Store):
-                            definite.add(p_node.id)
-                            may_del.discard(p_node.id)
-            safe_prefix, risky_suffix = _split_with_body_by_mode(
-                stmt, local_sup_aliases, safe_names=definite
-            )
-            _analyze_block_assignment(
-                safe_prefix,
-                definite,
-                conditional,
-                may_deleted=may_del,
-                live_in_deleted=live_in_del,
-                suppress_aliases=local_sup_aliases,
-            )
-            if risky_suffix and not _block_terminates(
-                safe_prefix, suppress_aliases=local_sup_aliases
-            ):
-                w_may: Set[str] = set()
-                w_live: Set[str] = set()
-                w_def, w_cond = _analyze_block_assignment(
-                    risky_suffix,
-                    may_deleted=w_may,
-                    live_in_deleted=w_live,
-                    suppress_aliases=local_sup_aliases,
-                )
-                live_in_del.update(w_live - definite)
-                may_del.update(w_may)
-                conditional.update((w_def | w_cond) - definite)
-                _demote_deletions_to_conditional(
-                    _extract_deleted_names(risky_suffix),
-                    definite,
-                    conditional,
-                )
-        elif isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
-            t_body = list(getattr(stmt, "body", []))
-            raw_try_del = _extract_deleted_names(t_body)
-            is_trystar = type(stmt).__name__ == "TryStar"
-            try_body_sup = set(local_sup_aliases)
-            for b_stmt in t_body:
-                _update_suppress_aliases_from_stmt(b_stmt, try_body_sup)
-            handler_base_sup = set(local_sup_aliases) | {
-                tok
-                for tok in (try_body_sup - local_sup_aliases)
-                if not tok.startswith("!nonsup:") and not tok.startswith("!mod:")
-            }
-            t_may: Set[str] = set()
-            t_live: Set[str] = set()
-            t_def, t_cond = _analyze_block_assignment(
-                t_body,
-                may_deleted=t_may,
-                live_in_deleted=t_live,
-                suppress_aliases=local_sup_aliases,
-            )
-            live_in_del.update(t_live - definite)
-            t_term = _block_terminates(
-                t_body, suppress_aliases=local_sup_aliases
-            )
-            o_stmts = list(getattr(stmt, "orelse", []))
-            o_try_may: Set[str] = set()
-            if o_stmts:
-                o_try_live: Set[str] = set()
-                o_def, o_cond = _analyze_block_assignment(
-                    o_stmts,
-                    may_deleted=o_try_may,
-                    live_in_deleted=o_try_live,
-                    suppress_aliases=try_body_sup,
-                )
-                for o_stmt in o_stmts:
-                    _update_suppress_aliases_from_stmt(o_stmt, try_body_sup)
-                if not t_term:
-                    live_in_del.update(o_try_live - (definite | t_def))
-                o_term = _block_terminates(
-                    o_stmts, suppress_aliases=try_body_sup
-                )
-                if not o_term:
-                    try_def = t_def | o_def
-                    try_cond = (t_cond | o_cond) - try_def
-                    succ_may = (t_may - o_def) | o_try_may
-                else:
-                    try_def = set()
-                    try_cond = set()
-                    succ_may = set()
-                    t_term = True
-            else:
-                try_def = t_def
-                try_cond = t_cond
-                succ_may = t_may
-
-            handlers = list(getattr(stmt, "handlers", []))
-            h_defs: List[Set[str]] = []
-            h_dels: List[Tuple[Set[str], Set[str], bool]] = []
-            h_mays: List[Set[str]] = []
-            all_handlers_terminate = bool(
-                handlers
-                and not is_trystar
-                and all(
-                    _block_terminates(
-                        getattr(h, "body", []),
-                        suppress_aliases=handler_base_sup,
-                    )
-                    for h in handlers
-                )
-            )
-            final_sup = set(handler_base_sup) | {
-                tok
-                for tok in (try_body_sup - local_sup_aliases)
-                if not tok.startswith("!nonsup:") and not tok.startswith("!mod:")
-            }
-
-            for h in handlers:
-                h_body = list(getattr(h, "body", []))
-                if getattr(h, "type", None) is not None:
-                    d_ht, c_ht = _walrus_assignment_in_expr(h.type, is_conditional=True)
-                    conditional.update(d_ht | c_ht)
-                h_sup = set(handler_base_sup)
-                if isinstance(getattr(h, "name", None), str):
-                    _clear_name_provenance(h.name, h_sup)
-                h_may: Set[str] = set()
-                h_live: Set[str] = set()
-                h_d, h_c = _analyze_block_assignment(
-                    h_body,
-                    may_deleted=h_may,
-                    live_in_deleted=h_live,
-                    suppress_aliases=h_sup,
-                )
-                for h_stmt in h_body:
-                    _update_suppress_aliases_from_stmt(h_stmt, h_sup)
-                final_sup.update(
-                    tok
-                    for tok in (h_sup - handler_base_sup)
-                    if not tok.startswith("!nonsup:")
-                    and not tok.startswith("!mod:")
-                )
-                h_bound = {h.name} if isinstance(getattr(h, "name", None), str) else set()
-                h_d.difference_update(h_bound)
-                h_may.update(h_bound)
-                live_in_del.update((h_live - h_bound) - definite)
-                h_term = not is_trystar and _block_terminates(
-                    h_body, suppress_aliases=h_sup
-                )
-                eff_h_del = (_extract_deleted_names(h_body) - h_d) | h_bound
-                reach_h_del = eff_h_del | (raw_try_del - h_d)
-                h_dels.append((eff_h_del, reach_h_del, h_term))
-                if not h_term:
-                    h_defs.append(h_d)
-                    h_mays.append(h_may | ((raw_try_del | t_may) - h_d))
-                conditional.update(((h_d | h_c) - h_bound) - definite)
-
-            if is_trystar and handlers:
-                conditional.update((t_def | t_cond | try_def | try_cond) - definite)
-                may_del.update(t_may | o_try_may | raw_try_del)
-                for hm in h_mays:
-                    may_del.update(hm)
-            elif not t_term:
-                if all_handlers_terminate:
-                    definite.update(try_def)
-                    conditional.update(try_cond - definite)
-                    may_del.difference_update(try_def)
-                    may_del.update(succ_may)
-                elif handlers and h_defs:
-                    common = try_def.intersection(*h_defs)
-                    definite.update(common)
-                    conditional.update((try_def | try_cond) - definite)
-                    may_del.difference_update(common)
-                    may_del.update(succ_may)
-                    for hm in h_mays:
-                        may_del.update(hm)
-                elif not handlers:
-                    definite.update(try_def)
-                    conditional.update(try_cond - definite)
-                    may_del.difference_update(try_def)
-                    may_del.update(succ_may)
-            elif h_defs:
-                common = set.intersection(*h_defs)
-                definite.update(common)
-                conditional.update(try_cond - definite)
-                may_del.difference_update(common)
-                for hm in h_mays:
-                    may_del.update(hm)
-
-            eff_try_del = raw_try_del - t_def
-            eff_o_del = _extract_deleted_names(o_stmts) - o_def if o_stmts else set()
-            succ_del = eff_try_del | eff_o_del
-
-            surviving_uncond_dels: List[Set[str]] = []
-            surviving_reach_dels: List[Set[str]] = []
-            all_try_dels = succ_del | raw_try_del
-            if not t_term and not (is_trystar and handlers):
-                surviving_uncond_dels.append(succ_del)
-                surviving_reach_dels.append(succ_del)
-
-            for eff_h_del, reach_h_del, h_term in h_dels:
-                all_try_dels.update(reach_h_del)
-                if not h_term and not is_trystar:
-                    surviving_uncond_dels.append(eff_h_del)
-                    surviving_reach_dels.append(reach_h_del)
-
-            f_body = list(getattr(stmt, "finalbody", []))
-            reach_dels: Set[str] = (
-                all_try_dels
-                if (f_body or is_trystar or not surviving_reach_dels)
-                else set().union(*surviving_reach_dels)
-            )
-            if surviving_uncond_dels and not is_trystar:
-                uncond_dels = set.intersection(*surviving_uncond_dels)
-                for v_del in uncond_dels:
-                    definite.discard(v_del)
-                    conditional.discard(v_del)
-                _demote_deletions_to_conditional(reach_dels - uncond_dels, definite, conditional)
-            else:
-                _demote_deletions_to_conditional(all_try_dels, definite, conditional)
-
-            if f_body:
-                _analyze_block_assignment(
-                    f_body,
-                    definite,
-                    conditional,
-                    may_deleted=may_del,
-                    live_in_deleted=live_in_del,
-                    suppress_aliases=final_sup,
-                )
-                local_sup_aliases.update(
-                    tok
-                    for tok in (final_sup - local_sup_aliases)
-                    if not tok.startswith("!nonsup:")
-                    and not tok.startswith("!mod:")
-                )
-        elif type(stmt).__name__ == "Match":  # pragma: no cover (py310+)
-            d_sub, c_sub = _walrus_assignment_in_expr(getattr(stmt, "subject", None))
-            definite.update(d_sub)
-            may_del.difference_update(d_sub)
-            conditional.update(c_sub)
-            case_defs: List[Set[str]] = []
-            non_term_case_defs: List[Set[str]] = []
-            case_conds: Set[str] = set()
-            case_dels: Set[str] = set()
-            non_term_case_dels: List[Set[str]] = []
-            has_irrefutable_default = False
-            for case in getattr(stmt, "cases", []):
-                pattern_stores: Set[str] = set()
-                pattern = getattr(case, "pattern", None)
-                if pattern is not None:
-                    for p_node in ast.walk(pattern):
-                        if type(p_node).__name__ in ("MatchAs", "MatchStar"):
-                            p_name = getattr(p_node, "name", None)
-                            if p_name and isinstance(p_name, str) and p_name != "_":
-                                pattern_stores.add(p_name)
-                        elif type(p_node).__name__ == "MatchMapping":
-                            p_rest = getattr(p_node, "rest", None)
-                            if p_rest and isinstance(p_rest, str) and p_rest != "_":
-                                pattern_stores.add(p_rest)
-                guard = getattr(case, "guard", None)
-                d_g: Set[str] = set()
-                c_g: Set[str] = set()
-                if guard is not None:
-                    d_g, c_g = _walrus_assignment_in_expr(guard, is_conditional=False)
-                case_init_def = pattern_stores | d_g
-                case_sup = set(local_sup_aliases)
-                for p_s in pattern_stores:
-                    _clear_name_provenance(p_s, case_sup)
-                c_may: Set[str] = set()
-                c_live: Set[str] = set()
-                c_def, c_cond = _analyze_block_assignment(
-                    case.body,
-                    definite=case_init_def.copy(),
-                    conditional=c_g.copy() if c_g else None,
-                    may_deleted=c_may,
-                    live_in_deleted=c_live,
-                    suppress_aliases=case_sup,
-                )
-                live_in_del.update((c_live - case_init_def) - definite)
-                case_defs.append(c_def)
-                case_conds.update(c_def | c_cond)
-                c_del = _extract_deleted_names(case.body) - c_def
-                case_dels.update(c_del)
-                if not _block_terminates(
-                    case.body, suppress_aliases=case_sup
-                ):
-                    non_term_case_defs.append(c_def)
-                    non_term_case_dels.append(c_del)
-                    may_del.update(c_may - pattern_stores)
-                if _is_irrefutable_case(case):
-                    has_irrefutable_default = True
-            if case_defs and has_irrefutable_default:
-                if non_term_case_defs:
-                    common = set.intersection(*non_term_case_defs)
-                    definite.update(common)
-                    may_del.difference_update(common)
-                conditional.update(case_conds - definite)
-            else:
-                conditional.update(case_conds - definite)
-            all_del = (
-                {v for v in case_dels if all(v in d for d in non_term_case_dels)}
-                if (has_irrefutable_default and non_term_case_dels)
-                else set()
-            )
-            for v_del in all_del:
-                definite.discard(v_del)
-                conditional.discard(v_del)
-            _demote_deletions_to_conditional(case_dels - all_del, definite, conditional)
-        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            definite.add(stmt.name)
-            may_del.discard(stmt.name)
-        elif type(stmt).__name__ == "TypeAlias":  # pragma: no cover (py312+)
-            name_node = getattr(stmt, "name", None)
-            if isinstance(name_node, ast.Name):
-                definite.add(name_node.id)
-                may_del.discard(name_node.id)
-        elif isinstance(stmt, ast.Import):
-            for alias in stmt.names:
-                bound_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
-                definite.add(bound_name)
-                may_del.discard(bound_name)
-        elif isinstance(stmt, ast.ImportFrom):
-            for alias in stmt.names:
-                if alias.name != "*":
-                    bound_name = alias.asname or alias.name
-                    definite.add(bound_name)
-                    may_del.discard(bound_name)
-        elif isinstance(stmt, ast.Assert):
-            d_ast, c_ast = _walrus_assignment_in_expr(stmt.test)
-            definite.update(d_ast)
-            may_del.difference_update(d_ast)
-            conditional.update(c_ast)
-            if stmt.msg is not None:
-                d_m, c_m = _walrus_assignment_in_expr(stmt.msg, is_conditional=True)
-                conditional.update(d_m | c_m)
-
-        may_del.difference_update(definite - before_def)
-        if _block_terminates([stmt], suppress_aliases=local_sup_aliases):
-            break
-
-    return definite, conditional - definite
-
-
 def _determine_binding_kind(
     has_instance_binding: bool,
     has_class_binding: bool,
@@ -2324,6 +1601,7 @@ def _inspect_unit_scope(
         else:
             raw_lines = split_source_lines(str(unit["source_code"]))
     dedented = dedent_source_text("".join(raw_lines))
+    skip_pre_unit_closures_flag = bool(unit.get("skip_pre_unit_closures"))
     empty_res: Dict[str, Any] = {
         "inputs": [],
         "outputs": [],
@@ -2336,6 +1614,7 @@ def _inspect_unit_scope(
         "param_details": [],
         "return_type": None,
         "control_flow_hazards": [],
+        "closure_hazard_reasons": [],
         "is_control_flow_safe": True,
         "has_yield": False,
         "has_yield_assignment": False,
@@ -2360,7 +1639,8 @@ def _inspect_unit_scope(
         "type_param_free_vars": [],
         "has_class_scoped_type_params": False,
         "deleted_names": [],
-        "_skip_pre_unit_closures": bool(unit.get("skip_pre_unit_closures")),
+        "skip_pre_unit_closures": skip_pre_unit_closures_flag,
+        "_skip_pre_unit_closures": skip_pre_unit_closures_flag,
     }
     if stale_source_code_mismatch:
         return {
@@ -2618,49 +1898,76 @@ def _inspect_unit_scope(
             ):
                 has_class_scoped_type_params = True
 
+        # Resolve module AST, unit column bounds, and enclosing function chain once per unit
+        closure_hazard_reasons: List[str] = []
+        u_start = parse_unit_coord(unit, "start", default=0)
+        u_end = parse_unit_coord(unit, "end", default=u_start)
+        mod_tree: Optional[ast.AST] = file_tree
+        if mod_tree is None and u_start > 0:
+            full_src = _get_full_source()
+            if full_src:
+                mod_tree = _get_or_parse_tree(full_src)
+        resolved_s_col, resolved_e_col = inferred_s_col, inferred_e_col
+        cols_resolved = False
+        enclosing_chain: List[Tuple[int, int, ast.AST]] = []
+        if mod_tree is not None and u_start > 0:
+            resolved_s_col, resolved_e_col = _resolve_unit_col_bounds(
+                candidate_stmts,
+                mod_tree,
+                u_start,
+                u_end,
+                resolved_s_col,
+                resolved_e_col,
+            )
+            cols_resolved = True
+            enclosing_chain = _find_enclosing_function_chain(
+                mod_tree,
+                u_start,
+                u_end,
+                resolved_s_col,
+                resolved_e_col,
+            )
+
         # Definite, conditional, and branch-aware deletion analysis across candidate statements
         may_deleted: Set[str] = set()
         live_in_deleted: Set[str] = set()
         initial_sup_aliases: Set[str] = set()
         if "open" in visitor.params:
             initial_sup_aliases.add("!shadow:open")
-        if any(
+        if mod_tree is not None and any(
             isinstance(n, (ast.With, ast.AsyncWith))
             for st in candidate_stmts
             for n in ast.walk(st)
         ):
-            sup_tree = file_tree
-            if sup_tree is None:
-                full_src_for_sup = _get_full_source()
-                if full_src_for_sup:
-                    sup_tree = _get_or_parse_tree(full_src_for_sup)
-            if sup_tree is not None:
-                sup_u_start = parse_unit_coord(unit, "start", default=0)
-                sup_u_end = parse_unit_coord(unit, "end", default=sup_u_start)
-                sup_chain = (
-                    _find_enclosing_function_chain(
-                        sup_tree,
-                        sup_u_start,
-                        sup_u_end,
-                        inferred_s_col,
-                        inferred_e_col,
-                    )
-                    if sup_u_start > 0
-                    else []
+            sup_fn = enclosing_chain[-1][2] if enclosing_chain else mod_tree
+            sup_scope_ctx = (
+                _get_fn_scope_context(
+                    sup_fn,
+                    mod_tree=mod_tree,
+                    enclosing_scopes=[f for _, _, f in enclosing_chain[:-1]],
                 )
-                sup_fn = sup_chain[-1][2] if sup_chain else sup_tree
-                initial_sup_aliases.update(
-                    _seed_scope_suppress_aliases(
-                        sup_fn,
-                        mod_tree=sup_tree,
-                        u_start=sup_u_start,
-                    )
+                if isinstance(sup_fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                else None
+            )
+            initial_sup_aliases.update(
+                _seed_scope_suppress_aliases(
+                    sup_fn,
+                    mod_tree=mod_tree,
+                    u_start=u_start,
+                    scope_ctx=sup_scope_ctx,
                 )
+            )
+        extra_non_sup = frozenset(
+            str(n)
+            for n in (unit.get("non_suppressing_ctx_managers") or ())
+            if isinstance(n, str) and n
+        )
         def_assigned, cond_assigned = _analyze_block_assignment(
             candidate_stmts,
             may_deleted=may_deleted,
             live_in_deleted=live_in_deleted,
             suppress_aliases=initial_sup_aliases,
+            extra_non_suppressing_ctx_managers=extra_non_sup,
         )
         for del_name in sorted(live_in_deleted):
             if (
@@ -2673,8 +1980,6 @@ def _inspect_unit_scope(
                 if del_name not in visitor.read_before_write:
                     visitor.read_before_write.append(del_name)
 
-        resolved_s_col, resolved_e_col = inferred_s_col, inferred_e_col
-        cols_resolved = False
         if is_subroutine:
             live_in_visitor = _UnitLiveInVisitor(1, 10**9, include_annotations=False)
             for stmt in candidate_stmts:
@@ -2701,23 +2006,7 @@ def _inspect_unit_scope(
             if cond_live_ins or cond_escaping_cands:
                 pre_bound: Set[str] = set()
                 rejected_escaping_vars: Set[str] = set()
-                u_start = parse_unit_coord(unit, "start", default=0)
-                u_end = parse_unit_coord(unit, "end", default=u_start)
-                mod_tree = file_tree
-                if mod_tree is None and u_start > 0:
-                    full_src = _get_full_source()
-                    if full_src:
-                        mod_tree = _get_or_parse_tree(full_src)
                 if mod_tree is not None and u_start > 0:
-                    resolved_s_col, resolved_e_col = _resolve_unit_col_bounds(
-                        candidate_stmts,
-                        mod_tree,
-                        u_start,
-                        u_end,
-                        resolved_s_col,
-                        resolved_e_col,
-                    )
-                    cols_resolved = True
                     u_start_col, u_end_col = resolved_s_col, resolved_e_col
                     pre_bound, _ = _find_enclosing_pre_bound_names(
                         mod_tree,
@@ -2726,64 +2015,41 @@ def _inspect_unit_scope(
                         u_start_col=u_start_col,
                         u_end_col=u_end_col,
                     )
-                    if cond_escaping_cands or cond_live_ins:
-                        enc_chain = _find_enclosing_function_chain(
-                            mod_tree, u_start, u_end, u_start_col, u_end_col
+                    if enclosing_chain:
+                        in_enclosing_class_body = isinstance(
+                            _resolve_immediate_scope_in_fn(
+                                enclosing_chain[-1][2],
+                                u_start,
+                                u_end,
+                                u_start_col=u_start_col,
+                                u_end_col=u_end_col,
+                            ),
+                            ast.ClassDef,
                         )
-                        if enc_chain:
-                            in_enclosing_class_body = isinstance(
-                                _resolve_immediate_scope_in_fn(
-                                    enc_chain[-1][2],
-                                    u_start,
-                                    u_end,
-                                    u_start_col=u_start_col,
-                                    u_end_col=u_end_col,
-                                ),
-                                ast.ClassDef,
+                        enc_nonlocals, enc_outer_globals = (
+                            _extract_scope_nonlocals_and_outer_globals(
+                                enclosing_chain[-1][2],
+                                u_start,
+                                u_end,
+                                u_start_col=u_start_col,
+                                u_end_col=u_end_col,
                             )
-                            enc_nonlocals, enc_outer_globals = (
-                                _extract_scope_nonlocals_and_outer_globals(
-                                    enc_chain[-1][2],
-                                    u_start,
-                                    u_end,
-                                    u_start_col=u_start_col,
-                                    u_end_col=u_end_col,
-                                )
+                        )
+                        enc_escaping = enc_nonlocals | enc_outer_globals
+                        def_pre_bound = (
+                            _find_enclosing_chain_definite_pre_bound(
+                                enclosing_chain,
+                                u_start,
+                                u_end,
+                                u_start_col=u_start_col,
+                                u_end_col=u_end_col,
+                                mod_tree=mod_tree,
                             )
-                            enc_escaping = enc_nonlocals | enc_outer_globals
-                            def_pre_bound = (
-                                _find_enclosing_chain_definite_pre_bound(
-                                    enc_chain,
-                                    u_start,
-                                    u_end,
-                                    u_start_col=u_start_col,
-                                    u_end_col=u_end_col,
-                                    mod_tree=mod_tree,
-                                )
-                            )
-                            for v in cond_escaping_cands:
-                                if v in enc_escaping:
-                                    if (
-                                        v in enc_nonlocals
-                                        and v in pre_bound
-                                        and v in def_pre_bound
-                                    ):
-                                        if v not in visitor.loads:
-                                            visitor.loads.append(v)
-                                        if v not in visitor.read_before_write:
-                                            visitor.read_before_write.append(v)
-                                    else:
-                                        rejected_escaping_vars.add(v)
-                                        if (
-                                            v in visitor.read_before_write
-                                            and v not in def_pre_bound
-                                        ):
-                                            visitor.read_before_write.remove(v)
-                                        if "severed_closure_cell" not in hazards:
-                                            hazards.append("severed_closure_cell")
-                                elif (
-                                    not in_enclosing_class_body
-                                    and not visitor.has_yield
+                        )
+                        for v in cond_escaping_cands:
+                            if v in enc_escaping:
+                                if (
+                                    v in enc_nonlocals
                                     and v in pre_bound
                                     and v in def_pre_bound
                                 ):
@@ -2791,22 +2057,53 @@ def _inspect_unit_scope(
                                         visitor.loads.append(v)
                                     if v not in visitor.read_before_write:
                                         visitor.read_before_write.append(v)
-                                elif (
-                                    in_enclosing_class_body
-                                    or v not in def_pre_bound
-                                ):
-                                    rejected_escaping_vars.add(v)
-                            for v in cond_live_ins:
-                                if v not in def_pre_bound or (
-                                    in_enclosing_class_body
-                                    and v not in enc_escaping
-                                ):
+                                else:
                                     rejected_escaping_vars.add(v)
                                     if (
-                                        v in pre_bound
-                                        and "severed_closure_cell" not in hazards
+                                        v in visitor.read_before_write
+                                        and v not in def_pre_bound
                                     ):
+                                        visitor.read_before_write.remove(v)
+                                    if "severed_closure_cell" not in hazards:
                                         hazards.append("severed_closure_cell")
+                                    sub_r = (
+                                        "global_escape"
+                                        if v in enc_outer_globals
+                                        else "cell_severing"
+                                    )
+                                    if sub_r not in closure_hazard_reasons:
+                                        closure_hazard_reasons.append(sub_r)
+                            elif (
+                                not in_enclosing_class_body
+                                and not visitor.has_yield
+                                and v in pre_bound
+                                and v in def_pre_bound
+                            ):
+                                if v not in visitor.loads:
+                                    visitor.loads.append(v)
+                                if v not in visitor.read_before_write:
+                                    visitor.read_before_write.append(v)
+                            elif (
+                                in_enclosing_class_body
+                                or v not in def_pre_bound
+                            ):
+                                rejected_escaping_vars.add(v)
+                        for v in cond_live_ins:
+                            if v not in def_pre_bound or (
+                                in_enclosing_class_body
+                                and v not in enc_escaping
+                            ):
+                                rejected_escaping_vars.add(v)
+                                if v in pre_bound:
+                                    if "severed_closure_cell" not in hazards:
+                                        hazards.append("severed_closure_cell")
+                                    if (
+                                        "conditional_live_in"
+                                        not in closure_hazard_reasons
+                                    ):
+                                        closure_hazard_reasons.append(
+                                            "conditional_live_in"
+                                        )
                 has_enclosing_context = mod_tree is not None and (
                     u_start > 1 or bool(_get_tree_scope_intervals(mod_tree))
                 )
@@ -2960,48 +2257,32 @@ def _inspect_unit_scope(
             and getattr(tree.body[0], "name", None) != _SYNTHETIC_WRAPPER_NAME
             else candidate_stmts
         )
-        c_u_start = parse_unit_coord(unit, "start", default=0)
-        c_u_end = parse_unit_coord(unit, "end", default=c_u_start)
-        c_mod_tree = file_tree
-        if c_mod_tree is None and c_u_start > 0:
-            full_src = _get_full_source()
-            if full_src:
-                c_mod_tree = _get_or_parse_tree(full_src)
-        lex_enc_chain = (
-            _find_enclosing_function_chain(
-                c_mod_tree,
-                c_u_start,
-                c_u_end,
-                resolved_s_col,
-                resolved_e_col,
-            )
-            if c_mod_tree is not None and c_u_start > 0
-            else ()
-        )
         if (
             "severed_closure_cell" not in hazards
             and _has_invalid_lexical_scope_declarations(
                 lex_stmts,
-                enclosing_chain=lex_enc_chain,
-                mod_tree=c_mod_tree,
+                enclosing_chain=enclosing_chain,
+                mod_tree=mod_tree,
             )
         ):
             hazards.append("severed_closure_cell")
+            if "invalid_lexical_declaration" not in closure_hazard_reasons:
+                closure_hazard_reasons.append("invalid_lexical_declaration")
 
         if is_subroutine or unit.get("kind") in (
             "closure",
             "comprehension",
             "complex_expr",
         ):
-            if c_u_start > 0 and c_mod_tree is not None:
+            if u_start > 0 and mod_tree is not None:
                 if (
                     "severed_closure_cell" not in hazards
                     and _has_severed_closure_cell_hazard(
                         _UnitClosureHazardContext(
                             candidate_stmts=candidate_stmts,
-                            mod_tree=c_mod_tree,
-                            u_start=c_u_start,
-                            u_end=c_u_end,
+                            mod_tree=mod_tree,
+                            u_start=u_start,
+                            u_end=u_end,
                             u_start_col=resolved_s_col,
                             u_end_col=resolved_e_col,
                             is_subroutine=is_subroutine,
@@ -3015,11 +2296,12 @@ def _inspect_unit_scope(
                             nonlocals=visitor.nonlocals,
                             has_yield=visitor.has_yield,
                             is_async=visitor.is_async,
-                            skip_pre_unit_closures=bool(
-                                unit.get("skip_pre_unit_closures")
-                            ),
+                            skip_pre_unit_closures=skip_pre_unit_closures_flag,
                             definite_stores=def_assigned,
                             cols_resolved=cols_resolved,
+                            enclosing_chain=enclosing_chain,
+                            lex_validated=True,
+                            hazard_reasons_out=closure_hazard_reasons,
                         )
                     )
                 ):
@@ -3099,6 +2381,7 @@ def _inspect_unit_scope(
             "param_details": visitor.param_details,
             "return_type": visitor.return_type,
             "control_flow_hazards": hazards,
+            "closure_hazard_reasons": closure_hazard_reasons,
             "is_control_flow_safe": is_control_flow_safe,
             "has_yield": visitor.has_yield,
             "has_yield_assignment": visitor.has_yield_assignment,
@@ -3129,7 +2412,8 @@ def _inspect_unit_scope(
             "type_param_free_vars": list(visitor.type_param_free_vars),
             "has_class_scoped_type_params": has_class_scoped_type_params,
             "deleted_names": sorted(may_deleted),
-            "_skip_pre_unit_closures": bool(unit.get("skip_pre_unit_closures")),
+            "skip_pre_unit_closures": skip_pre_unit_closures_flag,
+            "_skip_pre_unit_closures": skip_pre_unit_closures_flag,
         }
     except (RecursionError, MemoryError):
         return {
@@ -3144,8 +2428,15 @@ def inspect_single_unit_scope(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
     tree: Optional[ast.AST] = None,
+    *,
+    skip_pre_unit_closures: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping for an individual code unit."""
+    if skip_pre_unit_closures is not None:
+        unit = {
+            **unit,
+            "skip_pre_unit_closures": bool(skip_pre_unit_closures),
+        }
     return _inspect_unit_scope(unit, repo_root=repo_root, file_tree=tree)
 
 
@@ -3200,9 +2491,14 @@ def scope_matches_closure_mode(
     scope: Optional[Dict[str, Any]], expected_skip: bool
 ) -> bool:
     """Checks whether a precomputed scope dictionary explicitly matches expected_skip."""
-    if scope is None or "_skip_pre_unit_closures" not in scope:
+    if scope is None:
         return False
-    raw_flag = scope.get("_skip_pre_unit_closures")
+    if "skip_pre_unit_closures" in scope:
+        raw_flag = scope.get("skip_pre_unit_closures")
+    elif "_skip_pre_unit_closures" in scope:
+        raw_flag = scope.get("_skip_pre_unit_closures")
+    else:
+        return False
     return isinstance(raw_flag, bool) and raw_flag is bool(expected_skip)
 
 
@@ -3240,6 +2536,7 @@ def ensure_unit_scope_closure_mode(
             **scope,
             "control_flow_hazards": hazards,
             "is_control_flow_safe": False,
+            "skip_pre_unit_closures": bool(skip_pre_unit_closures),
             "_skip_pre_unit_closures": bool(skip_pre_unit_closures),
         }
     fresh_scope = inspect_single_unit_scope(
@@ -3250,9 +2547,13 @@ def ensure_unit_scope_closure_mode(
             **fresh_scope,
             **scope,
             "control_flow_hazards": fresh_scope.get("control_flow_hazards", []),
+            "closure_hazard_reasons": fresh_scope.get(
+                "closure_hazard_reasons", []
+            ),
             "is_control_flow_safe": fresh_scope.get(
                 "is_control_flow_safe", True
             ),
+            "skip_pre_unit_closures": bool(skip_pre_unit_closures),
             "_skip_pre_unit_closures": bool(skip_pre_unit_closures),
         }
     return fresh_scope
@@ -3458,6 +2759,31 @@ def analyze_unit_variable_scope(
             )
         ),
         "deleted_names": deleted_names,
+        "closure_hazard_reasons": list(
+            dict.fromkeys(
+                info1.get("closure_hazard_reasons", [])
+                + (
+                    info2.get("closure_hazard_reasons", [])
+                    if u2 is not None
+                    else []
+                )
+            )
+        ),
+        "skip_pre_unit_closures": bool(
+            info1.get(
+                "skip_pre_unit_closures",
+                info1.get("_skip_pre_unit_closures", False),
+            )
+        )
+        and (
+            u2 is None
+            or bool(
+                info2.get(
+                    "skip_pre_unit_closures",
+                    info2.get("_skip_pre_unit_closures", False),
+                )
+            )
+        ),
         "_skip_pre_unit_closures": bool(
             info1.get("_skip_pre_unit_closures", False)
         )

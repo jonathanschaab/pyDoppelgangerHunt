@@ -9,14 +9,20 @@ transformation is unsound whenever late-bound cell semantics, shared `nonlocal`
 mutations, or suspended execution observe a different binding state than pass-
 by-value/return-by-value.
 
-The analysis is partitioned across three modules:
-1. `_df_cell_carriers`: Lexical scope contexts, 2D span/column resolution,
-   deferred comprehension/generator-expression capture analysis, closure
-   carrier/factory extraction, and lexical-scope definition escape tracking.
-2. `_df_cell_traversal`: Flow-sensitive AST frame traversal and definite-
-   binding analysis across enclosing function chains, producing per-function
-   `_EnclosingFnCellInfo` summaries.
-3. `_df_cell_hazards` (this module): Numbered hazard checks 1–4 and the
+The analysis is partitioned across five modules:
+1. `_df_span_index`: 2D span/column resolution (`_SpanLineIndex`,
+   `_resolve_unit_col_bounds`, `_has_unresolved_span_bounds`) and syntax-level
+   lexical declaration validation (`_has_invalid_lexical_scope_declarations`).
+2. `_df_with_provenance`: Typed context-manager suppression provenance
+   (`_SuppressProvenance`) and the unified definite/conditional binding,
+   deletion, and block-termination engine (`_analyze_block_assignment`,
+   `_extract_block_definite_bindings_and_term`, `_block_terminates`).
+3. `_df_cell_carriers`: Lexical scope contexts (`_FnScopeContext`), deferred
+   comprehension/generator-expression capture analysis, closure carrier/factory
+   extraction, and lexical-scope definition escape tracking.
+4. `_df_cell_traversal`: Flow-sensitive AST frame traversal across enclosing
+   function chains, producing per-function `_EnclosingFnCellInfo` summaries.
+5. `_df_cell_hazards` (this module): Numbered hazard checks 1–4 and the
    top-level `_has_severed_closure_cell_hazard` entry point.
 
 The Four Numbered Hazard Checks and Their Invariants
@@ -62,17 +68,34 @@ The Four Numbered Hazard Checks and Their Invariants
   `async`) or expression unit MUST NOT mutate a cell captured by any concurrent
   sibling closure (`concurrent_sibling_vars`).
 
+Soundness Boundaries
+--------------------
+- **Anonymous Closure Registration via Opaque Calls**: Sibling closures stored
+  in local variables, containers, attributes, or returned by in-scope factory
+  functions are tracked transitively. An anonymous closure passed directly to an
+  opaque external call (e.g., `register(lambda: x)`) without binding a local
+  carrier name is captured as an anonymous sibling closure (`s_name is None`),
+  which is enforced for suspended/expression units (`concurrent_sibling_vars`)
+  and unreturned expression mutations in strict mode, while synchronous
+  subroutine calls to opaque external functions (`fire()`) are not assumed to
+  invoke previously registered anonymous callbacks unless a carrier name is
+  referenced in `eff_input_set`.
+- **Dynamic Introspection**: Dynamic frame/namespace introspection (`locals()`,
+  `eval()`, `exec()`, `sys._getframe()`) and zero-argument `super()` / implicit
+  `__class__` cell capture are handled by separate scope/AST hazard gates
+  (`has_super`, dynamic execution checks) rather than `PyCellObject` dataflow.
+
 Hazard Naming Note (`"severed_closure_cell"`)
 ---------------------------------------------
 Outer `global` and `nonlocal` binding escapes (e.g., an intra-unit `global x`
-that re-routes assignments in the enclosing function, a subroutine mutating an
-outer `global` declared in the enclosing function, or a conditionally pre-bound
-live-in variable in `scope.py`) are reported under the same canonical
-`"severed_closure_cell"` hazard key (and `"severed closure cell"` skip reason).
-Although `global` bindings are module-level rather than `PyCellObject` slots,
-extracting the unit into a separate helper severs the shared lexical binding
-contract with the enclosing function scope in the exact same way, and retaining
-a single hazard key preserves backward compatibility for callers and reports.
+that re-routes assignments in the enclosing function, a subroutine mutating or
+observing a mutated outer `global` declared in the enclosing function, or a
+conditionally pre-bound live-in variable in `scope.py`), invalid lexical scope
+declarations, and unresolved span bounds are reported under the canonical
+`"severed_closure_cell"` hazard key (and `"severed closure cell"` skip reason)
+for backward compatibility, while granular sub-reasons (`"cell_severing"`,
+`"global_escape"`, `"invalid_lexical_declaration"`, `"unresolved_span_bounds"`,
+`"conditional_live_in"`) are recorded in `scope["closure_hazard_reasons"]`.
 """
 
 from __future__ import annotations
@@ -377,6 +400,34 @@ class _UnitClosureHazardContext(NamedTuple):
     skip_pre_unit_closures: bool = False
     definite_stores: Optional[AbstractSet[str]] = None
     cols_resolved: bool = False
+    enclosing_chain: Optional[Sequence[Tuple[int, int, ast.AST]]] = None
+    lex_validated: bool = False
+    hazard_reasons_out: Optional[List[str]] = None
+
+
+def _record_hazard_reason(
+    ctx: _UnitClosureHazardContext,
+    reason: str,
+) -> bool:
+    """Appends a granular closure hazard sub-reason when requested and returns True."""
+    if (
+        ctx.hazard_reasons_out is not None
+        and reason not in ctx.hazard_reasons_out
+    ):
+        ctx.hazard_reasons_out.append(reason)
+    return True
+
+
+def _record_global_or_cell_hazard(
+    ctx: _UnitClosureHazardContext,
+    names: AbstractSet[str],
+    outer_globals: AbstractSet[str],
+) -> bool:
+    """Records 'global_escape' when names overlap outer_globals, otherwise 'cell_severing'."""
+    return _record_hazard_reason(
+        ctx,
+        "global_escape" if bool(names & outer_globals) else "cell_severing",
+    )
 
 
 def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
@@ -416,17 +467,21 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
             ctx.u_end_col,
         )
     )
-    enclosing_chain = _find_enclosing_function_chain(
-        ctx.mod_tree, ctx.u_start, ctx.u_end, u_start_col, u_end_col
+    enclosing_chain = (
+        list(ctx.enclosing_chain)
+        if ctx.enclosing_chain is not None
+        else _find_enclosing_function_chain(
+            ctx.mod_tree, ctx.u_start, ctx.u_end, u_start_col, u_end_col
+        )
     )
-    if _has_invalid_lexical_scope_declarations(
+    if not ctx.lex_validated and _has_invalid_lexical_scope_declarations(
         ctx.candidate_stmts,
         enclosing_chain=enclosing_chain,
         mod_tree=ctx.mod_tree,
     ):
-        return True
+        return _record_hazard_reason(ctx, "invalid_lexical_declaration")
     if not enclosing_chain:
-        return any(
+        has_unresolved = any(
             isinstance(
                 node,
                 (
@@ -441,7 +496,15 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
             and (
                 not isinstance(getattr(node, "end_lineno", None), int)
                 or (
-                    isinstance(node, (ast.Lambda, *_COMPREHENSION_TYPES))
+                    isinstance(
+                        node,
+                        (
+                            ast.FunctionDef,
+                            ast.AsyncFunctionDef,
+                            ast.Lambda,
+                            *_COMPREHENSION_TYPES,
+                        ),
+                    )
                     and getattr(node, "end_lineno", 0) >= ctx.u_start
                     and (u_start_col is None or u_end_col is None)
                     and _has_unresolved_span_bounds(
@@ -456,6 +519,11 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
             )
             for node in ast.walk(ctx.mod_tree)
         )
+        return (
+            _record_hazard_reason(ctx, "unresolved_span_bounds")
+            if has_unresolved
+            else False
+        )
     if _has_unresolved_span_bounds(
         enclosing_chain[-1][2],
         ctx.u_start,
@@ -464,7 +532,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         u_end_col,
         ctx.candidate_stmts,
     ):
-        return True
+        return _record_hazard_reason(ctx, "unresolved_span_bounds")
 
     unit_mod = ast.Module(body=list(ctx.candidate_stmts), type_ignores=[])
     is_expr_unit = (
@@ -494,7 +562,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         helper_rebound_vars | immediate_cell_mutations
     )
     if not unit_stores_affect_enclosing and bool(explicit_nonlocal_mutations):
-        return True
+        return _record_hazard_reason(ctx, "cell_severing")
 
     innermost_stmt_fn: ast.AST = next(
         (
@@ -512,7 +580,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         u_end_col=u_end_col,
         is_subroutine=ctx.is_subroutine,
     ):
-        return True
+        return _record_hazard_reason(ctx, "global_escape")
     enc_nonlocals, enc_outer_globals = _extract_scope_nonlocals_and_outer_globals(
         innermost_stmt_fn,
         ctx.u_start,
@@ -525,7 +593,9 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         escaping_unit_mutations
         & (enc_outer_globals if ctx.is_subroutine else enc_escaping)
     ):
-        return True
+        return _record_global_or_cell_hazard(
+            ctx, escaping_unit_mutations, enc_outer_globals
+        )
     imm_scope = _resolve_immediate_scope_in_fn(
         innermost_stmt_fn,
         ctx.u_start,
@@ -558,10 +628,12 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         )
     )
     if is_suspended and bool(unit_mutated_names & (enc_escaping | nonlocal_set)):
-        return True
+        return _record_global_or_cell_hazard(
+            ctx, unit_mutated_names, enc_outer_globals
+        )
 
     if ctx.is_subroutine and _extract_direct_nonlocals(unit_mod):
-        return True
+        return _record_hazard_reason(ctx, "cell_severing")
     unit_closures = _collect_scope_closures_uncached(
         unit_mod,
         module_tree=ctx.mod_tree,
@@ -588,13 +660,23 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
 
     eff_input_set = set(ctx.inputs) | set(ctx.free_vars) | nonlocal_set
     if unit_stores_affect_enclosing and bool(
+        eff_input_set & enc_outer_globals
+    ) and any(
+        isinstance(n, ast.Call)
+        for st in ctx.candidate_stmts
+        for n in ast.walk(st)
+    ):
+        return _record_hazard_reason(ctx, "global_escape")
+    if unit_stores_affect_enclosing and bool(
         unit_closure_reads
         & (
             (unit_mutated_names & (enc_escaping | nonlocal_set))
             | (enc_outer_globals & eff_input_set)
         )
     ):
-        return True
+        return _record_global_or_cell_hazard(
+            ctx, unit_closure_reads, enc_outer_globals
+        )
     unit_mutations = (
         (escaping_unit_mutations | (unit_mutated_names & unit_closure_reads))
         if unit_stores_affect_enclosing
@@ -658,14 +740,14 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
                     | unexported_pre_post
                 )
             ):
-                return True
+                return _record_hazard_reason(ctx, "cell_severing")
 
     captured_candidates = intra_closure_reads & (
         eff_input_set
         | ((store_set | output_set) if unit_stores_affect_enclosing else set())
     )
     sub_mutated = helper_rebound_vars | immediate_cell_mutations
-    return (
+    has_cell_hazard = (
         _check_intra_unit_nonlocal_mutators(
             ctx.candidate_stmts,
             intra_nl_mutators,
@@ -693,4 +775,9 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
             unreturned_mutations=is_expr_unit,
             skip_pre_unit_closures=ctx.skip_pre_unit_closures,
         )
+    )
+    return (
+        _record_hazard_reason(ctx, "cell_severing")
+        if has_cell_hazard
+        else False
     )

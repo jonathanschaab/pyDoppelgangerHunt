@@ -576,10 +576,19 @@ def _is_valid_eval_expr(text: str) -> bool:
         return False
 
 
-def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]:
+def _slice_unit_token_lines(
+    unit: Dict[str, Any],
+    lines: List[str],
+    *,
+    is_pre_sliced: Optional[bool] = None,
+) -> List[str]:
     """Slices source lines to the exact start_col and end_col offsets of the unit."""
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
         return lines
+    if is_pre_sliced is True or bool(
+        unit.get("source_lines_is_sliced") or unit.get("_tokens_pre_sliced")
+    ):
+        return list(lines)
     s_col_opt = _extract_slice_col_offset(
         unit, ("start_col", "start_col_offset"), default=0
     )

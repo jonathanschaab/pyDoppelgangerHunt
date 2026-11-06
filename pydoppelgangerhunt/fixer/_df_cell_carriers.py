@@ -34,25 +34,112 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _COMPREHENSION_TYPES,
     _INNER_SCOPE_TYPES,
     _extract_comprehension_walrus_names,
-    _extract_node_type_param_names,
     _extract_scope_local_names,
     _extract_single_node_local_names,
     _extract_strict_fn_local_names,
     _has_wildcard_star_import,
     _is_eagerly_consumed_genexp,
-    _is_span_in_scope_header,
     _node_earliest_start_pos,
     _node_strictly_encloses_bounds,
 )
+from pydoppelgangerhunt.fixer._df_span_index import (
+    _IndexedSpanNode,
+    _SpanLineIndex,
+    _extract_direct_nonlocals,
+    _extract_type_alias_or_pattern_name,
+    _find_enclosing_function_chain,
+    _get_span_line_index,
+    _get_tree_expr_scope_intervals,
+    _has_invalid_lexical_scope_declarations,
+    _has_unresolved_span_bounds,
+    _pick_inferred_col,
+    _resolve_unit_col_bounds,
+    _scope_has_invalid_lexical_declarations,
+    _stmt_dump_set,
+    _walk_invalid_lexical_scope_declarations,
+)
 from pydoppelgangerhunt.fixer._df_visitors import (
-    _collect_func_params as _extract_arg_names,
     _extract_nested_scope_free_reads,
-    _extract_pattern_bound_name,
     _is_ast_node_within_unit_bounds,
     _record_import_names,
 )
-from pydoppelgangerhunt.fixer.source import _get_tree_scope_intervals
 from pydoppelgangerhunt.parser import iter_nested_scope_header_nodes
+
+__all__ = [
+    "_EnclosingFnCellInfo",
+    "_FnScopeContext",
+    "_IndexedSpanNode",
+    "_IntraUnitMutator",
+    "_NON_CLOSURE_RETURN_BUILTINS",
+    "_SpanBounds",
+    "_SpanLineIndex",
+    "_block_contains_span",
+    "_can_bind_in_fn_scope",
+    "_collect_escaped_and_executed_intra_unit_defs",
+    "_collect_escaped_intra_unit_defs",
+    "_collect_escaped_intra_unit_names",
+    "_collect_unit_nonlocal_mutators",
+    "_ensure_subtree_scope_ctx",
+    "_extract_cached_scope_free_reads",
+    "_extract_carrier_value_closure_and_load_info",
+    "_extract_closure_carrier_mutation_targets_and_values",
+    "_extract_closure_carrier_targets_and_values",
+    "_extract_closure_nonlocal_mutations",
+    "_extract_closure_nonlocal_mutations_and_deletions",
+    "_extract_closure_nonlocal_mutations_and_deletions_uncached",
+    "_extract_comprehension_body_walrus_names",
+    "_extract_comprehension_deferred_closure_info",
+    "_extract_direct_nonlocals",
+    "_extract_direct_scope_nonlocal_mutations_and_deletions",
+    "_extract_expr_closure_and_load_info",
+    "_extract_expr_scope_free_reads",
+    "_extract_fn_outer_carrier_targets",
+    "_extract_fn_outer_carrier_targets_uncached",
+    "_extract_fn_returned_closure_refs",
+    "_extract_fn_returned_closure_refs_uncached",
+    "_extract_lazy_genexp_walrus_names",
+    "_extract_mutated_target_names",
+    "_extract_receiver_root_names",
+    "_extract_root_target_names",
+    "_extract_shallow_defs",
+    "_extract_shallow_loads_and_calls",
+    "_extract_store_names_in_node",
+    "_extract_type_alias_or_pattern_name",
+    "_find_enclosing_function_chain",
+    "_get_fn_scope_context",
+    "_get_fn_scope_context_uncached",
+    "_get_span_line_index",
+    "_get_tree_expr_scope_intervals",
+    "_has_invalid_lexical_scope_declarations",
+    "_has_unresolved_span_bounds",
+    "_is_closure_factory_scope",
+    "_is_closure_factory_scope_uncached",
+    "_is_lazy_genexp",
+    "_is_node_inside_span",
+    "_is_non_closure_builtin_call",
+    "_is_non_closure_scalar_expr",
+    "_is_pos_after_span",
+    "_is_pos_before_span",
+    "_is_self_escaping_def_node",
+    "_iter_carrier_target_entries",
+    "_iter_class_body_methods",
+    "_iter_comprehension_body_exprs_and_targets",
+    "_make_nested_fn_scope_context",
+    "_make_scope_ctx_cache_key",
+    "_node_contains_or_encloses_span",
+    "_pick_inferred_col",
+    "_propagate_sibling_closures",
+    "_resolve_unit_col_bounds",
+    "_scope_has_invalid_lexical_declarations",
+    "_stmt_dump_set",
+    "_strictly_encloses_span",
+    "_walk_invalid_lexical_scope_declarations",
+]
+
+
+def _is_node_attached_to_tree(node: ast.AST, mod_tree: ast.AST) -> bool:
+    """Returns True if node is mod_tree or belongs to mod_tree's parent map."""
+    return node is mod_tree or node in _get_scope_parent_map(mod_tree)
 
 
 class _FnScopeContext(NamedTuple):
@@ -78,18 +165,34 @@ class _FnScopeContext(NamedTuple):
             self.fn_locals,
             self.shadowed_names,
             self.has_star_import,
+            bool(self.parent_map),
         )
 
     def cache_aux_nodes(self) -> Tuple[ast.AST, ...]:
-        """Returns all AST owner and enclosing scope nodes referenced by this context."""
+        """Returns attached AST owner and enclosing scope nodes referenced by this context."""
+        mod_pm = (
+            _get_scope_parent_map(self.mod_tree)
+            if isinstance(self.mod_tree, ast.AST)
+            else None
+        )
         aux_nodes: List[ast.AST] = []
         if isinstance(self.scope_owner, ast.AST):
-            aux_nodes.append(self.scope_owner)
+            if mod_pm is not None:
+                if (
+                    self.scope_owner is self.mod_tree
+                    or self.scope_owner in mod_pm
+                ):
+                    aux_nodes.append(self.scope_owner)
+            elif not isinstance(self.scope_owner, ast.Module) or bool(
+                self.parent_map
+            ):
+                aux_nodes.append(self.scope_owner)
         if isinstance(self.mod_tree, ast.AST):
             aux_nodes.append(self.mod_tree)
         for enc in self.enclosing_scopes:
             if isinstance(enc, ast.AST):
-                aux_nodes.append(enc)
+                if mod_pm is None or enc is self.mod_tree or enc in mod_pm:
+                    aux_nodes.append(enc)
         return tuple(aux_nodes)
 
     def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
@@ -101,6 +204,33 @@ class _FnScopeContext(NamedTuple):
             if isinstance(pv, ast.AST):
                 nodes.append(pv)
         return tuple(nodes)
+
+
+def _scope_ctx_allows_node_cache(
+    owner: ast.AST,
+    scope_ctx: Optional[_FnScopeContext],
+) -> bool:
+    """Returns False when owner or scope_ctx.scope_owner is detached from the target AST."""
+    if scope_ctx is None:
+        return True
+    if isinstance(scope_ctx.mod_tree, ast.AST):
+        if not _is_node_attached_to_tree(owner, scope_ctx.mod_tree):
+            return False
+        if isinstance(
+            scope_ctx.scope_owner, ast.AST
+        ) and not _is_node_attached_to_tree(
+            scope_ctx.scope_owner, scope_ctx.mod_tree
+        ):
+            return False
+        return True
+    if isinstance(scope_ctx.scope_owner, ast.AST):
+        if (
+            scope_ctx.scope_owner is not owner
+            and scope_ctx.scope_owner not in scope_ctx.parent_map
+            and owner not in scope_ctx.parent_map
+        ):
+            return False
+    return True
 
 
 def _make_scope_ctx_cache_key(
@@ -132,14 +262,36 @@ def _get_fn_scope_context_uncached(
     *,
     cache_parent_map: bool = True,
     enclosing_scopes: Sequence[ast.AST] = (),
+    scope_owner: Optional[ast.AST] = None,
+    parent_map_override: Optional[Mapping[ast.AST, ast.AST]] = None,
 ) -> _FnScopeContext:
     """Computes lexical scope metadata for a function or ephemeral unit module without caching."""
-    raw_parent_map = _get_scope_parent_map(
-        scope_node, use_cache=cache_parent_map
-    )
+    if parent_map_override is not None:
+        eff_parent_map: Mapping[ast.AST, ast.AST] = (
+            parent_map_override
+            if isinstance(parent_map_override, MappingProxyType)
+            else MappingProxyType(dict(parent_map_override))
+        )
+    else:
+        raw_parent_map = _get_scope_parent_map(
+            scope_node, use_cache=cache_parent_map
+        )
+        eff_parent_map = MappingProxyType(raw_parent_map)
+    if scope_owner is None and (
+        cache_parent_map or not isinstance(scope_node, ast.Module)
+    ):
+        eff_owner: Optional[ast.AST] = scope_node
+    else:
+        eff_owner = scope_owner
+    if (
+        isinstance(eff_owner, ast.AST)
+        and isinstance(mod_tree, ast.AST)
+        and not _is_node_attached_to_tree(eff_owner, mod_tree)
+    ):
+        eff_owner = None
     return _FnScopeContext(
         fn_locals=frozenset(_extract_strict_fn_local_names(scope_node)),
-        parent_map=MappingProxyType(raw_parent_map),
+        parent_map=eff_parent_map,
         shadowed_names=frozenset(
             _extract_scope_local_names(
                 scope_node,
@@ -154,7 +306,7 @@ def _get_fn_scope_context_uncached(
             cache_scope_node=cache_parent_map,
             enclosing_scopes=enclosing_scopes,
         ),
-        scope_owner=scope_node,
+        scope_owner=eff_owner,
         mod_tree=mod_tree,
         enclosing_scopes=tuple(enclosing_scopes),
     )
@@ -163,12 +315,23 @@ def _get_fn_scope_context_uncached(
 def _get_fn_scope_context(
     scope_node: ast.AST,
     mod_tree: Optional[ast.AST] = None,
+    *,
+    enclosing_scopes: Sequence[ast.AST] = (),
 ) -> _FnScopeContext:
     """Computes and caches lexical scope metadata for an AST scope node."""
+    norm_enclosing = tuple(
+        n
+        for n in enclosing_scopes
+        if isinstance(n, ast.AST) and n is not scope_node
+    )
+    aux_nodes: Tuple[ast.AST, ...] = (
+        *((mod_tree,) if mod_tree is not None else ()),
+        *norm_enclosing,
+    )
     cache_key = _ScopeCacheKey(
         scope_node,
         "fn_scope_ctx",
-        aux_ast_nodes=() if mod_tree is None else (mod_tree,),
+        aux_ast_nodes=aux_nodes,
     )
     return cast(
         _FnScopeContext,
@@ -176,7 +339,10 @@ def _get_fn_scope_context(
             _scope_cell_info_cache,
             cache_key,
             lambda: _get_fn_scope_context_uncached(
-                scope_node, mod_tree=mod_tree
+                scope_node,
+                mod_tree=mod_tree,
+                enclosing_scopes=norm_enclosing,
+                scope_owner=scope_node,
             ),
         ),
     )
@@ -207,711 +373,6 @@ def _is_lazy_genexp(
         set(scope_ctx.shadowed_names),
         has_star_import=scope_ctx.has_star_import,
     )
-
-
-def _get_tree_expr_scope_intervals(
-    tree: ast.AST,
-) -> Tuple[Tuple[int, int, int, ast.AST], ...]:
-    """Returns cached (start, end, col_offset, node) tuples for Lambda and comprehension scopes."""
-
-    def _compute() -> Tuple[Tuple[int, int, int, ast.AST], ...]:
-        out: List[Tuple[int, int, int, ast.AST]] = []
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Lambda, *_COMPREHENSION_TYPES)):
-                n_start = int(getattr(node, "lineno", 0) or 0)
-                n_end = int(getattr(node, "end_lineno", n_start) or n_start)
-                n_col = int(getattr(node, "col_offset", 0) or 0)
-                if n_start > 0:
-                    out.append((n_start, n_end, n_col, node))
-        return tuple(out)
-
-    return cast(
-        Tuple[Tuple[int, int, int, ast.AST], ...],
-        _get_or_compute_scope_cached(
-            _scope_cell_info_cache,
-            _make_trusted_scope_cache_key(tree, "expr_scope_intervals"),
-            _compute,
-        ),
-    )
-
-
-def _find_enclosing_function_chain(
-    mod_tree: ast.AST,
-    u_start: int,
-    u_end: int,
-    u_start_col: Optional[int] = None,
-    u_end_col: Optional[int] = None,
-) -> List[Tuple[int, int, ast.AST]]:
-    """Finds enclosing function, lambda, and comprehension scopes ordered outermost to innermost."""
-    chain: List[Tuple[int, int, int, int, ast.AST]] = []
-    for estart, n_end, _span, node in _get_tree_scope_intervals(mod_tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        n_lineno = int(getattr(node, "lineno", estart) or estart)
-        if (
-            n_lineno <= 0
-            or u_start < n_lineno
-            or u_end > n_end
-            or _is_span_in_scope_header(
-                node,
-                u_start,
-                u_end,
-                u_start_col=u_start_col,
-                u_end_col=u_end_col,
-            )
-        ):
-            continue
-        n_col = int(getattr(node, "col_offset", 0) or 0)
-        n_end_col = getattr(node, "end_col_offset", None)
-        if (
-            u_end == n_end
-            and u_end_col is not None
-            and isinstance(n_end_col, int)
-            and u_end_col > n_end_col
-        ):
-            continue
-        if u_start in (estart, n_lineno):
-            _, e_col = _node_earliest_start_pos(node)
-            bound_col = (
-                e_col
-                if (u_start == estart and e_col is not None)
-                else n_col
-            )
-            if u_start_col is not None and bound_col > u_start_col:
-                continue
-            if u_end == n_end and (
-                u_start_col is None
-                or (
-                    bound_col == u_start_col
-                    and (
-                        u_end_col is None
-                        or not isinstance(n_end_col, int)
-                        or u_end_col == n_end_col
-                    )
-                )
-            ):
-                continue
-        chain.append(
-            (
-                estart,
-                n_end,
-                n_col,
-                -(n_end_col if isinstance(n_end_col, int) else 0),
-                node,
-            )
-        )
-    for n_start, n_end, n_col, node in _get_tree_expr_scope_intervals(mod_tree):
-        if (
-            n_start <= 0
-            or u_start < n_start
-            or u_end > n_end
-            or not _node_strictly_encloses_bounds(
-                node,
-                u_start,
-                u_end,
-                u_start_col=u_start_col,
-                u_end_col=u_end_col,
-            )
-            or _is_span_in_scope_header(
-                node,
-                u_start,
-                u_end,
-                u_start_col=u_start_col,
-                u_end_col=u_end_col,
-            )
-        ):
-            continue
-        expr_end_col = getattr(node, "end_col_offset", None)
-        chain.append(
-            (
-                n_start,
-                n_end,
-                n_col,
-                -(expr_end_col if isinstance(expr_end_col, int) else 0),
-                node,
-            )
-        )
-    chain.sort(key=lambda item: (item[0], -item[1], item[2], item[3]))
-    return [(estart, n_end, node) for estart, n_end, _col, _ecol, node in chain]
-
-
-def _stmt_dump_set(stmts: Sequence[ast.AST], idx: int) -> Set[str]:
-    """Builds the set of AST dumps for a boundary statement (and inner Expr value)."""
-    if not stmts:
-        return set()
-    target = stmts[idx]
-    dumps = {ast.dump(target)}
-    if isinstance(target, ast.Expr):
-        dumps.add(ast.dump(target.value))
-    return dumps
-
-
-class _IndexedSpanNode(NamedTuple):
-    """Pre-indexed AST node entry for fast line/column span resolution."""
-
-    node: ast.AST
-    n_start: int
-    n_end: int
-    n_col: Optional[int]
-    n_end_col: Optional[int]
-    req_u_start_le: int
-    req_u_end_ge: int
-
-    def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
-        """Returns the AST node retained by this span index entry."""
-        return (self.node,) if isinstance(self.node, ast.AST) else ()
-
-
-class _SpanLineIndex:
-    """Cached per-tree line index and lazy AST dump cache for O(1) boundary lookups."""
-
-    __slots__ = (
-        "by_start_line",
-        "by_end_line",
-        "stmts_by_start_line",
-        "stmts_by_end_line",
-        "missing_end_lineno_starts",
-        "missing_col_spans",
-        "_dump_cache",
-    )
-
-    def __init__(self, root_node: ast.AST) -> None:
-        self.by_start_line: Dict[int, List[_IndexedSpanNode]] = {}
-        self.by_end_line: Dict[int, List[_IndexedSpanNode]] = {}
-        self.stmts_by_start_line: Dict[int, List[ast.stmt]] = {}
-        self.stmts_by_end_line: Dict[int, List[Tuple[ast.stmt, int, bool]]] = {}
-        missing_end_starts: List[int] = []
-        missing_cols: List[Tuple[int, int]] = []
-        self._dump_cache: Dict[int, str] = {}
-
-        stack: List[Tuple[ast.AST, int, int]] = [(root_node, 0, 10**9)]
-        while stack:
-            node, anc_max_start, anc_min_end = stack.pop()
-            n_start, n_col = _node_earliest_start_pos(node)
-            raw_end = getattr(node, "end_lineno", None)
-            n_end_col = getattr(node, "end_col_offset", None)
-            is_stmt_or_expr = isinstance(node, (ast.stmt, ast.expr))
-            if is_stmt_or_expr and isinstance(n_start, int):
-                if not isinstance(raw_end, int):
-                    missing_end_starts.append(n_start)
-                elif not isinstance(n_col, int) or not isinstance(
-                    n_end_col, int
-                ):
-                    missing_cols.append((n_start, raw_end))
-
-            n_end = raw_end if isinstance(raw_end, int) else n_start
-            if isinstance(n_start, int) and isinstance(n_end, int):
-                req_start_le = (
-                    n_start if n_start < anc_min_end else anc_min_end
-                )
-                req_end_ge = (
-                    n_end if n_end > anc_max_start else anc_max_start
-                )
-                entry = _IndexedSpanNode(
-                    node=node,
-                    n_start=n_start,
-                    n_end=n_end,
-                    n_col=n_col if isinstance(n_col, int) else None,
-                    n_end_col=n_end_col if isinstance(n_end_col, int) else None,
-                    req_u_start_le=req_start_le,
-                    req_u_end_ge=req_end_ge,
-                )
-                self.by_start_line.setdefault(n_start, []).append(entry)
-                if n_end != n_start:
-                    self.by_end_line.setdefault(n_end, []).append(entry)
-                if (
-                    isinstance(node, ast.stmt)
-                    and isinstance(raw_end, int)
-                    and isinstance(n_col, int)
-                    and isinstance(n_end_col, int)
-                ):
-                    self.stmts_by_start_line.setdefault(n_start, []).append(
-                        node
-                    )
-                    has_compound_child = n_start < raw_end and any(
-                        isinstance(ch, ast.stmt)
-                        or type(ch).__name__ in ("ExceptHandler", "match_case")
-                        for ch in ast.iter_child_nodes(node)
-                    )
-                    self.stmts_by_end_line.setdefault(raw_end, []).append(
-                        (node, n_start, has_compound_child)
-                    )
-                next_max_start = (
-                    n_start if n_start > anc_max_start else anc_max_start
-                )
-                next_min_end = n_end if n_end < anc_min_end else anc_min_end
-            else:
-                next_max_start = anc_max_start
-                next_min_end = anc_min_end
-
-            children = list(ast.iter_child_nodes(node))
-            for ch in reversed(children):
-                stack.append((ch, next_max_start, next_min_end))
-
-        self.missing_end_lineno_starts: Tuple[int, ...] = tuple(
-            missing_end_starts
-        )
-        self.missing_col_spans: Tuple[Tuple[int, int], ...] = tuple(
-            missing_cols
-        )
-
-    def get_dump(self, node: ast.AST) -> str:
-        """Returns the cached ast.dump(node) string."""
-        nid = id(node)
-        cached = self._dump_cache.get(nid)
-        if cached is None:
-            cached = ast.dump(node)
-            self._dump_cache[nid] = cached
-        return cached
-
-    def iter_boundary_entries(
-        self, u_start: int, u_end: int
-    ) -> Sequence[_IndexedSpanNode]:
-        """Returns indexed AST entries starting at u_start or ending at u_end."""
-        start_entries = self.by_start_line.get(u_start, ())
-        if u_start == u_end:
-            extra_end = self.by_end_line.get(u_end, ())
-            if not extra_end:
-                return start_entries
-            return [*start_entries, *extra_end]
-        end_entries = self.by_end_line.get(u_end, ())
-        end_same_line = self.by_start_line.get(u_end, ())
-        if not end_entries and not end_same_line:
-            return start_entries
-        seen_ids = {id(e.node) for e in start_entries}
-        combined = list(start_entries)
-        for entry in (*end_entries, *end_same_line):
-            if entry.n_end == u_end and id(entry.node) not in seen_ids:
-                seen_ids.add(id(entry.node))
-                combined.append(entry)
-        return combined
-
-    def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
-        """Returns all AST nodes retained across the four span-line index maps."""
-        nodes: List[ast.AST] = []
-        seen_ids: Set[int] = set()
-        for entry_map in (self.by_start_line, self.by_end_line):
-            for entries in entry_map.values():
-                for entry in entries:
-                    if (
-                        isinstance(entry.node, ast.AST)
-                        and id(entry.node) not in seen_ids
-                    ):
-                        seen_ids.add(id(entry.node))
-                        nodes.append(entry.node)
-        for stmts in self.stmts_by_start_line.values():
-            for stmt in stmts:
-                if isinstance(stmt, ast.AST) and id(stmt) not in seen_ids:
-                    seen_ids.add(id(stmt))
-                    nodes.append(stmt)
-        for end_tuples in self.stmts_by_end_line.values():
-            for stmt, _, _ in end_tuples:
-                if isinstance(stmt, ast.AST) and id(stmt) not in seen_ids:
-                    seen_ids.add(id(stmt))
-                    nodes.append(stmt)
-        return tuple(nodes)
-
-
-def _get_span_line_index(root_node: ast.AST) -> _SpanLineIndex:
-    """Returns or builds the cached _SpanLineIndex for root_node."""
-    return cast(
-        _SpanLineIndex,
-        _get_or_compute_scope_cached(
-            _scope_cell_info_cache,
-            _make_trusted_scope_cache_key(root_node, "span_line_index"),
-            lambda: _SpanLineIndex(root_node),
-        ),
-    )
-
-
-def _pick_inferred_col(
-    explicit_col: Optional[int],
-    matches: Sequence[Tuple[int, int]],
-    span_stmts: Sequence[Tuple[int, int]],
-    stmt_idx: int,
-    opposite_col: Optional[int] = None,
-) -> Optional[int]:
-    """Selects explicit_col, unique best dump match column, or unique statement column."""
-    if explicit_col is not None:
-        return explicit_col
-    if matches:
-        best_rank = min(m[0] for m in matches)
-        best_cols = {m[1] for m in matches if m[0] == best_rank}
-        if len(best_cols) == 1:
-            return next(iter(best_cols))
-        return None
-    if opposite_col is not None:
-        opp_idx = 1 - stmt_idx
-        matched_stmts = [
-            s[stmt_idx] for s in span_stmts if s[opp_idx] == opposite_col
-        ]
-        if len(matched_stmts) == 1:
-            return matched_stmts[0]
-    if len(span_stmts) == 1:
-        return span_stmts[0][stmt_idx]
-    return None
-
-
-def _resolve_unit_col_bounds(
-    candidate_stmts: Sequence[ast.AST],
-    mod_tree: Optional[ast.AST],
-    u_start: int,
-    u_end: int,
-    u_start_col: Optional[int],
-    u_end_col: Optional[int],
-) -> Tuple[Optional[int], Optional[int]]:
-    """Infers missing (u_start_col, u_end_col) from candidate_stmts and mod_tree."""
-    if (
-        (u_start_col is not None and u_end_col is not None)
-        or mod_tree is None
-        or not candidate_stmts
-    ):
-        return u_start_col, u_end_col
-    single_stmt = len(candidate_stmts) == 1
-    first_dumps = (
-        _stmt_dump_set(candidate_stmts, 0) if u_start_col is None else set()
-    )
-    if u_end_col is not None:
-        last_dumps: Set[str] = set()
-    elif single_stmt and u_start_col is None:
-        last_dumps = first_dumps
-    else:
-        last_dumps = _stmt_dump_set(candidate_stmts, -1)
-
-    line_index = _get_span_line_index(mod_tree)
-    start_matches: List[Tuple[int, int]] = []
-    end_matches: List[Tuple[int, int]] = []
-    span_stmts: List[Tuple[int, int]] = []
-    for entry in line_index.iter_boundary_entries(u_start, u_end):
-        if not (
-            u_start <= entry.req_u_start_le and entry.req_u_end_ge <= u_end
-        ):
-            continue
-        node = entry.node
-        n_start = entry.n_start
-        n_end = entry.n_end
-        n_col = entry.n_col
-        n_end_col = entry.n_end_col
-        if (
-            isinstance(node, ast.stmt)
-            and n_start == u_start
-            and n_end == u_end
-            and isinstance(n_col, int)
-            and isinstance(n_end_col, int)
-            and not (
-                single_stmt
-                and isinstance(candidate_stmts[0], ast.Expr)
-                and not isinstance(node, ast.Expr)
-            )
-        ):
-            span_stmts.append((n_col, n_end_col))
-        if not (u_start <= n_start and n_end <= u_end):
-            continue
-        if (
-            u_start_col is not None
-            and n_start == u_start
-            and isinstance(n_col, int)
-            and n_col < u_start_col
-        ):
-            continue
-        if (
-            u_end_col is not None
-            and n_end == u_end
-            and isinstance(n_end_col, int)
-            and n_end_col > u_end_col
-        ):
-            continue
-        need_start = (
-            bool(first_dumps)
-            and n_start == u_start
-            and isinstance(n_col, int)
-        )
-        need_end = (
-            bool(last_dumps)
-            and n_end == u_end
-            and isinstance(n_end_col, int)
-        )
-        if need_start or need_end:
-            dumped = line_index.get_dump(node)
-            base_rank = 1 if isinstance(node, ast.Expr) else 0
-            for (
-                need_flag,
-                col_val,
-                dumps,
-                opp_col,
-                opp_n_ln,
-                opp_u_ln,
-                opp_n_col,
-                matches_out,
-            ) in (
-                (
-                    need_start,
-                    n_col,
-                    first_dumps,
-                    u_end_col,
-                    n_end,
-                    u_end,
-                    n_end_col,
-                    start_matches,
-                ),
-                (
-                    need_end,
-                    n_end_col,
-                    last_dumps,
-                    u_start_col,
-                    n_start,
-                    u_start,
-                    n_col,
-                    end_matches,
-                ),
-            ):
-                if (
-                    need_flag
-                    and isinstance(col_val, int)
-                    and dumped in dumps
-                ):
-                    rank = (
-                        base_rank - 2
-                        if (
-                            single_stmt
-                            and opp_col is not None
-                            and opp_n_ln == opp_u_ln
-                            and opp_n_col == opp_col
-                        )
-                        else base_rank
-                    )
-                    matches_out.append((rank, col_val))
-
-    return (
-        _pick_inferred_col(
-            u_start_col, start_matches, span_stmts, 0, opposite_col=u_end_col
-        ),
-        _pick_inferred_col(
-            u_end_col, end_matches, span_stmts, 1, opposite_col=u_start_col
-        ),
-    )
-
-
-def _has_unresolved_span_bounds(
-    scope_node: ast.AST,
-    u_start: int,
-    u_end: int,
-    u_start_col: Optional[int],
-    u_end_col: Optional[int],
-    candidate_stmts: Sequence[ast.AST] = (),
-) -> bool:
-    """Returns True if boundary columns on multi-statement/sub-expression lines are unresolved or AST end coords are missing."""
-    line_index = _get_span_line_index(scope_node)
-    if any(ln <= u_end for ln in line_index.missing_end_lineno_starts):
-        return True
-    if any(
-        not (n_end < u_start or n_start > u_end)
-        for n_start, n_end in line_index.missing_col_spans
-    ):
-        return True
-    for entry in line_index.iter_boundary_entries(u_start, u_end):
-        node = entry.node
-        if not isinstance(node, (ast.stmt, ast.expr)):
-            continue
-        live_end = getattr(node, "end_lineno", None)
-        live_end_col = getattr(node, "end_col_offset", None)
-        if not isinstance(live_end, int) or not isinstance(live_end_col, int):
-            return True
-    if u_start_col is not None and u_end_col is not None:
-        return False
-    if isinstance(scope_node, (ast.Lambda, *_COMPREHENSION_TYPES)) and (
-        (
-            u_start == getattr(scope_node, "lineno", None)
-            and u_start_col is None
-        )
-        or (
-            u_end == getattr(scope_node, "end_lineno", None)
-            and u_end_col is None
-        )
-    ):
-        return True
-
-    start_line_stmts: List[ast.stmt] = [
-        stmt
-        for stmt in line_index.stmts_by_start_line.get(u_start, ())
-        if isinstance(getattr(stmt, "end_lineno", None), int)
-        and getattr(stmt, "end_lineno", 0) >= u_start
-        and not _node_strictly_encloses_bounds(
-            stmt, u_start, u_end, u_start_col=u_start_col, u_end_col=u_end_col
-        )
-    ]
-    end_line_stmts: List[ast.stmt] = [
-        stmt
-        for stmt, n_start, has_compound_child in line_index.stmts_by_end_line.get(
-            u_end, ()
-        )
-        if n_start <= u_end
-        and not has_compound_child
-        and not _node_strictly_encloses_bounds(
-            stmt, u_start, u_end, u_start_col=u_start_col, u_end_col=u_end_col
-        )
-    ]
-    is_expr_cand = len(candidate_stmts) == 1 and isinstance(
-        candidate_stmts[0], ast.Expr
-    )
-    cand_dump = ast.dump(candidate_stmts[0]) if is_expr_cand else ""
-    return any(
-        col_bound is None
-        and (
-            len(line_stmts) > 1
-            or (
-                is_expr_cand
-                and any(line_index.get_dump(s) != cand_dump for s in line_stmts)
-            )
-        )
-        for col_bound, line_stmts in (
-            (u_start_col, start_line_stmts),
-            (u_end_col, end_line_stmts),
-        )
-    )
-
-
-def _walk_invalid_lexical_scope_declarations(
-    initial_stack: List[Tuple[ast.AST, frozenset[str], frozenset[str], bool]],
-) -> bool:
-    """Walks initial_stack checking for PEP 3104 nonlocal/global declaration violations."""
-    stack = initial_stack
-    while stack:
-        curr, cur_bound, cur_blocked, cur_rooted = stack.pop()
-        if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            for hdr in iter_nested_scope_header_nodes(curr):
-                stack.append((hdr, cur_bound, cur_blocked, cur_rooted))
-            d_nl = _extract_direct_nonlocals(curr, is_global=False)
-            d_g = _extract_direct_nonlocals(curr, is_global=True)
-            if d_nl & d_g:
-                return True
-            if d_nl & cur_blocked:
-                return True
-            if cur_rooted and (d_nl - cur_bound):
-                return True
-            if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                params = _extract_arg_names(
-                    curr.args
-                ) | _extract_node_type_param_names(curr)
-                if params & (d_nl | d_g):
-                    return True
-                own_locals = frozenset(_extract_strict_fn_local_names(curr))
-                next_bound = (cur_bound - d_g) | own_locals
-                next_blocked = (cur_blocked - own_locals) | d_g
-            else:
-                next_bound = cur_bound
-                next_blocked = cur_blocked
-            for ch in curr.body:
-                stack.append((ch, next_bound, next_blocked, cur_rooted))
-            continue
-        for child in ast.iter_child_nodes(curr):
-            stack.append((child, cur_bound, cur_blocked, cur_rooted))
-    return False
-
-
-def _scope_has_invalid_lexical_declarations(
-    root_scope: ast.AST,
-    is_module_rooted: bool,
-) -> bool:
-    """Checks (and caches per AST root scope) whether root_scope has invalid lexical declarations."""
-    return bool(
-        _get_or_compute_scope_cached(
-            _scope_cell_info_cache,
-            _make_trusted_scope_cache_key(
-                root_scope, "invalid_lex_decls", params=(is_module_rooted,)
-            ),
-            lambda: _walk_invalid_lexical_scope_declarations(
-                [(root_scope, frozenset(), frozenset(), is_module_rooted)]
-            ),
-        )
-    )
-
-
-def _has_invalid_lexical_scope_declarations(
-    candidate_stmts: Sequence[ast.AST],
-    enclosing_chain: Sequence[Tuple[int, int, ast.AST]] = (),
-    mod_tree: Optional[ast.AST] = None,
-) -> bool:
-    """Returns True if any scope in enclosing_chain or candidate_stmts violates PEP 3104 nonlocal/global rules."""
-    is_module_rooted = isinstance(mod_tree, ast.Module)
-    if enclosing_chain and _scope_has_invalid_lexical_declarations(
-        enclosing_chain[0][2], is_module_rooted
-    ):
-        return True
-    bound_in_fns: frozenset[str] = frozenset()
-    blocked_globals: frozenset[str] = frozenset()
-    for _, _, enc_fn in enclosing_chain:
-        d_nl = _extract_direct_nonlocals(enc_fn, is_global=False)
-        d_g = _extract_direct_nonlocals(enc_fn, is_global=True)
-        if d_nl & d_g:
-            return True
-        if isinstance(enc_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            params = _extract_arg_names(enc_fn.args) | _extract_node_type_param_names(
-                enc_fn
-            )
-            if params & (d_nl | d_g):
-                return True
-        if d_nl & blocked_globals:
-            return True
-        if is_module_rooted and (d_nl - bound_in_fns):
-            return True
-        own_locals = frozenset(_extract_strict_fn_local_names(enc_fn))
-        bound_in_fns = (bound_in_fns - d_g) | own_locals
-        blocked_globals = (blocked_globals - own_locals) | d_g
-
-    unit_mod = ast.Module(
-        body=[s for s in candidate_stmts if isinstance(s, ast.stmt)],
-        type_ignores=[],
-    )
-    top_nl = _extract_direct_nonlocals(unit_mod, is_global=False)
-    top_g = _extract_direct_nonlocals(unit_mod, is_global=True)
-    if top_nl & top_g:
-        return True
-    if enclosing_chain and (top_nl & blocked_globals):
-        return True
-    if is_module_rooted and (top_nl - bound_in_fns):
-        return True
-
-    return _walk_invalid_lexical_scope_declarations(
-        [
-            (stmt, bound_in_fns, blocked_globals, is_module_rooted)
-            for stmt in candidate_stmts
-        ]
-    )
-
-
-def _extract_direct_nonlocals(
-    scope_node: ast.AST,
-    *,
-    is_global: bool = False,
-) -> Set[str]:
-    """Extracts variable names declared nonlocal (or global) directly in scope_node."""
-    names: Set[str] = set()
-    raw_body = getattr(scope_node, "body", None)
-    if not isinstance(raw_body, (list, tuple)):
-        return names
-    stack: List[ast.AST] = list(raw_body)
-    while stack:
-        curr = stack.pop()
-        if isinstance(curr, _INNER_SCOPE_TYPES):
-            continue
-        if isinstance(curr, (ast.Global, ast.Nonlocal)):
-            if is_global == isinstance(curr, ast.Global):
-                names.update(curr.names)
-            continue
-        stack.extend(ast.iter_child_nodes(curr))
-    return names
-
-
-def _extract_type_alias_or_pattern_name(node: ast.AST) -> Optional[str]:
-    """Extracts the bound identifier from a TypeAlias or match pattern AST node."""
-    cls_name = type(node).__name__
-    if cls_name == "TypeAlias":
-        target_name = getattr(node, "name", None)
-        return target_name.id if isinstance(target_name, ast.Name) else None
-    if cls_name in ("MatchAs", "MatchStar", "MatchMapping"):
-        return _extract_pattern_bound_name(node)
-    return None
 
 
 def _scan_scope_nonlocal_mutations_and_deletions(
@@ -1008,7 +469,7 @@ def _extract_closure_nonlocal_mutations_and_deletions_uncached(
 
 def _resolve_cached_str_set_pair(
     node: ast.AST,
-    allowed_types: Tuple[ type[ast.AST], ...],
+    allowed_types: Tuple[type[ast.AST], ...],
     cache_key: _ScopeCacheKey,
     compute_fn: Callable[[bool], Tuple[frozenset[str], frozenset[str]]],
     *,
@@ -1285,10 +746,13 @@ def _collect_unit_nonlocal_mutators(
         body=[s for s in candidate_stmts if isinstance(s, ast.stmt)],
         type_ignores=[],
     )
+    mod_parent_map = (
+        _get_scope_parent_map(mod_tree) if mod_tree is not None else None
+    )
     use_node_cache = bool(
-        mod_tree is not None
+        mod_parent_map is not None
         and candidate_stmts
-        and candidate_stmts[0] in _get_scope_parent_map(mod_tree)
+        and candidate_stmts[0] in mod_parent_map
     )
     fn_enclosing = [
         s for s in enclosing_scopes if not isinstance(s, ast.ClassDef)
@@ -1298,6 +762,8 @@ def _collect_unit_nonlocal_mutators(
         mod_tree=mod_tree,
         cache_parent_map=False,
         enclosing_scopes=fn_enclosing,
+        scope_owner=None,
+        parent_map_override=mod_parent_map if use_node_cache else None,
     )
     top_ctx = (
         _get_fn_scope_context_uncached(
@@ -1305,6 +771,8 @@ def _collect_unit_nonlocal_mutators(
             mod_tree=mod_tree,
             cache_parent_map=False,
             enclosing_scopes=enclosing_scopes,
+            scope_owner=None,
+            parent_map_override=mod_parent_map if use_node_cache else None,
         )
         if len(fn_enclosing) != len(enclosing_scopes)
         else base_fn_ctx
@@ -1629,21 +1097,18 @@ def _is_non_closure_builtin_call(
 ) -> bool:
     """Returns True if node is a Call to an unshadowed scalar/non-closure built-in.
 
-    When ``scope_ctx`` is provided, both ``scope_ctx.has_star_import`` and
-    ``scope_ctx.shadowed_names`` must confirm the built-in is not shadowed.
+    Requires ``scope_ctx`` to be provided so ``scope_ctx.has_star_import`` and
+    ``scope_ctx.shadowed_names`` can verify the built-in is not shadowed. When
+    ``scope_ctx`` is None, returns ``False`` (conservative/fail-closed).
     """
     return (
-        isinstance(node, ast.Call)
+        scope_ctx is not None
+        and isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id in _NON_CLOSURE_RETURN_BUILTINS
-        and (
-            scope_ctx is None
-            or (
-                not scope_ctx.has_star_import
-                and "*" not in scope_ctx.shadowed_names
-                and node.func.id not in scope_ctx.shadowed_names
-            )
-        )
+        and not scope_ctx.has_star_import
+        and "*" not in scope_ctx.shadowed_names
+        and node.func.id not in scope_ctx.shadowed_names
     )
 
 
@@ -1694,8 +1159,8 @@ def _extract_expr_closure_and_load_info(
     Note:
         Direct ``ast.Name`` call targets (``curr.func`` when ``isinstance(curr.func, ast.Name)``
         and ``curr`` is not an unshadowed scalar built-in call) are routed to
-        ``called_names_out`` (when provided) rather than ``loaded_names`` so callers can
-        distinguish direct function/factory invocations from closure value references.
+        ``called_names_out`` when provided; when ``called_names_out`` is None, direct
+        callee names are included in ``loaded_names`` so they are never silently dropped.
     """
     inline_reads: Set[str] = set()
     inline_muts: Set[str] = set()
@@ -1738,6 +1203,8 @@ def _extract_expr_closure_and_load_info(
                 loaded_names.update(sub_loads - comp_targets)
                 if called_names_out is not None:
                     called_names_out.update(sub_calls - comp_targets)
+                else:
+                    loaded_names.update(sub_calls - comp_targets)
             continue
         if isinstance(curr, ast.Call):
             if _is_non_closure_builtin_call(curr, scope_ctx):
@@ -1764,6 +1231,8 @@ def _extract_expr_closure_and_load_info(
             elif isinstance(curr.func, ast.Name):
                 if called_names_out is not None:
                     called_names_out.add(curr.func.id)
+                else:
+                    loaded_names.add(curr.func.id)
             else:
                 stack.append(curr.func)
             stack.extend(curr.args)
@@ -2382,9 +1851,19 @@ def _make_nested_fn_scope_context(
         )
     else:
         parent_map = scope_ctx.parent_map
+    include_prev_owner = (
+        scope_ctx is not None
+        and isinstance(scope_ctx.scope_owner, ast.AST)
+        and (
+            not isinstance(scope_ctx.mod_tree, ast.AST)
+            or _is_node_attached_to_tree(
+                scope_ctx.scope_owner, scope_ctx.mod_tree
+            )
+        )
+    )
     enc_scopes: Tuple[ast.AST, ...] = (
-        (*scope_ctx.enclosing_scopes, scope_ctx.scope_owner)
-        if scope_ctx is not None and isinstance(scope_ctx.scope_owner, ast.AST)
+        (*scope_ctx.enclosing_scopes, cast(ast.AST, scope_ctx.scope_owner))
+        if scope_ctx is not None and include_prev_owner
         else (scope_ctx.enclosing_scopes if scope_ctx is not None else ())
     )
     return _FnScopeContext(
@@ -2549,7 +2028,10 @@ def _is_closure_factory_scope(
         scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
     ):
         return False
-    if not use_cache:
+    eff_cache = use_cache and _scope_ctx_allows_node_cache(
+        scope_node, scope_ctx
+    )
+    if not eff_cache:
         return _is_closure_factory_scope_uncached(
             scope_node, scope_ctx, use_cache=False
         )
@@ -2600,15 +2082,21 @@ def _extract_fn_returned_closure_refs_uncached(
 
 
 def _extract_fn_returned_closure_refs(
-    fn_node: ast.AST, scope_ctx: Optional[_FnScopeContext] = None, *, use_cache: bool = True
+    fn_node: ast.AST,
+    scope_ctx: Optional[_FnScopeContext] = None,
+    *,
+    use_cache: bool = True,
 ) -> Tuple[Set[str], Set[str]]:
     """Extracts non-local (returned_loaded_names, returned_called_names) for a nested function."""
+    eff_cache = use_cache and _scope_ctx_allows_node_cache(fn_node, scope_ctx)
     return _resolve_cached_str_set_pair(
         fn_node,
         (ast.FunctionDef, ast.AsyncFunctionDef),
         _make_scope_ctx_cache_key(fn_node, "ret_closure_refs", scope_ctx),
-        lambda c: _extract_fn_returned_closure_refs_uncached(fn_node, scope_ctx, use_cache=c),
-        use_cache=use_cache,
+        lambda c: _extract_fn_returned_closure_refs_uncached(
+            fn_node, scope_ctx, use_cache=c
+        ),
+        use_cache=eff_cache,
     )
 
 
@@ -2772,7 +2260,8 @@ def _extract_fn_outer_carrier_targets(
         fn_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
     ):
         return set()
-    if not use_cache:
+    eff_cache = use_cache and _scope_ctx_allows_node_cache(fn_node, scope_ctx)
+    if not eff_cache:
         return set(
             _extract_fn_outer_carrier_targets_uncached(
                 fn_node, fn_globals, scope_ctx, use_cache=False
