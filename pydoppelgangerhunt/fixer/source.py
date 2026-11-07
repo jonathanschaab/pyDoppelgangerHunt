@@ -90,8 +90,6 @@ class UnitSchema(TypedDict, total=False):
         source_lines_is_sliced: Explicit boolean disambiguating whether ``source_lines``
             is already sliced to the unit's line/column boundaries (``True``) or represents
             the full module buffer (``False``).
-        _tokens_pre_sliced: Internal flag set when ``source_lines`` has already been
-            sliced by ``_slice_unit_token_lines``.
         inputs: Ordered list of live-in variable names required by the unit.
         outputs: Ordered list of live-out variable names exported by the unit.
         precomputed_outputs: Explicit caller-supplied output variable list taking
@@ -128,7 +126,6 @@ class UnitSchema(TypedDict, total=False):
     file_source: Optional[str]
     source_lines: Optional[Sequence[str]]
     source_lines_is_sliced: Optional[bool]
-    _tokens_pre_sliced: Optional[bool]
     inputs: Sequence[str]
     outputs: Sequence[str]
     precomputed_outputs: Optional[Sequence[str]]
@@ -658,18 +655,6 @@ def _slice_utf8_line(
     return line[s_char:]
 
 
-def _is_valid_eval_expr(text: str) -> bool:
-    """Returns True if text parses as a standalone Python expression in eval mode."""
-    stripped = text.strip()
-    if not stripped:
-        return False
-    try:
-        ast.parse(stripped, mode="eval")
-        return True
-    except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
-        return False
-
-
 def _slice_unit_token_lines(
     unit: Dict[str, Any],
     lines: List[str],
@@ -679,9 +664,12 @@ def _slice_unit_token_lines(
     """Slices source lines to the exact start_col and end_col offsets of the unit."""
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
         return lines
-    if is_pre_sliced is True or bool(
-        unit.get("source_lines_is_sliced") or unit.get("_tokens_pre_sliced")
-    ):
+    already_sliced = (
+        is_pre_sliced
+        if is_pre_sliced is not None
+        else bool(unit.get("source_lines_is_sliced"))
+    )
+    if already_sliced:
         return list(lines)
     s_col_opt = _extract_slice_col_offset(
         unit, ("start_col", "start_col_offset"), default=0
@@ -714,32 +702,14 @@ def _slice_unit_token_lines(
             )
         ):
             return res
-        candidate = _slice_utf8_line(res[0], s_col, e_col)
-        if (
-            s_col > 0
-            and e_col is None
-            and not res[0].startswith((" ", "\t"))
-            and _is_valid_eval_expr(res[0])
-            and not _is_valid_eval_expr(candidate)
-        ):
-            return res
-        res[0] = candidate
+        res[0] = _slice_utf8_line(res[0], s_col, e_col)
     else:
-        cand_res = list(res)
         if 0 < s_col < first_byte_len:
-            cand_res[0] = _slice_utf8_line(cand_res[0], s_col, None)
+            res[0] = _slice_utf8_line(res[0], s_col, None)
         if e_col is not None:
-            last_byte_len = len(cand_res[-1].rstrip("\r\n").encode("utf-8"))
+            last_byte_len = len(res[-1].rstrip("\r\n").encode("utf-8"))
             if e_col <= last_byte_len:
-                cand_res[-1] = _slice_utf8_line(cand_res[-1], 0, e_col)
-        if (
-            (s_col > 0 or e_col is not None)
-            and not res[0].startswith((" ", "\t"))
-            and _is_valid_eval_expr("\n".join(res))
-            and not _is_valid_eval_expr("\n".join(cand_res))
-        ):
-            return res
-        res = cand_res
+                res[-1] = _slice_utf8_line(res[-1], 0, e_col)
     return res
 
 
@@ -1697,7 +1667,11 @@ def _find_innermost_enclosing_node(
             return None
     elif getattr(tree, "_source_lines", None) is None and source_text:
         try:
-            setattr(tree, "_source_lines", tuple(split_source_lines(source_text)))
+            setattr(
+                tree,
+                "_source_lines",
+                tuple(ln.rstrip("\r\n") for ln in split_source_lines(source_text)),
+            )
         except (AttributeError, TypeError):
             pass
 

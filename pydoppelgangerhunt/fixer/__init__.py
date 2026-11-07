@@ -63,6 +63,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
 )
 from pydoppelgangerhunt.fixer.scope import (
     BUILTIN_NAMES,
+    SCOPE_SCHEMA_VERSION,
     _ScopeVisitor,
     _analyze_block_assignment,
     _block_terminates,
@@ -128,6 +129,7 @@ from pydoppelgangerhunt.fixer.synthesis import (
 __all__ = [
     "ModuleDependencyGraph",
     "ReplacementItem",
+    "SCOPE_SCHEMA_VERSION",
     "UnitCollisionError",
     "UnitDict",
     "UnitSpan",

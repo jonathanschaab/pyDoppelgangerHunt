@@ -126,6 +126,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _collect_scope_closures_uncached,
     _extract_comprehension_walrus_names,
     _extract_scope_nonlocals_and_outer_globals,
+    _extract_single_node_local_names,
     _has_escaped_intra_unit_global_declarations,
     _resolve_immediate_scope_in_fn,
 )
@@ -401,6 +402,74 @@ class _UnitClosureHazardContext(NamedTuple):
     lex_validated: bool = False
     hazard_reasons_out: Optional[List[str]] = None
     strict_with_suppression: bool = False
+    extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset()
+
+
+_PURE_GLOBAL_SAFE_BUILTINS: frozenset[str] = frozenset(
+    {
+        "abs",
+        "all",
+        "any",
+        "ascii",
+        "bin",
+        "bool",
+        "bytes",
+        "callable",
+        "chr",
+        "dict",
+        "divmod",
+        "enumerate",
+        "float",
+        "frozenset",
+        "hash",
+        "hex",
+        "id",
+        "int",
+        "isinstance",
+        "issubclass",
+        "len",
+        "list",
+        "max",
+        "min",
+        "oct",
+        "ord",
+        "pow",
+        "range",
+        "repr",
+        "reversed",
+        "round",
+        "set",
+        "str",
+        "sum",
+        "tuple",
+        "zip",
+    }
+)
+
+
+def _unit_has_global_mutating_call(
+    candidate_stmts: Sequence[ast.stmt],
+    shadowed_names: AbstractSet[str],
+) -> bool:
+    """Returns True when candidate_stmts contain a call other than an unshadowed pure builtin.
+
+    When an extracted helper reads a variable declared ``global`` in an enclosing
+    function, the helper receives that global's value as a snapshot parameter at
+    call entry. Any impure or user-defined call inside the helper could mutate the
+    module-level global mid-execution, causing subsequent reads inside the helper
+    to observe the stale parameter rather than the updated global. Calls to
+    unshadowed pure builtins cannot rebind module globals and are safe to allow.
+    """
+    for st in candidate_stmts:
+        for node in ast.walk(st):
+            if isinstance(node, ast.Call):
+                if not (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in _PURE_GLOBAL_SAFE_BUILTINS
+                    and node.func.id not in shadowed_names
+                ):
+                    return True
+    return False
 
 
 def _record_hazard_reason(
@@ -643,12 +712,26 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
     eff_input_set = set(ctx.inputs) | set(ctx.free_vars) | nonlocal_set
     if unit_stores_affect_enclosing and bool(
         eff_input_set & enc_outer_globals
-    ) and any(
-        isinstance(n, ast.Call)
-        for st in ctx.candidate_stmts
-        for n in ast.walk(st)
     ):
-        return _record_hazard_reason(ctx, "global_escape")
+        shadowed_builtin_names: Set[str] = (
+            set(eff_input_set)
+            | store_set
+            | set(ctx.deleted_names)
+            | set(ctx.unit_top_locals)
+            | set(enc_escaping)
+        )
+        if ctx.mod_tree is not None:
+            shadowed_builtin_names.update(
+                _extract_single_node_local_names(ctx.mod_tree)
+            )
+        for _, _, enc_fn_node in enclosing_chain:
+            shadowed_builtin_names.update(
+                _extract_single_node_local_names(enc_fn_node)
+            )
+        if _unit_has_global_mutating_call(
+            ctx.candidate_stmts, shadowed_builtin_names
+        ):
+            return _record_hazard_reason(ctx, "global_escape")
     if unit_stores_affect_enclosing and bool(
         unit_closure_reads
         & (
@@ -682,6 +765,7 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         unit_mutations,
         mod_tree=ctx.mod_tree,
         strict_with_suppression=ctx.strict_with_suppression,
+        extra_non_suppressing_ctx_managers=ctx.extra_non_suppressing_ctx_managers,
     )
     if (
         ctx.definite_stores is not None

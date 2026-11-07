@@ -27,8 +27,10 @@ from pydoppelgangerhunt.config import (
     DEFAULT_EXCLUDES,
     init_tool_configuration,
     load_tool_config,
+    normalize_non_suppressing_ctx_managers,
     normalize_path_string,
     resolve_closure_strictness_mode,
+    resolve_strict_with_suppression,
 )
 from pydoppelgangerhunt.canonical_path import CanonicalPathResolver
 from pydoppelgangerhunt.coverage import check_asymmetric_coverage, read_coverage_data
@@ -209,9 +211,16 @@ def build_arg_parser() -> argparse.ArgumentParser:  # pydoppelgangerhunt: ignore
             "skip",
         ],
         help=(
-            "Closure strictness ('strict'/'fail_closed', 'pedantic'/'strict_with', "
-            "or 'lenient'/'fast'/'skip'; takes precedence over --skip-pre-unit-closures)"
+            "Closure strictness ('strict' [heuristic with-suppression, default], "
+            "'pedantic'/'fail_closed'/'strict_with' [all unproven with-managers treated as potentially suppressing], "
+            "or 'lenient'/'fast'/'skip' [skip pre-unit closure scan]; takes precedence over --skip-pre-unit-closures)"
         ),
+    )
+    parser.add_argument(
+        "--non-suppressing-ctx-managers",
+        action="append",
+        default=[],
+        help="Context manager names or dotted paths proven not to suppress exceptions (comma-separated or repeatable)",
     )
 
     color_group = parser.add_mutually_exclusive_group()
@@ -399,7 +408,9 @@ def _render_pair_diff_and_suggestions(
     effective_root = repo_root or target_repo_root
     lines: List[str] = []
     if args.suggest:
-        sug = synthesize_refactoring_suggestion(u1, u2, repo_root=effective_root)
+        sug = synthesize_refactoring_suggestion(
+            u1, u2, repo_root=effective_root
+        )
         sug_colored = colorize(sug, COLOR_YELLOW, use_color)
         print(indent + sug_colored.replace("\n", "\n" + indent))
         lines.append(indent + sug.replace("\n", "\n" + indent))
@@ -1172,10 +1183,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         cli_strictness = cfg_strictness
         cli_skip = cfg_skip
+        if (
+            cli_strictness is None
+            and not cli_skip
+            and _safe_bool(tool_cfg.get("strict_with_suppression", False))
+        ):
+            cli_strictness = "pedantic"
+
+    if cli_strictness is not None and "strict_with_suppression" in tool_cfg:
+        resolve_strict_with_suppression(
+            closure_strictness=cli_strictness,
+            strict_with_suppression=_safe_bool(
+                tool_cfg.get("strict_with_suppression")
+            ),
+        )
 
     closure_strictness, skip_pre_unit_closures = resolve_closure_strictness_mode(
         closure_strictness=cli_strictness,
         skip_pre_unit_closures=cli_skip,
+    )
+    non_suppressing_ctx_managers = normalize_non_suppressing_ctx_managers(
+        tool_cfg.get("non_suppressing_ctx_managers"),
+        getattr(args, "non_suppressing_ctx_managers", ()),
+    )
+    setattr(args, "resolved_closure_strictness", closure_strictness)
+    setattr(args, "resolved_skip_pre_unit_closures", skip_pre_unit_closures)
+    setattr(
+        args,
+        "resolved_non_suppressing_ctx_managers",
+        non_suppressing_ctx_managers,
     )
     if skip_pre_unit_closures and getattr(args, "patch", False):
         logger.info(
@@ -1508,6 +1544,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 shared_module_name=shared_module_name,
                 skip_pre_unit_closures=skip_pre_unit_closures,
                 closure_strictness=closure_strictness,
+                non_suppressing_ctx_managers=non_suppressing_ctx_managers,
             )
             if clones
             else ""

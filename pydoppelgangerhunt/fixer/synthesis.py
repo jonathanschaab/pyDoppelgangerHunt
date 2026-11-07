@@ -9,6 +9,7 @@ import typing
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.config import (
+    normalize_non_suppressing_ctx_managers,
     normalize_path_string,
     resolve_closure_strictness_mode,
     resolve_strict_with_suppression,
@@ -1304,6 +1305,7 @@ def synthesize_shared_helper_code(
     tree2: Optional[ast.AST] = None,
     skip_pre_unit_closures: bool = False,
     closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
     outputs: Optional[List[str]] = None,
     outputs2: Optional[List[str]] = None,
     scope1: Optional[Dict[str, Any]] = None,
@@ -1424,21 +1426,38 @@ def synthesize_shared_helper_code(
         closure_strictness=closure_strictness,
         strict_with_suppression=u2.get("strict_with_suppression"),
     )
+    eff_non_sup1 = normalize_non_suppressing_ctx_managers(
+        non_suppressing_ctx_managers
+        if non_suppressing_ctx_managers is not None
+        else u1.get("non_suppressing_ctx_managers")
+    )
+    eff_non_sup2 = normalize_non_suppressing_ctx_managers(
+        non_suppressing_ctx_managers
+        if non_suppressing_ctx_managers is not None
+        else u2.get("non_suppressing_ctx_managers")
+    )
+    if eff_non_sup1:
+        u1["non_suppressing_ctx_managers"] = list(eff_non_sup1)
+    if eff_non_sup2:
+        u2["non_suppressing_ctx_managers"] = list(eff_non_sup2)
     has_precomputed_scopes = (
         scope_matches_closure_mode(
             scope1,
             effective_skip_closures,
             expected_strict_with=effective_strict_with1,
+            expected_non_suppressing=eff_non_sup1,
         )
         and scope_matches_closure_mode(
             scope2,
             effective_skip_closures,
             expected_strict_with=effective_strict_with2,
+            expected_non_suppressing=eff_non_sup2,
         )
         and scope_matches_closure_mode(
             scope,
             effective_skip_closures,
             expected_strict_with=effective_strict_with1 or effective_strict_with2,
+            expected_non_suppressing=sorted(set(eff_non_sup1) & set(eff_non_sup2)),
         )
     )
     can_skip_tree_parse = (
@@ -1486,9 +1505,9 @@ def synthesize_shared_helper_code(
     tree1 = _resolve_tree(tree1, source_text1, u1)
     tree2 = _resolve_tree(tree2, source_text2, u2)
     scopes: List[Dict[str, Any]] = []
-    for u_item, s_text, t_item, pre_s, eff_sw in (
-        (u1, source_text1, tree1, scope1, effective_strict_with1),
-        (u2, source_text2, tree2, scope2, effective_strict_with2),
+    for u_item, s_text, t_item, pre_s, eff_sw, eff_ns in (
+        (u1, source_text1, tree1, scope1, effective_strict_with1, eff_non_sup1),
+        (u2, source_text2, tree2, scope2, effective_strict_with2, eff_non_sup2),
     ):
         if s_text is not None and (
             not isinstance(u_item.get("source_text"), str)
@@ -1504,6 +1523,7 @@ def synthesize_shared_helper_code(
                 pre_s,
                 effective_skip_closures,
                 strict_with_suppression=eff_sw,
+                non_suppressing_ctx_managers=eff_ns,
                 source_text=s_text,
                 tree=t_item,
                 repo_root=repo_root,
@@ -1542,6 +1562,7 @@ def synthesize_shared_helper_code(
             scope1=scope1,
             scope2=scope2,
             skip_pre_unit_closures=effective_skip_closures,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
         )
 
     if scope1.get("is_async") or scope2.get("is_async"):
@@ -1725,6 +1746,7 @@ def synthesize_shared_helper_code(
             repo_root=repo_root,
             skip_pre_unit_closures=skip_pre_unit_closures,
             closure_strictness=closure_strictness,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
             require_pairing=False,
         )
         if resolved_outs is None:

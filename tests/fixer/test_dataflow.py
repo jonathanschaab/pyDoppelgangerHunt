@@ -960,13 +960,15 @@ def test_resolve_clone_generator_subroutine_outputs_precomputed_and_fallback(
         "definite_stores": ["a"],
         "globals": ["b"],
         "nonlocals": [],
-        "_skip_pre_unit_closures": False,
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": 2,
     }
     s2 = {
         "definite_stores": ["x"],
         "globals": [],
         "nonlocals": ["y"],
-        "_skip_pre_unit_closures": False,
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": 2,
     }
     res = resolve_clone_generator_subroutine_outputs(u1_pre, u2_pre, s1, s2)
     assert res is not None
@@ -2678,12 +2680,14 @@ def test_resolve_clone_pair_outputs_clean_pair() -> None:
     s1: Dict[str, Any] = {
         "inputs": [],
         "definite_stores": ["a", "b"],
-        "_skip_pre_unit_closures": False,
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": 2,
     }
     s2: Dict[str, Any] = {
         "inputs": [],
         "definite_stores": ["x", "y"],
-        "_skip_pre_unit_closures": False,
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": 2,
     }
 
     res = resolve_clone_pair_outputs(u1, u2, s1, s2)

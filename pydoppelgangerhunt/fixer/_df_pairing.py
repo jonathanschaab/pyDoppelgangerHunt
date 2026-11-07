@@ -299,6 +299,7 @@ def _ensure_pair_scopes_closure_mode(
     *,
     closure_strictness: Optional[str],
     skip_pre_unit_closures: bool,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
     source_text1: Optional[str],
     source_text2: Optional[str],
     tree1: Optional[ast.AST],
@@ -318,6 +319,11 @@ def _ensure_pair_scopes_closure_mode(
             closure_strictness=closure_strictness,
             strict_with_suppression=u1.get("strict_with_suppression"),
         ),
+        non_suppressing_ctx_managers=(
+            non_suppressing_ctx_managers
+            if non_suppressing_ctx_managers is not None
+            else u1.get("non_suppressing_ctx_managers")
+        ),
         source_text=source_text1,
         tree=tree1,
         repo_root=repo_root,
@@ -329,6 +335,11 @@ def _ensure_pair_scopes_closure_mode(
         strict_with_suppression=resolve_strict_with_suppression(
             closure_strictness=closure_strictness,
             strict_with_suppression=u2.get("strict_with_suppression"),
+        ),
+        non_suppressing_ctx_managers=(
+            non_suppressing_ctx_managers
+            if non_suppressing_ctx_managers is not None
+            else u2.get("non_suppressing_ctx_managers")
         ),
         source_text=source_text2,
         tree=tree2,
@@ -355,6 +366,7 @@ def resolve_clone_generator_subroutine_outputs(
     *,
     return_details: Literal[True],
     closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> CloneOutputResolution: ...
 
 
@@ -375,6 +387,7 @@ def resolve_clone_generator_subroutine_outputs(
     allow_permuted_outputs: bool = False,
     return_details: Literal[False] = False,
     closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Optional[Tuple[List[str], List[str]]]: ...
 
 
@@ -395,6 +408,7 @@ def resolve_clone_generator_subroutine_outputs(
     allow_permuted_outputs: bool = False,
     return_details: bool = False,
     closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Union[Optional[Tuple[List[str], List[str]]], CloneOutputResolution]: ...
 
 
@@ -414,6 +428,7 @@ def resolve_clone_generator_subroutine_outputs(
     allow_permuted_outputs: bool = False,
     return_details: bool = False,
     closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Union[Optional[Tuple[List[str], List[str]]], CloneOutputResolution]:
     """Resolves output variable bindings for clone generator subroutines across two code units.
 
@@ -441,6 +456,7 @@ def resolve_clone_generator_subroutine_outputs(
         scope2,
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
         source_text1=source_text1,
         source_text2=source_text2,
         tree1=tree1,
@@ -644,6 +660,7 @@ def resolve_clone_pair_outputs(
     allow_permuted_outputs: bool = False,
     *,
     return_details: Literal[True],
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> CloneOutputResolution: ...
 
 
@@ -665,6 +682,7 @@ def resolve_clone_pair_outputs(
     require_pairing: Optional[bool] = None,
     allow_permuted_outputs: bool = False,
     return_details: Literal[False] = False,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Optional[Tuple[List[str], List[str]]]: ...
 
 
@@ -686,6 +704,7 @@ def resolve_clone_pair_outputs(
     require_pairing: Optional[bool] = None,
     allow_permuted_outputs: bool = False,
     return_details: bool = False,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Union[Optional[Tuple[List[str], List[str]]], CloneOutputResolution]: ...
 
 
@@ -706,6 +725,7 @@ def resolve_clone_pair_outputs(
     require_pairing: Optional[bool] = None,
     allow_permuted_outputs: bool = False,
     return_details: bool = False,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Union[Optional[Tuple[List[str], List[str]]], CloneOutputResolution]:
     """Resolves output variable bindings between two clone units, enforcing
     strict positional pairing and generator subroutine safety.
@@ -756,6 +776,7 @@ def resolve_clone_pair_outputs(
         scope2,
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
         source_text1=source_text1,
         source_text2=source_text2,
         tree1=tree1,
@@ -790,6 +811,7 @@ def resolve_clone_pair_outputs(
             source_digest1=source_digest1,
             source_digest2=source_digest2,
             closure_strictness=closure_strictness,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
             allow_permuted_outputs=allow_permuted_outputs,
             return_details=return_details,
         )

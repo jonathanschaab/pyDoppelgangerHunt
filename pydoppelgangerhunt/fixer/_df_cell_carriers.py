@@ -178,14 +178,8 @@ class _FnScopeContext(NamedTuple):
         return tuple(aux_nodes)
 
     def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
-        """Returns all AST nodes retained by this context for cache index ownership."""
-        nodes: List[ast.AST] = list(self.cache_aux_nodes())
-        for pk, pv in self.parent_map.items():
-            if isinstance(pk, ast.AST):
-                nodes.append(pk)
-            if isinstance(pv, ast.AST):
-                nodes.append(pv)
-        return tuple(nodes)
+        """Returns the scope owner, module root, and enclosing scope AST nodes for cache indexing."""
+        return self.cache_aux_nodes()
 
 
 def _scope_ctx_allows_node_cache(

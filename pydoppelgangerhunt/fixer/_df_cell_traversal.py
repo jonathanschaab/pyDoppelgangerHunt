@@ -118,6 +118,7 @@ class _CellBindingState:
     fn_globals: AbstractSet[str] = frozenset()
     suppress_aliases: Optional[_SuppressProvenance] = None
     strict_with_suppression: bool = False
+    extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset()
 
 
 class _StackFrame(NamedTuple):
@@ -267,6 +268,7 @@ def _maybe_push_pre_span_exhaustive_frame(
             state.fn_globals,
             suppress_aliases=active_sup or frozenset(),
             strict_with_suppression=state.strict_with_suppression,
+            extra_non_suppressing_ctx_managers=state.extra_non_suppressing_ctx_managers,
         )
         if exh_bound:
             stack.append(
@@ -1031,13 +1033,15 @@ def _make_empty_traversal_buffers(
     ] = None,
     *,
     strict_with_suppression: bool = False,
+    extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
+    seed_pre_mutated: bool = True,
 ) -> _CellTraversalBuffers:
     """Creates fresh mutable traversal buffers for enclosing function cell analysis."""
     bound_set: Set[str] = set(pre_bound) if pre_bound is not None else set()
     return _CellTraversalBuffers(
         state=_CellBindingState(
             pre_bound=bound_set,
-            pre_mutated=set(bound_set),
+            pre_mutated=set(bound_set) if seed_pre_mutated else set(),
             post_mutated=set(),
             post_reads=set(),
             loop_mutated=set(),
@@ -1047,6 +1051,9 @@ def _make_empty_traversal_buffers(
                 initial_suppress_aliases
             ),
             strict_with_suppression=strict_with_suppression,
+            extra_non_suppressing_ctx_managers=frozenset(
+                extra_non_suppressing_ctx_managers
+            ),
         ),
         sibling_closures=[],
         concurrent_sib_indices=set(),
@@ -1132,9 +1139,21 @@ def _try_apply_cached_stmt_delta(
     pre_prov = _coerce_suppress_provenance(bufs.state.suppress_aliases)
     sup_key = pre_prov.as_cache_key_tuple() if pre_prov else ()
     strict_w = bool(bufs.state.strict_with_suppression)
+    extra_non_sup = frozenset(bufs.state.extra_non_suppressing_ctx_managers)
+    has_with = is_before and any(
+        isinstance(n, (ast.With, ast.AsyncWith)) for n in ast.walk(stmt)
+    )
+    init_pre_bound: frozenset[str] = (
+        frozenset(
+            bufs.state.pre_bound
+            & {n.id for n in ast.walk(stmt) if isinstance(n, ast.Name)}
+        )
+        if has_with and bufs.state.pre_bound
+        else frozenset()
+    )
     key: Tuple[Any, ...] = (
-        (stmt, is_before, sup_key, strict_w)
-        if (sup_key or strict_w)
+        (stmt, is_before, sup_key, strict_w, init_pre_bound, extra_non_sup)
+        if (sup_key or strict_w or init_pre_bound or extra_non_sup)
         else (stmt, is_before)
     )
     with _downstream_cache_lock:
@@ -1153,17 +1172,25 @@ def _try_apply_cached_stmt_delta(
         sub_bufs = _make_empty_traversal_buffers(
             bufs.state.fn_globals,
             bufs.scope_ctx,
+            pre_bound=set(init_pre_bound) if init_pre_bound else None,
             initial_suppress_aliases=pre_prov,
             strict_with_suppression=strict_w,
+            extra_non_suppressing_ctx_managers=extra_non_sup,
+            seed_pre_mutated=False,
         )
         _traverse_fn_cell_frames(
             [_StackFrame(stmt, False, False, None)],
             dummy_span,
             sub_bufs,
         )
+        delta_pre_mutated = frozenset(sub_bufs.state.pre_mutated)
+        delta_pre_bound = frozenset(
+            (sub_bufs.state.pre_bound - init_pre_bound)
+            | (sub_bufs.state.pre_bound & delta_pre_mutated)
+        )
         computed_delta = _StmtCellDelta(
-            pre_bound=frozenset(sub_bufs.state.pre_bound),
-            pre_mutated=frozenset(sub_bufs.state.pre_mutated),
+            pre_bound=delta_pre_bound,
+            pre_mutated=delta_pre_mutated,
             post_mutated=frozenset(sub_bufs.state.post_mutated),
             post_reads=frozenset(sub_bufs.state.post_reads),
             loop_mutated=frozenset(sub_bufs.state.loop_mutated),
@@ -1508,6 +1535,7 @@ def _analyze_enclosing_fn_cells_uncached(
     enclosing_scopes: Sequence[ast.AST] = (),
     use_stmt_deltas: bool = True,
     strict_with_suppression: bool = False,
+    extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
 ) -> _EnclosingFnCellInfo:
     """Computes variable bindings, post-span mutations, loop mutations, and sibling closures."""
     scope_ctx = _get_fn_scope_context(
@@ -1545,6 +1573,7 @@ def _analyze_enclosing_fn_cells_uncached(
         unit_mutations=unit_mutations,
         initial_suppress_aliases=initial_sup,
         strict_with_suppression=strict_with_suppression,
+        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
     )
     if isinstance(fn_node, _COMPREHENSION_TYPES):
         bufs.state.loop_mutated.update(
@@ -1711,6 +1740,7 @@ def _analyze_enclosing_fn_cells(
     mod_tree: Optional[ast.AST] = None,
     enclosing_scopes: Sequence[ast.AST] = (),
     strict_with_suppression: bool = False,
+    extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
 ) -> _EnclosingFnCellInfo:
     """Analyzes and caches cell bindings, post-span mutations, loop mutations, and closures."""
     norm_span = span if isinstance(span, _SpanBounds) else _SpanBounds(*span)
@@ -1723,8 +1753,22 @@ def _analyze_enclosing_fn_cells(
         *(n for n in (enclosed_fn, mod_tree) if n is not None),
         *norm_enclosing,
     )
+    extra_non_sup = frozenset(extra_non_suppressing_ctx_managers)
     params: Tuple[Any, ...] = (
-        (norm_span, frozenset(unit_mutations), enclosed_fn is not None, True)
+        (
+            norm_span,
+            frozenset(unit_mutations),
+            enclosed_fn is not None,
+            bool(strict_with_suppression),
+            extra_non_sup,
+        )
+        if extra_non_sup
+        else (
+            norm_span,
+            frozenset(unit_mutations),
+            enclosed_fn is not None,
+            True,
+        )
         if strict_with_suppression
         else (norm_span, frozenset(unit_mutations), enclosed_fn is not None)
     )
@@ -1747,6 +1791,7 @@ def _analyze_enclosing_fn_cells(
                 mod_tree=mod_tree,
                 enclosing_scopes=norm_enclosing,
                 strict_with_suppression=strict_with_suppression,
+                extra_non_suppressing_ctx_managers=extra_non_sup,
             ),
         ),
     )
@@ -1795,6 +1840,7 @@ def _build_enclosing_chain_cell_infos(
     mod_tree: Optional[ast.AST] = None,
     *,
     strict_with_suppression: bool = False,
+    extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
 ) -> List[_EnclosingFnCellInfo]:
     """Builds _EnclosingFnCellInfo summaries for each function in enclosing_chain."""
     rev_infos: List[_EnclosingFnCellInfo] = []
@@ -1830,6 +1876,7 @@ def _build_enclosing_chain_cell_infos(
             mod_tree=mod_tree,
             enclosing_scopes=tuple(n for _, _, n in enclosing_chain[:idx]),
             strict_with_suppression=strict_with_suppression,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         )
         is_static_enc = any(
             (isinstance(d, ast.Name) and d.id == "staticmethod")
@@ -1886,6 +1933,7 @@ def _find_enclosing_chain_definite_pre_bound(
     mod_tree: Optional[ast.AST] = None,
     *,
     strict_with_suppression: bool = False,
+    extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
 ) -> Set[str]:
     """Computes variables definitely bound prior to the unit across enclosing functions."""
     chain_infos = _build_enclosing_chain_cell_infos(
@@ -1897,6 +1945,7 @@ def _find_enclosing_chain_definite_pre_bound(
         frozenset(),
         mod_tree=mod_tree,
         strict_with_suppression=strict_with_suppression,
+        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
     )
     acc_pre_bound: Set[str] = set()
     acc_pre_unbound: Set[str] = set()

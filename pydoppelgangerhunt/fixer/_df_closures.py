@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import symtable
 from typing import (
     AbstractSet,
     Any,
@@ -268,7 +269,7 @@ def _extract_single_node_local_names(
                     t_node.ctx, ast.Store
                 ):
                     names.add(t_node.id)
-        return names - global_names
+        return names
 
     body = getattr(scope_node, "body", [])
     stack: List[ast.AST] = (
@@ -447,88 +448,13 @@ def _collect_ancestors_from_parent_map(
     return ancestors
 
 
-class _DetachedDumpIndex:
-    """Cached per-tree structural dump index for O(1) detached unit resolution."""
-
-    __slots__ = ("stmt_blocks", "expr_by_dump", "_retained_nodes")
-
-    def __init__(self, module_tree: ast.AST) -> None:
-        blocks: List[Tuple[Tuple[str, ...], Tuple[ast.AST, ...]]] = []
-        expr_map: Dict[str, List[ast.AST]] = {}
-        retained: List[ast.AST] = []
-        seen_ids: Set[int] = set()
-        for node in ast.walk(module_tree):
-            if isinstance(node, ast.AST) and id(node) not in seen_ids:
-                seen_ids.add(id(node))
-                retained.append(node)
-            if node is not module_tree:
-                expr_map.setdefault(ast.dump(node), []).append(node)
-            for attr in ("body", "orelse", "finalbody"):
-                seq = getattr(node, attr, None)
-                if isinstance(seq, list) and seq:
-                    ast_seq = tuple(s for s in seq if isinstance(s, ast.AST))
-                    if ast_seq:
-                        blocks.append(
-                            (tuple(ast.dump(s) for s in ast_seq), ast_seq)
-                        )
-        self.stmt_blocks: Tuple[
-            Tuple[Tuple[str, ...], Tuple[ast.AST, ...]], ...
-        ] = tuple(blocks)
-        self.expr_by_dump: Dict[str, Tuple[ast.AST, ...]] = {
-            k: tuple(v) for k, v in expr_map.items()
-        }
-        self._retained_nodes: Tuple[ast.AST, ...] = tuple(retained)
-
-    def cached_ast_nodes(self) -> Tuple[ast.AST, ...]:
-        """Returns all AST nodes retained by this structural dump index."""
-        return self._retained_nodes
-
-
-def _get_detached_dump_index(module_tree: ast.AST) -> _DetachedDumpIndex:
-    """Returns or builds the cached _DetachedDumpIndex for module_tree."""
-    return cast(
-        _DetachedDumpIndex,
-        _get_or_compute_scope_cached(
-            _scope_cell_info_cache,
-            _ScopeCacheKey(module_tree, "detached_dump_index"),
-            lambda: _DetachedDumpIndex(module_tree),
-        ),
-    )
-
-
-def _find_detached_structural_matches(
-    stmts: Sequence[ast.AST],
-    module_tree: ast.AST,
-) -> List[ast.AST]:
-    """Finds statement slice heads (or expression nodes) in module_tree structurally matching stmts."""
-    if not stmts:
-        return []
-    k = len(stmts)
-    target_dumps = tuple(ast.dump(s) for s in stmts)
-    dump_index = _get_detached_dump_index(module_tree)
-    matches: List[ast.AST] = []
-    for dump_seq, ast_seq in dump_index.stmt_blocks:
-        seq_len = len(dump_seq)
-        if seq_len < k:
-            continue
-        for idx in range(seq_len - k + 1):
-            if dump_seq[idx : idx + k] == target_dumps:
-                matches.append(ast_seq[idx])
-    if matches or k != 1:
-        return matches
-    single = stmts[0]
-    expr_target = single.value if isinstance(single, ast.Expr) else single
-    expr_dump = ast.dump(expr_target)
-    return list(dump_index.expr_by_dump.get(expr_dump, ()))
-
-
-def _resolve_detached_enclosing_scopes(
+def _resolve_enclosing_scopes_by_coords(
     scope_node: ast.AST,
     module_tree: ast.AST,
     *,
     include_classes: bool = False,
 ) -> List[ast.AST]:
-    """Resolves enclosing lexical scope AST nodes in module_tree for a detached unit AST."""
+    """Resolves enclosing lexical scope AST nodes in module_tree by parent_map or unambiguous coordinates."""
     parent_map = _get_scope_parent_map(module_tree)
     if scope_node in parent_map:
         return _collect_ancestors_from_parent_map(
@@ -536,38 +462,14 @@ def _resolve_detached_enclosing_scopes(
         )
     is_fn_like = _is_function_like_scope_node(scope_node)
     body = getattr(scope_node, "body", None)
-    if isinstance(
-        scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    if isinstance(body, (list, tuple)):
+        stmts = [s for s in body if isinstance(s, ast.AST)]
+    elif isinstance(scope_node, ast.AST) and not isinstance(
+        scope_node, ast.Module
     ):
-        self_matches = _find_detached_structural_matches(
-            [scope_node], module_tree
-        )
-        if self_matches:
-            stmts: List[ast.AST] = [scope_node]
-            struct_matches = self_matches
-        else:
-            stmts = (
-                [s for s in body if isinstance(s, ast.AST)]
-                if isinstance(body, (list, tuple))
-                else [scope_node]
-            )
-            struct_matches = _find_detached_structural_matches(
-                stmts, module_tree
-            )
+        stmts = [scope_node]
     else:
-        if isinstance(body, (list, tuple)):
-            stmts = [s for s in body if isinstance(s, ast.AST)]
-        elif isinstance(scope_node, ast.AST) and not isinstance(
-            scope_node, ast.Module
-        ):
-            stmts = [scope_node]
-        else:
-            stmts = []
-        struct_matches = (
-            _find_detached_structural_matches(stmts, module_tree)
-            if stmts
-            else []
-        )
+        stmts = []
     if not stmts:
         return [module_tree] if isinstance(module_tree, ast.Module) else []
     first_stmt = stmts[0]
@@ -584,36 +486,6 @@ def _resolve_detached_enclosing_scopes(
         and isinstance(e_line, int)
         and 1 <= s_line <= e_line
     )
-    if struct_matches:
-        coord_filtered = (
-            [
-                m
-                for m in struct_matches
-                if getattr(m, "lineno", None) == s_line
-                and (s_col is None or getattr(m, "col_offset", None) == s_col)
-            ]
-            if has_valid_lines
-            else []
-        )
-        active_matches = coord_filtered if coord_filtered else struct_matches
-        merged_ancs: List[ast.AST] = []
-        seen_ids: Set[int] = set()
-        for m in active_matches:
-            for anc in _collect_ancestors_from_parent_map(
-                m, parent_map, module_tree, include_classes=include_classes
-            ):
-                if (
-                    not include_classes
-                    and is_fn_like
-                    and isinstance(anc, ast.ClassDef)
-                ):
-                    continue
-                if id(anc) not in seen_ids:
-                    seen_ids.add(id(anc))
-                    merged_ancs.append(anc)
-        if merged_ancs:
-            return merged_ancs
-
     all_sub_scopes = [
         node
         for node in ast.walk(module_tree)
@@ -694,16 +566,41 @@ def _resolve_detached_enclosing_scopes(
             if isinstance(module_tree, ast.Module):
                 res_cls.append(module_tree)
             return res_cls
-        return [module_tree] if isinstance(module_tree, ast.Module) else []
+    return [module_tree] if isinstance(module_tree, ast.Module) else []
 
-    fallback_res: List[ast.AST] = [
-        n
-        for n in all_sub_scopes
-        if include_classes or not isinstance(n, ast.ClassDef)
-    ]
-    if isinstance(module_tree, ast.Module):
-        fallback_res.append(module_tree)
-    return fallback_res
+
+def _extract_symtable_scope_info(
+    source_text: str,
+) -> Dict[Tuple[str, int], Dict[str, frozenset[str]]]:
+    """Computes C-level symtable locals, frees, globals, and cells keyed by (scope_name, lineno)."""
+    try:
+        root_table = symtable.symtable(source_text, "<symtable>", "exec")
+    except (SyntaxError, ValueError):
+        return {}
+    result: Dict[Tuple[str, int], Dict[str, frozenset[str]]] = {}
+    stack: List[symtable.SymbolTable] = [root_table]
+    while stack:
+        tbl = stack.pop()
+        if isinstance(tbl, symtable.Function):
+            descendant_frees: Set[str] = set()
+            desc_stack = list(tbl.get_children())
+            while desc_stack:
+                child_tbl = desc_stack.pop()
+                if isinstance(child_tbl, symtable.Function):
+                    descendant_frees.update(child_tbl.get_frees())
+                desc_stack.extend(child_tbl.get_children())
+            local_set = frozenset(tbl.get_locals())
+            global_set = frozenset(tbl.get_globals())
+            cells = (local_set - global_set) & frozenset(descendant_frees)
+            result[(tbl.get_name(), tbl.get_lineno())] = {
+                "locals": local_set,
+                "frees": frozenset(tbl.get_frees()),
+                "globals": global_set,
+                "parameters": frozenset(tbl.get_parameters()),
+                "cells": cells,
+            }
+        stack.extend(tbl.get_children())
+    return result
 
 
 def _extract_scope_local_names(
@@ -751,7 +648,7 @@ def _extract_scope_local_names(
         parent_map = _get_scope_parent_map(module_tree)
         curr: Optional[ast.AST] = parent_map.get(scope_node)
         if curr is None and not enclosing_scopes:
-            for enc in _resolve_detached_enclosing_scopes(
+            for enc in _resolve_enclosing_scopes_by_coords(
                 scope_node, module_tree, include_classes=include_classes
             ):
                 names.update(_get_cached_single_node_local_names(enc))
@@ -855,7 +752,7 @@ def _has_wildcard_star_import(
             if not enclosing_scopes:
                 return any(
                     _node_has_star_import(enc, use_cache=True)
-                    for enc in _resolve_detached_enclosing_scopes(
+                    for enc in _resolve_enclosing_scopes_by_coords(
                         scope_node, module_tree
                     )
                 )
@@ -1319,7 +1216,13 @@ def _collect_pre_unit_closures(
 def _is_irrefutable_pattern(
     pattern: Optional[ast.AST],
 ) -> bool:  # pragma: no cover (py310+)
-    """Recursively determines if a pattern matching AST node unconditionally matches any subject."""
+    """Recursively determines if a pattern matching AST node unconditionally matches any subject.
+
+    Note:
+        Passing ``None`` directly returns ``False`` (no pattern node exists). Inside an
+        ``ast.MatchAs`` node, ``pattern.pattern is None`` represents a wildcard ``case _:``
+        or bare capture ``case x:`` and is handled directly before recursing.
+    """
     if pattern is None:
         return False
     if type(pattern).__name__ == "MatchAs":

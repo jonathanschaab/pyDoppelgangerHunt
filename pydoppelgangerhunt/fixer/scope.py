@@ -19,6 +19,7 @@ from typing import (
 )
 
 from pydoppelgangerhunt.config import (
+    normalize_non_suppressing_ctx_managers,
     resolve_closure_strictness_mode,
     resolve_strict_with_suppression,
 )
@@ -87,6 +88,7 @@ from pydoppelgangerhunt.fixer.source import (
 
 __all__ = [
     "BUILTIN_NAMES",
+    "SCOPE_SCHEMA_VERSION",
     "_ScopeVisitor",
     "_analyze_block_assignment",
     "_block_terminates",
@@ -115,6 +117,7 @@ logger = logging.getLogger(__name__)
 
 BUILTIN_NAMES: Set[str] = set(dir(builtins))
 
+SCOPE_SCHEMA_VERSION: int = 2
 
 _SYNTHETIC_WRAPPER_NAME: str = "__pdh_wrapper__"
 
@@ -1479,6 +1482,51 @@ def _unit_cols(
     return s_col, e_col
 
 
+def _is_word_or_attr_char(ch: str) -> bool:
+    """Returns True if ch is an identifier character or attribute dot."""
+    return ch.isalnum() or ch in ("_", ".")
+
+
+def _has_token_boundary_subslice(
+    sub: str,
+    line: str,
+    *,
+    anchor_start: bool = False,
+    anchor_end: bool = False,
+    require_stmt_delimiters: bool = False,
+) -> bool:
+    """Checks whether sub occurs in line at valid lexical token boundaries."""
+    if not sub:
+        return False
+    if sub == line:
+        return True
+    search_start = 0
+    while True:
+        pos = line.find(sub, search_start)
+        if pos == -1:
+            return False
+        search_start = pos + 1
+        end_pos = pos + len(sub)
+        if anchor_start and pos != 0:
+            continue
+        if anchor_end and end_pos != len(line):
+            continue
+        if pos > 0 and (sub[0].isalnum() or sub[0] == "_"):
+            if _is_word_or_attr_char(line[pos - 1]):
+                continue
+        if end_pos < len(line) and (sub[-1].isalnum() or sub[-1] == "_"):
+            if _is_word_or_attr_char(line[end_pos]):
+                continue
+        if require_stmt_delimiters:
+            prefix = line[:pos].rstrip()
+            suffix = line[end_pos:].lstrip()
+            if prefix and not prefix.endswith((";", ":")):
+                continue
+            if suffix and not suffix.startswith((";", "#")):
+                continue
+        return True
+
+
 def _is_ordered_contiguous_source_match(
     src_code_lines: Sequence[str],
     raw_lines: Sequence[str],
@@ -1490,17 +1538,27 @@ def _is_ordered_contiguous_source_match(
         return False
     if k == 1:
         target = src_code_lines[0]
-        return any(target in r_ln for r_ln in raw_nonempty)
+        is_stmt_like = "=" in target and not target.startswith(
+            ("lambda", "(", "[", "{")
+        )
+        return any(
+            _has_token_boundary_subslice(
+                target,
+                r_ln,
+                require_stmt_delimiters=is_stmt_like,
+            )
+            for r_ln in raw_nonempty
+        )
     max_start = len(raw_nonempty) - k
     for start_idx in range(max_start + 1):
         first_raw = raw_nonempty[start_idx]
-        if first_raw != src_code_lines[0] and not first_raw.endswith(
-            src_code_lines[0]
+        if not _has_token_boundary_subslice(
+            src_code_lines[0], first_raw, anchor_end=True
         ):
             continue
         last_raw = raw_nonempty[start_idx + k - 1]
-        if last_raw != src_code_lines[-1] and not last_raw.startswith(
-            src_code_lines[-1]
+        if not _has_token_boundary_subslice(
+            src_code_lines[-1], last_raw, anchor_start=True
         ):
             continue
         if all(
@@ -1628,6 +1686,11 @@ def _inspect_unit_scope(
         closure_strictness=unit.get("closure_strictness"),
         strict_with_suppression=unit.get("strict_with_suppression"),
     )
+    extra_non_sup = frozenset(
+        normalize_non_suppressing_ctx_managers(
+            unit.get("non_suppressing_ctx_managers")
+        )
+    )
     empty_res: Dict[str, Any] = {
         "inputs": [],
         "outputs": [],
@@ -1665,8 +1728,10 @@ def _inspect_unit_scope(
         "type_param_free_vars": [],
         "has_class_scoped_type_params": False,
         "deleted_names": [],
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
         "skip_pre_unit_closures": skip_pre_unit_closures_flag,
         "strict_with_suppression": strict_with_flag,
+        "non_suppressing_ctx_managers": sorted(extra_non_sup),
     }
     if stale_source_code_mismatch:
         return {
@@ -1679,12 +1744,22 @@ def _inspect_unit_scope(
         if (
             bool(unit.get("is_subroutine"))
             or unit_kind_str in _SUBROUTINE_KINDS
-            or unit_kind_str in ("closure", "comprehension", "complex_expr")
+            or unit_kind_str
+            in (
+                "subroutine",
+                "basic_block",
+                "linear_block",
+                "stmt_seq",
+                "statement",
+                "closure",
+                "comprehension",
+                "complex_expr",
+            )
         ):
             return {
                 **empty_res,
                 "control_flow_hazards": ["severed_closure_cell"],
-                "closure_hazard_reasons": ["unresolved_span_bounds"],
+                "closure_hazard_reasons": ["unavailable_source_placeholder"],
                 "is_control_flow_safe": False,
             }
     if not dedented.strip():
@@ -1996,11 +2071,6 @@ def _inspect_unit_scope(
             initial_sup_prov = initial_sup_prov.with_shadowed_builtins(
                 ("open",)
             )
-        extra_non_sup = frozenset(
-            str(n)
-            for n in (unit.get("non_suppressing_ctx_managers") or ())
-            if isinstance(n, str) and n
-        )
         def_assigned, cond_assigned = _analyze_block_assignment(
             candidate_stmts,
             may_deleted=may_deleted,
@@ -2085,6 +2155,7 @@ def _inspect_unit_scope(
                                 u_end_col=u_end_col,
                                 mod_tree=mod_tree,
                                 strict_with_suppression=strict_with_flag,
+                                extra_non_suppressing_ctx_managers=extra_non_sup,
                             )
                         )
                         for v in cond_escaping_cands:
@@ -2339,6 +2410,7 @@ def _inspect_unit_scope(
                             is_async=visitor.is_async,
                             skip_pre_unit_closures=skip_pre_unit_closures_flag,
                             strict_with_suppression=strict_with_flag,
+                            extra_non_suppressing_ctx_managers=extra_non_sup,
                             definite_stores=def_assigned,
                             cols_resolved=cols_resolved,
                             enclosing_chain=enclosing_chain,
@@ -2466,8 +2538,10 @@ def _inspect_unit_scope(
             "type_param_free_vars": list(visitor.type_param_free_vars),
             "has_class_scoped_type_params": has_class_scoped_type_params,
             "deleted_names": sorted(may_deleted),
+            "scope_schema_version": SCOPE_SCHEMA_VERSION,
             "skip_pre_unit_closures": skip_pre_unit_closures_flag,
             "strict_with_suppression": strict_with_flag,
+            "non_suppressing_ctx_managers": sorted(extra_non_sup),
         }
     except (RecursionError, MemoryError):
         return {
@@ -2484,14 +2558,23 @@ def inspect_single_unit_scope(
     *,
     skip_pre_unit_closures: Optional[bool] = None,
     strict_with_suppression: Optional[bool] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping for an individual code unit."""
-    if skip_pre_unit_closures is not None or strict_with_suppression is not None:
+    if (
+        skip_pre_unit_closures is not None
+        or strict_with_suppression is not None
+        or non_suppressing_ctx_managers is not None
+    ):
         unit = dict(unit)
         if skip_pre_unit_closures is not None:
             unit["skip_pre_unit_closures"] = bool(skip_pre_unit_closures)
         if strict_with_suppression is not None:
             unit["strict_with_suppression"] = bool(strict_with_suppression)
+        if non_suppressing_ctx_managers is not None:
+            unit["non_suppressing_ctx_managers"] = normalize_non_suppressing_ctx_managers(
+                non_suppressing_ctx_managers
+            )
     return _inspect_unit_scope(unit, repo_root=repo_root, file_tree=tree)
 
 
@@ -2548,19 +2631,20 @@ def scope_matches_closure_mode(
     *,
     expected_strict_with: Optional[bool] = None,
     strict_with_suppression: Optional[bool] = None,
+    expected_non_suppressing: Optional[Sequence[str]] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> bool:
-    """Checks whether a precomputed scope dictionary is compatible with expected_skip.
+    """Checks whether a precomputed scope dictionary matches the current schema and mode.
 
-    Unmarked caller-supplied or serialized scopes (lacking the
-    ``skip_pre_unit_closures`` key) are treated as matching the default strict
-    mode (``expected_skip=False``, ``strict_with_suppression=False``) so
-    precomputed scopes are preserved without forced recomputation. When a
-    non-default mode (such as lenient ``expected_skip=True`` or pedantic
-    ``strict_with_suppression=True``) is requested, unmarked scopes return
-    ``False`` so ``ensure_unit_scope_closure_mode`` can recompute if source is
-    available.
+    Requires ``scope_schema_version == SCOPE_SCHEMA_VERSION`` and an explicit boolean
+    ``skip_pre_unit_closures`` matching ``expected_skip`` so unmarked or legacy
+    serialized scopes are never trusted without recomputation.
     """
     if scope is None:
+        return False
+    if scope.get("scope_schema_version") != SCOPE_SCHEMA_VERSION:
+        return False
+    if "skip_pre_unit_closures" not in scope:
         return False
     eff_expected_with = (
         strict_with_suppression
@@ -2579,6 +2663,21 @@ def scope_matches_closure_mode(
                 return False
         elif bool(expected_val) is not False:
             return False
+    eff_expected_non_sup = (
+        non_suppressing_ctx_managers
+        if non_suppressing_ctx_managers is not None
+        else expected_non_suppressing
+    )
+    scope_non_sup = frozenset(
+        normalize_non_suppressing_ctx_managers(
+            scope.get("non_suppressing_ctx_managers")
+        )
+    )
+    target_non_sup = frozenset(
+        normalize_non_suppressing_ctx_managers(eff_expected_non_sup)
+    )
+    if scope_non_sup != target_non_sup:
+        return False
     return True
 
 
@@ -2588,18 +2687,16 @@ def ensure_unit_scope_closure_mode(
     skip_pre_unit_closures: bool,
     *,
     strict_with_suppression: Optional[bool] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
     source_text: Optional[str] = None,
     tree: Optional[ast.AST] = None,
     repo_root: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Returns scope if its closure strictness mode matches, else recomputes it.
+    """Returns scope if its schema version and closure mode match, else recomputes it.
 
-    Unmarked caller-supplied precomputed scopes (without ``skip_pre_unit_closures``)
-    are preserved in default strict mode, or when no unit source is loadable.
-    Marked scopes whose ``skip_pre_unit_closures`` or ``strict_with_suppression``
-    flag differs from the requested mode are recomputed when unit source or AST
-    is available, or fail closed if upgrading an explicitly marked scope to a
-    stricter mode without source.
+    Unmarked or legacy scopes (missing ``scope_schema_version == SCOPE_SCHEMA_VERSION``)
+    and scopes whose mode flags differ from the requested configuration are recomputed
+    when unit source or AST is available, and fail closed when source is unavailable.
     """
     eff_strict_with = (
         bool(strict_with_suppression)
@@ -2609,47 +2706,61 @@ def ensure_unit_scope_closure_mode(
             strict_with_suppression=unit.get("strict_with_suppression"),
         )
     )
+    eff_non_sup = normalize_non_suppressing_ctx_managers(
+        non_suppressing_ctx_managers
+        if non_suppressing_ctx_managers is not None
+        else unit.get("non_suppressing_ctx_managers")
+    )
     if scope is not None and (
         scope_matches_closure_mode(
             scope,
             bool(skip_pre_unit_closures),
             expected_strict_with=eff_strict_with,
+            expected_non_suppressing=eff_non_sup,
         )
         or "pathological_ast" in scope.get("control_flow_hazards", ())
     ):
         return scope
-    u_copy = dict(unit)
-    u_copy["skip_pre_unit_closures"] = bool(skip_pre_unit_closures)
-    u_copy["strict_with_suppression"] = eff_strict_with
-    if source_text is not None and (
-        not isinstance(u_copy.get("source_text"), str)
-        or not u_copy["source_text"].strip()
-    ):
+    u_copy = {
+        **unit,
+        "skip_pre_unit_closures": bool(skip_pre_unit_closures),
+        "strict_with_suppression": eff_strict_with,
+    }
+    if eff_non_sup or "non_suppressing_ctx_managers" in u_copy:
+        u_copy["non_suppressing_ctx_managers"] = list(eff_non_sup)
+    if source_text is not None and not str(u_copy.get("source_text") or "").strip():
         u_copy["source_text"] = source_text
+    src_text_val = u_copy.get("source_text")
+    src_code_val = u_copy.get("source_code")
+    src_lines_val = u_copy.get("source_lines")
     has_unit_source = (
         tree is not None
         or bool(_load_unit_file_text(u_copy, repo_root=repo_root))
+        or (isinstance(src_text_val, str) and bool(src_text_val.strip()))
+        or (isinstance(src_code_val, str) and bool(src_code_val.strip()))
         or (
-            isinstance(u_copy.get("source_code"), str)
-            and bool(u_copy["source_text" if "source_text" in u_copy else "source_code"].strip())
+            isinstance(src_lines_val, (list, tuple))
+            and any(
+                isinstance(ln, str) and bool(ln.strip()) for ln in src_lines_val
+            )
         )
-        or isinstance(u_copy.get("source_lines"), (list, tuple))
     )
     if scope is not None and not has_unit_source:
-        if (
-            "skip_pre_unit_closures" not in scope
-            and "strict_with_suppression" not in scope
-        ):
-            return scope
         hazards = list(scope.get("control_flow_hazards", ()))
         if "severed_closure_cell" not in hazards:
             hazards.append("severed_closure_cell")
+        reasons = list(scope.get("closure_hazard_reasons", ()))
+        if "unavailable_source_for_closure_mode" not in reasons:
+            reasons.append("unavailable_source_for_closure_mode")
         return {
             **scope,
             "control_flow_hazards": hazards,
+            "closure_hazard_reasons": reasons,
             "is_control_flow_safe": False,
+            "scope_schema_version": SCOPE_SCHEMA_VERSION,
             "skip_pre_unit_closures": bool(skip_pre_unit_closures),
             "strict_with_suppression": eff_strict_with,
+            "non_suppressing_ctx_managers": list(eff_non_sup),
         }
     fresh_scope = inspect_single_unit_scope(
         u_copy, repo_root=repo_root, tree=tree
@@ -2665,8 +2776,10 @@ def ensure_unit_scope_closure_mode(
             "is_control_flow_safe": fresh_scope.get(
                 "is_control_flow_safe", True
             ),
+            "scope_schema_version": SCOPE_SCHEMA_VERSION,
             "skip_pre_unit_closures": bool(skip_pre_unit_closures),
             "strict_with_suppression": eff_strict_with,
+            "non_suppressing_ctx_managers": list(eff_non_sup),
         }
     return fresh_scope
 
@@ -2681,27 +2794,46 @@ def analyze_unit_variable_scope(
     scope2: Optional[Dict[str, Any]] = None,
     *,
     skip_pre_unit_closures: Optional[bool] = None,
+    closure_strictness: Optional[str] = None,
     strict_with_suppression: Optional[bool] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
     expected_skip1 = (
         bool(skip_pre_unit_closures)
         if skip_pre_unit_closures is not None
-        else bool(u1.get("skip_pre_unit_closures", False))
+        else resolve_closure_strictness_mode(
+            closure_strictness=(
+                closure_strictness
+                if closure_strictness is not None
+                else u1.get("closure_strictness")
+            ),
+            skip_pre_unit_closures=u1.get("skip_pre_unit_closures"),
+        )[1]
     )
     expected_strict_with1 = (
         bool(strict_with_suppression)
         if strict_with_suppression is not None
         else resolve_strict_with_suppression(
-            closure_strictness=u1.get("closure_strictness"),
+            closure_strictness=(
+                closure_strictness
+                if closure_strictness is not None
+                else u1.get("closure_strictness")
+            ),
             strict_with_suppression=u1.get("strict_with_suppression"),
         )
+    )
+    expected_non_sup1 = (
+        non_suppressing_ctx_managers
+        if non_suppressing_ctx_managers is not None
+        else u1.get("non_suppressing_ctx_managers")
     )
     info1 = ensure_unit_scope_closure_mode(
         u1,
         scope1,
         expected_skip1,
         strict_with_suppression=expected_strict_with1,
+        non_suppressing_ctx_managers=expected_non_sup1,
         repo_root=repo_root,
         tree=tree1,
     )
@@ -2709,21 +2841,38 @@ def analyze_unit_variable_scope(
         expected_skip2 = (
             bool(skip_pre_unit_closures)
             if skip_pre_unit_closures is not None
-            else bool(u2.get("skip_pre_unit_closures", False))
+            else resolve_closure_strictness_mode(
+                closure_strictness=(
+                    closure_strictness
+                    if closure_strictness is not None
+                    else u2.get("closure_strictness")
+                ),
+                skip_pre_unit_closures=u2.get("skip_pre_unit_closures"),
+            )[1]
         )
         expected_strict_with2 = (
             bool(strict_with_suppression)
             if strict_with_suppression is not None
             else resolve_strict_with_suppression(
-                closure_strictness=u2.get("closure_strictness"),
+                closure_strictness=(
+                    closure_strictness
+                    if closure_strictness is not None
+                    else u2.get("closure_strictness")
+                ),
                 strict_with_suppression=u2.get("strict_with_suppression"),
             )
+        )
+        expected_non_sup2 = (
+            non_suppressing_ctx_managers
+            if non_suppressing_ctx_managers is not None
+            else u2.get("non_suppressing_ctx_managers")
         )
         info2 = ensure_unit_scope_closure_mode(
             u2,
             scope2,
             expected_skip2,
             strict_with_suppression=expected_strict_with2,
+            non_suppressing_ctx_managers=expected_non_sup2,
             repo_root=repo_root,
             tree=tree2,
         )
@@ -2908,6 +3057,7 @@ def analyze_unit_variable_scope(
                 )
             )
         ),
+        "scope_schema_version": SCOPE_SCHEMA_VERSION,
         "skip_pre_unit_closures": bool(
             info1.get("skip_pre_unit_closures", False)
         )
@@ -2921,5 +3071,11 @@ def analyze_unit_variable_scope(
         or (
             u2 is not None
             and bool(info2.get("strict_with_suppression", False))
+        ),
+        "non_suppressing_ctx_managers": sorted(
+            set(info1.get("non_suppressing_ctx_managers", ()))
+            & set(info2.get("non_suppressing_ctx_managers", ()))
+            if u2 is not None
+            else set(info1.get("non_suppressing_ctx_managers", ()))
         ),
     }

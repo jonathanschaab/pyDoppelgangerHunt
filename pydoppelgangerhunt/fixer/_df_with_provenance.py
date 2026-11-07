@@ -51,7 +51,17 @@ from pydoppelgangerhunt.fixer._df_visitors import (
 from pydoppelgangerhunt.parser import iter_nested_scope_header_nodes
 
 _SUPPRESSING_CTX_MANAGER_NAMES: frozenset[str] = frozenset(
-    {"suppress", "raises", "assertRaises", "assertRaisesRegex", "ignored"}
+    {
+        "suppress",
+        "raises",
+        "assertRaises",
+        "assertRaisesRegex",
+        "ignored",
+        "subTest",
+        "ExitStack",
+        "AsyncExitStack",
+        "enter_context",
+    }
 )
 
 _NON_SUPPRESSING_CTX_MANAGER_NAMES: frozenset[str] = frozenset(
@@ -151,6 +161,9 @@ _SUSPICIOUS_SUPPRESS_SUBSTRINGS: Tuple[str, ...] = (
     "suppress",
     "raises",
     "ignore",
+    "subtest",
+    "exitstack",
+    "enter_context",
 )
 
 
@@ -428,10 +441,20 @@ def _is_proven_non_suppressing_target_expr(
         attr_name = expr.attr
         if (
             extra_non_suppressing_ctx_managers
-            and attr_name in extra_non_suppressing_ctx_managers
             and attr_name not in _SUPPRESSING_CTX_MANAGER_NAMES
         ):
-            return True
+            if attr_name in extra_non_suppressing_ctx_managers:
+                return True
+            parts: List[str] = [attr_name]
+            curr_val: ast.AST = expr.value
+            while isinstance(curr_val, ast.Attribute):
+                parts.append(curr_val.attr)
+                curr_val = curr_val.value
+            if isinstance(curr_val, ast.Name):
+                parts.append(curr_val.id)
+                dotted = ".".join(reversed(parts))
+                if dotted in extra_non_suppressing_ctx_managers:
+                    return True
         if isinstance(expr.value, ast.Name):
             base_id = expr.value.id
             if (
@@ -731,52 +754,101 @@ def _update_suppress_provenance_from_stmt(
         return prov
 
     if isinstance(stmt, (ast.If, ast.While)):
+        is_while = isinstance(stmt, ast.While)
         prov = _update_suppress_provenance_from_expr_walrus(
             (stmt.test,), prov, allow_positive=allow_pos
         )
-        return _update_suppress_provenance_from_stmts(
-            (*stmt.body, *stmt.orelse), prov, in_branch=True
+        branch_flag = True if is_while else in_branch
+        b_prov = _update_suppress_provenance_from_stmts(
+            stmt.body, prov, in_branch=branch_flag
         )
+        else_base = b_prov if is_while else prov
+        o_prov = (
+            _update_suppress_provenance_from_stmts(
+                stmt.orelse, else_base, in_branch=branch_flag
+            )
+            if stmt.orelse
+            else else_base
+        )
+        merged = b_prov.merge_branch_conservative(o_prov)
+        return prov.merge_branch_conservative(merged) if is_while else merged
 
     if isinstance(stmt, (ast.For, ast.AsyncFor)):
         prov = _update_suppress_provenance_from_expr_walrus(
-            (stmt.iter, stmt.target), prov, allow_positive=allow_pos
+            (stmt.iter,), prov, allow_positive=allow_pos
+        )
+        iter_prov = _update_suppress_provenance_from_expr_walrus(
+            (stmt.target,), prov, allow_positive=False
         )
         for t_name in _extract_store_names_in_node(stmt.target):
-            prov = prov.clear_name(t_name)
-        return _update_suppress_provenance_from_stmts(
-            (*stmt.body, *stmt.orelse), prov, in_branch=True
+            iter_prov = iter_prov.clear_name(t_name)
+        b_prov = _update_suppress_provenance_from_stmts(
+            stmt.body, iter_prov, in_branch=True
         )
+        o_base = prov.merge_branch_conservative(b_prov)
+        o_prov = (
+            _update_suppress_provenance_from_stmts(
+                stmt.orelse, o_base, in_branch=True
+            )
+            if stmt.orelse
+            else b_prov
+        )
+        return o_base.merge_branch_conservative(o_prov)
 
     if isinstance(stmt, (ast.With, ast.AsyncWith)):
+        header_prov = prov
+        item_prov = prov
         for item in stmt.items:
-            prov = _update_suppress_provenance_from_expr_walrus(
-                (item.context_expr,), prov, allow_positive=allow_pos
+            item_prov = _update_suppress_provenance_from_expr_walrus(
+                (item.context_expr,), item_prov, allow_positive=allow_pos
             )
             if item.optional_vars is not None:
                 for t_name in _extract_store_names_in_node(item.optional_vars):
-                    prov = prov.clear_name(t_name)
-        return _update_suppress_provenance_from_stmts(
-            stmt.body, prov, in_branch=True
+                    item_prov = item_prov.clear_name(t_name)
+        if _classify_with_suppression(stmt, header_prov) == "non_suppressing":
+            return _update_suppress_provenance_from_stmts(
+                stmt.body, item_prov, in_branch=in_branch
+            )
+        safe_prefix, risky_suffix = _split_suppress_with_body(stmt.body)
+        prefix_prov = _update_suppress_provenance_from_stmts(
+            safe_prefix, item_prov, in_branch=in_branch
         )
+        if not risky_suffix:
+            return prefix_prov
+        suffix_prov = _update_suppress_provenance_from_stmts(
+            risky_suffix, prefix_prov, in_branch=True
+        )
+        return prefix_prov.merge_branch_conservative(suffix_prov)
 
     if isinstance(stmt, ast.Try) or type(stmt).__name__ == "TryStar":
-        prov = _update_suppress_provenance_from_stmts(
-            (*getattr(stmt, "body", ()), *getattr(stmt, "orelse", ())),
-            prov,
-            in_branch=True,
+        try_prov = _update_suppress_provenance_from_stmts(
+            getattr(stmt, "body", ()), prov, in_branch=True
         )
+        handler_base = prov.merge_branch_conservative(try_prov)
+        o_stmts = getattr(stmt, "orelse", ())
+        normal_prov = (
+            _update_suppress_provenance_from_stmts(
+                o_stmts, try_prov, in_branch=True
+            )
+            if o_stmts
+            else try_prov
+        )
+        merged_try = normal_prov
         for h_node in getattr(stmt, "handlers", ()):
             h_name = getattr(h_node, "name", None)
-            prov = _update_clause_branch_provenance(
-                prov,
+            h_prov = _update_clause_branch_provenance(
+                handler_base,
                 getattr(h_node, "type", None),
                 (h_name,) if isinstance(h_name, str) else (),
                 getattr(h_node, "body", ()),
             )
-        return _update_suppress_provenance_from_stmts(
-            getattr(stmt, "finalbody", ()), prov, in_branch=in_branch
-        )
+            merged_try = merged_try.merge_branch_conservative(h_prov)
+        f_body = getattr(stmt, "finalbody", ())
+        if f_body:
+            return _update_suppress_provenance_from_stmts(
+                f_body, merged_try, in_branch=in_branch
+            )
+        return merged_try
 
     if type(stmt).__name__ == "Match":
         subject = getattr(stmt, "subject", None)
@@ -784,7 +856,12 @@ def _update_suppress_provenance_from_stmt(
             prov = _update_suppress_provenance_from_expr_walrus(
                 (subject,), prov, allow_positive=allow_pos
             )
-        for case in getattr(stmt, "cases", ()):
+        cases = getattr(stmt, "cases", ())
+        if not cases:
+            return prov
+        case_provs: List[_SuppressProvenance] = []
+        has_irrefutable = False
+        for case in cases:
             pattern = getattr(case, "pattern", None)
             pat_names = (
                 [
@@ -796,13 +873,22 @@ def _update_suppress_provenance_from_stmt(
                 if isinstance(pattern, ast.AST)
                 else []
             )
-            prov = _update_clause_branch_provenance(
+            c_prov = _update_clause_branch_provenance(
                 prov,
                 getattr(case, "guard", None),
                 pat_names,
                 getattr(case, "body", ()),
             )
-        return prov
+            case_provs.append(c_prov)
+            if _is_irrefutable_case(case):
+                has_irrefutable = True
+                break
+        merged_match = case_provs[0]
+        for cp in case_provs[1:]:
+            merged_match = merged_match.merge_branch_conservative(cp)
+        if not has_irrefutable:
+            merged_match = prov.merge_branch_conservative(merged_match)
+        return merged_match
 
     if not isinstance(stmt, _INNER_SCOPE_TYPES):
         child_exprs = [
@@ -890,8 +976,10 @@ def _build_module_suppress_seed(eff_mod: ast.Module) -> _ModuleSuppressSeed:
         ):
             p_stmt = prefix_provs[idx]
             for tail_stmt in body[idx + 1 :]:
-                p_stmt = _update_suppress_provenance_from_stmt(
-                    tail_stmt, p_stmt, in_branch=True
+                p_stmt = p_stmt.merge_branch_conservative(
+                    _update_suppress_provenance_from_stmt(
+                        tail_stmt, p_stmt, in_branch=True
+                    )
                 )
             by_top_id[id(m_stmt)] = p_stmt
     return _ModuleSuppressSeed(
@@ -942,8 +1030,13 @@ def _seed_scope_suppress_aliases_uncached(
                     getattr(m_stmt, "lineno", 0) or 0
                 ):
                     reached_cutoff = True
-                prov = _update_suppress_provenance_from_stmt(
+                next_p = _update_suppress_provenance_from_stmt(
                     m_stmt, prov, in_branch=reached_cutoff
+                )
+                prov = (
+                    prov.merge_branch_conservative(next_p)
+                    if reached_cutoff
+                    else next_p
                 )
 
     for enc in enclosing_nodes:
@@ -960,8 +1053,13 @@ def _seed_scope_suppress_aliases_uncached(
                 if e_stmt is fn_node:
                     reached_fn = True
                     continue
-                prov = _update_suppress_provenance_from_stmt(
+                next_e = _update_suppress_provenance_from_stmt(
                     e_stmt, prov, in_branch=reached_fn
+                )
+                prov = (
+                    prov.merge_branch_conservative(next_e)
+                    if reached_fn
+                    else next_e
                 )
 
     fn_args = getattr(fn_node, "args", None)
@@ -1098,6 +1196,14 @@ def _classify_with_item_suppression(
         expr,
         prov,
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+    ) or (
+        bool(extra_non_suppressing_ctx_managers)
+        and isinstance(expr, (ast.Name, ast.Attribute))
+        and _is_proven_non_suppressing_target_expr(
+            expr,
+            prov,
+            extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
+        )
     ):
         return "non_suppressing"
     return "unknown"
@@ -1606,7 +1712,9 @@ def _split_with_body_by_mode(
         extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
     )
     if w_mode == "suppressing":
-        return _split_suppress_with_body(stmt.body, safe_names=safe_names)
+        return _split_suppress_with_body(
+            stmt.body, safe_names=safe_names, strict_names=strict_names
+        )
     if w_mode == "unknown" and (
         strict_with_suppression
         or _with_stmt_looks_suppressing(
@@ -1672,12 +1780,12 @@ def _walrus_assignment_in_expr(
 
     if isinstance(expr, ast.IfExp):
         d_t, c_t = _walrus_assignment_in_expr(expr.test, is_conditional)
-        d_b, c_b = _walrus_assignment_in_expr(expr.body, True)
-        d_o, c_o = _walrus_assignment_in_expr(expr.orelse, True)
+        d_b, c_b = _walrus_assignment_in_expr(expr.body, False)
+        d_o, c_o = _walrus_assignment_in_expr(expr.orelse, False)
         definite.update(d_t)
-        conditional.update(c_t | d_b | c_b | (d_b & d_o) | d_o | c_o)
-        if not is_conditional:
-            definite.update(d_b & d_o)
+        both_def = (d_b & d_o) if not is_conditional else set()
+        definite.update(both_def)
+        conditional.update(c_t | ((d_b | c_b | d_o | c_o) - both_def))
         return definite, conditional - definite
 
     if isinstance(expr, ast.Compare):
@@ -1780,7 +1888,7 @@ def _block_terminates(
     ] = _EMPTY_SUPPRESS_PROVENANCE,
     loop_control_terminates: bool = False,
     safe_names: AbstractSet[str] = frozenset(),
-    strict_names: bool = False,
+    strict_names: bool = True,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
     strict_with_suppression: bool = False,
 ) -> bool:
@@ -2862,6 +2970,7 @@ def _eval_try_definite_bindings(
     suppress_aliases: Union[
         _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
+    extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
     strict_with_suppression: bool = False,
 ) -> Tuple[Set[str], bool]:
     """Computes definite bindings and termination across a Try/TryStar statement."""
@@ -2871,6 +2980,7 @@ def _eval_try_definite_bindings(
         bound,
         fn_globals,
         suppress_aliases=suppress_aliases,
+        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         strict_with_suppression=strict_with_suppression,
     )
 
@@ -2884,6 +2994,7 @@ def _eval_match_definite_bindings(
     suppress_aliases: Union[
         _SuppressProvenance, Iterable[str]
     ] = _EMPTY_SUPPRESS_PROVENANCE,
+    extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
     strict_with_suppression: bool = False,
 ) -> Tuple[Set[str], bool]:
     """Computes definite bindings and termination across a Match statement."""
@@ -2893,5 +3004,6 @@ def _eval_match_definite_bindings(
         bound,
         fn_globals,
         suppress_aliases=suppress_aliases,
+        extra_non_suppressing_ctx_managers=extra_non_suppressing_ctx_managers,
         strict_with_suppression=strict_with_suppression,
     )

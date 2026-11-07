@@ -626,27 +626,41 @@ def test_scope_preservation_carrier_shadowing_and_concurrency() -> None:
         "local_imports": [],
         "yield_expr_names": [],
     }
-    marked_hand_built = {**hand_built, "skip_pre_unit_closures": True}
+    marked_hand_built = {
+        **hand_built,
+        "skip_pre_unit_closures": True,
+        "scope_schema_version": 2,
+    }
     assert (
         ensure_unit_scope_closure_mode(
             {"start": 1, "end": 1}, marked_hand_built, True
         )
         is marked_hand_built
     )
+    marked_strict_hand_built = {
+        **hand_built,
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": 2,
+    }
     assert (
         ensure_unit_scope_closure_mode(
-            {"start": 1, "end": 1}, hand_built, False
+            {"start": 1, "end": 1}, marked_strict_hand_built, False
         )
-        is hand_built
+        is marked_strict_hand_built
     )
     unmarked_fallback = ensure_unit_scope_closure_mode(
         {"start": 1, "end": 1}, hand_built, True
     )
-    assert unmarked_fallback is hand_built
-    assert unmarked_fallback["is_control_flow_safe"] is True
+    assert unmarked_fallback["is_control_flow_safe"] is False
+    assert "severed_closure_cell" in unmarked_fallback["control_flow_hazards"]
+    assert (
+        "unavailable_source_for_closure_mode"
+        in unmarked_fallback["closure_hazard_reasons"]
+    )
     pathological_scope: dict[str, Any] = {
         **hand_built,
         "skip_pre_unit_closures": False,
+        "scope_schema_version": 2,
         "control_flow_hazards": ["pathological_ast"],
         "is_control_flow_safe": False,
     }
@@ -929,11 +943,17 @@ def test_unmarked_scope_recomputation_slice_truncation_and_scope_modes(
     unmarked_strict2 = dict(strict_sc2)
     unmarked_strict1.pop("skip_pre_unit_closures", None)
     unmarked_strict2.pop("skip_pre_unit_closures", None)
-    assert scope_matches_closure_mode(unmarked_strict1, False) is True
+    assert scope_matches_closure_mode(unmarked_strict1, False) is False
     assert scope_matches_closure_mode(unmarked_strict1, True) is False
     assert (
         scope_matches_closure_mode(
-            unmarked_strict1, False, strict_with_suppression=True
+            {**strict_sc1, "scope_schema_version": 1}, False
+        )
+        is False
+    )
+    assert (
+        scope_matches_closure_mode(
+            strict_sc1, False, strict_with_suppression=True
         )
         is False
     )
@@ -1721,12 +1741,22 @@ def test_intra_unit_global_escapes_detached_shadowing_and_suspended_local_closur
         "source_code": "for x in items:\n    y = x + 1\n",
     }
     minimal_unmarked_scope = {"inputs": ["items"], "outputs": ["y"]}
+    marked_v2_min = {
+        **minimal_unmarked_scope,
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": 2,
+    }
     assert (
         ensure_unit_scope_closure_mode(
-            min_unit, minimal_unmarked_scope, False, tree=min_tree
+            min_unit, marked_v2_min, False, tree=min_tree
         )
-        is minimal_unmarked_scope
+        is marked_v2_min
     )
+    recomputed_unmarked_min = ensure_unit_scope_closure_mode(
+        min_unit, minimal_unmarked_scope, False, tree=min_tree
+    )
+    assert recomputed_unmarked_min["scope_schema_version"] == 2
+    assert "severed_closure_cell" in recomputed_unmarked_min["control_flow_hazards"]
     recomputed_min = ensure_unit_scope_closure_mode(
         min_unit,
         {**minimal_unmarked_scope, "skip_pre_unit_closures": True},
@@ -2341,13 +2371,22 @@ def test_ensure_unit_scope_closure_mode_all_six_cases() -> None:
     assert res_2["skip_pre_unit_closures"] is False
     assert "severed_closure_cell" in res_2["control_flow_hazards"]
 
-    # 3. Unmarked scope is preserved in default strict mode and recomputes in lenient mode when source exists
+    # 3. Unmarked or legacy scope is recomputed in both strict and lenient mode when source exists
     unmarked = {
         k: v
         for k, v in strict_scope.items()
-        if k not in ("skip_pre_unit_closures", "strict_with_suppression")
+        if k
+        not in (
+            "skip_pre_unit_closures",
+            "strict_with_suppression",
+            "scope_schema_version",
+        )
     }
-    assert ensure_unit_scope_closure_mode(base_unit, unmarked, False) is unmarked
+    res_3_strict = ensure_unit_scope_closure_mode(base_unit, unmarked, False)
+    assert res_3_strict is not unmarked
+    assert res_3_strict["scope_schema_version"] == 2
+    assert res_3_strict["skip_pre_unit_closures"] is False
+    assert "severed_closure_cell" in res_3_strict["control_flow_hazards"]
     res_3 = ensure_unit_scope_closure_mode(base_unit, unmarked, True)
     assert res_3["skip_pre_unit_closures"] is True
     assert "severed_closure_cell" not in res_3["control_flow_hazards"]
@@ -2367,7 +2406,7 @@ def test_ensure_unit_scope_closure_mode_all_six_cases() -> None:
         is pathological_scope
     )
 
-    # 5. Missing source file with unmarked precomputed scope and no source_text -> preserves caller-supplied scope
+    # 5. Missing source file with unmarked or mismatched scope and no source_text fails closed
     no_src_unit = {
         "file": "nonexistent_on_disk_98765.py",
         "start": 3,
@@ -2375,8 +2414,24 @@ def test_ensure_unit_scope_closure_mode_all_six_cases() -> None:
         "kind": "compound_block",
     }
     res_5 = ensure_unit_scope_closure_mode(no_src_unit, unmarked, False)
-    assert res_5 is unmarked
-    assert ensure_unit_scope_closure_mode(no_src_unit, unmarked, True) is unmarked
+    assert res_5["is_control_flow_safe"] is False
+    assert "severed_closure_cell" in res_5["control_flow_hazards"]
+    assert (
+        "unavailable_source_for_closure_mode"
+        in res_5["closure_hazard_reasons"]
+    )
+    res_5_lenient_unmarked = ensure_unit_scope_closure_mode(
+        no_src_unit, unmarked, True
+    )
+    assert res_5_lenient_unmarked["is_control_flow_safe"] is False
+    assert (
+        ensure_unit_scope_closure_mode(no_src_unit, strict_scope, False)
+        is strict_scope
+    )
+    assert (
+        ensure_unit_scope_closure_mode(no_src_unit, lenient_scope, True)
+        is lenient_scope
+    )
     res_5_strict_from_lenient = ensure_unit_scope_closure_mode(
         no_src_unit, lenient_scope, False
     )
@@ -2386,7 +2441,7 @@ def test_ensure_unit_scope_closure_mode_all_six_cases() -> None:
         in res_5_strict_from_lenient["control_flow_hazards"]
     )
 
-    # 6. Valid source_text supplied alongside a missing file (even if unit has source_text: None or source_lines: [])
+    # 6. Valid source_text supplied alongside a missing file (and source_text: None + source_code fallback without AttributeError)
     unit_with_none_src = {
         "file": "nonexistent_on_disk_98765.py",
         "start": 3,
@@ -2395,6 +2450,25 @@ def test_ensure_unit_scope_closure_mode_all_six_cases() -> None:
         "source_text": None,
         "source_lines": [],
     }
+    res_6_no_src_arg = ensure_unit_scope_closure_mode(
+        {
+            **unit_with_none_src,
+            "source_code": "for x in items:\n    acc = x + 1\n",
+        },
+        lenient_scope,
+        False,
+    )
+    assert res_6_no_src_arg["skip_pre_unit_closures"] is False
+    res_6_empty_lines_fail_closed = ensure_unit_scope_closure_mode(
+        unit_with_none_src,
+        lenient_scope,
+        False,
+    )
+    assert res_6_empty_lines_fail_closed["is_control_flow_safe"] is False
+    assert (
+        "unavailable_source_for_closure_mode"
+        in res_6_empty_lines_fail_closed["closure_hazard_reasons"]
+    )
     res_6 = ensure_unit_scope_closure_mode(
         unit_with_none_src,
         lenient_scope,

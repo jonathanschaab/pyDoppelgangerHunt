@@ -24,7 +24,7 @@ from typing import (
 )
 
 from pydoppelgangerhunt.config import clear_closure_warning_cache
-from pydoppelgangerhunt.source_lines import parse_unit_coord
+from pydoppelgangerhunt.source_lines import parse_unit_coord, split_source_lines
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,6 @@ _MAX_SCOPE_CACHE_SIZE: int = 2048
 _MAX_PARSED_TREE_CACHE_SIZE: int = 128
 _SCOPE_CACHE_KIND_CAPS: Dict[str, int] = {
     "span_line_index": 128,
-    "detached_dump_index": 128,
     "fn_scope_ctx": 512,
     "stmt_deltas": 512,
     "enclosing_fn_cells": 512,
@@ -344,6 +343,8 @@ def _extract_value_ast_nodes(value: Any) -> Tuple[ast.AST, ...]:
 
 _scope_owner_keys_index: Dict[ast.AST, Set[Any]] = {}
 _scope_key_nodes_index: Dict[Any, Set[ast.AST]] = {}
+_node_to_parent_map_roots: Dict[ast.AST, Set[ast.AST]] = {}
+_parent_map_root_nodes: Dict[ast.AST, Set[ast.AST]] = {}
 
 
 def _index_entry_ast_nodes(
@@ -376,18 +377,52 @@ def _prune_reverse_index_buckets(
                 reverse_index.pop(node, None)
 
 
+def _store_parent_map_locked(
+    root_node: ast.AST, parent_map: Dict[ast.AST, ast.AST]
+) -> Dict[ast.AST, ast.AST]:
+    """Stores parent_map in _scope_parent_maps with LRU cap and reverse node-to-root indexing."""
+    if root_node in _scope_parent_maps:
+        _scope_parent_maps.move_to_end(root_node)
+        return _scope_parent_maps[root_node]
+    while len(_scope_parent_maps) >= _MAX_SCOPE_CACHE_SIZE and _scope_parent_maps:
+        evicted_root, _ = _scope_parent_maps.popitem(last=False)
+        _prune_reverse_index_buckets(
+            evicted_root, _parent_map_root_nodes, _node_to_parent_map_roots
+        )
+    _scope_parent_maps[root_node] = parent_map
+    _scope_parent_maps.move_to_end(root_node)
+    _index_entry_ast_nodes(
+        root_node,
+        (root_node, *parent_map.keys()),
+        _parent_map_root_nodes,
+        _node_to_parent_map_roots,
+    )
+    return parent_map
+
+
+def _pop_parent_map_locked(root_node: ast.AST) -> None:
+    """Removes root_node from _scope_parent_maps and prunes its reverse node-to-root index entries."""
+    if root_node in _scope_parent_maps:
+        _scope_parent_maps.pop(root_node, None)
+    _prune_reverse_index_buckets(
+        root_node, _parent_map_root_nodes, _node_to_parent_map_roots
+    )
+
+
 def _ensure_scope_owner_parent_map_locked(owner: ast.AST) -> None:
-    """Ensures a scope root has a parent map recorded so detached child eviction can walk ancestors."""
-    if not isinstance(owner, _SCOPE_ROOT_TYPES) or owner in _scope_parent_maps:
-        return
-    if any(owner in pmap for pmap in _scope_parent_maps.values()):
+    """Ensures a scope root has a parent map recorded in O(1) if already indexed, else builds and caches it."""
+    if (
+        not isinstance(owner, _SCOPE_ROOT_TYPES)
+        or owner in _scope_parent_maps
+        or owner in _node_to_parent_map_roots
+    ):
         return
     parent_map: Dict[ast.AST, ast.AST] = {}
     for parent in ast.walk(owner):
         for child in ast.iter_child_nodes(parent):
             if not isinstance(child, _SINGLETON_AST_TYPES):
                 parent_map[child] = parent
-    _scope_parent_maps[owner] = parent_map
+    _store_parent_map_locked(owner, parent_map)
 
 
 def _register_key_ast_nodes(key: Any, nodes: Sequence[ast.AST]) -> None:
@@ -631,9 +666,9 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
     """Purges scope-cache entries belonging to an evicted AST tree or detached subtree.
 
     Note:
-        Uses ``_scope_parent_maps`` to walk ancestor scopes from detached subtrees
-        and ``_scope_owner_keys_index`` to locate affected cache keys directly from
-        ``tree_nodes`` and ancestor owners without scanning unrelated cache entries.
+        Uses ``_node_to_parent_map_roots`` and ``_scope_parent_maps`` to locate owning
+        trees and walk ancestor scopes in O(|tree_nodes|), and ``_scope_owner_keys_index``
+        to evict affected cache keys without flushing unrelated sibling scopes.
     """
     if tree is None or not isinstance(tree, ast.AST):
         return
@@ -645,7 +680,18 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
     }
     scope_nodes.add(tree)
     with _downstream_cache_lock:
-        for root_node, pmap in list(_scope_parent_maps.items()):
+        candidate_roots: Set[ast.AST] = set()
+        if tree in _scope_parent_maps:
+            candidate_roots.add(tree)
+        for n in list(tree_nodes):
+            roots = _node_to_parent_map_roots.get(n)
+            if roots:
+                candidate_roots.update(roots)
+        keys_to_remove: Set[Any] = set()
+        for root_node in candidate_roots:
+            pmap = _scope_parent_maps.get(root_node)
+            if pmap is None:
+                continue
             matched_child: Optional[ast.AST] = None
             if tree in pmap:
                 matched_child = tree
@@ -656,15 +702,32 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
                     if n in pmap:
                         matched_child = n
                         break
-            if matched_child is not None:
-                scope_nodes.add(root_node)
-                tree_nodes.add(root_node)
-                curr_anc: Optional[ast.AST] = pmap.get(matched_child)
-                while curr_anc is not None:
+            if matched_child is None:
+                continue
+            scope_nodes.add(root_node)
+            has_inner_scope_anc = isinstance(
+                matched_child,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+            )
+            curr_anc: Optional[ast.AST] = pmap.get(matched_child)
+            while curr_anc is not None:
+                if curr_anc is not root_node or not isinstance(
+                    root_node, ast.Module
+                ):
                     tree_nodes.add(curr_anc)
-                    if isinstance(curr_anc, _SCOPE_ROOT_TYPES):
-                        scope_nodes.add(curr_anc)
-                    curr_anc = pmap.get(curr_anc)
+                if isinstance(curr_anc, _SCOPE_ROOT_TYPES):
+                    scope_nodes.add(curr_anc)
+                    if curr_anc is not root_node:
+                        has_inner_scope_anc = True
+                curr_anc = pmap.get(curr_anc)
+            if not has_inner_scope_anc:
+                tree_nodes.add(root_node)
+            else:
+                for rk in _scope_owner_keys_index.get(root_node, ()):
+                    if rk is root_node or (
+                        isinstance(rk, _ScopeCacheKey) and rk.owner is root_node
+                    ):
+                        keys_to_remove.add(rk)
         for stmt_cache in (_scope_stmts_by_start, _scope_stmts_by_end):
             for s_owner, line_map in list(stmt_cache.items()):
                 if s_owner in scope_nodes:
@@ -675,7 +738,6 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
                 ):
                     scope_nodes.add(s_owner)
                     tree_nodes.add(s_owner)
-        keys_to_remove: Set[Any] = set()
         for node in tree_nodes:
             node_keys = _scope_owner_keys_index.get(node)
             if node_keys:
@@ -690,7 +752,7 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
         for node in tree_nodes:
             _scope_owner_keys_index.pop(node, None)
         for node in scope_nodes:
-            _scope_parent_maps.pop(node, None)
+            _pop_parent_map_locked(node)
             _scope_stmts_by_end.pop(node, None)
             _scope_stmts_by_start.pop(node, None)
             _scope_loops_cache.pop(node, None)
@@ -706,6 +768,12 @@ def _store_lru_cache_entry(
     """Stores key-value pair in an OrderedDict LRU cache with per-kind caps and eviction outside lock."""
     evicted_trees: List[ast.AST] = []
     with _downstream_cache_lock:
+        if (
+            cache is _scope_parent_maps
+            and isinstance(key, ast.AST)
+            and isinstance(value, dict)
+        ):
+            return cast(_CacheValT, _store_parent_map_locked(key, value))
         if key in cache:
             cache.move_to_end(key)
             return cache[key]
@@ -755,6 +823,11 @@ def _get_or_compute_scope_cached(
     )
 
 
+def _split_source_lines_stripped(source_text: str) -> Tuple[str, ...]:
+    """Splits source_text on LF/CRLF boundaries only (matching AST lineno) and strips line endings."""
+    return tuple(ln.rstrip("\r\n") for ln in split_source_lines(source_text))
+
+
 def _get_or_parse_tree(
     source_text: str,
     source_digest: Optional[str] = None,
@@ -778,7 +851,7 @@ def _get_or_parse_tree(
     try:
         parsed = ast.parse(source_text)
         setattr(parsed, "_immutable_cached", True)
-        setattr(parsed, "_source_lines", tuple(source_text.splitlines()))
+        setattr(parsed, "_source_lines", _split_source_lines_stripped(source_text))
     except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
         parsed = None
 
@@ -796,7 +869,7 @@ def _parse_source_tree(
     """Parses Python source code into an AST tree if not already provided."""
     if tree is not None:
         if source_text and getattr(tree, "_source_lines", None) is None:
-            setattr(tree, "_source_lines", tuple(source_text.splitlines()))
+            setattr(tree, "_source_lines", _split_source_lines_stripped(source_text))
         return tree
     return _get_or_parse_tree(source_text, source_digest=source_digest)
 
@@ -858,7 +931,9 @@ def _get_scope_parent_map(
 
     if not use_cache:
         return _compute()
-    return _get_or_compute_scope_cached(_scope_parent_maps, scope_node, _compute)
+    return _get_or_compute_scope_cached(
+        _scope_parent_maps, scope_node, _compute
+    )
 
 
 def _index_scope_stmts(
@@ -1022,6 +1097,8 @@ def clear_dataflow_cache() -> None:
         _downstream_reads_cache.clear()
         _parsed_tree_cache.clear()
         _scope_parent_maps.clear()
+        _node_to_parent_map_roots.clear()
+        _parent_map_root_nodes.clear()
         _scope_stmts_by_end.clear()
         _scope_stmts_by_start.clear()
         _scope_closures_cache.clear()

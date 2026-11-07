@@ -259,12 +259,17 @@ escaping callbacks across lexical scopes.
   custom analysis pipelines invoking `collect_downstream_read_names` directly) should call
   `clear_dataflow_cache()` periodically between scan runs or batch boundaries to release
   memoized AST trees and parent node maps.
-- **Precision vs. Soundness Trade-off**: Pre-unit closure scanning can be configured via
-  `--closure-strictness {strict,lenient,fail_closed,fast,skip}` (or `--skip-pre-unit-closures`, or setting
-  `closure_strictness = "strict"|"lenient"` in `pyproject.toml`):
-  - `strict` (alias: `fail_closed`, default): Conservative defense mode that treats
-    pre-unit closures capturing candidate outputs as live escaping callbacks, guarding against
-    callbacks registered in event loops or tables.
+- **Precision vs. Soundness Trade-off**: Pre-unit closure and context-manager exception-suppression
+  analysis can be configured via `--closure-strictness {strict,pedantic,lenient,fail_closed,strict_with,fast,skip}`
+  (or `--skip-pre-unit-closures`, or setting `closure_strictness = "strict"|"pedantic"|"lenient"` and
+  `non_suppressing_ctx_managers = [...]` in `pyproject.toml`):
+  - `strict` (default): Conservative mode that treats pre-unit closures capturing candidate outputs
+    as live escaping callbacks, while treating unknown `with` context managers as non-suppressing
+    unless their name matches known suppression idioms (`suppress`, `raises`, `ignore`, `subTest`,
+    `ExitStack`, `enter_context`) or is proven exception-suppressing via local/class/function provenance.
+  - `pedantic` (aliases: `fail_closed`, `strict_with`): Fully fail-closed mode that additionally treats
+    all unproven unknown `with` context managers as potentially exception-suppressing unless explicitly
+    listed via `--non-suppressing-ctx-managers` or `non_suppressing_ctx_managers`.
   - `lenient` (aliases: `fast`, `skip`): Precision-oriented mode that skips pre-unit closure
     scanning, reducing false-positive pair rejections in codebases where pre-unit closures never
     escape, at the cost of potential callback capture hazards for escaping closures.
@@ -367,7 +372,8 @@ pydoppelgangerhunt --init
 | `--cross-file-strategy` | `auto\|shared_module\|host_module\|skip` | Cross-module deduplication strategy (`auto`, `shared_module`, `host_module`, or `skip`; default: `auto`) |
 | `--shared-module-name` | `FILENAME` | Target filename for shared utility extractions (default: `_common.py`) |
 | `--skip-pre-unit-closures` | Flag | Skip pre-unit closure scan during subroutine extraction |
-| `--closure-strictness` | `strict\|lenient\|fail_closed\|fast\|skip` | Closure strictness mode (`strict` / `fail_closed` [soundness] or `lenient` / `fast` / `skip` [fewer rejections]; default: `strict`) |
+| `--closure-strictness` | `strict\|pedantic\|lenient\|fail_closed\|strict_with\|fast\|skip` | Closure strictness mode (`strict` [heuristic `with`-suppression, default], `pedantic` / `fail_closed` / `strict_with` [all unproven `with`-managers treated as potentially suppressing], or `lenient` / `fast` / `skip` [fewer rejections]) |
+| `--non-suppressing-ctx-managers` | `NAMES` | Context manager names or dotted paths proven not to suppress exceptions (comma-separated or repeatable) |
 | `--sort-by` | `similarity\|priority\|sloc` | Sort clone hits (default: `similarity`) |
 | `--priority` | Flag | Sort clones by Priority score: $\text{Sim} \times \text{SLOC} \times \text{Complexity}$ |
 | `--top` | `INT` | Truncate report to top $N$ clone pairs |
