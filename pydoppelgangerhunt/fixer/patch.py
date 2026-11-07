@@ -13,7 +13,12 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, TypedDict, Union
 
-from pydoppelgangerhunt.config import normalize_path_string, resolve_closure_strictness_mode
+from pydoppelgangerhunt.config import (
+    normalize_non_suppressing_ctx_managers,
+    normalize_path_string,
+    resolve_closure_strictness_mode,
+    resolve_strict_with_suppression,
+)
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
     _extract_child_indentation,
@@ -80,7 +85,9 @@ from pydoppelgangerhunt.fixer.source import (
     resolve_unit_replacement,
     split_source_lines,
 )
-from pydoppelgangerhunt.reporters import extract_unit_source_code
+from pydoppelgangerhunt.reporters import (
+    extract_unit_source_lines_with_state,
+)
 from pydoppelgangerhunt.source_lines import (
     normalize_unit_coordinates,
     resolve_unit_line_bounds,
@@ -3174,6 +3181,7 @@ def _generate_refactoring_patch_impl(
     depgraph: Optional[ModuleDependencyGraph] = None,
     skip_pre_unit_closures: bool = False,
     closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> str:
     """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
     if not clones:
@@ -3204,6 +3212,9 @@ def _generate_refactoring_patch_impl(
     _, effective_skip_closures = resolve_closure_strictness_mode(
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
+    )
+    eff_non_sup = normalize_non_suppressing_ctx_managers(
+        non_suppressing_ctx_managers
     )
     if effective_skip_closures:
         logger.debug("Generating patches in lenient closure strictness mode")
@@ -3477,30 +3488,63 @@ def _generate_refactoring_patch_impl(
                     (fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static"))
                 )
 
+            u1_eff["skip_pre_unit_closures"] = bool(effective_skip_closures)
+            u2_eff["skip_pre_unit_closures"] = bool(effective_skip_closures)
+            u1_eff["strict_with_suppression"] = resolve_strict_with_suppression(
+                closure_strictness=closure_strictness,
+                strict_with_suppression=u1_eff.get("strict_with_suppression"),
+            )
+            u2_eff["strict_with_suppression"] = resolve_strict_with_suppression(
+                closure_strictness=closure_strictness,
+                strict_with_suppression=u2_eff.get("strict_with_suppression"),
+            )
+            if eff_non_sup:
+                u1_eff["non_suppressing_ctx_managers"] = list(
+                    normalize_non_suppressing_ctx_managers(
+                        list(eff_non_sup)
+                        + list(
+                            normalize_non_suppressing_ctx_managers(
+                                u1_eff.get("non_suppressing_ctx_managers")
+                            )
+                        )
+                    )
+                )
+                u2_eff["non_suppressing_ctx_managers"] = list(
+                    normalize_non_suppressing_ctx_managers(
+                        list(eff_non_sup)
+                        + list(
+                            normalize_non_suppressing_ctx_managers(
+                                u2_eff.get("non_suppressing_ctx_managers")
+                            )
+                        )
+                    )
+                )
             s1 = inspect_single_unit_scope(u1_eff, repo_root=str(root), tree=tree1)
             s2 = inspect_single_unit_scope(u2_eff, repo_root=str(root), tree=tree2)
             if u1_eff.get("kind") in ("comprehension", "complex_expr") or u2_eff.get(
                 "kind"
             ) in ("comprehension", "complex_expr"):
+                raw_l1, is_sl1 = extract_unit_source_lines_with_state(
+                    u1_eff, repo_root=str(root)
+                )
+                raw_l2, is_sl2 = extract_unit_source_lines_with_state(
+                    u2_eff, repo_root=str(root)
+                )
                 stmt_lines1 = _slice_unit_token_lines(
                     u1_eff,
                     _extract_unit_body_lines(
                         u1_eff,
-                        [
-                            ln.rstrip("\r\n")
-                            for ln in extract_unit_source_code(u1_eff, repo_root=str(root))
-                        ],
+                        [ln.rstrip("\r\n") for ln in raw_l1],
                     ),
+                    is_pre_sliced=is_sl1,
                 )
                 stmt_lines2 = _slice_unit_token_lines(
                     u2_eff,
                     _extract_unit_body_lines(
                         u2_eff,
-                        [
-                            ln.rstrip("\r\n")
-                            for ln in extract_unit_source_code(u2_eff, repo_root=str(root))
-                        ],
+                        [ln.rstrip("\r\n") for ln in raw_l2],
                     ),
+                    is_pre_sliced=is_sl2,
                 )
                 if not _prune_pair_lhs_and_augassign_scopes(
                     u1_eff, u2_eff, s1, s2, stmt_lines1, stmt_lines2
@@ -3558,6 +3602,21 @@ def _generate_refactoring_patch_impl(
                 continue
             if "deleted_output" in hazards1 | hazards2:
                 skip_reasons["deleted output hazard"] += 1
+                continue
+            if "severed_closure_cell" in hazards1 | hazards2:
+                sub_reasons = list(
+                    dict.fromkeys(
+                        list(s1.get("closure_hazard_reasons", ()))
+                        + list(s2.get("closure_hazard_reasons", ()))
+                    )
+                )
+                if sub_reasons and sub_reasons != ["cell_severing"]:
+                    reason_detail = "/".join(
+                        r.replace("_", " ") for r in sub_reasons
+                    )
+                    skip_reasons[f"severed closure cell ({reason_detail})"] += 1
+                else:
+                    skip_reasons["severed closure cell"] += 1
                 continue
             if "embedded_return" in hazards1 | hazards2:
                 lines1 = u1_lines
@@ -3659,6 +3718,8 @@ def _generate_refactoring_patch_impl(
                 skip_pre_unit_closures=effective_skip_closures,
                 source_digest1=digest1,
                 source_digest2=digest2,
+                closure_strictness=closure_strictness,
+                non_suppressing_ctx_managers=eff_non_sup or None,
                 require_pairing=replace_clones,
                 return_details=True,
             )
@@ -3817,6 +3878,7 @@ def _generate_refactoring_patch_impl(
                 tree2=tree2,
                 skip_pre_unit_closures=effective_skip_closures,
                 closure_strictness=closure_strictness,
+                non_suppressing_ctx_managers=eff_non_sup or None,
                 outputs=outputs,
                 outputs2=target_outs2,
                 scope1=s1,
@@ -4394,6 +4456,7 @@ def generate_refactoring_patch(
     depgraph: Optional[ModuleDependencyGraph] = None,
     skip_pre_unit_closures: bool = False,
     closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> str:
     """Generates a git-apply compatible unified diff patch proposing shared helper extractions."""
     return _generate_refactoring_patch_impl(
@@ -4407,4 +4470,5 @@ def generate_refactoring_patch(
         depgraph=depgraph,
         skip_pre_unit_closures=skip_pre_unit_closures,
         closure_strictness=closure_strictness,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
     )

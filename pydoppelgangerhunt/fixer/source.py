@@ -8,9 +8,21 @@ import logging
 import textwrap
 import tokenize
 import warnings
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TypedDict,
+    Union,
+)
 
 from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
+from pydoppelgangerhunt.fixer._df_closures import _node_earliest_start_pos
 from pydoppelgangerhunt.source_lines import (
     count_physical_newlines,
     detect_line_ending,
@@ -27,6 +39,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ReplacementItem",
     "UnitDict",
+    "UnitSchema",
     "UnitSpan",
     "col_offset_to_char_offset",
     "compute_line_offsets",
@@ -50,6 +63,84 @@ __all__ = [
     "slice_source_by_token_range",
     "split_source_lines",
 ]
+
+
+class UnitSchema(TypedDict, total=False):
+    """Documented schema for AST unit dictionaries across parser, matcher, and fixer.
+
+    Attributes:
+        file: Relative or absolute source file path (may include ``#cell_N`` for notebooks).
+        name: Qualified or simple name of the unit (e.g., ``"ClassName.method"`` or ``"fn:block"``).
+        kind: Structural unit kind (e.g., ``"function"``, ``"method"``, ``"closure"``,
+            ``"compound_block"``, ``"sliding_window"``, ``"clause_branch"``,
+            ``"comprehension"``, ``"complex_expr"``, ``"class"``, ``"data_table"``).
+        type: Legacy alias for ``kind`` in report payloads.
+        start: 1-based inclusive start line number (or ``"line:col"`` string).
+        end: 1-based inclusive end line number (or ``"line:col"`` string).
+        start_col: 0-based UTF-8 byte start column offset on ``start`` line.
+        end_col: 0-based UTF-8 byte end column offset on ``end`` line.
+        start_col_offset: Alias for ``start_col``.
+        end_col_offset: Alias for ``end_col``.
+        is_subroutine: Explicit boolean override indicating whether the unit is an
+            extracted subroutine block rather than a whole callable/class.
+        source_code: Pre-sliced source text of the unit itself.
+        source_text: Complete in-memory source text of the containing module.
+        file_source: Fallback complete in-memory source text of the containing module.
+        source_lines: Sequence of source lines (either pre-sliced excerpt or full module).
+        source_lines_is_sliced: Explicit boolean disambiguating whether ``source_lines``
+            is already sliced to the unit's line/column boundaries (``True``) or represents
+            the full module buffer (``False``).
+        inputs: Ordered list of live-in variable names required by the unit.
+        outputs: Ordered list of live-out variable names exported by the unit.
+        precomputed_outputs: Explicit caller-supplied output variable list taking
+            precedence over ``outputs``.
+        scope: Precomputed scope analysis dictionary from ``inspect_single_unit_scope``.
+        receiver_param: Receiver parameter name (e.g., ``"self"`` or ``"cls"``).
+        receiver_kind: Receiver binding kind (``"instance"``, ``"class"``, or ``"module"``).
+        skip_pre_unit_closures: Per-unit boolean overriding ``closure_strictness``
+            (``False`` for strict/pedantic mode, ``True`` for lenient mode).
+        strict_with_suppression: Per-unit boolean enabling pedantic unknown-``with``
+            exception suppression treatment (also enabled when ``closure_strictness="pedantic"``).
+        non_suppressing_ctx_managers: Optional iterable of context manager names/paths
+            configured to be treated as non-suppressing in ``with`` statements.
+        token_count: Number of normalized AST tokens in the unit.
+        tokens: Legacy alias for ``token_count``.
+        sloc: Source lines of code count.
+        complexity: McCabe cyclomatic complexity of the unit.
+        ast_node: Optional in-memory AST node reference.
+    """
+
+    file: Optional[str]
+    name: Optional[str]
+    kind: Optional[str]
+    type: Optional[str]
+    start: Union[int, str, None]
+    end: Union[int, str, None]
+    start_col: Union[int, str, None]
+    end_col: Union[int, str, None]
+    start_col_offset: Union[int, str, None]
+    end_col_offset: Union[int, str, None]
+    is_subroutine: Optional[bool]
+    source_code: Optional[str]
+    source_text: Optional[str]
+    file_source: Optional[str]
+    source_lines: Optional[Sequence[str]]
+    source_lines_is_sliced: Optional[bool]
+    inputs: Sequence[str]
+    outputs: Sequence[str]
+    precomputed_outputs: Optional[Sequence[str]]
+    scope: Dict[str, Any]
+    receiver_param: Optional[str]
+    receiver_kind: Optional[str]
+    skip_pre_unit_closures: Optional[bool]
+    strict_with_suppression: Optional[bool]
+    non_suppressing_ctx_managers: Optional[Sequence[str]]
+    token_count: Optional[int]
+    tokens: Optional[int]
+    sloc: Optional[int]
+    complexity: Optional[int]
+    ast_node: Optional[ast.AST]
+
 
 UnitDict = Dict[str, Any]
 
@@ -445,7 +536,7 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
             if body_nodes:
                 d_lines = [ln.rstrip("\r\n") for ln in split_source_lines(dedented)]
                 first_body = body_nodes[0]
-                start_l = _node_scope_bounds(first_body)[0] - line_offset
+                start_l = _node_scope_bounds(first_body, d_lines)[0] - line_offset
                 end_l = (
                     getattr(body_nodes[-1], "end_lineno", len(d_lines) + line_offset)
                     - line_offset
@@ -454,7 +545,7 @@ def _extract_unit_body_lines(unit: Dict[str, Any], raw_lines: List[str]) -> List
                 if extracted:
                     if start_l == fn_node.lineno - line_offset:
                         b_col = getattr(first_body, "col_offset", 0)
-                        extracted[0] = extracted[0][b_col:]
+                        extracted[0] = _slice_utf8_line(extracted[0], b_col)
                     return [
                         ln.rstrip("\r\n")
                         for ln in split_source_lines(dedent_source_text("\n".join(extracted)))
@@ -550,10 +641,36 @@ def _extract_slice_col_offset(
     return default
 
 
-def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]:
+def _slice_utf8_line(
+    line: str, s_col: int, e_col: Optional[int] = None
+) -> str:
+    """Slices a single line by UTF-8 byte column offsets.
+
+    When e_col < s_col (inverted column bounds), intentionally falls back to
+    line[s_char:] rather than collapsing the line to empty.
+    """
+    s_char = col_offset_to_char_offset(line, s_col)
+    if e_col is not None and e_col >= s_col:
+        return line[s_char : col_offset_to_char_offset(line, e_col)]
+    return line[s_char:]
+
+
+def _slice_unit_token_lines(
+    unit: Dict[str, Any],
+    lines: List[str],
+    *,
+    is_pre_sliced: Optional[bool] = None,
+) -> List[str]:
     """Slices source lines to the exact start_col and end_col offsets of the unit."""
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
         return lines
+    already_sliced = (
+        is_pre_sliced
+        if is_pre_sliced is not None
+        else bool(unit.get("source_lines_is_sliced"))
+    )
+    if already_sliced:
+        return list(lines)
     s_col_opt = _extract_slice_col_offset(
         unit, ("start_col", "start_col_offset"), default=0
     )
@@ -564,12 +681,35 @@ def _slice_unit_token_lines(unit: Dict[str, Any], lines: List[str]) -> List[str]
         return lines
     s_col = s_col_opt
     res = list(lines)
+    src_code = unit.get("source_code")
+    if (
+        s_col > 0
+        and isinstance(src_code, str)
+        and src_code.strip()
+        and "".join(res).strip() == src_code.strip()
+    ):
+        return res
+    # Guard against pre-sliced token lines whose length is already shorter than
+    # the original line's starting or ending byte column offset.
+    first_byte_len = len(res[0].rstrip("\r\n").encode("utf-8"))
     if len(res) == 1:
-        res[0] = res[0][s_col:e_col] if (e_col is not None and e_col >= s_col) else res[0][s_col:]
+        if (
+            s_col > first_byte_len
+            or (e_col is not None and e_col > first_byte_len)
+            or (
+                s_col == first_byte_len
+                and (e_col is None or e_col > first_byte_len)
+            )
+        ):
+            return res
+        res[0] = _slice_utf8_line(res[0], s_col, e_col)
     else:
-        res[0] = res[0][s_col:]
+        if 0 < s_col < first_byte_len:
+            res[0] = _slice_utf8_line(res[0], s_col, None)
         if e_col is not None:
-            res[-1] = res[-1][:e_col]
+            last_byte_len = len(res[-1].rstrip("\r\n").encode("utf-8"))
+            if e_col <= last_byte_len:
+                res[-1] = _slice_utf8_line(res[-1], 0, e_col)
     return res
 
 
@@ -1435,29 +1575,27 @@ def _find_sig_colon(line: str) -> int:
     return line.rfind(":")
 
 
-def _node_scope_bounds(node: ast.AST) -> Tuple[int, int]:
+def _node_scope_bounds(
+    node: ast.AST, source_lines: Optional[Sequence[str]] = None
+) -> Tuple[int, int]:
     """Computes (earliest_start, n_end) line bounds for a scope AST node."""
     n_start = getattr(node, "lineno", 0) or 0
     n_end = getattr(node, "end_lineno", None) or n_start
-    decorators = getattr(node, "decorator_list", [])
-    dec_start = (
-        min((getattr(d, "lineno", None) or n_start) for d in decorators)
-        if decorators
-        else n_start
-    )
-    return min(dec_start, n_start), n_end
+    estart, _ = _node_earliest_start_pos(node, source_lines=source_lines)
+    return (estart if isinstance(estart, int) and estart > 0 else n_start), n_end
 
 
 def _compute_scope_intervals_sig(
     tree: ast.AST, intervals: Sequence[Tuple[int, int, int, ast.AST]]
 ) -> Tuple[Any, ...]:
     """Computes a lightweight O(K) structural signature for scope interval cache validation."""
+    src_lines = getattr(tree, "_source_lines", None)
     return (
         tuple(id(s) for s in getattr(tree, "body", ())),
         *(
             (
                 id(node),
-                _node_scope_bounds(node),
+                _node_scope_bounds(node, src_lines),
                 getattr(node, "col_offset", 0),
                 tuple(id(s) for s in getattr(node, "body", ())),
             )
@@ -1477,10 +1615,11 @@ def _get_tree_scope_intervals(
         == _compute_scope_intervals_sig(tree, cached)
     ):
         return cached
+    src_lines = getattr(tree, "_source_lines", None)
     intervals: List[Tuple[int, int, int, ast.AST]] = []
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            earliest_start, n_end = _node_scope_bounds(node)
+            earliest_start, n_end = _node_scope_bounds(node, src_lines)
             intervals.append((earliest_start, n_end, n_end - earliest_start, node))
     intervals.sort(
         key=lambda item: (item[2], -item[0], -getattr(item[3], "col_offset", 0))
@@ -1526,6 +1665,15 @@ def _find_innermost_enclosing_node(
         tree = _get_or_parse_tree(source_text)
         if tree is None:
             return None
+    elif getattr(tree, "_source_lines", None) is None and source_text:
+        try:
+            setattr(
+                tree,
+                "_source_lines",
+                tuple(ln.rstrip("\r\n") for ln in split_source_lines(source_text)),
+            )
+        except (AttributeError, TypeError):
+            pass
 
     candidates: List[Tuple[int, ast.AST, int, int]] = []
     intervals = _get_tree_scope_intervals(tree)
@@ -1539,17 +1687,10 @@ def _find_innermost_enclosing_node(
         for nt in node_types
         if isinstance(nt, type)
     ):
+        src_lines = getattr(tree, "_source_lines", None)
         for node in ast.walk(tree):
             if isinstance(node, node_types):
-                n_start = getattr(node, "lineno", 0) or 0
-                n_end = getattr(node, "end_lineno", None) or n_start
-                decorators = getattr(node, "decorator_list", [])
-                dec_start = (
-                    min((getattr(d, "lineno", None) or n_start) for d in decorators)
-                    if decorators
-                    else n_start
-                )
-                earliest_start = min(dec_start, n_start)
+                earliest_start, n_end = _node_scope_bounds(node, src_lines)
                 if earliest_start <= u_start <= u_end <= n_end:
                     candidates.append((n_end - earliest_start, node, earliest_start, n_end))
 

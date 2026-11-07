@@ -23,34 +23,46 @@ _CONFIG_KEY_NAMES: Tuple[str, ...] = (
     "exclude",
     "closure_strictness",
     "skip_pre_unit_closures",
+    "strict_with_suppression",
+    "non_suppressing_ctx_managers",
     "top",
 )
 
 
 def resolve_closure_strictness_mode(
     closure_strictness: Optional[str] = None,
-    skip_pre_unit_closures: bool = False,
+    skip_pre_unit_closures: Optional[bool] = False,
 ) -> Tuple[str, bool]:
-    """Resolves canonical closure strictness mode ('strict' or 'lenient') and boolean skip flag.
+    """Resolves canonical closure strictness mode ('strict', 'pedantic', or 'lenient') and boolean skip flag.
 
     Precision vs Soundness Trade-off:
-    'strict' (default; alias 'fail_closed') preserves soundness by inspecting escaping closures
-    and callbacks that might execute after the unit.
-    'lenient' (aliases 'fast', 'skip') reduces false-positive rejections by bypassing pre-unit
-    closure scanning, at the cost of soundness for escaping closures.
+    'strict' (default) preserves soundness by inspecting escaping closures and callbacks
+    that might execute after the unit, while treating unknown context managers as
+    non-suppressing unless their name looks like suppress/raises/ignore/subTest/ExitStack
+    or is proven suppressing.
+    'pedantic' (aliases 'fail_closed', 'strict_with') additionally treats all unproven
+    unknown context managers as potentially exception-suppressing unless explicitly listed
+    in non_suppressing_ctx_managers.
+    'lenient' (aliases 'fast', 'skip') reduces false-positive rejections by bypassing
+    pre-unit closure scanning, at the cost of soundness for escaping closures.
     """
     if closure_strictness is not None:
         c_mode = str(closure_strictness).strip().lower()
         if c_mode in ("lenient", "fast", "skip"):
             return "lenient", True
-        if c_mode in ("strict", "fail_closed"):
+        if c_mode in ("pedantic", "strict_with", "strict", "fail_closed"):
             if skip_pre_unit_closures:
                 logger.warning(
                     "Conflicting configuration: closure_strictness '%s' takes precedence over "
                     "skip_pre_unit_closures=True",
                     closure_strictness,
                 )
-            return "strict", False
+            resolved_mode = (
+                "pedantic"
+                if c_mode in ("pedantic", "strict_with", "fail_closed")
+                else "strict"
+            )
+            return resolved_mode, False
         fallback = "lenient" if skip_pre_unit_closures else "strict"
         raw_key = str(closure_strictness)
         with _warned_closure_lock:
@@ -66,6 +78,63 @@ def resolve_closure_strictness_mode(
         return fallback, bool(skip_pre_unit_closures)
     is_lenient = bool(skip_pre_unit_closures)
     return ("lenient" if is_lenient else "strict"), is_lenient
+
+
+def resolve_strict_with_suppression(
+    closure_strictness: Optional[str] = None,
+    strict_with_suppression: Optional[bool] = None,
+) -> bool:
+    """Resolves whether unproven unknown context managers are treated as potentially suppressing.
+
+    When both ``closure_strictness`` and ``strict_with_suppression`` are provided,
+    ``closure_strictness`` takes precedence and logs a warning on conflict, matching
+    ``resolve_closure_strictness_mode``.
+    """
+    if closure_strictness is not None:
+        c_mode = str(closure_strictness).strip().lower()
+        mode_strict_map = {
+            "pedantic": True,
+            "strict_with": True,
+            "fail_closed": True,
+            "strict": False,
+            "lenient": False,
+            "fast": False,
+            "skip": False,
+        }
+        if c_mode in mode_strict_map:
+            resolved_flag = mode_strict_map[c_mode]
+            if (
+                strict_with_suppression is not None
+                and bool(strict_with_suppression) != resolved_flag
+            ):
+                logger.warning(
+                    "Conflicting configuration: closure_strictness '%s' takes precedence over "
+                    "strict_with_suppression=%s",
+                    closure_strictness,
+                    bool(strict_with_suppression),
+                )
+            return resolved_flag
+    if strict_with_suppression is not None:
+        return bool(strict_with_suppression)
+    return False
+
+
+def normalize_non_suppressing_ctx_managers(*sources: Any) -> Tuple[str, ...]:
+    """Normalizes one or more context-manager name sources into a sorted tuple of names."""
+    collected: Set[str] = set()
+    stack: List[Any] = list(sources)
+    while stack:
+        item = stack.pop()
+        if item is None or isinstance(item, bool):
+            continue
+        if isinstance(item, str):
+            for part in item.split(","):
+                cleaned = part.strip()
+                if cleaned:
+                    collected.add(cleaned)
+        elif isinstance(item, (list, tuple, set, frozenset)):
+            stack.extend(item)
+    return tuple(sorted(collected))
 
 
 def clear_closure_warning_cache() -> None:

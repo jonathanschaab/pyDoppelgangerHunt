@@ -63,18 +63,14 @@ def _unit_line_bounds(unit: Dict[str, Any]) -> Tuple[int, int]:
     return resolve_unit_line_bounds(unit)
 
 
-def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:
-    """Reads raw source code lines for a given unit from provided lines or disk.
+def extract_unit_source_lines_with_state(
+    unit: Dict[str, Any], repo_root: Optional[str] = None
+) -> Tuple[List[str], bool]:
+    """Reads raw source code lines for a unit and returns ``(lines, is_pre_sliced)``.
 
-    Supports pre-sliced unit lines, full-file line lists, in-memory source_text,
-    or disk-based source reading. Callers can explicitly specify
-    'source_lines_is_sliced': True (or False) to disambiguate whether 'source_lines'
-    represents a pre-sliced excerpt or the complete file.
-
-    Note:
-        When the 'end' coordinate is omitted in the unit dictionary, it defaults
-        to end = start (a single line), consistent with resolve_unit_line_bounds,
-        rather than extending to end-of-file.
+    ``is_pre_sliced`` is True when the returned lines came from a pre-sliced
+    ``source_lines`` excerpt (or fallback placeholder) rather than slicing a
+    full-file buffer or reading from disk.
     """
     s_d, e_d = _unit_line_bounds(unit)
     n_d = str(unit.get("name") or "unit")
@@ -82,32 +78,47 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
 
     source_lines = unit.get("source_lines")
     from_source_text = False
-    if source_lines is None and unit.get("source_text") is not None:
-        source_lines = split_source_lines(str(unit["source_text"]))
+    raw_src_text = unit.get("source_text")
+    if raw_src_text is None or not str(raw_src_text).strip():
+        file_src = unit.get("file_source")
+        if file_src is not None and str(file_src).strip():
+            raw_src_text = file_src
+    if (
+        not source_lines
+        and raw_src_text is not None
+        and str(raw_src_text).strip()
+    ):
+        source_lines = split_source_lines(str(raw_src_text))
         from_source_text = True
 
     if source_lines is not None and isinstance(source_lines, (list, tuple)):
         if not source_lines:
-            return placeholder
+            return placeholder, True
         # Sliced lines fast-path:
         # If 'source_lines_is_sliced' is explicitly set, honor caller intent.
         # Otherwise, heuristic: if len(source_lines) == (e_d - s_d + 1),
         # the list is treated as already sliced to unit boundaries (unless from full source_text).
         if not from_source_text and is_sliced_unit_source_lines(unit, source_lines):
-            return [
-                ln if ln.endswith("\n") else ln + "\n"
-                for ln in source_lines
-            ]
+            return (
+                [
+                    ln if ln.endswith("\n") else ln + "\n"
+                    for ln in source_lines
+                ],
+                True,
+            )
         start = max(1, s_d)
         end = min(len(source_lines), e_d)
-        return [
-            ln if ln.endswith("\n") else ln + "\n"
-            for ln in source_lines[start - 1 : end]
-        ]
+        return (
+            [
+                ln if ln.endswith("\n") else ln + "\n"
+                for ln in source_lines[start - 1 : end]
+            ],
+            False,
+        )
 
     resolved_file = resolve_safe_unit_file_path(unit, repo_root=repo_root)
     if resolved_file is None:
-        return placeholder
+        return placeholder, True
 
     try:
         is_cell_anchor = False
@@ -141,9 +152,25 @@ def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = No
                 all_lines = fh.readlines()
         start = max(1, s_d)
         end = min(len(all_lines), e_d)
-        return all_lines[start - 1 : end]
+        return all_lines[start - 1 : end], False
     except OSError:
-        return [f"# Unable to read {str(unit.get('file') or '')}\n"]
+        return [f"# Unable to read {str(unit.get('file') or '')}\n"], True
+
+
+def extract_unit_source_code(unit: Dict[str, Any], repo_root: Optional[str] = None) -> List[str]:
+    """Reads raw source code lines for a given unit from provided lines or disk.
+
+    Supports pre-sliced unit lines, full-file line lists, in-memory source_text,
+    or disk-based source reading. Callers can explicitly specify
+    'source_lines_is_sliced': True (or False) to disambiguate whether 'source_lines'
+    represents a pre-sliced excerpt or the complete file.
+
+    Note:
+        When the 'end' coordinate is omitted in the unit dictionary, it defaults
+        to end = start (a single line), consistent with resolve_unit_line_bounds,
+        rather than extending to end-of-file.
+    """
+    return extract_unit_source_lines_with_state(unit, repo_root=repo_root)[0]
 
 
 def generate_clone_diff(

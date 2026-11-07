@@ -57,8 +57,13 @@ from pydoppelgangerhunt.fixer.patch import (
     refactor_module_units,
     validate_module_unit_replacements,
 )
+from pydoppelgangerhunt.fixer._df_closures import (
+    _is_irrefutable_case,
+    _is_irrefutable_pattern,
+)
 from pydoppelgangerhunt.fixer.scope import (
     BUILTIN_NAMES,
+    SCOPE_SCHEMA_VERSION,
     _ScopeVisitor,
     _analyze_block_assignment,
     _block_terminates,
@@ -66,8 +71,6 @@ from pydoppelgangerhunt.fixer.scope import (
     _determine_binding_kind,
     _extract_deleted_names,
     _inspect_unit_scope,
-    _is_irrefutable_case,
-    _is_irrefutable_pattern,
     _is_mangled_name,
     _normalize_receiver_attr_name,
     _normalize_receiver_attrs,
@@ -126,6 +129,7 @@ from pydoppelgangerhunt.fixer.synthesis import (
 __all__ = [
     "ModuleDependencyGraph",
     "ReplacementItem",
+    "SCOPE_SCHEMA_VERSION",
     "UnitCollisionError",
     "UnitDict",
     "UnitSpan",

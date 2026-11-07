@@ -956,8 +956,20 @@ def test_resolve_clone_generator_subroutine_outputs_precomputed_and_fallback(
         "start": 2,
         "end": 2,
     }
-    s1 = {"definite_stores": ["a"], "globals": ["b"], "nonlocals": []}
-    s2 = {"definite_stores": ["x"], "globals": [], "nonlocals": ["y"]}
+    s1 = {
+        "definite_stores": ["a"],
+        "globals": ["b"],
+        "nonlocals": [],
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": 2,
+    }
+    s2 = {
+        "definite_stores": ["x"],
+        "globals": [],
+        "nonlocals": ["y"],
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": 2,
+    }
     res = resolve_clone_generator_subroutine_outputs(u1_pre, u2_pre, s1, s2)
     assert res is not None
     outs1, outs2 = res
@@ -1897,7 +1909,10 @@ def test_resolve_clone_generator_subroutine_outputs_precomputed_definite_stores(
     assert res_rejected is None
 
     # When both sides definitely assign all precomputed outputs, pairing succeeds
-    s1_valid = {"definite_stores": ["x", "unassigned"], "inputs": []}
+    s1_valid = {
+        "definite_stores": ["x", "unassigned"],
+        "inputs": [],
+    }
     res_valid = resolve_clone_generator_subroutine_outputs(u1, u2, s1_valid, s2)
     assert res_valid == (["x", "unassigned"], ["a", "b"])
 
@@ -2212,8 +2227,14 @@ def test_generator_subroutine_outputs_mocked_scope_fails_closed() -> None:
     u1 = {"outputs": ["val"], "source_text": "def f():\n    val = 1\n"}
     u2 = {"outputs": ["val"], "source_text": "def g():\n    val = 2\n"}
     # Scope dict missing both definite_stores and inputs
-    s1: Dict[str, Any] = {"globals": [], "nonlocals": []}
-    s2: Dict[str, Any] = {"globals": [], "nonlocals": []}
+    s1: Dict[str, Any] = {
+        "globals": [],
+        "nonlocals": [],
+    }
+    s2: Dict[str, Any] = {
+        "globals": [],
+        "nonlocals": [],
+    }
     res = resolve_clone_generator_subroutine_outputs(u1, u2, s1, s2)
     assert res is None
 
@@ -2656,8 +2677,18 @@ def test_resolve_clone_pair_outputs_clean_pair() -> None:
     """Verifies that resolve_clone_pair_outputs successfully pairs matching outputs."""
     u1 = {"kind": "function", "outputs": ["a", "b"]}
     u2 = {"kind": "function", "outputs": ["x", "y"]}
-    s1: Dict[str, Any] = {"inputs": [], "definite_stores": ["a", "b"]}
-    s2: Dict[str, Any] = {"inputs": [], "definite_stores": ["x", "y"]}
+    s1: Dict[str, Any] = {
+        "inputs": [],
+        "definite_stores": ["a", "b"],
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": 2,
+    }
+    s2: Dict[str, Any] = {
+        "inputs": [],
+        "definite_stores": ["x", "y"],
+        "skip_pre_unit_closures": False,
+        "scope_schema_version": 2,
+    }
 
     res = resolve_clone_pair_outputs(u1, u2, s1, s2)
     assert res == (["a", "b"], ["x", "y"])

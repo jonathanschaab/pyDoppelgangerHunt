@@ -8,8 +8,15 @@ import re
 import typing
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
-from pydoppelgangerhunt.config import normalize_path_string
-from pydoppelgangerhunt.reporters import extract_unit_source_code
+from pydoppelgangerhunt.config import (
+    normalize_non_suppressing_ctx_managers,
+    normalize_path_string,
+    resolve_closure_strictness_mode,
+    resolve_strict_with_suppression,
+)
+from pydoppelgangerhunt.reporters import (
+    extract_unit_source_lines_with_state,
+)
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
     _has_receiver_reference,
@@ -32,8 +39,9 @@ from pydoppelgangerhunt.fixer.scope import (
     _rank_param_kind,
     _unfold_receiver_attribute,
     analyze_unit_variable_scope,
-    inspect_single_unit_scope,
+    ensure_unit_scope_closure_mode,
     is_subroutine_unit,
+    scope_matches_closure_mode,
 )
 from pydoppelgangerhunt.fixer.source import (
     _detect_indent_step,
@@ -1297,6 +1305,7 @@ def synthesize_shared_helper_code(
     tree2: Optional[ast.AST] = None,
     skip_pre_unit_closures: bool = False,
     closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
     outputs: Optional[List[str]] = None,
     outputs2: Optional[List[str]] = None,
     scope1: Optional[Dict[str, Any]] = None,
@@ -1331,15 +1340,37 @@ def synthesize_shared_helper_code(
     """
     u1 = dict(u1)
     u2 = dict(u2)
+    if source_text1 is not None and (
+        not isinstance(u1.get("source_text"), str)
+        or not u1["source_text"].strip()
+    ):
+        u1["source_text"] = source_text1
+    if source_text2 is not None and (
+        not isinstance(u2.get("source_text"), str)
+        or not u2["source_text"].strip()
+    ):
+        u2["source_text"] = source_text2
     if not _align_pair_expr_kinds(u1, u2):
         return ""
+    raw_lines1, is_sliced1 = extract_unit_source_lines_with_state(
+        u1, repo_root=repo_root
+    )
+    raw_lines2, is_sliced2 = extract_unit_source_lines_with_state(
+        u2, repo_root=repo_root
+    )
     lines1 = _slice_unit_token_lines(
         u1,
-        _extract_unit_body_lines(u1, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u1, repo_root=repo_root)]),
+        _extract_unit_body_lines(
+            u1, [ln.rstrip("\r\n") for ln in raw_lines1]
+        ),
+        is_pre_sliced=is_sliced1,
     )
     lines2 = _slice_unit_token_lines(
         u2,
-        _extract_unit_body_lines(u2, [ln.rstrip("\r\n") for ln in extract_unit_source_code(u2, repo_root=repo_root)]),
+        _extract_unit_body_lines(
+            u2, [ln.rstrip("\r\n") for ln in raw_lines2]
+        ),
+        is_pre_sliced=is_sliced2,
     )
 
     base_name1 = _base_unit_name(u1)
@@ -1382,6 +1413,66 @@ def synthesize_shared_helper_code(
     if preserve_pragmas:
         common_lines = _attach_pragmas(common_lines, pragmas1 + pragmas2)
 
+    # Variable scope analysis for concrete parameter signatures.
+    _, effective_skip_closures = resolve_closure_strictness_mode(
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+    )
+    effective_strict_with1 = resolve_strict_with_suppression(
+        closure_strictness=closure_strictness,
+        strict_with_suppression=u1.get("strict_with_suppression"),
+    )
+    effective_strict_with2 = resolve_strict_with_suppression(
+        closure_strictness=closure_strictness,
+        strict_with_suppression=u2.get("strict_with_suppression"),
+    )
+    eff_non_sup1 = normalize_non_suppressing_ctx_managers(
+        non_suppressing_ctx_managers
+        if non_suppressing_ctx_managers is not None
+        else u1.get("non_suppressing_ctx_managers")
+    )
+    eff_non_sup2 = normalize_non_suppressing_ctx_managers(
+        non_suppressing_ctx_managers
+        if non_suppressing_ctx_managers is not None
+        else u2.get("non_suppressing_ctx_managers")
+    )
+    if eff_non_sup1:
+        u1["non_suppressing_ctx_managers"] = list(eff_non_sup1)
+    if eff_non_sup2:
+        u2["non_suppressing_ctx_managers"] = list(eff_non_sup2)
+    has_precomputed_scopes = (
+        scope_matches_closure_mode(
+            scope1,
+            effective_skip_closures,
+            expected_strict_with=effective_strict_with1,
+            expected_non_suppressing=eff_non_sup1,
+        )
+        and scope_matches_closure_mode(
+            scope2,
+            effective_skip_closures,
+            expected_strict_with=effective_strict_with2,
+            expected_non_suppressing=eff_non_sup2,
+        )
+        and scope_matches_closure_mode(
+            scope,
+            effective_skip_closures,
+            expected_strict_with=effective_strict_with1 or effective_strict_with2,
+            expected_non_suppressing=sorted(set(eff_non_sup1) & set(eff_non_sup2)),
+        )
+    )
+    can_skip_tree_parse = (
+        has_precomputed_scopes
+        and (
+            not is_expr_unit
+            or (
+                bool(scope1 and scope1.get("_lhs_pruned"))
+                and bool(scope2 and scope2.get("_lhs_pruned"))
+            )
+        )
+        and outputs is not None
+        and outputs2 is not None
+    )
+
     def _resolve_tree(
         given_tree: Optional[ast.AST],
         given_src: Optional[str],
@@ -1389,6 +1480,23 @@ def synthesize_shared_helper_code(
     ) -> Optional[ast.AST]:
         if given_tree is not None:
             return given_tree
+        if (
+            can_skip_tree_parse
+            and (
+                not unit.get("enclosing_class")
+                or unit.get("receiver_kind") is not None
+            )
+            and unit.get("kind")
+            in (
+                "function",
+                "method",
+                "async_function",
+                "compound_block",
+                "sliding_window",
+                "clause_branch",
+            )
+        ):
+            return None
         raw_text = given_src or _load_unit_file_text(unit, repo_root=repo_root)
         if raw_text:
             return _get_or_parse_tree(raw_text)
@@ -1396,25 +1504,30 @@ def synthesize_shared_helper_code(
 
     tree1 = _resolve_tree(tree1, source_text1, u1)
     tree2 = _resolve_tree(tree2, source_text2, u2)
-
-    # Variable scope analysis for concrete parameter signatures.
-    has_precomputed_scopes = (
-        scope1 is not None and scope2 is not None and scope is not None
-    )
     scopes: List[Dict[str, Any]] = []
-    for u_item, s_text, t_item, pre_s in (
-        (u1, source_text1, tree1, scope1),
-        (u2, source_text2, tree2, scope2),
+    for u_item, s_text, t_item, pre_s, eff_sw, eff_ns in (
+        (u1, source_text1, tree1, scope1, effective_strict_with1, eff_non_sup1),
+        (u2, source_text2, tree2, scope2, effective_strict_with2, eff_non_sup2),
     ):
-        if s_text is not None:
-            u_item.setdefault("source_text", s_text)
+        if s_text is not None and (
+            not isinstance(u_item.get("source_text"), str)
+            or not u_item["source_text"].strip()
+        ):
+            u_item["source_text"] = s_text
         _populate_unit_receiver_metadata(
             u_item, repo_root=repo_root, source_text=s_text, tree=t_item
         )
-        s_item = (
-            dict(pre_s)
-            if pre_s is not None
-            else inspect_single_unit_scope(u_item, repo_root=repo_root, tree=t_item)
+        s_item = dict(
+            ensure_unit_scope_closure_mode(
+                u_item,
+                pre_s,
+                effective_skip_closures,
+                strict_with_suppression=eff_sw,
+                non_suppressing_ctx_managers=eff_ns,
+                source_text=s_text,
+                tree=t_item,
+                repo_root=repo_root,
+            )
         )
         if u_item.get("enclosing_is_async") and s_item.get("has_yield"):
             s_item["is_async"] = True
@@ -1448,6 +1561,8 @@ def synthesize_shared_helper_code(
             tree2=tree2,
             scope1=scope1,
             scope2=scope2,
+            skip_pre_unit_closures=effective_skip_closures,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
         )
 
     if scope1.get("is_async") or scope2.get("is_async"):
@@ -1508,9 +1623,19 @@ def synthesize_shared_helper_code(
         return ""
     if scope1.get("nonlocals") or scope2.get("nonlocals") or scope.get("nonlocals"):
         return ""
+    combined_hazards = (
+        list(scope1.get("control_flow_hazards", ()))
+        + list(scope2.get("control_flow_hazards", ()))
+        + list(scope.get("control_flow_hazards", ()))
+    )
     if any(
-        h in scope.get("control_flow_hazards", [])
-        for h in ("type_param_closure_capture", "pathological_ast", "deleted_output")
+        h in combined_hazards
+        for h in (
+            "type_param_closure_capture",
+            "pathological_ast",
+            "deleted_output",
+            "severed_closure_cell",
+        )
     ):
         return ""
     if not is_same_class and not _is_same_file_path(f1, f2, repo_root=repo_root) and (
@@ -1621,6 +1746,7 @@ def synthesize_shared_helper_code(
             repo_root=repo_root,
             skip_pre_unit_closures=skip_pre_unit_closures,
             closure_strictness=closure_strictness,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
             require_pairing=False,
         )
         if resolved_outs is None:

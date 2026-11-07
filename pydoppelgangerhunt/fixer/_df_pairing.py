@@ -39,7 +39,11 @@ from pydoppelgangerhunt.fixer._df_hazards import (
     _resolve_downstream_scope_node,
     collect_downstream_read_names,
 )
-from pydoppelgangerhunt.config import resolve_closure_strictness_mode
+from pydoppelgangerhunt.config import (
+    resolve_closure_strictness_mode,
+    resolve_strict_with_suppression,
+)
+from pydoppelgangerhunt.fixer.scope import ensure_unit_scope_closure_mode
 from pydoppelgangerhunt.fixer.source import (
     _load_unit_file_text,
     is_subroutine_unit,
@@ -287,6 +291,63 @@ def _extract_effective_unit_outputs(
     return list(dict.fromkeys(v for v in cands if v not in excluded))
 
 
+def _ensure_pair_scopes_closure_mode(
+    u1: Dict[str, Any],
+    u2: Dict[str, Any],
+    scope1: Optional[Dict[str, Any]],
+    scope2: Optional[Dict[str, Any]],
+    *,
+    closure_strictness: Optional[str],
+    skip_pre_unit_closures: bool,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+    source_text1: Optional[str],
+    source_text2: Optional[str],
+    tree1: Optional[ast.AST],
+    tree2: Optional[ast.AST],
+    repo_root: Optional[str],
+) -> Tuple[Dict[str, Any], Dict[str, Any], bool]:
+    """Ensures both clone units' scopes match the requested closure strictness mode."""
+    _, effective_skip_closures = resolve_closure_strictness_mode(
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+    )
+    resolved_s1 = ensure_unit_scope_closure_mode(
+        u1,
+        scope1,
+        effective_skip_closures,
+        strict_with_suppression=resolve_strict_with_suppression(
+            closure_strictness=closure_strictness,
+            strict_with_suppression=u1.get("strict_with_suppression"),
+        ),
+        non_suppressing_ctx_managers=(
+            non_suppressing_ctx_managers
+            if non_suppressing_ctx_managers is not None
+            else u1.get("non_suppressing_ctx_managers")
+        ),
+        source_text=source_text1,
+        tree=tree1,
+        repo_root=repo_root,
+    )
+    resolved_s2 = ensure_unit_scope_closure_mode(
+        u2,
+        scope2,
+        effective_skip_closures,
+        strict_with_suppression=resolve_strict_with_suppression(
+            closure_strictness=closure_strictness,
+            strict_with_suppression=u2.get("strict_with_suppression"),
+        ),
+        non_suppressing_ctx_managers=(
+            non_suppressing_ctx_managers
+            if non_suppressing_ctx_managers is not None
+            else u2.get("non_suppressing_ctx_managers")
+        ),
+        source_text=source_text2,
+        tree=tree2,
+        repo_root=repo_root,
+    )
+    return resolved_s1, resolved_s2, effective_skip_closures
+
+
 @overload
 def resolve_clone_generator_subroutine_outputs(
     u1: Dict[str, Any],
@@ -304,6 +365,8 @@ def resolve_clone_generator_subroutine_outputs(
     allow_permuted_outputs: bool = False,
     *,
     return_details: Literal[True],
+    closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> CloneOutputResolution: ...
 
 
@@ -323,6 +386,8 @@ def resolve_clone_generator_subroutine_outputs(
     source_digest2: Optional[str] = None,
     allow_permuted_outputs: bool = False,
     return_details: Literal[False] = False,
+    closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Optional[Tuple[List[str], List[str]]]: ...
 
 
@@ -342,6 +407,8 @@ def resolve_clone_generator_subroutine_outputs(
     source_digest2: Optional[str] = None,
     allow_permuted_outputs: bool = False,
     return_details: bool = False,
+    closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Union[Optional[Tuple[List[str], List[str]]], CloneOutputResolution]: ...
 
 
@@ -360,6 +427,8 @@ def resolve_clone_generator_subroutine_outputs(
     source_digest2: Optional[str] = None,
     allow_permuted_outputs: bool = False,
     return_details: bool = False,
+    closure_strictness: Optional[str] = None,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Union[Optional[Tuple[List[str], List[str]]], CloneOutputResolution]:
     """Resolves output variable bindings for clone generator subroutines across two code units.
 
@@ -379,6 +448,21 @@ def resolve_clone_generator_subroutine_outputs(
                     if return_details
                     else None
                 )
+
+    scope1, scope2, effective_skip_closures = _ensure_pair_scopes_closure_mode(
+        u1,
+        u2,
+        scope1,
+        scope2,
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        source_text1=source_text1,
+        source_text2=source_text2,
+        tree1=tree1,
+        tree2=tree2,
+        repo_root=repo_root,
+    )
 
     for u_chk, s_chk, side_lbl in ((u1, scope1, "u1"), (u2, scope2, "u2")):
         if _has_unordered_multiset_outputs(u_chk):
@@ -400,19 +484,35 @@ def resolve_clone_generator_subroutine_outputs(
                 if return_details
                 else None
             )
-        if "deleted_output" in s_chk.get("control_flow_hazards", ()):
-            logger.debug(
-                "Rejecting generator subroutine pair: deleted output hazard on %s",
-                side_lbl,
-            )
-            return (
-                CloneOutputResolution(None, "deleted output hazard")
-                if return_details
-                else None
-            )
+        for hazard_key, reason_str in (
+            ("deleted_output", "deleted output hazard"),
+            ("severed_closure_cell", "severed closure cell"),
+        ):
+            if hazard_key in s_chk.get("control_flow_hazards", ()):
+                logger.debug(
+                    "Rejecting generator subroutine pair: %s on %s",
+                    reason_str,
+                    side_lbl,
+                )
+                return (
+                    CloneOutputResolution(None, reason_str)
+                    if return_details
+                    else None
+                )
 
     outs1 = _extract_effective_unit_outputs(u1, scope1)
     outs2 = _extract_effective_unit_outputs(u2, scope2)
+    if bool(set(outs1) & set(scope1.get("deleted_names", []))) or bool(
+        set(outs2) & set(scope2.get("deleted_names", []))
+    ):
+        logger.debug(
+            "Rejecting generator subroutine pair: deleted output hazard"
+        )
+        return (
+            CloneOutputResolution(None, "deleted output hazard")
+            if return_details
+            else None
+        )
 
     u1_cond = set(scope1.get("conditional_outputs", [])) | set(
         scope1.get("deleted_names", [])
@@ -423,13 +523,13 @@ def resolve_clone_generator_subroutine_outputs(
     u1_def = (
         set(scope1.get("definite_stores", []))
         | (set(scope1.get("inputs", [])) - u1_cond)
-        if ("definite_stores" in scope1 or "inputs" in scope1)
+        if "definite_stores" in scope1 or "inputs" in scope1
         else set()
     )
     u2_def = (
         set(scope2.get("definite_stores", []))
         | (set(scope2.get("inputs", [])) - u2_cond)
-        if ("definite_stores" in scope2 or "inputs" in scope2)
+        if "definite_stores" in scope2 or "inputs" in scope2
         else set()
     )
 
@@ -465,7 +565,7 @@ def resolve_clone_generator_subroutine_outputs(
                 u_item,
                 candidates=cands,
                 tree=eff_tr,
-                skip_pre_unit_closures=skip_pre_unit_closures,
+                skip_pre_unit_closures=effective_skip_closures,
                 source_digest=s_digest,
                 unit_inputs=unit_inps,
             )
@@ -513,17 +613,17 @@ def resolve_clone_generator_subroutine_outputs(
                 u_end_col = _extract_unit_end_col(u_item)
                 if u_end_col is None:
                     u_end_col = _resolve_unit_ast_end_col(scope_node, u_item)
-                for c_pos, reads in _collect_scope_closures(scope_node, module_tree=eff_tr):
+                for c_pos, c_reads in _collect_scope_closures(scope_node, module_tree=eff_tr):
                     _, is_intra, _ = _classify_closure_position(
                         c_pos, u_s, u_e, u_start_col=u_start_col, u_end_col=u_end_col
                     )
-                    if is_intra and bool(reads & set(needed_outs)):
+                    if is_intra and bool(c_reads & set(needed_outs)):
                         c_line, _ = _normalize_closure_position(c_pos)
                         logger.debug(
                             "Rejecting generator subroutine pair: intra-unit closure at line %d "
                             "captures needed output(s) %r for unit %s",
                             c_line,
-                            reads & set(needed_outs),
+                            c_reads & set(needed_outs),
                             side_idx + 1,
                         )
                         return (
@@ -560,6 +660,7 @@ def resolve_clone_pair_outputs(
     allow_permuted_outputs: bool = False,
     *,
     return_details: Literal[True],
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> CloneOutputResolution: ...
 
 
@@ -581,6 +682,7 @@ def resolve_clone_pair_outputs(
     require_pairing: Optional[bool] = None,
     allow_permuted_outputs: bool = False,
     return_details: Literal[False] = False,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Optional[Tuple[List[str], List[str]]]: ...
 
 
@@ -602,6 +704,7 @@ def resolve_clone_pair_outputs(
     require_pairing: Optional[bool] = None,
     allow_permuted_outputs: bool = False,
     return_details: bool = False,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Union[Optional[Tuple[List[str], List[str]]], CloneOutputResolution]: ...
 
 
@@ -622,6 +725,7 @@ def resolve_clone_pair_outputs(
     require_pairing: Optional[bool] = None,
     allow_permuted_outputs: bool = False,
     return_details: bool = False,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Union[Optional[Tuple[List[str], List[str]]], CloneOutputResolution]:
     """Resolves output variable bindings between two clone units, enforcing
     strict positional pairing and generator subroutine safety.
@@ -665,6 +769,21 @@ def resolve_clone_pair_outputs(
             else None
         )
 
+    scope1, scope2, effective_skip_closures = _ensure_pair_scopes_closure_mode(
+        u1,
+        u2,
+        scope1,
+        scope2,
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
+        source_text1=source_text1,
+        source_text2=source_text2,
+        tree1=tree1,
+        tree2=tree2,
+        repo_root=repo_root,
+    )
+
     if scope1.get("outputs_ambiguous") or scope2.get("outputs_ambiguous"):
         logger.debug(
             "Rejecting clone pair output resolution: ambiguous scope outputs "
@@ -675,11 +794,6 @@ def resolve_clone_pair_outputs(
             if return_details
             else None
         )
-
-    _, effective_skip_closures = resolve_closure_strictness_mode(
-        closure_strictness=closure_strictness,
-        skip_pre_unit_closures=skip_pre_unit_closures,
-    )
 
     has_yield = bool(scope1.get("has_yield") or scope2.get("has_yield"))
     if is_sub and has_yield:
@@ -696,12 +810,26 @@ def resolve_clone_pair_outputs(
             skip_pre_unit_closures=effective_skip_closures,
             source_digest1=source_digest1,
             source_digest2=source_digest2,
+            closure_strictness=closure_strictness,
+            non_suppressing_ctx_managers=non_suppressing_ctx_managers,
             allow_permuted_outputs=allow_permuted_outputs,
             return_details=return_details,
         )
 
     outs1 = _extract_effective_unit_outputs(u1, scope1)
     outs2 = _extract_effective_unit_outputs(u2, scope2)
+    if (
+        "severed_closure_cell" in scope1.get("control_flow_hazards", ())
+        or "severed_closure_cell" in scope2.get("control_flow_hazards", ())
+    ):
+        logger.debug(
+            "Rejecting clone pair output resolution: severed closure cell"
+        )
+        return (
+            CloneOutputResolution(None, "severed closure cell")
+            if return_details
+            else None
+        )
     if is_sub and (
         "deleted_output" in scope1.get("control_flow_hazards", ())
         or "deleted_output" in scope2.get("control_flow_hazards", ())
