@@ -124,6 +124,9 @@ min_lines = 8
 min_tokens = 15
 cross_file_strategy = "auto"
 shared_module_name = "_common.py"
+closure_strictness = "strict"  # "strict" (default), "pedantic", or "lenient"
+# strict_with_suppression = false  # Deprecated compatibility alias; prefer closure_strictness = "pedantic"
+non_suppressing_ctx_managers = []
 exclude = [
     "tests",
     "vendor",
@@ -261,18 +264,28 @@ escaping callbacks across lexical scopes.
   memoized AST trees and parent node maps.
 - **Precision vs. Soundness Trade-off**: Pre-unit closure and context-manager exception-suppression
   analysis can be configured via `--closure-strictness {strict,pedantic,lenient,fail_closed,strict_with,fast,skip}`
-  (or `--skip-pre-unit-closures`, or setting `closure_strictness = "strict"|"pedantic"|"lenient"` and
-  `non_suppressing_ctx_managers = [...]` in `pyproject.toml`):
-  - `strict` (default): Conservative mode that treats pre-unit closures capturing candidate outputs
-    as live escaping callbacks, while treating unknown `with` context managers as non-suppressing
-    unless their name matches known suppression idioms (`suppress`, `raises`, `ignore`, `subTest`,
-    `ExitStack`, `enter_context`) or is proven exception-suppressing via local/class/function provenance.
-  - `pedantic` (aliases: `fail_closed`, `strict_with`): Fully fail-closed mode that additionally treats
-    all unproven unknown `with` context managers as potentially exception-suppressing unless explicitly
-    listed via `--non-suppressing-ctx-managers` or `non_suppressing_ctx_managers`.
+  (or `--skip-pre-unit-closures`, or setting `closure_strictness = "strict"|"pedantic"|"lenient"`
+  and `non_suppressing_ctx_managers = [...]` in `pyproject.toml`):
+  - `strict` (default, `strict_with_suppression = false`): Conservative closure mode that treats
+    pre-unit closures capturing candidate outputs as live escaping callbacks, while using a
+    name-and-provenance heuristic for `with` context managers: unknown context managers are treated
+    as non-suppressing unless their name matches known suppression idioms (`suppress`, `raises`,
+    `ignore`, `subTest`, `ExitStack`, `enter_context`) or is proven exception-suppressing via
+    local, function, or class `__exit__` provenance.
+  - `pedantic` (aliases: `fail_closed`, `strict_with`; or `strict_with_suppression = true`): Fully
+    fail-closed mode that additionally treats all unproven unknown `with` context managers as
+    potentially exception-suppressing unless explicitly allowlisted via `--non-suppressing-ctx-managers`
+    or `non_suppressing_ctx_managers` (merged across global config and per-unit overrides).
   - `lenient` (aliases: `fast`, `skip`): Precision-oriented mode that skips pre-unit closure
     scanning, reducing false-positive pair rejections in codebases where pre-unit closures never
     escape, at the cost of potential callback capture hazards for escaping closures.
+  - **Deprecation & Migration Note (`strict_with_suppression`)**: The boolean `strict_with_suppression`
+    setting (in `pyproject.toml` and per-unit dicts) is retained for backward compatibility:
+    `strict_with_suppression = true` selects `pedantic` unknown-`with` handling and
+    `strict_with_suppression = false` selects `strict` heuristic handling when `closure_strictness`
+    is omitted. When both `closure_strictness` and `strict_with_suppression` are supplied,
+    `closure_strictness` takes precedence and logs a conflict warning. New configurations should
+    use the unified `closure_strictness = "strict" | "pedantic" | "lenient"` knob directly.
 
 #### Safety Model & Fail-Closed Refactoring Guarantees
 

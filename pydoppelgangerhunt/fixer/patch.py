@@ -3488,37 +3488,36 @@ def _generate_refactoring_patch_impl(
                     (fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static"))
                 )
 
+            u1_eff.pop("closure_strictness", None)
+            u2_eff.pop("closure_strictness", None)
             u1_eff["skip_pre_unit_closures"] = bool(effective_skip_closures)
             u2_eff["skip_pre_unit_closures"] = bool(effective_skip_closures)
             u1_eff["strict_with_suppression"] = resolve_strict_with_suppression(
-                closure_strictness=closure_strictness,
-                strict_with_suppression=u1_eff.get("strict_with_suppression"),
+                closure_strictness=(
+                    closure_strictness
+                    if closure_strictness is not None
+                    else u1.get("closure_strictness")
+                ),
+                strict_with_suppression=u1.get("strict_with_suppression"),
             )
             u2_eff["strict_with_suppression"] = resolve_strict_with_suppression(
-                closure_strictness=closure_strictness,
-                strict_with_suppression=u2_eff.get("strict_with_suppression"),
+                closure_strictness=(
+                    closure_strictness
+                    if closure_strictness is not None
+                    else u2.get("closure_strictness")
+                ),
+                strict_with_suppression=u2.get("strict_with_suppression"),
             )
-            if eff_non_sup:
-                u1_eff["non_suppressing_ctx_managers"] = list(
-                    normalize_non_suppressing_ctx_managers(
-                        list(eff_non_sup)
-                        + list(
-                            normalize_non_suppressing_ctx_managers(
-                                u1_eff.get("non_suppressing_ctx_managers")
-                            )
-                        )
-                    )
-                )
-                u2_eff["non_suppressing_ctx_managers"] = list(
-                    normalize_non_suppressing_ctx_managers(
-                        list(eff_non_sup)
-                        + list(
-                            normalize_non_suppressing_ctx_managers(
-                                u2_eff.get("non_suppressing_ctx_managers")
-                            )
-                        )
-                    )
-                )
+            merged_non_sup1 = normalize_non_suppressing_ctx_managers(
+                eff_non_sup, u1_eff.get("non_suppressing_ctx_managers")
+            )
+            if merged_non_sup1 or "non_suppressing_ctx_managers" in u1_eff:
+                u1_eff["non_suppressing_ctx_managers"] = list(merged_non_sup1)
+            merged_non_sup2 = normalize_non_suppressing_ctx_managers(
+                eff_non_sup, u2_eff.get("non_suppressing_ctx_managers")
+            )
+            if merged_non_sup2 or "non_suppressing_ctx_managers" in u2_eff:
+                u2_eff["non_suppressing_ctx_managers"] = list(merged_non_sup2)
             s1 = inspect_single_unit_scope(u1_eff, repo_root=str(root), tree=tree1)
             s2 = inspect_single_unit_scope(u2_eff, repo_root=str(root), tree=tree2)
             if u1_eff.get("kind") in ("comprehension", "complex_expr") or u2_eff.get(
@@ -3591,6 +3590,9 @@ def _generate_refactoring_patch_impl(
 
             hazards1 = set(s1.get("control_flow_hazards", []))
             hazards2 = set(s2.get("control_flow_hazards", []))
+            if "stale_source_code" in hazards1 | hazards2:
+                skip_reasons["stale source code"] += 1
+                continue
             if "pathological_ast" in hazards1 | hazards2:
                 skip_reasons["pathological ast"] += 1
                 continue

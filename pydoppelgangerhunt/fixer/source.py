@@ -97,10 +97,14 @@ class UnitSchema(TypedDict, total=False):
         scope: Precomputed scope analysis dictionary from ``inspect_single_unit_scope``.
         receiver_param: Receiver parameter name (e.g., ``"self"`` or ``"cls"``).
         receiver_kind: Receiver binding kind (``"instance"``, ``"class"``, or ``"module"``).
-        skip_pre_unit_closures: Per-unit boolean overriding ``closure_strictness``
+        closure_strictness: Per-unit closure strictness mode override
+            (``"strict"``, ``"pedantic"``, or ``"lenient"``; aliases ``"fail_closed"``,
+            ``"strict_with"``, ``"fast"``, ``"skip"``).
+        skip_pre_unit_closures: Per-unit boolean fallback when ``closure_strictness`` is omitted
             (``False`` for strict/pedantic mode, ``True`` for lenient mode).
-        strict_with_suppression: Per-unit boolean enabling pedantic unknown-``with``
-            exception suppression treatment (also enabled when ``closure_strictness="pedantic"``).
+        strict_with_suppression: Legacy per-unit boolean fallback enabling pedantic unknown-``with``
+            exception suppression treatment when ``closure_strictness`` is omitted (prefer
+            ``closure_strictness="pedantic"``).
         non_suppressing_ctx_managers: Optional iterable of context manager names/paths
             configured to be treated as non-suppressing in ``with`` statements.
         token_count: Number of normalized AST tokens in the unit.
@@ -132,6 +136,7 @@ class UnitSchema(TypedDict, total=False):
     scope: Dict[str, Any]
     receiver_param: Optional[str]
     receiver_kind: Optional[str]
+    closure_strictness: Optional[str]
     skip_pre_unit_closures: Optional[bool]
     strict_with_suppression: Optional[bool]
     non_suppressing_ctx_managers: Optional[Sequence[str]]
@@ -655,21 +660,46 @@ def _slice_utf8_line(
     return line[s_char:]
 
 
+def _is_valid_eval_expr(text: str) -> bool:
+    """Returns True if text parses as a standalone Python expression."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            ast.parse(stripped, mode="eval")
+        return True
+    except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
+        return False
+
+
 def _slice_unit_token_lines(
     unit: Dict[str, Any],
     lines: List[str],
     *,
     is_pre_sliced: Optional[bool] = None,
+    explicit_col_sliced: Optional[bool] = None,
 ) -> List[str]:
     """Slices source lines to the exact start_col and end_col offsets of the unit."""
     if not lines or unit.get("kind") not in ("comprehension", "complex_expr"):
         return lines
-    already_sliced = (
+    raw_flag = unit.get("source_lines_is_sliced")
+    eff_col_sliced = (
+        explicit_col_sliced
+        if explicit_col_sliced is not None
+        else (raw_flag if isinstance(raw_flag, bool) else None)
+    )
+    if eff_col_sliced is True:
+        return list(lines)
+    effective_pre_sliced: Optional[bool] = (
         is_pre_sliced
         if is_pre_sliced is not None
-        else bool(unit.get("source_lines_is_sliced"))
+        else eff_col_sliced
     )
-    if already_sliced:
+    if effective_pre_sliced is True and (
+        "source_lines" not in unit or len(lines) > 1
+    ):
         return list(lines)
     s_col_opt = _extract_slice_col_offset(
         unit, ("start_col", "start_col_offset"), default=0
@@ -681,17 +711,30 @@ def _slice_unit_token_lines(
         return lines
     s_col = s_col_opt
     res = list(lines)
-    src_code = unit.get("source_code")
-    if (
-        s_col > 0
-        and isinstance(src_code, str)
-        and src_code.strip()
-        and "".join(res).strip() == src_code.strip()
-    ):
-        return res
-    # Guard against pre-sliced token lines whose length is already shorter than
-    # the original line's starting or ending byte column offset.
     first_byte_len = len(res[0].rstrip("\r\n").encode("utf-8"))
+    if effective_pre_sliced is True and len(res) == 1:
+        if (
+            s_col > 0
+            and e_col is not None
+            and first_byte_len == e_col - s_col
+            and not res[0][:1].isspace()
+        ):
+            return res
+    if effective_pre_sliced is None:
+        src_code = unit.get("source_code")
+        if isinstance(src_code, str) and src_code.strip():
+            code_lines = [
+                ln.rstrip("\r\n") for ln in split_source_lines(src_code)
+            ]
+            res_stripped = [ln.rstrip("\r\n") for ln in res]
+            if res_stripped == code_lines and (
+                s_col > 0
+                or (
+                    e_col is not None
+                    and len(res_stripped[-1].encode("utf-8")) == e_col
+                )
+            ):
+                return res
     if len(res) == 1:
         if (
             s_col > first_byte_len
@@ -702,14 +745,43 @@ def _slice_unit_token_lines(
             )
         ):
             return res
+        if (
+            effective_pre_sliced is None
+            and s_col > 0
+            and not res[0][:1].isspace()
+            and _is_valid_eval_expr(res[0])
+            and not _is_valid_eval_expr(_slice_utf8_line(res[0], s_col, e_col))
+        ):
+            return res
         res[0] = _slice_utf8_line(res[0], s_col, e_col)
     else:
+        last_byte_len = len(res[-1].rstrip("\r\n").encode("utf-8"))
+        if effective_pre_sliced is None:
+            if e_col is not None and e_col > last_byte_len:
+                return res
+            if (
+                s_col > 0
+                and not res[0][:1].isspace()
+                and _is_valid_eval_expr("".join(res))
+            ):
+                cand_first = (
+                    _slice_utf8_line(res[0], s_col, None)
+                    if s_col < first_byte_len
+                    else res[0]
+                )
+                cand_last = (
+                    _slice_utf8_line(res[-1].rstrip("\r\n"), 0, e_col)
+                    if e_col is not None and e_col <= last_byte_len
+                    else res[-1]
+                )
+                if not _is_valid_eval_expr(
+                    cand_first + "".join(res[1:-1]) + cand_last
+                ):
+                    return res
         if 0 < s_col < first_byte_len:
             res[0] = _slice_utf8_line(res[0], s_col, None)
-        if e_col is not None:
-            last_byte_len = len(res[-1].rstrip("\r\n").encode("utf-8"))
-            if e_col <= last_byte_len:
-                res[-1] = _slice_utf8_line(res[-1], 0, e_col)
+        if e_col is not None and e_col <= last_byte_len:
+            res[-1] = _slice_utf8_line(res[-1].rstrip("\r\n"), 0, e_col)
     return res
 
 
@@ -1589,13 +1661,14 @@ def _compute_scope_intervals_sig(
     tree: ast.AST, intervals: Sequence[Tuple[int, int, int, ast.AST]]
 ) -> Tuple[Any, ...]:
     """Computes a lightweight O(K) structural signature for scope interval cache validation."""
-    src_lines = getattr(tree, "_source_lines", None)
     return (
         tuple(id(s) for s in getattr(tree, "body", ())),
         *(
             (
                 id(node),
-                _node_scope_bounds(node, src_lines),
+                getattr(node, "lineno", 0),
+                getattr(node, "end_lineno", 0),
+                len(getattr(node, "decorator_list", ())),
                 getattr(node, "col_offset", 0),
                 tuple(id(s) for s in getattr(node, "body", ())),
             )

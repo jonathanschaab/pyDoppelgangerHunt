@@ -9,20 +9,24 @@ transformation is unsound whenever late-bound cell semantics, shared `nonlocal`
 mutations, or suspended execution observe a different binding state than pass-
 by-value/return-by-value.
 
-The analysis is partitioned across five modules:
-1. `_df_span_index`: 2D span/column resolution (`_SpanLineIndex`,
+The analysis is partitioned across seven modules:
+1. `_df_cache`: LRU caches, parent-map and source-line caches, and composite
+   `_ScopeCacheKey` indexing.
+2. `_df_closures`: Lexical scope local/nonlocal/global extraction, eager
+   generator-expression classification, and closure free-variable collection.
+3. `_df_span_index`: 2D span/column resolution (`_SpanLineIndex`,
    `_resolve_unit_col_bounds`, `_has_unresolved_span_bounds`) and syntax-level
    lexical declaration validation (`_has_invalid_lexical_scope_declarations`).
-2. `_df_with_provenance`: Typed context-manager suppression provenance
+4. `_df_with_provenance`: Typed context-manager suppression provenance
    (`_SuppressProvenance`) and the unified definite/conditional binding,
    deletion, and block-termination engine (`_analyze_block_assignment`,
    `_extract_block_definite_bindings_and_term`, `_block_terminates`).
-3. `_df_cell_carriers`: Lexical scope contexts (`_FnScopeContext`), deferred
+5. `_df_cell_carriers`: Lexical scope contexts (`_FnScopeContext`), deferred
    comprehension/generator-expression capture analysis, closure carrier/factory
    extraction, and lexical-scope definition escape tracking.
-4. `_df_cell_traversal`: Flow-sensitive AST frame traversal across enclosing
+6. `_df_cell_traversal`: Flow-sensitive AST frame traversal across enclosing
    function chains, producing per-function `_EnclosingFnCellInfo` summaries.
-5. `_df_cell_hazards` (this module): Numbered hazard checks 1–4 and the
+7. `_df_cell_hazards` (this module): Numbered hazard checks 1–4 and the
    top-level `_has_severed_closure_cell_hazard` entry point.
 
 The Four Numbered Hazard Checks and Their Invariants
@@ -128,6 +132,7 @@ from pydoppelgangerhunt.fixer._df_closures import (
     _extract_scope_nonlocals_and_outer_globals,
     _extract_single_node_local_names,
     _has_escaped_intra_unit_global_declarations,
+    _has_wildcard_star_import,
     _resolve_immediate_scope_in_fn,
 )
 from pydoppelgangerhunt.fixer._df_span_index import (
@@ -405,44 +410,32 @@ class _UnitClosureHazardContext(NamedTuple):
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset()
 
 
+# Built-ins treated as side-effect-free with respect to module-level global variables
+# when checking whether an extracted helper might mutate an outer `global` mid-execution.
+# Excludes built-ins that iterate arbitrary iterables (`all`, `any`, `dict`, `enumerate`,
+# `frozenset`, `list`, `max`, `min`, `set`, `sum`, `tuple`, `zip`, `bytes`) or invoke
+# general value-producing dunders (`abs`, `divmod`, `float`, `hash`, `pow`, `repr`,
+# `reversed`, `round`, `str`).
+# Heuristic note: Remaining built-ins (`bool`, `int`, `len`, `ascii`) and non-call AST
+# operations (operators, subscripts, attribute/property reads, and `for` iteration) are
+# assumed not to mutate module-level globals via pathological `__bool__`/`__len__`/`__index__`
+# or operator/descriptor side effects.
 _PURE_GLOBAL_SAFE_BUILTINS: frozenset[str] = frozenset(
     {
-        "abs",
-        "all",
-        "any",
         "ascii",
         "bin",
         "bool",
-        "bytes",
         "callable",
         "chr",
-        "dict",
-        "divmod",
-        "enumerate",
-        "float",
-        "frozenset",
-        "hash",
         "hex",
         "id",
         "int",
         "isinstance",
         "issubclass",
         "len",
-        "list",
-        "max",
-        "min",
         "oct",
         "ord",
-        "pow",
         "range",
-        "repr",
-        "reversed",
-        "round",
-        "set",
-        "str",
-        "sum",
-        "tuple",
-        "zip",
     }
 )
 
@@ -450,6 +443,8 @@ _PURE_GLOBAL_SAFE_BUILTINS: frozenset[str] = frozenset(
 def _unit_has_global_mutating_call(
     candidate_stmts: Sequence[ast.stmt],
     shadowed_names: AbstractSet[str],
+    *,
+    has_star_import: bool = False,
 ) -> bool:
     """Returns True when candidate_stmts contain a call other than an unshadowed pure builtin.
 
@@ -460,10 +455,11 @@ def _unit_has_global_mutating_call(
     to observe the stale parameter rather than the updated global. Calls to
     unshadowed pure builtins cannot rebind module globals and are safe to allow.
     """
+    all_builtins_shadowed = has_star_import or ("*" in shadowed_names)
     for st in candidate_stmts:
         for node in ast.walk(st):
             if isinstance(node, ast.Call):
-                if not (
+                if all_builtins_shadowed or not (
                     isinstance(node.func, ast.Name)
                     and node.func.id in _PURE_GLOBAL_SAFE_BUILTINS
                     and node.func.id not in shadowed_names
@@ -549,25 +545,29 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
         return _record_hazard_reason(ctx, "invalid_lexical_declaration")
     if not enclosing_chain:
         span_idx = _get_span_line_index(ctx.mod_tree)
-        has_unresolved = any(
-            isinstance(getattr(node, "lineno", None), int)
-            and getattr(node, "lineno", 0) <= ctx.u_end
-            and (
-                not isinstance(getattr(node, "end_lineno", None), int)
-                or (
-                    getattr(node, "end_lineno", 0) >= ctx.u_start
-                    and (u_start_col is None or u_end_col is None)
-                    and _has_unresolved_span_bounds(
-                        ctx.mod_tree,
-                        ctx.u_start,
-                        ctx.u_end,
-                        u_start_col,
-                        u_end_col,
-                        ctx.candidate_stmts,
-                    )
-                )
+        has_missing_end = False
+        has_overlapping_closure = False
+        for node in span_idx.closure_like_nodes:
+            n_start = getattr(node, "lineno", None)
+            if not isinstance(n_start, int) or n_start > ctx.u_end:
+                continue
+            n_end = getattr(node, "end_lineno", None)
+            if not isinstance(n_end, int):
+                has_missing_end = True
+                break
+            if n_end >= ctx.u_start:
+                has_overlapping_closure = True
+        has_unresolved = has_missing_end or (
+            has_overlapping_closure
+            and (u_start_col is None or u_end_col is None)
+            and _has_unresolved_span_bounds(
+                ctx.mod_tree,
+                ctx.u_start,
+                ctx.u_end,
+                u_start_col,
+                u_end_col,
+                ctx.candidate_stmts,
             )
-            for node in span_idx.closure_like_nodes
         )
         return (
             _record_hazard_reason(ctx, "unresolved_span_bounds")
@@ -728,8 +728,16 @@ def _has_severed_closure_cell_hazard(ctx: _UnitClosureHazardContext) -> bool:
             shadowed_builtin_names.update(
                 _extract_single_node_local_names(enc_fn_node)
             )
+        has_star = _has_wildcard_star_import(
+            unit_mod,
+            module_tree=ctx.mod_tree,
+            cache_scope_node=False,
+            enclosing_scopes=unit_enclosing_scopes,
+        )
         if _unit_has_global_mutating_call(
-            ctx.candidate_stmts, shadowed_builtin_names
+            ctx.candidate_stmts,
+            shadowed_builtin_names,
+            has_star_import=has_star,
         ):
             return _record_hazard_reason(ctx, "global_escape")
     if unit_stores_affect_enclosing and bool(

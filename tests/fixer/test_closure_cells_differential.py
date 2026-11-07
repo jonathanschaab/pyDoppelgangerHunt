@@ -1031,7 +1031,7 @@ def test_tracked_cached_dict_ior_and_stale_source_and_whitespace_source_text() -
         "source_code": "del x\nx = 1\n",
     }
     sc_reordered = inspect_single_unit_scope(reordered_unit, tree=real_tree)
-    assert "pathological_ast" in sc_reordered["control_flow_hazards"]
+    assert "stale_source_code" in sc_reordered["control_flow_hazards"]
     assert sc_reordered["is_control_flow_safe"] is False
 
     dup_src = (
@@ -1047,7 +1047,7 @@ def test_tracked_cached_dict_ior_and_stale_source_and_whitespace_source_text() -
         "source_code": "x += 1\nx += 1\n",
     }
     sc_dup = inspect_single_unit_scope(dup_unit, tree=ast.parse(dup_src))
-    assert "pathological_ast" in sc_dup["control_flow_hazards"]
+    assert "stale_source_code" in sc_dup["control_flow_hazards"]
     assert sc_dup["is_control_flow_safe"] is False
 
     noncontig_src = (
@@ -1066,7 +1066,7 @@ def test_tracked_cached_dict_ior_and_stale_source_and_whitespace_source_text() -
     sc_noncontig = inspect_single_unit_scope(
         noncontig_unit, tree=ast.parse(noncontig_src)
     )
-    assert "pathological_ast" in sc_noncontig["control_flow_hazards"]
+    assert "stale_source_code" in sc_noncontig["control_flow_hazards"]
     assert sc_noncontig["is_control_flow_safe"] is False
 
     assert _is_ordered_contiguous_source_match([], ["a = 1"]) is False

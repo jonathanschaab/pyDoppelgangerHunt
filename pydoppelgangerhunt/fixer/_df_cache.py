@@ -30,13 +30,13 @@ logger = logging.getLogger(__name__)
 
 _CacheValT = TypeVar("_CacheValT")
 
-_RLOCK_TYPE: type = type(threading.RLock())
 _downstream_cache_lock: threading.RLock = threading.RLock()
+_RLOCK_TYPE: type = type(_downstream_cache_lock)
 
 
 def _is_reentrant_cache_lock(lock: Any) -> bool:
-    """Verifies that lock supports re-entrant acquisition on the same thread."""
-    return isinstance(lock, _RLOCK_TYPE) or type(lock).__name__ in ("RLock", "_RLock")
+    """Returns True if lock is a reentrant threading.RLock instance."""
+    return isinstance(lock, _RLOCK_TYPE)
 
 
 _MAX_DOWNSTREAM_CACHE_SIZE: int = 1024
@@ -143,6 +143,8 @@ def _params_contain_ast(params: Tuple[Any, ...]) -> bool:
 
 def _params_exact_types_match(a: Any, b: Any) -> bool:
     """Checks that equal parameter structures also match exact scalar types (distinguishing 1 from True)."""
+    if a is b:
+        return True
     if type(a) is not type(b):
         return False
     if isinstance(a, tuple):
@@ -152,6 +154,8 @@ def _params_exact_types_match(a: Any, b: Any) -> bool:
     if isinstance(a, frozenset):
         if len(a) != len(b):
             return False
+        if 1 not in a and 0 not in a and 1 not in b and 0 not in b:
+            return True
         return {(type(x), x) for x in a} == {(type(y), y) for y in b}
     return True
 
@@ -161,7 +165,11 @@ def _params_type_hash(obj: Any) -> int:
     if isinstance(obj, tuple):
         return hash((tuple, tuple(_params_type_hash(x) for x in obj)))
     if isinstance(obj, frozenset):
+        if 1 not in obj and 0 not in obj:
+            return hash((frozenset, obj))
         return hash((frozenset, frozenset((type(x), x) for x in obj)))
+    if isinstance(obj, (bool, int, float)):
+        return hash((type(obj), obj))
     return hash(type(obj))
 
 
@@ -214,10 +222,17 @@ class _ScopeCacheKey(_BaseScopeCacheKey):
         Cached values must be immutable (frozenset, tuple, NamedTuple, MappingProxyType,
         bool), wrapped in ``_TrackedCachedDict`` (protected by ``_downstream_cache_lock``
         with O(1) incremental node registration on insert), or returned via defensive
-        copies to callers. All custom cached value types must implement ``cached_ast_nodes()``.
-    """
+        copies to callers. All custom cached value types must implement ``cached_ast_nodes()``
+        (enforced eagerly upon cache insertion via ``_extract_value_ast_nodes``).
 
-    __slots__ = ()
+    AST Identity & Lifetime Invariant:
+        Cache keys and ``_scope_parent_maps`` hold live ``ast.AST`` object references.
+        Synthesized ephemeral unit modules must always set ``_is_ephemeral_unit_mod = True``
+        and bypass node-keyed caches so detached AST nodes never enter ``_scope_owner_keys_index``.
+        Any future code path that mutates a cached AST in place must call
+        ``_evict_tree_scopes(tree)`` prior to mutation so reverse owner and parent-map
+        indexes never become stale.
+    """
 
     def __new__(
         cls,
@@ -230,6 +245,8 @@ class _ScopeCacheKey(_BaseScopeCacheKey):
         return super().__new__(cls, owner, kind, params, aux_ast_nodes)
 
     def __eq__(self, other: object) -> bool:
+        if self is other:
+            return True
         if not isinstance(other, _ScopeCacheKey):
             return False
         if not tuple.__eq__(self, other):
@@ -242,10 +259,17 @@ class _ScopeCacheKey(_BaseScopeCacheKey):
         return not self.__eq__(other)
 
     def __hash__(self) -> int:
+        cached = self.__dict__.get("_cached_hash")
+        if cached is not None:
+            return int(cached)
         base_h = tuple.__hash__(self)
-        if not self.params:
-            return base_h
-        return hash((base_h, _params_type_hash(self.params)))
+        res = (
+            base_h
+            if not self.params
+            else hash((base_h, _params_type_hash(self.params)))
+        )
+        self.__dict__["_cached_hash"] = res
+        return res
 
 
 def _make_trusted_scope_cache_key(
@@ -391,9 +415,13 @@ def _store_parent_map_locked(
         )
     _scope_parent_maps[root_node] = parent_map
     _scope_parent_maps.move_to_end(root_node)
+    scope_boundary_nodes = [root_node]
+    for child_node in parent_map:
+        if isinstance(child_node, _SCOPE_ROOT_TYPES):
+            scope_boundary_nodes.append(child_node)
     _index_entry_ast_nodes(
         root_node,
-        (root_node, *parent_map.keys()),
+        scope_boundary_nodes,
         _parent_map_root_nodes,
         _node_to_parent_map_roots,
     )
@@ -683,10 +711,13 @@ def _evict_tree_scopes(tree: Optional[ast.AST]) -> None:
         candidate_roots: Set[ast.AST] = set()
         if tree in _scope_parent_maps:
             candidate_roots.add(tree)
-        for n in list(tree_nodes):
+        for n in scope_nodes:
             roots = _node_to_parent_map_roots.get(n)
             if roots:
                 candidate_roots.update(roots)
+        for r_node, r_pmap in _scope_parent_maps.items():
+            if tree in r_pmap:
+                candidate_roots.add(r_node)
         keys_to_remove: Set[Any] = set()
         for root_node in candidate_roots:
             pmap = _scope_parent_maps.get(root_node)
@@ -765,7 +796,24 @@ def _store_lru_cache_entry(
     value: _CacheValT,
     max_size: int,
 ) -> _CacheValT:
-    """Stores key-value pair in an OrderedDict LRU cache with per-kind caps and eviction outside lock."""
+    """Stores key-value pair in an OrderedDict LRU cache with per-kind caps and eviction outside lock.
+
+    Design Notes:
+        - ``_scope_parent_maps`` is routed through ``_store_parent_map_locked`` so its
+          reverse node-to-root indexes (``_parent_map_root_nodes`` and
+          ``_node_to_parent_map_roots``) remain synchronized on insertion and eviction.
+          Any new cache requiring reverse AST node indexing should either use
+          ``_TrackedScopeCache`` or register a dedicated reverse-index handler here.
+        - For ``_TrackedScopeCache``, per-kind ring caps (``_SCOPE_CACHE_KIND_CAPS``) evict
+          the oldest key of that specific kind before global ``_MAX_SCOPE_CACHE_SIZE``
+          eviction runs. Under mixed-kind workloads where one kind ring saturates early,
+          dropping the oldest key of that kind before global LRU eviction can produce
+          slightly non-strict global LRU ordering while preventing any single high-volume
+          kind from starving other cache kinds.
+        - ``_downstream_cache_lock`` is a reentrant ``RLock`` so nested cache lookups while
+          holding the lock are safe; callers that release the lock across ``compute_fn()``
+          and re-acquire here tolerate intermediate insertions or evictions cleanly.
+    """
     evicted_trees: List[ast.AST] = []
     with _downstream_cache_lock:
         if (
@@ -824,8 +872,13 @@ def _get_or_compute_scope_cached(
 
 
 def _split_source_lines_stripped(source_text: str) -> Tuple[str, ...]:
-    """Splits source_text on LF/CRLF boundaries only (matching AST lineno) and strips line endings."""
-    return tuple(ln.rstrip("\r\n") for ln in split_source_lines(source_text))
+    """Splits source_text on LF, CRLF, and CR boundaries (matching CPython's tokenizer) and strips line endings."""
+    normalized = (
+        source_text.replace("\r\n", "\n").replace("\r", "\n")
+        if "\r" in source_text
+        else source_text
+    )
+    return tuple(ln.rstrip("\r\n") for ln in split_source_lines(normalized))
 
 
 def _get_or_parse_tree(

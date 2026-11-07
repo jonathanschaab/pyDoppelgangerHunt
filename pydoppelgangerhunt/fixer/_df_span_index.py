@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import symtable
 from typing import (
     Dict,
     List,
@@ -678,6 +679,13 @@ def _walk_invalid_lexical_scope_declarations(
     stack = initial_stack
     while stack:
         curr, cur_bound, cur_blocked, cur_rooted = stack.pop()
+        if isinstance(curr, ast.Module):
+            d_nl = _extract_direct_nonlocals(curr, is_global=False)
+            d_g = _extract_direct_nonlocals(curr, is_global=True)
+            if d_nl & d_g:
+                return True
+            if cur_rooted and d_nl:
+                return True
         if isinstance(
             curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
         ):
@@ -715,13 +723,17 @@ def _compute_scope_invalid_lexical_declarations(
     root_scope: ast.AST,
     is_module_rooted: bool,
 ) -> bool:
-    """Checks whether root_scope has invalid lexical declarations using compile() fast-path for Module."""
+    """Checks whether root_scope has invalid lexical declarations using symtable fast-path for Module."""
     if is_module_rooted and isinstance(root_scope, ast.Module):
-        try:
-            compile(root_scope, "<ast>", "exec")
-            return False
-        except (SyntaxError, TypeError, ValueError):
-            pass
+        src_lines = getattr(root_scope, "_source_lines", None)
+        if isinstance(src_lines, (list, tuple)) and src_lines:
+            try:
+                symtable.symtable("\n".join(src_lines), "<symtable>", "exec")
+                return False
+            except SyntaxError:
+                return True
+            except (TypeError, ValueError, RecursionError, MemoryError):
+                pass
     return _walk_invalid_lexical_scope_declarations(
         [(root_scope, frozenset(), frozenset(), is_module_rooted)]
     )

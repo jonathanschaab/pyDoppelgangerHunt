@@ -40,6 +40,7 @@ from pydoppelgangerhunt.fixer._df_hazards import (
     collect_downstream_read_names,
 )
 from pydoppelgangerhunt.config import (
+    normalize_non_suppressing_ctx_managers,
     resolve_closure_strictness_mode,
     resolve_strict_with_suppression,
 )
@@ -319,10 +320,9 @@ def _ensure_pair_scopes_closure_mode(
             closure_strictness=closure_strictness,
             strict_with_suppression=u1.get("strict_with_suppression"),
         ),
-        non_suppressing_ctx_managers=(
-            non_suppressing_ctx_managers
-            if non_suppressing_ctx_managers is not None
-            else u1.get("non_suppressing_ctx_managers")
+        non_suppressing_ctx_managers=normalize_non_suppressing_ctx_managers(
+            non_suppressing_ctx_managers,
+            u1.get("non_suppressing_ctx_managers"),
         ),
         source_text=source_text1,
         tree=tree1,
@@ -336,10 +336,9 @@ def _ensure_pair_scopes_closure_mode(
             closure_strictness=closure_strictness,
             strict_with_suppression=u2.get("strict_with_suppression"),
         ),
-        non_suppressing_ctx_managers=(
-            non_suppressing_ctx_managers
-            if non_suppressing_ctx_managers is not None
-            else u2.get("non_suppressing_ctx_managers")
+        non_suppressing_ctx_managers=normalize_non_suppressing_ctx_managers(
+            non_suppressing_ctx_managers,
+            u2.get("non_suppressing_ctx_managers"),
         ),
         source_text=source_text2,
         tree=tree2,
@@ -487,6 +486,8 @@ def resolve_clone_generator_subroutine_outputs(
         for hazard_key, reason_str in (
             ("deleted_output", "deleted output hazard"),
             ("severed_closure_cell", "severed closure cell"),
+            ("stale_source_code", "stale source code"),
+            ("pathological_ast", "pathological or deeply nested AST"),
         ):
             if hazard_key in s_chk.get("control_flow_hazards", ()):
                 logger.debug(
@@ -818,18 +819,23 @@ def resolve_clone_pair_outputs(
 
     outs1 = _extract_effective_unit_outputs(u1, scope1)
     outs2 = _extract_effective_unit_outputs(u2, scope2)
-    if (
-        "severed_closure_cell" in scope1.get("control_flow_hazards", ())
-        or "severed_closure_cell" in scope2.get("control_flow_hazards", ())
+    for hazard_key, reason_str in (
+        ("severed_closure_cell", "severed closure cell"),
+        ("stale_source_code", "stale source code"),
+        ("pathological_ast", "pathological or deeply nested AST"),
     ):
-        logger.debug(
-            "Rejecting clone pair output resolution: severed closure cell"
-        )
-        return (
-            CloneOutputResolution(None, "severed closure cell")
-            if return_details
-            else None
-        )
+        if (
+            hazard_key in scope1.get("control_flow_hazards", ())
+            or hazard_key in scope2.get("control_flow_hazards", ())
+        ):
+            logger.debug(
+                "Rejecting clone pair output resolution: %s", reason_str
+            )
+            return (
+                CloneOutputResolution(None, reason_str)
+                if return_details
+                else None
+            )
     if is_sub and (
         "deleted_output" in scope1.get("control_flow_hazards", ())
         or "deleted_output" in scope2.get("control_flow_hazards", ())

@@ -22,9 +22,9 @@ from typing import (
 )
 
 from pydoppelgangerhunt.fixer._df_cache import (
-    _ScopeCacheKey,
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
+    _make_trusted_scope_cache_key,
     _scope_cell_info_cache,
     _scope_closures_cache,
 )
@@ -69,15 +69,15 @@ def _node_earliest_start_pos(
         d_col = getattr(dec, "col_offset", None)
         if isinstance(d_line, int):
             eff_d_line = d_line
-            if isinstance(d_col, int):
-                raw_at_col = max(0, d_col - 1)
-                at_col: Optional[int] = (
+            at_col: Optional[int] = (
+                min(n_col, max(0, d_col - 1))
+                if isinstance(n_col, int) and isinstance(d_col, int)
+                else (
                     n_col
-                    if isinstance(n_col, int) and n_col <= raw_at_col
-                    else raw_at_col
+                    if isinstance(n_col, int)
+                    else (max(0, d_col - 1) if isinstance(d_col, int) else best_col)
                 )
-            else:
-                at_col = best_col
+            )
             if source_lines is not None and 1 <= d_line <= len(source_lines):
                 scan_ln = d_line
                 while scan_ln >= 1:
@@ -370,7 +370,7 @@ def _get_cached_single_node_local_names(scope_node: ast.AST) -> frozenset[str]:
         frozenset[str],
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
-            _ScopeCacheKey(scope_node, "single_node_locals"),
+            _make_trusted_scope_cache_key(scope_node, "single_node_locals"),
             lambda: frozenset(_extract_single_node_local_names(scope_node)),
         ),
     )
@@ -725,7 +725,7 @@ def _node_has_star_import(root: ast.AST, *, use_cache: bool = True) -> bool:
     return bool(
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
-            _ScopeCacheKey(root, "has_star_import"),
+            _make_trusted_scope_cache_key(root, "has_star_import"),
             lambda: _node_has_star_import_uncached(root),
         )
     )
@@ -1126,7 +1126,7 @@ def _collect_scope_closures(
     cache_key: Any = (
         scope_node
         if not aux_nodes
-        else _ScopeCacheKey(
+        else _make_trusted_scope_cache_key(
             scope_node, "scope_closures", aux_ast_nodes=aux_nodes
         )
     )

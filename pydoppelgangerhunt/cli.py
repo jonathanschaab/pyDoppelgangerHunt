@@ -1206,13 +1206,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tool_cfg.get("non_suppressing_ctx_managers"),
         getattr(args, "non_suppressing_ctx_managers", ()),
     )
-    setattr(args, "resolved_closure_strictness", closure_strictness)
-    setattr(args, "resolved_skip_pre_unit_closures", skip_pre_unit_closures)
-    setattr(
-        args,
-        "resolved_non_suppressing_ctx_managers",
-        non_suppressing_ctx_managers,
-    )
     if skip_pre_unit_closures and getattr(args, "patch", False):
         logger.info(
             "Lenient closure mode active; skipping pre-unit closure scan during refactoring"

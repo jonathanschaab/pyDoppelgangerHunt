@@ -806,13 +806,18 @@ def test_with_and_async_with_definite_bindings() -> None:
 
     with_cases: list[tuple[str, set[str], bool]] = [
         (
-            "with cm1() as a, cm2() as b:\n    c = 1\n",
+            "with open('f1') as a, open('f2') as b:\n    c = 1\n",
             {"a", "b", "c"},
             False,
         ),
         (
+            "with cm1() as a, cm2() as b:\n    c = 1\n",
+            {"a"},
+            False,
+        ),
+        (
             "with cm1() as a, cm2() as b:\n    c = a + b\n",
-            {"a", "b"},
+            {"a"},
             False,
         ),
         (
@@ -2041,7 +2046,7 @@ def test_detached_unit_ast_isolation_and_stale_source_code_fail_closed() -> None
         },
         tree=ast.parse(real_mod_src),
     )
-    assert "pathological_ast" in sc_stale["control_flow_hazards"]
+    assert "stale_source_code" in sc_stale["control_flow_hazards"]
     assert sc_stale["is_control_flow_safe"] is False
 
     clear_dataflow_cache()
@@ -4164,3 +4169,475 @@ def test_granular_closure_hazard_skip_reasons_and_symtable_fuzzer(
             tree=tree,
         )
         assert unit_sc["scope_schema_version"] == 2
+
+
+def test_unit_closure_strictness_override_and_ctx_manager_merging() -> None:
+    """Verifies unit closure_strictness does not override explicit mode requests and non_suppressing_ctx_managers merges consistently."""
+    from pydoppelgangerhunt.fixer.dataflow import resolve_clone_pair_outputs
+    from pydoppelgangerhunt.fixer.scope import (
+        ensure_unit_scope_closure_mode,
+        scope_matches_closure_mode,
+    )
+    from pydoppelgangerhunt.fixer.synthesis import synthesize_shared_helper_code
+
+    src = (
+        "def outer(a):\n"
+        "    x = a + 1\n"
+        "    cb = lambda: x\n"
+        "    with CustomCtx(), UnitCtx():\n"
+        "        x = a + 2\n"
+        "        y = x * 3\n"
+        "    return cb(), x, y\n"
+    )
+    tree = ast.parse(src)
+    unit_with_strictness = {
+        "start": 4,
+        "end": 6,
+        "kind": "compound_block",
+        "source_text": src,
+        "closure_strictness": "pedantic",
+        "non_suppressing_ctx_managers": ["UnitCtx"],
+    }
+
+    # Explicit mode flags passed to ensure_unit_scope_closure_mode must override unit["closure_strictness"]
+    sc_lenient = ensure_unit_scope_closure_mode(
+        unit_with_strictness,
+        None,
+        True,
+        strict_with_suppression=False,
+        non_suppressing_ctx_managers=["GlobalCtx"],
+        tree=tree,
+    )
+    assert sc_lenient["skip_pre_unit_closures"] is True
+    assert sc_lenient["strict_with_suppression"] is False
+    assert sc_lenient["non_suppressing_ctx_managers"] == ["GlobalCtx", "UnitCtx"]
+    assert scope_matches_closure_mode(
+        sc_lenient,
+        True,
+        strict_with_suppression=False,
+        non_suppressing_ctx_managers=["GlobalCtx", "UnitCtx"],
+    )
+
+    # Precomputed scope with _lhs_pruned and merged managers must be preserved without recomputation
+    sc_pedantic = ensure_unit_scope_closure_mode(
+        unit_with_strictness,
+        None,
+        False,
+        strict_with_suppression=True,
+        non_suppressing_ctx_managers=["CustomCtx"],
+        tree=tree,
+    )
+    assert sc_pedantic["strict_with_suppression"] is True
+    assert sc_pedantic["non_suppressing_ctx_managers"] == ["CustomCtx", "UnitCtx"]
+    assert "y" in sc_pedantic["definite_stores"]
+
+    sc_marked = {**sc_pedantic, "_lhs_pruned": True}
+    sc_rechecked = ensure_unit_scope_closure_mode(
+        unit_with_strictness,
+        sc_marked,
+        False,
+        strict_with_suppression=True,
+        non_suppressing_ctx_managers=["CustomCtx"],
+        tree=tree,
+    )
+    assert sc_rechecked is sc_marked
+    assert sc_rechecked.get("_lhs_pruned") is True
+
+    # Pairing and synthesis also merge global + unit non_suppressing_ctx_managers
+    u1 = dict(unit_with_strictness, file="a.py", name="b1")
+    u2 = dict(unit_with_strictness, file="b.py", name="b2")
+    paired = resolve_clone_pair_outputs(
+        u1,
+        u2,
+        sc_marked,
+        dict(sc_marked),
+        source_text1=src,
+        source_text2=src,
+        tree1=tree,
+        tree2=tree,
+        closure_strictness="pedantic",
+        non_suppressing_ctx_managers=["CustomCtx"],
+    )
+    assert paired == (["x", "y"], ["x", "y"])
+
+    helper_code = synthesize_shared_helper_code(
+        u1,
+        u2,
+        scope1=sc_marked,
+        scope2=dict(sc_marked),
+        tree1=tree,
+        tree2=tree,
+        closure_strictness="pedantic",
+        non_suppressing_ctx_managers=["CustomCtx"],
+    )
+    assert "with CustomCtx(), UnitCtx():" in helper_code
+
+
+def test_multi_item_with_subsequent_targets_and_walrus_after_suppressor() -> None:
+    """Verifies that in a multi-item with statement, items after a suppressing or unknown item bind targets and walrus names only conditionally."""
+    from pydoppelgangerhunt.fixer._df_cell_carriers import _SpanBounds
+    from pydoppelgangerhunt.fixer._df_cell_traversal import (
+        _analyze_enclosing_fn_cells,
+    )
+    from pydoppelgangerhunt.fixer.scope import _analyze_block_assignment
+
+    # 1. Intra-unit _analyze_block_assignment: item 1 suppresses, item 2 has `as res` and `(w := ...)`
+    unit_src = (
+        "with suppress(ValueError), (w := acquire()) as res:\n"
+        "    body_var = 1\n"
+    )
+    stmts = ast.parse(unit_src).body
+    def_assigned, cond_assigned = _analyze_block_assignment(stmts)
+    assert "res" not in def_assigned
+    assert "w" not in def_assigned
+    assert "body_var" not in def_assigned
+    assert {"res", "w", "body_var"} <= cond_assigned
+
+    # 2. Item 1 is safe (open), item 2 suppresses, item 3 is after suppressor: items 1 & 2 bind definitely, item 3 and raising body bind conditionally
+    unit_src2 = (
+        "with open((w1 := 'f')) as safe_res, suppress((w2 := get_err())) as sup_res, open((w3 := 'g')) as post_sup_res:\n"
+        "    body_var = may_raise()\n"
+    )
+    stmts2 = ast.parse(unit_src2).body
+    def2, cond2 = _analyze_block_assignment(stmts2)
+    assert {"w1", "safe_res", "w2", "sup_res"} <= def2
+    assert "w3" not in def2
+    assert "post_sup_res" not in def2
+    assert "body_var" not in def2
+    assert {"w3", "post_sup_res", "body_var"} <= cond2
+
+    # 3. Enclosing cell traversal: pre-unit multi-item `with` where item 1 suppresses and item 2 binds `x` via `as` and `w`/`u` via walrus
+    enc_src = (
+        "def outer(f, g, d):\n"
+        "    with suppress(RuntimeError), (w := f()) as (x, d[(u := g())]):\n"
+        "        z = 1\n"
+        "    target = 10\n"
+        "    return x, w, u, z, target\n"
+    )
+    enc_tree = ast.parse(enc_src)
+    fn_node = enc_tree.body[0]
+    info = _analyze_enclosing_fn_cells(
+        fn_node,
+        _SpanBounds(4, 4, 4, 15),
+        mod_tree=enc_tree,
+    )
+    assert "x" not in info.pre_bound
+    assert "w" not in info.pre_bound
+    assert "u" not in info.pre_bound
+    assert "z" not in info.pre_bound
+    assert {"x", "w", "u", "z"} <= info.pre_mutated
+    assert {"x", "w", "u", "z"} <= (info.fn_locals - info.pre_bound)
+
+
+def test_nested_helper_purity_builtins_and_star_import_rejection() -> None:
+    """Verifies nested helper promotion rejects impure builtins (dir, vars, print, eval) and wildcard imports."""
+    for impure_call in ("dir()", "vars()", "print('hi')", "eval('1')"):
+        src = (
+            "def outer(a):\n"
+            f"    def helper(v):\n"
+            f"        return {impure_call}\n"
+            "    x = helper(a)\n"
+            "    return x\n"
+        )
+        sc = inspect_single_unit_scope(
+            {
+                "start": 4,
+                "end": 4,
+                "kind": "basic_block",
+                "source_text": src,
+            },
+            tree=ast.parse(src),
+        )
+        assert "helper" in sc["inputs"]
+
+    star_src = (
+        "from math import *\n"
+        "def outer(a):\n"
+        "    def helper(v):\n"
+        "        return cos(v)\n"
+        "    x = helper(a)\n"
+        "    return x\n"
+    )
+    sc_star = inspect_single_unit_scope(
+        {
+            "start": 5,
+            "end": 5,
+            "kind": "basic_block",
+            "source_text": star_src,
+        },
+        tree=ast.parse(star_src),
+    )
+    assert "helper" in sc_star["inputs"]
+
+
+def test_normalized_source_code_equivalence_and_stale_source_code_hazard(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies comment-stripped/formatted source_code is accepted while genuinely stale source_code reports stale_source_code."""
+    import logging
+    from pydoppelgangerhunt.fixer.patch import generate_refactoring_patch
+
+    mod_src = (
+        "def f1(a):\n"
+        "    x = a + 1  # inline comment\n"
+        "    y = x * 2  # another comment\n"
+        "    return y\n\n"
+        "def f2(a):\n"
+        "    x = a + 1  # comment b\n"
+        "    y = x * 2\n"
+        "    return y\n"
+    )
+    tree = ast.parse(mod_src)
+
+    # Comment-stripped and whitespace-normalized source_code matches raw_lines without hazard
+    sc_norm = inspect_single_unit_scope(
+        {
+            "start": 2,
+            "end": 3,
+            "kind": "basic_block",
+            "source_text": mod_src,
+            "source_code": "x=a+1\ny=x*2\n",
+        },
+        tree=tree,
+    )
+    assert sc_norm["is_control_flow_safe"] is True
+    assert "stale_source_code" not in sc_norm["control_flow_hazards"]
+    assert "pathological_ast" not in sc_norm["control_flow_hazards"]
+    assert sc_norm["inputs"] == ["a"]
+
+    # Genuinely stale source_code reports stale_source_code (and not pathological_ast)
+    f_path = tmp_path / "stale_mod.py"
+    f_path.write_text(mod_src, encoding="utf-8")
+    u_stale1 = {
+        "file": str(f_path),
+        "start": 2,
+        "end": 3,
+        "name": "u1",
+        "kind": "basic_block",
+        "source_code": "unrelated_stale = 123\nother_stale = 456\n",
+    }
+    u_stale2 = {
+        "file": str(f_path),
+        "start": 7,
+        "end": 8,
+        "name": "u2",
+        "kind": "basic_block",
+        "source_code": "unrelated_stale = 123\nother_stale = 456\n",
+    }
+    with caplog.at_level(logging.INFO):
+        patch_res = generate_refactoring_patch(
+            [(0.99, u_stale1, u_stale2)],
+            repo_root=str(tmp_path),
+            replace_clones=True,
+        )
+    assert patch_res == ""
+    assert "stale source code" in caplog.text
+
+
+def test_slice_unit_token_lines_and_compile_warning_suppression() -> None:
+    """Verifies _slice_unit_token_lines pre-sliced handling and _has_invalid_lexical_scope_declarations SyntaxWarning suppression."""
+    import warnings
+    from pydoppelgangerhunt.fixer._df_span_index import (
+        _has_invalid_lexical_scope_declarations,
+    )
+    from pydoppelgangerhunt.fixer.source import _slice_unit_token_lines
+
+    # 1. Explicit is_pre_sliced=False on a 2-line file where unit is lines 1..2
+    full_two_lines = ["a = 1\n", "b = 2\n"]
+    sliced_full = _slice_unit_token_lines(
+        {"start": 1, "end": 2},
+        full_two_lines,
+        is_pre_sliced=False,
+    )
+    assert sliced_full == ["a = 1\n", "b = 2\n"]
+
+    # 2. Line-sliced source_lines (without source_lines_is_sliced) still undergoes column slicing
+    sc_col = inspect_single_unit_scope(
+        {
+            "start": 5,
+            "end": 5,
+            "start_col": 11,
+            "end_col": 16,
+            "kind": "complex_expr",
+            "source_lines": ["    a = 1; b + a\n"],
+        }
+    )
+    assert sc_col["inputs"] == ["b", "a"] or set(sc_col["inputs"]) == {"a", "b"}
+
+    # 3. Pre-sliced multi-line snippet with start_col/end_col is not double-sliced
+    pre_sliced_multi = ["x = (\n", "    a + 1\n", ")"]
+    res_multi = _slice_unit_token_lines(
+        {"start": 10, "end": 12, "start_col": 4, "end_col": 5},
+        pre_sliced_multi,
+        is_pre_sliced=True,
+        explicit_col_sliced=True,
+    )
+    assert res_multi == pre_sliced_multi
+
+    # 4. _has_invalid_lexical_scope_declarations suppresses SyntaxWarning from invalid escape sequences
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        warn_mod = ast.parse('def f():\n    s = "\\d+"\n    return 1 is 1\n')
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        is_invalid = _has_invalid_lexical_scope_declarations(
+            [warn_mod.body[0]], mod_tree=warn_mod
+        )
+    assert is_invalid is False
+    assert not [w for w in caught if issubclass(w.category, SyntaxWarning)]
+
+
+def test_aliased_suppress_provenance_and_deep_nested_with_early_return() -> None:
+    """Verifies aliased suppress/ExitStack/custom classes under strict mode and deep nested with + early return propagation."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _block_terminates,
+        _extract_block_definite_bindings_and_term,
+        _seed_scope_suppress_aliases,
+    )
+
+    # 1. Benign-named local aliases of suppress, ExitStack, and custom suppressing classes in strict mode
+    alias_src = (
+        "from contextlib import suppress, ExitStack\n"
+        "class CustomSwallower:\n"
+        "    def __enter__(self):\n"
+        "        return self\n"
+        "    def __exit__(self, exc_type, exc, tb):\n"
+        "        return True\n"
+        "def outer(f):\n"
+        "    benign_sup = suppress\n"
+        "    benign_stack = ExitStack()\n"
+        "    benign_custom = CustomSwallower()\n"
+        "    with benign_sup(ValueError):\n"
+        "        a = f()\n"
+        "    with benign_stack:\n"
+        "        b = f()\n"
+        "    with benign_custom:\n"
+        "        c = f()\n"
+        "    return 0\n"
+    )
+    alias_tree = ast.parse(alias_src)
+    sc_alias_strict = inspect_single_unit_scope(
+        {
+            "start": 11,
+            "end": 16,
+            "kind": "compound_block",
+            "source_text": alias_src,
+            "closure_strictness": "strict",
+            "non_suppressing_ctx_managers": [
+                "benign_sup",
+                "benign_stack",
+                "benign_custom",
+            ],
+        },
+        tree=alias_tree,
+    )
+    assert set(sc_alias_strict["definite_stores"]) == set()
+    assert {"a", "b", "c"} <= set(sc_alias_strict["conditional_outputs"])
+
+    # 2. Deep 3-level nested with + early return: open -> tx_lock -> suppress
+    deep_sup_src = (
+        "from contextlib import suppress\n"
+        "def outer(f1, tx_lock, compute):\n"
+        "    with open(f1):\n"
+        "        with tx_lock():\n"
+        "            with suppress(ValueError):\n"
+        "                x = compute()\n"
+        "                return x\n"
+        "    after = 1\n"
+        "    return after\n"
+    )
+    deep_sup_tree = ast.parse(deep_sup_src)
+    deep_sup_fn = deep_sup_tree.body[1]
+    prov_sup = _seed_scope_suppress_aliases(deep_sup_fn, mod_tree=deep_sup_tree)
+    for strict_with in (False, True):
+        assert (
+            _block_terminates(
+                [deep_sup_fn.body[0]],  # type: ignore[attr-defined]
+                suppress_aliases=prov_sup,
+                strict_with_suppression=strict_with,
+            )
+            is False
+        )
+        bound_ds, term_ds = _extract_block_definite_bindings_and_term(
+            deep_sup_fn.body[:2],  # type: ignore[attr-defined]
+            None,
+            suppress_aliases=prov_sup,
+            strict_with_suppression=strict_with,
+        )
+        assert "after" in bound_ds
+        assert "x" not in bound_ds
+        assert term_ds is False
+
+    # 3. Deep 3-level nested with + early return: open -> tx_lock -> open (strict vs pedantic vs allowlist)
+    deep_unk_src = (
+        "def outer(f1, f2, compute):\n"
+        "    with open(f1):\n"
+        "        with tx_lock():\n"
+        "            with open(f2):\n"
+        "                x = compute()\n"
+        "                return x\n"
+        "    after = 1\n"
+        "    return after\n"
+    )
+    deep_unk_tree = ast.parse(deep_unk_src)
+    deep_unk_fn = deep_unk_tree.body[0]
+    prov_unk = _seed_scope_suppress_aliases(deep_unk_fn, mod_tree=deep_unk_tree)
+    assert (
+        _block_terminates(
+            [deep_unk_fn.body[0]],  # type: ignore[attr-defined]
+            suppress_aliases=prov_unk,
+            strict_with_suppression=False,
+        )
+        is True
+    )
+    assert (
+        _block_terminates(
+            [deep_unk_fn.body[0]],  # type: ignore[attr-defined]
+            suppress_aliases=prov_unk,
+            strict_with_suppression=True,
+        )
+        is False
+    )
+    assert (
+        _block_terminates(
+            [deep_unk_fn.body[0]],  # type: ignore[attr-defined]
+            suppress_aliases=prov_unk,
+            strict_with_suppression=True,
+            extra_non_suppressing_ctx_managers=frozenset({"tx_lock"}),
+        )
+        is True
+    )
+
+    # 4. Nested pytest.raises inside suppress(Exception) is NOT treated as non-raising on normal exit
+    raises_in_sup_src = (
+        "with suppress(Exception):\n"
+        "    with pytest.raises(ValueError):\n"
+        "        x = 10\n"
+        "        return x\n"
+        "after = 2\n"
+    )
+    raises_in_sup_stmts = ast.parse(raises_in_sup_src).body
+    assert _block_terminates([raises_in_sup_stmts[0]]) is False
+    bound_ris, term_ris = _extract_block_definite_bindings_and_term(
+        raises_in_sup_stmts, None
+    )
+    assert bound_ris == {"after"}
+    assert term_ris is False
+
+    # 5. Nested suppress assigning non-raising variable read by outer return + unreachable trailing call
+    nested_safe_ret_src = (
+        "with suppress(ValueError):\n"
+        "    with suppress(KeyError):\n"
+        "        x = 10\n"
+        "    return x\n"
+        "    risky_unreachable()\n"
+    )
+    nested_safe_ret_stmts = ast.parse(nested_safe_ret_src).body
+    assert _block_terminates([nested_safe_ret_stmts[0]]) is True
+    bound_nsr, term_nsr = _extract_block_definite_bindings_and_term(
+        nested_safe_ret_stmts, None
+    )
+    assert bound_nsr == {"x"}
+    assert term_nsr is True
+
+

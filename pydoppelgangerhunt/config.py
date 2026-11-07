@@ -52,11 +52,17 @@ def resolve_closure_strictness_mode(
             return "lenient", True
         if c_mode in ("pedantic", "strict_with", "strict", "fail_closed"):
             if skip_pre_unit_closures:
-                logger.warning(
-                    "Conflicting configuration: closure_strictness '%s' takes precedence over "
-                    "skip_pre_unit_closures=True",
-                    closure_strictness,
-                )
+                conflict_key = f"conflict_skip:{closure_strictness}"
+                with _warned_closure_lock:
+                    should_warn_conflict = conflict_key not in _warned_closure_strictness_values
+                    if should_warn_conflict:
+                        _warned_closure_strictness_values.add(conflict_key)
+                if should_warn_conflict:
+                    logger.warning(
+                        "Conflicting configuration: closure_strictness '%s' takes precedence over "
+                        "skip_pre_unit_closures=True",
+                        closure_strictness,
+                    )
             resolved_mode = (
                 "pedantic"
                 if c_mode in ("pedantic", "strict_with", "fail_closed")
@@ -86,6 +92,8 @@ def resolve_strict_with_suppression(
 ) -> bool:
     """Resolves whether unproven unknown context managers are treated as potentially suppressing.
 
+    ``strict_with_suppression`` is retained for backward compatibility; prefer configuring
+    the unified ``closure_strictness`` knob (``"strict"``, ``"pedantic"``, or ``"lenient"``).
     When both ``closure_strictness`` and ``strict_with_suppression`` are provided,
     ``closure_strictness`` takes precedence and logs a warning on conflict, matching
     ``resolve_closure_strictness_mode``.
@@ -107,12 +115,18 @@ def resolve_strict_with_suppression(
                 strict_with_suppression is not None
                 and bool(strict_with_suppression) != resolved_flag
             ):
-                logger.warning(
-                    "Conflicting configuration: closure_strictness '%s' takes precedence over "
-                    "strict_with_suppression=%s",
-                    closure_strictness,
-                    bool(strict_with_suppression),
-                )
+                conflict_key = f"conflict_strict_with:{closure_strictness}:{bool(strict_with_suppression)}"
+                with _warned_closure_lock:
+                    should_warn_conflict = conflict_key not in _warned_closure_strictness_values
+                    if should_warn_conflict:
+                        _warned_closure_strictness_values.add(conflict_key)
+                if should_warn_conflict:
+                    logger.warning(
+                        "Conflicting configuration: closure_strictness '%s' takes precedence over "
+                        "strict_with_suppression=%s",
+                        closure_strictness,
+                        bool(strict_with_suppression),
+                    )
             return resolved_flag
     if strict_with_suppression is not None:
         return bool(strict_with_suppression)
@@ -125,7 +139,7 @@ def normalize_non_suppressing_ctx_managers(*sources: Any) -> Tuple[str, ...]:
     stack: List[Any] = list(sources)
     while stack:
         item = stack.pop()
-        if item is None or isinstance(item, bool):
+        if item is None:
             continue
         if isinstance(item, str):
             for part in item.split(","):
@@ -134,6 +148,18 @@ def normalize_non_suppressing_ctx_managers(*sources: Any) -> Tuple[str, ...]:
                     collected.add(cleaned)
         elif isinstance(item, (list, tuple, set, frozenset)):
             stack.extend(item)
+        else:
+            invalid_key = f"invalid_non_sup_type:{type(item).__name__}"
+            with _warned_closure_lock:
+                should_warn = invalid_key not in _warned_closure_strictness_values
+                if should_warn:
+                    _warned_closure_strictness_values.add(invalid_key)
+            if should_warn:
+                logger.warning(
+                    "Ignoring unsupported non_suppressing_ctx_managers value of type %s; "
+                    "expected string or sequence of strings",
+                    type(item).__name__,
+                )
     return tuple(sorted(collected))
 
 
@@ -175,7 +201,9 @@ exclude = [
 ]
 call_sequences = true
 idioms = true
-# closure_strictness = "strict"  # Options: "strict", "lenient"
+# closure_strictness = "strict"  # Options: "strict", "pedantic", "lenient"
+# strict_with_suppression = false  # Deprecated compatibility alias; prefer closure_strictness = "pedantic"
+# non_suppressing_ctx_managers = ["mylib.SafeTransaction"]
 """
 
 

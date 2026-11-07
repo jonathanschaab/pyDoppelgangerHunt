@@ -1333,8 +1333,8 @@ def synthesize_shared_helper_code(
         repo_root: Optional root directory of the repository for relative path resolution.
         helper_name: Optional custom helper name override.
         skip_pre_unit_closures: Whether to bypass scanning pre-unit AST closures.
-        closure_strictness: Closure isolation strictness ("strict" / "fail_closed" vs
-            "lenient" / "fast" / "skip").
+        closure_strictness: Closure isolation strictness ("strict", "pedantic" / "fail_closed" /
+            "strict_with", or "lenient" / "fast" / "skip").
         outputs: Optional pre-resolved output variable names for u1.
         outputs2: Optional pre-resolved output variable names for u2.
     """
@@ -1427,14 +1427,12 @@ def synthesize_shared_helper_code(
         strict_with_suppression=u2.get("strict_with_suppression"),
     )
     eff_non_sup1 = normalize_non_suppressing_ctx_managers(
-        non_suppressing_ctx_managers
-        if non_suppressing_ctx_managers is not None
-        else u1.get("non_suppressing_ctx_managers")
+        non_suppressing_ctx_managers,
+        u1.get("non_suppressing_ctx_managers"),
     )
     eff_non_sup2 = normalize_non_suppressing_ctx_managers(
-        non_suppressing_ctx_managers
-        if non_suppressing_ctx_managers is not None
-        else u2.get("non_suppressing_ctx_managers")
+        non_suppressing_ctx_managers,
+        u2.get("non_suppressing_ctx_managers"),
     )
     if eff_non_sup1:
         u1["non_suppressing_ctx_managers"] = list(eff_non_sup1)
@@ -1633,6 +1631,7 @@ def synthesize_shared_helper_code(
         for h in (
             "type_param_closure_capture",
             "pathological_ast",
+            "stale_source_code",
             "deleted_output",
             "severed_closure_cell",
         )

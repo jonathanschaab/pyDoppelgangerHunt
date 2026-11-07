@@ -304,7 +304,7 @@ def _get_fn_scope_context(
         *((mod_tree,) if mod_tree is not None else ()),
         *norm_enclosing,
     )
-    cache_key = _ScopeCacheKey(
+    cache_key = _make_trusted_scope_cache_key(
         scope_node,
         "fn_scope_ctx",
         aux_ast_nodes=aux_nodes,
@@ -474,7 +474,7 @@ def _extract_closure_nonlocal_mutations_and_deletions(
     return _resolve_cached_str_set_pair(
         scope_node,
         (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
-        _ScopeCacheKey(scope_node, "nl_muts_dels"),
+        _make_trusted_scope_cache_key(scope_node, "nl_muts_dels"),
         lambda c: _extract_closure_nonlocal_mutations_and_deletions_uncached(scope_node, use_cache=c),
         use_cache=use_cache,
     )
@@ -500,7 +500,7 @@ def _extract_cached_scope_free_reads(
     raw = (
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
-            _ScopeCacheKey(node, "free_reads"),
+            _make_trusted_scope_cache_key(node, "free_reads"),
             lambda: frozenset(_extract_nested_scope_free_reads(node)),
         )
         if use_cache

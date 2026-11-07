@@ -2947,3 +2947,45 @@ def test_resolve_closure_strictness_mode_config_conflict_warning(
         for r in caplog.records
     )
 
+
+def test_cli_strict_with_suppression_config_and_ctx_manager_merging(
+    tmp_path: Path,
+) -> None:
+    """Verifies strict_with_suppression in pyproject.toml maps to pedantic closure_strictness and normalize_non_suppressing_ctx_managers merges variadic inputs."""
+    from pydoppelgangerhunt.cli import main  # pylint: disable=import-outside-toplevel
+    from pydoppelgangerhunt.config import (  # pylint: disable=import-outside-toplevel
+        normalize_non_suppressing_ctx_managers,
+    )
+
+    merged = normalize_non_suppressing_ctx_managers(
+        "LockA, LockB",
+        ["LockB", "pkg.LockC"],
+        None,
+        ("LockA", "LockD"),
+    )
+    assert merged == ("LockA", "LockB", "LockD", "pkg.LockC")
+
+    repo = tmp_path / "strict_with_repo"
+    repo.mkdir()
+    patch_out = repo / "refactor.patch"
+    (repo / "f.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "pyproject.toml").write_text(
+        "[tool.pydoppelgangerhunt]\nstrict_with_suppression = true\n",
+        encoding="utf-8",
+    )
+    dummy_clone = (
+        0.95,
+        {"name": "u1", "file": "f.py", "start": 1, "end": 1},
+        {"name": "u2", "file": "f.py", "start": 1, "end": 1},
+    )
+    with mock.patch("pydoppelgangerhunt.cli.scan_target", return_value=[dummy_clone]):
+        with mock.patch(
+            "pydoppelgangerhunt.cli.generate_refactoring_patch", return_value="# patch\n"
+        ) as mock_patch:
+            exit_code = main([str(repo), "--patch", str(patch_out)])
+            assert exit_code == 1
+            _, kwargs = mock_patch.call_args
+            assert kwargs.get("closure_strictness") == "pedantic"
+            assert kwargs.get("skip_pre_unit_closures") is False
+
+

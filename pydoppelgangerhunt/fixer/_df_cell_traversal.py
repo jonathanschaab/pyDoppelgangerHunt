@@ -20,10 +20,10 @@ from typing import (
 )
 
 from pydoppelgangerhunt.fixer._df_cache import (
-    _ScopeCacheKey,
     _downstream_cache_lock,
     _get_or_compute_scope_cached,
     _get_scope_parent_map,
+    _make_trusted_scope_cache_key,
     _scope_cell_info_cache,
 )
 from pydoppelgangerhunt.fixer._df_cell_carriers import (
@@ -70,11 +70,15 @@ from pydoppelgangerhunt.fixer._df_visitors import (
 )
 from pydoppelgangerhunt.fixer._df_with_provenance import (
     _SuppressProvenance,
+    _clear_store_target_provenance,
     _coerce_suppress_provenance,
     _extract_block_definite_bindings,
     _extract_shallow_deleted_names,
+    _is_non_raising_store_target,
     _seed_scope_suppress_aliases,
+    _update_suppress_provenance_from_expr_walrus,
     _update_suppress_provenance_from_stmt,
+    _with_item_may_suppress_exceptions,
 )
 from pydoppelgangerhunt.parser import iter_nested_scope_header_nodes
 
@@ -454,9 +458,78 @@ def _push_compound_children(
             act_nl,
             force_after_span=f_after,
         )
-        _push_seq(
-            stack, curr.items, is_br, in_lp, act_nl, force_after_span=f_after
+        active_sup = _coerce_suppress_provenance(
+            pre_stmt_suppress
+            if pre_stmt_suppress is not None
+            else state.suppress_aliases
         )
+        item_prov = active_sup
+        after_sup = False
+        item_frames: List[_StackFrame] = []
+        for item in curr.items:
+            item_br = is_br or (after_sup and not encloses)
+            w_prov = _update_suppress_provenance_from_expr_walrus(
+                (item.context_expr,),
+                item_prov,
+                allow_positive=not item_br,
+            )
+            item_prov = (
+                item_prov.merge_branch_conservative(w_prov)
+                if item_br
+                else w_prov
+            )
+            item_may_sup = _with_item_may_suppress_exceptions(
+                item.context_expr,
+                item_prov,
+                strict_with_suppression=state.strict_with_suppression,
+                extra_non_suppressing_ctx_managers=state.extra_non_suppressing_ctx_managers,
+            )
+            if (
+                not encloses
+                and not item_br
+                and item_may_sup
+                and item.optional_vars is not None
+                and not _is_non_raising_store_target(item.optional_vars)
+            ):
+                item_frames.append(
+                    _StackFrame(
+                        item.context_expr,
+                        item_br,
+                        in_lp,
+                        act_nl,
+                        force_after_span=f_after,
+                    )
+                )
+                item_frames.append(
+                    _StackFrame(
+                        item.optional_vars,
+                        True,
+                        in_lp,
+                        act_nl,
+                        force_after_span=f_after,
+                    )
+                )
+            else:
+                item_frames.append(
+                    _StackFrame(
+                        item,
+                        item_br,
+                        in_lp,
+                        act_nl,
+                        force_after_span=f_after,
+                    )
+                )
+            if item.optional_vars is not None:
+                opt_cond = item_br or (
+                    item_may_sup
+                    and not _is_non_raising_store_target(item.optional_vars)
+                )
+                item_prov = _clear_store_target_provenance(
+                    item.optional_vars, item_prov, is_conditional=opt_cond
+                )
+            if item_may_sup:
+                after_sup = True
+        stack.extend(reversed(item_frames))
         return True
 
     if isinstance(curr, ast.Try) or type(curr).__name__ == "TryStar":
@@ -1153,7 +1226,7 @@ def _try_apply_cached_stmt_delta(
     )
     key: Tuple[Any, ...] = (
         (stmt, is_before, sup_key, strict_w, init_pre_bound, extra_non_sup)
-        if (sup_key or strict_w or init_pre_bound or extra_non_sup)
+        if has_with and (sup_key or strict_w or init_pre_bound or extra_non_sup)
         else (stmt, is_before)
     )
     with _downstream_cache_lock:
@@ -1229,7 +1302,10 @@ def _try_apply_cached_stmt_delta(
         and bufs.state.suppress_aliases is not None
     ):
         bufs.state.suppress_aliases = _update_suppress_provenance_from_stmt(
-            stmt, pre_prov
+            stmt,
+            pre_prov,
+            strict_with_suppression=strict_w,
+            extra_non_suppressing_ctx_managers=extra_non_sup,
         )
     _apply_stmt_cell_delta(
         bufs, delta, is_branched=is_branched, in_loop=in_loop
@@ -1290,7 +1366,10 @@ def _traverse_fn_cell_frames(
             and _is_frame_before_span(c_line, c_col, span, frame)
         ):
             bufs.state.suppress_aliases = _update_suppress_provenance_from_stmt(
-                curr, bufs.state.suppress_aliases
+                curr,
+                bufs.state.suppress_aliases,
+                strict_with_suppression=bufs.state.strict_with_suppression,
+                extra_non_suppressing_ctx_managers=bufs.state.extra_non_suppressing_ctx_managers,
             )
 
         if curr is enclosed_fn:
@@ -1589,7 +1668,7 @@ def _analyze_enclosing_fn_cells_uncached(
             Dict[Tuple[Any, ...], Optional[_StmtCellDelta]],
             _get_or_compute_scope_cached(
                 _scope_cell_info_cache,
-                _ScopeCacheKey(
+                _make_trusted_scope_cache_key(
                     owner=fn_node,
                     kind="stmt_deltas",
                     aux_ast_nodes=delta_aux_nodes,
@@ -1772,7 +1851,7 @@ def _analyze_enclosing_fn_cells(
         if strict_with_suppression
         else (norm_span, frozenset(unit_mutations), enclosed_fn is not None)
     )
-    cache_key = _ScopeCacheKey(
+    cache_key = _make_trusted_scope_cache_key(
         owner=fn_node,
         kind="enclosing_fn_cells",
         params=params,
@@ -1820,7 +1899,7 @@ def _find_enclosing_method_class_names(
         frozenset[str],
         _get_or_compute_scope_cached(
             _scope_cell_info_cache,
-            _ScopeCacheKey(
+            _make_trusted_scope_cache_key(
                 owner=fn_node,
                 kind="method_cls_names",
                 aux_ast_nodes=(enc_child,),
@@ -1935,7 +2014,12 @@ def _find_enclosing_chain_definite_pre_bound(
     strict_with_suppression: bool = False,
     extra_non_suppressing_ctx_managers: AbstractSet[str] = frozenset(),
 ) -> Set[str]:
-    """Computes variables definitely bound prior to the unit across enclosing functions."""
+    """Computes variables must-bound (definitely assigned) on all paths prior to the unit.
+
+    Complements ``_find_enclosing_pre_bound_names`` (which computes may-bound names
+    across module, class, and function scopes) by performing branch-sensitive definite
+    assignment analysis across the enclosing function/comprehension chain.
+    """
     chain_infos = _build_enclosing_chain_cell_infos(
         enclosing_chain,
         u_start,

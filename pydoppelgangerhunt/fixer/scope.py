@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import ast
 import builtins
+import io
 import logging
 import re
 import textwrap
+import tokenize
 from typing import (
     Any,
     Dict,
@@ -1067,7 +1069,15 @@ def _find_enclosing_pre_bound_names(
     u_start_col: Optional[int] = None,
     u_end_col: Optional[int] = None,
 ) -> Tuple[Set[str], bool]:
-    """Finds names bound before s_line in scopes enclosing [s_line, e_line] and loop containment."""
+    """Finds names may-bound before s_line in enclosing module/class/function scopes.
+
+    Unlike ``_find_enclosing_chain_definite_pre_bound`` (which computes must-bound
+    definite assignment across every control-flow path in enclosing functions), this
+    function collects all names that have a lexical binding on at least one path prior
+    to the unit across module, class, and function scopes, and reports whether the unit
+    is enclosed inside a loop. Comparing the may-bound set against the must-bound set
+    identifies variables that are only conditionally initialized before the unit.
+    """
     bound_before: Set[str] = set()
     in_loop = False
 
@@ -1569,6 +1579,78 @@ def _is_ordered_contiguous_source_match(
     return False
 
 
+def _parse_normalized_stmt_dumps(text: str) -> Optional[List[str]]:
+    """Parses a code snippet into position-independent AST statement dumps."""
+    dedented = dedent_source_text(text).strip()
+    if not dedented:
+        return None
+    for cand in (
+        dedented,
+        f"if 1:\n{textwrap.indent(dedented, '    ')}",
+        f"def _norm_wrap():\n{textwrap.indent(dedented, '    ')}",
+        f"async def _norm_wrap():\n{textwrap.indent(dedented, '    ')}",
+    ):
+        try:
+            parsed = ast.parse(cand)
+            if cand == dedented:
+                stmts = parsed.body
+            else:
+                stmts = getattr(parsed.body[0], "body", [])
+            if stmts:
+                return [ast.dump(s, include_attributes=False) for s in stmts]
+        except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):
+            continue
+    return None
+
+
+def _strip_inline_comment_line(line: str) -> str:
+    """Strips trailing Python comments and normalizes intra-line token spacing."""
+    try:
+        toks: List[str] = []
+        for tok in tokenize.generate_tokens(io.StringIO(line).readline):
+            if tok.type in (
+                tokenize.COMMENT,
+                tokenize.NL,
+                tokenize.NEWLINE,
+                tokenize.INDENT,
+                tokenize.DEDENT,
+                tokenize.ENCODING,
+                tokenize.ENDMARKER,
+            ):
+                continue
+            toks.append(tok.string)
+        return " ".join(toks)
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return line.split("#", 1)[0].strip()
+
+
+def _is_normalized_source_equivalent(
+    src_code: str,
+    raw_lines: Sequence[str],
+) -> bool:
+    """Checks whether normalized or comment-stripped src_code matches raw_lines."""
+    src_dumps = _parse_normalized_stmt_dumps(src_code)
+    raw_dumps = _parse_normalized_stmt_dumps("".join(raw_lines))
+    if src_dumps and raw_dumps and len(src_dumps) <= len(raw_dumps):
+        k = len(src_dumps)
+        if any(
+            raw_dumps[i : i + k] == src_dumps
+            for i in range(len(raw_dumps) - k + 1)
+        ):
+            return True
+    norm_src_lines = [
+        s
+        for s in (_strip_inline_comment_line(ln) for ln in split_source_lines(src_code))
+        if s
+    ]
+    norm_raw_lines = [
+        s for s in (_strip_inline_comment_line(ln) for ln in raw_lines) if s
+    ]
+    if norm_src_lines and norm_raw_lines:
+        return _is_ordered_contiguous_source_match(norm_src_lines, norm_raw_lines)
+    return False
+
+
 def _inspect_unit_scope(
     unit: Dict[str, Any],
     repo_root: Optional[str] = None,
@@ -1586,6 +1668,7 @@ def _inspect_unit_scope(
     unit_code_lines, is_pre_sliced = extract_unit_source_lines_with_state(
         unit, repo_root=repo_root
     )
+    explicit_col_sliced = bool(unit.get("source_lines_is_sliced"))
     inferred_s_col, inferred_e_col = _unit_cols(unit, unit_code_lines)
     slice_unit = (
         {**unit, "start_col": inferred_s_col, "end_col": inferred_e_col}
@@ -1593,7 +1676,10 @@ def _inspect_unit_scope(
         else unit
     )
     raw_lines = _slice_unit_token_lines(
-        slice_unit, unit_code_lines, is_pre_sliced=is_pre_sliced
+        slice_unit,
+        unit_code_lines,
+        is_pre_sliced=is_pre_sliced,
+        explicit_col_sliced=explicit_col_sliced,
     )
     src_code_str = (
         unit["source_code"].strip()
@@ -1673,6 +1759,9 @@ def _inspect_unit_scope(
             and not _is_ordered_contiguous_source_match(
                 src_code_lines, raw_lines
             )
+            and not _is_normalized_source_equivalent(
+                str(unit["source_code"]), raw_lines
+            )
         ):
             stale_source_code_mismatch = True
         else:
@@ -1736,7 +1825,7 @@ def _inspect_unit_scope(
     if stale_source_code_mismatch:
         return {
             **empty_res,
-            "control_flow_hazards": ["pathological_ast"],
+            "control_flow_hazards": ["stale_source_code"],
             "is_control_flow_safe": False,
         }
     if is_placeholder_source and file_tree is None:
@@ -2566,14 +2655,35 @@ def inspect_single_unit_scope(
         or strict_with_suppression is not None
         or non_suppressing_ctx_managers is not None
     ):
+        orig_strictness = unit.get("closure_strictness")
         unit = dict(unit)
-        if skip_pre_unit_closures is not None:
-            unit["skip_pre_unit_closures"] = bool(skip_pre_unit_closures)
-        if strict_with_suppression is not None:
-            unit["strict_with_suppression"] = bool(strict_with_suppression)
+        if (
+            skip_pre_unit_closures is not None
+            or strict_with_suppression is not None
+        ):
+            unit.pop("closure_strictness", None)
+            unit["skip_pre_unit_closures"] = (
+                bool(skip_pre_unit_closures)
+                if skip_pre_unit_closures is not None
+                else resolve_closure_strictness_mode(
+                    closure_strictness=orig_strictness,
+                    skip_pre_unit_closures=unit.get("skip_pre_unit_closures"),
+                )[1]
+            )
+            unit["strict_with_suppression"] = (
+                bool(strict_with_suppression)
+                if strict_with_suppression is not None
+                else resolve_strict_with_suppression(
+                    closure_strictness=orig_strictness,
+                    strict_with_suppression=unit.get("strict_with_suppression"),
+                )
+            )
         if non_suppressing_ctx_managers is not None:
-            unit["non_suppressing_ctx_managers"] = normalize_non_suppressing_ctx_managers(
-                non_suppressing_ctx_managers
+            unit["non_suppressing_ctx_managers"] = list(
+                normalize_non_suppressing_ctx_managers(
+                    non_suppressing_ctx_managers,
+                    unit.get("non_suppressing_ctx_managers"),
+                )
             )
     return _inspect_unit_scope(unit, repo_root=repo_root, file_tree=tree)
 
@@ -2639,6 +2749,12 @@ def scope_matches_closure_mode(
     Requires ``scope_schema_version == SCOPE_SCHEMA_VERSION`` and an explicit boolean
     ``skip_pre_unit_closures`` matching ``expected_skip`` so unmarked or legacy
     serialized scopes are never trusted without recomputation.
+
+    Keyword argument precedence:
+        - ``strict_with_suppression`` takes precedence over its legacy alias
+          ``expected_strict_with`` when both are provided.
+        - ``non_suppressing_ctx_managers`` takes precedence over its legacy alias
+          ``expected_non_suppressing`` when both are provided.
     """
     if scope is None:
         return False
@@ -2707,9 +2823,8 @@ def ensure_unit_scope_closure_mode(
         )
     )
     eff_non_sup = normalize_non_suppressing_ctx_managers(
-        non_suppressing_ctx_managers
-        if non_suppressing_ctx_managers is not None
-        else unit.get("non_suppressing_ctx_managers")
+        non_suppressing_ctx_managers,
+        unit.get("non_suppressing_ctx_managers"),
     )
     if scope is not None and (
         scope_matches_closure_mode(
@@ -2718,7 +2833,10 @@ def ensure_unit_scope_closure_mode(
             expected_strict_with=eff_strict_with,
             expected_non_suppressing=eff_non_sup,
         )
-        or "pathological_ast" in scope.get("control_flow_hazards", ())
+        or any(
+            h in scope.get("control_flow_hazards", ())
+            for h in ("pathological_ast", "stale_source_code")
+        )
     ):
         return scope
     u_copy = {
@@ -2726,42 +2844,45 @@ def ensure_unit_scope_closure_mode(
         "skip_pre_unit_closures": bool(skip_pre_unit_closures),
         "strict_with_suppression": eff_strict_with,
     }
+    u_copy.pop("closure_strictness", None)
     if eff_non_sup or "non_suppressing_ctx_managers" in u_copy:
         u_copy["non_suppressing_ctx_managers"] = list(eff_non_sup)
     if source_text is not None and not str(u_copy.get("source_text") or "").strip():
         u_copy["source_text"] = source_text
-    src_text_val = u_copy.get("source_text")
-    src_code_val = u_copy.get("source_code")
-    src_lines_val = u_copy.get("source_lines")
-    has_unit_source = (
-        tree is not None
-        or bool(_load_unit_file_text(u_copy, repo_root=repo_root))
-        or (isinstance(src_text_val, str) and bool(src_text_val.strip()))
-        or (isinstance(src_code_val, str) and bool(src_code_val.strip()))
-        or (
-            isinstance(src_lines_val, (list, tuple))
-            and any(
-                isinstance(ln, str) and bool(ln.strip()) for ln in src_lines_val
+    if scope is not None:
+        src_text_val = u_copy.get("source_text")
+        src_code_val = u_copy.get("source_code")
+        src_lines_val = u_copy.get("source_lines")
+        has_unit_source = (
+            tree is not None
+            or (isinstance(src_text_val, str) and bool(src_text_val.strip()))
+            or (isinstance(src_code_val, str) and bool(src_code_val.strip()))
+            or (
+                isinstance(src_lines_val, (list, tuple))
+                and any(
+                    isinstance(ln, str) and bool(ln.strip())
+                    for ln in src_lines_val
+                )
             )
+            or bool(_load_unit_file_text(u_copy, repo_root=repo_root))
         )
-    )
-    if scope is not None and not has_unit_source:
-        hazards = list(scope.get("control_flow_hazards", ()))
-        if "severed_closure_cell" not in hazards:
-            hazards.append("severed_closure_cell")
-        reasons = list(scope.get("closure_hazard_reasons", ()))
-        if "unavailable_source_for_closure_mode" not in reasons:
-            reasons.append("unavailable_source_for_closure_mode")
-        return {
-            **scope,
-            "control_flow_hazards": hazards,
-            "closure_hazard_reasons": reasons,
-            "is_control_flow_safe": False,
-            "scope_schema_version": SCOPE_SCHEMA_VERSION,
-            "skip_pre_unit_closures": bool(skip_pre_unit_closures),
-            "strict_with_suppression": eff_strict_with,
-            "non_suppressing_ctx_managers": list(eff_non_sup),
-        }
+        if not has_unit_source:
+            hazards = list(scope.get("control_flow_hazards", ()))
+            if "severed_closure_cell" not in hazards:
+                hazards.append("severed_closure_cell")
+            reasons = list(scope.get("closure_hazard_reasons", ()))
+            if "unavailable_source_for_closure_mode" not in reasons:
+                reasons.append("unavailable_source_for_closure_mode")
+            return {
+                **scope,
+                "control_flow_hazards": hazards,
+                "closure_hazard_reasons": reasons,
+                "is_control_flow_safe": False,
+                "scope_schema_version": SCOPE_SCHEMA_VERSION,
+                "skip_pre_unit_closures": bool(skip_pre_unit_closures),
+                "strict_with_suppression": eff_strict_with,
+                "non_suppressing_ctx_managers": list(eff_non_sup),
+            }
     fresh_scope = inspect_single_unit_scope(
         u_copy, repo_root=repo_root, tree=tree
     )
@@ -2823,10 +2944,9 @@ def analyze_unit_variable_scope(
             strict_with_suppression=u1.get("strict_with_suppression"),
         )
     )
-    expected_non_sup1 = (
-        non_suppressing_ctx_managers
-        if non_suppressing_ctx_managers is not None
-        else u1.get("non_suppressing_ctx_managers")
+    expected_non_sup1 = normalize_non_suppressing_ctx_managers(
+        non_suppressing_ctx_managers,
+        u1.get("non_suppressing_ctx_managers"),
     )
     info1 = ensure_unit_scope_closure_mode(
         u1,
@@ -2862,10 +2982,9 @@ def analyze_unit_variable_scope(
                 strict_with_suppression=u2.get("strict_with_suppression"),
             )
         )
-        expected_non_sup2 = (
-            non_suppressing_ctx_managers
-            if non_suppressing_ctx_managers is not None
-            else u2.get("non_suppressing_ctx_managers")
+        expected_non_sup2 = normalize_non_suppressing_ctx_managers(
+            non_suppressing_ctx_managers,
+            u2.get("non_suppressing_ctx_managers"),
         )
         info2 = ensure_unit_scope_closure_mode(
             u2,
