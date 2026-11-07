@@ -17,7 +17,7 @@ from pydoppelgangerhunt.config import (
     normalize_non_suppressing_ctx_managers,
     normalize_path_string,
     resolve_closure_strictness_mode,
-    resolve_strict_with_suppression,
+    resolve_unit_closure_flags,
 )
 from pydoppelgangerhunt.fixer.binding import (
     _base_unit_name,
@@ -3488,26 +3488,25 @@ def _generate_refactoring_patch_impl(
                     (fn1 and fn1.get("is_static")) or (fn2 and fn2.get("is_static"))
                 )
 
+            explicit_skip = True if skip_pre_unit_closures else None
+            (
+                u1_eff["skip_pre_unit_closures"],
+                u1_eff["strict_with_suppression"],
+            ) = resolve_unit_closure_flags(
+                u1,
+                closure_strictness=closure_strictness,
+                skip_pre_unit_closures=explicit_skip,
+            )
+            (
+                u2_eff["skip_pre_unit_closures"],
+                u2_eff["strict_with_suppression"],
+            ) = resolve_unit_closure_flags(
+                u2,
+                closure_strictness=closure_strictness,
+                skip_pre_unit_closures=explicit_skip,
+            )
             u1_eff.pop("closure_strictness", None)
             u2_eff.pop("closure_strictness", None)
-            u1_eff["skip_pre_unit_closures"] = bool(effective_skip_closures)
-            u2_eff["skip_pre_unit_closures"] = bool(effective_skip_closures)
-            u1_eff["strict_with_suppression"] = resolve_strict_with_suppression(
-                closure_strictness=(
-                    closure_strictness
-                    if closure_strictness is not None
-                    else u1.get("closure_strictness")
-                ),
-                strict_with_suppression=u1.get("strict_with_suppression"),
-            )
-            u2_eff["strict_with_suppression"] = resolve_strict_with_suppression(
-                closure_strictness=(
-                    closure_strictness
-                    if closure_strictness is not None
-                    else u2.get("closure_strictness")
-                ),
-                strict_with_suppression=u2.get("strict_with_suppression"),
-            )
             merged_non_sup1 = normalize_non_suppressing_ctx_managers(
                 eff_non_sup, u1_eff.get("non_suppressing_ctx_managers")
             )

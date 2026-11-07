@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import sys
 import threading
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.canonical_path import normalize_lexical_posix, parse_notebook_cell_anchor
 
@@ -131,6 +131,85 @@ def resolve_strict_with_suppression(
     if strict_with_suppression is not None:
         return bool(strict_with_suppression)
     return False
+
+
+def resolve_unit_closure_flags(
+    unit: Mapping[str, Any],
+    *,
+    closure_strictness: Optional[str] = None,
+    skip_pre_unit_closures: Optional[bool] = None,
+    strict_with_suppression: Optional[bool] = None,
+) -> Tuple[bool, bool]:
+    """Resolves (skip_pre_unit_closures, strict_with_suppression) for a unit with optional overrides."""
+    eff_strictness = (
+        closure_strictness
+        if closure_strictness is not None
+        else unit.get("closure_strictness")
+    )
+    _, eff_skip = (
+        (None, bool(skip_pre_unit_closures))
+        if skip_pre_unit_closures is not None and closure_strictness is None
+        else resolve_closure_strictness_mode(
+            closure_strictness=eff_strictness,
+            skip_pre_unit_closures=(
+                skip_pre_unit_closures
+                if skip_pre_unit_closures is not None
+                else unit.get("skip_pre_unit_closures", False)
+            ),
+        )
+    )
+    eff_strict_with = (
+        bool(strict_with_suppression)
+        if strict_with_suppression is not None and closure_strictness is None
+        else resolve_strict_with_suppression(
+            closure_strictness=eff_strictness,
+            strict_with_suppression=(
+                strict_with_suppression
+                if strict_with_suppression is not None
+                else unit.get("strict_with_suppression")
+            ),
+        )
+    )
+    return eff_skip, eff_strict_with
+
+
+def resolve_pair_closure_flags(
+    u1: Mapping[str, Any],
+    u2: Mapping[str, Any],
+    *,
+    closure_strictness: Optional[str] = None,
+    skip_pre_unit_closures: bool = False,
+    non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
+) -> Tuple[
+    Tuple[bool, bool, Tuple[str, ...]],
+    Tuple[bool, bool, Tuple[str, ...]],
+    bool,
+]:
+    """Resolves per-unit and pair-level closure and context-manager flags for two clone units."""
+    explicit_skip = True if skip_pre_unit_closures else None
+    skip1, strict_with1 = resolve_unit_closure_flags(
+        u1,
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=explicit_skip,
+    )
+    skip2, strict_with2 = resolve_unit_closure_flags(
+        u2,
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=explicit_skip,
+    )
+    eff_non_sup1 = normalize_non_suppressing_ctx_managers(
+        non_suppressing_ctx_managers,
+        u1.get("non_suppressing_ctx_managers"),
+    )
+    eff_non_sup2 = normalize_non_suppressing_ctx_managers(
+        non_suppressing_ctx_managers,
+        u2.get("non_suppressing_ctx_managers"),
+    )
+    return (
+        (skip1, strict_with1, eff_non_sup1),
+        (skip2, strict_with2, eff_non_sup2),
+        bool(skip1 and skip2),
+    )
 
 
 def normalize_non_suppressing_ctx_managers(*sources: Any) -> Tuple[str, ...]:

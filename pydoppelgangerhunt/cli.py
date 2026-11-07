@@ -1190,9 +1190,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ):
             cli_strictness = "pedantic"
 
-    if cli_strictness is not None and "strict_with_suppression" in tool_cfg:
+    if (
+        args.closure_strictness is None
+        and cfg_strictness is not None
+        and "strict_with_suppression" in tool_cfg
+    ):
         resolve_strict_with_suppression(
-            closure_strictness=cli_strictness,
+            closure_strictness=cfg_strictness,
             strict_with_suppression=_safe_bool(
                 tool_cfg.get("strict_with_suppression")
             ),

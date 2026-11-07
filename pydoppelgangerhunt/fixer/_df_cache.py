@@ -8,6 +8,7 @@ import hashlib
 import logging
 import threading
 from types import MappingProxyType
+import warnings
 from typing import (
     Any,
     Callable,
@@ -902,7 +903,9 @@ def _get_or_parse_tree(
 
     parsed: Optional[ast.AST] = None
     try:
-        parsed = ast.parse(source_text)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            parsed = ast.parse(source_text)
         setattr(parsed, "_immutable_cached", True)
         setattr(parsed, "_source_lines", _split_source_lines_stripped(source_text))
     except (SyntaxError, ValueError, UnicodeDecodeError, RecursionError, MemoryError):

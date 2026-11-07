@@ -24,6 +24,7 @@ from pydoppelgangerhunt.config import (
     normalize_non_suppressing_ctx_managers,
     resolve_closure_strictness_mode,
     resolve_strict_with_suppression,
+    resolve_unit_closure_flags,
 )
 from pydoppelgangerhunt.fixer._df_cache import _get_or_parse_tree
 from pydoppelgangerhunt.fixer._df_cell_carriers import _get_fn_scope_context
@@ -2247,6 +2248,59 @@ def _inspect_unit_scope(
                                 extra_non_suppressing_ctx_managers=extra_non_sup,
                             )
                         )
+                        write_only_cond_cands = {
+                            v
+                            for v in cond_escaping_cands
+                            if v not in enc_escaping
+                            and v not in visitor.loads
+                            and v not in live_in_visitor.live_ins
+                            and v in pre_bound
+                            and v in def_pre_bound
+                        }
+                        live_write_only_cond: Set[str] = set()
+                        if write_only_cond_cands:
+                            pre_outs_decl = resolve_unit_declared_outputs(unit)
+                            if isinstance(
+                                pre_outs_decl, (list, tuple, set, frozenset)
+                            ):
+                                live_write_only_cond = (
+                                    write_only_cond_cands & set(pre_outs_decl)
+                                )
+                            elif visitor.returns:
+                                live_write_only_cond = (
+                                    write_only_cond_cands & set(visitor.returns)
+                                )
+                            else:
+                                full_src_text = _get_full_source() or ""
+                                ds_unit: Dict[str, Any] = {
+                                    **unit,
+                                    "start": u_start,
+                                    "end": u_end,
+                                }
+                                if u_start_col is not None:
+                                    ds_unit["start_col"] = u_start_col
+                                if u_end_col is not None:
+                                    ds_unit["end_col"] = u_end_col
+                                ds_live = collect_downstream_read_names(
+                                    full_src_text,
+                                    ds_unit,
+                                    candidates=write_only_cond_cands,
+                                    tree=mod_tree,
+                                    skip_pre_unit_closures=skip_pre_unit_closures_flag,
+                                    source_digest=(
+                                        None
+                                        if full_src_text
+                                        else f"tree:{id(mod_tree)}"
+                                    ),
+                                )
+                                if ds_live is None:
+                                    live_write_only_cond = set(
+                                        write_only_cond_cands
+                                    )
+                                else:
+                                    live_write_only_cond = (
+                                        write_only_cond_cands & ds_live
+                                    )
                         for v in cond_escaping_cands:
                             if v in enc_escaping:
                                 if (
@@ -2279,6 +2333,11 @@ def _inspect_unit_scope(
                                 and not visitor.has_yield
                                 and v in pre_bound
                                 and v in def_pre_bound
+                                and (
+                                    v in visitor.loads
+                                    or v in live_in_visitor.live_ins
+                                    or v in live_write_only_cond
+                                )
                             ):
                                 if v not in visitor.loads:
                                     visitor.loads.append(v)
@@ -2920,29 +2979,11 @@ def analyze_unit_variable_scope(
     non_suppressing_ctx_managers: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Analyzes AST variable scoping to determine inputs, outputs, closures, and attributes."""
-    expected_skip1 = (
-        bool(skip_pre_unit_closures)
-        if skip_pre_unit_closures is not None
-        else resolve_closure_strictness_mode(
-            closure_strictness=(
-                closure_strictness
-                if closure_strictness is not None
-                else u1.get("closure_strictness")
-            ),
-            skip_pre_unit_closures=u1.get("skip_pre_unit_closures"),
-        )[1]
-    )
-    expected_strict_with1 = (
-        bool(strict_with_suppression)
-        if strict_with_suppression is not None
-        else resolve_strict_with_suppression(
-            closure_strictness=(
-                closure_strictness
-                if closure_strictness is not None
-                else u1.get("closure_strictness")
-            ),
-            strict_with_suppression=u1.get("strict_with_suppression"),
-        )
+    expected_skip1, expected_strict_with1 = resolve_unit_closure_flags(
+        u1,
+        closure_strictness=closure_strictness,
+        skip_pre_unit_closures=skip_pre_unit_closures,
+        strict_with_suppression=strict_with_suppression,
     )
     expected_non_sup1 = normalize_non_suppressing_ctx_managers(
         non_suppressing_ctx_managers,
@@ -2958,29 +2999,11 @@ def analyze_unit_variable_scope(
         tree=tree1,
     )
     if u2 is not None:
-        expected_skip2 = (
-            bool(skip_pre_unit_closures)
-            if skip_pre_unit_closures is not None
-            else resolve_closure_strictness_mode(
-                closure_strictness=(
-                    closure_strictness
-                    if closure_strictness is not None
-                    else u2.get("closure_strictness")
-                ),
-                skip_pre_unit_closures=u2.get("skip_pre_unit_closures"),
-            )[1]
-        )
-        expected_strict_with2 = (
-            bool(strict_with_suppression)
-            if strict_with_suppression is not None
-            else resolve_strict_with_suppression(
-                closure_strictness=(
-                    closure_strictness
-                    if closure_strictness is not None
-                    else u2.get("closure_strictness")
-                ),
-                strict_with_suppression=u2.get("strict_with_suppression"),
-            )
+        expected_skip2, expected_strict_with2 = resolve_unit_closure_flags(
+            u2,
+            closure_strictness=closure_strictness,
+            skip_pre_unit_closures=skip_pre_unit_closures,
+            strict_with_suppression=strict_with_suppression,
         )
         expected_non_sup2 = normalize_non_suppressing_ctx_managers(
             non_suppressing_ctx_managers,

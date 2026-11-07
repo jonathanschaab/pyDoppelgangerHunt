@@ -9,10 +9,8 @@ import typing
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from pydoppelgangerhunt.config import (
-    normalize_non_suppressing_ctx_managers,
     normalize_path_string,
-    resolve_closure_strictness_mode,
-    resolve_strict_with_suppression,
+    resolve_pair_closure_flags,
 )
 from pydoppelgangerhunt.reporters import (
     extract_unit_source_lines_with_state,
@@ -1414,25 +1412,16 @@ def synthesize_shared_helper_code(
         common_lines = _attach_pragmas(common_lines, pragmas1 + pragmas2)
 
     # Variable scope analysis for concrete parameter signatures.
-    _, effective_skip_closures = resolve_closure_strictness_mode(
+    (
+        (skip1, effective_strict_with1, eff_non_sup1),
+        (skip2, effective_strict_with2, eff_non_sup2),
+        effective_skip_closures,
+    ) = resolve_pair_closure_flags(
+        u1,
+        u2,
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
-    )
-    effective_strict_with1 = resolve_strict_with_suppression(
-        closure_strictness=closure_strictness,
-        strict_with_suppression=u1.get("strict_with_suppression"),
-    )
-    effective_strict_with2 = resolve_strict_with_suppression(
-        closure_strictness=closure_strictness,
-        strict_with_suppression=u2.get("strict_with_suppression"),
-    )
-    eff_non_sup1 = normalize_non_suppressing_ctx_managers(
-        non_suppressing_ctx_managers,
-        u1.get("non_suppressing_ctx_managers"),
-    )
-    eff_non_sup2 = normalize_non_suppressing_ctx_managers(
-        non_suppressing_ctx_managers,
-        u2.get("non_suppressing_ctx_managers"),
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
     )
     if eff_non_sup1:
         u1["non_suppressing_ctx_managers"] = list(eff_non_sup1)
@@ -1441,13 +1430,13 @@ def synthesize_shared_helper_code(
     has_precomputed_scopes = (
         scope_matches_closure_mode(
             scope1,
-            effective_skip_closures,
+            skip1,
             expected_strict_with=effective_strict_with1,
             expected_non_suppressing=eff_non_sup1,
         )
         and scope_matches_closure_mode(
             scope2,
-            effective_skip_closures,
+            skip2,
             expected_strict_with=effective_strict_with2,
             expected_non_suppressing=eff_non_sup2,
         )
@@ -1503,9 +1492,25 @@ def synthesize_shared_helper_code(
     tree1 = _resolve_tree(tree1, source_text1, u1)
     tree2 = _resolve_tree(tree2, source_text2, u2)
     scopes: List[Dict[str, Any]] = []
-    for u_item, s_text, t_item, pre_s, eff_sw, eff_ns in (
-        (u1, source_text1, tree1, scope1, effective_strict_with1, eff_non_sup1),
-        (u2, source_text2, tree2, scope2, effective_strict_with2, eff_non_sup2),
+    for u_item, s_text, t_item, pre_s, eff_sk, eff_sw, eff_ns in (
+        (
+            u1,
+            source_text1,
+            tree1,
+            scope1,
+            skip1,
+            effective_strict_with1,
+            eff_non_sup1,
+        ),
+        (
+            u2,
+            source_text2,
+            tree2,
+            scope2,
+            skip2,
+            effective_strict_with2,
+            eff_non_sup2,
+        ),
     ):
         if s_text is not None and (
             not isinstance(u_item.get("source_text"), str)
@@ -1519,7 +1524,7 @@ def synthesize_shared_helper_code(
             ensure_unit_scope_closure_mode(
                 u_item,
                 pre_s,
-                effective_skip_closures,
+                eff_sk,
                 strict_with_suppression=eff_sw,
                 non_suppressing_ctx_managers=eff_ns,
                 source_text=s_text,
@@ -1559,7 +1564,12 @@ def synthesize_shared_helper_code(
             tree2=tree2,
             scope1=scope1,
             scope2=scope2,
-            skip_pre_unit_closures=effective_skip_closures,
+            skip_pre_unit_closures=(
+                effective_skip_closures
+                if closure_strictness is not None or skip_pre_unit_closures
+                else None
+            ),
+            closure_strictness=closure_strictness,
             non_suppressing_ctx_managers=non_suppressing_ctx_managers,
         )
 

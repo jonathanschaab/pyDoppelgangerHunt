@@ -2988,4 +2988,24 @@ def test_cli_strict_with_suppression_config_and_ctx_manager_merging(
             assert kwargs.get("closure_strictness") == "pedantic"
             assert kwargs.get("skip_pre_unit_closures") is False
 
+            # Explicit CLI --closure-strictness pedantic overriding pyproject.toml strict_with_suppression = false
+            # must NOT emit a spurious config conflict warning.
+            (repo / "pyproject.toml").write_text(
+                '[tool.pydoppelgangerhunt]\nclosure_strictness = "strict"\nstrict_with_suppression = false\n',
+                encoding="utf-8",
+            )
+            with mock.patch("pydoppelgangerhunt.config.logger.warning") as mock_warn:
+                exit_code2 = main([
+                    str(repo),
+                    "--patch",
+                    str(patch_out),
+                    "--closure-strictness",
+                    "pedantic",
+                ])
+                assert exit_code2 == 1
+                mock_warn.assert_not_called()
+                _, kwargs2 = mock_patch.call_args
+                assert kwargs2.get("closure_strictness") == "pedantic"
+
+
 

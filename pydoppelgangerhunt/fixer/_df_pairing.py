@@ -39,11 +39,7 @@ from pydoppelgangerhunt.fixer._df_hazards import (
     _resolve_downstream_scope_node,
     collect_downstream_read_names,
 )
-from pydoppelgangerhunt.config import (
-    normalize_non_suppressing_ctx_managers,
-    resolve_closure_strictness_mode,
-    resolve_strict_with_suppression,
-)
+from pydoppelgangerhunt.config import resolve_pair_closure_flags
 from pydoppelgangerhunt.fixer.scope import ensure_unit_scope_closure_mode
 from pydoppelgangerhunt.fixer.source import (
     _load_unit_file_text,
@@ -308,22 +304,23 @@ def _ensure_pair_scopes_closure_mode(
     repo_root: Optional[str],
 ) -> Tuple[Dict[str, Any], Dict[str, Any], bool]:
     """Ensures both clone units' scopes match the requested closure strictness mode."""
-    _, effective_skip_closures = resolve_closure_strictness_mode(
+    (
+        (skip1, strict_with1, eff_non_sup1),
+        (skip2, strict_with2, eff_non_sup2),
+        effective_skip_closures,
+    ) = resolve_pair_closure_flags(
+        u1,
+        u2,
         closure_strictness=closure_strictness,
         skip_pre_unit_closures=skip_pre_unit_closures,
+        non_suppressing_ctx_managers=non_suppressing_ctx_managers,
     )
     resolved_s1 = ensure_unit_scope_closure_mode(
         u1,
         scope1,
-        effective_skip_closures,
-        strict_with_suppression=resolve_strict_with_suppression(
-            closure_strictness=closure_strictness,
-            strict_with_suppression=u1.get("strict_with_suppression"),
-        ),
-        non_suppressing_ctx_managers=normalize_non_suppressing_ctx_managers(
-            non_suppressing_ctx_managers,
-            u1.get("non_suppressing_ctx_managers"),
-        ),
+        skip1,
+        strict_with_suppression=strict_with1,
+        non_suppressing_ctx_managers=eff_non_sup1,
         source_text=source_text1,
         tree=tree1,
         repo_root=repo_root,
@@ -331,15 +328,9 @@ def _ensure_pair_scopes_closure_mode(
     resolved_s2 = ensure_unit_scope_closure_mode(
         u2,
         scope2,
-        effective_skip_closures,
-        strict_with_suppression=resolve_strict_with_suppression(
-            closure_strictness=closure_strictness,
-            strict_with_suppression=u2.get("strict_with_suppression"),
-        ),
-        non_suppressing_ctx_managers=normalize_non_suppressing_ctx_managers(
-            non_suppressing_ctx_managers,
-            u2.get("non_suppressing_ctx_managers"),
-        ),
+        skip2,
+        strict_with_suppression=strict_with2,
+        non_suppressing_ctx_managers=eff_non_sup2,
         source_text=source_text2,
         tree=tree2,
         repo_root=repo_root,

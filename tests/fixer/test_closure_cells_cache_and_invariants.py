@@ -4641,3 +4641,268 @@ def test_aliased_suppress_provenance_and_deep_nested_with_early_return() -> None
     assert term_nsr is True
 
 
+def test_pedantic_expr_unit_lhs_pruning_and_per_unit_closure_strictness() -> None:
+    """Verifies pedantic synthesize_shared_helper_code preserves LHS-pruned expression scopes and honors per-unit closure_strictness."""
+    import warnings
+    from pydoppelgangerhunt.fixer.dataflow import resolve_clone_pair_outputs
+    from pydoppelgangerhunt.fixer.scope import (
+        _get_or_parse_tree,
+        _inspect_unit_scope,
+        analyze_unit_variable_scope,
+    )
+    from pydoppelgangerhunt.fixer.synthesis import synthesize_shared_helper_code
+
+    # 1. Expression unit with LHS target (`res = [x + offset for x in items]`) under closure_strictness="pedantic"
+    expr_mod_src = (
+        "def run_a(items, offset):\n"
+        "    res = 99\n"
+        "    res = [x + offset for x in items if x > 0]\n"
+        "    return res\n"
+        "\n"
+        "def run_b(items, offset):\n"
+        "    res = 99\n"
+        "    res = [x + offset for x in items if x > 0]\n"
+        "    return res\n"
+    )
+    u1_expr = {
+        "name": "comp_a",
+        "kind": "comprehension",
+        "start": 3,
+        "end": 3,
+        "source_text": expr_mod_src,
+        "source_code": "    res = [x + offset for x in items if x > 0]\n",
+    }
+    u2_expr = {
+        "name": "comp_b",
+        "kind": "comprehension",
+        "start": 8,
+        "end": 8,
+        "source_text": expr_mod_src,
+        "source_code": "    res = [x + offset for x in items if x > 0]\n",
+    }
+    helper_ped = synthesize_shared_helper_code(
+        u1_expr, u2_expr, closure_strictness="pedantic"
+    )
+    assert "def _shared_comp_a_comp_b(" in helper_ped
+    assert "res" not in helper_ped.split("):", 1)[0]
+
+    # 2. Per-unit closure_strictness honored when top-level closure_strictness is None
+    unk_ctx_src = (
+        "def fn_a(items, custom_mgr):\n"
+        "    with custom_mgr():\n"
+        "        val = sum(items)\n"
+        "    step = lambda x: x + val\n"
+        "    out = step(1)\n"
+        "    return out\n"
+    )
+    u1_ped_unit = {
+        "name": "sub_a",
+        "kind": "block",
+        "start": 4,
+        "end": 5,
+        "source_text": unk_ctx_src,
+        "closure_strictness": "pedantic",
+    }
+    u2_ped_unit = dict(u1_ped_unit, name="sub_b")
+    sc_ped = _inspect_unit_scope(u1_ped_unit)
+    assert sc_ped["strict_with_suppression"] is True
+    assert "severed_closure_cell" in sc_ped["control_flow_hazards"]
+    var_info_ped = analyze_unit_variable_scope(u1_ped_unit, u2_ped_unit)
+    assert var_info_ped["is_control_flow_safe"] is False
+
+    u1_strict_unit = dict(u1_ped_unit, closure_strictness="strict")
+    sc_strict = _inspect_unit_scope(u1_strict_unit)
+    assert sc_strict["strict_with_suppression"] is False
+    assert "severed_closure_cell" not in sc_strict["control_flow_hazards"]
+    res_ped = resolve_clone_pair_outputs(
+        u1_ped_unit, u2_ped_unit, sc_strict, sc_strict
+    )
+    assert res_ped is None
+
+    # 3. Dead write-only conditional store is NOT promoted to unit inputs when not read downstream
+    dead_cond_src = (
+        "def work(items, flag):\n"
+        "    tmp = 0\n"
+        "    acc = 1\n"
+        "    if flag:\n"
+        "        tmp = 2\n"
+        "    acc = acc + len(items)\n"
+        "    return acc\n"
+    )
+    u_dead_cond = {
+        "name": "dead_cond_blk",
+        "kind": "block",
+        "start": 4,
+        "end": 6,
+        "source_text": dead_cond_src,
+    }
+    sc_dead = _inspect_unit_scope(u_dead_cond)
+    assert "tmp" not in sc_dead["inputs"]
+    assert "tmp" not in sc_dead["free_vars"]
+
+    # When `tmp` IS read downstream after the unit, the conditional store must remain in inputs
+    live_cond_src = (
+        "def work_live(items, flag):\n"
+        "    tmp = 0\n"
+        "    acc = 1\n"
+        "    if flag:\n"
+        "        tmp = 2\n"
+        "    acc = acc + len(items)\n"
+        "    return acc + tmp\n"
+    )
+    u_live_cond = {
+        "name": "live_cond_blk",
+        "kind": "block",
+        "start": 4,
+        "end": 6,
+        "source_text": live_cond_src,
+    }
+    sc_live = _inspect_unit_scope(u_live_cond)
+    assert "tmp" in sc_live["inputs"]
+    assert "tmp" in sc_live["free_vars"]
+
+    # 4. SyntaxWarning suppression in symtable fast-path on invalid escape sequences
+    escape_src = (
+        'PAT = "\\d+\\s+"\n'
+        "def match_fn(x):\n"
+        "    return x\n"
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", SyntaxWarning)
+        esc_tree = _get_or_parse_tree(escape_src)
+        assert esc_tree is not None
+        u_esc = {
+            "name": "match_fn",
+            "kind": "function",
+            "start": 2,
+            "end": 3,
+            "source_text": escape_src,
+        }
+        sc_esc = _inspect_unit_scope(u_esc, file_tree=esc_tree)
+        assert sc_esc["is_control_flow_safe"] is True
+
+
+def test_imported_suppress_nullcontext_try_provenance_and_with_item_shadowing() -> None:
+    """Verifies imported/aliased suppress and nullcontext provenance, try/else/except/finally positive provenance, and with-item target shadowing."""
+    from pydoppelgangerhunt.fixer._df_with_provenance import (
+        _block_terminates,
+        _extract_block_definite_bindings_and_term,
+        _seed_scope_suppress_aliases,
+    )
+
+    # 1. Imported `from contextlib import suppress` and `from contextlib import suppress as sup, nullcontext as nc`
+    imp_sup_src = (
+        "from contextlib import suppress as sup, nullcontext as nc\n"
+        "def f():\n"
+        "    with sup(ValueError):\n"
+        "        with nc():\n"
+        "            x = 1\n"
+        "            return x\n"
+        "    after = 2\n"
+    )
+    imp_sup_tree = ast.parse(imp_sup_src)
+    imp_sup_fn = imp_sup_tree.body[1]
+    prov_imp = _seed_scope_suppress_aliases(imp_sup_fn, mod_tree=imp_sup_tree)
+    assert "sup" not in prov_imp.shadowed_names
+    assert "nc" not in prov_imp.shadowed_names
+    assert ("sup", "contextlib.suppress") in prov_imp.imported_symbols
+    assert ("nc", "contextlib.nullcontext") in prov_imp.imported_symbols
+    assert (
+        _block_terminates(
+            [imp_sup_fn.body[0]],  # type: ignore[attr-defined]
+            suppress_aliases=prov_imp,
+        )
+        is True
+    )
+    bound_imp, term_imp = _extract_block_definite_bindings_and_term(
+        imp_sup_fn.body,  # type: ignore[attr-defined]
+        None,
+        suppress_aliases=prov_imp,
+    )
+    assert bound_imp == {"x"}
+    assert term_imp is True
+
+    # 2. Positive provenance preserved across try prefix into except/finally and normal completion into else/post-try
+    try_prov_src = (
+        "def g(f1, f2, f3, f4):\n"
+        "    try:\n"
+        "        cm_safe = open\n"
+        "        may_raise()\n"
+        "        cm_late = open\n"
+        "    except RuntimeError:\n"
+        "        with cm_safe(f1):\n"
+        "            ex_ok = 1\n"
+        "        return ex_ok\n"
+        "    else:\n"
+        "        with cm_late(f2):\n"
+        "            el_ok = 2\n"
+        "    finally:\n"
+        "        with cm_safe(f3):\n"
+        "            fin_ok = 3\n"
+        "    with cm_late(f4):\n"
+        "        post_ok = 4\n"
+    )
+    try_prov_tree = ast.parse(try_prov_src)
+    try_prov_fn = try_prov_tree.body[0]
+    prov_g = _seed_scope_suppress_aliases(try_prov_fn, mod_tree=try_prov_tree)
+    bound_try, _ = _extract_block_definite_bindings_and_term(
+        try_prov_fn.body,  # type: ignore[attr-defined]
+        None,
+        suppress_aliases=prov_g,
+        strict_with_suppression=True,
+    )
+    assert {"cm_safe", "cm_late", "el_ok", "fin_ok", "post_ok"} <= bound_try
+
+    # 3. With-header `as` target shadowing `suppress` prevents inner `with suppress(...)` from being treated as non-raising contextlib.suppress
+    shadow_as_src = (
+        "from contextlib import suppress\n"
+        "def h(custom_factory):\n"
+        "    with suppress(ValueError) as suppress:\n"
+        "        with suppress(KeyError):\n"
+        "            x = 1\n"
+        "            return x\n"
+        "    after = 2\n"
+    )
+    shadow_as_tree = ast.parse(shadow_as_src)
+    shadow_as_fn = shadow_as_tree.body[1]
+    prov_h = _seed_scope_suppress_aliases(shadow_as_fn, mod_tree=shadow_as_tree)
+    assert (
+        _block_terminates(
+            [shadow_as_fn.body[0]],  # type: ignore[attr-defined]
+            suppress_aliases=prov_h,
+        )
+        is False
+    )
+    bound_h, term_h = _extract_block_definite_bindings_and_term(
+        shadow_as_fn.body,  # type: ignore[attr-defined]
+        None,
+        suppress_aliases=prov_h,
+    )
+    assert "after" in bound_h
+    assert "x" not in bound_h
+    assert term_h is False
+
+    # 4. Rebinding `suppress` inside safe_prefix of outer suppress block shadows it for subsequent nested with
+    rebind_in_body_src = (
+        "from contextlib import suppress\n"
+        "def k(other_cm):\n"
+        "    with suppress(ValueError):\n"
+        "        suppress = other_cm\n"
+        "        with suppress(KeyError):\n"
+        "            x = 1\n"
+        "            return x\n"
+        "    after = 2\n"
+    )
+    rebind_tree = ast.parse(rebind_in_body_src)
+    rebind_fn = rebind_tree.body[1]
+    prov_k = _seed_scope_suppress_aliases(rebind_fn, mod_tree=rebind_tree)
+    assert (
+        _block_terminates(
+            [rebind_fn.body[0]],  # type: ignore[attr-defined]
+            suppress_aliases=prov_k,
+        )
+        is False
+    )
+
+
+

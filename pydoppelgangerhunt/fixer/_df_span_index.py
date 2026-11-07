@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import symtable
+import warnings
 from typing import (
     Dict,
     List,
@@ -728,7 +729,9 @@ def _compute_scope_invalid_lexical_declarations(
         src_lines = getattr(root_scope, "_source_lines", None)
         if isinstance(src_lines, (list, tuple)) and src_lines:
             try:
-                symtable.symtable("\n".join(src_lines), "<symtable>", "exec")
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", SyntaxWarning)
+                    symtable.symtable("\n".join(src_lines), "<symtable>", "exec")
                 return False
             except SyntaxError:
                 return True
