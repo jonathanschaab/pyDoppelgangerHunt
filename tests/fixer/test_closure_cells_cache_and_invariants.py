@@ -4146,7 +4146,12 @@ def test_granular_closure_hazard_skip_reasons_and_symtable_fuzzer(
         assert expected_locals <= ast_locals
         assert "w_leaked" in ast_locals
         assert "z" not in ast_locals
-        assert sym_outer["cells"] == frozenset({loc1})
+        expected_cells = (
+            frozenset({loc1})
+            if sys.version_info >= (3, 12)
+            else frozenset({loc1, "w_leaked"})
+        )
+        assert sym_outer["cells"] == expected_cells
         assert sym_nested["frees"] == frozenset({loc1})
         assert g1 not in (sym_outer["locals"] - sym_outer["globals"])
         unit_sc = inspect_single_unit_scope(
